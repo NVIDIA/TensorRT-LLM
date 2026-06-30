@@ -571,6 +571,19 @@ def launch_visual_gen_server(
         visual_gen_args: Optional validated VisualGenArgs for model configuration.
         metadata_server_cfg: Optional metadata server configuration.
     """
+    # External-launch workers (rank > 0) must NOT bind the HTTP socket. Under an
+    # external launcher (torchrun/srun) every rank runs this command, but only
+    # rank 0 serves HTTP; ranks > 0 are pure compute workers. VisualGen() routes
+    # rank > 0 into the diffusion worker loop and sys.exit(0)s (never returns), so
+    # construct it *before* the rank-0-only bind below. Otherwise every rank races
+    # to bind (host, port) and, since a multi-GPU replica's tasks share a network
+    # namespace, all but one die with "Address already in use".
+    from tensorrt_llm._torch.visual_gen.executor import _detect_external_launch
+    _ext = _detect_external_launch()
+    if _ext is not None and _ext[0] != 0:
+        VisualGen(model=model, args=visual_gen_args)  # worker loop; sys.exit(0)s
+        return
+
     # Reserve the listening (host, port) by binding the socket *before*
     # constructing the VisualGen pipeline, then hand the bound socket to
     # uvicorn. VisualGen initialization can take many minutes; if we deferred
