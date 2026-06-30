@@ -458,6 +458,7 @@ unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py 
 unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_partial_update_weights_nvfp4[auto-Qwen3/Qwen3-8B] SKIP (https://nvbugs/6372690)
 unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_partial_update_weights_nvfp4[fp8-Qwen3/Qwen3-30B-A3B] SKIP (https://nvbugs/6372690)
 unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_partial_update_weights_nvfp4[fp8-Qwen3/Qwen3-8B] SKIP (https://nvbugs/6372690)
+unittest/_torch/sampler/test_beam_search_speculative_d2h.py::test_speculative_d2h_predictor_hit_is_sync_free SKIP (https://nvbugs/6378901)
 unittest/_torch/thop/parallel/test_fp8_rowwise_linear.py::test_fp8_rowwise_linear[dtype1] SKIP (https://nvbugs/6301807)
 unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_no_autotune[use_score_as_input-RoutingDSv3-swiglu-1024-1024-1] SKIP (https://nvbugs/5908070)
 unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_no_autotune[use_score_as_input-RoutingRenormalize_qwen_next-swiglu-1024-1024-150] SKIP (https://nvbugs/5908070)
