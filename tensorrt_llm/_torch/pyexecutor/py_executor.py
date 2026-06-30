@@ -2724,6 +2724,12 @@ class PyExecutor:
             getattr(kv_cache_manager, "tokens_per_block", None),
         )
 
+    @staticmethod
+    def _uses_async_disagg_gen_transfer() -> bool:
+        """Return whether generation KV transfers can remain in flight."""
+        return (os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") != "1" and
+                os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") != "1")
+
     def _uses_kv_manager_v2(self) -> bool:
         explicit_flag = getattr(self, "_is_kv_manager_v2", None)
         if explicit_flag is not None:
@@ -2734,6 +2740,12 @@ class PyExecutor:
     def _apply_disagg_transfer_admission(
         self, fitting_disagg_gen_init_requests: List[LlmRequest]
     ) -> Tuple[List[LlmRequest], bool]:
+        # Synchronous receives complete before this executor step continues, so
+        # they reuse one transfer slot and never contribute to the outstanding
+        # transfer budget. Synthetic gen-only benchmarks do not transfer data.
+        if not self._uses_async_disagg_gen_transfer():
+            return fitting_disagg_gen_init_requests, False
+
         controller = self._get_disagg_transfer_admission_controller()
         if not (getattr(self, "kv_cache_transceiver", None)
                 and controller.enabled() and fitting_disagg_gen_init_requests):
@@ -2801,18 +2813,28 @@ class PyExecutor:
             all_gen_first: bool) -> None:
         local_need_check = (num_fitting_reqs == 0
                             and not fitting_disagg_gen_init_requests)
-        local_need_gen_check = (local_need_check
-                                and wait_for_disagg_gen_transfer_progress)
 
-        any_need_gen_check = self._sync_disagg_gen_status_entry(
-            local_need_gen_check)
-        if any_need_gen_check > 0:
-            if local_need_gen_check:
-                logger.debug(
-                    "Waiting for generation KV cache transfer progress to free "
-                    "disagg admission budget")
-            self._check_disagg_gen_cache_transfer_status(1)
+        # Generation-only benchmark workers have no context transfers to
+        # reap. In synchronous mode, one rank can still be receiving a
+        # rank-local request while another is idle, so entering either the
+        # generation or context progress collective here is unsafe.
+        if (not self._uses_async_disagg_gen_transfer()
+                and self.is_benchmark_disagg):
             return
+
+        if self._uses_async_disagg_gen_transfer():
+            local_need_gen_check = (local_need_check
+                                    and wait_for_disagg_gen_transfer_progress)
+
+            any_need_gen_check = self._sync_disagg_gen_status_entry(
+                local_need_gen_check)
+            if any_need_gen_check > 0:
+                if local_need_gen_check:
+                    logger.debug(
+                        "Waiting for generation KV cache transfer progress to "
+                        "free disagg admission budget")
+                self._check_disagg_gen_cache_transfer_status(1)
+                return
 
         any_need_check = self._sync_disagg_ctx_status_entry(local_need_check)
         if any_need_check > 0:
@@ -4502,6 +4524,9 @@ class PyExecutor:
 
     @nvtx_range("_check_disagg_gen_transfer_status")
     def _check_disagg_gen_transfer_status(self):
+        if not self._uses_async_disagg_gen_transfer():
+            return
+
         # Gen-transfer status performs cross-rank consensus internally.
         # Enter it symmetrically; ranks with no ready local future contribute
         # an empty ready set.
@@ -4861,12 +4886,14 @@ class PyExecutor:
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             return
 
-        if os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") == "1":
+        if not self._uses_async_disagg_gen_transfer():
             for req in new_gen_reqs:
                 self.kv_cache_transceiver.request_and_receive_sync(req)
-        else:
-            for req in new_gen_reqs:
-                self.kv_cache_transceiver.request_and_receive_async(req)
+            self._check_cache_transfer_errors("generation requests")
+            return
+
+        for req in new_gen_reqs:
+            self.kv_cache_transceiver.request_and_receive_async(req)
 
         if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
             for req in new_gen_reqs:

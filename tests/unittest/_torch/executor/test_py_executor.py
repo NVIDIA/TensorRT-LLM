@@ -414,6 +414,29 @@ class TestDisaggTransferAdmissionController:
         assert wait_for_progress
         executor._revert_ctx_alloc.assert_not_called()
 
+    def test_sync_mode_bypasses_transfer_budget(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_transceiver = Mock()
+        executor._is_kv_manager_v2 = True
+        executor._revert_ctx_alloc = Mock()
+        executor.active_requests = [_make_disagg_transfer_request(1, 32, in_progress=True)]
+        executor._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
+            max_tokens_in_buffer=32, tokens_per_block=32
+        )
+        candidates = [
+            _make_disagg_transfer_request(2, 32),
+            _make_disagg_transfer_request(3, 32),
+        ]
+
+        admitted, wait_for_progress = PyExecutor._apply_disagg_transfer_admission(
+            executor, candidates
+        )
+
+        assert admitted == candidates
+        assert not wait_for_progress
+        executor._revert_ctx_alloc.assert_not_called()
+
 
 class TestDisaggTransferIdleProgress:
     def test_gen_transfer_status_polls_active_transfers(self):
@@ -433,6 +456,15 @@ class TestDisaggTransferIdleProgress:
         PyExecutor._check_disagg_gen_transfer_status(executor)
 
         executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(0)
+
+    def test_gen_transfer_status_skips_sync_mode(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+        executor = object.__new__(PyExecutor)
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+
+        PyExecutor._check_disagg_gen_transfer_status(executor)
+
+        executor._check_disagg_gen_cache_transfer_status.assert_not_called()
 
     def test_polls_generation_transfer_when_admission_blocked(self):
         executor = object.__new__(PyExecutor)
@@ -486,6 +518,46 @@ class TestDisaggTransferIdleProgress:
 
         executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(1)
         executor._check_disagg_gen_cache_transfer_status.assert_not_called()
+
+    def test_sync_benchmark_skips_idle_transfer_collectives(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(tp_size=4, cp_size=1, world_size=4)
+        executor.is_benchmark_disagg = True
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._check_disagg_ctx_cache_transfer_status = Mock()
+
+        PyExecutor._check_disagg_transfer_progress_when_idle(
+            executor,
+            num_fitting_reqs=0,
+            fitting_disagg_gen_init_requests=[],
+            wait_for_disagg_gen_transfer_progress=True,
+            all_gen_first=False,
+        )
+
+        executor.dist.allreduce.assert_not_called()
+        executor.dist.tp_allreduce.assert_not_called()
+        executor._check_disagg_gen_cache_transfer_status.assert_not_called()
+        executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
+
+    def test_sync_receive_does_not_poll_async_status(self, monkeypatch):
+        monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_transceiver = Mock()
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._check_cache_transfer_errors = Mock()
+        requests = [Mock(), Mock()]
+
+        PyExecutor._recv_disagg_gen_cache(executor, requests)
+
+        assert [
+            call.args[0]
+            for call in executor.kv_cache_transceiver.request_and_receive_sync.call_args_list
+        ] == requests
+        executor.kv_cache_transceiver.request_and_receive_async.assert_not_called()
+        executor._check_disagg_gen_cache_transfer_status.assert_not_called()
+        executor._check_cache_transfer_errors.assert_called_once_with("generation requests")
 
     def test_peer_cp_rank_enters_context_progress_poll(self):
         executor = object.__new__(PyExecutor)
