@@ -8,6 +8,7 @@ from typing import Annotated, Any, ClassVar, Literal, get_args, get_origin
 
 import pydantic_core
 import pytest
+import torch
 import yaml
 from pydantic import BaseModel, TypeAdapter, ValidationError
 from utils.llm_data import llm_models_root
@@ -2776,6 +2777,21 @@ class TestDeepSeekV4SparseAttentionConfig:
         config = DeepSeekV4SparseAttentionConfig(compress_ratios=[0, 4, 128])
 
         assert config.compress_ratios == [1, 4, 128]
+
+    def test_default_fp4_falls_back_to_fp8_before_blackwell(self, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr("tensorrt_llm._utils.get_sm_version", lambda: 90)
+
+        config = DeepSeekV4SparseAttentionConfig()
+
+        assert config.indexer_k_dtype == "fp8"
+
+    def test_explicit_fp4_is_rejected_before_blackwell(self, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr("tensorrt_llm._utils.get_sm_version", lambda: 90)
+
+        with pytest.raises(ValidationError, match="requires SM>=100"):
+            DeepSeekV4SparseAttentionConfig(indexer_k_dtype="fp4")
 
     @pytest.mark.parametrize("compress_ratios", [[], [-1, 4, 128]])
     def test_invalid_compress_ratios_raise(self, compress_ratios):

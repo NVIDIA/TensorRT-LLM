@@ -25,6 +25,7 @@ catch regressions in the FP4 plumbing without needing GPU memory:
 from __future__ import annotations
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import (
     DeepseekV4AttentionType,
@@ -38,6 +39,12 @@ from tensorrt_llm.llmapi.llm_args import (
 # ---------------------------------------------------------------------------
 # Pydantic config validators
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _disable_runtime_sm_validation(monkeypatch):
+    """Keep these schema/layout tests independent of the runner GPU."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
 
 def test_indexer_k_dtype_default_is_fp4():

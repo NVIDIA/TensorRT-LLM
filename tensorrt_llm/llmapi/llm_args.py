@@ -785,8 +785,9 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
 
         DeepGEMM's fp8_fp4_mqa_logits / fp8_fp4_paged_mqa_logits kernels
         require SM>=100, and invokeFusedCatFp4 hard-asserts head_dim==128.
-        Surface both as Pydantic errors so invalid configs fail fast at
-        construction instead of with a cryptic kernel-launch failure.
+        Surface explicitly requested invalid configs as Pydantic errors so
+        they fail fast instead of with a cryptic kernel-launch failure. The
+        DeepSeek-V4 default falls back to fp8 on pre-Blackwell GPUs.
 
         The SM check is skipped when CUDA is unavailable (config
         construction on CPU-only hosts or at doc-gen time), leaving the
@@ -802,10 +803,17 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
                 from tensorrt_llm._utils import get_sm_version
                 sm = get_sm_version()
                 if sm < 100:
-                    raise ValueError(
-                        f"indexer_k_dtype='fp4' requires SM>=100 (Blackwell); "
-                        f"current device is SM{sm}. Set indexer_k_dtype='fp8' "
-                        f"for non-Blackwell GPUs.")
+                    if 'indexer_k_dtype' not in self.model_fields_set:
+                        logger.warning(
+                            "DeepSeek-V4 defaults indexer_k_dtype to 'fp4', "
+                            f"but the current device is SM{sm}; falling back "
+                            "to 'fp8'.")
+                        self.indexer_k_dtype = "fp8"
+                    else:
+                        raise ValueError(
+                            f"indexer_k_dtype='fp4' requires SM>=100 "
+                            f"(Blackwell); current device is SM{sm}. Set "
+                            f"indexer_k_dtype='fp8' for non-Blackwell GPUs.")
         return self
 
     @model_validator(mode="after")
