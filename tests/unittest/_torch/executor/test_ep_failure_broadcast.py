@@ -37,7 +37,11 @@ import pytest
 
 from tensorrt_llm._torch.modules.fused_moe.ep_group_health import EPGroupHealth
 from tensorrt_llm._torch.pyexecutor import ep_failure_broadcast
-from tensorrt_llm._torch.pyexecutor.ep_failure_broadcast import MpiFtSubcomm, MpiFtSubcommConfig
+from tensorrt_llm._torch.pyexecutor.ep_failure_broadcast import (
+    DetectedRankState,
+    MpiFtSubcomm,
+    MpiFtSubcommConfig,
+)
 
 _TEST_CONFIG = MpiFtSubcommConfig(
     poll_interval_sec=0.001,
@@ -309,34 +313,50 @@ def _make_broadcaster(
     *,
     size: int = 4,
     rank: int = 0,
-    detected_health: EPGroupHealth | None = None,
+    detected_state: DetectedRankState | None = None,
     comm: _FakeComm | None = None,
     mpi: _FakeMPI | None = None,
     callback: Callable[[int, int, float], None] | None = None,
-) -> tuple[MpiFtSubcomm, EPGroupHealth, _FakeComm, _FakeMPI]:
-    detected_health = detected_health or EPGroupHealth(size)
+) -> tuple[MpiFtSubcomm, DetectedRankState, _FakeComm, _FakeMPI]:
+    detected_state = detected_state or DetectedRankState(size)
     comm = comm or _FakeComm(size=size, rank=rank)
     mpi = mpi or _FakeMPI()
     broadcaster = MpiFtSubcomm(
         _FakeMapping.ep_world(size, rank),
-        detected_health,
+        detected_state,
         _TEST_CONFIG,
         callback,
         comm=comm,
         mpi_module=mpi,
     )
-    return broadcaster, detected_health, comm, mpi
+    return broadcaster, detected_state, comm, mpi
+
+
+def test_committed_ep_group_health_is_rejected_before_mpi_setup() -> None:
+    comm = _FakeComm(size=2)
+
+    with pytest.raises(TypeError, match="committed EPGroupHealth cannot be used"):
+        MpiFtSubcomm(
+            _FakeMapping.ep_world(2),
+            EPGroupHealth(2),
+            _TEST_CONFIG,
+            comm=comm,
+            mpi_module=_FakeMPI(),
+        )
+
+    assert comm.errhandler_calls == 0
+    assert comm.is_revoked_calls == 0
 
 
 def test_watchdog_callback_records_and_fans_out_detected_failure() -> None:
-    detected_health = EPGroupHealth(4)
-    broadcaster, _, comm, _ = _make_broadcaster(detected_health=detected_health)
+    detected_state = DetectedRankState(4)
+    broadcaster, _, comm, _ = _make_broadcaster(detected_state=detected_state)
     broadcaster.start()
     caller_thread = threading.get_ident()
     try:
         watchdog_callback = broadcaster.report_detected_failure
         assert watchdog_callback(2) is True
-        assert detected_health.get_failed_ranks() == frozenset({2})
+        assert detected_state.get_failed_ranks() == frozenset({2})
         _wait_until(lambda: len(comm.sends) == 2, description="failure fanout")
         _wait_until(
             lambda: all(record.request.test_calls > 0 for record in comm.sends),
@@ -359,19 +379,19 @@ def test_watchdog_callback_records_and_fans_out_detected_failure() -> None:
         comm.deliver(source=1, failed_rank=2)
         comm.deliver(source=3, failed_rank=2)
         _wait_until(
-            broadcaster.detected_health_is_reconciled,
+            broadcaster.detected_state_is_reconciled,
             description="detection reconciliation",
         )
     finally:
         broadcaster.stop()
 
 
-def test_externally_premarked_detected_health_fails_closed() -> None:
-    detected_health = EPGroupHealth(2)
-    assert detected_health.mark_failed(1) is True
+def test_externally_premarked_detected_state_fails_closed() -> None:
+    detected_state = DetectedRankState(2)
+    assert detected_state.record_failure(1) is True
     broadcaster, _, comm, _ = _make_broadcaster(
         size=2,
-        detected_health=detected_health,
+        detected_state=detected_state,
     )
 
     try:
@@ -383,9 +403,9 @@ def test_externally_premarked_detected_health_fails_closed() -> None:
             pass
         _wait_until(
             lambda: isinstance(broadcaster.last_error, RuntimeError),
-            description="pre-marked detected-health rejection",
+            description="pre-recorded detected-state rejection",
         )
-        assert "without pre-marking health" in str(broadcaster.last_error)
+        assert "without pre-recording evidence" in str(broadcaster.last_error)
         _wait_until(lambda: comm.revoke_calls == 1, description="pre-mark fail-closed revoke")
     finally:
         broadcaster.stop()
@@ -393,12 +413,12 @@ def test_externally_premarked_detected_health_fails_closed() -> None:
 
 def test_detection_reconciliation_does_not_mutate_committed_health() -> None:
     callbacks: list[tuple[int, int, float]] = []
-    detected_health = EPGroupHealth(2)
+    detected_state = DetectedRankState(2)
     committed_health = EPGroupHealth(2)
     initial_committed_snapshot = committed_health.snapshot()
     broadcaster, _, _, _ = _make_broadcaster(
         size=2,
-        detected_health=detected_health,
+        detected_state=detected_state,
         callback=lambda failed, source, when: callbacks.append((failed, source, when)),
     )
     broadcaster.start()
@@ -409,12 +429,12 @@ def test_detection_reconciliation_does_not_mutate_committed_health() -> None:
             description="local detection coordinator handoff",
         )
         _wait_until(
-            broadcaster.detected_health_is_reconciled,
+            broadcaster.detected_state_is_reconciled,
             description="detection reconciliation",
         )
 
-        assert detected_health.get_failed_ranks() == frozenset({1})
-        assert detected_health.generation == 1
+        assert detected_state.get_failed_ranks() == frozenset({1})
+        assert detected_state.generation == 1
         assert committed_health.snapshot() == initial_committed_snapshot
         assert committed_health.all_active() is True
         assert callbacks[0][:2] == (1, 0)
@@ -454,77 +474,54 @@ def test_survivor_echoes_reconcile_failure_detection() -> None:
         broadcaster.stop()
 
 
-def test_rank_reactivation_cannot_reopen_reconciliation_for_same_comm_epoch() -> None:
-    broadcaster, health, comm, _ = _make_broadcaster(size=3)
-    broadcaster.start()
-    try:
-        assert broadcaster.pre_failover(2) is True
-        _wait_until(lambda: len(comm.sends) == 1, description="failure fanout")
-        comm.sends[0].request.complete()
-        comm.deliver(source=1, failed_rank=2)
-        _wait_until(broadcaster.health_is_reconciled, description="failure reconciliation")
+def test_detected_state_is_monotonic_for_one_communicator_epoch() -> None:
+    state = DetectedRankState(3)
 
-        assert health.mark_active(2) is True
-        _wait_until(
-            lambda: isinstance(broadcaster.last_error, RuntimeError),
-            description="reactivated-rank terminal handling",
-        )
-        _wait_until(lambda: comm.revoke_calls == 1, description="epoch-violation revoke")
-        assert broadcaster.world_is_poisoned() is True
-        assert broadcaster.failure_is_reconciled(2) is False
-        assert broadcaster.health_is_reconciled() is False
-
-        # Even restoring the failed bit cannot restore the old consensus: the
-        # intervening generation change belongs to a future communicator epoch.
-        assert health.mark_failed(2) is True
-        assert broadcaster.world_is_poisoned() is True
-        assert broadcaster.failure_is_reconciled(2) is False
-        assert broadcaster.health_is_reconciled() is False
-    finally:
-        broadcaster.stop()
+    assert state.snapshot() == ep_failure_broadcast.DetectedRankStateSnapshot(
+        mask=0b111,
+        failed_ranks=frozenset(),
+        generation=0,
+    )
+    assert state.record_failure(2) is True
+    assert state.record_failure(2) is False
+    assert state.get_mask() == 0b011
+    assert state.get_failed_ranks() == frozenset({2})
+    assert state.generation == 1
+    assert not hasattr(state, "mark_active")
 
 
-def test_reactivation_between_failure_claim_and_observe_cannot_become_epoch_baseline(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    health = EPGroupHealth(2)
-    broadcaster, _, _, _ = _make_broadcaster(size=2, detected_health=health)
-    original_claim = broadcaster._claim_failure
-    mutated = False
+def test_detected_state_coalesces_concurrent_evidence() -> None:
+    state = DetectedRankState(4)
+    barrier = threading.Barrier(8)
+    results: list[bool] = []
+    results_lock = threading.Lock()
 
-    def claim_then_turn_over_epoch(failed_rank: int) -> None:
-        nonlocal mutated
-        original_claim(failed_rank)
-        if not mutated:
-            mutated = True
-            assert health.mark_failed(failed_rank) is True
-            assert health.mark_active(failed_rank) is True
-            assert health.mark_failed(failed_rank) is True
+    def record_same_failure() -> None:
+        barrier.wait()
+        changed = state.record_failure(2)
+        with results_lock:
+            results.append(changed)
 
-    monkeypatch.setattr(broadcaster, "_claim_failure", claim_then_turn_over_epoch)
-    broadcaster.start()
-    try:
-        assert broadcaster.broadcast_failure(1) is False
-        _wait_until(
-            lambda: 1 in broadcaster._failure_fanout_complete,
-            description="single-survivor fanout completion",
-        )
-        assert health.generation == 3
-        _wait_until(
-            lambda: isinstance(broadcaster.last_error, RuntimeError),
-            description="turnover terminal handling",
-        )
-        assert broadcaster.failure_is_reconciled(1) is False
-        assert broadcaster.health_is_reconciled() is False
-    finally:
-        broadcaster.stop()
+    threads = [threading.Thread(target=record_same_failure) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert results.count(True) == 1
+    assert results.count(False) == 7
+    assert state.snapshot() == ep_failure_broadcast.DetectedRankStateSnapshot(
+        mask=0b1011,
+        failed_ranks=frozenset({2}),
+        generation=1,
+    )
 
 
 def test_second_failure_between_claim_and_observe_cannot_open_single_failure_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    health = EPGroupHealth(3)
-    broadcaster, _, _, _ = _make_broadcaster(size=3, detected_health=health)
+    health = DetectedRankState(3)
+    broadcaster, _, _, _ = _make_broadcaster(size=3, detected_state=health)
     original_claim = broadcaster._claim_failure
     mutated = False
 
@@ -533,7 +530,7 @@ def test_second_failure_between_claim_and_observe_cannot_open_single_failure_gat
         original_claim(failed_rank)
         if not mutated:
             mutated = True
-            assert health.mark_failed(1) is True
+            assert health.record_failure(1) is True
 
     monkeypatch.setattr(broadcaster, "_claim_failure", claim_then_add_second_failure)
     broadcaster.start()
@@ -546,7 +543,7 @@ def test_second_failure_between_claim_and_observe_cannot_open_single_failure_gat
         assert health.get_failed_ranks() == frozenset({1, 2})
         _wait_until(
             lambda: isinstance(broadcaster.last_error, RuntimeError),
-            description="second-health-failure terminal handling",
+            description="second-detected-failure terminal handling",
         )
         assert broadcaster.failure_is_reconciled(2) is False
         assert broadcaster.health_is_reconciled() is False
@@ -568,7 +565,7 @@ def test_reconciliation_timeout_fails_closed_while_mpi_test_is_wedged() -> None:
     )
     broadcaster = MpiFtSubcomm(
         _FakeMapping.ep_world(3),
-        EPGroupHealth(3),
+        DetectedRankState(3),
         config,
         comm=comm,
         mpi_module=_FakeMPI(),
@@ -609,7 +606,7 @@ def test_reconciliation_timeout_world_aborts_when_mpi_test_is_wedged_without_ulf
     )
     broadcaster = MpiFtSubcomm(
         _FakeMapping.ep_world(3),
-        EPGroupHealth(3),
+        DetectedRankState(3),
         config,
         comm=comm,
         mpi_module=_FakeMPI(),
@@ -728,7 +725,7 @@ def test_monitor_does_not_world_abort_reconciled_relay_when_mpi_test_resumes() -
     )
     broadcaster = MpiFtSubcomm(
         _FakeMapping.ep_world(2),
-        EPGroupHealth(2),
+        DetectedRankState(2),
         config,
         comm=comm,
         mpi_module=_FakeMPI(),
@@ -817,7 +814,7 @@ def test_no_ulfm_abort_timeout_uses_world_abort_before_stop_completes() -> None:
     comm = _FakeComm(size=3, ulfm_probe_error=NotImplementedError())
     broadcaster = MpiFtSubcomm(
         _FakeMapping.ep_world(3),
-        EPGroupHealth(3),
+        DetectedRankState(3),
         config,
         comm=comm,
         mpi_module=_FakeMPI(),
@@ -856,7 +853,7 @@ def test_stop_cannot_bypass_abort_requested_during_blocked_drain() -> None:
     )
     broadcaster = MpiFtSubcomm(
         _FakeMapping.ep_world(3),
-        EPGroupHealth(3),
+        DetectedRankState(3),
         config,
         comm=comm,
         mpi_module=_FakeMPI(),
@@ -1001,7 +998,7 @@ def test_received_report_is_idempotent_and_callback_runs_once() -> None:
         broadcaster.stop()
 
 
-def test_monitor_cannot_observe_remote_claim_before_detected_health_update(
+def test_monitor_cannot_observe_remote_claim_before_detected_state_update(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     broadcaster, health, comm, _ = _make_broadcaster(size=3)
@@ -1099,7 +1096,7 @@ def test_single_rank_group_has_no_peer_requests_or_sends() -> None:
         abort_timeout_sec=0.02,
     )
     comm = _FakeComm(size=1, ulfm_probe_error=NotImplementedError())
-    health = EPGroupHealth(1)
+    health = DetectedRankState(1)
     broadcaster = MpiFtSubcomm(
         _FakeMapping.ep_world(1),
         health,
@@ -1315,7 +1312,7 @@ def test_startup_timeout_fails_closed_before_progress_resumes() -> None:
     )
     broadcaster = MpiFtSubcomm(
         _FakeMapping.ep_world(2),
-        EPGroupHealth(2),
+        DetectedRankState(2),
         config,
         comm=comm,
         mpi_module=_FakeMPI(),
@@ -1372,7 +1369,7 @@ def test_startup_timeout_stops_callback_before_blocked_receive_is_released() -> 
     )
     broadcaster = MpiFtSubcomm(
         _FakeMapping.ep_world(2),
-        EPGroupHealth(2),
+        DetectedRankState(2),
         config,
         lambda _failed, _source, _when: None,
         comm=comm,
@@ -1498,7 +1495,7 @@ def test_healthy_stop_cleanup_timeout_aborts_world_and_retains_request() -> None
     )
     broadcaster = MpiFtSubcomm(
         _FakeMapping.ep_world(2),
-        EPGroupHealth(2),
+        DetectedRankState(2),
         config,
         comm=comm,
         mpi_module=_FakeMPI(),
@@ -1637,7 +1634,7 @@ def test_constructor_requires_mpi_thread_multiple() -> None:
     with pytest.raises(RuntimeError, match="MPI.THREAD_MULTIPLE"):
         MpiFtSubcomm(
             _FakeMapping.ep_world(2),
-            EPGroupHealth(2),
+            DetectedRankState(2),
             _TEST_CONFIG,
             comm=comm,
             mpi_module=mpi,
@@ -1696,7 +1693,7 @@ def test_collectively_created_comm_uses_frozen_setup_and_lives_for_process(
     try:
         broadcaster = MpiFtSubcomm(
             mapping,
-            EPGroupHealth(2),
+            DetectedRankState(2),
             _TEST_CONFIG,
             mpi_module=mpi,
         )
@@ -1728,7 +1725,7 @@ def test_constructor_rejects_non_world_spanning_ep_group_for_mvp() -> None:
     with pytest.raises(ValueError, match="spanning the full MPI world"):
         MpiFtSubcomm(
             mapping,
-            EPGroupHealth(2),
+            DetectedRankState(2),
             _TEST_CONFIG,
             comm=comm,
             mpi_module=_FakeMPI(),
@@ -1867,7 +1864,7 @@ def test_remote_revoke_after_local_reconciliation_still_fails_closed() -> None:
     assert comm.revoke_calls == 1
     with pytest.raises(RuntimeError, match="not running"):
         broadcaster.pre_failover(1)
-    assert broadcaster._detected_health.get_failed_ranks() == frozenset({2})
+    assert broadcaster._detected_state.get_failed_ranks() == frozenset({2})
     broadcaster.stop()
 
 
@@ -1982,7 +1979,7 @@ def test_non_ulfm_generic_error_after_watchdog_report_does_not_arm_stale_deadlin
     comm = _FakeComm(size=3, ulfm_probe_error=NotImplementedError())
     broadcaster = MpiFtSubcomm(
         _FakeMapping.ep_world(3),
-        EPGroupHealth(3),
+        DetectedRankState(3),
         config,
         comm=comm,
         mpi_module=_FakeMPI(),
@@ -2030,7 +2027,7 @@ def test_unattributed_error_from_other_source_keeps_reconciliation_gate_closed()
     comm = _FakeComm(size=4, ulfm_probe_error=NotImplementedError())
     broadcaster = MpiFtSubcomm(
         _FakeMapping.ep_world(4),
-        EPGroupHealth(4),
+        DetectedRankState(4),
         config,
         comm=comm,
         mpi_module=_FakeMPI(),
@@ -2084,7 +2081,7 @@ def test_non_ulfm_unattributed_receive_error_aborts_after_bounded_deadlines(
         abort_timeout_sec=0.05,
     )
     comm = _FakeComm(size=2, ulfm_probe_error=NotImplementedError())
-    health = EPGroupHealth(2)
+    health = DetectedRankState(2)
     broadcaster = MpiFtSubcomm(
         _FakeMapping.ep_world(2),
         health,
