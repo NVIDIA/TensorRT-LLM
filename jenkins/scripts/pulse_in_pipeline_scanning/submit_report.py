@@ -155,7 +155,7 @@ def submit_source_code_licenses(
                 "b_is_new": is_new,
             }
             if (is_new or not only_report_new_risk) and not is_preapproved(
-                map_preapproved, package_name, (component.get("type") or "").lower()
+                map_preapproved, package_name, (component.get("type") or "unknown").lower()
             ):
                 risks_to_report.append(doc)
             sbom_documents.append(doc)
