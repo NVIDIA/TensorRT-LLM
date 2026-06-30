@@ -46,7 +46,6 @@ import torch.nn.functional as F
 
 from tensorrt_llm.logger import logger
 
-
 # ---------------------------------------------------------------------------
 # Ulysses attention processor
 # ---------------------------------------------------------------------------
@@ -128,9 +127,7 @@ class HunyuanDiTUlyssesAttnProcessor:
             query = all_to_all_4d(
                 query, scatter_dim=2, gather_dim=1, process_group=self.ulysses_group
             )
-            key = all_to_all_4d(
-                key, scatter_dim=2, gather_dim=1, process_group=self.ulysses_group
-            )
+            key = all_to_all_4d(key, scatter_dim=2, gather_dim=1, process_group=self.ulysses_group)
             value = all_to_all_4d(
                 value, scatter_dim=2, gather_dim=1, process_group=self.ulysses_group
             )
@@ -144,9 +141,7 @@ class HunyuanDiTUlyssesAttnProcessor:
 
             # Reverse: [B, H/U, S, D] → [B, S, H/U, D] → [B, S/U, H, D]
             out = out.transpose(1, 2).contiguous()
-            out = all_to_all_4d(
-                out, scatter_dim=1, gather_dim=2, process_group=self.ulysses_group
-            )
+            out = all_to_all_4d(out, scatter_dim=1, gather_dim=2, process_group=self.ulysses_group)
         else:
             # Standard SDPA (cross-attention or single-GPU fallback)
             if attention_mask is not None:
@@ -257,12 +252,8 @@ class HunyuanDiT2DModelUlysses:
         encoder_hidden_states_t5 = encoder_hidden_states_t5.view(batch_size, seq_len_t5, -1)
 
         # Concatenate CLIP + T5 text embeddings
-        encoder_hidden_states = torch.cat(
-            [encoder_hidden_states, encoder_hidden_states_t5], dim=1
-        )
-        text_embedding_mask = torch.cat(
-            [text_embedding_mask, text_embedding_mask_t5], dim=-1
-        )
+        encoder_hidden_states = torch.cat([encoder_hidden_states, encoder_hidden_states_t5], dim=1)
+        text_embedding_mask = torch.cat([text_embedding_mask, text_embedding_mask_t5], dim=-1)
         text_embedding_mask = text_embedding_mask.unsqueeze(2).bool()
         encoder_hidden_states = torch.where(
             text_embedding_mask, encoder_hidden_states, self.text_embedding_padding
@@ -280,7 +271,9 @@ class HunyuanDiT2DModelUlysses:
                 f"(height // vae_scale_factor // patch_size)^2 is divisible by ulysses_size."
             )
         shard_size = S // ulysses_size
-        hidden_states = hidden_states[:, rank * shard_size : (rank + 1) * shard_size, :].contiguous()
+        hidden_states = hidden_states[
+            :, rank * shard_size : (rank + 1) * shard_size, :
+        ].contiguous()
 
         # Shard the RoPE frequencies to match the sequence shard
         if image_rotary_emb is not None:

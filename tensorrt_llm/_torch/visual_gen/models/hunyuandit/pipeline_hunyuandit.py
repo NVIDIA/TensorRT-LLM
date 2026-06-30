@@ -22,7 +22,6 @@ import math
 import time
 from typing import List, Optional, Tuple, Union
 
-import numpy as np
 import torch
 
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
@@ -51,9 +50,7 @@ _SUPPORTED_SHAPE_BINNING = (
 )
 
 
-def _map_to_standard_shapes(
-    target_height: int, target_width: int
-) -> Tuple[int, int]:
+def _map_to_standard_shapes(target_height: int, target_width: int) -> Tuple[int, int]:
     """Return the closest supported (height, width) pair.
 
     Matching strategy: minimise the Euclidean distance in log-space between
