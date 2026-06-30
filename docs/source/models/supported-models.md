@@ -116,6 +116,26 @@ Note:
 - V: Video
 - A: Audio
 
+## Multimodal Encoder Optimizations
+
+The following optimizations are available to models that implement
+`MultimodalModelMixin`. Currently, only `Mistral3ForConditionalGeneration` supports them.
+
+| Model Architecture | Multimodal Encoder Side Stream | Multimodal Embeddings Cache |
+| ------------------ | ------------------------------ | --------------------------- |
+| `Mistral3ForConditionalGeneration` | Yes | Yes |
+
+- **Multimodal encoder side stream** prefetches encoder work for pending requests on a separate
+  CUDA stream, allowing it to overlap with work on the main stream. Set
+  `multimodal_config.encoder_side_stream_max_ahead` to a positive value to enable it; the value
+  limits the number of prefetched requests that can be ahead of admission. This option is mutually
+  exclusive with `multimodal_config.encoder_cuda_graph` and can increase peak GPU memory use.
+- **Multimodal embeddings cache** is a per-model, cross-request LRU cache of encoder embeddings.
+  Set `multimodal_config.encoder_cache_max_bytes` to its capacity (for example, `"512MiB"`), or
+  `0` to disable it. Entries are cached per multimodal item, but a request reuses cached embeddings
+  only when all of its items hit the cache. At present, only single-modality requests are cacheable;
+  mixed-modality requests bypass the cache.
+
 # Visual Generation Models
 
 TensorRT-LLM provides beta support for diffusion-based image and video generation.
