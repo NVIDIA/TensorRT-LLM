@@ -226,7 +226,14 @@ class KVCacheManagerConfig:
     ssm_reuse_interval: int = 512
     """
     Interval (in tokens) at which SSM state is snapshotted for prefix reuse.
-    Must be a positive multiple of tokens_per_block. Only takes effect when SSM layers are present.
+    Must be 0, or a positive multiple of tokens_per_block. 0 disables regular
+    snapshots and requires mamba_save_last_snapshot=True. Only takes effect
+    when SSM layers are present.
+    """
+
+    mamba_save_last_snapshot: bool = False
+    """
+    Whether to snapshot the final SSM state at the end of prefill for prefix reuse.
     """
 
     swa_scratch_reuse: SwaScratchReuseConfig | None = None
@@ -267,11 +274,16 @@ class KVCacheManagerConfig:
             for buffer in layer.buffers
         )
         if any(layer.type == LayerType.SSM for layer in self.layers):
-            assert self.ssm_reuse_interval > 0, "ssm_reuse_interval must be positive"
-            assert self.ssm_reuse_interval % self.tokens_per_block == 0, (
-                f"ssm_reuse_interval ({self.ssm_reuse_interval}) must be a multiple of "
-                f"tokens_per_block ({self.tokens_per_block})"
-            )
+            assert self.ssm_reuse_interval >= 0, "ssm_reuse_interval must be non-negative"
+            if self.ssm_reuse_interval == 0:
+                assert self.mamba_save_last_snapshot, (
+                    "mamba_save_last_snapshot must be True when ssm_reuse_interval is 0"
+                )
+            else:
+                assert self.ssm_reuse_interval % self.tokens_per_block == 0, (
+                    f"ssm_reuse_interval ({self.ssm_reuse_interval}) must be a multiple of "
+                    f"tokens_per_block ({self.tokens_per_block})"
+                )
             assert not self.enable_partial_reuse, (
                 "enable_partial_reuse must be False when SSM layers are present"
             )

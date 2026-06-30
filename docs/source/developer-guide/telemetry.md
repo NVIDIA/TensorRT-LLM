@@ -25,7 +25,7 @@ unset or when the safety sanitizer rejects the runtime value.
 
 ### `TorchLlmArgs`
 
-234 captured fields.
+237 captured fields.
 
 | Captured key | Annotation | Kind | Converter | Allowed values |
 |--------------|------------|------|-----------|----------------|
@@ -95,13 +95,16 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.attention_dp_events_gather_period_ms` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.copy_on_partial_reuse` | `<class 'bool'>` | `value` |  |  |
 | `kv_cache_config.cross_kv_cache_fraction` | `Optional[float]` | `value` |  |  |
+| `kv_cache_config.disk_cache_size` | `Optional[Annotated[int, Ge(ge=0)]]` | `value` |  |  |
 | `kv_cache_config.dtype` | `<class 'str'>` | `categorical` | allowlist | `auto`, `float16`, `bfloat16`, `float32`, `fp8`, `nvfp4` |
 | `kv_cache_config.enable_block_reuse` | `<class 'bool'>` | `value` |  |  |
+| `kv_cache_config.enable_kv_pool_rebalance` | `<class 'bool'>` | `value` |  |  |
 | `kv_cache_config.enable_partial_reuse` | `<class 'bool'>` | `value` |  |  |
 | `kv_cache_config.event_buffer_max_size` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.free_gpu_memory_fraction` | `Optional[float]` | `value` |  |  |
 | `kv_cache_config.host_cache_size` | `Optional[int]` | `value` |  |  |
 | `kv_cache_config.iteration_stats_interval` | `<class 'int'>` | `value` |  |  |
+| `kv_cache_config.mamba_save_last_snapshot` | `<class 'bool'>` | `value` |  |  |
 | `kv_cache_config.mamba_ssm_cache_dtype` | `Literal['auto', 'float16', 'bfloat16', 'float32']` | `categorical` |  | `auto`, `float16`, `bfloat16`, `float32` |
 | `kv_cache_config.mamba_ssm_philox_rounds` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.mamba_ssm_stochastic_rounding` | `<class 'bool'>` | `value` |  |  |
@@ -266,7 +269,7 @@ unset or when the safety sanitizer rejects the runtime value.
 
 ### `TrtLlmArgs`
 
-260 captured fields.
+263 captured fields.
 
 | Captured key | Annotation | Kind | Converter | Allowed values |
 |--------------|------------|------|-----------|----------------|
@@ -383,13 +386,16 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.attention_dp_events_gather_period_ms` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.copy_on_partial_reuse` | `<class 'bool'>` | `value` |  |  |
 | `kv_cache_config.cross_kv_cache_fraction` | `Optional[float]` | `value` |  |  |
+| `kv_cache_config.disk_cache_size` | `Optional[Annotated[int, Ge(ge=0)]]` | `value` |  |  |
 | `kv_cache_config.dtype` | `<class 'str'>` | `categorical` | allowlist | `auto`, `float16`, `bfloat16`, `float32`, `fp8`, `nvfp4` |
 | `kv_cache_config.enable_block_reuse` | `<class 'bool'>` | `value` |  |  |
+| `kv_cache_config.enable_kv_pool_rebalance` | `<class 'bool'>` | `value` |  |  |
 | `kv_cache_config.enable_partial_reuse` | `<class 'bool'>` | `value` |  |  |
 | `kv_cache_config.event_buffer_max_size` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.free_gpu_memory_fraction` | `Optional[float]` | `value` |  |  |
 | `kv_cache_config.host_cache_size` | `Optional[int]` | `value` |  |  |
 | `kv_cache_config.iteration_stats_interval` | `<class 'int'>` | `value` |  |  |
+| `kv_cache_config.mamba_save_last_snapshot` | `<class 'bool'>` | `value` |  |  |
 | `kv_cache_config.mamba_ssm_cache_dtype` | `Literal['auto', 'float16', 'bfloat16', 'float32']` | `categorical` |  | `auto`, `float16`, `bfloat16`, `float32` |
 | `kv_cache_config.mamba_ssm_philox_rounds` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.mamba_ssm_stochastic_rounding` | `<class 'bool'>` | `value` |  |  |

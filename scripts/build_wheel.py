@@ -402,21 +402,26 @@ def generate_python_stubs_linux(venv_python: Path, deep_ep: bool,
         link_dir = None
 
     try:
-        build_run(f"\"{venv_python}\" -m nanobind.stubgen -m bindings -r -O .",
-                  env=env_stub_gen)
-        # Pre-import torch so deep_gemm_cpp_tllm's FP4 scalar-type registration
-        # succeeds; CLI args after `-c ...` land in sys.argv[1:] for argparse.
+        # Pre-import torch so extension modules can resolve torch/c10 symbols.
+        # CLI args after `-c ...` land in sys.argv[1:] for argparse.
+        build_run(
+            f"\"{venv_python}\" -c 'import torch; from nanobind.stubgen import main; main()' "
+            "-m bindings -r -O .",
+            env=env_stub_gen)
+        # Also needed by deep_gemm_cpp_tllm's FP4 scalar-type registration.
         build_run(
             f"\"{venv_python}\" -c 'import torch; from pybind11_stubgen import main; main()' "
             "-o . deep_gemm_cpp_tllm --exit-code",
             env=env_stub_gen)
         if flash_mla:
             build_run(
-                f"\"{venv_python}\" -m pybind11_stubgen -o . flash_mla_cpp_tllm --exit-code",
+                f"\"{venv_python}\" -c 'import torch; from pybind11_stubgen import main; main()' "
+                "-o . flash_mla_cpp_tllm --exit-code",
                 env=env_stub_gen)
         if deep_ep:
             build_run(
-                f"\"{venv_python}\" -m pybind11_stubgen -o . deep_ep_cpp_tllm --exit-code",
+                f"\"{venv_python}\" -c 'import torch; from pybind11_stubgen import main; main()' "
+                "-o . deep_ep_cpp_tllm --exit-code",
                 env=env_stub_gen)
         if transfer_agent_binding:
             # Generate stubs for tensorrt_llm_transfer_agent_binding

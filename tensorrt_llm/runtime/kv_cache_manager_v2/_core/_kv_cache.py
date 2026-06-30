@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from itertools import chain
 from typing import TYPE_CHECKING, Callable, ClassVar, Iterator, NamedTuple, Type, cast
 
+import cuda.bindings.driver as drv
+
 from .. import rawref
 from .._block_radix_tree import Block, ReuseMatch, ReuseScope, RootBlock, UselessBlockError
 from .._common import (
@@ -68,6 +70,7 @@ from .._utils import (
     CachedCudaEvent,
     HalfOpenRange,
     TypedIndexList,
+    _unwrap,
     div_up,
     expect_type,
     filled_list,
@@ -910,7 +913,7 @@ class _KVCache:
     # Users promise to not commit any more tokens. For cases where we shouldn't reuse generated tokens
     # (eg. CoT), this helps us drop (instead of evict) out-of-window blocks for SWA layers.
     # If there is a uncommitted block containing committed tokens, we will commit the block immediately.
-    def stop_committing(self) -> None:
+    def stop_committing(self, save_last_ssm_snapshot: bool = False) -> None:
         assert self.status != self.Status.CLOSED
         if self._commit_state == self.CommitState.USER_STOP:
             return
@@ -922,8 +925,10 @@ class _KVCache:
         if self.num_committed_tokens % self.tokens_per_block != 0:
             ordinal = _KVCache._to_block_ordinal(self.tokens_per_block, self.num_committed_tokens)
             with self._record_event():
-                self._commit_block(ordinal, True)
+                self._commit_block(ordinal, True, save_last_ssm_snapshot)
         else:
+            if save_last_ssm_snapshot:
+                self._snapshot_last_committed_ssm_block()
             self._commit_state = self.CommitState.USER_STOP
             self._on_stop_committing()
         # TODO: check if the last committed pages are usable, in case some prior pages are already
@@ -1056,11 +1061,11 @@ class _KVCache:
             )
             # Phase 1: Copy GPU→GPU from locked source pages to pre-allocated slots.
             src_locks: list[_SharedPageLock] = []
-            gpu_tier = storage.cache_tiers[GPU_LEVEL]
             # wait for all new slots to be ready
             stream_wait_events(
                 self.cuda_stream, (slot.ready_event for slot in deferred_slots if slot is not None)
             )
+            gpu_tier = storage.cache_tiers[GPU_LEVEL]
             for lc_idx, new_slot in typed_enumerate(deferred_slots):
                 if new_slot is None:
                     continue
@@ -1264,15 +1269,19 @@ class _KVCache:
             for p in typed_range(storage.num_pools(pg_idx)):
                 dst = storage.slot_address(lvl, pg_idx, new_slot.slot_id, p)
                 src = storage.slot_address(src_page.cache_level, pg_idx, src_page.slot_id, p)
-                batched_copy(
-                    storage.cache_tiers[lvl],
-                    storage.cache_tiers[src_page.cache_level],
-                    slot_size[p],
-                    [CopyTask(dst, src)],
-                    cuda_stream,
-                )
+                if lvl == GPU_LEVEL and src_page.cache_level == GPU_LEVEL:
+                    _unwrap(drv.cuMemcpyDtoDAsync(dst, src, slot_size[p], cuda_stream))
+                else:
+                    batched_copy(
+                        storage.cache_tiers[lvl],
+                        storage.cache_tiers[src_page.cache_level],
+                        slot_size[p],
+                        [CopyTask(dst, src)],
+                        cuda_stream,
+                    )
             ready_event = CachedCudaEvent(cuda_stream)
-            assert self.tokens_per_block * (tree_block.ordinal + 1) == self.num_committed_tokens
+            block_end = tree_block.ordinal * self.tokens_per_block + len(tree_block.tokens)
+            assert block_end == self.num_committed_tokens
             temp_page = UncommittedPage(
                 self, tree_block.ordinal, ssm_lc_id, lvl, new_slot, beam_idx
             )
@@ -1284,7 +1293,34 @@ class _KVCache:
         else:
             return  # No pages available in any level, silently skip snapshot
 
-    def _commit_block(self, ordinal: BlockOrdinal, is_last: bool) -> None:
+    def _should_snapshot_ssm_block(
+        self, ordinal: BlockOrdinal, is_last: bool, save_last_ssm_snapshot: bool
+    ) -> bool:
+        num_committed = self.num_committed_tokens
+        if num_committed == 0:
+            return False
+        block_end = min((ordinal + 1) * self.tokens_per_block, num_committed)
+        if block_end != num_committed:
+            return False
+        interval = self.manager.ssm_reuse_interval
+        return (interval > 0 and num_committed % interval == 0) or (
+            is_last and save_last_ssm_snapshot
+        )
+
+    def _snapshot_last_committed_ssm_block(self) -> None:
+        ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
+        if ssm_lc_id is None or self.num_committed_tokens == 0:
+            return
+        ordinal = _KVCache._to_block_ordinal(self.tokens_per_block, self.num_committed_tokens - 1)
+        if ordinal >= self._num_committed_blocks:
+            return
+        tree_block = self._get_tree_block(ordinal)
+        if tree_block.storage[ssm_lc_id] is None:
+            self._snapshot_ssm_to_tree_block(tree_block, ssm_lc_id, DEFAULT_BEAM_INDEX)
+
+    def _commit_block(
+        self, ordinal: BlockOrdinal, is_last: bool, save_last_ssm_snapshot: bool = False
+    ) -> None:
         "Commit the block for reuse. Block must be full of tokens except for the last block."
         assert self._commit_state == self.CommitState.ALLOWED
         assert (
@@ -1301,13 +1337,22 @@ class _KVCache:
         is_full = num_tokens == tokens_per_block
         if not is_last and not is_full:
             raise LogicError("Cannot commit block that is not full except last block")
+        ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
+        should_snapshot_ssm = ssm_lc_id is not None and self._should_snapshot_ssm_block(
+            ordinal, is_last, save_last_ssm_snapshot
+        )
         prev: RootBlock | Block
         if ordinal == 0:
             prev = self.manager._radix_tree.add_or_get_existing(self._reuse_scope)
         else:
             prev = self._get_tree_block(BlockOrdinal(ordinal - 1))
         try:
-            tree_block = Block(tokens, prev)
+            tree_block = Block(
+                tokens,
+                prev,
+                allow_covered_partial=should_snapshot_ssm,
+                protected_life_cycles=(ssm_lc_id,) if ssm_lc_id is not None else (),
+            )
             is_new = True
         except UselessBlockError as e:
             tree_block = e.block
@@ -1315,7 +1360,6 @@ class _KVCache:
             is_new = False
 
         assert tree_block.tokens_per_block == tokens_per_block
-        ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
         if is_new:
             # We are the only writer to padding. Other _KVCache reusing it should make copies.
             skip_lcs = {ssm_lc_id} if ssm_lc_id is not None else None
@@ -1336,12 +1380,7 @@ class _KVCache:
             # whose end equals num_committed_tokens and that count is a
             # non-zero multiple of the reuse interval.
             if ssm_lc_id is not None:
-                num_committed = self.num_committed_tokens
-                block_end = (ordinal + 1) * tokens_per_block
-                if (
-                    block_end == num_committed
-                    and num_committed % self.manager.ssm_reuse_interval == 0
-                ):
+                if should_snapshot_ssm:
                     self._snapshot_ssm_to_tree_block(tree_block, ssm_lc_id, beam_idx)
                 else:
                     tree_block.storage[ssm_lc_id] = None
@@ -1388,6 +1427,10 @@ class _KVCache:
             seq_block.tree_block = tree_block
             assert self._get_tree_block(ordinal) is tree_block
             self._num_committed_blocks = BlockOrdinal(ordinal + 1)
+        elif should_snapshot_ssm:
+            if tree_block.storage[ssm_lc_id] is None:
+                self._snapshot_ssm_to_tree_block(tree_block, ssm_lc_id, beam_idx)
+            self._commit_state = self.CommitState.VIRTUAL_STOP
         else:
             # We can't commit and can't reuse existing block. Just stop committing.
             self._commit_state = self.CommitState.VIRTUAL_STOP

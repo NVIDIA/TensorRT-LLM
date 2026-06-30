@@ -29,19 +29,28 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
+    KVCacheManagerV2, Role)
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     ATTENTION_DP_DUMMY_REQUEST_ID, LlmRequest)
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager,
     PoolConfiguration, get_pp_layers)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._utils import (nvtx_range, prefer_pinned,
+from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
+                                 nvtx_range, prefer_pinned,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings.internal.batch_manager import (
     LinearAttentionMetadata, LinearCacheType)
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (AttentionLayerConfig,
+                                                      BufferConfig,
+                                                      CacheTierConfig)
+from tensorrt_llm.runtime.kv_cache_manager_v2 import \
+    KVCacheManagerConfig as KVCacheManagerConfigPy
+from tensorrt_llm.runtime.kv_cache_manager_v2 import LayerId, SsmLayerConfig
 
 RnnStateManagerCpp = tensorrt_llm.bindings.internal.batch_manager.RnnStateManager
 WorldConfig = tensorrt_llm.bindings.WorldConfig
@@ -1314,22 +1323,23 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
 
 def calc_context_stop_positions(prompt_len: int,
                                 tokens_per_block: int,
-                                mamba_state_cache_interval: int,
+                                mamba_state_cache_interval: Optional[int],
                                 save_last_snapshot: bool = False) -> list[int]:
     """Compute token positions at which mamba state snapshots should be saved.
 
     Returns positions spaced by ``mamba_state_cache_interval`` plus the final
-    prompt length (and optionally the last block-aligned position).
+    prompt length. ``tokens_per_block`` and ``save_last_snapshot`` are kept in
+    the signature because V1 used them to derive a block-aligned tail point;
+    V2 can snapshot the exact prompt end even when the last block is partial.
     """
-    stop_positions = list(
-        range(mamba_state_cache_interval, prompt_len,
-              mamba_state_cache_interval))
-    last_ckpt = prompt_len // tokens_per_block * tokens_per_block
-    if save_last_snapshot and (last_ckpt not in stop_positions):
-        stop_positions.append(last_ckpt)
-    if prompt_len not in stop_positions:
-        stop_positions.append(prompt_len)
-    return stop_positions
+    del tokens_per_block, save_last_snapshot
+    stop_positions = []
+    if mamba_state_cache_interval is not None and mamba_state_cache_interval > 0:
+        stop_positions.extend(
+            range(mamba_state_cache_interval, prompt_len,
+                  mamba_state_cache_interval))
+    stop_positions.append(prompt_len)
+    return sorted({pos for pos in stop_positions if 0 < pos <= prompt_len})
 
 
 @triton.jit
@@ -1743,16 +1753,19 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             mapping.pp_layers(params.num_mamba_layers))
         state_bytes_per_rank = num_mamba_layers_per_rank * state_bytes_per_layer
 
-        # Per-request fixed cost. STATIC_SLOTS_PER_REQUEST = 1 today (the
-        # live mamba state); fixed-position snapshots are not yet
-        # implemented and would simply increment this constant. With
-        # pipeline parallelism, multiple microbatches are in-flight
-        # concurrently on the same rank, so each rank holds Mamba state
-        # for up to ``max_batch_size * pp_size`` concurrent sequences.
-        STATIC_SLOTS_PER_REQUEST = 1
+        saves_last_snapshot = (kv_cache_config.enable_block_reuse
+                               and kv_cache_config.mamba_save_last_snapshot)
+
+        # Per-request fixed cost: one live mamba state, plus one optional
+        # final snapshot when save-last reuse is enabled. With pipeline
+        # parallelism, multiple microbatches are in-flight concurrently on the
+        # same rank, so each rank holds Mamba state for up to
+        # ``max_batch_size * pp_size`` concurrent sequences.
+        live_slots_per_request = 1
+        last_snapshot_slots_per_request = 1 if saves_last_snapshot else 0
         pp_size = mapping.pp_size if mapping is not None else 1
         intercept = (max_batch_size * pp_size * state_bytes_per_rank *
-                     STATIC_SLOTS_PER_REQUEST)
+                     (live_slots_per_request + last_snapshot_slots_per_request))
 
         # Regular-snapshot bytes per token. None / non-positive intervals
         # mean "no regular snapshots", so the mamba contribution is zero.
@@ -1766,7 +1779,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         # So we ignore intercept and only calculate max_tokens based on slope
         # This can be improved by a more accurate max_batch_size and ISL/OSL estimation in the future.
         if mamba_slope > 0:
-            intercept = 0
+            intercept = (max_batch_size * pp_size * state_bytes_per_rank *
+                         last_snapshot_slots_per_request)
         return attention_slope + mamba_slope, intercept
 
     def shutdown(self):
@@ -2388,3 +2402,882 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         """Return the persistent (cache_size,) int64 Philox seed buffer or
         None when stochastic rounding is not active for this manager."""
         return getattr(self, 'mamba_ssm_rand_seed', None)
+
+
+class KVCacheManagerV2MambaHybridCacheManager(KVCacheManagerV2,
+                                              MambaHybridCacheManager):
+    """Hybrid Mamba cache manager backed by KVCacheManagerV2.
+
+    Attention KV pages and Mamba recurrent-state pages are both owned by the
+    Python V2 cache manager.  Mamba layers are represented as V2 SSM layers,
+    while this wrapper exposes the state tensors and slot indices expected by
+    the PyTorch Mamba kernels.
+    """
+
+    def __init__(
+        self,
+        # mamba cache parameters
+        mamba_d_state: int,
+        mamba_d_conv: int,
+        mamba_num_heads: int,
+        mamba_n_groups: int,
+        mamba_head_dim: int,
+        mamba_num_layers: int,
+        mamba_layer_mask: List[bool],
+        mamba_cache_dtype: torch.dtype,
+        mamba_ssm_cache_dtype: torch.dtype,
+        kv_cache_config: KvCacheConfig,
+        kv_cache_type: CacheTypeCpp,
+        *,
+        num_layers: int,
+        num_kv_heads: Union[int, List[Optional[int]]],
+        head_dim: int,
+        tokens_per_block: int,
+        max_seq_len: int,
+        max_batch_size: int,
+        mapping: Mapping,
+        dtype: DataType = DataType.HALF,
+        spec_config: Optional["DecodingBaseConfig"] = None,
+        layer_mask: Optional[List[bool]] = None,
+        is_estimating_kv_cache: bool = False,
+        is_draft: bool = False,
+        use_replay_state_update: bool = False,
+        mamba_ssm_stochastic_rounding: bool = False,
+        model_type: str = "nemotron_hybrid",
+        **kwargs,
+    ) -> None:
+        total_layers = len(mamba_layer_mask)
+        if layer_mask is None:
+            full_attention_layer_mask = [False] * total_layers
+        elif len(layer_mask) != total_layers:
+            raise ValueError(
+                f"layer_mask length ({len(layer_mask)}) must match "
+                f"mamba_layer_mask length ({total_layers})")
+        else:
+            full_attention_layer_mask = list(layer_mask)
+
+        combined_layer_mask = [
+            mamba_layer_mask[i] or full_attention_layer_mask[i]
+            for i in range(total_layers)
+        ]
+
+        self._mamba_layer_mask = list(mamba_layer_mask)
+        self._full_attention_layer_mask = full_attention_layer_mask
+        self._combined_layer_mask = combined_layer_mask
+        self.requests = []
+        self._use_replay_state_update = use_replay_state_update
+        self.replay_step_width: Optional[int] = (
+            spec_config.tokens_per_gen_step
+            if spec_config is not None and use_replay_state_update else None)
+        self.replay_history_size: Optional[int] = self.replay_step_width
+        self._mamba_ssm_stochastic_rounding = mamba_ssm_stochastic_rounding
+        self._seed_rank_offset = _mamba_rank_offset(mapping)
+        self._seed_request_counter = 0
+        self.ssm_state_dtype = (mamba_ssm_cache_dtype if mamba_ssm_cache_dtype
+                                is not None else mamba_cache_dtype)
+        self.conv_state_dtype = mamba_cache_dtype
+        self._mamba_state_cache_interval = (
+            kv_cache_config.mamba_state_cache_interval)
+        self._mamba_block_reuse_enabled = kv_cache_config.enable_block_reuse
+
+        self.pp_layers, _ = get_pp_layers(
+            mamba_num_layers + num_layers,
+            mapping,
+            spec_config=spec_config,
+            layer_mask=combined_layer_mask,
+        )
+        self.mamba_pp_layers = [
+            layer_idx for layer_idx in self.pp_layers
+            if mamba_layer_mask[layer_idx]
+        ]
+        self.local_num_mamba_layers = len(self.mamba_pp_layers)
+
+        if self.local_num_mamba_layers > 0:
+            tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
+            d_inner = mamba_head_dim * mamba_num_heads
+            conv_dim = d_inner + 2 * mamba_n_groups * mamba_d_state
+            nheads = mamba_num_heads
+            assert nheads % tp_size == 0, "mamba_num_heads must be divisible by tp_size"
+            assert conv_dim % tp_size == 0, "conv_dim must be divisible by tp_size"
+            if use_replay_state_update:
+                assert mamba_n_groups % tp_size == 0, \
+                    "replay state update requires mamba_n_groups divisible by tp_size"
+            self._n_groups_per_rank = mamba_n_groups // tp_size
+            conv_dim = conv_dim // tp_size
+            nheads = nheads // tp_size
+            self.conv_state_shape = [conv_dim, mamba_d_conv - 1]
+            self.ssm_state_shape = [nheads, mamba_head_dim, mamba_d_state]
+            self.ssm_count = math.prod(self.ssm_state_shape)
+            self.conv_count = math.prod(self.conv_state_shape)
+            self.ssm_bytes = self.ssm_count * self.ssm_state_dtype.itemsize
+            self.conv_bytes = self.conv_count * self.conv_state_dtype.itemsize
+        else:
+            logger.info(
+                "No local mamba layers for this rank, skipping mamba state views"
+            )
+            self._n_groups_per_rank = 0
+            self.conv_state_shape = []
+            self.ssm_state_shape = []
+            self.ssm_count = 0
+            self.conv_count = 0
+            self.ssm_bytes = 0
+            self.conv_bytes = 0
+
+        if isinstance(num_kv_heads, int):
+            per_layer_kv_heads = [num_kv_heads] * total_layers
+        else:
+            if len(num_kv_heads) != total_layers:
+                raise ValueError(
+                    f"num_kv_heads list length ({len(num_kv_heads)}) does not "
+                    f"match total layers ({total_layers})")
+            per_layer_kv_heads = list(num_kv_heads)
+        for i, is_mamba in enumerate(mamba_layer_mask):
+            if is_mamba:
+                per_layer_kv_heads[i] = 0
+
+        self._setup_mtp_intermediate_states(spec_config, max_batch_size)
+
+        kv_cache_config = kv_cache_config.model_copy(deep=True)
+        if any(mamba_layer_mask) and kv_cache_config.enable_partial_reuse:
+            logger.warning(
+                "Partial reuse is not supported for mamba hybrid models, disabling partial reuse"
+            )
+            kv_cache_config.enable_partial_reuse = False
+
+        super().__init__(
+            kv_cache_config,
+            kv_cache_type,
+            num_layers=mamba_num_layers + num_layers,
+            num_kv_heads=per_layer_kv_heads,
+            head_dim=head_dim,
+            tokens_per_block=tokens_per_block,
+            max_seq_len=max_seq_len,
+            max_batch_size=max_batch_size,
+            mapping=mapping,
+            dtype=dtype,
+            spec_config=spec_config,
+            layer_mask=combined_layer_mask,
+            is_draft=is_draft,
+            is_estimating_kv_cache=is_estimating_kv_cache,
+            **kwargs,
+        )
+
+        self.mamba_layer_offsets = {
+            layer_id: offset
+            for offset, layer_id in enumerate(self.mamba_pp_layers)
+        }
+        self.mamba_local_layer_ids = [
+            self.layer_offsets[layer_id] for layer_id in self.mamba_pp_layers
+        ]
+        self._request_id_to_state_index = {}
+        self.kv_cache_config = kv_cache_config
+        self.is_estimating_kv_cache = is_estimating_kv_cache
+
+        self.cuda_state_indices = torch.zeros([self.max_batch_size],
+                                              dtype=torch.int32,
+                                              device="cuda")
+        self._host_state_indices = torch.zeros([self.max_batch_size],
+                                               dtype=torch.int32,
+                                               pin_memory=prefer_pinned())
+
+        if self.local_num_mamba_layers > 0:
+            first_mamba_local_layer = self.mamba_local_layer_ids[0]
+            self.ssm_life_cycle_id = self.impl.get_layer_group_id(
+                LayerId(first_mamba_local_layer))
+            self._ssm_page_index_scale = self.impl.get_page_index_scale(
+                LayerId(first_mamba_local_layer), Role.SSM_STATE)
+            self._setup_states()
+            self._setup_replay_buffers(spec_config)
+        else:
+            self.ssm_life_cycle_id = None
+            self._ssm_page_index_scale = 1
+            self.all_ssm_states = []
+            self.all_conv_states = []
+            self._setup_replay_buffers(spec_config)
+
+    @staticmethod
+    def get_cache_size_per_token(model_config,
+                                 mapping: Mapping,
+                                 *,
+                                 max_batch_size: int,
+                                 kv_cache_config: KvCacheConfig,
+                                 num_layers: Optional[int] = None,
+                                 **kwargs):
+        return CppMambaHybridCacheManager.get_cache_size_per_token(
+            model_config,
+            mapping,
+            max_batch_size=max_batch_size,
+            kv_cache_config=kv_cache_config,
+            num_layers=num_layers,
+            **kwargs)
+
+    def _is_local_mamba_layer(self, local_layer_idx: int) -> bool:
+        return self._mamba_layer_mask[self.pp_layers[local_layer_idx]]
+
+    def _get_index_role_for_pool(self, pool_id: int):
+        layer_id = int(self.impl.layer_grouping[pool_id][0])
+        if self._is_local_mamba_layer(layer_id):
+            return Role.SSM_STATE
+        return Role.KEY
+
+    def _get_value_role_for_pool(self, pool_id: int):
+        layer_id = int(self.impl.layer_grouping[pool_id][0])
+        if self._is_local_mamba_layer(layer_id):
+            return None
+        return super()._get_value_role_for_pool(pool_id)
+
+    def _build_cache_config(
+        self,
+        kv_cache_config: KvCacheConfig,
+        *,
+        tokens_per_block: int,
+        vocab_size: Optional[int],
+        cache_tiers: List[CacheTierConfig],
+    ):
+        buffer_type = [Role.KEY]
+        if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
+            buffer_type.append(Role.VALUE)
+        if kv_cache_config.dtype == "nvfp4":
+            for layer_idx, hd in enumerate(self.head_dim_per_layer):
+                if self._is_local_mamba_layer(layer_idx):
+                    continue
+                assert hd % 2 == 0, (
+                    f"head_dim must be divisible by 2 for nvfp4 kv cache, "
+                    f"but layer {layer_idx} has head_dim={hd}")
+            buffer_type.append(Role.KEY_BLOCK_SCALE)
+            if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
+                buffer_type.append(Role.VALUE_BLOCK_SCALE)
+
+        layers = []
+        for local_layer_idx, global_layer_idx in enumerate(self.pp_layers):
+            layer_id = LayerId(local_layer_idx)
+            if self._mamba_layer_mask[global_layer_idx]:
+                layers.append(
+                    SsmLayerConfig(
+                        layer_id=layer_id,
+                        buffers=[
+                            BufferConfig(role=Role.SSM_STATE,
+                                         size=self.ssm_bytes),
+                            BufferConfig(role=Role.CONV_STATE,
+                                         size=self.conv_bytes),
+                        ],
+                    ))
+            else:
+                layers.append(
+                    AttentionLayerConfig(
+                        layer_id=layer_id,
+                        buffers=[
+                            BufferConfig(
+                                role=role,
+                                size=self.get_layer_bytes_per_token(
+                                    local_layer_idx=layer_id, data_role=role) *
+                                tokens_per_block,
+                            ) for role in buffer_type
+                        ],
+                        sliding_window_size=self.max_attention_window_vec[
+                            global_layer_idx %
+                            len(self.max_attention_window_vec)],
+                        num_sink_tokens=None,
+                    ))
+
+        return KVCacheManagerConfigPy(
+            tokens_per_block=tokens_per_block,
+            vocab_size=vocab_size,
+            cache_tiers=cache_tiers,
+            max_util_for_resume=kv_cache_config.max_util_for_resume,
+            layers=layers,
+            enable_partial_reuse=kv_cache_config.enable_partial_reuse,
+            ssm_reuse_interval=self._mamba_state_cache_interval,
+            mamba_save_last_snapshot=kv_cache_config.mamba_save_last_snapshot,
+        )
+
+    def _build_pool_mapping_tensors(self):
+        kv_cache_pool_pointers = torch.tensor(
+            [[
+                self.impl.get_mem_pool_base_address(
+                    self.impl.layer_grouping[pool_id][0],
+                    self._get_index_role_for_pool(pool_id)),
+                0,
+            ] for pool_id in range(self.num_pools)],
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=prefer_pinned(),
+        )
+
+        if self.dtype == DataType.NVFP4:
+            kv_cache_block_scale_pool_pointers = []
+            for pool_id in range(self.num_pools):
+                layer_id = self.impl.layer_grouping[pool_id][0]
+                if self._is_local_mamba_layer(int(layer_id)):
+                    kv_cache_block_scale_pool_pointers.append([0, 0])
+                else:
+                    kv_cache_block_scale_pool_pointers.append([
+                        self.impl.get_mem_pool_base_address(
+                            layer_id, Role.KEY_BLOCK_SCALE),
+                        0,
+                    ])
+            kv_cache_pool_pointers = torch.stack(
+                [
+                    kv_cache_pool_pointers,
+                    torch.tensor(
+                        kv_cache_block_scale_pool_pointers,
+                        dtype=torch.int64,
+                        device="cpu",
+                        pin_memory=prefer_pinned(),
+                    ),
+                ],
+                dim=-1,
+            )
+
+        kv_cache_pool_mapping_list = []
+        for local_layer_idx in range(self.num_local_layers):
+            layer_group_id = self.impl.get_layer_group_id(
+                LayerId(local_layer_idx))
+            if self._is_local_mamba_layer(local_layer_idx):
+                offset = 0
+            elif self.dtype != DataType.NVFP4:
+                addr_offset = (self.impl.get_mem_pool_base_address(
+                    LayerId(local_layer_idx), Role.KEY) -
+                               int(kv_cache_pool_pointers[layer_group_id][0]))
+                offset = addr_offset // (self.get_layer_bytes_per_token(
+                    local_layer_idx=LayerId(local_layer_idx),
+                    data_role=Role.KEY) * self.kv_factor *
+                                         self.tokens_per_block)
+            else:
+                addr_offset = (
+                    self.impl.get_mem_pool_base_address(
+                        LayerId(local_layer_idx), Role.KEY) -
+                    int(kv_cache_pool_pointers[layer_group_id][0][0]))
+                offset = addr_offset // (self.get_layer_bytes_per_token(
+                    local_layer_idx=LayerId(local_layer_idx),
+                    data_role=Role.KEY) * self.kv_factor *
+                                         self.tokens_per_block)
+            kv_cache_pool_mapping_list.append([layer_group_id, offset])
+
+        return (
+            kv_cache_pool_pointers,
+            torch.tensor(kv_cache_pool_mapping_list,
+                         dtype=torch.int32,
+                         device="cpu",
+                         pin_memory=prefer_pinned()),
+        )
+
+    def _get_state_buffer(self, local_layer_idx: int, role, dtype: torch.dtype,
+                          state_shape: List[int]) -> torch.Tensor:
+        addr = self.impl.get_mem_pool_base_address(LayerId(local_layer_idx),
+                                                   role)
+        num_pages = self.impl.get_page_index_upper_bound(
+            LayerId(local_layer_idx), role)
+        raw = convert_to_torch_tensor(
+            TensorWrapper(addr, dtype, [num_pages] + state_shape))
+        page_index_scale = self.impl.get_page_index_scale(
+            LayerId(local_layer_idx), role)
+        num_slots = (num_pages + page_index_scale - 1) // page_index_scale
+        # V2 coalesces same-size per-layer buffers inside each slot.  Kernels
+        # index Mamba states by logical slot id, so expose only this layer's
+        # sub-page from each coalesced slot instead of the raw page-index view.
+        return raw.as_strided(
+            [num_slots] + state_shape,
+            [raw.stride(0) * page_index_scale] + list(raw.stride()[1:]),
+        )
+
+    def _setup_states(self) -> None:
+        self.all_ssm_states = [
+            self._get_state_buffer(local_layer_idx, Role.SSM_STATE,
+                                   self.ssm_state_dtype, self.ssm_state_shape)
+            for local_layer_idx in self.mamba_local_layer_ids
+        ]
+        self.all_conv_states = [
+            self._get_state_buffer(local_layer_idx, Role.CONV_STATE,
+                                   self.conv_state_dtype, self.conv_state_shape)
+            for local_layer_idx in self.mamba_local_layer_ids
+        ]
+
+    def _setup_mtp_intermediate_states(self, spec_config,
+                                       max_batch_size) -> None:
+        self.spec_config = spec_config
+        self.intermediate_ssm_states = None
+        self.intermediate_conv_states = None
+        self.intermediate_state_indices = None
+        if self.spec_config is not None and self.local_num_mamba_layers > 0:
+            speculative_num_draft_tokens = self.spec_config.tokens_per_gen_step - 1
+            if not self._use_replay_state_update:
+                self.intermediate_ssm_states = torch.zeros(
+                    size=[
+                        self.local_num_mamba_layers, max_batch_size,
+                        speculative_num_draft_tokens + 1
+                    ] + self.ssm_state_shape,
+                    dtype=self.ssm_state_dtype,
+                    device="cuda",
+                )
+            self.intermediate_conv_states = torch.zeros(
+                size=[
+                    self.local_num_mamba_layers, max_batch_size,
+                    speculative_num_draft_tokens + 1
+                ] + self.conv_state_shape,
+                dtype=self.conv_state_dtype,
+                device="cuda",
+            )
+            self.intermediate_state_indices = torch.arange(max_batch_size,
+                                                           dtype=torch.int32,
+                                                           device="cuda")
+
+    def _setup_replay_buffers(self, spec_config) -> None:
+        self.prev_num_accepted_tokens = None
+        self.cache_buf_idx = None
+        self.mamba_ssm_rand_seed = None
+        self.old_x = None
+        self.old_B = None
+        self.old_dt = None
+        self.old_dA_cumsum = None
+
+        if (self.local_num_mamba_layers == 0
+                or (not self._use_replay_state_update
+                    and not self._mamba_ssm_stochastic_rounding)):
+            return
+
+        cache_size = self.all_ssm_states[0].shape[0]
+        assert all(t.shape[0] == cache_size for t in self.all_ssm_states)
+        device = self.all_ssm_states[0].device
+        self.mamba_ssm_rand_seed = _allocate_mamba_seed_buffer(
+            cache_size, self._seed_rank_offset, device)
+
+        if spec_config is None or not self._use_replay_state_update:
+            return
+
+        T = spec_config.tokens_per_gen_step
+        nheads, head_dim, d_state = self.ssm_state_shape
+        self.prev_num_accepted_tokens = torch.zeros(cache_size,
+                                                    dtype=torch.int32,
+                                                    device=device)
+        self.cache_buf_idx = torch.zeros(cache_size,
+                                         dtype=torch.int32,
+                                         device=device)
+        self.old_x = torch.zeros(self.local_num_mamba_layers,
+                                 cache_size,
+                                 2,
+                                 T,
+                                 nheads,
+                                 head_dim,
+                                 dtype=self.conv_state_dtype,
+                                 device=device)
+        self.old_B = torch.zeros(self.local_num_mamba_layers,
+                                 cache_size,
+                                 2,
+                                 T,
+                                 self._n_groups_per_rank,
+                                 d_state,
+                                 dtype=self.conv_state_dtype,
+                                 device=device)
+        self.old_dt = torch.zeros(self.local_num_mamba_layers,
+                                  cache_size,
+                                  2,
+                                  nheads,
+                                  T,
+                                  dtype=torch.float32,
+                                  device=device)
+        self.old_dA_cumsum = torch.zeros(self.local_num_mamba_layers,
+                                         cache_size,
+                                         2,
+                                         nheads,
+                                         T,
+                                         dtype=torch.float32,
+                                         device=device)
+
+    def get_cache_bytes_per_token(self) -> int:
+        data_roles = [Role.KEY]
+        if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
+            data_roles.append(Role.VALUE)
+        if self.dtype == DataType.NVFP4:
+            data_roles.append(Role.KEY_BLOCK_SCALE)
+            if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
+                data_roles.append(Role.VALUE_BLOCK_SCALE)
+
+        attention_bytes = 0
+        for local_layer_idx in range(self.num_local_layers):
+            if self._is_local_mamba_layer(local_layer_idx):
+                continue
+            for data_role in data_roles:
+                attention_bytes += self.get_layer_bytes_per_token(
+                    local_layer_idx=local_layer_idx, data_role=data_role)
+
+        if self._mamba_block_reuse_enabled and self._mamba_state_cache_interval:
+            attention_bytes += (self.local_num_mamba_layers *
+                                (self.ssm_bytes + self.conv_bytes) //
+                                self._mamba_state_cache_interval)
+        if attention_bytes == 0 and self.local_num_mamba_layers > 0:
+            return max(
+                1,
+                self.local_num_mamba_layers *
+                (self.ssm_bytes + self.conv_bytes))
+        return max(1, attention_bytes)
+
+    def get_num_free_blocks(self) -> int:
+        assert len(self.kv_cache_map) == 0, (
+            "get_num_free_blocks is only used when the kv cache manager is empty"
+        )
+        attention_pages = []
+        ssm_pages = []
+        for local_layer_idx in range(self.num_local_layers):
+            layer_id = LayerId(local_layer_idx)
+            if self._is_local_mamba_layer(local_layer_idx):
+                ssm_pages.append(
+                    self.impl.get_page_index_upper_bound(
+                        layer_id, Role.SSM_STATE) // self._ssm_page_index_scale)
+            else:
+                attention_pages.append(
+                    self.impl.get_page_index_upper_bound(layer_id, Role.KEY) //
+                    self.kv_factor)
+        if attention_pages:
+            return max(attention_pages)
+        return max(ssm_pages) if ssm_pages else 0
+
+    @property
+    def blocks_in_primary_pool(self) -> int:
+        for local_layer_idx in range(self.num_local_layers):
+            if self._is_local_mamba_layer(local_layer_idx):
+                continue
+            return self.impl.get_page_index_upper_bound(
+                LayerId(local_layer_idx), Role.KEY)
+        return 0
+
+    def get_buffers(self,
+                    layer_idx: int,
+                    kv_layout: str = "NHD") -> Optional[torch.Tensor]:
+        local_layer_idx = self.layer_offsets[layer_idx]
+        if self._is_local_mamba_layer(local_layer_idx):
+            return None
+        return super().get_buffers(layer_idx, kv_layout)
+
+    def check_invalid_values_in_kv_cache(self,
+                                         fill_with_zero: bool = False) -> bool:
+        some_checks_unavailable = False
+        has_invalid_values = torch.tensor([False],
+                                          dtype=torch.bool,
+                                          device=torch.cuda.current_device())
+        pool_handled = set()
+
+        for layer_id, layer_offset in self.layer_offsets.items():
+            if self._is_local_mamba_layer(layer_offset):
+                continue
+            pool_id = self.layer_to_pool_mapping_dict[layer_offset]
+            if pool_id in pool_handled:
+                continue
+            buffer = super().get_buffers(layer_id)
+            for i in range(0, buffer.shape[0], 256):
+                buffer_slice = buffer[i:i + 256]
+                try:
+                    has_invalid_values.logical_or_(
+                        torch.isnan(buffer_slice).any())
+                    has_invalid_values.logical_or_(
+                        torch.isinf(buffer_slice).any())
+                except NotImplementedError:
+                    some_checks_unavailable = True
+            if fill_with_zero:
+                buffer.zero_()
+            pool_handled.add(pool_id)
+        torch.cuda.synchronize()
+
+        if some_checks_unavailable:
+            logger.warning(
+                "`torch.isnan` or `torch.isinf` is not implemented for current kv cache dtype, "
+                "related checks are skipped")
+        return bool(has_invalid_values)
+
+    def add_dummy_requests(
+        self,
+        request_ids: List[int],
+        token_nums: Optional[List[int]] = None,
+        is_gen: bool = False,
+        prepare_resource: bool = True,
+        max_num_draft_tokens: int = 0,
+        kv_reserve_draft_tokens: Optional[int] = None,
+        use_mrope: bool = False,
+        max_beam_width: int = 1,
+        num_extra_decoding_steps: int = 0,
+        draft_kv_cache_manager: Optional[BaseResourceManager] = None,
+    ) -> List[LlmRequest]:
+        requests = super().add_dummy_requests(
+            request_ids=request_ids,
+            token_nums=token_nums,
+            is_gen=is_gen,
+            prepare_resource=prepare_resource,
+            max_num_draft_tokens=max_num_draft_tokens,
+            kv_reserve_draft_tokens=kv_reserve_draft_tokens,
+            use_mrope=use_mrope,
+            max_beam_width=max_beam_width,
+            num_extra_decoding_steps=num_extra_decoding_steps,
+            draft_kv_cache_manager=draft_kv_cache_manager,
+        )
+        if requests:
+            self.requests.extend(requests)
+            if prepare_resource:
+                self._setup_state_indices()
+        return requests
+
+    def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
+        if request in self.requests:
+            self.requests.remove(request)
+            self._request_id_to_state_index.pop(request.py_request_id, None)
+        super().free_resources(request, pin_on_release)
+
+    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+        super().prepare_resources(scheduled_batch)
+        if self.local_num_mamba_layers == 0:
+            return
+        self.requests = (scheduled_batch.context_requests +
+                         scheduled_batch.generation_requests)
+        self._setup_state_indices()
+        num_contexts = len(scheduled_batch.context_requests)
+        if num_contexts == 0:
+            return
+        ctx_slots = self.cuda_state_indices[:num_contexts].long()
+        if self._use_replay_state_update and self.prev_num_accepted_tokens is not None:
+            self.prev_num_accepted_tokens[ctx_slots] = 0
+            self.cache_buf_idx[ctx_slots] = 0
+            if self.old_x is not None:
+                self.old_x[:, ctx_slots] = 0
+            if self.old_B is not None:
+                self.old_B[:, ctx_slots] = 0
+            if self.old_dt is not None:
+                self.old_dt[:, ctx_slots] = 0
+            if self.old_dA_cumsum is not None:
+                self.old_dA_cumsum[:, ctx_slots] = 0
+        if self.mamba_ssm_rand_seed is not None:
+            self._seed_request_counter += 1
+            counter = self._seed_request_counter
+            rank_offset = self._seed_rank_offset
+            host_slots = ctx_slots.cpu().tolist()
+            new_seeds = [
+                _compute_deterministic_mamba_seed(counter, slot, rank_offset)
+                for slot in host_slots
+            ]
+            seed_tensor = torch.tensor(
+                new_seeds,
+                dtype=torch.int64,
+                device=self.mamba_ssm_rand_seed.device,
+            )
+            self.mamba_ssm_rand_seed[ctx_slots] = seed_tensor
+
+    def flush_state_transfers(self) -> None:
+        return
+
+    def update_resources(self,
+                         scheduled_batch: ScheduledRequests,
+                         attn_metadata: "AttentionMetadata" = None,
+                         kv_cache_dtype_byte_size: float = None):
+        super().update_resources(scheduled_batch, attn_metadata,
+                                 kv_cache_dtype_byte_size)
+
+    def _setup_state_indices(self) -> None:
+        if self.local_num_mamba_layers == 0:
+            return
+        n = len(self.requests)
+        self._host_state_indices.zero_()
+        if n > 0:
+            for i, req in enumerate(self.requests):
+                kv_cache = self.kv_cache_map.get(req.py_request_id)
+                if kv_cache is None:
+                    raise RuntimeError(
+                        f"Missing V2 KV cache for request {req.py_request_id}")
+                base_index = kv_cache.get_ssm_block_base_index(
+                    self.ssm_life_cycle_id)
+                if base_index < 0:
+                    raise RuntimeError(
+                        f"Invalid SSM state block index {base_index} for "
+                        f"request {req.py_request_id}")
+                self._host_state_indices[i] = base_index
+
+        self.cuda_state_indices.copy_(self._host_state_indices,
+                                      non_blocking=True)
+        for i, req in enumerate(self.requests):
+            self._request_id_to_state_index[
+                req.py_request_id] = self._host_state_indices[i].item()
+
+    def get_state_indices(self,
+                          request_ids: Optional[List[int]] = None,
+                          is_padding: Optional[List[bool]] = None):
+        if request_ids is not None:
+            return [self._request_id_to_state_index[rid] for rid in request_ids]
+        return self.cuda_state_indices
+
+    def get_max_resource_count(self) -> int:
+        return self.max_batch_size
+
+    def is_speculative(self) -> bool:
+        return self.spec_config is not None
+
+    def update_mamba_states(self,
+                            attn_metadata: "AttentionMetadata",
+                            num_accepted_tokens: torch.Tensor,
+                            state_indices: Optional[torch.Tensor] = None):
+        if self.local_num_mamba_layers == 0:
+            return
+        batch_size = attn_metadata.num_seqs
+        num_contexts = attn_metadata.num_contexts
+        num_gens = batch_size - num_contexts
+        num_accepted_draft_tokens = (
+            num_accepted_tokens[num_contexts:num_contexts + num_gens] - 1).to(
+                torch.int32)
+        if state_indices is None:
+            state_indices = self.get_state_indices()
+        state_indices_d = state_indices[num_contexts:num_contexts +
+                                        num_gens].to(torch.int32)
+        src_state_indices = self.intermediate_state_indices[:num_gens]
+
+        if self._use_replay_state_update:
+            slots = state_indices_d.long()
+            accepted = num_accepted_tokens[num_contexts:num_contexts + num_gens]
+            self.prev_num_accepted_tokens[slots] = accepted.to(
+                self.prev_num_accepted_tokens.dtype)
+            self.cache_buf_idx[slots] = 1 - self.cache_buf_idx[slots]
+        else:
+            for layer_offset, dst in enumerate(self.all_ssm_states):
+                _promote_mamba_state_triton(
+                    dst.unsqueeze(0),
+                    self.intermediate_ssm_states[layer_offset:layer_offset + 1],
+                    src_state_indices,
+                    num_accepted_draft_tokens,
+                    state_indices_d,
+                )
+
+        for layer_offset, dst in enumerate(self.all_conv_states):
+            _promote_mamba_state_triton(
+                dst.unsqueeze(0),
+                self.intermediate_conv_states[layer_offset:layer_offset + 1],
+                src_state_indices,
+                num_accepted_draft_tokens,
+                state_indices_d,
+            )
+
+    def get_ssm_states(self, layer_idx: int) -> torch.Tensor:
+        return self.all_ssm_states[self.mamba_layer_offsets[layer_idx]]
+
+    def get_conv_states(self, layer_idx: int) -> torch.Tensor:
+        return self.all_conv_states[self.mamba_layer_offsets[layer_idx]]
+
+    def get_intermediate_ssm_states(self,
+                                    layer_idx: int) -> Optional[torch.Tensor]:
+        if self.intermediate_ssm_states is None:
+            return None
+        layer_offset = self.mamba_layer_offsets[layer_idx]
+        return self.intermediate_ssm_states[layer_offset]
+
+    def get_intermediate_conv_states(self,
+                                     layer_idx: int) -> Optional[torch.Tensor]:
+        if self.intermediate_conv_states is None:
+            return None
+        layer_offset = self.mamba_layer_offsets[layer_idx]
+        return self.intermediate_conv_states[layer_offset]
+
+    def mamba_layer_cache(
+        self, layer_idx: int
+    ) -> Union[PythonMambaCacheManager.State,
+               PythonMambaCacheManager.SpeculativeState, None]:
+        conv = self.get_conv_states(layer_idx)
+        ssm = self.get_ssm_states(layer_idx)
+        if self.spec_config is not None:
+            layer_offset = self.mamba_layer_offsets[layer_idx]
+            spec_kwargs = {}
+            if self.mamba_ssm_rand_seed is not None:
+                spec_kwargs['mamba_ssm_rand_seed'] = self.mamba_ssm_rand_seed
+            if self._use_replay_state_update:
+                spec_kwargs['old_x'] = self.old_x[layer_offset]
+                spec_kwargs['old_B'] = self.old_B[layer_offset]
+                spec_kwargs['old_dt'] = self.old_dt[layer_offset]
+                spec_kwargs['old_dA_cumsum'] = self.old_dA_cumsum[layer_offset]
+                spec_kwargs['cache_buf_idx'] = self.cache_buf_idx
+                spec_kwargs['prev_num_accepted_tokens'] = (
+                    self.prev_num_accepted_tokens)
+            else:
+                spec_kwargs['intermediate_ssm'] = self.intermediate_ssm_states[
+                    layer_offset]
+            return PythonMambaCacheManager.SpeculativeState(
+                conv=conv,
+                temporal=ssm,
+                intermediate_conv_window=self.
+                intermediate_conv_states[layer_offset],
+                **spec_kwargs,
+            )
+        return PythonMambaCacheManager.State(conv=conv, temporal=ssm)
+
+    def prepare_expect_chunking_points(self,
+                                       requests: List[LlmRequest]) -> None:
+        """Set absolute context positions where FORCE_CHUNK should stop."""
+        if not self.kv_cache_config.enable_block_reuse:
+            for request in requests:
+                request.expect_chunking_points = None
+            return
+
+        interval = self._mamba_state_cache_interval
+        save_last_snapshot = self.kv_cache_config.mamba_save_last_snapshot
+        if (interval is None or interval <= 0) and not save_last_snapshot:
+            for request in requests:
+                request.expect_chunking_points = None
+            return
+
+        for request in requests:
+            request.expect_chunking_points = calc_context_stop_positions(
+                request.prompt_len, self.tokens_per_block, interval,
+                save_last_snapshot)
+
+    def calc_next_context_chunk_size(self, request: LlmRequest) -> int:
+        prompt_len = request.prompt_len
+        current = request.context_current_position
+        if current >= prompt_len:
+            return 0
+        if not self.kv_cache_config.enable_block_reuse:
+            assert current == 0, (
+                "Expected context_current_position to be 0 when block reuse "
+                f"is disabled, but got {current}")
+            return prompt_len - current
+        step = self._mamba_state_cache_interval
+        stop_positions = calc_context_stop_positions(
+            prompt_len, self.tokens_per_block, step,
+            self.kv_cache_config.mamba_save_last_snapshot)
+        stop_positions = sorted(set(stop_positions))
+        for pos in stop_positions:
+            if pos > current:
+                return pos - current
+        return prompt_len - current
+
+    @property
+    def use_replay_state_update(self) -> bool:
+        return self.get_replay_state_update_metadata() is not None
+
+    def get_replay_state_update_metadata(
+            self) -> Optional[ReplayStateUpdateMetadata]:
+        prev_num_accepted_tokens = getattr(self, 'prev_num_accepted_tokens',
+                                           None)
+        cache_buf_idx = getattr(self, 'cache_buf_idx', None)
+        if (not self._use_replay_state_update
+                or prev_num_accepted_tokens is None or cache_buf_idx is None
+                or self.replay_step_width is None
+                or self.replay_history_size is None):
+            return None
+        return ReplayStateUpdateMetadata(
+            prev_num_accepted_tokens=prev_num_accepted_tokens,
+            cache_buf_idx=cache_buf_idx,
+            replay_step_width=self.replay_step_width,
+            replay_history_size=self.replay_history_size)
+
+    def get_mamba_ssm_cache_dtype(self) -> torch.dtype:
+        return self.ssm_state_dtype
+
+    def get_mamba_ssm_rand_seed(self) -> Optional[torch.Tensor]:
+        return getattr(self, 'mamba_ssm_rand_seed', None)
+
+    def shutdown(self):
+        self.all_ssm_states = []
+        self.all_conv_states = []
+        self.intermediate_ssm_states = None
+        self.intermediate_conv_states = None
+        self.intermediate_state_indices = None
+        self.prev_num_accepted_tokens = None
+        self.cache_buf_idx = None
+        self.mamba_ssm_rand_seed = None
+        self.old_x = None
+        self.old_B = None
+        self.old_dt = None
+        self.old_dA_cumsum = None
+        super().shutdown()

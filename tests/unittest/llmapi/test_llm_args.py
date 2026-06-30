@@ -351,6 +351,8 @@ def test_KvCacheConfig_declaration():
                            kv_cache_event_hash_algo="v2_sha256_64",
                            enable_partial_reuse=True,
                            copy_on_partial_reuse=True,
+                           mamba_state_cache_interval=0,
+                           mamba_save_last_snapshot=True,
                            attention_dp_events_gather_period_ms=10)
 
     pybind_config = config._to_pybind()
@@ -371,6 +373,8 @@ def test_KvCacheConfig_declaration():
                          ).kv_cache_event_hash_algo == "v1_block_key"
     assert pybind_config.enable_partial_reuse == True
     assert pybind_config.copy_on_partial_reuse == True
+    assert config.mamba_state_cache_interval == 0
+    assert config.mamba_save_last_snapshot == True
     assert pybind_config.attention_dp_events_gather_period_ms == 10
 
 

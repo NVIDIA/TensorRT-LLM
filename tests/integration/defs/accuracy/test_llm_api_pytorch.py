@@ -44,8 +44,8 @@ from ..conftest import (check_device_contain, get_device_count, llm_models_root,
                         skip_post_hopper, skip_pre_ada, skip_pre_blackwell,
                         skip_pre_hopper, skip_ray)
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
-                            JsonModeEval, LlmapiAccuracyTestHarness,
-                            LongBenchV1, LongBenchV2)
+                            GSM8KAgentXReuse, JsonModeEval,
+                            LlmapiAccuracyTestHarness, LongBenchV1, LongBenchV2)
 
 
 # Keep helper definitions below imports so new imports do not need E402
@@ -5579,6 +5579,33 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
     @skip_pre_hopper
+    def test_fp8_block_reuse_save_last_snapshot_agentx(self):
+        model_path = f"{llm_models_root()}/Qwen3.5-4B-FP8"
+        with LLM(model_path,
+                 trust_remote_code=True,
+                 enable_chunked_prefill=True,
+                 max_seq_len=4096,
+                 max_num_tokens=512,
+                 max_batch_size=8,
+                 scheduler_config=SchedulerConfig(
+                     capacity_scheduler_policy="MAX_UTILIZATION",
+                     context_chunking_policy="FIRST_COME_FIRST_SERVED",
+                 ),
+                 kv_cache_config=KvCacheConfig(
+                     enable_block_reuse=True,
+                     mamba_state_cache_interval=0,
+                     mamba_save_last_snapshot=True,
+                     free_gpu_memory_fraction=0.8,
+                 ),
+                 cuda_graph_config=CudaGraphConfig(enable_padding=True,
+                                                   max_batch_size=8)) as llm:
+            task = GSM8KAgentXReuse(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )
+
+    @skip_pre_hopper
     def test_dflash(self):
         target_model_path = f"{llm_models_root()}/Qwen3.5-4B-FP8"
         dflash_model_path = f"{llm_models_root()}/Qwen3.5-4B-DFlash"
@@ -6514,19 +6541,20 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.parametrize(
-        "tp_size, ep_size, mamba_state_cache_interval, attention_dp, use_mtp",
+        "tp_size, ep_size, mamba_state_cache_interval, attention_dp, use_mtp, is_chat",
         [
-            (1, 1, 256, False, False),
-            (4, 1, 256, False, True),
-            (4, 4, 256, False, False),
-            (4, 4, 256, True, False),
-            (4, 4, 512, True, True),
+            (1, 1, 256, False, False, False),
+            (4, 1, 256, False, True, False),
+            (4, 4, 256, False, False, False),
+            (4, 4, 256, True, False, False),
+            (4, 4, 512, True, True, False),
+            (1, 1, 0, False, False, True),
         ],
-        ids=["TP1", "TP4_MTP", "TEP4", "TEP4_ADP", "TEP4_ADP_MTP"],
+        ids=["TP1", "TP4_MTP", "TEP4", "TEP4_ADP", "TEP4_ADP_MTP", "TP1_chat"],
     )
     def test_nvfp4_4gpus_block_reuse(self, tp_size, ep_size,
                                      mamba_state_cache_interval, attention_dp,
-                                     use_mtp):
+                                     use_mtp, is_chat):
         gpu_needed = max(tp_size, ep_size)
         if get_device_count() < gpu_needed:
             pytest.skip(
@@ -6542,6 +6570,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                     enable_block_reuse=True,
                     mamba_ssm_cache_dtype="float16",
                     mamba_state_cache_interval=mamba_state_cache_interval,
+                    mamba_save_last_snapshot=is_chat,
                     free_gpu_memory_fraction=0.8,
                 ),
                 max_batch_size=32,

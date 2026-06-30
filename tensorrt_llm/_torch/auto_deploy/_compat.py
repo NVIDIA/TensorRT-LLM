@@ -212,6 +212,7 @@ else:
         copy_on_partial_reuse: bool = True
         use_uvm: bool = False
         tokens_per_block: int = 32
+        mamba_save_last_snapshot: bool = False
         dtype: str = "auto"
 
         model_config = {"arbitrary_types_allowed": True, "extra": "allow"}

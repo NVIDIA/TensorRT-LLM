@@ -1474,6 +1474,7 @@ class TestSSMSupport(unittest.TestCase):
         num_ssm_layers: int = 2,
         window_size: SlidingWindowSize = None,
         ssm_reuse_interval: int = 512,
+        mamba_save_last_snapshot: bool = False,
     ) -> KVCacheManagerConfig:
         layers = []
         lid = 0
@@ -1505,6 +1506,7 @@ class TestSSMSupport(unittest.TestCase):
             cache_tiers=[GpuCacheTierConfig(quota=gpu_quota)],
             layers=layers,
             ssm_reuse_interval=ssm_reuse_interval,
+            mamba_save_last_snapshot=mamba_save_last_snapshot,
             enable_partial_reuse=False,
         )
 
@@ -1589,6 +1591,7 @@ class TestSSMSupport(unittest.TestCase):
         gpu_quota: int = 32 << 20,
         num_attn_layers: int = 2,
         num_ssm_layers: int = 2,
+        mamba_save_last_snapshot: bool = False,
     ) -> KVCacheManagerConfig:
         return self._make_ssm_config(
             tokens_per_block=tokens_per_block,
@@ -1596,6 +1599,7 @@ class TestSSMSupport(unittest.TestCase):
             num_attn_layers=num_attn_layers,
             num_ssm_layers=num_ssm_layers,
             ssm_reuse_interval=ssm_reuse_interval,
+            mamba_save_last_snapshot=mamba_save_last_snapshot,
         )
 
     def test_ssm_reuse_interval_boundary(self) -> None:
@@ -1627,6 +1631,335 @@ class TestSSMSupport(unittest.TestCase):
         )
         kv2.resume(stream)
         kv2.close()
+
+    def test_ssm_interval_snapshot_reuses_longer_prompt_prefix(self) -> None:
+        """An interval snapshot can seed a longer prompt with the same prefix."""
+        tokens_per_block = 32
+        ssm_reuse_interval = 64
+        cfg = self._make_ssm_reuse_config(
+            tokens_per_block=tokens_per_block,
+            ssm_reuse_interval=ssm_reuse_interval,
+        )
+        self.manager = KVCacheManager(cfg)
+        engine = FakeEngine(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+
+        base_prompt = [self.next_token() for _ in range(96)]
+        kv1 = self.manager.create_kv_cache()
+        kv1.resume(stream)
+        history = []
+        for chunk_end in (64, len(base_prompt)):
+            chunk = base_prompt[len(history) : chunk_end]
+            kv1.capacity = chunk_end
+            kv1.history_length = chunk_end
+            engine.execute([Step(kv1, chunk, history)], stream)
+            history.extend(chunk)
+            kv1.commit(chunk)
+        kv1.stop_committing()
+        kv1.close()
+
+        longer_prompt = base_prompt + [self.next_token() for _ in range(16)]
+        kv2 = self.manager.create_kv_cache(input_tokens=longer_prompt)
+
+        self.assertEqual(kv2.num_committed_tokens, ssm_reuse_interval)
+        kv2.resume(stream)
+        kv2.capacity = len(longer_prompt)
+        kv2.history_length = len(longer_prompt)
+        engine.execute(
+            [Step(kv2, longer_prompt[ssm_reuse_interval:], longer_prompt[:ssm_reuse_interval])],
+            stream,
+        )
+        kv2.close()
+
+    def test_ssm_last_snapshot_default_disabled(self) -> None:
+        """Partial final blocks are not reusable unless last snapshot saving is requested."""
+        cfg = self._make_ssm_reuse_config(tokens_per_block=32, ssm_reuse_interval=512)
+        self.manager = KVCacheManager(cfg)
+        engine = FakeEngine(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+
+        prompt = [self.next_token() for _ in range(70)]
+        kv1 = self.manager.create_kv_cache()
+        kv1.resume(stream)
+        kv1.capacity = len(prompt)
+        kv1.history_length = len(prompt)
+        engine.execute([Step(kv1, prompt, [])], stream)
+        kv1.commit(prompt)
+        kv1.stop_committing()
+        kv1.close()
+
+        kv2 = self.manager.create_kv_cache(input_tokens=prompt)
+        self.assertEqual(kv2.num_committed_tokens, 0)
+        kv2.resume(stream)
+        kv2.close()
+
+    def test_ssm_last_snapshot_reuses_partial_tail(self) -> None:
+        """A saved partial final SSM snapshot can be reused as an exact prefix."""
+        cfg = self._make_ssm_reuse_config(
+            tokens_per_block=32,
+            ssm_reuse_interval=512,
+            mamba_save_last_snapshot=True,
+        )
+        self.manager = KVCacheManager(cfg)
+        engine = FakeEngine(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+
+        prompt = [self.next_token() for _ in range(70)]
+        kv1 = self.manager.create_kv_cache()
+        kv1.resume(stream)
+        kv1.capacity = len(prompt)
+        kv1.history_length = len(prompt)
+        engine.execute([Step(kv1, prompt, [])], stream)
+        kv1.commit(prompt)
+        kv1.stop_committing(save_last_ssm_snapshot=True)
+        kv1.close()
+
+        kv2 = self.manager.create_kv_cache(input_tokens=prompt)
+        self.assertEqual(kv2.num_committed_tokens, len(prompt))
+        kv2.resume(stream)
+        kv2.capacity = len(prompt)
+        kv2.history_length = len(prompt)
+        engine.execute([Step(kv2, [], prompt)], stream)
+        kv2.close()
+
+        suffix = [self.next_token() for _ in range(5)]
+        longer_prompt = prompt + suffix
+        kv3 = self.manager.create_kv_cache(input_tokens=longer_prompt)
+        self.assertEqual(kv3.num_committed_tokens, len(prompt))
+        kv3.resume(stream)
+        kv3.capacity = len(longer_prompt)
+        kv3.history_length = len(prompt)
+        engine.execute([Step(kv3, suffix, prompt)], stream)
+        kv3.close()
+
+        kv4 = self.manager.create_kv_cache(input_tokens=prompt[:-1])
+        self.assertEqual(kv4.num_committed_tokens, 0)
+        kv4.resume(stream)
+        kv4.close()
+
+    def test_ssm_last_snapshot_partial_tail_reuses_longer_sibling_prefix(self) -> None:
+        """A partial final SSM snapshot can seed a longer sibling with the same prefix."""
+        tokens_per_block = 8
+        cfg = self._make_ssm_reuse_config(
+            tokens_per_block=tokens_per_block,
+            ssm_reuse_interval=0,
+            mamba_save_last_snapshot=True,
+        )
+        self.manager = KVCacheManager(cfg)
+        engine = FakeEngine(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+
+        shared = [self.next_token() for _ in range(tokens_per_block)]
+        full_tail = [self.next_token() for _ in range(tokens_per_block)]
+        final_tail = [self.next_token() for _ in range(3)]
+        longer_prompt = shared + full_tail + final_tail
+        shorter_prompt = shared + full_tail[:3]
+
+        kv1 = self.manager.create_kv_cache()
+        kv1.resume(stream)
+        kv1.capacity = len(longer_prompt)
+        kv1.history_length = len(longer_prompt)
+        engine.execute([Step(kv1, longer_prompt, [])], stream)
+        kv1.commit(longer_prompt)
+        kv1.stop_committing(save_last_ssm_snapshot=True)
+        kv1.close()
+
+        kv2 = self.manager.create_kv_cache()
+        kv2.resume(stream)
+        kv2.capacity = len(shorter_prompt)
+        kv2.history_length = len(shorter_prompt)
+        engine.execute([Step(kv2, shorter_prompt, [])], stream)
+        kv2.commit(shorter_prompt)
+        kv2.stop_committing(save_last_ssm_snapshot=True)
+        kv2.close()
+
+        kv3 = self.manager.create_kv_cache(input_tokens=shorter_prompt)
+        self.assertEqual(kv3.num_committed_tokens, len(shorter_prompt))
+        kv3.resume(stream)
+        engine.execute([Step(kv3, [], shorter_prompt)], stream)
+        kv3.close()
+
+        full_prefix_without_snapshot = shared + full_tail
+        kv4 = self.manager.create_kv_cache(input_tokens=full_prefix_without_snapshot)
+        self.assertEqual(kv4.num_committed_tokens, len(shorter_prompt))
+        kv4.resume(stream)
+        kv4.close()
+
+        kv5 = self.manager.create_kv_cache(input_tokens=longer_prompt)
+        self.assertEqual(kv5.num_committed_tokens, len(longer_prompt))
+        kv5.resume(stream)
+        engine.execute([Step(kv5, [], longer_prompt)], stream)
+        kv5.close()
+
+    def test_ssm_last_snapshot_reuses_full_non_interval_tail(self) -> None:
+        """A final full block can be snapshotted even when it is not an interval boundary."""
+        cfg = self._make_ssm_reuse_config(
+            tokens_per_block=32,
+            ssm_reuse_interval=128,
+            mamba_save_last_snapshot=True,
+        )
+        self.manager = KVCacheManager(cfg)
+        engine = FakeEngine(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+
+        prompt = [self.next_token() for _ in range(96)]
+        kv1 = self.manager.create_kv_cache()
+        kv1.resume(stream)
+        kv1.capacity = len(prompt)
+        kv1.history_length = len(prompt)
+        engine.execute([Step(kv1, prompt, [])], stream)
+        kv1.commit(prompt)
+        kv1.stop_committing(save_last_ssm_snapshot=True)
+        kv1.close()
+
+        kv2 = self.manager.create_kv_cache(input_tokens=prompt)
+        self.assertEqual(kv2.num_committed_tokens, len(prompt))
+        kv2.resume(stream)
+        kv2.capacity = len(prompt)
+        kv2.history_length = len(prompt)
+        engine.execute([Step(kv2, [], prompt)], stream)
+        kv2.close()
+
+    def test_ssm_last_snapshot_only_interval_zero(self) -> None:
+        """With interval=0, only the final SSM snapshot is reusable."""
+        cfg = self._make_ssm_reuse_config(
+            tokens_per_block=32,
+            ssm_reuse_interval=0,
+            mamba_save_last_snapshot=True,
+        )
+        self.manager = KVCacheManager(cfg)
+        engine = FakeEngine(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+
+        prompt = [self.next_token() for _ in range(128)]
+        kv1 = self.manager.create_kv_cache()
+        kv1.resume(stream)
+        kv1.capacity = len(prompt)
+        kv1.history_length = len(prompt)
+        engine.execute([Step(kv1, prompt, [])], stream)
+        kv1.commit(prompt)
+        kv1.stop_committing(save_last_ssm_snapshot=True)
+        kv1.close()
+
+        kv2 = self.manager.create_kv_cache(input_tokens=prompt)
+        self.assertEqual(kv2.num_committed_tokens, len(prompt))
+        kv2.resume(stream)
+        kv2.capacity = len(prompt)
+        kv2.history_length = len(prompt)
+        engine.execute([Step(kv2, [], prompt)], stream)
+        kv2.close()
+
+        shorter_prompt = prompt[:64]
+        kv3 = self.manager.create_kv_cache(input_tokens=shorter_prompt)
+        self.assertEqual(kv3.num_committed_tokens, 0)
+        kv3.resume(stream)
+        kv3.close()
+
+        suffix = [self.next_token() for _ in range(5)]
+        longer_prompt = prompt + suffix
+        kv4 = self.manager.create_kv_cache(input_tokens=longer_prompt)
+        self.assertEqual(kv4.num_committed_tokens, len(prompt))
+        kv4.resume(stream)
+        kv4.capacity = len(longer_prompt)
+        kv4.history_length = len(prompt)
+        engine.execute([Step(kv4, suffix, prompt)], stream)
+        kv4.close()
+
+    def test_ssm_last_snapshot_reuse_batch_order(self) -> None:
+        """Partial final SSM snapshots stay aligned when reused in a reordered batch."""
+        tokens_per_block = 8
+        cfg = self._make_ssm_reuse_config(
+            tokens_per_block=tokens_per_block,
+            ssm_reuse_interval=0,
+            mamba_save_last_snapshot=True,
+        )
+        self.manager = KVCacheManager(cfg)
+        engine = FakeEngine(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+
+        shared = [self.next_token() for _ in range(tokens_per_block)]
+        bases = [shared + [self.next_token() for _ in range(3 + i)] for i in range(4)]
+        suffixes = [[self.next_token() for _ in range(5)] for _ in bases]
+
+        def warm_bases(reuse_scope: ReuseScope) -> None:
+            for base in bases:
+                kv_cache = self.manager.create_kv_cache(reuse_scope)
+                kv_cache.resume(stream)
+                kv_cache.capacity = len(base)
+                kv_cache.history_length = len(base)
+                engine.execute([Step(kv_cache, base, [])], stream)
+                kv_cache.commit(base)
+                kv_cache.stop_committing(save_last_ssm_snapshot=True)
+                kv_cache.close()
+
+        def run_order(reuse_scope: ReuseScope, order: list[int]) -> None:
+            steps = []
+            kv_caches = []
+            for idx in order:
+                full_prompt = bases[idx] + suffixes[idx]
+                kv_cache = self.manager.create_kv_cache(reuse_scope, full_prompt)
+                self.assertEqual(kv_cache.num_committed_tokens, len(bases[idx]))
+                kv_cache.resume(stream)
+                kv_cache.capacity = len(full_prompt)
+                steps.append(Step(kv_cache, suffixes[idx], bases[idx]))
+                kv_caches.append(kv_cache)
+
+            engine.execute(steps, stream)
+            for kv_cache in kv_caches:
+                kv_cache.close()
+
+        first_scope = ReuseScope(salt=11)
+        second_scope = ReuseScope(salt=12)
+        warm_bases(first_scope)
+        run_order(first_scope, [0, 1, 2, 3])
+        warm_bases(second_scope)
+        run_order(second_scope, [2, 0, 3, 1])
+
+    def test_ssm_last_snapshot_reuses_partial_tail_with_many_siblings(self) -> None:
+        """High fanout must not prevent exact SSM partial-snapshot reuse."""
+        tokens_per_block = 8
+        cfg = self._make_ssm_reuse_config(
+            tokens_per_block=tokens_per_block,
+            ssm_reuse_interval=0,
+            mamba_save_last_snapshot=True,
+        )
+        self.manager = KVCacheManager(cfg)
+        engine = FakeEngine(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+
+        shared = [self.next_token() for _ in range(tokens_per_block)]
+        targets = []
+        for _ in range(40):
+            base = shared + [self.next_token() for _ in range(3)]
+            suffix = [self.next_token() for _ in range(2)]
+            targets.append((base, suffix))
+
+            kv_cache = self.manager.create_kv_cache()
+            kv_cache.resume(stream)
+            kv_cache.capacity = len(base)
+            kv_cache.history_length = len(base)
+            engine.execute([Step(kv_cache, base, [])], stream)
+            kv_cache.commit(base)
+            kv_cache.stop_committing(save_last_ssm_snapshot=True)
+            kv_cache.close()
+
+        base, suffix = targets[-1]
+        full_prompt = base + suffix
+        kv_cache = self.manager.create_kv_cache(input_tokens=full_prompt)
+        self.assertEqual(kv_cache.num_committed_tokens, len(base))
+        kv_cache.resume(stream)
+        kv_cache.capacity = len(full_prompt)
+        kv_cache.history_length = len(base)
+        engine.execute([Step(kv_cache, suffix, base)], stream)
+        kv_cache.close()
 
     def test_ssm_reuse_data_integrity(self) -> None:
         """After reuse, SSM data matches the snapshot (verified by FakeEngine)."""
@@ -1675,9 +2008,16 @@ class TestSSMSupport(unittest.TestCase):
         # Not divisible by tokens_per_block
         with self.assertRaises(AssertionError):
             self._make_ssm_config(tokens_per_block=32, ssm_reuse_interval=50)
-        # Zero interval
+        # Zero interval requires save-last snapshot.
         with self.assertRaises(AssertionError):
             self._make_ssm_config(tokens_per_block=32, ssm_reuse_interval=0)
+        self._make_ssm_config(
+            tokens_per_block=32,
+            ssm_reuse_interval=0,
+            mamba_save_last_snapshot=True,
+        )
+        with self.assertRaises(AssertionError):
+            self._make_ssm_config(tokens_per_block=32, ssm_reuse_interval=-32)
 
 
 class TestInitRatioConfig(unittest.TestCase):
