@@ -136,6 +136,8 @@ class FallbackFmha(Fmha):
             cross_kv=forward_args.cross_kv,
             relative_attention_bias=forward_args.relative_attention_bias,
             relative_attention_max_distance=forward_args.relative_attention_max_distance,
+            skip_softmax_threshold_scale_factor_prefill=forward_args.skip_softmax_kernel_params.threshold_scale_factor_prefill,
+            skip_softmax_threshold_scale_factor_decode=forward_args.skip_softmax_kernel_params.threshold_scale_factor_decode,
             # --- Module config (TrtllmAttention) ---
             rotary_inv_freq=attn.rotary_inv_freq,
             rotary_cos_sin=attn.rotary_cos_sin,
@@ -163,8 +165,6 @@ class FallbackFmha(Fmha):
             v_head_dim=attn.v_head_dim,
             rope_append=attn.rope_append,
             attention_chunk_size=attn.attention_chunk_size,
-            skip_softmax_threshold_scale_factor_prefill=forward_args.skip_softmax_kernel_params.threshold_scale_factor_prefill,
-            skip_softmax_threshold_scale_factor_decode=forward_args.skip_softmax_kernel_params.threshold_scale_factor_decode,
             skip_softmax_stat=attn.skip_softmax_stat,
             # --- Sparse-specific (AttentionForwardArgs.sparse_prediction) ---
             sparse_kv_indices=forward_args.sparse_prediction.sparse_kv_indices,
