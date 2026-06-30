@@ -53,6 +53,23 @@ static_assert(static_cast<int>(AttentionInputLayout::SEPARATE_Q_K_V) < (1 << 2),
 static_assert(static_cast<int>(ContextAttentionMaskType::CUSTOM_MASK) < (1 << 3),
     "ContextAttentionMaskType requires more than three bits in the FMHA kernel hash.");
 
+bool isSupportedBySkipSoftmaxSm120Bridge(MHARunnerFixedParams const& params, unsigned int sm)
+{
+#if defined(TLLM_ENABLE_SKIP_SOFTMAX_SM120)
+    return (sm == kSM_120 || sm == kSM_121) && params.dataType == DATA_TYPE_BF16
+        && params.dataTypeKv == DATA_TYPE_BF16 && params.dataTypeOut == DATA_TYPE_BF16
+        && !params.forceFp32Acc && params.attentionMaskType == ContextAttentionMaskType::CAUSAL
+        && params.attentionInputLayout == AttentionInputLayout::PACKED_QKV && params.headSize == params.headSizeV
+        && (params.headSize == 128 || params.headSize == 256) && !params.hasAlibi && !params.saveSoftmax
+        && params.attnLogitSoftcappingScale == 0.0F && params.sageBlockSizeQ == 0 && params.sageBlockSizeK == 0
+        && params.sageBlockSizeV == 0 && !params.useSparseMLA && !params.useTllmGenSparseAttention;
+#else
+    (void) params;
+    (void) sm;
+    return false;
+#endif // TLLM_ENABLE_SKIP_SOFTMAX_SM120
+}
+
 } // namespace
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -468,6 +485,11 @@ void FusedMultiHeadAttentionXMMAKernelV2::run(
 
 bool FusedMultiHeadAttentionXMMAKernelV2::checkIfKernelExist(MHARunnerFixedParams params) const
 {
+    if (isSupportedBySkipSoftmaxSm120Bridge(params, mSM))
+    {
+        return true;
+    }
+
     uint64_t id = hashID(0, params.headSize, params.headSizeV, 0, 0, params.forceFp32Acc, false, false, false,
         static_cast<int>(params.attentionMaskType), static_cast<int>(params.attentionInputLayout), false,
         params.attnLogitSoftcappingScale != 0.f, params.sageBlockSizeQ, params.sageBlockSizeK, params.sageBlockSizeV,
