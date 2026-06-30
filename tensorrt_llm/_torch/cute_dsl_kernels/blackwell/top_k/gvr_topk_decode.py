@@ -1815,8 +1815,12 @@ class GvrTopKKernel:
             bmin_r = cutlass.Float32(self.FLT_MAX)
             bmax_r = cutlass.Float32(self.NEG_FLT_MAX)
             for w in cutlass.range_constexpr(self.num_warps):
-                vmin = cutlass.Float32(llvm.bitcast(cutlass.Float32.mlir_type, smem_wcnt[w].ir_value()))
-                vmax = cutlass.Float32(llvm.bitcast(cutlass.Float32.mlir_type, smem_hist[w].ir_value()))
+                vmin = cutlass.Float32(
+                    llvm.bitcast(cutlass.Float32.mlir_type, smem_wcnt[w].ir_value())
+                )
+                vmax = cutlass.Float32(
+                    llvm.bitcast(cutlass.Float32.mlir_type, smem_hist[w].ir_value())
+                )
                 bmin_r = _fmin_f32_inline(bmin_r, vmin)
                 bmax_r = cute.arch.fmax(bmax_r, vmax)
             if bmax_r <= bmin_r:
@@ -1844,8 +1848,11 @@ class GvrTopKKernel:
             # ---- 3-step high→low bin search → straddling bin b* + rank_above ----
             warp_bin_sum = cutlass.Int32(0)
             for jb in cutlass.range_constexpr(bins_per_warp):
-                bidx_s = (cutlass.Int32(kBins - 1) - warp_id * cutlass.Int32(bins_per_warp)
-                          - cutlass.Int32(jb))
+                bidx_s = (
+                    cutlass.Int32(kBins - 1)
+                    - warp_id * cutlass.Int32(bins_per_warp)
+                    - cutlass.Int32(jb)
+                )
                 warp_bin_sum = warp_bin_sum + smem_hist[bidx_s]
             if lane == cutlass.Int32(0):
                 smem_wcnt[warp_id] = warp_bin_sum
@@ -1873,8 +1880,11 @@ class GvrTopKKernel:
                 rank_above = base_cum
                 set_d = cutlass.Int32(0)
                 for jb2 in cutlass.range_constexpr(bins_per_warp):
-                    bidx2 = (cutlass.Int32(kBins - 1) - target_warp * cutlass.Int32(bins_per_warp)
-                             - cutlass.Int32(jb2))
+                    bidx2 = (
+                        cutlass.Int32(kBins - 1)
+                        - target_warp * cutlass.Int32(bins_per_warp)
+                        - cutlass.Int32(jb2)
+                    )
                     ra_before = base_cum
                     base_cum = base_cum + smem_hist[bidx2]
                     if base_cum >= cutlass.Int32(kK) and set_d == cutlass.Int32(0):
@@ -1926,8 +1936,11 @@ class GvrTopKKernel:
                 # fine 3-step search seeded at rank_above (over fbins bins)
                 fws = cutlass.Int32(0)
                 for jbf in cutlass.range_constexpr(fbpw):
-                    bif = (cutlass.Int32(fbins - 1) - warp_id * cutlass.Int32(fbpw)
-                           - cutlass.Int32(jbf))
+                    bif = (
+                        cutlass.Int32(fbins - 1)
+                        - warp_id * cutlass.Int32(fbpw)
+                        - cutlass.Int32(jbf)
+                    )
                     fws = fws + smem_hist[bif]
                 if lane == cutlass.Int32(0):
                     smem_wcnt[warp_id] = fws
@@ -1951,8 +1964,8 @@ class GvrTopKKernel:
                     # histogram bins as scratch would corrupt sb_star/ra_fine
                     # when twf2 == num_warps-1. Slots [4]/[1] are dead here
                     # (re-zeroed at the cnt_above/cnt_strad reset below).
-                    s_iscalars[4] = pre   # prefix into target fine warp
-                    s_iscalars[1] = twf   # target fine warp
+                    s_iscalars[4] = pre  # prefix into target fine warp
+                    s_iscalars[1] = twf  # target fine warp
                 cute.arch.barrier()
                 pre_f = s_iscalars[4]
                 twf2 = s_iscalars[1]
@@ -1962,8 +1975,11 @@ class GvrTopKKernel:
                     ra_fine = base_f
                     sd = cutlass.Int32(0)
                     for jb3 in cutlass.range_constexpr(fbpw):
-                        sbi = (cutlass.Int32(fbins - 1) - twf2 * cutlass.Int32(fbpw)
-                               - cutlass.Int32(jb3))
+                        sbi = (
+                            cutlass.Int32(fbins - 1)
+                            - twf2 * cutlass.Int32(fbpw)
+                            - cutlass.Int32(jb3)
+                        )
                         ra_b = base_f
                         base_f = base_f + smem_hist[sbi]
                         if base_f >= cutlass.Int32(kK) and sd == cutlass.Int32(0):
