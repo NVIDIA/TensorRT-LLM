@@ -24,7 +24,7 @@ from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
-                                         get_is_diffusion_model)
+                                         get_is_diffusion_only_model)
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
@@ -906,6 +906,17 @@ class ChoiceWithAlias(click.Choice):
         "used as the model name. This is useful when the model path is long or "
         "when you want to expose a custom name to clients.", "prototype"))
 @click.option(
+    "--enable_visual_gen",
+    is_flag=True,
+    default=False,
+    help=help_info_with_stability_tag(
+        "Enable VisualGen runtime for model checkpoints that support both LLM "
+        "and Visual Generation. Not required if --visual_gen_args specified "
+        "or the model supports Visual Generation only.",
+        "prototype",
+    ),
+)
+@click.option(
     "--visual_gen_args",
     type=str,
     default=None,
@@ -946,7 +957,7 @@ def serve(
         agent_types: Optional[str], video_pruning_rate: Optional[float],
         telemetry: bool, custom_module_dirs: list[Path],
         chat_template: Optional[str], allow_request_chat_template: bool,
-        middleware: tuple[str, ...], grpc: bool,
+        middleware: tuple[str, ...], grpc: bool, enable_visual_gen: bool,
         served_model_name: Optional[str], visual_gen_args: Optional[str]):
     """Running an OpenAI API compatible server
 
@@ -1147,7 +1158,8 @@ def serve(
         launch_visual_gen_server(host, port, model, parsed_visual_gen_args,
                                  metadata_server_cfg, middleware)
 
-    is_visual_gen = visual_gen_args is not None or get_is_diffusion_model(model)
+    is_visual_gen = (enable_visual_gen or visual_gen_args is not None
+                     or get_is_diffusion_only_model(model))
     if is_visual_gen:
         _serve_visual_gen()
     else:
