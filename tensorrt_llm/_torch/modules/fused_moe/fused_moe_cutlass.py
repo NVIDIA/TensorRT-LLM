@@ -26,9 +26,8 @@ from .quantization import (
     DeepSeekFP8BlockScalesFusedMoEMethod, FP8QDQFusedMoEMethod,
     MoEWeightLoadingMode, MXFP8CutlassFusedMoEMethod,
     NVFP4CutlassFusedMoEMethod, INT8WoqPerChannelFusedMoEMethod,
-    W4A16NVFP4CutlassFusedMoEMethod, W4A8MXFP4FP8CutlassFusedMoEMethod,
-    W4A8MXFP4MXFP8CutlassFusedMoEMethod, WFP4A16FusedMoEMethod,
-    WInt4AFP8FusedMoEMethod)
+    W4A8MXFP4FP8CutlassFusedMoEMethod, W4A8MXFP4MXFP8CutlassFusedMoEMethod,
+    WFP4A16FusedMoEMethod, WInt4AFP8FusedMoEMethod)
 # isort: on
 from .routing import BaseMoeRoutingMethod
 
@@ -777,9 +776,6 @@ class CutlassFusedMoE(MoE):
         """
         x_sf = None
         if self.has_any_quant:
-            # W4A16 NVFP4 path keeps activations hp; skip FP4 quant below.
-            if isinstance(self.quant_method, W4A16NVFP4CutlassFusedMoEMethod):
-                return x, None
             if self.has_fp8_qdq or self.has_w4a8_mxfp4_fp8:
                 x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
                     x, self.fc31_input_dequant)
@@ -940,19 +936,6 @@ class CutlassFusedMoE(MoE):
         Returns:
             final_hidden_states: Output tensor from MoE computation
         """
-        # W4A16 NVFP4 fallback (SM<100).
-        if isinstance(self.quant_method, W4A16NVFP4CutlassFusedMoEMethod):
-            return self._run_moe_w4a16_nvfp4(
-                x,
-                token_selected_experts,
-                token_final_scales,
-                output_dtype=output_dtype,
-                tuner_num_tokens=tuner_num_tokens,
-                tuner_top_k=tuner_top_k,
-                moe_output=moe_output,
-                enable_alltoall=enable_alltoall,
-            )
-
         # SM120 + FP8 block scales: use Triton kernel (CUTLASS TMA fails on SM120
         # for large token counts due to cuTensorMapEncodeTiled limitations).
         if self.has_deepseek_fp8_block_scales and get_sm_version() == 120:
@@ -1078,84 +1061,6 @@ class CutlassFusedMoE(MoE):
             final_hidden_states = result[0]
 
         return final_hidden_states
-
-    def _run_moe_w4a16_nvfp4(
-        self,
-        x: torch.Tensor,
-        token_selected_experts: torch.Tensor,
-        token_final_scales: torch.Tensor,
-        output_dtype: Optional[torch.dtype] = None,
-        tuner_num_tokens: Optional[int] = None,
-        tuner_top_k: Optional[int] = None,
-        moe_output: Optional[torch.Tensor] = None,
-        enable_alltoall: Optional[bool] = None,
-    ) -> torch.Tensor:
-        """W4A16 fallback for NVFP4 MoE on SM<100. Active-mask dequant into
-        a static [E_total, N, K] bf16 workspace, then bf16 fused_moe with the
-        original (global) token_selected_experts. CUDA-graph capturable.
-        """
-        assert isinstance(self.quant_method, W4A16NVFP4CutlassFusedMoEMethod)
-
-        if enable_alltoall is None:
-            enable_alltoall = self.enable_alltoall
-        if output_dtype is None:
-            output_dtype = x.dtype
-
-        # Same EP id convention as the FP8 path above: global ids (or
-        # ``local_n``-padded under alltoall). Clamp to local range so the
-        # active-mask scatter is in-bounds; non-local tokens collapse onto a
-        # boundary expert (1 extra dequant/rank). ``trtllm.fused_moe`` below
-        # still gets the original global ids -- it does its own remap.
-        local_n = self.expert_size_per_partition
-        if enable_alltoall:
-            local_ids = token_selected_experts.clamp(0, local_n - 1)
-        else:
-            local_ids = (token_selected_experts - self.slot_start).clamp(
-                0, local_n - 1)
-
-        w3_w1_hp, w2_hp = self.quant_method.dequant_active_experts_to_hp(
-            self, local_ids, output_dtype)
-
-        # bf16 fused_moe with empty quant_scales (matches unquantized path).
-        result = torch.ops.trtllm.fused_moe(
-            x,
-            token_selected_experts,
-            token_final_scales,
-            w3_w1_hp,
-            self.w3_w1_bias,
-            w2_hp,
-            self.w2_bias,
-            output_dtype,
-            quant_scales=[],
-            input_sf=None,
-            swizzled_input_sf=False,
-            swiglu_alpha=self.swiglu_alpha,
-            swiglu_beta=self.swiglu_beta,
-            swiglu_limit=self.swiglu_limit,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            ep_size=self.ep_size,
-            ep_rank=self.ep_rank,
-            cluster_size=self.cluster_size,
-            cluster_rank=self.cluster_rank,
-            enable_alltoall=enable_alltoall,
-            use_deepseek_fp8_block_scale=False,
-            use_w4_group_scaling=False,
-            use_int8_woq_per_channel=False,
-            use_mxfp8_act_scaling=False,
-            min_latency_mode=False,
-            use_fused_finalize=self.use_fused_finalize,
-            tune_max_num_tokens=self.tune_max_num_tokens,
-            tuner_num_tokens=tuner_num_tokens,
-            tuner_top_k=tuner_top_k,
-            activation_type=self.activation_type,
-            unpadded_hidden_size=self.unpadded_hidden_size,
-            out_tensor=moe_output,
-            use_dynamic_fc2_scale=False,
-        )
-        if moe_output is not None:
-            return moe_output
-        return result[0]
 
     def forward_chunk(
         self,
