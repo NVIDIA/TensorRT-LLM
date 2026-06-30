@@ -570,7 +570,7 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName
             pipeline,
             script: Utils.sshUserCmd(
                 remote,
-                "\"${cleanupCommands}\""
+                Utils.bashWrappedRemoteCmd(cleanupCommands)
             )
         )
 
@@ -611,7 +611,7 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
             pipeline,
             script: Utils.sshUserCmd(
                 remote,
-                "\"${cleanupCommands}\""
+                Utils.bashWrappedRemoteCmd(cleanupCommands)
             )
         )
 
@@ -887,7 +887,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                         def setupLogPath = "/home/svc_tensorrt/slurm-logs/slurm-${slurmJobID}-${nodeName}.out"
                         def enrootLog = Utils.exec(
                             pipeline,
-                            script: CloudManager.sshUserCmdWithSlurmFrontendFailover(remotes, "\"grep '\\[ENROOT\\]' ${setupLogPath} 2>/dev/null || true\""),
+                            script: CloudManager.sshUserCmdWithSlurmFrontendFailover(remotes, Utils.bashWrappedRemoteCmd("grep '\\[ENROOT\\]' ${setupLogPath} 2>/dev/null || true")),
                             returnStdout: true,
                             numRetries: 3
                         ).trim()
@@ -2135,7 +2135,7 @@ def readSlurmWorkspaceFile(def pipeline, Map remote, String path, String stageNa
             pipeline,
             script: Utils.sshUserCmd(
                 remote,
-                "\"cat ${path} 2>/dev/null || true\""
+                Utils.bashWrappedRemoteCmd("cat ${path} 2>/dev/null || true")
             ),
             returnStdout: true,
             numRetries: numRetries
