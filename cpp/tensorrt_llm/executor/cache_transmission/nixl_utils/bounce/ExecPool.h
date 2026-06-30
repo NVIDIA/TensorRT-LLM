@@ -46,9 +46,12 @@ struct ExecCtx
 {
     std::uint32_t id{};
     cudaStream_t stream{nullptr};
-    cudaEvent_t event{nullptr}; // gather-completion event (cudaEventRecord/Query, no blocking sync)
-    void* scratch{nullptr};     // device plan arrays (srcs|dsts|sizes)
-    void* hostPinned{nullptr};  // pinned H2D staging for the plan arrays
+    cudaEvent_t event{nullptr};   // gather-completion event (cudaEventRecord/Query, no blocking sync)
+    void* scratch{nullptr};       // device plan arrays (srcs|dsts|sizes); unused when zeroCopyArgs
+    void* hostPinned{nullptr};    // pinned staging for the plan arrays (H2D source, or read in-kernel)
+    void* hostPinnedDev{nullptr}; // device-accessible alias of hostPinned (only set when zeroCopyArgs)
+    void* cubTemp{nullptr};       // cub::DeviceMemcpy::Batched workspace (only set when cubCopy)
+    std::size_t cubTempBytes{0};  // capacity of cubTemp
     std::size_t scratchBytes{0};
 };
 
@@ -57,7 +60,11 @@ class ExecPool
 public:
     /// Allocate `count` contexts, each with a stream/event + scratch/hostPinned sized for
     /// `maxDescsPerChunk` plan entries. Throws on CUDA allocation failure.
-    ExecPool(std::uint32_t count, std::size_t maxDescsPerChunk, int deviceId);
+    /// @param zeroCopyArgs map hostPinned into the device address space so a kernel can read the plan
+    ///        arrays directly (skip the H2D); @param cubCopy pre-allocate a cub batched-memcpy
+    ///        workspace per context. Both default OFF (experimental — see BounceConfig).
+    ExecPool(std::uint32_t count, std::size_t maxDescsPerChunk, int deviceId, bool zeroCopyArgs = false,
+        bool cubCopy = false);
     ~ExecPool();
 
     ExecPool(ExecPool const&) = delete;
