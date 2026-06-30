@@ -109,7 +109,7 @@ required_deps, extra_URLs = parse_requirements(
 devel_deps, _ = parse_requirements(
     Path("requirements-dev-windows.txt"
          if on_windows else "requirements-dev.txt"))
-mx_deps = ["modelexpress>=0.5.0,<0.6.0"]
+mx_deps = ["modelexpress>=0.4.1,<0.5.0"]
 constraints_file = Path("constraints.txt")
 if constraints_file.exists():
     constraints, _ = parse_requirements(constraints_file)
