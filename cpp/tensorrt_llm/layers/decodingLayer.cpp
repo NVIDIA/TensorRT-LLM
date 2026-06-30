@@ -241,6 +241,8 @@ std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInp
         decodeInputs->step = externalDraftTokenParams->step;
         decodeInputs->useDraftLogits = externalDraftTokenParams->useDraftLogits;
         decodeInputs->useDraftLogitsHost = externalDraftTokenParams->useDraftLogitsHost;
+        decodeInputs->fsdThreshold = externalDraftTokenParams->fsdThreshold;
+        decodeInputs->fsdDivergenceType = externalDraftTokenParams->fsdDivergenceType;
 
         preparedInputs = decodeInputs;
         preparedOutputs = baseOutputs;

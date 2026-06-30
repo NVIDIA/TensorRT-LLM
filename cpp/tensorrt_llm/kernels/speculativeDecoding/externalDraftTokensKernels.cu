@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2024-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -117,7 +117,7 @@ __global__ void acceptDraftTokensKernel(T const* draftProbs, T* targetProbs, Siz
     bool const* batchUseDraftLogits, TokenIdType const* draftIds, FinishedState const* finishedInput,
     FinishedState* finishedOutput, curandState_t* curandState, SizeType32 const* batchSlots, SizeType32 maxDraftTokens,
     SizeType32 beamWidth, SizeType32 vocabSize, bool randomThreshold, float constantThreshold, SizeType32 step,
-    bool* batchIsAccepted, SizeType32* targetOutputIds)
+    bool* batchIsAccepted, SizeType32* targetOutputIds, float fsdThreshold, SizeType32 fsdDivergenceType)
 {
     auto const bid = blockIdx.x;
     auto const draftTokenIdx = step;
@@ -164,10 +164,18 @@ __global__ void acceptDraftTokensKernel(T const* draftProbs, T* targetProbs, Siz
     auto const draftProbsBatch = draftProbs + logitsOffset;
     auto const targetProbsBatch = targetProbs + (batchIdx * beamWidth * vocabSize);
 
+    // FSD: save original finishedInput state as raw bytes before any writes to finishedOutput.
+    // finishedInput and finishedOutput may alias the SAME buffer; saving the raw uint8 now
+    // lets the FSD acceptance path restore the pre-rejection state correctly.
+    __shared__ FinishedState::UnderlyingType savedFinishedInputRaw;
     __shared__ bool isAccepted;
+    __shared__ bool fsdTriggered;
     __shared__ T sSumVal;
     if (tid == 0)
     {
+        savedFinishedInputRaw = reinterpret_cast<FinishedState::UnderlyingType const*>(finishedInput)[batchSlot];
+
+        fsdTriggered = false;
         auto const draftOutputTokenId = draftIds[batchSlot * maxDraftTokens + draftTokenIdx];
         if (useDraftLogits)
         {
@@ -175,6 +183,12 @@ __global__ void acceptDraftTokensKernel(T const* draftProbs, T* targetProbs, Siz
             auto const targetProb = static_cast<float>(targetProbsBatch[draftOutputTokenId]);
             auto const draftProb = static_cast<float>(draftProbsBatch[draftOutputTokenId]);
             isAccepted = targetProb > threshold * draftProb;
+
+            // FSD: only trigger divergence check if SD rejected and FSD is enabled
+            if (!isAccepted && fsdThreshold > 0.0F)
+            {
+                fsdTriggered = true;
+            }
         }
         else
         {
@@ -190,6 +204,89 @@ __global__ void acceptDraftTokensKernel(T const* draftProbs, T* targetProbs, Siz
 
     __syncthreads();
 
+    // FSD divergence computation: only entered when SD rejected and fsdThreshold > 0
+    if (useDraftLogits && fsdTriggered)
+    {
+        constexpr float kEPSILON = 1e-10F;
+        constexpr SizeType32 kJS_DIVERGENCE = 0;
+        constexpr SizeType32 kKL_DIVERGENCE = 1;
+        constexpr SizeType32 kTV_DISTANCE = 2;
+        constexpr SizeType32 kREVERSE_KL_DIVERGENCE = 3;
+
+        float localDiv = 0.0F;
+        for (SizeType32 vIdx = tid; vIdx < vocabSize; vIdx += static_cast<SizeType32>(blockDim.x))
+        {
+            float const pTarget = static_cast<float>(targetProbsBatch[vIdx]) + kEPSILON;
+            float const pDraft = static_cast<float>(draftProbsBatch[vIdx]) + kEPSILON;
+
+            switch (fsdDivergenceType)
+            {
+            case kJS_DIVERGENCE:
+            {
+                float const m = 0.5F * (pTarget + pDraft);
+                localDiv += 0.5F * (pTarget * logf(pTarget / m) + pDraft * logf(pDraft / m));
+                break;
+            }
+            case kKL_DIVERGENCE:
+            {
+                // KL(draft‖target): measures draft overconfidence in tokens target discounts.
+                // This is the natural direction for FSD — large when draft assigned high probability
+                // to a token the target disagrees with, which is exactly the SD rejection scenario.
+                localDiv += pDraft * logf(pDraft / pTarget);
+                break;
+            }
+            case kTV_DISTANCE:
+            {
+                localDiv += fabsf(pTarget - pDraft);
+                break;
+            }
+            case kREVERSE_KL_DIVERGENCE:
+            {
+                // KL(target‖draft): large when target has modes the draft missed entirely.
+                localDiv += pTarget * logf(pTarget / pDraft);
+                break;
+            }
+            default:
+            {
+                // Default to JS divergence for unknown types
+                float const m = 0.5F * (pTarget + pDraft);
+                localDiv += 0.5F * (pTarget * logf(pTarget / m) + pDraft * logf(pDraft / m));
+                break;
+            }
+            }
+        }
+
+        // JS divergence is bounded by ln(2) with natural log; normalise to [0, 1].
+        // TV distance has a 0.5 factor applied to the sum.
+        if (fsdDivergenceType == kJS_DIVERGENCE)
+        {
+            localDiv /= logf(2.0F);
+        }
+        else if (fsdDivergenceType == kTV_DISTANCE)
+        {
+            localDiv *= 0.5F;
+        }
+
+        // Block-level reduction to get total divergence
+        float const totalDiv = blockReduceSum<float>(localDiv);
+
+        if (tid == 0)
+        {
+            if (totalDiv < fsdThreshold)
+            {
+                // FSD accepts: override SD rejection
+                isAccepted = true;
+                batchIsAccepted[batchSlot] = true;
+                // Undo the skip-decoding flag set during SD rejection.
+                // Use savedFinishedInputRaw (captured before setSkipDecoding) because
+                // finishedInput and finishedOutput may alias the same buffer.
+                reinterpret_cast<FinishedState::UnderlyingType*>(finishedOutput)[batchSlot] = savedFinishedInputRaw;
+            }
+        }
+        __syncthreads();
+    }
+
+    // Standard SD correction: only runs when both SD and FSD rejected (or FSD was not triggered)
     if (useDraftLogits && !isAccepted)
     {
         // correct target distribution
@@ -271,7 +368,8 @@ void invokeAcceptDraftTokens(SizeType32 batchSize, T* draftProbs, T* targetProbs
     bool const* batchUseDraftLogits, TokenIdType const* draftIds, FinishedState const* finishedInput,
     FinishedState* finishedOutput, curandState_t* curandState, SizeType32 const* batchSlots, SizeType32 maxDraftTokens,
     SizeType32 beamWidth, SizeType32 vocabSizePadded, bool randomThreshold, float constantThreshold, SizeType32 step,
-    bool* batchIsAccepted, SizeType32* targetOutputIds, cudaStream_t stream)
+    bool* batchIsAccepted, SizeType32* targetOutputIds, float fsdThreshold, SizeType32 fsdDivergenceType,
+    cudaStream_t stream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(beamWidth == 1);
@@ -280,7 +378,8 @@ void invokeAcceptDraftTokens(SizeType32 batchSize, T* draftProbs, T* targetProbs
         dim3 grid(batchSize * beamWidth);
         acceptDraftTokensKernel<<<grid, block, 0, stream>>>(draftProbs, targetProbs, numsDraftTokens,
             batchUseDraftLogits, draftIds, finishedInput, finishedOutput, curandState, batchSlots, maxDraftTokens,
-            beamWidth, vocabSizePadded, randomThreshold, constantThreshold, step, batchIsAccepted, targetOutputIds);
+            beamWidth, vocabSizePadded, randomThreshold, constantThreshold, step, batchIsAccepted, targetOutputIds,
+            fsdThreshold, fsdDivergenceType);
     }
     sync_check_cuda_error(stream);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -298,13 +397,13 @@ template void invokeAcceptDraftTokens(SizeType32 batchSize, float* draftProbs, f
     FinishedState const* finishedInput, FinishedState* finishedOutput, curandState_t* curandState,
     SizeType32 const* batchSlots, SizeType32 maxDraftTokens, SizeType32 beamWidth, SizeType32 vocabSizePadded,
     bool randomThreshold, float constantThreshold, SizeType32 step, bool* batchIsAccepted, SizeType32* targetOutputIds,
-    cudaStream_t stream);
+    float fsdThreshold, SizeType32 fsdDivergenceType, cudaStream_t stream);
 template void invokeAcceptDraftTokens(SizeType32 batchSize, half* draftProbs, half* targetProbs,
     SizeType32 const* numsDraftTokens, bool const* batchUseDraftLogits, TokenIdType const* draftIds,
     FinishedState const* finishedInput, FinishedState* finishedOutput, curandState_t* curandState,
     SizeType32 const* batchSlots, SizeType32 maxDraftTokens, SizeType32 beamWidth, SizeType32 vocabSizePadded,
     bool randomThreshold, float constantThreshold, SizeType32 step, bool* batchIsAccepted, SizeType32* targetOutputIds,
-    cudaStream_t stream);
+    float fsdThreshold, SizeType32 fsdDivergenceType, cudaStream_t stream);
 
 void invokeForwardAcceptedTokens(SizeType32 batchSize, SizeType32 const* batchSlots, bool* batchIsAccepted,
     SizeType32* outputSequenceLengths, TokenIdType const* draftIds, TokenIdType** idsPtrs, SizeType32 step,
