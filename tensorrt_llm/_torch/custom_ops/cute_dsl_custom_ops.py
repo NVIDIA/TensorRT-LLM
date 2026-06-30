@@ -3821,6 +3821,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             sf_n = ceil_div(n, 128)
             aligned_mn = pad_up(m, 4)
             n_tiles_per_group = ceil_div(n, 128)
+            # The cooperative SMEM epilogue wins through M=32. Larger shapes
+            # retain the register epilogue and share one dynamic-M kernel.
+            use_fp8_smem_epilogue = m <= 32
+            fp8_smem_row_iters = ceil_div(m, 16) if use_fp8_smem_epilogue else 1
 
             if c_tensor.dtype != torch.float8_e4m3fn or c_tensor.shape != (
                     batch_size, m, n):
@@ -3840,6 +3844,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 mma_tiler_mn,
                 cluster_shape_mn,
                 self.use_tvm_ffi,
+                fp8_smem_row_iters,
+                use_fp8_smem_epilogue,
             )
             if cache_key not in self.__class__.kernel_cache:
                 a_ptr = make_ptr(cutlass.Float8E4M3FN,
@@ -3894,6 +3900,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     sf_out_ptr,
                     aligned_mn,
                     n_tiles_per_group,
+                    fp8_smem_row_iters,
+                    use_fp8_smem_epilogue,
                     options="--opt-level 2 --enable-tvm-ffi",
                 )
                 self.__class__.kernel_cache[cache_key] = compiled_gemm

@@ -395,7 +395,7 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
 
 @skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.parametrize("num_tokens", [1, 16, 128, 256])
+@pytest.mark.parametrize("num_tokens", [1, 16, 32, 128, 256])
 def test_deepseek_v4_o_proj_fused_fp8_equivalence(num_tokens: int, monkeypatch):
     """The opt-in DSV4_FUSE_OPROJ fused fp8 epilogue must be numerically
     equivalent to the default unfused path.
@@ -461,13 +461,18 @@ def test_deepseek_v4_o_proj_fused_fp8_equivalence(num_tokens: int, monkeypatch):
     assert diff_vs_ref < FP8_O_PROJ_DIFF_TOL, f"fused vs reference {diff_vs_ref=}"
     assert diff_vs_unfused < 1e-3, f"fused vs unfused {diff_vs_unfused=}"
 
+    expected_smem_epilogue = num_tokens <= 32
+    expected_smem_row_iters = (num_tokens + 15) // 16 if expected_smem_epilogue else 1
+    fp8out_keys = [
+        key
+        for key in cute_dsl_custom_ops.CuteDSLFp8BlackwellBmmRunner.kernel_cache
+        if key[0] == "fp8out"
+        and key[-2] == expected_smem_row_iters
+        and key[-1] == expected_smem_epilogue
+    ]
+    assert len(fp8out_keys) == 1
+
     if num_tokens == 16:
-        fp8out_keys = [
-            key
-            for key in cute_dsl_custom_ops.CuteDSLFp8BlackwellBmmRunner.kernel_cache
-            if key[0] == "fp8out"
-        ]
-        assert len(fp8out_keys) == 1
         compiled_gemm = cute_dsl_custom_ops.CuteDSLFp8BlackwellBmmRunner.kernel_cache[
             fp8out_keys[0]
         ]
