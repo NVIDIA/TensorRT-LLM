@@ -1580,6 +1580,22 @@ class SpecWorkerBase(nn.Module, ABC):
         attn_metadata.kv_cache_block_offsets = attn_metadata.draft_kv_cache_block_offsets
         attn_metadata.host_kv_cache_block_offsets = draft_kv_cache_manager.host_kv_cache_block_offsets
 
+        # FlashMLA reads its own block tables (block_ids_per_seq /
+        # kv_block_ids_per_seq) that prepare() populated from the *target*
+        # manager. Those hold target block IDs, which index far outside the
+        # smaller draft pool and cause an out-of-bounds read in the FlashMLA
+        # kernel. Rebuild them from the draft manager (now active) and restore
+        # the target tables on exit.
+        refresh_flash_mla = (getattr(attn_metadata, 'enable_flash_mla', False)
+                             and attn_metadata.block_ids_per_seq is not None)
+        saved_block_ids_per_seq = None
+        saved_kv_block_ids_per_seq = None
+        if refresh_flash_mla:
+            saved_block_ids_per_seq = attn_metadata.block_ids_per_seq.clone()
+            saved_kv_block_ids_per_seq = attn_metadata.kv_block_ids_per_seq.clone(
+            )
+            attn_metadata.prepare_flash_mla()
+
         try:
             yield
         finally:
@@ -1587,6 +1603,11 @@ class SpecWorkerBase(nn.Module, ABC):
             attn_metadata.kv_cache_manager = target_kv_cache_manager
             attn_metadata.kv_cache_block_offsets = target_kv_cache_block_offsets
             attn_metadata.host_kv_cache_block_offsets = target_host_kv_cache_block_offsets
+            if refresh_flash_mla:
+                attn_metadata.block_ids_per_seq.copy_(saved_block_ids_per_seq)
+                attn_metadata.kv_block_ids_per_seq.copy_(
+                    saved_kv_block_ids_per_seq)
+                attn_metadata._flash_mla_metadata_valid = False
 
     def _sample_tokens_for_batch(
         self,
