@@ -2671,6 +2671,172 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk, seq_l
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
+@pytest.mark.parametrize("step0_mode", ["gen", "context"])
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size):
+    """Verify mtp_index_share: draft step 0 stashes each request's last-token
+    Top-K and draft steps > 0 reuse it verbatim (bit-exact), across > 1 draft
+    step. Covers both step-0 shapes: "gen" (steady state, next_n > 1) and
+    "context" (the first gen round after prefill, which runs the context path).
+    Step-0 Top-K correctness is covered by test_indexer_decode_custom_vs_fallback.
+    """
+    torch.manual_seed(7)
+    heads, head_dim, block_size = 32, 128, 64
+    max_model_len, index_topk, kv_len = 16384, 2048, 4096
+    step0_next_n = 2 if step0_mode == "gen" else 1
+    num_reuse_steps = 2
+    # md=1: on SM100, max_draft_tokens 2/>3 triggers the mock's expanded-MTP-buffer
+    # path, which assumes num_gen_tokens == num_generations * (1 + md).
+    md = 1
+
+    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        batch_size=batch_size,
+        head_dim=head_dim,
+        tokens_per_block=block_size,
+        max_seq_len=max_model_len,
+        num_layers=1,
+        index_topk=index_topk,
+    )
+    indexer = create_indexer(sparse_attn_config, layer_idx=0)
+    indexer.mtp_index_share = True
+
+    request_ids = list(range(batch_size))
+    kv_lens = torch.full((batch_size,), kv_len, dtype=torch.int32)
+    reserve = (kv_lens + step0_next_n + num_reuse_steps).tolist()
+    cache_manager.add_dummy_requests(
+        request_ids=request_ids,
+        token_nums=reserve,
+        is_gen=False,
+        prepare_resource=True,
+    )
+
+    def make_inputs(n_tokens):
+        q = torch.randn((n_tokens, heads, head_dim), device="cuda", dtype=torch.bfloat16).to(
+            torch.float8_e4m3fn
+        )
+        k = torch.randn((n_tokens, head_dim), device="cuda", dtype=torch.bfloat16)
+        k_fp8, k_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(k)
+        w = torch.randn((n_tokens, heads), device="cuda", dtype=torch.float32)
+        h = torch.randn((n_tokens, 4096), device="cuda", dtype=torch.bfloat16)
+        return h, q, k_fp8, k_scale, w
+
+    # Draft step 0: compute Top-K and stash each request's last-token row.
+    if step0_mode == "gen":
+        # Populate historical context so step 0 is a steady-state gen batch.
+        ctx_k = torch.randn((kv_lens.sum().item(), head_dim), device="cuda", dtype=torch.bfloat16)
+        ctx_k_fp8, ctx_k_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(ctx_k)
+        meta_ctx = _create_mock_metadata(
+            request_ids,
+            batch_size,
+            batch_size,
+            0,
+            kv_lens.clone(),
+            kv_lens.clone(),
+            [0] * batch_size,
+            cache_manager,
+            kv_lens.sum().item(),
+            kv_lens.sum().item(),
+            max_draft_tokens=md,
+        )
+        Indexer.prepare(meta_ctx)
+        indexer._update_k_cache(ctx_k_fp8, ctx_k_scale, meta_ctx)
+
+        step0_tokens = batch_size * step0_next_n
+        meta0 = _create_mock_metadata(
+            request_ids,
+            batch_size,
+            0,
+            batch_size,
+            torch.full((batch_size,), step0_next_n, dtype=torch.int32),
+            (kv_lens + step0_next_n).clone(),
+            kv_lens.tolist(),
+            cache_manager,
+            0,
+            step0_tokens,
+            max_model_len,
+            max_draft_tokens=md,
+        )
+        Indexer.prepare(meta0)
+        # indexer_topk_decode needs caller-owned radix aux buffers for small gen batches.
+        _radix_bp = 10
+        meta0.radix_aux_indices = torch.zeros(
+            (step0_tokens, _radix_bp, index_topk), device="cuda", dtype=torch.int32
+        )
+        meta0.radix_aux_logits = torch.zeros(
+            (step0_tokens, _radix_bp, index_topk), device="cuda", dtype=torch.float32
+        )
+    else:  # context: first gen round -- step 0 runs the context/prefill path.
+        step0_tokens = kv_lens.sum().item()
+        meta0 = _create_mock_metadata(
+            request_ids,
+            batch_size,
+            batch_size,
+            0,
+            kv_lens.clone(),
+            kv_lens.clone(),
+            [0] * batch_size,
+            cache_manager,
+            step0_tokens,
+            step0_tokens,
+            max_model_len,
+            max_draft_tokens=md,
+        )
+        Indexer.prepare(meta0)
+        # context stash branch reads seq_lens_cuda (a read-only property); set its backing field.
+        meta0._seq_lens_cuda = kv_lens.clone().cuda()
+
+    meta0.in_mtp_draft_loop = True
+    h0, q0, k0_fp8, k0_scale, w0 = make_inputs(step0_tokens)
+    indexer._update_k_cache(k0_fp8, k0_scale, meta0)
+    try:
+        topk0 = indexer.sparse_attn_indexer(
+            meta0, h0, q0, k0_fp8, k0_scale, w0, use_custom_topk=True
+        )
+    except Exception as e:
+        pytest.skip(f"Custom topk not available: {e}")
+
+    if step0_mode == "gen":
+        expected_rows = topk0[step0_next_n - 1 :: step0_next_n, :]
+    else:
+        ctx_last = torch.cumsum(kv_lens.to(torch.long), dim=0).cuda() - 1
+        expected_rows = topk0[ctx_last, :]
+
+    stash = meta0.shared_topk_indices
+    assert stash is not None, "Step 0 should stash shared_topk_indices"
+    assert stash.shape[0] == batch_size
+    assert torch.equal(stash, expected_rows), f"{step0_mode} step-0 stash mismatch"
+
+    # Draft steps 1..N: reuse the stash verbatim (next_n=1, skip_topk).
+    for step in range(1, num_reuse_steps + 1):
+        prior = step0_next_n + (step - 1)
+        meta = _create_mock_metadata(
+            request_ids,
+            batch_size,
+            0,
+            batch_size,
+            torch.ones(batch_size, dtype=torch.int32),
+            (kv_lens + prior + 1).clone(),
+            (kv_lens + prior).tolist(),
+            cache_manager,
+            0,
+            batch_size,
+            max_model_len,
+            max_draft_tokens=md,
+        )
+        Indexer.prepare(meta)
+        meta.in_mtp_draft_loop = True
+        meta.shared_topk_indices = stash
+        meta.indexer_skip_topk = True
+        hs, qs, ks_fp8, ks_scale, ws = make_inputs(batch_size)
+        indexer._update_k_cache(ks_fp8, ks_scale, meta)
+        topk = indexer.sparse_attn_indexer(meta, hs, qs, ks_fp8, ks_scale, ws, use_custom_topk=True)
+        assert torch.equal(topk, stash[:batch_size, :]), (
+            f"{step0_mode} draft reuse step {step} should copy the stash 1:1 (next_n=1)"
+        )
+
+
+@pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
+@skip_pre_hopper
 @pytest.mark.parametrize("batch_size", [4, 16])
 @pytest.mark.parametrize("index_topk", [2048])
 @pytest.mark.parametrize("chunk_size", [1024, 2048])

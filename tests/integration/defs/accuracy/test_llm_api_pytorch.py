@@ -7859,6 +7859,110 @@ class TestGLM52(LlmapiAccuracyTestHarness):
             task = GSM8K(model_name)
             task.evaluate(llm)
 
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(8)
+    @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
+    def test_nvfp4_mtp_index_share(self, tp_size, ep_size):
+        # Like test_nvfp4 but max_draft_len=3, exercising DSA indexer Top-K reuse
+        # across MTP draft steps (index_share_for_mtp_iteration=true from the checkpoint).
+        model_name = "zai-org/GLM-5.2"
+        model_path = f"{llm_models_root()}/GLM-5.2-NVFP4"
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=128,
+                                              enable_padding=True),
+            moe_config=MoeConfig(backend="CUTEDSL"),
+            speculative_config=MTPDecodingConfig(max_draft_len=3),
+            enable_chunked_prefill=True,
+        )
+
+        with LLM(model_path,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=1,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 max_seq_len=8192,
+                 **pytorch_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = GSM8K(model_name)
+            task.evaluate(llm)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(8)
+    @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
+    def test_nvfp4_mtp_index_share_mtp_ar(self, tp_size, ep_size):
+        # Acceptance-rate guard for max_draft_len=3 + index-share; counts accepted
+        # drafts from streaming (get_stats needs enable_iter_perf_stats).
+        model_path = f"{llm_models_root()}/GLM-5.2-NVFP4"
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+        max_draft_len = 3
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=128,
+                                              enable_padding=True),
+            moe_config=MoeConfig(backend="CUTEDSL"),
+            speculative_config=MTPDecodingConfig(max_draft_len=max_draft_len),
+            enable_chunked_prefill=True,
+        )
+
+        with LLM(model_path,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=1,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 max_seq_len=8192,
+                 **pytorch_config) as llm:
+            raw_prompts = [
+                "The capital of France is",
+                "The president of the United States is",
+                "The future of AI is",
+            ]
+            prompts = [
+                llm.tokenizer.apply_chat_template(
+                    [{
+                        "role": "user",
+                        "content": p
+                    }],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                ) for p in raw_prompts
+            ]
+            tok_ids = [llm.tokenizer.encode(p) for p in prompts]
+            sampling_params = SamplingParams(max_tokens=128, temperature=0)
+
+            total_drafted = 0
+            total_accepted = 0
+            for i, prompt_ids in enumerate(tok_ids):
+                num_tokens = 0
+                num_drafted = 0
+                num_accepted = 0
+                for output in llm.generate_async(prompt_ids,
+                                                 sampling_params,
+                                                 streaming=True):
+                    new_tokens = output.outputs[0].token_ids
+                    num_drafted += max_draft_len
+                    num_accepted += len(new_tokens) - num_tokens - 1
+                    num_tokens = len(new_tokens)
+
+                accept_rate = num_accepted / num_drafted
+                total_drafted += num_drafted
+                total_accepted += num_accepted
+                print(
+                    f"GLM-5.2 MTP index-share prompt {i} acceptance rate: "
+                    f"{accept_rate:.2%} ({num_accepted}/{num_drafted} tokens)")
+
+            aggregate_accept_rate = (total_accepted / total_drafted
+                                     if total_drafted > 0 else 0.0)
+            print("GLM-5.2 MTP index-share aggregate acceptance rate: "
+                  f"{aggregate_accept_rate:.2%} ({total_accepted}/"
+                  f"{total_drafted} tokens across {len(tok_ids)} prompts)")
+            assert aggregate_accept_rate > 0.2, (
+                f"Aggregate acceptance rate {aggregate_accept_rate:.2%} "
+                f"below threshold 20%")
+
 
 @skip_pre_blackwell
 class TestStep3_7(LlmapiAccuracyTestHarness):
