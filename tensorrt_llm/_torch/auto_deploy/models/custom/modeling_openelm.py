@@ -17,7 +17,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Prefill-only OpenELM model for auto_deploy export.
+"""Prefill-only OpenELM model for auto_deploy export (sharding IR).
 
 Source: https://huggingface.co/apple/OpenELM-270M-Instruct
 
@@ -36,7 +36,11 @@ unrecognized kwargs such as ``use_cache`` to ``self.__post_init__(**kwargs)``),
 raising ``TypeError`` before any model code runs. Vendoring the config locally
 mirrors the pattern used by the other AutoDeploy custom models (e.g. EXAONE) and
 removes Apple's frozen remote code from the execution path entirely.
-Uses AutoDeploy canonical IR ops for export compatibility.
+
+Uses AutoDeploy sharding-IR hint ops (``torch_linear_simple`` / ``view`` /
+``split_with_sizes`` / ``all_reduce``) so the exported FX graph fully specifies
+tensor-parallel sharding for ``apply_sharding_hints`` (no legacy
+``detect_sharding`` heuristics needed).
 """
 
 from dataclasses import dataclass
@@ -269,7 +273,14 @@ class OpenELMRotaryEmbedding(nn.Module):
 
 
 class OpenELMFeedForwardNetwork(nn.Module):
-    """GLU-style FFN with fused gate+up projection (proj_1) and down projection (proj_2)."""
+    """GLU-style FFN with fused gate+up projection (proj_1) and down projection (proj_2).
+
+    Sharding strategy:
+      proj_1 (fused gate|up) -> colwise (output_sizes=[inter, inter] for the GLU
+                                variant so each half shards proportionally)
+      split (gate|up)        -> enable_sharding (split sizes scale with TP)
+      proj_2 (down)          -> rowwise + all_reduce
+    """
 
     def __init__(self, config, layer_idx: int):
         super().__init__()
@@ -277,6 +288,7 @@ class OpenELMFeedForwardNetwork(nn.Module):
         intermediate_dim = int(
             _make_divisible(ffn_multiplier * config.model_dim, divisor=config.ffn_dim_divisor)
         )
+        self.intermediate_dim = intermediate_dim
 
         if config.ffn_with_glu:
             self.proj_1 = nn.Linear(config.model_dim, 2 * intermediate_dim, bias=False)
@@ -291,11 +303,45 @@ class OpenELMFeedForwardNetwork(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.ffn_with_glu:
-            y_12 = self.proj_1(x)
-            y_1, y_2 = y_12.chunk(2, dim=-1)
-            return self.proj_2(self.act(y_1) * y_2)
+            y_12 = torch.ops.auto_deploy.torch_linear_simple(
+                x,
+                self.proj_1.weight,
+                self.proj_1.bias,
+                tp_mode="colwise",
+                output_sizes=[self.intermediate_dim, self.intermediate_dim],
+                layer_type="mlp",
+            )
+            y_1, y_2 = torch.ops.auto_deploy.split_with_sizes(
+                y_12,
+                [self.intermediate_dim, self.intermediate_dim],
+                dim=-1,
+                enable_sharding=True,
+                layer_type="mlp",
+            )
+            out = torch.ops.auto_deploy.torch_linear_simple(
+                self.act(y_1) * y_2,
+                self.proj_2.weight,
+                self.proj_2.bias,
+                tp_mode="rowwise",
+                layer_type="mlp",
+            )
+            return torch.ops.auto_deploy.all_reduce(out, layer_type="mlp")
         else:
-            return self.proj_2(self.act(self.proj_1(x)))
+            y = torch.ops.auto_deploy.torch_linear_simple(
+                x,
+                self.proj_1.weight,
+                self.proj_1.bias,
+                tp_mode="colwise",
+                layer_type="mlp",
+            )
+            out = torch.ops.auto_deploy.torch_linear_simple(
+                self.act(y),
+                self.proj_2.weight,
+                self.proj_2.bias,
+                tp_mode="rowwise",
+                layer_type="mlp",
+            )
+            return torch.ops.auto_deploy.all_reduce(out, layer_type="mlp")
 
 
 # =============================================================================
@@ -304,7 +350,15 @@ class OpenELMFeedForwardNetwork(nn.Module):
 
 
 class OpenELMAttention(nn.Module):
-    """GQA attention with fused QKV proj, Q/K norms, canonical AD ops."""
+    """GQA attention with fused QKV proj, Q/K norms, canonical AD ops.
+
+    Sharding strategy:
+      qkv_proj (fused Q|K|V) -> colwise (output_sizes=[q_dim, k_dim, v_dim],
+                                tp_min_local_shape=head_dim for GQA)
+      view (head-count dim)  -> tp_scaled_dim=2
+      split (Q|K|V)          -> enable_sharding (split sizes scale with TP)
+      out_proj               -> rowwise + all_reduce
+    """
 
     def __init__(self, config, layer_idx: int):
         super().__init__()
@@ -335,13 +389,34 @@ class OpenELMAttention(nn.Module):
     ) -> torch.Tensor:
         bsz, seq_len, _ = hidden_states.size()
 
-        # Fused QKV projection → split
-        qkv = self.qkv_proj(hidden_states)
-        qkv = qkv.view(
-            bsz, seq_len, self.num_q_heads + self.num_k_heads + self.num_v_heads, self.head_dim
+        # Fused QKV projection → view → split. ``output_sizes`` shards each of the
+        # Q/K/V blocks proportionally under colwise TP; the view's head-count dim and
+        # the split sizes both scale with TP so the per-rank shapes stay consistent.
+        qkv = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.qkv_proj.weight,
+            self.qkv_proj.bias,
+            tp_mode="colwise",
+            output_sizes=[
+                self.num_q_heads * self.head_dim,
+                self.num_k_heads * self.head_dim,
+                self.num_v_heads * self.head_dim,
+            ],
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
         )
-        queries, keys, values = qkv.split(
-            [self.num_q_heads, self.num_k_heads, self.num_v_heads], dim=2
+        qkv = torch.ops.auto_deploy.view(
+            qkv,
+            [bsz, seq_len, self.num_q_heads + self.num_k_heads + self.num_v_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        queries, keys, values = torch.ops.auto_deploy.split_with_sizes(
+            qkv,
+            [self.num_q_heads, self.num_k_heads, self.num_v_heads],
+            dim=2,
+            enable_sharding=True,
+            layer_type="mha",
         )
 
         # Q/K normalization (per-head, operates on last dim = head_dim)
@@ -365,8 +440,20 @@ class OpenELMAttention(nn.Module):
             queries, keys, values, is_causal=True, dropout_p=0.0, layout="bsnd"
         )
 
-        attn_output = attn_output.reshape(bsz, seq_len, self.num_q_heads * self.head_dim)
-        return self.out_proj(attn_output)
+        attn_output = torch.ops.auto_deploy.view(
+            attn_output,
+            [bsz, seq_len, self.num_q_heads * self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        attn_output = torch.ops.auto_deploy.torch_linear_simple(
+            attn_output,
+            self.out_proj.weight,
+            self.out_proj.bias,
+            tp_mode="rowwise",
+            layer_type="mha",
+        )
+        return torch.ops.auto_deploy.all_reduce(attn_output, layer_type="mha")
 
 
 # =============================================================================
