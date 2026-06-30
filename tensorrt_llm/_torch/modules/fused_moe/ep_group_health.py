@@ -20,6 +20,7 @@ structure that records which Expert Parallel (EP) ranks the recovery coordinator
 has committed as included vs. excluded from the data plane. It is consumed by:
 
   * AlltoAll communication backends (rank masking on dispatch / combine)
+  * The host-side AlltoAll watchdog (read-only expected-peer snapshot)
   * The MoE load balancer (emergency-mask reconfiguration)
   * The model engine and PyExecutor (degraded health reporting)
 
