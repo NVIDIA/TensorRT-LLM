@@ -33,6 +33,7 @@ from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm._torch.alltoall_watchdog import (
     DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
     DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S,
+    ActiveRankMaskSnapshot,
     AlltoAllWatchdog,
     AlltoAllWatchdogCoordinator,
     AlltoAllWatchdogTimeout,
@@ -425,7 +426,8 @@ class NVLinkOneSided(Communication):
             all_rank_num_tokens: Token counts per rank [ep_size]
             use_dp_padding: Whether to use DP padding (optional)
             **kwargs: Strategy-specific arguments. ``active_rank_mask`` may override the committed membership
-                for dispatch; the captured value is reused by combine.
+                for dispatch. Without an override, the committed mask and generation are captured together;
+                combine reuses that mask and fails closed if the generation changes first.
 
         Returns:
             Tuple of (hidden_states, hidden_states_sf, token_selected_slots, token_final_scales)
@@ -456,9 +458,10 @@ class NVLinkOneSided(Communication):
             assert eplb_local_stats.size(0) == self.eplb_stats_num_experts, (
                 "eplb_local_stats size must match eplb_stats_num_experts"
             )
-        active_rank_mask = self._watchdog_coordinator.active_rank_mask_tensor(
+        active_rank_mask_snapshot = self._watchdog_coordinator.capture_active_rank_mask(
             kwargs.get("active_rank_mask")
         )
+        active_rank_mask = active_rank_mask_snapshot.active_rank_mask
 
         recv_buffers, combine_payload_offset, eplb_gathered_stats = (
             torch.ops.trtllm.moe_a2a_dispatch(
@@ -484,7 +487,7 @@ class NVLinkOneSided(Communication):
         self._dispatch_state["combine_payload_offset"] = int(combine_payload_offset)
         self._dispatch_state["local_num_tokens"] = token_selected_slots.size(0)
         self._dispatch_state["runtime_max_tokens_per_rank"] = runtime_max_tokens_per_rank
-        self._dispatch_state["active_rank_mask"] = active_rank_mask
+        self._dispatch_state["active_rank_mask_snapshot"] = active_rank_mask_snapshot
         self._dispatch_state["phase"] = "dispatched"
 
         # Extract results from recv_buffers
@@ -548,7 +551,8 @@ class NVLinkOneSided(Communication):
                 Shape: [ep_size, max_tokens_per_rank, hidden_size] or
                        [ep_size * max_tokens_per_rank, hidden_size] (will be reshaped)
             **kwargs: Strategy-specific arguments. If ``active_rank_mask`` is supplied, it must match the mask
-                captured by dispatch for this collective.
+                captured by dispatch for this collective. A committed-generation change since dispatch aborts
+                the collective epoch.
 
         Returns:
             Combined output tensor [local_num_tokens, hidden_size]
@@ -583,8 +587,11 @@ class NVLinkOneSided(Communication):
             raise ValueError(
                 f"final_hidden_states must be 2D or 3D, got {final_hidden_states.dim()}D"
             )
+        active_rank_mask_snapshot = self._dispatch_state.get("active_rank_mask_snapshot")
+        if not isinstance(active_rank_mask_snapshot, ActiveRankMaskSnapshot):
+            raise RuntimeError("combine called but dispatch rank-mask snapshot is missing")
         active_rank_mask = self._watchdog_coordinator.active_rank_mask_for_combine(
-            self._dispatch_state.get("active_rank_mask"),
+            active_rank_mask_snapshot,
             kwargs.get("active_rank_mask"),
         )
         output = torch.ops.trtllm.moe_a2a_combine(
