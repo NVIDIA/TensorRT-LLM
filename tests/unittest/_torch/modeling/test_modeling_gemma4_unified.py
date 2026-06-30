@@ -77,9 +77,10 @@ class TestGemma4UnifiedRegistration(unittest.TestCase):
         from tensorrt_llm._torch.models.checkpoints.hf.gemma4_weight_mapper import (
             Gemma4HfWeightMapper,
         )
-        from tensorrt_llm._torch.models.modeling_utils import get_model_mapper
+        from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPER_MAPPING
 
-        mapper_cls = get_model_mapper("HF", _UNIFIED_ARCH)
+        # register_mapper("HF", name) stores the mapper under key f"{name}_{format}".
+        mapper_cls = MODEL_CLASS_MAPPER_MAPPING.get(f"{_UNIFIED_ARCH}_HF")
         self.assertIs(mapper_cls, Gemma4HfWeightMapper)
 
 
@@ -105,6 +106,10 @@ class TestGemma4UnifiedWeightRouting(unittest.TestCase):
             Gemma4UnifiedForConditionalGeneration
         )
         wrapper.llm = _FakeLLM()
+        # __new__ bypasses __init__; the encoder-free MM embedders are consulted
+        # in load_weights only when present. None = text-only routing (Phase A).
+        wrapper.embed_vision = None
+        wrapper.embed_audio = None
 
         raw = {
             "model.language_model.embed_tokens.weight": 0,
