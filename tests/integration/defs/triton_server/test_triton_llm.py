@@ -2406,6 +2406,49 @@ def test_tiny_llama_1b_guided_decoding(
             validate_by_keyword(output, keyword)
 
 
+# Define model configurations as a dictionary
+MODEL_CONFIGS = {
+    "llama_v2_7b": {
+        "example_root_fixture": "tensorrt_llm_llama_example_root",
+        "tokenizer_path_fixture": "llama_v2_tokenizer_model_root",
+        "prepare_engine_fn": prepare_llama_v2_7b_engine
+    },
+    "gptj_6b": {
+        "example_root_fixture": "tensorrt_llm_gptj_example_root",
+        "tokenizer_path_fixture": "gptj_tokenizer_model_root",
+        "prepare_engine_fn": prepare_gptj_6b_engine
+    },
+}
+
+# Latency thresholds for different GPUs and models
+LATENCY_THRESHOLDS = {
+    "NVIDIA H100 PCIe": {
+        "gptj_6b": 1300,  # Threshold in milliseconds
+        "llama_v2_7b": 1200,
+        # Can add more models here with their thresholds
+    },
+    # Can add more GPU types here
+}
+
+
+# Fixture to handle model configuration
+@pytest.fixture
+def model_setup(request):
+    model_name = request.param
+    config = MODEL_CONFIGS[model_name]
+
+    # Get the actual fixture values
+    example_root = request.getfixturevalue(config["example_root_fixture"])
+    tokenizer_path = request.getfixturevalue(config["tokenizer_path_fixture"])
+
+    return {
+        "name": model_name,
+        "example_root": example_root,
+        "tokenizer_path": tokenizer_path,
+        "prepare_engine_fn": config["prepare_engine_fn"]
+    }
+
+
 @pytest.mark.parametrize("ACCUMULATE_TOKEN", ["False"])
 @pytest.mark.parametrize("BLS_INSTANCE_COUNT", ["1"])
 @pytest.mark.parametrize("PREPROCESSING_INSTANCE_COUNT", ["1"])
