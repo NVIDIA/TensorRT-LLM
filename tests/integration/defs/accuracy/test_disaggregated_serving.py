@@ -1503,15 +1503,17 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
 
     @pytest.mark.skip_less_device(2)
+    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
+                             ids=["cache_mgr_v1", "cache_mgr_v2"])
     @skip_pre_hopper
-    def test_kv_cache_v2_nixl_python(self):
-        """Test with use_kv_cache_manager_v2=True, block_reuse=False, backend=NIXL, transceiver_runtime=PYTHON."""
+    def test_kv_cache_v2_nixl_python(self, use_kv_cache_manager_v2):
+        """Test with KV cache manager v1 and v2, block_reuse=False, backend=NIXL, transceiver_runtime=PYTHON."""
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "cuda_graph_config": None,
             "kv_cache_config": {
                 "enable_block_reuse": False,
-                "use_kv_cache_manager_v2": True
+                "use_kv_cache_manager_v2": use_kv_cache_manager_v2
             },
             "cache_transceiver_config": {
                 "backend": "NIXL",
@@ -1523,7 +1525,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             "cuda_graph_config": None,
             "kv_cache_config": {
                 "enable_block_reuse": False,
-                "use_kv_cache_manager_v2": True
+                "use_kv_cache_manager_v2": use_kv_cache_manager_v2
             },
             "cache_transceiver_config": {
                 "backend": "NIXL",
@@ -2483,4 +2485,73 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
         ctx_cfg, gen_cfg, disagg_cfg = self._make_configs(use_py_transceiver)
         with launch_disaggregated_llm(disagg_cfg, ctx_cfg, gen_cfg,
                                       self.MODEL_PATH) as llm:
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+
+@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
+@skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(80000)
+class TestGLM5FP4(LlmapiAccuracyTestHarness):
+    # GLM-5 NVFP4 MoE checkpoint exercised in disaggregated serving. Context and
+    # generation each run TP4/EP4 (8 GPUs total), mirroring the GLM-5 NVFP4
+    # disagg stress config. The KV cache is exchanged over the NIXL Python
+    # transceiver (transceiver v2). Only KV cache manager v1 is covered here.
+    MODEL_NAME = "zai-org/GLM-5"
+    MODEL_PATH = f"{llm_models_root()}/GLM-5-NVFP4"
+
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False],
+                             ids=["cache_mgr_v1"])
+    def test_nvfp4_nixl_python(self, use_kv_cache_manager_v2):
+        """GLM-5 NVFP4 disagg, ctx TP4/EP4 + gen TP4/EP4 (8 GPUs), NIXL Python
+        transceiver (v2), KV cache manager v1."""
+        kv_cache_config = {
+            "free_gpu_memory_fraction": 0.7,
+            "enable_block_reuse": False,
+            "dtype": "fp8",
+            "use_kv_cache_manager_v2": use_kv_cache_manager_v2,
+        }
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+        }
+        moe_config = {"backend": "TRTLLM"}
+        ctx_server_config = {
+            "tensor_parallel_size": 4,
+            "pipeline_parallel_size": 1,
+            "moe_expert_parallel_size": 4,
+            "enable_attention_dp": True,
+            "disable_overlap_scheduler": True,
+            "enable_chunked_prefill": True,
+            "cuda_graph_config": None,
+            "kv_cache_config": kv_cache_config,
+            "moe_config": moe_config,
+            "cache_transceiver_config": cache_transceiver_config,
+        }
+        gen_server_config = {
+            "tensor_parallel_size": 4,
+            "pipeline_parallel_size": 1,
+            "moe_expert_parallel_size": 4,
+            "enable_attention_dp": True,
+            "disable_overlap_scheduler": False,
+            "enable_chunked_prefill": True,
+            "kv_cache_config": kv_cache_config,
+            "moe_config": moe_config,
+            "cache_transceiver_config": cache_transceiver_config,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      self.MODEL_PATH,
+                                      max_workers=128) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
