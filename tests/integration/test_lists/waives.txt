@@ -469,7 +469,6 @@ unittest/_torch/visual_gen/multi_gpu/test_wan_tp.py::TestWanT2VTP::test_wan_t2v_
 unittest/_torch/visual_gen/multi_gpu/test_wan_transformer_parallel.py::TestWanTransformerParallel::test_parallel_all_combinations_vs_single_gpu_8gpu[attn2d_1x4_ul2] SKIP (https://nvbugs/6385134)
 unittest/_torch/visual_gen/test_attention_integration.py::test_sage_attention_self_attention[fp8-2-1560] SKIP (https://nvbugs/6198760)
 unittest/_torch/visual_gen/test_attention_integration.py::test_sage_attention_self_attention[int8-2-1560] SKIP (https://nvbugs/6198760)
-unittest/auto_deploy/singlegpu/smoke SKIP (https://nvbugs/6306936)
 unittest/bindings/test_transfer_agent_bindings.py::TestNixlFunctionalTransfer::test_nixl_wait_in_progress_on_zero_timeout SKIP (https://nvbugs/6260897)
 unittest/executor/test_rpc.py::TestRpcCorrectness::test_incremental_task_async SKIP (https://nvbugs/5741476)
 unittest/executor/test_rpc_proxy.py SKIP (https://nvbugs/5605741)
