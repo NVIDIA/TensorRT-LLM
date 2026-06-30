@@ -128,6 +128,15 @@ commands:
         is_flag: true
         flags:
         - "--enable_chunked_prefill"
+      enable_visual_gen:
+        type: bool
+        default: false
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: true
+        flags:
+        - "--enable_visual_gen"
       extra_llm_api_options:
         type: str
         default: null
@@ -322,8 +331,17 @@ commands:
         is_flag: false
         flags:
         - "--port"
+      post_processor_hook:
+        type: str
+        default: null
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--post_processor_hook"
       reasoning_parser:
-        type: Choice(['auto', 'deepseek-r1', 'gemma4', 'kimi_k2', 'kimi_k25', 'laguna', 'minimax_m2', 'minimax_m2_append_think', 'minimax_m3', 'nano-v3', 'nemotron-v3', 'qwen3', 'qwen3_5'])
+        type: Choice(['auto', 'deepseek-r1', 'deepseek_v4', 'gemma4', 'kimi_k2', 'kimi_k25', 'laguna', 'minimax_m2', 'minimax_m2_append_think', 'minimax_m3', 'nano-v3', 'nemotron-v3', 'qwen3', 'qwen3_5'])
         default: null
         status: prototype
         required: false
@@ -389,7 +407,7 @@ commands:
         flags:
         - "--tokenizer"
       tool_parser:
-        type: Choice(['auto', 'deepseek_v3', 'deepseek_v31', 'deepseek_v32', 'gemma4', 'glm4', 'glm47', 'kimi_k2', 'minimax_m2', 'minimax_m3', 'poolside_v1', 'qwen3', 'qwen3_coder'])
+        type: Choice(['auto', 'deepseek_v3', 'deepseek_v31', 'deepseek_v32', 'deepseek_v4', 'gemma4', 'glm4', 'glm47', 'kimi_k2', 'minimax_m2', 'minimax_m3', 'poolside_v1', 'qwen3', 'qwen3_coder'])
         default: null
         status: prototype
         required: false
