@@ -1940,11 +1940,17 @@ class GvrTopKKernel:
                     for w3 in cutlass.range_constexpr(self.num_warps):
                         if cutlass.Int32(w3) < twf:
                             pre = pre + smem_wcnt[w3]
-                    smem_hist[0] = pre   # prefix into target fine warp
-                    smem_hist[1] = twf   # target fine warp
+                    # Stage prefix/target-warp metadata in spare s_iscalars
+                    # slots, NOT smem_hist[0]/[1]: the last fine warp's reverse
+                    # scan below walks fine bins down to 0/1, so reusing those
+                    # histogram bins as scratch would corrupt sb_star/ra_fine
+                    # when twf2 == num_warps-1. Slots [4]/[1] are dead here
+                    # (re-zeroed at the cnt_above/cnt_strad reset below).
+                    s_iscalars[4] = pre   # prefix into target fine warp
+                    s_iscalars[1] = twf   # target fine warp
                 cute.arch.barrier()
-                pre_f = smem_hist[0]
-                twf2 = smem_hist[1]
+                pre_f = s_iscalars[4]
+                twf2 = s_iscalars[1]
                 if warp_id == twf2 and lane == cutlass.Int32(0):
                     base_f = pre_f
                     sb_star = cutlass.Int32(fbins - 1)
