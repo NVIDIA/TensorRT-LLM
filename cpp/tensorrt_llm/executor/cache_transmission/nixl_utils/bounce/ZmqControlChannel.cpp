@@ -44,6 +44,13 @@ ZmqControlChannel::ZmqControlChannel(std::string selfName, std::string const& bi
     // is unreachable (ROUTER drops messages to unknown/again-full peers by default).
     mRouter.set(zmq::sockopt::routing_id, mSelfName);
     mRouter.set(zmq::sockopt::linger, 0);
+    // Accept a reconnecting peer that reuses an existing routing id. Our peers' DEALERs identify by a
+    // fixed agent name, so when a peer is forgotten (removePeer drops its DEALER) and later comes back
+    // — same agent name = same identity — it reconnects with the SAME routing id. Without handover the
+    // ROUTER REJECTS the new connection while the old one is still being reaped and SILENTLY DROPS its
+    // messages (a forgotten-then-readded peer's WANTs vanish -> leaseTimeout). HANDOVER hands the
+    // identity to the new connection instead. (Loopback reconnect makes this race easy to hit.)
+    mRouter.set(zmq::sockopt::router_handover, 1);
     // zmq disables IPv6 on a socket by default, so binding an IPv6 address would fail. Enable it when
     // the bind address is IPv6 (brackets, e.g. "tcp://[::1]:*"). Mirrors ucx_utils. (Default ctor arg
     // is the IPv4 loopback, so tests are unaffected.)
