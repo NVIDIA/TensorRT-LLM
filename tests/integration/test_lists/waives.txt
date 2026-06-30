@@ -92,7 +92,6 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=Tru
 accuracy/test_llm_api_pytorch.py::TestStep3_7::test_fp8_block_scales[tp_size=4-ep_size=4-mtp_nextn=3] SKIP (https://nvbugs/6367805)
 accuracy/test_llm_api_pytorch.py::TestStep3_7::test_nvfp4[tp_size=4-ep_size=4-mtp_nextn=3] SKIP (https://nvbugs/6367805)
 accuracy/test_llm_api_pytorch_multimodal.py::TestMistralLarge3_675B::test_nvfp4_4gpus[latency_moe_trtllm] SKIP (https://nvbugs/6248827)
-accuracy/test_llm_api_pytorch_multimodal.py::TestNanoV3Omni::test_auto_dtype[nvfp4] SKIP (https://nvbugs/6336747)
 accuracy/test_llm_api_pytorch_multimodal.py::TestStep3_7::test_nvfp4[mtp_nextn=3] SKIP (https://nvbugs/6367805)
 cpp/test_e2e.py::test_benchmarks[bart-90] SKIP (https://nvbugs/5550689)
 cpp/test_e2e.py::test_benchmarks[gpt-80] SKIP (https://nvbugs/5550689)

@@ -14,6 +14,7 @@ from ..llmapi.utils import print_traceback_on_error
 from ..logger import logger
 from ..sampling_params import SamplingParams
 from .ipc import ZeroMqQueue
+from .postprocessor_hook import load_post_processor_hook
 from .utils import ErrorResponse, is_llm_response
 
 if TYPE_CHECKING:
@@ -46,6 +47,10 @@ class PostprocWorkerConfig:
     ''' The config for the postprocess worker. '''
     num_postprocess_workers: int = 0
     postprocess_tokenizer_dir: Optional[str] = None
+    # Dotted import path of the user post-processing hook, or
+    # None. NOTE: distinct from ``PostprocParams.post_processor``, which is the
+    # per-endpoint response *formatter* (a Callable), not this hook.
+    post_processor_hook: Optional[str] = None
 
     @property
     def enabled(self) -> bool:
@@ -85,6 +90,7 @@ class PostprocWorker:
         tokenizer_dir: str,
         record_creator: Callable[
             ["PostprocWorker.Input", TransformersTokenizer], Any],
+        post_processor_hook: Optional[str] = None,
     ):
         '''
         Args:
@@ -93,6 +99,7 @@ class PostprocWorker:
             tokenizer_dir (str): The directory to load tokenizer.
             record_creator (Callable[["ResponsePostprocessWorker.Input"], Any]): A creator for creating a record for a request.
             result_handler (Optional[Callable[[GenerationResultBase], Any]]): A callback handles the final result.
+            post_processor_hook (Optional[str]): Import path of the user post-processing hook; built once and threaded onto each record.
         '''
 
         self._records: Dict[int, GenerationResult] = {}
@@ -112,6 +119,12 @@ class PostprocWorker:
 
         # Load the tokenizer and share in all records
         self._tokenizer = load_hf_tokenizer(tokenizer_dir)
+
+        # Build the user post-processing hook once, like the
+        # tokenizer above; threaded onto each record in ``_handle_input``.
+        self._post_processor_hook = (
+            load_post_processor_hook(post_processor_hook)
+            if post_processor_hook else None)
 
     @staticmethod
     def default_record_creator(
@@ -144,6 +157,10 @@ class PostprocWorker:
                 # TODO: support variant creation later
                 self._records[req_id] = self._record_creator(
                     input, self._tokenizer)
+                # Thread the hook onto the record here rather than
+                # via record_creator, so custom record_creators keep working.
+                self._records[
+                    req_id]._post_processor_hook = self._post_processor_hook
                 if input.disaggregated_params is not None:
                     self._records[
                         req_id]._disaggregated_params = input.disaggregated_params
@@ -202,6 +219,11 @@ class PostprocWorker:
                 res, metrics, perf_metrics, disaggregated_params = await self._handle_input(
                     inp)
                 record = self._records.get(client_id)
+                # A `terminate` verdict forces the record done;
+                # honor it so the stream stops and the record is popped without
+                # waiting for the engine's own is_final.
+                if record is not None and record._done:
+                    is_final = True
                 should_abort = record._aborted if record else False
                 finish_reason = record.outputs[0].finish_reason if (
                     record and record.outputs
@@ -221,7 +243,7 @@ class PostprocWorker:
                         num_generated_tokens=num_generated_tokens,
                     ))
                 if is_final:
-                    self._records.pop(client_id)
+                    self._records.pop(client_id, None)
             except Exception as e:
                 logger.error(
                     f"Postprocessing error for client {client_id}: {e}\n"
@@ -268,9 +290,13 @@ class PostprocWorker:
 @print_traceback_on_error
 def postproc_worker_main(feedin_ipc_addr: tuple[str, Optional[bytes]],
                          feedout_ipc_addr: tuple[str, Optional[bytes]],
-                         tokenizer_dir: str, record_creator: Callable):
+                         tokenizer_dir: str,
+                         record_creator: Callable,
+                         post_processor_hook: Optional[str] = None):
+    # Pass the hook import path; PostprocWorker builds it once.
     worker = PostprocWorker(feedin_ipc_addr,
                             feedout_ipc_addr,
                             tokenizer_dir=tokenizer_dir,
-                            record_creator=record_creator)
+                            record_creator=record_creator,
+                            post_processor_hook=post_processor_hook)
     worker.start()
