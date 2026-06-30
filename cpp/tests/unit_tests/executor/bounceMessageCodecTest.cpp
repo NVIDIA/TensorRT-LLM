@@ -51,18 +51,27 @@ TEST(BounceMessageCodec, WantCarriesChunkSizesAndEndpoint)
     EXPECT_EQ(outEp, ep);
 }
 
-TEST(BounceMessageCodec, WantEmptyIsCancelbutStillCarriesEndpoint)
+TEST(BounceMessageCodec, CancelIsEmptyWantThatStillCarriesEndpoint)
 {
     std::string const ep = "tcp://127.0.0.1:9999";
-    auto blob = b::encodeWant(42, {}, ep);
+    auto blob = b::encodeCancel(42, ep); // same wire form as an empty-chunk WANT
     auto h = decodeOk(blob, b::BounceMsgType::kWANT);
-    EXPECT_EQ(h.count, 0u); // no chunks -> cancel
+    EXPECT_EQ(h.count, 0u);              // no chunks -> cancel
     EXPECT_EQ(h.aux, 0u);
     std::vector<std::uint32_t> out;
     std::string outEp;
     ASSERT_TRUE(b::decodeWant(blob, h, out, outEp));
     EXPECT_TRUE(out.empty());
-    EXPECT_EQ(outEp, ep); // endpoint still travels so the receiver can bootstrap even on a bare cancel
+    EXPECT_TRUE(b::isCancelWant(out)); // decoded WANT is recognized as a cancel
+    EXPECT_EQ(outEp, ep);              // endpoint still travels so the receiver can bootstrap even on a bare cancel
+
+    // A real (non-empty) WANT is NOT a cancel.
+    std::vector<std::uint32_t> real;
+    std::string ep2;
+    auto wblob = b::encodeWant(43, std::vector<std::uint32_t>{4096}, ep);
+    auto wh = decodeOk(wblob, b::BounceMsgType::kWANT);
+    ASSERT_TRUE(b::decodeWant(wblob, wh, real, ep2));
+    EXPECT_FALSE(b::isCancelWant(real));
 }
 
 TEST(BounceMessageCodec, WantEmptyEndpointRoundTrips)
