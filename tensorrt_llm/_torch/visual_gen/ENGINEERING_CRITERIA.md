@@ -25,7 +25,7 @@ end-to-end workflow.
    `VisualGenParams` fields (§2).
 4. **Example in CI.** At least one example per model series,
    exercised in pre-merge CI.
-5. **E2E vs reference framework.** One per task per checkpoint (T2I /
+5. **E2E vs reference.** One per task per checkpoint (T2I /
    T2V / TI2V) with LPIPS — or an equivalent metric — at an explicit
    threshold, comparing against a baseline image/video produced by a
    reference framework.
