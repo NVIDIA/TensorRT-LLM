@@ -165,6 +165,10 @@ class RpcExecutorMixin:
             method_name="_fetch_responses_loop_async",
         )
 
+    def _get_ep_health_stats(self, timeout: float = 1.0) -> Optional[dict]:
+        """Fetch passive committed EP membership from the rank-0 RPC worker."""
+        return self.rpc_client.fetch_ep_health_stats().remote(timeout=timeout)
+
     # NOTE: _fetch_stats_loop_async and _fetch_kv_cache_events_loop_async have been removed.
     # Stats and kv_events are now fetched on-demand via direct RPC calls
     # (get_stats, aget_stats, get_kv_events, aget_kv_events) instead of streaming loops.
