@@ -7,6 +7,6 @@ from .pipeline_hunyuandit import HunyuanDiTPipeline
 from .transformer_hunyuandit import HunyuanDiT2DModelWrapper
 
 __all__ = [
-    "HunyuanDiTPipeline",
     "HunyuanDiT2DModelWrapper",
+    "HunyuanDiTPipeline",
 ]
