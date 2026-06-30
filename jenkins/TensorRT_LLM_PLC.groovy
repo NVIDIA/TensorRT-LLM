@@ -366,12 +366,7 @@ def processScanResults(ref) {
                     if (result.dashboard_url) {
                         echo "Dashboard: ${result.dashboard_url}"
                     }
-                    // In pre_merge mode, we intentionally skip marking the build as UNSTABLE.
-                    // PLC scanning accuracy needs further improvement before we can reliably
-                    // gate pre-merge builds on scan results without causing false failures.
-                    if (params.scanMode != "pre_merge") {
-                        currentBuild.result = 'UNSTABLE'
-                    }
+                    currentBuild.result = 'UNSTABLE'
                 } else {
                     echo "No new risks detected."
                 }
