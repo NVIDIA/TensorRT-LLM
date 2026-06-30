@@ -238,8 +238,7 @@ def escape_html(text):
 def xml_to_html(xml_filename,
                 html_filename,
                 sort_by_name=False,
-                only_rerun_results=False,
-                include_original_failures=False):
+                only_rerun_results=False):
     # HTML template
     html_template = """
     <!DOCTYPE html>
@@ -366,6 +365,8 @@ def xml_to_html(xml_filename,
                                   tc.attrib.get('classname', '')) in rerun_ids]
 
         tests_count = len(all_test_cases)
+        if tests_count == 0:
+            continue
         failed_tests_count = sum(1 for s, _ in all_test_cases
                                  if s in ('failure', 'error'))
         skipped_tests_count = sum(1 for s, _ in all_test_cases
@@ -470,6 +471,12 @@ def xml_to_html(xml_filename,
             </div>
         """
         all_suites_html.append(suite_html)
+
+    if not all_suites_html:
+        print(
+            f"No rerun test results found in {xml_filename}, skipping HTML generation."
+        )
+        return
 
     # Generate complete HTML
     html_content = html_template.format(test_suites='\n'.join(all_suites_html))
