@@ -25,6 +25,7 @@
 #include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
 
 #include <algorithm>
+#include <string_view>
 
 namespace tensorrt_llm::batch_manager
 {
@@ -45,7 +46,7 @@ CacheTransferLayer::~CacheTransferLayer() = default;
 CacheTransferLayer::CacheTransferLayer(CacheTransferLayer&&) noexcept = default;
 CacheTransferLayer& CacheTransferLayer::operator=(CacheTransferLayer&&) noexcept = default;
 
-void CacheTransferLayer::validateSupport(executor::DataTransceiverState const& peerState) const
+void CacheTransferLayer::validateCacheSupport(executor::DataTransceiverState const& peerState) const
 {
     TLLM_CHECK_WITH_INFO(mKvFormatter->inquireSupport(mCacheState, peerState.getCacheState().value()),
         "Disagg server does not currently support these cacheState, please check the cacheState of the context and "
@@ -73,6 +74,27 @@ void CacheTransferLayer::validateSupport(executor::DataTransceiverState const& p
     {
         TLLM_LOG_WARNING("Peer has RNN state but self does not. RNN transfer will be skipped.");
     }
+}
+
+executor::kv_cache::PeerProtocolCompatibility CacheTransferLayer::getPeerProtocolCompatibility(
+    executor::DataTransceiverState const& peerState) const
+{
+    if (!peerState.getCommState().has_value() || !peerState.getCommState()->isAgentState())
+    {
+        return {
+            true, false, false, false, std::nullopt, "peer protocol negotiation is not applicable to this transport"};
+    }
+
+    std::vector<std::string_view> peerAgentNames;
+    auto const& peerAgentStates = peerState.getCommState()->getAgentState();
+    peerAgentNames.reserve(peerAgentStates.size());
+    for (auto const& peerAgentState : peerAgentStates)
+    {
+        peerAgentNames.emplace_back(peerAgentState.mAgentName);
+    }
+    auto const localMode = mEnableInflightCancel ? executor::kv_cache::PeerCancellationMode::kEnabled
+                                                 : executor::kv_cache::PeerCancellationMode::kBaseline;
+    return executor::kv_cache::validatePeerProtocol(localMode, peerAgentNames);
 }
 
 std::vector<SizeType32> CacheTransferLayer::computeCounterparts(

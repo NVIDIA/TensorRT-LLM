@@ -371,6 +371,7 @@ public:
             auto it = mRequestToSession.find(requestId);
             TLLM_CHECK(it != mRequestToSession.end());
             mRequestToSession.erase(it);
+            mPeerProtocolErrors.erase(requestId);
         }
         {
             std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
@@ -384,6 +385,7 @@ public:
         {
             std::unique_lock<std::mutex> lk(mMtxForMap);
             mRequestToSession.erase(requestId);
+            mPeerProtocolErrors.erase(requestId);
         }
         catch (...)
         {
@@ -429,7 +431,8 @@ public:
         }
 
         auto requestId = info.getRequestId();
-        mCacheTransferLayer.validateSupport(info.getTransState());
+        mCacheTransferLayer.validateCacheSupport(info.getTransState());
+        auto const peerProtocolCompatibility = mCacheTransferLayer.getPeerProtocolCompatibility(info.getTransState());
 
         auto allCounterparts = mCacheTransferLayer.computeCounterparts(
             mSelfState.getCommState().value().getSelfIdx(), info.getTransState());
@@ -450,10 +453,22 @@ public:
                     DataContext{tagFromRequestId(requestId), *cancelFlag}, allCounterparts, mSelfState,
                     info.getTransState(), mBufferManager, info.getIndexFromEnd(), info.getLastBlockKey(), nullptr,
                     !common::getEnvKVCacheTimeOutputPath().empty(), mInflightCancelEnabled);
+                // Version 1 has no version-dependent dispatch. Future versions must branch on this session-bound
+                // value instead of the local binary's maximum supported version.
+                session.setPeerProtocolVersion(peerProtocolCompatibility.selectedVersion);
                 session.setTime(TransferSession::kTimeRequestInfo);
                 it = mRequestToSession.emplace(requestId, std::move(session)).first;
             }
             it->second.setConnection(peerIdx, connection);
+            if (!peerProtocolCompatibility.compatible)
+            {
+                mPeerProtocolErrors.emplace(requestId, peerProtocolCompatibility.reason);
+            }
+        }
+        if (!peerProtocolCompatibility.compatible)
+        {
+            TLLM_LOG_WARNING("Rejecting KV cache transfer for request %zu before DMA: %s", requestId,
+                peerProtocolCompatibility.reason.c_str());
         }
         return info;
     }
@@ -640,6 +655,15 @@ private:
 
     void sendResponse(RequestIdType reqId)
     {
+        std::optional<std::string> peerProtocolError;
+        {
+            std::scoped_lock lock(mMtxForMap);
+            auto const errorIt = mPeerProtocolErrors.find(reqId);
+            if (errorIt != mPeerProtocolErrors.end())
+            {
+                peerProtocolError = errorIt->second;
+            }
+        }
         bool isReady = true;
         {
             std::scoped_lock lock(mSenderMutex);
@@ -657,7 +681,7 @@ private:
                 return;
             }
             mRemainSendCount.erase(countIt);
-            isReady = responseIt != mReadyResponses.end() && !isCancelled;
+            isReady = responseIt != mReadyResponses.end() && !isCancelled && !peerProtocolError.has_value();
         }
 
         // Keep mCurrentRequest set while notifying the peer so cancellation cannot change the decision after it has
@@ -697,9 +721,12 @@ private:
         {
             if (response.has_value())
             {
+                auto const errorMessage = peerProtocolError.has_value()
+                    ? "KV cache transfer rejected due to peer protocol mismatch: " + peerProtocolError.value()
+                    : "KV cache transfer was cancelled";
                 failResponse(*response,
                     std::make_exception_ptr(TLLM_REQUEST_EXCEPTION(reqId, common::RequestErrorCode::kNETWORK_ERROR,
-                        "KV cache transfer for request %zu was cancelled", reqId)));
+                        "%s for request %zu", errorMessage.c_str(), reqId)));
             }
             discardTransferState(reqId);
         }
@@ -867,6 +894,7 @@ private:
 
     executor::kv_cache::ConnectionManager* mManager;
     std::map<LlmRequest::RequestIdType, TransferSession> mRequestToSession;
+    std::unordered_map<LlmRequest::RequestIdType, std::string> mPeerProtocolErrors;
     executor::DataTransceiverState mSelfState;
     bool mInflightCancelEnabled{false};
     CacheTransferLayer mCacheTransferLayer;
@@ -984,14 +1012,41 @@ public:
         }
     }
 
+    executor::kv_cache::PeerProtocolCompatibility validateRequestSupport(LlmRequest const& llmRequest) const
+    {
+        auto const& contextState = llmRequest.getDataTransceiverState();
+        mCacheTransferLayer.validateCacheSupport(contextState);
+        auto const compatibility = mCacheTransferLayer.getPeerProtocolCompatibility(contextState);
+        if (!compatibility.compatible && !compatibility.allPeersCanRejectBeforeDma)
+        {
+            TLLM_THROW("Cannot safely reject incompatible legacy or malformed CTX peer before buffer advertisement: %s",
+                compatibility.reason.c_str());
+        }
+        return compatibility;
+    }
+
     TransferSession sendRequestInfo(LlmRequest const& llmRequest, std::atomic<bool> const* perRequestCancel = nullptr,
-        std::vector<std::optional<size_t>> cacheBufferIds = {})
+        std::vector<std::optional<size_t>> cacheBufferIds = {},
+        executor::kv_cache::PeerProtocolCompatibility const* validatedCompatibility = nullptr)
     {
         uint64_t requestId = llmRequest.getContextPhaseParams().value().getReqId();
         auto const& contextState = llmRequest.getDataTransceiverState();
         auto const& commState = contextState.getCommState().value();
         auto const& destCacheState = contextState.getCacheState().value();
-        mCacheTransferLayer.validateSupport(contextState);
+        std::optional<executor::kv_cache::PeerProtocolCompatibility> computedCompatibility;
+        if (validatedCompatibility == nullptr)
+        {
+            computedCompatibility = validateRequestSupport(llmRequest);
+            validatedCompatibility = std::addressof(computedCompatibility.value());
+        }
+        auto const& peerProtocolCompatibility = *validatedCompatibility;
+        if (!peerProtocolCompatibility.compatible)
+        {
+            // Every peer rank explicitly advertised pre-DMA protocol rejection, so complete the existing
+            // request/ready exchange. CTX will return ready=false and settle its queued response.
+            TLLM_LOG_WARNING("Completing control-only KV request handshake for request %zu so CTX can reject it: %s",
+                requestId, peerProtocolCompatibility.reason.c_str());
+        }
 
         RequestInfo requestInfo(requestId, mSelfState);
 
@@ -1082,6 +1137,12 @@ public:
             mSelfState, contextState, resource->mBufferManager, requestInfo.getIndexFromEnd(),
             requestInfo.getLastBlockKey(), &llmRequest, !common::getEnvKVCacheTimeOutputPath().empty(),
             mInflightCancelEnabled);
+        // Bind all later transfer behavior to the negotiated version. Version 1 needs no conditional dispatch.
+        session.setPeerProtocolVersion(peerProtocolCompatibility.selectedVersion);
+        if (!peerProtocolCompatibility.compatible)
+        {
+            session.rejectPeerProtocol();
+        }
         session.setRecvBufferHolders(std::move(allocatedRecvHolders));
 
         for (size_t ci = 0; ci < allCounterparts.size(); ci++)
@@ -1247,6 +1308,26 @@ public:
         kCancelled,
     };
 
+    bool settleLocallyRejectedSession(TransferSession& session, ReadySignalResult const result)
+    {
+        if (!session.isPeerProtocolRejected())
+        {
+            return false;
+        }
+        if (result == ReadySignalResult::kNotReady)
+        {
+            // Every peer confirmed that DMA did not start.
+            session.releaseRecvBufferHolders();
+        }
+        else
+        {
+            // A ready=true or incomplete reply contradicts the local fail-closed decision. The advertised slots may
+            // be writable by a peer, so they cannot be reused.
+            session.poisonRecvBufferHolders();
+        }
+        return true;
+    }
+
     ReadySignalResult receiveReadySignalDetailed(TransferSession& session, std::atomic<bool> const& perRequestCancel)
     {
         bool isReady = false;
@@ -1298,6 +1379,10 @@ public:
     bool receiveReadySignal(TransferSession& session)
     {
         auto const result = receiveReadySignalDetailed(session, mTerminate);
+        if (settleLocallyRejectedSession(session, result))
+        {
+            return false;
+        }
         if (result == ReadySignalResult::kNotReady)
         {
             // An explicit peer rejection proves that no transfer started.
@@ -1356,27 +1441,7 @@ private:
 
         std::vector<BufferIndexHolder> recvHolders;
         std::vector<std::optional<size_t>> cacheBufferIds;
-        auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
-        if (agentConnectionManager)
-        {
-            auto const& managers = agentConnectionManager->getCacheTransBufferManagers();
-            recvHolders.reserve(managers.size());
-            cacheBufferIds.reserve(managers.size());
-            for (auto* cacheTransBufferManager : managers)
-            {
-                auto rawIdx = cacheTransBufferManager->assignBufferIndexForRecv(&perRequestCancel);
-                recvHolders.emplace_back(*cacheTransBufferManager, rawIdx, /*isRecv=*/true);
-                if (rawIdx.has_value())
-                {
-                    cacheBufferIds.push_back(static_cast<size_t>(rawIdx.value()));
-                }
-                else
-                {
-                    cacheBufferIds.push_back(std::nullopt);
-                }
-            }
-        }
-
+        bool rejectPeerProtocol = false;
         auto poisonRecvHolders = [&recvHolders]()
         {
             for (auto& holder : recvHolders)
@@ -1387,10 +1452,46 @@ private:
 
         try
         {
-            auto session = sendRequestInfo(llmRequest, &perRequestCancel, std::move(cacheBufferIds));
+            // Validate before reserving slots. An incompatible legacy or malformed peer is rejected before any
+            // destination is advertised, so that safe local failure must not quarantine an unused receive pool.
+            auto const peerProtocolCompatibility = validateRequestSupport(llmRequest);
+
+            auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
+            if (agentConnectionManager)
+            {
+                auto const& managers = agentConnectionManager->getCacheTransBufferManagers();
+                recvHolders.reserve(managers.size());
+                cacheBufferIds.reserve(managers.size());
+                for (auto* cacheTransBufferManager : managers)
+                {
+                    auto rawIdx = cacheTransBufferManager->assignBufferIndexForRecv(&perRequestCancel);
+                    recvHolders.emplace_back(*cacheTransBufferManager, rawIdx, /*isRecv=*/true);
+                    if (rawIdx.has_value())
+                    {
+                        cacheBufferIds.push_back(static_cast<size_t>(rawIdx.value()));
+                    }
+                    else
+                    {
+                        cacheBufferIds.push_back(std::nullopt);
+                    }
+                }
+            }
+
+            rejectPeerProtocol = !peerProtocolCompatibility.compatible;
+            auto session
+                = sendRequestInfo(llmRequest, &perRequestCancel, std::move(cacheBufferIds), &peerProtocolCompatibility);
             session.setRecvBufferHolders(std::move(recvHolders));
             session.setTime(TransferSession::kTimeRequestInfo);
             auto readyResult = receiveReadySignalDetailed(session, perRequestCancel);
+            if (settleLocallyRejectedSession(session, readyResult))
+            {
+                if (!mInflightCancelEnabled)
+                {
+                    llmRequest.setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                }
+                llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
+                return false;
+            }
             if (readyResult == ReadySignalResult::kCancelled)
             {
                 if (!mInflightCancelEnabled)
@@ -1432,7 +1533,7 @@ private:
         }
         catch (...)
         {
-            if (mInflightCancelEnabled)
+            if (mInflightCancelEnabled || rejectPeerProtocol)
             {
                 poisonRecvHolders();
             }

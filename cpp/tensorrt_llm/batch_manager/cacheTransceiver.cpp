@@ -627,8 +627,11 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         {
             auto rnnState
                 = mCacheState->hasRnnConfig() ? std::make_optional(mCacheState->getRnnCacheState()) : std::nullopt;
+            auto const peerCancellationMode = mInflightCancelEnabled
+                ? executor::kv_cache::PeerCancellationMode::kEnabled
+                : executor::kv_cache::PeerCancellationMode::kBaseline;
             mManager = std::make_unique<tensorrt_llm::executor::kv_cache::AgentConnectionManager>(
-                mCacheTransBufferManagerPtrs, *mCacheState, "nixl", rnnState);
+                mCacheTransBufferManagerPtrs, *mCacheState, "nixl", rnnState, peerCancellationMode);
             TLLM_LOG_INFO("NIXL Connection Manager created");
         }
         else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::MOONCAKE)
@@ -660,7 +663,6 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
             }
             return createCacheFormatter(cacheManager, kvBufferPtrs, isMLA);
         };
-
         auto makeRnnFormatter = [this, cacheManager]() -> std::unique_ptr<RnnCacheFormatter>
         {
             if (mRnnStateManager != nullptr && mRnnCacheTransBufferManager != nullptr)

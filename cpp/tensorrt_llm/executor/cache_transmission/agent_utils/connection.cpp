@@ -21,6 +21,7 @@
 #include <limits>
 #include <random>
 #include <string>
+#include <string_view>
 #include <unistd.h>
 #include <utility>
 
@@ -81,20 +82,18 @@ bool isValidBufferKind(uint8_t kind)
     return false;
 }
 
-AgentState const* findAgentState(CommState const& commState, std::string const& agentName)
+std::uint64_t makeProtocolSessionToken(std::string_view const agentName)
 {
-    if (!commState.isAgentState())
+    // FNV-1a makes the already-unique registered agent identity available as a compact process-session token.
+    constexpr std::uint64_t kOffsetBasis{14695981039346656037ULL};
+    constexpr std::uint64_t kPrime{1099511628211ULL};
+    std::uint64_t token = kOffsetBasis;
+    for (auto const character : agentName)
     {
-        return nullptr;
+        token ^= static_cast<unsigned char>(character);
+        token *= kPrime;
     }
-    for (auto const& agentState : commState.getAgentState())
-    {
-        if (agentState.mAgentName == agentName)
-        {
-            return &agentState;
-        }
-    }
-    return nullptr;
+    return token == 0 ? kOffsetBasis : token;
 }
 
 void validateConnectionIdx(
@@ -106,6 +105,29 @@ void validateConnectionIdx(
 }
 
 } // namespace
+
+void validateRequestPeerIdentity(batch_manager::RequestInfo const& requestInfo, std::string const& notificationAgent,
+    std::string const& notificationAddress)
+{
+    auto const& transState = requestInfo.getTransState();
+    TLLM_CHECK_WITH_INFO(transState.getCommState().has_value(),
+        "AgentConnectionManager received request without comm state from agent '%s'", notificationAgent.c_str());
+    auto const& peerCommState = transState.getCommState().value();
+    TLLM_CHECK_WITH_INFO(peerCommState.isAgentState(),
+        "AgentConnectionManager received non-agent comm state from agent '%s'", notificationAgent.c_str());
+    auto const& peerAgentStates = peerCommState.getAgentState();
+    auto const peerSelfIdx = peerCommState.getSelfIdx();
+    TLLM_CHECK_WITH_INFO(peerSelfIdx >= 0 && static_cast<size_t>(peerSelfIdx) < peerAgentStates.size(),
+        "AgentConnectionManager received self index %d outside agent-state count %zu from agent '%s'", peerSelfIdx,
+        peerAgentStates.size(), notificationAgent.c_str());
+    auto const& advertisedSelf = peerAgentStates[peerSelfIdx];
+    TLLM_CHECK_WITH_INFO(advertisedSelf.mAgentName == notificationAgent,
+        "AgentConnectionManager received request from '%s' whose comm state identifies self as '%s'",
+        notificationAgent.c_str(), advertisedSelf.mAgentName.c_str());
+    TLLM_CHECK_WITH_INFO(advertisedSelf.mConnectionInfo == notificationAddress,
+        "AgentConnectionManager received request from '%s' whose comm-state address differs from the live sender",
+        notificationAgent.c_str());
+}
 
 AgentConnection::AgentConnection(
     std::string mAgentName, std::string mRemoteAgentName, AgentConnectionManager* mAgentConnectionManager)
@@ -372,16 +394,24 @@ std::optional<size_t> AgentConnection::getPreAssignedBufferId(uint8_t kind) cons
 
 AgentConnectionManager::AgentConnectionManager(
     std::vector<batch_manager::BaseTransBufferManager*> cacheTransBufferManagers, CacheState cacheState,
-    std::string const& backendType, std::optional<CacheState::RnnCacheState> rnnCacheState)
+    std::string const& backendType, std::optional<CacheState::RnnCacheState> rnnCacheState,
+    std::optional<PeerCancellationMode> peerCancellationMode)
     : mCacheState(std::move(cacheState))
     , mRnnCacheState(std::move(rnnCacheState))
     , mCacheTransBufferManagers(std::move(cacheTransBufferManagers))
     , mRegMemDescs(MemoryType::kVRAM, {})
+    , mPeerProtocolAware(peerCancellationMode.has_value())
 {
     TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
     TLLM_CHECK(mDeviceId != -1);
 
     mAgentName = genUniqueAgentName();
+    if (peerCancellationMode.has_value())
+    {
+        auto const descriptor = makePeerProtocolDescriptor(
+            peerCancellationMode.value() == PeerCancellationMode::kEnabled, makeProtocolSessionToken(mAgentName));
+        mAgentName = appendPeerProtocolDescriptor(std::move(mAgentName), descriptor);
+    }
     // Create Agent
     BaseAgentConfig config{mAgentName, true, false, true};
     m_Agent = makeTransferAgent(backendType, &config);
@@ -450,6 +480,18 @@ AgentConnectionManager::AgentConnectionManager(
         agentStates[0] = localAgentState;
     }
     mCommState = CommState(agentStates, mpi::MpiComm::session().getRank());
+    if (peerCancellationMode.has_value())
+    {
+        std::vector<std::string_view> localAgentNames;
+        localAgentNames.reserve(agentStates.size());
+        for (auto const& agentState : agentStates)
+        {
+            localAgentNames.emplace_back(agentState.mAgentName);
+        }
+        auto const localCompatibility = validateLocalPeerProtocol(peerCancellationMode.value(), localAgentNames);
+        TLLM_CHECK_WITH_INFO(localCompatibility.compatible,
+            "Local NIXL ranks advertise inconsistent cache-transfer protocols: %s", localCompatibility.reason.c_str());
+    }
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         " ***** AgentConnectionManager::AgentConnectionManager    mCommState: %s", mCommState.toString().c_str());
 }
@@ -491,14 +533,10 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
                     TLLM_CHECK_WITH_INFO(agent == remoteAgentName,
                         "AgentConnectionManager received RequestAndBufferInfo from '%s' with embedded agent '%s'",
                         agent.c_str(), remoteAgentName.c_str());
-                    auto const* expectedAgentState = findAgentState(mCommState, remoteAgentName);
-                    if (expectedAgentState != nullptr)
+                    if (mPeerProtocolAware)
                     {
-                        TLLM_CHECK_WITH_INFO(address == expectedAgentState->mConnectionInfo,
-                            "AgentConnectionManager received mismatched connection info for agent '%s'",
-                            remoteAgentName.c_str());
+                        validateRequestPeerIdentity(requestInfo, remoteAgentName, address);
                     }
-                    else
                     {
                         std::scoped_lock remoteInfoLock(mRemoteConnectionInfoMutex);
                         auto [remoteInfoIt, inserted] = mRemoteConnectionInfo.emplace(remoteAgentName, address);

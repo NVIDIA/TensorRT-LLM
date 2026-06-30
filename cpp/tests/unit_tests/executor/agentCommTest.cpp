@@ -19,6 +19,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <optional>
 
 using namespace tensorrt_llm::batch_manager::kv_cache_manager;
 using namespace tensorrt_llm::runtime;
@@ -157,7 +158,11 @@ protected:
 TEST_P(AgentCommTest, AgentConnectionManagerBasic)
 {
     std::vector<tensorrt_llm::batch_manager::BaseTransBufferManager*> bufferManagers{mTransBufferManager.get()};
-    auto connectionManager = std::make_unique<AgentConnectionManager>(bufferManagers, *mCacheState, backend);
+    std::optional<PeerCancellationMode> const peerMode = backend == "nixl"
+        ? std::make_optional(PeerCancellationMode::kBaseline)
+        : std::optional<PeerCancellationMode>{};
+    auto connectionManager
+        = std::make_unique<AgentConnectionManager>(bufferManagers, *mCacheState, backend, std::nullopt, peerMode);
     ASSERT_TRUE(connectionManager != nullptr);
     ASSERT_EQ(connectionManager->getCacheTransBufferManagers().size(), bufferManagers.size());
     ASSERT_TRUE(connectionManager->getCacheTransBufferManagers().front() != nullptr);
@@ -167,18 +172,45 @@ TEST_P(AgentCommTest, AgentConnectionManagerBasic)
     CommState commState = connectionManager->getCommState();
     ASSERT_TRUE(commState.isAgentState());
     ASSERT_EQ(commState.getAgentState().size(), 1);
+    auto const parsed = parsePeerProtocolDescriptor(connectionManager->getAgentName());
+    if (backend == "nixl")
+    {
+        ASSERT_EQ(parsed.status, PeerProtocolParseStatus::kValid);
+        ASSERT_TRUE(parsed.descriptor.has_value());
+        EXPECT_EQ(parsed.descriptor->cancellationMode, PeerCancellationMode::kBaseline);
+        EXPECT_NE(parsed.descriptor->sessionToken, 0);
+    }
+    else
+    {
+        EXPECT_EQ(parsed.status, PeerProtocolParseStatus::kMissing);
+    }
 }
 
 TEST_P(AgentCommTest, AgentConnectionManagerConnect)
 {
     std::vector<tensorrt_llm::batch_manager::BaseTransBufferManager*> bufferManagers{mTransBufferManager.get()};
-    auto connectionManager0 = std::make_unique<AgentConnectionManager>(bufferManagers, *mCacheState, backend);
-    auto connectionManager1 = std::make_unique<AgentConnectionManager>(bufferManagers, *mCacheState, backend);
+    std::optional<PeerCancellationMode> const peerMode = backend == "nixl"
+        ? std::make_optional(PeerCancellationMode::kBaseline)
+        : std::optional<PeerCancellationMode>{};
+    auto connectionManager0
+        = std::make_unique<AgentConnectionManager>(bufferManagers, *mCacheState, backend, std::nullopt, peerMode);
+    auto connectionManager1
+        = std::make_unique<AgentConnectionManager>(bufferManagers, *mCacheState, backend, std::nullopt, peerMode);
     auto agentName0 = connectionManager0->getAgentName();
     auto agentName1 = connectionManager1->getAgentName();
     ASSERT_TRUE(!agentName0.empty());
     ASSERT_TRUE(!agentName1.empty());
     ASSERT_TRUE(agentName0 != agentName1);
+    if (backend == "nixl")
+    {
+        auto const descriptor0 = parsePeerProtocolDescriptor(agentName0);
+        auto const descriptor1 = parsePeerProtocolDescriptor(agentName1);
+        ASSERT_EQ(descriptor0.status, PeerProtocolParseStatus::kValid);
+        ASSERT_EQ(descriptor1.status, PeerProtocolParseStatus::kValid);
+        ASSERT_TRUE(descriptor0.descriptor.has_value());
+        ASSERT_TRUE(descriptor1.descriptor.has_value());
+        EXPECT_NE(descriptor0.descriptor->sessionToken, descriptor1.descriptor->sessionToken);
+    }
 
     auto commState0 = connectionManager0->getCommState();
     auto commState1 = connectionManager1->getCommState();
