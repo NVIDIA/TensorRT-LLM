@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 import sys
 import xml.etree.ElementTree as ET
 
@@ -129,7 +130,7 @@ def generate_rerun_tests_list(outdir, xml_filename, failSignaturesList,
                 line = raw.strip()
                 if not line:
                     continue
-                test_name = line.split()[0]
+                test_name = re.split(r' TIMEOUT | ISOLATION', line)[0]
                 tests.append(test_name)
                 test_to_line[test_name] = line
 
