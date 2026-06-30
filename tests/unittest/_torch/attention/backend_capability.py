@@ -184,19 +184,4 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
     ):
         return "TRTLLM Blackwell no-cache fallback is unstable for head_dim 80"
 
-    # SM90 forces paged context FMHA whenever a mixed batch has context work.
-    # With an FP8 KV cache, that mode also reaches the MMHA generation phase and
-    # requires an attention-output scale that a standalone MHA backend does not
-    # own. Pure decode, GQA/MQA mixed batches, and Blackwell trtllm-gen all run.
-    if (
-        backend == "TRTLLM"
-        and sm in (90,)
-        and getattr(case, "kv_dtype", None) == "fp8"
-        and case.num_heads == case.num_kv_heads
-        and 0 < case.num_contexts < len(case.seq_lens)
-    ):
-        return (
-            "TRTLLM SM90 mixed-phase MHA with FP8 KV cache requires an "
-            "attention-output scale unavailable to the standalone backend"
-        )
     return None
