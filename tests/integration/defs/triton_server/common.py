@@ -180,21 +180,6 @@ def prepare_custom_config(llm_backend_repo_root, new_model_repo,
     check_call(f"cp -R {tensorrt_llm_config} {new_config}", shell=True)
 
 
-def prepare_multimodal_model_repo(llm_backend_repo_root, new_model_repo,
-                                  dir_name):
-    origin_model_repo = os.path.join(llm_backend_repo_root, "all_models",
-                                     "multimodal", dir_name)
-    check_call(f"cp -R {origin_model_repo} {new_model_repo}", shell=True)
-
-
-def prepare_disaggregated_serving_model_repo(llm_backend_repo_root,
-                                             new_model_repo):
-    origin_model_repo = os.path.join(llm_backend_repo_root, "all_models",
-                                     "disaggregated_serving",
-                                     "disaggregated_serving_bls")
-    check_call(f"cp -R {origin_model_repo} {new_model_repo}", shell=True)
-
-
 def prepare_llmapi_model_repo(llm_backend_repo_root, new_model_repo):
     origin_model_repo = os.path.join(llm_backend_repo_root, "all_models",
                                      "llmapi")
@@ -263,28 +248,6 @@ def modify_ib_config_pbtxt(REPO_PATH,
                                            "tensorrt_llm_bls", "config.pbtxt")
     whisper_bls_config = os.path.join(llm_backend_repo_root, REPO_PATH,
                                       "whisper_bls", "config.pbtxt")
-    disaggregated_serving_bls_config = os.path.join(
-        llm_backend_repo_root, REPO_PATH, "disaggregated_serving_bls",
-        "config.pbtxt")
-
-    if MULTIMODAL_ENGINE_PATH != "":
-        multimodal_enc_config = os.path.join(llm_backend_repo_root, REPO_PATH,
-                                             "multimodal_encoders",
-                                             "config.pbtxt")
-
-        check_call(
-            f"python3 {fill_template_py} -i {multimodal_enc_config} triton_max_batch_size:{TRITON_MAX_BATCH_SIZE}," \
-            f"multimodal_model_path:{MULTIMODAL_ENGINE_PATH},encoder_input_features_data_type:{ENCODER_INPUT_FEATURES_DTYPE}," \
-            f"prompt_embedding_table_data_type:{PROMPT_EMBEDDING_TABLE_DTYPE}," \
-            f"hf_model_path:{TOKENIZER_PATH}",
-            shell=True)
-        check_call(
-            f"python3 {fill_template_py} -i {tensorrt_llm_bls_config} tensorrt_llm_model_name:tensorrt_llm," \
-            f"multimodal_encoders_name:multimodal_encoders",
-            shell=True)
-        check_call(
-            f"python3 {fill_template_py} -i {preprocessing_config} max_num_images:{MAX_NUM_IMAGES}",
-            shell=True)
 
     if DRAFT_ENGINE_PATH != "":
         llm_draft_config = os.path.join(llm_backend_repo_root, REPO_PATH,
@@ -378,34 +341,6 @@ def modify_ib_config_pbtxt(REPO_PATH,
             f"python3 {fill_template_py} -i {whisper_bls_config} engine_dir:{ENCODER_ENGINE_PATH}," \
             f"n_mels:128,zero_pad:false,triton_max_batch_size:{TRITON_MAX_BATCH_SIZE},decoupled_mode:{DECOUPLED_MODE}",
             shell=True)
-    if os.path.exists(disaggregated_serving_bls_config):
-        check_call(
-            f"python3 {fill_template_py} -i {disaggregated_serving_bls_config} 'triton_max_batch_size:{TRITON_MAX_BATCH_SIZE}," \
-            f"decoupled_mode:{DECOUPLED_MODE},disaggregated_serving_bls_count:{BLS_INSTANCE_COUNT}," \
-            "context_model_name:context,generation_model_name:generation,logits_datatype:TYPE_FP32'",
-            shell=True)
-
-
-def modify_disaggregated_serving_config_pbtxt(llm_backend_repo_root, REPO_PATH):
-    check_call(f"cp -R {REPO_PATH}/tensorrt_llm {REPO_PATH}/generation",
-               shell=True)
-    check_call(f"mv {REPO_PATH}/tensorrt_llm {REPO_PATH}/context", shell=True)
-    check_call(
-        f"mv {REPO_PATH}/disaggregated_serving_bls {REPO_PATH}/tensorrt_llm",
-        shell=True)
-
-    tensorrt_llm_config = os.path.join(llm_backend_repo_root, REPO_PATH,
-                                       "tensorrt_llm", "config.pbtxt")
-    search_and_replace(tensorrt_llm_config, 'name: "disaggregated_serving_bls"',
-                       'name: "tensorrt_llm"')
-    context_config = os.path.join(llm_backend_repo_root, REPO_PATH, "context",
-                                  "config.pbtxt")
-    search_and_replace(context_config, 'name: "tensorrt_llm"',
-                       'name: "context"')
-    generation_config = os.path.join(llm_backend_repo_root, REPO_PATH,
-                                     "generation", "config.pbtxt")
-    search_and_replace(generation_config, 'name: "tensorrt_llm"',
-                       'name: "generation"')
 
 
 def validate_by_sequence_matcher(output_result, golden_results, threshold):

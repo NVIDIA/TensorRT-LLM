@@ -138,11 +138,6 @@ def llm_backend_whisper_example_root(llm_backend_root):
 
 
 @pytest.fixture(scope="session")
-def llm_backend_multimodal_example_root(llm_backend_root):
-    return os.path.join(llm_backend_root, "tools", "multimodal")
-
-
-@pytest.fixture(scope="session")
 def llm_backend_llmapi_example_root(llm_backend_root):
     return os.path.join(llm_backend_root, "tools", "llmapi")
 
@@ -170,11 +165,6 @@ def tensorrt_llm_gpt_example_root(llm_backend_root):
 @pytest.fixture(scope="session")
 def tensorrt_llm_gptj_example_root(llm_backend_root):
     return os.path.join(llm_backend_root, "../examples/models/contrib/gptj")
-
-
-@pytest.fixture(scope="session")
-def tensorrt_llm_multimodal_example_root(llm_backend_root):
-    return os.path.join(llm_backend_root, "../examples/models/core/multimodal")
 
 
 @pytest.fixture(scope="session")
@@ -210,11 +200,6 @@ def tensorrt_llm_llama_example_root(llm_backend_root):
 @pytest.fixture(scope="session")
 def tensorrt_llm_qwen_example_root(llm_backend_root):
     return os.path.join(llm_backend_root, "../examples/models/core/qwen")
-
-
-@pytest.fixture(scope="session")
-def tensorrt_llm_mllama_example_root(llm_backend_root):
-    return os.path.join(llm_backend_root, "../examples/models/core/mllama")
 
 
 @pytest.fixture(scope="session")
@@ -367,68 +352,6 @@ def gpt_2b_lora_model_root():
         gpt_2b_lora_model_root
     ), f"{gpt_2b_lora_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     return gpt_2b_lora_model_root
-
-
-@pytest.fixture(scope="session")
-def blip2_opt_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    blip2_opt_model_root = os.path.join(models_root, "blip2-opt-2.7b")
-
-    assert os.path.exists(
-        blip2_opt_model_root
-    ), f"{blip2_opt_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return blip2_opt_model_root
-
-
-@pytest.fixture(scope="session")
-def llava_onevision_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    llava_onevision_model_root = os.path.join(models_root,
-                                              "llava-onevision-qwen2-7b-ov-hf")
-
-    assert os.path.exists(
-        llava_onevision_model_root
-    ), f"{llava_onevision_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return llava_onevision_model_root
-
-
-@pytest.fixture(scope="session")
-def test_video_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    test_video = os.path.join(models_root, "video-neva", "test_video")
-
-    assert os.path.exists(
-        test_video
-    ), f"{test_video} does not exist under NFS LLM_MODELS_ROOT dir"
-    return test_video
-
-
-@pytest.fixture(scope="session")
-def llava_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    llava_model_root = os.path.join(models_root, "llava-1.5-7b-hf")
-
-    assert os.path.exists(
-        llava_model_root
-    ), f"{llava_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return llava_model_root
-
-
-@pytest.fixture(scope="session")
-def mllama_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    mllama_model_root = os.path.join(models_root, "llama-3.2-models",
-                                     "Llama-3.2-11B-Vision")
-
-    assert os.path.exists(
-        mllama_model_root
-    ), f"{mllama_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return mllama_model_root
 
 
 @pytest.fixture(scope="session")
