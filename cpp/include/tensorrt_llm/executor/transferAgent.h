@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -356,6 +356,13 @@ public:
     virtual ~TransferStatus() = default;
     [[nodiscard]] virtual bool isCompleted() const = 0;
     virtual TransferState wait(int64_t timeout_ms = -1) const = 0;
+
+    /// Release the backend transfer request handle. A true return means the backend accepted the handle release; it
+    /// does not prove remote memory quiescence.
+    [[nodiscard]] virtual bool release()
+    {
+        return false;
+    }
 };
 
 struct BaseAgentConfig

@@ -21,6 +21,7 @@
 #include "tensorrt_llm/executor/transferAgent.h"
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <thread>
 
@@ -73,11 +74,14 @@ public:
     [[nodiscard]] int getLastStatus() const noexcept;
     [[nodiscard]] std::string getLastStatusStr() const;
 
+    [[nodiscard]] bool release() override;
+
 private:
     // weak_ptr so the status outliving the owning agent is safe (lock() returns null after reset).
     std::weak_ptr<nixlAgent> mWeakAgent;
     nixlXferReqH* mHandle{};
     mutable std::atomic<int> mLastStatus{0};
+    mutable std::mutex mHandleMutex;
 };
 
 class NixlTransferAgent final : public BaseTransferAgent

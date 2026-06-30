@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import concurrent
 import contextlib
 import functools
@@ -54,6 +69,8 @@ DEFAULT_TEST_TIMEOUT = 3600
 DEFAULT_SERVER_WAITING_TIMEOUT = 2100
 # Timeout for the accuracy evaluation
 DEFAULT_ACC_EVALUATION_TIMEOUT = 1500
+# Timeout for each request sent to the disaggregated server
+DEFAULT_REQUEST_TIMEOUT_S = 1800000
 
 
 @functools.lru_cache(maxsize=1)
@@ -152,6 +169,8 @@ def launch_disaggregated_llm(
     enable_perf=False,
     extra_env: Optional[Dict[str, str]] = None,
     gen_extra_env: Optional[Dict[str, str]] = None,
+    request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S,
+    request_max_retries: Optional[int] = None,
 ):
     temp_dir = tempfile.TemporaryDirectory()
     disaggregated_serving_config_path = os.path.join(
@@ -405,9 +424,14 @@ def launch_disaggregated_llm(
                 f"Server is not ready after {server_waiting_timeout} seconds. Please check the logs for more details."
             )
 
-        client = openai.OpenAI(api_key="1234567890",
-                               base_url=f"http://localhost:{serve_port}/v1",
-                               timeout=1800000)
+        client_kwargs: Dict[str, Any] = {
+            "api_key": "1234567890",
+            "base_url": f"http://localhost:{serve_port}/v1",
+            "timeout": request_timeout_s,
+        }
+        if request_max_retries is not None:
+            client_kwargs["max_retries"] = request_max_retries
+        client = openai.OpenAI(**client_kwargs)
 
         def send_request(prompt: str, sampling_params: SamplingParams,
                          streaming: bool):
@@ -1077,17 +1101,18 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(60000)
     @skip_no_hopper
     def test_gen_only_sync(self):
-        """Test gen-only synchronous KV transfer path with NIXL Python transceiver.
+        """Test gen-only synchronous KV transfer path with NIXL C++ transceiver.
 
         Sets TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 so the gen worker calls
-        request_and_receive_sync instead of the async path. Accuracy must be
-        identical to the standard async path.
+        the blocking request_and_receive_sync path. A bounded client timeout
+        makes a stuck transfer fail this test instead of waiting for its outer
+        one-hour timeout.
         """
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
                 "backend": "NIXL",
-                "transceiver_runtime": "PYTHON",
+                "transceiver_runtime": "CPP",
                 "max_tokens_in_buffer": 4096,
             },
         }
@@ -1095,7 +1120,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
                 "backend": "NIXL",
-                "transceiver_runtime": "PYTHON",
+                "transceiver_runtime": "CPP",
                 "max_tokens_in_buffer": 4096,
             },
         }
@@ -1116,6 +1141,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 self.MODEL_PATH,
                 # Apply to both servers: gen worker uses sync receive path.
                 extra_env={"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP": "1"},
+                request_timeout_s=120,
+                request_max_retries=0,
         ) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 

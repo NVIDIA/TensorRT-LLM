@@ -49,7 +49,7 @@ public:
     /// @param kvFormatter The KV cache formatter.
     /// @param rnnFormatter Optional RNN cache formatter (for separate RnnStateManager pool).
     CacheTransferLayer(executor::kv_cache::CacheState cacheState, std::unique_ptr<BaseCacheFormatter> kvFormatter,
-        std::unique_ptr<RnnCacheFormatter> rnnFormatter = nullptr);
+        std::unique_ptr<RnnCacheFormatter> rnnFormatter = nullptr, bool enableInflightCancel = false);
 
     ~CacheTransferLayer();
     CacheTransferLayer(CacheTransferLayer&&) noexcept;
@@ -86,10 +86,13 @@ public:
 
     [[nodiscard]] BaseCacheFormatter* getKvFormatter() const noexcept;
 
+    [[nodiscard]] bool isInflightCancelEnabled() const noexcept;
+
 private:
     executor::kv_cache::CacheState mCacheState;
     std::unique_ptr<BaseCacheFormatter> mKvFormatter;
     std::unique_ptr<RnnCacheFormatter> mRnnFormatter;
+    bool mEnableInflightCancel{false};
 };
 
 } // namespace tensorrt_llm::batch_manager

@@ -17,8 +17,10 @@
 
 #include "tensorrt_llm/batch_manager/baseTransBuffer.h"
 #include "tensorrt_llm/batch_manager/cacheTransBuffer.h"
+#include "tensorrt_llm/batch_manager/dataTransceiver.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include <NvInferRuntime.h>
+#include <atomic>
 #include <gtest/gtest.h>
 #include <memory>
 #include <optional>
@@ -80,6 +82,7 @@ protected:
         SizeType32 constexpr maxNumSequences = 4;
         SizeType32 constexpr sinkTokenLength = 0;
         auto stream = std::make_shared<CudaStream>();
+        mBufferManager = std::make_unique<BufferManager>(stream);
         auto const kvMaxNumTokens = tokensPerBlock * maxBlocksPerSeq;
         auto const totalNumBlocks = maxNumSequences * maxBlocksPerSeq;
         using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
@@ -119,8 +122,19 @@ protected:
         return *mTrans;
     }
 
+    [[nodiscard]] TransferSession makeTransferSession()
+    {
+        using tensorrt_llm::executor::DataTransceiverState;
+        using tensorrt_llm::executor::kv_cache::DataContext;
+        return TransferSession({nullptr}, DataContext{/*tag=*/17, mCancel}, {0}, mSelfState, DataTransceiverState{},
+            *mBufferManager, /*indexFromEnd=*/0, BlockKey{});
+    }
+
     std::unique_ptr<KVCacheManager> mKv;
     std::unique_ptr<ObservableTransBufferManager> mTrans;
+    std::unique_ptr<BufferManager> mBufferManager;
+    tensorrt_llm::executor::DataTransceiverState mSelfState;
+    std::atomic<bool> mCancel{false};
 };
 
 // Default-constructed holder owns nothing; destruction is a no-op.
@@ -146,14 +160,28 @@ TEST_P(BufferIndexHolderLifecycleTest, DefaultConstructedExplicitReleaseIsNoOp)
     EXPECT_EQ(inUse(), before);
 }
 
-// Holder built from a nullopt index is disarmed (mHeld == false).
+// A nullopt index represents a held dynamic-buffer marker. Releasing it does
+// not affect the fixed-slot concurrence counter.
 TEST_P(BufferIndexHolderLifecycleTest, NulloptIndexReleasesNothing)
 {
     int const before = inUse();
     {
         BufferIndexHolder holder{mgr(), std::nullopt, isRecv()};
-        EXPECT_FALSE(holder.held());
+        EXPECT_TRUE(holder.held());
+        EXPECT_FALSE(holder.index().has_value());
     }
+    EXPECT_EQ(inUse(), before);
+}
+
+// Poisoning a nullopt dynamic-buffer marker records the fail-closed state
+// without changing the fixed-slot concurrence counter.
+TEST_P(BufferIndexHolderLifecycleTest, NulloptIndexPoisonMarksManager)
+{
+    int const before = inUse();
+    BufferIndexHolder holder{mgr(), std::nullopt, isRecv()};
+    holder.poison();
+    EXPECT_FALSE(holder.held());
+    EXPECT_TRUE(mgr().hasPoisonedBuffer());
     EXPECT_EQ(inUse(), before);
 }
 
@@ -284,6 +312,67 @@ TEST_P(BufferIndexHolderLifecycleTest, ExceptionUnwindStillReleases)
         // Holder destructor ran during unwind.
     }
     EXPECT_EQ(inUse(), before);
+}
+
+TEST_P(BufferIndexHolderLifecycleTest, TransferSessionExplicitReleaseFreesAdoptedRecvSlot)
+{
+    if (!isRecv())
+    {
+        GTEST_SKIP() << "TransferSession owns receive slots only";
+    }
+
+    int const before = inUse();
+    auto idx = acquire();
+    ASSERT_TRUE(idx.has_value());
+    auto session = makeTransferSession();
+    std::vector<BufferIndexHolder> holders;
+    holders.emplace_back(mgr(), idx, /*isRecv=*/true);
+    session.adoptRecvBufferHolders(std::move(holders));
+
+    EXPECT_EQ(inUse(), before + 1);
+    session.releaseRecvBufferHolders();
+    EXPECT_EQ(inUse(), before);
+    EXPECT_FALSE(mgr().hasPoisonedBuffer());
+}
+
+TEST_P(BufferIndexHolderLifecycleTest, TransferSessionExplicitPoisonQuarantinesAdoptedRecvSlot)
+{
+    if (!isRecv())
+    {
+        GTEST_SKIP() << "TransferSession owns receive slots only";
+    }
+
+    int const before = inUse();
+    auto idx = acquire();
+    ASSERT_TRUE(idx.has_value());
+    auto session = makeTransferSession();
+    std::vector<BufferIndexHolder> holders;
+    holders.emplace_back(mgr(), idx, /*isRecv=*/true);
+    session.adoptRecvBufferHolders(std::move(holders));
+
+    session.poisonRecvBufferHolders();
+    EXPECT_EQ(inUse(), before + 1);
+    EXPECT_TRUE(mgr().hasPoisonedBuffer());
+}
+
+TEST_P(BufferIndexHolderLifecycleTest, AbandonedTransferSessionQuarantinesAdvertisedRecvSlot)
+{
+    if (!isRecv())
+    {
+        GTEST_SKIP() << "TransferSession owns receive slots only";
+    }
+
+    int const before = inUse();
+    auto idx = acquire();
+    ASSERT_TRUE(idx.has_value());
+    {
+        auto session = makeTransferSession();
+        std::vector<BufferIndexHolder> holders;
+        holders.emplace_back(mgr(), idx, /*isRecv=*/true);
+        session.adoptRecvBufferHolders(std::move(holders));
+    }
+    EXPECT_EQ(inUse(), before + 1);
+    EXPECT_TRUE(mgr().hasPoisonedBuffer());
 }
 
 INSTANTIATE_TEST_SUITE_P(SideVariants, BufferIndexHolderLifecycleTest,

@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import dataclasses
 import datetime
 import queue
@@ -131,12 +146,15 @@ class ExecutorRequestQueue:
             self.request_queue.put(
                 RequestQueueItem(req_id, is_canceled_request=True))
 
-    def enqueue_control_request(self, drain: bool = True):
+    def enqueue_control_request(self, drain: bool = True) -> bool:
         """Enqueue a control-action sentinel. See ``PyExecutor.control_action``."""
         with self.enqueue_lock:
+            if not self.active:
+                return False
             self.request_queue.put(
                 RequestQueueItem(id=CONTROL_REQUEST_ID,
                                  control_requires_drain=drain))
+            return True
 
     def enqueue_shutdown_request(self):
         with self.enqueue_lock:

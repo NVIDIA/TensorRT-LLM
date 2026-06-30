@@ -522,7 +522,8 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         // cache blocks to the corresponding buffer.
         // 5. send the buffer to the corresponding target. Ideally, we send only once (one buffer) for each target.
 
-        auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend();
+        auto const* sendCancelFlag = &session.getDataContext().getTransferTerminate();
+        auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend(sendCancelFlag);
         BufferIndexHolder sendHolder(*mCacheTransBufferManager, cacheBufferId, /*isRecv=*/false);
         int peerDuplicateHeadFactor = targetInfo.mPeerDupHeadFactor;
         auto bufferTargetNum = targetNum / peerDuplicateHeadFactor;
@@ -602,8 +603,19 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
                 == inputKvCacheBlocksPerWindow.begin()->second.front()->getDataType());
         }
 
-        sendAllBuffers(session, deviceId, outputSplitCaches, bufferCoverTargetNum, preAllocSendBuffer, bufferManager,
-            targetInfo, pickUpConnections);
+        try
+        {
+            sendAllBuffers(session, deviceId, outputSplitCaches, bufferCoverTargetNum, preAllocSendBuffer,
+                bufferManager, targetInfo, pickUpConnections);
+        }
+        catch (...)
+        {
+            if (agentConnection != nullptr && session.isInflightCancelEnabled())
+            {
+                sendHolder.poison();
+            }
+            throw;
+        }
 
         session.setTime(TransferSession::kTimeTransmissions);
 
@@ -865,8 +877,8 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                 else
                 {
                     cacheBufferId = mCacheTransBufferManager->assignBufferIndexForRecv();
+                    recvHolder = BufferIndexHolder(*mCacheTransBufferManager, cacheBufferId, /*isRecv=*/true);
                 }
-                recvHolder = BufferIndexHolder(*mCacheTransBufferManager, cacheBufferId, /*isRecv=*/true);
                 auto [recvSplitCachestmp, bufferCoverTargetNumtmp, onlyUseDynamicBuffer]
                     = mCacheTransBufferManager->getOrAllocateRecvBuffers(
                         cacheBufferId, static_cast<int>(targetNum), bufferEleSizes, bufferManager);

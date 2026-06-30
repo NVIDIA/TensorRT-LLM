@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -198,7 +198,18 @@ TEST_P(AgentCommTest, AgentConnectionManagerConnect)
     // convert to AgentConnection
     auto agentConnection0 = const_cast<tensorrt_llm::executor::kv_cache::AgentConnection*>(
         dynamic_cast<tensorrt_llm::executor::kv_cache::AgentConnection const*>(connection0));
-    agentConnection0->sendRequestAndBufferInfo(sendRequestInfo, cacheBufferIds, validConnectionIdx);
+    // A pre-notify cancellation must not consume the one-time metadata. The
+    // retry still needs it so the sender can load the remote agent.
+    std::atomic<bool> perRequestCancel{true};
+    bool advertisementMayHaveOccurred = false;
+    EXPECT_THROW(agentConnection0->sendRequestAndBufferInfo(sendRequestInfo, cacheBufferIds, validConnectionIdx,
+                     &perRequestCancel, &advertisementMayHaveOccurred),
+        std::exception);
+    EXPECT_FALSE(advertisementMayHaveOccurred);
+    perRequestCancel.store(false, std::memory_order_relaxed);
+    agentConnection0->sendRequestAndBufferInfo(
+        sendRequestInfo, cacheBufferIds, validConnectionIdx, &perRequestCancel, &advertisementMayHaveOccurred);
+    EXPECT_TRUE(advertisementMayHaveOccurred);
 
     tensorrt_llm::batch_manager::RequestInfo recvRequestInfo;
     auto connection1 = connectionManager1->recvConnectionAndRequestInfo(recvRequestInfo, std::atomic<bool>(false));

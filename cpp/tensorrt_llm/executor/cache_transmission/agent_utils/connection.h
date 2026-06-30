@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -259,14 +259,17 @@ public:
         std::string mAgentName, std::string mRemoteAgentName, AgentConnectionManager* mAgentConnectionManager);
     void send(DataContext const& ctx, void const* data, size_t size) const override;
     void recv(DataContext const& ctx, void* data, size_t size) const override;
+    //! Sets advertisementMayHaveOccurred immediately before notifying the peer, after all definite pre-notify exits.
     void sendRequestAndBufferInfo(batch_manager::RequestInfo& requestInfo,
-        std::vector<std::optional<size_t>> const& cacheBufferIds, int validConnectionIdx);
+        std::vector<std::optional<size_t>> const& cacheBufferIds, int validConnectionIdx,
+        std::atomic<bool> const* perRequestCancel = nullptr, bool* advertisementMayHaveOccurred = nullptr);
     void setSenderState(std::vector<MemoryDesc> cacheReceiverBufferDescs, int valideSegmentIdx,
         std::vector<std::pair<size_t, size_t>> offsetRatios, std::vector<uint8_t> bufferKinds);
     void setHasLoadRemoteAgent(bool hasLoadRemoteAgent);
     [[nodiscard]] bool hasLoadRemoteAgent() const;
     void sendReadySignal(DataContext const& ctx, bool isReady) const;
     bool recvReadySignal(DataContext const& ctx) const;
+    std::optional<bool> recvReadySignalWithStatus(DataContext const& ctx) const;
 
     void activateBuffer(uint8_t kind) const override;
     [[nodiscard]] std::optional<size_t> getPreAssignedBufferId(uint8_t kind) const override;
@@ -320,11 +323,11 @@ public:
     [[nodiscard]] std::string const& getAgentName() const;
 
     template <typename NotificationType>
-    void waitForNotification(
+    bool waitForNotification(
         std::string const& remoteAgentName, NotificationType& expectedInfo, std::atomic<bool> const& terminateFlag);
-    void waitForSyncInfo(
+    bool waitForSyncInfo(
         std::string const& remoteAgentName, NotificationSyncInfo& syncInfo, std::atomic<bool> const& terminateFlag);
-    void waitForReadySignal(
+    bool waitForReadySignal(
         std::string const& remoteAgentName, ReadySignalInfo& readySignalInfo, std::atomic<bool> const& terminateFlag);
     [[nodiscard]] bool isRunning() const override;
 

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,6 +22,7 @@
 #include <string>
 #include <vector>
 
+#include "tensorrt_llm/batch_manager/baseTransBuffer.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/cacheTransferLayer.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
@@ -84,7 +85,8 @@ public:
     TransferSession(std::vector<Connection const*> connections, DataContext dataContext,
         std::vector<SizeType32> counterPartRanks, executor::DataTransceiverState const& selfState,
         executor::DataTransceiverState otherState, runtime::BufferManager const& bufferManager, int32_t indexFromEnd,
-        BlockKey const& lastBlockKey, LlmRequest const* llmRequest = nullptr, bool recordTiming = false)
+        BlockKey const& lastBlockKey, LlmRequest const* llmRequest = nullptr, bool recordTiming = false,
+        bool enableInflightCancel = false)
         : mConnections(std::move(connections))
         , mCounterPartRanks(std::move(counterPartRanks))
         , mDataContext(std::move(dataContext))
@@ -94,12 +96,26 @@ public:
         , mRequest(llmRequest)
         , mIndexFromEnd(indexFromEnd)
         , mLastBlockKey(lastBlockKey)
+        , mEnableInflightCancel(enableInflightCancel)
     {
         TLLM_CHECK(!mConnections.empty());
         if (recordTiming)
         {
             mTimes = std::make_unique<KVCacheTimes>();
         }
+    }
+
+    TransferSession(TransferSession const&) = delete;
+    TransferSession& operator=(TransferSession const&) = delete;
+    TransferSession(TransferSession&&) noexcept = default;
+    TransferSession& operator=(TransferSession&&) = delete;
+
+    ~TransferSession()
+    {
+        // An adopted receive slot has already been advertised to a peer. Unless
+        // a completed receive explicitly releases it, destruction cannot prove
+        // that the peer has stopped writing, so fail closed.
+        poisonRecvBufferHolders();
     }
 
     [[nodiscard]] std::vector<Connection const*> const& getConnections() const;
@@ -151,6 +167,41 @@ public:
         mCounterPartRanks = std::move(ranks);
     }
 
+    [[nodiscard]] bool isInflightCancelEnabled() const noexcept
+    {
+        return mEnableInflightCancel;
+    }
+
+    /// @brief Adopt receive-buffer slots allocated while constructing this session.
+    ///
+    /// The asynchronous receive path keeps these holders outside the session so it can
+    /// quarantine them on cancellation. The public sendRequestInfo()/receiveSync() path
+    /// has no such outer owner, so the session owns and releases those slots instead.
+    void adoptRecvBufferHolders(std::vector<BufferIndexHolder> holders) noexcept
+    {
+        mRecvBufferHolders = std::move(holders);
+    }
+
+    /// @brief Release receive-buffer slots owned by this session after a successful receive.
+    void releaseRecvBufferHolders() noexcept
+    {
+        for (auto& holder : mRecvBufferHolders)
+        {
+            holder.release();
+        }
+        mRecvBufferHolders.clear();
+    }
+
+    /// @brief Quarantine receive-buffer slots owned by this session when quiescence is unknown.
+    void poisonRecvBufferHolders() noexcept
+    {
+        for (auto& holder : mRecvBufferHolders)
+        {
+            holder.poison();
+        }
+        mRecvBufferHolders.clear();
+    }
+
 private:
     std::vector<Connection const*> mConnections;
     std::vector<SizeType32> mCounterPartRanks;        // Ranks corresponding to mConnections indices
@@ -162,6 +213,8 @@ private:
     std::unique_ptr<KVCacheTimes> mTimes;
     int32_t mIndexFromEnd{0};
     BlockKey mLastBlockKey{};
+    bool mEnableInflightCancel{false};
+    std::vector<BufferIndexHolder> mRecvBufferHolders;
 };
 
 using UniqueToken = tensorrt_llm::runtime::UniqueToken;
