@@ -54,10 +54,13 @@ class QuantAttentionConfig(StrictBaseModel):
     Unsupported recipes are rejected by AttentionConfig's validator with a ValueError.
     """
 
-    qk_dtype: Literal["bf16", "int8", "fp8"] = Field(
+    qk_dtype: Literal["bf16", "int8", "fp8", "fp4"] = Field(
         "bf16",
         status="prototype",
-        description="Q/K quantization dtype; bf16 leaves Q/K unquantized.",
+        description=(
+            "Q/K quantization dtype; bf16 leaves Q/K unquantized."
+            "fp4 must be accompanied by qk_sf_vec==16 for NVFP4."
+        ),
     )
     v_dtype: Literal["fp8"] = Field(
         "fp8",
@@ -81,6 +84,17 @@ class QuantAttentionConfig(StrictBaseModel):
         ge=0,
         status="prototype",
         description="Elements per quantization block for V; 0 for per-tensor quantization.",
+    )
+    qk_sf_vec: int = Field(
+        0,
+        ge=0,
+        status="prototype",
+        description=(
+            "Scale-factor vector size for the block-scaled Q@K kernel. 0 disables "
+            "the block-scaled path (SAGE / QK16PV8 / dense). "
+            "32 selects MXFP8 (requires qk_dtype==fp8); "
+            "16 selects NVFP4 (requires qk_dtype==fp4)."
+        ),
     )
 
 
@@ -119,17 +133,21 @@ class AttentionConfig(StrictBaseModel):
 
     @model_validator(mode="after")
     def _validate_quant_attention_config(self) -> "AttentionConfig":
-        # SAGE recipes target the TRTLLM backend (per-block Q/K/V scales).
+        # Recipe tuple: (qk_dtype, v_dtype, (q_block, k_block, v_block), qk_sf_vec).
+        # SAGE recipes target the TRTLLM backend; qk_sf_vec is always 0 for SAGE.
         SAGE_RECIPES = {
-            ("int8", "fp8", (1, 1, 1)),
-            ("int8", "fp8", (1, 4, 1)),
-            ("int8", "fp8", (1, 16, 1)),
-            ("fp8", "fp8", (1, 1, 1)),
-            ("fp8", "fp8", (1, 4, 1)),
+            ("int8", "fp8", (1, 1, 1), 0),
+            ("int8", "fp8", (1, 4, 1), 0),
+            ("int8", "fp8", (1, 16, 1), 0),
+            ("fp8", "fp8", (1, 1, 1), 0),
+            ("fp8", "fp8", (1, 4, 1), 0),
         }
-        # QK16PV8 (CUTEDSL backend): Q/K kept in bf16, V quantized to FP8.
-        QK16PV8_DTYPES = {
-            ("bf16", "fp8", (0, 0, 0)),
+        # CUTEDSL accepts QK16PV8 (dense path) plus the MXFP8 / NVFP4 block-scaled paths
+        # (qk_sf_vec == 0 deselects the block-scaled kernel class).
+        CUTEDSL_RECIPES = {
+            ("bf16", "fp8", (0, 0, 0), 0),  # QK16PV8
+            ("fp8", "fp8", (1, 1, 0), 32),  # MXFP8
+            ("fp4", "fp8", (1, 1, 0), 16),  # NVFP4
         }
 
         if self.quant_attention_config is None:
@@ -140,21 +158,23 @@ class AttentionConfig(StrictBaseModel):
             q_config.qk_dtype,
             q_config.v_dtype,
             (q_config.q_block_size, q_config.k_block_size, q_config.v_block_size),
+            q_config.qk_sf_vec,
         )
         if self.backend == "TRTLLM":
             if recipe not in SAGE_RECIPES:
                 raise ValueError(
                     f"Unsupported quant_attention_config={self.quant_attention_config!r} "
                     f"for backend='TRTLLM'. Supported SAGE recipes "
-                    f"(qk_dtype, v_dtype, (q_block, k_block, v_block)): "
+                    f"(qk_dtype, v_dtype, (q_block, k_block, v_block), qk_sf_vec): "
                     f"{sorted(SAGE_RECIPES)}."
                 )
         elif self.backend == "CUTEDSL":
-            if recipe not in QK16PV8_DTYPES:
+            if recipe not in CUTEDSL_RECIPES:
                 raise ValueError(
                     f"Unsupported quant_attention_config={self.quant_attention_config!r} "
-                    f"for backend='CUTEDSL'. Supported (qk_dtype, v_dtype): "
-                    f"{sorted(QK16PV8_DTYPES)}."
+                    f"for backend='CUTEDSL'. Supported recipes "
+                    f"(qk_dtype, v_dtype, (q_block, k_block, v_block), qk_sf_vec): "
+                    f"{sorted(CUTEDSL_RECIPES)}."
                 )
         else:
             raise ValueError(
