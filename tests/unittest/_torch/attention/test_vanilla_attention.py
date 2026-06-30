@@ -29,8 +29,8 @@ class TestVanillaAttention(unittest.TestCase):
         cu_seqlens = torch.tensor([0, 2], dtype=torch.int32)
         observed_is_causal = []
 
-        def fake_sdpa(q_s, k_s, v_s, *, is_causal, scale):
-            del k_s, v_s, scale
+        def fake_sdpa(q_s, k_s, v_s, *, is_causal, **kwargs):
+            del k_s, v_s, kwargs
             observed_is_causal.append(is_causal)
             return torch.zeros_like(q_s)
 

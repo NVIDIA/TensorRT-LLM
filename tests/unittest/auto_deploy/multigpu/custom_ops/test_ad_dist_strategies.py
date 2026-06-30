@@ -32,9 +32,9 @@ from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     DistBackend,
     ShardingTransformConfig,
     ShardingTransformContainer,
-    SplitDimension,
     WeightShardingInfo,
 )
+from tensorrt_llm._torch.auto_deploy.transform.library.sharding_ir import SplitDimension
 from tensorrt_llm._torch.auto_deploy.utils._graph import recompile
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm.commands.bench import main

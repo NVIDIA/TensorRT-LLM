@@ -2015,16 +2015,6 @@ class MLA(nn.Module):
             k_pe_gen = k_pe[num_ctx_tokens:, ...]
             if latent_cache_gen is None:
                 latent_cache_gen = latent_cache[num_ctx_tokens:, ...]
-            if self.apply_rotary_emb:
-                assert position_ids is not None
-                # position_ids spans [ctx..., gen...] in mixed batches; gen
-                # positions start at num_ctx_tokens.
-                gen_position_ids = position_ids[..., num_ctx_tokens:]
-                k_pe_gen = self.apply_rope(q_gen, k_pe_gen, gen_position_ids)
-                # External RoPE is only used by backends that do not handle
-                # fused RoPE internally, so keep latent_cache in sync.
-                latent_cache_gen = torch.cat([compressed_kv_gen, k_pe_gen],
-                                             dim=-1)
 
             if self.llama_4_scaling:
                 q_gen = self._attention_scaling(
@@ -2970,6 +2960,35 @@ class MLA(nn.Module):
                 device=q.device,
             )
 
+            def _mla_gen_rope():
+                if self.apply_rotary_emb:
+                    # Non-fused backends (Vanilla / FlashInfer) do not fuse RoPE
+                    # in the attention kernel. Reuse apply_rope, which rotates
+                    # q's q_pe slice in place, then copy rotated k_pe into the
+                    # latent cache that the backend appends.
+                    assert position_ids is not None
+                    assert latent_cache is not None
+                    gen_position_ids = position_ids[
+                        ..., attn_metadata.num_ctx_tokens:]
+                    k_pe_rope = self.apply_rope(q, k_pe, gen_position_ids)
+                    fused_q[..., self.kv_lora_rank:] = q_pe
+                    latent_cache[..., self.kv_lora_rank:] = k_pe_rope
+                else:
+                    # Fused backend (TRTLLM): RoPE, latent-cache append and the
+                    # trtllm-gen scheduler buffers are all produced in-kernel.
+                    self.mqa.mla_rope_generation(
+                        fused_q,
+                        q_pe,
+                        latent_cache,
+                        attn_metadata,
+                        cu_q_seqlens,
+                        cu_kv_seqlens,
+                        fmha_scheduler_counter,
+                        mla_bmm1_scale,
+                        mla_bmm2_scale,
+                        quant_q_buffer,
+                    )
+
             rope_stream = self.aux_stream if not has_fp8_kv_cache else None
             if self.k_b_proj_trans.dtype == torch.bfloat16:
                 # [num_heads, num_tokens, self.qk_nope_head_dim]
@@ -2984,18 +3003,7 @@ class MLA(nn.Module):
                     lambda: self._bmm_bf16_out(
                         q_nope_t, self.k_b_proj_trans,
                         self.k_b_proj_trans.transpose(1, 2), q_nope_out),
-                    lambda: self.mqa.mla_rope_generation(
-                        fused_q,
-                        q_pe,
-                        latent_cache,
-                        attn_metadata,
-                        cu_q_seqlens,
-                        cu_kv_seqlens,
-                        fmha_scheduler_counter,
-                        mla_bmm1_scale,
-                        mla_bmm2_scale,
-                        quant_q_buffer,
-                    ),
+                    _mla_gen_rope,
                     self.ln_events[0],
                     self.ln_events[1],
                     rope_stream,
@@ -3014,18 +3022,7 @@ class MLA(nn.Module):
                         self.k_b_proj_trans_dequant,
                         self.use_cute_dsl_blockscaling_bmm,
                     ),
-                    lambda: self.mqa.mla_rope_generation(
-                        fused_q,
-                        q_pe,
-                        latent_cache,
-                        attn_metadata,
-                        cu_q_seqlens,
-                        cu_kv_seqlens,
-                        fmha_scheduler_counter,
-                        mla_bmm1_scale,
-                        mla_bmm2_scale,
-                        quant_q_buffer,
-                    ),
+                    _mla_gen_rope,
                     self.ln_events[0],
                     self.ln_events[1],
                     rope_stream,
