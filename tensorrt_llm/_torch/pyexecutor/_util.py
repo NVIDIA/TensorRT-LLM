@@ -11,7 +11,8 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
 from tensorrt_llm._torch.models.modeling_utils import \
     MODEL_CLASS_VISION_ENCODER_MAPPING
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
-                                 str_dtype_to_binding, torch_dtype_to_str)
+                                 is_device_integrated, str_dtype_to_binding,
+                                 torch_dtype_to_str)
 from tensorrt_llm.bindings.executor import DecodingMode
 
 # isort: off
@@ -617,6 +618,14 @@ class KvCacheCreator:
         free_mem, total_mem = torch.cuda.mem_get_info()
         max_memory = self._kv_cache_config.free_gpu_memory_fraction * free_mem
         kv_size_per_token = self._get_kv_size_per_token()
+        if kv_size_per_token.intercept > 0 and is_device_integrated():
+            # On unified-memory GPUs the free counter can already be depressed
+            # by mmap-backed weights sharing the same physical pool. During the
+            # estimation dry run, subtracting the recurrent-state fixed cost
+            # here can collapse the provisional token cap to zero even though
+            # post-profiling affine sizing succeeds. Keep the final affine
+            # sizing unchanged; relax only this provisional cap.
+            kv_size_per_token = CacheCost(slope=kv_size_per_token.slope)
         max_num_tokens_in_memory = (
             kv_size_per_token.tokens_for_budget(max_memory) //
             self._tokens_per_block * self._tokens_per_block)
