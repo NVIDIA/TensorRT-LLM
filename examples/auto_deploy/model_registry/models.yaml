@@ -429,6 +429,11 @@ models:
 - name: nvidia/DeepSeek-V3.2-NVFP4
   config_id: num_hidden_layers_5
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']
+# --- NVFP4 quantized models (Mar 2026) ---
+- name: DeepInfra/GLM-4.7-Flash-NVFP4
+  yaml_extra: ['glm-4.7-flash.yaml']
+- name: nvidia/Qwen3.5-397B-A17B-NVFP4
+  yaml_extra: ['qwen3.5_moe_400b.yaml']
 # --- GLM-4.6 (Sep 2025) ---
 - name: zai-org/GLM-4.6
   config_id: glm4_moe
