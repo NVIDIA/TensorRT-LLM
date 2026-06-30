@@ -24,10 +24,9 @@ FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 
 
 class TestDynamicFP8QuantDequant(unittest.TestCase):
-
     def setUp(self):
         torch.manual_seed(42)
-        tensorrt_llm.logger.set_level('error')
+        tensorrt_llm.logger.set_level("error")
 
     def _ref_quant(self, x_, x_scale_):
         x_ = x_.float()
@@ -36,75 +35,71 @@ class TestDynamicFP8QuantDequant(unittest.TestCase):
         x_fp8_ = (x_ * inv_scale).clamp(min=finfo.min, max=finfo.max)
         return x_fp8_.to(torch.float8_e4m3fn)
 
-    @parameterized.expand([(torch.float32), (torch.float16), (torch.bfloat16)],
-                          name_func=unittest_name_func)
+    @parameterized.expand(
+        [(torch.float32), (torch.float16), (torch.bfloat16)], name_func=unittest_name_func
+    )
     def test_quantization_activation_scales(self, dtype):
         m = 11
         n = 11
         A = torch.randn((m, n), dtype=dtype).cuda()
         B, s = torch.ops.tensorrt_llm.quantize_e4m3_activation(A)
-        s_ref = (torch.max(A.float().abs(), -1)[0].view(m, 1) /
-                 FP8_E4M3_MAX).to(dtype)
+        s_ref = (torch.max(A.float().abs(), -1)[0].view(m, 1) / FP8_E4M3_MAX).to(dtype)
         B_ref = self._ref_quant(A, s_ref)
 
         torch.testing.assert_close(s_ref, s)
         torch.testing.assert_close(B.float(), B_ref.float())
 
-        B_s, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_activation(
-            A, s.float())
+        B_s, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_activation(A, s.float())
 
         torch.testing.assert_close(B_s.float(), B_ref.float())
 
-    @parameterized.expand([(torch.float32), (torch.float16), (torch.bfloat16)],
-                          name_func=unittest_name_func)
+    @parameterized.expand(
+        [(torch.float32), (torch.float16), (torch.bfloat16)], name_func=unittest_name_func
+    )
     def test_quantization_weight_scales(self, dtype):
         m = 11
         n = 11
         A = torch.randn((m, n), dtype=dtype).cuda()
         B, s = torch.ops.tensorrt_llm.quantize_e4m3_weight(A)
-        s_ref = (torch.max(A.float().abs(), 0)[0].view(1, n) /
-                 FP8_E4M3_MAX).to(dtype)
+        s_ref = (torch.max(A.float().abs(), 0)[0].view(1, n) / FP8_E4M3_MAX).to(dtype)
         B_ref = self._ref_quant(A, s_ref)
 
         torch.testing.assert_close(s_ref, s)
         torch.testing.assert_close(B.float(), B_ref.float())
 
-        B_s, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_weight(
-            A, s.float())
+        B_s, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_weight(A, s.float())
 
         torch.testing.assert_close(B_s.float(), B_ref.float())
 
-    @parameterized.expand([(torch.float32), (torch.float16), (torch.bfloat16)],
-                          name_func=unittest_name_func)
+    @parameterized.expand(
+        [(torch.float32), (torch.float16), (torch.bfloat16)], name_func=unittest_name_func
+    )
     def test_quantization_per_tensor_scales(self, dtype):
         m = 11
         n = 11
         A = torch.randn((m, n), dtype=dtype).cuda()
         B, s = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(A)
-        s_ref = (A.flatten().float().abs().max().view(1, 1) /
-                 FP8_E4M3_MAX).to(dtype)
+        s_ref = (A.flatten().float().abs().max().view(1, 1) / FP8_E4M3_MAX).to(dtype)
         B_ref = self._ref_quant(A, s_ref)
 
         torch.testing.assert_close(s_ref, s)
         torch.testing.assert_close(B.float(), B_ref.float())
 
-        B_s, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
-            A, s.float())
+        B_s, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(A, s.float())
 
         torch.testing.assert_close(B_s.float(), B_ref.float())
 
         from tensorrt_llm._torch.autotuner import autotune
+
         with autotune(tune_mode=True):
             B_tunable, s_tunable = torch.ops.trtllm.quantize_e4m3_per_tensor(A)
 
         torch.testing.assert_close(s_tunable, s_ref)
-        torch.testing.assert_close(B_tunable.float(),
-                                   B_ref.float(),
-                                   rtol=0.125,
-                                   atol=0)
+        torch.testing.assert_close(B_tunable.float(), B_ref.float(), rtol=0.125, atol=0)
 
-    @parameterized.expand([(torch.float32), (torch.float16), (torch.bfloat16)],
-                          name_func=unittest_name_func)
+    @parameterized.expand(
+        [(torch.float32), (torch.float16), (torch.bfloat16)], name_func=unittest_name_func
+    )
     def test_quantization_dequantization_activation(self, dtype):
         n = 512
         m = 1024
@@ -120,8 +115,7 @@ class TestDynamicFP8QuantDequant(unittest.TestCase):
         assert s.dtype == A.dtype
         assert qA.dtype == torch.float8_e4m3fn
 
-        s_ref = (torch.max(A.float().abs(), -1)[0].view(n, 1) /
-                 FP8_E4M3_MAX).to(dtype)
+        s_ref = (torch.max(A.float().abs(), -1)[0].view(n, 1) / FP8_E4M3_MAX).to(dtype)
         torch.testing.assert_close(s_ref, s)
 
         B = torch.ops.tensorrt_llm.dequantize_e4m3_activation(qA, s)
@@ -139,8 +133,9 @@ class TestDynamicFP8QuantDequant(unittest.TestCase):
 
         torch.testing.assert_close(A, B)
 
-    @parameterized.expand([(torch.float32), (torch.float16), (torch.bfloat16)],
-                          name_func=unittest_name_func)
+    @parameterized.expand(
+        [(torch.float32), (torch.float16), (torch.bfloat16)], name_func=unittest_name_func
+    )
     def test_quantization_dequantization_weight(self, dtype):
         n = 512
         m = 1024
@@ -154,8 +149,7 @@ class TestDynamicFP8QuantDequant(unittest.TestCase):
         assert qA.shape[1:] == s.shape[1:]
         assert s.shape[0] == 1
 
-        s_ref = (torch.max(A.float().abs(), 0)[0].view(1, m) /
-                 FP8_E4M3_MAX).to(dtype)
+        s_ref = (torch.max(A.float().abs(), 0)[0].view(1, m) / FP8_E4M3_MAX).to(dtype)
         torch.testing.assert_close(s_ref, s)
 
         B = torch.ops.tensorrt_llm.dequantize_e4m3_weight(qA, s)
@@ -170,8 +164,9 @@ class TestDynamicFP8QuantDequant(unittest.TestCase):
 
         torch.testing.assert_close(A, B)
 
-    @parameterized.expand([(torch.float32), (torch.float16), (torch.bfloat16)],
-                          name_func=unittest_name_func)
+    @parameterized.expand(
+        [(torch.float32), (torch.float16), (torch.bfloat16)], name_func=unittest_name_func
+    )
     def test_quantization_dequantization_per_tensor(self, dtype):
         n = 512
         m = 1024
@@ -183,8 +178,7 @@ class TestDynamicFP8QuantDequant(unittest.TestCase):
         assert qA.dim() == s.dim()
         assert s.numel() == 1
 
-        s_ref = (A.flatten().float().abs().max().view(1, 1) /
-                 FP8_E4M3_MAX).to(dtype)
+        s_ref = (A.flatten().float().abs().max().view(1, 1) / FP8_E4M3_MAX).to(dtype)
         torch.testing.assert_close(s_ref, s)
 
         B = torch.ops.tensorrt_llm.dequantize_e4m3_per_tensor(qA, s)
@@ -212,12 +206,10 @@ class TestDynamicFP8QuantDequant(unittest.TestCase):
         assert qA_tunable.dim() == s_tunable.dim()
         assert s_tunable.numel() == 1
 
-        s_ref_tunable = (A.flatten().float().abs().max().view(1, 1) /
-                         FP8_E4M3_MAX).to(dtype)
+        s_ref_tunable = (A.flatten().float().abs().max().view(1, 1) / FP8_E4M3_MAX).to(dtype)
         torch.testing.assert_close(s_ref_tunable, s_tunable)
 
-        B_tunable = torch.ops.tensorrt_llm.dequantize_e4m3_per_tensor(
-            qA_tunable, s_tunable)
+        B_tunable = torch.ops.tensorrt_llm.dequantize_e4m3_per_tensor(qA_tunable, s_tunable)
 
         # per tensor is less accurate than others, so larger atol is used.
         torch.testing.assert_close(A, B_tunable, atol=0.25, rtol=0)
@@ -227,11 +219,10 @@ class TestDynamicFP8QuantDequant(unittest.TestCase):
 
         with autotune(tune_mode=True):
             qA_tunable, s_tunable = torch.ops.trtllm.quantize_e4m3_per_tensor(A)
-        B_tunable = torch.ops.tensorrt_llm.dequantize_e4m3_per_tensor(
-            qA_tunable, s_tunable)
+        B_tunable = torch.ops.tensorrt_llm.dequantize_e4m3_per_tensor(qA_tunable, s_tunable)
 
         torch.testing.assert_close(A, B_tunable)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()
