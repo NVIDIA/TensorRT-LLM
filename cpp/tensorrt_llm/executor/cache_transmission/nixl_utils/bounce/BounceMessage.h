@@ -100,6 +100,12 @@ inline constexpr std::uint16_t kBounceVersion = 1U;
 /// decode via decodeWant.
 [[nodiscard]] std::string encodeWant(
     std::uint64_t requestId, std::vector<std::uint32_t> const& chunkBytes, std::string const& endpoint);
+/// Cancel/retract a request: a WANT with an EMPTY chunk list (the receiver frees everything it
+/// allocated/held for `requestId`). This is the ONLY meaning of an empty WANT — submit() never sends
+/// a zero-chunk WANT (a 0-chunk transfer resolves SUCCESS without any WANT) — so an empty chunk list
+/// is unambiguously a cancel. Thin named wrapper over encodeWant to make the intent explicit at call
+/// sites; the wire form is identical (still a WANT), so it reuses the receiver's onWant/reclaim path.
+[[nodiscard]] std::string encodeCancel(std::uint64_t requestId, std::string const& endpoint);
 [[nodiscard]] std::string encodeGrant(std::uint64_t requestId, std::vector<BounceCreditEntry> const& credits);
 [[nodiscard]] std::string encodeData(std::uint64_t requestId, std::uint32_t chunkIdx, std::uint32_t numChunks,
     std::uint64_t regionHandle, std::vector<BounceScatterEntry> const& entries);
@@ -125,5 +131,12 @@ inline constexpr std::uint16_t kBounceVersion = 1U;
 /// sender's bounce control endpoint. Returns false on a malformed/short blob.
 [[nodiscard]] bool decodeWant(std::string const& blob, BounceMsgHeader const& header,
     std::vector<std::uint32_t>& outChunkBytes, std::string& outEndpoint);
+
+/// Does a decoded WANT mean "cancel/retract"? (An empty chunk list — see encodeCancel.) Makes the
+/// receiver-side intent explicit instead of an inline `chunkBytes.empty()` check.
+[[nodiscard]] inline bool isCancelWant(std::vector<std::uint32_t> const& chunkBytes)
+{
+    return chunkBytes.empty();
+}
 
 } // namespace tensorrt_llm::executor::kv_cache::bounce

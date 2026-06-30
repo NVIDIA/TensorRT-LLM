@@ -109,6 +109,13 @@ std::string encodeWant(
     return blob;
 }
 
+std::string encodeCancel(std::uint64_t requestId, std::string const& endpoint)
+{
+    // A cancel IS an empty-chunk WANT (same wire form) — see the header. Keeping it a thin wrapper
+    // (rather than a new message type) reuses the receiver's onWant/reclaim path verbatim.
+    return encodeWant(requestId, {}, endpoint);
+}
+
 std::string encodeGrant(std::uint64_t requestId, std::vector<BounceCreditEntry> const& credits)
 {
     auto const bytes = static_cast<std::uint32_t>(credits.size() * sizeof(BounceCreditEntry));
