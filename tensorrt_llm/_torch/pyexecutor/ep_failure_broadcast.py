@@ -21,10 +21,10 @@ dedicated EP-scoped MPI communicator and progresses only nonblocking
 point-to-point requests on an independent CPU thread.
 
 The component propagates one rank-failure detection and updates only the
-process-local *detected* :class:`EPGroupHealth`. It never updates the committed
-execution mask. Multi-rank suspect/confirm consensus, commit authorization,
-and communicator reconstruction are intentionally left to later WideEP FT
-phases.
+process-local :class:`DetectedRankState`. It never receives or updates the
+committed ``EPGroupHealth`` execution mask. Multi-rank suspect/confirm
+consensus, commit authorization, and communicator reconstruction are
+intentionally left to later WideEP FT phases.
 
 Every survivor echoes a newly observed failure. Receiving one echo from every
 active survivor proves only that they propagated the same detection. Detection
@@ -57,10 +57,6 @@ try:
 except ImportError:
     MPI = None
 
-from tensorrt_llm._torch.modules.fused_moe.ep_group_health import (
-    EPGroupHealth,
-    EPGroupHealthSnapshot,
-)
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
@@ -131,6 +127,97 @@ FailureDetectedCallback = Callable[[int, int, float], None]
 # should use ``FailureDetectedCallback`` because this callback carries detected,
 # never committed, state.
 FailureReceivedCallback = FailureDetectedCallback
+
+
+@dataclass(frozen=True)
+class DetectedRankStateSnapshot:
+    """Atomic snapshot of rank-failure evidence for one communicator epoch."""
+
+    mask: int
+    failed_ranks: frozenset[int]
+    generation: int
+
+
+class DetectedRankState:
+    """Thread-safe, process-local rank-failure evidence.
+
+    This state is deliberately distinct from ``EPGroupHealth``. It is an
+    observation owned by :class:`MpiFtSubcomm`, not a committed execution mask,
+    and it is monotonic for the lifetime of one FT communicator epoch.
+
+    Args:
+        ep_size: Number of EP-local ranks represented by this state.
+
+    Raises:
+        ValueError: If ``ep_size`` is not positive.
+    """
+
+    def __init__(self, ep_size: int) -> None:
+        if ep_size <= 0:
+            raise ValueError(f"ep_size must be > 0, got {ep_size}")
+        self._ep_size = ep_size
+        self._all_active_mask = (1 << ep_size) - 1
+        self._active_mask = self._all_active_mask
+        self._failed_ranks: set[int] = set()
+        self._generation = 0
+        self._lock = threading.Lock()
+
+    @property
+    def ep_size(self) -> int:
+        """Number of ranks represented by this immutable communicator epoch."""
+        return self._ep_size
+
+    @property
+    def generation(self) -> int:
+        """Number of effective detected-failure transitions."""
+        with self._lock:
+            return self._generation
+
+    def record_failure(self, rank: int) -> bool:
+        """Record one failed rank, returning whether evidence changed."""
+        self._validate_rank(rank)
+        bit = 1 << rank
+        with self._lock:
+            if not self._active_mask & bit:
+                return False
+            self._active_mask &= ~bit
+            self._failed_ranks.add(rank)
+            self._generation += 1
+            return True
+
+    def is_active(self, rank: int) -> bool:
+        """Return whether no failure has been recorded for ``rank``."""
+        self._validate_rank(rank)
+        with self._lock:
+            return bool(self._active_mask & (1 << rank))
+
+    def get_mask(self) -> int:
+        """Return the active-rank mask derived from detected evidence."""
+        with self._lock:
+            return self._active_mask
+
+    def get_failed_ranks(self) -> frozenset[int]:
+        """Return an immutable snapshot of ranks with failure evidence."""
+        with self._lock:
+            return frozenset(self._failed_ranks)
+
+    def all_active(self) -> bool:
+        """Return whether no rank failure has been detected."""
+        with self._lock:
+            return self._active_mask == self._all_active_mask
+
+    def snapshot(self) -> DetectedRankStateSnapshot:
+        """Return one coherent mask, failure-set, and generation snapshot."""
+        with self._lock:
+            return DetectedRankStateSnapshot(
+                mask=self._active_mask,
+                failed_ranks=frozenset(self._failed_ranks),
+                generation=self._generation,
+            )
+
+    def _validate_rank(self, rank: int) -> None:
+        if not 0 <= rank < self._ep_size:
+            raise ValueError(f"rank must be in [0, {self._ep_size}), got {rank}")
 
 
 @dataclass(frozen=True)
@@ -214,8 +301,8 @@ class MpiFtSubcomm:
     thread. Call :meth:`start` only after every rank has constructed the
     component. During normal operation, the progress thread owns MPI calls on
     this communicator; :meth:`report_detected_failure` updates only local
-    detected health and enqueues a report, so it never waits for a peer or MPI
-    progress. The watchdog must call this method instead of pre-marking health.
+    detected state and enqueues a report, so it never waits for a peer or MPI
+    progress. The watchdog must call this method instead of pre-recording evidence.
     Because ``MPI.THREAD_MULTIPLE`` is required, a caller whose start/stop
     deadline proves that thread is wedged may issue the terminal Revoke/Abort
     fallback.
@@ -223,13 +310,14 @@ class MpiFtSubcomm:
     Args:
         mapping: Distributed mapping whose ``moe_ep_group`` defines the FT
             communicator and whose ``moe_ep_rank`` defines the local rank.
-        detected_health: Process-local EP detection state updated by sent and
-            received failure reports. This must be separate from the committed
-            execution-mask state owned by the recovery coordinator.
+        detected_state: Process-local EP detection evidence updated by sent and
+            received failure reports. ``EPGroupHealth`` is rejected because it
+            is the committed execution-mask state owned by the recovery
+            coordinator.
         config: Progress-loop timing configuration.
         on_failure_detected: Optional callback invoked as
             ``(failed_rank, source_rank, monotonic_time)`` when a local or
-            received report first changes detected health. This is the handoff
+            received report first changes detected state. This is the handoff
             to the future 1c.4b recovery coordinator; it is detection evidence,
             not commit authorization. Delivery runs on a dedicated daemon
             thread so callback latency cannot block MPI progress.
@@ -240,14 +328,15 @@ class MpiFtSubcomm:
     Raises:
         RuntimeError: If MPI support or thread support is insufficient, or if
             the communicator does not match ``mapping``.
-        ValueError: If ``detected_health`` and ``mapping`` describe different
+        TypeError: If ``detected_state`` is not a :class:`DetectedRankState`.
+        ValueError: If ``detected_state`` and ``mapping`` describe different
             EP groups, or if both callback keyword names are provided.
     """
 
     def __init__(
         self,
         mapping: Mapping,
-        detected_health: EPGroupHealth,
+        detected_state: DetectedRankState,
         config: MpiFtSubcommConfig | None = None,
         on_failure_detected: FailureDetectedCallback | None = None,
         *,
@@ -255,6 +344,11 @@ class MpiFtSubcomm:
         mpi_module: _MpiModule | None = None,
         on_failure_received: FailureReceivedCallback | None = None,
     ) -> None:
+        if not isinstance(detected_state, DetectedRankState):
+            raise TypeError(
+                "detected_state must be a DetectedRankState; committed "
+                "EPGroupHealth cannot be used as failure-detection evidence"
+            )
         if on_failure_detected is not None and on_failure_received is not None:
             raise ValueError(
                 "Specify only on_failure_detected; on_failure_received is a compatibility alias"
@@ -279,7 +373,7 @@ class MpiFtSubcomm:
 
             collective_setup = create_mpi_ft_subcomm(
                 mapping,
-                health_size=detected_health.moe_world_size,
+                health_size=detected_state.ep_size,
             )
             comm = cast(_MpiComm, collective_setup.comm)
 
@@ -312,10 +406,10 @@ class MpiFtSubcomm:
                     "WideEP FT MVP requires one MoE EP group spanning the full MPI world; "
                     f"got world_size={mapping.world_size}, moe_ep_group={ep_group}"
                 )
-            if detected_health.moe_world_size != mapping.moe_ep_size:
+            if detected_state.ep_size != mapping.moe_ep_size:
                 raise ValueError(
-                    "EPGroupHealth size must match mapping.moe_ep_size, "
-                    f"got {detected_health.moe_world_size} and {mapping.moe_ep_size}"
+                    "DetectedRankState size must match mapping.moe_ep_size, "
+                    f"got {detected_state.ep_size} and {mapping.moe_ep_size}"
                 )
             self._local_rank = mapping.moe_ep_rank
             self._ep_size = mapping.moe_ep_size
@@ -331,7 +425,7 @@ class MpiFtSubcomm:
                     f"expected rank={self._local_rank}, size={self._ep_size}"
                 )
 
-        self._detected_health = detected_health
+        self._detected_state = detected_state
         self._on_failure_detected = on_failure_detected
         self._outbound_reports: queue.SimpleQueue[_OutboundMessage] = queue.SimpleQueue()
         self._announced_failures: set[int] = set()
@@ -610,8 +704,8 @@ class MpiFtSubcomm:
         """Record and asynchronously announce one detected EP-rank failure.
 
         This is the nonblocking seam invoked by the host watchdog. The
-        broadcaster owns the detected-health transition; callers must not mark
-        ``detected_health`` before invoking it. This method performs no MPI
+        broadcaster owns the detected-state transition; callers must not record
+        the failure before invoking it. This method performs no MPI
         calls and never waits for the progress thread. Repeated reports for the
         same rank are coalesced after the first local announcement.
 
@@ -619,7 +713,7 @@ class MpiFtSubcomm:
             failed_rank: EP-local rank in ``[0, ep_size)``.
 
         Returns:
-            ``True`` if this call changed local detected health, else ``False``.
+            ``True`` if this call changed local detected state, else ``False``.
         """
         self._validate_rank(failed_rank)
         with self._lifecycle_lock:
@@ -634,7 +728,7 @@ class MpiFtSubcomm:
                 self._lifecycle = _Lifecycle.FAILED
                 self._request_terminal_abort(error, failed_rank, self._local_rank)
                 raise
-            changed = self._detected_health.mark_failed(failed_rank)
+            changed = self._detected_state.record_failure(failed_rank)
             enqueued = self._observe_failure(failed_rank, self._local_rank)
         detected_time = time.monotonic()
         logger.warning(
@@ -649,7 +743,7 @@ class MpiFtSubcomm:
         """Compatibility alias for :meth:`report_detected_failure`.
 
         Despite the historical name, this method does not commit failover and
-        callers must not pre-mark detected health.
+        callers must not pre-record detected evidence.
         """
         return self.report_detected_failure(failed_rank)
 
@@ -662,7 +756,7 @@ class MpiFtSubcomm:
         return (
             self._transport_poisoned.is_set()
             or self._accepted_failure_rank() is not None
-            or not self._detected_health.all_active()
+            or not self._detected_state.all_active()
         )
 
     def failure_detection_is_reconciled(self, failed_rank: int) -> bool:
@@ -680,7 +774,7 @@ class MpiFtSubcomm:
                 return False
             if self.last_error is not None or self._progress_failed.is_set():
                 return False
-            snapshot = self._detected_health.snapshot()
+            snapshot = self._detected_state.snapshot()
             if failed_rank not in snapshot.failed_ranks:
                 return False
             accepted_failure, accepted_generation = self._accepted_failure_state()
@@ -691,7 +785,7 @@ class MpiFtSubcomm:
                     return False
                 return self._failure_detection_is_reconciled_locked(failed_rank, snapshot.mask)
 
-    def detected_health_is_reconciled(self) -> bool:
+    def detected_state_is_reconciled(self) -> bool:
         """Return whether survivors propagated every local failure detection.
 
         This is not a commit gate. A ``True`` result does not authorize request
@@ -703,7 +797,7 @@ class MpiFtSubcomm:
                 return False
             if self.last_error is not None or self._progress_failed.is_set():
                 return False
-            snapshot = self._detected_health.snapshot()
+            snapshot = self._detected_state.snapshot()
             accepted_failure, accepted_generation = self._accepted_failure_state()
             if not snapshot.failed_ranks:
                 return accepted_failure is None and not self._transport_poisoned.is_set()
@@ -717,13 +811,17 @@ class MpiFtSubcomm:
                     for failed_rank in snapshot.failed_ranks
                 )
 
+    def detected_health_is_reconciled(self) -> bool:
+        """Compatibility alias for :meth:`detected_state_is_reconciled`."""
+        return self.detected_state_is_reconciled()
+
     def failure_is_reconciled(self, failed_rank: int) -> bool:
         """Compatibility alias for :meth:`failure_detection_is_reconciled`."""
         return self.failure_detection_is_reconciled(failed_rank)
 
     def health_is_reconciled(self) -> bool:
-        """Compatibility alias for :meth:`detected_health_is_reconciled`."""
-        return self.detected_health_is_reconciled()
+        """Compatibility alias for :meth:`detected_state_is_reconciled`."""
+        return self.detected_state_is_reconciled()
 
     def _validate_rank(self, rank: int) -> None:
         if not 0 <= rank < self._ep_size:
@@ -732,14 +830,14 @@ class MpiFtSubcomm:
     def _claim_failure(self, failed_rank: int) -> None:
         """Atomically enforce the single-distinct-failure MVP contract."""
         with self._failure_claim_lock:
-            snapshot = self._detected_health.snapshot()
+            snapshot = self._detected_state.snapshot()
             known_failures = snapshot.failed_ranks
-            conflicting_health = known_failures - {failed_rank}
+            conflicting_evidence = known_failures - {failed_rank}
             accepted = self._accepted_failed_rank
-            if (accepted is not None and accepted != failed_rank) or conflicting_health:
+            if (accepted is not None and accepted != failed_rank) or conflicting_evidence:
                 first_failure = accepted
                 if first_failure is None:
-                    first_failure = min(conflicting_health)
+                    first_failure = min(conflicting_evidence)
                 raise RuntimeError(
                     "WideEP FT MVP supports exactly one distinct failed rank; "
                     f"already accepted rank {first_failure}, received rank {failed_rank}"
@@ -747,15 +845,15 @@ class MpiFtSubcomm:
             if accepted is None:
                 if failed_rank in known_failures:
                     raise RuntimeError(
-                        "WideEP FT detected health was mutated before the failure "
+                        "WideEP FT detected state was mutated before the failure "
                         "broadcaster accepted the report; the watchdog must call "
-                        "report_detected_failure() without pre-marking health"
+                        "report_detected_failure() without pre-recording evidence"
                     )
                 self._accepted_failed_rank = failed_rank
-                # Exactly one effective mark_failed() must be the next detected
-                # health transition. Capturing that generation here prevents an
-                # independent mutation in the claim-to-observe window from
-                # becoming the accepted epoch baseline.
+                # Exactly one effective record_failure() must be the next
+                # detected-state transition. Capturing that generation here
+                # prevents an independent mutation in the claim-to-observe
+                # window from becoming the accepted epoch baseline.
                 self._accepted_failure_generation = snapshot.generation + 1
 
     def _accepted_failure_rank(self) -> int | None:
@@ -769,7 +867,7 @@ class MpiFtSubcomm:
     def _observe_failure(self, failed_rank: int, reporter: int) -> bool:
         """Record one detection report and enqueue this rank's echo once."""
         now = time.monotonic()
-        snapshot = self._detected_health.snapshot()
+        snapshot = self._detected_state.snapshot()
         message: _OutboundMessage | None = None
         with self._protocol_lock:
             unattributed_deadline = self._unattributed_error_deadlines.get(failed_rank)
@@ -794,7 +892,7 @@ class MpiFtSubcomm:
 
     def _detection_reconciliation_state_is_valid_locked(
         self,
-        snapshot: EPGroupHealthSnapshot,
+        snapshot: DetectedRankStateSnapshot,
         accepted_failure: int | None,
         accepted_generation: int | None,
     ) -> bool:
@@ -822,7 +920,7 @@ class MpiFtSubcomm:
         ``MPI_Abort``. This method performs no MPI calls.
         """
         self._record_error(error)
-        snapshot = self._detected_health.snapshot()
+        snapshot = self._detected_state.snapshot()
         enqueue_abort = False
         now = time.monotonic()
         with self._protocol_lock:
@@ -977,7 +1075,7 @@ class MpiFtSubcomm:
                 return
 
             failed_rank = message.failed_rank
-            snapshot = self._detected_health.snapshot()
+            snapshot = self._detected_state.snapshot()
             if message.kind is _MessageKind.ABORT:
                 # Terminal state must reach every rank still believed active.
                 # If one of them is actually the second failed rank, send
@@ -1095,7 +1193,7 @@ class MpiFtSubcomm:
                         f"{failed_rank} from EP rank {source}"
                     )
 
-            if self._detected_health.is_active(source) and not self._stop_event.is_set():
+            if self._detected_state.is_active(source) and not self._stop_event.is_set():
                 try:
                     pending_receives[source] = self._post_receive(source)
                 except Exception as error:
@@ -1158,7 +1256,7 @@ class MpiFtSubcomm:
                 self._lifecycle = _Lifecycle.FAILED
                 claim_error = error
             else:
-                changed = self._detected_health.mark_failed(failed_rank)
+                changed = self._detected_state.record_failure(failed_rank)
                 if transport_poisoned:
                     self._transport_poisoned.set()
                 self._observe_failure(failed_rank, reporter)
@@ -1304,21 +1402,21 @@ class MpiFtSubcomm:
         self._deadline_monitor_wake_event.set()
 
     def _check_accepted_failure_epoch(self) -> None:
-        """Fail closed when detected health leaves the accepted failure epoch."""
+        """Fail closed when detected state leaves the accepted failure epoch."""
         error: RuntimeError | None = None
         accepted_failure: int | None = None
         with self._lifecycle_lock:
             if self._lifecycle not in (_Lifecycle.RUNNING, _Lifecycle.STOPPING):
                 return
-            snapshot = self._detected_health.snapshot()
+            snapshot = self._detected_state.snapshot()
             accepted_failure, accepted_generation = self._accepted_failure_state()
             if accepted_failure is None:
                 if not snapshot.failed_ranks:
                     return
                 error = RuntimeError(
-                    "WideEP FT detected health changed outside the failure "
+                    "WideEP FT detected state changed outside the failure "
                     "broadcaster; the watchdog must call "
-                    "report_detected_failure() without pre-marking health "
+                    "report_detected_failure() without pre-recording evidence "
                     f"(snapshot={snapshot})"
                 )
             elif (
@@ -1375,7 +1473,7 @@ class MpiFtSubcomm:
         with self._lifecycle_lock:
             if self._lifecycle not in (_Lifecycle.RUNNING, _Lifecycle.STOPPING):
                 return
-            snapshot = self._detected_health.snapshot()
+            snapshot = self._detected_state.snapshot()
             with self._protocol_lock:
                 for failed_rank, deadline in list(self._reconcile_deadlines.items()):
                     if self._failure_detection_is_reconciled_locked(failed_rank, snapshot.mask):
@@ -1392,7 +1490,7 @@ class MpiFtSubcomm:
 
     def _stop_reconciliation_state(self) -> tuple[bool, BaseException | None]:
         """Return whether shutdown can stop MPI progress without splitting ranks."""
-        snapshot = self._detected_health.snapshot()
+        snapshot = self._detected_state.snapshot()
         failed_ranks = snapshot.failed_ranks
         accepted_failure, accepted_generation = self._accepted_failure_state()
         with self._protocol_lock:
