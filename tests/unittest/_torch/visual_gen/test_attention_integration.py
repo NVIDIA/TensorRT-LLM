@@ -270,8 +270,39 @@ def generate_rope_embeddings(
 
 
 class TestSeparateQkvSequenceParallelGuard:
-    def test_ring_with_separate_qkv_raises(self):
-        vgm = VisualGenMapping(world_size=2, rank=0, ring_size=2)
+    def test_trtllm_separate_qkv_without_quant_config_keeps_vanilla_fallback(self):
+        config = create_model_config(
+            hidden_size=64,
+            num_heads=4,
+            head_dim=16,
+            attn_backend="TRTLLM",
+            quant_attention_config=None,
+            skip_create_weights_in_init=True,
+        )
+
+        attn = Attention(
+            hidden_size=64,
+            num_attention_heads=4,
+            head_dim=16,
+            qkv_mode=QKVMode.SEPARATE_QKV,
+            config=config,
+        )
+
+        assert attn.attn_backend == "VANILLA"
+        assert isinstance(attn.attn, VanillaAttention)
+
+    @pytest.mark.parametrize(
+        "vgm_kwargs",
+        [
+            pytest.param(dict(world_size=2, rank=0, ring_size=2), id="ring"),
+            pytest.param(
+                dict(world_size=4, rank=0, attn2d_row_size=2, attn2d_col_size=2),
+                id="attn2d",
+            ),
+        ],
+    )
+    def test_ring_or_attn2d_with_separate_qkv_raises(self, vgm_kwargs):
+        vgm = VisualGenMapping(**vgm_kwargs)
 
         with pytest.raises(ValueError, match="SEPARATE_QKV cross-attention does not support"):
             _make_cross_attention_with_mapping(vgm, enable_sequence_parallel=True)

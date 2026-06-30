@@ -26,6 +26,7 @@ from ..config import CacheDiTConfig
 _WAN_CFG_DEFAULT = False
 _FLUX_CFG_DEFAULT = False
 _LTX2_CFG_DEFAULT = False
+_QWEN_CFG_DEFAULT = False
 
 # Wan 2.2 dual-transformer: stricter caps on the low-noise expert stack (second ParamsModifier).
 _WAN22_LOW_NOISE_MAX_WARMUP_STEPS = 2
@@ -342,12 +343,67 @@ def enable_cache_dit_for_ltx2(pipeline: Any, cache_dit_cfg: CacheDiTConfig) -> C
     )
 
 
+def enable_cache_dit_for_qwen_image(
+    pipeline: Any, cache_dit_cfg: CacheDiTConfig
+) -> CacheDiTEnableResult:
+    """Qwen-Image / Qwen-Image-Layered: dual-stream transformer blocks."""
+    calibrator = _maybe_calibrator(cache_dit_cfg)
+    separate = _resolved_enable_separate_cfg(cache_dit_cfg, _QWEN_CFG_DEFAULT)
+    db_cfg = _build_db_cache_config(cache_dit_cfg, enable_separate_cfg=separate)
+
+    if calibrator is not None:
+        logger.info(f"TaylorSeer enabled with order={cache_dit_cfg.taylorseer_order}")
+        modifier = ParamsModifier(cache_config=db_cfg, calibrator_config=calibrator)
+    else:
+        modifier = ParamsModifier(cache_config=db_cfg)
+
+    transformer = pipeline.transformer
+    adapter = BlockAdapter(
+        transformer=transformer,
+        blocks=[transformer.transformer_blocks],
+        forward_pattern=[ForwardPattern.Pattern_1],
+        params_modifiers=[modifier],
+        # Qwen block forward has an extra attention_mask kwarg compared
+        # with the stock Pattern_1 signature. Cache-DiT still wraps the
+        # same dual-stream hidden/text residual pattern.
+        check_forward_pattern=False,
+    )
+
+    logger.info(
+        f"Cache-DiT: Qwen-Image - Fn={db_cfg.Fn_compute_blocks}, "
+        f"Bn={db_cfg.Bn_compute_blocks}, W={db_cfg.max_warmup_steps}, "
+        f"separate_cfg={separate}",
+    )
+
+    disable_target = cache_dit.enable_cache(
+        adapter,
+        cache_config=db_cfg,
+        calibrator_config=calibrator,
+    )
+
+    def refresh_qwen(num_inference_steps: int) -> None:
+        _refresh_ctx(
+            transformer,
+            cache_dit_cfg,
+            num_inference_steps,
+            False,
+        )
+
+    return CacheDiTEnableResult(
+        refresh=refresh_qwen,
+        disable_target=disable_target,
+        summary_modules=[transformer],
+    )
+
+
 CUSTOM_CACHE_DIT_ENABLERS = {
     "WanPipeline": enable_cache_dit_for_wan,
     "WanImageToVideoPipeline": enable_cache_dit_for_wan,
     "FluxPipeline": lambda p, c: enable_cache_dit_for_flux(p, c, is_flux2=False),
     "Flux2Pipeline": lambda p, c: enable_cache_dit_for_flux(p, c, is_flux2=True),
     "LTX2Pipeline": enable_cache_dit_for_ltx2,
+    "QwenImagePipeline": enable_cache_dit_for_qwen_image,
+    "QwenImageLayeredPipeline": enable_cache_dit_for_qwen_image,
 }
 
 

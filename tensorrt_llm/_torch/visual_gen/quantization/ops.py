@@ -37,7 +37,7 @@ def quantize_fp8_per_tensor(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.T
 
 
 def quantize_fp8_blockwise(
-    weight: torch.Tensor, block_size: int = 128
+    weight: torch.Tensor, block_size: int = 128, use_e8m0_scales: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize weight to FP8 E4M3 with 128x128 blockwise scales.
@@ -49,6 +49,8 @@ def quantize_fp8_blockwise(
     Args:
         weight: Input weight tensor (BF16/FP16/FP32), shape (out_features, in_features)
         block_size: Block size for blockwise quantization (default: 128)
+        use_e8m0_scales: Use power-of-two dequantization scales for backends
+            that repack FP8 block scales to UE8M0 after weight loading.
 
     Returns:
         Tuple of:
@@ -81,9 +83,15 @@ def quantize_fp8_blockwise(
         .reshape(num_blocks_out * num_blocks_in, block_size * block_size)
     )
 
-    # Single CUDA kernel: per-row FP8 quantization
-    # quantize_e4m3_activation uses PER_TOKEN mode: one scale per row
-    qrows, scales = torch.ops.tensorrt_llm.quantize_e4m3_activation(rows_per_block.contiguous())
+    rows_per_block = rows_per_block.contiguous()
+    if use_e8m0_scales:
+        rows_float = rows_per_block.float()
+        amax = rows_float.abs().amax(dim=1).clamp_min(1.0e-4)
+        scales = torch.exp2(torch.ceil(torch.log2(amax / FP8_E4M3_MAX)))
+        qrows = (rows_float / scales.unsqueeze(1)).to(torch.float8_e4m3fn)
+    else:
+        # quantize_e4m3_activation uses PER_TOKEN mode: one scale per row
+        qrows, scales = torch.ops.tensorrt_llm.quantize_e4m3_activation(rows_per_block)
 
     # Reshape back: (nb_out*nb_in, bs*bs) -> (nb_out, nb_in, bs, bs) -> (out_padded, in_padded)
     qweight_padded = (

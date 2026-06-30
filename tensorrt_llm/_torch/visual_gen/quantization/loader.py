@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Dynamic weight quantization loader for Linear modules.
 
@@ -15,6 +18,7 @@ from tensorrt_llm._torch.visual_gen.quantization.ops import (
     quantize_fp8_per_tensor,
     quantize_nvfp4,
 )
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.utils import fp4_utils
 
@@ -165,8 +169,23 @@ class DynamicLinearWeightLoader:
 
         return False
 
+    @staticmethod
+    def _uses_e8m0_post_load_repack(module: Linear) -> bool:
+        """Match Linear.post_load_weights() backends that repack scales to UE8M0."""
+        return (
+            is_sm_100f()
+            and not (
+                getattr(module, "use_cute_dsl_blockscaling_mm", False)
+                or getattr(module, "disable_deep_gemm", False)
+            )
+        ) or get_sm_version() == 120
+
     def _maybe_dynamic_quantize(
-        self, weight_dict: Dict[str, torch.Tensor], quant_algo: Optional[QuantAlgo], name: str
+        self,
+        module: Linear,
+        weight_dict: Dict[str, torch.Tensor],
+        quant_algo: Optional[QuantAlgo],
+        name: str,
     ) -> Dict[str, torch.Tensor]:
         """Conditionally quantize weight at load time on GPU."""
         if not self._should_dynamic_quantize(weight_dict, quant_algo, name):
@@ -183,7 +202,11 @@ class DynamicLinearWeightLoader:
             return {**weight_dict, "weight": qweight, "weight_scale": scale}
         elif quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
             block_size = self.quant_config.group_size if self.quant_config else 128
-            qweight, scale = quantize_fp8_blockwise(weight, block_size=block_size)
+            qweight, scale = quantize_fp8_blockwise(
+                weight,
+                block_size=block_size,
+                use_e8m0_scales=self._uses_e8m0_post_load_repack(module),
+            )
             return {**weight_dict, "weight": qweight, "weight_scale": scale}
         elif quant_algo == QuantAlgo.NVFP4:
             qweight, weight_scale, weight_scale_2 = quantize_nvfp4(weight)
@@ -278,7 +301,7 @@ class DynamicLinearWeightLoader:
             quantized_weight_dicts = self._quantize_fused_nvfp4(weight_dicts)
         else:
             quantized_weight_dicts = [
-                self._maybe_dynamic_quantize(wd, quant_algo, name) for wd in weight_dicts
+                self._maybe_dynamic_quantize(module, wd, quant_algo, name) for wd in weight_dicts
             ]
 
         module.load_weights(quantized_weight_dicts)
