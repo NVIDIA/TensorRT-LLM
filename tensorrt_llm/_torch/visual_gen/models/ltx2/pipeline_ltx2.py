@@ -44,6 +44,7 @@ from .ltx2_core.types import (
     VideoPixelShape,
 )
 from .ltx2_core.video_vae import TilingConfig, VideoDecoderConfigurator, VideoEncoderConfigurator
+from .parallel_vae import tile_parallel_decode
 from .transformer_ltx2 import LTXModel, LTXModelType
 
 LTX2_FORCE_ONE_STAGE_ENV = "TLLM_LTX2_FORCE_ONE_STAGE_PIPELINE"
@@ -1051,6 +1052,31 @@ class LTX2Pipeline(BasePipeline):
 
         logger.info("LTX2 pipeline post-load complete")
 
+    def setup_parallel_vae(self) -> None:
+        """Enable tile-parallel VAE decode for LTX-2.
+
+        LTX-2 decodes via ``self.video_decoder`` (not ``self.vae``), so the base
+        ``setup_parallel_vae`` — which gates on ``self.vae`` + the halo-shaped
+        ``ParallelVAEFactory`` — never engages. Set the global
+        ``_parallel_vae_enabled`` flag directly from config + mapping so
+        ``decode_latents`` routes the decode to ``vae_ranks``; the tile-shard +
+        ``all_reduce`` happens in ``decode_video_fn`` via ``tile_parallel_decode``.
+        The flag is global (computed identically on every rank).
+        """
+        parallel_cfg = self.pipeline_config.parallel
+        vgm = self.pipeline_config.visual_gen_mapping
+        self._parallel_vae_enabled = (
+            parallel_cfg.parallel_vae_size > 1
+            and dist.is_initialized()
+            and dist.get_world_size() > 1
+            and vgm is not None
+        )
+        if self._parallel_vae_enabled and self.rank == 0:
+            logger.info(
+                f"LTX-2 tile-parallel VAE enabled: vae_ranks={vgm.vae_ranks}, "
+                f"parallel_vae_size={parallel_cfg.parallel_vae_size}"
+            )
+
     # ------------------------------------------------------------------
     # Text encoding
     # ------------------------------------------------------------------
@@ -1996,14 +2022,28 @@ class LTX2Pipeline(BasePipeline):
 
             vid_latents = vid_latents.to(self.dtype)
             tiling_config = TilingConfig.default()
-            chunks = list(
-                self.video_decoder.tiled_decode(
+            if self._parallel_vae_enabled:
+                # Tile-parallel: shard tiled_decode's tiles across vae_ranks and
+                # all_reduce the blend buffer. Output matches serial tiled_decode
+                # up to bf16 re-association. decode_latents calls this only on
+                # vae_ranks, so the all_reduce over vgm.vae_group is collective.
+                vgm = self.pipeline_config.visual_gen_mapping
+                video = tile_parallel_decode(
+                    self.video_decoder,
                     vid_latents,
                     tiling_config,
+                    pg=vgm.vae_group,
                     generator=generator,
                 )
-            )
-            video = torch.cat(chunks, dim=2)
+            else:
+                chunks = list(
+                    self.video_decoder.tiled_decode(
+                        vid_latents,
+                        tiling_config,
+                        generator=generator,
+                    )
+                )
+                video = torch.cat(chunks, dim=2)
             video = postprocess_video_tensor(video)
             return video
 
