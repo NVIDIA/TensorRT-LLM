@@ -53,6 +53,16 @@ struct MlaMetaParams
 template <typename T>
 struct MlaParams
 {
+    struct Dsv4EpilogueFusionParams
+    {
+        // Enable DSv4 inverse-RoPE + FP8 quant epilogue fusion.
+        bool enabled = false;
+        // The cos/sin cache used by the fused inverse-RoPE epilogue.
+        float const* cos_sin_cache = nullptr;
+        // The physical token stride of the FP32 output scale tensor.
+        int32_t scale_buf_m = 0;
+    };
+
     T const* latent_cache; // cKV + k_pe
     // Tensor Q for both context and generation MLA, contiguous. Pre-process kernel will apply RoPE and modify it
     // in-place. For context MLA, shape: [total_q_len, h * (d_nope + d_rope)], stride: [h * (d_nope + d_rope), 1]
@@ -115,6 +125,9 @@ struct MlaParams
     // STG goes to `quant_q_buf` as FP8 and the standalone quantize pass is
     // skipped. Nope segment must be pre-filled (see deepseek_v4_q_norm_fused_fp8).
     bool fuse_q_fp8_in_rope = false;
+
+    // DSv4 fused inverse-RoPE + FP8 quant epilogue parameters.
+    Dsv4EpilogueFusionParams dsv4_epilogue_fusion;
 
     // for Helix parallelism: the rotary position offsets [b]
     int32_t const* helix_position_offsets{nullptr};

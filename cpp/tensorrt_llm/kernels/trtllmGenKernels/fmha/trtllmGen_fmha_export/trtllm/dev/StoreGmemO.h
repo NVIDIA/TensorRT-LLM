@@ -83,7 +83,7 @@ template <int32_t NumRegs> struct StoreVec<NumRegs, true> {
     // Store the vector to remote smem.
     static_assert(NumRegs <= 4, "Not implemented.");
     cuda_ptx::st_async(reinterpret_cast<uint32_t*>(remoteSmemPtr),
-                       reinterpret_cast<uint32_t (&)[NumRegs]>(srcMemVec),
+                       reinterpret_cast<uint32_t(&)[NumRegs]>(srcMemVec),
                        barrier);
   }
 };

@@ -80,9 +80,9 @@ inline __device__ cute::uint128_t e2m1ToFp16(uint32_t src) {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline __device__ void computeNvFp4SfAndOutputScale(float& outputScale,
-                                               cutlass::float_e4m3_t& sfOut,
-                                               float const& amax,
-                                               float const& sfScale) {
+                                                    cutlass::float_e4m3_t& sfOut,
+                                                    float const& amax,
+                                                    float const& sfScale) {
   // The reciprocal of E2M1_MAX.
   float constexpr reciprocalOfE2m1Max = 1.f / 6.f;
   // The FP32 sf.
@@ -101,10 +101,10 @@ inline __device__ void computeNvFp4SfAndOutputScale(float& outputScale,
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline __device__ void computeNvFp4SfAndOutputScale(float& outputScale,
-                                               cutlass::float_e4m3_t& sfOut,
-                                               float const& amax,
-                                               float const& sfScale,
-                                               float const& sfScaleInv) {
+                                                    cutlass::float_e4m3_t& sfOut,
+                                                    float const& amax,
+                                                    float const& sfScale,
+                                                    float const& sfScaleInv) {
   // The reciprocal of E2M1_MAX.
   float constexpr reciprocalOfE2m1Max = 1.f / 6.f;
   // The FP32 sf.

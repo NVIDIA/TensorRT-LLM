@@ -98,7 +98,9 @@ public:
         std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
         std::optional<torch::Tensor> flash_mla_num_splits,
         std::optional<int64_t> compressed_kv_cache_pool_ptr = std::nullopt,
-        std::optional<torch::Tensor> quant_scale_qkv = std::nullopt) const
+        std::optional<torch::Tensor> quant_scale_qkv = std::nullopt,
+        std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache = std::nullopt,
+        bool enable_dsv4_epilogue_fusion = false) const
         = 0;
 };
 
@@ -161,7 +163,8 @@ public:
         std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
         std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
         std::optional<torch::Tensor> flash_mla_num_splits, std::optional<int64_t> compressed_kv_cache_pool_ptr,
-        std::optional<torch::Tensor> quant_scale_qkv) const override
+        std::optional<torch::Tensor> quant_scale_qkv, std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache,
+        bool enable_dsv4_epilogue_fusion) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
         T* attention_input = static_cast<T*>(qkv_or_q.slice(0, token_offset).data_ptr());
@@ -169,7 +172,8 @@ public:
         T* v_ptr = nullptr;
         AttentionOutT* context_buf = static_cast<AttentionOutT*>(output.slice(0, token_offset).data_ptr());
         TORCH_CHECK(!op.mFuseFp4Quant || output_sf.has_value());
-        void* context_buf_sf = op.mFuseFp4Quant ? output_sf->data_ptr() : nullptr;
+        TORCH_CHECK(!enable_dsv4_epilogue_fusion || output_sf.has_value());
+        void* context_buf_sf = (op.mFuseFp4Quant || enable_dsv4_epilogue_fusion) ? output_sf->data_ptr() : nullptr;
 
         // Rotary inv_freq, cos_sin cache to avoid re-computing.
         float const* rotary_inv_freq_ptr = nullptr;
@@ -303,6 +307,32 @@ public:
             mla_params.context_buf = reinterpret_cast<T*>(context_buf);
 
             mla_params.cos_sin_cache = rotary_cos_sin_ptr;
+            if (enable_dsv4_epilogue_fusion)
+            {
+                TORCH_CHECK(dsv4_inv_rope_cos_sin_cache.has_value(),
+                    "DSv4 fused epilogue requires inverse-RoPE cos/sin cache.");
+                auto const& cos_sin_cache = dsv4_inv_rope_cos_sin_cache.value();
+                auto const& output_sf_tensor = output_sf.value();
+                TORCH_CHECK(cos_sin_cache.scalar_type() == torch::kFloat32,
+                    "DSv4 fused epilogue cos/sin cache must be float32.");
+                TORCH_CHECK(
+                    output.scalar_type() == torch::kFloat8_e4m3fn, "DSv4 fused epilogue output must be float8_e4m3fn.");
+                TORCH_CHECK(output.dim() == 3 && output.is_contiguous(),
+                    "DSv4 fused epilogue output must be contiguous [groups, tokens, K].");
+                TORCH_CHECK(output_sf_tensor.scalar_type() == torch::kFloat32,
+                    "DSv4 fused epilogue output_sf must be float32.");
+                TORCH_CHECK(output_sf_tensor.dim() == 3 && output_sf_tensor.is_contiguous(),
+                    "DSv4 fused epilogue output_sf must be contiguous [groups, K/128, padded_tokens].");
+                TORCH_CHECK(output.size(1) >= num_tokens, "DSv4 fused epilogue output token dimension is too small.");
+                TORCH_CHECK(op.mMLAParams.v_head_dim > 0 && op.mMLAParams.v_head_dim % 128 == 0,
+                    "DSv4 fused epilogue requires v_head_dim to be a positive multiple of 128.");
+                TORCH_CHECK(output_sf_tensor.size(2) >= num_tokens,
+                    "DSv4 fused epilogue output_sf token dimension is too small.");
+
+                mla_params.dsv4_epilogue_fusion.enabled = true;
+                mla_params.dsv4_epilogue_fusion.cos_sin_cache = static_cast<float const*>(cos_sin_cache.data_ptr());
+                mla_params.dsv4_epilogue_fusion.scale_buf_m = static_cast<int32_t>(output_sf_tensor.size(2));
+            }
             mla_params.batch_size = num_seqs;
             mla_params.acc_q_len = num_tokens;
             mla_params.head_num = op.mNumHeads;
@@ -696,7 +726,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata, std::optional<torch::Tensor> flash_mla_num_splits,
     int64_t sage_attn_num_elts_per_blk_q, int64_t sage_attn_num_elts_per_blk_k, int64_t sage_attn_num_elts_per_blk_v,
     bool sage_attn_qk_int8, int64_t num_contexts, int64_t num_ctx_tokens,
-    std::optional<int64_t> compressed_kv_cache_pool_ptr, std::optional<torch::Tensor> quant_scale_qkv)
+    std::optional<int64_t> compressed_kv_cache_pool_ptr, std::optional<torch::Tensor> quant_scale_qkv,
+    std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -798,6 +829,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mTokensPerBlock = tokens_per_block.value_or(0);
     op->mFP8GenerationMLA = false;
     op->mFuseFp4Quant = is_fp4_out;
+    op->mFusesDsv4InvRopeFp8Quant = enable_dsv4_epilogue_fusion;
     op->mMaxContextLength = max_context_length;
     op->mQScaling = q_scaling;
     op->mPositionEmbeddingType
@@ -978,7 +1010,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             spec_decoding_tensor_params, attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices,
             sparse_attn_offsets, sparse_attn_indices_block_size, num_sparse_topk_value, sparse_mla_topk_lens,
             cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer,
-            flash_mla_tile_scheduler_metadata, flash_mla_num_splits, compressed_kv_cache_pool_ptr, quant_scale_qkv);
+            flash_mla_tile_scheduler_metadata, flash_mla_num_splits, compressed_kv_cache_pool_ptr, quant_scale_qkv,
+            dsv4_inv_rope_cos_sin_cache, enable_dsv4_epilogue_fusion);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -997,7 +1030,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             spec_decoding_tensor_params, attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices,
             sparse_attn_offsets, sparse_attn_indices_block_size, num_sparse_topk_value, sparse_mla_topk_lens,
             cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer,
-            flash_mla_tile_scheduler_metadata, flash_mla_num_splits, compressed_kv_cache_pool_ptr, quant_scale_qkv);
+            flash_mla_tile_scheduler_metadata, flash_mla_num_splits, compressed_kv_cache_pool_ptr, quant_scale_qkv,
+            dsv4_inv_rope_cos_sin_cache, enable_dsv4_epilogue_fusion);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);

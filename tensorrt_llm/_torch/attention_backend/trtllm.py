@@ -1331,7 +1331,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if self.print_skip_softmax_stat:
             self.skip_softmax_stat.zero_()
 
-        use_nvfp4_output = output_sf is not None
+        use_nvfp4_output = (output_sf is not None
+                            and not forward_args.enable_dsv4_epilogue_fusion)
         out_scale = (forward_args.out_scale_sf
                      if use_nvfp4_output else forward_args.out_scale)
         kv_scale_orig_quant = (self.kv_scale_orig_quant
@@ -1360,7 +1361,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         use_sage_attn = (forward_args.sage_attn_num_elts_per_blk_q > 0
                          or forward_args.sage_attn_num_elts_per_blk_k > 0
                          or forward_args.sage_attn_num_elts_per_blk_v > 0)
-        if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION and not helix_active and not use_sage_attn and trtllm_gen.is_supported(
+        use_python_trtllm_gen = (_TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION
+                                 and not helix_active and not use_sage_attn and
+                                 not forward_args.enable_dsv4_epilogue_fusion)
+        if use_python_trtllm_gen and trtllm_gen.is_supported(
                 q=q,
                 num_heads=self.num_heads,
                 num_kv_heads=self.num_kv_heads,
@@ -1566,6 +1570,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 num_ctx_tokens=metadata.num_ctx_tokens,
                 compressed_kv_cache_pool_ptr=compressed_kv_cache_pool_ptr,
                 quant_scale_qkv=forward_args.quant_scale_qkv,
+                dsv4_inv_rope_cos_sin_cache=(
+                    forward_args.dsv4_inv_rope_cos_sin_cache),
+                enable_dsv4_epilogue_fusion=(
+                    forward_args.enable_dsv4_epilogue_fusion),
             )
 
         if self.print_skip_softmax_stat:
@@ -1615,6 +1623,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         output = forward_args.output
         output_sf = forward_args.output_sf
+        if (forward_args.enable_dsv4_epilogue_fusion
+                and (output is None or output_sf is None)):
+            raise ValueError(
+                "DSv4 epilogue fusion requires caller-provided output and "
+                "output_sf buffers.")
         if output is None:
             # Output is not provided.
             is_gen_only = (forward_args.attention_input_type ==
