@@ -1106,6 +1106,7 @@ class Qwen3VLModelBase(PreTrainedModel):
             "Qwen3VLForConditionalGeneration": "Qwen3ForCausalLM",
             "Qwen3VLMoeForConditionalGeneration": "Qwen3MoeForCausalLM",
             "QwenImageBenchForConditionalGeneration": "Qwen3_5ForCausalLM",
+            "Cosmos3ForConditionalGeneration": "Qwen3ForCausalLM",
         }
         llm_arch = vlm_to_llm_arch.get(self.original_arch)
         if llm_arch is None:
