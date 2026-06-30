@@ -261,7 +261,7 @@ TEST(BounceAgentE2E, SubmitTransferRequestsUsesBounce)
 // Production-path CONCURRENCY: many threads call submitTransferRequests on the SAME sender agent at
 // once (mirrors transfer.py's KV_TRANSFER_NUM_THREADS>1 worker pool fanning out to one receiver).
 // Each gets its own seeded buffers; all must complete SUCCESS + land byte-exact with no cross-talk,
-// no hang/deadlock — the real-RDMA + production-API counterpart of the LocalCopy concurrency tests.
+// no hang/deadlock — the production-API counterpart of the transport-level concurrency tests.
 TEST(BounceAgentE2E, ConcurrentSubmitUsesBounce)
 {
     if (!hasCuda())

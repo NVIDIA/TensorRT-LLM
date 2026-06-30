@@ -87,7 +87,8 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 // SUCCESS on full ACK, FAILURE on transfer error / shutdown — never hangs.
 //
 // TransferEngine & ControlChannel are injected (not owned) so the same reactor runs
-// against the LocalCopy/zmq stack in tests and the NIXL/zmq stack in production.
+// unchanged in tests and production (both over the real NIXL/zmq stack; tests may inject a
+// fault-injecting engine to exercise the failure path).
 // ============================================================================
 
 /// Shared, single-IO-thread-owned dependencies both roles operate on. Holds the injected

@@ -15,84 +15,36 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceTransport.h"
-#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/LocalCopyTransferEngine.h"
-#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/ZmqControlChannel.h"
+// End-to-end transport tests over REAL NIXL RDMA (two in-process agents, real UCX backend): drive
+// the full bounce pipeline (gather -> RDMA write -> scatter + credit recycling) and verify every
+// byte arrives. Sizing is chosen so the chunk count exceeds the per-flow window, forcing credit
+// recycling (R1). Skips if no CUDA device or the NIXL backend can't init.
+
+#include "bounceTestNixlNode.h"
 
 #include <gtest/gtest.h>
 
-#include <cuda_runtime_api.h>
-
 #include <chrono>
-#include <memory>
-#include <vector>
+#include <string>
 
-namespace b = tensorrt_llm::executor::kv_cache::bounce;
 namespace kvc = tensorrt_llm::executor::kv_cache;
+namespace b = tensorrt_llm::executor::kv_cache::bounce;
 
 namespace
 {
-bool hasCuda()
+// One end-to-end transfer of `nDescs` x `descBytes` through the bounce pipeline between two real
+// NIXL nodes. maxChunkBytes/windowDepth are chosen so the chunk count exceeds the window (forcing
+// credit recycling). `tag` gives the two agents unique names (NIXL agents register by name).
+void runTransfer(std::string const& tag, std::uint32_t nDescs, std::uint32_t descBytes, std::size_t maxChunkBytes,
+    std::uint32_t windowDepth)
 {
-    int n = 0;
-    return cudaGetDeviceCount(&n) == cudaSuccess && n > 0;
-}
-
-std::uint64_t alignUp(std::uint64_t v, std::uint64_t a)
-{
-    return (v + a - 1) / a * a;
-}
-
-unsigned char pattern(std::size_t desc, std::size_t idx)
-{
-    return static_cast<unsigned char>((desc * 167 + idx * 13 + 7) & 0xFF);
-}
-
-// One end-to-end transfer of `nDescs` descriptors of `descBytes` each through the bounce
-// pipeline, where maxChunkBytes/windowDepth are chosen so the chunk count exceeds the pool depth
-// (forcing credit recycling). Verifies every byte arrives at the destination.
-void runTransfer(std::uint32_t nDescs, std::uint32_t descBytes, std::size_t maxChunkBytes, std::uint32_t windowDepth)
-{
-    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-
-    // Lay out src and dst regions with 256-aligned per-desc offsets.
-    std::vector<std::uint64_t> off(nDescs);
-    std::uint64_t cur = 0;
-    for (std::uint32_t i = 0; i < nDescs; ++i)
+    if (!bounce_test::hasCuda())
     {
-        off[i] = cur;
-        cur = alignUp(cur + descBytes, 256);
+        GTEST_SKIP() << "no CUDA device";
     }
-    std::uint64_t const total = cur;
-
-    void* dSrc = nullptr;
-    void* dDst = nullptr;
-    ASSERT_EQ(cudaMalloc(&dSrc, total), cudaSuccess);
-    ASSERT_EQ(cudaMalloc(&dDst, total), cudaSuccess);
-    std::vector<unsigned char> src(total, 0);
-    for (std::uint32_t i = 0; i < nDescs; ++i)
-    {
-        for (std::uint32_t j = 0; j < descBytes; ++j)
-        {
-            src[off[i] + j] = pattern(i, j);
-        }
-    }
-    ASSERT_EQ(cudaMemcpy(dSrc, src.data(), total, cudaMemcpyHostToDevice), cudaSuccess);
-    ASSERT_EQ(cudaMemset(dDst, 0, total), cudaSuccess);
-
-    auto addr = [](void* p, std::uint64_t o) { return reinterpret_cast<std::uintptr_t>(static_cast<char*>(p) + o); };
-    std::vector<kvc::MemoryDesc> srcD;
-    std::vector<kvc::MemoryDesc> dstD;
-    for (std::uint32_t i = 0; i < nDescs; ++i)
-    {
-        srcD.emplace_back(addr(dSrc, off[i]), descBytes, 0);
-        dstD.emplace_back(addr(dDst, off[i]), descBytes, 0);
-    }
-    kvc::TransferDescs srcDescs{kvc::MemoryType::kVRAM, std::move(srcD)};
-    kvc::TransferDescs dstDescs{kvc::MemoryType::kVRAM, std::move(dstD)};
 
     b::BounceConfig cfg;
-    cfg.maxChunkBytes = maxChunkBytes; // per-chunk byte cap (maxChunkBytes)
+    cfg.maxChunkBytes = maxChunkBytes; // per-chunk byte cap
     cfg.windowDepth = windowDepth;
     cfg.window = windowDepth;          // per-flow in-flight region cap -> still forces credit recycling
     cfg.scatterWorkers = 2;
@@ -106,75 +58,49 @@ void runTransfer(std::uint32_t nDescs, std::uint32_t descBytes, std::size_t maxC
     }
     cfg.arenaBytes = arenaBytes;
     std::size_t const maxDescs = std::max<std::size_t>(1024ULL, maxChunkBytes / 256ULL);
-    std::uint32_t const execCount = windowDepth + cfg.scatterWorkers + 2;
 
-    // Sender A and receiver B, each with its own control channel + arena + exec pool. One arena is
-    // unused on each side (A only gathers locally, B only grants), but the transport is symmetric.
-    b::ZmqControlChannel chA("A");
-    b::ZmqControlChannel chB("B");
-    b::LocalCopyTransferEngine engA;
-    b::LocalCopyTransferEngine engB;
-    auto arenaA = std::make_unique<b::BounceArena>(arenaBytes, 0, /*allowFabric=*/false);
-    auto arenaB = std::make_unique<b::BounceArena>(arenaBytes, 0, /*allowFabric=*/false);
-    auto execA = std::make_unique<b::ExecPool>(execCount, maxDescs, 0);
-    auto execB = std::make_unique<b::ExecPool>(execCount, maxDescs, 0);
-
-    auto A = std::make_unique<b::BounceTransport>("A", cfg, 0, &chA, &engA, arenaA.get(), execA.get());
-    auto B = std::make_unique<b::BounceTransport>("B", cfg, 0, &chB, &engB, arenaB.get(), execB.get());
-    A->addPeer("B", chB.localEndpoint());
-    B->addPeer("A", chA.localEndpoint());
-
-    auto fut = A->submit(srcDescs, dstDescs, "B");
-    ASSERT_EQ(fut.wait_for(std::chrono::seconds(20)), std::future_status::ready) << "transfer hung";
-    EXPECT_EQ(fut.get(), kvc::TransferState::kSUCCESS);
-
-    std::vector<unsigned char> got(total, 0xEE);
-    ASSERT_EQ(cudaMemcpy(got.data(), dDst, total, cudaMemcpyDeviceToHost), cudaSuccess);
-    for (std::uint32_t i = 0; i < nDescs; ++i)
+    auto A = bounce_test::makeNode(tag + "A", cfg, maxDescs);
+    auto B = bounce_test::makeNode(tag + "B", cfg, maxDescs);
+    if (!A || !B)
     {
-        for (std::uint32_t j = 0; j < descBytes; ++j)
-        {
-            ASSERT_EQ(got[off[i] + j], pattern(i, j)) << "mismatch desc=" << i << " byte=" << j;
-        }
+        GTEST_SKIP() << "NIXL agent/backend unavailable";
     }
+    bounce_test::wirePair(*A, *B);
 
-    A->shutdown();
-    B->shutdown();
-    cudaFree(dSrc);
-    cudaFree(dDst);
+    auto bufs = bounce_test::makeXferBufs(nDescs, descBytes, /*seed=*/1);
+    auto fut = A->tx->submit(bufs.srcDescs, bufs.dstDescs, B->name);
+    ASSERT_EQ(fut.wait_for(std::chrono::seconds(30)), std::future_status::ready) << "transfer hung";
+    EXPECT_EQ(fut.get(), kvc::TransferState::kSUCCESS);
+    EXPECT_TRUE(bounce_test::verifyXferBufs(bufs)) << "byte mismatch";
+
+    A->tx->shutdown();
+    B->tx->shutdown();
+    bounce_test::freeXferBufs(bufs);
 }
 } // namespace
 
 TEST(BounceTransport, SmallTransferFitsOneWindow)
 {
-    if (!hasCuda())
-        GTEST_SKIP();
-    // 4 descs, slot holds a few -> chunks <= windowDepth.
-    runTransfer(/*nDescs=*/4, /*descBytes=*/512, /*maxChunkBytes=*/8192, /*windowDepth=*/4);
+    // 4 descs, chunk holds a few -> chunks <= windowDepth.
+    runTransfer("btSmall", /*nDescs=*/4, /*descBytes=*/512, /*maxChunkBytes=*/8192, /*windowDepth=*/4);
 }
 
 TEST(BounceTransport, LargeTransferRecyclesCredits)
 {
-    if (!hasCuda())
-        GTEST_SKIP();
-    // 40 descs of ~700B, slot=4KB (a few descs/chunk) -> ~chunks >> windowDepth(2): forces
-    // credit recycling through a 2-slot receiver pool. Exercises R1 + the recycling loop.
-    runTransfer(/*nDescs=*/40, /*descBytes=*/700, /*maxChunkBytes=*/4096, /*windowDepth=*/2);
+    // 40 descs of ~700B, chunk=4KB (a few descs/chunk) -> chunks >> windowDepth(2): forces credit
+    // recycling through a 2-region window. Exercises R1 + the recycling loop.
+    runTransfer("btLarge", /*nDescs=*/40, /*descBytes=*/700, /*maxChunkBytes=*/4096, /*windowDepth=*/2);
 }
 
 TEST(BounceTransport, ManySmallDescs)
 {
-    if (!hasCuda())
-        GTEST_SKIP();
     // Closer to the real KV pattern: many tiny descs.
-    runTransfer(/*nDescs=*/500, /*descBytes=*/256, /*maxChunkBytes=*/16384, /*windowDepth=*/4);
+    runTransfer("btMany", /*nDescs=*/500, /*descBytes=*/256, /*maxChunkBytes=*/16384, /*windowDepth=*/4);
 }
 
 TEST(BounceTransport, ConcurrentRequestsToSameReceiver)
 {
-    if (!hasCuda())
-        GTEST_SKIP();
     // Two independent transfers (distinct rids) over one transport pair run as separate flows.
-    runTransfer(8, 1024, 8192, 3);
-    runTransfer(8, 1024, 8192, 3);
+    runTransfer("btConc1", 8, 1024, 8192, 3);
+    runTransfer("btConc2", 8, 1024, 8192, 3);
 }
