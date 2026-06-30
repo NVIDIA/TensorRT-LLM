@@ -259,9 +259,10 @@ class UlyssesAttention(AttentionBackend):
         compute_q: Callable[[], torch.Tensor],
         compute_k: Callable[[], torch.Tensor],
         compute_v: Callable[[], torch.Tensor],
+        issue_order: tuple = ("v", "q", "k"),
         **attn_kwargs,
     ) -> torch.Tensor:
-        """Run the async ulysses attention path (V/Q/K rolling A2A).
+        """Run the async ulysses attention path (Q/K/V rolling A2A).
 
         Args:
             compute_q / compute_k / compute_v : caller-provided closures that
@@ -269,29 +270,39 @@ class UlyssesAttention(AttentionBackend):
                 typically does `GEMM → (RMSNorm) → (RoPE) → view(4D)`; closures
                 live in the caller's compiled forward so inductor fuses each
                 into a single Triton kernel.
+            issue_order : order in which the three closures are computed +
+                issued. Default `("v", "q", "k")` (self-attn). Cross-attn passes
+                `("q", "k", "v")` to issue the small audio-Q first. Order is
+                correctness-neutral (`_join_async` syncs all recv bufs).
             **attn_kwargs : forwarded to the wrapped inner attention backend
                 (mask, scale, etc.).
 
         Returns:
             output tensor in the caller's sharded layout `[B, S/P, H, D]`.
 
-        Pipeline: V/Q/K computed in V→Q→K order on the default stream; each
-        compute's output is fed to `_issue_async` which queues push+barrier on
-        the comm side stream. Default stream proceeds to the next compute
-        immediately, so V's push overlaps with Q's compute, Q's push overlaps
-        with K's compute. `_join_async` makes default wait on the last push.
+        Pipeline: the three closures run on the default stream in `issue_order`;
+        each compute's output is fed to `_issue_async` which queues push+barrier
+        on the comm side stream. Default stream proceeds to the next compute
+        immediately, so each push overlaps with the next compute. `_join_async`
+        makes default wait on the last push.
         Post-attention permute / SDPA / reverse A2A run in the caller's outer
         compile region for additional inductor fusion."""
         P = self.world_size
 
-        v_4d = compute_v()
-        v_5d = self._issue_async(v_4d)
-
-        q_4d = compute_q()
-        q_5d = self._issue_async(q_4d)
-
-        k_4d = compute_k()
-        k_5d = self._issue_async(k_4d)
+        # Issue order tunes which push overlaps which compute. self-attn: V->Q->K
+        # (V is cheapest to compute, so its push hides behind the Q+K computes).
+        # Cross-attn (v2a, Q=small audio, K/V=large video): Q->K->V issues the small
+        # audio-Q first so the comm pipeline starts before the large video K/V GEMMs,
+        # which then overlap the in-flight pushes. Order is correctness-neutral
+        # (_join_async syncs all recv bufs before the post step).
+        if issue_order == ("q", "k", "v"):
+            q_5d = self._issue_async(compute_q())
+            k_5d = self._issue_async(compute_k())
+            v_5d = self._issue_async(compute_v())
+        else:
+            v_5d = self._issue_async(compute_v())
+            q_5d = self._issue_async(compute_q())
+            k_5d = self._issue_async(compute_k())
 
         self._join_async()
 
@@ -301,11 +312,15 @@ class UlyssesAttention(AttentionBackend):
         # only instantiated for __nv_bfloat16.
         _, B_q, Sp_q, HpP_q, D_q = q_5d.shape
         is_hnd = self.inner_backend.preferred_layout == AttentionTensorLayout.HND
-        use_fused_post_unscatter = q_5d.dtype == torch.bfloat16
+        # The 3-in-1 fused unscatter requires identical Q/K/V shape (self-attn MHA).
+        # Cross-attn (Q=audio seq ≠ K/V=video seq) → per-tensor unscatter + distinct seq_len_kv.
+        shapes_match = q_5d.shape == k_5d.shape == v_5d.shape
+        use_fused_post_unscatter = q_5d.dtype == torch.bfloat16 and shapes_match
         if use_fused_post_unscatter:
             q_out, k_out, v_out = _ulysses_post_unscatter(q_5d, k_5d, v_5d, is_hnd=is_hnd)
             B = B_q
             seq_len_full = P * Sp_q
+            seq_len_kv_full = seq_len_full
         else:
             v_out = post_permute_5d_to_4d(v_5d, P)
             q_out = post_permute_5d_to_4d(q_5d, P)
@@ -313,13 +328,14 @@ class UlyssesAttention(AttentionBackend):
 
             B = q_out.shape[0]
             seq_len_full = q_out.shape[1]
+            seq_len_kv_full = k_out.shape[1]  # cross-attn: K/V seq differs from Q
             if is_hnd:
                 q_out = q_out.transpose(1, 2).contiguous()
                 k_out = k_out.transpose(1, 2).contiguous()
                 v_out = v_out.transpose(1, 2).contiguous()
 
         attn_kwargs["seq_len"] = seq_len_full
-        attn_kwargs["seq_len_kv"] = seq_len_full
+        attn_kwargs["seq_len_kv"] = seq_len_kv_full
         output = self.inner_backend.forward(q=q_out, k=k_out, v=v_out, **attn_kwargs)
         return self._output_a2a(output, B, seq_len_full)
 
