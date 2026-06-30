@@ -1,3 +1,4 @@
+import array
 import bisect
 import contextlib
 import functools
@@ -219,6 +220,17 @@ def _filter_cuda_graph_seq_lens(cuda_graph_seq_lens: list[int],
                 result.append(max_seq_len)
             break
     return result
+
+
+def _copy_int_list_to_device(values: List[int], dst: torch.Tensor) -> None:
+    """Copy an int list into ``dst[:len(values)]`` (preallocated int32 CUDA buffer).
+
+    Stages via ``array.array('i', ...)`` + ``torch.frombuffer`` instead of
+    ``torch.tensor(<list>)``, which is ~3x faster for long sequences.
+    """
+    dst[:len(values)].copy_(torch.frombuffer(array.array('i', values),
+                                             dtype=torch.int),
+                            non_blocking=True)
 
 
 class PyTorchModelEngine(ModelEngine):
@@ -2951,6 +2963,16 @@ class PyTorchModelEngine(ModelEngine):
         request_ids = []  # per request
         gather_ids = []
         position_ids = []  # per sequence
+        # Pure-context batches (no generation request, no MRoPE, no position
+        # offset) have contiguous range() positions, so we build position_ids
+        # directly on-device with torch.arange and skip the (50k-element) Python
+        # list entirely. With a generation request the gen/extend/draft loops
+        # below need the running len(position_ids), so fall back to the list.
+        arange_positions = (not self.use_mrope
+                            and self._get_position_id_offset() == 0 and len(
+                                scheduled_requests.generation_requests) == 0)
+        ctx_position_segments = [
+        ]  # (begin_compute, length) per context request
         num_cached_tokens_per_seq = []  # per sequence
         draft_tokens = []
         draft_lens = []
@@ -3024,8 +3046,12 @@ class PyTorchModelEngine(ModelEngine):
             begin_compute = request.context_current_position
             end_compute = begin_compute + request.context_chunk_size
             prompt_tokens = all_prompt_tokens[begin_compute:end_compute]
-            position_ids.extend(
-                range(begin_compute, begin_compute + len(prompt_tokens)))
+            if arange_positions:
+                ctx_position_segments.append(
+                    (begin_compute, len(prompt_tokens)))
+            else:
+                position_ids.extend(
+                    range(begin_compute, begin_compute + len(prompt_tokens)))
 
             # Start offset of this request's (current-chunk) tokens within the
             # flattened input_ids. Recorded on multimodal_params below so models
@@ -3468,16 +3494,14 @@ class PyTorchModelEngine(ModelEngine):
 
         num_tokens = len(input_ids)
         num_draft_tokens = len(draft_tokens)
-        total_num_tokens = len(position_ids)
+        total_num_tokens = (sum(n for _, n in ctx_position_segments)
+                            if arange_positions else len(position_ids))
         assert total_num_tokens <= self.max_num_tokens, (
             f"total_num_tokens ({total_num_tokens}) should be less than or equal to max_num_tokens ({self.max_num_tokens})"
         )
         # if exist requests that do not have previous batch, copy input_ids and draft_tokens
         if num_tokens > 0:
-            input_ids = torch.tensor(input_ids,
-                                     dtype=torch.int,
-                                     pin_memory=prefer_pinned())
-            self.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
+            _copy_int_list_to_device(input_ids, self.input_ids_cuda)
 
             # Update input_ids_cuda with new tokens from new_tensors_device (draft model only)
             if self.is_draft_model and num_accepted_tokens_device is not None:
@@ -3717,12 +3741,22 @@ class PyTorchModelEngine(ModelEngine):
                     segment[:, :, :end_idx - start_idx], non_blocking=True)
             final_position_ids = self.mrope_position_ids_cuda[:, :, :
                                                               total_num_tokens]
+        elif arange_positions:
+            # Build contiguous context positions directly on-device (skips the
+            # Python list build + host->device copy).
+            offset = 0
+            for begin, length in ctx_position_segments:
+                torch.arange(begin,
+                             begin + length,
+                             dtype=torch.int,
+                             device=self.position_ids_cuda.device,
+                             out=self.position_ids_cuda[offset:offset + length])
+                offset += length
+            final_position_ids = self.position_ids_cuda[:
+                                                        total_num_tokens].unsqueeze(
+                                                            0)
         else:
-            position_ids = torch.tensor(position_ids,
-                                        dtype=torch.int,
-                                        pin_memory=prefer_pinned())
-            self.position_ids_cuda[:total_num_tokens].copy_(position_ids,
-                                                            non_blocking=True)
+            _copy_int_list_to_device(position_ids, self.position_ids_cuda)
             final_position_ids = self.position_ids_cuda[:
                                                         total_num_tokens].unsqueeze(
                                                             0)
