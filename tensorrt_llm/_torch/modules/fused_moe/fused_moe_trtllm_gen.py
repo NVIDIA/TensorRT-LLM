@@ -325,6 +325,10 @@ class TRTLLMGenFusedMoE(MoE):
                                        activation_type: ActivationType) -> int:
         if activation_type == ActivationType.Swiglu:
             return 0
+        elif activation_type == ActivationType.SwigluBias:
+            # SwigluBias uses the same SwiGlu kernel path (ActType::SwiGlu == 0);
+            # the per-expert alpha/beta/clamp_limit are passed as separate tensors.
+            return 0
         elif activation_type == ActivationType.Relu2:
             return 1
         elif activation_type == ActivationType.Silu:
