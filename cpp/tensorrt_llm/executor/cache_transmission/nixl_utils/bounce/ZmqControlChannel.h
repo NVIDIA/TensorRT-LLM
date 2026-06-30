@@ -66,6 +66,7 @@ public:
 
     [[nodiscard]] std::string localEndpoint() const override;
     void addPeer(std::string const& peer, std::string const& endpoint) override;
+    void removePeer(std::string const& peer) override;
     void sendTo(std::string const& peer, std::string const& blob) override;
     [[nodiscard]] bool recv(std::string& outPeer, std::string& outBlob, int timeoutMs) override;
 

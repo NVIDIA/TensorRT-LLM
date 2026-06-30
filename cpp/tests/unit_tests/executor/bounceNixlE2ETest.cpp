@@ -613,8 +613,10 @@ TEST(BounceNixlE2E, ForgetPeerInFlightRecovers)
     cudaFree(bufs.dst);
 
     // Recovery + no-leak: forgetPeer is a one-shot queued event, drained by the time fut resolved, so
-    // these new flows aren't reclaimed. The dealer to fpB + NIXL metadata persist (forgetPeer only
-    // reclaims scheduler/request state), so no re-wire is needed.
+    // these new flows aren't reclaimed. forgetPeer also drops the control-channel DEALER to fpB
+    // (removePeer), so re-establish it with addPeer before recovering; the NIXL metadata persists, so
+    // only the bounce dealer needs re-adding (no loadRemoteAgent / full re-wire).
+    A->tx->addPeer("fpB", B->ch->localEndpoint());
     for (int k = 0; k < 5; ++k)
     {
         auto rb = makeXferBufs(/*nDescs=*/20, /*descBytes=*/600, /*seed=*/static_cast<std::uint32_t>(50 + k));
