@@ -110,7 +110,8 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
         .def("check_gen_transfer_status", &BaseCacheTransceiver::checkGenTransferStatus,
             nb::call_guard<nb::gil_scoped_release>())
         .def("check_gen_transfer_complete", &BaseCacheTransceiver::checkGenTransferComplete)
-        .def("cancel_request", &BaseCacheTransceiver::cancelRequest);
+        .def("cancel_request", &BaseCacheTransceiver::cancelRequest)
+        .def("has_poisoned_transfer_buffer", &BaseCacheTransceiver::hasPoisonedTransferBuffer);
 
     nb::enum_<executor::kv_cache::CacheState::AttentionType>(m, "AttentionType")
         .value("DEFAULT", executor::kv_cache::CacheState::AttentionType::kDEFAULT)
@@ -120,11 +121,12 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
         .def(nb::init<tb::kv_cache_manager::BaseKVCacheManager*, std::vector<SizeType32>, SizeType32, SizeType32,
                  runtime::WorldConfig, std::vector<SizeType32>, nvinfer1::DataType,
                  executor::kv_cache::CacheState::AttentionType, std::optional<executor::CacheTransceiverConfig>,
-                 tb::rnn_state_manager::RnnStateManager*, std::vector<SizeType32>>(),
+                 tb::rnn_state_manager::RnnStateManager*, std::vector<SizeType32>, bool>(),
             nb::arg("cache_manager"), nb::arg("num_kv_heads_per_layer"), nb::arg("size_per_head"),
             nb::arg("tokens_per_block"), nb::arg("world_config"), nb::arg("attention_layer_num_per_pp"),
             nb::arg("dtype"), nb::arg("attention_type"), nb::arg("cache_transceiver_config") = std::nullopt,
-            nb::arg("rnn_state_manager") = nullptr, nb::arg("rnn_layer_num_per_pp") = std::vector<SizeType32>{});
+            nb::arg("rnn_state_manager") = nullptr, nb::arg("rnn_layer_num_per_pp") = std::vector<SizeType32>{},
+            nb::arg("enable_inflight_cancel") = false);
 
     nb::class_<tb::CacheTransceiverComm>(m, "CacheTransceiverComm")
         .def(

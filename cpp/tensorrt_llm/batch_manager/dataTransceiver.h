@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,6 +22,7 @@
 #include <string>
 #include <vector>
 
+#include "tensorrt_llm/batch_manager/baseTransBuffer.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/cacheTransferLayer.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
@@ -84,7 +85,8 @@ public:
     TransferSession(std::vector<Connection const*> connections, DataContext dataContext,
         std::vector<SizeType32> counterPartRanks, executor::DataTransceiverState const& selfState,
         executor::DataTransceiverState otherState, runtime::BufferManager const& bufferManager, int32_t indexFromEnd,
-        BlockKey const& lastBlockKey, LlmRequest const* llmRequest = nullptr, bool recordTiming = false)
+        BlockKey const& lastBlockKey, LlmRequest const* llmRequest = nullptr, bool recordTiming = false,
+        bool enableInflightCancel = false)
         : mConnections(std::move(connections))
         , mCounterPartRanks(std::move(counterPartRanks))
         , mDataContext(std::move(dataContext))
@@ -94,11 +96,25 @@ public:
         , mRequest(llmRequest)
         , mIndexFromEnd(indexFromEnd)
         , mLastBlockKey(lastBlockKey)
+        , mEnableInflightCancel(enableInflightCancel)
     {
         TLLM_CHECK(!mConnections.empty());
         if (recordTiming)
         {
             mTimes = std::make_unique<KVCacheTimes>();
+        }
+    }
+
+    TransferSession(TransferSession const&) = delete;
+    TransferSession& operator=(TransferSession const&) = delete;
+    TransferSession(TransferSession&&) noexcept = default;
+    TransferSession& operator=(TransferSession&&) noexcept = delete;
+
+    ~TransferSession()
+    {
+        if (mEnableInflightCancel)
+        {
+            poisonRecvBufferHolders();
         }
     }
 
@@ -151,6 +167,39 @@ public:
         mCounterPartRanks = std::move(ranks);
     }
 
+    [[nodiscard]] bool isInflightCancelEnabled() const noexcept
+    {
+        return mEnableInflightCancel;
+    }
+
+    /// Transfer ownership of preassigned receive-buffer slots to this session.
+    /// Formatters borrow these slots and must not release them independently.
+    void setRecvBufferHolders(std::vector<BufferIndexHolder> holders)
+    {
+        TLLM_CHECK(mRecvBufferHolders.empty());
+        mRecvBufferHolders = std::move(holders);
+    }
+
+    /// Release receive-buffer slots after the transfer and postprocessing have completed.
+    void releaseRecvBufferHolders() noexcept
+    {
+        for (auto& holder : mRecvBufferHolders)
+        {
+            holder.release();
+        }
+        mRecvBufferHolders.clear();
+    }
+
+    /// Quarantine receive-buffer slots when transfer quiescence is not known.
+    void poisonRecvBufferHolders() noexcept
+    {
+        for (auto& holder : mRecvBufferHolders)
+        {
+            holder.poison();
+        }
+        mRecvBufferHolders.clear();
+    }
+
 private:
     std::vector<Connection const*> mConnections;
     std::vector<SizeType32> mCounterPartRanks;        // Ranks corresponding to mConnections indices
@@ -162,6 +211,8 @@ private:
     std::unique_ptr<KVCacheTimes> mTimes;
     int32_t mIndexFromEnd{0};
     BlockKey mLastBlockKey{};
+    bool mEnableInflightCancel{false};
+    std::vector<BufferIndexHolder> mRecvBufferHolders;
 };
 
 using UniqueToken = tensorrt_llm::runtime::UniqueToken;
