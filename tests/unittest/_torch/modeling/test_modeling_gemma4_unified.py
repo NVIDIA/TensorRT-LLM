@@ -34,11 +34,14 @@ import pytest
 import transformers
 from packaging.version import Version
 
-# Registering the architecture only requires the modeling module to import,
-# which needs the family's transformers>=5.5.0 floor (same gate as Gemma4).
+# Gemma 4 12B Unified (gemma4_unified) requires transformers>=5.10 (the release
+# that ships the gemma4_unified config/model classes). TRT-LLM does NOT change
+# its transformers pin (still 5.5.4) for this; so under the pinned CI env this
+# test skips cleanly, and it only runs once the environment has transformers
+# >=5.10 (which the user installs at runtime to use the 12B model).
 pytestmark = pytest.mark.skipif(
-    Version(transformers.__version__) < Version("5.5.0"),
-    reason=f"Gemma4 requires transformers>=5.5.0 (installed: {transformers.__version__})",
+    Version(transformers.__version__) < Version("5.10"),
+    reason=f"gemma4_unified requires transformers>=5.10 (installed: {transformers.__version__})",
 )
 
 _UNIFIED_ARCH = "Gemma4UnifiedForConditionalGeneration"
