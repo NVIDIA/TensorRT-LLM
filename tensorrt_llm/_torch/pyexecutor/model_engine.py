@@ -48,7 +48,7 @@ from ..autotuner import AutoTuner, autotune
 from ..compilation.backend import Backend
 from ..compilation.utils import capture_piecewise_cuda_graph
 from ..distributed import Distributed
-from ..distributed.communicator import init_pp_comm
+from ..distributed.communicator import init_pp_comm, release_pp_comm
 from ..expert_statistic import ExpertStatistic
 from ..memory_buffer_utils import clear_memory_buffers, with_shared_pool
 from ..metadata import KVCacheParams
@@ -115,6 +115,40 @@ class ModelEngine(ABC):
         warmup actions: instantiating CUDA graphs, running torch.compile, etc.
         """
         return
+
+
+def _force_eager_mode_for_nccl_fault_tolerance(
+        llm_args: TorchLlmArgs) -> TorchLlmArgs:
+    """Disable CUDA capture until communicator-aware recapture lands.
+
+    A captured NCCL graph node retains the communicator handle used during
+    capture.  PR 1a.7 can replace that handle after a rank failure, but PR
+    1a.11 owns graph-cache invalidation and recapture.  Keep the MVP usable by
+    running both whole-model and piecewise paths eagerly while FT mode is on.
+    Work on the engine-local Pydantic copy so callers can reuse their original
+    arguments for a non-FT engine.
+    """
+    if os.environ.get("TLLM_FAULT_TOLERANCE_MODE") != "1":
+        return llm_args
+
+    updates = {}
+    if llm_args.cuda_graph_config is not None:
+        updates["cuda_graph_config"] = None
+
+    torch_compile_config = llm_args.torch_compile_config
+    if (torch_compile_config is not None
+            and torch_compile_config.enable_piecewise_cuda_graph):
+        updates["torch_compile_config"] = torch_compile_config.model_copy(
+            update={"enable_piecewise_cuda_graph": False})
+
+    if not updates:
+        return llm_args
+
+    logger.warning(
+        "TLLM_FAULT_TOLERANCE_MODE=1 disables CUDA graph capture until "
+        "communicator-aware invalidation and recapture are available; this "
+        "engine will serve in eager mode.")
+    return llm_args.model_copy(update=updates)
 
 
 def _filter_piecewise_capture_num_tokens(
@@ -289,9 +323,11 @@ class PyTorchModelEngine(ModelEngine):
         model_weights_restore_mode=None,
     ):
         _configure_deep_gemm_pdl()
+        llm_args = _force_eager_mode_for_nccl_fault_tolerance(llm_args)
 
         self.forward_pass_callable = None
         self.ub_buffers = None
+        self._pp_comm_acquired = False
         if llm_args.encode_only and llm_args.mm_encoder_only:
             raise ValueError(
                 "encode_only and mm_encoder_only are mutually exclusive.")
@@ -325,6 +361,7 @@ class PyTorchModelEngine(ModelEngine):
         self.mapping = mapping
         if mapping.has_pp():
             init_pp_comm(mapping)
+            self._pp_comm_acquired = True
         # Start with the established pool size. Once the model is loaded we
         # selectively enable headroom for the non-PP DeepSeek-V4 overlap path.
         from ._util import (compute_max_num_sequences,
@@ -2571,7 +2608,9 @@ class PyTorchModelEngine(ModelEngine):
         5. Userbuffers (``ub.ub_deallocate`` per buffer); on per-buffer
            failure the unfreed buffers are kept attached so a deterministic
            retry doesn't double-free already-released ones, and the
-           collected errors are re-raised after the loop.
+           collected errors are re-raised after unrelated global ownership is
+           released.
+        6. This engine's reference to the process-local PP communicator.
 
         Idempotency:
             Subsequent calls are no-ops (guarded by ``_cleanup_done``).
@@ -2608,9 +2647,9 @@ class PyTorchModelEngine(ModelEngine):
         self.input_processor_with_hash = None
 
         ub_buffers = getattr(self, 'ub_buffers', None)
+        ub_errors = []
         if ub_buffers:
             remaining_ub_buffers = []
-            ub_errors = []
             for u in ub_buffers:
                 try:
                     ub.ub_deallocate(u.addr)
@@ -2621,13 +2660,21 @@ class PyTorchModelEngine(ModelEngine):
                     remaining_ub_buffers.append(u)
                     ub_errors.append(e)
             self.ub_buffers = remaining_ub_buffers or None
-            if ub_errors:
-                raise RuntimeError(
-                    "Failed to deallocate one or more userbuffers during "
-                    "PyTorchModelEngine cleanup") from ub_errors[0]
+
+        if getattr(self, "_pp_comm_acquired", False):
+            release_pp_comm()
+            self._pp_comm_acquired = False
 
         # Release model weights.
         release_gc()
+        if ub_errors:
+            # Terminal teardown may not get another deterministic retry. Defer
+            # the userbuffer error until unrelated process-global ownership is
+            # released, while retaining only the failed buffers for a caller
+            # that can retry cleanup.
+            raise RuntimeError(
+                "Failed to deallocate one or more userbuffers during "
+                "PyTorchModelEngine cleanup") from ub_errors[0]
         self._cleanup_done = True
 
     def __del__(self) -> None:
@@ -2738,8 +2785,9 @@ class PyTorchModelEngine(ModelEngine):
         self._init_max_num_tokens()
 
     def _release_cuda_graphs(self):
-        if self._torch_compile_backend is not None:
-            self._torch_compile_backend.clear_piecewise_cuda_graphs()
+        torch_compile_backend = getattr(self, "_torch_compile_backend", None)
+        if torch_compile_backend is not None:
+            torch_compile_backend.clear_piecewise_cuda_graphs()
         if hasattr(self,
                    'cuda_graph_runner') and self.cuda_graph_runner is not None:
             self.cuda_graph_runner.clear()

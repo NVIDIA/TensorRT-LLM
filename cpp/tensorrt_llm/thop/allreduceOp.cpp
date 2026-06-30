@@ -265,9 +265,13 @@ public:
 
     int getRank() const
     {
-        return std::visit(
-            overloaded{[&](std::shared_ptr<ncclComm_t> const&) { return COMM_SESSION.getRank(); },
-                [&](c10::intrusive_ptr<c10d::ProcessGroup> const& torchPg) { return get_world_pg()->getRank(); }},
+        return std::visit(overloaded{[&](std::shared_ptr<ncclComm_t> const&)
+                              {
+                                  TLLM_CHECK_WITH_INFO(
+                                      mRank >= 0, "Raw AllreduceOp must be initialized before querying its rank");
+                                  return mRank;
+                              },
+                              [&](c10::intrusive_ptr<c10d::ProcessGroup> const&) { return get_world_pg()->getRank(); }},
             mNcclComm);
     }
 
@@ -283,6 +287,12 @@ public:
         TLLM_LOG_DEBUG("All reduce message size is %zu", size * bytes_per_element);
 
         AllReduceStrategyType runtime_strategy = selectImplementation(seq_len, hidden_size);
+
+        if (mNcclComm.index() == 0 && isNcclFaultToleranceEnabled())
+        {
+            TLLM_CHECK_WITH_INFO(runtime_strategy == AllReduceStrategyType::NCCL,
+                "NCCL error: TLLM_FAULT_TOLERANCE_MODE=1 requires a watchdog-managed NCCL allreduce strategy");
+        }
 
         // Log runtime strategy
         auto const rank = getRank();
@@ -308,10 +318,14 @@ public:
 
     int initialize()
     {
-        TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, getRank());
+        int const initialRank = mNcclComm.index() == 0 ? -1 : getRank();
+        TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, initialRank);
         if (mNcclComm.index() == 0)
         {
+            TLLM_CHECK_WITH_INFO(!isNcclFaultToleranceEnabled() || mStrategy == AllReduceStrategyType::NCCL,
+                "NCCL error: TLLM_FAULT_TOLERANCE_MODE=1 requires a watchdog-managed NCCL allreduce strategy");
             mNcclComm = getComm(mGroup);
+            mRank = getCommWorldRank(std::get<0>(mNcclComm));
         }
         if (mStrategy != AllReduceStrategyType::NCCL && mStrategy != AllReduceStrategyType::UB)
         {
@@ -415,8 +429,12 @@ private:
                            auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
                            int size = input.numel();
                            reduce_output = torch::empty_like(input);
-                           NCCLCHECK_THROW(ncclAllReduce(input.data_ptr(), reduce_output.mutable_data_ptr(), size,
-                               (*getDtypeMap())[mType], ncclSum, *rawComm, stream));
+                           auto commLease = acquireComm(rawComm);
+                           auto const watchdogToken = commLease.begin(stream, "ncclAllReduce");
+                           commLease.check(ncclAllReduce(input.data_ptr(), reduce_output.mutable_data_ptr(), size,
+                                               (*getDtypeMap())[mType], ncclSum, commLease.get(), stream),
+                               "ncclAllReduce");
+                           commLease.track(watchdogToken, stream);
                        },
                        [&](c10::intrusive_ptr<c10d::ProcessGroup>& torchPg)
                        {
@@ -462,8 +480,6 @@ private:
 
         // From here on, we have a raw NCCL comm - can proceed with window registration
         auto rawComm = std::get<0>(mNcclComm);
-        ncclComm_t comm = *rawComm;
-        TLLM_CHECK_WITH_INFO(comm != nullptr, "NCCL communicator is null");
         TLLM_LOG_DEBUG("[runNCCLAllReduceSymmetric] Using raw NCCL comm path (not ProcessGroup)");
 
         using tensorrt_llm::common::nccl_util::NCCLWindowAllocator;
@@ -486,7 +502,13 @@ private:
         double const a = -4986.43478503;
         double const b = 156716.52177552;
         int nRanks;
-        NCCLCHECK_THROW(ncclCommCount(comm, &nRanks));
+        ncclComm_t comm = nullptr;
+        {
+            auto commLease = acquireComm(rawComm);
+            comm = commLease.get();
+            TLLM_CHECK_WITH_INFO(comm != nullptr, "NCCL communicator is null");
+            commLease.check(ncclCommCount(comm, &nRanks), "ncclCommCount");
+        }
         size_t minRegistrationThreshold = static_cast<size_t>(std::max(0.0, a * nRanks + b)) * input.element_size();
         // Disable window registration if neither NVLink nor MNNVL is supported
         // TODO replace in NCCL 2.29 with comm query
@@ -566,7 +588,16 @@ private:
         }
 
         // Perform allreduce
-        NCCLCHECK_THROW(ncclAllReduce(inputPtr, outputPtr, size, (*getDtypeMap())[mType], ncclSum, comm, stream));
+        {
+            auto commLease = acquireComm(rawComm);
+            auto const activeComm = commLease.get();
+            TLLM_CHECK_WITH_INFO(activeComm == comm, "NCCL communicator changed while preparing a symmetric allreduce");
+            auto const watchdogToken = commLease.begin(stream, "ncclAllReduce(symmetric)");
+            commLease.check(
+                ncclAllReduce(inputPtr, outputPtr, size, (*getDtypeMap())[mType], ncclSum, activeComm, stream),
+                "ncclAllReduce(symmetric)");
+            commLease.track(watchdogToken, stream);
+        }
 
         if (mOp == AllReduceFusionOp::NONE)
         {
@@ -1466,6 +1497,7 @@ private:
     AllReduceFusionOp mOp;
     float mEps;
     std::variant<std::shared_ptr<ncclComm_t>, c10::intrusive_ptr<c10d::ProcessGroup>> mNcclComm;
+    int mRank{-1};
 };
 
 } // namespace
@@ -1488,7 +1520,7 @@ void preallocateNCCLWindowBuffer(
     }
 
     auto const commPtr = getComm(groupSet);
-    if (!commPtr || *commPtr == nullptr)
+    if (!commPtr)
     {
         TLLM_LOG_DEBUG("[preallocateNCCLWindowBuffers] NCCL comm is null; skipping preallocation");
         return;
@@ -1496,7 +1528,11 @@ void preallocateNCCLWindowBuffer(
 
     using tensorrt_llm::common::nccl_util::NCCLWindowAllocator;
     auto& allocator = NCCLWindowAllocator::getInstance();
-    ncclComm_t const comm = *commPtr;
+    ncclComm_t comm = nullptr;
+    {
+        auto commLease = acquireComm(commPtr);
+        comm = commLease.get();
+    }
 
     int64_t const numTokens = input.size(0);
     int64_t const elementsPerToken = input.numel() / numTokens;
@@ -1518,7 +1554,7 @@ void preallocateNCCLWindowBuffer(
     {
         for (int64_t i = 0; i < buffersPerSize; ++i)
         {
-            auto buffer = allocator.requestBuffer(comm, bufferSize);
+            auto buffer = allocator.requestBuffer(commPtr, bufferSize);
             if (!buffer.isValid())
             {
                 break;
@@ -1528,6 +1564,14 @@ void preallocateNCCLWindowBuffer(
     }
     catch (std::exception const& e)
     {
+        // A local allocation failure is a best-effort preallocation miss. A
+        // communicator failure is not: preserve the classifier-friendly NCCL
+        // exception so the executor enters recovery instead of continuing on
+        // the aborted native handle.
+        if (getCommAsyncError(commPtr).has_value())
+        {
+            throw;
+        }
         TLLM_LOG_DEBUG("[preallocateNCCLWindowBuffer] requestBuffer failed for %zu bytes: %s", bufferSize, e.what());
     }
 
