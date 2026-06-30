@@ -78,10 +78,23 @@ void CreditScheduler::dropFromRing(std::string const& flow)
     }
 }
 
+// Hand out as many region grants as possible RIGHT NOW, fairly and bounded. Called whenever space
+// frees up or new demand arrives (onWant / onScatterDone / releaseLocal / reclaim*). Three rules:
+//   1. Fair: rotate over flows round-robin (mRing + mCursor) so no flow starves.
+//   2. Per-flow window W: a flow may hold at most mMaxWindow regions in flight (held.size() < W);
+//      more must wait for an ACK to free one. This bounds a single flow's pipeline depth.
+//   3. Arena capacity: all flows' regions share one buddy arena; if the next chunk doesn't fit, skip
+//      this flow (a smaller chunk elsewhere may still fit) -> backpressure, never an error.
+// Shape: each inner sweep grants AT MOST ONE region then breaks, advancing the cursor past the flow
+// just served; the outer loop re-sweeps from there. That one-at-a-time + advance gives strict
+// rotation (A,B,A,B,...) instead of draining one flow's whole window first. It stops when a full
+// sweep grants nothing (every flow is done / window-full / can't fit). Returns the GRANTs to send.
 std::vector<Grant> CreditScheduler::schedule()
 {
     std::vector<Grant> grants;
     bool progress = true;
+    // Re-sweep as long as the previous sweep granted something (a grant may free a slot/leave room for
+    // the next flow); stop when a whole sweep makes no progress, or the ring is empty.
     while (progress && !mRing.empty())
     {
         progress = false;
@@ -116,8 +129,10 @@ std::vector<Grant> CreditScheduler::schedule()
             st.pending.pop_front();
             st.held.insert(*off);
             grants.push_back(Grant{mRing[idx], *off, mBaseAddr + *off, want});
-            mCursor = (idx + 1) % mRing.size();
+            mCursor = (idx + 1) % mRing.size(); // next sweep starts AFTER this flow -> round-robin
             progress = true;
+            // One grant per sweep: break out and let the outer loop re-sweep from the advanced cursor,
+            // so grants alternate across flows (strict rotation) rather than filling one flow first.
             break;
         }
     }
