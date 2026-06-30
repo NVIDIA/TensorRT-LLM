@@ -94,6 +94,7 @@ from tensorrt_llm._torch.modules.fused_moe.quantization import (
     DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
     FP8QDQFusedMoEMethod,
     INT8WoqPerChannelFusedMoEMethod,
+    NVFP4CuteDslFusedMoEMethod,
     NVFP4CutlassFusedMoEMethod,
     NVFP4MegaMoECuteDslMethod,
     NVFP4TRTLLMGenFusedMoEMethod,
@@ -350,7 +351,12 @@ def _run_eplb_test(
         "initial_expert_ids should be recorded before any forward pass"
     )
 
-    extra_steps = 1
+    # Run multiple iterations so online EPLB actually migrates several layers'
+    # experts between slots (roughly layer_updates_per_iter layers per step). A
+    # single step can pass even when migrated experts are laid out incorrectly,
+    # because few/no experts have moved yet -- exercise enough steps for the
+    # migration path (and any layout bug in it) to take effect.
+    extra_steps = 8
     for _ in range(extra_steps):
         output = run_forward_fn()
         ref_fused_moe.check_accuracy(output, ref_output)
@@ -835,6 +841,7 @@ QUANT_ALGOS = [
     QuantAlgo.W4A16_MXFP4,
     QuantAlgo.W4A8_MXFP4_FP8,
     QuantAlgo.W4A8_MXFP4_MXFP8,
+    QuantAlgo.MXFP8,
     QuantAlgo.W8A16,
     QuantAlgo.W4A8_AWQ,
 ]
@@ -849,6 +856,7 @@ BACKEND_TYPES = [
     MoeBackendType.MEGAMOE_DEEPGEMM,
     MoeBackendType.MEGAMOE_CUTEDSL,
     MoeBackendType.CUTE_DSL_B12X,
+    MoeBackendType.MARLIN,
 ]
 
 # Data types to test
@@ -1599,7 +1607,9 @@ MULTI_GPU_TEST_PARAMS = generate_multi_gpu_test_params(
     model_configs=MOE_MODEL_CONFIGS,
     seq_lens=[8] if IS_CI_MODE else SEQ_LENS,
     dtypes=DTYPES,
-    backend_types=BACKEND_TYPES,
+    backend_types=[
+        b for b in BACKEND_TYPES if b != MoeBackendType.MARLIN
+    ],  # Marlin doesn't support fused routing
     quant_algos=QUANT_ALGOS,
     routing_methods=MULTI_GPU_ROUTING_METHODS,
 )
@@ -1749,10 +1759,13 @@ def _get_fused_moe_method_class(quant_algo, backend_type):
         }
         return method_map.get(quant_algo)
 
-    # CUTEDSL backend uses same methods as CUTLASS for quantization
+    # CUTEDSL backend shares the CUTLASS NVFP4 pipeline but applies an extra
+    # gate/up interleave on top, so it has its own quant method class. Using the
+    # Cutlass class here would hide CuteDsl-specific behavior (e.g. its online
+    # EPLB shared-weight layout handling).
     if backend_str == "CUTEDSL":
         method_map = {
-            QuantAlgo.NVFP4: NVFP4CutlassFusedMoEMethod,
+            QuantAlgo.NVFP4: NVFP4CuteDslFusedMoEMethod,
         }
         return method_map.get(quant_algo)
 

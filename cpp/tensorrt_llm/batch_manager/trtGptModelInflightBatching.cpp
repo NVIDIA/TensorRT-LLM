@@ -25,6 +25,7 @@
 #include "tensorrt_llm/batch_manager/contextProgress.h"
 #include "tensorrt_llm/batch_manager/createNewDecoderRequests.h"
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
+#include "tensorrt_llm/batch_manager/disaggTransferAdmissionController.h"
 #include "tensorrt_llm/batch_manager/guidedDecoder.h"
 #include "tensorrt_llm/batch_manager/handleContextLogits.h"
 #include "tensorrt_llm/batch_manager/handleGenerationLogits.h"
@@ -333,6 +334,8 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
         mCacheTransceiver
             = CacheTransceiverFactory::createCacheTransceiver(mKvCacheManager.get(), mModelConfig, mWorldConfig,
                 executor::kv_cache::CacheState::AttentionType::kDEFAULT, executorConfig.getCacheTransceiverConfig());
+        mDisaggTransferAdmissionController = std::make_unique<DisaggTransferAdmissionController>(
+            cacheTransceiverConfig.getMaxTokensInBuffer(), mModelConfig.getTokensPerBlock());
     }
 
     if (mModelConfig.getSpeculativeDecodingMode().needsKVCacheRewind())
@@ -1018,8 +1021,26 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
         auto [fittingRequests, fittingDisaggGenInitRequests, requestsToPause]
             = (*mCapacityScheduler)(activeRequests, mKvCacheManager, mPeftCacheManager, mCrossKvCacheManager);
         // Remove from fitting requests the requests that cannot be scheduled due to disagg KV cache transfer
+        bool waitForDisaggGenTransferProgress = false;
         if (mModelConfig.isTransformerBased() && getKVCacheManager() && mCacheTransceiver)
         {
+            if (mDisaggTransferAdmissionController && mDisaggTransferAdmissionController->enabled()
+                && !fittingDisaggGenInitRequests.empty())
+            {
+                auto admissionResult
+                    = mDisaggTransferAdmissionController->select(activeRequests, fittingDisaggGenInitRequests);
+                waitForDisaggGenTransferProgress = admissionResult.isBlockedByActiveTransfers();
+                if (admissionResult.deferredRequestCount > 0)
+                {
+                    TLLM_LOG_DEBUG(
+                        "Disagg transfer admission deferred %zu requests; active transfer blocks=%zu, admitted "
+                        "transfer blocks=%zu, budget=%zu",
+                        admissionResult.deferredRequestCount, admissionResult.activeTransferBlocks,
+                        admissionResult.admittedTransferBlocks,
+                        mDisaggTransferAdmissionController->getMaxTransferBlocks().value_or(0));
+                }
+                fittingDisaggGenInitRequests = std::move(admissionResult.admittedRequests);
+            }
             prepareDisaggGenInitRequests(activeRequests, fittingDisaggGenInitRequests);
         }
         if (fittingRequests.empty() && fittingDisaggGenInitRequests.empty())
@@ -1031,8 +1052,16 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
                 mIterCounter);
             if (mCacheTransceiver)
             {
-                mCacheTransceiver->checkContextTransferStatus(1, true);
-                // will free kvCache in next iteration.
+                if (waitForDisaggGenTransferProgress)
+                {
+                    TLLM_LOG_DEBUG("Waiting for generation KV cache transfer progress to free disagg admission budget");
+                    mCacheTransceiver->checkGenTransferStatus(1);
+                }
+                else
+                {
+                    mCacheTransceiver->checkContextTransferStatus(1, true);
+                    // will free kvCache in next iteration.
+                }
             }
         }
         std::tie(currRequests.contextRequests, currRequests.generationRequests)
@@ -1629,10 +1658,10 @@ void TrtGptModelInflightBatching::prepareDisaggGenInitRequests(
         auto const blockTransfer = std::all_of(activeRequests.begin(), activeRequests.end(),
             [](auto const& req) { return req->isDisaggGenerationTransmissionInProgress(); });
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-            "newGenReqs.size():%ld requests, activeRequests.size():%ld checkGenTransferStatus :%d original "
+            "newGenReqs.size():%ld requests, activeRequests.size():%ld allTransferInProgress:%d original "
             "gen_only_requests_num:%ld",
             newGenReqs.size(), activeRequests.size(), blockTransfer, genInitReqNum);
-        mCacheTransceiver->checkGenTransferStatus(blockTransfer ? 1 : 0);
+        mCacheTransceiver->checkGenTransferStatus(0);
         auto timeEnd = std::chrono::steady_clock::now();
         auto duration = std::chrono::duration<float, std::milli>(timeEnd - timeStart).count();
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
@@ -1661,21 +1690,14 @@ void TrtGptModelInflightBatching::checkDisaggGenTransferStatus(RequestList const
 
     if (needCheck)
     {
-        auto const needCheckOne = std::all_of(activeRequests.begin(), activeRequests.end(),
-            [](auto const& req) { return req->isDisaggGenerationTransmissionInProgress(); });
-
-        int atLeastNum = needCheckOne ? 1 : 0;
-        TLLM_LOG_DEBUG(
-            mpi::MpiComm::world().getRank(), "noPreppared requests, checkGenTransferStatus atLeastNum:%d", atLeastNum);
-
-        mCacheTransceiver->checkGenTransferStatus(atLeastNum);
+        mCacheTransceiver->checkGenTransferStatus(0);
 
         auto timeEnd = std::chrono::steady_clock::now();
         auto duration = std::chrono::duration<float, std::milli>(timeEnd - timeStart).count();
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
             "no Prepare checkDisaggGenTransferStatus time:%f ms, "
-            "needCheckOne:%d,needCheck:%ld,activeRequests.size():%ld",
-            duration, needCheckOne, needCheck, activeRequests.size());
+            "needCheck:%d,activeRequests.size():%ld",
+            duration, needCheck, activeRequests.size());
     }
 }
 

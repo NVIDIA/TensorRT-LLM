@@ -51,6 +51,11 @@
 
 namespace kvc = tensorrt_llm::executor::kv_cache;
 
+namespace tensorrt_llm::batch_manager::kv_cache_manager
+{
+class FabricMemory;
+} // namespace tensorrt_llm::batch_manager::kv_cache_manager
+
 namespace tensorrt_llm::batch_manager::eviction_policy
 {
 class BaseEvictionPolicy;
@@ -486,6 +491,10 @@ public:
     [[nodiscard]] bool isShared() const;
 
     [[nodiscard]] bool isLeaf() const;
+
+    //! \brief Test if block is detached from radix search tree.
+    //! \return True if block is detached from search tree.
+    [[nodiscard]] bool isDetached() const;
 
     void setPriority(executor::RetentionPriority priority);
 
@@ -1340,6 +1349,8 @@ private:
 
     // Buffer manager
     runtime::BufferManager mBufferManager;
+    // Fabric memory backing for primary pools (MNNVL-capable allocation)
+    std::vector<std::unique_ptr<kv_cache_manager::FabricMemory>> mFabricMemoryPools;
 
     // Used to keep track of number of free blocks during scheduling
     SizeType32 mSchedulingNumFreeBlocks;

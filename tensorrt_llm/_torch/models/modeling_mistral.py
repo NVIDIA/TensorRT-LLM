@@ -23,7 +23,7 @@ from tensorrt_llm._torch.models.checkpoints.mistral.weight_mapper import \
 from tensorrt_llm._torch.models.modeling_mistral_large3 import (
     Mistral3Gate, MistralLarge3ForCausalLM)
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
-    MultimodalEncoderOutput, MultimodalModelMixin, PreparedLlmInputs)
+    MultimodalModelMixin, PreparedLlmInputs)
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     _MULTIMODAL_ENV_NAME, _is_mm_disagg)
 from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
@@ -705,9 +705,9 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
     def encode_multimodal_inputs(
         self,
         multimodal_params: Sequence[MultimodalParams],
-    ) -> MultimodalEncoderOutput:
+    ) -> torch.Tensor:
         mm_embeds = self._vision_forward(list(multimodal_params))
-        return MultimodalEncoderOutput(embeddings=mm_embeds[0])
+        return mm_embeds[0]
 
     def get_language_model_forward_kwargs(
         self,

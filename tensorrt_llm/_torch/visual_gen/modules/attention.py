@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig
 
 from ...modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
@@ -182,11 +183,22 @@ class Attention(nn.Module):
         # The async-ulysses path uses SEPARATE_QKV for stream-pipelined
         # V/Q/K projections AND still needs the head-sharding wrap — opt in
         # via async_ulysses=True.
+        cp_size = vgm.cp_size if vgm else 1
         use_ulysses = (
             ulysses_size > 1
             and enable_sequence_parallel
-            and (self.qkv_mode != QKVMode.SEPARATE_QKV or async_ulysses)
+            and (self.qkv_mode != QKVMode.SEPARATE_QKV or async_ulysses or cp_size == 1)
         )
+        if ulysses_size > 1 and enable_sequence_parallel and not use_ulysses:
+            # Ulysses was requested (ulysses_size > 1, SP on) but disabled: this is a
+            # SEPARATE_QKV cross-attention that is neither async nor pure-Ulysses
+            # (cp_size > 1), so it falls back to the all-gather K/V path.
+            logger.debug(
+                f"Attention(layer={layer_idx}): Ulysses disabled despite ulysses_size="
+                f"{ulysses_size} — qkv_mode={self.qkv_mode.value}, "
+                f"async_ulysses={async_ulysses}, cp_size={cp_size} "
+                f"(SEPARATE_QKV cross-attn needs async_ulysses or cp_size==1)."
+            )
 
         # Compute head counts for the backend
         # Ulysses shards heads across workers; inner backend sees sharded count
@@ -234,6 +246,7 @@ class Attention(nn.Module):
             self.attn,
             visual_gen_mapping=vgm,
             enable_sequence_parallel=enable_sequence_parallel,
+            use_ulysses=use_ulysses,
             async_ulysses=use_ulysses and async_ulysses,
         )
 
@@ -601,7 +614,7 @@ class Attention(nn.Module):
                 "forward() for sync execution."
             )
 
-        B, S, _ = hidden_states.shape
+        B, S = hidden_states.shape[:2]
         H = self.num_attention_heads
         KV = self.num_key_value_heads
         D = self.head_dim
@@ -610,13 +623,16 @@ class Attention(nn.Module):
         # has no async analog here.
         use_fused = self.fuse_qk_norm_rope and freqs is not None and self.qk_norm
 
-        # SEPARATE_QKV self-attn 3x fp4_quantize dedup: pre-quantize hidden_states
-        # once and pass the shared Fp4QuantizedTensor to to_q/to_k/to_v via Linear's
-        # Fp4QuantizedTensor shortcut. Saves 2 of 3 fp4_quantize launches per layer.
-        # Eligibility is structural (set in __init__); runtime gate checks that the
-        # checkpoint loaded an input_scale (some attn Linears can be excluded from
-        # NVFP4 per checkpoint config — e.g. LTX-2 transformer_blocks.10.attn1).
-        if self._maybe_share_qkv_quantize and getattr(self.to_q, "input_scale", None) is not None:
+        # SEPARATE_QKV self-attn shares ONE input quant across to_q/to_k/to_v (never 3):
+        #   * hidden_states already an Fp4QuantizedTensor -> an upstream fused norm+quant AdaLN
+        #     pre-quantized it once (with to_q.input_scale); reuse it directly -> 0 quant here.
+        #   * else eligible -> quantize once and share the Fp4QuantizedTensor -> 1 quant here.
+        #   * else -> bf16, each Linear quantizes its own (non-NVFP4 / NVFP4-excluded layers).
+        # Eligibility is structural (set in __init__); the runtime gate checks the checkpoint
+        # loaded an input_scale (some attn Linears are NVFP4-excluded -- e.g. LTX-2 blocks.10.attn1).
+        if isinstance(hidden_states, Fp4QuantizedTensor):
+            qkv_input = hidden_states
+        elif self._maybe_share_qkv_quantize and getattr(self.to_q, "input_scale", None) is not None:
             x_2d = hidden_states.reshape(-1, hidden_states.shape[-1])
             fp4, sf = torch.ops.trtllm.tunable_fp4_quantize(
                 x_2d, self.to_q.input_scale, self.to_q.scaling_vector_size, False

@@ -17,7 +17,7 @@ import functools
 import math
 import os
 import weakref
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -38,7 +38,7 @@ from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
                         KVCacheParams, MLAParams, PositionalEmbeddingParams,
-                        PredefinedAttentionMask, RopeParams, SparsePrediction,
+                        PredefinedAttentionMask, RopeParams,
                         merge_attention_forward_args)
 from .sparse.params import SparseParams
 from .sparse.skip_softmax import SkipSoftmaxParams
@@ -184,16 +184,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         Required max_seq_len for context-only attention cases like visual gen
         """
         return min(self.max_seq_len, self.max_num_tokens)
-
-    @property
-    def effective_beam_width(self) -> int:
-        """Beam width visible to the kernel.
-
-        Cross-attention metadata is already expanded to one row per decoder
-        beam, and all beams read the same encoder K/V cache. Keep kernel beam
-        indirection disabled for that path.
-        """
-        return 1 if self.is_cross else self.beam_width
 
     @property
     def max_seq_len(self) -> int:
@@ -1439,10 +1429,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # Cross-attention uses the THOP path; the trtllm-gen backend API does
         # not carry encoder K/V tensors yet.
 
-        if forward_args.multi_item_part_lens is not None:
-            raise ValueError(
-                "TRT-LLM Attention does not support multi-item scoring")
-
         # SM90 forces ``use_paged_context_fmha`` on for correctness
         # (https://nvbugs/5624818).
         if get_sm_version() == 90:
@@ -1487,6 +1473,49 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if forward_args.cu_kv_seqlens is None:
             forward_args.cu_kv_seqlens = metadata.cu_kv_seqlens
 
+        # Testing only: ``mla_rope_generation`` normally rotates q_pe, appends the
+        # new latent to the paged cache, and fills the trtllm-gen scheduler
+        # buffers (cumulative q/kv seqlens + the FMHA scheduler counter). When the
+        # harness sets ``skip_mla_rope_generation`` it feeds a pre-RoPE'd fused_q,
+        # so we skip only the RoPE and do the append + scheduler init here: the
+        # generation FMHA only reads the cache, and the fallback path needs the
+        # scheduler buffers (the flashinfer trtllm-gen decode kernel ignores them).
+        if (self.is_mla_enable and forward_args.skip_mla_rope_generation
+                and forward_args.attention_input_type
+                == AttentionInputType.generation_only):
+            num_ctx = metadata.num_contexts
+            n_gen = metadata.num_generations
+            # Use the GPU-resident length tensors (no host->device copy) so this
+            # stays CUDA-graph-capturable.
+            gen_q_lens = metadata.seq_lens_cuda[num_ctx:num_ctx + n_gen].to(
+                torch.int32)
+            gen_kv_lens = metadata.kv_lens_cuda_runtime[num_ctx:num_ctx +
+                                                        n_gen].to(torch.int32)
+            cu_q = torch.zeros(n_gen + 1, dtype=torch.int32, device=q.device)
+            cu_kv = torch.zeros(n_gen + 1, dtype=torch.int32, device=q.device)
+            cu_q[1:] = torch.cumsum(gen_q_lens, dim=0).to(
+                torch.int32) * self.num_heads
+            cu_kv[1:] = torch.cumsum(gen_kv_lens, dim=0).to(torch.int32)
+            forward_args.cu_q_seqlens = cu_q
+            forward_args.cu_kv_seqlens = cu_kv
+            if forward_args.fmha_scheduler_counter is None:
+                forward_args.fmha_scheduler_counter = torch.zeros(
+                    1, dtype=torch.uint32, device=q.device)
+            else:
+                forward_args.fmha_scheduler_counter.zero_()
+            assert forward_args.latent_cache is not None
+            from .utils import append_mla_latent_cache
+            append_mla_latent_cache(
+                metadata.kv_cache_manager,
+                self.get_local_layer_idx(metadata),
+                metadata.request_ids,
+                metadata.seq_lens.tolist(),
+                metadata.kv_cache_params.num_cached_tokens_per_seq,
+                forward_args.latent_cache,
+                kv_layout=metadata.kv_layout,
+                seq_start=num_ctx,
+            )
+
         # RocketKV and DSA predict which blocks to keep, so build their sparse
         # index tensors here. Skip-softmax needs no prediction.
         sparse_params = self.sparse_params
@@ -1496,7 +1525,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                                     forward_args)
             at_idx, at_off = self.sparse_attn_predict(q, k, metadata,
                                                       forward_args)
-            forward_args.sparse_prediction = SparsePrediction(
+            forward_args.sparse_prediction = replace(
+                forward_args.sparse_prediction,
                 sparse_kv_indices=kv_idx,
                 sparse_kv_offsets=kv_off,
                 sparse_attn_indices=at_idx,
