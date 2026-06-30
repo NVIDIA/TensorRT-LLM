@@ -67,18 +67,15 @@ models:
 - name: Qwen/Qwen3-8B
   config_id: default_ws_2
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'enable_sharder_ir.yaml']
-# RuntimeError: a and b must have same reduction dim, but got [s44*s70, 5120] X [2560, 5120]. See https://github.com/NVIDIA/TensorRT-LLM/issues/14679
-# - name: microsoft/phi-4
-#   config_id: default_ws_2
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
-# RuntimeError: a and b must have same reduction dim, but got [s44*s70, 5120] X [2560, 5120]. See https://github.com/NVIDIA/TensorRT-LLM/issues/14679
-# - name: microsoft/Phi-4-reasoning
-#   config_id: default_ws_2
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
-# RuntimeError: a and b must have same reduction dim, but got [s44*s70, 5120] X [2560, 5120]. See https://github.com/NVIDIA/TensorRT-LLM/issues/14679
-# - name: microsoft/Phi-4-reasoning-plus
-#   config_id: default_ws_2
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: microsoft/phi-4
+  config_id: default_ws_2
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'enable_sharder_ir.yaml']
+- name: microsoft/Phi-4-reasoning
+  config_id: default_ws_2
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'enable_sharder_ir.yaml']
+- name: microsoft/Phi-4-reasoning-plus
+  config_id: default_ws_2
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'enable_sharder_ir.yaml']
 # IndexError: list index out of range in AutoDeploy sharding path. See https://github.com/NVIDIA/TensorRT-LLM/issues/14681
 # - name: google/gemma-1.1-7b-it
 #   config_id: default_ws_2

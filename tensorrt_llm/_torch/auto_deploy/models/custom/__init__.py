@@ -55,6 +55,7 @@ _MODEL_MODULES = {
     "modeling_nemotron_h": ["NemotronHForCausalLM"],
     "modeling_olmo3": ["Olmo3ForCausalLM"],
     "modeling_openelm": ["OpenELMForCausalLM"],
+    "modeling_phi3": ["Phi3ForCausalLM"],
     "modeling_qwen3": ["Qwen3ForCausalLM"],
     "modeling_qwen3_5_moe": ["Qwen3_5MoeForCausalLM", "Qwen3_5MoeForConditionalGeneration"],
     "modeling_qwen3_moe": ["Qwen3MoeForCausalLM"],
