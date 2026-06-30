@@ -365,15 +365,6 @@ class BaseLLM:
             self.runtime_context: Optional[_ModelRuntimeContext] = None
             self.llm_build_stats = LlmBuildStats()
             self._build_model()
-            # Raw SamplingParams need new final-content scoping only for
-            # Harmony+xgrammar. Normal parsers and llguidance keep their
-            # pre-existing raw behavior; serving adapts its params separately.
-            self._guided_decoding_reasoning_parser = (
-                resolve_raw_guided_decoding_reasoning_parser(
-                    self.args.reasoning_parser,
-                    getattr(self._hf_model_config, "model_type", None),
-                    self.args.guided_decoding_backend,
-                ))
 
         except Exception:
             if self.mpi_session is not None:
@@ -1279,15 +1270,24 @@ class BaseLLM:
                 sampling_params._setup(self.tokenizer, self._hf_model_config,
                                        self._generation_config)
             self._add_bart_forced_tokens_logits_processor(sampling_params)
-            if (sampling_params.guided_decoding is not None
-                    and self._guided_decoding_reasoning_parser is not None):
-                # The constructor resolves this policy only for the
-                # Harmony+xgrammar case missing from the raw LLM path.
-                sampling_params.guided_decoding = (
-                    adapt_guided_decoding_params_for_reasoning_parser(
-                        sampling_params.guided_decoding,
-                        self._guided_decoding_reasoning_parser,
+            if sampling_params.guided_decoding is not None:
+                reasoning_format_for_guided_decoding = (
+                    resolve_raw_guided_decoding_reasoning_parser(
+                        self.args.reasoning_parser,
+                        getattr(self._hf_model_config, "model_type", None),
+                        self.args.guided_decoding_backend,
                     ))
+                if reasoning_format_for_guided_decoding is not None:
+                    # SamplingParams carries a caller-provided content
+                    # constraint, but not how this model frames reasoning and
+                    # final output. Add that model-aware framing here so
+                    # xgrammar applies the guide only to Harmony's final
+                    # channel. Other formats preserve the original guide.
+                    sampling_params.guided_decoding = (
+                        adapt_guided_decoding_params_for_reasoning_parser(
+                            sampling_params.guided_decoding,
+                            reasoning_format_for_guided_decoding,
+                        ))
             add_thinking_budget_logits_processor(
                 sampling_params,
                 reasoning_parser=self.args.reasoning_parser,

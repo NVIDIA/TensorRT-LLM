@@ -41,9 +41,8 @@ from tensorrt_llm.inputs.media_io import MediaModality
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import (DisaggScheduleStyle, GuidedDecodingParams,
                                  SamplingParams)
-from tensorrt_llm.llmapi.reasoning_parser import (
-    adapt_guided_decoding_params_for_reasoning_parser,
-)
+from tensorrt_llm.llmapi.reasoning_parser import \
+    adapt_guided_decoding_params_for_reasoning_parser
 from tensorrt_llm.sampling_params import (check_logprobs_limit,
                                           validate_thinking_token_budget)
 from tensorrt_llm.scheduling_params import AgentHierarchy
