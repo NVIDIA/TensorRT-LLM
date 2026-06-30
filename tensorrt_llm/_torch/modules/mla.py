@@ -2048,11 +2048,10 @@ class MLA(nn.Module):
                     # latent cache that the backend appends.
                     assert position_ids is not None
                     assert latent_cache is not None
-                    gen_position_ids = position_ids[
-                        ..., attn_metadata.num_ctx_tokens:]
+                    gen_position_ids = position_ids[..., attn_metadata.num_ctx_tokens :]
                     k_pe_rope = self.apply_rope(q, k_pe, gen_position_ids)
-                    fused_q[..., self.kv_lora_rank:] = q_pe
-                    latent_cache[..., self.kv_lora_rank:] = k_pe_rope
+                    fused_q[..., self.kv_lora_rank :] = q_pe
+                    latent_cache[..., self.kv_lora_rank :] = k_pe_rope
                 else:
                     # Fused backend (TRTLLM): RoPE, latent-cache append and the
                     # trtllm-gen scheduler buffers are all produced in-kernel.
