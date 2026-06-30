@@ -46,6 +46,8 @@ WAN_T2V_HEIGHT = 480
 WAN_T2V_WIDTH = 832
 WAN_T2V_NUM_FRAMES = 165
 
+# NB: this test file lives at tests/integration/defs/examples/visual_gen/, so the repo
+# root is five levels up (the LPIPS eval script is referenced from <repo>/scripts/).
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".."))
 VISUAL_GEN_LPIPS_EVAL_SCRIPT = os.path.join(
     REPO_ROOT, "scripts", "visualgen_eval", "visual_gen_lpips_score_eval.py"
@@ -66,6 +68,7 @@ FLUX_LPIPS_THRESHOLD = 0.05
 LTX2_LPIPS_NUM_FRAMES = 49
 LTX2_LPIPS_NUM_INFERENCE_STEPS = 8
 LTX2_LPIPS_THRESHOLD = 0.05
+LTX2_CUDA_GRAPH_LPIPS_THRESHOLD = 0.01
 
 WAN21_LPIPS_PROMPT = "A cat sitting on a windowsill"
 WAN21_LPIPS_NEGATIVE_PROMPT = None
@@ -87,6 +90,36 @@ WAN22_LPIPS_NUM_INFERENCE_STEPS = 4
 WAN22_LPIPS_GUIDANCE_SCALE = 4.0
 WAN22_LPIPS_SEED = 42
 WAN22_LPIPS_FRAME_RATE = 16.0
+
+# QwenImage (text-to-image) — default-setting LPIPS golden.
+# Params mirror the QwenImage 20B reference defaults (pipeline_qwen_image.py).
+# NOTE: QwenImage's forward CFG knob is ``true_cfg_scale`` (not ``guidance_scale``),
+# and real-CFG only engages when a negative prompt is supplied.
+QWENIMAGE_MODEL_SUBPATH = "qwen-image"
+QWENIMAGE_LPIPS_PROMPT = "a tiny astronaut hatching from an egg on the moon"
+QWENIMAGE_LPIPS_NEGATIVE_PROMPT = ""
+QWENIMAGE_LPIPS_HEIGHT = 1328
+QWENIMAGE_LPIPS_WIDTH = 1328
+QWENIMAGE_LPIPS_NUM_INFERENCE_STEPS = 50
+QWENIMAGE_LPIPS_TRUE_CFG_SCALE = 4.0
+QWENIMAGE_LPIPS_SEED = 42
+QWENIMAGE_LPIPS_THRESHOLD = 0.05
+
+# Cosmos3-Nano (text-to-video + text-to-image) — default-setting LPIPS golden.
+# Params are the Cosmos3 720P defaults (cosmos3/defaults.py:COSMOS3_720P_PARAMS).
+# Cosmos3 requires VANILLA attention and guardrails disabled in CI.
+COSMOS3_NANO_MODEL_SUBPATH = "Cosmos3-Nano"
+COSMOS3_LPIPS_PROMPT = "A serene mountain landscape with snow-capped peaks and a flowing river"
+COSMOS3_LPIPS_HEIGHT = 720
+COSMOS3_LPIPS_WIDTH = 1280
+COSMOS3_LPIPS_T2V_NUM_FRAMES = 189
+COSMOS3_LPIPS_T2I_NUM_FRAMES = 1
+COSMOS3_LPIPS_NUM_INFERENCE_STEPS = 35
+COSMOS3_LPIPS_GUIDANCE_SCALE = 6.0
+COSMOS3_LPIPS_SEED = 42
+COSMOS3_LPIPS_FRAME_RATE = 24.0
+COSMOS3_LPIPS_THRESHOLD = 0.05
+
 # LTX-2 configuration
 LTX2_MODEL_CHECKPOINT_PATH = "LTX-2/ltx-2-19b-dev.safetensors"
 LTX2_TEXT_ENCODER_SUBPATH = "gemma-3-12b-it"
@@ -487,12 +520,15 @@ def _assert_lpips_below_threshold(score, threshold):
 def _generate_flux_lpips_image(model_path, output_path):
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
     from tensorrt_llm.media.encoding import save_image
-    from tensorrt_llm.visual_gen.args import VisualGenArgs
+    from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
     _skip_if_missing(model_path, "FLUX checkpoint", is_dir=True)
     _disable_inductor_compile_worker_quiesce()
     with _lpips_deterministic_algorithms():
-        args = VisualGenArgs(model=model_path)
+        args = VisualGenArgs(
+            model=model_path,
+            torch_compile_config=TorchCompileConfig(enable=False),
+        )
         pipeline = PipelineLoader(args).load(skip_warmup=True)
         try:
             result = pipeline.forward(
@@ -511,9 +547,9 @@ def _generate_flux_lpips_image(model_path, output_path):
     save_image(generated_image, output_path)
 
 
-def _generate_ltx2_lpips_video(output_path):
+def _generate_ltx2_lpips_video(output_path, *, enable_cuda_graph=False):
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
-    from tensorrt_llm.visual_gen.args import VisualGenArgs
+    from tensorrt_llm.visual_gen.args import CudaGraphConfig, TorchCompileConfig, VisualGenArgs
 
     checkpoint_path = _lpips_model_path("LTX-2", "ltx-2-19b-dev.safetensors")
     text_encoder_path = _ltx2_lpips_text_encoder_path()
@@ -533,6 +569,8 @@ def _generate_ltx2_lpips_video(output_path):
                 "spatial_upsampler_path": spatial_upsampler_path,
                 "distilled_lora_path": distilled_lora_path,
             },
+            torch_compile_config=TorchCompileConfig(enable=False),
+            cuda_graph_config=CudaGraphConfig(enable=enable_cuda_graph),
         )
         pipeline = PipelineLoader(args).load(skip_warmup=True)
         try:
@@ -569,13 +607,14 @@ def _run_wan_lpips_pipeline(
     parallel=None,
 ):
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
-    from tensorrt_llm.visual_gen.args import AttentionConfig, VisualGenArgs
+    from tensorrt_llm.visual_gen.args import AttentionConfig, TorchCompileConfig, VisualGenArgs
 
     _skip_if_missing(model_path, "Wan checkpoint", is_dir=True)
     _disable_inductor_compile_worker_quiesce()
     args_kwargs = dict(
         model=model_path,
         attention_config=AttentionConfig(backend=attention_backend),
+        torch_compile_config=TorchCompileConfig(enable=False),
     )
     if parallel is not None:
         args_kwargs["parallel_config"] = parallel
@@ -674,6 +713,111 @@ def wan22_bf16_video_path(_visual_gen_deps, llm_venv):
     return output_path
 
 
+def _generate_qwenimage_lpips_image(model_path, output_path):
+    """Generate the QwenImage text-to-image LPIPS sample (default setting, compile-off)."""
+    from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+    from tensorrt_llm.media.encoding import save_image
+    from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
+
+    _skip_if_missing(model_path, "QwenImage checkpoint", is_dir=True)
+    _disable_inductor_compile_worker_quiesce()
+    args = VisualGenArgs(
+        model=model_path,
+        torch_compile_config=TorchCompileConfig(enable=False),
+    )
+    pipeline = PipelineLoader(args).load(skip_warmup=True)
+    try:
+        with torch.no_grad():
+            result = pipeline.forward(
+                prompt=QWENIMAGE_LPIPS_PROMPT,
+                negative_prompt=QWENIMAGE_LPIPS_NEGATIVE_PROMPT,
+                height=QWENIMAGE_LPIPS_HEIGHT,
+                width=QWENIMAGE_LPIPS_WIDTH,
+                num_inference_steps=QWENIMAGE_LPIPS_NUM_INFERENCE_STEPS,
+                true_cfg_scale=QWENIMAGE_LPIPS_TRUE_CFG_SCALE,
+                seed=QWENIMAGE_LPIPS_SEED,
+            )
+        generated_image = result.image[0].detach().cpu()
+    finally:
+        del pipeline
+        _cleanup_cuda()
+
+    save_image(generated_image, output_path)
+
+
+def _run_cosmos3_lpips_pipeline(num_frames):
+    """Run the Cosmos3-Nano pipeline (default setting, VANILLA attn, compile-off).
+
+    Returns the generated video tensor ``(B, T, H, W, C)`` (T == ``num_frames``),
+    or ``None`` if generation produced no video.  ``num_frames=1`` yields the
+    single-frame text-to-image path.
+    """
+    # Cosmos3 re-reads the guardrail flag in __init__; set it before the pipeline loads.
+    guardrails_env_key = "TRTLLM_DISABLE_COSMOS3_GUARDRAILS"
+    previous_guardrails_env = os.environ.get(guardrails_env_key)
+    os.environ[guardrails_env_key] = "1"
+    try:
+        from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+        from tensorrt_llm.visual_gen.args import (
+            AttentionConfig,
+            CompilationConfig,
+            TorchCompileConfig,
+            VisualGenArgs,
+        )
+
+        model_path = _lpips_model_path(COSMOS3_NANO_MODEL_SUBPATH)
+        _skip_if_missing(model_path, "Cosmos3-Nano checkpoint", is_dir=True)
+        _disable_inductor_compile_worker_quiesce()
+        args = VisualGenArgs(
+            model=model_path,
+            compilation_config=CompilationConfig(skip_warmup=True),
+            torch_compile_config=TorchCompileConfig(enable=False),
+            attention_config=AttentionConfig(backend="VANILLA"),
+        )
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        try:
+            with torch.no_grad():
+                result = pipeline.forward(
+                    prompt=COSMOS3_LPIPS_PROMPT,
+                    seed=COSMOS3_LPIPS_SEED,
+                    height=COSMOS3_LPIPS_HEIGHT,
+                    width=COSMOS3_LPIPS_WIDTH,
+                    num_frames=num_frames,
+                    num_inference_steps=COSMOS3_LPIPS_NUM_INFERENCE_STEPS,
+                    guidance_scale=COSMOS3_LPIPS_GUIDANCE_SCALE,
+                    frame_rate=COSMOS3_LPIPS_FRAME_RATE,
+                    use_guardrails=False,
+                )
+            if result is None or result.video is None:
+                return None
+            return result.video.detach().cpu()
+        finally:
+            del pipeline
+            _cleanup_cuda()
+    finally:
+        if previous_guardrails_env is None:
+            os.environ.pop(guardrails_env_key, None)
+        else:
+            os.environ[guardrails_env_key] = previous_guardrails_env
+
+
+def _generate_cosmos3_lpips_video(output_path):
+    """Generate the Cosmos3-Nano text-to-video LPIPS sample."""
+    video = _run_cosmos3_lpips_pipeline(COSMOS3_LPIPS_T2V_NUM_FRAMES)
+    assert video is not None, "Cosmos3-Nano T2V LPIPS run produced no video"
+    _save_lpips_video_mp4(video, output_path, frame_rate=COSMOS3_LPIPS_FRAME_RATE)
+
+
+def _generate_cosmos3_lpips_image(output_path):
+    """Generate the Cosmos3-Nano text-to-image LPIPS sample (single frame)."""
+    from tensorrt_llm.media.encoding import save_image
+
+    video = _run_cosmos3_lpips_pipeline(COSMOS3_LPIPS_T2I_NUM_FRAMES)
+    assert video is not None, "Cosmos3-Nano T2I LPIPS run produced no frame"
+    # video is (B, T, H, W, C); take the single frame -> (H, W, C) for save_image.
+    save_image(video[0, 0], output_path)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_flux1_lpips_against_golden(tmp_path):
     generated_path = tmp_path / "flux1_generated.png"
@@ -727,6 +871,24 @@ def test_ltx2_lpips_against_golden(tmp_path, ltx2_two_stage_bf16_video_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_ltx2_cuda_graph_lpips_matches_eager(tmp_path):
+    eager_path = tmp_path / "ltx2_eager_generated.mp4"
+    cuda_graph_path = tmp_path / "ltx2_cuda_graph_generated.mp4"
+
+    _generate_ltx2_lpips_video(eager_path, enable_cuda_graph=False)
+    _generate_ltx2_lpips_video(cuda_graph_path, enable_cuda_graph=True)
+    score = _run_lpips_eval(
+        tmp_path,
+        "ltx2_cuda_graph",
+        "video",
+        LTX2_T2V_PROMPT,
+        eager_path,
+        cuda_graph_path,
+    )
+    _assert_lpips_below_threshold(score, LTX2_CUDA_GRAPH_LPIPS_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_wan21_t2v_lpips_against_golden(tmp_path, wan21_bf16_video_path):
     golden_path = _golden_media_path(
         tmp_path, "wan21_t2v_lpips_golden_video.mp4", "Wan 2.1 LPIPS golden video"
@@ -756,6 +918,62 @@ def test_wan22_t2v_lpips_against_golden(tmp_path, wan22_bf16_video_path):
         wan22_bf16_video_path,
     )
     _assert_lpips_below_threshold(score, WAN_LPIPS_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_qwenimage_lpips_against_golden(tmp_path):
+    generated_path = tmp_path / "qwenimage_generated.png"
+    golden_path = _golden_media_path(
+        tmp_path, "qwenimage_lpips_golden.png", "QwenImage LPIPS golden image"
+    )
+    _generate_qwenimage_lpips_image(_lpips_model_path(QWENIMAGE_MODEL_SUBPATH), generated_path)
+    score = _run_lpips_eval(
+        tmp_path,
+        "qwenimage",
+        "image",
+        QWENIMAGE_LPIPS_PROMPT,
+        golden_path,
+        generated_path,
+    )
+    _assert_lpips_below_threshold(score, QWENIMAGE_LPIPS_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_cosmos3_nano_t2v_lpips_against_golden(tmp_path):
+    generated_path = tmp_path / "cosmos3_nano_t2v_generated.mp4"
+    golden_path = _golden_media_path(
+        tmp_path,
+        "cosmos3_nano_t2v_lpips_golden_video.mp4",
+        "Cosmos3-Nano T2V LPIPS golden video",
+    )
+    _generate_cosmos3_lpips_video(generated_path)
+    score = _run_lpips_eval(
+        tmp_path,
+        "cosmos3_nano_t2v",
+        "video",
+        COSMOS3_LPIPS_PROMPT,
+        golden_path,
+        generated_path,
+    )
+    _assert_lpips_below_threshold(score, COSMOS3_LPIPS_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_cosmos3_nano_t2i_lpips_against_golden(tmp_path):
+    generated_path = tmp_path / "cosmos3_nano_t2i_generated.png"
+    golden_path = _golden_media_path(
+        tmp_path, "cosmos3_nano_t2i_lpips_golden.png", "Cosmos3-Nano T2I LPIPS golden image"
+    )
+    _generate_cosmos3_lpips_image(generated_path)
+    score = _run_lpips_eval(
+        tmp_path,
+        "cosmos3_nano_t2i",
+        "image",
+        COSMOS3_LPIPS_PROMPT,
+        golden_path,
+        generated_path,
+    )
+    _assert_lpips_below_threshold(score, COSMOS3_LPIPS_THRESHOLD)
 
 
 def _generate_wan_video(llm_venv, model_subpath, output_subdir):
