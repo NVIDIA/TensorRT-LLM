@@ -1152,6 +1152,15 @@ class PyTorchModelEngine(ModelEngine):
         else:
             logger.debug("Skipped TRTLLM-Gen FMHA JIT warmup for Ctx kernels")
 
+        if (not self.is_draft_model and self.guided_decoder is None
+                and can_run_general_warmup):
+            # The cute_dsl_mla FMHA lib now only support the generation-only batch, we need to warmup the TRTLLM-Gen FMHA lib for the mixed context+generation batch.
+            # One MIXED context+generation batch (1 ctx token + 1 gen request).
+            warmup_requests_configs.append(
+                (1 + self.max_total_draft_tokens + 1, 1))
+        else:
+            logger.debug("Skipped TRTLLM-Gen flashinfer_trtllm_gen FMHA lib JIT warmup When enable cute_dsl_mla FMHA lib")
+
         for num_tokens, num_gen_requests in warmup_requests_configs:
             warmup_request = self._create_warmup_request(
                 resource_manager,

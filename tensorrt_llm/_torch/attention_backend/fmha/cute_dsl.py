@@ -518,32 +518,9 @@ class CuteDslMlaFmha(PhasedFmha):
                 f"{tuple(block_offsets.shape)} for layer_idx={attn.layer_idx}."
             )
         cache_seqs_base = params.sequence_lengths.to(torch.int32)
-        page_table = page_table_layer.transpose(0, 1).to(torch.int32)
+        page_table = page_table_layer[meta.num_contexts:].transpose(0, 1).to(torch.int32)
         if layers_in_pool > 1:
             page_table = page_table + layer_in_pool
-
-        if os.environ.get("TLLM_CUTE_DSL_DUMP"):
-            print(
-                "[CUTEDSL_DUMP] layer=%d kv_pool.shape=%s kv_pool.stride=%s "
-                "contiguous=%s block_offsets.shape=%s page_table.shape=%s "
-                "page_table=%s cache_seqs=%s"
-                % (
-                    attn.layer_idx,
-                    tuple(kv_pool.shape),
-                    tuple(kv_pool.stride()),
-                    kv_pool.is_contiguous(),
-                    tuple(block_offsets.shape),
-                    tuple(page_table.shape),
-                    # Full per-sequence rows when TLLM_CUTE_DSL_DUMP_FULL_PT=1
-                    # (page_table.t() -> [batch, pages_per_seq]); otherwise the
-                    # small-shape preview only (numel<64) to avoid log spam.
-                    page_table.t().tolist()
-                    if (os.environ.get("TLLM_CUTE_DSL_DUMP_FULL_PT")
-                        or page_table.numel() < 64) else "(big)",
-                    cache_seqs_base[:8].tolist(),
-                ),
-                flush=True,
-            )
 
         # KVCacheManager exposes NHD pages as [num_pages, 1, page_size, 1, head_dim].
         # The CuTe DSL kernel consumes a paged [page_size, dim, num_pages] view
@@ -659,42 +636,6 @@ class CuteDslMlaFmha(PhasedFmha):
             device=q.device,
         )
         lse = lse_storage.permute(2, 1, 0)
-
-        # Capture-safe one-shot dump of the params entering the CuTe DSL kernel.
-        # Unlike TLLM_CUTE_DSL_DUMP (which .tolist()s device tensors and is thus
-        # illegal under CUDA-graph capture), this logs only host-side metadata
-        # (shapes/strides/dtypes + scalar config), so it is safe to leave on for
-        # perf runs. Logged once per (layer_idx, seq_len_q, batch_size,
-        # page_table shape) so each (batch x KV) combo is captured, eager only.
-        if os.environ.get("TLLM_CUTE_DSL_PARAM_LOG") and not torch.cuda.is_current_stream_capturing():
-            seen = getattr(self, "_cute_dsl_param_logged", None)
-            if seen is None:
-                seen = set()
-                self._cute_dsl_param_logged = seen
-            key = (attn.layer_idx, seq_len_q, batch_size, tuple(page_table.shape))
-            if key not in seen:
-                seen.add(key)
-                print(
-                    "[CUTEDSL_PARAM] layer=%d kernel_dtype=%s batch_size=%d "
-                    "seq_len_q=%d num_heads=%d d_latent=%d d_rope=%d page_size=%d "
-                    "layers_in_pool=%d split_kv=%d is_var_split_kv=%s "
-                    "softmax_scale=%.8f output_scale=%.8f | "
-                    "q_latent%s/%s q_rope%s/%s c_latent%s/%s c_rope%s/%s "
-                    "page_table%s cache_seqs%s out%s lse%s"
-                    % (
-                        attn.layer_idx, kernel_dtype, batch_size,
-                        seq_len_q, num_heads, d_latent, d_rope, page_size,
-                        layers_in_pool, split_kv, is_var_split_kv,
-                        softmax_scale, output_scale,
-                        tuple(q_latent.shape), tuple(q_latent.stride()),
-                        tuple(q_rope.shape), tuple(q_rope.stride()),
-                        tuple(c_pool_latent.shape), tuple(c_pool_latent.stride()),
-                        tuple(c_pool_rope.shape), tuple(c_pool_rope.stride()),
-                        tuple(page_table.shape), tuple(cache_seqs_base.shape),
-                        tuple(o_kernel.shape), tuple(lse.shape),
-                    ),
-                    flush=True,
-                )
 
         # The decode path uses variable-seq mode by default (real serving has
         # unequal per-request KV lengths). Experiment toggle: set

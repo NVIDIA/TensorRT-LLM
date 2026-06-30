@@ -7543,13 +7543,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             cache_key = self.unique_id() + (
                 out_dtype,
                 mma_qk_tiler_mn,
-                mma_pv_tiler_mn,
-                # split_kv is baked into the kernel grid at ``cute.compile``
-                # time (``cutlass.Int32(split_kv)`` below). It is NOT in
-                # ``unique_id``, so it MUST be part of the cache key: reusing a
-                # kernel compiled for a different split_kv launches the wrong
-                # split-KV grid (out-of-bounds workspace writes).
-                split_kv,
+                mma_pv_tiler_mn
             )
             if cache_key not in CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache:
                 hardware_info = cutlass.utils.HardwareInfo()
