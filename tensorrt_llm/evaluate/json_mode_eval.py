@@ -29,9 +29,12 @@ from ..logger import logger
 from ..sampling_params import GuidedDecodingParams, SamplingParams
 from .interface import Evaluator, extract_final_content_from_generation
 
+JsonValue = Union[dict[str, object], list[object], str, int, float, bool, None]
 
-def _load_json_from_generation(output: RequestOutput,
-                               reasoning_parser: Optional[str] = None):
+
+def _load_json_from_generation(
+        output: RequestOutput,
+        reasoning_parser: Optional[str] = None) -> JsonValue:
     text = output.outputs[0].text
     try:
         # Plain/non-reasoning evals already return the constrained JSON as raw
