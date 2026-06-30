@@ -2335,10 +2335,6 @@ class DFlashDecodingConfig(DecodingBaseConfig):
 
     decoding_type: Literal["DFlash"] = Field(default="DFlash")
 
-    dflash_model_arch: Literal["default", "laguna"] = Field(
-        default="default",
-        description="The model architecture of the DFlash draft model.")
-
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
         self.max_total_draft_tokens = self.max_draft_len

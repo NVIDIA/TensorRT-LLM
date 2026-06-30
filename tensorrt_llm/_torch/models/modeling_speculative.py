@@ -1526,9 +1526,10 @@ class DFlashLagunaForCausalLM(DFlashForCausalLM):
     def __init__(self, draft_config):
         # Pin the Laguna draft-layer class + weight mapper. The Laguna DFlash
         # checkpoint labels itself with the vLLM name (architectures
-        # ["DFlashLagunaForCausalLM"], model_type "llama"), neither of which
-        # TRT-LLM resolves to the Laguna layers. dflash_model_arch="laguna"
-        # already selected this subclass, so force the architecture here.
+        # ["DFlashLagunaForCausalLM"], model_type "llama"), which TRT-LLM does
+        # not resolve to the Laguna layers. get_draft_model() selected this
+        # subclass by detecting that name in the draft config's architectures,
+        # so remap to the Laguna architecture here.
         draft_config.pretrained_config.architectures = ["LagunaForCausalLM"]
         super().__init__(draft_config)
         # Laguna draft layers apply input_layernorm to context K/V and use causal
@@ -1819,7 +1820,12 @@ def get_draft_model(model_config, draft_config, lm_head, model):
     elif spec_dec_mode.is_pard():
         return PARDForCausalLM(draft_config)
     elif spec_dec_mode.is_dflash():
-        if model_config.spec_config.dflash_model_arch == "laguna":
+        # Select the Laguna drafter by detecting its architecture in the draft
+        # checkpoint's own config (architectures: ["DFlashLagunaForCausalLM"]),
+        # rather than a separate user-supplied flag.
+        draft_arches = getattr(draft_config.pretrained_config, "architectures",
+                               None) or []
+        if any("Laguna" in arch for arch in draft_arches):
             return DFlashLagunaForCausalLM(draft_config)
         return DFlashForCausalLM(draft_config)
     elif spec_dec_mode.is_draft_target_one_model():
