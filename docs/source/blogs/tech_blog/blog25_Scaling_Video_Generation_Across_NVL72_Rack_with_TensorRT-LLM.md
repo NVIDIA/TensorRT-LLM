@@ -6,18 +6,18 @@ By NVIDIA TensorRT LLM Team
 
 Modern Diffusion Transformer (DiT) video generation models such as [Wan 2.2 T2V-A14B](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers) and [Cosmos3-Super](https://huggingface.co/nvidia/Cosmos3-Super) model) are computationally expensive: generating a single 5-second 720p clip takes over five minutes. Almost all of that time is the DiT denoising loop, which runs tens of full forward passes, each over a 70-150k-token sequence. Unlike LLM decode, every denoising step in DiT is a "prefill" - classifier-free guidance (CFG) evaluates the transformer twice, and the VAE decoder has its own peak both in compute and in activation memory. At these sequence lengths, the dense bidirectional attention — quadratic in the sequence — dominates the per-step compute cost. Pipeline parallelism cannot amortize a single-step single-request workload. Tensor parallelism reduces per-layer compute effectively within a node but adds communication in every layer including the FFN. Sequence-parallel methods restrict communication to inside the attention operation and directly attack the dominant cost, which is why the sequence is the natural multi-node scaling axis.
 
-This post describes how the `VisualGen` runtime in TensorRT-LLM scales the DiT denoising loop and the VAE decoder from a single NVIDIA B200 to a full GB200 NVL72 rack using techniques like \- **CFG**, **Ulysses parallelism**, **Ring Attention**, **Attention2D context parallelism**, and **parallel VAE** \- unified under a single PyTorch `DeviceMesh`. The first four shard the DiT's CFG streams and token sequence, while parallel VAE scales the decoder independently. All axes are declarative knobs on `ParallelConfig`; no model code changes are required to go from 1 GPU to 72\.
+This post describes how the `VisualGen` runtime in TensorRT-LLM scales the DiT denoising loop and the VAE decoder from a single NVIDIA B200 to a full GB200 NVL72 rack using techniques like - **CFG**, **Ulysses parallelism**, **Ring Attention**, **Attention2D context parallelism**, and **parallel VAE** - unified under a single PyTorch `DeviceMesh`. The first four shard the DiT's CFG streams and token sequence, while parallel VAE scales the decoder independently. All axes are declarative knobs on `ParallelConfig`; no model code changes are required to go from 1 GPU to 72.
 
-On Wan 2.2 T2V-A14B (a 5-second 1280×720 video, 40 steps), the `CFG=2 × Ulysses=4 × Attention2D 3×3` recipe shrinks the DiT denoising loop by **\~53×** going from a single NVIDIA B200 to a full GB200 NVL72 rack \- which in turn drives a **\~41× end-to-end** speedup. End-to-end trails the denoise speedup because of a fixed tail that stays constant as the DiT is sharded wider, setting the floor by Amdahl's law.
+On Wan 2.2 T2V-A14B (a 5-second 1280×720 video, 40 steps), the `CFG=2 × Ulysses=4 × Attention2D 3×3` recipe shrinks the DiT denoising loop by **~53×** going from a single NVIDIA B200 to a full GB200 NVL72 rack - which in turn drives a **~41× end-to-end** speedup. End-to-end trails the denoise speedup because of a fixed tail that stays constant as the DiT is sharded wider, setting the floor by Amdahl's law.
 
-The same runtime carries over unchanged to Cosmos3-Super (a 64B Mixture-of-Transformers generating a 189-frame 1280×720 clip), where the identical `CFG=2 × Ulysses=4 × Attention2D 3×3` recipe delivers **\~49× on the denoise loop (\~29× end-to-end)** on the full GB200 NVL72 rack.
+The same runtime carries over unchanged to Cosmos3-Super (a 64B Mixture-of-Transformers generating a 189-frame 1280×720 clip), where the identical `CFG=2 × Ulysses=4 × Attention2D 3×3` recipe delivers **~49× on the denoise loop (~29× end-to-end)** on the full GB200 NVL72 rack.
 
 <p align="center">
   <img src="../media/tech_blog25_nvl72_scaling.png" alt="Wan 2.2 T2V-A14B scaling from one B200 GPU to the 72-GPU GB200 NVL72 recipe: ~53x denoise, ~41x end-to-end" width="49%">
   <img src="../media/tech_blog25_cosmos3_highlight.png" alt="Cosmos3-Super scaling from one GB200 GPU to the full 72-GPU GB200 NVL72 recipe: ~49x denoise, ~29x end-to-end" width="49%">
 </p>
 
-<p align="center"><sub><em>Figure 1. The same VisualGen recipe scaling two models from a single GPU to a full GB200 NVL72 rack. Left: Wan 2.2 T2V-A14B (5-second 1280×720, 40 steps) \- ~53× on the DiT denoise loop, ~41× end-to-end. Right: Cosmos3-Super (189-frame 1280×720, 35 steps) under the identical `CFG=2 × Ulysses=4 × Attention2D 3×3` recipe.</em></sub></p>
+<p align="center"><sub><em>Figure 1. The same VisualGen recipe scaling two models from a single GPU to a full GB200 NVL72 rack. Left: Wan 2.2 T2V-A14B (5-second 1280×720, 40 steps) - ~53× on the DiT denoise loop, ~41× end-to-end. Right: Cosmos3-Super (189-frame 1280×720, 35 steps) under the identical `CFG=2 × Ulysses=4 × Attention2D 3×3` recipe.</em></sub></p>
 
 ## Table of Contents
 
@@ -57,32 +57,32 @@ This post focuses on the sequence and CFG axes as the primary multi-node scaling
 Finally, the VAE decoder at the end of the loop has its own activation-memory peak that is *larger* than any single DiT step's activation footprint, and lives outside the transformer entirely. Parallel VAE attacks this by spatially sharding the decoder along an image's spatial axis, so each rank decodes a $1/P$ slice locally before a final all-gather reconstructs the full video.
 
 To summarize, this post adopts the parallelism strategy below to scale video generation:
-  - **CFG parallelism** splits the conditional and unconditional prompts onto disjoint GPU groups \- two perfectly parallel prefills with one small all-gather at the combine step.  
+  - **CFG parallelism** splits the conditional and unconditional prompts onto disjoint GPU groups - two perfectly parallel prefills with one small all-gather at the combine step.  
   - **Sequence parallelism** (Ulysses, Ring, Attention2D) shards the spatiotemporal sequence across GPUs and pays for it with collectives only inside the attention layer; the FFN, norms, and modulation run sequence-sharded for free.  
   - **Parallel VAE** spatially shards the decoder so the post-DiT decode peak does not become the new bottleneck after the DiT itself has been scaled out.
 
-The rest of this post walks through each of these axes first, then shows how they compose into a single PyTorch `DeviceMesh` built from declarative knobs on `ParallelConfig` \- and how the same configuration scales from a single NVIDIA B200 to a full GB200 NVL72 rack. 
+The rest of this post walks through each of these axes first, then shows how they compose into a single PyTorch `DeviceMesh` built from declarative knobs on `ParallelConfig` - and how the same configuration scales from a single NVIDIA B200 to a full GB200 NVL72 rack. 
 
 <sub>\* This post targets multi-step diffusion transformers; step-distilled diffusion models and autoregressive video models are out of scope. See - [Limitations and Future Work](#limitations-and-future-work)</sub>
 
 ## CFG Parallelism
 
-Classifier-Free Guidance evaluates the diffusion transformer twice per denoising step \- once with the positive prompt embedding to produce $\text{noise}_\text{cond}$, once with the negative prompt embedding to produce $\text{noise}_\text{uncond}$ \- and combines the two predictions as
+Classifier-Free Guidance evaluates the diffusion transformer twice per denoising step - once with the positive prompt embedding to produce $\text{noise}_\text{cond}$, once with the negative prompt embedding to produce $\text{noise}_\text{uncond}$ - and combines the two predictions as
 
 $$\text{noise} = \text{noise}_\text{uncond} + \text{guidance\_scale} \cdot (\text{noise}_\text{cond} - \text{noise}_\text{uncond})$$
 
 The two evaluations share weights, timestep, and shape, so they are perfectly parallelisable across two disjoint GPU groups. CFG parallelism exploits this by setting `cfg_size = 2`: the conditional stream runs on one half of the mesh and the unconditional stream on the other half. Each half runs its full DiT forward end to end with no cross-stream communication; only the two scalar noise tensors meet at the combine step.
 
-`cfg` is the outermost mesh dimension, so each half of the GPUs runs one stream end to end and loads only its own (conditional or unconditional) prompt embedding. The two halves meet just once per step: a single all-gather over the CFG group exchanges the local `noise_pred`, after which every rank holds both predictions and applies the combine locally. Extra guidance streams (e.g. STG, modality conditioning) reuse the same all-gather \- one collective per stream.
+`cfg` is the outermost mesh dimension, so each half of the GPUs runs one stream end to end and loads only its own (conditional or unconditional) prompt embedding. The two halves meet just once per step: a single all-gather over the CFG group exchanges the local `noise_pred`, after which every rank holds both predictions and applies the combine locally. Extra guidance streams (e.g. STG, modality conditioning) reuse the same all-gather - one collective per stream.
 
-**The net effect is a near-2x per-step latency reduction** for the cost of 2x weight replication and a single per-step all-gather over a 2-rank group \- small enough that the collective is bandwidth-bound, not latency-bound, and overlaps essentially perfectly with the post-combine scheduler step on each rank. Turning on `cfg_size=2` alone, with no other parallelism, nearly halves latency:
+**The net effect is a near-2x per-step latency reduction** for the cost of 2x weight replication and a single per-step all-gather over a 2-rank group - small enough that the collective is bandwidth-bound, not latency-bound, and overlaps essentially perfectly with the post-combine scheduler step on each rank. Turning on `cfg_size=2` alone, with no other parallelism, nearly halves latency:
 
 | Config | GPUs | Denoise | End-to-end | Speedup |
 | :--- | ---: | ---: | ---: | ---: |
 | `cfg1` (single stream) | 1 | 342.04s | 346.16s | 1.0× |
 | `cfg2` (CFG parallel) | 2 | 179.96s | 183.01s | **1.90× / 1.89×** |
 
-That near-linear scaling makes CFG the cheapest scaling axis available, and the one worth spending GPUs on *before* widening a sequence-parallel axis. On a 72-GPU rack, moving a 2x factor onto CFG (`cfg2·ulysses4·cp9`) rather than Ulysses (`cfg1·ulysses8·cp9`) cuts the denoise loop from 7.57s to 7.04s \- **\~7.5% faster on the denoise loop (\~6% end-to-end)** \- and CFG composes with every other axis (Ulysses, Attention2D, Ring, parallel VAE) unchanged.
+That near-linear scaling makes CFG the cheapest scaling axis available, and the one worth spending GPUs on *before* widening a sequence-parallel axis. On a 72-GPU rack, moving a 2x factor onto CFG (`cfg2·ulysses4·cp9`) rather than Ulysses (`cfg1·ulysses8·cp9`) cuts the denoise loop from 7.57s to 7.04s - **~7.5% faster on the denoise loop (~6% end-to-end)** - and CFG composes with every other axis (Ulysses, Attention2D, Ring, parallel VAE) unchanged.
 
 ## Ulysses Parallelism
 
@@ -92,7 +92,7 @@ The key insight behind Ulysses ([arXiv:2309.14509](https://arxiv.org/abs/2309.14
   <img src="../media/tech_blog25_ulysses_dataflow.png" alt="Ulysses sequence parallelism data layout: a pair of all-to-alls transposes a frame-sharded layout into a head-sharded layout for attention, then back" width="1080">
 </p>
 
-<p align="center"><sub><em>Figure 2. Ulysses keeps every stage except attention sequence-sharded \- each rank owns a slice of the video frames (all heads), so QKV projection, norms, and the MLP run locally with no collective. A pair of all-to-alls transposes the layout to head-sharded (each rank owns all frames but a $1/P$ slice of heads) just for the full-sequence attention, then transposes back for the MLP.</em></sub></p>
+<p align="center"><sub><em>Figure 2. Ulysses keeps every stage except attention sequence-sharded - each rank owns a slice of the video frames (all heads), so QKV projection, norms, and the MLP run locally with no collective. A pair of all-to-alls transposes the layout to head-sharded (each rank owns all frames but a $1/P$ slice of heads) just for the full-sequence attention, then transposes back for the MLP.</em></sub></p>
 
 **Fused vs. unfused QKV all-to-all.** Before the input all-to-all, Q, K, and V have been computed by the QKV projection and sit in memory as three separate $[B, S/P, H, D]$ tensors. They need the same collective pattern over the same process group, so there are two ways to send them:
 
@@ -105,7 +105,7 @@ The stacked QKV buffer produced by the all-to-all is a single contiguous allocat
 
 **Communication cost.** Ulysses parallelism involves **only two all-to-all communications per layer, regardless of sequence length**. For a sequence length $N$ and $P$ GPUs, each GPU sends a data chunk of size $O(N/P^2)$ to each of the other $P-1$ GPUs. This leads to a communication cost of $O(N/P)$.
 
-**Limitation.** Ulysses sequence parallelism is constrained by the model’s attention head count: the Ulysses degree $P$ must not exceed the head count `num_heads` and must evenly divide `num_heads`; to use all GPUs in an NVL72 system uniformly, $P$ must also divide 72\. For Wan2.2‑T2V‑A14B with $\text{num\_heads} = 40$, this constraint makes $P = 8$ the largest feasible Ulysses degree on NVL72.
+**Limitation.** Ulysses sequence parallelism is constrained by the model’s attention head count: the Ulysses degree $P$ must not exceed the head count `num_heads` and must evenly divide `num_heads`; to use all GPUs in an NVL72 system uniformly, $P$ must also divide 72. For Wan2.2‑T2V‑A14B with $\text{num\_heads} = 40$, this constraint makes $P = 8$ the largest feasible Ulysses degree on NVL72.
 
 ### Toward Async Ulysses: Overlapping Communication and Computation
 
@@ -147,9 +147,9 @@ WAN 2.2 T2V-A14B, 720×1280, 80 frames, 40 steps, NVFP4:
 
 ## Context Parallelism
 
-### 1\. Ring Attention
+### 1. Ring Attention
 
-Like Ulysses, Ring attention ([arXiv:2310.01889](https://arxiv.org/abs/2310.01889)) shards the spatiotemporal sequence so each rank holds $[B, S/P, H, D]$ and FFN, norms, and modulation run on that shard with no communication. The difference is how attention itself is made global: Ulysses swaps to head sharding inside the attention layer, which caps the parallel degree at the number of attention heads. **Ring has no head-count ceiling** \- the ring degree $P$ can exceed `num_heads`, which makes it the lever required for pushing sequence parallelism past the Ulysses limit on a given GPU count.
+Like Ulysses, Ring attention ([arXiv:2310.01889](https://arxiv.org/abs/2310.01889)) shards the spatiotemporal sequence so each rank holds $[B, S/P, H, D]$ and FFN, norms, and modulation run on that shard with no communication. The difference is how attention itself is made global: Ulysses swaps to head sharding inside the attention layer, which caps the parallel degree at the number of attention heads. **Ring has no head-count ceiling** - the ring degree $P$ can exceed `num_heads`, which makes it the lever required for pushing sequence parallelism past the Ulysses limit on a given GPU count.
 
 **K/V blocks rotate; Q stays put.** Each rank keeps its local query shard resident and passes key/value blocks around a ring of $P$ GPUs. Over $P$ steps, the rank computes partial attention of its local Q against whichever K/V block it currently holds, then merges the result into a running output. After $P$ steps, every query position has attended over every key/value in the full sequence:
 
@@ -170,9 +170,9 @@ Rank r holds Q_r (fixed) and K/V block for step i
 
 **Communication cost.** Ring pays $P-1$ neighbor exchanges per attention layer, and communication volume scales as $O(N)$ in sequence length $N$ — more sequential steps than Ulysses. Each ring step also runs a partial FA4 pass plus an online-softmax merge, so attention work grows with ring degree $P$, not just communication. The upside is flexibility: **no head-count ceiling**, a simple 1D topology, and straightforward composition with Ulysses on the same mesh ($\text{cp\_size} \times \text{ulysses\_size}$). P2P can overlap with compute, which keeps Ring competitive at small $P$ and short sequences. For production video lengths, though, we **generally prefer Attention2D** (detailed in the next section) for the context-parallel axis, owing to its lower communication cost – $O(N/\sqrt{P})$ versus $O(N)$ for Ring attention.
 
-### 2\. Attention2D Parallelism
+### 2. Attention2D Parallelism
 
-Attention2D parallelism ([arXiv:2503.15758](https://arxiv.org/abs/2503.15758)) treats the $P$ context-parallel GPUs as a logical 2D grid of $\text{row\_size} \times \text{col\_size}$ workers. It is our preferred **context-parallel strategy** once Ulysses has consumed the head-divisible fraction of the mesh and more GPUs remain. Like Ring, it shards the spatiotemporal sequence with **no head-count ceiling** — any $\text{row\_size} \times \text{col\_size}$ grid is valid regardless of how many attention heads the DiT has. It also **generalizes 1D context parallelism** \- setting $\text{col\_size}=1$ reduces to the no-merge scheme (all-gather K/V), while setting $\text{row\_size}=1$ reduces to the merge scheme (all-gather Q). \- and **scales the CP degree better**, gathering only $S/\sqrt{P}$ per axis ($O(N/\sqrt{P})$ communication) on a symmetric grid, which suits long-sequence DiT inference. The runtime adapts the original Attention2D design from causal LLM training to **full bidirectional** DiT inference.
+Attention2D parallelism ([arXiv:2503.15758](https://arxiv.org/abs/2503.15758)) treats the $P$ context-parallel GPUs as a logical 2D grid of $\text{row\_size} \times \text{col\_size}$ workers. It is our preferred **context-parallel strategy** once Ulysses has consumed the head-divisible fraction of the mesh and more GPUs remain. Like Ring, it shards the spatiotemporal sequence with **no head-count ceiling** — any $\text{row\_size} \times \text{col\_size}$ grid is valid regardless of how many attention heads the DiT has. It also **generalizes 1D context parallelism** - setting $\text{col\_size}=1$ reduces to the no-merge scheme (all-gather K/V), while setting $\text{row\_size}=1$ reduces to the merge scheme (all-gather Q). - and **scales the CP degree better**, gathering only $S/\sqrt{P}$ per axis ($O(N/\sqrt{P})$ communication) on a symmetric grid, which suits long-sequence DiT inference. The runtime adapts the original Attention2D design from causal LLM training to **full bidirectional** DiT inference.
 
 **Gather phase: Q along rows and K/V along columns.** Ranks form a $\text{row\_size} \times \text{col\_size}$ grid ($P = \text{row\_size} \times \text{col\_size}$). Each rank starts with a $1/P$ shard of all three tensors — $Q_i, K_i, V_i$, each $[B, S/P, H, D]$. Attention2D then runs two all-gathers on the two independent grid axes:
 
@@ -220,9 +220,9 @@ Members of a **row (Q) group** end up with identical Q but **disjoint** K/V slic
 
 ## Scaling the VAE Decoder
 
-After the DiT denoising loop finishes, a single latent tensor still has to be turned into pixels by the VAE decoder. When the DiT is scaled out to 72 GPUs as on a GB200 NVL72 rack, the denoising loop runs in a fraction of its single-GPU time, but an unsharded VAE decode still runs on a single rank \- so VAE decoding becomes a non-trivial performance bottleneck in the whole pipeline. Parallel VAE removes that serial tail.
+After the DiT denoising loop finishes, a single latent tensor still has to be turned into pixels by the VAE decoder. When the DiT is scaled out to 72 GPUs as on a GB200 NVL72 rack, the denoising loop runs in a fraction of its single-GPU time, but an unsharded VAE decode still runs on a single rank - so VAE decoding becomes a non-trivial performance bottleneck in the whole pipeline. Parallel VAE removes that serial tail.
 
-**Spatial sharding.** Unlike the DiT \- which shards the *token sequence* \- the VAE is a convolutional UNet-style stack that operates on a `(B, C, T, H, W)` video tensor, so the natural axis to split is **image space**. `parallel_vae_split_dim` selects height or width, and the latent (decode) or video (encode) tensor is chunked along that dimension across the `parallel_vae_size` ranks. Each rank owns a $1/P$ spatial slice and decodes it locally; a single all-gather at the end reconstructs the full frame:
+**Spatial sharding.** Unlike the DiT - which shards the *token sequence* - the VAE is a convolutional UNet-style stack that operates on a `(B, C, T, H, W)` video tensor, so the natural axis to split is **image space**. `parallel_vae_split_dim` selects height or width, and the latent (decode) or video (encode) tensor is chunked along that dimension across the `parallel_vae_size` ranks. Each rank owns a $1/P$ spatial slice and decodes it locally; a single all-gather at the end reconstructs the full frame:
 
 <p align="center">
   <img src="../media/tech_blog25_parallel_vae.png" alt="Parallel VAE: route the final latent to the parallel_vae_size VAE-group ranks while the rest idle, split image space along W into 1/P slices, decode each slice locally, all-gather into the full video, and use halo exchange so boundary convolutions stay correct" width="1080">
@@ -230,18 +230,18 @@ After the DiT denoising loop finishes, a single latent tensor still has to be tu
 
 <p align="center"><sub><em>Figure 6. Parallel VAE decode. The full latent is split along an image-space axis (`W` here) into $1/P$ slices across the `parallel_vae_size` VAE-group ranks (the rest idle); each rank decodes its slice locally — boundary convolutions exchange only a thin $k-1$ "halo" with their neighbors (edge ranks zero-pad), and attention blocks gather the full split dimension — then a final all-gather reconstructs the full video.</em></sub></p>
 
-**Convolutions need their neighbors: Halo Exchange.** A spatial split breaks every convolution at the chunk boundary \- a $k \times k$ conv needs $k-1$ rows/columns that now live on the adjacent rank. Instead of gathering the whole activation, each conv exchanges only the thin boundary "halo" with its neighbors, runs, then strips the extra output; boundary ranks zero-pad. The halo is tiny and kernel-sized, so per-conv communication stays small regardless of activation size. VAE attention blocks, being global, instead gather along the split dimension before attention and re-shard afterward.
+**Convolutions need their neighbors: Halo Exchange.** A spatial split breaks every convolution at the chunk boundary - a $k \times k$ conv needs $k-1$ rows/columns that now live on the adjacent rank. Instead of gathering the whole activation, each conv exchanges only the thin boundary "halo" with its neighbors, runs, then strips the extra output; boundary ranks zero-pad. The halo is tiny and kernel-sized, so per-conv communication stays small regardless of activation size. VAE attention blocks, being global, instead gather along the split dimension before attention and re-shard afterward.
 
-**The VAE's parallel degree is chosen independently of how the DiT is sharded.** `parallel_vae_size` sets the VAE's width without matching the CFG, Ulysses, or context-parallel degrees \- independence of degree, not hardware, since the VAE decodes on a subset of the same GPUs. A separate knob is needed because the VAE saturates far earlier than the DiT, and because the split dimension must divide the few latent rows/columns evenly, which a large `world_size` rarely does.
+**The VAE's parallel degree is chosen independently of how the DiT is sharded.** `parallel_vae_size` sets the VAE's width without matching the CFG, Ulysses, or context-parallel degrees - independence of degree, not hardware, since the VAE decodes on a subset of the same GPUs. A separate knob is needed because the VAE saturates far earlier than the DiT, and because the split dimension must divide the few latent rows/columns evenly, which a large `world_size` rarely does.
 
 This yields two regimes:
 
-- **Single node (`world_size <= 8`)** \- `parallel_vae_size == world_size`; every rank decodes (e.g. the 8-GPU Wan 2.2 example pairs `cfg_size=2, ulysses_size=4` with `parallel_vae_size=8`).  
-- **Multi-node (`world_size > 8`, e.g. NVL72)** \- the DiT scales to all 72 ranks but `parallel_vae_size` stays at its ceiling (\~8); the VAE decodes on that subset while the rest idle.
+- **Single node (`world_size <= 8`)** - `parallel_vae_size == world_size`; every rank decodes (e.g. the 8-GPU Wan 2.2 example pairs `cfg_size=2, ulysses_size=4` with `parallel_vae_size=8`).  
+- **Multi-node (`world_size > 8`, e.g. NVL72)** - the DiT scales to all 72 ranks but `parallel_vae_size` stays at its ceiling (~8); the VAE decodes on that subset while the rest idle.
 
-**Measured impact.** On the full 72-GPU recipe the denoising loop is only **7.04s**, but a rank-0-only decode adds **\~2.7s** \- after the DiT has already been scaled out \~53x, **\~25% of the 11.1s end-to-end request** is now spent in a single-rank VAE. Sweeping `parallel_vae_size` shows why a separate VAE knob matters: the first few doublings nearly halve decode latency, then returns flatten as the VAE runs out of spatial work to split and per-rank halo/all-gather overhead starts to dominate. Setting `parallel_vae_size=8` cuts decode to **\~0.8s** (**3.3x faster, a 69% reduction**), shrinking end-to-end to **9.2s** (**1.2x, \-17%**) and dropping the VAE's share to **\~9%**. The VAE saturates at this width \- `parallel_vae_size=16` measures no faster \- which is why the multi-node recipe caps the VAE at \~8 ranks.
+**Measured impact.** On the full 72-GPU recipe the denoising loop is only **7.04s**, but a rank-0-only decode adds **~2.7s** - after the DiT has already been scaled out ~53x, **~25% of the 11.1s end-to-end request** is now spent in a single-rank VAE. Sweeping `parallel_vae_size` shows why a separate VAE knob matters: the first few doublings nearly halve decode latency, then returns flatten as the VAE runs out of spatial work to split and per-rank halo/all-gather overhead starts to dominate. Setting `parallel_vae_size=8` cuts decode to **~0.8s** (**3.3x faster, a 69% reduction**), shrinking end-to-end to **9.2s** (**1.2x, -17%**) and dropping the VAE's share to **~9%**. The VAE saturates at this width - `parallel_vae_size=16` measures no faster - which is why the multi-node recipe caps the VAE at ~8 ranks.
 
-*Decode scaling curve* \- the full sweep, decode-only:
+*Decode scaling curve* - the full sweep, decode-only:
 
 | `parallel_vae_size` | VAE decode | Decode speedup |
 | :--- | ---: | ---: |
@@ -251,7 +251,7 @@ This yields two regimes:
 | 8 | 0.83s | **3.28×** |
 | 16 | 0.85s | 3.20× |
 
-*End-to-end impact* \- on the full 72-GPU NVL72 recipe:
+*End-to-end impact* - on the full 72-GPU NVL72 recipe:
 
 | NVL72 recipe | VAE decode | VAE share of E2E | End-to-end | E2E speedup |
 | :--- | ---: | ---: | ---: | ---: |
@@ -261,7 +261,7 @@ This yields two regimes:
 
 ## The Parallelism Mesh
 
-All five parallelism axes \- CFG, TP, Ulysses, context parallelism, and the parallel-VAE slice \- live on a single PyTorch `DeviceMesh` built once at startup by `VisualGenMapping` (in [`mapping.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/163be837f3e82d092eb33704747a93fb419e7099/tensorrt_llm/_torch/visual_gen/mapping.py)). The user only sets the per-axis sizes on `ParallelConfig`; every per-axis process group (`cfg_group`, `ulysses_group`, `cp_group`, `attn2d_row_group`, `attn2d_col_group`, `vae_group`, ...) is derived from that one mesh and cached, so different layers \- Linear, attention, VAE \- all see consistent NCCL communicators.
+All five parallelism axes - CFG, TP, Ulysses, context parallelism, and the parallel-VAE slice - live on a single PyTorch `DeviceMesh` built once at startup by `VisualGenMapping` (in [`mapping.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/163be837f3e82d092eb33704747a93fb419e7099/tensorrt_llm/_torch/visual_gen/mapping.py)). The user only sets the per-axis sizes on `ParallelConfig`; every per-axis process group (`cfg_group`, `ulysses_group`, `cp_group`, `attn2d_row_group`, `attn2d_col_group`, `vae_group`, ...) is derived from that one mesh and cached, so different layers - Linear, attention, VAE - all see consistent NCCL communicators.
 
 The total world size is just the product of the axes:
 
@@ -293,7 +293,7 @@ For the full property catalog (every `*_group`, `*_rank`, the flattened `seq_mes
 
 ## NVL72 Scaling Results
 
-All performance numbers in this section use the same measured workload and publish one distributed recipe: `examples/visual_gen/configs/wan22_t2v_bf16_gb200_nvl72.yml`.
+All performance numbers in this section use the same measured workload and publish one distributed recipe: [`examples/visual_gen/configs/wan22_t2v_bf16_gb200_nvl72.yml`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/visual_gen/configs/wan22_t2v_bf16_gb200_nvl72.yml).
 
 | Item | Value |
 | :--- | :--- |
@@ -323,9 +323,9 @@ Sweeping the best recipe at every width on GB200 NVL72 shows the DiT denoise loo
   <img src="../media/tech_blog25_scaling_lines.png" alt="WAN 2.2 T2V-A14B DiT denoise-loop latency vs ideal linear scaling on GB200 NVL72, from 1 to 72 GPUs, with per-point parallel efficiency" width="1080">
 </p>
 
-<p align="center"><sub><em>Figure 7. DiT denoise-loop scaling on GB200 NVL72 (best config at each width, GB200 1-GPU baseline). The loop tracks ideal linear scaling closely \- ~49× at 72 GPUs \- because CFG and sequence parallelism shard the transformer almost perfectly.</em></sub></p>
+<p align="center"><sub><em>Figure 7. DiT denoise-loop scaling on GB200 NVL72 (best config at each width, GB200 1-GPU baseline). The loop tracks ideal linear scaling closely - ~49× at 72 GPUs - because CFG and sequence parallelism shard the transformer almost perfectly.</em></sub></p>
 
-Crucially, that ~67% efficiency at full-rack scale is only reachable with **Attention2D**. Once Ulysses hits WAN's head-divisibility wall (`ulysses_size ≤ 8` for 40 heads), the residual GPUs have to go into a context-parallel axis \- and Attention2D is the only one that holds up at NVL72 scale. At 72 GPUs, `cfg2·ul4·attn2d 3×3` lands at **~67% efficiency**, while the equivalent `cfg2·ul4·ring9` collapses to **~37% efficiency** \- **83% slower at the same GPU count**. Attention2D's fixed $O(N/\sqrt{P})$ row/column collectives keep scaling all the way across the rack (see [Figure 5](#2-attention2d-parallelism)).
+Crucially, that ~67% efficiency at full-rack scale is only reachable with **Attention2D**. Once Ulysses hits WAN's head-divisibility wall (`ulysses_size ≤ 8` for 40 heads), the residual GPUs have to go into a context-parallel axis - and Attention2D is the only one that holds up at NVL72 scale. At 72 GPUs, `cfg2·ul4·attn2d 3×3` lands at **~67% efficiency**, while the equivalent `cfg2·ul4·ring9` collapses to **~37% efficiency** - **83% slower at the same GPU count**. Attention2D's fixed $O(N/\sqrt{P})$ row/column collectives keep scaling all the way across the rack (see [Figure 5](#2-attention2d-parallelism)).
 
 The full recipe behind these numbers is shown below:
 
@@ -346,7 +346,7 @@ compilation_config:
 
 ### Cosmos3-Super
 
-The same runtime scales a very different model unchanged. Cosmos3-Super is a 64B Mixture-of-Transformers with 64 attention heads, generating a longer 189-frame clip — so each denoising step is an even larger dense prefill than Wan. Only the workload and the per-width recipe change; the CFG, Ulysses, Attention2D, and parallel-VAE knobs are identical (`examples/visual_gen/configs/cosmos3_t2v_bf16_gb200_nvl72.yml`)
+The same runtime scales a very different model unchanged. Cosmos3-Super is a 64B Mixture-of-Transformers with 64 attention heads, generating a longer 189-frame clip — so each denoising step is an even larger dense prefill than Wan. Only the workload and the per-width recipe change; the CFG, Ulysses, Attention2D, and parallel-VAE knobs are identical ([`examples/visual_gen/configs/cosmos3_t2v_bf16_gb200_nvl72.yml`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/visual_gen/configs/cosmos3_t2v_bf16_gb200_nvl72.yml))
 
 | Item | Value |
 | :--- | :--- |
@@ -372,7 +372,7 @@ Sweeping the best recipe at every width gives the same near-linear denoise-loop 
   <img src="../media/tech_blog25_cosmos3_scaling_lines.png" alt="Cosmos3-Super DiT denoise-loop latency vs ideal linear scaling on GB200 NVL72, with per-point parallel efficiency" width="1080">
 </p>
 
-<p align="center"><sub><em>Figure 8. Cosmos3-Super DiT denoise-loop scaling on GB200 NVL72 (best config at each width, GB200 1-GPU baseline). The loop tracks ideal linear scaling closely \- ~49× at 72 GPUs \- because CFG and sequence parallelism shard the transformer almost perfectly.</em></sub></p>
+<p align="center"><sub><em>Figure 8. Cosmos3-Super DiT denoise-loop scaling on GB200 NVL72 (best config at each width, GB200 1-GPU baseline). The loop tracks ideal linear scaling closely - ~49× at 72 GPUs - because CFG and sequence parallelism shard the transformer almost perfectly.</em></sub></p>
 
 As with Wan, the denoise loop scales almost linearly under the *same* recipe, which proves that the sequence-length sharding pattern for the DiT generalizes across models — even at a very different model size and sequence length. End-to-end efficiency falls off faster because it folds in everything outside the DiT, including the longer clip's larger mp4 encode and transport/persist; those fixed per-request costs become the dominant share once the denoise loop collapses to ~7s (Amdahl's law).
 
@@ -384,29 +384,13 @@ The same `--visual_gen_args` YAML drives `trtllm-serve` for online serving. Dist
 export CONTAINER_IMAGE=/path/to/tensorrt-llm.sqsh
 export PROJECT_ROOT=/path/to/TensorRT-LLM
 export MODEL=Wan-AI/Wan2.2-T2V-A14B-Diffusers
-export SERVER_CONFIG=examples/visual_gen/configs/wan22_nvl72.yml
+export SERVER_CONFIG=examples/visual_gen/configs/wan22_t2v_bf16_gb200_nvl72.yml
 
-sbatch -N 18 --ntasks-per-node=4 --ntasks=72 \
-    examples/visual_gen/serve/benchmark_visual_gen_mgmn_distributed.sh
+# Fill in <ACCOUNT_NAME> and <PARTITION> with your SLURM account and partition
+sbatch -A <ACCOUNT_NAME> -p <PARTITION> -N 18 --ntasks-per-node=4 --ntasks=72 examples/visual_gen/serve/benchmark_visual_gen_mgmn_distributed.sh
 ```
 
 The script spawns `trtllm-serve` across all allocated ranks in the background, polls `http://${MASTER_ADDR}:8000/health` until 200, and then runs `tensorrt_llm.serve.scripts.benchmark_visual_gen` from rank-0 only.
-
-OpenAI-compatible client example:
-
-```shell
-curl -X POST "http://${MASTER_ADDR}:8000/v1/videos" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
-    "prompt": "A cute cat playing piano",
-    "size": "1280x720",
-    "num_frames": 80,
-    "fps": 16,
-    "num_inference_steps": 40,
-    "guidance_scale": 5.0,
-    "seed": 42
-  }'
 ```
 
 ## Quality Evaluation
@@ -444,7 +428,7 @@ To drill into that nondeterminism — and to confirm each parallel configuration
 | FA4 vs PyTorch SDPA attention backend | 0.21 |
 | PyTorch SDPA, `torch.compile` on vs off | 0.24 |
 
-A deterministic backend (PyTorch SDPA attention, `torch.compile` off) reproduces byte-for-byte, confirming the harness is exact. Turning on the fast kernels breaks that: an FA4 rerun alone already moves the output 0.121 LPIPS — the _floor_ row in the results table above — and swapping the attention backend (0.21) or toggling `torch.compile` (0.24) moves it further. Routine single-GPU choices alone therefore span 0–0.24 LPIPS, all from pixel-level kernel ordering rather than any algorithmic change (LPIPS is a learned perceptual distance where 0 is bit-wise identical).
+A deterministic backend (PyTorch SDPA attention, `torch.compile` off) reproduces byte-for-byte, confirming the harness is exact. Turning on the fast kernels breaks that: an FA4 rerun alone already moves the output 0.121 LPIPS — the _floor_ row in the results table above — and swapping the attention backend (0.21) or toggling `torch.compile` (0.24) moves it further. Routine single-GPU choices alone therefore span 0–0.24 LPIPS, all from pixel-level kernel ordering rather than any algorithmic change (LPIPS is a learned perceptual distance where 0 is bit-wise identical). Setting `torch.use_deterministic_algorithms(True)` forces deterministic kernel implementations and collapses this noise floor back to 0 LPIPS (bit-exact reruns), but impacts performance. We leave it off for the performance numbers above and instead measure parallel configurations against the realistic faster kernel floor.
 
 Against that band, parallelism is essentially free. Every parallel configuration lands at 0.187–0.220 LPIPS (cosine ≥ 0.967, PSNR ≥ 23 dB) — only 0.07–0.10 above the floor, well inside the spread that single-GPU kernel choices already produce. The offset is independent of parallel degree: 2-GPU Ulysses (0.187) is as close to the reference as the 4-GPU recipes (~0.196–0.198). Attention2D paths run marginally higher (up to 0.220) because their cross-rank online-softmax merge and gather collectives reorder non-associative BF16 additions — the same effect the correctness test isolates, bounded across steps rather than compounding. A parallel run is thus about as far from the single-GPU reference as two single-GPU runs are from each other.
 
@@ -484,7 +468,7 @@ Future directions:
 - Examples:  
   - Offline scripts: [`examples/visual_gen/`](https://github.com/NVIDIA/TensorRT-LLM/tree/163be837f3e82d092eb33704747a93fb419e7099/examples/visual_gen)  
   - Shared YAML configs: [`examples/visual_gen/configs/`](https://github.com/NVIDIA/TensorRT-LLM/tree/163be837f3e82d092eb33704747a93fb419e7099/examples/visual_gen/configs)  
-  - Serving \+ benchmark: [`examples/visual_gen/serve/`](https://github.com/NVIDIA/TensorRT-LLM/tree/163be837f3e82d092eb33704747a93fb419e7099/examples/visual_gen/serve)  
+  - Serving + benchmark: [`examples/visual_gen/serve/`](https://github.com/NVIDIA/TensorRT-LLM/tree/163be837f3e82d092eb33704747a93fb419e7099/examples/visual_gen/serve)  
 - Papers:  
   - DeepSpeed Ulysses: [arXiv:2309.14509](https://arxiv.org/abs/2309.14509)  
   - Attention2D: [arXiv:2503.15758](https://arxiv.org/abs/2503.15758)  
