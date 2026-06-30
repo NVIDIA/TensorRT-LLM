@@ -33,9 +33,9 @@ from ..distributed import Distributed
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
 from ..virtual_memory import scope as virtual_memory_scope
-from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
-                    create_py_executor_instance, instantiate_sampler, is_mla,
-                    validate_feature_combination)
+from ._util import (KvCacheCreator, KVCacheManagerV2,
+                    _adjust_torch_mem_fraction, create_py_executor_instance,
+                    instantiate_sampler, is_mla, validate_feature_combination)
 from .config_utils import is_hybrid_linear
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
@@ -323,7 +323,8 @@ def create_py_executor(
         A fully initialized PyExecutor instance.
     """
 
-    skip_est = os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", '0') == '1'
+    skip_est = os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", '1') == '1'
+
     llm_args, checkpoint_loader = _load_config_and_create_checkpoint_loader(
         llm_args, checkpoint_dir)
 
@@ -886,6 +887,9 @@ def create_py_executor(
             is_disagg=is_disagg,
         )
 
+        skip_est = skip_est and issubclass(
+            kv_cache_creator.kv_cache_manager_cls(), KVCacheManagerV2)
+        kv_cache_creator._skip_est = skip_est
         if not skip_est:
             log_memory_usage("after loading weights")
 
