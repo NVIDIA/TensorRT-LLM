@@ -1576,7 +1576,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 }
 
                 if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
-                    echo "Skipping x86_64 tests (PLC container scanning)"
+                    echo "Skipping SBSA tests (PLC container scanning)"
                     return
                 }
 
@@ -1787,7 +1787,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             propagate: false
                         )
                         if (handle.result != "SUCCESS") {
-                            error "Downstream job did not succeed"
+                            catchError(buildResult: currentBuild.result ?: 'SUCCESS', stageResult: 'UNSTABLE') {
+                                error "Risks detected on NGC Containers"
+                            }
                         }
                     } catch (InterruptedException e) {
                         throw e
