@@ -4698,6 +4698,7 @@ class PyExecutor:
                     requests)
             self._setup_sampler_step(requests)
 
+        kv_transfer_only_done = []
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
@@ -4728,11 +4729,30 @@ class PyExecutor:
 
                 self._maybe_prepend_logprobs_and_logits(req, beam_width)
 
-                # kv_transfer_only: transfer done + first token adopted; finish now
-                # (no generation forward pass), KV is committed for reuse.
+                # kv_transfer_only: transfer done + first token adopted; KV already
+                # committed for reuse above, so finish now and record for the trim below.
                 if (req.py_disaggregated_params is not None and getattr(
                         req.py_disaggregated_params, "kv_transfer_only", None)):
                     req.finish_by(FinishReason.LENGTH, 0)
+                    kv_transfer_only_done.append(req.py_request_id)
+
+        # kv_transfer_only reqs have committed their KV (above) and produce no
+        # output, so their forward is wasted -- but only drop them when OTHER work
+        # remains. Empirically, a lone transfer that skips its forward loses its
+        # reuse commit (a later query stops hitting it) and the emptied batch also
+        # trips the overlap loop; some forward in the iteration is needed to finalize
+        # the commit (appears gated on a CUDA event on the forward stream -- see
+        # KVCacheManagerV2._KVCache.commit). So when these are the whole batch we keep
+        # them: their own (discarded) forward finalizes it and is free while idle. The
+        # terminal response comes from _handle_responses (active_requests), so safe.
+        if kv_transfer_only_done:
+            done = set(kv_transfer_only_done)
+            remaining = [
+                req for req in scheduled_batch.generation_requests
+                if req.py_request_id not in done
+            ]
+            if remaining or scheduled_batch.context_requests:
+                scheduled_batch.generation_requests = remaining
 
     def _update_sampler_state_for_disagg_gen_request(self, req, beam_width,
                                                      first_gen_tokens) -> bool:

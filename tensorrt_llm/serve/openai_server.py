@@ -679,7 +679,16 @@ class OpenAIServer(_VideoRoutesMixin):
             return JSONResponse(
                 status_code=400,
                 content={"error": "require source and messages|prompt"})
-        if self._kvt_allow is not None and source not in self._kvt_allow:
+        # Fail closed: this endpoint makes the server POST to `source`, so require an
+        # explicit allowlist (KV_TRANSFER_SOURCE_ALLOW) to avoid an SSRF primitive.
+        if self._kvt_allow is None:
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error":
+                    "kv_transfer disabled: set KV_TRANSFER_SOURCE_ALLOW to enable"
+                })
+        if source not in self._kvt_allow:
             return JSONResponse(
                 status_code=403,
                 content={"error": f"source not allowed: {source}"})
@@ -721,6 +730,13 @@ class OpenAIServer(_VideoRoutesMixin):
                             })
 
     async def _do_kv_transfer(self, model, messages, prompt, source, h):
+        """Background worker: pull the prompt's KV from `source` and commit it locally.
+
+        Runs the two-phase disagg flow -- context_only on `source`, then
+        generation_only with kv_transfer_only on self -- checking both responses
+        before counting the transfer as successful. On failure, clears the dedup
+        entry so a transient error can be retried before the TTL elapses.
+        """
         is_chat = messages is not None
         path = "/v1/chat/completions" if is_chat else "/v1/completions"
         ctx_body = {
@@ -739,26 +755,35 @@ class OpenAIServer(_VideoRoutesMixin):
                     total=self._kvt_dedup_ttl)) as session:
                 async with session.post(source.rstrip("/") + path,
                                         json=ctx_body) as r:
+                    if r.status >= 300:
+                        raise RuntimeError(
+                            f"source context_only returned {r.status}")
                     ctx = await r.json()
                 dp = ctx.get("disaggregated_params") or (ctx.get(
                     "choices", [{}])[0].get("disaggregated_params"))
                 if not dp:
-                    self._kvt_stats["failed"] += 1
-                    return
+                    raise RuntimeError(
+                        "no disaggregated_params ticket from source")
                 gen_body = dict(ctx_body)
                 gen_body["disaggregated_params"] = dict(
                     dp, request_type="generation_only", kv_transfer_only=True)
                 async with session.post(f"http://127.0.0.1:{self.port}{path}",
                                         json=gen_body) as r2:
                     await r2.read()
+                    if r2.status >= 300:
+                        raise RuntimeError(
+                            f"local generation_only returned {r2.status}")
             self._kvt_stats["transferred"] += 1
-        except Exception as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError,
+                RuntimeError) as e:
             self._kvt_stats["failed"] += 1
+            self._kvt_seen.pop(h, None)  # not a real dedup hit -> allow retry
             logger.warning(f"[kv-transfer] {h[:8]} failed: {repr(e)[:120]}")
         finally:
             self._kvt_inflight -= 1
 
     async def kv_transfer_stats(self, request: Request):
+        """Return KV-transfer counters plus live inflight, dedup-table size, cap."""
         return JSONResponse(
             content={
                 **self._kvt_stats, "inflight": self._kvt_inflight,

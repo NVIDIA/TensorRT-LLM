@@ -45,8 +45,12 @@ async def _noop_transfer(*args, **kwargs):
     return None
 
 
-def _make_server(max_inflight=4, dedup_ttl=300.0, allow=None, inflight=0):
-    """A bare object carrying just the state kv_transfer touches."""
+def _make_server(max_inflight=4, dedup_ttl=300.0, allow=frozenset({"http://a:8001"}), inflight=0):
+    """A bare object carrying just the state kv_transfer touches.
+
+    `allow` defaults to a single-source allowlist so the happy-path tests pass the
+    fail-closed gate; pass allow=None to exercise the disabled-by-default behavior.
+    """
     s = types.SimpleNamespace()
     s.model = "test-model"
     s.port = 8000
@@ -136,6 +140,13 @@ def test_source_allowlist_blocks_and_allows():
     ok = _make_server(allow={"http://allowed:8001"})
     code, body = _call(ok, {"source": "http://allowed:8001", "prompt": "x"})
     assert code == 202 and body["status"] == "accepted"
+
+
+def test_no_allowlist_is_disabled_fail_closed():
+    # With no allowlist configured the endpoint fails closed (SSRF guard).
+    s = _make_server(allow=None)
+    code, _ = _call(s, {"source": "http://a:8001", "prompt": "x"})
+    assert code == 403
 
 
 def test_stats_endpoint_reports_counters():
