@@ -273,7 +273,7 @@ def _run_failure_propagation_smoke(world: MPI.Intracomm) -> str | None:
             propagation_start = time.monotonic()
             try:
                 assert broadcaster is not None
-                broadcaster.pre_failover(failure_rank)
+                broadcaster.report_detected_failure(failure_rank)
             except Exception:
                 trigger_error = traceback.format_exc()
 
@@ -281,12 +281,13 @@ def _run_failure_propagation_smoke(world: MPI.Intracomm) -> str | None:
         try:
             # The victim process remains alive only so the smoke can coordinate
             # its result on COMM_WORLD. Survivors exclude its logical rank and
-            # exercise the same failure/reconciliation fanout as production.
+            # exercise the same detection/reconciliation fanout as production.
+            # This smoke does not model recovery commit or request resumption.
             assert broadcaster is not None
             deadline = time.monotonic() + _CONVERGENCE_TIMEOUT_SEC
             while not phase_errors and rank != failure_rank and time.monotonic() < deadline:
                 failure_observed = not health.is_active(failure_rank)
-                failure_reconciled = broadcaster.failure_is_reconciled(failure_rank)
+                failure_reconciled = broadcaster.failure_detection_is_reconciled(failure_rank)
                 if failure_observed and failure_reconciled:
                     if rank == detector_rank:
                         assert propagation_start is not None
@@ -295,8 +296,8 @@ def _run_failure_propagation_smoke(world: MPI.Intracomm) -> str | None:
                 time.sleep(0.005)
             local_converged = rank == failure_rank or (
                 not health.is_active(failure_rank)
-                and broadcaster.failure_is_reconciled(failure_rank)
-                and broadcaster.health_is_reconciled()
+                and broadcaster.failure_detection_is_reconciled(failure_rank)
+                and broadcaster.detected_health_is_reconciled()
                 and broadcaster.world_is_poisoned()
             )
         except Exception:
