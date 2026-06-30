@@ -235,7 +235,11 @@ def escape_html(text):
     return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
 
-def xml_to_html(xml_filename, html_filename, sort_by_name=False, only_rerun_results=False):
+def xml_to_html(xml_filename,
+                html_filename,
+                sort_by_name=False,
+                only_rerun_results=False,
+                include_original_failures=False):
     # HTML template
     html_template = """
     <!DOCTYPE html>
@@ -352,20 +356,20 @@ def xml_to_html(xml_filename, html_filename, sort_by_name=False, only_rerun_resu
         if only_rerun_results:
             # Keep only tests that were re-run (isrerun=true) and their
             # corresponding original failures from the first pytest run.
-            rerun_ids = {
-                (tc.attrib.get('name', ''), tc.attrib.get('classname', ''))
-                for _, tc in all_test_cases
-                if tc.attrib.get('isrerun') == 'true'
-            }
-            all_test_cases = [
-                (s, tc) for s, tc in all_test_cases
-                if tc.attrib.get('isrerun') == 'true'
-                or (tc.attrib.get('name', ''), tc.attrib.get('classname', '')) in rerun_ids
-            ]
+            rerun_ids = {(tc.attrib.get('name',
+                                        ''), tc.attrib.get('classname', ''))
+                         for _, tc in all_test_cases
+                         if tc.attrib.get('isrerun') == 'true'}
+            all_test_cases = [(s, tc) for s, tc in all_test_cases
+                              if tc.attrib.get('isrerun') == 'true' or (
+                                  tc.attrib.get('name', ''),
+                                  tc.attrib.get('classname', '')) in rerun_ids]
 
         tests_count = len(all_test_cases)
-        failed_tests_count = sum(1 for s, _ in all_test_cases if s in ('failure', 'error'))
-        skipped_tests_count = sum(1 for s, _ in all_test_cases if s == 'skipped')
+        failed_tests_count = sum(1 for s, _ in all_test_cases
+                                 if s in ('failure', 'error'))
+        skipped_tests_count = sum(1 for s, _ in all_test_cases
+                                  if s == 'skipped')
         passed_tests_count = tests_count - failed_tests_count - skipped_tests_count
 
         # Generate summary for the suite
