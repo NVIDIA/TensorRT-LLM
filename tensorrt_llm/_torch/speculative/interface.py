@@ -1327,6 +1327,14 @@ class SpecWorkerBase(nn.Module, ABC):
                 offset=self.offset,
             )
 
+            if self.force_num_accepted_tokens != 0.0:
+                # Fill gen_accepted positions 1..runtime_draft_len with all draft tokens
+                # so that when _apply_force_accepted_tokens inflates num_accepted_tokens
+                # the decoder reads valid draft tokens instead of zeros.
+                # Slice bounds are Python ints (static at CUDA-graph capture time).
+                gen_accepted[:,
+                             1:runtime_draft_len + 1].copy_(full_draft_tokens)
+
             accepted_tokens[num_contexts:] = gen_accepted
             num_accepted_tokens[num_contexts:] = gen_num_accepted
 
@@ -1384,7 +1392,6 @@ class SpecWorkerBase(nn.Module, ABC):
         top_ps = spec_metadata.request_top_ps[:batch_size]
 
         if self.use_flashinfer:
-            top_ks = top_ks.clamp(min=1, max=logits.shape[-1] - 1)
             if self.seed is None:
                 self.seed = torch.tensor([0],
                                          dtype=torch.int64,
@@ -1616,7 +1623,6 @@ class SpecWorkerBase(nn.Module, ABC):
             top_ps = spec_metadata.top_ps[:num_tokens]
 
             if self.use_flashinfer:
-                top_ks = top_ks.clamp(min=1, max=logits.shape[-1] - 1)
                 # Lazily initialize seed/offset tensors on correct device
                 if self.seed is None:
                     self.seed = torch.tensor([0],
