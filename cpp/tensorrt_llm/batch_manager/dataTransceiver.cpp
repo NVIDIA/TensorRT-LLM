@@ -371,6 +371,7 @@ public:
             auto it = mRequestToSession.find(requestId);
             TLLM_CHECK(it != mRequestToSession.end());
             mRequestToSession.erase(it);
+            mPeerProtocolErrors.erase(requestId);
         }
         {
             std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
@@ -384,6 +385,7 @@ public:
         {
             std::unique_lock<std::mutex> lk(mMtxForMap);
             mRequestToSession.erase(requestId);
+            mPeerProtocolErrors.erase(requestId);
         }
         catch (...)
         {
@@ -429,7 +431,8 @@ public:
         }
 
         auto requestId = info.getRequestId();
-        mCacheTransferLayer.validateSupport(info.getTransState());
+        mCacheTransferLayer.validateCacheSupport(info.getTransState());
+        auto const peerProtocolCompatibility = mCacheTransferLayer.getPeerProtocolCompatibility(info.getTransState());
 
         auto allCounterparts = mCacheTransferLayer.computeCounterparts(
             mSelfState.getCommState().value().getSelfIdx(), info.getTransState());
@@ -454,6 +457,15 @@ public:
                 it = mRequestToSession.emplace(requestId, std::move(session)).first;
             }
             it->second.setConnection(peerIdx, connection);
+            if (!peerProtocolCompatibility.compatible)
+            {
+                mPeerProtocolErrors.emplace(requestId, peerProtocolCompatibility.reason);
+            }
+        }
+        if (!peerProtocolCompatibility.compatible)
+        {
+            TLLM_LOG_WARNING("Rejecting KV cache transfer for request %zu before DMA: %s", requestId,
+                peerProtocolCompatibility.reason.c_str());
         }
         return info;
     }
@@ -640,6 +652,15 @@ private:
 
     void sendResponse(RequestIdType reqId)
     {
+        std::optional<std::string> peerProtocolError;
+        {
+            std::scoped_lock lock(mMtxForMap);
+            auto const errorIt = mPeerProtocolErrors.find(reqId);
+            if (errorIt != mPeerProtocolErrors.end())
+            {
+                peerProtocolError = errorIt->second;
+            }
+        }
         bool isReady = true;
         {
             std::scoped_lock lock(mSenderMutex);
@@ -657,7 +678,7 @@ private:
                 return;
             }
             mRemainSendCount.erase(countIt);
-            isReady = responseIt != mReadyResponses.end() && !isCancelled;
+            isReady = responseIt != mReadyResponses.end() && !isCancelled && !peerProtocolError.has_value();
         }
 
         // Keep mCurrentRequest set while notifying the peer so cancellation cannot change the decision after it has
@@ -697,9 +718,12 @@ private:
         {
             if (response.has_value())
             {
+                auto const errorMessage = peerProtocolError.has_value()
+                    ? "KV cache transfer rejected due to peer protocol mismatch: " + peerProtocolError.value()
+                    : "KV cache transfer was cancelled";
                 failResponse(*response,
                     std::make_exception_ptr(TLLM_REQUEST_EXCEPTION(reqId, common::RequestErrorCode::kNETWORK_ERROR,
-                        "KV cache transfer for request %zu was cancelled", reqId)));
+                        "%s for request %zu", errorMessage.c_str(), reqId)));
             }
             discardTransferState(reqId);
         }
@@ -867,6 +891,7 @@ private:
 
     executor::kv_cache::ConnectionManager* mManager;
     std::map<LlmRequest::RequestIdType, TransferSession> mRequestToSession;
+    std::unordered_map<LlmRequest::RequestIdType, std::string> mPeerProtocolErrors;
     executor::DataTransceiverState mSelfState;
     bool mInflightCancelEnabled{false};
     CacheTransferLayer mCacheTransferLayer;
@@ -991,7 +1016,20 @@ public:
         auto const& contextState = llmRequest.getDataTransceiverState();
         auto const& commState = contextState.getCommState().value();
         auto const& destCacheState = contextState.getCacheState().value();
-        mCacheTransferLayer.validateSupport(contextState);
+        mCacheTransferLayer.validateCacheSupport(contextState);
+        auto const peerProtocolCompatibility = mCacheTransferLayer.getPeerProtocolCompatibility(contextState);
+        if (!peerProtocolCompatibility.compatible && !peerProtocolCompatibility.allPeersProtocolAware)
+        {
+            TLLM_THROW("Cannot safely reject incompatible legacy or malformed CTX peer before buffer advertisement: %s",
+                peerProtocolCompatibility.reason.c_str());
+        }
+        if (!peerProtocolCompatibility.compatible)
+        {
+            // Every peer rank advertised this protocol, so complete the existing request/ready exchange. CTX will
+            // return ready=false before DMA and settle its queued response instead of being stranded indefinitely.
+            TLLM_LOG_WARNING("Completing control-only KV request handshake for request %zu so CTX can reject it: %s",
+                requestId, peerProtocolCompatibility.reason.c_str());
+        }
 
         RequestInfo requestInfo(requestId, mSelfState);
 

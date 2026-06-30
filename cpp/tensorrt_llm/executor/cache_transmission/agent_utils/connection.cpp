@@ -81,6 +81,20 @@ bool isValidBufferKind(uint8_t kind)
     return false;
 }
 
+std::uint64_t makeProtocolSessionToken(std::string_view const agentName)
+{
+    // FNV-1a makes the already-unique registered agent identity available as a compact process-session token.
+    constexpr std::uint64_t kOffsetBasis{14695981039346656037ULL};
+    constexpr std::uint64_t kPrime{1099511628211ULL};
+    std::uint64_t token = kOffsetBasis;
+    for (auto const character : agentName)
+    {
+        token ^= static_cast<unsigned char>(character);
+        token *= kPrime;
+    }
+    return token == 0 ? kOffsetBasis : token;
+}
+
 AgentState const* findAgentState(CommState const& commState, std::string const& agentName)
 {
     if (!commState.isAgentState())
@@ -367,7 +381,8 @@ std::optional<size_t> AgentConnection::getPreAssignedBufferId(uint8_t kind) cons
 
 AgentConnectionManager::AgentConnectionManager(
     std::vector<batch_manager::BaseTransBufferManager*> cacheTransBufferManagers, CacheState cacheState,
-    std::string const& backendType, std::optional<CacheState::RnnCacheState> rnnCacheState)
+    std::string const& backendType, std::optional<CacheState::RnnCacheState> rnnCacheState,
+    std::optional<PeerCancellationMode> peerCancellationMode)
     : mCacheState(std::move(cacheState))
     , mRnnCacheState(std::move(rnnCacheState))
     , mCacheTransBufferManagers(std::move(cacheTransBufferManagers))
@@ -377,6 +392,12 @@ AgentConnectionManager::AgentConnectionManager(
     TLLM_CHECK(mDeviceId != -1);
 
     mAgentName = genUniqueAgentName();
+    if (peerCancellationMode.has_value())
+    {
+        auto const descriptor = makePeerProtocolDescriptor(
+            peerCancellationMode.value() == PeerCancellationMode::kEnabled, makeProtocolSessionToken(mAgentName));
+        mAgentName = appendPeerProtocolDescriptor(std::move(mAgentName), descriptor);
+    }
     // Create Agent
     BaseAgentConfig config{mAgentName, true, false, true};
     m_Agent = makeTransferAgent(backendType, &config);

@@ -22,6 +22,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/executor/cacheCommunicator.h"
+#include "tensorrt_llm/executor/cache_transmission/agent_utils/peerProtocol.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 #include <map>
@@ -305,7 +306,8 @@ class AgentConnectionManager : public ConnectionManager
 public:
     AgentConnectionManager(std::vector<batch_manager::BaseTransBufferManager*> cacheTransBufferManagers,
         CacheState cacheState, std::string const& backendType,
-        std::optional<CacheState::RnnCacheState> rnnCacheState = std::nullopt);
+        std::optional<CacheState::RnnCacheState> rnnCacheState = std::nullopt,
+        std::optional<PeerCancellationMode> peerCancellationMode = std::nullopt);
     ~AgentConnectionManager();
     AgentConnection* recvConnect(DataContext const& ctx, void* data, size_t size) override;
     [[nodiscard]] std::vector<Connection const*> getConnections(CommState const& state) override;

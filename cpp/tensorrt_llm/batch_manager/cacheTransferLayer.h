@@ -18,6 +18,7 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/rnnCacheFormatter.h"
+#include "tensorrt_llm/executor/cache_transmission/agent_utils/peerProtocol.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/runtime/common.h"
 
@@ -58,6 +59,14 @@ public:
     /// @brief Validates all cache types against the peer state. Throws on incompatibility.
     /// @param peerState The peer's DataTransceiverState.
     void validateSupport(executor::DataTransceiverState const& peerState) const;
+
+    /// @brief Validates cache layout support independently of peer protocol negotiation.
+    /// @param peerState The peer's DataTransceiverState.
+    void validateCacheSupport(executor::DataTransceiverState const& peerState) const;
+
+    /// @brief Check the peer's advertised wire protocol and effective cancellation mode.
+    [[nodiscard]] executor::kv_cache::PeerProtocolCompatibility getPeerProtocolCompatibility(
+        executor::DataTransceiverState const& peerState) const;
 
     /// @brief Computes counterparts for all cache types and returns the union (KV + RNN if present).
     /// @param selfIdx The sequential index of the current executor process.
