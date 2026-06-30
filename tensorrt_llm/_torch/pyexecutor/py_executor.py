@@ -81,7 +81,8 @@ from .hang_detector import HangDetector
 from .kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache_stats import append_kv_cache_iteration_stats
 from .kv_cache_transceiver import (KvCacheTransceiver,
-                                   is_disagg_inflight_cancel_enabled)
+                                   is_disagg_inflight_cancel_enabled,
+                                   is_disagg_inflight_cancel_required)
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID,
                           MAX_SPEC_DECODE_POSITIONS, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
@@ -4660,8 +4661,8 @@ class PyExecutor:
         if callable(supports) and supports() is True:
             return True
 
-        if not getattr(self, "_disagg_inflight_cancel_unsupported_logged",
-                       False):
+        if (is_disagg_inflight_cancel_required() and not getattr(
+                self, "_disagg_inflight_cancel_unsupported_logged", False)):
             logger.warning(
                 "TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1 was requested, but "
                 f"{type(transceiver).__name__} does not advertise in-flight "

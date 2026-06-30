@@ -36,11 +36,16 @@ def _reset_inflight_cancel_env_cache(monkeypatch):
     monkeypatch.delenv(transceiver_module._TRY_ZCOPY_FOR_KV_CACHE_TRANSFER_ENV, raising=False)
     for env_name, _ in transceiver_module._CACHE_TRANSCEIVER_BACKEND_ENV_VARS:
         monkeypatch.delenv(env_name, raising=False)
-    monkeypatch.setattr(transceiver_module, "_disagg_inflight_cancel_enabled_cache", None)
+    monkeypatch.setattr(transceiver_module, "_disagg_inflight_cancel_mode_cache", None)
 
 
 def _supported_mapping():
-    return SimpleNamespace(pp_size=1, cp_size=1, enable_attention_dp=False)
+    return SimpleNamespace(
+        pp_size=1,
+        cp_size=1,
+        enable_attention_dp=False,
+        dwdp_enabled=False,
+    )
 
 
 def _make_timeout_request(request_id=7, in_progress=False):
@@ -77,7 +82,40 @@ def _make_response_handler_stub(active_requests, tp_allgather_result):
     return executor
 
 
-def test_flag_unset_short_circuits_before_capability_query(monkeypatch):
+@pytest.mark.parametrize(
+    "override,expected_enabled,expected_required,expected_warnings",
+    [
+        (None, True, False, 0),
+        ("0", False, False, 0),
+        ("1", True, True, 1),
+    ],
+)
+def test_feature_policy_is_strict_tri_state(
+    monkeypatch,
+    override,
+    expected_enabled,
+    expected_required,
+    expected_warnings,
+):
+    if override is not None:
+        monkeypatch.setenv(transceiver_module._DISAGG_INFLIGHT_CANCEL_ENABLED_ENV, override)
+    warning = Mock()
+    monkeypatch.setattr(transceiver_module.logger, "warning", warning)
+
+    assert transceiver_module.is_disagg_inflight_cancel_enabled() is expected_enabled
+    assert transceiver_module.is_disagg_inflight_cancel_required() is expected_required
+    assert warning.call_count == expected_warnings
+
+
+@pytest.mark.parametrize("override", ["", "2", "true"])
+def test_feature_policy_rejects_invalid_value(monkeypatch, override):
+    monkeypatch.setenv(transceiver_module._DISAGG_INFLIGHT_CANCEL_ENABLED_ENV, override)
+
+    with pytest.raises(ValueError, match="must be unset, 0, or 1"):
+        transceiver_module.is_disagg_inflight_cancel_enabled()
+
+
+def test_feature_disabled_short_circuits_before_capability_query(monkeypatch):
     executor = object.__new__(PyExecutor)
     executor.kv_cache_transceiver = Mock()
     executor._disagg_inflight_cancel_unsupported_logged = False
@@ -87,23 +125,35 @@ def test_flag_unset_short_circuits_before_capability_query(monkeypatch):
     executor.kv_cache_transceiver.supports_inflight_request_cancellation.assert_not_called()
 
 
-def test_unsupported_transceiver_warns_once(monkeypatch):
+@pytest.mark.parametrize("required,expected_warnings", [(False, 0), (True, 1)])
+def test_unsupported_transceiver_warns_only_when_required(monkeypatch, required, expected_warnings):
     executor = object.__new__(PyExecutor)
     executor.kv_cache_transceiver = Mock()
     executor.kv_cache_transceiver.supports_inflight_request_cancellation.return_value = False
     executor._disagg_inflight_cancel_unsupported_logged = False
     monkeypatch.setattr(executor_module, "is_disagg_inflight_cancel_enabled", lambda: True)
+    monkeypatch.setattr(executor_module, "is_disagg_inflight_cancel_required", lambda: required)
     warning = Mock()
     monkeypatch.setattr(executor_module.logger, "warning", warning)
 
     assert not PyExecutor._is_disagg_inflight_cancel_active(executor)
     assert not PyExecutor._is_disagg_inflight_cancel_active(executor)
 
-    assert executor._disagg_inflight_cancel_unsupported_logged
-    warning.assert_called_once()
+    assert executor._disagg_inflight_cancel_unsupported_logged is required
+    assert warning.call_count == expected_warnings
 
 
-def test_flag_unset_generation_timeout_uses_rank_uniform_cleanup():
+def test_auto_mode_supported_transceiver_is_active():
+    executor = object.__new__(PyExecutor)
+    executor.kv_cache_transceiver = Mock()
+    executor.kv_cache_transceiver.supports_inflight_request_cancellation.return_value = True
+    executor._disagg_inflight_cancel_unsupported_logged = False
+
+    assert PyExecutor._is_disagg_inflight_cancel_active(executor)
+
+
+def test_feature_disabled_generation_timeout_uses_rank_uniform_cleanup(monkeypatch):
+    monkeypatch.setenv(transceiver_module._DISAGG_INFLIGHT_CANCEL_ENABLED_ENV, "0")
     request = _make_timeout_request()
     executor = _make_response_handler_stub([request], [True, False])
 
@@ -127,7 +177,8 @@ def test_flag_unset_generation_timeout_uses_rank_uniform_cleanup():
     ]
 
 
-def test_flag_unset_generation_timeout_peer_enters_cleanup():
+def test_feature_disabled_generation_timeout_peer_enters_cleanup(monkeypatch):
+    monkeypatch.setenv(transceiver_module._DISAGG_INFLIGHT_CANCEL_ENABLED_ENV, "0")
     executor = _make_response_handler_stub([], [False, True])
 
     PyExecutor._handle_responses(executor)
@@ -149,7 +200,8 @@ def test_flag_unset_generation_timeout_peer_enters_cleanup():
     ]
 
 
-def test_flag_unset_context_timeout_preserves_legacy_cleanup():
+def test_feature_disabled_context_timeout_preserves_legacy_cleanup(monkeypatch):
+    monkeypatch.setenv(transceiver_module._DISAGG_INFLIGHT_CANCEL_ENABLED_ENV, "0")
     request = _make_timeout_request()
     request.py_kv_transfer_start_time = 1.0
     request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
@@ -174,7 +226,8 @@ def test_flag_unset_context_timeout_preserves_legacy_cleanup():
     executor._end_transfer_and_maybe_terminate.assert_called_once_with(request)
 
 
-def test_flag_unset_generation_driver_skips_cancel_pipeline():
+def test_feature_disabled_generation_driver_skips_cancel_pipeline(monkeypatch):
+    monkeypatch.setenv(transceiver_module._DISAGG_INFLIGHT_CANCEL_ENABLED_ENV, "0")
     executor = object.__new__(PyExecutor)
     executor.kv_cache_transceiver = Mock()
     executor.kv_cache_transceiver.supports_inflight_request_cancellation.return_value = True
@@ -234,6 +287,16 @@ def test_feature_opt_in_accepts_cpp_nixl_ucx(monkeypatch):
     constructor.assert_called_once()
 
 
+@pytest.mark.parametrize("config", [None, CacheTransceiverConfig(backend=None)])
+def test_feature_opt_in_rejects_missing_transceiver(monkeypatch, config):
+    monkeypatch.setenv(transceiver_module._DISAGG_INFLIGHT_CANCEL_ENABLED_ENV, "1")
+
+    with pytest.raises(ValueError, match="requires a configured, supported cache transceiver"):
+        transceiver_module.create_kv_cache_transceiver(
+            _supported_mapping(), Mock(), Mock(), Mock(), config
+        )
+
+
 def test_feature_opt_in_rejects_ambiguous_legacy_backend_env(monkeypatch):
     monkeypatch.setenv(transceiver_module._DISAGG_INFLIGHT_CANCEL_ENABLED_ENV, "1")
     monkeypatch.setenv("TRTLLM_USE_NIXL_KVCACHE", "1")
@@ -261,7 +324,8 @@ def test_direct_cpp_wrapper_rejects_python_runtime_opt_in(monkeypatch):
         )
 
 
-def test_flag_unset_preserves_existing_backend_selection(monkeypatch):
+def test_feature_disabled_preserves_existing_backend_selection(monkeypatch):
+    monkeypatch.setenv(transceiver_module._DISAGG_INFLIGHT_CANCEL_ENABLED_ENV, "0")
     config = CacheTransceiverConfig(backend="UCX")
     expected = object()
     constructor = Mock(return_value=expected)
@@ -274,7 +338,7 @@ def test_flag_unset_preserves_existing_backend_selection(monkeypatch):
     constructor.assert_called_once()
 
 
-def test_flag_unset_preserves_python_transceiver(monkeypatch):
+def test_auto_mode_preserves_python_transceiver(monkeypatch):
     config = CacheTransceiverConfig(backend="NIXL", transceiver_runtime="PYTHON")
     expected = object()
     constructor = Mock(return_value=expected)
@@ -287,7 +351,7 @@ def test_flag_unset_preserves_python_transceiver(monkeypatch):
     constructor.assert_called_once()
 
 
-def test_flag_unset_preserves_libfabric_selection(monkeypatch):
+def test_auto_mode_preserves_libfabric_selection(monkeypatch):
     monkeypatch.setenv(transceiver_module._NIXL_KVCACHE_BACKEND_ENV, "LIBFABRIC")
     config = CacheTransceiverConfig(backend="NIXL")
     expected = object()
@@ -309,7 +373,7 @@ def test_flag_unset_preserves_libfabric_selection(monkeypatch):
         ("TRTLLM_USE_MPI_KVCACHE", "MPI"),
     ],
 )
-def test_flag_unset_preserves_legacy_backend_env(monkeypatch, selector, expected_backend):
+def test_auto_mode_preserves_legacy_backend_env(monkeypatch, selector, expected_backend):
     monkeypatch.setenv(selector, "1")
     config = CacheTransceiverConfig(backend="DEFAULT")
     constructor = Mock(return_value=object())
@@ -321,7 +385,7 @@ def test_flag_unset_preserves_legacy_backend_env(monkeypatch, selector, expected
     constructor.assert_called_once()
 
 
-def test_flag_unset_preserves_legacy_backend_env_precedence(monkeypatch):
+def test_auto_mode_preserves_legacy_backend_env_precedence(monkeypatch):
     for selector in (
         "TRTLLM_USE_MPI_KVCACHE",
         "TRTLLM_USE_MOONCAKE_KVCACHE",
@@ -395,11 +459,13 @@ def test_cpp_capability_is_config_scoped(
 
     assert transceiver.supports_inflight_request_cancellation() is expected
     constructor.assert_called_once()
-    assert constructor.call_args.args[-1] is False
+    assert constructor.call_args.args[-1] is expected
 
 
-def test_cpp_constructor_receives_effective_opt_in(monkeypatch):
-    monkeypatch.setenv(transceiver_module._DISAGG_INFLIGHT_CANCEL_ENABLED_ENV, "1")
+@pytest.mark.parametrize("override,expected_enabled", [(None, True), ("0", False), ("1", True)])
+def test_cpp_constructor_receives_effective_policy(monkeypatch, override, expected_enabled):
+    if override is not None:
+        monkeypatch.setenv(transceiver_module._DISAGG_INFLIGHT_CANCEL_ENABLED_ENV, override)
     monkeypatch.setattr(transceiver_module, "mapping_to_world_config", lambda mapping: object())
     constructor = Mock(return_value=Mock())
     monkeypatch.setattr(transceiver_module, "CacheTransceiverCpp", constructor)
@@ -428,7 +494,7 @@ def test_cpp_constructor_receives_effective_opt_in(monkeypatch):
         inflight_cancel_supported_by_executor=True,
     )
 
-    assert constructor.call_args.args[-1] is True
+    assert constructor.call_args.args[-1] is expected_enabled
 
 
 @pytest.mark.parametrize(
@@ -439,6 +505,7 @@ def test_cpp_constructor_receives_effective_opt_in(monkeypatch):
         "pipeline_parallelism",
         "context_parallelism",
         "attention_dp",
+        "dwdp",
         "layerwise",
         "zero_copy",
         "executor",
@@ -463,6 +530,8 @@ def test_feature_opt_in_rejects_unqualified_safety_path(monkeypatch, qualifier):
         mapping.cp_size = 2
     elif qualifier == "attention_dp":
         mapping.enable_attention_dp = True
+    elif qualifier == "dwdp":
+        mapping.dwdp_enabled = True
     elif qualifier == "layerwise":
         monkeypatch.setenv(transceiver_module._DISAGG_LAYERWISE_ENV, "1")
     elif qualifier == "zero_copy":
@@ -481,7 +550,7 @@ def test_feature_opt_in_rejects_unqualified_safety_path(monkeypatch, qualifier):
         )
 
 
-def test_flag_unset_keeps_unsupported_executor_inactive(monkeypatch):
+def test_auto_mode_keeps_unsupported_executor_inactive(monkeypatch):
     config = CacheTransceiverConfig(
         backend="NIXL", transceiver_runtime="CPP", max_tokens_in_buffer=512
     )
@@ -517,7 +586,7 @@ def test_python_transceiver_capability_defaults_to_unsupported():
     assert not transceiver.has_poisoned_transfer_buffer()
 
 
-def test_flag_unset_skips_cpp_poison_query():
+def test_feature_disabled_skips_cpp_poison_query():
     transceiver = SimpleNamespace(
         impl=Mock(),
         _inflight_request_cancellation_enabled=False,

@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -397,7 +398,20 @@ bool getEnvTryZCopyForKVCacheTransfer()
 
 bool getEnvDisaggEnableInflightCancel()
 {
-    static bool const enabled = getBoolEnv("TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL");
+    static bool const enabled = []()
+    {
+        auto const value = getStrEnv("TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL");
+        if (!value.has_value() || value.value() == "0")
+        {
+            return false;
+        }
+        if (value.value() == "1")
+        {
+            return true;
+        }
+        throw std::invalid_argument(
+            "TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL must be unset, 0, or 1; got '" + value.value() + "'.");
+    }();
     return enabled;
 }
 

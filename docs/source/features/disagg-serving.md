@@ -237,6 +237,44 @@ Example (two-node deployment):
 
 TRT-LLM uses some environment variables to control the behavior of disaggregated service.
 
+* `TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL`: Controls cancellation of active KV cache transfers and quarantine of
+  transfer buffers whose completion cannot be proven. The value is strict and has the following behavior:
+
+  | Value | Qualified configuration | Unqualified configuration |
+  | ----- | ----------------------- | ------------------------- |
+  | Unset | Enabled automatically | Coordinated in-flight cancellation remains disabled |
+  | `0` | Disabled | Disabled |
+  | `1` | Enabled and required | Startup fails with a configuration error |
+
+  Any other value is invalid. A configuration is qualified only when all of the following are true:
+
+  - The standard PyTorch `PyExecutor` is used without a simultaneous KV connector.
+  - The asynchronous C++ cache transceiver uses `backend: NIXL` with
+    `TRTLLM_NIXL_KVCACHE_BACKEND=UCX` (the default NIXL plugin).
+  - `max_tokens_in_buffer` and `kv_transfer_timeout_ms` are both positive. `PyExecutor` resolves an omitted
+    `max_tokens_in_buffer` to the model maximum sequence length before creating the transceiver; the transfer timeout
+    defaults to 60,000 ms.
+  - `PP=1`, `CP=1`, attention DP is disabled, and DWDP is disabled. Tensor parallelism is supported.
+  - Transfer overlap is enabled, and layerwise and zero-copy transfers are disabled.
+
+  Consequently, AutoDeploy, the legacy TensorRT executor, the Python transceiver, direct UCX, MPI, Mooncake,
+  NIXL-libfabric, synchronous receive, PP, CP, attention DP, DWDP, layerwise transfer, zero-copy transfer,
+  no-deadline, unbounded-admission, and KV-connector paths do not enable coordinated in-flight cancellation when the
+  variable is unset; their ordinary successful-transfer path remains unchanged. Set the variable to `1` when
+  deployment validation should reject any such fallback, including a missing cache transceiver or use of the legacy
+  TensorRT executor.
+
+  **Fail-closed behavior:** Cancelling a NIXL operation does not prove that its peer has stopped accessing the
+  advertised buffer. TRT-LLM therefore poisons the affected staging-buffer slot and terminates the executor instead
+  of reusing that memory. Deferred un-poison is not implemented, so an in-flight cancellation can require a process
+  or pod restart.
+
+  **Rolling upgrades:** Before upgrading, set `TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=0` on every context and generation
+  worker. Upgrade all workers, verify that they use the same TensorRT-LLM version and transfer configuration, and only
+  then remove the override. Older workers interpret an unset variable as disabled, while workers with this policy can
+  enable it automatically. C++ validates the effective mode across local parallel ranks, but context and generation
+  services do not negotiate mixed-version policy.
+
 * `TRTLLM_NIXL_KVCACHE_BACKEND`: When using NIXL as the cache transceiver backend, this variable specifies the underlying communication backend for NIXL. Valid options are:
   - `UCX` (default)
   - `LIBFABRIC` (available from v0.16.0)

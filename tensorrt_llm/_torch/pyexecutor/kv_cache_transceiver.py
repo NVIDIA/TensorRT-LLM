@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from abc import ABC, abstractmethod
+from enum import Enum
 from os import getenv
 from typing import Any, Dict, List, Optional
 
@@ -46,21 +47,52 @@ _CACHE_TRANSCEIVER_BACKEND_ENV_VARS = (
     ("TRTLLM_USE_MOONCAKE_KVCACHE", "MOONCAKE"),
     ("TRTLLM_USE_MPI_KVCACHE", "MPI"),
 )
-_disagg_inflight_cancel_enabled_cache: Optional[bool] = None
+
+
+class _DisaggInflightCancelMode(Enum):
+    AUTO = "auto"
+    DISABLED = "0"
+    REQUIRED = "1"
+
+
+_disagg_inflight_cancel_mode_cache: Optional[_DisaggInflightCancelMode] = None
+
+
+def _get_disagg_inflight_cancel_mode() -> _DisaggInflightCancelMode:
+    global _disagg_inflight_cancel_mode_cache
+    if _disagg_inflight_cancel_mode_cache is not None:
+        return _disagg_inflight_cancel_mode_cache
+
+    value = getenv(_DISAGG_INFLIGHT_CANCEL_ENABLED_ENV)
+    if value is None:
+        mode = _DisaggInflightCancelMode.AUTO
+    elif value == "0":
+        mode = _DisaggInflightCancelMode.DISABLED
+    elif value == "1":
+        mode = _DisaggInflightCancelMode.REQUIRED
+        logger.warning(
+            f"{_DISAGG_INFLIGHT_CANCEL_ENABLED_ENV}=1: disagg KV "
+            "transfer in-flight cancellation was requested. It is active "
+            "only for cache transceivers that advertise support.")
+    else:
+        raise ValueError(
+            f"{_DISAGG_INFLIGHT_CANCEL_ENABLED_ENV} must be unset, 0, or 1; "
+            f"got {value!r}.")
+
+    _disagg_inflight_cancel_mode_cache = mode
+    return mode
 
 
 def is_disagg_inflight_cancel_enabled() -> bool:
-    """Return whether disaggregated in-flight KV transfer cancellation is enabled."""
-    global _disagg_inflight_cancel_enabled_cache
-    if _disagg_inflight_cancel_enabled_cache is None:
-        _disagg_inflight_cancel_enabled_cache = (getenv(
-            _DISAGG_INFLIGHT_CANCEL_ENABLED_ENV, "0") == "1")
-        if _disagg_inflight_cancel_enabled_cache:
-            logger.warning(
-                f"{_DISAGG_INFLIGHT_CANCEL_ENABLED_ENV}=1: disagg KV "
-                "transfer in-flight cancellation was requested. It is active "
-                "only for cache transceivers that advertise support.")
-    return _disagg_inflight_cancel_enabled_cache
+    """Return whether configuration-scoped in-flight cancellation is permitted."""
+    return (_get_disagg_inflight_cancel_mode()
+            is not _DisaggInflightCancelMode.DISABLED)
+
+
+def is_disagg_inflight_cancel_required() -> bool:
+    """Return whether in-flight cancellation was explicitly required."""
+    return (_get_disagg_inflight_cancel_mode()
+            is _DisaggInflightCancelMode.REQUIRED)
 
 
 def _is_disagg_inflight_cancel_config_supported(
@@ -77,6 +109,7 @@ def _is_disagg_inflight_cancel_config_supported(
             and getenv(_DISABLE_KV_CACHE_TRANSFER_OVERLAP_ENV) != "1"
             and mapping.pp_size == 1 and mapping.cp_size == 1
             and not mapping.enable_attention_dp
+            and not getattr(mapping, "dwdp_enabled", False)
             and getenv(_DISAGG_LAYERWISE_ENV) != "1"
             and getenv(_TRY_ZCOPY_FOR_KV_CACHE_TRANSFER_ENV) != "1")
 
@@ -85,7 +118,7 @@ def _validate_disagg_inflight_cancel_config(
         cache_transceiver_config: CacheTransceiverConfig,
         mapping: Mapping,
         inflight_cancel_supported_by_executor: bool = False) -> None:
-    if not is_disagg_inflight_cancel_enabled():
+    if not is_disagg_inflight_cancel_required():
         return
 
     enabled_backend_env_vars = [
@@ -109,8 +142,8 @@ def _validate_disagg_inflight_cancel_config(
     layerwise = getenv(_DISAGG_LAYERWISE_ENV)
     try_zcopy = getenv(_TRY_ZCOPY_FOR_KV_CACHE_TRANSFER_ENV)
     raise ValueError(
-        f"{_DISAGG_INFLIGHT_CANCEL_ENABLED_ENV}=1 is experimental and "
-        "currently supported only by the standard PyTorch backend "
+        f"{_DISAGG_INFLIGHT_CANCEL_ENABLED_ENV}=1 is currently supported "
+        "only by the standard PyTorch backend "
         "PyExecutor with asynchronous transceiver_runtime='CPP', "
         "backend='NIXL', and TRTLLM_NIXL_KVCACHE_BACKEND=UCX on ordinary "
         "TP topology, using a positive max_tokens_in_buffer admission "
@@ -123,11 +156,14 @@ def _validate_disagg_inflight_cancel_config(
         f"TRTLLM_NIXL_KVCACHE_BACKEND={nixl_backend!r}, "
         f"pp_size={mapping.pp_size!r}, cp_size={mapping.cp_size!r}, "
         f"enable_attention_dp={mapping.enable_attention_dp!r}, "
+        f"dwdp_enabled={getattr(mapping, 'dwdp_enabled', False)!r}, "
         "inflight_cancel_supported_by_executor="
         f"{inflight_cancel_supported_by_executor!r}, "
         f"{_DISABLE_KV_CACHE_TRANSFER_OVERLAP_ENV}={disable_overlap!r}, "
         f"{_DISAGG_LAYERWISE_ENV}={layerwise!r}, "
-        f"{_TRY_ZCOPY_FOR_KV_CACHE_TRANSFER_ENV}={try_zcopy!r}.")
+        f"{_TRY_ZCOPY_FOR_KV_CACHE_TRANSFER_ENV}={try_zcopy!r}. Unset "
+        f"{_DISAGG_INFLIGHT_CANCEL_ENABLED_ENV}, or set it to 0, to use "
+        "this configuration without coordinated in-flight cancellation.")
 
 
 def mapping_to_world_config(mapping: Mapping) -> WorldConfig:
@@ -146,10 +182,15 @@ def create_kv_cache_transceiver(
         dist: Distributed,
         kv_cache_manager: KVCacheManager,
         attention_type: AttentionTypeCpp,
-        cache_transceiver_config: CacheTransceiverConfig,
+        cache_transceiver_config: Optional[CacheTransceiverConfig],
         mamba_cache_manager: Optional[BaseMambaCacheManager] = None,
         inflight_cancel_supported_by_executor: bool = False):
     if cache_transceiver_config is None or cache_transceiver_config.backend is None:
+        if is_disagg_inflight_cancel_required():
+            raise ValueError(
+                f"{_DISAGG_INFLIGHT_CANCEL_ENABLED_ENV}=1 requires a "
+                "configured, supported cache transceiver; no cache transceiver "
+                "backend was configured.")
         logger.info("cache_transceiver is disabled")
         return None
 

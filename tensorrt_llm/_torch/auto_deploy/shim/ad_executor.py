@@ -1249,7 +1249,7 @@ def create_autodeploy_executor(
     )
 
     cache_transceiver_config = ad_config.cache_transceiver_config
-    kv_cache_transceiver = None
+    attention_type_cpp = AttentionTypeCpp.DEFAULT
     if cache_transceiver_config is not None and cache_transceiver_config.backend is not None:
         if isinstance(kv_cache_manager, BaseMambaCacheManager):
             # See https://github.com/NVIDIA/TensorRT-LLM/issues/14320.
@@ -1275,15 +1275,19 @@ def create_autodeploy_executor(
             raise TypeError(f"attention_type must be AttentionType, got {cache_attention_type!r}")
         attention_type_cpp = _ATTENTION_TYPE_TO_CPP[cache_attention_type]
 
-        kv_cache_transceiver = create_kv_cache_transceiver(
-            dist_mapping,
-            dist,
-            kv_cache_manager,
-            attention_type_cpp,
-            cache_transceiver_config,
-            mamba_cache_manager=None,
-            inflight_cancel_supported_by_executor=False,
-        )
+    # Call the shared factory even when no transceiver is configured so an
+    # explicit TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1 cannot silently fall
+    # back to an unsupported AutoDeploy path. AUTO and disabled mode still
+    # return None and preserve the existing aggregate-serving behavior.
+    kv_cache_transceiver = create_kv_cache_transceiver(
+        dist_mapping,
+        dist,
+        kv_cache_manager,
+        attention_type_cpp,
+        cache_transceiver_config,
+        mamba_cache_manager=None,
+        inflight_cancel_supported_by_executor=False,
+    )
 
     # Guided (structured) decoding.
     guided_decoder = None
