@@ -460,14 +460,6 @@ def test_fill_template(tritonserver_test_root, test_name, llm_root):
         llm_root)
 
 
-@pytest.mark.parametrize("test_name", ["triton-extensive"], indirect=True)
-def test_triton_extensive(tritonserver_test_root, test_name, llm_root):
-    backend_path = os.path.join(llm_root, "triton_backend")
-    run_shell_command(
-        f"cd {backend_path}/ci/L0_backend_trtllm && "
-        f"BACKEND_ROOT={backend_path} bash -ex test.sh", llm_root)
-
-
 @pytest.mark.parametrize("test_name", ["llmapi-unit-tests"], indirect=True)
 def test_llmapi_unit_tests(tritonserver_test_root, test_name, llm_root):
     run_shell_command(

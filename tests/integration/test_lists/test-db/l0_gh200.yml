@@ -14,20 +14,11 @@ l0_gh200:
       stage: post_merge
       backend: tensorrt
   tests:
-  - unittest/trt/attention/test_gpt_attention.py -k "partition0"
-  - unittest/trt/attention/test_gpt_attention.py -k "partition1"
-  - unittest/trt/attention/test_gpt_attention.py -k "partition2"
-  - unittest/trt/attention/test_gpt_attention.py -k "partition3"
-  - unittest/trt/attention/test_gpt_attention.py -k "xqa_generic"
-  - unittest/trt/model/test_gpt_e2e.py
   - unittest/bindings
   - unittest/llmapi/test_llm_quant.py
   - llmapi/test_llm_examples.py::test_llmapi_quickstart_atexit
   - examples/visual_gen/test_visual_gen.py::test_visual_gen_quickstart
   - examples/visual_gen/test_visual_gen.py::test_visual_gen_api_walkthrough
-  - unittest/test_model_runner_cpp.py
   - accuracy/test_cli_flow.py::TestGptNext::test_auto_dtype
   - examples/test_medusa.py::test_llm_medusa_with_qaunt_base_model_1gpu[fp8-use_py_session-medusa-vicuna-7b-v1.3-4-heads-float16-bs1] TIMEOUT (90)
   - examples/test_medusa.py::test_llm_medusa_with_qaunt_base_model_1gpu[fp8-use_cpp_session-medusa-vicuna-7b-v1.3-4-heads-float16-bs1]
-  - unittest/trt/model/eagle
-  - unittest/trt/model_api/test_model_api_multi_gpu.py

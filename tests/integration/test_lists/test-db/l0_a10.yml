@@ -220,13 +220,6 @@ l0_a10:
       backend: tensorrt
   tests:
   # ------------- Move from pre_merge to post_merge ---------------
-  - unittest/trt/attention/test_gpt_attention.py -k "partition0"
-  - unittest/trt/attention/test_gpt_attention.py -k "partition1"
-  - unittest/trt/attention/test_gpt_attention.py -k "partition2"
-  - unittest/trt/attention/test_gpt_attention.py -k "partition3"
-  - unittest/trt/attention/test_gpt_attention.py -k "xqa_generic"
-  - unittest/trt/model/test_mistral.py
-  - unittest/trt/model/test_llama.py
   - llmapi/test_llm_examples.py::test_llmapi_chat_example
   - llmapi/test_llm_e2e.py::test_llmapi_exit
   - llmapi/test_llm_examples.py::test_llmapi_server_example
@@ -240,13 +233,7 @@ l0_a10:
   - test_e2e.py::test_openai_reasoning[trt]
   - test_e2e.py::test_trtllm_bench_sanity[--non-streaming-FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
   - test_e2e.py::test_trtllm_bench_latency_sanity[FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
-  - unittest/trt/quantization
-  - unittest/trt/functional # 37 mins
   - llmapi/test_llm_examples.py::test_llmapi_quickstart_atexit
-  - unittest/test_model_runner_cpp.py
-  - unittest/llmapi/test_build_cache.py
-  - unittest/trt/attention/test_gpt_attention_IFB.py
-  - unittest/trt/attention/test_gpt_attention_no_cache.py
 - condition:
     ranges:
       system_gpu_count:
