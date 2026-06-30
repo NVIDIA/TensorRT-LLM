@@ -80,8 +80,7 @@ class BackendCase:
 
     # Cross-attention: new KV (encoder) tokens per request. None => self-attention
     # (KV tokens == seq_lens). When set, the case is cross-attention (must be
-    # non-causal). Same-length cross runs on TRTLLM/FlashInfer/Vanilla; unequal
-    # q/kv lengths are gated for TRTLLM in the capability matrix.
+    # non-causal).
     seq_lens_kv: Optional[List[int]] = None
 
     dtype: str = "float16"
@@ -963,7 +962,7 @@ def run_backend(
                 max_num_tokens=case.max_num_tokens,
                 kv_cache_manager=mgr,
                 request_ids=request_ids,
-                prompt_lens=case.token_nums,
+                prompt_lens=case.seq_lens if case.is_cross else case.token_nums,
                 kv_layout=kv_layout,
             )
 
