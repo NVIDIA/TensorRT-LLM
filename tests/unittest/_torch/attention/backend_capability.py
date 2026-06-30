@@ -177,30 +177,6 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
     ):
         return f"TRTLLM Blackwell paged attention is unstable for head_dim {case.head_dim}"
 
-    # TRTLLM's Blackwell pure-decode sliding-window path is numerically unstable
-    # for the listed Gemma GQA shapes. Mixed batches still use a different path
-    # and match the golden.
-    if (
-        backend == "TRTLLM"
-        and sm >= 100
-        and getattr(case, "sliding_window", None) is not None
-        and getattr(case, "cache", "paged") != "none"
-        and not getattr(case, "is_mla", False)
-        and case.num_contexts == 0
-        and (
-            case.num_heads,
-            case.num_kv_heads,
-            case.head_dim,
-            case.sliding_window,
-        )
-        in _TRTLLM_BLACKWELL_SLIDING_DECODE_UNSTABLE
-    ):
-        return (
-            "TRTLLM Blackwell sliding-window pure decode is unstable for "
-            f"num_heads={case.num_heads}, num_kv_heads={case.num_kv_heads}, "
-            f"head_dim={case.head_dim}, window={case.sliding_window}"
-        )
-
     # TRTLLM's Blackwell no-cache fallback mismatches the Vanilla golden for the
     # Qwen2-VL vision tower's head_dim 80 workload; other no-cache head dims in
     # this sweep still pass on Blackwell.
@@ -213,36 +189,40 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
     ):
         return "TRTLLM Blackwell no-cache fallback is unstable for head_dim 80"
 
-    # TRTLLM's fp8 generation (XQA) path computes in fp8 and needs the model's
-    # real KV-dequant + output scale state (fed by the Attention module's
-    # projection layers). A bare standalone backend lacks it: supplying a unit
-    # output scale lets the kernel run, but the MHA path then produces garbage
-    # (~1e5 abs error) while only GQA happens to tolerate it. fp8 *context*
-    # (pure prefill) is exercised; FlashInfer validates fp8 decode on every arch.
-    if backend == "TRTLLM" and getattr(case, "kv_dtype", None) == "fp8":
-        has_generation = case.num_contexts < len(case.seq_lens)
-        if has_generation:
-            return (
-                "TRTLLM fp8 KV generation (XQA) needs the model's fp8 scale "
-                "state, absent in the standalone backend; fp8 context is covered "
-                "and FlashInfer validates fp8 decode"
-            )
-
-    # TRTLLM cross-attention works through the standard plumbing (prepare()
-    # derives the cross kv_lens from seq_lens_kv; the backend builds cross_kv from
-    # k/v). The aligned q_len == kv_len case is exercised on TRTLLM. The
-    # q_len != kv_len case is numerically correct in isolation (verified vs the
-    # golden to ~2e-3) but exhibits a cross-case state-dependent mismatch when run
-    # after other cross cases in the same process (a TRTLLM cross-path global not
-    # reset between fresh backend instances), so it is validated via
-    # FlashInfer/Vanilla in the suite.
+    # These Blackwell sliding-window decode shapes pass in isolation but become
+    # numerically unstable after earlier cases initialize trtllm-gen process
+    # state. Keep the skip exact so other sliding-window decode shapes run.
     if (
         backend == "TRTLLM"
-        and getattr(case, "is_cross", False)
-        and list(case.seq_lens) != list(case.seq_lens_kv)
+        and sm >= 100
+        and case.num_contexts == 0
+        and (
+            case.num_heads,
+            case.num_kv_heads,
+            case.head_dim,
+            getattr(case, "sliding_window", None),
+        )
+        in _TRTLLM_BLACKWELL_SLIDING_DECODE_UNSTABLE
     ):
         return (
-            "TRTLLM cross q_len != kv_len is correct standalone (~2e-3) but "
-            "flaky across cross cases in-process; validated via FlashInfer/Vanilla"
+            "TRTLLM Blackwell sliding-window pure decode is unstable for "
+            f"num_heads={case.num_heads}, num_kv_heads={case.num_kv_heads}, "
+            f"head_dim={case.head_dim}, window={case.sliding_window}"
+        )
+
+    # SM90 forces paged context FMHA whenever a mixed batch has context work.
+    # With an FP8 KV cache, that mode also reaches the MMHA generation phase and
+    # requires an attention-output scale that a standalone MHA backend does not
+    # own. Pure decode, GQA/MQA mixed batches, and Blackwell trtllm-gen all run.
+    if (
+        backend == "TRTLLM"
+        and sm in (90,)
+        and getattr(case, "kv_dtype", None) == "fp8"
+        and case.num_heads == case.num_kv_heads
+        and 0 < case.num_contexts < len(case.seq_lens)
+    ):
+        return (
+            "TRTLLM SM90 mixed-phase MHA with FP8 KV cache requires an "
+            "attention-output scale unavailable to the standalone backend"
         )
     return None

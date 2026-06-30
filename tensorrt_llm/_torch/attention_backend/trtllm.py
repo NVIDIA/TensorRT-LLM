@@ -1473,7 +1473,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         # SM90 forces `use_paged_context_fmha` on for correctness
         # (https://nvbugs/5624818).
-        if get_sm_version() == 90:
+        if get_sm_version() == 90 and metadata.num_contexts > 0:
             metadata.use_paged_context_fmha = True
 
         # Sparse mqa/gqa attention uses generation kernel which reads Q from qPtr (separate buffer).
