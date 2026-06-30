@@ -1822,6 +1822,50 @@ TEST_F(CapacitySchedulerTest, DelayDuplicateRequest)
     }
 }
 
+TEST_F(CapacitySchedulerTest, PrefixAwareSchedulingDisabledDoesNotDelayDuplicateRequest)
+{
+    SizeType32 kvCacheMaxNumTokens = 200;
+    SizeType32 kvCacheTokensPerBlock = 10;
+    SizeType32 kvCacheMaxNumTokensPerSeq = 50;
+    SizeType32 maxNumRequests = 3;
+    bool enableReuse = true;
+    bool enablePrefixAwareScheduling = false;
+
+    auto capacitySchedulerPolicies = std::vector<CapacitySchedulerPolicy>{
+        CapacitySchedulerPolicy::kMAX_UTILIZATION, CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT};
+    for (auto capacitySchedulerPolicy : capacitySchedulerPolicies)
+    {
+        auto kvCacheManager = getKvCacheManager(maxNumRequests, kvCacheTokensPerBlock, kvCacheMaxNumTokens,
+            kvCacheMaxNumTokensPerSeq, /*sinkTokenLength=*/0, /*enableReuse=*/enableReuse);
+        auto peftCacheManager = getPeftCacheManager();
+        auto capacityScheduler = CapacityScheduler(maxNumRequests, capacitySchedulerPolicy, kvCacheManager != nullptr,
+            /*twoStepsLookAhead=*/false, /*noScheduleUntilState=*/LlmRequestState::kCONTEXT_INIT,
+            /*noScheduleAfterState=*/LlmRequestState::kGENERATION_COMPLETE,
+            /*enablePrefixAwareScheduling=*/enablePrefixAwareScheduling);
+
+        int32_t maxNewTokens = 2;
+        int32_t promptLen = 2 * kvCacheTokensPerBlock + 1;
+
+        auto inputTokens = std::make_shared<std::vector<int32_t>>(promptLen, 1);
+        std::iota(inputTokens->begin(), inputTokens->end(), 0);
+
+        RequestList activeRequests;
+        activeRequests.push_back(createRequest(inputTokens, maxNewTokens, 0, 1234));
+        activeRequests.push_back(createRequest(inputTokens, maxNewTokens, 1, 1234));
+        activeRequests.push_back(createRequest(inputTokens, maxNewTokens, 2, 1234));
+
+        auto [scheduled, disaggInit, paused] = capacityScheduler(activeRequests, *kvCacheManager, peftCacheManager);
+
+        EXPECT_EQ(scheduled.size(), 3u);
+        EXPECT_TRUE(disaggInit.empty());
+        EXPECT_TRUE(paused.empty());
+        for (auto const& req : activeRequests)
+        {
+            EXPECT_EQ(req->getEstimatedReusableTokens(), 0);
+        }
+    }
+}
+
 TEST_F(CapacitySchedulerTest, DelayDuplicateRequestChunked)
 {
     SizeType32 kvCacheMaxNumTokens = 200;
