@@ -42,6 +42,8 @@
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
+#include <algorithm>
+#include <chrono>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
@@ -735,6 +737,9 @@ protected:
             bool isUcx = tensorrt_llm::common::getEnvUseUCXKvCache();
             bool isNixl = tensorrt_llm::common::getEnvUseNixlKvCache();
             bool isMooncake = tensorrt_llm::common::getEnvUseMooncakeKvCache();
+            auto const peerCancellationMode = mIsContext ? mContextPeerCancellationMode : mGenPeerCancellationMode;
+            bool const enableInflightCancel
+                = isNixl && peerCancellationMode == texec::kv_cache::PeerCancellationMode::kEnabled;
             // Skip tests for MOONCAKE when on Rocky8
             bool isRocky8 = std::filesystem::exists("/etc/redhat-release");
             isMooncake = isMooncake && !isRocky8;
@@ -771,7 +776,7 @@ protected:
                 std::vector<tensorrt_llm::batch_manager::BaseTransBufferManager*> baseBufferManagers(
                     bufferManagers.begin(), bufferManagers.end());
                 mConnectionManager = std::make_unique<texec::kv_cache::AgentConnectionManager>(
-                    baseBufferManagers, *mCacheState, "nixl");
+                    baseBufferManagers, *mCacheState, "nixl", std::nullopt, peerCancellationMode);
             }
             else if (isMooncake)
             {
@@ -792,13 +797,13 @@ protected:
 
             if (mIsContext)
             {
-                mSender = std::make_unique<CacheSender>(
-                    mConnectionManager.get(), mRankInInstance, CacheTransferLayer(*mCacheState, makeFormatter()));
+                mSender = std::make_unique<CacheSender>(mConnectionManager.get(), mRankInInstance,
+                    CacheTransferLayer(*mCacheState, makeFormatter(), nullptr, enableInflightCancel));
             }
             else
             {
-                mRequester = std::make_unique<CacheReceiver>(
-                    mConnectionManager.get(), mRankInInstance, CacheTransferLayer(*mCacheState, makeFormatter()));
+                mRequester = std::make_unique<CacheReceiver>(mConnectionManager.get(), mRankInInstance,
+                    CacheTransferLayer(*mCacheState, makeFormatter(), nullptr, enableInflightCancel));
             }
             TLLM_LOG_DEBUG("setUpCacheTransceiver mSender");
 
@@ -1270,6 +1275,108 @@ protected:
         return 0.F;
     }
 
+    void runPeerProtocolMismatch(texec::kv_cache::PeerCancellationMode const contextMode,
+        texec::kv_cache::PeerCancellationMode const generationMode)
+    {
+        if (!tensorrt_llm::common::getEnvUseNixlKvCache())
+        {
+            GTEST_SKIP() << "Peer protocol negotiation applies only to NIXL";
+        }
+
+        mContextPeerCancellationMode = contextMode;
+        mGenPeerCancellationMode = generationMode;
+        setUpCommunicator(/*contextTp=*/1, /*contextPp=*/1, /*contextCp=*/1, /*genTp=*/1, /*genPp=*/1, /*genCp=*/1);
+
+        if (mIsContext || mIsGeneration)
+        {
+            setUpCacheManager(/*numLayers=*/2, /*numHeads=*/2, /*sizePerHead=*/8, /*tokensPerBlock=*/4,
+                nvinfer1::DataType::kFLOAT, /*kvFactor=*/2, /*isMLA=*/false, /*enableDPAttention=*/false,
+                /*isWindow=*/false, /*isIndexerKCache=*/false);
+            setUpCacheTransceiver();
+            std::shared_ptr<WrappedLlmRequest> request = makeLlmRequest(/*length=*/10);
+            bool transferSettled = false;
+            std::future<void> transferFuture;
+
+            if (mIsContext)
+            {
+                transferFuture = addRequestAndTransportCacheForContext(request);
+                mComm->barrier();
+                auto const status = transferFuture.wait_for(std::chrono::seconds(30));
+                EXPECT_EQ(status, std::future_status::ready);
+                transferSettled = status == std::future_status::ready;
+                if (transferSettled)
+                {
+                    EXPECT_ANY_THROW(transferFuture.get());
+                    EXPECT_FALSE(mCacheTransBufferManagers.front()->hasPoisonedBuffer());
+                }
+            }
+            else
+            {
+                constexpr std::uint8_t kRecvSentinel{0xA5};
+                auto const recvBuffer = mCacheTransBufferManagers.front()->getRecvBuffer(0);
+                EXPECT_NE(recvBuffer, nullptr);
+                if (recvBuffer != nullptr)
+                {
+                    TLLM_CUDA_CHECK(cudaMemset(recvBuffer->data(), kRecvSentinel, recvBuffer->getSizeInBytes()));
+                    TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+                }
+
+                mComm->barrier();
+                transferFuture = addRequestAndTransportCacheForGeneration(request);
+                auto const status = transferFuture.wait_for(std::chrono::seconds(30));
+                EXPECT_EQ(status, std::future_status::ready);
+                transferSettled = status == std::future_status::ready;
+                if (transferSettled && generationMode == texec::kv_cache::PeerCancellationMode::kEnabled)
+                {
+                    EXPECT_ANY_THROW(transferFuture.get());
+                }
+                else if (transferSettled)
+                {
+                    EXPECT_NO_THROW(transferFuture.get());
+                    EXPECT_EQ(request->mLlmRequest->getState(), LlmRequestState::kDISAGG_TRANS_ERROR);
+                }
+
+                if (transferSettled && recvBuffer != nullptr)
+                {
+                    std::vector<std::uint8_t> sentinelPrefix(std::min<std::size_t>(recvBuffer->getSizeInBytes(), 256));
+                    TLLM_CUDA_CHECK(cudaMemcpy(
+                        sentinelPrefix.data(), recvBuffer->data(), sentinelPrefix.size(), cudaMemcpyDeviceToHost));
+                    EXPECT_TRUE(std::all_of(sentinelPrefix.begin(), sentinelPrefix.end(),
+                        [](std::uint8_t const value) { return value == kRecvSentinel; }));
+                }
+
+                if (transferSettled)
+                {
+                    auto& recvManager = *mCacheTransBufferManagers.front();
+                    EXPECT_FALSE(recvManager.hasPoisonedBuffer());
+                    auto const reacquired = recvManager.assignBufferIndexForRecv();
+                    EXPECT_TRUE(reacquired.has_value());
+                    if (reacquired.has_value())
+                    {
+                        recvManager.freeBufferIndexForRecv(reacquired);
+                    }
+                }
+            }
+
+            if (transferSettled)
+            {
+                tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request->mLlmRequest);
+                mManager->removeSequence(request->mLlmRequest->mRequestId, request->mLlmRequest);
+            }
+            if (mIsContext)
+            {
+                mSender.reset();
+            }
+            else
+            {
+                mRequester.reset();
+            }
+            mComm->barrier();
+            mConnectionManager.reset();
+        }
+        tensorrt_llm::mpi::MpiComm::world().barrier();
+    }
+
     bool mIsContext{false};
     bool mIsGeneration{false};
     tensorrt_llm::mpi::MpiComm const* mComm;
@@ -1282,6 +1389,9 @@ protected:
     bool mGenerationDP{false};
     bool mIsMLA{false};
     bool mIsWindowAttention{false};
+    texec::kv_cache::PeerCancellationMode mContextPeerCancellationMode{
+        texec::kv_cache::PeerCancellationMode::kBaseline};
+    texec::kv_cache::PeerCancellationMode mGenPeerCancellationMode{texec::kv_cache::PeerCancellationMode::kBaseline};
     int mDupHeadFactor{1};
     std::vector<SizeType32> mAttentionLayerNumPerPP;
 
@@ -1296,6 +1406,22 @@ protected:
     std::unique_ptr<texec::kv_cache::ConnectionManager> mConnectionManager;
     std::mt19937 generator;
 };
+
+class PeerProtocolMismatchTest : public AsymmetricalCacheTest
+{
+};
+
+TEST_F(PeerProtocolMismatchTest, EnabledGenerationRejectsBaselineContextBeforeDma)
+{
+    runPeerProtocolMismatch(
+        texec::kv_cache::PeerCancellationMode::kBaseline, texec::kv_cache::PeerCancellationMode::kEnabled);
+}
+
+TEST_F(PeerProtocolMismatchTest, BaselineGenerationRejectsEnabledContextBeforeDma)
+{
+    runPeerProtocolMismatch(
+        texec::kv_cache::PeerCancellationMode::kEnabled, texec::kv_cache::PeerCancellationMode::kBaseline);
+}
 
 TEST_P(AsymmetricalCacheTest, TestCase)
 {

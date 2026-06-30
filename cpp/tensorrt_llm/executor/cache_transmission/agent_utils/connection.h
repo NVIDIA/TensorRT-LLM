@@ -36,6 +36,10 @@ namespace tensorrt_llm::executor::kv_cache
 // that share hostname (--network host) and PID namespace.
 std::string genUniqueAgentName();
 
+//! Bind request-advertised peer state to the live notification sender before trusting protocol metadata.
+void validateRequestPeerIdentity(batch_manager::RequestInfo const& requestInfo, std::string const& notificationAgent,
+    std::string const& notificationAddress);
+
 struct RequestAndBufferInfo
 {
     std::string mAgentName;
@@ -349,6 +353,7 @@ private:
     int mDeviceId;
     std::string mAgentName;
     MemoryDescs mRegMemDescs;
+    bool mPeerProtocolAware{false};
     std::atomic<bool> mIsRunning{true};
 };
 

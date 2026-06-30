@@ -56,10 +56,6 @@ public:
     CacheTransferLayer(CacheTransferLayer&&) noexcept;
     CacheTransferLayer& operator=(CacheTransferLayer&&) noexcept;
 
-    /// @brief Validates all cache types against the peer state. Throws on incompatibility.
-    /// @param peerState The peer's DataTransceiverState.
-    void validateSupport(executor::DataTransceiverState const& peerState) const;
-
     /// @brief Validates cache layout support independently of peer protocol negotiation.
     /// @param peerState The peer's DataTransceiverState.
     void validateCacheSupport(executor::DataTransceiverState const& peerState) const;

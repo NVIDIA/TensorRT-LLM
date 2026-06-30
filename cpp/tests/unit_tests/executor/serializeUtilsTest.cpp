@@ -752,6 +752,25 @@ TEST(SerializeUtilsTest, ContextPhaseParams)
         EXPECT_EQ(state2, stateCopy);
     }
 
+    // The opaque NIXL identity is the CTX-to-GEN protocol carrier and must survive ContextPhaseParams serialization.
+    {
+        auto const descriptor
+            = texec::kv_cache::makePeerProtocolDescriptor(/*inflightCancellationEnabled=*/true, 0x1234);
+        auto const agentName = texec::kv_cache::appendPeerProtocolDescriptor("agent", descriptor);
+        auto state = std::make_unique<texec::DataTransceiverState>();
+        state->setCommState(texec::kv_cache::CommState{{texec::kv_cache::AgentState{agentName, "127.0.0.1:1234"}}, 0});
+        auto contextPhaseParams = texec::ContextPhaseParams({10, 20}, 1, state.release(), VecTokens{10, 20});
+
+        auto serializedState = contextPhaseParams.getSerializedState();
+        auto const stateCopy = texec::Serialization::deserializeDataTransceiverState(serializedState);
+        ASSERT_TRUE(stateCopy.getCommState().has_value());
+        auto const& agentStates = stateCopy.getCommState()->getAgentState();
+        ASSERT_EQ(agentStates.size(), 1);
+        auto const parsed = texec::kv_cache::parsePeerProtocolDescriptor(agentStates.front().mAgentName);
+        ASSERT_EQ(parsed.status, texec::kv_cache::PeerProtocolParseStatus::kValid);
+        EXPECT_EQ(parsed.descriptor, descriptor);
+    }
+
     // Test with ctxDpRank and disaggInfoEndpoint
     {
         auto state = std::make_unique<texec::DataTransceiverState>();
@@ -1327,6 +1346,51 @@ T serializeDeserializeNotification(T const& val)
 
     std::istringstream iss(oss.str());
     return T::deserialize(iss);
+}
+
+tensorrt_llm::batch_manager::RequestInfo makeAgentRequestInfo(
+    std::vector<kv_cache::AgentState> agentStates, int const selfIdx)
+{
+    texec::DataTransceiverState state;
+    state.setCommState(kv_cache::CommState{std::move(agentStates), selfIdx});
+    return tensorrt_llm::batch_manager::RequestInfo{42, std::move(state)};
+}
+
+TEST(SerializeUtilsTest, PeerProtocolIdentitySurvivesRequestNotificationSerialization)
+{
+    auto const descriptor = kv_cache::makePeerProtocolDescriptor(/*inflightCancellationEnabled=*/true, 0x1234);
+    auto const agentName = kv_cache::appendPeerProtocolDescriptor("sender", descriptor);
+    std::string const address{"127.0.0.1:8080"};
+    auto const requestInfo
+        = makeAgentRequestInfo({kv_cache::AgentState{agentName, address}, kv_cache::AgentState{"peer", "address"}}, 0);
+    kv_cache::RequestAndBufferInfo original{agentName, address, requestInfo,
+        std::vector<kv_cache::MemoryDesc>{kv_cache::MemoryDesc{nullptr, 1024, 0}}, std::nullopt, 0, {0}};
+
+    auto const deserialized = serializeDeserializeNotification(original);
+    EXPECT_EQ(deserialized.mRequestInfo.getTransState(), requestInfo.getTransState());
+    EXPECT_NO_THROW(kv_cache::validateRequestPeerIdentity(deserialized.mRequestInfo, agentName, deserialized.mAddress));
+    auto const& roundTripName = deserialized.mRequestInfo.getTransState()
+                                    .getCommState()
+                                    ->getAgentState()
+                                    .at(deserialized.mRequestInfo.getTransState().getCommState()->getSelfIdx())
+                                    .mAgentName;
+    auto const parsed = kv_cache::parsePeerProtocolDescriptor(roundTripName);
+    ASSERT_EQ(parsed.status, kv_cache::PeerProtocolParseStatus::kValid);
+    EXPECT_EQ(parsed.descriptor, descriptor);
+}
+
+TEST(SerializeUtilsTest, RequestNotificationIdentityMustMatchAdvertisedSelf)
+{
+    std::string const agentName{"sender"};
+    std::string const address{"127.0.0.1:8080"};
+    auto const wrongName = makeAgentRequestInfo({kv_cache::AgentState{"other", address}}, 0);
+    EXPECT_ANY_THROW(kv_cache::validateRequestPeerIdentity(wrongName, agentName, address));
+
+    auto const wrongAddress = makeAgentRequestInfo({kv_cache::AgentState{agentName, "127.0.0.1:9090"}}, 0);
+    EXPECT_ANY_THROW(kv_cache::validateRequestPeerIdentity(wrongAddress, agentName, address));
+
+    auto const wrongSelfIndex = makeAgentRequestInfo({kv_cache::AgentState{agentName, address}}, 1);
+    EXPECT_ANY_THROW(kv_cache::validateRequestPeerIdentity(wrongSelfIndex, agentName, address));
 }
 
 TEST(SerializeUtilsTest, RequestAndBufferInfo)

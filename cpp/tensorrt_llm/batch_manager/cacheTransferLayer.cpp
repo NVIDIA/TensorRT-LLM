@@ -25,6 +25,7 @@
 #include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
 
 #include <algorithm>
+#include <string_view>
 
 namespace tensorrt_llm::batch_manager
 {
@@ -44,14 +45,6 @@ CacheTransferLayer::~CacheTransferLayer() = default;
 
 CacheTransferLayer::CacheTransferLayer(CacheTransferLayer&&) noexcept = default;
 CacheTransferLayer& CacheTransferLayer::operator=(CacheTransferLayer&&) noexcept = default;
-
-void CacheTransferLayer::validateSupport(executor::DataTransceiverState const& peerState) const
-{
-    validateCacheSupport(peerState);
-    auto const compatibility = getPeerProtocolCompatibility(peerState);
-    TLLM_CHECK_WITH_INFO(
-        compatibility.compatible, "Disaggregated cache-transfer protocol mismatch: %s", compatibility.reason.c_str());
-}
 
 void CacheTransferLayer::validateCacheSupport(executor::DataTransceiverState const& peerState) const
 {
@@ -88,15 +81,16 @@ executor::kv_cache::PeerProtocolCompatibility CacheTransferLayer::getPeerProtoco
 {
     if (!peerState.getCommState().has_value() || !peerState.getCommState()->isAgentState())
     {
-        return {true, false, false, "peer protocol negotiation is not applicable to this transport"};
+        return {
+            true, false, false, false, std::nullopt, "peer protocol negotiation is not applicable to this transport"};
     }
 
-    std::vector<std::string> peerAgentNames;
+    std::vector<std::string_view> peerAgentNames;
     auto const& peerAgentStates = peerState.getCommState()->getAgentState();
     peerAgentNames.reserve(peerAgentStates.size());
     for (auto const& peerAgentState : peerAgentStates)
     {
-        peerAgentNames.push_back(peerAgentState.mAgentName);
+        peerAgentNames.emplace_back(peerAgentState.mAgentName);
     }
     auto const localMode = mEnableInflightCancel ? executor::kv_cache::PeerCancellationMode::kEnabled
                                                  : executor::kv_cache::PeerCancellationMode::kBaseline;

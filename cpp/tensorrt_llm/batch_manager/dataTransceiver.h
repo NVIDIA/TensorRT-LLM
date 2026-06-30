@@ -16,9 +16,11 @@
  */
 
 #pragma once
+#include <cstdint>
 #include <fstream>
 #include <future>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -112,7 +114,7 @@ public:
 
     ~TransferSession()
     {
-        if (mEnableInflightCancel)
+        if (mEnableInflightCancel || mPeerProtocolRejected)
         {
             poisonRecvBufferHolders();
         }
@@ -172,6 +174,26 @@ public:
         return mEnableInflightCancel;
     }
 
+    void rejectPeerProtocol() noexcept
+    {
+        mPeerProtocolRejected = true;
+    }
+
+    [[nodiscard]] bool isPeerProtocolRejected() const noexcept
+    {
+        return mPeerProtocolRejected;
+    }
+
+    void setPeerProtocolVersion(std::optional<std::uint16_t> version) noexcept
+    {
+        mPeerProtocolVersion = version;
+    }
+
+    [[nodiscard]] std::optional<std::uint16_t> getPeerProtocolVersion() const noexcept
+    {
+        return mPeerProtocolVersion;
+    }
+
     /// Transfer ownership of preassigned receive-buffer slots to this session.
     /// Formatters borrow these slots and must not release them independently.
     void setRecvBufferHolders(std::vector<BufferIndexHolder> holders)
@@ -212,6 +234,8 @@ private:
     int32_t mIndexFromEnd{0};
     BlockKey mLastBlockKey{};
     bool mEnableInflightCancel{false};
+    bool mPeerProtocolRejected{false};
+    std::optional<std::uint16_t> mPeerProtocolVersion;
     std::vector<BufferIndexHolder> mRecvBufferHolders;
 };
 

@@ -304,6 +304,8 @@ TEST_P(BufferIndexHolderLifecycleTest, TransferSessionReleasesRecvSlotOnSuccess)
     std::vector<Connection const*> connections{nullptr};
     TransferSession session(std::move(connections), DataContext{0}, std::vector<SizeType32>{0}, selfState,
         std::move(otherState), bufferManager, 0, BlockKey{}, nullptr, false, false);
+    session.setPeerProtocolVersion(1);
+    EXPECT_EQ(session.getPeerProtocolVersion(), 1);
     std::vector<BufferIndexHolder> holders;
     holders.emplace_back(mgr(), idx, /*isRecv=*/true);
     session.setRecvBufferHolders(std::move(holders));
@@ -334,6 +336,62 @@ TEST_P(BufferIndexHolderLifecycleTest, ActiveTransferSessionPoisonsUnreleasedRec
     }
 
     EXPECT_TRUE(mgr().hasPoisonedBuffer());
+}
+
+TEST_P(BufferIndexHolderLifecycleTest, RejectedBaselineSessionPoisonsOnExceptionUnwind)
+{
+    if (!isRecv())
+    {
+        GTEST_SKIP() << "TransferSession owns receive slots only";
+    }
+    auto idx = acquire();
+    ASSERT_TRUE(idx.has_value());
+    try
+    {
+        executor::DataTransceiverState selfState;
+        executor::DataTransceiverState otherState;
+        runtime::BufferManager bufferManager{std::make_shared<runtime::CudaStream>()};
+        std::vector<Connection const*> connections{nullptr};
+        TransferSession session(std::move(connections), DataContext{0}, std::vector<SizeType32>{0}, selfState,
+            std::move(otherState), bufferManager, 0, BlockKey{}, nullptr, false, false);
+        session.rejectPeerProtocol();
+        std::vector<BufferIndexHolder> holders;
+        holders.emplace_back(mgr(), idx, /*isRecv=*/true);
+        session.setRecvBufferHolders(std::move(holders));
+        throw std::runtime_error("ready wait failed after advertisement");
+    }
+    catch (std::runtime_error const&)
+    {
+    }
+
+    EXPECT_TRUE(mgr().hasPoisonedBuffer());
+}
+
+TEST_P(BufferIndexHolderLifecycleTest, RejectedBaselineSessionReleasesAfterAllPeersReject)
+{
+    if (!isRecv())
+    {
+        GTEST_SKIP() << "TransferSession owns receive slots only";
+    }
+    int const before = inUse();
+    auto idx = acquire();
+    ASSERT_TRUE(idx.has_value());
+    {
+        executor::DataTransceiverState selfState;
+        executor::DataTransceiverState otherState;
+        runtime::BufferManager bufferManager{std::make_shared<runtime::CudaStream>()};
+        std::vector<Connection const*> connections{nullptr};
+        TransferSession session(std::move(connections), DataContext{0}, std::vector<SizeType32>{0}, selfState,
+            std::move(otherState), bufferManager, 0, BlockKey{}, nullptr, false, false);
+        session.rejectPeerProtocol();
+        std::vector<BufferIndexHolder> holders;
+        holders.emplace_back(mgr(), idx, /*isRecv=*/true);
+        session.setRecvBufferHolders(std::move(holders));
+        session.releaseRecvBufferHolders();
+    }
+
+    EXPECT_EQ(inUse(), before);
+    EXPECT_FALSE(mgr().hasPoisonedBuffer());
 }
 
 INSTANTIATE_TEST_SUITE_P(SideVariants, BufferIndexHolderLifecycleTest,
