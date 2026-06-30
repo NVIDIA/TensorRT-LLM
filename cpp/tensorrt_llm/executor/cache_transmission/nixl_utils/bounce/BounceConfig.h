@@ -41,6 +41,10 @@ struct BounceConfig
     std::size_t maxAvgDescBytes{16ULL << 10}; // TRTLLM_NIXL_BOUNCE_MAX_AVG (16 KiB)
     int leaseTimeoutMs{30000};                // TRTLLM_NIXL_BOUNCE_LEASE_TIMEOUT_MS
     bool forceFallback{false};                // TRTLLM_NIXL_BOUNCE_FORCE_FALLBACK (no fabric mem; CI)
+    // --- experimental gather/scatter copy backends (default OFF; benchmark before enabling) ---
+    bool cubCopy{false};      // TRTLLM_NIXL_BOUNCE_CUB_COPY: use cub::DeviceMemcpy::Batched vs the custom kernel
+    bool zeroCopyArgs{false}; // TRTLLM_NIXL_BOUNCE_ZEROCOPY_ARGS: kernel reads the [srcs|dsts|sizes] plan arrays
+                              // directly from pinned host (skip their H2D copy) — likely a loss for large n
 
     /// Effective per-flow window: explicit `window` if set, else `windowDepth` (per-flow region cap).
     [[nodiscard]] std::uint32_t effectiveWindow() const noexcept
@@ -107,6 +111,8 @@ struct BounceConfig
         cfg.leaseTimeoutMs = static_cast<int>(
             envU64("TRTLLM_NIXL_BOUNCE_LEASE_TIMEOUT_MS", static_cast<std::uint64_t>(cfg.leaseTimeoutMs)));
         cfg.forceFallback = envBool("TRTLLM_NIXL_BOUNCE_FORCE_FALLBACK", false);
+        cfg.cubCopy = envBool("TRTLLM_NIXL_BOUNCE_CUB_COPY", false);
+        cfg.zeroCopyArgs = envBool("TRTLLM_NIXL_BOUNCE_ZEROCOPY_ARGS", false);
         return cfg;
     }
 };

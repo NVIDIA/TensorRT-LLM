@@ -17,6 +17,8 @@
 
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/ExecPool.h"
 
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/GatherScatterKernel.h"
+
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
@@ -24,12 +26,19 @@
 namespace tensorrt_llm::executor::kv_cache::bounce
 {
 
-ExecPool::ExecPool(std::uint32_t count, std::size_t maxDescsPerChunk, int deviceId)
+ExecPool::ExecPool(std::uint32_t count, std::size_t maxDescsPerChunk, int deviceId, bool zeroCopyArgs, bool cubCopy)
     : mDeviceId(deviceId)
 {
     TLLM_CHECK_WITH_INFO(count > 0, "ExecPool: count must be > 0");
     TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
     std::size_t const scratchBytes = maxDescsPerChunk * (2 * sizeof(std::uint64_t) + sizeof(std::uint32_t));
+    // cub workspace size depends only on the buffer count -> size it once for the worst case (maxDescs);
+    // per-call we re-query for the actual n (<= maxDescs, so <= this) and validate it fits.
+    std::size_t cubTempBytes = 0;
+    if (cubCopy)
+    {
+        TLLM_CUDA_CHECK(batchedCopyCubTempBytes(static_cast<std::uint32_t>(maxDescsPerChunk), cubTempBytes));
+    }
     mCtxs.resize(count);
     for (std::uint32_t i = 0; i < count; ++i)
     {
@@ -37,7 +46,19 @@ ExecPool::ExecPool(std::uint32_t count, std::size_t maxDescsPerChunk, int device
         c.id = i;
         c.scratchBytes = scratchBytes;
         TLLM_CUDA_CHECK(cudaMalloc(&c.scratch, scratchBytes));
-        TLLM_CUDA_CHECK(cudaHostAlloc(&c.hostPinned, scratchBytes, cudaHostAllocDefault));
+        // zeroCopyArgs: map the pinned buffer into the device address space so the kernel can read the
+        // plan arrays in place (no H2D). cudaHostAllocMapped is otherwise a normal pinned buffer.
+        TLLM_CUDA_CHECK(
+            cudaHostAlloc(&c.hostPinned, scratchBytes, zeroCopyArgs ? cudaHostAllocMapped : cudaHostAllocDefault));
+        if (zeroCopyArgs)
+        {
+            TLLM_CUDA_CHECK(cudaHostGetDevicePointer(&c.hostPinnedDev, c.hostPinned, 0));
+        }
+        if (cubCopy && cubTempBytes > 0)
+        {
+            TLLM_CUDA_CHECK(cudaMalloc(&c.cubTemp, cubTempBytes));
+            c.cubTempBytes = cubTempBytes;
+        }
         TLLM_CUDA_CHECK(cudaStreamCreateWithFlags(&c.stream, cudaStreamNonBlocking));
         TLLM_CUDA_CHECK(cudaEventCreateWithFlags(&c.event, cudaEventDisableTiming));
         mFree.push_back(i);
@@ -56,8 +77,10 @@ ExecPool::~ExecPool()
     {
         if (c.scratch != nullptr)
             TLLM_CUDA_CHECK_WARN(cudaFree(c.scratch));
+        if (c.cubTemp != nullptr)
+            TLLM_CUDA_CHECK_WARN(cudaFree(c.cubTemp));
         if (c.hostPinned != nullptr)
-            TLLM_CUDA_CHECK_WARN(cudaFreeHost(c.hostPinned));
+            TLLM_CUDA_CHECK_WARN(cudaFreeHost(c.hostPinned)); // also frees its hostPinnedDev alias
         if (c.stream != nullptr)
             TLLM_CUDA_CHECK_WARN(cudaStreamDestroy(c.stream));
         if (c.event != nullptr)

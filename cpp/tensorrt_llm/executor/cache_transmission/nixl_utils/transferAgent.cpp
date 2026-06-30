@@ -183,7 +183,7 @@ void NixlTransferAgent::maybeInitBounce()
                 mName.c_str());
             return;
         }
-        st->exec = std::make_unique<bounce::ExecPool>(cfg.execCtxCount, maxDescs, dev);
+        st->exec = std::make_unique<bounce::ExecPool>(cfg.execCtxCount, maxDescs, dev, cfg.zeroCopyArgs, cfg.cubCopy);
         st->transport = std::make_unique<bounce::BounceTransport>(
             mName, cfg, dev, st->channel.get(), st->engine.get(), st->arena.get(), st->exec.get());
         mBounce = std::move(st);
