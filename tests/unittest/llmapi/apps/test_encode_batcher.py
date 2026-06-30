@@ -14,7 +14,7 @@
 """Unit tests for the encode dynamic batcher (tensorrt_llm/serve/encode_batcher.py).
 
 These tests exercise the pure-async coalescing logic with an injected, synchronous
-``encode_fn``. They do not require a GPU or any TensorRT-LLM runtime.
+`encode_fn`. They do not require a GPU or any TensorRT-LLM runtime.
 """
 
 import pytest

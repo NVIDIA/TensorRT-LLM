@@ -569,13 +569,13 @@ def _resolve_embedding_architecture_override(
         model: str,
         trust_remote_code: bool,
         revision: Optional[str] = None) -> Optional[dict]:
-    """Return a ``model_kwargs`` architecture override for a known embedder.
+    """Return a `model_kwargs` architecture override for a known embedder.
 
-    Returns ``None`` to leave the model's declared architecture unchanged.
-    Qwen3-Embedding ships as ``Qwen3ForCausalLM`` (a causal decoder) plus a
-    sentence-transformers pooling/normalize pipeline. Overriding ``architectures``
-    flips both the model-class selection (``get_model_architecture``) and the
-    encoder-vs-generation routing (``is_generation_model``) with one change.
+    Returns `None` to leave the model's declared architecture unchanged.
+    Qwen3-Embedding ships as `Qwen3ForCausalLM` (a causal decoder) plus a
+    sentence-transformers pooling/normalize pipeline. Overriding `architectures`
+    flips both the model-class selection (`get_model_architecture`) and the
+    encoder-vs-generation routing (`is_generation_model`) with one change.
     """
     try:
         from transformers import AutoConfig

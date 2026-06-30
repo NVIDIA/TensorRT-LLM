@@ -794,7 +794,7 @@ class OpenAIServer(_VideoRoutesMixin):
         """Create the encode dynamic batcher for the embedding server.
 
         The batcher coalesces concurrent /v1/embeddings requests into a single
-        ``llm.encode()`` call. ``encode()`` is synchronous; the batcher runs it in
+        `llm.encode()` call. `encode()` is synchronous; the batcher runs it in
         the default executor so the event loop stays responsive.
         """
 

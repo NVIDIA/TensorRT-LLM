@@ -13,10 +13,10 @@
 # limitations under the License.
 """Dynamic batcher for encoder-only (embedding) serving.
 
-Coalesces independent concurrent requests into a single batched ``encode_fn`` call,
+Coalesces independent concurrent requests into a single batched `encode_fn` call,
 mirroring NVIDIA Triton Inference Server's dynamic batcher: a configurable hold
-window (``max_queue_delay``) and a maximum batch size, with a token budget and queue
-backpressure. The actual model forward is injected as ``encode_fn`` so this module
+window (`max_queue_delay`) and a maximum batch size, with a token budget and queue
+backpressure. The actual model forward is injected as `encode_fn` so this module
 carries no TensorRT-LLM / torch dependencies and is unit-testable on CPU.
 """
 
@@ -44,20 +44,20 @@ class _QueuedRequest:
 
 
 class EncodeBatcher:
-    """Async micro-batcher in front of a synchronous ``encode_fn``.
+    """Async micro-batcher in front of a synchronous `encode_fn`.
 
     A single background worker drains a request queue and forms a batch, flushing
-    it to ``encode_fn`` when any of three triggers fires: the batch reaches
-    ``max_batch_size``; adding the next request would exceed ``max_num_tokens``; or
-    the ``max_queue_delay`` hold window elapses. Results are routed back to each
-    caller by input index. ``encode_fn`` runs in the default executor so the event
+    it to `encode_fn` when any of three triggers fires: the batch reaches
+    `max_batch_size`; adding the next request would exceed `max_num_tokens`; or
+    the `max_queue_delay` hold window elapses. Results are routed back to each
+    caller by input index. `encode_fn` runs in the default executor so the event
     loop is never blocked.
 
-    There is exactly one worker by design (no ``num_workers`` knob). It is both
+    There is exactly one worker by design (no `num_workers` knob). It is both
     sufficient and required: the GPU serializes forwards anyway, and the underlying
-    ``EncoderExecutor`` runs ``encode()`` on the calling thread over shared,
+    `EncoderExecutor` runs `encode()` on the calling thread over shared,
     pre-allocated CUDA buffers and a single CUDA-graph runner — concurrent calls
-    would race. Scale throughput via ``max_batch_size`` (bigger coalesced batches)
+    would race. Scale throughput via `max_batch_size` (bigger coalesced batches)
     or multiple single-GPU server instances, not more workers.
     """
 
@@ -85,10 +85,10 @@ class EncodeBatcher:
     def validate_input(self, token_ids: List[int]) -> None:
         """Validate a single input against the model's capacity.
 
-        Raises InputTooLongError (HTTP 400) if the input exceeds ``max_seq_len``
-        (the model's positional limit) or, on its own, exceeds ``max_num_tokens``
+        Raises InputTooLongError (HTTP 400) if the input exceeds `max_seq_len`
+        (the model's positional limit) or, on its own, exceeds `max_num_tokens`
         (the engine's per-batch token budget) — either of which would make
-        ``encode_fn`` reject the formed batch. Callers may invoke this before
+        `encode_fn` reject the formed batch. Callers may invoke this before
         submitting a group of inputs so an oversize item fails fast.
         """
         if self._max_seq_len is not None and len(token_ids) > self._max_seq_len:

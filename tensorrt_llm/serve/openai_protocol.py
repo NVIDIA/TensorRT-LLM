@@ -286,8 +286,8 @@ class EmbeddingResponseData(OpenAIBaseModel):
 class EmbeddingUsageInfo(OpenAIBaseModel):
     """Token usage for embeddings.
 
-    OpenAI's embeddings ``usage`` object contains only ``prompt_tokens`` and
-    ``total_tokens`` (no ``completion_tokens``), unlike chat/completions.
+    OpenAI's embeddings `usage` object contains only `prompt_tokens` and
+    `total_tokens` (no `completion_tokens`), unlike chat/completions.
     """
     prompt_tokens: int = Field(default=0,
                                description="Number of tokens in the input.")

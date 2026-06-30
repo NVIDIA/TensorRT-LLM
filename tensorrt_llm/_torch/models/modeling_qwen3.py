@@ -306,19 +306,18 @@ class Qwen3ForCausalLM(SpecDecOneEngineForCausalLM[Qwen3Model, Qwen3Config]):
 class Qwen3ForTextEmbedding(DecoderModelForCausalLM[Qwen3Model, Qwen3Config]):
     """Qwen3-Embedding family (0.6B / 4B / 8B).
 
-    The Qwen3 decoder backbone exposed as a sentence-embedding model: ``forward``
+    The Qwen3 decoder backbone exposed as a sentence-embedding model: `forward`
     returns the L2-normalized last-token hidden state (the sentence embedding)
     instead of vocabulary logits. This matches the model's sentence-transformers
     pipeline (Transformer -> Pooling[last-token] -> Normalize) and SGLang's
-    ``Pooler(PoolingType.LAST, normalize=True)``.
-
-    ``lm_head`` is intentionally not allocated: like ``Qwen2ForRewardModel`` we call
-    ``nn.Module.__init__`` directly instead of ``DecoderModelForCausalLM.__init__``,
-    which avoids a vocab x hidden parameter we never use and sidesteps tied-embedding
-    checkpoint handling (0.6B/4B tie word embeddings).
+    `Pooler(PoolingType.LAST, normalize=True)`.
     """
 
     def __init__(self, model_config: ModelConfig[Qwen3Config]):
+        # lm_head is intentionally not allocated: like Qwen2ForRewardModel we call
+        # nn.Module.__init__ directly instead of DecoderModelForCausalLM.__init__,
+        # which avoids a vocab x hidden parameter we never use and sidesteps
+        # tied-embedding checkpoint handling (0.6B/4B tie word embeddings).
         nn.Module.__init__(self)
         self.model_config = model_config
         self.model = Qwen3Model(model_config)
