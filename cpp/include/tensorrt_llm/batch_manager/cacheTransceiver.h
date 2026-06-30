@@ -273,10 +273,22 @@ public:
 
     virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) override;
 
+    [[nodiscard]] std::optional<SizeType32> getTransferChunkSizeBlocks() const noexcept
+    {
+        return mCacheState == nullptr ? std::nullopt : mCacheState->getTransferChunkSizeBlocks();
+    }
+
+    [[nodiscard]] bool isTransferEarlyReleaseEnabled() const noexcept
+    {
+        return mEnableTransferEarlyRelease;
+    }
+
 private:
     void initializeCommState();
 
     void setContextState(LlmRequest* llmRequest);
+
+    void endTransferLease(LlmRequest::RequestIdType requestId);
 
     std::unique_ptr<CacheSender> mCacheSender;
     std::unique_ptr<CacheReceiver> mCacheReceiver;
@@ -302,6 +314,10 @@ private:
     executor::kv_cache::CommState const* mCommState;
     std::unique_ptr<executor::kv_cache::CacheState> mCacheState;
     std::unique_ptr<executor::kv_cache::ConnectionManager> mManager;
+    // Non-owning; the executor's KV-cache manager outlives the transceiver.
+    kv_cache_manager::BaseKVCacheManager* mCacheManager{nullptr};
+    bool mEnableTransferEarlyRelease{false};
+    std::unordered_set<LlmRequest::RequestIdType> mActiveTransferLeaseIds;
     std::optional<executor::CacheTransceiverConfig> mCacheTransceiverConfig;
     std::vector<std::unique_ptr<kv_cache_manager::CacheTransBufferManager>> mCacheTransBufferManagers;
     std::vector<BaseTransBufferManager*> mCacheTransBufferManagerPtrs;

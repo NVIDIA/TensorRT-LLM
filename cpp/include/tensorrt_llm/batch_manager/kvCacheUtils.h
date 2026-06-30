@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,10 +19,76 @@
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
+#include <cstddef>
+#include <unordered_set>
+
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
 class BlockIterator;
+
+//! \brief Select the requested suffix from a single-window transfer lease while preserving allocation order.
+inline TransferBlockIds selectTransferLeaseTail(TransferBlockIds const& leasedBlockIds, int32_t indexFromEnd)
+{
+    TLLM_CHECK_WITH_INFO(
+        leasedBlockIds.size() == 1, "Transfer-lease tail selection currently requires exactly one cache window.");
+    TLLM_CHECK_WITH_INFO(indexFromEnd >= 0, "Requested KV-cache block index must be non-negative.");
+    auto const& [windowSize, orderedBlockIds] = *leasedBlockIds.begin();
+    auto const requestedBlockCount = static_cast<size_t>(indexFromEnd) + 1;
+    TLLM_CHECK_WITH_INFO(requestedBlockCount <= orderedBlockIds.size(),
+        "Requested %zu KV-cache blocks from a lease containing only %zu blocks.", requestedBlockCount,
+        orderedBlockIds.size());
+
+    TransferBlockIds requestedBlockIds;
+    requestedBlockIds.emplace(windowSize,
+        std::vector<KVCacheBlock::IdType>(
+            orderedBlockIds.end() - static_cast<std::ptrdiff_t>(requestedBlockCount), orderedBlockIds.end()));
+    return requestedBlockIds;
+}
+
+//! \brief Return lease-owned blocks that are absent from the selected transfer set, preserving lease order.
+inline TransferBlockIds getUntransferredLeaseBlockIds(
+    TransferBlockIds const& leasedBlockIds, TransferBlockIds const& selectedBlockIds)
+{
+    std::unordered_map<WindowSizeType, std::unordered_set<KVCacheBlock::IdType>> selectedBlockIdSets;
+    for (auto const& [windowSize, windowBlockIds] : selectedBlockIds)
+    {
+        auto const leaseWindowIt = leasedBlockIds.find(windowSize);
+        TLLM_CHECK_WITH_INFO(leaseWindowIt != leasedBlockIds.end(),
+            "Transferred KV-cache window %d is absent from the lease.", windowSize);
+        std::unordered_set<KVCacheBlock::IdType> const leaseWindowBlockIds(
+            leaseWindowIt->second.begin(), leaseWindowIt->second.end());
+        auto& selectedForWindow = selectedBlockIdSets[windowSize];
+        selectedForWindow.reserve(windowBlockIds.size());
+        for (auto const blockId : windowBlockIds)
+        {
+            TLLM_CHECK_WITH_INFO(leaseWindowBlockIds.find(blockId) != leaseWindowBlockIds.end(),
+                "Transferred KV-cache block %d in window %d is absent from the lease.", blockId, windowSize);
+            selectedForWindow.insert(blockId);
+        }
+    }
+
+    TransferBlockIds untransferredBlockIds;
+    for (auto const& [windowSize, windowBlockIds] : leasedBlockIds)
+    {
+        auto const selectedWindowIt = selectedBlockIdSets.find(windowSize);
+        auto& untransferredForWindow = untransferredBlockIds[windowSize];
+        untransferredForWindow.reserve(windowBlockIds.size());
+        for (auto const blockId : windowBlockIds)
+        {
+            if (selectedWindowIt == selectedBlockIdSets.end()
+                || selectedWindowIt->second.find(blockId) == selectedWindowIt->second.end())
+            {
+                untransferredForWindow.push_back(blockId);
+            }
+        }
+        if (untransferredForWindow.empty())
+        {
+            untransferredBlockIds.erase(windowSize);
+        }
+    }
+    return untransferredBlockIds;
+}
 
 class BlockRangeForWindow
 {
@@ -67,6 +133,12 @@ public:
     {
 
         return BlockRange(cacheManager, requestId);
+    }
+
+    static BlockRange fromBlockIds(
+        BaseKVCacheManager const& cacheManager, TransferBlockIds blockIds, LlmRequest::RequestIdType requestId)
+    {
+        return BlockRange(cacheManager, std::move(blockIds), requestId);
     }
 
     static BlockRange fromReuseTree(

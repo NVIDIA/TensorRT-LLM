@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -96,6 +96,21 @@ std::optional<int> BaseTransBufferManager::assignBufferIndexForRecv()
 void BaseTransBufferManager::freeBufferIndexForRecv(std::optional<int> bufferId)
 {
     freeBufferIndex(mConcurrenceRecvResource, bufferId, mRecvBufferCount, mOnlyUseDynamicBuffer);
+}
+
+void BaseTransBufferManager::abortRecvBufferAssignments()
+{
+    {
+        std::scoped_lock lk(mConcurrenceRecvResource.mBuffersMutex);
+        mConcurrenceRecvResource.mAssignmentsAborted = true;
+    }
+    mConcurrenceRecvResource.mBuffersCV.notify_all();
+}
+
+bool BaseTransBufferManager::areRecvBufferAssignmentsAborted()
+{
+    std::scoped_lock lk(mConcurrenceRecvResource.mBuffersMutex);
+    return mConcurrenceRecvResource.mAssignmentsAborted;
 }
 
 std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> BaseTransBufferManager::getOrAllocateSendBuffers(
@@ -257,8 +272,11 @@ std::optional<int> BaseTransBufferManager::assignBufferIndex(
         return std::nullopt;
     }
     std::unique_lock lk(resource.mBuffersMutex);
-    resource.mBuffersCV.wait(
-        lk, [&resource, bufferCount]() { return static_cast<size_t>(resource.mConcurrence) < bufferCount; });
+    resource.mBuffersCV.wait(lk,
+        [&resource, bufferCount]()
+        { return resource.mAssignmentsAborted || static_cast<size_t>(resource.mConcurrence) < bufferCount; });
+    TLLM_CHECK_WITH_INFO(!resource.mAssignmentsAborted,
+        "KV-cache receive-buffer assignments were aborted after a published buffer was quarantined.");
     int bufferId = -1;
     for (size_t i = 0; i < bufferCount; i++)
     {

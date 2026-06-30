@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -503,7 +503,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
         {
             auto bufferKind = transferIndexerKCache ? static_cast<uint8_t>(BufferKind::kKV_INDEXER)
                                                     : static_cast<uint8_t>(BufferKind::kKV);
-            auto preAssignedId = connections[pickUpConnections[0]]->getPreAssignedBufferId(bufferKind);
+            auto preAssignedId = session.getPreAssignedBufferId(bufferKind);
             if (preAssignedId.has_value())
             {
                 cacheBufferId = static_cast<int>(*preAssignedId);

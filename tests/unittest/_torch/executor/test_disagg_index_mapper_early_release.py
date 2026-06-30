@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,11 +19,16 @@ the transfer phase, preventing exhaustion when transfers are slow and multiple
 iterations of requests accumulate in-flight.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor.py_executor import AsyncTransferManager, PyExecutor
+from tensorrt_llm._torch.pyexecutor.py_executor import (
+    AsyncTransferManager,
+    PyExecutor,
+    _resolve_active_kv_cache_transfer_config,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.bindings import LlmRequestState
 
@@ -76,6 +81,7 @@ class _FakeExecutor:
         self.kv_connector_manager = None
         self.disable_overlap_scheduler = True
         self.previous_batch = None
+        self._terminate_request = MagicMock()
 
     def _check_disagg_ctx_cache_transfer_status(self, _):
         return None
@@ -86,9 +92,11 @@ class TestSendKvAsyncReleasesIndexSlot:
     transfer is started, which is where the production code actually lives
     (see py_executor._send_kv_async)."""
 
-    def _build(self, kv_cache_manager):
+    def _build(self, kv_cache_manager, *, use_cpp_transfer_lease: bool = False):
         resource_manager = create_mock_resource_manager(kv_cache_manager=kv_cache_manager)
-        transfer_manager = AsyncTransferManager(resource_manager)
+        transfer_manager = AsyncTransferManager(
+            resource_manager, use_cpp_transfer_lease=use_cpp_transfer_lease
+        )
         transceiver = MagicMock()
         transceiver.kv_transfer_timeout_ms = None
         return _FakeExecutor(kv_cache_manager, transfer_manager, transceiver), transfer_manager
@@ -135,6 +143,101 @@ class TestSendKvAsyncReleasesIndexSlot:
         PyExecutor._send_kv_async(executor, [request])
 
         kv_cache_manager.release_index_slot.assert_called_once_with(42)
+
+    def test_send_start_failure_rolls_back_transfer_tracking(self):
+        kv_cache_manager = MagicMock()
+        kv_cache_manager.store_blocks_for_reuse.return_value = 100
+
+        executor, transfer_manager = self._build(kv_cache_manager)
+        executor.kv_cache_transceiver.respond_and_send_async.side_effect = RuntimeError(
+            "send startup failed"
+        )
+        request = create_mock_request(42)
+
+        with pytest.raises(RuntimeError, match="send startup failed"):
+            PyExecutor._send_kv_async(executor, [request])
+
+        assert transfer_manager.requests_in_transfer() == {}
+        assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
+        kv_cache_manager.unpin_blocks_by_id.assert_called_once_with(100)
+        executor._terminate_request.assert_called_once_with(request)
+
+    def test_send_start_failure_rolls_back_cpp_lease_tracking(self):
+        kv_cache_manager = MagicMock()
+
+        executor, transfer_manager = self._build(kv_cache_manager, use_cpp_transfer_lease=True)
+        executor.kv_cache_transceiver.respond_and_send_async.side_effect = RuntimeError(
+            "send startup failed"
+        )
+        request = create_mock_request(42)
+
+        with pytest.raises(RuntimeError, match="send startup failed"):
+            PyExecutor._send_kv_async(executor, [request])
+
+        assert transfer_manager.requests_in_transfer() == {}
+        assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
+        kv_cache_manager.store_blocks_for_reuse.assert_not_called()
+        kv_cache_manager.unpin_blocks_by_id.assert_not_called()
+        executor._terminate_request.assert_called_once_with(request)
+
+
+def test_shutdown_stops_cpp_transceiver_before_resource_managers(monkeypatch):
+    events = []
+    transceiver = MagicMock()
+    transceiver.supports_cpp_chunked_transfer = True
+    transceiver.shutdown.side_effect = lambda: events.append("transceiver")
+    resource_manager = MagicMock()
+    resource_manager.shutdown.side_effect = lambda: events.append("manager")
+
+    executor = SimpleNamespace(
+        executor_request_queue=MagicMock(),
+        shutdown_event=MagicMock(),
+        hang_detector=MagicMock(),
+        worker_thread=MagicMock(),
+        worker_started=True,
+        dist=SimpleNamespace(pp_size=1),
+        model_engine=MagicMock(),
+        draft_model_engine=None,
+        kv_cache_transceiver=transceiver,
+        resource_manager=SimpleNamespace(resource_managers={"kv_cache": resource_manager}),
+        virtual_memory_pools=None,
+        sampler=object(),
+        dwdp_manager=None,
+    )
+    executor.hang_detector.detected.return_value = False
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.is_available", lambda: False
+    )
+
+    PyExecutor.shutdown(executor)
+
+    assert events == ["transceiver", "manager"]
+    assert executor.kv_cache_transceiver is None
+
+
+def test_request_validation_rejects_chunked_beam_search():
+    executor = SimpleNamespace(
+        kv_cache_transfer_chunk_size_blocks=4,
+        max_beam_width=4,
+        _validate_token_id_range=MagicMock(),
+        sampler=MagicMock(),
+    )
+    request = SimpleNamespace(sampling_config=SimpleNamespace(beam_width=4))
+
+    with pytest.raises(ValueError, match="only beam width 1"):
+        PyExecutor._validate_request(executor, request)
+
+    executor._validate_token_id_range.assert_not_called()
+    executor.sampler.validate_request.assert_not_called()
+
+
+def test_active_cpp_transfer_config_is_source_of_truth():
+    transceiver = SimpleNamespace(transfer_chunk_size_blocks=4, transfer_early_release_enabled=True)
+
+    assert _resolve_active_kv_cache_transfer_config(4, True, transceiver) == (4, True)
+
+    with pytest.raises(RuntimeError, match="environment changed"):
+        _resolve_active_kv_cache_transfer_config(None, False, transceiver)
 
 
 class TestIndexMapperSlotReuse:

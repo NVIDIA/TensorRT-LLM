@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from abc import ABC, abstractmethod
 from os import getenv
 from typing import Any, Dict, List, Optional
@@ -19,6 +34,34 @@ AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 CacheTransBufferManagerCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransBufferManager
 BackendTypeCpp = tensorrt_llm.bindings.executor.CacheTransceiverBackendType
 
+KV_CACHE_TRANSFER_CHUNK_SIZE_BLOCKS_ENV_VAR_NAME = \
+    "TRTLLM_KVCACHE_TRANSFER_CHUNK_SIZE_BLOCKS"
+KV_CACHE_TRANSFER_EARLY_RELEASE_ENV_VAR_NAME = \
+    "TRTLLM_KVCACHE_TRANSFER_EARLY_RELEASE"
+
+
+def get_kv_cache_transfer_chunk_size_blocks() -> Optional[int]:
+    value = getenv(KV_CACHE_TRANSFER_CHUNK_SIZE_BLOCKS_ENV_VAR_NAME)
+    if value is None:
+        return None
+
+    if not value or not value.isascii() or not value.isdigit():
+        raise ValueError(
+            f"{KV_CACHE_TRANSFER_CHUNK_SIZE_BLOCKS_ENV_VAR_NAME} must be a "
+            f"non-negative decimal integer, got {value!r}.")
+
+    try:
+        chunk_size_blocks = int(value)
+    except ValueError as error:
+        raise ValueError(
+            f"{KV_CACHE_TRANSFER_CHUNK_SIZE_BLOCKS_ENV_VAR_NAME} must be a "
+            f"non-negative decimal integer, got {value!r}.") from error
+    if chunk_size_blocks > 2**31 - 1:
+        raise ValueError(
+            f"{KV_CACHE_TRANSFER_CHUNK_SIZE_BLOCKS_ENV_VAR_NAME} exceeds "
+            f"the supported maximum ({2**31 - 1}), got {value!r}.")
+    return chunk_size_blocks or None
+
 
 def mapping_to_world_config(mapping: Mapping) -> WorldConfig:
 
@@ -38,9 +81,26 @@ def create_kv_cache_transceiver(
         attention_type: AttentionTypeCpp,
         cache_transceiver_config: CacheTransceiverConfig,
         mamba_cache_manager: Optional[BaseMambaCacheManager] = None):
+    chunk_size_blocks = get_kv_cache_transfer_chunk_size_blocks()
+    early_release = getenv(KV_CACHE_TRANSFER_EARLY_RELEASE_ENV_VAR_NAME) == "1"
+    if early_release and chunk_size_blocks is None:
+        raise ValueError(
+            f"{KV_CACHE_TRANSFER_EARLY_RELEASE_ENV_VAR_NAME}=1 requires a "
+            f"positive {KV_CACHE_TRANSFER_CHUNK_SIZE_BLOCKS_ENV_VAR_NAME}.")
     if cache_transceiver_config is None or cache_transceiver_config.backend is None:
+        if chunk_size_blocks is not None or early_release:
+            raise ValueError(
+                "Chunked KV-cache transfer requires an enabled C++ KV cache "
+                "transceiver.")
         logger.info("cache_transceiver is disabled")
         return None
+
+    if (cache_transceiver_config.transceiver_runtime == "PYTHON"
+            and (chunk_size_blocks is not None or early_release)):
+        raise NotImplementedError(
+            "Chunked KV-cache transfer and early release are supported only "
+            "by the C++ KV cache transceiver; set "
+            "cache_transceiver_config.transceiver_runtime='CPP'.")
 
     if cache_transceiver_config.backend == "DEFAULT":
         # When cache_transceiver_config.backend is not set, fallback to env_vars settings
@@ -94,6 +154,21 @@ def create_kv_cache_transceiver(
 
 
 class KvCacheTransceiver(ABC):
+
+    @property
+    def supports_cpp_chunked_transfer(self) -> bool:
+        """Whether this implementation uses the env-gated C++ chunk protocol."""
+        return False
+
+    @property
+    def transfer_chunk_size_blocks(self) -> Optional[int]:
+        """Chunk size actually selected by the transceiver implementation."""
+        return None
+
+    @property
+    def transfer_early_release_enabled(self) -> bool:
+        """Whether this transceiver actually owns exact early-release leases."""
+        return False
 
     @abstractmethod
     def respond_and_send_async(self, req: LlmRequest):
@@ -149,6 +224,18 @@ class KvCacheTransceiver(ABC):
 
 
 class BindKvCacheTransceiver(KvCacheTransceiver):
+
+    @property
+    def supports_cpp_chunked_transfer(self) -> bool:
+        return True
+
+    @property
+    def transfer_chunk_size_blocks(self) -> Optional[int]:
+        return self.impl.transfer_chunk_size_blocks
+
+    @property
+    def transfer_early_release_enabled(self) -> bool:
+        return self.impl.transfer_early_release_enabled
 
     def __init__(self,
                  mapping: Mapping,
@@ -227,6 +314,13 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
 
     def cancel_request(self, req: LlmRequest):
         return self.impl.cancel_request(req)
+
+    def shutdown(self):
+        # Destroy the C++ transceiver while the KV-cache manager and its pools
+        # are still alive. Its destructor joins workers and closes any active
+        # transfer leases.
+        if self.impl is not None:
+            self.impl = None
 
     def prepare_context_requests(self, requests: List[LlmRequest]):
         # not implemented, an empty placeholder to allow being invoked unconditionally

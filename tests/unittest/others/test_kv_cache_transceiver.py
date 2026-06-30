@@ -1,8 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import gc
 import sys
 import time
+import types
 import uuid
 import weakref
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -11,8 +28,12 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._torch.distributed import Distributed
-from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import \
-    create_kv_cache_transceiver
+from tensorrt_llm._torch.pyexecutor import \
+    kv_cache_transceiver as transceiver_module
+from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import (
+    KV_CACHE_TRANSFER_CHUNK_SIZE_BLOCKS_ENV_VAR_NAME,
+    KV_CACHE_TRANSFER_EARLY_RELEASE_ENV_VAR_NAME, BindKvCacheTransceiver,
+    create_kv_cache_transceiver)
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
                                                         LlmRequestState)
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
@@ -30,6 +51,90 @@ DEFAULT_KV_TRANSFER_TIMEOUT_S = (
     CacheTransceiverConfig.model_fields["kv_transfer_timeout_ms"].default /
     1000.0)
 KV_TRANSFER_COMPLETION_MARGIN_S = 10.0
+
+
+def install_transport_constructor_guards(monkeypatch):
+    cpp_constructor = MagicMock(name="BindKvCacheTransceiver")
+    python_constructor = MagicMock(name="KvCacheTransceiverV2")
+    python_transceiver_module = types.ModuleType(
+        "tensorrt_llm._torch.disaggregation.transceiver")
+    python_transceiver_module.KvCacheTransceiverV2 = python_constructor
+
+    monkeypatch.setattr(transceiver_module, "BindKvCacheTransceiver",
+                        cpp_constructor)
+    monkeypatch.setitem(sys.modules,
+                        "tensorrt_llm._torch.disaggregation.transceiver",
+                        python_transceiver_module)
+    return cpp_constructor, python_constructor
+
+
+def create_transceiver_with_mock_dependencies(cache_transceiver_config):
+    return create_kv_cache_transceiver(
+        MagicMock(name="mapping"),
+        MagicMock(name="dist"),
+        MagicMock(name="kv_cache_manager"),
+        MagicMock(name="attention_type"),
+        cache_transceiver_config,
+    )
+
+
+def test_bind_transceiver_reports_active_cpp_transfer_config():
+    transceiver = BindKvCacheTransceiver.__new__(BindKvCacheTransceiver)
+    transceiver.impl = types.SimpleNamespace(
+        transfer_chunk_size_blocks=4,
+        transfer_early_release_enabled=True,
+    )
+
+    assert transceiver.transfer_chunk_size_blocks == 4
+    assert transceiver.transfer_early_release_enabled is True
+
+
+def test_early_release_without_chunking_fails_before_transport_construction(
+        monkeypatch):
+    monkeypatch.delenv(KV_CACHE_TRANSFER_CHUNK_SIZE_BLOCKS_ENV_VAR_NAME,
+                       raising=False)
+    monkeypatch.setenv(KV_CACHE_TRANSFER_EARLY_RELEASE_ENV_VAR_NAME, "1")
+    cpp_constructor, python_constructor = install_transport_constructor_guards(
+        monkeypatch)
+
+    with pytest.raises(ValueError, match="requires a positive"):
+        create_transceiver_with_mock_dependencies(
+            CacheTransceiverConfig(backend="NIXL"))
+
+    cpp_constructor.assert_not_called()
+    python_constructor.assert_not_called()
+
+
+def test_chunking_with_disabled_transceiver_fails_before_transport_construction(
+        monkeypatch):
+    monkeypatch.setenv(KV_CACHE_TRANSFER_CHUNK_SIZE_BLOCKS_ENV_VAR_NAME, "4")
+    monkeypatch.setenv(KV_CACHE_TRANSFER_EARLY_RELEASE_ENV_VAR_NAME, "1")
+    cpp_constructor, python_constructor = install_transport_constructor_guards(
+        monkeypatch)
+
+    with pytest.raises(ValueError, match=r"requires an enabled C\+\+ KV cache"):
+        create_transceiver_with_mock_dependencies(None)
+
+    cpp_constructor.assert_not_called()
+    python_constructor.assert_not_called()
+
+
+def test_chunking_with_python_runtime_fails_before_transport_construction(
+        monkeypatch):
+    monkeypatch.setenv(KV_CACHE_TRANSFER_CHUNK_SIZE_BLOCKS_ENV_VAR_NAME, "4")
+    monkeypatch.delenv(KV_CACHE_TRANSFER_EARLY_RELEASE_ENV_VAR_NAME,
+                       raising=False)
+    cpp_constructor, python_constructor = install_transport_constructor_guards(
+        monkeypatch)
+
+    with pytest.raises(NotImplementedError,
+                       match=r"supported only by the C\+\+"):
+        create_transceiver_with_mock_dependencies(
+            CacheTransceiverConfig(backend="NIXL",
+                                   transceiver_runtime="PYTHON"))
+
+    cpp_constructor.assert_not_called()
+    python_constructor.assert_not_called()
 
 
 def create_kv_cache_manager(mapping, dtype):

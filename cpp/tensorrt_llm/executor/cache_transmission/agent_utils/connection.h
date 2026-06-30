@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,6 +25,8 @@
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 #include <map>
+#include <mutex>
+#include <unordered_map>
 
 namespace tensorrt_llm::executor::kv_cache
 {
@@ -255,21 +257,24 @@ class AgentConnectionManager;
 class AgentConnection : public Connection
 {
 public:
+    using RequestIdType = batch_manager::LlmRequest::RequestIdType;
+
     AgentConnection(
         std::string mAgentName, std::string mRemoteAgentName, AgentConnectionManager* mAgentConnectionManager);
     void send(DataContext const& ctx, void const* data, size_t size) const override;
     void recv(DataContext const& ctx, void* data, size_t size) const override;
     void sendRequestAndBufferInfo(batch_manager::RequestInfo& requestInfo,
         std::vector<std::optional<size_t>> const& cacheBufferIds, int validConnectionIdx);
-    void setSenderState(std::vector<MemoryDesc> cacheReceiverBufferDescs, int valideSegmentIdx,
+    void setSenderState(RequestIdType requestId, std::vector<MemoryDesc> cacheReceiverBufferDescs, int validSegmentIdx,
         std::vector<std::pair<size_t, size_t>> offsetRatios, std::vector<uint8_t> bufferKinds);
+    void activateRequestSenderState(RequestIdType requestId) const;
+    void eraseRequestSenderState(RequestIdType requestId) const;
     void setHasLoadRemoteAgent(bool hasLoadRemoteAgent);
     [[nodiscard]] bool hasLoadRemoteAgent() const;
     void sendReadySignal(DataContext const& ctx, bool isReady) const;
     bool recvReadySignal(DataContext const& ctx) const;
 
     void activateBuffer(uint8_t kind) const override;
-    [[nodiscard]] std::optional<size_t> getPreAssignedBufferId(uint8_t kind) const override;
 
 private:
     std::string mAgentName;
@@ -281,6 +286,7 @@ private:
         int validSegmentIdx{0};
         /// Per-buffer offset ratios. Index corresponds to mCacheReceiverBufferDescs / mActiveBufferIdx.
         std::vector<std::pair<size_t, size_t>> mOffsetRatios;
+        std::vector<uint8_t> mBufferKinds;
         mutable size_t mActiveBufferIdx{0};
         [[nodiscard]] MemoryDesc const& activeBufferDesc() const;
         [[nodiscard]] std::pair<size_t, size_t> const& activeOffsetRatio() const;
@@ -291,9 +297,10 @@ private:
     AgentConnectionManager* mAgentConnectionManager;
 
     std::vector<batch_manager::BaseTransBufferManager*> const& mCacheTransBufferManagers;
-    std::vector<std::optional<size_t>> mCacheBufferIds;
-    std::vector<uint8_t> mBufferKinds;
-    mutable SenderState mSenderState;
+    mutable std::unordered_map<RequestIdType, SenderState> mSenderStates;
+    mutable std::optional<RequestIdType> mActiveSenderRequestId;
+    mutable std::mutex mSenderStateMutex;
+    std::mutex mRequestInfoMutex;
     bool mNeedSendMetadata{true};
     bool mHasLoadRemoteAgent{false};
 };

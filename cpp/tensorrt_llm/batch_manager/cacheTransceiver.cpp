@@ -294,10 +294,56 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     executor::kv_cache::CacheState::AttentionType attentionType,
     std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig,
     rnn_state_manager::RnnStateManager* rnnStateManager, std::vector<SizeType32> const& rnnLayerNumPerPP)
-    : mCacheTransceiverConfig{cacheTransceiverConfig}
+    : mCacheManager{cacheManager}
+    , mEnableTransferEarlyRelease{common::getEnvKVCacheTransferEarlyRelease()}
+    , mCacheTransceiverConfig{cacheTransceiverConfig}
     , mRnnStateManager{rnnStateManager}
 {
     using tensorrt_llm::batch_manager::kv_cache_manager::CacheFormatter;
+    TLLM_CHECK_WITH_INFO(mCacheManager != nullptr, "CacheTransceiver requires a KV-cache manager.");
+
+    auto const transferChunkSizeBlocks = common::getEnvKVCacheTransferChunkSizeBlocks();
+    TLLM_CHECK_WITH_INFO(!mEnableTransferEarlyRelease || transferChunkSizeBlocks.has_value(),
+        "TRTLLM_KVCACHE_TRANSFER_EARLY_RELEASE requires TRTLLM_KVCACHE_TRANSFER_CHUNK_SIZE_BLOCKS to be set to a "
+        "positive value.");
+    if (transferChunkSizeBlocks.has_value())
+    {
+        auto const& blockManager = mCacheManager->getBlockManager();
+        TLLM_CHECK_WITH_INFO(attentionType != executor::kv_cache::CacheState::AttentionType::kMLA,
+            "Chunked KV-cache transfer does not support MLA cache layouts.");
+        TLLM_CHECK_WITH_INFO(
+            !mCacheManager->isEnableIndexerKCache(), "Chunked KV-cache transfer does not support indexer K-cache.");
+        TLLM_CHECK_WITH_INFO(blockManager.getWindowSizesMetadata().size() == 1,
+            "Chunked KV-cache transfer currently requires exactly one KV-cache window.");
+        TLLM_CHECK_WITH_INFO(blockManager.getNumPools(
+                                 /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false)
+                == 1,
+            "Chunked KV-cache transfer currently requires exactly one primary KV-cache pool.");
+        TLLM_CHECK_WITH_INFO(!blockManager.getWindowSizesMetadata().begin()->second.isSWA,
+            "Chunked KV-cache transfer does not yet support sliding-window cache layouts.");
+        TLLM_CHECK_WITH_INFO(worldConfig.getContextParallelism() == 1,
+            "Chunked KV-cache transfer does not support context parallelism.");
+        TLLM_CHECK_WITH_INFO(!common::getEnvDisaggLayerwise(),
+            "Chunked KV-cache transfer does not support layer-wise disaggregated serving.");
+        TLLM_CHECK_WITH_INFO(!common::getEnvTryZCopyForKVCacheTransfer(),
+            "Chunked KV-cache transfer does not support zero-copy KV-cache transfer.");
+        TLLM_CHECK_WITH_INFO(rnnStateManager == nullptr && rnnLayerNumPerPP.empty()
+                && !blockManager.getLinearAttentionMetadata().has_value(),
+            "Chunked KV-cache transfer does not support RNN, linear-attention, or hybrid cache state.");
+
+        if (mEnableTransferEarlyRelease)
+        {
+            TLLM_CHECK_WITH_INFO(mCacheManager->supportsTransferLeases(),
+                "Early KV-cache release requires a KV-cache manager with exact transfer-lease support.");
+            TLLM_CHECK_WITH_INFO(!blockManager.hasKVCacheConnector(),
+                "Early KV-cache release cannot be combined with a KV-cache connector until all consumers share "
+                "per-chunk transfer leases.");
+            TLLM_CHECK_WITH_INFO(worldConfig.getTensorParallelism() == 1 && worldConfig.getPipelineParallelism() == 1
+                    && worldConfig.getContextParallelism() == 1,
+                "Early KV-cache release currently requires TP=PP=CP=1.");
+        }
+    }
+
     if (useMPI())
     {
         mGroupComm = std::make_shared<CacheTransceiverComm>(std::addressof(tensorrt_llm::mpi::MpiComm::session()));
@@ -329,6 +375,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
             dataType, attentionType, kvFactor, cacheManager->isEnableBlockReuse(), cacheManager->isEnablePartialReuse(),
             cacheManager->isEnableIndexerKCache(), cacheManager->getIndexerKCacheIndexHeadDim(),
             cacheManager->getIndexerKCacheQuantBlockSize(), cacheManager->getIndexerKCacheUseFp4());
+    mCacheState->setTransferChunkSizeBlocks(transferChunkSizeBlocks);
 
     if (mCacheState->getParallelConfig().mEnableAttentionDP)
     {
@@ -443,85 +490,105 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         mCacheTransBufferManagerPtrs.push_back(mRnnCacheTransBufferManager.get());
     }
 
-    if (backendType.value() == executor::CacheTransceiverConfig::BackendType::UCX)
+    try
     {
-        std::lock_guard<std::mutex> lock(mDllMutex);
-        mWrapperLibHandle = dllOpen(UCX_WRAPPER_LIB_NAME);
-        TLLM_CHECK_WITH_INFO(
-            mWrapperLibHandle != nullptr, "UCX wrapper library is not open correctly. error : %s", dlerror());
-        auto load_sym = [](void* handle, char const* name)
+        if (backendType.value() == executor::CacheTransceiverConfig::BackendType::UCX)
         {
-            void* ret = dllGetSym(handle, name);
-            TLLM_CHECK_WITH_INFO(ret != nullptr,
-                "Unable to load UCX wrapper library symbol, possible cause is that TensorRT LLM library is not "
-                "built with UCX support, please rebuild in UCX-enabled environment.");
-            return ret;
+            std::lock_guard<std::mutex> lock(mDllMutex);
+            mWrapperLibHandle = dllOpen(UCX_WRAPPER_LIB_NAME);
+            TLLM_CHECK_WITH_INFO(
+                mWrapperLibHandle != nullptr, "UCX wrapper library is not open correctly. error : %s", dlerror());
+            auto load_sym = [](void* handle, char const* name)
+            {
+                void* ret = dllGetSym(handle, name);
+                TLLM_CHECK_WITH_INFO(ret != nullptr,
+                    "Unable to load UCX wrapper library symbol, possible cause is that TensorRT LLM library is not "
+                    "built with UCX support, please rebuild in UCX-enabled environment.");
+                return ret;
+            };
+            std::unique_ptr<tensorrt_llm::executor::kv_cache::ConnectionManager> (*makeUcxConnectionManager)();
+            *(void**) (&makeUcxConnectionManager) = load_sym(mWrapperLibHandle, "makeUcxConnectionManager");
+            mManager = makeUcxConnectionManager();
+            TLLM_LOG_INFO("UCX Connection Manager created");
+        }
+        else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::NIXL)
+        {
+            auto rnnState
+                = mCacheState->hasRnnConfig() ? std::make_optional(mCacheState->getRnnCacheState()) : std::nullopt;
+            mManager = std::make_unique<tensorrt_llm::executor::kv_cache::AgentConnectionManager>(
+                mCacheTransBufferManagerPtrs, *mCacheState, "nixl", rnnState);
+            TLLM_LOG_INFO("NIXL Connection Manager created");
+        }
+        else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::MOONCAKE)
+        {
+            auto rnnState
+                = mCacheState->hasRnnConfig() ? std::make_optional(mCacheState->getRnnCacheState()) : std::nullopt;
+            mManager = std::make_unique<tensorrt_llm::executor::kv_cache::AgentConnectionManager>(
+                mCacheTransBufferManagerPtrs, *mCacheState, "mooncake", rnnState);
+            TLLM_LOG_INFO("MOONCAKE Connection Manager created");
+        }
+        else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::MPI)
+        {
+            mMpiWorldComm = std::addressof(tensorrt_llm::mpi::MpiComm::world());
+            mManager = std::make_unique<executor::kv_cache::MpiConnectionManager>(mMpiWorldComm);
+            TLLM_LOG_INFO("MPI Connection Manager created");
+        }
+        else
+        {
+            TLLM_THROW("Unsupported cache transceiver backend type ");
+        }
+
+        auto makeFormatter = [cacheManager, isMLA, this]()
+        {
+            std::vector<kv_cache_manager::CacheTransBufferManager*> kvBufferPtrs;
+            kvBufferPtrs.reserve(mCacheTransBufferManagers.size());
+            for (auto& mgr : mCacheTransBufferManagers)
+            {
+                kvBufferPtrs.push_back(mgr.get());
+            }
+            return createCacheFormatter(cacheManager, kvBufferPtrs, isMLA);
         };
-        std::unique_ptr<tensorrt_llm::executor::kv_cache::ConnectionManager> (*makeUcxConnectionManager)();
-        *(void**) (&makeUcxConnectionManager) = load_sym(mWrapperLibHandle, "makeUcxConnectionManager");
-        mManager = makeUcxConnectionManager();
-        TLLM_LOG_INFO("UCX Connection Manager created");
-    }
-    else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::NIXL)
-    {
-        auto rnnState
-            = mCacheState->hasRnnConfig() ? std::make_optional(mCacheState->getRnnCacheState()) : std::nullopt;
-        mManager = std::make_unique<tensorrt_llm::executor::kv_cache::AgentConnectionManager>(
-            mCacheTransBufferManagerPtrs, *mCacheState, "nixl", rnnState);
-        TLLM_LOG_INFO("NIXL Connection Manager created");
-    }
-    else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::MOONCAKE)
-    {
-        auto rnnState
-            = mCacheState->hasRnnConfig() ? std::make_optional(mCacheState->getRnnCacheState()) : std::nullopt;
-        mManager = std::make_unique<tensorrt_llm::executor::kv_cache::AgentConnectionManager>(
-            mCacheTransBufferManagerPtrs, *mCacheState, "mooncake", rnnState);
-        TLLM_LOG_INFO("MOONCAKE Connection Manager created");
-    }
-    else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::MPI)
-    {
-        mMpiWorldComm = std::addressof(tensorrt_llm::mpi::MpiComm::world());
-        mManager = std::make_unique<executor::kv_cache::MpiConnectionManager>(mMpiWorldComm);
-        TLLM_LOG_INFO("MPI Connection Manager created");
-    }
-    else
-    {
-        TLLM_THROW("Unsupported cache transceiver backend type ");
-    }
 
-    auto makeFormatter = [cacheManager, isMLA, this]()
-    {
-        std::vector<kv_cache_manager::CacheTransBufferManager*> kvBufferPtrs;
-        kvBufferPtrs.reserve(mCacheTransBufferManagers.size());
-        for (auto& mgr : mCacheTransBufferManagers)
+        auto makeRnnFormatter = [this, cacheManager]() -> std::unique_ptr<RnnCacheFormatter>
         {
-            kvBufferPtrs.push_back(mgr.get());
-        }
-        return createCacheFormatter(cacheManager, kvBufferPtrs, isMLA);
-    };
+            if (mRnnStateManager != nullptr && mRnnCacheTransBufferManager != nullptr)
+            {
+                // Slot-based path (CppMambaCacheManager)
+                return std::make_unique<RnnCacheFormatter>(mRnnStateManager, mRnnCacheTransBufferManager.get());
+            }
+            // Unified pool path (CppMambaHybridCacheManager)
+            if (mCacheState->hasRnnConfig() && mRnnCacheTransBufferManager != nullptr)
+            {
+                return std::make_unique<RnnCacheFormatter>(cacheManager, mRnnCacheTransBufferManager.get());
+            }
+            return nullptr;
+        };
 
-    auto makeRnnFormatter = [this, cacheManager]() -> std::unique_ptr<RnnCacheFormatter>
+        auto makeCacheTransferLayer
+            = [&]() { return CacheTransferLayer(*mCacheState, makeFormatter(), makeRnnFormatter()); };
+
+        mCacheSender = std::make_unique<CacheSender>(mManager.get(), worldConfig.getRank(), makeCacheTransferLayer());
+        mCacheReceiver
+            = std::make_unique<CacheReceiver>(mManager.get(), worldConfig.getRank(), makeCacheTransferLayer());
+
+        initializeCommState();
+    }
+    catch (...)
     {
-        if (mRnnStateManager != nullptr && mRnnCacheTransBufferManager != nullptr)
+        // A constructor exception skips CacheTransceiver::~CacheTransceiver.
+        // Tear dependencies down explicitly while staging buffers and the UCX
+        // wrapper are still alive.
+        mCacheReceiver.reset();
+        mCacheSender.reset();
+        mManager.reset();
+        if (mWrapperLibHandle)
         {
-            // Slot-based path (CppMambaCacheManager)
-            return std::make_unique<RnnCacheFormatter>(mRnnStateManager, mRnnCacheTransBufferManager.get());
+            std::lock_guard<std::mutex> lock(mDllMutex);
+            dllClose(mWrapperLibHandle);
+            mWrapperLibHandle = nullptr;
         }
-        // Unified pool path (CppMambaHybridCacheManager)
-        if (mCacheState->hasRnnConfig() && mRnnCacheTransBufferManager != nullptr)
-        {
-            return std::make_unique<RnnCacheFormatter>(cacheManager, mRnnCacheTransBufferManager.get());
-        }
-        return nullptr;
-    };
-
-    auto makeCacheTransferLayer
-        = [&]() { return CacheTransferLayer(*mCacheState, makeFormatter(), makeRnnFormatter()); };
-
-    mCacheSender = std::make_unique<CacheSender>(mManager.get(), worldConfig.getRank(), makeCacheTransferLayer());
-    mCacheReceiver = std::make_unique<CacheReceiver>(mManager.get(), worldConfig.getRank(), makeCacheTransferLayer());
-
-    initializeCommState();
+        throw;
+    }
 }
 
 CacheTransceiver::~CacheTransceiver()
@@ -530,6 +597,48 @@ CacheTransceiver::~CacheTransceiver()
     // plugin are still alive. The workers can access both during termination.
     mCacheSender.reset();
     mCacheReceiver.reset();
+
+    if (mEnableTransferEarlyRelease)
+    {
+        try
+        {
+            mCacheManager->drainTransferLeaseReleases();
+        }
+        catch (std::exception const& e)
+        {
+            TLLM_LOG_ERROR("Failed to drain KV-cache transfer leases during transceiver shutdown: %s", e.what());
+        }
+        catch (...)
+        {
+            TLLM_LOG_ERROR("Failed to drain KV-cache transfer leases during transceiver shutdown.");
+        }
+        while (!mActiveTransferLeaseIds.empty())
+        {
+            auto const requestId = *mActiveTransferLeaseIds.begin();
+            try
+            {
+                endTransferLease(requestId);
+            }
+            catch (std::exception const& e)
+            {
+                TLLM_LOG_ERROR(
+                    "Failed to end KV-cache transfer lease for request %ld during shutdown: %s", requestId, e.what());
+                // A destructor cannot retry forever. Drop local tracking so
+                // cleanup can continue for other requests.
+                mActiveTransferLeaseIds.erase(requestId);
+            }
+            catch (...)
+            {
+                TLLM_LOG_ERROR("Failed to end KV-cache transfer lease for request %ld during shutdown.", requestId);
+                mActiveTransferLeaseIds.erase(requestId);
+            }
+        }
+    }
+
+    // Connection-manager teardown can deregister the staging buffers and may
+    // call into the dynamically loaded UCX wrapper. Destroy it while both the
+    // buffers and wrapper library are still alive.
+    mManager.reset();
 
     if (mWrapperLibHandle)
     {
@@ -561,6 +670,16 @@ void CacheTransceiver::setContextState(LlmRequest* llmRequest)
     }
 }
 
+void CacheTransceiver::endTransferLease(LlmRequest::RequestIdType requestId)
+{
+    auto const leaseIt = mActiveTransferLeaseIds.find(requestId);
+    if (mEnableTransferEarlyRelease && leaseIt != mActiveTransferLeaseIds.end())
+    {
+        mCacheManager->endTransferLease(requestId);
+        mActiveTransferLeaseIds.erase(leaseIt);
+    }
+}
+
 void CacheTransceiver::respondAndSendAsync(std::shared_ptr<LlmRequest> llmRequest)
 {
     TLLM_CHECK(llmRequest && llmRequest->isContextOnlyRequest());
@@ -575,9 +694,38 @@ void CacheTransceiver::respondAndSendAsync(std::shared_ptr<LlmRequest> llmReques
         }
         return;
     }
-    setContextState(llmRequest.get());
-    auto future = mCacheSender->sendAsync(llmRequest);
-    mSenderFutures.emplace_back(std::move(llmRequest), std::move(future));
+    auto const requestId = llmRequest->mRequestId;
+    bool const chunkRequestSupported
+        = !mCacheState->getTransferChunkSizeBlocks().has_value() || llmRequest->mSamplingConfig.beamWidth == 1;
+    // Allocate status bookkeeping before the sender can observe the request.
+    // Once sendAsync returns, no throwing vector growth may be allowed to
+    // release the lease underneath queued worker work.
+    mSenderFutures.reserve(mSenderFutures.size() + 1);
+    if (mEnableTransferEarlyRelease && chunkRequestSupported)
+    {
+        bool const inserted = mActiveTransferLeaseIds.insert(requestId).second;
+        TLLM_CHECK_WITH_INFO(inserted, "A KV-cache transfer lease is already active for request %ld.", requestId);
+        try
+        {
+            mCacheManager->beginTransferLease(requestId, *llmRequest);
+        }
+        catch (...)
+        {
+            mActiveTransferLeaseIds.erase(requestId);
+            throw;
+        }
+    }
+    try
+    {
+        setContextState(llmRequest.get());
+        auto future = mCacheSender->sendAsync(llmRequest);
+        mSenderFutures.emplace_back(std::move(llmRequest), std::move(future));
+    }
+    catch (...)
+    {
+        endTransferLease(requestId);
+        throw;
+    }
 }
 
 void CacheTransceiver::respondAndSendLayerWise(
@@ -724,6 +872,12 @@ void updateKVCacheTransferBW(std::shared_ptr<CacheTransceiverComm> const& mComm,
 RequestStatuses CacheTransceiver::checkContextTransferStatus(
     std::optional<int> const& atLeastRequestNum, bool markComplete)
 {
+    if (mEnableTransferEarlyRelease)
+    {
+        // CacheFormatter workers only enqueue completed chunks. Refcounts and
+        // eviction queues are mutated here on the transceiver caller thread.
+        mCacheManager->drainTransferLeaseReleases();
+    }
     bool const blockAll = !atLeastRequestNum.has_value();
     std::optional<int> senderFutureTimeoutMs = std::nullopt;
     if (mCacheTransceiverConfig.has_value())
@@ -864,6 +1018,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         {
             continue;
         }
+        endTransferLease(requestId);
         requestIt->second->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
         requestsStatus.errorRequestIds.insert(requestId);
         mTimedOutSenderIds.erase(requestId);
@@ -877,6 +1032,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         {
             continue;
         }
+        endTransferLease(requestId);
         requestsStatus.completedRequestIds.insert(requestId);
         if (markComplete)
         {
@@ -1108,7 +1264,12 @@ bool CacheTransceiver::cancelRequest(std::shared_ptr<LlmRequest> llmRequest)
 {
     if (llmRequest->isContextOnlyRequest())
     {
-        return mCacheSender->cancelRequest(*llmRequest);
+        bool const cancelled = mCacheSender->cancelRequest(*llmRequest);
+        if (cancelled)
+        {
+            endTransferLease(llmRequest->mRequestId);
+        }
+        return cancelled;
     }
     else if (llmRequest->isGenerationOnlyRequest())
     {

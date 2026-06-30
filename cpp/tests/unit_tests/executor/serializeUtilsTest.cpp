@@ -1568,9 +1568,11 @@ TEST(SerializeUtilsTest, CacheStateIndexerKCache)
     CacheState state{nbKvHeadsPerLayer, sizePerHead, tokensPerBlock, tp, pp, cp, attentionLayerNumPerPP, dataType,
         attentionType, kvFactor, enableAttentionDP, dpRank, dpSize, enableBlockReuse, enablePartialReuse,
         hasIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize};
+    state.setTransferChunkSizeBlocks(7);
 
     std::ostringstream oss;
     texec::Serialization::serialize(state, oss);
+    EXPECT_EQ(texec::Serialization::serializedSize(state), oss.str().size());
     std::istringstream iss(oss.str());
     auto state2 = texec::Serialization::deserializeCacheState(iss);
 
@@ -1589,4 +1591,6 @@ TEST(SerializeUtilsTest, CacheStateIndexerKCache)
     EXPECT_EQ(state.getHasIndexerKCache(), state2.getHasIndexerKCache());
     EXPECT_EQ(state.getIndexerDimPerHead(), state2.getIndexerDimPerHead());
     EXPECT_EQ(state.getIndexerKCacheQuantBlockSize(), state2.getIndexerKCacheQuantBlockSize());
+    EXPECT_EQ(state.getTransferChunkSizeBlocks(), state2.getTransferChunkSizeBlocks());
+    EXPECT_EQ(state, state2);
 }

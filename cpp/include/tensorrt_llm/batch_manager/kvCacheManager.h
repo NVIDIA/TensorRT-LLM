@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <limits>
 #include <list>
 #include <memory>
@@ -46,6 +47,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -574,6 +576,11 @@ private:
     size_t mHash;
 };
 
+//! \brief Window-qualified KV-cache block IDs owned by a transfer lease.
+//! \details Block IDs are scoped to a WindowBlockManager, so the window-size key is required even for
+//! single-window models. Each vector preserves the sequence allocation order and contains each real block once.
+using TransferBlockIds = std::unordered_map<WindowSizeType, std::vector<KVCacheBlock::IdType>>;
+
 class GenerationRequest
 {
 public:
@@ -984,6 +991,13 @@ public:
     //! \brief Pin blocks associated with a sequence to prevent eviction.
     void pinBlocks(GenerationRequest& sequence);
 
+    //! \brief Pin every distinct, non-placeholder block allocated to a sequence exactly once.
+    //! \return Block IDs in allocation order.
+    [[nodiscard]] std::vector<KVCacheBlock::IdType> pinBlocksForTransferLease(GenerationRequest& sequence);
+
+    //! \brief Release exact block pins previously acquired for a transfer lease.
+    void unpinBlocksForTransferLease(std::vector<KVCacheBlock::IdType> const& blockIds);
+
     //! \brief Release blocks of the sequence.
     //! \details When llmRequest is provided and reuse is enabled, blocks will be stored.
     std::optional<KVCacheBlock::IdType> releaseBlocks(
@@ -1231,6 +1245,11 @@ public:
     [[nodiscard]] bool isEnablePartialReuse() const
     {
         return mEnablePartialReuse;
+    }
+
+    [[nodiscard]] bool hasKVCacheConnector() const noexcept
+    {
+        return mKvCacheConnectorManager != nullptr;
     }
 
     [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey);
@@ -1535,11 +1554,21 @@ public:
     [[nodiscard]] std::vector<KVCacheBlock::IdType> storeBlocksForReuse(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest = std::nullopt, bool pinBlocks = false);
 
+    //! \brief Store blocks using the same eligibility rules as releaseBlocks, without releasing sequence ownership.
+    void storeBlocksForTransferLease(
+        GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest = std::nullopt);
+
     void schedulingReleaseBlocks(LlmRequest::RequestIdType requestId);
 
     /// @brief Pin all blocks associated with a sequence across all window managers.
     /// @param sequence The generation request whose blocks should be pinned.
     void pinBlocks(GenerationRequest& sequence);
+
+    //! \brief Pin every distinct, non-placeholder block once and return window-qualified IDs.
+    [[nodiscard]] TransferBlockIds pinBlocksForTransferLease(GenerationRequest& sequence);
+
+    //! \brief Release window-qualified pins previously acquired for a transfer lease.
+    void unpinBlocksForTransferLease(TransferBlockIds const& blockIds);
 
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
 
@@ -1770,6 +1799,12 @@ public:
     [[nodiscard]] bool isVariableWindow() const noexcept
     {
         return mIsVariableWindow;
+    }
+
+    [[nodiscard]] bool hasKVCacheConnector() const noexcept
+    {
+        return std::any_of(mWindowBlockManagers.begin(), mWindowBlockManagers.end(),
+            [](auto const& entry) { return entry.second.hasKVCacheConnector(); });
     }
 
     [[nodiscard]] SizeType32 getMaxBlockPerSeqWhenSingleWindowSize() const
@@ -2011,6 +2046,55 @@ public:
     /// @brief Pin blocks associated with a request to prevent eviction.
     /// @param requestId The ID of the request whose blocks should be pinned.
     virtual void pinBlocks(LlmRequest::RequestIdType requestId) = 0;
+
+    //! \brief Whether this manager can transfer sequence ownership to exact, window-qualified leases.
+    [[nodiscard]] virtual bool supportsTransferLeases() const noexcept
+    {
+        return false;
+    }
+
+    //! \brief Make a transfer lease the owner of a request's real allocated blocks and detach the sequence.
+    //! \param requestId Request whose KV blocks should be leased.
+    //! \param llmRequest Optional request metadata used to store reusable blocks before detaching the sequence.
+    virtual void beginTransferLease(
+        LlmRequest::RequestIdType requestId, OptionalRef<LlmRequest const> llmRequest = std::nullopt)
+    {
+        static_cast<void>(requestId);
+        static_cast<void>(llmRequest);
+        TLLM_THROW("Transfer leases are not supported by this KV cache manager.");
+    }
+
+    //! \brief Return the full ordered, window-qualified block set for an active transfer lease.
+    [[nodiscard]] virtual std::optional<TransferBlockIds> getTransferLeaseBlockIds(
+        LlmRequest::RequestIdType requestId) const
+    {
+        static_cast<void>(requestId);
+        return std::nullopt;
+    }
+
+    //! \brief Whether an exact transfer lease currently owns this request's blocks.
+    [[nodiscard]] virtual bool hasActiveTransferLease(LlmRequest::RequestIdType requestId) const
+    {
+        static_cast<void>(requestId);
+        return false;
+    }
+
+    //! \brief Queue transferred block IDs for later release on the KV-cache manager's caller thread.
+    virtual void enqueueTransferLeaseRelease(LlmRequest::RequestIdType requestId, TransferBlockIds blockIds)
+    {
+        static_cast<void>(requestId);
+        static_cast<void>(blockIds);
+        TLLM_THROW("Transfer leases are not supported by this KV cache manager.");
+    }
+
+    //! \brief Apply queued transfer-lease releases. Must be called from the KV-cache manager's caller thread.
+    virtual void drainTransferLeaseReleases() {}
+
+    //! \brief End a lease and release every lease-owned block that has not already been drained.
+    virtual void endTransferLease(LlmRequest::RequestIdType requestId)
+    {
+        static_cast<void>(requestId);
+    }
 
     /// @brief Increase size for request at seqSlotIdx. Allocate new KV cache block(s) if needed.
     virtual void addToken(LlmRequest::RequestIdType requestId) = 0;
@@ -2552,6 +2636,25 @@ public:
 
     void pinBlocks(LlmRequest::RequestIdType requestId) override;
 
+    [[nodiscard]] bool supportsTransferLeases() const noexcept override
+    {
+        return true;
+    }
+
+    void beginTransferLease(
+        LlmRequest::RequestIdType requestId, OptionalRef<LlmRequest const> llmRequest = std::nullopt) override;
+
+    [[nodiscard]] std::optional<TransferBlockIds> getTransferLeaseBlockIds(
+        LlmRequest::RequestIdType requestId) const override;
+
+    [[nodiscard]] bool hasActiveTransferLease(LlmRequest::RequestIdType requestId) const override;
+
+    void enqueueTransferLeaseRelease(LlmRequest::RequestIdType requestId, TransferBlockIds blockIds) override;
+
+    void drainTransferLeaseReleases() override;
+
+    void endTransferLease(LlmRequest::RequestIdType requestId) override;
+
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) override;
 
     [[nodiscard]] executor::RetentionPriority getPriorityByBlockId(
@@ -2642,6 +2745,12 @@ public:
     void truncateBlocks(LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep) override;
 
 private:
+    struct TransferLeaseState
+    {
+        TransferBlockIds blockIds;
+        std::unordered_map<WindowSizeType, std::unordered_set<KVCacheBlock::IdType>> remainingBlockIds;
+    };
+
     // Maximum number of sequences
     SizeType32 mMaxNumSequences;
     // Maximum beam width
@@ -2665,6 +2774,10 @@ private:
     bool mEnableBlockReuse;
     // Mutex to protect access to mSequences
     mutable std::mutex mSequencesMtx;
+    // Active transfer leases and the worker-to-main-thread release queue.
+    std::unordered_map<LlmRequest::RequestIdType, TransferLeaseState> mTransferLeases;
+    std::deque<std::pair<LlmRequest::RequestIdType, TransferBlockIds>> mPendingTransferLeaseReleases;
+    mutable std::mutex mTransferLeaseMtx;
     // buffers for static tensors, will be created after allocating pools
     runtime::ITensor::SharedPtr mBlockPoolPointers;
     runtime::ITensor::SharedPtr mLayerToPoolMapping;

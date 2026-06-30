@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,10 +22,32 @@
 #include "tensorrt_llm/executor/executor.h"
 
 #include <NvInferRuntimeBase.h>
+#include <algorithm>
 #include <mutex>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
+
+namespace
+{
+
+std::optional<size_t> getEffectiveMaxNumTokens(std::optional<size_t> maxNumTokens, SizeType32 tokensPerBlock)
+{
+    auto const chunkSizeBlocks = common::getEnvKVCacheTransferChunkSizeBlocks();
+    if (!chunkSizeBlocks.has_value())
+    {
+        return maxNumTokens;
+    }
+
+    TLLM_CHECK_WITH_INFO(tokensPerBlock > 0, "KV-cache tokens per block must be positive.");
+    auto const chunkNumTokens = static_cast<size_t>(chunkSizeBlocks.value()) * static_cast<size_t>(tokensPerBlock);
+    // The env knob defines the wire-protocol chunk size. Both peers must be
+    // able to stage a complete chunk even when a smaller legacy
+    // max_tokens_in_buffer value is configured.
+    return chunkNumTokens;
+}
+
+} // namespace
 
 // ============================================================================
 // FabricMemory Implementation
@@ -205,6 +227,7 @@ size_t CacheTransBufferManager::computeTransferBufferSize(
     }
 
     auto tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
+    maxNumTokens = getEffectiveMaxNumTokens(maxNumTokens, tokensPerBlock);
     size_t bufferSizeFromMaxNumToken = 0;
 
     if (maxNumTokens.has_value())
@@ -233,7 +256,10 @@ size_t CacheTransBufferManager::computeTransferBufferSize(
             {
                 validTokenNum = maxNumTokens.value();
             }
-            validTokenNum += tokensPerBlock; // add one more block
+            if (!common::getEnvKVCacheTransferChunkSizeBlocks().has_value())
+            {
+                validTokenNum += tokensPerBlock; // legacy path keeps one-block headroom
+            }
 
             bufferSizeFromMaxNumToken += validTokenNum * kvCacheByteSizePerTokenPerLayer;
         }
@@ -247,7 +273,7 @@ CacheTransBufferManager::CacheTransBufferManager(
     : BaseTransBufferManager(computeTransferBufferSize(cacheManager, maxNumTokens, transferIndexerKCache),
         transferIndexerKCache ? cacheManager->getIndexerKCachePool()->getDataType()
                               : cacheManager->getPrimaryPool(0)->getDataType(),
-        maxNumTokens)
+        getEffectiveMaxNumTokens(maxNumTokens, cacheManager->getBlockManager().getTokensPerBlock()))
     , mCacheManager{cacheManager}
     , mTransferIndexerKCache{transferIndexerKCache}
 {
@@ -290,7 +316,7 @@ size_t CacheTransBufferManager::preAllocBufferSize(
     {
         return 0;
     }
-    auto maxNumTokens = cacheTransceiverConfig->getMaxTokensInBuffer();
+    auto maxNumTokens = getEffectiveMaxNumTokens(cacheTransceiverConfig->getMaxTokensInBuffer(), tokensPerBlock);
     size_t transferBufferSize = common::getEnvMemSizeForKVCacheTransferBuffer();
     if (maxNumTokens.has_value())
     {
@@ -305,7 +331,10 @@ size_t CacheTransBufferManager::preAllocBufferSize(
             {
                 validTokenNum = maxNumTokens.value();
             }
-            validTokenNum += tokensPerBlock; // add one more block
+            if (!common::getEnvKVCacheTransferChunkSizeBlocks().has_value())
+            {
+                validTokenNum += tokensPerBlock; // legacy path keeps one-block headroom
+            }
             transferBufferSize += validTokenNum * cacheSizeBytesPerToken;
         }
     }

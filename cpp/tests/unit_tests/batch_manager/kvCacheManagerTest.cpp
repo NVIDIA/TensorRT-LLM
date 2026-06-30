@@ -2420,6 +2420,169 @@ TEST_F(KVCacheManagerTest, KVCacheManagerPerRequestStatsTest)
         static_cast<float>(numSharedBlocks) / static_cast<float>(numBlocks));
 }
 
+TEST_F(KVCacheManagerTest, TransferLeaseRejectsMultipleBeamsBeforeDetaching)
+{
+    auto constexpr numLayers = 2;
+    auto constexpr numHeads = 2;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr maxSequenceLength = 8;
+    auto constexpr maxNumSequences = 2;
+    auto constexpr blocksInPrimaryPool = 8;
+    auto constexpr beamWidth = 4;
+    auto constexpr requestId = LlmRequest::RequestIdType{41};
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto const blocksPerWindow = BlocksPerWindow{{maxSequenceLength, {blocksInPrimaryPool, 0}}};
+
+    KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<SizeType32>{maxSequenceLength}, nvinfer1::DataType::kHALF, 0, stream, maxSequenceLength,
+        maxSequenceLength, /*enableBlockReuse=*/false);
+    kvCacheManager.allocatePools(false);
+
+    auto inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7});
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    auto llmRequest = std::make_shared<LlmRequest>(
+        requestId, /*maxNewTokens=*/0, inputTokens, samplingConfig, /*isStreaming=*/false);
+    kvCacheManager.addSequenceBatch(
+        {{{requestId, static_cast<SizeType32>(inputTokens->size()), beamWidth}}}, {std::ref(*llmRequest)});
+
+    EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), blocksInPrimaryPool - 2);
+    EXPECT_THROW(kvCacheManager.beginTransferLease(requestId), std::exception);
+    EXPECT_FALSE(kvCacheManager.getTransferLeaseBlockIds(requestId).has_value());
+    EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), blocksInPrimaryPool - 2);
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager.getSequence(requestId)));
+
+    kvCacheManager.removeSequence(requestId);
+    EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), blocksInPrimaryPool);
+}
+
+TEST_F(KVCacheManagerTest, TransferLeaseReleasesOneChunkWhileRemainderStaysPinned)
+{
+    auto constexpr numLayers = 2;
+    auto constexpr numHeads = 2;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr maxSequenceLength = 16;
+    auto constexpr maxNumSequences = 2;
+    auto constexpr blocksInPrimaryPool = 8;
+    auto constexpr beamWidth = 1;
+    auto constexpr requestId = LlmRequest::RequestIdType{42};
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto const blocksPerWindow = BlocksPerWindow{{maxSequenceLength, {blocksInPrimaryPool, 0}}};
+
+    KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<SizeType32>{maxSequenceLength}, nvinfer1::DataType::kHALF, 0, stream, maxSequenceLength,
+        maxSequenceLength, /*enableBlockReuse=*/true);
+    kvCacheManager.allocatePools(false);
+
+    auto inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8});
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    auto llmRequest = std::make_shared<LlmRequest>(
+        requestId, /*maxNewTokens=*/0, inputTokens, samplingConfig, /*isStreaming=*/false);
+    kvCacheManager.addSequenceBatch(
+        {{{requestId, static_cast<SizeType32>(inputTokens->size()), beamWidth}}}, {std::ref(*llmRequest)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest);
+    kvCacheManager.beginTransferLease(requestId, *llmRequest);
+
+    auto const leaseBlockIds = kvCacheManager.getTransferLeaseBlockIds(requestId);
+    ASSERT_TRUE(leaseBlockIds.has_value());
+    auto const& orderedBlockIds = leaseBlockIds->at(maxSequenceLength);
+    ASSERT_EQ(orderedBlockIds.size(), 3);
+    EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), blocksInPrimaryPool - 3);
+
+    TransferBlockIds firstCompletion{{maxSequenceLength,
+        {orderedBlockIds.at(0), orderedBlockIds.at(1), orderedBlockIds.at(0),
+            std::numeric_limits<KVCacheBlock::IdType>::max()}}};
+    std::thread worker([&kvCacheManager, requestId, firstCompletion = std::move(firstCompletion)]() mutable
+        { kvCacheManager.enqueueTransferLeaseRelease(requestId, std::move(firstCompletion)); });
+    worker.join();
+
+    // Enqueue is worker-safe but never mutates eviction/refcount state itself.
+    EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), blocksInPrimaryPool - 3);
+    kvCacheManager.drainTransferLeaseReleases();
+    // The first two-block chunk is now evictable while the final block remains
+    // pinned by the active transfer lease.
+    EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), blocksInPrimaryPool - 1);
+
+    // Duplicate completions and unknown windows are ignored; the first block is not unpinned twice.
+    kvCacheManager.enqueueTransferLeaseRelease(requestId,
+        TransferBlockIds{
+            {maxSequenceLength, {orderedBlockIds.at(0)}}, {maxSequenceLength + 1, {orderedBlockIds.at(1)}}});
+    kvCacheManager.drainTransferLeaseReleases();
+    EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), blocksInPrimaryPool - 1);
+
+    kvCacheManager.endTransferLease(requestId);
+    EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), blocksInPrimaryPool);
+}
+
+TEST_F(KVCacheManagerTest, TransferLeaseEarlyReleasePreservesSharedPrefix)
+{
+    auto constexpr numLayers = 2;
+    auto constexpr numHeads = 2;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr maxSequenceLength = 16;
+    auto constexpr maxNumSequences = 2;
+    auto constexpr blocksInPrimaryPool = 8;
+    auto constexpr beamWidth = 1;
+    auto constexpr requestIdA = LlmRequest::RequestIdType{43};
+    auto constexpr requestIdB = LlmRequest::RequestIdType{44};
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto const blocksPerWindow = BlocksPerWindow{{maxSequenceLength, {blocksInPrimaryPool, 0}}};
+
+    KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<SizeType32>{maxSequenceLength}, nvinfer1::DataType::kHALF, 0, stream, maxSequenceLength,
+        maxSequenceLength, /*enableBlockReuse=*/true);
+    kvCacheManager.allocatePools(false);
+
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    auto inputTokensA = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8});
+    auto llmRequestA = std::make_shared<LlmRequest>(
+        requestIdA, /*maxNewTokens=*/0, inputTokensA, samplingConfig, /*isStreaming=*/false);
+    kvCacheManager.addSequenceBatch(
+        {{{requestIdA, static_cast<SizeType32>(inputTokensA->size()), beamWidth}}}, {std::ref(*llmRequestA)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequestA);
+    kvCacheManager.beginTransferLease(requestIdA, *llmRequestA);
+
+    auto const leaseBlockIds = kvCacheManager.getTransferLeaseBlockIds(requestIdA);
+    ASSERT_TRUE(leaseBlockIds.has_value());
+    auto const& requestABlockIds = leaseBlockIds->at(maxSequenceLength);
+    ASSERT_EQ(requestABlockIds.size(), 3);
+    EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), blocksInPrimaryPool - 3);
+
+    // While A's transfer lease owns the stored prefix, B reuses the two full
+    // prefix blocks and allocates a distinct tail block.
+    auto inputTokensB = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 99});
+    auto llmRequestB = std::make_shared<LlmRequest>(
+        requestIdB, /*maxNewTokens=*/0, inputTokensB, samplingConfig, /*isStreaming=*/false);
+    kvCacheManager.addSequenceBatch(
+        {{{requestIdB, static_cast<SizeType32>(inputTokensB->size()), beamWidth}}}, {std::ref(*llmRequestB)});
+    auto const& requestBBlockIds = kvCacheManager.getCacheBlockIds(requestIdB, maxSequenceLength).at(0);
+    ASSERT_EQ(requestBBlockIds.size(), 3);
+    EXPECT_EQ(requestBBlockIds.at(0), requestABlockIds.at(0));
+    EXPECT_EQ(requestBBlockIds.at(1), requestABlockIds.at(1));
+    EXPECT_NE(requestBBlockIds.at(2), requestABlockIds.at(2));
+    EXPECT_EQ(llmRequestB->getReusedBlocksPerRequest(), 2);
+    EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), blocksInPrimaryPool - 4);
+
+    // Releasing A's transferred prefix drops only the lease references. B's
+    // sequence references keep the shared blocks resident and non-evictable.
+    kvCacheManager.enqueueTransferLeaseRelease(
+        requestIdA, TransferBlockIds{{maxSequenceLength, {requestABlockIds.at(0), requestABlockIds.at(1)}}});
+    kvCacheManager.drainTransferLeaseReleases();
+    EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), blocksInPrimaryPool - 4);
+
+    kvCacheManager.enqueueTransferLeaseRelease(
+        requestIdA, TransferBlockIds{{maxSequenceLength, {requestABlockIds.at(2)}}});
+    kvCacheManager.drainTransferLeaseReleases();
+    EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), blocksInPrimaryPool - 3);
+    kvCacheManager.endTransferLease(requestIdA);
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequestB);
+    kvCacheManager.removeSequence(requestIdB, llmRequestB);
+    EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), blocksInPrimaryPool);
+}
+
 TEST_F(KVCacheManagerTest, BlockManagerBlockPriorityTest)
 {
     auto constexpr numLayers = 12;

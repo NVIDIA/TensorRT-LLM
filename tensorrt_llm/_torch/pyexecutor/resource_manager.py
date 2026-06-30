@@ -1013,6 +1013,10 @@ class KVCacheManager(BaseResourceManager):
         return self.impl.remove_sequence(request.py_request_id, request,
                                          pin_on_release)
 
+    @property
+    def supports_transfer_leases(self) -> bool:
+        return self.impl.supports_transfer_leases
+
     def store_blocks_for_reuse(self,
                                request: LlmRequest,
                                pin_blocks: bool = False):

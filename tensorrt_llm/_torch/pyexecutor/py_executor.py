@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import dataclasses
 import datetime
 import functools
@@ -65,7 +80,10 @@ from .handle_logits import HandleLogits
 from .hang_detector import HangDetector
 from .kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache_stats import append_kv_cache_iteration_stats
-from .kv_cache_transceiver import KvCacheTransceiver
+from .kv_cache_transceiver import (
+    KV_CACHE_TRANSFER_CHUNK_SIZE_BLOCKS_ENV_VAR_NAME,
+    KV_CACHE_TRANSFER_EARLY_RELEASE_ENV_VAR_NAME, KvCacheTransceiver,
+    get_kv_cache_transfer_chunk_size_blocks)
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID,
                           MAX_SPEC_DECODE_POSITIONS, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
@@ -101,6 +119,28 @@ PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 # Format: comma-separated rank IDs, e.g. "0,1,3", or "all" for all ranks.
 # Default: "0" (only rank 0 prints, matching existing behavior).
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
+
+
+def _resolve_active_kv_cache_transfer_config(
+    requested_chunk_size_blocks: Optional[int],
+    requested_early_release: bool,
+    kv_cache_transceiver: Optional[KvCacheTransceiver],
+) -> Tuple[Optional[int], bool]:
+    """Match dynamic Python flags to the C++ transceiver's cached config."""
+    actual_chunk_size_blocks = (kv_cache_transceiver.transfer_chunk_size_blocks
+                                if kv_cache_transceiver is not None else None)
+    actual_early_release = (kv_cache_transceiver.transfer_early_release_enabled
+                            if kv_cache_transceiver is not None else False)
+    if (requested_chunk_size_blocks != actual_chunk_size_blocks
+            or requested_early_release != actual_early_release):
+        raise RuntimeError(
+            "KV-cache transfer environment changed after the C++ "
+            "transceiver configuration was initialized: requested "
+            f"chunk_size_blocks={requested_chunk_size_blocks}, "
+            f"early_release={requested_early_release}; active "
+            f"chunk_size_blocks={actual_chunk_size_blocks}, "
+            f"early_release={actual_early_release}.")
+    return actual_chunk_size_blocks, actual_early_release
 
 
 class PPCommTag(IntEnum):
@@ -316,12 +356,14 @@ class AsyncTransferManager:
 
     def __init__(self,
                  resource_manager: "ResourceManager",
-                 should_store_blocks: bool = True):
+                 should_store_blocks: bool = True,
+                 use_cpp_transfer_lease: bool = False):
         self.resource_manager = resource_manager
         self.kv_cache_manager = resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
 
         self.should_store_blocks = should_store_blocks
+        self.use_cpp_transfer_lease = use_cpp_transfer_lease
 
         # Mapping of request id to the LlmRequest
         self._requests_in_transfer: Dict[int, LlmRequest] = dict()
@@ -354,7 +396,7 @@ class AsyncTransferManager:
 
             request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
 
-            if self.should_store_blocks:
+            if self.should_store_blocks and not self.use_cpp_transfer_lease:
                 block_id = self.kv_cache_manager.store_blocks_for_reuse(
                     request, True)
             else:
@@ -388,7 +430,7 @@ class AsyncTransferManager:
             self._requests_in_transfer.pop(request.py_request_id)
             self._request_transfer_metadata.pop(request.py_request_id)
 
-            if self.should_store_blocks:
+            if self.should_store_blocks and not self.use_cpp_transfer_lease:
                 self.kv_cache_manager.unpin_blocks_by_id(
                     transfer_metadata.block_id)
 
@@ -562,6 +604,65 @@ class PyExecutor:
             self.enable_kv_cache_reuse
             and self.kv_cache_manager.enable_partial_reuse)
 
+        requested_chunk_size_blocks = get_kv_cache_transfer_chunk_size_blocks()
+        requested_early_release = os.getenv(
+            KV_CACHE_TRANSFER_EARLY_RELEASE_ENV_VAR_NAME) == "1"
+        self.kv_cache_transfer_chunk_size_blocks = requested_chunk_size_blocks
+        self.enable_kv_cache_transfer_early_release = requested_early_release
+        if self.kv_cache_transfer_chunk_size_blocks is not None:
+            if self.max_beam_width != 1:
+                raise NotImplementedError(
+                    "Chunked KV-cache transfer currently requires "
+                    "max_beam_width=1.")
+            if kv_cache_transceiver is None:
+                raise ValueError(
+                    f"{KV_CACHE_TRANSFER_CHUNK_SIZE_BLOCKS_ENV_VAR_NAME} "
+                    "requires the C++ KV cache transceiver.")
+            if not kv_cache_transceiver.supports_cpp_chunked_transfer:
+                raise NotImplementedError(
+                    f"{KV_CACHE_TRANSFER_CHUNK_SIZE_BLOCKS_ENV_VAR_NAME} is "
+                    "supported only by the C++ KV cache transceiver; set "
+                    "cache_transceiver_config.transceiver_runtime='CPP'.")
+        if self.enable_kv_cache_transfer_early_release:
+            if self.kv_cache_transfer_chunk_size_blocks is None:
+                raise ValueError(
+                    f"{KV_CACHE_TRANSFER_EARLY_RELEASE_ENV_VAR_NAME}=1 "
+                    f"requires a positive "
+                    f"{KV_CACHE_TRANSFER_CHUNK_SIZE_BLOCKS_ENV_VAR_NAME}.")
+            if kv_cache_transceiver is None:
+                raise ValueError(
+                    f"{KV_CACHE_TRANSFER_EARLY_RELEASE_ENV_VAR_NAME}=1 "
+                    "requires the C++ KV cache transceiver.")
+            if not kv_cache_transceiver.supports_cpp_chunked_transfer:
+                raise NotImplementedError(
+                    "Chunked KV-cache early release is supported only by the "
+                    "C++ KV cache transceiver; set "
+                    "cache_transceiver_config.transceiver_runtime='CPP'.")
+            if not getattr(self.kv_cache_manager, "supports_transfer_leases",
+                           False):
+                raise NotImplementedError(
+                    "Chunked KV-cache early release requires a KV cache "
+                    "manager with exact transfer-lease support.")
+            if kv_connector_manager is not None:
+                raise NotImplementedError(
+                    "Chunked KV-cache early release cannot be combined with "
+                    "the KV cache connector because both consumers do not "
+                    "yet share per-chunk transfer leases.")
+            if self.dist.world_size != 1:
+                raise NotImplementedError(
+                    "Chunked KV-cache early release currently requires "
+                    "world_size=1; cross-rank per-chunk completion consensus "
+                    "is not implemented.")
+
+        actual_chunk_size_blocks, actual_early_release = \
+            _resolve_active_kv_cache_transfer_config(
+                requested_chunk_size_blocks, requested_early_release,
+                kv_cache_transceiver)
+        # Lease ownership must follow the transceiver's actual C++ state, not
+        # a second dynamic environment read.
+        self.kv_cache_transfer_chunk_size_blocks = actual_chunk_size_blocks
+        self.enable_kv_cache_transfer_early_release = actual_early_release
+
         self.max_input_len = max_input_len
         # _executor_loop private data
         self.max_num_active_requests = model_engine.get_max_num_sequences()
@@ -604,7 +705,8 @@ class PyExecutor:
         self.async_transfer_manager = AsyncTransferManager(
             self.resource_manager,
             should_store_blocks=self.enable_partial_reuse_for_disagg
-            and not self.kv_cache_manager.is_vswa and self.dist.pp_size == 1)
+            and not self.kv_cache_manager.is_vswa and self.dist.pp_size == 1,
+            use_cpp_transfer_lease=self.enable_kv_cache_transfer_early_release)
 
         # Router is built after async_transfer_manager so KVCacheAwareADPRouter
         # can receive the transfer-manager reference at construction time.
@@ -1159,6 +1261,14 @@ class PyExecutor:
         # resource managers start freeing GPU-backed workspaces.
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        # Stop C++ transfer workers and close leases before the KV-cache
+        # resource manager releases its pools. The Python transceiver owns a
+        # separate shutdown lifecycle and cannot use these env-gated features.
+        kv_cache_transceiver = getattr(self, "kv_cache_transceiver", None)
+        if (kv_cache_transceiver is not None
+                and kv_cache_transceiver.supports_cpp_chunked_transfer):
+            kv_cache_transceiver.shutdown()
+            self.kv_cache_transceiver = None
         for manager in self.resource_manager.resource_managers.values():
             if manager:
                 manager.shutdown()
@@ -3944,6 +4054,11 @@ class PyExecutor:
         # Validate beam width
         sampling_config = request.sampling_config
         if sampling_config is not None:
+            if (self.kv_cache_transfer_chunk_size_blocks is not None
+                    and sampling_config.beam_width != 1):
+                raise ValueError(
+                    "Chunked KV-cache transfer currently supports only beam "
+                    "width 1.")
             if sampling_config.beam_width != self.max_beam_width:
                 raise ValueError(
                     f"Request beam width {sampling_config.beam_width} "
@@ -4906,7 +5021,25 @@ class PyExecutor:
                     # Order is important here: we need to start the transfer before responding
                     # to make sure the blocks are stored for reuse before they are sent.
                     self.async_transfer_manager.start_transfer(req)
-                    self.kv_cache_transceiver.respond_and_send_async(req)
+                    try:
+                        self.kv_cache_transceiver.respond_and_send_async(req)
+                    except Exception:
+                        # Roll back Python-side transfer bookkeeping. The C++
+                        # transceiver independently closes a lease if startup
+                        # fails after lease creation.
+                        req.state = LlmRequestState.DISAGG_TRANS_ERROR
+                        try:
+                            if self.async_transfer_manager.end_transfer(req):
+                                # beginTransferLease may fail before it detaches
+                                # the sequence. Release any request resources that
+                                # are still owned by the normal executor path; if
+                                # C++ already detached it, KV removal is a no-op.
+                                self._terminate_request(req)
+                        except Exception:
+                            logger.exception(
+                                "Failed to roll back transfer resources for "
+                                f"request {req.py_request_id}")
+                        raise
 
                     if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
                         req.py_kv_transfer_start_time = time.time()
