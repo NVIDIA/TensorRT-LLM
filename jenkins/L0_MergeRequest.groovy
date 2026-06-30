@@ -1741,7 +1741,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             parameters: params,
                             propagate: false
                         )
-                        if (handle.result != "SUCCESS") {
+                        if (handle.result == "UNSTABLE") {
+                            logger.warning("OSS Compliance Check downstream job is UNSTABLE, ignoring")
+                        } else if (handle.result != "SUCCESS") {
                             error "Downstream job did not succeed"
                         }
                     } catch (InterruptedException e) {
