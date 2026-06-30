@@ -228,6 +228,49 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             second_per_grid_ts,
         )
 
+    def _preprocess(
+        self,
+        text: Dict[str, Any],
+        mm_data: Dict[str, Any],
+        mm_processor_kwargs: Dict[str, Any],
+    ):
+        images = mm_data.get("image")
+        video_datas = mm_data.get("video")
+        if video_datas is not None:
+            videos = [video_data.frames for video_data in video_datas]
+        else:
+            videos = None
+        do_rescale = True
+        if images and isinstance(images[0], torch.Tensor):
+            do_rescale = False
+        if videos and isinstance(videos[0][0], torch.Tensor):
+            do_rescale = False
+
+        # Forward video metadata only when the caller opts into per-request kwargs;
+        # the default path pre-samples frames in the IO loader, so unconditional
+        # metadata triggers IndexError in HF's _decode_and_sample_videos.
+        video_metadata = (
+            [vd.metadata for vd in video_datas] if video_datas and mm_processor_kwargs else None
+        )
+
+        # num_frames and fps are mutually exclusive in the HF processor's sample_frames.
+        # If the caller set num_frames without fps, null fps explicitly so the class-level
+        # default fps=2 does not interfere.
+        proc_kwargs = dict(mm_processor_kwargs)
+        if "num_frames" in proc_kwargs and "fps" not in proc_kwargs:
+            proc_kwargs["fps"] = None
+
+        return self.processor(
+            text=[text],
+            images=images,
+            videos=videos,
+            padding=True,
+            do_rescale=do_rescale,
+            return_tensors="pt",
+            video_metadata=video_metadata,
+            **proc_kwargs,
+        )
+
     def get_num_tokens_per_video(
         self,
         *,
@@ -1059,25 +1102,23 @@ class Qwen3VLModelBase(PreTrainedModel):
 
         self.model_config = model_config
 
+        vlm_to_llm_arch = {
+            "Qwen3VLForConditionalGeneration": "Qwen3ForCausalLM",
+            "Qwen3VLMoeForConditionalGeneration": "Qwen3MoeForCausalLM",
+            "QwenImageBenchForConditionalGeneration": "Qwen3_5ForCausalLM",
+        }
+        llm_arch = vlm_to_llm_arch.get(self.original_arch)
+        if llm_arch is None:
+            raise ValueError(f"Unsupported architecture: {self.original_arch}")
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config = config.text_config
-        # The LM's attention modules look themselves up in the global
-        # `extra_attrs` that `model_engine.model_forward` binds via
-        # `with_model_extra_attrs(self.model.extra_attrs)` -- the
-        # outer wrapper's dict. Without sharing, `llm_model_config`
-        # carries a deep-copied dict, so LM `attn_custom_op_inplace`
-        # (used under `set_torch_compiling(True)`) fails its layer
-        # lookup and the piecewise-CUDA-graph dynamo trace blows up
-        # at the LM's `o_proj` call. Vision attention unregisters
-        # itself from this dict in `Qwen2_5_VLVisionAttention.__init__`
-        # so it does not poison LM lookups.
+        # The LM attention modules use extra_attrs through the outer wrapper.
+        # Share the dict after deepcopy so compiled LM attention lookups see
+        # the same per-layer metadata as model_engine.model_forward.
+        # Vision attention unregisters itself from this dict during init,
+        # so it does not pollute LM lookups.
         llm_model_config.extra_attrs = model_config.extra_attrs
-        if self.original_arch == "Qwen3VLForConditionalGeneration":
-            llm_model_config.pretrained_config.architectures = ["Qwen3ForCausalLM"]
-        elif self.original_arch == "Qwen3VLMoeForConditionalGeneration":
-            llm_model_config.pretrained_config.architectures = ["Qwen3MoeForCausalLM"]
-        else:
-            raise ValueError(f"Unsupported architecture: {self.original_arch}")
+        llm_model_config.pretrained_config.architectures = [llm_arch]
         # Qwen3ForCausalLM.
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 

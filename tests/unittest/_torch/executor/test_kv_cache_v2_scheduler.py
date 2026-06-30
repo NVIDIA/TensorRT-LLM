@@ -18,10 +18,12 @@ All KVCacheManagerV2, LlmRequest, and PeftCacheManager objects are mocked.
 No GPU required.
 """
 
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 
@@ -54,6 +56,7 @@ def make_gen_request(
     req.is_context_init_state = False
     req.is_generation_in_progress_state = True
     req.is_first_context_chunk = is_first_context_chunk
+    req.py_encoder_output_ready_event = None
     return req
 
 
@@ -84,6 +87,8 @@ def make_ctx_request(
     req.is_context_init_state = True
     req.is_generation_in_progress_state = False
     req.encoder_output_len = encoder_output_len
+    req.py_encoder_output_ready_event = None
+    req.py_skip_cross_kv_projection = False
     return req
 
 
@@ -178,6 +183,7 @@ def make_scheduler(
     scheduler_capacity=None,
     no_schedule_until_state=None,
     no_schedule_after_state=None,
+    cross_kv_cache_manager=None,
 ):
     """Create KVCacheV2Scheduler, patching isinstance check for mock mgr."""
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
@@ -191,6 +197,8 @@ def make_scheduler(
             kwargs["no_schedule_until_state"] = no_schedule_until_state
         if no_schedule_after_state is not None:
             kwargs["no_schedule_after_state"] = no_schedule_after_state
+        if cross_kv_cache_manager is not None:
+            kwargs["cross_kv_cache_manager"] = cross_kv_cache_manager
         return KVCacheV2Scheduler(
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
@@ -203,14 +211,29 @@ def make_scheduler(
         )
 
 
-def make_encoder_scheduler(kv_cache_manager, **kwargs):
+def make_encoder_scheduler(kv_cache_manager, cross_kv_cache_manager=None, **kwargs):
     """Scheduler with state range widened to include ENCODER_INIT (matches
-    C++ trtEncoderModel pattern)."""
+    C++ trtEncoderModel pattern).
+
+    Encoder-decoder runtime requires a cross_kv_cache_manager for the later
+    decoder-context cross-KV step. By default we wire a fresh mock cross
+    manager that succeeds; tests that exercise misconfiguration pass an
+    explicit ``None`` through ``make_scheduler`` directly.
+    """
+    if cross_kv_cache_manager is None:
+        cross_kv_cache_manager = make_kv_cache_manager()
     return make_scheduler(
         kv_cache_manager,
         no_schedule_until_state=LlmRequestState.ENCODER_INIT,
+        cross_kv_cache_manager=cross_kv_cache_manager,
         **kwargs,
     )
+
+
+def make_not_ready_event():
+    event = Mock()
+    event.query.return_value = False
+    return event
 
 
 def ids(reqs):
@@ -288,7 +311,7 @@ class TestTokenBudget:
         sched = make_encoder_scheduler(mgr, max_num_tokens=100)
         reqs = [make_encoder_request(0, encoder_output_len=200)]
         out = sched.schedule_request(reqs, set())
-        assert len(out.context_requests) == 0
+        assert len(out.encoder_requests) == 0
 
     def test_gen_with_draft_tokens(self):
         mgr = make_kv_cache_manager()
@@ -624,24 +647,6 @@ class TestKVCacheFailuresCtxChunked:
         assert ids(out.generation_requests) == [1]
 
 
-class TestKVCacheFailuresEncoder:
-    """Encoder KV failures."""
-
-    def test_encoder_prepare_fails(self):
-        mgr = make_kv_cache_manager(prepare_context_fn=lambda req: False)
-        sched = make_encoder_scheduler(mgr, max_num_tokens=1000)
-        reqs = [make_encoder_request(0, encoder_output_len=100)]
-        out = sched.schedule_request(reqs, set())
-        assert len(out.context_requests) == 0
-
-    def test_encoder_resize_fails(self):
-        mgr = make_kv_cache_manager(resize_context_fn=lambda req, n: False)
-        sched = make_encoder_scheduler(mgr, max_num_tokens=1000)
-        reqs = [make_encoder_request(0, encoder_output_len=100)]
-        out = sched.schedule_request(reqs, set())
-        assert len(out.context_requests) == 0
-
-
 # ===========================================================================
 # Eviction (MAX_UTILIZATION)
 # ===========================================================================
@@ -914,7 +919,7 @@ class TestPEFT:
         sched = make_encoder_scheduler(mgr, peft_cache_manager=peft)
         reqs = [make_encoder_request(0, encoder_output_len=100, lora_task_id=1)]
         out = sched.schedule_request(reqs, set())
-        assert len(out.context_requests) == 0
+        assert len(out.encoder_requests) == 0
 
     def test_mixed_peft_gen_claims_reduce_ctx(self):
         """[gen(task1), ctx(task2)], pages for 2 total → both ok."""
@@ -972,14 +977,15 @@ class TestEncoder:
         sched = make_encoder_scheduler(mgr, max_num_tokens=200)
         reqs = [make_encoder_request(0, encoder_output_len=100)]
         out = sched.schedule_request(reqs, set())
-        assert ids(out.context_requests) == [0]
+        assert ids(out.encoder_requests) == [0]
+        assert ids(out.context_requests) == []
 
     def test_encoder_budget_overflow(self):
         mgr = make_kv_cache_manager()
         sched = make_encoder_scheduler(mgr, max_num_tokens=100)
         reqs = [make_encoder_request(0, encoder_output_len=200)]
         out = sched.schedule_request(reqs, set())
-        assert len(out.context_requests) == 0
+        assert len(out.encoder_requests) == 0
 
     def test_encoder_exceeds_budget(self):
         """encoder_output_len > max_num_tokens → break (not scheduled)."""
@@ -987,7 +993,7 @@ class TestEncoder:
         sched = make_encoder_scheduler(mgr, max_num_tokens=1000)
         reqs = [make_encoder_request(0, encoder_output_len=2000)]
         out = sched.schedule_request(reqs, set())
-        assert len(out.context_requests) == 0
+        assert len(out.encoder_requests) == 0
 
     def test_encoder_plus_gen(self):
         mgr = make_kv_cache_manager()
@@ -997,22 +1003,9 @@ class TestEncoder:
             make_gen_request(1),
         ]
         out = sched.schedule_request(reqs, set())
-        assert ids(out.context_requests) == [0]
+        assert ids(out.encoder_requests) == [0]
+        assert ids(out.context_requests) == []
         assert ids(out.generation_requests) == [1]
-
-    def test_encoder_prepare_fails(self):
-        mgr = make_kv_cache_manager(prepare_context_fn=lambda req: False)
-        sched = make_encoder_scheduler(mgr, max_num_tokens=1000)
-        reqs = [make_encoder_request(0, encoder_output_len=100)]
-        out = sched.schedule_request(reqs, set())
-        assert len(out.context_requests) == 0
-
-    def test_encoder_resize_fails(self):
-        mgr = make_kv_cache_manager(resize_context_fn=lambda req, n: False)
-        sched = make_encoder_scheduler(mgr, max_num_tokens=1000)
-        reqs = [make_encoder_request(0, encoder_output_len=100)]
-        out = sched.schedule_request(reqs, set())
-        assert len(out.context_requests) == 0
 
     def test_multiple_encoders(self):
         mgr = make_kv_cache_manager()
@@ -1022,7 +1015,8 @@ class TestEncoder:
             make_encoder_request(1, encoder_output_len=50),
         ]
         out = sched.schedule_request(reqs, set())
-        assert ids(out.context_requests) == [0, 1]
+        assert ids(out.encoder_requests) == [0, 1]
+        assert ids(out.context_requests) == []
 
     def test_encoder_counts_toward_batch(self):
         """Gen wins phase 1; encoder scheduled in phase 2 still occupies a batch slot."""
@@ -1036,8 +1030,110 @@ class TestEncoder:
         out = sched.schedule_request(reqs, set())
         # gen(1) scheduled first (phase 1), encoder(0) fills remaining slot (phase 2)
         assert ids(out.generation_requests) == [1]
-        assert ids(out.context_requests) == [0]
+        assert ids(out.encoder_requests) == [0]
+        assert ids(out.context_requests) == []
         # encoder(2) excluded — encoder(0) counted toward batch
+
+    def test_encoder_does_not_touch_kv_pools(self):
+        """Encoder admission must not touch either KV pool.
+
+        This guards the dual-pool contract: both self- and cross-pool
+        allocation are decoder-context responsibilities.
+        """
+        self_mgr = make_kv_cache_manager()
+        cross_mgr = make_kv_cache_manager()
+        sched = make_encoder_scheduler(
+            self_mgr, cross_kv_cache_manager=cross_mgr, max_num_tokens=1000
+        )
+        req = make_encoder_request(0, encoder_output_len=100)
+        out = sched.schedule_request([req], set())
+        assert ids(out.encoder_requests) == [0]
+        assert ids(out.context_requests) == []
+        # Self pool stays untouched.
+        self_mgr.prepare_context.assert_not_called()
+        self_mgr.resize_context.assert_not_called()
+        self_mgr.try_allocate_generation.assert_not_called()
+        cross_mgr.prepare_context.assert_not_called()
+        cross_mgr.resize_context.assert_not_called()
+        cross_mgr.try_allocate_generation.assert_not_called()
+
+    def test_encoder_without_cross_manager_raises(self):
+        """No cross_kv_cache_manager -> encoder request cannot be admitted.
+
+        The dual-pool contract requires a cross manager.  Without one
+        the scheduler errors rather than silently routing to the
+        self pool (which would corrupt self-pool sizing).
+        """
+        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
+
+        mgr = make_kv_cache_manager()
+        # Build a scheduler with ENCODER_INIT gating but no cross manager.
+        with patch(
+            "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2.KVCacheManagerV2",
+            new=type(mgr),
+        ):
+            sched = KVCacheV2Scheduler(
+                max_batch_size=8,
+                max_num_tokens=1000,
+                kv_cache_manager=mgr,
+                scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+                no_schedule_until_state=LlmRequestState.ENCODER_INIT,
+            )
+        reqs = [make_encoder_request(0, encoder_output_len=100)]
+        with pytest.raises(RuntimeError, match="requires a cross_kv_cache_manager"):
+            sched.schedule_request(reqs, set())
+        # Self pool must not be touched.
+        mgr.prepare_context.assert_not_called()
+
+    def test_encoder_then_context_defers_cross_pool_to_context(self):
+        """Cross-pool allocation is deferred from ENCODER_INIT to CONTEXT_INIT."""
+        self_mgr = make_kv_cache_manager()
+        cross_mgr = make_kv_cache_manager()
+        sched = make_encoder_scheduler(
+            self_mgr, cross_kv_cache_manager=cross_mgr, max_num_tokens=1000
+        )
+
+        # Iteration 1: ENCODER_INIT → encoder compute admission.
+        enc_req = make_encoder_request(0, encoder_output_len=80)
+        out1 = sched.schedule_request([enc_req], set())
+        assert ids(out1.encoder_requests) == [0]
+        assert ids(out1.context_requests) == []
+        self_mgr.prepare_context.assert_not_called()
+        self_mgr.resize_context.assert_not_called()
+        cross_mgr.prepare_context.assert_not_called()
+        cross_mgr.resize_context.assert_not_called()
+
+        # Iteration 2: CONTEXT_INIT (post-encoder transition) → both pools.
+        ctx_req = make_ctx_request(0, context_remaining_length=50, encoder_output_len=80)
+        out2 = sched.schedule_request([ctx_req], set())
+        assert ids(out2.context_requests) == [0]
+        self_mgr.prepare_context.assert_called_once_with(ctx_req)
+        self_mgr.resize_context.assert_called_once_with(ctx_req, 50)
+        cross_mgr.prepare_context.assert_called_once_with(ctx_req)
+        cross_mgr.resize_context.assert_called_once_with(ctx_req, 80)
+
+    def test_later_context_chunk_reuses_cross_pool_without_resizing(self):
+        """Later decoder chunks read existing cross-KV without reallocation."""
+        self_mgr = make_kv_cache_manager()
+        cross_mgr = make_kv_cache_manager()
+        sched = make_encoder_scheduler(
+            self_mgr, cross_kv_cache_manager=cross_mgr, max_num_tokens=1000
+        )
+        ctx_req = make_ctx_request(
+            0,
+            context_remaining_length=50,
+            is_first_context_chunk=False,
+            encoder_output_len=80,
+        )
+        ctx_req.py_skip_cross_kv_projection = True
+
+        out = sched.schedule_request([ctx_req], set())
+
+        assert ids(out.context_requests) == [0]
+        self_mgr.prepare_context.assert_called_once_with(ctx_req)
+        self_mgr.resize_context.assert_called_once_with(ctx_req, 50)
+        cross_mgr.prepare_context.assert_not_called()
+        cross_mgr.resize_context.assert_not_called()
 
 
 # ===========================================================================
@@ -1589,6 +1685,18 @@ class TestStateFiltering:
         out = sched.schedule_request(reqs, set())
         assert len(out.context_requests) == 1
 
+    def test_context_init_waiting_on_encoder_event_is_filtered(self):
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        blocked_ctx = make_ctx_request(0, context_remaining_length=10)
+        blocked_ctx.py_encoder_output_ready_event = make_not_ready_event()
+        gen_req = make_gen_request(1)
+
+        out = sched.schedule_request([blocked_ctx, gen_req], set())
+
+        assert ids(out.context_requests) == []
+        assert ids(out.generation_requests) == [1]
+
     def test_gen_in_progress_passes(self):
         """GEN_IN_PROGRESS (13) is in [10,14) range → not filtered."""
         mgr = make_kv_cache_manager()
@@ -1691,6 +1799,7 @@ class TestSchedulerOutput:
             make_disagg_request(2),
         ]
         out = sched.schedule_request(reqs, set())
+        assert len(out.encoder_requests) == 0
         assert len(out.context_requests) == 1
         assert len(out.generation_requests) == 1
         assert len(out.fitting_disagg_gen_init_requests) == 1
@@ -1790,7 +1899,8 @@ class TestMixedOrdering:
             make_gen_request(1),
         ]
         out = sched.schedule_request(reqs, set())
-        assert ids(out.context_requests) == [0]
+        assert ids(out.encoder_requests) == [0]
+        assert ids(out.context_requests) == []
         assert ids(out.generation_requests) == [1]
 
     def test_ctx_fail_budget_preserved(self):
@@ -1900,7 +2010,8 @@ class TestEdgeCases:
         # Single encoder (needs widened state range)
         enc_sched = make_encoder_scheduler(mgr, max_num_tokens=1000)
         out = enc_sched.schedule_request([make_encoder_request(2, 50)], set())
-        assert len(out.context_requests) == 1
+        assert len(out.encoder_requests) == 1
+        assert len(out.context_requests) == 0
 
     def test_all_inflight(self):
         mgr = make_kv_cache_manager()
@@ -2310,3 +2421,48 @@ class TestMultimodalAwareChunkingV2:
         out = sched.schedule_request([req], set())
         assert ids(out.context_requests) == []
         assert resize_calls == []  # SKIP path: no commit to KV cache
+
+
+# ---------------------------------------------------------------------------
+# KVCacheManagerV2.trim_to_history (#14258): unbound on a fake self, all 5 branches.
+# ---------------------------------------------------------------------------
+class TestTrimToHistory:
+    @staticmethod
+    def _call(kv_cache, history_length, req_id=1):
+        kv_cache_map = {} if kv_cache is None else {req_id: kv_cache}
+        fake = SimpleNamespace(kv_cache_map=kv_cache_map)
+        req = SimpleNamespace(py_request_id=req_id)
+        return KVCacheManagerV2.trim_to_history(fake, req, history_length)
+
+    def test_missing_cache_is_noop_true(self):
+        assert self._call(None, 50) is True
+
+    def test_inactive_cache_is_noop_true(self):
+        kv = Mock(is_active=False)
+        assert self._call(kv, 50) is True
+        kv.resize.assert_not_called()
+
+    def test_history_not_increasing_is_noop_true(self):
+        kv = Mock(is_active=True, history_length=50, capacity=100)
+        assert self._call(kv, 50) is True  # 50 <= current 50
+        kv.resize.assert_not_called()
+
+    def test_resize_success_clamps_capacity_and_returns_true(self):
+        kv = Mock(is_active=True, history_length=10, capacity=8)
+        kv.resize.return_value = True
+        assert self._call(kv, 64) is True
+        # target_capacity = max(capacity=8, history=64) = 64
+        kv.resize.assert_called_once_with(64, history_length=64)
+
+    def test_resize_rejection_returns_false(self):
+        kv = Mock(is_active=True, history_length=10, capacity=100)
+        kv.resize.return_value = False
+        assert self._call(kv, 64) is False
+        kv.resize.assert_called_once_with(100, history_length=64)
+
+    def test_resize_exception_degrades_to_false(self):
+        # Broad except: a non-ValueError (e.g. internal state assert) must
+        # degrade to False rather than propagate (do-not-narrow contract).
+        kv = Mock(is_active=True, history_length=10, capacity=100)
+        kv.resize.side_effect = RuntimeError("internal state assert")
+        assert self._call(kv, 64) is False

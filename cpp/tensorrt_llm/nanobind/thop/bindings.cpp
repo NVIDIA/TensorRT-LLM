@@ -57,7 +57,7 @@ nb::tuple trtllmGenContextPreprocessBinding(torch::Tensor qkv_input, torch::Tens
     double rotary_embedding_scale, int64_t rotary_embedding_max_positions, int64_t position_embedding_type,
     double bmm1_scale, double bmm2_scale, int64_t attention_chunk_size, bool fp8_context_fmha, bool paged_context_fmha,
     bool is_mla_enable, int64_t multi_processor_count, int64_t total_num_blocks, int64_t kv_factor,
-    bool need_build_kv_cache_metadata)
+    bool need_build_kv_cache_metadata, std::optional<torch::Tensor> cross_kv, bool cross_attention)
 {
     auto result = [&]()
     {
@@ -70,7 +70,7 @@ nb::tuple trtllmGenContextPreprocessBinding(torch::Tensor qkv_input, torch::Tens
             max_past_kv_length, rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale_type,
             rotary_embedding_scale, rotary_embedding_max_positions, position_embedding_type, bmm1_scale, bmm2_scale,
             attention_chunk_size, fp8_context_fmha, paged_context_fmha, is_mla_enable, multi_processor_count,
-            total_num_blocks, kv_factor, need_build_kv_cache_metadata);
+            total_num_blocks, kv_factor, need_build_kv_cache_metadata, cross_kv, cross_attention);
     }();
 
     return nb::make_tuple(std::get<0>(result), optionalToObject(std::get<1>(result)),
@@ -92,7 +92,7 @@ nb::tuple trtllmGenGenerationPreprocessBinding(torch::Tensor qkv_input, torch::T
     int64_t rotary_embedding_scale_type, double rotary_embedding_scale, int64_t rotary_embedding_max_positions,
     int64_t position_embedding_type, double bmm1_scale, double bmm2_scale, bool fp8_context_fmha,
     int64_t predicted_tokens_per_seq, int64_t attention_chunk_size, int64_t multi_processor_count,
-    int64_t total_num_blocks, int64_t kv_factor, bool need_build_kv_cache_metadata)
+    int64_t total_num_blocks, int64_t kv_factor, bool need_build_kv_cache_metadata, bool cross_attention)
 {
     auto result = [&]()
     {
@@ -106,7 +106,7 @@ nb::tuple trtllmGenGenerationPreprocessBinding(torch::Tensor qkv_input, torch::T
             rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale_type, rotary_embedding_scale,
             rotary_embedding_max_positions, position_embedding_type, bmm1_scale, bmm2_scale, fp8_context_fmha,
             predicted_tokens_per_seq, attention_chunk_size, multi_processor_count, total_num_blocks, kv_factor,
-            need_build_kv_cache_metadata);
+            need_build_kv_cache_metadata, cross_attention);
     }();
 
     return nb::make_tuple(std::get<0>(result), optionalToObject(std::get<1>(result)),
@@ -174,6 +174,8 @@ void initBindings(nb::module_& m)
         nb::arg("sage_attn_num_elts_per_blk_k") = 0, nb::arg("sage_attn_num_elts_per_blk_v") = 0,
         nb::arg("sage_attn_qk_int8") = false, nb::arg("num_contexts") = 0, nb::arg("num_ctx_tokens") = 0,
         nb::arg("trtllm_gen_jit_warmup") = false, nb::arg("compressed_kv_cache_pool_ptr") = std::nullopt,
+        nb::arg("is_cross") = false, nb::arg("cross_kv") = std::nullopt,
+        nb::arg("relative_attention_bias") = std::nullopt, nb::arg("relative_attention_max_distance") = 0,
         nb::arg("spec_decoding_target_max_draft_tokens") = std::nullopt, "Multi-head attention operation",
         nb::call_guard<nb::gil_scoped_release>());
 
@@ -271,7 +273,8 @@ void initBindings(nb::module_& m)
         nb::arg("position_embedding_type"), nb::arg("bmm1_scale"), nb::arg("bmm2_scale"),
         nb::arg("attention_chunk_size"), nb::arg("fp8_context_fmha"), nb::arg("paged_context_fmha"),
         nb::arg("is_mla_enable"), nb::arg("multi_processor_count"), nb::arg("total_num_blocks"), nb::arg("kv_factor"),
-        nb::arg("need_build_kv_cache_metadata") = true, "Fused nanobind context preprocess for trtllm-gen attention.");
+        nb::arg("need_build_kv_cache_metadata") = true, nb::arg("cross_kv").none() = nb::none(),
+        nb::arg("cross_attention") = false, "Fused nanobind context preprocess for trtllm-gen attention.");
 
     m.def("trtllm_gen_context_postprocess", &torch_ext::trtllmGenContextPostprocess, nb::arg("qkv_input"),
         nb::arg("workspace"), nb::arg("sequence_lengths"), nb::arg("context_lengths"),
@@ -330,6 +333,6 @@ void initBindings(nb::module_& m)
         nb::arg("position_embedding_type"), nb::arg("bmm1_scale"), nb::arg("bmm2_scale"), nb::arg("fp8_context_fmha"),
         nb::arg("predicted_tokens_per_seq"), nb::arg("attention_chunk_size"), nb::arg("multi_processor_count"),
         nb::arg("total_num_blocks"), nb::arg("kv_factor"), nb::arg("need_build_kv_cache_metadata") = true,
-        "Fused nanobind generation preprocess for trtllm-gen attention.");
+        nb::arg("cross_attention") = false, "Fused nanobind generation preprocess for trtllm-gen attention.");
 }
 } // namespace tensorrt_llm::nanobind::thop

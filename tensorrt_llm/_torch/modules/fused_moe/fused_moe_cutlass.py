@@ -24,10 +24,11 @@ from .quantization import UnquantizedFusedMoEMethod
 # isort: off
 from .quantization import (
     DeepSeekFP8BlockScalesFusedMoEMethod, FP8QDQFusedMoEMethod,
-    MoEWeightLoadingMode, NVFP4CutlassFusedMoEMethod,
-    INT8WoqPerChannelFusedMoEMethod, W4A16NVFP4CutlassFusedMoEMethod,
-    W4A8MXFP4FP8CutlassFusedMoEMethod, W4A8MXFP4MXFP8CutlassFusedMoEMethod,
-    WFP4A16FusedMoEMethod, WInt4AFP8FusedMoEMethod)
+    MoEWeightLoadingMode, MXFP8CutlassFusedMoEMethod,
+    NVFP4CutlassFusedMoEMethod, INT8WoqPerChannelFusedMoEMethod,
+    W4A16NVFP4CutlassFusedMoEMethod, W4A8MXFP4FP8CutlassFusedMoEMethod,
+    W4A8MXFP4MXFP8CutlassFusedMoEMethod, WFP4A16FusedMoEMethod,
+    WInt4AFP8FusedMoEMethod)
 # isort: on
 from .routing import BaseMoeRoutingMethod
 
@@ -110,6 +111,12 @@ class CutlassFusedMoE(MoE):
         # W4A8_MXFP4_MXFP8: SM in {100, 103, 120, 121}
         QuantAlgo.W4A8_MXFP4_MXFP8: {
             "sm_constraint": ("in", {100, 103, 120, 121}),
+            "dtypes": {torch.float16, torch.bfloat16},
+        },
+        # MXFP8 (W8A8 e4m3xe4m3 with UE8M0 1x32 block scales): SM in {100, 103}.
+        # M3.1 enables construction/load; the fused kernel is M3.2.
+        QuantAlgo.MXFP8: {
+            "sm_constraint": ("in", {100, 103}),
             "dtypes": {torch.float16, torch.bfloat16},
         },
     }
@@ -225,6 +232,7 @@ class CutlassFusedMoE(MoE):
         swiglu_alpha: Optional[torch.Tensor] = None,
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
+        swiglu_limit_scalar: Optional[float] = None,
         init_load_balancer: bool = True,
         without_comm: bool = False,
         activation_type: ActivationType = ActivationType.Swiglu,
@@ -243,6 +251,7 @@ class CutlassFusedMoE(MoE):
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
+            swiglu_limit_scalar=swiglu_limit_scalar,
             layer_idx=layer_idx,
             init_load_balancer=init_load_balancer,
             activation_type=activation_type,
@@ -548,7 +557,10 @@ class CutlassFusedMoE(MoE):
             if entry is None:
                 continue
             kernel_ranks[slot] = entry["adapter_size"]
-            kernel_ptrs[slot] = entry["weight_pointers"]
+            # weight_pointers is built flat ([num_seqs * 3], row-major (A, B,
+            # DoRA) per seq) in PyTorchModelEngine._build_lora_params; the MoE op
+            # expects a [num_seqs, 3] table, so restore that shape.
+            kernel_ptrs[slot] = entry["weight_pointers"].reshape(-1, 3)
             try:
                 active_max_rank = max(active_max_rank,
                                       int(entry["adapter_size"].max().item()))
@@ -692,7 +704,8 @@ class CutlassFusedMoE(MoE):
                     | self.quant_config.quant_mode.is_weight_only()
                     | self.quant_config.quant_mode.has_w4a8_mxfp4_fp8()
                     | self.quant_config.quant_mode.has_w4a16_mxfp4()
-                    | self.quant_config.quant_mode.has_w4a8_mxfp4_mxfp8()):
+                    | self.quant_config.quant_mode.has_w4a8_mxfp4_mxfp8()
+                    | self.quant_config.quant_mode.has_mxfp8()):
                 raise ValueError(
                     f"unsupported quantization mode: {self.quant_config.quant_mode}"
                 )
@@ -824,7 +837,10 @@ class CutlassFusedMoE(MoE):
                         x, x_sf = torch.ops.trtllm.fp4_quantize(
                             x, self.fc31_input_scale, self.scaling_vector_size,
                             False, True)
-            elif self.has_w4a8_mxfp4_mxfp8:
+            elif self.has_w4a8_mxfp4_mxfp8 or self.has_mxfp8:
+                # MXFP8 dynamic activation quantize. The MXFP8xMXFP8 path reuses
+                # the same activation quant kernel as W4A8 MXFP4xMXFP8 -- only
+                # the weight side differs (B element widens from fp4 to fp8).
                 if post_quant_comm:
                     x, x_sf = torch.ops.trtllm.mxfp8_quantize(
                         x, False, alignment=self.quant_method.weight_alignment)
@@ -866,6 +882,8 @@ class CutlassFusedMoE(MoE):
                 return WFP4A16FusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_w4a8_mxfp4_mxfp8():
                 return W4A8MXFP4MXFP8CutlassFusedMoEMethod()
+            elif self.quant_config.layer_quant_mode.has_mxfp8():
+                return MXFP8CutlassFusedMoEMethod()
             else:
                 raise ValueError(
                     f"Unsupported quantization mode: {self.quant_config.quant_mode}"
@@ -1032,7 +1050,10 @@ class CutlassFusedMoE(MoE):
             use_deepseek_fp8_block_scale=self.has_deepseek_fp8_block_scales,
             use_w4_group_scaling=self.has_w4afp8 or self.has_w4a16_mxfp4,
             use_int8_woq_per_channel=self.has_int8_woq_per_channel,
-            use_mxfp8_act_scaling=self.has_w4a8_mxfp4_mxfp8,
+            # use_mxfp8_act_scaling drives dynamic MXFP8 activation quantization
+            # before the GEMM; required for both W4A8 MXFP4xMXFP8 and W8A8
+            # MXFP8xMXFP8 paths.
+            use_mxfp8_act_scaling=self.has_w4a8_mxfp4_mxfp8 or self.has_mxfp8,
             min_latency_mode=False,
             use_fused_finalize=self.use_fused_finalize,
             tune_max_num_tokens=self.tune_max_num_tokens,
@@ -1042,6 +1063,10 @@ class CutlassFusedMoE(MoE):
             unpadded_hidden_size=self.unpadded_hidden_size,
             out_tensor=moe_output,
             use_dynamic_fc2_scale=use_dynamic_fc2_scale,
+            # use_mxfp8_weight_scaling selects the MXFP8xMXFP8 block-scaled
+            # kernel path within the <e4m3, e4m3> CutlassMoeFCRunner template
+            # (per-tensor FP8 otherwise).
+            use_mxfp8_weight_scaling=self.has_mxfp8,
             **lora_kwargs,
         )
         # When moe_output is provided, the result is written in-place and
@@ -1136,6 +1161,7 @@ class CutlassFusedMoE(MoE):
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
+        input_ids: Optional[torch.IntTensor],
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
@@ -1153,7 +1179,7 @@ class CutlassFusedMoE(MoE):
 
         # apply routing
         token_selected_experts, token_final_scales = self.routing_method.apply(
-            router_logits)
+            router_logits, input_ids)
         assert token_selected_experts.shape[
             1] == self.routing_method.experts_per_token
         assert token_selected_experts.shape == token_final_scales.shape
@@ -1391,6 +1417,7 @@ class CutlassFusedMoE(MoE):
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
         *,
+        input_ids: Optional[torch.IntTensor] = None,
         do_finalize: bool = True,  # used by other MoE backends
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
@@ -1442,7 +1469,8 @@ class CutlassFusedMoE(MoE):
             outputs = self.forward_chunk(
                 x,
                 router_logits,
-                output_dtype,
+                input_ids=input_ids,
+                output_dtype=output_dtype,
                 all_rank_num_tokens=all_rank_num_tokens_padded,
                 use_dp_padding=use_dp_padding,
                 repeating_info=(is_first_call, is_last_call),
@@ -1467,17 +1495,21 @@ class CutlassFusedMoE(MoE):
 
             x_list = x.split(chunk_size_list)
             router_logits_list = router_logits.split(chunk_size_list)
+            input_ids_list = input_ids.split(
+                chunk_size_list) if input_ids is not None else [None
+                                                                ] * num_chunks
 
             self.event_dict[EventType.Main].record()
             with torch.cuda.stream(self.aux_stream):
                 self.event_dict[EventType.Main].wait()
 
-            def _forward_chunk(x_, router_logits_, idx):
+            def _forward_chunk(x_, router_logits_, input_ids_, idx):
                 is_first_call = idx == 0 and self.repeat_idx == 0
                 is_last_call = idx == num_chunks - 1 and self.repeat_idx == self.repeat_count - 1
                 return self.forward_chunk(
                     x_,
                     router_logits_,
+                    input_ids=input_ids_,
                     all_rank_num_tokens=all_rank_num_tokens_list[idx]
                     if self.use_dp else None,
                     use_dp_padding=use_dp_padding,
@@ -1492,8 +1524,8 @@ class CutlassFusedMoE(MoE):
 
             outputs_list = []
             # Postpone reduce-scatter/all-reduce to the next iteration to achieve better overlap
-            for idx_chunk, (x, router_logits) in enumerate(
-                    zip(x_list, router_logits_list)):
+            for idx_chunk, (x, router_logits, input_ids) in enumerate(
+                    zip(x_list, router_logits_list, input_ids_list)):
                 if not (self.alltoall_method_type
                         == AlltoallMethodType.NVLinkOneSided
                         or self.alltoall_method_type
@@ -1501,17 +1533,19 @@ class CutlassFusedMoE(MoE):
                     if idx_chunk % 2 == 0:
                         with torch.cuda.stream(self.aux_stream):
                             outputs = _forward_chunk(x, router_logits,
-                                                     idx_chunk)
+                                                     input_ids, idx_chunk)
                         if idx_chunk > 0:
                             outputs_list[-1] = _reducescatter_or_allreduce(
                                 outputs_list[-1], idx_chunk - 1)
                     else:
-                        outputs = _forward_chunk(x, router_logits, idx_chunk)
+                        outputs = _forward_chunk(x, router_logits, input_ids,
+                                                 idx_chunk)
                         with torch.cuda.stream(self.aux_stream):
                             outputs_list[-1] = _reducescatter_or_allreduce(
                                 outputs_list[-1], idx_chunk - 1)
                 else:
-                    outputs = _forward_chunk(x, router_logits, idx_chunk)
+                    outputs = _forward_chunk(x, router_logits, input_ids,
+                                             idx_chunk)
 
                 outputs_list.append(outputs)
 

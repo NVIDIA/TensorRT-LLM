@@ -12,7 +12,7 @@ CBTS narrows test cases only; Build always runs.
 | Layer | Where | Action |
 |---|---|---|
 | **2. Stage** | `L0_Test.groovy::launchTestJobs` | Set `parallelJobsFiltered` to affected stages plus PackageSanityCheck (kept iff `sanity_required`) and PerfSanity (kept iff `perfsanity_required`). Pure `-Perf-` stages always excluded. Empty affectedSet + nothing force-kept → no-op. |
-| **2.5. Split-collapse** | `L0_Test.groovy::runLLMTestlistOn*` entries | Narrowed test count < 20 → collapse pytest-split to splits=1 (only group 1 runs); else default splits stand. |
+| **2.5. Split-resize** | `L0_Test.groovy::launchTestJobs` (`cbtsResizeSplits`) | Keep only shards `1..k` per narrowed stage, where `k` (duration-sized to ~2h/shard) is `affected_stage_split_counts`. |
 | **3. Within-stage tests** | `L0_Test.groovy::renderTestDB` | Point trt-test-db at the narrowed `cbts_test_db/`. Each affected block's `tests:` is restricted to entries in the filter prefix subtree; unaffected blocks are dropped. |
 
 CBTS only subtracts; anything it can't narrow → fallback to the existing
@@ -76,7 +76,8 @@ jenkins/scripts/cbts/
 │   ├── spec_dec_rule.py
 │   └── out_of_scope_rule.py
 └── tools/
-    └── dryrun.py          replay CBTS over historical commits → per-PR summary.txt + filtered YAMLs + INDEX.md (debug only)
+    ├── dryrun.py          replay CBTS over historical commits → per-PR summary.txt + filtered YAMLs + INDEX.md (debug only)
+    └── report_cbts_decision.py  post the decision (hit-stage count, case-level skip rate, fallback) to OpenSearch for CI-health monitoring
 ```
 
 ## Lookup algorithms
@@ -138,8 +139,9 @@ Orthogonal flags (`--reuse-test`, `--disable-reuse-test`, `--debug`,
 
 - `post_merge=False` (default for `/bot run`): drop every stage whose name
   contains `Post-Merge`.
-- `post_merge=True` (`/bot run --post-merge`): keep only stages whose name
-  contains `Post-Merge`.
+- `post_merge=True` (`/bot run --post-merge`): keep all affected stages —
+  pre-merge plus `Post-Merge` (Post-Merge runs on top of pre-merge, matching
+  the non-CBTS baseline).
 
 Applied after rules union; rules see all stages so reasons report the
 pre-filter narrow. `_log_decision_to_stderr` prints the dropped set for
@@ -178,6 +180,7 @@ Decision JSON:
   ],
   "test_db_dir_override": "cbts_test_db",
   "affected_stage_test_counts": {"A10-PyTorch-1": 5, "A10-PyTorch-2": 5},
+  "affected_stage_split_counts": {"A10-PyTorch-1": 1, "A10-PyTorch-2": 1},
   "sanity_required": false,
   "perfsanity_required": false
 }
@@ -189,38 +192,41 @@ Decision JSON:
   `perfsanity_required`.
 - `test_db_dir_override: null` → no Layer 3 narrowing; trt-test-db reads
   the source test-db.
-- `affected_stage_test_counts` → per-stage post-keep-filter test count for
-  Layer 2.5 split-collapse.
+- `affected_stage_test_counts` → per-stage kept-entry count (telemetry).
+- `affected_stage_split_counts` → per-stage duration-sized split count (Layer 2.5).
 
 ## Cross-job seed for stage agents
 
 `cbts_test_db/` is written on the L0_MergeRequest agent and is not
-available to downstream `L0_Test-*` pods. To regenerate it per stage:
+available to downstream `L0_Test-*` pods. To deliver it per stage:
 
-1. `getCbtsResult` base64-encodes the input JSON and stores it in
-   `result.cbts_input_json_b64`, which rides along inside `testFilter`.
-   Encoding is mandatory: the raw payload contains PR diff text which can
-   include `${...}` or `{...}` fragments (Python f-strings, shell vars, etc.)
-   that the Jenkins tokenmacro plugin tries to evaluate when the parent
-   serializes `globalVars` for `Parameterized-Remote-Trigger`, raising
-   `MacroEvaluationException` and blocking test dispatch.
-2. `renderTestDB` on the stage agent decodes `cbts_input_json_b64`, writes
-   it to a temp file, and re-runs `main.py`. Output is deterministic, so
-   each agent gets the same `cbts_test_db/` as L0_MergeRequest produced.
+1. `getCbtsResult` tars `cbts_test_db/` and uploads it to Artifactory,
+   recording the path in `result.cbts_test_db_artifact_path` (rides along
+   inside `testFilter`).
+2. `renderTestDB` on the stage agent downloads and extracts that tarball
+   into `${llmSrc}/${test_db_dir_override}`; trt-test-db then renders from
+   the narrowed test-db.
 
-If `cbts_input_json_b64` exceeds 256 KB (post-encoding, the size that
-actually travels over the wire) the piggyback is dropped; Layer 3 falls
-back to the source test-db on each stage agent. Layer 2 still applies.
+If the upload or the download/extraction fails, the override directory is
+absent and `renderTestDB` falls back to the source test-db. Layer 2 still
+applies. The tarball carries only the narrowed YAMLs, so no PR diff text
+travels between jobs.
 
-## Split-collapse heuristic (Layer 2.5)
+## Split-resize heuristic (Layer 2.5)
 
-In `_cbtsMaybeCollapseSplits`, when the stage's narrowed count < 20:
-- `splitId == 1` → run as splits=1 (single agent runs the full list).
-- `splitId > 1` → early return; no agent allocated.
+`blocks.compute_stage_split_counts` sizes each narrowed stage to
+`k = clamp(ceil(est_seconds / 2h), 1, stage.total_splits)` (cap parsed from
+`L0_Test.groovy`). `est_seconds` sums the `.test_durations` cache over the
+stage's kept entries (exact node-id, else subtree-sum, else average — over-counts
+toward the cap, never under-sizes). `launchTestJobs::cbtsResizeSplits` keeps only
+shards `1..k`; pytest-split then balances within them via `least_duration`.
 
-At/above 20, default splits stand. The count is computed by
-`blocks.compute_stage_test_counts` using the same keep filter as
-`write_filtered_test_db`.
+`cbtsResizeSplits` also renames each narrowed stage with a `-cbts` suffix so its
+narrowed result is never reused (whole-stage `REUSE_STAGE_LIST` or per-test
+`reusePassedTestResults`) by a non-CBTS full run on the same commit. A suffix (not
+a prefix) keeps the GPU type as the first `-` token, so positional stage-name
+parsers need no change; full sanity / PerfSanity stages keep their original names
+and reuse normally.
 
 ## Adding a new rule
 
@@ -285,7 +291,7 @@ CBTS defers to the existing filter chain when:
   YAML edit)
 - Combined scope is `None` (incompatible mix)
 - Layer 3 narrowing would empty a block — block keeps original tests
-- `cbts_input_json_b64` (post-encoding) exceeds 256 KB — Layer 3 falls back per stage
+- `cbts_test_db` tarball upload or download/extraction fails — renderTestDB falls back to source
 - Narrowed YAML missing/empty on a stage agent — renderTestDB falls back
 
 Every fallback emits an `echo` log line.

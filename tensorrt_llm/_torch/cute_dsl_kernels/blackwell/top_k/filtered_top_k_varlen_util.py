@@ -98,6 +98,9 @@ class FilteredTopKKernelVarlen:
             self.enable_gmem_store = False
 
         self.return_val = return_val
+        # Subclasses set to True to subtract row_start from absolute indices before
+        # writing output (used in prefill where row_start may be non-zero).
+        self.subtract_row_start_on_output = False
 
         self.vec_size = num_copy_bits // dtype.width
         if cutlass.const_expr(dtype not in [cutlass.Float32, cute.BFloat16, cutlass.Float16]):
@@ -996,6 +999,8 @@ class FilteredTopKKernelVarlen:
                             topk_vals[v, i] = score[index]
                         if cutlass.const_expr(self.merge_blocks):
                             topk_indices[v, i] = indices[index]
+                        elif cutlass.const_expr(self.subtract_row_start_on_output):
+                            topk_indices[v, i] = index - cutlass.Int32(row_start)
                         else:
                             topk_indices[v, i] = index
             # [atom, rest_vec]

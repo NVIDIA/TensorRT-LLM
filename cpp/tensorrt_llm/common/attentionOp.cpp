@@ -748,7 +748,7 @@ size_t AttentionOp::getFmhaMultiCtasKvScratchSize() const noexcept
 }
 
 size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t max_num_seq, int32_t input_seq_length,
-    int32_t cross_kv_length, int32_t max_num_tokens) const noexcept
+    int32_t cross_kv_length, int32_t max_num_tokens, int32_t total_kv_len) const noexcept
 {
     if (max_num_tokens == 0)
     {
@@ -828,8 +828,12 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
         }
         else
         {
-            fp8_k_buf_size = mChunkPrefillBufferBatchSize * max_num_tokens * static_cast<size_t>(total_k_dim_all_heads);
-            fp8_v_buf_size = mChunkPrefillBufferBatchSize * max_num_tokens * static_cast<size_t>(total_v_dim_all_heads);
+            // Use total_kv_len when available (KV cache reuse causes total_kv_len >> max_num_tokens).
+            // enqueueContext sizes these buffers by total_kv_len, so workspace must match.
+            size_t const kv_buf_tokens = std::max(
+                static_cast<size_t>(total_kv_len), static_cast<size_t>(mChunkPrefillBufferBatchSize) * max_num_tokens);
+            fp8_k_buf_size = kv_buf_tokens * static_cast<size_t>(total_k_dim_all_heads);
+            fp8_v_buf_size = kv_buf_tokens * static_cast<size_t>(total_v_dim_all_heads);
         }
     }
     else if (useSageAttnSeparateQkv)
@@ -1731,8 +1735,12 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         preprocessingParams.qkv_bias = params.qkv_bias;
         preprocessingParams.tokens_info = decoder_params.tokensInfo;
         preprocessingParams.seq_lens = params.context_lengths;
-        // Indicate if chunked-context is used (i.e. q_seqlen > kv_seqlen).
-        preprocessingParams.cache_seq_lens = params.sequence_lengths;
+        // For self-attention, cache_seq_lens indicates whether chunked context is used
+        // (i.e. cache_seq_len > seq_len).
+        // For cross-attention, callers do not consistently use sequence_lengths as decoder length; use decoder
+        // context lengths so the encoder KV-cache write gate opens.
+        preprocessingParams.cache_seq_lens = isCrossAttention() ? params.context_lengths : params.sequence_lengths;
+
         preprocessingParams.encoder_seq_lens = params.encoder_input_lengths;
         preprocessingParams.cu_seq_lens = contextCuQSeqlens;
         // Cross-attention only.
