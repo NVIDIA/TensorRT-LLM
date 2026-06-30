@@ -135,8 +135,9 @@ else:
 # tries to load a Gemma4 model.
 try:
     from .modeling_gemma4 import Gemma4ForCausalLM  # noqa
+    from .modeling_gemma4_unified import \
+        Gemma4UnifiedForConditionalGeneration  # noqa
     from .modeling_gemma4mm import Gemma4ForConditionalGeneration  # noqa
-    from .modeling_gemma4_unified import Gemma4UnifiedForConditionalGeneration  # noqa
 
     __all__.extend([
         "Gemma4ForCausalLM",

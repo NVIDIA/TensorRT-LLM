@@ -55,8 +55,8 @@ class TestGemma4UnifiedRegistration(unittest.TestCase):
         # Importing the package runs the @register_auto_model decorator.
         import tensorrt_llm._torch.models  # noqa: F401
         from tensorrt_llm._torch.models.modeling_utils import (
-            MODEL_CLASS_MAPPING,
             _GEMMA4_ARCHITECTURES,
+            MODEL_CLASS_MAPPING,
         )
 
         self.assertIn(_UNIFIED_ARCH, MODEL_CLASS_MAPPING)

@@ -99,7 +99,11 @@ class Gemma4UnifiedVisionEmbedder(nn.Module):
 
         self.patch_ln1 = LayerNorm(hidden_size=patch_dim, eps=_VISION_LN_EPS, dtype=dtype)
         self.patch_dense = Linear(
-            in_features=patch_dim, out_features=mm_embed_dim, bias=True, dtype=dtype, mapping=mapping
+            in_features=patch_dim,
+            out_features=mm_embed_dim,
+            bias=True,
+            dtype=dtype,
+            mapping=mapping,
         )
         self.patch_ln2 = LayerNorm(hidden_size=mm_embed_dim, eps=_VISION_LN_EPS, dtype=dtype)
         self.pos_embedding = nn.Parameter(
@@ -197,15 +201,18 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
         self._top_config = config
         self.image_token_ids = (
             torch.tensor([config.image_token_id], dtype=torch.int32, device=self._device)
-            if getattr(config, "image_token_id", None) is not None else None
+            if getattr(config, "image_token_id", None) is not None
+            else None
         )
         self.audio_token_ids = (
             torch.tensor([config.audio_token_id], dtype=torch.int32, device=self._device)
-            if getattr(config, "audio_token_id", None) is not None else None
+            if getattr(config, "audio_token_id", None) is not None
+            else None
         )
         self.video_token_ids = (
             torch.tensor([config.video_token_id], dtype=torch.int32, device=self._device)
-            if getattr(config, "video_token_id", None) is not None else None
+            if getattr(config, "video_token_id", None) is not None
+            else None
         )
 
         # --- Text backbone (reused verbatim) ---
@@ -232,14 +239,20 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
         if getattr(config, "vision_config", None) is not None:
             self.embed_vision = (
                 Gemma4UnifiedVisionEmbedder(
-                    config.vision_config, config.text_config,
-                    dtype=self.model_dtype, mapping=model_config.mapping,
-                ).eval().to(self._device)
+                    config.vision_config,
+                    config.text_config,
+                    dtype=self.model_dtype,
+                    mapping=model_config.mapping,
+                )
+                .eval()
+                .to(self._device)
             )
         if getattr(config, "audio_config", None) is not None:
-            audio_in = getattr(config.audio_config, "output_proj_dims", None) \
-                or getattr(config.audio_config, "audio_embed_dim", None) \
+            audio_in = (
+                getattr(config.audio_config, "output_proj_dims", None)
+                or getattr(config.audio_config, "audio_embed_dim", None)
                 or config.audio_config.hidden_size
+            )
             self.embed_audio = (
                 Gemma4MultimodalEmbedder(
                     mm_hidden_size=audio_in,
@@ -247,7 +260,9 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
                     eps=config.audio_config.rms_norm_eps,
                     dtype=self.model_dtype,
                     mapping=model_config.mapping,
-                ).eval().to(self._device)
+                )
+                .eval()
+                .to(self._device)
             )
 
         # Surface the text (LLM) config so KV-cache sizing + is_gemma4_hybrid
@@ -328,13 +343,17 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
 
         if len(pixel_values_list) > 0 and self.embed_vision is not None:
             pv = torch.cat(pixel_values_list)
-            pid = torch.cat(image_pos_list) if len(image_pos_list) == len(pixel_values_list) else None
+            pid = (
+                torch.cat(image_pos_list) if len(image_pos_list) == len(pixel_values_list) else None
+            )
             mm_embeds.append(self._get_image_features(pv, pid))
             all_mm_token_ids.append(self.image_token_ids)
 
         if len(video_pixel_list) > 0 and self.embed_vision is not None:
             vpv = torch.cat(video_pixel_list)
-            vpid = torch.cat(video_pos_list) if len(video_pos_list) == len(video_pixel_list) else None
+            vpid = (
+                torch.cat(video_pos_list) if len(video_pos_list) == len(video_pixel_list) else None
+            )
             mm_embeds.append(self._get_image_features(vpv, vpid))
             all_mm_token_ids.append(
                 self.video_token_ids if self.video_token_ids is not None else self.image_token_ids
@@ -384,21 +403,26 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
         # Text backbone: "model.language_model.X" -> "model.X" (same as the
         # parent), then load via the reused Gemma4 text core.
         llm_weights = {
-            "model." + k[len(_LANG_PREFIX):]: v
-            for k, v in weights.items() if k.startswith(_LANG_PREFIX)
+            "model." + k[len(_LANG_PREFIX) :]: v
+            for k, v in weights.items()
+            if k.startswith(_LANG_PREFIX)
         }
         self.llm.load_weights(llm_weights, weight_mapper)
 
         # Encoder-free MM front-end: strip the outer "model." from the non-text
         # keys and route to the embedders.
         stripped = {
-            k[len("model."):]: v
+            k[len("model.") :]: v
             for k, v in weights.items()
             if k.startswith("model.") and not k.startswith(_LANG_PREFIX)
         }
         if self.embed_vision is not None:
-            ve = filter_weights("vision_embedder", stripped)   # patch_ln1/dense/ln2/pos_embedding/pos_norm
-            proj = filter_weights("embed_vision", stripped)     # embedding_projection.weight (top-level)
+            ve = filter_weights(
+                "vision_embedder", stripped
+            )  # patch_ln1/dense/ln2/pos_embedding/pos_norm
+            proj = filter_weights(
+                "embed_vision", stripped
+            )  # embedding_projection.weight (top-level)
             self.embed_vision.load_weights(ve, proj)
         if self.embed_audio is not None:
             self.embed_audio.load_weights(filter_weights("embed_audio", stripped))
