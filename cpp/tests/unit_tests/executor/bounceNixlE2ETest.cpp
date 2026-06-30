@@ -491,3 +491,142 @@ TEST(BounceNixlE2E, MultiAgentManySendersToOneReceiver)
         cudaFree(x.dst);
     }
 }
+
+namespace
+{
+// Build one full bounce node (agent+engine+arena+exec+channel+transport). Returns nullptr if the
+// NIXL agent/backend can't init or the arena can't be registered (caller GTEST_SKIPs).
+std::unique_ptr<Node> makeNode(std::string const& name, b::BounceConfig const& cfg, std::size_t maxDescs)
+{
+    auto n = std::make_unique<Node>();
+    n->name = name;
+    try
+    {
+        kvc::BaseAgentConfig c{name, /*useProgThread=*/true, /*multiThread=*/false, /*useListenThread=*/true};
+        n->agent = std::make_unique<kvc::NixlTransferAgent>(c);
+    }
+    catch (std::exception const&)
+    {
+        return nullptr;
+    }
+    n->eng = std::make_unique<b::NixlTransferEngine>(n->agent->getRawAgent(), 0);
+    n->arena = std::make_unique<b::BounceArena>(cfg.arenaBytes, 0, /*allowFabric=*/false);
+    n->exec = std::make_unique<b::ExecPool>(cfg.windowDepth + 4, maxDescs, 0);
+    if (!n->eng->registerRegion(n->arena->base(), n->arena->bytes()))
+    {
+        return nullptr;
+    }
+    n->ch = std::make_unique<b::ZmqControlChannel>(name);
+    n->tx = std::make_unique<b::BounceTransport>(
+        n->name, cfg, 0, n->ch.get(), n->eng.get(), n->arena.get(), n->exec.get());
+    return n;
+}
+
+// Bidirectional connect: NIXL metadata both ways + bounce addPeer both ways.
+void wirePair(Node& a, Node& b)
+{
+    a.agent->loadRemoteAgent(b.name, b.agent->getLocalConnectionInfo());
+    b.agent->loadRemoteAgent(a.name, a.agent->getLocalConnectionInfo());
+    a.tx->addPeer(b.name, b.ch->localEndpoint());
+    b.tx->addPeer(a.name, a.ch->localEndpoint());
+}
+} // namespace
+
+// FAILURE PATH over the real stack: a request whose peer never GRANTs must FAIL on leaseTimeout, not
+// hang. The sender's WANT goes to a control endpoint with no live receiver transport (nobody grants),
+// so checkTimeouts must resolve the future kFAILURE within ~leaseTimeoutMs (R5 over the real
+// ZmqControlChannel + NixlTransferEngine wiring).
+TEST(BounceNixlE2E, NoGrantTimesOutNotHang)
+{
+    if (!hasCuda())
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    constexpr std::size_t kMaxChunkBytes = 4096;
+    std::size_t const maxDescs = std::max<std::size_t>(1024ULL, kMaxChunkBytes / 256ULL);
+    b::BounceConfig cfg;
+    cfg.maxChunkBytes = kMaxChunkBytes;
+    cfg.arenaBytes = 1 << 20;
+    cfg.minBlock = 256;
+    cfg.windowDepth = 2;
+    cfg.window = 2;
+    cfg.scatterWorkers = 2;
+    cfg.leaseTimeoutMs = 1500; // short: a no-grant request must fail fast, not hang
+
+    auto A = makeNode("toGrantA", cfg, maxDescs);
+    if (!A)
+    {
+        GTEST_SKIP() << "NIXL agent/backend unavailable";
+    }
+    // A bound ROUTER that no transport ever recv()s on -> A's WANT is delivered but never granted.
+    b::ZmqControlChannel ghost("ghostPeer");
+    A->tx->addPeer("ghostPeer", ghost.localEndpoint());
+
+    auto bufs = makeXferBufs(/*nDescs=*/8, /*descBytes=*/500, /*seed=*/7);
+    auto fut = A->tx->submit(bufs.srcDescs, bufs.dstDescs, "ghostPeer");
+    ASSERT_EQ(fut.wait_for(std::chrono::seconds(10)), std::future_status::ready) << "no-grant request hung";
+    EXPECT_EQ(fut.get(), kvc::TransferState::kFAILURE);
+
+    A->tx->shutdown();
+    cudaFree(bufs.src);
+    cudaFree(bufs.dst);
+}
+
+// FAILURE PATH over real RDMA: forgetPeer() while a transfer is in flight must not hang, leak, or
+// corrupt. We submit then immediately forgetPeer the target; the request must RESOLVE (SUCCESS if it
+// beat the queued reclaim, else FAILURE) — never hang. Then several FRESH transfers to the same peer
+// must still complete byte-exact, proving forgetPeer's reclaim returned the regions to the arena and
+// left the reactor healthy (small arena + window -> a leak would soon exhaust it and stall these).
+TEST(BounceNixlE2E, ForgetPeerInFlightRecovers)
+{
+    if (!hasCuda())
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    constexpr std::size_t kMaxChunkBytes = 4096;
+    std::size_t const maxDescs = std::max<std::size_t>(1024ULL, kMaxChunkBytes / 256ULL);
+    b::BounceConfig cfg;
+    cfg.maxChunkBytes = kMaxChunkBytes;
+    cfg.arenaBytes = 1 << 20;
+    cfg.minBlock = 256;
+    cfg.windowDepth = 2;
+    cfg.window = 2;
+    cfg.scatterWorkers = 2;
+    cfg.leaseTimeoutMs = 5000;
+
+    auto A = makeNode("fpA", cfg, maxDescs);
+    auto B = makeNode("fpB", cfg, maxDescs);
+    if (!A || !B)
+    {
+        GTEST_SKIP() << "NIXL agent/backend unavailable";
+    }
+    wirePair(*A, *B);
+
+    auto bufs = makeXferBufs(/*nDescs=*/24, /*descBytes=*/600, /*seed=*/1);
+    auto fut = A->tx->submit(bufs.srcDescs, bufs.dstDescs, "fpB");
+    A->tx->forgetPeer("fpB"); // drop the peer (queued; applied on A's IO thread)
+    ASSERT_EQ(fut.wait_for(std::chrono::seconds(10)), std::future_status::ready) << "request hung after forgetPeer";
+    auto const st = fut.get();
+    EXPECT_TRUE(st == kvc::TransferState::kSUCCESS || st == kvc::TransferState::kFAILURE)
+        << "unexpected state " << static_cast<int>(st);
+    cudaFree(bufs.src);
+    cudaFree(bufs.dst);
+
+    // Recovery + no-leak: forgetPeer is a one-shot queued event, drained by the time fut resolved, so
+    // these new flows aren't reclaimed. The dealer to fpB + NIXL metadata persist (forgetPeer only
+    // reclaims scheduler/request state), so no re-wire is needed.
+    for (int k = 0; k < 5; ++k)
+    {
+        auto rb = makeXferBufs(/*nDescs=*/20, /*descBytes=*/600, /*seed=*/static_cast<std::uint32_t>(50 + k));
+        auto rf = A->tx->submit(rb.srcDescs, rb.dstDescs, "fpB");
+        ASSERT_EQ(rf.wait_for(std::chrono::seconds(30)), std::future_status::ready)
+            << "post-forget transfer hung k=" << k;
+        EXPECT_EQ(rf.get(), kvc::TransferState::kSUCCESS) << "post-forget transfer failed k=" << k;
+        EXPECT_TRUE(verifyXferBufs(rb)) << "post-forget byte mismatch k=" << k;
+        cudaFree(rb.src);
+        cudaFree(rb.dst);
+    }
+
+    A->tx->shutdown();
+    B->tx->shutdown();
+}
