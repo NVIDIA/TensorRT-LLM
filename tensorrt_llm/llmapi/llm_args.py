@@ -778,6 +778,11 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         "`fp4` requires Blackwell+ (SM>=100) at runtime and "
         "index_head_dim=128.",
     )
+    index_share_for_mtp_iteration: Optional[bool] = Field(
+        default=None,
+        description=
+        "Reuse the indexer Top-K across MTP draft steps instead of recomputing "
+        "it each step. Defaults to the model's HF config value.")
 
     @model_validator(mode="after")
     def _validate_indexer_k_dtype(self):
@@ -843,6 +848,8 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             indexer_rope_interleave=self.indexer_rope_interleave,
             enable_heuristic_topk=self.enable_heuristic_topk,
             indexer_k_dtype=self.indexer_k_dtype,
+            mtp_index_share=bool(_value("index_share_for_mtp_iteration",
+                                        False)),
         )
 
     def to_sparse_metadata_params(self, **kwargs):

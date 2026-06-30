@@ -96,6 +96,7 @@ class DSAParams(SparseParams):
     indexer_rope_interleave: bool = False
     enable_heuristic_topk: bool = False
     indexer_k_dtype: Literal["fp8", "fp4"] = "fp8"
+    mtp_index_share: bool = False
 
     @property
     def indices_block_size(self) -> int:
@@ -1067,6 +1068,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 capture_graph=capture_graph,
             )
 
+        # MTP cross-step indexer Top-K reuse state.
+        self.shared_topk_indices: Optional[torch.Tensor] = None
+        self.indexer_skip_topk = False
+        self.in_mtp_draft_loop = False
+
         # Persistent scratch for the Radix-split-work indexer path. Re-created
         # in update_spec_dec_param when max_draft_tokens changes so it stays
         # large enough for the MTP generation-row count.
@@ -1226,6 +1232,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         pool_indices = pool_indices.clamp(min=0,
                                           max=max_pool_idx).to(torch.int32)
         return pool_indices
+
+    def set_skip_topk(self, skip: bool):
+        self.indexer_skip_topk = skip
+
+    def set_in_mtp_draft_loop(self, active: bool):
+        self.in_mtp_draft_loop = active
 
     def _invalidate_pool_view_cache(self):
         """Invalidate the cached pool view and related step-invariant values.
@@ -1730,6 +1742,8 @@ class Indexer(nn.Module):
 
         self._enable_heuristic_topk = (sparse_params.enable_heuristic_topk
                                        and get_sm_version() >= 100)
+
+        self.mtp_index_share = sparse_params.mtp_index_share
 
         if (self.use_cute_dsl_topk
                 or self.use_cute_dsl_paged_mqa_logits) and layer_idx == 0:
@@ -2527,7 +2541,16 @@ class Indexer(nn.Module):
                 local_layer, num_generations:num_generations +
                 num_contexts].copy_(topk_indices_buffer[last_ctx_idx, :])
 
-        if has_decode and not metadata.skip_indexer_for_gen_reqs:
+        reuse_topk = (self.mtp_index_share
+                      and getattr(metadata, "indexer_skip_topk", False)
+                      and getattr(metadata, "shared_topk_indices",
+                                  None) is not None)
+
+        if has_decode and not metadata.skip_indexer_for_gen_reqs and reuse_topk:
+            topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
+                                num_gen_tokens, :] = \
+                metadata.shared_topk_indices[:num_generations, :]
+        elif has_decode and not metadata.skip_indexer_for_gen_reqs:
             # Get decode lengths per request (from seq_lens) for validation
             gen_seq_lens = metadata.seq_lens[num_contexts:num_contexts +
                                              num_generations]
@@ -2769,6 +2792,25 @@ class Indexer(nn.Module):
             # Fill topk_indices_buffer with pre-defined dense topk indices
             topk_indices_buffer[num_ctx_tokens:num_tokens, :] = \
                 metadata.topk_indices_buffer[num_ctx_tokens:num_tokens, :]
+
+        # MTP Top-K stash: save each sequence's last-token Top-K for reuse
+        # by subsequent draft steps.
+        if (self.mtp_index_share
+                and getattr(metadata, "in_mtp_draft_loop", False)
+                and not reuse_topk):
+            rows = None
+            if num_generations > 0:
+                next_n = num_gen_tokens // num_generations
+                rows = topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
+                                           num_gen_tokens][next_n - 1::next_n]
+            if num_contexts > 0:
+                ctx_last = torch.cumsum(
+                    metadata.seq_lens_cuda[:num_contexts].to(
+                        torch.long), dim=0) - 1
+                ctx_rows = topk_indices_buffer[ctx_last]
+                rows = ctx_rows if rows is None else torch.cat([ctx_rows, rows])
+            if rows is not None:
+                metadata.shared_topk_indices = rows.contiguous()
         return topk_indices_buffer
 
     def _weight_scale(self, weights: torch.Tensor,
