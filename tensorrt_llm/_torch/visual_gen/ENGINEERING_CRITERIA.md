@@ -1,14 +1,11 @@
 # VisualGen Engineering Criteria
 
-VisualGen aims to deliver **SOL performance** for image and video
-generation with **world-class quality**.
-
 In the agentic-coding era, implementing models and features has gotten
 dramatically cheaper — but shaping the project around them now takes
 a larger share of engineering effort.
 
 This document aligns the high-level engineering principles and
-guidelines that hold VisualGen to its **world-class quality** bar, for
+guidelines that hold VisualGen's quality, for
 engineers ***and the agents*** alike.
 
 ## 1. New model support
