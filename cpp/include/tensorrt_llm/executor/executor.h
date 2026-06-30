@@ -1535,8 +1535,8 @@ private:
     /// transfer may be degraded.
     std::optional<size_t> mMaxTokensInBuffer;
     std::optional<int> mKvTransferTimeoutMs;
-    // @brief Timeout in milliseconds to wait for the sender future to be ready when scheduled batch size is 0. This
-    // allows the request to be eventually cancelled by the user or because of kv_transfer_timeout_ms
+    // @brief Bounded wait in milliseconds for polling the sender future when the scheduled batch size is 0. This lets
+    // the executor observe cancellation and KV-transfer timeout state without blocking indefinitely.
     std::optional<int> mKvTransferSenderFutureTimeoutMs;
     // @brief Bounded wait interval in milliseconds for polling KV transfer progress when active transfers block
     // disaggregated admission.

@@ -1,4 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import gc
+import multiprocessing
 import sys
 import time
 import uuid
@@ -11,6 +27,8 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.pyexecutor import \
+    kv_cache_transceiver as transceiver_module
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import \
     create_kv_cache_transceiver
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
@@ -32,10 +50,14 @@ DEFAULT_KV_TRANSFER_TIMEOUT_S = (
 KV_TRANSFER_COMPLETION_MARGIN_S = 10.0
 
 
-def create_kv_cache_manager(mapping, dtype):
+def create_kv_cache_manager(mapping,
+                            dtype,
+                            max_tokens=256,
+                            max_seq_len=256,
+                            max_batch_size=1):
     return KVCacheManager(
         trtllm.KvCacheConfig(
-            max_tokens=256,
+            max_tokens=max_tokens,
             enable_block_reuse=False,
         ),
         tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
@@ -43,8 +65,8 @@ def create_kv_cache_manager(mapping, dtype):
         num_kv_heads=1,
         head_dim=1,
         tokens_per_block=8,
-        max_seq_len=256,
-        max_batch_size=1,
+        max_seq_len=max_seq_len,
+        max_batch_size=max_batch_size,
         mapping=mapping,
         dtype=dtype)
 
@@ -222,6 +244,313 @@ def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
     finally:
         shutdown_transceivers(kv_cache_transceiver_gen,
                               kv_cache_transceiver_ctx)
+
+
+def _run_cpp_nixl_sync_transfer_stress():
+    """Exercise repeated empty-to-nonempty sender transitions in a child."""
+    request_count = 64
+    prompt_len = 16
+    mapping = Mapping(world_size=1, rank=0)
+    dist = Distributed.get(mapping)
+    manager_kwargs = {
+        "max_tokens": request_count * prompt_len * 2,
+        "max_seq_len": prompt_len,
+        "max_batch_size": request_count,
+    }
+    kv_cache_manager_ctx = create_kv_cache_manager(mapping, DataType.HALF,
+                                                   **manager_kwargs)
+    kv_cache_manager_gen = create_kv_cache_manager(mapping, DataType.HALF,
+                                                   **manager_kwargs)
+    cache_transceiver_config = CacheTransceiverConfig(backend="NIXL",
+                                                      transceiver_runtime="CPP",
+                                                      max_tokens_in_buffer=512)
+    transceiver_ctx = create_kv_cache_transceiver(mapping, dist,
+                                                  kv_cache_manager_ctx,
+                                                  AttentionTypeCpp.DEFAULT,
+                                                  cache_transceiver_config)
+    transceiver_gen = create_kv_cache_transceiver(mapping, dist,
+                                                  kv_cache_manager_gen,
+                                                  AttentionTypeCpp.DEFAULT,
+                                                  cache_transceiver_config)
+
+    try:
+        sampling_config = tensorrt_llm.bindings.SamplingConfig(
+            SamplingParams()._get_sampling_config())
+        ctx_requests = [
+            LlmRequest(
+                request_id=request_id,
+                max_new_tokens=1,
+                input_tokens=list(range(prompt_len)),
+                sampling_config=sampling_config,
+                is_streaming=False,
+                llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
+            for request_id in range(request_count)
+        ]
+        kv_cache_manager_ctx.impl.add_sequence_batch(
+            [(request.py_request_id, request.prompt_len, 1)
+             for request in ctx_requests], ctx_requests)
+        fill_kv_cache_buffer(kv_cache_manager_ctx)
+
+        transceiver_ctx.respond_and_send_async(ctx_requests[0])
+        completed_ctx_ids = set()
+
+        def poll_context_transfers():
+            completed, failed = transceiver_ctx.check_context_transfer_status(1)
+            assert failed == []
+            completed_ctx_ids.update(completed)
+
+        for request_index, ctx_request in enumerate(ctx_requests):
+            gen_request = LlmRequest(
+                request_id=request_index,
+                max_new_tokens=1,
+                input_tokens=list(range(prompt_len)),
+                sampling_config=sampling_config,
+                is_streaming=False,
+                llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+                context_phase_params=ctx_request.context_phase_params)
+            kv_cache_manager_gen.impl.add_sequence_batch(
+                [(gen_request.py_request_id, gen_request.prompt_len, 1)],
+                [gen_request])
+
+            transceiver_gen.request_and_receive_sync(gen_request)
+
+            # Queue the next response immediately so its insertion can overlap
+            # the previous response's sender-side cleanup.
+            if request_index + 1 < request_count:
+                transceiver_ctx.respond_and_send_async(
+                    ctx_requests[request_index + 1])
+
+            assert (gen_request.state ==
+                    LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE)
+
+            ctx_block_ids = kv_cache_manager_ctx.get_cache_indices(ctx_request)
+            gen_block_ids = kv_cache_manager_gen.get_cache_indices(gen_request)
+            assert torch.equal(
+                kv_cache_manager_ctx.get_unique_primary_pool()[ctx_block_ids],
+                kv_cache_manager_gen.get_unique_primary_pool()[gen_block_ids],
+            ), f"different KV-cache values for request {request_index}"
+
+            expected_ctx_id = ctx_request.py_request_id
+            wait_for_transfer_completion(poll_context_transfers,
+                                         lambda request_id=expected_ctx_id:
+                                         request_id in completed_ctx_ids)
+    finally:
+        shutdown_transceivers(transceiver_gen, transceiver_ctx)
+
+
+@pytest.mark.timeout(150)
+def test_cpp_nixl_sync_transfer_stress():
+    """C++ NIXL sync transfers must not lose sender wakeups between requests."""
+    process = multiprocessing.get_context("spawn").Process(
+        target=_run_cpp_nixl_sync_transfer_stress,
+        name="cpp-nixl-sync-transfer-stress")
+    process.start()
+    process.join(timeout=120)
+    try:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=5)
+            pytest.fail("C++ NIXL synchronous KV transfer stress test hung")
+        assert process.exitcode == 0, (
+            f"C++ NIXL synchronous KV transfer child exited with "
+            f"code {process.exitcode}")
+    finally:
+        process.close()
+
+
+@pytest.mark.timeout(120)
+def test_cpp_nixl_active_cancellation_reaches_terminal_error(monkeypatch):
+    """Qualified C++ NIXL cancellation must quiesce both transfer sides."""
+    _configure_cpp_nixl_cancel_env(monkeypatch, "1")
+
+    mapping = Mapping(world_size=1, rank=0)
+    dist = Distributed.get(mapping)
+    kv_cache_manager_ctx = create_kv_cache_manager(mapping, DataType.HALF)
+    kv_cache_manager_gen = create_kv_cache_manager(mapping, DataType.HALF)
+    cache_transceiver_config = CacheTransceiverConfig(
+        backend="NIXL",
+        transceiver_runtime="CPP",
+        max_tokens_in_buffer=512,
+        kv_transfer_timeout_ms=5000,
+        kv_transfer_sender_future_timeout_ms=10,
+        kv_transfer_poll_interval_ms=10)
+    transceiver_ctx = create_kv_cache_transceiver(
+        mapping,
+        dist,
+        kv_cache_manager_ctx,
+        AttentionTypeCpp.DEFAULT,
+        cache_transceiver_config,
+        inflight_cancel_supported_by_executor=True)
+    transceiver_gen = create_kv_cache_transceiver(
+        mapping,
+        dist,
+        kv_cache_manager_gen,
+        AttentionTypeCpp.DEFAULT,
+        cache_transceiver_config,
+        inflight_cancel_supported_by_executor=True)
+
+    try:
+        assert transceiver_ctx.supports_inflight_request_cancellation()
+        assert transceiver_gen.supports_inflight_request_cancellation()
+        assert transceiver_ctx._inflight_request_cancellation_enabled
+        assert transceiver_gen._inflight_request_cancellation_enabled
+
+        fill_kv_cache_buffer(kv_cache_manager_ctx)
+        sampling_config = tensorrt_llm.bindings.SamplingConfig(
+            SamplingParams()._get_sampling_config())
+        ctx_request = LlmRequest(
+            request_id=0,
+            max_new_tokens=1,
+            input_tokens=list(range(256)),
+            sampling_config=sampling_config,
+            is_streaming=False,
+            llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
+        kv_cache_manager_ctx.impl.add_sequence_batch(
+            [(ctx_request.py_request_id, ctx_request.prompt_len, 1)],
+            [ctx_request])
+        transceiver_ctx.respond_and_send_async(ctx_request)
+
+        # Cancel before starting GEN. This deterministically exercises the
+        # sender's queued-cancellation path instead of racing a tiny transfer.
+        assert ctx_request.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+        assert transceiver_ctx.cancel_request(ctx_request)
+
+        gen_request = LlmRequest(
+            request_id=0,
+            max_new_tokens=1,
+            input_tokens=list(range(256)),
+            sampling_config=sampling_config,
+            is_streaming=False,
+            llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+            context_phase_params=ctx_request.context_phase_params)
+        kv_cache_manager_gen.impl.add_sequence_batch(
+            [(gen_request.py_request_id, gen_request.prompt_len, 1)],
+            [gen_request])
+        transceiver_gen.request_and_receive_async(gen_request)
+
+        failed_ctx_ids = set()
+
+        def poll_transfers():
+            completed, failed = transceiver_ctx.check_context_transfer_status(1)
+            assert completed == []
+            failed_ctx_ids.update(failed)
+            transceiver_gen.check_gen_transfer_status(1)
+
+        def cancellation_quiesced():
+            return (ctx_request.py_request_id in failed_ctx_ids
+                    and ctx_request.state == LlmRequestState.DISAGG_TRANS_ERROR
+                    and gen_request.state == LlmRequestState.DISAGG_TRANS_ERROR
+                    and transceiver_gen.check_gen_transfer_complete())
+
+        wait_for_transfer_completion(poll_transfers,
+                                     cancellation_quiesced,
+                                     timeout_s=10.0)
+
+        # A cancellation committed before ready=true never exposes a transfer
+        # buffer to a peer, so both sides should quiesce without poisoning it.
+        assert not transceiver_ctx.has_poisoned_transfer_buffer()
+        assert not transceiver_gen.has_poisoned_transfer_buffer()
+    finally:
+        shutdown_transceivers(transceiver_gen, transceiver_ctx)
+
+
+def _configure_cpp_nixl_cancel_env(monkeypatch, mode):
+    monkeypatch.setenv(transceiver_module._DISAGG_INFLIGHT_CANCEL_ENABLED_ENV,
+                       mode)
+    monkeypatch.setenv(transceiver_module._NIXL_KVCACHE_BACKEND_ENV, "UCX")
+    monkeypatch.delenv(
+        transceiver_module._DISABLE_KV_CACHE_TRANSFER_OVERLAP_ENV,
+        raising=False)
+    monkeypatch.delenv(transceiver_module._DISAGG_LAYERWISE_ENV, raising=False)
+    monkeypatch.delenv(transceiver_module._TRY_ZCOPY_FOR_KV_CACHE_TRANSFER_ENV,
+                       raising=False)
+    for env_name, _ in transceiver_module._CACHE_TRANSCEIVER_BACKEND_ENV_VARS:
+        monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.setattr(transceiver_module,
+                        "_disagg_inflight_cancel_mode_cache", None)
+
+
+@pytest.mark.timeout(120)
+def test_cpp_nixl_sync_rejection_preserves_transfer_error(monkeypatch):
+    """Default-off synchronous receive must not rewrite rejection as success."""
+    _configure_cpp_nixl_cancel_env(monkeypatch, "0")
+
+    mapping = Mapping(world_size=1, rank=0)
+    dist = Distributed.get(mapping)
+    kv_cache_manager_ctx = create_kv_cache_manager(mapping, DataType.HALF)
+    kv_cache_manager_gen = create_kv_cache_manager(mapping, DataType.HALF)
+    cache_transceiver_config = CacheTransceiverConfig(
+        backend="NIXL",
+        transceiver_runtime="CPP",
+        max_tokens_in_buffer=512,
+        kv_transfer_timeout_ms=5000,
+        kv_transfer_sender_future_timeout_ms=10,
+        kv_transfer_poll_interval_ms=10)
+    transceiver_ctx = create_kv_cache_transceiver(
+        mapping,
+        dist,
+        kv_cache_manager_ctx,
+        AttentionTypeCpp.DEFAULT,
+        cache_transceiver_config,
+        inflight_cancel_supported_by_executor=True)
+    transceiver_gen = create_kv_cache_transceiver(
+        mapping,
+        dist,
+        kv_cache_manager_gen,
+        AttentionTypeCpp.DEFAULT,
+        cache_transceiver_config,
+        inflight_cancel_supported_by_executor=True)
+
+    try:
+        assert transceiver_ctx.supports_inflight_request_cancellation()
+        assert transceiver_gen.supports_inflight_request_cancellation()
+        assert not transceiver_ctx._inflight_request_cancellation_enabled
+        assert not transceiver_gen._inflight_request_cancellation_enabled
+
+        fill_kv_cache_buffer(kv_cache_manager_ctx)
+        sampling_config = tensorrt_llm.bindings.SamplingConfig(
+            SamplingParams()._get_sampling_config())
+        ctx_request = LlmRequest(
+            request_id=0,
+            max_new_tokens=1,
+            input_tokens=list(range(256)),
+            sampling_config=sampling_config,
+            is_streaming=False,
+            llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
+        kv_cache_manager_ctx.impl.add_sequence_batch(
+            [(ctx_request.py_request_id, ctx_request.prompt_len, 1)],
+            [ctx_request])
+        transceiver_ctx.respond_and_send_async(ctx_request)
+
+        # Cancel before starting GEN. This deterministically exercises the
+        # sender's queued-cancellation path instead of racing a tiny transfer.
+        assert ctx_request.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+        assert transceiver_ctx.cancel_request(ctx_request)
+
+        gen_request = LlmRequest(
+            request_id=0,
+            max_new_tokens=1,
+            input_tokens=list(range(256)),
+            sampling_config=sampling_config,
+            is_streaming=False,
+            llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+            context_phase_params=ctx_request.context_phase_params)
+        kv_cache_manager_gen.impl.add_sequence_batch(
+            [(gen_request.py_request_id, gen_request.prompt_len, 1)],
+            [gen_request])
+        transceiver_gen.request_and_receive_sync(gen_request)
+
+        assert gen_request.state == LlmRequestState.DISAGG_TRANS_ERROR
+        completed_ctx_ids, failed_ctx_ids = (
+            transceiver_ctx.check_context_transfer_status(1))
+        assert completed_ctx_ids == []
+        assert set(failed_ctx_ids) == {ctx_request.py_request_id}
+        assert ctx_request.state == LlmRequestState.DISAGG_TRANS_ERROR
+    finally:
+        shutdown_transceivers(transceiver_gen, transceiver_ctx)
 
 
 @pytest.mark.timeout(120)

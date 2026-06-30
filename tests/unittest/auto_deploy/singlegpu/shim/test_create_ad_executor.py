@@ -23,6 +23,7 @@ import pytest
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import AttentionType
 from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import create_autodeploy_executor
+from tensorrt_llm._torch.pyexecutor import kv_cache_transceiver as transceiver_module
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import AttentionTypeCpp
 from tensorrt_llm.llmapi import CacheTransceiverConfig
 
@@ -223,10 +224,45 @@ def test_create_executor_uses_cache_transceiver(cache_attention_type, expected_a
     _, _, passed_kv_cache_manager, attention_type, passed_config = create_transceiver.call_args.args
     assert passed_kv_cache_manager is kv_cache_manager
     assert attention_type == expected_attention_type
+    assert create_transceiver.call_args.kwargs["inflight_cancel_supported_by_executor"] is False
     assert passed_config is ad_config.cache_transceiver_config
     assert passed_config.max_tokens_in_buffer == mock_engine.cache_seq_interface.info.max_seq_len
     assert create_transceiver.call_args.kwargs["mamba_cache_manager"] is None
     assert result.kv_cache_transceiver is mock_transceiver
+
+
+def test_create_executor_rejects_required_cancel_without_transceiver(monkeypatch):
+    monkeypatch.setenv(
+        transceiver_module._DISAGG_INFLIGHT_CANCEL_ENABLED_ENV,
+        "1",
+    )
+    monkeypatch.setattr(transceiver_module, "_disagg_inflight_cancel_mode_cache", None)
+    ad_config = LlmArgs(
+        model="test-model",
+        max_batch_size=4,
+        max_seq_len=128,
+        max_input_len=64,
+        backend="_autodeploy",
+        cuda_graph_config={"max_batch_size": 4},
+    )
+    mock_engine, _ = make_mock_engine()
+
+    with (
+        patch("tensorrt_llm._torch.auto_deploy.shim.ad_executor.PyExecutor"),
+        patch(
+            "tensorrt_llm._torch.auto_deploy.shim.ad_executor.ADEngine.build_from_config",
+            return_value=mock_engine,
+        ),
+        patch(
+            "tensorrt_llm._torch.auto_deploy.llm_args.LlmArgs.create_factory",
+            return_value=MockFactory(vocab_size_padded=1000),
+        ),
+    ):
+        with pytest.raises(
+            ValueError,
+            match="requires a configured, supported cache transceiver",
+        ):
+            create_autodeploy_executor(ad_config, MockTokenizer())
 
 
 @pytest.mark.parametrize(

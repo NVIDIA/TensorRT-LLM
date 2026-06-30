@@ -30,10 +30,12 @@ namespace tensorrt_llm::batch_manager
 {
 
 CacheTransferLayer::CacheTransferLayer(executor::kv_cache::CacheState cacheState,
-    std::unique_ptr<BaseCacheFormatter> kvFormatter, std::unique_ptr<RnnCacheFormatter> rnnFormatter)
+    std::unique_ptr<BaseCacheFormatter> kvFormatter, std::unique_ptr<RnnCacheFormatter> rnnFormatter,
+    bool const enableInflightCancel)
     : mCacheState{std::move(cacheState)}
     , mKvFormatter{std::move(kvFormatter)}
     , mRnnFormatter{std::move(rnnFormatter)}
+    , mEnableInflightCancel{enableInflightCancel}
 {
     TLLM_CHECK(mKvFormatter);
 }
@@ -141,6 +143,11 @@ kv_cache_manager::BaseKVCacheManager* CacheTransferLayer::getCacheManager() cons
 BaseCacheFormatter* CacheTransferLayer::getKvFormatter() const noexcept
 {
     return mKvFormatter.get();
+}
+
+bool CacheTransferLayer::isInflightCancelEnabled() const noexcept
+{
+    return mEnableInflightCancel;
 }
 
 } // namespace tensorrt_llm::batch_manager

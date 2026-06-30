@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import dataclasses
 import datetime
 import functools
@@ -7,7 +22,7 @@ import time
 import traceback
 from contextlib import contextmanager
 from enum import IntEnum
-from queue import Queue
+from queue import Empty, Queue
 from typing import (TYPE_CHECKING, Callable, Dict, Iterable, List, Optional,
                     Tuple, Union)
 
@@ -65,7 +80,9 @@ from .handle_logits import HandleLogits
 from .hang_detector import HangDetector
 from .kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache_stats import append_kv_cache_iteration_stats
-from .kv_cache_transceiver import KvCacheTransceiver
+from .kv_cache_transceiver import (KvCacheTransceiver,
+                                   is_disagg_inflight_cancel_enabled,
+                                   is_disagg_inflight_cancel_required)
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID,
                           MAX_SPEC_DECODE_POSITIONS, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
@@ -411,6 +428,15 @@ class PyExecutor:
     # If the number of micro batches is too large, the executor will spend too much host memory (No additional GPU memory is required).
     # 1024 in-flight micro batches can avoid synchronization in most cases and keep host memory usage low.
     MIN_ASYNC_MICRO_BATCH_NUM = 1024
+    # Poison cleanup is best effort.  If a native transfer cannot quiesce in
+    # this window, preserve every transfer-owned resource and require the
+    # process supervisor to restart the worker.
+    FATAL_TRANSFER_CLEANUP_GRACE_PERIOD_S = 10.0
+    # Unsafe executors intentionally remain strongly reachable until process
+    # teardown.  Returning early from shutdown() alone is insufficient because
+    # a serving layer may drop its final reference during graceful shutdown.
+    _UNSAFE_TRANSFER_SHUTDOWN_QUARANTINE: List["PyExecutor"] = []
+    _UNSAFE_TRANSFER_SHUTDOWN_QUARANTINE_LOCK = threading.Lock()
 
     def __init__(
             self,
@@ -681,6 +707,21 @@ class PyExecutor:
         self.is_shutdown = False
         self._fatal_error: Optional[BaseException] = None
         self._error_budget = ErrorBudget()
+        # Requests whose resources are still owned by a native KV transfer
+        # during topology-poison shutdown.  They are kept outside the
+        # scheduler and reaped only after every native owner is terminal.
+        self._fatal_transfer_cleanup_requests: Dict[int, LlmRequest] = {}
+        # A detached context request may already have been terminated by the
+        # partial-reuse path while AsyncTransferManager still pins its blocks.
+        # Such requests need owner quiescence but must not be terminated twice.
+        self._fatal_transfer_cleanup_skip_termination_ids: set[int] = set()
+        self._fatal_transfer_shutdown = False
+        self._fatal_transfer_cleanup_complete = False
+        self._unsafe_transfer_shutdown = False
+        self._fatal_transfer_cleanup_deadline: Optional[float] = None
+        self._fatal_transfer_cleanup_timer: Optional[threading.Timer] = None
+        self._fatal_transfer_cleanup_lock = threading.Lock()
+        self._disagg_inflight_cancel_unsupported_logged = False
         self.max_batch_size = max_batch_size
         self.adp_ctx_waiting_iters_count = 0
         self.adp_ctx_batching_wait_iters_count = 0
@@ -934,27 +975,41 @@ class PyExecutor:
 
             self.kv_connector_manager.wait_for_initialization()
 
-    def _end_transfer_and_maybe_terminate(self, request: LlmRequest):
-        if self.kv_cache_transceiver and request in self.active_requests:
+    def _end_transfer_and_maybe_terminate(self, request: LlmRequest) -> None:
+        fatal_cleanup_pending = request.py_request_id in getattr(
+            self, "_fatal_transfer_cleanup_requests", {})
+        if self.kv_cache_transceiver and (request in self.active_requests
+                                          or fatal_cleanup_pending):
             # Fast-transfer: KV transfer completed in the same iteration
             # before _handle_responses could run. Create the response now
             # while state is still TRANS_IN_PROGRESS (required by C++
             # createResult). Then proceed with end_transfer + termination.
-            response = request.create_response(False, self.dist.rank)
-            if response:
-                response.result.cached_tokens = request.cached_tokens
-                self._maybe_attach_ctx_usage(request, response)
-                # Buffer the response instead of enqueueing immediately.
-                # With ADP, _enqueue_responses does a tp_gather collective.
-                # Calling it here would deadlock because only the owning DP
-                # rank reaches this point; the other DP rank never enters
-                # the matching collective.  The buffer is flushed later at
-                # _flush_pending_transfer_responses where all ranks
-                # participate.
-                self._pending_transfer_responses.append(
-                    (request.py_request_id, response))
+            transfer_failed = request.state == LlmRequestState.DISAGG_TRANS_ERROR
+            user_cancel_pending = self._is_user_cancel_pending(request)
+            preserve_terminal_outcome = (transfer_failed or user_cancel_pending
+                                         or fatal_cleanup_pending)
+            if not preserve_terminal_outcome:
+                response = request.create_response(False, self.dist.rank)
+                if response:
+                    response.result.cached_tokens = request.cached_tokens
+                    self._maybe_attach_ctx_usage(request, response)
+                    # Buffer the response instead of enqueueing immediately.
+                    # With ADP, _enqueue_responses does a tp_gather collective.
+                    # Calling it here would deadlock because only the owning DP
+                    # rank reaches this point; the other DP rank never enters
+                    # the matching collective.  The buffer is flushed later at
+                    # _flush_pending_transfer_responses where all ranks
+                    # participate.
+                    self._pending_transfer_responses.append(
+                        (request.py_request_id, response))
             if self.async_transfer_manager.end_transfer(request):
-                self.active_requests.remove(request)
+                # Error, cancellation, and fatal shutdown each have a
+                # centralized terminal-response path.  Keep the request alive
+                # until that path observes that the last transfer owner is gone.
+                if preserve_terminal_outcome:
+                    return
+                if request in self.active_requests:
+                    self.active_requests.remove(request)
                 self._terminate_request(request)
             return
         if self.async_transfer_manager.end_transfer(request):
@@ -993,6 +1048,12 @@ class PyExecutor:
         except Exception as e:
             logger.error(f"Error in event loop: {e}")
             logger.error(traceback.format_exc())
+            if getattr(self, "_fatal_transfer_shutdown", False):
+                # Any exception after topology poison means transfer ownership
+                # can no longer be proven quiescent.  shutdown() must preserve
+                # registered buffers instead of running normal teardown.
+                self._mark_unsafe_transfer_shutdown(
+                    "event loop failed during topology-poison shutdown", e)
             # Stash the original error so local consumers
             # (_await_single_response and BaseWorker.AwaitResponseHelper)
             # can surface it instead of letting callers hang. We do NOT
@@ -1133,12 +1194,34 @@ class PyExecutor:
         self.executor_request_queue.enqueue_shutdown_request()
         self.shutdown_event.wait()
         if self.hang_detector.detected():
+            if getattr(self, "_fatal_transfer_shutdown", False):
+                self._mark_unsafe_transfer_shutdown(
+                    "hang detected during topology-poison cleanup",
+                    complete_cleanup=False)
             # Early return here to avoid waiting for hanging threads.
             # Since `on_detected` has sent the error message as response,
             # this worker will be asked to shutdown immediately.
             # Since the whole process will shutdown after this `shutdown` call,
             # All threads and memory pools will be freed properly.
             logger.error("Hang detected, shutting down immediately.")
+            return
+        transfer_shutdown_unsafe = (
+            getattr(self, "_fatal_transfer_shutdown", False) and
+            (getattr(self, "_unsafe_transfer_shutdown", False)
+             or bool(getattr(self, "_fatal_transfer_cleanup_requests", {}))))
+        if transfer_shutdown_unsafe:
+            if not getattr(self, "_unsafe_transfer_shutdown", False):
+                self._mark_unsafe_transfer_shutdown(
+                    "shutdown reached with native owners still pending",
+                    complete_cleanup=False)
+            # Native code may still own registered KV buffers.  Joining can
+            # block forever, while normal graph/resource teardown can free
+            # memory that the transfer worker is still accessing.  The fatal
+            # response requires the serving process to be restarted, so leave
+            # those objects intentionally alive until process exit.
+            logger.error(
+                "Unsafe KV-transfer shutdown; skipping in-process resource "
+                "teardown and requiring process restart.")
             return
         self.worker_thread.join()
         if self.dist.pp_size > 1:
@@ -2143,10 +2226,16 @@ class PyExecutor:
             iter_start_time = time.time()
             iter_stats = None
             while True:
-                self.hang_detector.checkpoint()
+                if not getattr(self, "_fatal_transfer_shutdown", False):
+                    self.hang_detector.checkpoint()
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
+
+                if self._fatal_shutdown_complete():
+                    break
+                if self._progress_fatal_transfer_cleanup():
+                    continue
 
                 self._handle_disagg_cache_errors_synced()
 
@@ -3120,10 +3209,16 @@ class PyExecutor:
             iter_stats = None
             can_forward = not self.is_benchmark_disagg
             while True:
-                self.hang_detector.checkpoint()
+                if not getattr(self, "_fatal_transfer_shutdown", False):
+                    self.hang_detector.checkpoint()
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
+
+                if self._fatal_shutdown_complete():
+                    break
+                if self._progress_fatal_transfer_cleanup():
+                    continue
 
                 if self._resource_governor_enabled:
                     self._sync_and_process_resource_governor_queue()
@@ -3523,10 +3618,33 @@ class PyExecutor:
                      are parked until the ``with`` block exits.
         """
 
+        fatal_error = getattr(self, "_fatal_error", None)
+        if fatal_error is not None or getattr(self, "is_shutdown", False):
+            error = RuntimeError(
+                "Control action rejected because PyExecutor is shutting down")
+            if fatal_error is not None:
+                raise error from fatal_error
+            raise error
+
         if self.dist.rank == 0:
-            self.executor_request_queue.enqueue_control_request(drain=drain)
+            if not self.executor_request_queue.enqueue_control_request(
+                    drain=drain):
+                raise RuntimeError(
+                    "Control action rejected because PyExecutor is shutting "
+                    "down")
 
         self.control_request_barrier.wait()
+        fatal_error = getattr(self, "_fatal_error", None)
+        if fatal_error is not None or getattr(self, "is_shutdown", False):
+            # Fatal shutdown can release the barrier before the scheduler ever
+            # reaches this control action.  Never yield exclusive access to a
+            # caller after the executor has become unusable.
+            self.control_request_barrier.clear()
+            error = RuntimeError(
+                "Control action aborted because PyExecutor is shutting down")
+            if fatal_error is not None:
+                raise error from fatal_error
+            raise error
 
         try:
             yield self
@@ -3545,10 +3663,16 @@ class PyExecutor:
             previous_tensors_device = None
             can_forward = not self.is_benchmark_disagg
             while True:
-                self.hang_detector.checkpoint()
+                if not getattr(self, "_fatal_transfer_shutdown", False):
+                    self.hang_detector.checkpoint()
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
+
+                if self._fatal_shutdown_complete():
+                    break
+                if self._progress_fatal_transfer_cleanup():
+                    continue
 
                 if self._resource_governor_enabled:
                     self._sync_and_process_resource_governor_queue()
@@ -4501,18 +4625,65 @@ class PyExecutor:
             req.py_skip_cross_kv_projection = True
 
     @nvtx_range("_check_disagg_gen_transfer_status")
-    def _check_disagg_gen_transfer_status(self):
+    def _check_disagg_gen_transfer_status(self) -> None:
+        inflight_cancel_active = self._is_disagg_inflight_cancel_active()
+        canceled_without_forward = (self._handle_canceled_requests(
+            transfer_only=True) if inflight_cancel_active else [])
+
         # Gen-transfer status performs cross-rank consensus internally.
         # Enter it symmetrically; ranks with no ready local future contribute
         # an empty ready set.
         self._check_disagg_gen_cache_transfer_status(0)
+        if getattr(self, "_fatal_error", None) is not None:
+            return
+
+        if inflight_cancel_active:
+            # The first pass submits native user cancellation; the C++ poll
+            # commits topology-wide terminal state; this second pass finishes
+            # requests that no longer have a native or async owner.  It must
+            # not submit a second cancellation in the same poll.
+            canceled_without_forward.extend(
+                self._handle_canceled_requests(transfer_only=True,
+                                               issue_native_cancel=False))
+            self._finish_canceled_requests_without_forward(
+                canceled_without_forward)
+
+    def _is_disagg_inflight_cancel_active(self) -> bool:
+        if not is_disagg_inflight_cancel_enabled():
+            return False
+
+        transceiver = getattr(self, "kv_cache_transceiver", None)
+        if transceiver is None:
+            return False
+
+        supports = getattr(transceiver,
+                           "supports_inflight_request_cancellation", None)
+        if callable(supports) and supports() is True:
+            return True
+
+        if (is_disagg_inflight_cancel_required() and not getattr(
+                self, "_disagg_inflight_cancel_unsupported_logged", False)):
+            logger.warning(
+                "TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1 was requested, but "
+                f"{type(transceiver).__name__} does not advertise in-flight "
+                "request cancellation support. Cancellation and transfer-buffer "
+                "quarantine are currently scoped to the C++ NIXL transceiver "
+                "with the UCX plugin; using the existing timeout and "
+                "cancellation behavior for this transceiver.")
+            self._disagg_inflight_cancel_unsupported_logged = True
+        return False
 
     @nvtx_range("_check_kv_transfer_timeout")
-    def _check_kv_transfer_timeout(self):
+    def _check_kv_transfer_timeout(self) -> None:
         if not self.kv_cache_transceiver:
             return
         timeout_ms = self.kv_cache_transceiver.kv_transfer_timeout_ms
         if timeout_ms is None:
+            return
+        if self._is_disagg_inflight_cancel_active():
+            # C++ owns deadline observation, topology voting, and cancellation
+            # while the feature is active.  A Python rank-local timeout must
+            # never touch a transfer before that vote.
             return
 
         def flag_if_kv_transfer_timed_out(req: LlmRequest, type: str) -> None:
@@ -4522,8 +4693,8 @@ class PyExecutor:
             elapsed_time = (current_time - req.py_kv_transfer_start_time) * 1000
             if elapsed_time > timeout_ms and not req.py_kv_transfer_timed_out:
                 logger.warning(
-                    f"Terminating {type} request {req.py_request_id} due to KV cache transfer timeout"
-                )
+                    f"Observed timeout on {type} request {req.py_request_id} "
+                    "due to KV cache transfer timeout")
                 req.py_kv_transfer_timed_out = True
 
         for req in self.async_transfer_manager.requests_in_transfer().values():
@@ -4924,13 +5095,13 @@ class PyExecutor:
         if self.kv_cache_transceiver:
             self._check_disagg_ctx_cache_transfer_status(0)
 
-    def _get_disagg_reqs_in_error_state(self):
+    def _get_disagg_reqs_in_error_state(self) -> List[LlmRequest]:
         return [
             req for req in self.active_requests
             if req.state == LlmRequestState.DISAGG_TRANS_ERROR
         ]
 
-    def _check_cache_transfer_errors(self, error_msg_prefix: str):
+    def _check_cache_transfer_errors(self, error_msg_prefix: str) -> None:
         """Check and handle cache transfer errors.
 
         Under ADP this is a no-op: errors are handled by
@@ -4938,17 +5109,45 @@ class PyExecutor:
         """
         if self.enable_attention_dp and self.dist.world_size != 1:
             return
-        error_requests = self._get_disagg_reqs_in_error_state()
+        canceled_req_ids = set(getattr(self, "canceled_req_ids", []))
+        async_transfer_manager = getattr(self, "async_transfer_manager", None)
+        requests_in_transfer = (async_transfer_manager.requests_in_transfer()
+                                if async_transfer_manager is not None else {})
+        error_requests = [
+            req for req in self._get_disagg_reqs_in_error_state()
+            if req.py_request_id not in requests_in_transfer
+            and not self._is_user_cancel_pending(req, canceled_req_ids)
+        ]
         if error_requests:
-            self._handle_errors(
-                f"Error in kv cache transfer for {error_msg_prefix}",
-                requests=error_requests,
-                charge_budget=False)
+            error_msg = f"Error in kv cache transfer for {error_msg_prefix}"
+            self._handle_errors(error_msg,
+                                requests=error_requests,
+                                charge_budget=False)
+
+    def _handle_poisoned_transfer_buffer(self, request_role: str) -> bool:
+        """Enter fail-closed shutdown for a topology-wide poison latch."""
+        if not self._is_disagg_inflight_cancel_active():
+            return False
+        if not self.kv_cache_transceiver.has_poisoned_transfer_buffer():
+            return False
+
+        error_msg = (f"Error in kv cache transfer for {request_role}; poisoned "
+                     "transfer buffer requires process restart")
+        self._handle_errors(error_msg,
+                            charge_budget=False,
+                            force_fatal=True,
+                            defer_transfer_cleanup=True)
+        return True
 
     @nvtx_range("_check_disagg_ctx_cache_transfer_status")
-    def _check_disagg_ctx_cache_transfer_status(self, atLeastNum: int = 0):
+    def _check_disagg_ctx_cache_transfer_status(self,
+                                                atLeastNum: int = 0) -> None:
         finished_requests, error_requests = self.kv_cache_transceiver.check_context_transfer_status(
             atLeastNum)
+        # C++ updates a topology-wide sticky poison latch as part of the status
+        # exchange.  Reading it is noncollective and must happen even when no
+        # request is quiescent yet.
+        poisoned = self._handle_poisoned_transfer_buffer("context requests")
 
         completed_req_ids = set(finished_requests + error_requests)
 
@@ -4970,23 +5169,32 @@ class PyExecutor:
         requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
         )
 
-        for request_id in list(requests_in_transfer.keys()):
-            request = requests_in_transfer[request_id]
-            if request.py_kv_transfer_timed_out and request_id not in completed_req_ids:
+        if not self._is_disagg_inflight_cancel_active():
+            for request_id in list(requests_in_transfer.keys()):
+                request = requests_in_transfer[request_id]
+                if (not request.py_kv_transfer_timed_out
+                        or request_id in completed_req_ids):
+                    continue
+
                 is_cancelled = self.kv_cache_transceiver.cancel_request(request)
-                # If cancel is successful, mark as complete so it can be cleaned up
-                # Otherwise, try at next iteration
-                if is_cancelled:
-                    request.py_kv_transfer_start_time = None
-                    request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
+                if not is_cancelled:
+                    continue
 
-                    self._end_transfer_and_maybe_terminate(request)
+                # Preserve the legacy timeout behavior when in-flight
+                # cancellation is disabled: a queued transfer that can be
+                # cancelled is immediately released from the async manager.
+                request.py_kv_transfer_start_time = None
+                request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
+                self._end_transfer_and_maybe_terminate(request)
 
-        self._check_cache_transfer_errors("context requests")
+        if not poisoned:
+            self._check_cache_transfer_errors("context requests")
 
     @nvtx_range("_check_disagg_gen_cache_transfer_status")
-    def _check_disagg_gen_cache_transfer_status(self, atLeastNum: int = 0):
+    def _check_disagg_gen_cache_transfer_status(self,
+                                                atLeastNum: int = 0) -> None:
         result = self.kv_cache_transceiver.check_gen_transfer_status(atLeastNum)
+        poisoned = self._handle_poisoned_transfer_buffer("generation requests")
         if isinstance(result, tuple):
             _, _, cancelled_reqs = result
             user_canceled_set = set(self.canceled_req_ids)
@@ -4994,7 +5202,8 @@ class PyExecutor:
                 req_id = req.py_request_id if not req.is_child else req.parent_request_id
                 if req_id not in user_canceled_set:
                     req.state = LlmRequestState.DISAGG_TRANS_ERROR
-        self._check_cache_transfer_errors("generation requests")
+        if not poisoned:
+            self._check_cache_transfer_errors("generation requests")
 
     def _maybe_prefetch_next_iter_mm_encoders(
             self, scheduled_batch: ScheduledRequests) -> None:
@@ -5238,7 +5447,9 @@ class PyExecutor:
                        error_msg: Optional[str] = None,
                        *,
                        requests: Optional[List[LlmRequest]] = None,
-                       charge_budget: bool = True) -> None:
+                       charge_budget: bool = True,
+                       force_fatal: bool = False,
+                       defer_transfer_cleanup: bool = False) -> None:
         """Fail requests and optionally initiate shutdown on fatal errors.
 
         When ``charge_budget`` is True (the default), classifies the error
@@ -5251,6 +5462,12 @@ class PyExecutor:
         error budget is not consumed, and shutdown is never triggered.
         Use this for request-scoped errors (validation, KV-transfer
         timeout, guided-decoder) that should not affect server health.
+
+        ``force_fatal`` is reserved for failures, such as a poisoned native
+        transfer buffer, whose severity is already known without consulting
+        the error budget.  ``defer_transfer_cleanup`` keeps transfer-owned
+        requests out of the scheduler but does not free their resources until
+        the native owner becomes terminal.
 
         .. note::
             The ``charge_budget=False`` path reuses the full
@@ -5270,23 +5487,63 @@ class PyExecutor:
             charge_budget: Whether to consume the error budget.  Set to
                 False for request-scoped errors that should not affect
                 server health.
+            force_fatal: Enter fatal shutdown without charging the budget.
+            defer_transfer_cleanup: Retain resources owned by an in-flight
+                native or asynchronous transfer during fatal shutdown.
         """
-        error_responses: Dict[int, LlmResponse] = {}
         error_msg = error_msg or "error"
 
-        is_fatal = (self._error_budget.consume(error_msg)
-                    if charge_budget else False)
-        if is_fatal and self._error_budget.budget < 1e-9:
+        # A topology-poison latch is sticky and is observed on every status
+        # poll.  Start fatal shutdown exactly once; later polls only make
+        # progress on deferred transfer cleanup.
+        if force_fatal and getattr(self, "_fatal_transfer_shutdown", False):
+            return
+
+        budget_fatal = (self._error_budget.consume(error_msg)
+                        if charge_budget else False)
+        is_fatal = force_fatal or budget_fatal
+        if budget_fatal and self._error_budget.budget < 1e-9:
             logger.error(f"Error budget exhausted "
                          f"(budget={self._error_budget.budget:.3f}), "
                          "treating as fatal")
 
+        responses: List[Tuple[int, LlmResponse]] = []
         if is_fatal:
+            if not hasattr(self, "_fatal_transfer_cleanup_requests"):
+                self._fatal_transfer_cleanup_requests = {}
+            if not hasattr(self,
+                           "_fatal_transfer_cleanup_skip_termination_ids"):
+                self._fatal_transfer_cleanup_skip_termination_ids = set()
+            if defer_transfer_cleanup:
+                self._fatal_transfer_shutdown = True
+                self._fatal_transfer_cleanup_complete = False
+                self._unsafe_transfer_shutdown = False
             self._fatal_error = RuntimeError(f"Fatal error: {error_msg}")
             self.is_shutdown = True
             logger.error(
                 f"Fatal error detected, initiating shutdown: {error_msg}")
             requests = None
+
+            # Close the ingress queue under its lock before draining it.  This
+            # removes the old race in which a producer could enqueue a request
+            # after the raw queue had been observed empty.
+            self.executor_request_queue.enqueue_shutdown_request()
+            # A drain-style control action may be waiting for the scheduler to
+            # reach its sentinel.  Poison bypasses normal control handling, so
+            # release the waiter; control_action checks _fatal_error and raises
+            # before yielding access to the unusable executor.
+            control_requests = getattr(self, "control_requests", None)
+            if control_requests is not None:
+                control_requests.clear()
+            control_request_barrier = getattr(self, "control_request_barrier",
+                                              None)
+            if control_request_barrier is not None:
+                control_request_barrier.set()
+
+            # Preserve responses for requests that completed before the fatal
+            # observation; they are no longer active and are safe to publish.
+            responses.extend(getattr(self, "_pending_transfer_responses", []))
+            self._pending_transfer_responses = []
 
             # Drain waiting_queue so that queued-but-not-yet-activated
             # requests don't get picked up on the next iteration.
@@ -5295,50 +5552,93 @@ class PyExecutor:
             # call _enqueue_responses once after the loop so every rank
             # enters the same number of collectives (attention-DP /
             # gather-all modes use collective gathers internally).
-            waiting_responses: List[Tuple[int, LlmResponse]] = []
             while self.waiting_queue:
                 item = self.waiting_queue.pop_request()
                 if (self.gather_all_responses
                         or self.dist.rank == 0) and item.request is not None:
-                    waiting_responses.append(
+                    responses.append(
                         (item.id,
                          LlmResponse(request_id=item.id,
                                      error_msg=error_msg,
                                      client_id=getattr(item.request,
                                                        'client_id', None))))
+            # Requests fetched after a pending control sentinel are parked
+            # outside waiting_queue.  They need the same terminal response and
+            # must not survive a fatal shutdown.
+            request_accumulated = getattr(self, "request_accumulated", [])
+            for item in request_accumulated:
+                if ((self.gather_all_responses or self.dist.rank == 0)
+                        and item.request is not None):
+                    responses.append(
+                        (item.id,
+                         LlmResponse(request_id=item.id,
+                                     error_msg=error_msg,
+                                     client_id=getattr(item.request,
+                                                       'client_id', None))))
+            request_accumulated.clear()
             # Also drain executor_request_queue so items already queued
             # but not yet fetched by the main loop are not scheduled
-            # after the CUDA context is corrupted.  Safe to use empty()
-            # here because is_shutdown is True and the queue's active
-            # flag is about to be set False, so no new items arrive.
+            # after the transfer buffer is poisoned.  The queue is already
+            # inactive, so get_nowait() can drain it to a stable empty state.
             raw_queue = self.executor_request_queue.get_request_queue()
-            while not raw_queue.empty():
-                item = raw_queue.get_nowait()
+            while True:
+                try:
+                    item = raw_queue.get_nowait()
+                except Empty:
+                    break
                 if item.is_shutdown_request:
                     continue
                 if ((self.gather_all_responses or self.dist.rank == 0)
                         and item.request is not None):
-                    waiting_responses.append(
+                    responses.append(
                         (item.id,
                          LlmResponse(request_id=item.id,
                                      error_msg=error_msg,
                                      client_id=getattr(item.request,
                                                        'client_id', None))))
-
-            if waiting_responses:
-                self._enqueue_responses(waiting_responses)
-                logger.info(f"Drained {len(waiting_responses)} queued requests "
-                            "on fatal error")
+            if not defer_transfer_cleanup and self.dist.rank == 0:
+                # Generic fatal errors are not guaranteed to be observed on
+                # every rank.  Preserve their normal broadcast shutdown path:
+                # rank 0 must fetch a sentinel on the next iteration instead
+                # of blocking forever on the now-empty inactive queue.
+                self.executor_request_queue.enqueue_shutdown_request()
 
         failed_requests = (list(self.active_requests)
                            if requests is None else requests)
+        error_responses: Dict[int, LlmResponse] = {}
+        requests_to_terminate: List[LlmRequest] = []
         for request in failed_requests:
             req_id = request.py_request_id
-            request.state = LlmRequestState.GENERATION_COMPLETE
             error_responses[req_id] = LlmResponse(
                 request_id=req_id,
                 error_msg=error_msg,
                 client_id=request.py_client_id)
+            if is_fatal and defer_transfer_cleanup:
+                # Defer every active request until the next fatal-progress
+                # boundary.  Besides native transfers, an overlap batch may
+                # still own request resources through sampler/D2H work that was
+                # launched just before a CTX status poll observed poison.
+                self._fatal_transfer_cleanup_requests[req_id] = request
+            else:
+                request.state = LlmRequestState.GENERATION_COMPLETE
+                requests_to_terminate.append(request)
+        if is_fatal and defer_transfer_cleanup:
+            # Finished context requests leave active_requests after publishing
+            # their response, but AsyncTransferManager can still own their KV
+            # blocks.  Track those detached owners without emitting a second
+            # response.  With partial reuse they were already terminated by
+            # _handle_responses, so only the final unpin remains.
+            async_transfer_manager = getattr(self, "async_transfer_manager",
+                                             None)
+            if async_transfer_manager is not None:
+                for req_id, request in list(
+                        async_transfer_manager.requests_in_transfer().items()):
+                    if req_id in self._fatal_transfer_cleanup_requests:
+                        continue
+                    self._fatal_transfer_cleanup_requests[req_id] = request
+                    if async_transfer_manager.should_store_blocks:
+                        self._fatal_transfer_cleanup_skip_termination_ids.add(
+                            req_id)
         if requests is None:
             self.active_requests.clear()
         else:
@@ -5346,12 +5646,221 @@ class PyExecutor:
                 request for request in self.active_requests
                 if request not in requests
             ]
-        self._enqueue_responses(list(error_responses.items()))
-        for request in failed_requests:
+
+        responses.extend(error_responses.items())
+        # One enqueue per error path keeps any response collective symmetric
+        # and prevents duplicate terminal delivery during sticky poison polls.
+        self._enqueue_responses(responses)
+        if is_fatal and defer_transfer_cleanup:
+            self._start_fatal_transfer_cleanup_watchdog()
+        for request in requests_to_terminate:
             self._terminate_request(request)
 
-        if self._fatal_error is not None:
-            self.executor_request_queue.enqueue_shutdown_request()
+    def _request_has_transfer_ownership(self, request: LlmRequest) -> bool:
+        async_transfer_manager = getattr(self, "async_transfer_manager", None)
+        if async_transfer_manager is not None:
+            requests_in_transfer = async_transfer_manager.requests_in_transfer()
+            if request.py_request_id in requests_in_transfer:
+                return True
+        return self._is_request_in_transmission(request)
+
+    def _fatal_shutdown_complete(self) -> bool:
+        return (getattr(self, "_fatal_transfer_shutdown", False)
+                and getattr(self, "_fatal_transfer_cleanup_complete", False))
+
+    def _fatal_transfer_cleanup_expired(self) -> bool:
+        """Return whether this rank's poison-cleanup grace period expired."""
+        deadline = getattr(self, "_fatal_transfer_cleanup_deadline", None)
+        return deadline is not None and time.monotonic() >= deadline
+
+    def _start_fatal_transfer_cleanup_watchdog(self) -> None:
+        """Wake shutdown even if native poison cleanup blocks indefinitely."""
+        lock = getattr(self, "_fatal_transfer_cleanup_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._fatal_transfer_cleanup_lock = lock
+        with lock:
+            if getattr(self, "_fatal_transfer_cleanup_timer", None) is not None:
+                return
+            grace_period = self.FATAL_TRANSFER_CLEANUP_GRACE_PERIOD_S
+            self._fatal_transfer_cleanup_deadline = (time.monotonic() +
+                                                     grace_period)
+
+            def on_timeout() -> None:
+                self._mark_unsafe_transfer_shutdown(
+                    "native owners did not quiesce within "
+                    f"{grace_period:g}s",
+                    require_incomplete=True,
+                    complete_cleanup=False)
+
+            timer = threading.Timer(grace_period, on_timeout)
+            timer.daemon = True
+            self._fatal_transfer_cleanup_timer = timer
+        timer.start()
+
+    def _claim_safe_fatal_transfer_cleanup(self) -> bool:
+        """Stop the watchdog after all ranks prove native quiescence."""
+        lock = getattr(self, "_fatal_transfer_cleanup_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._fatal_transfer_cleanup_lock = lock
+        with lock:
+            if getattr(self, "_unsafe_transfer_shutdown", False):
+                self._fatal_transfer_cleanup_complete = True
+                return False
+            self._fatal_transfer_cleanup_complete = True
+            self._fatal_transfer_cleanup_deadline = None
+            timer = getattr(self, "_fatal_transfer_cleanup_timer", None)
+            self._fatal_transfer_cleanup_timer = None
+        if timer is not None:
+            timer.cancel()
+        return True
+
+    def _mark_unsafe_transfer_shutdown(self,
+                                       reason: str,
+                                       error: Optional[BaseException] = None,
+                                       *,
+                                       require_incomplete: bool = False,
+                                       complete_cleanup: bool = True) -> None:
+        lock = getattr(self, "_fatal_transfer_cleanup_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._fatal_transfer_cleanup_lock = lock
+        with lock:
+            cleanup_complete = getattr(self, "_fatal_transfer_cleanup_complete",
+                                       False)
+            if require_incomplete and cleanup_complete:
+                return
+            if getattr(self, "_unsafe_transfer_shutdown", False):
+                if complete_cleanup:
+                    self._fatal_transfer_cleanup_complete = True
+                return
+            self._unsafe_transfer_shutdown = True
+            if complete_cleanup:
+                self._fatal_transfer_cleanup_complete = True
+            timer = getattr(self, "_fatal_transfer_cleanup_timer", None)
+            self._fatal_transfer_cleanup_timer = None
+        if timer is not None:
+            timer.cancel()
+        detail = f": {error}" if error is not None else ""
+        logger.critical(
+            f"Fatal KV-transfer cleanup is unsafe ({reason}){detail}; "
+            "preserving transfer-owned resources until process restart.")
+        with PyExecutor._UNSAFE_TRANSFER_SHUTDOWN_QUARANTINE_LOCK:
+            if not any(executor is self for executor in
+                       PyExecutor._UNSAFE_TRANSFER_SHUTDOWN_QUARANTINE):
+                PyExecutor._UNSAFE_TRANSFER_SHUTDOWN_QUARANTINE.append(self)
+        self.is_shutdown = True
+        if getattr(self, "_event_loop_error", None) is None:
+            self._event_loop_error = getattr(
+                self, "_fatal_error",
+                RuntimeError("Unsafe KV-transfer shutdown"))
+        shutdown_event = getattr(self, "shutdown_event", None)
+        if shutdown_event is not None:
+            shutdown_event.set()
+
+    def _progress_fatal_transfer_cleanup(self) -> bool:
+        """Poll native owners and reap fatal requests only after quiescence."""
+        if not getattr(self, "_fatal_transfer_shutdown", False):
+            return False
+        pending = getattr(self, "_fatal_transfer_cleanup_requests", {})
+        cleanup_errors: List[str] = []
+
+        # A CTX poll can observe poison after overlap launched the next batch.
+        # That batch is installed as previous_batch before the loop reaches
+        # this fatal-progress boundary.  Synchronize its sampler work and drop
+        # the normal response path before considering any resource releasable.
+        previous_batch = getattr(self, "previous_batch", None)
+        if previous_batch is not None:
+            try:
+                sampler_event = getattr(previous_batch.sample_state,
+                                        "sampler_event", None)
+                if sampler_event is not None:
+                    sampler_event.synchronize()
+                self.previous_batch = None
+            except Exception as error:
+                cleanup_errors.append(f"overlap synchronization: {error}")
+
+        # Keep the collective order fixed even after a local exception.  A
+        # peer may still be inside either C++ status exchange and must not see
+        # this rank skip directly to the final Python state vote.
+        try:
+            self._cancel_fatal_transfer_owners()
+        except Exception as error:
+            cleanup_errors.append(f"native cancellation: {error}")
+        try:
+            self._check_disagg_ctx_cache_transfer_status(0)
+        except Exception as error:
+            cleanup_errors.append(f"context status: {error}")
+        try:
+            self._check_disagg_gen_cache_transfer_status(0)
+        except Exception as error:
+            cleanup_errors.append(f"generation status: {error}")
+
+        try:
+            local_has_owner = any(
+                self._request_has_transfer_ownership(request)
+                for request in pending.values())
+        except Exception as error:
+            cleanup_errors.append(f"ownership check: {error}")
+            local_has_owner = True
+
+        local_state = (bool(cleanup_errors)
+                       or getattr(self, "_unsafe_transfer_shutdown", False),
+                       self._fatal_transfer_cleanup_expired(), local_has_owner,
+                       tuple(sorted(pending)))
+        try:
+            states = ([local_state] if self._dist_size(self.dist, "world_size")
+                      == 1 else self.dist.tp_allgather(local_state))
+        except Exception as error:
+            self._mark_unsafe_transfer_shutdown(
+                "fatal-cleanup state consensus failed", error)
+            return True
+
+        pending_id_sets = {state[3] for state in states}
+        any_cleanup_error = any(state[0] for state in states)
+        any_expired = any(state[1] for state in states)
+        pending_mismatch = len(pending_id_sets) != 1
+        if any_cleanup_error or any_expired or pending_mismatch:
+            if any_cleanup_error:
+                reason = "native cancellation or status polling failed"
+            elif any_expired:
+                reason = ("native owners did not quiesce within "
+                          f"{self.FATAL_TRANSFER_CLEANUP_GRACE_PERIOD_S:g}s")
+            else:
+                reason = "ranks disagreed on deferred request ownership"
+            detail = RuntimeError(
+                "; ".join(cleanup_errors)) if cleanup_errors else None
+            self._mark_unsafe_transfer_shutdown(reason, detail)
+            return True
+
+        if any(state[2] for state in states):
+            # Fatal cleanup is not latency-sensitive; avoid a hot host spin
+            # while the cancellation worker reaches a terminal state.
+            time.sleep(0.001)
+            return True
+
+        if not self._claim_safe_fatal_transfer_cleanup():
+            return True
+        skip_termination_ids = getattr(
+            self, "_fatal_transfer_cleanup_skip_termination_ids", set())
+        for request in list(pending.values()):
+            request_id = request.py_request_id
+            pending.pop(request_id, None)
+            if request_id in skip_termination_ids:
+                skip_termination_ids.discard(request_id)
+                continue
+            request.state = LlmRequestState.GENERATION_COMPLETE
+            self._terminate_request(request)
+        return True
+
+    def _cancel_fatal_transfer_owners(self) -> None:
+        transceiver = getattr(self, "kv_cache_transceiver", None)
+        if transceiver is None:
+            return
+        for request in self._fatal_transfer_cleanup_requests.values():
+            if self._is_request_in_transmission(request):
+                transceiver.cancel_request(request)
 
     def _terminate_request(self, request: LlmRequest):
         # Dummy requests don't participate in disagg KV cache transfers,
@@ -5367,18 +5876,32 @@ class PyExecutor:
     def _do_terminate_request(self, request: LlmRequest):
         self.resource_manager.free_resources(request)
         self._prefetched_request_ids.discard(request.py_request_id)
-
         if self.gather_all_responses or self.dist.rank == 0:
             self.result_wait_queues.pop(request.py_request_id, None)
 
-    def _is_request_in_transmission(self, request) -> bool:
+    @staticmethod
+    def _request_cancel_id(request: LlmRequest) -> int:
+        return (request.parent_request_id if getattr(request, "is_child", False)
+                else request.py_request_id)
+
+    def _is_user_cancel_pending(
+            self,
+            request: LlmRequest,
+            canceled_req_ids: Optional[set[int]] = None) -> bool:
+        ids = (set(self.canceled_req_ids)
+               if canceled_req_ids is None else canceled_req_ids)
+        return self._request_cancel_id(request) in ids
+
+    def _is_request_in_transmission(self, request: LlmRequest) -> bool:
         """Check if a request is currently in transmission state."""
         return (request.state
                 == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
                 or request.state
                 == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS)
 
-    def _try_cancel_request(self, request) -> bool:
+    def _try_cancel_request(self,
+                            request: LlmRequest,
+                            issue_native_cancel: bool = True) -> bool:
         """Check if a request can be canceled and attempt cancellation if needed.
 
         Returns:
@@ -5388,14 +5911,29 @@ class PyExecutor:
             return True
 
         if not self._is_request_in_transmission(request):
-            return True
+            # A transceiver future can be terminal while a second async owner
+            # still pins the same context request.  Do not turn the logical
+            # user cancellation into resource cleanup until the last owner is
+            # gone.
+            return request.py_request_id not in (
+                self.async_transfer_manager.requests_in_transfer())
 
-        return self.kv_cache_transceiver.cancel_request(request)
+        if self._is_disagg_inflight_cancel_active():
+            if issue_native_cancel:
+                self.kv_cache_transceiver.cancel_request(request)
+            return False
+
+        return (self.kv_cache_transceiver.cancel_request(request)
+                if issue_native_cancel else False)
 
     @nvtx_range("_handle_canceled_requests")
-    def _handle_canceled_requests(self):
+    def _handle_canceled_requests(
+            self,
+            *,
+            transfer_only: bool = False,
+            issue_native_cancel: bool = True) -> List[LlmRequest]:
         if len(self.canceled_req_ids) == 0:
-            return
+            return []
 
         # Create set from list of canceled request ids to speed up canceled test
         canceled_req_ids_set = set(self.canceled_req_ids)
@@ -5403,24 +5941,70 @@ class PyExecutor:
         # Remove canceled requests from the waiting queue
         self.waiting_queue.remove_by_ids(canceled_req_ids_set)
 
-        still_pending_canceled_ids = []
+        previous_requests: List[LlmRequest] = []
+        if transfer_only and getattr(self, "previous_batch", None) is not None:
+            previous_requests = self.previous_batch.scheduled_requests.all_requests(
+            )
+
+        finished_canceled_requests: List[LlmRequest] = []
         for request in self.active_requests:
-            req_id = request.py_request_id if not request.is_child else request.parent_request_id
+            if transfer_only and request in previous_requests:
+                continue
+            req_id = self._request_cancel_id(request)
             if req_id not in canceled_req_ids_set:
                 continue
 
-            is_cancelled = self._try_cancel_request(request)
+            is_cancelled = self._try_cancel_request(request,
+                                                    issue_native_cancel)
             if is_cancelled:
                 # Mark requests as finished, then, we reuse all existing code
                 # to clean up the KV cache resources.
                 request.finish_by_reason(FinishReason.CANCELLED)
                 request.decoding_iter = request.py_decoding_iter
-            else:
-                still_pending_canceled_ids.append(req_id)
+                finished_canceled_requests.append(request)
 
-        # Clear list of requests marked for cancellation and add back those that failed to cancel.
-        self.canceled_req_ids.clear()
-        self.canceled_req_ids.extend(still_pending_canceled_ids)
+        unfinished_cancel_ids = {
+            self._request_cancel_id(request)
+            for request in self.active_requests
+            if request not in finished_canceled_requests
+        }
+        # Preserve input order while retaining a parent cancellation until all
+        # of its child requests can finish.
+        self.canceled_req_ids = list(
+            dict.fromkeys(request_id for request_id in self.canceled_req_ids
+                          if request_id in unfinished_cancel_ids))
+        return finished_canceled_requests
+
+    def _finish_canceled_requests_without_forward(
+            self, requests: List[LlmRequest]) -> None:
+        """Emit one terminal cancellation response after owners quiesce."""
+        requests_to_terminate: List[LlmRequest] = []
+        responses: List[Tuple[int, LlmResponse]] = []
+        seen_request_ids: set[int] = set()
+        for request in requests:
+            request_id = request.py_request_id
+            if (request_id in seen_request_ids
+                    or request not in self.active_requests):
+                continue
+            seen_request_ids.add(request_id)
+            request.draft_tokens = request.py_draft_tokens or []
+            response = request.create_response(False, self.dist.rank)
+            if response:
+                response.result.cached_tokens = request.cached_tokens
+                self._maybe_attach_ctx_usage(request, response)
+                responses.append((request_id, response))
+            requests_to_terminate.append(request)
+
+        if not requests_to_terminate:
+            return
+
+        self._enqueue_responses(responses)
+        self.active_requests = [
+            request for request in self.active_requests
+            if request not in requests_to_terminate
+        ]
+        for request in requests_to_terminate:
+            self._terminate_request(request)
 
     @nvtx_range("_enqueue_responses")
     def _enqueue_responses(self, responses: Iterable[Tuple[int, LlmResponse]]):
@@ -5547,6 +6131,7 @@ class PyExecutor:
         requests_finished_by_transfer = []
         new_active_requests = []
         timed_out_requests = []
+        pending_canceled_req_ids = set(self.canceled_req_ids)
         logger.debug(
             f'------before _handle_responses, rank = {self.dist.rank}, output = {self.active_requests}'
         )
@@ -5560,11 +6145,31 @@ class PyExecutor:
                 requests_to_terminate.append(request)
                 continue
 
-            # Check if generation request needs cleanup due to KV cache transfer timeout
+            if (self._request_cancel_id(request) in pending_canceled_req_ids
+                    and self._is_request_in_transmission(request)):
+                # Native cancellation has been requested but C++ still owns
+                # the transfer.  Do not race it with a successful context
+                # response; the centralized cancellation path emits exactly
+                # one terminal response after ownership is released.
+                new_active_requests.append(request)
+                continue
+
+            # Check if a generation request needs cleanup due to KV cache transfer timeout.
             if request.py_kv_transfer_timed_out:
-                is_cancelled = self.kv_cache_transceiver.cancel_request(request)
-                if is_cancelled:
-                    timed_out_requests.append(request)
+                defer_timeout_cleanup = (
+                    self._is_disagg_inflight_cancel_active() and
+                    (request.is_disagg_generation_transmission_in_progress
+                     or request.state == LlmRequestState.DISAGG_TRANS_ERROR))
+                if not defer_timeout_cleanup:
+                    is_cancelled = self.kv_cache_transceiver.cancel_request(
+                        request)
+                    if is_cancelled:
+                        # _handle_errors enters response collectives under ADP.
+                        # Defer it until the rank-uniform vote below.
+                        timed_out_requests.append(request)
+                    continue
+
+                new_active_requests.append(request)
                 continue
 
             if request.is_generation_only_request() and not request.is_finished:
