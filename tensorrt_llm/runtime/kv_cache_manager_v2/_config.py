@@ -229,7 +229,10 @@ class KVCacheManagerConfig:
 
     commit_min_snapshot: bool = False
     """
-    If True, commit only the minimum reusable snapshot for each commit() call.
+    If True, commit() records only the minimum cache snapshot reusable at the post-call
+    num_committed_tokens. Only the minimum amount of pages required for such reuse will
+    be preserved.
+
     Required when SSM layers are present.
     """
 

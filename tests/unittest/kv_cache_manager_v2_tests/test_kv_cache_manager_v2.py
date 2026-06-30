@@ -546,6 +546,61 @@ class TestNoBatching(TestKVCacheManagerV2):
 
         self.manager.clear_reusable_blocks()
 
+    def test_commit_min_snapshot_reuses_swa_post_commit_prefix(self) -> None:
+        tokens_per_block = 32
+        window_size = 64
+        prompt = [TokenId(i) for i in range(tokens_per_block * 4)]
+        cfg = KVCacheManagerConfig(
+            tokens_per_block=tokens_per_block,
+            vocab_size=4096,
+            cache_tiers=[GpuCacheTierConfig(quota=16 << 20)],
+            layers=[
+                AttentionLayerConfig(
+                    layer_id=LayerId(0),
+                    buffers=[
+                        BufferConfig(role=Role.KEY, size=8192),
+                        BufferConfig(role=Role.VALUE, size=8192),
+                    ],
+                    sliding_window_size=window_size,
+                )
+            ],
+            commit_min_snapshot=True,
+        )
+        self.manager = KVCacheManager(cfg)
+
+        with TemporaryCudaStream([]) as stream_holder:
+            stream = cast(CudaStream, stream_holder.handle)
+            kv1 = self.manager.create_kv_cache()
+            self.assertTrue(kv1.resume(stream))
+            self.assertTrue(kv1.resize(len(prompt), len(prompt)))
+            kv1.commit(prompt)
+            kv1.close()
+        stream_holder.take_finish_event().synchronize()
+
+        match = self.manager._radix_tree.match(ReuseScope(), prompt)
+        self.assertEqual(match.num_tokens, len(prompt))
+        self.assertEqual(len(match.blocks), 4)
+
+        swa_lc_id = next(
+            lc_id
+            for lc_id, lc in self.manager._life_cycles.attention_life_cycles()
+            if lc.window_size is not None
+        )
+        # The committed snapshot is reusable at the post-commit token count, but
+        # old SWA blocks outside that window should not keep reusable pages.
+        self.assertIsNone(match.blocks[0].storage[swa_lc_id])
+        self.assertIsNone(match.blocks[1].storage[swa_lc_id])
+        self.assertIsNotNone(match.blocks[2].storage[swa_lc_id])
+        self.assertIsNotNone(match.blocks[3].storage[swa_lc_id])
+        self.assertEqual(
+            self.manager.probe_reuse(input_tokens=prompt[: tokens_per_block * 3]),
+            0,
+        )
+
+        kv2 = self.manager.create_kv_cache(input_tokens=prompt)
+        self.assertEqual(kv2.num_committed_tokens, len(prompt))
+        kv2.close()
+
     def test_reuse_scope_isolates_reuse(self) -> None:
         self.prepare(16 << 20, 0, 0, 2, None, 0, tokens_per_block=8)
         tokens = [TokenId(i) for i in range(64)]
