@@ -36,6 +36,9 @@ BackendTypeCpp = tensorrt_llm.bindings.executor.CacheTransceiverBackendType
 
 _DISAGG_INFLIGHT_CANCEL_ENABLED_ENV = "TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL"
 _NIXL_KVCACHE_BACKEND_ENV = "TRTLLM_NIXL_KVCACHE_BACKEND"
+_DISABLE_KV_CACHE_TRANSFER_OVERLAP_ENV = "TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP"
+_DISAGG_LAYERWISE_ENV = "TRTLLM_DISAGG_LAYERWISE"
+_TRY_ZCOPY_FOR_KV_CACHE_TRANSFER_ENV = "TRTLLM_TRY_ZCOPY_FOR_KVCACHE_TRANSFER"
 _SUPPORTED_INFLIGHT_CANCEL_NIXL_BACKEND = "UCX"
 _CACHE_TRANSCEIVER_BACKEND_ENV_VARS = (
     ("TRTLLM_USE_NIXL_KVCACHE", "NIXL"),
@@ -61,15 +64,27 @@ def is_disagg_inflight_cancel_enabled() -> bool:
 
 
 def _is_disagg_inflight_cancel_config_supported(
-        cache_transceiver_config: CacheTransceiverConfig) -> bool:
+        cache_transceiver_config: CacheTransceiverConfig,
+        mapping: Mapping,
+        inflight_cancel_supported_by_executor: bool = False) -> bool:
     runtime = cache_transceiver_config.transceiver_runtime or "CPP"
     nixl_backend = getenv(_NIXL_KVCACHE_BACKEND_ENV, "UCX")
-    return (runtime == "CPP" and cache_transceiver_config.backend == "NIXL"
-            and nixl_backend == _SUPPORTED_INFLIGHT_CANCEL_NIXL_BACKEND)
+    return (inflight_cancel_supported_by_executor and runtime == "CPP"
+            and cache_transceiver_config.backend == "NIXL"
+            and nixl_backend == _SUPPORTED_INFLIGHT_CANCEL_NIXL_BACKEND
+            and (cache_transceiver_config.max_tokens_in_buffer or 0) > 0
+            and (cache_transceiver_config.kv_transfer_timeout_ms or 0) > 0
+            and getenv(_DISABLE_KV_CACHE_TRANSFER_OVERLAP_ENV) != "1"
+            and mapping.pp_size == 1 and mapping.cp_size == 1
+            and not mapping.enable_attention_dp
+            and getenv(_DISAGG_LAYERWISE_ENV) != "1"
+            and getenv(_TRY_ZCOPY_FOR_KV_CACHE_TRANSFER_ENV) != "1")
 
 
 def _validate_disagg_inflight_cancel_config(
-        cache_transceiver_config: CacheTransceiverConfig) -> None:
+        cache_transceiver_config: CacheTransceiverConfig,
+        mapping: Mapping,
+        inflight_cancel_supported_by_executor: bool = False) -> None:
     if not is_disagg_inflight_cancel_enabled():
         return
 
@@ -83,18 +98,36 @@ def _validate_disagg_inflight_cancel_config(
             "unambiguous cache transceiver backend, but multiple legacy "
             f"backend selectors are enabled: {enabled_backend_env_vars}.")
 
-    if _is_disagg_inflight_cancel_config_supported(cache_transceiver_config):
+    if _is_disagg_inflight_cancel_config_supported(
+            cache_transceiver_config, mapping,
+            inflight_cancel_supported_by_executor):
         return
 
     runtime = cache_transceiver_config.transceiver_runtime or "CPP"
     nixl_backend = getenv(_NIXL_KVCACHE_BACKEND_ENV, "UCX")
+    disable_overlap = getenv(_DISABLE_KV_CACHE_TRANSFER_OVERLAP_ENV)
+    layerwise = getenv(_DISAGG_LAYERWISE_ENV)
+    try_zcopy = getenv(_TRY_ZCOPY_FOR_KV_CACHE_TRANSFER_ENV)
     raise ValueError(
         f"{_DISAGG_INFLIGHT_CANCEL_ENABLED_ENV}=1 is experimental and "
-        "currently supported only with transceiver_runtime='CPP', "
-        "backend='NIXL', and TRTLLM_NIXL_KVCACHE_BACKEND=UCX; got "
+        "currently supported only by the standard PyTorch backend "
+        "PyExecutor with asynchronous transceiver_runtime='CPP', "
+        "backend='NIXL', and TRTLLM_NIXL_KVCACHE_BACKEND=UCX on ordinary "
+        "TP topology, using a positive max_tokens_in_buffer admission "
+        "budget, a transfer deadline, and preallocated staging buffers "
+        "without layerwise or zero-copy transfer; got "
         f"transceiver_runtime={runtime!r}, "
         f"backend={cache_transceiver_config.backend!r}, "
-        f"TRTLLM_NIXL_KVCACHE_BACKEND={nixl_backend!r}.")
+        f"max_tokens_in_buffer={cache_transceiver_config.max_tokens_in_buffer!r}, "
+        f"kv_transfer_timeout_ms={cache_transceiver_config.kv_transfer_timeout_ms!r}, "
+        f"TRTLLM_NIXL_KVCACHE_BACKEND={nixl_backend!r}, "
+        f"pp_size={mapping.pp_size!r}, cp_size={mapping.cp_size!r}, "
+        f"enable_attention_dp={mapping.enable_attention_dp!r}, "
+        "inflight_cancel_supported_by_executor="
+        f"{inflight_cancel_supported_by_executor!r}, "
+        f"{_DISABLE_KV_CACHE_TRANSFER_OVERLAP_ENV}={disable_overlap!r}, "
+        f"{_DISAGG_LAYERWISE_ENV}={layerwise!r}, "
+        f"{_TRY_ZCOPY_FOR_KV_CACHE_TRANSFER_ENV}={try_zcopy!r}.")
 
 
 def mapping_to_world_config(mapping: Mapping) -> WorldConfig:
@@ -114,7 +147,8 @@ def create_kv_cache_transceiver(
         kv_cache_manager: KVCacheManager,
         attention_type: AttentionTypeCpp,
         cache_transceiver_config: CacheTransceiverConfig,
-        mamba_cache_manager: Optional[BaseMambaCacheManager] = None):
+        mamba_cache_manager: Optional[BaseMambaCacheManager] = None,
+        inflight_cancel_supported_by_executor: bool = False):
     if cache_transceiver_config is None or cache_transceiver_config.backend is None:
         logger.info("cache_transceiver is disabled")
         return None
@@ -132,7 +166,9 @@ def create_kv_cache_transceiver(
                 cache_transceiver_config.backend = be_type
                 break
 
-    _validate_disagg_inflight_cancel_config(cache_transceiver_config)
+    _validate_disagg_inflight_cancel_config(
+        cache_transceiver_config, mapping,
+        inflight_cancel_supported_by_executor)
 
     if cache_transceiver_config.backend == "MPI":
         logger.warning(
@@ -163,7 +199,8 @@ def create_kv_cache_transceiver(
     # Default: use C++ transceiver (transceiver_runtime is None or "CPP")
     return BindKvCacheTransceiver(mapping, dist, kv_cache_manager,
                                   attention_type, cache_transceiver_config,
-                                  mamba_cache_manager)
+                                  mamba_cache_manager,
+                                  inflight_cancel_supported_by_executor)
 
 
 class KvCacheTransceiver(ABC):
@@ -235,8 +272,11 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
                  kv_cache_manager: KVCacheManager,
                  attention_type: AttentionTypeCpp,
                  cache_transceiver_config: CacheTransceiverConfig,
-                 mamba_cache_manager: Optional[BaseMambaCacheManager] = None):
-        _validate_disagg_inflight_cancel_config(cache_transceiver_config)
+                 mamba_cache_manager: Optional[BaseMambaCacheManager] = None,
+                 inflight_cancel_supported_by_executor: bool = False):
+        _validate_disagg_inflight_cancel_config(
+            cache_transceiver_config, mapping,
+            inflight_cancel_supported_by_executor)
         world_config = mapping_to_world_config(mapping)
         # Filter out mamba/recurrent state layers (kv_heads == 0) so that
         # CacheState::ModelConfig::mNbKvHeadsPerLayer only contains attention
@@ -262,7 +302,11 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
         self.kv_transfer_poll_interval_ms = cache_transceiver_config.kv_transfer_poll_interval_ms
         self._supports_inflight_request_cancellation = (
             _is_disagg_inflight_cancel_config_supported(
-                cache_transceiver_config))
+                cache_transceiver_config, mapping,
+                inflight_cancel_supported_by_executor))
+        self._inflight_request_cancellation_enabled = (
+            is_disagg_inflight_cancel_enabled()
+            and self._supports_inflight_request_cancellation)
 
         # Get RNN state manager and layer distribution if mamba_cache_manager is provided.
         rnn_state_manager = None
@@ -288,7 +332,8 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
             tokens_per_block, world_config,
             pp_layer_num_per_pp_rank, dtype, attention_type,
             cache_transceiver_config._to_pybind(), rnn_state_manager,
-            rnn_layer_num_per_pp_rank)
+            rnn_layer_num_per_pp_rank,
+            self._inflight_request_cancellation_enabled)
 
     def respond_and_send_async(self, req: LlmRequest):
         return self.impl.respond_and_send_async(req)
@@ -315,7 +360,7 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
         return self._supports_inflight_request_cancellation
 
     def has_poisoned_transfer_buffer(self) -> bool:
-        if not is_disagg_inflight_cancel_enabled():
+        if not self._inflight_request_cancellation_enabled:
             return False
         return self.impl.has_poisoned_transfer_buffer()
 

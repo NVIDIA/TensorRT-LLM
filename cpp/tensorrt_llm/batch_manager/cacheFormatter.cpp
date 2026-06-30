@@ -610,7 +610,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         }
         catch (...)
         {
-            if (agentConnection != nullptr && common::getEnvDisaggEnableInflightCancel())
+            if (agentConnection != nullptr && session.isInflightCancelEnabled())
             {
                 sendHolder.poison();
             }
@@ -877,8 +877,8 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                 else
                 {
                     cacheBufferId = mCacheTransBufferManager->assignBufferIndexForRecv();
+                    recvHolder = BufferIndexHolder(*mCacheTransBufferManager, cacheBufferId, /*isRecv=*/true);
                 }
-                recvHolder = BufferIndexHolder(*mCacheTransBufferManager, cacheBufferId, /*isRecv=*/true);
                 auto [recvSplitCachestmp, bufferCoverTargetNumtmp, onlyUseDynamicBuffer]
                     = mCacheTransBufferManager->getOrAllocateRecvBuffers(
                         cacheBufferId, static_cast<int>(targetNum), bufferEleSizes, bufferManager);

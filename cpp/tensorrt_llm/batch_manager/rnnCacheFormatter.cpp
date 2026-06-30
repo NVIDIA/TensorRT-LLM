@@ -232,7 +232,7 @@ void RnnCacheFormatter::formatSlotMode(TransferSession& session)
     }
     catch (...)
     {
-        if (agentConnection != nullptr && common::getEnvDisaggEnableInflightCancel())
+        if (agentConnection != nullptr && session.isInflightCancelEnabled())
         {
             sendHolder.poison();
         }
@@ -362,6 +362,7 @@ void RnnCacheFormatter::unformatSlotMode(TransferSession& session)
     size_t remainNoCoverSourceNum = 0;
     size_t bufferCoverSourceNum = 0;
     std::optional<int> cacheBufferId = std::nullopt;
+    BufferIndexHolder recvHolder;
 
     auto preAssignedRnnId
         = connections[pickUpConnections[0]]->getPreAssignedBufferId(static_cast<uint8_t>(BufferKind::kRNN));
@@ -372,6 +373,7 @@ void RnnCacheFormatter::unformatSlotMode(TransferSession& session)
     else
     {
         cacheBufferId = mRnnCacheTransBufferManager->assignBufferIndexForRecv();
+        recvHolder = BufferIndexHolder(*mRnnCacheTransBufferManager, cacheBufferId, /*isRecv=*/true);
     }
 
     auto allocationResult = mRnnCacheTransBufferManager->getOrAllocateRecvBuffers(
@@ -519,10 +521,7 @@ void RnnCacheFormatter::unformatSlotMode(TransferSession& session)
 
     bufferManager.getStream().synchronize();
 
-    if (cacheBufferId.has_value())
-    {
-        mRnnCacheTransBufferManager->freeBufferIndexForRecv(cacheBufferId);
-    }
+    recvHolder.release();
     session.setTime(TransferSession::kTimePostprocess);
 
     TLLM_LOG_DEBUG(
@@ -703,7 +702,7 @@ void RnnCacheFormatter::formatUnifiedPoolMode(TransferSession& session)
             }
             catch (...)
             {
-                if (agentConnection != nullptr && common::getEnvDisaggEnableInflightCancel())
+                if (agentConnection != nullptr && session.isInflightCancelEnabled())
                 {
                     sendHolder.poison();
                 }
@@ -851,6 +850,7 @@ void RnnCacheFormatter::unformatUnifiedPoolMode(TransferSession& session)
 
             // Use pre-assigned buffer ID from NIXL connection if available (same as slot mode).
             std::optional<int> cacheBufferId = std::nullopt;
+            BufferIndexHolder recvHolder;
             auto preAssignedRnnId
                 = connections[rnnRecvConns[0]]->getPreAssignedBufferId(static_cast<uint8_t>(BufferKind::kRNN));
             if (preAssignedRnnId.has_value())
@@ -860,6 +860,7 @@ void RnnCacheFormatter::unformatUnifiedPoolMode(TransferSession& session)
             else
             {
                 cacheBufferId = mRnnCacheTransBufferManager->assignBufferIndexForRecv();
+                recvHolder = BufferIndexHolder(*mRnnCacheTransBufferManager, cacheBufferId, /*isRecv=*/true);
             }
 
             auto allocationResult = mRnnCacheTransBufferManager->getOrAllocateRecvBuffers(
@@ -906,7 +907,7 @@ void RnnCacheFormatter::unformatUnifiedPoolMode(TransferSession& session)
 
             bufferManager.getStream().synchronize();
 
-            mRnnCacheTransBufferManager->freeBufferIndexForRecv(cacheBufferId);
+            recvHolder.release();
         }
     }
 

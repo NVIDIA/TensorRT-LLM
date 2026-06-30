@@ -388,7 +388,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         }
         catch (...)
         {
-            if (agentConnection != nullptr && common::getEnvDisaggEnableInflightCancel())
+            if (agentConnection != nullptr && session.isInflightCancelEnabled())
             {
                 sendHolder.poison();
             }
@@ -509,9 +509,9 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
             else
             {
                 cacheBufferId = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForRecv();
+                recvHolder = BufferIndexHolder(
+                    *mCacheTransBufferManagers[transferIndexerKCache], cacheBufferId, /*isRecv=*/true);
             }
-            recvHolder
-                = BufferIndexHolder(*mCacheTransBufferManagers[transferIndexerKCache], cacheBufferId, /*isRecv=*/true);
 
             auto targetNum = pickUpConnections.size();
 

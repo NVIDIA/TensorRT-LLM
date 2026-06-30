@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -84,7 +84,8 @@ public:
     TransferSession(std::vector<Connection const*> connections, DataContext dataContext,
         std::vector<SizeType32> counterPartRanks, executor::DataTransceiverState const& selfState,
         executor::DataTransceiverState otherState, runtime::BufferManager const& bufferManager, int32_t indexFromEnd,
-        BlockKey const& lastBlockKey, LlmRequest const* llmRequest = nullptr, bool recordTiming = false)
+        BlockKey const& lastBlockKey, LlmRequest const* llmRequest = nullptr, bool recordTiming = false,
+        bool enableInflightCancel = false)
         : mConnections(std::move(connections))
         , mCounterPartRanks(std::move(counterPartRanks))
         , mDataContext(std::move(dataContext))
@@ -94,6 +95,7 @@ public:
         , mRequest(llmRequest)
         , mIndexFromEnd(indexFromEnd)
         , mLastBlockKey(lastBlockKey)
+        , mEnableInflightCancel(enableInflightCancel)
     {
         TLLM_CHECK(!mConnections.empty());
         if (recordTiming)
@@ -151,6 +153,11 @@ public:
         mCounterPartRanks = std::move(ranks);
     }
 
+    [[nodiscard]] bool isInflightCancelEnabled() const noexcept
+    {
+        return mEnableInflightCancel;
+    }
+
 private:
     std::vector<Connection const*> mConnections;
     std::vector<SizeType32> mCounterPartRanks;        // Ranks corresponding to mConnections indices
@@ -162,6 +169,7 @@ private:
     std::unique_ptr<KVCacheTimes> mTimes;
     int32_t mIndexFromEnd{0};
     BlockKey mLastBlockKey{};
+    bool mEnableInflightCancel{false};
 };
 
 using UniqueToken = tensorrt_llm::runtime::UniqueToken;

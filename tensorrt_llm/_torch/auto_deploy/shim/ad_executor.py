@@ -1282,6 +1282,7 @@ def create_autodeploy_executor(
             attention_type_cpp,
             cache_transceiver_config,
             mamba_cache_manager=None,
+            inflight_cancel_supported_by_executor=False,
         )
 
     # Guided (structured) decoding.

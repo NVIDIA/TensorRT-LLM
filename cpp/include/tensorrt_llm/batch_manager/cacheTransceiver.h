@@ -26,6 +26,7 @@
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
+#include <atomic>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -243,7 +244,7 @@ public:
         = executor::kv_cache::CacheState::AttentionType::kDEFAULT,
         std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
         rnn_state_manager::RnnStateManager* rnnStateManager = nullptr,
-        std::vector<SizeType32> const& rnnLayerNumPerPP = {});
+        std::vector<SizeType32> const& rnnLayerNumPerPP = {}, bool enableInflightCancel = false);
 
     CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager, std::vector<SizeType32> numKvHeadsPerLayer,
         SizeType32 sizePerHead, SizeType32 tokensPerBlock, runtime::WorldConfig const& worldConfig,
@@ -252,10 +253,11 @@ public:
         = executor::kv_cache::CacheState::AttentionType::kDEFAULT,
         std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
         rnn_state_manager::RnnStateManager* rnnStateManager = nullptr,
-        std::vector<SizeType32> const& rnnLayerNumPerPP = {})
+        std::vector<SizeType32> const& rnnLayerNumPerPP = {}, bool enableInflightCancel = false)
         : CacheTransceiver(cacheManager,
             executor::kv_cache::CacheState::ModelConfig{numKvHeadsPerLayer, sizePerHead, tokensPerBlock}, worldConfig,
-            attentionLayerNumPerPP, dataType, attentionType, cacheTransceiverConfig, rnnStateManager, rnnLayerNumPerPP)
+            attentionLayerNumPerPP, dataType, attentionType, cacheTransceiverConfig, rnnStateManager, rnnLayerNumPerPP,
+            enableInflightCancel)
     {
     }
 
@@ -285,6 +287,11 @@ private:
 
     void setContextState(LlmRequest* llmRequest);
 
+    RequestStatuses checkContextTransferStatusWithInflightCancel(
+        std::optional<int> const& atLeastRequestNum, bool markComplete);
+
+    void checkGenTransferStatusWithInflightCancel(std::optional<int> const& atLeastRequestNum);
+
     std::unique_ptr<CacheSender> mCacheSender;
     std::unique_ptr<CacheReceiver> mCacheReceiver;
     // shared_ptr (not raw LlmRequest*) so the futures hold a strong reference for
@@ -310,6 +317,8 @@ private:
     std::unique_ptr<executor::kv_cache::CacheState> mCacheState;
     std::unique_ptr<executor::kv_cache::ConnectionManager> mManager;
     std::optional<executor::CacheTransceiverConfig> mCacheTransceiverConfig;
+    bool mInflightCancelEnabled{false};
+    std::atomic<bool> mTopologyTransferBufferPoisoned{false};
     std::vector<std::unique_ptr<kv_cache_manager::CacheTransBufferManager>> mCacheTransBufferManagers;
     std::vector<BaseTransBufferManager*> mCacheTransBufferManagerPtrs;
 
