@@ -222,8 +222,9 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         required=False,
         help=(
-            "Global token counts to sweep. Each value is balanced across ranks "
-            "with any remainder on rank 0. Example: --balanced_total_num_tokens 64 256 1024."
+            "Global token counts to sweep. Each value is balanced across ranks, "
+            "spreading any remainder one token per leading rank (e.g. world_size=4, "
+            "tokens=2 -> [1, 1, 0, 0]). Example: --balanced_total_num_tokens 64 256 1024."
         ),
     )
 
