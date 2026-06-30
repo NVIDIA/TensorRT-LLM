@@ -954,14 +954,17 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
     def _get_token_type_mask(self, mm_token_type_ids: torch.Tensor):
         """Build bidirectional attention mask from mm_token_type_ids.
 
-        mm_token_type_ids: 0=text, 1=image, 2=video (or any positive int for
-        a modality blob). Tokens within the same contiguous blob of the same
-        modality attend bidirectionally to each other.
+        mm_token_type_ids: 0=text, 1=image, 2=video, 3=audio. Only VISION
+        tokens (image/video) attend bidirectionally within their contiguous
+        blob; text and audio stay causal. Matches HF Gemma4, where
+        ``is_vision = (mm_token_type_ids == 1) | (mm_token_type_ids == 2)`` and
+        audio is left causal.
         """
         device = mm_token_type_ids.device
         token_type_ids = mm_token_type_ids.clone()
-        # We only care about non-zero (multimodal) tokens
-        is_mm = token_type_ids > 0
+        # Only vision tokens (image=1, video=2) get the bidirectional mask;
+        # audio (3) stays causal, matching HF Gemma4 (audio is not in is_vision).
+        is_mm = (token_type_ids == 1) | (token_type_ids == 2)
 
         # Detect blob boundaries: positions where type changes or goes 0->nonzero
         padded = torch.cat(
