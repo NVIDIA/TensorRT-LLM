@@ -84,10 +84,13 @@ inline std::string checkErrorStr(Args const&... args) {
 #endif
 
 #ifndef TLLM_CHECK_INFO
+// Perf advisories: KernelTraits<> is constructed per kernel selection/launch, so an INFO-level
+// log here can spam stdout (hundreds of MB per test) on long-context workloads. Emit at DEBUG
+// level so the hint is preserved for opt-in verbose logging but does not break CI log capture.
 #define TLLM_CHECK_INFO(cond, ...)                                                                 \
   do {                                                                                             \
     if (!static_cast<bool>(cond)) {                                                                \
-      TLLM_LOG_INFO("[FMHA] %s", ::fmha::detail::checkErrorStr(__VA_ARGS__).c_str());              \
+      TLLM_LOG_DEBUG("[FMHA] %s", ::fmha::detail::checkErrorStr(__VA_ARGS__).c_str());             \
     }                                                                                              \
   } while (0)
 #endif
