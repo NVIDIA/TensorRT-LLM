@@ -935,6 +935,19 @@ class GenerationExecutorProxy(GenerationExecutor):
             logger.debug(f"Error fetching kv cache capacity via RPC: {e}")
             return {}
 
+    def _get_ep_health_stats(self, timeout: float = 1.0) -> Optional[dict]:
+        """Fetch best-effort committed EP membership from the rank-0 worker.
+
+        The rank-0 RPC is the only MPI worker control endpoint today. Callers
+        must treat ``ep_health_available`` as the validity bit if that endpoint
+        is lost. The snapshot is not detected/suspected physical liveness, and
+        this passive metrics hook must not drive recovery. Survivor-side
+        observation belongs to the fault-tolerant control-plane work.
+        """
+        if self.rpc_client is None:
+            return None
+        return self.rpc_client.fetch_ep_health_stats().remote(timeout=timeout)
+
     def get_disaggregated_params(self) -> dict:
         """Get disaggregated params from worker runtime via RPC."""
         if self.rpc_client is None:
