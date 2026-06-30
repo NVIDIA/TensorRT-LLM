@@ -213,22 +213,6 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
     ):
         return "TRTLLM Blackwell no-cache fallback is unstable for head_dim 80"
 
-    # TRTLLM MLA context is validated by test_attention_mla.py through the
-    # production MLA module path. This standalone backend harness feeds already
-    # up-projected random K/V tensors, which does not match the TRTLLM MLA
-    # context op contract and produces invalid output, while Vanilla/FlashInfer
-    # can still validate the up-projected context math and cache append.
-    if (
-        backend == "TRTLLM"
-        and getattr(case, "is_mla", False)
-        and getattr(case, "num_contexts", 0) == len(getattr(case, "seq_lens", ()))
-    ):
-        return (
-            "TRTLLM MLA context is covered by test_attention_mla.py via the "
-            "production MLA module path; standalone up-projected backend "
-            "inputs are validated with Vanilla/FlashInfer"
-        )
-
     # On Blackwell, TRTLLM-Gen is the supported MLA generation path. The current
     # kernel set explicitly lacks the DeepSeek-family decode shape at page_size
     # 32, and the generic fallback then tries to JIT an unsupported generated
