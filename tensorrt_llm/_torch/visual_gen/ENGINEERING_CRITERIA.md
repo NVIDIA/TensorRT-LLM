@@ -36,7 +36,7 @@ end-to-end workflow.
 ## 2. API
 
 Public surface: `tensorrt_llm/visual_gen/`. The API must be cheap to
-extend and cheap to keep stable; apply Occam's Razor.
+extend and cheap to keep stable.
 
 1. **Team review, not just PR approval.** Public API changes
    (additions, renames, semantic shifts on `VisualGen` /
