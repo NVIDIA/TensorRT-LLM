@@ -657,11 +657,18 @@ class TestKVCacheV2SchedulerCrossParam:
         assert scheduler.cross_kv_cache_manager is cross_mgr
 
     @pytest.mark.parametrize(
-        "has_kv_connector,expected_inflight_cancel_support",
-        [(False, False), (True, False)],
+        (
+            "has_kv_connector",
+            "process_restart_supported",
+            "expected_inflight_cancel_support",
+        ),
+        [(False, True, True), (True, True, False), (False, False, False)],
     )
     def test_factory_forwards_encoder_init_until_state_for_cross_pool(
-        self, has_kv_connector, expected_inflight_cancel_support
+        self,
+        has_kv_connector,
+        process_restart_supported,
+        expected_inflight_cancel_support,
     ):
         """The executor factory must widen V2 scheduling to ENCODER_INIT.
 
@@ -735,6 +742,7 @@ class TestKVCacheV2SchedulerCrossParam:
                 max_batch_size=8,
                 max_beam_width=1,
                 max_num_tokens=4096,
+                inflight_cancel_supported_by_executor=process_restart_supported,
             )
 
         kwargs = scheduler_cls.call_args.kwargs

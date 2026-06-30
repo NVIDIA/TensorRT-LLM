@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Unit tests for AwaitResponseHelper.__call__ event-loop crash handling.
 
 When PyExecutor's event-loop thread dies (e.g. KV cache OOM), every
@@ -10,11 +24,26 @@ These tests bind the real ``AwaitResponseHelper.__call__`` /
 neither GPUs nor models.
 """
 
+import asyncio
 import datetime
 import queue as _stdlib_queue
+import threading
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+import pytest
 
 from tensorrt_llm.executor.base_worker import AwaitResponseHelper
-from tensorrt_llm.executor.utils import ErrorResponse
+from tensorrt_llm.executor.ipc import IpcQueue
+from tensorrt_llm.executor.postproc_worker import PostprocWorker
+from tensorrt_llm.executor.proxy import GenerationExecutorProxy
+from tensorrt_llm.executor.utils import ErrorResponse, WorkerFatalError
+from tensorrt_llm.executor.worker import GenerationExecutorWorker
+from tensorrt_llm.llmapi.mpi_session import (
+    MpiCommSession,
+    MpiPoolSession,
+    RemoteMpiCommSessionClient,
+)
 
 
 class _EngineStub:
@@ -56,6 +85,8 @@ class _WorkerStub:
         self.popped = []
         self.result_queue = None
         self.postproc_queues = None
+        self.system_result_queue = None
+        self.system_fatal_event = threading.Event()
 
         # Echoed straight back so __call__'s filter is a no-op.
         def _engine_response_callback(r):
@@ -155,3 +186,245 @@ class TestAwaitResponseHelperEventLoopError:
         assert sorted(helper.worker.popped) == [1, 2]
         # second time around: nothing left to wake.
         assert helper._broadcast_event_loop_error(original) is False
+
+    def test_ipc_sends_system_fatal_marker_without_request_local_cleanup(self):
+        """IPC mode delegates atomic fan-out and shutdown to the proxy."""
+        original = RuntimeError("topology-poisoned transfer buffer")
+        engine = _EngineStub(event_loop_error=original, is_shutdown=True)
+        helper = _make_helper(engine, num_pending=2)
+        system_result_queue = _stdlib_queue.Queue()
+        helper.worker.result_queue = system_result_queue
+        helper.worker.system_result_queue = system_result_queue
+
+        assert helper(timeout=0.01) is False
+
+        marker = system_result_queue.get_nowait()
+        assert isinstance(marker, WorkerFatalError)
+        assert "topology-poisoned transfer buffer" in marker.error_msg
+        assert helper.worker.system_fatal_event.is_set()
+        assert sorted(helper.worker._results) == [1, 2]
+        assert helper.worker.popped == []
+
+    def test_ipc_fatal_bypasses_normal_response_handler(self):
+        """A post-processing stall cannot delay the direct fatal marker."""
+        original = RuntimeError("topology-poisoned transfer buffer")
+        engine = _EngineStub(
+            await_responses_result=[object()],
+            event_loop_error=original,
+            is_shutdown=True,
+        )
+        helper = _make_helper(engine)
+        system_result_queue = _stdlib_queue.Queue()
+        postproc_queue = Mock()
+        helper.worker.postproc_queues = [postproc_queue]
+        helper.worker.system_result_queue = system_result_queue
+        helper.responses_handler = Mock(
+            side_effect=AssertionError("normal response path must be bypassed")
+        )
+
+        assert helper(timeout=0.01) is False
+
+        assert isinstance(system_result_queue.get_nowait(), WorkerFatalError)
+        postproc_queue.put_noblock.assert_called_once_with(PostprocWorker.FatalStop(), retry=0)
+        helper.responses_handler.assert_not_called()
+
+    def test_ipc_fatal_retirement_survives_postproc_stop_failure(self):
+        original = RuntimeError("topology-poisoned transfer buffer")
+        helper = _make_helper(_EngineStub(event_loop_error=original, is_shutdown=True))
+        system_result_queue = _stdlib_queue.Queue()
+        postproc_queue = Mock()
+        postproc_queue.put_noblock.side_effect = RuntimeError("postproc stalled")
+        helper.worker.postproc_queues = [postproc_queue]
+        helper.worker.system_result_queue = system_result_queue
+
+        assert helper(timeout=0.01) is False
+        assert helper.worker.system_fatal_event.is_set()
+        assert isinstance(system_result_queue.get_nowait(), WorkerFatalError)
+
+    def test_ipc_missing_system_queue_exits_worker_instead_of_failing_open(self):
+        original = RuntimeError("topology-poisoned transfer buffer")
+        helper = _make_helper(_EngineStub())
+        helper.worker.postproc_queues = [Mock()]
+
+        with pytest.raises(RuntimeError, match="system result queue"):
+            helper._broadcast_event_loop_error(original)
+
+        assert helper.worker.system_fatal_event.is_set()
+
+
+class TestProxyWorkerFatalError:
+    @staticmethod
+    def _make_proxy(num_pending: int = 2):
+        proxy = GenerationExecutorProxy.__new__(GenerationExecutorProxy)
+        proxy.result_queue = _stdlib_queue.Queue()
+        proxy._results = {client_id: _ResultStub() for client_id in range(1, num_pending + 1)}
+        proxy._worker_fatal_error = None
+        proxy._fatal_error = None
+        proxy.doing_shutdown = False
+        proxy._error_queue = _stdlib_queue.Queue()
+        proxy._shutdown_event = threading.Event()
+        return proxy
+
+    def test_marker_fails_all_pending_results_and_wakes_error_monitor(self):
+        proxy = self._make_proxy()
+        result_queues = {client_id: result.queue for client_id, result in proxy._results.items()}
+        proxy.result_queue.put(WorkerFatalError("topology poison requires process restart"))
+
+        assert proxy.dispatch_result_task() is False
+        assert proxy._results == {}
+        assert proxy._shutdown_event.is_set()
+        assert isinstance(proxy._worker_fatal_error, RuntimeError)
+        assert isinstance(proxy._error_queue.get_nowait(), RuntimeError)
+        for client_id, result_queue in result_queues.items():
+            response = result_queue.get_nowait()
+            assert isinstance(response, ErrorResponse)
+            assert response.client_id == client_id
+            assert "process restart" in response.error_msg
+
+    def test_marker_rejects_later_work(self):
+        proxy = self._make_proxy(num_pending=0)
+        proxy._worker_fatal_error = RuntimeError("worker quarantined")
+
+        with pytest.raises(RuntimeError, match="worker quarantined"):
+            proxy._raise_if_worker_unavailable()
+
+    def test_inflight_cancel_requires_disposable_worker_processes(self):
+        proxy_supports = GenerationExecutorProxy._supports_inflight_cancel_process_restart
+        pool_session = object.__new__(MpiPoolSession)
+        pool_session.mpi_pool = None
+        comm_session = object.__new__(MpiCommSession)
+        comm_session.mpi_pool = None
+        comm_session.thread_pool = None
+        comm_session.owns_mpi_pool = False
+
+        assert proxy_supports(pool_session)
+        assert not proxy_supports(comm_session)
+        assert not proxy_supports(object.__new__(RemoteMpiCommSessionClient))
+
+    def test_submit_race_removes_result_and_raises(self):
+        proxy = self._make_proxy(num_pending=0)
+        proxy._start_dispatch_threads = Mock()
+        proxy._get_next_client_id = Mock(return_value=41)
+        proxy._get_logprob_params = Mock(return_value=None)
+        proxy._handle_background_error = Mock()
+        proxy.request_queue = Mock()
+        proxy.request_queue.put.side_effect = lambda _: setattr(
+            proxy, "_worker_fatal_error", RuntimeError("worker quarantined")
+        )
+        request = Mock(id=None, disaggregated_params=None)
+        request.set_id.side_effect = lambda request_id: setattr(request, "id", request_id)
+
+        with (
+            patch(
+                "tensorrt_llm.executor.proxy.GenerationResult",
+                side_effect=lambda *_args, **_kwargs: _ResultStub(),
+            ),
+            pytest.raises(RuntimeError, match="worker quarantined"),
+        ):
+            proxy.submit(request)
+
+        assert 41 not in proxy._results
+        proxy._handle_background_error.assert_not_called()
+
+    def test_worker_fatal_pre_shutdown_does_not_cross_request_socket_threads(self):
+        request_queue = IpcQueue(is_server=True, name="fatal_pre_shutdown_test")
+        request_queue._zmq_debug_enabled = True
+        request_queue._check_thread_safety()
+        owner_thread_id = request_queue._zmq_thread_id
+        proxy = self._make_proxy(num_pending=0)
+        proxy.workers_started = True
+        proxy._worker_fatal_error = RuntimeError("worker quarantined")
+        proxy.request_queue = request_queue
+        proxy.mpi_futures = []
+        errors = []
+
+        def pre_shutdown():
+            try:
+                proxy.pre_shutdown()
+            except Exception as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=pre_shutdown)
+        try:
+            thread.start()
+            thread.join(timeout=1.0)
+
+            assert not thread.is_alive()
+            assert errors == []
+            assert request_queue._zmq_thread_id == owner_thread_id
+        finally:
+            request_queue.close()
+
+    def test_worker_fatal_shutdown_uses_bounded_session_abort(self):
+        proxy = self._make_proxy(num_pending=0)
+        proxy.workers_started = True
+        proxy.doing_shutdown = True
+        proxy._worker_fatal_error = RuntimeError("worker quarantined")
+        worker_future = Mock()
+        proxy.mpi_futures = [worker_future]
+        proxy.mpi_session = Mock()
+        proxy.dispatch_result_thread = None
+        proxy.rpc_client = None
+        proxy.request_queue = Mock()
+        proxy.worker_init_status_queue = Mock()
+        proxy.result_queue = Mock()
+        proxy._resource_governor_queue = None
+        proxy._handle_background_error = Mock()
+
+        proxy.shutdown()
+
+        worker_future.result.assert_not_called()
+        proxy.mpi_session.shutdown_abort.assert_called_once_with(
+            grace=proxy.WORKER_FATAL_SHUTDOWN_GRACE_SECONDS,
+            reason=proxy._worker_fatal_error,
+        )
+        proxy.mpi_session.shutdown.assert_not_called()
+
+
+def test_unsafe_engine_quarantines_complete_executor_worker():
+    worker = GenerationExecutorWorker.__new__(GenerationExecutorWorker)
+    worker.doing_shutdown = False
+    worker.await_response_thread = Mock()
+    engine = Mock()
+    engine.can_enqueue_requests.return_value = False
+    engine._unsafe_transfer_shutdown = True
+    worker.engine = engine
+    worker.llm_args = SimpleNamespace(backend="pytorch")
+    worker._executor_config = None
+    worker.checkpoint_loader = Mock()
+
+    try:
+        with patch("torch.distributed.destroy_process_group") as destroy_group:
+            worker.shutdown()
+
+        engine.shutdown.assert_called_once_with()
+        assert worker.engine is engine
+        worker.checkpoint_loader.cleanup.assert_not_called()
+        destroy_group.assert_not_called()
+        assert any(
+            quarantined is worker
+            for quarantined in GenerationExecutorWorker._UNSAFE_ENGINE_SHUTDOWN_QUARANTINE
+        )
+    finally:
+        with GenerationExecutorWorker._UNSAFE_ENGINE_SHUTDOWN_QUARANTINE_LOCK:
+            GenerationExecutorWorker._UNSAFE_ENGINE_SHUTDOWN_QUARANTINE[:] = [
+                quarantined
+                for quarantined in GenerationExecutorWorker._UNSAFE_ENGINE_SHUTDOWN_QUARANTINE
+                if quarantined is not worker
+            ]
+
+
+def test_postproc_fatal_stop_does_not_forward_proxy_sentinel():
+    class _PullPipe:
+        async def get_async(self):
+            return [PostprocWorker.FatalStop()]
+
+    worker = PostprocWorker.__new__(PostprocWorker)
+    worker._pull_pipe = _PullPipe()
+    worker._to_stop = asyncio.Event()
+
+    async def collect_batches():
+        return [batch async for batch in worker._mainloop()]
+
+    assert asyncio.run(collect_batches()) == []
+    assert worker._to_stop.is_set()

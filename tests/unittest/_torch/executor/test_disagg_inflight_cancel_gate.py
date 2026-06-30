@@ -70,6 +70,7 @@ def _make_response_handler_stub(active_requests, tp_allgather_result):
     executor._enqueue_responses = Mock()
     executor._terminate_request = Mock()
     executor._handle_errors = Mock()
+    executor.canceled_req_ids = []
     executor._timeout_cleanup_order = Mock()
     executor._timeout_cleanup_order.attach_mock(executor.dist.tp_allgather, "vote")
     executor._timeout_cleanup_order.attach_mock(executor._handle_errors, "handle")
@@ -160,7 +161,6 @@ def test_flag_unset_context_timeout_preserves_legacy_cleanup():
     executor.async_transfer_manager.requests_in_transfer.return_value = {
         request.py_request_id: request
     }
-    executor._disagg_timed_out_ctx_cancelled_ids = set()
     executor.kv_cache_transceiver.supports_inflight_request_cancellation.return_value = True
     executor._disagg_inflight_cancel_unsupported_logged = False
     executor._end_transfer_and_maybe_terminate = Mock()
@@ -172,7 +172,6 @@ def test_flag_unset_context_timeout_preserves_legacy_cleanup():
     assert request.py_kv_transfer_start_time is None
     assert request.state == LlmRequestState.DISAGG_CONTEXT_COMPLETE
     executor._end_transfer_and_maybe_terminate.assert_called_once_with(request)
-    assert request.py_request_id not in executor._disagg_timed_out_ctx_cancelled_ids
 
 
 def test_flag_unset_generation_driver_skips_cancel_pipeline():
@@ -181,14 +180,10 @@ def test_flag_unset_generation_driver_skips_cancel_pipeline():
     executor.kv_cache_transceiver.supports_inflight_request_cancellation.return_value = True
     executor._disagg_inflight_cancel_unsupported_logged = False
     executor._check_disagg_gen_cache_transfer_status = Mock()
-    executor._cancel_timed_out_gen_transfers = Mock()
-    executor._check_gen_cache_transfer_errors_consensus = Mock()
 
     PyExecutor._check_disagg_gen_transfer_status(executor)
 
     executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(0)
-    executor._cancel_timed_out_gen_transfers.assert_not_called()
-    executor._check_gen_cache_transfer_errors_consensus.assert_not_called()
 
 
 @pytest.mark.parametrize(

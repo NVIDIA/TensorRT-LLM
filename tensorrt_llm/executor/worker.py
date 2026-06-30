@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import gc
 import os
 import threading
@@ -36,6 +51,12 @@ __all__ = [
 
 class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
+    # A topology-poisoned PyExecutor cannot prove that remote transport has
+    # stopped touching registered buffers.  Retain the whole outer worker —
+    # including checkpoint-loader and process-group state — until process exit.
+    _UNSAFE_ENGINE_SHUTDOWN_QUARANTINE: List["GenerationExecutorWorker"] = []
+    _UNSAFE_ENGINE_SHUTDOWN_QUARANTINE_LOCK = threading.Lock()
+
     def __init__(
         self,
         engine: Union[Path, Engine],
@@ -48,6 +69,7 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
         llm_args: Optional[BaseLlmArgs] = None,
         rpc_addr: Optional[str] = None,
         hmac_key: bytes = b"",
+        inflight_cancel_supported_by_executor: bool = False,
     ) -> None:
         super().__init__(
             engine=engine,
@@ -58,6 +80,8 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
             hf_model_dir=hf_model_dir,
             tokenizer=tokenizer,
             llm_args=llm_args,
+            inflight_cancel_supported_by_executor=
+            inflight_cancel_supported_by_executor,
         )
 
         if (self.llm_args is not None
@@ -101,12 +125,23 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
         logger_debug(f'Worker {mpi_rank()} shutdown...\n', "yellow")
 
         if self.engine is not None:
-            if self.engine.can_enqueue_requests():
+            engine = self.engine
+            if engine.can_enqueue_requests():
                 if self.await_response_thread.is_alive():
                     self.await_response_thread.stop()
                     self.await_response_thread.join()
 
-            self.engine.shutdown()
+            engine.shutdown()
+            if getattr(engine, "_unsafe_transfer_shutdown", False):
+                logger.critical(
+                    "Unsafe KV-transfer shutdown; preserving the complete "
+                    "executor worker until process restart.")
+                with self._UNSAFE_ENGINE_SHUTDOWN_QUARANTINE_LOCK:
+                    if not any(worker is self for worker in
+                               self._UNSAFE_ENGINE_SHUTDOWN_QUARANTINE):
+                        self._UNSAFE_ENGINE_SHUTDOWN_QUARANTINE.append(self)
+                return
+
             self.engine = None
 
             if self.llm_args is not None:
@@ -168,6 +203,7 @@ def worker_main(
     llm_args: Optional[BaseLlmArgs] = None,
     rpc_addr: Optional[str] = None,
     hmac_key: bytes = b"",
+    inflight_cancel_supported_by_executor: bool = False,
 ) -> None:
 
     def _print_stacks():
@@ -202,6 +238,7 @@ def worker_main(
 
     result_queue: Optional[IpcQueue] = None
     result_queues: Optional[List[IpcQueue]] = None
+    system_result_queue: Optional[FusedIpcQueue] = None
     resource_governor_queue: Optional[IpcQueue] = None
 
     postproc_worker_config = postproc_worker_config or PostprocWorkerConfig()
@@ -246,6 +283,16 @@ def worker_main(
                               name=f"postprocess_{i}_feedin_queue")
                 for i in range(postproc_worker_config.num_postprocess_workers)
             ]
+            # Fatal worker state must bypass post-processing so the proxy can
+            # fail every pending result even if per-request responses are still
+            # queued on different post-process workers.
+            system_result_queue = FusedIpcQueue(
+                worker_queues.result_queue_addr,
+                is_server=False,
+                fuse_message=False,
+                socket_type=zmq.PUSH,
+                name="worker_system_result_queue",
+            )
         else:
             # IPC queue for sending results back to the proxy, and let the
             # Proxy process to handle the postprocess
@@ -253,6 +300,7 @@ def worker_main(
                                          is_server=False,
                                          fuse_message=False,
                                          name="worker_result_queue")
+            system_result_queue = result_queue
 
     def notify_proxy_threads_to_quit():
         # Signal the dispatcher thread in the proxy to quit
@@ -310,7 +358,9 @@ def worker_main(
             tokenizer=tokenizer,
             llm_args=llm_args,
             rpc_addr=rpc_addr,
-            hmac_key=hmac_key)
+            hmac_key=hmac_key,
+            inflight_cancel_supported_by_executor=
+            inflight_cancel_supported_by_executor)
     except Exception as e:
         logger.error(f"Failed to initialize executor on rank {mpi_rank()}: {e}")
         logger.error(traceback.format_exc())
@@ -335,6 +385,7 @@ def worker_main(
                     worker.set_postproc_queues(result_queues)
                 else:
                     worker.set_result_queue(result_queue)
+                worker.set_system_result_queue(system_result_queue)
 
                 # Send ready signal with confirmation
                 ready_msg = (ready_signal, None)
@@ -349,7 +400,12 @@ def worker_main(
                     worker.engine.set_resource_governor_queue(
                         resource_governor_queue)
 
-                while (req := request_queue.get()) is not None:
+                while not worker.system_fatal_event.is_set():
+                    if not request_queue.poll(0.1):
+                        continue
+                    req = request_queue.get()
+                    if req is None or worker.system_fatal_event.is_set():
+                        break
                     if isinstance(req, CancellingRequest):
                         worker.abort_request(req.id)
                     elif isinstance(req, GenerationRequest):
@@ -363,7 +419,8 @@ def worker_main(
                     else:
                         raise ValueError(f"Unknown request type: {type(req)}")
 
-                notify_proxy_threads_to_quit()
+                if not worker.system_fatal_event.is_set():
+                    notify_proxy_threads_to_quit()
 
         except GenerationExecutorWorker.WorkerExit as e:
             # This will capture by the with-statement and exit normally.

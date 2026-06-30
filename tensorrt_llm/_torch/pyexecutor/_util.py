@@ -1913,6 +1913,7 @@ def create_py_executor_instance(
     virtual_memory_pools: Optional[dict] = None,
     execution_stream: Optional[torch.cuda.Stream] = None,
     dwdp_manager: Optional[DwdpManager] = None,
+    inflight_cancel_supported_by_executor: bool = False,
 ) -> PyExecutor:
     kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
 
@@ -2226,10 +2227,9 @@ def create_py_executor_instance(
         attention_type,
         cache_transceiver_config,
         mamba_cache_manager,
-        # This protocol-only prerequisite remains dormant until the dependent
-        # PyExecutor lifecycle change can guarantee safe timeout, cancellation,
-        # poison, and terminal-response ownership.
-        inflight_cancel_supported_by_executor=False)
+        inflight_cancel_supported_by_executor=(
+            inflight_cancel_supported_by_executor
+            and kv_connector_manager is None))
 
     waiting_queue_policy = (scheduler_config.waiting_queue_policy
                             if scheduler_config is not None else
