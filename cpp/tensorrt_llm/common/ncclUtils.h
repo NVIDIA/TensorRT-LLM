@@ -30,11 +30,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -61,6 +63,10 @@
 
 TRTLLM_NAMESPACE_BEGIN
 
+class NcclCommLease;
+bool isNcclFaultToleranceEnabled();
+std::optional<std::string> getCommAsyncError(std::shared_ptr<ncclComm_t> const& comm);
+
 namespace common::nccl_util
 {
 
@@ -68,8 +74,10 @@ namespace common::nccl_util
 // NCCL Resource Management
 //==============================================================================
 
-// Resource cleanup function type. Called before the NCCL communicator is destroyed.
-using ResourceCleanupFunc = std::function<void()>;
+// Resource cleanup function type. Called before the NCCL communicator is
+// destroyed. False tells the owner that graceful communicator destruction is
+// unsafe and it must take the abort/quarantine path instead.
+using ResourceCleanupFunc = std::function<bool()>;
 
 // Manages resources associated with NCCL communicators. Thread-safe singleton that maintains
 // a pool of resources per NCCL comm. Resources are automatically cleaned up when the
@@ -88,7 +96,18 @@ public:
     // the shared_ptr deleter before ncclCommDestroy.
     // Thread-safe: Uses global mutex to serialize cleanup operations.
     // Order-preserving: Resources are cleaned up in registration order.
-    void cleanupResources(ncclComm_t comm) noexcept;
+    [[nodiscard]] bool cleanupResources(ncclComm_t comm, bool communicatorAborted = false) noexcept;
+
+    // Mark a successfully-aborted native handle as retired before releasing
+    // the NCCL host gate. A later communicator whose native pointer is reused
+    // waits for the old pointer-keyed cleanup before it can be published.
+    void beginAbortCleanup(ncclComm_t comm) noexcept;
+    void waitForAbortCleanup(ncclComm_t comm) noexcept;
+
+    // True only while abort-specific callbacks for comm are running. Resource
+    // owners use this to skip operations that require a live communicator or
+    // a device-wide synchronization (both can hang on a failed communicator).
+    bool isAbortCleanup(ncclComm_t comm) const noexcept;
 
     // Check if a communicator has registered resources.
     bool hasResources(ncclComm_t comm) const noexcept;
@@ -108,7 +127,13 @@ private:
     using ResourceEntry = std::pair<ResourceCleanupFunc, std::string>;
 
     mutable std::mutex mMutex;
+    std::condition_variable mAbortCleanupComplete;
     std::unordered_map<ncclComm_t, std::vector<ResourceEntry>> mCommResources;
+    std::unordered_set<ncclComm_t> mAbortCleanups;
+    // Track every callback owner, not just callers explicitly marked as
+    // aborted. A normal cleanup may already own the callbacks when another
+    // thread retires the same native handle.
+    std::unordered_set<ncclComm_t> mCleanupsInProgress;
     std::atomic<bool> mIsDestroying{false};
 };
 
@@ -134,6 +159,7 @@ public:
                 {
                     mCleanup(mResource);
                 }
+                return true;
             },
             debugName);
     }
@@ -223,7 +249,17 @@ public:
     // If an unused buffer of at least the requested size exists for this communicator, it will be reused.
     // Uses best-fit strategy: selects the smallest available buffer that meets the size requirement.
     // Otherwise, a new buffer is allocated and registered.
+    // Caller-owned/raw communicator overload. It supports a nonblocking call
+    // result by bounded polling, but it cannot coordinate with the TRT-LLM
+    // registry's abort/replacement lock. Registry-managed communicators must
+    // use the shared_ptr overload below.
     NCCLWindowBuffer requestBuffer(ncclComm_t comm, size_t size);
+
+    // Managed-communicator overload. CUDA allocation and tensor construction
+    // happen without an operation lease; the allocator acquires short leases
+    // only around NCCL calls so a watchdog can abort stalled work.
+    NCCLWindowBuffer requestBuffer(
+        std::shared_ptr<ncclComm_t> const& comm, size_t size, ncclComm_t* associatedComm = nullptr);
 
     // Search for a buffer by pointer. Returns an invalid buffer if not found.
     // This matches the UBManager.search_buffer() interface.
@@ -264,7 +300,10 @@ private:
     ~NCCLWindowAllocator() = default;
 
     // Allocate a new buffer and register it with NCCL as a window
-    NCCLWindowBuffer allocateAndRegisterBuffer(ncclComm_t comm, size_t size, int handle);
+    NCCLWindowBuffer requestBufferImpl(
+        ncclComm_t comm, size_t size, std::shared_ptr<ncclComm_t> const* managedComm, ncclComm_t* associatedComm);
+    NCCLWindowBuffer allocateAndRegisterBuffer(ncclComm_t comm, size_t size, int handle,
+        std::shared_ptr<ncclComm_t> const* managedComm, std::unique_ptr<NcclCommLease>* completionLease);
 
     // Record a failed new symmetric allocation (assumes mMutex is already locked).
     void recordSymmetricFailureLocked(ncclComm_t comm, size_t size);
@@ -282,7 +321,7 @@ private:
     void registerBufferCleanup(ncclComm_t comm);
 
     // Cleanup all buffers for a specific communicator
-    void cleanupBuffersForComm(ncclComm_t comm) noexcept;
+    [[nodiscard]] bool cleanupBuffersForComm(ncclComm_t comm) noexcept;
 
     struct BufferEntry
     {
@@ -291,6 +330,7 @@ private:
     };
 
     mutable std::mutex mMutex;
+    std::mutex mAllocationMutex;
     std::unordered_map<ncclComm_t, std::vector<BufferEntry>> mBufferPool;
     std::unordered_set<ncclComm_t> mRegisteredComms;
     // Smallest request size that is known to fail collectively for each communicator.
@@ -305,11 +345,12 @@ class ScopedNCCLWindowBuffer
 public:
     ScopedNCCLWindowBuffer(std::shared_ptr<ncclComm_t> comm, size_t size)
         : mComm(std::move(comm))
+        , mRawComm(nullptr)
         , mBuffer{}
     {
-        if (mComm && *mComm)
+        if (mComm)
         {
-            mBuffer = NCCLWindowAllocator::getInstance().requestBuffer(*mComm, size);
+            mBuffer = NCCLWindowAllocator::getInstance().requestBuffer(mComm, size, &mRawComm);
         }
     }
 
@@ -317,7 +358,7 @@ public:
     {
         if (mBuffer.isValid())
         {
-            NCCLWindowAllocator::getInstance().releaseBuffer(*mComm, mBuffer.ptr);
+            NCCLWindowAllocator::getInstance().releaseBuffer(mRawComm, mBuffer.ptr);
         }
     }
 
@@ -348,6 +389,7 @@ public:
 
 private:
     std::shared_ptr<ncclComm_t> mComm;
+    ncclComm_t mRawComm;
     NCCLWindowBuffer mBuffer;
 };
 
@@ -357,6 +399,7 @@ private:
 inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
     std::shared_ptr<ncclComm_t> comm, at::IntArrayRef shape, torch::ScalarType dtype)
 {
+    ncclComm_t rawComm = nullptr;
     // Calculate buffer size
     int64_t buffer_size
         = std::accumulate(shape.begin(), shape.end(), 1LL, std::multiplies<int64_t>()) * torch::elementSize(dtype);
@@ -376,7 +419,7 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
     auto& allocator = NCCLWindowAllocator::getInstance();
     NCCLWindowBuffer buffer;
 
-    if (!comm || !*comm)
+    if (!comm || (!isNcclFaultToleranceEnabled() && !*comm))
     {
         TLLM_LOG_DEBUG("[createNCCLWindowTensor] null comm; returning invalid buffer");
         return std::make_pair(torch::Tensor(), NCCLWindowBuffer());
@@ -384,10 +427,17 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
 
     try
     {
-        buffer = allocator.requestBuffer(*comm, buffer_size);
+        buffer = allocator.requestBuffer(comm, buffer_size, &rawComm);
     }
     catch (std::exception const& e)
     {
+        // Local allocation failures may fall back to a regular CUDA tensor.
+        // Never hide a watchdog error: continuing would reuse an aborted
+        // communicator on the fallback collective.
+        if (isNcclFaultToleranceEnabled() && getCommAsyncError(comm).has_value())
+        {
+            throw;
+        }
         TLLM_LOG_DEBUG("[createNCCLWindowTensor] requestBuffer failed; returning invalid buffer: %s", e.what());
         return std::make_pair(torch::Tensor(), NCCLWindowBuffer());
     }
@@ -398,9 +448,16 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
         TLLM_LOG_DEBUG("[createNCCLWindowTensor] invalid buffer returned from requestBuffer; returning invalid buffer");
         return std::make_pair(torch::Tensor(), NCCLWindowBuffer());
     }
+    TLLM_CHECK_WITH_INFO(rawComm != nullptr, "NCCL window allocator returned a buffer without its communicator");
 
     // Create custom deleter that releases the buffer
-    auto deleter = [comm, ptr = buffer.ptr](void*) { NCCLWindowAllocator::getInstance().releaseBuffer(*comm, ptr); };
+    auto deleter = [comm = std::move(comm), rawComm, ptr = buffer.ptr](void*)
+    {
+        // Keep a generic caller-owned communicator alive until its window
+        // tensor releases the buffer; rawComm remains the stable pool key.
+        static_cast<void>(comm);
+        NCCLWindowAllocator::getInstance().releaseBuffer(rawComm, ptr);
+    };
 
     // Create tensor from the buffer
     auto tensor = torch::from_blob(buffer.ptr, shape, strides_vec, deleter, torch::dtype(dtype).device(torch::kCUDA));
