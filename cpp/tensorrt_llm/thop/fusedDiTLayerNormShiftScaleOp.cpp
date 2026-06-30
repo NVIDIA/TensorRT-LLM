@@ -141,7 +141,7 @@ std::tuple<at::Tensor, at::Tensor> fused_dit_layernorm_shift_scale_quant(at::Ten
     // sf_out: swizzled NVFP4 scale factors.  The layout tiles are 128×4 in (tokens, sf_cols),
     // so we round up both dimensions before allocating.
     int64_t const sf_cols = D / 16;
-    int64_t const sfSize = (M + 127) / 128 * 128 * (sf_cols + 3) / 4 * 4;
+    int64_t const sfSize = ((M + 127) / 128 * 128) * ((sf_cols + 3) / 4 * 4);
     at::Tensor sf_out = torch::empty({sfSize}, torch::TensorOptions().dtype(SF_DTYPE).device(x.device()));
 
     auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
