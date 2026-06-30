@@ -106,15 +106,18 @@ def _compute_stats(values: List[float]) -> Dict[str, float]:
 
 
 def _distribute_tokens(total: int, world_size: int) -> List[int]:
-    """Distribute ``total`` global tokens evenly across ``world_size`` ranks."""
+    """Distribute ``total`` global tokens evenly across ranks.
+
+    Remainder tokens are spread one-per-rank over the leading ranks (instead of
+    piling the entire remainder on rank 0), so e.g. (total=2, world_size=4) ->
+    [1, 1, 0, 0]. An even, non-degenerate split keeps every rank's per-rank token
+    count within 1 of each other, which the downstream symmetric-memory workspace
+    sizing relies on.
+    """
     if world_size <= 0 or total < 0:
         raise ValueError(f"invalid args: total={total}, world_size={world_size}")
-    if world_size == 1:
-        return [total]
-    base = total // world_size
-    out = [base] * world_size
-    out[0] += total - base * world_size
-    return out
+    base, rem = divmod(total, world_size)
+    return [base + (1 if i < rem else 0) for i in range(world_size)]
 
 
 def _validate_per_rank_token_list(

@@ -690,7 +690,11 @@ def _run_one_candidate(
                 mapping=mapping,
                 moe_backend=config.backend,
                 use_cuda_graph=bool(config.cuda_graph),
-                max_num_tokens=max(int(local_num_tokens), 1),
+                # Symmetric-memory comm backends (e.g. NVLINK_ONE_SIDED) size their
+                # workspace from max_num_tokens and require every rank to allocate the
+                # same size, so use the global per-rank maximum rather than this rank's
+                # local token count (which differs under uneven attention-DP shards).
+                max_num_tokens=max(int(max(per_rank)) if per_rank else 0, 1),
                 use_low_precision_moe_combine=bool(config.use_low_precision_moe_combine),
                 enable_perfect_router=enable_perfect_router,
                 dtype=act_dtype,
