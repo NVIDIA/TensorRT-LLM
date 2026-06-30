@@ -72,6 +72,7 @@ set(PLUGIN_LISTS
     mixtureOfExperts
     selectiveScanPlugin
     mambaConv1dPlugin
+    gatedDeltaNetPlugin
     lruPlugin
     cumsumLastDimPlugin
     topkLastDimPlugin
