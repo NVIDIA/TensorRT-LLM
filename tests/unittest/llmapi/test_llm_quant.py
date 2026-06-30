@@ -239,6 +239,10 @@ def test_quant_cfg_qwen35_nvfp4_alias_and_prefix_normalization():
                                 "quant_algo": "W4A16_NVFP4",
                                 "group_size": 16,
                             },
+                            "model.language_model.lm_head": {
+                                "quant_algo": "W4A16_NVFP4",
+                                "group_size": 16,
+                            },
                         },
                     },
                 }, f)
@@ -247,8 +251,9 @@ def test_quant_cfg_qwen35_nvfp4_alias_and_prefix_normalization():
             hf_quant_config_file, model_dir, "CUTLASS")
 
         assert quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
-        assert quant_config.exclude_modules == ["lm_head"]
+        assert quant_config.exclude_modules == ["lm_head", "model.lm_head"]
         assert "lm_head" not in layer_quant_config
+        assert "model.lm_head" not in layer_quant_config
         assert "model.language_model.layers.0.mlp.experts" not in layer_quant_config
         experts_config = layer_quant_config["model.layers.0.mlp.experts"]
         assert experts_config.quant_algo == QuantAlgo.NVFP4

@@ -445,13 +445,19 @@ class ModelConfig(Generic[TConfig]):
             # LMHead bypasses Linear.create_weights (manual Parameter),
             # so NVFP4 weight scales are never allocated there.  Move
             # lm_head to exclude_modules so it loads as BF16.
-            if mixed_quant_configs and "lm_head" in mixed_quant_configs:
+            lm_head_keys = [
+                key for key in mixed_quant_configs
+                if key == "lm_head" or key.endswith(".lm_head")
+            ]
+            if lm_head_keys:
                 if quant_config.exclude_modules is None:
                     quant_config.exclude_modules = []
-                if "lm_head" not in quant_config.exclude_modules:
-                    quant_config.exclude_modules = list(
-                        quant_config.exclude_modules) + ["lm_head"]
-                del mixed_quant_configs["lm_head"]
+                quant_config.exclude_modules = list(
+                    dict.fromkeys(
+                        list(quant_config.exclude_modules) + ["lm_head"] +
+                        lm_head_keys))
+                for key in lm_head_keys:
+                    del mixed_quant_configs[key]
             layer_quant_config = mixed_quant_configs
         elif quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
             if quant_config.group_size is None:
