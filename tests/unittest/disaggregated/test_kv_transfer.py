@@ -173,6 +173,7 @@ def _chunk_block_ids(all_block_ids, chunk_size_blocks, mamba_state_index=None):
     transceiver = MagicMock()
     transceiver._chunk_size_blocks = chunk_size_blocks
     transceiver._collect_base_slice = MagicMock(return_value=base_slice)
+    transceiver._reuse_adapter.tokens_per_block = 1
     transceiver._create_kv_slices = KvCacheTransceiverV2._create_kv_slices.__get__(transceiver)
 
     req = MagicMock()
@@ -210,16 +211,17 @@ def test_create_kv_slices_integrity_check():
             reassembled.extend(s.block_ids_per_layer_groups[lg_idx])
         assert reassembled == original
 
-
 def test_create_kv_slices_multiple_layer_groups():
-    """Different layer groups with different block counts produce correct chunking."""
+    """Shorter layer groups are projected into the overlapping global chunk."""
     all_block_ids = [list(range(8)), list(range(3))]
     slices = _chunk_block_ids(all_block_ids, chunk_size_blocks=4)
     assert len(slices) == 2
-    assert slices[0].block_ids_per_layer_groups[0] == [0, 1, 2, 3]
-    assert slices[1].block_ids_per_layer_groups[0] == [4, 5, 6, 7]
-    assert slices[0].block_ids_per_layer_groups[1] == [0, 1, 2]
-    assert slices[1].block_ids_per_layer_groups[1] == []
+    assert np.array_equal(slices[0].block_ids_per_layer_groups[0], np.array([0, 1, 2, 3]))
+    assert np.array_equal(slices[1].block_ids_per_layer_groups[0], np.array([4, 5, 6, 7]))
+    assert len(slices[0].block_ids_per_layer_groups[1]) == 0
+    assert np.array_equal(slices[1].block_ids_per_layer_groups[1], np.array([0, 1, 2]))
+    assert slices[0].token_range == TokenRange(start=0, end=4)
+    assert slices[1].token_range == TokenRange(start=4, end=8)
 
 
 def test_create_kv_slices_preserves_mamba_state_index():

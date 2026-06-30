@@ -11,6 +11,36 @@ from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
 
+def project_blocks_to_global_chunk(
+    block_ids: np.ndarray,
+    chunk_block_offset: int,
+    chunk_block_count: int,
+    total_blocks: int,
+) -> np.ndarray:
+    """Project a global block chunk into a suffix-resident block list.
+
+    ``block_ids`` represents the resident suffix of the logical range
+    ``[0, total_blocks)``.  ``chunk_block_offset`` and ``chunk_block_count``
+    describe a chunk in that global coordinate space.
+    """
+    if chunk_block_count <= 0 or len(block_ids) == 0:
+        return block_ids[:0]
+
+    resident_start = max(0, total_blocks - len(block_ids))
+    resident_end = total_blocks
+    chunk_start = chunk_block_offset
+    chunk_end = chunk_start + chunk_block_count
+
+    overlap_start = max(chunk_start, resident_start)
+    overlap_end = min(chunk_end, resident_end)
+    if overlap_start >= overlap_end:
+        return block_ids[:0]
+
+    local_start = overlap_start - resident_start
+    local_end = overlap_end - resident_start
+    return block_ids[local_start:local_end]
+
+
 @dataclass
 class TokenRange:
     """Range of tokens in the sequence dimension."""
@@ -66,6 +96,8 @@ class KVSlice:
     is_last_slice: bool = False
     mamba_state_index: Optional[int] = None
     chunk_block_offset: int = 0
+    chunk_size_blocks: Optional[int] = None
+    total_blocks: Optional[int] = None
 
 
 class SessionStatus(Enum):
@@ -164,9 +196,9 @@ class TxSessionBase(_SessionBase):
 
         Args:
             slice: The KV slice describing which source blocks to send.
-                The slice's ``chunk_block_offset`` field indicates the offset
-                into the receiver's destination block list for sender-side
-                chunking.
+                The slice's ``chunk_block_offset`` field is the shared
+                sender-side chunk cursor. Each layer group projects it into its
+                own resident/windowed source and destination block ranges.
         """
         ...
 

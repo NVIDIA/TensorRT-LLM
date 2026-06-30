@@ -17,6 +17,7 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     TxSessionBase,
     WaitResult,
     get_unique_rid,
+    project_blocks_to_global_chunk,
 )
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
@@ -281,35 +282,52 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if self._chunk_size_blocks is None:
             return [base_slice]
 
-        max_blocks = max((len(ids) for ids in all_block_ids), default=0)
-        if max_blocks == 0:
+        max_resident_blocks = max((len(ids) for ids in all_block_ids), default=0)
+        if max_resident_blocks == 0:
             return [base_slice]
 
-        num_chunks = math.ceil(max_blocks / self._chunk_size_blocks)
+        tpb = self._reuse_adapter.tokens_per_block
+        prompt_len = getattr(req, "prompt_len", None)
+        if isinstance(prompt_len, int) and prompt_len > 0:
+            total_blocks = math.ceil(prompt_len / tpb)
+        elif base_slice.token_range is not None:
+            total_blocks = math.ceil(base_slice.token_range.end / tpb)
+        else:
+            total_blocks = max_resident_blocks
+        total_blocks = max(max_resident_blocks, total_blocks) # why would these not be the same? Why not just use max_resident_blocks?
+
+        num_chunks = math.ceil(total_blocks / self._chunk_size_blocks) # what happens to self._chunk_size_blocks when we use chunked prefill?
         slices: List[KVSlice] = []
-        block_offset = 0
         for chunk_idx in range(num_chunks):
             start = chunk_idx * self._chunk_size_blocks
-            end = start + self._chunk_size_blocks
             is_last = chunk_idx == num_chunks - 1
+            chunk_block_count = min(self._chunk_size_blocks, total_blocks - start)
+            chunk_token_start = start * tpb
+            chunk_token_end = (start + chunk_block_count) * tpb
+            if base_slice.token_range is not None:
+                chunk_token_end = min(chunk_token_end, base_slice.token_range.end)
+            chunk_token_range = TokenRange(start=chunk_token_start, end=chunk_token_end)
 
-            chunk_block_ids = [ids[start:end] for ids in all_block_ids]
+            chunk_block_ids = [
+                project_blocks_to_global_chunk(
+                    ids,
+                    chunk_block_offset=start,
+                    chunk_block_count=chunk_block_count,
+                    total_blocks=total_blocks,
+                )
+                for ids in all_block_ids
+            ]
             slices.append(
                 KVSlice(
                     is_last_slice=is_last,
                     block_ids_per_layer_groups=chunk_block_ids,
                     mamba_state_index=base_slice.mamba_state_index,
-                    token_range=base_slice.token_range,
-                    chunk_block_offset=block_offset,
+                    token_range=chunk_token_range,
+                    chunk_block_offset=start,
+                    chunk_size_blocks=chunk_block_count,
+                    total_blocks=total_blocks,
                 )
             )
-            # Use the max length across layer groups to advance the receiver
-            # offset.  This is the contract that lets receiver-side slicing in
-            # native/transfer.py (`_build_kv_write_meta`) trim the per-LG dst
-            # range with `len(src_block_ids)`, so asymmetric layer groups still
-            # land at the right destination position even though the offset is
-            # shared across groups.
-            block_offset += max((len(ids) for ids in chunk_block_ids), default=0)
 
         for lg_idx, original_ids in enumerate(all_block_ids):
             reassembled = np.concatenate([s.block_ids_per_layer_groups[lg_idx] for s in slices])

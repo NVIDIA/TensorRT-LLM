@@ -37,6 +37,7 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     SessionStatus,
     TxSessionBase,
     WaitResult,
+    project_blocks_to_global_chunk,
 )
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBuffer
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
@@ -207,7 +208,7 @@ class KVSendTask(SendTaskBase):
     Args:
         kv_slice: The KV slice describing which blocks to transfer.
             The slice's ``chunk_block_offset`` field indicates the
-            offset into the receiver's destination block list.
+            shared global chunk cursor in block units.
         params: Disaggregated serving parameters for this request.
         slice_id: Index of this slice within the session's task list.
     """
@@ -717,22 +718,34 @@ class Sender(SenderBase):
             dst_block_ids_per_groups = req_info.block_ids_per_layer_groups
             src_block_ids_per_groups = task._slice.block_ids_per_layer_groups
 
+            tpb = extractor.page_table.tokens_per_block
+            token_range = task._slice.token_range
+            slice_end = (
+                task._prompt_len
+                if task._prompt_len is not None
+                else (token_range.end if token_range is not None else 0)
+            )
+            total_blocks = task._slice.total_blocks
+            if total_blocks is None:
+                total_blocks = (slice_end + tpb - 1) // tpb
             chunk_offset = task._slice.chunk_block_offset
+            chunk_block_count = task._slice.chunk_size_blocks
+
             for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
                 src_block_ids = src_block_ids_per_groups[self_lg]
                 full_dst_block_ids = dst_block_ids_per_groups[peer_lg]
 
-                # When sender uses chunking, the receiver sends all dst
-                # blocks in a single RecvReqInfo.  Slice dst to match
-                # this task's src chunk position.
+                # When sender uses chunking, the receiver sends all dst blocks
+                # in a single RecvReqInfo. Project the global chunk cursor into
+                # each destination layer group's resident/windowed block range.
                 if chunk_offset > 0 or not task._slice.is_last_slice:
-                    chunk_end = chunk_offset + len(src_block_ids)
-                    if chunk_end > full_dst_block_ids.size:
-                        raise ValueError(
-                            f"dst chunk range out of bounds: offset={chunk_offset}, "
-                            f"len={len(src_block_ids)}, dst_blocks={full_dst_block_ids.size}"
-                        )
-                    dst_block_ids = full_dst_block_ids[chunk_offset:chunk_end]
+                    dst_projectable_blocks = full_dst_block_ids[:total_blocks]
+                    dst_block_ids = project_blocks_to_global_chunk(
+                        dst_projectable_blocks,
+                        chunk_block_offset=chunk_offset,
+                        chunk_block_count=chunk_block_count,
+                        total_blocks=total_blocks,
+                    )
                 else:
                     dst_block_ids = full_dst_block_ids
 
@@ -749,15 +762,11 @@ class Sender(SenderBase):
                         f"src/dst block count mismatch: {src_block_ids.size} vs "
                         f"{dst_block_ids.size} (expected diff <= 1)"
                     )
-                tpb = extractor.page_table.tokens_per_block
-                token_range = task._slice.token_range
                 lg_info = extractor.page_table.layer_groups[self_lg]
                 window_size = getattr(lg_info, "sliding_window_size", None)
 
                 # Block lists are the suffix of [..., slice_end); cached prefix
                 # is implicit in their size. token_start = (total_blocks - n) * tpb.
-                slice_end = token_range.end if token_range is not None else 0
-                total_blocks = (slice_end + tpb - 1) // tpb
                 src_beam0_blocks = Sender._beam0_block_count(
                     src_block_ids, total_blocks, task._beam_width
                 )
@@ -772,8 +781,14 @@ class Sender(SenderBase):
                     f"dst beam-0 block list ({dst_beam0_blocks}) exceeds total slice "
                     f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
                 )
-                src_start = (total_blocks - src_beam0_blocks) * tpb
-                dst_start = (total_blocks - dst_beam0_blocks) * tpb
+                if chunk_block_count is not None and (chunk_offset > 0 or not task._slice.is_last_slice):
+                    # Chunked lists are suffixes of the current global chunk,
+                    # not of the full prompt.
+                    src_start = (chunk_offset + chunk_block_count - src_beam0_blocks) * tpb
+                    dst_start = (chunk_offset + chunk_block_count - dst_beam0_blocks) * tpb
+                else:
+                    src_start = (total_blocks - src_beam0_blocks) * tpb
+                    dst_start = (total_blocks - dst_beam0_blocks) * tpb
                 if req_info.dst_start_token is not None:
                     dst_start = max(dst_start, req_info.dst_start_token)
                 if window_size is not None:
