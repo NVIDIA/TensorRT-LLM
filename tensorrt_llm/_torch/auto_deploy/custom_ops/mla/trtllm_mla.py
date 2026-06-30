@@ -69,7 +69,7 @@ from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.quantization import QuantMode
 
-from ..._compat import KvCacheConfig, prefer_pinned
+from ..._compat import KvCacheConfig, get_sm_version, prefer_pinned
 from ...utils.cuda_graph import cuda_graph_state
 from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
@@ -132,6 +132,43 @@ _CONTEXT_LAYER_OFFSET = 1
 # ``max_num_tokens`` for any standard config (typically
 # ``max_num_tokens >= max_seq_len``).
 _TRTLLM_MLA_CHUNK_BATCH_SIZE = 4
+
+
+def _is_blackwell_trtllm_gen_kernel(sm: int) -> bool:
+    return not (sm < 100 or sm in [120, 121])
+
+
+def _generate_spec_decoding_position_offsets(max_num_requests: int, draft_len: int) -> torch.Tensor:
+    width = draft_len + 1
+    row = torch.arange(width, dtype=torch.int, device="cuda")
+    return row.unsqueeze(0).expand(max_num_requests, -1).contiguous()
+
+
+def _generate_spec_decoding_packed_mask(max_num_requests: int, draft_len: int) -> torch.Tensor:
+    """Build the packed int32 causal mask expected by TRT-LLM spec-decoding."""
+    width = draft_len + 1
+    num_blocks = math.ceil(width / 32)
+    mask = torch.zeros([max_num_requests, width, num_blocks], dtype=torch.int, device="cuda")
+    remaining = width
+    for blk in range(num_blocks):
+        if remaining <= 0:
+            break
+        n = min(32, remaining)
+        vals = (torch.pow(2, torch.arange(n) + 1) - 1).int()
+        mask[:, blk * 32 : blk * 32 + n, blk] = vals
+        remaining -= 32
+    return mask
+
+
+def _get_generation_tokens_per_seq(batch_info: BatchInfo) -> int:
+    """Return the query width for generation-side MLA requests."""
+    _, num_extend, num_decode = batch_info.get_num_sequences()
+    _, num_extend_tokens, num_decode_tokens = batch_info.get_num_tokens()
+    if num_extend > 0:
+        return num_extend_tokens // num_extend
+    if num_decode > 0:
+        return num_decode_tokens // num_decode
+    return 1
 
 
 # =============================================================================
@@ -243,6 +280,16 @@ class _TrtllmMLAPlanner:
         self._decode_buf_kv_lora_rank: int = 0
         self._decode_buf_rope_dim: int = 0
         self._decode_buf_dtype: Optional[torch.dtype] = None
+        self.predicted_tokens_per_seq: int = 1
+
+        # Spec-dec state for AutoDeploy linear Eagle/MTP chains. This mirrors
+        # trtllm_attention.py and the PyTorch TRTLLM backend's linear-tree metadata.
+        self.is_spec_dec_active: bool = False
+        self.is_spec_decoding_enabled: bool = False
+        self.use_spec_decoding: bool = False
+        self.spec_decoding_generation_lengths: Optional[torch.Tensor] = None
+        self.spec_decoding_position_offsets: Optional[torch.Tensor] = None
+        self.spec_decoding_packed_mask: Optional[torch.Tensor] = None
 
     def reset(self, device: torch.device, max_batch: int, max_blocks_per_seq: int) -> None:
         """One-time allocation of ALL persistent buffers."""
@@ -362,6 +409,25 @@ class _TrtllmMLAPlanner:
                 sm_count * 8, dtype=torch.int32, device=device
             )
             self.flash_mla_num_splits = torch.zeros(max_batch + 1, dtype=torch.int32, device=device)
+
+    def init_spec_decoding(self, max_batch: int, max_draft_len: int) -> None:
+        """Initialize persistent linear spec-decoding tensors once when configured."""
+        if self.is_spec_dec_active:
+            return
+
+        self.is_spec_dec_active = True
+        self.is_spec_decoding_enabled = not _is_blackwell_trtllm_gen_kernel(get_sm_version())
+        self.spec_decoding_generation_lengths = torch.full(
+            (max_batch,), max_draft_len + 1, dtype=torch.int, device="cuda"
+        )
+        self.spec_decoding_position_offsets = _generate_spec_decoding_position_offsets(
+            max_batch, max_draft_len
+        )
+        self.spec_decoding_packed_mask = _generate_spec_decoding_packed_mask(
+            max_batch, max_draft_len
+        )
+        if self.is_spec_decoding_enabled:
+            self.use_spec_decoding = True
 
     def _select_workspace(self) -> torch.Tensor:
         """Return the right workspace for the current execution context.
@@ -575,7 +641,9 @@ class _TrtllmMLAPlanner:
     def plan_host(
         self,
         num_prefill: int,
+        num_extend: int,
         num_decode: int,
+        generation_tokens_per_seq: int,
         max_context_length: int,
         seq_len_with_cache_host: torch.Tensor,
         input_pos_host: torch.Tensor,
@@ -586,7 +654,9 @@ class _TrtllmMLAPlanner:
         Called from ``prepare_trtllm_mla_metadata_host`` before every forward
         (including CUDA graph replays).  Mirrors ``_TrtllmPlanner.plan_host``.
         """
-        num_seq = num_prefill + num_decode
+        num_generation = num_extend + num_decode
+        num_seq = num_prefill + num_generation
+        self.predicted_tokens_per_seq = generation_tokens_per_seq
 
         self.host_request_types[:num_prefill].fill_(0)
         self.host_request_types[num_prefill:num_seq].fill_(1)
@@ -594,7 +664,7 @@ class _TrtllmMLAPlanner:
         is_capturing = torch.cuda.is_current_stream_capturing() or cuda_graph_state.in_warm_up()
         if is_capturing:
             self.host_total_kv_lens[0] = max_context_length * num_prefill
-            self.host_total_kv_lens[1] = max_context_length * num_decode
+            self.host_total_kv_lens[1] = max_context_length * num_generation
             self.host_past_kv_lengths[:num_seq].fill_(max_context_length)
             self.host_context_lengths[:num_seq].fill_(max_context_length)
             # Cached-KV prefill scratch: padded to the max-cached / max-full
@@ -625,12 +695,12 @@ class _TrtllmMLAPlanner:
                     new_kv_per_seq=_wcase,
                     chunk_size=max_context_length,
                 )
-            if num_decode > 0:
+            if num_generation > 0:
                 cu_kv = self._cu_kv_decode_host
-                for i in range(num_decode):
+                for i in range(num_generation):
                     cu_kv[i + 1] = (i + 1) * max_context_length
-                self.cu_kv_decode[: num_decode + 1].copy_(
-                    cu_kv[: num_decode + 1], non_blocking=True
+                self.cu_kv_decode[: num_generation + 1].copy_(
+                    cu_kv[: num_generation + 1], non_blocking=True
                 )
         else:
             self.host_total_kv_lens[0] = seq_len_with_cache_host[:num_prefill].sum()
@@ -678,13 +748,23 @@ class _TrtllmMLAPlanner:
                 self.chunked_loop_num = 0
                 self.max_chunk_len_per_loop = []
                 self.max_q_seq_len = 0
-            if num_decode > 0:
+            if num_generation > 0:
                 cu_kv = self._cu_kv_decode_host
                 decode_lens = seq_len_with_cache_host[num_prefill:num_seq]
-                cu_kv[1 : num_decode + 1] = decode_lens.cumsum(0).int()
-                self.cu_kv_decode[: num_decode + 1].copy_(
-                    cu_kv[: num_decode + 1], non_blocking=True
+                cu_kv[1 : num_generation + 1] = decode_lens.cumsum(0).int()
+                self.cu_kv_decode[: num_generation + 1].copy_(
+                    cu_kv[: num_generation + 1], non_blocking=True
                 )
+
+    def refresh_batch_state(self, batch_info: BatchInfo) -> None:
+        """Refresh graph-time batch state after Eagle mutates batch_info."""
+        num_prefill, num_extend, num_decode = batch_info.get_num_sequences()
+        num_seq = num_prefill + num_extend + num_decode
+        self.host_request_types[:num_prefill].fill_(0)
+        self.host_request_types[num_prefill:num_seq].fill_(1)
+        self.predicted_tokens_per_seq = _get_generation_tokens_per_seq(batch_info)
+        if self.is_spec_decoding_enabled:
+            self.use_spec_decoding = num_decode == 0
 
     def plan_device(
         self,
@@ -763,17 +843,22 @@ def prepare_trtllm_mla_metadata_host(
     Mirrors ``prepare_trtllm_metadata_host`` from the standard trtllm backend.
     """
     batch_info = BatchInfo(batch_info_host)
-    num_prefill, _, num_decode = batch_info.get_absorbed_info()
+    num_prefill, num_extend, num_decode = batch_info.get_num_sequences()
     max_context_length = batch_info.get_max_context_length()
     max_blocks_per_seq = batch_info.get_max_blocks_per_seq()
     max_batch_size = batch_info.get_max_batch_size()
+    generation_tokens_per_seq = _get_generation_tokens_per_seq(batch_info)
 
     planner = _GlobalTrtllmMLAPlanner
     planner.reset(torch.device("cuda"), max_batch_size, max_blocks_per_seq)
+    if batch_info.get_max_draft_len() > 0:
+        planner.init_spec_decoding(max_batch_size, batch_info.get_max_draft_len())
 
     planner.plan_host(
         num_prefill=num_prefill,
+        num_extend=num_extend,
         num_decode=num_decode,
+        generation_tokens_per_seq=generation_tokens_per_seq,
         max_context_length=max_context_length,
         seq_len_with_cache_host=seq_len_with_cache_host,
         input_pos_host=input_pos_host,
@@ -799,8 +884,9 @@ def prepare_trtllm_mla_metadata(
     Returns ``[block_offsets]`` which flows through the graph to each attention op.
     """
     batch_info = BatchInfo(batch_info_host)
-    num_prefill, _, num_decode = batch_info.get_absorbed_info()
-    num_seq = num_prefill + num_decode
+    if _GlobalTrtllmMLAPlanner.is_spec_dec_active:
+        _GlobalTrtllmMLAPlanner.refresh_batch_state(batch_info)
+    num_seq = batch_info.get_total_num_sequences()
     block_offset_multiplier = batch_info.get_block_offset_multiplier()
 
     _GlobalTrtllmMLAPlanner.plan_device(
@@ -1550,6 +1636,8 @@ def _handle_decode_impl(
     latent_cache: torch.Tensor,
     num_tokens: int,
     num_prefill: int,
+    num_generation: int,
+    predicted_tokens_per_seq: int,
     num_heads: int,
     num_kv_heads: int,
     qk_nope_head_dim: int,
@@ -1605,14 +1693,14 @@ def _handle_decode_impl(
     flash_mla_meta = None
     flash_mla_splits = None
     if planner.flash_mla_tile_scheduler_metadata is not None:
-        decode_kv_lens = sequence_length[num_prefill:]
-        flash_mla_splits = planner.flash_mla_num_splits[: num_tokens + 1]
+        decode_kv_lens = sequence_length[num_prefill : num_prefill + num_generation]
+        flash_mla_splits = planner.flash_mla_num_splits[: num_generation + 1]
         thop.compute_flash_mla_metadata(
             decode_kv_lens,
             planner.flash_mla_tile_scheduler_metadata,
             flash_mla_splits,
-            num_tokens,
-            1,  # s_q (1 token per decode request)
+            num_generation,
+            predicted_tokens_per_seq,
             num_heads,
             1,  # num_kv_heads
             kv_lora_rank,
@@ -1626,8 +1714,9 @@ def _handle_decode_impl(
     q_absorbed = torch.bmm(q_nope_flat.transpose(0, 1), w_kn)
     fused_q_view[:, :, :kv_lora_rank] = q_absorbed.transpose(0, 1)
 
-    cu_q = planner.cu_q_decode[: num_tokens + 1]
-    cu_kv = planner.cu_kv_decode[: num_tokens + 1]
+    num_seq = num_prefill + num_generation
+    cu_q = planner.cu_q_decode[: num_seq + 1]
+    cu_kv = planner.cu_kv_decode[: num_seq + 1]
 
     # FP8 generation MLA: pass quantized Q buffer and BMM scales when FP8 KV
     # cache is active.  The mla_rope_generation kernel fills these tensors;
@@ -1664,7 +1753,7 @@ def _handle_decode_impl(
         None,  # out_scale
         planner.block_ids_per_seq,
         [None, None],  # mla_tensor_params (helix)
-        1,  # predicted_tokens_per_seq
+        predicted_tokens_per_seq,
         0,  # layer_idx (constant: decode bucket)
         num_heads,
         num_kv_heads,
@@ -1718,7 +1807,7 @@ def _handle_decode_impl(
         None,  # attention_sinks
         True,  # is_fused_qkv
         True,  # update_kv_cache
-        1,  # predicted_tokens_per_seq
+        predicted_tokens_per_seq,
         0,  # layer_idx (constant: decode bucket)
         num_heads,  # num_heads
         num_kv_heads,  # num_kv_heads
@@ -1757,12 +1846,12 @@ def _handle_decode_impl(
         None,  # helix_is_inactive_rank
         None,  # attention_chunk_size
         None,  # softmax_stats_tensor
-        False,  # is_spec_decoding_enabled
-        False,  # use_spec_decoding
+        planner.is_spec_decoding_enabled,  # is_spec_decoding_enabled
+        planner.use_spec_decoding,  # use_spec_decoding
         False,  # is_spec_dec_tree
-        None,  # spec_decoding_generation_lengths
-        None,  # spec_decoding_position_offsets_for_cpp
-        None,  # spec_decoding_packed_mask
+        planner.spec_decoding_generation_lengths,
+        planner.spec_decoding_position_offsets,
+        planner.spec_decoding_packed_mask,
         None,  # spec_decoding_bl_tree_mask_offset
         None,  # spec_decoding_bl_tree_mask
         None,  # spec_bl_tree_first_sparse_mask_offset_kv
@@ -1839,9 +1928,13 @@ def _mla_with_cache_impl(
     v_head_dim = kv_head_dim - qk_nope_head_dim
 
     batch_info = BatchInfo(batch_info_host)
-    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
-    num_seq = num_prefill + num_decode
-    num_tokens = num_prefill_tokens + num_decode
+    num_prefill, num_extend, num_decode = batch_info.get_num_sequences()
+    num_prefill_tokens, num_extend_tokens, num_decode_tokens = batch_info.get_num_tokens()
+    num_generation = num_extend + num_decode
+    num_generation_tokens = num_extend_tokens + num_decode_tokens
+    num_seq = num_prefill + num_generation
+    num_tokens = num_prefill_tokens + num_generation_tokens
+    predicted_tokens_per_seq = _get_generation_tokens_per_seq(batch_info)
     max_seq_len = batch_info.get_max_seq_len()
     max_context_length = batch_info.get_max_context_length()
     max_num_requests = batch_info.get_max_batch_size()
@@ -1894,10 +1987,10 @@ def _mla_with_cache_impl(
     # the decode/prefill helpers and referenced in the thop.attention calls.
     planner.ensure_rope_tables(qk_rope_head_dim)
 
-    if num_decode > 0:
+    if num_generation > 0:
         planner.ensure_decode_buffers(
             q_nope.device,
-            max_num_requests,
+            max_num_requests * predicted_tokens_per_seq,
             num_heads,
             kv_lora_rank,
             qk_rope_head_dim,
@@ -1990,7 +2083,7 @@ def _mla_with_cache_impl(
             rotary_cos_sin=rotary_cos_sin,
         )
 
-    if num_decode > 0:
+    if num_generation > 0:
         # Mixed batches slice the decode portion of the latent_cache; decode-only
         # passes the full tensor.
         decode_latent = (
@@ -2001,8 +2094,10 @@ def _mla_with_cache_impl(
             q_pe_flat[num_prefill_tokens:num_tokens],
             kv_b_proj_weight,
             decode_latent,
-            num_decode,
+            num_generation_tokens,
             num_prefill,
+            num_generation,
+            predicted_tokens_per_seq,
             num_heads,
             num_kv_heads,
             qk_nope_head_dim,

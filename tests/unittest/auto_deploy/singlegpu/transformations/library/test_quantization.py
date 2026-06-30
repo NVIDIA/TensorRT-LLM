@@ -186,6 +186,33 @@ def test_finegrained_fp8_quantization():
     torch_export_to_gm(gm_transformed, args=(x,))
 
 
+@pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
+@pytest.mark.parametrize("exclude_key", ["exclude_modules", "modules_to_not_convert"])
+def test_finegrained_fp8_quantization_respects_exclusions(exclude_key):
+    model = MLP(128, 256, 128).to(torch.float16).to("cuda")
+    x = torch.randn(3, 128, dtype=torch.float16).to("cuda")
+
+    quant_config = {
+        "quant_method": "fp8",
+        "weight_block_size": [128, 128],
+        exclude_key: ["linear2"],
+    }
+    quant_op = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear
+
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+    gm_transformed = InferenceOptimizer(
+        DummyFactory(quant_config),
+        {
+            "quantize_finegrained_fp8_linear_from_config": {
+                "stage": "pattern_matcher",
+            },
+        },
+    )(None, gm)
+
+    quant_nodes = [node for node in gm_transformed.graph.nodes if is_op(node, quant_op)]
+    assert len(quant_nodes) == 1
+
+
 @pytest.mark.parametrize(
     "quant_config,atol,rtol,num_p_og,model_class",
     [
