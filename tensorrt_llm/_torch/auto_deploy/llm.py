@@ -223,6 +223,7 @@ class DemoLLM(LLM):
 
         self.mpi_session = None
         self.runtime_context = None
+        self._post_processor_hook = None
 
         # prefetch model and load tokenizer
         self._prefetch_model()
