@@ -26,6 +26,7 @@ All published functionality in the Release Notes has been fully tested and verif
 
 ### API Changes
 
+- **[BREAKING CHANGE] TensorRT backend removed.** PyTorch is now the sole execution backend. `LLM(backend="tensorrt")` now raises a `ValueError`; `TrtLlmArgs`, `tensorrt_llm._tensorrt_engine.LLM`, the `trtllm-build` / `trtllm-refit` / `trtllm-prune` CLIs, the `--backend tensorrt` CLI choice, and the per-model `convert_checkpoint.py` scripts have all been removed. The `tensorrt` pip dependency is no longer installed. See the [TensorRT Backend Removed migration guide](legacy/tensorrt-backend-removal.md) for details.
 - `trtllm-serve`, `trtllm-eval`, `trtllm-bench`: explicit CLI flags now take precedence over values in `--config` / `--extra_llm_api_options` YAML files (was: YAML overrode CLI). Un-set CLI flags continue to fall back to the YAML, then to model-specific and built-in defaults.
 
 ### Fixed Issues

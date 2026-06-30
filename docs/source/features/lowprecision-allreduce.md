@@ -5,8 +5,7 @@ Note:
 This feature is optimized for PCIe-based GPU topologies and may affect model accuracy. Please evaluate precision impact for your specific workload.
 ```
 
-
-TRT-LLM supports `low-precision-allreduce`, a communication optimization that accelerates AllReduce operations in PCIe-based GPU environments. This feature quantizes FP16/BF16 data to FP8 during network transmission, reducing communication volume and improving performance.
+TensorRT LLM supports `low-precision-allreduce`, a communication optimization that accelerates AllReduce operations in PCIe-based GPU environments. This feature quantizes FP16/BF16 data to FP8 during network transmission, reducing communication volume and improving performance. It is available on the PyTorch backend through the `allreduce_strategy` field of `LlmArgs`.
 
 ## Algorithm
 
@@ -35,19 +34,15 @@ Low-Precision-AllReduce is specifically designed for the topology shown above, w
 
 ## Usage
 
-The Low-Precision-AllReduce algorithm can be enabled in two ways:
+Enable the Low-Precision-AllReduce algorithm by setting the `allreduce_strategy` field in `LlmArgs`:
 
-1. **Direct specification** in your code:
-```
-AllReduce allreduce(mapping=mapping, strategy=AllReduceStrategy.LOWPRECISION);
+```python
+from tensorrt_llm import LLM
+
+llm = LLM(model="<hf_model>", allreduce_strategy="LOWPRECISION")
 ```
 
-2. Enable by LlmArgs
-```
-Set allreduce_strategy field in LlmArgs.
-Candidates of strategies are "AUTO", "NCCL", "UB", "MINLATENCY", "ONESHOT", "TWOSHOT", "LOWPRECISION" and "MNNVL".
-If no strategy is set, AUTO will be set.
-```
+The candidate strategies are `"AUTO"`, `"NCCL"`, `"UB"`, `"MINLATENCY"`, `"ONESHOT"`, `"TWOSHOT"`, `"LOWPRECISION"` and `"MNNVL"`. If no strategy is set, `AUTO` is used.
 
 ## Performance and Accuracy Considerations
 
@@ -58,4 +53,4 @@ Low-Precision-AllReduce reduces communication volume by using FP8 data format fo
 
 Users should evaluate the precision impact on their specific models and workloads.
 
-**Note**: When compiling TensorRT-LLM without enabling the `ENABLE_FP8` option, setting Low Precision allreduce will not take effect.
+**Note**: When TensorRT LLM is built without the `ENABLE_FP8` option, setting the low-precision AllReduce strategy will not take effect.
