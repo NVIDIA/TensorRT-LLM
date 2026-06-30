@@ -781,7 +781,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                     initial_state=recurrent_state_p,
                     output_final_state=True,
                     cu_seqlens=query_start_loc_long[: num_prefill + 1],
-                    head_first=False,
                     use_qk_l2norm_in_kernel=True,
                 )
                 last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
@@ -848,7 +847,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             inplace_indexed_state_update=True,
             output_final_state=False,
             cu_seqlens=query_start_loc_long,
-            head_first=False,
             use_qk_l2norm_in_kernel=True,
         )
 

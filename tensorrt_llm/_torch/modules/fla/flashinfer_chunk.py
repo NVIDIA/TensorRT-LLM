@@ -53,7 +53,6 @@ def chunk_gated_delta_rule(
     inplace_indexed_state_update: bool = False,
     output_final_state: bool = False,
     cu_seqlens: Optional[torch.Tensor] = None,
-    head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Adapter for FlashInfer's chunk_gated_delta_rule."""
@@ -62,7 +61,6 @@ def chunk_gated_delta_rule(
     import flashinfer
 
     # --- Step 1: pre-flight asserts --------------------------------------
-    assert head_first is False, "head_first=True is not supported by this wrapper"
     assert q.dim() == 4 and q.shape[0] == 1, f"q must be [1, T, H_q, D_k], got {tuple(q.shape)}"
     assert k.shape[2] == q.shape[2], (
         f"num_q_heads ({q.shape[2]}) must equal num_k_heads ({k.shape[2]})"
