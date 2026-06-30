@@ -211,7 +211,7 @@ def test_wide_ep_ft_options_ignore_legacy_enable_flag(monkeypatch: pytest.Monkey
     assert timeout_s is None
 
 
-def test_watchdog_coordinator_reuses_dispatch_mask_for_combine() -> None:
+def test_watchdog_coordinator_reuses_committed_mask_when_generation_is_unchanged() -> None:
     health = EPGroupHealth(4)
     coordinator = AlltoAllWatchdogCoordinator(
         workspace_state={},
@@ -221,19 +221,80 @@ def test_watchdog_coordinator_reuses_dispatch_mask_for_combine() -> None:
         ep_rank=0,
         health=health,
     )
-    dispatch_mask = coordinator.active_rank_mask_tensor(None)
-    assert dispatch_mask is not None
+    dispatch_snapshot = coordinator.capture_active_rank_mask(None)
+    assert dispatch_snapshot.active_rank_mask is not None
+    assert dispatch_snapshot.committed_generation == 0
 
-    # Simulate a higher-layer commit at an invalid mid-collective point. The
-    # local dispatch/combine pair must keep using its dispatch snapshot.
-    health.mark_failed(2)
-    combine_mask = coordinator.active_rank_mask_for_combine(dispatch_mask, None)
+    combine_mask = coordinator.active_rank_mask_for_combine(dispatch_snapshot, None)
 
-    assert combine_mask is dispatch_mask
+    assert combine_mask is dispatch_snapshot.active_rank_mask
     assert combine_mask.tolist() == [0b1111, 0]
+
+
+def test_watchdog_coordinator_fails_closed_on_committed_generation_change() -> None:
+    health = EPGroupHealth(4)
+    coordinator = AlltoAllWatchdogCoordinator(
+        workspace_state={},
+        workspace=torch.zeros((4, 1), dtype=torch.uint8),
+        metainfo=torch.zeros((1,), dtype=torch.int64),
+        metainfo_index={},
+        ep_rank=0,
+        health=health,
+    )
+    dispatch_snapshot = coordinator.capture_active_rank_mask(None)
+
+    health.mark_failed(2)
+    health.mark_active(2)
+    assert health.get_mask() == 0b1111
+
+    with pytest.raises(
+        RuntimeError,
+        match="committed EP membership changed between dispatch and combine",
+    ):
+        coordinator.active_rank_mask_for_combine(dispatch_snapshot, None)
+
+
+def test_watchdog_coordinator_converts_atomic_snapshot_to_two_mask_words() -> None:
+    health = EPGroupHealth(72)
+    health.mark_failed(70)
+    coordinator = AlltoAllWatchdogCoordinator(
+        workspace_state={},
+        workspace=torch.zeros((72, 1), dtype=torch.uint8),
+        metainfo=torch.zeros((1,), dtype=torch.int64),
+        metainfo_index={},
+        ep_rank=0,
+        health=health,
+    )
+
+    dispatch_snapshot = coordinator.capture_active_rank_mask(None)
+
+    assert dispatch_snapshot.committed_generation == 1
+    assert dispatch_snapshot.active_rank_mask is not None
+    assert dispatch_snapshot.active_rank_mask.tolist() == [(1 << 64) - 1, 0xBF]
+
+
+def test_watchdog_coordinator_explicit_mask_is_not_bound_to_health_generation() -> None:
+    health = EPGroupHealth(4)
+    coordinator = AlltoAllWatchdogCoordinator(
+        workspace_state={},
+        workspace=torch.zeros((4, 1), dtype=torch.uint8),
+        metainfo=torch.zeros((1,), dtype=torch.int64),
+        metainfo_index={},
+        ep_rank=0,
+        health=health,
+    )
+    explicit_mask = torch.tensor([0b1101, 0], dtype=torch.uint64)
+    dispatch_snapshot = coordinator.capture_active_rank_mask(explicit_mask)
+    assert dispatch_snapshot.committed_generation is None
+
+    health.mark_failed(2)
+    combine_mask = coordinator.active_rank_mask_for_combine(dispatch_snapshot, None)
+
+    assert combine_mask is dispatch_snapshot.active_rank_mask
+    assert combine_mask.tolist() == explicit_mask.tolist()
     with pytest.raises(ValueError, match="mask captured at dispatch"):
         coordinator.active_rank_mask_for_combine(
-            dispatch_mask,
+            dispatch_snapshot,
             torch.tensor(health.get_mask_words(), dtype=torch.uint64),
         )
 

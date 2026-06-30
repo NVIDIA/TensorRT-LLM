@@ -46,6 +46,9 @@ DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S = 0.1
 UNKNOWN_COMPLETION_FLAG = -(2**63)
 _COMPLETION_FLAG_MASK = (1 << 32) - 1
 _COMPLETION_FLAG_HALF_RANGE = 1 << 31
+_ACTIVE_RANK_MASK_WORD_BITS = 64
+_ACTIVE_RANK_MASK_WORDS = 2
+_ACTIVE_RANK_MASK_WORD_MASK = (1 << _ACTIVE_RANK_MASK_WORD_BITS) - 1
 _WORKSPACE_WATCHDOG_STATE_KEY = "alltoall_watchdog_shared_state"
 _WORKSPACE_WATCHDOG_STATE_INIT_LOCK = threading.Lock()
 
@@ -70,6 +73,18 @@ class CompletionFlagReader(Protocol):
         """Return ``ep_size`` flag values for ``phase``."""
 
 
+class EPGroupHealthSnapshotLike(Protocol):
+    """Atomic fields required from a committed-membership snapshot."""
+
+    @property
+    def mask(self) -> int:
+        """Return the committed active-rank bitmask."""
+
+    @property
+    def generation(self) -> int:
+        """Return the matching committed-membership generation."""
+
+
 class EPGroupHealthLike(Protocol):
     """Read-only committed EP membership used by AlltoAll frontends."""
 
@@ -78,6 +93,22 @@ class EPGroupHealthLike(Protocol):
 
     def get_mask_words(self) -> tuple[int, ...]:
         """Return the active-rank bitmask split into uint64 words."""
+
+    def snapshot(self) -> EPGroupHealthSnapshotLike:
+        """Return one atomic committed mask and generation snapshot."""
+
+
+@dataclass(frozen=True)
+class ActiveRankMaskSnapshot:
+    """One dispatch epoch's rank mask and optional committed generation.
+
+    ``committed_generation`` is populated only when ``active_rank_mask`` was
+    read from the coordinator-owned EP health object. Explicit caller masks do
+    not inherit a generation from unrelated health state.
+    """
+
+    active_rank_mask: torch.Tensor | None
+    committed_generation: int | None
 
 
 class CompletionFlagReadTimeout(TimeoutError):
@@ -266,29 +297,75 @@ class AlltoAllWatchdogCoordinator:
             flag_val = flag_val.detach().cpu()
         return _normalize_completion_flag(int(flag_val.item()))
 
-    def active_rank_mask_tensor(self, active_rank_mask: torch.Tensor | None) -> torch.Tensor | None:
-        """Capture a caller override or the current committed mask.
+    def capture_active_rank_mask(
+        self, active_rank_mask: torch.Tensor | None
+    ) -> ActiveRankMaskSnapshot:
+        """Capture a caller override or one coherent committed-mask epoch.
 
         The returned tensor does not alias a caller-owned override, so it can
-        safely represent the mask used by one dispatch/combine pair.
+        safely represent the mask used by one dispatch/combine pair. When the
+        mask comes from ``health``, derive both fixed-width ABI words from one
+        atomic mask/generation snapshot.
         """
         if active_rank_mask is not None:
-            return active_rank_mask.detach().clone()
+            return ActiveRankMaskSnapshot(
+                active_rank_mask=active_rank_mask.detach().clone(),
+                committed_generation=None,
+            )
         if self._health is None:
-            return None
-        return torch.tensor(self._health.get_mask_words(), dtype=torch.uint64, device="cpu")
+            return ActiveRankMaskSnapshot(
+                active_rank_mask=None,
+                committed_generation=None,
+            )
+
+        health_snapshot = self._health.snapshot()
+        mask_words = tuple(
+            (health_snapshot.mask >> (_ACTIVE_RANK_MASK_WORD_BITS * index))
+            & _ACTIVE_RANK_MASK_WORD_MASK
+            for index in range(_ACTIVE_RANK_MASK_WORDS)
+        )
+        return ActiveRankMaskSnapshot(
+            active_rank_mask=torch.tensor(
+                mask_words,
+                dtype=torch.uint64,
+                device="cpu",
+            ),
+            committed_generation=health_snapshot.generation,
+        )
+
+    def active_rank_mask_tensor(self, active_rank_mask: torch.Tensor | None) -> torch.Tensor | None:
+        """Return only the tensor from :meth:`capture_active_rank_mask`.
+
+        Dispatch frontends must retain the full snapshot so combine can verify
+        the committed generation before launching its kernel.
+        """
+        return self.capture_active_rank_mask(active_rank_mask).active_rank_mask
 
     def active_rank_mask_for_combine(
         self,
-        dispatch_active_rank_mask: torch.Tensor | None,
+        dispatch_snapshot: ActiveRankMaskSnapshot,
         requested_active_rank_mask: torch.Tensor | None,
     ) -> torch.Tensor | None:
-        """Reuse the dispatch mask and reject a conflicting combine override.
+        """Validate the dispatch epoch and return its captured rank mask.
 
-        This guarantees one local mask snapshot across a dispatch/combine pair.
-        Atomic membership across layers and iterations remains the recovery
-        coordinator's responsibility.
+        A coordinator-owned generation change between dispatch and combine is
+        an invalid asynchronous commit, so fail closed before launching the
+        combine kernel. Explicit caller masks are independent of health and
+        therefore carry no committed generation.
         """
+        dispatch_active_rank_mask = dispatch_snapshot.active_rank_mask
+        committed_generation = dispatch_snapshot.committed_generation
+        if committed_generation is not None:
+            if self._health is None:
+                raise RuntimeError("committed rank-mask snapshot has no EP health source")
+            current_generation = self._health.snapshot().generation
+            if current_generation != committed_generation:
+                raise RuntimeError(
+                    "committed EP membership changed between dispatch and combine "
+                    f"(generation {committed_generation} -> {current_generation}); "
+                    "aborting collective epoch"
+                )
+
         if requested_active_rank_mask is None:
             return dispatch_active_rank_mask
         requested_mask = self.active_rank_mask_tensor(requested_active_rank_mask)
