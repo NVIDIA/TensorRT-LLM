@@ -460,7 +460,7 @@ def create_mpi_ft_subcomm(
     This operation is collective across ``parent_comm`` and must run on every
     rank during startup, before any background failure-broadcast threads are
     launched. The MVP requires one MoE EP group spanning the parent world,
-    ordered by the EP-local rank used by :class:`EPGroupHealth`.
+    ordered by the EP-local rank used by the caller's detected-rank state.
 
     Before splitting, ranks exchange their local validation outcome and EP
     topology on the healthy parent communicator. This prevents one rank from
@@ -471,7 +471,7 @@ def create_mpi_ft_subcomm(
         parent_comm: Parent MPI communicator. Defaults to TRT-LLM's active
             ``mpi_comm()``, which wraps ``MPI.COMM_WORLD`` in the standard
             launch path and preserves custom communicator sessions.
-        health_size: Optional local ``EPGroupHealth`` size to validate
+        health_size: Optional local detected-rank-state size to validate
             collectively before splitting.
 
     Returns:
