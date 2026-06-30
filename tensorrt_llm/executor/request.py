@@ -207,6 +207,8 @@ class GenerationRequest:
             if buf is not None:
                 ptids = buf.tolist()
                 self._prompt_token_ids = ptids  # cache
+        # Callers that mutate this returned list in place must clear
+        # `_prompt_token_ids_i32`; base_worker assumes both forms stay synced.
         return ptids
 
     @prompt_token_ids.setter

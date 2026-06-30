@@ -400,6 +400,8 @@ class BaseWorker(GenerationExecutor):
         # THAT to the C++ Request ctor (memcpy) instead of the list -- this avoids
         # the O(ISL) list copy + element-wise nanobind cast on the GIL-held submit
         # thread. No buffer (in-process, or prompt-adapter prepend) -> list path.
+        # If both forms exist, they are assumed to describe the same token ids;
+        # in-place mutations of request.prompt_token_ids must clear the i32 buffer.
         i32_buf = getattr(request, "_prompt_token_ids_i32", None)
         if i32_buf is not None and request.prompt_adapter_request is None:
             prompt_token_ids = i32_buf
