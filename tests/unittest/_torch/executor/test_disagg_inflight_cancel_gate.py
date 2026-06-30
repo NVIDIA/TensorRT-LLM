@@ -237,6 +237,46 @@ def test_feature_opt_in_accepts_cpp_nixl_ucx(monkeypatch):
     assert result is expected
     assert config.backend == "NIXL"
     constructor.assert_called_once()
+    assert constructor.call_args.kwargs["_inflight_cancel_config_prevalidated"] is True
+
+
+def test_feature_preflight_rejects_asymmetric_rank_capability(monkeypatch):
+    monkeypatch.setenv(transceiver_module._DISAGG_INFLIGHT_CANCEL_ENABLED_ENV, "1")
+    mapping = _supported_mapping()
+    mapping.world_size = 2
+    config = CacheTransceiverConfig(backend="NIXL", max_tokens_in_buffer=512)
+    dist = Mock()
+    dist.allgather.return_value = [
+        (True, None),
+        (True, "rank-local capability is unsupported"),
+    ]
+
+    with pytest.raises(ValueError, match="unsupported on one or more worker ranks"):
+        transceiver_module._validate_disagg_inflight_cancel_config(
+            config,
+            mapping,
+            dist,
+            inflight_cancel_supported_by_executor=True,
+        )
+
+    dist.allgather.assert_called_once_with((True, None))
+
+
+def test_feature_preflight_rejects_asymmetric_rank_mode(monkeypatch):
+    monkeypatch.setenv(transceiver_module._DISAGG_INFLIGHT_CANCEL_ENABLED_ENV, "1")
+    mapping = _supported_mapping()
+    mapping.world_size = 2
+    config = CacheTransceiverConfig(backend="NIXL", max_tokens_in_buffer=512)
+    dist = Mock()
+    dist.allgather.return_value = [(True, None), (False, None)]
+
+    with pytest.raises(ValueError, match="must resolve identically"):
+        transceiver_module._validate_disagg_inflight_cancel_config(
+            config,
+            mapping,
+            dist,
+            inflight_cancel_supported_by_executor=True,
+        )
 
 
 def test_feature_opt_in_rejects_ambiguous_legacy_backend_env(monkeypatch):

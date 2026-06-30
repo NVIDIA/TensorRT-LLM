@@ -2214,7 +2214,10 @@ def create_py_executor_instance(
         attention_type,
         cache_transceiver_config,
         mamba_cache_manager,
-        inflight_cancel_supported_by_executor=kv_connector_manager is None)
+        # This protocol-only prerequisite remains dormant until the dependent
+        # PyExecutor lifecycle change can guarantee safe timeout, cancellation,
+        # poison, and terminal-response ownership.
+        inflight_cancel_supported_by_executor=False)
 
     waiting_queue_policy = (scheduler_config.waiting_queue_policy
                             if scheduler_config is not None else

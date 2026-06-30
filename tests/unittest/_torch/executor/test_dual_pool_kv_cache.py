@@ -658,7 +658,7 @@ class TestKVCacheV2SchedulerCrossParam:
 
     @pytest.mark.parametrize(
         "has_kv_connector,expected_inflight_cancel_support",
-        [(False, True), (True, False)],
+        [(False, False), (True, False)],
     )
     def test_factory_forwards_encoder_init_until_state_for_cross_pool(
         self, has_kv_connector, expected_inflight_cancel_support

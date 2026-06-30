@@ -238,6 +238,7 @@ std::vector<std::vector<std::uint64_t>> gatherPackedTransferStatePayloads(
     {
         auto const stateSize = descriptors[rank] & ~kPoisonedDescriptorBit;
         TLLM_CHECK(stateSize <= static_cast<std::uint64_t>(std::numeric_limits<int>::max()));
+        TLLM_CHECK(totalSize <= static_cast<size_t>(std::numeric_limits<int>::max()) - static_cast<size_t>(stateSize));
         sizes[rank] = static_cast<int>(stateSize);
         displacements[rank] = static_cast<int>(totalSize);
         totalSize += sizes[rank];
@@ -369,6 +370,9 @@ std::unique_ptr<BaseCacheTransceiver> CacheTransceiverFactory::createCacheTransc
     runtime::WorldConfig const& worldConfig, executor::kv_cache::CacheState::AttentionType attentionType,
     std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig)
 {
+    TLLM_CHECK_WITH_INFO(!common::getEnvDisaggEnableInflightCancel(),
+        "TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1 is not supported by the legacy C++ executor; use the standard "
+        "PyExecutor path after its cancellation lifecycle support is enabled.");
     if (!cacheTransceiverConfig.has_value() || !cacheTransceiverConfig.value().getBackendType().has_value())
     {
         TLLM_LOG_INFO("CacheTransceiver is disabled.");
@@ -418,6 +422,17 @@ std::unique_ptr<BaseCacheTransceiver> CacheTransceiverFactory::createCacheTransc
 
     return std::make_unique<CacheTransceiver>(cacheManager, cacheStateCfg, worldConfig, attentionLayerNumPerPP,
         modelConfig.getKvDataType(), attentionType, cacheTransceiverConfig);
+}
+
+CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager,
+    executor::kv_cache::CacheState::ModelConfig const& cacheStateModelCfg, runtime::WorldConfig const& worldConfig,
+    std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
+    executor::kv_cache::CacheState::AttentionType attentionType,
+    std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig,
+    rnn_state_manager::RnnStateManager* rnnStateManager, std::vector<SizeType32> const& rnnLayerNumPerPP)
+    : CacheTransceiver(cacheManager, cacheStateModelCfg, worldConfig, attentionLayerNumPerPP, dataType, attentionType,
+        std::move(cacheTransceiverConfig), rnnStateManager, rnnLayerNumPerPP, /*enableInflightCancel=*/false)
+{
 }
 
 CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager,

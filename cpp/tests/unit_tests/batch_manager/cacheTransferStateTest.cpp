@@ -89,5 +89,13 @@ TEST(CacheTransferStateTest, PoisonIsTopologyWideIndependentOfRequestState)
     EXPECT_TRUE(outcome.quiescedRequestIds.empty());
 }
 
+TEST(CacheTransferStateTest, ReadySignalSummaryDistinguishesMixedPeers)
+{
+    EXPECT_EQ(summarizeReadySignals(/*anyReady=*/true, /*anyNotReady=*/false), ReadySignalSummary::kAllReady);
+    EXPECT_EQ(summarizeReadySignals(/*anyReady=*/false, /*anyNotReady=*/true), ReadySignalSummary::kAllNotReady);
+    EXPECT_EQ(summarizeReadySignals(/*anyReady=*/true, /*anyNotReady=*/true), ReadySignalSummary::kMixed);
+    EXPECT_THROW((void) summarizeReadySignals(/*anyReady=*/false, /*anyNotReady=*/false), std::exception);
+}
+
 } // namespace
 } // namespace tensorrt_llm::batch_manager::detail

@@ -42,6 +42,23 @@ enum TransferGlobalFlag : std::uint64_t
     kTransferBufferPoisoned = 1U << 0,
 };
 
+enum class ReadySignalSummary
+{
+    kAllReady,
+    kAllNotReady,
+    kMixed,
+};
+
+inline ReadySignalSummary summarizeReadySignals(bool const anyReady, bool const anyNotReady)
+{
+    TLLM_CHECK_WITH_INFO(anyReady || anyNotReady, "Ready-signal summary requires at least one peer response.");
+    if (anyReady && anyNotReady)
+    {
+        return ReadySignalSummary::kMixed;
+    }
+    return anyReady ? ReadySignalSummary::kAllReady : ReadySignalSummary::kAllNotReady;
+}
+
 struct TransferTopologyOutcome
 {
     // Logical failure is a union: one failed or timed-out rank fails the request everywhere.

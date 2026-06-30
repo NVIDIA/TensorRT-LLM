@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/batch_manager/baseTransBuffer.h"
 #include "tensorrt_llm/batch_manager/cacheTransBuffer.h"
+#include "tensorrt_llm/batch_manager/dataTransceiver.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include <NvInferRuntime.h>
 #include <gtest/gtest.h>
@@ -146,13 +147,14 @@ TEST_P(BufferIndexHolderLifecycleTest, DefaultConstructedExplicitReleaseIsNoOp)
     EXPECT_EQ(inUse(), before);
 }
 
-// Holder built from a nullopt index is disarmed (mHeld == false).
+// A nullopt index still represents ownership for dynamic-buffer mode: an
+// interrupted transfer must be able to poison the whole dynamic pool.
 TEST_P(BufferIndexHolderLifecycleTest, NulloptIndexReleasesNothing)
 {
     int const before = inUse();
     {
         BufferIndexHolder holder{mgr(), std::nullopt, isRecv()};
-        EXPECT_FALSE(holder.held());
+        EXPECT_TRUE(holder.held());
     }
     EXPECT_EQ(inUse(), before);
 }
@@ -284,6 +286,54 @@ TEST_P(BufferIndexHolderLifecycleTest, ExceptionUnwindStillReleases)
         // Holder destructor ran during unwind.
     }
     EXPECT_EQ(inUse(), before);
+}
+
+TEST_P(BufferIndexHolderLifecycleTest, TransferSessionReleasesRecvSlotOnSuccess)
+{
+    if (!isRecv())
+    {
+        GTEST_SKIP() << "TransferSession owns receive slots only";
+    }
+    int const before = inUse();
+    auto idx = acquire();
+    ASSERT_TRUE(idx.has_value());
+
+    executor::DataTransceiverState selfState;
+    executor::DataTransceiverState otherState;
+    runtime::BufferManager bufferManager{std::make_shared<runtime::CudaStream>()};
+    std::vector<Connection const*> connections{nullptr};
+    TransferSession session(std::move(connections), DataContext{0}, std::vector<SizeType32>{0}, selfState,
+        std::move(otherState), bufferManager, 0, BlockKey{}, nullptr, false, false);
+    std::vector<BufferIndexHolder> holders;
+    holders.emplace_back(mgr(), idx, /*isRecv=*/true);
+    session.setRecvBufferHolders(std::move(holders));
+
+    EXPECT_EQ(inUse(), before + 1);
+    session.releaseRecvBufferHolders();
+    EXPECT_EQ(inUse(), before);
+}
+
+TEST_P(BufferIndexHolderLifecycleTest, ActiveTransferSessionPoisonsUnreleasedRecvSlot)
+{
+    if (!isRecv())
+    {
+        GTEST_SKIP() << "TransferSession owns receive slots only";
+    }
+    auto idx = acquire();
+    ASSERT_TRUE(idx.has_value());
+    {
+        executor::DataTransceiverState selfState;
+        executor::DataTransceiverState otherState;
+        runtime::BufferManager bufferManager{std::make_shared<runtime::CudaStream>()};
+        std::vector<Connection const*> connections{nullptr};
+        TransferSession session(std::move(connections), DataContext{0}, std::vector<SizeType32>{0}, selfState,
+            std::move(otherState), bufferManager, 0, BlockKey{}, nullptr, false, true);
+        std::vector<BufferIndexHolder> holders;
+        holders.emplace_back(mgr(), idx, /*isRecv=*/true);
+        session.setRecvBufferHolders(std::move(holders));
+    }
+
+    EXPECT_TRUE(mgr().hasPoisonedBuffer());
 }
 
 INSTANTIATE_TEST_SUITE_P(SideVariants, BufferIndexHolderLifecycleTest,

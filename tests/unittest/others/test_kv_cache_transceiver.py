@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import gc
 import multiprocessing
 import sys
@@ -12,6 +27,8 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.pyexecutor import \
+    kv_cache_transceiver as transceiver_module
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import \
     create_kv_cache_transceiver
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
@@ -411,6 +428,114 @@ def test_cancel_request_in_transmission(attention_type):
     # Block the main thread due to the async operation
     time.sleep(2)
     assert gen_request.state == LlmRequestState.DISAGG_TRANS_ERROR
+
+
+@pytest.mark.timeout(120)
+def test_queued_context_cancel_settles_and_rejects_late_peer(monkeypatch):
+    """A queued CTX cancellation must not wait for GEN RequestInfo.
+
+    The local sender future becomes terminal immediately, while a tombstone
+    remains long enough to reject a generation peer that arrives later.
+    """
+    monkeypatch.setenv(transceiver_module._DISAGG_INFLIGHT_CANCEL_ENABLED_ENV,
+                       "1")
+    monkeypatch.setattr(transceiver_module,
+                        "_disagg_inflight_cancel_enabled_cache", None)
+    mapping = Mapping(world_size=1, rank=0)
+    dist = Distributed.get(mapping)
+    kv_cache_manager_ctx = create_kv_cache_manager(mapping, DataType.HALF)
+    kv_cache_manager_gen = create_kv_cache_manager(mapping, DataType.HALF)
+    config = CacheTransceiverConfig(backend="NIXL", max_tokens_in_buffer=512)
+    transceiver_ctx = create_kv_cache_transceiver(
+        mapping,
+        dist,
+        kv_cache_manager_ctx,
+        AttentionTypeCpp.DEFAULT,
+        config,
+        inflight_cancel_supported_by_executor=True)
+    transceiver_gen = create_kv_cache_transceiver(
+        mapping,
+        dist,
+        kv_cache_manager_gen,
+        AttentionTypeCpp.DEFAULT,
+        config,
+        inflight_cancel_supported_by_executor=True)
+
+    try:
+        fill_kv_cache_buffer(kv_cache_manager_ctx)
+        ctx_request = _build_ctx_request_for_timeout_test(request_id=43)
+        kv_cache_manager_ctx.impl.add_sequence_batch(
+            [(ctx_request.py_request_id, ctx_request.prompt_len, 1)],
+            [ctx_request])
+        transceiver_ctx.respond_and_send_async(ctx_request)
+
+        assert transceiver_ctx.cancel_request(ctx_request)
+        failed_ctx_ids = set()
+
+        def poll_context():
+            _, failed = transceiver_ctx.check_context_transfer_status(0)
+            failed_ctx_ids.update(failed)
+
+        wait_for_transfer_completion(
+            poll_context,
+            lambda: ctx_request.py_request_id in failed_ctx_ids,
+            timeout_s=5,
+        )
+        assert ctx_request.state == LlmRequestState.DISAGG_TRANS_ERROR
+
+        sampling_config = tensorrt_llm.bindings.SamplingConfig(
+            SamplingParams()._get_sampling_config())
+        gen_request = LlmRequest(
+            request_id=43,
+            max_new_tokens=1,
+            input_tokens=list(range(256)),
+            sampling_config=sampling_config,
+            is_streaming=False,
+            llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+            context_phase_params=ctx_request.context_phase_params,
+        )
+        kv_cache_manager_gen.impl.add_sequence_batch(
+            [(gen_request.py_request_id, gen_request.prompt_len, 1)],
+            [gen_request])
+        transceiver_gen.request_and_receive_async(gen_request)
+
+        wait_for_transfer_completion(
+            lambda: transceiver_gen.check_gen_transfer_status(0),
+            lambda: gen_request.state == LlmRequestState.DISAGG_TRANS_ERROR,
+            timeout_s=5,
+        )
+        assert not transceiver_gen.has_poisoned_transfer_buffer()
+    finally:
+        shutdown_transceivers(transceiver_gen, transceiver_ctx)
+
+
+@pytest.mark.timeout(60)
+def test_default_off_queued_context_cancel_preserves_pending_future(
+        monkeypatch):
+    """Legacy queued cancellation remains pending until the peer handshake."""
+    monkeypatch.delenv(transceiver_module._DISAGG_INFLIGHT_CANCEL_ENABLED_ENV,
+                       raising=False)
+    monkeypatch.setattr(transceiver_module,
+                        "_disagg_inflight_cancel_enabled_cache", None)
+    mapping = Mapping(world_size=1, rank=0)
+    dist = Distributed.get(mapping)
+    kv_cache_manager = create_kv_cache_manager(mapping, DataType.HALF)
+    config = CacheTransceiverConfig(backend="NIXL", max_tokens_in_buffer=512)
+    transceiver = create_kv_cache_transceiver(mapping, dist, kv_cache_manager,
+                                              AttentionTypeCpp.DEFAULT, config)
+    try:
+        fill_kv_cache_buffer(kv_cache_manager)
+        request = _build_ctx_request_for_timeout_test(request_id=44)
+        kv_cache_manager.impl.add_sequence_batch(
+            [(request.py_request_id, request.prompt_len, 1)], [request])
+        transceiver.respond_and_send_async(request)
+
+        assert transceiver.cancel_request(request)
+        completed, failed = transceiver.check_context_transfer_status(0)
+        assert completed == []
+        assert failed == []
+    finally:
+        shutdown_transceivers(transceiver)
 
 
 @pytest.mark.timeout(120)

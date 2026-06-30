@@ -244,7 +244,15 @@ public:
         = executor::kv_cache::CacheState::AttentionType::kDEFAULT,
         std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
         rnn_state_manager::RnnStateManager* rnnStateManager = nullptr,
-        std::vector<SizeType32> const& rnnLayerNumPerPP = {}, bool enableInflightCancel = false);
+        std::vector<SizeType32> const& rnnLayerNumPerPP = {});
+
+    CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager,
+        executor::kv_cache::CacheState::ModelConfig const& cacheStateModelCfg, runtime::WorldConfig const& worldConfig,
+        std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
+        executor::kv_cache::CacheState::AttentionType attentionType,
+        std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig,
+        rnn_state_manager::RnnStateManager* rnnStateManager, std::vector<SizeType32> const& rnnLayerNumPerPP,
+        bool enableInflightCancel);
 
     CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager, std::vector<SizeType32> numKvHeadsPerLayer,
         SizeType32 sizePerHead, SizeType32 tokensPerBlock, runtime::WorldConfig const& worldConfig,
@@ -253,7 +261,20 @@ public:
         = executor::kv_cache::CacheState::AttentionType::kDEFAULT,
         std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
         rnn_state_manager::RnnStateManager* rnnStateManager = nullptr,
-        std::vector<SizeType32> const& rnnLayerNumPerPP = {}, bool enableInflightCancel = false)
+        std::vector<SizeType32> const& rnnLayerNumPerPP = {})
+        : CacheTransceiver(cacheManager,
+            executor::kv_cache::CacheState::ModelConfig{numKvHeadsPerLayer, sizePerHead, tokensPerBlock}, worldConfig,
+            attentionLayerNumPerPP, dataType, attentionType, cacheTransceiverConfig, rnnStateManager, rnnLayerNumPerPP)
+    {
+    }
+
+    CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager, std::vector<SizeType32> numKvHeadsPerLayer,
+        SizeType32 sizePerHead, SizeType32 tokensPerBlock, runtime::WorldConfig const& worldConfig,
+        std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
+        executor::kv_cache::CacheState::AttentionType attentionType,
+        std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig,
+        rnn_state_manager::RnnStateManager* rnnStateManager, std::vector<SizeType32> const& rnnLayerNumPerPP,
+        bool enableInflightCancel)
         : CacheTransceiver(cacheManager,
             executor::kv_cache::CacheState::ModelConfig{numKvHeadsPerLayer, sizePerHead, tokensPerBlock}, worldConfig,
             attentionLayerNumPerPP, dataType, attentionType, cacheTransceiverConfig, rnnStateManager, rnnLayerNumPerPP,

@@ -81,34 +81,34 @@ def _is_disagg_inflight_cancel_config_supported(
             and getenv(_TRY_ZCOPY_FOR_KV_CACHE_TRANSFER_ENV) != "1")
 
 
-def _validate_disagg_inflight_cancel_config(
-        cache_transceiver_config: CacheTransceiverConfig,
+def _get_disagg_inflight_cancel_config_error(
+        cache_transceiver_config: Optional[CacheTransceiverConfig],
         mapping: Mapping,
-        inflight_cancel_supported_by_executor: bool = False) -> None:
-    if not is_disagg_inflight_cancel_enabled():
-        return
+        inflight_cancel_supported_by_executor: bool = False) -> Optional[str]:
+    if cache_transceiver_config is None or cache_transceiver_config.backend is None:
+        return (f"{_DISAGG_INFLIGHT_CANCEL_ENABLED_ENV}=1 requires a "
+                "configured cache transceiver.")
 
     enabled_backend_env_vars = [
         env_name for env_name, _ in _CACHE_TRANSCEIVER_BACKEND_ENV_VARS
         if getenv(env_name) == "1"
     ]
     if len(enabled_backend_env_vars) > 1:
-        raise ValueError(
-            f"{_DISAGG_INFLIGHT_CANCEL_ENABLED_ENV}=1 requires an "
-            "unambiguous cache transceiver backend, but multiple legacy "
-            f"backend selectors are enabled: {enabled_backend_env_vars}.")
+        return (f"{_DISAGG_INFLIGHT_CANCEL_ENABLED_ENV}=1 requires an "
+                "unambiguous cache transceiver backend, but multiple legacy "
+                f"backend selectors are enabled: {enabled_backend_env_vars}.")
 
     if _is_disagg_inflight_cancel_config_supported(
             cache_transceiver_config, mapping,
             inflight_cancel_supported_by_executor):
-        return
+        return None
 
     runtime = cache_transceiver_config.transceiver_runtime or "CPP"
     nixl_backend = getenv(_NIXL_KVCACHE_BACKEND_ENV, "UCX")
     disable_overlap = getenv(_DISABLE_KV_CACHE_TRANSFER_OVERLAP_ENV)
     layerwise = getenv(_DISAGG_LAYERWISE_ENV)
     try_zcopy = getenv(_TRY_ZCOPY_FOR_KV_CACHE_TRANSFER_ENV)
-    raise ValueError(
+    return (
         f"{_DISAGG_INFLIGHT_CANCEL_ENABLED_ENV}=1 is experimental and "
         "currently supported only by the standard PyTorch backend "
         "PyExecutor with asynchronous transceiver_runtime='CPP', "
@@ -130,6 +130,37 @@ def _validate_disagg_inflight_cancel_config(
         f"{_TRY_ZCOPY_FOR_KV_CACHE_TRANSFER_ENV}={try_zcopy!r}.")
 
 
+def _validate_disagg_inflight_cancel_config(
+        cache_transceiver_config: Optional[CacheTransceiverConfig],
+        mapping: Mapping,
+        dist: Distributed,
+        inflight_cancel_supported_by_executor: bool = False) -> None:
+    requested = is_disagg_inflight_cancel_enabled()
+    local_error = (_get_disagg_inflight_cancel_config_error(
+        cache_transceiver_config, mapping,
+        inflight_cancel_supported_by_executor) if requested else None)
+    local_descriptor = (requested, local_error)
+
+    world_size = getattr(mapping, "world_size", 1)
+    descriptors = (dist.allgather(local_descriptor)
+                   if isinstance(world_size, int) and world_size > 1 else
+                   [local_descriptor])
+    requested_by_rank = [descriptor[0] for descriptor in descriptors]
+    if any(requested_by_rank) and not all(requested_by_rank):
+        raise ValueError(
+            f"{_DISAGG_INFLIGHT_CANCEL_ENABLED_ENV} must resolve identically "
+            f"on every worker rank; got requested={requested_by_rank}.")
+
+    errors = [(rank, descriptor[1])
+              for rank, descriptor in enumerate(descriptors)
+              if descriptor[1] is not None]
+    if errors:
+        details = "; ".join(f"rank {rank}: {error}" for rank, error in errors)
+        raise ValueError(
+            "Disaggregated in-flight cancellation is unsupported on one or "
+            f"more worker ranks: {details}")
+
+
 def mapping_to_world_config(mapping: Mapping) -> WorldConfig:
 
     return WorldConfig(tensor_parallelism=mapping.tp_size,
@@ -149,11 +180,8 @@ def create_kv_cache_transceiver(
         cache_transceiver_config: CacheTransceiverConfig,
         mamba_cache_manager: Optional[BaseMambaCacheManager] = None,
         inflight_cancel_supported_by_executor: bool = False):
-    if cache_transceiver_config is None or cache_transceiver_config.backend is None:
-        logger.info("cache_transceiver is disabled")
-        return None
-
-    if cache_transceiver_config.backend == "DEFAULT":
+    if (cache_transceiver_config is not None
+            and cache_transceiver_config.backend == "DEFAULT"):
         # When cache_transceiver_config.backend is not set, fallback to env_vars settings
         # NIXL is the default backend for non hybrid models
         cache_transceiver_config.backend = "NIXL"
@@ -166,9 +194,16 @@ def create_kv_cache_transceiver(
                 cache_transceiver_config.backend = be_type
                 break
 
+    # Every rank enters the same preflight before one rank can reject a local
+    # environment/configuration mismatch and strand peers in a later native
+    # startup collective.
     _validate_disagg_inflight_cancel_config(
-        cache_transceiver_config, mapping,
+        cache_transceiver_config, mapping, dist,
         inflight_cancel_supported_by_executor)
+
+    if cache_transceiver_config is None or cache_transceiver_config.backend is None:
+        logger.info("cache_transceiver is disabled")
+        return None
 
     if cache_transceiver_config.backend == "MPI":
         logger.warning(
@@ -197,10 +232,14 @@ def create_kv_cache_transceiver(
                                     cache_transceiver_config)
 
     # Default: use C++ transceiver (transceiver_runtime is None or "CPP")
-    return BindKvCacheTransceiver(mapping, dist, kv_cache_manager,
-                                  attention_type, cache_transceiver_config,
+    return BindKvCacheTransceiver(mapping,
+                                  dist,
+                                  kv_cache_manager,
+                                  attention_type,
+                                  cache_transceiver_config,
                                   mamba_cache_manager,
-                                  inflight_cancel_supported_by_executor)
+                                  inflight_cancel_supported_by_executor,
+                                  _inflight_cancel_config_prevalidated=True)
 
 
 class KvCacheTransceiver(ABC):
@@ -273,10 +312,13 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
                  attention_type: AttentionTypeCpp,
                  cache_transceiver_config: CacheTransceiverConfig,
                  mamba_cache_manager: Optional[BaseMambaCacheManager] = None,
-                 inflight_cancel_supported_by_executor: bool = False):
-        _validate_disagg_inflight_cancel_config(
-            cache_transceiver_config, mapping,
-            inflight_cancel_supported_by_executor)
+                 inflight_cancel_supported_by_executor: bool = False,
+                 *,
+                 _inflight_cancel_config_prevalidated: bool = False):
+        if not _inflight_cancel_config_prevalidated:
+            _validate_disagg_inflight_cancel_config(
+                cache_transceiver_config, mapping, dist,
+                inflight_cancel_supported_by_executor)
         world_config = mapping_to_world_config(mapping)
         # Filter out mamba/recurrent state layers (kv_heads == 0) so that
         # CacheState::ModelConfig::mNbKvHeadsPerLayer only contains attention

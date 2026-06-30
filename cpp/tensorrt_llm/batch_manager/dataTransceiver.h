@@ -22,6 +22,7 @@
 #include <string>
 #include <vector>
 
+#include "tensorrt_llm/batch_manager/baseTransBuffer.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/cacheTransferLayer.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
@@ -104,6 +105,19 @@ public:
         }
     }
 
+    TransferSession(TransferSession const&) = delete;
+    TransferSession& operator=(TransferSession const&) = delete;
+    TransferSession(TransferSession&&) noexcept = default;
+    TransferSession& operator=(TransferSession&&) noexcept = delete;
+
+    ~TransferSession()
+    {
+        if (mEnableInflightCancel)
+        {
+            poisonRecvBufferHolders();
+        }
+    }
+
     [[nodiscard]] std::vector<Connection const*> const& getConnections() const;
 
     // should be called only during the initialization of the TransferSession
@@ -158,6 +172,34 @@ public:
         return mEnableInflightCancel;
     }
 
+    /// Transfer ownership of preassigned receive-buffer slots to this session.
+    /// Formatters borrow these slots and must not release them independently.
+    void setRecvBufferHolders(std::vector<BufferIndexHolder> holders)
+    {
+        TLLM_CHECK(mRecvBufferHolders.empty());
+        mRecvBufferHolders = std::move(holders);
+    }
+
+    /// Release receive-buffer slots after the transfer and postprocessing have completed.
+    void releaseRecvBufferHolders() noexcept
+    {
+        for (auto& holder : mRecvBufferHolders)
+        {
+            holder.release();
+        }
+        mRecvBufferHolders.clear();
+    }
+
+    /// Quarantine receive-buffer slots when transfer quiescence is not known.
+    void poisonRecvBufferHolders() noexcept
+    {
+        for (auto& holder : mRecvBufferHolders)
+        {
+            holder.poison();
+        }
+        mRecvBufferHolders.clear();
+    }
+
 private:
     std::vector<Connection const*> mConnections;
     std::vector<SizeType32> mCounterPartRanks;        // Ranks corresponding to mConnections indices
@@ -170,6 +212,7 @@ private:
     int32_t mIndexFromEnd{0};
     BlockKey mLastBlockKey{};
     bool mEnableInflightCancel{false};
+    std::vector<BufferIndexHolder> mRecvBufferHolders;
 };
 
 using UniqueToken = tensorrt_llm::runtime::UniqueToken;
