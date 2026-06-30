@@ -70,6 +70,23 @@ np_bfloat16 = np.dtype('V2', metadata={"dtype": "bfloat16"})
 np_float8 = np.dtype('V1', metadata={"dtype": "float8"})
 
 
+def get_hf_rope_theta(config: Any, default: float = 10000.0) -> float:
+    """Return RoPE ``theta`` from a Hugging Face ``PreTrainedConfig``-like object.
+
+    Transformers v5+ nests ``rope_theta`` under ``rope_parameters`` for several
+    models (e.g. LLaMA); older releases expose ``config.rope_theta`` directly.
+    """
+    theta = getattr(config, "rope_theta", None)
+    if theta is not None:
+        return float(theta)
+    rope_params = getattr(config, "rope_parameters", None)
+    if isinstance(rope_params, dict):
+        theta = rope_params.get("rope_theta")
+        if theta is not None:
+            return float(theta)
+    return default
+
+
 def torch_to_numpy(x: torch.Tensor):
     assert isinstance(x, torch.Tensor), \
         f'x must be a torch.Tensor object, but got {type(x)}.'
@@ -161,6 +178,7 @@ _str_to_np_dict = dict(
     int64=np.int64,
     int32=np.int32,
     int8=np.int8,
+    uint8=np.uint8,
     bool=np.bool_,
     bfloat16=np_bfloat16,
     fp8=np_float8,
@@ -180,6 +198,7 @@ _str_to_torch_dtype_dict = dict(
     int64=torch.int64,
     int32=torch.int32,
     int8=torch.int8,
+    uint8=torch.uint8,
     bool=torch.bool,
     fp8=torch.float8_e4m3fn,
 )
@@ -198,6 +217,7 @@ _str_to_binding_dtype_dict = dict(
     int64=DataType.INT64,
     int32=DataType.INT32,
     int8=DataType.INT8,
+    uint8=DataType.UINT8,
     bool=DataType.BOOL,
     fp8=DataType.FP8,
 )
@@ -796,6 +816,20 @@ def is_sm_100f(sm_version=None):
     return sm_version == 100 or sm_version == 103
 
 
+@lru_cache(maxsize=1)
+def is_flashinfer_gdn_supported_arch(sm_version=None):
+    """Whether FlashInfer ships GDN (gated-delta-rule) kernels for this arch.
+
+    FlashInfer's GDN chunk-prefill and bf16-state decode kernels are built only
+    for Hopper (SM90) and datacenter Blackwell (SM100/SM103). On consumer
+    Blackwell (SM120) and other architectures the kernels abort at launch, so
+    callers must fall back to the vendored Triton kernels.
+    """
+    if sm_version is None:
+        sm_version = get_sm_version()
+    return sm_version in (90, 100, 103)
+
+
 def print_all_stacks():
     """Print stack traces for all threads"""
     for thread_id, frame in sys._current_frames().items():
@@ -1144,6 +1178,12 @@ class KVCacheEventSerializer:
             "data": event_serialize_func(event.data),
             "window_size": event.window_size,
         }
+        hash_algo = getattr(event, "hash_algo", None)
+        if hash_algo is not None:
+            json_str["hash_algo"] = hash_algo
+        layer_group_id = getattr(event, "layer_group_id", None)
+        if layer_group_id is not None:
+            json_str["layer_group_id"] = layer_group_id
         if event.attention_dp_rank is not None:
             json_str["attention_dp_rank"] = event.attention_dp_rank
 
@@ -1181,6 +1221,8 @@ class KVCacheEventSerializer:
                 for token in data.tokens
             ],
             # "lora_id": data.lora_id, # TODO (shreyasm): enable serialization of lora_id
+            "cache_salt":
+            data.cache_salt,
             "cache_level":
             data.cache_level,
             "priority":
@@ -1339,11 +1381,52 @@ def prefer_pinned() -> bool:
 
 def maybe_pin_memory(tensor: torch.Tensor) -> torch.Tensor:
     """
-    Pin the Tensor memory if pinning is preferred/beneficial for performance
+    Pin the Tensor memory if pinning is preferred/beneficial for performance.
+
+    Idempotent: if the tensor is already pinned, returns it unchanged.
+    PyTorch's `.pin_memory()` is itself a no-op for an already-pinned
+    tensor, but the call still goes through a CPython dispatch + pybind
+    boundary; gating on `is_pinned()` skips that for the common case
+    in tight loops (e.g. `AttentionMetadata.prepare()` re-pinning
+    `kv_lens` that callers already pinned upstream).
     """
-    if prefer_pinned():
+    if prefer_pinned() and not tensor.is_pinned():
         return tensor.pin_memory()
     return tensor
+
+
+def async_tensor_h2d(data, dtype: torch.dtype,
+                     device: Union[str, torch.device]) -> torch.Tensor:
+    """Build a CPU tensor from `data` and ship it to `device` with a
+    non-blocking H->D copy.
+
+    Mirrors vLLM's helper of the same name. Centralizes the pinned-CPU
+    + `cudaMemcpyAsync` pattern so callers don't have to choose
+    between `pin_memory=prefer_pinned()` + `.to(..., non_blocking=True)`
+    (sequence input) and `maybe_pin_memory(t).to(..., non_blocking=True)`
+    (existing CPU tensor input). Without pinning, `non_blocking=True`
+    silently degrades to a staging copy.
+
+    `data` may be:
+      * a Python sequence (list/tuple/etc.) — built via `torch.tensor`.
+      * a CPU `torch.Tensor` — reused (and cast to `dtype` if needed)
+        before pinning.
+    """
+    if isinstance(data, torch.Tensor):
+        assert data.device.type == "cpu", (
+            "async_tensor_h2d expects a CPU tensor; got "
+            f"device={data.device}")
+        if data.dtype != dtype:
+            data = data.to(dtype)
+        if prefer_pinned() and not data.is_pinned():
+            data = data.pin_memory()
+        return data.to(device, non_blocking=True)
+    # Sequence input -- let torch.tensor pin during construction.
+    return torch.tensor(
+        data,
+        dtype=dtype,
+        pin_memory=prefer_pinned(),
+    ).to(device, non_blocking=True)
 
 
 P = ParamSpec("P")

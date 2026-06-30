@@ -4,7 +4,7 @@ import subprocess
 import sys
 import unittest
 from typing import NamedTuple, Tuple
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
@@ -12,8 +12,9 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
-                                                             PeftCacheManager)
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    KVCacheManager, PeftCacheManager,
+    _warn_if_unsupported_v1_kv_cache_event_hash_algo)
 from tensorrt_llm.bindings import LayerType
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings import executor as tllm
@@ -24,6 +25,9 @@ from tensorrt_llm.bindings.internal.testing import \
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_hash import (KV_CACHE_HASH_ALGO_AUTO,
+                                                KV_CACHE_HASH_ALGO_V1,
+                                                KV_CACHE_HASH_ALGO_V2)
 from tensorrt_llm.sampling_params import SamplingParams
 
 DataType = tensorrt_llm.bindings.DataType
@@ -33,6 +37,33 @@ current_dir = pathlib.Path(__file__).parent.resolve()
 root_dir = current_dir.parent.parent.parent.parent
 
 sys.path.append(str(root_dir / "tests" / "integration"))
+
+
+def test_v1_kv_cache_event_hash_algo_warning_for_non_v1():
+    with patch("tensorrt_llm._torch.pyexecutor.resource_manager.logger.warning"
+               ) as warning:
+        _warn_if_unsupported_v1_kv_cache_event_hash_algo(KV_CACHE_HASH_ALGO_V2)
+
+    warning.assert_called_once()
+    assert KV_CACHE_HASH_ALGO_V1 in warning.call_args.args[0]
+    assert KV_CACHE_HASH_ALGO_V2 in warning.call_args.args[0]
+
+
+def test_v1_kv_cache_event_hash_algo_no_warning_for_v1():
+    with patch("tensorrt_llm._torch.pyexecutor.resource_manager.logger.warning"
+               ) as warning:
+        _warn_if_unsupported_v1_kv_cache_event_hash_algo(KV_CACHE_HASH_ALGO_V1)
+
+    warning.assert_not_called()
+
+
+def test_v1_kv_cache_event_hash_algo_no_warning_for_auto():
+    with patch("tensorrt_llm._torch.pyexecutor.resource_manager.logger.warning"
+               ) as warning:
+        _warn_if_unsupported_v1_kv_cache_event_hash_algo(
+            KV_CACHE_HASH_ALGO_AUTO)
+
+    warning.assert_not_called()
 
 
 class TestResourceManager(unittest.TestCase):
@@ -751,8 +782,8 @@ class TestResourceManager(unittest.TestCase):
 
         # First request: Add sequence and store blocks for reuse
         req1 = self.create_llm_request(0, [1, 2, 3, 4, 5])
-        kv_cache_manager.impl.add_sequence(req1.py_request_id, req1.prompt_len,
-                                           1, req1)
+        kv_cache_manager.impl.add_sequence_batch(
+            [(req1.py_request_id, req1.prompt_len, 1)], [req1])
 
         stats_initial = kv_cache_manager.get_kv_cache_stats()
         initial_reused_blocks = stats_initial.reused_blocks
@@ -762,8 +793,8 @@ class TestResourceManager(unittest.TestCase):
 
         # Second request with same tokens - should reuse blocks from the reuse tree
         req2 = self.create_llm_request(1, [1, 2, 3, 4, 5])
-        kv_cache_manager.impl.add_sequence(req2.py_request_id, req2.prompt_len,
-                                           1, req2)
+        kv_cache_manager.impl.add_sequence_batch(
+            [(req2.py_request_id, req2.prompt_len, 1)], [req2])
 
         stats_after_reuse = kv_cache_manager.get_kv_cache_stats()
         self.assertGreater(
@@ -782,8 +813,8 @@ class TestResourceManager(unittest.TestCase):
 
         # Third request with same tokens - should NOT reuse blocks after reset
         req3 = self.create_llm_request(2, [1, 2, 3, 4, 5])
-        kv_cache_manager.impl.add_sequence(req3.py_request_id, req3.prompt_len,
-                                           1, req3)
+        kv_cache_manager.impl.add_sequence_batch(
+            [(req3.py_request_id, req3.prompt_len, 1)], [req3])
 
         stats_after_third = kv_cache_manager.get_kv_cache_stats()
         self.assertEqual(
@@ -880,6 +911,51 @@ class TestResourceManager(unittest.TestCase):
 
         # The PeftCacheManager should be created successfully with the provided stream
         self.assertTrue(peft_cache_manager.impl.enabled)
+
+
+class TestKVCacheManagerConfigForwarding(unittest.TestCase):
+
+    def test_secondary_offload_min_priority_forwarded_to_cpp_manager(self):
+        """Regression guard: preserve explicit priority 0 when building C++ kwargs."""
+        kv_cache_config = KvCacheConfig(max_tokens=64,
+                                        secondary_offload_min_priority=0)
+
+        mock_impl = MagicMock()
+        mock_impl.get_block_pool_pointers.return_value = torch.empty(0)
+        mock_impl.get_block_scale_pool_pointers.return_value = torch.empty(0)
+        mock_impl.get_layer_to_pool_mapping.return_value = [0]
+        mock_impl.num_pools = 1
+        mock_impl.max_blocks_per_seq = 1
+
+        class MockStream:
+            cuda_stream = 0
+
+        with patch(
+                "tensorrt_llm._torch.pyexecutor.resource_manager.KVCacheManagerCpp",
+                return_value=mock_impl) as mock_cpp_manager:
+            with patch("torch.cuda.mem_get_info",
+                       return_value=(1 << 30, 2 << 30)):
+                kv_cache_manager = KVCacheManager(
+                    kv_cache_config=kv_cache_config,
+                    kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
+                    CacheType.SELF,
+                    num_layers=1,
+                    num_kv_heads=1,
+                    head_dim=128,
+                    tokens_per_block=32,
+                    max_seq_len=64,
+                    max_batch_size=1,
+                    mapping=Mapping(),
+                    execution_stream=MockStream(),
+                )
+
+        try:
+            mock_cpp_manager.assert_called_once()
+            self.assertEqual(
+                mock_cpp_manager.call_args.
+                kwargs["secondary_offload_min_priority"], 0)
+        finally:
+            kv_cache_manager.shutdown()
 
 
 if __name__ == "__main__":

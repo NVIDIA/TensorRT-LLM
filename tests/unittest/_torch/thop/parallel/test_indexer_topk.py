@@ -1,3 +1,11 @@
+# Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+
 """
 Distribution-parameterized correctness tests for the heuristic indexer_topk_decode.
 
@@ -98,10 +106,11 @@ def create_random_logits(
     torch.manual_seed(seed)
     num_rows = row_starts.shape[0]
     max_len = int(row_ends.max().item())
-    # Pad to multiple of 4 so stride0 satisfies the float4-alignment requirement
-    # of launchHeuristicTopKDecode (matches TRT-LLM runtime where strides are
-    # always multiples of tokens_per_block >= 64).
-    max_len = (max_len + 3) & ~3
+    # Pad to multiple of 8 so stride0 satisfies the alignment requirement of
+    # launchHeuristicTopKDecode for both fp32 (float4 = 4 elements) and
+    # bf16/fp16 (int4 = 16 B = 8 elements) in multi-row mode (matches TRT-LLM
+    # runtime where strides are always multiples of tokens_per_block >= 64).
+    max_len = (max_len + 7) & ~7
 
     logits = torch.rand(num_rows, max_len, dtype=dtype, device="cuda")
 
@@ -220,16 +229,13 @@ def generate_seq_lens(batch_size, min_long_seq, num_tokens):
 
 
 # ---------------------------------------------------------------------------
-# Original random-data decode test (verbatim from test_indexer_topk.py)
+# Random-data decode tests (verbatim helper from test_indexer_topk.py, plus
+# regression coverage for the SM-saturation heuristic).
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("batch_size", [1, 64, 512, 2048])
-@pytest.mark.parametrize("next_n", [1, 2])
-@pytest.mark.parametrize("index_topk", [2048, 128])
-@pytest.mark.parametrize("num_tokens", [4096, 8192])
-def test_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens):
-    """Verify indexer_topk_decode output matches torch.topk for random logits."""
+def _run_indexer_topk_decode_check(batch_size, next_n, index_topk, num_tokens, compress_ratio):
+    """Run the random-data decode equivalence check against torch.topk."""
     torch.manual_seed(24)
     torch.cuda.manual_seed(24)
     num_gen_tokens = batch_size * next_n
@@ -238,16 +244,44 @@ def test_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens):
     next_n_offset = torch.arange(num_gen_tokens, device="cuda") % next_n
 
     seq_lens = generate_seq_lens(batch_size, index_topk, num_tokens)
-    row_ends = seq_lens[row_indices] - next_n + next_n_offset + 1
 
+    # Calculate actual KV lengths
+    actual_kv_lens = seq_lens[row_indices] - next_n + next_n_offset + 1
+
+    # Apply compression with floor division
+    row_ends = actual_kv_lens // compress_ratio
+
+    # Generate logits with the compressed size
     logits = create_random_logits(row_starts, row_ends, torch.float32, 42)
 
     indices = torch.empty((num_gen_tokens, index_topk), dtype=torch.int32, device="cuda")
 
-    torch.ops.trtllm.indexer_topk_decode(logits, seq_lens, indices, next_n, index_topk)
+    # Pre-allocate worst-case Radix split-work aux scratch so the fp32 path is
+    # CUDA-Graph-safe under capture and unconditionally accepted by the cpp op
+    # (which rejects blocks_per_row > 1 without caller-owned scratch). For
+    # blocks_per_row == 1 the kernel never dereferences these — supplying them
+    # is harmless. See IndexerTopKOp.cpp's fp32 branch.
+    radix_aux_indices, radix_aux_logits = _build_radix_aux_buffers(num_gen_tokens, index_topk)
+
+    # Run CUDA implementation with compress_ratio
+    torch.ops.trtllm.indexer_topk_decode(
+        logits,
+        seq_lens,
+        indices,
+        next_n,
+        index_topk,
+        compress_ratio=compress_ratio,
+        radix_aux_indices=radix_aux_indices,
+        radix_aux_logits=radix_aux_logits,
+    )
+
     torch.cuda.synchronize()
 
+    # Run reference implementation on compressed row_ends
     max_row_len = row_ends.max().item()
+    if max_row_len == 0:
+        # All rows are empty after compression, skip comparison
+        return
     torch_indices = logits.topk(min(index_topk, max_row_len), dim=-1)[1]
     mask_lo = torch_indices >= 0
     mask_hi = (torch_indices - (row_ends - row_starts)[:, None]) < 0
@@ -259,12 +293,343 @@ def test_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens):
     ), "CUDA top_k_per_row results don't match torch.topk"
 
 
-@skip_pre_hopper
-@pytest.mark.parametrize("batch_size", _PREFILL_BATCH_SIZES)
-@pytest.mark.parametrize("index_topk", [2048, 128])
-@pytest.mark.parametrize("num_tokens", _PREFILL_NUM_TOKENS)
-def test_indexer_topk_prefill(batch_size, index_topk, num_tokens):
-    """Verify indexer_topk_prefill output matches torch.topk for variable-length rows."""
+@pytest.mark.parametrize("batch_size", [1, 64, 512, 2048])
+@pytest.mark.parametrize("next_n", [1, 2])
+@pytest.mark.parametrize("index_topk", [2048, 512, 128])
+@pytest.mark.parametrize("num_tokens", [4096, 8192])
+@pytest.mark.parametrize("compress_ratio", [1, 4])
+def test_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens, compress_ratio):
+    _run_indexer_topk_decode_check(batch_size, next_n, index_topk, num_tokens, compress_ratio)
+
+
+# Regression coverage for the SM-saturation heuristic in indexerTopK decode.
+# Exercises the multi-block split path that was newly enabled for small batches
+# and moderate numColumns (commits 1c88ecd58, 38f9b59b2):
+#   batch_size in {16, 32, 128} bracket the smTarget transitions (>= 9, 5, 2 blocks/row)
+#   num_tokens 4096-32768 with cr in {1, 4} spans both the small-numColumns range
+#   that previously short-circuited to blocksPerRow=1 and the legacy single-block
+#   regime (numCols < 2048 stays single-block via the maxByCols guard).
+@pytest.mark.parametrize("batch_size", [16, 32, 128])
+@pytest.mark.parametrize("next_n", [1, 2])
+@pytest.mark.parametrize("index_topk", [2048])
+@pytest.mark.parametrize("num_tokens", [4096, 16384, 32768])
+@pytest.mark.parametrize("compress_ratio", [1, 4])
+def test_indexer_topk_decode_sm_saturation(
+    batch_size, next_n, index_topk, num_tokens, compress_ratio
+):
+    _run_indexer_topk_decode_check(batch_size, next_n, index_topk, num_tokens, compress_ratio)
+
+
+# Covers the single-block / multi-block path transition at
+# batch_size == kDecodeTargetTotalBlocks (= 132). batch_size < 132 keeps the
+# single-block-per-row path; at and above 132 the launch policy routes to
+# the multi-block split-and-merge path with bp = 2 to avoid the wave-
+# scheduling cliff that the single-block radix kernel hits once gridDim.x
+# approaches smCount on B200.
+@pytest.mark.parametrize("batch_size", [1, 64, 100, 132, 148, 256])
+@pytest.mark.parametrize("next_n", [1, 2])
+@pytest.mark.parametrize("index_topk", [2048])
+@pytest.mark.parametrize("num_tokens", [4096, 16384, 32768])
+@pytest.mark.parametrize("compress_ratio", [1, 4])
+def test_indexer_topk_decode_launch_policy_transitions(
+    batch_size, next_n, index_topk, num_tokens, compress_ratio
+):
+    _run_indexer_topk_decode_check(batch_size, next_n, index_topk, num_tokens, compress_ratio)
+
+
+# ---------------------------------------------------------------------------
+# Caller-owned Radix aux scratch (CUDA-Graph-safe path)
+#
+# The fp32 Radix path of indexer_topk_decode allocates its split-work aux
+# buffers via th::empty per call when blocks_per_row > 1. Under CUDA Graph
+# capture+replay these per-call pointers become stale when the caching
+# allocator is perturbed (chunked-prefill churn at high CONC), producing
+# silent corruption that surfaces as CUDA_ERROR_ILLEGAL_ADDRESS at a
+# downstream sync (see DSv4-Flash pareto sweep G4).
+#
+# The fix added two optional kwargs `radix_aux_indices` and
+# `radix_aux_logits` so the caller can supply persistent stable-address
+# buffers (matching the existing `heuristic_scratch` convention).
+#
+# These tests verify:
+#   (a) caller-owned-aux output matches the default (th::empty) path,
+#   (b) the same caller-owned-aux op survives CUDA Graph capture+replay
+#       with consistent output and matches the non-graph reference,
+#   (c) validation rejects malformed buffers (dtype / size / device /
+#       contiguity).
+#
+# Parameters target the fp32 split-work regime: blocks_per_row > 1
+# requires numColumns / kNumBins(=2048) >= 2 (see indexerTopK.cu:775).
+# For compress_ratio=4 that means num_tokens >= 16384 (numColumns = 4096).
+# ---------------------------------------------------------------------------
+
+
+_K_MAX_BLOCKS_PER_ROW_DECODE = 10  # mirror kMaxBlocksPerRowDecode in indexerTopK.cu
+
+
+def _build_radix_aux_buffers(num_rows: int, index_topk: int):
+    """Allocate worst-case stable-address aux buffers for the Radix path."""
+    aux_indices = torch.empty(
+        (num_rows, _K_MAX_BLOCKS_PER_ROW_DECODE, index_topk),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    aux_logits = torch.empty(
+        (num_rows, _K_MAX_BLOCKS_PER_ROW_DECODE, index_topk),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    return aux_indices, aux_logits
+
+
+def _build_decode_inputs(batch_size, next_n, index_topk, num_tokens, compress_ratio, seed=24):
+    """Construct the (logits, seq_lens, row_starts, row_ends) tuple used by
+    the fp32 indexer_topk_decode path.
+
+    Unlike `_run_indexer_topk_decode_check`'s helper, this one **forces
+    every row to span the full num_tokens window** so that the row_ends
+    distribution is deterministic and `row_ends.max() == num_tokens //
+    compress_ratio` for every parametrisation. That guarantees the test
+    exercises the Radix-split-work path (`blocks_per_row > 1` requires
+    `num_columns >= 2 * kNumBins = 4096`) instead of accidentally
+    short-circuiting to the single-block fallback when a random seq_len
+    happens to be small."""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    num_gen_tokens = batch_size * next_n
+    row_starts = torch.zeros(num_gen_tokens, dtype=torch.int32, device="cuda")
+    row_indices = torch.arange(num_gen_tokens, device="cuda") // next_n
+    next_n_offset = torch.arange(num_gen_tokens, device="cuda") % next_n
+
+    seq_lens = torch.full((batch_size,), num_tokens, dtype=torch.int32, device="cuda")
+    actual_kv_lens = seq_lens[row_indices] - next_n + next_n_offset + 1
+    row_ends = actual_kv_lens // compress_ratio
+
+    logits = create_random_logits(row_starts, row_ends, torch.float32, 42)
+    return logits, seq_lens, row_starts, row_ends
+
+
+def _topk_logit_values_sorted(logits, indices, k):
+    """For each row, return the top-K logit VALUES (sorted descending,
+    invalid -1 slots replaced with -inf). Used to compare two op-call
+    outputs by the VALUES they selected, tolerating the kernel's
+    nondeterministic tie-breaking on equal-logit candidates."""
+    safe_idx = indices.clone().long()
+    valid = safe_idx >= 0
+    safe_idx[~valid] = 0  # gather requires non-negative
+    gathered = logits.gather(1, safe_idx)
+    gathered = gathered.masked_fill(~valid, float("-inf"))
+    sorted_vals, _ = torch.sort(gathered[:, :k], dim=-1, descending=True)
+    return sorted_vals
+
+
+@pytest.mark.parametrize(
+    "batch_size,next_n,index_topk,num_tokens,compress_ratio",
+    [
+        # blocks_per_row > 1 regime: numColumns >= 4096
+        (8, 1, 512, 16384, 4),  # mirrors DSv4 Flash CONC=8 GVR-OFF failure point
+        (16, 1, 512, 16384, 4),
+        (32, 1, 512, 16384, 4),
+        (8, 1, 512, 8192, 1),  # compress_ratio=1 path
+    ],
+)
+def test_indexer_topk_decode_radix_aux_equivalence(
+    batch_size, next_n, index_topk, num_tokens, compress_ratio
+):
+    """Caller-owned Radix aux scratch must yield allocation-pointer-independent
+    output: two invocations with freshly-allocated aux buffers (different
+    backing addresses) on identical inputs must produce the same selected
+    top-K logit values. Guards against the original G4 hazard at the API
+    boundary — the kernel must consume the supplied buffers without leaking
+    pointer state from any prior call."""
+    logits, seq_lens, _, _ = _build_decode_inputs(
+        batch_size, next_n, index_topk, num_tokens, compress_ratio
+    )
+    num_rows = logits.shape[0]
+
+    # First invocation: caller-owned aux buffer A.
+    aux_a_idx, aux_a_log = _build_radix_aux_buffers(num_rows, index_topk)
+    indices_a = torch.empty((num_rows, index_topk), dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.indexer_topk_decode(
+        logits,
+        seq_lens,
+        indices_a,
+        next_n,
+        index_topk,
+        compress_ratio=compress_ratio,
+        radix_aux_indices=aux_a_idx,
+        radix_aux_logits=aux_a_log,
+    )
+    torch.cuda.synchronize()
+
+    # Second invocation with a freshly-allocated aux buffer B at a distinct
+    # backing address — the only intentional difference vs invocation A.
+    aux_b_idx, aux_b_log = _build_radix_aux_buffers(num_rows, index_topk)
+    indices_b = torch.empty((num_rows, index_topk), dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.indexer_topk_decode(
+        logits,
+        seq_lens,
+        indices_b,
+        next_n,
+        index_topk,
+        compress_ratio=compress_ratio,
+        radix_aux_indices=aux_b_idx,
+        radix_aux_logits=aux_b_log,
+    )
+    torch.cuda.synchronize()
+
+    # Compare by selected-logit VALUES rather than bit-identical indices —
+    # the Radix kernel uses histogram-radix sort with atomic ops and may
+    # return different (but equally valid) index orderings across calls on
+    # ties. Top-K logit values are the correctness invariant; existing
+    # `compare_top_k_results` follows the same principle.
+    k_effective = min(index_topk, int(logits.size(1)))
+    values_a = _topk_logit_values_sorted(logits, indices_a, k_effective)
+    values_b = _topk_logit_values_sorted(logits, indices_b, k_effective)
+    assert torch.allclose(values_a, values_b, rtol=0.0, atol=0.0), (
+        "Top-K logit values diverged across two caller-owned-aux invocations"
+    )
+
+
+@pytest.mark.parametrize(
+    "batch_size,next_n,index_topk,num_tokens,compress_ratio",
+    [
+        # Same shapes as the equivalence test, exercising blocks_per_row > 1.
+        (8, 1, 512, 16384, 4),
+        (32, 1, 512, 16384, 4),
+    ],
+)
+def test_indexer_topk_decode_radix_aux_cuda_graph_replay(
+    batch_size, next_n, index_topk, num_tokens, compress_ratio
+):
+    """Regression test for the original CUDA-Graph stale-pointer bug. Capture
+    the Radix path with caller-owned aux into a CUDA Graph, replay multiple
+    times, and verify the output matches a non-graph reference and stays
+    stable across replays. With the pre-fix per-call `th::empty` aux the
+    captured kernels could write to recycled memory between replays — the
+    persistent aux buffer eliminates that hazard."""
+    logits, seq_lens, _, _ = _build_decode_inputs(
+        batch_size, next_n, index_topk, num_tokens, compress_ratio
+    )
+    num_rows = logits.shape[0]
+
+    # Non-graph reference (uses the same caller-owned aux path).
+    aux_indices, aux_logits = _build_radix_aux_buffers(num_rows, index_topk)
+    indices_ref = torch.empty((num_rows, index_topk), dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.indexer_topk_decode(
+        logits,
+        seq_lens,
+        indices_ref,
+        next_n,
+        index_topk,
+        compress_ratio=compress_ratio,
+        radix_aux_indices=aux_indices,
+        radix_aux_logits=aux_logits,
+    )
+    torch.cuda.synchronize()
+
+    # CUDA-Graph capture + replay using the SAME aux tensors. The captured
+    # kernel descriptors hold the aux pointers; persistent allocation keeps
+    # them valid across replays.
+    indices_graph = torch.empty((num_rows, index_topk), dtype=torch.int32, device="cuda")
+
+    # Warm-up outside capture (recommended for stable allocator state).
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        torch.ops.trtllm.indexer_topk_decode(
+            logits,
+            seq_lens,
+            indices_graph,
+            next_n,
+            index_topk,
+            compress_ratio=compress_ratio,
+            radix_aux_indices=aux_indices,
+            radix_aux_logits=aux_logits,
+        )
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        torch.ops.trtllm.indexer_topk_decode(
+            logits,
+            seq_lens,
+            indices_graph,
+            next_n,
+            index_topk,
+            compress_ratio=compress_ratio,
+            radix_aux_indices=aux_indices,
+            radix_aux_logits=aux_logits,
+        )
+
+    # Replay several times; selected top-K logit values must match the
+    # non-graph reference and stay invariant across replays. (Indices
+    # themselves may reorder among equal-logit candidates due to atomic
+    # tie-breaking in the histogram-radix sort — value equality is the
+    # correctness invariant.)
+    k_effective = min(index_topk, int(logits.size(1)))
+    ref_values = _topk_logit_values_sorted(logits, indices_ref, k_effective)
+    for replay in range(8):
+        indices_graph.zero_()
+        g.replay()
+        torch.cuda.synchronize()
+        replay_values = _topk_logit_values_sorted(logits, indices_graph, k_effective)
+        assert torch.allclose(replay_values, ref_values, rtol=0.0, atol=0.0), (
+            f"CUDA Graph replay #{replay} top-K logit values diverged from non-graph reference"
+        )
+
+
+def test_indexer_topk_decode_radix_aux_validation():
+    """Caller-owned aux validation: wrong dtype, undersized buffer, wrong
+    device, and non-contiguous tensors must each raise."""
+    batch_size, next_n, index_topk, num_tokens, compress_ratio = 8, 1, 512, 16384, 4
+    logits, seq_lens, _, _ = _build_decode_inputs(
+        batch_size, next_n, index_topk, num_tokens, compress_ratio
+    )
+    num_rows = logits.shape[0]
+    indices = torch.empty((num_rows, index_topk), dtype=torch.int32, device="cuda")
+
+    good_idx, good_log = _build_radix_aux_buffers(num_rows, index_topk)
+
+    def call(ai, al):
+        torch.ops.trtllm.indexer_topk_decode(
+            logits,
+            seq_lens,
+            indices,
+            next_n,
+            index_topk,
+            compress_ratio=compress_ratio,
+            radix_aux_indices=ai,
+            radix_aux_logits=al,
+        )
+
+    # Wrong dtype for indices buffer (float32 instead of int32).
+    bad_idx_dtype = torch.empty_like(good_idx, dtype=torch.float32)
+    with pytest.raises(RuntimeError, match="radix_aux_indices must be int32"):
+        call(bad_idx_dtype, good_log)
+
+    # Wrong dtype for logits buffer (int32 instead of float32).
+    bad_log_dtype = torch.empty_like(good_log, dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="radix_aux_logits must be float32"):
+        call(good_idx, bad_log_dtype)
+
+    # Undersized buffer (fewer elements than num_rows*blocks_per_row*index_topk).
+    too_small_idx = torch.empty((num_rows, 1, index_topk), dtype=torch.int32, device="cuda")
+    too_small_log = torch.empty((num_rows, 1, index_topk), dtype=torch.float32, device="cuda")
+    with pytest.raises(RuntimeError, match="at least num_rows"):
+        call(too_small_idx, too_small_log)
+
+    # Non-contiguous buffer.
+    non_contig_idx = good_idx.transpose(0, 1)  # makes it non-contiguous
+    assert not non_contig_idx.is_contiguous()
+    with pytest.raises(RuntimeError, match="must be contiguous"):
+        call(non_contig_idx, good_log)
+
+
+def _run_indexer_topk_prefill_check(batch_size, index_topk, num_tokens):
+    """Run the prefill equivalence check against torch.topk."""
     torch.manual_seed(24)
     torch.cuda.manual_seed(24)
 
@@ -294,6 +659,15 @@ def test_indexer_topk_prefill(batch_size, index_topk, num_tokens):
     assert compare_top_k_results(
         logits, indices, torch_indices, row_starts, row_ends, index_topk
     ), "CUDA top_k_per_row results don't match torch.topk"
+
+
+@skip_pre_hopper
+@pytest.mark.parametrize("batch_size", _PREFILL_BATCH_SIZES)
+@pytest.mark.parametrize("index_topk", [2048, 128])
+@pytest.mark.parametrize("num_tokens", _PREFILL_NUM_TOKENS)
+def test_indexer_topk_prefill(batch_size, index_topk, num_tokens):
+    """Verify indexer_topk_prefill output matches torch.topk for variable-length rows."""
+    _run_indexer_topk_prefill_check(batch_size, index_topk, num_tokens)
 
 
 # ============================================================================
@@ -571,10 +945,11 @@ def create_distributed_logits(
     rng = np.random.default_rng(seed)
     num_rows = int(row_starts.shape[0])
     max_len = int(row_ends.cpu().max().item())
-    # Pad to multiple of 4 so stride0 satisfies the float4-alignment requirement
-    # of launchHeuristicTopKDecode (matches TRT-LLM runtime where strides are
-    # always multiples of tokens_per_block >= 64).
-    max_len = (max_len + 3) & ~3
+    # Pad to multiple of 8 so stride0 satisfies the alignment requirement of
+    # launchHeuristicTopKDecode for both fp32 (float4 = 4 elements) and
+    # bf16/fp16 (int4 = 16 B = 8 elements) in multi-row mode (matches TRT-LLM
+    # runtime where strides are always multiples of tokens_per_block >= 64).
+    max_len = (max_len + 7) & ~7
     size = (num_rows, max_len)
 
     dist = cfg["dist"]
@@ -694,6 +1069,19 @@ def generate_pre_idx(
     """
     Build the heuristic pre-prediction index tensor for each batch element.
 
+    The V3.2 multi-row kernel (`heuristicTopKMultiRowKernel{,Dtype}` in
+    cpp/tensorrt_llm/kernels/heuristicTopKDecode.cu) internally adds
+    `preIdxOffset = (rowIdx % next_n) + 1` to every pre_idx slot during its
+    Phase-1 stats reduction (heuristic_topk.cuh:654/1209). Production V3.2
+    callers therefore pass pre_idx in PREVIOUS-step coordinates so the
+    kernel's +1 / +2 / +3 shift maps prev positions to current-step
+    positions correctly.
+
+    This test builds pre_idx from `current_logits.topk()`, then applies a
+    `-1` shift before returning, so the kernel's internal `+1` brings every
+    hint back to its intended current-step position (preserves the kernel's
+    argmax invariant: kernel reads `input[(argmax_pos - 1) + 1] = input[argmax_pos]`).
+
     For batch element b (base row = b*next_n):
       - pre_idx[b, 0]       = argmax of the base row  (kernel invariant)
       - n_hit slots          = floor(index_topk * success_ratio) indices drawn
@@ -772,6 +1160,137 @@ def generate_pre_idx(
                         :take
                     ].int()
 
+    # V3.2 compensation: kernel adds `(rowIdx % next_n) + 1` to every pre_idx
+    # entry during P1 stats reduction. Shifting by -1 here means that for the
+    # base row (rowIdx % next_n == 0, offset = +1) the kernel reads the exact
+    # current-step positions our `topk()` selected. Negative entries are
+    # silently dropped by the kernel's `idx >= 0 && idx < N` range check.
+    pre_idx -= 1
+    return pre_idx
+
+
+def apply_mtp_structure_compressed(
+    logits: torch.Tensor,
+    batch_size: int,
+    next_n: int,
+    row_ends: torch.Tensor,
+) -> torch.Tensor:
+    """
+    cr=4-safe variant of apply_mtp_structure.
+
+    apply_mtp_structure assumes ``row_ends[b*next_n + nni] == row_ends[b*next_n]
+    + nni`` (the V3.2 cr=1 invariant where each MTP draft adds exactly one KV
+    token). Under cr=4, ``row_ends = floor(actual_kv_len / 4)`` and that
+    invariant breaks: when ``actual_kv_len[base] mod 4`` lies in {1, 2, 3}
+    (75% of seq_lens) we get ``row_ends[base+nni] == row_ends[base]``, so the
+    copy ``[nni : nni+valid_base]`` overruns ``row_ends[base+nni]`` and writes
+    finite values into what create_distributed_logits left as -inf. The
+    polluted positions then leak into torch.topk's reference (which doesn't
+    know about the row's true compressed N), producing off-by-one counts vs.
+    the kernel.
+
+    This variant clips the per-row copy length to fit within row b*next_n+nni's
+    valid compressed range, preserving MTP correlation where it fits and
+    leaving -inf positions untouched.
+    """
+    if next_n == 1:
+        return logits
+
+    for b in range(batch_size):
+        base = b * next_n
+        valid_base = int(row_ends[base].item())
+        for nni in range(1, next_n):
+            row = base + nni
+            valid_row = int(row_ends[row].item())
+            # Largest copy_len such that [nni, nni+copy_len) ⊆ [0, valid_row).
+            copy_len = max(0, min(valid_base, valid_row - nni))
+            if copy_len > 0:
+                logits[row, nni : nni + copy_len] = logits[base, :copy_len]
+
+    return logits
+
+
+def generate_pre_idx_v4(
+    logits: torch.Tensor,
+    row_ends: torch.Tensor,
+    batch_size: int,
+    next_n: int,
+    index_topk: int,
+    success_ratio: float = 0.6,
+    seed: int = 0,
+) -> torch.Tensor:
+    """
+    DSv4 (compress_ratio=4) variant of generate_pre_idx — no `-1` shift.
+
+    Unlike V3.2 where the kernel applies preIdxOffset = (rowIdx % next_n) + 1
+    to every preIdx entry (KV grew by 1 per decode step in uncompressed space),
+    the V4 indexer operates in compressed-token-index space where consecutive
+    decode steps may add 0 or 1 compressed entries (each compressed entry
+    fuses 4 real tokens). Per-row Δc varies with prev kv_len mod 4 alignment,
+    but new compressed entries are always appended at the end so prev-step
+    indices in [0, c_prev-1] remain valid as-is in [0, c_curr-1]. The kernel
+    therefore forces preIdxOffset = 0 when compressRatio != 1, and tests must
+    pass preIdx in CURRENT-step coordinates (no -1 shift).
+
+    Structure of the returned pre_idx[b]:
+      - pre_idx[b, 0]              = argmax of the base row (kernel invariant)
+      - floor(K * success_ratio) slots from the actual top-K (without replace)
+      - remaining slots from non-top-K pool (without replace)
+
+    Edge case (valid_len < K) handled identically to generate_pre_idx.
+
+    Args:
+        logits, row_ends, batch_size, next_n, index_topk, success_ratio, seed:
+            See generate_pre_idx — the V4 helper mirrors its sampling logic.
+
+    Returns:
+        pre_idx: int32 tensor of shape (batch_size, index_topk), entries in
+        the compressed current-step index space (no negative entries since
+        the kernel uses offset = 0).
+    """
+    torch.manual_seed(seed)
+    pre_idx = torch.zeros(batch_size, index_topk, dtype=torch.int32, device=logits.device)
+
+    for b in range(batch_size):
+        base = b * next_n
+        valid_len = int(row_ends[base].item())
+        k = min(index_topk, valid_len)
+
+        # Actual top-K of the base row; index 0 = argmax (kernel invariant).
+        _, topk_idx = logits[base, :valid_len].topk(k)
+
+        n_hit = max(1, int(k * success_ratio))
+        n_hit = min(n_hit, k)
+
+        if n_hit > 1:
+            perm = torch.randperm(k - 1, device=logits.device)[: n_hit - 1]
+            hits = torch.cat([topk_idx[:1], topk_idx[1:][perm]])
+        else:
+            hits = topk_idx[:1]
+
+        pre_idx[b, :n_hit] = hits.int()
+
+        n_fill = index_topk - n_hit
+        if n_fill > 0:
+            topk_mask = torch.zeros(valid_len, dtype=torch.bool, device=logits.device)
+            topk_mask[topk_idx] = True
+            non_topk = torch.where(~topk_mask)[0]
+
+            if len(non_topk) >= n_fill:
+                perm = torch.randperm(len(non_topk), device=logits.device)[:n_fill]
+                pre_idx[b, n_hit:] = non_topk[perm].int()
+            else:
+                pre_idx[b, n_hit : n_hit + len(non_topk)] = non_topk.int()
+                leftover = n_fill - len(non_topk)
+                topk_tail = topk_idx[n_hit:]
+                take = min(leftover, len(topk_tail))
+                if take > 0:
+                    pre_idx[b, n_hit + len(non_topk) : n_hit + len(non_topk) + take] = topk_tail[
+                        :take
+                    ].int()
+
+    # No shift: kernel reads input[preIdx[i] + 0] = input[preIdx[i]] directly
+    # in compressed current-step coordinates.
     return pre_idx
 
 
@@ -944,14 +1463,20 @@ def test_cute_dsl_topk_decode_single_pass_multi_cta_cluster(
 @pytest.mark.parametrize("dist_cfg", _DECODE_DIST_CONFIGS, ids=_DECODE_DIST_IDS)
 @pytest.mark.parametrize("batch_size", [1, 64, 128])
 @pytest.mark.parametrize("next_n", [1, 2, 3])
-@pytest.mark.parametrize("index_topk", [2048])
+@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
 @pytest.mark.parametrize("num_tokens", [8192, 16384])
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float32, torch.bfloat16, torch.float16],
+    ids=["fp32", "bf16", "fp16"],
+)
 def test_indexer_topk_decode_dist(
-    dist_cfg, batch_size, next_n, index_topk, num_tokens, success_ratio
+    dist_cfg, batch_size, next_n, index_topk, num_tokens, success_ratio, dtype
 ):
     """
     Correctness test for the heuristic indexer_topk_decode across realistic
-    logit distributions, MTP correlation structures, and pre_idx accuracy levels.
+    logit distributions, MTP correlation structures, pre_idx accuracy levels,
+    GVR-supported K values, and supported logit dtypes.
     """
     torch.manual_seed(24)
     torch.cuda.manual_seed(24)
@@ -968,7 +1493,7 @@ def test_indexer_topk_decode_dist(
     row_ends = seq_lens[row_indices] - next_n + next_n_offset + 1
 
     # 1. Sample logits from the target distribution
-    logits = create_distributed_logits(dist_cfg, row_starts, row_ends, torch.float32, seed=42)
+    logits = create_distributed_logits(dist_cfg, row_starts, row_ends, dtype, seed=42)
 
     # 2. Apply MTP correlation: consecutive rows share their tail logits
     if next_n > 1:
@@ -985,11 +1510,24 @@ def test_indexer_topk_decode_dist(
         seed=7,
     )
 
-    # 4. Run heuristic CUDA kernel
+    # 4. Run heuristic CUDA kernel — heuristic_scratch dtype must match logits.
     indices = torch.empty((num_gen_tokens, index_topk), dtype=torch.int32, device="cuda")
-    heuristic_scratch = torch.empty(num_gen_tokens * index_topk, dtype=torch.float32, device="cuda")
+    heuristic_scratch = torch.empty(num_gen_tokens * index_topk, dtype=dtype, device="cuda")
+    # Supply Radix split-work aux scratch. For dtype=fp32 with num_columns
+    # below kSeqSmall the dispatcher falls through GVR to the Radix path and
+    # the cpp op rejects blocks_per_row > 1 without caller-owned scratch; for
+    # bf16/fp16 these kwargs are simply ignored.
+    radix_aux_indices, radix_aux_logits = _build_radix_aux_buffers(num_gen_tokens, index_topk)
     torch.ops.trtllm.indexer_topk_decode(
-        logits, seq_lens, indices, next_n, index_topk, pre_idx, heuristic_scratch
+        logits,
+        seq_lens,
+        indices,
+        next_n,
+        index_topk,
+        pre_idx,
+        heuristic_scratch,
+        radix_aux_indices=radix_aux_indices,
+        radix_aux_logits=radix_aux_logits,
     )
     torch.cuda.synchronize()
 
@@ -1000,10 +1538,12 @@ def test_indexer_topk_decode_dist(
     mask_hi = (torch_indices - (row_ends - row_starts)[:, None]) < 0
     torch_indices = torch_indices.masked_fill(~(mask_lo & mask_hi), -1)
 
-    # Tolerance reflects the kernel's 256-bin histogram precision:
-    # elements within one bin width (full_range/256) of the K-th boundary are
-    # ambiguous and may be selected or excluded; either is a valid top-K answer.
-    bin_tolerance = dist_cfg["full_range"] / 256
+    # GVR Top-K is an exact algorithm: with same-dtype `logits.topk` as the
+    # reference, the sorted output values must be bit-identical (bf16 -> fp32
+    # promotion inside the kernel is lossless and order-preserving, so the
+    # K-th cutoff is identical in both comparison spaces). Any value gap is
+    # a real kernel bug, not algorithmic noise — keep the default 1e-5
+    # tolerance and let CI surface regressions.
     assert compare_top_k_results(
         logits,
         indices,
@@ -1011,9 +1551,164 @@ def test_indexer_topk_decode_dist(
         row_starts,
         row_ends,
         index_topk,
-        tolerance=bin_tolerance,
     ), (
         f"heuristic indexer_topk_decode mismatch: dist={dist_cfg['dist']}, "
         f"mean={dist_cfg['mean']}, std={dist_cfg['std']}, "
-        f"next_n={next_n}, success_ratio={success_ratio}"
+        f"next_n={next_n}, success_ratio={success_ratio}, dtype={dtype}"
+    )
+
+
+# ============================================================================
+# DSv4 Heuristic Decode Test (compress_ratio = 4)
+# ============================================================================
+#
+# Exercises the V4 indexer GVR Top-K path enabled by the
+# `compressRatio == 1 || compressRatio == 4` relaxation in
+# canUseHeuristic (cpp/tensorrt_llm/kernels/indexerTopK.cu). For
+# compressRatio != 1 the kernel:
+#   1. Computes N = (seq_len - next_n + (rowIdx % next_n) + 1) / compressRatio,
+#      i.e. the row's compressed-KV length (vs. uncompressed N in the V3.2
+#      path).
+#   2. Forces preIdxOffset = 0 (vs. (rowIdx % next_n) + 1 in V3.2), since
+#      compressed entries are appended at the end of the compressed KV and
+#      prev-step indices remain valid as-is.
+#
+# To reach the GVR (Heuristic) path with cr=4 we need the *compressed*
+# numColumns ≥ kSeqSmall (≈12288), so the test uses num_tokens ∈
+# {65536, 131072} which gives compressed range ≈ {16K, 32K}. Smaller cr=4
+# cases (where compressed N falls below kSeqSmall) are already covered by
+# test_indexer_topk_decode parametrized on compress_ratio ∈ [1, 4] — those
+# exercise the Radix/Insertion fallback for the same gate.
+
+
+def _run_indexer_topk_decode_v4_gvr_check(
+    batch_size: int,
+    next_n: int,
+    index_topk: int,
+    num_tokens: int,
+    dtype: torch.dtype,
+    dist_cfg: dict,
+    success_ratio: float,
+):
+    """Run the V4 (compress_ratio=4) heuristic indexer_topk_decode check."""
+    torch.manual_seed(24)
+    torch.cuda.manual_seed(24)
+
+    compress_ratio = 4
+    num_gen_tokens = batch_size * next_n
+    row_starts = torch.zeros(num_gen_tokens, dtype=torch.int32, device="cuda")
+    row_indices = torch.arange(num_gen_tokens, device="cuda") // next_n
+    next_n_offset = torch.arange(num_gen_tokens, device="cuda") % next_n
+
+    # Uncompressed seq_lens are what the kernel receives in `seq_lens`.
+    # Clamp so that compressed_actual_kv_len ≥ kSeqSmall (= 12288) for every
+    # row; the kernel will divide actual_kv_len by compress_ratio internally,
+    # so a floor of (kSeqSmall + 1) * compress_ratio + next_n on the
+    # uncompressed seq_len guarantees compressed N stays in the GVR window.
+    min_uncompressed = (12288 + 1) * compress_ratio + next_n
+    seq_lens = generate_seq_lens(batch_size, min_uncompressed, num_tokens)
+    seq_lens = seq_lens.clamp(min=min_uncompressed)
+
+    # row_ends is the compressed-KV length per row (= what logits' columns
+    # represent in V4 — the indexer operates in compressed-token-index space).
+    actual_kv_lens = seq_lens[row_indices] - next_n + next_n_offset + 1
+    row_ends = actual_kv_lens // compress_ratio
+
+    # 1. Sample logits over the compressed shape.
+    logits = create_distributed_logits(dist_cfg, row_starts, row_ends, dtype, seed=42)
+
+    # 2. Apply MTP correlation between rows within each batch element.
+    # Use the compressed-aware variant: cr=4 breaks the cr=1 invariant
+    # row_ends[base+nni] = row_ends[base]+nni, so the copy length must be
+    # clipped per-row to avoid overrunning the row's valid range.
+    if next_n > 1:
+        logits = apply_mtp_structure_compressed(logits, batch_size, next_n, row_ends)
+
+    # 3. Build heuristic pre-prediction indices — V4 variant (no -1 shift).
+    pre_idx = generate_pre_idx_v4(
+        logits,
+        row_ends,
+        batch_size,
+        next_n,
+        index_topk,
+        success_ratio=success_ratio,
+        seed=7,
+    )
+
+    # 4. Run heuristic CUDA kernel with compress_ratio=4. The kernel:
+    #    - reads logits in compressed-index space (numColumns = logits.shape[1])
+    #    - divides seq_lens by compress_ratio to derive per-row N
+    #    - uses preIdxOffset = 0 (preIdx already in current-step coords)
+    indices = torch.empty((num_gen_tokens, index_topk), dtype=torch.int32, device="cuda")
+    heuristic_scratch = torch.empty(num_gen_tokens * index_topk, dtype=dtype, device="cuda")
+    # Supply Radix split-work aux scratch — same rationale as the V3.2 helper:
+    # required by the cpp op when blocks_per_row > 1, harmless otherwise.
+    radix_aux_indices, radix_aux_logits = _build_radix_aux_buffers(num_gen_tokens, index_topk)
+    torch.ops.trtllm.indexer_topk_decode(
+        logits,
+        seq_lens,
+        indices,
+        next_n,
+        index_topk,
+        pre_idx,
+        heuristic_scratch,
+        compress_ratio=compress_ratio,
+        radix_aux_indices=radix_aux_indices,
+        radix_aux_logits=radix_aux_logits,
+    )
+    torch.cuda.synchronize()
+
+    # 5. Reference: torch.topk masked to the compressed row_ends.
+    max_row_len = int(row_ends.max().item())
+    torch_indices = logits.topk(min(index_topk, max_row_len), dim=-1)[1]
+    mask = (torch_indices >= 0) & ((torch_indices - (row_ends - row_starts)[:, None]) < 0)
+    torch_indices = torch_indices.masked_fill(~mask, -1)
+
+    assert compare_top_k_results(
+        logits, indices, torch_indices, row_starts, row_ends, index_topk
+    ), (
+        f"V4 heuristic indexer_topk_decode (cr=4) mismatch: dist={dist_cfg['dist']}, "
+        f"mean={dist_cfg['mean']}, std={dist_cfg['std']}, batch_size={batch_size}, "
+        f"next_n={next_n}, index_topk={index_topk}, num_tokens={num_tokens}, "
+        f"success_ratio={success_ratio}, dtype={dtype}"
+    )
+
+
+# Param matrix is intentionally tighter than test_indexer_topk_decode_dist:
+# only one logit distribution and one success_ratio because the GVR algorithm
+# is dist-/hint-quality-invariant for correctness (an exact algorithm). The
+# axes that *do* differ in V4 vs V3.2 are exercised in full:
+#   compress_ratio = 4         (fixed — sole purpose of this test)
+#   next_n in {1, 2, 3}         (decode + MTP windows)
+#   index_topk in {512, 1024, 2048}  (all GVR-supported K)
+#   num_tokens in {65536, 131072}    (compressed N ≈ 16K and 32K)
+#   dtype: fp32 / bf16 / fp16   (both kernel templates)
+#   batch_size: 1 (single-row), 64 (multi-row)
+@skip_pre_blackwell
+@pytest.mark.skipif(not _HAS_SCIPY, reason="scipy required for distribution tests")
+@pytest.mark.parametrize("success_ratio", [0.7])
+@pytest.mark.parametrize("batch_size", [1, 64])
+@pytest.mark.parametrize("next_n", [1, 2, 3])
+@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
+@pytest.mark.parametrize("num_tokens", [65536, 131072])
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float32, torch.bfloat16, torch.float16],
+    ids=["fp32", "bf16", "fp16"],
+)
+def test_indexer_topk_decode_dist_v4_cr4(
+    batch_size, next_n, index_topk, num_tokens, success_ratio, dtype
+):
+    """
+    Correctness test for the DSv4 heuristic indexer_topk_decode with
+    compress_ratio=4 across MTP windows, all GVR-supported K, and all
+    supported logit dtypes. Uses one representative distribution; broader
+    distribution coverage is left to test_indexer_topk_decode_dist (cr=1).
+    """
+    # Logistic chosen as the single representative distribution — its
+    # heavy-tailed symmetric shape produces the wide K-th-value spread that
+    # stresses GVR's secant threshold search most.
+    dist_cfg = dict(dist="logistic", mean=-0.47, std=1.46, full_range=12.32)
+    _run_indexer_topk_decode_v4_gvr_check(
+        batch_size, next_n, index_topk, num_tokens, dtype, dist_cfg, success_ratio
     )

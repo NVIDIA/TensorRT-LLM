@@ -27,139 +27,6 @@ def stop_triton_server():
     time.sleep(8)
 
 
-@pytest.mark.parametrize("E2E_MODEL_NAME", ["ensemble", "tensorrt_llm_bls"])
-@pytest.mark.parametrize("ACCUMULATE_TOKEN", ["True", "False"])
-@pytest.mark.parametrize("BLS_INSTANCE_COUNT", ["1"])
-@pytest.mark.parametrize("PREPROCESSING_INSTANCE_COUNT", ["1"])
-@pytest.mark.parametrize("POSTPROCESSING_INSTANCE_COUNT", ["1"])
-@pytest.mark.parametrize("MAX_TOKENS_IN_KV_CACHE", [""])
-@pytest.mark.parametrize("MAX_ATTENTION_WINDOW_SIZE", [""])
-@pytest.mark.parametrize("BATCH_SCHEDULER_POLICY",
-                         ["max_utilization", "guaranteed_no_evict"])
-@pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
-@pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False", "True"],
-                         ids=["disableTrtOverlap", "enableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
-@pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
-                         ids=["enableDecoupleMode", "disableDecoupleMode"])
-@pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
-@pytest.mark.parametrize("MAX_QUEUE_DELAY_MICROSECONDS", ["0"])
-@pytest.mark.parametrize("ENABLE_KV_CACHE_REUSE", ["False"])
-@pytest.mark.parametrize("NORMALIZE_LOG_PROBS", ["True"])
-@pytest.mark.parametrize("ENABLE_CHUNKED_CONTEXT", ["False"])
-@pytest.mark.parametrize("GPU_DEVICE_IDS", [""])
-@pytest.mark.parametrize("DECODING_MODE", [""])
-@pytest.mark.parametrize("MAX_BEAM_WIDTH", ["1"])
-@pytest.mark.parametrize("EXCLUDE_INPUT_IN_OUTPUT", ["False"])
-@pytest.mark.parametrize("FEATURE_NAME", [
-    "test_basic", "batched_inputs", "test_log_probs", "test_request_id",
-    "test_stop_words", "test_embedding_bias", "test_n_returns"
-])
-def test_llama_v2_7b_ifb(
-    E2E_MODEL_NAME,
-    FEATURE_NAME,
-    MAX_TOKENS_IN_KV_CACHE,
-    MAX_ATTENTION_WINDOW_SIZE,
-    BATCH_SCHEDULER_POLICY,
-    KV_CACHE_FREE_GPU_MEM_FRACTION,
-    ENABLE_TRT_OVERLAP,
-    BATCHING_STRATEGY,
-    DECOUPLED_MODE,
-    TRITON_MAX_BATCH_SIZE,
-    MAX_QUEUE_DELAY_MICROSECONDS,
-    MAX_BEAM_WIDTH,
-    ENABLE_KV_CACHE_REUSE,
-    NORMALIZE_LOG_PROBS,
-    ENABLE_CHUNKED_CONTEXT,
-    GPU_DEVICE_IDS,
-    DECODING_MODE,
-    PREPROCESSING_INSTANCE_COUNT,
-    POSTPROCESSING_INSTANCE_COUNT,
-    ACCUMULATE_TOKEN,
-    BLS_INSTANCE_COUNT,
-    EXCLUDE_INPUT_IN_OUTPUT,
-    inflight_batcher_llm_client_root,
-    tensorrt_llm_llama_example_root,
-    llama_v2_tokenizer_model_root,
-    llm_backend_venv,
-):
-    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
-        pytest.skip("Skipping. V1 doesn't support max_utilization.")
-
-    if BATCHING_STRATEGY == "V1" and FEATURE_NAME == "test_embedding_bias":
-        pytest.skip("Skipping. V1 doesn't support embedding_bias tensor yet.")
-
-    if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
-        pytest.skip("Skipping.")
-
-    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
-    # Build engine
-    ENGINE_PATH = prepare_llama_v2_7b_engine("ifb",
-                                             tensorrt_llm_llama_example_root,
-                                             llama_v2_tokenizer_model_root)
-
-    # Prepare model repo
-    new_model_repo = os.path.join(llm_backend_repo_root, "triton_repo")
-    prepare_ib_model_repo(llm_backend_repo_root, new_model_repo)
-
-    # Modify config.pbtxt
-    TOKENIZER_PATH = llama_v2_tokenizer_model_root
-    modify_ib_config_pbtxt(
-        new_model_repo,
-        ENGINE_PATH,
-        TOKENIZER_PATH,
-        llm_backend_repo_root,
-        DECOUPLED_MODE,
-        MAX_TOKENS_IN_KV_CACHE,
-        MAX_ATTENTION_WINDOW_SIZE,
-        BATCH_SCHEDULER_POLICY,
-        BATCHING_STRATEGY,
-        KV_CACHE_FREE_GPU_MEM_FRACTION,
-        EXCLUDE_INPUT_IN_OUTPUT,
-        ENABLE_TRT_OVERLAP,
-        TRITON_MAX_BATCH_SIZE,
-        MAX_QUEUE_DELAY_MICROSECONDS,
-        MAX_BEAM_WIDTH,
-        ENABLE_KV_CACHE_REUSE,
-        NORMALIZE_LOG_PROBS,
-        ENABLE_CHUNKED_CONTEXT,
-        GPU_DEVICE_IDS,
-        DECODING_MODE,
-        PREPROCESSING_INSTANCE_COUNT,
-        POSTPROCESSING_INSTANCE_COUNT,
-        ACCUMULATE_TOKEN,
-        BLS_INSTANCE_COUNT,
-        TENSORRT_LLM_TARGET_MODEL_NAME="tensorrt_llm",
-        TENSORRT_LLM_DRAFT_MODEL_NAME="",
-    )
-
-    # Launch Triton Server
-    launch_server_py = os.path.join(llm_backend_repo_root, "scripts",
-                                    "launch_triton_server.py")
-    check_call(
-        f"python3 {launch_server_py} --world_size=1 --model_repo={new_model_repo}",
-        shell=True)
-    check_server_ready()
-    # Run Test
-    feature_name = f"{FEATURE_NAME}"
-    tokenizer_dir = f"{llama_v2_tokenizer_model_root}"
-
-    if DECOUPLED_MODE == "False":
-        run_cpp_backend_tests(feature_name, llm_backend_venv,
-                              inflight_batcher_llm_client_root, tokenizer_dir)
-    else:
-        test_model_name = ""
-        if ACCUMULATE_TOKEN == "True" and E2E_MODEL_NAME == "tensorrt_llm_bls":
-            test_model_name = "llama_v2_7b"
-
-        run_cpp_streaming_backend_tests(feature_name,
-                                        llm_backend_venv,
-                                        inflight_batcher_llm_client_root,
-                                        tokenizer_dir,
-                                        model_name=test_model_name,
-                                        e2e_model=E2E_MODEL_NAME)
-
-
 @pytest.mark.parametrize("E2E_MODEL_NAME", ["ensemble"])
 @pytest.mark.parametrize("ACCUMULATE_TOKEN", ["False"])
 @pytest.mark.parametrize("BLS_INSTANCE_COUNT", ["1"])
@@ -460,249 +327,6 @@ def test_mistral_v1_7b_python_backend(
                                    run_cmd).strip().split("\n")[-1]
 
         print_info(output)
-
-
-@pytest.mark.skip_less_device(8)
-@pytest.mark.parametrize("E2E_MODEL_NAME", ["ensemble"])
-@pytest.mark.parametrize("ACCUMULATE_TOKEN", ["False"])
-@pytest.mark.parametrize("BLS_INSTANCE_COUNT", ["1"])
-@pytest.mark.parametrize("PREPROCESSING_INSTANCE_COUNT", ["1"])
-@pytest.mark.parametrize("POSTPROCESSING_INSTANCE_COUNT", ["1"])
-@pytest.mark.parametrize("MAX_TOKENS_IN_KV_CACHE", [""])
-@pytest.mark.parametrize("MAX_ATTENTION_WINDOW_SIZE", [""])
-@pytest.mark.parametrize("BATCH_SCHEDULER_POLICY",
-                         ["max_utilization", "guaranteed_no_evict"])
-@pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
-@pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
-                         ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
-@pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
-                         ids=["enableDecoupleMode", "disableDecoupleMode"])
-@pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
-@pytest.mark.parametrize("MAX_QUEUE_DELAY_MICROSECONDS", ["0"])
-@pytest.mark.parametrize("ENABLE_KV_CACHE_REUSE", ["False"])
-@pytest.mark.parametrize("NORMALIZE_LOG_PROBS", ["True"])
-@pytest.mark.parametrize("ENABLE_CHUNKED_CONTEXT", ["False"])
-@pytest.mark.parametrize("GPU_DEVICE_IDS", [""])
-@pytest.mark.parametrize("DECODING_MODE", [""])
-@pytest.mark.parametrize("MAX_BEAM_WIDTH", ["1"])
-@pytest.mark.parametrize("EXCLUDE_INPUT_IN_OUTPUT", ["False"])
-def test_llama_v2_70b_ifb(
-    E2E_MODEL_NAME,
-    MAX_TOKENS_IN_KV_CACHE,
-    MAX_ATTENTION_WINDOW_SIZE,
-    BATCH_SCHEDULER_POLICY,
-    KV_CACHE_FREE_GPU_MEM_FRACTION,
-    ENABLE_TRT_OVERLAP,
-    BATCHING_STRATEGY,
-    DECOUPLED_MODE,
-    TRITON_MAX_BATCH_SIZE,
-    MAX_QUEUE_DELAY_MICROSECONDS,
-    MAX_BEAM_WIDTH,
-    ENABLE_KV_CACHE_REUSE,
-    NORMALIZE_LOG_PROBS,
-    ENABLE_CHUNKED_CONTEXT,
-    GPU_DEVICE_IDS,
-    DECODING_MODE,
-    PREPROCESSING_INSTANCE_COUNT,
-    POSTPROCESSING_INSTANCE_COUNT,
-    ACCUMULATE_TOKEN,
-    BLS_INSTANCE_COUNT,
-    EXCLUDE_INPUT_IN_OUTPUT,
-    inflight_batcher_llm_client_root,
-    tensorrt_llm_llama_example_root,
-    llama_v2_tokenizer_model_root,
-    llm_backend_venv,
-):
-    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
-        pytest.skip("Skipping. V1 doesn't support max_utilization.")
-
-    if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
-        pytest.skip("Skipping.")
-
-    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
-    # Build Engine
-    ENGINE_PATH = prepare_llama_v2_70b_engine("ifb",
-                                              tensorrt_llm_llama_example_root,
-                                              llama_v2_tokenizer_model_root)
-    # Prepare model repo
-    new_model_repo = os.path.join(llm_backend_repo_root, "triton_repo")
-    prepare_ib_model_repo(llm_backend_repo_root, new_model_repo)
-
-    # Modify config.pbtxt
-    TOKENIZER_PATH = llama_v2_tokenizer_model_root
-    modify_ib_config_pbtxt(
-        new_model_repo,
-        ENGINE_PATH,
-        TOKENIZER_PATH,
-        llm_backend_repo_root,
-        DECOUPLED_MODE,
-        MAX_TOKENS_IN_KV_CACHE,
-        MAX_ATTENTION_WINDOW_SIZE,
-        BATCH_SCHEDULER_POLICY,
-        BATCHING_STRATEGY,
-        KV_CACHE_FREE_GPU_MEM_FRACTION,
-        EXCLUDE_INPUT_IN_OUTPUT,
-        ENABLE_TRT_OVERLAP,
-        TRITON_MAX_BATCH_SIZE,
-        MAX_QUEUE_DELAY_MICROSECONDS,
-        MAX_BEAM_WIDTH,
-        ENABLE_KV_CACHE_REUSE,
-        NORMALIZE_LOG_PROBS,
-        ENABLE_CHUNKED_CONTEXT,
-        GPU_DEVICE_IDS,
-        DECODING_MODE,
-        PREPROCESSING_INSTANCE_COUNT,
-        POSTPROCESSING_INSTANCE_COUNT,
-        ACCUMULATE_TOKEN,
-        BLS_INSTANCE_COUNT,
-    )
-
-    # Launch Triton Server
-    launch_server_py = os.path.join(llm_backend_repo_root, "scripts",
-                                    "launch_triton_server.py")
-    check_call(
-        f"python3 {launch_server_py} --world_size=8 --model_repo={new_model_repo}",
-        shell=True)
-    check_server_ready()
-    # Run Test
-    run_cmd = [
-        f"{inflight_batcher_llm_client_root}/inflight_batcher_llm_client.py",
-        f"--tokenizer-dir={llama_v2_tokenizer_model_root}",
-        "--tokenizer-type=llama",
-    ]
-    if DECOUPLED_MODE == "True":
-        run_cmd += [
-            "--streaming",
-        ]
-
-    venv_check_call(llm_backend_venv, run_cmd)
-
-
-@pytest.mark.skip_less_device(8)
-@pytest.mark.parametrize("E2E_MODEL_NAME", ["ensemble"])
-@pytest.mark.parametrize("ACCUMULATE_TOKEN", ["False"])
-@pytest.mark.parametrize("BLS_INSTANCE_COUNT", ["1"])
-@pytest.mark.parametrize("PREPROCESSING_INSTANCE_COUNT", ["1"])
-@pytest.mark.parametrize("POSTPROCESSING_INSTANCE_COUNT", ["1"])
-@pytest.mark.parametrize("MAX_TOKENS_IN_KV_CACHE", [""])
-@pytest.mark.parametrize("MAX_ATTENTION_WINDOW_SIZE", [""])
-@pytest.mark.parametrize("BATCH_SCHEDULER_POLICY",
-                         ["max_utilization", "guaranteed_no_evict"])
-@pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
-@pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
-                         ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
-@pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
-                         ids=["enableDecoupleMode", "disableDecoupleMode"])
-@pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
-@pytest.mark.parametrize("MAX_QUEUE_DELAY_MICROSECONDS", ["0"])
-@pytest.mark.parametrize("ENABLE_KV_CACHE_REUSE", ["False"])
-@pytest.mark.parametrize("NORMALIZE_LOG_PROBS", ["True"])
-@pytest.mark.parametrize("ENABLE_CHUNKED_CONTEXT", ["False"])
-@pytest.mark.parametrize("GPU_DEVICE_IDS", [""])
-@pytest.mark.parametrize("DECODING_MODE", ["lookahead"])
-@pytest.mark.parametrize("MAX_BEAM_WIDTH", ["1"])
-@pytest.mark.parametrize("EXCLUDE_INPUT_IN_OUTPUT", ["False"])
-@pytest.mark.parametrize("EXECUTOR_LOOKAHEAD_WINDOW", ["7"])
-@pytest.mark.parametrize("EXECUTOR_LOOKAHEAD_NGRAM", ["7"])
-@pytest.mark.parametrize("EXECUTOR_LOOKAHEAD_VERIFICATION_SET", ["7"])
-def test_llama_v2_70b_ifb_lad(
-    E2E_MODEL_NAME,
-    MAX_TOKENS_IN_KV_CACHE,
-    MAX_ATTENTION_WINDOW_SIZE,
-    BATCH_SCHEDULER_POLICY,
-    KV_CACHE_FREE_GPU_MEM_FRACTION,
-    ENABLE_TRT_OVERLAP,
-    BATCHING_STRATEGY,
-    DECOUPLED_MODE,
-    TRITON_MAX_BATCH_SIZE,
-    MAX_QUEUE_DELAY_MICROSECONDS,
-    MAX_BEAM_WIDTH,
-    ENABLE_KV_CACHE_REUSE,
-    NORMALIZE_LOG_PROBS,
-    ENABLE_CHUNKED_CONTEXT,
-    GPU_DEVICE_IDS,
-    DECODING_MODE,
-    PREPROCESSING_INSTANCE_COUNT,
-    POSTPROCESSING_INSTANCE_COUNT,
-    ACCUMULATE_TOKEN,
-    BLS_INSTANCE_COUNT,
-    EXCLUDE_INPUT_IN_OUTPUT,
-    EXECUTOR_LOOKAHEAD_WINDOW,
-    EXECUTOR_LOOKAHEAD_NGRAM,
-    EXECUTOR_LOOKAHEAD_VERIFICATION_SET,
-    inflight_batcher_llm_client_root,
-    tensorrt_llm_llama_example_root,
-    llama_v2_tokenizer_model_root,
-    llm_backend_venv,
-):
-    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
-        pytest.skip("Skipping. V1 doesn't support max_utilization.")
-
-    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
-
-    # Build Engine
-    ENGINE_PATH = prepare_llama_v2_70b_engine("ifb",
-                                              tensorrt_llm_llama_example_root,
-                                              llama_v2_tokenizer_model_root,
-                                              use_lad=True)
-    # Prepare model repo
-    new_model_repo = os.path.join(llm_backend_repo_root, "triton_repo")
-    prepare_ib_model_repo(llm_backend_repo_root, new_model_repo)
-
-    # Modify config.pbtxt
-    TOKENIZER_PATH = llama_v2_tokenizer_model_root
-    modify_ib_config_pbtxt(
-        new_model_repo,
-        ENGINE_PATH,
-        TOKENIZER_PATH,
-        llm_backend_repo_root,
-        DECOUPLED_MODE,
-        MAX_TOKENS_IN_KV_CACHE,
-        MAX_ATTENTION_WINDOW_SIZE,
-        BATCH_SCHEDULER_POLICY,
-        BATCHING_STRATEGY,
-        KV_CACHE_FREE_GPU_MEM_FRACTION,
-        EXCLUDE_INPUT_IN_OUTPUT,
-        ENABLE_TRT_OVERLAP,
-        TRITON_MAX_BATCH_SIZE,
-        MAX_QUEUE_DELAY_MICROSECONDS,
-        MAX_BEAM_WIDTH,
-        ENABLE_KV_CACHE_REUSE,
-        NORMALIZE_LOG_PROBS,
-        ENABLE_CHUNKED_CONTEXT,
-        GPU_DEVICE_IDS,
-        DECODING_MODE,
-        PREPROCESSING_INSTANCE_COUNT,
-        POSTPROCESSING_INSTANCE_COUNT,
-        ACCUMULATE_TOKEN,
-        BLS_INSTANCE_COUNT,
-        EXECUTOR_LOOKAHEAD_WINDOW=EXECUTOR_LOOKAHEAD_WINDOW,
-        EXECUTOR_LOOKAHEAD_NGRAM=EXECUTOR_LOOKAHEAD_NGRAM,
-        EXECUTOR_LOOKAHEAD_VERIFICATION_SET=EXECUTOR_LOOKAHEAD_VERIFICATION_SET,
-    )
-
-    # Launch Triton Server
-    launch_server_py = os.path.join(llm_backend_repo_root, "scripts",
-                                    "launch_triton_server.py")
-    check_call(
-        f"python3 {launch_server_py} --world_size=8 --model_repo={new_model_repo}",
-        shell=True)
-    check_server_ready()
-    # Run Test
-    run_cmd = [
-        f"{inflight_batcher_llm_client_root}/inflight_batcher_llm_client.py",
-        f"--tokenizer-dir={llama_v2_tokenizer_model_root}",
-        "--tokenizer-type=llama",
-        f"--lookahead_config=[{EXECUTOR_LOOKAHEAD_WINDOW}, {EXECUTOR_LOOKAHEAD_NGRAM}, {EXECUTOR_LOOKAHEAD_VERIFICATION_SET}]"
-    ]
-    if DECOUPLED_MODE == "True":
-        run_cmd += [
-            "--streaming",
-        ]
-
-    venv_check_call(llm_backend_venv, run_cmd)
 
 
 @pytest.mark.parametrize("E2E_MODEL_NAME", ["ensemble"])
@@ -2408,11 +2032,6 @@ def test_tiny_llama_1b_guided_decoding(
 
 # Define model configurations as a dictionary
 MODEL_CONFIGS = {
-    "llama_v2_7b": {
-        "example_root_fixture": "tensorrt_llm_llama_example_root",
-        "tokenizer_path_fixture": "llama_v2_tokenizer_model_root",
-        "prepare_engine_fn": prepare_llama_v2_7b_engine
-    },
     "gptj_6b": {
         "example_root_fixture": "tensorrt_llm_gptj_example_root",
         "tokenizer_path_fixture": "gptj_tokenizer_model_root",
@@ -2424,7 +2043,6 @@ MODEL_CONFIGS = {
 LATENCY_THRESHOLDS = {
     "NVIDIA H100 PCIe": {
         "gptj_6b": 1300,  # Threshold in milliseconds
-        "llama_v2_7b": 1200,
         # Can add more models here with their thresholds
     },
     # Can add more GPU types here
@@ -2585,6 +2203,7 @@ def test_llmapi_backend(E2E_MODEL_NAME, DECOUPLED_MODE, TRITON_MAX_BATCH_SIZE,
     # Prepare model repo
     new_model_repo = os.path.join(llm_backend_repo_root, "triton_repo")
     prepare_llmapi_model_repo(llm_backend_repo_root, new_model_repo)
+    set_llmapi_decoupled_mode(new_model_repo, DECOUPLED_MODE)
     model_config_path = os.path.join(new_model_repo, "tensorrt_llm", "1",
                                      "model.yaml")
     with open(model_config_path, "r") as f:
@@ -2650,6 +2269,12 @@ def test_llmapi_backend(E2E_MODEL_NAME, DECOUPLED_MODE, TRITON_MAX_BATCH_SIZE,
                 f"--tensorrt-llm-model-name={E2E_MODEL_NAME}",
                 f"--protocol={protocol}",
                 f"--test-llmapi",
+            ]
+            if DECOUPLED_MODE:
+                # Triton rejects ModelInfer RPC on decoupled models; the
+                # benchmark must use async_stream_infer in that mode.
+                run_cmd.append("--decoupled")
+            run_cmd += [
                 'dataset',
                 f"--dataset={os.path.join(llm_backend_dataset_root, 'mini_cnn_eval.json')}",
                 f"--tokenizer-dir={tiny_llama_model_root}",
@@ -2663,6 +2288,11 @@ def test_llmapi_backend(E2E_MODEL_NAME, DECOUPLED_MODE, TRITON_MAX_BATCH_SIZE,
                 f"{llm_backend_repo_root}/tools/llmapi_client.py",
                 "--request-output-len=200", '--stop-after-ms=25'
             ]
+            if DECOUPLED_MODE:
+                # On a decoupled server, ModelInfer RPC is rejected;
+                # llmapi_client.py must use the bidirectional stream
+                # RPC, which it routes through when --streaming is set.
+                run_cmd.append('--streaming')
 
             output = venv_check_output(llm_backend_venv, run_cmd)
             assert 'Request is cancelled' in output
@@ -2672,11 +2302,83 @@ def test_llmapi_backend(E2E_MODEL_NAME, DECOUPLED_MODE, TRITON_MAX_BATCH_SIZE,
             output = venv_check_output(llm_backend_venv, run_cmd)
             assert 'Request is cancelled' in output
 
-            # Test request cancellation for non-existing request and completed request
-            run_cmd = [
-                f"{llm_backend_repo_root}/tools/tests/test_llmapi_cancel.py"
-            ]
-            output = venv_check_output(llm_backend_venv, run_cmd)
+            # Test request cancellation for non-existing request and
+            # completed request. The helper script uses ModelInfer RPC
+            # (async_infer), which Triton rejects on a decoupled model;
+            # only exercise it in the non-decoupled config.
+            if not DECOUPLED_MODE:
+                run_cmd = [
+                    f"{llm_backend_repo_root}/tools/tests/test_llmapi_cancel.py"
+                ]
+                output = venv_check_output(llm_backend_venv, run_cmd)
+
+
+@pytest.mark.parametrize("E2E_MODEL_NAME", ["tensorrt_llm"])
+@pytest.mark.parametrize("TENSOR_PARALLEL_SIZE", ["1"])
+def test_llmapi_lora(E2E_MODEL_NAME, TENSOR_PARALLEL_SIZE,
+                     llm_backend_inflight_batcher_llm_root, llm_backend_venv,
+                     tiny_llama_model_root, tiny_llama_lora_model_root):
+    """E2E LoRA test for the new llmapi triton backend.
+
+    Templates `model.yaml` with `lora_config:` pointing at a TinyLlama
+    HF LoRA adapter, launches Triton with the llmapi backend, and sends
+    one request via `llmapi_client.py --lora-id/--lora-name/--lora-path`.
+    Asserts that the response carries generated text — proving the new
+    lora_id/lora_name/lora_path inputs reach `LLM.generate_async(
+    lora_request=...)` and adapter-applied inference completes.
+    """
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
+
+    if torch.cuda.device_count() < int(TENSOR_PARALLEL_SIZE):
+        pytest.skip("Skipping. Not enough GPUs.")
+
+    # Prepare model repo with lora_config
+    new_model_repo = os.path.join(llm_backend_repo_root, "triton_repo")
+    prepare_llmapi_model_repo(llm_backend_repo_root, new_model_repo)
+    set_llmapi_decoupled_mode(new_model_repo, False)
+    model_config_path = os.path.join(new_model_repo, "tensorrt_llm", "1",
+                                     "model.yaml")
+    with open(model_config_path, "r") as f:
+        model_config = yaml.safe_load(f)
+    model_config["triton_config"]["decoupled"] = False
+    model_config["triton_config"]["max_batch_size"] = 0
+    model_config["tensor_parallel_size"] = int(TENSOR_PARALLEL_SIZE)
+    model_config["kv_cache_config"] = {"free_gpu_memory_fraction": 0.8}
+    model_config["model"] = tiny_llama_model_root
+    model_config["lora_config"] = {
+        "lora_dir": [tiny_llama_lora_model_root],
+        "max_lora_rank": 64,
+        "max_loras": 1,
+        "max_cpu_loras": 1,
+    }
+    with open(model_config_path, "w") as f:
+        yaml.dump(model_config, f)
+
+    # Launch Triton Server
+    launch_server_py = os.path.join(llm_backend_repo_root, "scripts",
+                                    "launch_triton_server.py")
+    cmd = (f"python3 {launch_server_py} "
+           f"--world_size={TENSOR_PARALLEL_SIZE} "
+           f"--model_repo={new_model_repo} --no-mpi")
+    print_info(f"DEBUG:: launch_server with args: {cmd}")
+    check_call(cmd, shell=True)
+    check_server_ready()
+
+    # Send a LoRA request via llmapi_client.py
+    run_cmd = [
+        f"{llm_backend_repo_root}/tools/llmapi_client.py",
+        "--text=I've noticed you seem a bit down lately. "
+        "Is there anything you'd like to talk about?",
+        "--request-output-len=32",
+        "--lora-id=0",
+        "--lora-name=mental-health",
+        f"--lora-path={tiny_llama_lora_model_root}",
+        f"--model-name={E2E_MODEL_NAME}",
+    ]
+    print_info("DEBUG:: run_cmd: python3 " + " ".join(run_cmd))
+    output = venv_check_output(llm_backend_venv, run_cmd)
+    assert "Output text:" in output, (
+        f"Expected 'Output text:' in client output, got: {output[:500]}")
 
 
 def test_llmapi_backend_multi_instance(llm_backend_inflight_batcher_llm_root,
@@ -2688,6 +2390,7 @@ def test_llmapi_backend_multi_instance(llm_backend_inflight_batcher_llm_root,
     # Prepare model repo
     new_model_repo = os.path.join(llm_backend_repo_root, "triton_repo")
     prepare_llmapi_model_repo(llm_backend_repo_root, new_model_repo)
+    set_llmapi_decoupled_mode(new_model_repo, True)
 
     # Modify model.yaml
     model_config_path = os.path.join(new_model_repo, "tensorrt_llm", "1",
@@ -2758,6 +2461,7 @@ def test_llmapi_backend_multi_instance(llm_backend_inflight_batcher_llm_root,
         "--tensorrt-llm-model-name=tensorrt_llm",
         f"--protocol={protocol}",
         "--test-llmapi",
+        "--decoupled",
         "dataset",
         f"--dataset={os.path.join(llm_backend_dataset_root, 'mini_cnn_eval.json')}",
         f"--tokenizer-dir={tiny_llama_model_root}",

@@ -7,6 +7,7 @@ from tensorrt_llm._torch.models.modeling_utils import register_mapper
 from tensorrt_llm._torch.utils import split
 
 
+@register_mapper("HF", "NemotronHPuzzleForCausalLM")
 @register_mapper("HF", "NemotronHForCausalLM")
 class NemotronHHfWeightMapper(HfWeightMapper):
 
@@ -93,6 +94,11 @@ class NemotronHHfWeightMapper(HfWeightMapper):
                 w = w.to(torch.float32)
                 new_weights[key] = w
             elif "mixer.in_proj" in key:
+                # Restrict the mamba2 in_proj split to the actual weight tensor.
+                # NVFP4 checkpoints attach companion tensors (``input_scale``,
+                # ``weight_scale``, ``weight_scale_2``, …) under ``mixer.in_proj.*``
+                # — those are scalars / 1-D scales and must not go through the
+                # Mamba2 split rearrangement.
                 new_weights[key] = _split_mamba2_mixer_in_proj(weights[name])
             elif "conv1d" in key:
                 w = weights[name]

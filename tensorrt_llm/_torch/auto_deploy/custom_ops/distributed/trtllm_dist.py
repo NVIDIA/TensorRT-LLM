@@ -19,14 +19,17 @@ This module defines atomic TRT-LLM-specific ops that use optimized kernels.
 The torch fallback variants are defined separately to enable multi-pattern matching.
 """
 
+import os
 from typing import List, Optional
 
 import torch
 
-# use trtllm distributed ops to improve TP performance if possible
-from .....mapping import Mapping
-from ....distributed import AllReduce, allgather
-from ....modules.linear import AllReduceFusionOp, AllReduceParams, AllReduceStrategy
+import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+from tensorrt_llm._torch.distributed import AllReduce, allgather
+from tensorrt_llm._torch.distributed.symm_mem_allgather import SymmetricMemoryAllGather
+from tensorrt_llm._torch.modules.linear import AllReduceFusionOp, AllReduceParams, AllReduceStrategy
+from tensorrt_llm.mapping import Mapping
+
 from ...distributed.common import ReduceOp, get_rank_world_size, get_world_size, is_ompi
 
 # Cache AllReduce modules to avoid recreating on every call
@@ -34,11 +37,50 @@ from ...distributed.common import ReduceOp, get_rank_world_size, get_world_size,
 # warmup causes hangs due to workspace allocation with CPU synchronization
 _allreduce_cache = {}
 
+# SymmetricMemoryAllGather instances keyed on (rank, world_size, workspace_id).
+# workspace_id == 0 uses the default TP process group. Higher workspace_ids
+# allocate fresh process groups (via dist.new_group), each with its own
+# symm_mem workspace buffer; this lets concurrent symm-mem allgathers on
+# different streams (e.g. multi-stream MLA) avoid workspace conflicts.
+_symm_mem_allgather_cache = {}
+
 
 def trtllm_allgather(tensor, dim, sizes=None):
     rank, world_size = get_rank_world_size()
     p_config = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
     return allgather(tensor, p_config, dim=dim, sizes=sizes)
+
+
+def _get_symm_mem_allgather(workspace_id: int):
+    """Get or create a cached SymmetricMemoryAllGather instance for *workspace_id*."""
+    import torch.distributed as dist
+
+    rank, world_size = get_rank_world_size()
+    cache_key = (rank, world_size, workspace_id)
+    if cache_key not in _symm_mem_allgather_cache:
+        p_config = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
+        if workspace_id == 0:
+            group = None  # use default TP group
+        else:
+            group = dist.new_group(p_config.tp_group)
+        _symm_mem_allgather_cache[cache_key] = SymmetricMemoryAllGather(
+            mapping=p_config, dtype=torch.bfloat16, group=group
+        )
+    return _symm_mem_allgather_cache[cache_key]
+
+
+def trtllm_symm_mem_allgather_impl(tensor, dim, sizes, workspace_id):
+    """Symm-mem allgather with TRT-LLM NCCL fallback."""
+    # Uneven per-rank sizes (allgatherv) aren't supported by multimem_all_gather_out; fall back to NCCL.
+    if sizes is not None:
+        return trtllm_allgather(tensor, dim=dim, sizes=sizes)
+
+    ag_module = _get_symm_mem_allgather(workspace_id)
+    result = ag_module(tensor, dim=dim)
+    if result is not None:
+        return result
+
+    return trtllm_allgather(tensor, dim=dim, sizes=sizes)
 
 
 def trtllm_allreduce(tensor, op, strategy: str, all_reduce_params=None):
@@ -76,17 +118,33 @@ def trtllm_allreduce(tensor, op, strategy: str, all_reduce_params=None):
     "auto_deploy::trtllm_dist_all_gather", mutates_args=(), device_types="cuda"
 )
 def trtllm_dist_all_gather(
-    tensor: torch.Tensor, dim: int = 0, sizes: Optional[List[int]] = None
+    tensor: torch.Tensor,
+    strategy: str,
+    dim: int = 0,
+    sizes: Optional[List[int]] = None,
+    # Picks the symm_mem workspace; use distinct ids for concurrent multi-stream allgathers to avoid buffer races.
+    workspace_id: int = 0,
 ) -> torch.Tensor:
-    """All gather using TRT-LLM optimized backend.
+    """AllGather via TRT-LLM optimized backend.
 
-    This op always uses TRT-LLM's optimized allgather and is used in MPI mode.
+    Strategy (required, no default — callers must pick the strategy explicitly
+    from the AD config to avoid silently using a default when emitting this
+    op into the graph):
+        AUTO     — TRT-LLM NCCL allgather.
+        SYMM_MEM — symmetric memory (multimem_all_gather_out) with NCCL fallback.
+
+    workspace_id picks the symm_mem ProcessGroup/workspace and is only
+    relevant when strategy == "SYMM_MEM" (ignored otherwise). Use distinct
+    workspace_ids for symm-mem allgathers running concurrently on different
+    streams to avoid workspace buffer conflicts.
     """
+    if strategy == "SYMM_MEM":
+        return trtllm_symm_mem_allgather_impl(tensor, dim, sizes, workspace_id)
     return trtllm_allgather(tensor, dim=dim, sizes=sizes)
 
 
 @trtllm_dist_all_gather.register_fake
-def trtllm_dist_all_gather_fake(tensor, dim=0, sizes=None):
+def trtllm_dist_all_gather_fake(tensor, strategy, dim=0, sizes=None, workspace_id=0):
     return torch.cat([torch.empty_like(tensor) for _ in range(get_world_size())], dim=dim)
 
 
@@ -127,6 +185,9 @@ def trtllm_fused_allreduce_residual_rmsnorm(
         residual=residual,
         norm_weight=norm_weight,
         eps=eps,
+        # PDL early trigger: fire launch-completion before the reduce loop so the
+        # next projection GEMM's weight-load prologue overlaps the AR tail (matches PT).
+        trigger_completion_at_end=False,
     )
     return trtllm_allreduce(
         tensor, ReduceOp.SUM, strategy=strategy, all_reduce_params=all_reduce_params
@@ -144,6 +205,114 @@ def trtllm_fused_allreduce_residual_rmsnorm_fake(
     return torch.empty_like(tensor), torch.empty_like(tensor)
 
 
+@torch.library.custom_op(
+    "dist::trtllm_fused_allreduce_residual_rmsnorm_quant_nvfp4",
+    mutates_args=(),
+    device_types="cuda",
+)
+def trtllm_fused_allreduce_residual_rmsnorm_quant_nvfp4(
+    tensor: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    scale: torch.Tensor,
+    eps: float,
+    strategy: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused allreduce + residual + RMSNorm + NVFP4 quantization."""
+    all_reduce_params = AllReduceParams(
+        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
+        bias=None,
+        residual=residual,
+        norm_weight=norm_weight,
+        scale=scale,
+        eps=eps,
+        trigger_completion_at_end=False,  # PDL early trigger (see RESIDUAL_RMS_NORM above)
+    )
+    quant_fp4, scale_factor, residual_out = trtllm_allreduce(
+        tensor, ReduceOp.SUM, strategy=strategy, all_reduce_params=all_reduce_params
+    )
+    return quant_fp4, scale_factor, residual_out
+
+
+@trtllm_fused_allreduce_residual_rmsnorm_quant_nvfp4.register_fake
+def trtllm_fused_allreduce_residual_rmsnorm_quant_nvfp4_fake(
+    tensor: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    scale: torch.Tensor,
+    eps: float,
+    strategy: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del norm_weight, scale, eps, strategy
+    fp4_shape, scale_shape = fp4_utils.get_fp4_shape(tensor.shape, 16)
+    return (
+        tensor.new_empty(fp4_shape, dtype=torch.uint8),
+        tensor.new_empty((scale_shape,), dtype=torch.uint8),
+        torch.empty_like(residual),
+    )
+
+
+@torch.library.custom_op(
+    "dist::trtllm_fused_allreduce_residual_rmsnorm_out_quant_nvfp4",
+    mutates_args=(),
+    device_types="cuda",
+)
+def trtllm_fused_allreduce_residual_rmsnorm_out_quant_nvfp4(
+    tensor: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    scale: torch.Tensor,
+    eps: float,
+    strategy: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused allreduce + residual + RMSNorm with both BF16 and NVFP4 norm outputs."""
+    all_reduce_params = AllReduceParams(
+        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4,
+        bias=None,
+        residual=residual,
+        norm_weight=norm_weight,
+        scale=scale,
+        eps=eps,
+        trigger_completion_at_end=False,  # PDL early trigger (see RESIDUAL_RMS_NORM above)
+    )
+    norm_out, quant_fp4, scale_factor, residual_out = trtllm_allreduce(
+        tensor, ReduceOp.SUM, strategy=strategy, all_reduce_params=all_reduce_params
+    )
+    return norm_out, quant_fp4, scale_factor, residual_out
+
+
+@trtllm_fused_allreduce_residual_rmsnorm_out_quant_nvfp4.register_fake
+def trtllm_fused_allreduce_residual_rmsnorm_out_quant_nvfp4_fake(
+    tensor: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    scale: torch.Tensor,
+    eps: float,
+    strategy: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    del norm_weight, scale, eps, strategy
+    fp4_shape, scale_shape = fp4_utils.get_fp4_shape(tensor.shape, 16)
+    return (
+        torch.empty_like(tensor),
+        tensor.new_empty(fp4_shape, dtype=torch.uint8),
+        tensor.new_empty((scale_shape,), dtype=torch.uint8),
+        torch.empty_like(residual),
+    )
+
+
 def is_trtllm_op_available():
-    """Check if TRT-LLM ops are available and running with MPI."""
-    return is_ompi()
+    """Check if TRT-LLM ops are available for AutoDeploy collectives."""
+    if is_ompi():
+        return True
+
+    # trtllm-llmapi-launch intentionally removes OMPI/SLURM variables from
+    # the trtllm-serve child to avoid duplicate MPI initialization. It leaves
+    # these launcher-specific variables so the child can bind to pre-spawned
+    # LLMAPI worker ranks.
+    if os.getenv("TLLM_SPAWN_PROXY_PROCESS") == "1":
+        try:
+            return int(os.getenv("tllm_mpi_size") or "1") > 1
+        except ValueError:
+            return False
+
+    return False

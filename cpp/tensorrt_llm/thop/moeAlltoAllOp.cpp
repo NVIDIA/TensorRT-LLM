@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,6 +40,43 @@ static constexpr size_t CACHELINE_ALIGNMENT = 128;
 inline size_t alignOffset(size_t offset, size_t alignment)
 {
     return (offset + alignment - 1) & ~(alignment - 1);
+}
+
+// Resolve an optional rank-mask tensor into a fixed-width uint64 array.
+// If the caller did not provide a mask, default to "all ranks active" (all bits set), which
+// reproduces the pre-fault-tolerance behavior bit-for-bit.
+//
+// On failure (wrong dtype / device / shape), throws via TORCH_CHECK so the error surfaces
+// at the Python op boundary rather than the kernel launch.
+inline void resolveActiveRankMask(torch::optional<torch::Tensor> const& maskTensor, int64_t epRank,
+    uint64_t (&out)[tensorrt_llm::kernels::moe_comm::kRankMaskWords])
+{
+    using tensorrt_llm::kernels::moe_comm::kRankMaskWords;
+    using tensorrt_llm::kernels::moe_comm::kMaxRanks;
+    TORCH_CHECK(
+        epRank >= 0 && epRank < kMaxRanks, "epRank must be in the range [0, ", kMaxRanks, ") for active_rank_mask");
+    if (!maskTensor.has_value() || !maskTensor.value().defined())
+    {
+        for (int w = 0; w < kRankMaskWords; ++w)
+        {
+            out[w] = ~uint64_t{0};
+        }
+        return;
+    }
+    torch::Tensor const& t = maskTensor.value();
+    TORCH_CHECK(t.is_cpu(), "active_rank_mask must be a CPU tensor");
+    TORCH_CHECK(t.scalar_type() == torch::kUInt64, "active_rank_mask must have dtype uint64");
+    TORCH_CHECK(t.dim() == 1, "active_rank_mask must be a 1D tensor");
+    TORCH_CHECK(t.numel() == kRankMaskWords, "active_rank_mask must have exactly ", kRankMaskWords, " uint64 elements");
+    TORCH_CHECK(t.is_contiguous(), "active_rank_mask must be contiguous");
+    auto const* src = static_cast<uint64_t const*>(t.const_data_ptr());
+    for (int w = 0; w < kRankMaskWords; ++w)
+    {
+        out[w] = src[w];
+    }
+    // Local rank's bit must be set; otherwise the kernel would be running on a "dead" rank.
+    TORCH_CHECK((out[epRank >> 6] >> (epRank & 63)) & 1ULL, "active_rank_mask must mark the local ep_rank (", epRank,
+        ") as active");
 }
 
 // Calculate auxiliary data offsets
@@ -117,11 +154,14 @@ MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens, int eplbStatsNu
 torch::Tensor moeA2AInitializeOp(torch::Tensor const& workspace, int64_t epRank, int64_t epSize, int64_t maxNumTokens,
     torch::optional<int64_t> eplbStatsNumExperts)
 {
+    using tensorrt_llm::kernels::moe_comm::kMaxRanks;
+
     // Validate inputs
     CHECK_TH_CUDA(workspace);
     CHECK_TYPE(workspace, torch::kUInt8);
     TORCH_CHECK(workspace.dim() == 2, "workspace must be a 2D tensor of shape [epSize, sizePerRank]");
     TORCH_CHECK(workspace.size(0) == epSize, "workspace first dimension must equal epSize");
+    TORCH_CHECK(epSize > 0 && epSize <= kMaxRanks, "epSize must be in the range (0, ", kMaxRanks, "]");
     TORCH_CHECK(epRank >= 0 && epRank < epSize, "epRank must be in the range [0, epSize)");
 
     // Initialize workspace to zero
@@ -181,13 +221,15 @@ torch::Tensor moeA2AInitializeOp(torch::Tensor const& workspace, int64_t epRank,
 std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     torch::Tensor const& tokenSelectedExperts, std::vector<torch::Tensor> const& inputPayloads,
     torch::Tensor const& workspace, torch::Tensor const& metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank,
-    int64_t epSize, int64_t topK, int64_t numExperts, torch::optional<torch::Tensor> eplbLocalStats)
+    int64_t epSize, int64_t topK, int64_t numExperts, torch::optional<torch::Tensor> eplbLocalStats,
+    torch::optional<torch::Tensor> activeRankMask)
 {
     using tensorrt_llm::kernels::moe_comm::PayloadDescriptor;
     using tensorrt_llm::kernels::moe_comm::MoeA2ADispatchParams;
     using tensorrt_llm::kernels::moe_comm::moe_a2a_dispatch_launch;
     using tensorrt_llm::kernels::moe_comm::kMaxTopK;
     using tensorrt_llm::kernels::moe_comm::kMaxPayloads;
+    using tensorrt_llm::kernels::moe_comm::kMaxRanks;
 
     // Validate inputs
     CHECK_INPUT(tokenSelectedExperts, torch::kInt32);
@@ -203,12 +245,15 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
 
     int64_t localNumTokens = tokenSelectedExperts.size(0);
     TORCH_CHECK(runtimeMaxTokensPerRank > 0, "runtimeMaxTokensPerRank must be positive");
+    TORCH_CHECK(epSize > 0 && epSize <= kMaxRanks, "epSize must be in the range (0, ", kMaxRanks, "]");
     TORCH_CHECK(epRank >= 0 && epRank < epSize, "epRank must be in the range [0, epSize)");
     TORCH_CHECK(topK > 0 && topK <= kMaxTopK, "topK must be in the range (0, kMaxTopK]");
     TORCH_CHECK(!inputPayloads.empty(), "inputPayloads must not be empty");
     TORCH_CHECK(inputPayloads.size() <= kMaxPayloads, "Too many input payloads");
     TORCH_CHECK(numExperts >= epSize, "numExperts must be greater than or equal to epSize");
-    TORCH_CHECK(numExperts % epSize == 0, "numExperts must be divisible by epSize for contiguous partitioning");
+    // numExperts does not need to be divisible by epSize: the kernel performs
+    // ceil/floor contiguous partitioning so ranks [0, numExperts % epSize)
+    // own (numExperts / epSize + 1) experts and the rest own (numExperts / epSize).
     bool enableEplb = eplbLocalStats.has_value();
     int64_t eplbStatsNumExperts = 0;
     if (enableEplb)
@@ -304,8 +349,6 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
 
     // Setup dispatch parameters
     MoeA2ADispatchParams params{};
-    params.one_block_per_token
-        = tensorrt_llm::common::getEnvMoeA2AOneBlockPerToken(); // TODO: Decide this based on the workload
     params.ep_size = static_cast<int>(epSize);
     params.ep_rank = static_cast<int>(epRank);
     params.num_experts = static_cast<int>(numExperts);
@@ -360,6 +403,10 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
         params.eplb_local_stats = nullptr;
     }
 
+    // Resolve the optional active-rank mask. Default (no mask) = all bits set, which
+    // exactly reproduces the pre-fault-tolerance kernel behavior.
+    resolveActiveRankMask(activeRankMask, epRank, params.active_rank_mask);
+
     params.stream = at::cuda::getCurrentCUDAStream();
 
     // Prepare for dispatch (zero counters/indices and increment flag_val)
@@ -413,11 +460,13 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
 // In both cases, the combine kernel reads from the workspace at 'combinePayloadOffset'.
 torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumTokens, torch::Tensor const& workspace,
     torch::Tensor const& metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank, int64_t epSize, int64_t topK,
-    int64_t combinePayloadOffset, bool payloadInWorkspace, bool useLowPrecision = false)
+    int64_t combinePayloadOffset, bool payloadInWorkspace, bool useLowPrecision = false,
+    torch::optional<torch::Tensor> activeRankMask = torch::nullopt)
 {
     using tensorrt_llm::kernels::moe_comm::MoeA2ACombineParams;
     using tensorrt_llm::kernels::moe_comm::moe_a2a_combine_launch;
     using tensorrt_llm::kernels::moe_comm::kMaxTopK;
+    using tensorrt_llm::kernels::moe_comm::kMaxRanks;
 
     // Validate inputs
     CHECK_TH_CUDA(payload);
@@ -431,6 +480,7 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     TORCH_CHECK(reinterpret_cast<uintptr_t>(payload.data_ptr()) % 16 == 0, "payload must be 16-byte aligned");
     int64_t elementsPerToken = payload.size(2);
     TORCH_CHECK(elementsPerToken > 0, "elementsPerToken must be positive");
+    TORCH_CHECK(epSize > 0 && epSize <= kMaxRanks, "epSize must be in the range (0, ", kMaxRanks, "]");
     TORCH_CHECK(epRank >= 0 && epRank < epSize, "epRank must be in the range [0, epSize)");
     TORCH_CHECK(topK > 0 && topK <= kMaxTopK, "topK must be in the range (0, kMaxTopK]");
 
@@ -492,8 +542,6 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
 
     // Setup combine parameters
     MoeA2ACombineParams params{};
-    params.one_block_per_token
-        = tensorrt_llm::common::getEnvMoeA2AOneBlockPerToken(); // TODO: Decide this based on the workload
     params.ep_size = static_cast<int>(epSize);
     params.ep_rank = static_cast<int>(epRank);
     params.local_num_tokens = static_cast<int>(localNumTokens);
@@ -521,6 +569,9 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
             = reinterpret_cast<uint32_t*>(target_workspace_ptr + offsets[COMBINE_COMPLETION_FLAGS_OFFSET_INDEX]);
         params.recv_buffers[target_rank] = target_workspace_ptr + combinePayloadOffset;
     }
+
+    // Resolve the optional active-rank mask. Default (no mask) = all bits set.
+    resolveActiveRankMask(activeRankMask, epRank, params.active_rank_mask);
 
     params.stream = at::cuda::getCurrentCUDAStream();
 
@@ -615,12 +666,14 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "moe_a2a_dispatch(Tensor token_selected_experts, Tensor[] input_payloads, "
         "Tensor(a!->*) workspace, Tensor metainfo, int runtime_max_tokens_per_rank, "
         "int ep_rank, int ep_size, int top_k, int num_experts, "
-        "Tensor? eplb_local_stats=None) -> (Tensor(a!)[], int, Tensor(a!))");
+        "Tensor? eplb_local_stats=None, "
+        "Tensor? active_rank_mask=None) -> (Tensor(a!)[], int, Tensor(a!))");
     module.def(
         "moe_a2a_combine(Tensor(a) payload, int local_num_tokens,"
         "Tensor(a!) workspace, Tensor metainfo, int runtime_max_tokens_per_rank, "
         "int ep_rank, int ep_size, int top_k, int combine_payload_offset, "
-        "bool payload_in_workspace, bool use_low_precision=False) -> Tensor");
+        "bool payload_in_workspace, bool use_low_precision=False, "
+        "Tensor? active_rank_mask=None) -> Tensor");
     module.def(
         "moe_a2a_initialize(Tensor(a!) workspace, int ep_rank, int ep_size, int max_num_tokens_per_rank, "
         "int? eplb_stats_num_experts=None) -> Tensor");

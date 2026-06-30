@@ -190,7 +190,12 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
             // Tensor K is contiguous.
             mKernelParams.k_stride_in_bytes
                 = get_size_in_bytes(mFixedParams.numKvHeads * mFixedParams.headSize, mFixedParams.dataType);
-            if (mFixedParams.headSizeQkNope > 0 && mFixedParams.dataType != DATA_TYPE_E4M3)
+            if (runnerParams.vStrideInBytes > 0)
+            {
+                // Caller provided the actual V stride (supports both contiguous and non-contiguous V).
+                mKernelParams.v_stride_in_bytes = runnerParams.vStrideInBytes;
+            }
+            else if (mFixedParams.headSizeQkNope > 0 && mFixedParams.dataType != DATA_TYPE_E4M3)
             {
                 // Non-FP8 context MLA: tensor V is not contiguous. The token stride is numKvHeads * (headSizeQkNope +
                 // headSizeV).
@@ -493,17 +498,16 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
                     && (mLaunchParams.attention_input_layout == AttentionInputLayout::SEPARATE_Q_K_V))));
     }
 
-    // Setup launch params for skip softmax attention
-    mLaunchParams.enableSkipSoftmax = false;
-    if (runnerParams.skipSoftmaxThresholdScaleFactor > 0)
-    {
-        if (!isSm90 || !mLaunchParams.warp_specialization || !mLaunchParams.flash_attention)
-        {
-            TLLM_CHECK_WITH_INFO(false,
-                "Skip softmax attention is only supported on Hopper with warp specialization and flash attention.");
-        }
-        mLaunchParams.enableSkipSoftmax = true;
-    }
+    // Skip-softmax is driven by the threshold alone -- there is no separate enable
+    // flag. It is realized by two kernels: the Hopper warp-specialized FMHA, which
+    // is selected through the enableSkipSoftmax cubin-hash bit, and the sm_120 /
+    // sm_121 warp-specialized context FMHA, which reads the threshold directly and
+    // therefore does not need the cubin-hash bit (enableSkipSoftmax stays false
+    // there -- see fused_multihead_attention_v2.cpp). If no skip-capable kernel
+    // matches the config, skipping is simply not enabled and the request runs full
+    // softmax.
+    mLaunchParams.enableSkipSoftmax = runnerParams.skipSoftmaxThresholdScaleFactor > 0 && isSm90
+        && mLaunchParams.warp_specialization && mLaunchParams.flash_attention;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

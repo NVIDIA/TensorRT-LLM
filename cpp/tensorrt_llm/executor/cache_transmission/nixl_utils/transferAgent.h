@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,7 +20,8 @@
 #include "nixl.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 #include <atomic>
-#include <map>
+#include <memory>
+#include <shared_mutex>
 #include <thread>
 
 namespace tensorrt_llm::executor::kv_cache
@@ -52,25 +53,31 @@ struct NixlHelper
     /// @return Pair of coalesced (src, dst) MemoryDescs
     [[nodiscard]] static std::pair<MemoryDescs, MemoryDescs> coalesceTransferDescs(
         TransferDescs const& srcDescs, TransferDescs const& dstDescs);
-
-    /// @brief Split VRAM descs at VMM chunk boundaries detected via cuMemGetAddressRange.
-    /// For cudaMalloc memory (single allocation), descs pass through unchanged.
-    /// @param[out] detectedChunkSize Set to the VMM chunk size if detected, 0 otherwise.
-    [[nodiscard]] static MemoryDescs splitVmmDescs(MemoryDescs const& descs, size_t& detectedChunkSize);
 };
 
 class NixlTransferStatus final : public TransferStatus
 {
 public:
-    NixlTransferStatus(nixlAgent* agent, nixlXferReqH* handle);
+    NixlTransferStatus(std::weak_ptr<nixlAgent> agent, nixlXferReqH* handle);
+    ~NixlTransferStatus() noexcept override;
+
+    NixlTransferStatus(NixlTransferStatus const&) = delete;
+    NixlTransferStatus& operator=(NixlTransferStatus const&) = delete;
+    NixlTransferStatus(NixlTransferStatus&&) = delete;
+    NixlTransferStatus& operator=(NixlTransferStatus&&) = delete;
 
     [[nodiscard]] bool isCompleted() const override;
 
     [[nodiscard]] TransferState wait(int64_t timeout_ms = -1) const override;
 
+    [[nodiscard]] int getLastStatus() const noexcept;
+    [[nodiscard]] std::string getLastStatusStr() const;
+
 private:
-    nixlAgent* mRawAgent{};
+    // weak_ptr so the status outliving the owning agent is safe (lock() returns null after reset).
+    std::weak_ptr<nixlAgent> mWeakAgent;
     nixlXferReqH* mHandle{};
+    mutable std::atomic<int> mLastStatus{0};
 };
 
 class NixlTransferAgent final : public BaseTransferAgent
@@ -78,6 +85,9 @@ class NixlTransferAgent final : public BaseTransferAgent
 public:
     NixlTransferAgent(BaseAgentConfig const& config);
     ~NixlTransferAgent();
+
+    /// Synchronously release NIXL agent / UCX / prog_thread. Idempotent.
+    void shutdown() noexcept;
 
     void registerMemory(RegisterDescs const& descs) override;
 
@@ -112,40 +122,35 @@ public:
     bool checkRemoteDescs(std::string const& name, MemoryDescs const& memoryDescs) override;
 
 private:
-    std::unique_ptr<nixlAgent> mRawAgent;
+    // shared_ptr so outstanding NixlTransferStatus (via weak_ptr) can detect agent reset.
+    std::shared_ptr<nixlAgent> mRawAgent;
     nixlBackendH* mRawBackend{};
     nixl_opt_args_t mExtraParams;
     std::string mName;
     std::string mAddress;
+    std::atomic<bool> mShutdown{false};
 
-    std::vector<char> mDRamSrcBuffer;
-    std::vector<char> mDRamDstBuffer;
+    /// Serializes (a) wrapper-map mutations vs reads and (b) drain-on-shutdown.
+    /// Writers (register/deregister/load/invalidate/shutdown) take unique_lock;
+    /// readers (submit / getLocalAgentDesc / checkRemoteDescs / etc.) take shared_lock.
+    mutable std::shared_mutex mLock;
 
-    /// Per-region VMM chunk info recorded at registerMemory time.
-    struct VramRegionInfo
-    {
-        size_t totalLen;
-        size_t chunkSize; ///< 0 = cudaMalloc (no split), >0 = VMM chunk size
-    };
+    /// Local VMM region info (from registerMemory). Keyed by local virtual address.
+    VramRegionMap mLocalVramRegionInfo;
 
-    std::map<uintptr_t, VramRegionInfo> mVramRegionInfo;
-
-    /// Look up VMM chunk size for a given address from stored registration info.
-    [[nodiscard]] size_t lookupChunkSize(uintptr_t addr) const;
-
-    /// Split VRAM descs using per-region registry info (for deregisterMemory).
-    [[nodiscard]] MemoryDescs splitDescsFromRegistry(MemoryDescs const& descs) const;
-
-    /// Split paired transfer descs: split src based on registry, dst follows with matching piece sizes.
-    [[nodiscard]] std::pair<MemoryDescs, MemoryDescs> splitTransferDescsFromRegistry(
-        MemoryDescs const& srcDescs, MemoryDescs const& dstDescs) const;
+    /// Remote VMM region info (from loadRemoteAgent). Keyed by {agentName → {addr → info}}.
+    /// Per-agent maps because different remote agents may have overlapping virtual addresses.
+    std::unordered_map<std::string, VramRegionMap> mRemoteVramRegionInfo;
 };
 
 class NixlLoopbackAgent final : public BaseLoopbackAgent
 {
 public:
     NixlLoopbackAgent(BaseAgentConfig const& config);
-    virtual ~NixlLoopbackAgent() = default;
+    ~NixlLoopbackAgent() override;
+
+    /// Synchronously release the NIXL agent. Idempotent; drains in-flight requests.
+    void shutdown() noexcept;
 
     virtual void executeLoopbackRequest(
         MemoryDescs const& memoryDescs, FileDescs const& fileDescs, bool isOffload) override;
@@ -159,8 +164,11 @@ private:
     [[nodiscard]] std::unique_ptr<TransferStatus> submitLoopbackRequests(
         MemoryDescs const& memoryDescs, FileDescs const& filedescs, bool isOffload);
 
-    std::unique_ptr<nixlAgent> mRawAgent;
+    std::shared_ptr<nixlAgent> mRawAgent;
     std::string mName;
+    std::atomic<bool> mShutdown{false};
+    /// Drain-on-shutdown: executeLoopbackRequest takes shared_lock; shutdown takes unique_lock.
+    mutable std::shared_mutex mLock;
 };
 
 #if defined(__clang__)

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,6 +25,7 @@
 #include "tensorrt_llm/batch_manager/contextProgress.h"
 #include "tensorrt_llm/batch_manager/createNewDecoderRequests.h"
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
+#include "tensorrt_llm/batch_manager/disaggTransferAdmissionController.h"
 #include "tensorrt_llm/batch_manager/guidedDecoder.h"
 #include "tensorrt_llm/batch_manager/handleContextLogits.h"
 #include "tensorrt_llm/batch_manager/handleGenerationLogits.h"
@@ -333,6 +334,8 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
         mCacheTransceiver
             = CacheTransceiverFactory::createCacheTransceiver(mKvCacheManager.get(), mModelConfig, mWorldConfig,
                 executor::kv_cache::CacheState::AttentionType::kDEFAULT, executorConfig.getCacheTransceiverConfig());
+        mDisaggTransferAdmissionController = std::make_unique<DisaggTransferAdmissionController>(
+            cacheTransceiverConfig.getMaxTokensInBuffer(), mModelConfig.getTokensPerBlock());
     }
 
     if (mModelConfig.getSpeculativeDecodingMode().needsKVCacheRewind())
@@ -442,7 +445,10 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
 
     mCapacityScheduler = std::make_unique<CapacityScheduler>(getMaxNumSequences(),
         executorConfig.getSchedulerConfig().getCapacitySchedulerPolicy(), mKvCacheManager != nullptr,
-        mWorldConfig.isPipelineParallel());
+        /*twoStepsLookAhead=*/mWorldConfig.isPipelineParallel(),
+        /*noScheduleUntilState=*/LlmRequestState::kCONTEXT_INIT,
+        /*noScheduleAfterState=*/LlmRequestState::kGENERATION_COMPLETE,
+        /*enablePrefixAwareScheduling=*/executorConfig.getSchedulerConfig().getEnablePrefixAwareScheduling());
 
     mMicroBatchScheduler = std::make_unique<MicroBatchScheduler>(ctxChunkConfig, maxContextLength);
 
@@ -485,9 +491,9 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
         = executorConfig.getSpecDecConfig().has_value() && executorConfig.getSpecDecConfig()->fastLogits;
     if (mSpeculativeDecodingFastLogits && modelConfig.getSpeculativeDecodingMode().isNone() && mIsLeaderInOrchMode)
     {
-        mDraftModelSendLogitsThread = std::make_unique<std::thread>(&utils::draftModelSendLogitsThread, mDevice,
-            &mDraftModelThreadShouldExit, &mDraftRequestsWaitingToSendLogits, mSeqSlotManager, getMaxInputLen(),
-            mKvCacheManager, mCrossKvCacheManager, mPeftCacheManager);
+        mDraftModelSendLogitsThread
+            = std::make_unique<std::thread>(&utils::draftModelSendLogitsThread, mDevice, &mDraftModelThreadShouldExit,
+                &mDraftRequestsWaitingToSendLogits, &mDraftRequestsDoneSendingLogits, &mDraftRequestsMtx);
     }
 
     mCreateNewDecoderRequests = std::make_unique<CreateNewDecoderRequests>(
@@ -670,11 +676,6 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
             = clampWindowSizesToFitAtLeastOneSequence(blocksPerWindow, failFastOnAttentionWindowTooLarge);
     }
 
-    kv_cache_manager::TempAttentionWindowInputs tempAttentionWindowInputs;
-    tempAttentionWindowInputs.pagedContextFMHA = mModelConfig.getPagedContextFMHA();
-    tempAttentionWindowInputs.maxInputLen = getMaxInputLen();
-    tempAttentionWindowInputs.maxNumTokens = getMaxNumTokens().value();
-
     if (kvCacheType == KvCacheType::kCROSS && kvCacheConfig.getEnableBlockReuse())
     {
         TLLM_LOG_INFO(
@@ -684,10 +685,10 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
     auto const enableBlockReuse = kvCacheType == KvCacheType::kSELF ? kvCacheConfig.getEnableBlockReuse() : false;
 
     auto kvCacheManager = std::make_unique<KVCacheManager>(numKvHeadsPerLayer, sizePerHead, tokensPerBlock,
-        blocksPerWindow, getMaxNumSequences(), getMaxBeamWidth(), maxAttentionWindowVec, tempAttentionWindowInputs,
-        kvDtype, getSinkTokenLen(), mRuntime->getStreamPtr(),
-        kvCacheType == KvCacheType::kCROSS ? mModelConfig.getMaxEncoderLen() : getMaxSequenceLen(), enableBlockReuse,
-        kvCacheType, kvCacheConfig.getSecondaryOffloadMinPriority(),
+        blocksPerWindow, getMaxNumSequences(), getMaxBeamWidth(), maxAttentionWindowVec, kvDtype, getSinkTokenLen(),
+        mRuntime->getStreamPtr(),
+        kvCacheType == KvCacheType::kCROSS ? mModelConfig.getMaxEncoderLen() : getMaxSequenceLen(),
+        getMaxNumTokens().value(), enableBlockReuse, kvCacheType, kvCacheConfig.getSecondaryOffloadMinPriority(),
         kvCacheConfig.getEventBufferMaxSize() > 0
             ? std::make_unique<kv_cache_manager::KVCacheEventManager>(kvCacheConfig.getEventBufferMaxSize())
             : nullptr,
@@ -904,6 +905,19 @@ void TrtGptModelInflightBatching::forwardSync()
             }
         }
 
+        // Terminate draft requests whose logits have been sent by the background thread.
+        {
+            RequestVector doneSending;
+            {
+                std::lock_guard<std::mutex> lk(mDraftRequestsMtx);
+                doneSending.swap(mDraftRequestsDoneSendingLogits);
+            }
+            for (auto const& llmReq : doneSending)
+            {
+                terminateRequest(llmReq);
+            }
+        }
+
         // Finished context requests have been moved to generationRequests by moveFinishedContextRequestsToGeneration
         for (auto const& llmReq : currRequests.generationRequests)
         {
@@ -915,7 +929,7 @@ void TrtGptModelInflightBatching::forwardSync()
                     TLLM_CHECK_WITH_INFO(mCacheTransceiver,
                         "Disaggregated serving is not enabled, please check the configuration of "
                         "cacheTransceiverConfig.");
-                    mCacheTransceiver->respondAndSendAsync(llmReq.get());
+                    mCacheTransceiver->respondAndSendAsync(llmReq);
                 }
                 mSeqSlotManager->freeSequenceSlot(llmReq->mRequestId);
             }
@@ -1010,8 +1024,26 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
         auto [fittingRequests, fittingDisaggGenInitRequests, requestsToPause]
             = (*mCapacityScheduler)(activeRequests, mKvCacheManager, mPeftCacheManager, mCrossKvCacheManager);
         // Remove from fitting requests the requests that cannot be scheduled due to disagg KV cache transfer
+        bool waitForDisaggGenTransferProgress = false;
         if (mModelConfig.isTransformerBased() && getKVCacheManager() && mCacheTransceiver)
         {
+            if (mDisaggTransferAdmissionController && mDisaggTransferAdmissionController->enabled()
+                && !fittingDisaggGenInitRequests.empty())
+            {
+                auto admissionResult
+                    = mDisaggTransferAdmissionController->select(activeRequests, fittingDisaggGenInitRequests);
+                waitForDisaggGenTransferProgress = admissionResult.isBlockedByActiveTransfers();
+                if (admissionResult.deferredRequestCount > 0)
+                {
+                    TLLM_LOG_DEBUG(
+                        "Disagg transfer admission deferred %zu requests; active transfer blocks=%zu, admitted "
+                        "transfer blocks=%zu, budget=%zu",
+                        admissionResult.deferredRequestCount, admissionResult.activeTransferBlocks,
+                        admissionResult.admittedTransferBlocks,
+                        mDisaggTransferAdmissionController->getMaxTransferBlocks().value_or(0));
+                }
+                fittingDisaggGenInitRequests = std::move(admissionResult.admittedRequests);
+            }
             prepareDisaggGenInitRequests(activeRequests, fittingDisaggGenInitRequests);
         }
         if (fittingRequests.empty() && fittingDisaggGenInitRequests.empty())
@@ -1023,8 +1055,16 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
                 mIterCounter);
             if (mCacheTransceiver)
             {
-                mCacheTransceiver->checkContextTransferStatus(1, true);
-                // will free kvCache in next iteration.
+                if (waitForDisaggGenTransferProgress)
+                {
+                    TLLM_LOG_DEBUG("Waiting for generation KV cache transfer progress to free disagg admission budget");
+                    mCacheTransceiver->checkGenTransferStatus(1);
+                }
+                else
+                {
+                    mCacheTransceiver->checkContextTransferStatus(1, true);
+                    // will free kvCache in next iteration.
+                }
             }
         }
         std::tie(currRequests.contextRequests, currRequests.generationRequests)
@@ -1208,7 +1248,20 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
         {
             for (auto const& llmReq : activeRequests)
             {
+                // Remove from mInflightReqIds so changeBeamWidth can proceed on the next iteration.
+                // terminateRequest frees seqSlot/KV cache but does not clean up mInflightReqIds.
+                mInflightReqIds.erase(llmReq->mRequestId);
                 terminateRequest(llmReq);
+            }
+            // Force buffer/decoder reset to clean up any partial state from the aborted batch
+            // (e.g. partially-filled cross-KV block offsets from mid-context-chunk processing).
+            // Guard on mInflightReqIds.empty(): in pipeline-parallel multi-micro-batch mode,
+            // other micro-batches may still have requests tracked here; changeBeamWidth asserts
+            // emptiness so we skip the reset and let the next successful forwardAsync iteration
+            // perform it when the set is clear.
+            if (mWorldConfig.isLastPipelineParallelRank() && mInflightReqIds.empty())
+            {
+                changeBeamWidth(mOperatingBeamWidth);
             }
         }
         catch (std::exception const& e)
@@ -1596,11 +1649,11 @@ void TrtGptModelInflightBatching::prepareDisaggGenInitRequests(
             mCacheTransceiver, "Disaggregated serving is not enabled, please check the configuration.");
         if (common::getEnvDisableKVCacheTransferOverlap())
         {
-            mCacheTransceiver->requestAndReceiveSync(newGenReq.get());
+            mCacheTransceiver->requestAndReceiveSync(newGenReq);
         }
         else
         {
-            mCacheTransceiver->requestAndReceiveAsync(newGenReq.get());
+            mCacheTransceiver->requestAndReceiveAsync(newGenReq);
         }
     }
     if (!common::getEnvDisableKVCacheTransferOverlap())
@@ -1608,10 +1661,10 @@ void TrtGptModelInflightBatching::prepareDisaggGenInitRequests(
         auto const blockTransfer = std::all_of(activeRequests.begin(), activeRequests.end(),
             [](auto const& req) { return req->isDisaggGenerationTransmissionInProgress(); });
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-            "newGenReqs.size():%ld requests, activeRequests.size():%ld checkGenTransferStatus :%d original "
+            "newGenReqs.size():%ld requests, activeRequests.size():%ld allTransferInProgress:%d original "
             "gen_only_requests_num:%ld",
             newGenReqs.size(), activeRequests.size(), blockTransfer, genInitReqNum);
-        mCacheTransceiver->checkGenTransferStatus(blockTransfer ? 1 : 0);
+        mCacheTransceiver->checkGenTransferStatus(0);
         auto timeEnd = std::chrono::steady_clock::now();
         auto duration = std::chrono::duration<float, std::milli>(timeEnd - timeStart).count();
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
@@ -1640,21 +1693,14 @@ void TrtGptModelInflightBatching::checkDisaggGenTransferStatus(RequestList const
 
     if (needCheck)
     {
-        auto const needCheckOne = std::all_of(activeRequests.begin(), activeRequests.end(),
-            [](auto const& req) { return req->isDisaggGenerationTransmissionInProgress(); });
-
-        int atLeastNum = needCheckOne ? 1 : 0;
-        TLLM_LOG_DEBUG(
-            mpi::MpiComm::world().getRank(), "noPreppared requests, checkGenTransferStatus atLeastNum:%d", atLeastNum);
-
-        mCacheTransceiver->checkGenTransferStatus(atLeastNum);
+        mCacheTransceiver->checkGenTransferStatus(0);
 
         auto timeEnd = std::chrono::steady_clock::now();
         auto duration = std::chrono::duration<float, std::milli>(timeEnd - timeStart).count();
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
             "no Prepare checkDisaggGenTransferStatus time:%f ms, "
-            "needCheckOne:%d,needCheck:%ld,activeRequests.size():%ld",
-            duration, needCheckOne, needCheck, activeRequests.size());
+            "needCheck:%d,activeRequests.size():%ld",
+            duration, needCheck, activeRequests.size());
     }
 }
 
@@ -2524,6 +2570,7 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
             {
                 if (llmReq->getReturnGenerationLogits() && mSpeculativeDecodingFastLogits && mIsLeaderInOrchMode)
                 {
+                    std::lock_guard<std::mutex> lk(mDraftRequestsMtx);
                     mDraftRequestsWaitingToSendLogits.push_back(llmReq);
                 }
                 else
@@ -2663,6 +2710,12 @@ nvinfer1::DataType TrtGptModelInflightBatching::getLogitDataType() const
     return mModelConfig.getLogitsDtype();
 }
 
+TrtGptModelInflightBatching::SizeType32 TrtGptModelInflightBatching::numCachedCudaGraphs() const
+{
+    return std::accumulate(mCudaGraphExecutorCaches.begin(), mCudaGraphExecutorCaches.end(), SizeType32{0},
+        [](SizeType32 sum, auto const& cache) { return sum + cache.size(); });
+}
+
 void TrtGptModelInflightBatching::changeBeamWidth(SizeType32 beamWidth)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -2674,6 +2727,13 @@ void TrtGptModelInflightBatching::changeBeamWidth(SizeType32 beamWidth)
     TLLM_LOG_DEBUG("Changing operating beam width from %d to %d", mOperatingBeamWidth, beamWidth);
     mOperatingBeamWidth = beamWidth;
 
+    if (isCudaGraphMode())
+    {
+        for (auto& cache : mCudaGraphExecutorCaches)
+        {
+            cache.clear();
+        }
+    }
     createBuffers(mDecodingConfig, mAdditionalModelOutputs);
     createDecoder(mDecodingConfig.getDecodingMode());
 

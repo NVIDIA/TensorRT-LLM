@@ -8,6 +8,7 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.utils import model_extra_attrs
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.math_utils import pad_up
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -469,7 +470,7 @@ def test_nvfp4_gemm_unified_all_tactics(dtype, mnk):
                                                  weight_scale=w_sf_block,
                                                  alpha=alpha_tensor,
                                                  output_dtype=dtype,
-                                                 to_userbuffers=False,
+                                                 output_buffer_kind=0,
                                                  allowed_backends='cutlass')
 
     # Test auto backend selection with autotuning
@@ -481,7 +482,7 @@ def test_nvfp4_gemm_unified_all_tactics(dtype, mnk):
             weight_scale=w_sf_block,
             alpha=alpha_tensor,
             output_dtype=dtype,
-            to_userbuffers=False,
+            output_buffer_kind=0,
             allowed_backends='cutlass,cublaslt,cuda_core,cutedsl')
 
     AutoTuner.get().print_profiling_cache()
@@ -509,7 +510,7 @@ def test_nvfp4_gemm_unified_all_tactics(dtype, mnk):
             weight_scale=w_sf_block,
             alpha=alpha_tensor,
             output_dtype=dtype,
-            to_userbuffers=False,
+            output_buffer_kind=0,
             allowed_backends='cutlass,cublaslt,cuda_core,cutedsl')
 
     outer_tactics_list = list(outer_capture)
@@ -609,7 +610,7 @@ def test_nvfp4_gemm_unified_all_tactics(dtype, mnk):
                 weight_scale=w_sf_block,
                 alpha=alpha_tensor,
                 output_dtype=dtype,
-                to_userbuffers=False,
+                output_buffer_kind=0,
                 allowed_backends='cuda_core')
 
             torch.testing.assert_close(output_cuda_core,
@@ -724,7 +725,7 @@ def test_fp4_linear_cuda_core(dtype, mnk):
                                                  weight_scale=w_sf_block,
                                                  alpha=alpha_tensor,
                                                  output_dtype=dtype,
-                                                 to_userbuffers=False,
+                                                 output_buffer_kind=0,
                                                  allowed_backends='cutlass')
 
         # Test CUDA Core backend
@@ -735,7 +736,7 @@ def test_fp4_linear_cuda_core(dtype, mnk):
             weight_scale=w_sf_block,
             alpha=alpha_tensor,
             output_dtype=dtype,
-            to_userbuffers=False,
+            output_buffer_kind=0,
             allowed_backends='cuda_core')
 
     # Compare results
@@ -747,6 +748,91 @@ def test_fp4_linear_cuda_core(dtype, mnk):
     print(
         f"✓ CUDA Core test passed for M={SEQ_LEN}, N={OUTPUT_SIZE}, K={HIDDEN_SIZE}"
     )
+
+
+@pytest.mark.skipif(
+    get_sm_version() < 90 or get_sm_version() >= 100,
+    reason="Marlin NVFP4 backend runs Hopper",
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize(
+    "mnk",
+    [
+        (1, 1024, 1024),
+        (8, 1024, 2048),
+        (128, 2048, 1024),
+        (1, 18560, 4096),
+        (128, 18560, 4096),
+        (1, 4096, 8192),
+        (128, 4096, 8192),
+        # Non-64-aligned N and/or K (e.g. from TP sharding)
+        (8, 2576, 672),
+        (128, 2576, 672),
+        (8, 2576, 4096),
+        (8, 4096, 2576),
+        (8, 2576, 544),
+        (1, 96, 80),
+        (3, 176, 144),
+        (128, 928, 1360),
+    ])
+def test_fp4_linear_marlin(dtype, mnk):
+    SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE = mnk
+    torch.manual_seed(0)
+
+    w_float = torch.randn((OUTPUT_SIZE, HIDDEN_SIZE), dtype=torch.float32)
+    w_fp4, w_sf_swizzled, w_dequant = torch.ops.tensorrt_llm.float_to_e2m1_and_ufp8sf_scale(
+        w_float,
+        scaling_vector_size,
+        1,  # ufp8_type=1 (e4m3)
+        True,  # is_sf_swizzled_layout=True (modelopt checkpoint native layout)
+    )
+    assert torch.iinfo(w_sf_swizzled.dtype).bits == 8  # torch.uint8
+    w_sf_2d = torch.ops.trtllm.block_scale_interleave_reverse(
+        w_sf_swizzled.view(pad_up(OUTPUT_SIZE, 128),
+                           -1)).view(torch.float8_e4m3fn)
+
+    with model_extra_attrs({'nvfp4_gemm_allowed_backends': ['marlin']}):
+        l_marlin = Linear(
+            in_features=HIDDEN_SIZE,
+            out_features=OUTPUT_SIZE,
+            bias=False,
+            dtype=dtype,
+            quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+            nvfp4_allowed_backends=['marlin'],  # key
+        )
+
+        # ``float_to_e2m1_and_ufp8sf_scale`` returns ``w_dequant`` that already
+        # encodes the per-block FP8 scale. The Marlin BF16-activation path
+        # multiplies the kernel output by ``weight_global_scale`` (derived from
+        # ``weight_scale_2``); we want that scalar to be 1 so the kernel result
+        # matches the reference ``torch.mm(x, w_dequant.T)``. Mirrors the
+        # passing GEMM test (test_fp4_gemm.py:453-454, is_bf16_act=True branch).
+        l_marlin.load_weights([{
+            'weight':
+            w_fp4,
+            'weight_scale':
+            w_sf_2d,
+            'weight_scale_2':
+            torch.tensor(1.0, dtype=torch.float32),
+        }])
+        l_marlin = l_marlin.cuda()
+
+        l_marlin.post_load_weights()
+
+        x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda()
+        x_sf_global = (448 * 6) / x.abs().max().float()
+        x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(
+            x, x_sf_global, scaling_vector_size, False)
+
+        with torch.inference_mode():
+            output = l_marlin(x)
+
+    w_dequant_bf16 = w_dequant.to(dtype).cuda()
+    with torch.inference_mode():
+        ref_output = torch.mm(x, w_dequant_bf16.T)
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, ref_output, atol=0.5, rtol=2e-2)
 
 
 if __name__ == "__main__":
@@ -767,3 +853,53 @@ if __name__ == "__main__":
     #     nvfp4_gemm_perf_test(torch.bfloat16, m, 7168, 65792)
     #     nvfp4_gemm_perf_test(torch.bfloat16, m, 227368, 2560, test_ref=False)
     #     nvfp4_gemm_perf_test(torch.bfloat16, m, 2560, 113664)
+
+
+def _make_nvfp4_inputs_for_bias_test(m, n, k, dtype=torch.bfloat16):
+    """Quantize random bf16 act+weight; return (act_fp4, weight_fp4, act_sf, weight_sf, alpha)."""
+    torch.manual_seed(0)
+    act = torch.randn(m, k, dtype=dtype, device="cuda")
+    weight = torch.randn(n, k, dtype=dtype, device="cuda")
+    act_gs = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+    w_gs = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+    act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(act, act_gs, 16, False,
+                                                    True)
+    w_fp4, w_sf = torch.ops.trtllm.fp4_quantize(weight, w_gs, 16, False, True)
+    alpha = (1.0 / act_gs * 1.0 / w_gs).to(torch.float32).reshape(())
+    return act_fp4, w_fp4, act_sf, w_sf, alpha
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("backend", ["cutlass", "cublaslt", "cuda_core"])
+@pytest.mark.parametrize("mnk", [(8, 4096, 4096), (252, 2048, 2048),
+                                 (1024, 4096, 4096), (4096, 6144, 4096)])
+def test_fp4_gemm_bias_per_backend(backend, mnk):
+    """Per-backend numerical parity: nvfp4_gemm(bias=B) ≈ nvfp4_gemm(bias=None) + B."""
+    m, n, k = mnk
+    if backend == "cuda_core" and m > 8:
+        pytest.skip("cuda_core backend only supports M <= 8")
+
+    act_fp4, w_fp4, act_sf, w_sf, alpha = _make_nvfp4_inputs_for_bias_test(
+        m, n, k)
+    bias = torch.randn(n, dtype=torch.bfloat16, device="cuda") * 0.5
+
+    out_no_bias = torch.ops.trtllm.nvfp4_gemm(act_fp4,
+                                              w_fp4,
+                                              act_sf,
+                                              w_sf,
+                                              alpha,
+                                              torch.bfloat16,
+                                              allowed_backends=backend)
+    ref = out_no_bias + bias
+
+    out_fused = torch.ops.trtllm.nvfp4_gemm(act_fp4,
+                                            w_fp4,
+                                            act_sf,
+                                            w_sf,
+                                            alpha,
+                                            torch.bfloat16,
+                                            allowed_backends=backend,
+                                            bias=bias)
+
+    # bf16 1-ULP at cast boundary (~0.0039) — fused vs gemm+add differs by ULP-level rounding.
+    torch.testing.assert_close(out_fused, ref, rtol=1e-2, atol=5e-3)

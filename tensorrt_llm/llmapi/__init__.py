@@ -2,28 +2,34 @@ from .._torch.async_llm import AsyncLLM
 from ..disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 from ..executor import CompletionOutput, LoRARequest, RequestError
 from ..sampling_params import GuidedDecodingParams, SamplingParams
+from ..scheduling_params import SchedulingParams
 from .build_cache import BuildCacheConfig
 from .llm import LLM, RequestOutput
 # yapf: disable
 from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
                        CacheTransceiverConfig, CalibConfig,
                        CapacitySchedulerPolicy, ContextChunkingPolicy,
-                       CudaGraphConfig, DeepSeekSparseAttentionConfig,
+                       CudaGraphConfig, DecodeCudaGraphConfig,
+                       DeepSeekSparseAttentionConfig,
+                       DeepSeekV4SparseAttentionConfig, DFlashDecodingConfig,
                        DraftTargetDecodingConfig, DynamicBatchConfig,
                        Eagle3DecodingConfig, EagleDecodingConfig,
-                       ExtendedRuntimePerfKnobConfig, KvCacheConfig, LlmArgs,
-                       LookaheadDecodingConfig, MedusaDecodingConfig, MoeConfig,
-                       MTPDecodingConfig, NGramDecodingConfig,
+                       EncodeCudaGraphConfig, ExtendedRuntimePerfKnobConfig,
+                       KvCacheConfig, LlmArgs, LookaheadDecodingConfig,
+                       MedusaDecodingConfig, MiniMaxM3SparseAttentionConfig,
+                       MoeConfig, MTPDecodingConfig, NGramDecodingConfig,
                        PARDDecodingConfig, PrometheusMetricsConfig,
-                       RocketSparseAttentionConfig, SADecodingConfig,
-                       SAEnhancerConfig, SaveHiddenStatesDecodingConfig,
-                       SchedulerConfig, SkipSoftmaxAttentionConfig,
-                       TorchCompileConfig, TorchLlmArgs, TrtLlmArgs,
-                       UserProvidedDecodingConfig)
+                       ReorderRequestPolicyConfig, RocketSparseAttentionConfig,
+                       SADecodingConfig, SAEnhancerConfig,
+                       SaveHiddenStatesDecodingConfig, SchedulerConfig,
+                       SkipSoftmaxAttentionConfig, TorchCompileConfig,
+                       TorchLlmArgs, TrtLlmArgs, UserProvidedDecodingConfig)
 from .llm_utils import (BuildConfig, KvCacheRetentionConfig, QuantAlgo,
                         QuantConfig)
 from .mm_encoder import MultimodalEncoder
 from .mpi_session import MpiCommSession
+from .thinking_budget import (ThinkingBudgetLogitsProcessor,
+                              add_thinking_budget_logits_processor)
 
 __all__ = [
     'LLM',
@@ -38,6 +44,8 @@ __all__ = [
     'KvCacheConfig',
     'KvCacheRetentionConfig',
     'CudaGraphConfig',
+    'DecodeCudaGraphConfig',
+    'EncodeCudaGraphConfig',
     'MoeConfig',
     'LookaheadDecodingConfig',
     'MedusaDecodingConfig',
@@ -60,6 +68,7 @@ __all__ = [
     'CacheTransceiverConfig',
     'NGramDecodingConfig',
     'PARDDecodingConfig',
+    'DFlashDecodingConfig',
     'SADecodingConfig',
     'SAEnhancerConfig',
     'UserProvidedDecodingConfig',
@@ -73,7 +82,14 @@ __all__ = [
     'LoRARequest',
     'SaveHiddenStatesDecodingConfig',
     'RocketSparseAttentionConfig',
+    'ReorderRequestPolicyConfig',
     'DeepSeekSparseAttentionConfig',
+    'DeepSeekV4SparseAttentionConfig',
+    'MiniMaxM3SparseAttentionConfig',
+    'SchedulingParams',
     'SkipSoftmaxAttentionConfig',
     'PrometheusMetricsConfig',
+    'ThinkingBudgetLogitsProcessor',
+    'add_thinking_budget_logits_processor',
+    'DeepSeekV4SparseAttentionConfig',
 ]

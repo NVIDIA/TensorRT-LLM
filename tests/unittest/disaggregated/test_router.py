@@ -1,16 +1,43 @@
+import asyncio
 import copy
 import threading
 from unittest import mock
 
+import aiohttp
 import pytest
 
 from tensorrt_llm.llmapi.disagg_utils import RouterConfig
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionRequest,
                                                 DisaggregatedParams)
-from tensorrt_llm.serve.router import (ConversationRouter, KvCacheAwareRouter,
-                                       LoadBalancingRouter, RoundRobinRouter,
-                                       create_router)
+from tensorrt_llm.serve.router import (BlockHashMixin, ConversationRouter,
+                                       KvCacheAwareRouter, LoadBalancingRouter,
+                                       RoundRobinRouter, create_router)
+
+
+def _make_mock_aiohttp_session(return_value=None):
+    """Create a mock aiohttp.ClientSession whose .post() returns canned JSON."""
+    if return_value is None:
+        return_value = []
+    mock_response = mock.AsyncMock()
+    mock_response.json = mock.AsyncMock(return_value=return_value)
+    mock_ctx = mock.AsyncMock()
+    mock_ctx.__aenter__ = mock.AsyncMock(return_value=mock_response)
+    mock_ctx.__aexit__ = mock.AsyncMock(return_value=False)
+    mock_session = mock.MagicMock(spec=aiohttp.ClientSession)
+    mock_session.post = mock.MagicMock(return_value=mock_ctx)
+    mock_session.get = mock.MagicMock(return_value=mock_ctx)
+    mock_session.close = mock.AsyncMock()
+    return mock_session
+
+
+@pytest.fixture(autouse=True)
+def mock_aiohttp_session(request):
+    """Auto-mock aiohttp.ClientSession so poll_events doesn't make real HTTP calls."""
+    mock_session = _make_mock_aiohttp_session()
+    with mock.patch('tensorrt_llm.serve.router.aiohttp.ClientSession',
+                    return_value=mock_session):
+        yield mock_session
 
 
 # Mock class for metadata server
@@ -227,7 +254,7 @@ async def test_gen_tokens_balancing_router(servers, requests_fixture, request):
 
 
 @pytest.mark.asyncio
-async def test_kv_cache_aware_router(servers):
+async def test_kv_cache_aware_router(servers, mock_aiohttp_session):
     # create tokenized requests to skip tokenization
     # req0: [1000]*100, req1: [1000]*50+[1001]*150, req2: [1002]*300
     requests = [
@@ -330,7 +357,8 @@ async def test_kv_cache_aware_router(servers):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("api_type", ["completion", "chat"])
-async def test_kv_cache_aware_router_multi_turn_conversation(api_type):
+async def test_kv_cache_aware_router_multi_turn_conversation(
+        api_type, mock_aiohttp_session):
     """Test that consecutive turns of a multi-turn conversation route to the same server due to KV cache prefix hits.
 
     Verifies that consecutive turns route to the same server.
@@ -789,7 +817,113 @@ async def test_conversation_router_hash_skip_count():
     assert sb2 != sa2, "With skip, different content should not match"
 
 
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_polls_kv_cache_events(
+        servers, mock_aiohttp_session):
+    """finish_request must POST /kv_cache_events and apply returned events."""
+    # Reconfigure the mock session to return a stored-block event.
+    stored_event = [{"type": "stored", "blocks": [{"block_hash": 99999}]}]
+    mock_response = mock.AsyncMock()
+    mock_response.json = mock.AsyncMock(return_value=stored_event)
+    mock_ctx = mock.AsyncMock()
+    mock_ctx.__aenter__ = mock.AsyncMock(return_value=mock_response)
+    mock_ctx.__aexit__ = mock.AsyncMock(return_value=False)
+    mock_aiohttp_session.post = mock.MagicMock(return_value=mock_ctx)
+
+    router = KvCacheAwareRouter(
+        server_role=None,
+        servers=servers,
+        use_tokens=False,
+        max_batch_size=32,
+        tokens_per_block=32,
+    )
+
+    request = CompletionRequest(model="TinyLlama", prompt=[[1000] * 100])
+    server, _ = await router.get_next_server(request)
+
+    mock_aiohttp_session.post.reset_mock()
+    await router.finish_request(request)
+    # poll_and_update runs as a background task; yield to let it complete
+    await asyncio.sleep(0)
+
+    # /kv_cache_events was queried on the correct server
+    mock_aiohttp_session.post.assert_called_once_with("http://" + server +
+                                                      "/kv_cache_events")
+
+    # Returned events were applied to the server state
+    assert 99999 in router._server_state[server]._kv_cache_block_table
+
+
 def test_create_router_conversation():
     router = create_router(RouterConfig(type="conversation"),
                            ["server1", "server2"])
     assert isinstance(router, ConversationRouter)
+
+
+def test_block_hash_mixin_routes_through_transformers_tokenizer():
+    """``BlockHashMixin._get_tokenizer`` must call ``TransformersTokenizer.from_pretrained``.
+
+    Routing through ``TransformersTokenizer`` is what lets block-hash KV-cache
+    routing inherit the post-load fixes (``maybe_fix_byte_level_tokenizer`` for
+    DeepSeek-V3 Metaspace, ``_fallback_to_fast_tokenizer`` for DeepSeek-V3.2
+    on transformers >= 5.x). Without this routing, ``trtllm-serve`` would
+    tokenize prompts differently from the rest of TRT-LLM when computing
+    block hashes for cache hits.
+    """
+
+    class _Probe(BlockHashMixin):
+        pass
+
+    probe = _Probe()
+    probe._init_block_hashing()
+
+    inner = mock.MagicMock()
+    wrapper = mock.MagicMock(tokenizer=inner)
+    with mock.patch(
+            "tensorrt_llm.tokenizer.TransformersTokenizer.from_pretrained",
+            return_value=wrapper) as routed:
+        out = probe._get_tokenizer("dummy/model")
+
+    routed.assert_called_once_with("dummy/model", trust_remote_code=True)
+    # The cached tokenizer must be the raw HF tokenizer used by _tokenize,
+    # not the TransformersTokenizer wrapper.
+    assert out is inner
+    assert probe._tokenizers["dummy/model"] is inner
+
+
+@pytest.mark.asyncio
+async def test_finish_request_forwards_explicit_session(servers):
+    """A caller-provided session is forwarded to the kv-cache-events poll.
+
+    finish_request(..., session=) threads the session through to
+    KvCacheAwareServerState.poll_and_update (disagg router session fix), which
+    must use the provided session for the kv_cache_events poll rather than its
+    own self._session.
+    """
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=32)
+    request = CompletionRequest(model="TinyLlama", prompt=[[1000] * 100])
+    await router.get_next_server(request)
+
+    # Build the explicit session inline WITHOUT spec=aiohttp.ClientSession: the
+    # autouse fixture has already patched aiohttp.ClientSession to a MagicMock, so
+    # _make_mock_aiohttp_session's spec= would raise "Cannot spec a Mock object".
+    mock_response = mock.AsyncMock()
+    mock_response.json = mock.AsyncMock(return_value=[])
+    mock_ctx = mock.AsyncMock()
+    mock_ctx.__aenter__ = mock.AsyncMock(return_value=mock_response)
+    mock_ctx.__aexit__ = mock.AsyncMock(return_value=False)
+    explicit_session = mock.MagicMock()
+    explicit_session.post = mock.MagicMock(return_value=mock_ctx)
+
+    await router.finish_request(request, session=explicit_session)
+    await asyncio.sleep(0)
+
+    # The explicitly provided session is the one used to poll kv-cache events.
+    explicit_session.post.assert_called_once()
+    call = explicit_session.post.call_args
+    posted_url = call.args[0] if call.args else call.kwargs.get("url", "")
+    assert "kv_cache_events" in posted_url

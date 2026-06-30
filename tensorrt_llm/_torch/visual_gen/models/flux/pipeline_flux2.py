@@ -39,10 +39,9 @@ from tensorrt_llm._torch.visual_gen.cache.teacache import (
     ExtractorConfig,
     register_extractor_from_config,
 )
-from tensorrt_llm._torch.visual_gen.config import PipelineComponent
-from tensorrt_llm._torch.visual_gen.output import MediaOutput
+from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
-from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
+from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm.logger import logger
 
 from .transformer_flux2 import Flux2Transformer2DModel
@@ -90,7 +89,11 @@ def format_input(prompts: List[str], system_message: str) -> List[List[dict]]:
     ]
 
 
-@register_pipeline("Flux2Pipeline")
+@register_pipeline(
+    "Flux2Pipeline",
+    hf_ids=["black-forest-labs/FLUX.2-dev"],
+    doc="Black Forest Labs FLUX.2 family (text-to-image).",
+)
 class Flux2Pipeline(BasePipeline):
     """FLUX.2 Text-to-Image Pipeline.
 
@@ -116,16 +119,16 @@ class Flux2Pipeline(BasePipeline):
     # Default for backward compatibility (FLUX.2-dev)
     HIDDEN_STATE_LAYERS: Tuple[int, ...] = (10, 20, 30)
 
-    def __init__(self, model_config):
+    def __init__(self, pipeline_config):
         if (
-            model_config.visual_gen_mapping is not None
-            and model_config.visual_gen_mapping.cfg_size != 1
+            pipeline_config.visual_gen_mapping is not None
+            and pipeline_config.visual_gen_mapping.cfg_size != 1
         ):
             raise ValueError(
-                "Flux2Pipeline does not support CFG parallelism. Please set dit_cfg_size to 1."
+                "Flux2Pipeline does not support CFG parallelism. Please set cfg_size to 1."
             )
 
-        super().__init__(model_config)
+        super().__init__(pipeline_config)
 
     @staticmethod
     def _compute_flux2_timestep_embedding(
@@ -164,7 +167,7 @@ class Flux2Pipeline(BasePipeline):
 
     @property
     def dtype(self):
-        return self.model_config.torch_dtype
+        return self.pipeline_config.torch_dtype
 
     @property
     def device(self):
@@ -186,7 +189,9 @@ class Flux2Pipeline(BasePipeline):
     def _init_transformer(self) -> None:
         """Initialize FLUX.2 transformer with quantization support."""
         logger.info("Creating FLUX.2 transformer with quantization support...")
-        self.transformer = Flux2Transformer2DModel(model_config=self.model_config)
+        self.transformer = Flux2Transformer2DModel(
+            model_config=self.pipeline_config.model_configs["transformer"]
+        )
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         with torch.no_grad():
@@ -252,13 +257,13 @@ class Flux2Pipeline(BasePipeline):
                 # Mistral3 is a multimodal model (not pure CausalLM)
                 self.text_encoder = Mistral3ForConditionalGeneration.from_pretrained(
                     text_encoder_path,
-                    torch_dtype=self.model_config.torch_dtype,
+                    torch_dtype=self.pipeline_config.torch_dtype,
                 ).to(device)
             else:
                 # Qwen3 and other CausalLM text encoders
                 self.text_encoder = AutoModelForCausalLM.from_pretrained(
                     text_encoder_path,
-                    torch_dtype=self.model_config.torch_dtype,
+                    torch_dtype=self.pipeline_config.torch_dtype,
                 ).to(device)
 
         # VAE (FLUX.2-specific VAE with BatchNorm)
@@ -291,39 +296,40 @@ class Flux2Pipeline(BasePipeline):
             self.transformer.load_weights(transformer_weights)
             logger.info("Transformer weights loaded successfully.")
 
-        self._target_dtype = self.model_config.torch_dtype
+        self._target_dtype = self.pipeline_config.torch_dtype
 
         if self.transformer is not None:
             self.transformer.eval()
 
     def post_load_weights(self) -> None:
-        """Post-load setup: TeaCache registration."""
+        """Post-load setup: cache acceleration (TeaCache or Cache-DiT)."""
         super().post_load_weights()
         if self.transformer is not None:
-            # Register TeaCache extractor for FLUX.2 (must be after device placement)
-            # Only set guidance_param_name for variants with guidance_embeds
-            guidance_param = "guidance" if self.transformer.guidance_embeds else None
-            forward_params = [
-                "hidden_states",
-                "encoder_hidden_states",
-                "timestep",
-                "img_ids",
-                "txt_ids",
-                "guidance",
-                "return_dict",
-            ]
-            register_extractor_from_config(
-                ExtractorConfig(
-                    model_class_name="Flux2Transformer2DModel",
-                    timestep_embed_fn=self._compute_flux2_timestep_embedding,
-                    guidance_param_name=guidance_param,
-                    forward_params=forward_params,
-                    return_dict_default=False,
+            if self.pipeline_config.cache_backend == "teacache":
+                # Register TeaCache extractor for FLUX.2 (must be after device placement)
+                # Only set guidance_param_name for variants with guidance_embeds
+                guidance_param = "guidance" if self.transformer.guidance_embeds else None
+                forward_params = [
+                    "hidden_states",
+                    "encoder_hidden_states",
+                    "timestep",
+                    "img_ids",
+                    "txt_ids",
+                    "guidance",
+                    "return_dict",
+                ]
+                register_extractor_from_config(
+                    ExtractorConfig(
+                        model_class_name="Flux2Transformer2DModel",
+                        timestep_embed_fn=self._compute_flux2_timestep_embedding,
+                        guidance_param_name=guidance_param,
+                        forward_params=forward_params,
+                        return_dict_default=False,
+                    )
                 )
-            )
 
-            # TeaCache or Cache-DiT
-            self._setup_cache_acceleration(self.transformer, FLUX2_TEACACHE_COEFFICIENTS)
+            self._apply_teacache_coefficients(FLUX2_TEACACHE_COEFFICIENTS)
+            self._setup_cache_acceleration()
 
     @property
     def default_generation_params(self):
@@ -339,24 +345,26 @@ class Flux2Pipeline(BasePipeline):
         """Run inference from DiffusionRequest."""
         return self.forward(
             prompt=req.prompt,
-            height=req.height,
-            width=req.width,
-            num_inference_steps=req.num_inference_steps,
-            guidance_scale=req.guidance_scale,
-            seed=req.seed,
-            max_sequence_length=req.max_sequence_length,
+            height=req.params.height,
+            width=req.params.width,
+            num_inference_steps=req.params.num_inference_steps,
+            guidance_scale=req.params.guidance_scale,
+            seed=req.params.seed,
+            max_sequence_length=req.params.max_sequence_length,
+            num_images_per_prompt=req.params.num_images_per_prompt,
         )
 
     @torch.inference_mode()
     def forward(
         self,
         prompt: Union[str, List[str]],
+        seed: int,
         height: int = 1024,
         width: int = 1024,
         num_inference_steps: int = 50,
         guidance_scale: float = 3.5,
-        seed: int = 42,
         max_sequence_length: int = 512,
+        num_images_per_prompt: int = 1,
     ):
         """Generate image(s) from text prompt(s).
 
@@ -370,16 +378,24 @@ class Flux2Pipeline(BasePipeline):
             guidance_scale: Embedded guidance scale
             seed: Random seed for reproducibility.
             max_sequence_length: Maximum text sequence length
+            num_images_per_prompt: Number of images to generate per prompt.
+                Each prompt's embeddings are repeated and independent noise is
+                sampled, producing N different images per prompt.
 
         Returns:
-            MediaOutput with image tensor (B, H, W, C).
+            PipelineOutput with image tensor (B, H, W, C) where
+            B = len(prompt) * num_images_per_prompt.
         """
         pipeline_start = time.time()
+        timer = CudaPhaseTimer()
+        timer.mark_pre_start()
 
         # Determine batch size
         if isinstance(prompt, str):
             prompt = [prompt]
-        batch_size = len(prompt)
+        if num_images_per_prompt < 1:
+            raise ValueError(f"num_images_per_prompt must be >= 1, got {num_images_per_prompt}")
+        batch_size = len(prompt) * num_images_per_prompt
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
@@ -388,6 +404,10 @@ class Flux2Pipeline(BasePipeline):
         encode_start = time.time()
         prompt_embeds, text_ids = self._encode_prompt(prompt, max_sequence_length)
         logger.info(f"Prompt encoding completed in {time.time() - encode_start:.2f}s")
+
+        # Repeat embeddings for num_images_per_prompt (diffusers convention)
+        if num_images_per_prompt > 1:
+            prompt_embeds = prompt_embeds.repeat_interleave(num_images_per_prompt, dim=0)
 
         latents, latent_ids = self._prepare_latents(batch_size, height, width, generator)
         logger.info(f"Latents shape: {latents.shape}")
@@ -419,7 +439,12 @@ class Flux2Pipeline(BasePipeline):
 
         # Denoising loop using forward_fn callback (WAN pattern)
         def forward_fn(
-            latents, extra_stream_latents, timestep, encoder_hidden_states, extra_tensors
+            latents,
+            extra_stream_latents,
+            step_index,
+            timestep,
+            encoder_hidden_states,
+            extra_tensors,
         ):
             """Forward function for FLUX.2 transformer."""
             return self.transformer(
@@ -432,6 +457,7 @@ class Flux2Pipeline(BasePipeline):
                 return_dict=False,
             )[0]
 
+        timer.mark_denoise_start()
         latents = self.denoise(
             latents=latents,
             scheduler=self.scheduler,
@@ -440,6 +466,7 @@ class Flux2Pipeline(BasePipeline):
             forward_fn=forward_fn,
             timesteps=timesteps,
         )
+        timer.mark_post_start()
 
         # Decode
         logger.info("Decoding image...")
@@ -450,7 +477,8 @@ class Flux2Pipeline(BasePipeline):
             logger.info(f"Image decoded in {time.time() - decode_start:.2f}s")
             logger.info(f"Total pipeline time: {time.time() - pipeline_start:.2f}s")
 
-        return MediaOutput(image=image)
+        timer.mark_end()
+        return timer.fill(PipelineOutput(image=image))
 
     def _encode_prompt(
         self,

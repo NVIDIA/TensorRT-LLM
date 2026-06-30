@@ -15,10 +15,12 @@
 import abc
 import contextlib
 import copy
+import inspect
 import io
 import os
 import re
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -27,8 +29,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional
 
-from _pytest.nodes import Item
-from _pytest.python import Function
+import pytest
 from defs.trt_test_alternative import print_error, print_info
 
 from ..common import get_trt_llm_lib_dir
@@ -101,7 +102,7 @@ class PerfMetricType(str, Enum):
     OUTPUT_TOKEN_TIME = "OUTPUT_TOKEN_TIME"
     MEDIAN_OUTPUT_TOKEN_TIME = "MEDIAN_OUTPUT_TOKEN_TIME"
     P99_OUTPUT_TOKEN_TIME = "P99_OUTPUT_TOKEN_TIME"
-    TOKEN_THROUGHPUT = "TOKEN_THROUGHPUT"
+    TOTAL_OUTPUT_THROUGHPUT = "TOTAL_OUTPUT_THROUGHPUT"
     TOTAL_TOKEN_THROUGHPUT = "TOTAL_TOKEN_THROUGHPUT"
     USER_THROUGHPUT = "USER_THROUGHPUT"
     BUILD_TIME = "BUILD_TIME"
@@ -278,8 +279,9 @@ class PerfBenchScriptTestCmds(NamedTuple):
                 else:
                     cmd = prepare_cmd
                     dataset_file = None
-                output += subprocess.check_output(cmd.split(),
-                                                  env=envs).decode()
+                # Pipe stderr separately so subprocess tracebacks land in e.stderr (forwarded to Allure), not just the inherited console fd.
+                output += subprocess.check_output(
+                    cmd.split(), env=envs, stderr=subprocess.PIPE).decode()
                 if dataset_file:
                     with open(f"{dataset_file}", 'w+') as f:
                         f.write(output)
@@ -421,8 +423,9 @@ class PerfServeScriptTestCmds:
                 else:
                     cmd = sub_cmd
                     dataset_file = None
-                output += subprocess.check_output(cmd.split(),
-                                                  env=envs).decode()
+                # Pipe stderr separately so subprocess tracebacks land in e.stderr (forwarded to Allure), not just the inherited console fd.
+                output += subprocess.check_output(
+                    cmd.split(), env=envs, stderr=subprocess.PIPE).decode()
                 if dataset_file:
                     with open(f"{dataset_file}", 'w+') as f:
                         f.write(output)
@@ -700,6 +703,16 @@ class AbstractPerfScriptTestClass(abc.ABC):
         if self._gpu_clock_lock:
             device_subtype = self._gpu_clock_lock.get_device_subtype()
 
+        # Node(s) that ran this case. Recorded per-case (not per-run) because
+        # parallel splits are submitted as separate SLURM allocations and can
+        # land on different nodes within a single run — a per-run hostname would
+        # be ambiguous. Prefer the SLURM nodelist (a single string that also
+        # covers multinode cases) and fall back to the local hostname for
+        # bare-metal/non-SLURM runs.
+        node_hostname = (os.environ.get("SLURM_JOB_NODELIST")
+                         or os.environ.get("SLURM_NODELIST")
+                         or socket.gethostname())
+
         test_description_dict = {
             "network_name": self.get_test_name(),
             "network_hash":
@@ -707,7 +720,8 @@ class AbstractPerfScriptTestClass(abc.ABC):
             "sm_clk": gpu_clocks.get("gpu_clock__MHz", None),
             "mem_clk": gpu_clocks.get("memory_clock__MHz", None),
             "gpu_idx": gpu_idx,
-            "device_subtype": device_subtype
+            "device_subtype": device_subtype,
+            "hostname": node_hostname
         }
 
         # Serialize the commands.
@@ -796,51 +810,71 @@ class AbstractPerfScriptTestClass(abc.ABC):
                            os.path.join(output_dir, yaml_name)))
 
 
-def generate_one_test_node(session, config, domain_name, test_name, test_func):
+def _find_collected_dir_node(items, rootpath):
+    """Return the real rootdir ``Dir`` collection node created by pytest.
+
+    Since pytest 9.1, fixture visibility is matched by the actual collection-node
+    hierarchy instead of the textual nodeid (pytest issue #11785). Dynamically
+    generated perf nodes must therefore descend from this real ``Dir`` node to
+    inherit the fixtures declared in ``conftest.py``.
+    """
+    for item in items:
+        node = item
+        while node is not None:
+            if isinstance(node, pytest.Dir) and node.path == rootpath:
+                return node
+            node = node.parent
+    return None
+
+
+def generate_one_test_node(session,
+                           config,
+                           domain_name,
+                           test_name,
+                           test_func,
+                           parent_dir=None,
+                           module_cache=None):
     """
     A helper function to create a PyTest item with the specific name and specific test function.
     """
 
-    # Create the parent Item node.
-    # Pytest 8.x upgrade compatibility.
-    # We should never import Pytest internals within test-definitions.
+    # Attach the node under the real Dir -> Module hierarchy so it inherits the
+    # fixtures declared in conftest.py. Since pytest 9.1 fixture visibility is
+    # matched by the collection-node hierarchy rather than the textual nodeid
+    # (pytest issue #11785), a node attached directly to the session can no longer
+    # resolve those fixtures. The legacy nodeid is restored afterwards so that
+    # test-list filtering and --test-prefix rewriting keep working unchanged.
+    if parent_dir is not None:
+        if module_cache is None:
+            module_cache = {}
+        module_path = Path(inspect.getfile(test_func)).resolve()
+        module = module_cache.get(module_path)
+        if module is None:
+            module = pytest.Module.from_parent(parent_dir, path=module_path)
+            module_cache[module_path] = module
+        item = pytest.Function.from_parent(module,
+                                           name=test_name,
+                                           callobj=test_func)
+        item.obj = test_func
+        item._nodeid = f"{domain_name}::{test_name}"
+        return item
+
+    # Fallback when no collected Dir node is available (e.g. nothing was collected
+    # before the dynamic generation): mirror the legacy session-attached behavior.
     # TODO: TRT-23565
-    parent = None
-    if hasattr(Item, "from_parent"):
+    class TrtexecItem(pytest.Item):
 
-        class TrtexecItem(Item):
+        def runtest(self):
+            return test_func()
 
-            def __init__(self, **kwargs):
-                super().__init__(**kwargs)
-
-            def runtest(self):
-                return test_func()
-
-        parent = TrtexecItem.from_parent(session,
-                                         name=domain_name,
-                                         nodeid=domain_name)
-    else:
-        parent = Item(name=domain_name,
-                      parent=session,
-                      config=config,
-                      session=session,
-                      nodeid=domain_name)
-
+    parent = TrtexecItem.from_parent(session,
+                                     name=domain_name,
+                                     nodeid=domain_name)
     parent.obj = None
 
-    # Create the Function node for the test.
-    # For pytest 8.x compatibility
-    # TODO: TRT-23565
-    item = None
-    if hasattr(Function, "from_parent"):
-        item = Function.from_parent(parent, name=test_name, callobj=test_func)
-    else:
-        item = Function(name=test_name,
-                        parent=parent,
-                        config=config,
-                        session=session,
-                        callobj=test_func)
-
+    item = pytest.Function.from_parent(parent,
+                                       name=test_name,
+                                       callobj=test_func)
     item.obj = test_func
 
     # This has to be set but can be random as it isn't used.
@@ -867,6 +901,12 @@ def generate_test_nodes(session, config, items, valid_prefixes: List[str],
     except FileNotFoundError:
         pass
 
+    # Reuse the real rootdir Dir node that pytest created during collection so the
+    # generated nodes inherit conftest fixtures (see generate_one_test_node). The
+    # module node is created once and shared across all generated cases.
+    parent_dir = _find_collected_dir_node(items, config.rootpath)
+    module_cache = {}
+
     # Go through all test names and find the ones that need to be generated.
     for test_name in all_tests:
 
@@ -880,7 +920,8 @@ def generate_test_nodes(session, config, items, valid_prefixes: List[str],
             # Generate the test node and append it to the Pytest item list.
             items.append(
                 generate_one_test_node(session, config, domain_name,
-                                       short_test_name, test_func))
+                                       short_test_name, test_func, parent_dir,
+                                       module_cache))
             print(f"Dynamically generated test node: {test_name}")
 
     return items

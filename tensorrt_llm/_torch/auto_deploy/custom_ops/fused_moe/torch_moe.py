@@ -14,14 +14,14 @@
 # limitations under the License.
 
 from functools import partial
-from typing import Callable, List
+from typing import Callable, List, Optional
 
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.auto_deploy.distributed import common as dist_common
-from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
-from tensorrt_llm._torch.utils import ActivationType
+from ..._compat import ActivationType
+from ...distributed import common as dist_common
+from ...utils.dist_config import DistConfig
 
 
 def _template_moe_alltoall(
@@ -287,6 +287,7 @@ def torch_moe(
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
     layer_type: str = "moe",
+    batch_info_host: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Unified Mixture-of-Experts (MoE) operator that uses a Mixtral-style dispatch
@@ -364,6 +365,7 @@ def torch_moe_fake(
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
     layer_type: str = "moe",
+    batch_info_host: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -454,6 +456,7 @@ def torch_quant_fp8_moe(
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
     layer_type: str = "moe",
+    batch_info_host: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     FP8 MoE op using quantized linear operations. Computes a Mixture-of-Experts layer similar to the reference
@@ -574,6 +577,7 @@ def torch_quant_fp8_moe_fake(
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
     layer_type: str = "moe",
+    batch_info_host: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -601,6 +605,7 @@ def torch_quant_nvfp4_moe(
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
     layer_type: str = "moe",
+    batch_info_host: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     FP4 MoE op using quantized linear operations.
@@ -737,6 +742,7 @@ def torch_quant_nvfp4_moe_fake(
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
     layer_type: str = "moe",
+    batch_info_host: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -808,6 +814,7 @@ def torch_quant_finegrained_fp8_moe(
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
     layer_type: str = "moe",
+    batch_info_host: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     FineGrainedFP8 MoE op using block-wise FP8 quantized linear operations.
@@ -922,5 +929,6 @@ def torch_quant_finegrained_fp8_moe_fake(
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
     layer_type: str = "moe",
+    batch_info_host: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)

@@ -117,7 +117,7 @@ In the Dynamo workflow, requests are initially processed by pre- and post-proces
 
 Dynamo also includes built-in support for Kubernetes deployment, monitoring, and metrics collection. The development team is actively working on enabling dynamic instance scaling, further enhancing its suitability for production environments.
 
-For more information on how to use Dynamo with TensorRT-LLM, please refer to [this documentation](https://docs.dynamo.nvidia.com/dynamo/components/backends/tensor-rt-llm).
+For more information on how to use Dynamo with TensorRT-LLM, please refer to [this documentation](https://docs.nvidia.com/dynamo/backends/tensor-rt-llm).
 
 ### trtllm-serve
 
@@ -258,7 +258,12 @@ TRT-LLM uses some environment variables to control the behavior of disaggregated
 
 There are some other useful environment variables that may help when encountering failures or performance issues.
 
-* `NCCL_GRAPH_MIXING_SUPPORT`: With the default value `1`, the CUDA driver may create too many CUDA streams while working with one CUDA graph, leading to performance drop. Setting it to `0` will reduce the number of CUDA streams, but please make sure there are no other NCCL ops outside the one CUDA graph, otherwise it's unsafe.
+* `NCCL_GRAPH_MIXING_SUPPORT`: TensorRT-LLM now initializes common NCCL communicators with graph
+  mixing support off by default to reduce launch overhead for CUDA graph-captured NCCL operations.
+  This assumes the communicator is not used by parallel graph launches or by uncaptured NCCL calls
+  while a graph launch is outstanding. Set `NCCL_GRAPH_MIXING_SUPPORT=1` to restore NCCL's default
+  graph mixing behavior if your workload needs it. For more details, see the
+  [NCCL_GRAPH_MIXING_SUPPORT documentation](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html#nccl-graph-mixing-support).
 
 * `UCX_MAX_RNDV_RAILS`: With the default value 2, UCX attempts to use two InfiniBand (IB) NIC devices per GPU for Rendezvous (RNDV) transfers. When both the context and generation instances enable tensor- and expert-parallel (TEP), multiple TP ranks may transfer KV cache concurrently. Because each TP rank can use up to two NIC devices, some NIC devices can be shared across GPUs, causing contention and reduced throughput. Setting UCX_MAX_RNDV_RAILS=1 can reduce contention in this case.
 
@@ -308,6 +313,12 @@ executorConfig.setCacheTransceiverConfig(texec::CacheTransceiverConfig(BackendTy
 *Q. Does TRT-LLM support using GPU direct RDMA for inter-node KV Cache transfer?*
 
 A. Yes, TRT-LLM supports using GPU direct RDMA for inter-node KV cache transfer.
+
+*Q. How do I debug a suspected hang from overlapping NCCL graph operations?*
+
+A. TensorRT-LLM turns graph mixing support off by default for common NCCL communicators. To check if
+a hang might be related to NCCL graph mixing support, set `NCCL_GRAPH_MIXING_SUPPORT=1` to restore
+NCCL's default graph mixing behavior.
 
 *Q. What causes the substantial bandwidth fluctuations in kvCache transfers, especially during the first few requests following service initialization?*
 

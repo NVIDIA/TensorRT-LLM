@@ -1,4 +1,4 @@
-# Copyright 2024 NVIDIA CORPORATION & AFFILIATES
+# Copyright 2024-2026 NVIDIA CORPORATION & AFFILIATES
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 # This file is based on official VILA: https://github.com/NVlabs/VILA/
 # and s2wrapper: https://github.com/bfshi/scaling_on_scales
 
+import functools
 import math
 import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
@@ -34,8 +35,89 @@ _MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
 
 
 # Make this a runtime lookup rather than a module-wide constant for easier unit testing.
-def _is_disagg() -> bool:
+# MM E/P split flag. Not generic disaggregated serving.
+def _is_mm_disagg() -> bool:
     return os.getenv(_MULTIMODAL_ENV_NAME, "0") == "1"
+
+
+def has_raw_multimodal_payload(param: MultimodalParams) -> bool:
+    multimodal_data = param.multimodal_data or {}
+    modality_type = multimodal_data.get("modality_type")
+    return (modality_type in ("image", "video", "audio")
+            and multimodal_data.get(modality_type) is not None)
+
+
+# Processor *output* keys that transformers 5.x's
+# ``ProcessorMixin._merge_kwargs`` strictly rejects when they leak into
+# ``output_kwargs[<modality>]`` and reach ``validate_typed_dict``. They
+# round-trip into call kwargs via saved tokenizer ``init_kwargs`` /
+# ``model_input_names``, sub-processor metadata, or per-item processed
+# fields, even when no caller passed them as inputs.
+_PROCESSOR_OUTPUT_KEYS = frozenset({
+    "image_grid_thw",
+    "video_grid_thw",
+    "pixel_values",
+    "pixel_values_videos",
+    "second_per_grid_ts",
+    "mm_token_type_ids",
+})
+
+
+@functools.lru_cache(maxsize=None)
+def _install_processor_output_validation_filter():
+    """Install a process-wide filter over transformers' ``validate_typed_dict``.
+
+    transformers 5.x added strict per-modality TypedDict validation in
+    ``ProcessorMixin._merge_kwargs``. The keys in ``_PROCESSOR_OUTPUT_KEYS``
+    are processor *outputs* that leak into ``output_kwargs[<modality>]`` via
+    upstream bugs — e.g. ``Qwen2_5_VLProcessor._get_num_multimodal_tokens``
+    mutates the class-level default dict instead of a copy, so once any
+    caller passes ``video_grid_thw`` to ``get_num_multimodal_tokens`` it gets
+    baked into the per-modality default and trips ``validate_typed_dict`` on
+    every subsequent processor call. We filter those keys out before calling
+    the genuine huggingface_hub implementation.
+
+    Called from each Qwen VL input processor's ``__init__``. ``@lru_cache``
+    guarantees the patch runs at most once per process: ``base_orig`` is
+    captured exactly once from the genuine HF function, so concurrent
+    ``trtllm-serve`` workers dispatched via ``asyncio.to_thread`` cannot
+    observe a partially-patched state or chain filters recursively.
+
+    Patches every transformers module that binds ``validate_typed_dict`` —
+    each does its own ``from huggingface_hub.dataclasses import …``, so
+    patching only one is insufficient. The set of binders differs across
+    transformers versions (5.3.x rebinds it on ``image_processing_utils_fast``;
+    5.5.x dropped that module and rebinds it on ``image_processing_utils``
+    instead), so we discover binders by ``hasattr`` rather than hard-coding.
+    """
+    import transformers.processing_utils as _pu
+    import transformers.video_processing_utils as _vpu
+
+    _candidate_binders = [_pu, _vpu]
+    for _name in ("transformers.image_processing_utils",
+                  "transformers.image_processing_utils_fast"):
+        try:
+            _candidate_binders.append(__import__(_name, fromlist=[""]))
+        except ImportError:
+            pass
+    binders = tuple(b for b in _candidate_binders
+                    if hasattr(b, "validate_typed_dict"))
+    if not binders:
+        raise RuntimeError(
+            "No transformers module exposes validate_typed_dict; "
+            "cannot patch processor output validation.")
+    base_orig = binders[0].validate_typed_dict
+
+    def _filtered_validate(schema, data):
+        if isinstance(data, dict):
+            data = {
+                k: v
+                for k, v in data.items() if k not in _PROCESSOR_OUTPUT_KEYS
+            }
+        return base_orig(schema, data)
+
+    for b in binders:
+        b.validate_typed_dict = _filtered_validate
 
 
 def _get_uncached_multimodal_params(
@@ -55,7 +137,7 @@ def _get_uncached_multimodal_params(
                 and "multimodal_embedding" in param.multimodal_data
                 and param.multimodal_data["multimodal_embedding"] is not None):
             logger.debug(
-                f"Skipping encoder forward for param with cached multimodal_embedding"
+                "Skipping encoder forward for param with cached multimodal_embedding"
             )
             continue
 
@@ -84,8 +166,7 @@ def _cache_multimodal_embeddings(
     for param in multimodal_params:
         if param.multimodal_runtime is not None:
             embed_lengths.append(
-                param.multimodal_runtime.total_mm_tokens_in_request -
-                param.multimodal_runtime.total_special_tokens_in_request)
+                param.multimodal_runtime.total_embeds_in_request)
 
     # Validate total length matches
     total_expected = sum(embed_lengths)
@@ -102,7 +183,7 @@ def _cache_multimodal_embeddings(
     logger.debug(
         f"Caching {len(split_embeddings)} multimodal embedding chunks in {len(multimodal_params)} params"
     )
-    for param, embed_chunk in zip(valid_params, split_embeddings):
+    for param, embed_chunk in zip(valid_params, split_embeddings, strict=True):
         param.multimodal_data["multimodal_embedding"] = embed_chunk
 
     logger.debug(
@@ -110,14 +191,30 @@ def _cache_multimodal_embeddings(
     )
 
 
+def _normalize_encoder_embeddings(
+    encoder_embeddings: Union[torch.Tensor, List[torch.Tensor]],
+) -> List[torch.Tensor]:
+    if isinstance(encoder_embeddings, torch.Tensor):
+        return [encoder_embeddings]
+
+    if (not isinstance(encoder_embeddings, list) or not all(
+            isinstance(embedding, torch.Tensor)
+            for embedding in encoder_embeddings)):
+        raise TypeError(
+            "encoder_forward_fn must return a torch.Tensor or a list of torch.Tensor."
+        )
+
+    return encoder_embeddings
+
+
 def get_multimodal_embeddings(
     encoder_forward_fn: Callable[
-        [List[MultimodalParams]],
-        Union[torch.Tensor, Tuple[torch.Tensor, Any]],
+        ...,
+        torch.Tensor | List[torch.Tensor],
     ],
     multimodal_params: List[MultimodalParams],
     encoder_kwargs: Optional[Dict[str, Any]] = None,
-) -> Union[List[torch.Tensor], Tuple[List[torch.Tensor], Any]]:
+) -> List[torch.Tensor]:
     """
     High-level utility to get multimodal embeddings from encoder or cached embeddings.
 
@@ -129,44 +226,33 @@ def get_multimodal_embeddings(
 
     Args:
         encoder_forward_fn: Callable that performs encoder forward pass.
-                           Should accept List[MultimodalParams] and return List[torch.Tensor] or
-                           Tuple[List[torch.Tensor], aux_data] for models with auxiliary outputs.
-                           When returning a tuple, the first element must be a List[torch.Tensor]
-                           (one tensor per multimodal param), and aux_data is passed through to
-                           the caller unchanged.
+                           Should accept List[MultimodalParams] and return either
+                           a single torch.Tensor or List[torch.Tensor].
         multimodal_params: All multimodal parameters in the batch.
         encoder_kwargs: Optional kwargs to pass to encoder_forward_fn.
     Returns:
-        List of multimodal embeddings for all multimodal params in the batch, or a
-        (List[torch.Tensor], aux_data) tuple if encoder_forward_fn returned auxiliary data.
+        List of multimodal embeddings for all multimodal params in the batch.
     """
     if not multimodal_params:
         return []
+
+    # Wait before touching tensors produced on the MM side stream. Do not
+    # clear the event here; repeated stream-side waits are cheap, and leaving
+    # the event field untouched avoids races if a caller accidentally reuses it.
+    for param in multimodal_params:
+        if param.encoder_event is not None:
+            torch.cuda.current_stream().wait_event(param.encoder_event)
 
     # Step 1: Find uncached multimodal params that need encoder processing
     uncached_multimodal_params = _get_uncached_multimodal_params(
         multimodal_params)
 
-    aux_data = None
-
     # Step 2: Run encoder forward only on uncached parameters
     if uncached_multimodal_params:
         kwargs = encoder_kwargs or {}
-        encoder_output = encoder_forward_fn(uncached_multimodal_params,
-                                            **kwargs)
-
-        # Handle encoder returning (embeddings, aux_data) tuple.
-        # In this case the first element is a List[torch.Tensor] with one tensor per
-        # multimodal param (not yet concatenated), which we concatenate before caching.
-        if isinstance(encoder_output, tuple):
-            encoder_embeddings, aux_data = encoder_output
-            # Concatenate per-param tensors into a single tensor for the caching path
-            if isinstance(encoder_embeddings,
-                          list) and encoder_embeddings and isinstance(
-                              encoder_embeddings[0], torch.Tensor):
-                encoder_embeddings = [torch.cat(encoder_embeddings, dim=0)]
-        else:
-            encoder_embeddings = encoder_output
+        encoder_embeddings = encoder_forward_fn(uncached_multimodal_params,
+                                                **kwargs)
+        encoder_embeddings = _normalize_encoder_embeddings(encoder_embeddings)
 
         # TODO: support multiple multimodal modalities per request
         if len(encoder_embeddings) > 1:
@@ -183,12 +269,10 @@ def get_multimodal_embeddings(
         if (not hasattr(uncached_multimodal_params[0], 'multimodal_runtime')
                 or uncached_multimodal_params[0].multimodal_runtime is None
                 or uncached_multimodal_params[0].multimodal_runtime.
-                total_mm_tokens_in_request is None):
+                total_embeds_in_request is None):
             logger.warning(
                 "Multimodal runtime data missing or incomplete, will not cache embeddings."
             )
-            if aux_data is not None:
-                return encoder_embeddings, aux_data
             return encoder_embeddings
 
         # Step 3: Cache the computed embeddings to multimodal_data["multimodal_embedding"]
@@ -211,9 +295,35 @@ def get_multimodal_embeddings(
         param.multimodal_data["multimodal_embedding"] for param in valid_params
     ],
                                dim=0)
-    if aux_data is not None:
-        return [all_embeddings], aux_data
     return [all_embeddings]
+
+
+def get_attached_multimodal_embeddings(
+        multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
+    """Gather embeddings already stored on MultimodalParams.
+
+    Use this on E/P prefill workers and cached-only paths. The encoder already
+    ran somewhere else. This only makes the tensor list that
+    find_input_mm_embeds slices.
+    """
+    attached_embeddings = []
+    for param in multimodal_params:
+        embeds = param.multimodal_data.get("multimodal_embedding")
+        # No attached embedding for this request.
+        if embeds is None:
+            continue
+        # Some paths stash chunks. Slicer expects one tensor.
+        if isinstance(embeds, list):
+            embeds = torch.cat(embeds, dim=0)
+            param.multimodal_data["multimodal_embedding"] = embeds
+        if not isinstance(embeds, torch.Tensor):
+            raise TypeError("multimodal_embedding must be a torch.Tensor")
+        attached_embeddings.append(embeds)
+
+    if not attached_embeddings:
+        return []
+    # Match get_multimodal_embeddings output: one concatenated tensor.
+    return [torch.cat(attached_embeddings, dim=0)]
 
 
 def find_input_mm_embeds(
@@ -237,8 +347,15 @@ def find_input_mm_embeds(
     Note:
         - Supports both individual batching (len(mm_embeds) == len(multimodal_params))
           and pre-concatenated batching (len(mm_embeds) == 1)
+        - Call get_attached_multimodal_embeddings before this helper when
+          embeddings are already attached to multimodal_params.
         - Handles chunked prefill by considering chunk boundaries and current chunk tokens
+        - Example: if a request has 8 MM embed rows, 2 cached rows, and 3 rows
+          in the current chunk, this keeps rows [2:5].
     """
+    if not isinstance(mm_embeds, list):
+        raise TypeError("mm_embeds must be a list")
+
     # Current support two batching modes:
     # 1. Pre-concatenated mm_embeds for each batch, i.e., len(mm_embeds) == 1
     # 2. Individual mm_embeds for each multimodal param, i.e., len(mm_embeds) == len(multimodal_params)
@@ -251,19 +368,20 @@ def find_input_mm_embeds(
         # No slicing, return the full mm_embeds
         return mm_embeds
 
-    # Calculate total tokens that need processing (both cached and current chunk)
-    total_mm_tokens = sum([
-        param.multimodal_runtime.num_mm_tokens_in_chunk -
-        param.multimodal_runtime.num_special_tokens_in_chunk
-        for param in multimodal_params if param.multimodal_runtime is not None
-    ])
+    total_mm_tokens = sum(param.multimodal_runtime.num_mm_tokens_in_chunk
+                          for param in multimodal_params
+                          if param.multimodal_runtime is not None)
 
     if total_mm_tokens == 0:
-        # No tokens need processing, return empty list
         logger.debug(
             "All multimodal tokens are cached or beyond current chunk, skipping vision encoder forward"
         )
         return []
+
+    if not mm_embeds:
+        raise ValueError(
+            "No multimodal embeddings were provided or cached for active multimodal tokens."
+        )
 
     if total_mm_tokens == sum(mm_embed.shape[0] for mm_embed in mm_embeds):
         return mm_embeds
@@ -274,26 +392,17 @@ def find_input_mm_embeds(
         runtime = param.multimodal_runtime
         if runtime is None:
             continue
-        local_start_pos = runtime.num_unseen_mm_tokens - runtime.num_unseen_special_tokens
-        local_end_pos = local_start_pos + runtime.num_mm_tokens_in_chunk - runtime.num_special_tokens_in_chunk
+        local_start_pos = runtime.num_cached_mm_tokens
+        local_end_pos = local_start_pos + runtime.num_mm_tokens_in_chunk
         slices.append(
             (current_pos + local_start_pos, current_pos + local_end_pos))
-        if len(mm_embeds
-               ) == 1:  # pre-concatenated mm_embeds, need global offset
-            current_pos += runtime.total_mm_tokens_in_request
-            current_pos -= runtime.total_special_tokens_in_request
-
-    sliced_mm_embeds = []
-    if len(mm_embeds) == 1:
-        sliced_mm_embeds = [mm_embeds[0][start:end] for start, end in slices]
-    else:  # slice each mm_embeds individually
-        for i, (start, end) in enumerate(slices):
-            sliced_mm_embeds.append(mm_embeds[i][start:end])
+        if len(mm_embeds) == 1:  # pre-concatenated; advance global cursor
+            current_pos += runtime.total_embeds_in_request
 
     if len(mm_embeds) == 1:
-        sliced_mm_embeds = [torch.cat(sliced_mm_embeds, dim=0)]
-
-    return sliced_mm_embeds
+        sliced = [mm_embeds[0][start:end] for start, end in slices]
+        return [torch.cat(sliced, dim=0)]
+    return [mm_embeds[i][start:end] for i, (start, end) in enumerate(slices)]
 
 
 def filter_mm_token_from_input_ids(
@@ -308,6 +417,9 @@ def filter_mm_token_from_input_ids(
         vocab_size: size of the model's vocabulary
         mm_token_ids: possible token ids for multimodal tokens, if known. If not known and set to None, it is assumed that the multimodal tokens are out-of-vocabulary tokens i.e. the `input_ids` contains tokens >= vocab_size that represent the multimodal tokens.
     Note:
+        Example: input_ids=[1, 55, 2, 101], vocab_size=100, and
+        mm_token_ids=[55] returns mm_token_indices=[1]; token 101 is text
+        because explicit mm_token_ids overrides the OOV fallback.
         This function involves host-device synchronization due to torch.where() (= torch.nonzero) requiring
         host allocation. The output indices reside on the same device as input_ids.
     Returns:
@@ -315,23 +427,15 @@ def filter_mm_token_from_input_ids(
         mm_token_indices: indices of multimodal tokens in the input_ids
     """
     if mm_token_ids is None:
-        # NOTE:
-        # If mm_token_ids is None, it is assumed that the multimodal
-        # tokens are out-of-vocab tokens i.e. the `input_ids` contains
-        # tokens >= vocab_size that represent the multimodal tokens.
-        # Since mm_token_ids can be unbounded in this case,
-        # using torch.isin() may not be performant.
-        # This provides a more performant alternative while keeping
-        # the flexibility of still specifying all possible mm_token_ids,
-        # if the user wants to.
+        # If mm_token_ids is None, assume the multimodal tokens are out-of-vocab
+        # (input_ids >= vocab_size). Avoids torch.isin() over a potentially
+        # unbounded mm_token_ids set.
         mm_token_mask = input_ids >= vocab_size
-        text_token_mask = input_ids < vocab_size
     else:
         mm_token_ids = mm_token_ids.to(input_ids.device, dtype=input_ids.dtype)
         mm_token_mask = torch.isin(input_ids, mm_token_ids)
-        text_token_mask = ~mm_token_mask
     # NOTE: torch.where() enforces a host sync
-    text_token_indices = torch.where(text_token_mask)[0]
+    text_token_indices = torch.where(~mm_token_mask)[0]
     mm_token_indices = torch.where(mm_token_mask)[0]
     return text_token_indices, mm_token_indices
 
@@ -363,6 +467,9 @@ def fuse_input_embeds(
         - If (4) multimodal run, mixed batch of context and generation requests, each context request has a multimodal feature --> return only the fused input_embeds of shape [total length, hidden_dim]. For text tokens, LLM embedding layer has already run.
     Note:
         - Precedence: If kwargs provide indices (text_token_indices and mm_token_indices), those are used. If any one of them is not provided, fallback to filtering method. Sentinel-/OOV-based filtering (e.g., tokens >= vocab_size) is used only when neither index tensor and mm_token_ids is provided.
+        - Example: len(torch.cat(mm_embeds)) must match len(mm_token_indices);
+          for chunked prefill, pass only the current chunk's mm_embeds or
+          explicit indices for the active MM token positions.
         - This function may involve host-device synchronization if indices are not provided and filtering is performed. See filter_mm_token_from_input_ids for details.
     """
     if len(mm_embeds) == 0:
@@ -382,9 +489,7 @@ def fuse_input_embeds(
     if mm_token_indices.shape[0] != mm_embed.shape[0]:
         raise ValueError(
             f"Multimodal token count mismatch: found {len(mm_token_indices)} image tokens in input_ids "
-            f"but received {mm_embed.shape[0]} image embeddings. "
-            "This is likely due to KV cache reuse, chunk prefill, or other optimizations that "
-            "cause token count mismatches within the inference batch.")
+            f"but received {mm_embed.shape[0]} image embeddings.")
 
     text_embed = embedding_layer(input_ids[text_token_indices])
     input_embeds = torch.empty(input_ids.shape[0],
@@ -868,7 +973,7 @@ def multiscale_forward(model,
     num_splits = [math.ceil(size / max_split_size)
                   for size in img_sizes]  # number of splits each scale
     input_multiscale = []
-    for size, num_split in zip(img_sizes, num_splits):
+    for size, num_split in zip(img_sizes, num_splits, strict=True):
         x = F.interpolate(input.to(torch.float32), size=size,
                           mode='bicubic').to(input.dtype)
         x = s2_split_chessboard(x, num_split=num_split)
@@ -895,7 +1000,7 @@ def multiscale_forward(model,
     # merge outputs of different splits for each scale separately
     outs_multiscale = [
         s2_merge_chessboard(out, num_split=num_split)
-        for num_split, out in zip(num_splits, outs_multiscale)
+        for num_split, out in zip(num_splits, outs_multiscale, strict=True)
     ]
 
     # interpolate outputs from different scales and concat together

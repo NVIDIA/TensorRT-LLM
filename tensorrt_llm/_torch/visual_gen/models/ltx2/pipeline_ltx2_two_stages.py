@@ -5,15 +5,19 @@
 import json
 import math
 import time
-from typing import Any, Dict, List, Optional, Union
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import safetensors.torch
 import torch
 
-from tensorrt_llm._torch.visual_gen.output import MediaOutput
+from tensorrt_llm._torch.modules.linear import Linear, UnquantizedLinearMethod
+from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunnerConfig
+from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
 from tensorrt_llm._torch.visual_gen.quantization.ops import quantize_fp8_blockwise, quantize_nvfp4
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
+from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.utils.fp8_utils import (
     align,
@@ -33,14 +37,66 @@ from .ltx2_core.types import (
 )
 from .ltx2_core.upsampler import LatentUpsamplerConfigurator, upsample_video
 from .ltx2_core.video_vae import TilingConfig
-from .pipeline_ltx2 import LTX2Pipeline, _assert_resolution, _find_safetensors_files
+from .pipeline_ltx2 import (
+    LTX2Pipeline,
+    _assert_resolution,
+    _find_safetensors_files,
+    _LTX2CUDAGraphRunner,
+    _prefetch_ltx2_safetensors_files,
+)
 
 STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
+_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+# Baseline BF16 peak memory ~75 GiB, saving BF16 weights snapshot total ~108 GiB.
+_BF16_WEIGHTS_SNAPSHOT_FREE_MEMORY_THRESHOLD_GIB = 115.0
 
 
 # ---------------------------------------------------------------------------
 # LoRA helpers
 # ---------------------------------------------------------------------------
+
+
+def _get_free_gpu_memory_gib(
+    device: Optional[Union[torch.device, str, int]] = None,
+) -> Optional[float]:
+    """Return free memory on the requested CUDA device, or ``None`` if unavailable."""
+    if not torch.cuda.is_available():
+        return None
+
+    try:
+        free_bytes, _ = torch.cuda.mem_get_info(device=device)
+    except (RuntimeError, OSError) as exc:
+        logger.warning(
+            f"Unable to query CUDA free memory for BF16 weight snapshots on device {device}: {exc}"
+        )
+        return None
+
+    return free_bytes / (1024**3)
+
+
+def _should_save_bf16_weights(
+    device: Optional[Union[torch.device, str, int]] = None,
+    preload_free_gib: Optional[float] = None,
+    threshold_gib: float = _BF16_WEIGHTS_SNAPSHOT_FREE_MEMORY_THRESHOLD_GIB,
+) -> bool:
+    free_gib = preload_free_gib
+    source = "pre-load"
+    if free_gib is None:
+        free_gib = _get_free_gpu_memory_gib(device=device)
+        source = "current"
+
+    if free_gib is None:
+        logger.debug("BF16 weight snapshots disabled: CUDA free memory is unavailable")
+        return False
+
+    save_state = free_gib > threshold_gib
+    relation = ">" if save_state else "<="
+    logger.debug(
+        f"BF16 weight snapshots {'enabled' if save_state else 'disabled'} "
+        f"on device {device}: {source} free GPU memory {free_gib:.2f} GiB "
+        f"{relation} {threshold_gib:.2f} GiB threshold"
+    )
+    return save_state
 
 
 def _load_lora_deltas(
@@ -61,6 +117,7 @@ def _load_lora_deltas(
     sft_paths = _find_safetensors_files(lora_path)
     if not sft_paths:
         raise ValueError(f"No safetensors files found at {lora_path}")
+    _prefetch_ltx2_safetensors_files(sft_paths)
 
     raw: Dict[str, torch.Tensor] = {}
     alpha_dict: Dict[str, float] = {}
@@ -331,25 +388,46 @@ def _requantize_fp8_weight(
     return qw, scale
 
 
+def _scale_like(scale: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    return scale.to(device=reference.device, dtype=reference.dtype).reshape(reference.shape)
+
+
 def _apply_lora_deltas(
     module: torch.nn.Module,
     deltas: Dict[str, torch.Tensor],
     sign: float = 1.0,
+    save_bf16_weights: bool = False,
 ) -> tuple:
     """Add (sign=+1) or remove (sign=-1) pre-computed LoRA deltas.
 
-    For standard (BF16/FP16) weights the delta is added directly.
-    For FP8-quantized weights (same shape, float8 dtype) and
-    NVFP4-quantized weights (packed, half the last dim) we
-    dequantize → apply → requantize.
+    For BF16 weights the delta is added directly and later removed either
+    by restoring an optional saved snapshot or by subtracting the same delta.
+    For FP8-quantized weights (same shape, float8 dtype), we
+    dequantize → apply → requantize.  FP4 weights are handled through
+    the packed-FP4 branch because the current static and dynamic NVFP4
+    load paths both store packed FP4 weights by the time LoRA deltas are
+    applied.  For packed FP4, merged weights are kept in BF16 for stage 2
+    inference.  The parent ``Linear`` module's ``quant_method`` is swapped
+    to ``UnquantizedLinearMethod`` so inference runs with plain
+    ``F.linear``.  The quantized original tensors and ``quant_method`` are
+    saved so that ``_restore_lora_state`` can fully restore the original
+    state afterwards.
 
-    Returns ``(applied_count, saved_quant_state)`` where
-    *saved_quant_state* maps parameter names to their original
-    quantized tensors so that un-merging can restore them exactly
-    (avoiding double round-trip loss).
+    Returns ``(applied_count, saved_lora_state, snapshot_required_count)`` where
+    *saved_lora_state* maps each touched snapshotted parameter name to its
+    original tensor.  BF16 weights are snapshotted only when
+    *save_bf16_weights* is true.  This does not change FP8 or FP4 LoRA
+    handling: those paths always snapshot quantized state.  For packed FP4 it
+    also stores the parent
+    ``quant_method`` so that stage 2 can run with BF16 weights and then
+    restore the exact original FP4 state without another quantization round
+    trip.  *snapshot_required_count* is the number of weights that must be
+    restored from saved snapshots.
     """
     applied = 0
-    saved_state: Dict[str, torch.Tensor] = {}
+    snapshot_required = 0
+    saved_state: Dict[str, Any] = {}
+    applied_deltas: Dict[str, torch.Tensor] = {}
     # Build a lookup that maps *clean* parameter names to the actual
     # Parameter objects.  torch.compile wraps each block in an
     # OptimizedModule, inserting ``._orig_mod.`` into the parameter
@@ -360,114 +438,452 @@ def _apply_lora_deltas(
     for raw_name, param in module.named_parameters():
         clean = raw_name.replace("._orig_mod.", ".")
         state[clean] = param
-    _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
-    for name, delta in deltas.items():
-        param_name = name if name in state else f"{name}.weight"
-        if param_name not in state:
-            continue
+    # Always build module path → module mapping for quant_method swapping.
+    module_dict: Dict[str, torch.nn.Module] = {}
+    for raw_name, mod in module.named_modules():
+        clean = raw_name.replace("._orig_mod.", ".")
+        module_dict[clean] = mod
 
-        param = state[param_name]
-        base = param_name.rsplit(".weight", 1)[0]
+    try:
+        for name, delta in deltas.items():
+            param_name = name if name in state else f"{name}.weight"
+            if param_name not in state:
+                continue
 
-        # --- same shape ---------------------------------------------------
-        if param.shape == delta.shape:
-            if param.dtype in _FP8_DTYPES:
-                # FP8: dequant → apply → requant
-                scale_key = f"{base}.weight_scale"
-                if scale_key not in state:
-                    raise RuntimeError(
-                        f"Cannot apply LoRA delta to FP8 param '{param_name}': missing {scale_key}."
+            param = state[param_name]
+            base = param_name.rsplit(".weight", 1)[0]
+
+            # --- same shape ---------------------------------------------------
+            if param.shape == delta.shape:
+                if param.dtype in _FP8_DTYPES:
+                    # FP8: dequant -> apply -> requant
+                    scale_key = f"{base}.weight_scale"
+                    if scale_key not in state:
+                        raise RuntimeError(
+                            f"Cannot apply LoRA delta to FP8 param '{param_name}': missing {scale_key}."
+                        )
+                    ws_param = state[scale_key]
+                    out_f, in_f = delta.shape
+                    is_per_tensor = ws_param.data.numel() == 1
+                    is_packed = not is_per_tensor and _is_fp8_scale_packed(
+                        ws_param.data, out_f, in_f
                     )
+
+                    saved_state[param_name] = param.data.clone()
+                    saved_state[scale_key] = ws_param.data.clone()
+
+                    bf16 = _dequantize_fp8_weight(
+                        param.data,
+                        ws_param.data,
+                        packed=is_packed,
+                    )
+                    bf16.add_(delta.to(bf16.device, bf16.dtype), alpha=sign)
+
+                    qw, new_scale = _requantize_fp8_weight(
+                        bf16,
+                        repack=is_packed,
+                        per_tensor=is_per_tensor,
+                    )
+                    new_scale = _scale_like(new_scale, ws_param.data)
+                    param.data.copy_(qw)
+                    ws_param.data.copy_(new_scale)
+                    snapshot_required += 1
+                else:
+                    if save_bf16_weights and param.dtype == torch.bfloat16:
+                        saved_state[param_name] = param.data.clone()
+                        snapshot_required += 1
+                    # BF16: direct in-place addition, then restore by snapshot
+                    # copy when memory allows or by subtracting the delta.
+                    param.data.add_(
+                        delta.to(param.device, param.dtype),
+                        alpha=sign,
+                    )
+                applied_deltas[name] = delta
+                applied += 1
+
+            # --- packed FP4 (half last dim) -----------------------------------
+            elif (
+                param.ndim == 2
+                and delta.ndim == 2
+                and param.shape[0] == delta.shape[0]
+                and param.shape[1] * 2 == delta.shape[1]
+            ):
+                scale_key = f"{base}.weight_scale"
+                scale2_key = f"{base}.weight_scale_2"
+                if scale_key not in state or scale2_key not in state:
+                    raise RuntimeError(
+                        f"Cannot apply LoRA delta to quantized param "
+                        f"'{param_name}': missing {scale_key} or {scale2_key}."
+                    )
+
                 ws_param = state[scale_key]
-                out_f, in_f = delta.shape
-                is_per_tensor = ws_param.data.numel() == 1
-                is_packed = not is_per_tensor and _is_fp8_scale_packed(ws_param.data, out_f, in_f)
+                ws2_param = state[scale2_key]
+                out_features, in_features = delta.shape
 
                 saved_state[param_name] = param.data.clone()
                 saved_state[scale_key] = ws_param.data.clone()
+                saved_state[scale2_key] = ws2_param.data.clone()
 
-                bf16 = _dequantize_fp8_weight(
+                bf16 = _dequantize_fp4_weight(
                     param.data,
                     ws_param.data,
-                    packed=is_packed,
+                    ws2_param.data,
+                    out_features,
+                    in_features,
                 )
                 bf16.add_(delta.to(bf16.device, bf16.dtype), alpha=sign)
 
-                qw, new_scale = _requantize_fp8_weight(
-                    bf16,
-                    repack=is_packed,
-                    per_tensor=is_per_tensor,
-                )
-                param.data.copy_(qw)
-                ws_param.data.copy_(new_scale)
+                linear_mod = module_dict.get(base)
+                if linear_mod is None or not isinstance(linear_mod, Linear):
+                    raise RuntimeError(
+                        f"Packed FP4 LoRA merge: could not find Linear module at '{base}'."
+                    )
+
+                # Packed FP4: keep the LoRA-merged weight in BF16 for stage 2.
+                # This replaces packed FP4 storage (out, in//2) with BF16 storage
+                # (out, in) and swaps the parent Linear to plain F.linear.
+                param.data = bf16
+                saved_state[f"__quant_method__{base}"] = linear_mod.quant_method
+                linear_mod.quant_method = UnquantizedLinearMethod()
+                snapshot_required += 1
+                applied_deltas[name] = delta
+                applied += 1
             else:
-                # BF16/FP16/FP32 — direct in-place addition
-                saved_state[param_name] = param.data.clone()
-                param.data.add_(
-                    delta.to(param.device, param.dtype),
-                    alpha=sign,
+                logger.warning(
+                    f"Shape mismatch for LoRA param '{param_name}': "
+                    f"param={list(param.shape)}, delta={list(delta.shape)}. "
+                    f"Skipping."
                 )
-            applied += 1
-
-        # --- FP4 packed (half last dim) -----------------------------------
-        elif (
-            param.ndim == 2
-            and delta.ndim == 2
-            and param.shape[0] == delta.shape[0]
-            and param.shape[1] * 2 == delta.shape[1]
-        ):
-            scale_key = f"{base}.weight_scale"
-            scale2_key = f"{base}.weight_scale_2"
-            if scale_key not in state or scale2_key not in state:
-                raise RuntimeError(
-                    f"Cannot apply LoRA delta to quantized param "
-                    f"'{param_name}': missing {scale_key} or {scale2_key}."
-                )
-
-            ws_param = state[scale_key]
-            ws2_param = state[scale2_key]
-            out_features, in_features = delta.shape
-
-            saved_state[param_name] = param.data.clone()
-            saved_state[scale_key] = ws_param.data.clone()
-            saved_state[scale2_key] = ws2_param.data.clone()
-
-            bf16 = _dequantize_fp4_weight(
-                param.data,
-                ws_param.data,
-                ws2_param.data,
-                out_features,
-                in_features,
-            )
-            bf16.add_(delta.to(bf16.device, bf16.dtype), alpha=sign)
-
-            qw, new_scale, new_s2 = _requantize_fp4_weight(bf16)
-            param.data.copy_(qw)
-            ws_param.data.copy_(new_scale)
-            ws2_param.data.fill_(new_s2.item())
-            applied += 1
-        else:
-            logger.warning(
-                f"Shape mismatch for LoRA param '{param_name}': "
-                f"param={list(param.shape)}, delta={list(delta.shape)}. "
-                f"Skipping."
-            )
-    return applied, saved_state
+    except Exception:
+        if saved_state:
+            _restore_lora_state(module, saved_state)
+        if applied_deltas:
+            _subtract_dense_lora_deltas(module, applied_deltas, saved_state)
+        raise
+    return applied, saved_state, snapshot_required
 
 
-def _restore_lora_state(
+def _subtract_dense_lora_deltas(
     module: torch.nn.Module,
-    saved_state: Dict[str, torch.Tensor],
-) -> None:
-    """Restore quantized parameters saved by ``_apply_lora_deltas``."""
+    deltas: Dict[str, torch.Tensor],
+    saved_state: Dict[str, Any],
+) -> int:
+    """Remove LoRA deltas from dense floating-point weights.
+
+    Quantized weights are skipped here because FP8 and FP4 are restored from
+    exact snapshots in ``saved_state``.
+    """
+    restored = 0
     state: Dict[str, torch.nn.Parameter] = {}
     for raw_name, param in module.named_parameters():
         clean = raw_name.replace("._orig_mod.", ".")
         state[clean] = param
+
+    for name, delta in deltas.items():
+        param_name = name if name in state else f"{name}.weight"
+        if param_name not in state or param_name in saved_state:
+            continue
+
+        param = state[param_name]
+        if param.shape != delta.shape or param.dtype in _FP8_DTYPES:
+            continue
+
+        if not param.data.is_floating_point():
+            continue
+
+        param.data.add_(
+            delta.to(param.device, param.dtype),
+            alpha=-1.0,
+        )
+        restored += 1
+
+    return restored
+
+
+def _count_saved_lora_weight_tensors(saved_state: Dict[str, Any]) -> int:
+    """Count LoRA-touched base weights restored from snapshots."""
+    return sum(
+        1
+        for name in saved_state
+        if not name.startswith("__quant_method__")
+        and (name == "weight" or name.endswith(".weight"))
+    )
+
+
+def _restore_lora_state(
+    module: torch.nn.Module,
+    saved_state: Dict[str, Any],
+) -> None:
+    """Restore parameters and quantization state saved by ``_apply_lora_deltas``.
+
+    Handles three cases:
+    - Regular tensors (same shape/dtype): restored via ``.data.copy_()``.
+    - BF16-swapped FP4 weights (shape/dtype changed for stage 2):
+      restored via ``.data =`` assignment to replace the storage.
+    - Saved ``quant_method`` objects (keys starting with
+      ``__quant_method__``): re-assigned to the corresponding Linear module.
+    """
+    state: Dict[str, torch.nn.Parameter] = {}
+    for raw_name, param in module.named_parameters():
+        clean = raw_name.replace("._orig_mod.", ".")
+        state[clean] = param
+
+    module_dict: Dict[str, torch.nn.Module] = {}
+    for raw_name, mod in module.named_modules():
+        clean = raw_name.replace("._orig_mod.", ".")
+        module_dict[clean] = mod
+
     for name, data in saved_state.items():
-        if name in state:
-            state[name].data.copy_(data)
+        if name.startswith("__quant_method__"):
+            mod_path = name[len("__quant_method__") :]
+            mod = module_dict.get(mod_path)
+            if mod is None or not isinstance(mod, Linear):
+                raise RuntimeError(
+                    f"Could not restore quant_method for Linear module '{mod_path}'."
+                )
+            mod.quant_method = data
+        elif name in state:
+            param = state[name]
+            if param.data.shape == data.shape and param.data.dtype == data.dtype:
+                param.data.copy_(data)
+            else:
+                # Shape or dtype changed (e.g. BF16 swap): replace storage.
+                param.data = data
+
+
+@dataclass
+class _PersistentLoRAParamState:
+    param_name: str
+    precision: str
+    weight_param: torch.nn.Parameter
+    original_weight: torch.Tensor
+    merged_weight: torch.Tensor
+    scale_params: Dict[str, torch.nn.Parameter] = field(default_factory=dict)
+    original_scales: Dict[str, torch.Tensor] = field(default_factory=dict)
+    merged_scales: Dict[str, torch.Tensor] = field(default_factory=dict)
+    linear_module: Optional[Linear] = None
+    original_quant_method: Optional[Any] = None
+    merged_quant_method: Optional[Any] = None
+
+
+class _PersistentLoRAWeightCache:
+    """Keep unmerged and merged LoRA-touched weights resident.
+
+    The cache is built when distilled LoRA is loaded and used only for LTX-2
+    Stage 2 distilled LoRA.
+    It removes per-request merge/unmerge math by rebinding parameter storage to
+    precomputed resident tensors.  FP8 and FP4 keep exact original quantized
+    state.  FP4's merged state is BF16 and swaps the parent Linear to
+    UnquantizedLinearMethod, matching the existing per-request Stage 2 path.
+    """
+
+    def __init__(
+        self,
+        entries: List[_PersistentLoRAParamState],
+    ) -> None:
+        self._entries = entries
+        self._bound_state = "original"
+        self.applied_count = len(entries)
+
+    @staticmethod
+    def _module_state(
+        module: torch.nn.Module,
+    ) -> tuple[Dict[str, torch.nn.Parameter], Dict[str, torch.nn.Module]]:
+        state: Dict[str, torch.nn.Parameter] = {}
+        for raw_name, param in module.named_parameters():
+            clean = raw_name.replace("._orig_mod.", ".")
+            state[clean] = param
+
+        module_dict: Dict[str, torch.nn.Module] = {}
+        for raw_name, mod in module.named_modules():
+            clean = raw_name.replace("._orig_mod.", ".")
+            module_dict[clean] = mod
+
+        return state, module_dict
+
+    @classmethod
+    def build(
+        cls,
+        module: torch.nn.Module,
+        deltas: Dict[str, torch.Tensor],
+    ) -> "_PersistentLoRAWeightCache":
+        state, module_dict = cls._module_state(module)
+        entries: List[_PersistentLoRAParamState] = []
+
+        for name, delta in deltas.items():
+            param_name = name if name in state else f"{name}.weight"
+            if param_name not in state:
+                continue
+
+            param = state[param_name]
+            base = param_name.rsplit(".weight", 1)[0]
+
+            if param.shape == delta.shape:
+                if param.dtype in _FP8_DTYPES:
+                    scale_key = f"{base}.weight_scale"
+                    if scale_key not in state:
+                        raise RuntimeError(
+                            f"Cannot build persistent LoRA state for FP8 param "
+                            f"'{param_name}': missing {scale_key}."
+                        )
+
+                    ws_param = state[scale_key]
+                    out_f, in_f = delta.shape
+                    is_per_tensor = ws_param.data.numel() == 1
+                    is_packed = not is_per_tensor and _is_fp8_scale_packed(
+                        ws_param.data, out_f, in_f
+                    )
+
+                    bf16 = _dequantize_fp8_weight(
+                        param.data,
+                        ws_param.data,
+                        packed=is_packed,
+                    )
+                    bf16.add_(delta.to(bf16.device, bf16.dtype))
+                    qw, new_scale = _requantize_fp8_weight(
+                        bf16,
+                        repack=is_packed,
+                        per_tensor=is_per_tensor,
+                    )
+                    new_scale = _scale_like(new_scale, ws_param.data)
+
+                    entries.append(
+                        _PersistentLoRAParamState(
+                            param_name=param_name,
+                            precision="fp8",
+                            weight_param=param,
+                            original_weight=param.data,
+                            merged_weight=qw,
+                            scale_params={scale_key: ws_param},
+                            original_scales={scale_key: ws_param.data},
+                            merged_scales={scale_key: new_scale},
+                        )
+                    )
+                else:
+                    merged = param.data.clone()
+                    merged.add_(delta.to(merged.device, merged.dtype))
+                    precision = "bf16" if param.dtype == torch.bfloat16 else str(param.dtype)
+                    entries.append(
+                        _PersistentLoRAParamState(
+                            param_name=param_name,
+                            precision=precision,
+                            weight_param=param,
+                            original_weight=param.data,
+                            merged_weight=merged,
+                        )
+                    )
+                continue
+
+            if (
+                param.ndim == 2
+                and delta.ndim == 2
+                and param.shape[0] == delta.shape[0]
+                and param.shape[1] * 2 == delta.shape[1]
+            ):
+                scale_key = f"{base}.weight_scale"
+                scale2_key = f"{base}.weight_scale_2"
+                if scale_key not in state or scale2_key not in state:
+                    raise RuntimeError(
+                        f"Cannot build persistent LoRA state for packed FP4 param "
+                        f"'{param_name}': missing {scale_key} or {scale2_key}."
+                    )
+
+                ws_param = state[scale_key]
+                ws2_param = state[scale2_key]
+                out_features, in_features = delta.shape
+
+                bf16 = _dequantize_fp4_weight(
+                    param.data,
+                    ws_param.data,
+                    ws2_param.data,
+                    out_features,
+                    in_features,
+                )
+                bf16.add_(delta.to(bf16.device, bf16.dtype))
+
+                linear_mod = module_dict.get(base)
+                if linear_mod is None or not isinstance(linear_mod, Linear):
+                    raise RuntimeError(
+                        f"Packed FP4 persistent LoRA state: could not find "
+                        f"Linear module at '{base}'."
+                    )
+
+                entries.append(
+                    _PersistentLoRAParamState(
+                        param_name=param_name,
+                        precision="fp4",
+                        weight_param=param,
+                        original_weight=param.data,
+                        merged_weight=bf16,
+                        scale_params={
+                            scale_key: ws_param,
+                            scale2_key: ws2_param,
+                        },
+                        original_scales={
+                            scale_key: ws_param.data,
+                            scale2_key: ws2_param.data,
+                        },
+                        merged_scales={
+                            scale_key: ws_param.data,
+                            scale2_key: ws2_param.data,
+                        },
+                        linear_module=linear_mod,
+                        original_quant_method=linear_mod.quant_method,
+                        merged_quant_method=UnquantizedLinearMethod(),
+                    )
+                )
+                continue
+
+            logger.warning(
+                f"Shape mismatch for persistent LoRA param '{param_name}': "
+                f"param={list(param.shape)}, delta={list(delta.shape)}. "
+                f"Skipping."
+            )
+
+        return cls(entries)
+
+    def bind_original(self) -> None:
+        for entry in self._entries:
+            entry.weight_param.data = entry.original_weight
+            for scale_name, scale_param in entry.scale_params.items():
+                scale_param.data = entry.original_scales[scale_name]
+            if entry.linear_module is not None:
+                entry.linear_module.quant_method = entry.original_quant_method
+        self._bound_state = "original"
+
+    def bind_merged(self) -> None:
+        for entry in self._entries:
+            entry.weight_param.data = entry.merged_weight
+            for scale_name, scale_param in entry.scale_params.items():
+                scale_param.data = entry.merged_scales[scale_name]
+            if entry.linear_module is not None:
+                entry.linear_module.quant_method = entry.merged_quant_method
+        self._bound_state = "merged"
+
+    def precision_counts(self) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for entry in self._entries:
+            counts[entry.precision] = counts.get(entry.precision, 0) + 1
+        return counts
+
+
+class _LTX2TwoStageCUDAGraphRunner(_LTX2CUDAGraphRunner):
+    """CUDA graph runner keyed by LTX-2 two-stage LoRA weight state."""
+
+    def __init__(
+        self,
+        config: CUDAGraphRunnerConfig,
+        lora_state_getter: Callable[[], str],
+    ) -> None:
+        super().__init__(config)
+        self._lora_state_getter = lora_state_getter
+
+    def get_graph_key(self, *args, **kwargs):
+        return (
+            *super().get_graph_key(*args, **kwargs),
+            ("ltx2_two_stage_lora_state", self._lora_state_getter()),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -475,19 +891,67 @@ def _restore_lora_state(
 # ---------------------------------------------------------------------------
 
 
+# Registered without ``hf_ids`` / ``defaults`` on purpose: this class is
+# only reached via ``LTX2Pipeline.resolve_variant()`` swap, never through
+# class-name dispatch from the registry, so its own discovery surface
+# entry would duplicate the canonical ``LTX2Pipeline`` entry above and
+# make ``supported_models()`` / ``pipeline_config()`` ambiguous.
 @register_pipeline("LTX2TwoStagesPipeline")
 class LTX2TwoStagesPipeline(LTX2Pipeline):
-    """Two-stage text-to-video with audio.
+    """Lightricks LTX-Video two-stage text-to-video with audio.
 
     Stage 1: denoise at half spatial resolution with full guidance.
-    Stage 2: learned 2x spatial upsample, refinement denoising
-             (distilled sigma schedule, no guidance, distilled LoRA),
+    Stage 2: learned 2x spatial upsample, refinement denoising with
+             the distilled sigma schedule (no guidance, distilled LoRA),
              then decode.
     """
 
     @property
     def common_warmup_shapes(self) -> list:
         return [(512, 768, 121)]
+
+    def _current_lora_cuda_graph_state(self) -> str:
+        return getattr(self, "_lora_cuda_graph_state", "original")
+
+    def _is_cuda_graph_enabled(self) -> bool:
+        for config_name in ("pipeline_config", "model_config"):
+            config = getattr(self, config_name, None)
+            cuda_graph = getattr(config, "cuda_graph", None)
+            if getattr(cuda_graph, "enable", False):
+                return True
+        return False
+
+    def _assert_cuda_graph_safe_lora_bindings(self) -> None:
+        if not self._is_cuda_graph_enabled():
+            return
+        if not getattr(self, "_distilled_lora_deltas", {}):
+            return
+        if getattr(self, "_distilled_lora_weight_cache", None) is not None:
+            return
+
+        raise RuntimeError(
+            "LTX-2 two-stage CUDA graph requires persistent LoRA weights. "
+            "The non-persistent distilled LoRA path mutates parameter storage "
+            "and quantization state during Stage 2, which is not CUDA-graph safe. "
+            "Disable CUDA graph or ensure the persistent LoRA cache can be built."
+        )
+
+    def _setup_cuda_graphs(self):
+        """Wrap transformer.forward with a LoRA-state-aware CUDA graph key."""
+        if not self.pipeline_config.cuda_graph.enable:
+            return
+
+        runner = _LTX2TwoStageCUDAGraphRunner(
+            CUDAGraphRunnerConfig(use_cuda_graph=True),
+            self._current_lora_cuda_graph_state,
+        )
+        compile_note = " (with torch.compile)" if self.pipeline_config.torch_compile.enable else ""
+        logger.info(
+            "CUDA graph runner: wrapping LTX-2 two-stage transformer.forward "
+            f"with LoRA state key{compile_note}"
+        )
+        self.transformer.forward = runner.wrap(self.transformer.forward)
+        self._cuda_graph_runners["transformer"] = runner
 
     # ------------------------------------------------------------------
     # Component loading
@@ -500,16 +964,19 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         skip_components: Optional[list] = None,
         **kwargs,
     ) -> None:
+        # The BF16 snapshot threshold is a whole-pipeline capacity gate, so
+        # record it before loading model/runtime components that consume HBM.
+        self._bf16_snapshot_preload_free_gib = _get_free_gpu_memory_gib(device=device)
         super().load_standard_components(
             checkpoint_dir,
             device,
-            skip_components,
+            skip_components=skip_components,
             **kwargs,
         )
 
-        dtype = self.model_config.torch_dtype
-        spatial_upsampler_path = self.model_config.extra_attrs.get("spatial_upsampler_path", "")
-        distilled_lora_path = self.model_config.extra_attrs.get("distilled_lora_path", "")
+        dtype = self.pipeline_config.torch_dtype
+        spatial_upsampler_path = self.pipeline_config.extra_attrs.get("spatial_upsampler_path", "")
+        distilled_lora_path = self.pipeline_config.extra_attrs.get("distilled_lora_path", "")
 
         # --- Spatial upsampler ---
         if spatial_upsampler_path:
@@ -517,6 +984,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             sft_paths = _find_safetensors_files(spatial_upsampler_path)
             if not sft_paths:
                 raise ValueError(f"No safetensors files found at {spatial_upsampler_path}")
+            _prefetch_ltx2_safetensors_files(sft_paths)
 
             config: Dict[str, Any] = {}
             try:
@@ -548,6 +1016,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
 
         # --- Distilled LoRA (pre-compute deltas) ---
         self._distilled_lora_deltas: Dict[str, torch.Tensor] = {}
+        self._distilled_lora_weight_cache: Optional[_PersistentLoRAWeightCache] = None
         if distilled_lora_path:
             logger.info(f"Loading distilled LoRA from {distilled_lora_path}...")
             self._distilled_lora_deltas = _load_lora_deltas(
@@ -558,28 +1027,48 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             logger.info(
                 f"Distilled LoRA ready: {len(self._distilled_lora_deltas)} parameter deltas"
             )
+            try:
+                self._distilled_lora_weight_cache = _PersistentLoRAWeightCache.build(
+                    self.transformer,
+                    self._distilled_lora_deltas,
+                )
+            except torch.cuda.OutOfMemoryError as exc:
+                logger.warning(
+                    "Persistent LTX-2 LoRA weights disabled after CUDA OOM "
+                    f"during cache build: {exc}"
+                )
+                torch.cuda.empty_cache()
+                self._distilled_lora_weight_cache = None
+            else:
+                self._distilled_lora_weight_cache.bind_original()
+                logger.info(
+                    "Persistent LTX-2 LoRA weights ready: "
+                    f"{self._distilled_lora_weight_cache.applied_count} params, "
+                    f"precision_counts={self._distilled_lora_weight_cache.precision_counts()}"
+                )
+        self._assert_cuda_graph_safe_lora_bindings()
 
     # ------------------------------------------------------------------
     # Inference entry point
     # ------------------------------------------------------------------
 
     def infer(self, req):
-        extra = req.extra_params or {}
+        extra = req.params.extra_params or {}
         return self.forward(
             prompt=req.prompt,
-            negative_prompt=req.negative_prompt,
-            height=req.height,
-            width=req.width,
-            num_frames=req.num_frames,
-            frame_rate=req.frame_rate,
-            num_inference_steps=req.num_inference_steps,
-            guidance_scale=req.guidance_scale,
-            seed=req.seed,
+            negative_prompt=req.params.negative_prompt,
+            height=req.params.height,
+            width=req.params.width,
+            num_frames=req.params.num_frames,
+            frame_rate=req.params.frame_rate,
+            num_inference_steps=req.params.num_inference_steps,
+            guidance_scale=req.params.guidance_scale,
+            seed=req.params.seed,
             output_type=extra["output_type"],
             guidance_rescale=extra["guidance_rescale"],
-            max_sequence_length=req.max_sequence_length,
-            image=req.image,
-            image_cond_strength=req.image_cond_strength,
+            max_sequence_length=req.params.max_sequence_length,
+            image=req.params.image,
+            image_cond_strength=extra["image_cond_strength"],
             stg_scale=extra["stg_scale"],
             stg_blocks=extra["stg_blocks"],
             modality_scale=extra["modality_scale"],
@@ -596,6 +1085,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
     def forward(
         self,
         prompt: Union[str, List[str]],
+        seed: int,
         negative_prompt: Optional[Union[str, List[str]]] = None,
         height: int = 512,
         width: int = 768,
@@ -604,7 +1094,6 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         num_inference_steps: int = 40,
         guidance_scale: float = 3.0,
         guidance_rescale: float = 0.0,
-        seed: int = 42,
         output_type: str = "pt",
         max_sequence_length: int = 1024,
         image: Optional[Union[str, torch.Tensor]] = None,
@@ -625,6 +1114,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                  → decode.
         """
         # Optional prompt enhancement (applied once and reused for both stages).
+        self._lora_cuda_graph_state = "original"
         if enhance_prompt:
             logger.info("Enhancing prompt with Gemma3 (two-stage)...")
             prompt_text = prompt if isinstance(prompt, str) else prompt[0]
@@ -634,6 +1124,12 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
 
         _assert_resolution(height, width, is_two_stage=True)
         pipeline_start = time.time()
+        # Two-stage timing: stage 1 is reported as ``denoise``; stage 2
+        # (spatial upsample + refinement denoise + decode) folds into
+        # ``post_denoise``. Only the outer timer's numbers reach
+        # ``PipelineOutput``.
+        timer = CudaPhaseTimer()
+        timer.mark_pre_start()
         height_s1 = height // 2
         width_s1 = width // 2
         logger.info(f"LTX2 two-stage: stage1 at {height_s1}x{width_s1}, final {height}x{width}")
@@ -641,6 +1137,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # ================================================================
         # Stage 1: denoise at half resolution
         # ================================================================
+        timer.mark_denoise_start()
         out = super().forward(
             prompt=prompt,
             negative_prompt=negative_prompt,
@@ -667,10 +1164,13 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         video_latents = out.video  # (B, C, F_lat, H_lat_s1, W_lat_s1)
         audio_latents = out.audio  # (B, C, F_aud, M) or None
 
+        timer.mark_post_start()
+
         # Non-primary workers (rank != 0) receive None from
         # decode_latents and exit here.  Rank 0 continues with Stage 2.
         if video_latents is None:
-            return MediaOutput(video=None, audio=None)
+            timer.mark_end()
+            return timer.fill(PipelineOutput(video=None, audio=None, frame_rate=float(frame_rate)))
 
         # ================================================================
         # Spatial upsample: 2x via learned upsampler
@@ -686,17 +1186,43 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # ================================================================
         # Stage 2: refinement denoising with distilled LoRA
         # ================================================================
-        n, saved_quant_state = _apply_lora_deltas(
-            self.transformer,
-            self._distilled_lora_deltas,
-            sign=1.0,
-        )
-        logger.info(f"Merged distilled LoRA ({n} params) for stage 2")
-
-        # Disable Ulysses for Stage 2: only rank 0 is active, so
-        # cross-rank collectives in the attention backend would hang.
-        self.transformer.set_ulysses_enabled(False)
+        # The persistent cache owns original and merged tensors when it can be
+        # built at load time. Stage 2 only rebinds pointers and FP4 quant_method
+        # state, so no per-request clone, merge, or unmerge math is needed.
+        self._assert_cuda_graph_safe_lora_bindings()
+        lora_cache = self._distilled_lora_weight_cache
+        using_persistent_lora = lora_cache is not None
+        saved_lora_state: Dict[str, Any] = {}
+        snapshot_required = 0
+        n = 0
+        dense_lora_merge_completed = False
+        stage2_start = time.time()
         try:
+            if using_persistent_lora:
+                lora_cache.bind_merged()
+                self._lora_cuda_graph_state = "merged"
+                n = lora_cache.applied_count
+                logger.info(f"Bound persistent distilled LoRA ({n} params) for stage 2")
+            else:
+                transformer_device = next(self.transformer.parameters()).device
+                preload_free_gib = getattr(self, "_bf16_snapshot_preload_free_gib", None)
+                save_bf16_weights = _should_save_bf16_weights(
+                    device=transformer_device,
+                    preload_free_gib=preload_free_gib,
+                )
+                n, saved_lora_state, snapshot_required = _apply_lora_deltas(
+                    self.transformer,
+                    self._distilled_lora_deltas,
+                    sign=1.0,
+                    save_bf16_weights=save_bf16_weights,
+                )
+                dense_lora_merge_completed = True
+                self._lora_cuda_graph_state = "merged"
+                logger.info(f"Merged distilled LoRA ({n} params) for stage 2 (BF16 weights)")
+
+            # Disable Ulysses for Stage 2: only rank 0 is active, so
+            # cross-rank collectives in the attention backend would hang.
+            self.transformer.set_ulysses_enabled(False)
             video_latents, audio_latents = self._refinement_denoise(
                 video_latents=video_latents,
                 audio_latents=audio_latents,
@@ -711,18 +1237,42 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 image_cond_strength=image_cond_strength,
             )
         finally:
+            stage2_denoise_time = time.time() - stage2_start
+            logger.info(f"Stage 2 denoising time: {stage2_denoise_time:.2f}s (BF16 weights)")
             self.transformer.set_ulysses_enabled(True)
-            if saved_quant_state:
-                # for FP8 / FP4 stage 2, we restore the original quantized weights by copying them back
-                _restore_lora_state(self.transformer, saved_quant_state)
-            else:
-                # for BF16 stage 2, we restore the original weights by subtracting LoRA deltas
-                _apply_lora_deltas(
+            if using_persistent_lora:
+                lora_cache.bind_original()
+                self._lora_cuda_graph_state = "original"
+                logger.info("Re-bound persistent distilled LoRA original weights after stage 2")
+            elif dense_lora_merge_completed:
+                if snapshot_required and not saved_lora_state:
+                    raise RuntimeError(
+                        "LoRA state was not saved; cannot safely restore stage 2 weights."
+                    )
+
+                snapshot_restored = 0
+                if snapshot_required:
+                    # Restore every LoRA-touched parameter from its snapshot. Packed
+                    # FP4 also restores the original quant_method.
+                    _restore_lora_state(self.transformer, saved_lora_state)
+                    snapshot_restored = _count_saved_lora_weight_tensors(saved_lora_state)
+
+                # BF16 weights that were not snapshotted are restored by
+                # subtracting LoRA deltas. FP8 and FP4 are exact snapshot restores.
+                dense_restored = _subtract_dense_lora_deltas(
                     self.transformer,
                     self._distilled_lora_deltas,
-                    sign=-1.0,
+                    saved_lora_state,
                 )
-            logger.info("Un-merged distilled LoRA after stage 2")
+                restored = snapshot_restored + dense_restored
+                if restored != n:
+                    raise RuntimeError(
+                        f"Restored {restored} LoRA-touched weights after stage 2, but {n} were applied."
+                    )
+                self._lora_cuda_graph_state = "original"
+                logger.info("Un-merged distilled LoRA after stage 2")
+            else:
+                self._lora_cuda_graph_state = "original"
 
         # ================================================================
         # Decode
@@ -730,7 +1280,20 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         if output_type == "latent":
             if self.rank == 0:
                 logger.info(f"Two-stage total time: {time.time() - pipeline_start:.2f}s")
-            return MediaOutput(video=video_latents, audio=audio_latents)
+            timer.mark_end()
+            return timer.fill(
+                PipelineOutput(
+                    video=video_latents,
+                    audio=audio_latents,
+                    frame_rate=float(frame_rate),
+                    audio_sample_rate=(
+                        int(self.audio_sampling_rate)
+                        if getattr(self, "audio_sampling_rate", None) is not None
+                        and audio_latents is not None
+                        else None
+                    ),
+                )
+            )
 
         logger.info("Decoding upsampled video (tiled)...")
         video_latents = video_latents.to(self.dtype)
@@ -752,7 +1315,20 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
 
         if self.rank == 0:
             logger.info(f"Two-stage total time: {time.time() - pipeline_start:.2f}s")
-        return MediaOutput(video=video, audio=audio_out)
+        timer.mark_end()
+        return timer.fill(
+            PipelineOutput(
+                video=video,
+                audio=audio_out,
+                frame_rate=float(frame_rate),
+                audio_sample_rate=(
+                    int(self.audio_sampling_rate)
+                    if getattr(self, "audio_sampling_rate", None) is not None
+                    and audio_out is not None
+                    else None
+                ),
+            )
+        )
 
     # ------------------------------------------------------------------
     # Helpers
@@ -797,16 +1373,10 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         logger.info("Stage 2: refinement denoising...")
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
-        # --- Text conditioning (positive only, no CFG) ---
-        prompt_embeds, prompt_attention_mask = self._encode_prompt(
-            prompt,
-            num_videos_per_prompt=1,
-            max_sequence_length=max_sequence_length,
-        )
-        video_embeds, audio_embeds, connector_mask = self._process_connectors(
-            prompt_embeds,
-            prompt_attention_mask,
-        )
+        # --- Text conditioning: reuse Stage 1 encoder output ---
+        # Gemma3 + Connector outputs depend only on prompt text, not on
+        # resolution or LoRA weights.
+        video_embeds, audio_embeds, connector_mask = self._cached_encoder_output
 
         # --- Shapes at full resolution ---
         pixel_shape = VideoPixelShape(
@@ -908,63 +1478,77 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             a_noise = torch.randn_like(a_working, generator=generator)
             a_working = a_noise * sigma_0 + a_working * (1.0 - sigma_0)
 
+        # --- Pre-compute static preproc (context, PE, KV) for Stage 2 ---
+        _s2_static = self.transformer.prepare_text_cache(
+            video_context=video_embeds,
+            video_context_mask=connector_mask,
+            video_positions=video_positions,
+            audio_context=audio_embeds if a_working is not None else None,
+            audio_context_mask=connector_mask if a_working is not None else None,
+            audio_positions=audio_positions if a_working is not None else None,
+            dtype=self.dtype,
+        )
+
         # --- Euler denoising loop (no guidance) ---
         for i in range(len(sigmas) - 1):
-            sigma = sigmas[i]
-            sigma_next = sigmas[i + 1]
-            dt = sigma_next - sigma
-            timestep = sigma.unsqueeze(0).expand(v_working.shape[0])
+            with nvtx_range(f"refinement_step {i}"):
+                sigma = sigmas[i]
+                sigma_next = sigmas[i + 1]
+                dt = sigma_next - sigma
+                timestep = sigma.unsqueeze(0).expand(v_working.shape[0])
 
-            if denoise_mask is not None:
-                v_timestep = denoise_mask * sigma
-            else:
-                v_timestep = timestep
+                if denoise_mask is not None:
+                    v_timestep = denoise_mask * sigma
+                else:
+                    v_timestep = timestep
 
-            video_mod = Modality(
-                latent=v_working.to(self.dtype),
-                timesteps=v_timestep,
-                positions=video_positions,
-                context=video_embeds,
-                context_mask=connector_mask,
-            )
-
-            audio_mod = None
-            if a_working is not None:
-                audio_mod = Modality(
-                    latent=a_working.to(self.dtype),
-                    timesteps=timestep,
-                    positions=audio_positions,
-                    context=audio_embeds,
+                video_mod = Modality(
+                    latent=v_working.to(self.dtype),
+                    timesteps=v_timestep,
+                    positions=video_positions,
+                    context=video_embeds,
                     context_mask=connector_mask,
                 )
 
-            vel_v, vel_a = self.transformer(
-                video=video_mod,
-                audio=audio_mod,
-            )
+                audio_mod = None
+                if a_working is not None:
+                    audio_mod = Modality(
+                        latent=a_working.to(self.dtype),
+                        timesteps=timestep,
+                        positions=audio_positions,
+                        context=audio_embeds,
+                        context_mask=connector_mask,
+                    )
 
-            # Video: velocity → x0 → post-process → Euler step
-            sigma_v = sigma.float()
-            while sigma_v.dim() < vel_v.dim():
-                sigma_v = sigma_v.unsqueeze(-1)
+                vel_v, vel_a = self.transformer(
+                    video=video_mod,
+                    audio=audio_mod,
+                    text_cache=_s2_static,
+                    step_index=i,
+                )
 
-            denoised_v = v_working.float() - vel_v.float() * sigma_v
+                # Video: velocity → x0 → post-process → Euler step
+                sigma_v = sigma.float()
+                while sigma_v.dim() < vel_v.dim():
+                    sigma_v = sigma_v.unsqueeze(-1)
 
-            if denoise_mask is not None and clean_latent is not None:
-                dm = denoise_mask.unsqueeze(-1)
-                denoised_v = denoised_v * dm + clean_latent.float() * (1.0 - dm)
+                denoised_v = v_working.float() - vel_v.float() * sigma_v
 
-            velocity_v = (v_working.float() - denoised_v) / sigma_v
-            v_working = (v_working.float() + velocity_v * dt).to(v_working.dtype)
+                if denoise_mask is not None and clean_latent is not None:
+                    dm = denoise_mask.unsqueeze(-1)
+                    denoised_v = denoised_v * dm + clean_latent.float() * (1.0 - dm)
 
-            # Audio: velocity → x0 → Euler step
-            if vel_a is not None and a_working is not None:
-                sigma_a = sigma.float()
-                while sigma_a.dim() < vel_a.dim():
-                    sigma_a = sigma_a.unsqueeze(-1)
-                denoised_a = a_working.float() - vel_a.float() * sigma_a
-                velocity_a = (a_working.float() - denoised_a) / sigma_a
-                a_working = (a_working.float() + velocity_a * dt).to(a_working.dtype)
+                velocity_v = (v_working.float() - denoised_v) / sigma_v
+                v_working = (v_working.float() + velocity_v * dt).to(v_working.dtype)
+
+                # Audio: velocity → x0 → Euler step
+                if vel_a is not None and a_working is not None:
+                    sigma_a = sigma.float()
+                    while sigma_a.dim() < vel_a.dim():
+                        sigma_a = sigma_a.unsqueeze(-1)
+                    denoised_a = a_working.float() - vel_a.float() * sigma_a
+                    velocity_a = (a_working.float() - denoised_a) / sigma_a
+                    a_working = (a_working.float() + velocity_a * dt).to(a_working.dtype)
 
         # --- Unpatchify ---
         video_out = self.video_patchifier.unpatchify(v_working, video_shape)

@@ -13,7 +13,24 @@ import os
 import json
 import struct
 
-from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
+from tensorrt_llm._torch.pyexecutor.config_utils import (
+    load_pretrained_config, get_qwen3_hybrid_layer_types)
+
+# Mapping from safetensors dtype strings to bytes per element.
+# Used to compute checkpoint size from per-dtype element counts.
+SAFETENSORS_DTYPE_BYTES = {
+    'F64': 8,
+    'F32': 4,
+    'F16': 2,
+    'BF16': 2,
+    'I64': 8,
+    'I32': 4,
+    'I16': 2,
+    'I8': 1,
+    'U8': 1,
+    'BOOL': 1,
+    'F8_E4M3': 1,
+}
 
 
 def parse_safetensors_file_metadata(model_path, filename):
@@ -113,12 +130,14 @@ def get_safetensors_metadata(model_name_or_path):
 
 
 class ModelConfig(BaseModel):
-    """ Model specific configurations. The parameters are needed in engine
-        setting calculation.
+    """Model specific configurations.
+
+    The parameters are needed in engine setting calculation.
     """
     name: str
     model_type: str
     param_count: int
+    checkpoint_size_in_gb: float = Field(default=0.0)
     num_hidden_layers: int = Field(validation_alias=AliasChoices(
         "num_hidden_layers",
         "n_layer",
@@ -179,17 +198,37 @@ class ModelConfig(BaseModel):
         return self
 
     @classmethod
-    def get_param_count(cls, model_hf_name, hf_model_path):
-        """ Read the parameter count from HF safetensor metadata. """
+    def get_param_count_and_checkpoint_size(cls, model_hf_name, hf_model_path):
+        """Read parameter count and checkpoint size from safetensors metadata.
+
+        Returns:
+            Tuple[int, float]: (param_count, checkpoint_size_in_gb).
+        """
         if model_hf_name == "EleutherAI/gpt-j-6b":  # GPT-J repo doesn't use safetensor format.
             param_count = 6053381344
+            checkpoint_size_in_gb = param_count * 2 / (1024**3)
+        # TODO: Remove this once HF supports DeepSeek-V4
+        elif model_hf_name == "deepseek-ai/DeepSeek-V4":
+            param_count = 284347051735
+            # DeepSeek-V4 ships as an FP8 checkpoint (~1 byte/param).
+            checkpoint_size_in_gb = param_count / (1024**3)
         else:
             model_name_or_path = hf_model_path or model_hf_name
             metadata = get_safetensors_metadata(model_name_or_path)
             param_count = sum(metadata.parameter_count.values())
-        assert param_count, f"Can't get valid parameter count for model: {model_name_or_path}."
+            # Compute actual checkpoint size using per-dtype byte sizes.
+            # This is critical for quantized models (e.g. NVFP4) where
+            # different tensors have different dtypes (U8 for packed weights,
+            # BF16 for non-quantized layers, F8_E4M3 for scales, etc.).
+            checkpoint_size_in_bytes = sum(
+                count * SAFETENSORS_DTYPE_BYTES.get(dtype, 1)
+                for dtype, count in metadata.parameter_count.items())
+            checkpoint_size_in_gb = checkpoint_size_in_bytes / (1024**3)
+        if not param_count:
+            raise ValueError(f"Can't get valid parameter count for model: "
+                             f"{hf_model_path or model_hf_name}.")
 
-        return param_count
+        return param_count, checkpoint_size_in_gb
 
     @classmethod
     def from_hf(cls, model_hf_name, hf_model_path):
@@ -197,9 +236,14 @@ class ModelConfig(BaseModel):
                                                    or model_hf_name,
                                                    trust_remote_code=True)
         hf_config = pretrained_config.to_dict()
-        param_count = cls.get_param_count(model_hf_name, hf_model_path)
+        param_count, checkpoint_size_in_gb = (
+            cls.get_param_count_and_checkpoint_size(model_hf_name,
+                                                    hf_model_path))
 
-        return cls(name=model_hf_name, param_count=param_count, **hf_config)
+        return cls(name=model_hf_name,
+                   param_count=param_count,
+                   checkpoint_size_in_gb=checkpoint_size_in_gb,
+                   **hf_config)
 
     def extra_model_cache_in_gb(self, bytes_per_elem, target_seq_len=None):
         return 0
@@ -209,7 +253,17 @@ class ModelConfig(BaseModel):
 
 
 class NemotronHybridConfig(ModelConfig):
-    hybrid_override_pattern: str
+    hybrid_override_pattern: str = Field(validation_alias=AliasChoices(
+        "hybrid_override_pattern",
+        AliasPath("text_config", "hybrid_override_pattern"),
+        AliasPath("language_config", "hybrid_override_pattern"),
+    ))
+    num_hidden_layers: int = Field(validation_alias=AliasChoices(
+        "num_hidden_layers",
+        "n_layer",
+        AliasPath("text_config", "num_hidden_layers"),
+        AliasPath("language_config", "num_hidden_layers"),
+    ))
     d_state: int = Field(validation_alias=AliasChoices(
         "d_state",
         "mamba_d_state",
@@ -250,6 +304,97 @@ class NemotronHybridConfig(ModelConfig):
 
     def cache_memory_fraction(self, cache_memory_fraction):
         # Each mamba cache entry is pretty large (~50MB for 8B model), so we are more conservative when estimating the max batch size
+        return cache_memory_fraction**2
+
+    def set_mamba_ssm_cache_dtype(self, mamba_ssm_cache_dtype: str):
+        self.mamba_ssm_cache_dtype = mamba_ssm_cache_dtype
+
+    @classmethod
+    def from_hf(cls, model_hf_name, hf_model_path):
+        pretrained_config = load_pretrained_config(hf_model_path
+                                                   or model_hf_name,
+                                                   trust_remote_code=True)
+        hf_config = pretrained_config.to_dict()
+        param_count, checkpoint_size_in_gb = (
+            cls.get_param_count_and_checkpoint_size(model_hf_name,
+                                                    hf_model_path))
+
+        # HuggingFace PretrainedConfig.to_dict() only serializes attributes known to
+        # the base class; custom configs (e.g. NemotronHConfig) have num_hidden_layers
+        # and hybrid_override_pattern on the object but to_dict() omits them. Fill
+        # from the config object (and nested text_config/language_config if present).
+        text_config = getattr(pretrained_config, "text_config", None)
+        language_config = getattr(pretrained_config, "language_config", None)
+        for key in (
+                "num_hidden_layers",
+                "hybrid_override_pattern",
+        ):
+            if hf_config.get(key) is None:
+                value = None
+                if text_config is not None:
+                    value = getattr(text_config, key, None)
+                if value is None and language_config is not None:
+                    value = getattr(language_config, key, None)
+                if value is None:
+                    value = getattr(pretrained_config, key, None)
+                if value is None and key == "num_hidden_layers":
+                    value = getattr(pretrained_config, "n_layer", None)
+                if value is not None:
+                    hf_config[key] = value
+
+        return cls(name=model_hf_name,
+                   param_count=param_count,
+                   checkpoint_size_in_gb=checkpoint_size_in_gb,
+                   **hf_config)
+
+
+class Qwen3HybridConfig(ModelConfig):
+    """Config for Qwen3 hybrid models (full-attention + linear-attention layers).
+
+    Maps Qwen3.5 linear-attention parameters to the same cache estimation
+    formulas used by NemotronHybridConfig.
+    """
+    linear_key_head_dim: int  # d_state
+    linear_conv_kernel_dim: int  # d_conv
+    linear_num_value_heads: int  # num_heads (mamba_num_heads)
+    linear_num_key_heads: int  # n_groups
+    linear_value_head_dim: int  # head_dim (mamba_head_dim)
+    num_linear_attention_layers: Optional[int] = Field(default=None)
+    mamba_ssm_cache_dtype: Optional[str] = Field(default="auto")
+
+    @classmethod
+    def from_hf(cls, model_hf_name, hf_model_path):
+        pretrained_config = load_pretrained_config(hf_model_path
+                                                   or model_hf_name,
+                                                   trust_remote_code=True)
+        hf_config = pretrained_config.to_dict()
+        param_count, checkpoint_size_in_gb = (
+            cls.get_param_count_and_checkpoint_size(model_hf_name,
+                                                    hf_model_path))
+
+        layer_types = get_qwen3_hybrid_layer_types(pretrained_config)
+        hf_config.setdefault("num_attention_layers",
+                             layer_types.count("full_attention"))
+        hf_config.setdefault("num_linear_attention_layers",
+                             layer_types.count("linear_attention"))
+
+        return cls(name=model_hf_name,
+                   param_count=param_count,
+                   checkpoint_size_in_gb=checkpoint_size_in_gb,
+                   **hf_config)
+
+    def extra_model_cache_in_gb(self, bytes_per_elem, target_seq_len=None):
+        d_inner = self.linear_value_head_dim * self.linear_num_value_heads
+        conv_dim = d_inner + 2 * self.linear_num_key_heads * self.linear_key_head_dim
+        conv_state_elems = conv_dim * (self.linear_conv_kernel_dim - 1)
+        ssm_state_elems = (self.linear_num_value_heads *
+                           self.linear_value_head_dim *
+                           self.linear_key_head_dim)
+        gb_per_cache = bytes_per_elem * self.num_linear_attention_layers * (
+            conv_state_elems + ssm_state_elems) / (1024**3)
+        return gb_per_cache
+
+    def cache_memory_fraction(self, cache_memory_fraction):
         return cache_memory_fraction**2
 
     def set_mamba_ssm_cache_dtype(self, mamba_ssm_cache_dtype: str):

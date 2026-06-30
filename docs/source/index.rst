@@ -23,6 +23,7 @@ Welcome to TensorRT LLM's Documentation!
    :name: Deployment Guide
 
    examples/llm_api_examples.rst
+   examples/visual_gen_examples.rst
    examples/trtllm_serve_examples
    examples/dynamo_k8s_example.rst
    deployment-guide/index.rst
@@ -74,10 +75,12 @@ Welcome to TensorRT LLM's Documentation!
    features/quantization.md
    features/sampling.md
    features/additional-outputs.md
+   features/post-processor-hook.md
    features/guided-decoding.md
    features/speculative-decoding.md
    features/checkpoint-loading.md
    features/auto_deploy/auto-deploy.md
+   features/auto_deploy/transforms.rst
    features/ray-orchestrator.md
    features/torch_compile_and_piecewise_cuda_graph.md
    features/helix.md
@@ -96,6 +99,8 @@ Welcome to TensorRT LLM's Documentation!
    developer-guide/dev-containers.md
    developer-guide/api-change.md
    developer-guide/kv-transfer.md
+   developer-guide/telemetry.md
+   developer-guide/sparse-attention-development-guide.md
 
 
 .. toctree::

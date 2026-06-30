@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -208,7 +208,6 @@ def fmin(a: Union[float, cutlass.Float32],
          ip=None) -> cutlass.Float32:
     return cutlass.Float32(
         nvvm.fmin(
-            T.f32(),
             cutlass.Float32(a).ir_value(loc=loc, ip=ip),
             cutlass.Float32(b).ir_value(loc=loc, ip=ip),
             nan=nan,
@@ -233,6 +232,22 @@ def silu_f32(a: Union[float, cutlass.Float32],
     return a * sigmoid_f32(a, fastmath=fastmath)
 
 
+def gelu_tanh_f32(a: Union[float, cutlass.Float32],
+                  fastmath: bool = False) -> Union[float, cutlass.Float32]:
+    """
+    Compute the tanh approximation of GELU (matches F.gelu(approximate="tanh")).
+
+    gelu(a) = 0.5 * a * (1 + tanh(c * (a + 0.044715 * a^3))),  c = sqrt(2/pi)
+            = a * sigmoid(2c * (a + 0.044715 * a^3))
+
+    using the identity tanh(z) = 2 * sigmoid(2z) - 1, so the activation reuses
+    the same exp2-based sigmoid as silu_f32.
+    """
+    c2 = 1.5957691216057308  # 2 * sqrt(2/pi)
+    inner = c2 * (a + 0.044715 * a * a * a)
+    return a * sigmoid_f32(inner, fastmath=fastmath)
+
+
 # TODO(zhichenj): try to move these to NVVM wrapper or helper functions
 @dsl_user_op
 def vectorized_atomic_add_bf16x8(rOut_epi_packed,
@@ -249,6 +264,28 @@ def vectorized_atomic_add_bf16x8(rOut_epi_packed,
             llvm.bitcast(T.i32(), rOut_epi_packed[3, None].load().ir_value()),
         ],
         "red.global.v4.bf16x2.add.noftz [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def vectorized_atomic_add_fp16x8(rOut_epi_packed,
+                                 scatter_out_offset,
+                                 loc=None,
+                                 ip=None):
+    llvm.inline_asm(
+        None,
+        [
+            scatter_out_offset.iterator.llvm_ptr,
+            llvm.bitcast(T.i32(), rOut_epi_packed[0, None].load().ir_value()),
+            llvm.bitcast(T.i32(), rOut_epi_packed[1, None].load().ir_value()),
+            llvm.bitcast(T.i32(), rOut_epi_packed[2, None].load().ir_value()),
+            llvm.bitcast(T.i32(), rOut_epi_packed[3, None].load().ir_value()),
+        ],
+        "red.global.v4.f16x2.add.noftz [$0], {$1, $2, $3, $4};",
         "l,r,r,r,r",
         has_side_effects=True,
         loc=loc,
@@ -299,6 +336,19 @@ def atomic_add_func(rOut_epi_packed, scatter_out_offset, loc=None, ip=None):
                 llvm.bitcast(T.i16(), rOut_epi_packed.ir_value()),
             ],
             "red.add.noftz.bf16 [$0], $1;",
+            "l,h",
+            has_side_effects=True,
+            loc=loc,
+            ip=ip,
+        )
+    elif cutlass.const_expr(rOut_epi_packed.dtype == cutlass.Float16):
+        llvm.inline_asm(
+            None,
+            [
+                scatter_out_offset.iterator.llvm_ptr,
+                llvm.bitcast(T.i16(), rOut_epi_packed.ir_value()),
+            ],
+            "red.add.noftz.f16 [$0], $1;",
             "l,h",
             has_side_effects=True,
             loc=loc,

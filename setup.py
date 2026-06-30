@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,7 +15,6 @@
 import os
 import platform
 from pathlib import Path
-from typing import List
 
 from setuptools import find_packages, setup
 from setuptools.dist import Distribution
@@ -171,6 +170,7 @@ package_data += [
     # Include CUDA source for fused MoE align extension so runtime JIT can find it in wheels
     '_torch/auto_deploy/custom_ops/fused_moe/moe_align_kernel.cu',
     '_torch/auto_deploy/custom_ops/fused_moe/triton_fused_moe_configs/*',
+    '_torch/visual_gen/cute_dsl_kernels/blackwell/attention/cubins/**/*.so',
     'usage/schemas/*.json',
 ]
 
@@ -197,7 +197,19 @@ def download_precompiled(workspace: str, version: str) -> str:
         return wheel_path
 
 
-def extract_from_precompiled(precompiled_location: str, package_data: List[str],
+def should_skip_precompiled_package_data(filename: str) -> bool:
+    """Return True for source-owned package data kept from local checkout.
+
+    Precompiled wheels own native bits. Source owns telemetry schema JSON.
+    Skip those wheel files so Python-only schema edits layer over old wheels.
+    """
+    filename = filename.replace("\\", "/")
+    source_owned_package_data_prefixes = ("tensorrt_llm/usage/schemas/", )
+    return filename.endswith(".json") and filename.startswith(
+        source_owned_package_data_prefixes)
+
+
+def extract_from_precompiled(precompiled_location: str, package_data: list[str],
                              workspace: str) -> None:
     """Extract package data (binaries and other materials) from a precompiled wheel or local directory to the working directory.
     This allows skipping the compilation, and repackaging the binaries and Python files in the working directory to a new wheel.
@@ -237,6 +249,11 @@ def extract_from_precompiled(precompiled_location: str, package_data: List[str],
 
                 # Skip yaml files
                 if dst_file.endswith(".yaml"):
+                    continue
+
+                # Keep source-owned package data local so Python-only schema edits
+                # layer over precompiled wheels.
+                if should_skip_precompiled_package_data(dst_file):
                     continue
 
                 # Skip .py files EXCEPT for generated C++ extension wrappers
@@ -299,6 +316,11 @@ def extract_from_precompiled(precompiled_location: str, package_data: List[str],
         for file in wheel.filelist:
             # Skip yaml files
             if file.filename.endswith(".yaml"):
+                continue
+
+            # Keep source-owned package data local so Python-only schema edits
+            # layer over precompiled wheels.
+            if should_skip_precompiled_package_data(file.filename):
                 continue
 
             # Skip .py files EXCEPT for generated C++ extension wrappers
@@ -427,6 +449,10 @@ setup(
     scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],
     extras_require={
         "devel": devel_deps,
+        # MX remains prototype-only and is intentionally not declared as an
+        # optional package extra until its external dependency completes OSS
+        # allowlist onboarding. Keep install instructions in docs/PR text
+        # rather than packaging metadata.
     },
     zip_safe=True,
     install_requires=required_deps,

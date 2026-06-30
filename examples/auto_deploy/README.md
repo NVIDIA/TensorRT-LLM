@@ -1,6 +1,8 @@
 # 🔥🚀⚡ AutoDeploy Examples
 
-This folder contains runnable examples for **AutoDeploy**. For general AutoDeploy documentation, motivation, support matrix, and feature overview, please see the [official docs](https://nvidia.github.io/TensorRT-LLM/features/auto_deploy/auto-deploy.html).
+This folder contains runnable examples for **AutoDeploy** as it ships inside [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM). For general AutoDeploy documentation, motivation, support matrix, and feature overview, please see the [official docs](https://nvidia.github.io/TensorRT-LLM/features/auto_deploy/auto-deploy.html).
+
+> Looking for the lightweight standalone package (no TRT-LLM required)? See **LLM Compiler** at [github.com/NVIDIA/llm-compiler](https://github.com/NVIDIA/llm-compiler). That repo is generated from this source tree by [`llmc/create_standalone_package.py`](./llmc/create_standalone_package.py).
 
 ______________________________________________________________________
 
@@ -12,7 +14,7 @@ AutoDeploy is included with the TRT-LLM installation.
 sudo apt-get -y install libopenmpi-dev && pip3 install --upgrade pip setuptools && pip3 install tensorrt_llm
 ```
 
-You can refer to [TRT-LLM installation guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/installation/linux.md) for more information.
+You can refer to the [TRT-LLM installation guide](../../docs/source/installation/installation-guide.md) for more information.
 
 Run a simple example with a Hugging Face model:
 
@@ -25,7 +27,7 @@ ______________________________________________________________________
 
 ## Example Run Script ([`build_and_run_ad.py`](./build_and_run_ad.py))
 
-This script demonstrates end-to-end deployment of HuggingFace checkpoints using AutoDeploy’s graph-transformation pipeline.
+This script demonstrates end-to-end deployment of HuggingFace checkpoints using AutoDeploy's graph-transformation pipeline.
 
 You can configure your experiment with various options. Use the `-h/--help` flag to see available options:
 
@@ -38,6 +40,8 @@ Below is a non-exhaustive list of common configuration options:
 | Configuration Key | Description |
 |-------------------|-------------|
 | `--model` | The HF model card or path to a HF checkpoint folder |
+| `--use-registry` | Auto-populate `args.yaml_extra` from `model_registry/models.yaml` for the chosen model |
+| `--registry-config-id` | Select a specific registry `config_id` when a model has multiple registry entries |
 | `--args.model-factory` | Choose model factory implementation (`"AutoModelForCausalLM"`, ...) |
 | `--args.skip-loading-weights` | Only load the architecture, not the weights |
 | `--args.model-kwargs` | Extra kwargs that are being passed to the model initializer in the model factory |
@@ -65,6 +69,17 @@ python build_and_run_ad.py \
 --args.compile-backend "torch-compile" \
 --args.attn-backend "flashinfer" \
 --benchmark.enabled True
+
+# Pull yaml_extra directly from model_registry/models.yaml
+python build_and_run_ad.py \
+--model "meta-llama/Llama-3.1-8B-Instruct" \
+--use-registry
+
+# Select a specific config_id when the model has multiple registry entries
+python build_and_run_ad.py \
+--model "meta-llama/Llama-3.1-8B-Instruct" \
+--use-registry \
+--registry-config-id default_ws_2
 ```
 
 ### Advanced Configuration
@@ -109,32 +124,24 @@ python build_and_run_ad.py --model "<MODELOPT_CKPT_PATH>" --args.world-size 1
 
 ### Incorporating `auto_deploy` into your own workflow
 
-AutoDeploy can be seamlessly integrated into your existing workflows using TRT-LLM's LLM high-level API. This section provides a blueprint for configuring and invoking AutoDeploy within your custom applications.
+AutoDeploy can be integrated into your existing workflows. When using TRT-LLM, use the LLM high-level API:
 
-Here is an example of how you can build an LLM object with AutoDeploy integration:
-
-```
+```python
+# With TensorRT-LLM
 from tensorrt_llm._torch.auto_deploy import LLM
 
-
-# Construct the LLM high-level interface object with autodeploy as backend
 llm = LLM(
     model=<HF_MODEL_CARD_OR_DIR>,
     world_size=<DESIRED_WORLD_SIZE>,
     compile_backend="torch-compile",
-    model_kwargs={"num_hidden_layers": 2}, # test with smaller model configuration
-    attn_backend="flashinfer", # choose between "triton", "trtllm" and "flashinfer"
+    model_kwargs={"num_hidden_layers": 2},
+    attn_backend="flashinfer",
     skip_loading_weights=False,
-    model_factory="AutoModelForCausalLM", # choose appropriate model factory
+    model_factory="AutoModelForCausalLM",
     max_seq_len=<MAX_SEQ_LEN>,
     max_batch_size=<MAX_BATCH_SIZE>,
 )
-
 ```
-
-Please consult the [AutoDeploy `LLM` API](../../tensorrt_llm/_torch/auto_deploy/llm.py) and the
-[`AutoDeployConfig` class](../../tensorrt_llm/_torch/auto_deploy/llm_args.py)
-for more detail on how AutoDeploy is configured via the `**kwargs` of the `LLM` API.
 
 ### Expert Configuration of LLM API
 
@@ -216,8 +223,8 @@ args:
   max_seq_len: 2048
   max_batch_size: 16
   transforms:
-    detect_sharding:
-      support_partial_config: true
+    apply_sharding_hints:
+      allreduce_strategy: SYMM_MEM
     insert_cached_attention:
       backend: triton
     compile_model:

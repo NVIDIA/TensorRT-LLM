@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -84,9 +84,11 @@ class LlmRequest;
 class RuntimeBuffers;
 class BasePeftCacheManager;
 class GuidedDecoder;
+class TrtGptModelTest;
 
 // Algorithms
 class CapacityScheduler;
+class DisaggTransferAdmissionController;
 class MicroBatchScheduler;
 class PauseRequests;
 class AssignReqSeqSlots;
@@ -235,7 +237,11 @@ public:
         return mModelConfig.getSpeculativeDecodingMode();
     }
 
+    [[nodiscard]] SizeType32 numCachedCudaGraphs() const;
+
 private:
+    friend class TrtGptModelTest;
+
     [[nodiscard]] SizeType32 getContextBufferId() const
     {
         return mMicroBatchId;
@@ -595,6 +601,7 @@ private:
 
     /******************** Cache transceiver ********************/
     std::unique_ptr<BaseCacheTransceiver> mCacheTransceiver;
+    std::unique_ptr<DisaggTransferAdmissionController> mDisaggTransferAdmissionController;
 
     /******************** Spec dec ***********************/
     std::unique_ptr<std::thread> mDraftModelSendLogitsThread;
@@ -602,7 +609,12 @@ private:
     std::atomic<bool> mDraftModelThreadShouldExit{false};
     bool mIsLeaderInOrchMode{false};
     // List of completed draft requests which logits will need to be sent to the target model.
+    // Guarded by mDraftRequestsMtx (shared with the background logits sender thread).
     RequestVector mDraftRequestsWaitingToSendLogits;
+    // Draft requests whose logits have been sent — pending termination by main thread.
+    // Guarded by mDraftRequestsMtx.
+    RequestVector mDraftRequestsDoneSendingLogits;
+    std::mutex mDraftRequestsMtx;
     SizeType32 mSeamlessLADMaxDraftLen{0};
     bool mUseSeamlessLookahead{false};
     RewindInputs mRewindInputs;

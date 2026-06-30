@@ -17,14 +17,30 @@ l0_a100:
     - unittest/llmapi/test_llm_pytorch.py -m "part1"
     - unittest/llmapi/test_llm_pytorch.py -m "part2"
     - unittest/llmapi/test_llm_pytorch.py -m "part3"
+    - unittest/llmapi/test_llm_encode.py
+    - unittest/llmapi/test_llm_encode_multi_item.py
     - unittest/llmapi/test_mpi_session.py ISOLATION
     - unittest/llmapi/test_memory_profiling.py::test_profile_kvcache # profile kvcache for vision encoder
     - unittest/llmapi/test_memory_profiling.py::test_pyexecutor_and_kvcache_share_execution_stream # test that PyExecutor and KVCacheManager share the same execution_stream
-    - unittest/trt/model_api/test_model_quantization.py
     # executor
     - unittest/executor/test_base_worker.py ISOLATION
     - unittest/executor/test_rpc_proxy.py
     - unittest/executor/test_rpc_worker.py
+    # llm.encode() accuracy
+    - accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encoder_encode_matches_huggingface_classification[bert-yelp-eager]
+    - accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encoder_encode_matches_huggingface_classification[bert-yelp-cuda_graph]
+    - accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encoder_encode_cuda_graph_matches_eager_logits[bert-yelp]
+    - accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encoder_encode_matches_huggingface_per_token_reward[qwen2.5-prm-7b]
+    - accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_matches_huggingface[tinyllama-1.1b]
+    - accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_matches_huggingface[gemma-3-1b]
+    - accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_matches_huggingface[phi-4-mini]
+    - accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_matches_huggingface[qwen2-7b]
+    - accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_matches_huggingface[qwen3-0.6b]
+    - accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_matches_huggingface[starcoder2-3b]
+    - accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_cuda_graph_matches_eager_logits[tinyllama-1.1b]
+    # Moved from l0_a10.yml: Llama-7B + KV cache + spec resources OOM on A10's 22 GB.
+    - test_e2e.py::test_openai_lora
+    - test_e2e.py::test_trtllm_serve_lora_example
 - condition:
     ranges:
       system_gpu_count:
@@ -58,13 +74,14 @@ l0_a100:
       stage: post_merge
       backend: tensorrt
   tests:
-  - unittest/trt/model_api/test_model_level_api.py
   - unittest/trt/model_api/test_model_api_multi_gpu.py
   - unittest/trt/model/test_gpt_e2e.py
   - unittest/trt/model/eagle
   - unittest/llmapi/test_llm_models.py -m "part0"
   - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_cpp_runtime]
   - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime]
+  - examples/test_whisper.py::test_whisper_beam_search_generation_logits[large-v3-nb:4]
+  - examples/test_whisper.py::test_whisper_log_probs_determinism[large-v3-bs:4-nb:4]
 - condition:
     ranges:
       system_gpu_count:
@@ -78,4 +95,4 @@ l0_a100:
       stage: post_merge
       backend: fmha
   tests:
-  - test_fmha.py::test_fmha TIMEOUT (120) # Longer timeout for A100 as it builds all the architectures
+  - test_fmha.py::test_fmha TIMEOUT (180) # Longer timeout for A100 as it builds all the architectures

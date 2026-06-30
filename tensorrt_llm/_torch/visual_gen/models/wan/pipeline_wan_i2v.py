@@ -15,14 +15,14 @@ from tensorrt_llm._torch.visual_gen.cache.teacache import (
     ExtractorConfig,
     register_extractor_from_config,
 )
-from tensorrt_llm._torch.visual_gen.config import PipelineComponent
 from tensorrt_llm._torch.visual_gen.models.wan.defaults import (
     get_wan_default_params,
     get_wan_extra_param_specs,
 )
-from tensorrt_llm._torch.visual_gen.output import MediaOutput
+from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_utils import retrieve_latents
+from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
-from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
+from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm.logger import logger
 
@@ -78,41 +78,25 @@ WAN_DEFAULT_NEGATIVE_PROMPT = (
 )
 
 
-def retrieve_latents(
-    encoder_output: torch.Tensor,
-    generator: Optional[torch.Generator] = None,
-    sample_mode: str = "argmax",
-):
-    """Extract latents from VAE encoder output.
-
-    For I2V, we use argmax mode to get deterministic encoding of the input image.
-    """
-    if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
-        return encoder_output.latent_dist.sample(generator)
-    elif hasattr(encoder_output, "latent_dist") and sample_mode == "argmax":
-        return encoder_output.latent_dist.mode()
-    elif hasattr(encoder_output, "latents"):
-        return encoder_output.latents
-    else:
-        raise AttributeError("Could not access latents of provided encoder_output")
-
-
-@register_pipeline("WanImageToVideoPipeline")
+@register_pipeline(
+    "WanImageToVideoPipeline",
+    hf_ids=[
+        "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+        "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
+        "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+    ],
+    doc="Wan 2.1 & 2.2 image-to-video family.",
+)
 class WanImageToVideoPipeline(BasePipeline):
-    def __init__(self, model_config):
+    def __init__(self, pipeline_config):
         # Wan2.2 14B two-stage denoising parameters
         self.transformer_2 = None
-        self.boundary_ratio = getattr(model_config.pretrained_config, "boundary_ratio", None)
-        self.is_wan22 = self.boundary_ratio is not None
+        self.boundary_ratio = getattr(
+            pipeline_config.primary_pretrained_config, "boundary_ratio", None
+        )
+        self.is_wan22_14b = self.boundary_ratio is not None
 
-        # Validate TeaCache compatibility before allocating GPU memory
-        if self.is_wan22 and model_config.cache_backend == "teacache":
-            raise ValueError(
-                "TeaCache is not supported for Wan 2.2 models. "
-                "Use cache_backend='none' or 'cache_dit' (not 'teacache')."
-            )
-
-        super().__init__(model_config)
+        super().__init__(pipeline_config)
 
     def _compute_wan_timestep_embedding(self, module, timestep=None, **kwargs):
         """Compute timestep embedding for Wan I2V transformer.
@@ -121,7 +105,10 @@ class WanImageToVideoPipeline(BasePipeline):
         calibration), or temb when use_ret_steps=False (standard mode).
         """
         ce = module.condition_embedder
-        t_freq = ce.timesteps_proj(timestep)
+        # The forward path receives normalized timesteps. TeaCache coefficients
+        # were calibrated against WAN's raw scheduler timestep scale.
+        timestep_for_embedding = timestep * self.scheduler.config.num_train_timesteps
+        t_freq = ce.timesteps_proj(timestep_for_embedding)
 
         # Cast to embedder's dtype (avoid int8 quantized layers)
         te_dtype = next(iter(ce.time_embedder.parameters())).dtype
@@ -130,7 +117,7 @@ class WanImageToVideoPipeline(BasePipeline):
 
         t_emb = ce.time_embedder(t_freq)
 
-        teacache = self.model_config.teacache
+        teacache = self.pipeline_config.teacache
         if teacache is not None and teacache.use_ret_steps:
             # ret_steps mode: use timestep_proj — what the ret_steps coefficients were calibrated for
             return ce.time_proj(ce.act_fn(t_emb)).to(torch.float32)
@@ -139,7 +126,7 @@ class WanImageToVideoPipeline(BasePipeline):
 
     @property
     def dtype(self):
-        return self.model_config.torch_dtype
+        return self.pipeline_config.torch_dtype
 
     @property
     def device(self):
@@ -161,7 +148,7 @@ class WanImageToVideoPipeline(BasePipeline):
 
     @property
     def default_warmup_steps(self):
-        return 4 if self.is_wan22 else 2
+        return 4 if self.is_wan22_14b else 2
 
     @property
     def resolution_multiple_of(self):
@@ -177,12 +164,16 @@ class WanImageToVideoPipeline(BasePipeline):
 
     def _init_transformer(self) -> None:
         logger.info("Creating WAN I2V transformer with quantization support...")
-        self.transformer = WanTransformer3DModel(model_config=self.model_config)
+        self.transformer = WanTransformer3DModel(
+            model_config=self.pipeline_config.model_configs["transformer"]
+        )
 
         # Wan2.2: Optionally create second transformer for two-stage denoising
         if self.boundary_ratio is not None:
             logger.info("Creating second transformer for Wan2.2 I2V two-stage denoising...")
-            self.transformer_2 = WanTransformer3DModel(model_config=self.model_config)
+            self.transformer_2 = WanTransformer3DModel(
+                model_config=self.pipeline_config.model_configs["transformer_2"]
+            )
 
     def load_standard_components(
         self,
@@ -213,7 +204,6 @@ class WanImageToVideoPipeline(BasePipeline):
                 )
                 logger.info(f"transformer_2 in model_index.json: {has_transformer_2}")
 
-        # Set default VAE scale factors (will be overridden if VAE is loaded)
         self.vae_scale_factor_temporal = 4
         self.vae_scale_factor_spatial = 8
 
@@ -229,7 +219,7 @@ class WanImageToVideoPipeline(BasePipeline):
             self.text_encoder = UMT5EncoderModel.from_pretrained(
                 checkpoint_dir,
                 subfolder=PipelineComponent.TEXT_ENCODER,
-                torch_dtype=self.model_config.torch_dtype,
+                torch_dtype=self.pipeline_config.torch_dtype,
             ).to(device)
 
         if PipelineComponent.VAE not in skip_components:
@@ -268,25 +258,24 @@ class WanImageToVideoPipeline(BasePipeline):
 
         # Load image encoder and processor (only for Wan 2.1)
         # Wan 2.2: Has both transformer_2 and boundary_ratio (two-stage denoising)
-        if self.is_wan22:
+        if self.is_wan22_14b:
             logger.info("Detected Wan 2.2 I2V (two-stage, no CLIP)")
         else:
             logger.info("Detected Wan 2.1 I2V (single-stage, uses CLIP)")
+            if PipelineComponent.IMAGE_ENCODER not in skip_components:
+                logger.info("Loading CLIP image encoder for I2V conditioning (Wan 2.1 only)...")
+                self.image_encoder = CLIPVisionModel.from_pretrained(
+                    checkpoint_dir,
+                    subfolder=PipelineComponent.IMAGE_ENCODER,
+                    torch_dtype=torch.float32,  # Keep CLIP in FP32 for stability
+                ).to(device)
 
-        if PipelineComponent.IMAGE_ENCODER not in skip_components and not self.is_wan22:
-            logger.info("Loading CLIP image encoder for I2V conditioning (Wan 2.1 only)...")
-            self.image_encoder = CLIPVisionModel.from_pretrained(
-                checkpoint_dir,
-                subfolder=PipelineComponent.IMAGE_ENCODER,
-                torch_dtype=torch.float32,  # Keep CLIP in FP32 for stability
-            ).to(device)
-
-        if PipelineComponent.IMAGE_PROCESSOR not in skip_components and not self.is_wan22:
-            logger.info("Loading CLIP image processor...")
-            self.image_processor = CLIPImageProcessor.from_pretrained(
-                checkpoint_dir,
-                subfolder=PipelineComponent.IMAGE_PROCESSOR,
-            )
+            if PipelineComponent.IMAGE_PROCESSOR not in skip_components:
+                logger.info("Loading CLIP image processor...")
+                self.image_processor = CLIPImageProcessor.from_pretrained(
+                    checkpoint_dir,
+                    subfolder=PipelineComponent.IMAGE_PROCESSOR,
+                )
 
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
 
@@ -319,7 +308,7 @@ class WanImageToVideoPipeline(BasePipeline):
             logger.info("Transformer_2 weights loaded successfully.")
 
         # Cache the target dtype from model config (default: bfloat16)
-        self._target_dtype = self.model_config.torch_dtype
+        self._target_dtype = self.pipeline_config.torch_dtype
 
         # Set model to eval mode
         if self.transformer is not None:
@@ -332,7 +321,7 @@ class WanImageToVideoPipeline(BasePipeline):
     def post_load_weights(self) -> None:
         super().post_load_weights()  # Calls transformer.post_load_weights() for FP8 scale transformations
         if self.transformer is not None:
-            if self.model_config.cache_backend == "teacache":
+            if self.pipeline_config.cache_backend == "teacache":
                 register_extractor_from_config(
                     ExtractorConfig(
                         model_class_name="WanTransformer3DModel",
@@ -341,19 +330,30 @@ class WanImageToVideoPipeline(BasePipeline):
                     )
                 )
 
-            if not self.is_wan22:
-                self._setup_cache_acceleration(
-                    self.transformer, coefficients=WAN_I2V_TEACACHE_COEFFICIENTS
-                )
-                self.transformer_cache_backend = self.cache_accelerator
+            if not self.is_wan22_14b:
+                self._apply_teacache_coefficients(WAN_I2V_TEACACHE_COEFFICIENTS)
+                self._setup_cache_acceleration()
             else:
-                if self.model_config.cache_backend == "cache_dit":
-                    self._setup_cache_acceleration(self.transformer, coefficients=None)
-                self.transformer_cache_backend = self.cache_accelerator
+                if self.pipeline_config.cache_backend == "cache_dit":
+                    self._setup_cache_acceleration()
 
         if self.transformer_2 is not None:
             if hasattr(self.transformer_2, "post_load_weights"):
                 self.transformer_2.post_load_weights()
+
+        if (
+            self.transformer is not None
+            and self.transformer_2 is not None
+            and self.pipeline_config.cache_backend == "teacache"
+        ):
+            tc = self.pipeline_config.teacache
+            if tc.coefficients is None or tc.coefficients_2 is None:
+                raise ValueError(
+                    "Wan 2.2 TeaCache requires explicit teacache.coefficients and "
+                    "teacache.coefficients_2 (high-noise and low-noise stage polynomials). "
+                    "There is no built-in coefficient table for Wan 2.2."
+                )
+            self._setup_cache_acceleration()
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         dummy_image = PIL.Image.new("RGB", (width, height))
@@ -374,15 +374,14 @@ class WanImageToVideoPipeline(BasePipeline):
     @property
     def default_generation_params(self):
         return get_wan_default_params(
-            is_wan22=self.is_wan22,
+            is_wan22_14b=self.is_wan22_14b,
             name_or_path=getattr(self.config, "_name_or_path", ""),
             num_heads=getattr(self.config, "num_attention_heads", 40),
-            include_i2v=True,
         )
 
     @property
     def extra_param_specs(self):
-        specs = get_wan_extra_param_specs(self.is_wan22)
+        specs = get_wan_extra_param_specs(self.is_wan22_14b)
         specs["last_image"] = ExtraParamSchema(
             type="str",
             default=None,
@@ -393,11 +392,11 @@ class WanImageToVideoPipeline(BasePipeline):
     def infer(self, req):
         """Run inference with request parameters."""
         # Extract image from request (can be path, PIL Image, or torch.Tensor)
-        if req.image is None:
+        if req.params.image is None:
             raise ValueError("I2V pipeline requires 'image' parameter")
 
-        image = req.image[0] if isinstance(req.image, list) else req.image
-        extra = req.extra_params or {}
+        image = req.params.image[0] if isinstance(req.params.image, list) else req.params.image
+        extra = req.params.extra_params or {}
         last_image = extra.get("last_image")
 
         if last_image is not None and isinstance(last_image, list):
@@ -406,16 +405,16 @@ class WanImageToVideoPipeline(BasePipeline):
         return self.forward(
             image=image,
             prompt=req.prompt,
-            negative_prompt=req.negative_prompt,
-            height=req.height,
-            width=req.width,
-            num_frames=req.num_frames,
-            num_inference_steps=req.num_inference_steps,
-            guidance_scale=req.guidance_scale,
+            negative_prompt=req.params.negative_prompt,
+            height=req.params.height,
+            width=req.params.width,
+            num_frames=req.params.num_frames,
+            num_inference_steps=req.params.num_inference_steps,
+            guidance_scale=req.params.guidance_scale,
             guidance_scale_2=extra.get("guidance_scale_2"),
             boundary_ratio=extra.get("boundary_ratio"),
-            seed=req.seed,
-            max_sequence_length=req.max_sequence_length,
+            seed=req.params.seed,
+            max_sequence_length=req.params.max_sequence_length,
             last_image=last_image,
         )
 
@@ -424,6 +423,7 @@ class WanImageToVideoPipeline(BasePipeline):
         self,
         image: Union[PIL.Image.Image, torch.Tensor, str],
         prompt: Union[str, List[str]],
+        seed: int,
         negative_prompt: Optional[str] = None,
         height: int = 480,
         width: int = 832,
@@ -432,11 +432,12 @@ class WanImageToVideoPipeline(BasePipeline):
         guidance_scale: Optional[float] = None,
         guidance_scale_2: Optional[float] = None,
         boundary_ratio: Optional[float] = None,
-        seed: int = 42,
         max_sequence_length: int = 512,
         last_image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
     ):
         pipeline_start = time.time()
+        timer = CudaPhaseTimer()
+        timer.mark_pre_start()
 
         # Validate image input — only single image is supported for batch generation
         if not isinstance(image, (PIL.Image.Image, torch.Tensor, str)):
@@ -472,14 +473,14 @@ class WanImageToVideoPipeline(BasePipeline):
         if negative_prompt is None:
             negative_prompt = WAN_DEFAULT_NEGATIVE_PROMPT
 
-        # Set model-specific defaults based on Wan version
+        # Set model-specific defaults if not provided
+        defaults = self.default_generation_params
         if num_inference_steps is None:
-            num_inference_steps = 40 if self.is_wan22 else 50
-
+            num_inference_steps = defaults["num_inference_steps"]
         if guidance_scale is None:
-            guidance_scale = 4.0 if self.is_wan22 else 5.0
+            guidance_scale = defaults["guidance_scale"]
 
-        if self.is_wan22 and guidance_scale_2 is None:
+        if self.is_wan22_14b and guidance_scale_2 is None:
             guidance_scale_2 = guidance_scale  # Match HF: default to guidance_scale when unset
 
         # Validate two-stage denoising configuration
@@ -516,13 +517,13 @@ class WanImageToVideoPipeline(BasePipeline):
         image_encode_start = time.time()
 
         # Determine model version
-        model_version = "Wan 2.2" if self.is_wan22 else "Wan 2.1"
+        model_version = "Wan 2.2" if self.is_wan22_14b else "Wan 2.1"
         logger.info(
             f"Running {model_version} I2V inference "
             f"(boundary_ratio={boundary_ratio}, has_transformer_2={self.transformer_2 is not None})"
         )
 
-        if not self.is_wan22:
+        if not self.is_wan22_14b:
             # Wan 2.1 I2V: Compute CLIP image embeddings
             image_embeds = self._encode_image(image, last_image)
             image_embeds = image_embeds.to(self.dtype)
@@ -556,7 +557,12 @@ class WanImageToVideoPipeline(BasePipeline):
         last_model_used = [None]
 
         def forward_fn(
-            latents_input, extra_stream_latents, timestep, encoder_hidden_states, extra_tensors
+            latents_input,
+            extra_stream_latents,
+            step_index,
+            timestep,
+            encoder_hidden_states,
+            extra_tensors,
         ):
             """Forward function for WAN I2V transformer with two-stage support.
 
@@ -608,12 +614,13 @@ class WanImageToVideoPipeline(BasePipeline):
 
             return current_model(
                 hidden_states=latent_model_input,
-                timestep=timestep_input,
+                timestep=timestep_input / self.scheduler.config.num_train_timesteps,
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_hidden_states_image=image_embeds_to_use,
             )
 
         # Two-stage denoising: model switching in forward_fn, guidance scale switching in denoise()
+        timer.mark_denoise_start()
         latents = self.denoise(
             latents=latents,
             scheduler=self.scheduler,
@@ -624,6 +631,7 @@ class WanImageToVideoPipeline(BasePipeline):
             guidance_scale_2=guidance_scale_2,
             boundary_timestep=boundary_timestep,
         )
+        timer.mark_post_start()
 
         # Decode
         logger.info("Decoding video...")
@@ -634,7 +642,8 @@ class WanImageToVideoPipeline(BasePipeline):
             logger.info(f"Video decoded in {time.time() - decode_start:.2f}s")
             logger.info(f"Total pipeline time: {time.time() - pipeline_start:.2f}s")
 
-        return MediaOutput(video=video)
+        timer.mark_end()
+        return timer.fill(PipelineOutput(video=video, frame_rate=16.0))
 
     def _encode_prompt(self, prompt: List[str], negative_prompt, max_sequence_length):
         """Encode text prompts to embeddings (same as T2V)."""

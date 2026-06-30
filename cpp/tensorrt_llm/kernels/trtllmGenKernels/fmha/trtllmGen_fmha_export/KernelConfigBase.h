@@ -517,6 +517,8 @@ template <> inline std::string toString(MmaOrder e) {
   X(bool, mGroupsHeadsQ, false, bool)                                                              \
   /* Whether to group both tokensQ and headsQ into one CTA. */                                     \
   X(bool, mGroupsTokensHeadsQ, false, bool)                                                        \
+  /* Whether the DSv4 sparse MLA sliding-window KV pool is enabled. */                             \
+  X(bool, mHasSlidingWindowKvPool, false, bool)                                                    \
   /* The head dimension per CTA for V. */                                                          \
   X(int32_t, mHeadDimPerCtaV, 0, int32_t)                                                          \
   /* The head dimension per stage for K/V. */                                                      \
@@ -568,6 +570,10 @@ template <> inline std::string toString(MmaOrder e) {
   /* Signal at the last N remaining exps to cover the */                                           \
   X(int, mNumLeadingExpElts, 6, int)                                                               \
   X(int, mNumPrefetchedFmas, 4, int)                                                               \
+  /* The number of stages of the K/V shared memory buffer. 0 uses the default heuristic. */        \
+  X(int32_t, mNumStagesKv, 0, int32_t)                                                             \
+  /* The number of stages of the Q shared memory buffer. 0 uses the default heuristic. */          \
+  X(int32_t, mNumStagesQ, 0, int32_t)                                                              \
   /* The paged-kv configurations. The number of tokens in one pageKv. */                           \
   X(int32_t, mNumTokensPerPage, 32, int32_t)                                                       \
   /* How many warps are doing V transposition */                                                   \
@@ -671,6 +677,13 @@ struct KernelConfigBase {
 
   bool operator!=(KernelConfigBase const& o) const { return !(*this == o); }
 };
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename Config_>
+__host__ __device__ inline bool supportsVarSparseMlaTopKLens(Config_ const& config) {
+  return config.mIsMlaGen && isDynamicTokenSparse(config.mSparseType);
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

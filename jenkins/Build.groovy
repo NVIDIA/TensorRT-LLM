@@ -408,7 +408,7 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     def llmPath = sh (script: "realpath ${LLM_ROOT}",returnStdout: true).trim()
     // TODO: Remove after the cmake version is upgraded to 3.31.8
     // Get triton tag from docker/dockerfile.multi
-    def tritonShortTag = "r26.02"
+    def tritonShortTag = "r26.04"
     sh "cd ${LLM_ROOT}/triton_backend/inflight_batcher_llm && mkdir build && cd build && cmake .. -DTRTLLM_DIR=${llmPath} -DTRITON_COMMON_REPO_TAG=${tritonShortTag} -DTRITON_CORE_REPO_TAG=${tritonShortTag} -DTRITON_THIRD_PARTY_REPO_TAG=${tritonShortTag} -DTRITON_BACKEND_REPO_TAG=${tritonShortTag} -DUSE_CXX11_ABI=ON && make -j${buildJobs} install"
 
     // Step 3: packaging wheels into tarfile
@@ -504,6 +504,7 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
 
         echo "env.globalVars is: ${env.globalVars}"
         globalVars = trtllm_utils.updateMapWithJson(pipeline, globalVars, env.globalVars, "globalVars")
+        globalVars = trtllm_utils.initializeCiBudget(pipeline, globalVars, 24, 'HOURS', "Build-${cpu_arch}")
         globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(pipeline, globalVars[ACTION_INFO])
     }
 

@@ -1016,6 +1016,9 @@ def test_multimodal_input():
     assert config.multimodal_lengths == multimodal_lengths
     # Default value for multimodal_uuids should be None
     assert config.multimodal_uuids is None
+    assert config.multimodal_item_run_cu_offsets is None
+    assert config.multimodal_run_positions is None
+    assert config.multimodal_run_lengths is None
 
 
 @pytest.mark.parametrize(
@@ -1046,6 +1049,34 @@ def test_multimodal_input_with_uuids(multimodal_uuids, expected_uuids):
     assert config.multimodal_uuids == expected_uuids
 
 
+def test_multimodal_input_with_exact_run_buffers():
+    """Test MultimodalInput with exact flat run buffers."""
+    multimodal_hashes = [[1, 2, 3, 4, 5, 6, 7, 8], [8, 7, 6, 5, 4, 3, 2, 1]]
+    multimodal_positions = [1, 8]
+    multimodal_lengths = [3, 2]
+    multimodal_uuids = ["item-a", None]
+    item_run_cu_offsets = [0, 2, 3]
+    run_positions = [1, 5, 8]
+    run_lengths = [2, 1, 2]
+
+    config = trtllm.MultimodalInput(
+        multimodal_hashes,
+        multimodal_positions,
+        multimodal_lengths,
+        multimodal_uuids,
+        item_run_cu_offsets,
+        run_positions,
+        run_lengths,
+    )
+    assert config.multimodal_hashes == multimodal_hashes
+    assert config.multimodal_positions == multimodal_positions
+    assert config.multimodal_lengths == multimodal_lengths
+    assert config.multimodal_uuids == multimodal_uuids
+    assert config.multimodal_item_run_cu_offsets == item_run_cu_offsets
+    assert config.multimodal_run_positions == run_positions
+    assert config.multimodal_run_lengths == run_lengths
+
+
 def test_multimodal_input_pickle_with_uuids():
     """Test pickling and unpickling of MultimodalInput with UUIDs."""
     multimodal_hashes = [[1, 2, 3, 4, 5, 6, 7, 8], [8, 7, 6, 5, 4, 3, 2, 1]]
@@ -1064,6 +1095,26 @@ def test_multimodal_input_pickle_with_uuids():
     assert restored.multimodal_positions == multimodal_positions
     assert restored.multimodal_lengths == multimodal_lengths
     assert restored.multimodal_uuids == multimodal_uuids
+    assert restored.multimodal_item_run_cu_offsets is None
+    assert restored.multimodal_run_positions is None
+    assert restored.multimodal_run_lengths is None
+
+    item_run_cu_offsets = [0, 2, 3]
+    run_positions = [10, 20, 100]
+    run_lengths = [5, 45, 60]
+    config_with_runs = trtllm.MultimodalInput(
+        multimodal_hashes,
+        multimodal_positions,
+        multimodal_lengths,
+        multimodal_uuids,
+        item_run_cu_offsets,
+        run_positions,
+        run_lengths,
+    )
+    restored_with_runs = pickle.loads(pickle.dumps(config_with_runs))
+    assert restored_with_runs.multimodal_item_run_cu_offsets == item_run_cu_offsets
+    assert restored_with_runs.multimodal_run_positions == run_positions
+    assert restored_with_runs.multimodal_run_lengths == run_lengths
 
     # Test with None UUIDs
     config_no_uuids = trtllm.MultimodalInput(multimodal_hashes,
@@ -1326,6 +1377,7 @@ def test_scheduler_config():
     config = trtllm.SchedulerConfig()
     assert config.capacity_scheduler_policy == capacity_scheduler_policy
     assert config.context_chunking_policy is None
+    assert config.enable_prefix_aware_scheduling is True
 
     capacity_scheduler_policy = trtllm.CapacitySchedulerPolicy.MAX_UTILIZATION
     config = trtllm.SchedulerConfig(capacity_scheduler_policy)
@@ -1351,12 +1403,13 @@ def test_scheduler_config():
     dynamic_batch_config = trtllm.DynamicBatchConfig(True, True, 128)
     config = trtllm.SchedulerConfig(capacity_scheduler_policy,
                                     context_chunking_policy,
-                                    dynamic_batch_config)
+                                    dynamic_batch_config, False)
     assert config.capacity_scheduler_policy == capacity_scheduler_policy
     assert config.context_chunking_policy == context_chunking_policy
     assert config.dynamic_batch_config.enable_batch_size_tuning == True
     assert config.dynamic_batch_config.enable_max_num_tokens_tuning == True
     assert config.dynamic_batch_config.dynamic_batch_moving_average_window == 128
+    assert config.enable_prefix_aware_scheduling is False
 
 
 def test_kv_cache_config():
@@ -2439,12 +2492,14 @@ def test_request_stats_per_iteration():
     assert stats_json["requestStats"][0]["id"] == 1
 
 
-def test_scheduler_config_pickle():
+def test_scheduler_config_pickle() -> None:
     policy = trtllm.CapacitySchedulerPolicy.MAX_UTILIZATION
-    config = trtllm.SchedulerConfig(policy)
+    config = trtllm.SchedulerConfig(policy,
+                                    enable_prefix_aware_scheduling=False)
     config_str = pickle.dumps(config)
     config_copy = pickle.loads(config_str)
     assert config.capacity_scheduler_policy == config_copy.capacity_scheduler_policy
+    assert config_copy.enable_prefix_aware_scheduling is False
 
 
 def test_kv_cache_config_pickle():
@@ -2568,13 +2623,15 @@ def test_guided_decoding_config_pickle():
 def test_cache_transceiver_config_pickle():
     config = trtllm.CacheTransceiverConfig(
         backend=trtllm.CacheTransceiverBackendType.UCX,
-        max_tokens_in_buffer=1024)
+        max_tokens_in_buffer=1024,
+        kv_transfer_poll_interval_ms=5000)
     config_copy = pickle.loads(pickle.dumps(config))
     assert config_copy.backend == config.backend
     assert config_copy.max_tokens_in_buffer == config.max_tokens_in_buffer
+    assert config_copy.kv_transfer_poll_interval_ms == config.kv_transfer_poll_interval_ms
 
 
-def test_executor_config_pickle():
+def test_executor_config_pickle() -> None:
     beam_width = 2
     config = trtllm.ExecutorConfig(beam_width)
 
@@ -2586,7 +2643,8 @@ def test_executor_config_pickle():
         "max_num_tokens":
         128,
         "scheduler_config":
-        trtllm.SchedulerConfig(trtllm.CapacitySchedulerPolicy.MAX_UTILIZATION),
+        trtllm.SchedulerConfig(trtllm.CapacitySchedulerPolicy.MAX_UTILIZATION,
+                               enable_prefix_aware_scheduling=False),
         "kv_cache_config":
         trtllm.KvCacheConfig(enable_block_reuse=True,
                              free_gpu_memory_fraction=0.5),
@@ -2644,6 +2702,7 @@ def test_executor_config_pickle():
     assert config.max_batch_size == config_copy.max_batch_size
     assert config.max_num_tokens == config_copy.max_num_tokens
     assert config.scheduler_config.capacity_scheduler_policy == config_copy.scheduler_config.capacity_scheduler_policy
+    assert config_copy.scheduler_config.enable_prefix_aware_scheduling is False
     assert config.kv_cache_config.enable_block_reuse == config_copy.kv_cache_config.enable_block_reuse
     assert config.enable_chunked_context == config_copy.enable_chunked_context
     assert config.normalize_log_probs == config_copy.normalize_log_probs

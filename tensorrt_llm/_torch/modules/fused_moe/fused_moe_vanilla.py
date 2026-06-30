@@ -92,6 +92,16 @@ class VanillaMoE(nn.ModuleList):
 
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
 
+        # VanillaMoE uses uniform expert partitioning; non-divisible EP would require
+        # ceil/floor distribution (see MoE._compute_ep_partition in interface.py).
+        # Reject explicitly rather than silently producing wrong local-expert ranges.
+        if num_experts % self.ep_size != 0:
+            raise ValueError(
+                f"VanillaMoE does not support non-divisible EP: "
+                f"num_experts ({num_experts}) must be divisible by ep_size ({self.ep_size}). "
+                f"Use CutlassFusedMoE / TRTLLMGenFusedMoE with NVLINK_ONE_SIDED comm for non-divisible EP."
+            )
+
         self.expert_size_per_partition = num_experts // self.ep_size
         self.expert_start = self.ep_rank * self.expert_size_per_partition
         self.expert_end = min(
@@ -525,6 +535,7 @@ class VanillaMoE(nn.ModuleList):
         self,
         x: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: Optional[torch.IntTensor] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
         **kwargs,
@@ -533,7 +544,7 @@ class VanillaMoE(nn.ModuleList):
         x = x.view(-1, self.hidden_size)
 
         token_selected_experts, token_final_scales = self.routing_method.apply(
-            router_logits)
+            router_logits, input_ids)
 
         if self.use_dp and self.parallel_size > 1:
             x, token_selected_experts, token_final_scales = allgather(

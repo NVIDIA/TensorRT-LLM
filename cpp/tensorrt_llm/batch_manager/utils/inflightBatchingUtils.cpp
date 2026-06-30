@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -103,10 +103,11 @@ void copyGenerationLogits(RuntimeBuffers::GenerationLogitsCache& generationLogit
 
     auto const fragmentSize = llmReq.getGenerationLogitsFragmentsSize();
 
-    // Merge logits fragments on device
+    // Merge logits fragments on device.  getFragmentPointerSlot() returns the matching host and
+    // device rows for the current workIdx and advances the index atomically, so concurrent flushes
+    // for different requests in the same batch never clobber each other's pointer arrays.
     auto const& transposeBufferPtr = generationLogitsCache.transposedLogits;
-    auto const& cachePointerDevice = generationLogitsCache.fragmentPointerDevice;
-    auto const& cachePointerHost = generationLogitsCache.getFragmentPointerHost();
+    auto [cachePointerHost, cachePointerDevice] = generationLogitsCache.getFragmentPointerSlot();
     tensorrt_llm::runtime::kernels::mergeLogitsFragments(bufferManager, *transposeBufferPtr,
         llmReq.getGenerationLogitsFragments(), *cachePointerDevice, *cachePointerHost, 0, 1, reqBeamWidth,
         bufferManager.getStream(), 0);
@@ -394,6 +395,14 @@ void CudaGraphExecutorCache::put(BatchState const& state, std::shared_ptr<CudaGr
         mCache.pop_back();
         mMap.erase(lastState);
     }
+}
+
+void CudaGraphExecutorCache::clear()
+{
+    // Releasing the shared_ptrs runs ~CudaGraphExecutor, which calls
+    // cudaGraphExecDestroy on each cached instance.
+    mMap.clear();
+    mCache.clear();
 }
 
 } // namespace tensorrt_llm::batch_manager::utils

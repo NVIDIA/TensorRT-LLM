@@ -17,7 +17,17 @@ __all__ = [
     'parse_disagg_config_file',
     'extract_server_configs',
     'split_world_comm',
+    'get_usage_tokens_from_ctx',
+    'rewrite_usage_info_from_ctx',
+    'rewrite_usage_response_from_ctx',
 ]
+
+
+def validate_config_bool(value: Any, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    raise ValueError(
+        f"{field_name} must be a boolean, got {type(value).__name__}")
 
 
 class ServerRole(IntEnum):
@@ -86,6 +96,7 @@ class DisaggServerConfig():
     # If this causes collisions, users can set node_id manually within range [0, 1023] in config
     schedule_style: Literal['context_first',
                             'generation_first'] = 'context_first'
+    allow_request_chat_template: bool = False
 
 
 @dataclass
@@ -95,6 +106,40 @@ class MetadataServerConfig():
     port: int = 2379
     health_check_timeout: float = 5.0
     refresh_interval: float = 10.0
+
+
+def get_usage_tokens_from_ctx(
+        ctx_usage: Optional[Any]) -> tuple[Optional[int], int]:
+    if ctx_usage is None:
+        return None, 0
+
+    prompt_tokens = ctx_usage.prompt_tokens
+    cached_tokens = 0
+    prompt_tokens_details = ctx_usage.prompt_tokens_details
+    if prompt_tokens_details is not None:
+        cached_tokens = prompt_tokens_details.cached_tokens
+    return prompt_tokens, cached_tokens
+
+
+def rewrite_usage_info_from_ctx(usage: Optional[Any],
+                                ctx_usage: Optional[Any]) -> Optional[Any]:
+    prompt_tokens, cached_tokens = get_usage_tokens_from_ctx(ctx_usage)
+    if prompt_tokens is None or usage is None:
+        return usage
+
+    from tensorrt_llm.serve.openai_protocol import PromptTokensDetails
+
+    usage.prompt_tokens = prompt_tokens
+    usage.total_tokens = prompt_tokens + (usage.completion_tokens or 0)
+    usage.prompt_tokens_details = PromptTokensDetails(
+        cached_tokens=cached_tokens)
+    return usage
+
+
+def rewrite_usage_response_from_ctx(response: Any,
+                                    ctx_usage: Optional[Any]) -> Any:
+    rewrite_usage_info_from_ctx(response.usage, ctx_usage)
+    return response
 
 
 def get_ctx_gen_server_addrs(
@@ -135,6 +180,7 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                        schedule_style: Literal[
                            'context_first',
                            'generation_first'] = 'context_first',
+                       allow_request_chat_template: bool = False,
                        **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
     generation_servers = generation_servers or {}
@@ -182,6 +228,8 @@ def extract_disagg_cfg(hostname: str = 'localhost',
         config.node_id = node_id
     if schedule_style:
         config.schedule_style = schedule_style
+    config.allow_request_chat_template = validate_config_bool(
+        allow_request_chat_template, "allow_request_chat_template")
     return config
 
 

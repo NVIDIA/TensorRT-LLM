@@ -30,10 +30,12 @@ from tensorrt_llm import LLM as LLM_torch
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor import (GenerationExecutorWorker, GenerationRequest,
-                                   GenerationResult, LoRARequest,
-                                   PromptAdapterRequest, RequestError)
+                                   GenerationResult, GenerationResultBase,
+                                   LoRARequest, PromptAdapterRequest,
+                                   RequestError)
 from tensorrt_llm.llmapi import (BuildCacheConfig, EagleDecodingConfig,
-                                 KvCacheConfig, KvCacheRetentionConfig,
+                                 ExtendedRuntimePerfKnobConfig, KvCacheConfig,
+                                 KvCacheRetentionConfig,
                                  LookaheadDecodingConfig, MedusaDecodingConfig,
                                  RequestOutput)
 from tensorrt_llm.llmapi import TrtLlmArgs as LlmArgs
@@ -49,6 +51,10 @@ from tensorrt_llm.models.automodel import AutoConfig, AutoModelForCausalLM
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
                                           LogitsProcessor, SamplingParams)
+from tensorrt_llm.serve.openai_protocol import CompletionRequest
+from tensorrt_llm.serve.openai_server import OpenAIServer
+from tensorrt_llm.serve.postprocess_handlers import (ChatPostprocArgs,
+                                                     chat_stream_post_processor)
 
 # isort: off
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
@@ -319,7 +325,7 @@ class MyTokenizer(TokenizerBase):
         return self.tokenizer.decode(token_ids, **kwargs)
 
     def batch_encode_plus(self, texts: List[str], **kwargs) -> dict:
-        return self.tokenizer.batch_encode_plus(texts, **kwargs)
+        return self.tokenizer(texts, **kwargs)
 
 
 @pytest.mark.part0
@@ -703,28 +709,54 @@ def test_generate_with_beam_search(llm_for_sampling_params: LLM):
     check_output(outputs, references)
 
 
-@pytest.mark.skip(reason="https://nvbugs/5435714")
 @force_ampere
 @pytest.mark.part0
-def test_generate_with_streaming_llm():
-    # TODO[chunweiy]: Test with larger size when the underlying support is ready
-    build_config = BuildConfig()
-    build_config.plugin_config.streamingllm = True
-    build_config.max_batch_size = 8
-    build_config.max_seq_len = 512
-    kv_cache_config = KvCacheConfig(max_attention_window=[64],
-                                    sink_token_length=4)
+def test_generate_with_cuda_graph_dynamic_beam_width():
+    build_config = BuildConfig(max_beam_width=3)
+    extended_runtime_perf_knob_config = ExtendedRuntimePerfKnobConfig(
+        cuda_graph_mode=True, cuda_graph_cache_size=64)
 
-    # Check the plugin config is correctly set
-    assert build_config.plugin_config.streamingllm is True
+    llm = LLM(
+        model=llama_model_path,
+        build_config=build_config,
+        kv_cache_config=global_kvcache_config,
+        extended_runtime_perf_knob_config=extended_runtime_perf_knob_config,
+        fast_build=True,
+    )
 
-    sampling_params = SamplingParams(max_tokens=4)
+    def _generate(beam_width):
+        sampling_params = SamplingParams(
+            max_tokens=8,
+            n=beam_width,
+            use_beam_search=(beam_width > 1),
+        )
+        outputs = llm.generate(prompts, sampling_params=sampling_params)
+        # Snapshot per-prompt, per-beam token IDs as a hashable structure
+        # so we can compare bit-for-bit across runs.
+        return [
+            tuple(tuple(o.token_ids) for o in out.outputs) for out in outputs
+        ]
 
-    llm_test_harness(llama_model_path,
-                     prompts, ["D E F G"],
-                     sampling_params=sampling_params,
-                     build_config=build_config,
-                     kv_cache_config=kv_cache_config)
+    try:
+        # Capture clean references. The first time each beam width is
+        # used, a fresh graph is captured against the *current* buffers,
+        # so these outputs are correct regardless of the bug.
+        ref = {1: _generate(1), 2: _generate(2), 3: _generate(3)}
+
+        # Now cycle through the beam widths again. Each transition fires
+        # changeBeamWidth(), reallocating decoder state.
+        revisit_sequence = [1, 2, 3, 1, 3, 2, 1]
+        for beam_width in revisit_sequence:
+            got = _generate(beam_width)
+            assert got == ref[beam_width], (
+                f"beam_width={beam_width}: token IDs diverged from the "
+                f"reference run after intervening beam-width changes. "
+                f"This indicates that a stale cudaGraphExec_t was "
+                f"replayed against reallocated decoder state.\n"
+                f"reference: {ref[beam_width]}\n"
+                f"got:       {got}")
+    finally:
+        llm.shutdown()
 
 
 @pytest.mark.part0
@@ -2127,6 +2159,45 @@ def validate_stats(
         if pytorch_backend:
             assert result["numCompletedRequests"] == expected_num_completed
 
+            # Per-iteration request-aggregate fields populated by
+            # PyExecutor._update_iter_stats inside inflightBatchingStats.
+            # Assert presence (a missing key indicates a serializer or
+            # RPC-path regression) and sane per-iteration values (a
+            # zero-under-load value indicates a mis-wired populate block).
+            new_aggregate_keys = (
+                "numCtxKvTokens",
+                "numGenKvTokens",
+                "numQueuedContextRequests",
+                "numQueuedCtxTokens",
+                "numQueuedGenRequests",
+                "numQueuedGenKvTokens",
+                "numPausedKvTokens",
+            )
+            for k in new_aggregate_keys:
+                assert k in ifbStats, f"iter {iter}: missing ifbStats key {k}"
+                assert isinstance(
+                    ifbStats[k],
+                    int), (f"iter {iter}: ifbStats key {k} not int "
+                           f"(got {type(ifbStats[k])})")
+                assert ifbStats[
+                    k] >= 0, f"iter {iter}: ifbStats key {k} negative"
+
+            if iter < context_iterations:
+                # Prefill iteration: at least one scheduled context request
+                # and nonzero numCtxTokens. numCtxTokens is sourced from
+                # model_engine.iter_states after _forward_step for this
+                # batch, so it is overlap-safe under every scheduler
+                # configuration.
+                assert ifbStats["numContextRequests"] >= 1, f"iter: {iter}"
+                assert ifbStats["numGenRequests"] == 0, f"iter: {iter}"
+                assert ifbStats["numCtxTokens"] > 0, f"iter: {iter}"
+            else:
+                # Generation iteration: at least one decode request with
+                # nonzero total KV context length.
+                assert ifbStats["numGenRequests"] >= 1, f"iter: {iter}"
+                assert ifbStats["numGenKvTokens"] > 0, f"iter: {iter}"
+                assert ifbStats["numContextRequests"] == 0, f"iter: {iter}"
+
 
 def llm_get_stats_test_harness(tp_size: int = 1,
                                pp_size: int = 1,
@@ -2507,6 +2578,171 @@ def run_llm_with_postprocess_parallel(tp_size: int = 1):
 
 def test_llm_with_postprocess_parallel():
     run_llm_with_postprocess_parallel(tp_size=1)
+
+
+def _stream_payloads_from_chunks(chunks):
+    payloads = []
+    for chunk in chunks:
+        if isinstance(chunk, bytes):
+            chunk = chunk.decode()
+        for line in chunk.splitlines():
+            if line.startswith("data: "):
+                data = line[len("data: "):].strip()
+                if data != "[DONE]":
+                    payloads.append(json.loads(data))
+    return payloads
+
+
+def test_chat_stream_post_processor_reuses_stream_metadata() -> None:
+    result = GenerationResultBase(123, SamplingParams())
+    output = result._outputs[0]
+    output.text = "x"
+    output.token_ids = [1]
+
+    args = ChatPostprocArgs(role="assistant", model="test-model")
+    chunks = chat_stream_post_processor(result, args)
+
+    output._last_text_len = len(output.text)
+    output._last_token_ids_len = len(output.token_ids)
+    output.text = "xy"
+    output.token_ids.append(2)
+    chunks += chat_stream_post_processor(result, args)
+
+    payloads = _stream_payloads_from_chunks(chunks)
+
+    assert {payload["id"] for payload in payloads} == {"chatcmpl-123"}
+    assert len({payload["created"] for payload in payloads}) == 1
+    assert payloads[0]["choices"][0]["delta"]["role"] == "assistant"
+    assert payloads[-1]["choices"][0]["delta"]["content"] == "y"
+
+
+class _FakeCompletionGeneratorArgs:
+    backend = "pytorch"
+    gather_generation_logits = False
+    num_postprocess_workers = 0
+    return_perf_metrics = False
+
+
+class _FakeModelConfig:
+    vocab_size = 32000
+
+
+class _FakeCompletionStreamResult(GenerationResultBase):
+
+    @property
+    def finished(self):
+        return self._done
+
+    @property
+    def request_id(self):
+        return self.id
+
+
+class _FakeCompletionPromise:
+
+    def __init__(self, result, prompt_token_ids):
+        self._result = result
+        self._yielded = False
+        self.prompt_token_ids = prompt_token_ids
+        self.aborted = False
+
+    @property
+    def finished(self):
+        return True
+
+    @property
+    def request_id(self):
+        return self._result.id
+
+    def abort(self):
+        self.aborted = True
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._yielded:
+            raise StopAsyncIteration
+        self._yielded = True
+        return self._result
+
+
+class _FakeCompletionGenerator:
+
+    def __init__(self):
+        self.args = _FakeCompletionGeneratorArgs()
+        self.postproc_args = []
+
+    def input_processor(self, prompt, _sampling_params):
+        token_id = ord(prompt["prompt"])
+        return [token_id], {}
+
+    def generate_async(self, inputs, sampling_params, _postproc_params,
+                       streaming, **_kwargs):
+        assert streaming
+        result_id = 100 + len(self.postproc_args)
+        result = _FakeCompletionStreamResult(result_id, sampling_params)
+        result._done = True
+
+        output = result._outputs[0]
+        output.text = f"text-{result_id}"
+        output.token_ids = [result_id]
+        output.finish_reason = "stop"
+
+        self.postproc_args.append(_postproc_params.postproc_args)
+        return _FakeCompletionPromise(result, inputs["prompt_token_ids"])
+
+
+class _FakeRawRequestState:
+    pass
+
+
+class _FakeRawRequest:
+
+    def __init__(self):
+        self.headers = {}
+        self.state = _FakeRawRequestState()
+        self.client = "test-client"
+
+    async def is_disconnected(self):
+        return True
+
+
+def test_openai_completion_list_prompt_stream_reuses_stream_metadata() -> None:
+
+    async def run_request():
+        generator = _FakeCompletionGenerator()
+        server = object.__new__(OpenAIServer)
+        server.generator = generator
+        server.model = "test-model"
+        server.model_config = _FakeModelConfig()
+        server.tokenizer = None
+        server.metrics_collector = None
+        server.perf_metrics = None
+
+        request = CompletionRequest(model="test-model",
+                                    prompt=["A", "B"],
+                                    stream=True)
+        response = await server.openai_completion(request, _FakeRawRequest())
+        chunks = [chunk async for chunk in response.body_iterator]
+        return generator, _stream_payloads_from_chunks(chunks)
+
+    generator, payloads = asyncio.run(run_request())
+
+    ids = {payload["id"] for payload in payloads}
+    created = {payload["created"] for payload in payloads}
+    choice_indexes = {
+        payload["choices"][0]["index"]
+        for payload in payloads if payload["choices"]
+    }
+
+    assert len(payloads) == 2
+    assert len(ids) == 1
+    assert ids.isdisjoint({"cmpl-100", "cmpl-101"})
+    assert len(created) == 1
+    assert choice_indexes == {0, 1}
+    assert {args.stream_response_id for args in generator.postproc_args} == ids
+    assert {args.stream_created for args in generator.postproc_args} == created
 
 
 def run_llm_with_postprocess_parallel_and_result_handler(

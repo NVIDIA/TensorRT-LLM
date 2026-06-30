@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -64,6 +64,11 @@ class BeamSearchMetadata(StrategyMetadata):
     seq_lens: torch.Tensor
     finished_beams: torch.Tensor
     predecessor_beams: torch.Tensor
+    # Pre-computed indexer constants sliced (not allocated) per call.
+    # seq_offsets[i] = i * max_beam_width, shape (max_num_sequences,), int64.
+    # beam_idx_arange[j] = j, shape (max_beam_width,), int32.
+    seq_offsets: torch.Tensor
+    beam_idx_arange: torch.Tensor
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -361,10 +366,9 @@ def beam_search_sampling_batch(
     max_beam_width = beam_search_args.finished_beams.size(1)
     finished_beams = beam_search_args.finished_beams[beam_search_args.seq_slots].view(-1)
 
-    offset_predecessor_beam = predecessor_beam + (
-        torch.arange(predecessor_beam.size(0), device=predecessor_beam.device).unsqueeze(1)
-        * max_beam_width
-    )
+    offset_predecessor_beam = predecessor_beam + beam_search_args.seq_offsets[
+        : predecessor_beam.size(0)
+    ].unsqueeze(1)
     finished_beams = finished_beams[offset_predecessor_beam]
     beam_search_args.finished_beams[beam_search_args.seq_slots] = finished_beams.view(
         batch_size, max_beam_width
@@ -385,19 +389,15 @@ def beam_search_sampling_batch(
         out=cache_indirection,
     )
 
-    # Prepare target values
-    target_values = (
-        torch.arange(
-            beam_width_out * batch_size, device=cache_indirection.device, dtype=torch.int32
-        )
-        % beam_width_out
-    )
-
     # seq lens is of shape (batch_size), we assume all beams have the same seq len
     # therefore we can use expand
     index = beam_search_args.seq_lens.view(-1, 1, 1).expand(-1, beam_width_out, 1)
     # index is of shape (batch_size, beam_width, 1)
-    src = target_values.view(batch_size, beam_width_out, 1)
+    src = (
+        beam_search_args.beam_idx_arange[:beam_width_out]
+        .view(1, beam_width_out, 1)
+        .expand(batch_size, beam_width_out, 1)
+    )
     # src is of shape (batch_size, beam_width, 1)
     # cache_indirection is of shape (batch_size, beam_width, max_seq_len)
     cache_indirection.scatter_(2, index, src)
@@ -612,95 +612,6 @@ class SimpleGroupedStrategySampler(GroupedStrategySampler[Strategy]):
             return_probs=return_probs,
             group_metadata=group_metadata,
         )
-
-
-class _AcceptSyncCompute:
-    pass
-
-
-ACCEPT_SYNC_COMPUTE = _AcceptSyncCompute()
-
-
-# Inspired by https://github.com/pytorch/pytorch/issues/80577; note also the
-# suggestion to consider torch.nested.
-def torch_multi_arange(
-    ends: torch.Tensor,
-    *,
-    output_length: int | _AcceptSyncCompute,
-    starts: Optional[torch.Tensor] = None,
-    steps: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Efficiently compute torch.cat([torch.arange(b, e, d) for b, e, d in zip(starts, ends, steps)]).
-
-    Starts, ends, steps need to share dtype and shape. Invalid ranges like range(1, 2, -1) are
-    silently discarded. 'steps' defaults to 1 and 'starts' defaults to 0.
-
-    Provide 'output_length' to avoid synchronization when using device tensors or pass
-    `ACCEPT_SYNC_COMPUTE` to explicitly accept the possibility of a device sync (for device tensors)
-    or when tensors are known to reside on the host.
-    """
-    if steps is not None:
-        assert ends.dtype == steps.dtype
-        assert ends.shape == steps.shape
-        assert ends.device == steps.device
-    if starts is not None:
-        assert ends.dtype == starts.dtype
-        assert ends.shape == starts.shape
-        assert ends.device == starts.device
-    output_length_arg = None if isinstance(output_length, _AcceptSyncCompute) else output_length
-
-    if ends.numel() == 0:
-        return ends.clone()
-
-    # This algorithm combines torch.repeat_interleaved() and torch.cumsum() to
-    # construct the result.
-    #
-    # 1. Given N ranges (characterized by starts, ends, steps), construct a sequence
-    #    of 2N numbers, in which the non-overlapping pairs of consecutive numbers
-    #    correspond to the ranges. For a given range, the pair (a, b) is chosen such
-    #    that upon torch.cumsum() application 'a' turns the last element of the
-    #    preceding range into the start element for the current range and 'b' is
-    #    simply the step size for the current range.
-    #
-    repeats = ends  # number of elements in each range
-    if starts is not None:
-        repeats = repeats.clone()
-        repeats -= starts
-    if steps is not None:
-        repeats *= steps.sign()
-        steps_abs = steps.abs()
-        repeats = (repeats + steps_abs - 1).div(steps_abs, rounding_mode="floor")
-    repeats = repeats.clip(min=0)  # ignore invalid ranges
-    range_ends = repeats - 1  # last element in each range
-    if steps is not None:
-        range_ends *= steps
-    if starts is not None:
-        range_ends += starts
-    prev_range_ends = range_ends.roll(1)  # last element in preceding range (or 0)
-    prev_range_ends[0].fill_(0)
-    ones = torch.ones((), dtype=ends.dtype, device=ends.device)
-    zeros = torch.zeros((), dtype=ends.dtype, device=ends.device)
-    if steps is None:
-        steps = ones.broadcast_to(ends.shape)
-    jumps = -prev_range_ends  # delta from one range to the next
-    if starts is not None:
-        jumps += starts
-    #     NB: Apply correction for empty ranges
-    jumps_corrections = torch.where(repeats == 0, jumps, zeros).cumsum(0, dtype=ends.dtype)
-    jumps += jumps_corrections
-    seq = torch.cat((jumps.unsqueeze(-1), steps.unsqueeze(-1)), dim=1).view(-1)
-    #
-    # 2. Construct output via torch.repeat_interleave() and torch.cumsum()
-    #     NB: For a resulting empty range, repeats - 1 == -1. In this case, we
-    #         should set repeats for delta and increment both to 0 instead.
-    jump_repeats = torch.where(repeats == 0, zeros, ones)
-    step_repeats = torch.where(repeats == 0, zeros, repeats - 1)
-    seq_repeats = torch.cat((jump_repeats.unsqueeze(-1), step_repeats.unsqueeze(-1)), dim=1).view(
-        -1
-    )
-    seq = seq.repeat_interleave(seq_repeats, output_size=output_length_arg)
-    seq = seq.cumsum(0, dtype=ends.dtype)
-    return seq
 
 
 class _Fusions:

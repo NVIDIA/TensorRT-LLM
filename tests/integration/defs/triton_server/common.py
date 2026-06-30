@@ -187,6 +187,23 @@ def prepare_llmapi_model_repo(llm_backend_repo_root, new_model_repo):
     check_call(f"cp -R {origin_model_repo} {new_model_repo}", shell=True)
 
 
+def set_llmapi_decoupled_mode(new_model_repo, decoupled):
+    """Set Triton transaction policy via config.pbtxt for the llmapi model.
+
+    Append `model_transaction_policy { decoupled: ... }` so Triton sees the
+    model as decoupled (or not). Required because launch_triton_server.py
+    uses `--disable-auto-complete-config`, which prevents the llmapi
+    model.py `auto_complete_config` callback (where decoupled is taken from
+    model.yaml) from running. Without this, Triton treats the model as
+    non-decoupled and rejects multi-response sends from the streaming path.
+    """
+    config_pbtxt = os.path.join(new_model_repo, "tensorrt_llm", "config.pbtxt")
+    with open(config_pbtxt, "a") as f:
+        f.write("\nmodel_transaction_policy {\n"
+                f"  decoupled: {str(bool(decoupled)).lower()}\n"
+                "}\n")
+
+
 def modify_ib_config_pbtxt(REPO_PATH,
                            DECODER_ENGINE_PATH,
                            TOKENIZER_PATH,

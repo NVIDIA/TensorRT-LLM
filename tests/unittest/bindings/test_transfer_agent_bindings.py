@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import pytest
 
 # Try to import the transfer agent binding module
@@ -163,6 +177,64 @@ def test_agent_desc_from_bytes():
     test_data = b"test_binary_data\x00\x01\x02"
     desc = tab.AgentDesc(test_data)
     assert desc.backend_agent_desc == test_data
+
+
+def test_agent_desc_serialize_returns_bytes():
+    """Test that AgentDesc.serialize() returns bytes."""
+    desc = tab.AgentDesc("some_blob")
+    serialized = desc.serialize()
+    assert isinstance(serialized, bytes)
+    assert len(serialized) > 0
+
+
+def test_agent_desc_serialize_deserialize_no_regions():
+    """Test AgentDesc serialize/deserialize roundtrip without VMM regions."""
+    original_blob = b"nixl_metadata_blob_content"
+    desc = tab.AgentDesc(original_blob)
+    serialized = desc.serialize()
+
+    restored = tab.AgentDesc.deserialize(serialized)
+    assert restored.backend_agent_desc == original_blob
+
+
+def test_agent_desc_serialize_deserialize_roundtrip_string():
+    """Test AgentDesc serialize/deserialize roundtrip with string input."""
+    original_blob = "string_blob_data"
+    desc = tab.AgentDesc(original_blob)
+    serialized = desc.serialize()
+
+    restored = tab.AgentDesc.deserialize(serialized)
+    assert restored.backend_agent_desc == original_blob.encode()
+
+
+def test_agent_desc_serialize_deserialize_binary_blob():
+    """Test AgentDesc serialize/deserialize with binary data containing null bytes."""
+    # NIXL blobs can contain arbitrary binary data including null bytes
+    original_blob = bytes(range(256))
+    desc = tab.AgentDesc(original_blob)
+    serialized = desc.serialize()
+
+    restored = tab.AgentDesc.deserialize(serialized)
+    assert restored.backend_agent_desc == original_blob
+
+
+def test_agent_desc_deserialize_accepts_bytes():
+    """Test that AgentDesc.deserialize() accepts bytes input."""
+    desc = tab.AgentDesc(b"test_data")
+    serialized = desc.serialize()
+
+    # deserialize should accept bytes
+    restored = tab.AgentDesc.deserialize(serialized)
+    assert restored.backend_agent_desc == b"test_data"
+
+
+def test_agent_desc_serialize_deserialize_empty_blob():
+    """Test AgentDesc serialize/deserialize with empty backend blob."""
+    desc = tab.AgentDesc(b"")
+    serialized = desc.serialize()
+
+    restored = tab.AgentDesc.deserialize(serialized)
+    assert restored.backend_agent_desc == b""
 
 
 def test_base_agent_config_default():

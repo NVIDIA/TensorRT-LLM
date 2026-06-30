@@ -26,6 +26,30 @@
 namespace tensorrt_llm::batch_manager
 {
 
+void BufferIndexHolder::release() noexcept
+{
+    if (!mHeld || mMgr == nullptr)
+    {
+        return;
+    }
+    try
+    {
+        if (mIsRecv)
+        {
+            mMgr->freeBufferIndexForRecv(mIndex);
+        }
+        else
+        {
+            mMgr->freeBufferIndexForSend(mIndex);
+        }
+    }
+    catch (...)
+    {
+        // noexcept: swallow so the destructor can never throw.
+    }
+    mHeld = false;
+}
+
 BaseTransBufferManager::BaseTransBufferManager(
     size_t transferBufferSize, nvinfer1::DataType dataType, std::optional<size_t> maxNumTokens)
     : mDataType{dataType}
@@ -37,7 +61,7 @@ BaseTransBufferManager::BaseTransBufferManager(
     mRecvBufferCount = common::getEnvRequestKVCacheConcurrent() ? common::getEnvKVCacheRecvBufferCount() : 1;
     mSendBufferCount = common::getEnvKVCacheSendMaxConcurrenceNum();
     mUseFabricMemory = !(common::getEnvKVCacheTransferUseSyncBuffer() || common::getEnvKVCacheTransferUseAsyncBuffer())
-        && kv_cache_manager::FabricMemory::supportFbaricMemory();
+        && kv_cache_manager::FabricMemory::supportFabricMemory();
     if (mUseFabricMemory)
     {
         mTransferBufferSize = kv_cache_manager::FabricMemory::getAlignedSize(mTransferBufferSize);

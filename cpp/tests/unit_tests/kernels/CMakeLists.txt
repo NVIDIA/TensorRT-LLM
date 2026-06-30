@@ -89,11 +89,17 @@ add_gtest(samplingKernelsTest "${SAMPLING_KERNEL_TEST_SRC}")
 
 set(ROUTING_KERNEL_TEST_SRC
     routing/routingTest.cpp routing/routingLlama4Test.cpp
-    routing/routingRenormalizeTest.cpp routing/routingDeepSeekTest.cpp)
+    routing/routingCustomTest.cpp routing/routingDeepSeekTest.cpp)
 add_gtest(routingKernelsTest "${ROUTING_KERNEL_TEST_SRC}")
 target_link_libraries(routingKernelsTest PRIVATE Python3::Python)
 
 add_gtest(moeLoadBalanceKernelTest moeLoadBalanceKernelTest.cpp)
+
+if(USING_OSS_CUTLASS_MOE_GEMM)
+  add_gtest(moeLoraPointerExpandTest moeLoraPointerExpandTest.cu)
+  add_gtest(moeLoraProblemBuilderTest moeLoraProblemBuilderTest.cu)
+  add_gtest(moeLoraSlotExpandTest moeLoraSlotExpandTest.cu)
+endif()
 
 add_gtest(eaglePackDataTest eaglePackDataTest.cpp)
 add_gtest(sparseKvCacheTest sparseKvCacheTest.cu)

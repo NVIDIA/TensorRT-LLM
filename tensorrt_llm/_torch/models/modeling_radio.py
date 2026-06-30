@@ -6,8 +6,8 @@ import copy
 import dataclasses
 import math
 from collections import namedtuple
-from typing import (Dict, Iterable, List, Literal, NamedTuple, Optional, Tuple,
-                    Type, Union)
+from typing import (TYPE_CHECKING, Dict, Iterable, List, Literal, Mapping,
+                    NamedTuple, Optional, Sequence, Tuple, Type, Union)
 
 import torch
 import torch.nn as nn
@@ -21,10 +21,16 @@ from tensorrt_llm._torch.attention_backend import \
     interface as attention_interface
 from tensorrt_llm._torch.attention_backend import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_utils
+from tensorrt_llm._torch.models.multimodal_encoder_graph import (
+    EncoderGraphKey, EncoderGraphTensorSpec, EncoderMetadataProvider,
+    MultimodalEncoderGraphRunner)
 from tensorrt_llm._torch.modules import attention as trtllm_attention
 from tensorrt_llm._torch.modules import mlp as trtllm_mlp
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.models.modeling_utils import QuantConfig
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import MultimodalEncoderCudaGraphConfig
 
 InputDimT = Union[int, Tuple[int, int]]
 
@@ -759,8 +765,35 @@ class VisionTransformer(nn.Module):
             metadata_kwargs["kv_layout"] = "NHD"
         self.attn_metadata = self.metadata_cls(**metadata_kwargs)
 
-    def prepare_attn_metadata(self, batch_size: int, seq_lengths: List[int],
-                              attn_metadata: AttentionMetadata):
+        # CUDA-graph runner for the block stack. None means graphs are off and
+        # the eager path is always taken; the caller opts in via
+        # `enable_blocks_cuda_graph`.
+        self._blocks_graph_runner: Optional[MultimodalEncoderGraphRunner] = None
+
+    def enable_blocks_cuda_graph(
+        self,
+        config: "MultimodalEncoderCudaGraphConfig",
+        *,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        """Build the block-stack runner from `config` and capture startup graphs.
+
+        The caller must ensure the model parameters already live on `device`
+        (or on a CUDA device discoverable from `self.parameters()`); captures
+        are recorded immediately.
+        """
+        if self._blocks_graph_runner is not None:
+            return
+
+        graph_runner = self._build_blocks_graph_runner(config)
+        if device is None:
+            device = next(self.parameters()).device
+        graph_runner.capture_all(device)
+        self._blocks_graph_runner = graph_runner
+
+    def prepare_attn_metadata(
+            self, batch_size: int, seq_lengths: List[int],
+            attn_metadata: AttentionMetadata) -> AttentionMetadata:
         """
         To simplify the usage of the model, this function aims to fill the metadata for Attention
         Call this function before forward pass
@@ -786,7 +819,7 @@ class VisionTransformer(nn.Module):
                          x: torch.Tensor,
                          image_sizes: Optional[List[Tuple[int, int]]] = None,
                          num_frames: Optional[int] = None) -> torch.Tensor:
-        """Forward pass through feature layers (embeddings, transformer blocks, post-transformer norm).
+        """Forward through embeddings, transformer blocks, and post-transformer norm.
 
         Args:
             x: Input pixel values.
@@ -825,8 +858,7 @@ class VisionTransformer(nn.Module):
         hidden_size = x.shape[-1]
         # Need flatten batch/seq_len for trtllm attention.
         x = x.reshape(-1, hidden_size)
-        for block in self.blocks:
-            x = block(x, attn_metadata=attn_metadata)
+        x = self._run_blocks(x, attn_metadata)
 
         # Reshape back from flattened.
         if packed_batch_size is not None:
@@ -838,6 +870,99 @@ class VisionTransformer(nn.Module):
 
         x = self.norm(x)
         return x
+
+    def _build_blocks_graph_runner(
+        self, config: "MultimodalEncoderCudaGraphConfig"
+    ) -> MultimodalEncoderGraphRunner:
+        input_specs = {
+            "x":
+            EncoderGraphTensorSpec(shape=(self.embed_dim, ),
+                                   dtype=self.model_config.torch_dtype,
+                                   token_dim=0),
+        }
+        output_specs = {"x": 0}
+        return MultimodalEncoderGraphRunner(
+            encoder_fn=self._encoder_graph_fn,
+            metadata_provider=_VisionEncoderMetadataProvider(self),
+            input_specs=input_specs,
+            output_specs=output_specs,
+            config=config,
+        )
+
+    # This is what gets passed to the `MultimodalEncoderGraphRunner`.
+    def _encoder_graph_fn(
+        self,
+        inputs: Mapping[str, torch.Tensor],
+        md: AttentionMetadata,
+    ) -> Dict[str, torch.Tensor]:
+        return {"x": self._run_blocks_eager(inputs["x"], md)}
+
+    def _run_blocks(self, x: torch.Tensor,
+                    attn_metadata: AttentionMetadata) -> torch.Tensor:
+        if self._blocks_graph_runner is not None:
+            seq_lengths = attn_metadata.seq_lens.tolist()
+            output = self._blocks_graph_runner.maybe_run(
+                seq_lengths=seq_lengths,
+                inputs={"x": x},
+            )
+            if output is not None:
+                return output["x"]
+        return self._run_blocks_eager(x, attn_metadata)
+
+    def _run_blocks_eager(self, x: torch.Tensor,
+                          attn_metadata: AttentionMetadata) -> torch.Tensor:
+        for block in self.blocks:
+            x = block(x, attn_metadata=attn_metadata)
+        return x
+
+
+class _VisionEncoderMetadataProvider(EncoderMetadataProvider):
+    """Bridges the multimodal encoder graph runner to the model's eager metadata path.
+
+    `build` returns a fresh `AttentionMetadata` with `is_cuda_graph=True`; that flag flips
+    `AttentionMetadata.seq_lens`'s setter into the in-place `copy_` branch (see
+    `attention_backend/interface.py`), which is what makes subsequent `refresh_in_place` calls safe
+    to run against captured CUDA graphs.
+
+    The runner double-checks via its `data_ptr` stability assertion against `graph_critical_attrs`.
+    """
+
+    # `_seq_lens_cuda` is the on-device buffer the captured attention kernels read sequence lengths
+    # from; the `seq_lens` setter copies into it in place when `is_cuda_graph=True`.
+    # FlashInfer also owns a persistent workspace buffer that backs its captured ragged-prefill run.
+    graph_critical_attrs: Sequence[str]
+
+    def __init__(self, vit: VisionTransformer) -> None:
+        self._vit = vit
+        self.graph_critical_attrs = ("_seq_lens_cuda", )
+        if vit.model_config.attn_backend == "FLASHINFER":
+            self.graph_critical_attrs += (
+                "workspace_buffer",
+                "_ragged_qo_indptr_buf",
+                "_ragged_kv_indptr_buf",
+            )
+
+    def build(self, key: EncoderGraphKey) -> AttentionMetadata:
+        vit = self._vit
+        metadata_kwargs = dict(
+            max_num_requests=max(vit.attn_metadata.max_num_requests,
+                                 key.num_contexts),
+            max_num_tokens=max(vit.attn_metadata.max_num_tokens,
+                               key.total_tokens),
+            kv_cache_manager=None,
+        )
+        if vit.model_config.attn_backend == "FLASHINFER":
+            metadata_kwargs["kv_layout"] = "NHD"
+        md = vit.metadata_cls(**metadata_kwargs)
+        md.is_cuda_graph = True
+        return md
+
+    def refresh_in_place(self, metadata: AttentionMetadata,
+                         padded_seq_lengths: Sequence[int]) -> None:
+        # Reuse the eager path so both modes go through the same setter logic; the captured graph
+        # holds the metadata's tensor addresses.
+        self._vit.prepare_attn_metadata(len(padded_seq_lengths),
+                                        list(padded_seq_lengths), metadata)
 
 
 class RADIOVisionModelBase(nn.Module):
@@ -1015,19 +1140,30 @@ class RADIOVisionModelBase(nn.Module):
 class RADIOVisionModel(PreTrainedModel):
     """Modify from https://huggingface.co/nvidia/C-RADIOv2-H/blob/main/hf_model.py."""
 
+    # transformers>=5.5 strict-validates _attn_implementation in PreTrainedModel.__init__.
+    # RADIO uses TRT-LLM's own vision attention backend (FLASHINFER by default),
+    # not HF's flash_attention_2 path — declare both so super().__init__() accepts whatever
+    # backend HF auto-selects.
+    _supports_flash_attn = True
+    _supports_sdpa = True
+
     def __init__(self,
                  model_config: model_config_lib.ModelConfig,
                  disable_quantization: bool = True,
-                 vision_attn_backend: Optional[str] = "FLASHINFER"):
+                 vision_attn_backend: Optional[str] = "FLASHINFER",
+                 encoder_cuda_graph_config: Optional[
+                     "MultimodalEncoderCudaGraphConfig"] = None):
         """
         Args:
             model_config: Model configuration.
             disable_quantization: Disable quantization for RADIO model.
                 Since the radio model is for vision only, we can disable quantization for it by default.
             vision_attn_backend: Attention backend to use for the vision tower. Defaults to "FLASHINFER".
+            encoder_cuda_graph_config: Optional CUDA graph capture configuration for the vision tower.
         """
         config = model_config.pretrained_config
         super().__init__(config)
+        self._encoder_cuda_graph_config = encoder_cuda_graph_config
 
         self.model_config = copy.deepcopy(model_config)
         if self.model_config.quant_config is not None:
@@ -1178,6 +1314,17 @@ class RADIOVisionModel(PreTrainedModel):
         modeling_utils._load_weights_impl(self.radio_model.model,
                                           converted_weights,
                                           params_map=pattern_mapping)
+
+    def enable_blocks_cuda_graph(
+        self,
+        *,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        """Forward the configuration to the inner VisionTransformer."""
+        if self._encoder_cuda_graph_config is None:
+            return
+        self.radio_model.model.enable_blocks_cuda_graph(
+            self._encoder_cuda_graph_config, device=device)
 
     def forward(self,
                 x: torch.Tensor,

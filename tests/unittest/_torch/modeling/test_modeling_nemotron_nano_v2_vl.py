@@ -1,5 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import MagicMock
 
@@ -11,14 +15,20 @@ from test_modeling_multimodal import llm_models_root
 from test_modeling_nemotron_h import extract_decode_logprobs
 
 from tensorrt_llm import LLM
+from tensorrt_llm._torch.models import modeling_nemotron_nano as nemotron_nano
 from tensorrt_llm._torch.models.modeling_multimodal_utils import get_multimodal_embeddings
 from tensorrt_llm._torch.models.modeling_nemotron_nano import (
     NanoV2VLInputProcessor,
+    NanoV2VLMultimodalEncoder,
     NanoV2VLVisionEncoder,
     NemotronH_Nano_VL_V2,
+    _get_vision_encoder_cuda_graph_config,
 )
 from tensorrt_llm._torch.models.modeling_parakeet import ProjectedParakeet
+from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_VISION_ENCODER_MAPPING
 from tensorrt_llm.inputs import (
+    AudioData,
+    VideoData,
     create_input_processor,
     create_input_processor_with_hash,
     default_multimodal_input_loader,
@@ -26,10 +36,193 @@ from tensorrt_llm.inputs import (
 )
 from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalRuntimeData
 from tensorrt_llm.llmapi import KvCacheConfig
-from tensorrt_llm.llmapi.llm_args import CudaGraphConfig
+from tensorrt_llm.llmapi.llm_args import (
+    CudaGraphConfig,
+    MultimodalConfig,
+    MultimodalEncoderCudaGraphConfig,
+)
 from tensorrt_llm.sampling_params import SamplingParams
 
 MODEL_PATH = str(os.path.join(llm_models_root(), "NVIDIA-Nemotron-Nano-12B-v2-VL-BF16"))
+
+
+def _make_minimal_nano_model_config():
+    llm_config = SimpleNamespace(vocab_size=128)
+    pretrained_config = SimpleNamespace(
+        llm_config=llm_config,
+        torch_dtype=torch.bfloat16,
+        img_context_token_id=20,
+        video_context_token_id=21,
+        sound_context_token_id=None,
+        sound_config=None,
+    )
+    return SimpleNamespace(
+        pretrained_config=pretrained_config,
+        quant_config=SimpleNamespace(exclude_modules=None),
+        quant_config_dict=None,
+        video_pruning_rate=None,
+    )
+
+
+def test_nemotron_nano_registers_native_multimodal_epd_components():
+    """Native Nano VL/Omni classes advertise MM EPD support."""
+    for arch in ("NemotronH_Nano_VL_V2", "NemotronH_Nano_Omni_Reasoning_V3"):
+        vision_encoder_cls, vlm_base_model = MODEL_CLASS_VISION_ENCODER_MAPPING[arch]
+        assert vision_encoder_cls is NanoV2VLMultimodalEncoder
+        assert vlm_base_model is None
+    assert NanoV2VLInputProcessor.support_mm_disagg is True
+    assert NemotronH_Nano_VL_V2.support_mm_disagg is True
+
+
+def _assert_nano_video_handoff(handoff):
+    """Shared assertions for the EPD video handoff: split runs stay grouped under one MM item."""
+    assert handoff.prompt_token_ids == [101, 30, 20, 20, 31, 55, 30, 20, 20, 31, 102]
+    assert handoff.multimodal_lengths == [8]
+    assert handoff.multimodal_positions == [1]
+    assert handoff.multimodal_embedding_lengths == [4]
+    assert handoff.multimodal_item_run_cu_offsets == [0, 2]
+    assert handoff.multimodal_run_positions == [1, 6]
+    assert handoff.multimodal_run_lengths == [4, 4]
+    assert handoff.special_token_offsets == [0, 3, 4, 7]
+
+
+@pytest.mark.parametrize(
+    "input_field, input_value, asserts_encode_not_called",
+    [
+        # Detokenized prompt text path: the tokenizer may encode the prompt.
+        ("prompt", "Question <video> answer", False),
+        # Tokenized handoff path: prompt text is absent, so encode must not be called.
+        ("prompt_token_ids", [101, 98, 102], True),
+    ],
+    ids=["prompt", "prompt_token_ids"],
+)
+def test_nemotron_nano_epd_handoff_preserves_non_contiguous_video_runs(
+    input_field, input_value, asserts_encode_not_called
+):
+    """Split video prompt runs stay grouped under one MM item, with or without prompt text."""
+    processor = object.__new__(NanoV2VLInputProcessor)
+    processor._config = SimpleNamespace(
+        llm_config=SimpleNamespace(vocab_size=1000, hidden_size=16),
+    )
+    if asserts_encode_not_called:
+        # In the tokenized path the tokenizer must never be invoked; a side effect
+        # turns any accidental call into a hard failure.
+        encode_mock = MagicMock(side_effect=AssertionError("tokenizer should not be called"))
+    else:
+        encode_mock = MagicMock(return_value=[101, 98, 102])
+    processor._tokenizer = SimpleNamespace(encode=encode_mock)
+    processor.img_context_token_id = 20
+    processor._img_start_token_ids = [30]
+    processor._img_end_token_ids = [31]
+    processor._sound_context_token_id = None
+    processor._sound_start_token_id = None
+    processor._sound_end_token_id = None
+
+    processor.get_num_tokens_per_video = MagicMock(return_value=8)
+    processor.expand_prompt_token_ids_for_mm = MagicMock(
+        return_value=([101, 30, 20, 20, 31, 55, 30, 20, 20, 31, 102], None)
+    )
+
+    video = VideoData(frames=[object()], metadata={}, audio=None)
+    handoff = processor.build_disagg_prefill_multimodal_inputs(
+        {
+            input_field: input_value,
+            "multi_modal_data": {"video": [video]},
+        },
+        [{"tensor_size": (4, 16)}],
+    )
+
+    if asserts_encode_not_called:
+        processor._tokenizer.encode.assert_not_called()
+        processor.expand_prompt_token_ids_for_mm.assert_called_once()
+        assert processor.expand_prompt_token_ids_for_mm.call_args.args[0] == [101, 98, 102]
+    _assert_nano_video_handoff(handoff)
+
+
+@pytest.mark.parametrize(
+    "env_value, expects_encoder",
+    [
+        # Normal worker: the vision encoder must be built and loaded for raw MM prefill.
+        ("0", True),
+        # MM E/P/D full-model worker: consumes attached embeddings, so the encoder is deferred.
+        ("1", False),
+    ],
+    ids=["normal_worker", "mm_epd_worker"],
+)
+def test_nemotron_nano_multimodal_encoder_load_by_worker_role(env_value, expects_encoder):
+    """Encoder load depends on whether the worker runs raw MM prefill or consumes embeddings."""
+    fake_encoder = MagicMock()
+    fake_encoder.eval.return_value = fake_encoder
+    fake_encoder.to.return_value = fake_encoder
+    vision_encoder_cls = MagicMock(return_value=fake_encoder)
+
+    fake_mapper = MagicMock()
+    mapper_cls = MagicMock(return_value=fake_mapper)
+
+    model = SimpleNamespace(
+        _mm_model_config=_make_minimal_nano_model_config(),
+        vision_encoder=None,
+        sound_encoder=None,
+        llm=MagicMock(),
+        model_config=SimpleNamespace(),
+    )
+    weights = {
+        "vision_model.weight": torch.empty(0),
+        "mlp1.weight": torch.empty(0),
+        "language_model.weight": torch.empty(0),
+    }
+
+    with (
+        mock.patch.dict(os.environ, {"TLLM_MULTIMODAL_DISAGGREGATED": env_value}),
+        mock.patch.object(nemotron_nano, "NanoV2VLVisionEncoder", vision_encoder_cls),
+        mock.patch.object(nemotron_nano, "NemotronHHfWeightMapper", mapper_cls),
+    ):
+        NemotronH_Nano_VL_V2.load_weights(model, weights)
+
+    if expects_encoder:
+        vision_encoder_cls.assert_called_once_with(model._mm_model_config)
+        fake_encoder.load_weights.assert_called_once_with(weights)
+    else:
+        vision_encoder_cls.assert_not_called()
+
+
+def test_nemotron_nano_rejects_evs_attached_video_embeddings():
+    """EVS needs retained-token metadata that E/P attached embeddings do not carry."""
+    model = SimpleNamespace(
+        video_pruning_rate=0.5,
+        _validate_evs_context_batch=MagicMock(),
+    )
+    attn_metadata = SimpleNamespace(num_contexts=1, num_generations=0)
+    param = MultimodalParams(
+        multimodal_data={
+            "modality_type": "video",
+            "multimodal_embedding": torch.zeros(1, 4),
+        }
+    )
+
+    with pytest.raises(ValueError, match="EVS video pruning is not supported"):
+        NemotronH_Nano_VL_V2.forward(
+            model,
+            attn_metadata,
+            input_ids=torch.tensor([[20]], dtype=torch.long),
+            multimodal_params=[param],
+        )
+
+
+def test_get_vision_encoder_cuda_graph_config():
+    config = MultimodalEncoderCudaGraphConfig(buckets=[(1280, 1)])
+    mm_config = MultimodalConfig(encoder_cuda_graph={"vision": config})
+
+    assert _get_vision_encoder_cuda_graph_config(mm_config) is config
+
+
+def test_get_vision_encoder_cuda_graph_config_rejects_unknown_modalities():
+    mm_config = MultimodalConfig(
+        encoder_cuda_graph={"audio": MultimodalEncoderCudaGraphConfig(buckets=[(1024, 1)])}
+    )
+
+    with pytest.raises(ValueError, match="Unsupported multimodal encoder CUDA graph modalities"):
+        _get_vision_encoder_cuda_graph_config(mm_config)
 
 
 @pytest.fixture(scope="function")
@@ -70,8 +263,9 @@ def nano_llm_model():
     # we use the top-level LLM to create the engine to make things simpler.
     nano_llm = LLM(
         model=MODEL_PATH,
+        trust_remote_code=True,
         tensor_parallel_size=1,
-        max_batch_size=2,
+        max_batch_size=24,
         cuda_graph_config=CudaGraphConfig(),
         kv_cache_config=KvCacheConfig(enable_block_reuse=False, mamba_ssm_cache_dtype="float32"),
     )
@@ -217,6 +411,153 @@ def test_nemotron_nano_v2_vl_model_sanity_check(
         print("Passed! Max difference is within tolerance")
 
 
+@pytest.mark.threadleak(enabled=False)
+def test_nemotron_nano_v2_vl_image_batch_equivalence(nano_llm_model):
+    """End-to-end equivalence check for cross-request image batching.
+
+    Two distinct image+prompt requests are sent (a) together in one
+    `generate` call so the engine batches them in a single forward step
+    (and thus a single `_encode_multimodal` invocation with two
+    multimodal_params), and (b) separately in two `generate` calls. With
+    greedy decoding, the resulting token IDs must be identical and the
+    logprobs must match within bf16 tolerance. This is intended to detect
+    cross-request leakage or ordering bugs introduced by a future change
+    that batches per-modality across requests inside the vision encoder.
+    """
+    nano_llm = nano_llm_model
+    test_data_root = Path(os.path.join(llm_models_root(), "multimodals", "test_data"))
+    prompts = [
+        "Describe the natural environment in the image.",
+        "Describe the object and the weather condition in the image.",
+    ]
+    media = [str(test_data_root / "seashore.png"), str(test_data_root / "inpaint.png")]
+
+    sampling_params = SamplingParams(
+        max_tokens=16,
+        temperature=0.0,
+        add_special_tokens=False,
+        return_generation_logits=True,
+    )
+
+    def _build_inputs(prompts_subset, media_subset):
+        return default_multimodal_input_loader(
+            tokenizer=nano_llm.tokenizer,
+            model_dir=MODEL_PATH,
+            model_type="NemotronH_Nano_VL_V2",
+            modality="image",
+            prompts=prompts_subset,
+            media=media_subset,
+            image_data_format="pt",
+            num_frames=8,
+            device="cpu",
+        )
+
+    # Path A: both requests in one generate call -> engine batches them.
+    batched_inputs = _build_inputs(prompts, media)
+    batched_outputs = nano_llm.generate(batched_inputs, sampling_params)
+    assert len(batched_outputs) == 2
+
+    # Path B: each request in its own generate call.
+    sep_outputs = []
+    for p, m in zip(prompts, media):
+        sep_inputs = _build_inputs([p], [m])
+        sep_outputs.append(nano_llm.generate(sep_inputs, sampling_params)[0])
+
+    for i, (b_out, s_out) in enumerate(zip(batched_outputs, sep_outputs)):
+        b_token_ids = list(b_out.outputs[0].token_ids)
+        s_token_ids = list(s_out.outputs[0].token_ids)
+        assert b_token_ids == s_token_ids, (
+            f"Request {i}: token_ids differ between batched and separate runs.\n"
+            f"  batched : {b_token_ids}\n"
+            f"  separate: {s_token_ids}"
+        )
+
+        b_logp = extract_decode_logprobs(b_out).cpu()
+        s_logp = extract_decode_logprobs(s_out).cpu()
+        max_diff = (b_logp - s_logp).abs().max().item()
+        # bf16 reductions in attention / layernorm produce small but
+        # nonzero diffs between batched-forward and per-request-forward
+        # even for the same input. Token IDs (greedy) are the stronger
+        # equivalence signal; logprobs use a looser tolerance, well
+        # below the 0.3 threshold used by the sanity test.
+        assert max_diff < 0.15, (
+            f"Request {i}: logprob diff too large ({max_diff:.4f}).\n"
+            f"  batched : {b_logp}\n"
+            f"  separate: {s_logp}"
+        )
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_nemotron_nano_v2_vl_video_batch_equivalence(nano_llm_model):
+    """End-to-end equivalence check for cross-request video batching.
+
+    Mirror of `test_nemotron_nano_v2_vl_image_batch_equivalence` for
+    video: two distinct video+prompt requests sent (a) together in one
+    `generate` call (engine batches them, vision_encoder sees both
+    multimodal_params at once) and (b) separately in two `generate`
+    calls. With greedy decoding, token IDs must match and logprobs stay
+    within bf16 tolerance.
+
+    Intended to detect cross-video tubelet leakage if a future change
+    batches the temporal-video path across requests inside the vision
+    encoder.
+    """
+    nano_llm = nano_llm_model
+    test_data_root = Path(os.path.join(llm_models_root(), "multimodals", "test_data"))
+    prompts = [
+        "Describe the natural environment in the video.",
+        "Describe the scene in the video briefly.",
+    ]
+    media = [str(test_data_root / "world.mp4"), str(test_data_root / "world.mp4")]
+
+    sampling_params = SamplingParams(
+        max_tokens=16,
+        temperature=0.0,
+        add_special_tokens=False,
+        return_generation_logits=True,
+    )
+
+    def _build_inputs(prompts_subset, media_subset):
+        return default_multimodal_input_loader(
+            tokenizer=nano_llm.tokenizer,
+            model_dir=MODEL_PATH,
+            model_type="NemotronH_Nano_VL_V2",
+            modality="video",
+            prompts=prompts_subset,
+            media=media_subset,
+            image_data_format="pt",
+            num_frames=8,
+            device="cpu",
+        )
+
+    batched_inputs = _build_inputs(prompts, media)
+    batched_outputs = nano_llm.generate(batched_inputs, sampling_params)
+    assert len(batched_outputs) == 2
+
+    sep_outputs = []
+    for p, m in zip(prompts, media):
+        sep_inputs = _build_inputs([p], [m])
+        sep_outputs.append(nano_llm.generate(sep_inputs, sampling_params)[0])
+
+    for i, (b_out, s_out) in enumerate(zip(batched_outputs, sep_outputs)):
+        b_token_ids = list(b_out.outputs[0].token_ids)
+        s_token_ids = list(s_out.outputs[0].token_ids)
+        assert b_token_ids == s_token_ids, (
+            f"Request {i}: token_ids differ between batched and separate runs.\n"
+            f"  batched : {b_token_ids}\n"
+            f"  separate: {s_token_ids}"
+        )
+
+        b_logp = extract_decode_logprobs(b_out).cpu()
+        s_logp = extract_decode_logprobs(s_out).cpu()
+        max_diff = (b_logp - s_logp).abs().max().item()
+        assert max_diff < 0.15, (
+            f"Request {i}: logprob diff too large ({max_diff:.4f}).\n"
+            f"  batched : {b_logp}\n"
+            f"  separate: {s_logp}"
+        )
+
+
 class TestEncodeMultimodalDispatch:
     def _make_mock_model(self):
         """Create a minimal mock with the attributes `_encode_multimodal` needs."""
@@ -237,15 +578,17 @@ class TestEncodeMultimodalDispatch:
     def test_encode_multimodal_dispatches_audio(self):
         model = self._make_mock_model()
         fake_audio_embeds = torch.randn(10, 128)
-        model._encode_audio = mock.MagicMock(return_value=fake_audio_embeds)
+        # All audio is encoded via the batched `_encode_audio` helper.
+        model._encode_audio = mock.MagicMock(return_value=[(fake_audio_embeds, [10])])
 
         mm_param = mock.MagicMock()
-        mm_param.multimodal_data = {"modality_type": "audio", "audio": {}}
+        audio_data = {"foo": "bar"}
+        mm_param.multimodal_data = {"modality_type": "audio", "audio": audio_data}
 
         # Call the real method on our mock
         result = NemotronH_Nano_VL_V2._encode_multimodal(model, [mm_param])
 
-        model._encode_audio.assert_called_once_with(mm_param)
+        model._encode_audio.assert_called_once_with([audio_data])
         model.vision_encoder.assert_not_called()
         self._assert_compatible_with_chunked_prefill(result)
         assert torch.equal(result[0], fake_audio_embeds)
@@ -286,7 +629,7 @@ class TestSoundPlaceholderInjection:
     VIDEO_TOKEN = "<video>"
     SOUND_TOKEN = "<so_embedding>"
 
-    def _call_extract_audio_from_video(self, text_prompt, video_metadatas):
+    def _call_extract_audio_from_video(self, text_prompt, video_audios):
         """Call the real _extract_audio_from_video with a minimal mock model.
 
         _prepare_audio_features is stubbed to pass through the text unchanged
@@ -297,19 +640,22 @@ class TestSoundPlaceholderInjection:
         model._sound_context_token = self.SOUND_TOKEN
         model._audio_extractor = MagicMock()  # not None → passes early return
         model._prepare_audio_features = MagicMock(side_effect=lambda text, _: (text, {}))
-        return NanoV2VLInputProcessor._extract_audio_from_video(model, text_prompt, video_metadatas)
+        return NanoV2VLInputProcessor._extract_audio_from_video(model, text_prompt, video_audios)
+
+    def _make_audio(self) -> AudioData:
+        return AudioData(samples=np.zeros(16000), sample_rate=16000)
 
     def test_two_videos_only_second_has_audio(self):
         """When video1 is silent and video2 has audio, the sound placeholder
         should be injected after the *second* <video>, not the first."""
         text_prompt = f"Watch {self.VIDEO_TOKEN} and {self.VIDEO_TOKEN} carefully."
 
-        video_metadatas = [
-            {},  # video 1: no audio
-            {"audio_samples": np.zeros(16000), "audio_sample_rate": 16000},
+        video_audios = [
+            None,  # video 1: no audio
+            self._make_audio(),
         ]
 
-        result, _ = self._call_extract_audio_from_video(text_prompt, video_metadatas)
+        result, _ = self._call_extract_audio_from_video(text_prompt, video_audios)
 
         expected = f"Watch {self.VIDEO_TOKEN} and {self.VIDEO_TOKEN}{self.SOUND_TOKEN} carefully."
         assert result == expected, (
@@ -322,13 +668,13 @@ class TestSoundPlaceholderInjection:
         """Sound placeholders should follow the first and third <video> tokens."""
         text_prompt = f"A {self.VIDEO_TOKEN} B {self.VIDEO_TOKEN} C {self.VIDEO_TOKEN} D"
 
-        video_metadatas = [
-            {"audio_samples": np.zeros(16000), "audio_sample_rate": 16000},
-            {},  # video 2: no audio
-            {"audio_samples": np.zeros(16000), "audio_sample_rate": 16000},
+        video_audios = [
+            self._make_audio(),
+            None,  # video 2: no audio
+            self._make_audio(),
         ]
 
-        result, _ = self._call_extract_audio_from_video(text_prompt, video_metadatas)
+        result, _ = self._call_extract_audio_from_video(text_prompt, video_audios)
 
         expected = (
             f"A {self.VIDEO_TOKEN}{self.SOUND_TOKEN} B "
@@ -375,12 +721,15 @@ class TestEncodeMultimodalAudioOrder:
         v2_emb = torch.randn(v2_len, hidden)
         a2_emb = torch.randn(a2_len, hidden)
 
-        # vision_encoder is called once per param; return the right tensor.
-        vision_returns = [
-            ([v1_emb], [list(range(v1_len))]),
-            ([v2_emb], [list(range(v2_len))]),
-        ]
+        # All video params are encoded in a single batched call; the encoder
+        # returns one embedding per param, in input order.
+        vision_return = (
+            [v1_emb, v2_emb],
+            [list(range(v1_len)), list(range(v2_len))],
+        )
 
+        # All audio (across both videos) is encoded in a single batched call;
+        # the helper returns one (emb, per_clip_counts) per input in order.
         audio_returns = [(a1_emb, [a1_len]), (a2_emb, [a2_len])]
 
         params = [
@@ -391,9 +740,9 @@ class TestEncodeMultimodalAudioOrder:
         # Build a minimal mock of NemotronH_Nano_VL_V2 with only the attributes `_encode_multimodal`
         # touches.
         model = MagicMock()
-        model.vision_encoder = MagicMock(side_effect=vision_returns)
+        model.vision_encoder = MagicMock(return_value=vision_return)
         model.sound_encoder = MagicMock()  # not None -> audio path taken
-        model._encode_audio_data = MagicMock(side_effect=audio_returns)
+        model._encode_audio = MagicMock(return_value=audio_returns)
         # Mock the interleaver to simply concatenate vision + audio, since this test only verifies
         # per-param dispatch, not interleaving math.
         model._interleave_video_audio_embeddings = MagicMock(
@@ -431,13 +780,13 @@ class TestEncodeMultimodalAudioOrder:
         model = MagicMock()
         model.vision_encoder = MagicMock(return_value=([v_emb], [list(range(v_len))]))
         model.sound_encoder = MagicMock()
-        model._encode_audio_data = MagicMock()
+        model._encode_audio = MagicMock()
 
         result = NemotronH_Nano_VL_V2._encode_multimodal(model, [param])
 
         assert len(result) == 1
         assert torch.equal(result[0], v_emb), "Vision-only video should not have audio appended"
-        model._encode_audio_data.assert_not_called()
+        model._encode_audio.assert_not_called()
 
     def test_no_audio_concat_when_sound_encoder_is_none(self):
         hidden = 16
@@ -449,13 +798,13 @@ class TestEncodeMultimodalAudioOrder:
         model = MagicMock()
         model.vision_encoder = MagicMock(return_value=([v_emb], [list(range(v_len))]))
         model.sound_encoder = None  # no audio support
-        model._encode_audio_data = MagicMock()
+        model._encode_audio = MagicMock()
 
         result = NemotronH_Nano_VL_V2._encode_multimodal(model, [param])
 
         assert len(result) == 1
         assert torch.equal(result[0], v_emb)
-        model._encode_audio_data.assert_not_called()
+        model._encode_audio.assert_not_called()
 
 
 class TestInterleaveVideoAudioEmbeddings:
@@ -571,6 +920,97 @@ class TestInterleaveVideoAudioEmbeddings:
         assert torch.equal(result, expected)
 
 
+class TestEncodeAudio:
+    """Numerical equivalence: batched audio vs per-input encoding.
+
+    Uses a deterministic stub for `sound_encoder` so the test does not
+    depend on a checkpoint that ships sound weights (the test fixture's
+    12B-v2-VL has none). The stub mirrors what the real encoder
+    contracts: maps ``[N, T_in, mel]`` to ``[N, T_out, hidden]`` with
+    a fixed temporal subsampling factor and exposes
+    ``encoder._get_subsampling_output_length``.
+    """
+
+    MEL_BINS = 4
+    HIDDEN = 8
+    SUBSAMPLE = 2  # 2 input timesteps -> 1 output timestep
+
+    def _make_stub_sound_encoder(self):
+        # The model invokes:
+        #   sound_embeds = sound_encoder(features, mask)
+        #   valid_output_lens = sound_encoder.encoder._get_subsampling_output_length(valid_input_lens)
+        # so the stub is a small Linear over the time dim plus a method.
+        proj = torch.nn.Linear(self.MEL_BINS, self.HIDDEN, bias=False)
+
+        class _StubEncoder(torch.nn.Module):
+            def __init__(self_inner):
+                super().__init__()
+
+            def _get_subsampling_output_length(self_inner, valid_input_lens):
+                return torch.div(valid_input_lens, TestEncodeAudio.SUBSAMPLE, rounding_mode="floor")
+
+        class _Stub(torch.nn.Module):
+            def __init__(self_inner):
+                super().__init__()
+                self_inner.proj = proj
+                self_inner.encoder = _StubEncoder()
+
+            def forward(self_inner, features, mask):
+                # features: [N, T, mel] -> mel-projected, then mean-pool every
+                # SUBSAMPLE timesteps to mimic temporal subsampling.
+                x = self_inner.proj(features)  # [N, T, hidden]
+                T = x.shape[1]
+                T_trim = (T // TestEncodeAudio.SUBSAMPLE) * TestEncodeAudio.SUBSAMPLE
+                x = x[:, :T_trim].reshape(
+                    x.shape[0],
+                    T_trim // TestEncodeAudio.SUBSAMPLE,
+                    TestEncodeAudio.SUBSAMPLE,
+                    -1,
+                )
+                return x.mean(dim=2)  # [N, T_out, hidden]
+
+        return _Stub()
+
+    def _make_audio_data(self, num_clips, time_len, valid_lens):
+        features = torch.randn(num_clips, time_len, self.MEL_BINS)
+        mask = torch.zeros(num_clips, time_len, dtype=torch.long)
+        for i, vl in enumerate(valid_lens):
+            mask[i, :vl] = 1
+        return {"input_audio_features": features, "feature_attention_mask": mask}
+
+    def test_batched_matches_per_input(self):
+        """Bucket output equals N singleton `_encode_audio` calls.
+
+        Compares ``encode([a1, a2])`` against ``[encode([a1])[0], encode([a2])[0]]``
+        — the contract is that the i-th batched result is identical to a
+        per-input call for input i.
+        """
+        torch.manual_seed(0)
+        stub = self._make_stub_sound_encoder()
+        model = mock.MagicMock(spec=NemotronH_Nano_VL_V2)
+        model.sound_encoder = stub
+        model.model_dtype = torch.float32
+
+        # Two inputs with different time / clip counts.
+        a1 = self._make_audio_data(num_clips=2, time_len=10, valid_lens=[10, 6])
+        a2 = self._make_audio_data(num_clips=1, time_len=14, valid_lens=[12])
+
+        per_input_results = [
+            NemotronH_Nano_VL_V2._encode_audio(model, [a1])[0],
+            NemotronH_Nano_VL_V2._encode_audio(model, [a2])[0],
+        ]
+        batched_results = NemotronH_Nano_VL_V2._encode_audio(model, [a1, a2])
+
+        assert len(batched_results) == 2
+        for (b_emb, b_counts), (s_emb, s_counts) in zip(batched_results, per_input_results):
+            assert b_counts == s_counts
+            assert torch.allclose(b_emb, s_emb, atol=1e-6, rtol=1e-6)
+
+    def test_empty_input(self):
+        model = mock.MagicMock(spec=NemotronH_Nano_VL_V2)
+        assert NemotronH_Nano_VL_V2._encode_audio(model, []) == []
+
+
 class TestEncodeMultimodalContract:
     """Verify `_encode_multimodal` conforms to the contract expected by `get_multimodal_embeddings`.
 
@@ -614,18 +1054,21 @@ class TestEncodeMultimodalContract:
 
         `get_multimodal_embeddings` requires `len(embeddings) == 1` and splits by per-request token
         counts in order to cache the embeddings.
+
+        Image params are batched into a single `vision_encoder` call that
+        returns a per-param embedding list.
         """
         model = self._make_mock_model()
         emb_a = torch.randn(5, self.HIDDEN)
         emb_b = torch.randn(3, self.HIDDEN)
-        model.vision_encoder.side_effect = [
-            ([emb_a], [None]),
-            ([emb_b], [None]),
-        ]
+        model.vision_encoder.return_value = ([emb_a, emb_b], [None, None])
 
         params = [self._make_mm_param("image"), self._make_mm_param("image")]
         result = NemotronH_Nano_VL_V2._encode_multimodal(model, params)
 
+        # All image params go through a single batched vision_encoder call.
+        assert model.vision_encoder.call_count == 1
+        assert model.vision_encoder.call_args.args == (params,)
         assert len(result) == 1
         assert result[0].shape == (8, self.HIDDEN)
         # Verify concatenation order is preserved.
@@ -638,7 +1081,7 @@ class TestEncodeMultimodalContract:
         img_emb = torch.randn(5, self.HIDDEN)
         audio_emb = torch.randn(3, self.HIDDEN)
         model.vision_encoder.return_value = ([img_emb], [None])
-        model._encode_audio = mock.MagicMock(return_value=audio_emb)
+        model._encode_audio = mock.MagicMock(return_value=[(audio_emb, [3])])
 
         params = [
             self._make_mm_param("image"),
@@ -683,12 +1126,13 @@ class TestChunkedPrefillCaching:
 
     def _make_param_with_runtime(self, modality_type, num_tokens, **extra):
         """Build a real MultimodalParams with runtime data for caching."""
+        # Single contiguous mm block of `num_tokens` tokens, none cached yet:
+        # mask = all-True over the chunk, cumsum = [1, 2, ..., num_tokens].
+        embed_mask_cumsum = torch.arange(1, num_tokens + 1, dtype=torch.int64)
         runtime = MultimodalRuntimeData(
             past_seen_token_num=0,
-            mm_token_lengths=[num_tokens],
-            mm_token_positions=[0],
             chunk_end_pos=num_tokens,
-            special_token_offsets=[],
+            embed_mask_cumsum=embed_mask_cumsum,
         )
         # Mirror the nested shape produced by the input processor: a dict
         # keyed by `modality_type` holds per-modality side-channel data.
@@ -747,7 +1191,8 @@ class TestChunkedPrefillCaching:
     def test_audio_encoder_not_called_on_second_chunk(self):
         model = self._make_mock_model()
         fake_emb = torch.randn(self.NUM_TOKENS, self.HIDDEN)
-        model._encode_audio = mock.MagicMock(return_value=fake_emb)
+        # Audio is encoded via the batched `_encode_audio` helper.
+        model._encode_audio = mock.MagicMock(return_value=[(fake_emb, [self.NUM_TOKENS])])
 
         param = self._make_param_with_runtime("audio", self.NUM_TOKENS, audio={})
         encoder_fn = self._make_encoder_fn(model)
@@ -773,27 +1218,27 @@ class TestChunkedPrefillCaching:
         assert torch.equal(result2[0], result[0])
 
     def test_multi_request_batch_caching(self):
-        """Two image requests in one batch: both cached after one call."""
+        """Two image requests in one batch: both cached after a single batched call."""
         model = self._make_mock_model()
         emb_a = torch.randn(5, self.HIDDEN)
         emb_b = torch.randn(3, self.HIDDEN)
-        model.vision_encoder.side_effect = [
-            ([emb_a], [None]),
-            ([emb_b], [None]),
-        ]
+        # All image params are encoded in a single batched call.
+        model.vision_encoder.return_value = ([emb_a, emb_b], [None, None])
 
         param_a = self._make_param_with_runtime("image", 5)
         param_b = self._make_param_with_runtime("image", 3)
         encoder_fn = self._make_encoder_fn(model)
 
-        # First call: encoder runs for both.
+        # First call: encoder runs once for the whole image batch.
         result = get_multimodal_embeddings(
             encoder_forward_fn=encoder_fn,
             multimodal_params=[param_a, param_b],
         )
         assert len(result) == 1
         assert result[0].shape == (8, self.HIDDEN)
-        assert model.vision_encoder.call_count == 2  # once per param
+        assert model.vision_encoder.call_count == 1, (
+            "image params should be encoded in a single batched vision_encoder call"
+        )
 
         # Both should be cached.
         assert "multimodal_embedding" in param_a.multimodal_data
@@ -804,7 +1249,7 @@ class TestChunkedPrefillCaching:
             encoder_forward_fn=encoder_fn,
             multimodal_params=[param_a, param_b],
         )
-        assert model.vision_encoder.call_count == 2, (
+        assert model.vision_encoder.call_count == 1, (
             "`vision_encoder` was called again on the second chunk. "
             "Caching is broken - `_encode_multimodal` likely violates the "
             "`get_multimodal_embeddings` return type contract."

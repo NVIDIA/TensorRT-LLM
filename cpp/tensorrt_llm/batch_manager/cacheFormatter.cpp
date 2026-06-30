@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -73,6 +73,13 @@ void sendBuffer(TransferSession& session, int deviceId, size_t localIdx,
 
     size_t bufferIdx = computeBufferIdx(localIdx, targetInfo);
     size_t size = outputBuffers[bufferIdx]->getSizeInBytes();
+
+    // Skip Helix CP ranks that own no blocks for this sequence (num_total_blocks < cp_size).
+    // The matching gen rank skips its receive, so no 0-byte transfer is posted on either side.
+    if (size == 0)
+    {
+        return;
+    }
 
     if (bufferIdx < bufferCoverTargetNum)
     {
@@ -204,6 +211,12 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
 
         for (auto const& [windowSize, metadata] : windowsMetadata)
         {
+            // Skip recurrent state windows — their encoded windowSize (0x80000001)
+            // would overflow the arithmetic below
+            if (LinearAttentionMetadata::hasRecurrentStatesCache(windowSize))
+            {
+                continue;
+            }
             auto windowStartBlockIdx = needSendAllForWindow
                 ? 0
                 : static_cast<SizeType32>(blockIdsPerWindow.at(windowSize).size())
@@ -221,6 +234,19 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
     }
 
     TLLM_CHECK_WITH_INFO(lastBlockKey.uniqueTokens.size() > 0, "lastBlockKey must be non-empty when reuse is enabled");
+
+    auto multimodalHashes = llmRequest.getMultimodalHashes();
+    bool isMultimodal = multimodalHashes.has_value() && *multimodalHashes && !(*multimodalHashes)->empty();
+    if (isMultimodal)
+    {
+        auto tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
+        auto const usableSize = static_cast<SizeType32>(lastBlockKey.uniqueTokens.size());
+        auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(
+            lastBlockKey.uniqueTokens, usableSize, tokensPerBlock, /*allowPartial=*/true);
+        auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
+        return BlockRange::fromReuseTree(*cacheManager, blockKeys, indexFromEnd);
+    }
+
     return BlockRange::fromReuseTree(*cacheManager, lastBlockKey, indexFromEnd);
 }
 
@@ -273,6 +299,12 @@ BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmReques
 
     for (auto const& [windowSize, metadata] : windowsMetadata)
     {
+        // Skip recurrent state windows — their encoded windowSize (0x80000001) would
+        // overflow the arithmetic below.
+        if (LinearAttentionMetadata::hasRecurrentStatesCache(windowSize))
+        {
+            continue;
+        }
         auto const& blockIdsPerWindow = blockRange.getBlockIdsPerWindow();
         auto windowStartBlockIdx = static_cast<SizeType32>(blockIdsPerWindow.at(windowSize).size())
             - (windowSize / cacheManager->getBlockManager().getTokensPerBlock() + 1);
@@ -342,7 +374,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
     auto indexFromEnd = session.getIndexFromEnd();
     auto& bufferManager = session.getBufferManager();
-    // Some TP rank don't need to send cache since duplicate header is not needed.
+
     if (!cache_formatter_utils::needSendCache(selfConfig, destConfig, selfIdx))
     {
         return;
@@ -367,7 +399,24 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         = blockManager.getNumPools(/*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
     // TODO(oargov): are we sure the other side has the same number of pools? this might not hold for pp_size>1...
 
-    bool layerWise = common::getEnvDisaggLayerwise() && numPools == 1;
+    // Filter out recurrent state windows — handled by RnnCacheFormatter.
+    auto const allWindowSizes = blockRange.getWindowSizes();
+    std::vector<SizeType32> kvWindowSizes;
+    kvWindowSizes.reserve(allWindowSizes.size());
+    for (auto const& ws : allWindowSizes)
+    {
+        if (!LinearAttentionMetadata::hasRecurrentStatesCache(ws))
+        {
+            kvWindowSizes.push_back(ws);
+        }
+    }
+
+    SizeType32 const numKvPools = static_cast<SizeType32>(kvWindowSizes.size());
+
+    TLLM_LOG_DEBUG("CacheFormatter::format: allWindowSizes=%zu, kvWindowSizes=%d, numPools=%d, requestId=%lu",
+        allWindowSizes.size(), numKvPools, numPools, llmRequest.mRequestId);
+
+    bool layerWise = common::getEnvDisaggLayerwise() && numKvPools == 1;
     if (layerWise)
     {
         auto& progress = llmRequest.getContextProgress();
@@ -382,8 +431,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
             {
                 progress->wait(layerIdx);
             }
-            auto const& windowSizes = blockRange.getWindowSizes();
-            for (auto const& windowSize : windowSizes)
+            for (auto const& windowSize : kvWindowSizes)
             {
                 auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSize);
                 for (auto it = blockRangeForWindow.begin(); it != blockRangeForWindow.end(); ++it)
@@ -409,15 +457,14 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         int blockNum = 0;
 
         size_t allCacheBlockSize = 0;
-        auto const& windowSizes = blockRange.getWindowSizes();
         TLLM_LOG_DEBUG(
-            mpi::MpiComm::world().getRank(), " blockRange.getWindowSizes(); windowSizes size: %d", windowSizes.size());
-        TLLM_CHECK_WITH_INFO(
-            static_cast<int>(windowSizes.size()) == numPools, "window sizes should be the same as numPools");
+            mpi::MpiComm::world().getRank(), " kvWindowSizes size: %d, numPools: %d", kvWindowSizes.size(), numPools);
+        // When recurrent state windows are present (unified pool), numKvPools < numPools.
+        TLLM_CHECK_WITH_INFO(numKvPools <= numPools, "KV window sizes should not exceed numPools");
 
         std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> inputKvCacheBlocksPerWindow;
 
-        for (auto const& windowSize : windowSizes)
+        for (auto const& windowSize : kvWindowSizes)
         {
             auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSize);
             TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " format  windowSize: %d blockRangeForWindow size: %d",
@@ -430,8 +477,9 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
                 blockNum++;
             }
         }
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "inputKvCacheBlocks size: %ld,blockNum: %d , windowSizes: %ld",
-            inputKvCacheBlocksPerWindow.size(), blockNum, windowSizes.size());
+        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+            "inputKvCacheBlocks size: %ld,blockNum: %d , kvWindowSizes: %ld", inputKvCacheBlocksPerWindow.size(),
+            blockNum, kvWindowSizes.size());
 
         if (inputKvCacheBlocksPerWindow.size() > 1)
         {
@@ -482,6 +530,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         // 5. send the buffer to the corresponding target. Ideally, we send only once (one buffer) for each target.
 
         auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend();
+        BufferIndexHolder sendHolder(*mCacheTransBufferManager, cacheBufferId, /*isRecv=*/false);
         int peerDuplicateHeadFactor = targetInfo.mPeerDupHeadFactor;
         auto bufferTargetNum = targetNum / peerDuplicateHeadFactor;
         auto ppRank = selfIdx
@@ -565,7 +614,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
 
         session.setTime(TransferSession::kTimeTransmissions);
 
-        mCacheTransBufferManager->freeBufferIndexForSend(cacheBufferId);
+        sendHolder.release();
         session.setTime(TransferSession::kTimePostprocess);
     }
     TLLM_LOG_DEBUG(
@@ -609,9 +658,24 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
     size_t blockNum = 0;
     size_t cacheBlockSizeSum = 0;
 
-    auto windowSizes = blockRange.getWindowSizes();
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " unformat windowSizes size: %d", windowSizes.size());
-    for (auto const& windowSize : windowSizes)
+    // Filter out recurrent state windows — handled by RnnCacheFormatter.
+    auto const allWindowSizes = blockRange.getWindowSizes();
+    std::vector<SizeType32> kvWindowSizes;
+    kvWindowSizes.reserve(allWindowSizes.size());
+    for (auto const& ws : allWindowSizes)
+    {
+        if (!LinearAttentionMetadata::hasRecurrentStatesCache(ws))
+        {
+            kvWindowSizes.push_back(ws);
+        }
+    }
+    SizeType32 const numKvPools = static_cast<SizeType32>(kvWindowSizes.size());
+
+    TLLM_LOG_DEBUG("CacheFormatter::unformat: allWindowSizes=%zu, kvWindowSizes=%d, numPools=%d, requestId=%lu",
+        allWindowSizes.size(), numKvPools, numPools, llmRequest.mRequestId);
+
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " unformat kvWindowSizes size: %d", kvWindowSizes.size());
+    for (auto const& windowSize : kvWindowSizes)
     {
         auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSize);
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "  unformat windowSize: %d blockRangeForWindow size: %d",
@@ -625,9 +689,17 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
             blockNum++;
         }
     }
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "outputBuffersPerWindow size: %ld,blockNum: %d , windowSizes: %ld",
-        outputBuffersPerWindow.size(), blockNum, windowSizes.size());
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+        "outputBuffersPerWindow size: %ld,blockNum: %d , kvWindowSizes: %ld", outputBuffersPerWindow.size(), blockNum,
+        kvWindowSizes.size());
     TLLM_CHECK(!outputBuffersPerWindow.empty());
+
+    // An "empty" Helix CP rank owns no KV blocks for this sequence (num_total_blocks < cp_size).
+    // There is nothing to receive; the sender (context, CP=1) skips the matching 0-byte transfer.
+    if (blockNum == 0)
+    {
+        return;
+    }
     if (outputBuffersPerWindow.size() > 1)
     {
         // We only support limited case for VSWA.
@@ -639,8 +711,13 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
     {
         NVTX3_SCOPED_RANGE(formatInputRecvBuffer);
 
+        // TODO(disagg-multi-dtype): pool 0's dtype is treated as canonical for the wire
+        // transport here.  Pools with differing dtypes are rejected up-front in
+        // CacheTransBufferManager's constructor (see cacheTransBuffer.cpp).  When
+        // per-pool dtype dispatch lands, this single dataType variable must be replaced
+        // with a per-pool lookup keyed by the source pool of each block.
         auto dataType = mCacheManager->getPrimaryPool(0)->getDataType();
-        bool layerWise = common::getEnvDisaggLayerwise() && numPools == 1;
+        bool layerWise = common::getEnvDisaggLayerwise() && numKvPools == 1;
         if (layerWise)
         {
             // [numLayersInPool, ...]
@@ -787,6 +864,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
             size_t remainNoCoverTargetNum = 0;
             size_t bufferCoverTargetNum = 0;
             std::optional<int> cacheBufferId = std::nullopt;
+            BufferIndexHolder recvHolder;
             {
                 NVTX3_SCOPED_RANGE(formatInputAllocBuffer);
 
@@ -802,6 +880,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                 {
                     cacheBufferId = mCacheTransBufferManager->assignBufferIndexForRecv();
                 }
+                recvHolder = BufferIndexHolder(*mCacheTransBufferManager, cacheBufferId, /*isRecv=*/true);
                 auto [recvSplitCachestmp, bufferCoverTargetNumtmp, onlyUseDynamicBuffer]
                     = mCacheTransBufferManager->getOrAllocateRecvBuffers(
                         cacheBufferId, static_cast<int>(targetNum), bufferEleSizes, bufferManager);
@@ -935,10 +1014,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                     recvSplitCaches, outputBuffersPerWindow, destConfig, selfConfig, selfIdx, bufferManager);
 
                 bufferManager.getStream().synchronize();
-                if (cacheBufferId.has_value())
-                {
-                    mCacheTransBufferManager->freeBufferIndexForRecv(cacheBufferId);
-                }
+                recvHolder.release();
             }
             session.setTime(TransferSession::kTimePostprocess);
         }
@@ -957,8 +1033,17 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
         return false;
     }
 
-    std::unordered_set<SizeType32> setVecSelf{
-        selfConfig.getModelConfig().mNbKvHeadsPerLayer.begin(), selfConfig.getModelConfig().mNbKvHeadsPerLayer.end()};
+    // Collect unique non-zero KV head counts.  Hybrid models (CppMambaHybridCacheManager)
+    // include mamba/recurrent state layers with 0 KV heads — those must be excluded from
+    // the uniformity check which only applies to attention layers.
+    std::unordered_set<SizeType32> setVecSelf;
+    for (auto h : selfConfig.getModelConfig().mNbKvHeadsPerLayer)
+    {
+        if (h > 0)
+        {
+            setVecSelf.insert(h);
+        }
+    }
 
     if (setVecSelf.size() != 1)
     {
@@ -989,8 +1074,14 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
         return false;
     }
 
-    std::unordered_set<int> setVecDest{
-        destConfig.getModelConfig().mNbKvHeadsPerLayer.begin(), destConfig.getModelConfig().mNbKvHeadsPerLayer.end()};
+    std::unordered_set<SizeType32> setVecDest;
+    for (auto h : destConfig.getModelConfig().mNbKvHeadsPerLayer)
+    {
+        if (h > 0)
+        {
+            setVecDest.insert(h);
+        }
+    }
 
     if (setVecDest.size() != 1)
     {

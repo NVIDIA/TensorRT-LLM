@@ -595,6 +595,9 @@ executor::SamplingConfig getSamplingConfigFromTensors(InputTensors const& inputs
     std::optional<float> frequencyPenalty{std::nullopt};
     extractOptionalSingleton<float>(inputsTensors, InputFieldsNames::frequencyPenalty, frequencyPenalty);
 
+    std::optional<int32_t> promptIgnoreLength{std::nullopt};
+    extractOptionalSingleton<int32_t>(inputsTensors, InputFieldsNames::promptIgnoreLength, promptIgnoreLength);
+
     std::optional<uint64_t> seed{std::nullopt};
     extractOptionalSingleton<uint64_t>(inputsTensors, InputFieldsNames::seed, seed);
 
@@ -605,8 +608,8 @@ executor::SamplingConfig getSamplingConfigFromTensors(InputTensors const& inputs
     extractOptionalSingleton<int32_t>(inputsTensors, InputFieldsNames::numReturnSequences, numReturnSequences);
 
     return executor::SamplingConfig(beamWidth, topK, topP, topPMin, topPResetIds, topPDecay, seed, temperature,
-        minTokens, beamSearchDiversityRate, repetitionPenalty, presencePenalty, frequencyPenalty, lengthPenalty,
-        earlyStopping, noRepeatNgramSize, numReturnSequences);
+        minTokens, beamSearchDiversityRate, repetitionPenalty, presencePenalty, frequencyPenalty, promptIgnoreLength,
+        lengthPenalty, earlyStopping, noRepeatNgramSize, numReturnSequences);
 }
 
 executor::OutputConfig getOutputConfigFromTensors(InputTensors const& inputsTensors)

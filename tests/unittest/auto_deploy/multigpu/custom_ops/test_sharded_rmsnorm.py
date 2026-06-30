@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Functional tests for sharded_rmsnorm custom op.
 
 This module tests that the sharded_rmsnorm op produces correct
@@ -19,6 +33,7 @@ import torch.distributed as dist
 from mpi4py import MPI
 
 from tensorrt_llm._torch.auto_deploy.distributed.common import initialize, is_initialized
+from tensorrt_llm._utils import get_free_port
 
 # Register this module for cloudpickle serialization for MPI workers
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -42,6 +57,7 @@ def _reference_rmsnorm(input: torch.Tensor, weight: torch.Tensor, eps: float) ->
 
 def _run_sharded_rmsnorm_test(
     tensor_parallel_size: int,
+    port: int,
     batch_size: int = 2,
     seq_len: int = 8,
     hidden_size: int = 64,
@@ -66,7 +82,7 @@ def _run_sharded_rmsnorm_test(
     torch.cuda.set_device(rank)
 
     if not is_initialized():
-        initialize(rank, port=29500)
+        initialize(rank, port=port)
 
     # Map string to torch.dtype inside worker to avoid cloudpickle serialization issues
     dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16}
@@ -120,18 +136,19 @@ def test_sharded_rmsnorm_functional(mpi_pool_executor):
     """Functional test: verify sharded_rmsnorm produces correct numerical results."""
     torch.manual_seed(0)
     tensor_parallel_size = mpi_pool_executor.num_workers
+    port = get_free_port()
 
     results = mpi_pool_executor.map(
         _run_sharded_rmsnorm_test,
-        *zip(*[(tensor_parallel_size,)] * tensor_parallel_size),
+        *zip(*[(tensor_parallel_size, port)] * tensor_parallel_size),
     )
     for r in results:
         assert r is True
 
 
-def _run_sharded_rmsnorm_hidden_size_test(tensor_parallel_size: int, hidden_size: int):
+def _run_sharded_rmsnorm_hidden_size_test(tensor_parallel_size: int, port: int, hidden_size: int):
     """Worker function for hidden size parametrized test."""
-    return _run_sharded_rmsnorm_test(tensor_parallel_size, hidden_size=hidden_size)
+    return _run_sharded_rmsnorm_test(tensor_parallel_size, port=port, hidden_size=hidden_size)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 GPUs for this test")
@@ -141,18 +158,19 @@ def test_sharded_rmsnorm_different_hidden_sizes(mpi_pool_executor, hidden_size):
     """Test sharded_rmsnorm with different hidden sizes."""
     torch.manual_seed(0)
     tensor_parallel_size = mpi_pool_executor.num_workers
+    port = get_free_port()
 
     results = mpi_pool_executor.map(
         _run_sharded_rmsnorm_hidden_size_test,
-        *zip(*[(tensor_parallel_size, hidden_size)] * tensor_parallel_size),
+        *zip(*[(tensor_parallel_size, port, hidden_size)] * tensor_parallel_size),
     )
     for r in results:
         assert r is True
 
 
-def _run_sharded_rmsnorm_dtype_test(tensor_parallel_size: int, dtype_str: str):
+def _run_sharded_rmsnorm_dtype_test(tensor_parallel_size: int, port: int, dtype_str: str):
     """Worker function for dtype parametrized test."""
-    return _run_sharded_rmsnorm_test(tensor_parallel_size, dtype_str=dtype_str)
+    return _run_sharded_rmsnorm_test(tensor_parallel_size, port=port, dtype_str=dtype_str)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 GPUs for this test")
@@ -162,10 +180,11 @@ def test_sharded_rmsnorm_different_dtypes(mpi_pool_executor, dtype_str):
     """Test sharded_rmsnorm with different dtypes."""
     torch.manual_seed(0)
     tensor_parallel_size = mpi_pool_executor.num_workers
+    port = get_free_port()
 
     results = mpi_pool_executor.map(
         _run_sharded_rmsnorm_dtype_test,
-        *zip(*[(tensor_parallel_size, dtype_str)] * tensor_parallel_size),
+        *zip(*[(tensor_parallel_size, port, dtype_str)] * tensor_parallel_size),
     )
     for r in results:
         assert r is True

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -222,9 +222,9 @@ protected:
         auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {totalNumBlocks, blocksInSecondaryPool}}};
 
         mManager = std::make_unique<KVCacheManager>(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow,
-            mMaxNumSequences, maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt,
-            dataType, sinkTokenLength, stream, maxNumTokens, enableBlockReuse, CacheType::kSELF, std::nullopt, nullptr,
-            true);
+            mMaxNumSequences, maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, dataType,
+            sinkTokenLength, stream, maxAttentionWindow, maxAttentionWindow, enableBlockReuse, CacheType::kSELF,
+            std::nullopt, nullptr, true);
         auto attentionLayerNumPerPP = std::vector<SizeType32>{numLayers};
         mCacheState = std::make_unique<texec::kv_cache::CacheState>(
             numLayers, numHeads, sizePerHead, tokensPerBlock, 1, 1, 1, attentionLayerNumPerPP, dataType);
@@ -333,7 +333,8 @@ protected:
     {
         auto constexpr beamIdx{0};
         auto constexpr beamWidth{1};
-        mManager->addSequence(llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth, llmRequest);
+        mManager->addSequenceBatch(
+            {{{llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth}}}, {std::ref(*llmRequest)});
         if (isSender)
         {
             auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
@@ -347,11 +348,11 @@ protected:
                     TLLM_CUDA_CHECK(cudaMemset(it->data(), llmRequest->getPromptLen(), it->getSizeInBytes()));
                 }
             }
-            mFutures.emplace_back(mSender->sendAsync(*llmRequest));
+            mFutures.emplace_back(mSender->sendAsync(llmRequest));
         }
         else
         {
-            auto future = mRequester->receiveAsync(*llmRequest);
+            auto future = mRequester->receiveAsync(llmRequest);
             future.get();
             TLLM_CUDA_CHECK(cudaDeviceSynchronize());
             auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
@@ -467,12 +468,13 @@ struct CPMetaData
 
 struct WrappedLlmRequest
 {
-    std::unique_ptr<LlmRequest> mLlmRequest;
+    // shared_ptr to match CacheSender::sendAsync / CacheReceiver::receiveAsync signatures.
+    std::shared_ptr<LlmRequest> mLlmRequest;
     std::optional<CPMetaData> mCPMetaData;
 
     using RequestIdType = LlmRequest::RequestIdType;
 
-    WrappedLlmRequest(std::unique_ptr<LlmRequest> llmRequest, std::optional<CPMetaData> cpMetaData)
+    WrappedLlmRequest(std::shared_ptr<LlmRequest> llmRequest, std::optional<CPMetaData> cpMetaData)
         : mLlmRequest(std::move(llmRequest))
         , mCPMetaData(std::move(cpMetaData))
     {
@@ -687,10 +689,11 @@ protected:
         }
         TLLM_LOG_DEBUG(" cacheManager isWindowAttention: %d", mIsWindowAttention);
         mManager = std::make_unique<KVCacheManager>(layerNumthisRank, numHeadsPerRank, sizePerHead, tokensPerBlock,
-            blocksPerWindow, mMaxNumSequences, maxBeamWidth, maxAttentionWindowVec, std::nullopt, dataType,
-            sinkTokenLength, stream, maxNumTokens, enableBlockReuse, cacheType, std::nullopt, nullptr,
-            /*enablePartialReuse=*/true, /*copyOnpartialReuse=*/true, /*kvCacheConnectorManager=*/nullptr,
-            /*enableIndexerKCache=*/isIndexerKCache, /*indexerKCacheQuantBlockSize=*/indexerKCacheQuantBlockSize,
+            blocksPerWindow, mMaxNumSequences, maxBeamWidth, maxAttentionWindowVec, dataType, sinkTokenLength, stream,
+            maxAttentionWindow, maxAttentionWindow, enableBlockReuse, cacheType, std::nullopt, nullptr,
+            /*enablePartialReuse=*/true, /*copyOnpartialReuse=*/true,
+            /*kvCacheConnectorManager=*/nullptr, /*enableIndexerKCache=*/isIndexerKCache,
+            /*indexerKCacheQuantBlockSize=*/indexerKCacheQuantBlockSize,
             /*indexerKCacheIndexHeadDim=*/indexerDimPerHead);
         texec::kv_cache::CacheState::AttentionType attentionType = isMLA
             ? texec::kv_cache::CacheState::AttentionType::kMLA
@@ -885,7 +888,7 @@ protected:
         auto stats = texec::ContextPhaseParams({}, mRequestId, state.release(), std::nullopt);
         request.setContextPhaseParams(std::move(stats));
 
-        auto llmRequestPtr = std::make_unique<LlmRequest>(mRequestId++, std::move(request));
+        auto llmRequestPtr = std::make_shared<LlmRequest>(mRequestId++, std::move(request));
         return std::make_unique<WrappedLlmRequest>(std::move(llmRequestPtr), cpMetaData);
     }
 
@@ -917,7 +920,7 @@ protected:
         state->setCacheState(cacheState);
         auto stats = texec::ContextPhaseParams({}, requestId, state.release(), std::nullopt);
         request.setContextPhaseParams(std::move(stats));
-        auto llmRequestPtr = std::make_unique<LlmRequest>(requestId, std::move(request));
+        auto llmRequestPtr = std::make_shared<LlmRequest>(requestId, std::move(request));
 
         return std::make_unique<WrappedLlmRequest>(std::move(llmRequestPtr), cpMetaData);
     }
@@ -927,7 +930,8 @@ protected:
         auto constexpr beamIdx{0};
         auto constexpr beamWidth{1};
         auto& llmRequest = request->mLlmRequest;
-        mManager->addSequence(llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth, llmRequest);
+        mManager->addSequenceBatch(
+            {{{llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth}}}, {std::ref(*llmRequest)});
         auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
 
         int const numPools = mManager->getBlockManager().getNumPools(
@@ -970,7 +974,7 @@ protected:
         auto const onlyWindowSize = blockManager.getPoolWindowSize(0);
 
         blockManager.getBufferManager(onlyWindowSize).getStream().synchronize();
-        auto future = mSender->sendAsync(*llmRequest);
+        auto future = mSender->sendAsync(llmRequest);
         return future;
     }
 
@@ -979,8 +983,9 @@ protected:
         auto constexpr beamIdx{0};
         auto constexpr beamWidth{1};
         auto& llmRequest = request->mLlmRequest;
-        mManager->addSequence(llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth, llmRequest);
-        return mRequester->receiveAsync(*llmRequest);
+        mManager->addSequenceBatch(
+            {{{llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth}}}, {std::ref(*llmRequest)});
+        return mRequester->receiveAsync(llmRequest);
     }
 
     void generationVerifyKVCache(std::shared_ptr<WrappedLlmRequest> const& request)
@@ -1082,8 +1087,10 @@ protected:
         {
             TLLM_CHECK(mCacheState->getIndexerKCacheQuantBlockSize() != 0);
             TLLM_CHECK(mCacheState->getIndexerDimPerHead() % mCacheState->getIndexerKCacheQuantBlockSize() == 0);
-            sizePerHead = mCacheState->getIndexerDimPerHead()
-                + mCacheState->getIndexerDimPerHead() / mCacheState->getIndexerKCacheQuantBlockSize() * 4;
+            auto const dim = mCacheState->getIndexerDimPerHead();
+            auto const q = mCacheState->getIndexerKCacheQuantBlockSize();
+            auto const dataBytes = mCacheState->getIndexerKCacheUseFp4() ? dim / 2 : dim;
+            sizePerHead = dataBytes + dim / q * 4;
         }
         else
         {
@@ -1176,8 +1183,10 @@ protected:
         int sizePerHead;
         if (isIndexerKCache)
         {
-            sizePerHead = mCacheState->getIndexerDimPerHead()
-                + mCacheState->getIndexerDimPerHead() / mCacheState->getIndexerKCacheQuantBlockSize() * 4;
+            auto const dim = mCacheState->getIndexerDimPerHead();
+            auto const q = mCacheState->getIndexerKCacheQuantBlockSize();
+            auto const dataBytes = mCacheState->getIndexerKCacheUseFp4() ? dim / 2 : dim;
+            sizePerHead = dataBytes + dim / q * 4;
         }
         else
         {
@@ -1331,24 +1340,8 @@ TEST_P(AsymmetricalCacheTest, TestCase)
         // https://nvbugs/5760737
         GTEST_SKIP() << "Temporarily skipping cache transceiver tests with Mooncake backend for Indexer KCache.";
     }
+
     std::vector<int> lenList = {30, 10, 60, 80};
-    if (genCp > 1)
-    {
-        std::vector<int> updatedLenList;
-        for (auto len : lenList)
-        {
-            if (len > tokensPerBlock * (genCp - 1))
-            {
-                updatedLenList.push_back(len);
-            }
-        }
-        if (updatedLenList.empty())
-        {
-            GTEST_SKIP() << "Skipping test because not even one request has one block per genCP rank. tokensPerBlock="
-                         << tokensPerBlock << ", genCp=" << genCp;
-        }
-        lenList = updatedLenList;
-    }
 
     setUpCommunicator(contextTp, contextPp, contextCp, genTp, genPp, genCp, isMLA, contextDP, generationDP);
 
@@ -1456,26 +1449,8 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
     {
         GTEST_SKIP() << "Temporarily skipping cache transceiver tests with NIXL and MOONCAKE backend for CP.";
     }
-    // Filter request lengths based on CP requirements.
-    // Each request must have at least one block per CP rank to be valid for CP tests.
+
     std::vector<int> lenList = {60, 30, 60, 10};
-    if (genCp > 1)
-    {
-        std::vector<int> updatedLenList;
-        for (auto len : lenList)
-        {
-            if (len > tokensPerBlock * (genCp - 1))
-            {
-                updatedLenList.push_back(len);
-            }
-        }
-        if (updatedLenList.empty())
-        {
-            GTEST_SKIP() << "Skipping test because not even one request has one block per genCP rank. tokensPerBlock="
-                         << tokensPerBlock << ", genCp=" << genCp;
-        }
-        lenList = updatedLenList;
-    }
 
     setUpCommunicator(contextTp, contextPp, contextCp, genTp, genPp, genCp, isMLA, contextDP, generationDP);
 

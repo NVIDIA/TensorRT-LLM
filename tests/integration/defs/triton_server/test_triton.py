@@ -37,7 +37,6 @@ def model_path(test_name):
     model_mapping = {
         "gpt": "gpt2",
         "opt": "opt-125m",
-        "llama": "llama-models/llama-7b-hf",
         "mistral": "mistral-7b-v0.1",
         "mistral-ib": "mistral-7b-v0.1",
         "mistral-ib-streaming": "mistral-7b-v0.1",
@@ -75,7 +74,6 @@ def engine_dir(test_name, llm_root):
     engine_mapping = {
         "gpt": "models/core/gpt/trt_engine/gpt2/fp16/1-gpu/",
         "opt": "models/contrib/opt/trt_engine/opt-125m/fp16/1-gpu/",
-        "llama": "models/core/llama/llama_outputs",
         "mistral": "models/core/llama/mistral_7b_outputs",
         "mistral-ib": "models/core/llama/ib_mistral_7b_outputs",
         "mistral-ib-streaming": "models/core/llama/ib_mistral_7b_outputs",
@@ -118,16 +116,6 @@ def test_gpt(tritonserver_test_root, test_name, llm_root, model_path,
 
     # Run the test
     tokenizer_type = "auto"
-    run_shell_command(
-        f"cd {tritonserver_test_root} && ./test.sh {test_name} {engine_dir} {model_path} {tokenizer_type}",
-        llm_root)
-
-
-@pytest.mark.parametrize("test_name", ["llama"], indirect=True)
-def test_llama(tritonserver_test_root, test_name, llm_root, model_path,
-               engine_dir):
-    build_model(test_name, llm_root, tritonserver_test_root)
-    tokenizer_type = "llama"
     run_shell_command(
         f"cd {tritonserver_test_root} && ./test.sh {test_name} {engine_dir} {model_path} {tokenizer_type}",
         llm_root)

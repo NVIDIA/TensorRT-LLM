@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (out) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (out) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,10 +21,12 @@
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include "tensorrt_llm/plugins/gemmPlugin/gemmPlugin.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
+#include "tensorrt_llm/thop/outputTensor.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include "userbuffersTensor.h"
 #include <cublasLt.h>
 #include <torch/extension.h>
+#include <unordered_map>
 
 using torch::Tensor;
 
@@ -38,6 +40,7 @@ namespace
 
 using tensorrt_llm::common::check;
 using tensorrt_llm::common::CublasMMWrapper;
+
 using cublas_lut::AlgoListType;
 
 void set_algo_attr(cublasLtMatmulAlgo_t& algo, std::array<int, 8> const& attr_list)
@@ -156,6 +159,33 @@ bool find_special_algo_deprecated(cublasLtMatmulAlgo_t& algo, std::shared_ptr<Cu
     return true;
 }
 
+// Helper function: Get or create a workspace tensor for the given (device, stream).
+// Workspace is reused across multiple GEMM calls so the pointer captured by the
+// cublasLt kernel remains valid for CUDA-graph capture/replay. Keyed by
+// (device, stream) so concurrent GEMMs on different streams of the same device
+// don't race on the same scratch bytes.
+inline at::Tensor const& getWorkspaceTensor(c10::Device device, cudaStream_t stream)
+{
+    struct KeyHash
+    {
+        std::size_t operator()(std::pair<int, cudaStream_t> const& key) const noexcept
+        {
+            return std::hash<int>()(key.first) ^ (std::hash<cudaStream_t>()(key.second) << 1);
+        }
+    };
+
+    thread_local std::unordered_map<std::pair<int, cudaStream_t>, at::Tensor, KeyHash> workspace_tensors;
+    auto key = std::make_pair(device.index(), stream);
+
+    if (workspace_tensors.find(key) == workspace_tensors.end())
+    {
+        workspace_tensors[key]
+            = torch::empty(CUBLAS_WORKSPACE_SIZE, torch::TensorOptions().dtype(torch::kUInt8).device(device));
+    }
+
+    return workspace_tensors[key];
+}
+
 void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tensor const& b,
     std::optional<at::Tensor> const& scale_a, std::optional<at::Tensor> const& scale_b,
     std::optional<at::Tensor> const& bias, bool fast_acc = false)
@@ -187,10 +217,8 @@ void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tenso
     cudaDataType_t scaleType = CUDA_R_32F;
     cublasWrapper->setGemmConfig(aType, bType, outType, /*computeType=*/scaleType);
 
-    auto const workspace_options = torch::TensorOptions().dtype(torch::kUInt8).device(a.device());
-    auto workspace = torch::empty(CUBLAS_WORKSPACE_SIZE, workspace_options);
-
     auto stream = at::cuda::getCurrentCUDAStream(a.get_device());
+    auto const& workspace = getWorkspaceTensor(a.device(), stream.stream());
 
     auto* a_ptr = static_cast<void*>(a.data_ptr());
     auto* b_ptr = static_cast<void*>(b.data_ptr());
@@ -268,22 +296,16 @@ Tensor& cublas_scaled_mm_out(Tensor const& mat_a, Tensor const& mat_b, Tensor co
 }
 
 Tensor cublas_scaled_mm(Tensor const& mat_a, Tensor const& mat_b, Tensor const& scale_a, Tensor const& scale_b,
-    std::optional<at::Tensor> const& bias, std::optional<c10::ScalarType> out_dtype, bool to_userbuffers = false)
+    std::optional<at::Tensor> const& bias, std::optional<c10::ScalarType> out_dtype, int64_t output_buffer_kind = 0,
+    c10::optional<torch::List<int64_t>> group = c10::nullopt)
 {
     TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2);
     auto const out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
 
     std::vector<int64_t> output_size = {mat_a.sizes()[0], mat_b.sizes()[1]};
 
-    Tensor out;
-    if (to_userbuffers)
-    {
-        out = torch_ext::create_userbuffers_tensor(output_size, out_dtype_).first;
-    }
-    else
-    {
-        out = at::empty(output_size, mat_a.options().dtype(out_dtype_));
-    }
+    auto [out, _] = torch_ext::allocate_output(
+        output_size, out_dtype_, mat_a.device(), static_cast<torch_ext::BufferKind>(output_buffer_kind), group);
 
     return cublas_scaled_mm_out(mat_a, mat_b, scale_a, scale_b, bias, out);
 }
@@ -309,12 +331,14 @@ Tensor& cublas_mm_out(Tensor const& mat_a, Tensor const& mat_b, std::optional<at
 }
 
 Tensor cublas_mm(Tensor const& mat_a, Tensor const& mat_b, std::optional<at::Tensor> const& bias,
-    std::optional<c10::ScalarType> out_dtype)
+    std::optional<c10::ScalarType> out_dtype, int64_t output_buffer_kind = 0,
+    c10::optional<torch::List<int64_t>> group = c10::nullopt)
 {
     TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2);
     auto const out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
     std::vector<int64_t> output_size = {mat_a.sizes()[0], mat_b.sizes()[1]};
-    Tensor out = at::empty(output_size, mat_a.options().dtype(out_dtype_));
+    auto [out, _] = torch_ext::allocate_output(
+        output_size, out_dtype_, mat_a.device(), static_cast<torch_ext::BufferKind>(output_buffer_kind), group);
     return cublas_mm_out(mat_a, mat_b, bias, out);
 }
 
@@ -326,8 +350,11 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "cublas_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scale_a, Tensor scale_b, Tensor? bias,"
-        " ScalarType? out_dtype, bool to_userbuffers=False) -> (Tensor out)");
-    m.def("cublas_mm(Tensor mat_a, Tensor mat_b, Tensor? bias, ScalarType? out_dtype) -> (Tensor out)");
+        " ScalarType? out_dtype, int output_buffer_kind=0, int[]? group=None)"
+        " -> (Tensor out)");
+    m.def(
+        "cublas_mm(Tensor mat_a, Tensor mat_b, Tensor? bias, ScalarType? out_dtype,"
+        " int output_buffer_kind=0, int[]? group=None) -> (Tensor out)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
