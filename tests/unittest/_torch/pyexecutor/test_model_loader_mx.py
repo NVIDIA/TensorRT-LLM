@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules import attention as attention_mod
 from tensorrt_llm._torch.modules.attention import MLA
 from tensorrt_llm._torch.modules.linear import Linear
@@ -36,9 +37,22 @@ class _LinearStub(nn.Module):
         pass
 
 
+def _make_draft_model_config():
+    pretrained_config = SimpleNamespace(
+        architectures=["DraftArch"],
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        tie_word_embeddings=False,
+        torch_dtype=torch.float16,
+    )
+    return ModelConfig(pretrained_config=pretrained_config)
+
+
 class _DraftModel(nn.Module):
-    def __init__(self):
+    def __init__(self, model_config):
         super().__init__()
+        self.model_config = model_config
+        self.config = model_config.pretrained_config
         self.linear = _LinearStub()
 
 
@@ -47,10 +61,8 @@ class _TinyModel(nn.Module):
         super().__init__()
         self._weights_transformed = False
         self.linear = _LinearStub()
-        self.draft_model = _DraftModel()
-        self.draft_config = SimpleNamespace(
-            pretrained_config=SimpleNamespace(architectures=["DraftArch"])
-        )
+        self.draft_config = _make_draft_model_config()
+        self.draft_model = _DraftModel(self.draft_config)
         self._events = events
 
     def _apply(self, fn):
