@@ -33,7 +33,11 @@ try:
 except Exception:
     MPI = None  # deferred; functions will error if used when ENABLE_MULTI_DEVICE is True
 
-from tensorrt_llm._mnnvl_utils import init_helix_cp_comm
+from tensorrt_llm._mnnvl_utils import (get_helix_cp_mnnvl_topology,
+                                       init_helix_cp_comm)
+from tensorrt_llm._torch.distributed.nccl_fault_tolerance import (
+    NCCL_FAULT_TOLERANCE_ENABLED, _canonical_recovery_generation,
+    _recovery_rendezvous_id)
 from tensorrt_llm._utils import (mpi_allgather, mpi_barrier, mpi_comm,
                                  mpi_disabled, mpi_isend, mpi_isend_object,
                                  mpi_recv, mpi_recv_object, mpi_send,
@@ -1636,16 +1640,67 @@ class PPCommNCCL:
 
     def __init__(self, global_mapping: Mapping):
         self.mapping = global_mapping
+        self._topology = self._mapping_topology(global_mapping)
+        self._reconfigure_lock = threading.Lock()
+        self._reconfigure_generation = 0
+        self._completed_recovery = None
         self.nccl_comm = torch.classes.trtllm.NcclCommunicatorOp(
             self.mapping.world_size,
             self.mapping.rank,
         )
+        if NCCL_FAULT_TOLERANCE_ENABLED:
+            # The FT native communicator survives process-local Python wrapper
+            # churn. Mirror its actual survivor membership instead of assuming
+            # a newly-created wrapper always represents the initial world.
+            self._active_ranks = tuple(
+                int(rank) for rank in self.nccl_comm.get_active_ranks())
+        else:
+            # Preserve the legacy constructor path when FT is disabled.
+            self._active_ranks = tuple(range(self.mapping.world_size))
         self.tensor_ready_event = torch.cuda.Event()
         self.send_stream = torch.cuda.Stream()
 
+    @staticmethod
+    def _mapping_topology(mapping: Mapping) -> tuple:
+        return (
+            int(mapping.world_size),
+            int(mapping.rank),
+            tuple(mapping.pp_group),
+            get_helix_cp_mnnvl_topology(mapping),
+        )
+
+    def is_compatible(self, mapping: Mapping) -> bool:
+        """Whether another engine can share this process-local communicator."""
+        return self._topology == self._mapping_topology(mapping)
+
+    def _validate_peer(self, peer: int) -> int:
+        peer = int(peer)
+        if peer not in self._topology[2]:
+            raise RuntimeError(
+                f"NCCL error: peer world rank {peer} is not in this rank's PP group "
+                f"{list(self._topology[2])}")
+        if peer not in self._active_ranks:
+            raise RuntimeError(
+                f"NCCL error: peer world rank {peer} is not active in the current PP communicator"
+            )
+        return peer
+
+    def _required_pp_peer(self, *, next_peer: bool) -> int:
+        # Do not silently skip a failed stage: connecting non-adjacent stages
+        # would bypass model layers. A higher-level topology reconstruction may
+        # pass an explicit remapped peer once it has reassigned those layers.
+        peer = (self.mapping.next_pp_rank()
+                if next_peer else self.mapping.prev_pp_rank())
+        return self._validate_peer(peer)
+
     def send(self, tensor: torch.Tensor, dest: Optional[int] = None):
-        if dest is None:
-            dest = self.mapping.next_pp_rank()
+        if not NCCL_FAULT_TOLERANCE_ENABLED:
+            if dest is None:
+                dest = self.mapping.next_pp_rank()
+        elif dest is None:
+            dest = self._required_pp_peer(next_peer=True)
+        else:
+            dest = self._validate_peer(dest)
 
         # NCCL send kernel in send_stream cannot be captured,
         # so we send in the current stream instead in CUDA graph cases.
@@ -1663,9 +1718,109 @@ class PPCommNCCL:
             self.nccl_comm.send(tensor, dest)
 
     def recv(self, tensor: torch.Tensor, src: Optional[int] = None):
-        if src is None:
-            src = self.mapping.prev_pp_rank()
+        if not NCCL_FAULT_TOLERANCE_ENABLED:
+            if src is None:
+                src = self.mapping.prev_pp_rank()
+        elif src is None:
+            src = self._required_pp_peer(next_peer=False)
+        else:
+            src = self._validate_peer(src)
         self.nccl_comm.recv(tensor, src)
+
+    def abort(self, generation: Optional[int] = None) -> None:
+        """Abort the PP communicator on this survivor."""
+        # Capture the generation before waiting for a concurrent rebuild. If
+        # that rebuild succeeds, this abort belongs to the old communicator
+        # and must not tear down its replacement. An abort that starts after
+        # the rebuild observes the new generation and still takes effect.
+        if generation is None:
+            generation = self._reconfigure_generation
+        with self._reconfigure_lock:
+            if generation != self._reconfigure_generation:
+                return
+            self.nccl_comm.abort()
+
+    def abort_and_reinit(self,
+                         active_ranks: List[int],
+                         generation: Optional[int] = None) -> None:
+        """Rebuild the PP communicator using only surviving world ranks.
+
+        Every survivor must call this with the same rank set. The C++ wrapper
+        exchanges a fresh NCCL unique ID point-to-point, so excluded ranks do
+        not participate in communicator initialization.
+
+        ``generation`` is the coordinator's shared monotonic recovery-event
+        generation, advanced for every distinct attempt. It is required for
+        same-membership recovery so every rank enters the native rendezvous
+        even when local watchdog observations differ. Repeated callbacks with
+        the same generation and target are idempotent. A retry after any native
+        failure must use a newly advanced generation so stale rendezvous traffic
+        cannot pair different recovery attempts.
+        """
+        canonical_ranks = tuple(sorted(int(rank) for rank in active_ranks))
+        if not canonical_ranks:
+            raise ValueError("active_ranks must not be empty")
+        if len(canonical_ranks) != len(set(canonical_ranks)):
+            raise ValueError("active_ranks must not contain duplicates")
+        if self.mapping.rank not in canonical_ranks:
+            raise ValueError(
+                f"current world rank {self.mapping.rank} is not active")
+        generation = _canonical_recovery_generation(generation)
+        rendezvous_id = _recovery_rendezvous_id(generation)
+
+        # Failure notifications can be duplicated or delivered concurrently by
+        # independent control paths. Keep the native rebuild and its Python
+        # membership mirror in one transaction so a stale callback cannot
+        # widen membership after a newer shrink has completed.
+        with self._reconfigure_lock:
+            current_ranks = tuple(
+                int(rank) for rank in self.nccl_comm.get_active_ranks())
+            self._active_ranks = current_ranks
+            if generation is not None and self._completed_recovery is not None:
+                completed_generation, completed_target = self._completed_recovery
+                if generation < completed_generation:
+                    return
+                if generation == completed_generation:
+                    if canonical_ranks != completed_target:
+                        raise RuntimeError(
+                            "NCCL error: conflicting PP communicator recovery "
+                            f"target for generation {generation}: completed "
+                            f"{list(completed_target)}, requested {list(canonical_ranks)}"
+                        )
+                    return
+            if canonical_ranks == current_ranks and generation is None:
+                raise ValueError(
+                    "generation is required for same-membership PP communicator "
+                    "recovery so every survivor makes the same rebuild decision"
+                )
+            if not set(canonical_ranks).issubset(current_ranks):
+                raise ValueError(
+                    "abort_and_reinit cannot reactivate a removed rank")
+
+            self.nccl_comm.abort_and_reinit(list(canonical_ranks),
+                                            rendezvous_id)
+            native_ranks = tuple(
+                int(rank) for rank in self.nccl_comm.get_active_ranks())
+            self._active_ranks = native_ranks
+            self._reconfigure_generation += 1
+            if native_ranks != canonical_ranks:
+                raise RuntimeError(
+                    "NCCL error: rebuilt PP communicator returned unexpected "
+                    f"membership {list(native_ranks)}; expected {list(canonical_ranks)}"
+                )
+            if generation is not None:
+                self._completed_recovery = (generation, canonical_ranks)
+
+    def get_async_error(self) -> str:
+        """Return the C++ wrapper's latched NCCL abort/error reason, if any."""
+        return self.nccl_comm.get_async_error()
+
+    def get_active_ranks(self) -> List[int]:
+        """Return original world-rank IDs in the current PP communicator."""
+        with self._reconfigure_lock:
+            self._active_ranks = tuple(
+                int(rank) for rank in self.nccl_comm.get_active_ranks())
+            return list(self._active_ranks)
 
 
 class PPCommTorch:
@@ -1698,16 +1853,149 @@ class PPCommTorch:
 
 
 _pp_comm = None
+_pp_comm_refcount = 0
+_pp_comm_lock = threading.Lock()
+_pp_comm_condition = threading.Condition(_pp_comm_lock)
+_pp_comm_control_refcount = 0
+_pp_comm_final_release_pending = False
 
 
 def init_pp_comm(mapping):
-    """Initialize PPComm once at startup"""
-    global _pp_comm
-    if mpi_disabled():
-        _pp_comm = PPCommTorch(mapping)
-    else:
-        _pp_comm = PPCommNCCL(mapping)
-    init_helix_cp_comm(mapping)
+    """Acquire the process-local PP communicator for one model engine."""
+    global _pp_comm, _pp_comm_refcount
+    with _pp_comm_condition:
+        while (_pp_comm_control_refcount > 0 or _pp_comm_final_release_pending):
+            _pp_comm_condition.wait()
+        created = False
+        if mpi_disabled():
+            if _pp_comm is None:
+                _pp_comm = PPCommTorch(mapping)
+                created = True
+            elif not isinstance(_pp_comm, PPCommTorch):
+                raise RuntimeError(
+                    "PP communicator is already initialized with a different backend"
+                )
+            elif _pp_comm.mapping != mapping:
+                raise RuntimeError(
+                    "PP communicator is already initialized for a different topology"
+                )
+        else:
+            if _pp_comm is None:
+                _pp_comm = PPCommNCCL(mapping)
+                created = True
+            elif not isinstance(_pp_comm, PPCommNCCL):
+                raise RuntimeError(
+                    "NCCL error: PP communicator is already initialized with a different backend"
+                )
+            elif not _pp_comm.is_compatible(mapping):
+                raise RuntimeError(
+                    "NCCL error: PP communicator is already initialized for a "
+                    "different topology (PP or Helix MNNVL CP topology)")
+        try:
+            init_helix_cp_comm(mapping)
+        except Exception:
+            if created and _pp_comm_refcount == 0:
+                _pp_comm = None
+            raise
+        _pp_comm_refcount += 1
+
+
+def release_pp_comm() -> None:
+    """Release one model engine's ownership of the shared PP communicator."""
+    global _pp_comm, _pp_comm_refcount, _pp_comm_final_release_pending
+    with _pp_comm_condition:
+        if _pp_comm_refcount <= 0:
+            raise RuntimeError(
+                "PP communicator release has no matching acquisition")
+        _pp_comm_refcount -= 1
+        if _pp_comm_refcount == 0:
+            _pp_comm_final_release_pending = True
+            while _pp_comm_control_refcount > 0:
+                _pp_comm_condition.wait()
+            if not (NCCL_FAULT_TOLERANCE_ENABLED
+                    and isinstance(_pp_comm, PPCommNCCL)):
+                # Preserve the legacy teardown behavior when FT is disabled.
+                _pp_comm = None
+            # In FT mode both the native communicator and its Python recovery
+            # generation state are process-lifetime. A rank-local final release
+            # is not a distributed teardown barrier, and dropping either state
+            # could make only one rank enter a duplicate-generation rendezvous.
+            _pp_comm_final_release_pending = False
+            _pp_comm_condition.notify_all()
+
+
+def _get_pp_nccl_comm_locked() -> PPCommNCCL:
+    """Return the NCCL PP communicator while ``_pp_comm_lock`` is held."""
+    if not isinstance(_pp_comm, PPCommNCCL):
+        raise RuntimeError("NCCL error: PP communicator is not initialized")
+    return _pp_comm
+
+
+def _acquire_pp_nccl_control(
+        *,
+        capture_generation: bool = False) -> tuple[PPCommNCCL, Optional[int]]:
+    """Keep the shared communicator alive without holding its lifecycle lock."""
+    global _pp_comm_control_refcount
+    with _pp_comm_lock:
+        comm = _get_pp_nccl_comm_locked()
+        if _pp_comm_refcount <= 0 or _pp_comm_final_release_pending:
+            raise RuntimeError("NCCL error: PP communicator is being released")
+        _pp_comm_control_refcount += 1
+        generation = (comm._reconfigure_generation
+                      if capture_generation else None)
+        return comm, generation
+
+
+def _release_pp_nccl_control() -> None:
+    global _pp_comm_control_refcount
+    with _pp_comm_condition:
+        if _pp_comm_control_refcount <= 0:
+            raise RuntimeError(
+                "NCCL error: PP communicator control reference underflow")
+        _pp_comm_control_refcount -= 1
+        if _pp_comm_control_refcount == 0:
+            _pp_comm_condition.notify_all()
+
+
+def pp_comm_abort() -> None:
+    """Abort the process-local NCCL PP communicator."""
+    comm, generation = _acquire_pp_nccl_control(capture_generation=True)
+    try:
+        comm.abort(generation)
+    finally:
+        comm = None
+        _release_pp_nccl_control()
+
+
+def pp_comm_abort_and_reinit(active_ranks: List[int],
+                             generation: Optional[int] = None) -> None:
+    """Rebuild the NCCL PP communicator using surviving original world ranks."""
+    comm, _ = _acquire_pp_nccl_control()
+    try:
+        comm.abort_and_reinit(active_ranks, generation)
+    finally:
+        comm = None
+        _release_pp_nccl_control()
+
+
+def pp_comm_get_async_error() -> str:
+    """Return the NCCL PP communicator's latched abort/error reason."""
+    comm, _ = _acquire_pp_nccl_control()
+    try:
+        return comm.get_async_error()
+    finally:
+        comm = None
+        _release_pp_nccl_control()
+
+
+def pp_comm_get_active_ranks() -> List[int]:
+    """Return original world-rank IDs in the NCCL PP communicator."""
+    comm, _ = _acquire_pp_nccl_control()
+    try:
+        return comm.get_active_ranks()
+    finally:
+        comm = None
+        _release_pp_nccl_control()
 
 
 @TorchDist.log_op

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -56,9 +56,9 @@ public:
 
     int initialize()
     {
-        TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
+        TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
         mNcclComm = getComm(mGroup);
-        TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
+        TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
         return 0;
     }
 
@@ -71,12 +71,11 @@ public:
         int64_t sum_sizes
             = sizes.has_value() ? std::accumulate(sizes.value().begin(), sizes.value().end(), 0, std::plus<>{}) : 0;
         std::vector<torch::Tensor> output_list;
+        std::vector<cudaStream_t> streams;
+        bool const trackOperations = isNcclFaultToleranceEnabled();
         output_list.reserve(input_list.size());
-        ncclGroupStart();
         for (auto const& input : input_list)
         {
-            auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
-            auto type = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
             std::vector<int64_t> outputShape = input.sizes().vec();
             if (sizes.has_value())
             {
@@ -86,29 +85,68 @@ public:
             {
                 outputShape[0] *= mGroup.size();
             }
-            auto output = torch::empty(outputShape, input.options());
+            output_list.push_back(torch::empty(outputShape, input.options()));
+            if (trackOperations)
+            {
+                auto const stream = at::cuda::getCurrentCUDAStream(input.get_device());
+                if (std::find(streams.begin(), streams.end(), stream) == streams.end())
+                {
+                    streams.push_back(stream);
+                }
+            }
+        }
+
+        auto commLease = acquireComm(mNcclComm);
+        auto const comm = commLease.get();
+        std::vector<uint64_t> watchdogTokens;
+        if (trackOperations)
+        {
+            watchdogTokens.reserve(streams.size());
+            for (auto const stream : streams)
+            {
+                watchdogTokens.push_back(commLease.begin(stream, "ncclAllGather"));
+            }
+        }
+        commLease.groupStart("ncclGroupStart(allgather)");
+        for (size_t index = 0; index < input_list.size(); ++index)
+        {
+            auto const& input = input_list[index];
+            auto& output = output_list[index];
+            auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+            auto type = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
             if (use_nccl_allgather)
             {
-                ncclAllGather(input.data_ptr(), output.mutable_data_ptr(), input.numel(), (*getDtypeMap())[type],
-                    *mNcclComm, stream);
+                commLease.checkEnqueue(ncclAllGather(input.data_ptr(), output.mutable_data_ptr(), input.numel(),
+                                           (*getDtypeMap())[type], comm, stream),
+                    "ncclAllGather");
             }
             else
             {
+                auto const& outputShape = output.sizes();
                 size_t numel_base
                     = std::accumulate(outputShape.cbegin() + 1, outputShape.cend(), 1, std::multiplies<>{});
                 int64_t split_offset = 0;
                 for (int root = 0; root < static_cast<int>(mGroup.size()); ++root)
                 {
                     auto split_size = sizes.value()[root];
-                    ncclBroadcast(input.data_ptr(),
-                        output.index({torch::indexing::Slice(split_offset, torch::indexing::None)}).mutable_data_ptr(),
-                        numel_base * split_size, (*getDtypeMap())[type], root, *mNcclComm, stream);
+                    commLease.checkEnqueue(
+                        ncclBroadcast(input.data_ptr(),
+                            output.index({torch::indexing::Slice(split_offset, torch::indexing::None)})
+                                .mutable_data_ptr(),
+                            numel_base * split_size, (*getDtypeMap())[type], root, comm, stream),
+                        "ncclBroadcast(allgather)");
                     split_offset += split_size;
                 }
             }
-            output_list.push_back(output);
         }
-        NCCLCHECK_THROW(ncclGroupEnd());
+        commLease.groupEnd("ncclGroupEnd(allgather)");
+        if (trackOperations)
+        {
+            for (size_t index = 0; index < streams.size(); ++index)
+            {
+                commLease.track(watchdogTokens[index], streams[index]);
+            }
+        }
         return output_list;
     }
 
