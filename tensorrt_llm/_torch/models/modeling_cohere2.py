@@ -162,7 +162,7 @@ class Cohere2DecoderLayer(DecoderLayer):
         hidden_states = self.input_layernorm(hidden_states)
 
         hidden_states_attention = self.self_attn(
-            position_ids=None,
+            position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             **kwargs,
