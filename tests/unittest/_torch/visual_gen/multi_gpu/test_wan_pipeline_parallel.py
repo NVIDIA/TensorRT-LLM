@@ -37,10 +37,21 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 
 try:
+    import sys
+    from pathlib import Path
+
     from diffusers import DiffusionPipeline
 
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
-    from tensorrt_llm._utils import get_free_port
+
+    # Reuse the CI-aware free-port allocator from tests/integration so that
+    # sequentially spawned distributed workers get disjoint MASTER_PORTs and
+    # don't collide with ports still in TIME_WAIT (EADDRINUSE).
+    _integration_dir = Path(__file__).resolve().parents[4] / "integration"
+    if str(_integration_dir) not in sys.path:
+        sys.path.insert(0, str(_integration_dir))
+    from defs.common import get_free_port_in_ci
+
     from tensorrt_llm.visual_gen.args import (
         AttentionConfig,
         ParallelConfig,
@@ -149,7 +160,7 @@ def run_test_in_distributed(world_size: int, test_fn: Callable, **kwargs):
         pytest.skip("Required modules not available")
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
-    port = get_free_port()
+    port = get_free_port_in_ci()
     mp.spawn(
         _distributed_worker,
         args=(world_size, "nccl", test_fn, port, kwargs),
