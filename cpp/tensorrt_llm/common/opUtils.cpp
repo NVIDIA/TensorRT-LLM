@@ -169,7 +169,13 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
         setenv("NCCL_NVLS_ENABLE", "0", 0);
     }
 #endif // _WIN32
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
+    ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
+    config.graphUsageMode = 1;
+    NCCLCHECK_THROW(ncclCommInitRankConfig(ncclComm.get(), group.size(), id, groupRank, &config));
+#else
     NCCLCHECK_THROW(ncclCommInitRank(ncclComm.get(), group.size(), id, groupRank));
+#endif // NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
     commMap[group] = ncclComm;
     TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, rank);
     return ncclComm;
