@@ -58,9 +58,12 @@ target_sources(bounceMessageCodecTest PRIVATE ${BOUNCE_DIR}/BounceMessage.cpp)
 add_gtest(buddyAllocatorTest buddyAllocatorTest.cpp)
 target_sources(buddyAllocatorTest PRIVATE ${BOUNCE_DIR}/BuddyAllocator.cpp)
 # GPU test: execution-context pool (stream/event/scratch/hostPinned)
-# acquire/release.
+# acquire/release. ExecPool now sizes the optional cub batched-copy workspace
+# via batchedCopyCubTempBytes(), so it links the kernel TU
+# (GatherScatterKernel.cu) too.
 add_gtest(execPoolTest execPoolTest.cpp)
-target_sources(execPoolTest PRIVATE ${BOUNCE_DIR}/ExecPool.cpp)
+target_sources(execPoolTest PRIVATE ${BOUNCE_DIR}/ExecPool.cpp
+                                    ${BOUNCE_DIR}/GatherScatterKernel.cu)
 # GPU test: gather/scatter CUDA kernel round-trip (needs a CUDA device to run).
 add_gtest(gatherScatterKernelTest gatherScatterKernelTest.cpp)
 target_sources(gatherScatterKernelTest
