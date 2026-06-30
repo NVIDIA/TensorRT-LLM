@@ -107,6 +107,52 @@ class TestAttentionConfigQuantValidation:
 
         assert attention.quant_attention_config is not None
 
+    def test_supported_quant_config_cute_mxfp8(self):
+        attention = AttentionConfig(
+            backend="CUTEDSL",
+            quant_attention_config=QuantAttentionConfig(
+                qk_dtype="fp8",
+                v_dtype="fp8",
+                q_block_size=1,
+                k_block_size=1,
+                v_block_size=0,
+                qk_sf_vec=32,
+            ),
+        )
+
+        assert attention.quant_attention_config is not None
+        assert attention.quant_attention_config.qk_sf_vec == 32
+
+    def test_supported_quant_config_cute_nvfp4(self):
+        attention = AttentionConfig(
+            backend="CUTEDSL",
+            quant_attention_config=QuantAttentionConfig(
+                qk_dtype="fp4",
+                v_dtype="fp8",
+                q_block_size=1,
+                k_block_size=1,
+                v_block_size=0,
+                qk_sf_vec=16,
+            ),
+        )
+
+        assert attention.quant_attention_config is not None
+        assert attention.quant_attention_config.qk_sf_vec == 16
+
+    def test_fp4_qk_dtype_rejected_on_trtllm(self):
+        with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
+            AttentionConfig(
+                backend="TRTLLM",
+                quant_attention_config=QuantAttentionConfig(
+                    qk_dtype="fp4",
+                    v_dtype="fp8",
+                    q_block_size=1,
+                    k_block_size=1,
+                    v_block_size=0,
+                    qk_sf_vec=16,
+                ),
+            )
+
 
 class TestPipelineRegistryUnique:
     """Guard against duplicate HF IDs across PIPELINE_REGISTRY entries.

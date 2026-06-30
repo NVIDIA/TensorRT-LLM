@@ -49,8 +49,8 @@ def get_visual_gen_attention_backend(
                     Better performance but requires fused QKV
         - "FA4": Flash Attention 4; provides higher speedup on Blackwell GPUs (sm100)
                  Requires flash-attn package with cute interface
-        - "CUTEDSL": CuTe DSL FMHA kernels; uses packaged cubins when present,
-                     otherwise compiles from CuTe DSL source
+        - "CUTEDSL": CuTe DSL FMHA kernels; Best performance on Blackwell GPUs (sm100/sm103)
+                     Compiles from CuTe DSL source
     """
     # Lazy imports to avoid circular dependency
     from .cute_dsl import CuTeDSLAttention
@@ -116,9 +116,8 @@ def create_attention(
     """
     attn_cls = get_visual_gen_attention_backend(backend)
 
-    # Extract quant_attention_config from AttentionConfig and pass to backends
-    # that support it (TRTLLM SAGE recipes, CUTEDSL QK16PV8). AttentionConfig
-    # validation rejects unsupported (backend, recipe) combinations upstream.
+    # Extract quant_attention_config from AttentionConfig and pass to supported backends
+    # (TRTLLM SAGE / CUTEDSL QK16PV8); AttentionConfig's validator rejects unsupported combos.
     if attention_config is not None and attention_config.quant_attention_config is not None:
         kwargs["quant_attention_config"] = attention_config.quant_attention_config
     if backend.upper() == "TRTLLM":
