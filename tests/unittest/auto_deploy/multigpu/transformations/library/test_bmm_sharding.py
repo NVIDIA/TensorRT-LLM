@@ -23,6 +23,7 @@ from _dist_test_utils import get_device_counts
 from _graph_test_helpers import run_sharding_pattern_detection_test, run_test_transformed_gm
 
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
+from tensorrt_llm._torch.auto_deploy._compat import AllReduceStrategy
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     BMMShardingInfo,
@@ -30,7 +31,6 @@ from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
-from tensorrt_llm.functional import AllReduceStrategy
 
 
 class BMM(nn.Module):
