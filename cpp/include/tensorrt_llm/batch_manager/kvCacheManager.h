@@ -1203,6 +1203,14 @@ public:
     //!          are already in the trie when they are replaced with placeholders.
     void storeContextBlocks(GenerationRequest& sequence, LlmRequest const& llmRequest);
 
+    //! \brief Release orphaned blocks for a request whose sequence was removed before
+    //!        storeContextBlocks could register them in the reuse trie.
+    //! \details Returns blocks to the eviction policy free pool WITHOUT inserting them
+    //!          into the radix trie, preventing stale KV-cache data from being recycled
+    //!          to new requests (which would cause cascading empty-completion corruption).
+    //!          No-op if removeSequence already cleaned up this request.
+    void releaseOrphanedBlocks(LlmRequest::RequestIdType requestId);
+
     //! \brief Store blocks in the reuse trie.
     //! \param blockKeys Key of each block.
     //! \param blocks Block pointers (beam 0 only). OOW slots contain placeholder blocks
@@ -1337,6 +1345,14 @@ private:
 
     // List of allocated blocks for each sequences
     std::unordered_map<LlmRequest::RequestIdType, std::vector<BlockPtr>> mAllocatedBlocksPerSeq;
+    // Guards mutation of mAllocatedBlocksPerSeq (extract/erase) and the associated
+    // per-block refcount + eviction-policy release. The normal teardown path
+    // (releaseBlocks, driven by removeSequence) and the orphaned-block reclamation path
+    // (releaseOrphanedBlocks, driven by storeContextBlocks when the sequence was already
+    // removed) can run concurrently for the same request; without this lock both could
+    // extract() the same node and double-decrement refcounts. Leaf lock: never held while
+    // calling into storeBlocks()/the reuse trie (mLookupTree mutex) to avoid lock inversion.
+    mutable std::mutex mAllocatedBlocksMtx;
 
     // Pool per unique numKvHeads in the model
     std::vector<KVCacheBlockPool> mPools;
@@ -1829,6 +1845,12 @@ public:
 
     //! \brief Store context blocks
     void storeContextBlocks(GenerationRequest& sequence, LlmRequest const& llmRequest);
+
+    //! \brief Release orphaned blocks across all window managers for a request whose
+    //!        sequence was removed before its context blocks were stored for reuse.
+    //! \details Delegates to each WindowBlockManager::releaseOrphanedBlocks. Prevents
+    //!          stale KV blocks from poisoning the reuse trie under enable_block_reuse.
+    void releaseOrphanedBlocks(LlmRequest::RequestIdType requestId);
 
     //! \brief Store newest block for reuse
     void storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
