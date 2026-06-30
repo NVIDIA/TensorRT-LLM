@@ -23,6 +23,6 @@ from defs.trt_test_alternative import check_call
 def _visual_gen_deps(llm_venv):
     """Install av, diffusers, and ffmpeg once per VisualGen test session."""
     llm_venv.run_cmd(["-m", "pip", "install", "av"])
-    llm_venv.run_cmd(["-m", "pip", "install", "diffusers>=0.37.0"])
+    llm_venv.run_cmd(["-m", "pip", "install", "diffusers==0.38.0"])
     check_call(["apt-get", "update", "-y"], shell=False)
     check_call(["apt-get", "install", "-y", "ffmpeg"], shell=False)
