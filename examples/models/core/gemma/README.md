@@ -71,4 +71,3 @@ trtllm-eval \
 ```
 
 Internally, `trtllm-eval mmmu` forces `apply_chat_template=True` because it is a multimodal benchmark, while `trtllm-eval covost2` sets `--apply_chat_template` to `True` by default. Both configurations align with the chat template that Gemma 4 was trained on.
-
