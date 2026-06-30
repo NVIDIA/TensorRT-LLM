@@ -1471,6 +1471,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # Cross-attention uses the THOP path; the trtllm-gen backend API does
         # not carry encoder K/V tensors yet.
 
+        # Paged context enables the QKV preprocessing required for FP8 context
+        # FMHA when the KV cache uses FP8 storage.
+        if self.has_fp8_kv_cache:
+            metadata.use_paged_context_fmha = True
+
         # SM90 forces `use_paged_context_fmha` on for correctness
         # (https://nvbugs/5624818).
         if get_sm_version() == 90:
