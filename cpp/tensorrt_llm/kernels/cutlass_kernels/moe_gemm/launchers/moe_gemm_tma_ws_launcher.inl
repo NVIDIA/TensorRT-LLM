@@ -15,6 +15,8 @@
  */
 
 #pragma once
+#include "tensorrt_llm/common/cudaUtils.h"
+
 #include "cutlass/array.h"
 #include "cutlass/numeric_conversion.h"
 
@@ -675,9 +677,10 @@ using namespace cutlass::epilogue;
                 using GemmKernel_ = typename GemmGrouped::GemmKernel;                                                                                                                                                                                                                                                       \
                 int smem_size = static_cast<int>(sizeof(typename GemmKernel_::SharedStorage));                                                                                                                                                                                                                              \
                 int device_ = 0;                                                                                                                                                                                                                                                                                            \
-                cudaGetDevice(&device_);                                                                                                                                                                                                                                                                                    \
+                tensorrt_llm::common::check_cuda_error(cudaGetDevice(&device_));                                                                                                                                                                                                                                            \
                 int maxSmem_ = 0;                                                                                                                                                                                                                                                                                           \
-                cudaDeviceGetAttribute(&maxSmem_, cudaDevAttrMaxSharedMemoryPerBlockOptin, device_);                                                                                                                                                                                                                        \
+                tensorrt_llm::common::check_cuda_error(                                                                                                                                                                                                                                                                     \
+                    cudaDeviceGetAttribute(&maxSmem_, cudaDevAttrMaxSharedMemoryPerBlockOptin, device_));                                                                                                                                                                                                                   \
                 TLLM_CHECK_WITH_INFO(smem_size <= maxSmem_,                                                                                                                                                                                                                                                                 \
                     "MoE grouped GEMM requires %d bytes shared memory but device supports %d", smem_size, maxSmem_);                                                                                                                                                                                                        \
             }                                                                                                                                                                                                                                                                                                               \

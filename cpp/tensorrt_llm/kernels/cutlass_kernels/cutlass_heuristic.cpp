@@ -17,6 +17,7 @@
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 
 #ifdef __GNUC__ // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic push
@@ -563,13 +564,14 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm120(CutlassGemmConfig::Ca
         {
             constexpr int kMinSmemForFullTileSet = 120 * 1024;
             int device = 0;
-            cudaGetDevice(&device);
+            tensorrt_llm::common::check_cuda_error(cudaGetDevice(&device));
             int maxSmem = 0;
-            cudaDeviceGetAttribute(&maxSmem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+            tensorrt_llm::common::check_cuda_error(
+                cudaDeviceGetAttribute(&maxSmem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
 
             if (maxSmem < kMinSmemForFullTileSet)
             {
-                auto it = std::remove_if(candidate_configs.begin(), candidate_configs.end(),
+                auto const it = std::remove_if(candidate_configs.begin(), candidate_configs.end(),
                     [](CutlassGemmConfig const& config)
                     { return config.tile_config_sm120 != CutlassTileConfigSM120::CtaShape128x128x64B; });
                 candidate_configs.erase(it, candidate_configs.end());
