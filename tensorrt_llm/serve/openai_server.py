@@ -112,6 +112,46 @@ from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
 # yapf: enable
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
 
+# Parse incoming request bodies with orjson instead of the stdlib json when it
+# is available. FastAPI/Starlette call Request.json() (stdlib json.loads) before
+# pydantic validation; at high concurrency that decode dominates the single
+# OpenAI-server process's event-loop/GIL time, and orjson is ~5-10x faster.
+# Fully fallback-safe: if orjson is not installed behavior is unchanged, and any
+# input orjson rejects is re-parsed with the stdlib parser per request.
+try:
+    import orjson as _orjson
+    from fastapi.routing import APIRoute as _APIRoute
+
+    class _ORJSONRequest(Request):
+        """Request that decodes its JSON body with orjson (stdlib fallback)."""
+
+        async def json(self) -> Any:
+            if not hasattr(self, "_json"):
+                body = await self.body()
+                try:
+                    self._json = _orjson.loads(body)
+                except ValueError:
+                    # orjson is stricter than the stdlib (e.g. rejects
+                    # NaN/Infinity); fall back so behavior is identical.
+                    self._json = json.loads(body)
+            return self._json
+
+    class _ORJSONRoute(_APIRoute):
+        """APIRoute whose request bodies are parsed via orjson."""
+
+        def get_route_handler(self):
+            original = super().get_route_handler()
+
+            async def handler(request: Request):
+                return await original(
+                    _ORJSONRequest(request.scope, request.receive))
+
+            return handler
+
+    _HAS_ORJSON = True
+except Exception:  # pragma: no cover - orjson is an optional speedup
+    _HAS_ORJSON = False
+
 
 def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
     """Build GuidedDecodingParams with structural tags for tools with strict=True.
@@ -322,6 +362,9 @@ class OpenAIServer(_VideoRoutesMixin):
             self.generator.shutdown()
 
         self.app = FastAPI(lifespan=lifespan)
+        if _HAS_ORJSON:
+            # Routes registered below inherit the orjson-based request class.
+            self.app.router.route_class = _ORJSONRoute
 
         @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(_, exc):
