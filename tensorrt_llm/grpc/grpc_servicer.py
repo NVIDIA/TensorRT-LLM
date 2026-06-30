@@ -26,18 +26,28 @@ from collections.abc import AsyncGenerator
 from typing import List, Union
 
 import grpc
+from smg_grpc_proto.generated import common_pb2
 
 from tensorrt_llm.executor.result import Logprob, TokenLogprobs
 from tensorrt_llm.inputs.media_io import _load_and_convert_image
 from tensorrt_llm.logger import logger
 
 from . import trtllm_service_pb2, trtllm_service_pb2_grpc
+from .kv_events import convert_events
 from .grpc_request_manager import (
     GrpcRequestManager,
     create_disaggregated_params_from_proto,
     create_lora_request_from_proto,
     create_sampling_params_from_proto,
 )
+
+# Cap KvCacheEvents per streamed batch so a heavy drain cycle is split into a
+# few bounded messages rather than one oversized one.
+_MAX_EVENTS_PER_BATCH = 1024
+
+# Bound each subscriber's fan-out queue; on overflow batches are dropped and
+# the consumer's sequence-gap detection triggers a reconnect.
+_KV_SUBSCRIBER_QUEUE_MAX = 256
 
 
 class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
@@ -62,6 +72,17 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
         self.request_manager = request_manager
         self.model_path = model_path
         self._start_time = time.time()
+        # KV-event fan-out. TRT-LLM's get_kv_cache_events is a single-consumer
+        # drain: if every SubscribeKvEvents stream drained it directly, the
+        # events would be split across subscribers and each gateway would see
+        # only a fraction. Instead one background task drains once and broadcasts
+        # every batch to all active subscribers, so each receives the full
+        # stream. _kv_seq is the global broadcast counter; it advances once per
+        # emitted batch and is relayed to every subscriber, staying monotonic
+        # across reconnects (the consumer drops batches with seq <= last_seq).
+        self._kv_seq = 0
+        self._kv_subscribers: set = set()
+        self._kv_drain_task = None
         logger.info("TrtllmServiceServicer initialized")
 
     async def Generate(
@@ -318,6 +339,94 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
             context_parallel_size=1,  # Context parallelism is separate from TP/PP
             world_size=world_size,
         )
+
+    async def _kv_drain_loop(self):
+        """Drain TRT-LLM's KV-event queue once and broadcast to all subscribers.
+
+        Runs while at least one ``SubscribeKvEvents`` stream is active. The
+        blocking drain runs in a worker thread so the serving event loop is not
+        stalled; each drain cycle is packed into batches (capped at
+        ``_MAX_EVENTS_PER_BATCH``) and pushed to every subscriber queue, so each
+        gateway receives the full event stream rather than a single-consumer
+        split of it.
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            while self._kv_subscribers:
+                events = await loop.run_in_executor(
+                    None, self.request_manager.llm.get_kv_cache_events, 1)
+                if not events:
+                    continue
+                for start in range(0, len(events), _MAX_EVENTS_PER_BATCH):
+                    batch = convert_events(
+                        events[start:start + _MAX_EVENTS_PER_BATCH], self._kv_seq)
+                    if batch is None or len(batch.events) == 0:
+                        continue
+                    batch.timestamp = time.time()
+                    self._kv_seq += 1  # global broadcast counter, monotonic
+                    for queue in list(self._kv_subscribers):
+                        try:
+                            queue.put_nowait(batch)
+                        except asyncio.QueueFull:
+                            pass  # slow subscriber; consumer reconnects on gap
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # noqa: BLE001
+            logger.exception("KV event drain loop failed")
+
+    async def SubscribeKvEvents(
+        self,
+        request: common_pb2.SubscribeKvEventsRequest,
+        context: grpc.aio.ServicerContext,
+    ):
+        """Stream KV-cache events for the gateway's cache-aware router.
+
+        Bridges TRT-LLM's KV-cache event queue to the engine-neutral
+        ``common.KvEventBatch`` stream. ``start_sequence_number`` (replay) is
+        not honored — the stream starts from the current queue position.
+
+        TRT-LLM's event queue is single-consumer, so a shared background task
+        drains it once and broadcasts each batch to every active subscriber
+        (this method just relays its own queue); that lets multiple gateways
+        each receive the full stream instead of a split of it. Each drain cycle
+        is packed into as few ``KvEventBatch`` messages as possible (capped at
+        ``_MAX_EVENTS_PER_BATCH``).
+        """
+        args = getattr(getattr(self.request_manager, "llm", None), "args", None)
+        cfg = getattr(args, "kv_cache_config", None)
+        enabled = (bool(getattr(cfg, "enable_block_reuse", False))
+                   and int(getattr(cfg, "event_buffer_max_size", 0) or 0) > 0)
+        if not enabled:
+            await context.abort(
+                grpc.StatusCode.UNIMPLEMENTED,
+                "KV cache events not enabled. Start TensorRT-LLM with "
+                "enable_block_reuse=True and event_buffer_max_size>0 in KvCacheConfig.",
+            )
+            return
+
+        await context.send_initial_metadata(())
+        queue: asyncio.Queue = asyncio.Queue(maxsize=_KV_SUBSCRIBER_QUEUE_MAX)
+        self._kv_subscribers.add(queue)
+        if self._kv_drain_task is None or self._kv_drain_task.done():
+            self._kv_drain_task = asyncio.ensure_future(self._kv_drain_loop())
+        try:
+            while not context.cancelled():
+                try:
+                    batch = await asyncio.wait_for(queue.get(), timeout=1)
+                except asyncio.TimeoutError:
+                    continue
+                yield batch
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:  # noqa: BLE001
+            logger.exception("SubscribeKvEvents failed")
+            await context.abort(grpc.StatusCode.INTERNAL, str(e))
+        finally:
+            self._kv_subscribers.discard(queue)
+            if not self._kv_subscribers and self._kv_drain_task is not None:
+                self._kv_drain_task.cancel()
+                self._kv_drain_task = None
+            logger.info("SubscribeKvEvents stream closed")
 
     # ========== Helper methods ==========
 
