@@ -366,12 +366,13 @@ def test_deepseek_v4_mla_q_b_layernorm_init_and_forward_shape():
     init_src = inspect.getsource(MLA.__init__)
     helper_src = inspect.getsource(MLA._deepseek_v4_q_b_layernorm)
     forward_src = inspect.getsource(MLA.forward_impl_with_deepseek_v4)
+    init_src_no_ws = "".join(init_src.split())
 
-    assert "self.q_b_layernorm = RMSNorm(hidden_size=self.qk_head_dim" in init_src
+    assert "self.q_b_layernorm=RMSNorm(hidden_size=self.qk_head_dim" in init_src_no_ws
     assert "has_weights=False" in init_src
     assert "kv_a_layernorm_hidden_size = (" in init_src
     assert "self.kv_lora_rank + self.qk_rope_head_dim" in init_src
-    assert "self.kv_a_layernorm = RMSNorm(hidden_size=kv_a_layernorm_hidden_size" in init_src
+    assert "self.kv_a_layernorm=RMSNorm(hidden_size=kv_a_layernorm_hidden_size" in init_src_no_ws
     assert "q.dim() == 2" in helper_src
     assert "self.num_heads_tp * self.qk_head_dim" in helper_src
     assert "torch.ops.trtllm.deepseek_v4_q_norm" in helper_src
