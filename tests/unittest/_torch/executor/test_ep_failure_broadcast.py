@@ -309,34 +309,34 @@ def _make_broadcaster(
     *,
     size: int = 4,
     rank: int = 0,
-    health: EPGroupHealth | None = None,
+    detected_health: EPGroupHealth | None = None,
     comm: _FakeComm | None = None,
     mpi: _FakeMPI | None = None,
     callback: Callable[[int, int, float], None] | None = None,
 ) -> tuple[MpiFtSubcomm, EPGroupHealth, _FakeComm, _FakeMPI]:
-    health = health or EPGroupHealth(size)
+    detected_health = detected_health or EPGroupHealth(size)
     comm = comm or _FakeComm(size=size, rank=rank)
     mpi = mpi or _FakeMPI()
     broadcaster = MpiFtSubcomm(
         _FakeMapping.ep_world(size, rank),
-        health,
+        detected_health,
         _TEST_CONFIG,
         callback,
         comm=comm,
         mpi_module=mpi,
     )
-    return broadcaster, health, comm, mpi
+    return broadcaster, detected_health, comm, mpi
 
 
-def test_nonblocking_fanout_announces_externally_premarked_rank() -> None:
-    """The watchdog's prior local mark must not suppress cross-rank fanout."""
-    health = EPGroupHealth(4)
-    assert health.mark_failed(2) is True
-    broadcaster, _, comm, _ = _make_broadcaster(health=health)
+def test_watchdog_callback_records_and_fans_out_detected_failure() -> None:
+    detected_health = EPGroupHealth(4)
+    broadcaster, _, comm, _ = _make_broadcaster(detected_health=detected_health)
     broadcaster.start()
     caller_thread = threading.get_ident()
     try:
-        assert broadcaster.broadcast_failure(2) is False
+        watchdog_callback = broadcaster.report_detected_failure
+        assert watchdog_callback(2) is True
+        assert detected_health.get_failed_ranks() == frozenset({2})
         _wait_until(lambda: len(comm.sends) == 2, description="failure fanout")
         _wait_until(
             lambda: all(record.request.test_calls > 0 for record in comm.sends),
@@ -350,7 +350,7 @@ def test_nonblocking_fanout_announces_externally_premarked_rank() -> None:
         assert all(record.buffer_ref() is not None for record in comm.sends)
 
         # A repeated detector report is locally coalesced.
-        assert broadcaster.pre_failover(2) is False
+        assert watchdog_callback(2) is False
         time.sleep(2 * _TEST_CONFIG.poll_interval_sec)
         assert len(comm.sends) == 2
 
@@ -358,17 +358,76 @@ def test_nonblocking_fanout_announces_externally_premarked_rank() -> None:
             send.request.complete()
         comm.deliver(source=1, failed_rank=2)
         comm.deliver(source=3, failed_rank=2)
-        _wait_until(broadcaster.health_is_reconciled, description="failure reconciliation")
+        _wait_until(
+            broadcaster.detected_health_is_reconciled,
+            description="detection reconciliation",
+        )
     finally:
         broadcaster.stop()
 
 
-def test_survivor_echoes_reconcile_failure_before_next_collective() -> None:
+def test_externally_premarked_detected_health_fails_closed() -> None:
+    detected_health = EPGroupHealth(2)
+    assert detected_health.mark_failed(1) is True
+    broadcaster, _, comm, _ = _make_broadcaster(
+        size=2,
+        detected_health=detected_health,
+    )
+
+    try:
+        try:
+            broadcaster.start()
+        except RuntimeError:
+            # The progress thread can detect the invalid initial state before
+            # start() observes RUNNING, or immediately after start() returns.
+            pass
+        _wait_until(
+            lambda: isinstance(broadcaster.last_error, RuntimeError),
+            description="pre-marked detected-health rejection",
+        )
+        assert "without pre-marking health" in str(broadcaster.last_error)
+        _wait_until(lambda: comm.revoke_calls == 1, description="pre-mark fail-closed revoke")
+    finally:
+        broadcaster.stop()
+
+
+def test_detection_reconciliation_does_not_mutate_committed_health() -> None:
+    callbacks: list[tuple[int, int, float]] = []
+    detected_health = EPGroupHealth(2)
+    committed_health = EPGroupHealth(2)
+    initial_committed_snapshot = committed_health.snapshot()
+    broadcaster, _, _, _ = _make_broadcaster(
+        size=2,
+        detected_health=detected_health,
+        callback=lambda failed, source, when: callbacks.append((failed, source, when)),
+    )
+    broadcaster.start()
+    try:
+        assert broadcaster.report_detected_failure(1) is True
+        _wait_until(
+            lambda: len(callbacks) == 1,
+            description="local detection coordinator handoff",
+        )
+        _wait_until(
+            broadcaster.detected_health_is_reconciled,
+            description="detection reconciliation",
+        )
+
+        assert detected_health.get_failed_ranks() == frozenset({1})
+        assert detected_health.generation == 1
+        assert committed_health.snapshot() == initial_committed_snapshot
+        assert committed_health.all_active() is True
+        assert callbacks[0][:2] == (1, 0)
+    finally:
+        broadcaster.stop()
+
+
+def test_survivor_echoes_reconcile_failure_detection() -> None:
     broadcaster, _, comm, _ = _make_broadcaster(size=4)
     broadcaster.start()
     try:
-        assert broadcaster.pre_failover(2) is True
-        assert broadcaster.failure_is_reconciled(2) is False
+        assert broadcaster.report_detected_failure(2) is True
+        assert broadcaster.failure_detection_is_reconciled(2) is False
         _wait_until(lambda: len(comm.sends) == 2, description="initial failure fanout")
 
         comm.deliver(source=1, failed_rank=2)
@@ -376,20 +435,20 @@ def test_survivor_echoes_reconcile_failure_before_next_collective() -> None:
             lambda: comm.receive_count(1) == 2,
             description="source 1 receive repost",
         )
-        assert broadcaster.failure_is_reconciled(2) is False
+        assert broadcaster.failure_detection_is_reconciled(2) is False
 
         comm.deliver(source=3, failed_rank=2)
         for send in comm.sends:
             send.request.complete()
         _wait_until(
-            lambda: broadcaster.failure_is_reconciled(2),
+            lambda: broadcaster.failure_detection_is_reconciled(2),
             description="all survivor echoes",
         )
         time.sleep(2 * _TEST_CONFIG.poll_interval_sec)
         assert len(comm.sends) == 2
         assert {send.destination for send in comm.sends} == {1, 3}
         assert all(send.message_kind == _FAILURE_MESSAGE for send in comm.sends)
-        assert broadcaster.health_is_reconciled() is True
+        assert broadcaster.detected_health_is_reconciled() is True
         assert comm.revoke_calls == 0
     finally:
         broadcaster.stop()
@@ -429,8 +488,7 @@ def test_reactivation_between_failure_claim_and_observe_cannot_become_epoch_base
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     health = EPGroupHealth(2)
-    assert health.mark_failed(1) is True
-    broadcaster, _, _, _ = _make_broadcaster(size=2, health=health)
+    broadcaster, _, _, _ = _make_broadcaster(size=2, detected_health=health)
     original_claim = broadcaster._claim_failure
     mutated = False
 
@@ -439,6 +497,7 @@ def test_reactivation_between_failure_claim_and_observe_cannot_become_epoch_base
         original_claim(failed_rank)
         if not mutated:
             mutated = True
+            assert health.mark_failed(failed_rank) is True
             assert health.mark_active(failed_rank) is True
             assert health.mark_failed(failed_rank) is True
 
@@ -465,7 +524,7 @@ def test_second_failure_between_claim_and_observe_cannot_open_single_failure_gat
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     health = EPGroupHealth(3)
-    broadcaster, _, _, _ = _make_broadcaster(size=3, health=health)
+    broadcaster, _, _, _ = _make_broadcaster(size=3, detected_health=health)
     original_claim = broadcaster._claim_failure
     mutated = False
 
@@ -684,8 +743,10 @@ def test_monitor_does_not_world_abort_reconciled_relay_when_mpi_test_resumes() -
     broadcaster._deadline_monitor_wake_event.set()
 
     _wait_until(
-        lambda: broadcaster._deadline_monitor_thread is not None
-        and not broadcaster._deadline_monitor_thread.is_alive(),
+        lambda: (
+            broadcaster._deadline_monitor_thread is not None
+            and not broadcaster._deadline_monitor_thread.is_alive()
+        ),
         description="monitor-observed terminal reconciliation",
     )
     assert broadcaster._progress_failed.is_set() is False
@@ -940,7 +1001,7 @@ def test_received_report_is_idempotent_and_callback_runs_once() -> None:
         broadcaster.stop()
 
 
-def test_monitor_cannot_observe_remote_claim_before_health_commit(
+def test_monitor_cannot_observe_remote_claim_before_detected_health_update(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     broadcaster, health, comm, _ = _make_broadcaster(size=3)
@@ -965,7 +1026,7 @@ def test_monitor_cannot_observe_remote_claim_before_health_commit(
         assert comm.revoke_calls == 0
 
         release_claim.set()
-        _wait_until(lambda: not health.is_active(2), description="committed remote failure")
+        _wait_until(lambda: not health.is_active(2), description="recorded remote detection")
         _wait_until(lambda: len(comm.sends) == 1, description="remote failure echo")
         comm.sends[0].request.complete()
         _wait_until(broadcaster.health_is_reconciled, description="failure reconciliation")
@@ -1806,7 +1867,7 @@ def test_remote_revoke_after_local_reconciliation_still_fails_closed() -> None:
     assert comm.revoke_calls == 1
     with pytest.raises(RuntimeError, match="not running"):
         broadcaster.pre_failover(1)
-    assert broadcaster._health.get_failed_ranks() == frozenset({2})
+    assert broadcaster._detected_health.get_failed_ranks() == frozenset({2})
     broadcaster.stop()
 
 
@@ -1892,14 +1953,14 @@ def test_non_ulfm_generic_receive_error_keeps_other_sources_live() -> None:
         assert broadcaster.last_error is None
         assert failed_receive.cancel_calls == 0
 
-        # Another survivor's watchdog report remains authoritative even when
-        # the dead source's fixed receive failed with a generic error.
+        # Another survivor's rank-attributed detection remains usable even
+        # when the dead source's fixed receive failed with a generic error.
         comm.deliver(source=2, failed_rank=1)
-        _wait_until(lambda: health.is_active(1) is False, description="authoritative report")
+        _wait_until(lambda: health.is_active(1) is False, description="detection report")
         _wait_until(lambda: len(comm.sends) == 1, description="failure relay")
         comm.sends[0].request.complete()
         _wait_until(lambda: comm.receive_count(2) == 2, description="live-source receive repost")
-        _wait_until(lambda: len(callbacks) == 1, description="authoritative callback")
+        _wait_until(lambda: len(callbacks) == 1, description="detection callback")
 
         assert [(failed, source) for failed, source, _ in callbacks] == [(1, 2)]
         assert broadcaster.last_error is None
@@ -1941,8 +2002,9 @@ def test_non_ulfm_generic_error_after_watchdog_report_does_not_arm_stale_deadlin
         failed_receive = comm.latest_receive(1).request
         failed_receive.fail(_FakeMpiException(999, "late generic peer error"))
         _wait_until(
-            lambda: failed_receive
-            in [pending.request for pending in broadcaster._retained_requests],
+            lambda: (
+                failed_receive in [pending.request for pending in broadcaster._retained_requests]
+            ),
             description="retained explained receive",
         )
         comm.sends[0].request.complete()
