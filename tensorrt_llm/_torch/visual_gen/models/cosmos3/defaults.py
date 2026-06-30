@@ -75,7 +75,7 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
         description="Whether to enable audio generation.",
     ),
     "output_type": ExtraParamSchema(
-        type="str",
+        type="Literal['video', 'image']",
         default="video",
         description="Output modality: 'video' (T2V/I2V) or 'image' (text-to-image).",
     ),
