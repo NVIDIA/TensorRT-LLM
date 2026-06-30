@@ -828,6 +828,7 @@ def get_config_loader(name: str) -> Type["BaseConfigLoader"]:
 _GEMMA4_ARCHITECTURES = (
     "Gemma4ForCausalLM",
     "Gemma4ForConditionalGeneration",
+    "Gemma4UnifiedForConditionalGeneration",
 )
 
 

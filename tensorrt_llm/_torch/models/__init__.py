@@ -132,7 +132,12 @@ else:
 try:
     from .modeling_gemma4 import Gemma4ForCausalLM  # noqa
     from .modeling_gemma4mm import Gemma4ForConditionalGeneration  # noqa
+    from .modeling_gemma4_unified import Gemma4UnifiedForConditionalGeneration  # noqa
 
-    __all__.extend(["Gemma4ForCausalLM", "Gemma4ForConditionalGeneration"])
+    __all__.extend([
+        "Gemma4ForCausalLM",
+        "Gemma4ForConditionalGeneration",
+        "Gemma4UnifiedForConditionalGeneration",
+    ])
 except ImportError:
     pass
