@@ -29,7 +29,6 @@ import zipfile
 import pytest
 import torch
 import torch._inductor.config as inductor_config
-from defs import conftest
 from defs.common import venv_check_call
 from defs.trt_test_alternative import check_call
 from torch._inductor.async_compile import shutdown_compile_workers
@@ -333,8 +332,19 @@ def _precache_aesthetic_predictor():
                 ) from exc
 
 
+def _llm_models_root():
+    # Imported lazily so that re-importing this module in a torch.multiprocessing.spawn
+    # child (a fresh interpreter) does not run a module-level `from defs import conftest`,
+    # which pulls in `tensorrt_llm.bindings` -- a compiled extension absent from the source
+    # tree the spawned child resolves, crashing the worker before the test runs. The parent
+    # process already imports conftest during collection, so this deferral is free.
+    from defs import conftest
+
+    return conftest.llm_models_root()
+
+
 def _lpips_model_path(*parts):
-    return os.path.join(conftest.llm_models_root(), *parts)
+    return os.path.join(_llm_models_root(), *parts)
 
 
 def _skip_if_missing(path, label, is_dir=False):
@@ -370,7 +380,7 @@ def _golden_media_path(tmp_path, media_name, label):
 
 
 def _ltx2_lpips_text_encoder_path():
-    scratch_space = conftest.llm_models_root()
+    scratch_space = _llm_models_root()
     candidates = [
         os.path.join(scratch_space, LTX2_TEXT_ENCODER_SUBPATH),
         os.path.join(scratch_space, "gemma", LTX2_TEXT_ENCODER_SUBPATH),
@@ -993,7 +1003,7 @@ def _generate_wan_video(llm_venv, model_subpath, output_subdir):
     """
     from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams
 
-    scratch_space = conftest.llm_models_root()
+    scratch_space = _llm_models_root()
     model_path = os.path.join(scratch_space, model_subpath)
     if not os.path.isdir(model_path):
         pytest.skip(
@@ -1066,7 +1076,7 @@ def _generate_ltx2_two_stage_video(llm_venv, output_subdir, linear_type="default
     """
     from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams
 
-    scratch_space = conftest.llm_models_root()
+    scratch_space = _llm_models_root()
     model_path = os.path.join(scratch_space, LTX2_MODEL_CHECKPOINT_PATH)
     text_encoder_path = os.path.join(scratch_space, LTX2_TEXT_ENCODER_SUBPATH)
     upsampler_path = os.path.join(scratch_space, LTX2_UPSAMPLER_SUBPATH)
@@ -1365,7 +1375,7 @@ def test_vbench_dimension_score_ltx2_two_stage_fp8(
 
 def test_visual_gen_quickstart(_visual_gen_deps, llm_root, llm_venv):
     """Run examples/visual_gen/quickstart_example.py end-to-end."""
-    scratch_space = conftest.llm_models_root()
+    scratch_space = _llm_models_root()
     model_src = os.path.join(scratch_space, WAN_T2V_MODEL_SUBPATH)
     if not os.path.isdir(model_src):
         pytest.skip(
@@ -1387,7 +1397,7 @@ def test_visual_gen_quickstart(_visual_gen_deps, llm_root, llm_venv):
 
 def test_visual_gen_api_walkthrough(_visual_gen_deps, llm_root, llm_venv):
     """Run examples/visual_gen/api_walkthrough.py end-to-end."""
-    scratch_space = conftest.llm_models_root()
+    scratch_space = _llm_models_root()
     model_src = os.path.join(scratch_space, WAN_T2V_MODEL_SUBPATH)
     if not os.path.isdir(model_src):
         pytest.skip(
@@ -1424,7 +1434,7 @@ def test_wan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
     which runs the same script but with a no-quant YAML synthesized at
     runtime and additionally evaluates VBench scores.
     """
-    scratch_space = conftest.llm_models_root()
+    scratch_space = _llm_models_root()
     model_path = os.path.join(scratch_space, WAN22_A14B_NVFP4_MODEL_SUBPATH)
     assert os.path.isdir(model_path), (
         f"Model not found: {model_path} "
@@ -1577,7 +1587,7 @@ def test_wan_i2v_example(_visual_gen_deps, llm_root, llm_venv):
     work together as documented. Uses the pre-quantized Wan 2.2 I2V A14B NVFP4
     checkpoint and the default input image (cat_piano.png) bundled with the examples.
     """
-    scratch_space = conftest.llm_models_root()
+    scratch_space = _llm_models_root()
     model_path = os.path.join(scratch_space, WAN22_I2V_A14B_NVFP4_MODEL_SUBPATH)
     if not os.path.isdir(model_path):
         pytest.skip(
@@ -1618,7 +1628,7 @@ def test_qwen_image_example(_visual_gen_deps, llm_root, llm_venv):
     ``configs/qwen-image-fp8-1gpu.yaml`` work together as documented. Uses the
     local Qwen-Image checkpoint and the shared FP8 blockwise dynamic-quant config.
     """
-    scratch_space = conftest.llm_models_root()
+    scratch_space = _llm_models_root()
     model_path = os.path.join(scratch_space, QWEN_IMAGE_MODEL_SUBPATH)
     _skip_if_missing(model_path, "Qwen-Image checkpoint", is_dir=True)
     model_index_path = os.path.join(model_path, "model_index.json")
