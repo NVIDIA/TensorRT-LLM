@@ -156,6 +156,7 @@ async def test_minimal_instances(model_name, disagg_server_config,
 async def test_worker_restart(model_name, disagg_server_config, worker_config,
                               router, service_discovery, disagg_port, work_dir,
                               worker_env):
+    pytest.fail("yiqingy test")
     ctx_worker1 = None
     ctx_worker2 = None
     gen_worker1 = None

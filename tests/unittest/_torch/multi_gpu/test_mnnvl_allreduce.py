@@ -555,6 +555,7 @@ def test_mnnvl_quant_fusion(seq_len, hidden_size, dtype, fusion_op,
                     reason="needs 2 GPUs to run this test")
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
 def test_mnnvl_nvfp4_rejects_fp32_before_launch(mpi_pool_executor):
+    pytest.fail("yiqingy test")
     torch.manual_seed(42)
     tensor_parallel_size = mpi_pool_executor.num_workers
     seq_len = 16
