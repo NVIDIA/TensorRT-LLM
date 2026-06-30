@@ -1075,25 +1075,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # Create expanded buffers for MTP support
         self.create_expanded_buffers(capture_graph=capture_graph)
 
-    def _create_radix_aux_buffers(self, capture_graph=False):
-        """Create persistent scratch for the fp32 radix split-work TopK path."""
-        max_blocks_per_row = 10
-        max_gen_tokens = self.max_num_sequences * (1 + self.max_draft_tokens)
-        self.radix_aux_indices = self.get_empty(
-            self.cuda_graph_buffers,
-            (max_gen_tokens, max_blocks_per_row, self.num_sparse_topk),
-            cache_name="radix_aux_indices",
-            dtype=torch.int32,
-            capture_graph=capture_graph,
-        )
-        self.radix_aux_logits = self.get_empty(
-            self.cuda_graph_buffers,
-            (max_gen_tokens, max_blocks_per_row, self.num_sparse_topk),
-            cache_name="radix_aux_logits",
-            dtype=torch.float32,
-            capture_graph=capture_graph,
-        )
-
     def _create_kv_lens_2d_buffer(self, capture_graph=False):
         """Pre-allocated buffer for the DeepGEMM 2D context_lens API.
 
