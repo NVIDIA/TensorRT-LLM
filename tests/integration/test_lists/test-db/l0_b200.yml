@@ -193,6 +193,8 @@ l0_b200:
   # ------------- KV Cache Iteration Stats ---------------
   - unittest/executor/test_stats_serializer.py
   - unittest/metrics/test_collector.py
+  - unittest/_torch/modules/test_ep_metrics.py
+  - unittest/_torch/pyexecutor/test_ep_metrics_stats.py
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_cold_start
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_partial_block_reuse
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_full_block_reuse

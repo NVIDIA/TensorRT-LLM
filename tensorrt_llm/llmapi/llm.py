@@ -1181,6 +1181,10 @@ class BaseLLM:
                 "Use llm.encode() for encoder-only models.")
         return self._executor.aget_stats(timeout=timeout)
 
+    def _get_ep_health_stats(self) -> Optional[dict]:
+        """Return committed EP membership for the passive metrics hook."""
+        return self._executor._get_ep_health_stats()
+
     @set_api_status("beta")
     def get_kv_cache_events(self, timeout: Optional[float] = 2) -> List[dict]:
         """Get iteration KV events from the runtime.

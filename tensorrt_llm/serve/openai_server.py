@@ -9,6 +9,7 @@ import socket
 import time
 import traceback
 import uuid
+from builtins import anext
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -18,6 +19,7 @@ from typing import (Annotated, Any, AsyncGenerator, AsyncIterator, List,
                     Optional, Union)
 
 import uvicorn
+import zmq
 from fastapi import Body, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (FileResponse, JSONResponse, Response,
@@ -28,10 +30,13 @@ from transformers import AutoProcessor
 
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.async_llm import AsyncLLM
+from tensorrt_llm._torch.modules.fused_moe.ep_metrics import \
+    is_pending_ep_health_metrics
 from tensorrt_llm._utils import EnergyMonitor
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
+from tensorrt_llm.executor.rpc import RPCCancelled, RPCError, RPCTimeout
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
@@ -91,6 +96,51 @@ from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
 
 # yapf: enable
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
+
+
+def _is_transient_ep_health_error(error: Exception) -> bool:
+    """Return whether an EP health read can reasonably succeed on retry."""
+    if isinstance(
+            error,
+        (RPCCancelled, RPCTimeout, TimeoutError, OSError, zmq.ZMQError)):
+        return True
+    if isinstance(error, RPCError) and error.cause is not None:
+        return _is_transient_ep_health_error(error.cause)
+    return False
+
+
+async def _await_task_cancellation_safe(task: asyncio.Task) -> Any:
+    """Await ``task`` without forwarding repeated owner cancellation to it.
+
+    ``asyncio.shield`` protects a child only from the cancellation that reaches
+    that particular shield future.  After catching the first cancellation, an
+    unshielded ``await task`` lets a later ``Task.cancel()`` cancel the child.
+    That is especially unsafe for ``asyncio.to_thread``: cancelling its asyncio
+    wrapper does not stop the worker thread.  Drain through a separately
+    shielded task instead, retrying the shield after every owner cancellation,
+    then preserve the first cancellation request.
+    """
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError as cancellation:
+
+        async def drain_task() -> None:
+            try:
+                await task
+            except (Exception, asyncio.CancelledError):
+                pass
+
+        drain = asyncio.create_task(drain_task())
+        while not drain.done():
+            try:
+                await asyncio.shield(drain)
+            except asyncio.CancelledError:
+                continue
+        # Retrieve an unexpected BaseException from the drain before restoring
+        # cancellation. Ordinary task errors and child cancellation were
+        # consumed above to preserve the owner's cancellation semantics.
+        drain.result()
+        raise cancellation
 
 
 def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
@@ -212,6 +262,9 @@ class OpenAIServer(_VideoRoutesMixin):
         self.perf_metrics = None
         self.perf_metrics_lock = None
         self._iteration_stats_collector_task = None
+        self._ep_health_collector_task = None
+        self._ep_health_stop_event = asyncio.Event()
+        self._ep_health_outage_logged = False
         self._iteration_stats_wakeup_event = asyncio.Event()
         # Bounded snapshot of iteration stats for the GET /metrics handler.
         # When the background Prometheus collector loop is active, it is the
@@ -292,25 +345,34 @@ class OpenAIServer(_VideoRoutesMixin):
                     logger.info(
                         "Started background iteration stats collector task")
 
-            yield
+                await self._start_ep_health_collector()
 
-            # Stop background iteration stats collector
-            if self._iteration_stats_collector_task is not None:
-                self._iteration_stats_collector_task.cancel()
+            try:
+                yield
+            finally:
                 try:
-                    await self._iteration_stats_collector_task
-                except asyncio.CancelledError:
-                    pass
-                logger.info("Stopped background iteration stats collector task")
+                    await self._stop_ep_health_collector()
+                finally:
+                    # Stop background iteration stats collector
+                    if self._iteration_stats_collector_task is not None:
+                        self._iteration_stats_collector_task.cancel()
+                        try:
+                            await self._iteration_stats_collector_task
+                        except asyncio.CancelledError:
+                            pass
+                        logger.info(
+                            "Stopped background iteration stats collector task")
 
-            if self.metadata_server is not None:
-                self.metadata_server.remove(f"trtllm/{self.generator.llm_id}")
-                logger.info(f"trtllm/{self.generator.llm_id} is unregistered")
-            if self.disagg_cluster_worker:
-                await self.disagg_cluster_worker.deregister_worker()
-            if self.resource_governor is not None:
-                self.resource_governor.close()
-            self.generator.shutdown()
+                    if self.metadata_server is not None:
+                        self.metadata_server.remove(
+                            f"trtllm/{self.generator.llm_id}")
+                        logger.info(
+                            f"trtllm/{self.generator.llm_id} is unregistered")
+                    if self.disagg_cluster_worker:
+                        await self.disagg_cluster_worker.deregister_worker()
+                    if self.resource_governor is not None:
+                        self.resource_governor.close()
+                    self.generator.shutdown()
 
         self.app = FastAPI(lifespan=lifespan)
 
@@ -750,6 +812,7 @@ class OpenAIServer(_VideoRoutesMixin):
         from prometheus_fastapi_instrumentator import Instrumentator
         registry = CollectorRegistry()
         multiprocess.MultiProcessCollector(registry)
+        self.metrics_collector.register_ep_health_metrics(registry)
         Instrumentator(
             should_group_status_codes=False,
             should_respect_env_var=True,
@@ -1169,6 +1232,113 @@ class OpenAIServer(_VideoRoutesMixin):
         except asyncio.CancelledError:
             logger.info("Iteration stats collector loop cancelled")
             raise
+
+    def _log_ep_health_outage_once(self,
+                                   message: str,
+                                   error: Optional[Exception] = None,
+                                   terminal: bool = False) -> None:
+        """Log one retry diagnostic, while always logging a terminal state."""
+        if (getattr(self, "_ep_health_outage_logged", False) and not terminal):
+            return
+        detail = f": {error}" if error is not None else ""
+        logger.warning(f"{message}{detail}")
+        self._ep_health_outage_logged = True
+
+    def _get_ep_health_stop_event(self) -> asyncio.Event:
+        """Return the lazily initialized health-collector stop event."""
+        stop_event = getattr(self, "_ep_health_stop_event", None)
+        if stop_event is None:
+            stop_event = asyncio.Event()
+            self._ep_health_stop_event = stop_event
+        return stop_event
+
+    async def _wait_for_ep_health_stop(self, timeout: float) -> bool:
+        """Wait up to ``timeout`` seconds for a collector stop request."""
+        stop_event = self._get_ep_health_stop_event()
+        if stop_event.is_set():
+            return True
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return False
+        return True
+
+    async def _read_ep_health_stats(self) -> Optional[dict]:
+        """Run one synchronous health read without abandoning its worker thread."""
+        read_task = asyncio.create_task(
+            asyncio.to_thread(self.generator._get_ep_health_stats))
+        # asyncio.to_thread cancellation does not stop the underlying thread.
+        # Drain it before allowing the owner to close the RPC client.
+        return await _await_task_cancellation_safe(read_task)
+
+    async def _stop_ep_health_collector(self) -> None:
+        """Cooperatively stop and cancellation-safely drain the collector."""
+        task = self._ep_health_collector_task
+        if task is None:
+            return
+        self._get_ep_health_stop_event().set()
+        try:
+            await _await_task_cancellation_safe(task)
+        finally:
+            self._ep_health_collector_task = None
+            logger.info("Stopped EP health metrics collector task")
+
+    async def _ep_health_collector_loop(self) -> None:
+        """Passively poll rank-0's committed EP membership for metrics.
+
+        This loop observes coordinator-committed state, not detected or
+        suspected physical liveness, and never drives recovery.
+        """
+        try:
+            while not self._get_ep_health_stop_event().is_set():
+                try:
+                    stats = await self._read_ep_health_stats()
+                    if stats is None:
+                        self.metrics_collector.log_ep_health_unavailable()
+                        logger.info(
+                            "EP health telemetry is unsupported; polling disabled"
+                        )
+                        return
+                    if is_pending_ep_health_metrics(stats):
+                        self.metrics_collector.log_ep_health_unavailable()
+                        self._log_ep_health_outage_once(
+                            "EP health telemetry registration is pending; will retry"
+                        )
+                    elif not self.metrics_collector.log_ep_health_stats(stats):
+                        self._log_ep_health_outage_once(
+                            "EP health telemetry returned an invalid, stale, or conflicting payload; will retry",
+                        )
+                    else:
+                        self._ep_health_outage_logged = False
+                except Exception as e:
+                    self.metrics_collector.log_ep_health_unavailable()
+                    if not _is_transient_ep_health_error(e):
+                        self._log_ep_health_outage_once(
+                            "EP health telemetry failed deterministically; stopping polling",
+                            e,
+                            terminal=True)
+                        return
+                    self._log_ep_health_outage_once(
+                        "Transient error collecting EP health telemetry; will retry",
+                        e)
+                if await self._wait_for_ep_health_stop(timeout=1.0):
+                    return
+        except asyncio.CancelledError:
+            logger.info("EP health metrics collector loop cancelled")
+            raise
+
+    async def _start_ep_health_collector(self) -> None:
+        """Start EP health polling without delaying server readiness."""
+        if not self.metrics_collector:
+            return
+        if self._ep_health_collector_task is not None:
+            if not self._ep_health_collector_task.done():
+                return
+            self._ep_health_collector_task = None
+        self._get_ep_health_stop_event().clear()
+        self._ep_health_collector_task = asyncio.create_task(
+            self._ep_health_collector_loop())
+        logger.info("Started EP health metrics collector task")
 
     async def openai_chat(self, request: ChatCompletionRequest,
                           raw_request: Request) -> Response:
