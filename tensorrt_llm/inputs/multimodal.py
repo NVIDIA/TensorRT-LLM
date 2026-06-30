@@ -964,6 +964,7 @@ def find_mm_token_lengths(
 
     mm_video_dict = (multimodal_data or {}).get("video") or {}
     video_grid_thw = mm_video_dict.get("video_grid_thw")
+    video_temporal_ids = mm_video_dict.get("temporal_ids")
     if video_grid_thw is not None:
         video_grid_thw = torch.as_tensor(video_grid_thw)
         assert video_grid_thw.device.type == "cpu", (
@@ -1021,6 +1022,10 @@ def find_mm_token_lengths(
                     call_kwargs["video_grid_thw"] = (
                         video_grid_thw_for_items if len(items) == 1 else
                         video_grid_thw_for_items[idx:idx + 1])
+                if video_temporal_ids is not None:
+                    call_kwargs["temporal_ids"] = (
+                        video_temporal_ids
+                        if len(items) == 1 else video_temporal_ids[idx])
                 num_tokens = input_processor.get_num_tokens_per_video(
                     **call_kwargs)
                 modality_token_lengths.append(num_tokens)
