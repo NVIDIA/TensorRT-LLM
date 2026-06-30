@@ -105,6 +105,50 @@ def test_collect_command_options_skips_arguments():
     assert out["port"]["status"] == "beta"
     assert out["port"]["type"] == "int"
     assert out["port"]["default"] == 8000
+    # Invocation-shape fields are part of the user contract and must be
+    # recorded for every option.
+    assert out["port"]["required"] is False
+    assert out["port"]["multiple"] is False
+    assert out["port"]["is_flag"] is False
+
+
+def test_collect_command_options_records_invocation_shape():
+    """``required``, ``multiple``, and ``is_flag`` are diffed by the CI gate.
+
+    Each one changes how users invoke the option (a flag becoming
+    value-taking, a repeatable option going single-value, an option
+    becoming required). The collector must surface them so the gate can
+    pin them.
+    """
+
+    @click.command("toy")
+    @stability_option(
+        "--required_field",
+        type=str,
+        required=True,
+        status="beta",
+        help="required field",
+    )
+    @stability_option(
+        "--repeatable",
+        type=str,
+        multiple=True,
+        status="prototype",
+        help="repeatable",
+    )
+    @stability_option(
+        "--switch",
+        is_flag=True,
+        default=False,
+        status="beta",
+        help="switch",
+    )
+    def toy(required_field, repeatable, switch): ...
+
+    out = collect_command_options(toy)
+    assert out["required_field"]["required"] is True
+    assert out["repeatable"]["multiple"] is True
+    assert out["switch"]["is_flag"] is True
 
 
 def test_allowed_tags_match_expected_set():

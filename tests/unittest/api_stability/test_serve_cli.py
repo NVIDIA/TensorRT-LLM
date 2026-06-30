@@ -20,10 +20,14 @@ YAML diff.
 How it works
 ------------
 1. Walk every Click subcommand on the `trtllm-serve` group and collect each
-   option's stability tag, type, default, and required-ness.
+   option's stability tag, type, default, full ``flags`` list, and the
+   Click semantics that shape how it's invoked (``required``, ``multiple``,
+   ``is_flag``).
 2. Load the reference YAML at ``references/trtllm_serve_cli.yaml``.
-3. Diff the live surface against the YAML. Report each divergence as a
-   structured failure.
+3. Diff the live surface against the YAML — across the *entire* recorded
+   contract. Anything user-visible (a renamed alias, a flag becoming
+   value-taking, a repeatable option going single-value, an option
+   becoming required) shows up as a structured failure.
 
 Strict vs audit mode
 --------------------
@@ -139,8 +143,13 @@ class TestServeCLIStability:
           * Option present in code but not in YAML  → "you added an option,
             update the YAML" (downgraded to a warning while ``audit_mode``
             is true)
-          * Status / type / default mismatch        → "you changed an option
+          * ``status / type / default`` mismatch    → "you changed an option
             in a way that needs explicit reviewer sign-off"
+          * ``flags`` drift                         → "you renamed, added,
+            or removed a CLI flag (or alias) — that is a user-visible break"
+          * ``required / multiple / is_flag`` drift → "you changed the
+            invocation shape (e.g. an option became required, a flag became
+            value-taking, a repeatable option went single-value)"
         """
         audit_mode = bool(reference.get("audit_mode", False))
         ref_commands = reference.get("commands", {})
@@ -176,10 +185,27 @@ class TestServeCLIStability:
                         errors.append(message)
                     continue
 
-                # 3) Field-level diff for options listed in both.
+                # 3) Field-level diff for options listed in both. The YAML
+                #    is the user-facing CLI contract, so every field that
+                #    affects how a user invokes the option is part of the
+                #    diff:
+                #
+                #      * ``status / type / default`` — the obvious metadata.
+                #      * ``flags``  — the full sorted list of accepted CLI
+                #        surface strings (primary + aliases, both ``--long``
+                #        and ``-s``). Diffed for EVERY option, not just
+                #        multi-flag ones: changing ``--log_level`` to
+                #        ``--log-level`` leaves the Click parameter name
+                #        ``log_level`` unchanged but breaks every user
+                #        invocation, and we want that to fail the gate.
+                #      * ``required / multiple / is_flag`` — these change
+                #        the invocation *shape* (``--middleware`` going from
+                #        repeatable to single-value, ``--grpc`` going from
+                #        a flag to a value-taking option, an option becoming
+                #        required) and would silently break existing scripts.
                 live_spec = live_opts[opt_name]
                 ref_spec = ref_opts[opt_name]
-                for key in ("status", "type", "default"):
+                for key in ("status", "type", "default", "required", "multiple", "is_flag"):
                     live_val = live_spec.get(key)
                     ref_val = ref_spec.get(key)
                     if live_val != ref_val:
@@ -189,23 +215,14 @@ class TestServeCLIStability:
                             f"yaml={ref_val!r}. Update one or the other."
                         )
 
-                # 4) Alias-set drift. Renaming or removing an alias (e.g.
-                #    dropping `--tp_size` while keeping `--tensor_parallel_size`)
-                #    is a user-visible break that wouldn't be caught by the
-                #    `status / type / default` diff above. The `flags:` field
-                #    captures the full set of CLI surface strings Click accepts
-                #    and is recorded in the YAML for every multi-flag option.
-                #    Single-flag options omit the field; we only diff when the
-                #    YAML explicitly records it.
-                ref_flags = ref_spec.get("flags")
-                if ref_flags is not None:
-                    live_flags = live_spec.get("flags") or []
-                    if list(ref_flags) != list(live_flags):
-                        errors.append(
-                            f"[{cmd_name}] option `--{opt_name}` flags drift: "
-                            f"code={live_flags!r} vs yaml={list(ref_flags)!r}. "
-                            "Update one or the other."
-                        )
+                live_flags = list(live_spec.get("flags") or [])
+                ref_flags = list(ref_spec.get("flags") or [])
+                if ref_flags != live_flags:
+                    errors.append(
+                        f"[{cmd_name}] option `--{opt_name}` flags drift: "
+                        f"code={live_flags!r} vs yaml={ref_flags!r}. "
+                        "Update one or the other."
+                    )
 
         for w in warnings_:
             warnings.warn(w, stacklevel=2)

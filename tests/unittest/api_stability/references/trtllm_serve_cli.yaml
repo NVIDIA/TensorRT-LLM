@@ -14,6 +14,13 @@
 # is strict: adding a new option without a corresponding entry here is a build
 # failure, and so is removing, renaming, or retyping a listed option.
 #
+# Each option records the full user-visible CLI contract: `status`, `type`,
+# `default`, the complete set of `flags` (primary + aliases), and the Click
+# semantics that affect invocation shape (`required`, `multiple`, `is_flag`).
+# The gate diffs ALL of these — renaming an alias, flipping `multiple` off,
+# or making an option required all break existing user scripts and must show
+# up in the YAML diff for explicit review.
+#
 # Entries are alphabetical within each subcommand to keep diffs clean as new
 # options are added.
 audit_mode: false
@@ -25,26 +32,54 @@ commands:
         type: float
         default: 0.0
         status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--agent_percentage"
       agent_types:
         type: str
         default: null
         status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--agent_types"
       allow_request_chat_template:
         type: bool
         default: false
         status: prototype
+        required: false
+        multiple: false
+        is_flag: true
+        flags:
+        - "--allow_request_chat_template"
       backend:
         type: Choice(['_autodeploy', 'pytorch', 'tensorrt'])
         default: pytorch
         status: beta
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--backend"
       chat_template:
         type: str
         default: null
         status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--chat_template"
       context_parallel_size:
         type: int
         default: 1
         status: beta
+        required: false
+        multiple: false
+        is_flag: false
         flags:
         - "--context_parallel_size"
         - "--cp_size"
@@ -52,26 +87,54 @@ commands:
         type: Path
         default: null
         status: prototype
+        required: false
+        multiple: true
+        is_flag: false
+        flags:
+        - "--custom_module_dirs"
       custom_tokenizer:
         type: str
         default: null
         status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--custom_tokenizer"
       disagg_cluster_uri:
         type: str
         default: null
         status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--disagg_cluster_uri"
       enable_attention_dp:
         type: bool
         default: false
         status: beta
+        required: false
+        multiple: false
+        is_flag: true
+        flags:
+        - "--enable_attention_dp"
       enable_chunked_prefill:
         type: bool
         default: false
         status: prototype
+        required: false
+        multiple: false
+        is_flag: true
+        flags:
+        - "--enable_chunked_prefill"
       extra_llm_api_options:
         type: str
         default: null
         status: prototype
+        required: false
+        multiple: false
+        is_flag: false
         flags:
         - "--config"
         - "--extra_llm_api_options"
@@ -79,10 +142,18 @@ commands:
         type: bool
         default: true
         status: deprecated
+        required: false
+        multiple: false
+        is_flag: true
+        flags:
+        - "--fail_fast_on_attention_window_too_large"
       free_gpu_memory_fraction:
         type: float
         default: 0.9
         status: beta
+        required: false
+        multiple: false
+        is_flag: false
         flags:
         - "--free_gpu_memory_fraction"
         - "--kv_cache_free_gpu_memory_fraction"
@@ -90,54 +161,117 @@ commands:
         type: int
         default: null
         status: beta
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--gpus_per_node"
       grpc:
         type: bool
         default: false
         status: prototype
+        required: false
+        multiple: false
+        is_flag: true
+        flags:
+        - "--grpc"
       host:
         type: str
         default: localhost
         status: beta
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--host"
       kv_cache_dtype:
         type: Choice(['auto', 'fp8', 'nvfp4'])
         default: auto
         status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--kv_cache_dtype"
       log_level:
         type: Choice(['debug', 'error', 'info', 'internal_error', 'trace', 'verbose', 'warning'])
         default: info
         status: beta
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--log_level"
       max_batch_size:
         type: int
         default: 2048
         status: beta
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--max_batch_size"
       max_beam_width:
         type: int
         default: 1
         status: beta
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--max_beam_width"
       max_num_tokens:
         type: int
         default: 8192
         status: beta
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--max_num_tokens"
       max_seq_len:
         type: int
         default: null
         status: beta
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--max_seq_len"
       media_io_kwargs:
         type: str
         default: null
         status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--media_io_kwargs"
       metadata_server_config_file:
         type: str
         default: null
         status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--metadata_server_config_file"
       middleware:
         type: str
         default: null
         status: prototype
+        required: false
+        multiple: true
+        is_flag: false
+        flags:
+        - "--middleware"
       moe_cluster_parallel_size:
         type: int
         default: null
         status: deprecated
+        required: false
+        multiple: false
+        is_flag: false
         flags:
         - "--cluster_size"
         - "--moe_cluster_parallel_size"
@@ -145,6 +279,9 @@ commands:
         type: int
         default: null
         status: beta
+        required: false
+        multiple: false
+        is_flag: false
         flags:
         - "--ep_size"
         - "--moe_expert_parallel_size"
@@ -152,14 +289,27 @@ commands:
         type: int
         default: 0
         status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--num_postprocess_workers"
       otlp_traces_endpoint:
         type: str
         default: null
         status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--otlp_traces_endpoint"
       pipeline_parallel_size:
         type: int
         default: 1
         status: beta
+        required: false
+        multiple: false
+        is_flag: false
         flags:
         - "--pipeline_parallel_size"
         - "--pp_size"
@@ -167,14 +317,27 @@ commands:
         type: int
         default: 8000
         status: beta
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--port"
       reasoning_parser:
         type: Choice(['auto', 'deepseek-r1', 'gemma4', 'kimi_k2', 'kimi_k25', 'laguna', 'minimax_m2', 'minimax_m2_append_think', 'minimax_m3', 'nano-v3', 'nemotron-v3', 'qwen3', 'qwen3_5'])
         default: null
         status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--reasoning_parser"
       revision:
         type: str
         default: null
         status: beta
+        required: false
+        multiple: false
+        is_flag: false
         flags:
         - "--hf_revision"
         - "--revision"
@@ -182,14 +345,27 @@ commands:
         type: str
         default: null
         status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--served_model_name"
       server_role:
         type: str
         default: null
         status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--server_role"
       telemetry:
         type: bool
         default: true
         status: beta
+        required: false
+        multiple: false
+        is_flag: true
         flags:
         - "--no-telemetry"
         - "--telemetry"
@@ -197,6 +373,9 @@ commands:
         type: int
         default: 1
         status: beta
+        required: false
+        multiple: false
+        is_flag: false
         flags:
         - "--tensor_parallel_size"
         - "--tp_size"
@@ -204,29 +383,56 @@ commands:
         type: str
         default: null
         status: beta
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--tokenizer"
       tool_parser:
         type: Choice(['auto', 'deepseek_v3', 'deepseek_v31', 'deepseek_v32', 'gemma4', 'glm4', 'glm47', 'kimi_k2', 'minimax_m2', 'minimax_m3', 'poolside_v1', 'qwen3', 'qwen3_coder'])
         default: null
         status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--tool_parser"
       trust_remote_code:
         type: bool
         default: false
         status: beta
+        required: false
+        multiple: false
+        is_flag: true
+        flags:
+        - "--trust_remote_code"
       video_pruning_rate:
         type: float
         default: null
         status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--video_pruning_rate"
       visual_gen_args:
         type: str
         default: null
         status: prototype
-
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--visual_gen_args"
   disaggregated:
     options:
       config_file:
         type: str
         default: null
         status: beta
+        required: false
+        multiple: false
+        is_flag: false
         flags:
         - "--config"
         - "--config_file"
@@ -235,6 +441,9 @@ commands:
         type: Choice(['debug', 'error', 'info', 'internal_error', 'trace', 'verbose', 'warning'])
         default: info
         status: beta
+        required: false
+        multiple: false
+        is_flag: false
         flags:
         - "--log_level"
         - "-l"
@@ -242,6 +451,9 @@ commands:
         type: str
         default: null
         status: prototype
+        required: false
+        multiple: false
+        is_flag: false
         flags:
         - "--metadata_server_config_file"
         - "-m"
@@ -249,10 +461,18 @@ commands:
         type: int
         default: 0
         status: deprecated
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--metrics-log-interval"
       request_timeout:
         type: int
         default: 180
         status: beta
+        required: false
+        multiple: false
+        is_flag: false
         flags:
         - "--request_timeout"
         - "-r"
@@ -260,6 +480,9 @@ commands:
         type: Choice(['context_first', 'generation_first'])
         default: null
         status: beta
+        required: false
+        multiple: false
+        is_flag: false
         flags:
         - "--schedule_style"
         - "-s"
@@ -267,16 +490,21 @@ commands:
         type: int
         default: 180
         status: beta
+        required: false
+        multiple: false
+        is_flag: false
         flags:
         - "--server_start_timeout"
         - "-t"
-
   disaggregated_mpi_worker:
     options:
       config_file:
         type: str
         default: null
         status: beta
+        required: false
+        multiple: false
+        is_flag: false
         flags:
         - "--config"
         - "--config_file"
@@ -285,17 +513,29 @@ commands:
         type: Choice(['debug', 'error', 'info', 'internal_error', 'trace', 'verbose', 'warning'])
         default: info
         status: beta
-
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--log_level"
   mm_embedding_serve:
     options:
       allow_request_chat_template:
         type: bool
         default: false
         status: prototype
+        required: false
+        multiple: false
+        is_flag: true
+        flags:
+        - "--allow_request_chat_template"
       extra_encoder_options:
         type: str
         default: null
         status: prototype
+        required: false
+        multiple: false
+        is_flag: false
         flags:
         - "--config"
         - "--extra_encoder_options"
@@ -303,38 +543,81 @@ commands:
         type: float
         default: 0.9
         status: beta
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--free_gpu_memory_fraction"
       gpus_per_node:
         type: int
         default: null
         status: beta
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--gpus_per_node"
       host:
         type: str
         default: localhost
         status: beta
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--host"
       log_level:
         type: Choice(['debug', 'error', 'info', 'internal_error', 'trace', 'verbose', 'warning'])
         default: info
         status: beta
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--log_level"
       max_batch_size:
         type: int
         default: 2048
         status: beta
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--max_batch_size"
       max_num_tokens:
         type: int
         default: 16384
         status: beta
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--max_num_tokens"
       metadata_server_config_file:
         type: str
         default: null
         status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--metadata_server_config_file"
       port:
         type: int
         default: 8000
         status: beta
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--port"
       revision:
         type: str
         default: null
         status: beta
+        required: false
+        multiple: false
+        is_flag: false
         flags:
         - "--hf_revision"
         - "--revision"
@@ -342,6 +625,9 @@ commands:
         type: bool
         default: true
         status: beta
+        required: false
+        multiple: false
+        is_flag: true
         flags:
         - "--no-telemetry"
         - "--telemetry"
@@ -349,6 +635,9 @@ commands:
         type: int
         default: 1
         status: beta
+        required: false
+        multiple: false
+        is_flag: false
         flags:
         - "--tensor_parallel_size"
         - "--tp_size"
@@ -356,3 +645,8 @@ commands:
         type: bool
         default: false
         status: beta
+        required: false
+        multiple: false
+        is_flag: true
+        flags:
+        - "--trust_remote_code"
