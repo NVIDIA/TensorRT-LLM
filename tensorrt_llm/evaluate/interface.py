@@ -96,7 +96,8 @@ def extract_final_content_from_generation(
             if not parsed.get("_harmony_parsing_failed") and isinstance(
                     content, str):
                 return content
-        except Exception:
+        except (ImportError, AttributeError, TypeError, RuntimeError,
+                ValueError):
             return text
         return text
 
@@ -105,7 +106,7 @@ def extract_final_content_from_generation(
         parser = ReasoningParserFactory.create_reasoning_parser(
             reasoning_parser)
         return parser.parse(text).content or text
-    except Exception:
+    except (AttributeError, TypeError, ValueError):
         return text
 
 
