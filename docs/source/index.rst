@@ -76,6 +76,7 @@ Welcome to TensorRT LLM's Documentation!
    features/quantization.md
    features/sampling.md
    features/additional-outputs.md
+   features/post-processor-hook.md
    features/guided-decoding.md
    features/speculative-decoding.md
    features/checkpoint-loading.md

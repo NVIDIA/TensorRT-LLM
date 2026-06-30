@@ -13,6 +13,8 @@ import json
 import pytest
 import torch
 
+from tensorrt_llm._torch.modules.linear import NVFP4LinearMethod, UnquantizedLinearMethod
+
 # Importing the models package side-effects the ``@register_pipeline``
 # decorator on ``QwenImagePipeline`` being applied, which is what we are
 # testing here.
@@ -23,6 +25,8 @@ from tensorrt_llm._torch.visual_gen.models.qwen_image import (
     QwenImageTransformer2DModel,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.visual_gen.args import AttentionConfig
 
 
@@ -63,6 +67,41 @@ def test_transformer_load_weights_detects_mismatch():
     model = QwenImageTransformer2DModel(model_config=None, num_layers=2)
     with pytest.raises(RuntimeError, match=r"Missing keys|Unexpected keys"):
         model.load_weights({})
+
+
+def test_transformer_applies_quant_config_ignore_list() -> None:
+    """Qwen-Image should honor selective dynamic quantization exclusions."""
+    model_config = DiffusionModelConfig(
+        quant_config=QuantConfig(
+            quant_algo=QuantAlgo.NVFP4,
+            exclude_modules=[
+                "transformer_blocks.0*",
+                "img_in",
+                "proj_out",
+            ],
+        ),
+        dynamic_weight_quant=True,
+        force_dynamic_quantization=True,
+    )
+    model = QwenImageTransformer2DModel(model_config=model_config, num_layers=2)
+
+    assert model.img_in.quant_config.quant_algo is None
+    assert model.proj_out.quant_config.quant_algo is None
+    assert model.transformer_blocks[0].attn.add_q_proj.quant_config.quant_algo is None
+    assert model.transformer_blocks[0].img_mlp.up_proj.quant_config.quant_algo is None
+    assert isinstance(model.img_in.quant_method, UnquantizedLinearMethod)
+    assert isinstance(model.proj_out.quant_method, UnquantizedLinearMethod)
+    assert isinstance(
+        model.transformer_blocks[0].attn.add_q_proj.quant_method, UnquantizedLinearMethod
+    )
+    assert isinstance(
+        model.transformer_blocks[0].img_mlp.up_proj.quant_method, UnquantizedLinearMethod
+    )
+
+    assert model.txt_in.quant_config.quant_algo == QuantAlgo.NVFP4
+    assert model.transformer_blocks[1].attn.add_q_proj.quant_config.quant_algo == QuantAlgo.NVFP4
+    assert isinstance(model.txt_in.quant_method, NVFP4LinearMethod)
+    assert isinstance(model.transformer_blocks[1].attn.add_q_proj.quant_method, NVFP4LinearMethod)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

@@ -606,15 +606,20 @@ public:
             TORCH_CHECK(!(lora_per_request && lora_slot_indexed),
                 "MoE LoRA: the per-request (fc1_lora_ranks, ...) and slot-indexed (fc1_slot_lora_ranks, ..., "
                 "token_to_slot) input schemas are mutually exclusive. Provide exactly one, not both.");
-            // Conservative rejections (min-latency, alltoall, quant, graph capture).
+            // Conservative rejections (min-latency, alltoall, unsupported quant, graph capture).
             TORCH_CHECK(!min_latency_mode, "MoE LoRA is not supported in min-latency mode.");
             TORCH_CHECK(!enable_alltoall,
                 "MoE LoRA is not supported with alltoall: the per-token adapter pointer arrays do not survive "
                 "cross-rank token reshuffling.");
-            TORCH_CHECK(mActivationDtype == c10::ScalarType::Half || mActivationDtype == c10::ScalarType::BFloat16,
-                "MoE LoRA only supports fp16 and bf16 activation dtypes.");
-            TORCH_CHECK(mWeightDtype == c10::ScalarType::Half || mWeightDtype == c10::ScalarType::BFloat16,
-                "MoE LoRA only supports unquantized fp16/bf16 expert weights.");
+            bool const is_per_tensor_fp8 = isFp8Quant();
+            TORCH_CHECK(mActivationDtype == c10::ScalarType::Half || mActivationDtype == c10::ScalarType::BFloat16
+                    || is_per_tensor_fp8,
+                "MoE LoRA only supports fp16, bf16, or per-tensor FP8 (qdq) base weights. FP8 block-scale, NVFP4, "
+                "MXFP8, and integer quant are not supported.");
+            TORCH_CHECK(
+                mWeightDtype == c10::ScalarType::Half || mWeightDtype == c10::ScalarType::BFloat16 || is_per_tensor_fp8,
+                "MoE LoRA supports unquantized fp16/bf16 or per-tensor FP8 (qdq) base expert weights only "
+                "(LoRA adapters are always fp16/bf16).");
             // CUDA-graph capture is only safe on the device LoRA path. The
             // legacy host path performs a host-side cudaEventSynchronize and
             // per-token pointer expansion in setupLoraWorkspace, plus host-side
@@ -1274,7 +1279,7 @@ private:
     }
 
     // Map a torch dtype to the TRT-LLM nvinfer1::DataType expected by LoraImpl.
-    static nvinfer1::DataType loraTypeFromActDtype(c10::ScalarType dtype)
+    nvinfer1::DataType loraTypeFromActDtype(c10::ScalarType dtype) const
     {
         switch (dtype)
         {
@@ -1282,6 +1287,12 @@ private:
         case c10::ScalarType::Float: return nvinfer1::DataType::kFLOAT;
 #ifdef ENABLE_BF16
         case c10::ScalarType::BFloat16: return nvinfer1::DataType::kBF16;
+#endif
+#ifdef ENABLE_FP8
+        case c10::ScalarType::Float8_e4m3fn:
+            TORCH_CHECK(mOutputDtype != c10::ScalarType::Float8_e4m3fn,
+                "MoE LoRA with FP8 base activations requires an fp16/bf16 output (LoRA compute) dtype.");
+            return loraTypeFromActDtype(mOutputDtype);
 #endif
         default: C10_THROW_ERROR_FORMATTED(Error, "MoE LoRA only supports fp16/bf16/fp32 activation dtype.");
         }
