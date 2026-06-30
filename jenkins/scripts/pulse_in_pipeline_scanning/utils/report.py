@@ -60,7 +60,7 @@ def is_preapproved(map_preapproved_deps, package_name, package_type):
     Checks exact (name, type) match first, then falls back to (name, None) for
     legacy approvals recorded before the type field was added.
     """
-    return (package_name, package_type) in map_preapproved_deps
+    return (package_name, package_type.lower()) in map_preapproved_deps
 
 
 def diff_licenses(scan_type, release_path, base_path=None):
