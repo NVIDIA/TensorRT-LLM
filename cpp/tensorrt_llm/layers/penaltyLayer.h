@@ -82,6 +82,18 @@ private:
     bool mUseFrequencyPenalty{false};
     bool mUseMinLength{false};
     bool mUsePromptIgnoreLength{false};
+    /// @brief When true and ``beamWidth > 1``, ``forwardAsync`` invokes
+    /// ``addBiasSoftMax`` with ``skipSoftMax=true`` so the user-supplied
+    /// LogitsPostProcessor's output (already full-vocab log-probs with -inf
+    /// on disallowed positions) flows unchanged into ``BeamSearchLayer``.
+    /// Default false: TRT-LLM applies its own ``log_softmax`` to whatever
+    /// the post-processor returned (which renormalizes over the support of
+    /// finite values — i.e. constrained log-probs over the allowed set).
+    /// Set globally via
+    /// ``executor::LogitsPostProcessorConfig::setReturnsLogProbs(true)``,
+    /// then per-request via ``SamplingConfig::logitsPostProcessorReturnsLogProbs``,
+    /// then read here in ``setup`` from ``PenaltySetupParams``.
+    bool mLogitsPostProcessorReturnsLogProbs{false};
 
     runtime::SizeType32 mCyclicStep{0};
     runtime::SizeType32 mRuntimeMaxSeqLen{0};

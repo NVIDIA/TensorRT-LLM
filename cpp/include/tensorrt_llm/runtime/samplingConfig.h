@@ -115,6 +115,7 @@ public:
         beamWidth = configs.front().beamWidth;
         numReturnSequences = configs.front().numReturnSequences;
         normalizeLogProbs = configs.front().normalizeLogProbs;
+        logitsPostProcessorReturnsLogProbs = configs.front().logitsPostProcessorReturnsLogProbs;
         temperature = fuseValues<FloatType>(
             configs, [&configs](size_t ci) { return configs[ci].temperature; },
             layers::DefaultDecodingParams::getTemperature());
@@ -376,6 +377,18 @@ public:
 
     std::optional<bool> normalizeLogProbs;
 
+    /// @brief When true, the user-supplied LogitsPostProcessor returns
+    /// full-vocab log-probabilities (with -inf for masked positions) rather
+    /// than raw logits. In beam search mode, this causes ``PenaltyLayer`` to
+    /// skip the in-place ``log_softmax`` it would otherwise apply, so the
+    /// processor's output flows unchanged into the beam-search top-K kernel.
+    /// Result: cumulative beam scores accumulate full-vocab log-probs
+    /// (matching HuggingFace ``model.generate()`` + ``LogitsProcessor``)
+    /// instead of constrained log-probs renormalized over the allowed set.
+    /// Populated globally from ``LogitsPostProcessorConfig::getReturnsLogProbs()``
+    /// at request creation in ``CreateNewDecoderRequests``.
+    std::optional<bool> logitsPostProcessorReturnsLogProbs;
+
     bool operator==(SamplingConfig const& other) const
     {
         return beamWidth == other.beamWidth && numReturnSequences == other.numReturnSequences
@@ -388,6 +401,7 @@ public:
             && beamSearchDiversityRate == other.beamSearchDiversityRate && lengthPenalty == other.lengthPenalty
             && earlyStopping == other.earlyStopping && draftAcceptanceThreshold == other.draftAcceptanceThreshold
             && topKMedusaHeads == other.topKMedusaHeads && normalizeLogProbs == other.normalizeLogProbs
+            && logitsPostProcessorReturnsLogProbs == other.logitsPostProcessorReturnsLogProbs
             && outputLogProbs == other.outputLogProbs && cumLogProbs == other.cumLogProbs && minP == other.minP
             && beamWidthArray == other.beamWidthArray;
     }

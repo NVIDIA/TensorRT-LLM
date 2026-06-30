@@ -51,6 +51,18 @@ bool LogitsPostProcessor::operator()(DecoderInputBuffers& inputBuffers, bool rep
         auto const& llmReq = inputBuffers.decoderRequests.at(batchIdx);
         auto& logits = inputBuffers.decoderLogits.at(batchIdx);
 
+        // Pick the coherent token histories for this request:
+        //   - `gatheredBeamTokensForCallback[batchIdx]` is set by
+        //     TrtGptModelInflightBatching::buildGatheredBeamTokensForCallback() when
+        //     the request is doing beam search and a parentIds reorder happened.
+        //   - Otherwise (beamWidth==1, no reorder, or callback-less request) fall back
+        //     to llmReq->getTokens(), which is the slot-accumulated mTokens view
+        //     — correct in those cases and avoids any allocation.
+        auto const& tokensForCallback = (batchIdx < inputBuffers.gatheredBeamTokensForCallback.size()
+                                            && inputBuffers.gatheredBeamTokensForCallback[batchIdx].has_value())
+            ? *inputBuffers.gatheredBeamTokensForCallback[batchIdx]
+            : llmReq->getTokens();
+
         // Invoke non-batched processor or collect arguments for batched processor
         if (llmReq->mLogitsPostProcessor)
         {
@@ -58,14 +70,14 @@ bool LogitsPostProcessor::operator()(DecoderInputBuffers& inputBuffers, bool rep
             if (replicateLogitsPostProcessor || worldConfig.isFirstTensorParallelRank())
             {
                 (*llmReq->mLogitsPostProcessor)(
-                    llmReq->mRequestId, logits, llmReq->getTokens(), stream, llmReq->mClientId);
+                    llmReq->mRequestId, logits, tokensForCallback, stream, llmReq->mClientId);
             }
         }
         else if (llmReq->mApplyLogitsPostProcessorBatched)
         {
             reqIdsVec.push_back(llmReq->mRequestId);
             logitsVec.push_back(logits);
-            beamTokensVec.emplace_back(llmReq->getTokens());
+            beamTokensVec.emplace_back(tokensForCallback);
             clientIdsVec.push_back(llmReq->mClientId);
         }
     }

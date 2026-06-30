@@ -493,8 +493,16 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
                 &mDraftRequestsWaitingToSendLogits, &mDraftRequestsDoneSendingLogits, &mDraftRequestsMtx);
     }
 
+    // The LogitsPostProcessor::returnsLogProbs flag is global per-executor
+    // (lives on ExecutorConfig::LogitsPostProcessorConfig). Read it once here
+    // and forward to CreateNewDecoderRequests so each new LlmRequest's
+    // SamplingConfig carries the bit — PenaltyLayer reads it at setup time.
+    bool const logitsPostProcessorReturnsLogProbs
+        = executorConfig.getLogitsPostProcessorConfig().has_value()
+        && executorConfig.getLogitsPostProcessorConfig()->getReturnsLogProbs();
     mCreateNewDecoderRequests = std::make_unique<CreateNewDecoderRequests>(
-        mSpeculativeDecodingFastLogits, mIsLeaderInOrchMode, isNormalizeLogProbs());
+        mSpeculativeDecodingFastLogits, mIsLeaderInOrchMode, isNormalizeLogProbs(),
+        logitsPostProcessorReturnsLogProbs);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -2174,6 +2182,128 @@ void TrtGptModelInflightBatching::reorderGenerationLogitsForBeamSearch(LlmReques
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
+void TrtGptModelInflightBatching::buildGatheredBeamTokensForCallback(DecoderInputBuffers& inputBuffers)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(buildGatheredBeamTokensForCallback);
+
+    auto const numReqs = inputBuffers.decoderRequests.size();
+    inputBuffers.gatheredBeamTokensForCallback.assign(numReqs, std::nullopt);
+
+    for (size_t i = 0; i < numReqs; ++i)
+    {
+        auto const& llmReq = inputBuffers.decoderRequests[i];
+        // Use the iteration-active beam width — finished/inactive beams may have shorter
+        // histories than the SamplingConfig nominal width.
+        auto const beamWidth = llmReq->getBeamWidthByIter(true);
+
+        // Skip: nothing to gather.
+        if (beamWidth <= 1)
+        {
+            continue;
+        }
+        // Skip: no callback registered — the gather would have no consumer.
+        if (!llmReq->mLogitsPostProcessor && !llmReq->mApplyLogitsPostProcessorBatched)
+        {
+            continue;
+        }
+
+        auto const seqSlot = llmReq->mSeqSlot.value();
+        auto const& mTokens = llmReq->getTokens(); // slot-accumulated, [beamWidth][promptLen + numGen_b]
+        auto const promptLen = llmReq->mPromptLen;
+
+        // Beams may have diverging lengths (a finished beam stops appending tokens while
+        // its peers keep going). Compute per-beam generated counts so the parentIds trace
+        // never reads past a source beam's actual mTokens history.
+        std::vector<SizeType32> numGeneratedPerBeam(beamWidth);
+        SizeType32 maxGenerated = 0;
+        for (SizeType32 beam = 0; beam < beamWidth; ++beam)
+        {
+            auto const beamGenerated = static_cast<SizeType32>(mTokens[beam].size()) - promptLen;
+            numGeneratedPerBeam[beam] = beamGenerated;
+            maxGenerated = std::max(maxGenerated, beamGenerated);
+        }
+
+        // Step 0/1 cannot have a beam reorder yet — parentIds at step 0 is always self.
+        if (maxGenerated <= 1)
+        {
+            continue;
+        }
+
+        // GPU → host copy of this slot's parentIds.
+        // Layout (after slicing by seqSlot): [beamWidth, maxSeqLength], flat as
+        //   parentIdsData[slot * maxSeqLength + pos] = parent slot of `slot` at `pos`.
+        // Same convention as reorderGenerationLogitsForBeamSearch above.
+        auto parentIdsDevice = runtime::ITensor::at(mDecoderState->getParentIds(), {seqSlot});
+        auto parentIdsHost
+            = runtime::BufferManager::pinnedPool(parentIdsDevice->getShape(), nvinfer1::DataType::kINT32);
+        mCopyBufferManager.copy(*parentIdsDevice, *parentIdsHost);
+        mCopyBufferManager.getStream().synchronize();
+
+        auto const* parentIdsData = runtime::bufferCast<TokenIdType>(*parentIdsHost);
+        auto const maxSeqLength = static_cast<SizeType32>(parentIdsDevice->getShape().d[1]);
+
+        // Trace parentIds backward per beam. slotAtStep[g] = the slot whose mTokens[][promptLen+g]
+        // emit is part of beam `b`'s ancestral chain at generation step g. Per-beam length
+        // (beamNumGenerated) bounds the trace so finished/short beams aren't read past
+        // their last written token.
+        DecoderInputBuffers::BeamTokens gathered(beamWidth);
+        bool anyReorderNeeded = false;
+
+        for (SizeType32 beam = 0; beam < beamWidth; ++beam)
+        {
+            auto const beamNumGenerated = numGeneratedPerBeam[beam];
+
+            // Beam never produced anything (or already trimmed). Just clone its current
+            // (possibly prompt-only) history.
+            if (beamNumGenerated <= 0)
+            {
+                gathered[beam] = mTokens[beam];
+                continue;
+            }
+
+            std::vector<SizeType32> slotAtStep(beamNumGenerated);
+            SizeType32 slot = beam;
+            for (SizeType32 g = beamNumGenerated - 1; g >= 0; --g)
+            {
+                slotAtStep[g] = slot;
+                if (g > 0)
+                {
+                    slot = parentIdsData[slot * maxSeqLength + (promptLen + g)];
+                }
+            }
+
+            // Track whether this beam's ancestry crossed any other slot — if no beam crossed,
+            // we leave gatheredBeamTokensForCallback[i] as nullopt and the callback uses
+            // mTokens directly (cheap path).
+            for (SizeType32 g = 0; g < beamNumGenerated; ++g)
+            {
+                if (slotAtStep[g] != beam)
+                {
+                    anyReorderNeeded = true;
+                    break;
+                }
+            }
+
+            // Materialize beam `b`'s coherent path: shared prompt + traced generated tokens.
+            auto& tokens = gathered[beam];
+            tokens.reserve(static_cast<size_t>(promptLen) + static_cast<size_t>(beamNumGenerated));
+            tokens.insert(tokens.end(), mTokens[0].begin(), mTokens[0].begin() + promptLen);
+            for (SizeType32 g = 0; g < beamNumGenerated; ++g)
+            {
+                tokens.push_back(mTokens[slotAtStep[g]][promptLen + g]);
+            }
+        }
+
+        if (anyReorderNeeded)
+        {
+            inputBuffers.gatheredBeamTokensForCallback[i] = std::move(gathered);
+        }
+    }
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
 void TrtGptModelInflightBatching::getDecoderSlotHostOutputs(
     SizeType32 seqSlot, bool returnLogProbs, SamplingConfig const& samplingConfig, bool streaming)
 {
@@ -2279,6 +2409,14 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
     if (mOperatingBeamWidth > 1)
     {
         copyCacheIndirectionFromOutputsToInputs(scheduledRequests, genBufferId);
+    }
+
+    // Build coherent per-beam token histories (parentIds gather) for any request whose
+    // LogitsPostProcessor needs them. Must run before the post-processor invocation so
+    // the callback sees beam-coherent paths instead of the slot-accumulated mTokens view.
+    if (mOperatingBeamWidth > 1)
+    {
+        buildGatheredBeamTokensForCallback(decoderInputBuffers);
     }
 
     mLogitsPostProcessorIsApplied = (*mLogitsPostProcessor)(decoderInputBuffers, mReplicateLogitsPostProcessor,

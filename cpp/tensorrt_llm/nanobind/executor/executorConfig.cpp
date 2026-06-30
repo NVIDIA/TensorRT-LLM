@@ -322,30 +322,35 @@ void initConfigBindings(nb::module_& m)
         .def("__getstate__", debugConfigGetstate)
         .def("__setstate__", debugConfigSetstate);
 
-    auto logitsPostProcessorConfigGetstate = [](tle::LogitsPostProcessorConfig const& self)
-    { return nb::make_tuple(self.getProcessorMap(), self.getProcessorBatched(), self.getReplicate()); };
+    auto logitsPostProcessorConfigGetstate = [](tle::LogitsPostProcessorConfig const& self) {
+        return nb::make_tuple(
+            self.getProcessorMap(), self.getProcessorBatched(), self.getReplicate(), self.getReturnsLogProbs());
+    };
 
     auto logitsPostProcessorConfigSetstate = [](tle::LogitsPostProcessorConfig& self, nb::tuple const& state)
     {
-        if (state.size() != 3)
+        if (state.size() != 4)
         {
             throw std::runtime_error("Invalid LogitsPostProcessorConfig state!");
         }
         new (&self) tle::LogitsPostProcessorConfig(nb::cast<std::optional<tle::LogitsPostProcessorMap>>(state[0]),
-            nb::cast<std::optional<tle::LogitsPostProcessorBatched>>(state[1]), nb::cast<bool>(state[2]));
+            nb::cast<std::optional<tle::LogitsPostProcessorBatched>>(state[1]), nb::cast<bool>(state[2]),
+            nb::cast<bool>(state[3]));
     };
 
     nb::class_<tle::LogitsPostProcessorConfig>(m, "LogitsPostProcessorConfig")
-        .def(nb::init<std::optional<tle::LogitsPostProcessorMap>, std::optional<tle::LogitsPostProcessorBatched>,
+        .def(nb::init<std::optional<tle::LogitsPostProcessorMap>, std::optional<tle::LogitsPostProcessorBatched>, bool,
                  bool>(),
             nb::arg("processor_map") = nb::none(), nb::arg("processor_batched") = nb::none(),
-            nb::arg("replicate") = true)
+            nb::arg("replicate") = true, nb::arg("returns_log_probs") = false)
         .def_prop_rw("processor_map", &tle::LogitsPostProcessorConfig::getProcessorMap,
             &tle::LogitsPostProcessorConfig::setProcessorMap)
         .def_prop_rw("processor_batched", &tle::LogitsPostProcessorConfig::getProcessorBatched,
             &tle::LogitsPostProcessorConfig::setProcessorBatched)
         .def_prop_rw(
             "replicate", &tle::LogitsPostProcessorConfig::getReplicate, &tle::LogitsPostProcessorConfig::setReplicate)
+        .def_prop_rw("returns_log_probs", &tle::LogitsPostProcessorConfig::getReturnsLogProbs,
+            &tle::LogitsPostProcessorConfig::setReturnsLogProbs)
         .def("__getstate__", logitsPostProcessorConfigGetstate)
         .def("__setstate__", logitsPostProcessorConfigSetstate);
 
