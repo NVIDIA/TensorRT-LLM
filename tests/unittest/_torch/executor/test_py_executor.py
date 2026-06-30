@@ -300,6 +300,13 @@ def _make_disagg_transfer_request(
     return req
 
 
+@pytest.fixture
+def _clear_disagg_transfer_mode_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
+
+
+@pytest.mark.usefixtures("_clear_disagg_transfer_mode_env")
 class TestDisaggTransferAdmissionController:
     def test_disabled_preserves_candidates(self):
         controller = DisaggTransferAdmissionController(
@@ -414,8 +421,31 @@ class TestDisaggTransferAdmissionController:
         assert wait_for_progress
         executor._revert_ctx_alloc.assert_not_called()
 
-    def test_sync_mode_bypasses_transfer_budget(self, monkeypatch):
+    def test_sync_mode_retains_transfer_budget(self, monkeypatch):
         monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_transceiver = Mock()
+        executor._is_kv_manager_v2 = True
+        executor._revert_ctx_alloc = Mock()
+        executor.active_requests = []
+        executor._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
+            max_tokens_in_buffer=32, tokens_per_block=32
+        )
+        candidates = [
+            _make_disagg_transfer_request(2, 32),
+            _make_disagg_transfer_request(3, 32),
+        ]
+
+        admitted, wait_for_progress = PyExecutor._apply_disagg_transfer_admission(
+            executor, candidates
+        )
+
+        assert admitted == [candidates[0]]
+        assert not wait_for_progress
+        executor._revert_ctx_alloc.assert_called_once_with([candidates[1]])
+
+    def test_gen_only_no_context_bypasses_transfer_budget(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", "1")
         executor = object.__new__(PyExecutor)
         executor.kv_cache_transceiver = Mock()
         executor._is_kv_manager_v2 = True
@@ -438,6 +468,7 @@ class TestDisaggTransferAdmissionController:
         executor._revert_ctx_alloc.assert_not_called()
 
 
+@pytest.mark.usefixtures("_clear_disagg_transfer_mode_env")
 class TestDisaggTransferIdleProgress:
     def test_gen_transfer_status_polls_active_transfers(self):
         executor = object.__new__(PyExecutor)
@@ -541,7 +572,6 @@ class TestDisaggTransferIdleProgress:
         executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
 
     def test_sync_receive_does_not_poll_async_status(self, monkeypatch):
-        monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
         monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
         executor = object.__new__(PyExecutor)
         executor.kv_cache_transceiver = Mock()
@@ -580,6 +610,7 @@ class TestDisaggTransferIdleProgress:
         executor.dist.tp_cp_allgather.assert_called_once_with(0)
 
 
+@pytest.mark.usefixtures("_clear_disagg_transfer_mode_env")
 class TestDisaggTransferAdmissionPP:
     def test_pp_schedule_applies_gate_before_serializing(self):
         executor = object.__new__(PyExecutor)

@@ -2725,9 +2725,13 @@ class PyExecutor:
         )
 
     @staticmethod
-    def _uses_async_disagg_gen_transfer() -> bool:
+    def _is_disagg_gen_only_no_context_benchmark() -> bool:
+        """Return whether ``gen_only_no_context`` skips KV transfer."""
+        return os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1"
+
+    def _uses_async_disagg_gen_transfer(self) -> bool:
         """Return whether generation KV transfers can remain in flight."""
-        return (os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") != "1" and
+        return (not self._is_disagg_gen_only_no_context_benchmark() and
                 os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") != "1")
 
     def _uses_kv_manager_v2(self) -> bool:
@@ -2740,10 +2744,10 @@ class PyExecutor:
     def _apply_disagg_transfer_admission(
         self, fitting_disagg_gen_init_requests: List[LlmRequest]
     ) -> Tuple[List[LlmRequest], bool]:
-        # Synchronous receives complete before this executor step continues, so
-        # they reuse one transfer slot and never contribute to the outstanding
-        # transfer budget. Synthetic gen-only benchmarks do not transfer data.
-        if not self._uses_async_disagg_gen_transfer():
+        # gen_only_no_context has no CTX worker and does not transfer data.
+        # Real synchronous gen_only transfers still honor the budget to bound
+        # the number of blocking transfers started in one executor iteration.
+        if self._is_disagg_gen_only_no_context_benchmark():
             return fitting_disagg_gen_init_requests, False
 
         controller = self._get_disagg_transfer_admission_controller()
@@ -2814,10 +2818,10 @@ class PyExecutor:
         local_need_check = (num_fitting_reqs == 0
                             and not fitting_disagg_gen_init_requests)
 
-        # Generation-only benchmark workers have no context transfers to
-        # reap. In synchronous mode, one rank can still be receiving a
-        # rank-local request while another is idle, so entering either the
-        # generation or context progress collective here is unsafe.
+        # The GEN worker in benchmark mode has no local context transfers to
+        # reap. In real synchronous gen_only mode, one rank can still be
+        # receiving a rank-local request while another is idle, so entering
+        # either the generation or context progress collective here is unsafe.
         if (not self._uses_async_disagg_gen_transfer()
                 and self.is_benchmark_disagg):
             return
@@ -4880,8 +4884,9 @@ class PyExecutor:
     @nvtx_range("_recv_disagg_gen_cache")
     def _recv_disagg_gen_cache(self, new_gen_reqs):
 
-        # For gen-only benchmarking, mark new gen request as transmission complete right away
-        if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
+        # gen_only_no_context has no CTX worker, so mark each request as
+        # transmission-complete immediately.
+        if self._is_disagg_gen_only_no_context_benchmark():
             for req in new_gen_reqs:
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             return
