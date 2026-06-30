@@ -1,4 +1,6 @@
-"""Lookup Jenkins stage names for integration tests and vice versa.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+r"""Lookup Jenkins stage names for integration tests and vice versa.
 
 This helper parses ``jenkins/L0_Test.groovy`` and the YAML files under
 ``tests/integration/test_lists/test-db`` to provide a bidirectional mapping
@@ -46,8 +48,10 @@ def _load_tests_file(path: str) -> List[str]:
     return tests
 
 
-# Regex to parse Jenkins stage configurations from Groovy files
-# Matches patterns like: "Stage-Name": ["platform", "yaml_file", split_id, split_count, gpu_count]
+# Regex to parse Jenkins stage configurations from Groovy files.
+# Matches patterns like:
+#   "Stage-Name": ["platform", "yaml_file", split_id, split_count, gpu_count]
+#   "Stage-Name": ["platform", "yaml_file", split_id, split_count, gpu_count, node_count, true]
 #
 # Pattern breakdown:
 #   "(?P<stage>[^"]+)"     - Captures stage name in quotes (group 'stage')
@@ -55,11 +59,14 @@ def _load_tests_file(path: str) -> List[str]:
 #   \[                    - Matches opening bracket
 #   "[^"]+"              - Matches platform string in quotes (ignored)
 #   ,\s*                 - Matches comma with optional whitespace
-#   "(?P<yml>[^"]+)"     - Captures yaml filename in quotes (group 'yml')
-#   (?:,\s*\d+)*         - Matches zero or more comma-separated numbers (split_id, split_count, gpu_count)
+#   "(?P<yml>[^"]+)"     - Captures YAML filename in quotes (group 'yml')
+#   (?:,\s*(\d+|true|false))* - Matches trailing positional numbers/booleans
 #   \s*\]                - Matches closing bracket with optional whitespace
-_STAGE_RE = re.compile(
-    r'"(?P<stage>[^"]+)"\s*:\s*\["[^"]+",\s*"(?P<yml>[^"]+)"(?:,\s*\d+)*\s*\]')
+_STAGE_RE = re.compile(r'"(?P<stage>[^"]+)"\s*:\s*\['
+                       r'\s*"[^"]+"\s*,'
+                       r'\s*"(?P<yml>[^"]+)"'
+                       r"(?:,\s*(?:\d+|true|false))*"
+                       r"\s*\]")
 
 
 def _extract_terms(entry):

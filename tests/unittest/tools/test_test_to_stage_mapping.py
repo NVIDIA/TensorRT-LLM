@@ -1,7 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 import random
 import subprocess
 import sys
+import textwrap
 from collections import defaultdict
 
 import pytest
@@ -11,7 +15,7 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
 SCRIPTS_DIR = os.path.join(REPO_ROOT, 'scripts')
 sys.path.insert(0, SCRIPTS_DIR)
 
-from test_to_stage_mapping import StageQuery
+from test_to_stage_mapping import StageQuery  # noqa: E402
 
 GROOVY = os.path.join(REPO_ROOT, 'jenkins', 'L0_Test.groovy')
 DB_DIR = os.path.join(REPO_ROOT, 'tests', 'integration', 'test_lists',
@@ -79,13 +83,46 @@ def test_data_availability(stage_query):
     print(f"Max samples configured: {MAX_SAMPLES}")
 
 
+def test_parses_stage_entries_with_trailing_boolean_args(tmp_path):
+    """B200 flex stages append trailing Groovy args after GPU count."""
+    groovy = tmp_path / 'L0_Test.groovy'
+    db_dir = tmp_path / 'test-db'
+    db_dir.mkdir()
+
+    groovy.write_text(
+        textwrap.dedent('''
+        x86SlurmTestConfigs = [
+            "DGX_B200-4_GPUs-AutoDeploy-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 4, 1, true],
+            "DGX_B200-8_GPUs-AutoDeploy-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
+            // "Template-Stage": ["platform", "yaml_file", splitId, split_count, gpu_count]
+        ]
+        '''))
+    (db_dir / 'l0_dgx_b200.yml').write_text(
+        textwrap.dedent('''
+        l0_dgx_b200:
+        - condition:
+            terms:
+              stage: pre_merge
+              backend: autodeploy
+          tests:
+          - accuracy/test_pre.py::test_pre
+        '''))
+
+    query = StageQuery(str(groovy), str(db_dir))
+
+    assert (query.stage_to_yaml['DGX_B200-4_GPUs-AutoDeploy-1'] ==
+            'l0_dgx_b200.yml')
+    assert (query.stage_to_yaml['DGX_B200-8_GPUs-AutoDeploy-Post-Merge-1'] ==
+            'l0_dgx_b200.yml')
+    assert 'Template-Stage' not in query.stage_to_yaml
+
+
 @pytest.mark.skip(reason="https://nvbugs/5547275")
 @pytest.mark.parametrize("direction",
                          ["test_to_stage", "stage_to_test", "roundtrip"])
 def test_bidirectional_mapping_consistency(stage_query, sample_test_cases,
                                            sample_stages, direction):
     """Test mapping consistency in both directions with roundtrip validation."""
-
     if direction == "test_to_stage":
         if not sample_test_cases:
             pytest.skip("No test cases available")
