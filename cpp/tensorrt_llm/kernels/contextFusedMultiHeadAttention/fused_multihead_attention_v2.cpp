@@ -53,12 +53,32 @@ static_assert(static_cast<int>(AttentionInputLayout::SEPARATE_Q_K_V) < (1 << 2),
 static_assert(static_cast<int>(ContextAttentionMaskType::CUSTOM_MASK) < (1 << 3),
     "ContextAttentionMaskType requires more than three bits in the FMHA kernel hash.");
 
-bool isSupportedBySkipSoftmaxSm120Bridge(MHARunnerFixedParams const& params, unsigned int sm)
+struct SkipSoftmaxSm120BridgeSupportParams
+{
+    Data_type dataType;
+    Data_type dataTypeKv;
+    Data_type dataTypeOut;
+    bool forceFp32Acc;
+    ContextAttentionMaskType attentionMaskType;
+    AttentionInputLayout attentionInputLayout;
+    int headSize;
+    int headSizeV;
+    bool hasAlibi;
+    bool saveSoftmax;
+    float attnLogitSoftcappingScale;
+    int sageBlockSizeQ;
+    int sageBlockSizeK;
+    int sageBlockSizeV;
+    bool useSparseMLA;
+    bool useTllmGenSparseAttention;
+};
+
+bool isSupportedBySkipSoftmaxSm120Bridge(SkipSoftmaxSm120BridgeSupportParams const& params, unsigned int sm)
 {
 #if defined(TLLM_ENABLE_SKIP_SOFTMAX_SM120)
-    return (sm == kSM_120 || sm == kSM_121) && params.dataType == DATA_TYPE_BF16
-        && params.dataTypeKv == DATA_TYPE_BF16 && params.dataTypeOut == DATA_TYPE_BF16
-        && !params.forceFp32Acc && params.attentionMaskType == ContextAttentionMaskType::CAUSAL
+    return (sm == kSM_120 || sm == kSM_121) && params.dataType == DATA_TYPE_BF16 && params.dataTypeKv == DATA_TYPE_BF16
+        && params.dataTypeOut == DATA_TYPE_BF16 && !params.forceFp32Acc
+        && params.attentionMaskType == ContextAttentionMaskType::CAUSAL
         && params.attentionInputLayout == AttentionInputLayout::PACKED_QKV && params.headSize == params.headSizeV
         && (params.headSize == 128 || params.headSize == 256) && !params.hasAlibi && !params.saveSoftmax
         && params.attnLogitSoftcappingScale == 0.0F && params.sageBlockSizeQ == 0 && params.sageBlockSizeK == 0
@@ -68,6 +88,52 @@ bool isSupportedBySkipSoftmaxSm120Bridge(MHARunnerFixedParams const& params, uns
     (void) sm;
     return false;
 #endif // TLLM_ENABLE_SKIP_SOFTMAX_SM120
+}
+
+SkipSoftmaxSm120BridgeSupportParams getSkipSoftmaxSm120BridgeSupportParams(MHARunnerFixedParams const& params)
+{
+    SkipSoftmaxSm120BridgeSupportParams supportParams{};
+    supportParams.dataType = params.dataType;
+    supportParams.dataTypeKv = params.dataTypeKv;
+    supportParams.dataTypeOut = params.dataTypeOut;
+    supportParams.forceFp32Acc = params.forceFp32Acc;
+    supportParams.attentionMaskType = params.attentionMaskType;
+    supportParams.attentionInputLayout = params.attentionInputLayout;
+    supportParams.headSize = params.headSize;
+    supportParams.headSizeV = params.headSizeV;
+    supportParams.hasAlibi = params.hasAlibi;
+    supportParams.saveSoftmax = params.saveSoftmax;
+    supportParams.attnLogitSoftcappingScale = params.attnLogitSoftcappingScale;
+    supportParams.sageBlockSizeQ = params.sageBlockSizeQ;
+    supportParams.sageBlockSizeK = params.sageBlockSizeK;
+    supportParams.sageBlockSizeV = params.sageBlockSizeV;
+    supportParams.useSparseMLA = params.useSparseMLA;
+    supportParams.useTllmGenSparseAttention = params.useTllmGenSparseAttention;
+    return supportParams;
+}
+
+SkipSoftmaxSm120BridgeSupportParams getSkipSoftmaxSm120BridgeSupportParams(
+    Fused_multihead_attention_params_v2 const& params, Launch_params const& launchParams, Data_type inputType,
+    Data_type outputType)
+{
+    SkipSoftmaxSm120BridgeSupportParams supportParams{};
+    supportParams.dataType = inputType;
+    supportParams.dataTypeKv = inputType;
+    supportParams.dataTypeOut = outputType;
+    supportParams.forceFp32Acc = false;
+    supportParams.attentionMaskType = launchParams.attention_mask_type;
+    supportParams.attentionInputLayout = launchParams.attention_input_layout;
+    supportParams.headSize = params.d;
+    supportParams.headSizeV = params.dv;
+    supportParams.hasAlibi = params.has_alibi;
+    supportParams.saveSoftmax = false;
+    supportParams.attnLogitSoftcappingScale = launchParams.enableAttnLogitSoftcapping ? 1.0F : 0.0F;
+    supportParams.sageBlockSizeQ = launchParams.sage_block_size_q;
+    supportParams.sageBlockSizeK = launchParams.sage_block_size_k;
+    supportParams.sageBlockSizeV = launchParams.sage_block_size_v;
+    supportParams.useSparseMLA = false;
+    supportParams.useTllmGenSparseAttention = false;
+    return supportParams;
 }
 
 } // namespace
@@ -303,13 +369,10 @@ void FusedMultiHeadAttentionXMMAKernelV2::run(
     // {128, 256} or head_dim != head_dim_v, non-causal / sliding-window / custom
     // mask, non-PACKED_QKV layout, alibi, logit softcapping, sage attention,
     // interleaved, and returning softmax stats.
-    if ((mSM == kSM_120 || mSM == kSM_121) && launch_params.flash_attention && mInputDataType == DATA_TYPE_BF16
-        && mOutputDataType == DATA_TYPE_BF16 && params.d == params.dv && (params.d == 128 || params.d == 256)
-        && launch_params.attention_mask_type == ContextAttentionMaskType::CAUSAL
-        && launch_params.attention_input_layout == AttentionInputLayout::PACKED_QKV && !params.has_alibi
-        && !launch_params.enableAttnLogitSoftcapping && !launch_params.interleaved
-        && params.softmax_stats_ptr == nullptr && launch_params.sage_block_size_q == 0
-        && launch_params.sage_block_size_k == 0 && launch_params.sage_block_size_v == 0)
+    auto const supportParams
+        = getSkipSoftmaxSm120BridgeSupportParams(params, launch_params, mInputDataType, mOutputDataType);
+    if (isSupportedBySkipSoftmaxSm120Bridge(supportParams, mSM) && launch_params.flash_attention
+        && !launch_params.interleaved && params.softmax_stats_ptr == nullptr)
     {
         if (params.d == 256)
         {
@@ -485,7 +548,7 @@ void FusedMultiHeadAttentionXMMAKernelV2::run(
 
 bool FusedMultiHeadAttentionXMMAKernelV2::checkIfKernelExist(MHARunnerFixedParams params) const
 {
-    if (isSupportedBySkipSoftmaxSm120Bridge(params, mSM))
+    if (isSupportedBySkipSoftmaxSm120Bridge(getSkipSoftmaxSm120BridgeSupportParams(params), mSM))
     {
         return true;
     }
