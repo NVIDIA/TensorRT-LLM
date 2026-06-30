@@ -181,8 +181,8 @@ class NVLinkOneSided(Communication):
             use_low_precision_combine: If True, quantize the combine payload to FP8 for NVLink
                 transfer (halves NVLink bandwidth usage, output precision is preserved).
                 Corresponds to model_config.use_low_precision_moe_combine.
-            ep_group_health: Optional EPGroupHealth-compatible object. When present, its mask is passed to the
-                CUDA kernels and used by the watchdog.
+            ep_group_health: Optional read-only committed EP membership. When present, its mask is passed to
+                the CUDA kernels and defines the peers expected by the watchdog. Timeout detection never mutates it.
             alltoall_watchdog_timeout_s: Optional timeout for the host-side AlltoAll watchdog. If None, the
                 watchdog is disabled.
             alltoall_watchdog_poll_interval_s: Poll interval for the watchdog thread.
@@ -424,7 +424,8 @@ class NVLinkOneSided(Communication):
             token_final_scales: Router weights [local_num_tokens, top_k]
             all_rank_num_tokens: Token counts per rank [ep_size]
             use_dp_padding: Whether to use DP padding (optional)
-            **kwargs: Strategy-specific arguments (unused)
+            **kwargs: Strategy-specific arguments. ``active_rank_mask`` may override the committed membership
+                for dispatch; the captured value is reused by combine.
 
         Returns:
             Tuple of (hidden_states, hidden_states_sf, token_selected_slots, token_final_scales)
@@ -483,6 +484,7 @@ class NVLinkOneSided(Communication):
         self._dispatch_state["combine_payload_offset"] = int(combine_payload_offset)
         self._dispatch_state["local_num_tokens"] = token_selected_slots.size(0)
         self._dispatch_state["runtime_max_tokens_per_rank"] = runtime_max_tokens_per_rank
+        self._dispatch_state["active_rank_mask"] = active_rank_mask
         self._dispatch_state["phase"] = "dispatched"
 
         # Extract results from recv_buffers
@@ -545,6 +547,8 @@ class NVLinkOneSided(Communication):
             final_hidden_states: Output from MoE computation
                 Shape: [ep_size, max_tokens_per_rank, hidden_size] or
                        [ep_size * max_tokens_per_rank, hidden_size] (will be reshaped)
+            **kwargs: Strategy-specific arguments. If ``active_rank_mask`` is supplied, it must match the mask
+                captured by dispatch for this collective.
 
         Returns:
             Combined output tensor [local_num_tokens, hidden_size]
@@ -579,8 +583,9 @@ class NVLinkOneSided(Communication):
             raise ValueError(
                 f"final_hidden_states must be 2D or 3D, got {final_hidden_states.dim()}D"
             )
-        active_rank_mask = self._watchdog_coordinator.active_rank_mask_tensor(
-            kwargs.get("active_rank_mask")
+        active_rank_mask = self._watchdog_coordinator.active_rank_mask_for_combine(
+            self._dispatch_state.get("active_rank_mask"),
+            kwargs.get("active_rank_mask"),
         )
         output = torch.ops.trtllm.moe_a2a_combine(
             final_hidden_states,

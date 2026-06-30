@@ -26,17 +26,19 @@ from tensorrt_llm._torch.alltoall_watchdog import (
 
 from .ep_group_health import EPGroupHealth
 
-_ENABLE_ENV = "TRTLLM_ENABLE_WIDE_EP_FT"
+_ENABLE_ENV = "TLLM_FAULT_TOLERANCE_MODE"
 _TIMEOUT_ENV = "TRTLLM_ALLTOALL_WATCHDOG_TIMEOUT_S"
 _POLL_INTERVAL_ENV = "TRTLLM_ALLTOALL_WATCHDOG_POLL_INTERVAL_S"
 
+# This object contains membership committed by higher-layer recovery
+# coordination.  Detection threads must treat it as read-only.
 _HEALTH_KEY = "wide_ep_ft_ep_group_health"
 _TIMEOUT_KEY = "alltoall_watchdog_timeout_s"
 _POLL_INTERVAL_KEY = "alltoall_watchdog_poll_interval_s"
 
 
 def _env_enabled() -> bool:
-    return os.environ.get(_ENABLE_ENV, "0").lower() in {"1", "true", "yes", "on"}
+    return os.environ.get(_ENABLE_ENV) == "1"
 
 
 def _float_option(extra_attrs: dict, key: str, env_name: str, default: float) -> float:
@@ -50,12 +52,15 @@ def _float_option(extra_attrs: dict, key: str, env_name: str, default: float) ->
 def get_wide_ep_ft_options(
     model_config: Any,
 ) -> tuple[Optional[EPGroupHealth], Optional[float], float]:
-    """Return the shared EP health object and watchdog timing for a model.
+    """Return committed EP membership and watchdog timing for a model.
 
     WideEP FT remains opt-in until the integration PR wires a public model
     option.  Callers can either inject ``wide_ep_ft_ep_group_health`` through
-    ``ModelConfig.extra_attrs`` or set ``TRTLLM_ENABLE_WIDE_EP_FT=1`` to create
-    one process-local health object shared by all MoE communication layers.
+    ``ModelConfig.extra_attrs`` or set ``TLLM_FAULT_TOLERANCE_MODE=1`` to create
+    one process-local membership object shared by all MoE communication layers.
+    The AlltoAll watchdog reads this object to determine expected peers and
+    reports suspects through its ``on_timeout`` seam; it never mutates the
+    committed membership directly.
     """
 
     extra_attrs = getattr(model_config, "extra_attrs", {})
