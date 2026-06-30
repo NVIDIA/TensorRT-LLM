@@ -35,13 +35,10 @@ try:
 
     from tensorrt_llm._torch.distributed import all_to_all_4d
 
-    # Reuse the CI-aware free-port allocator from tests/integration so that
-    # sequentially spawned distributed workers get disjoint MASTER_PORTs and
-    # don't collide with ports still in TIME_WAIT (EADDRINUSE).
-    _integration_dir = Path(__file__).resolve().parents[4] / "integration"
-    if str(_integration_dir) not in sys.path:
-        sys.path.insert(0, str(_integration_dir))
-    from defs.common import get_free_port_in_ci
+    # Spawn distributed workers via a helper that retries with a fresh master
+    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _visual_gen_dist_utils import spawn_with_retry
 
     MODULES_AVAILABLE = True
 except ImportError:
@@ -272,8 +269,14 @@ def _run(world_size: int, test_fn: Callable):
         pytest.skip("Required modules not available")
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
-    port = get_free_port_in_ci()
-    mp.spawn(test_fn, args=(world_size, port), nprocs=world_size, join=True)
+    spawn_with_retry(
+        lambda port: mp.spawn(
+            test_fn,
+            args=(world_size, port),
+            nprocs=world_size,
+            join=True,
+        )
+    )
 
 
 def test_slot_ring_wraparound():
