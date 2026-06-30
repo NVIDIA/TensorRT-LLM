@@ -13,6 +13,7 @@ from .modeling_bert import BertForSequenceClassification
 from .modeling_clip import CLIPVisionModel
 from .modeling_cohere2 import Cohere2ForCausalLM
 from .modeling_deepseekv3 import DeepseekV3ForCausalLM
+from .modeling_deepseekv4 import DeepseekV4ForCausalLM
 from .modeling_exaone4 import Exaone4ForCausalLM
 from .modeling_exaone4_5 import Exaone4_5_ForConditionalGeneration
 from .modeling_exaone_moe import ExaoneMoeForCausalLM
@@ -47,6 +48,7 @@ from .modeling_qwen3_moe import Qwen3MoeForCausalLM
 from .modeling_qwen3_next import Qwen3NextForCausalLM
 from .modeling_qwen3vl import Qwen3VLModel
 from .modeling_qwen3vl_moe import Qwen3MoeVLModel
+from .modeling_qwen_image_bench import QwenImageBenchModel
 from .modeling_qwen_moe import Qwen2MoeForCausalLM
 from .modeling_seedoss import SeedOssForCausalLM
 from .modeling_siglip import SiglipVisionModel
@@ -80,6 +82,7 @@ __all__ = [
     "Mistral3VLM",
     "MistralForCausalLM",
     "MixtralForCausalLM",
+    "DeepseekV4ForCausalLM",
     "NemotronH_Nano_VL_V2",
     "NemotronForCausalLM",
     "NemotronHForCausalLM",
@@ -102,6 +105,7 @@ __all__ = [
     "Qwen3MoeForCausalLM",
     "Qwen3_5ForCausalLM",
     "Qwen3_5MoeForCausalLM",
+    "QwenImageBenchModel",
     "Qwen3NextForCausalLM",
     "Qwen3MoeVLModel",
     "GptOssForCausalLM",
