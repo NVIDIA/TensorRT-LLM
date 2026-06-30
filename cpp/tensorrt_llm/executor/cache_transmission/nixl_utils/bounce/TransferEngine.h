@@ -36,13 +36,13 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 //   ucp_ep_flush_nbx — so v2 needs NO notifMsg (see bounce/DESIGN.md §4).
 //
 // Why abstract
-//   - NixlTransferEngine (production): wraps nixlAgent registerMem / createXferReq /
-//     postXferReq / getXferStatus.
-//   - LocalCopyTransferEngine (loopback/test): same-process D2D cudaMemcpyAsync, so the
-//     entire reactor + scheduler + slot-pool + gather/scatter pipeline and data
-//     correctness can be exercised end-to-end on a single GPU without RDMA/NIXL.
-//   The reactor is written against this interface only, so it is identical for test
-//   and production — the L1 component test and the real path share one code path.
+//   - NixlTransferEngine (production + tests): wraps nixlAgent registerMem / createXferReq /
+//     postXferReq / getXferStatus. The bounce tests drive the full pipeline over REAL NIXL RDMA.
+//   - Tests can also substitute a trivial fault-injecting engine (one whose poll() always reports
+//     kFailed) to exercise the reactor's transfer-failure path deterministically — something a real
+//     NIXL engine cannot be coerced into.
+//   The reactor is written against this interface only, so the production data path and the
+//   failure-injection test share one code path.
 //
 // Threading
 //   Used only by the IO-reactor thread (post + poll + release). Implementations need
