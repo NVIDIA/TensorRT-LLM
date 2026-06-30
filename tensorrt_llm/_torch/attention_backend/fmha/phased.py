@@ -56,6 +56,7 @@ class FmhaParams:
     num_requests: int = 0
     spec_decoding_generation_lengths: Optional[torch.Tensor] = None
     spec_decoding_position_offsets: Optional[torch.Tensor] = None
+    is_cross: bool = False
 
 
 class PhasedFmha(Fmha):
@@ -184,6 +185,7 @@ class PhasedFmha(Fmha):
             fp8_context_fmha=fp8_context_fmha,
             kv_factor=self.kv_factor,
             total_num_blocks=self._get_total_num_blocks(metadata),
+            is_cross=metadata.is_cross,
         )
 
         sequence_length = metadata.kv_lens_cuda_runtime

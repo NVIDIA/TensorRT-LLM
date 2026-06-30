@@ -61,7 +61,7 @@ BaseTransBufferManager::BaseTransBufferManager(
     mRecvBufferCount = common::getEnvRequestKVCacheConcurrent() ? common::getEnvKVCacheRecvBufferCount() : 1;
     mSendBufferCount = common::getEnvKVCacheSendMaxConcurrenceNum();
     mUseFabricMemory = !(common::getEnvKVCacheTransferUseSyncBuffer() || common::getEnvKVCacheTransferUseAsyncBuffer())
-        && kv_cache_manager::FabricMemory::supportFbaricMemory();
+        && kv_cache_manager::FabricMemory::supportFabricMemory();
     if (mUseFabricMemory)
     {
         mTransferBufferSize = kv_cache_manager::FabricMemory::getAlignedSize(mTransferBufferSize);
