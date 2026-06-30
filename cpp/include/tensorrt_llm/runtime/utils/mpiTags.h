@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2021-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -71,7 +71,23 @@ enum class MpiTag : int
 
     // KvCacheEventManager
     kKvCacheEventSize = 1026,
-    kKvCacheEvent = 1027
+    kKvCacheEvent = 1027,
+
+    // Fault-tolerant NCCL communicator rendezvous. Each ownership path and
+    // protocol phase has a distinct tag so stale or simultaneous messages
+    // cannot be decoded as another phase's payload.
+    kNcclCommReady = 1028,
+    kNcclCommUniqueId = 1029,
+    kNcclCommAck = 1030,
+    kNcclPpReady = 1031,
+    kNcclPpUniqueId = 1032,
+    kNcclPpAck = 1033,
+
+    // Seeds used with the canonical group to derive MPI_Comm_create_group
+    // tags for dedicated, pre-failure NCCL rendezvous channels. These are
+    // separate from message tags and distinguish raw-op and PP ownership.
+    kNcclCommControl = 1034,
+    kNcclPpControl = 1035
 };
 
 } // namespace tensorrt_llm::mpi

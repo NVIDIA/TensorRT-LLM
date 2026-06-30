@@ -56,6 +56,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
 # BufferKind is bound from C++; see cpp/tensorrt_llm/thop/outputTensor.h (torch_ext::BufferKind).
 from tensorrt_llm.bindings.internal.thop import BufferKind
 
+# Communicator mode is startup-only. Keep this local cached flag so importing
+# the custom-op registry does not recursively initialize the distributed
+# package merely to filter allreduce tactics.
+NCCL_FAULT_TOLERANCE_ENABLED = os.environ.get(
+    "TLLM_FAULT_TOLERANCE_MODE") == "1"
+
+
+def _use_cuda_graph_for_allreduce_tuning() -> bool:
+    """Whether raw-NCCL tactics may be captured by the autotuner.
+
+    The 1a.7 communicator can be replaced after failure, so captured NCCL
+    nodes are intentionally rejected in FT mode until graph invalidation and
+    recapture land in 1a.11.  Eager profiling preserves valid tactic timings.
+    """
+    return os.environ.get("TLLM_FAULT_TOLERANCE_MODE") != "1"
+
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
 @torch.library.custom_op("trtllm::bmm_out", mutates_args=("out", ))
@@ -2181,6 +2197,8 @@ class AllReduceRunner(TunableRunner):
             AllReduceStrategy.NCCL_SYMMETRIC.value,
             AllReduceStrategy.NCCL.value,
         ]
+        if NCCL_FAULT_TOLERANCE_ENABLED:
+            return [AllReduceStrategy.NCCL.value]
         # Fallback in allreduceOp is set to NCCL_SYMMETRIC as default
         # So we need to check if the workspace size is too large to avoid hanging.
         workspace_size = inputs[0].numel() * inputs[0].element_size()
@@ -2223,10 +2241,17 @@ class AllReduceRunner(TunableRunner):
             return input
         if tactic == -1:
             # tactic == -1 means the autotuner cache missed for this shape.
-            # Fall back to NCCL_SYMMETRIC; asymmetric ncclMemAlloc failures are handled
-            # by a cross-rank barrier in NCCLWindowAllocator which falls back
-            # to plain NCCL.
-            tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
+            # FT mode must avoid NCCL_SYMMETRIC's MPI-local topology discovery;
+            # otherwise retain the optimized default-off fallback.
+            tactic = (AllReduceStrategy.NCCL.value
+                      if NCCL_FAULT_TOLERANCE_ENABLED else
+                      AllReduceStrategy.NCCL_SYMMETRIC.value)
+
+        if (NCCL_FAULT_TOLERANCE_ENABLED
+                and tactic != AllReduceStrategy.NCCL.value):
+            raise RuntimeError(
+                "NCCL error: fault-tolerant allreduce tuning selected a "
+                "custom tactic without a peer-failure abort path")
 
         return torch.ops.trtllm.allreduce(
             input,
@@ -2320,9 +2345,11 @@ def tunable_allreduce(
     tuning_config = AllReduceRunner.tuning_config
     if input_uses_nccl_window:
         tuning_config = replace(
-            AllReduceRunner.tuning_config,
+            tuning_config,
             inputs_pre_hook=
             _inputs_pre_hook_register_nccl_symmetric_memory_window)
+    if not _use_cuda_graph_for_allreduce_tuning():
+        tuning_config = replace(tuning_config, use_cuda_graph=False)
 
     _, best_tactic = tuner.choose_one(
         "trtllm::tunable_allreduce::allreduce",
