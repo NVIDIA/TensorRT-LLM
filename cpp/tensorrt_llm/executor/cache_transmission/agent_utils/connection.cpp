@@ -21,6 +21,7 @@
 #include <limits>
 #include <random>
 #include <string>
+#include <string_view>
 #include <unistd.h>
 #include <utility>
 
@@ -81,20 +82,18 @@ bool isValidBufferKind(uint8_t kind)
     return false;
 }
 
-AgentState const* findAgentState(CommState const& commState, std::string const& agentName)
+std::uint64_t makeProtocolSessionToken(std::string_view const agentName)
 {
-    if (!commState.isAgentState())
+    // FNV-1a makes the already-unique registered agent identity available as a compact process-session token.
+    constexpr std::uint64_t kOffsetBasis{14695981039346656037ULL};
+    constexpr std::uint64_t kPrime{1099511628211ULL};
+    std::uint64_t token = kOffsetBasis;
+    for (auto const character : agentName)
     {
-        return nullptr;
+        token ^= static_cast<unsigned char>(character);
+        token *= kPrime;
     }
-    for (auto const& agentState : commState.getAgentState())
-    {
-        if (agentState.mAgentName == agentName)
-        {
-            return &agentState;
-        }
-    }
-    return nullptr;
+    return token == 0 ? kOffsetBasis : token;
 }
 
 void validateConnectionIdx(
@@ -106,6 +105,29 @@ void validateConnectionIdx(
 }
 
 } // namespace
+
+void validateRequestPeerIdentity(batch_manager::RequestInfo const& requestInfo, std::string const& notificationAgent,
+    std::string const& notificationAddress)
+{
+    auto const& transState = requestInfo.getTransState();
+    TLLM_CHECK_WITH_INFO(transState.getCommState().has_value(),
+        "AgentConnectionManager received request without comm state from agent '%s'", notificationAgent.c_str());
+    auto const& peerCommState = transState.getCommState().value();
+    TLLM_CHECK_WITH_INFO(peerCommState.isAgentState(),
+        "AgentConnectionManager received non-agent comm state from agent '%s'", notificationAgent.c_str());
+    auto const& peerAgentStates = peerCommState.getAgentState();
+    auto const peerSelfIdx = peerCommState.getSelfIdx();
+    TLLM_CHECK_WITH_INFO(peerSelfIdx >= 0 && static_cast<size_t>(peerSelfIdx) < peerAgentStates.size(),
+        "AgentConnectionManager received self index %d outside agent-state count %zu from agent '%s'", peerSelfIdx,
+        peerAgentStates.size(), notificationAgent.c_str());
+    auto const& advertisedSelf = peerAgentStates[peerSelfIdx];
+    TLLM_CHECK_WITH_INFO(advertisedSelf.mAgentName == notificationAgent,
+        "AgentConnectionManager received request from '%s' whose comm state identifies self as '%s'",
+        notificationAgent.c_str(), advertisedSelf.mAgentName.c_str());
+    TLLM_CHECK_WITH_INFO(advertisedSelf.mConnectionInfo == notificationAddress,
+        "AgentConnectionManager received request from '%s' whose comm-state address differs from the live sender",
+        notificationAgent.c_str());
+}
 
 AgentConnection::AgentConnection(
     std::string mAgentName, std::string mRemoteAgentName, AgentConnectionManager* mAgentConnectionManager)
@@ -189,8 +211,35 @@ void AgentConnection::send(DataContext const& ctx, void const* data, size_t size
     NotificationInfo notificationInfo{syncInfo};
     std::stringstream ss;
     NotificationInfo::serialize(notificationInfo, ss);
-    TransferState transferState = status->wait();
+    static constexpr int64_t kCancelPollTimeoutMs = 100;
+    TransferState transferState = TransferState::kIN_PROGRESS;
+    while (transferState == TransferState::kIN_PROGRESS)
+    {
+        transferState = status->wait(kCancelPollTimeoutMs);
+        if (transferState == TransferState::kIN_PROGRESS && ctx.getTransferTerminate().load(std::memory_order_relaxed))
+        {
+            bool const released = status->release();
+            TLLM_LOG_WARNING(
+                "AgentConnection::send cancelled while transfer was in progress (ctx tag=%d, remote=%s, "
+                "releaseAccepted=%d)",
+                ctx.getTag(), mRemoteAgentName.c_str(), released);
+            TLLM_CHECK_WITH_INFO(
+                released, "AgentConnection::send cancel could not release the backend transfer handle");
+            TLLM_THROW("AgentConnection::send cancelled mid-transfer");
+        }
+    }
     TLLM_CHECK_WITH_INFO(transferState == TransferState::kSUCCESS, "AgentConnection::send failed");
+    if (ctx.getTransferTerminate().load(std::memory_order_relaxed))
+    {
+        bool const released = status->release();
+        TLLM_LOG_WARNING(
+            "AgentConnection::send cancelled after transfer completed but before notify (ctx tag=%d, remote=%s, "
+            "releaseAccepted=%d)",
+            ctx.getTag(), mRemoteAgentName.c_str(), released);
+        TLLM_CHECK_WITH_INFO(
+            released, "AgentConnection::send pre-notify cancel could not release the backend transfer handle");
+        TLLM_THROW("AgentConnection::send cancelled pre-notify");
+    }
     // TODO: there is a bug in request_with_notify https://github.com/ai-dynamo/nixl/pull/252
     mAgentConnectionManager->getAgent()->notifySyncMessage(mRemoteAgentName, ss.str());
 }
@@ -199,11 +248,16 @@ void AgentConnection::recv(DataContext const& ctx, void* data, size_t size) cons
 {
 
     NotificationSyncInfo syncInfo{mAgentName, ctx};
-    mAgentConnectionManager->waitForSyncInfo(mRemoteAgentName, syncInfo, ctx.getTransferTerminate());
+    bool const received
+        = mAgentConnectionManager->waitForSyncInfo(mRemoteAgentName, syncInfo, ctx.getTransferTerminate());
+    TLLM_CHECK_WITH_INFO(received,
+        "AgentConnection::recv ended before receiving sync notification (ctx tag=%d, remote=%s)", ctx.getTag(),
+        mRemoteAgentName.c_str());
 }
 
 void AgentConnection::sendRequestAndBufferInfo(batch_manager::RequestInfo& requestInfo,
-    std::vector<std::optional<size_t>> const& cacheBufferIds, int connectionIdx)
+    std::vector<std::optional<size_t>> const& cacheBufferIds, int connectionIdx,
+    std::atomic<bool> const* perRequestCancel)
 {
     TLLM_CHECK(!common::getEnvTryZCopyForKVCacheTransfer());
 
@@ -255,6 +309,10 @@ void AgentConnection::sendRequestAndBufferInfo(batch_manager::RequestInfo& reque
     std::stringstream ss;
     NotificationInfo notificationInfo{requestAndBufferInfo};
     NotificationInfo::serialize(notificationInfo, ss);
+    if (perRequestCancel != nullptr && perRequestCancel->load(std::memory_order_relaxed))
+    {
+        TLLM_THROW("sendRequestAndBufferInfo cancelled before notify");
+    }
     mAgentConnectionManager->getAgent()->notifySyncMessage(mRemoteAgentName, ss.str());
 }
 
@@ -292,8 +350,16 @@ void AgentConnection::sendReadySignal(DataContext const& ctx, bool isReady) cons
 
 bool AgentConnection::recvReadySignal(DataContext const& ctx) const
 {
+    return recvReadySignalWithStatus(ctx).value_or(false);
+}
+
+std::optional<bool> AgentConnection::recvReadySignalWithStatus(DataContext const& ctx) const
+{
     ReadySignalInfo readySignalInfo{mAgentName, ctx, false};
-    mAgentConnectionManager->waitForReadySignal(mRemoteAgentName, readySignalInfo, ctx.getTransferTerminate());
+    if (!mAgentConnectionManager->waitForReadySignal(mRemoteAgentName, readySignalInfo, ctx.getTransferTerminate()))
+    {
+        return std::nullopt;
+    }
     return readySignalInfo.mIsReady;
 }
 
@@ -323,16 +389,24 @@ std::optional<size_t> AgentConnection::getPreAssignedBufferId(uint8_t kind) cons
 
 AgentConnectionManager::AgentConnectionManager(
     std::vector<batch_manager::BaseTransBufferManager*> cacheTransBufferManagers, CacheState cacheState,
-    std::string const& backendType, std::optional<CacheState::RnnCacheState> rnnCacheState)
+    std::string const& backendType, std::optional<CacheState::RnnCacheState> rnnCacheState,
+    std::optional<PeerCancellationMode> peerCancellationMode)
     : mCacheState(std::move(cacheState))
     , mRnnCacheState(std::move(rnnCacheState))
     , mCacheTransBufferManagers(std::move(cacheTransBufferManagers))
     , mRegMemDescs(MemoryType::kVRAM, {})
+    , mPeerProtocolAware(peerCancellationMode.has_value())
 {
     TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
     TLLM_CHECK(mDeviceId != -1);
 
     mAgentName = genUniqueAgentName();
+    if (peerCancellationMode.has_value())
+    {
+        auto const descriptor = makePeerProtocolDescriptor(
+            peerCancellationMode.value() == PeerCancellationMode::kEnabled, makeProtocolSessionToken(mAgentName));
+        mAgentName = appendPeerProtocolDescriptor(std::move(mAgentName), descriptor);
+    }
     // Create Agent
     BaseAgentConfig config{mAgentName, true, false, true};
     m_Agent = makeTransferAgent(backendType, &config);
@@ -401,6 +475,18 @@ AgentConnectionManager::AgentConnectionManager(
         agentStates[0] = localAgentState;
     }
     mCommState = CommState(agentStates, mpi::MpiComm::session().getRank());
+    if (peerCancellationMode.has_value())
+    {
+        std::vector<std::string_view> localAgentNames;
+        localAgentNames.reserve(agentStates.size());
+        for (auto const& agentState : agentStates)
+        {
+            localAgentNames.emplace_back(agentState.mAgentName);
+        }
+        auto const localCompatibility = validateLocalPeerProtocol(peerCancellationMode.value(), localAgentNames);
+        TLLM_CHECK_WITH_INFO(localCompatibility.compatible,
+            "Local NIXL ranks advertise inconsistent cache-transfer protocols: %s", localCompatibility.reason.c_str());
+    }
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         " ***** AgentConnectionManager::AgentConnectionManager    mCommState: %s", mCommState.toString().c_str());
 }
@@ -442,14 +528,10 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
                     TLLM_CHECK_WITH_INFO(agent == remoteAgentName,
                         "AgentConnectionManager received RequestAndBufferInfo from '%s' with embedded agent '%s'",
                         agent.c_str(), remoteAgentName.c_str());
-                    auto const* expectedAgentState = findAgentState(mCommState, remoteAgentName);
-                    if (expectedAgentState != nullptr)
+                    if (mPeerProtocolAware)
                     {
-                        TLLM_CHECK_WITH_INFO(address == expectedAgentState->mConnectionInfo,
-                            "AgentConnectionManager received mismatched connection info for agent '%s'",
-                            remoteAgentName.c_str());
+                        validateRequestPeerIdentity(requestInfo, remoteAgentName, address);
                     }
-                    else
                     {
                         std::scoped_lock remoteInfoLock(mRemoteConnectionInfoMutex);
                         auto [remoteInfoIt, inserted] = mRemoteConnectionInfo.emplace(remoteAgentName, address);
@@ -692,7 +774,7 @@ int AgentConnectionManager::getDeviceId() const
 }
 
 template <typename NotificationType>
-void AgentConnectionManager::waitForNotification(
+bool AgentConnectionManager::waitForNotification(
     std::string const& remoteAgentName, NotificationType& expectedInfo, std::atomic<bool> const& terminateFlag)
 {
     while (!terminateFlag.load())
@@ -700,7 +782,7 @@ void AgentConnectionManager::waitForNotification(
 
         if (!mIsRunning)
         {
-            return;
+            return false;
         }
         updateUnhandledNotifications();
         std::scoped_lock lock(mNotificationMutex);
@@ -733,7 +815,7 @@ void AgentConnectionManager::waitForNotification(
                             {
                                 it = mUnhandledNotifications.erase(it);
                             }
-                            return;
+                            return true;
                         }
                     }
                 }
@@ -753,7 +835,7 @@ void AgentConnectionManager::waitForNotification(
                             {
                                 it = mUnhandledNotifications.erase(it);
                             }
-                            return;
+                            return true;
                         }
                     }
                 }
@@ -773,24 +855,25 @@ void AgentConnectionManager::waitForNotification(
             }
         }
     }
+    return false;
 }
 
 // Explicit template instantiations
-template void AgentConnectionManager::waitForNotification<NotificationSyncInfo>(
+template bool AgentConnectionManager::waitForNotification<NotificationSyncInfo>(
     std::string const& remoteAgentName, NotificationSyncInfo& expectedInfo, std::atomic<bool> const& terminateFlag);
-template void AgentConnectionManager::waitForNotification<ReadySignalInfo>(
+template bool AgentConnectionManager::waitForNotification<ReadySignalInfo>(
     std::string const& remoteAgentName, ReadySignalInfo& expectedInfo, std::atomic<bool> const& terminateFlag);
 
-void AgentConnectionManager::waitForSyncInfo(
+bool AgentConnectionManager::waitForSyncInfo(
     std::string const& remoteAgentName, NotificationSyncInfo& syncInfo, std::atomic<bool> const& terminateFlag)
 {
-    waitForNotification(remoteAgentName, syncInfo, terminateFlag);
+    return waitForNotification(remoteAgentName, syncInfo, terminateFlag);
 }
 
-void AgentConnectionManager::waitForReadySignal(
+bool AgentConnectionManager::waitForReadySignal(
     std::string const& remoteAgentName, ReadySignalInfo& readySignalInfo, std::atomic<bool> const& terminateFlag)
 {
-    waitForNotification(remoteAgentName, readySignalInfo, terminateFlag);
+    return waitForNotification(remoteAgentName, readySignalInfo, terminateFlag);
 }
 
 std::string const& AgentConnectionManager::getAgentName() const

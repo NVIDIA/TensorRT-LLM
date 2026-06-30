@@ -656,7 +656,13 @@ class TestKVCacheV2SchedulerCrossParam:
         )
         assert scheduler.cross_kv_cache_manager is cross_mgr
 
-    def test_factory_forwards_encoder_init_until_state_for_cross_pool(self):
+    @pytest.mark.parametrize(
+        "has_kv_connector,expected_inflight_cancel_support",
+        [(False, False), (True, False)],
+    )
+    def test_factory_forwards_encoder_init_until_state_for_cross_pool(
+        self, has_kv_connector, expected_inflight_cancel_support
+    ):
         """The executor factory must widen V2 scheduling to ENCODER_INIT.
 
         Without this, V2 enc-dec requests are filtered by the default
@@ -695,6 +701,7 @@ class TestKVCacheV2SchedulerCrossParam:
             enable_early_first_token_response=False,
             kv_cache_config=SimpleNamespace(enable_kv_pool_rebalance=False),
         )
+        kv_connector_manager = Mock() if has_kv_connector else None
 
         with (
             patch(
@@ -707,7 +714,7 @@ class TestKVCacheV2SchedulerCrossParam:
             patch(
                 "tensorrt_llm._torch.pyexecutor._util.create_kv_cache_transceiver",
                 return_value=None,
-            ),
+            ) as create_transceiver,
             patch(
                 "tensorrt_llm._torch.pyexecutor._util.PyExecutor",
             ),
@@ -723,6 +730,7 @@ class TestKVCacheV2SchedulerCrossParam:
                 start_worker=False,
                 sampler=Mock(),
                 drafter=None,
+                kv_connector_manager=kv_connector_manager,
                 max_seq_len=128,
                 max_batch_size=8,
                 max_beam_width=1,
@@ -732,6 +740,10 @@ class TestKVCacheV2SchedulerCrossParam:
         kwargs = scheduler_cls.call_args.kwargs
         assert kwargs["cross_kv_cache_manager"] is cross_mgr
         assert kwargs["no_schedule_until_state"] == LlmRequestState.ENCODER_INIT
+        assert (
+            create_transceiver.call_args.kwargs["inflight_cancel_supported_by_executor"]
+            is expected_inflight_cancel_support
+        )
 
 
 # ---------------------------------------------------------------------------

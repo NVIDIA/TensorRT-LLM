@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,6 +22,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/executor/cacheCommunicator.h"
+#include "tensorrt_llm/executor/cache_transmission/agent_utils/peerProtocol.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 #include <map>
@@ -34,6 +35,10 @@ namespace tensorrt_llm::executor::kv_cache
 // The per-process random suffix prevents collisions across Docker containers
 // that share hostname (--network host) and PID namespace.
 std::string genUniqueAgentName();
+
+//! Bind request-advertised peer state to the live notification sender before trusting protocol metadata.
+void validateRequestPeerIdentity(batch_manager::RequestInfo const& requestInfo, std::string const& notificationAgent,
+    std::string const& notificationAddress);
 
 struct RequestAndBufferInfo
 {
@@ -260,13 +265,15 @@ public:
     void send(DataContext const& ctx, void const* data, size_t size) const override;
     void recv(DataContext const& ctx, void* data, size_t size) const override;
     void sendRequestAndBufferInfo(batch_manager::RequestInfo& requestInfo,
-        std::vector<std::optional<size_t>> const& cacheBufferIds, int validConnectionIdx);
+        std::vector<std::optional<size_t>> const& cacheBufferIds, int validConnectionIdx,
+        std::atomic<bool> const* perRequestCancel = nullptr);
     void setSenderState(std::vector<MemoryDesc> cacheReceiverBufferDescs, int valideSegmentIdx,
         std::vector<std::pair<size_t, size_t>> offsetRatios, std::vector<uint8_t> bufferKinds);
     void setHasLoadRemoteAgent(bool hasLoadRemoteAgent);
     [[nodiscard]] bool hasLoadRemoteAgent() const;
     void sendReadySignal(DataContext const& ctx, bool isReady) const;
     bool recvReadySignal(DataContext const& ctx) const;
+    std::optional<bool> recvReadySignalWithStatus(DataContext const& ctx) const;
 
     void activateBuffer(uint8_t kind) const override;
     [[nodiscard]] std::optional<size_t> getPreAssignedBufferId(uint8_t kind) const override;
@@ -303,7 +310,8 @@ class AgentConnectionManager : public ConnectionManager
 public:
     AgentConnectionManager(std::vector<batch_manager::BaseTransBufferManager*> cacheTransBufferManagers,
         CacheState cacheState, std::string const& backendType,
-        std::optional<CacheState::RnnCacheState> rnnCacheState = std::nullopt);
+        std::optional<CacheState::RnnCacheState> rnnCacheState = std::nullopt,
+        std::optional<PeerCancellationMode> peerCancellationMode = std::nullopt);
     ~AgentConnectionManager();
     AgentConnection* recvConnect(DataContext const& ctx, void* data, size_t size) override;
     [[nodiscard]] std::vector<Connection const*> getConnections(CommState const& state) override;
@@ -320,11 +328,11 @@ public:
     [[nodiscard]] std::string const& getAgentName() const;
 
     template <typename NotificationType>
-    void waitForNotification(
+    bool waitForNotification(
         std::string const& remoteAgentName, NotificationType& expectedInfo, std::atomic<bool> const& terminateFlag);
-    void waitForSyncInfo(
+    bool waitForSyncInfo(
         std::string const& remoteAgentName, NotificationSyncInfo& syncInfo, std::atomic<bool> const& terminateFlag);
-    void waitForReadySignal(
+    bool waitForReadySignal(
         std::string const& remoteAgentName, ReadySignalInfo& readySignalInfo, std::atomic<bool> const& terminateFlag);
     [[nodiscard]] bool isRunning() const override;
 
@@ -345,6 +353,7 @@ private:
     int mDeviceId;
     std::string mAgentName;
     MemoryDescs mRegMemDescs;
+    bool mPeerProtocolAware{false};
     std::atomic<bool> mIsRunning{true};
 };
 
