@@ -1,3 +1,18 @@
+#
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import pathlib
 import subprocess
@@ -13,7 +28,7 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    KVCacheManager, PeftCacheManager,
+    KVCacheManager, PeftCacheManager, ResourceManager, ResourceManagerType,
     _warn_if_unsupported_v1_kv_cache_event_hash_algo)
 from tensorrt_llm.bindings import LayerType
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
@@ -64,6 +79,29 @@ def test_v1_kv_cache_event_hash_algo_no_warning_for_auto():
             KV_CACHE_HASH_ALGO_AUTO)
 
     warning.assert_not_called()
+
+
+def test_resource_manager_updates_context_resources_before_generation_resources(
+):
+    scheduled_batch = object()
+    calls = []
+
+    class MockResourceManager:
+
+        def update_context_resources(self, batch):
+            assert batch is scheduled_batch
+            calls.append("context")
+
+        def update_resources(self, batch):
+            assert batch is scheduled_batch
+            calls.append("generation")
+
+    manager = ResourceManager(
+        {ResourceManagerType.KV_CACHE_MANAGER: MockResourceManager()})
+
+    manager.update_resources(scheduled_batch)
+
+    assert calls == ["context", "generation"]
 
 
 class TestResourceManager(unittest.TestCase):

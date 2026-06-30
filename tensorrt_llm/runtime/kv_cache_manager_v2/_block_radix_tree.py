@@ -228,8 +228,6 @@ def find_best_exact_ssm_match_in_next_nodes(
     block: "Block | RootBlock", tokens: TokenBlock, ssm_lc_id: LifeCycleId
 ) -> tuple["Block | None", int]:
     """Find the longest child block whose full token sequence matches tokens."""
-    if len(block.next) >= 32:
-        return None, 0
     best_block = None
     best_match_len = 0
     for b in block.next.values():
@@ -633,6 +631,39 @@ class BlockRadixTree:
                 break
         return matched
 
+    def _find_best_exact_ssm_partial_match(
+        self,
+        reuse_scope: ReuseScope,
+        tokens: Sequence[TokenIdExt],
+        matched: list[tuple[Block, int]],
+        ssm_lc_id: LifeCycleId,
+    ) -> list[tuple[Block, int]]:
+        root = self.next.get(RootBlock.make_key(reuse_scope))
+        if not isinstance(root, RootBlock):
+            return []
+
+        best: list[tuple[Block, int]] = []
+        best_num_tokens = 0
+        parents: list[RootBlock | Block] = [root]
+        parents.extend(block for block, _ in matched)
+        for depth, parent in enumerate(parents):
+            offset = depth * self._tokens_per_block
+            if offset >= len(tokens):
+                break
+            token_block = list(tokens[offset : offset + self._tokens_per_block])
+            partial_block, match_len = find_best_exact_ssm_match_in_next_nodes(
+                parent, token_block, ssm_lc_id
+            )
+            if partial_block is None:
+                continue
+
+            candidate = self._prune_match(matched[:depth] + [(partial_block, match_len)])
+            candidate_num_tokens = self._num_matched_tokens(candidate)
+            if candidate_num_tokens > best_num_tokens:
+                best = candidate
+                best_num_tokens = candidate_num_tokens
+        return best
+
     def match(
         self,
         reuse_scope: ReuseScope,
@@ -645,9 +676,15 @@ class BlockRadixTree:
         The result is volatile: callers that need to reuse the returned blocks must
         acquire ownership of the pages before depending on them.
         """
-        matched = self._prune_match(
-            list(self._match_token_path(reuse_scope, tokens, enable_partial_match))
-        )
+        raw_matched = list(self._match_token_path(reuse_scope, tokens, enable_partial_match))
+        matched = self._prune_match(raw_matched)
+        ssm_lc_id = self._life_cycles.ssm_life_cycle_id
+        if ssm_lc_id is not None:
+            ssm_partial_matched = self._find_best_exact_ssm_partial_match(
+                reuse_scope, tokens, raw_matched, ssm_lc_id
+            )
+            if self._num_matched_tokens(ssm_partial_matched) > self._num_matched_tokens(matched):
+                matched = ssm_partial_matched
         return ReuseMatch([block for block, _ in matched], self._num_matched_tokens(matched))
 
     def _check_sanity(self) -> bool:

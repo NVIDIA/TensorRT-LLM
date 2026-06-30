@@ -146,6 +146,11 @@ class _MmRunMetadata(NamedTuple):
     run_item_offsets: torch.Tensor
 
 
+class _BlockReusePrefixSnapshot(NamedTuple):
+    length: int
+    fingerprint: int
+
+
 def _hash_to_digest(hash_ints: Sequence[int]) -> bytes:
     # Convert 8 x int32 hash chunks to the 32-byte digest used by C++ block
     # keys. The byte order matches getNthByte(), which extracts MSB first.
@@ -806,6 +811,18 @@ class KVCacheManagerV2(BaseResourceManager):
         self._block_reuse_hit_log_count = 0
         self._block_reuse_miss_log_count = 0
         self._block_reuse_commit_log_count = 0
+        self._block_reuse_lookup_token_count = 0
+        self._block_reuse_reused_token_count = 0
+        self._block_reuse_commit_token_count = 0
+        self._block_reuse_dummy_lookup_count = 0
+        self._block_reuse_salted_lookup_count = 0
+        self._block_reuse_cache_salt_hashes: set[int] = set()
+        self._block_reuse_committed_prefix_count = 0
+        self._block_reuse_last_committed_prefix_by_scope = {}
+        self._block_reuse_last_committed_prefix = None
+        self._block_reuse_commit_fingerprint_state = {}
+        self._block_reuse_miss_with_matching_prefix_same_scope_count = 0
+        self._block_reuse_miss_with_matching_prefix_any_scope_count = 0
         self.disk_prefetch_num_reqs = kv_cache_config.disk_prefetch_num_reqs
 
         # With pipeline parallelism, multiple microbatches can be in-flight
@@ -1478,6 +1495,114 @@ class KVCacheManagerV2(BaseResourceManager):
         self._restore_page_index_bufs(req_id, kv_cache)
         return True
 
+    @staticmethod
+    def _get_cache_salt_hash(cache_salt: str | None) -> int | None:
+        if cache_salt is None:
+            return None
+        return int.from_bytes(hashlib.sha256(cache_salt.encode("utf-8")).digest()[:8], "little")
+
+    @staticmethod
+    def _update_token_sequence_hasher(
+        hasher,
+        tokens: Sequence[TokenIdExt],
+        start: int = 0,
+        end: int | None = None,
+    ) -> None:
+        if end is None:
+            end = len(tokens)
+        for idx in range(start, end):
+            token = tokens[idx]
+            if type(token) is bytes:
+                hasher.update(b"b")
+                hasher.update(len(token).to_bytes(8, "little"))
+                hasher.update(token)
+            else:
+                hasher.update(b"i")
+                hasher.update(int(token).to_bytes(8, "little"))
+
+    @classmethod
+    def _get_token_sequence_fingerprint(
+        cls,
+        tokens: Sequence[TokenIdExt],
+        end: int | None = None,
+    ) -> int:
+        hasher = hashlib.sha256()
+        cls._update_token_sequence_hasher(hasher, tokens, end=end)
+        return int.from_bytes(hasher.digest()[:8], "little")
+
+    @staticmethod
+    def _get_block_reuse_scope(
+        request: LlmRequest,
+        salt_hash: int | None,
+    ) -> tuple[int | None, int | None]:
+        return getattr(request, "lora_task_id", None), salt_hash
+
+    @classmethod
+    def _does_token_sequence_start_with_snapshot(
+        cls,
+        tokens: Sequence[TokenIdExt],
+        snapshot: _BlockReusePrefixSnapshot | None,
+    ) -> bool:
+        if snapshot is None or snapshot.length > len(tokens):
+            return False
+        return cls._get_token_sequence_fingerprint(tokens, snapshot.length) == snapshot.fingerprint
+
+    def _record_block_reuse_committed_prefix(
+        self,
+        request: LlmRequest,
+        commit_start: int,
+        commit_end: int,
+    ) -> None:
+        if commit_end <= 0:
+            return
+        all_tokens = request.get_tokens(DEFAULT_BEAM_INDEX)
+        request_id = request.py_request_id
+        state = self._block_reuse_commit_fingerprint_state.get(request_id)
+        if state is not None and state[0] == commit_start:
+            _, hasher = state
+            tokens = self._augment_tokens_for_block_reuse(
+                all_tokens, request, start=commit_start, end=commit_end
+            )
+            self._update_token_sequence_hasher(hasher, tokens)
+        else:
+            tokens = self._augment_tokens_for_block_reuse(all_tokens, request, end=commit_end)
+            hasher = hashlib.sha256()
+            self._update_token_sequence_hasher(hasher, tokens)
+        self._block_reuse_commit_fingerprint_state[request_id] = (commit_end, hasher)
+        fingerprint = int.from_bytes(hasher.copy().digest()[:8], "little")
+        salt_hash = self._get_cache_salt_hash(getattr(request, "cache_salt", None))
+        scope = self._get_block_reuse_scope(request, salt_hash)
+        snapshot = _BlockReusePrefixSnapshot(commit_end, fingerprint)
+        self._block_reuse_committed_prefix_count += 1
+        self._block_reuse_last_committed_prefix_by_scope[scope] = snapshot
+        self._block_reuse_last_committed_prefix = snapshot
+
+    def _record_block_reuse_miss_diagnostics(
+        self,
+        request: LlmRequest,
+        tokens: Sequence[TokenIdExt],
+        salt_hash: int | None,
+    ) -> str:
+        scope = self._get_block_reuse_scope(request, salt_hash)
+        same_scope_snapshot = self._block_reuse_last_committed_prefix_by_scope.get(scope)
+
+        has_matching_prefix_same_scope = self._does_token_sequence_start_with_snapshot(
+            tokens, same_scope_snapshot
+        )
+        has_matching_prefix_any_scope = self._does_token_sequence_start_with_snapshot(
+            tokens, self._block_reuse_last_committed_prefix
+        )
+
+        if has_matching_prefix_same_scope:
+            self._block_reuse_miss_with_matching_prefix_same_scope_count += 1
+        if has_matching_prefix_any_scope:
+            self._block_reuse_miss_with_matching_prefix_any_scope_count += 1
+
+        return (
+            f"matching_prefix_same_scope={has_matching_prefix_same_scope}, "
+            f"matching_prefix_any_scope={has_matching_prefix_any_scope}"
+        )
+
     def _log_block_reuse_commit(
         self,
         request: LlmRequest,
@@ -1488,7 +1613,11 @@ class KVCacheManagerV2(BaseResourceManager):
     ) -> None:
         if commit_end <= commit_start:
             return
+        if request.is_dummy:
+            return
         self._block_reuse_commit_log_count += 1
+        self._block_reuse_commit_token_count += commit_end - commit_start
+        self._record_block_reuse_committed_prefix(request, commit_start, commit_end)
         if self._block_reuse_commit_log_count <= 8 or self._block_reuse_commit_log_count % 512 == 0:
             logger.info(
                 "KVCacheManagerV2 block reuse commit: "
@@ -1530,38 +1659,51 @@ class KVCacheManagerV2(BaseResourceManager):
                 if kv_cache is None:
                     return False
                 kv_cache.cuda_stream = self._stream.cuda_stream
-                if (
-                    self.enable_block_reuse
-                    and tokens is not None
-                    and kv_cache.num_committed_tokens > 0
-                ):
-                    self._block_reuse_hit_log_count += 1
-                    if (
-                        self._block_reuse_hit_log_count <= 8
-                        or self._block_reuse_hit_log_count % 128 == 0
-                    ):
-                        logger.info(
-                            "KVCacheManagerV2 block reuse hit: "
-                            f"request_id={req.py_request_id}, "
-                            f"prompt_tokens={len(all_tokens)}, "
-                            f"lookup_tokens={len(tokens)}, "
-                            f"reused_tokens={kv_cache.num_committed_tokens}, "
-                            f"reused_blocks={kv_cache.num_blocks}, "
-                            f"hit_count={self._block_reuse_hit_log_count}"
-                        )
-                elif self.enable_block_reuse and tokens is not None:
-                    self._block_reuse_miss_log_count += 1
-                    if (
-                        self._block_reuse_miss_log_count <= 8
-                        or self._block_reuse_miss_log_count % 512 == 0
-                    ):
-                        logger.info(
-                            "KVCacheManagerV2 block reuse miss: "
-                            f"request_id={req.py_request_id}, "
-                            f"prompt_tokens={len(all_tokens)}, "
-                            f"lookup_tokens={len(tokens)}, "
-                            f"miss_count={self._block_reuse_miss_log_count}"
-                        )
+                if self.enable_block_reuse and tokens is not None:
+                    if req.is_dummy:
+                        self._block_reuse_dummy_lookup_count += 1
+                    else:
+                        cache_salt = getattr(req, "cache_salt", None)
+                        salt_hash = self._get_cache_salt_hash(cache_salt)
+                        if salt_hash is not None:
+                            self._block_reuse_salted_lookup_count += 1
+                            self._block_reuse_cache_salt_hashes.add(salt_hash)
+                        self._block_reuse_lookup_token_count += len(tokens)
+                        if kv_cache.num_committed_tokens > 0:
+                            self._block_reuse_hit_log_count += 1
+                            self._block_reuse_reused_token_count += kv_cache.num_committed_tokens
+                            if (
+                                self._block_reuse_hit_log_count <= 8
+                                or self._block_reuse_hit_log_count % 128 == 0
+                            ):
+                                logger.info(
+                                    "KVCacheManagerV2 block reuse hit: "
+                                    f"request_id={req.py_request_id}, "
+                                    f"prompt_tokens={len(all_tokens)}, "
+                                    f"lookup_tokens={len(tokens)}, "
+                                    f"reused_tokens={kv_cache.num_committed_tokens}, "
+                                    f"reused_blocks={kv_cache.num_blocks}, "
+                                    f"cache_salt_present={cache_salt is not None}, "
+                                    f"hit_count={self._block_reuse_hit_log_count}"
+                                )
+                        else:
+                            self._block_reuse_miss_log_count += 1
+                            miss_diag = self._record_block_reuse_miss_diagnostics(
+                                req, tokens, salt_hash
+                            )
+                            if (
+                                self._block_reuse_miss_log_count <= 8
+                                or self._block_reuse_miss_log_count % 512 == 0
+                            ):
+                                logger.info(
+                                    "KVCacheManagerV2 block reuse miss: "
+                                    f"request_id={req.py_request_id}, "
+                                    f"prompt_tokens={len(all_tokens)}, "
+                                    f"lookup_tokens={len(tokens)}, "
+                                    f"cache_salt_present={cache_salt is not None}, "
+                                    f"{miss_diag}, "
+                                    f"miss_count={self._block_reuse_miss_log_count}"
+                                )
 
             if not self.enable_block_reuse:
                 kv_cache.stop_committing()
@@ -2258,6 +2400,38 @@ class KVCacheManagerV2(BaseResourceManager):
                 save_last_ssm_snapshot=self.kv_cache_config.mamba_save_last_snapshot
             )
 
+    def _log_block_reuse_summary(self) -> None:
+        if not self.enable_block_reuse:
+            return
+
+        num_lookups = self._block_reuse_hit_log_count + self._block_reuse_miss_log_count
+        request_hit_rate = self._block_reuse_hit_log_count / num_lookups if num_lookups > 0 else 0.0
+        token_reuse_rate = (
+            self._block_reuse_reused_token_count / self._block_reuse_lookup_token_count
+            if self._block_reuse_lookup_token_count > 0
+            else 0.0
+        )
+        logger.info(
+            "KVCacheManagerV2 block reuse summary: "
+            f"lookups={num_lookups}, "
+            f"hits={self._block_reuse_hit_log_count}, "
+            f"misses={self._block_reuse_miss_log_count}, "
+            f"request_hit_rate={request_hit_rate:.6f}, "
+            f"lookup_tokens={self._block_reuse_lookup_token_count}, "
+            f"reused_tokens={self._block_reuse_reused_token_count}, "
+            f"token_reuse_rate={token_reuse_rate:.6f}, "
+            f"commits={self._block_reuse_commit_log_count}, "
+            f"committed_tokens={self._block_reuse_commit_token_count}, "
+            f"dummy_lookups={self._block_reuse_dummy_lookup_count}, "
+            f"salted_lookups={self._block_reuse_salted_lookup_count}, "
+            f"unique_cache_salts={len(self._block_reuse_cache_salt_hashes)}, "
+            f"committed_prefixes={self._block_reuse_committed_prefix_count}, "
+            f"misses_with_matching_prefix_same_scope="
+            f"{self._block_reuse_miss_with_matching_prefix_same_scope_count}, "
+            f"misses_with_matching_prefix_any_scope="
+            f"{self._block_reuse_miss_with_matching_prefix_any_scope_count}"
+        )
+
     def release_index_slot(self, request_id: int) -> None:
         """Release IndexMapper slot early while keeping KV cache blocks allocated.
 
@@ -2273,10 +2447,12 @@ class KVCacheManagerV2(BaseResourceManager):
         self._allocated_draft_lens.pop(request.py_request_id, None)
         kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
         if kv_cache is None:
+            self._block_reuse_commit_fingerprint_state.pop(request.py_request_id, None)
             self.impl.clear_stats_excluded(request.py_request_id)
             return
         kv_cache.discard_pending_stats()
         self.try_commit_blocks_for_reuse(request, kv_cache)
+        self._block_reuse_commit_fingerprint_state.pop(request.py_request_id, None)
         kv_cache.close()
         self.impl.clear_stats_excluded(request.py_request_id)
         if request.py_request_id in self._early_freed_index_requests:
@@ -2430,6 +2606,7 @@ class KVCacheManagerV2(BaseResourceManager):
         return bool(has_invalid_values)
 
     def shutdown(self):
+        self._log_block_reuse_summary()
         for kv_cache in self.kv_cache_map.values():
             kv_cache.close()
         self.kv_cache_map.clear()

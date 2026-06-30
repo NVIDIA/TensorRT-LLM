@@ -12,12 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import copy
 import gc
 import json
 import math
 import os
-import random
 import tempfile
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
@@ -266,20 +264,15 @@ class AccuracyTask:
 
 
 @dataclass(slots=True)
-class _RepeatShuffleSample:
+class _AgentXReuseSample:
     prompt: Any
     sampling_params: SamplingParams
-    reference: Any = None
-    auxiliaries: tuple[Any, ...] = ()
-    base_prompt: Optional[List[int]] = None
-    cache_salt: Optional[str] = None
+    reuse_prompt_rounds: tuple[Any, ...] = ()
+    reuse_prompt_round_token_lens: tuple[int, ...] = ()
 
 
-class RepeatShuffleReuseAccuracyTask(AccuracyTask):
-    REPEAT_SHUFFLE_GROUP_SIZE = 4
-    REPEAT_SHUFFLE_SEED = 0
-    REPEAT_SHUFFLE_MAX_TOKENS = 1
-    REPEAT_SHUFFLE_COMPARE_OUTPUTS = True
+class AgentXReuseAccuracyTask(AccuracyTask):
+    AGENTX_REUSE_MAX_TOKENS = 1
 
     def _build_evaluator(self, extra_evaluator_kwargs: Optional[dict],
                          num_samples: Optional[int]):
@@ -293,18 +286,17 @@ class RepeatShuffleReuseAccuracyTask(AccuracyTask):
     def _collect_evaluator_samples(
             self, llm: Union[LLM, PyTorchLLM, AutoDeployLLM], evaluator,
             sampling_params: SamplingParams,
-            num_samples: Optional[int]) -> List[_RepeatShuffleSample]:
+            num_samples: Optional[int]) -> List[_AgentXReuseSample]:
         samples = []
         try:
             sample_iter = evaluator.generate_samples()
-            for prompt, sampling_args, reference, *aux in sample_iter:
+            for prompt, sampling_args, *_ in sample_iter:
                 if evaluator.apply_chat_template:
                     prompt = evaluator.do_apply_chat_template(llm, prompt)
                 sample_sampling_params = evaluator._get_sampline_params(
                     sampling_params, sampling_args)
                 samples.append(
-                    _RepeatShuffleSample(prompt, sample_sampling_params,
-                                         reference, tuple(aux)))
+                    _AgentXReuseSample(prompt, sample_sampling_params))
                 if num_samples is not None and len(samples) >= num_samples:
                     break
         except NotImplementedError:
@@ -314,7 +306,7 @@ class RepeatShuffleReuseAccuracyTask(AccuracyTask):
     def _collect_lm_eval_samples(
             self, llm: Union[LLM, PyTorchLLM, AutoDeployLLM], evaluator,
             sampling_params: SamplingParams, streaming: bool,
-            num_samples: Optional[int]) -> List[_RepeatShuffleSample]:
+            num_samples: Optional[int]) -> List[_AgentXReuseSample]:
         from lm_eval.evaluator import get_sample_size, get_task_list
 
         from tensorrt_llm.evaluate.lm_eval import LmEvalWrapper
@@ -353,7 +345,7 @@ class RepeatShuffleReuseAccuracyTask(AccuracyTask):
                 if sampling_params.max_tokens is not None:
                     sample_sampling_params.max_tokens = sampling_params.max_tokens
                 samples.append(
-                    _RepeatShuffleSample(prompt, sample_sampling_params))
+                    _AgentXReuseSample(prompt, sample_sampling_params))
                 if num_samples is not None and len(samples) >= num_samples:
                     return samples
         return samples
@@ -361,7 +353,7 @@ class RepeatShuffleReuseAccuracyTask(AccuracyTask):
     def _collect_samples(
             self, llm: Union[LLM, PyTorchLLM, AutoDeployLLM], evaluator,
             sampling_params: SamplingParams, streaming: bool,
-            num_samples: Optional[int]) -> List[_RepeatShuffleSample]:
+            num_samples: Optional[int]) -> List[_AgentXReuseSample]:
         samples = self._collect_evaluator_samples(llm, evaluator,
                                                   sampling_params, num_samples)
         if (num_samples is None or len(samples) < num_samples) and hasattr(
@@ -369,40 +361,13 @@ class RepeatShuffleReuseAccuracyTask(AccuracyTask):
             samples = self._collect_lm_eval_samples(llm, evaluator,
                                                     sampling_params, streaming,
                                                     num_samples)
-        if len(samples) < self.REPEAT_SHUFFLE_GROUP_SIZE:
-            raise ValueError(
-                f"Only collected {len(samples)} samples for {self.DATASET}; "
-                f"expected at least {self.REPEAT_SHUFFLE_GROUP_SIZE}.")
+        if not samples:
+            raise ValueError(f"Could not collect samples for {self.DATASET}.")
         return samples
-
-    def _reuse_base_group_key(self, sample: _RepeatShuffleSample) -> Any:
-        return None
-
-    def _get_reuse_base_prompt_token_ids(
-            self, llm: Union[LLM, PyTorchLLM,
-                             AutoDeployLLM], sample: _RepeatShuffleSample,
-            token_ids: List[int]) -> Optional[List[int]]:
-        return None
-
-    @staticmethod
-    def _common_token_prefix(token_ids_list: List[List[int]]) -> List[int]:
-        if not token_ids_list:
-            return []
-        prefix = list(token_ids_list[0])
-        for token_ids in token_ids_list[1:]:
-            prefix_len = 0
-            max_prefix_len = min(len(prefix), len(token_ids))
-            while (prefix_len < max_prefix_len
-                   and prefix[prefix_len] == token_ids[prefix_len]):
-                prefix_len += 1
-            prefix = prefix[:prefix_len]
-            if not prefix:
-                break
-        return prefix
 
     def _preprocess_prompt_token_ids(self, llm: Union[LLM, PyTorchLLM,
                                                       AutoDeployLLM],
-                                     sample: _RepeatShuffleSample) -> List[int]:
+                                     sample: _AgentXReuseSample) -> List[int]:
         if isinstance(sample.prompt, list):
             return list(sample.prompt)
         if hasattr(llm, "preprocess"):
@@ -413,150 +378,219 @@ class RepeatShuffleReuseAccuracyTask(AccuracyTask):
                                         sample.sampling_params,
                                         "add_special_tokens", True))
 
-    def _prepare_reuse_base_prompts(
-            self, llm: Union[LLM, PyTorchLLM, AutoDeployLLM],
-            samples: List[_RepeatShuffleSample]) -> None:
-        groups: Dict[Any, List[tuple[int, List[int]]]] = {}
-        for sample_idx, sample in enumerate(samples):
-            token_ids = self._preprocess_prompt_token_ids(llm, sample)
-            base_prompt = self._get_reuse_base_prompt_token_ids(
-                llm, sample, token_ids)
-            if (base_prompt is not None and len(base_prompt) < len(token_ids)
-                    and token_ids[:len(base_prompt)] == base_prompt):
-                samples[sample_idx].base_prompt = base_prompt
-                continue
-            groups.setdefault(self._reuse_base_group_key(sample), []).append(
-                (sample_idx, token_ids))
-
-        num_prepared_samples = sum(sample.base_prompt is not None
-                                   for sample in samples)
-        for group in groups.values():
-            group_token_ids = [token_ids for _, token_ids in group]
-            max_base_len = min(
-                max(len(token_ids) - 1, 0) for token_ids in group_token_ids)
-            base_prompt = self._common_token_prefix(
-                group_token_ids)[:max_base_len]
-            if not base_prompt:
-                continue
-            for sample_idx, _ in group:
-                samples[sample_idx].base_prompt = base_prompt
-                num_prepared_samples += 1
-
-        if num_prepared_samples == 0:
-            raise ValueError(
-                f"Could not prepare reusable base prompts for {self.DATASET}.")
-        base_lengths = [
-            len(sample.base_prompt) for sample in samples
-            if sample.base_prompt is not None
-        ]
-        unique_bases = {
-            tuple(sample.base_prompt)
-            for sample in samples if sample.base_prompt is not None
-        }
-        logger.info(
-            f"Prepared reuse base prompts for {self.DATASET}: "
-            f"samples={num_prepared_samples}, unique={len(unique_bases)}, "
-            f"min_tokens={min(base_lengths)}, max_tokens={max(base_lengths)}")
-
-    def _warm_reuse_base_prompts(self, llm: Union[LLM, PyTorchLLM,
-                                                  AutoDeployLLM],
-                                 samples: List[_RepeatShuffleSample]) -> None:
-        base_prompts = []
-        seen = set()
-        for sample in samples:
-            if sample.base_prompt is None:
-                continue
-            key = (sample.cache_salt, tuple(sample.base_prompt))
-            if key not in seen:
-                seen.add(key)
-                base_prompts.append((sample.cache_salt, sample.base_prompt))
-        if not base_prompts:
-            return
-
-        sampling_params = SamplingParams(
-            max_tokens=self.REPEAT_SHUFFLE_MAX_TOKENS,
-            temperature=0,
-        )
-        outputs = [
-            llm.generate_async(base_prompt,
-                               sampling_params=sampling_params,
-                               cache_salt=cache_salt)
-            for cache_salt, base_prompt in base_prompts
-        ]
-        for output in outputs:
-            output.result()
-
-    def _run_samples(self,
-                     llm: Union[LLM, PyTorchLLM, AutoDeployLLM],
-                     samples: List[_RepeatShuffleSample],
-                     streaming: bool,
-                     warm_reuse_base_prompts: bool = False):
-        max_batch_size = getattr(getattr(llm, "args", None), "max_batch_size",
-                                 None)
-        chunk_size = max_batch_size or self.MAX_BATCH_SIZE or 128
-        if self.MAX_BATCH_SIZE is not None:
-            chunk_size = min(chunk_size, self.MAX_BATCH_SIZE)
-        chunk_size = max(1, chunk_size)
-
-        results = []
-        for start in range(0, len(samples), chunk_size):
-            chunk = samples[start:start + chunk_size]
-            if warm_reuse_base_prompts:
-                self._warm_reuse_base_prompts(llm, chunk)
-            outputs = [
-                llm.generate_async(sample.prompt,
-                                   sampling_params=sample.sampling_params,
-                                   streaming=streaming,
-                                   cache_salt=sample.cache_salt)
-                for sample in chunk
-            ]
-            results.extend(output.result() for output in outputs)
-        return results
-
     @staticmethod
-    def _with_cache_salt(samples: List[_RepeatShuffleSample],
-                         cache_salt: str) -> List[_RepeatShuffleSample]:
-        return [
-            _RepeatShuffleSample(sample.prompt,
-                                 sample.sampling_params,
-                                 sample.reference,
-                                 sample.auxiliaries,
-                                 sample.base_prompt,
-                                 cache_salt=cache_salt) for sample in samples
-        ]
+    def _get_agentx_round_prompts(prompt: str) -> List[str]:
+        assistant_marker = "<|im_start|>assistant\n"
+        positions = []
+        start = 0
+        while True:
+            pos = prompt.find(assistant_marker, start)
+            if pos < 0:
+                break
+            positions.append(pos + len(assistant_marker))
+            start = pos + len(assistant_marker)
+        return [prompt[:pos] for pos in positions[:-1]]
 
-    def _build_reuse_check_samples(
-            self,
-            samples: List[_RepeatShuffleSample]) -> List[_RepeatShuffleSample]:
-        reuse_check_samples = []
+    def _prepare_agentx_reuse_prompts(
+            self, llm: Union[LLM, PyTorchLLM, AutoDeployLLM],
+            samples: List[_AgentXReuseSample]) -> List[_AgentXReuseSample]:
+        prepared_samples = []
         for sample in samples:
-            sampling_params = copy.deepcopy(sample.sampling_params)
-            sampling_params.max_tokens = self.REPEAT_SHUFFLE_MAX_TOKENS
-            sampling_params.temperature = 0
-            reuse_check_samples.append(
-                _RepeatShuffleSample(sample.prompt, sampling_params,
-                                     sample.reference, sample.auxiliaries,
-                                     sample.base_prompt, sample.cache_salt))
-        return reuse_check_samples
+            if not isinstance(sample.prompt, str):
+                continue
+            token_ids = self._preprocess_prompt_token_ids(llm, sample)
+            round_prompts = self._get_agentx_round_prompts(sample.prompt)
+            round_token_ids = [
+                self._preprocess_prompt_token_ids(
+                    llm, _AgentXReuseSample(round_prompt,
+                                            sample.sampling_params))
+                for round_prompt in round_prompts
+            ]
+            if not round_token_ids:
+                continue
+            if any(token_ids[:len(round_ids)] != round_ids
+                   for round_ids in round_token_ids):
+                continue
+            sample.reuse_prompt_rounds = tuple(
+                list(round_ids) for round_ids in round_token_ids)
+            sample.reuse_prompt_round_token_lens = tuple(
+                len(round_ids) for round_ids in round_token_ids)
+            prepared_samples.append(sample)
 
-    def _score_outputs(self, evaluator, outputs: List[Any],
-                       samples: List[_RepeatShuffleSample],
-                       llm: Union[LLM, PyTorchLLM, AutoDeployLLM],
-                       sampling_params: SamplingParams, streaming: bool,
-                       extra_evaluator_kwargs: Optional[dict]) -> float:
-        evaluate_kwargs = {}
-        if hasattr(self, 'EVALUATE_KWARGS'):
-            evaluate_kwargs.update(self.EVALUATE_KWARGS)
+        if not prepared_samples:
+            raise ValueError(
+                f"Could not prepare AgentX grow-prefix prompts for "
+                f"{self.DATASET}.")
 
-        if all(sample.reference is not None for sample in samples):
-            references = [sample.reference for sample in samples]
-            auxiliaries = [sample.auxiliaries for sample in samples]
-            return evaluator.compute_score(outputs, references,
-                                           *zip(*auxiliaries))
+        round_counts = [
+            len(sample.reuse_prompt_rounds) for sample in prepared_samples
+        ]
+        logger.info(f"Prepared AgentX grow-prefix prompts for {self.DATASET}: "
+                    f"samples={len(prepared_samples)}, min_rounds="
+                    f"{min(round_counts)}, max_rounds={max(round_counts)}")
+        return prepared_samples
 
-        score_evaluator = self._build_evaluator(extra_evaluator_kwargs, None)
-        return score_evaluator.evaluate(llm, sampling_params, streaming,
-                                        **evaluate_kwargs)
+    def _evaluate_lm_eval_with_agentx_reuse(
+            self, llm: Union[LLM, PyTorchLLM, AutoDeployLLM], evaluator,
+            sampling_params: Optional[SamplingParams], streaming: bool,
+            scores_filter: Optional[str]) -> float:
+        import lm_eval
+        from tqdm import tqdm
+
+        import tensorrt_llm.profiler as profiler
+        from tensorrt_llm.evaluate.interface import dump_inference_results
+        from tensorrt_llm.evaluate.lm_eval import LmEvalWrapper
+
+        task = self
+
+        class AgentXReuseLmEvalWrapper(LmEvalWrapper):
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.agentx_num_checked = 0
+                self.agentx_cache_salt = f"{task.DATASET}-agentx-reuse"
+
+            def _prepare_agentx_sample(
+                    self, prompt: str, final_sampling_params: SamplingParams
+            ) -> _AgentXReuseSample:
+                sample = _AgentXReuseSample(prompt, final_sampling_params)
+                token_ids = task._preprocess_prompt_token_ids(self.llm, sample)
+                round_prompts = task._get_agentx_round_prompts(prompt)
+                round_token_ids = [
+                    task._preprocess_prompt_token_ids(
+                        self.llm,
+                        _AgentXReuseSample(round_prompt, final_sampling_params))
+                    for round_prompt in round_prompts
+                ]
+                if not round_token_ids:
+                    raise ValueError(
+                        f"Could not prepare AgentX grow-prefix prompts for "
+                        f"{task.DATASET} sample {self.agentx_num_checked}.")
+                if any(token_ids[:len(round_ids)] != round_ids
+                       for round_ids in round_token_ids):
+                    raise ValueError(
+                        f"AgentX grow-prefix prompt is not a token prefix of "
+                        f"the final prompt for {task.DATASET} sample "
+                        f"{self.agentx_num_checked}.")
+                sample.reuse_prompt_rounds = tuple(
+                    list(round_ids) for round_ids in round_token_ids)
+                sample.reuse_prompt_round_token_lens = tuple(
+                    len(round_ids) for round_ids in round_token_ids)
+                return sample
+
+            def _grow_agentx_prefix(self, sample: _AgentXReuseSample) -> None:
+                reuse_sampling_params = SamplingParams(
+                    max_tokens=task.AGENTX_REUSE_MAX_TOKENS,
+                    temperature=0,
+                )
+                previous_prompt_len = None
+                sample_idx = self.agentx_num_checked
+                for round_idx, round_prompt in enumerate(
+                        sample.reuse_prompt_rounds):
+                    output = self.llm.generate_async(
+                        round_prompt,
+                        sampling_params=reuse_sampling_params,
+                        cache_salt=self.agentx_cache_salt)
+                    result = output.result()
+                    if previous_prompt_len is not None:
+                        expected_min_cached = previous_prompt_len - 1
+                        assert result.cached_tokens >= expected_min_cached, (
+                            f"AgentX grow-prefix reuse miss for "
+                            f"{task.DATASET} sample {sample_idx}, round "
+                            f"{round_idx}: cached_tokens="
+                            f"{result.cached_tokens}, expected at least "
+                            f"{expected_min_cached}.")
+                    previous_prompt_len = (
+                        sample.reuse_prompt_round_token_lens[round_idx])
+
+            def generate_until(self,
+                               requests,
+                               disable_tqdm: bool = False) -> List[str]:
+                profiler.start("trtllm exec")
+                results = []
+                for request in tqdm(requests,
+                                    desc="Submitting requests",
+                                    disable=disable_tqdm):
+                    prompt, gen_kwargs = request.args
+                    final_sampling_params = self._get_sampling_params(
+                        dict(gen_kwargs or {}))
+                    sample = self._prepare_agentx_sample(
+                        prompt, final_sampling_params)
+                    self._grow_agentx_prefix(sample)
+                    output = self.llm.generate_async(
+                        prompt,
+                        sampling_params=final_sampling_params,
+                        streaming=self.streaming,
+                        cache_salt=self.agentx_cache_salt)
+                    result = output.result()
+                    expected_min_cached = (
+                        sample.reuse_prompt_round_token_lens[-1] - 1)
+                    assert result.cached_tokens >= expected_min_cached, (
+                        f"AgentX final prompt reuse miss for {task.DATASET} "
+                        f"sample {self.agentx_num_checked}: cached_tokens="
+                        f"{result.cached_tokens}, expected at least "
+                        f"{expected_min_cached}.")
+                    results.append(result)
+                    self.agentx_num_checked += 1
+
+                if self.output_dir:
+                    dump_inference_results(self.output_dir, results,
+                                           getattr(self.llm, 'tokenizer', None))
+
+                profiler.stop("trtllm exec")
+                elapsed_time = profiler.elapsed_time_in_sec("trtllm exec")
+                logger.info(
+                    f"TRTLLM execution time: {elapsed_time:.3f} seconds.")
+                profiler.reset("trtllm exec")
+                logger.info(
+                    f"AgentX grow-prefix reuse check passed for "
+                    f"{task.DATASET}: {self.agentx_num_checked} samples "
+                    f"checked.")
+                return [output.outputs[0].text for output in results]
+
+        if getattr(evaluator, "MULTIMODAL", False):
+            raise ValueError(
+                "AgentX reuse evaluation only supports text-only lm-eval "
+                "tasks.")
+
+        lm = AgentXReuseLmEvalWrapper(
+            llm,
+            sampling_params=sampling_params,
+            streaming=streaming,
+            chat_template_kwargs=evaluator.chat_template_kwargs,
+            output_dir=evaluator.output_dir)
+        results = lm_eval.evaluate(
+            lm=lm,
+            task_dict=evaluator.task_dict,
+            limit=evaluator.num_samples,
+            apply_chat_template=evaluator.apply_chat_template,
+            fewshot_as_multiturn=evaluator.fewshot_as_multiturn,
+            system_instruction=evaluator.system_prompt,
+            log_samples=evaluator.log_samples)
+
+        scores = results["results"][evaluator.task_name]
+        for metric in scores.keys():
+            if isinstance(scores[metric], (float, int)):
+                scores[metric] *= 100
+        logger.info(
+            f"lm-eval {evaluator.task_name} results (scores normalized to "
+            f"range 0~100):\n{lm_eval.utils.make_table(results)}")
+
+        if evaluator.output_path:
+            evaluator.save_results(results)
+
+        if scores_filter is not None:
+            result_acc = results["results"][evaluator.task_name][scores_filter]
+            logger.info(
+                f"lm-eval {evaluator.task_name} {scores_filter} accuracy: "
+                f"{result_acc:.2f}")
+        else:
+            result_acc = sum(acc for metric, acc in scores.items()
+                             if "_stderr" not in metric)
+            result_acc /= sum(1 for metric in scores if "_stderr" not in metric)
+            logger.info(f"lm-eval {evaluator.task_name} average accuracy: "
+                        f"{result_acc:.2f}")
+        return result_acc
 
     def evaluate(self,
                  llm: Union[LLM, PyTorchLLM, AutoDeployLLM],
@@ -565,10 +599,9 @@ class RepeatShuffleReuseAccuracyTask(AccuracyTask):
                  sampling_params: Optional[SamplingParams] = None,
                  streaming: bool = False,
                  is_integration_test: bool = False):
-        assert self.EVALUATOR_CLS is not None
         if streaming:
             raise ValueError(
-                "Repeat-shuffle reuse evaluation does not support streaming.")
+                "AgentX reuse evaluation does not support streaming.")
 
         if llm.args.speculative_config is None:
             spec_dec_algo = None
@@ -577,16 +610,15 @@ class RepeatShuffleReuseAccuracyTask(AccuracyTask):
             if spec_dec_algo == 'AUTO':
                 spec_dec_algo = 'NGram'
         else:
-            raise ValueError(
-                f"Not recognized speculative_config: {llm.args.speculative_config}."
-            )
+            raise ValueError(f"Not recognized speculative_config: "
+                             f"{llm.args.speculative_config}.")
         is_integration_test = is_integration_test or os.getenv(
             'INTEGRATION_TEST', '0') == '1'
 
         if is_integration_test:
             logger.info(
-                "Running in INTEGRATION_TEST mode: skipping accuracy verification"
-            )
+                "Running in INTEGRATION_TEST mode: using only 1 sample and "
+                "skipping accuracy verification")
             hypothesis_testing_params = HypothesisTestingParams(
                 ref_accuracy=0 if self.HIGHER_IS_BETTER else math.inf,
                 num_samples=1,
@@ -610,92 +642,22 @@ class RepeatShuffleReuseAccuracyTask(AccuracyTask):
             if sampling_params.truncate_prompt_tokens is None:
                 sampling_params.truncate_prompt_tokens = self.MAX_INPUT_LEN
 
-        evaluator = self._build_evaluator(extra_evaluator_kwargs, None)
-        samples = self._collect_samples(llm, evaluator, sampling_params,
-                                        streaming, None)
-        self._prepare_reuse_base_prompts(llm, samples)
-        compare_outputs = (self.REPEAT_SHUFFLE_COMPARE_OUTPUTS
-                           and spec_dec_algo != "MTP")
-        if compare_outputs:
-            group_ranges = [(start,
-                             min(start + self.REPEAT_SHUFFLE_GROUP_SIZE,
-                                 len(samples)))
-                            for start in range(0, len(samples),
-                                               self.REPEAT_SHUFFLE_GROUP_SIZE)]
-            num_groups = len(group_ranges)
-            if num_groups == 0:
-                raise ValueError(f"Only collected {len(samples)} samples for "
-                                 f"{self.DATASET}; expected at least "
-                                 f"{self.REPEAT_SHUFFLE_GROUP_SIZE}.")
+        evaluator = self._build_evaluator(extra_evaluator_kwargs,
+                                          hypothesis_testing_params.num_samples)
+        if not hasattr(evaluator, "task_dict"):
+            raise ValueError(
+                "AgentX reuse evaluation requires an lm-eval based task.")
 
-            reuse_check_samples = self._build_reuse_check_samples(samples)
-            rng = random.Random(self.REPEAT_SHUFFLE_SEED)
-            shuffled_entries = []
-            for group_idx, (start, end) in enumerate(group_ranges):
-                group = reuse_check_samples[start:end]
-                order = list(range(len(group)))
-                rng.shuffle(order)
-                shuffled_entries.extend(
-                    (group_idx, sample_idx, group[sample_idx])
-                    for sample_idx in order)
+        evaluate_kwargs = {}
+        if hasattr(self, 'EVALUATE_KWARGS'):
+            evaluate_kwargs.update(self.EVALUATE_KWARGS)
+        scores_filter = evaluate_kwargs.pop("scores_filter", None)
+        if evaluate_kwargs:
+            raise ValueError(f"Unsupported AgentX reuse evaluation kwargs: "
+                             f"{evaluate_kwargs}.")
 
-            first_samples = self._with_cache_salt(
-                [sample for _, _, sample in shuffled_entries],
-                f"{self.DATASET}-reuse-check-first")
-            first_outputs = self._run_samples(llm,
-                                              first_samples,
-                                              streaming,
-                                              warm_reuse_base_prompts=True)
-            first_outputs_by_key = {
-                (group_idx, sample_idx): output
-                for (group_idx, sample_idx,
-                     _), output in zip(shuffled_entries, first_outputs)
-            }
-
-            second_samples = self._with_cache_salt(
-                [sample for _, _, sample in shuffled_entries],
-                f"{self.DATASET}-reuse-check-second")
-            second_outputs = self._run_samples(llm,
-                                               second_samples,
-                                               streaming,
-                                               warm_reuse_base_prompts=True)
-            second_outputs_by_key = {
-                (group_idx, sample_idx): output
-                for (group_idx, sample_idx,
-                     _), output in zip(shuffled_entries, second_outputs)
-            }
-
-            for group_idx, sample_idx, sample in shuffled_entries:
-                first_output = first_outputs_by_key[(group_idx, sample_idx)]
-                second_output = second_outputs_by_key[(group_idx, sample_idx)]
-                first_token_ids = first_output.outputs[0].token_ids
-                second_token_ids = second_output.outputs[0].token_ids
-                assert len(first_token_ids) > 0
-                assert first_token_ids == second_token_ids, (
-                    f"Repeat-shuffle reuse output mismatch for "
-                    f"{self.DATASET} group {group_idx}, sample {sample_idx}.\n"
-                    f"Prompt:\n{sample.prompt}\n"
-                    f"First reuse output:\n{first_output.outputs[0].text}\n"
-                    f"Second reuse output:\n{second_output.outputs[0].text}")
-
-            logger.info(
-                f"Repeat-shuffle reuse check passed for {self.DATASET}: "
-                f"{num_groups} groups, {len(reuse_check_samples)} samples "
-                f"checked, {len(samples)} samples collected.")
-        else:
-            logger.info(
-                f"Prepared reuse accuracy check for {self.DATASET}: "
-                f"{len(samples)} samples collected, exact output comparison "
-                f"disabled for speculative decoding.")
-        score_outputs = []
-        if all(sample.reference is not None for sample in samples):
-            score_outputs = self._run_samples(llm,
-                                              samples,
-                                              streaming,
-                                              warm_reuse_base_prompts=True)
-        score = self._score_outputs(evaluator, score_outputs, samples, llm,
-                                    sampling_params, streaming,
-                                    extra_evaluator_kwargs)
+        score = self._evaluate_lm_eval_with_agentx_reuse(
+            llm, evaluator, sampling_params, streaming, scores_filter)
         logger.info(
             f"Hypothesis testing report:\n{hypothesis_testing_params.report(score)}"
         )
@@ -854,38 +816,8 @@ class GSM8K(AccuracyTask):
     EVALUATE_KWARGS = dict(scores_filter=None)
 
 
-class MMLURepeatShuffleReuse(RepeatShuffleReuseAccuracyTask, MMLU):
-
-    def _reuse_base_group_key(self, sample: _RepeatShuffleSample) -> Any:
-        if sample.auxiliaries:
-            return sample.auxiliaries[0]
-        return None
-
-
-class GSM8KRepeatShuffleReuse(RepeatShuffleReuseAccuracyTask, GSM8K):
-
-    def _get_reuse_base_prompt_token_ids(
-            self, llm: Union[LLM, PyTorchLLM,
-                             AutoDeployLLM], sample: _RepeatShuffleSample,
-            token_ids: List[int]) -> Optional[List[int]]:
-        if not isinstance(sample.prompt, str):
-            return None
-
-        split_pos = -1
-        for marker in ("<|im_start|>user\nQuestion:", "\nQuestion:"):
-            pos = sample.prompt.rfind(marker)
-            if pos > 0:
-                split_pos = pos
-                break
-        if split_pos <= 0:
-            return None
-
-        base_prompt = sample.prompt[:split_pos]
-        base_token_ids = self._preprocess_prompt_token_ids(
-            llm, _RepeatShuffleSample(base_prompt, sample.sampling_params))
-        if not base_token_ids or len(base_token_ids) >= len(token_ids):
-            return None
-        return base_token_ids
+class GSM8KAgentXReuse(AgentXReuseAccuracyTask, GSM8K):
+    pass
 
 
 class GPQADiamond(AccuracyTask):

@@ -1740,8 +1740,8 @@ class TestSSMSupport(unittest.TestCase):
         kv4.resume(stream)
         kv4.close()
 
-    def test_ssm_last_snapshot_partial_tail_does_not_cover_longer_sibling(self) -> None:
-        """A partial final SSM snapshot must not attach to a longer sibling block."""
+    def test_ssm_last_snapshot_partial_tail_reuses_longer_sibling_prefix(self) -> None:
+        """A partial final SSM snapshot can seed a longer sibling with the same prefix."""
         tokens_per_block = 8
         cfg = self._make_ssm_reuse_config(
             tokens_per_block=tokens_per_block,
@@ -1785,7 +1785,7 @@ class TestSSMSupport(unittest.TestCase):
 
         full_prefix_without_snapshot = shared + full_tail
         kv4 = self.manager.create_kv_cache(input_tokens=full_prefix_without_snapshot)
-        self.assertEqual(kv4.num_committed_tokens, 0)
+        self.assertEqual(kv4.num_committed_tokens, len(shorter_prompt))
         kv4.resume(stream)
         kv4.close()
 
@@ -1921,6 +1921,45 @@ class TestSSMSupport(unittest.TestCase):
         run_order(first_scope, [0, 1, 2, 3])
         warm_bases(second_scope)
         run_order(second_scope, [2, 0, 3, 1])
+
+    def test_ssm_last_snapshot_reuses_partial_tail_with_many_siblings(self) -> None:
+        """High fanout must not prevent exact SSM partial-snapshot reuse."""
+        tokens_per_block = 8
+        cfg = self._make_ssm_reuse_config(
+            tokens_per_block=tokens_per_block,
+            ssm_reuse_interval=0,
+            mamba_save_last_snapshot=True,
+        )
+        self.manager = KVCacheManager(cfg)
+        engine = FakeEngine(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+
+        shared = [self.next_token() for _ in range(tokens_per_block)]
+        targets = []
+        for _ in range(40):
+            base = shared + [self.next_token() for _ in range(3)]
+            suffix = [self.next_token() for _ in range(2)]
+            targets.append((base, suffix))
+
+            kv_cache = self.manager.create_kv_cache()
+            kv_cache.resume(stream)
+            kv_cache.capacity = len(base)
+            kv_cache.history_length = len(base)
+            engine.execute([Step(kv_cache, base, [])], stream)
+            kv_cache.commit(base)
+            kv_cache.stop_committing(save_last_ssm_snapshot=True)
+            kv_cache.close()
+
+        base, suffix = targets[-1]
+        full_prompt = base + suffix
+        kv_cache = self.manager.create_kv_cache(input_tokens=full_prompt)
+        self.assertEqual(kv_cache.num_committed_tokens, len(base))
+        kv_cache.resume(stream)
+        kv_cache.capacity = len(full_prompt)
+        kv_cache.history_length = len(base)
+        engine.execute([Step(kv_cache, suffix, base)], stream)
+        kv_cache.close()
 
     def test_ssm_reuse_data_integrity(self) -> None:
         """After reuse, SSM data matches the snapshot (verified by FakeEngine)."""

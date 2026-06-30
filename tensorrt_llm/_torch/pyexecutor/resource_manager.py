@@ -2463,6 +2463,8 @@ class ResourceManager:
         kv_cache_dtype_byte_size: Optional[float] = None,
     ):
         for _, resource_manager in self.resource_managers.items():
+            if hasattr(resource_manager, "update_context_resources"):
+                resource_manager.update_context_resources(scheduled_batch)
             if hasattr(resource_manager, "update_resources"):
                 if isinstance(resource_manager, KVCacheManager):
                     resource_manager.update_resources(scheduled_batch,

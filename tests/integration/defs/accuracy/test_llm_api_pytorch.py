@@ -44,9 +44,8 @@ from ..conftest import (check_device_contain, get_device_count, llm_models_root,
                         skip_post_hopper, skip_pre_ada, skip_pre_blackwell,
                         skip_pre_hopper, skip_ray)
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
-                            GSM8KRepeatShuffleReuse, JsonModeEval,
-                            LlmapiAccuracyTestHarness, LongBenchV1, LongBenchV2,
-                            MMLURepeatShuffleReuse)
+                            GSM8KAgentXReuse, JsonModeEval,
+                            LlmapiAccuracyTestHarness, LongBenchV1, LongBenchV2)
 
 
 # Keep helper definitions below imports so new imports do not need E402
@@ -5580,39 +5579,27 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
     @skip_pre_hopper
-    def test_fp8_block_reuse_interval_repeat_shuffle(self):
+    def test_fp8_block_reuse_save_last_snapshot_agentx(self):
         model_path = f"{llm_models_root()}/Qwen3.5-4B-FP8"
         with LLM(model_path,
                  trust_remote_code=True,
+                 enable_chunked_prefill=True,
                  max_seq_len=4096,
-                 max_batch_size=32,
-                 kv_cache_config=KvCacheConfig(
-                     enable_block_reuse=True,
-                     mamba_state_cache_interval=256,
-                     free_gpu_memory_fraction=0.8,
+                 max_num_tokens=512,
+                 max_batch_size=8,
+                 scheduler_config=SchedulerConfig(
+                     capacity_scheduler_policy="MAX_UTILIZATION",
+                     context_chunking_policy="FIRST_COME_FIRST_SERVED",
                  ),
-                 cuda_graph_config=self.cuda_graph_config) as llm:
-            task = GSM8KRepeatShuffleReuse(self.MODEL_NAME)
-            task.evaluate(
-                llm,
-                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
-            )
-
-    @skip_pre_hopper
-    def test_fp8_block_reuse_save_last_snapshot_repeat_shuffle(self):
-        model_path = f"{llm_models_root()}/Qwen3.5-4B-FP8"
-        with LLM(model_path,
-                 trust_remote_code=True,
-                 max_seq_len=4096,
-                 max_batch_size=32,
                  kv_cache_config=KvCacheConfig(
                      enable_block_reuse=True,
                      mamba_state_cache_interval=0,
                      mamba_save_last_snapshot=True,
                      free_gpu_memory_fraction=0.8,
                  ),
-                 cuda_graph_config=self.cuda_graph_config) as llm:
-            task = GSM8KRepeatShuffleReuse(self.MODEL_NAME)
+                 cuda_graph_config=CudaGraphConfig(enable_padding=True,
+                                                   max_batch_size=8)) as llm:
+            task = GSM8KAgentXReuse(self.MODEL_NAME)
             task.evaluate(
                 llm,
                 extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
@@ -6597,15 +6584,10 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 moe_config=MoeConfig(backend="TRTLLM"),
                 speculative_config=mtp_config if use_mtp else None,
         ) as llm:
-            use_repeat_shuffle_reuse = use_mtp or is_chat
-            mmlu_task_cls = (MMLURepeatShuffleReuse
-                             if use_repeat_shuffle_reuse else MMLU)
-            gsm8k_task_cls = (GSM8KRepeatShuffleReuse
-                              if use_repeat_shuffle_reuse else GSM8K)
-            task = mmlu_task_cls(self.MODEL_NAME)
+            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-            task = gsm8k_task_cls(self.MODEL_NAME)
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
