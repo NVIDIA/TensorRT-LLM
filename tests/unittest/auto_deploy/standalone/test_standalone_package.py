@@ -141,6 +141,40 @@ class TestStandalonePackage:
         )
         assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
 
+    def test_linear_simple_works_in_standalone_on_b200(self, standalone_package):
+        """The standalone linear op must work on the B200 bf16 path."""
+        result = _run_isolated(
+            standalone_package,
+            """
+            from unittest import mock
+
+            import torch
+            import llmc
+            from llmc.custom_ops.linear import linear
+
+            if torch.cuda.is_available():
+                device = "cuda"
+                dtype = torch.bfloat16
+            else:
+                device = "cpu"
+                dtype = torch.float32
+
+            x = torch.randn(2, 3, 5, device=device, dtype=dtype)
+            weight = torch.randn(7, 5, device=device, dtype=dtype)
+            bias = torch.randn(7, device=device, dtype=dtype)
+
+            # Force the Blackwell bf16 branch even when this standalone test
+            # runs on H100 CI instead of B200 CI.
+            with mock.patch.object(linear, "get_sm_version", return_value=100):
+                out = torch.ops.auto_deploy.torch_linear_simple(x, weight, bias)
+
+            ref = torch.ops.aten.linear(x, weight, bias)
+            torch.testing.assert_close(out, ref)
+            print("OK")
+            """,
+        )
+        assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+
     def test_compat_types(self, standalone_package):
         """Standalone _compat types should work."""
         result = _run_isolated(

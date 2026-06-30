@@ -107,6 +107,41 @@ def test_transformer_load_weights_detects_mismatch():
         model.load_weights({})
 
 
+def test_transformer_applies_quant_config_ignore_list() -> None:
+    """Qwen-Image should honor selective dynamic quantization exclusions."""
+    model_config = DiffusionModelConfig(
+        quant_config=QuantConfig(
+            quant_algo=QuantAlgo.NVFP4,
+            exclude_modules=[
+                "transformer_blocks.0*",
+                "img_in",
+                "proj_out",
+            ],
+        ),
+        dynamic_weight_quant=True,
+        force_dynamic_quantization=True,
+    )
+    model = QwenImageTransformer2DModel(model_config=model_config, num_layers=2)
+
+    assert model.img_in.quant_config.quant_algo is None
+    assert model.proj_out.quant_config.quant_algo is None
+    assert model.transformer_blocks[0].attn.add_q_proj.quant_config.quant_algo is None
+    assert model.transformer_blocks[0].img_mlp.up_proj.quant_config.quant_algo is None
+    assert isinstance(model.img_in.quant_method, UnquantizedLinearMethod)
+    assert isinstance(model.proj_out.quant_method, UnquantizedLinearMethod)
+    assert isinstance(
+        model.transformer_blocks[0].attn.add_q_proj.quant_method, UnquantizedLinearMethod
+    )
+    assert isinstance(
+        model.transformer_blocks[0].img_mlp.up_proj.quant_method, UnquantizedLinearMethod
+    )
+
+    assert model.txt_in.quant_config.quant_algo == QuantAlgo.NVFP4
+    assert model.transformer_blocks[1].attn.add_q_proj.quant_config.quant_algo == QuantAlgo.NVFP4
+    assert isinstance(model.txt_in.quant_method, NVFP4LinearMethod)
+    assert isinstance(model.transformer_blocks[1].attn.add_q_proj.quant_method, NVFP4LinearMethod)
+
+
 @pytest.mark.parametrize("quant_algo", [QuantAlgo.NVFP4, QuantAlgo.FP8], ids=["nvfp4", "fp8"])
 def test_static_quant_excludes_high_precision_layers(quant_algo: QuantAlgo) -> None:
     """Layers in the checkpoint's ``ignore`` list build as unquantized.

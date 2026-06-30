@@ -892,31 +892,24 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         return self
 
     def apply_quant_config_exclude_modules(self) -> None:
-        """Disable weight quantization for excluded Linear modules.
-
-        Preserve the global KV-cache quantization policy, matching the shared
-        TensorRT-LLM and VisualGen convention. Direct construction may have
-        already materialized Linear weights, so rebuild those modules with the
-        effective no-weight-quant config.
-        """
         quant_config = self.model_config.quant_config
         if quant_config is None or quant_config.exclude_modules is None:
             return
 
-        no_quant_config = QuantConfig(kv_cache_quant_algo=quant_config.kv_cache_quant_algo)
+        kv_cache_quant_algo = quant_config.kv_cache_quant_algo if quant_config else None
+        no_quant_config = QuantConfig(kv_cache_quant_algo=kv_cache_quant_algo)
 
         for name, module in self.named_modules():
-            if (
-                isinstance(module, Linear)
-                and quant_config.is_module_excluded_from_quantization(name)
-                and getattr(module, "quant_config", None) is not None
-            ):
-                module.quant_config = no_quant_config
-                if getattr(module, "_weights_created", False):
-                    module._weights_created = False
-                    module._parameters.clear()
-                    module._buffers.clear()
-                    module.create_weights()
+            if isinstance(module, Linear):
+                is_excluded = quant_config.is_module_excluded_from_quantization(name)
+                if is_excluded and getattr(module, "quant_config", None) is not None:
+                    module.quant_config = no_quant_config
+                    if getattr(module, "_weights_created", False):
+                        # Rebuild weights so quant_method and parameter layout match the no-quant config.
+                        module._weights_created = False
+                        module._parameters.clear()
+                        module._buffers.clear()
+                        module.create_weights()
 
     def _non_serialized_quant_parameter_names(self) -> set[str]:
         """Return shared Linear parameters absent from ModelOpt checkpoints."""
