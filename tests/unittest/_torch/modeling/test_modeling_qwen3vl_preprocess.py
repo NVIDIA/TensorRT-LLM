@@ -89,12 +89,11 @@ class TestDecideDoSampleFrames:
         vd = _fake_video({"total_num_frames": 240}, n_frames=240)
         assert _decide_do_sample_frames([vd], {}) is True
 
-    def test_silent_caller_io_subsampled_no_sampling(self):
-        # No num_frames/fps from caller, IO already subsampled
-        # (decoded count < total_num_frames): leave the IO-decoded frames
-        # alone.
+    def test_silent_caller_io_subsampled_triggers_sampling(self):
+        # No num_frames/fps from caller: defer to HF's class-default sampling
+        # even when IO already subsampled (decoded count < total_num_frames).
         vd = _fake_video({"total_num_frames": 240}, n_frames=8)
-        assert _decide_do_sample_frames([vd], {}) is False
+        assert _decide_do_sample_frames([vd], {}) is True
 
     def test_batch_reduction_is_any_video_needs_sampling(self):
         # One video matches, one needs resampling → batch is sampled.
