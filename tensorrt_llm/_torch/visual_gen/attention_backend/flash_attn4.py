@@ -30,7 +30,10 @@ from .interface import AttentionBackend, AttentionTensorLayout
 _flash_attn_fwd_import_error = None
 try:
     from flash_attn.cute.interface import _flash_attn_fwd
-except (ImportError, OSError) as e:
+except (ImportError, OSError, AttributeError) as e:
+    # AttributeError covers nvidia-cutlass-dsl version skew (flash_attn.cute / quack
+    # referencing a cute API removed in a newer cutlass-dsl). This backend is
+    # optional, so degrade gracefully instead of breaking `import tensorrt_llm`.
     _flash_attn_fwd = None
     _flash_attn_fwd_import_error = e
 

@@ -37,7 +37,10 @@ from .interface import AttentionBackend, AttentionTensorLayout
 _flash_attn_combine_import_error = None
 try:
     from flash_attn.cute.interface import flash_attn_combine as _flash_attn_combine
-except (ImportError, OSError) as e:
+except (ImportError, OSError, AttributeError) as e:
+    # AttributeError covers nvidia-cutlass-dsl version skew (flash_attn.cute / quack
+    # referencing a cute API removed in a newer cutlass-dsl). The parallel attention
+    # combine is optional, so degrade gracefully instead of breaking the import.
     _flash_attn_combine = None
     _flash_attn_combine_import_error = e
 
