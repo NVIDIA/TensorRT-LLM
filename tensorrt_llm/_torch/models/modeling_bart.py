@@ -445,7 +445,6 @@ class BartModel(nn.Module):
             dtype=config.torch_dtype,
             mapping=model_config.mapping,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
-            gather_output=True,
         )
         self.embed_scale = (
             math.sqrt(config.d_model) if getattr(config, "scale_embedding", False) else 1.0
@@ -576,6 +575,9 @@ class BartForConditionalGeneration(nn.Module, metaclass=PostInitCaller):
         tllm_weights = _convert_hf_bart_weights(
             weights, config, dtype=self.model_config.torch_dtype
         )
+
+        if "lm_head.weight" in weights:
+            self.lm_head.weight = nn.Parameter(torch.empty_like(self.lm_head.weight))
 
         for name, module in self.named_modules():
             if len(list(module.parameters(recurse=False))) == 0:

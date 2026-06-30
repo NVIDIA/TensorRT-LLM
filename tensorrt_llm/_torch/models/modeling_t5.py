@@ -755,7 +755,6 @@ class T5Model(nn.Module):
             dtype=config.torch_dtype,
             mapping=model_config.mapping,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
-            gather_output=True,
         )
 
         self.encoder = T5Encoder(model_config)

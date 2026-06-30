@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import copy
 import inspect
 import os
@@ -118,6 +133,29 @@ def validate_encoder_decoder_kv_cache_config(model_config: ModelConfig,
         raise ValueError(
             "kv_cache_config.cross_kv_cache_fraction should only be set for encoder-decoder models."
         )
+
+
+def validate_encoder_decoder_tp_scope(model_config: ModelConfig) -> None:
+    """Validate initially supported encoder-decoder TP combinations."""
+    if not model_config.is_encoder_decoder:
+        return
+
+    mapping = model_config.mapping
+    if mapping.enable_attention_dp:
+        raise ValueError(
+            "Encoder-decoder models do not support attention DP yet. "
+            "Set mapping.enable_attention_dp=False.")
+
+    if mapping.cp_size > 1:
+        raise ValueError(
+            "Encoder-decoder models do not support context parallelism yet. "
+            "Set mapping.cp_size=1.")
+
+    if mapping.tp_size > 1 and model_config.attn_backend != "TRTLLM":
+        raise ValueError(
+            "Encoder-decoder tensor parallelism currently supports "
+            f"attn_backend='TRTLLM' only, but got "
+            f"attn_backend='{model_config.attn_backend}'.")
 
 
 def initialize_dummy_weights(
@@ -1055,6 +1093,7 @@ class ModelLoader:
                 f"{type(config.pretrained_config).__name__}: {e}. "
                 f"AllReduce pre-allocation will be skipped.")
 
+        validate_encoder_decoder_tp_scope(config)
         validate_encoder_decoder_kv_cache_config(config,
                                                  self.llm_args.kv_cache_config)
         validate_and_set_kv_cache_quant(config,

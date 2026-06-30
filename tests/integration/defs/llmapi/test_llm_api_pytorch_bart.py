@@ -64,9 +64,15 @@ def _test_case(
     exact_match: bool,
     feature_id: str,
     kv_cache_dtype: str = "auto",
+    tensor_parallel_size: int = 1,
+    marks=None,
 ):
     expected_output_token_ids = [_EXPECTED_GREEDY_OUTPUT_TOKEN_IDS] if num_beams == 1 else None
     assert not exact_match or expected_output_token_ids is not None
+
+    param_kwargs = {"id": f"{feature_id}-{_MODEL_NAME}"}
+    if marks is not None:
+        param_kwargs["marks"] = marks
 
     return pytest.param(
         expected_output_token_ids,
@@ -77,7 +83,8 @@ def _test_case(
         num_return_sequences,
         exact_match,
         kv_cache_dtype,
-        id=f"{feature_id}-{_MODEL_NAME}",
+        tensor_parallel_size,
+        **param_kwargs,
     )
 
 
@@ -117,6 +124,28 @@ _TEST_CASES = [
         num_return_sequences=1,
         exact_match=True,
         feature_id="bf16-kv-v2-cuda-graph-off-greedy",
+    ),
+    _test_case(
+        torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=False,
+        enable_cuda_graph=False,
+        num_beams=1,
+        num_return_sequences=1,
+        exact_match=True,
+        feature_id="bf16-kv-v1-cuda-graph-off-greedy-tp2",
+        tensor_parallel_size=2,
+        marks=pytest.mark.skip_less_device(2),
+    ),
+    _test_case(
+        torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=True,
+        enable_cuda_graph=False,
+        num_beams=1,
+        num_return_sequences=1,
+        exact_match=True,
+        feature_id="bf16-kv-v2-cuda-graph-off-greedy-tp2",
+        tensor_parallel_size=2,
+        marks=pytest.mark.skip_less_device(2),
     ),
 ]
 
@@ -257,8 +286,10 @@ def _run_bart_pytorch_generate_encoder_decoder(
     num_return_sequences: int,
     exact_match: bool,
     kv_cache_dtype: str = "auto",
+    tensor_parallel_size: int = 1,
 ) -> None:
-    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+    if tensor_parallel_size == 1:
+        monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
     monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
 
     model_path = _get_bart_model_path()
@@ -266,7 +297,7 @@ def _run_bart_pytorch_generate_encoder_decoder(
     case_id = (
         f"model={_MODEL_NAME}, dtype={torch_dtype}, kv_v2={use_kv_cache_manager_v2}, "
         f"cuda_graph={enable_cuda_graph}, beams={num_beams}, returns={num_return_sequences}, "
-        f"kv_dtype={kv_cache_dtype}"
+        f"kv_dtype={kv_cache_dtype}, tp={tensor_parallel_size}"
     )
     sampling_params = _sampling_params(num_beams, num_return_sequences)
 
@@ -278,6 +309,7 @@ def _run_bart_pytorch_generate_encoder_decoder(
         disable_overlap_scheduler=True,
         dtype=torch_dtype,
         enable_chunked_prefill=False,
+        tensor_parallel_size=tensor_parallel_size,
         kv_cache_config=KvCacheConfig(
             enable_block_reuse=False,
             max_tokens=_MAX_KV_TOKENS,
@@ -314,7 +346,8 @@ def _run_bart_pytorch_generate_encoder_decoder(
 
 @pytest.mark.parametrize(
     "expected_output_token_ids_by_output,torch_dtype,use_kv_cache_manager_v2,"
-    "enable_cuda_graph,num_beams,num_return_sequences,exact_match,kv_cache_dtype",
+    "enable_cuda_graph,num_beams,num_return_sequences,exact_match,kv_cache_dtype,"
+    "tensor_parallel_size",
     _TEST_CASES,
 )
 def test_bart_pytorch_generate_encoder_decoder_end_to_end(
@@ -327,6 +360,7 @@ def test_bart_pytorch_generate_encoder_decoder_end_to_end(
     num_return_sequences: int,
     exact_match: bool,
     kv_cache_dtype: str,
+    tensor_parallel_size: int,
 ) -> None:
     _run_bart_pytorch_generate_encoder_decoder(
         monkeypatch,
@@ -338,6 +372,7 @@ def test_bart_pytorch_generate_encoder_decoder_end_to_end(
         num_return_sequences,
         exact_match,
         kv_cache_dtype,
+        tensor_parallel_size,
     )
 
 
