@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Optional, Type, Union
+from typing import TYPE_CHECKING, Optional, Sequence, Type, Union
 
 import torch
 
@@ -125,3 +125,55 @@ def create_attention(
         num_kv_heads,
         **kwargs,
     )
+
+
+def append_mla_latent_cache(
+    kv_cache_manager,
+    layer_idx: int,
+    request_ids: Sequence[int],
+    seq_lens: Sequence[int],
+    num_cached_tokens: Sequence[int],
+    latent_cache: torch.Tensor,
+    *,
+    kv_layout: str = "NHD",
+    seq_start: int = 0,
+) -> torch.Tensor:
+    """Append packed MLA latent tokens into a paged KV cache.
+
+    The MLA cache has one latent head with ``kv_factor=1`` and stores
+    ``[compressed_kv | k_pe]``. ``latent_cache`` is packed by request for the
+    sequences in ``seq_lens[seq_start:]``.
+    """
+    kv_cache = kv_cache_manager.get_buffers(layer_idx, kv_layout=kv_layout)
+    if kv_layout == "NHD":
+        tokens_per_block = kv_cache.shape[2]
+    elif kv_layout == "HND":
+        tokens_per_block = kv_cache.shape[3]
+    else:
+        raise ValueError(f"Unsupported kv_layout: {kv_layout}")
+
+    blocks_per_seq = kv_cache_manager.get_batch_cache_indices(
+        list(request_ids), layer_idx)
+
+    offset = 0
+    for i in range(seq_start, len(seq_lens)):
+        q_len = int(seq_lens[i])
+        new = latent_cache[offset:offset + q_len].to(kv_cache.dtype)
+        start = int(num_cached_tokens[i])
+        blocks = [b for b in blocks_per_seq[i] if b != -1]
+        written = 0
+        while written < q_len:
+            pos = start + written
+            block = blocks[pos // tokens_per_block]
+            block_offset = pos % tokens_per_block
+            n = min(tokens_per_block - block_offset, q_len - written)
+            if kv_layout == "NHD":
+                kv_cache[block, 0, block_offset:block_offset + n,
+                         0, :].copy_(new[written:written + n])
+            else:
+                kv_cache[block, 0, 0, block_offset:block_offset + n, :].copy_(
+                    new[written:written + n])
+            written += n
+        offset += q_len
+
+    return kv_cache
