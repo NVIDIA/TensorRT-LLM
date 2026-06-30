@@ -83,6 +83,139 @@ Currently, HF checkpoint loader is the primary built-in format, supporting:
 - **Configuration parser** - Parsing HF stored configuration information to TRTLLM `ModelConfig` object
 - **Weights Mapping** - Converting HF weights into TRTLLM compatible representation
 
+## Distributing checkpoints and engine artifacts from object storage
+
+TensorRT LLM reads checkpoints and engines from a local directory and does
+not include an object-store client. To distribute artifacts across a GPU
+fleet you stage them in object storage and pull them onto each serving node
+with standard S3 tooling. This suits object storage that exposes the Amazon
+S3 API, because TensorRT engines are large and specific to a given GPU,
+driver, and TensorRT version, so an organization typically ends up hosting a
+matrix of engines keyed by model, GPU SKU, and precision. The workflow below
+is written against the S3 API, so the same `aws` CLI and `boto3` code work
+against Amazon S3 directly, or against any S3-compatible object store (for
+example Amazon S3, Backblaze B2, Cloudflare R2, and MinIO) once you point the
+tooling at that store's endpoint.
+
+The workflow has three stages: build the engine (or obtain a prebuilt one),
+upload the artifact directory to a bucket, and sync it to a local cache on
+each serving node before pointing `LLM(model=...)` or `trtllm-serve` at the
+cached path.
+
+### Credentials and endpoint
+
+The `aws` CLI and `boto3` read AWS-style environment variables. Set your
+access key, secret key, region, bucket, and (for a non-AWS store) the S3
+endpoint. Adjust the region and endpoint to match your bucket:
+
+```bash
+# S3 credentials, mapped onto the AWS_* names the tooling reads.
+export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY_ID"
+export AWS_SECRET_ACCESS_KEY="$S3_SECRET_ACCESS_KEY"
+export AWS_DEFAULT_REGION="${S3_REGION:-us-east-1}"
+
+# Bucket and S3 endpoint.
+export S3_BUCKET_NAME="my-trtllm-artifacts"
+export S3_ENDPOINT="https://your-s3-endpoint.example.com"
+```
+
+For Amazon S3, drop `--endpoint-url` and use AWS credentials directly. For any
+other S3-compatible store, keep `--endpoint-url "$S3_ENDPOINT"` on every
+command and set it to that store's endpoint.
+
+### Build and upload an engine
+
+Build an engine from a checkpoint with `trtllm-build` (the PyTorch backend can
+also load checkpoints directly, in which case you upload the checkpoint
+directory instead of a built engine):
+
+```bash
+trtllm-build --checkpoint_dir ./llama-3.1-8b-ckpt \
+             --output_dir ./engines/llama-3.1-8b-fp8
+
+# Sync the engine directory (config.json + rank*.engine shards) to the bucket.
+aws s3 sync ./engines/llama-3.1-8b-fp8 \
+    "s3://${S3_BUCKET_NAME}/engines/llama-3.1-8b-fp8" \
+    --endpoint-url "$S3_ENDPOINT"
+```
+
+### Download on the serving node
+
+On each serving node, sync the artifact directory into a local cache and serve
+from the cached path. `aws s3 sync` only transfers objects that are missing or
+changed, so a warm cache skips the download:
+
+```bash
+export TRTLLM_MODEL_CACHE="${TRTLLM_MODEL_CACHE:-/models/cache}"
+LOCAL_DIR="${TRTLLM_MODEL_CACHE}/llama-3.1-8b-fp8"
+
+aws s3 sync "s3://${S3_BUCKET_NAME}/engines/llama-3.1-8b-fp8" \
+    "$LOCAL_DIR" --endpoint-url "$S3_ENDPOINT"
+
+trtllm-serve "$LOCAL_DIR" --host 0.0.0.0 --port 8000
+```
+
+### Equivalent download with boto3
+
+When you prefer to pull artifacts from application code (for example, inside a
+container entrypoint), `boto3` against the same endpoint is equivalent. Setting
+`user_agent_extra` identifies the traffic to the storage service:
+
+```python
+import os
+from pathlib import Path
+
+import boto3
+from botocore.config import Config
+
+from tensorrt_llm import LLM
+
+CACHE_DIR = Path(os.environ.get("TRTLLM_MODEL_CACHE", "/models/cache"))
+BUCKET = os.environ["S3_BUCKET_NAME"]
+PREFIX = os.environ.get("S3_PREFIX", "engines/llama-3.1-8b-fp8/")
+LOCAL_DIR = CACHE_DIR / PREFIX.rstrip("/").split("/")[-1]
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url=os.environ["S3_ENDPOINT"],
+    aws_access_key_id=os.environ["S3_ACCESS_KEY_ID"],
+    aws_secret_access_key=os.environ["S3_SECRET_ACCESS_KEY"],
+    region_name=os.environ.get("S3_REGION", "us-east-1"),
+    config=Config(user_agent_extra="tensorrt-llm-docs"),
+)
+
+paginator = s3.get_paginator("list_objects_v2")
+for page in paginator.paginate(Bucket=BUCKET, Prefix=PREFIX):
+    for obj in page.get("Contents", []):
+        rel = obj["Key"][len(PREFIX):]
+        if not rel:
+            continue
+        dest = LOCAL_DIR / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        s3.download_file(BUCKET, obj["Key"], str(dest))
+
+llm = LLM(model=str(LOCAL_DIR))
+```
+
+### Recommended practices
+
+- **Bucket-scoped credentials.** Issue read-only credentials scoped to the
+  artifact bucket for serving nodes; never deploy with root or account-wide
+  keys.
+- **Match the cache key to the build.** TensorRT engines are not portable
+  across GPU SKU, driver, or TensorRT version. Encode those values in the
+  object prefix (for example, `engines/<model>/<gpu>/<precision>/`) so a node
+  never loads an engine built for a different configuration.
+- **Multipart transfers.** The default `boto3` and `aws` CLI transfer config
+  issues multipart requests, which suits the large `.safetensors` checkpoint
+  shards and `rank*.engine` files typical of LLM artifacts.
+- **Local cache reuse.** Mount `TRTLLM_MODEL_CACHE` on persistent storage so a
+  cold pull happens once per node rather than once per pod restart.
+- **Custom weight loader.** To stream checkpoint weights directly from the
+  object store without staging to disk, implement a `BaseWeightLoader`
+  subclass that reads each shard from `s3.get_object(...)["Body"]`. See
+  *Creating Custom Checkpoint Loaders* below.
+
 ## Using Checkpoint Loaders
 
 ### Basic Usage
