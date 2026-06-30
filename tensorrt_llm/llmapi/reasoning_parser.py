@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Type
 
-from tensorrt_llm import logger
+from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import GuidedDecodingParams
 
 
