@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@revert/mr-2511-slurm-frontend-failover', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.Exception
 import groovy.transform.Field
