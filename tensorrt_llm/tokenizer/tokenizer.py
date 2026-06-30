@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import importlib
 import os
 import pickle  # nosec B403
@@ -33,6 +48,7 @@ TLLM_INCREMENTAL_DETOKENIZATION_BACKEND = os.environ.get(
     "TLLM_INCREMENTAL_DETOKENIZATION_BACKEND", "HF")
 TLLM_STREAM_INTERVAL_THRESHOLD = int(
     os.environ.get("TLLM_STREAM_INTERVAL_THRESHOLD", "24"))
+_HF_DECODE_STREAM_INVALID_PREFIX_ERROR = "Invalid prefix encountered"
 try:
     from tokenizers.decoders import DecodeStream  # noqa
 except ImportError:
@@ -491,11 +507,24 @@ class TransformersTokenizer(TokenizerBase):
             }
 
         decode_stream = states.get('decode_stream')
-        results = [
-            result for tid in token_ids
-            if (result := decode_stream.step(self.tokenizer._tokenizer, tid)
-                ) is not None
-        ]
+        results = []
+        for tid in token_ids:
+            try:
+                result = decode_stream.step(self.tokenizer._tokenizer, tid)
+            except Exception as error:
+                # PyO3 exposes tokenizers' DecodeStreamError as a plain Exception.
+                if not str(error).startswith(
+                        _HF_DECODE_STREAM_INVALID_PREFIX_ERROR):
+                    raise
+                logger.warning(
+                    "HF DecodeStream encountered an invalid prefix while decoding token %d. "
+                    "Resetting the decode stream.", tid)
+                decode_stream = DecodeStream(
+                    skip_special_tokens=skip_special_tokens)
+                states['decode_stream'] = decode_stream
+                result = decode_stream.step(self.tokenizer._tokenizer, tid)
+            if result is not None:
+                results.append(result)
         curr_new_text = "".join(results)
         if clean_up_tokenization_spaces is None:
             clean_up_tokenization_spaces = self.clean_up_tokenization_spaces

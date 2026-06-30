@@ -62,6 +62,11 @@ from tensorrt_llm._torch.models.modeling_gemma4mm import (  # noqa: E402
     Gemma4ForConditionalGeneration,
     Gemma4MultimodalEmbedder,
 )
+from tensorrt_llm._torch.models.modeling_multimodal_utils import (  # noqa: E402
+    find_input_mm_embeds,
+    get_multimodal_embeddings,
+)
+from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalRuntimeData  # noqa: E402
 from tensorrt_llm.mapping import Mapping  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -651,6 +656,22 @@ class TestGemma4VisionPipeline(unittest.TestCase):
 class TestGemma4ForConditionalGeneration(unittest.TestCase):
     """Test the multimodal VLM wrapper."""
 
+    @staticmethod
+    def _make_model() -> Gemma4ForConditionalGeneration:
+        text_config = Gemma4TextConfig(**SMALL_TEXT_CONFIG)
+        vision_config = Gemma4VisionConfig(**SMALL_VISION_CONFIG)
+        config = Gemma4Config(
+            text_config=text_config,
+            vision_config=vision_config,
+            audio_config=None,
+        )
+        model_config = ModelConfig(
+            pretrained_config=config,
+            mapping=Mapping(world_size=1, tp_size=1, rank=0),
+            attn_backend="FLASHINFER",
+        )
+        return Gemma4ForConditionalGeneration(model_config)
+
     def test_instantiation_with_vision(self):
         """VLM wrapper creates LLM + vision tower + embedder.
 
@@ -680,6 +701,123 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         # Regression guard for Option B: the vision tower must be the native
         # TRT-LLM class, not ``transformers.AutoModel`` output.
         self.assertIsInstance(model.vision_tower, Gemma4VisionModel)
+
+    def test_chunked_prefill_reuses_cached_vision_embeddings(self):
+        """Later active chunks slice cached features without rerunning vision."""
+        model = self._make_model()
+        embed_mask_cumsum = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
+        multimodal_param = MultimodalParams(
+            multimodal_data={
+                "image": {
+                    "pixel_values": torch.zeros(1, 1, 1, device="cuda"),
+                }
+            },
+            multimodal_runtime=MultimodalRuntimeData(
+                past_seen_token_num=0,
+                chunk_end_pos=2,
+                embed_mask_cumsum=embed_mask_cumsum,
+            ),
+        )
+        expected_embeddings = torch.randn(4, SMALL_TEXT_CONFIG["hidden_size"], device="cuda")
+
+        with unittest.mock.patch.object(
+            model, "_get_image_features", return_value=expected_embeddings
+        ) as image_encoder:
+            all_embeddings = get_multimodal_embeddings(
+                model._forward_multimodal_encoder, [multimodal_param]
+            )
+            first_chunk = find_input_mm_embeds(all_embeddings, [multimodal_param])
+
+            multimodal_param.multimodal_runtime = MultimodalRuntimeData(
+                past_seen_token_num=2,
+                chunk_end_pos=4,
+                embed_mask_cumsum=embed_mask_cumsum,
+            )
+            all_embeddings = get_multimodal_embeddings(
+                model._forward_multimodal_encoder, [multimodal_param]
+            )
+            second_chunk = find_input_mm_embeds(all_embeddings, [multimodal_param])
+
+        image_encoder.assert_called_once()
+        torch.testing.assert_close(first_chunk[0], expected_embeddings[:2])
+        torch.testing.assert_close(second_chunk[0], expected_embeddings[2:])
+
+    def test_chunk_without_multimodal_tokens_is_inactive(self):
+        """A text-only chunk does not schedule the multimodal encoder."""
+        multimodal_param = MultimodalParams(
+            multimodal_data={"image": {"pixel_values": torch.zeros(1, 1, 1)}},
+            multimodal_runtime=MultimodalRuntimeData(
+                past_seen_token_num=0,
+                chunk_end_pos=2,
+                embed_mask_cumsum=torch.tensor([0, 0, 1, 2], dtype=torch.int64),
+            ),
+        )
+        self.assertFalse(
+            Gemma4ForConditionalGeneration._has_active_multimodal_tokens(multimodal_param)
+        )
+
+    def test_mixed_modality_batch_preserves_request_order(self):
+        """Cached mixed-modality embeddings retain their request order."""
+        model = self._make_model()
+        params = [
+            MultimodalParams(
+                multimodal_data={"video": {"pixel_values": torch.tensor([[[2.0]]])}},
+                multimodal_runtime=MultimodalRuntimeData(
+                    past_seen_token_num=0,
+                    chunk_end_pos=1,
+                    embed_mask_cumsum=torch.tensor([1], dtype=torch.int64),
+                ),
+            ),
+            MultimodalParams(
+                multimodal_data={"image": {"pixel_values": torch.tensor([[[1.0]]])}},
+                multimodal_runtime=MultimodalRuntimeData(
+                    past_seen_token_num=0,
+                    chunk_end_pos=1,
+                    embed_mask_cumsum=torch.tensor([1], dtype=torch.int64),
+                ),
+            ),
+            MultimodalParams(
+                multimodal_data={"video": {"pixel_values": torch.tensor([[[3.0]]])}},
+                multimodal_runtime=MultimodalRuntimeData(
+                    past_seen_token_num=0,
+                    chunk_end_pos=1,
+                    embed_mask_cumsum=torch.tensor([1], dtype=torch.int64),
+                ),
+            ),
+        ]
+
+        with unittest.mock.patch.object(
+            model,
+            "_get_image_features",
+            side_effect=lambda pixel_values, **_: pixel_values[:, 0],
+        ):
+            embeddings = get_multimodal_embeddings(model._forward_multimodal_encoder, params)
+
+        expected = torch.tensor([[2.0], [1.0], [3.0]])
+        torch.testing.assert_close(embeddings[0], expected)
+        for param, expected_embedding in zip(params, expected, strict=True):
+            torch.testing.assert_close(
+                param.multimodal_data["multimodal_embedding"], expected_embedding.unsqueeze(0)
+            )
+
+    def test_single_request_with_multiple_modalities_is_allowed(self):
+        """The request-order fix does not reject an existing mixed request."""
+        model = self._make_model()
+        multimodal_param = MultimodalParams(
+            multimodal_data={
+                "image": {"pixel_values": torch.tensor([[[1.0]]])},
+                "video": {"pixel_values": torch.tensor([[[2.0]]])},
+            }
+        )
+
+        with unittest.mock.patch.object(
+            model,
+            "_get_image_features",
+            side_effect=lambda pixel_values, **_: pixel_values[:, 0],
+        ):
+            embeddings = model._forward_multimodal_encoder([multimodal_param])
+
+        torch.testing.assert_close(embeddings, torch.tensor([[1.0], [2.0]]))
 
     def test_instantiation_without_vision(self):
         """VLM wrapper works text-only when vision_config is None."""

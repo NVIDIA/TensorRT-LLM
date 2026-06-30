@@ -19,8 +19,8 @@ import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
-from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Set, Tuple,
-                    Union)
+from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence,
+                    Set, Tuple, Union)
 
 import torch
 from mpi4py import MPI
@@ -1326,6 +1326,7 @@ class KVCacheManager(BaseResourceManager):
         layer_idx: Optional[int] = None,
         window_size: Optional[int] = None,
         beam_width: Optional[int] = 1,
+        num_blocks_per_seq: Optional[Sequence[int]] = None,
     ) -> List[List[int]]:
         beam_width = beam_width or 1
         if window_size is None:
@@ -1349,6 +1350,8 @@ class KVCacheManager(BaseResourceManager):
             )
             result[i] = beams[
                 0] if beam_width == 1 else self._pack_beam_cache_indices(beams)
+            if num_blocks_per_seq is not None:
+                result[i] = result[i][:num_blocks_per_seq[i]]
         return result
 
     @staticmethod

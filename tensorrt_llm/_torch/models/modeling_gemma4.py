@@ -449,17 +449,14 @@ class Gemma4MoeRoutingMethod(BaseMoeRoutingMethod):
         router_logits: torch.Tensor,
         input_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # softmax over all experts
-        router_probs = F.softmax(router_logits.to(self.output_dtype), dim=-1)
-        # top-k selection
-        topk_weights, topk_indices = torch.topk(router_probs, k=self.top_k, dim=-1)
-        # renormalize so selected weights sum to 1
-        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
-        # apply per-expert scale
+        # Match HF's FP32 softmax for numerically stable top-k routing.
+        router_probabilities = F.softmax(router_logits, dim=-1, dtype=torch.float32)
+        topk_weights, topk_indices = torch.topk(router_probabilities, k=self.top_k, dim=-1)
+        topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
         per_expert_scale = self.callable_per_expert_scale()
         expert_scales = per_expert_scale[topk_indices].to(topk_weights.dtype)
-        topk_weights = topk_weights * expert_scales
-        return topk_indices.to(torch.int32), topk_weights
+        topk_weights *= expert_scales
+        return topk_indices.to(torch.int32), topk_weights.to(self.output_dtype)
 
 
 class Gemma4MoE(nn.Module):
@@ -865,7 +862,6 @@ class Gemma4TextModel(DecoderModel):
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         local_attention_mask_data: Optional[torch.Tensor] = None,
-        global_attention_mask_data: Optional[torch.Tensor] = None,
         ple_input_ids: Optional[torch.IntTensor] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -895,9 +891,9 @@ class Gemma4TextModel(DecoderModel):
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
-                attention_mask_data=local_attention_mask_data
-                if decoder_layer.is_sliding
-                else global_attention_mask_data,
+                attention_mask_data=(
+                    local_attention_mask_data if decoder_layer.is_sliding else None
+                ),
                 per_layer_input=per_layer_input,
                 **kwargs,
             )
@@ -959,13 +955,15 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
         modality attend bidirectionally to each other.
         """
         device = mm_token_type_ids.device
-        token_type_ids = mm_token_type_ids.clone()
         # We only care about non-zero (multimodal) tokens
-        is_mm = token_type_ids > 0
+        is_mm = mm_token_type_ids > 0
 
         # Detect blob boundaries: positions where type changes or goes 0->nonzero
         padded = torch.cat(
-            (torch.tensor([0], device=device, dtype=token_type_ids.dtype), token_type_ids)
+            (
+                torch.tensor([0], device=device, dtype=mm_token_type_ids.dtype),
+                mm_token_type_ids,
+            )
         )
         # A new blob starts whenever the type changes and the current is nonzero
         changes = (padded[1:] != padded[:-1]) & is_mm
@@ -975,8 +973,8 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
 
         # Tokens with the same non-zero blob_id attend bidirectionally
         token_type_mask = blob_ids.unsqueeze(0) == blob_ids.unsqueeze(1)
-        # Only apply bidirectional mask for multimodal tokens
-        token_type_mask = torch.where(blob_ids == 0, False, token_type_mask)
+        token_type_mask.logical_and_(is_mm.unsqueeze(0))
+        token_type_mask.logical_and_(is_mm.unsqueeze(1))
 
         return token_type_mask
 
@@ -1000,15 +998,11 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
         device = mm_token_type_ids.device
         extend_len = len(mm_token_type_ids)
 
-        if effective_sliding_window is None or effective_sliding_window >= extend_len:
-            causal_mask = torch.arange(extend_len, device=device).unsqueeze(0) <= torch.arange(
-                extend_len, device=device
-            ).unsqueeze(1)
-        else:
-            pos = torch.arange(extend_len, device=device)
-            causal_mask = (pos.unsqueeze(0) <= pos.unsqueeze(1)) & (
-                pos.unsqueeze(0) > pos.unsqueeze(1) - effective_sliding_window
-            )
+        pos = torch.arange(extend_len, device=device)
+        causal_mask = pos.unsqueeze(0) <= pos.unsqueeze(1)
+
+        if effective_sliding_window is not None and effective_sliding_window < extend_len:
+            causal_mask.logical_and_(pos.unsqueeze(0) > pos.unsqueeze(1) - effective_sliding_window)
 
         token_type_mask = self._get_token_type_mask(mm_token_type_ids)
         causal_mask = causal_mask.masked_fill(token_type_mask, True)
@@ -1034,18 +1028,28 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
         num_contexts = attn_metadata.num_contexts
         assert num_contexts > 0
 
-        qo_indptr = attn_metadata.qo_indptr[: num_contexts + 1]
-        cached_token_lens = attn_metadata.cached_token_lens[:num_contexts]
+        context_lens = attn_metadata.context_lens.tolist()
+        if (
+            attn_metadata.kv_cache_params is not None
+            and attn_metadata.kv_cache_params.num_cached_tokens_per_seq is not None
+        ):
+            cached_token_lens = attn_metadata.kv_cache_params.num_cached_tokens_per_seq[
+                :num_contexts
+            ]
+        else:
+            cached_token_lens = [0] * num_contexts
 
         context_mask_list = []
-        for i in range(num_contexts):
-            prefix_len = int(cached_token_lens[i].item())
+        token_offset = 0
+        for context_len, prefix_len in zip(context_lens, cached_token_lens, strict=True):
+            context_end = token_offset + context_len
             mask_i = self.get_context_mask(
-                mm_token_type_ids=mm_token_type_ids[qo_indptr[i] : qo_indptr[i + 1]],
+                mm_token_type_ids=mm_token_type_ids[token_offset:context_end],
                 effective_sliding_window=effective_sliding_window,
                 prefix_len=prefix_len,
             )
             context_mask_list.append(mask_i.flatten())
+            token_offset = context_end
         return torch.cat(context_mask_list, dim=0).contiguous()
 
     @torch.inference_mode()
@@ -1060,17 +1064,13 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
         **kwargs,
     ) -> torch.Tensor:
         local_attention_mask_data = None
-        global_attention_mask_data = None
         # Only build bidirectional masks when use_bidirectional_attention is
         # set to "vision" (26B, 31B).  E2B/E4B have this as None and should
-        # use standard causal attention even for multimodal tokens.
+        # use standard causal attention even for multimodal tokens. Gemma4
+        # applies multimodal bidirectionality only to sliding-window layers;
+        # full-attention layers retain their normal causal mask.
         use_bidir = getattr(self.config, "use_bidirectional_attention", None)
         if mm_token_type_ids is not None and use_bidir == "vision":
-            global_attention_mask_data = self.get_flashinfer_attention_mask(
-                mm_token_type_ids=mm_token_type_ids,
-                attn_metadata=attn_metadata,
-                effective_sliding_window=None,
-            )
             local_attention_mask_data = self.get_flashinfer_attention_mask(
                 mm_token_type_ids=mm_token_type_ids,
                 attn_metadata=attn_metadata,
@@ -1083,7 +1083,6 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             local_attention_mask_data=local_attention_mask_data,
-            global_attention_mask_data=global_attention_mask_data,
             ple_input_ids=kwargs.pop("ple_input_ids", None),
             **kwargs,
         )

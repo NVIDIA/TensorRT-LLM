@@ -2210,18 +2210,29 @@ class KVCacheManagerV2(BaseResourceManager):
             self.index_mapper.remove_sequence(request.py_request_id)
 
     def get_batch_cache_indices(
-        self, request_ids: List[int], layer_idx: Optional[int] = None
+        self,
+        request_ids: List[int],
+        layer_idx: Optional[int] = None,
+        num_blocks_per_seq: Optional[Sequence[int]] = None,
     ) -> List[List[int]]:
         if layer_idx is None:
             pool_id = 0
         else:
             pool_id = self.layer_to_pool_mapping_dict[self.layer_offsets[layer_idx]]
         return self._get_batch_cache_indices_by_pool_id(
-            request_ids, pool_id=pool_id, is_kv_aggregate=True
+            request_ids,
+            pool_id=pool_id,
+            is_kv_aggregate=True,
+            num_blocks_per_seq=num_blocks_per_seq,
         )
 
     def _get_batch_cache_indices_by_pool_id(
-        self, request_ids: List[int], *, pool_id: int = 0, is_kv_aggregate: bool = True
+        self,
+        request_ids: List[int],
+        *,
+        pool_id: int = 0,
+        is_kv_aggregate: bool = True,
+        num_blocks_per_seq: Optional[Sequence[int]] = None,
     ) -> List[List[int]]:
         if is_kv_aggregate:
             # Div by kv_factor to index kv cache with size
@@ -2230,18 +2241,25 @@ class KVCacheManagerV2(BaseResourceManager):
         else:
             div_factor = 1
 
+        index_scale = int(self.index_scales[pool_id])
         res = []
 
-        for req_id in request_ids:
-            idx_tensor = torch.as_tensor(self.kv_cache_map[req_id].get_base_page_indices(pool_id))
+        for req_idx, req_id in enumerate(request_ids):
+            kv_cache = self.kv_cache_map[req_id]
+            # Zero-copy page-index buffers are padded to max_blocks_per_seq.
+            # Only convert blocks owned by this request; attention callers
+            # discard the padded tail immediately.
+            num_blocks = kv_cache.num_blocks
+            if num_blocks_per_seq is not None:
+                num_blocks = min(num_blocks, num_blocks_per_seq[req_idx])
+            base_page_indices = kv_cache.get_base_page_indices(pool_id)[:num_blocks]
             res.append(
-                (
-                    torch.where(
-                        idx_tensor != BAD_PAGE_INDEX,
-                        idx_tensor * self.index_scales[pool_id] // div_factor,
-                        BAD_PAGE_INDEX,
-                    )
-                ).tolist()
+                [
+                    base_page_index * index_scale // div_factor
+                    if base_page_index != BAD_PAGE_INDEX
+                    else BAD_PAGE_INDEX
+                    for base_page_index in base_page_indices
+                ]
             )
 
         return res

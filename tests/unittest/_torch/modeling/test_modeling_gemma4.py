@@ -50,6 +50,7 @@ if _HAS_GEMMA4:
         Gemma4DecoderLayer,
         Gemma4ForCausalLM,
         Gemma4MoE,
+        Gemma4MoeRoutingMethod,
         Gemma4TextModel,
         Gemma4TextScaledWordEmbedding,
     )
@@ -786,6 +787,34 @@ class TestGemma4HFComparison(unittest.TestCase):
 
     # ---- Full model E2E comparison (context + generation) ----
 
+    def _stabilize_moe_routing(self, hf_model, trt_model, config):
+        """Add identical expert-logit offsets to avoid random-init top-k ties.
+
+        Random router weights produce near-uniform expert scores. Small BF16 differences between
+        HF and TRT-LLM can then flip the top-k experts, sending a token through unrelated random
+        expert weights and overwhelming the otherwise small numerical error.
+
+        Unit-spaced offsets make the expert ordering stable while keeping the second expert's
+        normalized weight non-trivial (about 0.27 for top-2 routing). Applying the offsets after the
+        projection also preserves the random router weights, so their projection math remains part
+        of the comparison.
+
+        This intentionally favors the same top-k experts and therefore tests router projection,
+        dispatch, expert, and weighted-combine equivalence rather than routing diversity.
+        """
+        expert_offsets = torch.arange(
+            config.num_experts,
+            dtype=config.torch_dtype,
+            device=next(hf_model.parameters()).device,
+        )
+
+        def add_expert_offsets(_module, _inputs, output):
+            return output + expert_offsets
+
+        for hf_layer, trt_layer in zip(hf_model.model.layers, trt_model.model.layers, strict=True):
+            hf_layer.router.proj.register_forward_hook(add_expert_offsets)
+            trt_layer.moe.router.proj.register_forward_hook(add_expert_offsets)
+
     def _run_full_model_comparison(
         self,
         config_dict,
@@ -801,6 +830,8 @@ class TestGemma4HFComparison(unittest.TestCase):
 
         torch.random.manual_seed(42)
         hf, trt, gemma4_config = self._make_hf_and_trt_models(config_dict)
+        if gemma4_config.enable_moe_block:
+            self._stabilize_moe_routing(hf, trt, gemma4_config)
         hf_cache = DynamicCache()
 
         device = torch.device("cuda")
@@ -1018,10 +1049,9 @@ class TestGemma4HFComparison(unittest.TestCase):
         """MoE (Mixture of Experts) enabled — tests router + expert dispatch."""
         self._run_full_model_comparison(
             deepcopy(GEMMA4_MOE_HF_CONFIG),
-            # MoE routing may differ slightly between fused and reference
-            atol=1.0,
-            rtol=1.0,
-            max_failed_frac=0.05,
+            atol=0.1,
+            rtol=0.1,
+            max_failed_frac=0.015,
         )
 
     # ---- Mixed feature tests (matching real model patterns) ----
@@ -1031,9 +1061,9 @@ class TestGemma4HFComparison(unittest.TestCase):
         """26B-A4B pattern: hybrid head_dim + K=V + MoE + softcap."""
         self._run_full_model_comparison(
             deepcopy(GEMMA4_26B_LIKE_CONFIG),
-            atol=1.0,
-            rtol=1.0,
-            max_failed_frac=0.05,
+            atol=0.1,
+            rtol=0.1,
+            max_failed_frac=0.02,
         )
 
     @torch.no_grad()
@@ -1994,6 +2024,59 @@ class TestGemma4HFComparison(unittest.TestCase):
         self.assertTrue(mask_26b[4, 2].item(), "Image token 4 should attend to 2")
         # But causal for text tokens
         self.assertFalse(mask_26b[0, 1].item(), "Text token 0 should NOT attend to 1")
+
+    @torch.no_grad()
+    def test_bidirectional_mask_only_applies_to_sliding_layers(self):
+        """Full-attention layers retain the standard causal mask."""
+        config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
+        config_dict["use_bidirectional_attention"] = "vision"
+        config = Gemma4TextConfig(**config_dict)
+        model_config = ModelConfig(pretrained_config=config, attn_backend="FLASHINFER")
+        model = Gemma4ForCausalLM(model_config).to(config.torch_dtype).to("cuda")
+
+        def passthrough(*, hidden_states, **_kwargs):
+            return hidden_states
+
+        layer_forwards = []
+        for layer in model.model.layers:
+            layer.forward = unittest.mock.MagicMock(side_effect=passthrough)
+            layer_forwards.append(layer.forward)
+
+        local_mask = torch.ones(1, dtype=torch.bool, device="cuda")
+        model.model(
+            attn_metadata=unittest.mock.MagicMock(),
+            inputs_embeds=torch.zeros(
+                4, config.hidden_size, dtype=config.torch_dtype, device="cuda"
+            ),
+            local_attention_mask_data=local_mask,
+        )
+
+        for layer, layer_forward in zip(model.model.layers, layer_forwards, strict=True):
+            actual_mask = layer_forward.call_args.kwargs["attention_mask_data"]
+            if layer.is_sliding:
+                self.assertIs(actual_mask, local_mask)
+            else:
+                self.assertIsNone(actual_mask)
+
+    @torch.no_grad()
+    def test_gemma4_routing_matches_hf_reference(self):
+        """Routing preserves Hugging Face's FP32 softmax operation order."""
+        torch.manual_seed(1234)
+        per_expert_scale = torch.linspace(0.5, 1.5, 128, dtype=torch.bfloat16, device="cuda")
+        routing = Gemma4MoeRoutingMethod(
+            top_k=8,
+            callable_per_expert_scale=lambda: per_expert_scale,
+        )
+        router_logits = torch.randn(16, 128, dtype=torch.bfloat16, device="cuda") * 0.02
+
+        actual_indices, actual_weights = routing.apply(router_logits)
+
+        router_probabilities = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
+        expected_weights, expected_indices = torch.topk(router_probabilities, k=8, dim=-1)
+        expected_weights /= expected_weights.sum(dim=-1, keepdim=True)
+        expected_weights *= per_expert_scale[expected_indices]
+        torch.testing.assert_close(actual_indices, expected_indices.to(torch.int32))
+        torch.testing.assert_close(actual_weights, expected_weights.float())
 
 
 class TestGemma4ModelDefaults(unittest.TestCase):
