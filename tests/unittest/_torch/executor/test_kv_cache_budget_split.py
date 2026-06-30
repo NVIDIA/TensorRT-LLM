@@ -46,7 +46,9 @@ def _make_creator(
         host_cache_size=host_cache_size,
     )
     c._tokens_per_block = 64
+    c._max_seq_len = 1024
     c._max_batch_size = 1
+    c._speculative_config = None
     c._mapping = Mock()
     c._model_engine = Mock()
 
