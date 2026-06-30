@@ -218,13 +218,13 @@ class GvrTopKLBKernel:
         min_blocks_per_mp: int = 3,
         use_256bit_load: bool = True,
         enable_warp_parallel_reduce: Optional[bool] = None,
-        # Phase-4 rank-scatter (opt-in). Forwarded to BOTH underlying
-        # GvrTopKKernel instances, so the long (cluster / multi-CTA) branch
-        # and the short (single-CTA) branch use the same P4 variant. Default
-        # off; see GvrTopKKernel / PR notes for the hardware-dependent gain
-        # (consistent win on sm_103/B300, mixed on sm_100/B200 at BS=1).
-        enable_p4_rank_scatter: bool = False,
-        enable_p4_rank_scatter_exact: bool = False,
+        # Phase-4 rank-scatter. Forwarded to BOTH underlying GvrTopKKernel
+        # instances, so the long (cluster / multi-CTA) branch and the short
+        # (single-CTA) branch use the same P4 variant. Default on (exact),
+        # matching GvrTopKKernel: exact rank-scatter is a drop-in for the
+        # snap Phase-4 and the faster path (see GvrTopKKernel / PR notes).
+        enable_p4_rank_scatter: bool = True,
+        enable_p4_rank_scatter_exact: bool = True,
     ):
         assert cluster_size in (2, 4, 8), (
             f"cluster_size must be 2, 4, or 8 (GPC-bound); got {cluster_size}"

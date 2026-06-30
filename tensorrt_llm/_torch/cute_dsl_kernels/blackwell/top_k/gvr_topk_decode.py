@@ -231,8 +231,8 @@ class GvrTopKKernel:
         enable_smem_cache: bool = False,
         smem_cache_elems: int = 32768,
         seqlen_sorted: bool = False,
-        enable_p4_rank_scatter: bool = False,
-        enable_p4_rank_scatter_exact: bool = False,
+        enable_p4_rank_scatter: bool = True,
+        enable_p4_rank_scatter_exact: bool = True,
     ):
         # cluster_size: number of CTAs cooperating per row. 1 = single-CTA
         # path; 2/4 = thread-block cluster with DSMEM aggregation. Capped at
@@ -354,10 +354,15 @@ class GvrTopKKernel:
         # recursion that makes the straddling-bin tie-break exact (vdiff=0);
         # without it the straddling bin is emitted in arbitrary order
         # (set-correct, value-correct, but not rank-stable within ties).
-        # Both default off — opt-in, hardware-dependent gain (see module/PR
-        # notes: a consistent win on sm_103/B300, mixed on sm_100/B200 at
-        # BS=1). Identical body is reused by the single-CTA path and the
-        # cluster leader-only path, so it stacks on cluster_size > 1.
+        # Both default on: the exact rank-scatter is a drop-in replacement
+        # for the snap Phase-4 (both exact, vdiff=0) and is the faster path
+        # (nsys cold-L2 median ~1.077x B300 / ~1.078x B200, 704-707/720 cells
+        # faster, hardware- and BS-invariant; see PR notes). ``_exact`` is
+        # kept on so the default stays exact like snap; pass
+        # enable_p4_rank_scatter_exact=False only when approximate
+        # straddling-tie order is acceptable in exchange for fewer barriers.
+        # Identical body is reused by the single-CTA path and the cluster
+        # leader-only path, so it stacks on cluster_size > 1.
         self.enable_p4_rank_scatter = enable_p4_rank_scatter
         self.enable_p4_rank_scatter_exact = enable_p4_rank_scatter_exact
 
