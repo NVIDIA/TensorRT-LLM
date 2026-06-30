@@ -80,6 +80,14 @@ void ZmqControlChannel::addPeer(std::string const& peer, std::string const& endp
     mDealers.emplace(peer, std::move(dealer));
 }
 
+void ZmqControlChannel::removePeer(std::string const& peer)
+{
+    std::lock_guard<std::mutex> lk(mMu);
+    // Erasing closes the DEALER (linger=0 -> no block on close); idempotent if `peer` is unknown.
+    // sendTo() holds mMu while looking up the dealer, so the close can never race a concurrent send.
+    mDealers.erase(peer);
+}
+
 void ZmqControlChannel::sendTo(std::string const& peer, std::string const& blob)
 {
     std::lock_guard<std::mutex> lk(mMu);

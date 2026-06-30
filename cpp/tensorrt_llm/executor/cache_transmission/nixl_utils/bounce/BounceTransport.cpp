@@ -993,6 +993,10 @@ void BounceTransport::drainForgets()
     {
         mReceiver.forget(peer); // reclaim receiver-side credits/jobs of the gone peer
         mSender.forget(peer);   // fail in-flight sender requests to the gone peer
+        // Reclaim the per-peer control-channel DEALER/endpoint too (forget()s above may emit a final
+        // cancel WANT, so do this last). A later transfer to/from this peer re-establishes the dealer
+        // via addPeer() (our submit path) or the WANT self-bootstrap (the peer's onWant).
+        mCtx.channel->removePeer(peer);
     }
 }
 

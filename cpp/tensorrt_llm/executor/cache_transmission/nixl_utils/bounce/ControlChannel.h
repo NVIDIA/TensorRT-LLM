@@ -71,6 +71,12 @@ public:
     /// the first sendTo(peer, ...). Idempotent.
     virtual void addPeer(std::string const& peer, std::string const& endpoint) = 0;
 
+    /// Forget `peer`: drop its send-side socket/endpoint (e.g. when the peer is lost, so the
+    /// per-peer resource isn't kept alive until shutdown). Idempotent; thread-safe with
+    /// sendTo()/addPeer(). A sendTo() to a removed peer is dropped until it is re-added — either
+    /// explicitly via addPeer() or implicitly by the WANT self-bootstrap in the receiver's onWant.
+    virtual void removePeer(std::string const& peer) = 0;
+
     /// Fire-and-forget send of an encoded BounceMessage `blob` to `peer`.
     /// Thread-safe with other sendTo()/addPeer() calls.
     virtual void sendTo(std::string const& peer, std::string const& blob) = 0;
