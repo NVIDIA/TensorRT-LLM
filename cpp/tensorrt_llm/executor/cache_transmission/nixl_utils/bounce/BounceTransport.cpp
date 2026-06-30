@@ -46,11 +46,15 @@ std::pair<std::string, std::uint64_t> splitKey(std::string const& key)
     return {key.substr(0, pos), std::strtoull(key.c_str() + pos + 1, nullptr, 10)};
 }
 
-// Lay out plan arrays [srcs|dsts|sizes] into the exec context's pinned host buffer, copy to its
-// device scratch on ctx->stream, then launch the batched copy. Direction-agnostic (gather or
-// scatter); the data region (arena offset) is encoded into hsrcs/hdsts by the caller.
+// Lay out plan arrays [srcs|dsts|sizes] into the exec context's pinned host buffer, make them
+// device-accessible, then launch the batched copy. Direction-agnostic (gather or scatter); the data
+// region (arena offset) is encoded into hsrcs/hdsts by the caller. Two opt-in knobs (default off):
+//   - zeroCopy: skip the H2D of the plan arrays — the kernel reads them straight from pinned host via
+//     ctx->hostPinnedDev (saves a small copy; likely a loss for large n — PCIe reads in-kernel).
+//   - cub: use cub::DeviceMemcpy::Batched (ctx->cubTemp workspace) instead of the custom kernel.
+// The two compose: arg source (scratch H2D vs pinned) x copy backend (custom vs cub).
 cudaError_t launchPacked(ExecCtx* ctx, std::vector<std::uint64_t> const& hsrcs, std::vector<std::uint64_t> const& hdsts,
-    std::vector<std::uint32_t> const& hsizes)
+    std::vector<std::uint32_t> const& hsizes, bool zeroCopy, bool cub)
 {
     auto const n = static_cast<std::uint32_t>(hsrcs.size());
     if (n == 0)
@@ -67,19 +71,44 @@ cudaError_t launchPacked(ExecCtx* ctx, std::vector<std::uint64_t> const& hsrcs, 
     {
         return cudaErrorInvalidValue;
     }
+    // Pack the plan into pinned host (the H2D source, and what the kernel reads under zeroCopy).
     auto* host = static_cast<std::uint8_t*>(ctx->hostPinned);
     std::memcpy(host, hsrcs.data(), b64);
     std::memcpy(host + b64, hdsts.data(), b64);
     std::memcpy(host + 2 * b64, hsizes.data(), b32);
-    auto* scratch = static_cast<std::uint8_t*>(ctx->scratch);
-    cudaError_t st = cudaMemcpyAsync(scratch, host, 2 * b64 + b32, cudaMemcpyHostToDevice, ctx->stream);
-    if (st != cudaSuccess)
+    // Pick the DEVICE-accessible base for the plan arrays: the pinned buffer's device alias (zeroCopy)
+    // or the device scratch we H2D-copy into.
+    std::uint8_t* base = nullptr;
+    if (zeroCopy && ctx->hostPinnedDev != nullptr)
     {
-        return st;
+        base = static_cast<std::uint8_t*>(ctx->hostPinnedDev);
     }
-    auto* dsrcs = reinterpret_cast<std::uint64_t*>(scratch);
-    auto* ddsts = reinterpret_cast<std::uint64_t*>(scratch + b64);
-    auto* dsizes = reinterpret_cast<std::uint32_t*>(scratch + 2 * b64);
+    else
+    {
+        base = static_cast<std::uint8_t*>(ctx->scratch);
+        cudaError_t const st = cudaMemcpyAsync(base, host, 2 * b64 + b32, cudaMemcpyHostToDevice, ctx->stream);
+        if (st != cudaSuccess)
+        {
+            return st;
+        }
+    }
+    auto* dsrcs = reinterpret_cast<std::uint64_t*>(base);
+    auto* ddsts = reinterpret_cast<std::uint64_t*>(base + b64);
+    auto* dsizes = reinterpret_cast<std::uint32_t*>(base + 2 * b64);
+    if (cub && ctx->cubTemp != nullptr)
+    {
+        std::size_t need = 0;
+        cudaError_t const st = batchedCopyCubTempBytes(n, need);
+        if (st != cudaSuccess)
+        {
+            return st;
+        }
+        if (need > ctx->cubTempBytes)
+        {
+            return cudaErrorMemoryAllocation; // shouldn't happen: n <= maxDescs the temp was sized for
+        }
+        return launchBatchedCopyCub(dsrcs, ddsts, dsizes, n, ctx->stream, ctx->cubTemp, need);
+    }
     return launchBatchedCopy(dsrcs, ddsts, dsizes, n, ctx->stream);
 }
 } // namespace
@@ -162,7 +191,7 @@ void BounceReceiver::onWant(std::string const& peer, BounceMsgHeader const& h, s
         mCtx.channel->addPeer(peer, endpoint);
     }
     auto const key = makeKey(peer, h.requestId);
-    if (chunkBytes.empty())
+    if (isCancelWant(chunkBytes))
     {
         // Explicit cancel/abort (the sender failed or retracted): precisely free this flow's
         // granted-but-unwritten regions now — otherwise they stay held until peer loss and a
@@ -356,7 +385,9 @@ void BounceReceiver::scatterWorkerLoop()
         // failed launch, OR a stream error must NOT produce an ACK — an ACK tells the sender its KV
         // data landed, so a false ACK here is silent corruption. On error we still free the region
         // (below) but mark !ok so drainScatterDone skips the ACK; the sender then times out -> FAILURE.
-        cudaError_t const launchErr = srcInBounds ? launchPacked(ctx, hsrcs, hdsts, hsizes) : cudaErrorInvalidValue;
+        cudaError_t const launchErr = srcInBounds
+            ? launchPacked(ctx, hsrcs, hdsts, hsizes, mCtx.cfg.zeroCopyArgs, mCtx.cfg.cubCopy)
+            : cudaErrorInvalidValue;
         cudaError_t const syncErr = (launchErr == cudaSuccess) ? cudaStreamSynchronize(ctx->stream) : cudaSuccess;
         bool const ok = srcInBounds && launchErr == cudaSuccess && syncErr == cudaSuccess;
         if (!ok)
@@ -491,7 +522,8 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
             hdsts[i] = regionBase + chunk.bounceOffsets[i];
             hsizes[i] = chunk.sizes[i];
         }
-        cudaError_t const gatherErr = launchPacked(ctx, hsrcs, hdsts, hsizes); // gather into the region
+        // gather into the region (cfg knobs select the H2D-vs-zero-copy arg path + custom-vs-cub copy)
+        cudaError_t const gatherErr = launchPacked(ctx, hsrcs, hdsts, hsizes, mCtx.cfg.zeroCopyArgs, mCtx.cfg.cubCopy);
         // Record an event for gather completion and DEFER the write. The gather must finish before
         // NIXL reads the region, but on a shared GPU the gather can be delayed behind model kernels
         // — blocking the IO thread on cudaStreamSynchronize here would stall the whole reactor
@@ -759,7 +791,7 @@ bool BounceSender::drainOrphanLocal()
             ++it;
             continue;
         }
-        mCtx.channel->sendTo(it->second, encodeWant(rid, {}, mCtx.channel->localEndpoint()));
+        mCtx.channel->sendTo(it->second, encodeCancel(rid, mCtx.channel->localEndpoint()));
         it = mPendingCancel.erase(it);
         didWork = true;
     }
@@ -810,7 +842,7 @@ void BounceSender::failRequest(std::uint64_t rid, Request& req)
     }
     else
     {
-        mCtx.channel->sendTo(req.peer, encodeWant(rid, {}, mCtx.channel->localEndpoint()));
+        mCtx.channel->sendTo(req.peer, encodeCancel(rid, mCtx.channel->localEndpoint()));
     }
     try
     {
