@@ -66,7 +66,8 @@ def get_request_num_tokens(request: OpenAIRequest) -> int:
             )
 
         if isinstance(request.prompt, str) or \
-            (isinstance(request.prompt, list) and isinstance(request.prompt[0], int)):
+            (isinstance(request.prompt, list) and len(request.prompt) > 0
+             and isinstance(request.prompt[0], int)):
             prompts = [request.prompt]
         else:
             prompts = request.prompt
@@ -887,6 +888,8 @@ class BlockHashMixin:
 
         # Handle CompletionRequest (has prompt)
         prompts = request.prompt
+        if isinstance(prompts, list) and len(prompts) == 0:
+            return []
         if isinstance(prompts, list) and isinstance(prompts[0], list):
             return prompts
         elif isinstance(prompts, list) and isinstance(prompts[0], int):
