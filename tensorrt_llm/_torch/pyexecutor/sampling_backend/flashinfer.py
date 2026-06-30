@@ -47,7 +47,7 @@ def compute_probs(
     is a one-hot regardless of skip_temperature.
     """
     if not IS_FLASHINFER_AVAILABLE:
-        raise RuntimeError("FlashInfer is required for backend_flashinfer.compute_probs")
+        raise RuntimeError("FlashInfer is required for flashinfer.compute_probs")
 
     assert logits.dim() == 2, "logits must be 2D: [batch_size, vocab_size]"
     batch_size, vocab_size = logits.size()
@@ -95,7 +95,7 @@ def sample_from_probs(
 ) -> torch.Tensor:
     """Sample tokens from a pre-computed probability distribution."""
     if not IS_FLASHINFER_AVAILABLE:
-        raise RuntimeError("FlashInfer is required for backend_flashinfer.sample_from_probs")
+        raise RuntimeError("FlashInfer is required for flashinfer.sample_from_probs")
     return flashinfer.sampling.sampling_from_probs(
         probs,
         deterministic=True,

@@ -2345,7 +2345,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self.LOGPROBS_SHAPE = (self.max_num_sequences, self.max_beam_width, self.max_tokens)
         self.TOPK_LOGPROBS_SHAPE = (self.max_num_sequences, self.max_tokens, self.max_topk_logprobs)
 
-        from .sampling_utils import BoundSamplingBackend, SamplerConfig, resolve_sampling_backend
+        from .sampling_backend.interface import (
+            BoundSamplingBackend,
+            SamplerConfig,
+            resolve_sampling_backend,
+        )
 
         self._bound_backend: BoundSamplingBackend = resolve_sampling_backend(
             torch.device("cuda"),

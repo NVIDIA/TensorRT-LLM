@@ -27,15 +27,15 @@ from typing import Any, Generic, Literal, Optional, Type, TypeAlias, TypeVar, ca
 import torch
 
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from tensorrt_llm._torch.pyexecutor.sampling_backends import backend_custom, backend_torch
-from tensorrt_llm._torch.pyexecutor.sampling_backends.backend_torch import (
+from tensorrt_llm._torch.pyexecutor.sampling_backend import trtllm, vanilla
+from tensorrt_llm._torch.pyexecutor.sampling_backend.vanilla import (
     BeamSearchMetadata as BeamSearchMetadata,
 )
-from tensorrt_llm._torch.pyexecutor.sampling_backends.backend_torch import (
+from tensorrt_llm._torch.pyexecutor.sampling_backend.vanilla import (
     StrategyMetadata as StrategyMetadata,
 )
-from tensorrt_llm._torch.pyexecutor.sampling_backends.backend_torch import _Fusions as _Fusions
-from tensorrt_llm._torch.pyexecutor.sampling_backends.backend_torch import (
+from tensorrt_llm._torch.pyexecutor.sampling_backend.vanilla import _Fusions as _Fusions
+from tensorrt_llm._torch.pyexecutor.sampling_backend.vanilla import (
     beam_search_sampling_batch,
     greedy_search_sampling_batch,
     temperature_sampling_batch,
@@ -43,20 +43,20 @@ from tensorrt_llm._torch.pyexecutor.sampling_backends.backend_torch import (
     top_k_top_p_sampling_batch,
     top_p_sampling_batch,
 )
-from tensorrt_llm._torch.pyexecutor.sampling_backends.backend_torch import (
+from tensorrt_llm._torch.pyexecutor.sampling_backend.vanilla import (
     compute_probs as _torch_compute_probs,
 )
-from tensorrt_llm._torch.pyexecutor.sampling_backends.backend_torch import (
+from tensorrt_llm._torch.pyexecutor.sampling_backend.vanilla import (
     get_rejected_indices as get_rejected_indices,
 )
-from tensorrt_llm._torch.pyexecutor.sampling_backends.backend_torch import greedy as _torch_greedy
-from tensorrt_llm._torch.pyexecutor.sampling_backends.backend_torch import (
+from tensorrt_llm._torch.pyexecutor.sampling_backend.vanilla import greedy as _torch_greedy
+from tensorrt_llm._torch.pyexecutor.sampling_backend.vanilla import (
     sample_from_logits as _torch_sample_from_logits,
 )
-from tensorrt_llm._torch.pyexecutor.sampling_backends.backend_torch import (
+from tensorrt_llm._torch.pyexecutor.sampling_backend.vanilla import (
     sample_from_probs as _torch_sample_from_probs,
 )
-from tensorrt_llm._torch.pyexecutor.sampling_backends.backend_torch import (
+from tensorrt_llm._torch.pyexecutor.sampling_backend.vanilla import (
     sample_rejected as sample_rejected,
 )
 from tensorrt_llm._utils import prefer_pinned
@@ -877,92 +877,9 @@ class FlashInferGroupedStrategySampler(GroupedStrategySampler[_STRATEGY_KEY_TYPE
         return next_tokens, softmax, strategy_impl.get_temperature()
 
 
-# ---------------------------------------------------------------------------
-# Static routing: SamplerConfig, BoundSamplingBackend, resolve_sampling_backend
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True, kw_only=True)
-class SamplerConfig:
-    """Configuration used to resolve and bind a sampling backend at init time."""
-
-    use_flashinfer: bool = False
-
-
-class BoundSamplingBackend:
-    """Holds kernel function pointers bound at initialisation; CUDA-graph safe.
-
-    All callables are resolved once (in resolve_sampling_backend) so that no
-    per-call dispatch occurs inside CUDA graph capture.  Includes the
-    strategy-grouping helpers so TorchSampler needs no separate
-    _grouped_sampler_cls attribute.
-    """
-
-    def __init__(
-        self,
-        compute_probs: Any,
-        sample_from_probs: Any,
-        sample_from_logits: Any,
-        greedy: Any,
-        strategy_grouping_key: Any,
-        get_metadata_type_for_group: Any,
-        sample_grouped_strategies: Any,
-    ) -> None:
-        self.compute_probs = compute_probs
-        self.sample_from_probs = sample_from_probs
-        self.sample_from_logits = sample_from_logits
-        self.greedy = greedy
-        self.strategy_grouping_key = strategy_grouping_key
-        self.get_metadata_type_for_group = get_metadata_type_for_group
-        self.sample_grouped_strategies = sample_grouped_strategies
-
-
-def resolve_sampling_backend(
-    device: torch.device,
-    config: SamplerConfig,
-) -> BoundSamplingBackend:
-    """Bind kernel functions at init time; returns a CUDA-graph-safe backend.
-
-    Selection order:
-      1. FlashInfer  — CUDA device AND IS_FLASHINFER_AVAILABLE AND config.use_flashinfer
-      2. Torch       — everything else (including CPU)
-    """
-    if device.type == "cuda" and IS_FLASHINFER_AVAILABLE and config.use_flashinfer:
-        from tensorrt_llm._torch.pyexecutor.sampling_backends.backend_flashinfer import (
-            compute_probs as _fi_compute_probs,
-        )
-        from tensorrt_llm._torch.pyexecutor.sampling_backends.backend_flashinfer import (
-            greedy as _fi_greedy,
-        )
-        from tensorrt_llm._torch.pyexecutor.sampling_backends.backend_flashinfer import (
-            sample_from_logits as _fi_sample_from_logits,
-        )
-        from tensorrt_llm._torch.pyexecutor.sampling_backends.backend_flashinfer import (
-            sample_from_probs as _fi_sample_from_probs,
-        )
-
-        return BoundSamplingBackend(
-            compute_probs=_fi_compute_probs,
-            sample_from_probs=_fi_sample_from_probs,
-            sample_from_logits=_fi_sample_from_logits,
-            greedy=_fi_greedy,
-            strategy_grouping_key=FlashInferGroupedStrategySampler.strategy_grouping_key,
-            get_metadata_type_for_group=FlashInferGroupedStrategySampler.get_metadata_type_for_group,
-            sample_grouped_strategies=FlashInferGroupedStrategySampler.sample_grouped_strategies,
-        )
-    return BoundSamplingBackend(
-        compute_probs=_torch_compute_probs,
-        sample_from_probs=_torch_sample_from_probs,
-        sample_from_logits=_torch_sample_from_logits,
-        greedy=_torch_greedy,
-        strategy_grouping_key=SimpleGroupedStrategySampler.strategy_grouping_key,
-        get_metadata_type_for_group=SimpleGroupedStrategySampler.get_metadata_type_for_group,
-        sample_grouped_strategies=SimpleGroupedStrategySampler.sample_grouped_strategies,
-    )
-
-
 # Public re-exports of the new kernel contract (torch backend as default).
-# Callers that need a specific backend should use resolve_sampling_backend.
+# Callers that need a specific backend should use resolve_sampling_backend
+# from sampling_backend.interface.
 compute_probs = _torch_compute_probs
 sample_from_probs = _torch_sample_from_probs
 sample_from_logits = _torch_sample_from_logits
@@ -988,8 +905,8 @@ def sanitize_top_k(top_k: torch.Tensor, vocab_size: int) -> torch.Tensor:
 
 
 if IS_FLASHINFER_AVAILABLE:
-    from tensorrt_llm._torch.pyexecutor.sampling_backends import backend_flashinfer
-    from tensorrt_llm._torch.pyexecutor.sampling_backends.backend_flashinfer import (
+    from tensorrt_llm._torch.pyexecutor.sampling_backend import flashinfer
+    from tensorrt_llm._torch.pyexecutor.sampling_backend.flashinfer import (
         sampling_from_probs_generator_op,
         softmax_op,
         top_k_mask_logits_op,
@@ -1016,10 +933,10 @@ def compute_probs_from_logits(
         top_k = sanitize_top_k(top_k, logits.shape[-1])
 
     if logits.is_cuda and IS_FLASHINFER_AVAILABLE:
-        return backend_flashinfer.compute_probs_from_logits_op(logits, temperatures, top_k, top_p)
+        return flashinfer.compute_probs_from_logits_op(logits, temperatures, top_k, top_p)
     if logits.is_cuda:
-        return backend_custom.compute_probs_from_logits_op(logits, temperatures, top_k, top_p)
-    return backend_torch.compute_probs_from_logits_op(logits, temperatures, top_k, top_p)
+        return trtllm.compute_probs_from_logits_op(logits, temperatures, top_k, top_p)
+    return vanilla.compute_probs_from_logits_op(logits, temperatures, top_k, top_p)
 
 
 @torch.compile(options={"max-autotune": True})
@@ -1039,15 +956,15 @@ def sampling_batch_spec_dec_one_model(
     # against the greedy sentinel, and torch.where restores the greedy rows below.
     # All ops are branch-free (no data-dependent control flow), so this stays
     # CUDA-graph safe.
-    is_greedy = temperatures <= backend_torch._GREEDY_TEMPERATURE_THRESHOLD
+    is_greedy = temperatures <= vanilla._GREEDY_TEMPERATURE_THRESHOLD
     greedy_tokens = logits.argmax(dim=-1)
-    logits = backend_torch._safely_apply_temperature(logits, temperatures)
+    logits = vanilla._safely_apply_temperature(logits, temperatures)
     if IS_FLASHINFER_AVAILABLE:
-        sampled = backend_flashinfer.top_k_top_p_sampling_from_logits_op(
+        sampled = flashinfer.top_k_top_p_sampling_from_logits_op(
             logits, top_k, top_p, seed=seed, offset=offset
         )
     else:
-        sampled = backend_torch.forward_native_sampling(logits, top_k, top_p)
+        sampled = vanilla.forward_native_sampling(logits, top_k, top_p)
     return torch.where(is_greedy, greedy_tokens, sampled)
 
 
@@ -1063,7 +980,7 @@ def sampling_batch_spec_dec_one_model_for_rejection(
     """Draft sampler returning tokens AND probs for the downstream rejection-sampling path."""
     probs = compute_probs_from_logits(logits, temperatures, top_k, top_p)
     if IS_FLASHINFER_AVAILABLE:
-        tokens = backend_flashinfer.sampling_from_probs_op(probs, seed=seed, offset=offset)
+        tokens = flashinfer.sampling_from_probs_op(probs, seed=seed, offset=offset)
     else:
-        tokens = backend_torch._random_sample(probs)
+        tokens = vanilla._random_sample(probs)
     return tokens, probs

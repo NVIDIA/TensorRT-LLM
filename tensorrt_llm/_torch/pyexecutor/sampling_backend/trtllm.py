@@ -15,10 +15,10 @@
 """TRT-LLM custom kernel backend for sampling.
 
 Houses sampling kernels implemented natively in TRT-LLM (registered under
-``torch.ops.trtllm``), as opposed to pure-PyTorch fallbacks (backend_torch)
-or third-party fused kernels (backend_flashinfer).
+``torch.ops.trtllm``), as opposed to pure-PyTorch fallbacks (vanilla)
+or third-party fused kernels (flashinfer).
 
-Backend implementation module: no imports from sampling_utils, backend_torch, or backend_flashinfer.
+Backend implementation module: no imports from sampling_utils, vanilla, or flashinfer.
 """
 
 from typing import Optional

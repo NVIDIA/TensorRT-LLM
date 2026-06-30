@@ -887,7 +887,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 spec_metadata.temperatures[:num_contexts],
                 top_ks_ctx,
                 spec_metadata.top_ps[:num_contexts],
-                use_flashinfer=self.use_flashinfer,
                 seed=self.seed,
                 offset=self.offset,
             )
