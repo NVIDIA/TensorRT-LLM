@@ -14,12 +14,14 @@
 # limitations under the License.
 """Unit tests for MetricsCollector and process_req_perf_metrics."""
 
+import threading
+import time
 from typing import Dict
 
 import pytest
-from prometheus_client import REGISTRY
+from prometheus_client import REGISTRY, CollectorRegistry, generate_latest, multiprocess
 
-from tensorrt_llm.metrics.collector import MetricsCollector
+from tensorrt_llm.metrics.collector import _MAX_RETIRED_EP_HEALTH_SOURCE_EPOCHS, MetricsCollector
 from tensorrt_llm.metrics.enums import MetricNames, RequestEventTiming
 from tensorrt_llm.metrics.perf_utils import process_req_perf_metrics
 
@@ -47,6 +49,13 @@ def collector():
 
 def _get_gauge_value(collector, metric_name: str):
     """Get the current value of a Prometheus gauge."""
+    if metric_name.startswith("ep_"):
+        sample_name = f"trtllm_{metric_name}"
+        for metric in collector._ep_health_prometheus_collector.collect():
+            for sample in metric.samples:
+                if sample.name == sample_name:
+                    return sample.value
+        raise AssertionError(f"Missing EP health sample {sample_name}")
     metric = getattr(collector, metric_name)
     return metric.labels(**collector.labels)._value.get()
 
@@ -55,6 +64,37 @@ def _get_counter_value(collector, metric_name: str):
     """Get the current value of a Prometheus counter."""
     metric = getattr(collector, metric_name)
     return metric.labels(**collector.labels)._value.get()
+
+
+def _get_ep_rank_gauge_value(collector, rank: int):
+    for metric in collector._ep_health_prometheus_collector.collect():
+        for sample in metric.samples:
+            if sample.name == "trtllm_ep_rank_active" and sample.labels[
+                collector.labelname_ep_rank
+            ] == str(rank):
+                return sample.value
+    raise AssertionError(f"Missing EP rank sample {rank}")
+
+
+def _get_ep_rank_samples(collector):
+    return [
+        sample
+        for metric in collector._ep_health_prometheus_collector.collect()
+        for sample in metric.samples
+        if sample.name == "trtllm_ep_rank_active"
+    ]
+
+
+def _get_ep_metric_samples(collector):
+    return [
+        sample
+        for metric in collector._ep_health_prometheus_collector.collect()
+        for sample in metric.samples
+    ]
+
+
+EP_HEALTH_SOURCE_A = "source-a"
+EP_HEALTH_SOURCE_B = "source-b"
 
 
 SAMPLE_ITERATION_STATS = {
@@ -91,6 +131,491 @@ SAMPLE_ITERATION_STATS = {
         "draftOverhead": 1.2,
     },
 }
+
+
+class TestEPHealthStats:
+    """Test committed EPGroupHealth membership is exposed as passive gauges."""
+
+    def test_no_snapshot_exports_no_ep_health_families(self, collector):
+        registry = CollectorRegistry()
+        collector.register_ep_health_metrics(registry)
+
+        assert _get_ep_metric_samples(collector) == []
+        assert "trtllm_ep_" not in generate_latest(registry).decode()
+
+        # ``None``/unsupported health is represented by marking a collector
+        # unavailable before any producer has published a valid snapshot.
+        collector.log_ep_health_unavailable()
+        assert _get_ep_metric_samples(collector) == []
+        assert "trtllm_ep_" not in generate_latest(registry).decode()
+
+    def test_per_rank_and_group_gauges(self, collector):
+        assert (
+            collector.log_ep_health_stats(
+                {
+                    "sourceEpoch": EP_HEALTH_SOURCE_A,
+                    "worldSize": 4,
+                    "activeCount": 3,
+                    "failedRanks": [2],
+                    "generation": 1,
+                }
+            )
+            is True
+        )
+
+        assert [_get_ep_rank_gauge_value(collector, rank) for rank in range(4)] == [
+            1,
+            1,
+            0,
+            1,
+        ]
+        assert _get_gauge_value(collector, "ep_active_ranks") == 3
+        assert _get_gauge_value(collector, "ep_failed_ranks") == 1
+        assert _get_gauge_value(collector, "ep_health_generation") == 1
+        assert _get_gauge_value(collector, "ep_health_available") == 1
+
+    def test_reactivation_updates_existing_rank_series(self, collector):
+        collector.log_ep_health_stats(
+            {
+                "sourceEpoch": EP_HEALTH_SOURCE_A,
+                "worldSize": 2,
+                "activeCount": 1,
+                "failedRanks": [1],
+                "generation": 1,
+            }
+        )
+        collector.log_ep_health_stats(
+            {
+                "sourceEpoch": EP_HEALTH_SOURCE_A,
+                "worldSize": 2,
+                "activeCount": 2,
+                "failedRanks": [],
+                "generation": 2,
+            }
+        )
+
+        assert _get_ep_rank_gauge_value(collector, 1) == 1
+        assert _get_gauge_value(collector, "ep_active_ranks") == 2
+        assert _get_gauge_value(collector, "ep_failed_ranks") == 0
+        assert _get_gauge_value(collector, "ep_health_generation") == 2
+
+    def test_conflicting_same_generation_warns_and_is_ignored(self, collector, caplog):
+        collector.log_ep_health_stats(
+            {
+                "sourceEpoch": EP_HEALTH_SOURCE_A,
+                "worldSize": 2,
+                "activeCount": 1,
+                "failedRanks": [1],
+                "generation": 1,
+            }
+        )
+        assert (
+            collector.log_ep_health_stats(
+                {
+                    "sourceEpoch": EP_HEALTH_SOURCE_A,
+                    "worldSize": 2,
+                    "activeCount": 1,
+                    "failedRanks": [0],
+                    "generation": 1,
+                }
+            )
+            is False
+        )
+
+        assert "Conflicting epHealthStats payloads" in caplog.text
+        assert _get_ep_rank_gauge_value(collector, 0) == 1
+        assert _get_ep_rank_gauge_value(collector, 1) == 0
+        assert _get_gauge_value(collector, "ep_health_available") == 0
+
+    def test_stale_generation_warns_and_is_ignored(self, collector, caplog):
+        collector.log_ep_health_stats(
+            {
+                "sourceEpoch": EP_HEALTH_SOURCE_A,
+                "worldSize": 2,
+                "activeCount": 1,
+                "failedRanks": [1],
+                "generation": 2,
+            }
+        )
+        assert (
+            collector.log_ep_health_stats(
+                {
+                    "sourceEpoch": EP_HEALTH_SOURCE_A,
+                    "worldSize": 2,
+                    "activeCount": 1,
+                    "failedRanks": [0],
+                    "generation": 1,
+                }
+            )
+            is False
+        )
+
+        assert "Ignoring stale epHealthStats generation" in caplog.text
+        assert _get_ep_rank_gauge_value(collector, 0) == 1
+        assert _get_ep_rank_gauge_value(collector, 1) == 0
+        assert _get_gauge_value(collector, "ep_health_available") == 0
+
+    def test_new_producer_epoch_can_restart_generation(self, collector):
+        assert collector.log_ep_health_stats(
+            {
+                "sourceEpoch": "producer-a",
+                "worldSize": 2,
+                "activeCount": 1,
+                "failedRanks": [1],
+                "generation": 5,
+            }
+        )
+        collector.log_ep_health_unavailable()
+
+        assert collector.log_ep_health_stats(
+            {
+                "sourceEpoch": "producer-b",
+                "worldSize": 2,
+                "activeCount": 2,
+                "failedRanks": [],
+                "generation": 0,
+            }
+        )
+        assert [_get_ep_rank_gauge_value(collector, rank) for rank in range(2)] == [1, 1]
+        assert _get_gauge_value(collector, "ep_active_ranks") == 2
+        assert _get_gauge_value(collector, "ep_health_generation") == 0
+        assert _get_gauge_value(collector, "ep_health_available") == 1
+
+    def test_retired_producer_epoch_cannot_become_current_again(self, collector, caplog):
+        assert collector.log_ep_health_stats(
+            {
+                "sourceEpoch": EP_HEALTH_SOURCE_A,
+                "worldSize": 2,
+                "activeCount": 1,
+                "failedRanks": [1],
+                "generation": 9,
+            }
+        )
+        assert collector.log_ep_health_stats(
+            {
+                "sourceEpoch": EP_HEALTH_SOURCE_B,
+                "worldSize": 2,
+                "activeCount": 2,
+                "failedRanks": [],
+                "generation": 0,
+            }
+        )
+
+        assert (
+            collector.log_ep_health_stats(
+                {
+                    "sourceEpoch": EP_HEALTH_SOURCE_A,
+                    "worldSize": 2,
+                    "activeCount": 1,
+                    "failedRanks": [1],
+                    "generation": 9,
+                }
+            )
+            is False
+        )
+        assert "retired source epoch" in caplog.text
+        assert [_get_ep_rank_gauge_value(collector, rank) for rank in range(2)] == [1, 1]
+        assert _get_gauge_value(collector, "ep_health_generation") == 0
+        assert _get_gauge_value(collector, "ep_health_available") == 0
+
+    def test_source_epoch_is_required_after_epoch_aware_payload(self, collector):
+        assert collector.log_ep_health_stats(
+            {
+                "sourceEpoch": EP_HEALTH_SOURCE_A,
+                "worldSize": 1,
+                "activeCount": 1,
+                "failedRanks": [],
+                "generation": 0,
+            }
+        )
+
+        assert (
+            collector.log_ep_health_stats(
+                {
+                    "worldSize": 1,
+                    "activeCount": 1,
+                    "failedRanks": [],
+                    "generation": 1,
+                }
+            )
+            is False
+        )
+        assert collector._last_ep_health_state[0] == EP_HEALTH_SOURCE_A
+        assert _get_gauge_value(collector, "ep_health_available") == 0
+
+    def test_source_epoch_churn_keeps_recent_replay_window_bounded(self, collector):
+        transitions = _MAX_RETIRED_EP_HEALTH_SOURCE_EPOCHS + 10
+        for epoch in range(transitions):
+            assert collector.log_ep_health_stats(
+                {
+                    "sourceEpoch": f"source-{epoch}",
+                    "worldSize": 1,
+                    "activeCount": 1,
+                    "failedRanks": [],
+                    "generation": 0,
+                }
+            )
+
+        # Legitimate producer replacements continue after the bounded history
+        # fills, while recently retired producers are still rejected.
+        assert (
+            collector.log_ep_health_stats(
+                {
+                    "sourceEpoch": f"source-{transitions - 2}",
+                    "worldSize": 1,
+                    "activeCount": 1,
+                    "failedRanks": [],
+                    "generation": 0,
+                }
+            )
+            is False
+        )
+        assert (
+            len(collector._retired_ep_health_source_epochs) == _MAX_RETIRED_EP_HEALTH_SOURCE_EPOCHS
+        )
+        assert (
+            len(collector._retired_ep_health_source_epoch_order)
+            == _MAX_RETIRED_EP_HEALTH_SOURCE_EPOCHS
+        )
+        assert _get_gauge_value(collector, "ep_health_available") == 0
+
+        assert collector.log_ep_health_stats(
+            {
+                "sourceEpoch": "source-0",
+                "worldSize": 1,
+                "activeCount": 1,
+                "failedRanks": [],
+                "generation": 0,
+            }
+        )
+        assert _get_gauge_value(collector, "ep_health_available") == 1
+
+    def test_oversized_world_is_rejected_before_rank_series_creation(self, collector):
+        assert _get_ep_rank_samples(collector) == []
+
+        assert (
+            collector.log_ep_health_stats(
+                {
+                    "sourceEpoch": EP_HEALTH_SOURCE_A,
+                    "worldSize": 129,
+                    "activeCount": 129,
+                    "failedRanks": [],
+                    "generation": 0,
+                }
+            )
+            is False
+        )
+        assert _get_ep_metric_samples(collector) == []
+
+    def test_unrepresentable_generation_is_rejected_before_metric_writes(self, collector):
+        assert _get_ep_rank_samples(collector) == []
+
+        assert (
+            collector.log_ep_health_stats(
+                {
+                    "sourceEpoch": EP_HEALTH_SOURCE_A,
+                    "worldSize": 1,
+                    "activeCount": 1,
+                    "failedRanks": [],
+                    "generation": 10**1000,
+                }
+            )
+            is False
+        )
+        assert collector._last_ep_health_state is None
+        assert _get_ep_metric_samples(collector) == []
+
+    def test_world_size_change_warns_and_is_ignored(self, collector, caplog):
+        collector.log_ep_health_stats(
+            {
+                "sourceEpoch": EP_HEALTH_SOURCE_A,
+                "worldSize": 4,
+                "activeCount": 3,
+                "failedRanks": [3],
+                "generation": 1,
+            }
+        )
+        assert (
+            collector.log_ep_health_stats(
+                {
+                    "sourceEpoch": EP_HEALTH_SOURCE_A,
+                    "worldSize": 2,
+                    "activeCount": 2,
+                    "failedRanks": [],
+                    "generation": 2,
+                }
+            )
+            is False
+        )
+
+        assert "Ignoring epHealthStats world-size change" in caplog.text
+        assert _get_ep_rank_gauge_value(collector, 3) == 0
+        assert _get_gauge_value(collector, "ep_active_ranks") == 3
+        assert _get_gauge_value(collector, "ep_failed_ranks") == 1
+        assert _get_gauge_value(collector, "ep_health_generation") == 1
+        assert _get_gauge_value(collector, "ep_health_available") == 0
+
+    def test_invalid_payload_is_ignored(self, collector, caplog):
+        invalid = {
+            "sourceEpoch": EP_HEALTH_SOURCE_A,
+            "worldSize": 4,
+            "activeCount": 4,
+            "failedRanks": [4],
+            "generation": 1,
+        }
+        assert collector.log_ep_health_stats(invalid) is False
+        assert collector.log_ep_health_stats(invalid) is False
+
+        assert "Ignoring invalid epHealthStats payload" in caplog.text
+        assert caplog.text.count("Ignoring invalid epHealthStats payload") == 1
+        assert collector._last_ep_health_state is None
+        assert _get_ep_metric_samples(collector) == []
+
+        assert collector.log_ep_health_stats(
+            {
+                "sourceEpoch": EP_HEALTH_SOURCE_A,
+                "worldSize": 4,
+                "activeCount": 4,
+                "failedRanks": [],
+                "generation": 0,
+            }
+        )
+        assert collector.log_ep_health_stats(invalid) is False
+        assert caplog.text.count("Ignoring invalid epHealthStats payload") == 2
+
+    def test_rpc_outage_marks_snapshot_unavailable_and_duplicate_recovers(self, collector):
+        snapshot = {
+            "sourceEpoch": EP_HEALTH_SOURCE_A,
+            "worldSize": 2,
+            "activeCount": 2,
+            "failedRanks": [],
+            "generation": 0,
+        }
+        assert collector.log_ep_health_stats(snapshot) is True
+        collector.log_ep_health_unavailable()
+
+        assert _get_ep_rank_gauge_value(collector, 0) == 1
+        assert _get_gauge_value(collector, "ep_active_ranks") == 2
+        assert _get_gauge_value(collector, "ep_failed_ranks") == 0
+        assert _get_gauge_value(collector, "ep_health_generation") == 0
+        assert _get_gauge_value(collector, "ep_health_available") == 0
+
+        assert collector.log_ep_health_stats(snapshot) is True
+        assert _get_gauge_value(collector, "ep_health_available") == 1
+
+    def test_health_metrics_register_on_scrape_registry(self, collector):
+        collector.log_ep_health_stats(
+            {
+                "sourceEpoch": EP_HEALTH_SOURCE_A,
+                "worldSize": 2,
+                "activeCount": 1,
+                "failedRanks": [1],
+                "generation": 3,
+            }
+        )
+        registry = CollectorRegistry()
+        collector.register_ep_health_metrics(registry)
+        output = generate_latest(registry).decode()
+
+        assert 'trtllm_ep_rank_active{ep_rank="0",model_name="test_model"} 1.0' in output
+        assert 'trtllm_ep_rank_active{ep_rank="1",model_name="test_model"} 0.0' in output
+        assert 'trtllm_ep_active_ranks{model_name="test_model"} 1.0' in output
+        assert 'trtllm_ep_failed_ranks{model_name="test_model"} 1.0' in output
+        assert 'trtllm_ep_health_generation{model_name="test_model"} 3.0' in output
+        assert 'trtllm_ep_health_available{model_name="test_model"} 1.0' in output
+
+    def test_multiprocess_registry_and_local_health_collector_do_not_duplicate(
+        self, collector, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
+        collector.log_ep_health_stats(
+            {
+                "sourceEpoch": EP_HEALTH_SOURCE_A,
+                "worldSize": 2,
+                "activeCount": 1,
+                "failedRanks": [1],
+                "generation": 4,
+            }
+        )
+
+        registry = CollectorRegistry()
+        multiprocess.MultiProcessCollector(registry)
+        collector.register_ep_health_metrics(registry)
+        output = generate_latest(registry).decode()
+
+        assert output.count("# HELP trtllm_ep_rank_active") == 1
+        assert output.count("trtllm_ep_rank_active{") == 2
+        assert output.count("trtllm_ep_health_available{") == 1
+        assert "pid=" not in "\n".join(
+            line for line in output.splitlines() if line.startswith("trtllm_ep_")
+        )
+
+    def test_concurrent_scrapes_observe_only_complete_health_snapshots(self, collector):
+        registry = CollectorRegistry()
+        collector.register_ep_health_metrics(registry)
+        assert collector.log_ep_health_stats(
+            {
+                "sourceEpoch": EP_HEALTH_SOURCE_A,
+                "worldSize": 4,
+                "activeCount": 3,
+                "failedRanks": [0],
+                "generation": 0,
+            }
+        )
+        writer_done = threading.Event()
+        start = threading.Barrier(2)
+        writer_errors = []
+
+        def writer():
+            try:
+                start.wait(timeout=10.0)
+                for generation in range(1, 501):
+                    failed_ranks = [generation % 4]
+                    assert collector.log_ep_health_stats(
+                        {
+                            "sourceEpoch": EP_HEALTH_SOURCE_A,
+                            "worldSize": 4,
+                            "activeCount": 3,
+                            "failedRanks": failed_ranks,
+                            "generation": generation,
+                        }
+                    )
+                    time.sleep(0)
+            except BaseException as error:
+                writer_errors.append(error)
+            finally:
+                writer_done.set()
+
+        thread = threading.Thread(target=writer)
+        thread.start()
+        start.wait(timeout=10.0)
+        scrapes = 0
+        while not writer_done.is_set() or scrapes == 0:
+            families = {
+                metric.name: metric
+                for metric in collector._ep_health_prometheus_collector.collect()
+            }
+            availability = families["trtllm_ep_health_available"].samples[0].value
+            if availability:
+                ranks = families["trtllm_ep_rank_active"].samples
+                active_count = families["trtllm_ep_active_ranks"].samples[0].value
+                failed_count = families["trtllm_ep_failed_ranks"].samples[0].value
+                generation = families["trtllm_ep_health_generation"].samples[0].value
+                failed_ranks = [
+                    int(sample.labels[collector.labelname_ep_rank])
+                    for sample in ranks
+                    if not sample.value
+                ]
+                assert len(ranks) == 4
+                assert sum(sample.value for sample in ranks) == active_count
+                assert len(ranks) - active_count == failed_count
+                assert failed_ranks == [int(generation) % 4]
+            scrapes += 1
+        thread.join(timeout=10.0)
+
+        assert not thread.is_alive()
+        assert writer_errors == []
+        assert collector._last_ep_health_state[2] == 500
 
 
 class TestIterationStatsTopLevel:
