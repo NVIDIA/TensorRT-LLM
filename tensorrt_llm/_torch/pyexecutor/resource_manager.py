@@ -1,6 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import copy
 import enum
 import math
@@ -26,6 +37,8 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
 from tensorrt_llm.runtime import ModelConfig as ModelConfigPython
+from tensorrt_llm.runtime.kv_cache_hash import (KV_CACHE_HASH_ALGO_AUTO,
+                                                KV_CACHE_HASH_ALGO_V1)
 
 # isort: off
 # isort: on
@@ -55,6 +68,8 @@ if TYPE_CHECKING:
         AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
+    from .kv_cache_manager_v2 import KVCacheManagerV2
+
 BlocksPerWindow = Dict[int, Tuple[
     int,
     int]]  # window_size -> (blocks_in_primary_pool, blocks_in_secondary_pool)
@@ -83,16 +98,27 @@ class ResourceManagerType(enum.Enum):
     PEFT_CACHE_MANAGER = "PEFT_CACHE_MANAGER"
     SEQ_SLOT_MANAGER = "SEQ_SLOT_MANAGER"
     SPEC_RESOURCE_MANAGER = "SPEC_RESOURCE_MANAGER"
+    KV_CACHE_COMPRESSION_MANAGER = "KV_CACHE_COMPRESSION_MANAGER"
 
 
 def compute_page_count(token_count: int, tokens_per_page: int) -> int:
     return (token_count + tokens_per_page) // tokens_per_page
 
 
+def _warn_if_unsupported_v1_kv_cache_event_hash_algo(hash_algo: str) -> None:
+    if hash_algo in (KV_CACHE_HASH_ALGO_AUTO, KV_CACHE_HASH_ALGO_V1):
+        return
+    logger.warning(
+        f"KVCacheManager only supports kv_cache_event_hash_algo={KV_CACHE_HASH_ALGO_V1}; "
+        f"requested {hash_algo}. The V1 event manager will emit {KV_CACHE_HASH_ALGO_V1} "
+        "event hashes.")
+
+
 class BaseResourceManager(ABC):
 
     @abstractmethod
     def get_max_resource_count(self) -> int:
+        """Return the maximum number of real requests this manager can admit."""
         raise NotImplementedError
 
     @abstractmethod
@@ -572,6 +598,8 @@ class KVCacheManager(BaseResourceManager):
         }
 
         if self.event_buffer_max_size > 0:
+            _warn_if_unsupported_v1_kv_cache_event_hash_algo(
+                kv_cache_config.kv_cache_event_hash_algo)
             if mapping.enable_attention_dp:
                 kwargs['event_manager'] = KVCacheEventManagerCpp(
                     max_kv_event_entries=self.event_buffer_max_size,
@@ -2069,6 +2097,13 @@ class KVCacheManager(BaseResourceManager):
     def copy_batch_block_offsets(self, dst_tensor: torch.Tensor,
                                  request_ids: List[int], beam_width: int,
                                  num_context: int, num_seqs: int):
+        # Fill the persistent host buffer in place, exactly as before. CPU-side
+        # consumers read self.host_kv_cache_block_offsets directly and depend on
+        # its persistent, max_batch-sized layout: DSA sparse attention, the
+        # speculative-decoding draft/target swap, and the KV-cache relocation
+        # path. Reassigning this attribute to a per-call, num_seqs-sized buffer
+        # broke those readers (nvbug 6293536 regression), so it must stay the
+        # buffer they see.
         if self.kv_cache_type == CacheTypeCpp.CROSS and beam_width > 1:
             # This branch is reached only via attribute aliasing, never a
             # direct cross_kv_cache_manager.copy_batch_block_offsets(...) call:
@@ -2091,14 +2126,18 @@ class KVCacheManager(BaseResourceManager):
             # tensor whose rows are decoder-sequence scoped.
             self.impl.copy_batch_block_offsets(self.host_kv_cache_block_offsets,
                                                request_ids, 1, 0)
-            for pool_idx in range(self.host_kv_cache_block_offsets.shape[0]):
+            # Snapshot the rows this call reads into a fresh pinned buffer so the
+            # async H2D below has a private, immutable source (see the non-cross
+            # path for the full rationale).
+            num_rows = num_context + num_gen_requests
+            host_block_offsets = self._stage_block_offsets_for_copy(num_rows)
+            for pool_idx in range(self.num_pools):
                 if num_context > 0:
                     dst_tensor[pool_idx, :num_context].copy_(
-                        self.host_kv_cache_block_offsets[
-                            pool_idx, :num_context],
+                        host_block_offsets[pool_idx, :num_context],
                         non_blocking=True)
                 if num_gen_requests > 0:
-                    gen_block_offsets = self.host_kv_cache_block_offsets[
+                    gen_block_offsets = host_block_offsets[
                         pool_idx, num_context:num_context + num_gen_requests]
                     dst_tensor[pool_idx, num_context:num_seqs].copy_(
                         gen_block_offsets.repeat_interleave(beam_width, dim=0),
@@ -2111,10 +2150,36 @@ class KVCacheManager(BaseResourceManager):
                                            request_ids[num_context:],
                                            beam_width, num_context)
 
-        for pool_idx in range(self.host_kv_cache_block_offsets.shape[0]):
-            dst_tensor[pool_idx, :num_seqs].copy_(
-                self.host_kv_cache_block_offsets[pool_idx, :num_seqs],
-                non_blocking=True)
+        # The H2D copies below are asynchronous, so their source is read at copy
+        # execution time, not enqueue time. With the overlap scheduler the CPU
+        # runs an iteration ahead, so copying straight from the persistent buffer
+        # let the next iteration's in-place refill clobber the source of this
+        # iteration's still-pending H2D -> the attention kernel indexed another
+        # batch's blocks (nvbug 6293536; the window is widened when host
+        # offloading stalls the execution stream in front of the H2D). Stage the
+        # async copy through a freshly-allocated pinned buffer instead; the
+        # caching host allocator holds it until the consuming copy completes,
+        # matching the already-safe kv_lens / block_ids_per_seq staging. The
+        # persistent buffer above is untouched by this and stays valid for the
+        # synchronous CPU readers.
+        host_block_offsets = self._stage_block_offsets_for_copy(num_seqs)
+        for pool_idx in range(self.num_pools):
+            dst_tensor[pool_idx, :num_seqs].copy_(host_block_offsets[pool_idx],
+                                                  non_blocking=True)
+
+    def _stage_block_offsets_for_copy(self, num_rows: int) -> torch.Tensor:
+        """Snapshot the first ``num_rows`` rows of the persistent host block
+        offset buffer into a fresh pinned buffer, to serve as the private source
+        of an asynchronous H2D copy (nvbug 6293536)."""
+        host_block_offsets = torch.empty(self.num_pools,
+                                         num_rows,
+                                         2,
+                                         self.max_blocks_per_seq,
+                                         dtype=torch.int32,
+                                         pin_memory=prefer_pinned(),
+                                         device='cpu')
+        host_block_offsets.copy_(self.host_kv_cache_block_offsets[:, :num_rows])
+        return host_block_offsets
 
     def truncate_blocks(self, target_tokens: List[int],
                         num_tokens_to_keep: int):
@@ -2242,6 +2307,129 @@ class BlockManager:
 
     def _free_blocks(self, block_list: list):
         self.free_blocks.extend(block_list)
+
+
+# --------------------------------------------------------------------- #
+# KV-cache compression framework (BaseResourceManager-based)             #
+# --------------------------------------------------------------------- #
+
+
+class BaseKVCacheCompressionManager(BaseResourceManager):
+    """Framework-level base class for all KV-cache compression managers.
+
+    Inherits :class:`BaseResourceManager` so PyExecutor's main loop
+    auto-invokes ``prepare_resources`` / ``update_resources`` /
+    ``free_resources`` each iteration without any PyExecutor code changes; the
+    base implementations below translate those callbacks into the lifecycle
+    hooks.
+
+    Concrete compression methods subclass this directly. All 4 hooks default to
+    no-op; subclasses override what they need. The manager never inherits from
+    any cache manager because this layer decides *how* the physical KV is used,
+    not *what* physical KV exists. Subclasses hold ``KVCacheManagerV2`` as a tool.
+    """
+
+    def __init__(self, kv_cache_manager: "KVCacheManagerV2"):
+        self.kv_cache_manager = kv_cache_manager
+        # Compression evicts/rewrites stored keys and values, so a shared prefix
+        # block is no longer safe to reuse (same constraint as RocketKVCacheManager).
+        if kv_cache_manager.enable_block_reuse:
+            raise ValueError(
+                f"{type(self).__name__} changes stored keys and values and cannot "
+                f"run with KV-cache block reuse. Set "
+                f"KvCacheConfig.enable_block_reuse to False.")
+
+    # ================================================================== #
+    # KV-cache lifecycle hooks (4, in temporal order).                   #
+    # Subclasses override what they need; all default to no-op.          #
+    # ================================================================== #
+
+    def on_request_init(self, request: "LlmRequest", **kwargs) -> None:
+        """Per-request init hook.
+
+        Override to allocate per-request accumulators (e.g. per-request
+        scoring buffers).
+        """
+
+    def on_context_step_end(
+        self,
+        request: "LlmRequest",
+        metadata: "AttentionMetadata",
+        **kwargs,
+    ) -> None:
+        """Fired once per request, when its prefill finishes (its final
+        chunk). Override for a one-shot prefill-end eviction.
+        """
+
+    def on_generation_step_end(
+        self,
+        scheduled_batch: "ScheduledRequests",
+        attn_metadata: "AttentionMetadata",
+        **kwargs,
+    ) -> None:
+        """Fired once per generation step, after every layer's forward
+        completes. Override for periodic or budget-triggered eviction.
+        """
+
+    def on_request_finish(self, request: "LlmRequest", **kwargs) -> None:
+        """Per-request finish / abort hook.
+
+        Override to release per-request state allocated in
+        ``on_request_init``. Underlying KV blocks are still freed by the
+        ``KVCacheManagerV2``; subclasses must not free them here.
+        """
+
+    # ================================================================== #
+    # BaseResourceManager interface — PyExecutor auto-invokes these each  #
+    # iteration; they translate into the semantic lifecycle hooks above.  #
+    # ================================================================== #
+
+    def get_max_resource_count(self) -> int:
+        """The compression manager does not own physical resources (the V2
+        cache manager does). Returns 0 so PyExecutor's scheduler does not gate
+        on us."""
+        return 0
+
+    def get_needed_resource_to_completion(self, request: "LlmRequest") -> int:
+        """The compression manager does not own physical resources (the V2
+        cache manager does). Returns 0 so PyExecutor's scheduler does not block
+        on us."""
+        return 0
+
+    def prepare_resources(self, scheduled_batch: "ScheduledRequests") -> None:
+        """Fire :meth:`on_request_init` once per request, on its first prefill
+        chunk -- the same ``is_first_context_chunk`` gate ``KVCacheManager``
+        uses, so no manager-side dedup bookkeeping is needed.
+        """
+        for req in scheduled_batch.context_requests:
+            if req.is_first_context_chunk:
+                self.on_request_init(req)
+
+    def update_resources(
+        self,
+        scheduled_batch: "ScheduledRequests",
+        attn_metadata: Optional["AttentionMetadata"] = None,
+        kv_cache_dtype_byte_size: Optional[float] = None,
+    ) -> None:
+        """Fire :meth:`on_context_step_end` once per request, on the iteration its
+        final prefill chunk runs, then :meth:`on_generation_step_end` once.
+
+        Uses the scheduler's ``context_requests_last_chunk`` split (computed at
+        schedule time from ``is_last_context_chunk``) rather than tracking
+        request-state transitions: it is iteration-exact and immune to a
+        short-output request going straight to ``GENERATION_TO_COMPLETE``
+        (which, under the overlap scheduler, never passes through
+        ``GENERATION_IN_PROGRESS``). Signature matches the other resource
+        managers so PyExecutor passes ``attn_metadata`` /
+        ``kv_cache_dtype_byte_size`` through transparently.
+        """
+        for req in scheduled_batch.context_requests_last_chunk:
+            self.on_context_step_end(req, attn_metadata)
+        self.on_generation_step_end(scheduled_batch, attn_metadata)
+
+    def free_resources(self, request: "LlmRequest") -> None:
+        """Fire :meth:`on_request_finish`."""
+        self.on_request_finish(request)
 
 
 class ResourceManager:

@@ -144,7 +144,7 @@ transforms:
     allreduce_strategy: NCCL
   pipeline_cache:
     stage: sharding
-    enabled: true
+    enabled: false
     root: null
   ############################################################################################
   # MOVE MODEL AND LOAD WEIGHTS

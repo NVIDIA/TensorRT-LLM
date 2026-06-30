@@ -309,6 +309,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_triton.yaml",
         "qwen3_5_4b_fp8_stress":
         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_qwen3_5_4b_fp8_tllm.yaml",
+        "glm5_nvfp4_tp4_ep4_dp_stress":
+        f"{test_configs_root}/disagg_config_ctxtp4ep4_gentp4ep4_glm5_nvfp4_dp_tllm.yaml",
         "qwen3_32b_fp8_stress":
         f"{test_configs_root}/disagg_config_ctxtp1_gentp4_qwen3_32b_fp8.yaml",
         "gpt_oss_120b_harmony":
@@ -1121,6 +1123,30 @@ def test_disaggregated_overlap_transceiver_runtime_python(
 
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
+    run_disaggregated_test(disaggregated_example_root,
+                           "overlap_transceiver_runtime_python",
+                           env=env,
+                           model_path=llama_model_root,
+                           cwd=llm_venv.get_working_directory())
+
+
+# Exercises the disaggregated KV-cache transfer path with the Python cache transceiver runtime
+# while the KV-cache pool itself is allocated from fabric (MNNVL) VMM memory via
+# TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY=1. Restricted to GB200/GB300 since those are the only
+# platforms with MNNVL fabric-memory support; on other devices the env var would silently fall
+# back to a non-fabric allocation, which would defeat the purpose of this test.
+@pytest.mark.skip_device_not_contain(["GB200", "GB300"])
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_overlap_transceiver_runtime_python_fabric_memory(
+        disaggregated_test_root, llm_venv, disaggregated_example_root,
+        llama_model_root):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
+    env = llm_venv._new_env.copy()
+    env["UCX_TLS"] = get_ucx_tls()
+    env["TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY"] = "1"
     run_disaggregated_test(disaggregated_example_root,
                            "overlap_transceiver_runtime_python",
                            env=env,
@@ -2382,6 +2408,13 @@ def test_disaggregated_qwen3_32b_fp8(disaggregated_test_root,
                             cancellation_rate=10,
                             cancellation_delay=0.5),
                  marks=(pytest.mark.skip_less_device(2), skip_no_hopper)),
+    pytest.param(TestConfig(model_path='GLM-5-NVFP4',
+                            test_desc='glm5_nvfp4_tp4_ep4_dp_stress',
+                            request_count=35000,
+                            accuracy_threshold=0.90,
+                            cancellation_rate=10,
+                            cancellation_delay=0.5),
+                 marks=(pytest.mark.skip_less_device(8), skip_pre_blackwell)),
     pytest.param(TestConfig(model_path='Qwen3/Qwen3-32B-FP8',
                             test_desc='qwen3_32b_fp8_stress',
                             request_count=10000,

@@ -194,6 +194,12 @@ def _fmt_summary(
     stages = result.get("affected_stages", [])
     lines.append(f"affected_stages ({len(stages)}):")
     lines.extend(f"  - {s}" for s in stages)
+    counts = result.get("affected_stage_test_counts", {})
+    splits = result.get("affected_stage_split_counts", {})
+    if splits:
+        lines.append(f"split sizing ({len(splits)} stages, kept_entries -> shards):")
+        for s in sorted(splits):
+            lines.append(f"  - {s}: {counts.get(s, '?')} -> {splits[s]}")
     lines.append("reasons:")
     lines.extend(f"  - {r}" for r in result.get("reasons", []))
     return "\n".join(lines) + "\n"

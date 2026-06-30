@@ -44,6 +44,15 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64" AND CMAKE_CXX_COMPILER_ID
   set(CMAKE_CUDA_HOST_COMPILER ${GCC_EXECUTABLE})
   message(
     STATUS "FlashMLA: Using GCC at ${GCC_EXECUTABLE} for CUDA compilation")
+  # PyTorch's cmake/public/cuda.cmake (loaded transitively by
+  # find_package(Torch)) appends -Xcompiler=-fclang-abi-compat=17 to
+  # CMAKE_CUDA_FLAGS whenever the parent build is configured with Clang>=18 (see
+  # pytorch PR #175233). Since CUDA host compilation here falls back to GCC,
+  # that Clang-only flag would be forwarded to g++ via `nvcc -ccbin=g++` and
+  # abort the build with: g++: error: unrecognized command-line option
+  # '-fclang-abi-compat=17'
+  string(REGEX REPLACE "-Xcompiler=-fclang-abi-compat=[0-9]+" ""
+                       CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
 endif()
 
 # Check CUDA version and architecture support
