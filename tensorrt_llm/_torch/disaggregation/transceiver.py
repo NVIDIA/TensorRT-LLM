@@ -183,12 +183,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         )
 
         if token_range is None and req.prompt_len > 0:
-            # Align with KV cache allocation (resize_context /
-            # _get_context_bytes), which reserves prompt_len +
-            # num_extra_kv_tokens slots for speculative decoding methods
-            # (e.g. EAGLE3) that consume extra KV positions per request.
-            num_extra_kv_tokens = getattr(self._kv_cache_manager, "num_extra_kv_tokens", 0) or 0
-            token_range = TokenRange(start=0, end=req.prompt_len + num_extra_kv_tokens)
+            # end must match the trimmed block list below (ceil(prompt_len / tpb)
+            # blocks). num_extra_kv_tokens slots (speculative decoding) are not
+            # transferred -- see PR #14546.
+            # TODO: the accuracy impact of not transferring num_extra_kv_tokens
+            # on MTP and other speculative decoding paths is currently unclear;
+            # revisit whether these extra KV slots need to be transferred.
+            token_range = TokenRange(start=0, end=req.prompt_len)
 
         groups = []
         for idx, lg in enumerate(layer_groups):
@@ -197,8 +198,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 continue
             block_ids = adapter.get_block_ids(req, idx, lg)
             # Limit to prompt_len blocks, matching C++ cacheFormatter behavior.
-            # Extra blocks from num_extra_kv_tokens (speculative decoding) have
-            # uninitialized KV data and must not be transferred.
             total_blocks = (req.prompt_len + tpb - 1) // tpb
             if block_ids.size > total_blocks:
                 block_ids = block_ids[:total_blocks]
