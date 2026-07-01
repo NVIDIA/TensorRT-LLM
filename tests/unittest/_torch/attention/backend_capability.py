@@ -68,12 +68,6 @@ BACKEND_CAPS = {
 }
 
 _FLASHINFER_PAGED_UNSUPPORTED_HEAD_DIMS = (96, 512)
-_FLASHINFER_PAGED_APPEND_OVER_1024_THREADS = (
-    # bf16/fp16 append launches 16 threads/head for head_dim=128. With 128 KV
-    # heads, that exceeds CUDA's 1024 threads/block launch limit.
-    (128, 128, "bfloat16"),
-    (128, 128, "float16"),
-)
 
 _TRTLLM_PAGED_UNSUPPORTED_HEAD_DIMS = (512,)
 _TRTLLM_BLACKWELL_PAGED_UNSUPPORTED_HEAD_DIMS = (96,)
@@ -128,27 +122,16 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
     if kv_layout is not None and kv_layout not in caps.get("kv_layouts", ()):
         return f"{backend} does not support kv_layout '{kv_layout}'"
 
-    # FlashInfer's standard paged path has shape-specific kernel limits in this
-    # suite. Keep the skip list explicit so newly supported shapes are not
-    # hidden by a broad dispatch-set predicate.
+    # FlashInfer's standard paged kernels reject these head dimensions. Keep
+    # the skip list explicit so newly supported shapes are not hidden by a
+    # broad dispatch-set predicate.
     if (
         backend == "FLASHINFER"
         and getattr(case, "cache", "paged") != "none"
         and not getattr(case, "is_mla", False)
+        and case.head_dim in _FLASHINFER_PAGED_UNSUPPORTED_HEAD_DIMS
     ):
-        kv_dtype = getattr(case, "kv_dtype", None) or getattr(case, "dtype", None)
-        if case.head_dim in _FLASHINFER_PAGED_UNSUPPORTED_HEAD_DIMS:
-            return f"FLASHINFER paged attention is unstable for head_dim {case.head_dim}"
-        if (
-            case.head_dim,
-            case.num_kv_heads,
-            kv_dtype,
-        ) in _FLASHINFER_PAGED_APPEND_OVER_1024_THREADS:
-            return (
-                "FLASHINFER paged KV append exceeds CUDA's 1024 threads/block "
-                f"limit for head_dim={case.head_dim}, "
-                f"num_kv_heads={case.num_kv_heads}, kv_dtype={kv_dtype}"
-            )
+        return f"FLASHINFER paged kernels do not support head_dim {case.head_dim}"
 
     # TRTLLM's standard paged FMHA/MMHA kernels in this build do not cover the
     # Gemma4 head_dim 512 path.
@@ -158,7 +141,7 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
         and not getattr(case, "is_mla", False)
         and case.head_dim in _TRTLLM_PAGED_UNSUPPORTED_HEAD_DIMS
     ):
-        return f"TRTLLM paged attention is unstable for head_dim {case.head_dim}"
+        return f"TRTLLM paged attention does not support head_dim {case.head_dim}"
 
     # TRTLLM's Blackwell paged fallback path aborts for the Phi-3 head_dim 96
     # shape. Hopper covers that context config, but Blackwell must skip it
@@ -170,7 +153,7 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
         and not getattr(case, "is_mla", False)
         and case.head_dim in _TRTLLM_BLACKWELL_PAGED_UNSUPPORTED_HEAD_DIMS
     ):
-        return f"TRTLLM Blackwell paged attention is unstable for head_dim {case.head_dim}"
+        return f"TRTLLM Blackwell paged attention does not support head_dim {case.head_dim}"
 
     # TRTLLM's Blackwell no-cache fallback mismatches the Vanilla golden for the
     # Qwen2-VL vision tower's head_dim 80 workload; other no-cache head dims in
