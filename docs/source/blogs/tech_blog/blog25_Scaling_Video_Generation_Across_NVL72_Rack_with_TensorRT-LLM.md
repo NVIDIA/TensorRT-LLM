@@ -67,9 +67,11 @@ The rest of this post walks through each of these axes first, then shows how the
 
 ## CFG Parallelism
 
-Classifier-Free Guidance evaluates the diffusion transformer twice per denoising step - once with the positive prompt embedding to produce $\text{noise}_\text{cond}$, once with the negative prompt embedding to produce $\text{noise}_\text{uncond}$ - and combines the two predictions as
+Classifier-Free Guidance evaluates the diffusion transformer twice per denoising step - once with the positive prompt embedding to produce $`\text{noise}_\text{cond}`$, once with the negative prompt embedding to produce $`\text{noise}_\text{uncond}`$ - and combines the two predictions as
 
-$$\text{noise} = \text{noise}_\text{uncond} + \text{guidance\_scale} \cdot (\text{noise}_\text{cond} - \text{noise}_\text{uncond})$$
+```math
+\text{noise} = \text{noise}_\text{uncond} + \text{guidance\_scale} \cdot (\text{noise}_\text{cond} - \text{noise}_\text{uncond})
+```
 
 The two evaluations share weights, timestep, and shape, so they are perfectly parallelisable across two disjoint GPU groups. CFG parallelism exploits this by setting `cfg_size = 2`: the conditional stream runs on one half of the mesh and the unconditional stream on the other half. Each half runs its full DiT forward end to end with no cross-stream communication; only the two scalar noise tensors meet at the combine step.
 
@@ -105,7 +107,7 @@ The stacked QKV buffer produced by the all-to-all is a single contiguous allocat
 
 **Communication cost.** Ulysses parallelism involves **only two all-to-all communications per layer, regardless of sequence length**. For a sequence length $N$ and $P$ GPUs, each GPU sends a data chunk of size $O(N/P^2)$ to each of the other $P-1$ GPUs. This leads to a communication cost of $O(N/P)$.
 
-**Limitation.** Ulysses sequence parallelism is constrained by the model’s attention head count: the Ulysses degree $P$ must not exceed the head count `num_heads` and must evenly divide `num_heads`; to use all GPUs in an NVL72 system uniformly, $P$ must also divide 72. For Wan2.2‑T2V‑A14B with $\text{num\_heads} = 40$, this constraint makes $P = 8$ the largest feasible Ulysses degree on NVL72.
+**Limitation.** Ulysses sequence parallelism is constrained by the model’s attention head count: the Ulysses degree $P$ must not exceed the head count `num_heads` and must evenly divide `num_heads`; to use all GPUs in an NVL72 system uniformly, $P$ must also divide 72. For Wan2.2‑T2V‑A14B with $`\text{num\_heads} = 40`$, this constraint makes $P = 8$ the largest feasible Ulysses degree on NVL72.
 
 ### Toward Async Ulysses: Overlapping Communication and Computation
 
@@ -168,18 +170,18 @@ Rank r holds Q_r (fixed) and K/V block for step i
 
 **Overlapping communication and compute.** The K/V exchange for the next block is posted with non-blocking point-to-point (`batch_isend_irecv`) *before* the current block's FA4 kernel runs, so the neighbor transfer overlaps with attention compute. Even ranks send-then-recv and odd ranks recv-then-send to avoid deadlock; the final ring step skips the exchange entirely.
 
-**Communication cost.** Ring pays $P-1$ neighbor exchanges per attention layer, and communication volume scales as $O(N)$ in sequence length $N$ — more sequential steps than Ulysses. Each ring step also runs a partial FA4 pass plus an online-softmax merge, so attention work grows with ring degree $P$, not just communication. The upside is flexibility: **no head-count ceiling**, a simple 1D topology, and straightforward composition with Ulysses on the same mesh ($\text{cp\_size} \times \text{ulysses\_size}$). P2P can overlap with compute, which keeps Ring competitive at small $P$ and short sequences. For production video lengths, though, we **generally prefer Attention2D** (detailed in the next section) for the context-parallel axis, owing to its lower communication cost – $O(N/\sqrt{P})$ versus $O(N)$ for Ring attention.
+**Communication cost.** Ring pays $P-1$ neighbor exchanges per attention layer, and communication volume scales as $O(N)$ in sequence length $N$ — more sequential steps than Ulysses. Each ring step also runs a partial FA4 pass plus an online-softmax merge, so attention work grows with ring degree $P$, not just communication. The upside is flexibility: **no head-count ceiling**, a simple 1D topology, and straightforward composition with Ulysses on the same mesh ($`\text{cp\_size} \times \text{ulysses\_size}`$). P2P can overlap with compute, which keeps Ring competitive at small $P$ and short sequences. For production video lengths, though, we **generally prefer Attention2D** (detailed in the next section) for the context-parallel axis, owing to its lower communication cost – $O(N/\sqrt{P})$ versus $O(N)$ for Ring attention.
 
 ### 2. Attention2D Parallelism
 
-Attention2D parallelism ([arXiv:2503.15758](https://arxiv.org/abs/2503.15758)) treats the $P$ context-parallel GPUs as a logical 2D grid of $\text{row\_size} \times \text{col\_size}$ workers. It is our preferred **context-parallel strategy** once Ulysses has consumed the head-divisible fraction of the mesh and more GPUs remain. Like Ring, it shards the spatiotemporal sequence with **no head-count ceiling** — any $\text{row\_size} \times \text{col\_size}$ grid is valid regardless of how many attention heads the DiT has. It also **generalizes 1D context parallelism** - setting $\text{col\_size}=1$ reduces to the no-merge scheme (all-gather K/V), while setting $\text{row\_size}=1$ reduces to the merge scheme (all-gather Q). - and **scales the CP degree better**, gathering only $S/\sqrt{P}$ per axis ($O(N/\sqrt{P})$ communication) on a symmetric grid, which suits long-sequence DiT inference. The runtime adapts the original Attention2D design from causal LLM training to **full bidirectional** DiT inference.
+Attention2D parallelism ([arXiv:2503.15758](https://arxiv.org/abs/2503.15758)) treats the $P$ context-parallel GPUs as a logical 2D grid of $`\text{row\_size} \times \text{col\_size}`$ workers. It is our preferred **context-parallel strategy** once Ulysses has consumed the head-divisible fraction of the mesh and more GPUs remain. Like Ring, it shards the spatiotemporal sequence with **no head-count ceiling** — any $`\text{row\_size} \times \text{col\_size}`$ grid is valid regardless of how many attention heads the DiT has. It also **generalizes 1D context parallelism** - setting $`\text{col\_size}=1`$ reduces to the no-merge scheme (all-gather K/V), while setting $`\text{row\_size}=1`$ reduces to the merge scheme (all-gather Q). - and **scales the CP degree better**, gathering only $S/\sqrt{P}$ per axis ($O(N/\sqrt{P})$ communication) on a symmetric grid, which suits long-sequence DiT inference. The runtime adapts the original Attention2D design from causal LLM training to **full bidirectional** DiT inference.
 
-**Gather phase: Q along rows and K/V along columns.** Ranks form a $\text{row\_size} \times \text{col\_size}$ grid ($P = \text{row\_size} \times \text{col\_size}$). Each rank starts with a $1/P$ shard of all three tensors — $Q_i, K_i, V_i$, each $[B, S/P, H, D]$. Attention2D then runs two all-gathers on the two independent grid axes:
+**Gather phase: Q along rows and K/V along columns.** Ranks form a $`\text{row\_size} \times \text{col\_size}`$ grid ($`P = \text{row\_size} \times \text{col\_size}`$). Each rank starts with a $1/P$ shard of all three tensors — $Q_i, K_i, V_i$, each $[B, S/P, H, D]$. Attention2D then runs two all-gathers on the two independent grid axes:
 
-- **Q gather** over the **row group** (`row_process_group`): the `col_size` ranks that share a row. Concatenates their $Q_i$ → every member holds $[B, S/\text{row\_size}, H, D]$. K/V are untouched.  
-- **K/V gather** over the **column group** (`col_process_group`): the `row_size` ranks that share a column, fused into a single collective. Concatenates their $K_i$/$V_i$ → every member holds $[B, S/\text{col\_size}, H, D]$. Q is untouched.
+- **Q gather** over the **row group** (`row_process_group`): the `col_size` ranks that share a row. Concatenates their $Q_i$ → every member holds $`[B, S/\text{row\_size}, H, D]`$. K/V are untouched.  
+- **K/V gather** over the **column group** (`col_process_group`): the `row_size` ranks that share a column, fused into a single collective. Concatenates their $K_i$/$V_i$ → every member holds $`[B, S/\text{col\_size}, H, D]`$. Q is untouched.
 
-So **Q expands by `col_size`** (a row holds `col_size` ranks → $S/\text{row\_size}$) and **K/V expand by `row_size`** (a column holds `row_size` ranks → $S/\text{col\_size}$); on a symmetric $\sqrt{P} \times \sqrt{P}$ mesh both land at $S/\sqrt{P}$. The picture below uses a $2 \times 3$ grid (`row_size=2, col_size=3`, $P=6$), with $S$ split into shards $0..5$:
+So **Q expands by `col_size`** (a row holds `col_size` ranks → $`S/\text{row\_size}`$) and **K/V expand by `row_size`** (a column holds `row_size` ranks → $`S/\text{col\_size}`$); on a symmetric $\sqrt{P} \times \sqrt{P}$ mesh both land at $S/\sqrt{P}$. The picture below uses a $2 \times 3$ grid (`row_size=2, col_size=3`, $P=6$), with $S$ split into shards $0..5$:
 
 <p align="center">
   <img src="../media/tech_blog25_attention2d.png" alt="Attention2D per-rank data flow on a 2x3 grid: gather Q over the row group, K/V over the column group, one attention pass per rank produces a partial output, then an all-to-all over the row group exchanges partials and a local flash_attn_combine reduction merges them" width="1080">
@@ -189,7 +191,7 @@ So **Q expands by `col_size`** (a row holds `col_size` ranks → $S/\text{row\_s
 
 Members of a **row (Q) group** end up with identical Q but **disjoint** K/V slices; members of a **column (K/V) group** share identical K/V but hold different Q.
 
-**Local Attention.** The inner backend ([`Attention2DAttention`](https://github.com/NVIDIA/TensorRT-LLM/blob/163be837f3e82d092eb33704747a93fb419e7099/tensorrt_llm/_torch/visual_gen/attention_backend/parallel.py)) runs attention with LSE returning a partial output $[B, S/\text{row\_size}, H, D]$ and a log-sum-exp (LSE) statistic $[B, H, S/\text{row\_size}]$. The LSE records the softmax normalizer for that partial pass.
+**Local Attention.** The inner backend ([`Attention2DAttention`](https://github.com/NVIDIA/TensorRT-LLM/blob/163be837f3e82d092eb33704747a93fb419e7099/tensorrt_llm/_torch/visual_gen/attention_backend/parallel.py)) runs attention with LSE returning a partial output $`[B, S/\text{row\_size}, H, D]`$ and a log-sum-exp (LSE) statistic $`[B, H, S/\text{row\_size}]`$. The LSE records the softmax normalizer for that partial pass.
 
 **Merge phase.** The `col_size` ranks that share the same Q each attended over a **disjoint slice of K/V** (above: ranks `0`, `1`, `2` all hold queries `{0,1,2}` but keys `{0,3}`, `{1,4}`, `{2,5}` respectively). Their FA4 outputs are partial results for the **same query positions** over **complementary key spans**, so they must be combined **within that row group** to recover the full softmax. For `col_size = 3`, the partial results are spread across 3 GPUs. These are combined into the final output as follows: 
 
@@ -202,7 +204,7 @@ Members of a **row (Q) group** end up with identical Q but **disjoint** K/V slic
 | :---- | :---- | :---- |
 | **Q communication** | None. All required Q tokens  available locally. | $O(N / \sqrt{P})$ data all-gathered among `col_size` ranks within a row group |
 | **K/V communication** | $O(N)$ data exchanged among all $P$ ranks in a P2P fashion | $O(N / \sqrt{P})$ data all-gathered among `row_size` ranks within a column group |
-| **Partials** | $P$ blocks, one per ring step, each against a rotating K/V shard | $N = \text{col\_size}$ partials from the row (Q) group, each over a disjoint slice of K/V |
+| **Partials** | $P$ blocks, one per ring step, each against a rotating K/V shard | $`N = \text{col\_size}`$ partials from the row (Q) group, each over a disjoint slice of K/V |
 | **Merge schedule** | **Streaming** — merge after every FA4 step, in-place on the local rank (`sigmoid` / `logsigmoid` recurrence) | **Batch** — one FA4 pass, then a single `flash_attn_combine` after the row `all_to_all` |
 | **Merge communication** | None (all local) | One **`all_to_all`** of size $O(N / \sqrt{P})$ on output+LSE within the row group (fixed collectives, no per-hop wait tail) |
 | **Attention passes** | $P$ partial FA4 kernels | **1** FA4 kernel per rank |
@@ -210,7 +212,7 @@ Members of a **row (Q) group** end up with identical Q but **disjoint** K/V slic
 | **Communication cost** | $O(N)$ | $O(N / \sqrt{P})$ |
 | **Scaling** | No scaling: communication cost remains constant as $P$ increases | Efficient scaling: communication cost decreases as $O(1 / \sqrt{P})$ as $P$ increases |
 
-**Communication cost.** Across the full layer, Attention2D runs three collective phases: Q all-gather (row), K/V all-gather (column), and output+LSE all-to-all (row). On a symmetric mesh ($\text{row\_size} \approx \text{col\_size} \approx \sqrt{P}$), moved volume scales as $O(N / \sqrt{P})$ in sequence length $N$, compared to $O(N)$ for Ring — the same head-count freedom, but better communication scaling and one attention pass instead of $P$.
+**Communication cost.** Across the full layer, Attention2D runs three collective phases: Q all-gather (row), K/V all-gather (column), and output+LSE all-to-all (row). On a symmetric mesh ($`\text{row\_size} \approx \text{col\_size} \approx \sqrt{P}`$), moved volume scales as $O(N / \sqrt{P})$ in sequence length $N$, compared to $O(N)$ for Ring — the same head-count freedom, but better communication scaling and one attention pass instead of $P$.
 
 <p align="center">
   <img src="../media/tech_blog25_a2d_vs_ring.png" alt="Bar chart of denoise-loop latency for Attention2D vs Ring at 32 GPU (UL=8, CP=2), 64 GPU (UL=8, CP=4), and 72 GPU (UL=4, CP=9); Ring is +3%, +13%, and +83% slower respectively" width="820">
