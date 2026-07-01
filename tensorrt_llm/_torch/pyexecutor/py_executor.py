@@ -888,7 +888,7 @@ class PyExecutor:
         # detection jitter and empty-poll churn. The periodic load thread still
         # runs. Sends are serialized + closed-guarded inside the reporter, so
         # calling report_events() from the executor loop is safe.
-        self._per_rank_reporter.start(poll_events=False)
+        self._per_rank_reporter.start()
         logger.info(
             f"PerRankReporter started (inline event reporting): "
             f"worker_id={worker_id} namespace={namespace} "
