@@ -50,6 +50,13 @@ class TestDefaults:
         args = _make_args()
         assert args.mx_config.server_url is None
         assert args.mx_config.server_query_timeout_s is None
+        assert args.mx_config.local_server.enabled is True
+        assert args.mx_config.local_server.port == 8001
+        assert args.mx_config.local_server.server_image == (
+            "nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.5.0"
+        )
+        assert args.mx_config.local_server.redis_image == "redis:8-alpine"
+        assert args.mx_config.local_server.startup_timeout_s == 30
         assert args.mx_config.preshard_strategy == "per_module"
 
     def test_mx_server_query_timeout_accepts_nonnegative_int(self):
@@ -59,6 +66,30 @@ class TestDefaults:
     def test_mx_server_query_timeout_rejects_negative(self):
         with pytest.raises(ValueError):
             _make_args(checkpoint_format="MX", mx_config={"server_query_timeout_s": -1})
+
+    def test_mx_local_server_accepts_overrides(self):
+        args = _make_args(
+            checkpoint_format="MX",
+            mx_config={
+                "local_server": {
+                    "enabled": False,
+                    "port": 8123,
+                    "server_image": "example/mx:dev",
+                    "redis_image": "redis:7-alpine",
+                    "startup_timeout_s": 45,
+                }
+            },
+        )
+        assert args.mx_config.local_server.enabled is False
+        assert args.mx_config.local_server.port == 8123
+        assert args.mx_config.local_server.server_image == "example/mx:dev"
+        assert args.mx_config.local_server.redis_image == "redis:7-alpine"
+        assert args.mx_config.local_server.startup_timeout_s == 45
+
+    @pytest.mark.parametrize("field", ["port", "startup_timeout_s"])
+    def test_mx_local_server_rejects_non_positive_ints(self, field):
+        with pytest.raises(ValueError):
+            _make_args(checkpoint_format="MX", mx_config={"local_server": {field: 0}})
 
     def test_mx_preshard_strategy_accepts_per_module(self):
         args = _make_args(checkpoint_format="MX", mx_config={"preshard_strategy": "per_module"})

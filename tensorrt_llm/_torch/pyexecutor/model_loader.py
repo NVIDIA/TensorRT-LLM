@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import copy
 import inspect
 import os
@@ -24,7 +27,7 @@ from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
 from ...llmapi.llm_args import LoadFormat
 from ..model_config import ModelConfig
-from ..models import AutoModelForCausalLM
+from ..models import AutoModelForCausalLM, LlamaForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      timing)
@@ -237,6 +240,15 @@ def _construct_checkpoint_loader(
                 extra_kwargs["mx_server_url"] = mx_config.server_url
                 extra_kwargs[
                     "query_timeout_s"] = mx_config.server_query_timeout_s
+                extra_kwargs[
+                    "auto_start_local_server"] = mx_config.local_server.enabled
+                extra_kwargs["local_server_port"] = mx_config.local_server.port
+                extra_kwargs[
+                    "local_server_image"] = mx_config.local_server.server_image
+                extra_kwargs[
+                    "local_redis_image"] = mx_config.local_server.redis_image
+                extra_kwargs["local_server_startup_timeout_s"] = (
+                    mx_config.local_server.startup_timeout_s)
             if mx_model_name is not None:
                 extra_kwargs["model_name"] = mx_model_name
 
@@ -264,6 +276,10 @@ class ModelLoader:
     Handles the loading, configuration, and weight initialization of a PyTorch model.
     This class isolates model loading logic from the main execution engine.
     """
+    _MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION = 1
+    _MX_STAGED_RECEIVER_ALLOWLIST = frozenset({
+        (LlamaForCausalLM, _MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION)
+    })
 
     def __init__(self,
                  llm_args: TorchLlmArgs,
@@ -500,6 +516,9 @@ class ModelLoader:
                     # Generic loaders ignore it; MXCheckpointLoader pops it.
                     "source_identity": self._source_identity,
                 }
+                if checkpoint_loader.checkpoint_format == "MX":
+                    load_weights_kwargs["allow_post_transform_weights"] = (
+                        self._is_mx_staged_receiver_allowlisted(model))
 
                 if hasattr(model, 'llm_checkpoint_dir'):
                     weights = checkpoint_loader.load_weights(
@@ -612,11 +631,18 @@ class ModelLoader:
                             # parameter buffers. Keeping the call shape
                             # consistent here avoids forgetting it when MX+GMS
                             # composition lands later.
+                            load_weights_kwargs = {
+                                "mapping": self.mapping,
+                                "model": model,
+                                "source_identity": self._source_identity,
+                            }
+                            if checkpoint_loader.checkpoint_format == "MX":
+                                load_weights_kwargs[
+                                    "allow_post_transform_weights"] = (
+                                        self._is_mx_staged_receiver_allowlisted(
+                                            model))
                             weights = checkpoint_loader.load_weights(
-                                weight_source,
-                                mapping=self.mapping,
-                                model=model,
-                                source_identity=self._source_identity)
+                                weight_source, **load_weights_kwargs)
 
                             # `weights` may be:
                             #   - non-empty dict: standard mapping pipeline runs
@@ -673,17 +699,17 @@ class ModelLoader:
                             # narrow-scope and commit-ordering concerns.
                             checkpoint_loader.post_load_apply(
                                 model, weights_preloaded=weights_preloaded)
-                            checkpoint_loader.post_load_publish(
-                                model,
-                                checkpoint_dir=checkpoint_dir,
-                                weights_preloaded=weights_preloaded)
 
-                            for module in model.modules():
-                                if hasattr(
-                                        module,
-                                        'post_load_weights') and not getattr(
-                                            module, '_weights_removed', False):
-                                    module.post_load_weights()
+                            mx_staged_receiver_path = self._should_run_mx_staged_receiver_path(
+                                checkpoint_loader,
+                                model,
+                                weights_preloaded=weights_preloaded)
+                            if mx_staged_receiver_path:
+                                self._setup_aliases(model)
+                                self._mark_weights_transformed(model)
+                                self._walk_cache_state(model)
+                            else:
+                                self._walk_full_post_load(model)
 
                             # Defensive last-mile sweep: catches strays from
                             # C++ ops that bypassed the active torch
@@ -697,6 +723,12 @@ class ModelLoader:
                             # GMS-backed replacements above) before commit so the
                             # cached size doesn't show as live in memory accounting.
                             torch.cuda.empty_cache()
+
+                            self._post_load_publish(
+                                checkpoint_loader,
+                                model,
+                                checkpoint_dir=checkpoint_dir,
+                                weights_preloaded=weights_preloaded)
 
                         # Pool closed. Commit the post-post_load layout.
                         gms_backend.finalize_write(model)
@@ -744,10 +776,10 @@ class ModelLoader:
                         gms_backend.materialize_module(model)
                         self._walk_cache_state(model)
 
-                        checkpoint_loader.post_load_publish(
-                            model,
-                            checkpoint_dir=checkpoint_dir,
-                            weights_preloaded=True)
+                        self._post_load_publish(checkpoint_loader,
+                                                model,
+                                                checkpoint_dir=checkpoint_dir,
+                                                weights_preloaded=True)
                         gms_post_load_handled = True
                         logger.info("LoadFormat.GMS (RO): materialized weights")
                     else:
@@ -782,12 +814,24 @@ class ModelLoader:
             if not gms_post_load_handled:
                 checkpoint_loader.post_load_apply(
                     model, weights_preloaded=weights_preloaded)
-                checkpoint_loader.post_load_publish(
+                mx_staged_receiver_path = self._should_run_mx_staged_receiver_path(
+                    checkpoint_loader,
                     model,
-                    checkpoint_dir=checkpoint_dir,
                     weights_preloaded=weights_preloaded)
-
-                self._walk_full_post_load(model)
+                if mx_staged_receiver_path:
+                    self._setup_aliases(model)
+                    self._mark_weights_transformed(model)
+                    self._walk_cache_state(model)
+                    self._post_load_publish(checkpoint_loader,
+                                            model,
+                                            checkpoint_dir=checkpoint_dir,
+                                            weights_preloaded=weights_preloaded)
+                else:
+                    self._walk_full_post_load(model)
+                    self._post_load_publish(checkpoint_loader,
+                                            model,
+                                            checkpoint_dir=checkpoint_dir,
+                                            weights_preloaded=weights_preloaded)
 
             # TODO(GMS-MOE-LB): when the (MoE, GMS) combination is enabled,
             # `register_weight_slots_after_to_cuda` and `finalize_model`
@@ -829,6 +873,78 @@ class ModelLoader:
             gms_backend.get_source_identity(),
             IdentityCheckPolicy.STRICT,
         )
+
+    @classmethod
+    def _should_run_mx_staged_receiver_path(
+            cls, checkpoint_loader: BaseCheckpointLoader,
+            model: DecoderModelForCausalLM, *, weights_preloaded: bool) -> bool:
+        """Whether an MX receiver can skip one-shot weight transforms.
+
+        MXCheckpointLoader only accepts post-transform P2P bytes when this same
+        allow-list check passes before transfer, so this post-load branch should
+        never see a non-allow-listed post-transform receiver in normal use.
+        """
+        if checkpoint_loader.checkpoint_format != "MX" or not weights_preloaded:
+            return False
+
+        method = getattr(type(checkpoint_loader),
+                         'is_post_transform_weights_preloaded', None)
+        if method is None or not checkpoint_loader.is_post_transform_weights_preloaded(
+        ):
+            return False
+
+        if cls._is_mx_staged_receiver_allowlisted(model):
+            logger.info(
+                "MX receiver using staged post-load path for %s "
+                "(transform protocol v%d).",
+                type(model).__name__,
+                cls._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            )
+            return True
+
+        raise RuntimeError(
+            f"MX receiver got post-transform weights for {type(model).__name__}, "
+            "but the model is not allow-listed for staged post-load transform "
+            f"protocol v{cls._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION}. "
+            "Refusing to run the full post-load path on already-transformed "
+            "weights.")
+
+    @classmethod
+    def _is_mx_staged_receiver_allowlisted(
+            cls, model: DecoderModelForCausalLM) -> bool:
+        for model_type, protocol_version in cls._MX_STAGED_RECEIVER_ALLOWLIST:
+            if (protocol_version
+                    == cls._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION
+                    and isinstance(model, model_type)):
+                return True
+        return False
+
+    def _post_load_publish(self, checkpoint_loader: BaseCheckpointLoader,
+                           model: DecoderModelForCausalLM, *,
+                           checkpoint_dir: str,
+                           weights_preloaded: bool) -> None:
+        kwargs = {
+            "checkpoint_dir": checkpoint_dir,
+            "weights_preloaded": weights_preloaded,
+        }
+        if checkpoint_loader.checkpoint_format == "MX":
+            kwargs["source_identity"] = self._source_identity
+        checkpoint_loader.post_load_publish(model, **kwargs)
+
+    @staticmethod
+    def _mark_weights_transformed(model: DecoderModelForCausalLM) -> None:
+        """Mark modules with transform guards as already transformed.
+
+        Post-transform sharing paths skip ``transform_weights()`` because the
+        incoming bytes already use the final runtime layout. Preserve that
+        lifecycle state on modules that participate in the transform guard
+        protocol so a later orchestrator/refactor does not treat them as raw
+        checkpoint bytes.
+        """
+        for module in model.modules():
+            if hasattr(module, '_weights_transformed') and not getattr(
+                    module, '_weights_removed', False):
+                module._weights_transformed = True
 
     @staticmethod
     def _setup_aliases(model: DecoderModelForCausalLM) -> None:

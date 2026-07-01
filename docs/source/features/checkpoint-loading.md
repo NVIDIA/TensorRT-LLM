@@ -83,6 +83,13 @@ Currently, HF checkpoint loader is the primary built-in format, supporting:
 - **Configuration parser** - Parsing HF stored configuration information to TRTLLM `ModelConfig` object
 - **Weights Mapping** - Converting HF weights into TRTLLM compatible representation
 
+### ModelExpress (MX) Format
+
+The PyTorch backend can use ModelExpress (MX) for peer-to-peer weight transfer
+from a running TensorRT-LLM source instance before falling back to Hugging Face
+checkpoint loading. For installation, local server launch, and configuration
+details, see [ModelExpress (MX) Checkpoint Loading](./model-express.md).
+
 ## Using Checkpoint Loaders
 
 ### Basic Usage
