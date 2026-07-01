@@ -63,21 +63,25 @@ class DFlashSpecMetadata(SpecMetadata):
         self.is_spec_dec_dynamic_tree = False
 
         # Set up hidden state capture buffer
-        if self.layers_to_capture is not None and len(self.layers_to_capture) > 0:
+        if self.layers_to_capture is not None and len(
+                self.layers_to_capture) > 0:
             self.layers_to_capture = sorted(list(self.layers_to_capture))
             self.num_capture_layers = len(self.layers_to_capture)
             # O(1) lookups for is_layer_capture() and maybe_capture_hidden_states()
             self._capture_layer_set = frozenset(self.layers_to_capture)
-            self._layer_to_idx = {lid: i for i, lid in enumerate(self.layers_to_capture)}
+            self._layer_to_idx = {
+                lid: i
+                for i, lid in enumerate(self.layers_to_capture)
+            }
             self.captured_hidden_states = torch.empty(
-                (self.max_num_tokens, self.hidden_size * self.num_capture_layers),
+                (self.max_num_tokens,
+                 self.hidden_size * self.num_capture_layers),
                 dtype=self.dtype,
                 device="cuda",
             )
             logger.info(
                 f"DFlash: capturing hidden states from layers {self.layers_to_capture}, "
-                f"buffer shape {self.captured_hidden_states.shape}"
-            )
+                f"buffer shape {self.captured_hidden_states.shape}")
         else:
             self.num_capture_layers = 0
             self._capture_layer_set = frozenset()
@@ -87,10 +91,12 @@ class DFlashSpecMetadata(SpecMetadata):
         assert self.request_ids is not None
 
         num_seqs = len(self.request_ids)
-        batch_indices = torch.arange(
-            num_seqs, dtype=torch.int, device="cpu", pin_memory=prefer_pinned()
-        )
-        self.batch_indices_cuda[:num_seqs].copy_(batch_indices, non_blocking=True)
+        batch_indices = torch.arange(num_seqs,
+                                     dtype=torch.int,
+                                     device="cpu",
+                                     pin_memory=prefer_pinned())
+        self.batch_indices_cuda[:num_seqs].copy_(batch_indices,
+                                                 non_blocking=True)
 
         # Update slot mapping for DFlash context buffers
         worker = getattr(self, "_dflash_worker", None)
@@ -116,8 +122,10 @@ class DFlashSpecMetadata(SpecMetadata):
         return layer_id in self._capture_layer_set
 
     def maybe_capture_hidden_states(
-        self, layer_id: int, hidden_states: torch.Tensor, residual: Optional[torch.Tensor] = None
-    ) -> None:
+            self,
+            layer_id: int,
+            hidden_states: torch.Tensor,
+            residual: Optional[torch.Tensor] = None) -> None:
         """Capture hidden states from a target model layer into the buffer."""
         if self.captured_hidden_states is None:
             return
@@ -125,17 +133,17 @@ class DFlashSpecMetadata(SpecMetadata):
         if i is not None:
             num_tokens = hidden_states.shape[0]
             to_save = hidden_states + residual if residual is not None else hidden_states
-            self.captured_hidden_states[
-                :num_tokens, i * self.hidden_size : (i + 1) * self.hidden_size
-            ].copy_(to_save, non_blocking=True)
+            self.captured_hidden_states[:num_tokens,
+                                        i * self.hidden_size:(i + 1) *
+                                        self.hidden_size].copy_(
+                                            to_save, non_blocking=True)
 
     def get_hidden_states(self, num_tokens: int) -> Optional[torch.Tensor]:
         """Get captured hidden states (all layers concatenated)."""
         if self.captured_hidden_states is None:
             return None
-        return self.captured_hidden_states[
-            :num_tokens, : self.hidden_size * self.num_capture_layers
-        ]
+        return self.captured_hidden_states[:num_tokens, :self.hidden_size *
+                                           self.num_capture_layers]
 
 
 class DFlashWorker(SpecWorkerBase):
@@ -214,48 +222,50 @@ class DFlashWorker(SpecWorkerBase):
             self._max_ctx = config_max_ctx
         else:
             config = getattr(draft_model, "config", None)
-            max_pos = getattr(config, "max_position_embeddings", None) if config else None
+            max_pos = getattr(config, "max_position_embeddings",
+                              None) if config else None
             runtime_max = getattr(attn_metadata, "max_seq_len", None)
             candidates = [c for c in (runtime_max, max_pos) if c is not None]
             self._max_ctx = min(candidates) if candidates else 8192
 
-        dtype = draft_model.fc.weight.dtype if hasattr(draft_model, "fc") else torch.bfloat16
+        dtype = draft_model.fc.weight.dtype if hasattr(draft_model,
+                                                       "fc") else torch.bfloat16
 
         self._ctx_len = torch.zeros(max_batch, dtype=torch.long, device="cuda")
-        self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
+        self._batch_to_slot = torch.zeros(max_batch,
+                                          dtype=torch.long,
+                                          device="cuda")
 
         self._free_slots = deque(range(max_batch))
         self._req_to_slot = {}
 
-        self._resolved_block_size = getattr(draft_model, "block_size", None) or (
-            self.max_draft_len + 1
-        )
+        self._resolved_block_size = getattr(draft_model, "block_size",
+                                            None) or (self.max_draft_len + 1)
 
         # +block_size slack lets per-iter noise K/V scatter into the gathered
         # view and flash_attn read it in place.
         assert hasattr(draft_model, "_build_fused_kv_buffers"), (
-            "DFlash draft model must define _build_fused_kv_buffers."
-        )
+            "DFlash draft model must define _build_fused_kv_buffers.")
         draft_model._build_fused_kv_buffers()
         L = draft_model._num_attn_layers
         nkv = draft_model._num_kv_heads
         hd = draft_model._head_dim
-        kv_shape = (max_batch, L, self._max_ctx + self._resolved_block_size, nkv, hd)
+        kv_shape = (max_batch, L, self._max_ctx + self._resolved_block_size,
+                    nkv, hd)
         self._ctx_k_buf = torch.zeros(kv_shape, dtype=dtype, device="cuda")
         self._ctx_v_buf = torch.zeros(kv_shape, dtype=dtype, device="cuda")
         self._ctx_buf_inited = True
 
-        logger.info(
-            f"DFlash: allocated ctx buffers: max_batch={max_batch}, "
-            f"max_ctx={self._max_ctx}, dtype={dtype}"
-        )
+        logger.info(f"DFlash: allocated ctx buffers: max_batch={max_batch}, "
+                    f"max_ctx={self._max_ctx}, dtype={dtype}")
 
     def _prepare_attn_metadata_for_dflash(self, attn_metadata, spec_metadata):
         """Save attn_metadata fields that DFlash modifies during forward."""
         is_capturing = torch.cuda.is_current_stream_capturing()
 
         if spec_metadata.is_cuda_graph and not is_capturing:
-            attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda", "kv_lens_cuda")
+            attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda",
+                                               "kv_lens_cuda")
         else:
             attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
 
@@ -268,7 +278,8 @@ class DFlashWorker(SpecWorkerBase):
     ):
         """Adjust kv_lens_cuda so the draft model sees correct RoPE positions."""
         if hasattr(attn_metadata, "kv_lens_cuda"):
-            self._kv_rewind_amount = 1 - num_accepted_tokens[num_contexts:batch_size]
+            self._kv_rewind_amount = 1 - num_accepted_tokens[
+                num_contexts:batch_size]
             self._kv_rewind_nc = num_contexts
             self._kv_rewind_bs = batch_size
 
@@ -279,11 +290,13 @@ class DFlashWorker(SpecWorkerBase):
 
     def _apply_kv_rewind_after_draft(self, attn_metadata, spec_metadata):
         """Apply the deferred kv_lens rewind after the draft forward."""
-        is_warmup = spec_metadata.is_cuda_graph and not torch.cuda.is_current_stream_capturing()
+        is_warmup = spec_metadata.is_cuda_graph and not torch.cuda.is_current_stream_capturing(
+        )
         if is_warmup:
             return
 
-        if hasattr(self, "_kv_rewind_amount") and hasattr(attn_metadata, "kv_lens_cuda"):
+        if hasattr(self, "_kv_rewind_amount") and hasattr(
+                attn_metadata, "kv_lens_cuda"):
             nc = self._kv_rewind_nc
             bs = self._kv_rewind_bs
             attn_metadata.kv_lens_cuda[nc:bs] -= self._kv_rewind_amount
@@ -304,7 +317,8 @@ class DFlashWorker(SpecWorkerBase):
         and store them per-request so the draft model can use the full prompt
         as cross-attention context on subsequent gen steps.
         """
-        if not hasattr(draft_model, "fc") or not hasattr(draft_model, "hidden_norm"):
+        if not hasattr(draft_model, "fc") or not hasattr(
+                draft_model, "hidden_norm"):
             return
 
         num_ctx_tokens = attn_metadata.num_ctx_tokens
@@ -330,8 +344,8 @@ class DFlashWorker(SpecWorkerBase):
         for i in range(num_contexts):
             req_id = spec_metadata.request_ids[i]
             slen = int(attn_metadata._seq_lens[i])
-            chunk_proj = ctx_proj[offset : offset + slen].detach()
-            chunk_pos = position_ids[offset : offset + slen].long().detach()
+            chunk_proj = ctx_proj[offset:offset + slen].detach()
+            chunk_pos = position_ids[offset:offset + slen].long().detach()
 
             first_pos = chunk_pos[0].item() if slen > 0 else 0
 
@@ -342,7 +356,8 @@ class DFlashWorker(SpecWorkerBase):
                     self._ctx_len[old_slot] = 0
                     self._free_slots.append(old_slot)
                 if not self._free_slots:
-                    logger.warning("DFlash: no free slots, skipping context store")
+                    logger.warning(
+                        "DFlash: no free slots, skipping context store")
                     offset += slen
                     continue
                 slot = self._free_slots.popleft()
@@ -359,8 +374,7 @@ class DFlashWorker(SpecWorkerBase):
                 # Precompute post-norm/post-RoPE K,V for this prefill chunk
                 # so decode iters can read without re-projecting.
                 chunk_k, chunk_v = draft_model.precompute_context_kv(
-                    chunk_proj_cast, chunk_pos[:actual]
-                )
+                    chunk_proj_cast, chunk_pos[:actual])
                 # chunk_k/v: [actual, L, nkv, hd] → [L, actual, nkv, hd]
                 self._ctx_k_buf[slot, :, cur:end] = chunk_k.permute(1, 0, 2, 3)
                 self._ctx_v_buf[slot, :, cur:end] = chunk_v.permute(1, 0, 2, 3)
@@ -389,7 +403,8 @@ class DFlashWorker(SpecWorkerBase):
         spec_metadata._dflash_worker = self
 
         # Save context lengths before warmup to prevent accumulation
-        is_warmup = spec_metadata.is_cuda_graph and not torch.cuda.is_current_stream_capturing()
+        is_warmup = spec_metadata.is_cuda_graph and not torch.cuda.is_current_stream_capturing(
+        )
         if is_warmup:
             saved_ctx_len = self._ctx_len.clone()
 
@@ -405,11 +420,12 @@ class DFlashWorker(SpecWorkerBase):
         logits_for_accept = logits
 
         accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens_base(
-            logits_for_accept, draft_tokens, num_contexts, batch_size, spec_metadata
-        )
+            logits_for_accept, draft_tokens, num_contexts, batch_size,
+            spec_metadata)
 
         # Update GDN/Mamba recurrent states to the accepted token's state.
-        if num_gens > 0 and isinstance(attn_metadata.kv_cache_manager, MambaHybridCacheManager):
+        if num_gens > 0 and isinstance(attn_metadata.kv_cache_manager,
+                                       MambaHybridCacheManager):
             attn_metadata.kv_cache_manager.update_mamba_states(
                 attn_metadata=attn_metadata,
                 num_accepted_tokens=num_accepted_tokens,
@@ -417,9 +433,8 @@ class DFlashWorker(SpecWorkerBase):
             )
 
         self._prepare_attn_metadata_for_dflash(attn_metadata, spec_metadata)
-        self._prepare_kv_for_draft_forward(
-            attn_metadata, num_accepted_tokens, num_contexts, batch_size
-        )
+        self._prepare_kv_for_draft_forward(attn_metadata, num_accepted_tokens,
+                                           num_contexts, batch_size)
 
         # Collapse mrope [3, 1, N] to 1D by taking the first (temporal) dimension.
         # The draft model uses standard 1D RoPE, so only scalar positions are needed.
@@ -434,16 +449,18 @@ class DFlashWorker(SpecWorkerBase):
         # Capture prefill (context) hidden states for future gen steps.
         # This gives the draft model the full prompt context, not just gen tokens.
         if num_contexts > 0:
-            self._store_prefill_context(
-                draft_model, spec_metadata, attn_metadata, position_ids, total_target_tokens
-            )
+            self._store_prefill_context(draft_model, spec_metadata,
+                                        attn_metadata, position_ids,
+                                        total_target_tokens)
             # Rebuild batch_to_slot after prefill assigns new slots
             if self._ctx_buf_inited and spec_metadata.request_ids:
                 num_seqs = len(spec_metadata.request_ids)
-                mapping = [self._req_to_slot.get(rid, 0) for rid in spec_metadata.request_ids]
+                mapping = [
+                    self._req_to_slot.get(rid, 0)
+                    for rid in spec_metadata.request_ids
+                ]
                 self._batch_to_slot[:num_seqs].copy_(
-                    torch.tensor(mapping, dtype=torch.long, device="cuda")
-                )
+                    torch.tensor(mapping, dtype=torch.long, device="cuda"))
 
         inputs = self.prepare_1st_drafter_inputs(
             input_ids=input_ids,
@@ -457,10 +474,12 @@ class DFlashWorker(SpecWorkerBase):
             total_target_tokens=total_target_tokens,
         )
 
-        draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
+        draft_kv_cache_manager = self.get_draft_kv_cache_manager(
+            resource_manager)
 
         if num_gens > 0:
-            with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
+            with self.draft_kv_cache_context(attn_metadata,
+                                             draft_kv_cache_manager):
                 hidden_states_out = draft_model.dflash_forward(
                     noise_embedding=inputs["noise_embedding"],
                     query_positions=inputs["query_positions"],
@@ -473,21 +492,27 @@ class DFlashWorker(SpecWorkerBase):
                 # Gather K logits per gen request from mask positions (1..K).
                 # hidden_states_out is flat: [num_gens * block_size, hidden_dim]
                 block_size = self._resolved_block_size
-                request_bases = torch.arange(num_gens, dtype=torch.long, device="cuda") * block_size
+                request_bases = torch.arange(
+                    num_gens, dtype=torch.long, device="cuda") * block_size
                 offsets = torch.arange(K, dtype=torch.long, device="cuda")
                 # Masks are at positions 1..K in each request's block_size output
-                gen_gather_ids = (request_bases.unsqueeze(1) + 1 + offsets.unsqueeze(0)).flatten()
-                gen_gather_ids = gen_gather_ids.clamp(max=hidden_states_out.shape[0] - 1)
+                gen_gather_ids = (request_bases.unsqueeze(1) + 1 +
+                                  offsets.unsqueeze(0)).flatten()
+                gen_gather_ids = gen_gather_ids.clamp(
+                    max=hidden_states_out.shape[0] - 1)
 
                 gen_logits = draft_model.logits_processor(
-                    hidden_states_out[gen_gather_ids], draft_model.lm_head, attn_metadata, True
-                )
+                    hidden_states_out[gen_gather_ids], draft_model.lm_head,
+                    attn_metadata, True)
 
                 vocab_size = gen_logits.shape[-1]
-                gen_logits = gen_logits.reshape(num_gens, self.max_draft_len, vocab_size)
+                gen_logits = gen_logits.reshape(num_gens, self.max_draft_len,
+                                                vocab_size)
 
                 d2t = getattr(draft_model.model, "d2t", None)
-                gen_draft_tokens = torch.argmax(gen_logits, dim=-1, keepdim=False).long()
+                gen_draft_tokens = torch.argmax(gen_logits,
+                                                dim=-1,
+                                                keepdim=False).long()
 
                 if d2t is not None:
                     gen_draft_tokens = d2t[gen_draft_tokens] + gen_draft_tokens
@@ -495,13 +520,20 @@ class DFlashWorker(SpecWorkerBase):
                 gen_draft_tokens = gen_draft_tokens.type(torch.int32)
 
         else:
-            gen_draft_tokens = torch.empty((0, K), dtype=torch.int32, device="cuda")
+            gen_draft_tokens = torch.empty((0, K),
+                                           dtype=torch.int32,
+                                           device="cuda")
 
         if num_contexts > 0 and num_gens > 0:
-            ctx_draft_tokens = torch.zeros((num_contexts, K), dtype=torch.int32, device="cuda")
-            next_draft_tokens = torch.cat([ctx_draft_tokens, gen_draft_tokens], dim=0)
+            ctx_draft_tokens = torch.zeros((num_contexts, K),
+                                           dtype=torch.int32,
+                                           device="cuda")
+            next_draft_tokens = torch.cat([ctx_draft_tokens, gen_draft_tokens],
+                                          dim=0)
         elif num_contexts > 0:
-            next_draft_tokens = torch.zeros((num_contexts, K), dtype=torch.int32, device="cuda")
+            next_draft_tokens = torch.zeros((num_contexts, K),
+                                            dtype=torch.int32,
+                                            device="cuda")
         else:
             next_draft_tokens = gen_draft_tokens
 
@@ -555,10 +587,8 @@ class DFlashWorker(SpecWorkerBase):
 
         # Resolve mask_token_id and block_size once, cache for subsequent calls
         if self._resolved_mask_token_id is None:
-            if (
-                hasattr(self.spec_config, "mask_token_id")
-                and self.spec_config.mask_token_id is not None
-            ):
+            if (hasattr(self.spec_config, "mask_token_id")
+                    and self.spec_config.mask_token_id is not None):
                 self._resolved_mask_token_id = self.spec_config.mask_token_id
             elif hasattr(draft_model, "mask_token_id"):
                 self._resolved_mask_token_id = draft_model.mask_token_id
@@ -573,31 +603,30 @@ class DFlashWorker(SpecWorkerBase):
 
         # Get the embed_tokens layer from the draft model
         embed_tokens = draft_model.draft_model_full.model.embed_tokens
-        hidden_dim = (
-            spec_metadata.hidden_size if spec_metadata.hidden_size > 0 else hidden_states.shape[-1]
-        )
+        hidden_dim = (spec_metadata.hidden_size if spec_metadata.hidden_size > 0
+                      else hidden_states.shape[-1])
 
         if num_gens > 0:
-            gen_num_accepted = num_accepted_tokens[num_contexts : num_contexts + num_gens]
-            gen_accepted_tokens = accepted_tokens[num_contexts : num_contexts + num_gens, :]
+            gen_num_accepted = num_accepted_tokens[num_contexts:num_contexts +
+                                                   num_gens]
+            gen_accepted_tokens = accepted_tokens[num_contexts:num_contexts +
+                                                  num_gens, :]
 
             total_tokens_per_req = self._draft_tokens_per_req  # K+1
             K = self.max_draft_len
 
             # Get captured multi-layer hidden states from spec_metadata
             captured_hs = spec_metadata.get_hidden_states(total_target_tokens)
-            has_target_features = (
-                captured_hs is not None
-                and hasattr(draft_model, "fc")
-                and hasattr(draft_model, "hidden_norm")
-            )
+            has_target_features = (captured_hs is not None
+                                   and hasattr(draft_model, "fc")
+                                   and hasattr(draft_model, "hidden_norm"))
 
             # Use cached block_size (resolved once on first call)
             block_size = self._resolved_block_size
             query_tokens_per_req = block_size
 
             # Get slots for gen requests from pre-computed mapping
-            slots = self._batch_to_slot[num_contexts : num_contexts + num_gens]
+            slots = self._batch_to_slot[num_contexts:num_contexts + num_gens]
 
             K_plus_1 = K + 1
 
@@ -605,23 +634,30 @@ class DFlashWorker(SpecWorkerBase):
             bonus = gen_accepted_tokens.gather(1, bonus_idx).squeeze(1).long()
 
             ctx_len_gen = self._ctx_len[slots]
-            j_block = torch.arange(query_tokens_per_req, dtype=torch.long, device="cuda")
-            offsets_kp1 = torch.arange(K_plus_1, dtype=torch.long, device="cuda")
+            j_block = torch.arange(query_tokens_per_req,
+                                   dtype=torch.long,
+                                   device="cuda")
+            offsets_kp1 = torch.arange(K_plus_1,
+                                       dtype=torch.long,
+                                       device="cuda")
 
-            query_position_ids = (
-                ctx_len_gen.unsqueeze(1)
-                + gen_num_accepted.long().unsqueeze(1)
-                + j_block.unsqueeze(0)
-            )
-            ctx_position_ids = ctx_len_gen.unsqueeze(1) + offsets_kp1.unsqueeze(0)
+            query_position_ids = (ctx_len_gen.unsqueeze(1) +
+                                  gen_num_accepted.long().unsqueeze(1) +
+                                  j_block.unsqueeze(0))
+            ctx_position_ids = ctx_len_gen.unsqueeze(1) + offsets_kp1.unsqueeze(
+                0)
 
             # Go through embed_tokens.forward (NOT .weight[...]) so TP-sharded
             # vocabs mask out ranks that don't own the token id and all-reduce.
-            mask_tok = torch.full((1,), int(mask_token_id), dtype=torch.long, device="cuda")
+            mask_tok = torch.full((1, ),
+                                  int(mask_token_id),
+                                  dtype=torch.long,
+                                  device="cuda")
             combined_embed = embed_tokens(torch.cat([bonus, mask_tok], dim=0))
             embed_bonus = combined_embed[:num_gens]
             embed_mask = combined_embed[num_gens]
-            noise_embed_2d = embed_mask.expand(num_gens, query_tokens_per_req, -1).clone()
+            noise_embed_2d = embed_mask.expand(num_gens, query_tokens_per_req,
+                                               -1).clone()
             noise_embed_2d[:, 0, :] = embed_bonus
 
             # Accumulate new accepted features into context buffers
@@ -629,12 +665,16 @@ class DFlashWorker(SpecWorkerBase):
                 gen_start = attn_metadata.num_ctx_tokens
                 # Target now processes exactly K+1 tokens per gen req, so the
                 # captured slice is already the full set we need to project.
-                gen_hs = captured_hs[gen_start : gen_start + num_gens * total_tokens_per_req]
+                gen_hs = captured_hs[gen_start:gen_start +
+                                     num_gens * total_tokens_per_req]
                 gen_hs_to_project = gen_hs.reshape(-1, gen_hs.shape[-1])
-                projected_to_store = draft_model.project_target_hidden(gen_hs_to_project)
+                projected_to_store = draft_model.project_target_hidden(
+                    gen_hs_to_project)
                 gen_num_accepted_long = gen_num_accepted.long()
-                col_idx = self._ctx_len[slots].unsqueeze(1) + offsets_kp1.unsqueeze(0)
-                write_mask = offsets_kp1.unsqueeze(0) < gen_num_accepted_long.unsqueeze(1)
+                col_idx = self._ctx_len[slots].unsqueeze(
+                    1) + offsets_kp1.unsqueeze(0)
+                write_mask = offsets_kp1.unsqueeze(
+                    0) < gen_num_accepted_long.unsqueeze(1)
                 col_idx = col_idx.clamp(max=self._max_ctx - 1)
 
                 # Fixed-size writes for CUDA graph compatibility:
@@ -650,8 +690,7 @@ class DFlashWorker(SpecWorkerBase):
                 # Fast path: store the pre-projected/pre-RoPE'd K/V.
                 # dflash_forward reads these directly via cache_batch_idx.
                 k_new, v_new = draft_model.precompute_context_kv(
-                    proj_flat.to(self._ctx_k_buf.dtype), pos_flat
-                )
+                    proj_flat.to(self._ctx_k_buf.dtype), pos_flat)
                 mask_bc = mask_1d.view(-1, 1, 1, 1).to(k_new.dtype)
                 k_new.mul_(mask_bc)
                 v_new.mul_(mask_bc)
@@ -669,10 +708,10 @@ class DFlashWorker(SpecWorkerBase):
 
             # Update seq_lens for gen requests to K+1 (the number of tokens
             # the target forward actually processed).
-            attn_metadata._seq_lens_cuda[num_contexts : num_contexts + num_gens] = (
-                total_tokens_per_req
-            )
-            attn_metadata._seq_lens[num_contexts : num_contexts + num_gens] = total_tokens_per_req
+            attn_metadata._seq_lens_cuda[num_contexts:num_contexts +
+                                         num_gens] = (total_tokens_per_req)
+            attn_metadata._seq_lens[num_contexts:num_contexts +
+                                    num_gens] = total_tokens_per_req
         else:
             noise_embedding = hidden_states.new_empty(0, 0, hidden_dim)
             query_positions = torch.empty(0, 0, dtype=torch.long, device="cuda")
