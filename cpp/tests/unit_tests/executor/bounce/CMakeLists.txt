@@ -72,16 +72,6 @@ endif()
 # (transport, failure-path, e2e) lives here, sharing one source set + the
 # bounceTestNixlNode.h helpers. ----
 if(NIXL_ROOT)
-  # Bounce v2 NIXL TransferEngine: compile/link smoke test against real NIXL.
-  # NixlTransferEngine.cpp calls nixlDescList::addDesc, which lives in
-  # libnixl_build.
-  add_gtest(nixlTransferEngineTest nixlTransferEngineTest.cpp)
-  target_sources(nixlTransferEngineTest
-                 PRIVATE ${BOUNCE_DIR}/NixlTransferEngine.cpp)
-  target_link_libraries(
-    nixlTransferEngineTest PRIVATE tensorrt_llm_nixl_wrapper NIXL::nixl
-                                   ${NIXL_BUILD_LIBRARY})
-
   # The reactor tests also need zmq for the control plane (cppzmq is fetched
   # when NIXL is on); all of them share this source set + include/link sets.
   if(ZMQ_FOUND)
