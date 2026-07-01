@@ -37,10 +37,10 @@ Tested on Ubuntu 24.04.
 Before the pre-built Python wheel can be installed via `pip`, a few
 prerequisites must be put into place:
 
-Install CUDA Toolkit 13.1 following the [CUDA Installation Guide for Linux](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/)
+Install CUDA Toolkit 13.2 following the [CUDA Installation Guide for Linux](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/)
 and make sure `CUDA_HOME` environment variable is properly set.
 
-The `cuda-compat-13-1` package may be required depending on your system's NVIDIA GPU
+The `cuda-compat-13-2` package may be required depending on your system's NVIDIA GPU
 driver version. For additional information, refer to the [CUDA Forward Compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/forward-compatibility.html).
 
 ```bash
