@@ -20,6 +20,8 @@ backend — compose around a real backend (VANILLA/TRTLLM/FA4/CUTEDSL).
 
 """
 
+import logging
+import os
 from typing import TYPE_CHECKING, Callable, ClassVar, Dict, Optional
 
 import torch
@@ -33,6 +35,8 @@ from tensorrt_llm._torch.distributed import all_to_all_4d, all_to_all_5d
 
 from ...attention_backend.interface import PredefinedAttentionMask
 from .interface import AttentionBackend, AttentionTensorLayout
+
+logger = logging.getLogger(__name__)
 
 _flash_attn_combine_import_error = None
 try:
@@ -118,6 +122,22 @@ class UlyssesAttention(AttentionBackend):
         # side stream so V/Q/K pushes FIFO together without intermediate
         # barrier kernels.
         self._pending_barriers: int = 0
+
+        # Prefer UBX (caliper) > NCCL for all-to-all when available.
+        # UBX Lamport wins by 1.3–1.5x in CUDA graph mode (≥64KB payloads).
+        # Async path uses TRTLLM CE ops and is not eligible for UBX.
+        self._ub_a2a = None
+        if not async_ulysses and os.environ.get("TRTLLM_FORCE_NCCL_ALLREDUCE", "0") == "0":
+            from ..ubx_alltoall import UBXAllToAll, _ubx_available
+
+            device = None
+            if torch.cuda.is_available():
+                device = torch.device("cuda", torch.cuda.current_device())
+            if _ubx_available(process_group, device):
+                self._ub_a2a = UBXAllToAll(process_group)
+            else:
+                logger.info("UBX all-to-all unavailable on at least one rank; using NCCL")
+
         if async_ulysses:
             device = torch.cuda.current_device()
             if device not in UlyssesAttention._side_stream_by_device:
@@ -125,6 +145,38 @@ class UlyssesAttention(AttentionBackend):
             self._async_side_stream = UlyssesAttention._side_stream_by_device[device]
             if process_group is not None:
                 self._pg_boxed = process_group.boxed()
+
+    def _all_to_all_4d(
+        self,
+        tensor: torch.Tensor,
+        scatter_dim: int,
+        gather_dim: int,
+    ) -> torch.Tensor:
+        """Run the selected 4D all-to-all implementation."""
+        if self._ub_a2a is not None:
+            return self._ub_a2a(tensor, scatter_dim=scatter_dim, gather_dim=gather_dim)
+        return all_to_all_4d(
+            tensor,
+            scatter_dim=scatter_dim,
+            gather_dim=gather_dim,
+            process_group=self.process_group,
+        )
+
+    def _all_to_all_5d(
+        self,
+        tensor: torch.Tensor,
+        scatter_dim: int,
+        gather_dim: int,
+    ) -> torch.Tensor:
+        """Run the selected 5D all-to-all implementation."""
+        if self._ub_a2a is not None:
+            return self._ub_a2a(tensor, scatter_dim=scatter_dim, gather_dim=gather_dim)
+        return all_to_all_5d(
+            tensor,
+            scatter_dim=scatter_dim,
+            gather_dim=gather_dim,
+            process_group=self.process_group,
+        )
 
     def forward(
         self,
@@ -168,18 +220,14 @@ class UlyssesAttention(AttentionBackend):
 
         batch_size = q.shape[0]
         qkv = torch.stack([q, k, v], dim=2)
-        qkv = all_to_all_5d(qkv, scatter_dim=3, gather_dim=1, process_group=self.process_group)
+        qkv = self._all_to_all_5d(qkv, scatter_dim=3, gather_dim=1)
 
         B, seq_len, _, Hp, D = qkv.shape
 
         if gate_compress is not None:
-            gate_compress = all_to_all_4d(
-                gate_compress, scatter_dim=2, gather_dim=1, process_group=self.process_group
-            )
+            gate_compress = self._all_to_all_4d(gate_compress, scatter_dim=2, gather_dim=1)
         if gate_fine is not None:
-            gate_fine = all_to_all_4d(
-                gate_fine, scatter_dim=2, gather_dim=1, process_group=self.process_group
-            )
+            gate_fine = self._all_to_all_4d(gate_fine, scatter_dim=2, gather_dim=1)
 
         # Caller passed pre-A2A (sharded) seq_len; the inner backend
         # reshapes by it, so hand it the post-A2A length instead.
@@ -208,17 +256,13 @@ class UlyssesAttention(AttentionBackend):
         gate_fine = kwargs.pop("gate_fine", None)
 
         batch_size = q.shape[0]
-        q = all_to_all_4d(q, scatter_dim=2, gather_dim=1, process_group=self.process_group)
-        k = all_to_all_4d(k, scatter_dim=2, gather_dim=1, process_group=self.process_group)
-        v = all_to_all_4d(v, scatter_dim=2, gather_dim=1, process_group=self.process_group)
+        q = self._all_to_all_4d(q, scatter_dim=2, gather_dim=1)
+        k = self._all_to_all_4d(k, scatter_dim=2, gather_dim=1)
+        v = self._all_to_all_4d(v, scatter_dim=2, gather_dim=1)
         if gate_compress is not None:
-            gate_compress = all_to_all_4d(
-                gate_compress, scatter_dim=2, gather_dim=1, process_group=self.process_group
-            )
+            gate_compress = self._all_to_all_4d(gate_compress, scatter_dim=2, gather_dim=1)
         if gate_fine is not None:
-            gate_fine = all_to_all_4d(
-                gate_fine, scatter_dim=2, gather_dim=1, process_group=self.process_group
-            )
+            gate_fine = self._all_to_all_4d(gate_fine, scatter_dim=2, gather_dim=1)
 
         seq_len_full = q.shape[1]
         kv_seq_len_full = k.shape[1]
@@ -383,9 +427,7 @@ class UlyssesAttention(AttentionBackend):
                 )
             output = output.contiguous()
 
-        output = all_to_all_4d(
-            output, scatter_dim=1, gather_dim=2, process_group=self.process_group
-        )
+        output = self._all_to_all_4d(output, scatter_dim=1, gather_dim=2)
         return output
 
     @property
