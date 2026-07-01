@@ -2608,6 +2608,136 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk, seq_l
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
+def test_indexer_decode_mtp_topk_reuse():
+    """Verify mtp_index_share: step 0 stashes last-token Top-K per request,
+    step 1 (next_n=1, as set by eagle3) reuses the stash verbatim.
+    """
+    torch.manual_seed(7)
+    batch_size, step0_next_n = 2, 2
+    heads, head_dim, block_size = 32, 128, 64
+    max_model_len, index_topk, kv_len = 16384, 2048, 4096
+
+    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        batch_size=batch_size,
+        head_dim=head_dim,
+        tokens_per_block=block_size,
+        max_seq_len=max_model_len,
+        num_layers=1,
+        index_topk=index_topk,
+    )
+    indexer = create_indexer(sparse_attn_config, layer_idx=0)
+    indexer.mtp_index_share = True
+
+    request_ids = list(range(batch_size))
+    kv_lens = torch.full((batch_size,), kv_len, dtype=torch.int32)
+    cache_manager.add_dummy_requests(
+        request_ids=request_ids,
+        token_nums=(kv_lens + step0_next_n).tolist(),
+        is_gen=False,
+        prepare_resource=True,
+    )
+    ctx_k = torch.randn((kv_lens.sum().item(), head_dim), device="cuda", dtype=torch.bfloat16)
+    ctx_k_fp8, ctx_k_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(ctx_k)
+    meta_ctx = _create_mock_metadata(
+        request_ids,
+        batch_size,
+        batch_size,
+        0,
+        kv_lens.clone(),
+        kv_lens.clone(),
+        [0] * batch_size,
+        cache_manager,
+        kv_lens.sum().item(),
+        kv_lens.sum().item(),
+        max_draft_tokens=step0_next_n - 1,
+    )
+    Indexer.prepare(meta_ctx)
+    indexer._update_k_cache(ctx_k_fp8, ctx_k_scale, meta_ctx)
+
+    def make_inputs(n_tokens):
+        q = torch.randn((n_tokens, heads, head_dim), device="cuda", dtype=torch.bfloat16).to(
+            torch.float8_e4m3fn
+        )
+        k = torch.randn((n_tokens, head_dim), device="cuda", dtype=torch.bfloat16)
+        k_fp8, k_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(k)
+        w = torch.randn((n_tokens, heads), device="cuda", dtype=torch.float32)
+        h = torch.randn((n_tokens, 4096), device="cuda", dtype=torch.bfloat16)
+        return h, q, k_fp8, k_scale, w
+
+    # -- Step 0: gen with next_n = step0_next_n, compute + stash --
+    step0_tokens = batch_size * step0_next_n
+    meta0 = _create_mock_metadata(
+        request_ids,
+        batch_size,
+        0,
+        batch_size,
+        torch.full((batch_size,), step0_next_n, dtype=torch.int32),
+        (kv_lens + step0_next_n).clone(),
+        kv_lens.tolist(),
+        cache_manager,
+        0,
+        step0_tokens,
+        max_model_len,
+        max_draft_tokens=step0_next_n - 1,
+    )
+    Indexer.prepare(meta0)
+
+    # indexer_topk_decode requires caller-owned radix aux buffers when the
+    # dispatcher picks blocksPerRow > 1 (two-pass split-and-merge path).
+    # Small batches almost always trigger this path.
+    _radix_bp = 10
+    _radix_gen = batch_size * (1 + step0_next_n - 1)
+    meta0.radix_aux_indices = torch.zeros(
+        (_radix_gen, _radix_bp, index_topk), device="cuda", dtype=torch.int32
+    )
+    meta0.radix_aux_logits = torch.zeros(
+        (_radix_gen, _radix_bp, index_topk), device="cuda", dtype=torch.float32
+    )
+
+    meta0.in_mtp_draft_loop = True
+
+    h, q, k_fp8, k_scale, w = make_inputs(step0_tokens)
+    indexer._update_k_cache(k_fp8, k_scale, meta0)
+    try:
+        topk0 = indexer.sparse_attn_indexer(meta0, h, q, k_fp8, k_scale, w, use_custom_topk=True)
+    except Exception as e:
+        pytest.skip(f"Custom topk not available: {e}")
+
+    stash = meta0.shared_topk_indices
+    assert stash is not None, "Step 0 should stash shared_topk_indices"
+    assert stash.shape[0] == batch_size
+    assert torch.equal(stash, topk0[step0_next_n - 1 :: step0_next_n, :])
+
+    # -- Step 1: eagle3 sets seq_lens=1, all gen, next_n=1, reuse stash --
+    step1_tokens = batch_size
+    meta1 = _create_mock_metadata(
+        request_ids,
+        batch_size,
+        0,
+        batch_size,
+        torch.ones(batch_size, dtype=torch.int32),
+        (kv_lens + step0_next_n + 1).clone(),
+        (kv_lens + step0_next_n).tolist(),
+        cache_manager,
+        0,
+        step1_tokens,
+        max_model_len,
+        max_draft_tokens=step0_next_n - 1,
+    )
+    Indexer.prepare(meta1)
+    meta1.in_mtp_draft_loop = True
+    meta1.shared_topk_indices = stash
+    meta1.indexer_skip_topk = True
+
+    h1, q1, k1_fp8, k1_scale, w1 = make_inputs(step1_tokens)
+    indexer._update_k_cache(k1_fp8, k1_scale, meta1)
+    topk1 = indexer.sparse_attn_indexer(meta1, h1, q1, k1_fp8, k1_scale, w1, use_custom_topk=True)
+
+    assert torch.equal(topk1, stash[:batch_size, :]), "Step 1 should reuse the stash 1:1 (next_n=1)"
+
+
+@pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
+@skip_pre_hopper
 @pytest.mark.parametrize("batch_size", [4, 16])
 @pytest.mark.parametrize("index_topk", [2048])
 @pytest.mark.parametrize("chunk_size", [1024, 2048])
