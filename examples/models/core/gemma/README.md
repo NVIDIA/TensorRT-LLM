@@ -36,6 +36,7 @@
       - [Dynamo](#dynamo)
     - [Run Gemma 4](#run-gemma-4)
       - [Serve with `trtllm-serve` (OpenAI-compatible API)](#serve-with-trtllm-serve-openai-compatible-api)
+      - [MTP speculative decoding](#mtp-speculative-decoding)
       - [Accuracy evaluation with `trtllm-eval`](#accuracy-evaluation-with-trtllm-eval)
     - [Run Modelopt Quantization](#run-modelopt-quantization)
       - [Requirements](#requirements)
@@ -784,12 +785,12 @@ Dynamo supports TensorRT LLM as one of its inference engine. For details on how 
 
 Gemma 4 runs on the **PyTorch backend** — HuggingFace checkpoints are loaded directly. The legacy TensorRT engine flow (`convert_checkpoint.py` / `trtllm-build`) is not required and is not covered here.
 
-| HuggingFace checkpoint        | Modalities                       | Notes                                  |
-|-------------------------------|----------------------------------|----------------------------------------|
-| `google/gemma-4-E2B-it`       | text + image + video + audio     | Single-GPU friendly                    |
-| `google/gemma-4-E4B-it`       | text + image + video + audio     | Single-GPU friendly                    |
-| `google/gemma-4-26B-A4B-it`   | text + image + video (MoE)       | Multi-GPU recommended; no audio tower  |
-| `google/gemma-4-31B-it`       | text + image + video             | Multi-GPU recommended; no audio tower  |
+| HuggingFace checkpoint      | Modalities                   | Matching MTP assistant                         | Notes                                 |
+| --------------------------- | ---------------------------- | ---------------------------------------------- | ------------------------------------- |
+| `google/gemma-4-E2B-it`     | text + image + video + audio | `google/gemma-4-E2B-it-assistant`              | Single-GPU friendly                   |
+| `google/gemma-4-E4B-it`     | text + image + video + audio | `google/gemma-4-E4B-it-assistant`              | Single-GPU friendly                   |
+| `google/gemma-4-26B-A4B-it` | text + image + video (MoE)   | `google/gemma-4-26B-A4B-it-assistant`          | Multi-GPU recommended; no audio tower |
+| `google/gemma-4-31B-it`     | text + image + video         | `google/gemma-4-31B-it-assistant`              | Multi-GPU recommended; no audio tower |
 
 All four variants ship the vision tower (image + video). The audio tower is only present on `E2B` / `E4B`. The examples below use `google/gemma-4-E4B-it` (small, full multimodal) — swap the model name for the other variants and bump `--tp_size` (e.g. `4` or `8`) for the larger checkpoints.
 
@@ -822,6 +823,42 @@ curl http://localhost:8000/v1/chat/completions \
 ```
 
 The `/v1/chat/completions` endpoint applies the Gemma 4 chat template automatically.
+
+#### MTP speculative decoding
+
+Gemma 4 supports two-model Multi-Token Prediction (MTP) speculative decoding on the PyTorch backend. Each target checkpoint must use the matching assistant checkpoint listed above. Create a server configuration for the target/assistant pair:
+
+```bash
+cat > gemma4_mtp.yaml <<'EOF'
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 3
+  mtp_eagle_one_model: false
+  speculative_model: google/gemma-4-E4B-it-assistant
+kv_cache_config:
+  enable_block_reuse: false
+EOF
+
+trtllm-serve google/gemma-4-E4B-it \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --config gemma4_mtp.yaml
+```
+
+The assistant reads the target model's KV cache directly, so TensorRT-LLM does not allocate a second full-size GPU KV cache for it. The current implementation supports the `Gemma4AssistantForCausalLM` assistants for E2B, E4B, 26B-A4B, and 31B. Gemma 4 12B uses the `Gemma4UnifiedForConditionalGeneration` and `Gemma4UnifiedAssistantForCausalLM` architectures, which are not supported. This path uses two-model MTP, which is deprecated and scheduled for removal in release 1.4.
+
+For offline inference, pass both checkpoints to the advanced LLM API example:
+
+```bash
+python3 examples/llm-api/quickstart_advanced.py \
+    --model_dir google/gemma-4-E4B-it \
+    --draft_model_dir google/gemma-4-E4B-it-assistant \
+    --spec_decode_algo MTP \
+    --spec_decode_max_draft_len 3 \
+    --no-use_one_model \
+    --disable_kv_cache_reuse \
+    --apply_chat_template
+```
 
 #### Accuracy evaluation with `trtllm-eval`
 

@@ -19,6 +19,7 @@ The following is a table of supported models for the PyTorch backend:
 | `Gemma3ForCausalLM`                  | Gemma 3                            | `google/gemma-3-1b-it`                       |
 | `Gemma3nForConditionalGeneration` [^7]| Gemma 3n                           | `google/gemma-3n-E2B-it`, `google/gemma-3n-E4B-it` |
 | `Gemma4ForConditionalGeneration`     | Gemma 4                            | `google/gemma-4-E2B-it`, `google/gemma-4-E4B-it`, `google/gemma-4-26B-A4B-it` [^6], `google/gemma-4-31B-it` [^6] |
+| `Gemma4AssistantForCausalLM` [^14]   | Gemma 4 MTP assistant              | `google/gemma-4-E2B-it-assistant`, `google/gemma-4-E4B-it-assistant`, `google/gemma-4-26B-A4B-it-assistant`, `google/gemma-4-31B-it-assistant` |
 | `Glm4MoeForCausalLM`                 | GLM-4.5, GLM-4.6, GLM-4.7          | `THUDM/GLM-4-100B-A10B`                      |
 | `Glm4MoeLiteForCausalLM` [^5]        | GLM-4.7-Flash                      | `zai-org/GLM-4.7-Flash`                      |
 | `GlmMoeDsaForCausalLM`               | GLM-5                              | `zai-org/GLM-5`                              |
@@ -73,7 +74,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 | `GptOssForCausalLM`              | Yes               | Yes        | Yes                        | Yes                   | Yes             | No  | Yes              | No                | Yes    | Yes           | Yes              | Yes            | N/A                      | Yes                   | Yes             |
 | `Glm4MoeLiteForCausalLM` [^5]    | Yes               | Yes        | Untested                   | Untested              | Yes             | No  | No               | No                | No     | Yes           | Untested         | Untested       | N/A                      | Untested              | Untested        |
 | `NemotronHForCausalLM`           | Yes               | Yes        | Yes                        | Yes                   | Yes             | Yes | No               | No                | No     | Yes           | Yes              | Yes            | N/A                      | Untested              | Untested        |
-| `Gemma4ForConditionalGeneration` | Untested          | Yes        | Untested                   | No                    | Yes             | No  | No               | No                | No     | Yes           | Untested         | No             | Yes                      | Untested              | Untested        |
+| `Gemma4ForConditionalGeneration` | Untested          | Yes        | Untested                   | No                    | Yes             | Yes [^14] | No               | No                | No     | Yes           | Untested         | No             | Yes                      | Untested              | Untested        |
 | `Step3p7ForConditionalGeneration`| Yes               | Yes        | Yes                        | Untested              | Untested        | Yes | No               | No                | No     | Yes           | Untested         | Untested       | Yes                      | Untested              | Untested        |
 | `MiniMaxM3SparseForConditionalGeneration` [^12] | Yes               | Yes        | Yes                        | Untested              | Untested        | No  | No               | No                | No     | Yes           | Untested         | No             | N/A                      | Untested              | Untested        |
 
@@ -89,6 +90,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 [^11]: DeepSeek-V4 is only supported on Blackwell GPUs (`SM100+`). See the [DeepSeek-V4 example README](../../../examples/models/core/deepseek_v4/README.md) for setup and parallelism.
 [^12]: Supports text, image, and video inputs over the block-sparse attention path. The published MXFP8 checkpoint is dequantized on load so the runtime sees an effectively BF16 model. The text decoder is also usable standalone (text-only) via the `MiniMaxM3SparseForCausalLM` architecture. KV cache reuse and MTP are not supported on the sparse-attention path in this release.
 [^13]: The Cosmos 3 family also supports visual generation through the VisualGen API. See [Visual Generation Models](#visual-generation-models).
+[^14]: Gemma 4 uses two-model MTP on the PyTorch backend with a matching `Gemma4AssistantForCausalLM` checkpoint. See the [Gemma 4 example](../../../examples/models/core/gemma/README.md#mtp-speculative-decoding). Two-model MTP is deprecated and scheduled for removal in release 1.4. The Gemma 4 12B target and assistant use the `Gemma4UnifiedForConditionalGeneration` and `Gemma4UnifiedAssistantForCausalLM` architectures, which are not supported.
 
 # Multimodal Feature Support Matrix (PyTorch Backend)
 
