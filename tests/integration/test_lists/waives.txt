@@ -180,7 +180,6 @@ full:B300/disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_genpp2[
 full:B300/unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM" SKIP (https://nvbugs/6165866)
 full:DGX_B200/accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention_4gpus[target_sparsity_0.5-fp8kv=False] SKIP (https://nvbugs/6390307)
 full:DGX_B200/accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention_4gpus[target_sparsity_0.5-fp8kv=True] SKIP (https://nvbugs/6390307)
-full:DGX_B200/accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention_4gpus[target_sparsity_0.9-fp8kv=False] SKIP (https://nvbugs/6390307)
 full:DGX_B200/accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention_4gpus[target_sparsity_0.9-fp8kv=True] SKIP (https://nvbugs/6390307)
 full:DGX_B200/unittest/_torch/attention/sparse/deepseek_v4/test_compressor_kernel.py::test_prefill_corner_cases[overlap_large_head_dim] SKIP (https://nvbugs/6401925)
 full:DGX_B200/unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM" SKIP (https://nvbugs/6165866)
