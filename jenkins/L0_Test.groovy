@@ -3694,6 +3694,13 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                             error "Regular tests failed after rerun attempt"
                         }
                         rerunFailed = true
+                    } else if (generateTimeoutTestResultXml(pipeline, stageName)) {
+                        // Rerun passed but the first run had a timeout: mark this
+                        // stage FAILURE so "[${stageName}] Run Pytest" turns red,
+                        // not just the enclosing parent stage.
+                        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                            error "Some tests terminated unexpectedly, please check the test report."
+                        }
                     }
                 }
 
@@ -3725,8 +3732,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             error "Some tests still failed after rerun attempts, please check the test report."
         }
 
-        hasTimeoutTest = generateTimeoutTestResultXml(pipeline, stageName)
-        if (hasTimeoutTest) {
+        if (fileExists("${stageName}/results-timeout.xml") || generateTimeoutTestResultXml(pipeline, stageName)) {
             error "Some tests terminated unexpectedly, please check the test report."
         }
 
