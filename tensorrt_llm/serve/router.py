@@ -498,6 +498,43 @@ class Router(ABC):
                              success: bool = True):
         pass
 
+    # ---- coordinator-path API (used only when workers>1; see coordinator) ----
+    # Placement is split so a worker process can compute a small routing key
+    # locally and a coordinator process can select from it. Single-process
+    # serving never uses these -- it calls get_next_server directly.
+
+    def extract_routing_key(self, request: OpenAIRequest):
+        """Client-side: the minimal JSON-serializable value the coordinator
+        needs to place *request* for this router type. Default: nothing.
+
+        Overridden by content/session routers (Centralized -> block hashes;
+        Conversation -> conversation_id).
+        """
+        return None
+
+    async def select_by_key(
+            self, routing_key,
+            exclude_server: Optional[str] = None) -> tuple[str, dict, Optional[str]]:
+        """Coordinator-side: pick a server from a pre-extracted *routing_key*.
+
+        Returns ``(server, info, handle)`` where *handle* is an opaque token the
+        worker passes back to :meth:`finish_by_handle` to release any per-request
+        state (or ``None`` for stateless routers). Routers that support
+        coordinator placement override this.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support coordinator-mode placement "
+            "(workers>1). Use a centralized or conversation router, or run "
+            "single-process (WEB_CONCURRENCY=1).")
+
+    async def finish_by_handle(self, handle: Optional[str],
+                               success: bool = True) -> None:
+        """Coordinator-side: release state for a handle from select_by_key.
+
+        Default no-op (stateless routers). Stateful routers override.
+        """
+        del handle, success
+
     @property
     def session(self) -> aiohttp.ClientSession:
         if not self._session:
@@ -739,6 +776,20 @@ class RoundRobinRouter(Router):
                         f"No available servers after excluding {exclude_server}"
                     )
         return server, {"server_info": self._server_info.get(server, {})}
+
+    async def select_by_key(self, routing_key, exclude_server=None):
+        # round-robin ignores the (empty) routing key.
+        del routing_key
+        if not self._servers:
+            raise ValueError(f"No {self._server_role} servers available")
+        async with self._lock:
+            server = self._get_next_server()
+            if exclude_server and server == exclude_server:
+                server = self._get_next_server()
+                if server == exclude_server:
+                    raise ValueError(
+                        f"No available servers after excluding {exclude_server}")
+        return server, {"server_info": self._server_info.get(server, {})}, None
 
     async def finish_request(self,
                              request: OpenAIRequest,
@@ -1486,6 +1537,52 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
             logger.debug(f"ConversationRouter: FINISH server={server}, "
                          f"content_loads={loads}")
 
+    # -- coordinator-path: conversation_id-only sticky routing --
+    # The coordinator has no request object, so per-request load is tracked by an
+    # opaque handle instead of id(request). Only explicit conversation_id sessions
+    # are supported over the coordinator (no implicit content match).
+
+    def extract_routing_key(self, request: OpenAIRequest):
+        """The conversation_id (or None); no tokenization on the worker."""
+        return self._get_conversation_id(request)
+
+    async def select_by_key(self, routing_key, exclude_server=None):
+        conv_id = routing_key
+        self._validate_servers_available()
+        if not hasattr(self, "_coord_handle_server"):
+            self._coord_handle_server: dict[str, str] = {}
+            self._coord_handle_counter = 0
+        async with self._lock:
+            entry = self._session_table.get(conv_id) if conv_id else None
+            if (entry is not None and entry[0] in self._server_state
+                    and entry[0] != exclude_server):
+                server = entry[0]
+                self._session_table.move_to_end(conv_id)
+            else:
+                server = self._select_least_loaded(exclude_server)
+                if server is None:
+                    raise ValueError(
+                        f"No available servers after excluding {exclude_server}")
+                if conv_id:
+                    self._update_session(conv_id, server, [])
+            # Request-count load (no request object at the coordinator).
+            self._server_content_load[server] = (
+                self._server_content_load.get(server, 0) + 1)
+            self._coord_handle_counter += 1
+            handle = f"h{self._disagg_node_id}_{self._coord_handle_counter}"
+            self._coord_handle_server[handle] = server
+        return server, {"server_info": self._server_info.get(server, {})}, handle
+
+    async def finish_by_handle(self, handle, success=True):
+        del success
+        if not handle:
+            return
+        async with self._lock:
+            server = getattr(self, "_coord_handle_server", {}).pop(handle, None)
+            if server and server in self._server_content_load:
+                self._server_content_load[server] = max(
+                    0, self._server_content_load[server] - 1)
+
 
 class CentralizedKVCacheRouter(BlockHashMixin, Router):
     """Thin Router adaptor over the centralized KV-cache router core.
@@ -1582,8 +1679,8 @@ class CentralizedKVCacheRouter(BlockHashMixin, Router):
     ) -> tuple[str, int, Optional[int]]:
         """Placement from pre-computed block hashes (no tokenization).
 
-        The hashing is done by the caller (the orchestrator surface, or the
-        remote client via ``RemoteHttpRouter``), so this is the pure selection
+        The hashing is done by the caller (the orchestrator surface, or a
+        worker via ``extract_routing_key``), so this is the pure selection
         step: pick the best server for ``block_hashes`` among the currently
         prepared servers, round-robining as fallback. Returns
         ``(server, matched_blocks, dp_rank)``. Raises ``ValueError`` when no
@@ -1624,6 +1721,22 @@ class CentralizedKVCacheRouter(BlockHashMixin, Router):
         return server, {"matched_blocks": matched,
                         "token_lists": token_lists}
 
+    # -- coordinator-path: worker sends block hashes, coordinator selects --
+
+    def extract_routing_key(self, request: OpenAIRequest):
+        """Tokenize + block-hash locally; the flat hash list is the key."""
+        cache_salt_id = self._get_request_cache_salt_id(request)
+        _, block_hashes = self._tokenize_and_compute_block_hashes_with_salt(
+            request, cache_salt_id)
+        return [h for hl in block_hashes for h in hl]
+
+    async def select_by_key(self, routing_key, exclude_server=None):
+        block_hashes = routing_key or []
+        async with self._lock:
+            server, matched, dp_rank = self.select_by_block_hashes(
+                block_hashes, exclude_server)
+        return server, {"matched_blocks": matched, "dp_rank": dp_rank}, None
+
     def _address_worker_for(self, address: str) -> Optional[str]:
         """Resolve server address to worker_id (reverse lookup)."""
         return self._core.address_worker_for(address)
@@ -1648,50 +1761,46 @@ class CentralizedKVCacheRouter(BlockHashMixin, Router):
 CentralizedKvCacheAwareRouter = CentralizedKVCacheRouter
 
 
-class RemoteHttpRouter(BlockHashMixin, Router):
-    """Client adaptor that delegates placement to a remote HTTP router server.
+class CoordinatorHttpRouter(Router):
+    """Worker-side Router that delegates placement to the disagg coordinator.
 
-    Tokenization and block-hashing happen **here** (in the orchestrator), on the
-    ``asyncio.to_thread`` pool, exactly like the in-process centralized router.
-    Only the resulting flat block hashes are sent to the remote router server
-    (``POST /select``), which keeps the request body (potentially tens of
-    thousands of tokens) off the wire and keeps all tokenization compute local.
+    In the coordinator/worker deployment each worker holds one of these per role
+    instead of a real router. It wraps a *local* router of the configured type
+    (same config as the coordinator) used only for the client half of placement
+    (:meth:`Router.extract_routing_key`) and for server-pool / prepare operations
+    (delegated by attribute passthrough). ``get_next_server`` extracts the routing
+    key locally and POSTs it to the coordinator's ``/select``; ``finish_request``
+    POSTs the returned handle to ``/finish`` so stateful (conversation) load is
+    released where the state lives.
 
-    When the remote returns a ``dp_rank`` (per-rank choice from a centralized
-    KV-cache router), it is injected into the request's ``disaggregated_params``
-    like the in-process ``CentralizedKVCacheRouter``, so downstream disagg
-    handling is unchanged.
-
-    Args:
-        remote_url: Base URL of the router HTTP server (e.g.
-            ``"http://router-host:8080"``).
-        request_timeout_s: Per-request timeout for the remote call.
+    Because ``OpenAIClient`` already drives ``router.get_next_server`` /
+    ``router.finish_request``, the completions service needs no worker-specific
+    branching -- it just holds a ``CoordinatorHttpRouter`` where it would hold a
+    real router.
     """
 
-    def __init__(self,
-                 server_role: ServerRole = None,
-                 servers: List[str] = None,
-                 metadata_server_cfg: MetadataServerConfig = None,
-                 metadata_server: JsonDictionary = None,
-                 remote_url: str = None,
-                 tokens_per_block: Optional[int] = None,
-                 custom_tokenizer: Optional[str] = None,
-                 tokenizer_dir: Optional[str] = None,
-                 request_timeout_s: float = 5.0,
-                 **kwargs):
-        super().__init__(server_role, servers, metadata_server_cfg,
-                         metadata_server, **kwargs)
-        self._init_block_hashing(tokens_per_block, custom_tokenizer,
-                                 tokenizer_dir)
-        if not remote_url:
-            raise ValueError(
-                "RemoteHttpRouter requires 'remote_url' (the router HTTP "
-                "server base URL, e.g. http://router-host:8080)")
-        self._remote_url = remote_url.rstrip("/")
+    def __init__(self, coordinator_url: str, local_router: "Router", role: str,
+                 request_timeout_s: float = 5.0):
+        # Intentionally NOT calling Router.__init__: this is a thin proxy whose
+        # server-pool state lives on the wrapped local router (see __getattr__).
+        self._coordinator_url = coordinator_url.rstrip("/")
+        self._local = local_router
+        self._role = role  # "context" | "generation"
         self._request_timeout_s = request_timeout_s
-        logger.info(
-            f"RemoteHttpRouter: delegating placement to {self._remote_url} "
-            f"(hashing locally, tpb={self._tokens_per_block})")
+        self._session: Optional[aiohttp.ClientSession] = None
+        # id(request) -> handle, so finish_request releases coordinator state.
+        self._handles: dict[int, Optional[str]] = {}
+
+    def __getattr__(self, name):
+        # servers / prepare_servers / num_prepared_servers / start_server_monitoring
+        # / close / extract_routing_key / ... all delegate to the local router.
+        return getattr(self._local, name)
+
+    @property
+    def session(self) -> aiohttp.ClientSession:
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+        return self._session
 
     def _on_servers_updated(self, old_servers, new_servers):
         pass
@@ -1700,50 +1809,51 @@ class RemoteHttpRouter(BlockHashMixin, Router):
             self,
             request: OpenAIRequest,
             exclude_server: Optional[str] = None) -> tuple[str, dict]:
-        _rt_t0 = time.monotonic()
-        # Tokenize + block-hash locally (off the event loop); send only hashes.
-        cache_salt_id = self._get_request_cache_salt_id(request)
-        token_lists, block_hashes = await asyncio.to_thread(
-            self._tokenize_and_compute_block_hashes_with_salt, request,
-            cache_salt_id)
-        flat_hashes = [h for hl in block_hashes for h in hl]
-
-        payload = {"block_hashes": flat_hashes}
-        if exclude_server is not None:
-            payload["exclude_server"] = exclude_server
-
-        try:
-            async with self.session.post(
-                    f"{self._remote_url}/select",
-                    json=payload,
-                    timeout=self._request_timeout_s) as resp:
-                if resp.status != 200:
-                    detail = await resp.text()
-                    raise ValueError(
-                        f"remote router returned {resp.status}: {detail}")
-                body = await resp.json()
-        except ValueError:
-            raise
-        except Exception as e:  # noqa: BLE001
-            raise ValueError(
-                f"RemoteHttpRouter failed to reach {self._remote_url}: {e}"
-            ) from e
-
-        server = body["server"]
-        matched = body.get("matched_blocks", 0)
-        dp_rank = body.get("dp_rank")
+        routing_key = self._local.extract_routing_key(request)
+        payload = {"role": self._role, "routing_key": routing_key,
+                   "exclude_server": exclude_server}
+        async with self.session.post(
+                f"{self._coordinator_url}/select", json=payload,
+                timeout=self._request_timeout_s) as resp:
+            if resp.status != 200:
+                raise ValueError(
+                    f"coordinator /select returned {resp.status}: "
+                    f"{await resp.text()}")
+            body = await resp.json()
+        handle = body.get("handle")
+        if handle is not None:
+            self._handles[id(request)] = handle
+        info = body.get("info") or {}
+        dp_rank = info.get("dp_rank")
         if dp_rank is not None:
             _inject_route_hint(request, dp_rank)
-
-        self._record_route_timing(time.monotonic() - _rt_t0)
-        return server, {"matched_blocks": matched,
-                        "token_lists": token_lists}
+        return body["server"], info
 
     async def finish_request(self,
                              request: OpenAIRequest,
                              session: Optional[aiohttp.ClientSession] = None,
                              success: bool = True):
-        del request, session, success
+        del session
+        handle = self._handles.pop(id(request), None)
+        if handle is None:
+            return
+        try:
+            async with self.session.post(
+                    f"{self._coordinator_url}/finish",
+                    json={"role": self._role, "handle": handle,
+                          "success": success},
+                    timeout=self._request_timeout_s) as resp:
+                if resp.status != 200:
+                    logger.warning(
+                        f"coordinator /finish returned {resp.status}")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"CoordinatorHttpRouter finish failed: {e}")
+
+    async def close(self):
+        if self._session is not None:
+            await self._session.close()
+            self._session = None
+        await self._local.close()
 
 
 def create_router(
@@ -1762,8 +1872,6 @@ def create_router(
             - "round_robin": Creates a RoundRobinRouter (default)
             - "load_balancing": Creates a LoadBalancingRouter, which balances requests or tokens across instances
             - "kv_cache_aware": Creates a KvCacheAwareRouter, which balances requests across instances additionally based on KV cache hits
-            - "remote_http": Creates a RemoteHttpRouter that delegates placement to a
-              standalone router HTTP server; requires args={"remote_url": "http://host:port"}
         servers: List of server URLs
 
     Returns:
@@ -1778,9 +1886,6 @@ def create_router(
         "kv_cache_aware": KvCacheAwareRouter,
         "conversation": ConversationRouter,
         "centralized_kv_cache_aware": CentralizedKVCacheRouter,
-        # Client adaptor: delegate placement to a remote router HTTP server.
-        # Requires args={"remote_url": "http://router-host:8080"}.
-        "remote_http": RemoteHttpRouter,
     }
     router_type = router_config.type if router_config else "round_robin"
     router_class = router_map.get(router_type.lower())

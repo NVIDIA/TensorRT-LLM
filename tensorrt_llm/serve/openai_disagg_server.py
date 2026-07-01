@@ -40,6 +40,8 @@ from tensorrt_llm.serve.cluster_storage import (HttpClusterStorageServer,
                                                 create_cluster_storage)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
+from tensorrt_llm.serve.disagg_coordinator import (CoordinatorClient,
+                                                   DisaggCoordinatorService)
 from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
 from tensorrt_llm.serve.openai_protocol import (DisaggregatedParams,
@@ -92,12 +94,17 @@ class OpenAIDisaggServer:
                  req_timeout_secs: int = 180,
                  server_start_timeout_secs: int = 180,
                  metadata_server_cfg: Optional[MetadataServerConfig] = None,
-                 metrics_interval_secs: int = 0):
+                 metrics_interval_secs: int = 0,
+                 coordinator_url: Optional[str] = None):
         self._config = config
         self._req_timeout_secs = req_timeout_secs
         self._server_start_timeout_secs = server_start_timeout_secs
         self._metadata_server_cfg = metadata_server_cfg
         self._metrics_interval_secs = metrics_interval_secs
+        # When set, this is a forked worker: routing/readiness are delegated to
+        # the coordinator at coordinator_url (CoordinatorClient). Otherwise this
+        # process owns the routers + cluster state (DisaggCoordinatorService).
+        self._coordinator_url = coordinator_url
 
         self._ctx_servers, self._gen_servers = get_ctx_gen_server_addrs(config.server_configs)
         self._ctx_router = create_router(config.ctx_router_config, self._ctx_servers, metadata_server_cfg, create_metadata_server(metadata_server_cfg), self._sync_server_clock, disagg_node_id=config.node_id)
@@ -107,14 +114,23 @@ class OpenAIDisaggServer:
 
         self._disagg_cluster_storage = create_cluster_storage(config.disagg_cluster_config.cluster_uri, config.disagg_cluster_config.cluster_name) if config.disagg_cluster_config else None
 
+        if self._coordinator_url:
+            self._coordinator = CoordinatorClient(
+                self._coordinator_url, self._ctx_router, self._gen_router,
+                request_timeout_s=self._req_timeout_secs)
+        else:
+            self._coordinator = DisaggCoordinatorService(
+                self._config, self._ctx_router, self._gen_router,
+                self._create_client,
+                metadata_server=self._metadata_server,
+                metadata_config=self._metadata_server_cfg,
+                cluster_storage=self._disagg_cluster_storage,
+                server_start_timeout_secs=self._server_start_timeout_secs)
+
         self._service = OpenAIDisaggregatedService(
-            self._config, self._ctx_router, self._gen_router, self._create_client,
-            metadata_server=self._metadata_server,
-            metadata_config=self._metadata_server_cfg,
+            self._config, self._coordinator, self._create_client,
             req_timeout_secs=self._req_timeout_secs,
-            server_start_timeout_secs=self._server_start_timeout_secs,
-            perf_metrics_collector=self._perf_metrics_collector,
-            disagg_cluster_storage=self._disagg_cluster_storage)
+            perf_metrics_collector=self._perf_metrics_collector)
 
         try:
             otlp_cfg = config.otlp_config
@@ -129,9 +145,7 @@ class OpenAIDisaggServer:
 
         @asynccontextmanager
         async def lifespan(app) -> None:
-            # Prepare servers (sync server clock) when static ctx/gen server list is used
-            await self._ctx_router.prepare_servers()
-            await self._gen_router.prepare_servers()
+            # The cluster manager (via setup) owns server preparation + monitoring.
             await self._service.setup()
             yield
             await self._service.teardown()

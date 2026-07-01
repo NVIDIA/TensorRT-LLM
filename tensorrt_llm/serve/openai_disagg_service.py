@@ -20,17 +20,13 @@ from typing import Any, Callable, Dict, Optional
 
 from tensorrt_llm.llmapi.disagg_utils import (
     ConditionalDisaggConfig,
-    DisaggClusterConfig,
     DisaggServerConfig,
-    MetadataServerConfig,
     ServerRole,
     get_global_disagg_request_id,
 )
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.cluster_storage import ClusterStorage, WatchEventType
-from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterManager, WorkerInfo
-from tensorrt_llm.serve.metadata_server import JsonDictionary
 from tensorrt_llm.serve.openai_client import OpenAIClient
+from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinator
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
     CompletionRequest,
@@ -54,32 +50,25 @@ class OpenAIDisaggregatedService(OpenAIService):
     def __init__(
         self,
         config: DisaggServerConfig,
-        ctx_router: Router,
-        gen_router: Router,
+        coordinator: "DisaggCoordinator",
         client_factory: Callable[[Router, ServerRole], OpenAIClient],
-        metadata_server: Optional[JsonDictionary] = None,
-        metadata_config: Optional[MetadataServerConfig] = None,
         req_timeout_secs: int = 180,
-        server_start_timeout_secs: int = 180,
         perf_metrics_collector: Optional[DisaggPerfMetricsCollector] = None,
-        disagg_cluster_storage: Optional[ClusterStorage] = None,
-        health_check_interval_secs: int = 3,
     ):
         self._config = config
-        self._ctx_router = ctx_router
-        self._gen_router = gen_router
+        # The coordinator owns the ctx/gen routers, readiness, cluster info, and
+        # worker events. The service reads the routers off it and drives
+        # get_next_server / finish_request uniformly -- so serving is identical
+        # whether this process owns the routers (DisaggCoordinatorService) or
+        # delegates to a remote coordinator (CoordinatorClient via
+        # CoordinatorHttpRouter).
+        self._cluster = coordinator
         self._client_factory = client_factory
-        self._metadata_server = metadata_server
-        self._metadata_config = metadata_config
         self._req_timeout_secs = req_timeout_secs
-        self._server_start_timeout_secs = server_start_timeout_secs
         self._perf_metrics_collector = perf_metrics_collector
-        self._cluster_storage = disagg_cluster_storage
-        self._health_check_interval_secs = health_check_interval_secs
 
         self._ctx_client = None
         self._gen_client = None
-        self._disagg_cluster_manager = None
         self._schedule_style = DisaggScheduleStyle.CONTEXT_FIRST
 
         match self._config.schedule_style:
@@ -95,6 +84,16 @@ class OpenAIDisaggregatedService(OpenAIService):
                 logger.info(
                     f"Using context first disagg schedule style, schedule_style: {self._config.schedule_style}"
                 )
+
+    @property
+    def ctx_router(self) -> Router:
+        # The real router (single-process) or a CoordinatorHttpRouter (worker);
+        # either way get_next_server / finish_request behave the same here.
+        return self._cluster.ctx_router
+
+    @property
+    def gen_router(self) -> Router:
+        return self._cluster.gen_router
 
     async def openai_completion(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
@@ -139,7 +138,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         if need_ctx:
             ctx_req = self._get_ctx_request(request, disagg_request_id)
             # ctx generator is empty
-            ctx_server, _ = await self._ctx_router.get_next_server(
+            ctx_server, _ = await self.ctx_router.get_next_server(
                 ctx_req, exclude_server=gen_server
             )
             ctx_response = await self._ctx_client.send_request(
@@ -162,7 +161,7 @@ class OpenAIDisaggregatedService(OpenAIService):
                 gen_req.disaggregated_params = None
         if ctx_response is None or self._need_gen(ctx_response):
             if not gen_server:
-                gen_server, _ = await self._gen_router.get_next_server(
+                gen_server, _ = await self.gen_router.get_next_server(
                     gen_req, exclude_server=ctx_server
                 )
             gen_response = await self._gen_client.send_request(
@@ -385,10 +384,10 @@ class OpenAIDisaggregatedService(OpenAIService):
 
     async def _check_conditional_disagg(self, request: UCompletionRequest) -> bool:
         if self.conditional_disagg_config:
-            assert isinstance(self._gen_router, KvCacheAwareRouter)
+            assert isinstance(self.gen_router, KvCacheAwareRouter)
             # Query kv cache status and select a best gen_server.
             # The server is reserved for generation request
-            gen_server, info = await self._gen_router.get_next_server(request)
+            gen_server, info = await self.gen_router.get_next_server(request)
             match_length = sum(info["matches"])
             total_length = sum(len(token_list) for token_list in info["token_lists"])
             need_ctx_decision = (
@@ -422,109 +421,35 @@ class OpenAIDisaggregatedService(OpenAIService):
         return False
 
     async def cluster_info(self) -> Dict[str, Any]:
-        cluster_info = {"is_ready": await self.is_ready()}
-        if self._disagg_cluster_manager:
-            cluster_info.update(await self._disagg_cluster_manager.cluster_info())
-        return cluster_info
+        return await self._cluster.cluster_info()
 
     async def is_ready(self) -> bool:
-        if self._disagg_cluster_manager:
-            return await self._disagg_cluster_manager.is_ready_with_router(
-                self._ctx_router.num_prepared_servers,
-                self._gen_router.num_prepared_servers,
-            )
-        return True
-
-    @property
-    def disagg_cluster_config(self) -> Optional[DisaggClusterConfig]:
-        return self._config.disagg_cluster_config
+        return await self._cluster.is_ready()
 
     @property
     def conditional_disagg_config(self) -> Optional[ConditionalDisaggConfig]:
         return self._config.conditional_disagg_config
 
     async def setup(self) -> None:
+        # Build the request-sending clients from the coordinator's routers
+        # (worker-mode: get_next_server / finish_request on those routers proxy
+        # the coordinator). Share them with the coordinator service so it can run
+        # readiness checks against the same pool (no-op on CoordinatorClient).
         self._ctx_client = self._client_factory(
-            self._ctx_router, ServerRole.CONTEXT, self._config.max_retries
+            self.ctx_router, ServerRole.CONTEXT, self._config.max_retries
         )
         self._gen_client = self._client_factory(
-            self._gen_router, ServerRole.GENERATION, self._config.max_retries
+            self.gen_router, ServerRole.GENERATION,
+            self._config.max_retries
         )
-
-        if self.disagg_cluster_config and self._cluster_storage:
-            logger.info("Starting disagg cluster manager")
-            self._disagg_cluster_manager = DisaggClusterManager(
-                self.disagg_cluster_config, self._cluster_storage
-            )
-            await self._disagg_cluster_manager.start()
-            await self._disagg_cluster_manager.watch_workers(on_event=self._on_worker_event)
-            logger.info("Disagg cluster manager started")
-        else:
-            if self._metadata_server and self._metadata_config:
-                logger.info("Starting server monitoring via metadata service")
-                await self._ctx_router.start_server_monitoring(
-                    self._metadata_config.refresh_interval
-                )
-                await self._gen_router.start_server_monitoring(
-                    self._metadata_config.refresh_interval
-                )
-            await self._wait_for_all_servers_ready()
+        if hasattr(self._cluster, "set_clients"):
+            self._cluster.set_clients(self._ctx_client, self._gen_client)
+        await self._cluster.start()
 
     async def teardown(self) -> None:
         await self._ctx_client.shutdown()
         await self._gen_client.shutdown()
-
-        if self._disagg_cluster_manager:
-            await self._disagg_cluster_manager.stop()
-
-        if self._metadata_server:
-            await self._ctx_router.stop_server_monitoring()
-            await self._gen_router.stop_server_monitoring()
-
-    async def _wait_for_all_servers_ready(self) -> None:
-        # Skip context servers if TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is set
-        gen_only = os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1"
-
-        async def check_servers_ready():
-            elapsed_time = 0
-            interval = self._health_check_interval_secs
-            while elapsed_time < self._server_start_timeout_secs:
-                if gen_only:
-                    unready_ctx_servers = []
-                else:
-                    _, unready_ctx_servers = await self._ctx_client.check_ready()
-                _, unready_gen_servers = await self._gen_client.check_ready()
-                if len(unready_ctx_servers) == 0 and len(unready_gen_servers) == 0:
-                    if gen_only:
-                        logger.info("Generation servers are ready (context servers skipped)")
-                    else:
-                        logger.info("All servers are ready")
-                    return
-                logger.info(
-                    f"Waiting for servers, context: {unready_ctx_servers}, generation: {unready_gen_servers}"
-                )
-                await asyncio.sleep(interval)
-                elapsed_time += interval
-
-        try:
-            await asyncio.wait_for(check_servers_ready(), timeout=self._server_start_timeout_secs)
-        except asyncio.TimeoutError:
-            raise TimeoutError("Timeout waiting for context and generation servers to be ready")
-
-    async def _on_worker_event(self, worker_info: WorkerInfo, event_type: WatchEventType):
-        router_map = {ServerRole.CONTEXT: self._ctx_router, ServerRole.GENERATION: self._gen_router}
-        worker_addr = f"{worker_info.host}:{worker_info.port}"
-        try:
-            router = router_map[worker_info.role]
-            if event_type == WatchEventType.SET:
-                await router.add_server(worker_addr)
-            elif event_type == WatchEventType.DELETE:
-                await router.remove_server(worker_addr)
-            logger.info(f"Worker {event_type.name} event: {worker_info.worker_id}, {worker_addr}")
-        except KeyError:
-            logger.error(
-                f"Unknown worker role: {worker_info.role}, Worker {worker_info.worker_id} event: {event_type.name}"
-            )
+        await self._cluster.stop()
 
     async def _verify_ctx_response(self, ctx_response: UCompletionResponse) -> None:
         if ctx_response:
@@ -564,7 +489,8 @@ class OpenAIDisaggregatedService(OpenAIService):
         ctx_req, gen_req = None, None
         disagg_request_id = get_global_disagg_request_id(self._config.node_id)
         if need_ctx:
-            ctx_server, ctx_server_info = await self._ctx_router.get_next_server(request)
+            ctx_server, ctx_server_info = await self.ctx_router.get_next_server(
+                request)
             ctx_req = self._get_ctx_request(request, disagg_request_id)
         gen_req = self._get_gen_request(
             request,
