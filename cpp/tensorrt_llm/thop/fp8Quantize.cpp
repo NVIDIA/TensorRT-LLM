@@ -197,15 +197,12 @@ std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_packed_ue8m0(at::Tensor co
         reinterpret_cast<__nv_bfloat16 const*>(self.data_ptr()), static_cast<int>(m), static_cast<int>(n),
         static_cast<int>(m_aligned), stream);
 
-    // Wrap the [num_packed_sf_k, m_aligned] memory as a [m, num_packed_sf_k] strided tensor
+    // View the [num_packed_sf_k, m_aligned] memory as a [m, num_packed_sf_k] strided tensor
     // matching deep_gemm's get_mn_major_tma_aligned_packed_ue8m0_tensor return contract:
     //   shape  = (m, num_packed_sf_k)
     //   stride = (1, m_aligned)
-    at::Tensor packedScale = at::from_blob(
-        packedBuf.data_ptr(),
-        /* sizes   */ {m, num_packed_sf_k},
-        /* strides */ {1, m_aligned},
-        /* deleter */ [keep = packedBuf](void*) mutable {}, packedBuf.options());
+    // Keep packedBuf's allocator-owned storage so PyTorch can track its use on downstream CUDA streams.
+    at::Tensor packedScale = packedBuf.as_strided({m, num_packed_sf_k}, {1, m_aligned});
 
     return {valueE4M3.slice(0, 0, m), packedScale};
 }
