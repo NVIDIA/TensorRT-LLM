@@ -41,7 +41,7 @@ transforms:
     enabled: true
   multi_stream_moe:
     stage: compile
-    enabled: true
+    enabled: false
   fuse_mamba_a_log:
     stage: post_load_fusion
     enabled: true
