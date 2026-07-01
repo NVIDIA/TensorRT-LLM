@@ -1617,6 +1617,23 @@ class KvCacheCreator:
                                        if draft_kv_cache_config is not None else
                                        self_kv_cache_config)
 
+        # Gemma4 assistants read the target model's KV cache directly. They
+        # still need a small draft manager for request/slot bookkeeping, but
+        # must not reserve a second full-size GPU cache during final capacity
+        # allocation.
+        if (self._draft_model_engine is not None
+                and self._draft_model_engine.kv_cache_manager_key
+                == ResourceManagerType.KV_CACHE_MANAGER):
+            draft_build_kv_cache_config = copy.deepcopy(
+                draft_build_kv_cache_config)
+            draft_build_kv_cache_config.max_gpu_total_bytes = 0
+            draft_build_kv_cache_config.free_gpu_memory_fraction = None
+            draft_build_kv_cache_config.host_cache_size = 0
+            draft_build_kv_cache_config.max_tokens = max(
+                self._max_num_tokens,
+                self._max_seq_len * self._max_batch_size,
+            )
+
         # Two-model speculative decoding: draft model has separate engine
         if self._draft_model_engine is not None:
             if self._is_kv_cache_manager_v2:

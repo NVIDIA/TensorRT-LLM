@@ -28,10 +28,12 @@ import torch
 from transformers import Gemma4Config, Gemma4TextConfig
 
 from tensorrt_llm._torch.attention_backend import FlashInferAttention, FlashInferAttentionMetadata
+from tensorrt_llm._torch.configs.gemma4 import Gemma4AssistantConfig
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.gemma4_weight_mapper import Gemma4HfWeightMapper
 from tensorrt_llm._torch.models.modeling_gemma4 import (
+    Gemma4AssistantForCausalLM,
     Gemma4Attention,
     Gemma4DecoderLayer,
     Gemma4ForCausalLM,
@@ -104,10 +106,37 @@ GEMMA4_PLE_CONFIG = {
     "use_double_wide_mlp": True,
 }
 
+GEMMA4_ASSISTANT_CONFIG = {
+    "text_config": {
+        **GEMMA4_SMALL_CONFIG,
+        "num_hidden_layers": 4,
+        "layer_types": [
+            "sliding_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention",
+        ],
+        "num_kv_shared_layers": 4,
+    },
+    "backbone_hidden_size": 256,
+    "use_ordered_embeddings": True,
+    "num_centroids": 16,
+    "centroid_intermediate_top_k": 2,
+    "tie_word_embeddings": True,
+    "dtype": "bfloat16",
+}
+
 
 def _make_model_config(config_dict):
     """Build a ModelConfig from a raw config dict."""
     cfg = Gemma4TextConfig(**config_dict)
+    mapping = Mapping(world_size=1, tp_size=1, rank=0)
+    return ModelConfig(pretrained_config=cfg, mapping=mapping)
+
+
+def _make_assistant_model_config(config_dict=GEMMA4_ASSISTANT_CONFIG):
+    """Build a ModelConfig for a standalone Gemma4 assistant."""
+    cfg = Gemma4AssistantConfig(**deepcopy(config_dict))
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
     return ModelConfig(pretrained_config=cfg, mapping=mapping)
 
@@ -443,6 +472,44 @@ class TestGemma4HfWeightMapper(unittest.TestCase):
             r"model\.layers\.0\.experts\.0\.unknown_proj\.weight",
         ):
             Gemma4HfWeightMapper()._remap_moe_keys(weights)
+
+
+class TestGemma4Assistant(unittest.TestCase):
+    """Structural tests for standalone Gemma4 MTP assistants."""
+
+    def test_assistant_config_wraps_text_config(self):
+        config = Gemma4AssistantConfig(**deepcopy(GEMMA4_ASSISTANT_CONFIG))
+
+        self.assertEqual(config.model_type, "gemma4_assistant")
+        self.assertIsInstance(config.text_config, Gemma4TextConfig)
+        self.assertEqual(config.hidden_size, 256)
+        self.assertEqual(config.vocab_size, 1024)
+        self.assertEqual(config.num_hidden_layers, 4)
+
+    def test_assistant_uses_target_kv_sources(self):
+        assistant = Gemma4AssistantForCausalLM(_make_assistant_model_config())
+        self.assertEqual(len(assistant.model.layers), 4)
+        self.assertTrue(all(layer.is_kv_shared_layer for layer in assistant.model.layers))
+
+        target_config = {
+            **GEMMA4_SMALL_CONFIG,
+            "layer_types": [
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            "num_kv_shared_layers": 2,
+        }
+        target = Gemma4ForCausalLM(_make_model_config(target_config))
+        assistant.load_weights_from_target_model(target)
+
+        expected_source_layers = [2, 2, 2, 3]
+        actual_source_layers = [layer.self_attn.attn.layer_idx for layer in assistant.model.layers]
+        self.assertEqual(actual_source_layers, expected_source_layers)
+        self.assertIs(assistant._target_embed_tokens_ref(), target.model.embed_tokens)
 
 
 # ---------------------------------------------------------------------------

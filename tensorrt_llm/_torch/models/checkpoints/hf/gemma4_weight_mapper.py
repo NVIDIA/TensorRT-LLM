@@ -28,6 +28,7 @@ _LAYER_IDX_RE = re.compile(r"layers\.(\d+)$")
 @register_mapper("HF", "Gemma4ForCausalLM")
 @register_mapper("HF", "Gemma4ForConditionalGeneration")
 @register_mapper("HF", "Gemma4UnifiedForConditionalGeneration")
+@register_mapper("HF", "Gemma4AssistantForCausalLM")
 class Gemma4HfWeightMapper(HfWeightMapper):
     @property
     def _is_vlm(self) -> bool:
