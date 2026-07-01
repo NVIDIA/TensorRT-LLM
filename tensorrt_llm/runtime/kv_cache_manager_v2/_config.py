@@ -212,6 +212,20 @@ class KVCacheManagerConfig:
     If True, we will try to reuse tokens from partially matched blocks.
     """
 
+    enable_inclusive_host_cache: bool = False
+    """
+    If True, the host cache tier behaves inclusively: when a full, immutable committed page is
+    recalled host->GPU, its clean host copy is retained as a shadow rather than freed. A later
+    eviction of that page back to host reuses the shadow and skips the device->host (D2H) copy.
+
+    This eliminates redundant D2H rewrites of hot prefixes that repeatedly bounce GPU<->host under
+    high concurrency (a major source of TTFT/prefill latency). Shadows are reclaimed under host
+    memory pressure since the authoritative copy always lives on the GPU.
+
+    Only meaningful when at least one host/disk tier is configured; a no-op with a GPU-only tier.
+    Default is False, preserving the exclusive paging behavior.
+    """
+
     constraints: list[BatchDesc] = field(default_factory=list)
     """
     A list of step configurations that must always be supported.

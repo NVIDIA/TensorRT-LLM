@@ -2793,6 +2793,19 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "Whether KV cache manager v2 uses SWA scratch reuse during prefill.")
 
+    enable_inclusive_host_cache: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Make the host KV cache tier inclusive: when a full, immutable block is recalled from "
+        "host to GPU, its clean host copy is retained as a shadow instead of being freed. A later "
+        "eviction of that block back to host reuses the shadow and skips the device-to-host (D2H) "
+        "copy, eliminating redundant D2H rewrites of hot prefixes that repeatedly bounce GPU<->host "
+        "under high concurrency (a major source of TTFT/prefill latency). Shadows are reclaimed "
+        "under host memory pressure since the authoritative copy always lives on the GPU. Requires "
+        "a host cache tier (``host_cache_size`` > 0). Default False preserves exclusive paging. "
+        "Only used when using KV cache manager v2 (experimental).")
+
     def _to_pybind(self):
         config = _KvCacheConfig(
             enable_block_reuse=self.enable_block_reuse,

@@ -136,7 +136,7 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
     def get_block_ids(self, req, group_idx, lg):  # noqa: ARG002
         return np.fromiter(
             self._mgr.kv_cache_map[req.py_request_id].get_aggregated_page_indices(
-                group_idx, valid_only=True
+                group_idx, valid_only=False
             ),
             dtype=np.int64,
         )

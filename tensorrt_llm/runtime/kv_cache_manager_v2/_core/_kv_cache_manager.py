@@ -264,6 +264,7 @@ class KVCacheManager:
             constraints=config.constraints,
             initial_pool_ratio=config.initial_pool_ratio,
             event_manager=event_manager,
+            enable_inclusive_host_cache=config.enable_inclusive_host_cache,
         )
         self._living_kv_caches = set[rawref.ref[_KVCache]]()
         decay = 0.9999
