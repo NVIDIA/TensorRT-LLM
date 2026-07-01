@@ -62,7 +62,7 @@ from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
-from .hang_detector import HangDetector
+from .hang_detector import HangDetector, propagate_hard_kill
 from .kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache_stats import append_kv_cache_iteration_stats
 from .kv_cache_transceiver import KvCacheTransceiver
@@ -687,13 +687,17 @@ class PyExecutor:
         self.batch_wait_iters_count = 0
 
         def on_detected():
-            logger.error(
-                f"Hang detected on rank {self.global_rank} in PyExecutor.")
-            if self._event_loop_error is None:
-                self._event_loop_error = RuntimeError(
-                    f"Hang detected on rank {self.global_rank} in PyExecutor.")
-            self.shutdown_event.set()
-            self.is_shutdown = True
+            # The graceful shutdown path can itself deadlock on collectives
+            # while peer ranks stay blocked in NCCL holding their GPUs. Hard-kill
+            # this rank and propagate the kill outward instead.
+            # Guard the diagnostic log in try/finally so propagate_hard_kill()
+            # always runs even if logging itself raises.
+            try:
+                logger.error(
+                    f"Hang detected on rank {self.global_rank} in PyExecutor; "
+                    "hard-killing and propagating to peer ranks.")
+            finally:
+                propagate_hard_kill()
 
         self.hang_detector = HangDetector(timeout=hang_detection_timeout,
                                           on_detected=on_detected)

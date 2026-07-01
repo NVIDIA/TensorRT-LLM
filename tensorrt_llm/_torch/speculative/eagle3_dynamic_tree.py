@@ -842,7 +842,10 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             )
 
         num_accepted_tokens = self._apply_force_accepted_tokens(
-            num_accepted_tokens, num_contexts, self.max_draft_len
+            num_accepted_tokens,
+            num_contexts,
+            self.max_draft_len,
+            spec_metadata=spec_metadata,
         )
 
         return accepted_tokens, num_accepted_tokens
@@ -968,7 +971,10 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             )
 
         num_accepted_tokens = self._apply_force_accepted_tokens(
-            num_accepted_tokens, num_contexts, self.max_draft_len
+            num_accepted_tokens,
+            num_contexts,
+            self.max_draft_len,
+            spec_metadata=spec_metadata,
         )
 
         return accepted_tokens, num_accepted_tokens
