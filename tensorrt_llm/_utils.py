@@ -524,6 +524,11 @@ def get_free_port() -> int:
 
 
 def get_free_ports(num=1) -> List[int]:
+    # Ports are reserved by binding to port 0, reading the OS-assigned port,
+    # then closing the socket. This leaves a time-of-check-to-time-of-use
+    # window: another process can take the port before the caller rebinds it,
+    # surfacing as an "Address already in use" failure. Log the ports and PID
+    # so such races stay traceable.
     sockets = [
         socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(num)
     ]
@@ -532,6 +537,9 @@ def get_free_ports(num=1) -> List[int]:
     ports = [s.getsockname()[1] for s in sockets]
     for s in sockets:
         s.close()
+    logger.info(
+        f"[get_free_ports] pid={os.getpid()} reserved ports={ports} via "
+        f"bind-then-close (subject to TOCTOU reuse before rebinding)")
     return ports
 
 
