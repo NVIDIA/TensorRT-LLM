@@ -3518,7 +3518,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         sh "nproc && free -g && hostname"
         echoNodeAndGpuInfo(pipeline, stageName)
         sh "cat ${MODEL_CACHE_DIR}/README"
-        sh "nvidia-smi && nvidia-smi -q && nvidia-smi topo -m"
+        sh "nvidia-smi && nvidia-smi -q && nvidia-smi topo -m || echo nvidia-smi missing"
         sh "df -h"
 
         // setup HF_HOME to cache model and datasets
