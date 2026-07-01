@@ -31,14 +31,21 @@ exercises the whole chain including the coordinator HTTP hop.
 """
 
 import asyncio
+import os
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 
 import aiohttp
 import pytest
 import uvicorn
+import yaml
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
+
+from tensorrt_llm.logger import logger
 
 from tensorrt_llm.llmapi.disagg_utils import (CtxGenServerConfig,
                                               DisaggServerConfig, RouterConfig,
@@ -50,6 +57,10 @@ from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.router import create_router
 
 GEN_TEXT = "HELLO_FROM_GEN"
+
+# The uvicorn worker threads / CLI-output pump thread are background threads that
+# outlive a strict thread snapshot; exempt this module (same as the other e2e).
+pytestmark = pytest.mark.threadleak(enabled=False)
 
 
 @pytest.fixture(autouse=True)
@@ -275,6 +286,132 @@ def test_disagg_completion_e2e_through_coordinator():
     # The full ctx -> coordinator/select -> gen chain returned the gen text.
     assert body["choices"][0]["text"] == GEN_TEXT, body
     assert body["choices"][0]["finish_reason"] == "stop"
+
+
+def _write_config(path, ctx_url, gen_url, public_port):
+    """A disagg config YAML: round-robin ctx, conversation gen (delegated)."""
+    cfg = {
+        "hostname": "127.0.0.1",
+        "port": public_port,
+        "context_servers": {
+            "num_instances": 1,
+            "urls": [ctx_url],
+            "router": {"type": "round_robin"},
+        },
+        "generation_servers": {
+            "num_instances": 1,
+            "urls": [gen_url],
+            "router": {"type": "conversation"},
+        },
+    }
+    with open(path, "w") as f:
+        yaml.safe_dump(cfg, f)
+
+
+def test_disagg_completion_e2e_web_concurrency_4():
+    """WEB_CONCURRENCY=4 through the real CLI: `trtllm-serve disaggregated`
+    forks a coordinator (port-1) + a uvicorn fleet of 4 disagg servers on the
+    public port. Mock ctx/gen workers run in this test process; a real HTTP
+    completion round-trips through one of the four workers -> coordinator -> gen.
+    """
+    logger.set_level("info")  # trtllm logger defaults to "error"; show progress
+    WORKERS = 4
+    with _UvicornThread(_mock_worker_app("ctx"), _free_port()) as ctx, \
+         _UvicornThread(_mock_worker_app("gen"), _free_port()) as gen:
+        ctx_url = f"127.0.0.1:{ctx.port}"
+        gen_url = f"127.0.0.1:{gen.port}"
+        # port-1 is the coordinator, so pick a public port with room below it.
+        public_port = _free_port()
+        coord_port = public_port - 1
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = os.path.join(td, "disagg.yaml")
+            _write_config(cfg_path, ctx_url, gen_url, public_port)
+
+            env = dict(os.environ)
+            env["WEB_CONCURRENCY"] = str(WORKERS)
+            # Unbuffered so the child's launch logs stream out live (else stdout
+            # to a pipe is block-buffered and nothing shows until it exits).
+            env["PYTHONUNBUFFERED"] = "1"
+            # trtllm logger defaults to "error"; raise it so the coordinator/fleet
+            # launch logs are visible in the streamed [cli] output.
+            env["TLLM_LOG_LEVEL"] = "info"
+            # A plain HTTP fleet, never an MPI rank -- strip any launcher env so
+            # the CLI's own strip is not even relied upon.
+            for k in list(env):
+                if k.startswith(("SLURM_", "PMIX_", "PMI_", "OMPI_", "UCX_",
+                                 "I_MPI_", "HYDRA_", "MPI_")):
+                    env.pop(k)
+
+            logger.info(f"mock ctx={ctx_url} gen={gen_url}; launching "
+                        f"`trtllm-serve disaggregated` WEB_CONCURRENCY={WORKERS}, "
+                        f"public={public_port} coordinator={coord_port}")
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "tensorrt_llm.commands.serve",
+                 "disaggregated", "-c", cfg_path],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, start_new_session=True)
+
+            # Stream the CLI child's stdout live (prefixed) so coordinator/fleet
+            # startup is visible in real time instead of only at teardown.
+            def _pump():
+                for line in proc.stdout:
+                    logger.info(f"[cli] {line.rstrip()}")
+
+            pump = threading.Thread(target=_pump, daemon=True)
+            pump.start()
+            try:
+                base = f"http://127.0.0.1:{public_port}"
+                coord = f"http://127.0.0.1:{coord_port}"
+
+                async def _wait_all():
+                    # Both the coordinator (port-1) and the public fleet must be
+                    # up before the fleet reports ready (fleet is_ready proxies
+                    # the coordinator).
+                    logger.info("waiting for coordinator health...")
+                    assert await _wait_healthy(coord, 120.0), \
+                        "coordinator never became healthy"
+                    logger.info("coordinator healthy; waiting for fleet health...")
+                    assert await _wait_healthy(base, 120.0), \
+                        "disagg fleet never became healthy"
+                    logger.info("fleet healthy")
+
+                asyncio.run(_wait_all())
+
+                async def drive():
+                    # Fire several requests so the kernel spreads them across the
+                    # 4 uvicorn workers. Every one must round-trip to GEN_TEXT.
+                    async with aiohttp.ClientSession() as sess:
+                        texts = []
+                        for i in range(8):
+                            payload = {"model": "m", "prompt": f"hello-{i}",
+                                       "max_tokens": 8}
+                            headers = {"X-Session-ID": f"conv-{i}"}
+                            async with sess.post(f"{base}/v1/completions",
+                                                 json=payload, headers=headers,
+                                                 timeout=30) as r:
+                                assert r.status == 200, await r.text()
+                                texts.append((await r.json())["choices"][0]["text"])
+                            logger.info(f"request {i} -> {texts[-1]!r}")
+                        return texts
+
+                texts = asyncio.run(drive())
+                assert all(t == GEN_TEXT for t in texts), texts
+                logger.info(f"all {len(texts)} requests round-tripped to GEN_TEXT")
+            finally:
+                # Kill the whole process group: the CLI parent + coordinator +
+                # all uvicorn workers. Terminating only proc leaves the workers
+                # holding the stdout pipe open, so _pump never sees EOF.
+                logger.info("terminating CLI process group")
+                import signal
+                pgid = os.getpgid(proc.pid)
+                os.killpg(pgid, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    os.killpg(pgid, signal.SIGKILL)
+                    proc.wait()
+                pump.join(timeout=10)
 
 
 if __name__ == "__main__":

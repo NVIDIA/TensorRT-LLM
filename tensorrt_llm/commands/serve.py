@@ -1327,8 +1327,10 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
            "tensorrt_llm.commands.serve:create_worker_app"]
     logger.info(f"Launching disagg fleet: {web_concurrency} uvicorn workers on "
                 f"{public_host}:{public_port}, coordinator={coord_url}")
+    logger.info(f"Disagg fleet command: {' '.join(cmd)}")
     fleet = subprocess.Popen(cmd, env=child_env, stdout=sys.stdout,
                              stderr=sys.stderr, start_new_session=True)
+    logger.info(f"Disagg fleet launched (pid={fleet.pid})")
 
     def _cleanup():
         if fleet.poll() is None:
@@ -1343,6 +1345,8 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     # 2. Build + serve the coordinator in this process.
     md = create_metadata_server(metadata_server_cfg)
     ctx_servers, gen_servers = get_ctx_gen_server_addrs(disagg_cfg.server_configs)
+    logger.info(f"Coordinator building routers: ctx={ctx_servers} "
+                f"gen={gen_servers}")
     ctx_router = create_router(disagg_cfg.ctx_router_config, ctx_servers,
                                metadata_server_cfg, md,
                                disagg_node_id=disagg_cfg.node_id)
@@ -1358,7 +1362,8 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
         disagg_cfg, ctx_router, gen_router, _client_factory,
         metadata_server=md, metadata_config=metadata_server_cfg,
         server_start_timeout_secs=server_start_timeout)
-    logger.info(f"Coordinator serving on {public_host}:{coord_port}")
+    logger.info(f"Coordinator serving on {public_host}:{coord_port} "
+                f"(fleet on public port {public_port})")
     asyncio.run(CoordinatorServer(coordinator)(public_host, coord_port))
 
 
@@ -1375,6 +1380,14 @@ def create_worker_app():
     os.environ.pop("WEB_CONCURRENCY", None)
     if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
         gc.disable()
+
+    # All N fleet workers share one stdout; tag every trtllm log line from this
+    # worker with its PID so interleaved fleet output is attributable.
+    import logging as _logging
+    for _h in _logging.getLogger("TRT-LLM").handlers:
+        _h.setFormatter(_logging.Formatter(
+            fmt=f"[%(asctime)s] [fleet-worker pid={os.getpid()}] %(message)s",
+            datefmt="%m/%d/%Y-%H:%M:%S"))
 
     config_file = os.environ[DisaggWorkerEnvs.TLLM_DISAGG_CONFIG_FILE]
     coordinator_url = os.environ[DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_URL]
@@ -1395,8 +1408,7 @@ def create_worker_app():
         server_start_timeout_secs=server_start_timeout,
         metadata_server_cfg=metadata_server_cfg,
         coordinator_url=coordinator_url)
-    logger.info(f"Disagg server (pid={os.getpid()}) app built, coordinator="
-                f"{coordinator_url}")
+    logger.info(f"Disagg server app built, coordinator={coordinator_url}")
     return server.app
 
 
