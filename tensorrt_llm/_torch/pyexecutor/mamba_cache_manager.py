@@ -1348,18 +1348,13 @@ def _calc_context_stop_positions_for_request(
     mamba_state_cache_interval: Optional[int],
     save_last_snapshot: bool = False,
 ) -> list[int]:
-    stop_positions = calc_context_stop_positions(
+    del save_last_snapshot
+    return calc_context_stop_positions(
         request.prompt_len,
         tokens_per_block,
         mamba_state_cache_interval,
-        save_last_snapshot,
+        False,
     )
-    stable_token_count = getattr(request, "py_block_reuse_stable_token_count",
-                                 None)
-    if (save_last_snapshot and isinstance(stable_token_count, int)
-            and 0 < stable_token_count < request.prompt_len):
-        stop_positions.append(stable_token_count)
-    return sorted(set(stop_positions))
 
 
 @triton.jit

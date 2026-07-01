@@ -425,7 +425,7 @@ def test_v2_hybrid_prepare_expect_chunking_points_save_last_only():
     assert request.expect_chunking_points == [150]
 
 
-def test_v2_hybrid_prepare_expect_chunking_points_includes_stable_boundary():
+def test_v2_hybrid_prepare_expect_chunking_points_excludes_stable_boundary():
     mgr = object.__new__(KVCacheManagerV2MambaHybridCacheManager)
     mgr.kv_cache_config = KvCacheConfig(
         enable_block_reuse=True,
@@ -442,17 +442,17 @@ def test_v2_hybrid_prepare_expect_chunking_points_includes_stable_boundary():
 
     mgr.prepare_expect_chunking_points([request])
 
-    assert request.expect_chunking_points == [137, 150]
+    assert request.expect_chunking_points == [150]
 
 
-def test_v2_hybrid_stable_boundary_requires_save_last_snapshot():
+def test_v2_hybrid_stable_boundary_does_not_force_chunking():
     request = SimpleNamespace(
         prompt_len=150,
         py_block_reuse_stable_token_count=137,
     )
 
     assert _calc_context_stop_positions_for_request(
-        request, tokens_per_block=32, mamba_state_cache_interval=0, save_last_snapshot=False
+        request, tokens_per_block=32, mamba_state_cache_interval=0, save_last_snapshot=True
     ) == [150]
 
 

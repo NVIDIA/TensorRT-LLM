@@ -1,13 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
+
+import pytest
+
 from tensorrt_llm.inputs.utils import apply_chat_template
+from tensorrt_llm.llmapi import SchedulingParams
 from tensorrt_llm.llmapi.block_reuse import (
     BLOCK_REUSE_STABLE_TOKEN_COUNT_TRACE_KEY,
     get_block_reuse_stable_token_count,
     set_block_reuse_stable_token_count,
 )
-from tensorrt_llm.serve.openai_server import _count_text_prompt_tokens
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.serve.openai_server import OpenAIServer, _count_text_prompt_tokens
 
 
 class _FakeTokenizer:
@@ -46,6 +52,30 @@ class _FakeChatTokenizer:
 
     def encode(self, prompt: str, add_special_tokens: bool = False) -> list[int]:
         return list(range(len(prompt) + (1 if add_special_tokens else 0)))
+
+
+class _FakePromise:
+    def __init__(self) -> None:
+        self.awaited = False
+
+    async def aresult(self) -> None:
+        self.awaited = True
+
+
+class _FakeGenerator:
+    def __init__(self) -> None:
+        self.args = SimpleNamespace(
+            kv_cache_config=KvCacheConfig(
+                enable_block_reuse=True,
+                mamba_save_last_snapshot=True,
+            )
+        )
+        self.calls = []
+        self.promise = _FakePromise()
+
+    def generate_async(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.promise
 
 
 def test_block_reuse_stable_token_count_trace_header_round_trip() -> None:
@@ -110,3 +140,57 @@ def test_stable_token_count_handles_agentx_last_assistant_prompt() -> None:
     assert full_prompt.endswith("<|im_start|>assistant\n<think>\n")
     assert stable_token_count == len(stable_prompt)
     assert get_block_reuse_stable_token_count(trace_headers) == stable_token_count
+
+
+def test_stable_prompt_prewarm_requires_mamba_save_last_snapshot() -> None:
+    server = object.__new__(OpenAIServer)
+    server.generator = SimpleNamespace(
+        args=SimpleNamespace(
+            kv_cache_config=KvCacheConfig(
+                enable_block_reuse=True,
+                mamba_save_last_snapshot=True,
+            )
+        )
+    )
+
+    assert server._should_prewarm_block_reuse_stable_prompt("stable", "stable<gen>")
+    assert not server._should_prewarm_block_reuse_stable_prompt("stable", "stable")
+    assert not server._should_prewarm_block_reuse_stable_prompt("stable", "other")
+
+    server.generator.args.kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True,
+        mamba_save_last_snapshot=False,
+    )
+    assert not server._should_prewarm_block_reuse_stable_prompt("stable", "stable<gen>")
+
+
+@pytest.mark.asyncio
+async def test_stable_prompt_prewarm_generates_internal_stable_request() -> None:
+    server = object.__new__(OpenAIServer)
+    generator = _FakeGenerator()
+    server.generator = generator
+    trace_headers = {"traceparent": "parent"}
+    scheduling_params = SchedulingParams(agent_hierarchy=None)
+
+    await server._prewarm_block_reuse_stable_prompt(
+        "stable",
+        add_special_tokens=True,
+        lora_request="lora",
+        disaggregated_params=None,
+        cache_salt="salt",
+        trace_headers=trace_headers,
+        scheduling_params=scheduling_params,
+    )
+
+    assert generator.promise.awaited
+    assert len(generator.calls) == 1
+    call = generator.calls[0]
+    assert call["inputs"] == {"prompt": "stable"}
+    assert call["sampling_params"].max_tokens == 1
+    assert call["sampling_params"].temperature == 0
+    assert call["sampling_params"].add_special_tokens
+    assert call["streaming"] is False
+    assert call["lora_request"] == "lora"
+    assert call["cache_salt"] == "salt"
+    assert call["trace_headers"] is trace_headers
+    assert call["scheduling_params"] is scheduling_params
