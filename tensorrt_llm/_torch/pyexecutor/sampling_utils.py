@@ -44,18 +44,9 @@ from tensorrt_llm._torch.pyexecutor.sampling_backend.vanilla import (
     top_p_sampling_batch,
 )
 from tensorrt_llm._torch.pyexecutor.sampling_backend.vanilla import (
-    compute_probs as _torch_compute_probs,
-)
-from tensorrt_llm._torch.pyexecutor.sampling_backend.vanilla import (
     get_rejected_indices as get_rejected_indices,
 )
 from tensorrt_llm._torch.pyexecutor.sampling_backend.vanilla import greedy as _torch_greedy
-from tensorrt_llm._torch.pyexecutor.sampling_backend.vanilla import (
-    sample_from_logits as _torch_sample_from_logits,
-)
-from tensorrt_llm._torch.pyexecutor.sampling_backend.vanilla import (
-    sample_from_probs as _torch_sample_from_probs,
-)
 from tensorrt_llm._torch.pyexecutor.sampling_backend.vanilla import (
     sample_rejected as sample_rejected,
 )
@@ -877,12 +868,7 @@ class FlashInferGroupedStrategySampler(GroupedStrategySampler[_STRATEGY_KEY_TYPE
         return next_tokens, softmax, strategy_impl.get_temperature()
 
 
-# Public re-exports of the new kernel contract (torch backend as default).
-# Callers that need a specific backend should use resolve_sampling_backend
-# from sampling_backend.interface.
-compute_probs = _torch_compute_probs
-sample_from_probs = _torch_sample_from_probs
-sample_from_logits = _torch_sample_from_logits
+# Re-export the torch greedy op (used by drafting_loops and speculative/interface).
 greedy = _torch_greedy
 
 # ---------------------------------------------------------------------------
