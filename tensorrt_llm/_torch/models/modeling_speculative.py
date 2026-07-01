@@ -1451,7 +1451,7 @@ class MTPForCausalLM(nn.Module):
             case "nemotron_h" | "nemotron_h_puzzle":
                 from .modeling_nemotron_h import NemotronHMTP
                 mtp_layer = NemotronHMTP
-            case "qwen3_next" | "qwen3_5_text" | "qwen3_5_moe_text":
+            case "qwen3_next" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text":
                 from .modeling_qwen3_next import Qwen3NextMTP
                 mtp_layer = Qwen3NextMTP
             case "step3p7" | "step3p5":
@@ -1516,7 +1516,9 @@ class MTPDraftModel(nn.Module):
                                      layer_idx,
                                      aux_stream_dict,
                                      is_separate_draft_engine=False)
-        elif model_type == "qwen3_next":
+        elif model_type in [
+                "qwen3_next", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"
+        ]:
             from .modeling_qwen3_next import Qwen3NextMTP
             mtp_layer = Qwen3NextMTP(model_config, layer_idx, aux_stream_dict)
         elif model_type == "deepseek_v4":

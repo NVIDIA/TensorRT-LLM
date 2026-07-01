@@ -36,6 +36,7 @@ from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor.config_utils import \
     get_qwen3_hybrid_layer_types
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.quantization import QuantAlgo
 
 from ...logger import logger
 from ..attention_backend import AttentionMetadata
@@ -146,6 +147,24 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         weight_loading_mode = (MoEWeightLoadingMode.FUSED_GATE_UP_PROJ
                                if config.model_type == "qwen3_5_moe_text" else
                                MoEWeightLoadingMode.VANILLA)
+        # For MIXED_PRECISION checkpoints (e.g. Qwen3.6-35B-A3B-NVFP4) the
+        # global quant_algo is MIXED_PRECISION but each MoE layer has a
+        # per-layer NVFP4 quant config.  Pass it explicitly so create_moe()
+        # selects the right MoE kernel (NVFP4-aware) instead of falling back
+        # to the default CutlassFusedMoE which cannot load NVFP4 weights.
+        moe_override_quant_config = None
+        if (model_config.quant_config_dict is not None
+                and model_config.quant_config.quant_algo
+                == QuantAlgo.MIXED_PRECISION and layer_idx is not None):
+            candidate_keys = [
+                f"model.language_model.layers.{layer_idx}.mlp.experts",
+                f"model.layers.{layer_idx}.mlp.experts",
+            ]
+            for key in candidate_keys:
+                if key in model_config.quant_config_dict:
+                    moe_override_quant_config = model_config.quant_config_dict[
+                        key]
+                    break
         self.experts = create_moe(
             num_experts=self.num_experts,
             routing_method=self.gate.routing_method,
@@ -157,6 +176,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             model_config=model_config,
             layer_idx=layer_idx,
             weight_loading_mode=weight_loading_mode,
+            override_quant_config=moe_override_quant_config,
         )
 
         self.shared_expert = GatedMLP(

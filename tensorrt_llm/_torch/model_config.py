@@ -435,7 +435,39 @@ class ModelConfig(Generic[TConfig]):
                     config.has_zero_point = layer_cfg['has_zero_point']
                 if 'pre_quant_scale' in layer_cfg:
                     config.pre_quant_scale = layer_cfg['pre_quant_scale']
+                # W4A16_NVFP4 is a modelopt label for full NVFP4 (W4A4).
+                # Normalize to NVFP4 for kernel dispatch so the CUTLASS
+                # NVFP4 MoE path is selected (the label distinction is
+                # only meaningful at the checkpoint-loading boundary).
+                if config.quant_algo == QuantAlgo.W4A16_NVFP4:
+                    config.quant_algo = QuantAlgo.NVFP4
                 mixed_quant_configs[layer] = config
+            # Normalize "model.language_model." prefix to "model." so that
+            # quant_config_dict keys match TRT-LLM module names produced by
+            # named_modules() (which don't include the "language_model" level).
+            _LM_PREFIX = "model.language_model."
+            _MODEL_PREFIX = "model."
+            mixed_quant_configs = {
+                (_MODEL_PREFIX + k[len(_LM_PREFIX):] if k.startswith(_LM_PREFIX) else k):
+                v
+                for k, v in mixed_quant_configs.items()
+            }
+            # LMHead bypasses Linear.create_weights (manual Parameter),
+            # so NVFP4 weight scales are never allocated there.  Move
+            # lm_head to exclude_modules so it loads as BF16.
+            lm_head_keys = [
+                key for key in mixed_quant_configs
+                if key == "lm_head" or key.endswith(".lm_head")
+            ]
+            if lm_head_keys:
+                if quant_config.exclude_modules is None:
+                    quant_config.exclude_modules = []
+                quant_config.exclude_modules = list(
+                    dict.fromkeys(
+                        list(quant_config.exclude_modules) + ["lm_head"] +
+                        lm_head_keys))
+                for key in lm_head_keys:
+                    del mixed_quant_configs[key]
             layer_quant_config = mixed_quant_configs
         elif quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
             if quant_config.group_size is None:

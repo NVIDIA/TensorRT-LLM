@@ -475,8 +475,24 @@ class _Qwen35ConfigCompat:
             has_mrope = ("mrope_section" in rope_scaling
                          or rope_scaling.get("mrope_interleaved", False))
             if has_mrope:
-                rope_scaling["type"] = "mrope"
+                # Qwen3.5 VLM checkpoints embed mrope_section / mrope_interleaved
+                # in rope_parameters for use with the vision path.  The text
+                # executor never constructs 3D position_ids (no vision encoder),
+                # so leaving type="mrope" causes MRotaryEmbedding to silently
+                # produce wrong cos/sin from 2D position_ids.  Strip the mRoPE
+                # fields unconditionally here; partial_rotary_factor (already
+                # extracted above) carries the fractional-RoPE scaling needed
+                # for the linear-attention layers.
+                rope_scaling.pop("mrope_section", None)
+                rope_scaling.pop("mrope_interleaved", None)
                 rope_scaling.pop("rope_type", None)
+                rope_scaling.pop("type", None)
+                # After stripping the mRoPE fields, what remains (if anything)
+                # is standard scaling config.  If nothing meaningful is left,
+                # clear rope_scaling to avoid triggering unexpected code paths.
+                if rope_scaling:
+                    if "type" not in rope_scaling and "rope_type" not in rope_scaling:
+                        rope_scaling = {}
             elif "type" not in rope_scaling and "rope_type" in rope_scaling:
                 rope_type = rope_scaling.pop("rope_type")
                 # "default" means standard RoPE (no scaling) — don't set
@@ -487,6 +503,10 @@ class _Qwen35ConfigCompat:
                     rope_scaling["type"] = rope_type
             if rope_scaling:
                 text_config["rope_scaling"] = rope_scaling
+            else:
+                # Clearing rope_scaling locally is not enough — the original key
+                # in text_config still points at the pre-strip dict. Remove it.
+                text_config.pop("rope_scaling", None)
         return text_config
 
 
