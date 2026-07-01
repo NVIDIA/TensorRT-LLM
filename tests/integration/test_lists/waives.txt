@@ -181,6 +181,8 @@ full:B300/unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "
 full:DGX_B200/unittest/_torch/attention/sparse/deepseek_v4/test_compressor_kernel.py::test_prefill_corner_cases[overlap_large_head_dim] SKIP (https://nvbugs/6401925)
 full:DGX_B200/unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM" SKIP (https://nvbugs/6165866)
 full:DGX_B200/unittest/auto_deploy/multigpu/custom_ops/test_ad_dist_strategies.py::test_allreduce_strategies[MIN_LATENCY] SKIP (https://nvbugs/6403920)
+full:DGX_B200/unittest/auto_deploy/multigpu/custom_ops/test_ad_dist_strategies.py::test_allreduce_strategies[ONESHOT] SKIP (https://nvbugs/6403920)
+full:DGX_B200/unittest/auto_deploy/multigpu/custom_ops/test_ad_dist_strategies.py::test_allreduce_strategies[TWOSHOT] SKIP (https://nvbugs/6403920)
 full:DGX_H100/unittest/_torch/attention/test_attention_backends.py::test_attention_backend[qwen2_0_5b_gqa_hd64-ctx-bf16-HND-p32-v1] SKIP (https://nvbugs/6403909)
 full:GB200/accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy SKIP (https://nvbugs/6276923)
 full:GB200/accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_contention_opt SKIP (https://nvbugs/6276923)
