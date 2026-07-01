@@ -503,30 +503,6 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             device="cpu",
         )
         staging_capacity = self.max_batch_size * self.max_beam_width
-        self._host_attention_op_block_offsets_staging = torch.full(
-            (
-                self.num_attention_op_pools,
-                staging_capacity,
-                2,
-                self.max_blocks_per_seq,
-            ),
-            BAD_PAGE_INDEX,
-            dtype=torch.int32,
-            pin_memory=prefer_pinned(),
-            device="cpu",
-        )
-        self._host_per_layer_block_tables_staging = torch.full(
-            (
-                self.num_local_layers,
-                len(DEEPSEEK_V4_SLIDING_ATTENTION),
-                staging_capacity,
-                self.max_blocks_per_seq,
-            ),
-            BAD_PAGE_INDEX,
-            dtype=torch.int32,
-            pin_memory=prefer_pinned(),
-            device="cpu",
-        )
         self._host_compress_block_tables_staging = {
             compress_ratio: torch.full(
                 (staging_capacity, self.max_blocks_per_seq),
@@ -566,30 +542,16 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             dtype=torch.int32,
             device="cpu",
         )
-        # pool id of SWA attention
-        first_layer = self.pp_layers[0]
-        swa_layer_id = self._layer_attn_to_layer_id[first_layer, DeepseekV4AttentionType.SWA]
-        self._swa_pool_id = self.layer_to_pool_mapping_dict[swa_layer_id]
-        swa_converter = self.impl.get_page_index_converter(
-            swa_layer_id, DeepseekV4AttentionType.SWA.role
-        )
-        self._swa_scale = int(swa_converter.scale)
-        # last CSA layer (i.e. last layer with compress ratio 4)
-        self._csa_layer_idx = None
         self._csa_compress_pool_id = None
         self._csa_compress_scale = None
         self._csa_indexer_compress_pool_id = None
         self._csa_indexer_compress_scale = None
-        # last HCA layer (i.e. last layer with compress ratio 128)
-        self._hca_layer_idx = None
         self._hca_compress_pool_id = None
         self._hca_compress_scale = None
 
-        sliding_attn_pool_ids = set()
         for layer_idx in self.pp_layers:
             compress_ratio = self._compress_ratios[layer_idx]
             if compress_ratio == 4:
-                self._csa_layer_idx = layer_idx
                 compress_layer_id = self._layer_attn_to_layer_id[
                     layer_idx, DeepseekV4AttentionType.COMPRESS
                 ]
@@ -609,7 +571,6 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 ]
                 self._csa_indexer_compress_scale = int(indexer_converter.scale)
             elif compress_ratio == 128:
-                self._hca_layer_idx = layer_idx
                 compress_layer_id = self._layer_attn_to_layer_id[
                     layer_idx, DeepseekV4AttentionType.COMPRESS
                 ]
@@ -626,7 +587,6 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 layer_id = self._layer_attn_to_layer_id[layer_idx, attn_type]
                 pool_id = self.layer_to_pool_mapping_dict[layer_id]
                 converter = self.impl.get_page_index_converter(layer_id, attn_type.role)
-                sliding_attn_pool_ids.add(pool_id)
                 self._layer_attn_pool_ids[local_layer_idx, attn_type.value] = pool_id
                 self._layer_attn_scales[local_layer_idx, attn_type.value] = converter.scale
                 self._layer_offsets[local_layer_idx, attn_type.value] = converter.layer_offset
