@@ -122,6 +122,11 @@ class CuteDslB12xFusedMoE(CuteDslFusedMoE):
 
     @classmethod
     def get_runtime_disable_reason(cls, sm_version: int) -> Optional[str]:
+        """Return why this backend cannot run, or ``None`` when it can.
+
+        Args:
+            sm_version: SM version as returned by ``get_sm_version()``.
+        """
         if sm_version not in cls._SUPPORTED_SM_VERSIONS:
             sm_list = "/".join(f"SM{v}" for v in sorted(cls._SUPPORTED_SM_VERSIONS))
             return f"CuteDslB12xFusedMoE requires {sm_list}, got SM{sm_version}"
@@ -151,10 +156,11 @@ class CuteDslB12xFusedMoE(CuteDslFusedMoE):
     @staticmethod
     def _get_cutlass_dsl_cuda_major() -> Optional[int]:
         try:
-            from cutlass.base_dsl.version_info import CUDA_VERSION
+            import cutlass
         except ImportError:
             return None
-        major = getattr(CUDA_VERSION, "major", None)
+        cuda_version = getattr(cutlass, "CUDA_VERSION", None)
+        major = getattr(cuda_version, "major", None)
         if isinstance(major, int):
             return major
         return None
