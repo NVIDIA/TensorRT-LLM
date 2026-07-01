@@ -31,12 +31,12 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 {
 
 // ============================================================================
-// NixlTransferEngine — production TransferEngine backed by a nixlAgent (DESIGN)
+// NixlTransferEngine — production TransferEngine backed by a nixlAgent
 // ----------------------------------------------------------------------------
 // Wraps a borrowed nixlAgent. registerRegion() -> registerMem (VRAM); postWrite() ->
 // createXferReq(NIXL_WRITE, [src,bytes] -> [dstAddr,bytes] @ peer) + postXferReq;
-// poll() -> getXferStatus; release() -> releaseXferReq. NO notifMsg is ever attached
-// (DESIGN.md §4): getXferStatus==SUCCESS already implies the data has landed at the
+// poll() -> getXferStatus; release() -> releaseXferReq. NO notifMsg is ever attached:
+// getXferStatus==SUCCESS already implies the data has landed at the
 // remote target because NIXL's UCX backend appends a ucp_ep_flush_nbx to every transfer.
 //
 // The dst address comes from a credit (the receiver's registered region address); NIXL

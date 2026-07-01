@@ -190,7 +190,7 @@ TEST(BounceAgentE2E, SubmitTransferRequestsUsesBounce)
     // the metadata exchange is ONE-DIRECTIONAL — only the KV sender loads the receiver's AgentDesc
     // (get_local_agent_desc / loadRemoteAgent(AgentDesc)); the receiver never loads the sender. The
     // bounce control endpoint rides inside that AgentDesc. B's reverse control path (GRANT/ACK back
-    // to A) is self-bootstrapped from A's WANT (BounceReceiver::onWant, DESIGN §7) — exercising it
+    // to A) is self-bootstrapped from A's WANT (BounceReceiver::onWant) — exercising it
     // here is the whole point. (We deliberately do NOT touch the connection-info path.)
     a->loadRemoteAgent("bAgentB", b->getLocalAgentDesc());
 
@@ -291,7 +291,7 @@ TEST(BounceAgentE2E, ConcurrentSubmitUsesBounce)
     }
 
     // One-directional bootstrap, exactly like transfer.py: only the sender (A) loads the receiver
-    // (B); B self-bootstraps A from the first WANT (DESIGN §7). No manual addPeer — the agent's own
+    // (B); B self-bootstraps A from the first WANT (BounceReceiver::onWant). No manual addPeer — the agent's own
     // bounce transport is wired through loadRemoteAgent(AgentDesc).
     a->loadRemoteAgent("cAgentB", b->getLocalAgentDesc());
 
@@ -453,7 +453,7 @@ TEST(BounceAgentE2E, ConcurrentBidirectionalUsesBounce)
 // receiver concurrently (the disagg "many context workers -> one gen" shape). This is the REAL
 // one-directional bootstrap that transfer.py uses: each sender loads the receiver's AgentDesc; the
 // receiver loads NOBODY and self-bootstraps every sender from its WANT (BounceReceiver::onWant,
-// DESIGN §7) — so the reverse-control self-bootstrap is exercised across N distinct peers at once.
+// BounceReceiver::onWant) — so the reverse-control self-bootstrap is exercised across N distinct peers at once.
 // Seed-distinct patterns -> any cross-talk fails; all must complete SUCCESS + land byte-exact.
 TEST(BounceAgentE2E, MultiAgentManySendersToOneReceiver)
 {
