@@ -13,9 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import glob
-import multiprocessing
 import os
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, List
 
 import psutil
@@ -160,24 +158,43 @@ class HfWeightLoader(BaseWeightLoader):
             return part_weights
 
     def _prefetch_one_file(self, file_name):
-        if os.path.exists(file_name):
-            logger.info(f"Prefetching {file_name} to memory...")
-            with open(file_name, 'rb') as f:
-                f.read()
-            logger.info(f"Finished prefetching {file_name}.")
+        # Warm the OS page cache via posix_fadvise(WILLNEED): the kernel reads
+        # the file into the reclaimable, file-backed page cache directly, with
+        # no copy into a process-owned buffer. This adds zero anonymous memory,
+        # so it cannot trigger the OOM killer -- unlike a bare f.read(), whose
+        # file-sized anonymous bytes buffer, multiplied across all local ranks
+        # on a node, could exhaust host RAM and SIGKILL the process during
+        # prefetch (before any weights reach the GPU). The hint is asynchronous;
+        # the kernel reads ahead in the background, overlapping with the
+        # subsequent weight load, and caps itself to available memory.
+        if not os.path.exists(file_name):
+            return
+        logger.info(f"Prefetching {file_name} to page cache...")
+        try:
+            fd = os.open(file_name, os.O_RDONLY)
+        except OSError as e:
+            logger.warning(f"Could not open {file_name} for prefetch: {e}")
+            return
+        try:
+            # posix_fadvise is POSIX-only and may be absent on some platforms;
+            # without it we simply skip the page-cache warm-up. len=0 covers the
+            # whole file.
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_WILLNEED)
+        except (AttributeError, OSError) as e:
+            logger.debug(f"posix_fadvise unavailable, skipping prefetch: {e}")
+        finally:
+            os.close(fd)
 
     def prefetch_files(self, file_names: List[str]):
         """
-        Prefetch safetensors files to memory so that the weight loading will be much faster.
-        When multiple ranks run in parallel, each rank will prefetch some files.
+        Warm the OS page cache for the weight files so that the subsequent
+        weight loading reads from memory instead of disk/network.
+        When multiple ranks run on the same node, each rank warms a disjoint
+        slice of the files to avoid redundant work; the page cache is shared
+        node-wide.
         """
-        # Find out the files to prefetch for the current rank.
-        # Each rank loads files with indices local_rank, local_rank + local_mpi_size, local_rank + 2*local_mpi_size, etc.
+        # Each rank warms files with indices local_rank, local_rank +
+        # local_mpi_size, local_rank + 2*local_mpi_size, etc.
         local_file_names = file_names[local_mpi_rank()::local_mpi_size()]
-        if len(local_file_names) == 0:
-            return
-
-        max_workers = min(multiprocessing.cpu_count() * 2, 16,
-                          len(local_file_names))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            list(executor.map(self._prefetch_one_file, local_file_names))
+        for file_name in local_file_names:
+            self._prefetch_one_file(file_name)
