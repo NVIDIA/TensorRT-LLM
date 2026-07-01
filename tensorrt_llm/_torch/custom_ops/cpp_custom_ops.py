@@ -1094,14 +1094,11 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::ulysses_post_unscatter_qkv")
     def _(q_in, k_in, v_in, layout=0):
-        # Storage is always NHD-contig [B, P*Sp, H, D]. HND-shape return is a
-        # transpose-view (HND-shape, NHD-stride, non-contig) so Inductor sees
-        # the same stride pattern as the real op.
-        P, B, Sp, H, D = q_in.shape
-        nhd_shape = (B, P * Sp, H, D)
-
+        # Per-tensor NHD-contig storage [B, P*Sp, H, D] (Q/K/V may differ in Sp/H for
+        # cross-attn); layout=0 (HND) returns a transpose-view (HND-shape, NHD-stride).
         def _mk(t):
-            base = t.new_empty(nhd_shape)
+            P, B, Sp, H, D = t.shape
+            base = t.new_empty((B, P * Sp, H, D))
             return base.transpose(1, 2) if layout == 0 else base
 
         return (_mk(q_in), _mk(k_in), _mk(v_in))

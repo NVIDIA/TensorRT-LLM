@@ -47,16 +47,18 @@ namespace kernels
 //   - Each block reads one fully contiguous (p, b, sp, :H, :D) tile of
 //     H*D bf16
 //   - H*(D/8) threads/block — each thread copies one uint4 (8 bf16)
-//   - Grid (P*Sp, B, 3): blockIdx.z selects Q / K / V
+//   - Grid (P*(Sp_q+Sp_k+Sp_v), B): blockIdx.x is packed over Q/K/V tiles and mapped
+//     to the owning tensor -> no idle blocks even when Q/K/V shapes differ
 //
 // Constraints:
 //   - dtype must be bf16
 //   - D must be a multiple of 8 (uint4 vector load/store, 8 bf16 per thread)
-//   - threads/block = H * (D / 8) must be <= 1024 (CUDA hw limit)
-void launchUlyssesPostUnscatter(void const* q_in, // [P, B, Sp, H, D]
-    void const* k_in, void const* v_in,
-    void* q_out,                                  // [B, P*Sp, H, D] NHD-contig
-    void* k_out, void* v_out, int P, int B, int Sp, int H, int D, cudaStream_t stream);
+//   - threads/block = max(H) * (D / 8) must be <= 1024 (CUDA hw limit)
+void launchUlyssesPostUnscatter(void const* q_in, // [P, B, Sp_q, H_q, D]
+    void const* k_in, void const* v_in,           // [P, B, Sp_{k,v}, H_{k,v}, D]
+    void* q_out,                                  // per-tensor [B, P*Sp, H, D] NHD-contig
+    void* k_out, void* v_out, int P, int B, int D, int Sp_q, int H_q, int Sp_k, int H_k, int Sp_v, int H_v,
+    cudaStream_t stream);
 
 } // namespace kernels
 
