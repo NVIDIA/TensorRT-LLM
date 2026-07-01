@@ -256,6 +256,8 @@ TRT-LLM uses some environment variables to control the behavior of disaggregated
 
 * `TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM`: The maximum number of concurrent KV cache sends. The default value is `1`. This environment variable only takes effect when `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE` is greater than 0.
 
+* `TRTLLM_NIXL_PORT_LOCK_PATH`: Path to the lock file the NIXL backend uses to assign unique listener ports across colocated agents. The default value is `/tmp/trtllm_nixl_port.lock`. Set this to a non-shared path to avoid collisions on a shared `/tmp`, for example on multi-tenant hosts or when running multiple independent instances on the same node.
+
 There are some other useful environment variables that may help when encountering failures or performance issues.
 
 * `NCCL_GRAPH_MIXING_SUPPORT`: TensorRT-LLM now initializes common NCCL communicators with graph
