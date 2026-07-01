@@ -10,14 +10,14 @@ This post describes how the `VisualGen` runtime in TensorRT-LLM scales the DiT d
 
 On Wan 2.2 T2V-A14B (a 5-second 1280×720 video, 40 steps), the `CFG=2 × Ulysses=4 × Attention2D 3×3` recipe shrinks the DiT denoising loop by **~53×** going from a single NVIDIA B200 to a full GB200 NVL72 rack - which in turn drives a **~41× end-to-end** speedup. End-to-end trails the denoise speedup because of a fixed tail that stays constant as the DiT is sharded wider, setting the floor by Amdahl's law.
 
-The same runtime carries over unchanged to Cosmos3-Super (a 64B Mixture-of-Transformers generating a 189-frame 1280×720 clip), where the identical `CFG=2 × Ulysses=4 × Attention2D 3×3` recipe delivers **~49× on the denoise loop (~29× end-to-end)** on the full GB200 NVL72 rack.
+The same runtime carries over unchanged to Cosmos3-Super (a 64B Mixture-of-Transformers generating a 189-frame 1280×720 clip), where the identical `CFG=2 × Ulysses=4 × Attention2D 3×3` recipe delivers **~55× on the denoise loop (~33× end-to-end)** on the full GB200 NVL72 rack.
 
 <p align="center">
   <img src="../media/tech_blog25_nvl72_scaling.png" alt="Wan 2.2 T2V-A14B scaling from one B200 GPU to the 72-GPU GB200 NVL72 recipe: ~53x denoise, ~41x end-to-end" width="49%">
-  <img src="../media/tech_blog25_cosmos3_highlight.png" alt="Cosmos3-Super scaling from one GB200 GPU to the full 72-GPU GB200 NVL72 recipe: ~49x denoise, ~29x end-to-end" width="49%">
+  <img src="../media/tech_blog25_cosmos3_highlight.png" alt="Cosmos3-Super scaling from one B200 GPU to the full 72-GPU GB200 NVL72 recipe: ~55x denoise, ~33x end-to-end" width="49%">
 </p>
 
-<p align="center"><sub><em>Figure 1. The same VisualGen recipe scaling two models from a single GPU to a full GB200 NVL72 rack. Left: Wan 2.2 T2V-A14B (5-second 1280×720, 40 steps) - ~53× on the DiT denoise loop, ~41× end-to-end. Right: Cosmos3-Super (189-frame 1280×720, 35 steps) under the identical `CFG=2 × Ulysses=4 × Attention2D 3×3` recipe.</em></sub></p>
+<p align="center"><sub><em>Figure 1. The same VisualGen recipe scaling two models from a single GPU to a full GB200 NVL72 rack. Left: Wan 2.2 T2V-A14B (5-second 1280×720, 40 steps). Right: Cosmos3-Super (189-frame 1280×720, 35 steps) under the identical `CFG=2 × Ulysses=4 × Attention2D 3×3` recipe.</em></sub></p>
 
 ## Table of Contents
 
@@ -363,10 +363,10 @@ The same runtime scales a very different model unchanged. Cosmos3-Super is a 64B
 
 The headline result is summarized on the right of [Figure 1](#scaling-video-generation-across-nvl72-rack-with-tensorrt-llm) at the top of the post; the underlying numbers are:
 
-| Metric | 1× GB200 baseline | 72-GPU GB200 NVL72 | Speedup |
+| Metric | 1× B200 baseline | 72-GPU GB200 NVL72 | Speedup |
 | :--- | ---: | ---: | ---: |
-| Denoise loop | 335.25s | 6.79s | 49.4× (~49×) |
-| End-to-end request | 347.18s | 11.78s | 29.5× (~29×) |
+| Denoise loop | 373.1s | 6.79s | 54.9× (~55×) |
+| End-to-end request | 383.1s | 11.78s | 32.5× (~33×) |
 
 Sweeping the best recipe at every width gives the same near-linear denoise-loop scaling as Wan:
 
@@ -393,7 +393,6 @@ sbatch -A <ACCOUNT_NAME> -p <PARTITION> -N 18 --ntasks-per-node=4 --ntasks=72 ex
 ```
 
 The script spawns `trtllm-serve` across all allocated ranks in the background, polls `http://${MASTER_ADDR}:8000/health` until 200, and then runs `tensorrt_llm.serve.scripts.benchmark_visual_gen` from rank-0 only.
-```
 
 ## Quality Evaluation
 
@@ -438,7 +437,7 @@ Against that band, parallelism is essentially free. Every parallel configuration
 
 Serving Diffusion Transformers for video generation is a different scaling problem from LLM serving: a single latency-bound request, no KV cache, and full bi-directional attention over a 70–150k-token sequence that dominates all of the tens of denoising steps. The `VisualGen` runtime in TensorRT-LLM attacks that cost by unifying four parallelism axes — CFG, Ulysses, Attention2D context parallelism, and parallel VAE — under a single PyTorch `DeviceMesh`, exposed as declarative knobs on `ParallelConfig`. All four axes work together to compress the latency: CFG splits the two guidance streams, halving per-rank compute across the CFG group (2 GPUs, ~2×). Ulysses then shards the sequence until it hits each model's head-count wall (`ulysses ≤ 8` for Wan and Cosmos3), taking the first 16 GPUs to ~14×. Context parallelism carries the DiT the rest of the way to the full rack: we use Attention2D rather than Ring Attention because its 2D row/column groups and $O(N/\sqrt{P})$ collectives hold near-linear scaling at 72 GPUs — where Ring Attention's $O(N)$ cost caps out around 64 — reaching ~49× on the denoise loop. Finally, parallel VAE scales out the decode, which becomes the bottleneck at NVL72 scale once the DiT is this small.
 
-The result is near-ideal scaling of the DiT denoising steps. On Wan 2.2 T2V-A14B, the `CFG=2 × Ulysses=4 × Attention2D 3×3` recipe shrinks the DiT denoise loop ~53× from a single B200 to a full GB200 NVL72 rack (~41× end-to-end), and the *same* recipe applies unchanged to the 64B Cosmos3-Super (~49× denoise), confirming that the sequence-length sharding pattern generalizes across very different model sizes and sequence lengths. Concretely, a video clip that once took over five minutes to generate now finishes in ~9 seconds on the full GB200 NVL72 rack — and we expect the same approach to carry over to the next generation of longer, higher-resolution video models.
+The result is near-ideal scaling of the DiT denoising steps. On Wan 2.2 T2V-A14B, the `CFG=2 × Ulysses=4 × Attention2D 3×3` recipe shrinks the DiT denoise loop ~53× from a single B200 to a full GB200 NVL72 rack (~41× end-to-end), and the *same* recipe applies unchanged to the 64B Cosmos3-Super (~55× denoise, ~33× end-to-end), confirming that the sequence-length sharding pattern generalizes across very different model sizes and sequence lengths. Concretely, a video clip that once took over five minutes to generate now finishes in ~9 seconds on the full GB200 NVL72 rack — and we expect the same approach to carry over to the next generation of longer, higher-resolution video models.
 
 ## Picking the Performant Configuration
 
