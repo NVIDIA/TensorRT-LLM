@@ -26,6 +26,7 @@ from mpi4py.futures import MPIPoolExecutor
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.model_config import MoeLoadBalancerConfig
+from tensorrt_llm._utils import mpi_disabled
 
 # isort: off
 from tensorrt_llm.llmapi import (
@@ -72,6 +73,47 @@ def patch_mpi_pool_session_for_env(mocker, env_vars: dict):
 
     mocker.patch.object(MpiPoolSession, '_start_mpi_pool',
                         patched_start_mpi_pool)
+
+
+def _restore_env_var(name: str, value: str | None) -> None:
+    if value is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = value
+
+
+def _shared_mpi_session(n_workers: int):
+    if mpi_disabled():
+        yield None
+        return
+
+    from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
+
+    mpi_session = MpiPoolSession(n_workers=n_workers)
+    try:
+        yield mpi_session
+    finally:
+        mpi_session.shutdown()
+
+
+@pytest.fixture(scope="module")
+def shared_mpi_session_4gpu():
+    yield from _shared_mpi_session(4)
+
+
+@pytest.fixture(scope="module")
+def hf_weight_cache():
+    previous_cache_env = os.environ.get("TRTLLM_HF_WEIGHT_CACHE")
+    previous_cache_entries_env = os.environ.get(
+        "TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES")
+    os.environ["TRTLLM_HF_WEIGHT_CACHE"] = "1"
+    os.environ["TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES"] = "1"
+    try:
+        yield
+    finally:
+        _restore_env_var("TRTLLM_HF_WEIGHT_CACHE", previous_cache_env)
+        _restore_env_var("TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES",
+                         previous_cache_entries_env)
 
 
 def _get_default_torch_compile_config(torch_compile):
@@ -1495,20 +1537,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
              low_precision_combine=True,
              torch_compile=False),
     )
-    _NVFP4_4GPU_PREMERGE_GROUPS = (
-        ("tp4_mtp0",
-         ("cutlass_mtp0_tp4_compile_off", "cutlass_mtp0_tp4_compile_on",
-          "trtllm_mtp0_tp4_compile_off", "cutlass_mtp0_tp4_lpc_compile_off")),
-        ("ep4_mtp0", ("cutlass_mtp0_ep4_compile_on",
-                      "trtllm_mtp0_ep4_compile_off")),
-        ("tp2pp2_mtp0", ("cutlass_mtp0_tp2pp2_compile_off",
-                         "cutlass_mtp0_tp2pp2_compile_on")),
-        ("tp4_mtp2", ("cutlass_mtp2_tp4_compile_off", )),
-        ("ep4_mtp2", ("trtllm_mtp2_ep4_compile_off", )),
-        ("pp4_mtp2", ("cutlass_mtp2_pp4_compile_off", )),
-        ("pp4_mtp0", ("cutlass_mtp0_pp4_compile_off",
-                      "cutlass_mtp0_pp4_compile_on")),
-    )
 
     @pytest.mark.skip_less_device_memory(60000)
     @parametrize_with_ids("v2_kv_cache", [True, False])
@@ -2395,49 +2423,16 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @skip_pre_blackwell
-    def test_nvfp4_4gpus_premerge_grouped(self):
-        from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
-
-        cases_by_id = {
-            case["id"]: case
-            for case in self._NVFP4_4GPU_PREMERGE_CASES
-        }
-        grouped_case_ids = tuple(
-            case_id for _, case_ids in self._NVFP4_4GPU_PREMERGE_GROUPS
-            for case_id in case_ids)
-        assert len(grouped_case_ids) == len(set(grouped_case_ids))
-        assert set(grouped_case_ids) == set(cases_by_id)
-
-        previous_cache_env = os.environ.get("TRTLLM_HF_WEIGHT_CACHE")
-        os.environ["TRTLLM_HF_WEIGHT_CACHE"] = "1"
-        try:
-            for group_id, case_ids in self._NVFP4_4GPU_PREMERGE_GROUPS:
-                mpi_session = (MpiPoolSession(
-                    n_workers=4) if len(case_ids) > 1 else None)
-                try:
-                    for case_id in case_ids:
-                        case = cases_by_id[case_id]
-                        case_kwargs = {
-                            key: value
-                            for key, value in case.items() if key != "id"
-                        }
-                        try:
-                            self._run_nvfp4_4gpus_case(_mpi_session=mpi_session,
-                                                       **case_kwargs)
-                        except pytest.skip.Exception:
-                            raise
-                        except Exception as exc:
-                            raise AssertionError(
-                                "DeepSeek V3 Lite NVFP4 grouped case failed: "
-                                f"{group_id}/{case_id}") from exc
-                finally:
-                    if mpi_session is not None:
-                        mpi_session.shutdown()
-        finally:
-            if previous_cache_env is None:
-                os.environ.pop("TRTLLM_HF_WEIGHT_CACHE", None)
-            else:
-                os.environ["TRTLLM_HF_WEIGHT_CACHE"] = previous_cache_env
+    @pytest.mark.parametrize(
+        "case",
+        _NVFP4_4GPU_PREMERGE_CASES,
+        ids=[case["id"] for case in _NVFP4_4GPU_PREMERGE_CASES],
+    )
+    def test_nvfp4_4gpus_premerge_grouped(self, case, shared_mpi_session_4gpu,
+                                          hf_weight_cache):
+        case_kwargs = {key: value for key, value in case.items() if key != "id"}
+        self._run_nvfp4_4gpus_case(_mpi_session=shared_mpi_session_4gpu,
+                                   **case_kwargs)
 
     def _run_nvfp4_4gpus_case(self,
                               *,
