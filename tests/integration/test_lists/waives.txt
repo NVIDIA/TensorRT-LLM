@@ -477,7 +477,6 @@ unittest/_torch/visual_gen/multi_gpu/test_wan_tp.py::TestWanI2VTP::test_wan_i2v_
 unittest/_torch/visual_gen/multi_gpu/test_wan_tp.py::TestWanI2VTP::test_wan_i2v_tp_vs_single_gpu SKIP (https://nvbugs/6384633)
 unittest/_torch/visual_gen/multi_gpu/test_wan_tp.py::TestWanT2VTP::test_wan_t2v_tp_forward SKIP (https://nvbugs/6384633)
 unittest/_torch/visual_gen/multi_gpu/test_wan_tp.py::TestWanT2VTP::test_wan_t2v_tp_vs_single_gpu SKIP (https://nvbugs/6384633)
-unittest/_torch/visual_gen/multi_gpu/test_wan_transformer_parallel.py::TestWanTransformerParallel::test_parallel_all_combinations_vs_single_gpu_8gpu[attn2d_1x4_ul2] SKIP (https://nvbugs/6385134)
 unittest/_torch/visual_gen/test_attention_integration.py::test_sage_attention_self_attention[fp8-2-1560] SKIP (https://nvbugs/6198760)
 unittest/_torch/visual_gen/test_attention_integration.py::test_sage_attention_self_attention[int8-2-1560] SKIP (https://nvbugs/6198760)
 unittest/bindings/test_transfer_agent_bindings.py::TestNixlFunctionalTransfer::test_nixl_wait_in_progress_on_zero_timeout SKIP (https://nvbugs/6260897)
