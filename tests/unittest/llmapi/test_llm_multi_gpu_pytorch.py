@@ -50,6 +50,27 @@ def _mpi_session_kwargs(mpi_session) -> dict:
     return {"_mpi_session": mpi_session} if mpi_session is not None else {}
 
 
+def _make_shared_llm(mpi_session):
+    """Return an LLM factory that transparently injects a shared MPI session.
+
+    Tests that build the LLM directly can request the ``shared_llm_*`` fixture
+    and call it exactly like ``LLM(...)`` -- the shared session is passed through
+    without the test having to know it exists. Harness-based tests inject the
+    session via ``**_mpi_session_kwargs(...)`` instead, since the harness owns
+    LLM construction.
+    """
+
+    def shared_llm(*args, **kwargs):
+        return LLM(*args, **kwargs, **_mpi_session_kwargs(mpi_session))
+
+    return shared_llm
+
+
+@pytest.fixture(scope="module")
+def shared_llm_2gpu(shared_mpi_session_2gpu):
+    return _make_shared_llm(shared_mpi_session_2gpu)
+
+
 @pytest.mark.gpu2
 def test_llm_capture_request_error(shared_mpi_session_2gpu):
     _test_llm_capture_request_error(
@@ -118,27 +139,22 @@ def test_phi3_lora_fused_modules_output_on_tp2_identical_to_tp1(
 
 @skip_ray
 @pytest.mark.gpu2
-def test_llm_rpc_tp2(shared_mpi_session_2gpu):
-    _run_llm_rpc_tp2(shared_mpi_session_2gpu)
+def test_llm_rpc_tp2(shared_llm_2gpu):
+    _run_llm_rpc_tp2(shared_llm_2gpu)
 
 
 @skip_ray
 @pytest.mark.gpu2
 @pytest.mark.asyncio
-async def test_llm_rpc_streaming_tp2(shared_mpi_session_2gpu):
-    await _run_llm_rpc_streaming_tp2(shared_mpi_session_2gpu)
+async def test_llm_rpc_streaming_tp2(shared_llm_2gpu):
+    await _run_llm_rpc_streaming_tp2(shared_llm_2gpu)
 
 
-def _run_llm_rpc_tp2(_mpi_session=None):
-    llm_kwargs = dict(
-        model=llama_model_path,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
-        orchestrator_type="rpc",
-        tensor_parallel_size=2)
-    if _mpi_session is not None:
-        llm_kwargs["_mpi_session"] = _mpi_session
-
-    with LLM(**llm_kwargs) as llm:
+def _run_llm_rpc_tp2(make_llm=LLM):
+    with make_llm(model=llama_model_path,
+                  kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+                  orchestrator_type="rpc",
+                  tensor_parallel_size=2) as llm:
         assert isinstance(llm._executor, GenerationExecutorRpcProxy)
 
         res = llm.generate("Tell me a joke",
@@ -150,16 +166,11 @@ def _run_llm_rpc_tp2(_mpi_session=None):
         assert len(res.outputs[0].token_ids) == 10
 
 
-async def _run_llm_rpc_streaming_tp2(_mpi_session=None):
-    llm_kwargs = dict(
-        model=llama_model_path,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
-        orchestrator_type="rpc",
-        tensor_parallel_size=2)
-    if _mpi_session is not None:
-        llm_kwargs["_mpi_session"] = _mpi_session
-
-    with LLM(**llm_kwargs) as llm:
+async def _run_llm_rpc_streaming_tp2(make_llm=LLM):
+    with make_llm(model=llama_model_path,
+                  kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+                  orchestrator_type="rpc",
+                  tensor_parallel_size=2) as llm:
         assert isinstance(llm._executor, GenerationExecutorRpcProxy)
 
         async for output in llm.generate_async("Tell me a joke",

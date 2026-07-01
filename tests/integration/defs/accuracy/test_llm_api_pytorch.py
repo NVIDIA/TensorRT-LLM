@@ -97,11 +97,6 @@ def _shared_mpi_session(n_workers: int):
 
 
 @pytest.fixture(scope="module")
-def shared_mpi_session_4gpu():
-    yield from _shared_mpi_session(4)
-
-
-@pytest.fixture(scope="module")
 def hf_weight_cache():
     previous_cache_env = os.environ.get("TRTLLM_HF_WEIGHT_CACHE")
     previous_cache_entries_env = os.environ.get(
@@ -114,6 +109,43 @@ def hf_weight_cache():
         _restore_env_var("TRTLLM_HF_WEIGHT_CACHE", previous_cache_env)
         _restore_env_var("TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES",
                          previous_cache_entries_env)
+
+
+@pytest.fixture(scope="module")
+def shared_mpi_session_4gpu(hf_weight_cache):
+    # Ordering is load-bearing: MpiPoolSession snapshots TRTLLM*/TLLM* env at
+    # spawn time and passes that copy to the workers. Any env exported AFTER the
+    # pool spawns never reaches them. Depending on hf_weight_cache guarantees
+    # TRTLLM_HF_WEIGHT_CACHE is exported before MpiPoolSession spawns, otherwise
+    # the weight cache would be silently disabled in the workers (which are the
+    # processes that actually load weights) and only session reuse would speed
+    # things up. The assertion pins this contract so a future fixture reorder
+    # fails loudly instead of silently regressing the optimization.
+    assert os.environ.get("TRTLLM_HF_WEIGHT_CACHE") == "1", (
+        "hf_weight_cache must be set up before the shared MPI pool spawns so "
+        "the workers inherit TRTLLM_HF_WEIGHT_CACHE at spawn time.")
+    yield from _shared_mpi_session(4)
+
+
+def _make_shared_llm(mpi_session):
+    """Return an LLM factory that transparently injects a shared MPI session.
+
+    Tests build the LLM by calling this factory exactly like ``LLM(...)``; the
+    shared session (if any) is passed through without the test having to know it
+    exists. Falls back to a private per-LLM session when ``mpi_session`` is None.
+    """
+
+    def shared_llm(*args, **kwargs):
+        if mpi_session is not None:
+            kwargs["_mpi_session"] = mpi_session
+        return LLM(*args, **kwargs)
+
+    return shared_llm
+
+
+@pytest.fixture(scope="module")
+def shared_llm_4gpu(shared_mpi_session_4gpu):
+    return _make_shared_llm(shared_mpi_session_4gpu)
 
 
 def _get_default_torch_compile_config(torch_compile):
@@ -2423,16 +2455,22 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @skip_pre_blackwell
+    # The shared module-scoped MPI session is intentionally kept alive across the
+    # parametrized cases (that is the whole point of reuse), so mpi4py's
+    # `_manager_spawn` management thread outlives each test. Disable the
+    # threadleak check here, consistent with other session/proxy-based tests.
+    @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize(
         "case",
         _NVFP4_4GPU_PREMERGE_CASES,
         ids=[case["id"] for case in _NVFP4_4GPU_PREMERGE_CASES],
     )
-    def test_nvfp4_4gpus_premerge_grouped(self, case, shared_mpi_session_4gpu,
-                                          hf_weight_cache):
+    def test_nvfp4_4gpus_premerge_grouped(self, case, shared_llm_4gpu):
+        # shared_llm_4gpu injects the shared 4-GPU MPI session and (transitively)
+        # depends on hf_weight_cache, so the weight-cache env is exported before
+        # the pool spawns (see the shared_mpi_session_4gpu fixture for details).
         case_kwargs = {key: value for key, value in case.items() if key != "id"}
-        self._run_nvfp4_4gpus_case(_mpi_session=shared_mpi_session_4gpu,
-                                   **case_kwargs)
+        self._run_nvfp4_4gpus_case(make_llm=shared_llm_4gpu, **case_kwargs)
 
     def _run_nvfp4_4gpus_case(self,
                               *,
@@ -2447,7 +2485,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                               torch_compile,
                               mtp_nextn,
                               moe_backend,
-                              _mpi_session=None):
+                              make_llm=LLM):
         sm_version = get_sm_version()
         if moe_backend == "TRTLLM" and sm_version in (120, 121):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
@@ -2474,20 +2512,16 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         if fp8kv:
             kv_cache_config.dtype = "fp8"
 
-        llm_kwargs = dict(
-            tensor_parallel_size=tp_size,
-            pipeline_parallel_size=pp_size,
-            moe_expert_parallel_size=ep_size,
-            kv_cache_config=kv_cache_config,
-            **pytorch_config,
-            enable_attention_dp=attention_dp,
-            speculative_config=mtp_config,
-        )
-        if _mpi_session is not None:
-            llm_kwargs["_mpi_session"] = _mpi_session
-
-        with LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
-                 **llm_kwargs) as llm:
+        with make_llm(
+                f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
+                tensor_parallel_size=tp_size,
+                pipeline_parallel_size=pp_size,
+                moe_expert_parallel_size=ep_size,
+                kv_cache_config=kv_cache_config,
+                **pytorch_config,
+                enable_attention_dp=attention_dp,
+                speculative_config=mtp_config,
+        ) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
 
             task = GSM8K(self.MODEL_NAME)

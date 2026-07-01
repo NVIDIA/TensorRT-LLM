@@ -153,9 +153,12 @@ class HfWeightLoader(BaseWeightLoader):
         if len(filtered_weight_files) > 0:
             weight_files = filtered_weight_files
         if weight_files:
-            cache_key = self._weight_files_cache_key(weight_files,
-                                                     use_consolidated)
-            if self._is_weight_cache_enabled():
+            # Only fingerprint the files (per-file os.stat) when the cache is
+            # enabled; the default path must not pay for a key it never uses.
+            cache_key = self._weight_files_cache_key(
+                weight_files,
+                use_consolidated) if self._is_weight_cache_enabled() else None
+            if cache_key is not None:
                 cached_weights = self._get_cached_weights(cache_key)
                 if cached_weights is not None:
                     logger.info(
@@ -193,7 +196,7 @@ class HfWeightLoader(BaseWeightLoader):
             weights = self._load_weights_in_parallel(
                 weight_files, self._load_safetensors_file,
                 "Loading safetensors weights in parallel")
-            if self._is_weight_cache_enabled():
+            if cache_key is not None:
                 self._cache_loaded_weights(cache_key, weights)
             return weights
 
@@ -202,9 +205,10 @@ class HfWeightLoader(BaseWeightLoader):
             weight_files = glob.glob(f"{checkpoint_dir}/*.pth")
 
         if weight_files:
-            cache_key = self._weight_files_cache_key(weight_files,
-                                                     use_consolidated)
-            if self._is_weight_cache_enabled():
+            cache_key = self._weight_files_cache_key(
+                weight_files,
+                use_consolidated) if self._is_weight_cache_enabled() else None
+            if cache_key is not None:
                 cached_weights = self._get_cached_weights(cache_key)
                 if cached_weights is not None:
                     logger.info(
@@ -215,7 +219,7 @@ class HfWeightLoader(BaseWeightLoader):
             weights = self._load_weights_in_parallel(
                 weight_files, self._load_bin_or_path_file,
                 "Loading bin weights in parallel")
-            if self._is_weight_cache_enabled():
+            if cache_key is not None:
                 self._cache_loaded_weights(cache_key, weights)
             return weights
 
