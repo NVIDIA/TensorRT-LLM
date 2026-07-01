@@ -1,18 +1,20 @@
 # IterResearch (scaffolding example)
 
-Multi-tool research agent using TensorRT-LLM scaffolding: Tavily search, Google Scholar, webpage fetch, and an optional Python sandbox via `coder_mcp`. Configuration lives in `config.yaml` (API keys, MCP host/ports, `base_url`, model name, turn/token limits).
+Multi-tool research agent using TensorRT-LLM scaffolding: Tavily search, Google Scholar, webpage fetch, and an optional Python sandbox via `coder_mcp`.
+
+Configuration (API keys, MCP host/ports, `base_url`, model name, turn/token limits) uses the shared example config `examples/scaffolding/contrib/open_deep_research/config.example.yaml`. IterResearch, Tree-of-Thought Research, and Open Deep Research all share the same layout, so there is no per-agent config file — copy the example to your own `config.yaml` and fill in the keys.
 
 ```bash
 cd examples/scaffolding/mcp/tavily_search && uv run tavily_search.py \
-    --config examples/scaffolding/contrib/iter_research/config.yaml
+    --config examples/scaffolding/contrib/open_deep_research/config.example.yaml
 ```
 ```bash
 cd examples/scaffolding/mcp/google_scholar && uv run google_scholar.py \
-    --config examples/scaffolding/contrib/iter_research/config.yaml
+    --config examples/scaffolding/contrib/open_deep_research/config.example.yaml
 ```
 ```bash
 cd examples/scaffolding/mcp/fetch_webpage && uv run fetch_webpage.py \
-    --config examples/scaffolding/contrib/iter_research/config.yaml
+    --config examples/scaffolding/contrib/open_deep_research/config.example.yaml
 ```
 ```bash
 python examples/scaffolding/mcp/coder/coder_mcp.py \
@@ -32,7 +34,7 @@ python examples/scaffolding/mcp/coder/coder_mcp.py \
 
 ```bash
 python examples/scaffolding/contrib/iter_research/run_iter_research.py \
-  --config examples/scaffolding/contrib/iter_research/config.yaml \
+  --config examples/scaffolding/contrib/open_deep_research/config.example.yaml \
   --enable_tracing --enable_statistics
 ```
 
@@ -57,7 +59,7 @@ Use `--question "…"` to override the default prompt. Outputs and traces depend
 
 ```bash
 python examples/scaffolding/contrib/iter_research/run_iter_research.py \
-  --config examples/scaffolding/contrib/iter_research/config.yaml \
+  --config examples/scaffolding/contrib/open_deep_research/config.example.yaml \
   --enable_tracing \
   --trace_output_dir ./iter_research_trace_manual
 ```

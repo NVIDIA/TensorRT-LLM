@@ -273,13 +273,13 @@ traces.
 
 ```bash
 python examples/scaffolding/contrib/iter_research/run_iter_research.py \
-  --config examples/scaffolding/contrib/iter_research/config.yaml \
+  --config examples/scaffolding/contrib/open_deep_research/config.example.yaml \
   --enable_tracing
 ```
 
 ```bash
 python examples/scaffolding/contrib/open_deep_research/run_open_deep_research.py \
-  --config examples/scaffolding/contrib/open_deep_research/config.yaml \
+  --config examples/scaffolding/contrib/open_deep_research/config.example.yaml \
   --enable_tracing
 ```
 

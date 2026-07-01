@@ -23,6 +23,6 @@ Run a single prompt:
 
 ```bash
 python examples/scaffolding/contrib/tree_of_thought_research/run_tot_research.py \
-  --config examples/scaffolding/contrib/iter_research/config.yaml \
+  --config examples/scaffolding/contrib/open_deep_research/config.example.yaml \
   --prompt "Use current sources to compare TensorRT-LLM and vLLM for serving LLMs."
 ```

@@ -43,24 +43,24 @@ Each controller/worker can evolve independently. For example:
 
 1. Serve a chat model at an OpenAI-compatible `base_url` (for example, `trtllm-serve`).
 2. If code execution is needed, start `coder_mcp.py` (Apiary-backed), then MCP servers.
-3. Start each MCP server with the same `config.yaml` (same layout as `examples/scaffolding/contrib/iter_research/config.yaml`).
+3. Start each MCP server with the same config — the shared example is `examples/scaffolding/contrib/open_deep_research/config.example.yaml` (copy it to your own `config.yaml` and fill in the keys).
 4. Fill required API keys in `config.yaml` (Tavily, Jina/Scraper for fetch, Google Scholar credentials, and so on).
 
 Example MCP startup commands:
 
 ```bash
 cd examples/scaffolding/mcp/tavily_search && uv run tavily_search.py \
-    --config examples/scaffolding/contrib/open_deep_research/config.yaml
+    --config examples/scaffolding/contrib/open_deep_research/config.example.yaml
 ```
 
 ```bash
 cd examples/scaffolding/mcp/google_scholar && uv run google_scholar.py \
-    --config examples/scaffolding/contrib/open_deep_research/config.yaml
+    --config examples/scaffolding/contrib/open_deep_research/config.example.yaml
 ```
 
 ```bash
 cd examples/scaffolding/mcp/fetch_webpage && uv run fetch_webpage.py \
-    --config examples/scaffolding/contrib/open_deep_research/config.yaml
+    --config examples/scaffolding/contrib/open_deep_research/config.example.yaml
 ```
 
 ```bash
@@ -76,7 +76,7 @@ Use the runnable example entrypoint:
 
 ```bash
 python examples/scaffolding/contrib/open_deep_research/run_open_deep_research.py \
-  --config examples/scaffolding/contrib/open_deep_research/config.yaml \
+  --config examples/scaffolding/contrib/open_deep_research/config.example.yaml \
   --base_url http://localhost:8000/v1 \
   --model Qwen3/Qwen3-30B-A3B \
   --enable_tracing
@@ -103,7 +103,7 @@ You can override `--prompt` for custom questions. Add `--enable_tracing` or `--e
 
 ```bash
 python examples/scaffolding/contrib/open_deep_research/run_open_deep_research.py \
-  --config examples/scaffolding/contrib/open_deep_research/config.yaml \
+  --config examples/scaffolding/contrib/open_deep_research/config.example.yaml \
   --base_url http://localhost:8000/v1 \
   --model Qwen3/Qwen3-30B-A3B \
   --enable_tracing \

@@ -1,6 +1,8 @@
 # Open Deep Research (scaffolding example)
 
-Research agent built on TensorRT-LLM scaffolding with the same MCP stack as IterResearch (Tavily, Google Scholar, webpage fetch, optional Python sandbox via `coder_mcp`). Configuration and ports live in `config.yaml` (same layout as `examples/scaffolding/contrib/iter_research/config.yaml`). Batch runs use JSONL benchmarks under `search_datasets/` (`browsecomp`, `hle`).
+Research agent built on TensorRT-LLM scaffolding with the same MCP stack as IterResearch (Tavily, Google Scholar, webpage fetch, optional Python sandbox via `coder_mcp`). Batch runs use JSONL benchmarks under `search_datasets/` (`browsecomp`, `hle`).
+
+Configuration and ports live in `config.example.yaml` — the shared example config used by all three research-agent examples (IterResearch, Tree-of-Thought Research, Open Deep Research), since they use the same layout. Copy it to your own `config.yaml` and fill in the keys, or pass `config.example.yaml` directly to `--config`.
 
 ## Prerequisites
 
@@ -9,15 +11,15 @@ Research agent built on TensorRT-LLM scaffolding with the same MCP stack as Iter
 3. Start the MCP tools you need, passing the **same** `config.yaml` to each server, for example `uv run … --config …/config.yaml`.
    ```bash
    cd examples/scaffolding/mcp/tavily_search && uv run tavily_search.py \
-       --config examples/scaffolding/contrib/open_deep_research/config.yaml
+       --config examples/scaffolding/contrib/open_deep_research/config.example.yaml
     ```
     ```bash
    cd examples/scaffolding/mcp/google_scholar && uv run google_scholar.py \
-       --config examples/scaffolding/contrib/open_deep_research/config.yaml
+       --config examples/scaffolding/contrib/open_deep_research/config.example.yaml
     ```
     ```bash
    cd examples/scaffolding/mcp/fetch_webpage && uv run fetch_webpage.py \
-       --config examples/scaffolding/contrib/open_deep_research/config.yaml
+       --config examples/scaffolding/contrib/open_deep_research/config.example.yaml
     ```
     ```bash
   python examples/scaffolding/mcp/coder/coder_mcp.py \
@@ -32,7 +34,7 @@ Research agent built on TensorRT-LLM scaffolding with the same MCP stack as Iter
 
 ```bash
 python examples/scaffolding/contrib/open_deep_research/run_open_deep_research.py \
-  --config examples/scaffolding/contrib/open_deep_research/config.yaml \
+  --config examples/scaffolding/contrib/open_deep_research/config.example.yaml \
   --base_url http://localhost:8000/v1 \
   --model Qwen3/Qwen3-30B-A3B \
   --enable_tracing
@@ -60,7 +62,7 @@ Override `--prompt` for your own question. Add `--enable_tracing` or `--enable_q
 
 ```bash
 python examples/scaffolding/contrib/open_deep_research/run_open_deep_research.py \
-  --config examples/scaffolding/contrib/open_deep_research/config.yaml \
+  --config examples/scaffolding/contrib/open_deep_research/config.example.yaml \
   --base_url http://localhost:8000/v1 \
   --model Qwen3/Qwen3-235B-A22B \
   --enable_tracing \

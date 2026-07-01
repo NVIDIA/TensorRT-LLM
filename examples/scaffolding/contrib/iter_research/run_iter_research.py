@@ -3,7 +3,7 @@ r"""IterResearch runner (TensorRT-LLM scaffolding).
 Start Apiary, then ``apiary_python_gateway.py``, then MCP servers and LLM, then::
 
     python examples/scaffolding/contrib/iter_research/run_iter_research.py \\
-        --config examples/scaffolding/contrib/iter_research/config.yaml --enable_tracing
+        --config examples/scaffolding/contrib/open_deep_research/config.example.yaml --enable_tracing
 """
 
 import argparse

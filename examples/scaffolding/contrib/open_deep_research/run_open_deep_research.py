@@ -3,7 +3,7 @@ r"""Open Deep Research runner (TensorRT-LLM scaffolding).
 Start Apiary (if using python_interpreter), then MCP servers and LLM, then::
 
     python examples/scaffolding/contrib/open_deep_research/run_open_deep_research.py \\
-        --config examples/scaffolding/contrib/open_deep_research/config.yaml --enable_tracing
+        --config examples/scaffolding/contrib/open_deep_research/config.example.yaml --enable_tracing
 """
 
 import argparse
@@ -33,7 +33,8 @@ def parse_arguments():
         "--config",
         type=str,
         default=None,
-        help="Path to config.yaml (same layout as iter_research/config.yaml).",
+        help="Path to config.yaml (see the shared example "
+        "examples/scaffolding/contrib/open_deep_research/config.example.yaml).",
     )
     parser.add_argument("--openai_api_key", type=str, default=None)
     parser.add_argument("--base_url", type=str, default=None)

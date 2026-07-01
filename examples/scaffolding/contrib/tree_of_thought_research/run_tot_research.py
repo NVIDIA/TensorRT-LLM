@@ -3,7 +3,7 @@ r"""Run one Tree-of-Thought research prompt.
 Start the MCP servers and an OpenAI-compatible TensorRT-LLM endpoint, then run::
 
     python examples/scaffolding/contrib/tree_of_thought_research/run_tot_research.py \
-        --config examples/scaffolding/contrib/tree_of_thought_research/config.yaml --enable_tracing
+        --config examples/scaffolding/contrib/open_deep_research/config.example.yaml --enable_tracing
 """
 
 from __future__ import annotations

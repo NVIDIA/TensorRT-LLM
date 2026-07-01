@@ -108,17 +108,17 @@ The following steps start **after** you are inside a TensorRT-LLM dev or inferen
    # Terminal 2 — google_search
    cd examples/scaffolding/mcp/google_search
    uv run google_search.py \
-       --config ../../../../examples/scaffolding/contrib/iter_research/config.yaml
+       --config ../../../../examples/scaffolding/contrib/open_deep_research/config.example.yaml
 
    # Terminal 3 — google_scholar
    cd examples/scaffolding/mcp/google_scholar
    uv run google_scholar.py \
-       --config ../../../../examples/scaffolding/contrib/iter_research/config.yaml
+       --config ../../../../examples/scaffolding/contrib/open_deep_research/config.example.yaml
 
    # Terminal 4 — fetch_webpage
    cd examples/scaffolding/mcp/fetch_webpage
    uv run fetch_webpage.py \
-       --config ../../../../examples/scaffolding/contrib/iter_research/config.yaml
+       --config ../../../../examples/scaffolding/contrib/open_deep_research/config.example.yaml
 
    # Terminal 5 — coder_mcp (serves python_interpreter, need to set port from config.yaml manually)
     python examples/scaffolding/mcp/coder/coder_mcp.py \
@@ -133,7 +133,7 @@ The following steps start **after** you are inside a TensorRT-LLM dev or inferen
 
    ```bash
    python examples/scaffolding/contrib/iter_research/run_iter_research.py \
-       --config examples/scaffolding/contrib/iter_research/config.yaml --enable_tracing
+       --config examples/scaffolding/contrib/open_deep_research/config.example.yaml --enable_tracing
    ```
 
    Optional flags: `--enable_tracing`, `--question "..."`; see `run_iter_research.py --help`.
