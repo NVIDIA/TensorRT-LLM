@@ -11,6 +11,7 @@ this module never triggers a circular import during package initialization.
 """
 
 import os
+from contextlib import contextmanager
 from typing import Optional
 
 
@@ -20,6 +21,29 @@ def restore_env_var(name: str, value: Optional[str]) -> None:
         os.environ.pop(name, None)
     else:
         os.environ[name] = value
+
+
+@contextmanager
+def hf_weight_cache_env(max_entries: str = "1"):
+    """Enable the HF weight cache via env vars, restoring prior values on exit.
+
+    IMPORTANT (load-bearing ordering): enter this BEFORE spawning the shared
+    ``MpiPoolSession``. ``MpiPoolSession`` snapshots ``TRTLLM*``/``TLLM*`` env at
+    spawn time and passes that copy to the workers (which are the processes that
+    actually load weights); enabling the cache AFTER the pool spawns leaves it
+    silently disabled in the workers. Back a module-scoped ``hf_weight_cache``
+    fixture with this and have the session fixture depend on that fixture so the
+    env is exported first.
+    """
+    prev = os.environ.get("TRTLLM_HF_WEIGHT_CACHE")
+    prev_entries = os.environ.get("TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES")
+    os.environ["TRTLLM_HF_WEIGHT_CACHE"] = "1"
+    os.environ["TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES"] = max_entries
+    try:
+        yield
+    finally:
+        restore_env_var("TRTLLM_HF_WEIGHT_CACHE", prev)
+        restore_env_var("TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES", prev_entries)
 
 
 def shared_mpi_session(n_workers: int):

@@ -75,28 +75,19 @@ def patch_mpi_pool_session_for_env(mocker, env_vars: dict):
 
 
 from tensorrt_llm.llmapi._grouped_test_utils import \
-    make_shared_llm as _make_shared_llm  # noqa: E402
+    hf_weight_cache_env as _hf_weight_cache_env  # noqa: E402
+from tensorrt_llm.llmapi._grouped_test_utils import \
+    make_shared_llm as _make_shared_llm
 from tensorrt_llm.llmapi._grouped_test_utils import \
     reset_worker_torch_compile_state as _reset_worker_torch_compile_state
-from tensorrt_llm.llmapi._grouped_test_utils import \
-    restore_env_var as _restore_env_var
 from tensorrt_llm.llmapi._grouped_test_utils import \
     shared_mpi_session as _shared_mpi_session
 
 
 @pytest.fixture(scope="module")
 def hf_weight_cache():
-    previous_cache_env = os.environ.get("TRTLLM_HF_WEIGHT_CACHE")
-    previous_cache_entries_env = os.environ.get(
-        "TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES")
-    os.environ["TRTLLM_HF_WEIGHT_CACHE"] = "1"
-    os.environ["TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES"] = "1"
-    try:
+    with _hf_weight_cache_env():
         yield
-    finally:
-        _restore_env_var("TRTLLM_HF_WEIGHT_CACHE", previous_cache_env)
-        _restore_env_var("TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES",
-                         previous_cache_entries_env)
 
 
 @pytest.fixture(scope="module")
