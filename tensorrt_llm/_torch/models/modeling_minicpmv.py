@@ -244,7 +244,7 @@ class MiniCPMVInputProcessor(BaseMultimodalDummyInputsBuilder,
                 trust_remote_code=trust_remote_code,
                 use_fast=self.use_fast,
             )
-        except Exception:
+        except (OSError, ValueError):
             processor_tokenizer = getattr(self._tokenizer, "tokenizer",
                                           self._tokenizer)
 
@@ -382,6 +382,7 @@ class MiniCPMVInputProcessor(BaseMultimodalDummyInputsBuilder,
         modality, media, raw_media = self._get_media_inputs(mm_data)
         temporal_ids = mm_processor_kwargs.pop("temporal_ids", None)
         if modality == "video":
+            mm_processor_kwargs.setdefault("max_slice_nums", 1)
             if temporal_ids is None:
                 temporal_ids = self._build_video_temporal_ids(
                     raw_media, media, mm_processor_kwargs)
@@ -430,6 +431,7 @@ class MiniCPMVInputProcessor(BaseMultimodalDummyInputsBuilder,
         temporal_ids: Optional[Any] = None,
         **kwargs: Any,
     ) -> int:
+        kwargs.setdefault("max_slice_nums", 1)
         if temporal_ids is None:
             return sum(
                 self.get_num_tokens_per_image(image=frame, **kwargs)
@@ -928,25 +930,35 @@ class MiniCPMVVisionModel(nn.Module):
         all_pixel_values = []
         all_tgt_sizes = []
         request_slice_counts = []
-        all_temporal_ids = []
-        has_temporal_ids = False
+        request_embedding_counts = []
+        per_request_temporal_ids = []
 
         for multimodal_param in multimodal_params:
             data = multimodal_param.multimodal_data
             media_data = data.get("image") or data.get("video") or {}
-            pixel_values = media_data.get("pixel_values") or []
+            pixel_values = media_data.get("pixel_values")
+            if pixel_values is None:
+                pixel_values = []
             tgt_sizes = media_data.get("tgt_sizes")
             temporal_ids = media_data.get("temporal_ids")
             request_slice_counts.append(len(pixel_values))
+            per_request_temporal_ids.append(temporal_ids)
+            if temporal_ids is not None:
+                temporal_slice_count = sum(len(group) for group in temporal_ids)
+                if temporal_slice_count != len(pixel_values):
+                    raise ValueError(
+                        "MiniCPMV temporal_ids must cover every visual slice: "
+                        f"got {temporal_slice_count} temporal slices for "
+                        f"{len(pixel_values)} pixel_values.")
+                request_embedding_counts.append(len(temporal_ids))
+            else:
+                request_embedding_counts.append(len(pixel_values))
             all_pixel_values.extend([
                 pixel_value.flatten(end_dim=1).permute(1, 0)
                 for pixel_value in pixel_values
             ])
             if tgt_sizes is not None and len(pixel_values) > 0:
                 all_tgt_sizes.append(torch.as_tensor(tgt_sizes))
-            if temporal_ids is not None:
-                has_temporal_ids = True
-                all_temporal_ids.extend(temporal_ids)
 
         if not all_pixel_values:
             return {
@@ -955,6 +967,7 @@ class MiniCPMVVisionModel(nn.Module):
                 "patch_attention_mask": None,
                 "temporal_ids": None,
                 "request_slice_counts": request_slice_counts,
+                "request_embedding_counts": request_embedding_counts,
             }
 
         tgt_sizes = torch.vstack(all_tgt_sizes).to(
@@ -964,19 +977,49 @@ class MiniCPMVVisionModel(nn.Module):
         batch_size, length, _ = padded_pixel_values.shape
         padded_pixel_values = padded_pixel_values.permute(0, 2, 1).reshape(
             batch_size, 3, -1, length)
-        max_patches = length // self.config.vision_config.patch_size
+        patch_size = self.config.vision_config.patch_size
+        max_patches_h = padded_pixel_values.shape[2] // patch_size
+        max_patches_w = padded_pixel_values.shape[3] // patch_size
         patch_lens = tgt_sizes[:, 0] * tgt_sizes[:, 1]
-        patch_attention_mask = torch.arange(
-            max_patches,
-            device=padded_pixel_values.device,
-        )[None, None, :] < patch_lens[:, None, None]
+        if max_patches_h == 1:
+            # MiniCPM-V's processor packs a 2D patch grid into a height-1
+            # sequence after reshape_by_patch(). Keep the mask aligned with the
+            # conv output while tgt_sizes still carries the original 2D shape.
+            patch_attention_mask = torch.arange(
+                max_patches_w,
+                device=padded_pixel_values.device,
+            )[None, None, :] < patch_lens[:, None, None]
+        else:
+            h_range = torch.arange(
+                max_patches_h,
+                device=padded_pixel_values.device,
+            )[None, :, None]
+            w_range = torch.arange(
+                max_patches_w,
+                device=padded_pixel_values.device,
+            )[None, None, :]
+            patch_attention_mask = (
+                (h_range < tgt_sizes[:, 0, None, None])
+                & (w_range < tgt_sizes[:, 1, None, None]))
+
+        all_temporal_ids = None
+        if any(temporal_ids is not None
+               for temporal_ids in per_request_temporal_ids):
+            all_temporal_ids = []
+            for slice_count, temporal_ids in zip(request_slice_counts,
+                                                per_request_temporal_ids):
+                if temporal_ids is None:
+                    all_temporal_ids.extend([[-1] for _ in range(slice_count)])
+                else:
+                    all_temporal_ids.extend(temporal_ids)
 
         return {
             "pixel_values": padded_pixel_values,
             "tgt_sizes": tgt_sizes,
             "patch_attention_mask": patch_attention_mask,
-            "temporal_ids": all_temporal_ids if has_temporal_ids else None,
+            "temporal_ids": all_temporal_ids,
             "request_slice_counts": request_slice_counts,
+            "request_embedding_counts": request_embedding_counts,
         }
 
     @torch.inference_mode()
@@ -1013,7 +1056,25 @@ class MiniCPMVVisionModel(nn.Module):
             tgt_sizes,
             batched["temporal_ids"],
         )
-        return [vision_embedding.reshape(-1, vision_embedding.shape[-1])]
+        request_embedding_counts = batched["request_embedding_counts"]
+        if sum(request_embedding_counts) != vision_embedding.shape[0]:
+            raise ValueError(
+                "MiniCPMV vision embedding count does not match request "
+                "grouping: got "
+                f"{vision_embedding.shape[0]} groups for "
+                f"{sum(request_embedding_counts)} expected groups.")
+
+        # Keep the public encoder contract as one concatenated tensor while
+        # validating that each request owns the right contiguous embedding span.
+        request_embeddings = [
+            embedding.reshape(-1, embedding.shape[-1])
+            for embedding in torch.split(
+                vision_embedding, request_embedding_counts, dim=0)
+            if embedding.shape[0] > 0
+        ]
+        if not request_embeddings:
+            return []
+        return [torch.cat(request_embeddings, dim=0)]
 
     def load_weights(self, weights: dict[str, torch.Tensor]) -> None:
         self.vision_tower.load_weights(weights)
