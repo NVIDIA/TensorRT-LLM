@@ -1,0 +1,129 @@
+"""Unit tests for the base multimodal input-processor mixins.
+
+A concrete multimodal input processor inherits both
+``BaseMultimodalInputProcessor`` (the token-counting math) and
+``BaseMultimodalDummyInputsBuilder`` (the KV-cache profiling dummy
+contract); these tests pin the default behavior of both.
+
+Token-counting (`BaseMultimodalInputProcessor`):
+
+* ``get_num_tokens_per_image`` / ``get_num_tokens_per_video`` delegate to the
+  HF processor's ``_get_num_multimodal_tokens`` by default. Models with
+  deterministic encoder math (e.g. Qwen-VL) override these methods; that path
+  is covered by the per-model tests.
+
+Dummy contract (`BaseMultimodalDummyInputsBuilder`):
+
+* Defaults — the modality-agnostic profiler hooks
+  ``get_mm_max_tokens_per_item`` (returns ``{}``) and
+  ``get_dummy_mm_data_for_tokens`` (raises ``NotImplementedError``) mean
+  "no direct encoder profiling" (text-only dummy fallback) until a subclass
+  opts in. Modality-specific helpers (vision's ``get_size_for_max_tokens`` /
+  ``get_dummy_mm_data_for_size``) live on the concrete processor.
+"""
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+from PIL import Image
+
+from tensorrt_llm.inputs.registry import (
+    BaseMultimodalDummyInputsBuilder,
+    BaseMultimodalInputProcessor,
+)
+
+
+def _make_subclass(*, hf_post_merger_tokens: int = 999):
+    """Build a subclass whose token counts come from a mocked HF processor."""
+
+    class _Sub(BaseMultimodalInputProcessor):
+        # ``get_num_multimodal_tokens`` reads ``processor`` via the property;
+        # the rest are abstracts the token-counting path doesn't touch.
+        @property
+        def processor(self):
+            return self._processor
+
+        @property
+        def tokenizer(self):
+            return None
+
+        @property
+        def config(self):
+            return None
+
+        @property
+        def dtype(self):
+            return None
+
+        def __call__(self, *args, **kwargs):
+            raise NotImplementedError
+
+        def call_with_text_prompt(self, *args, **kwargs):
+            raise NotImplementedError
+
+    # The token-counting path under test reads none of the base constructor's
+    # required args, so pass throwaways; only `_processor` (set below) matters.
+    instance = _Sub(model_path=None, config=None, tokenizer=None)
+    # HF processor mock returning the configured post-merger count.
+    hf_processor = SimpleNamespace(
+        _get_num_multimodal_tokens=MagicMock(
+            return_value={
+                "num_image_tokens": [hf_post_merger_tokens],
+                "num_video_tokens": [hf_post_merger_tokens],
+            }
+        )
+    )
+    instance._processor = hf_processor
+    return instance
+
+
+def test_get_num_tokens_per_image_delegates_to_hf_processor():
+    """The base image token count comes from the HF processor."""
+    expected_tokens = 999
+    sub = _make_subclass(hf_post_merger_tokens=expected_tokens)
+    image = Image.new("RGB", (8, 6))
+    assert sub.get_num_tokens_per_image(image=image) == expected_tokens
+    sub._processor._get_num_multimodal_tokens.assert_called_once()
+
+
+def test_get_num_tokens_per_video_delegates_to_hf_processor():
+    """The base video token count comes from the HF processor."""
+    expected_tokens = 777
+    sub = _make_subclass(hf_post_merger_tokens=expected_tokens)
+    frames = [Image.new("RGB", (8, 6)) for _ in range(3)]
+    assert sub.get_num_tokens_per_video(video=frames) == expected_tokens
+    sub._processor._get_num_multimodal_tokens.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Dummy contract defaults (BaseMultimodalDummyInputsBuilder).
+# ---------------------------------------------------------------------------
+class _StubBuilder(BaseMultimodalDummyInputsBuilder):
+    """Minimal concrete builder that satisfies the abstract properties.
+
+    Doesn't run any real processor / tokenizer — these tests only exercise the
+    default base-class behavior, never a deterministic-sizing implementation.
+    """
+
+    @property
+    def tokenizer(self):
+        return None
+
+    @property
+    def config(self):
+        return None
+
+    @property
+    def model_path(self):
+        return ""
+
+
+def test_get_mm_max_tokens_per_item_default_empty():
+    assert _StubBuilder().get_mm_max_tokens_per_item() == {}
+
+
+def test_get_dummy_mm_data_for_tokens_default_raises_not_implemented():
+    builder = _StubBuilder()
+    with pytest.raises(NotImplementedError):
+        builder.get_dummy_mm_data_for_tokens(max_tokens_per_modality={"image": 1024})

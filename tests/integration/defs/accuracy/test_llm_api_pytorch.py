@@ -7261,6 +7261,42 @@ class TestGLM5FP8(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+class TestGLM52(LlmapiAccuracyTestHarness):
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(8)
+    @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
+    def test_nvfp4(self, tp_size, ep_size):
+        # GLM-5.2 reuses the DeepSeek-V3.2 path (MLA + DSA) with cross-layer
+        # indexer sharing. NVFP4 weights run on the CuteDSL MoE backend with
+        # MTP speculative decoding. The checkpoint keeps the leading dense
+        # layers and per-MoE-layer shared_experts / self_attn in higher
+        # precision.
+        model_name = "zai-org/GLM-5.2"
+        model_path = f"{llm_models_root()}/GLM-5.2-NVFP4"
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=128,
+                                              enable_padding=True),
+            moe_config=MoeConfig(backend="CUTEDSL"),
+            speculative_config=MTPDecodingConfig(max_draft_len=1),
+            enable_chunked_prefill=True,
+        )
+
+        with LLM(model_path,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=1,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 max_seq_len=8192,
+                 **pytorch_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = GSM8K(model_name)
+            task.evaluate(llm)
+
+
 @skip_pre_blackwell
 class TestStep3_7(LlmapiAccuracyTestHarness):
     # Step-3.7-Flash is a MoE model registered under the multimodal

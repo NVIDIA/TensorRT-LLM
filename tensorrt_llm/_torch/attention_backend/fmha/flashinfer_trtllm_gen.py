@@ -78,7 +78,7 @@ def _clear_multi_ctas_kv_counter_workspace(
         max_num_requests,
         multi_processor_count,
     )
-    fmha_workspace.narrow(0, 0, counter_size).zero_()
+    fmha_workspace.flatten().narrow(0, 0, counter_size).zero_()
 
 
 def _get_multi_ctas_kv_counter_size(
@@ -86,7 +86,7 @@ def _get_multi_ctas_kv_counter_size(
     max_num_requests: int,
     multi_processor_count: Optional[int],
 ) -> int:
-    return max(num_heads * max_num_requests, multi_processor_count or 0)
+    return max(num_heads * max_num_requests, multi_processor_count or 0) * torch.int32.itemsize
 
 
 def _get_bmm1_scale_log2(bmm1_scale: torch.Tensor) -> torch.Tensor:
