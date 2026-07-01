@@ -18,11 +18,23 @@ import json
 import pytest
 import torch
 
+from tensorrt_llm.llmapi.reasoning_parser import (
+    HARMONY_FINAL_CHANNEL_TRIGGER,
+    HARMONY_REASONING_PARSER,
+    adapt_guided_decoding_params_for_reasoning_parser,
+    resolve_guided_decoding_reasoning_parser,
+    resolve_raw_guided_decoding_reasoning_parser,
+)
 from tensorrt_llm.llmapi.thinking_budget import (
     ThinkingBudgetLogitsProcessor,
     add_thinking_budget_logits_processor,
 )
-from tensorrt_llm.sampling_params import MAX_TOP_LOGPROBS, SamplingParams, check_logprobs_limit
+from tensorrt_llm.sampling_params import (
+    MAX_TOP_LOGPROBS,
+    GuidedDecodingParams,
+    SamplingParams,
+    check_logprobs_limit,
+)
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
     CompletionRequest,
@@ -61,6 +73,164 @@ def test_chat_top_logprobs_request_limit():
             logprobs=True,
             top_logprobs=MAX_TOP_LOGPROBS + 1,
         )
+
+
+def test_harmony_guided_decoding_triggers_on_final_channel():
+    guided_decoding = GuidedDecodingParams(json={"type": "object"})
+
+    adapted = adapt_guided_decoding_params_for_reasoning_parser(
+        guided_decoding, HARMONY_REASONING_PARSER
+    )
+
+    assert adapted is not guided_decoding
+    assert adapted.structural_tag is not None
+    stag = json.loads(adapted.structural_tag)
+    assert stag["type"] == "structural_tag"
+
+    fmt = stag["format"]
+    assert fmt["type"] == "triggered_tags"
+    assert fmt["triggers"] == [HARMONY_FINAL_CHANNEL_TRIGGER]
+    assert fmt["stop_after_first"] is True
+
+    tag = fmt["tags"][0]
+    assert tag["begin"] == HARMONY_FINAL_CHANNEL_TRIGGER
+    assert tag["end"] == ""
+    assert tag["content"] == {
+        "type": "json_schema",
+        "json_schema": {"type": "object"},
+    }
+
+
+def test_harmony_guided_decoding_accepts_json_schema_string():
+    json_schema = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+    }
+    guided_decoding = GuidedDecodingParams(json=json.dumps(json_schema))
+
+    adapted = adapt_guided_decoding_params_for_reasoning_parser(
+        guided_decoding, HARMONY_REASONING_PARSER
+    )
+
+    stag = json.loads(adapted.structural_tag)
+    content = stag["format"]["tags"][0]["content"]
+    assert content == {
+        "type": "json_schema",
+        "json_schema": json_schema,
+    }
+
+
+def test_guided_decoding_preserves_top_level_schema_property():
+    json_schema = {
+        "type": "object",
+        "schema": {"type": "string"},
+    }
+
+    adapted = adapt_guided_decoding_params_for_reasoning_parser(
+        GuidedDecodingParams(json=json_schema), HARMONY_REASONING_PARSER
+    )
+
+    stag = json.loads(adapted.structural_tag)
+    assert stag["format"]["tags"][0]["content"]["json_schema"] == json_schema
+
+
+@pytest.mark.parametrize(
+    ("reasoning_parser", "model_type", "expected"),
+    [
+        (None, "gpt_oss", HARMONY_REASONING_PARSER),
+        (None, "llama", None),
+        ("qwen3", "llama", "qwen3"),
+    ],
+)
+def test_resolve_guided_decoding_reasoning_parser(reasoning_parser, model_type, expected):
+    assert resolve_guided_decoding_reasoning_parser(reasoning_parser, model_type) == expected
+
+
+@pytest.mark.parametrize(
+    ("reasoning_parser", "model_type", "guided_backend", "expected"),
+    [
+        (None, "gpt_oss", "xgrammar", HARMONY_REASONING_PARSER),
+        (HARMONY_REASONING_PARSER, "llama", "xgrammar", HARMONY_REASONING_PARSER),
+        (None, "gpt_oss", "llguidance", None),
+        ("qwen3", "qwen3", "xgrammar", None),
+        ("gemma4", "gemma4", "xgrammar", None),
+    ],
+)
+def test_resolve_raw_guided_decoding_reasoning_parser(
+    reasoning_parser, model_type, guided_backend, expected
+):
+    assert (
+        resolve_raw_guided_decoding_reasoning_parser(reasoning_parser, model_type, guided_backend)
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("reasoning_parser", "model_type", "guided_backend"),
+    [
+        (None, "gpt_oss", "llguidance"),
+        ("qwen3", "qwen3", "xgrammar"),
+        ("gemma4", "gemma4", "xgrammar"),
+    ],
+)
+def test_raw_llm_preserves_guides_outside_harmony_xgrammar(
+    reasoning_parser, model_type, guided_backend
+):
+    guided_decoding = GuidedDecodingParams(json_object=True)
+    resolved_parser = resolve_raw_guided_decoding_reasoning_parser(
+        reasoning_parser, model_type, guided_backend
+    )
+
+    # These combinations worked without raw final-content adaptation before
+    # bug 6284101; keep the caller's ordinary guide unchanged.
+    assert (
+        adapt_guided_decoding_params_for_reasoning_parser(guided_decoding, resolved_parser)
+        is guided_decoding
+    )
+
+
+def test_plain_model_guided_decoding_is_unchanged():
+    guided_decoding = GuidedDecodingParams(json_object=True)
+    reasoning_parser = resolve_guided_decoding_reasoning_parser(None, "llama")
+
+    assert (
+        adapt_guided_decoding_params_for_reasoning_parser(guided_decoding, reasoning_parser)
+        is guided_decoding
+    )
+
+
+def test_reasoning_parser_guided_decoding_uses_sequence_for_normal_parser():
+    guided_decoding = GuidedDecodingParams(json_object=True)
+
+    adapted = adapt_guided_decoding_params_for_reasoning_parser(guided_decoding, "qwen3")
+
+    stag = json.loads(adapted.structural_tag)
+    assert stag["type"] == "structural_tag"
+
+    fmt = stag["format"]
+    assert fmt["type"] == "sequence"
+    reasoning_element, content_element = fmt["elements"]
+    assert reasoning_element == {
+        "type": "tag",
+        "begin": "<think>",
+        "content": {"type": "any_text"},
+        "end": "</think>",
+    }
+    assert content_element == {
+        "type": "json_schema",
+        "json_schema": {"type": "object"},
+    }
+
+
+def test_existing_structural_tag_guided_decoding_is_unchanged():
+    guided_decoding = GuidedDecodingParams(
+        structural_tag='{"type":"structural_tag","format":{"type":"any_text"}}'
+    )
+
+    assert (
+        adapt_guided_decoding_params_for_reasoning_parser(guided_decoding, HARMONY_REASONING_PARSER)
+        is guided_decoding
+    )
 
 
 def test_chat_template_request_override_respects_runtime_policy():

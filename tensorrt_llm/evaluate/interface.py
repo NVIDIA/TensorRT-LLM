@@ -26,6 +26,8 @@ from tqdm import tqdm
 import tensorrt_llm.profiler as profiler
 
 from ..llmapi import RequestOutput
+from ..llmapi.reasoning_parser import (HARMONY_REASONING_PARSER,
+                                       ReasoningParserFactory)
 from ..logger import logger
 from ..sampling_params import SamplingParams
 
@@ -64,6 +66,48 @@ def get_model_context(llm: Any) -> tuple[str, str]:
     if model_type is None:
         raise KeyError(f"'model_type' is missing from {config_path}.")
     return str(model_dir), str(model_type)
+
+
+def extract_final_content_from_generation(
+    output: RequestOutput,
+    *,
+    reasoning_parser: Optional[str] = None,
+) -> str:
+    """Return the scoreable final-answer text from a raw generation.
+
+    Handles plain JSON text, Harmony token transcripts, and normal reasoning
+    parser formats like `<think>...</think>{...}` for eval-only scoring.
+    """
+    # Eval scoring has historically used the first completion choice.
+    text = output.outputs[0].text
+
+    if reasoning_parser is None:
+        # Plain models keep the raw output; never guess a parser from text.
+        return text
+
+    if reasoning_parser.lower() == HARMONY_REASONING_PARSER:
+        # Harmony preserves final-channel boundaries in token ids, not text.
+        try:
+            from tensorrt_llm.serve.harmony_adapter import get_harmony_adapter
+
+            parsed = get_harmony_adapter().harmony_output_to_openai(
+                output.outputs[0].token_ids)
+            content = parsed.get("content")
+            if not parsed.get("_harmony_parsing_failed") and isinstance(
+                    content, str):
+                return content
+        except (ImportError, AttributeError, TypeError, RuntimeError,
+                ValueError):
+            return text
+        return text
+
+    try:
+        # Normal reasoning formats expose final content through their parser.
+        parser = ReasoningParserFactory.create_reasoning_parser(
+            reasoning_parser)
+        return parser.parse(text).content or text
+    except (AttributeError, TypeError, ValueError):
+        return text
 
 
 class Evaluator(ABC):
