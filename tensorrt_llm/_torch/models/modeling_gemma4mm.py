@@ -1053,6 +1053,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             mm_token_type_ids=mm_token_type_ids,
             ple_input_ids=ple_input_ids,
             lora_params=kwargs.get("lora_params", None),
+            spec_metadata=kwargs.get("spec_metadata", None),
         )
         return logits
 

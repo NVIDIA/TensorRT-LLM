@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import copy
 import dataclasses
 import os
@@ -1424,6 +1439,23 @@ class KvCacheCreator:
         draft_build_kv_cache_config = (draft_kv_cache_config
                                        if draft_kv_cache_config is not None else
                                        self_kv_cache_config)
+
+        # Gemma4 assistants read the target model's KV cache directly. They
+        # still need a small draft manager for request/slot bookkeeping, but
+        # must not reserve a second full-size GPU cache during final capacity
+        # allocation.
+        if (self._draft_model_engine is not None
+                and self._draft_model_engine.kv_cache_manager_key
+                == ResourceManagerType.KV_CACHE_MANAGER):
+            draft_build_kv_cache_config = copy.deepcopy(
+                draft_build_kv_cache_config)
+            draft_build_kv_cache_config.max_gpu_total_bytes = 0
+            draft_build_kv_cache_config.free_gpu_memory_fraction = None
+            draft_build_kv_cache_config.host_cache_size = 0
+            draft_build_kv_cache_config.max_tokens = max(
+                self._max_num_tokens,
+                self._max_seq_len * self._max_batch_size,
+            )
 
         # Two-model speculative decoding: draft model has separate engine
         if self._draft_model_engine is not None:
