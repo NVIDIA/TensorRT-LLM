@@ -194,7 +194,15 @@ void initBindings(nb::module_& m)
         .def_prop_ro("kv_cache_transfer_start", &GenLlmReq::getKvCacheTransferStart)
         .def_prop_ro("kv_cache_transfer_end", &GenLlmReq::getKvCacheTransferEnd)
         .def_prop_ro("kv_cache_size", &GenLlmReq::getKvCacheSize)
+        // Let the Python (v2) transceiver record per-request KV-transfer timing/size into perf metrics like the
+        // C++ (v1) one. Each timing setter is overloaded: the no-arg form stamps steady_clock::now() (used by
+        // the v2 transceiver), the explicit-time form keeps the original metric API (setters apply
+        // maybeToGlobalSteadyClock).
+        .def("set_kv_cache_transfer_start",
+            [](GenLlmReq& self) { self.setKvCacheTransferStart(std::chrono::steady_clock::now()); })
         .def("set_kv_cache_transfer_start", &GenLlmReq::setKvCacheTransferStart, nb::arg("time"))
+        .def("set_kv_cache_transfer_end",
+            [](GenLlmReq& self) { self.setKvCacheTransferEnd(std::chrono::steady_clock::now()); })
         .def("set_kv_cache_transfer_end", &GenLlmReq::setKvCacheTransferEnd, nb::arg("time"))
         .def("set_kv_cache_size", &GenLlmReq::setKvCacheSize, nb::arg("target_buffer_size"))
         .def("update_kv_cache_size", &GenLlmReq::updateKvCacheSize, nb::arg("target_buffer_size"))
