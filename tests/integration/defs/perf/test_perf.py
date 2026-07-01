@@ -60,6 +60,7 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
     "llama_v3.1_nemotron_ultra_253b",
     "llama_v3.1_nemotron_ultra_253b_fp8",
     "kimi_k2_nvfp4",
+    "kimi_k2.5_fp4",
     "nemotron_3_super_120b_nvfp4",
     "nemotron_3_super_120b_nvfp4_mtp",
     "nemotron_3_ultra_550b_nvfp4",

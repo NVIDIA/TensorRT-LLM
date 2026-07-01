@@ -24,7 +24,8 @@ from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             _has_mm_payload_keys,
                                             check_mm_embed_cumsum_if_needed,
                                             strip_mm_data_for_generation)
-from tensorrt_llm.inputs.registry import (create_input_processor,
+from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
+                                          create_input_processor,
                                           create_input_processor_with_hash)
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig,
                                           EncodeCudaGraphConfig,
@@ -49,6 +50,8 @@ from ..expert_statistic import ExpertStatistic
 from ..memory_buffer_utils import clear_memory_buffers, with_shared_pool
 from ..metadata import KVCacheParams
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
+from ..models.modeling_multimodal_encoder import MultimodalEncoderMixin
+from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_multimodal_utils import filter_mm_token_from_input_ids
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.fused_moe.moe_load_balancer import (MoeLoadBalancer,
@@ -256,6 +259,12 @@ class PyTorchModelEngine(ModelEngine):
         self.max_num_tokens = max_num_tokens
         self.max_seq_len = max_seq_len
         self.max_beam_width = max_beam_width
+        # Multimodal encoder runtime sizes; fall back to LLM-side values when
+        # the encoder-specific knobs are unset.
+        (
+            self.encoder_batch_size,
+            self.encoder_max_num_tokens,
+        ) = llm_args.get_encoder_runtime_sizes()
 
         if checkpoint_loader is None:
             checkpoint_loader = _construct_checkpoint_loader(
@@ -353,6 +362,7 @@ class PyTorchModelEngine(ModelEngine):
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
             self.model.extra_attrs = {}
+        self._set_up_multimodal_encoder_attn_metadata()
         if self.llm_args.enable_layerwise_nvtx_marker:
             layerwise_nvtx_marker = LayerwiseNvtxMarker()
             module_prefix = 'Model'
@@ -1871,6 +1881,42 @@ class PyTorchModelEngine(ModelEngine):
 
         return self.attn_metadata
 
+    @property
+    def is_multimodal(self) -> bool:
+        """True iff this engine drives a multimodal model.
+
+        Primary signal: ``MultimodalModelMixin`` is the
+        canonical marker — multimodal LM classes inherit from it. Until
+        every model has migrated (Mistral done; Qwen-VL, Nemotron, Gemma,
+        Phi-4-MM, etc. pending), fall back to whether the input processor
+        subclasses ``BaseMultimodalInputProcessor``, which every
+        multimodal model necessarily provides at the data boundary.
+
+        TODO(TRTLLM-13542): Once all multimodal models inherit
+        ``MultimodalModelMixin``, drop the input-processor fallback so the
+        model class itself is the single source of truth.
+        """
+        if isinstance(self.model, MultimodalModelMixin):
+            return True
+        return isinstance(self.input_processor, BaseMultimodalInputProcessor)
+
+    def _set_up_multimodal_encoder_attn_metadata(self) -> None:
+        """Construct AttentionMetadata for any multimodal encoders inside the
+        loaded model, using the engine's encoder runtime sizes
+        (`encoder_max_batch_size` / `encoder_max_num_tokens`, falling back to
+        the LLM-side `max_batch_size` / `max_num_tokens`).
+
+        Mirrors `_set_up_attn_metadata` for the LLM backbone: encoders opt in
+        by inheriting `MultimodalEncoderMixin`, and the engine drives the construction
+        so the sizes match ``llm_args.get_encoder_runtime_sizes()`` rather
+        than being hardcoded inside each encoder's ``__init__``.
+        """
+        for module in self.model.modules():
+            if isinstance(module, MultimodalEncoderMixin):
+                module.setup_attn_metadata(
+                    max_num_requests=self.encoder_batch_size,
+                    max_num_tokens=self.encoder_max_num_tokens)
+
     def _set_up_spec_metadata(
             self,
             spec_resource_manager: Optional[BaseResourceManager],
@@ -2424,6 +2470,34 @@ class PyTorchModelEngine(ModelEngine):
             "cross_attn_metadata": cross_attn_metadata,
             "skip_cross_kv_projection": skip_cross_kv_projection,
         }
+
+    def _ship_multimodal_indices(
+        self,
+        inputs: dict,
+        *,
+        mm_token_indices_cpu: torch.Tensor,
+        text_token_indices_cpu: torch.Tensor,
+        num_ctx_tokens: int,
+        total_num_tokens: int,
+    ) -> None:
+        """Pin and async-copy executor-precomputed MM/text token indices into
+        ``inputs`` so ``fuse_input_embeds`` can skip its ``torch.where`` host
+        sync. If ``total_num_tokens > num_ctx_tokens`` (KV-cache path with
+        extend/draft tokens appended after the indices were computed), the
+        post-context positions are appended as text. Current speculative decode
+        paths do not append multimodal placeholders after the context tokens."""
+        mm_token_indices_cpu = maybe_pin_memory(mm_token_indices_cpu)
+        inputs['mm_token_indices'] = mm_token_indices_cpu.to("cuda",
+                                                             non_blocking=True)
+        if total_num_tokens > num_ctx_tokens:
+            extra_text = torch.arange(num_ctx_tokens,
+                                      total_num_tokens,
+                                      dtype=text_token_indices_cpu.dtype)
+            text_token_indices_cpu = torch.cat(
+                [text_token_indices_cpu, extra_text])
+        text_token_indices_cpu = maybe_pin_memory(text_token_indices_cpu)
+        inputs['text_token_indices'] = text_token_indices_cpu.to(
+            "cuda", non_blocking=True)
 
     def _can_use_incremental_update(
             self, scheduled_requests: ScheduledRequests,
@@ -3144,13 +3218,19 @@ class PyTorchModelEngine(ModelEngine):
 
             request.py_batch_idx = request.py_seq_slot
 
-        if len(multimodal_params_list) > 0:
-            # discard the text token indices as it only includes context tokens at this moment
-            _, mm_token_indices = self._prepare_multimodal_indices(input_ids)
-        else:
-            mm_token_indices = None
         num_ctx_requests = scheduled_requests.num_context_requests
         num_ctx_tokens = len(input_ids)
+        if len(multimodal_params_list) > 0:
+            # input_ids holds only context tokens here; extend/draft tokens are
+            # appended below and are by construction text, so we reuse the
+            # CPU-side text_token_indices and just extend it with the
+            # post-context arange instead of recomputing via a bool mask +
+            # torch.where over the full range.
+            text_token_indices_ctx, mm_token_indices = \
+                self._prepare_multimodal_indices(input_ids)
+        else:
+            text_token_indices_ctx = None
+            mm_token_indices = None
 
         # Requests with draft tokens are treated like extend requests. Dummy extend requests should be
         # at the end of extend_requests.
@@ -3916,13 +3996,13 @@ class PyTorchModelEngine(ModelEngine):
                     [item[1] for item in all_rank_num_tokens])
 
         if mm_token_indices is not None:
-            mask = torch.ones(total_num_tokens, dtype=torch.bool)
-            mask[mm_token_indices] = False
-            mm_idx = maybe_pin_memory(mm_token_indices)
-            inputs['mm_token_indices'] = mm_idx.to("cuda", non_blocking=True)
-            text_idx = maybe_pin_memory(torch.where(mask)[0])
-            inputs['text_token_indices'] = text_idx.to("cuda",
-                                                       non_blocking=True)
+            self._ship_multimodal_indices(
+                inputs,
+                mm_token_indices_cpu=mm_token_indices,
+                text_token_indices_cpu=text_token_indices_ctx,
+                num_ctx_tokens=num_ctx_tokens,
+                total_num_tokens=total_num_tokens,
+            )
 
         num_generation_tokens = len(generation_requests) + len(
             extend_requests) + sum(draft_lens) + len(first_draft_requests)
@@ -3988,6 +4068,21 @@ class PyTorchModelEngine(ModelEngine):
         num_tokens = len(input_ids)
         assert num_tokens <= self.max_num_tokens, (
             "num_tokens should be less than or equal to max_num_tokens")
+        # Compute MM/text token indices on CPU input_ids so that
+        # fuse_input_embeds can skip its torch.where host sync. Must run before
+        # the input_ids list is rebound to a tensor below. Skipped when
+        # ``self.model`` is a vision encoder (no ``config.vocab_size`` to filter
+        # against, and its forward doesn't consume the indices anyway); this
+        # is a structural check on the model rather than a flag lookup, so it
+        # naturally extends to any future "LLM-less" engine setup.
+        _model_config = getattr(self.model, "config", None)
+        if (len(multimodal_params_list) > 0
+                and getattr(_model_config, "vocab_size", None) is not None):
+            text_token_indices_cpu, mm_token_indices_cpu = \
+                self._prepare_multimodal_indices(input_ids)
+        else:
+            text_token_indices_cpu = None
+            mm_token_indices_cpu = None
         input_ids = torch.tensor(input_ids,
                                  dtype=torch.int,
                                  pin_memory=prefer_pinned())
@@ -4056,6 +4151,17 @@ class PyTorchModelEngine(ModelEngine):
             "multimodal_params": multimodal_params_list,
             'resource_manager': resource_manager,
         }
+
+        if mm_token_indices_cpu is not None:
+            # No extend/draft tokens in the no-cache path, so num_tokens covers
+            # the full range and the helper's arange/cat branch is skipped.
+            self._ship_multimodal_indices(
+                inputs,
+                mm_token_indices_cpu=mm_token_indices_cpu,
+                text_token_indices_cpu=text_token_indices_cpu,
+                num_ctx_tokens=num_tokens,
+                total_num_tokens=num_tokens,
+            )
 
         if bool(lora_params):
             inputs['lora_params'] = lora_params

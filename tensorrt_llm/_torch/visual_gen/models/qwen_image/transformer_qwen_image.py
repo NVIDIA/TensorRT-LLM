@@ -32,6 +32,7 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 _WEIGHT_KEY_REMAPS = [
     (".net.0.proj.", ".up_proj."),
@@ -825,6 +826,8 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
             **linear_kwargs,
         )
 
+        self.apply_quant_config_exclude_modules()
+
     @property
     def device(self) -> torch.device:
         return self.proj_out.weight.device
@@ -872,6 +875,26 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
                 if buffer.is_floating_point():
                     buffer.data = buffer.data.to(target_dtype)
         return self
+
+    def apply_quant_config_exclude_modules(self) -> None:
+        quant_config = self.model_config.quant_config
+        if quant_config is None or quant_config.exclude_modules is None:
+            return
+
+        kv_cache_quant_algo = quant_config.kv_cache_quant_algo if quant_config else None
+        no_quant_config = QuantConfig(kv_cache_quant_algo=kv_cache_quant_algo)
+
+        for name, module in self.named_modules():
+            if isinstance(module, Linear):
+                is_excluded = quant_config.is_module_excluded_from_quantization(name)
+                if is_excluded and getattr(module, "quant_config", None) is not None:
+                    module.quant_config = no_quant_config
+                    if getattr(module, "_weights_created", False):
+                        # Rebuild weights so quant_method and parameter layout match the no-quant config.
+                        module._weights_created = False
+                        module._parameters.clear()
+                        module._buffers.clear()
+                        module.create_weights()
 
     def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
         """Load HF ``transformer/*.safetensors`` state_dict.

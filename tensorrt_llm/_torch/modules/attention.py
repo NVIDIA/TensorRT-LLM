@@ -2,7 +2,7 @@ import functools
 import math
 import os
 import weakref
-from typing import List, Optional, Union, cast
+from typing import List, Optional, Tuple, Union, cast
 
 import torch
 from torch import nn
@@ -144,6 +144,77 @@ def attn_custom_op_inplace(
     )
 
 
+def _helix_zero_kv_mask(
+        attn_metadata: AttentionMetadata,
+        num_tokens: int,
+        *,
+        seq_start: int = 0,
+        num_seqs: Optional[int] = None) -> Optional[torch.Tensor]:
+    """Return a per-token bool mask marking tokens with zero local KV on this CP rank.
+
+    These tokens belong to sequences for which this rank owns no KV blocks. Since
+    kv_lens_cuda is per-sequence, it is expanded to per-token using the
+    seq_lens_cuda query lengths, which stays correct when a sequence spans
+    multiple tokens (e.g. speculative decoding). The buffers are static and
+    output_size is passed to repeat_interleave, so the mask is CUDA-graph safe.
+    Returns None when a length buffer is unavailable.
+
+    Args:
+        attn_metadata: Attention metadata holding the length buffers.
+        num_tokens: Number of tokens covered by partial_o; used as the static
+            output_size of the per-token expansion.
+        seq_start: Index of the first sequence covered by partial_o. Defaults to
+            0 for generation-only callers; MLA passes num_contexts to select the
+            generation slice.
+        num_seqs: Number of sequences covered by partial_o. Defaults to all
+            sequences after seq_start.
+    """
+    kv_lens = getattr(attn_metadata, "kv_lens_cuda", None)
+    seq_lens = getattr(attn_metadata, "seq_lens_cuda", None)
+    if kv_lens is None or seq_lens is None:
+        return None
+    if num_seqs is None:
+        num_seqs = attn_metadata.num_seqs - seq_start
+    seq_slice = slice(seq_start, seq_start + num_seqs)
+    per_seq_mask = kv_lens[seq_slice] == 0
+    return torch.repeat_interleave(per_seq_mask,
+                                   seq_lens[seq_slice],
+                                   output_size=num_tokens)
+
+
+def _helix_sanitize_empty_kv(
+    partial_o: torch.Tensor,
+    softmax_stats: torch.Tensor,
+    zero_kv_mask: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Force zero-local-KV rows to a no-op contribution for the Helix combine.
+
+    A CP rank that owns no KV blocks for a token attends to zero keys, so the
+    attention kernel normalizes by a zero softmax sum and yields NaN. The combine
+    weights each rank by sum * exp(max - global_max), so such rows must contribute
+    softmax_stats of (-inf, 0) and a zeroed partial_o to act as a no-op. The rows
+    are selected by zero_kv_mask, which is robust regardless of what the kernel
+    wrote. Passing None disables sanitization.
+
+    Args:
+        partial_o: Partial attention output, shape [num_tokens, ...].
+        softmax_stats: Per (token, head) (max, sum), shape [num_tokens, num_heads, 2].
+        zero_kv_mask: Bool tensor of shape [num_tokens], True where this rank has
+            zero local KV.
+    """
+    if zero_kv_mask is None:
+        return partial_o, softmax_stats
+    num_tokens = partial_o.shape[0]
+    mask = zero_kv_mask[:num_tokens].view(-1, 1)
+    # masked_fill overwrites masked rows regardless of their current (possibly NaN)
+    # value and is CUDA-graph safe due to static shapes.
+    partial_o = partial_o.masked_fill(mask, 0.0)
+    sm_max = softmax_stats[..., 0].masked_fill(mask, float("-inf"))
+    sm_sum = softmax_stats[..., 1].masked_fill(mask, 0.0)
+    softmax_stats = torch.stack([sm_max, sm_sum], dim=-1)
+    return partial_o, softmax_stats
+
+
 def _helix_post_process(
     partial_o: torch.Tensor,
     softmax_stats: torch.Tensor,
@@ -152,6 +223,7 @@ def _helix_post_process(
     value_dim: int,
     aux_stream: Optional[torch.cuda.Stream] = None,
     ln_events: Optional[list] = None,
+    zero_kv_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Helix CP post-processing: all-to-all exchange and combine partial
     attention outputs across CP ranks.
@@ -160,10 +232,17 @@ def _helix_post_process(
     dimension that differs between the two callers is *value_dim*
     (``head_dim`` for MHA, ``kv_lora_rank`` for MLA).
 
+    zero_kv_mask marks tokens for which this CP rank owns no KV blocks; those rows
+    are forced to a no-op contribution before the exchange (see
+    _helix_sanitize_empty_kv).
+
     When *aux_stream* and *ln_events* are provided the two
     ``.contiguous()`` calls in the FIFO-v1 path are overlapped on
     separate CUDA streams for better performance.
     """
+    partial_o, softmax_stats = _helix_sanitize_empty_kv(partial_o,
+                                                        softmax_stats,
+                                                        zero_kv_mask)
     if mapping.cp_config.get("use_nccl_for_alltoall", True):
         # NCCL-based implementation using alltoall_helix.
         chunks = []
@@ -692,11 +771,17 @@ class Attention(nn.Module):
             is_gen_only=False)
 
     def _helix_post_process(self, partial_o: torch.Tensor,
-                            softmax_stats: torch.Tensor) -> torch.Tensor:
+                            softmax_stats: torch.Tensor,
+                            attn_metadata: AttentionMetadata) -> torch.Tensor:
         """Helix CP post-processing: all-to-all exchange and combine partial
         attention outputs across CP ranks."""
-        return _helix_post_process(partial_o, softmax_stats, self.mapping,
-                                   self.num_heads_tp_cp, self.head_dim)
+        zero_kv_mask = _helix_zero_kv_mask(attn_metadata, partial_o.shape[0])
+        return _helix_post_process(partial_o,
+                                   softmax_stats,
+                                   self.mapping,
+                                   self.num_heads_tp_cp,
+                                   self.head_dim,
+                                   zero_kv_mask=zero_kv_mask)
 
     def _attn_impl(
         self,
@@ -757,7 +842,8 @@ class Attention(nn.Module):
                 ))
             if isinstance(attn_output, tuple):
                 attn_output = attn_output[0]
-            attn_output = self._helix_post_process(attn_output, softmax_stats)
+            attn_output = self._helix_post_process(attn_output, softmax_stats,
+                                                   attn_metadata)
             return attn_output, None
 
         # Don't set out_scale if o_proj has pre_quant_scale — this prevents
@@ -1111,6 +1197,10 @@ def _mla_dsa_proj_fake(
     k_pe = hidden_states.new_empty([num_tokens, mla_layer.qk_rope_head_dim])
     latent_cache = hidden_states.new_empty(
         [num_tokens, mla_layer.kv_lora_rank + mla_layer.qk_rope_head_dim])
+    if indexer is None:
+        # DSA "shared" layer: no indexer, mirror forward_dsa_proj's early
+        # return of only the 4 base tensors (no indexer intermediates).
+        return [q, compressed_kv, k_pe, latent_cache]
     # Indexer intermediates: q_fp8, k_fp8, k_scale, weights, q_scale.
     # Under FP4 q_fp8's trailing dim is head_dim // 2 (two E2M1 codes per
     # byte) and q_scale carries one int32 per (token, head) packing four
@@ -1812,9 +1902,21 @@ class MLA(nn.Module):
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
             assert self.kv_lora_rank == kv_lora_rank
 
-            return _helix_post_process(partial_o, softmax_stats, self.mapping,
-                                       self.num_heads_tp_cp, kv_lora_rank,
-                                       self.aux_stream, self.ln_events)
+            # MLA processes only the generation token slice here, so build the
+            # mask from the generation sequence range [num_contexts, num_seqs).
+            zero_kv_mask = _helix_zero_kv_mask(
+                attn_metadata,
+                partial_o.shape[0],
+                seq_start=attn_metadata.num_contexts,
+                num_seqs=attn_metadata.num_generations)
+            return _helix_post_process(partial_o,
+                                       softmax_stats,
+                                       self.mapping,
+                                       self.num_heads_tp_cp,
+                                       kv_lora_rank,
+                                       self.aux_stream,
+                                       self.ln_events,
+                                       zero_kv_mask=zero_kv_mask)
         else:
             attn_output = attn_backend.forward(
                 q,
@@ -2015,16 +2117,6 @@ class MLA(nn.Module):
             k_pe_gen = k_pe[num_ctx_tokens:, ...]
             if latent_cache_gen is None:
                 latent_cache_gen = latent_cache[num_ctx_tokens:, ...]
-            if self.apply_rotary_emb:
-                assert position_ids is not None
-                # position_ids spans [ctx..., gen...] in mixed batches; gen
-                # positions start at num_ctx_tokens.
-                gen_position_ids = position_ids[..., num_ctx_tokens:]
-                k_pe_gen = self.apply_rope(q_gen, k_pe_gen, gen_position_ids)
-                # External RoPE is only used by backends that do not handle
-                # fused RoPE internally, so keep latent_cache in sync.
-                latent_cache_gen = torch.cat([compressed_kv_gen, k_pe_gen],
-                                             dim=-1)
 
             if self.llama_4_scaling:
                 q_gen = self._attention_scaling(
@@ -2113,6 +2205,11 @@ class MLA(nn.Module):
         if use_short_mha_for_ctx and attn_metadata.num_generations == 0:
             return [q, compressed_kv, k_pe, latent_cache]
 
+        # DSA "shared" layer: no indexer; reuses the previous full layer's
+        # top-k (in forward_dsa_attn), so skip the projection.
+        if self.mqa.indexer is None:
+            return [q, compressed_kv, k_pe, latent_cache]
+
         # pre_indexer_proj is the CUDA-graph-safe portion: pure token-wise
         # compute (cublas_mm, rope, FP4/FP8 quantize, weight scaling) with no
         # access to batch-specific metadata or the k cache. Returns q_scale
@@ -2166,6 +2263,14 @@ class MLA(nn.Module):
 
         if use_short_mha_for_ctx and num_generations == 0:
             topk_indices = None
+        elif self.mqa.indexer is None:
+            # DSA "shared" layer: reuse the previous full layer's top-k. These
+            # are local token positions, so they are layer-agnostic; each layer
+            # applies its own paged-KV transform downstream.
+            topk_indices = getattr(attn_metadata, 'shared_topk_indices', None)
+            assert topk_indices is not None, (
+                "DSA shared layer has no top-k from a preceding full indexer "
+                "layer; check the index_topk_pattern/freq schedule.")
         else:
             q_fp8, k_fp8, k_scale, weights, q_scale = indexer_intermediates
             # Slice indexer intermediates to actual num_tokens (they were
@@ -2184,6 +2289,9 @@ class MLA(nn.Module):
                 weights,
                 q_scale=q_scale,
             )
+            # Stash for subsequent DSA "shared" layers (full -> shared reuse);
+            # unused by a dense per-layer indexer.
+            attn_metadata.shared_topk_indices = topk_indices
 
         assert output is not None, "output must be provided"
 
@@ -2970,6 +3078,35 @@ class MLA(nn.Module):
                 device=q.device,
             )
 
+            def _mla_gen_rope():
+                if self.apply_rotary_emb:
+                    # Non-fused backends (Vanilla / FlashInfer) do not fuse RoPE
+                    # in the attention kernel. Reuse apply_rope, which rotates
+                    # q's q_pe slice in place, then copy rotated k_pe into the
+                    # latent cache that the backend appends.
+                    assert position_ids is not None
+                    assert latent_cache is not None
+                    gen_position_ids = position_ids[
+                        ..., attn_metadata.num_ctx_tokens:]
+                    k_pe_rope = self.apply_rope(q, k_pe, gen_position_ids)
+                    fused_q[..., self.kv_lora_rank:] = q_pe
+                    latent_cache[..., self.kv_lora_rank:] = k_pe_rope
+                else:
+                    # Fused backend (TRTLLM): RoPE, latent-cache append and the
+                    # trtllm-gen scheduler buffers are all produced in-kernel.
+                    self.mqa.mla_rope_generation(
+                        fused_q,
+                        q_pe,
+                        latent_cache,
+                        attn_metadata,
+                        cu_q_seqlens,
+                        cu_kv_seqlens,
+                        fmha_scheduler_counter,
+                        mla_bmm1_scale,
+                        mla_bmm2_scale,
+                        quant_q_buffer,
+                    )
+
             rope_stream = self.aux_stream if not has_fp8_kv_cache else None
             if self.k_b_proj_trans.dtype == torch.bfloat16:
                 # [num_heads, num_tokens, self.qk_nope_head_dim]
@@ -2984,18 +3121,7 @@ class MLA(nn.Module):
                     lambda: self._bmm_bf16_out(
                         q_nope_t, self.k_b_proj_trans,
                         self.k_b_proj_trans.transpose(1, 2), q_nope_out),
-                    lambda: self.mqa.mla_rope_generation(
-                        fused_q,
-                        q_pe,
-                        latent_cache,
-                        attn_metadata,
-                        cu_q_seqlens,
-                        cu_kv_seqlens,
-                        fmha_scheduler_counter,
-                        mla_bmm1_scale,
-                        mla_bmm2_scale,
-                        quant_q_buffer,
-                    ),
+                    _mla_gen_rope,
                     self.ln_events[0],
                     self.ln_events[1],
                     rope_stream,
@@ -3014,18 +3140,7 @@ class MLA(nn.Module):
                         self.k_b_proj_trans_dequant,
                         self.use_cute_dsl_blockscaling_bmm,
                     ),
-                    lambda: self.mqa.mla_rope_generation(
-                        fused_q,
-                        q_pe,
-                        latent_cache,
-                        attn_metadata,
-                        cu_q_seqlens,
-                        cu_kv_seqlens,
-                        fmha_scheduler_counter,
-                        mla_bmm1_scale,
-                        mla_bmm2_scale,
-                        quant_q_buffer,
-                    ),
+                    _mla_gen_rope,
                     self.ln_events[0],
                     self.ln_events[1],
                     rope_stream,

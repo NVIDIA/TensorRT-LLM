@@ -5,7 +5,7 @@ import sys
 import weakref
 from dataclasses import dataclass, field
 from itertools import chain
-from typing import Any, Dict, Literal, NewType, Optional, TypeAlias, cast
+from typing import Any, Dict, NewType, Optional, TypeAlias, cast
 
 if sys.version_info[:2] >= (3, 12):
     from typing import override
@@ -126,11 +126,6 @@ class FlashInferWrappers:
 @dataclass(kw_only=True)
 class FlashInferAttentionMetadata(AttentionMetadata):
     workspace_buffer: Optional[torch.Tensor] = None
-
-    # cache concat/split kernels when using PD disaggregation
-    # expects KV cache in [max_num_pages, 2, num_kv_heads, page_size, head_dim] layout,
-    # so set kv_layout as "HND" here
-    kv_layout: Literal["NHD", "HND"] = "HND"
 
     paged_kv_indptr_decode: torch.Tensor = field(init=False)
     paged_kv_indptr_prefill: torch.Tensor = field(init=False)
@@ -1390,33 +1385,6 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             self.has_fp8_kv_cache = self.quant_config.layer_quant_mode.has_fp8_kv_cache(
             )
 
-    def mla_rope_generation(
-        self,
-        fused_q: torch.Tensor,
-        q_pe: torch.Tensor,
-        latent_cache: torch.Tensor,
-        metadata,
-        cu_q_seqlens: torch.Tensor,
-        cu_kv_seqlens: torch.Tensor,
-        fmha_scheduler_counter: torch.Tensor,
-        mla_bmm1_scale,
-        mla_bmm2_scale,
-        quant_q_buffer,
-        out_scale=None,
-    ) -> None:
-        """Stub for MLA generation rope step used when FlashInfer is the mqa backend.
-
-        FlashInferAttention does not fuse RoPE (support_fused_rope returns False),
-        so RoPE is applied externally in MLA.forward_impl before this point.
-        q_pe already has RoPE applied; we just copy it into the rope slot of
-        fused_q so that forward_absorption_generation can pass fused_q directly
-        to _mla_forward_generation.  The latent_cache KV-cache append is handled
-        inside _mla_forward_generation when forward() is called.
-        """
-        # fused_q shape: [num_tokens, num_heads, kv_lora_rank + qk_rope_head_dim]
-        # q_pe shape:    [num_tokens, num_heads, qk_rope_head_dim]
-        fused_q[..., self.kv_lora_rank:] = q_pe
-
     def _get_mla_caches(
         self,
         metadata: "FlashInferAttentionMetadata",
@@ -1929,8 +1897,8 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             else:
                 output = torch.empty_like(q)
 
-        # FlashInfer's sliding window attention is inclusive, while the attention window size defined in TRTLLM is exclusive.
-        # So we need to subtract 1 from the attention window size for a consistent behavior.
+        # FlashInfer's sliding window attention is inclusive, while the attention window size defined
+        # in TRTLLM is exclusive. Subtract 1 from the attention window size for consistent behavior.
         attention_window_size = forward_args.attention_window_size
         if attention_window_size is not None:
             attention_window_size = attention_window_size - 1
