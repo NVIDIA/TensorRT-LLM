@@ -35,6 +35,7 @@ import uvicorn
 from fastapi import Body, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.routing import APIRoute
 from pydantic import ValidationError
 from starlette.routing import Mount
 from transformers import AutoProcessor
@@ -110,6 +111,56 @@ from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
                               maybe_transform_reasoning_effort)
 
 # yapf: enable
+
+# orjson is an opt-in speedup for request-body parsing: the large agentic chat
+# body otherwise blocks the serving event loop on the stdlib json.loads.
+# Off by default; set TRTLLM_SERVE_ENABLE_ORJSON=1 to enable. When enabled, a
+# missing orjson raises at import time (rather than silently falling back to
+# stdlib json), so the flag can never silently no-op.
+if os.getenv("TRTLLM_SERVE_ENABLE_ORJSON", "0") == "1":
+    try:
+        import orjson
+    except ImportError as exc:
+        raise ImportError(
+            "TRTLLM_SERVE_ENABLE_ORJSON=1 requires the orjson package "
+            "(listed in requirements.txt).") from exc
+    _json_loads = orjson.loads
+else:
+    _json_loads = json.loads
+
+
+class _ORJSONRequest(Request):
+    """Request whose JSON body is parsed with orjson (falls back to stdlib json)."""
+
+    async def json(self):
+        if not hasattr(self, "_json_body"):
+            body = await self.body()
+            if not body:
+                self._json_body = {}
+            else:
+                try:
+                    self._json_body = _json_loads(body)
+                except ValueError:
+                    # orjson is stricter than the stdlib parser (e.g. it rejects
+                    # NaN/Infinity, which json.loads accepts); re-parse with the
+                    # stdlib parser so results are identical.
+                    self._json_body = json.loads(body)
+        return self._json_body
+
+
+class _ORJSONRoute(APIRoute):
+    """APIRoute that parses request bodies via :class:`_ORJSONRequest`."""
+
+    def get_route_handler(self):
+        original_route_handler = super().get_route_handler()
+
+        async def route_handler(request: Request):
+            return await original_route_handler(
+                _ORJSONRequest(request.scope, request.receive))
+
+        return route_handler
+
+
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
 
 
@@ -322,6 +373,7 @@ class OpenAIServer(_VideoRoutesMixin):
             self.generator.shutdown()
 
         self.app = FastAPI(lifespan=lifespan)
+        self.app.router.route_class = _ORJSONRoute
 
         @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(_, exc):
