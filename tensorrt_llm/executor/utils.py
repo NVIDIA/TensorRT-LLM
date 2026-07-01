@@ -64,7 +64,13 @@ def _read_spawn_proxy_process_ipc_hmac_key_fd(fd_value: str) -> bytes:
     finally:
         os.close(fd)
 
-    return _normalize_spawn_proxy_process_ipc_hmac_key(b"".join(chunks))
+    try:
+        key_hex = b"".join(chunks).decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            "IPC HMAC key FD must contain an ASCII hex string.") from exc
+
+    return _normalize_spawn_proxy_process_ipc_hmac_key(key_hex)
 
 
 def get_spawn_proxy_process_ipc_addr_env() -> str | None:
