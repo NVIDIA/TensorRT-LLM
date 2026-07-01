@@ -13,9 +13,9 @@
 # limitations under the License.
 """Centralized KV-cache-aware router state and query API.
 
-:class:`CentralizedKVCacheRouter` is the in-process core shared by the ZMQ ingest
-server and the HTTP shim. It maintains, per routing namespace, a hierarchical
-instance -> rank structure:
+:class:`CentralizedKVCacheRouterCore` is the in-process core shared by the ZMQ
+ingest server and the HTTP shim. It maintains, per routing namespace, a
+hierarchical instance -> rank structure:
 
 - Each instance has a **combined trie** (union of all its ranks' hashes) for
   instance-level selection.
@@ -36,16 +36,16 @@ import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
-from tensorrt_llm.bindings.internal.batch_manager import (BlockKey,
-                                                          BlockKeyHasher)
 from tensorrt_llm.logger import logger
+# Single source of truth for request-side block hashing (shared with router.py).
+from tensorrt_llm.serve.router_utils import block_key_hasher
 
 from .messages import KvCacheEventReport, Selection, WorkerLoadReport
 from .prefix_trie import PrefixBlockSet
 
 __all__ = [
-    "CentralizedKVCacheRouter", "block_key_hasher",
-    "score_kv_aware_candidates"
+    "CentralizedKVCacheRouterCore", "CentralizedKVCacheRouter",
+    "block_key_hasher", "score_kv_aware_candidates"
 ]
 
 
@@ -119,18 +119,6 @@ def score_kv_aware_candidates(
             # rows: (rank, matched, load, match_term, load_term, score)
             rows=rows, winners=best_ids)
     return best_ids
-
-
-def block_key_hasher(token_ids: List[int],
-                     parent_hash: Optional[int] = None) -> int:
-    """Hash one block of token IDs, chaining in *parent_hash*.
-
-    Mirrors ``tensorrt_llm.serve.router.block_key_hasher`` so request-side hashes
-    line up with the hashes workers emit in their events.
-    """
-    block_key = BlockKey(token_ids)
-    return BlockKeyHasher.hash(block_key,
-                               0 if parent_hash is None else parent_hash)
 
 
 def _parse_worker_id(worker_id: str) -> Tuple[str, Optional[int]]:
@@ -256,7 +244,7 @@ class _NamespaceState:
         self.last_seen_ts: Dict[str, float] = {}
 
 
-class CentralizedKVCacheRouter:
+class CentralizedKVCacheRouterCore:
     """Thread-safe KV-cache-aware router state with a block-hash query API.
 
     Supports both legacy single-worker reporting and per-rank hierarchical
@@ -327,6 +315,12 @@ class CentralizedKVCacheRouter:
         self._log_route_scores = (
             os.environ.get("TLLM_LOG_ROUTE_SCORES", "0") == "1")
         self._score_log_n = 0
+        # Routing diagnostics accumulated by select_address (moved off the
+        # surface adaptor). Periodic summary logged every _diag_log_every calls.
+        self._diag = {"total": 0, "fallback": 0, "matched_0": 0,
+                      "matched_partial": 0, "matched_full": 0,
+                      "total_hashes": 0, "total_matched": 0}
+        self._diag_log_every = 50
         self._load_suspend_s = load_suspend_s
         self._stale_timeout_s = stale_timeout_s
         self._clock = clock
@@ -763,6 +757,81 @@ class CentralizedKVCacheRouter:
         block_hashes = self._hash_tokens(token_ids)
         return self.select_worker(namespace, block_hashes)
 
+    def address_worker_for(self, address: str) -> Optional[str]:
+        """Reverse-resolve a server address to its ``worker_id`` (or None)."""
+        with self._lock:
+            return self._address_worker.get(address)
+
+    def select_address(self, namespace: str, block_hashes: List[int],
+                       candidate_servers: List[str],
+                       rr_counter: int) -> Tuple[str, int, Optional[int], Optional[str]]:
+        """High-level placement for the surface adaptor.
+
+        Runs :meth:`select_worker`, validates the chosen address against
+        *candidate_servers*, and falls back to round-robin over the candidates
+        when the router returns nothing usable. Also accumulates routing
+        diagnostics (periodically logged). Returns
+        ``(server, matched_blocks, dp_rank, fallback_reason)`` where
+        ``fallback_reason`` is None on a cache-aware hit.
+        """
+        selection = self.select_worker(namespace, block_hashes)
+        fallback_reason = None
+        dp_rank = None
+        if selection is not None and selection.address in candidate_servers:
+            server = selection.address
+            matched = selection.matched_blocks
+            dp_rank = selection.dp_rank
+        else:
+            server = candidate_servers[rr_counter % len(candidate_servers)]
+            matched = 0
+            fallback_reason = ("select_returned_None" if selection is None
+                               else f"addr_not_in_servers({selection.address})")
+        self._record_routing_diag(namespace, len(block_hashes), matched,
+                                  fallback_reason, server)
+        return server, matched, dp_rank, fallback_reason
+
+    def _record_routing_diag(self, namespace: str, num_hashes: int,
+                             matched: int, fallback_reason: Optional[str],
+                             server: str) -> None:
+        d = self._diag
+        d["total"] += 1
+        d["total_hashes"] += num_hashes
+        d["total_matched"] += matched
+        if fallback_reason:
+            d["fallback"] += 1
+        elif matched == 0:
+            d["matched_0"] += 1
+        elif matched < num_hashes:
+            d["matched_partial"] += 1
+        else:
+            d["matched_full"] += 1
+        if d["total"] % self._diag_log_every == 0:
+            snap = self.debug_snapshot(namespace)
+            hit_rate = d["total_matched"] / max(d["total_hashes"], 1) * 100
+            logger.info(
+                f"CentralizedRouter DIAG total={d['total']} "
+                f"fallback={d['fallback']} match0={d['matched_0']} "
+                f"partial={d['matched_partial']} full={d['matched_full']} "
+                f"hash_hit_rate={hit_rate:.1f}% | {snap}")
+
+    def debug_snapshot(self, namespace: str) -> dict:
+        """Cheap, internals-free view of a namespace's routing state for logs."""
+        with self._lock:
+            ns = self._namespaces.get(namespace)
+            if ns is None:
+                return {"namespace": namespace, "exists": False}
+            instances = {
+                iid: {r: len(rs.owned_hashes) for r, rs in inst.ranks.items()}
+                for iid, inst in ns.instances.items()
+            }
+            legacy_blocks = {w: len(t._blocks) for w, t in ns.tries.items()}
+            return {
+                "namespace": namespace,
+                "instances": instances,
+                "legacy_blocks": legacy_blocks,
+                "loads": len(ns.loads),
+            }
+
     # --------------------------------------------------------------- internals
 
     def _hash_tokens(self, token_ids: List[int]) -> List[int]:
@@ -782,12 +851,10 @@ class CentralizedKVCacheRouter:
     def _apply_events_hierarchical(self, inst: _InstanceState,
                                    rs: _RankState, worker_id: str,
                                    events: List[dict]) -> None:
-        """Apply events to both the rank's trie and the instance's combined trie.
+        """Apply events to the rank's trie and the instance's combined trie.
 
         Layer groups are not distinguished: a block is stored/removed for the
-        rank as a whole. A block re-emitted across N layer groups is counted
-        once per rank (owned_hashes de-dups the stored side; the removed side is
-        gated on owned_hashes so redundant per-group removals are no-ops).
+        rank as a whole (de-duped via owned_hashes).
         """
         for event_raw in events:
             data = event_raw.get("data", event_raw)
@@ -796,8 +863,8 @@ class CentralizedKVCacheRouter:
                 block_hashes = [
                     b["block_hash"] for b in data.get("blocks", [])
                 ]
-                if not CentralizedKVCacheRouter._event_debug_logged and block_hashes:
-                    CentralizedKVCacheRouter._event_debug_logged = True
+                if not CentralizedKVCacheRouterCore._event_debug_logged and block_hashes:
+                    CentralizedKVCacheRouterCore._event_debug_logged = True
                     hash_algo = event_raw.get(
                         "hash_algo", data.get("hash_algo"))
                     logger.info(
@@ -807,42 +874,32 @@ class CentralizedKVCacheRouter:
                         f"hashes[:5]={block_hashes[:5]} "
                         f"types={[type(h).__name__ for h in block_hashes[:3]]} "
                         f"raw_blocks={data.get('blocks', [])[:2]}")
-                # Add to rank trie (skipped in "none" mode -- never queried).
-                # Always track owned_hashes (cheap) for combined-trie cleanup.
+                # Rank trie is skipped in "none" mode (never queried); owned_hashes
+                # is always tracked and drives combined-trie refcounting.
                 if not self._skip_rank_trie:
                     rs.trie.add(worker_id, block_hashes)
-                # combined_refcount counts how many RANKS of this instance hold
-                # each block; the combined trie drops a block only once the LAST
-                # rank evicts it. Increment once per distinct rank acquisition
-                # (gate on "newly owned by this rank"), symmetric with the
-                # removal below. Layer groups are NOT distinguished: a block is
-                # re-emitted once per layer group, but owned_hashes de-dups so we
-                # count the rank once regardless of how many groups hold it.
+                # combined_refcount = number of ranks holding each block; bump
+                # once per rank that newly acquires it (owned_hashes de-dups the
+                # re-emitted-per-layer-group stores), symmetric with removal.
                 new_to_rank = [h for h in block_hashes
                                if h not in rs.owned_hashes]
                 rs.owned_hashes.update(block_hashes)
-                # Add to combined trie (instance_id as the "worker" key)
                 inst.combined_trie.add(inst.instance_id, block_hashes)
-                # Update combined refcount (once per rank that newly holds h)
                 for h in new_to_rank:
                     inst.combined_refcount[h] = (
                         inst.combined_refcount.get(h, 0) + 1)
             elif etype == "removed":
                 removed_hashes = data.get("block_hashes", [])
-                # Layer groups are not distinguished: a removal from ANY group
-                # evicts the block from this rank entirely. Gate on owned_hashes
-                # so the FIRST removed event drops the block and the redundant
-                # per-layer-group removed events for the same block are no-ops
-                # (otherwise combined_refcount would be decremented more than
-                # once per rank and go negative / evict too early).
+                # Gate on owned_hashes so the first removal drops the block and
+                # redundant per-layer-group removals are no-ops (else
+                # combined_refcount would be over-decremented).
                 actually_removed = [h for h in removed_hashes
                                     if h in rs.owned_hashes]
                 if actually_removed:
-                    # Remove from rank trie (skipped in "none" mode).
                     if not self._skip_rank_trie:
                         rs.trie.remove(worker_id, actually_removed)
                     rs.owned_hashes.difference_update(actually_removed)
-                    # Remove from combined trie only when no rank holds it
+                    # Drop from combined trie only when the last rank evicts.
                     combined_removed = []
                     for h in actually_removed:
                         rc = inst.combined_refcount.get(h, 0)
@@ -932,3 +989,10 @@ class CentralizedKVCacheRouter:
         ns.last_load_seq.pop(worker_id, None)
         ns.last_load_ts.pop(worker_id, None)
         ns.last_seen_ts.pop(worker_id, None)
+
+
+# Backward-compatible alias: the core was historically named
+# CentralizedKVCacheRouter. The surface Router adaptor in serve/router.py now
+# owns that name, so the core is CentralizedKVCacheRouterCore; keep the old name
+# working for existing imports/tests.
+CentralizedKVCacheRouter = CentralizedKVCacheRouterCore

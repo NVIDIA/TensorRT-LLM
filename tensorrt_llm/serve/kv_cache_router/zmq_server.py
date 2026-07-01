@@ -14,7 +14,7 @@
 """ZMQ ingest server for the centralized KV-cache router.
 
 Binds a single PULL socket (fan-in) and dispatches each received report to the
-:class:`CentralizedKVCacheRouter` by type. Reuses ``ZeroMqQueue`` verbatim, so it
+:class:`CentralizedKVCacheRouterCore` by type. Reuses ``ZeroMqQueue`` verbatim, so it
 inherits HMAC-signed pickle transport. The bound endpoint + HMAC key are exposed
 via :attr:`address` to hand to workers out-of-band.
 """
@@ -29,13 +29,13 @@ from tensorrt_llm.logger import logger
 
 from .messages import KvCacheEventReport, WorkerLoadReport
 from .reporter import _now_on_synced_clock
-from .router_core import CentralizedKVCacheRouter
+from .router_core import CentralizedKVCacheRouterCore
 
 __all__ = ["KVCacheRouterServer"]
 
 
 class KVCacheRouterServer:
-    """Background PULL-socket loop feeding a :class:`CentralizedKVCacheRouter`.
+    """Background PULL-socket loop feeding a :class:`CentralizedKVCacheRouterCore`.
 
     Args:
         router: The router state to apply reports to.
@@ -46,7 +46,7 @@ class KVCacheRouterServer:
     """
 
     def __init__(self,
-                 router: CentralizedKVCacheRouter,
+                 router: CentralizedKVCacheRouterCore,
                  address: Optional[str] = None,
                  hmac_key: Optional[bytes] = None,
                  evict_interval_s: float = 5.0) -> None:
