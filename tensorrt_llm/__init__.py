@@ -199,4 +199,32 @@ _init()
 
 print(f"[TensorRT-LLM] TensorRT LLM version: {__version__}")
 
+
+def _check_ld_library_path():
+    import platform
+    if platform.system() != "Linux":
+        return
+
+    libs_dir = str(Path(__file__).parent / "libs")
+    ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+    ld_dirs = set(ld_path.split(os.pathsep)) if ld_path else set()
+
+    required = {
+        libs_dir: "${TRTLLM_LIBS_DIR}",
+        str(Path(libs_dir) / "ucx"): "${TRTLLM_LIBS_DIR}/ucx",
+        str(Path(libs_dir) / "nixl"): "${TRTLLM_LIBS_DIR}/nixl",
+    }
+    missing = [label for path, label in required.items() if path not in ld_dirs]
+    if missing:
+        print(
+            f"\n[TensorRT-LLM] WARNING: LD_LIBRARY_PATH is missing required paths.\n"
+            f"[TensorRT-LLM] TensorRT-LLM libraries are installed at: {libs_dir}\n"
+            f"[TensorRT-LLM] Please add the following to your environment:\n"
+            f"[TensorRT-LLM]\n"
+            f"[TensorRT-LLM]   export LD_LIBRARY_PATH={libs_dir}:{libs_dir}/ucx:{libs_dir}/nixl:$LD_LIBRARY_PATH\n"
+        )
+
+
+_check_ld_library_path()
+
 sys.stdout.flush()
