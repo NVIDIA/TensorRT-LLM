@@ -435,6 +435,7 @@ class DiffusionExecutor:
             output = self.pipeline.infer(req)
             generation = time.perf_counter() - generation_start  # seconds
             if self.rank == 0:
+                output.to_handle()
                 self.response_queue.put(
                     DiffusionResponse(
                         request_id=req.request_id,
@@ -812,6 +813,9 @@ class DiffusionRemoteClient:
                 if isinstance(response, DiffusionResponse):
                     if response.request_id == -1:
                         logger.info("DiffusionClient: Received READY signal")
+
+                    if isinstance(response.output, PipelineOutput):
+                        response.output.to_tensor()
 
                     # Schedule the lock acquisition and event setting in the event loop
                     asyncio.run_coroutine_threadsafe(
