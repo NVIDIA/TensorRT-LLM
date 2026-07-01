@@ -851,6 +851,19 @@ class AllReduce(nn.Module):
         if all_reduce_params is None:
             all_reduce_params = AllReduceParams()
 
+        # Mirror the C++ pre-launch dtype check in mnnvlFusionAllReduce so the
+        # MNNVL fused NVFP4 path rejects unsupported input dtypes even when
+        # MNNVL failed to initialize on the current node and would otherwise
+        # silently fall back to the generic allreduce path.
+        if (self.strategy == AllReduceStrategy.MNNVL
+                and all_reduce_params.fusion_op
+                in (AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
+                    AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4)
+                and input.dtype not in (torch.float16, torch.bfloat16)):
+            raise RuntimeError(
+                "[mnnvlFusionAllReduce] NVFP4 quantization requires FP16 or BF16 input"
+            )
+
         # Try Symmetric Memory AllReduce first if available
         # Note: Currently only supports NONE fusion op (plain allreduce)
         if self.symm_mem_allreduce and all_reduce_params.fusion_op == AllReduceFusionOp.NONE:
