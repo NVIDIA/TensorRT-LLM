@@ -83,7 +83,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     int64_t sage_attn_num_elts_per_blk_k = 0, int64_t sage_attn_num_elts_per_blk_v = 0, bool sage_attn_qk_int8 = false,
     int64_t num_contexts = 0, int64_t num_ctx_tokens = 0,
     std::optional<int64_t> compressed_kv_cache_pool_ptr = std::nullopt,
-    std::optional<torch::Tensor> quant_scale_qkv = std::nullopt);
+    std::optional<torch::Tensor> quant_scale_qkv = std::nullopt,
+    std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache = std::nullopt, bool enable_dsv4_epilogue_fusion = false);
 
 struct KvCachePoolPointers
 {

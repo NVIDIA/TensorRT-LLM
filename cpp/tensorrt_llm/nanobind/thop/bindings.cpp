@@ -82,6 +82,7 @@ void initBindings(nb::module_& m)
         nb::arg("sage_attn_num_elts_per_blk_k") = 0, nb::arg("sage_attn_num_elts_per_blk_v") = 0,
         nb::arg("sage_attn_qk_int8") = false, nb::arg("num_contexts") = 0, nb::arg("num_ctx_tokens") = 0,
         nb::arg("compressed_kv_cache_pool_ptr") = std::nullopt, nb::arg("quant_scale_qkv") = std::nullopt,
+        nb::arg("dsv4_inv_rope_cos_sin_cache") = std::nullopt, nb::arg("enable_dsv4_epilogue_fusion") = false,
         "Multi-head attention operation", nb::call_guard<nb::gil_scoped_release>());
 
     m.def(

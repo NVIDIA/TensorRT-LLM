@@ -180,9 +180,7 @@ public:
   }
 
   CUTLASS_DEVICE
-  void producer_acquire(PipelineState state) {
-    producer_acquire(state.index(), state.phase());
-  }
+  void producer_acquire(PipelineState state) { producer_acquire(state.index(), state.phase()); }
 
   CUTLASS_DEVICE
   void producer_acquire(PipelineState state, cutlass::ProducerToken barrier_token) {
@@ -236,9 +234,7 @@ public:
   }
 
   CUTLASS_DEVICE
-  void consumer_wait(PipelineState state) {
-    consumer_wait(state.index(), state.phase());
-  }
+  void consumer_wait(PipelineState state) { consumer_wait(state.index(), state.phase()); }
 
   CUTLASS_DEVICE
   void consumer_wait(PipelineState state, cutlass::ConsumerToken barrier_token) {
@@ -246,9 +242,7 @@ public:
   }
 
   CUTLASS_DEVICE
-  void consumer_release(PipelineState state) {
-    consumer_release(state.index());
-  }
+  void consumer_release(PipelineState state) { consumer_release(state.index()); }
 
 private:
   uint32_t dst_blockid_ = 0;
@@ -713,9 +707,7 @@ public:
 
   // Wait on a stage to be unlocked
   CUTLASS_DEVICE
-  void wait() {
-    get_barrier_for_current_stage(params_.group_id).wait(stage_.phase());
-  }
+  void wait() { get_barrier_for_current_stage(params_.group_id).wait(stage_.phase()); }
 
   // Signal completion of Stage and move to the next stage
   // (group_id) signals to (group_id+1)
@@ -727,9 +719,7 @@ public:
   }
 
   CUTLASS_DEVICE
-  void advance() {
-    ++stage_;
-  }
+  void advance() { ++stage_; }
 
 private:
   CUTLASS_DEVICE
