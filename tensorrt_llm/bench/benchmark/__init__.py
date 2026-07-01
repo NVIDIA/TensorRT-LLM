@@ -56,6 +56,8 @@ class GeneralExecSettings(BaseModel):
                                          validation_alias=AliasChoices(
                                              "dataset_path", "dataset"),
                                          description="Path to dataset file")
+    duration: Optional[int] = Field(
+        default=None, description="Maximum run time in seconds")
     engine_dir: Optional[Path] = Field(
         default=None, description="Path to a serialized TRT-LLM engine")
     eos_id: int = Field(
