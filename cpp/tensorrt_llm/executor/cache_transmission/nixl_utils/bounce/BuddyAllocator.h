@@ -28,13 +28,13 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 {
 
 // ============================================================================
-// BuddyAllocator — power-of-two buddy allocator over a logical byte space (DESIGN)
+// BuddyAllocator — power-of-two buddy allocator over a logical byte space
 // ----------------------------------------------------------------------------
 // Pure logic, no GPU / threads / IO — fully unit-testable. It is the data-region allocator for the
 // bounce v2 arena (one shared registered buffer): instead of fixed full slots, each chunk gets a
 // region sized to its actual bytes, so MANY small transfers fit (high concurrency, no waste) while
 // a transfer LARGER than the whole buffer still streams through (its chunks are each ≤ a modest
-// maxChunkBytes and recycled per ACK via the credit window — see DESIGN.md §5/§9).
+// maxChunkBytes and recycled per ACK via the credit window).
 //
 // alloc(bytes) rounds up to a power-of-two multiple of minBlock and returns the byte offset of a
 // free block of that order (splitting a larger one if needed). free(offset) coalesces with the
