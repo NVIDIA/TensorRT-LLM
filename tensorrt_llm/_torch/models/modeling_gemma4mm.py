@@ -635,6 +635,13 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             else None
         )
 
+        _mm_ids = [config.image_token_id]
+        if getattr(config, "audio_token_id", None) is not None:
+            _mm_ids.append(config.audio_token_id)
+        if getattr(config, "video_token_id", None) is not None:
+            _mm_ids.append(config.video_token_id)
+        self._mm_token_ids = torch.tensor(_mm_ids, dtype=torch.int32)
+
         model_config_cp = copy.deepcopy(model_config)
         self.model_config = model_config_cp
 
@@ -1034,7 +1041,8 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             input_ids=input_ids,
             mm_embeds=mm_embeds,
             mm_token_ids=fuse_token_ids,
-            **kwargs,
+            mm_token_indices=kwargs.get("mm_token_indices"),
+            text_token_indices=kwargs.get("text_token_indices"),
         )
         logits = self.llm.forward(
             attn_metadata=attn_metadata,
@@ -1049,8 +1057,5 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         return logits
 
     @property
-    def mm_token_ids(self):
-        ids = [self.image_token_ids]
-        if self.audio_token_ids is not None:
-            ids.append(self.audio_token_ids)
-        return torch.cat(ids) if len(ids) > 1 else self.image_token_ids
+    def mm_token_ids(self) -> torch.Tensor:
+        return self._mm_token_ids
