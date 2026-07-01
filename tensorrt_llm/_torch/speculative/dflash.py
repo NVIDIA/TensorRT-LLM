@@ -166,6 +166,7 @@ class DFlashWorker(SpecWorkerBase):
         self.mapping = mapping
         self._resolved_mask_token_id = None
         self._resolved_block_size = None
+        self._resolved_shift_label = None
 
         # Pre-allocated per-slot context K/V buffers, built lazily on the
         # first forward. Fixed-size so slot-indexed reads/writes are CUDA
@@ -230,6 +231,50 @@ class DFlashWorker(SpecWorkerBase):
         self._resolved_block_size = getattr(draft_model, "block_size", None) or (
             self.max_draft_len + 1
         )
+
+        # `shift_label` controls which positions of the parallel-draft
+        # hidden states predict the K draft tokens.
+        #   shift_label=False: hidden at position p predicts token at p+1, so
+        #     we read positions 1..K (current default; matches original DFlash
+        #     checkpoints whose dflash_config has no `shift_label` key).
+        #   shift_label=True: hidden at position p predicts token at p, so we
+        #     read positions 0..K-1 (used by Domino-b16 checkpoints).
+        # Resolve from spec_config first so callers can override, then fall
+        # back to the draft model's `dflash_config.shift_label`, defaulting
+        # to False to preserve the historical behavior.
+        cfg_shift = getattr(self.spec_config, "shift_label", None)
+        if cfg_shift is None:
+            dflash_cfg = getattr(getattr(draft_model, "config", None), "dflash_config", None) or {}
+            if isinstance(dflash_cfg, dict):
+                cfg_shift = dflash_cfg.get("shift_label", False)
+            else:
+                cfg_shift = getattr(dflash_cfg, "shift_label", False)
+        self._resolved_shift_label = bool(cfg_shift)
+        logger.info(
+            f"DFlash: resolved block_size={self._resolved_block_size}, "
+            f"shift_label={self._resolved_shift_label}"
+        )
+
+        # Validate max_draft_len against the supervised draft slots in this
+        # checkpoint. With shift_label=False the draft hidden at position 0 is
+        # the anchor (loss-masked during training), so only block_size-1
+        # positions are usable; reading position block_size lands on the next
+        # request's anchor (or clamps for the final request) and silently
+        # corrupts the K-th draft. With shift_label=True the anchor itself is
+        # supervised, giving block_size usable positions.
+        max_draft = self.max_draft_len
+        max_allowed = (
+            self._resolved_block_size
+            if self._resolved_shift_label
+            else self._resolved_block_size - 1
+        )
+        if max_draft > max_allowed:
+            raise ValueError(
+                f"DFlash: max_draft_len={max_draft} exceeds the supervised "
+                f"range of this checkpoint (block_size={self._resolved_block_size}, "
+                f"shift_label={self._resolved_shift_label}; max allowed = "
+                f"{max_allowed}). Reduce speculative_config.max_draft_len."
+            )
 
         # +block_size slack lets per-iter noise K/V scatter into the gathered
         # view and flash_attn read it in place.
@@ -471,29 +516,14 @@ class DFlashWorker(SpecWorkerBase):
                     ctx_cache_batch_idx=inputs["ctx_cache_batch_idx"],
                 )
 
-                # Gather K logits per gen request from mask positions (1..K).
-                # hidden_states_out is flat: [num_gens * block_size, hidden_dim]
-                block_size = self._resolved_block_size
-                request_bases = torch.arange(num_gens, dtype=torch.long, device="cuda") * block_size
-                offsets = torch.arange(K, dtype=torch.long, device="cuda")
-                # Masks are at positions 1..K in each request's block_size output
-                gen_gather_ids = (request_bases.unsqueeze(1) + 1 + offsets.unsqueeze(0)).flatten()
-                gen_gather_ids = gen_gather_ids.clamp(max=hidden_states_out.shape[0] - 1)
-
-                gen_logits = draft_model.logits_processor(
-                    hidden_states_out[gen_gather_ids], draft_model.lm_head, attn_metadata, True
+                gen_draft_tokens = self._sample_gen_draft_tokens(
+                    hidden_states_out=hidden_states_out,
+                    draft_model=draft_model,
+                    attn_metadata=attn_metadata,
+                    num_gens=num_gens,
+                    K=K,
+                    inputs=inputs,
                 )
-
-                vocab_size = gen_logits.shape[-1]
-                gen_logits = gen_logits.reshape(num_gens, self.max_draft_len, vocab_size)
-
-                d2t = getattr(draft_model.model, "d2t", None)
-                gen_draft_tokens = torch.argmax(gen_logits, dim=-1, keepdim=False).long()
-
-                if d2t is not None:
-                    gen_draft_tokens = d2t[gen_draft_tokens] + gen_draft_tokens
-
-                gen_draft_tokens = gen_draft_tokens.type(torch.int32)
 
         else:
             gen_draft_tokens = torch.empty((0, K), dtype=torch.int32, device="cuda")
@@ -528,6 +558,91 @@ class DFlashWorker(SpecWorkerBase):
             "next_draft_tokens": next_draft_tokens,
             "next_new_tokens": next_new_tokens,
         }
+
+    def _sample_gen_draft_tokens(
+        self,
+        hidden_states_out: torch.Tensor,
+        draft_model: nn.Module,
+        attn_metadata: AttentionMetadata,
+        num_gens: int,
+        K: int,
+        inputs: dict,
+    ) -> torch.Tensor:
+        """Sample K draft tokens per gen request from mask-position logits.
+
+        Subclasses (e.g. Domino) override this to apply causal corrections to
+        the suffix logits before argmax.
+
+        Returns:
+            gen_draft_tokens: [num_gens, K] int32
+        """
+        suffix_hidden = self._gather_mask_position_hidden(
+            hidden_states_out=hidden_states_out,
+            num_gens=num_gens,
+            K=K,
+        )
+        gen_logits = self._project_logits(suffix_hidden, draft_model, attn_metadata, num_gens, K)
+
+        d2t = getattr(draft_model.model, "d2t", None)
+        gen_draft_tokens = torch.argmax(gen_logits, dim=-1, keepdim=False).long()
+        if d2t is not None:
+            gen_draft_tokens = d2t[gen_draft_tokens] + gen_draft_tokens
+        return gen_draft_tokens.type(torch.int32)
+
+    def _gather_mask_position_hidden(
+        self,
+        hidden_states_out: torch.Tensor,
+        num_gens: int,
+        K: int,
+    ) -> torch.Tensor:
+        """Gather K hidden vectors per gen request used to predict draft tokens.
+
+        With `shift_label=False` (default), hidden at block position p predicts
+        token at p+1, so we read positions 1..K (requires K <= block_size-1
+        because position 0 is the loss-masked anchor and the trainer only
+        supervises 1..block_size-1). With `shift_label=True` (Domino-b16
+        checkpoints), hidden at p predicts token at p, so we read positions
+        0..K-1 (requires K <= block_size; the trainer supervises every
+        position).
+
+        Returns:
+            suffix_hidden: [num_gens * K, hidden_dim]
+        """
+        block_size = self._resolved_block_size
+        start_offset = 0 if self._resolved_shift_label else 1
+        # Host-level assert (not a tensor clamp): if start_offset+K exceeds
+        # block_size, reads would leak into the next request's anchor hidden.
+        # The init-time validator at _lazy_init_ctx_buffers already enforces
+        # this; a silent tensor clamp here would mask future misconfigs by
+        # repeating the last in-block hidden and silently degrading AR.
+        assert start_offset + K <= block_size, (
+            f"DFlash: start_offset={start_offset} + K={K} exceeds "
+            f"block_size={block_size}; init-time validator should have "
+            f"caught this — check _lazy_init_ctx_buffers."
+        )
+        request_bases = torch.arange(num_gens, dtype=torch.long, device="cuda") * block_size
+        offsets = torch.arange(K, dtype=torch.long, device="cuda") + start_offset
+        gen_gather_ids = (request_bases.unsqueeze(1) + offsets.unsqueeze(0)).flatten()
+        return hidden_states_out[gen_gather_ids]
+
+    def _project_logits(
+        self,
+        suffix_hidden: torch.Tensor,
+        draft_model: nn.Module,
+        attn_metadata: AttentionMetadata,
+        num_gens: int,
+        K: int,
+    ) -> torch.Tensor:
+        """Run lm_head on gathered hidden states.
+
+        Returns:
+            logits: [num_gens, K, vocab]
+        """
+        gen_logits = draft_model.logits_processor(
+            suffix_hidden, draft_model.lm_head, attn_metadata, True
+        )
+        vocab_size = gen_logits.shape[-1]
+        return gen_logits.reshape(num_gens, K, vocab_size)
 
     def prepare_1st_drafter_inputs(
         self,
@@ -690,4 +805,9 @@ class DFlashWorker(SpecWorkerBase):
             "ctx_k_cache": self._ctx_k_buf,
             "ctx_v_cache": self._ctx_v_buf,
             "ctx_cache_batch_idx": slots,
+            # Bonus token (last accepted target token) per gen request — Domino
+            # uses it as the leading element of the prefix-GRU input.
+            "bonus_token_ids": bonus
+            if num_gens > 0
+            else torch.empty(0, dtype=torch.long, device="cuda"),
         }

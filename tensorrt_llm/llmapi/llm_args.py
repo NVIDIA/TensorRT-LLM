@@ -2395,6 +2395,20 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         "for cross-attention in the draft model. If None, read from the draft "
         "model config (dflash_config.target_layer_ids).")
 
+    shift_label: Optional[bool] = Field(
+        default=None,
+        description=
+        "Whether the draft model was trained with the labels shifted left by "
+        "one position. With shift_label=False (default) the hidden at block "
+        "position p predicts the token at p+1, so position 0 is an anchor "
+        "that is loss-masked during training; only block_size - 1 positions "
+        "are usable drafts and max_draft_len must be <= block_size - 1. "
+        "With shift_label=True the anchor itself is supervised and all "
+        "block_size positions are usable drafts (max_draft_len <= "
+        "block_size). When None, read from the draft model config "
+        "(dflash_config.shift_label, default False). DFlashWorker validates "
+        "max_draft_len against this ceiling at startup.")
+
     decoding_type: Literal["DFlash"] = Field(default="DFlash")
 
     @model_validator(mode="after")
@@ -2419,6 +2433,82 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         from tensorrt_llm._torch.speculative.interface import \
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
         return TorchSpeculativeDecodingMode.DFLASH
+
+
+class DominoDecodingConfig(DecodingBaseConfig):
+    """Configuration for Domino speculative decoding.
+
+    Domino extends DFlash with a lightweight causal "Domino head" applied
+    only at the final draft-token sampling stage: a small GRU consumes the
+    embeddings of already-committed prefix tokens to produce a per-position
+    bias which is added to the base draft logits before argmax. The cross-
+    attention forward pass is identical to DFlash; only the suffix sampling
+    differs.
+
+    Key features:
+    - Reuses the DFlash cross-attention pipeline (target hidden states +
+      pooled K/V buffer + parallel mask-token query).
+    - Applies a GRU + 2-layer MLP correction head to suffix logits to enforce
+      causal awareness of previously-committed draft tokens.
+    """
+    mask_token_id: Optional[int] = Field(
+        default=None,
+        description=
+        "The token ID used as a mask token for parallel draft prediction. "
+        "If None, it will be read from the draft model config "
+        "(dflash_config.mask_token_id).")
+
+    target_layer_ids: Optional[List[int]] = Field(
+        default=None,
+        description=
+        "List of target model layer indices whose hidden states are captured "
+        "for cross-attention in the draft model. If None, read from the draft "
+        "model config (dflash_config.target_layer_ids).")
+
+    pure_draft_prefix_len: Optional[int] = Field(
+        default=None,
+        description=
+        "Number of leading positions that act as a 'pure parallel-draft' "
+        "prefix (no Domino bias applied to these). Read from the draft model "
+        "config (dflash_config.pure_draft_prefix_len) when None.")
+
+    shift_label: Optional[bool] = Field(
+        default=None,
+        description=
+        "Whether the draft model was trained with the labels shifted left by "
+        "one position. With shift_label=False (default) the hidden at block "
+        "position p predicts the token at p+1, so position 0 is an anchor "
+        "that is loss-masked during training; only block_size - 1 positions "
+        "are usable drafts and max_draft_len must be <= block_size - 1. "
+        "With shift_label=True the anchor itself is supervised and all "
+        "block_size positions are usable drafts (max_draft_len <= "
+        "block_size). When None, read from the draft model config "
+        "(dflash_config.shift_label, default False). DFlashWorker validates "
+        "max_draft_len against this ceiling at startup.")
+
+    decoding_type: Literal["Domino"] = "Domino"
+
+    @model_validator(mode="after")
+    def set_max_total_draft_tokens(self):
+        self.max_total_draft_tokens = self.max_draft_len
+        return self
+
+    @property
+    def tokens_per_gen_step(self) -> int:
+        """Domino only needs K+1 tokens per gen request (K drafts + 1 bonus).
+
+        Same as DFlash — the draft produces its own mask queries internally.
+        """
+        return self.max_draft_len + 1
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+    @functools.cached_property
+    def spec_dec_mode(self):
+        from tensorrt_llm._torch.speculative.interface import \
+            SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+        return TorchSpeculativeDecodingMode.DOMINO
 
 
 class AutoDecodingConfig(DecodingBaseConfig):
@@ -3087,6 +3177,7 @@ SpeculativeConfig: TypeAlias = Annotated[
         SaveHiddenStatesDecodingConfig,
         PARDDecodingConfig,
         DFlashDecodingConfig,
+        DominoDecodingConfig,
         AutoDecodingConfig,
     ],
     Field(discriminator="decoding_type"),
@@ -4254,6 +4345,10 @@ class TrtLlmArgs(BaseLlmArgs):
                 raise ValueError(
                     "speculative_config.decoding_type 'DFlash' is only supported on the PyTorch backend."
                 )
+            elif isinstance(self.speculative_config, DominoDecodingConfig):
+                raise ValueError(
+                    "speculative_config.decoding_type 'Domino' is only supported on the PyTorch backend."
+                )
             else:
                 raise ValueError(
                     f"Unrecognized speculative config type {type(self.speculative_config)}"
@@ -5048,12 +5143,20 @@ class TorchLlmArgs(BaseLlmArgs):
             if isinstance(self.speculative_config, PARDDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"
 
-            if isinstance(self.speculative_config, DFlashDecodingConfig):
-                assert self.speculative_config.max_draft_len > 0, "DFlash max_draft_len must be > 0"
+            if isinstance(self.speculative_config,
+                          (DFlashDecodingConfig, DominoDecodingConfig)):
+                algo_name = "DFlash" if isinstance(
+                    self.speculative_config, DFlashDecodingConfig) else "Domino"
+                assert self.speculative_config.max_draft_len > 0, f"{algo_name} max_draft_len must be > 0"
                 # Resolve target_layer_ids and mask_token_id from draft model config if not set
                 needs_target_layer_ids = self.speculative_config.target_layer_ids is None
                 needs_mask_token_id = self.speculative_config.mask_token_id is None
+                needs_pure_prefix = (
+                    isinstance(self.speculative_config, DominoDecodingConfig)
+                    and self.speculative_config.pure_draft_prefix_len is None)
+                needs_shift_label = self.speculative_config.shift_label is None
                 if (needs_target_layer_ids or needs_mask_token_id
+                        or needs_pure_prefix or needs_shift_label
                     ) and self.speculative_config.speculative_model is not None:
                     draft_config_path = os.path.join(
                         self.speculative_config.speculative_model,
@@ -5070,6 +5173,14 @@ class TorchLlmArgs(BaseLlmArgs):
                             mask_id = dflash_cfg.get("mask_token_id")
                             if mask_id is not None:
                                 self.speculative_config.mask_token_id = mask_id
+                        if needs_pure_prefix:
+                            pure_prefix = dflash_cfg.get(
+                                "pure_draft_prefix_len", 0)
+                            self.speculative_config.pure_draft_prefix_len = (
+                                pure_prefix or 0)
+                        if needs_shift_label:
+                            self.speculative_config.shift_label = bool(
+                                dflash_cfg.get("shift_label", False))
 
             if isinstance(self.speculative_config, SADecodingConfig):
                 pool_size = self.speculative_config.global_pool_size
