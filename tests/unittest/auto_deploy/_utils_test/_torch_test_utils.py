@@ -12,8 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Tuple, Union
+import os
+from contextlib import contextmanager
+from typing import Generator, Tuple, Union
 
+import pytest
 import torch
 
 
@@ -56,3 +59,18 @@ def trtllm_ops_available():
         return hasattr(torch.ops.trtllm, "fp8_quantize_1x128")
     except (AttributeError, RuntimeError):
         return False
+
+
+@contextmanager
+def assert_no_cuda_sync() -> Generator[None, None, None]:
+    """Raise if PyTorch detects a synchronizing CUDA operation in the guarded scope."""
+    if os.environ.get("CUDA_LAUNCH_BLOCKING") == "1":
+        pytest.skip("CUDA_LAUNCH_BLOCKING makes CUDA sync detection invalid")
+
+    torch.cuda.synchronize()
+    torch_debug_mode_orig = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        yield
+    finally:
+        torch.cuda.set_sync_debug_mode(torch_debug_mode_orig)

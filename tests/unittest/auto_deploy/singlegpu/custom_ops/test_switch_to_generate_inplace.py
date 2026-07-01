@@ -15,7 +15,9 @@
 
 """Tests for SequenceInfo.switch_to_generate_inplace."""
 
+import pytest
 import torch
+from _torch_test_utils import assert_no_cuda_sync
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import SequenceInfo
 
@@ -118,6 +120,138 @@ def _has_active_host_arg(si: SequenceInfo):
     """Return whether any managed host mirror is an active graph input."""
     host_mirrors = {name + si._host_suffix for name in si._input_buffer.tensor_names}
     return bool(host_mirrors & set(si._active_args))
+
+
+def _make_mixed_sequence_info(device=None):
+    num_prefill_tokens = 5
+    num_extend_tokens = 4
+    num_decode_tokens = 1
+
+    seq_info = SequenceInfo(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=16,
+        tokens_per_block=32,
+    )
+    if device is not None:
+        seq_info.to(device)
+    seq_info.nest_sequences(
+        input_ids=[1] * (num_prefill_tokens + num_extend_tokens + num_decode_tokens),
+        cu_seqlen=[0, 3, 5, 9, 10],
+        input_pos=[10, 20, 30, 40],
+        batch_info=[2, num_prefill_tokens, 1, num_extend_tokens, 1, num_decode_tokens],
+        slot_idx=[0, 1, 2, 3],
+    )
+    return seq_info
+
+
+def test_sequence_info_mixed_offset_updates_position_ids():
+    """Mixed-batch position-id offsets are applied to the matching token spans.
+
+    This is a correctness test for ``offset_pos_and_cache_``. Host-sync coverage
+    lives in ``test_sequence_info_mixed_offset_has_no_cuda_sync``.
+    """
+    seq_info = _make_mixed_sequence_info()
+    position_ids_before = seq_info.get_arg("position_ids", truncate=True, unflatten=False).clone()
+
+    seq_info.offset_pos_and_cache_(torch.tensor([1, 2, 3, 4], dtype=torch.int32))
+
+    position_ids_after = seq_info.get_arg("position_ids", truncate=True, unflatten=False)
+    expected = position_ids_before.clone()
+    expected[:3] += 1
+    expected[3:5] += 2
+    expected[5:9] += 3
+    expected[9:] += 4
+
+    assert torch.equal(position_ids_after, expected)
+    assert seq_info.get_arg("input_pos", truncate=True).tolist() == [11, 22, 33, 44]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.filterwarnings("ignore:Synchronization debug mode is a prototype feature:UserWarning")
+def test_sequence_info_mixed_offset_has_no_cuda_sync():
+    """Mixed-batch position-id offset expansion must not synchronize the CUDA stream."""
+    offset = torch.tensor([1, 2, 3, 4], dtype=torch.int32, device="cuda")
+
+    # Warm up the CUDA allocator and repeat_interleave kernel outside the guarded scope.
+    warmup_seq_info = _make_mixed_sequence_info(device="cuda")
+    warmup_seq_info.offset_pos_and_cache_(offset)
+    torch.cuda.synchronize()
+
+    seq_info = _make_mixed_sequence_info(device="cuda")
+    position_ids_before = seq_info.get_arg("position_ids", truncate=True, unflatten=False).clone()
+    torch.cuda.synchronize()
+
+    with assert_no_cuda_sync():
+        seq_info.offset_pos_and_cache_(offset)
+
+    position_ids_after = seq_info.get_arg("position_ids", truncate=True, unflatten=False)
+    expected = position_ids_before.clone()
+    expected[:3] += 1
+    expected[3:5] += 2
+    expected[5:9] += 3
+    expected[9:] += 4
+
+    assert torch.equal(position_ids_after, expected)
+
+
+def test_offset_with_new_lens_correctness():
+    """Basic correctness coverage for ``SequenceInfo.offset_with_new_lens_``.
+
+    This complements the direct ``offset_pos_and_cache_`` test above by checking
+    that overlap request new-token lengths are converted to ``new_len - 1``
+    increments before offsets are applied.
+    """
+    max_draft_len = 3
+    num_prefill_tokens = 5
+    num_extend_tokens = 1 + max_draft_len
+    num_decode_tokens = 1
+    extend_new_len = 3
+    decode_new_len = 4
+    expected_extend_increment = extend_new_len - 1
+    expected_decode_increment = decode_new_len - 1
+
+    seq_info = SequenceInfo(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=16,
+        tokens_per_block=32,
+    )
+    seq_info.batch_info.update_max_draft_len(max_draft_len)
+    seq_info.nest_sequences(
+        input_ids=[1] * (num_prefill_tokens + num_extend_tokens + num_decode_tokens),
+        # Packed tokens: prefill lengths 3 and 2, then one fixed-width MTP extend
+        # request containing the target token plus max_draft_len draft tokens, then
+        # one single-token decode request.
+        cu_seqlen=[0, 3, 5, 9, 10],
+        # Prefill offsets are zero. The extend and decode requests are the only
+        # requests offset_with_new_lens_ should advance.
+        input_pos=[0, 0, 10, 20],
+        batch_info=[2, num_prefill_tokens, 1, num_extend_tokens, 1, num_decode_tokens],
+        slot_idx=[0, 1, 2, 3],
+        # Two overlap-carried requests; consume new_lens_ungathered[0] for extend
+        # and new_lens_ungathered[1] for decode.
+        _gather_slot_idx=[0, 1],
+    )
+
+    position_ids_before = seq_info.get_arg("position_ids", truncate=True, unflatten=False).clone()
+
+    new_lens_ungathered = torch.tensor([extend_new_len, decode_new_len], dtype=torch.int32)
+    seq_info.offset_with_new_lens_(new_lens_ungathered)
+
+    position_ids_after = seq_info.get_arg("position_ids", truncate=True, unflatten=False)
+    expected = position_ids_before.clone()
+    extend_token_end = num_prefill_tokens + num_extend_tokens
+    expected[num_prefill_tokens:extend_token_end] += expected_extend_increment
+    expected[extend_token_end:] += expected_decode_increment
+
+    assert torch.equal(position_ids_after, expected)
+    assert seq_info.get_arg("input_pos", truncate=True).tolist() == [
+        0,
+        0,
+        10 + expected_extend_increment,
+        20 + expected_decode_increment,
+    ]
 
 
 class TestSwitchToGeneratePackedToDecode:
