@@ -175,12 +175,17 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         hf_config = config_class.from_dict(config_dict)
         return hf_config
 
+    def get_trtllm_pretrained_config(self) -> PretrainedConfig:
+        """Return the pretrained config used to construct the TRT-LLM model."""
+        return self.hf_config
+
     def create_trtllm_model(
         self, load_weights: bool = False, hf_model_state_dict: Optional[Dict] = None, **kwargs
     ) -> Tuple[PreTrainedModel, ModelConfig]:
         """Create a TensorRT-LLM model instance."""
 
-        model_config = ModelConfig(pretrained_config=self.hf_config)
+        pretrained_config = self.get_trtllm_pretrained_config()
+        model_config = ModelConfig(pretrained_config=pretrained_config)
         model_config.max_num_tokens = max(
             self.get_max_num_tokens(scenario) for scenario in self.get_scenarios()
         )
@@ -191,7 +196,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
             weight_mapper_class = self.get_weight_mapper_class()
             if weight_mapper_class is not None:
                 weight_mapper = weight_mapper_class()
-                weight_mapper.init_model_and_config(model, self.hf_config)
+                weight_mapper.init_model_and_config(model, pretrained_config)
                 model.load_weights(hf_model_state_dict, weight_mapper)
             else:
                 model.load_weights(hf_model_state_dict)

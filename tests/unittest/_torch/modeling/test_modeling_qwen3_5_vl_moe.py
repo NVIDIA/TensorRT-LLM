@@ -75,7 +75,7 @@ def _write_qwen35_moe_vl_config(tmp_path: Path) -> Path:
         "tie_word_embeddings": False,
         "video_token_id": 248057,
         "vision_config": {
-            "deepstack_visual_indexes": [8, 16, 24],
+            "deepstack_visual_indexes": [],
             "depth": 27,
             "hidden_act": "gelu_pytorch_tanh",
             "hidden_size": 1152,
@@ -115,6 +115,7 @@ def test_qwen35_moe_vl_config_preserves_vlm_architecture(
     # 3*num_tokens and mismatches the QKV token count.
     assert config.text_config.rope_scaling["mrope_interleaved"] is True
     assert config.text_config.mamba_ssm_dtype == "float32"
+    assert config.vision_config.deepstack_visual_indexes == []
     assert config.get_text_config() is config.text_config
 
 
@@ -172,22 +173,19 @@ def test_qwen35_moe_vl_placeholder_metadata_registered() -> None:
 #     can't split with section sum 32.
 #   - num_attention_heads=16, num_key_value_heads=2 match the real
 #     model's 8:1 GQA layout; Q proj is 2048 --> 4096, K/V are 2048 --> 512.
-#   - Vision deepstack indices [8, 16, 24] match the real config, and
-#     depth=27 is the smallest value that hosts those indices. Disabling
-#     deepstack (indices=[], depth=2) produces fewer vision embeddings
-#     than the HF processor reserves placeholder tokens for, which
-#     breaks `fuse_input_embeds`.
 #   - vocab_size=248320 matches the real Qwen3.5 tokenizer. The
 #     tokenizer (loaded via _name_or_path) emits special-token ids in
-#     the 248k range; `fuse_input_embeds` uses `vocab_size` as the
-#     OOV threshold to identify image-pad tokens. A smaller vocab_size
-#     would misclassify regular chat-template specials as mm tokens
-#     and trip the placeholder/embedding count check.
+#     the 248k range. A smaller vocabulary would leave regular
+#     chat-template specials outside the embedding table even though the
+#     image/video placeholders themselves are selected by explicit token IDs.
 #
 # Shapes that can be shrunk for tests:
 #
 #   - num_hidden_layers: 2 (vs 40+).
 #   - num_experts: 128 (vs 256). Still moderate so MoE routing runs.
+#   - vision depth: 2 (vs 27). Qwen3.5 does not use Qwen3-VL deepstack,
+#     so the synthetic tower can be shortened without changing its output
+#     contract. The full-depth path is covered by the accuracy test.
 #   - full_attention_interval=2 with 2 LM layers yields the pattern
 #     [linear_attention, full_attention] — one of each kind, exercising
 #     both the regular KV cache and the Mamba SSM/conv state via the
@@ -240,8 +238,8 @@ QWEN3_5_VL_MOE_PARITY_CONFIG = {
     "tie_word_embeddings": False,
     "video_token_id": 248057,
     "vision_config": {
-        "deepstack_visual_indexes": [8, 16, 24],
-        "depth": 27,
+        "deepstack_visual_indexes": [],
+        "depth": 2,
         "hidden_act": "gelu_pytorch_tanh",
         "hidden_size": 1152,
         "in_channels": 3,
@@ -279,7 +277,7 @@ class TestQwen3_5MoeVL(TestModelingMultimodal):
         (`rope_parameters` intact with `rope_type`,
         `moe_intermediate_size`, …).
       - TRT-LLM gets a deep-copied + normalized version via the
-        `create_trtllm_model` override below. That copy goes through
+        `get_trtllm_pretrained_config` override below. That copy goes through
         `_normalize_qwen35_moe_vl_config` exactly the same way
         production `load_pretrained_config` does, so the Qwen3Next
         runtime sees the flat aliases it expects
@@ -311,50 +309,19 @@ class TestQwen3_5MoeVL(TestModelingMultimodal):
     def get_model_config_class(self):
         return transformers.Qwen3_5MoeConfig
 
-    def create_trtllm_model(
-        self,
-        load_weights: bool = False,
-        hf_model_state_dict: Optional[dict] = None,
-        **kwargs,
-    ):
-        """Build the TRT-LLM model from a *normalized copy* of `self.hf_config`.
-
-        Mirrors the base-class body but swaps in
-        `_normalize_qwen35_moe_vl_config(trtllm_config)` before
-        wrapping in `ModelConfig`. `self.hf_config` itself stays
-        raw so the HF model that the base class builds in `setUp`
-        sees native HF schema.
-        """
+    def get_trtllm_pretrained_config(self) -> transformers.PretrainedConfig:
+        """Return a normalized config copy for TRT-LLM model construction."""
         trtllm_config = deepcopy(self.hf_config)
         _normalize_qwen35_moe_vl_config(trtllm_config)
-
-        model_config = ModelConfig(pretrained_config=trtllm_config)
-        model_class = self.get_trtllm_model_class()
-        model = model_class(model_config, **kwargs).to("cuda")
-
-        if load_weights:
-            weight_mapper = self.get_weight_mapper_class()()
-            weight_mapper.init_model_and_config(model, trtllm_config)
-            model.load_weights(hf_model_state_dict, weight_mapper)
-
-            for module in model.modules():
-                if hasattr(module, "post_load_weights") and not getattr(
-                    module, "_weights_removed", False
-                ):
-                    module.post_load_weights()
-
-        return model, model_config
+        return trtllm_config
 
     def _dummy_request_kwargs(self, scenario):
         """Qwen3.5-VL uses mRoPE; the cache manager needs the mRoPE
         position-id buffer allocated at dummy-request time."""
         return {"use_mrope": True}
 
-    def get_tolerance(self):
-        """Tighten `rtol` to `0.1` (4x tighter than the base 0.4
-        default) while keeping `atol` at `0.4` to absorb single-logit
-        tail outliers seen on `multiple_image` / `video`.
-        """
+    def get_tolerance(self) -> tuple[float, float]:
+        """Use a tight relative bound while allowing BF16 kernel-order drift."""
         return 0.4, 0.1
 
     def get_trtllm_inputs(
