@@ -113,13 +113,14 @@ def _create_manager(
     num_layers: int = 1,
     max_attention_window: list[int] | None = None,
     enable_block_reuse: bool = True,
+    enable_partial_reuse: bool = True,
     block_reuse_policy: str = "all_reusable",
     enable_stats: bool = True,
 ) -> KVCacheManagerV2:
     return KVCacheManagerV2(
         KvCacheConfig(
             enable_block_reuse=enable_block_reuse,
-            enable_partial_reuse=True,
+            enable_partial_reuse=enable_partial_reuse,
             max_gpu_total_bytes=gpu_bytes,
             max_util_for_resume=1.0,
             max_attention_window=max_attention_window,
@@ -446,6 +447,7 @@ def test_all_reusable_policy_commits_each_context_chunk(resource_guard) -> None:
     manager = resource_guard(
         _create_manager(gpu_bytes=8 << 20, block_reuse_policy="all_reusable"), request
     )
+    assert not manager.kv_cache_manager_py_config.commit_min_snapshot
 
     assert manager.prepare_context(request)
     assert manager.resize_context(request, num_tokens=4)
@@ -461,8 +463,13 @@ def test_all_reusable_policy_commits_each_context_chunk(resource_guard) -> None:
 def test_per_request_policy_delays_commit_until_last_context_chunk(resource_guard) -> None:
     request = _StatsRequest(1, list(range(8)), context_remaining_length=8)
     manager = resource_guard(
-        _create_manager(gpu_bytes=8 << 20, block_reuse_policy="per_request"), request
+        _create_manager(
+            gpu_bytes=8 << 20,
+            block_reuse_policy="per_request",
+        ),
+        request,
     )
+    assert manager.kv_cache_manager_py_config.commit_min_snapshot
 
     assert manager.prepare_context(request)
     assert manager.resize_context(request, num_tokens=4)
@@ -483,6 +490,52 @@ def test_per_request_policy_delays_commit_until_last_context_chunk(resource_guar
 
     assert kv_cache.num_committed_tokens == 8
     assert kv_cache.history_length == 8
+
+
+def test_per_request_policy_commits_partial_final_context_chunk(resource_guard) -> None:
+    request = _StatsRequest(1, list(range(6)), context_remaining_length=6)
+    manager = resource_guard(
+        _create_manager(
+            gpu_bytes=8 << 20,
+            block_reuse_policy="per_request",
+        ),
+        request,
+    )
+
+    assert manager.prepare_context(request)
+    assert manager.resize_context(request, num_tokens=6)
+    _finish_context(manager, request)
+
+    kv_cache = manager.kv_cache_map[request.py_request_id]
+    assert kv_cache.num_committed_tokens == request.prompt_len
+    assert kv_cache.history_length == request.prompt_len
+
+
+@pytest.mark.parametrize(
+    ("enable_partial_reuse", "expected_reused_tokens"), [(False, 8), (True, 9)]
+)
+def test_v2_propagates_partial_reuse_config(
+    resource_guard, enable_partial_reuse: bool, expected_reused_tokens: int
+) -> None:
+    warmup_request = _StatsRequest(1, list(range(12)), context_remaining_length=12)
+    reuse_request = _StatsRequest(2, list(range(10)), context_remaining_length=10)
+    manager = resource_guard(
+        _create_manager(
+            gpu_bytes=8 << 20,
+            enable_partial_reuse=enable_partial_reuse,
+        ),
+        warmup_request,
+        reuse_request,
+    )
+    assert manager.kv_cache_manager_py_config.enable_partial_reuse is enable_partial_reuse
+
+    assert manager.prepare_context(warmup_request)
+    assert manager.resize_context(warmup_request, num_tokens=12)
+    _finish_context(manager, warmup_request)
+    manager.free_resources(warmup_request)
+
+    assert manager.prepare_context(reuse_request)
+    assert reuse_request.prepopulated_prompt == (expected_reused_tokens, TOKENS_PER_BLOCK)
 
 
 def test_v2_generation_alloc_updates_request_metrics_unlike_v1(resource_guard) -> None:

@@ -2661,8 +2661,12 @@ class KVCacheManagerV2(BaseResourceManager):
             vocab_size=vocab_size,
             cache_tiers=cache_tiers,
             max_util_for_resume=kv_cache_config.max_util_for_resume,
+            enable_partial_reuse=kv_cache_config.enable_partial_reuse,
             enable_stats=self.enable_stats,
             swa_scratch_reuse=scratch_reuse_config,
+            commit_min_snapshot=(kv_cache_config.enable_block_reuse
+                                 and self.block_reuse_policy
+                                 != BlockReusePolicy.ALL_REUSABLE),
             initial_pool_ratio=kv_cache_config.pool_ratio,
             layers=[
                 AttentionLayerConfig(

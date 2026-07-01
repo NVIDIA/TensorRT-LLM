@@ -23,13 +23,18 @@ from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.pyexecutor._util import CacheCost
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
+from tensorrt_llm._torch.pyexecutor.resource_manager import BlockReusePolicy
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import binding_to_torch_dtype
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import GpuCacheTierConfig, PageIndexMode
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    GpuCacheTierConfig,
+    KVCacheManagerConfig,
+    PageIndexMode,
+)
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
 _RequestCache = Dict[
@@ -177,7 +182,8 @@ def _build_deepseek_v4_cache_config_for_test(
     max_seq_len: int = 1024,
     max_num_tokens: int | None = 2048,
     max_draft_len: int = 0,
-):
+    is_draft: bool = False,
+) -> KVCacheManagerConfig:
     cache_manager = object.__new__(DeepseekV4CacheManager)
     cache_manager.pp_layers = [0, 1, 2]
     cache_manager._compress_ratios = [1, 4, 128]
@@ -195,6 +201,8 @@ def _build_deepseek_v4_cache_config_for_test(
     cache_manager.enable_stats = False
     cache_manager.enable_swa_scratch_reuse = False
     cache_manager.num_extra_kv_tokens = 0
+    cache_manager.block_reuse_policy = BlockReusePolicy(kv_cache_config.block_reuse_policy)
+    cache_manager.is_draft = is_draft
 
     return cache_manager._build_cache_config(
         kv_cache_config,
@@ -239,6 +247,43 @@ def test_deepseek_v4_avg_seq_len_must_not_exceed_max_seq_len():
             KvCacheConfig(avg_seq_len=2048),
             max_seq_len=1024,
         )
+
+
+@pytest.mark.parametrize(
+    ("enable_block_reuse", "block_reuse_policy", "is_draft", "commit_min_snapshot"),
+    [
+        (True, "all_reusable", False, False),
+        (True, "per_request", False, True),
+        (False, "per_request", False, False),
+        (True, "per_request", True, True),
+    ],
+)
+def test_deepseek_v4_commit_min_snapshot_follows_block_reuse_policy(
+    enable_block_reuse: bool,
+    block_reuse_policy: str,
+    is_draft: bool,
+    commit_min_snapshot: bool,
+) -> None:
+    config = _build_deepseek_v4_cache_config_for_test(
+        KvCacheConfig(
+            enable_block_reuse=enable_block_reuse,
+            block_reuse_policy=block_reuse_policy,
+            enable_partial_reuse=True,
+        ),
+        is_draft=is_draft,
+    )
+
+    assert config.commit_min_snapshot is commit_min_snapshot
+    assert config.enable_partial_reuse
+
+
+@pytest.mark.parametrize("enable_partial_reuse", [False, True])
+def test_deepseek_v4_propagates_partial_reuse_config(enable_partial_reuse: bool) -> None:
+    config = _build_deepseek_v4_cache_config_for_test(
+        KvCacheConfig(enable_partial_reuse=enable_partial_reuse)
+    )
+
+    assert config.enable_partial_reuse is enable_partial_reuse
 
 
 @pytest.fixture(params=[False, True], ids=["scratch_reuse_disabled", "scratch_reuse_enabled"])
