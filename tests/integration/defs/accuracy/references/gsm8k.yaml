@@ -444,7 +444,7 @@ MiniMaxAI/MiniMax-M2.5:
 # Thresholds tracked per checkpoint / quantization scheme.
 MiniMaxAI/MiniMax-M3:
   - accuracy: 89
-nvidia/MiniMax-M3-MXFP8:
+MiniMaxAI/MiniMax-M3-MXFP8:
   - quant_algo: MXFP8
     accuracy: 89
 nvidia/NVIDIA-Nemotron-Nano-9B-v2:

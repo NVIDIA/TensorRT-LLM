@@ -33,11 +33,11 @@ Two checkpoints are supported. Both are loaded through the same `MiniMaxM3Sparse
 
 ### MXFP8 (recommended for throughput)
 
-* [nvidia/MiniMax-M3-MXFP8](https://huggingface.co/nvidia/MiniMax-M3-MXFP8) — NVIDIA-published MXFP8-quantized checkpoint. Weights are stored in MXFP8 (block size 1×32); activations and the KV cache stay in BF16.
+* [MiniMaxAI/MiniMax-M3-MXFP8](https://huggingface.co/MiniMaxAI/MiniMax-M3-MXFP8) — MiniMaxAI-published MXFP8-quantized checkpoint. Weights are stored in MXFP8 (block size 1×32); activations and the KV cache stay in BF16.
 
 ```bash
 git lfs install
-git clone https://huggingface.co/nvidia/MiniMax-M3-MXFP8 /models/MiniMax-M3-MXFP8
+git clone https://huggingface.co/MiniMaxAI/MiniMax-M3-MXFP8 /models/MiniMax-M3-MXFP8
 ```
 
 ### BF16 (upstream)
@@ -173,7 +173,7 @@ After the TensorRT LLM server is set up and shows *Application startup complete*
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-      "model": "nvidia/MiniMax-M3-MXFP8",
+      "model": "MiniMaxAI/MiniMax-M3-MXFP8",
       "messages": [
           {"role": "user", "content": "What is the capital of France?"}
       ],
@@ -188,7 +188,7 @@ Example response:
 {
   "id": "chatcmpl-...",
   "object": "chat.completion",
-  "model": "nvidia/MiniMax-M3-MXFP8",
+  "model": "MiniMaxAI/MiniMax-M3-MXFP8",
   "choices": [
     {
       "index": 0,
@@ -237,7 +237,7 @@ result_dir=/tmp/minimax_m3_output
 for concurrency in ${concurrency_list}; do
     num_prompts=$((concurrency * multi_round))
     python -m tensorrt_llm.serve.scripts.benchmark_serving \
-        --model nvidia/MiniMax-M3-MXFP8 \
+        --model MiniMaxAI/MiniMax-M3-MXFP8 \
         --backend openai \
         --dataset-name "random" \
         --random-input-len ${isl} \

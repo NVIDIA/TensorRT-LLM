@@ -275,7 +275,7 @@ MiniMaxAI/MiniMax-M2:
   - accuracy: 83.82
 MiniMaxAI/MiniMax-M3:
   - accuracy: 85
-nvidia/MiniMax-M3-MXFP8:
+MiniMaxAI/MiniMax-M3-MXFP8:
   - quant_algo: MXFP8
     accuracy: 85
 moonshotai/Kimi-K2-Instruct:

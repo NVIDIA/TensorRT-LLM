@@ -7268,7 +7268,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         # MXFP8 checkpoint: weights are MXFP8 (e4m3 + UE8M0 1x32 block
         # scales) with MXFP8 dynamic activations; the KV cache stays in
         # BF16 and the sparse attention path is unchanged from BF16.
-        model_name = "nvidia/MiniMax-M3-MXFP8"
+        model_name = "MiniMaxAI/MiniMax-M3-MXFP8"
         model_path = f"{llm_models_root()}/MiniMax-M3-MXFP8"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=False)
