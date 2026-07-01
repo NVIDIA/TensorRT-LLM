@@ -201,6 +201,24 @@ EXCLUDE_TEST_FILES = {
     "test_trtllm_quant_mxfp4_trtllm_gen_moe.py",
 }
 
+# Multi-GPU tests that exercise only AutoDeploy and its standalone dependencies.
+# Keep this list explicit: the remaining multi-GPU tests depend on TensorRT-LLM
+# runtime components, kernels, or test infrastructure that LLMC does not ship.
+STANDALONE_MULTIGPU_TEST_FILES = (
+    "custom_ops/test_dist.py",
+    "custom_ops/test_sharded_rmsnorm.py",
+    "transformations/library/test_apply_sharding_hints.py",
+    "transformations/library/test_bmm_sharding.py",
+    "transformations/library/test_ep_sharding.py",
+    "transformations/library/test_rmsnorm_sharding.py",
+    "transformations/library/test_sharding_num_correctness.py",
+    "transformations/library/test_step3p7_sharding_ir.py",
+    "transformations/library/test_tp_sharding.py",
+)
+
+# Pytest support files required by the allowlisted multi-GPU tests.
+STANDALONE_MULTIGPU_SUPPORT_FILES = ("transformations/library/conftest.py",)
+
 # Import path rewrite: old -> new (applied to test files only).
 _IMPORT_REWRITE = "tensorrt_llm._torch.auto_deploy"
 _IMPORT_TARGET = "llmc"
@@ -363,6 +381,19 @@ def _copy_tests(output_dir: str) -> int:
                 os.makedirs(os.path.dirname(dst_path), exist_ok=True)
                 shutil.copy2(src_path, dst_path)
                 count += 1
+
+    # Copy only the explicitly standalone-compatible multi-GPU tests. Unlike
+    # singlegpu/, this tree contains several tests that require TensorRT-LLM.
+    multigpu_src = os.path.join(AD_TESTS_DIR, "multigpu")
+    multigpu_files = STANDALONE_MULTIGPU_TEST_FILES + STANDALONE_MULTIGPU_SUPPORT_FILES
+    for rel_path in multigpu_files:
+        src_path = os.path.join(multigpu_src, rel_path)
+        if not os.path.isfile(src_path):
+            raise FileNotFoundError(f"Allowlisted multi-GPU test file does not exist: {src_path}")
+        dst_path = os.path.join(tests_dst, "multigpu", rel_path)
+        os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+        shutil.copy2(src_path, dst_path)
+        count += 1
 
     # Copy test utilities
     if os.path.isdir(AD_UTILS_TEST_DIR):
@@ -550,6 +581,9 @@ def _create_pyproject_toml(output_dir: str, dependencies: list, dev_dependencies
         "\n"
         "[tool.pytest.ini_options]\n"
         'testpaths = ["tests"]\n'
+        "markers = [\n"
+        '    "threadleak(enabled): configure thread-leak checks (inert in standalone tests)",\n'
+        "]\n"
     )
 
     with open(os.path.join(output_dir, "pyproject.toml"), "w") as f:

@@ -11,8 +11,8 @@
 ``test_sharding_num_correctness`` is parametrized intrinsically (one invocation
 per modeling file × dist config). The two CLI options pin a single value
 to that axis for per-file debugging; when omitted, the test auto-discovers
-every ``modeling_*.py`` under ``tensorrt_llm/_torch/auto_deploy/models/custom/``
-and runs the cheapest dist config across all of them.
+the supported ``modeling_*.py`` files from the active AutoDeploy package and
+runs the cheapest dist config across all of them.
 
 IR-marked files (graph carries ``torch.ops.auto_deploy.all_reduce`` per skill
 rule A3) run ``apply_sharding_hints`` + ``strip_sharding_hints``. Legacy
@@ -23,6 +23,7 @@ which the legacy heuristic inserts zero collectives ``pytest.skip`` cleanly
 (rather than rubber-stamping a trivial identity pass).
 """
 
+from importlib.util import find_spec
 from pathlib import Path
 
 import pytest
@@ -38,8 +39,29 @@ _QUANT_CHOICES = ("none", "nvfp4")
 _DIST_CONFIG_DEFAULT_CLI = "tep"
 _DIST_CONFIG_DEFAULT_AUTO = "tp-only"
 
-_REPO_ROOT = Path(__file__).resolve().parents[6]
-_MODELING_DIR = _REPO_ROOT / "tensorrt_llm" / "_torch" / "auto_deploy" / "models" / "custom"
+# This value is rewritten to ``llmc`` with the copied tests. Resolve the package
+# without importing it so test collection does not eagerly load every custom model.
+_AUTO_DEPLOY_PACKAGE = "tensorrt_llm._torch.auto_deploy"
+
+# ``modeling_eagle`` and ``modeling_gpt_oss`` have direct TRT-LLM dependencies
+# and therefore cannot import in standalone. Keep canonical discovery unchanged.
+_STANDALONE_DISCOVERY_EXCLUDED = {"modeling_eagle.py", "modeling_gpt_oss.py"}
+
+
+def _package_dir(package_name: str) -> Path:
+    """Resolve a package directory without importing the package."""
+    top_level, *subpackages = package_name.split(".")
+    spec = find_spec(top_level)
+    if spec is None or spec.submodule_search_locations is None:
+        raise ImportError(f"Could not locate package {package_name!r}")
+    for location in spec.submodule_search_locations:
+        package_dir = Path(location).joinpath(*subpackages)
+        if package_dir.is_dir():
+            return package_dir
+    raise ImportError(f"Package {package_name!r} has no filesystem location")
+
+
+_MODELING_DIR = _package_dir(_AUTO_DEPLOY_PACKAGE) / "models" / "custom"
 
 
 def pytest_addoption(parser):
@@ -50,10 +72,10 @@ def pytest_addoption(parser):
         help=(
             "Path to a single modeling file to verify with "
             "test_sharding_num_correctness. Accepts an absolute path, a path "
-            "relative to cwd or repo root, or a bare module short name "
-            "(resolved under tensorrt_llm._torch.auto_deploy.models.custom). "
+            "relative to cwd, or a bare module short name (resolved under "
+            "the active AutoDeploy package's models.custom package). "
             "When omitted, the test auto-discovers and parametrizes over "
-            "EVERY modeling_*.py in custom/."
+            "every supported modeling_*.py in custom/."
         ),
     )
     parser.addoption(
@@ -116,12 +138,15 @@ def _modeling_id(path: str) -> str:
 
 
 def _discover_modeling_files() -> list:
-    """Sorted absolute paths of every modeling_*.py in the AD custom models dir.
+    """Sorted absolute paths of supported modeling files in the AD custom models dir.
 
     Deterministic ordering is important: a flaky test mapped to a different
     parametrize id from run to run would mislead bisection.
     """
-    return sorted(str(p) for p in _MODELING_DIR.glob("modeling_*.py"))
+    excluded = _STANDALONE_DISCOVERY_EXCLUDED if _AUTO_DEPLOY_PACKAGE == "llmc" else set()
+    return sorted(
+        str(path) for path in _MODELING_DIR.glob("modeling_*.py") if path.name not in excluded
+    )
 
 
 def pytest_generate_tests(metafunc):
