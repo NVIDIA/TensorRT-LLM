@@ -131,7 +131,12 @@ class _SleepWakeupAction(StrEnum):
 
     SLEEP = "sleep"
     WAKEUP = "wakeup"
+    ABORT = "abort"
     SHUTDOWN = "shutdown"
+
+
+_SLEEP_WAKEUP_LISTENER_JOIN_TIMEOUT_S = 30.0
+_SLEEP_WAKEUP_ABORT_BARRIER_TIMEOUT_S = 30.0
 
 
 @functools.cache
@@ -1200,21 +1205,60 @@ class PyExecutor:
         # after the worker thread has joined, which guarantees that the non-rank-0
         # executor loops have already processed the shutdown broadcast and are
         # no longer driving NCCL, so the send cannot deadlock.
-        if (self.dist.rank == 0 and self._sleep_wakeup_comm is not None
-                and self.dist.world_size > 1):
-            logger.info(
-                "Sending shutdown to %d sleep/wakeup listener thread(s).",
-                self.dist.world_size - 1,
-            )
-            for dest in range(1, self.dist.world_size):
-                self._sleep_wakeup_comm.send(
-                    {
-                        "action": _SleepWakeupAction.SHUTDOWN,
-                        "tags": []
-                    },
-                    dest=dest,
-                    tag=_SleepWakeupTag.ACTION,
+        if self._sleep_wakeup_comm is not None and self.dist.world_size > 1:
+            if self.dist.rank == 0:
+                logger.info(
+                    "Sending shutdown to %d sleep/wakeup listener thread(s).",
+                    self.dist.world_size - 1,
                 )
+                shutdown_errors = []
+                shutdown_ranks = []
+                for dest in range(1, self.dist.world_size):
+                    try:
+                        self._sleep_wakeup_comm.send(
+                            {
+                                "action": _SleepWakeupAction.SHUTDOWN,
+                                "tags": []
+                            },
+                            dest=dest,
+                            tag=_SleepWakeupTag.ACTION,
+                        )
+                        shutdown_ranks.append(dest)
+                    except Exception as exc:
+                        shutdown_errors.append(
+                            f"rank {dest} shutdown send failed: {exc}")
+                        logger.warning(
+                            "Failed to send sleep/wakeup listener shutdown to "
+                            "rank %d: %s", dest, exc)
+                for src in shutdown_ranks:
+                    try:
+                        ack = self._sleep_wakeup_comm.recv(
+                            source=src, tag=_SleepWakeupTag.ACK)
+                    except Exception as exc:
+                        shutdown_errors.append(
+                            f"rank {src} shutdown ACK recv failed: {exc}")
+                        logger.warning(
+                            "Failed to receive sleep/wakeup listener shutdown "
+                            "ACK from rank %d: %s", src, exc)
+                        continue
+                    if ack.get("status") != "ok":
+                        shutdown_errors.append(
+                            ack.get("error")
+                            or f"rank {src} returned unknown shutdown ACK")
+                if shutdown_errors:
+                    logger.warning(
+                        "Sleep/wakeup listener shutdown completed with "
+                        "errors: %s", "; ".join(shutdown_errors))
+            elif self._sleep_wakeup_listener_thread is not None:
+                self._sleep_wakeup_listener_thread.join(
+                    timeout=_SLEEP_WAKEUP_LISTENER_JOIN_TIMEOUT_S)
+                if self._sleep_wakeup_listener_thread.is_alive():
+                    logger.warning(
+                        "Sleep/wakeup listener thread did not exit within "
+                        "%.1f seconds on rank %d.",
+                        _SLEEP_WAKEUP_LISTENER_JOIN_TIMEOUT_S,
+                        self.dist.rank,
+                    )
         self.worker_started = False
         # Release CUDA graphs before resource managers free their GPU memory.
         # Resource managers (e.g. SuffixAutomatonManager) allocate GPU workspace
@@ -2564,8 +2608,10 @@ class PyExecutor:
         Runs in a dedicated daemon thread on every non-rank-0 rank.  Blocks on
         ``_sleep_wakeup_comm.recv`` waiting for a control message from rank-0, then
         executes the requested VMM operation (``release_with_tag`` or
-        ``materialize_with_tag``) and sends an ACK back.  A ``SHUTDOWN``
-        message breaks the loop cleanly.
+        ``materialize_with_tag``) and sends an ACK back.  An ``ABORT`` message
+        unblocks the control barrier without touching VMM state when rank-0
+        could not broadcast the action to every peer.  A ``SHUTDOWN`` message
+        ACKs rank-0 and breaks the loop cleanly.
 
         Safety notes:
         - ``_sleep_wakeup_comm`` is a dedicated duplicated MPI communicator, isolated
@@ -2601,17 +2647,24 @@ class PyExecutor:
             while True:
                 msg = self._sleep_wakeup_comm.recv(source=0,
                                                    tag=_SleepWakeupTag.ACTION)
-                # Check for shutdown before entering the ACK-guarded block so
-                # we can break cleanly without sending a spurious ACK.
                 if msg.get("action") == _SleepWakeupAction.SHUTDOWN:
                     logger.debug(
                         "Sleep/wakeup listener (rank %d): received shutdown, "
                         "exiting.", self.dist.rank)
+                    self._sleep_wakeup_comm.send(
+                        {
+                            "status": "ok",
+                            "error": None
+                        },
+                        dest=0,
+                        tag=_SleepWakeupTag.ACK,
+                    )
                     break
                 # Use .get() so a missing "action" key surfaces as an unknown
                 # action inside the try rather than a bare KeyError here.
                 action = msg.get("action", "<unknown>")
                 error_msg = None
+                release_control_request = True
                 try:
                     # Decode tags inside the try so KeyError / ValueError from
                     # a malformed message still results in an error ACK being
@@ -2623,8 +2676,23 @@ class PyExecutor:
                     # control_action() waits on locally).  This guarantees no
                     # in-flight CUDA kernels from the executor are still running
                     # on this rank when the VMM mapping is changed below.
-                    self.control_request_barrier.wait()
-                    torch.cuda.synchronize()
+                    if action == _SleepWakeupAction.ABORT:
+                        # ABORT is sent after rank-0 fails to broadcast an
+                        # ACTION to every peer.  Usually the executor loop is
+                        # already parked in _handle_control_request(); if the
+                        # abort is stale, this bounded wait prevents the
+                        # listener from hanging forever on a message that no
+                        # longer has a matching control request.
+                        release_control_request = (
+                            self.control_request_barrier.wait(
+                                timeout=_SLEEP_WAKEUP_ABORT_BARRIER_TIMEOUT_S))
+                        error_msg = (
+                            "rank 0 aborted sleep/wakeup before local "
+                            f"execution: {msg.get('reason', 'unknown error')}")
+                        logger.warning("Sleep/wakeup listener: %s", error_msg)
+                    else:
+                        self.control_request_barrier.wait()
+                        torch.cuda.synchronize()
                     if action == _SleepWakeupAction.SLEEP:
                         release_with_tag(*tags)
                         torch.cuda.synchronize()
@@ -2634,9 +2702,11 @@ class PyExecutor:
                         materialize_with_tag(*tags)
                         torch.cuda.synchronize()
                     else:
-                        error_msg = f"unknown action '{action}'"
-                        logger.warning("Sleep/wakeup listener: %s, ignoring.",
-                                       error_msg)
+                        if action != _SleepWakeupAction.ABORT:
+                            error_msg = f"unknown action '{action}'"
+                            logger.warning(
+                                "Sleep/wakeup listener: %s, ignoring.",
+                                error_msg)
                 except (KeyError, TypeError, ValueError, RuntimeError,
                         torch.OutOfMemoryError) as exc:
                     error_msg = (f"rank {self.dist.rank} '{action}' failed: "
@@ -2668,8 +2738,9 @@ class PyExecutor:
                     # first so that it is clean for the next sleep/wakeup cycle
                     # before the executor loop resumes and could potentially
                     # set it again.  Only then signal control_action_done.
-                    self.control_request_barrier.clear()
-                    self.control_action_done.set()
+                    if release_control_request:
+                        self.control_request_barrier.clear()
+                        self.control_action_done.set()
                     # Send the ACK to rank-0 only after the executor loop on
                     # this rank has been unblocked.  This prevents rank-0 from
                     # exiting control_action() and broadcasting new requests

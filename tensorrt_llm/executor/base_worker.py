@@ -686,14 +686,21 @@ class BaseWorker(GenerationExecutor):
         from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
                                                         release_with_tag)
 
-        assert self.rank == 0, (
-            "_multi_rank_sleep_wakeup must only be called on rank 0")
+        if self.rank != 0:
+            raise RuntimeError(
+                "_multi_rank_sleep_wakeup must only be called on rank 0")
 
         sleep_wakeup_comm = self.engine._sleep_wakeup_comm
-        assert sleep_wakeup_comm is not None, (
-            "_sleep_wakeup_comm not initialised; was start_worker() called?")
+        if sleep_wakeup_comm is None:
+            raise RuntimeError(
+                "_sleep_wakeup_comm not initialised; was start_worker() called?"
+            )
 
         world_size = self.llm_args.parallel_config.world_size
+        if world_size <= 1:
+            raise ValueError(
+                "_multi_rank_sleep_wakeup requires world_size greater than 1")
+
         tag_strings = [t.value for t in tags]
         msg = {"action": _SleepWakeupAction(action), "tags": tag_strings}
 
@@ -703,26 +710,68 @@ class BaseWorker(GenerationExecutor):
         # consuming the wrong ACKs or resuming the event loop prematurely.
         # _sleep_wakeup_lock turns the whole sequence into a critical section.
         with self.engine._sleep_wakeup_lock, self.engine.control_action():
-            # Broadcast control message to non-rank-0 listeners.
-            for dest in range(1, world_size):
-                sleep_wakeup_comm.send(msg,
-                                       dest=dest,
-                                       tag=_SleepWakeupTag.ACTION)
-
-            # Execute locally on rank-0.  Only CUDA/VMM errors are captured
-            # as local_error; unexpected exceptions bypass the except clause
-            # and are re-raised after the finally has drained peer ACKs.
+            action_ranks = []
+            abort_ranks = []
+            errors = []
             local_error = None
             try:
-                torch.cuda.synchronize()
-                if action == _SleepWakeupAction.SLEEP:
-                    release_with_tag(*tags)
+                # Broadcast control message to non-rank-0 listeners.  Keep
+                # this inside the try/finally so a partial broadcast still
+                # drains ACKs from peers that received an action or abort.
+                for dest in range(1, world_size):
+                    try:
+                        sleep_wakeup_comm.send(msg,
+                                               dest=dest,
+                                               tag=_SleepWakeupTag.ACTION)
+                        action_ranks.append(dest)
+                    except Exception as exc:
+                        send_error = (
+                            f"rank 0 failed to send '{action}' to rank "
+                            f"{dest}: {exc}")
+                        errors.append(send_error)
+                        logger.error(
+                            "_multi_rank_sleep_wakeup: %s",
+                            send_error,
+                            exc_info=True,
+                        )
+                        abort_msg = {
+                            "action": _SleepWakeupAction.ABORT,
+                            "tags": [],
+                            "reason": send_error,
+                        }
+                        for abort_dest in range(dest, world_size):
+                            try:
+                                sleep_wakeup_comm.send(
+                                    abort_msg,
+                                    dest=abort_dest,
+                                    tag=_SleepWakeupTag.ACTION,
+                                )
+                                abort_ranks.append(abort_dest)
+                            except Exception as abort_exc:
+                                abort_error = (
+                                    "rank 0 failed to send sleep/wakeup abort "
+                                    f"to rank {abort_dest}: {abort_exc}")
+                                errors.append(abort_error)
+                                logger.error(
+                                    "_multi_rank_sleep_wakeup: %s",
+                                    abort_error,
+                                    exc_info=True,
+                                )
+                        break
+
+                if not errors:
+                    # Execute locally on rank-0.  Only CUDA/VMM errors are
+                    # captured as local_error; unexpected exceptions are
+                    # re-raised after the finally has drained peer ACKs.
                     torch.cuda.synchronize()
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                else:
-                    materialize_with_tag(*tags)
-                    torch.cuda.synchronize()
+                    if action == _SleepWakeupAction.SLEEP:
+                        release_with_tag(*tags)
+                        torch.cuda.synchronize()
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                    else:
+                        materialize_with_tag(*tags)
+                        torch.cuda.synchronize()
             except (RuntimeError, torch.OutOfMemoryError) as exc:
                 local_error = (f"rank 0 '{action}' failed: {exc}\n"
                                f"{traceback.format_exc()}")
@@ -733,13 +782,25 @@ class BaseWorker(GenerationExecutor):
                 )
             finally:
                 # Always drain all ACKs to keep the communicator clean even
-                # if rank-0's local op failed or raised unexpectedly.
-                errors = []
+                # if rank-0's send/local op failed or raised unexpectedly.
                 if local_error:
                     errors.append(local_error)
-                for src in range(1, world_size):
-                    ack = sleep_wakeup_comm.recv(source=src,
-                                                 tag=_SleepWakeupTag.ACK)
+                ack_ranks = action_ranks + abort_ranks
+                for src in ack_ranks:
+                    try:
+                        ack = sleep_wakeup_comm.recv(source=src,
+                                                     tag=_SleepWakeupTag.ACK)
+                    except Exception as exc:
+                        errors.append(
+                            f"rank 0 failed to receive ACK from rank {src}: "
+                            f"{exc}")
+                        logger.error(
+                            "_multi_rank_sleep_wakeup: failed to receive ACK "
+                            "from rank %d",
+                            src,
+                            exc_info=True,
+                        )
+                        continue
                     if ack.get("status") != "ok":
                         errors.append(
                             ack.get("error")

@@ -383,6 +383,107 @@ class TestMultiRankAckErrorPropagation:
         assert "rank 2 OOM" in msg
 
 
+class TestMultiRankSendFailureRecovery:
+    """Partial rank-0 broadcast failures must not leave peer ACKs undrained."""
+
+    def test_mid_broadcast_send_failure_drains_action_and_abort_acks(self):
+        """If one peer received the action before send() fails, rank-0 drains it.
+
+        The peer that did not receive the original action gets a best-effort
+        abort message so its executor loop can leave the control barrier.
+        """
+        import threading
+        from contextlib import contextmanager
+        from unittest.mock import patch
+
+        from tensorrt_llm._torch.pyexecutor.py_executor import _SleepWakeupAction, _SleepWakeupTag
+        from tensorrt_llm.executor.base_worker import BaseWorker
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        send_calls = []
+        recv_calls = []
+
+        class FakeComm:
+            def send(self, payload, dest, tag):
+                send_calls.append((payload["action"], dest, tag))
+                if payload["action"] == _SleepWakeupAction.SLEEP and dest == 2:
+                    raise RuntimeError("simulated mid-broadcast send failure")
+
+            def recv(self, source, tag):
+                recv_calls.append((source, tag))
+                if source == 1:
+                    return {"status": "ok"}
+                return {
+                    "status": "error",
+                    "error": "rank 0 aborted sleep/wakeup before local execution",
+                }
+
+        @contextmanager
+        def _noop_control_action():
+            yield None
+
+        w = object.__new__(BaseWorker)
+        w._backend = "pytorch"
+        w.rank = 0
+        w.llm_args = SimpleNamespace(
+            backend="pytorch",
+            parallel_config=SimpleNamespace(world_size=3),
+            sleep_config=object(),
+        )
+        w.engine = SimpleNamespace(
+            _sleep_wakeup_lock=threading.Lock(),
+            _sleep_wakeup_comm=FakeComm(),
+            control_action=_noop_control_action,
+        )
+
+        with (
+            patch("tensorrt_llm._torch.virtual_memory.release_with_tag") as release,
+            patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag"),
+            patch("torch.cuda.synchronize"),
+            patch("gc.collect"),
+            patch("torch.cuda.empty_cache"),
+        ):
+            with pytest.raises(RuntimeError) as exc_info:
+                w._multi_rank_sleep_wakeup("sleep", [ExecutorMemoryType.KV_CACHE])
+
+        msg = str(exc_info.value)
+        assert "simulated mid-broadcast send failure" in msg
+        assert "rank 0 aborted sleep/wakeup" in msg
+        assert release.call_count == 0
+        assert send_calls == [
+            (_SleepWakeupAction.SLEEP, 1, _SleepWakeupTag.ACTION),
+            (_SleepWakeupAction.SLEEP, 2, _SleepWakeupTag.ACTION),
+            (_SleepWakeupAction.ABORT, 2, _SleepWakeupTag.ACTION),
+        ]
+        assert recv_calls == [
+            (1, _SleepWakeupTag.ACK),
+            (2, _SleepWakeupTag.ACK),
+        ]
+
+    def test_non_rank_call_raises_runtime_error(self):
+        """Rank precondition uses a production RuntimeError, not assert."""
+        from tensorrt_llm.executor.base_worker import BaseWorker
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        w = object.__new__(BaseWorker)
+        w.rank = 1
+
+        with pytest.raises(RuntimeError, match="rank 0"):
+            w._multi_rank_sleep_wakeup("sleep", [ExecutorMemoryType.KV_CACHE])
+
+    def test_missing_sleep_wakeup_comm_raises_runtime_error(self):
+        """Communicator precondition uses a production RuntimeError, not assert."""
+        from tensorrt_llm.executor.base_worker import BaseWorker
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        w = object.__new__(BaseWorker)
+        w.rank = 0
+        w.engine = SimpleNamespace(_sleep_wakeup_comm=None)
+
+        with pytest.raises(RuntimeError, match="_sleep_wakeup_comm"):
+            w._multi_rank_sleep_wakeup("sleep", [ExecutorMemoryType.KV_CACHE])
+
+
 class TestListenerUncaughtExceptionSendsErrorAck:
     """An exception that bypasses the narrow except clause must still produce an error ACK.
 
@@ -420,8 +521,9 @@ class TestListenerUncaughtExceptionSendsErrorAck:
 
         with (
             patch("torch.cuda.set_device"),
-            patch("tensorrt_llm.runtime.generation.CUASSERT"),
-            patch("tensorrt_llm._utils.set_thread_local_mpi_comm"),
+            patch("tensorrt_llm._torch.pyexecutor.py_executor.CUASSERT"),
+            patch("tensorrt_llm._torch.pyexecutor.py_executor.cudart.cudaSetDevice"),
+            patch("tensorrt_llm._torch.pyexecutor.py_executor.set_thread_local_mpi_comm"),
             patch(
                 "tensorrt_llm._torch.virtual_memory.release_with_tag",
                 side_effect=MemoryError("simulated OOM outside except list"),
@@ -453,6 +555,92 @@ class TestListenerUncaughtExceptionSendsErrorAck:
         )
         assert sent_acks[0]["error"] is not None
         assert "MemoryError" in sent_acks[0]["error"]
+
+
+class TestListenerAbortAndShutdown:
+    """Listener control messages must unblock cleanly and ACK rank-0."""
+
+    def test_abort_unblocks_control_request_and_sends_error_ack(self):
+        """Abort messages release the non-rank executor control barrier."""
+        import threading
+        from unittest.mock import patch
+
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, _SleepWakeupAction
+
+        sent_acks = []
+
+        class FakeComm:
+            def __init__(self):
+                self.recv_count = 0
+
+            def recv(self, source, tag):
+                self.recv_count += 1
+                if self.recv_count > 1:
+                    raise StopIteration
+                return {
+                    "action": _SleepWakeupAction.ABORT,
+                    "tags": [],
+                    "reason": "rank 0 send failed",
+                }
+
+            def send(self, payload, dest, tag):
+                sent_acks.append(payload)
+
+        executor = object.__new__(PyExecutor)
+        executor._sleep_wakeup_comm = FakeComm()
+        executor.device_id = 0
+        executor.dist = SimpleNamespace(rank=1)
+        executor.control_request_barrier = threading.Event()
+        executor.control_request_barrier.set()
+        executor.control_action_done = threading.Event()
+
+        with (
+            patch("torch.cuda.set_device"),
+            patch("tensorrt_llm._torch.pyexecutor.py_executor.CUASSERT"),
+            patch("tensorrt_llm._torch.pyexecutor.py_executor.cudart.cudaSetDevice"),
+            patch("tensorrt_llm._torch.pyexecutor.py_executor.set_thread_local_mpi_comm"),
+            patch("torch.cuda.synchronize"),
+        ):
+            try:
+                executor._sleep_wakeup_listener_loop()
+            except StopIteration:
+                pass
+
+        assert executor.control_action_done.is_set()
+        assert not executor.control_request_barrier.is_set()
+        assert sent_acks
+        assert sent_acks[0]["status"] == "error"
+        assert "rank 0 send failed" in sent_acks[0]["error"]
+
+    def test_shutdown_sends_ack_before_listener_exits(self):
+        """Shutdown messages are acknowledged so rank-0 can drain them."""
+        from unittest.mock import patch
+
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, _SleepWakeupAction
+
+        sent_acks = []
+
+        class FakeComm:
+            def recv(self, source, tag):
+                return {"action": _SleepWakeupAction.SHUTDOWN, "tags": []}
+
+            def send(self, payload, dest, tag):
+                sent_acks.append(payload)
+
+        executor = object.__new__(PyExecutor)
+        executor._sleep_wakeup_comm = FakeComm()
+        executor.device_id = 0
+        executor.dist = SimpleNamespace(rank=1)
+
+        with (
+            patch("torch.cuda.set_device"),
+            patch("tensorrt_llm._torch.pyexecutor.py_executor.CUASSERT"),
+            patch("tensorrt_llm._torch.pyexecutor.py_executor.cudart.cudaSetDevice"),
+            patch("tensorrt_llm._torch.pyexecutor.py_executor.set_thread_local_mpi_comm"),
+        ):
+            executor._sleep_wakeup_listener_loop()
+
+        assert sent_acks == [{"status": "ok", "error": None}]
 
 
 class TestMultiRankRank0LocalFailureDrainsAcks:
