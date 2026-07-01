@@ -1437,7 +1437,7 @@ class PyTorchModelEngine(ModelEngine):
                     new_tensors_device=None,
                     resource_manager=resource_manager,
                     maybe_graph=False)
-                self._project_enc_dec_warmup_cross_kv(projection_inputs)
+                self._populate_cross_kv_cache(projection_inputs)
             torch.cuda.synchronize()
 
             for (request, encoder_output, skip_cross_kv_projection, state,
@@ -1913,7 +1913,7 @@ class PyTorchModelEngine(ModelEngine):
                 spec_resource_manager.free_resources(request)
         return False
 
-    def _project_enc_dec_warmup_cross_kv(self, inputs: Dict[str, Any]) -> None:
+    def _populate_cross_kv_cache(self, inputs: Dict[str, Any]) -> None:
         encoder_hidden_states = inputs.get("encoder_hidden_states")
         cross_attn_metadata = inputs.get("cross_attn_metadata")
         if encoder_hidden_states is None or cross_attn_metadata is None:
