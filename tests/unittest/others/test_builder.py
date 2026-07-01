@@ -57,7 +57,9 @@ class TestBuilder(unittest.TestCase):
         assert engine is not None
         refit_engine = builder.refit_engine(network, engine)
         assert refit_engine is not None
-        builder.save_config(builder_config, tempfile.mktemp())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = f"{tmpdir}/builder_config.json"
+            builder.save_config(builder_config, config_path)
 
     def test_top_level_dont_have_functional_apis(self):
         # This did not check all the functional apis, but should already prevent
