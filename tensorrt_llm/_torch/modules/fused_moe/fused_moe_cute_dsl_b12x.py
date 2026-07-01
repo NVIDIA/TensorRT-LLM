@@ -83,9 +83,10 @@ class CuteDslB12xFusedMoE(CuteDslFusedMoE):
     flashinfer-importable gates pass (see ``create_moe.get_moe_cls``).
     """
 
-    # SM versions on which the FlashInfer b12x NVFP4 MoE kernel is available.
+    # SM versions on which FlashInfer exposes the b12x NVFP4 MoE kernel.
     # SM120 = desktop Blackwell (RTX 5090 / GB202); SM121 = GB10 / DGX Spark.
     _SUPPORTED_SM_VERSIONS = frozenset({120, 121})
+    _MIN_CUTLASS_DSL_CUDA_MAJOR_FOR_SM121 = 13
 
     # Prefill chunks (``x.shape[0] >= threshold``) route via CUTLASS NVFP4
     # GroupGEMM; decode (``x.shape[0] < threshold``) uses b12x. 64 cleanly
@@ -102,9 +103,9 @@ class CuteDslB12xFusedMoE(CuteDslFusedMoE):
         swiglu_gptoss_style: bool = False,
     ) -> Tuple[bool, Optional[str]]:
         sm_version = get_sm_version()
-        if sm_version not in cls._SUPPORTED_SM_VERSIONS:
-            sm_list = "/".join(f"SM{v}" for v in sorted(cls._SUPPORTED_SM_VERSIONS))
-            return _warn_and_return(f"CuteDslB12xFusedMoE requires {sm_list}, got SM{sm_version}")
+        runtime_disable_reason = cls.get_runtime_disable_reason(sm_version)
+        if runtime_disable_reason is not None:
+            return _warn_and_return(runtime_disable_reason)
         if quant_algo != QuantAlgo.NVFP4:
             return _warn_and_return(
                 f"CuteDslB12xFusedMoE only supports NVFP4 quantization "
@@ -118,6 +119,45 @@ class CuteDslB12xFusedMoE(CuteDslFusedMoE):
         if swiglu_gptoss_style:
             return _warn_and_return("CuteDslB12xFusedMoE does not support swiglu_gptoss_style")
         return True, None
+
+    @classmethod
+    def get_runtime_disable_reason(cls, sm_version: int) -> Optional[str]:
+        if sm_version not in cls._SUPPORTED_SM_VERSIONS:
+            sm_list = "/".join(f"SM{v}" for v in sorted(cls._SUPPORTED_SM_VERSIONS))
+            return f"CuteDslB12xFusedMoE requires {sm_list}, got SM{sm_version}"
+
+        # CUDA 12.x CuTe DSL lowers the SM121 NVFP4 MMA atom to the internal
+        # ``_mma.block_scale...`` spelling, which ptxas rejects. CUDA 13.x
+        # emits the public ``mma.sync.aligned...kind::mxf4nvf4`` opcode.
+        if sm_version == 121 and not cls._is_sm121_cutlass_dsl_runtime_available():
+            return (
+                "CuteDslB12xFusedMoE on SM121 requires the active "
+                "nvidia-cutlass-dsl CUDA 13 native payload. CUDA 12.x CuTe "
+                "DSL lowers FlashInfer's B12x NVFP4 MMA to PTX that ptxas "
+                "rejects with Unexpected instruction types specified for "
+                "'_mma'. Install nvidia-cutlass-dsl-libs-cu13 after "
+                "nvidia-cutlass-dsl-libs-base (or install "
+                "nvidia-cutlass-dsl[cu13]) so "
+                "cutlass.base_dsl.version_info.CUDA_VERSION reports CUDA "
+                f"{cls._MIN_CUTLASS_DSL_CUDA_MAJOR_FOR_SM121}.x or newer."
+            )
+        return None
+
+    @classmethod
+    def _is_sm121_cutlass_dsl_runtime_available(cls) -> bool:
+        cuda_major = cls._get_cutlass_dsl_cuda_major()
+        return cuda_major is not None and cuda_major >= cls._MIN_CUTLASS_DSL_CUDA_MAJOR_FOR_SM121
+
+    @staticmethod
+    def _get_cutlass_dsl_cuda_major() -> Optional[int]:
+        try:
+            from cutlass.base_dsl.version_info import CUDA_VERSION
+        except ImportError:
+            return None
+        major = getattr(CUDA_VERSION, "major", None)
+        if isinstance(major, int):
+            return major
+        return None
 
     def __init__(self, *args, **kwargs):
         # ``ModelConfig`` is consumed by the inherited ``__init__`` for cache

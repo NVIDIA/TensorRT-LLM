@@ -85,6 +85,15 @@ def get_moe_cls(
                 from tensorrt_llm._utils import get_sm_version
                 sm_version = get_sm_version()
                 if sm_version in CuteDslB12xFusedMoE._SUPPORTED_SM_VERSIONS:
+                    runtime_disable_reason = CuteDslB12xFusedMoE.get_runtime_disable_reason(
+                        sm_version)
+                    if runtime_disable_reason is not None:
+                        logger.warning_once(
+                            f"{layer_prefix}{runtime_disable_reason} "
+                            "Using CutlassFusedMoE instead.",
+                            key="cute_dsl_b12x_runtime_disabled",
+                        )
+                        return CutlassFusedMoE
                     try:
                         import flashinfer  # noqa: F401
                         logger.info(
