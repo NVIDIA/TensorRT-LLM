@@ -865,12 +865,11 @@ def supports_autotuner_capture(
     Returns:
         True if autotuner capture/replay is supported, False otherwise
     """
-    # DEEPGEMM and both MegaMoE backends do not support autotuner capture
+    # DEEPGEMM and MEGAMOE_DEEPGEMM do not support autotuner capture
     # (fused kernels own dispatch+combine).
     if backend_type in (
         MoeBackendType.DEEPGEMM,
         MoeBackendType.MEGAMOE_DEEPGEMM,
-        MoeBackendType.MEGAMOE_CUTEDSL,
     ):
         return False
 

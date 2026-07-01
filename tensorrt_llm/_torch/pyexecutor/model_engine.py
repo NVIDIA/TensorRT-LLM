@@ -1014,6 +1014,18 @@ class PyTorchModelEngine(ModelEngine):
         )
         AutoTuner.get().print_profiling_cache()
 
+        # Free the MegaMoE CuteDSL AutoTuner profiling scratch (a transient
+        # symmetric buffer only needed during profiling). Clearing the
+        # process-global cache here drops its sole strong owner; MegaMoE modules
+        # hold only a weakref to it, so the symmetric buffer is reclaimed below
+        # without keeping it in the KV-cache memory baseline.
+        from ..custom_ops import cute_dsl_megamoe_custom_op as _megamoe_op
+        release_megamoe_scratch = getattr(_megamoe_op,
+                                          "release_megamoe_profiling_scratch",
+                                          None)
+        if release_megamoe_scratch is not None:
+            release_megamoe_scratch()
+
         # Clear workspace buffers allocated during the autotuner forward pass.
         # The autotuner runs a context-only forward with max_num_tokens, which
         # causes the global Buffers pool to cache large MoE/GEMM workspaces.

@@ -1,7 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Inline-PTX wrappers (TMA 1D load/store, fns.b32, raw-int64 peer ops) for the cuTeDSL dispatch kernel."""
+"""Inline-PTX wrappers (TMA 1D load/store, fns.b32, raw-int64 peer ops) for the cuTeDSL kernels."""
 
+from typing import Optional
+
+from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import Float32, Int32, Int64, T, dsl_user_op
 
@@ -87,6 +90,63 @@ def tma_store_1d(dst_gmem, src_smem, num_bytes, *, loc=None, ip=None):
         "l,r,r,l",
         has_side_effects=True,
         asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def cp_async_bulk_s2g(dst_gmem,
+                      src_smem,
+                      size_bytes,
+                      *,
+                      loc=None,
+                      ip=None) -> None:
+    """Issue descriptor-free ``cp.async.bulk`` SMEM->GMEM.
+
+    The caller owns ``cp_async_bulk_commit_group`` so copy and reduce bulk
+    paths can share the same group boundary.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            dst_gmem.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            src_smem.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            size_bytes.ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.bulk.global.shared::cta.bulk_group [$0], [$1], $2;",
+        "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def cp_reduce_async_bulk_add_noftz_bf16_s2g(
+    dst_gmem,
+    src_smem,
+    size_bytes,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
+    """Issue descriptor-free ``cp.reduce.async.bulk`` for BF16 add."""
+    llvm.inline_asm(
+        None,
+        [
+            dst_gmem.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            src_smem.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            size_bytes.ir_value(loc=loc, ip=ip),
+        ],
+        "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.noftz.bf16 "
+        "[$0], [$1], $2;",
+        "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,
         ip=ip,
     )
@@ -205,6 +265,31 @@ def red_add_release_sys_u64_raw(addr: Int64,
 
 
 @dsl_user_op
+def red_add_relaxed_sys_u64_raw(addr: Int64,
+                                val: Int64,
+                                *,
+                                loc=None,
+                                ip=None) -> None:
+    """``red.relaxed.sys.global.add.u64`` via raw int64 byte address.
+
+    Relaxed (no release fence) sibling of ``red_add_release_sys_u64_raw``.  Use
+    when an enclosing ``bar.sync`` + a later release fence (e.g. the trailing
+    ``nvlink_barrier`` publish) already provides cross-rank ordering, so the
+    per-op release fence would just emit a redundant ``membar.sys`` drain.
+    """
+    llvm.inline_asm(
+        None,
+        [addr.ir_value(), val.ir_value()],
+        "red.relaxed.sys.global.add.u64 [$0], $1;",
+        "l,l",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def red_add_release_sys_s32_raw(addr: Int64,
                                 val: Int32,
                                 *,
@@ -222,6 +307,58 @@ def red_add_release_sys_s32_raw(addr: Int64,
         "l,r",
         has_side_effects=True,
         asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def red_add_relaxed_sys_v2_bf16x2(
+    addr,
+    val0_packed_bf16x2,
+    val1_packed_bf16x2,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
+    """Issue ``red.relaxed.sys.global.add.v2.bf16x2 [addr], {v0, v1};``."""
+    llvm.inline_asm(
+        None,
+        [
+            addr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            val0_packed_bf16x2.ir_value(loc=loc, ip=ip),
+            val1_packed_bf16x2.ir_value(loc=loc, ip=ip),
+        ],
+        "red.relaxed.sys.global.add.noftz.v2.bf16x2 [$0], {$1, $2};",
+        "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def red_add_release_gpu_s32(
+    counter_ptr,
+    value,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
+    """Issue ``red.release.gpu.global.add.s32`` to a GMEM int32 location."""
+    llvm.inline_asm(
+        None,
+        [
+            counter_ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            value.ir_value(loc=loc, ip=ip),
+        ],
+        "red.release.gpu.global.add.s32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,
         ip=ip,
     )
@@ -267,3 +404,27 @@ def read_clock64(*, loc=None, ip=None) -> Int64:
             loc=loc,
             ip=ip,
         ))
+
+
+@dsl_user_op
+def _fence_rel_sys(*,
+                   loc: Optional[ir.Location] = None,
+                   ip: Optional[ir.InsertionPoint] = None) -> None:
+    """
+    Fence operation with acquire-release semantics at system scope.
+
+    See the `PTX documentation <https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-membar>`__.
+    """
+    llvm.fence(llvm.AtomicOrdering.release, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _fence_rel_gpu(*,
+                   loc: Optional[ir.Location] = None,
+                   ip: Optional[ir.InsertionPoint] = None) -> None:
+    """
+    Fence operation with acquire-release semantics at system scope.
+
+    See the `PTX documentation <https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-membar>`__.
+    """
+    llvm.fence(llvm.AtomicOrdering.release, syncscope="device", loc=loc, ip=ip)

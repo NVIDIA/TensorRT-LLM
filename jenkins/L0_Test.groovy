@@ -3358,7 +3358,7 @@ def launchTestJobs(pipeline, testFilter)
     fullSet += SBSATestConfigs.keySet()
 
     SBSASlurmTestConfigs = [
-        "GB200-4_GPUs-PyTorch-DS-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_ds", 1, 1, 4],
+        "GB200-4_GPUs-PyTorch-DS-1": ["auto:gb200-x4-split", "l0_gb200_multi_gpus_ds", 1, 1, 4],
     ]
     fullSet += SBSASlurmTestConfigs.keySet()
 

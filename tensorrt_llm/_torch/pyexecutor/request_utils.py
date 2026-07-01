@@ -38,13 +38,15 @@ def get_num_child_requests(request: ExecutorRequest) -> int:
 
 
 def collect_py_objects_from_requests(
-    requests: List, attribute_name: str
+    requests: List, attribute_name: str, include_none: bool = False
 ) -> Optional[Tuple[str, Dict]]:
     """Collect Python-only objects from requests.
 
     Args:
         requests: List of RequestQueueItem objects.
         attribute_name: Name of the attribute to collect.
+        include_none: Include requests whose attribute value is None. When
+            enabled, the source request must have the attribute.
 
     Returns:
         Tuple of (attribute_name, dict mapping request_id to object) or None if empty.
@@ -54,9 +56,12 @@ def collect_py_objects_from_requests(
         if not item.is_normal_request:
             continue
         if item.request:
-            obj = getattr(item.request, attribute_name, None)
-            if obj is not None:
-                req_id_to_obj[item.id] = obj
+            if include_none:
+                req_id_to_obj[item.id] = getattr(item.request, attribute_name)
+            else:
+                obj = getattr(item.request, attribute_name, None)
+                if obj is not None:
+                    req_id_to_obj[item.id] = obj
     return None if not req_id_to_obj else (attribute_name, req_id_to_obj)
 
 
@@ -70,9 +75,8 @@ def attach_py_objects_to_requests(requests: List, py_request_objects: Tuple) -> 
     for attr_name, req_obj_dict in py_request_objects:
         for item in requests:
             if item.request:
-                py_obj = req_obj_dict.get(item.id)
-                if py_obj is not None:
-                    setattr(item.request, attr_name, py_obj)
+                if item.id in req_obj_dict:
+                    setattr(item.request, attr_name, req_obj_dict[item.id])
 
 
 def build_no_fitting_reqs_diagnostic(active_requests, kv_cache_manager) -> str:
@@ -578,6 +582,9 @@ class RequestBroadcaster:
         py_disaggregated_params = collect_py_objects_from_requests(
             new_requests, "py_disaggregated_params"
         )
+        py_conversation_params = collect_py_objects_from_requests(
+            new_requests, "py_conversation_params", include_none=True
+        )
         py_lora_path = collect_py_objects_from_requests(new_requests, "py_lora_path")
 
         return tuple(
@@ -589,6 +596,7 @@ class RequestBroadcaster:
                     py_scheduling_params,
                     py_num_logprobs,
                     py_disaggregated_params,
+                    py_conversation_params,
                     py_lora_path,
                 ],
             )

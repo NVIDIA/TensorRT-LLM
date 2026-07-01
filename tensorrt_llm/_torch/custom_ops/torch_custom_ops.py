@@ -55,6 +55,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
 # BufferKind is bound from C++; see cpp/tensorrt_llm/thop/outputTensor.h (torch_ext::BufferKind).
 from tensorrt_llm.bindings.internal.thop import BufferKind
 
+# Guard the import-time PDL setup: deep_gemm.set_pdl() allocates a CUDA tensor
+# and would force a CUDA context on every `import tensorrt_llm`. Skip it when no
+# GPU is visible (e.g. CUDA_VISIBLE_DEVICES="" on a pure client such as the
+# benchmark_serving load generator); a GPU-less process never launches a
+# DeepGEMM kernel, so the flag is irrelevant there.
+if torch.cuda.is_available():
+    deep_gemm.set_pdl(get_env_enable_pdl())
+
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
 @torch.library.custom_op("trtllm::bmm_out", mutates_args=("out", ))

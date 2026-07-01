@@ -38,6 +38,7 @@ from tensorrt_llm.serve.openai_protocol import (
     CompletionRequest,
     CompletionResponse,
     CompletionResponseChoice,
+    ConversationParams,
     DisaggregatedParams,
     DisaggScheduleStyle,
     PromptTokensDetails,
@@ -143,6 +144,7 @@ def test_get_gen_request_uses_ctx_response_prompt_token_ids_for_chat():
             }
         ],
         prompt_token_ids=[1, 2, 3],
+        conversation_params=ConversationParams(conversation_id="conv-chat"),
     )
     ctx_response = _make_chat_response(
         finish_reason="length",
@@ -153,6 +155,7 @@ def test_get_gen_request_uses_ctx_response_prompt_token_ids_for_chat():
 
     assert gen_request.prompt_token_ids == ctx_prompt_token_ids
     assert gen_request.disaggregated_params.request_type == "generation_only"
+    assert gen_request.conversation_params.conversation_id == "conv-chat"
 
 
 @pytest.mark.asyncio
@@ -165,6 +168,7 @@ async def test_create_chat_response_sets_prompt_token_ids_for_context_only():
         def __init__(self) -> None:
             self.outputs = []
             self.prompt_token_ids = prompt_token_ids
+            self.error = None
 
         async def aresult(self):
             return self

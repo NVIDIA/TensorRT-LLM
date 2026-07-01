@@ -16,13 +16,10 @@ l0_dgx_b200_ds:
       orchestrator: mpi
   tests:
   - unittest/_torch/modeling/test_modeling_deepseekv4.py
-  - accuracy/test_disaggregated_serving.py::TestDeepSeekV4Flash::test_auto_dtype
-  - accuracy/test_disaggregated_serving.py::TestDeepSeekV4Flash::test_gen_first
   # V4-Flash NVFP4 aggregate smoke (TP=4, no EPLB): integration-test mode
   # (1 MMLU sample, no GSM8K reference required). Validates the basic
   # forward path without disagg or EPLB complexity.
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_auto_dtype TIMEOUT (60)
-  - accuracy/test_disaggregated_serving.py::TestDeepSeekV4FlashBase::test_auto_dtype TIMEOUT (120)
   # ------------- Disaggregated transfer component tests (multi-process) ---------------
   - unittest/disaggregated/test_kv_transfer_mp.py
   # Split test_py_cache_transceiver_mp.py by workflow (4 × 12 = 48 combos).

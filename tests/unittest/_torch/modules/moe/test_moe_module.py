@@ -1643,6 +1643,11 @@ def test_configurable_moe_multi_gpu(
     ):
         dtype_routing_logits = torch.float32
 
+    # MegaMoECuteDsl tunes its fused cross-rank kernel via the MERGE strategy,
+    # which only runs under autotune; enable it so the multi-GPU lockstep tuning
+    # path is actually exercised for this backend.
+    enable_autotune = moe_backend == MoeBackendType.MEGAMOE_CUTEDSL.value
+
     world_size = 4
     _test_moe_multi_gpu(
         comm_method_type,
@@ -1653,6 +1658,7 @@ def test_configurable_moe_multi_gpu(
         parallel_mode=parallel_mode,
         model_config=model_config,
         seq_len=seq_len,
+        enable_autotune=enable_autotune,
         routing_method_cls=routing_method_cls,
         dtype_routing_logits=dtype_routing_logits,
         swiglu_alpha=swiglu_alpha,

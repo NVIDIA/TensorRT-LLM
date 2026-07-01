@@ -1,5 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
 """Codegen-time finite mapping contracts for RMEM tensor handoff."""
 
 from __future__ import annotations
@@ -78,9 +80,8 @@ class Space:
         """Convert a coordinate tuple into a CuTe-style linear index."""
         coord_tuple = tuple(coord)
         if len(coord_tuple) != self.rank:
-            raise ContractError(
-                f"Coordinate rank mismatch for {self.names!r}: {len(coord_tuple)} != {self.rank}"
-            )
+            raise ContractError(f"Coordinate rank mismatch for {self.names!r}: "
+                                f"{len(coord_tuple)} != {self.rank}")
 
         linear = 0
         stride = 1
@@ -162,8 +163,8 @@ class TableMapping:
         """Validate and return the canonical table for the given spaces."""
         if len(self.table) != domain.size:
             raise ContractError(
-                f"TableMapping length must equal domain size {domain.size}, got {len(self.table)}"
-            )
+                f"TableMapping length must equal domain size {domain.size}, "
+                f"got {len(self.table)}")
         for idx, value in enumerate(self.table):
             if value < 0 or value >= codomain.size:
                 raise ContractError(
@@ -395,3 +396,27 @@ class TensorWithContract:
 
     tensor: Any
     contract: Contract
+
+
+def eval_function_mapping(contract: Contract, **domain_coord):
+    """Evaluate a FunctionMapping contract at runtime."""
+    if not isinstance(contract.mapping, FunctionMapping):
+        raise TypeError("runtime contract eval requires a FunctionMapping")
+
+    result = contract.mapping.function(**domain_coord)
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, (tuple, list)):
+        if len(result) != contract.codomain.rank:
+            raise ValueError(
+                "FunctionMapping result rank does not match codomain rank: "
+                f"{len(result)} vs {contract.codomain.rank}")
+        return {
+            name: result[i]
+            for i, name in enumerate(contract.codomain.names)
+        }
+    if contract.codomain.rank == 1:
+        return {contract.codomain.names[0]: result}
+    raise TypeError(
+        "FunctionMapping runtime eval must return dict/tuple/list, or scalar "
+        "for rank-1 codomain")

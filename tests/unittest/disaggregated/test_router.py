@@ -13,12 +13,13 @@ from tensorrt_llm.runtime.kv_cache_hash import (get_cache_salt_id,
                                                 truncate_sha256_hash_to_int64)
 from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
     ReuseScope, sequence_to_blockchain_keys)
+# yapf: disable
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionToolsParam,
                                                 CompletionRequest,
+                                                ConversationParams,
                                                 DisaggregatedParams,
                                                 FunctionDefinition)
-# yapf: disable
 from tensorrt_llm.serve.router import (KV_CACHE_HASH_ALGO_V1,
                                        KV_CACHE_HASH_ALGO_V2,
                                        KV_CACHE_HASH_ALGO_V2_SHA256_64,
@@ -1531,11 +1532,15 @@ async def test_get_next_server_exclude_server_insufficient(router_class):
 
 
 def _make_request(conversation_id=None, prompt="the " * 100):
-    params = DisaggregatedParams(request_type="context_only",
-                                 conversation_id=conversation_id)
+    params = DisaggregatedParams(request_type="context_only")
+    conversation_params = None
+    if conversation_id is not None:
+        conversation_params = ConversationParams(
+            conversation_id=conversation_id)
     return CompletionRequest(model="TinyLlama",
                              prompt=[prompt],
-                             disaggregated_params=params)
+                             disaggregated_params=params,
+                             conversation_params=conversation_params)
 
 
 @pytest.mark.asyncio

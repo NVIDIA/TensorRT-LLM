@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager as KVCacheManagerV1
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -52,9 +52,11 @@ class _StatsRequest:
     is_cuda_graph_dummy: bool = False
     is_disagg_generation_init_state: bool = False
     is_disagg_generation_transmission_complete: bool = False
+    is_finished_due_to_cancellation: bool = False
     context_phase_params: None = None
     py_draft_tokens: list[int] = field(default_factory=list)
     draft_tokens: list[int] = field(default_factory=list)
+    state: LlmRequestState = LlmRequestState.GENERATION_IN_PROGRESS
     context_current_position: int = 0
     context_chunk_size: int = 0
     prepopulated_prompt: tuple[int, int] | None = None

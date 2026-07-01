@@ -68,6 +68,7 @@ non-1 scales compute correctly.
 
 from __future__ import annotations
 
+import weakref
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -76,6 +77,7 @@ import torch.distributed as dist
 
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.logger import logger
+from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 # ``megamoe_activation_sf_bytes_per_row`` lives at module top of the
@@ -426,6 +428,7 @@ class MegaMoECuteDsl(MoE):
         without_comm: bool = False,
         activation_type: ActivationType = ActivationType.Swiglu,
         swiglu_limit: Optional[torch.Tensor] = None,
+        in_kernel_fc2_reduce: bool = False,
         **kwargs,
     ) -> None:
         # ``aux_stream_dict`` is accepted for ``create_moe_backend`` signature
@@ -491,24 +494,23 @@ class MegaMoECuteDsl(MoE):
         # the transformers route is GPU-validated and promoted to MoeConfig.
         self.apply_topk_in_fc1 = True
 
-        # Cross-rank combine path. ``False`` (default): the FC2 epilogue writes
-        # ``combine_output`` directly (scattered symmetric writes back to the
-        # source rank). ``True``: the kernel stages FC2 output in a local
-        # ``fc2_output_workspace`` and a fused in-kernel NVLink ``token_back_by_push``
-        # bulk-returns it to the source rank's ``combine_output`` -- faster for
-        # multi-rank EP at the cost of the extra (local) fc2_output_workspace +
-        # fc2_done_counter budget (auto-sized by ``get_workspace_sizes``). The
-        # ``combine_output`` shape / host ``.sum(dim=1)`` reduce are unchanged
-        # (those depend on ``in_kernel_fc2_reduce``, not this knob). Internal
-        # backend constant for now; flip to opt into the fused-combine path.
-        self.token_back_by_dispatch = False
-
-        # FC2 output store path (codegen-time). ``True`` (default): non-bulk
-        # TMA store (upstream default). ``False``: bulk store path. Kept as an
-        # internal backend attribute so different shapes/cases can pick the
-        # cheaper store; it changes the generated kernel, so it is part of the
-        # runner ``unique_id`` / compile-cache key (never a per-call runtime kwarg).
-        self.non_ubulk_fc2_store = True
+        # Output reduction form (functional, NOT a perf tactic). ``False``
+        # (default, form-A): ``combine_output`` is ``(T, num_topk, hidden)`` and
+        # the host reduces ``.sum(dim=1)`` -- deterministic. ``True`` (form-B):
+        # ``combine_output`` is ``(T, 1, hidden)`` (zeroed per launch) and the
+        # kernel folds the top-k reduction in-kernel, fusing the standalone
+        # reduce kernel into the mega kernel (saves one launch) at the cost of
+        # NON-deterministic output (in-kernel float accumulation order). It
+        # changes codegen + the combine buffer shape, so it is carried in the
+        # runner ``unique_id`` / compile + workspace caches and in the symm
+        # provider cache key (form-A and form-B never share buffers). The caller
+        # opts into form-B by constructing the backend with
+        # ``in_kernel_fc2_reduce=True``; otherwise the deterministic form-A is
+        # used and serve configs need no change.
+        # NOTE: the cross-rank combine path (token_back_mode) and fc2 store path
+        # (use_bulk_fc2_store) are now autotuner TACTIC fields, not backend
+        # constants -- the op/runner pick them per token bucket.
+        self.in_kernel_fc2_reduce = bool(in_kernel_fc2_reduce)
 
         # SwiGLU clamp: map the model-provided per-layer ``swiglu_limit`` tensor
         # to the kernel's codegen-time scalar ``gate_up_clamp``. The MegaMoE
@@ -548,6 +550,13 @@ class MegaMoECuteDsl(MoE):
         # cache in ``cute_dsl_megamoe_custom_op.py``. ``None`` for the
         # single-rank degenerate path.
         self._symm_provider = None
+        # WEAK reference to the symmetric scratch provider used ONLY for
+        # AutoTuner profiling (one buffer shared across same-shape MoE layers).
+        # The process-global ``_MEGAMOE_PROFILING_SCRATCH_CACHE`` is the SOLE
+        # strong owner, so once ``release_megamoe_profiling_scratch()`` clears
+        # that cache after warmup the buffer is reclaimed and this weakref goes
+        # dead -- no per-module teardown needed. ``None`` for single-rank.
+        self._profiling_scratch_provider_ref = None
         self._weights_loaded = False
         self._weights_created = False
         self._post_load_done = False
@@ -748,6 +757,7 @@ class MegaMoECuteDsl(MoE):
         would block the rendezvous and is a hard error for multi-rank.
         """
         from ....custom_ops.cute_dsl_megamoe_custom_op import (
+            get_megamoe_profiling_scratch,
             get_megamoe_symm_provider,
             query_megamoe_shared_workspace_bytes,
         )
@@ -768,8 +778,9 @@ class MegaMoECuteDsl(MoE):
             intermediate_size_per_partition=int(self.intermediate_size_per_partition),
             expand_intermediate_size_per_partition=int(self.expand_intermediate_size_per_partition),
             max_tokens_per_rank=int(self.max_num_tokens),
+            in_kernel_fc2_reduce=bool(self.in_kernel_fc2_reduce),
         )
-        return get_megamoe_symm_provider(
+        staging = get_megamoe_symm_provider(
             process_group=self._ep_pg,
             world_size=self.ep_size,
             rank=self.ep_rank,
@@ -778,7 +789,26 @@ class MegaMoECuteDsl(MoE):
             num_topk=top_k,
             output_dtype=self.dtype or torch.bfloat16,
             shared_workspace_bytes=shared_workspace_bytes,
+            in_kernel_fc2_reduce=bool(self.in_kernel_fc2_reduce),
         )
+        # Separate symmetric scratch for AutoTuner profiling (same layout, own
+        # peer_offsets). Shared across same-shape layers; freed after warmup.
+        scratch = get_megamoe_profiling_scratch(
+            process_group=self._ep_pg,
+            world_size=self.ep_size,
+            rank=self.ep_rank,
+            hidden_size=self.hidden_size,
+            max_tokens_per_rank=int(self.max_num_tokens),
+            num_topk=top_k,
+            output_dtype=self.dtype or torch.bfloat16,
+            shared_workspace_bytes=shared_workspace_bytes,
+            in_kernel_fc2_reduce=bool(self.in_kernel_fc2_reduce),
+        )
+        # Hold only a weakref: the global scratch cache owns the buffer, so it
+        # is freed by ``release_megamoe_profiling_scratch()`` after warmup
+        # without this module pinning it for the process lifetime.
+        self._profiling_scratch_provider_ref = weakref.ref(scratch) if scratch is not None else None
+        return staging
 
     def load_weights(self, weights: List[Dict], allow_partial_loading: bool = False) -> None:
         if self.quant_method is None:
@@ -922,10 +952,11 @@ class MegaMoECuteDsl(MoE):
         )
         # ``fp4_quantize(is_sf_swizzled=False)`` returns LINEAR layout
         # ``(rows, ceil(hidden/16))`` with no column pad. The kernel TMA
-        # load needs ``round_up(ceil(hidden/16), 4)`` bytes per row, so
+        # load needs ``pad_up(ceil_div(hidden, 16), 4)`` bytes per row
+        # (== ``megamoe_activation_sf_bytes_per_row``), so
         # 32-aligned-but-not-64-aligned hidden sizes (1568, 1632, 2080)
         # come back 2 bytes short; pad the tail before returning.
-        raw_cols = (hidden + 15) // 16
+        raw_cols = ceil_div(hidden, 16)
         x_sf_raw = x_sf.view(x_bf16.shape[0], raw_cols)
         if sf_cols == raw_cols:
             return x_fp4, x_sf_raw
@@ -1044,8 +1075,11 @@ class MegaMoECuteDsl(MoE):
             staging["activation_sf"] = torch.empty(
                 (max_T, sf_bytes_per_row), dtype=torch.uint8, device=device
             )
+            # form-A: (max_T, top_k, hidden); form-B (in_kernel_fc2_reduce):
+            # (max_T, 1, hidden) -- kernel folds the top-k reduction in-kernel.
+            combine_k = 1 if self.in_kernel_fc2_reduce else top_k
             staging["combine_output"] = torch.empty(
-                (max_T, top_k, hidden),
+                (max_T, combine_k, hidden),
                 dtype=torch.bfloat16,
                 device=device,
             )
@@ -1066,6 +1100,7 @@ class MegaMoECuteDsl(MoE):
                     self.expand_intermediate_size_per_partition
                 ),
                 max_tokens_per_rank=max_T,
+                in_kernel_fc2_reduce=bool(self.in_kernel_fc2_reduce),
             )
             staging["shared_workspace"] = torch.empty(
                 shared_bytes, dtype=torch.uint8, device=device
@@ -1201,6 +1236,37 @@ class MegaMoECuteDsl(MoE):
         through the module-level :func:`_as_nvfp4` / :func:`_as_fp8_sf`
         helpers (the kernel rejects raw uint8 byte tensors).
         """
+        # form-B (in_kernel_fc2_reduce) accumulates the top-k reduction on top
+        # of the existing combine cell, so the live rows MUST start at 0. Only
+        # the first ``num_tokens`` rows are consumed (the host squeeze reads
+        # ``combine_output[:num_tokens]`` below) and the padded tail rows are
+        # never written by any rank (``topk_idx == -1`` skips them), so zeroing
+        # just ``[:num_tokens]`` is sufficient and avoids clearing the whole
+        # ``max_T``-row buffer every launch. The zero is stream-ordered before
+        # the kernel launch (and thus before any peer cross-rank push, which is
+        # gated behind the in-kernel dispatch barrier). form-A overwrites cells
+        # and needs no per-launch zero.
+        if self.in_kernel_fc2_reduce and num_tokens > 0:
+            combine_output[:num_tokens].zero_()
+        # Hand the symmetric profiling scratch to the op so AutoTuner profiling
+        # keeps the cross-rank inputs symmetric without touching this staging
+        # buffer. Cleared right after so a later same-process op call for a
+        # different shape never reuses a stale scratch. The provider is held via
+        # a weakref: after warmup ``release_megamoe_profiling_scratch()`` drops
+        # the global cache (sole owner), the weakref goes dead, and this resolves
+        # to ``None`` so steady-state forwards use the staging buffer.
+        from ....custom_ops.cute_dsl_megamoe_custom_op import set_active_megamoe_profiling_scratch
+
+        scratch_provider = (
+            self._profiling_scratch_provider_ref()
+            if self._profiling_scratch_provider_ref is not None
+            else None
+        )
+        set_active_megamoe_profiling_scratch(
+            scratch_provider.get_regions()
+            if (scratch_provider is not None and world_size > 1)
+            else None
+        )
         torch.ops.trtllm.cute_dsl_megamoe_nvfp4_blackwell(
             activation=_as_nvfp4(activation),
             activation_sf=_as_fp8_sf(activation_sf),
@@ -1226,16 +1292,22 @@ class MegaMoECuteDsl(MoE):
             peer_offsets=peer_offsets,
             apply_topk_in_fc1=bool(self.apply_topk_in_fc1),
             gate_up_clamp=self.gate_up_clamp,
-            token_back_by_dispatch=bool(self.token_back_by_dispatch),
-            non_ubulk_fc2_store=bool(self.non_ubulk_fc2_store),
+            in_kernel_fc2_reduce=bool(self.in_kernel_fc2_reduce),
         )
+        set_active_megamoe_profiling_scratch(None)
         if num_tokens == 0:
             return torch.empty((0, hidden), dtype=output_dtype, device=combine_output.device)
-        # Deepgemm graph (apply_topk_in_fc1=True): the kernel already folded
-        # the topk score into the per-route BF16 terms, so the host reduce is
-        # a plain sum over the top-k axis. Accumulate in fp32 explicitly to
-        # match the design reference ``bf16(sum_fp32(term))`` and to be robust
-        # against any future change to the bf16 reduction accumulator type.
+        if self.in_kernel_fc2_reduce:
+            # form-B: the kernel already summed the top-k routes in-kernel, so
+            # ``combine_output`` is (T, 1, hidden); just drop the singleton axis
+            # (NO host reduce). Output is non-deterministic (in-kernel float
+            # accumulation order).
+            return combine_output[:num_tokens].squeeze(1).to(output_dtype)
+        # form-A deepgemm graph (apply_topk_in_fc1=True): the kernel folded the
+        # topk score into the per-route BF16 terms, so the host reduce is a
+        # plain sum over the top-k axis. Accumulate in fp32 explicitly to match
+        # the design reference ``bf16(sum_fp32(term))`` and to be robust against
+        # any future change to the bf16 reduction accumulator type.
         out = combine_output[:num_tokens].to(torch.float32).sum(dim=1).to(output_dtype)
         return out
 
