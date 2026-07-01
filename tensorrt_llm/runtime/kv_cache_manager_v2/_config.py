@@ -212,6 +212,12 @@ class KVCacheManagerConfig:
     If True, we will try to reuse tokens from partially matched blocks.
     """
 
+    enable_inclusive_host_cache: bool = False
+    """
+    If True, keep a page's clean host copy after recall so a later eviction reuses it instead of
+    re-copying to host. Reclaimed under host memory pressure.
+    """
+
     constraints: list[BatchDesc] = field(default_factory=list)
     """
     A list of step configurations that must always be supported.
