@@ -1167,6 +1167,9 @@ class BaseLLM:
     def get_kv_cache_capacity(self) -> dict:
         """Get the runtime's static primary/GPU KV cache capacity.
 
+        Raises:
+            RuntimeError: If called when ``encode_only=True``.
+
         Returns:
             dict: KV cache capacity. The returned capacity covers the primary
                 GPU KV cache pool only; CPU/host offload capacity is not
