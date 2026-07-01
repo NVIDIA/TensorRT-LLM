@@ -135,6 +135,10 @@ methods:
         annotation: bool
         default: False
         status: beta
+      enable_pipelined_scheduler:
+        annotation: bool
+        default: False
+        status: prototype
       disable_flashinfer_sampling:
         annotation: bool
         default: False

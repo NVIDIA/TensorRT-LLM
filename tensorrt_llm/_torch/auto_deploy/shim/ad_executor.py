@@ -475,6 +475,9 @@ class ADEngine(ModelEngine):
             )
             self.llm_args.max_stats_len = ad_config.max_stats_len
             self._enable_chunked_prefill = getattr(ad_config, "enable_chunked_prefill", False)
+            self.llm_args.enable_pipelined_scheduler = getattr(
+                ad_config, "enable_pipelined_scheduler", False
+            )
         else:
             self.llm_args.stream_interval = 1
             self.llm_args.attention_dp_config = None
@@ -487,6 +490,7 @@ class ADEngine(ModelEngine):
             self._cache_transceiver_enabled = False
             self.llm_args.max_stats_len = 1000
             self._enable_chunked_prefill = False
+            self.llm_args.enable_pipelined_scheduler = False
 
         # check for max total draft tokens
         if self.spec_config is not None:
