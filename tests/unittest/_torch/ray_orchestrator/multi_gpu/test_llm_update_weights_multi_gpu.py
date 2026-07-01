@@ -322,10 +322,12 @@ class RefNVFP4ModelWithIPCHandles(RefHFModel):
 
         assert not fusion_buffer, f"Incomplete fusion groups: {list(fusion_buffer.keys())}"
 
+        # Only populate the owning device. Extra replicas are created on
+        # demand by ``get_weight_ipc_handles_serialized`` so that GPUs not
+        # actually asked for via IPC (e.g. cuda:2/3 on a 4-GPU CI runner
+        # when a TP=2 test only requests device_ids=[0, 1]) don't hold
+        # onto NVFP4 quantized tensors that persist across parametrize IDs.
         self.all_weights[self.device_id] = model_weights
-        for i in range(torch.cuda.device_count()):
-            if i != self.device_id:
-                self.all_weights[i] = [(n, p.to(f"cuda:{i}")) for n, p in model_weights]
 
         with torch.no_grad():
             param_dict = dict(self.model.named_parameters())
@@ -427,6 +429,10 @@ class RefNVFP4ModelWithIPCHandles(RefHFModel):
         device_list = list(range(torch.cuda.device_count())) if device_ids is None else device_ids
 
         for device in device_list:
+            if device not in self.all_weights:
+                src = self.all_weights[self.device_id]
+                self.all_weights[device] = [(n, p.to(f"cuda:{device}")) for n, p in src]
+
             all_handles = []
             for item in self.all_weights[device]:
                 name, p = item
