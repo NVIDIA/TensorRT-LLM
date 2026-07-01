@@ -213,11 +213,6 @@ def resolve_moe_cls(
     moe_cls = get_moe_cls(model_config, override_quant_config, layer_idx)
 
     effective_quant_config = override_quant_config or model_config.quant_config
-    has_quant = (effective_quant_config is not None
-                 and effective_quant_config.layer_quant_mode.has_any_quant(
-                     exclude_kv_cache=True))
-    if (moe_cls == TRTLLMGenFusedMoE and not has_quant):
-        moe_cls = CutlassFusedMoE
 
     # Routed-expert LoRA is supported only on CutlassFusedMoE with unquantized
     # base weights. Fail loudly here rather than at runtime if the user-selected
