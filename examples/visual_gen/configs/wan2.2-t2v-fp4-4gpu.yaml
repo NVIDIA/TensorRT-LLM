@@ -25,5 +25,8 @@ parallel_config:
   ulysses_size: 2
   async_ulysses: true
   parallel_vae_size: 4
+torch_compile_config:
+  options:
+    emulate_precision_casts: true
 cuda_graph_config:
   enable: false
