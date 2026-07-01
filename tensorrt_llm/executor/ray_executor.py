@@ -8,9 +8,15 @@ except ModuleNotFoundError as e:
     e.msg = """Cannot import Ray. Please install 'ray' package to use ray orchestrator"""
     raise
 
-from ray.util.placement_group import (PlacementGroupSchedulingStrategy,
-                                      get_current_placement_group,
+from ray.util.placement_group import (get_current_placement_group,
                                       placement_group)
+
+try:
+    # Ray >= 2.55.0
+    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+except ImportError:
+    # Older Ray re-exported it from ray.util.placement_group
+    from ray.util.placement_group import PlacementGroupSchedulingStrategy
 
 from tensorrt_llm._ray_utils import unwrap_ray_errors
 from tensorrt_llm._utils import nvtx_range_debug
