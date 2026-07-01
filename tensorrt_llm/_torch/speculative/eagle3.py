@@ -1159,7 +1159,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 self.spec_config.end_thinking_phase_token)
 
             num_accepted_tokens = self._apply_force_accepted_tokens(
-                num_accepted_tokens, num_contexts, runtime_draft_len)
+                num_accepted_tokens,
+                num_contexts,
+                runtime_draft_len,
+                spec_metadata=spec_metadata)
 
             return accepted_tokens, num_accepted_tokens
 

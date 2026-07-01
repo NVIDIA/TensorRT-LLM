@@ -96,6 +96,10 @@ class DSAParams(SparseParams):
     indexer_rope_interleave: bool = False
     enable_heuristic_topk: bool = False
     indexer_k_dtype: Literal["fp8", "fp4"] = "fp8"
+    # Cross-layer indexer sharing: whether this layer runs its own indexer
+    # ("full") or reuses the previous full layer's top-k ("shared"). Always
+    # True for a dense per-layer indexer (e.g. DeepSeek-V3.2).
+    is_full_indexer_layer: bool = True
 
     @property
     def indices_block_size(self) -> int:
@@ -555,6 +559,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     indexer_quant_block_size: int = 128
     # Enable indexer skip for short sequences
     enable_indexer_skip: bool = False
+    # Cross-layer indexer sharing: previous full layer's top-k, reused by
+    # "shared" layers (None for a dense per-layer indexer).
+    shared_topk_indices: Optional[torch.Tensor] = None
     # Whether skip the indexer for context requests
     skip_indexer_for_ctx_reqs: bool = False
     # Whether skip the indexer for generation requests
@@ -655,6 +662,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def prepare(self):
         super().prepare()
         self._invalidate_pool_view_cache()
+        # Cross-layer indexer sharing is per-step state; clear it so a "shared"
+        # layer can never reuse a previous step's top-k before a full layer runs.
+        self.shared_topk_indices = None
 
         # Get kv lengths
         assert self.kv_cache_params.use_cache is True, "DSA requires use_cache to be True"
@@ -718,6 +728,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # pool_view cache here so it is recomputed on the next
         # transform_local_topk_and_prepare_pool_view() call.
         self._invalidate_pool_view_cache()
+        # Per-step state for cross-layer indexer sharing; clear at the step
+        # boundary so a "shared" layer never reuses a stale top-k.
+        self.shared_topk_indices = None
 
         if self.kv_cache_manager is not None and self.num_tokens > 0:
             seq_lens = self.seq_lens_cuda[:self.num_seqs]
@@ -2934,14 +2947,24 @@ class DSATrtllmAttention(TrtllmAttention):
             attention_chunk_size=attention_chunk_size,
             **kwargs)
 
-        self.indexer = Indexer(quant_config,
-                               pos_embd_params,
-                               mla_params,
-                               skip_create_weights_in_init,
-                               sparse_params,
-                               dtype=dtype,
-                               layer_idx=layer_idx,
-                               aux_stream=aux_stream)
+        # Cross-layer indexer sharing: only "full" layers own an indexer;
+        # "shared" layers reuse the previous full layer's top-k (see
+        # MLA.forward_dsa_*). Resolved per-layer in to_sparse_params; defaults to
+        # full (dense per-layer indexer). indexer=None also makes the weight
+        # loader skip the (absent) shared-layer indexer weights.
+        self.is_full_indexer_layer = getattr(sparse_params,
+                                             'is_full_indexer_layer', True)
+        if self.is_full_indexer_layer:
+            self.indexer = Indexer(quant_config,
+                                   pos_embd_params,
+                                   mla_params,
+                                   skip_create_weights_in_init,
+                                   sparse_params,
+                                   dtype=dtype,
+                                   layer_idx=layer_idx,
+                                   aux_stream=aux_stream)
+        else:
+            self.indexer = None
 
     def sparse_attn_predict(
         self,

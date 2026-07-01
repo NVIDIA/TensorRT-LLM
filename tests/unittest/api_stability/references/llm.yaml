@@ -123,6 +123,14 @@ methods:
         annotation: bool
         default: False
         status: prototype
+      encoder_max_batch_size:
+        annotation: Optional[int]
+        default: null
+        status: prototype
+      encoder_max_num_tokens:
+        annotation: Optional[int]
+        default: null
+        status: prototype
       disable_overlap_scheduler:
         annotation: bool
         default: False
