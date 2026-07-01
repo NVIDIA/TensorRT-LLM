@@ -921,6 +921,14 @@ class DFlashForCausalLM(nn.Module):
         Reuses the existing RotaryEmbedding infrastructure which correctly
         handles all RoPE variants (standard, YaRN, scaled, etc.).
         """
+        # RoPE is read from layer 0; guard that the drafter is single-layer-type
+        # (the target uses per-layer-type RoPE, the drafter does not).
+        layer_types = getattr(self.config, 'layer_types', None)
+        if layer_types is not None and len(set(layer_types)) > 1:
+            raise ValueError(
+                "DFlash _init_rope() reads RoPE from layer 0 only, but the drafter "
+                f"has heterogeneous layer_types {sorted(set(layer_types))}; per-layer "
+                "RoPE resolution is required for this checkpoint.")
         attn0 = self.model.layers[0].self_attn
 
         if attn0.rotary_emb is not None:
@@ -1172,12 +1180,16 @@ class DFlashForCausalLM(nn.Module):
         q_size = attn0.q_size
         kv_size = attn0.kv_size
         head_dim = attn0.head_dim
+        num_heads = attn0.num_heads
         num_kv_heads = attn0.num_key_value_heads
+        # Head counts are read from layer 0 here and in dflash_forward; assert
+        # uniformity (the target uses per-layer heads, the drafter does not).
         for a in layers_attn[1:]:
-            assert (a.kv_size == kv_size and a.head_dim == head_dim
+            assert (a.q_size == q_size and a.kv_size == kv_size
+                    and a.head_dim == head_dim and a.num_heads == num_heads
                     and a.num_key_value_heads == num_kv_heads), (
                         "DFlash fused KV requires all drafter layers to share "
-                        "kv_size / head_dim / num_kv_heads.")
+                        "q_size / kv_size / head_dim / num_heads / num_kv_heads.")
 
         has_k_norm = [hasattr(a, 'k_norm') for a in layers_attn]
         assert all(has_k_norm) or not any(has_k_norm), (
@@ -1318,6 +1330,7 @@ class DFlashForCausalLM(nn.Module):
         q_size = attn0.q_size
         kv_size = attn0.kv_size
         head_dim = attn0.head_dim
+        # Uniformity across layers is asserted in _build_fused_kv_buffers (above).
         num_heads_per_rank = attn0.num_heads
         num_kv_heads_per_rank = attn0.num_key_value_heads
 
