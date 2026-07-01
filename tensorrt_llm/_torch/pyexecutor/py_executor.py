@@ -2673,6 +2673,11 @@ class PyExecutor:
             for req in scheduled_batch.generation_requests:
                 self.kv_cache_manager.revert_allocate_generation(req)
 
+    def _revert_ctx_alloc(self, dropped_context_requests):
+        """Revert V2 context KV growth for requests deferred after scheduling."""
+        for req in dropped_context_requests:
+            self.kv_cache_manager.revert_allocate_context(req)
+
     @nvtx_range("_prefetch_for_context_requests")
     def _prefetch_for_context_requests(self) -> None:
         """Pre-stage disk blocks to host for upcoming context requests with block reuse."""

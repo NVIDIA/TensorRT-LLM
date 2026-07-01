@@ -1857,6 +1857,30 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"{reverted_cap}"
             )
 
+    def revert_allocate_context(self, req: LlmRequest) -> None:
+        """Undo the capacity growth from this iteration's context resize."""
+        pre_cap = getattr(req, "py_ctx_pre_resize_cap", None)
+        if pre_cap is None:
+            return
+        req.py_ctx_pre_resize_cap = None
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None or not kv_cache.is_active:
+            return
+        if pre_cap >= kv_cache.capacity:
+            return
+        if kv_cache.history_length > pre_cap:
+            self.free_resources(req)
+            return
+        history_length = min(kv_cache.history_length, pre_cap)
+        if not kv_cache.resize(pre_cap, history_length):
+            raise RuntimeError(
+                f"Failed to revert KV cache capacity for context "
+                f"request {req.py_request_id} from {kv_cache.capacity} "
+                f"to {pre_cap}"
+            )
+        if pre_cap > 0:
+            kv_cache.suspend()
+
     def _restore_page_index_bufs(self, request_id: int, kv_cache) -> None:
         """Re-connect host page-index buffers after resume().
 
@@ -1963,12 +1987,14 @@ class KVCacheManagerV2(BaseResourceManager):
 
         target = req.context_current_position + num_tokens + self.num_extra_kv_tokens
         capacity = max(kv_cache.capacity, target)
+        pre_cap = kv_cache.capacity
 
         success = kv_cache.resize(capacity)
         if not success:
             if req.is_first_context_chunk:
                 kv_cache.suspend()
             return False
+        req.py_ctx_pre_resize_cap = pre_cap if capacity > pre_cap else None
         return True
 
     def prepare_disagg_gen_init(self, req: LlmRequest) -> bool:
@@ -1990,12 +2016,14 @@ class KVCacheManagerV2(BaseResourceManager):
         # reuse (which may leave a non-zero context_current_position).
         target = req.prompt_len + get_draft_token_length(req) + self.num_extra_kv_tokens
         capacity = max(kv_cache.capacity, target)
+        pre_cap = kv_cache.capacity
 
         success = kv_cache.resize(capacity, req.prompt_len)
         if not success:
             if req.is_first_context_chunk:
                 kv_cache.suspend()
             return False
+        req.py_ctx_pre_resize_cap = pre_cap if capacity > pre_cap else None
         return True
 
     def get_history_length(self, req: LlmRequest) -> int | None:
