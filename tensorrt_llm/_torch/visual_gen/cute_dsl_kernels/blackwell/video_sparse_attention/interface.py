@@ -24,7 +24,6 @@ device/dtype/head_dim envelope is not met.
 from __future__ import annotations
 
 import math
-import os
 from typing import Tuple
 
 import torch
@@ -59,10 +58,8 @@ _COMPILE_CACHE: dict = {}
 
 
 def is_cute_supported(q: torch.Tensor) -> bool:
-    """Capability check for the CuTe path. Set TLLM_VSA_DISABLE_CUTE=1 to force off."""
+    """Capability check for the CuTe path."""
     # Kernel asserts head_dim==128, block_m==block_n==64, fp16/bf16, sm_100+.
-    if os.environ.get("TLLM_VSA_DISABLE_CUTE", "").strip() in ("1", "true", "True"):
-        return False
     if not CUTE_AVAILABLE:
         return False
     if not q.is_cuda:

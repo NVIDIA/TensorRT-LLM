@@ -104,8 +104,9 @@ def test_vsa_with_attn2d_raises():
         attn2d_col_size=2,
         attn2d_row_group=None,
         attn2d_col_group=None,
+        cp_size=4,
     )
-    with pytest.raises(ValueError, match="incompatible with Attention2D"):
+    with pytest.raises(ValueError, match="incompatible with context parallelism"):
         Attention(64, 4, qkv_mode=QKVMode.FUSE_QKV, config=cfg)
 
 
