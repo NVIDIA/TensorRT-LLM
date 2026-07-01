@@ -1261,6 +1261,17 @@ class TestPipelinedLoopEligibility:
         stub = _make_pipelined_eligibility_stub(_is_kv_manager_v2=False)
         assert PyExecutor._is_pipelined_loop_eligible(stub) is False
 
+    def test_ineligible_when_llm_args_lacks_attribute(self):
+        """Regression: not every ModelEngine's `llm_args` is a full
+        TorchLlmArgs instance. AutoDeploy's ADEngine builds a hand-picked
+        `types.SimpleNamespace` (see ad_executor.py) that only carries the
+        specific fields PyExecutor is known to read; a plain attribute
+        access here raised AttributeError through that path instead of
+        falling back to "ineligible"."""
+        stub = _make_pipelined_eligibility_stub()
+        stub.llm_args = types.SimpleNamespace()  # no enable_pipelined_scheduler
+        assert PyExecutor._is_pipelined_loop_eligible(stub) is False
+
 
 # ---------------------------------------------------------------------------
 # Tests for `_process_previous_batch`'s explicit-`batch_state` argument,

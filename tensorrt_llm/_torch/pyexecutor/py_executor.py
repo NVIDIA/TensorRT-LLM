@@ -3602,7 +3602,7 @@ class PyExecutor:
         the same number of times and in the same order on every rank, so
         collectives stay aligned across ranks despite the 2-deep lookahead.
         """
-        if not self.llm_args.enable_pipelined_scheduler:
+        if not getattr(self.llm_args, "enable_pipelined_scheduler", False):
             return False
         if self.disable_overlap_scheduler:
             return False
