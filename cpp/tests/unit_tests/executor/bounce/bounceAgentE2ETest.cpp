@@ -16,7 +16,10 @@
  */
 
 // Production-path e2e: bounce engaged transparently through NixlTransferAgent::submitTransferRequests
-// with TRTLLM_NIXL_BOUNCE_ENABLE=1. Two real agents, real RDMA. NOTE: the KV src/dst buffers are
+// with TRTLLM_NIXL_BOUNCE_ENABLE=1. Real agents (2..N), real RDMA, wired exactly as production disagg
+// does (tensorrt_llm/_torch/disaggregation/native/transfer.py): one-directional AgentDesc exchange
+// (senders load the receiver, never the reverse) and the receiver self-bootstraps each sender from
+// its WANT — no manual addPeer, no connection-info path. NOTE: the KV src/dst buffers are
 // intentionally NOT NIXL-registered, so the standard path's createXferReq would fail on them --
 // a SUCCESS here proves the bounce fast path was taken (only the bounce arena is registered).
 
@@ -183,11 +186,13 @@ TEST(BounceAgentE2E, SubmitTransferRequestsUsesBounce)
         GTEST_SKIP() << "NIXL agent/backend unavailable: " << e.what();
     }
 
-    // Connect via the AgentDesc path — the SAME bootstrap production disagg uses
-    // (get_local_agent_desc / loadRemoteAgent(AgentDesc)); the bounce control endpoint travels
-    // inside the AgentDesc. (We deliberately do NOT exercise the connection-info path.)
+    // Connect exactly as production disagg does (tensorrt_llm/_torch/disaggregation/native/transfer.py):
+    // the metadata exchange is ONE-DIRECTIONAL — only the KV sender loads the receiver's AgentDesc
+    // (get_local_agent_desc / loadRemoteAgent(AgentDesc)); the receiver never loads the sender. The
+    // bounce control endpoint rides inside that AgentDesc. B's reverse control path (GRANT/ACK back
+    // to A) is self-bootstrapped from A's WANT (BounceReceiver::onWant, DESIGN §7) — exercising it
+    // here is the whole point. (We deliberately do NOT touch the connection-info path.)
     a->loadRemoteAgent("bAgentB", b->getLocalAgentDesc());
-    b->loadRemoteAgent("bAgentA", a->getLocalAgentDesc());
 
     constexpr std::uint32_t kNDescs = 24;
     constexpr std::uint32_t kDescBytes = 600;
@@ -285,8 +290,10 @@ TEST(BounceAgentE2E, ConcurrentSubmitUsesBounce)
         GTEST_SKIP() << "NIXL agent/backend unavailable: " << e.what();
     }
 
+    // One-directional bootstrap, exactly like transfer.py: only the sender (A) loads the receiver
+    // (B); B self-bootstraps A from the first WANT (DESIGN §7). No manual addPeer — the agent's own
+    // bounce transport is wired through loadRemoteAgent(AgentDesc).
     a->loadRemoteAgent("cAgentB", b->getLocalAgentDesc());
-    b->loadRemoteAgent("cAgentA", a->getLocalAgentDesc());
 
     constexpr int kThreads = 8;
     std::vector<AgentBufs> bufs;
@@ -338,6 +345,203 @@ TEST(BounceAgentE2E, ConcurrentSubmitUsesBounce)
 
     a->shutdown();
     b->shutdown();
+    for (auto& x : bufs)
+    {
+        cudaFree(x.src);
+        cudaFree(x.dst);
+    }
+    clearBounceEnv();
+}
+
+// Production-path BIDIRECTIONAL concurrency: two bounce-enabled agents each submit to the OTHER at
+// once, so both arenas serve sender (gather) AND receiver (scatter) roles simultaneously. Both are
+// senders here, so — exactly like transfer.py when two ranks each write to each other — each loads
+// the other's AgentDesc; there is still NO manual addPeer (loadRemoteAgent wires each agent's own
+// bounce transport). Every transfer must land byte-exact with no cross-talk / hang (R2/R3/R4 over
+// the production API).
+TEST(BounceAgentE2E, ConcurrentBidirectionalUsesBounce)
+{
+    if (!hasCuda())
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    setBounceEnv();
+
+    std::unique_ptr<kvc::NixlTransferAgent> a;
+    std::unique_ptr<kvc::NixlTransferAgent> b;
+    try
+    {
+        kvc::BaseAgentConfig ca{"biAgentA", true, false, true};
+        kvc::BaseAgentConfig cb{"biAgentB", true, false, true};
+        a = std::make_unique<kvc::NixlTransferAgent>(ca);
+        b = std::make_unique<kvc::NixlTransferAgent>(cb);
+    }
+    catch (std::exception const& e)
+    {
+        clearBounceEnv();
+        GTEST_SKIP() << "NIXL agent/backend unavailable: " << e.what();
+    }
+
+    // Both agents send, so both load the other's AgentDesc (each direction's WANT self-bootstraps
+    // the reverse control path anyway; the redundant load is harmless and mirrors a two-way flow).
+    a->loadRemoteAgent("biAgentB", b->getLocalAgentDesc());
+    b->loadRemoteAgent("biAgentA", a->getLocalAgentDesc());
+
+    constexpr int kThreads = 8; // 4 flows A->B + 4 flows B->A, all concurrent
+    std::vector<AgentBufs> bufs;
+    bufs.reserve(kThreads);
+    for (int i = 0; i < kThreads; ++i)
+    {
+        bufs.push_back(makeAgentBufs(/*nDescs=*/16, /*descBytes=*/500, /*seed=*/static_cast<std::uint32_t>(i + 1)));
+    }
+
+    std::atomic<int> ok{0};
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (int i = 0; i < kThreads; ++i)
+    {
+        threads.emplace_back(
+            [&, i]
+            {
+                // Even threads send A->B; odd threads send B->A (both arenas act as both roles).
+                bool const a2b = (i % 2 == 0);
+                auto* tx = a2b ? a.get() : b.get();
+                char const* peer = a2b ? "biAgentB" : "biAgentA";
+                auto req = makeReq(bufs[i], peer);
+                auto status = tx->submitTransferRequests(req);
+                if (status == nullptr)
+                {
+                    return;
+                }
+                auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+                kvc::TransferState st = kvc::TransferState::kIN_PROGRESS;
+                while (std::chrono::steady_clock::now() < deadline)
+                {
+                    st = status->wait(100);
+                    if (st != kvc::TransferState::kIN_PROGRESS)
+                    {
+                        break;
+                    }
+                }
+                if (st == kvc::TransferState::kSUCCESS)
+                {
+                    ok.fetch_add(1);
+                }
+            });
+    }
+    for (auto& t : threads)
+    {
+        t.join();
+    }
+    EXPECT_EQ(ok.load(), kThreads) << "not all bidirectional submitTransferRequests completed";
+    for (auto const& x : bufs)
+    {
+        EXPECT_TRUE(verifyAgentBufs(x)) << "byte mismatch / cross-talk for seed=" << x.seed;
+    }
+
+    a->shutdown();
+    b->shutdown();
+    for (auto& x : bufs)
+    {
+        cudaFree(x.src);
+        cudaFree(x.dst);
+    }
+    clearBounceEnv();
+}
+
+// Production-path MULTI-AGENT (N>2): 1 receiver + S sender agents, every sender writing to the one
+// receiver concurrently (the disagg "many context workers -> one gen" shape). This is the REAL
+// one-directional bootstrap that transfer.py uses: each sender loads the receiver's AgentDesc; the
+// receiver loads NOBODY and self-bootstraps every sender from its WANT (BounceReceiver::onWant,
+// DESIGN §7) — so the reverse-control self-bootstrap is exercised across N distinct peers at once.
+// Seed-distinct patterns -> any cross-talk fails; all must complete SUCCESS + land byte-exact.
+TEST(BounceAgentE2E, MultiAgentManySendersToOneReceiver)
+{
+    if (!hasCuda())
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    setBounceEnv();
+
+    constexpr int kSenders = 3; // total agents = 1 receiver + 3 senders
+    std::string const recvName = "mnAgentR";
+
+    std::unique_ptr<kvc::NixlTransferAgent> recv;
+    std::vector<std::unique_ptr<kvc::NixlTransferAgent>> senders;
+    try
+    {
+        recv = std::make_unique<kvc::NixlTransferAgent>(kvc::BaseAgentConfig{recvName, true, false, true});
+        for (int i = 1; i <= kSenders; ++i)
+        {
+            senders.push_back(std::make_unique<kvc::NixlTransferAgent>(
+                kvc::BaseAgentConfig{"mnAgentS" + std::to_string(i), true, false, true}));
+        }
+    }
+    catch (std::exception const& e)
+    {
+        clearBounceEnv();
+        GTEST_SKIP() << "NIXL agent/backend unavailable: " << e.what();
+    }
+
+    // One-directional wiring: each sender loads the receiver; the receiver loads NOBODY. The
+    // receiver only ever hears about a sender when that sender's WANT arrives (self-bootstrap).
+    for (auto& s : senders)
+    {
+        s->loadRemoteAgent(recvName, recv->getLocalAgentDesc());
+    }
+
+    std::vector<AgentBufs> bufs;
+    bufs.reserve(kSenders);
+    for (int i = 0; i < kSenders; ++i)
+    {
+        bufs.push_back(makeAgentBufs(/*nDescs=*/16, /*descBytes=*/500, /*seed=*/static_cast<std::uint32_t>(100 + i)));
+    }
+
+    std::atomic<int> ok{0};
+    std::vector<std::thread> threads;
+    threads.reserve(kSenders);
+    for (int i = 0; i < kSenders; ++i)
+    {
+        threads.emplace_back(
+            [&, i]
+            {
+                auto req = makeReq(bufs[i], recvName.c_str());
+                auto status = senders[i]->submitTransferRequests(req);
+                if (status == nullptr)
+                {
+                    return;
+                }
+                auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+                kvc::TransferState st = kvc::TransferState::kIN_PROGRESS;
+                while (std::chrono::steady_clock::now() < deadline)
+                {
+                    st = status->wait(100);
+                    if (st != kvc::TransferState::kIN_PROGRESS)
+                    {
+                        break;
+                    }
+                }
+                if (st == kvc::TransferState::kSUCCESS)
+                {
+                    ok.fetch_add(1);
+                }
+            });
+    }
+    for (auto& t : threads)
+    {
+        t.join();
+    }
+    EXPECT_EQ(ok.load(), kSenders) << "not all senders completed to the shared receiver";
+    for (auto const& x : bufs)
+    {
+        EXPECT_TRUE(verifyAgentBufs(x)) << "byte mismatch / cross-talk for seed=" << x.seed;
+    }
+
+    for (auto& s : senders)
+    {
+        s->shutdown();
+    }
+    recv->shutdown();
     for (auto& x : bufs)
     {
         cudaFree(x.src);
