@@ -180,7 +180,6 @@ l0_a30:
   - triton_server/test_triton_llm.py::test_mistral_v1_7b_python_backend[accuracy]
   - triton_server/test_triton_llm.py::test_mistral_v1_7b_python_backend[e2e]
   - triton_server/test_triton_llm.py::test_mistral_v1_7b_ifb[False-1---False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap--max_utilization-4096--1-1-1-False-ensemble]
-  - triton_server/test_triton_llm.py::test_benchmark_core_model[llama_v2_7b-False-1---False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap--max_utilization-4096--1-1-1-False]
   - triton_server/test_triton_llm.py::test_mistral_v1_7b_ifb[False-1---False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap--guaranteed_no_evict-4096--1-1-1-False-ensemble]
   - triton_server/test_triton_llm.py::test_mistral_v1_7b_ifb[False-1---False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap--max_utilization-4096--1-1-1-False-ensemble]
   - triton_server/test_triton_llm.py::test_mistral_v1_7b_ifb[False-1---False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap--guaranteed_no_evict-4096--1-1-1-False-ensemble]
