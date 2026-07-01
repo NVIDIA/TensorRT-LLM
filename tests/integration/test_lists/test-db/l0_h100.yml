@@ -258,9 +258,8 @@ l0_h100:
     - unittest/llmapi/test_llm_pytorch.py -m "part1"
     - unittest/llmapi/test_llm_pytorch.py -m "part2"
     - unittest/llmapi/test_llm_pytorch.py -m "part3"
-    - llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks[host_path] TIMEOUT (90)
-    - llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks[device_path_eager] TIMEOUT (90)
-    - llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks[device_path_cudagraph] TIMEOUT (90)
+    - llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks[eager] TIMEOUT (90)
+    - llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks[cudagraph] TIMEOUT (90)
     - unittest/llmapi/test_async_llm.py -m "not (gpu2 or gpu4)"
     - examples/test_ray.py::test_llm_inference_async_ray
 - condition:
@@ -335,7 +334,8 @@ l0_h100:
       orchestrator: mpi
   tests:
   # ------------- PyTorch tests ---------------
-  - llmapi/test_llm_api_pytorch_moe_lora.py::test_mixtral_moe_routed_expert_fp8_multi_lora_varying_ranks TIMEOUT (90)
+  - llmapi/test_llm_api_pytorch_moe_lora.py::test_mixtral_moe_routed_expert_fp8_multi_lora_varying_ranks[eager] TIMEOUT (90)
+  - llmapi/test_llm_api_pytorch_moe_lora.py::test_mixtral_moe_routed_expert_fp8_multi_lora_varying_ranks[cudagraph] TIMEOUT (90)
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=True-enable_chunked_prefill=True-enable_max_concurrency=False-enable_draft_len_schedule=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=True-enable_chunked_prefill=False-enable_max_concurrency=False-enable_draft_len_schedule=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=True-enable_chunked_prefill=False-enable_max_concurrency=True-enable_draft_len_schedule=False]
