@@ -1242,6 +1242,16 @@ public:
     //! \brief Unpin blocks by block ids directly
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
 
+    //! \brief Pin a single block: claim it from the eviction policy if it is free, then take a
+    //! reference. This is the one canonical pinning primitive — all pin paths (storeBlocks,
+    //! findBlocksInReuseTreeByBlockKey, pinBlocks) must go through it so a pinned block can
+    //! neither be evicted nor handed out by the eviction policy while the pin is held.
+    void pinBlock(BlockPtr const& block);
+
+    //! \brief Inverse of pinBlock: drop one reference and release the block back to the
+    //! eviction policy once no references remain.
+    void unpinBlock(BlockPtr const& block);
+
     void truncateBlocks(LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep);
 
     void resetReuseState()
