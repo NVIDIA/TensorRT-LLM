@@ -79,9 +79,15 @@ void TransferSession::send(size_t idx, void const* data, size_t size)
     }
     catch (std::exception const& e)
     {
-        auto requestId = mRequest ? mRequest->mRequestId : 0;
+        // A RequestSpecificException must carry a real request ID. On the
+        // llmRequest-agnostic path (e.g. arbitrary reuse-tree transfer) there is
+        // no request, so throw a generic exception instead of inventing an ID.
+        if (mRequest == nullptr)
+        {
+            TLLM_THROW("%s", e.what());
+        }
         throw common::RequestSpecificException(
-            __FILE__, __LINE__, e.what(), requestId, common::RequestErrorCode::kNETWORK_ERROR);
+            __FILE__, __LINE__, e.what(), mRequest->mRequestId, common::RequestErrorCode::kNETWORK_ERROR);
     }
 }
 
@@ -93,9 +99,15 @@ void TransferSession::recv(size_t idx, void* data, size_t size)
     }
     catch (std::exception const& e)
     {
-        auto requestId = mRequest ? mRequest->mRequestId : 0;
+        // A RequestSpecificException must carry a real request ID. On the
+        // llmRequest-agnostic path (e.g. arbitrary reuse-tree transfer) there is
+        // no request, so throw a generic exception instead of inventing an ID.
+        if (mRequest == nullptr)
+        {
+            TLLM_THROW("%s", e.what());
+        }
         throw common::RequestSpecificException(
-            __FILE__, __LINE__, e.what(), requestId, common::RequestErrorCode::kNETWORK_ERROR);
+            __FILE__, __LINE__, e.what(), mRequest->mRequestId, common::RequestErrorCode::kNETWORK_ERROR);
     }
 }
 
