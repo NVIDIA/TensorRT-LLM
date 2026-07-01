@@ -1246,6 +1246,18 @@ def init_pp_comm(mapping):
     global _pp_comm
     if mpi_disabled():
         _pp_comm = PPCommTorch(mapping)
+    elif isinstance(_pp_comm, PPCommNCCL) and \
+            _pp_comm.mapping.world_size == mapping.world_size:
+        # Reuse the existing world NCCL communicator across LLM instances that
+        # share the same worker processes (e.g. a reused MpiPoolSession). The
+        # underlying comm depends only on (world_size, rank) -- it is a world
+        # communicator, independent of the pp/tp/ep layout -- so only the
+        # routing mapping needs refreshing. Recreating it would drop the old
+        # comm and trigger a collective ncclCommDestroy at an unsynchronized
+        # point during the next model build, which can deadlock on reused
+        # workers. Single-LLM (production) runs are unaffected: _pp_comm starts
+        # as None, so the first call still constructs a fresh PPCommNCCL.
+        _pp_comm.mapping = mapping
     else:
         _pp_comm = PPCommNCCL(mapping)
     init_helix_cp_comm(mapping)
