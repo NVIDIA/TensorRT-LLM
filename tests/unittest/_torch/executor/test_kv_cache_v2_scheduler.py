@@ -18,10 +18,12 @@ All KVCacheManagerV2, LlmRequest, and PeftCacheManager objects are mocked.
 No GPU required.
 """
 
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 
@@ -173,16 +175,17 @@ def make_peft_cache_manager(max_device_pages, pages_per_task=1):
 
 
 def make_scheduler(
-    kv_cache_manager,
-    max_batch_size=100,
-    max_num_tokens=1024,
-    ctx_chunk_config=None,
-    peft_cache_manager=None,
-    scheduler_capacity=None,
-    no_schedule_until_state=None,
-    no_schedule_after_state=None,
-    cross_kv_cache_manager=None,
-):
+    kv_cache_manager: Mock,
+    max_batch_size: int = 100,
+    max_num_tokens: int | None = 1024,
+    ctx_chunk_config: tuple | None = None,
+    peft_cache_manager: Mock | None = None,
+    scheduler_capacity: int | None = None,
+    no_schedule_until_state: LlmRequestState | None = None,
+    no_schedule_after_state: LlmRequestState | None = None,
+    cross_kv_cache_manager: Mock | None = None,
+    enable_prefix_aware_scheduling: bool = True,
+) -> object:
     """Create KVCacheV2Scheduler, patching isinstance check for mock mgr."""
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 
@@ -205,6 +208,7 @@ def make_scheduler(
             ctx_chunk_config=ctx_chunk_config,
             peft_cache_manager=peft_cache_manager,
             scheduler_capacity=scheduler_capacity,
+            enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
             **kwargs,
         )
 
@@ -1982,6 +1986,44 @@ class TestPrepareBeforeBudget:
         out = sched.schedule_request([req], set())
         assert ids(out.context_requests) == [0]
 
+    def test_prefix_aware_scheduling_disabled_charges_pre_reuse_tokens(self) -> None:
+        """Actual KV resize uses post-reuse length, but scheduler budget uses the pre-reuse length."""
+        resize_calls: list[int] = []
+
+        def prepare_with_reuse(req: Mock) -> bool:
+            req.context_remaining_length = 500
+            return True
+
+        def track_resize(req: Mock, num_tokens: int) -> bool:
+            resize_calls.append(num_tokens)
+            return True
+
+        mgr = make_kv_cache_manager(
+            prepare_context_fn=prepare_with_reuse,
+            resize_context_fn=track_resize,
+        )
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=1000,
+            enable_prefix_aware_scheduling=False,
+        )
+        req = make_ctx_request(0, context_remaining_length=1000)
+        out = sched.schedule_request([req], set())
+        assert ids(out.context_requests) == [0]
+        assert resize_calls == [500]
+
+        mgr = make_kv_cache_manager(prepare_context_fn=prepare_with_reuse)
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=1000,
+            enable_prefix_aware_scheduling=False,
+        )
+        gen = make_gen_request(1)
+        ctx = make_ctx_request(2, context_remaining_length=1000)
+        out = sched.schedule_request([gen, ctx], set())
+        assert ids(out.generation_requests) == [1]
+        assert ids(out.context_requests) == []
+
 
 # ===========================================================================
 # Edge Cases
@@ -2419,3 +2461,48 @@ class TestMultimodalAwareChunkingV2:
         out = sched.schedule_request([req], set())
         assert ids(out.context_requests) == []
         assert resize_calls == []  # SKIP path: no commit to KV cache
+
+
+# ---------------------------------------------------------------------------
+# KVCacheManagerV2.trim_to_history (#14258): unbound on a fake self, all 5 branches.
+# ---------------------------------------------------------------------------
+class TestTrimToHistory:
+    @staticmethod
+    def _call(kv_cache, history_length, req_id=1):
+        kv_cache_map = {} if kv_cache is None else {req_id: kv_cache}
+        fake = SimpleNamespace(kv_cache_map=kv_cache_map)
+        req = SimpleNamespace(py_request_id=req_id)
+        return KVCacheManagerV2.trim_to_history(fake, req, history_length)
+
+    def test_missing_cache_is_noop_true(self):
+        assert self._call(None, 50) is True
+
+    def test_inactive_cache_is_noop_true(self):
+        kv = Mock(is_active=False)
+        assert self._call(kv, 50) is True
+        kv.resize.assert_not_called()
+
+    def test_history_not_increasing_is_noop_true(self):
+        kv = Mock(is_active=True, history_length=50, capacity=100)
+        assert self._call(kv, 50) is True  # 50 <= current 50
+        kv.resize.assert_not_called()
+
+    def test_resize_success_clamps_capacity_and_returns_true(self):
+        kv = Mock(is_active=True, history_length=10, capacity=8)
+        kv.resize.return_value = True
+        assert self._call(kv, 64) is True
+        # target_capacity = max(capacity=8, history=64) = 64
+        kv.resize.assert_called_once_with(64, history_length=64)
+
+    def test_resize_rejection_returns_false(self):
+        kv = Mock(is_active=True, history_length=10, capacity=100)
+        kv.resize.return_value = False
+        assert self._call(kv, 64) is False
+        kv.resize.assert_called_once_with(100, history_length=64)
+
+    def test_resize_exception_degrades_to_false(self):
+        # Broad except: a non-ValueError (e.g. internal state assert) must
+        # degrade to False rather than propagate (do-not-narrow contract).
+        kv = Mock(is_active=True, history_length=10, capacity=100)
+        kv.resize.side_effect = RuntimeError("internal state assert")
+        assert self._call(kv, 64) is False

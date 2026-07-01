@@ -19,7 +19,7 @@ import secrets
 import sys
 import weakref
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, AsyncIterator, Dict, List, Literal, Optional, Union
 
 from tensorrt_llm._torch.visual_gen import DiffusionRequest, DiffusionResponse
 from tensorrt_llm._torch.visual_gen.executor import (
@@ -441,3 +441,25 @@ class VisualGen:
         logger.info("VisualGen: Shutting down")
         self.executor.shutdown()
         self.executor = None
+
+    @set_api_status("prototype")
+    async def get_stats_async(self, timeout: Optional[float] = None) -> AsyncIterator[Dict]:
+        """Yield buffered visual-gen iteration-stats snapshots.
+
+        Mirrors the LLM ``get_stats_async`` API so the ``/metrics`` HTTP
+        handler in :mod:`tensorrt_llm.serve.openai_server` can iterate over
+        VisualGen stats with the same code path it uses for the LLM stats
+        queue.  Each yielded dict has the visual-gen ``/metrics`` shape:
+        ``iter``, ``timestamp``, ``numQueuedRequests``, ``numActiveRequests``,
+        ``currentStepsProcessed``, ``currentRequestId``,
+        ``currentRequestStepIdx``.
+
+        ``timeout`` is accepted for API compatibility with the LLM variant
+        but is not used: snapshots are produced synchronously on lifecycle
+        events into an in-process deque so draining is non-blocking.
+        """
+        del timeout  # accepted for LLM-API compatibility; see docstring.
+        if self.executor is None:
+            return
+        for snapshot in self.executor.get_iteration_stats():
+            yield snapshot

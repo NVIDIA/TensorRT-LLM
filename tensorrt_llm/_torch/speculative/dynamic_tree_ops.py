@@ -27,6 +27,8 @@ Key Features:
 
 import torch
 
+from tensorrt_llm._torch.speculative.one_model_sampler import compute_probs_from_logits
+
 
 class DynamicTreeOpsConverter:
     """
@@ -218,101 +220,67 @@ class DynamicTreeOpsConverter:
 
         return accept_index, accept_token_num, accept_token
 
-    def verify_dynamic_tree_rejection_from_logits_out(
+    def verify_dynamic_tree_rejection_out(
         self,
-        candidates: torch.Tensor,
-        draft_logits_tree: torch.Tensor,
+        draft_tokens: torch.Tensor,
         target_logits_tree: torch.Tensor,
-        draft_prob_indices: torch.Tensor,
         retrieve_next_token: torch.Tensor,
         retrieve_next_sibling: torch.Tensor,
         tree_valid: torch.Tensor,
         temperatures: torch.Tensor,
         top_k: torch.Tensor | None,
         top_p: torch.Tensor | None,
-        skip_temperature: bool,
         num_gens: int,
         num_spec_step: int,
         seed: int | torch.Tensor = 0,
         offset: int | torch.Tensor = 0,
-        d2t: torch.Tensor | None = None,
-        skip_all_sampling_params: bool = False,
-        top_k_max: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Tree-aware rejection sampling from logits (three CUDA ops).
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Dynamic tree rejection sampling.
 
-        This path keeps draft/target logits as inputs, computes unique draft
-        and target probabilities with separate CUDA ops, then runs the tree
-        rejection kernel as a third CUDA op. `draft_prob_indices` maps each
-        tree position to its shared draft-prob row. `tree_valid` guards
-        first-gen and dummy requests that do not have a usable tree yet.
+        Computes target probabilities from logits, then runs the target-only
+        rejection kernel. No draft probabilities are needed.
+        `tree_valid` guards first-gen and dummy requests without a valid tree.
         """
         accept_index = self._rej_accept_index_buf[:num_gens]
         accept_token = self._rej_accept_token_buf[:num_gens]
         accept_tok_num = self._rej_accept_token_num_buf[:num_gens]
         seed_tensor = self._get_rejection_rng_tensor(seed, self._rej_seed_buf, "seed")
         offset_tensor = self._get_rejection_rng_tensor(offset, self._rej_offset_buf, "offset")
-        num_draft_tokens = candidates.shape[1]
         if num_gens <= 0:
             raise ValueError(f"num_gens must be positive, got {num_gens}")
-        if draft_logits_tree.shape[0] % num_gens != 0:
+        if target_logits_tree.shape[0] % num_gens != 0:
             raise ValueError(
-                f"draft_logits_tree rows ({draft_logits_tree.shape[0]}) must be divisible by "
-                f"num_gens ({num_gens})"
+                "target_logits_tree rows must be divisible by num_gens, got "
+                f"{target_logits_tree.shape[0]} and {num_gens}"
             )
-        num_draft_prob_rows = draft_logits_tree.shape[0] // num_gens
-        target_vocab_size = target_logits_tree.shape[-1]
+        # draft_tokens has shape [num_gens, N-1]; derive total tree nodes N from target_logits_tree.
+        num_draft_tokens = target_logits_tree.shape[0] // num_gens
 
         if tree_valid is None:
-            tree_valid = torch.ones(num_gens, dtype=torch.bool, device=candidates.device)
+            tree_valid = torch.ones(num_gens, dtype=torch.bool, device=draft_tokens.device)
         tree_valid = tree_valid.contiguous()
 
-        if top_k_max is not None:
-            # Pre-computed CPU-side (CUDA-graph-safe): use as-is.
-            pass
-        elif top_k is None:
-            top_k_max = 0
-        else:
-            # Fallback path (non-CUDA-graph contexts): compute from tensor.
-            enabled_top_k = top_k[(top_k > 0) & (top_k < target_vocab_size)]
-            top_k_max = int(enabled_top_k.max().item()) if enabled_top_k.numel() > 0 else 0
+        # Expand per-request sampling params to per-tree-position (num_gens * N rows).
+        temps_exp = temperatures.repeat_interleave(num_draft_tokens)
+        top_k_exp = top_k.repeat_interleave(num_draft_tokens) if top_k is not None else None
+        top_p_exp = top_p.repeat_interleave(num_draft_tokens) if top_p is not None else None
+
+        # Compute target probs using the shared linear-path interface (FlashInfer fast
+        # path when available, sort-based fallback otherwise). Returns dense full-vocab
+        # probs [num_gens * N, vocab_size]; no sparse support indices needed.
+        target_probs_flat = compute_probs_from_logits(
+            target_logits_tree,
+            temps_exp,
+            top_k_exp,
+            top_p_exp,
+        )
+        vocab_size = target_probs_flat.shape[-1]
+        target_probs_tree = target_probs_flat.reshape(num_gens, num_draft_tokens, vocab_size)
 
         try:
-            draft_probs_tree = torch.ops.trtllm.compute_draft_probs_for_dynamic_tree_rejection_op(
-                draft_logits_tree,
-                temperatures,
-                num_draft_prob_rows,
-                target_vocab_size,
-                top_k,
-                top_p,
-                skip_temperature,
-                d2t=d2t,
-                top_k_max=top_k_max,
-                skip_all_sampling_params=skip_all_sampling_params,
-            )
-
-            (
-                target_probs_tree,
-                target_support_indices,
-                target_support_lengths,
-            ) = torch.ops.trtllm.compute_target_probs_for_dynamic_tree_rejection_op(
-                target_logits_tree,
-                temperatures,
-                num_draft_tokens,
-                top_k,
-                top_p,
-                skip_temperature,
-                top_k_max=top_k_max,
-                skip_all_sampling_params=skip_all_sampling_params,
-            )
-
             torch.ops.trtllm.verify_dynamic_tree_rejection_out_op(
-                candidates,
-                draft_probs_tree,
+                draft_tokens,
                 target_probs_tree,
-                target_support_indices,
-                target_support_lengths,
-                draft_prob_indices,
                 retrieve_next_token,
                 retrieve_next_sibling,
                 tree_valid,
@@ -325,10 +293,9 @@ class DynamicTreeOpsConverter:
             )
         except Exception as e:
             raise RuntimeError(
-                f"dynamic tree rejection op chain failed: {e}\n"
-                f"Inputs: num_gens={num_gens}, N={candidates.shape[1]}, "
-                f"draft_vocab={draft_logits_tree.shape[-1]}, "
+                f"dynamic tree rejection target-only op chain failed: {e}\n"
+                f"Inputs: num_gens={num_gens}, N={draft_tokens.shape[1] + 1}, "
                 f"target_vocab={target_logits_tree.shape[-1]}, num_spec_step={num_spec_step}"
             ) from e
 
-        return target_support_indices, accept_index, accept_tok_num, accept_token
+        return accept_index, accept_tok_num, accept_token

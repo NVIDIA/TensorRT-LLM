@@ -51,6 +51,11 @@
 
 namespace kvc = tensorrt_llm::executor::kv_cache;
 
+namespace tensorrt_llm::batch_manager::kv_cache_manager
+{
+class FabricMemory;
+} // namespace tensorrt_llm::batch_manager::kv_cache_manager
+
 namespace tensorrt_llm::batch_manager::eviction_policy
 {
 class BaseEvictionPolicy;
@@ -98,6 +103,13 @@ template <typename T>
 std::list<std::vector<T>> chopVectorIntoBlocks(
     std::vector<T> const& vec, SizeType32 usableSize, SizeType32 elementsPerBlock, bool allowPartial)
 {
+    // No usable elements yields no blocks. Guard non-positive usableSize explicitly: callers may pass
+    // usableSize = inputLength - 1, which is -1 for a Helix CP "empty" rank with 0 input tokens. With a
+    // negative usableSize, downstream usage of "vec.begin() + usableSize" is undefined behavior.
+    if (usableSize <= 0)
+    {
+        return {};
+    }
     TLLM_CHECK_WITH_INFO(
         usableSize <= static_cast<SizeType32>(vec.size()), "usableSize=%d > %ld=vec.size()", usableSize, vec.size());
     std::list<std::vector<T>> blockedVectors;
@@ -486,6 +498,10 @@ public:
     [[nodiscard]] bool isShared() const;
 
     [[nodiscard]] bool isLeaf() const;
+
+    //! \brief Test if block is detached from radix search tree.
+    //! \return True if block is detached from search tree.
+    [[nodiscard]] bool isDetached() const;
 
     void setPriority(executor::RetentionPriority priority);
 
@@ -1340,6 +1356,8 @@ private:
 
     // Buffer manager
     runtime::BufferManager mBufferManager;
+    // Fabric memory backing for primary pools (MNNVL-capable allocation)
+    std::vector<std::unique_ptr<kv_cache_manager::FabricMemory>> mFabricMemoryPools;
 
     // Used to keep track of number of free blocks during scheduling
     SizeType32 mSchedulingNumFreeBlocks;

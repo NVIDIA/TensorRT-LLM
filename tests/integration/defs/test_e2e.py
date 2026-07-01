@@ -902,6 +902,13 @@ def test_openai_tool_call(llm_root, llm_venv):
          str(test_root / "_test_openai_tool_call.py")])
 
 
+def test_openai_post_processor(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_openai_post_processor.py")])
+
+
 @pytest.mark.parametrize("sampler", ["torch_sampler", "trtllm_sampler"])
 def test_openai_completions_with_logit_bias(llm_root, llm_venv, sampler: str):
     test_root = unittest_path() / "llmapi" / "apps"
@@ -2141,6 +2148,8 @@ def test_ptp_scaffolding(llm_root, llm_venv, model_name, model_path):
                  marks=skip_pre_blackwell),
     pytest.param('DeepSeek-R1/DeepSeek-R1-0528-FP4', marks=skip_pre_blackwell),
     pytest.param('Kimi-K2-Thinking-NVFP4', marks=skip_pre_blackwell),
+    pytest.param('MiniMax-M2', marks=skip_pre_hopper),
+    pytest.param('MiniMax-M3', marks=skip_pre_blackwell),
 ])
 def test_multi_nodes_eval(model_path, tp_size, pp_size, ep_size, eval_task,
                           mmlu_dataset_root):
@@ -2157,7 +2166,7 @@ def test_multi_nodes_eval(model_path, tp_size, pp_size, ep_size, eval_task,
         "--backend=pytorch",
     ]
 
-    if "Kimi" in model_path:
+    if "Kimi" in model_path or "MiniMax-M3" in model_path:
         run_cmd.append("--trust_remote_code")
     else:
         run_cmd.append(f"--tokenizer={model_dir}")

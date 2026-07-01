@@ -170,14 +170,17 @@ class BasePipeline(nn.Module):
                 logger.info("CUDA profiler stopped")
 
     def _setup_cuda_graphs(self):
-        """Wrap all transformer components with CUDA graph capture/replay."""
-        if not self.pipeline_config.cuda_graph.enable:
-            return
+        """Wrap all transformer components with CUDA graph capture/replay.
 
-        if self.pipeline_config.torch_compile.enable:
-            logger.warning(
-                "CUDA graphs with torch.compile not yet supported. Using torch.compile only."
-            )
+        Composes with torch.compile: the runner wraps the (outer) transformer
+        ``forward`` while torch.compile compiles the inner transformer blocks
+        (see ``torch_compile``). Graph capture happens during warmup, by which
+        point the runner's own ``WARMUP_STEPS`` eager iterations have already
+        triggered torch.compile's lazy compilation, so the captured graph
+        contains the optimized compiled kernels. (The ``LTX2Pipeline`` override
+        relies on the same ordering.)
+        """
+        if not self.pipeline_config.cuda_graph.enable:
             return
 
         if len(self.transformer_components) > 1:
@@ -188,6 +191,7 @@ class BasePipeline(nn.Module):
         else:
             shared_pool = None
 
+        compile_note = " (with torch.compile)" if self.pipeline_config.torch_compile.enable else ""
         for name in self.transformer_components:
             model = getattr(self, name, None)
             if model is None:
@@ -198,7 +202,7 @@ class BasePipeline(nn.Module):
                 shared_pool,
             )
             model.register_cuda_graph_extra_key_fns(runner)
-            logger.info(f"CUDA graph runner: wrapping {name}.forward")
+            logger.info(f"CUDA graph runner: wrapping {name}.forward{compile_note}")
             model.forward = runner.wrap(model.forward)
             self._cuda_graph_runners[name] = runner
 
@@ -400,48 +404,92 @@ class BasePipeline(nn.Module):
         if self.transformer is not None and hasattr(self.transformer, "post_load_weights"):
             self.transformer.post_load_weights()
 
-    def _apply_teacache_coefficients(self, coefficients: Optional[Dict]) -> None:
-        """Pick TeaCache coefficients from checkpoint path; updates pipeline config in place."""
-        if not coefficients:
-            return
+    def _apply_teacache_coefficients(self, coefficients: Optional[Dict] = None) -> None:
+        """Resolve TeaCache polynomial coefficients into pipeline_config.cache (TeaCacheConfig).
+
+        Precedence:
+
+        1. User-specified TeaCacheConfig.coefficients — any non-None list skips built-in
+           variant matching.
+
+        2. Pipeline table — if step 1 does not apply and coefficients is a non-empty dict
+           (model-specific tables from the pipeline subclass), match
+           pretrained_config._name_or_path against keys and set coefficients (and optional
+           default_thresh).
+
+        3. If coefficients are still unresolved after step 2, _setup_cache_acceleration
+           raises: TeaCache must not run without resolved coefficients.
+
+        Args:
+            coefficients: Optional mapping from variant key to coefficient list or nested
+                dict (ret_steps / standard), from the pipeline subclass.
+        """
         teacache_cfg = self.pipeline_config.teacache
-        checkpoint_path = getattr(
-            self.pipeline_config.primary_pretrained_config, "_name_or_path", ""
+        if teacache_cfg is None:
+            return
+        if teacache_cfg.is_explicit_user_override():
+            logger.info(
+                "TeaCache: Using user-configured coefficients "
+                "(skipping built-in checkpoint variant matching)"
+            )
+            return
+
+        teacache_explicit = teacache_cfg.model_dump(exclude_unset=True)
+
+        if not coefficients:
+            if teacache_cfg.coefficients is None:
+                raise ValueError(
+                    "TeaCache is enabled but no polynomial coefficients were resolved. "
+                    "Set teacache.coefficients in VisualGenArgs, or use a pipeline and "
+                    "checkpoint whose path matches a built-in coefficient table."
+                )
+            return
+
+        checkpoint_path = (
+            getattr(self.pipeline_config.primary_pretrained_config, "_name_or_path", "") or ""
         )
-        matched = False
+
         for model_size, coeff_data in coefficients.items():
-            if model_size.lower() in checkpoint_path.lower():
-                matched = True
-                if isinstance(coeff_data, dict):
-                    mode = "ret_steps" if teacache_cfg.use_ret_steps else "standard"
-                    if mode in coeff_data:
-                        teacache_cfg.coefficients = coeff_data[mode]
-                        logger.info(f"TeaCache: Using {model_size} coefficients ({mode} mode)")
-                    default_thresh = coeff_data.get("default_thresh")
-                    if (
-                        default_thresh is not None
-                        and "teacache_thresh" not in teacache_cfg.model_fields_set
-                    ):
-                        teacache_cfg.teacache_thresh = default_thresh
-                        logger.info(
-                            f"TeaCache: Using {model_size} default threshold {default_thresh}"
-                        )
-                else:
-                    teacache_cfg.coefficients = coeff_data
-                    logger.info(f"TeaCache: Using {model_size} coefficients")
+            # Match model size in path (case-insensitive, e.g., "1.3B", "14B", "dev")
+            path_l = checkpoint_path.lower()
+            key_l = model_size.lower()
+            if key_l not in path_l:
+                continue
+
+            if isinstance(coeff_data, dict):
+                # Select coefficient set based on warmup mode
+                mode = "ret_steps" if teacache_cfg.use_ret_steps else "standard"
+                if mode not in coeff_data:
+                    logger.warning(
+                        "TeaCache: matched variant %r but table has no %r entry "
+                        "(available keys: %s). Trying other variants.",
+                        model_size,
+                        mode,
+                        list(coeff_data.keys()),
+                    )
+                    continue
+                teacache_cfg.coefficients = coeff_data[mode]
+                logger.info(f"TeaCache: Using {model_size} coefficients ({mode} mode)")
+                # Apply model-specific default threshold if user didn't explicitly set one
+                default_thresh = coeff_data.get("default_thresh")
+                if default_thresh is not None and "teacache_thresh" not in teacache_explicit:
+                    teacache_cfg.teacache_thresh = default_thresh
+                    logger.info(f"TeaCache: Using {model_size} default threshold {default_thresh}")
                 break
-        if not matched:
+            else:
+                # Single coefficient list (no mode distinction)
+                teacache_cfg.coefficients = coeff_data
+                logger.info(f"TeaCache: Using {model_size} coefficients")
+                break
+        else:
             raise ValueError(
                 f"TeaCache: No coefficients found for checkpoint '{checkpoint_path}'. "
                 f"Available variants: {list(coefficients.keys())}. "
-                f"TeaCache is not supported for this model variant."
+                f"Set teacache.coefficients explicitly in VisualGenArgs to use TeaCache anyway, "
+                f"or use a checkpoint path that contains one of the variant keys."
             )
 
-    def _setup_cache_acceleration(
-        self,
-        model: Optional[nn.Module] = None,
-        coefficients: Optional[Dict] = None,
-    ) -> None:
+    def _setup_cache_acceleration(self) -> None:
         """Enable TeaCache or Cache-DiT from model_config.cache_backend."""
 
         if getattr(self, "cache_accelerator", None) is not None:
@@ -460,15 +508,9 @@ class BasePipeline(nn.Module):
         if not use_teacache:
             return
 
-        BasePipeline._apply_teacache_coefficients(self, coefficients)
-
-        if model is None:
-            return
-
-        acc = TeaCacheAccelerator(cfg.teacache)
-        acc.wrap(model=model)
-        if acc.is_enabled():
-            self.cache_accelerator = acc
+        acc = TeaCacheAccelerator(self, cfg.teacache)
+        acc.wrap()
+        self.cache_accelerator = acc
 
     def setup_parallel_vae(self):
         """Enable parallel-VAE decode mode and wrap the VAE on participating ranks.
@@ -1140,11 +1182,20 @@ class BasePipeline(nn.Module):
                 if stats:
                     if self.pipeline_config.cache_backend == "cache_dit":
                         logger.info("Cache-DiT stats: %s", stats)
-                    elif "hit_rate" in stats:
-                        logger.info(
-                            f"TeaCache: {stats['hit_rate']:.1%} hit rate "
-                            f"({stats['cached']}/{stats['total']} steps)"
-                        )
+                    elif self.pipeline_config.cache_backend == "teacache":
+                        first_val = next(iter(stats.values()), None)
+                        if isinstance(first_val, dict):
+                            for key, s in stats.items():
+                                if "hit_rate" in s:
+                                    logger.info(
+                                        f"TeaCache {key}: {s['hit_rate']:.1%} hit rate "
+                                        f"({s['cached']}/{s['total']} steps)"
+                                    )
+                        elif "hit_rate" in stats:
+                            logger.info(
+                                f"TeaCache: {stats['hit_rate']:.1%} hit rate "
+                                f"({stats['cached']}/{stats['total']} steps)"
+                            )
                     else:
                         logger.info("Cache acceleration stats: %s", stats)
 

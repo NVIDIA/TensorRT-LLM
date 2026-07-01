@@ -1225,15 +1225,15 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
 
 #endif
 #endif
+                        auto const refAttentionSinks
+                            = hasAttentionSinks ? attentionSinksPtr + headGrpSize * idxKHead : nullptr;
 #if SPEC_DEC
                         Eigen::Matrix<float, runtimeHeadGrpSize, validElemsPerHead, Eigen::RowMajor> refOutput;
                         refOutput = refAttention<InputElem>(&qHeads[req][b][q_len][runtimeHeadGrpSize * idxKHead],
                             kCacheSeq, vCacheSeq, seqLen, qScaleForRef, kvCacheScale[0], xScale, slidingWinSize,
-                            hostMask, qSeqLen, q_len);
+                            refAttentionSinks, hostMask, qSeqLen, q_len);
 #else
                     Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refOutput;
-                    auto const refAttentionSinks
-                        = hasAttentionSinks ? attentionSinksPtr + headGrpSize * idxKHead : nullptr;
                     if (useQGMMA)
                     {
                         refOutput = refFlashAttention<CacheElem, 64>(&qHeads[req][b][headGrpSize * idxKHead], kCacheSeq,
@@ -1360,6 +1360,20 @@ TEST(RefCheck, llama_V2_70b_3)
 
 #endif
 }
+
+#if SLIDING_WINDOW && !IS_SPEC_DEC_TREE
+TEST(RefCheck, gpt_oss_spec_swa_rows)
+{
+    runTest<8, HEAD_GROUP_SIZE, 2>(1, 258, false, true, true, false, true, ~0U, 128);
+    runTest<8, HEAD_GROUP_SIZE, 4>(1, 260, false, true, true, false, true, ~0U, 128);
+    runTest<8, HEAD_GROUP_SIZE, 2>(4, 258, false, true, true, false, true, ~0U, 128);
+    runTest<8, HEAD_GROUP_SIZE, 4>(4, 260, false, true, true, false, true, ~0U, 128);
+    runTest<2, HEAD_GROUP_SIZE, 2>(1, 258, false, true, true, false, true, ~0U, 128);
+    runTest<2, HEAD_GROUP_SIZE, 4>(1, 260, false, true, true, false, true, ~0U, 128);
+    runTest<2, HEAD_GROUP_SIZE, 2>(4, 258, false, true, true, false, true, ~0U, 128);
+    runTest<2, HEAD_GROUP_SIZE, 4>(4, 260, false, true, true, false, true, ~0U, 128);
+}
+#endif
 
 #endif
 

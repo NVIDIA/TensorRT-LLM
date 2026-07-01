@@ -212,7 +212,7 @@ public:
 
     FusedMoeRunner(c10::ScalarType activation_dtype, c10::ScalarType weight_dtype, c10::ScalarType output_dtype,
         bool use_deepseek_fp8_block_scale, bool use_w4_group_scaling, bool use_int8_woq_per_channel,
-        bool use_mxfp8_act_scaling, bool use_fused_finalize)
+        bool use_mxfp8_act_scaling, bool use_mxfp8_weight_scaling, bool use_fused_finalize)
     {
         mActivationDtype = activation_dtype;
         mWeightDtype = weight_dtype;
@@ -221,8 +221,18 @@ public:
         mUseW4GroupScaling = use_w4_group_scaling;
         mUseINT8WoqPerChannel = use_int8_woq_per_channel;
         mUseMxfp8ActScaling = use_mxfp8_act_scaling;
+        mUseMxfp8WeightScaling = use_mxfp8_weight_scaling;
         mUseFusedFinalize = use_fused_finalize;
         mInnerDimMultiplier = 1;
+
+        // MXFP8xMXFP8 grouped MoE is only meaningful for the <e4m3, e4m3>
+        // template instantiation. Reject other (act, weight) dtype pairs at
+        // construction time so the downstream kernel runner never sees a
+        // mismatched configuration.
+        TORCH_CHECK(!mUseMxfp8WeightScaling
+                || (mActivationDtype == c10::ScalarType::Float8_e4m3fn
+                    && mWeightDtype == c10::ScalarType::Float8_e4m3fn),
+            "use_mxfp8_weight_scaling requires both activation and weight dtypes to be Float8_e4m3fn.");
 
         // keep consistent with cpp/tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.cpp
         if (mActivationDtype == c10::ScalarType::Half && mWeightDtype == c10::ScalarType::Half)
@@ -243,7 +253,9 @@ public:
 #endif
 
 #ifdef ENABLE_FP8
-        if (isFp8Quant())
+        // Per-tensor FP8 and MXFP8xMXFP8 share the <e4m3, e4m3> instantiation;
+        // use_mxfp8_weight_scaling_ selects between them at runtime.
+        if (isFp8Quant() || isWMxfp8AMxfp8Quant())
         {
             mKernelRunner = switch_output_type<__nv_fp8_e4m3, __nv_fp8_e4m3>(mOutputDtype);
         }
@@ -320,6 +332,7 @@ public:
         }
 
         mKernelRunner->use_fused_finalize_ = mUseFusedFinalize;
+        mKernelRunner->use_mxfp8_weight_scaling_ = mUseMxfp8WeightScaling;
 
         mProfiler = std::make_shared<kernels::GemmProfilerBackend>();
         mGemm1Profiles = mKernelRunner->getTactics(MoeGemmId::GEMM_1);
@@ -593,15 +606,20 @@ public:
             TORCH_CHECK(!(lora_per_request && lora_slot_indexed),
                 "MoE LoRA: the per-request (fc1_lora_ranks, ...) and slot-indexed (fc1_slot_lora_ranks, ..., "
                 "token_to_slot) input schemas are mutually exclusive. Provide exactly one, not both.");
-            // Conservative rejections (min-latency, alltoall, quant, graph capture).
+            // Conservative rejections (min-latency, alltoall, unsupported quant, graph capture).
             TORCH_CHECK(!min_latency_mode, "MoE LoRA is not supported in min-latency mode.");
             TORCH_CHECK(!enable_alltoall,
                 "MoE LoRA is not supported with alltoall: the per-token adapter pointer arrays do not survive "
                 "cross-rank token reshuffling.");
-            TORCH_CHECK(mActivationDtype == c10::ScalarType::Half || mActivationDtype == c10::ScalarType::BFloat16,
-                "MoE LoRA only supports fp16 and bf16 activation dtypes.");
-            TORCH_CHECK(mWeightDtype == c10::ScalarType::Half || mWeightDtype == c10::ScalarType::BFloat16,
-                "MoE LoRA only supports unquantized fp16/bf16 expert weights.");
+            bool const is_per_tensor_fp8 = isFp8Quant();
+            TORCH_CHECK(mActivationDtype == c10::ScalarType::Half || mActivationDtype == c10::ScalarType::BFloat16
+                    || is_per_tensor_fp8,
+                "MoE LoRA only supports fp16, bf16, or per-tensor FP8 (qdq) base weights. FP8 block-scale, NVFP4, "
+                "MXFP8, and integer quant are not supported.");
+            TORCH_CHECK(
+                mWeightDtype == c10::ScalarType::Half || mWeightDtype == c10::ScalarType::BFloat16 || is_per_tensor_fp8,
+                "MoE LoRA supports unquantized fp16/bf16 or per-tensor FP8 (qdq) base expert weights only "
+                "(LoRA adapters are always fp16/bf16).");
             // CUDA-graph capture is only safe on the device LoRA path. The
             // legacy host path performs a host-side cudaEventSynchronize and
             // per-token pointer expansion in setupLoraWorkspace, plus host-side
@@ -967,7 +985,7 @@ public:
                 tensorrt_llm::runtime::TorchUtils::dataType(mOutputDtype), num_experts, static_cast<int>(top_k),
                 hidden_size, unpadded_hidden_size > 0 ? unpadded_hidden_size : hidden_size, inter_size, group_size,
                 activation_type, USE_BIAS, USE_LORA, min_latency_mode,
-                /*need_weights*/ false, parallelism_config, enable_alltoall);
+                /*need_weights*/ false, parallelism_config, enable_alltoall, mUseMxfp8WeightScaling);
 #else
             mProfiler->init(*mKernelRunner.get(), mProfiler->mGemmToProfile,
                 tensorrt_llm::runtime::TorchUtils::dataType(activation_dtype),
@@ -1017,6 +1035,7 @@ private:
     bool mUseINT8WoqPerChannel = false;
     bool mUseMxfp8ActScaling = false;
     bool mUseFusedFinalize = true;
+    bool mUseMxfp8WeightScaling = false;
 
     using Profile = tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
     std::vector<Profile> mGemm1Profiles;
@@ -1260,7 +1279,7 @@ private:
     }
 
     // Map a torch dtype to the TRT-LLM nvinfer1::DataType expected by LoraImpl.
-    static nvinfer1::DataType loraTypeFromActDtype(c10::ScalarType dtype)
+    nvinfer1::DataType loraTypeFromActDtype(c10::ScalarType dtype) const
     {
         switch (dtype)
         {
@@ -1268,6 +1287,12 @@ private:
         case c10::ScalarType::Float: return nvinfer1::DataType::kFLOAT;
 #ifdef ENABLE_BF16
         case c10::ScalarType::BFloat16: return nvinfer1::DataType::kBF16;
+#endif
+#ifdef ENABLE_FP8
+        case c10::ScalarType::Float8_e4m3fn:
+            TORCH_CHECK(mOutputDtype != c10::ScalarType::Float8_e4m3fn,
+                "MoE LoRA with FP8 base activations requires an fp16/bf16 output (LoRA compute) dtype.");
+            return loraTypeFromActDtype(mOutputDtype);
 #endif
         default: C10_THROW_ERROR_FORMATTED(Error, "MoE LoRA only supports fp16/bf16/fp32 activation dtype.");
         }
@@ -2233,6 +2258,26 @@ private:
             TORCH_CHECK(false, "MXFP8 x MXFP4 quantization is not supported in OSS Cutlass Moe Gemm");
 #endif
         }
+        else if (isWMxfp8AMxfp8Quant())
+        {
+            // <e4m3, e4m3> with MXFP8 1x32 UE8M0 block scales on both sides;
+            // SF storage is int32-packed UE8M0 (same convention as MXFP4 MoE).
+            TORCH_CHECK(quant_scales.has_value(), "Expecting quant scales for MXFP8 x MXFP8 quantization");
+            TORCH_CHECK(quant_scales.value().size() == 2,
+                "Expecting 2 quant scales (fc1_weight_block, fc2_weight_block) for MXFP8 x MXFP8 quantization");
+
+            auto const fc1_weight_block = quant_scales.value()[0];
+            auto const fc2_weight_block = quant_scales.value()[1];
+
+            CHECK_INPUT(fc1_weight_block, c10::ScalarType::Int);
+            CHECK_INPUT(fc2_weight_block, c10::ScalarType::Int);
+            TORCH_CHECK(fc1_weight_block.dim() == 3, "fc1 weight block must be 3D");
+            TORCH_CHECK(fc2_weight_block.dim() == 3, "fc2 weight block must be 3D");
+
+            return kernels::QuantParams::MXFP8MXFP8(
+                static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc1_weight_block.data_ptr()),
+                static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc2_weight_block.data_ptr()));
+        }
         else if (isNvfp4Quant())
         {
             TORCH_CHECK(quant_scales.has_value(), "Expecting quant scales for nvfp4 quantization");
@@ -2370,7 +2415,15 @@ private:
 
     bool isFp8Quant() const
     {
-        return !mUseDeepSeekFP8BlockScaling && mActivationDtype == c10::ScalarType::Float8_e4m3fn
+        // <e4m3, e4m3> per-tensor FP8; excludes DeepSeek block-scale FP8 and MXFP8xMXFP8.
+        return !mUseDeepSeekFP8BlockScaling && !mUseMxfp8WeightScaling
+            && mActivationDtype == c10::ScalarType::Float8_e4m3fn && mWeightDtype == c10::ScalarType::Float8_e4m3fn;
+    }
+
+    bool isWMxfp8AMxfp8Quant() const
+    {
+        // <e4m3, e4m3> with MXFP8 block-scaled weights + dynamic MXFP8 acts.
+        return mUseMxfp8WeightScaling && mActivationDtype == c10::ScalarType::Float8_e4m3fn
             && mWeightDtype == c10::ScalarType::Float8_e4m3fn;
     }
 
@@ -2425,7 +2478,7 @@ TRTLLM_NAMESPACE_END
 TORCH_LIBRARY(trtllm, m)
 {
     m.class_<tensorrt_llm::torch_ext::FusedMoeRunner>("FusedMoeRunner")
-        .def(torch::init<c10::ScalarType, c10::ScalarType, c10::ScalarType, bool, bool, bool, bool, bool>())
+        .def(torch::init<c10::ScalarType, c10::ScalarType, c10::ScalarType, bool, bool, bool, bool, bool, bool>())
         .def("run_gemm_profile", &tensorrt_llm::torch_ext::FusedMoeRunner::runGemmProfile)
         .def("get_tactic_num", &tensorrt_llm::torch_ext::FusedMoeRunner::getTacticNum)
         .def("run_moe", &tensorrt_llm::torch_ext::FusedMoeRunner::runMoe)

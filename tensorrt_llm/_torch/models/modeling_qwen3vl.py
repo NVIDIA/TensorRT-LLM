@@ -43,6 +43,7 @@ from ..modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from .modeling_auto import AutoModelForCausalLM
+from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_mixin import MultimodalModelMixin
 from .modeling_multimodal_utils import (
     filter_mm_token_from_input_ids,
@@ -201,6 +202,12 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         # so the per-grid block is a plain ``np.indices`` lattice (no
         # ``tokens_per_second`` scaling).
         return np.indices((llm_grid_t, llm_grid_h, llm_grid_w)).reshape(3, -1)
+
+    # Deterministic dummy-input sizing (`spatial_merge_unit`,
+    # `_num_vision_tokens`, `get_size_for_max_tokens`) and the
+    # `get_num_tokens_per_image` override are inherited unchanged from
+    # `Qwen2VLInputProcessorBase` -- the grid math and the HF `smart_resize`
+    # it defers to are identical for Qwen3-VL.
 
     @classmethod
     def get_rope_index(
@@ -629,7 +636,7 @@ def _triton_pos_embed_interpolate(
     return output
 
 
-class Qwen3VisionModel(torch.nn.Module):
+class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__()
         self.model_config = model_config
@@ -703,19 +710,38 @@ class Qwen3VisionModel(torch.nn.Module):
 
         self.attn_metadata: Optional[AttentionMetadata] = None
 
-        # Pre-allocated `arange` for the vision block's
-        # `rope_position_ids`; per-call code just slices `[:seq_len]`
-        # instead of allocating a fresh `(seq_len,) int32` + H->D copy.
-        # TODO: Make capacity dynamic with the encoder's `max_num_tokens`.
-        self.register_buffer(
-            "_rope_position_ids_buffer",
-            torch.arange(32768, dtype=torch.int32, device="cuda"),
-            persistent=False,
-        )
+        # Vision block's `rope_position_ids` scratch. Registered empty here;
+        # `setup_attn_metadata` allocates it as an `arange` (see there).
+        self.register_buffer("_rope_position_ids_buffer", None, persistent=False)
 
     @property
     def device(self) -> torch.device:
         return self.patch_embed.proj.weight.device
+
+    def setup_attn_metadata(self, max_num_requests: int, max_num_tokens: int) -> None:
+        # Override the mixin default: each image / video frame is its own
+        # attention segment (``seq_lens.extend([h * w] * t)`` in ``forward``),
+        # so a single multi-image or video request can produce many more
+        # segments than ``max_batch_size``. The number of segments in one
+        # encoder forward is bounded by the token budget (every segment holds
+        # at least one token), NOT by the request count -- so floor the
+        # metadata's request capacity at ``max_num_tokens`` to keep the
+        # per-request buffers (prompt_lens / host_request_types / kv_lens) from
+        # overflowing when ``num_contexts`` is set to the segment count.
+        max_num_requests = max(max_num_requests, max_num_tokens)
+        self.attn_metadata = self.metadata_cls(
+            max_num_requests=max_num_requests,
+            max_num_tokens=max_num_tokens,
+            kv_cache_manager=None,
+        )
+        # Pre-allocate the vision-block ``rope_position_ids`` as an ``arange``
+        # sized to the encoder's ``max_num_tokens`` (engine-driven) so per-call
+        # code just slices ``[:seq_len]`` instead of allocating a fresh
+        # ``(seq_len,) int32`` + H->D copy; ``forward`` still grows it on the
+        # rare miss above the budget (e.g. packed multi-video batches).
+        self._rope_position_ids_buffer = torch.arange(
+            max_num_tokens, dtype=torch.int32, device=self.device
+        )
 
     @staticmethod
     @lru_cache(maxsize=1024)
@@ -837,10 +863,9 @@ class Qwen3VisionModel(torch.nn.Module):
         attn_metadata: Optional[AttentionMetadata] = None,
     ):
         if attn_metadata is None:
-            attn_metadata = self.metadata_cls(
-                max_num_requests=8192,  # TODO: Make this dynamic
-                max_num_tokens=8192,  # TODO: Make this dynamic
-                kv_cache_manager=None,
+            raise RuntimeError(
+                "Vision encoder AttentionMetadata is not initialized. "
+                "It must be set up before the encoder forward runs."
             )
         return _prepare_qwen_vl_vision_attn_metadata(seq_lens, attn_metadata)
 
@@ -873,7 +898,10 @@ class Qwen3VisionModel(torch.nn.Module):
         # the gate clears when `head_dim % 64 == 0`. Keep the pre-allocated
         # buffer large enough for packed multi-video batches.
         seq_len = hidden_states.shape[0]
-        if seq_len > self._rope_position_ids_buffer.numel():
+        if (
+            self._rope_position_ids_buffer is None
+            or seq_len > self._rope_position_ids_buffer.numel()
+        ):
             self._rope_position_ids_buffer = torch.arange(
                 seq_len, dtype=torch.int32, device=self.device
             )
@@ -1035,7 +1063,23 @@ class Qwen3VisionModelBase(nn.Module):
         return embeds
 
 
-class Qwen3VLModelBase(PreTrainedModel):
+class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
+    def encode_multimodal_inputs(
+        self, multimodal_params: List[MultimodalParams], **encoder_kwargs: Any
+    ) -> torch.Tensor:
+        """Uniform encoder entry (``MultimodalModelMixin`` contract).
+
+        Runs the vision encoder over ``multimodal_params`` and returns the
+        embeddings as a single tensor (Qwen3-VL folds deepstack streams into
+        the hidden dim, so the single-tensor contract holds). Used by the
+        startup memory profiler to invoke the encoder directly; the model's
+        own ``forward`` keeps its custom deepstack fusion path.
+        """
+        mm_embeds = get_multimodal_embeddings(
+            encoder_forward_fn=self.mm_encoder.forward, multimodal_params=list(multimodal_params)
+        )
+        return mm_embeds[0]
+
     def _check_and_adjust_experts_implementation(self, *args, **kwargs):
         """No-op override.
 
@@ -1102,25 +1146,24 @@ class Qwen3VLModelBase(PreTrainedModel):
 
         self.model_config = model_config
 
+        vlm_to_llm_arch = {
+            "Qwen3VLForConditionalGeneration": "Qwen3ForCausalLM",
+            "Qwen3VLMoeForConditionalGeneration": "Qwen3MoeForCausalLM",
+            "QwenImageBenchForConditionalGeneration": "Qwen3_5ForCausalLM",
+            "Cosmos3ForConditionalGeneration": "Qwen3ForCausalLM",
+        }
+        llm_arch = vlm_to_llm_arch.get(self.original_arch)
+        if llm_arch is None:
+            raise ValueError(f"Unsupported architecture: {self.original_arch}")
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config = config.text_config
-        # The LM's attention modules look themselves up in the global
-        # `extra_attrs` that `model_engine.model_forward` binds via
-        # `with_model_extra_attrs(self.model.extra_attrs)` -- the
-        # outer wrapper's dict. Without sharing, `llm_model_config`
-        # carries a deep-copied dict, so LM `attn_custom_op_inplace`
-        # (used under `set_torch_compiling(True)`) fails its layer
-        # lookup and the piecewise-CUDA-graph dynamo trace blows up
-        # at the LM's `o_proj` call. Vision attention unregisters
-        # itself from this dict in `Qwen2_5_VLVisionAttention.__init__`
-        # so it does not poison LM lookups.
+        # The LM attention modules use extra_attrs through the outer wrapper.
+        # Share the dict after deepcopy so compiled LM attention lookups see
+        # the same per-layer metadata as model_engine.model_forward.
+        # Vision attention unregisters itself from this dict during init,
+        # so it does not pollute LM lookups.
         llm_model_config.extra_attrs = model_config.extra_attrs
-        if self.original_arch == "Qwen3VLForConditionalGeneration":
-            llm_model_config.pretrained_config.architectures = ["Qwen3ForCausalLM"]
-        elif self.original_arch == "Qwen3VLMoeForConditionalGeneration":
-            llm_model_config.pretrained_config.architectures = ["Qwen3MoeForCausalLM"]
-        else:
-            raise ValueError(f"Unsupported architecture: {self.original_arch}")
+        llm_model_config.pretrained_config.architectures = [llm_arch]
         # Qwen3ForCausalLM.
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
@@ -1138,7 +1181,7 @@ class Qwen3VLModelBase(PreTrainedModel):
         if self.use_deepstack:
             # Pre-allocated `(L, max_num_tokens, hidden)` scratch buffer for
             # per-layer deepstack embeddings; replaces `L` fresh
-            # `torch.zeros` + `L` scatters per prefill (vLLM-style).
+            # `torch.zeros` + `L` scatters per prefill.
             # `persistent=False` keeps it out of `state_dict`.
             self.register_buffer(
                 "deepstack_input_embeds",

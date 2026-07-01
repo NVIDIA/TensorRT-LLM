@@ -7,19 +7,18 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
-from tensorrt_llm._torch.models.modeling_utils import \
-    MODEL_CLASS_VISION_ENCODER_MAPPING
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
-                                 str_dtype_to_binding, torch_dtype_to_str)
+                                 prefer_pinned, str_dtype_to_binding,
+                                 torch_dtype_to_str)
 from tensorrt_llm.bindings.executor import DecodingMode
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig, CapacitySchedulerPolicy, EagleDecodingConfig,
-    KvCacheConfig, MTPDecodingConfig, PeftCacheConfig, SamplerType,
-    SchedulerConfig, SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs,
-    WaitingQueuePolicy)
+    KvCacheCompressionConfig, KvCacheConfig, MTPDecodingConfig, PeftCacheConfig,
+    SamplerType, SchedulerConfig, SparseAttentionConfig, SpeculativeConfig,
+    TorchLlmArgs, WaitingQueuePolicy)
 # isort: on
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
@@ -29,6 +28,7 @@ from tensorrt_llm.mapping import CpType, Mapping
 
 from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..model_config import ModelConfig
+from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
 from .config_utils import (extract_mamba_kv_cache_params, is_gemma4_hybrid,
@@ -47,8 +47,9 @@ from .mamba_cache_manager import (BaseMambaCacheManager,
                                   use_py_mamba_cache_manager)
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
-from .resource_manager import (KVCacheManager, PeftCacheManager,
-                               ResourceManager, ResourceManagerType)
+from .resource_manager import (BaseKVCacheCompressionManager, KVCacheManager,
+                               PeftCacheManager, ResourceManager,
+                               ResourceManagerType)
 from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
                       TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
@@ -236,8 +237,6 @@ class KvCacheCreator:
         self._max_beam_width = max_beam_width
         self._kv_connector_manager = kv_connector_manager
         self._llm_args = llm_args
-        # For V2 fallback use only, will be removed after V2 is stable
-        self._cache_transceiver_config = llm_args.cache_transceiver_config
         self._speculative_config = speculative_config
         self._sparse_attention_config = sparse_attention_config
         self._tokens_per_block = tokens_per_block
@@ -245,8 +244,10 @@ class KvCacheCreator:
         self._max_batch_size = max_batch_size
         self._net_max_seq_len = net_max_seq_len
         self._dummy_reqs = None
+        self._dummy_encoder_inputs: List[MultimodalParams] = []
         self._profiling_stage_data = profiling_stage_data
         self._is_disagg = is_disagg
+        self._cache_transceiver_config = llm_args.cache_transceiver_config
         self._execution_stream = execution_stream
         self._kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
             model_engine)
@@ -261,30 +262,46 @@ class KvCacheCreator:
         kv_cache_config = (kv_cache_config_override if kv_cache_config_override
                            is not None else self._kv_cache_config)
         model_config = model_engine.model.model_config
-        config = model_config.pretrained_config
         cls = get_kv_cache_manager_cls(
             model_config,
             kv_cache_config,
             is_disagg=self._is_disagg,
             cache_transceiver_config=self._cache_transceiver_config)
+        cls = self._fallback_if_unsupported_kv_cache_manager_v2(
+            cls, model_config, kv_cache_config)
+        # The V1-route hybrid mamba managers (disagg, TRTLLM_USE_CPP_MAMBA,
+        # TRTLLM_USE_PY_MAMBA, or one-model speculative decoding) keep mamba
+        # state in a separate cache that doesn't honor block reuse. Warn at
+        # the routing site so users see the warning where the decision is
+        # actually made.
+        if is_hybrid_linear(model_engine.model.model_config.pretrained_config) \
+                and kv_cache_config.enable_block_reuse:
+            uses_v1_mamba_route = self._is_disagg \
+                or os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1' \
+                or os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1' \
+                or self._speculative_config is not None
+            if uses_v1_mamba_route:
+                logger.warning(
+                    "Block reuse does not work with MTP for hybrid linear models "
+                    "when using the legacy MambaCacheManager (TRTLLM_USE_CPP_MAMBA=1)"
+                )
+        return cls
+
+    def _fallback_if_unsupported_kv_cache_manager_v2(
+            self,
+            kv_cache_manager_cls,
+            model_config: ModelConfig,
+            kv_cache_config: Optional[KvCacheConfig] = None):
+        config = model_config.pretrained_config
         # Use ``issubclass`` rather than identity equality so V2 subclasses
         # (e.g. ``MiniMaxM3KVCacheManagerV2`` from the sparse-attention path)
-        # also go through the V2-incompatible-feature gate below. The earlier
-        # ``cls == KVCacheManagerV2`` check silently bypassed all V2 subclasses
-        # and let the bare ``assert event_buffer_max_size == 0`` in
-        # ``KVCacheManagerV2.__init__`` trip at executor construction with
-        # a useless error message.
-        if issubclass(cls, KVCacheManagerV2):
+        # also go through the V2-incompatible-feature gate below.
+        if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
             incompat: List[str] = []
             if self._kv_connector_manager is not None:
                 incompat.append("kv_connector_manager")
             if self._max_beam_width is not None and self._max_beam_width > 1:
                 incompat.append("beam_width > 1")
-            if kv_cache_config.event_buffer_max_size > 0:
-                incompat.append("event_buffer_max_size > 0")
-            if (self._cache_transceiver_config is not None
-                    and self._cache_transceiver_config.backend is not None):
-                incompat.append("cache_transceiver")
             if incompat:
                 incompat_str = ", ".join(incompat)
                 # Some models are structurally bound to V2 and cannot fall
@@ -315,24 +332,8 @@ class KvCacheCreator:
                 logger.warning(
                     "KVCacheManagerV2 is not supported with %s. "
                     "Falling back to KVCacheManager.", incompat_str)
-                cls = KVCacheManager
-        # The V1-route hybrid mamba managers (disagg, TRTLLM_USE_CPP_MAMBA,
-        # TRTLLM_USE_PY_MAMBA, or one-model speculative decoding) keep mamba
-        # state in a separate cache that doesn't honor block reuse. Warn at
-        # the routing site so users see the warning where the decision is
-        # actually made.
-        if is_hybrid_linear(model_engine.model.model_config.pretrained_config) \
-                and kv_cache_config.enable_block_reuse:
-            uses_v1_mamba_route = self._is_disagg \
-                or os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1' \
-                or os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1' \
-                or self._speculative_config is not None
-            if uses_v1_mamba_route:
-                logger.warning(
-                    "Block reuse does not work with MTP for hybrid linear models "
-                    "when using the legacy MambaCacheManager (TRTLLM_USE_CPP_MAMBA=1)"
-                )
-        return cls
+                return KVCacheManager
+        return kv_cache_manager_cls
 
     def _per_manager_cache_cost(self,
                                 manager_cls,
@@ -419,92 +420,14 @@ class KvCacheCreator:
         )
         return int(available_kv_mem)
 
-    def _create_dummy_mm_context_request(
-            self, input_seq_len: int) -> List[trtllm.Request]:
-        requests = []
-        if isinstance(
-                self._profiling_stage_data,
-                dict) and not self._profiling_stage_data.get("enable_mm_reqs"):
-            return requests
-
-        input_processor = self._model_engine.input_processor
-        if not (hasattr(input_processor, "get_dummy_prompt")):
-            logger.warning("The input processor of the model does not have the method [get_dummy_prompt] implemented." \
-            "Profiling with the default input dummy context request. This may not take into account the memory consumption of " \
-            "the image encoder")
-            return requests
-
-        max_num_tokens = self._max_num_tokens
-        max_beam_width = self._max_beam_width
-        vocab_size = self._model_engine.model.model_config.pretrained_config.vocab_size
-
-        input_seq_len = min(max_num_tokens, input_seq_len)
-        remaining_tokens = max_num_tokens
-        while remaining_tokens > 0:
-            input_seq_len = min(input_seq_len, remaining_tokens)
-            dummy_mm_prompt = input_processor.get_dummy_prompt(input_seq_len)
-
-            if dummy_mm_prompt is not None:
-                prompt_token_ids, extra_processed_inputs = self._model_engine.input_processor_with_hash(
-                    dummy_mm_prompt, sampling_params=None)
-
-                multimodal_input = extra_processed_inputs.get(
-                    'multimodal_input')
-                multimodal_data = extra_processed_inputs.get('multimodal_data')
-                req_mm_input = multimodal_input.to_binding(
-                    trtllm) if multimodal_input else None
-
-                request = trtllm.Request(prompt_token_ids,
-                                         max_tokens=1,
-                                         streaming=False,
-                                         sampling_config=trtllm.SamplingConfig(
-                                             beam_width=max_beam_width, ),
-                                         output_config=trtllm.OutputConfig(),
-                                         end_id=-1,
-                                         multimodal_input=req_mm_input)
-                request.py_multimodal_data = multimodal_data
-            else:
-                # Fall back to text-only prompt when we could not find the small image size.
-                prompt_token_ids = torch.randint(
-                    low=0, high=vocab_size, size=(input_seq_len, )).tolist()
-                request = trtllm.Request(prompt_token_ids,
-                                         max_tokens=1,
-                                         streaming=False,
-                                         sampling_config=trtllm.SamplingConfig(
-                                             beam_width=max_beam_width, ),
-                                         output_config=trtllm.OutputConfig(),
-                                         end_id=-1)
-                if self._model_engine.use_mrope:
-                    request.py_multimodal_data = {
-                        "mrope_config": {
-                            "mrope_position_ids":
-                            torch.zeros(3, 1, input_seq_len, dtype=torch.int32),
-                            "mrope_position_deltas":
-                            torch.zeros(1, 1, dtype=torch.int32)
-                        }
-                    }
-            remaining_tokens -= len(prompt_token_ids)
-            requests.append(request)
-
-        if self._mapping.enable_attention_dp:
-            requests = requests * self._mapping.tp_size
-
-        return requests
-
     def _create_dummy_context_requests(
             self, input_seq_len: int) -> List[trtllm.Request]:
+        # Always text-only: this sizes the LLM-activation term at
+        # ``max_num_tokens``. The multimodal encoder is profiled separately and
+        # decoupled (``_encode_dummy_inputs`` in
+        # ``configure_kv_cache_capacity``) by running the encoder on its own
+        # worst-case dummy batch, so there is no multimodal dummy request here.
         requests = []
-        # Disaggregated workers receive multimodal embeddings instead of raw
-        # pixel inputs, so capacity probing must use the text-only fallback.
-        if (not _is_mm_disagg()
-                and hasattr(self._model_engine.model, "original_arch")
-                and MODEL_CLASS_VISION_ENCODER_MAPPING.get(
-                    self._model_engine.model.original_arch, None)):
-            requests = self._create_dummy_mm_context_request(input_seq_len)
-        # if succeed profiling with multimodal requests then return, otherwise profile
-        # with default case
-        if requests:
-            return requests
         vocab_size = self._model_engine.model.model_config.pretrained_config.vocab_size
         max_num_tokens = self._max_num_tokens
         max_beam_width = self._max_beam_width
@@ -538,6 +461,78 @@ class KvCacheCreator:
             requests = requests * self._mapping.tp_size
         return requests
 
+    def _create_dummy_encoder_inputs(self) -> List[MultimodalParams]:
+        """Build the worst-case dummy multimodal batch for direct encoder
+        profiling: the processor's worst-case dummy saturating
+        ``encoder_max_num_tokens`` (one batched encoder forward), staged to GPU.
+
+        Returns an empty list when the model is not a multimodal-encoder model
+        or the processor has no dummy builder (then the encoder is not profiled
+        directly). Whether the *processor* has opted into deterministic dummy
+        sizing is detected below via ``NotImplementedError`` / empty demand — a
+        model with the encoder entry but no dummy builder just yields an empty
+        batch (no encoder profiling) until the builder is implemented.
+        """
+        # Gate on `MultimodalModelMixin`: the dummy-data sizing below only
+        # needs the input processor, but `_encode_dummy_inputs` then calls
+        # `model.encode_multimodal_inputs` (the mixin contract), so the model
+        # must provide it. This also intentionally scopes direct encoder
+        # profiling to mixin-migrated models (Qwen2-VL and Mistral are the
+        # pilots; future models opt in by inheriting the mixin and implementing
+        # the processor dummy hooks).
+        if not isinstance(self._model_engine.model, MultimodalModelMixin):
+            return []
+        if isinstance(
+                self._profiling_stage_data,
+                dict) and not self._profiling_stage_data.get("enable_mm_reqs"):
+            return []
+        input_processor = self._model_engine.input_processor
+        _, encoder_max_num_tokens = self._llm_args.get_encoder_runtime_sizes()
+        # Modality-agnostic: the model declares each modality's per-item token
+        # demand; split the shared ``encoder_max_num_tokens`` budget across them
+        # in proportion to that demand (they share one encoder microbatch cap, so
+        # the shares sum to the budget rather than each claiming all of it). The
+        # processor then materializes a dummy per modality, merged into one batch
+        # so a single encode profiles the combined peak. Empty demand /
+        # NotImplementedError on the builder → text-only dummy fallback.
+        demand = input_processor.get_mm_max_tokens_per_item()
+        total_demand = sum(demand.values())
+        if total_demand <= 0:
+            return []
+        max_tokens_per_modality = {
+            m: max(1, encoder_max_num_tokens * d // total_demand)
+            for m, d in demand.items()
+        }
+        try:
+            multimodal_data = input_processor.get_dummy_mm_data_for_tokens(
+                max_tokens_per_modality=max_tokens_per_modality,
+                dtype=self._model_engine.model.dtype)
+        except NotImplementedError:
+            return []
+
+        if not multimodal_data:
+            return []
+        params = MultimodalParams(multimodal_data=multimodal_data)
+        params.to_device("multimodal_data",
+                         "cuda",
+                         pin_memory=prefer_pinned(),
+                         target_keywords=getattr(
+                             self._model_engine.model,
+                             "multimodal_data_device_paths", None))
+        return [params]
+
+    def _encode_dummy_inputs(self):
+        """Run the multimodal encoder(s) once on the pre-built worst-case dummy
+        batch (``self._dummy_encoder_inputs``) and return its output so the
+        embeddings stay resident while the peak is measured (the caller must hold
+        the returned tensors so the peak accounts for the live embeddings).
+        Returns ``None`` when direct profiling does not apply."""
+        if not self._dummy_encoder_inputs:
+            return None
+        with torch.inference_mode():
+            return self._model_engine.model.encode_multimodal_inputs(
+                self._dummy_encoder_inputs)
+
     def _get_token_num_for_estimation(self) -> int:
         """Compute KV cache capacity required for estimate_max_kv_cache_tokens to succeed."""
         if 'cp_type' in self._mapping.cp_config:
@@ -558,6 +553,10 @@ class KvCacheCreator:
         if self._dummy_reqs is None:
             self._dummy_reqs = self._create_dummy_context_requests(
                 max(1, self._net_max_seq_len - 1))
+            # Symmetric with `_dummy_reqs`: build the direct-encoder-profiling
+            # batch here (empty for models without the uniform encoder entry);
+            # `configure_kv_cache_capacity` runs it inside the peak window.
+            self._dummy_encoder_inputs = self._create_dummy_encoder_inputs()
         for req in self._dummy_reqs:
             num_req_tokens = len(req.input_token_ids) + num_extra_tokens_per_seq
             # Requests cannot share KV cache blocks. Round up to nearest integer multiple of block size.
@@ -677,6 +676,14 @@ class KvCacheCreator:
         )
 
         if py_executor is not None and not self._skip_est:
+            # Direct encoder profiling: run the vision encoder once
+            # on the worst-case dummy batch and keep its embeddings resident so
+            # the peak below captures the encoder activation + live embeddings,
+            # while the LLM-activation term comes from the (text-only) dummy
+            # requests. ``None`` for models without the uniform encoder entry.
+            # Bound (not discarded) so the embeddings stay resident through the
+            # peak read below; ``del`` frees them afterward.
+            encoder_profile_output = self._encode_dummy_inputs()  # noqa: F841
             py_executor.set_gather_responses(True)
             origin_iter_stats = py_executor.enable_iter_perf_stats
             py_executor.enable_iter_perf_stats = False
@@ -698,6 +705,13 @@ class KvCacheCreator:
 
                 torch_peak_memory = torch.cuda.memory_stats(
                 )["allocated_bytes.all.peak"]
+
+                # Free the held encoder embeddings and the GPU-resident dummy
+                # encoder inputs now that the peak (which they contributed to)
+                # has been recorded, so the steady-state measurement below
+                # doesn't count these transient dummies.
+                del encoder_profile_output
+                self._dummy_encoder_inputs = []
 
                 # Clear the caching allocator before measuring the current memory usage
                 torch.cuda.empty_cache()
@@ -943,18 +957,8 @@ class KvCacheCreator:
         # Get the appropriate KV cache manager class for the draft model
         draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
             effective_draft_config, draft_kv_config, is_disagg=self._is_disagg)
-
-        # Use V2 if enabled and the base class is KVCacheManager
-        if draft_kv_cache_manager_cls == KVCacheManagerV2:
-            if self._kv_connector_manager is not None or (
-                    self._max_beam_width is not None and self._max_beam_width
-                    > 1) or draft_kv_config.event_buffer_max_size > 0 or (
-                        self._cache_transceiver_config is not None
-                        and self._cache_transceiver_config.backend is not None):
-                logger.warning(
-                    "KVCacheManagerV2 is not supported with disaggregated serving or beam width > 1 or event buffer max size > 0 or disagg config. "
-                    "Falling back to KVCacheManager for draft model.")
-                draft_kv_cache_manager_cls = KVCacheManager
+        draft_kv_cache_manager_cls = self._fallback_if_unsupported_kv_cache_manager_v2(
+            draft_kv_cache_manager_cls, effective_draft_config, draft_kv_config)
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
         # For MTP with models using sparse attention (e.g., DeepSeek V3 with DSA),
@@ -1863,6 +1867,25 @@ def _create_kv_cache_manager(
     return kv_cache_manager
 
 
+def create_kv_cache_compression_manager(
+    config: KvCacheCompressionConfig,
+    kv_cache_manager: KVCacheManagerV2,
+) -> Optional[BaseKVCacheCompressionManager]:
+    """Build the KV-cache compression manager for ``config.algorithm``, or return
+    None if no algorithm matches.
+
+    Called from ``create_py_executor`` and registered as a resource manager,
+    like the KV cache manager itself. Concrete algorithms add a dispatch branch
+    here; the framework ships none.
+    """
+    logger.warning(
+        "KV-cache compression algorithm '%s' is not registered; running without "
+        "a compression manager.",
+        config.algorithm,
+    )
+    return None
+
+
 def create_py_executor_instance(
     *,
     dist,
@@ -2058,13 +2081,30 @@ def create_py_executor_instance(
     resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
         max_num_sequences)
 
+    # Register the compression manager (if one is configured) with the other
+    # managers, before building ResourceManager, so it is part of the manager
+    # set from the start. Reads its own config, not the sparse-attention one.
+    kv_cache_compression_config = getattr(llm_args,
+                                          "kv_cache_compression_config", None)
+    if kv_cache_compression_config is not None:
+        compression_manager = create_kv_cache_compression_manager(
+            kv_cache_compression_config, kv_cache_manager)
+        if compression_manager is not None:
+            resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
+                compression_manager)
+
     resource_manager = ResourceManager(resources)
 
-    # Make sure the kv cache managers are always invoked last as they could
-    # depend on the results of other resource managers.
+    # KV cache manager runs last (others may depend on it), except the
+    # compression manager which reconciles after it (below).
     if kv_cache_manager is not None:
         resource_manager.resource_managers.move_to_end(
             ResourceManagerType.KV_CACHE_MANAGER, last=True)
+    # Compression manager runs after the cache manager: reconciles history once it's resized.
+    if (ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER
+            in resource_manager.resource_managers):
+        resource_manager.resource_managers.move_to_end(
+            ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER, last=True)
 
     cross_kv_cache_manager = resources.get(
         ResourceManagerType.CROSS_KV_CACHE_MANAGER)
@@ -2086,6 +2126,18 @@ def create_py_executor_instance(
                                if cross_kv_cache_manager is not None else
                                LlmRequestState.CONTEXT_INIT)
 
+    # V2 scheduler uses scheduler_capacity as the per-iteration request
+    # budget (BudgetTracker.max_num_requests).  Unlike V1 which has a
+    # separate CapacityScheduler (needs pp_size * max_batch_size to hold
+    # requests across PP stages) and MicroBatchScheduler (uses
+    # max_batch_size for per-forward batch limit), V2 merges both into
+    # one loop.  PP on-the-fly is handled by inflight_request_ids
+    # filtering, so its budget should be based on max_batch_size, not
+    # max_num_sequences (which includes the pp_size multiplier).
+    v2_scheduler_capacity = max_batch_size
+    if v2_scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
+        v2_scheduler_capacity += 1
+
     if isinstance(kv_cache_manager, KVCacheManagerV2):
         # V2: interleaved scheduler handles both capacity and budget
         draft_kv_cache_manager = resources.get(
@@ -2093,6 +2145,9 @@ def create_py_executor_instance(
         scheduler_policy = (scheduler_config.capacity_scheduler_policy
                             if scheduler_config is not None else
                             CapacitySchedulerPolicy.MAX_UTILIZATION)
+        enable_prefix_aware_scheduling = (
+            scheduler_config.enable_prefix_aware_scheduling
+            if scheduler_config is not None else True)
         scheduler = KVCacheV2Scheduler(
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
@@ -2101,13 +2156,15 @@ def create_py_executor_instance(
             ctx_chunk_config=ctx_chunk_config,
             peft_cache_manager=peft_cache_manager.impl
             if peft_cache_manager is not None else None,
-            scheduler_capacity=scheduler_capacity,
+            scheduler_capacity=v2_scheduler_capacity,
             draft_kv_cache_manager=draft_kv_cache_manager,
             cross_kv_cache_manager=cross_kv_cache_manager,
             no_schedule_until_state=no_schedule_until_state,
+            enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
         )
     elif (scheduler_config is not None
           and scheduler_config.use_python_scheduler):
+        enable_prefix_aware_scheduling = scheduler_config.enable_prefix_aware_scheduling
         scheduler = SimpleUnifiedScheduler(
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
@@ -2121,8 +2178,13 @@ def create_py_executor_instance(
             if cross_kv_cache_manager is not None else None,
             two_step_lookahead=mapping.has_pp(),
             scheduler_capacity=scheduler_capacity,
-            no_schedule_until_state=no_schedule_until_state)
+            no_schedule_until_state=no_schedule_until_state,
+            enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
+        )
     else:
+        enable_prefix_aware_scheduling = (
+            scheduler_config.enable_prefix_aware_scheduling
+            if scheduler_config is not None else True)
         capacity_scheduler = BindCapacityScheduler(
             scheduler_capacity,
             kv_cache_manager.impl if kv_cache_manager is not None else None,
@@ -2131,7 +2193,9 @@ def create_py_executor_instance(
             cross_kv_cache_manager=cross_kv_cache_manager.impl
             if cross_kv_cache_manager is not None else None,
             two_step_lookahead=mapping.has_pp(),
-            no_schedule_until_state=no_schedule_until_state)
+            no_schedule_until_state=no_schedule_until_state,
+            enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
+        )
 
         mb_scheduler = BindMicroBatchScheduler(max_batch_size, max_num_tokens,
                                                ctx_chunk_config)
