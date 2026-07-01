@@ -882,10 +882,17 @@ class PyExecutor:
             get_load=get_load,
             max_batch_size=self.max_batch_size,
         )
-        self._per_rank_reporter.start()
+        # Drive event reporting inline from the per-iteration event flush (see
+        # _add_kv_cache_events): the KV-cache event queue is filled exactly once
+        # per iteration, so a background poll thread on its own clock only adds
+        # detection jitter and empty-poll churn. The periodic load thread still
+        # runs. Sends are serialized + closed-guarded inside the reporter, so
+        # calling report_events() from the executor loop is safe.
+        self._per_rank_reporter.start(poll_events=False)
         logger.info(
-            f"PerRankReporter started: worker_id={worker_id} "
-            f"namespace={namespace} router={router_address}")
+            f"PerRankReporter started (inline event reporting): "
+            f"worker_id={worker_id} namespace={namespace} "
+            f"router={router_address}")
 
     def start_worker(self):
         with self.worker_lock:
@@ -3444,6 +3451,15 @@ class PyExecutor:
         # Flush iteration events at each iteration to ensure that events have enough time
         # to be transferred to main thread when user needs them.
         kv_cache_manager.flush_iteration_events()
+        # Per-rank centralized routing: report this iteration's freshly-flushed
+        # events inline (no background poll thread). This is the producer
+        # boundary -- the event queue was just filled by the flush above -- so
+        # draining here reports with zero detection latency. The reporter
+        # serializes the send and no-ops after shutdown; the socket write is
+        # handed to ZMQ's I/O thread, so a slow router doesn't block us.
+        reporter = getattr(self, "_per_rank_reporter", None)
+        if reporter is not None:
+            reporter.report_events()
 
     def _balance_adp_requests(self, context_requests: list[LlmRequest],
                               generation_requests: list[LlmRequest]):

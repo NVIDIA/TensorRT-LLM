@@ -108,30 +108,68 @@ class WorkerReporter:
         self._stop = threading.Event()
         self._event_thread: Optional[threading.Thread] = None
         self._load_thread: Optional[threading.Thread] = None
+        # The ZMQ socket is not thread-safe and several producers may send on
+        # it: the startup snapshot (caller thread), the periodic load loop, and
+        # -- in inline mode -- the engine's executor loop via report_events().
+        # Serialize every send under one lock, and hard-gate on _closed so a
+        # send racing with stop()/close() becomes a no-op instead of touching a
+        # torn-down (None) socket. This is the lifetime bug that crashed the
+        # earlier inline attempt ('NoneType has no attribute send').
+        self._send_lock = threading.Lock()
+        self._closed = False
 
-    def start(self) -> None:
-        """Send the initial full snapshot and start both report loops."""
-        if self._event_thread is not None:
+    def start(self, poll_events: bool = True) -> None:
+        """Send the initial full snapshot and start the report loop(s).
+
+        Args:
+            poll_events: When True (default), run a background thread that polls
+                the KV-cache event queue every ``event_interval_s`` and reports.
+                When False, no event thread is started and the caller drives
+                event reporting synchronously via :meth:`report_events` (e.g.
+                inline at the engine's per-iteration event flush) -- the event
+                queue is filled exactly once per iteration, so a separate poll
+                clock only adds detection jitter and empty-poll churn. The
+                periodic load thread runs in both modes.
+        """
+        if self._event_thread is not None or self._load_thread is not None:
             raise RuntimeError("WorkerReporter already started")
         # Initial snapshot lets a (re)started router rebuild this worker's table.
         self._push_events(self._drain_events(), is_full_snapshot=True)
-        self._event_thread = threading.Thread(target=self._run_event_loop,
-                                              name="kv_cache_reporter_events",
-                                              daemon=True)
+        if poll_events:
+            self._event_thread = threading.Thread(
+                target=self._run_event_loop,
+                name="kv_cache_reporter_events",
+                daemon=True)
+            self._event_thread.start()
         self._load_thread = threading.Thread(target=self._run_load_loop,
                                              name="kv_cache_reporter_load",
                                              daemon=True)
-        self._event_thread.start()
         self._load_thread.start()
 
+    def report_events(self) -> None:
+        """Drain and push pending events once, on the calling thread.
+
+        For inline (non-polling) mode: call right after the engine flushes
+        KV-cache events for an iteration. Safe to call from the executor loop
+        thread -- the send is serialized with the load loop and no-ops after
+        :meth:`stop`. Sends nothing when there are no pending events."""
+        events = self._drain_events()
+        if events:
+            self._push_events(events)
+
     def stop(self) -> None:
-        """Stop both loops and close the socket."""
+        """Stop the loops and close the socket. Idempotent."""
         self._stop.set()
         for t in (self._event_thread, self._load_thread):
             if t is not None:
                 t.join(timeout=5.0)
         self._event_thread = self._load_thread = None
-        self._queue.close()
+        # Take the send lock so we never close the socket underneath an
+        # in-flight send (report_events on the executor thread / load loop).
+        with self._send_lock:
+            if not self._closed:
+                self._closed = True
+                self._queue.close()
 
     # ----------------------------------------------------------------- loops
 
@@ -173,16 +211,19 @@ class WorkerReporter:
                 # (active, queued, active_tokens); accept both for compat.
                 num_active, num_queued = load[0], load[1]
                 num_active_tokens = load[2] if len(load) > 2 else 0
-                self._queue.put_noblock(
-                    WorkerLoadReport(
-                        worker_id=self._worker_id,
-                        namespace=self._namespace,
-                        seq=self._load_seq,
-                        num_active_requests=num_active,
-                        num_queued_requests=num_queued,
-                        max_batch_size=self._max_batch_size,
-                        num_active_tokens=num_active_tokens,
-                    ))
+                report = WorkerLoadReport(
+                    worker_id=self._worker_id,
+                    namespace=self._namespace,
+                    seq=self._load_seq,
+                    num_active_requests=num_active,
+                    num_queued_requests=num_queued,
+                    max_batch_size=self._max_batch_size,
+                    num_active_tokens=num_active_tokens,
+                )
+                with self._send_lock:
+                    if self._closed:
+                        return
+                    self._queue.put_noblock(report)
                 self._load_seq += 1
             except Exception as e:  # noqa: BLE001 - keep the daemon alive
                 logger.error(f"WorkerReporter load loop error: {e}")
@@ -205,13 +246,18 @@ class WorkerReporter:
     def _push_events(self,
                      events: List[dict],
                      is_full_snapshot: bool = False) -> None:
-        self._queue.put_noblock(
-            KvCacheEventReport(
-                worker_id=self._worker_id,
-                namespace=self._namespace,
-                seq=self._event_seq,
-                events=events,
-                is_full_snapshot=is_full_snapshot,
-                send_ts=_now_on_synced_clock(),
-            ))
+        report = KvCacheEventReport(
+            worker_id=self._worker_id,
+            namespace=self._namespace,
+            seq=self._event_seq,
+            events=events,
+            is_full_snapshot=is_full_snapshot,
+            send_ts=_now_on_synced_clock(),
+        )
+        # Serialized with the load loop; no-op after stop() so a send racing
+        # teardown never touches a closed (None) socket.
+        with self._send_lock:
+            if self._closed:
+                return
+            self._queue.put_noblock(report)
         self._event_seq += 1
