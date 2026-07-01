@@ -77,11 +77,6 @@ _FLASHINFER_PAGED_APPEND_OVER_1024_THREADS = (
 
 _TRTLLM_PAGED_UNSUPPORTED_HEAD_DIMS = (512,)
 _TRTLLM_BLACKWELL_PAGED_UNSUPPORTED_HEAD_DIMS = (96,)
-_TRTLLM_BLACKWELL_SLIDING_DECODE_UNSTABLE = (
-    # Gemma3-27B local layers and Gemma4-31B sliding layers.
-    (32, 16, 128, 1024),
-    (32, 16, 256, 1024),
-)
 
 
 def required_features(case) -> set:
@@ -188,27 +183,6 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
         and case.head_dim == 80
     ):
         return "TRTLLM Blackwell no-cache fallback is unstable for head_dim 80"
-
-    # These Blackwell sliding-window decode shapes pass in isolation but become
-    # numerically unstable after earlier cases initialize trtllm-gen process
-    # state. Keep the skip exact so other sliding-window decode shapes run.
-    if (
-        backend == "TRTLLM"
-        and sm >= 100
-        and case.num_contexts == 0
-        and (
-            case.num_heads,
-            case.num_kv_heads,
-            case.head_dim,
-            getattr(case, "sliding_window", None),
-        )
-        in _TRTLLM_BLACKWELL_SLIDING_DECODE_UNSTABLE
-    ):
-        return (
-            "TRTLLM Blackwell sliding-window pure decode is unstable for "
-            f"num_heads={case.num_heads}, num_kv_heads={case.num_kv_heads}, "
-            f"head_dim={case.head_dim}, window={case.sliding_window}"
-        )
 
     # SM90 forces paged context FMHA whenever a mixed batch has context work.
     # With an FP8 KV cache, that mode also reaches the MMHA generation phase and
