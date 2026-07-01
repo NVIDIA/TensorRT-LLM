@@ -13,25 +13,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""EP group health tracking for WideEP fault tolerance.
+"""Committed EP data-plane membership for WideEP fault tolerance.
 
 This module provides :class:`EPGroupHealth`, a process-local, thread-safe data
-structure that records which ranks in an Expert Parallel (EP) group are currently
-alive vs. failed. It is the single source of truth for EP rank health within one
-process and is consumed by:
+structure that records which Expert Parallel (EP) ranks the recovery coordinator
+has committed as included vs. excluded from the data plane. It is consumed by:
 
   * AlltoAll communication backends (rank masking on dispatch / combine)
-  * The host-side AlltoAll watchdog (failure detection)
+  * The host-side AlltoAll watchdog (read-only expected-peer snapshot)
   * The MoE load balancer (emergency-mask reconfiguration)
   * The model engine and PyExecutor (degraded health reporting)
 
-Cross-process consensus on which ranks are dead (failure broadcast across the EP
-group) is the responsibility of higher-layer coordination components and is not
-performed here.
+Detected or suspected physical liveness is separate evidence. Higher-layer
+coordination reconciles that evidence and commits membership; detectors and
+telemetry consumers must not mutate this object to drive recovery.
 """
 
 import threading
-from typing import NamedTuple
+import uuid
+from typing import Any, NamedTuple
+
+# Canonical ModelConfig.extra_attrs key for coordinator-committed data-plane
+# membership. The object is not a detector or a physical-liveness tracker.
+EP_GROUP_HEALTH_EXTRA_ATTR = "wide_ep_ft_ep_group_health"
+EP_GROUP_HEALTH_LEGACY_EXTRA_ATTR = "ep_group_health"
 
 # Default number of uint64 words for EPGroupHealth.get_mask_words().
 # Matches the active_rank_mask ABI of the NVLink AlltoAll kernels
@@ -50,24 +55,29 @@ class EPGroupHealthSnapshot(NamedTuple):
     if a mutator runs between calls).
     """
 
-    # Active-rank bitmask (bit i set iff rank i is active).
+    # Committed-rank bitmask (bit i set iff rank i is included).
     mask: int
-    # Number of ranks currently marked active.
+    # Number of ranks included in committed data-plane membership.
     active_count: int
-    # Immutable snapshot of failed ranks.
+    # Immutable snapshot of ranks excluded from committed membership.
     failed_ranks: frozenset[int]
-    # Monotonic counter; bumps only on effective state changes.
+    # Monotonic committed-membership version.
     generation: int
 
 
 class EPGroupHealth:
-    """Thread-safe health tracker for the ranks of an EP group.
+    """Thread-safe committed-membership tracker for an EP group.
 
     Internally backed by an arbitrary-precision Python ``int`` bitmask
-    (bit ``i`` set iff rank ``i`` is currently active). The kernel-side
-    representation as a fixed-width array of ``uint64`` words is exposed via
-    :meth:`get_mask_words`; this matches the ``active_rank_mask`` parameter
-    expected by the NVLink AlltoAll kernels.
+    (bit ``i`` set iff rank ``i`` is included in the committed data plane).
+    The kernel-side representation as a fixed-width array of ``uint64`` words
+    is exposed via :meth:`get_mask_words`; this matches the
+    ``active_rank_mask`` parameter expected by the NVLink AlltoAll kernels.
+
+    This object does not represent uncommitted detector observations or
+    suspected physical liveness. A higher-level recovery coordinator owns
+    membership transitions; passive consumers such as telemetry must only
+    read coherent snapshots.
 
     All read and write operations take an internal lock. Read operations that
     return collection types return defensive snapshots so the caller cannot
@@ -99,6 +109,10 @@ class EPGroupHealth:
         self._active_count: int = moe_world_size
         self._failed_ranks: set[int] = set()
         self._generation: int = 0
+        # A generation is monotonic only within one producer lifetime.  The
+        # immutable epoch lets serving distinguish a restarted producer from a
+        # stale snapshot emitted by the current one.
+        self._source_epoch = uuid.uuid4().hex
         self._lock = threading.Lock()
 
     @property
@@ -108,7 +122,7 @@ class EPGroupHealth:
 
     @property
     def generation(self) -> int:
-        """Monotonic counter incremented on every effective state change.
+        """Monotonic counter incremented on each committed membership change.
 
         Idempotent calls (e.g. marking an already-failed rank as failed) do not
         bump the counter. Consumers that need to react to mask changes can
@@ -121,13 +135,22 @@ class EPGroupHealth:
         with self._lock:
             return self._generation
 
+    @property
+    def source_epoch(self) -> str:
+        """Unique identifier for this producer lifetime."""
+        return self._source_epoch
+
     def _validate_rank(self, rank: int) -> None:
         """Raise if ``rank`` is outside the MoE world."""
         if not 0 <= rank < self._moe_world_size:
             raise ValueError(f"rank must be in [0, {self._moe_world_size}), got {rank}")
 
     def mark_failed(self, rank: int) -> bool:
-        """Mark ``rank`` as failed. Idempotent.
+        """Exclude ``rank`` from committed data-plane membership. Idempotent.
+
+        A higher-level recovery coordinator owns calls to this mutator after
+        reconciling detector evidence; detection and telemetry must not call it
+        directly.
 
         Args:
             rank: Index of the rank to mark, in ``[0, moe_world_size)``.
@@ -151,7 +174,7 @@ class EPGroupHealth:
             return True
 
     def mark_active(self, rank: int) -> bool:
-        """Mark ``rank`` as active. Idempotent.
+        """Include ``rank`` in committed data-plane membership. Idempotent.
 
         Used when a replacement rank rejoins the group after a failure.
         Higher layers may impose a "monotonic failure" policy (do not
@@ -180,7 +203,7 @@ class EPGroupHealth:
             return True
 
     def is_active(self, rank: int) -> bool:
-        """Return ``True`` iff ``rank`` is currently marked active.
+        """Return whether ``rank`` is included in committed membership.
 
         Raises:
             ValueError: If ``rank`` is outside ``[0, moe_world_size)``.
@@ -190,15 +213,15 @@ class EPGroupHealth:
             return bool(self._active_mask & (1 << rank))
 
     def get_mask(self) -> int:
-        """Return the active-rank bitmask as a Python ``int``.
+        """Return the committed active-rank bitmask as a Python ``int``.
 
-        Bit ``i`` is set iff rank ``i`` is currently active.
+        Bit ``i`` is set iff rank ``i`` is included in data-plane membership.
         """
         with self._lock:
             return self._active_mask
 
     def get_mask_words(self, num_words: int = EP_MASK_NUM_WORDS) -> tuple[int, ...]:
-        """Return the active-rank bitmask split into little-endian uint64 words.
+        """Return the committed rank mask as little-endian uint64 words.
 
         Suitable for passing to CUDA kernels that accept ``uint64_t[num_words]``.
         Word ``0`` covers ranks ``0..63``, word ``1`` covers ranks ``64..127``,
@@ -229,22 +252,22 @@ class EPGroupHealth:
         return tuple((mask >> (i * 64)) & word_mask for i in range(num_words))
 
     def get_active_count(self) -> int:
-        """Return the number of ranks currently marked active."""
+        """Return the number of ranks in committed data-plane membership."""
         with self._lock:
             return self._active_count
 
     def get_failed_ranks(self) -> frozenset[int]:
-        """Return an immutable snapshot of the set of failed ranks."""
+        """Return ranks excluded from committed data-plane membership."""
         with self._lock:
             return frozenset(self._failed_ranks)
 
     def all_active(self) -> bool:
-        """Return ``True`` iff every rank in the group is currently active."""
+        """Return whether committed membership includes every group rank."""
         with self._lock:
             return self._active_mask == self._all_active_mask
 
     def snapshot(self) -> EPGroupHealthSnapshot:
-        """Return an atomic snapshot of mask, active_count, failed_ranks, generation.
+        """Return an atomic committed-membership snapshot.
 
         All four fields reflect a single point in time (one lock acquisition).
         Prefer this over calling individual accessors back-to-back when the
@@ -262,13 +285,18 @@ class EPGroupHealth:
         """Return the MoE world size (``moe_world_size``), not the active count.
 
         Provided for compatibility with code that treats this object as a
-        sized container of ranks (alive or dead). Use :meth:`get_active_count`
-        when you specifically want the surviving-rank count.
+        sized container of included and excluded ranks. Use
+        :meth:`get_active_count` for the committed-membership count.
         """
         return self._moe_world_size
 
+    def __deepcopy__(self, memo: dict[int, Any]) -> "EPGroupHealth":
+        """Preserve producer identity when ``ModelConfig`` is deep-copied."""
+        memo[id(self)] = self
+        return self
+
     def __repr__(self) -> str:
-        """Return a concise debug representation of the current health state."""
+        """Return a concise representation of committed membership."""
         with self._lock:
             return (
                 f"EPGroupHealth(moe_world_size={self._moe_world_size}, "
