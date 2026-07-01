@@ -81,7 +81,7 @@ def ceil_div(a: int, b: int) -> int:
 def _non_hybrid_kv_cache_manager_cls(config, kv_cache_config: KvCacheConfig):
     # Models with per-layer head_dim (e.g., Gemma4 hybrid attention)
     # require KVCacheManagerV2 for per-layer buffer sizes.
-    needs_v2 = (kv_cache_config.use_kv_cache_manager_v2
+    needs_v2 = (kv_cache_config.use_kv_cache_manager_v2 is True
                 or is_gemma4_hybrid(config))
     return KVCacheManagerV2 if needs_v2 else KVCacheManager
 
@@ -344,9 +344,9 @@ class KvCacheCreator:
                         f"Gemma4 hybrid attention requires KVCacheManagerV2, "
                         f"which is not yet supported with {incompat_str}. "
                         f"Disable these features to run Gemma4 hybrid models.")
-                # Plain V2 (user opt-in via ``use_kv_cache_manager_v2=True``):
-                # V2 was a preference, not a structural requirement, so we
-                # can safely fall back to V1.
+                # Plain V2 (explicitly enabled or selected by a model default):
+                # V2 was a preference, not a structural requirement, so we can
+                # safely fall back to V1.
                 logger.warning(
                     "KVCacheManagerV2 is not supported with %s. "
                     "Falling back to KVCacheManager.", incompat_str)
