@@ -5506,15 +5506,6 @@ class MXFP8CutlassFusedMoEMethod(FusedMoEMethodBase):
     def create_weights(self, module: torch.nn.Module):
         module.scaling_vector_size = self.BLOCK_SIZE
 
-        w3_w1_weight_shape = (module.expert_size_per_partition,
-                              module.expand_intermediate_size_per_partition,
-                              module.hidden_size)
-        w2_weight_shape = (module.expert_size_per_partition, module.hidden_size,
-                           module.intermediate_size_per_partition)
-
-        super().create_weights(module, torch.float8_e4m3fn, w3_w1_weight_shape,
-                               w2_weight_shape)
-
         # K must divide evenly into 32 * 4 = 128 element groups so we can
         # repack 4 UE8M0 scales per int32 along the K (SF) dim. For modern
         # MoE checkpoints with 128-aligned hidden/intermediate, this is
@@ -5523,11 +5514,37 @@ class MXFP8CutlassFusedMoEMethod(FusedMoEMethodBase):
         assert module.hidden_size % sf_pack_k == 0, (
             f"hidden_size={module.hidden_size} must be a multiple of "
             f"{sf_pack_k} for MXFP8 MoE int32 SF packing")
-        assert module.intermediate_size_per_partition % sf_pack_k == 0
+
+        # Pad the per-partition intermediate to weight_alignment (128) when
+        # a moe_tp_size > 1 shard would not be naturally aligned. Match the
+        # MXFP4 auto-padding pattern (MXFP4WeightFusedMoEMethod.create_weights):
+        # allocate storage for the padded shape and pad source weights before
+        # sharding at load time. The padded entries are zeros; they contribute
+        # zero to the reduce-scatter output so the reference (unpadded) result
+        # is preserved bit-for-bit on the non-padded rows.
+        def _round_up(x, alignment):
+            return (x + alignment - 1) // alignment * alignment
+
+        intermediate_size_per_partition_padded = _round_up(
+            module.intermediate_size_per_partition, self.weight_alignment)
+        # expand_intermediate_size_per_partition mirrors the same padding
+        # (factor of intermediate_size_expand_ratio: 2 for gated activation).
+        expand_intermediate_size_per_partition_padded = (
+            intermediate_size_per_partition_padded *
+            module.intermediate_size_expand_ratio)
+
+        w3_w1_weight_shape = (module.expert_size_per_partition,
+                              expand_intermediate_size_per_partition_padded,
+                              module.hidden_size)
+        w2_weight_shape = (module.expert_size_per_partition, module.hidden_size,
+                           intermediate_size_per_partition_padded)
+
+        super().create_weights(module, torch.float8_e4m3fn, w3_w1_weight_shape,
+                               w2_weight_shape)
 
         w3_w1_weight_scale = nn.Parameter(torch.empty(
             (module.expert_size_per_partition,
-             module.expand_intermediate_size_per_partition,
+             expand_intermediate_size_per_partition_padded,
              module.hidden_size // sf_pack_k),
             dtype=self.BLOCK_SCALES_DTYPE),
                                           requires_grad=False)
@@ -5535,13 +5552,56 @@ class MXFP8CutlassFusedMoEMethod(FusedMoEMethodBase):
 
         w2_weight_scale = nn.Parameter(torch.empty(
             (module.expert_size_per_partition, module.hidden_size,
-             module.intermediate_size_per_partition // sf_pack_k),
+             intermediate_size_per_partition_padded // sf_pack_k),
             dtype=self.BLOCK_SCALES_DTYPE),
                                        requires_grad=False)
         module.register_parameter("w2_weight_scale", w2_weight_scale)
 
         self._online_eplb_not_verified(module)
         self.setup_quant_scales(module)
+
+    def load_expert_w3_w1_weight(self,
+                                 module: torch.nn.Module,
+                                 w1_weight: torch.Tensor,
+                                 w3_weight: torch.Tensor,
+                                 dst_w3_w1_weight: torch.Tensor,
+                                 allow_partial_loading: bool = False):
+        # Pad the un-sharded intermediate axis so each rank's shard is
+        # weight_alignment-aligned, then delegate to the base loader.
+        # Matches the MXFP4 pad-before-shard flow.
+        def _pad(w):
+            if w is None:
+                return None
+            alignment = _get_weight_alignment(self.weight_alignment,
+                                              module.scaling_vector_size,
+                                              module.tp_size, w.shape[0])
+            if len(w.shape) == 2:
+                return maybe_pad_for_mxfp4(w, self.weight_alignment, alignment)
+            assert len(w.shape) == 1
+            return maybe_pad_for_mxfp4(w, alignment)
+
+        return super().load_expert_w3_w1_weight(module, _pad(w1_weight),
+                                                _pad(w3_weight),
+                                                dst_w3_w1_weight,
+                                                allow_partial_loading)
+
+    def load_expert_w2_weight(self,
+                              module: torch.nn.Module,
+                              w2_weight: torch.Tensor,
+                              dst_w2_weight: torch.Tensor,
+                              allow_partial_loading: bool = False):
+        # w2 is row-parallel on the intermediate axis (axis 1 of [H, N]);
+        # pad the source along that axis so each rank's shard is
+        # weight_alignment-aligned, then delegate to the base loader.
+        # 1-D biases are hidden-sized on w2 so they need no per-shard padding.
+        if w2_weight is not None and len(w2_weight.shape) == 2:
+            alignment = _get_weight_alignment(self.weight_alignment,
+                                              module.scaling_vector_size,
+                                              module.tp_size,
+                                              w2_weight.shape[1])
+            w2_weight = maybe_pad_for_mxfp4(w2_weight, alignment)
+        return super().load_expert_w2_weight(module, w2_weight, dst_w2_weight,
+                                             allow_partial_loading)
 
     def setup_quant_scales(self, module: torch.nn.Module):
         module.quant_scales = FusedMoEQuantScalesMXFP8(
@@ -5561,6 +5621,8 @@ class MXFP8CutlassFusedMoEMethod(FusedMoEMethodBase):
 
     def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
         device = module.w3_w1_weight_scale.device
+        # Scale-tensor SF-axis alignment mirrors the weight side; see
+        # load_expert_w3_w1_weight for the parallel logic.
         for local_slot_id, expert_id in enumerate(
                 module.initial_local_expert_ids):
             if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
@@ -5588,22 +5650,30 @@ class MXFP8CutlassFusedMoEMethod(FusedMoEMethodBase):
             # Layout: top half = w3, bottom half = w1 (matches the weight
             # load order in FusedMoEMethodBase.load_expert_w3_w1_weight).
             dst_w3_u8, dst_w1_u8 = dst_w3_w1_u8.chunk(2, dim=0)
-            if w1_sf is not None:
-                w1_shard = load_weight_shard(w1_sf,
-                                             module.tp_size,
-                                             module.tp_rank,
-                                             TensorParallelMode.COLUMN,
-                                             device=device)
-                dst_w1_u8.copy_(w1_shard.to(torch.uint8))
-            if w3_sf is not None:
-                w3_shard = load_weight_shard(w3_sf,
-                                             module.tp_size,
-                                             module.tp_rank,
-                                             TensorParallelMode.COLUMN,
-                                             device=device)
-                dst_w3_u8.copy_(w3_shard.to(torch.uint8))
+            for sf, dst_u8 in ((w1_sf, dst_w1_u8), (w3_sf, dst_w3_u8)):
+                if sf is None:
+                    continue
+                alignment = _get_weight_alignment(self.weight_alignment,
+                                                  module.scaling_vector_size,
+                                                  module.tp_size, sf.shape[0])
+                sf_padded = maybe_pad_for_mxfp4(sf, sf.shape[-1], alignment)
+                shard = load_weight_shard(sf_padded,
+                                          module.tp_size,
+                                          module.tp_rank,
+                                          TensorParallelMode.COLUMN,
+                                          device=device)
+                dst_u8.copy_(shard.to(torch.uint8))
             if w2_sf is not None:
-                w2_shard = load_weight_shard(w2_sf,
+                # w2_sf is [H, N/BLOCK_SIZE]; row-parallel along N/BLOCK_SIZE.
+                # The N-axis in the source is already scaled down by
+                # scaling_vector_size (BLOCK_SIZE=32), so per-shard alignment
+                # in scale units is (weight_alignment / scaling_vector_size).
+                sf_col_align = self.weight_alignment // module.scaling_vector_size
+                alignment = _get_weight_alignment(sf_col_align, 1,
+                                                  module.tp_size,
+                                                  w2_sf.shape[-1])
+                w2_sf_padded = maybe_pad_for_mxfp4(w2_sf, alignment)
+                w2_shard = load_weight_shard(w2_sf_padded,
                                              module.tp_size,
                                              module.tp_rank,
                                              TensorParallelMode.ROW,
