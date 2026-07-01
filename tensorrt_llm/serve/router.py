@@ -113,14 +113,29 @@ class KvCacheAwareServerState(ServerState):
         super().__init__(server, use_tokens, session_provider)
         self._kv_cache_block_table: set[int] = set()
         self._tokens_per_block = tokens_per_block
+        # Number of /kv_cache_events entries ever applied; stays 0 if the
+        # server never reports any.
+        self._kv_events_applied = 0
 
     def add_blocks(self, block_hashes: Iterable[int]):
-        for hash in block_hashes:
-            self._kv_cache_block_table.add(hash)
+        for block_hash in block_hashes:
+            self._kv_cache_block_table.add(block_hash)
+
+    async def backfill_blocks(self, block_hashes: Iterable[Iterable[int]]):
+        """Record block hashes the router computed for a request it served.
+
+        Once a context request finishes on this server, the server holds those
+        blocks, so we can add them to the table directly instead of waiting for
+        the worker to report them via ``/kv_cache_events``. Evictions are still
+        applied from ``removed`` events when that stream is available.
+        """
+        async with self._lock:
+            for hash_list in block_hashes:
+                self.add_blocks(hash_list)
 
     def remove_blocks(self, block_hashes: Iterable[int]):
-        for hash in block_hashes:
-            self._kv_cache_block_table.discard(hash)
+        for block_hash in block_hashes:
+            self._kv_cache_block_table.discard(block_hash)
 
     def update_with_events(self, events: Iterable[dict]):
         # event_raw: {"id": <id>, "data": <event body>}
@@ -133,8 +148,10 @@ class KvCacheAwareServerState(ServerState):
             if event["type"] == "stored":
                 self.add_blocks(block["block_hash"]
                                 for block in event["blocks"])
+                self._kv_events_applied += 1
             elif event["type"] == "removed":
                 self.remove_blocks(event["block_hashes"])
+                self._kv_events_applied += 1
 
     async def poll_events(self, session: aiohttp.ClientSession):
         async with session.post(
@@ -146,9 +163,9 @@ class KvCacheAwareServerState(ServerState):
         match_count = 0
         async with self._lock:
             for hash_list in block_hashes:
-                for hash in hash_list:
+                for block_hash in hash_list:
                     # TODO: 1) parent hash verification, 2) partial matching
-                    if hash in self._kv_cache_block_table:
+                    if block_hash in self._kv_cache_block_table:
                         match_count += self._tokens_per_block
                     else:
                         break
@@ -800,6 +817,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  max_batch_size: int = 64,
                  tokens_per_block: int = 32,
                  custom_tokenizer: Optional[str] = None,
+                 backfill_block_hashes_on_finish: bool = False,
                  **kwargs):
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
@@ -807,6 +825,14 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         self._init_load_balancing(servers, use_tokens)
         # TODO: use max_num_tokens? per server?
         self._max_batch_size = max_batch_size
+        # When enabled, populate server block tables from the hashes the router
+        # already computed rather than relying only on /kv_cache_events polling.
+        # Off by default so the event-driven behavior is unchanged.
+        self._backfill_block_hashes_on_finish = backfill_block_hashes_on_finish
+        self._request_block_hashes: dict[int, list[list[int]]] = {}
+        self._finished_requests = 0
+        self._kv_signal_warned = False
+        self._kv_signal_warn_threshold = 32
 
     def _create_server_state(self, server: str) -> KvCacheAwareServerState:
         return KvCacheAwareServerState(server, self._use_tokens,
@@ -867,6 +893,8 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             server = servers[winner]
         async with self._lock:
             await self._register_request(server, request)
+            if self._backfill_block_hashes_on_finish and block_hashes:
+                self._request_block_hashes[id(request)] = block_hashes
         return server, {
             "block_hashes": block_hashes,  # list[list[int]]
             "token_lists": token_lists,  # list[list[int]]
@@ -879,10 +907,41 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                              session: Optional[aiohttp.ClientSession] = None):
         async with self._lock:
             server = self._req_routing_table.pop(id(request), None)
+            block_hashes = self._request_block_hashes.pop(id(request), None)
             if server is not None and server in self._server_state:
                 await self._server_state[server].decrement_load(request)
         if server is not None and server in self._server_state:
-            await self._server_state[server].poll_and_update(session)
+            state = self._server_state[server]
+            if self._backfill_block_hashes_on_finish and block_hashes:
+                await state.backfill_blocks(block_hashes)
+            await state.poll_and_update(session)
+            self._maybe_warn_dead_kv_signal()
+
+    def _maybe_warn_dead_kv_signal(self):
+        """Warn once if the KV-cache signal never materializes.
+
+        Without it ``matched_tokens`` is 0 for every server and routing
+        quietly falls back to least-loaded selection, which is easy to miss.
+        """
+        if self._kv_signal_warned or self._backfill_block_hashes_on_finish:
+            return
+        self._finished_requests += 1
+        if self._finished_requests < self._kv_signal_warn_threshold:
+            return
+        events = sum(state._kv_events_applied
+                     for state in self._server_state.values())
+        blocks = sum(
+            len(state._kv_cache_block_table)
+            for state in self._server_state.values())
+        if events == 0 and blocks == 0:
+            logger.warning(
+                "KvCacheAwareRouter received no KV-cache events from any server "
+                f"after {self._finished_requests} finished requests; every "
+                "block table is empty, so routing has silently degraded to "
+                "load-only selection. Ensure KV-cache event reporting is "
+                "enabled on the workers (kv_cache_config.event_buffer_max_size "
+                "> 0), or set router.args.backfill_block_hashes_on_finish: true.")
+            self._kv_signal_warned = True
 
     def _on_servers_updated(self, old_servers, new_servers):
         new_state = {}
