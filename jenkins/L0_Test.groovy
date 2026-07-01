@@ -1898,6 +1898,8 @@ def DEBUG_MODE = "debug"
 def DETAILED_LOG = "detailed_log"
 @Field
 def CBTS_RESULT = "cbts_result"
+@Field
+def DISABLE_CBTS = "disable_cbts"
 // Suffix for CBTS-narrowed stages so their results aren't reused by non-CBTS runs.
 // A suffix (not prefix) keeps the GPU type as the first '-' token for positional parsers.
 @Field
@@ -1921,6 +1923,7 @@ def testFilter = [
     (AUTO_TRIGGER_TAG_LIST): [],
     (DETAILED_LOG): false,
     (CBTS_RESULT): null,
+    (DISABLE_CBTS): false,
 ]
 
 @Field
