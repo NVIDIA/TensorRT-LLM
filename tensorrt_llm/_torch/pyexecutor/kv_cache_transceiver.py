@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from abc import ABC, abstractmethod
 from os import getenv
 from typing import Any, Dict, List, Optional
@@ -18,6 +33,68 @@ CacheTransceiverCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTranscei
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 CacheTransBufferManagerCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransBufferManager
 BackendTypeCpp = tensorrt_llm.bindings.executor.CacheTransceiverBackendType
+
+_DISAGG_INFLIGHT_CANCEL_ENABLED_ENV = "TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL"
+_NIXL_KVCACHE_BACKEND_ENV = "TRTLLM_NIXL_KVCACHE_BACKEND"
+_SUPPORTED_INFLIGHT_CANCEL_NIXL_BACKEND = "UCX"
+_CACHE_TRANSCEIVER_BACKEND_ENV_VARS = (
+    ("TRTLLM_USE_NIXL_KVCACHE", "NIXL"),
+    ("TRTLLM_USE_UCX_KVCACHE", "UCX"),
+    ("TRTLLM_USE_MOONCAKE_KVCACHE", "MOONCAKE"),
+    ("TRTLLM_USE_MPI_KVCACHE", "MPI"),
+)
+_disagg_inflight_cancel_enabled_cache: Optional[bool] = None
+
+
+def is_disagg_inflight_cancel_enabled() -> bool:
+    """Return whether disaggregated in-flight KV transfer cancellation is enabled."""
+    global _disagg_inflight_cancel_enabled_cache
+    if _disagg_inflight_cancel_enabled_cache is None:
+        _disagg_inflight_cancel_enabled_cache = (getenv(
+            _DISAGG_INFLIGHT_CANCEL_ENABLED_ENV, "0") == "1")
+        if _disagg_inflight_cancel_enabled_cache:
+            logger.warning(
+                f"{_DISAGG_INFLIGHT_CANCEL_ENABLED_ENV}=1: disagg KV "
+                "transfer in-flight cancellation was requested. It is active "
+                "only for cache transceivers that advertise support.")
+    return _disagg_inflight_cancel_enabled_cache
+
+
+def _is_disagg_inflight_cancel_config_supported(
+        cache_transceiver_config: CacheTransceiverConfig) -> bool:
+    runtime = cache_transceiver_config.transceiver_runtime or "CPP"
+    nixl_backend = getenv(_NIXL_KVCACHE_BACKEND_ENV, "UCX")
+    return (runtime == "CPP" and cache_transceiver_config.backend == "NIXL"
+            and nixl_backend == _SUPPORTED_INFLIGHT_CANCEL_NIXL_BACKEND)
+
+
+def _validate_disagg_inflight_cancel_config(
+        cache_transceiver_config: CacheTransceiverConfig) -> None:
+    if not is_disagg_inflight_cancel_enabled():
+        return
+
+    enabled_backend_env_vars = [
+        env_name for env_name, _ in _CACHE_TRANSCEIVER_BACKEND_ENV_VARS
+        if getenv(env_name) == "1"
+    ]
+    if len(enabled_backend_env_vars) > 1:
+        raise ValueError(
+            f"{_DISAGG_INFLIGHT_CANCEL_ENABLED_ENV}=1 requires an "
+            "unambiguous cache transceiver backend, but multiple legacy "
+            f"backend selectors are enabled: {enabled_backend_env_vars}.")
+
+    if _is_disagg_inflight_cancel_config_supported(cache_transceiver_config):
+        return
+
+    runtime = cache_transceiver_config.transceiver_runtime or "CPP"
+    nixl_backend = getenv(_NIXL_KVCACHE_BACKEND_ENV, "UCX")
+    raise ValueError(
+        f"{_DISAGG_INFLIGHT_CANCEL_ENABLED_ENV}=1 is experimental and "
+        "currently supported only with transceiver_runtime='CPP', "
+        "backend='NIXL', and TRTLLM_NIXL_KVCACHE_BACKEND=UCX; got "
+        f"transceiver_runtime={runtime!r}, "
+        f"backend={cache_transceiver_config.backend!r}, "
+        f"TRTLLM_NIXL_KVCACHE_BACKEND={nixl_backend!r}.")
 
 
 def mapping_to_world_config(mapping: Mapping) -> WorldConfig:
@@ -47,19 +124,15 @@ def create_kv_cache_transceiver(
         # NIXL is the default backend for non hybrid models
         cache_transceiver_config.backend = "NIXL"
         # Ordered by priority
-        env_vars = [
-            ("TRTLLM_USE_NIXL_KVCACHE", "NIXL"),
-            ("TRTLLM_USE_UCX_KVCACHE", "UCX"),
-            ("TRTLLM_USE_MOONCAKE_KVCACHE", "MOONCAKE"),
-            ("TRTLLM_USE_MPI_KVCACHE", "MPI"),
-        ]
-        for env_var, be_type in env_vars:
+        for env_var, be_type in _CACHE_TRANSCEIVER_BACKEND_ENV_VARS:
             if getenv(env_var) == "1":
                 logger.warning(
                     f"{env_var}=1 is set, but it's recommended to set cache_transceiver_config.backend in yaml config"
                 )
                 cache_transceiver_config.backend = be_type
                 break
+
+    _validate_disagg_inflight_cancel_config(cache_transceiver_config)
 
     if cache_transceiver_config.backend == "MPI":
         logger.warning(
@@ -123,6 +196,12 @@ class KvCacheTransceiver(ABC):
     def cancel_request(self, req: LlmRequest):
         raise NotImplementedError
 
+    def supports_inflight_request_cancellation(self) -> bool:
+        return False
+
+    def has_poisoned_transfer_buffer(self) -> bool:
+        return False
+
     @abstractmethod
     def prepare_context_requests(self, requests: List[LlmRequest]):
         """
@@ -157,6 +236,7 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
                  attention_type: AttentionTypeCpp,
                  cache_transceiver_config: CacheTransceiverConfig,
                  mamba_cache_manager: Optional[BaseMambaCacheManager] = None):
+        _validate_disagg_inflight_cancel_config(cache_transceiver_config)
         world_config = mapping_to_world_config(mapping)
         # Filter out mamba/recurrent state layers (kv_heads == 0) so that
         # CacheState::ModelConfig::mNbKvHeadsPerLayer only contains attention
@@ -180,6 +260,9 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
         self.kv_transfer_timeout_ms = cache_transceiver_config.kv_transfer_timeout_ms
         self.kv_transfer_sender_future_timeout_ms = cache_transceiver_config.kv_transfer_sender_future_timeout_ms
         self.kv_transfer_poll_interval_ms = cache_transceiver_config.kv_transfer_poll_interval_ms
+        self._supports_inflight_request_cancellation = (
+            _is_disagg_inflight_cancel_config_supported(
+                cache_transceiver_config))
 
         # Get RNN state manager and layer distribution if mamba_cache_manager is provided.
         rnn_state_manager = None
@@ -227,6 +310,14 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
 
     def cancel_request(self, req: LlmRequest):
         return self.impl.cancel_request(req)
+
+    def supports_inflight_request_cancellation(self) -> bool:
+        return self._supports_inflight_request_cancellation
+
+    def has_poisoned_transfer_buffer(self) -> bool:
+        if not is_disagg_inflight_cancel_enabled():
+            return False
+        return self.impl.has_poisoned_transfer_buffer()
 
     def prepare_context_requests(self, requests: List[LlmRequest]):
         # not implemented, an empty placeholder to allow being invoked unconditionally

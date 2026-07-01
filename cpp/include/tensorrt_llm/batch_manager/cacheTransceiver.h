@@ -226,6 +226,11 @@ public:
     [[nodiscard]] virtual bool checkGenTransferComplete() const = 0;
 
     virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) = 0;
+
+    [[nodiscard]] virtual bool hasPoisonedTransferBuffer() const
+    {
+        return false;
+    }
 };
 
 class CacheTransceiver : public BaseCacheTransceiver
@@ -272,6 +277,8 @@ public:
     [[nodiscard]] bool checkGenTransferComplete() const override;
 
     virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) override;
+
+    [[nodiscard]] bool hasPoisonedTransferBuffer() const override;
 
 private:
     void initializeCommState();

@@ -395,6 +395,12 @@ bool getEnvTryZCopyForKVCacheTransfer()
     return zcopyForSysmmetricKVCache;
 }
 
+bool getEnvDisaggEnableInflightCancel()
+{
+    static bool const enabled = getBoolEnv("TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL");
+    return enabled;
+}
+
 bool getEnvForceDeterministic()
 {
     static bool const forceDeterministic = getBoolEnv("FORCE_DETERMINISTIC");

@@ -110,6 +110,9 @@ std::string const& getEnvKVCacheTimeOutputPath();
 
 bool getEnvTryZCopyForKVCacheTransfer();
 
+// Opt-in for disaggregated KV transfer in-flight cancellation and fail-closed transfer-buffer quarantine.
+bool getEnvDisaggEnableInflightCancel();
+
 // Force deterministic behavior for all kernels.
 bool getEnvForceDeterministic();
 
