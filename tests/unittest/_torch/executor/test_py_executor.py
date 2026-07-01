@@ -13,9 +13,11 @@ to PyExecutor, including:
 import threading
 import time
 import types
-from unittest.mock import Mock
+from contextlib import contextmanager
+from unittest.mock import MagicMock, Mock
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
@@ -23,7 +25,13 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     RequestQueueItem,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm._torch.pyexecutor.py_executor import DisaggTransferAdmissionController, PyExecutor
+from tensorrt_llm._torch.pyexecutor.perf_metrics_manager import PerfMetricsManager
+from tensorrt_llm._torch.pyexecutor.py_executor import (
+    BatchState,
+    DisaggTransferAdmissionController,
+    PyExecutor,
+    _PipelinedSlot,
+)
 from tensorrt_llm._torch.pyexecutor.scheduler import (
     FCFSWaitingQueue,
     ScheduledRequests,
@@ -1173,3 +1181,308 @@ class TestCheckCacheTransferErrorsAdpNoop:
         stub = _make_disagg_err_stub(world_size=1, active_requests=[err])
         stub._check_cache_transfer_errors("gen")
         assert len(stub.handle_errors_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests for `_is_pipelined_loop_eligible` (enable_pipelined_scheduler gate).
+# ---------------------------------------------------------------------------
+
+
+def _make_pipelined_eligibility_stub(**overrides):
+    llm_args = types.SimpleNamespace(enable_pipelined_scheduler=True)
+    stub = types.SimpleNamespace(
+        llm_args=llm_args,
+        disable_overlap_scheduler=False,
+        drafter=None,
+        kv_cache_transceiver=None,
+        guided_decoder=None,
+        kv_connector_manager=None,
+        is_benchmark_disagg=False,
+        enable_attention_dp=False,
+        dist=types.SimpleNamespace(pp_size=1),
+        _is_kv_manager_v2=True,
+    )
+    for key, value in overrides.items():
+        if key == "enable_pipelined_scheduler":
+            llm_args.enable_pipelined_scheduler = value
+        elif key == "pp_size":
+            stub.dist.pp_size = value
+        else:
+            setattr(stub, key, value)
+    return stub
+
+
+class TestPipelinedLoopEligibility:
+    """`_is_pipelined_loop_eligible` must be True only when every
+    prerequisite for the 2-batch pipeline holds; any one of them being off
+    must fall back to the overlap scheduler."""
+
+    def test_eligible_when_all_conditions_met(self):
+        stub = _make_pipelined_eligibility_stub()
+        assert PyExecutor._is_pipelined_loop_eligible(stub) is True
+
+    def test_ineligible_when_flag_off(self):
+        stub = _make_pipelined_eligibility_stub(enable_pipelined_scheduler=False)
+        assert PyExecutor._is_pipelined_loop_eligible(stub) is False
+
+    def test_ineligible_when_overlap_scheduler_disabled(self):
+        stub = _make_pipelined_eligibility_stub(disable_overlap_scheduler=True)
+        assert PyExecutor._is_pipelined_loop_eligible(stub) is False
+
+    def test_ineligible_with_drafter(self):
+        stub = _make_pipelined_eligibility_stub(drafter=Mock())
+        assert PyExecutor._is_pipelined_loop_eligible(stub) is False
+
+    def test_ineligible_with_kv_cache_transceiver(self):
+        stub = _make_pipelined_eligibility_stub(kv_cache_transceiver=Mock())
+        assert PyExecutor._is_pipelined_loop_eligible(stub) is False
+
+    def test_ineligible_with_guided_decoder(self):
+        stub = _make_pipelined_eligibility_stub(guided_decoder=Mock())
+        assert PyExecutor._is_pipelined_loop_eligible(stub) is False
+
+    def test_ineligible_with_kv_connector_manager(self):
+        stub = _make_pipelined_eligibility_stub(kv_connector_manager=Mock())
+        assert PyExecutor._is_pipelined_loop_eligible(stub) is False
+
+    def test_ineligible_when_benchmark_disagg(self):
+        stub = _make_pipelined_eligibility_stub(is_benchmark_disagg=True)
+        assert PyExecutor._is_pipelined_loop_eligible(stub) is False
+
+    def test_ineligible_with_attention_dp(self):
+        stub = _make_pipelined_eligibility_stub(enable_attention_dp=True)
+        assert PyExecutor._is_pipelined_loop_eligible(stub) is False
+
+    def test_ineligible_with_pipeline_parallelism(self):
+        stub = _make_pipelined_eligibility_stub(pp_size=2)
+        assert PyExecutor._is_pipelined_loop_eligible(stub) is False
+
+    def test_ineligible_without_kv_manager_v2(self):
+        stub = _make_pipelined_eligibility_stub(_is_kv_manager_v2=False)
+        assert PyExecutor._is_pipelined_loop_eligible(stub) is False
+
+
+# ---------------------------------------------------------------------------
+# Tests for `_process_previous_batch`'s explicit-`batch_state` argument,
+# added so `_executor_loop_pipelined` can drain a batch that isn't
+# `self.previous_batch` (it has no single previous_batch attribute).
+# ---------------------------------------------------------------------------
+
+
+class TestProcessPreviousBatchExplicitArgs:
+    def _make_stub(self, previous_batch=None):
+        stub = types.SimpleNamespace()
+        stub.previous_batch = previous_batch
+        stub._handle_canceled_requests = Mock()
+        stub._handle_responses = Mock(return_value=["finished"])
+        stub.enable_early_first_token_response = False
+        stub.model_engine = Mock(attn_metadata=None, kv_cache_dtype_byte_size=None)
+        stub.resource_manager = Mock()
+        stub.enable_kv_cache_events = False
+        stub.enable_iter_perf_stats = True
+        stub.active_requests = ["r1"]
+        stub._process_iter_stats = Mock()
+        return stub
+
+    def test_uses_explicit_batch_state_when_provided(self):
+        explicit_state = Mock(scheduled_requests=Mock())
+        previous_state = Mock(scheduled_requests=Mock())
+        stub = self._make_stub(previous_batch=previous_state)
+
+        PyExecutor._process_previous_batch(stub, explicit_state)
+
+        called_scheduled_requests = stub.resource_manager.update_resources.call_args[0][0]
+        assert called_scheduled_requests is explicit_state.scheduled_requests
+        stub._process_iter_stats.assert_called_once_with(
+            ["finished"], stub.active_requests, explicit_state
+        )
+
+    def test_falls_back_to_self_previous_batch_when_omitted(self):
+        previous_state = Mock(scheduled_requests=Mock())
+        stub = self._make_stub(previous_batch=previous_state)
+
+        PyExecutor._process_previous_batch(stub)
+
+        called_scheduled_requests = stub.resource_manager.update_resources.call_args[0][0]
+        assert called_scheduled_requests is previous_state.scheduled_requests
+        stub._process_iter_stats.assert_called_once_with(
+            ["finished"], stub.active_requests, previous_state
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests for `_PipelinedSlot.into_batch_state` (merges the worker's
+# asynchronously-produced `SampleState` into a `BatchState` at drain time).
+# ---------------------------------------------------------------------------
+
+
+class TestPipelinedSlot:
+    def test_into_batch_state_merges_sample_state(self):
+        scheduled_requests = Mock()
+        slot = _PipelinedSlot(
+            scheduled_requests=scheduled_requests,
+            fwd_sample_future=Mock(),
+            iter_start_time=123.0,
+            iter_stats="stats",
+            scheduled_batch_stats="batch_stats",
+            gpu_forward_start_event="start_evt",
+            gpu_forward_end_event="end_evt",
+            gpu_sample_end_event="sample_evt",
+            gpu_forward_events_from_perf_pool=True,
+        )
+        sample_state = Mock()
+
+        batch_state = slot.into_batch_state(sample_state)
+
+        assert isinstance(batch_state, BatchState)
+        assert batch_state.scheduled_requests is scheduled_requests
+        assert batch_state.sample_state is sample_state
+        assert batch_state.iter_start_time == 123.0
+        assert batch_state.iter_stats == "stats"
+        assert batch_state.scheduled_batch_stats == "batch_stats"
+        assert batch_state.gpu_forward_start_event == "start_evt"
+        assert batch_state.gpu_forward_end_event == "end_evt"
+        assert batch_state.gpu_forward_events_from_perf_pool is True
+
+
+# ---------------------------------------------------------------------------
+# Tests for `_executor_loop_pipelined`'s fill/drain control flow. Uses real
+# `torch.cuda.Stream`/`Event` objects (needs a CUDA device) with
+# `_forward_step` / `_sample_async` / etc. replaced by lightweight fakes
+# that just record call order -- this validates the pipeline mechanics
+# (FIFO drain, 2-deep lookahead, graceful shutdown, and the ordering
+# invariant documented on `_executor_loop_pipelined`), not model
+# correctness. Model-level correctness is covered by
+# test_pipelined_scheduler_consistency in test_overlap_scheduler.py, which
+# needs a GPU + real weights.
+# ---------------------------------------------------------------------------
+
+
+class _FakeScheduledBatch:
+    def __init__(self, tag):
+        self.tag = tag
+        self.generation_requests = []
+
+    def all_requests(self):
+        return []
+
+    def __repr__(self):
+        return f"batch({self.tag})"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+class TestExecutorLoopPipelinedMechanics:
+    def _make_stub(self, batch_tags):
+        events = []
+        stub = types.SimpleNamespace()
+        stub.device_id = torch.cuda.current_device()
+        stub.execution_stream = torch.cuda.Stream()
+        stub.PIPELINE_DEPTH = PyExecutor.PIPELINE_DEPTH
+        stub.hang_detector = MagicMock()
+        stub._resource_governor_enabled = False
+        stub._can_pause_for_rebalance = Mock(return_value=False)
+        stub.enable_iter_perf_stats = False
+        stub._handle_disagg_cache_errors_synced = Mock()
+        stub._can_queue = Mock(return_value=(True, True))
+        stub._revert_gen_alloc = Mock()
+        stub._collect_scheduled_batch_stats = Mock(return_value=None)
+        stub.perf_manager = PerfMetricsManager(enabled=False)
+        stub.resource_manager = Mock()
+        stub.iter_counter = 0
+
+        batches = [_FakeScheduledBatch(tag) for tag in batch_tags]
+        remaining = iter(batches)
+
+        def _prepare_and_schedule_batch():
+            events.append(("schedule", None))
+            return next(remaining, None), None
+
+        stub._prepare_and_schedule_batch = _prepare_and_schedule_batch
+
+        def _forward_step(scheduled_batch, previous_tensors_device, _):
+            events.append(("forward", scheduled_batch.tag, previous_tensors_device))
+            return {"logits": None}
+
+        def _sample_async(scheduled_batch, batch_outputs):
+            sample_state = Mock()
+            sample_state.device = f"device_of_{scheduled_batch.tag}"
+            events.append(("sample", scheduled_batch.tag))
+            return sample_state
+
+        stub._forward_step = _forward_step
+        stub._sample_async = _sample_async
+        stub._update_request_states = lambda b: events.append(("update_request_states", b.tag))
+        stub._update_requests = lambda ss: events.append(("update_requests", ss.device))
+        stub._send_kv_async = lambda reqs: events.append(("send_kv_async", None))
+        stub._flush_pending_transfer_responses = lambda: events.append(("flush", None))
+        stub._update_generation_requests_that_will_complete_next_iteration = (
+            lambda gen_reqs: events.append(("flag_update", None))
+        )
+        stub._commit_kv_cache_stats = lambda b: events.append(("commit_kv_stats", b.tag))
+        stub._process_previous_batch = lambda bs: events.append(
+            ("process_previous_batch", bs.scheduled_requests.tag)
+        )
+        stub._kv_connector_terminate_requests = lambda: events.append(
+            ("kv_connector_terminate", None)
+        )
+
+        stub._forward_and_sample_worker = types.MethodType(
+            PyExecutor._forward_and_sample_worker, stub
+        )
+        stub._executor_loop_pipelined = types.MethodType(PyExecutor._executor_loop_pipelined, stub)
+
+        @contextmanager
+        def _profiler():
+            yield lambda: None
+
+        stub._profiler = _profiler
+        return stub, events
+
+    def test_fifo_drain_order_and_lookahead(self):
+        """3 batches through a depth-2 pipeline: drained strictly in FIFO
+        (submission) order, and each batch's own `sample_state.device`
+        feeds the NEXT batch's forward as `previous_tensors_device`."""
+        stub, events = self._make_stub(["a", "b", "c"])
+
+        stub._executor_loop_pipelined()
+
+        forwards = [e for e in events if e[0] == "forward"]
+        drains = [e for e in events if e[0] == "process_previous_batch"]
+
+        assert [f[1] for f in forwards] == ["a", "b", "c"]
+        assert [d[1] for d in drains] == ["a", "b", "c"]
+        assert forwards[0][2] is None
+        assert forwards[1][2] == "device_of_a"
+        assert forwards[2][2] == "device_of_b"
+
+    def test_flag_update_runs_before_process_previous_batch(self):
+        """Correctness-critical ordering documented on
+        `_executor_loop_pipelined`: for every drained batch,
+        `_update_generation_requests_that_will_complete_next_iteration`
+        must run before that batch's own `_process_previous_batch`, on the
+        main thread -- see the loop's docstring for why running it inside
+        the worker instead would race the main thread draining an
+        adjacent, request-sharing batch."""
+        stub, events = self._make_stub(["a", "b"])
+
+        stub._executor_loop_pipelined()
+
+        drain_related = [e for e in events if e[0] in ("flag_update", "process_previous_batch")]
+        assert len(drain_related) == 4
+        for i in range(0, len(drain_related), 2):
+            assert drain_related[i][0] == "flag_update"
+            assert drain_related[i + 1][0] == "process_previous_batch"
+
+    def test_stops_scheduling_and_drains_remaining_on_shutdown(self):
+        """When the scheduler returns None (shutdown), the loop must stop
+        submitting new batches but still drain everything already
+        in-flight."""
+        stub, events = self._make_stub(["a", "b"])
+
+        stub._executor_loop_pipelined()
+
+        schedule_calls = [e for e in events if e[0] == "schedule"]
+        drains = [e for e in events if e[0] == "process_previous_batch"]
+        # 2 real batches submitted + 1 final attempt that returns None.
+        assert len(schedule_calls) == 3
+        assert [d[1] for d in drains] == ["a", "b"]

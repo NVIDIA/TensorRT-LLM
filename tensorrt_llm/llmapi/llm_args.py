@@ -4641,6 +4641,16 @@ class TorchLlmArgs(BaseLlmArgs):
         description="Disable the overlap scheduler.",
         status="beta")
 
+    enable_pipelined_scheduler: bool = Field(
+        default=False,
+        description=
+        "Use a 2-batch pipelined executor loop (schedule/dispatch batch N+1 "
+        "on a worker thread while batch N-1's outputs are processed on the "
+        "main thread) instead of the 1-step overlap scheduler. Falls back "
+        "to the overlap scheduler for spec decoding, disaggregated serving, "
+        "guided decoding, pipeline parallelism, and attention DP.",
+        status="prototype")
+
     moe_config: MoeConfig = Field(default_factory=MoeConfig,
                                   description="MoE config.",
                                   status="beta")
@@ -5153,6 +5163,29 @@ class TorchLlmArgs(BaseLlmArgs):
         else:
             self.decoding_config = None
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_pipelined_scheduler(self) -> 'TorchLlmArgs':
+        if not self.enable_pipelined_scheduler:
+            return self
+        is_disagg = (self.cache_transceiver_config is not None
+                     and self.cache_transceiver_config.backend is not None)
+        incompatible = {
+            "disable_overlap_scheduler": self.disable_overlap_scheduler,
+            "speculative_config": self.speculative_config is not None,
+            "cache_transceiver_config (disaggregated serving)": is_disagg,
+            "guided_decoding_backend": self.guided_decoding_backend is not None,
+            "pipeline_parallel_size > 1": self.pipeline_parallel_size > 1,
+            "enable_attention_dp": self.enable_attention_dp,
+        }
+        blocking = [name for name, active in incompatible.items() if active]
+        if blocking:
+            logger.warning(
+                "enable_pipelined_scheduler is not yet supported with "
+                f"{', '.join(blocking)}; falling back to the overlap "
+                "scheduler for this configuration.")
+            self.enable_pipelined_scheduler = False
         return self
 
     @model_validator(mode="after")

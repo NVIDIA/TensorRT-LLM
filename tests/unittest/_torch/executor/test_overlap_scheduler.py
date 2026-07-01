@@ -26,12 +26,14 @@ def create_llm(model_dir,
                disable_overlap_scheduler,
                sampler_type,
                scheduler_config=None,
-               enable_block_reuse=False):
+               enable_block_reuse=False,
+               enable_pipelined_scheduler=False):
     """Create LLM with specific overlap scheduler setting"""
     if scheduler_config is None:
         scheduler_config = SchedulerConfig()
     pytorch_config = dict(disable_overlap_scheduler=disable_overlap_scheduler,
-                          sampler_type=sampler_type)
+                          sampler_type=sampler_type,
+                          enable_pipelined_scheduler=enable_pipelined_scheduler)
 
     trt_kv_cache_config = TRT_KvCacheConfig(
         enable_block_reuse=enable_block_reuse)
@@ -108,6 +110,58 @@ def test_overlap_scheduler_consistency(model_path, test_case, sampler_type,
                                              texts_without_overlap,
                                              strict=True):
         assert with_overlap == without_overlap
+
+
+@pytest.mark.parametrize("sampler_type", ["TorchSampler", "TRTLLMSampler"])
+@pytest.mark.parametrize("enable_block_reuse", [False, True],
+                         ids=["no_reuse", "block_reuse"])
+@pytest.mark.high_cuda_memory
+@pytest.mark.mpi_ray_parity
+def test_pipelined_scheduler_consistency(model_path, test_case, sampler_type,
+                                         enable_block_reuse):
+    """The 2-batch pipelined loop (enable_pipelined_scheduler) must produce
+    byte-identical greedy output to the 1-step overlap scheduler it
+    replaces -- it only changes *when* host work runs relative to the GPU,
+    not the scheduling or sampling decisions themselves."""
+    prompts = test_case["prompts"]
+    max_new_tokens = test_case["max_new_tokens"]
+    temperature = test_case["temperature"]
+    top_p = test_case["top_p"]
+    stop_words = test_case["stop_words"]
+
+    sampling_config = SamplingParams(max_tokens=max_new_tokens,
+                                     stop=stop_words,
+                                     temperature=temperature,
+                                     top_p=top_p,
+                                     n=1,
+                                     use_beam_search=True)
+
+    with create_llm(model_path,
+                    disable_overlap_scheduler=False,
+                    sampler_type=sampler_type,
+                    enable_block_reuse=enable_block_reuse,
+                    enable_pipelined_scheduler=False) as llm:
+        outputs_overlap = llm.generate(prompts,
+                                       sampling_params=sampling_config,
+                                       use_tqdm=True)
+        texts_overlap = [[
+            completion.text for completion in request_output.outputs
+        ] for request_output in outputs_overlap]
+
+    with create_llm(model_path,
+                    disable_overlap_scheduler=False,
+                    sampler_type=sampler_type,
+                    enable_block_reuse=enable_block_reuse,
+                    enable_pipelined_scheduler=True) as llm:
+        outputs_pipelined = llm.generate(prompts,
+                                         sampling_params=sampling_config,
+                                         use_tqdm=True)
+        texts_pipelined = [[
+            completion.text for completion in request_output.outputs
+        ] for request_output in outputs_pipelined]
+
+    for overlap, pipelined in zip(texts_overlap, texts_pipelined, strict=True):
+        assert overlap == pipelined
 
 
 @pytest.mark.parametrize("sampler_type", ["TorchSampler", "TRTLLMSampler"])
