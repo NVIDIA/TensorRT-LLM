@@ -192,7 +192,8 @@ def isCbtsStage(String stageName) {
     }
     // Skip legacy / non-Python-coverage backends: TensorRT is legacy (features target PyTorch/AutoDeploy),
     // and CPP stages run C++ gtest binaries that produce no product Python coverage.
-    if (stageName.contains("TensorRT") || stageName.contains("CPP")) {
+    // AutoDeploy stages are moving out of L0 CI, so they no longer need coverage.
+    if (stageName.contains("TensorRT") || stageName.contains("CPP") || stageName.contains("AutoDeploy")) {
         return false
     }
     return !CBTS_EXCLUDE_STAGES.contains(stageName)
