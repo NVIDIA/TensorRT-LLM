@@ -473,6 +473,7 @@ unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_no_autotune[use_score_
 unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_no_autotune[use_score_as_input-RoutingRenormalize_topk_4-swiglu-1024-1024-150] SKIP (https://nvbugs/5908070)
 unittest/_torch/visual_gen/multi_gpu/test_cosmos3_transformer_parallel.py::TestCosmos3TransformerParallel::test_tp2_vs_single_gpu SKIP (https://nvbugs/6384633)
 unittest/_torch/visual_gen/multi_gpu/test_ulysses_async.py::test_capture_smoke SKIP (https://nvbugs/6385134)
+unittest/_torch/visual_gen/multi_gpu/test_wan_tp.py::TestWanI2VTP::test_wan_i2v_tp_forward SKIP (https://nvbugs/6398197)
 unittest/_torch/visual_gen/multi_gpu/test_wan_tp.py::TestWanI2VTP::test_wan_i2v_tp_vs_single_gpu SKIP (https://nvbugs/6384633)
 unittest/_torch/visual_gen/multi_gpu/test_wan_tp.py::TestWanT2VTP::test_wan_t2v_tp_forward SKIP (https://nvbugs/6384633)
 unittest/_torch/visual_gen/multi_gpu/test_wan_tp.py::TestWanT2VTP::test_wan_t2v_tp_vs_single_gpu SKIP (https://nvbugs/6384633)
