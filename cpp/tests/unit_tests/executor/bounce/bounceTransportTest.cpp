@@ -104,3 +104,47 @@ TEST(BounceTransport, ConcurrentRequestsToSameReceiver)
     runTransfer("btConc1", 8, 1024, 8192, 3);
     runTransfer("btConc2", 8, 1024, 8192, 3);
 }
+
+// Regression: a maxChunkBytes that passes the naive "<= arenaBytes" check but exceeds the arena's
+// USABLE capacity must be clamped at construction. The buddy allocator rounds usable capacity DOWN
+// (to minBlock<<maxOrder) and rounds each request UP to a power of two, so an unclamped chunk sized
+// to the whole arena can never be granted and the flow hangs to leaseTimeout. Here arena=96KiB has
+// only 64KiB usable, yet maxChunkBytes=96KiB (96KiB <= 96KiB passes). A transfer larger than the
+// usable capacity must still complete byte-exact — proving the cap was clamped so chunks split to fit.
+TEST(BounceTransport, MaxChunkBytesClampedToUsableArena)
+{
+    if (!bounce_test::hasCuda())
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    b::BounceConfig cfg;
+    cfg.arenaBytes = 96 * 1024;    // buddy usable rounds DOWN to 64KiB (256<<8)
+    cfg.maxChunkBytes = 96 * 1024; // exceeds the 64KiB usable -> must be clamped to 64KiB
+    cfg.minBlock = 256;
+    cfg.windowDepth = 2;
+    cfg.window = 2;
+    cfg.scatterWorkers = 2;
+    std::size_t const maxDescs = std::max<std::size_t>(1024ULL, cfg.maxChunkBytes / 256ULL);
+
+    auto A = bounce_test::makeNode("btClampA", cfg, maxDescs);
+    auto B = bounce_test::makeNode("btClampB", cfg, maxDescs);
+    if (!A || !B)
+    {
+        GTEST_SKIP() << "NIXL agent/backend unavailable";
+    }
+    bounce_test::wirePair(*A, *B);
+
+    // 4 x 20KiB = 80KiB total > 64KiB usable. Unclamped, the planner packs all 80KiB into ONE chunk
+    // (<= 96KiB cap) that can never be allocated (rounds to 128KiB > 64KiB usable) -> hang. Clamped to
+    // 64KiB, it splits into chunks that each fit a drained arena and recycle through.
+    auto bufs = bounce_test::makeXferBufs(/*nDescs=*/4, /*descBytes=*/20480, /*seed=*/9);
+    auto fut = A->tx->submit(bufs.srcDescs, bufs.dstDescs, B->name);
+    ASSERT_EQ(fut.wait_for(std::chrono::seconds(30)), std::future_status::ready)
+        << "transfer hung -> maxChunkBytes was NOT clamped to usable arena capacity";
+    EXPECT_EQ(fut.get(), kvc::TransferState::kSUCCESS);
+    EXPECT_TRUE(bounce_test::verifyXferBufs(bufs)) << "byte mismatch";
+
+    A->tx->shutdown();
+    B->tx->shutdown();
+    bounce_test::freeXferBufs(bufs);
+}

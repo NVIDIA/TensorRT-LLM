@@ -45,10 +45,10 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 {
 
 // ============================================================================
-// Bounce v2 reactor (DESIGN)
+// Bounce v2 reactor
 // ----------------------------------------------------------------------------
 // One BounceTransport per agent. Concurrency is collapsed onto ONE IO thread +
-// M scatter workers (DESIGN.md §7), so the credit/request state needs almost no
+// M scatter workers, so the credit/request state needs almost no
 // locking. The reactor is decomposed into three collaborators that all live on
 // (and are owned by) that single IO thread:
 //
@@ -166,7 +166,8 @@ private:
         std::string peer;
         std::uint64_t rid{};
         std::uint32_t chunkIdx{};
-        std::uint64_t offset{}; // receiver arena region offset (the granted region handle) to scatter from
+        std::uint64_t offset{};      // receiver arena region offset (the granted region handle) to scatter from
+        std::uint64_t regionBytes{}; // byte size of the buddy block backing `offset` (bounds scatter reads)
         std::vector<BounceScatterEntry> entries;
     };
 
@@ -181,7 +182,7 @@ private:
     };
 
     /// The set of incoming regions currently scattering — the `busy` set passed to the scheduler's
-    /// reclaim calls so a region a worker is still reading is deferred, not re-granted (see §7.4).
+    /// reclaim calls so a region a worker is still reading is deferred, not re-granted.
     std::unordered_set<std::uint64_t> scatteringRegions() const;
     void scatterWorkerLoop();
 
@@ -202,7 +203,7 @@ private:
     // (onData / drainScatterDone / forget / onWant) so it needs no lock. Membership stops forget()
     // from re-granting an incoming region a worker is still reading; the orphaned flag decides whether
     // drainScatterDone frees the region via freeOrphanRegion (flow already gone) or onScatterDone
-    // (normal completion). See DESIGN.md §7.4.
+    // (normal completion).
     std::unordered_map<std::uint64_t, bool> mScattering;
 };
 
@@ -248,8 +249,8 @@ public:
     }
 
 private:
-    // A chunk's transfer state — the per-chunk view of the sender Request state machine in
-    // DESIGN.md §9. Linear progression Gathering -> Writing -> Sent, with GatherFailed as the one
+    // A chunk's transfer state — the per-chunk view of the sender Request state machine.
+    // Linear progression Gathering -> Writing -> Sent, with GatherFailed as the one
     // off-ramp (a gather whose launch/event-record failed). Replaces a former trio of bools whose
     // illegal combinations (e.g. !writePosted && dataSent) were only ruled out by convention.
     enum class PostState
@@ -289,7 +290,7 @@ private:
         // Credits granted by the receiver but not yet posted because no gather region / exec context
         // was free (the shared arena is used across peers and can be oversubscribed). The IO thread
         // NEVER blocks on acquire; instead it parks the credit here and retries each loop iteration
-        // as ACKs free regions — see DESIGN.md §7.3. FIFO: paired with chunk indices in order.
+        // as ACKs free regions. FIFO: paired with chunk indices in order.
         std::deque<BounceCreditEntry> pendingCredits;
         std::shared_ptr<std::promise<TransferState>> promise;
         // Last time this request made forward progress (granted+posted a chunk, or got an ACK).
@@ -343,7 +344,7 @@ public:
     /// engine). @param exec the gather/scatter execution contexts (streams/scratch) borrowed for the
     /// duration of one kernel. `channel`/`engine`/`arena`/`exec` are borrowed for the transport's
     /// lifetime. (Most disagg agents are sender-only OR receiver-only, so a single arena avoids
-    /// wasting a second one — DESIGN.md §5.2.)
+    /// wasting a second one.)
     BounceTransport(std::string selfName, BounceConfig cfg, int deviceId, ControlChannel* channel,
         TransferEngine* engine, BounceArena* arena, ExecPool* exec);
     ~BounceTransport();
