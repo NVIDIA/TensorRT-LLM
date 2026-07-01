@@ -179,7 +179,7 @@ Attention2D parallelism ([arXiv:2503.15758](https://arxiv.org/abs/2503.15758)) t
 **Gather phase: Q along rows and K/V along columns.** Ranks form a $`\text{row\_size} \times \text{col\_size}`$ grid ($`P = \text{row\_size} \times \text{col\_size}`$). Each rank starts with a $1/P$ shard of all three tensors — $Q_i, K_i, V_i$, each $[B, S/P, H, D]$. Attention2D then runs two all-gathers on the two independent grid axes:
 
 - **Q gather** over the **row group** (`row_process_group`): the `col_size` ranks that share a row. Concatenates their $Q_i$ → every member holds $`[B, S/\text{row\_size}, H, D]`$. K/V are untouched.  
-- **K/V gather** over the **column group** (`col_process_group`): the `row_size` ranks that share a column, fused into a single collective. Concatenates their $K_i$/$V_i$ → every member holds $`[B, S/\text{col\_size}, H, D]`$. Q is untouched.
+- **K/V gather** over the **column group** (`col_process_group`): the `row_size` ranks that share a column, fused into a single collective. Concatenates their $`K_i / V_i`$ → every member holds $`[B, S/\text{col\_size}, H, D]`$. Q is untouched.
 
 So **Q expands by `col_size`** (a row holds `col_size` ranks → $`S/\text{row\_size}`$) and **K/V expand by `row_size`** (a column holds `row_size` ranks → $`S/\text{col\_size}`$); on a symmetric $\sqrt{P} \times \sqrt{P}$ mesh both land at $S/\sqrt{P}$. The picture below uses a $2 \times 3$ grid (`row_size=2, col_size=3`, $P=6$), with $S$ split into shards $0..5$:
 
@@ -204,7 +204,7 @@ Members of a **row (Q) group** end up with identical Q but **disjoint** K/V slic
 | :---- | :---- | :---- |
 | **Q communication** | None. All required Q tokens  available locally. | $O(N / \sqrt{P})$ data all-gathered among `col_size` ranks within a row group |
 | **K/V communication** | $O(N)$ data exchanged among all $P$ ranks in a P2P fashion | $O(N / \sqrt{P})$ data all-gathered among `row_size` ranks within a column group |
-| **Partials** | $P$ blocks, one per ring step, each against a rotating K/V shard | $`N = \text{col\_size}`$ partials from the row (Q) group, each over a disjoint slice of K/V |
+| **Partials** | $P$ blocks, one per ring step, each against a rotating K/V shard | `col_size` partials from the row (Q) group, each over a disjoint slice of K/V |
 | **Merge schedule** | **Streaming** — merge after every FA4 step, in-place on the local rank (`sigmoid` / `logsigmoid` recurrence) | **Batch** — one FA4 pass, then a single `flash_attn_combine` after the row `all_to_all` |
 | **Merge communication** | None (all local) | One **`all_to_all`** of size $O(N / \sqrt{P})$ on output+LSE within the row group (fixed collectives, no per-hop wait tail) |
 | **Attention passes** | $P$ partial FA4 kernels | **1** FA4 kernel per rank |
