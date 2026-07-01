@@ -15,35 +15,35 @@
 """Gemma 4 12B *Unified* (encoder-free multimodal) — PyTorch backend.
 
 Gemma 4 12B ships as the family's "unified" / encoder-free member: HF
-``architectures = ["Gemma4UnifiedForConditionalGeneration"]``, ``model_type =
-"gemma4_unified"``. Unlike the standard Gemma 4 VLMs (26B/31B) it has **no**
+`architectures = ["Gemma4UnifiedForConditionalGeneration"]`, `model_type =
+"gemma4_unified"`. Unlike the standard Gemma 4 VLMs (26B/31B) it has **no**
 vision/audio encoder *towers* — raw pixel patches and audio waveform frames are
 projected directly into the LM embedding space through lightweight linear
 pipelines:
 
-* **vision** (``model.vision_embedder.*`` + ``model.embed_vision.*``):
-  ``LayerNorm -> Dense(6912->3840) -> LayerNorm`` + factorized 2D positional
-  embedding ``(mm_posemb_size, 2, mm_embed_dim)`` ``-> LayerNorm`` ``->``
-  ``RMSNorm(no-scale) -> Linear`` into the LM hidden space.
-* **audio** (``model.embed_audio.*``): ``RMSNorm(no-scale) -> Linear(640->3840)``.
+* **vision** (`model.vision_embedder.*` + `model.embed_vision.*`):
+  `LayerNorm -> Dense(6912->3840) -> LayerNorm` + factorized 2D positional
+  embedding `(mm_posemb_size, 2, mm_embed_dim)` `-> LayerNorm` `->`
+  `RMSNorm(no-scale) -> Linear` into the LM hidden space.
+* **audio** (`model.embed_audio.*`): `RMSNorm(no-scale) -> Linear(640->3840)`.
 
 The text backbone is a plain dense Gemma 4 text model nested under
-``config.text_config`` (already fully supported by :class:`Gemma4ForCausalLM`:
-per-layer head_dim 256/512, interleaved VSWA, ``k_eq_v`` MQA on global layers,
-``layer_scalar``, final-logit softcap, tied embeddings). 12B has PLE and
-KV-sharing **off** (``hidden_size_per_layer_input=0``, ``num_kv_shared_layers=0``).
+`config.text_config` (already fully supported by :class:`Gemma4ForCausalLM`:
+per-layer head_dim 256/512, interleaved VSWA, `k_eq_v` MQA on global layers,
+`layer_scalar`, final-logit softcap, tied embeddings). 12B has PLE and
+KV-sharing **off** (`hidden_size_per_layer_input=0`, `num_kv_shared_layers=0`).
 
 This module reuses the existing Gemma 4 multimodal wrapper
 (:class:`Gemma4ForConditionalGeneration`) for all engine plumbing
-(``post_config`` / ``get_sub_model_config`` / ``infer_max_seq_len`` /
-``vocab_size_padded`` / ``get_model_defaults``), and reuses
+(`post_config` / `get_sub_model_config` / `infer_max_seq_len` /
+`vocab_size_padded` / `get_model_defaults`), and reuses
 :class:`Gemma4MultimodalEmbedder` (audio) and :class:`Gemma4InputProcessor`
-(HF ``AutoProcessor`` resolves to ``Gemma4UnifiedProcessor``; the output dict
-keys match). It overrides ``__init__`` / ``forward`` / ``_get_image_features`` /
-``_get_audio_features`` / ``load_weights`` to drop the encoder towers and use the
+(HF `AutoProcessor` resolves to `Gemma4UnifiedProcessor`; the output dict
+keys match). It overrides `__init__` / `forward` / `_get_image_features` /
+`_get_audio_features` / `load_weights` to drop the encoder towers and use the
 encoder-free projections instead.
 
-Note: this file does NOT pin or bump transformers. The new ``gemma4_unified``
+Note: this file does NOT pin or bump transformers. The new `gemma4_unified`
 config class requires a recent transformers (>=5.10) — that is a user/runtime
 install, never a TRT-LLM repo change.
 """
@@ -83,19 +83,26 @@ _LANG_PREFIX = "model.language_model."
 class Gemma4UnifiedVisionEmbedder(nn.Module):
     """Encoder-free vision projection (no ViT tower).
 
-    Mirrors HF ``Gemma4UnifiedVisionEmbedder``: each merged pixel patch (raw
-    ``48*48*3 = 6912`` channels) is normalized, densely projected to the model
+    Mirrors HF `Gemma4UnifiedVisionEmbedder`: each merged pixel patch (raw
+    `48*48*3 = 6912` channels) is normalized, densely projected to the model
     embedding dim, gets a factorized 2D positional embedding added, is
     re-normalized, then projected into the LM hidden space by the shared
-    ``Gemma4MultimodalEmbedder`` (RMSNorm-no-scale -> Linear).
+    `Gemma4MultimodalEmbedder` (RMSNorm-no-scale -> Linear).
     """
 
     def __init__(self, vision_config, text_config, dtype=torch.bfloat16, mapping=None):
         super().__init__()
-        model_patch = vision_config.patch_size * vision_config.pooling_kernel_size  # 16*3 = 48
-        patch_dim = model_patch * model_patch * 3  # 48^2 * 3 = 6912
-        mm_embed_dim = vision_config.mm_embed_dim  # 3840
-        proj_in = getattr(vision_config, "output_proj_dims", mm_embed_dim)  # 3840
+        # Dims come from vision_config; only the "* 3" (RGB channels) is a literal.
+        merged_patch_size = (
+            vision_config.patch_size * vision_config.pooling_kernel_size
+        )  # merged pixel-patch side length
+        patch_dim = (
+            merged_patch_size * merged_patch_size * 3
+        )  # flattened raw-pixel patch: side^2 * 3 RGB channels
+        mm_embed_dim = vision_config.mm_embed_dim  # multimodal embedding width
+        projector_input_dim = (
+            vision_config.output_proj_dims
+        )  # projector input width (HF: multimodal_hidden_size)
 
         self.patch_ln1 = LayerNorm(hidden_size=patch_dim, eps=_VISION_LN_EPS, dtype=dtype)
         self.patch_dense = Linear(
@@ -109,10 +116,12 @@ class Gemma4UnifiedVisionEmbedder(nn.Module):
         self.pos_embedding = nn.Parameter(
             torch.zeros(vision_config.mm_posemb_size, 2, mm_embed_dim, dtype=dtype)
         )
+        # Cache the [0, 1] axis index instead of rebuilding it every forward.
+        self.register_buffer("axis_index", torch.arange(2), persistent=False)
         self.pos_norm = LayerNorm(hidden_size=mm_embed_dim, eps=_VISION_LN_EPS, dtype=dtype)
         # Final projection into LM hidden space (RMSNorm-no-scale -> Linear).
         self.multimodal_embedder = Gemma4MultimodalEmbedder(
-            mm_hidden_size=proj_in,
+            mm_hidden_size=projector_input_dim,
             text_hidden_size=text_config.hidden_size,
             eps=vision_config.rms_norm_eps,
             dtype=dtype,
@@ -121,51 +130,51 @@ class Gemma4UnifiedVisionEmbedder(nn.Module):
 
     @torch.inference_mode()
     def forward(self, pixel_values: torch.Tensor, image_position_ids: torch.Tensor) -> torch.Tensor:
-        h = pixel_values.to(self.patch_dense.weight.dtype)  # (B, P, 6912)
-        h = self.patch_ln1(h)
-        h = self.patch_dense(h)  # (B, P, 3840)
-        h = self.patch_ln2(h)
+        hidden_states = pixel_values.to(self.patch_dense.weight.dtype)  # (B, P, patch_dim)
+        hidden_states = self.patch_ln1(hidden_states)
+        hidden_states = self.patch_dense(hidden_states)  # (B, P, mm_embed_dim)
+        hidden_states = self.patch_ln2(hidden_states)
         # Factorized 2D positional embedding: pos_embedding[idx, axis] summed
         # over the two axes; padding positions (-1) contribute zero.
-        clamped = image_position_ids.clamp(min=0).long()  # (B, P, 2)
-        valid = (image_position_ids != -1).to(self.pos_embedding.dtype).unsqueeze(-1)  # (B,P,2,1)
-        axes = torch.arange(2, device=clamped.device)
-        pos = (self.pos_embedding[clamped, axes] * valid).sum(dim=-2)  # (B, P, 3840)
-        h = h + pos
-        h = self.pos_norm(h)
-        h = self.multimodal_embedder(h)  # (B, P, H_text)
-        return h
+        clamped_position_ids = image_position_ids.clamp(min=0).long()  # (B, P, 2)
+        valid = (
+            (image_position_ids != -1).to(self.pos_embedding.dtype).unsqueeze(-1)
+        )  # (B, P, 2, 1)
+        position_embeds = (self.pos_embedding[clamped_position_ids, self.axis_index] * valid).sum(
+            dim=-2
+        )  # (B, P, mm_embed_dim)
+        hidden_states = hidden_states + position_embeds
+        hidden_states = self.pos_norm(hidden_states)
+        hidden_states = self.multimodal_embedder(hidden_states)  # (B, P, H_text)
+        return hidden_states
 
-    def load_weights(self, embedder_weights: Dict, proj_weights: Dict):
-        def _cp(param, key):
-            w = embedder_weights.get(key)
-            if w is not None:
-                param.data.copy_(w)
-
-        _cp(self.patch_ln1.weight, "patch_ln1.weight")
-        _cp(self.patch_ln1.bias, "patch_ln1.bias")
-        _cp(self.patch_dense.weight, "patch_dense.weight")
-        _cp(self.patch_dense.bias, "patch_dense.bias")
-        _cp(self.patch_ln2.weight, "patch_ln2.weight")
-        _cp(self.patch_ln2.bias, "patch_ln2.bias")
-        _cp(self.pos_embedding, "pos_embedding")
-        _cp(self.pos_norm.weight, "pos_norm.weight")
-        _cp(self.pos_norm.bias, "pos_norm.bias")
+    def load_weights(self, embedder_weights: Dict, projector_weights: Dict):
+        # A valid checkpoint has all of these, so a missing key raises (fail loud)
+        # rather than being silently skipped.
+        self.patch_ln1.weight.data.copy_(embedder_weights["patch_ln1.weight"])
+        self.patch_ln1.bias.data.copy_(embedder_weights["patch_ln1.bias"])
+        self.patch_dense.weight.data.copy_(embedder_weights["patch_dense.weight"])
+        self.patch_dense.bias.data.copy_(embedder_weights["patch_dense.bias"])
+        self.patch_ln2.weight.data.copy_(embedder_weights["patch_ln2.weight"])
+        self.patch_ln2.bias.data.copy_(embedder_weights["patch_ln2.bias"])
+        self.pos_embedding.data.copy_(embedder_weights["pos_embedding"])
+        self.pos_norm.weight.data.copy_(embedder_weights["pos_norm.weight"])
+        self.pos_norm.bias.data.copy_(embedder_weights["pos_norm.bias"])
         # CRITICAL: the final vision projector lives at the TOP-LEVEL checkpoint
-        # key ``model.embed_vision.embedding_projection.weight`` (not nested under
-        # ``model.vision_embedder.*``). Route it explicitly.
-        self.multimodal_embedder.load_weights(proj_weights)
+        # key `model.embed_vision.embedding_projection.weight` (not nested under
+        # `model.vision_embedder.*`). Route it explicitly.
+        self.multimodal_embedder.load_weights(projector_weights)
 
 
 class Gemma4UnifiedInputProcessor(Gemma4InputProcessor):
     """Input processor for Gemma 4 12B Unified.
 
-    Identical to :class:`Gemma4InputProcessor`: HF ``AutoProcessor`` resolves to
-    ``Gemma4UnifiedProcessor`` (encoder-free image patches + raw audio frames),
-    whose output dict keys (``pixel_values`` / ``image_position_ids`` /
-    ``input_features`` / ``input_features_mask``) match what the base processor
-    already produces. ``mm_bidirectional_blocks`` auto-derives to True from
-    ``text_config.use_bidirectional_attention == "vision"``.
+    Identical to :class:`Gemma4InputProcessor`: HF `AutoProcessor` resolves to
+    `Gemma4UnifiedProcessor` (encoder-free image patches + raw audio frames),
+    whose output dict keys (`pixel_values` / `image_position_ids` /
+    `input_features` / `input_features_mask`) match what the base processor
+    already produces. `mm_bidirectional_blocks` auto-derives to True from
+    `text_config.use_bidirectional_attention == "vision"`.
     """
 
 
@@ -195,48 +204,55 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
         # *towers* the unified architecture does not have) and init the HF base.
         PreTrainedModel.__init__(self, config)
 
-        _local_rank = getattr(getattr(model_config, "mapping", None), "local_rank", 0) or 0
-        self._device = f"cuda:{_local_rank}"
+        # ModelConfig always has `mapping`, and Mapping always has `local_rank`.
+        local_rank = model_config.mapping.local_rank
+        self._device = f"cuda:{local_rank}"
         self.model_dtype = getattr(config, "torch_dtype", torch.bfloat16)
         self._top_config = config
+        # HF always defines these token ids (each may be None if that modality is absent).
         self.image_token_ids = (
             torch.tensor([config.image_token_id], dtype=torch.int32, device=self._device)
-            if getattr(config, "image_token_id", None) is not None
+            if config.image_token_id is not None
             else None
         )
         self.audio_token_ids = (
             torch.tensor([config.audio_token_id], dtype=torch.int32, device=self._device)
-            if getattr(config, "audio_token_id", None) is not None
+            if config.audio_token_id is not None
             else None
         )
         self.video_token_ids = (
             torch.tensor([config.video_token_id], dtype=torch.int32, device=self._device)
-            if getattr(config, "video_token_id", None) is not None
+            if config.video_token_id is not None
             else None
         )
 
         # --- Text backbone (reused verbatim) ---
         model_config_cp = copy.deepcopy(model_config)
         self.model_config = model_config_cp
-        # Mirror the parent's quant exclude_modules HF->TRT remap so quantized
-        # unified checkpoints (e.g. *-qat-w4a16) exclude the right text modules.
-        qc = getattr(model_config_cp, "quant_config", None)
-        if qc and getattr(qc, "exclude_modules", None):
+        # Mirror the parent's quant exclude_modules remap so quantized unified
+        # checkpoints exclude the right text modules.
+        quant_config = model_config_cp.quant_config
+        if quant_config.exclude_modules:
             remapped = []
-            for pat in qc.exclude_modules:
-                remapped.append(pat)
-                if pat.startswith(_LANG_PREFIX):
-                    remapped.append(pat.replace(_LANG_PREFIX, "model."))
-            qc.exclude_modules = remapped
+            for pattern in quant_config.exclude_modules:
+                remapped.append(pattern)
+                if pattern.startswith(_LANG_PREFIX):
+                    # Strip only the leading prefix, not any later occurrence.
+                    remapped.append("model." + pattern[len(_LANG_PREFIX) :])
+            quant_config.exclude_modules = remapped
         llm_model_config = self.get_sub_model_config(model_config_cp, "text_config")
         self.llm = Gemma4ForCausalLM(llm_model_config)
 
         # --- Encoder-free multimodal front-end (no towers) ---
-        self.vision_tower = None  # kept so weight-mapper's hasattr(...) is stable
+        self.vision_tower = (
+            None  # kept so the weight mapper's hasattr(self, "vision_tower") returns True
+        )
         self.audio_tower = None
         self.embed_vision = None
         self.embed_audio = None
-        if getattr(config, "vision_config", None) is not None:
+        # vision_config / audio_config are optional sub-configs (HF sets them to
+        # None when a modality is absent), so build each embedder only if present.
+        if config.vision_config is not None:
             self.embed_vision = (
                 Gemma4UnifiedVisionEmbedder(
                     config.vision_config,
@@ -247,15 +263,13 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
                 .eval()
                 .to(self._device)
             )
-        if getattr(config, "audio_config", None) is not None:
-            audio_in = (
-                getattr(config.audio_config, "output_proj_dims", None)
-                or getattr(config.audio_config, "audio_embed_dim", None)
-                or config.audio_config.hidden_size
-            )
+        if config.audio_config is not None:
+            # HF's shared multimodal embedder reads output_proj_dims for both
+            # modalities; for audio it aliases audio_embed_dim (the raw frame width).
+            audio_input_dim = config.audio_config.output_proj_dims
             self.embed_audio = (
                 Gemma4MultimodalEmbedder(
-                    mm_hidden_size=audio_in,
+                    mm_hidden_size=audio_input_dim,
                     text_hidden_size=config.text_config.hidden_size,
                     eps=config.audio_config.rms_norm_eps,
                     dtype=self.model_dtype,
@@ -266,7 +280,7 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
             )
 
         # Surface the text (LLM) config so KV-cache sizing + is_gemma4_hybrid
-        # (global_head_dim 512 != head_dim 256) read the text geometry.
+        # (global head dim differs from the per-layer head dim) read the text geometry.
         self.post_config()
         self.is_loaded = True
 
@@ -275,24 +289,25 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
     @torch.inference_mode()
     def _get_image_features(self, pixel_values, image_position_ids=None, image_seq_lens=None):
         with torch.autocast(device_type="cuda", dtype=self.model_dtype):
-            feats = self.embed_vision(pixel_values, image_position_ids)  # (B, P, H)
+            features = self.embed_vision(pixel_values, image_position_ids)  # (B, P, H)
         if image_position_ids is not None:
-            pad_mask = (image_position_ids == -1).all(dim=-1)  # (B, P)
-            feats = feats[~pad_mask]  # (N_valid, H)
+            # -1 marks a padding patch (pads a variable-size image); drop those rows.
+            padding_mask = (image_position_ids == -1).all(dim=-1)  # (B, P); True = padding patch
+            features = features[~padding_mask]  # keep only real patches -> (N_valid, H)
         else:
-            feats = feats.reshape(-1, feats.shape[-1])
-        return feats.contiguous()
+            features = features.reshape(-1, features.shape[-1])
+        return features.contiguous()
 
     @torch.inference_mode()
     def _get_audio_features(self, audio_features, audio_features_mask=None):
         target_dtype = self.embed_audio.embedding_projection.weight.dtype
         with torch.autocast(device_type="cuda", dtype=self.model_dtype):
-            feats = self.embed_audio(audio_features.to(target_dtype))  # (B, T, H) or (T, H)
+            features = self.embed_audio(audio_features.to(target_dtype))  # (B, T, H) or (T, H)
         if audio_features_mask is not None:
-            feats = feats[audio_features_mask.bool()]
+            features = features[audio_features_mask.bool()]
         else:
-            feats = feats.reshape(-1, feats.shape[-1])
-        return feats.contiguous()
+            features = features.reshape(-1, features.shape[-1])
+        return features.contiguous()
 
     @property
     def multimodal_data_device_paths(self) -> List[str]:
@@ -317,54 +332,62 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
     ) -> torch.Tensor:
         multimodal_params = kwargs.get("multimodal_params", [])
 
-        pixel_values_list, image_pos_list = [], []
+        pixel_values_list, image_position_ids_list = [], []
         audio_features_list, audio_mask_list = [], []
-        video_pixel_list, video_pos_list = [], []
-        for mp in multimodal_params:
-            img = mp.multimodal_data.get("image", {})
-            if img.get("pixel_values") is not None:
-                pixel_values_list.append(img["pixel_values"])
-                if img.get("image_position_ids") is not None:
-                    image_pos_list.append(img["image_position_ids"])
-            aud = mp.multimodal_data.get("audio", {})
-            if aud.get("audio_features") is not None:
-                audio_features_list.append(aud["audio_features"])
-                if aud.get("audio_features_mask") is not None:
-                    audio_mask_list.append(aud["audio_features_mask"])
-            vid = mp.multimodal_data.get("video", {})
-            if vid.get("pixel_values") is not None:
-                video_pixel_list.append(vid["pixel_values"])
-                if vid.get("image_position_ids") is not None:
-                    video_pos_list.append(vid["image_position_ids"])
+        video_pixel_values_list, video_position_ids_list = [], []
+        for multimodal_param in multimodal_params:
+            image_data = multimodal_param.multimodal_data.get("image", {})
+            if image_data.get("pixel_values") is not None:
+                pixel_values_list.append(image_data["pixel_values"])
+                if image_data.get("image_position_ids") is not None:
+                    image_position_ids_list.append(image_data["image_position_ids"])
+            audio_data = multimodal_param.multimodal_data.get("audio", {})
+            if audio_data.get("audio_features") is not None:
+                audio_features_list.append(audio_data["audio_features"])
+                if audio_data.get("audio_features_mask") is not None:
+                    audio_mask_list.append(audio_data["audio_features_mask"])
+            video_data = multimodal_param.multimodal_data.get("video", {})
+            if video_data.get("pixel_values") is not None:
+                video_pixel_values_list.append(video_data["pixel_values"])
+                if video_data.get("image_position_ids") is not None:
+                    video_position_ids_list.append(video_data["image_position_ids"])
 
         mm_embeds: List[torch.Tensor] = []
         all_mm_token_ids: List[torch.Tensor] = []
         mm_token_type_ids = None
 
         if len(pixel_values_list) > 0 and self.embed_vision is not None:
-            pv = torch.cat(pixel_values_list)
-            pid = (
-                torch.cat(image_pos_list) if len(image_pos_list) == len(pixel_values_list) else None
+            pixel_values = torch.cat(pixel_values_list)
+            image_position_ids = (
+                torch.cat(image_position_ids_list)
+                if len(image_position_ids_list) == len(pixel_values_list)
+                else None
             )
-            mm_embeds.append(self._get_image_features(pv, pid))
+            mm_embeds.append(self._get_image_features(pixel_values, image_position_ids))
             all_mm_token_ids.append(self.image_token_ids)
 
-        if len(video_pixel_list) > 0 and self.embed_vision is not None:
-            vpv = torch.cat(video_pixel_list)
-            vpid = (
-                torch.cat(video_pos_list) if len(video_pos_list) == len(video_pixel_list) else None
+        if len(video_pixel_values_list) > 0 and self.embed_vision is not None:
+            video_pixel_values = torch.cat(video_pixel_values_list)
+            video_position_ids = (
+                torch.cat(video_position_ids_list)
+                if len(video_position_ids_list) == len(video_pixel_values_list)
+                else None
             )
-            mm_embeds.append(self._get_image_features(vpv, vpid))
+            mm_embeds.append(self._get_image_features(video_pixel_values, video_position_ids))
             all_mm_token_ids.append(
                 self.video_token_ids if self.video_token_ids is not None else self.image_token_ids
             )
 
         if len(audio_features_list) > 0 and self.embed_audio is not None:
-            per_audio = []
-            for i, af in enumerate(audio_features_list):
-                afm = audio_mask_list[i] if i < len(audio_mask_list) else None
-                per_audio.append(self._get_audio_features(af, afm))
-            mm_embeds.append(torch.cat(per_audio, dim=0))
+            audio_features_per_clip = []
+            for clip_index, audio_feature in enumerate(audio_features_list):
+                audio_feature_mask = (
+                    audio_mask_list[clip_index] if clip_index < len(audio_mask_list) else None
+                )
+                audio_features_per_clip.append(
+                    self._get_audio_features(audio_feature, audio_feature_mask)
+                )
+            mm_embeds.append(torch.cat(audio_features_per_clip, dim=0))
             all_mm_token_ids.append(self.audio_token_ids)
 
         # Integer mm_token_type_ids (0=text,1=image,2=video,3=audio) drive the
@@ -403,26 +426,26 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
         # Text backbone: "model.language_model.X" -> "model.X" (same as the
         # parent), then load via the reused Gemma4 text core.
         llm_weights = {
-            "model." + k[len(_LANG_PREFIX) :]: v
-            for k, v in weights.items()
-            if k.startswith(_LANG_PREFIX)
+            "model." + key[len(_LANG_PREFIX) :]: value
+            for key, value in weights.items()
+            if key.startswith(_LANG_PREFIX)
         }
         self.llm.load_weights(llm_weights, weight_mapper)
 
         # Encoder-free MM front-end: strip the outer "model." from the non-text
         # keys and route to the embedders.
-        stripped = {
-            k[len("model.") :]: v
-            for k, v in weights.items()
-            if k.startswith("model.") and not k.startswith(_LANG_PREFIX)
+        stripped_weights = {
+            key[len("model.") :]: value
+            for key, value in weights.items()
+            if key.startswith("model.") and not key.startswith(_LANG_PREFIX)
         }
         if self.embed_vision is not None:
-            ve = filter_weights(
-                "vision_embedder", stripped
+            vision_embedder_weights = filter_weights(
+                "vision_embedder", stripped_weights
             )  # patch_ln1/dense/ln2/pos_embedding/pos_norm
-            proj = filter_weights(
-                "embed_vision", stripped
+            projector_weights = filter_weights(
+                "embed_vision", stripped_weights
             )  # embedding_projection.weight (top-level)
-            self.embed_vision.load_weights(ve, proj)
+            self.embed_vision.load_weights(vision_embedder_weights, projector_weights)
         if self.embed_audio is not None:
-            self.embed_audio.load_weights(filter_weights("embed_audio", stripped))
+            self.embed_audio.load_weights(filter_weights("embed_audio", stripped_weights))
