@@ -76,27 +76,29 @@ void initConfigBindings(nb::module_& m)
 
     auto schedulerConfigSetstate = [](tle::SchedulerConfig& self, nb::tuple const& state)
     {
-        if (state.size() != 3)
+        if (state.size() != 4)
         {
             throw std::runtime_error("Invalid state!");
         }
         new (&self) tle::SchedulerConfig(nb::cast<tle::CapacitySchedulerPolicy>(state[0]),
             nb::cast<std::optional<tle::ContextChunkingPolicy>>(state[1]),
-            nb::cast<std::optional<tle::DynamicBatchConfig>>(state[2]));
+            nb::cast<std::optional<tle::DynamicBatchConfig>>(state[2]), nb::cast<bool>(state[3]));
     };
     auto schedulerConfigGetstate = [](tle::SchedulerConfig const& self)
     {
-        return nb::make_tuple(
-            self.getCapacitySchedulerPolicy(), self.getContextChunkingPolicy(), self.getDynamicBatchConfig());
+        return nb::make_tuple(self.getCapacitySchedulerPolicy(), self.getContextChunkingPolicy(),
+            self.getDynamicBatchConfig(), self.getEnablePrefixAwareScheduling());
     };
     nb::class_<tle::SchedulerConfig>(m, "SchedulerConfig")
         .def(nb::init<tle::CapacitySchedulerPolicy, std::optional<tle::ContextChunkingPolicy>,
-                 std::optional<tle::DynamicBatchConfig>>(),
+                 std::optional<tle::DynamicBatchConfig>, bool>(),
             nb::arg("capacity_scheduler_policy") = tle::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT,
-            nb::arg("context_chunking_policy") = nb::none(), nb::arg("dynamic_batch_config") = nb::none())
+            nb::arg("context_chunking_policy") = nb::none(), nb::arg("dynamic_batch_config") = nb::none(),
+            nb::arg("enable_prefix_aware_scheduling") = true)
         .def_prop_ro("capacity_scheduler_policy", &tle::SchedulerConfig::getCapacitySchedulerPolicy)
         .def_prop_ro("context_chunking_policy", &tle::SchedulerConfig::getContextChunkingPolicy)
         .def_prop_ro("dynamic_batch_config", &tle::SchedulerConfig::getDynamicBatchConfig)
+        .def_prop_ro("enable_prefix_aware_scheduling", &tle::SchedulerConfig::getEnablePrefixAwareScheduling)
         .def("__getstate__", schedulerConfigGetstate)
         .def("__setstate__", schedulerConfigSetstate);
 
