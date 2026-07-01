@@ -15,6 +15,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import zmq
 
+from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.executor.ipc import ZeroMqQueue
@@ -34,6 +35,34 @@ WORKER_TIMEOUT = 2.0
 # Default cap on the size of the iteration-stats snapshot buffer used by the
 # /metrics endpoint.  Mirrors the LLM ``iter_stats_max_iterations`` default.
 _DEFAULT_ITER_STATS_MAX = 1000
+
+# Worker->client media IPC by handle: pickle+HMAC+ZMQ of the hundreds-of-MB decoded
+# video dominates the result tail; a ~1KB handle lets the client rebuild a zero-copy view.
+_VG_IPC_MEDIA_FIELDS = ("image", "video", "audio")
+
+
+def _output_media_to_handles(output: PipelineOutput) -> None:
+    """Producer: replace PipelineOutput media tensors with handle dicts, in place."""
+    for field in _VG_IPC_MEDIA_FIELDS:
+        t = getattr(output, field, None)
+        if isinstance(t, torch.Tensor):
+            setattr(output, field, SharedTensorContainer.from_tensor(t).dump_to_dict())
+
+
+def _restore_output_media(response: "DiffusionResponse") -> None:
+    """Client: restore media tensors from handle dicts, in place.
+
+    ``clone()`` materializes a client-owned copy so the producer's block is
+    released via the shared-tensor refcount instead of staying pinned.
+    """
+    output = response.output
+    if not isinstance(output, PipelineOutput):
+        return
+    for field in _VG_IPC_MEDIA_FIELDS:
+        v = getattr(output, field, None)
+        if isinstance(v, dict) and "method_key" in v:
+            view = SharedTensorContainer.from_dict(v).get_local_view()
+            setattr(output, field, view.clone())
 
 
 class _IterationStatsTracker:
@@ -435,6 +464,7 @@ class DiffusionExecutor:
             output = self.pipeline.infer(req)
             generation = time.perf_counter() - generation_start  # seconds
             if self.rank == 0:
+                _output_media_to_handles(output)
                 self.response_queue.put(
                     DiffusionResponse(
                         request_id=req.request_id,
@@ -812,6 +842,8 @@ class DiffusionRemoteClient:
                 if isinstance(response, DiffusionResponse):
                     if response.request_id == -1:
                         logger.info("DiffusionClient: Received READY signal")
+
+                    _restore_output_media(response)
 
                     # Schedule the lock acquisition and event setting in the event loop
                     asyncio.run_coroutine_threadsafe(
