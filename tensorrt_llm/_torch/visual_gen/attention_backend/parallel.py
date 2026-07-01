@@ -289,22 +289,14 @@ class UlyssesAttention(AttentionBackend):
         compile region for additional inductor fusion."""
         P = self.world_size
 
-        # Issue order tunes which push overlaps which compute. self-attn: V->Q->K
-        # (V is cheapest to compute, so its push hides behind the Q+K computes).
-        # Cross-attn (v2a, Q=small audio, K/V=large video): Q->K->V issues the small
-        # audio-Q first so the comm pipeline starts before the large video K/V GEMMs,
-        # which then overlap the in-flight pushes. Order is correctness-neutral
-        # (_join_async syncs all recv bufs before the post step).
-        if issue_order == ("q", "k", "v"):
-            q_5d = self._issue_async(compute_q())
-            k_5d = self._issue_async(compute_k())
-            v_5d = self._issue_async(compute_v())
-        else:
-            v_5d = self._issue_async(compute_v())
-            q_5d = self._issue_async(compute_q())
-            k_5d = self._issue_async(compute_k())
-
+        # Issue the closures in issue_order. Order is correctness-neutral (_join_async
+        # syncs all recv bufs); it only tunes which push overlaps which compute.
+        computes = {"q": compute_q, "k": compute_k, "v": compute_v}
+        recv = {}
+        for name in issue_order:
+            recv[name] = self._issue_async(computes[name]())
         self._join_async()
+        q_5d, k_5d, v_5d = recv["q"], recv["k"], recv["v"]
 
         # Fast path: one fused kernel replaces the eager post-A2A chain
         # (6 ops for HND target: permute+reshape+contig + transpose+contig
@@ -312,15 +304,12 @@ class UlyssesAttention(AttentionBackend):
         # only instantiated for __nv_bfloat16.
         _, B_q, Sp_q, HpP_q, D_q = q_5d.shape
         is_hnd = self.inner_backend.preferred_layout == AttentionTensorLayout.HND
-        # The 3-in-1 fused unscatter requires identical Q/K/V shape (self-attn MHA).
-        # Cross-attn (Q=audio seq ≠ K/V=video seq) → per-tensor unscatter + distinct seq_len_kv.
-        shapes_match = q_5d.shape == k_5d.shape == v_5d.shape
-        use_fused_post_unscatter = q_5d.dtype == torch.bfloat16 and shapes_match
+        use_fused_post_unscatter = q_5d.dtype == torch.bfloat16
         if use_fused_post_unscatter:
             q_out, k_out, v_out = _ulysses_post_unscatter(q_5d, k_5d, v_5d, is_hnd=is_hnd)
             B = B_q
             seq_len_full = P * Sp_q
-            seq_len_kv_full = seq_len_full
+            seq_len_kv_full = P * k_5d.shape[2]  # cross-attn: K/V seq (Sp_k) differs from Q
         else:
             v_out = post_permute_5d_to_4d(v_5d, P)
             q_out = post_permute_5d_to_4d(q_5d, P)

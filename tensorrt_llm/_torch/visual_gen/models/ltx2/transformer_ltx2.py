@@ -113,13 +113,8 @@ class LTX2Attention(Attention):
         self.rope_type = rope_type
         self._is_cross_attn = context_dim is not None
 
-        # Async ulysses opt-in: V/Q/K GEMMs interleave with the all-to-all on a
-        # side stream. Forces SEPARATE_QKV so the 3 projections issue independently.
-        # Gated per-attn on enable_sequence_parallel + async_ulysses: only attns that
-        # pass async_ulysses=True opt in (video self-attn and v2a). audio_attn1 is
-        # enable_sequence_parallel=True but does NOT pass async_ulysses -- it needs
-        # key_padding_mask (audio is padded), which forward_async has no param for --
-        # so it stays on the sync path.
+        # Async-Ulysses opt-in: interleaves the Q/K/V GEMMs with the all-to-all on a side
+        # stream. Gated on enable_sequence_parallel + async_ulysses + ulysses_size > 1.
         self._use_async_ulysses = bool(
             enable_sequence_parallel and async_ulysses and vgm is not None and vgm.ulysses_size > 1
         )
@@ -471,13 +466,9 @@ class LTX2Attention(Attention):
         value-preserving). Issue order: self-attn V->Q->K, cross-attn Q->K->V
         (issue the small audio-Q first; see ``UlyssesAttention.forward_async``).
 
-        Structurally mirrors base ``Attention.forward_async`` (fused/unfused
-        branches) but uses LTX-2's ``apply_rotary_emb`` (with ``rope_type``) on
-        the unfused fallback and injects gated-attention scaling in 4D before
-        ``to_out``. Returns 3D ``[B, S_q, H*D]`` (Q seq), matching ``forward``.
-
-        Precondition: caller gates on ``_use_async_ulysses`` +
-        ``hasattr(self.attn, "forward_async")``.
+        Injects LTX-2 gated-attention scaling in 4D before ``to_out``; returns
+        3D ``[B, S_q, H*D]`` (Q seq). Precondition: caller gates on
+        ``_use_async_ulysses`` + ``hasattr(self.attn, "forward_async")``.
         """
         self_attn = kv_input is None
         if self_attn:
@@ -661,13 +652,9 @@ class BasicAVTransformerBlock(nn.Module):
         self.scale_shift_table = nn.Parameter(torch.empty(6, cfg.dim))
 
     def _init_audio_modules(self, cfg, rope_type, eps, model_config, idx):
-        # Audio under Ulysses needs key_padding_mask support on audio_attn1
-        # (audio is padded to be divisible by ulysses_size; mask zeros pad
-        # slots). TRTLLM self-attn silently drops key_padding_mask, so downgrade
-        # to VANILLA whenever Ulysses is active under a TRTLLM backend config.
-        # Mirrors the existing cross-attn TRTLLM→VANILLA fallback
-        # (modules/attention.py); audio is small (T_a ~ 126) so the downgrade
-        # is negligible.
+        # audio_attn1 needs key_padding_mask (audio is padded to divide ulysses_size; the
+        # mask zeros pad slots), but TRTLLM self-attn silently drops it — so downgrade to
+        # VANILLA when Ulysses is active under a TRTLLM backend.
         audio_self_config = model_config
         vgm = model_config.visual_gen_mapping
         ulysses_size = vgm.ulysses_size if vgm is not None else 1
@@ -1169,10 +1156,9 @@ class BasicAVTransformerBlock(nn.Module):
             if run_v2a and not skip_v2a:
                 if self._async_ulysses and self.video_to_audio_attn.is_ulysses_active():
                     # Async-Ulysses v2a: compute Q(audio)/K/V(video) inside the async
-                    # driver so the video K/V GEMMs overlap the a2a (replaces the
-                    # project_kv pre-projection). RoPE-on-K stays on the local shard
-                    # (value-preserving). No key_padding_mask — video K/V unpadded;
-                    # padded audio Q stripped on exit by LTXModel.forward.
+                    # driver so the video K/V GEMMs overlap the a2a. RoPE-on-K on the local
+                    # shard is value-preserving; no key_padding_mask (video K/V unpadded,
+                    # padded audio Q stripped on exit by LTXModel.forward).
                     v2a_attn_raw = self.video_to_audio_attn.forward_async(
                         q_input=ax_scaled_v2a,
                         freqs=audio.cross_positional_embeddings,
@@ -1181,17 +1167,12 @@ class BasicAVTransformerBlock(nn.Module):
                         timestep=audio.timesteps,
                     )
                 else:
-                    # v2a sync: when the Ulysses wrapper is active, K/V (video, large)
-                    # stay seq-sharded and the wrapper handles Q + K|V + output
-                    # a2a internally. RoPE is applied to K in project_kv on the
-                    # local shard (commutes with a2a along the seq dim, so
-                    # rotate-before-gather is value-preserving). No
-                    # key_padding_mask — video K/V is unpadded; padded audio Q is
-                    # stripped on exit by LTXModel.forward. When inactive (no
-                    # wrapper built, Stage 2 disable, or audio not sharded), fall
-                    # back to AG so the plain backend sees full K/V. Gate on
-                    # is_ulysses_active() — _audio_is_sharded can be true under
-                    # Attention2D where no wrapper was built.
+                    # v2a sync: with the Ulysses wrapper active, K/V (video) stay
+                    # seq-sharded and the wrapper does the Q + K|V + output a2a; RoPE-on-K
+                    # in project_kv commutes with the seq-dim a2a (value-preserving). When
+                    # inactive, all-gather so the plain backend sees full K/V — gate on
+                    # is_ulysses_active(), since _audio_is_sharded can be true under
+                    # Attention2D where no wrapper exists.
                     k_v2a, v_v2a = self.video_to_audio_attn.project_kv(
                         vx_scaled_v2a, pe=video.cross_positional_embeddings
                     )
