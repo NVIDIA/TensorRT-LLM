@@ -1008,12 +1008,7 @@ class PyTorchModelEngine(ModelEngine):
         # Reset the global cuda graph dummy requests in warmup.
         self.cuda_graph_runner.padding_dummy_requests = {}
 
-        if self._is_encoder_decoder_model():
-            AutoTuner.get()
-            with self.cuda_graph_runner.allow_capture():
-                self._run_cuda_graph_warmup(resource_manager)
-            return
-
+        is_enc_dec = self._is_encoder_decoder_model()
         if self.mapping.cp_size > 1:
             cp_type = self.mapping.cp_config.get("cp_type", None)
             if cp_type != CpType.HELIX:
@@ -1028,11 +1023,12 @@ class PyTorchModelEngine(ModelEngine):
         AutoTuner.get()
 
         can_run_general_warmup = (
-            not self.is_draft_model and not self.mapping.has_cp_helix()
-            and self.guided_decoder is None
+            not is_enc_dec and not self.is_draft_model
+            and not self.mapping.has_cp_helix() and self.guided_decoder is None
             and not isinstance(kv_cache_manager, MambaHybridCacheManager))
 
-        self._run_attention_warmup(resource_manager, can_run_general_warmup)
+        if not is_enc_dec:
+            self._run_attention_warmup(resource_manager, can_run_general_warmup)
 
         if can_run_general_warmup:
             # Specialize torch.compile graphs across the key input shapes before CUDA graph capture.
@@ -1051,7 +1047,7 @@ class PyTorchModelEngine(ModelEngine):
                 torch.cuda.empty_cache()
         # Autotuner warmup uses context-only requests. Helix CP
         # is decode-only and runs into issues with autotuner warmup.
-        if not self.mapping.has_cp_helix():
+        if not is_enc_dec and not self.mapping.has_cp_helix():
             self._run_autotuner_warmup(resource_manager)
             # Release the autotuner's exploration-mode intermediates. The
             # exploration leftovers are pure waste that hide tens of GiB from
@@ -1400,6 +1396,62 @@ class PyTorchModelEngine(ModelEngine):
         else:
             max_seq_len_list = [effective_max_seq_len]
 
+        def prepare_cross_batch(batch: ScheduledRequests,
+                                resource_manager: ResourceManager) -> None:
+            if not batch.generation_requests:
+                return
+
+            max_encoder_output_len = self._get_max_encoder_output_len(
+                resource_manager)
+            hidden_size = self._get_enc_dec_hidden_size()
+            saved_request_state = []
+            for request in batch.generation_requests:
+                saved_request_state.append(
+                    (request, request.py_encoder_output,
+                     request.py_skip_cross_kv_projection, request.state,
+                     request.py_batch_idx, request._cached_tokens,
+                     request._cached_tokens_set))
+                request.py_encoder_output = torch.ones(
+                    (max_encoder_output_len, hidden_size),
+                    device="cuda",
+                    dtype=self.dtype)
+                request.py_skip_cross_kv_projection = False
+                request.state = LlmRequestState.CONTEXT_INIT
+                request.context_current_position = 0
+                request.context_chunk_size = 1
+
+            projection_batch = ScheduledRequests()
+            projection_batch.reset_context_requests(batch.generation_requests)
+            kv_cache_manager = resource_manager.get_resource_manager(
+                self.kv_cache_manager_key)
+            draft_kv_cache_manager = self._get_draft_kv_cache_manager(
+                resource_manager)
+            attn_metadata = self._set_up_attn_metadata(kv_cache_manager,
+                                                       draft_kv_cache_manager)
+            with self.no_cuda_graph():
+                projection_inputs, _ = self._prepare_inputs(
+                    projection_batch,
+                    kv_cache_manager,
+                    attn_metadata,
+                    spec_metadata=None,
+                    new_tensors_device=None,
+                    resource_manager=resource_manager,
+                    maybe_graph=False)
+                self._project_enc_dec_warmup_cross_kv(projection_inputs)
+            torch.cuda.synchronize()
+
+            for (request, encoder_output, skip_cross_kv_projection, state,
+                 batch_idx, cached_tokens,
+                 cached_tokens_set) in saved_request_state:
+                request.py_encoder_output = encoder_output
+                request.py_skip_cross_kv_projection = skip_cross_kv_projection
+                request.state = state
+                if state == LlmRequestState.GENERATION_IN_PROGRESS:
+                    request.context_current_position = request.prompt_len
+                request.py_batch_idx = batch_idx
+                request._cached_tokens = cached_tokens
+                request._cached_tokens_set = cached_tokens_set
+
         def _run_capture_pass(force_non_greedy: bool, label: str) -> None:
             spec_metadata = self.spec_metadata
             if force_non_greedy and spec_metadata is not None:
@@ -1434,8 +1486,7 @@ class PyTorchModelEngine(ModelEngine):
                                 batch, draft_len > 0, resource_manager)
                             self.runtime_draft_len = draft_len
                             if self._is_encoder_decoder_model():
-                                self._prepare_decoder_cuda_graph_warmup_batch_for_encoder_decoder_model(
-                                    batch, resource_manager)
+                                prepare_cross_batch(batch, resource_manager)
                             self.forward(batch,
                                          new_tensors_device=None,
                                          resource_manager=resource_manager)
@@ -1709,26 +1760,24 @@ class PyTorchModelEngine(ModelEngine):
 
         result = ScheduledRequests()
         num_extra_decoding_steps = self._get_num_extra_decoding_steps()
-        is_encoder_decoder = self._is_encoder_decoder_model()
-        dummy_encoder_output_len = (
-            self._get_encoder_decoder_dummy_encoder_output_len(resource_manager)
-            if is_encoder_decoder else None)
+        is_enc_dec = self._is_encoder_decoder_model()
+        max_encoder_output_len = (
+            self._get_max_encoder_output_len(resource_manager)
+            if is_enc_dec else None)
 
         # Add (batch_size - 1) dummy requests with seq_len=1.
-        short_token_nums = ([2] *
-                            (batch_size - 1)) if is_encoder_decoder else None
-        short_encoder_output_lens = (
-            [dummy_encoder_output_len] *
-            (batch_size - 1)) if is_encoder_decoder else None
+        token_nums = ([2] * (batch_size - 1)) if is_enc_dec else None
+        encoder_output_lens = ([max_encoder_output_len] *
+                               (batch_size - 1)) if is_enc_dec else None
         requests = kv_cache_manager.add_dummy_requests(
             list(range(batch_size - 1)),
-            token_nums=short_token_nums,
+            token_nums=token_nums,
             is_gen=True,
             max_num_draft_tokens=draft_len,
             kv_reserve_draft_tokens=self.max_draft_loop_tokens,
             use_mrope=self.use_mrope,
             max_beam_width=self.max_beam_width,
-            encoder_output_lens=short_encoder_output_lens,
+            encoder_output_lens=encoder_output_lens,
             num_extra_decoding_steps=num_extra_decoding_steps,
             draft_kv_cache_manager=draft_kv_cache_manager)
 
@@ -1763,7 +1812,7 @@ class PyTorchModelEngine(ModelEngine):
             available_tokens = min(available_tokens, draft_available_tokens)
 
         token_num = max(
-            2 if is_encoder_decoder else 1,
+            2 if is_enc_dec else 1,
             min(
                 available_tokens, max_seq_len - 1 -
                 get_num_extra_kv_tokens(self.spec_config) - _kv_draft))
@@ -1788,8 +1837,8 @@ class PyTorchModelEngine(ModelEngine):
             kv_reserve_draft_tokens=self.max_draft_loop_tokens,
             use_mrope=self.use_mrope,
             max_beam_width=self.max_beam_width,
-            encoder_output_lens=[dummy_encoder_output_len]
-            if is_encoder_decoder else None,
+            encoder_output_lens=[max_encoder_output_len]
+            if is_enc_dec else None,
             num_extra_decoding_steps=num_extra_decoding_steps,
             draft_kv_cache_manager=draft_kv_cache_manager)
 
@@ -1806,19 +1855,13 @@ class PyTorchModelEngine(ModelEngine):
             spec_resource_manager.add_dummy_requests(
                 request_ids=list(range(batch_size)))
         if self._is_encoder_decoder_model():
-            if not self._allocate_encoder_decoder_dummy_cross_kv(
-                    result.generation_requests, resource_manager):
-                for request in result.generation_requests:
-                    kv_cache_manager.free_resources(request)
-                    if draft_kv_cache_manager is not None:
-                        draft_kv_cache_manager.free_resources(request)
-                    if spec_resource_manager is not None:
-                        spec_resource_manager.free_resources(request)
+            if not self._add_cross_dummy_requests(result.generation_requests,
+                                                  resource_manager):
                 return None
         return result
 
-    def _get_encoder_decoder_dummy_encoder_output_len(
-            self, resource_manager: ResourceManager) -> int:
+    def _get_max_encoder_output_len(self,
+                                    resource_manager: ResourceManager) -> int:
         cross_kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.CROSS_KV_CACHE_MANAGER)
         max_encoder_output_len = int(self.max_seq_len)
@@ -1830,9 +1873,8 @@ class PyTorchModelEngine(ModelEngine):
                             max_encoder_output_len)))
         return max(1, max_encoder_output_len)
 
-    def _allocate_encoder_decoder_dummy_cross_kv(
-            self, requests: List[LlmRequest],
-            resource_manager: ResourceManager) -> bool:
+    def _add_cross_dummy_requests(self, requests: List[LlmRequest],
+                                  resource_manager: ResourceManager) -> bool:
         if not requests:
             return True
         cross_kv_cache_manager = resource_manager.get_resource_manager(
@@ -1841,80 +1883,37 @@ class PyTorchModelEngine(ModelEngine):
             raise RuntimeError("Encoder-decoder CUDA graph warmup requires "
                                "ResourceManagerType.CROSS_KV_CACHE_MANAGER.")
 
-        encoder_output_len = self._get_encoder_decoder_dummy_encoder_output_len(
+        max_encoder_output_len = self._get_max_encoder_output_len(
             resource_manager)
         for request in requests:
             request.py_encoder_output = None
             request.py_skip_cross_kv_projection = True
 
-        encoder_output_lens = [encoder_output_len] * len(requests)
+        encoder_output_lens = [max_encoder_output_len] * len(requests)
         cross_dummy_requests = cross_kv_cache_manager.add_dummy_requests(
             request_ids=[request.py_request_id for request in requests],
             token_nums=encoder_output_lens,
             is_gen=True,
             max_beam_width=1,
             encoder_output_lens=encoder_output_lens)
-        return cross_dummy_requests is not None
+        if cross_dummy_requests is not None:
+            return True
 
-    def _prepare_decoder_cuda_graph_warmup_batch_for_encoder_decoder_model(
-            self, batch: ScheduledRequests,
-            resource_manager: ResourceManager) -> None:
-        if not batch.generation_requests:
-            return
-
-        encoder_output_len = self._get_encoder_decoder_dummy_encoder_output_len(
-            resource_manager)
-        hidden_size = self._get_encoder_decoder_hidden_size()
-        saved_request_state = []
-        for request in batch.generation_requests:
-            saved_request_state.append(
-                (request, request.py_encoder_output,
-                 request.py_skip_cross_kv_projection, request.state,
-                 request.py_batch_idx, request._cached_tokens,
-                 request._cached_tokens_set))
-            request.py_encoder_output = torch.ones(
-                (encoder_output_len, hidden_size),
-                device="cuda",
-                dtype=self.dtype)
-            request.py_skip_cross_kv_projection = False
-            request.state = LlmRequestState.CONTEXT_INIT
-            request.context_current_position = 0
-            request.context_chunk_size = 1
-
-        projection_batch = ScheduledRequests()
-        projection_batch.reset_context_requests(batch.generation_requests)
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(
             resource_manager)
-        attn_metadata = self._set_up_attn_metadata(kv_cache_manager,
-                                                   draft_kv_cache_manager)
-        with self.no_cuda_graph():
-            projection_inputs, _ = self._prepare_inputs(
-                projection_batch,
-                kv_cache_manager,
-                attn_metadata,
-                spec_metadata=None,
-                new_tensors_device=None,
-                resource_manager=resource_manager,
-                maybe_graph=False)
-            self._project_encoder_decoder_warmup_cross_kv(projection_inputs)
-        torch.cuda.synchronize()
+        spec_resource_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.SPEC_RESOURCE_MANAGER)
+        for request in requests:
+            kv_cache_manager.free_resources(request)
+            if draft_kv_cache_manager is not None:
+                draft_kv_cache_manager.free_resources(request)
+            if spec_resource_manager is not None:
+                spec_resource_manager.free_resources(request)
+        return False
 
-        for (request, encoder_output, skip_cross_kv_projection, state,
-             batch_idx, cached_tokens,
-             cached_tokens_set) in saved_request_state:
-            request.py_encoder_output = encoder_output
-            request.py_skip_cross_kv_projection = skip_cross_kv_projection
-            request.state = state
-            if state == LlmRequestState.GENERATION_IN_PROGRESS:
-                request.context_current_position = request.prompt_len
-            request.py_batch_idx = batch_idx
-            request._cached_tokens = cached_tokens
-            request._cached_tokens_set = cached_tokens_set
-
-    def _project_encoder_decoder_warmup_cross_kv(
-            self, inputs: Dict[str, Any]) -> None:
+    def _project_enc_dec_warmup_cross_kv(self, inputs: Dict[str, Any]) -> None:
         encoder_hidden_states = inputs.get("encoder_hidden_states")
         cross_attn_metadata = inputs.get("cross_attn_metadata")
         if encoder_hidden_states is None or cross_attn_metadata is None:
@@ -1928,7 +1927,7 @@ class PyTorchModelEngine(ModelEngine):
 
         attn_metadata = inputs["attn_metadata"]
         hidden_states = torch.ones(
-            (attn_metadata.num_tokens, self._get_encoder_decoder_hidden_size()),
+            (attn_metadata.num_tokens, self._get_enc_dec_hidden_size()),
             device=encoder_hidden_states.device,
             dtype=encoder_hidden_states.dtype)
         for layer in layers:
@@ -1943,7 +1942,7 @@ class PyTorchModelEngine(ModelEngine):
                        cross_attn_metadata=cross_attn_metadata,
                        skip_cross_kv_projection=False)
 
-    def _get_encoder_decoder_hidden_size(self) -> int:
+    def _get_enc_dec_hidden_size(self) -> int:
         config = self.model.model_config.pretrained_config
         hidden_size = getattr(config, "hidden_size", None)
         if hidden_size is None:
@@ -2496,7 +2495,7 @@ class PyTorchModelEngine(ModelEngine):
             return position_ids
         return [position_id + offset for position_id in position_ids]
 
-    def _prepare_encoder_decoder_cross_attention_inputs(
+    def _prepare_enc_dec_cross_attn_inputs(
         self,
         encoder_hidden_states: List[torch.Tensor],
         encoder_seq_lens: List[int],
@@ -3106,7 +3105,7 @@ class PyTorchModelEngine(ModelEngine):
         # requests, whose outputs are discarded.
         mrope_dummy_seq_slot = self.max_num_tokens * self.mapping.pp_size
         num_accepted_draft_tokens = []  # per request
-        is_encoder_decoder = self._is_encoder_decoder_model()
+        is_enc_dec = self._is_encoder_decoder_model()
         cross_encoder_hidden_states: List[torch.Tensor] = []
         cross_encoder_seq_lens: List[int] = [
         ]  # new encoder K/V tokens per decoder sequence
@@ -3131,7 +3130,7 @@ class PyTorchModelEngine(ModelEngine):
         def append_cross_attention_state(request: LlmRequest,
                                          project_encoder_output: bool,
                                          repeat: int = 1) -> None:
-            if not is_encoder_decoder:
+            if not is_enc_dec:
                 return
 
             encoder_output_len = int(request.encoder_output_len)
@@ -3960,14 +3959,13 @@ class PyTorchModelEngine(ModelEngine):
         if hasattr(self.model.model_config.pretrained_config, 'chunk_size'):
             attn_metadata.mamba_chunk_size = self.model.model_config.pretrained_config.chunk_size
         attn_metadata.prepare()
-        cross_attention_inputs = (
-            self._prepare_encoder_decoder_cross_attention_inputs(
-                cross_encoder_hidden_states,
-                cross_encoder_seq_lens,
-                cross_encoder_cached_tokens_per_seq,
-                attn_metadata,
-                resource_manager,
-            ) if is_encoder_decoder else {})
+        cross_attention_inputs = (self._prepare_enc_dec_cross_attn_inputs(
+            cross_encoder_hidden_states,
+            cross_encoder_seq_lens,
+            cross_encoder_cached_tokens_per_seq,
+            attn_metadata,
+            resource_manager,
+        ) if is_enc_dec else {})
 
         peft_cache_manager = resource_manager and resource_manager.get_resource_manager(
             ResourceManagerType.PEFT_CACHE_MANAGER)

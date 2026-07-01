@@ -23,7 +23,7 @@ from ..speculative.interface import SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import get_draft_kv_cache_manager
 from ..utils import make_weak_ref, piecewise_cuda_graph
-from .llm_request import get_draft_token_length
+from .llm_request import LlmRequest, get_draft_token_length
 from .resource_manager import (BaseResourceManager, ResourceManager,
                                ResourceManagerType)
 from .sampler import SampleStateTensors
@@ -115,7 +115,7 @@ class CUDAGraphRunner:
                                  Callable[[], Optional[torch.Tensor]]] = {}
         self.graph_metadata: Dict[KeyType, Dict[str, Any]] = {}
         self.memory_pool = config.cuda_graph_mem_pool
-        self.padding_dummy_requests: Dict[int, Any] = {}
+        self.padding_dummy_requests: Dict[int, LlmRequest] = {}
         self.dynamic_draft_len_mapping = config.dynamic_draft_len_mapping
 
         self.shared_static_tensors: Dict[str, torch.Tensor] = {}
@@ -552,12 +552,9 @@ class CUDAGraphRunner:
                 dummy_request = dummy_request[0]
             dummy_request.is_cuda_graph_dummy = True
             if self.is_encoder_decoder:
-                if not self._prepare_encoder_decoder_padding_dummy(
+                if not self._add_cross_dummy_request(
                         dummy_request, resource_manager,
-                        dummy_encoder_output_len):
-                    kv_cache_manager.free_resources(dummy_request)
-                    if draft_kv_cache_manager is not None:
-                        draft_kv_cache_manager.free_resources(dummy_request)
+                        dummy_encoder_output_len, draft_kv_cache_manager):
                     return 0
 
             spec_res_mgr = resource_manager.get_resource_manager(
@@ -570,9 +567,10 @@ class CUDAGraphRunner:
         batch.generation_requests.extend([padding_dummy_request] * padding_size)
         return padding_size
 
-    def _prepare_encoder_decoder_padding_dummy(
-            self, dummy_request: Any, resource_manager: ResourceManager,
-            encoder_output_len: int) -> bool:
+    def _add_cross_dummy_request(
+            self, dummy_request: LlmRequest, resource_manager: ResourceManager,
+            encoder_output_len: int,
+            draft_kv_cache_manager: Optional[BaseResourceManager]) -> bool:
         cross_kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.CROSS_KV_CACHE_MANAGER)
         if cross_kv_cache_manager is None:
@@ -588,7 +586,15 @@ class CUDAGraphRunner:
             is_gen=True,
             max_beam_width=self.config.max_beam_width,
             encoder_output_lens=encoder_output_lens)
-        return cross_dummy_requests is not None
+        if cross_dummy_requests is not None:
+            return True
+
+        kv_cache_manager = resource_manager.get_resource_manager(
+            self.config.kv_cache_manager_key)
+        kv_cache_manager.free_resources(dummy_request)
+        if draft_kv_cache_manager is not None:
+            draft_kv_cache_manager.free_resources(dummy_request)
+        return False
 
     @staticmethod
     def _get_padding_dummy_encoder_output_len(

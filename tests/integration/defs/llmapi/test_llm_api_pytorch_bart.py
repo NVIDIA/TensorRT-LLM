@@ -122,7 +122,7 @@ _TEST_CASES = [
         enable_cuda_graph=False,
         num_beams=1,
         num_return_sequences=1,
-        exact_match=False,
+        exact_match=True,
         feature_id="fp16-kv-v1-cuda-graph-off-greedy",
     ),
     _test_case(
@@ -272,14 +272,6 @@ def _assert_decoder_cuda_graphs_captured(llm: LLM) -> None:
     assert not model_engine.encoder_cuda_graph_runner.graphs
     assert model_engine.cuda_graph_runner.enabled
     assert model_engine.cuda_graph_runner.graphs
-
-
-def _enable_trtllm_gen_attention(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "1")
-
-    from tensorrt_llm._torch.attention_backend import trtllm
-
-    monkeypatch.setattr(trtllm, "_TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", True)
 
 
 def _assert_bart_response(
