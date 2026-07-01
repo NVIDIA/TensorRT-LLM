@@ -455,6 +455,7 @@ class _KVCache:
         slots: Sequence[Slot],
         src_level: CacheLevel,
         dst_level: CacheLevel,
+        copy_free: bool = False,
     ) -> None:
         if not self._should_record_stats():
             return
@@ -469,7 +470,9 @@ class _KVCache:
             iteration_stats = KVCacheIterationStatsDelta()
             if src_level == GPU_LEVEL and dst_level > GPU_LEVEL:
                 iteration_stats.iter_offload_blocks = 1
-                iteration_stats.iter_offload_bytes = page_size
+                # Inclusive host cache: an eviction that reused a retained clean shadow performs no
+                # device->host copy, so it costs zero offload bytes (the win we are after).
+                iteration_stats.iter_offload_bytes = 0 if copy_free else page_size
             elif dst_level == GPU_LEVEL:
                 stats.alloc_total_blocks = 1
                 stats.alloc_new_blocks = 1

@@ -2662,6 +2662,8 @@ class KVCacheManagerV2(BaseResourceManager):
             cache_tiers=cache_tiers,
             max_util_for_resume=kv_cache_config.max_util_for_resume,
             enable_stats=self.enable_stats,
+            enable_inclusive_host_cache=kv_cache_config.
+            enable_inclusive_host_cache,
             swa_scratch_reuse=scratch_reuse_config,
             initial_pool_ratio=kv_cache_config.pool_ratio,
             layers=[

@@ -249,6 +249,7 @@ def create_config(
     sink_tokens: int,
     kv_buf_size: int = 8192,
     block_quant_buf_size: int | None = None,
+    enable_inclusive_host_cache: bool = False,
 ) -> KVCacheManagerConfig:
     layer_buffers = [
         BufferConfig(role=Role.KEY, size=kv_buf_size),
@@ -283,6 +284,7 @@ def create_config(
             )
             for layer_id in typed_range(LayerId(num_layers))
         ],
+        enable_inclusive_host_cache=enable_inclusive_host_cache,
     )
 
 
@@ -322,6 +324,7 @@ class TestKVCacheManagerV2(unittest.TestCase):
         tokens_per_block: int = 32,
         kv_buf_size: int = 8192,
         block_quant_buf_size: int | None = None,
+        enable_inclusive_host_cache: bool = False,
     ):
         self.cfg = create_config(
             tokens_per_block,
@@ -333,6 +336,7 @@ class TestKVCacheManagerV2(unittest.TestCase):
             sink_tokens,
             kv_buf_size,
             block_quant_buf_size,
+            enable_inclusive_host_cache,
         )
         self.engine = FakeEngine(self.cfg)
         self.manager = KVCacheManager(self.cfg)
@@ -590,6 +594,96 @@ class TestNoBatching(TestKVCacheManagerV2):
         commit_for(None)
         self.assertGreater(num_reused(None), 0)
         self.assertGreater(num_reused(default_scope), 0)
+
+    def _sum_offload(self) -> tuple[int, int]:
+        """Drain accumulated iteration stats, returning (offload_blocks, offload_bytes)."""
+        per_lc = self.manager.get_and_reset_iteration_stats()
+        blocks = sum(s.iter_offload_blocks for s in per_lc.values())
+        nbytes = sum(s.iter_offload_bytes for s in per_lc.values())
+        return blocks, nbytes
+
+    def _bounce_hot_prefix(self, enable_inclusive_host_cache: bool) -> tuple[int, int]:
+        """Bounce a hot suspended request's pages GPU<->host repeatedly under memory pressure.
+
+        Returns cumulative (offload_blocks, offload_bytes) observed across all bounce cycles. With
+        the inclusive host cache enabled, immutable pages recalled to GPU retain a clean host
+        shadow, so subsequent evictions reuse it and report zero offload bytes — the win we assert.
+        """
+        # ~22 full-attention blocks fit in 32MiB (see test_sol_mem_utilization for the sizing).
+        self.prepare(
+            32 << 20,
+            32 << 20,
+            0,
+            36,
+            128,
+            1,
+            kv_buf_size=32768,
+            enable_inclusive_host_cache=enable_inclusive_host_cache,
+        )
+        max_seq_len = 32 * 22
+        seq_len = max_seq_len
+
+        # A "hot" request whose committed (immutable) pages we will bounce GPU<->host.
+        hot = self.new_request(0, None, 256, seq_len - 256)
+        with TemporaryCudaStream([]) as s:
+            stream = cast(CudaStream, s.handle)
+            assert hot.kv_cache.resume(stream)
+            # refcheck=True writes a deterministic pattern into the hot pages so we can verify the
+            # data survives the GPU<->host bounce (including shadow reuse) intact later on.
+            self.run_request(hot, 32, True)
+            hot_history = list(hot.kv_cache._committed_tokens)
+        s.take_finish_event()
+        hot.kv_cache.suspend()
+        # Discard stats produced while warming up the hot request.
+        self._sum_offload()
+
+        offload_blocks = 0
+        offload_bytes = 0
+        num_cycles = 4
+        for cycle in range(num_cycles):
+            # A filler request consumes the GPU pool, forcing the suspended hot pages out to host.
+            filler = self.new_request(100 + cycle, None, 256, seq_len - 256)
+            with TemporaryCudaStream([]) as s:
+                stream = cast(CudaStream, s.handle)
+                assert filler.kv_cache.resume(stream)
+                self.run_request(filler, 1, False)
+            s.take_finish_event()
+            filler.kv_cache.close()
+            b, n = self._sum_offload()
+            offload_blocks += b
+            offload_bytes += n
+
+            # Recall the hot pages back to GPU, verifying their data is intact, then suspend again
+            # so the next cycle re-evicts them.
+            with TemporaryCudaStream([]) as s:
+                stream = cast(CudaStream, s.handle)
+                assert hot.kv_cache.resume(stream)
+                self.engine.execute([Step(hot.kv_cache, [], hot_history)], stream)
+            s.take_finish_event()
+            hot.kv_cache.suspend()
+            # Onboarding (host->GPU) is not an offload; ignore those stats here.
+            self._sum_offload()
+
+        hot.kv_cache.close()
+        return offload_blocks, offload_bytes
+
+    def test_inclusive_host_cache_eliminates_redundant_d2h(self) -> None:
+        # Baseline: exclusive paging re-writes immutable pages to host on every eviction.
+        excl_blocks, excl_bytes = self._bounce_hot_prefix(enable_inclusive_host_cache=False)
+        self.manager.shutdown()
+        del self.manager
+
+        # Inclusive host cache: retained clean shadows let later evictions skip the D2H copy.
+        incl_blocks, incl_bytes = self._bounce_hot_prefix(enable_inclusive_host_cache=True)
+
+        # The same number of pages are accounted as offloaded in both modes (same eviction events)...
+        self.assertGreater(excl_blocks, 0)
+        self.assertEqual(incl_blocks, excl_blocks)
+        # ...but the inclusive mode transfers far fewer bytes because reused shadows cost zero D2H.
+        self.assertLess(incl_bytes, excl_bytes)
+        # After the first eviction populates shadows, the remaining cycles should be copy-free, so
+        # the inclusive byte count is at most roughly one cycle's worth of the exclusive total.
+        self.assertLessEqual(incl_bytes, excl_bytes // 2)
 
     @parameterized.expand(list(itertools.product([False, True], repeat=3)))
     # @assert_no_ref_cycle

@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import TYPE_CHECKING, Callable, Iterator, Sequence, cast
 
+from llist import dllist
+
 from . import rawref
 from ._common import (
     GPU_LEVEL,
@@ -171,7 +173,9 @@ class StorageStatistics:
         return self.total - self.available
 
 
-MigrationRecorder = Callable[[Sequence[Page], Sequence[Slot], CacheLevel, CacheLevel], None]
+# copy_free=True means the migration moved data without an actual cross-tier copy (it reused a
+# retained clean shadow slot), so transfer-byte stats should not be charged for it.
+MigrationRecorder = Callable[[Sequence[Page], Sequence[Slot], CacheLevel, CacheLevel, bool], None]
 # Invoked when pages at the last cache level are released to free their slots
 # without being migrated to any further tier (i.e. dropped from the cache hierarchy).
 DropRecorder = Callable[[Sequence[Page], CacheLevel], None]
@@ -191,6 +195,14 @@ class KVCacheMetrics:
         self._onboard_bytes = [0] * num_pool_groups
         self._host_dropped_blocks = [0] * num_pool_groups
         self._host_dropped_bytes = [0] * num_pool_groups
+        # Inclusive host cache instrumentation:
+        #  - shadow_attach: immutable pages recalled to GPU whose clean host copy was RETAINED as a
+        #    shadow (candidates for a future copy-free eviction).
+        #  - shadow_reuse: evictions that reused a retained shadow and skipped the D2H copy (the win).
+        #  - shadow_reclaim: shadows dropped under host pressure (a forfeited future D2H saving).
+        self._shadow_attach = [0] * num_pool_groups
+        self._shadow_reuse = [0] * num_pool_groups
+        self._shadow_reclaim = [0] * num_pool_groups
 
     def record_offload(self, pg_idx: int, num_blocks: int, bytes_per_block: int) -> None:
         with self._lock:
@@ -207,6 +219,18 @@ class KVCacheMetrics:
             self._host_dropped_blocks[pg_idx] += num_blocks
             self._host_dropped_bytes[pg_idx] += num_blocks * bytes_per_block
 
+    def record_shadow_attach(self, pg_idx: int, num_blocks: int) -> None:
+        with self._lock:
+            self._shadow_attach[pg_idx] += num_blocks
+
+    def record_shadow_reuse(self, pg_idx: int, num_blocks: int) -> None:
+        with self._lock:
+            self._shadow_reuse[pg_idx] += num_blocks
+
+    def record_shadow_reclaim(self, pg_idx: int, num_blocks: int) -> None:
+        with self._lock:
+            self._shadow_reclaim[pg_idx] += num_blocks
+
     def snapshot_and_reset(self) -> list[dict[str, int]]:
         with self._lock:
             result = []
@@ -218,6 +242,9 @@ class KVCacheMetrics:
                     "onboard_bytes": self._onboard_bytes[i],
                     "host_dropped_blocks": self._host_dropped_blocks[i],
                     "host_dropped_bytes": self._host_dropped_bytes[i],
+                    "shadow_attach": self._shadow_attach[i],
+                    "shadow_reuse": self._shadow_reuse[i],
+                    "shadow_reclaim": self._shadow_reclaim[i],
                 })
                 self._offload_blocks[i] = 0
                 self._offload_bytes[i] = 0
@@ -225,6 +252,9 @@ class KVCacheMetrics:
                 self._onboard_bytes[i] = 0
                 self._host_dropped_blocks[i] = 0
                 self._host_dropped_bytes[i] = 0
+                self._shadow_attach[i] = 0
+                self._shadow_reuse[i] = 0
+                self._shadow_reclaim[i] = 0
             return result
 
 
@@ -242,6 +272,8 @@ class StorageManager:
         "_min_slots",
         "_event_manager",
         "_execution_stream",
+        "_enable_inclusive_host_cache",
+        "_shadow_reclaim",
         "__rawref__",
         "_metrics",
         "_metrics_interval",
@@ -259,6 +291,11 @@ class StorageManager:
     _min_slots: TypedIndexList[PoolGroupIndex, int]
     _event_manager: "KVCacheEventManager | None"
     _execution_stream: CudaStream | None
+    _enable_inclusive_host_cache: bool
+    # Per-(cache level, pool group) FIFO of pages holding a clean host shadow at that level.
+    # Used to reclaim shadow slots (oldest first) under memory pressure. Only populated when
+    # _enable_inclusive_host_cache is True.
+    _shadow_reclaim: "TypedIndexList[CacheLevel, TypedIndexList[PoolGroupIndex, dllist]]"
     __rawref__: rawref.ref["StorageManager"]
 
     def __init__(
@@ -271,10 +308,12 @@ class StorageManager:
         constraints: list[BatchDesc] | None = None,
         initial_pool_ratio: list[float] | None = None,
         event_manager: "KVCacheEventManager | None" = None,
+        enable_inclusive_host_cache: bool = False,
     ) -> None:
         self.__rawref__ = rawref.NULL
         self._event_manager = event_manager
         self._execution_stream: CudaStream | None = None
+        self._enable_inclusive_host_cache = enable_inclusive_host_cache
         assert config.cache_tiers[GPU_LEVEL].tier == CacheTier.GPU_MEM, (
             "The first cache tier must be GPU memory"
         )
@@ -350,6 +389,18 @@ class StorageManager:
         assert self.num_pool_groups == get_uniform_attribute(
             self._levels, lambda level: level.storage.num_pool_groups
         )
+        # One reclaim FIFO per (cache level, pool group). Only lower-than-GPU levels are ever
+        # populated, but we allocate for all levels to keep indexing uniform.
+        self._shadow_reclaim = cast(
+            TypedIndexList,
+            [
+                cast(
+                    TypedIndexList,
+                    [dllist() for _ in typed_range(self.num_pool_groups)],
+                )
+                for _ in typed_range(num_levels)
+            ],
+        )
 
         self._metrics = KVCacheMetrics(int(self.num_pool_groups))
         self._metrics_interval = float(os.environ.get("TRTLLM_KV_METRICS_INTERVAL_S", "30"))
@@ -364,6 +415,12 @@ class StorageManager:
             self._metrics_timer_stop.set()
         if self.__rawref__.is_valid:
             self.__rawref__.invalidate()
+            # Reclaim any outstanding clean shadows so their slots return to the pools before the
+            # allocators are torn down (which assert all slots are freed).
+            if self._enable_inclusive_host_cache:
+                for lvl in typed_range(self.num_cache_levels):
+                    for pg_idx in typed_range(self.num_pool_groups):
+                        self._reclaim_shadows(lvl, pg_idx, self._num_shadow_slots(lvl, pg_idx))
             for lvl in self._levels:
                 lvl.storage.destroy()
 
@@ -387,6 +444,9 @@ class StorageManager:
                 f" onboard_bytes={snap['onboard_bytes']}"
                 f" dropped_blocks={snap['host_dropped_blocks']}"
                 f" dropped_bytes={snap['host_dropped_bytes']}"
+                f" shadow_attach={snap['shadow_attach']}"
+                f" shadow_reuse={snap['shadow_reuse']}"
+                f" shadow_reclaim={snap['shadow_reclaim']}"
             ]
             for lvl_id in typed_range(self.num_cache_levels):
                 level_name = "gpu" if lvl_id == GPU_LEVEL else f"level{int(lvl_id)}"
@@ -567,6 +627,16 @@ class StorageManager:
             fallen = len(fallen_pages[pg_idx])
             old_free_cnt = storage.get_num_free_slots(pg_idx)
             evictable_cnt = ctrl.num_evictable_pages(pg_idx)
+            # Inclusive host cache: clean shadows occupy slots at this level but are reclaimable for
+            # free (the authoritative copy lives on the GPU page). When free + evictable real pages
+            # cannot produce the slots this level must yield (goal to remain free + fallen pages to
+            # place), reclaim shadows oldest-first to cover the shortfall before evicting/raising.
+            shadow_cnt = self._num_shadow_slots(lvl_id, pg_idx)
+            if shadow_cnt > 0:
+                deficit = (goal + fallen) - (old_free_cnt + evictable_cnt)
+                if deficit > 0:
+                    self._reclaim_shadows(lvl_id, pg_idx, min(deficit, shadow_cnt))
+                    old_free_cnt = storage.get_num_free_slots(pg_idx)
             num_to_evict[pg_idx] = max(0, min(goal + fallen - old_free_cnt, evictable_cnt))
             fallen_held_cnt = 0  # fallen held pages we must accept in the current level.
             if self.is_last_level(lvl_id):
@@ -662,6 +732,36 @@ class StorageManager:
                     self._levels[dst_lvl].controller.schedule_for_eviction(p)
         return
 
+    def _is_inclusive_recall(
+        self, page: Page, src_level: CacheLevel, dst_level: CacheLevel
+    ) -> bool:
+        """A migration that should retain the source slot as a clean host shadow.
+
+        True only for the inclusive-host-cache fast path: a committed (immutable) page being
+        recalled from a lower tier toward GPU. The retained source slot becomes the page's shadow.
+        """
+        return (
+            self._enable_inclusive_host_cache
+            and dst_level < src_level
+            and isinstance(page, CommittedPage)
+            and page.shadow_slot is None
+        )
+
+    def _shadow_reuse_slot(
+        self, page: Page, src_level: CacheLevel, dst_level: CacheLevel
+    ) -> "Slot | None":
+        """Return the page's retained shadow slot if it can satisfy this GPU->host eviction.
+
+        When a committed page that holds a clean shadow at exactly dst_level is evicted back down,
+        the shadow already mirrors the (immutable) GPU contents, so we can rebind to it and skip
+        the device->host copy entirely. Returns the detached shadow slot, or None if not applicable.
+        """
+        if not self._enable_inclusive_host_cache or not isinstance(page, CommittedPage):
+            return None
+        if page.shadow_slot is None or page.shadow_level != dst_level or dst_level <= src_level:
+            return None
+        return self._detach_shadow(page)
+
     def _batched_migrate(
         self,
         pool_group_index: PoolGroupIndex,
@@ -676,11 +776,33 @@ class StorageManager:
         assert defrag or dst_level != src_level, (
             "dst_level and src_level must be different unless performing defragmentation"
         )
-        num_slots = len(src_pages)
         num_pools = self.num_pools(pool_group_index)
         src_pool_group = self._pool_group(src_level, pool_group_index)
         dst_pool_group = self._pool_group(dst_level, pool_group_index)
+
+        # Inclusive host cache: a committed page being evicted back to the level that already holds
+        # its clean shadow needs neither a fresh dst slot nor a D2H copy — it simply rebinds to the
+        # shadow. Partition those out before allocating/copying. `reused_shadow` parallels src_pages
+        # (the detached shadow slot, or None). reused_shadow stays all-None unless update_src.
+        reused_shadow: list["Slot | None"] = [None] * len(src_pages)
+        copy_pages: list[Page] = []
+        if update_src and not defrag:
+            for i, src in enumerate(src_pages):
+                shadow = self._shadow_reuse_slot(src, src_level, dst_level)
+                if shadow is not None:
+                    reused_shadow[i] = shadow
+                else:
+                    copy_pages.append(src)
+        else:
+            copy_pages = list(src_pages)
+
+        num_slots = len(copy_pages)
         if dst_pool_group.num_free_slots < num_slots:
+            # Roll back any shadow detaches we performed for this batch.
+            for i, shadow in enumerate(reused_shadow):
+                if shadow is not None:
+                    self._levels[dst_level].storage.release(pool_group_index, shadow)
+                    reused_shadow[i] = None
             raise OutOfPagesError("Not enough free slots")
         dst_slots = dst_pool_group.allocate_multiple(num_slots)
         try:
@@ -697,7 +819,7 @@ class StorageManager:
             tasks_per_pool: TypedIndexList[PoolIndex, list[CopyTask]] = make_typed(
                 lambda _: list[CopyTask](), num_pools
             )
-            for src, dst in zip(src_pages, dst_slots):
+            for src, dst in zip(copy_pages, dst_slots):
                 assert defrag or src.node_ref is None
                 prior_events.update((dst.ready_event, src.ready_event))
                 dst_addresses = dst_pool_group.slot_address(dst.slot_id)
@@ -708,11 +830,16 @@ class StorageManager:
                     )
             dst_tier = self._levels[dst_level].cache_tier
             src_tier = self._levels[src_level].cache_tier
-            with TemporaryCudaStream(prior_events) as stream:
-                slot_sizes = self.slot_size(pool_group_index)
-                for pool_idx, tasks in typed_enumerate(tasks_per_pool):
-                    batched_copy(dst_tier, src_tier, slot_sizes[pool_idx], tasks, stream.get())
-            finish_event = stream.take_finish_event()
+            finish_event = CachedCudaEvent.NULL
+            if num_slots > 0:
+                with TemporaryCudaStream(prior_events) as stream:
+                    slot_sizes = self.slot_size(pool_group_index)
+                    for pool_idx, tasks in typed_enumerate(tasks_per_pool):
+                        batched_copy(dst_tier, src_tier, slot_sizes[pool_idx], tasks, stream.get())
+                # take_finish_event() must run AFTER the `with` block: TemporaryCudaStream records
+                # its finish event in __exit__, so calling it inside the block returns None and
+                # raises "Expected non-None value".
+                finish_event = stream.take_finish_event()
             emit_cache_level_updates = (
                 update_src
                 and not defrag
@@ -721,8 +848,17 @@ class StorageManager:
             )
             emitted_update_keys: set[tuple[bytes, LifeCycleId]] = set()
             if migration_recorder is not None and not defrag:
-                migration_recorder(src_pages, dst_slots, src_level, dst_level)
-            for src, dst in zip(src_pages, dst_slots):
+                # Copied pages incur a real cross-tier transfer; report them with copy_free=False.
+                if copy_pages:
+                    migration_recorder(copy_pages, dst_slots, src_level, dst_level, False)
+                # Shadow-reuse pages moved to dst_level via a retained clean shadow (no copy), so
+                # report them separately with copy_free=True (zero transfer bytes).
+                shadow_pages = [src_pages[i] for i, s in enumerate(reused_shadow) if s is not None]
+                shadow_slots = [s for s in reused_shadow if s is not None]
+                if shadow_pages:
+                    migration_recorder(shadow_pages, shadow_slots, src_level, dst_level, True)
+            # Update the copied pages, rebinding each to its freshly allocated dst slot.
+            for src, dst in zip(copy_pages, dst_slots):
                 dst.ready_event = finish_event
                 src.ready_event = (
                     finish_event  # compulsory for the next owner getting this slot from the pool.
@@ -731,7 +867,21 @@ class StorageManager:
                     scheduled_for_eviction = src.scheduled_for_eviction
                     if scheduled_for_eviction:
                         self.exclude_from_eviction(src)
-                    src_pool_group.release(src)
+                    if self._is_inclusive_recall(src, src_level, dst_level):
+                        # Retain the source (host) slot as a clean shadow instead of releasing it.
+                        self._attach_shadow(cast(CommittedPage, src), src_level)
+                    else:
+                        # If this page still holds a shadow that would not sit strictly colder than
+                        # its new level (e.g. a host shadow while the page evicts to disk), the
+                        # shadow is stale — reclaim it so the strictly-below invariant holds.
+                        if (
+                            self._enable_inclusive_host_cache
+                            and isinstance(src, CommittedPage)
+                            and src.shadow_slot is not None
+                            and src.shadow_level <= dst_level
+                        ):
+                            self.drop_shadow(src)
+                        src_pool_group.release(src)
                     src.set_slot(dst)
                     src.cache_level = dst_level
                     if emit_cache_level_updates:
@@ -740,17 +890,115 @@ class StorageManager:
                         )
                     if scheduled_for_eviction:
                         self.schedule_for_eviction(src)
+            if update_src and not defrag:
+                # Rebind shadow-reuse pages to their retained shadow slots (no copy happened).
+                for i, shadow in enumerate(reused_shadow):
+                    if shadow is None:
+                        continue
+                    src = src_pages[i]
+                    scheduled_for_eviction = src.scheduled_for_eviction
+                    if scheduled_for_eviction:
+                        self.exclude_from_eviction(src)
+                    src_pool_group.release(src)
+                    src.set_slot(shadow)
+                    src.cache_level = dst_level
+                    if emit_cache_level_updates:
+                        self._emit_cache_level_updated_event(
+                            src, src_level, dst_level, emitted_update_keys
+                        )
+                    if scheduled_for_eviction:
+                        self.schedule_for_eviction(src)
             if not defrag:
+                # num_slots counts only copy_pages (shadow-reuse pages are copy-free), so the
+                # transfer-byte metrics here exclude the no-copy shadow rebinds above.
                 bytes_per_block = sum(self.slot_size(pool_group_index))
                 if dst_level > src_level:
                     self._metrics.record_offload(int(pool_group_index), num_slots, bytes_per_block)
                 else:
                     self._metrics.record_onboard(int(pool_group_index), num_slots, bytes_per_block)
+                # Copy-free evictions that reused a retained shadow (the inclusive-cache win).
+                num_shadow_reused = sum(1 for s in reused_shadow if s is not None)
+                if num_shadow_reused > 0:
+                    self._metrics.record_shadow_reuse(int(pool_group_index), num_shadow_reused)
             return None if update_src else dst_slots
         except Exception:
             for s in dst_slots:
                 dst_pool_group.release(s)
+            # Release any detached-but-not-yet-rebound shadow slots so they are not leaked.
+            for shadow in reused_shadow:
+                if shadow is not None and shadow.has_valid_slot:
+                    self._levels[dst_level].storage.release(pool_group_index, shadow)
             raise
+
+    # ------------------------------------------------------------------
+    # Inclusive host cache: clean-shadow lifecycle
+    # ------------------------------------------------------------------
+    def _attach_shadow(self, page: CommittedPage, shadow_level: CacheLevel) -> None:
+        """Retain `page`'s current source slot as a clean shadow at shadow_level.
+
+        Caller must NOT have released the source slot yet — this detaches it into the shadow and
+        registers the page in the reclaim FIFO. The page itself is being rebound to GPU by the
+        caller right after.
+        """
+        assert self._enable_inclusive_host_cache
+        assert page.shadow_slot is None and page.shadow_node is None
+        assert shadow_level > GPU_LEVEL, "Shadows only live in lower (host/disk) tiers"
+        # Move the still-valid source slot into a standalone shadow slot owned by the page.
+        page.shadow_slot = page.move_to_new_slot()
+        page.shadow_level = shadow_level
+        pg_idx = self.get_pool_group_index(page.life_cycle)
+        page.shadow_node = self._shadow_reclaim[shadow_level][pg_idx].append(page)
+        self._metrics.record_shadow_attach(int(pg_idx), 1)
+
+    def _detach_shadow(self, page: CommittedPage) -> Slot:
+        """Remove the page from the reclaim FIFO and return its detached shadow slot.
+
+        The returned slot is no longer owned by the page (shadow_slot is cleared). Caller is
+        responsible for either rebinding it to the page or releasing it back to the pool.
+        """
+        assert page.shadow_slot is not None and page.shadow_node is not None
+        pg_idx = self.get_pool_group_index(page.life_cycle)
+        self._shadow_reclaim[page.shadow_level][pg_idx].remove(page.shadow_node)
+        shadow = page.shadow_slot
+        page.shadow_slot = None
+        page.shadow_node = None
+        return shadow
+
+    def drop_shadow(self, page: CommittedPage) -> None:
+        """Reclaim a page's shadow: detach it from the FIFO and release the slot to its pool."""
+        if page.shadow_slot is None:
+            return
+        shadow_level = page.shadow_level
+        pg_idx = self.get_pool_group_index(page.life_cycle)
+        shadow = self._detach_shadow(page)
+        self._levels[shadow_level].storage.release(pg_idx, shadow)
+        self._metrics.record_shadow_reclaim(int(pg_idx), 1)
+
+    def _reclaim_shadows(self, level: CacheLevel, pg_idx: PoolGroupIndex, max_count: int) -> int:
+        """Reclaim up to max_count shadow slots (oldest first) at (level, pg_idx).
+
+        Reclaiming a clean shadow is always safe: the authoritative copy lives on the GPU page, so
+        dropping the shadow only forfeits a future D2H saving. Returns the number reclaimed.
+        """
+        if max_count <= 0:
+            return 0
+        fifo = self._shadow_reclaim[level][pg_idx]
+        storage = self._levels[level].storage
+        reclaimed = 0
+        while reclaimed < max_count and len(fifo) > 0:
+            page = cast(CommittedPage, fifo.first.value)
+            shadow = self._detach_shadow(page)
+            storage.release(pg_idx, shadow)
+            reclaimed += 1
+        if reclaimed > 0:
+            self._metrics.record_shadow_reclaim(int(pg_idx), reclaimed)
+        return reclaimed
+
+    def _num_shadow_slots(self, level: CacheLevel, pg_idx: PoolGroupIndex) -> int:
+        """Number of reclaimable shadow slots currently held at (level, pg_idx)."""
+        if not self._enable_inclusive_host_cache:
+            return 0
+        return len(self._shadow_reclaim[level][pg_idx])
 
     def _emit_cache_level_updated_event(
         self,
@@ -867,6 +1115,10 @@ class StorageManager:
         assert len(persistent_pages) <= new_num_slots and all(
             p.cache_level == level and lc2pg[p.life_cycle] == pg_idx for p in persistent_pages
         ), "Not enough slots"
+        # Clean shadows hold slots that are not tracked by the eviction queue or defrag logic, so
+        # they could occupy soon-to-be-removed overflow slot ids. Reclaiming them first is free
+        # (the authoritative copy lives on the GPU page) and keeps the shrink/defrag invariants.
+        self._reclaim_shadows(level, pg_idx, self._num_shadow_slots(level, pg_idx))
         pool_group = self._levels[level].storage._pool_groups[pg_idx]
         assert new_num_slots < pool_group.num_slots, "Not required for expansion of pools"
         allocator = pool_group._slot_allocator

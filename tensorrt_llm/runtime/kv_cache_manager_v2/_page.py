@@ -17,6 +17,8 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple, cast
 
+from llist import dllistnode
+
 from . import rawref
 from ._block_radix_tree import Block
 from ._common import (
@@ -205,6 +207,13 @@ class UncommittedPage(Page):
 class CommittedPage(Page):
     block: rawref.ref["Block"]
     __rawref__: rawref.ref["CommittedPage"]
+    # Inclusive host cache: a retained clean copy of this immutable page at a lower (host/disk)
+    # tier. When set, a later eviction of this page to shadow_level can reuse this slot and skip
+    # the device->host copy. None when no shadow is held (the default / exclusive behavior).
+    # shadow_node is this page's node in the StorageManager shadow reclaim FIFO for shadow_level.
+    shadow_slot: "Slot | None"
+    shadow_level: CacheLevel
+    shadow_node: "dllistnode | None"
 
     def is_committed(self) -> bool:
         return True
@@ -220,6 +229,9 @@ class CommittedPage(Page):
     ):
         self.block = rawref.ref(block)
         self.__rawref__ = rawref.NULL
+        self.shadow_slot = None
+        self.shadow_level = cache_level
+        self.shadow_node = None
         Page.__init__(
             self,
             None,
@@ -235,6 +247,9 @@ class CommittedPage(Page):
 
     def __del__(self) -> None:
         try:
+            # Release any retained host shadow first so its slot returns to the pool.
+            if self.shadow_slot is not None:
+                self.manager.drop_shadow(self)
             block = self.block()
             # block may be None when rebase happens, i.e. another block with the same key is committed,
             # replacing it, but the page is still used by a _KVCache.
