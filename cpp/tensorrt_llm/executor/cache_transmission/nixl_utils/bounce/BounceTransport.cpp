@@ -185,7 +185,7 @@ void BounceReceiver::onWant(std::string const& peer, BounceMsgHeader const& h, s
     // Self-bootstrap the reverse control path. The disagg metadata exchange is one-directional — the
     // KV sender loads OUR agent metadata (so it can WANT us), but we never load the sender's, so we'd
     // have no DEALER to send GRANT/ACK back and every transfer would stall to leaseTimeout. The WANT
-    // carries the sender's bounce endpoint; register it here (addPeer is idempotent). See DESIGN.md §7.
+    // carries the sender's bounce endpoint; register it here (addPeer is idempotent).
     if (!endpoint.empty())
     {
         mCtx.channel->addPeer(peer, endpoint);
@@ -229,6 +229,9 @@ void BounceReceiver::onData(std::string const& peer, BounceMsgHeader const& h, s
     job.rid = h.requestId;
     job.chunkIdx = h.chunkIdx;
     job.offset = h.regionHandle;
+    // Capture the granted region's byte size HERE (IO thread) — the scatter worker cannot query the
+    // IO-thread-only scheduler. Used to bound scatter reads to THIS flow's region (below).
+    job.regionBytes = mCtx.scheduler.regionBytes(h.regionHandle);
     job.entries = std::move(entries);
     mScattering.emplace(job.offset, false); // a worker is about to read this incoming region (not yet orphaned)
     {
@@ -365,18 +368,22 @@ void BounceReceiver::scatterWorkerLoop()
         hsrcs.resize(n);
         hdsts.resize(n);
         hsizes.resize(n);
-        // Validate every scatter SOURCE stays inside the arena before launching. bounceOffset/size
-        // come from the peer's DATA message; a buggy/hostile peer could point them outside the
-        // region/arena and make the kernel read out of bounds. (dstAddr is the caller's own KV target
-        // by design, so it isn't bounded here.) Any bad entry -> skip launch, no ACK (sender times out).
+        // Validate every scatter SOURCE stays inside THIS flow's granted region before launching.
+        // bounceOffset/size come from the peer's DATA message; a buggy/hostile peer (or a reordered
+        // GRANT) could point them past the region and, if we only bounded against the whole arena,
+        // read from an ADJACENT flow's region and copy its bytes into our KV — silent cross-flow
+        // corruption. The region is one buddy block [regionBase, regionBase+regionBytes) owned solely
+        // by this flow, so bounding to it prevents any cross-flow read. (dstAddr is the caller's own KV
+        // target by design, so it isn't bounded here.) Any bad entry -> skip launch, no ACK (sender
+        // times out). regionBytes==0 means the region wasn't allocated (stale) -> reject the whole job.
         std::uint64_t const arenaLo = mCtx.arena->baseAddr();
-        std::uint64_t const arenaHi = arenaLo + mCtx.arena->bytes();
         auto const regionBase = arenaLo + job.offset;
-        bool srcInBounds = (regionBase >= arenaLo && regionBase <= arenaHi);
+        std::uint64_t const regionHi = regionBase + job.regionBytes;
+        bool srcInBounds = (job.regionBytes > 0 && regionBase + job.regionBytes <= arenaLo + mCtx.arena->bytes());
         for (std::uint32_t i = 0; i < n; ++i)
         {
             std::uint64_t const s = regionBase + job.entries[i].bounceOffset;
-            srcInBounds = srcInBounds && s >= regionBase && s + job.entries[i].size <= arenaHi;
+            srcInBounds = srcInBounds && s >= regionBase && s + job.entries[i].size <= regionHi;
             hsrcs[i] = s;
             hdsts[i] = job.entries[i].dstAddr;
             hsizes[i] = job.entries[i].size;
@@ -493,6 +500,23 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
         }
         std::uint32_t const chunkIdx = req.nextPost;
         auto const& chunk = req.plan.chunks()[chunkIdx];
+        // Defensive pairing check BEFORE committing resources. Credits pair with chunks by FIFO order,
+        // and the receiver sizes each granted region to the chunkBytes[chunkIdx] in the WANT, so packedBytes
+        // always fits. But the control channel does NOT guarantee GRANT ordering (a reconnect can
+        // reorder messages), and a mispaired credit would make us RDMA-write packedBytes into a
+        // smaller granted region — overflowing into an adjacent flow's region on the peer (silent
+        // cross-flow corruption). Detect the mispair and abandon the flow (it then fails via
+        // checkTimeouts) rather than corrupt the peer. Mirrors the over-grant guard above.
+        if (chunk.packedBytes > req.pendingCredits.front().len)
+        {
+            TLLM_LOG_WARNING(
+                "BounceTransport(%s): rid=%llu chunk=%u packedBytes=%zu > granted region len=%u (GRANT "
+                "mispair/reorder); abandoning flow",
+                mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), chunkIdx,
+                static_cast<std::size_t>(chunk.packedBytes), static_cast<unsigned int>(req.pendingCredits.front().len));
+            req.pendingCredits.clear();
+            break;
+        }
         // Non-blocking: borrow an exec context (cheap to return), then a gather-staging region sized
         // to this chunk from the SHARED arena. If either is unavailable, leave the credit parked and
         // bail; the IO loop retries via drainPendingPosts() once an ACK frees a region / context —
@@ -607,7 +631,7 @@ bool BounceSender::drainGatherReady()
             // Gather done: NOW issue the RDMA write (postXferReq is not stream-ordered, so it was
             // correct to wait for the gather before posting). The gather has completed, so the write
             // no longer needs the gather stream's ordering — return the exec context immediately for
-            // another chunk to reuse (the region stays held until ACK; see ExecPool DESIGN).
+            // another chunk to reuse (the region stays held until ACK).
             p.xfer = mCtx.engine->postWrite(
                 req.peer, mCtx.arena->at(p.localOffset), p.remoteAddr, p.remoteDevId, p.writeBytes, p.ctx->stream);
             mCtx.exec->release(p.ctx);
@@ -932,6 +956,18 @@ BounceTransport::BounceTransport(std::string selfName, BounceConfig cfg, int dev
     , mReceiver(mCtx)
     , mSender(mCtx)
 {
+    // A bounce chunk must fit a fully-drained arena, or its GRANT can never succeed and the flow
+    // stalls to leaseTimeout. The buddy allocator rounds usable capacity DOWN (to minBlock<<maxOrder)
+    // and rounds each request UP to a power of two, so the naive "maxChunkBytes <= arenaBytes" is NOT
+    // sufficient (e.g. a 96 MiB arena has only 64 MiB usable, so a 65 MiB chunk never fits). Clamp to
+    // the largest block the drained arena can actually hand out.
+    std::size_t const cap = mCtx.scheduler.arenaCapacity();
+    if (mCtx.cfg.maxChunkBytes > cap)
+    {
+        TLLM_LOG_WARNING("BounceTransport(%s): maxChunkBytes=%zu exceeds usable arena capacity=%zu; clamping to %zu",
+            mCtx.selfName.c_str(), static_cast<std::size_t>(mCtx.cfg.maxChunkBytes), cap, cap);
+        mCtx.cfg.maxChunkBytes = cap;
+    }
     mReceiver.startWorkers();
     mIoThread = std::thread(&BounceTransport::ioLoop, this);
 }
