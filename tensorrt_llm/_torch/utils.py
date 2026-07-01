@@ -25,6 +25,7 @@ aux_stream_name_list = [
     'MoeBalancer',
     'MoeOutputMemset',
     'MoeFc2Alpha',
+    'EngramPrecompute',
 ]
 AuxStreamType = Enum(
     'AuxStreamType',
@@ -460,6 +461,10 @@ def split(x: torch.Tensor,
 
 def relu2(x: torch.Tensor) -> torch.Tensor:
     return torch.square(F.relu(x))
+
+
+def gelu_tanh(x: torch.Tensor) -> torch.Tensor:
+    return F.gelu(x, approximate="tanh")
 
 
 def tensor_to_str(x: torch.Tensor, num_elements: int = 10) -> str:
