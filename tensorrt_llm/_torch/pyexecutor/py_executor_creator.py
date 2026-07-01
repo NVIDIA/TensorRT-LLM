@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import copy
 import gc
 import importlib
@@ -301,6 +316,7 @@ def create_py_executor(
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
     resource_governor_queue=None,
+    inflight_cancel_supported_by_executor: bool = False,
 ) -> PyExecutor:
     """Create and initialize a PyExecutor instance from the given LLM arguments.
 
@@ -318,6 +334,8 @@ def create_py_executor(
         resource_governor_queue: Optional queue for resource governor
             requests. When provided, it is installed before the worker thread
             starts so all ranks observe the same collective sequence.
+        inflight_cancel_supported_by_executor: Whether the hosting executor
+            owns disposable worker processes required for poison recovery.
 
     Returns:
         A fully initialized PyExecutor instance.
@@ -945,6 +963,8 @@ def create_py_executor(
             kv_connector_manager=kv_connector_manager
             if not estimating_kv_cache else None,
             resource_governor_queue=resource_governor_queue,
+            inflight_cancel_supported_by_executor=
+            inflight_cancel_supported_by_executor,
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
             max_beam_width=max_beam_width,
@@ -1019,6 +1039,8 @@ def create_py_executor(
                 garbage_collection_gen0_threshold,
                 kv_connector_manager=kv_connector_manager,
                 resource_governor_queue=resource_governor_queue,
+                inflight_cancel_supported_by_executor=
+                inflight_cancel_supported_by_executor,
                 max_seq_len=max_seq_len,
                 max_batch_size=max_batch_size,
                 max_beam_width=max_beam_width,

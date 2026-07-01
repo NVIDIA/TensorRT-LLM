@@ -41,8 +41,9 @@ from .result import GenerationResult, IterationResult
 from .rpc import RPCClient
 from .rpc.rpc_common import RPCError, get_unique_ipc_addr
 from .utils import (ErrorResponse, RequestError, WorkerCommIpcAddrs,
-                    create_mpi_comm_session, get_spawn_proxy_process_env,
-                    is_llm_response, print_alive_threads)
+                    WorkerFatalError, create_mpi_comm_session,
+                    get_spawn_proxy_process_env, is_llm_response,
+                    print_alive_threads)
 from .worker import GenerationExecutorWorker, worker_main
 
 __all__ = [
@@ -73,6 +74,13 @@ def _check_collective_rpc_guard(
 
 class GenerationExecutorProxy(GenerationExecutor):
     READY_SIGNAL = b"READY"
+    WORKER_FATAL_SHUTDOWN_GRACE_SECONDS = 5.0
+
+    @staticmethod
+    def _supports_inflight_cancel_process_restart(
+            mpi_session: MpiSession) -> bool:
+        """Return whether fatal poison retires disposable worker processes."""
+        return isinstance(mpi_session, MpiPoolSession)
 
     def __init__(
         self,
@@ -121,6 +129,11 @@ class GenerationExecutorProxy(GenerationExecutor):
                 "yellow")
 
         self._results: Dict[int, GenerationResult] = {}
+        # Set by the result dispatcher before it fails the current result set.
+        # Keeping this separate from ``_fatal_error`` lets the existing
+        # error-monitor path perform ``pre_shutdown()`` instead of exiting its
+        # loop as soon as the dispatcher publishes the failure.
+        self._worker_fatal_error: Optional[BaseException] = None
 
         self.model_world_size = model_world_size
 
@@ -140,7 +153,10 @@ class GenerationExecutorProxy(GenerationExecutor):
                              postproc_worker_config=postproc_worker_config,
                              is_llm_executor=False,
                              rpc_addr=self.rpc_addr,
-                             hmac_key=self.hmac_key)
+                             hmac_key=self.hmac_key,
+                             inflight_cancel_supported_by_executor=self.
+                             _supports_inflight_cancel_process_restart(
+                                 self.mpi_session))
 
         if "log_level" not in worker_kwargs:
             worker_kwargs["log_level"] = logger.level
@@ -231,7 +247,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         Returns:
             True if the executor and all MPI workers are healthy.
         """
-        if self.doing_shutdown or self._fatal_error is not None:
+        if (self.doing_shutdown or self._fatal_error is not None
+                or self._worker_fatal_error is not None):
             return False
 
         if self._drain_error_queue():
@@ -313,11 +330,65 @@ class GenerationExecutorProxy(GenerationExecutor):
         # send back a finished result.
         self.request_queue.put(CancellingRequest(request_id))
 
+    def _raise_if_worker_unavailable(self) -> None:
+        """Reject work once the worker has entered a system-fatal state."""
+        error = self._worker_fatal_error or self._fatal_error
+        if error is not None:
+            raise RuntimeError(
+                f"Executor worker is unavailable after a fatal error: {error}"
+            ) from error
+        if self.doing_shutdown:
+            raise RuntimeError("Executor worker is shutting down")
+
+    @staticmethod
+    def _notify_result_queues(async_queues: List[_SyncQueue],
+                              event_loop) -> None:
+        if not async_queues:
+            return
+        try:
+            _SyncQueue.notify_many(event_loop, async_queues)
+        except AsyncQueue.EventLoopShutdownError:
+            logger.warning(
+                "proxy.py: EventLoopShutdownError because event loop is not running"
+            )
+
+    def _fail_pending_results(self, error_msg: str) -> None:
+        """Wake all proxy-owned results after a system-fatal worker error."""
+        async_queues: List[_SyncQueue] = []
+        event_loop = None
+        for client_id, result in list(self._results.items()):
+            queue = result.queue
+            response = ErrorResponse(client_id, error_msg, client_id)
+            if isinstance(queue, _SyncQueue):
+                queue.put_nowait(response)
+                async_queues.append(queue)
+                event_loop = event_loop or queue.loop
+            else:
+                queue.put(response)
+            self._results.pop(client_id, None)
+
+        self._notify_result_queues(async_queues, event_loop)
+
     def dispatch_result_task(self) -> bool:
         # TODO[chunweiy]: convert the dispatch_result_task to async, that should
         # benefit from zmq.asyncio.Context
         if (res := self.result_queue.get()) is None:
             return False  # shutdown the thread
+
+        res = res if isinstance(res, list) else [res]
+        fatal_error = next(
+            (item for item in res if isinstance(item, WorkerFatalError)), None)
+        if fatal_error is not None:
+            error = RuntimeError(fatal_error.error_msg)
+            # Publish the fatal state before taking the pending-result snapshot.
+            # A concurrent submit either appears in that snapshot or observes
+            # this state in its post-send check and removes its own result.
+            if self._worker_fatal_error is None:
+                self._worker_fatal_error = error
+                self._fail_pending_results(fatal_error.error_msg)
+                self._error_queue.put(error)
+                self._shutdown_event.set()
+            return False
 
         async_queues = []
         event_loop = None
@@ -351,21 +422,13 @@ class GenerationExecutorProxy(GenerationExecutor):
                                        and res.is_final):
                 self._results.pop(client_id, None)
 
-        res = res if isinstance(res, list) else [res]
-
         for i in res:
             global_tracer().log_instant("IPC.get")
             if i is None:
                 return False
             process_res(i)
 
-        if async_queues:
-            try:
-                _SyncQueue.notify_many(event_loop, async_queues)
-            except AsyncQueue.EventLoopShutdownError:
-                logger.warning(
-                    "proxy.py: EventLoopShutdownError because event loop is not running"
-                )
+        self._notify_result_queues(async_queues, event_loop)
 
         return True  # success
 
@@ -463,7 +526,19 @@ class GenerationExecutorProxy(GenerationExecutor):
         if hasattr(self, '_shutdown_event'):
             self._shutdown_event.set()
 
-        self._abort_all_requests()
+        worker_fatal = self._worker_fatal_error is not None
+        if worker_fatal:
+            # WorkerFatalError sets an in-process event that releases
+            # worker_main's request loop.  Do not touch request_queue here: the
+            # error monitor is not necessarily the thread that owns this ZMQ
+            # socket, and the dispatcher has already failed every pending
+            # proxy result (including racing submissions via the post-send
+            # health check).
+            logger.error(
+                "Worker reported a system-fatal error; waiting for process "
+                "restart without sending on the request queue.")
+        else:
+            self._abort_all_requests()
 
         # Notify surviving workers to quit.  Send the sentinel when:
         #   (a) ``mpi_futures`` is empty -- the
@@ -481,7 +556,9 @@ class GenerationExecutorProxy(GenerationExecutor):
         # empty list and therefore covered case (a) by accident.  Switching
         # to bare ``any(...)`` to better handle partial crashes regressed
         # case (a); keep both behaviours explicit.
-        if not self.mpi_futures or any(not f.done() for f in self.mpi_futures):
+        if (not worker_fatal
+                and (not self.mpi_futures or any(not f.done()
+                                                 for f in self.mpi_futures))):
             self.request_queue.put_noblock(None, retry=4)
 
     def shutdown(self):
@@ -493,13 +570,24 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         logger_debug('Proxy.shutdown...\n', "yellow")
 
-        for f in self.mpi_futures:
-            try:
-                f.result()
-            except:
-                # The errors are already captured in mpi_done_callback, ignored
-                # here
-                pass
+        worker_fatal = self._worker_fatal_error is not None
+        if worker_fatal:
+            # Poison explicitly means native/remote quiescence is unknown.  Do
+            # not wait forever for worker futures that may be blocked in
+            # transport or collective cleanup; use the session's bounded abort
+            # path and require a fresh worker process.
+            self.mpi_session.shutdown_abort(
+                grace=self.WORKER_FATAL_SHUTDOWN_GRACE_SECONDS,
+                reason=self._worker_fatal_error,
+            )
+        else:
+            for f in self.mpi_futures:
+                try:
+                    f.result()
+                except:
+                    # The errors are already captured in mpi_done_callback, ignored
+                    # here
+                    pass
 
         # step2: notify the background threads to quit
         if (hasattr(self, '_error_monitor_thread')
@@ -527,7 +615,8 @@ class GenerationExecutorProxy(GenerationExecutor):
             self._resource_governor_queue.close()
 
         self.workers_started = False
-        self.mpi_session.shutdown()
+        if not worker_fatal:
+            self.mpi_session.shutdown()
 
         # Process the errors in-case error during shutting down the threads
         self._handle_background_error()
@@ -542,6 +631,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             Forwards the request to the workers through the request queue.
         """
 
+        self._raise_if_worker_unavailable()
         self._start_dispatch_threads()
 
         request.set_id(self._get_next_client_id())
@@ -557,6 +647,12 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         with nvtx_range_debug("request_queue.put"):
             self.request_queue.put(request)
+
+        # Close the race where the worker-fatal marker was dispatched after
+        # the first health check but before this result was registered/sent.
+        if self._worker_fatal_error is not None:
+            self._results.pop(request.id, None)
+            self._raise_if_worker_unavailable()
 
         self._handle_background_error()
 

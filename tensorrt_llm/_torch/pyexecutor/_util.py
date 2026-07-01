@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import copy
 import dataclasses
 import os
@@ -1912,6 +1927,7 @@ def create_py_executor_instance(
     virtual_memory_pools: Optional[dict] = None,
     execution_stream: Optional[torch.cuda.Stream] = None,
     dwdp_manager: Optional[DwdpManager] = None,
+    inflight_cancel_supported_by_executor: bool = False,
 ) -> PyExecutor:
     kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
 
@@ -2219,8 +2235,15 @@ def create_py_executor_instance(
         mamba_cache_manager = kv_cache_manager
 
     kv_cache_transceiver = create_kv_cache_transceiver(
-        mapping, dist, kv_cache_manager, attention_type,
-        cache_transceiver_config, mamba_cache_manager)
+        mapping,
+        dist,
+        kv_cache_manager,
+        attention_type,
+        cache_transceiver_config,
+        mamba_cache_manager,
+        inflight_cancel_supported_by_executor=(
+            inflight_cancel_supported_by_executor
+            and kv_connector_manager is None))
 
     waiting_queue_policy = (scheduler_config.waiting_queue_policy
                             if scheduler_config is not None else

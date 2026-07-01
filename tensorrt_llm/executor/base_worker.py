@@ -16,6 +16,7 @@ import datetime
 import enum
 import gc
 import json
+import threading
 import weakref
 from pathlib import Path
 from queue import Queue
@@ -48,7 +49,7 @@ from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
 from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
                      compute_logprobs, get_metrics_dict)
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
-                    is_llm_response)
+                    WorkerFatalError, is_llm_response)
 
 if TYPE_CHECKING:
     from ..disaggregated_params import DisaggregatedParams
@@ -96,6 +97,7 @@ class BaseWorker(GenerationExecutor):
         hf_model_dir: Optional[Path] = None,
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[BaseLlmArgs] = None,
+        inflight_cancel_supported_by_executor: bool = False,
     ) -> None:
         postproc_config = postproc_worker_config or PostprocWorkerConfig()
         super().__init__(
@@ -113,10 +115,14 @@ class BaseWorker(GenerationExecutor):
         self._hf_model_dir = hf_model_dir
         self._tokenizer = tokenizer
         self.llm_args = llm_args
+        self._inflight_cancel_supported_by_executor = (
+            inflight_cancel_supported_by_executor)
 
         self.engine = None
         self.result_queue: Optional[IpcQueue] = None
+        self.system_result_queue: Optional[IpcQueue] = None
         self.postproc_queues: Optional[List[IpcQueue]] = None
+        self.system_fatal_event = threading.Event()
         self.rank = mpi_rank()
         self.global_rank = global_mpi_rank()
         # mapping: client_id -> GenerationResult
@@ -169,6 +175,8 @@ class BaseWorker(GenerationExecutor):
                 args["llm_args"] = self.llm_args
                 args["checkpoint_dir"] = self._hf_model_dir
                 args["tokenizer"] = self._tokenizer
+                args["inflight_cancel_supported_by_executor"] = (
+                    self._inflight_cancel_supported_by_executor)
             elif self._backend == "_autodeploy":
                 from tensorrt_llm._torch.auto_deploy.llm_args import \
                     LlmArgs as ADLlmArgs
@@ -295,6 +303,10 @@ class BaseWorker(GenerationExecutor):
         """ Set the IPC queues for feeding post-processing processes. """
         assert self.result_queue is None
         self.postproc_queues = queues
+
+    def set_system_result_queue(self, queue):
+        """Set the direct worker-to-proxy queue for system-fatal messages."""
+        self.system_result_queue = queue
 
     def _set_iteration_result_queue(self, it_result_queue: IterationResultQueue,
                                     queue: Union[Queue, FusedIpcQueue,
@@ -894,6 +906,15 @@ class AwaitResponseHelper:
             # _await_any_response) is also a clear signal to broadcast
             # and stop the thread.
             return self._broadcast_event_loop_error(e)
+
+        # A fatal engine state supersedes any responses returned in the same
+        # wakeup.  In IPC mode this check must happen before post-processing:
+        # those queues can block independently, while the direct fatal marker
+        # is what releases every proxy-owned result.
+        error = getattr(self.worker.engine, "_event_loop_error", None)
+        if error is not None:
+            return self._broadcast_event_loop_error(error)
+
         # filter since The _engine_response_callback may return None
         responses = list(
             filter(
@@ -903,6 +924,11 @@ class AwaitResponseHelper:
         # append the error responses to the temp_error_responses
         while not self.temp_error_responses.empty():
             responses.append(self.temp_error_responses.get())
+
+        # Cover an error published while response callbacks were running.
+        error = getattr(self.worker.engine, "_event_loop_error", None)
+        if error is not None:
+            return self._broadcast_event_loop_error(error)
 
         with nvtx_range_debug(f"await_response-{len(responses)}",
                               color="red",
@@ -922,22 +948,47 @@ class AwaitResponseHelper:
     def _broadcast_event_loop_error(self, error: BaseException) -> bool:
         """Wake every pending ``GenerationResult`` after an event-loop crash.
 
-        Inject an ``ErrorResponse`` into every pending ``GenerationResult``
-        queue so callers parked in ``queue.get()`` / ``aqueue.get()``
-        (``LLM.generate``, ``generate_async`` + ``aresult``,
-        ``trtllm-bench``) wake up with a meaningful error instead of
-        hanging when the PyExecutor event loop dies.
+        In single-process mode, inject an ``ErrorResponse`` into every pending
+        ``GenerationResult`` queue.  In IPC mode, send one
+        ``WorkerFatalError`` marker so the proxy can atomically fail all of its
+        pending results and terminate the worker session.
 
         Returns ``False`` so the calling ``ManagedThread`` exits — there
         is no point polling a dead engine.
 
-        Scope: single-process worker (the path that backs ``LLM.generate``
-        and the bench async client). The IPC / proxy path tracks pending
-        results on a different side of the boundary and would need a
-        separate poison-pill on ``self.worker.result_queue``; that is left
-        as a follow-up consistent with the PyExecutor-side fix.
         """
         error_msg = f"Event loop terminated with error: {error}"
+        is_ipc = (self.worker.result_queue is not None
+                  or self.worker.postproc_queues is not None)
+        if is_ipc:
+            system_result_queue = getattr(self.worker, "system_result_queue",
+                                          None)
+            try:
+                if system_result_queue is None:
+                    raise RuntimeError("system result queue is not configured")
+                system_result_queue.put(WorkerFatalError(error_msg))
+                # Retire worker_main before attempting any auxiliary cleanup;
+                # a stalled postprocessor must not leave request ingress alive.
+                self.worker.system_fatal_event.set()
+                # These feed sockets are owned by this response thread.  Stop
+                # post-process workers here, rather than from worker_main, so
+                # they cannot remain blocked after the direct marker bypasses
+                # their normal response path.
+                if self.worker.postproc_queues is not None:
+                    for queue in self.worker.postproc_queues:
+                        try:
+                            queue.put_noblock(PostprocWorker.FatalStop(),
+                                              retry=0)
+                        except Exception as stop_error:
+                            logger.warning(
+                                "Failed to stop a postprocess worker after a "
+                                f"system-fatal error: {stop_error}")
+            finally:
+                # Wake worker_main without requiring the proxy's error-monitor
+                # thread to use the caller-owned request ZMQ socket.
+                self.worker.system_fatal_event.set()
+            return False
+
         pending_client_ids = list(self.worker._results.keys())
         if not pending_client_ids:
             logger.error(
