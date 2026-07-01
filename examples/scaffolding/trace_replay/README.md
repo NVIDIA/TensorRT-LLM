@@ -33,9 +33,8 @@ examples/scaffolding/trace_replay/
 ├── run_trace_replay.py        -- single-trace single-config replay driver
 ├── metrics.py                 -- replay-result metrics (used by run_trace_replay)
 ├── trace_example/             -- one ready-to-run example trace
-│   └── django__django-16801/
-│       ├── django__django-16801.trace.json        (compact)
-│       └── django__django-16801.full.trace.json   (full)
+│   └── matplotlib__matplotlib-23412/
+│       └── matplotlib__matplotlib-23412.trace.json   (compact)
 └── analysis/                  -- offline KV-cache hit-rate upper-bound analyzer
     ├── compute_cache_hit_trace.py   CLI: optimal upper-bound hit rate per trace
     ├── cache_hit.py / aggregation.py / annotate.py / blocks.py /
@@ -300,7 +299,7 @@ python examples/scaffolding/contrib/Coder/run_coder.py \
 
 ```bash
 python examples/scaffolding/trace_replay/run_trace_replay.py \
-  examples/scaffolding/trace_replay/trace_example/django__django-16801/django__django-16801.trace.json \
+  examples/scaffolding/trace_replay/trace_example/matplotlib__matplotlib-23412/matplotlib__matplotlib-23412.trace.json \
   --model "Qwen3-30B-A3B" \
   --openai-base-url "http://127.0.0.1:8000/v1"
 ```
