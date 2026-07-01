@@ -34,7 +34,6 @@ from .deep_ep import DeepEP
 from .deep_ep_low_latency import DeepEPLowLatency
 from .nvlink_one_sided import NVLinkOneSided
 from .nvlink_two_sided import NVLinkTwoSided
-from .nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
 
 
 class CommunicationFactory:
@@ -159,6 +158,8 @@ class CommunicationFactory:
 
         try:
             if use_flashinfer:
+                from .nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
+
                 strategy = NVLinkTwoSidedFlashinfer(
                     mapping,
                     num_experts,
@@ -266,6 +267,8 @@ class CommunicationFactory:
         # Create strategy - will raise RuntimeError if platform not supported
         if method in ["NVLINK_TWO_SIDED"]:
             if use_flashinfer:
+                from .nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
+
                 return NVLinkTwoSidedFlashinfer(
                     mapping,
                     num_experts,
