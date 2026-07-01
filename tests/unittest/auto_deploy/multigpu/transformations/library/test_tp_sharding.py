@@ -38,10 +38,10 @@ from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     FP8WeightShardingInfo,
     LayerType,
     ShardingTransformConfig,
-    SplitDimension,
     WeightShardingInfo,
     _update_node_args,
 )
+from tensorrt_llm._torch.auto_deploy.transform.library.sharding_ir import SplitDimension
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op, is_weight_node
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (

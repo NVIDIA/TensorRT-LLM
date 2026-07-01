@@ -1340,24 +1340,8 @@ TEST_P(AsymmetricalCacheTest, TestCase)
         // https://nvbugs/5760737
         GTEST_SKIP() << "Temporarily skipping cache transceiver tests with Mooncake backend for Indexer KCache.";
     }
+
     std::vector<int> lenList = {30, 10, 60, 80};
-    if (genCp > 1)
-    {
-        std::vector<int> updatedLenList;
-        for (auto len : lenList)
-        {
-            if (len > tokensPerBlock * (genCp - 1))
-            {
-                updatedLenList.push_back(len);
-            }
-        }
-        if (updatedLenList.empty())
-        {
-            GTEST_SKIP() << "Skipping test because not even one request has one block per genCP rank. tokensPerBlock="
-                         << tokensPerBlock << ", genCp=" << genCp;
-        }
-        lenList = updatedLenList;
-    }
 
     setUpCommunicator(contextTp, contextPp, contextCp, genTp, genPp, genCp, isMLA, contextDP, generationDP);
 
@@ -1465,26 +1449,8 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
     {
         GTEST_SKIP() << "Temporarily skipping cache transceiver tests with NIXL and MOONCAKE backend for CP.";
     }
-    // Filter request lengths based on CP requirements.
-    // Each request must have at least one block per CP rank to be valid for CP tests.
+
     std::vector<int> lenList = {60, 30, 60, 10};
-    if (genCp > 1)
-    {
-        std::vector<int> updatedLenList;
-        for (auto len : lenList)
-        {
-            if (len > tokensPerBlock * (genCp - 1))
-            {
-                updatedLenList.push_back(len);
-            }
-        }
-        if (updatedLenList.empty())
-        {
-            GTEST_SKIP() << "Skipping test because not even one request has one block per genCP rank. tokensPerBlock="
-                         << tokensPerBlock << ", genCp=" << genCp;
-        }
-        lenList = updatedLenList;
-    }
 
     setUpCommunicator(contextTp, contextPp, contextCp, genTp, genPp, genCp, isMLA, contextDP, generationDP);
 

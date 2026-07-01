@@ -37,12 +37,9 @@ l0_h100:
   - unittest/_torch/modules/test_moe_host_sharer.py
   - unittest/_torch/modules/fused_moe/test_deepgemm_fused_gather_finalize.py
   - unittest/_torch/modules/fused_moe/test_deepgemm_fused_expand_quant.py
-  # ------------- legacy MoE tests ---------------
-  - unittest/_torch/modules/test_fused_moe.py
   # ------------- MoE: test_moe_backend (by backend) ---------------
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "CUTLASS"
   # ------------- MoE: test_single_gpu (by backend) ---------------
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and not None"
   - unittest/_torch/multimodal -k "not nemotron_nano_v2_vl_fp8"
   - unittest/_torch/sampler
   - unittest/_torch/speculative/test_eagle3.py
@@ -88,6 +85,8 @@ l0_h100:
   # Boundary request lengths.
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_boundary_lengths -k "v1"
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_boundary_lengths -k "v2"
+  - unittest/disaggregated/test_cache_transceiver_harness_report.py
+  - unittest/disaggregated/test_cache_transceiver_harness.py
   - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[PYTHON-mha-ctx_fp16_gen_fp16]
   - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[PYTHON-mla-ctx_fp16_gen_fp16]
   - unittest/llmapi/test_llm_telemetry.py
@@ -259,7 +258,9 @@ l0_h100:
     - unittest/llmapi/test_llm_pytorch.py -m "part1"
     - unittest/llmapi/test_llm_pytorch.py -m "part2"
     - unittest/llmapi/test_llm_pytorch.py -m "part3"
-    - unittest/llmapi/test_llm_pytorch.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks TIMEOUT (90)
+    - llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks[host_path] TIMEOUT (90)
+    - llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks[device_path_eager] TIMEOUT (90)
+    - llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks[device_path_cudagraph] TIMEOUT (90)
     - unittest/llmapi/test_async_llm.py -m "not (gpu2 or gpu4)"
     - examples/test_ray.py::test_llm_inference_async_ray
 - condition:
@@ -334,6 +335,7 @@ l0_h100:
       orchestrator: mpi
   tests:
   # ------------- PyTorch tests ---------------
+  - llmapi/test_llm_api_pytorch_moe_lora.py::test_mixtral_moe_routed_expert_fp8_multi_lora_varying_ranks TIMEOUT (90)
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=True-enable_chunked_prefill=True-enable_max_concurrency=False-enable_draft_len_schedule=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=True-enable_chunked_prefill=False-enable_max_concurrency=False-enable_draft_len_schedule=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=True-enable_chunked_prefill=False-enable_max_concurrency=True-enable_draft_len_schedule=False]
@@ -410,6 +412,10 @@ l0_h100:
   - examples/test_phi.py::test_phi_4_mini_instruct_with_bf16_lora_torch[Phi-4-mini-instruct]
   - test_e2e.py::test_draft_token_tree_quickstart_advanced_eagle3[Llama-3.1-8b-Instruct-llama-3.1-model/Llama-3.1-8B-Instruct-EAGLE3-LLaMA3.1-Instruct-8B]
   - test_e2e.py::test_draft_token_tree_quickstart_advanced_eagle3_depth_1_tree[Llama-3.1-8b-Instruct-llama-3.1-model/Llama-3.1-8B-Instruct-EAGLE3-LLaMA3.1-Instruct-8B]
+  # ---- moved to post-merge (MoE CI optimization) ----
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "CUTLASS"
+  # ---- non-quantized (quant=None) moved to post-merge ----
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and None"
   # Documentation URL validation (CPU-only, no GPU needed)
   - test_doc.py::test_url_validity
 - condition:

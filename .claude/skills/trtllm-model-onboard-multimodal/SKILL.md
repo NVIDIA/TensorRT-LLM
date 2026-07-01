@@ -304,7 +304,18 @@ class {Name}Model(PreTrainedModel):
 
 ### Phase 3 — Input processor + dummy builder
 
-Subclass **both** `BaseMultimodalInputProcessor` (drives every real request) and `BaseMultimodalDummyInputsBuilder` (drives engine warmup / profiling — the base shrinks dummy image resolution until the synthetic prompt fits `input_seq_len`). Colocate in the modeling file. Reference: `Qwen3VLInputProcessorBase`.
+Subclass **both** `BaseMultimodalInputProcessor` (drives every real request) and `BaseMultimodalDummyInputsBuilder` (drives engine warmup / KV-cache profiling). Colocate in the modeling file. References: `Qwen3VLInputProcessorBase` (image+video), `Mistral3InputProcessor` (Pixtral).
+
+**Encoder KV-cache memory profiling (deterministic dummy sizing).** The KV-cache profiler sizes the encoder's memory contribution by running the encoder **once** on a worst-case dummy (held resident through the peak measurement), **decoupled** from the text-only LLM dummy. To opt in, the model exposes `encode_multimodal_inputs` (via `MultimodalModelMixin`) and the input processor implements the modality-agnostic dummy contract on `BaseMultimodalDummyInputsBuilder`:
+
+- `get_mm_max_tokens_per_item() -> {modality: tokens}` — per-modality worst-case single-item encoder-attention tokens. The keys enumerate the modalities the model encodes; the profiler splits the shared `encoder_max_num_tokens` across them in proportion to these (so they share one microbatch cap, not each the whole budget). Default `{}` → no direct encoder profiling.
+- `get_dummy_mm_data_for_tokens(*, max_tokens_per_modality, dtype) -> multimodal_data` — materialize the processed encoder tensors **directly** (zeros of the exact shape the processor would emit; no PIL image + HF-processor round-trip), merged into one `multimodal_data` dict so a single `encode_multimodal_inputs` profiles the combined peak. Default raises `NotImplementedError`.
+
+Vision models implement these via the size trio: `get_num_mm_tokens(*, width, height, num_frames)` (size → **pre-merger encoder-attention tokens**; the single source of truth shared with the hashing path `get_num_tokens_per_image`/`_video`), its inverse `get_size_for_max_tokens(max_tokens)` (largest aspect-bounded size whose token count ≤ budget, capped at `max_pixels`), and `get_dummy_mm_data_for_size(...)`. Qwen builds `pixel_values`/`image_grid_thw`; Mistral builds `pixel_values`/`image_sizes` and keeps its ViT patch count off `get_num_mm_tokens` (a private `_vit_tokens` helper) so the LLM-side Pixtral hashing count is unchanged. A model with neither contract falls back to a text-only dummy (encoder memory unaccounted). Don't hardcode the encoder attention workspace (`max_num_*=8192`): inherit `MultimodalEncoderMixin` and let the engine size it via `setup_attn_metadata` at load.
+
+The workspace dimensions come from `TorchLlmArgs.get_encoder_runtime_sizes()` → `(encoder_max_batch_size, encoder_max_num_tokens)` — two prototype knobs that size the encoder's `AttentionMetadata` independently of the LLM batch and fall back to the LLM-side `max_batch_size` / `max_num_tokens` when unset. `encoder_max_num_tokens` is exactly the per-iteration encoder microbatch token cap that `get_dummy_mm_data_for_tokens` saturates (and that the profiler splits across modalities), so an encoder microbatch can be sized larger than the LLM `max_num_tokens` without inflating the KV-cache budget. Read them via `get_encoder_runtime_sizes()` rather than the raw fields so the fallback is applied.
+
+> Mixed image+video+audio models (nemotron-nano / phi4mm) compose multiple modality dummies through the same `get_dummy_mm_data_for_tokens` (return `{"image": ..., "audio": ...}`); a per-modality `ModalityDummySizer` composition is the planned home for the shared orchestration.
 
 Implement `call_with_text_prompt(inputs, sampling_params)` — the per-model text-prompt path. **Don't override `__call__`**: the base class's concrete `__call__` dispatches here for text prompts, and also detokenizes `prompt_token_ids → prompt` and falls through to here for non-fast-path VLMs. `call_with_text_prompt` does:
 
@@ -433,6 +444,7 @@ Follow `CONTRIBUTING.md`. Title `[JIRA/NVBUG/None][type] description`, `git comm
 
 **Input processor**
 - [ ] Subclasses both `BaseMultimodalInputProcessor` and `BaseMultimodalDummyInputsBuilder`.
+- [ ] Encoder KV-cache profiling: implements the deterministic dummy contract (`get_mm_max_tokens_per_item` + `get_dummy_mm_data_for_tokens`, vision via the `get_num_mm_tokens` / `get_size_for_max_tokens` / `get_dummy_mm_data_for_size` trio) and the model exposes `encode_multimodal_inputs`; encoder inherits `MultimodalEncoderMixin` (no hardcoded `max_num_*=8192` — sized by `setup_attn_metadata`). Skipping these = text-only dummy, encoder memory unaccounted.
 - [ ] `call_with_text_prompt` (not `__call__` — that's the base-class dispatcher) runs HF AutoProcessor + tokenizer, builds `multimodal_data` by modality, computes `mrope_config` on CPU, `_postprocess`-rewrites mm token ids to the OOV sentinel.
 - [ ] `mm_processor_kwargs` flow-through preserved. (Tokenized fast path is optional: set `supports_token_id_mm_expansion = True` + implement `get_text_with_mm_placeholders` / `expand_prompt_token_ids_for_mm`; otherwise the base class detokenizes token-ID inputs automatically.)
 - [ ] `_attach_multimodal_embeddings_impl` implemented (not the `attach_multimodal_embeddings` wrapper) if `@support_multimodal_disaggregated`.

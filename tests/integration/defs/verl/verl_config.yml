@@ -15,8 +15,8 @@ verl_config:
     - "pip install nvidia-nvshmem-cu13==3.3.20"
     # Create nvshmem symlink (needed before DeepEP build)
     - >-
-      (cd /usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/lib &&
-      ln -s libnvshmem_host.so.3 libnvshmem_host.so)
+      (cd /usr/local/cuda/targets/x86_64-linux/lib &&
+      [ -e libnvshmem_host.so ] || ln -s libnvshmem_host.so.3 libnvshmem_host.so)
     # Install DeepEP
     - >-
       git clone -b hybrid-ep https://github.com/deepseek-ai/DeepEP.git &&
@@ -36,7 +36,7 @@ verl_config:
 
   # The environment variables to expose in the container before setting up
   env_vars:
-    - "NVSHMEM_DIR=/usr/local/lib/python3.12/dist-packages/nvidia/nvshmem"
+    - "NVSHMEM_DIR=/usr/local/cuda/targets/x86_64-linux"
     - "LD_LIBRARY_PATH=\"${NVSHMEM_DIR}/lib:$LD_LIBRARY_PATH\""
     - "PATH=\"${NVSHMEM_DIR}/bin:$PATH\""
     - "TRTLLM_TEST_MODEL_PATH_ROOT=/tmp/verl-models"

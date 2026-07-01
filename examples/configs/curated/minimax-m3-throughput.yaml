@@ -1,0 +1,15 @@
+max_batch_size: 256
+max_num_tokens: 8192
+tensor_parallel_size: 8
+moe_expert_parallel_size: 8
+enable_attention_dp: true
+trust_remote_code: true
+cuda_graph_config:
+  enable_padding: true
+kv_cache_config:
+  free_gpu_memory_fraction: 0.3
+  enable_block_reuse: false
+sparse_attention_config:
+  algorithm: minimax_m3
+stream_interval: 10
+num_postprocess_workers: 4
