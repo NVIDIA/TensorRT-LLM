@@ -458,6 +458,11 @@ MiniMaxAI/MiniMax-M2:
   - accuracy: 89.045
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 93.75
+  # AutoDeploy finegrained FP8 TP-sharded path (see cc4f2ebd2a for pytorch analog).
+  # Set ~1pp below measured 81.20 to give ~3pp headroom for run-to-run variance
+  # (precedent: 157782c358 GPT-OSS-DFlash).
+  - extra_acc_spec: ad_fp8_tp_attn
+    accuracy: 81
 MiniMaxAI/MiniMax-M2.5:
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 93.75

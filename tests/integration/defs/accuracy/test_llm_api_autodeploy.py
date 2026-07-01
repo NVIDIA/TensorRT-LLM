@@ -1165,7 +1165,8 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+            # AutoDeploy TP-sharded finegrained-FP8 path has different numerics than the shared baseline.
+            task.evaluate(llm, extra_acc_spec="ad_fp8_tp_attn")
 
 
 class TestKimiK2_5(LlmapiAccuracyTestHarness):
