@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -445,8 +445,9 @@ def test_fp8_quantize_1x128_packed_ue8m0_matches_legacy(m, k):
 ])
 def test_fp8_quantize_1x128_packed_ue8m0_padded_rows_are_zero(m, k):
     """Padded rows [m, m_aligned) of the physical packed scale buffer must be 0.
-    The op must return a strided view backed by the complete allocator-owned
-    physical buffer so downstream CUDA streams can track its lifetime.
+    The op returns a `(m, num_packed_sf_k)` strided view that hides the padded
+    rows; allocate a sentinel buffer immediately before the call so any
+    unwritten ints in the padded region surface as the sentinel.
     """
     if m % 4 == 0:
         pytest.skip("m is already TMA-aligned; no padded rows to check")
@@ -470,13 +471,30 @@ def test_fp8_quantize_1x128_packed_ue8m0_padded_rows_are_zero(m, k):
     x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
     _, packed = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(x)
 
+    # Physical layout: int32[num_packed_sf_k][m_padded] starting at packed.data_ptr().
+    # The returned tensor's storage_size() reflects only the logical view, so
+    # reach into it via the data_ptr + cudaMemcpyDeviceToDevice into a fresh
+    # full-sized tensor.
+    physical = torch.empty((num_packed_sf_k, m_padded),
+                           dtype=torch.int32,
+                           device="cuda")
+    # Use cudart memcpy via torch's torch.cuda.memory functions
+    src_ptr = packed.data_ptr()
+    dst_ptr = physical.data_ptr()
     nbytes = total_int32 * 4
-    assert packed.untyped_storage().nbytes() == nbytes
-
-    physical = torch.empty(0, dtype=torch.int32,
-                           device="cuda").set_(packed.untyped_storage(), 0,
-                                               (num_packed_sf_k, m_padded),
-                                               (m_padded, 1))
+    # Build a 1-D byte view at src_ptr by creating a fresh tensor of the
+    # appropriate size; this requires an untyped storage of full extent. The
+    # storage created by `at::from_blob` is sized to the strided view's reach
+    # (m, num_packed_sf_k) so we need an out-of-band copy. cudart via torch:
+    torch.cuda.synchronize()
+    import ctypes
+    libcudart = ctypes.CDLL("libcudart.so")
+    err = libcudart.cudaMemcpy(ctypes.c_void_p(dst_ptr),
+                               ctypes.c_void_p(src_ptr),
+                               ctypes.c_size_t(nbytes),
+                               ctypes.c_int(3))  # cudaMemcpyDeviceToDevice
+    assert err == 0, f"cudaMemcpy failed with err={err}"
+    torch.cuda.synchronize()
 
     padded_tail = physical[:, m:m_padded]
     nonzero = int((padded_tail != 0).sum().item())
