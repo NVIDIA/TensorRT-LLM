@@ -133,9 +133,9 @@ def _mla_dsa_proj_fake(
     q = hidden_states.new_empty([num_tokens, mla_layer.num_heads_tp * mla_layer.qk_head_dim])
     compressed_kv = hidden_states.new_empty([num_tokens, mla_layer.kv_lora_rank])
     k_pe = hidden_states.new_empty([num_tokens, mla_layer.qk_rope_head_dim])
-    latent_cache = hidden_states.new_empty([
-        num_tokens, mla_layer.kv_lora_rank + mla_layer.qk_rope_head_dim
-    ])
+    latent_cache = hidden_states.new_empty(
+        [num_tokens, mla_layer.kv_lora_rank + mla_layer.qk_rope_head_dim]
+    )
     if indexer is None:
         # DSA "shared" layer: no indexer, mirror forward_dsa_proj's early
         # return of only the 4 base tensors (no indexer intermediates).
@@ -1233,10 +1233,11 @@ class MLA(nn.Module):
             # DSA "shared" layer: reuse the previous full layer's top-k. These
             # are local token positions, so they are layer-agnostic; each layer
             # applies its own paged-KV transform downstream.
-            topk_indices = getattr(attn_metadata, 'shared_topk_indices', None)
+            topk_indices = getattr(attn_metadata, "shared_topk_indices", None)
             assert topk_indices is not None, (
                 "DSA shared layer has no top-k from a preceding full indexer "
-                "layer; check the index_topk_pattern/freq schedule.")
+                "layer; check the index_topk_pattern/freq schedule."
+            )
         else:
             q_fp8, k_fp8, k_scale, weights, q_scale = indexer_intermediates
             # Slice indexer intermediates to actual num_tokens (they were
