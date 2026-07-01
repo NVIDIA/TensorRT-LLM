@@ -101,6 +101,11 @@ class FluxJointAttention(Attention):
                 mapping=config.mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 reduce_output=False,
+                override_tp_sharding={
+                    "q": (self.local_q_dim_start, self.local_q_dim_end),
+                    "k": (self.local_kv_dim_start, self.local_kv_dim_end),
+                    "v": (self.local_kv_dim_start, self.local_kv_dim_end),
+                },
             )
 
             # Need not pass any mapping info since this is intra-head normalization
@@ -130,6 +135,7 @@ class FluxJointAttention(Attention):
                 allreduce_strategy=config.allreduce_strategy,
                 tensor_parallel_mode=TensorParallelMode.ROW,
                 reduce_output=True,
+                override_tp_sharding=(self.local_kv_dim_start, self.local_kv_dim_end),
             )
 
     def apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -350,6 +356,7 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
             skip_create_weights_in_init=self.skip_create_weights_in_init,
             force_dynamic_quantization=self.force_dynamic_quantization,
             config=config,
+            attn_shard=(self.local_q_dim_start, self.local_q_dim_end),
         )
 
     def _init_qkv_proj(self):
@@ -366,6 +373,11 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
             skip_create_weights_in_init=self.skip_create_weights_in_init,
             force_dynamic_quantization=self.force_dynamic_quantization,
             mapping=self.mapping,
+            override_qkv_sharding={
+                "q": (self.local_q_dim_start, self.local_q_dim_end),
+                "k": (self.local_kv_dim_start, self.local_kv_dim_end),
+                "v": (self.local_kv_dim_start, self.local_kv_dim_end),
+            },
         )
 
     def _apply_norm_rope_unfused(

@@ -67,11 +67,31 @@ class GatedMLP(nn.Module):
 
         # Calculate local intermediate size after tensor parallel sharding
         tp_size = mapping.tp_size
-        local_intermediate_size = self.intermediate_size // tp_size
 
+        local_intermediate_start = Linear._calc_shard(self.intermediate_size,
+                                                      mapping.tp_size,
+                                                      mapping.tp_rank)
+        local_intermediate_end = Linear._calc_shard(self.intermediate_size,
+                                                    mapping.tp_size,
+                                                    mapping.tp_rank + 1)
+        local_intermediate_size = local_intermediate_end - local_intermediate_start
+
+        self._uneven_tp_blocks_lora = (mapping.tp_size > 1
+                                       and self.intermediate_size %
+                                       mapping.tp_size != 0)
+
+        # gateup_shard_indices_mapping is the local offset and size for each sub-weight
+        # in this rank's concatenated (gate || up) buffer.
+        # override_tp_sharding is the absolute range of the global weight from which
+        # this rank pulls each sub-weight.
         gateup_shard_indices_mapping = {
             'gate': (0, local_intermediate_size),
             'up': (local_intermediate_size, local_intermediate_size),
+        }
+
+        override_tp_sharding = {
+            'gate': (local_intermediate_start, local_intermediate_end),
+            'up': (local_intermediate_start, local_intermediate_end),
         }
 
         self.gate_up_proj = Linear(
@@ -93,6 +113,7 @@ class GatedMLP(nn.Module):
             disable_deep_gemm=disable_deep_gemm,
             fused_weight_shard_indices_mapping=gateup_shard_indices_mapping,
             use_custom_cublas_mm=use_custom_cublas_mm,
+            override_tp_sharding=override_tp_sharding,
         )
 
         if is_shared_expert:
@@ -298,6 +319,10 @@ class GatedMLP(nn.Module):
     ) -> torch.Tensor:
         assert lora_params is not None
         assert self.layer_idx is not None, "layer_idx is required for lora"
+        if self._uneven_tp_blocks_lora:
+            raise NotImplementedError(
+                "LoRA is not supported with uneven TP for GatedMLP "
+                "(intermediate_size not divisible by tp_size).")
 
         h1 = self.gate_up_proj(x)
 
