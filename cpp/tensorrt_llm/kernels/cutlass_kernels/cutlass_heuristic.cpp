@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 
 #ifdef __GNUC__ // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic push
@@ -31,6 +32,7 @@
 #pragma GCC diagnostic pop
 #endif          // __GNUC
 
+#include <algorithm>
 #include <cuda_runtime_api.h>
 #include <set>
 #include <vector>
@@ -573,10 +575,12 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm120(CutlassGemmConfig::Ca
         std::vector<CutlassGemmConfig> candidate_configs;
         if (config & CutlassGemmConfig::FP8FP4_MIXED)
         {
-            // Mixed FP8 x FP4: restrict to 128x128x128B only
+            // Mixed FP8 x FP4: prefer 128x128x128B on devices with enough
+            // shared memory, but keep a low-SMEM fallback for SM120/SM121.
             candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x128B,
                 MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-            return candidate_configs;
+            candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B,
+                MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
         }
         else if (config & CutlassGemmConfig::FP4_ONLY)
         {
@@ -589,9 +593,34 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm120(CutlassGemmConfig::Ca
                 MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
             candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM120::CtaShape256x128x64B,
                 MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-            return candidate_configs;
         }
-        TLLM_THROW("Not Implemented: SM120 group GEMM only supports mxfp8-mxfp4 mixed or nvfp4.");
+        else
+        {
+            TLLM_THROW("Not Implemented: SM120 group GEMM only supports mxfp8-mxfp4 mixed or nvfp4.");
+        }
+        // Filter configs by device shared memory. SM100 (B200) has 228 KiB, but
+        // consumer Blackwell (SM120 RTX PRO 6000, SM121 GB10 / DGX Spark) has only
+        // 99 KiB. On these constrained devices, keep only CtaShape128x128x64B which
+        // fits within 99 KiB including FINALIZE epilogue (~80 KiB total).
+        // CtaShape128x256x64B/256x128x64B overflow with FINALIZE (~100 KiB).
+        // CtaShape128x128x128B also exceeds 99 KiB at typical stage counts.
+        {
+            constexpr int kMinSmemForFullTileSet = 120 * 1024;
+            int device = 0;
+            tensorrt_llm::common::check_cuda_error(cudaGetDevice(&device));
+            int maxSmem = 0;
+            tensorrt_llm::common::check_cuda_error(
+                cudaDeviceGetAttribute(&maxSmem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+
+            if (maxSmem < kMinSmemForFullTileSet)
+            {
+                auto const it = std::remove_if(candidate_configs.begin(), candidate_configs.end(),
+                    [](CutlassGemmConfig const& config)
+                    { return config.tile_config_sm120 != CutlassTileConfigSM120::CtaShape128x128x64B; });
+                candidate_configs.erase(it, candidate_configs.end());
+            }
+        }
+        return candidate_configs;
     }
     else
     {
