@@ -2951,14 +2951,22 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
         default=False,
         description="Use pure-Python scheduler instead of C++ scheduler.")
 
-    def _to_pybind(self):
+    enable_prefix_aware_scheduling: bool = Field(
+        default=True,
+        description=("Use KV prefix-reuse estimates for scheduler admission, "
+                     "duplicate-request deferral, and token-budget decisions. "
+                     "This is orthogonal to "
+                     "kv_cache_config.enable_block_reuse."))
+
+    def _to_pybind(self) -> _SchedulerConfig:
         return _SchedulerConfig(
             capacity_scheduler_policy=self.capacity_scheduler_policy._to_pybind(
             ),
             context_chunking_policy=self.context_chunking_policy._to_pybind()
             if self.context_chunking_policy else None,
             dynamic_batch_config=self.dynamic_batch_config._to_pybind()
-            if self.dynamic_batch_config else None)
+            if self.dynamic_batch_config else None,
+            enable_prefix_aware_scheduling=self.enable_prefix_aware_scheduling)
 
 
 @PybindMirror.mirror_pybind_fields(_PeftCacheConfig)
