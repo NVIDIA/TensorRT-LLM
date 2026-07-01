@@ -41,7 +41,7 @@ class FluxJointAttention(Attention):
     - FLUX-style RoPE on concatenated text+image tokens
     - pre_only mode for single-stream blocks (no output projection)
 
-    FLUX enables fuse_qk_norm_rope by default on a single GPU: the fused CUDA
+    FLUX enables fuse_qk_norm_rope by default when TP=1: the fused CUDA
     kernel handles QK norm + RoPE in a single pass. It falls back to separate
     F.rms_norm + apply_rotary_emb calls when disabled, and is disabled under
     tensor parallelism because the fused op currently requires TP=1
@@ -62,7 +62,7 @@ class FluxJointAttention(Attention):
         module_name: Optional[str] = None,
     ):
         # Opt in to the fused DiT QK-norm + RoPE kernel (per-head template), but
-        # only on a single GPU: the fused op asserts tp_size == 1
+        # only when TP=1: the fused op asserts tp_size == 1
         # (apply_packed_qk_norm_rope), so under TP>1 we fall back to the unfused
         # F.rms_norm + apply_rotary_emb path. Mirrors WAN's gating.
         tp_size = config.mapping.tp_size if config and config.mapping else 1
