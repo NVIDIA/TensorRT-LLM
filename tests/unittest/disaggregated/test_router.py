@@ -889,3 +889,41 @@ def test_block_hash_mixin_routes_through_transformers_tokenizer():
     # not the TransformersTokenizer wrapper.
     assert out is inner
     assert probe._tokenizers["dummy/model"] is inner
+
+
+@pytest.mark.asyncio
+async def test_finish_request_forwards_explicit_session(servers):
+    """A caller-provided session is forwarded to the kv-cache-events poll.
+
+    finish_request(..., session=) threads the session through to
+    KvCacheAwareServerState.poll_and_update (disagg router session fix), which
+    must use the provided session for the kv_cache_events poll rather than its
+    own self._session.
+    """
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=32)
+    request = CompletionRequest(model="TinyLlama", prompt=[[1000] * 100])
+    await router.get_next_server(request)
+
+    # Build the explicit session inline WITHOUT spec=aiohttp.ClientSession: the
+    # autouse fixture has already patched aiohttp.ClientSession to a MagicMock, so
+    # _make_mock_aiohttp_session's spec= would raise "Cannot spec a Mock object".
+    mock_response = mock.AsyncMock()
+    mock_response.json = mock.AsyncMock(return_value=[])
+    mock_ctx = mock.AsyncMock()
+    mock_ctx.__aenter__ = mock.AsyncMock(return_value=mock_response)
+    mock_ctx.__aexit__ = mock.AsyncMock(return_value=False)
+    explicit_session = mock.MagicMock()
+    explicit_session.post = mock.MagicMock(return_value=mock_ctx)
+
+    await router.finish_request(request, session=explicit_session)
+    await asyncio.sleep(0)
+
+    # The explicitly provided session is the one used to poll kv-cache events.
+    explicit_session.post.assert_called_once()
+    call = explicit_session.post.call_args
+    posted_url = call.args[0] if call.args else call.kwargs.get("url", "")
+    assert "kv_cache_events" in posted_url

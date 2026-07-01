@@ -2173,11 +2173,11 @@ class TestBatchedSampling:
             test_expected_counts != 0, 0, test_token_counts
         )
         assert (test_token_counts_for_zero_prob == 0).all()
-        test_expected_counts_ma = np.ma.masked_array(
+        test_expected_counts_ma = np.ma.MaskedArray(
             test_expected_counts.numpy(),
             mask=(test_expected_counts.numpy() == 0),
         )
-        test_token_counts_ma = np.ma.masked_array(
+        test_token_counts_ma = np.ma.MaskedArray(
             test_token_counts.numpy(),
             mask=test_expected_counts_ma.mask,
         )
@@ -2227,7 +2227,7 @@ class TestBatchedSampling:
             prob_delta = np.where(prob_delta > 5e-2, prob_delta, 0)  # NB: this is rather liberal
             # bound relative differences on remaining probs
             prob_delta_rel = (
-                np.ma.masked_array(num_samples * prob_delta, mask=test_expected_counts_ma.mask)
+                np.ma.MaskedArray(num_samples * prob_delta, mask=test_expected_counts_ma.mask)
                 / test_expected_counts_ma.data
             )
             assert prob_delta_rel.max() < 0.05

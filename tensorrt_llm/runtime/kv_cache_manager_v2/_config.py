@@ -243,6 +243,11 @@ class KVCacheManagerConfig:
     where the number of out-of-window blocks dominates memory usage.
     """
 
+    enable_stats: bool = True
+    """
+    Collect V2 KV cache allocation, reuse, and transfer statistics.
+    """
+
     # unsupported yet
     helix_config: HelixConfig | None = None
 

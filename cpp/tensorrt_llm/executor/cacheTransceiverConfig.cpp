@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,18 +23,21 @@ namespace tensorrt_llm::executor
 
 CacheTransceiverConfig::CacheTransceiverConfig(std::optional<BackendType> backendType,
     std::optional<size_t> maxNumTokens, std::optional<int> kvTransferTimeoutMs,
-    std::optional<int> kvTransferSenderFutureTimeoutMs)
+    std::optional<int> kvTransferSenderFutureTimeoutMs, std::optional<int> kvTransferPollIntervalMs)
     : mBackendType(backendType)
     , mMaxTokensInBuffer(maxNumTokens)
     , mKvTransferTimeoutMs(kvTransferTimeoutMs)
     , mKvTransferSenderFutureTimeoutMs(kvTransferSenderFutureTimeoutMs)
+    , mKvTransferPollIntervalMs(kvTransferPollIntervalMs)
 {
 }
 
 bool CacheTransceiverConfig::operator==(CacheTransceiverConfig const& other) const
 {
     return mMaxTokensInBuffer == other.mMaxTokensInBuffer && mBackendType == other.mBackendType
-        && mKvTransferTimeoutMs == other.mKvTransferTimeoutMs;
+        && mKvTransferTimeoutMs == other.mKvTransferTimeoutMs
+        && mKvTransferSenderFutureTimeoutMs == other.mKvTransferSenderFutureTimeoutMs
+        && mKvTransferPollIntervalMs == other.mKvTransferPollIntervalMs;
 }
 
 void CacheTransceiverConfig::setBackendType(std::optional<BackendType> backendType)
@@ -65,6 +68,15 @@ void CacheTransceiverConfig::setKvTransferSenderFutureTimeoutMs(std::optional<in
     mKvTransferSenderFutureTimeoutMs = kvTransferSenderFutureTimeoutMs;
 }
 
+void CacheTransceiverConfig::setKvTransferPollIntervalMs(std::optional<int> kvTransferPollIntervalMs)
+{
+    if (kvTransferPollIntervalMs.has_value() && kvTransferPollIntervalMs.value() <= 0)
+    {
+        TLLM_THROW("kvTransferPollIntervalMs must be positive");
+    }
+    mKvTransferPollIntervalMs = kvTransferPollIntervalMs;
+}
+
 std::optional<CacheTransceiverConfig::BackendType> CacheTransceiverConfig::getBackendType() const
 {
     return mBackendType;
@@ -83,5 +95,10 @@ std::optional<int> CacheTransceiverConfig::getKvTransferTimeoutMs() const
 std::optional<int> CacheTransceiverConfig::getKvTransferSenderFutureTimeoutMs() const
 {
     return mKvTransferSenderFutureTimeoutMs;
+}
+
+std::optional<int> CacheTransceiverConfig::getKvTransferPollIntervalMs() const
+{
+    return mKvTransferPollIntervalMs;
 }
 } // namespace tensorrt_llm::executor

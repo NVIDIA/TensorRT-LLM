@@ -277,9 +277,11 @@ class NemotronHMOE(nn.Module):
         )
 
         if reduce_output:
+            # AllReduce needs dtype at construction to build fused MNNVL paths.
             self.allreduce = AllReduce(
                 mapping=model_config.mapping,
                 strategy=model_config.allreduce_strategy,
+                dtype=config.torch_dtype,
             )
         else:
             self.allreduce = None
@@ -488,9 +490,11 @@ class NemotronHLayer(DecoderLayer):
         )
 
         if fuse_allreduce_norm and layer_idx > 0:
+            # AllReduce needs dtype at construction to build fused MNNVL paths.
             self.pre_allreduce = AllReduce(
                 mapping=model_config.mapping,
                 strategy=model_config.allreduce_strategy,
+                dtype=config.torch_dtype,
             )
 
         # Mixer creation.  The fuse_allreduce_norm optimization is orthogonal
@@ -717,9 +721,11 @@ class NemotronHModel(DecoderModel):
 
         # AllReduce for fusing with final norm (after last layer's mixer)
         if self.fuse_allreduce_norm:
+            # AllReduce needs dtype at construction to build fused MNNVL paths.
             self.final_allreduce = AllReduce(
                 mapping=model_config.mapping,
                 strategy=model_config.allreduce_strategy,
+                dtype=config.torch_dtype,
             )
 
     def forward(
@@ -798,12 +804,6 @@ def _force_moe_backend_for_w4a16_on_hopper(
 
     if model_config.moe_backend.upper() in ('CUTLASS', 'AUTO'):
         return
-    logger.warning(
-        f"Nemotron-H SM{get_sm_version()}: forcing moe_backend "
-        f"'{model_config.moe_backend}' -> 'CUTLASS' for W4A16 fallback")
-    model_config._frozen = False
-    model_config.moe_backend = 'CUTLASS'
-    model_config._frozen = True
 
 
 @contextmanager

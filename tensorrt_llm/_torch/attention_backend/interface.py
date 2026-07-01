@@ -3,8 +3,8 @@ import weakref
 from collections import namedtuple
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from typing import (TYPE_CHECKING, Any, Dict, Generic, List, Optional, Protocol,
-                    Tuple, Type, TypeVar, Union)
+from typing import (TYPE_CHECKING, Any, Dict, Generic, List, Literal, Optional,
+                    Protocol, Tuple, Type, TypeVar, Union)
 
 import torch
 from typing_extensions import Self
@@ -42,8 +42,10 @@ class AttentionRuntimeFeatures:
     chunked_prefill: bool = False
     cache_reuse: bool = False
     has_speculative_draft_tokens: bool = False
-    chunk_size: int = 0  # this is the chunk size for MLA chunked prefill, it will split kv cache into chunks to save global memory.
-    chunked_prefill_buffer_batch_size: int = 4  # real chunk size for MLA chunked prefill is chunked_prefill_buffer_batch_size * chunk_size.
+    # This is the chunk size for MLA chunked prefill, which splits KV cache into chunks.
+    chunk_size: int = 0
+    # The real chunk size for MLA chunked prefill is this value * chunk_size.
+    chunked_prefill_buffer_batch_size: int = 4
 
 
 # The type of requests in qkv passed to attention
@@ -73,6 +75,10 @@ class AttentionMetadata:
     mapping: Optional[Mapping] = None
     # Sparse settings for metadata allocation/update; dense metadata leaves it None.
     sparse_metadata_params: Optional[SparseMetadataParams] = None
+    # Paged KV-cache block layout:
+    # NHD: [max_num_pages, 2, page_size, num_kv_heads, head_dim]
+    # HND: [max_num_pages, 2, num_kv_heads, page_size, head_dim]
+    kv_layout: Literal["NHD", "HND"] = "HND"
 
     enable_flash_mla: bool = False
     enable_context_mla_with_cached_kv: bool = False
@@ -173,6 +179,13 @@ class AttentionMetadata:
                                                     default_factory=dict)
     # The number of heads per kv head.
     num_heads_per_kv: Optional[int] = 1
+
+    multi_item_part_lens: Optional[list[list[int]]] = None
+    """Additional token layout information for multi-item scoring.
+
+    Aggregates `TokensPrompt.multi_item_part_lens` for all requests in the batch,
+    see `TokensPrompt` for details.
+    """
 
     def __post_init__(self) -> None:
         if self.is_cross:
@@ -835,13 +848,6 @@ class AttentionForwardArgs:
     relative_attention_max_distance: int = 0
     cross_kv: Optional[torch.Tensor] = None
 
-    multi_item_part_lens: Optional[list[list[int]]] = None
-    """Additional token layout information for multi-item scoring.
-
-    Aggregates `TokensPrompt.multi_item_part_lens` for all requests in the batch,
-    see `TokensPrompt` for details.
-    """
-
     latent_cache: Optional[torch.Tensor] = None
     q_pe: Optional[torch.Tensor] = None
     mrope_rotary_cos_sin: Optional[torch.Tensor] = None
@@ -853,6 +859,10 @@ class AttentionForwardArgs:
     cu_q_seqlens: Optional[torch.Tensor] = None
     cu_kv_seqlens: Optional[torch.Tensor] = None
     fmha_scheduler_counter: Optional[torch.Tensor] = None
+    # Testing only: skip the RoPE step of MLA generation (the standalone harness
+    # feeds a pre-RoPE'd fused_q). The TRTLLM backend then appends the new latent
+    # and inits the trtllm-gen scheduler buffers itself.
+    skip_mla_rope_generation: bool = False
 
     mla_bmm1_scale: Optional[torch.Tensor] = None
     mla_bmm2_scale: Optional[torch.Tensor] = None
@@ -982,6 +992,10 @@ class AttentionBackend(Generic[TMetadata]):
 
     @classmethod
     def support_mla(cls) -> bool:
+        return False
+
+    @classmethod
+    def support_multi_item_scoring(cls) -> bool:
         return False
 
     def create_output(self, q: torch.Tensor, **kwargs) -> List[torch.Tensor]:

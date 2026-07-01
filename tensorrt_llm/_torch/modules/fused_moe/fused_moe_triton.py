@@ -366,8 +366,11 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
             module.w3_w1_weight.data)
         module.w2_weight.data = update_weight_stride(module.w2_weight.data)
 
-    def apply(self, module: torch.nn.Module, x: torch.Tensor,
-              router_logits: torch.Tensor) -> torch.Tensor:
+    def apply(self,
+              module: torch.nn.Module,
+              x: torch.Tensor,
+              router_logits: torch.Tensor,
+              input_ids: Optional[torch.IntTensor] = None) -> torch.Tensor:
         # Fetch all the data needed for the Triton kernel
         hidden_states = x
         expert_logits = router_logits
@@ -592,8 +595,11 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
             module.w3_w1_weight.data)
         module.w2_weight.data = update_weight_stride(module.w2_weight.data)
 
-    def apply(self, module: torch.nn.Module, x: torch.Tensor,
-              router_logits: torch.Tensor) -> torch.Tensor:
+    def apply(self,
+              module: torch.nn.Module,
+              x: torch.Tensor,
+              router_logits: torch.Tensor,
+              input_ids: Optional[torch.IntTensor] = None) -> torch.Tensor:
         # Fetch all the data needed for the Triton kernel
         hidden_states, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
             x, module.fc31_input_dequant)
@@ -1242,8 +1248,11 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                 module.fc2_input_dequant.data.copy_(max_fc2_input_scale,
                                                     non_blocking=True)
 
-    def apply(self, module: torch.nn.Module, x: torch.Tensor,
-              router_logits: torch.Tensor) -> torch.Tensor:
+    def apply(self,
+              module: torch.nn.Module,
+              x: torch.Tensor,
+              router_logits: torch.Tensor,
+              input_ids: Optional[torch.IntTensor] = None) -> torch.Tensor:
         # Fetch all the data needed for the Triton kernel
         if self.activation_dtype == torch.float8_e4m3fn:
             if module.fc31_input_dequant is None:
@@ -1557,6 +1566,7 @@ class TritonFusedMoE(MoE):
         x: torch.Tensor,
         router_logits: torch.Tensor,
         *,
+        input_ids: Optional[torch.IntTensor] = None,
         do_finalize: bool = True,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
@@ -1566,7 +1576,8 @@ class TritonFusedMoE(MoE):
         assert use_dp_padding is None or not use_dp_padding, \
             "TritonFusedMoE does not support use_dp_padding=True"
 
-        hidden_states = self.quant_method.apply(self, x, router_logits)
+        hidden_states = self.quant_method.apply(self, x, router_logits,
+                                                input_ids)
 
         final_hidden_states = self.reducescatter_or_allreduce(
             hidden_states,

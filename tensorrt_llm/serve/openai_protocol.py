@@ -50,6 +50,15 @@ _LOGIT_BIAS_MIN = -100.0
 _LOGIT_BIAS_MAX = 100.0
 
 
+def ensure_request_chat_template_allowed(request: Any,
+                                         allow_request_chat_template: bool):
+    if (getattr(request, "chat_template", None) is not None
+            and not allow_request_chat_template):
+        raise ValueError(
+            "chat_template cannot be supplied per request unless request-level "
+            "chat templates are enabled at server startup.")
+
+
 def _logit_bias_to_embedding_bias(
         logit_bias: Optional[Dict[str, float]],
         vocab_size: Optional[int]) -> Optional[torch.Tensor]:

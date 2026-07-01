@@ -268,7 +268,7 @@ class TestCosmos3FP8Load:
         checkpoint = _require_checkpoint()
         pipeline = _load_pipeline(checkpoint, quant_config=COSMOS3_FP8_QUANT_CONFIG)
         try:
-            assert pipeline.model_config.quant_config.quant_algo is not None
+            assert pipeline.transformer.model_config.quant_config.quant_algo is not None
             result = _run_forward(pipeline, image=None, num_frames=NUM_FRAMES)
             _assert_valid_video(result.video, num_frames=NUM_FRAMES)
             assert result.frame_rate == FRAME_RATE

@@ -32,6 +32,8 @@ from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
                         GenerationResult, IterationResult, LoRARequest,
                         PostprocWorkerConfig, PromptAdapterRequest)
 from ..executor.postproc_worker import PostprocParams
+from ..executor.postprocessor_hook import (PostProcessorHook,
+                                           load_post_processor_hook)
 from ..executor.request import DEFAULT_REQUEST_PRIORITY
 from ..executor.utils import (RequestError, create_mpi_comm_session,
                               get_spawn_proxy_process_env)
@@ -76,15 +78,20 @@ class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
 
     @classmethod
     def _from_generation_result(
-            cls,
-            generation_result: GenerationResult,
-            prompt: Optional[str] = None,
-            tokenizer: Optional[TokenizerBase] = None) -> 'RequestOutput':
+        cls,
+        generation_result: GenerationResult,
+        prompt: Optional[str] = None,
+        tokenizer: Optional[TokenizerBase] = None,
+        post_processor_hook: Optional[PostProcessorHook] = None
+    ) -> 'RequestOutput':
         inst = cls.__new__(cls)
         inst.__dict__.update(generation_result.__dict__)
         inst.tokenizer = tokenizer
         inst._streaming = generation_result._streaming
         inst._prompt = prompt
+        # User post-processing hook; threaded onto the result the
+        # user holds, where the in-proxy detok runs. None when unconfigured.
+        inst._post_processor_hook = post_processor_hook
         return inst
 
     @property
@@ -306,6 +313,14 @@ class BaseLLM:
         logger_debug(f"LLM.args.mpi_session: {self.args.mpi_session}\n",
                      "yellow")
         self.mpi_session = self.args.mpi_session
+
+        # Build this LLM's post-processing hook for the in-proxy detok path (each
+        # postproc worker builds its own). Resolving here fails fast on a bad
+        # import path at startup rather than per-request.
+        _post_processor_path = getattr(self.args, "post_processor_hook", None)
+        self._post_processor_hook = (
+            load_post_processor_hook(_post_processor_path)
+            if _post_processor_path else None)
 
         if self.args.parallel_config.is_multi_gpu:
             if os.getenv("RAY_LOCAL_WORLD_SIZE") is None and get_device_count(
@@ -681,8 +696,11 @@ class BaseLLM:
             result.metrics_dict.update(
                 {MetricNames.ARRIVAL_TIMESTAMP: time.time()})
 
-        return RequestOutput._from_generation_result(result, prompt,
-                                                     self.tokenizer)
+        return RequestOutput._from_generation_result(
+            result,
+            prompt,
+            self.tokenizer,
+            post_processor_hook=self._post_processor_hook)
 
     def _preprocess(
         self,
@@ -1018,6 +1036,10 @@ class BaseLLM:
                 prompt_token_ids = inp_tok["prompt_token_ids"]
                 if multi_item_part_lens is not None:
                     # validate lengths
+                    if len(multi_item_part_lens) < 2:
+                        raise ValueError(
+                            "\"multi_item_part_lens\" must have at least two elements"
+                        )
                     if sum(multi_item_part_lens) + len(
                             multi_item_part_lens) != len(prompt_token_ids):
                         raise ValueError(
@@ -1681,6 +1703,7 @@ class _TrtLLM(BaseLLM):
             postproc_worker_config=PostprocWorkerConfig(
                 num_postprocess_workers=self.args.num_postprocess_workers,
                 postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir,
+                post_processor_hook=self.args.post_processor_hook,
             ),
             is_llm_executor=True)
 
@@ -1829,6 +1852,7 @@ class _TorchLLM(BaseLLM):
             postproc_worker_config=PostprocWorkerConfig(
                 num_postprocess_workers=self.args.num_postprocess_workers,
                 postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir,
+                post_processor_hook=self.args.post_processor_hook,
             ),
             is_llm_executor=True,
             hf_model_dir=self._hf_model_dir,

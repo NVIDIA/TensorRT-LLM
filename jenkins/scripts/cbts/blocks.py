@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+import json
+import math
 import re
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
@@ -29,6 +31,9 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 import yaml
+
+# Target wall-time per pytest-split shard (used to size a narrowed stage's splits).
+TARGET_SHARD_SECONDS = 2 * 60 * 60
 
 
 @dataclass
@@ -583,8 +588,36 @@ def block_matches_stage(block: Block, stage: Stage) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# CBTS Layer 3 split-count heuristic: per-stage narrowed test count
+# CBTS Layer 3 split sizing: per-stage narrowed test count + duration estimate
 # ---------------------------------------------------------------------------
+
+
+def _kept_entries_for_stage(
+    block_by_key: dict[tuple[str, int], Block],
+    stage: "Stage",
+    block_filters: dict[tuple[str, int], dict[str, set[str]]],
+) -> list[str]:
+    """Kept `tests:` entries for a stage (same keep filter as write_filtered_test_db)."""
+    entries: list[str] = []
+    for (yaml_stem, idx), prefix_to_waives in block_filters.items():
+        if yaml_stem != stage.yaml_stem:
+            continue
+        block = block_by_key.get((yaml_stem, idx))
+        if block is None or not block_matches_stage(block, stage):
+            continue
+        kept: list[str] = []
+        for t in block.tests:
+            target = _entry_target(t)
+            matched_waives: set[str] = set()
+            for prefix, waives in prefix_to_waives.items():
+                if _target_in_filter_subtree(target, prefix):
+                    matched_waives |= waives
+            if not matched_waives:
+                continue
+            if any(_entry_applies_to_waive(t, w) for w in matched_waives):
+                kept.append(t)
+        entries.extend(kept if kept else list(block.tests))
+    return entries
 
 
 def compute_stage_test_counts(
@@ -593,13 +626,7 @@ def compute_stage_test_counts(
     affected_stages: set[str],
     block_filters: dict[tuple[str, int], dict[str, set[str]]],
 ) -> dict[str, int]:
-    """Sum the kept-test count per affected stage across matching blocks.
-
-    Used by Groovy launchTestJobs to decide whether to collapse the stage's
-    pytest-split splits to 1 (when narrowed_count < 20). The keep filter
-    here mirrors the one in `write_filtered_test_db` exactly so the count
-    matches what trt-test-db will eventually render.
-    """
+    """Per-stage kept-entry count (decision telemetry / diagnostics)."""
     block_by_key: dict[tuple[str, int], Block] = {
         (b.yaml_stem, b.block_index): b for b in yaml_index.blocks
     }
@@ -608,29 +635,67 @@ def compute_stage_test_counts(
         stage = stages.get(stage_name)
         if stage is None:
             continue
-        total = 0
-        for (yaml_stem, idx), prefix_to_waives in block_filters.items():
-            if yaml_stem != stage.yaml_stem:
-                continue
-            block = block_by_key.get((yaml_stem, idx))
-            if block is None or not block_matches_stage(block, stage):
-                continue
-            kept: list[str] = []
-            for t in block.tests:
-                target = _entry_target(t)
-                matched_waives: set[str] = set()
-                for prefix, waives in prefix_to_waives.items():
-                    if _target_in_filter_subtree(target, prefix):
-                        matched_waives |= waives
-                if not matched_waives:
-                    continue
-                if any(_entry_applies_to_waive(t, w) for w in matched_waives):
-                    kept.append(t)
-            # Safety fallback mirrors write_filtered_test_db: when the
-            # narrowing would empty the block, the original tests stay.
-            total += len(kept) if kept else len(block.tests)
-        counts[stage_name] = total
+        counts[stage_name] = len(_kept_entries_for_stage(block_by_key, stage, block_filters))
     return counts
+
+
+def load_durations(durations_path: Path) -> dict[str, float]:
+    """Load pytest-split `.test_durations` ({node_id: seconds}); {} if absent/unparsable."""
+    try:
+        data = json.loads(durations_path.read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): float(v) for k, v in data.items() if isinstance(v, (int, float))}
+
+
+def _avg_duration(durations: dict[str, float]) -> float:
+    """Average known duration, or 1.0 when empty (mirrors pytest-split)."""
+    return (sum(durations.values()) / len(durations)) if durations else 1.0
+
+
+def _estimate_entries_seconds(entries: list[str], durations: dict[str, float], avg: float) -> float:
+    """Sum entries' wall-time: exact node-id, else subtree-sum (deduped), else avg."""
+    matched: set[str] = set()
+    unknown = 0
+    for entry in entries:
+        bare = _strip_pytest_options(normalize_test_id(entry))
+        if bare in durations:
+            matched.add(bare)
+            continue
+        target = _strip_params(bare)
+        subtree = [nid for nid in durations if _target_in_filter_subtree(nid, target)]
+        if subtree:
+            matched.update(subtree)
+        else:
+            unknown += 1
+    return sum(durations[nid] for nid in matched) + unknown * avg
+
+
+def compute_stage_split_counts(
+    yaml_index: "YAMLIndex",
+    stages: dict[str, "Stage"],
+    affected_stages: set[str],
+    block_filters: dict[tuple[str, int], dict[str, set[str]]],
+    durations: dict[str, float],
+    target_seconds: int = TARGET_SHARD_SECONDS,
+) -> dict[str, int]:
+    """Per-stage k = clamp(ceil(est_seconds / target_seconds), 1, stage.total_splits)."""
+    block_by_key: dict[tuple[str, int], Block] = {
+        (b.yaml_stem, b.block_index): b for b in yaml_index.blocks
+    }
+    avg = _avg_duration(durations)
+    splits: dict[str, int] = {}
+    for stage_name in affected_stages:
+        stage = stages.get(stage_name)
+        if stage is None:
+            continue
+        entries = _kept_entries_for_stage(block_by_key, stage, block_filters)
+        seconds = _estimate_entries_seconds(entries, durations, avg)
+        k = max(1, min(math.ceil(seconds / target_seconds), stage.total_splits))
+        splits[stage_name] = k
+    return splits
 
 
 # ---------------------------------------------------------------------------

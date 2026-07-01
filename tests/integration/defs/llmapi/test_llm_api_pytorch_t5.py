@@ -79,8 +79,8 @@ _MIXED_ENCODER_OUTPUT_TOKEN_IDS_BY_MODEL_AND_BEAMS = {
     ("t5-small", 2): [
         _HF_BEAM_OUTPUT_TOKEN_IDS_BY_MODEL_AND_BEAMS[("t5-small", 2)],
         [
-            [644, 4675, 229, 219],
             [644, 4675, 4186, 219],
+            [644, 4675, 229, 219],
         ],
     ],
     ("flan-t5-small", 2): [
@@ -106,7 +106,7 @@ def _test_case(
     num_return_sequences: int,
     exact_match: bool,
     feature_id: str,
-    marks=(),
+    marks=None,
 ):
     if num_beams == 1:
         expected_output_token_ids = (
@@ -127,6 +127,10 @@ def _test_case(
 
     assert not exact_match or expected_output_token_ids is not None
 
+    param_kwargs = {"id": f"{feature_id}-{model_name}"}
+    if marks is not None:
+        param_kwargs["marks"] = marks
+
     return pytest.param(
         model_name,
         expected_output_token_ids,
@@ -136,8 +140,7 @@ def _test_case(
         num_beams,
         num_return_sequences,
         exact_match,
-        id=f"{feature_id}-{model_name}",
-        marks=marks,
+        **param_kwargs,
     )
 
 
@@ -371,7 +374,6 @@ def _mixed_batch_test_case(
     num_return_sequences: int,
     exact_match: bool,
     feature_id: str,
-    marks=(),
 ):
     expected_output_token_ids_by_request = (
         _MIXED_ENCODER_OUTPUT_TOKEN_IDS_BY_MODEL_AND_BEAMS.get((model_name, num_beams))
@@ -389,7 +391,6 @@ def _mixed_batch_test_case(
         num_return_sequences,
         exact_match,
         id=f"{feature_id}-{model_name}",
-        marks=marks,
     )
 
 
@@ -511,25 +512,21 @@ def _assert_expected_generation(
     assert all(decoded_text_by_output)
     if expected_token_ids_by_output is None:
         assert all(expected_text_fragment in text for text in decoded_text_by_output)
+    elif exact_match:
+        assert token_ids_by_output == expected_token_ids_by_output
+    elif len(expected_token_ids_by_output) > 1:
+        assert {tuple(token_ids) for token_ids in token_ids_by_output} == {
+            tuple(token_ids) for token_ids in expected_token_ids_by_output
+        }
     else:
         assert token_ids_by_output[0] == expected_token_ids_by_output[0]
     if len(token_ids_by_output) > 1:
         assert len({tuple(token_ids) for token_ids in token_ids_by_output}) == len(
             token_ids_by_output
         )
-    if not exact_match:
-        return
-
-    assert expected_token_ids_by_output is not None
-    assert token_ids_by_output == expected_token_ids_by_output
 
 
-@pytest.mark.parametrize(
-    "model_name,expected_output_token_ids_by_output,torch_dtype,use_kv_cache_manager_v2,"
-    "enable_cuda_graph,num_beams,num_return_sequences,exact_match",
-    _TEST_CASES,
-)
-def test_t5_pytorch_generate_encoder_decoder_end_to_end(
+def _run_t5_pytorch_generate_encoder_decoder(
     monkeypatch: pytest.MonkeyPatch,
     model_name: str,
     expected_output_token_ids_by_output: list[list[int]] | None,
@@ -590,6 +587,35 @@ def test_t5_pytorch_generate_encoder_decoder_end_to_end(
             exact_match,
             expected_output_token_ids_by_output,
         )
+
+
+@pytest.mark.parametrize(
+    "model_name,expected_output_token_ids_by_output,torch_dtype,use_kv_cache_manager_v2,"
+    "enable_cuda_graph,num_beams,num_return_sequences,exact_match",
+    _TEST_CASES,
+)
+def test_t5_pytorch_generate_encoder_decoder_end_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+    model_name: str,
+    expected_output_token_ids_by_output: list[list[int]] | None,
+    torch_dtype: str,
+    use_kv_cache_manager_v2: bool,
+    enable_cuda_graph: bool,
+    num_beams: int,
+    num_return_sequences: int,
+    exact_match: bool,
+) -> None:
+    _run_t5_pytorch_generate_encoder_decoder(
+        monkeypatch,
+        model_name,
+        expected_output_token_ids_by_output,
+        torch_dtype,
+        use_kv_cache_manager_v2,
+        enable_cuda_graph,
+        num_beams,
+        num_return_sequences,
+        exact_match,
+    )
 
 
 @pytest.mark.parametrize(

@@ -115,6 +115,19 @@ class FusedMoEQuantScalesW4A8MXFP4MXFP8(NamedTuple):
     fc2_dequant_scale: torch.Tensor
 
 
+class FusedMoEQuantScalesMXFP8(NamedTuple):
+    """MXFP8 (W8A8) MoE block scales.
+
+    Both expert GEMMs (fc31 = w3_w1, fc2 = w2) use MXFP8 weights with UE8M0
+    1x32 block scales. Activations are dynamically quantized to MXFP8 at
+    runtime, so no static fc31/fc2 dequant scales are required (we still
+    register fake unit tensors to keep the quant_scales tuple shape stable
+    if the kernel expects a fixed arity).
+    """
+    fc31_weight_block_scale: torch.Tensor
+    fc2_weight_block_scale: torch.Tensor
+
+
 def trtllmgen_maybe_get_cached_w3_w1_permute_indices(
         dst_w3_w1_weight: torch.Tensor,
         cache_permute_indices: Dict[tuple[tuple[int, int, int], str],
@@ -2540,6 +2553,19 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
 
         delattr(module, 'tmp_pre_quant_scales')
 
+    def _prepare_shared_weight_scales_for_finalization(
+            self, module: torch.nn.Module) -> None:
+        """Hook for subclasses to transform the shared weight-scale tensors
+        before they are registered with the load balancer and freed.
+
+        Mirrors ``FusedMoEMethodBase._prepare_shared_weights_for_finalization``
+        but for the NVFP4 block-scale tensors, which are finalized and
+        registered here in ``process_weights_after_loading`` (not in
+        ``_finalize_shared_weights``).  Backends whose kernels expect a
+        backend-specific scale layout (e.g. CuteDsl) must override this so that
+        experts migrated by online EPLB receive correctly-laid-out scales.
+        """
+
     def process_weights_after_loading(self, module: torch.nn.Module):
         if not hasattr(module, 'tmp_raw_input_scales'):
             return  # No quant scales were loaded, nothing to finalize
@@ -2608,6 +2634,11 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                 shared_fc2_alpha, shared_fc31_weight_scale_2,
                 shared_fc2_weight_scale_2,
                 module.layer_load_balancer.get_load_expert_ids())
+            # Let subclasses transform the shared scale tensors into their
+            # backend-specific layout BEFORE they are registered with the load
+            # balancer for online EPLB migration (see hook docstring). Must run
+            # before register_all_parameter_slot_and_to_fix_weight_fns below.
+            self._prepare_shared_weight_scales_for_finalization(module)
             weight_fns = {
                 'w3_w1_weight_scale': module.local_shared_w3_w1_scale_tensors,
                 'w2_weight_scale': module.local_shared_w2_scale_tensors,
@@ -2822,7 +2853,7 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
         if not hasattr(module, 'tmp_cutlass_w3_w1_weights'):
             module.tmp_cutlass_w3_w1_weights = {}
         assert expert_idx >= 0, "expert_idx must be provided for stable dict key"
-        dst_base = dst_w3_w1_weight.storage().data_ptr()
+        dst_base = dst_w3_w1_weight.untyped_storage().data_ptr()
         dict_key = (dst_base, expert_idx)
         expert_entry = module.tmp_cutlass_w3_w1_weights.setdefault(dict_key, {})
         expert_entry['dst'] = dst_w3_w1_weight
@@ -2909,6 +2940,113 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
                     module.local_shared_w2_scale_tensors[expert_idx])
 
         super().process_weights_after_loading(module)
+
+
+class NVFP4MarlinFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
+    """NVFP4 MoE quantization method for the Marlin backend.
+
+    Inherits weight loading from the CUTLASS method, then transforms the loaded
+    weights to Marlin tiled format in ``post_load_weights``.
+
+    The Marlin kernel is W4A16 (BF16 activations, no activation quantization),
+    so global_scale must be the raw ``weight_scale_2`` — not the CUTLASS alpha
+    which folds in ``input_scale``.  We intercept alpha loading to save the
+    raw ``weight_scale_2`` values.
+    """
+
+    # Marlin's ``post_load_weights`` repacks weights into Marlin tiled format
+    # and rebuilds the module parameters, which is incompatible with dynamic
+    # EPLB weight migration.
+    eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
+
+    def load_expert_fc31_alpha_nvfp4(self, w1_weight_scale_2, w3_weight_scale_2,
+                                     final_fc31_input_scale, dst_fc31_alpha):
+        # Store raw weight_scale_2 for Marlin (W4A16: no input_scale needed).
+        w1_ws2 = w1_weight_scale_2[...].reshape([])
+        dst_fc31_alpha.copy_(w1_ws2)
+
+    def load_expert_fc2_alpha_nvfp4(self, w2_weight_scale_2,
+                                    final_fc2_input_scale, dst_w2_alpha):
+        w2_ws2 = w2_weight_scale_2[...].reshape([])
+        dst_w2_alpha.copy_(w2_ws2)
+
+    def post_load_weights(self, module):
+        """Transform CUTLASS-format NVFP4 weights to Marlin tiled format."""
+        from tensorrt_llm.quantization.utils import marlin_utils
+
+        # Standard CUTLASS loading (swizzles scales, computes alpha, etc.)
+        super().post_load_weights(module)
+
+        num_experts = module.expert_size_per_partition
+        hidden_size = module.hidden_size
+        intermediate_size = module.intermediate_size_per_partition
+        is_act_and_mul = module.intermediate_size_expand_ratio == 2
+        group_size = module.scaling_vector_size  # 16
+
+        # Actual (unpadded) dimensions
+        N1 = intermediate_size * (2 if is_act_and_mul else 1)
+        K1 = hidden_size
+        N2 = hidden_size
+        K2 = intermediate_size
+
+        def unswizzle_scales(scale_3d, N_actual, K_actual):
+            """Unswizzle packed int32 scales -> FP8 [num_experts, N, num_groups]."""
+            num_groups = K_actual // group_size
+            result = []
+            for i in range(num_experts):
+                # [N_padded, K//64] int32 -> float4_sf_dtype -> reverse -> FP8
+                s_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+                    scale_3d[i].view(float4_sf_dtype))
+                s_fp8 = s_unswizzled.view(
+                    torch.float8_e4m3fn)[:N_actual, :num_groups]
+                result.append(s_fp8.unsqueeze(0))
+            return torch.cat(result, 0)
+
+        w13_scale = unswizzle_scales(module.w3_w1_weight_scale, N1, K1)
+        w2_scale = unswizzle_scales(module.w2_weight_scale, N2, K2)
+        w13_weight = module.w3_w1_weight.view(torch.uint8)[:, :N1, :K1 //
+                                                           2].contiguous()
+        w2_weight = module.w2_weight.view(torch.uint8)[:, :N2, :K2 //
+                                                       2].contiguous()
+
+        w13_gs = module.fc31_alpha.data.clone()
+        w2_gs = module.fc2_alpha.data.clone()
+
+        (w13, w13_s, w13_gs, w2, w2_s,
+         w2_gs) = marlin_utils.prepare_nvfp4_moe_weights_for_marlin(
+             w13=w13_weight,
+             w13_scale=w13_scale,
+             w13_global_scale=w13_gs,
+             w2=w2_weight,
+             w2_scale=w2_scale,
+             w2_global_scale=w2_gs,
+             hidden_size=hidden_size,
+             intermediate_size_per_partition=intermediate_size,
+             num_experts=num_experts,
+             is_act_and_mul=is_act_and_mul,
+             param_dtype=torch.bfloat16,
+         )
+
+        for name in (
+                "w3_w1_weight",
+                "w2_weight",
+                "w3_w1_weight_scale",
+                "w2_weight_scale",
+                "fc31_alpha",
+                "fc2_alpha",
+        ):
+            getattr(module, name).data.untyped_storage().resize_(0)
+
+        module.w3_w1_weight = nn.Parameter(w13.view(torch.int64),
+                                           requires_grad=False)
+        module.w3_w1_weight_scale = nn.Parameter(w13_s.view(torch.int32),
+                                                 requires_grad=False)
+        module.fc31_alpha = nn.Parameter(w13_gs, requires_grad=False)
+        module.w2_weight = nn.Parameter(w2.view(torch.int64),
+                                        requires_grad=False)
+        module.w2_weight_scale = nn.Parameter(w2_s.view(torch.int32),
+                                              requires_grad=False)
+        module.fc2_alpha = nn.Parameter(w2_gs, requires_grad=False)
 
 
 class W4A16NVFP4CutlassFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
@@ -3051,6 +3189,36 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
             k).view(n, k // module.scaling_vector_size)
         dst_w3_w1_weight_scale.copy_(
             w3_w1_weight_scale_interleaved.view(dst_w3_w1_weight_scale.dtype))
+
+    def _prepare_shared_weights_for_finalization(
+            self, module: torch.nn.Module) -> None:
+        # The base hook registers the shared (host) w3_w1 weights with the load
+        # balancer for online EPLB migration. Apply the same gate/up interleave
+        # that process_weights_after_loading() applies to the on-device weights,
+        # so experts migrated into a slot land in the layout the fused CuteDsl
+        # kernel expects (otherwise migrated slots are silently corrupted).
+        super()._prepare_shared_weights_for_finalization(module)
+        if not module.is_gated_activation:
+            return
+        shared = getattr(module, 'local_shared_w3_w1_tensors', None)
+        if shared is None:
+            return
+        for expert_idx in range(shared.shape[0]):
+            self._interleave_w3_w1_weight(shared[expert_idx])
+
+    def _prepare_shared_weight_scales_for_finalization(
+            self, module: torch.nn.Module) -> None:
+        # Same as _prepare_shared_weights_for_finalization above, for the shared
+        # (host) w3_w1 block scales.
+        super()._prepare_shared_weight_scales_for_finalization(module)
+        if not module.is_gated_activation:
+            return
+        shared = getattr(module, 'local_shared_w3_w1_scale_tensors', None)
+        if shared is None:
+            return
+        for expert_idx in range(shared.shape[0]):
+            self._interleave_w3_w1_weight_scale_cute_dsl(
+                module, shared[expert_idx])
 
     def process_weights_after_loading(self, module: torch.nn.Module):
         # First let Cutlass parent do cat + pad + block_scale_interleave
@@ -5311,6 +5479,158 @@ class W4A8MXFP4FP8CutlassFusedMoEMethod(MXFP4WeightCutlassFusedMoEMethod):
         )
 
 
+class MXFP8CutlassFusedMoEMethod(FusedMoEMethodBase):
+    """MXFP8 weights (e4m3 + UE8M0 1x32 block scales) x dynamic MXFP8 acts MoE.
+
+    M3.1 scope (this class): create the weight + block-scale parameters, load
+    them from the checkpoint (e4m3 weights + uint8 UE8M0 scales), and wire
+    dispatch so the CutlassFusedMoE backend can be constructed for MXFP8
+    models. The actual forward kernel path (M3.2) lives in C++ MoE kernel
+    instantiations + a `use_mxfp8_weight_scaling` flag in `torch.ops.trtllm.
+    fused_moe`; until that lands `setup_quant_scales` will register a
+    `FusedMoEQuantScalesMXFP8` tuple but the forward will raise a clear
+    NotImplementedError pointing at the follow-up.
+    """
+    eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
+    weight_alignment = 128
+    BLOCK_SIZE = 32
+    # Match the MXFP4 MoE storage convention: scales are stored as int32 with
+    # 4 UE8M0 (uint8) values packed per int32 along the K dim. The MoE TMA
+    # descriptor and per-expert SF stride math both assume int32 SF buffers
+    # (see MXFP4WeightFusedMoEMethod). Storing as raw uint8 leads to wrong
+    # per-expert SF offsets and tcgen05.mma reading invalid SF descriptors
+    # -> cudaErrorIllegalInstruction. Total byte count is identical.
+    BLOCK_SCALES_DTYPE = torch.int32
+    BLOCK_SCALES_VEC_SIZE = 4  # sizeof(int32) / sizeof(uint8)
+
+    def create_weights(self, module: torch.nn.Module):
+        module.scaling_vector_size = self.BLOCK_SIZE
+
+        w3_w1_weight_shape = (module.expert_size_per_partition,
+                              module.expand_intermediate_size_per_partition,
+                              module.hidden_size)
+        w2_weight_shape = (module.expert_size_per_partition, module.hidden_size,
+                           module.intermediate_size_per_partition)
+
+        super().create_weights(module, torch.float8_e4m3fn, w3_w1_weight_shape,
+                               w2_weight_shape)
+
+        # K must divide evenly into 32 * 4 = 128 element groups so we can
+        # repack 4 UE8M0 scales per int32 along the K (SF) dim. For modern
+        # MoE checkpoints with 128-aligned hidden/intermediate, this is
+        # naturally satisfied.
+        sf_pack_k = self.BLOCK_SIZE * self.BLOCK_SCALES_VEC_SIZE  # = 128
+        assert module.hidden_size % sf_pack_k == 0, (
+            f"hidden_size={module.hidden_size} must be a multiple of "
+            f"{sf_pack_k} for MXFP8 MoE int32 SF packing")
+        assert module.intermediate_size_per_partition % sf_pack_k == 0
+
+        w3_w1_weight_scale = nn.Parameter(torch.empty(
+            (module.expert_size_per_partition,
+             module.expand_intermediate_size_per_partition,
+             module.hidden_size // sf_pack_k),
+            dtype=self.BLOCK_SCALES_DTYPE),
+                                          requires_grad=False)
+        module.register_parameter("w3_w1_weight_scale", w3_w1_weight_scale)
+
+        w2_weight_scale = nn.Parameter(torch.empty(
+            (module.expert_size_per_partition, module.hidden_size,
+             module.intermediate_size_per_partition // sf_pack_k),
+            dtype=self.BLOCK_SCALES_DTYPE),
+                                       requires_grad=False)
+        module.register_parameter("w2_weight_scale", w2_weight_scale)
+
+        self._online_eplb_not_verified(module)
+        self.setup_quant_scales(module)
+
+    def setup_quant_scales(self, module: torch.nn.Module):
+        module.quant_scales = FusedMoEQuantScalesMXFP8(
+            fc31_weight_block_scale=module.w3_w1_weight_scale,
+            fc2_weight_block_scale=module.w2_weight_scale,
+        )
+
+    @staticmethod
+    def _get_scale_key(weights, expert_id: int, leaf: str) -> Optional[str]:
+        # Producers either ship `weight_scale_inv` (MiniMax M3 / DeepSeek-style)
+        # or `weight_scale`. Probe both.
+        for suffix in ("weight_scale_inv", "weight_scale"):
+            key = f"{expert_id}.{leaf}.{suffix}"
+            if key in weights:
+                return key
+        return None
+
+    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+        device = module.w3_w1_weight_scale.device
+        for local_slot_id, expert_id in enumerate(
+                module.initial_local_expert_ids):
+            if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+                w1_key = self._get_scale_key(weights, expert_id, "w1")
+                w3_key = self._get_scale_key(weights, expert_id, "w3")
+                w2_key = self._get_scale_key(weights, expert_id, "w2")
+                w1_sf = weights[w1_key] if w1_key is not None else None
+                w3_sf = weights[w3_key] if w3_key is not None else None
+                w2_sf = weights[w2_key] if w2_key is not None else None
+            else:
+                raise NotImplementedError(
+                    f"MXFP8 MoE: weight loading mode {module.weight_loading_mode} "
+                    "not yet supported (only VANILLA today).")
+
+            # View the int32-packed storage as raw uint8 [E_slot, 2*N, K/32]
+            # so we can write per-row UE8M0 scales naturally. The byte layout
+            # is identical to int32 [E_slot, 2*N, K/(32*4)]; this is just a
+            # reinterpret cast, not a copy.
+            dst_w3_w1_u8 = module.w3_w1_weight_scale.data[local_slot_id].view(
+                torch.uint8)
+            dst_w2_u8 = module.w2_weight_scale.data[local_slot_id].view(
+                torch.uint8)
+
+            # w3_w1_weight is [2*N_int, K]; the scale axis 0 is also 2*N_int.
+            # Layout: top half = w3, bottom half = w1 (matches the weight
+            # load order in FusedMoEMethodBase.load_expert_w3_w1_weight).
+            dst_w3_u8, dst_w1_u8 = dst_w3_w1_u8.chunk(2, dim=0)
+            if w1_sf is not None:
+                w1_shard = load_weight_shard(w1_sf,
+                                             module.tp_size,
+                                             module.tp_rank,
+                                             TensorParallelMode.COLUMN,
+                                             device=device)
+                dst_w1_u8.copy_(w1_shard.to(torch.uint8))
+            if w3_sf is not None:
+                w3_shard = load_weight_shard(w3_sf,
+                                             module.tp_size,
+                                             module.tp_rank,
+                                             TensorParallelMode.COLUMN,
+                                             device=device)
+                dst_w3_u8.copy_(w3_shard.to(torch.uint8))
+            if w2_sf is not None:
+                w2_shard = load_weight_shard(w2_sf,
+                                             module.tp_size,
+                                             module.tp_rank,
+                                             TensorParallelMode.ROW,
+                                             device=device)
+                dst_w2_u8.copy_(w2_shard.to(torch.uint8))
+
+            # Swizzle each expert's block scale into the CUTLASS Mxf8f6f4
+            # block-scaled layout expected by the kernel mainloop. The op
+            # operates on the uint8 view; the result is then re-viewed back
+            # to int32 (same bytes, new dtype interpretation matching what
+            # the MoE TMA descriptor reads).
+            orig_w3_w1_int32_shape = module.w3_w1_weight_scale.data[
+                local_slot_id].shape
+            swizzled_w3_w1 = torch.ops.trtllm.block_scale_interleave(
+                dst_w3_w1_u8)
+            module.w3_w1_weight_scale.data[local_slot_id].copy_(
+                swizzled_w3_w1.view(
+                    self.BLOCK_SCALES_DTYPE).reshape(orig_w3_w1_int32_shape))
+
+            orig_w2_int32_shape = module.w2_weight_scale.data[
+                local_slot_id].shape
+            swizzled_w2 = torch.ops.trtllm.block_scale_interleave(dst_w2_u8)
+            module.w2_weight_scale.data[local_slot_id].copy_(
+                swizzled_w2.view(
+                    self.BLOCK_SCALES_DTYPE).reshape(orig_w2_int32_shape))
+
+
 class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
     weight_dtype = torch.uint8
     block_scales_dtype = torch.uint8
@@ -6099,6 +6419,36 @@ class W4A8MXFP4MXFP8MegaMoEDeepGemmMethod(FusedMoEMethodBase):
                f"{module._t_l1[0].dtype}, "
                f"sf {tuple(module._t_l1[1].shape)}/"
                f"{module._t_l1[1].dtype})")
+
+        # DG's transform copies w3_w1_weight and both SF tensors into
+        # fresh storage but lets w2_weight pass through as _t_l2[0], so
+        # the other three Parameters are dead duplicates (~24 GiB/rank
+        # on V4-Flash @ EP=4). Reseat their .data to an empty tensor to
+        # release the storage while keeping the Parameter objects (and
+        # therefore state_dict keys) registered. The asserts below
+        # guard against a future DG version that view-passes any of
+        # them — that would dangle the forward-time weight.
+        assert module._t_l1[0].data_ptr() != module.w3_w1_weight.data_ptr(), (
+            "MegaMoE dedup invariant broken: DG returned a view of "
+            "w3_w1_weight as _t_l1[0]; releasing the raw param would "
+            "dangle the forward-time L1 weight.")
+        assert module._t_l1[1].data_ptr() != module.w3_w1_weight_scale.data_ptr(
+        ), ("MegaMoE dedup invariant broken: _t_l1[1] aliases w3_w1_weight_scale."
+            )
+        assert module._t_l2[1].data_ptr() != module.w2_weight_scale.data_ptr(
+        ), ("MegaMoE dedup invariant broken: _t_l2[1] aliases w2_weight_scale.")
+        # Reseat the redundant raw params to empty storage to release HBM, but
+        # route through replace_parameter_and_save_metadata so the original
+        # full-shape meta is recorded in module.rebuild_tensor_metadata. Without
+        # this, pre_reload_weights() (dynamic EPLB reload) cannot rebuild these
+        # parameters to full size before load_weights() copies into them.
+        for _name in ("w3_w1_weight", "w3_w1_weight_scale", "w2_weight_scale"):
+            _redundant = getattr(module, _name)
+            replace_parameter_and_save_metadata(
+                module, _name,
+                torch.empty(0, dtype=_redundant.dtype,
+                            device=_redundant.device),
+                module.rebuild_tensor_metadata)
 
     def _setup_shared_weights_for_eplb(self, module: torch.nn.Module) -> None:
         """Transform & register host-side shared weights for dynamic EPLB.

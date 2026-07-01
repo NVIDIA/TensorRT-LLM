@@ -50,7 +50,19 @@ from ._core import (
     ScratchDesc,
     _KVCache,
 )
+from ._event_manager import (
+    KVCacheCreatedData,
+    KVCacheEvent,
+    KVCacheEventDiff,
+    KVCacheEventManager,
+    KVCacheRemovedData,
+    KVCacheStoredBlockData,
+    KVCacheStoredData,
+    KVCacheUpdatedData,
+    UniqueToken,
+)
 from ._life_cycle_registry import LayerGroupId, LifeCycleId
+from ._stats import KVCacheIterationStatsDelta, KVCacheStatsDelta
 from ._storage import BufferId
 
 __all__ = [
@@ -60,6 +72,15 @@ __all__ = [
     "TokenIdExt",
     "KVCacheManager",
     "_KVCache",
+    "KVCacheCreatedData",
+    "KVCacheEvent",
+    "KVCacheEventDiff",
+    "KVCacheEventManager",
+    "KVCacheRemovedData",
+    "KVCacheStoredBlockData",
+    "KVCacheStoredData",
+    "KVCacheUpdatedData",
+    "UniqueToken",
     "BeamIndex",
     "DEFAULT_BEAM_INDEX",
     "LayerId",
@@ -89,4 +110,6 @@ __all__ = [
     "PageIndexConverter",
     "PageIndexMode",
     "ScratchDesc",
+    "KVCacheIterationStatsDelta",
+    "KVCacheStatsDelta",
 ]

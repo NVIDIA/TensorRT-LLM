@@ -78,7 +78,7 @@ def _clear_multi_ctas_kv_counter_workspace(
         max_num_requests,
         multi_processor_count,
     )
-    fmha_workspace.narrow(0, 0, counter_size).zero_()
+    fmha_workspace.flatten().narrow(0, 0, counter_size).zero_()
 
 
 def _get_multi_ctas_kv_counter_size(
@@ -86,7 +86,7 @@ def _get_multi_ctas_kv_counter_size(
     max_num_requests: int,
     multi_processor_count: Optional[int],
 ) -> int:
-    return max(num_heads * max_num_requests, multi_processor_count or 0)
+    return max(num_heads * max_num_requests, multi_processor_count or 0) * torch.int32.itemsize
 
 
 def _get_bmm1_scale_log2(bmm1_scale: torch.Tensor) -> torch.Tensor:
@@ -184,6 +184,7 @@ def _trtllm_gen_batch_context_with_kv_cache(
     enable_pdl: bool,
     kv_scale_pool: Optional[torch.Tensor],
     uses_shared_paged_kv_idx: bool,
+    causal: bool,
 ) -> None:
     bmm1_scale_arg = (
         _get_bmm1_scale_log2(bmm1_scale) if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
@@ -219,7 +220,7 @@ def _trtllm_gen_batch_context_with_kv_cache(
         kv_scale_pool,  # value_block_scales
         None,  # skip_softmax_threshold_scale_factor
         uses_shared_paged_kv_idx,
-        True,  # causal
+        causal,  # causal
         None,  # lse
         0,  # lse_stride_tokens
         0,  # lse_stride_heads
@@ -401,6 +402,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     MAX_HEADS_RATIO_GENERATION = 32
     MIN_TOKENS_PER_BLOCK = 8
     SUPPORTED_TOKENS_PER_BLOCK = {16, 32, 64}
+    # FlashInfer narrows key_cache.size(0) to int before constructing its TMA descriptor.
+    MAX_NUM_PAGES_IN_MEM_POOL = (1 << 31) - 1
     SUPPORTED_MLA_GENERATION_HEAD_DIMS = {
         (320, 256),
         (576, 512),
@@ -417,6 +420,18 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
 
         # Lazily set on the first forward() call from the query device.
         self._multi_processor_count: Optional[int] = None
+
+    def _get_total_num_blocks(self, meta: "TrtllmAttentionMetadata") -> int:
+        kv_cache_manager = meta.kv_cache_manager
+        if kv_cache_manager is not None:
+            get_page_index_upper_bound = getattr(
+                getattr(kv_cache_manager, "impl", None), "get_page_index_upper_bound", None
+            )
+            # KVCacheManagerV2 exposes this implementation-only API and reports an
+            # already-flattened page-index bound, unlike the legacy logical block count.
+            if get_page_index_upper_bound is not None:
+                return int(kv_cache_manager.blocks_in_primary_pool)
+        return super()._get_total_num_blocks(meta)
 
     @classmethod
     def is_available(cls, attn: "TrtllmAttention") -> bool:
@@ -595,8 +610,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         sparse_params = attn.sparse_params
         has_skip_softmax = getattr(sparse_params, "algorithm", None) == "skip_softmax"
         has_sparse_attention = sparse_params is not None and not has_skip_softmax
-        if meta.is_cross:
-            return False, "trtllm-gen does not support cross attention."
         if (
             fwd.sage_attn_num_elts_per_blk_q > 0
             or fwd.sage_attn_num_elts_per_blk_k > 0
@@ -616,6 +629,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             return False, "trtllm-gen does not support sparse attention."
         if has_skip_softmax:
             return False, "trtllm-gen does not support skip-softmax attention."
+        if fwd.relative_attention_bias is not None:
+            return False, "Relative attention bias is not supported by trtllm-gen backend."
         if meta.use_spec_decoding and meta.is_spec_dec_tree:
             return (
                 False,
@@ -626,6 +641,16 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
 
         if meta.kv_cache_block_offsets is None:
             return False, "trtllm-gen requires paged KV cache."
+
+        num_pages_in_mem_pool = self._get_total_num_blocks(meta)
+        if num_pages_in_mem_pool > self.MAX_NUM_PAGES_IN_MEM_POOL:
+            return (
+                False,
+                f"TRTLLM-Gen FMHA supports at most {self.MAX_NUM_PAGES_IN_MEM_POOL} "
+                f"flattened KV-cache pages, but this pool requires "
+                f"{num_pages_in_mem_pool}.",
+            )
+
         output = fwd.output
         if output is None:
             return False, "trtllm-gen requires output."
@@ -648,6 +673,25 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         kv_cache_dtype = self._get_kv_cache_dtype(meta)
         if kv_cache_dtype is None:
             kv_cache_dtype = torch_dtype_to_binding(q_dtype)
+        if meta.is_cross:
+            if kv_cache_dtype == DataType.NVFP4:
+                return (
+                    False,
+                    "Cross attention with NVFP4 KV cache is not supported by trtllm-gen backend.",
+                )
+            if is_mla_enable:
+                return False, "Cross attention with MLA is not supported by trtllm-gen backend."
+            if meta.is_spec_decoding_enabled or meta.use_spec_decoding:
+                return (
+                    False,
+                    "Cross attention with speculative decoding is not supported by "
+                    "trtllm-gen backend.",
+                )
+            if fwd.update_kv_cache and fwd.cross_kv is None:
+                return (
+                    False,
+                    "trtllm-gen cross attention requires cross_kv when update_kv_cache=True.",
+                )
 
         is_fp8_out = output.dtype == torch.float8_e4m3fn
         is_fp4_out = output.dtype == torch.uint8
@@ -685,7 +729,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 )
 
         if has_generation_phase:
-            if meta.beam_width != 1:
+            if meta.beam_width != 1 and not meta.is_cross:
                 return (
                     False,
                     f"[Generation] Beam search (beam_width={meta.beam_width}) "
@@ -862,7 +906,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         rope_params = attn.rope_params
         bmm1_scale_static = self._get_bmm1_scale(attn)
         attention_chunk_size = self._get_attention_chunk_size(attn)
-
         (
             q_processed,
             kv_pool,
@@ -919,6 +962,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             params.total_num_blocks,  # total_num_blocks
             params.kv_factor,  # kv_factor
             True,  # need_build_kv_cache_metadata
+            fwd.cross_kv,  # cross_kv
+            params.is_cross,  # is_cross
         )
 
         has_fp4_kv = QuantMode(attn.quant_mode).has_fp4_kv_cache()
@@ -935,7 +980,11 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             bmm1_scale if params.fp8_context_fmha and bmm1_scale is not None else bmm1_scale_static
         )
         ctx_bmm2_scale = bmm2_scale if params.fp8_context_fmha and bmm2_scale is not None else 1.0
-
+        causal = (
+            False
+            if params.is_cross
+            else AttentionMaskType(fwd.mask_type) == AttentionMaskType.causal
+        )
         _trtllm_gen_batch_context_with_kv_cache(
             q_processed,  # query
             kv_pool,  # kv_pool
@@ -955,7 +1004,11 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             self._enable_pdl,  # enable_pdl
             kv_scale_pool,  # kv_scale_pool
             self.USE_SHARED_PAGED_KV_IDX,  # uses_shared_paged_kv_idx
+            causal,  # causal
         )
+
+        if params.is_cross:
+            return
 
         thop.trtllm_gen_context_postprocess(
             params.qkv_input,  # qkv_input
@@ -1063,6 +1116,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             params.total_num_blocks,  # total_num_blocks
             params.kv_factor,  # kv_factor
             True,  # need_build_kv_cache_metadata
+            params.is_cross,  # is_cross
         )
 
         # FIXME: Flashinfer trtllm-gen API doesn't support a separate

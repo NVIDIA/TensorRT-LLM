@@ -58,6 +58,22 @@ Property ```free_gpu_memory_fraction``` is a ratio > 0 and < 1 that specifies ho
 
 Block reuse across requests is enabled by default, but can be disabled by setting ```enable_block_reuse``` to False.
 
+`scheduler_config.enable_prefix_aware_scheduling` controls only scheduler-side use of prefix-reuse estimates. When it is
+`True` (the default), schedulers can use estimated reusable KV tokens to defer duplicate first-chunk context requests and
+to reduce token-budget accounting for requests that are expected to reuse cached prefix blocks. When it is `False`,
+these scheduler estimates are disabled and reusable-token estimates remain zero, but actual KV block reuse is still
+controlled by `kv_cache_config.enable_block_reuse`.
+
+For example, this keeps runtime KV block reuse enabled while disabling prefix-aware scheduler admission and token-budget
+credit:
+
+```yaml
+kv_cache_config:
+  enable_block_reuse: true
+scheduler_config:
+  enable_prefix_aware_scheduling: false
+```
+
 ### KV Cache Salting for Secure Reuse
 
 KV cache salting provides a security mechanism to control which requests can reuse cached KV states. When a `cache_salt` parameter is provided with a request, the KV cache system will only allow reuse of cached blocks given the same cache salt value. This prevents potential security issues such as prompt theft attacks, where malicious users might try to infer information from cached states of other users' requests.

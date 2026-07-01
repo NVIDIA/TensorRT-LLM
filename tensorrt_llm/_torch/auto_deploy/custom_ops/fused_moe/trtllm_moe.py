@@ -19,6 +19,7 @@ import torch
 
 from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._torch.modules.fused_moe.routing import RoutingMethodType
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
 
 from ..._compat import ActivationType, is_sm_100f
@@ -26,6 +27,33 @@ from ...utils.dist_config import DistConfig
 from ..quantization.quant import TRTLLM_NVFP4_SCALING_VECTOR_SIZE
 
 _f32_scale_cache: dict = {}
+
+
+def _router_use_tinygemm(x2d: torch.Tensor, weight: torch.Tensor, bias) -> bool:
+    """Whether the router GEMM may use tinygemm2 (else fall back to F.linear).
+
+    Encodes tinygemm2's hard preconditions (thop CHECK_INPUT: CUDA + contiguous +
+    bf16; bias required; SM90/100/103) plus the small-M decode regime where it wins.
+    Any unmet condition (prefill, non-bf16, non-contiguous, no bias, other arch)
+    silently falls back to F.linear — no hard failure.
+    """
+    # Router GEMM uses TRT-LLM tinygemm2 (single-kernel tall-skinny GEMM, no cuBLAS split-K + splitKreduce) for small-M
+    # decode, matching PT's compute_gate_output. Above this token count cuBLAS GEMM is preferred (tinygemm2
+    # specialization no longer wins and its accumulation diverges); same threshold PT uses.
+    _MIN_LATENCY_TINYGEMM_NUM_TOKENS = 128
+    # tinygemm2 only supports these SM archs (see thop/tinygemm2.cpp).
+    _TINYGEMM_SM = (90, 100, 103)
+    return (
+        bias is not None
+        and get_sm_version() in _TINYGEMM_SM
+        and x2d.shape[0] <= _MIN_LATENCY_TINYGEMM_NUM_TOKENS
+        and x2d.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and bias.dtype == torch.bfloat16
+        and x2d.is_contiguous()
+        and weight.is_contiguous()
+        and bias.is_contiguous()
+    )
 
 
 def _get_cached_f32_scale(scale: torch.Tensor) -> torch.Tensor:
@@ -1394,14 +1422,21 @@ def trtllm_quant_mxfp4_trtllm_gen_moe_fused(
 
     # Routing: compute router logits and hand them to the C++ runner which performs
     # fused topk + softmax + cast internally. routing_bias is None — the linear-layer
-    # bias was already folded into router_logits via F.linear.
-    router_logits = torch.nn.functional.linear(x2d, router_weight, router_bias)
+    # bias is fused into router_logits here.
+    # For the small-M (decode) router GEMM, TRT-LLM tinygemm2 is a single-kernel tall-skinny GEMM that avoids cuBLAS's
+    # split-K + splitKreduce round-trip (matches PT's compute_gate_output). Router-only (small N=num_experts);
+    # attention/lm_head keep their cublas_mm path. See _router_use_tinygemm for the support guard.
+    if _router_use_tinygemm(x2d, router_weight, router_bias):
+        router_logits = torch.ops.trtllm.tinygemm2(x2d, router_weight, router_bias)
+    else:
+        router_logits = torch.nn.functional.linear(x2d, router_weight, router_bias)
 
     # Pad activations to the kernel's expected hidden (H_pad, multiple of 512).
+    # Hidden must be padded to the kernel's 512-aligned expected width. The mxfp8 path's
+    # mxfp8_quantize(alignment=512) already pads internally (2880->3072), so only the
+    # bf16 path needs an explicit F.pad (applied in that branch) — skipping the redundant
+    # per-token pad kernel on the mxfp8 decode path.
     expected_hidden = int(fc1_weights_mxfp4.shape[-1] * 2)
-    pad_size = expected_hidden - int(x2d.shape[-1])
-    if pad_size > 0:
-        x2d = torch.nn.functional.pad(x2d, (0, pad_size))
 
     num_experts_total = int(router_weight.shape[0])
     if local_num_experts < 0:
@@ -1447,6 +1482,10 @@ def trtllm_quant_mxfp4_trtllm_gen_moe_fused(
             topk_ids=None,
         )
     elif act_dtype == "bf16":
+        # bf16 runner takes the activation directly, so pad hidden to 512-aligned here.
+        pad_size = expected_hidden - int(x2d.shape[-1])
+        if pad_size > 0:
+            x2d = torch.nn.functional.pad(x2d, (0, pad_size))
         result = torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
             router_logits,
             None,  # routing_bias

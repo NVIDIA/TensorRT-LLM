@@ -15,6 +15,8 @@ from tensorrt_llm.quantization import QuantAlgo
 _FP8_2D_BLOCK_SIZE = 128
 
 
+@register_mapper("HF", "Qwen3_5ForConditionalGeneration")
+@register_mapper("HF", "QwenImageBenchForConditionalGeneration")
 @register_mapper("HF", "Qwen3_5MoeForCausalLM")
 @register_mapper("HF", "Qwen3_5ForCausalLM")
 class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):

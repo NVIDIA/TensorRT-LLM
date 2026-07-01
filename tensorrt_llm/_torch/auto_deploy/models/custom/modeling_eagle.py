@@ -323,8 +323,22 @@ class EagleMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
+        # Sharding IR (SwiGLU MLP): gate/up colwise, down rowwise + all_reduce.
+        gate = torch.ops.auto_deploy.torch_linear_simple(
+            x, self.gate_proj.weight, self.gate_proj.bias, tp_mode="colwise", layer_type="mlp"
+        )
+        up = torch.ops.auto_deploy.torch_linear_simple(
+            x, self.up_proj.weight, self.up_proj.bias, tp_mode="colwise", layer_type="mlp"
+        )
+        down = torch.ops.auto_deploy.torch_linear_simple(
+            self.act_fn(gate) * up,
+            self.down_proj.weight,
+            self.down_proj.bias,
+            tp_mode="rowwise",
+            layer_type="mlp",
+        )
+        down = torch.ops.auto_deploy.all_reduce(down, layer_type="mlp")
+        return down
 
 
 class Eagle3Attention(nn.Module):
@@ -378,15 +392,54 @@ class Eagle3Attention(nn.Module):
         bsz, q_len, _ = hidden_states.size()
         cos, sin = position_embeddings
 
-        # Projections
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        # Sharding IR (MHA): q/k/v colwise (the 2*hidden_size input is the replicated
+        # concat of normed embeds + hidden; only the head output dim is sharded, so the
+        # colwise rule is unchanged), o_proj rowwise + all_reduce. tp_min_local_shape keeps
+        # whole heads together when num_heads is not divisible by world_size.
+        query_states = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.q_proj.weight,
+            self.q_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
+        key_states = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.k_proj.weight,
+            self.k_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
+        value_states = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.v_proj.weight,
+            self.v_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
 
-        # Reshape to [Batch, Seq, Heads, Dim]
-        query_states = query_states.view(bsz, q_len, -1, self.head_dim)
-        key_states = key_states.view(bsz, q_len, -1, self.head_dim)
-        value_states = value_states.view(bsz, q_len, -1, self.head_dim)
+        # Reshape to [Batch, Seq, Heads, Dim] -- head-count dim scales with TP.
+        query_states = torch.ops.auto_deploy.view(
+            query_states,
+            [bsz, q_len, self.num_attention_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        key_states = torch.ops.auto_deploy.view(
+            key_states,
+            [bsz, q_len, self.num_key_value_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        value_states = torch.ops.auto_deploy.view(
+            value_states,
+            [bsz, q_len, self.num_key_value_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
 
         query_states, key_states = apply_rotary_pos_emb(
             query_states, key_states, cos, sin, unsqueeze_dim=2
@@ -402,9 +455,21 @@ class Eagle3Attention(nn.Module):
             layout="bsnd",
         )
 
-        attn_output = attn_output.view(bsz, q_len, self.num_attention_heads * self.head_dim)
+        attn_output = torch.ops.auto_deploy.view(
+            attn_output,
+            [bsz, q_len, self.num_attention_heads * self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
 
-        attn_output = self.o_proj(attn_output)
+        attn_output = torch.ops.auto_deploy.torch_linear_simple(
+            attn_output,
+            self.o_proj.weight,
+            self.o_proj.bias,
+            tp_mode="rowwise",
+            layer_type="mha",
+        )
+        attn_output = torch.ops.auto_deploy.all_reduce(attn_output, layer_type="mha")
 
         return attn_output
 

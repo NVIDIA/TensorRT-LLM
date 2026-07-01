@@ -167,6 +167,18 @@
       "model_display_name": "Llama 4 Scout (FP8)",
       "model_url": "https://huggingface.co/nvidia/Llama-4-Scout-17B-16E-Instruct-FP8",
       "scenario": "Max Throughput"
+    },
+    {
+      "command": "trtllm-serve MiniMaxAI/MiniMax-M3 --config ${TRTLLM_DIR}/examples/configs/curated/minimax-m3-throughput.yaml",
+      "config_filename": "minimax-m3-throughput.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/minimax-m3-throughput.yaml",
+      "config_path": "examples/configs/curated/minimax-m3-throughput.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/curated/minimax-m3-throughput.yaml",
+      "gpu_compatibility": "GB200",
+      "model": "MiniMaxAI/MiniMax-M3",
+      "model_display_name": "MiniMax-M3 (BF16)",
+      "model_url": "https://huggingface.co/MiniMaxAI/MiniMax-M3",
+      "scenario": "Max Throughput"
     }
   ],
   "entries": [
@@ -3504,6 +3516,10 @@
     }
   ],
   "models": {
+    "MiniMaxAI/MiniMax-M3": {
+      "display_name": "MiniMax-M3 (BF16)",
+      "url": "https://huggingface.co/MiniMaxAI/MiniMax-M3"
+    },
     "Qwen/Qwen3-30B-A3B": {
       "display_name": "Qwen3-30B-A3B",
       "url": "https://huggingface.co/Qwen/Qwen3-30B-A3B"
