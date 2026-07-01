@@ -63,6 +63,10 @@ class KvCacheEventReport:
     seq: int
     events: List[dict] = field(default_factory=list)
     is_full_snapshot: bool = False
+    # Steady-clock timestamp (seconds) when the worker enqueued this report,
+    # on the disagg-synced timebase shared with the router. Lets the router
+    # measure worker->router propagation lag. 0.0 if the worker did not stamp.
+    send_ts: float = 0.0
 
 
 @dataclass
@@ -87,6 +91,10 @@ class WorkerLoadReport:
     num_active_requests: int = 0
     num_queued_requests: int = 0
     max_batch_size: int = 1
+    # Active KV tokens on this worker/rank (cache-discounted compute load), the
+    # metric the worker KVCacheAwareADPRouter scores on. 0 if the reporter does
+    # not supply it (older reporters) -> consumers fall back to request count.
+    num_active_tokens: int = 0
 
 
 @dataclass
@@ -106,3 +114,4 @@ class Selection:
     worker_id: str
     address: Optional[str] = None
     matched_blocks: int = 0
+    dp_rank: Optional[int] = None

@@ -168,7 +168,10 @@ class BaseLLM:
 
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
         self._orchestrator_type = kwargs.get("orchestrator_type", None)
-        self._llm_id = None
+        hostname = socket.gethostname()
+        pid = os.getpid()
+        timestamp = int(time.time() * 1000)
+        self._llm_id = f"{hostname}-{pid}-{timestamp}"
         self._disaggregated_params: Optional[dict] = None
 
         log_level = logger.level
@@ -217,6 +220,8 @@ class BaseLLM:
                                      revision=revision,
                                      tokenizer_revision=tokenizer_revision,
                                      **kwargs)
+            if hasattr(self.args, 'llm_id'):
+                self.args.llm_id = self._llm_id
 
         except Exception as e:
             logger.error(
@@ -271,6 +276,9 @@ class BaseLLM:
             self.llm_build_stats = LlmBuildStats()
             self._build_model()
 
+            if self._executor is not None:
+                self._executor.llm_id = self._llm_id
+
         except Exception:
             if self.mpi_session is not None:
                 self.mpi_session.shutdown()
@@ -310,12 +318,6 @@ class BaseLLM:
     @property
     @set_api_status("beta")
     def llm_id(self) -> str:
-        if self._llm_id is None:
-            hostname = socket.gethostname()
-            pid = os.getpid()
-            timestamp = int(time.time() * 1000)
-            self._llm_id = f"{hostname}-{pid}-{timestamp}"
-
         return self._llm_id
 
     @property

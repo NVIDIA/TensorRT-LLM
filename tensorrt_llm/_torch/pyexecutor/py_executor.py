@@ -645,6 +645,10 @@ class PyExecutor:
 
         self.dwdp_manager = dwdp_manager
 
+        # Per-rank KV cache reporter for centralized routing
+        self._per_rank_reporter = None
+        self._maybe_start_per_rank_reporter()
+
         if start_worker:
             self.start_worker()
 
@@ -800,6 +804,89 @@ class PyExecutor:
         if self.draft_model_engine is not None:
             self.draft_model_engine.is_warmup = value
 
+    def _maybe_start_per_rank_reporter(self):
+        """Start a WorkerReporter for this rank if per-rank routing is configured."""
+        kv_cfg = getattr(self.llm_args, 'kv_cache_config', None)
+        if kv_cfg is None:
+            logger.warning(
+                "PerRankReporter: kv_cache_config is None, skipping. "
+                f"llm_args type={type(self.llm_args).__name__}, "
+                f"has kv_cache_config={hasattr(self.llm_args, 'kv_cache_config')}")
+            return
+        per_rank = getattr(kv_cfg, 'per_rank_routing', False)
+        router_addr = getattr(kv_cfg, 'centralized_router_report_address', None)
+        llm_id = getattr(self.llm_args, 'llm_id', None)
+        logger.info(
+            f"PerRankReporter check: per_rank_routing={per_rank}, "
+            f"router_addr={router_addr}, llm_id={llm_id}")
+        if not per_rank:
+            return
+        router_address = getattr(kv_cfg, 'centralized_router_report_address', None)
+        if not router_address:
+            logger.warning("per_rank_routing enabled but centralized_router_report_address not set")
+            return
+
+        import base64
+        import os
+
+        from tensorrt_llm.serve.kv_cache_router.reporter import WorkerReporter
+
+        instance_id = getattr(self.llm_args, 'llm_id', None)
+        assert instance_id is not None, (
+            "per_rank_routing requires llm_id to be set in llm_args. "
+            "Ensure the LLM class sets args.llm_id before executor creation."
+        )
+        instance_id = mpi_comm().bcast(instance_id, root=0)
+        self._per_rank_instance_id = instance_id
+
+        dp_rank = self.dist.tp_rank
+        worker_id = f"{instance_id}:rank{dp_rank}"
+
+        hmac_key_b64 = os.environ.get("TLLM_CENTRALIZED_ROUTER_HMAC_KEY")
+        hmac_key = base64.b64decode(hmac_key_b64) if hmac_key_b64 else None
+
+        kv_mgr = self.resource_manager.resource_managers.get(
+            ResourceManagerType.KV_CACHE_MANAGER)
+        if kv_mgr is None:
+            logger.warning(
+                f"per_rank_routing: no KV cache manager on rank {dp_rank}")
+            return
+
+        namespace = os.environ.get(
+            "TLLM_CENTRALIZED_ROUTER_NAMESPACE",
+            os.environ.get("TRTLLM_DISAGG_ROLE", "ctx"))
+
+        def get_events(timeout_ms):
+            return kv_mgr.get_latest_events(0)
+
+        def get_load():
+            # Report (active_requests, queued_requests, active_tokens). The
+            # active-token load mirrors KVCacheAwareADPRouter.create_rank_state
+            # (cache-discounted: orig_prompt_len - cached_tokens), so the
+            # centralized "adp" rank scorer uses the same compute-weighted load
+            # the worker router does -- not a coarse request count.
+            active = self.active_requests
+            num_active_tokens = sum(
+                max(getattr(r, "py_orig_prompt_len", 0)
+                    - getattr(r, "cached_tokens", 0), 0)
+                for r in active)
+            num_queued = len(getattr(self, "waiting_queue", None) or [])
+            return (len(active), num_queued, num_active_tokens)
+
+        self._per_rank_reporter = WorkerReporter(
+            worker_id=worker_id,
+            namespace=namespace,
+            router_address=router_address,
+            hmac_key=hmac_key,
+            get_events=get_events,
+            get_load=get_load,
+            max_batch_size=self.max_batch_size,
+        )
+        self._per_rank_reporter.start()
+        logger.info(
+            f"PerRankReporter started: worker_id={worker_id} "
+            f"namespace={namespace} router={router_address}")
+
     def start_worker(self):
         with self.worker_lock:
             if not self.worker_started:
@@ -914,6 +1001,9 @@ class PyExecutor:
         """
         Signals the server to shutdown.
         """
+        if self._per_rank_reporter is not None:
+            self._per_rank_reporter.stop()
+            self._per_rank_reporter = None
         self.executor_request_queue.enqueue_shutdown_request()
         self.shutdown_event.wait()
         if self.hang_detector.detected():

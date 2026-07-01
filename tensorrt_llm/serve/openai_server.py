@@ -303,9 +303,14 @@ class OpenAIServer(_VideoRoutesMixin):
                     logger.info(
                         "Started background iteration stats collector task")
 
-            # Start centralized KV-cache router reporter if configured
+            # Start centralized KV-cache router reporter if configured.
+            # Skip when per_rank_routing is enabled — each rank reports via
+            # its own WorkerReporter started in PyExecutor.
             router_address = os.environ.get("TLLM_CENTRALIZED_ROUTER_ADDRESS")
-            if router_address and not self._is_visual_gen:
+            kv_cfg = getattr(self.generator, "args", None)
+            kv_cfg = getattr(kv_cfg, "kv_cache_config", None) if kv_cfg else None
+            per_rank = getattr(kv_cfg, "per_rank_routing", False) if kv_cfg else False
+            if router_address and not self._is_visual_gen and not per_rank:
                 self._start_centralized_reporter(router_address)
 
             # terminate rank0 worker
@@ -1902,8 +1907,6 @@ class OpenAIServer(_VideoRoutesMixin):
 
     async def get_server_info(self) -> JSONResponse:
         content = {"disaggregated_params": self.generator.disaggregated_params}
-        # Stable per-instance id, used by the centralized KV-cache router to map
-        # the worker_id stamped on its ZMQ reports back to this server's address.
         llm_id = getattr(self.generator, "llm_id", None)
         if llm_id is not None:
             content["worker_id"] = llm_id

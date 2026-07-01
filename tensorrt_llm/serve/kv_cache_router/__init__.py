@@ -22,7 +22,8 @@ rationale.
 from .messages import KvCacheEventReport, Selection, WorkerLoadReport
 from .prefix_trie import WorkerPrefixTrie
 from .reporter import WorkerReporter
-from .router_core import CentralizedKVCacheRouter, block_key_hasher
+from .router_core import (CentralizedKVCacheRouter, block_key_hasher,
+                          score_kv_aware_candidates)
 from .zmq_server import KVCacheRouterServer
 
 __all__ = [
@@ -34,4 +35,5 @@ __all__ = [
     "WorkerLoadReport",
     "Selection",
     "block_key_hasher",
+    "score_kv_aware_candidates",
 ]

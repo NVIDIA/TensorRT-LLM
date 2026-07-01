@@ -372,6 +372,15 @@ class OpenAIDisaggregatedService(OpenAIService):
                 )
 
         request.disaggregated_params.disagg_request_id = disagg_request_id
+        # route_hint.dp_rank is a context-pool per-rank routing decision (made by
+        # the ctx centralized KV-cache router against the ctx instance's DP
+        # layout). The gen request inherits the ctx response's
+        # disaggregated_params above, but the gen pool has its own, independent
+        # DP layout (often a different TP size), so the ctx rank is meaningless
+        # there and would pin all gen traffic onto the low ctx ranks. Clear it
+        # so the gen pool routes via its own hint / load balancing.
+        if request.disaggregated_params is not None:
+            request.disaggregated_params.route_hint = None
         return request
 
     async def _check_conditional_disagg(self, request: UCompletionRequest) -> bool:

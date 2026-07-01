@@ -73,9 +73,15 @@ class WorkerPrefixTrie:
         Walks the query path; a worker's count is the depth at which it stops
         owning the running prefix. Workers that do not own the first block match
         zero blocks and are omitted.
+
+        A worker's matched depth is recorded **once**, when it drops out of the
+        running candidate set (or at the end of the walk), instead of rewriting
+        every candidate's entry at every depth -- so the cost is
+        ``O(blocks + workers)`` rather than ``O(blocks * workers)``.
         """
         result: Dict[str, int] = {}
         candidates: set[str] | None = None
+        prev_depth = 0
         for depth, h in enumerate(block_hashes, start=1):
             owners = self._owners.get(h)
             if not owners:
@@ -83,12 +89,39 @@ class WorkerPrefixTrie:
             if candidates is None:
                 candidates = set(owners)
             else:
-                candidates &= owners
+                # Workers that owned the prefix up to prev_depth but not this
+                # block stop here -- record their final matched depth now.
+                dropped = candidates - owners
+                if dropped:
+                    for w in dropped:
+                        result[w] = prev_depth
+                    candidates = candidates & owners
             if not candidates:
                 break
+            prev_depth = depth
+        # Survivors matched the whole walked prefix.
+        if candidates:
             for w in candidates:
-                result[w] = depth
+                result[w] = prev_depth
         return result
+
+    def match_one(self, worker_id: str, block_hashes: List[int]) -> int:
+        """Return the consecutive prefix-block count for a SINGLE *worker_id*.
+
+        Avoids building the full ``worker -> depth`` dict (and the per-depth set
+        intersections across all owners) when the caller only needs one worker's
+        match -- e.g. the centralized router scoring one instance's combined
+        trie. ``O(matched_depth)`` membership checks, no set algebra.
+        """
+        owned = self._worker_blocks.get(worker_id)
+        if not owned:
+            return 0
+        depth = 0
+        for h in block_hashes:
+            if h not in owned:
+                break
+            depth += 1
+        return depth
 
     def has_worker(self, worker_id: str) -> bool:
         return worker_id in self._worker_blocks

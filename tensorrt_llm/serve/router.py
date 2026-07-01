@@ -382,6 +382,34 @@ class Router(ABC):
         self._health_check_timeout = metadata_server_cfg.health_check_timeout if metadata_server_cfg else None
         self._server_preparation_func = server_preparation_func
         self._prepared_ready_servers: set[str] = set()
+        # Routing-latency diagnostics (gated by TLLM_LOG_ROUTE_TIMING=1). Records
+        # wall time spent in get_next_server per request and logs percentiles
+        # periodically. Lets us compare the per-request routing cost of the
+        # worker KvCacheAwareRouter vs the CentralizedKvCacheAwareRouter.
+        import os
+        self._log_route_timing = (
+            os.environ.get("TLLM_LOG_ROUTE_TIMING", "0") == "1")
+        self._rt_samples: list = []
+        self._rt_n = 0
+
+    def _record_route_timing(self, dt_s: float) -> None:
+        """Record one get_next_server latency sample; log percentiles every
+        500 calls. No-op unless TLLM_LOG_ROUTE_TIMING=1."""
+        if not self._log_route_timing:
+            return
+        self._rt_samples.append(dt_s * 1000.0)  # ms
+        self._rt_n += 1
+        if self._rt_n % 500 == 0:
+            import statistics
+            s = sorted(self._rt_samples)
+            n = len(s)
+            p = lambda q: s[min(int(q * n), n - 1)]
+            logger.info(
+                f"[route_timing] {type(self).__name__} n={self._rt_n} "
+                f"get_next_server_ms: mean={statistics.mean(s):.2f} "
+                f"p50={p(0.5):.2f} p90={p(0.9):.2f} p99={p(0.99):.2f} "
+                f"max={s[-1]:.2f}")
+            self._rt_samples = []  # reset window
 
     async def close(self):
         """Close the shared HTTP session."""
@@ -1157,6 +1185,8 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             self,
             request: OpenAIRequest,
             exclude_server: Optional[str] = None) -> tuple[str, dict]:
+        import time as _time
+        _rt_t0 = _time.monotonic()
         async with self._lock:
             servers = list([
                 server for server in self._server_state.keys()
@@ -1240,6 +1270,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         async with self._lock:
             await self._register_request(server, request)
             self._stash_routed_blocks_on_route(request, block_hashes, hash_algo)
+        self._record_route_timing(_time.monotonic() - _rt_t0)
         return server, {
             "block_hashes": block_hashes,  # list[list[int | str]]
             "hash_algo": hash_algo,
@@ -1726,6 +1757,10 @@ class CentralizedKvCacheAwareRouter(BlockHashMixin, Router):
                  custom_tokenizer: Optional[str] = None,
                  tokenizer_dir: Optional[str] = None,
                  router_port: int = 5557,
+                 load_weight: float = 0.25,
+                 rank_routing_algo: str = "instance",
+                 fair_share_multiplier: float = 2.0,
+                 match_rate_threshold: float = 0.1,
                  load_suspend_s: float = 100.0,
                  stale_timeout_s: float = 30.0,
                  **kwargs):
@@ -1744,10 +1779,25 @@ class CentralizedKvCacheAwareRouter(BlockHashMixin, Router):
                     if hmac_key_b64 else None)
 
         tpb = self._tokens_per_block
+        # rank_routing_algo selects the phase-2 per-rank algorithm:
+        #   "instance" -> same scoring as phase-1 instance routing
+        #   "adp"      -> same scoring as the kvcache ADP router
+        # load_weight trades cache affinity against load in both; the ADP algo
+        # adds fair_share_multiplier + match_rate_threshold. Tunable via
+        # router_args.
         self._core_router = CentralizedKVCacheRouter(
             tokens_per_block=tpb,
+            load_weight=load_weight,
+            rank_routing_algo=rank_routing_algo,
+            fair_share_multiplier=fair_share_multiplier,
+            match_rate_threshold=match_rate_threshold,
             load_suspend_s=load_suspend_s,
             stale_timeout_s=stale_timeout_s)
+        logger.info(
+            f"CentralizedKvCacheAwareRouter: rank_routing_algo={rank_routing_algo} "
+            f"load_weight={load_weight} "
+            f"fair_share_multiplier={fair_share_multiplier} "
+            f"match_rate_threshold={match_rate_threshold}")
         self._zmq_server = KVCacheRouterServer(
             self._core_router,
             address=f"tcp://0.0.0.0:{router_port}",
@@ -1791,6 +1841,8 @@ class CentralizedKvCacheAwareRouter(BlockHashMixin, Router):
             self,
             request: OpenAIRequest,
             exclude_server: Optional[str] = None) -> tuple[str, dict]:
+        import time as _time
+        _rt_t0 = _time.monotonic()
         async with self._lock:
             servers = [s for s in self._prepared_ready_servers
                        if s != exclude_server]
@@ -1895,6 +1947,20 @@ class CentralizedKvCacheAwareRouter(BlockHashMixin, Router):
                 f"ns_loads={len(ns.loads) if ns else 0} "
                 f"hashes={len(flat_hashes)}")
 
+        # Inject route_hint when per-rank routing selected a specific dp_rank
+        if selection is not None and selection.dp_rank is not None:
+            from tensorrt_llm.serve.openai_protocol import (
+                DisaggregatedParams as ProtoDisaggParams,
+                RouteHint as ProtoRouteHint)
+            if request.disaggregated_params is None:
+                request.disaggregated_params = ProtoDisaggParams(
+                    request_type="context_only",
+                    route_hint=ProtoRouteHint(dp_rank=selection.dp_rank))
+            else:
+                request.disaggregated_params.route_hint = ProtoRouteHint(
+                    dp_rank=selection.dp_rank)
+
+        self._record_route_timing(_time.monotonic() - _rt_t0)
         return server, {"matched_blocks": matched,
                         "token_lists": token_lists}
 

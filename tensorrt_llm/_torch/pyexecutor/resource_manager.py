@@ -2088,6 +2088,7 @@ class KVCacheManagerV2(BaseResourceManager):
             self.max_seq_len if window_size is None else int(window_size)
             for window_size in self.max_attention_window_vec)
         self.event_manager: Optional[KVCacheEventManager] = None
+        per_rank_reporting = getattr(kv_cache_config, 'per_rank_routing', False)
         if self.event_buffer_max_size > 0:
             if mapping.enable_attention_dp:
                 self.event_manager = KVCacheEventManager(
@@ -2096,8 +2097,9 @@ class KVCacheManagerV2(BaseResourceManager):
                     attention_dp_rank=mapping.rank,
                     attention_dp_gather=Distributed.get(mapping).allgather,
                     hash_algo=kv_cache_event_hash_algo,
+                    per_rank_reporting=per_rank_reporting,
                 )
-            elif mpi_rank() == 0:
+            elif mpi_rank() == 0 or per_rank_reporting:
                 self.event_manager = KVCacheEventManager(
                     self.event_buffer_max_size,
                     window_size=event_window_size,

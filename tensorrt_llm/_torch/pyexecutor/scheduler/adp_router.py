@@ -172,6 +172,73 @@ class ADPRouter(ABC):
         return [RankState.deserialize(data=resp) for resp in responses]
 
     @staticmethod
+    def _assign_route_hint_ranks(
+        requests: List["RequestQueueItem"],
+        all_ranks_new_requests: Dict[int, List["RequestQueueItem"]],
+        all_ranks_num_active_requests: List[int],
+        max_num_active_requests: int,
+        *,
+        all_ranks_num_active_tokens: Optional[List] = None,
+        effective_tokens_fn=None,
+    ) -> List["RequestQueueItem"]:
+        """Honour the centralized per-rank KV-cache router's
+        ``disagg_params.route_hint.dp_rank`` BEFORE any local dispatch.
+
+        The orchestrator already scored ranks against its global per-rank trie,
+        so its choice is authoritative and takes precedence over every
+        local signal (``attention_dp_rank``, cold-start warmup, load balancing).
+        Requests without a hint -- or whose hinted rank is saturated / out of
+        range -- are returned unchanged for the caller's normal dispatch.
+
+        ``route_hint.dp_rank`` is a *context*-instance rank decision. It is
+        carried forward on the generation request (the gen request inherits the
+        ctx response's disaggregated_params), but the gen instance has its own,
+        independent DP layout (often a different TP size), so the ctx rank is
+        meaningless there. Generation-only requests are therefore skipped and
+        left to the gen worker's normal load balancing -- otherwise every gen
+        request would be pinned to the small set of ctx ranks (0..ctx_tp-1),
+        starving the higher gen ranks.
+
+        Mutates the ``all_ranks_*`` accumulators in place. Shared by all
+        ADPRouter subclasses. ``all_ranks_num_active_tokens`` and
+        ``effective_tokens_fn`` are optional; when both are provided the token
+        tally is kept in sync (used by the KV-cache-aware router whose scoring
+        depends on per-rank token load).
+        """
+        remaining: List["RequestQueueItem"] = []
+        for req_item in requests:
+            req = req_item.request
+            disagg = getattr(req, "py_disaggregated_params", None) if req is not None else None
+            # Skip generation-only requests: the inherited route_hint is a ctx
+            # rank and does not map to the gen instance's DP layout. NOTE: at ADP
+            # routing time req is an ExecutorRequest (not an LlmRequest), so the
+            # phase is read from py_disaggregated_params.request_type -- the
+            # LlmRequest.is_generation_only_request() helper does not exist here.
+            is_gen_only = (
+                disagg is not None
+                and getattr(disagg, "request_type", None) == "generation_only"
+            )
+            route_hint = getattr(disagg, "route_hint", None) if disagg is not None else None
+            target_dp_rank = (
+                route_hint.dp_rank if (route_hint is not None and not is_gen_only) else None
+            )
+
+            if (
+                target_dp_rank is not None
+                and 0 <= target_dp_rank < len(all_ranks_num_active_requests)
+                and all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests
+            ):
+                all_ranks_num_active_requests[target_dp_rank] += 1
+                all_ranks_new_requests[target_dp_rank].append(req_item)
+                if all_ranks_num_active_tokens is not None and effective_tokens_fn is not None:
+                    all_ranks_num_active_tokens[target_dp_rank] += effective_tokens_fn(
+                        req_item, target_dp_rank
+                    )
+            else:
+                remaining.append(req_item)
+        return remaining
+
+    @staticmethod
     def _assign_explicit_dp_ranks(
         requests: List["RequestQueueItem"],
         all_ranks_new_requests: Dict[int, List["RequestQueueItem"]],
@@ -182,6 +249,10 @@ class ADPRouter(ABC):
         (while it is under ``max_num_active_requests``) and return the rest for
         load-balanced assignment. Mutates the ``all_ranks_*`` accumulators in
         place. Shared by Default and ConversationAware routers.
+
+        The centralized ``route_hint.dp_rank`` is handled separately and with
+        higher priority by ``_assign_route_hint_ranks``; this method only
+        considers ``scheduling_params.attention_dp_rank``.
         """
         remaining: List["RequestQueueItem"] = []
         for req_item in requests:
@@ -189,8 +260,10 @@ class ADPRouter(ABC):
             target_dp_rank = (
                 scheduling_params.attention_dp_rank if scheduling_params is not None else None
             )
+
             if (
                 target_dp_rank is not None
+                and target_dp_rank < len(all_ranks_num_active_requests)
                 and all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests
             ):
                 all_ranks_num_active_requests[target_dp_rank] += 1
@@ -297,6 +370,18 @@ class DefaultADPRouter(ADPRouter):
             return scheduling_params.attention_dp_relax
 
         sorted_requests = sorted(new_requests, key=get_relax_value)
+
+        # Centralized per-rank route_hint is authoritative -- honour it first.
+        sorted_requests = self._assign_route_hint_ranks(
+            sorted_requests,
+            all_ranks_new_requests,
+            all_ranks_num_active_requests,
+            max_num_active_requests,
+            all_ranks_num_active_tokens=all_ranks_num_active_tokens,
+            effective_tokens_fn=lambda req_item, rank: (
+                len(req_item.request.input_token_ids) if req_item.request is not None else 0
+            ),
+        )
 
         remaining_unscheduled = self._assign_explicit_dp_ranks(
             sorted_requests,
@@ -435,6 +520,16 @@ class KVCacheAwareADPRouter(ADPRouter):
         self.match_rate_threshold = match_rate_threshold
         self.fair_share_multiplier = fair_share_multiplier
         self._all_ranks_prefix_matches: List[Dict[int, int]] = []
+        # Diagnostic: when TLLM_LOG_ROUTE_DECISIONS=1, log how often the
+        # orchestrator's centralized route_hint agrees with the rank this
+        # worker's local cache view would have picked. Cumulative counters
+        # surfaced periodically at INFO. Zero routing-behavior impact.
+        import os
+        self._log_route_decisions = (
+            os.environ.get("TLLM_LOG_ROUTE_DECISIONS", "0") == "1")
+        self._rd_total = 0
+        self._rd_agree = 0
+        self._rd_calls = 0
         # Cold-start warmup: ranks not yet targeted through this router.
         # Empty set disables warmup; see ``route_requests``.
         self._pending_warmup_ranks: Set[int] = (
@@ -564,6 +659,44 @@ class KVCacheAwareADPRouter(ADPRouter):
         matches = self._all_ranks_prefix_matches
         return matches[rank].get(req_id, 0) if rank < len(matches) else 0
 
+    def _compare_hint_vs_local(self, new_requests, tp_size: int) -> None:
+        """Diagnostic: for each request carrying a centralized route_hint,
+        compare the hinted rank against the rank this worker's *local* cache
+        view (per-rank prefix match) would have picked. Surfaces how often the
+        orchestrator's global per-rank trie agrees with local cache state --
+        divergence means the centralized view is stale relative to the worker.
+
+        Read-only: never changes routing. Gated by TLLM_LOG_ROUTE_DECISIONS.
+        """
+        round_total = round_agree = 0
+        for req_item in new_requests:
+            disagg = getattr(req_item.request, "py_disaggregated_params", None)
+            route_hint = getattr(disagg, "route_hint", None) if disagg else None
+            hint_rank = route_hint.dp_rank if route_hint is not None else None
+            if hint_rank is None:
+                continue
+            # Local cache argmax: rank with the longest prefix match here.
+            best_rank, best_match = None, -1
+            for rank in range(tp_size):
+                m = self._match_len(rank, req_item.id)
+                if m > best_match:
+                    best_match, best_rank = m, rank
+            round_total += 1
+            if best_rank == hint_rank:
+                round_agree += 1
+            elif self._rd_total < 20:  # sample first divergences with detail
+                logger.info(
+                    f"[route_cmp] DIVERGE req={req_item.id} hint_rank={hint_rank} "
+                    f"local_rank={best_rank} hint_match={self._match_len(hint_rank, req_item.id)} "
+                    f"local_match={best_match}")
+        self._rd_total += round_total
+        self._rd_agree += round_agree
+        self._rd_calls += 1
+        if self._rd_calls % 200 == 0 and self._rd_total > 0:
+            logger.info(
+                f"[route_cmp] hint==local agreement: {self._rd_agree}/{self._rd_total} "
+                f"({100.0 * self._rd_agree / self._rd_total:.1f}%) over {self._rd_calls} calls")
+
     def route_requests(
         self,
         all_rank_states: list[RankState],
@@ -585,10 +718,27 @@ class KVCacheAwareADPRouter(ADPRouter):
 
         sorted_requests = sorted(new_requests, key=get_relax_value)
 
-        # Strict ``attention_dp_rank`` is honoured first; relaxed requests
-        # fall back to the smallest unwarmed rank until every rank has been
-        # targeted, seeding the shared system prompt before scoring would
-        # otherwise pin all traffic to the first warm rank.
+        # The centralized per-rank KV-cache router's ``route_hint.dp_rank`` is
+        # authoritative and is honoured before any local dispatch (handled in
+        # the base class). Of what remains, strict ``attention_dp_rank`` is
+        # honoured next; relaxed requests with neither fall back to the smallest
+        # unwarmed rank until every rank has been targeted, seeding the shared
+        # system prompt before scoring would otherwise pin all traffic to the
+        # first warm rank.
+        if self._log_route_decisions:
+            self._compare_hint_vs_local(new_requests, tp_size)
+
+        sorted_requests = self._assign_route_hint_ranks(
+            sorted_requests,
+            all_ranks_new_requests,
+            all_ranks_num_active_requests,
+            max_num_active_requests,
+            all_ranks_num_active_tokens=all_ranks_num_active_tokens,
+            effective_tokens_fn=lambda req_item, rank: max(
+                self._req_tokens(req_item) - self._match_len(rank, req_item.id), 0
+            ),
+        )
+
         remaining_unscheduled = []
         for req_item in sorted_requests:
             scheduled = False
@@ -790,7 +940,16 @@ class ConversationAwareADPRouter(ADPRouter):
 
         sorted_requests = sorted(new_requests, key=get_relax_value)
 
-        # 1) Honour an explicit attention_dp_rank first (strict placement).
+        # 0) Centralized per-rank route_hint is authoritative -- honour it
+        #    before conversation stickiness or explicit attention_dp_rank.
+        sorted_requests = self._assign_route_hint_ranks(
+            sorted_requests,
+            all_ranks_new_requests,
+            all_ranks_num_active_requests,
+            max_num_active_requests,
+        )
+
+        # 1) Honour an explicit attention_dp_rank next (strict placement).
         remaining_unscheduled = self._assign_explicit_dp_ranks(
             sorted_requests,
             all_ranks_new_requests,

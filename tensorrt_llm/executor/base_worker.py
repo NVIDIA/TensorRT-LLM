@@ -116,6 +116,7 @@ class BaseWorker(GenerationExecutor):
         self._is_pytorch_backend = self._backend in ["pytorch", "_autodeploy"]
         self._lora_config = llm_args.lora_config if self._is_pytorch_backend else None
         self._resource_governor_queue = None
+        self._llm_id = getattr(llm_args, 'llm_id', None) if llm_args else None
 
         if global_mpi_size() > 1:
             logger.set_rank(self.global_rank)

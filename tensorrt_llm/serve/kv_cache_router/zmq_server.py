@@ -28,6 +28,7 @@ from tensorrt_llm.executor.ipc import ZeroMqQueue
 from tensorrt_llm.logger import logger
 
 from .messages import KvCacheEventReport, WorkerLoadReport
+from .reporter import _now_on_synced_clock
 from .router_core import CentralizedKVCacheRouter
 
 __all__ = ["KVCacheRouterServer"]
@@ -104,13 +105,32 @@ class KVCacheRouterServer:
             self._total_events_in_reports = (
                 getattr(self, "_total_events_in_reports", 0)
                 + len(report.events))
+            # Worker->router propagation lag, on NTP-synced wall clock
+            # (time.time() at both ends). This is the staleness window during
+            # which the router's trie does not yet reflect cache the worker has
+            # already stored. Implausible values (negative, or > 60s) indicate
+            # NTP skew on a host and are discarded so they don't poison stats.
+            send_ts = getattr(report, "send_ts", 0.0)
+            if send_ts:
+                lag_ms = (_now_on_synced_clock() - send_ts) * 1000.0
+                if -1000.0 < lag_ms < 60000.0:
+                    self._lag_sum_ms = getattr(self, "_lag_sum_ms", 0.0) + lag_ms
+                    self._lag_n = getattr(self, "_lag_n", 0) + 1
+                    self._lag_max_ms = max(
+                        getattr(self, "_lag_max_ms", 0.0), lag_ms)
+                else:
+                    self._lag_skew_drops = getattr(self, "_lag_skew_drops", 0) + 1
             if self._event_count % 100 == 0:
+                n = getattr(self, "_lag_n", 0)
+                avg = (self._lag_sum_ms / n) if n else 0.0
                 logger.info(
                     f"KVCacheRouterServer: ingested {self._event_count} "
                     f"event reports ({self._total_events_in_reports} events) "
                     f"from {report.worker_id} seq={report.seq} "
                     f"snapshot={report.is_full_snapshot} "
-                    f"batch_size={len(report.events)}")
+                    f"batch_size={len(report.events)} "
+                    f"report_lag_ms(avg={avg:.1f} max={getattr(self, '_lag_max_ms', 0.0):.1f} "
+                    f"n={n} skew_drops={getattr(self, '_lag_skew_drops', 0)})")
             self._router.apply_event_report(report)
         elif isinstance(report, WorkerLoadReport):
             self._load_count = getattr(self, "_load_count", 0) + 1

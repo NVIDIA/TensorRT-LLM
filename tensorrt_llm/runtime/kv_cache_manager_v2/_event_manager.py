@@ -117,6 +117,7 @@ class KVCacheEventManager:
         attention_dp_gather: AttentionDpGatherFn | None = None,
         hash_algo: str = KV_CACHE_HASH_ALGO_V2,
         window_size_by_layer_group: dict[int, int] | None = None,
+        per_rank_reporting: bool = False,
     ) -> None:
         if hash_algo == KV_CACHE_HASH_ALGO_AUTO:
             hash_algo = KV_CACHE_HASH_ALGO_DEFAULT
@@ -131,6 +132,7 @@ class KVCacheEventManager:
         self._window_size_by_layer_group = dict(window_size_by_layer_group or {})
         self._attention_dp_rank = attention_dp_rank
         self._attention_dp_gather = attention_dp_gather
+        self._per_rank_reporting = per_rank_reporting
         self._hash_algo = hash_algo
         self._next_event_id = 0
         self._stored_blocks: dict[bytes, _StoredBlockState] = {}
@@ -262,7 +264,7 @@ class KVCacheEventManager:
         )
 
     def flush_iteration_events(self) -> None:
-        if self._attention_dp_gather is not None:
+        if self._attention_dp_gather is not None and not self._per_rank_reporting:
             with self._condition:
                 local_events = self._drain_pending_events_unlocked()
                 local_events = self._trim_events(local_events, self._max_kv_event_entries)

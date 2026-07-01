@@ -45,6 +45,19 @@ from .messages import KvCacheEventReport, WorkerLoadReport
 __all__ = ["WorkerReporter"]
 
 
+def _now_on_synced_clock() -> float:
+    """Wall-clock now (epoch seconds) for measuring worker->router report lag.
+
+    Uses time.time() (NOT steady_clock): wall clock is epoch-based and
+    NTP-disciplined, so timestamps are directly comparable across nodes. The
+    C++ steady_clock_now() binding is unusable here -- it returns a raw
+    per-machine steady_clock whose origin differs by ~1e6 s between hosts.
+    Lag = router_recv_time - worker_send_time is meaningful only because both
+    ends call time.time() on NTP-synced hosts; if NTP is off, lags will be
+    implausible (large or negative) and should be discarded."""
+    return time.time()
+
+
 class WorkerReporter:
     """Pushes KV-cache event and load reports from one worker instance.
 
@@ -155,7 +168,11 @@ class WorkerReporter:
     def _run_load_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                num_active, num_queued = self._get_load()
+                load = self._get_load()
+                # get_load may return (active, queued) or
+                # (active, queued, active_tokens); accept both for compat.
+                num_active, num_queued = load[0], load[1]
+                num_active_tokens = load[2] if len(load) > 2 else 0
                 self._queue.put_noblock(
                     WorkerLoadReport(
                         worker_id=self._worker_id,
@@ -164,6 +181,7 @@ class WorkerReporter:
                         num_active_requests=num_active,
                         num_queued_requests=num_queued,
                         max_batch_size=self._max_batch_size,
+                        num_active_tokens=num_active_tokens,
                     ))
                 self._load_seq += 1
             except Exception as e:  # noqa: BLE001 - keep the daemon alive
@@ -194,5 +212,6 @@ class WorkerReporter:
                 seq=self._event_seq,
                 events=events,
                 is_full_snapshot=is_full_snapshot,
+                send_ts=_now_on_synced_clock(),
             ))
         self._event_seq += 1
