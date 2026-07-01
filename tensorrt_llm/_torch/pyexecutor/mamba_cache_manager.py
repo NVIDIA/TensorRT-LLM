@@ -1342,6 +1342,26 @@ def calc_context_stop_positions(prompt_len: int,
     return sorted({pos for pos in stop_positions if 0 < pos <= prompt_len})
 
 
+def _calc_context_stop_positions_for_request(
+    request: LlmRequest,
+    tokens_per_block: int,
+    mamba_state_cache_interval: Optional[int],
+    save_last_snapshot: bool = False,
+) -> list[int]:
+    stop_positions = calc_context_stop_positions(
+        request.prompt_len,
+        tokens_per_block,
+        mamba_state_cache_interval,
+        save_last_snapshot,
+    )
+    stable_token_count = getattr(request, "py_block_reuse_stable_token_count",
+                                 None)
+    if (save_last_snapshot and isinstance(stable_token_count, int)
+            and 0 < stable_token_count < request.prompt_len):
+        stop_positions.append(stable_token_count)
+    return sorted(set(stop_positions))
+
+
 @triton.jit
 def _promote_mamba_state_kernel(
     src_ptr,
@@ -2213,10 +2233,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                 f"disabled, but got {current}")
             return prompt_len - current
         step = self.linear_attention_metadata.states_snapshot_interval
-        stop_positions = calc_context_stop_positions(prompt_len,
-                                                     self.tokens_per_block,
-                                                     step)
-        stop_positions = sorted(set(stop_positions))
+        stop_positions = _calc_context_stop_positions_for_request(
+            request, self.tokens_per_block, step)
         for pos in stop_positions:
             if pos > current:
                 return pos - current
@@ -3217,9 +3235,8 @@ class KVCacheManagerV2MambaHybridCacheManager(KVCacheManagerV2,
             return
 
         for request in requests:
-            request.expect_chunking_points = calc_context_stop_positions(
-                request.prompt_len, self.tokens_per_block, interval,
-                save_last_snapshot)
+            request.expect_chunking_points = _calc_context_stop_positions_for_request(
+                request, self.tokens_per_block, interval, save_last_snapshot)
 
     def calc_next_context_chunk_size(self, request: LlmRequest) -> int:
         prompt_len = request.prompt_len
@@ -3232,10 +3249,9 @@ class KVCacheManagerV2MambaHybridCacheManager(KVCacheManagerV2,
                 f"is disabled, but got {current}")
             return prompt_len - current
         step = self._mamba_state_cache_interval
-        stop_positions = calc_context_stop_positions(
-            prompt_len, self.tokens_per_block, step,
+        stop_positions = _calc_context_stop_positions_for_request(
+            request, self.tokens_per_block, step,
             self.kv_cache_config.mamba_save_last_snapshot)
-        stop_positions = sorted(set(stop_positions))
         for pos in stop_positions:
             if pos > current:
                 return pos - current

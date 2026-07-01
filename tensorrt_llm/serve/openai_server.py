@@ -38,6 +38,7 @@ from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import MultimodalEncoder, SchedulingParams, tracing
+from tensorrt_llm.llmapi.block_reuse import set_block_reuse_stable_token_count
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.llmapi.llm import RequestOutput
@@ -91,6 +92,23 @@ from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
 
 # yapf: enable
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
+
+
+def _has_mm_placeholders(mm_placeholder_counts: list[dict[str, int]]) -> bool:
+    return any(count > 0 for message_counts in mm_placeholder_counts
+               for count in message_counts.values())
+
+
+def _count_text_prompt_tokens(tokenizer, prompt: str) -> int | None:
+    try:
+        return len(tokenizer.encode(prompt, add_special_tokens=False))
+    except TypeError:
+        try:
+            return len(tokenizer.encode(prompt))
+        except Exception:
+            return None
+    except Exception:
+        return None
 
 
 def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
@@ -1234,9 +1252,28 @@ class OpenAIServer(_VideoRoutesMixin):
                     self.multimodal_server_config,
                     request_media_io_kwargs=request.media_io_kwargs)
 
+            block_reuse_stable_token_count = None
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
+                if (request.add_generation_prompt
+                        and not _has_mm_placeholders(mm_placeholder_counts)):
+                    stable_prompt = apply_chat_template(
+                        model_type=resolve_top_level_model_type(
+                            self.model_config),
+                        tokenizer=self.tokenizer,
+                        processor=self.processor,
+                        conversation=conversation,
+                        add_generation_prompt=False,
+                        mm_placeholder_counts=mm_placeholder_counts,
+                        tools=tool_dicts,
+                        documents=request.documents,
+                        chat_template=request.chat_template
+                        or self.chat_template,
+                        chat_template_kwargs=request.chat_template_kwargs or {},
+                    )
+                    block_reuse_stable_token_count = _count_text_prompt_tokens(
+                        self.tokenizer, stable_prompt)
                 prompt: str = apply_chat_template(
                     model_type=resolve_top_level_model_type(self.model_config),
                     tokenizer=self.tokenizer,
@@ -1278,6 +1315,8 @@ class OpenAIServer(_VideoRoutesMixin):
 
             trace_headers = (None if raw_request is None else
                              tracing.extract_trace_headers(raw_request.headers))
+            trace_headers = set_block_reuse_stable_token_count(
+                trace_headers, block_reuse_stable_token_count)
 
             scheduling_params = SchedulingParams(
                 agent_hierarchy=request.agent_hierarchy)

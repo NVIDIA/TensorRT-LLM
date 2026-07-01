@@ -1501,6 +1501,25 @@ class KVCacheManagerV2(BaseResourceManager):
             return None
         return int.from_bytes(hashlib.sha256(cache_salt.encode("utf-8")).digest()[:8], "little")
 
+    def _get_block_reuse_commit_limit(self, request: LlmRequest) -> int:
+        if not self.kv_cache_config.mamba_save_last_snapshot:
+            return request.prompt_len
+        stable_token_count = getattr(request, "py_block_reuse_stable_token_count", None)
+        if isinstance(stable_token_count, int) and stable_token_count > 0:
+            return min(stable_token_count, request.prompt_len)
+        return request.prompt_len
+
+    def _mark_context_position_as_history(self, request: LlmRequest, kv_cache) -> None:
+        history_length = request.context_current_position
+        if history_length <= kv_cache.history_length:
+            return
+        capacity = max(kv_cache.capacity, history_length)
+        if not kv_cache.resize(capacity, history_length=history_length):
+            raise ValueError(
+                "Failed to resize history length of KV cache for request "
+                f"{request.py_request_id} to {history_length} tokens"
+            )
+
     @staticmethod
     def _update_token_sequence_hasher(
         hasher,
@@ -2379,9 +2398,10 @@ class KVCacheManagerV2(BaseResourceManager):
     def try_commit_blocks_for_reuse(self, request: LlmRequest, kv_cache) -> None:
         if not self.enable_block_reuse or self.is_draft or request.is_dummy_request:
             return
-        if request.context_current_position > kv_cache.num_committed_tokens:
+        commit_limit = self._get_block_reuse_commit_limit(request)
+        commit_end = min(request.context_current_position, commit_limit)
+        if commit_end > kv_cache.num_committed_tokens:
             commit_start = kv_cache.num_committed_tokens
-            commit_end = request.context_current_position
             tokens = self._augment_tokens_for_block_reuse(
                 request.get_tokens(DEFAULT_BEAM_INDEX),
                 request,
@@ -2393,12 +2413,13 @@ class KVCacheManagerV2(BaseResourceManager):
                 request,
                 commit_start,
                 commit_end,
-                complete=request.context_current_position >= request.prompt_len,
+                complete=request.context_current_position >= commit_limit,
             )
-        if request.context_current_position >= request.prompt_len:
+        if request.context_current_position >= commit_limit:
             kv_cache.stop_committing(
                 save_last_ssm_snapshot=self.kv_cache_config.mamba_save_last_snapshot
             )
+            self._mark_context_position_as_history(request, kv_cache)
 
     def _log_block_reuse_summary(self) -> None:
         if not self.enable_block_reuse:
@@ -2690,9 +2711,10 @@ class KVCacheManagerV2(BaseResourceManager):
             if not kv_cache.is_active:
                 continue
             if self.enable_block_reuse and not self.is_draft and not req.is_dummy_request:
-                if req.context_current_position > kv_cache.num_committed_tokens:
+                commit_limit = self._get_block_reuse_commit_limit(req)
+                commit_end = min(req.context_current_position, commit_limit)
+                if commit_end > kv_cache.num_committed_tokens:
                     commit_start = kv_cache.num_committed_tokens
-                    commit_end = req.context_current_position
                     tokens = self._augment_tokens_for_block_reuse(
                         req.get_tokens(DEFAULT_BEAM_INDEX),
                         req,
@@ -2704,12 +2726,13 @@ class KVCacheManagerV2(BaseResourceManager):
                         req,
                         commit_start,
                         commit_end,
-                        complete=req.context_remaining_length == 0,
+                        complete=req.context_current_position >= commit_limit,
                     )
-                if req.context_remaining_length == 0:
+                if req.context_current_position >= commit_limit:
                     kv_cache.stop_committing(
                         save_last_ssm_snapshot=(self.kv_cache_config.mamba_save_last_snapshot)
                     )
+                    self._mark_context_position_as_history(req, kv_cache)
             else:
                 success = kv_cache.resize(None, req.context_current_position)
                 if not success:
