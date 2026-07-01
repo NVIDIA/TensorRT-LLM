@@ -1518,8 +1518,8 @@ class CentralizedKVCacheRouter(BlockHashMixin, Router):
         self._init_block_hashing(tokens_per_block, custom_tokenizer,
                                  tokenizer_dir)
 
-        from tensorrt_llm.serve.kv_cache_router import (
-            CentralizedKVCacheRouterCore, KVCacheRouterServer)
+        from tensorrt_llm.serve.kv_cache_router import \
+            CentralizedKVCacheRouterCore
 
         import base64
         import os
@@ -1528,6 +1528,7 @@ class CentralizedKVCacheRouter(BlockHashMixin, Router):
                     if hmac_key_b64 else None)
 
         tpb = self._tokens_per_block
+        # The core owns the ZMQ ingest server (how workers PUSH events/load).
         self._core = CentralizedKVCacheRouterCore(
             tokens_per_block=tpb,
             load_weight=load_weight,
@@ -1535,34 +1536,29 @@ class CentralizedKVCacheRouter(BlockHashMixin, Router):
             fair_share_multiplier=fair_share_multiplier,
             match_rate_threshold=match_rate_threshold,
             load_suspend_s=load_suspend_s,
-            stale_timeout_s=stale_timeout_s)
+            stale_timeout_s=stale_timeout_s,
+            ingest_address=f"tcp://0.0.0.0:{router_port}",
+            ingest_hmac_key=hmac_key)
+        endpoint, _ = self._core.start_ingest_server()
         logger.info(
             f"CentralizedKVCacheRouter: rank_routing_algo={rank_routing_algo} "
             f"load_weight={load_weight} "
             f"fair_share_multiplier={fair_share_multiplier} "
             f"match_rate_threshold={match_rate_threshold}")
-        self._zmq_server = KVCacheRouterServer(
-            self._core,
-            address=f"tcp://0.0.0.0:{router_port}",
-            hmac_key=hmac_key)
-        self._zmq_server.start()
-        endpoint, hmac_key = self._zmq_server.address
-        self._router_endpoint = endpoint
-        self._router_hmac_key = hmac_key
         self._namespace = ("ctx" if server_role == ServerRole.CONTEXT
                            else "gen")
         self._rr_counter = 0
         logger.info(
-            f"CentralizedKVCacheRouter: ZMQ server started at "
+            f"CentralizedKVCacheRouter: ZMQ ingest server at "
             f"{endpoint}, namespace={self._namespace}, tpb={tpb}")
 
     @property
     def router_endpoint(self) -> str:
-        return self._router_endpoint
+        return self._core.ingest_endpoint
 
     @property
     def router_hmac_key(self) -> Optional[bytes]:
-        return self._router_hmac_key
+        return self._core.ingest_hmac_key
 
     async def _prepare_server(self, server: str):
         await super()._prepare_server(server)
@@ -1644,7 +1640,7 @@ class CentralizedKVCacheRouter(BlockHashMixin, Router):
             self._core.unregister_worker_address(address=server)
 
     async def close(self):
-        self._zmq_server.stop()
+        self._core.stop_ingest_server()
         await super().close()
 
 

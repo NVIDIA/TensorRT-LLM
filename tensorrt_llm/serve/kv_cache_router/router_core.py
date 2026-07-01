@@ -282,7 +282,9 @@ class CentralizedKVCacheRouterCore:
                  match_rate_threshold: float = 0.1,
                  load_suspend_s: float = 3.0,
                  stale_timeout_s: float = 30.0,
-                 clock=time.monotonic) -> None:
+                 clock=time.monotonic,
+                 ingest_address: Optional[str] = None,
+                 ingest_hmac_key: Optional[bytes] = None) -> None:
         self._tokens_per_block = tokens_per_block
         self._load_weight = load_weight
         # Phase-2 rank-selection algorithm (tunable):
@@ -331,6 +333,42 @@ class CentralizedKVCacheRouterCore:
         # Reverse index so a re-registered address (worker restarted under a new
         # id at the same URL) cleanly supersedes the stale id.
         self._address_worker: Dict[str, str] = {}
+        # ZMQ ingest server: how workers PUSH their KV-cache events/load into
+        # this core. Owned here (not by the Router surface) since it feeds the
+        # core's state. Created lazily in start_ingest_server() to avoid a
+        # circular import (zmq_server imports this module).
+        self._ingest_address = ingest_address
+        self._ingest_hmac_key = ingest_hmac_key
+        self._ingest_server = None
+
+    def start_ingest_server(self) -> Tuple[str, Optional[bytes]]:
+        """Start the ZMQ PULL ingest server feeding this core; idempotent.
+
+        Returns the bound ``(endpoint, hmac_key)`` for workers to report to.
+        """
+        if self._ingest_server is None:
+            from .zmq_server import KVCacheRouterServer
+            self._ingest_server = KVCacheRouterServer(
+                self,
+                address=self._ingest_address,
+                hmac_key=self._ingest_hmac_key)
+            self._ingest_server.start()
+            self._ingest_address, self._ingest_hmac_key = \
+                self._ingest_server.address
+        return self._ingest_address, self._ingest_hmac_key
+
+    def stop_ingest_server(self) -> None:
+        if self._ingest_server is not None:
+            self._ingest_server.stop()
+            self._ingest_server = None
+
+    @property
+    def ingest_endpoint(self) -> Optional[str]:
+        return self._ingest_address
+
+    @property
+    def ingest_hmac_key(self) -> Optional[bytes]:
+        return self._ingest_hmac_key
 
     # ----------------------------------------------------- worker<->address map
 
