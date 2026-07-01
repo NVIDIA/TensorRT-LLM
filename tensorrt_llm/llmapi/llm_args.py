@@ -3723,14 +3723,14 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "Per-region size in MiB of the native-disagg KV-cache bounce buffer (one for send, one for recv). Bounce coalesces a request's scattered per-block KV into one contiguous fabric-VMM buffer and issues a single multi-rail NIXL write. The size doubles as the on/off switch: 0 (default) keeps the per-block path, >0 enables bounce at that capacity. Only used by the Python (v2) transceiver."
     )
 
-    chunk_size_blocks: Optional[PositiveInt] = Field(
+    transfer_chunk_size: Optional[PositiveInt] = Field(
         default=None,
         description=
         "Maximum number of KV cache blocks per layer group per chunk for "
         "chunked KV cache transfer. When set, each layer group's block list "
         "is partitioned into slices of at most this many blocks, and each "
         "slice is transferred independently. The total data per chunk is "
-        "approximately chunk_size_blocks * num_layer_groups * slot_bytes. "
+        "approximately transfer_chunk_size * num_layer_groups * slot_bytes. "
         "This reduces per-transfer NIXL descriptor pressure for long "
         "sequences. When None (default), the entire "
         "KV cache is transferred in a single slice. When set with NIXL "
@@ -3738,7 +3738,7 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "Not supported with UCX, MPI, or MOONCAKE backends.")
 
     def _to_pybind(self):
-        # chunk_size_blocks is consumed by the Python transceiver only
+        # transfer_chunk_size is consumed by the Python transceiver only
         # and has no C++ counterpart, so it is intentionally omitted.
         return _CacheTransceiverConfig(
             backend=_CacheTransceiverBackendType.from_string(self.backend),

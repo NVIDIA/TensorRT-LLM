@@ -106,7 +106,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # _slice_num_bytes() is this rank's KV shard, so scale by tp_size to get the request total (kv_cache_size),
         # except under attention DP where the local count already is the total.
         self._kv_size_rank_factor = 1 if mapping.enable_attention_dp else max(1, mapping.tp_size)
-        self._chunk_size_blocks = cache_transceiver_config.chunk_size_blocks
+        self._transfer_chunk_size = cache_transceiver_config.transfer_chunk_size
 
         # Sticky role markers; flip True once any session opens, used to short-circuit
         # per-iter tp_allgather when this transceiver never sends/receives.
@@ -280,9 +280,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def _create_kv_slices(self, req: LlmRequest) -> List[KVSlice]:
         """Create one or more KVSlice objects for a request.
 
-        When ``chunk_size_blocks`` is ``None``, returns a single slice
+        When ``transfer_chunk_size`` is ``None``, returns a single slice
         covering all blocks.  Otherwise, each layer group's block ID
-        list is partitioned into slices of at most ``chunk_size_blocks``
+        list is partitioned into slices of at most ``transfer_chunk_size``
         blocks.
 
         Args:
@@ -299,7 +299,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         base_slice = self._collect_base_slice(req)
         all_block_ids = base_slice.block_ids_per_layer_groups
 
-        if self._chunk_size_blocks is None:
+        if self._transfer_chunk_size is None:
             return [base_slice]
 
         max_resident_blocks = max((len(ids) for ids in all_block_ids), default=0)
@@ -314,14 +314,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             total_blocks = math.ceil(base_slice.token_range.end / tpb)
         else:
             total_blocks = max_resident_blocks
-        total_blocks = max(max_resident_blocks, total_blocks) # why would these not be the same? Why not just use max_resident_blocks?
+        total_blocks = max(max_resident_blocks, total_blocks)
 
-        num_chunks = math.ceil(total_blocks / self._chunk_size_blocks) # what happens to self._chunk_size_blocks when we use chunked prefill?
+        num_chunks = math.ceil(total_blocks / self._transfer_chunk_size)
         slices: List[KVSlice] = []
         for chunk_idx in range(num_chunks):
-            start = chunk_idx * self._chunk_size_blocks
+            start = chunk_idx * self._transfer_chunk_size
             is_last = chunk_idx == num_chunks - 1
-            chunk_block_count = min(self._chunk_size_blocks, total_blocks - start)
+            chunk_block_count = min(self._transfer_chunk_size, total_blocks - start)
             chunk_token_start = start * tpb
             chunk_token_end = (start + chunk_block_count) * tpb
             if base_slice.token_range is not None:
@@ -344,7 +344,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     mamba_state_index=base_slice.mamba_state_index,
                     token_range=chunk_token_range,
                     chunk_block_offset=start,
-                    chunk_size_blocks=chunk_block_count,
+                    transfer_chunk_size=chunk_block_count,
                     total_blocks=total_blocks,
                 )
             )

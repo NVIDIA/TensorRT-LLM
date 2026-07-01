@@ -70,51 +70,50 @@ def create_kv_cache_transceiver(
             "UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
             "hangs or lower-than-expected performance.")
 
-    # Auto-select Python transceiver when chunk_size_blocks is set,
+    # Auto-select Python transceiver when transfer_chunk_size is set,
     # since the C++ transceiver does not support chunked transfer.
     # Only applies to NIXL/DEFAULT backends (the Python transceiver
     # does not support UCX, MPI, or MOONCAKE).
     runtime = cache_transceiver_config.transceiver_runtime
     use_python = runtime == "PYTHON"
     if (runtime is None
-            and cache_transceiver_config.chunk_size_blocks is not None):
+            and cache_transceiver_config.transfer_chunk_size is not None):
         if cache_transceiver_config.backend in (None, "DEFAULT", "NIXL"):
             # Use warning (not info) so users notice the transceiver swap and
             # the implied perf / staging-buffer characteristics change.  Set
             # transceiver_runtime='CPP' explicitly to opt out (and lose
             # chunked transfer).
             logger.warning(
-                "chunk_size_blocks is set; auto-selecting the Python "
+                "transfer_chunk_size is set; auto-selecting the Python "
                 "transceiver instead of the C++ transceiver to enable "
                 "chunked KV cache transfer. "
                 "Set transceiver_runtime='CPP' to disable this auto-selection.")
             use_python = True
         else:
             logger.warning(
-                f"chunk_size_blocks is set but backend "
+                f"transfer_chunk_size is set but backend "
                 f"'{cache_transceiver_config.backend}' requires the C++ "
                 f"transceiver, which does not support chunked transfer. "
-                f"chunk_size_blocks will be ignored. Use NIXL backend to "
+                f"transfer_chunk_size will be ignored. Use NIXL backend to "
                 f"enable chunked transfer.")
     elif (runtime == "CPP"
-          and cache_transceiver_config.chunk_size_blocks is not None):
+          and cache_transceiver_config.transfer_chunk_size is not None):
         raise ValueError(
-            "chunk_size_blocks is set but transceiver_runtime='CPP' "
+            "transfer_chunk_size is set but transceiver_runtime='CPP' "
             "explicitly disables Python auto-selection; "
-            "chunk_size_blocks will be ignored."
-        )
+            "transfer_chunk_size will be ignored.")
 
-    # Warn when chunk_size_blocks is below the recommended floor.  The Pydantic
+    # Warn when transfer_chunk_size is below the recommended floor.  The Pydantic
     # field is PositiveInt (>=1), but values below ~16 push the per-chunk RDMA
     # overhead into the regime where it dominates transfer throughput.
-    _MIN_RECOMMENDED_CHUNK_SIZE_BLOCKS = 16
-    if (cache_transceiver_config.chunk_size_blocks is not None
-            and cache_transceiver_config.chunk_size_blocks
-            < _MIN_RECOMMENDED_CHUNK_SIZE_BLOCKS):
+    _MIN_RECOMMENDED_TRANSFER_CHUNK_SIZE = 16
+    if (cache_transceiver_config.transfer_chunk_size is not None
+            and cache_transceiver_config.transfer_chunk_size
+            < _MIN_RECOMMENDED_TRANSFER_CHUNK_SIZE):
         logger.warning(
-            f"chunk_size_blocks={cache_transceiver_config.chunk_size_blocks} "
+            f"transfer_chunk_size={cache_transceiver_config.transfer_chunk_size} "
             f"is below the recommended floor of "
-            f"{_MIN_RECOMMENDED_CHUNK_SIZE_BLOCKS}; per-chunk RDMA overhead "
+            f"{_MIN_RECOMMENDED_TRANSFER_CHUNK_SIZE}; per-chunk RDMA overhead "
             f"may dominate transfer throughput. Consider 64-128 for "
             f"long-context workloads (ISL >= 32K).")
 

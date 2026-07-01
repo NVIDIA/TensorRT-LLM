@@ -219,7 +219,7 @@ def test_build_kv_write_meta_projects_asymmetric_layer_group_chunk():
             ],
             token_range=SimpleNamespace(end=64),
             chunk_block_offset=4,
-            chunk_size_blocks=4,
+            transfer_chunk_size=4,
             total_blocks=8,
         ),
         _make_params(),
