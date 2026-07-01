@@ -49,6 +49,10 @@ ValidatedParams validateInputs(at::Tensor const& x, std::optional<at::Tensor> co
     TORCH_CHECK(D == 5120, "fused_dit_layernorm_shift_scale only supports D=5120 (got ", D, ")");
     TORCH_CHECK(D % 16 == 0, "D must be divisible by 16 (NVFP4 group size)");
 
+    TORCH_CHECK(ln_weight.has_value() == ln_bias.has_value(), "ln_weight and ln_bias must both be provided together");
+    TORCH_CHECK(
+        scale_msa.has_value() == shift_msa.has_value(), "scale_msa and shift_msa must both be provided together");
+
     bool const has_ln_affine = ln_weight.has_value();
     bool const has_modulation = scale_msa.has_value();
 
@@ -57,8 +61,10 @@ ValidatedParams validateInputs(at::Tensor const& x, std::optional<at::Tensor> co
 
     if (has_ln_affine)
     {
-        TORCH_CHECK(
-            ln_weight.has_value() && ln_bias.has_value(), "ln_weight and ln_bias must both be provided together");
+        CHECK_TH_CUDA(ln_weight.value());
+        CHECK_TH_CUDA(ln_bias.value());
+        TORCH_CHECK(ln_weight->device() == x.device(), "ln_weight must be on the same device as x");
+        TORCH_CHECK(ln_bias->device() == x.device(), "ln_bias must be on the same device as x");
         TORCH_CHECK(ln_weight->dim() == 1 && ln_weight->size(0) == D, "ln_weight must be 1D [D]");
         TORCH_CHECK(ln_bias->dim() == 1 && ln_bias->size(0) == D, "ln_bias must be 1D [D]");
         CHECK_TYPE(ln_weight.value(), torch::kBFloat16);
@@ -69,8 +75,10 @@ ValidatedParams validateInputs(at::Tensor const& x, std::optional<at::Tensor> co
 
     if (has_modulation)
     {
-        TORCH_CHECK(
-            scale_msa.has_value() && shift_msa.has_value(), "scale_msa and shift_msa must both be provided together");
+        CHECK_TH_CUDA(scale_msa.value());
+        CHECK_TH_CUDA(shift_msa.value());
+        TORCH_CHECK(scale_msa->device() == x.device(), "scale_msa must be on the same device as x");
+        TORCH_CHECK(shift_msa->device() == x.device(), "shift_msa must be on the same device as x");
         TORCH_CHECK(seq_len_per_batch > 0, "seq_len_per_batch must be positive when using AdaLN modulation");
         TORCH_CHECK(
             M % seq_len_per_batch == 0, "M (", M, ") must be divisible by seq_len_per_batch (", seq_len_per_batch, ")");

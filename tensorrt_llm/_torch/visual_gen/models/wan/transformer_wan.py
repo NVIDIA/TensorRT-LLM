@@ -363,6 +363,7 @@ class WanBlock(nn.Module):
         self._norm1_fp4_scale: Optional[torch.Tensor] = None
         self._norm2_fp4_scale: Optional[torch.Tensor] = None
         self._norm3_fp4_scale: Optional[torch.Tensor] = None
+        self._fused_ln_supported = hidden_size == 5120
 
         self.ffn = MLP(
             hidden_size=hidden_size,
@@ -443,15 +444,29 @@ class WanBlock(nn.Module):
                 self.scale_shift_table.float() + temb.float()
             ).chunk(6, dim=1)
 
-        if self._norm1_fp4_scale is not None and _wan_ln_fusion_enabled():
+        if (
+            self._norm1_fp4_scale is not None
+            and self._fused_ln_supported
+            and _wan_ln_fusion_enabled()
+        ):
             # x is [B, S, D]; flatten to 2D for the fused op, reshape output back.
-            _batch_size = temb.shape[0]
             _x_2d = x.reshape(-1, x.shape[-1])
-            _seq_len_per_batch = _x_2d.shape[0] // _batch_size
+            if temb.ndim == 4:
+                # scale_msa/shift_msa are [B, S, D] here; flatten per-token so each
+                # row of _x_2d gets its own modulation row (seq_len_per_batch=1).
+                _scale_msa_2d = scale_msa.reshape(-1, scale_msa.shape[-1])
+                _shift_msa_2d = shift_msa.reshape(-1, shift_msa.shape[-1])
+                _seq_len_per_batch = 1
+            else:
+                # scale_msa/shift_msa are [B, D] here; one modulation row per batch element.
+                _batch_size = temb.shape[0]
+                _scale_msa_2d = scale_msa.reshape(_batch_size, -1)
+                _shift_msa_2d = shift_msa.reshape(_batch_size, -1)
+                _seq_len_per_batch = _x_2d.shape[0] // _batch_size
             normed = apply_fused_layernorm_adaln_quant(
                 _x_2d,
-                scale_msa.reshape(_batch_size, -1),
-                shift_msa.reshape(_batch_size, -1),
+                _scale_msa_2d,
+                _shift_msa_2d,
                 _seq_len_per_batch,
                 self._norm1_fp4_scale,
                 eps=self.norm1.variance_epsilon,
@@ -483,6 +498,7 @@ class WanBlock(nn.Module):
 
         if (
             self._norm2_fp4_scale is not None
+            and self._fused_ln_supported
             and _wan_ln_fusion_enabled()
             and isinstance(self.norm2, LayerNorm)
             and self.norm2.weight is not None
@@ -548,31 +564,40 @@ class WanBlock(nn.Module):
         x = x + self.attn2.to_out[0](attn2_output)
 
         # 3. Feed-forward
-        if self._norm3_fp4_scale is not None and _wan_ln_fusion_enabled():
-            _batch_size = temb.shape[0]
+        if (
+            self._norm3_fp4_scale is not None
+            and self._fused_ln_supported
+            and _wan_ln_fusion_enabled()
+        ):
             _x_2d = x.reshape(-1, x.shape[-1])
-            _seq_len_per_batch = _x_2d.shape[0] // _batch_size
+            if temb.ndim == 4:
+                # c_scale_msa/c_shift_msa are [B, S, D] here; flatten per-token so each
+                # row of _x_2d gets its own modulation row (seq_len_per_batch=1).
+                _c_scale_msa_2d = c_scale_msa.reshape(-1, c_scale_msa.shape[-1])
+                _c_shift_msa_2d = c_shift_msa.reshape(-1, c_shift_msa.shape[-1])
+                _seq_len_per_batch = 1
+            else:
+                # c_scale_msa/c_shift_msa are [B, D] here; one modulation row per batch element.
+                _batch_size = temb.shape[0]
+                _c_scale_msa_2d = c_scale_msa.reshape(_batch_size, -1)
+                _c_shift_msa_2d = c_shift_msa.reshape(_batch_size, -1)
+                _seq_len_per_batch = _x_2d.shape[0] // _batch_size
             normed = apply_fused_layernorm_adaln_quant(
                 _x_2d,
-                c_scale_msa.reshape(_batch_size, -1),
-                c_shift_msa.reshape(_batch_size, -1),
+                _c_scale_msa_2d,
+                _c_shift_msa_2d,
                 _seq_len_per_batch,
                 self._norm3_fp4_scale,
                 eps=self.norm3.variance_epsilon,
             )
-            if isinstance(normed, Fp4QuantizedTensor):
-                normed = Fp4QuantizedTensor(
-                    normed.fp4_tensor.reshape(*x.shape[:-1], normed.fp4_tensor.shape[-1]),
-                    normed.scaling_factor,
-                    normed.is_sf_swizzled,
-                )
-            else:
-                normed = normed.reshape(x.shape)
+            # MLP's fused GELU kernel requires 2D input; reshape the output instead.
+            ffn_out = self.ffn(normed).reshape(x.shape)
         else:
             normed = self.norm3(x.float()) * (1 + c_scale_msa) + c_shift_msa
             normed = normed.to(x.dtype)
+            ffn_out = self.ffn(normed)
 
-        x = (x.float() + self.ffn(normed).float() * c_gate_msa).to(x.dtype)
+        x = (x.float() + ffn_out.float() * c_gate_msa).to(x.dtype)
 
         return x
 

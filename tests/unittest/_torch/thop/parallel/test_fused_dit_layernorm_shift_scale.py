@@ -312,6 +312,70 @@ def test_validation_non_contiguous_x():
         torch.ops.trtllm.fused_dit_layernorm_shift_scale(x_strided, None, None, None, None, 32, EPS)
 
 
+def test_validation_ln_weight_without_ln_bias():
+    """ln_weight provided without ln_bias must raise (partial affine pair)."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    device = torch.device("cuda")
+    x = torch.randn(32, D, device=device).to(torch.bfloat16)
+    ln_w = torch.ones(D, device=device).to(torch.bfloat16)
+    with pytest.raises(RuntimeError, match="ln_weight and ln_bias must both be provided together"):
+        torch.ops.trtllm.fused_dit_layernorm_shift_scale(x, ln_w, None, None, None, 32, EPS)
+
+
+def test_validation_scale_msa_without_shift_msa():
+    """scale_msa provided without shift_msa must raise (partial modulation pair)."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    device = torch.device("cuda")
+    x = torch.randn(32, D, device=device).to(torch.bfloat16)
+    scale = torch.zeros(1, D, device=device).to(torch.bfloat16)
+    with pytest.raises(
+        RuntimeError, match="scale_msa and shift_msa must both be provided together"
+    ):
+        torch.ops.trtllm.fused_dit_layernorm_shift_scale(x, None, None, scale, None, 32, EPS)
+
+
+def test_validation_non_positive_seq_len():
+    """seq_len_per_batch <= 0 on the AdaLN path must raise."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    device = torch.device("cuda")
+    x = torch.randn(32, D, device=device).to(torch.bfloat16)
+    scale = torch.zeros(1, D, device=device).to(torch.bfloat16)
+    shift = torch.zeros(1, D, device=device).to(torch.bfloat16)
+    with pytest.raises(RuntimeError, match="seq_len_per_batch must be positive"):
+        torch.ops.trtllm.fused_dit_layernorm_shift_scale(x, None, None, scale, shift, 0, EPS)
+
+
+@skip_pre_blackwell
+def test_validation_sf_scale_wrong_dtype():
+    """sf_scale with a non-float32 dtype must raise a descriptive error."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    device = torch.device("cuda")
+    x = torch.randn(32, D, device=device).to(torch.bfloat16)
+    sf_scale = torch.ones(1, device=device).to(torch.bfloat16)  # wrong dtype
+    with pytest.raises(RuntimeError, match="dtype"):
+        torch.ops.trtllm.fused_dit_layernorm_shift_scale_quant(
+            x, None, None, None, None, sf_scale, 32, EPS
+        )
+
+
+@skip_pre_blackwell
+def test_validation_sf_scale_non_scalar():
+    """sf_scale with more than one element must raise a descriptive error."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    device = torch.device("cuda")
+    x = torch.randn(32, D, device=device).to(torch.bfloat16)
+    sf_scale = torch.ones(2, device=device)  # non-scalar
+    with pytest.raises(RuntimeError, match="scalar tensor"):
+        torch.ops.trtllm.fused_dit_layernorm_shift_scale_quant(
+            x, None, None, None, None, sf_scale, 32, EPS
+        )
+
+
 # ---------------------------------------------------------------------------
 # Production shapes: Wan 2.2 T2V-A14B at both default resolutions.
 #

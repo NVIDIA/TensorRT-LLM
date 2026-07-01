@@ -418,6 +418,9 @@ void launchFusedDiTLayerNormShiftScaleKernel(DiTLayerNormShiftScaleParams const&
 {
     TLLM_CHECK_WITH_INFO(params.D == 5120, "fusedDiTLayerNormShiftScaleKernel only supports D=5120 (got %d)", params.D);
     TLLM_CHECK_WITH_INFO(!(has_ln_affine && has_modulation), "has_ln_affine and has_modulation are mutually exclusive");
+    TLLM_CHECK_WITH_INFO(!has_quant || tensorrt_llm::common::getSMVersion() >= 100,
+        "fusedDiTLayerNormShiftScaleKernel quant mode requires SM >= 100 (Blackwell+), got SM %d",
+        tensorrt_llm::common::getSMVersion());
 
     constexpr int D = 5120;
     constexpr int BLOCK_SIZE = 128;
