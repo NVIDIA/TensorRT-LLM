@@ -99,6 +99,7 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
     )
 
     def _normalize_weight_names(self, weights: dict) -> dict:
+        """Map HF checkpoint names onto the shared Qwen3Next module layout."""
         normalized_weights = {}
         for key, tensor in weights.items():
             if key.startswith("model.visual."):
@@ -109,6 +110,12 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         return normalized_weights
 
     def _normalize_scale_names(self, weights: dict, quant_algo) -> tuple[dict, bool]:
+        """Canonicalize ModelOpt FP8 scale names and shapes before loading.
+
+        Returns:
+            The remapped weight dictionary and whether the source checkpoint
+            used ModelOpt's native FP8 block-scale layout.
+        """
         # Canonicalize FP8 weight_scale layout so the Linear loader sees one
         # shape per quant algo:
         #   - FP8_BLOCK_SCALES: modelopt fp8_pb_wo stores weight_scale shaped
@@ -152,6 +159,7 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         module_weights: dict,
         allow_partial_loading: bool = False,
     ) -> None:
+        """Load Qwen3.5 MoE expert tensors with the layout TRT-LLM expects."""
         if isinstance(module, MoE):
             config = self.config.pretrained_config
             uses_fused_expert_tensors = "gate_up_proj" in module_weights
@@ -190,6 +198,7 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         )
 
     def _pack_projection_tensor(self, tensors: list[torch.Tensor], num_groups: int) -> torch.Tensor:
+        """Group-interleave split projection tensors for fused linear attention."""
         reference_shape = tensors[0].shape[1:]
         for tensor in tensors:
             assert tensor.shape[1:] == reference_shape, (
@@ -209,6 +218,7 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
     def _split_qkv_tensor(
         self, tensor: torch.Tensor, expected_q: int, expected_v: int
     ) -> tuple[torch.Tensor, ...]:
+        """Split a packed qkv tensor into q, k, and v component tensors."""
         expected_total = expected_q * 2 + expected_v
         assert tensor.shape[0] == expected_total, (
             f"Expected packed qkv projection with leading dim {expected_total}, got {tensor.shape}"
@@ -218,6 +228,7 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
     def _split_qkv_scale_tensor(
         self, tensor: torch.Tensor, expected_q: int, expected_v: int
     ) -> tuple[torch.Tensor, ...]:
+        """Split a packed qkv FP8 block-scale tensor into q, k, and v scales."""
         expected_q_blocks = math.ceil(expected_q / _FP8_2D_BLOCK_SIZE)
         expected_v_blocks = math.ceil(expected_v / _FP8_2D_BLOCK_SIZE)
         expected_total_blocks = expected_q_blocks * 2 + expected_v_blocks
@@ -230,6 +241,7 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
     def _dequantize_fp8_block_scale_weight(
         self, weight: torch.Tensor, weight_scale_inv: torch.Tensor
     ) -> torch.Tensor:
+        """Dequantize a 2-D FP8 block-scale linear-attention weight tensor."""
         rows, cols = weight.shape
         expanded_scales = (
             weight_scale_inv.to(torch.float32)
@@ -242,6 +254,7 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         return (weight.to(torch.float32) * expanded_scales).to(target_dtype).contiguous()
 
     def _dequantize_linear_attn_fp8_qkvz(self, weights: dict) -> dict:
+        """Dequantize packed qkvz FP8 block-scale weights that load as BF16."""
         updated_weights = dict(weights)
         for name in list(weights):
             if not name.endswith(".linear_attn.in_proj_qkvz.weight"):
@@ -423,6 +436,12 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         return updated
 
     def _pack_split_projections(self, weights: dict) -> dict:
+        """Pack Qwen3.5 split linear-attention projections into fused keys.
+
+        Qwen3.5 checkpoints may store qkv/z or q/k/v/z plus b/a separately.
+        TRT-LLM's Qwen3Next modules expect fused ``in_proj_qkvz`` and
+        ``in_proj_ba`` tensors with grouped interleaving.
+        """
         config = self.config.pretrained_config
         num_k_groups = config.linear_num_key_heads
         num_v_heads = config.linear_num_value_heads
@@ -568,6 +587,7 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         return remapped_weights
 
     def preprocess_weights(self, weights: dict) -> dict:
+        """Normalize, pack, and dequantize Qwen3.5 weights before loading."""
         quant_algo = self.config.quant_config.quant_algo
 
         normalized_weights = self._normalize_weight_names(weights)
