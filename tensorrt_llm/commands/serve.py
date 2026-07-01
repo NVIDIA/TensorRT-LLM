@@ -1381,11 +1381,25 @@ def _maybe_start_router_http_servers(disagg_cfg) -> list:
                                     "request_timeout_s")}
         server_args.setdefault("type", "centralized_kv_cache_aware")
 
-        env = dict(os.environ)
-        # Never fork the routing server into multiple uvicorn workers.
+        # The routing server is a plain HTTP process, not an MPI rank. If the
+        # parent happens to run under an MPI launcher (srun --mpi=pmix, mpirun),
+        # the inherited SLURM/PMIX/OMPI env would make the child's mpi4py import
+        # try to join that MPI namespace and abort. Drop those vars so the child
+        # comes up as a standalone process (mpi4py falls back to a singleton
+        # COMM_WORLD).
+        env = {
+            k: v for k, v in os.environ.items()
+            if not k.startswith(("SLURM_", "PMIX_", "PMI_", "OMPI_", "UCX_",
+                                 "I_MPI_", "HYDRA_", "MPI_"))
+        }
+        # Never fork the routing server into multiple uvicorn workers (each
+        # would try to bind the same port / fragment routing state).
         env.pop("WEB_CONCURRENCY", None)
+        # Invoke via the module entrypoint (robust regardless of how the parent
+        # was launched -- e.g. under pytest sys.argv[0] is not the serve CLI).
         command = [
-            "python3", sys.argv[0], "router_http_server",
+            sys.executable, "-m", "tensorrt_llm.commands.serve",
+            "router_http_server",
             "--host", host, "--port", str(port),
             "--server_role", role,
             "--servers", ",".join(role_servers[role]),
