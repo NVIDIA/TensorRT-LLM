@@ -42,6 +42,24 @@ ROUTE_AFFINITY_CACHE_SIZE = 50000
 ROUTE_AFFINITY_TOKEN_PREFIX = 256
 
 
+def _inject_route_hint(request: OpenAIRequest, dp_rank: int) -> None:
+    """Set ``disaggregated_params.route_hint.dp_rank`` on *request*.
+
+    Shared by the in-process centralized router and the remote HTTP client so
+    the worker ADP router honors the router's per-rank choice.
+    """
+    from tensorrt_llm.serve.openai_protocol import (
+        DisaggregatedParams as ProtoDisaggParams,
+        RouteHint as ProtoRouteHint)
+    if request.disaggregated_params is None:
+        request.disaggregated_params = ProtoDisaggParams(
+            request_type="context_only",
+            route_hint=ProtoRouteHint(dp_rank=dp_rank))
+    else:
+        request.disaggregated_params.route_hint = ProtoRouteHint(
+            dp_rank=dp_rank)
+
+
 class ServerState:
 
     def __init__(
@@ -1562,17 +1580,35 @@ class CentralizedKVCacheRouter(BlockHashMixin, Router):
                 f"CentralizedKVCacheRouter: {server} did not expose "
                 f"worker_id in /server_info; routing will degrade")
 
+    def select_by_block_hashes(
+            self, block_hashes: List[BlockHash],
+            exclude_server: Optional[str] = None
+    ) -> tuple[str, int, Optional[int]]:
+        """Placement from pre-computed block hashes (no tokenization).
+
+        The hashing is done by the caller (the orchestrator surface, or the
+        remote client via ``RemoteHttpRouter``), so this is the pure selection
+        step: pick the best server for ``block_hashes`` among the currently
+        prepared servers, round-robining as fallback. Returns
+        ``(server, matched_blocks, dp_rank)``. Raises ``ValueError`` when no
+        server is available. Safe to call directly (in-process) or from the
+        HTTP server handler.
+        """
+        servers = [s for s in self._prepared_ready_servers
+                   if s != exclude_server]
+        if not servers:
+            raise ValueError(
+                f"No available servers after excluding {exclude_server}")
+        server, matched, dp_rank, _ = self._core.select_address(
+            self._namespace, block_hashes, servers, self._rr_counter)
+        self._rr_counter += 1
+        return server, matched, dp_rank
+
     async def get_next_server(
             self,
             request: OpenAIRequest,
             exclude_server: Optional[str] = None) -> tuple[str, dict]:
         _rt_t0 = time.monotonic()
-        async with self._lock:
-            servers = [s for s in self._prepared_ready_servers
-                       if s != exclude_server]
-        if not servers:
-            raise ValueError(
-                f"No available servers after excluding {exclude_server}")
 
         cache_salt_id = self._get_request_cache_salt_id(request)
         token_lists, block_hashes = await asyncio.to_thread(
@@ -1580,22 +1616,13 @@ class CentralizedKVCacheRouter(BlockHashMixin, Router):
             cache_salt_id)
         flat_hashes = [h for hl in block_hashes for h in hl]
 
-        server, matched, dp_rank, _ = self._core.select_address(
-            self._namespace, flat_hashes, servers, self._rr_counter)
-        self._rr_counter += 1
+        async with self._lock:
+            server, matched, dp_rank = self.select_by_block_hashes(
+                flat_hashes, exclude_server)
 
         # Inject route_hint when per-rank routing selected a specific dp_rank.
         if dp_rank is not None:
-            from tensorrt_llm.serve.openai_protocol import (
-                DisaggregatedParams as ProtoDisaggParams,
-                RouteHint as ProtoRouteHint)
-            if request.disaggregated_params is None:
-                request.disaggregated_params = ProtoDisaggParams(
-                    request_type="context_only",
-                    route_hint=ProtoRouteHint(dp_rank=dp_rank))
-            else:
-                request.disaggregated_params.route_hint = ProtoRouteHint(
-                    dp_rank=dp_rank)
+            _inject_route_hint(request, dp_rank)
 
         self._record_route_timing(time.monotonic() - _rt_t0)
         return server, {"matched_blocks": matched,
@@ -1625,20 +1652,19 @@ class CentralizedKVCacheRouter(BlockHashMixin, Router):
 CentralizedKvCacheAwareRouter = CentralizedKVCacheRouter
 
 
-class RemoteHttpRouter(Router):
+class RemoteHttpRouter(BlockHashMixin, Router):
     """Client adaptor that delegates placement to a remote HTTP router server.
 
-    Instead of running routing logic in-process, this router POSTs each request
-    to a standalone :class:`~tensorrt_llm.serve.router_http_server.RouterHttpServer`
-    (``POST /get_next_server``) and uses the returned server address. When the
-    remote returns a ``route_hint`` (per-rank dp_rank from a centralized
-    KV-cache router), it is injected into the request's ``disaggregated_params``
-    exactly as the in-process ``CentralizedKVCacheRouter`` would, so downstream
-    disagg handling is unchanged.
+    Tokenization and block-hashing happen **here** (in the orchestrator), on the
+    ``asyncio.to_thread`` pool, exactly like the in-process centralized router.
+    Only the resulting flat block hashes are sent to the remote router server
+    (``POST /select``), which keeps the request body (potentially tens of
+    thousands of tokens) off the wire and keeps all tokenization compute local.
 
-    The remote endpoint owns the server pool and routing state; this adaptor
-    keeps a local ``_servers`` list only for the base-class bookkeeping and
-    ``exclude_server`` plumbing.
+    When the remote returns a ``dp_rank`` (per-rank choice from a centralized
+    KV-cache router), it is injected into the request's ``disaggregated_params``
+    like the in-process ``CentralizedKVCacheRouter``, so downstream disagg
+    handling is unchanged.
 
     Args:
         remote_url: Base URL of the router HTTP server (e.g.
@@ -1652,10 +1678,15 @@ class RemoteHttpRouter(Router):
                  metadata_server_cfg: MetadataServerConfig = None,
                  metadata_server: JsonDictionary = None,
                  remote_url: str = None,
+                 tokens_per_block: Optional[int] = None,
+                 custom_tokenizer: Optional[str] = None,
+                 tokenizer_dir: Optional[str] = None,
                  request_timeout_s: float = 5.0,
                  **kwargs):
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
+        self._init_block_hashing(tokens_per_block, custom_tokenizer,
+                                 tokenizer_dir)
         if not remote_url:
             raise ValueError(
                 "RemoteHttpRouter requires 'remote_url' (the router HTTP "
@@ -1663,7 +1694,8 @@ class RemoteHttpRouter(Router):
         self._remote_url = remote_url.rstrip("/")
         self._request_timeout_s = request_timeout_s
         logger.info(
-            f"RemoteHttpRouter: delegating placement to {self._remote_url}")
+            f"RemoteHttpRouter: delegating placement to {self._remote_url} "
+            f"(hashing locally, tpb={self._tokens_per_block})")
 
     def _on_servers_updated(self, old_servers, new_servers):
         pass
@@ -1673,15 +1705,20 @@ class RemoteHttpRouter(Router):
             request: OpenAIRequest,
             exclude_server: Optional[str] = None) -> tuple[str, dict]:
         _rt_t0 = time.monotonic()
-        # Forward the request body (the remote router tokenizes / block-hashes
-        # it for cache-aware placement) plus the optional exclude_server.
-        payload = request.model_dump(exclude_none=True)
+        # Tokenize + block-hash locally (off the event loop); send only hashes.
+        cache_salt_id = self._get_request_cache_salt_id(request)
+        token_lists, block_hashes = await asyncio.to_thread(
+            self._tokenize_and_compute_block_hashes_with_salt, request,
+            cache_salt_id)
+        flat_hashes = [h for hl in block_hashes for h in hl]
+
+        payload = {"block_hashes": flat_hashes}
         if exclude_server is not None:
             payload["exclude_server"] = exclude_server
 
         try:
             async with self.session.post(
-                    f"{self._remote_url}/get_next_server",
+                    f"{self._remote_url}/select",
                     json=payload,
                     timeout=self._request_timeout_s) as resp:
                 if resp.status != 200:
@@ -1698,25 +1735,13 @@ class RemoteHttpRouter(Router):
 
         server = body["server"]
         matched = body.get("matched_blocks", 0)
-
-        # Mirror the centralized router: inject the per-rank route_hint so the
-        # worker ADP router honors the remote's dp_rank choice.
-        route_hint = body.get("route_hint")
-        if route_hint is not None and route_hint.get("dp_rank") is not None:
-            from tensorrt_llm.serve.openai_protocol import (
-                DisaggregatedParams as ProtoDisaggParams,
-                RouteHint as ProtoRouteHint)
-            dp_rank = route_hint["dp_rank"]
-            if request.disaggregated_params is None:
-                request.disaggregated_params = ProtoDisaggParams(
-                    request_type="context_only",
-                    route_hint=ProtoRouteHint(dp_rank=dp_rank))
-            else:
-                request.disaggregated_params.route_hint = ProtoRouteHint(
-                    dp_rank=dp_rank)
+        dp_rank = body.get("dp_rank")
+        if dp_rank is not None:
+            _inject_route_hint(request, dp_rank)
 
         self._record_route_timing(time.monotonic() - _rt_t0)
-        return server, {"matched_blocks": matched}
+        return server, {"matched_blocks": matched,
+                        "token_lists": token_lists}
 
     async def finish_request(self,
                              request: OpenAIRequest,
