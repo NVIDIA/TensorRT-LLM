@@ -26,21 +26,24 @@ DEVICE = "cuda"
 DTYPE = torch.float32
 
 
-def _wan22_ti2v_checkpoint() -> Path:
-    override = os.environ.get("WAN22_TI2V_MODEL_PATH")
-    if override:
-        return Path(override)
-    return Path(llm_models_root(check=True)) / "Wan2.2-TI2V-5B-Diffusers"
+def _require_checkpoint(model_dir: str, env_var: str) -> Path:
+    override = os.environ.get(env_var)
+    checkpoint_dir = Path(override) if override else Path(llm_models_root(check=True)) / model_dir
+    if not checkpoint_dir.exists():
+        raise FileNotFoundError(
+            f"{model_dir} checkpoint not found at {checkpoint_dir}. Set {env_var} or LLM_MODELS_ROOT."
+        )
+    return checkpoint_dir
 
 
 def _require_wan22_ti2v_checkpoint() -> Path:
-    checkpoint_dir = _wan22_ti2v_checkpoint()
-    if not checkpoint_dir.exists():
-        raise FileNotFoundError(
-            f"Wan2.2 TI2V checkpoint not found at {checkpoint_dir}. "
-            "Set WAN22_TI2V_MODEL_PATH or LLM_MODELS_ROOT."
-        )
-    return checkpoint_dir
+    # Wan2.2-TI2V-5B: is_residual=True -> exercises the residual encoder/decoder path.
+    return _require_checkpoint("Wan2.2-TI2V-5B-Diffusers", "DIFFUSION_MODEL_PATH_WAN22_TI2V_5B")
+
+
+def _require_wan21_t2v_1p3b_checkpoint() -> Path:
+    # Wan2.1-T2V-1.3B: is_residual=False -> exercises the non-residual encoder/decoder path.
+    return _require_checkpoint("Wan2.1-T2V-1.3B-Diffusers", "DIFFUSION_MODEL_PATH_WAN21_1_3B")
 
 
 def _make_reference_and_wan_vae(
@@ -135,7 +138,7 @@ def test_use_diffuser_vae_env_zero_keeps_native(monkeypatch):
         ("720p", 704, 1280),
     ],
 )
-def test_wan_vae_matches_diffusers_decode_checkpoint(
+def test_wan22_ti2v_vae_matches_diffusers_decode_checkpoint(
     case_name: str,
     height: int,
     width: int,
@@ -143,6 +146,7 @@ def test_wan_vae_matches_diffusers_decode_checkpoint(
     del case_name
     checkpoint_dir = _require_wan22_ti2v_checkpoint()
     reference_vae, wan_vae = _make_reference_and_wan_vae(checkpoint_dir)
+    assert wan_vae.config.is_residual is True  # residual encoder/decoder path
 
     torch.manual_seed(1)
     frames = 81
@@ -183,7 +187,7 @@ def test_wan_vae_matches_diffusers_decode_checkpoint(
         ("720p", 704, 1280),
     ],
 )
-def test_wan_vae_matches_diffusers_encode_checkpoint(
+def test_wan22_ti2v_vae_matches_diffusers_encode_checkpoint(
     case_name: str,
     height: int,
     width: int,
@@ -219,3 +223,63 @@ def test_wan_vae_matches_diffusers_encode_checkpoint(
         max_abs=2e-3,
         relative_mean=1e-3,
     )
+
+
+# Wan2.1-T2V-1.3B has is_residual=False, so it exercises the non-residual
+# encoder/decoder path (WanResidualBlock loop + WanResample / WanUpBlock) that
+# the Wan2.2-TI2V-5B tests above (is_residual=True) never reach.
+def test_wan21_t2v_vae_matches_diffusers_decode_checkpoint():
+    checkpoint_dir = _require_wan21_t2v_1p3b_checkpoint()
+    reference_vae, wan_vae = _make_reference_and_wan_vae(checkpoint_dir)
+    assert wan_vae.config.is_residual is False  # non-residual encoder/decoder path
+
+    torch.manual_seed(1)
+    frames, height, width = 81, 480, 832
+    latent_frames = 1 + (frames - 1) // wan_vae.config.scale_factor_temporal
+    latents = torch.randn(
+        1,
+        wan_vae.config.z_dim,
+        latent_frames,
+        height // wan_vae.config.scale_factor_spatial,
+        width // wan_vae.config.scale_factor_spatial,
+        device=DEVICE,
+        dtype=DTYPE,
+    ).to(memory_format=torch.channels_last_3d)
+
+    with torch.inference_mode():
+        reference_decoded = reference_vae.decode(latents).sample
+        wan_decoded = wan_vae.decode(latents).sample
+
+    # fp32 parity; the residual gap is only channels_last vs contiguous conv
+    # reduction order.
+    _assert_close_metrics(wan_decoded, reference_decoded, max_abs=4e-3, relative_mean=1e-3)
+
+
+def test_wan21_t2v_vae_matches_diffusers_encode_checkpoint():
+    checkpoint_dir = _require_wan21_t2v_1p3b_checkpoint()
+    reference_vae, wan_vae = _make_reference_and_wan_vae(checkpoint_dir)
+    assert wan_vae.config.is_residual is False  # non-residual encoder/decoder path
+
+    torch.manual_seed(2)
+    height, width = 480, 832
+    video = (
+        torch.rand(
+            1,
+            wan_vae.config.public_video_channels,
+            81,
+            height,
+            width,
+            device=DEVICE,
+            dtype=DTYPE,
+        )
+        .mul_(2.0)
+        .sub_(1.0)
+    ).to(memory_format=torch.channels_last_3d)
+
+    with torch.inference_mode():
+        reference_latents = reference_vae.encode(video).latent_dist.mode()
+        wan_latents = wan_vae.encode(video).latent_dist.mode()
+
+    # fp32 parity; the residual gap is only channels_last vs contiguous conv
+    # reduction order.
+    _assert_close_metrics(wan_latents, reference_latents, max_abs=3e-3, relative_mean=1e-3)
