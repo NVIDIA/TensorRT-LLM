@@ -32,6 +32,7 @@ _K_PROJ_KEY_RE = re.compile(
 @register_mapper("HF", "Gemma4ForCausalLM")
 @register_mapper("HF", "Gemma4ForConditionalGeneration")
 @register_mapper("HF", "Gemma4UnifiedForConditionalGeneration")
+@register_mapper("HF", "Gemma4AssistantForCausalLM")
 class Gemma4HfWeightMapper(HfWeightMapper):
     @property
     def _is_vlm(self) -> bool:
