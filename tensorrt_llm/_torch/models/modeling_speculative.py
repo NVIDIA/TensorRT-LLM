@@ -839,11 +839,11 @@ class DFlashForCausalLM(nn.Module):
     """
 
     def __init__(self, draft_config):
+        """Build the draft model, resolving its architecture from the draft config
+        (falling back to a model_type-derived name when the checkpoint uses a
+        custom DFlash architecture label)."""
         super().__init__()
 
-        # DFlash draft models may use custom architecture names (e.g. "DFlashDraftModel")
-        # that are not registered in MODEL_CLASS_MAPPING. Fall back to model_type-based
-        # architecture name (e.g. "qwen3" -> "Qwen3ForCausalLM").
         pretrained_cfg = draft_config.pretrained_config
         try:
             DraftModelClass, _ = get_model_architecture(pretrained_cfg)
@@ -1516,6 +1516,8 @@ class DFlashForCausalLM(nn.Module):
         hidden_states: torch.Tensor | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the draft model and return (hidden_states, hidden_states) for the
+        speculative-decoding contract."""
         hidden_states_out = self.model(
             input_ids=input_ids,
             attn_metadata=attn_metadata,
@@ -1537,20 +1539,15 @@ class DFlashLagunaForCausalLM(DFlashForCausalLM):
     """
 
     def __init__(self, draft_config):
-        # Pin the Laguna draft-layer class + weight mapper. The Laguna DFlash
-        # checkpoint labels itself with the vLLM name (architectures
-        # ["DFlashLagunaForCausalLM"], model_type "llama"), which TRT-LLM does
-        # not resolve to the Laguna layers. get_draft_model() selected this
-        # subclass by detecting that name in the draft config's architectures,
-        # so remap to the Laguna architecture here.
+        """Pin the Laguna draft-layer class and enable Laguna-specific behaviors
+        (context input_layernorm, causal sliding blocks); reject non-per-head
+        gating."""
+        # The checkpoint labels itself with the vLLM name (model_type "llama");
+        # remap to the Laguna architecture so TRT-LLM builds the Laguna layers.
         draft_config.pretrained_config.architectures = ["LagunaForCausalLM"]
         super().__init__(draft_config)
-        # Laguna draft layers apply input_layernorm to context K/V and use causal
-        # block attention on sliding-attention layers (the generic base does neither).
         self._context_input_layernorm = True
         self._sliding_layers_causal = True
-        # Laguna DFlash supports per-head gating only; reject a per-element
-        # config (e.g. Laguna-M.1 style) loudly rather than silently mis-gating.
         gating = getattr(self.config, 'gating', True)
         if gating not in (True, 'per-head'):
             raise NotImplementedError(
@@ -1558,8 +1555,8 @@ class DFlashLagunaForCausalLM(DFlashForCausalLM):
                 f"got gating={gating!r}")
 
     def load_weights(self, weights, weight_mapper=None, **kwargs):
-        # Build per-aux fc_norm (one RMSNorm per captured target layer) from the
-        # drafter's aux_hidden_norms.* weights, then defer the rest to the base.
+        """Build the per-aux ``fc_norm`` from the drafter's ``aux_hidden_norms.*``
+        weights, then defer the remaining weights to the base loader."""
         aux_keys = sorted(
             (k for k in weights if k.startswith('aux_hidden_norms.')),
             key=lambda k: int(k.split('.')[1]))
@@ -1583,6 +1580,8 @@ class DFlashLagunaForCausalLM(DFlashForCausalLM):
         super().load_weights(weights, weight_mapper=weight_mapper, **kwargs)
 
     def project_target_hidden(self, hidden_states):
+        """Project captured target features to the draft width: apply the per-aux
+        ``fc_norm`` to each hidden chunk, then ``fc`` + ``hidden_norm``."""
         hidden_states = hidden_states.to(self.fc.weight.dtype)
         fc_norm = getattr(self, 'fc_norm', None)
         if fc_norm is not None:
@@ -1593,6 +1592,8 @@ class DFlashLagunaForCausalLM(DFlashForCausalLM):
 
     def _post_attention_gate(self, attn_output, gate_input, attn_mod, num_heads,
                              head_dim):
+        """Apply Laguna's per-head softplus output gate (``g_proj``) to the
+        attention output; a no-op when the layer has no ``g_proj``."""
         g_proj = getattr(attn_mod, 'g_proj', None)
         if g_proj is None:
             return attn_output
@@ -1808,6 +1809,9 @@ class MTPDraftModelForCausalLM(DecoderModelForCausalLM[MTPDraftModel,
 
 
 def get_draft_model(model_config, draft_config, lm_head, model):
+    """Construct the draft model for the configured speculative-decoding mode
+    (EAGLE3 / MTP / PARD / DFlash). The DFlash branch selects the Laguna drafter
+    by detecting its architecture in the draft checkpoint's own config."""
     assert getattr(model_config, 'spec_config', None) is not None
     spec_dec_mode = model_config.spec_config.spec_dec_mode
     if spec_dec_mode.is_eagle3_one_model():
@@ -1833,9 +1837,6 @@ def get_draft_model(model_config, draft_config, lm_head, model):
     elif spec_dec_mode.is_pard():
         return PARDForCausalLM(draft_config)
     elif spec_dec_mode.is_dflash():
-        # Select the Laguna drafter by detecting its architecture in the draft
-        # checkpoint's own config (architectures: ["DFlashLagunaForCausalLM"]),
-        # rather than a separate user-supplied flag.
         draft_arches = getattr(draft_config.pretrained_config, "architectures",
                                None) or []
         if any("Laguna" in arch for arch in draft_arches):
