@@ -86,7 +86,7 @@ class CuteDslB12xFusedMoE(CuteDslFusedMoE):
     # SM versions on which FlashInfer exposes the b12x NVFP4 MoE kernel.
     # SM120 = desktop Blackwell (RTX 5090 / GB202); SM121 = GB10 / DGX Spark.
     _SUPPORTED_SM_VERSIONS = frozenset({120, 121})
-    _MIN_CUTLASS_DSL_CUDA_MAJOR_FOR_SM121 = 13
+    _MIN_CUTLASS_DSL_CUDA_MAJOR_FOR_B12X = 13
 
     # Prefill chunks (``x.shape[0] >= threshold``) route via CUTLASS NVFP4
     # GroupGEMM; decode (``x.shape[0] < threshold``) uses b12x. 64 cleanly
@@ -126,12 +126,12 @@ class CuteDslB12xFusedMoE(CuteDslFusedMoE):
             sm_list = "/".join(f"SM{v}" for v in sorted(cls._SUPPORTED_SM_VERSIONS))
             return f"CuteDslB12xFusedMoE requires {sm_list}, got SM{sm_version}"
 
-        # CUDA 12.x CuTe DSL lowers the SM121 NVFP4 MMA atom to the internal
+        # CUDA 12.x CuTe DSL lowers the SM12x NVFP4 MMA atom to the internal
         # ``_mma.block_scale...`` spelling, which ptxas rejects. CUDA 13.x
         # emits the public ``mma.sync.aligned...kind::mxf4nvf4`` opcode.
-        if sm_version == 121 and not cls._is_sm121_cutlass_dsl_runtime_available():
+        if not cls._is_cutlass_dsl_runtime_available():
             return (
-                "CuteDslB12xFusedMoE on SM121 requires the active "
+                "CuteDslB12xFusedMoE requires the active "
                 "nvidia-cutlass-dsl CUDA 13 native payload. CUDA 12.x CuTe "
                 "DSL lowers FlashInfer's B12x NVFP4 MMA to PTX that ptxas "
                 "rejects with Unexpected instruction types specified for "
@@ -139,14 +139,14 @@ class CuteDslB12xFusedMoE(CuteDslFusedMoE):
                 "nvidia-cutlass-dsl-libs-base (or install "
                 "nvidia-cutlass-dsl[cu13]) so "
                 "cutlass.base_dsl.version_info.CUDA_VERSION reports CUDA "
-                f"{cls._MIN_CUTLASS_DSL_CUDA_MAJOR_FOR_SM121}.x or newer."
+                f"{cls._MIN_CUTLASS_DSL_CUDA_MAJOR_FOR_B12X}.x or newer."
             )
         return None
 
     @classmethod
-    def _is_sm121_cutlass_dsl_runtime_available(cls) -> bool:
+    def _is_cutlass_dsl_runtime_available(cls) -> bool:
         cuda_major = cls._get_cutlass_dsl_cuda_major()
-        return cuda_major is not None and cuda_major >= cls._MIN_CUTLASS_DSL_CUDA_MAJOR_FOR_SM121
+        return cuda_major is not None and cuda_major >= cls._MIN_CUTLASS_DSL_CUDA_MAJOR_FOR_B12X
 
     @staticmethod
     def _get_cutlass_dsl_cuda_major() -> Optional[int]:
