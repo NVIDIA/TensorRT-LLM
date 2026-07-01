@@ -120,7 +120,7 @@ std::vector<Grant> CreditScheduler::schedule()
             // NOTE: no aging — a flow whose FRONT chunk can't fit right now is skipped while smaller
             // chunks elsewhere keep cycling, so a large chunk can be passed over under sustained small
             // traffic (HOL; never a deadlock — buddy coalescing eventually frees a high-order block,
-            // and maxChunkBytes <= arena guarantees it can fit a drained arena). See DESIGN.md §5.
+            // and maxChunkBytes <= arena guarantees it can fit a drained arena).
             auto off = mArena.alloc(want);
             if (!off)
             {

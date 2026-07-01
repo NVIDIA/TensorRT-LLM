@@ -33,7 +33,7 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 {
 
 // ============================================================================
-// BounceArena — the ONE shared bounce data buffer (DESIGN)
+// BounceArena — the ONE shared bounce data buffer
 // ----------------------------------------------------------------------------
 // Role
 //   Pure STORAGE: a single contiguous `bytes`-byte device buffer registered ONCE with NIXL and

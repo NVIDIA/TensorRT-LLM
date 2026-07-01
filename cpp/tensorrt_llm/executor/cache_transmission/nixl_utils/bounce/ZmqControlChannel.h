@@ -29,7 +29,7 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 {
 
 // ============================================================================
-// ZmqControlChannel — zmq implementation of ControlChannel (DESIGN)
+// ZmqControlChannel — zmq implementation of ControlChannel
 // ----------------------------------------------------------------------------
 // Topology (one-way, symmetric peers)
 //   Each agent owns:

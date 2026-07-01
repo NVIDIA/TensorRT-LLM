@@ -113,7 +113,7 @@ void ZmqControlChannel::sendTo(std::string const& peer, std::string const& blob)
         // unreachable peer whose queue is full (kSendHwm + TCP buffers) would wedge the whole reactor
         // — exactly the hang the design forbids. With dontwait a full queue returns an empty result
         // (EAGAIN) instead; we DROP the message. A dropped control message degrades the affected
-        // request to a leaseTimeout FAILURE — never a hang or data corruption (DESIGN.md §10).
+        // request to a leaseTimeout FAILURE — never a hang or data corruption.
         auto const sent = it->second.send(msg, zmq::send_flags::dontwait);
         if (!sent.has_value())
         {

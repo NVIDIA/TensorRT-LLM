@@ -24,7 +24,7 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 {
 
 // ============================================================================
-// ControlChannel — bounce v2 control-plane transport (DESIGN)
+// ControlChannel — bounce v2 control-plane transport
 // ----------------------------------------------------------------------------
 // Role
 //   Carries the small control messages of the credit protocol between agents:
@@ -42,7 +42,7 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 //       no zmq endpoint can be bootstrapped (no extra port).
 //   Crucially, NEITHER uses NIXL's postXferReq notifMsg — v2 abandons it entirely
 //   (data-landed is detected by the sender polling getXferStatus, which already
-//   includes NIXL's ucp_ep_flush_nbx; see bounce/DESIGN.md §4).
+//   includes NIXL's ucp_ep_flush_nbx).
 //
 // Ordering / correctness contract
 //   The channel need NOT order messages w.r.t. the RDMA data plane: the only
