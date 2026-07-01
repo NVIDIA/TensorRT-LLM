@@ -218,12 +218,13 @@ class GvrTopKLBKernel:
         min_blocks_per_mp: int = 3,
         use_256bit_load: bool = True,
         enable_warp_parallel_reduce: Optional[bool] = None,
-        # Phase-4 rank-scatter. Forwarded to BOTH underlying GvrTopKKernel
-        # instances, so the long (cluster / multi-CTA) branch and the short
-        # (single-CTA) branch use the same P4 variant. Default on (exact),
-        # matching GvrTopKKernel: exact rank-scatter is a drop-in for the
-        # snap Phase-4 and the faster path (see GvrTopKKernel / PR notes).
-        enable_p4_rank_scatter: bool = True,
+        # Phase-4 rank-scatter (OPT-IN, default OFF). Forwarded to BOTH
+        # underlying GvrTopKKernel instances, so the long (cluster / multi-CTA)
+        # and short (single-CTA) branches use the same P4 variant. Default off
+        # matches GvrTopKKernel: rank-scatter is faster but NOT exact on
+        # arbitrary inputs (see GvrTopKKernel docstring); the exact
+        # histogram-snap is the shipped default.
+        enable_p4_rank_scatter: bool = False,
         enable_p4_rank_scatter_exact: bool = True,
     ):
         assert cluster_size in (2, 4, 8), (

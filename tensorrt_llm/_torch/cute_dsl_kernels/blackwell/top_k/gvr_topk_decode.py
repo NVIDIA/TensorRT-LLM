@@ -231,7 +231,7 @@ class GvrTopKKernel:
         enable_smem_cache: bool = False,
         smem_cache_elems: int = 32768,
         seqlen_sorted: bool = False,
-        enable_p4_rank_scatter: bool = True,
+        enable_p4_rank_scatter: bool = False,
         enable_p4_rank_scatter_exact: bool = True,
     ):
         # cluster_size: number of CTAs cooperating per row. 1 = single-CTA
@@ -344,25 +344,35 @@ class GvrTopKKernel:
         self.FLT_MAX = 3.4028235e38
         self.NEG_FLT_MAX = -self.FLT_MAX
 
-        # Phase-4 variant select. When ``enable_p4_rank_scatter`` is True,
-        # the kernel dispatches :meth:`phase4_rank_scatter` instead of the
-        # iterative histogram-snap (:meth:`phase4_histogram_snap`). The
-        # rank-scatter path resolves the K-th rank with a single coarse
-        # histogram + (optionally) one fixed-256-bin fine recursion, then
-        # scatters survivors to their rank in one pass — collapsing the
-        # snap loop's ~14 block barriers to ~7. ``_exact`` adds the fine
-        # recursion that makes the straddling-bin tie-break exact (vdiff=0);
-        # without it the straddling bin is emitted in arbitrary order
-        # (set-correct, value-correct, but not rank-stable within ties).
-        # Both default on: the exact rank-scatter is a drop-in replacement
-        # for the snap Phase-4 (both exact, vdiff=0) and is the faster path
-        # (nsys cold-L2 median ~1.077x B300 / ~1.078x B200, 704-707/720 cells
-        # faster, hardware- and BS-invariant; see PR notes). ``_exact`` is
-        # kept on so the default stays exact like snap; pass
-        # enable_p4_rank_scatter_exact=False only when approximate
-        # straddling-tie order is acceptable in exchange for fewer barriers.
-        # Identical body is reused by the single-CTA path and the cluster
-        # leader-only path, so it stacks on cluster_size > 1.
+        # Phase-4 variant select (OPT-IN, default OFF). When
+        # ``enable_p4_rank_scatter`` is True the kernel dispatches
+        # :meth:`phase4_rank_scatter` instead of the exact iterative
+        # histogram-snap (:meth:`phase4_histogram_snap`). The rank-scatter
+        # path resolves the K-th rank with a coarse histogram + (optionally,
+        # ``_exact``) one fixed-256-bin fine recursion, then scatters
+        # survivors to their rank in a single pass — collapsing the snap
+        # loop's block barriers and running ~1.35x faster than snap on
+        # production temporally-coherent indexer logits (nsys cold-L2 B200,
+        # V4 Pro K1024 N64K).
+        #
+        # IMPORTANT — rank-scatter is NOT guaranteed exact on arbitrary
+        # continuous inputs. A fixed-depth histogram cannot separate two
+        # distinct values that land in the same (sub-)bin, so the straddling
+        # bin can emit a value below the true K-th rank. ``_exact`` (one
+        # fixed-256-bin fine recursion, default on when rank-scatter is
+        # enabled) resolves the straddling bin on typical distributions —
+        # exact (vdiff=0) on the temporally-coherent decode distribution
+        # (verified on V4 Pro/Flash synth) and on well-separated inputs — but
+        # a single recursion is still not sufficient for adversarial
+        # multi-bucket batches (large BS / cluster / varlen with uniform-random
+        # logits), where it can miss a boundary tie. Making it exact for ALL
+        # continuous inputs requires iterating to a real-value threshold, which
+        # costs about as much as the snap loop and so buys nothing over it.
+        # The exact histogram-snap is therefore the shipped DEFAULT; enable
+        # rank-scatter (opt-in) only where the production distribution holds
+        # and the ~1.35x P4 speedup (nsys cold-L2 B200, V4 Pro K1024 N64K) is
+        # wanted. Identical body is reused by the single-CTA and cluster
+        # leader-only paths, so it stacks on cluster_size > 1.
         self.enable_p4_rank_scatter = enable_p4_rank_scatter
         self.enable_p4_rank_scatter_exact = enable_p4_rank_scatter_exact
 
