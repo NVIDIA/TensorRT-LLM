@@ -729,7 +729,7 @@ class Sender(SenderBase):
             if total_blocks is None:
                 total_blocks = (slice_end + tpb - 1) // tpb
             chunk_offset = task._slice.chunk_block_offset
-            chunk_block_count = task._slice.chunk_size_blocks
+            chunk_block_count = task._slice.transfer_chunk_size
 
             for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
                 src_block_ids = src_block_ids_per_groups[self_lg]
@@ -781,7 +781,9 @@ class Sender(SenderBase):
                     f"dst beam-0 block list ({dst_beam0_blocks}) exceeds total slice "
                     f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
                 )
-                if chunk_block_count is not None and (chunk_offset > 0 or not task._slice.is_last_slice):
+                if chunk_block_count is not None and (
+                    chunk_offset > 0 or not task._slice.is_last_slice
+                ):
                     # Chunked lists are suffixes of the current global chunk,
                     # not of the full prompt.
                     src_start = (chunk_offset + chunk_block_count - src_beam0_blocks) * tpb

@@ -96,7 +96,7 @@ class KVSlice:
     is_last_slice: bool = False
     mamba_state_index: Optional[int] = None
     chunk_block_offset: int = 0
-    chunk_size_blocks: Optional[int] = None
+    transfer_chunk_size: Optional[int] = None
     total_blocks: Optional[int] = None
 
 

@@ -159,11 +159,12 @@ def test_session_status_enum():
 # ---------------------------------------------------------------------------
 
 
-def _chunk_block_ids(all_block_ids, chunk_size_blocks, mamba_state_index=None):
+def _chunk_block_ids(all_block_ids, transfer_chunk_size, mamba_state_index=None):
     """Call the real _create_kv_slices via a mock transceiver."""
     from unittest.mock import MagicMock
 
     from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice
+
     base_slice = KVSlice(
         is_last_slice=True,
         block_ids_per_layer_groups=all_block_ids,
@@ -171,7 +172,7 @@ def _chunk_block_ids(all_block_ids, chunk_size_blocks, mamba_state_index=None):
     )
 
     transceiver = MagicMock()
-    transceiver._chunk_size_blocks = chunk_size_blocks
+    transceiver._transfer_chunk_size = transfer_chunk_size
     transceiver._collect_base_slice = MagicMock(return_value=base_slice)
     transceiver._reuse_adapter.tokens_per_block = 1
     transceiver._create_kv_slices = KvCacheTransceiverV2._create_kv_slices.__get__(transceiver)
@@ -193,7 +194,7 @@ def _chunk_block_ids(all_block_ids, chunk_size_blocks, mamba_state_index=None):
 )
 def test_create_kv_slices_basic(all_block_ids, chunk_size, expected_num_slices):
     """Chunking produces the expected number of slices."""
-    slices = _chunk_block_ids(all_block_ids, chunk_size_blocks=chunk_size)
+    slices = _chunk_block_ids(all_block_ids, transfer_chunk_size=chunk_size)
     assert len(slices) == expected_num_slices
     assert slices[-1].is_last_slice is True
     if expected_num_slices > 1:
@@ -204,17 +205,18 @@ def test_create_kv_slices_basic(all_block_ids, chunk_size, expected_num_slices):
 def test_create_kv_slices_integrity_check():
     """Reassembled block IDs from all slices must match the original."""
     all_block_ids = [list(range(17)), list(range(5))]
-    slices = _chunk_block_ids(all_block_ids, chunk_size_blocks=4)
+    slices = _chunk_block_ids(all_block_ids, transfer_chunk_size=4)
     for lg_idx, original in enumerate(all_block_ids):
         reassembled = []
         for s in slices:
             reassembled.extend(s.block_ids_per_layer_groups[lg_idx])
         assert reassembled == original
 
+
 def test_create_kv_slices_multiple_layer_groups():
     """Shorter layer groups are projected into the overlapping global chunk."""
     all_block_ids = [list(range(8)), list(range(3))]
-    slices = _chunk_block_ids(all_block_ids, chunk_size_blocks=4)
+    slices = _chunk_block_ids(all_block_ids, transfer_chunk_size=4)
     assert len(slices) == 2
     assert np.array_equal(slices[0].block_ids_per_layer_groups[0], np.array([0, 1, 2, 3]))
     assert np.array_equal(slices[1].block_ids_per_layer_groups[0], np.array([4, 5, 6, 7]))
@@ -227,7 +229,7 @@ def test_create_kv_slices_multiple_layer_groups():
 def test_create_kv_slices_preserves_mamba_state_index():
     """mamba_state_index is propagated to every chunk slice."""
     all_block_ids = [list(range(8))]
-    slices = _chunk_block_ids(all_block_ids, chunk_size_blocks=4, mamba_state_index=42)
+    slices = _chunk_block_ids(all_block_ids, transfer_chunk_size=4, mamba_state_index=42)
     assert len(slices) == 2
     for s in slices:
         assert s.mamba_state_index == 42
@@ -236,7 +238,7 @@ def test_create_kv_slices_preserves_mamba_state_index():
 def test_create_kv_slices_none_mamba_state_index():
     """mamba_state_index=None is preserved when not set."""
     all_block_ids = [list(range(4))]
-    slices = _chunk_block_ids(all_block_ids, chunk_size_blocks=4)
+    slices = _chunk_block_ids(all_block_ids, transfer_chunk_size=4)
     assert len(slices) == 1
     assert slices[0].mamba_state_index is None
 
@@ -1168,11 +1170,11 @@ def test_transfer_worker_v2_with_window(
 @pytest.mark.timeout(120)
 @pytest.mark.parametrize("use_v2", [False, True], ids=["v1", "v2"])
 @pytest.mark.parametrize(
-    "chunk_size_blocks",
+    "transfer_chunk_size",
     [None, 2],
     ids=["single_slice", "sender_chunked"],
 )
-def test_transfer_with_gen_prefix_offset(use_v2, chunk_size_blocks):
+def test_transfer_with_gen_prefix_offset(use_v2, transfer_chunk_size):
     """Verify that only suffix blocks are transferred when gen has a prefix offset.
 
     Simulates gen-side prefix cache: ctx sends all blocks for [0, request_len),
@@ -1272,7 +1274,7 @@ def test_transfer_with_gen_prefix_offset(use_v2, chunk_size_blocks):
         )
         rx.receive(recv_slice)
 
-        if chunk_size_blocks is None:
+        if transfer_chunk_size is None:
             tx.send(
                 KVSlice(
                     is_last_slice=True,
@@ -1282,7 +1284,7 @@ def test_transfer_with_gen_prefix_offset(use_v2, chunk_size_blocks):
             )
         else:
             transceiver = MagicMock()
-            transceiver._chunk_size_blocks = chunk_size_blocks
+            transceiver._transfer_chunk_size = transfer_chunk_size
             transceiver._collect_base_slice = MagicMock(
                 return_value=KVSlice(
                     is_last_slice=True,
@@ -1569,7 +1571,7 @@ def add_and_verify_chunked_request(
     ctx_request_id,
     gen_request_id,
     request_len,
-    chunk_size_blocks,
+    transfer_chunk_size,
 ):
     """Chunked transfer variant: sender sends N slices, receiver sends 1."""
     ctx_transfer_workers = setup["ctx_transfer_workers"]
@@ -1583,7 +1585,7 @@ def add_and_verify_chunked_request(
     sender_sessions = [tw.create_tx_session(ctx_info["ctx_request"]) for tw in ctx_transfer_workers]
     for sender_session, block_ids_per_groups in zip(sender_sessions, ctx_block_ids, strict=True):
         transceiver = MagicMock()
-        transceiver._chunk_size_blocks = chunk_size_blocks
+        transceiver._transfer_chunk_size = transfer_chunk_size
         transceiver._collect_base_slice = MagicMock(
             return_value=KVSlice(
                 is_last_slice=True,
@@ -1653,8 +1655,8 @@ def test_transfer_worker_chunked(
     chunk_size = max(1, total_blocks // 2)
 
     try:
-        add_and_verify_chunked_request(setup, 0, 1, request_len, chunk_size_blocks=chunk_size)
-        add_and_verify_chunked_request(setup, 2, 3, request_len * 2, chunk_size_blocks=chunk_size)
+        add_and_verify_chunked_request(setup, 0, 1, request_len, transfer_chunk_size=chunk_size)
+        add_and_verify_chunked_request(setup, 2, 3, request_len * 2, transfer_chunk_size=chunk_size)
     finally:
         for worker in setup["ctx_transfer_workers"]:
             worker.shutdown()
