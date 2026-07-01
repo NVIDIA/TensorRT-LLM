@@ -47,17 +47,21 @@ def test_can_implement_rejects_unsupported_sm(sm_version):
     assert reason is not None and f"SM{sm_version}" in reason
 
 
-@pytest.mark.parametrize("sm_version", [120])
+@pytest.mark.parametrize("sm_version", sorted(CuteDslB12xFusedMoE._SUPPORTED_SM_VERSIONS))
 def test_can_implement_accepts_supported_sm_with_nvfp4(sm_version):
-    with patch(f"{_FUSED_MOE_MODULE}.get_sm_version", return_value=sm_version):
+    with (
+        patch(f"{_FUSED_MOE_MODULE}.get_sm_version", return_value=sm_version),
+        patch.object(CuteDslB12xFusedMoE, "_get_cutlass_dsl_cuda_major", return_value=13),
+    ):
         ok, reason = CuteDslB12xFusedMoE.can_implement(QuantAlgo.NVFP4)
     assert ok
     assert reason is None
 
 
-def test_can_implement_rejects_sm121_with_cuda12_cute_dsl():
+@pytest.mark.parametrize("sm_version", sorted(CuteDslB12xFusedMoE._SUPPORTED_SM_VERSIONS))
+def test_can_implement_rejects_supported_sm_with_cuda12_cute_dsl(sm_version):
     with (
-        patch(f"{_FUSED_MOE_MODULE}.get_sm_version", return_value=121),
+        patch(f"{_FUSED_MOE_MODULE}.get_sm_version", return_value=sm_version),
         patch.object(CuteDslB12xFusedMoE, "_get_cutlass_dsl_cuda_major", return_value=12),
     ):
         ok, reason = CuteDslB12xFusedMoE.can_implement(QuantAlgo.NVFP4)
@@ -67,9 +71,10 @@ def test_can_implement_rejects_sm121_with_cuda12_cute_dsl():
     assert "Unexpected instruction types" in reason
 
 
-def test_can_implement_rejects_sm121_when_cute_dsl_version_unavailable():
+@pytest.mark.parametrize("sm_version", sorted(CuteDslB12xFusedMoE._SUPPORTED_SM_VERSIONS))
+def test_can_implement_rejects_supported_sm_when_cute_dsl_version_unavailable(sm_version):
     with (
-        patch(f"{_FUSED_MOE_MODULE}.get_sm_version", return_value=121),
+        patch(f"{_FUSED_MOE_MODULE}.get_sm_version", return_value=sm_version),
         patch.object(CuteDslB12xFusedMoE, "_get_cutlass_dsl_cuda_major", return_value=None),
     ):
         ok, reason = CuteDslB12xFusedMoE.can_implement(QuantAlgo.NVFP4)
@@ -77,9 +82,10 @@ def test_can_implement_rejects_sm121_when_cute_dsl_version_unavailable():
     assert reason is not None and "CUDA 13 native payload" in reason
 
 
-def test_can_implement_accepts_sm121_with_cuda13_cute_dsl():
+@pytest.mark.parametrize("sm_version", sorted(CuteDslB12xFusedMoE._SUPPORTED_SM_VERSIONS))
+def test_can_implement_accepts_supported_sm_with_cuda13_cute_dsl(sm_version):
     with (
-        patch(f"{_FUSED_MOE_MODULE}.get_sm_version", return_value=121),
+        patch(f"{_FUSED_MOE_MODULE}.get_sm_version", return_value=sm_version),
         patch.object(CuteDslB12xFusedMoE, "_get_cutlass_dsl_cuda_major", return_value=13),
     ):
         ok, reason = CuteDslB12xFusedMoE.can_implement(QuantAlgo.NVFP4)
@@ -99,14 +105,20 @@ def test_can_implement_accepts_sm121_with_cuda13_cute_dsl():
 )
 def test_can_implement_rejects_non_nvfp4(quant_algo):
     """Only NVFP4 is supported; everything else must be turned away."""
-    with patch(f"{_FUSED_MOE_MODULE}.get_sm_version", return_value=120):
+    with (
+        patch(f"{_FUSED_MOE_MODULE}.get_sm_version", return_value=120),
+        patch.object(CuteDslB12xFusedMoE, "_get_cutlass_dsl_cuda_major", return_value=13),
+    ):
         ok, reason = CuteDslB12xFusedMoE.can_implement(quant_algo)
     assert not ok
     assert reason is not None and "NVFP4" in reason
 
 
 def test_can_implement_rejects_swiglu_gptoss_style():
-    with patch(f"{_FUSED_MOE_MODULE}.get_sm_version", return_value=120):
+    with (
+        patch(f"{_FUSED_MOE_MODULE}.get_sm_version", return_value=120),
+        patch.object(CuteDslB12xFusedMoE, "_get_cutlass_dsl_cuda_major", return_value=13),
+    ):
         ok, reason = CuteDslB12xFusedMoE.can_implement(QuantAlgo.NVFP4, swiglu_gptoss_style=True)
     assert not ok
     assert reason is not None and "swiglu_gptoss_style" in reason
@@ -114,7 +126,10 @@ def test_can_implement_rejects_swiglu_gptoss_style():
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float8_e4m3fn])
 def test_can_implement_rejects_unsupported_activation_dtype(dtype):
-    with patch(f"{_FUSED_MOE_MODULE}.get_sm_version", return_value=120):
+    with (
+        patch(f"{_FUSED_MOE_MODULE}.get_sm_version", return_value=120),
+        patch.object(CuteDslB12xFusedMoE, "_get_cutlass_dsl_cuda_major", return_value=13),
+    ):
         ok, reason = CuteDslB12xFusedMoE.can_implement(QuantAlgo.NVFP4, dtype_activation=dtype)
     assert not ok
     assert reason is not None
@@ -162,36 +177,41 @@ def test_get_moe_cls_cutedsl_returns_plain_cutedsl_on_unsupported_sm():
     assert cls is CuteDslFusedMoE
 
 
-@pytest.mark.parametrize("sm_version", [120])
+@pytest.mark.parametrize("sm_version", sorted(CuteDslB12xFusedMoE._SUPPORTED_SM_VERSIONS))
 def test_get_moe_cls_cutedsl_selects_b12x_on_supported_sm(sm_version):
-    """CUTEDSL + NVFP4 + SM120 + flashinfer importable → CuteDslB12xFusedMoE."""
-    cfg = ModelConfig()
-    cfg.moe_backend = "CUTEDSL"
-    cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
-    with patch("tensorrt_llm._utils.get_sm_version", return_value=sm_version):
-        cls = get_moe_cls(cfg)
-    assert cls is CuteDslB12xFusedMoE
-
-
-def test_get_moe_cls_cutedsl_falls_back_to_cutlass_on_sm121_with_cuda12():
-    """CUTEDSL + NVFP4 + SM121 avoids the CUDA 12 CuTe DSL JIT crash."""
+    """CUTEDSL + NVFP4 + SM12x + CUDA13 CuTe DSL -> CuteDslB12xFusedMoE."""
     cfg = ModelConfig()
     cfg.moe_backend = "CUTEDSL"
     cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
     with (
-        patch("tensorrt_llm._utils.get_sm_version", return_value=121),
+        patch("tensorrt_llm._utils.get_sm_version", return_value=sm_version),
+        patch.object(CuteDslB12xFusedMoE, "_get_cutlass_dsl_cuda_major", return_value=13),
+    ):
+        cls = get_moe_cls(cfg)
+    assert cls is CuteDslB12xFusedMoE
+
+
+@pytest.mark.parametrize("sm_version", sorted(CuteDslB12xFusedMoE._SUPPORTED_SM_VERSIONS))
+def test_get_moe_cls_cutedsl_falls_back_to_cutlass_on_supported_sm_with_cuda12(sm_version):
+    """CUTEDSL + NVFP4 + SM12x avoids the CUDA 12 CuTe DSL JIT crash."""
+    cfg = ModelConfig()
+    cfg.moe_backend = "CUTEDSL"
+    cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    with (
+        patch("tensorrt_llm._utils.get_sm_version", return_value=sm_version),
         patch.object(CuteDslB12xFusedMoE, "_get_cutlass_dsl_cuda_major", return_value=12),
     ):
         cls = get_moe_cls(cfg)
     assert cls is CutlassFusedMoE
 
 
-def test_get_moe_cls_cutedsl_selects_b12x_on_sm121_with_cuda13():
+@pytest.mark.parametrize("sm_version", sorted(CuteDslB12xFusedMoE._SUPPORTED_SM_VERSIONS))
+def test_get_moe_cls_cutedsl_selects_b12x_on_supported_sm_with_cuda13(sm_version):
     cfg = ModelConfig()
     cfg.moe_backend = "CUTEDSL"
     cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
     with (
-        patch("tensorrt_llm._utils.get_sm_version", return_value=121),
+        patch("tensorrt_llm._utils.get_sm_version", return_value=sm_version),
         patch.object(CuteDslB12xFusedMoE, "_get_cutlass_dsl_cuda_major", return_value=13),
     ):
         cls = get_moe_cls(cfg)
@@ -199,7 +219,7 @@ def test_get_moe_cls_cutedsl_selects_b12x_on_sm121_with_cuda13():
 
 
 def test_get_moe_cls_cutedsl_falls_back_to_plain_cutedsl_when_flashinfer_missing(monkeypatch):
-    """CUTEDSL + NVFP4 + SM120 + flashinfer NOT importable → CuteDslFusedMoE."""
+    """CUTEDSL + NVFP4 + SM12x + flashinfer NOT importable -> CuteDslFusedMoE."""
     import builtins
 
     cfg = ModelConfig()
@@ -214,7 +234,10 @@ def test_get_moe_cls_cutedsl_falls_back_to_plain_cutedsl_when_flashinfer_missing
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", _raise_on_flashinfer)
-    with patch("tensorrt_llm._utils.get_sm_version", return_value=120):
+    with (
+        patch("tensorrt_llm._utils.get_sm_version", return_value=120),
+        patch.object(CuteDslB12xFusedMoE, "_get_cutlass_dsl_cuda_major", return_value=13),
+    ):
         cls = get_moe_cls(cfg)
     assert cls is CuteDslFusedMoE
 
