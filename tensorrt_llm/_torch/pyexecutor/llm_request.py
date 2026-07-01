@@ -674,6 +674,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.is_attention_dp_dummy = False
         self.is_cuda_graph_dummy = False
         self.py_kv_transfer_start_time = None
+        # Consensus-agreed timeout flag the cancellation sites act on.  Set only
+        # by PyExecutor._sync_kv_transfer_timed_out_flags (after cross-rank union
+        # consensus) so every rank cancels the same per-rid set in the same
+        # iteration.  The per-rank wall-clock detection is derived on the fly
+        # from py_kv_transfer_start_time and is not persisted.
         self.py_kv_transfer_timed_out = False
 
         # Performance timing info (step metrics, GPU events, context GPU timing)
