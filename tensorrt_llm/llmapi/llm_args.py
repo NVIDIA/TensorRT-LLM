@@ -3293,9 +3293,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "The number of tokens between cache steps in the Mamba prefix cache.")
 
     use_kv_cache_manager_v2: bool = Field(
-        default=False,
+        default=True,
         status="prototype",
-        description="Whether to use the KV cache manager v2 (experimental).")
+        description=
+        "Whether to use the KV cache manager v2. Unsupported feature combinations fall back to the original KV cache manager."
+    )
 
     kv_cache_event_hash_algo: Literal[
         "auto", "v1_block_key", "v2_sha256", "v2_sha256_64"] = Field(
