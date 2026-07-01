@@ -100,6 +100,12 @@ def _distributed_worker(rank, world_size, backend, test_fn, port):
     finally:
         cleanup_distributed()
 
+    # ProcessGroupNCCL's destructor can throw c10::AcceleratorError from
+    # ExchangeDevice during Py_FinalizeEx (destructor-throw -> std::terminate
+    # -> SIGABRT) when torch's internal references to the PG outlive
+    # destroy_process_group(). Bypass interpreter shutdown on success.
+    os._exit(0)
+
 
 def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool = True):
     """Run a test function in a distributed environment."""
