@@ -256,19 +256,25 @@ def partition_context_for_helix(
     Returns:
         Tuple of (input_ids_this_rank, position_ids_this_rank, input_len, padding_len).
 
+        When num_total_blocks < cp_size, the highest-indexed CP ranks own no blocks
+        for this sequence; those empty ranks return empty token and position lists.
+        input_len still reflects the full prompt length so global position ids stay
+        correct.
+
     Raises:
-        ValueError: If there aren't enough tokens for at least one block per CP rank.
+        ValueError: If the prompt is empty (no blocks to distribute).
     """
     all_input_ids = torch.tensor(input_token_ids, dtype=torch.int64).unsqueeze(0)
     input_len = all_input_ids.shape[-1]
 
     num_total_blocks = (input_len + tokens_per_block - 1) // tokens_per_block
-    if num_total_blocks < cp_size:
-        raise ValueError(
-            f"There aren't enough tokens to get at least one block per CP rank. "
-            f"num_total_blocks {num_total_blocks} < num_cp_ranks {cp_size}. "
-            f"Please use smaller tokens_per_block for KV cache or reduce the number of CP ranks."
-        )
+    if num_total_blocks == 0:
+        raise ValueError("Cannot partition an empty prompt for Helix CP: num_total_blocks == 0.")
+    # NOTE: When num_total_blocks < cp_size, CP ranks in [num_total_blocks, cp_size)
+    # own zero blocks ("empty" ranks). This is supported: such ranks contribute a
+    # no-op (-inf, 0) to the Helix attention combine and receive zero KV blocks
+    # during cache transmission. Rank 0 always owns global block 0, so the combine
+    # denominator is never zero.
 
     # Pad the last (partial) block so every block has exactly tokens_per_block tokens.
     padding_len = 0
@@ -284,10 +290,14 @@ def partition_context_for_helix(
     input_id_blocks = list(all_input_ids.split(tokens_per_block, dim=-1))
     position_id_blocks = list(all_position_ids.split(tokens_per_block, dim=-1))
 
-    input_ids_this_rank = torch.cat(input_id_blocks[cp_rank::cp_size], dim=-1).flatten().tolist()
-    position_ids_this_rank = (
-        torch.cat(position_id_blocks[cp_rank::cp_size], dim=-1).flatten().tolist()
-    )
+    curank_input_blocks = input_id_blocks[cp_rank::cp_size]
+    curank_position_blocks = position_id_blocks[cp_rank::cp_size]
+    # Empty rank: this CP rank owns no blocks for this sequence (num_total_blocks < cp_size).
+    if len(curank_input_blocks) == 0:
+        return [], [], input_len, padding_len
+
+    input_ids_this_rank = torch.cat(curank_input_blocks, dim=-1).flatten().tolist()
+    position_ids_this_rank = torch.cat(curank_position_blocks, dim=-1).flatten().tolist()
 
     # The (single) padded block is the global last block; under round-robin it is owned by rank
     # (num_total_blocks - 1) % cp_size, and is the last local block on that rank. Strip its padding.

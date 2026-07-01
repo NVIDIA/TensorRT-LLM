@@ -2,6 +2,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
+import math
 import re
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -62,9 +63,13 @@ try:
 except ImportError:
     _flash_attn_apply_rotary = None
 
+from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
+
 from ..modules.gated_mlp import GatedMLP
 from ..modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from .modeling_auto import AutoModelForCausalLM
+from .modeling_multimodal_encoder import (_ENCODER_FALLBACK_MAX_NUM_REQUESTS,
+                                          MultimodalEncoderMixin)
 from .modeling_multimodal_mixin import MultimodalModelMixin
 from .modeling_multimodal_utils import (
     _install_processor_output_validation_filter, find_input_mm_embeds,
@@ -109,7 +114,12 @@ def _prepare_qwen_vl_vision_attn_metadata(
     attn_metadata.cu_q_seqlens = cu_seqlens
     attn_metadata.cu_kv_seqlens = cu_seqlens
     attn_metadata.max_seq_len = max(seq_lens)
-    attn_metadata.prepare()
+    # The vision tower runs no-cache, context-only attention and supplies its
+    # own `cu_seqlens` above, so the heavy KV-oriented `prepare()` (kv_lens /
+    # prompt_lens / host_request_types setup) is unnecessary host work.
+    # `prepare_encoder_only` runs the lean path on backends that have one
+    # (TRTLLM) and falls back to the full `prepare()` elsewhere.
+    attn_metadata.prepare_encoder_only()
     return attn_metadata
 
 
@@ -161,6 +171,12 @@ def _prepare_qwen_vl_mrope_config(
                 0, mrope_delta_read_seq_slots).unsqueeze(1)
 
     return mrope_config
+
+
+# A token budget larger than any real ``encoder_max_num_tokens`` so that
+# ``get_size_for_max_tokens`` falls through to its ``max_pixels`` cap, yielding
+# the largest single-image size (used to report the per-item token demand).
+_MAX_PIXELS_TOKEN_PROBE = 1 << 31
 
 
 class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
@@ -215,6 +231,275 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
     @property
     def dtype(self) -> torch.dtype:
         return self._dtype
+
+    # ------------------------------------------------------------------
+    # Deterministic dummy-input sizing for multimodal profiling.
+    #
+    # `_num_vision_tokens` / `get_size_for_max_tokens` are the encoder-
+    # side counterpart to the LLM's `max_num_tokens`: they report (and
+    # invert) the exact number of attention tokens the vision encoder will
+    # process for a given input size. The unit is **pre-merger patches** so
+    # that values are directly comparable with ``encoder_max_num_tokens``
+    # and ``AttentionMetadata.max_num_tokens``. Callers working in
+    # LLM-visible (post-merger) units multiply/divide by
+    # ``spatial_merge_unit`` at the boundary.
+    # ------------------------------------------------------------------
+    @property
+    def spatial_merge_unit(self) -> int:
+        """Encoder→LLM token ratio. Qwen2/2.5-VL applies a ``merge_size`` × ``merge_size`` spatial merger."""
+        merge_size = self.config.vision_config.spatial_merge_size
+        return merge_size * merge_size
+
+    def _vision_pixel_bounds(self) -> Tuple[int, int]:
+        """``(min_pixels, max_pixels)`` the HF image processor clamps to in
+        ``smart_resize``. Read from the live processor's ``size`` config
+        (transformers 5.x ``SizeDict`` with ``shortest_edge`` / ``longest_edge``)
+        so per-model overrides are honored; falls back to the HF ``smart_resize``
+        defaults when unavailable.
+        """
+        processor = getattr(self, "_processor", None)
+        image_processor = getattr(processor, "image_processor", None)
+        size = getattr(image_processor, "size", None)
+        if size is not None:
+            try:
+                min_pixels = size["shortest_edge"]
+                max_pixels = size["longest_edge"]
+                if min_pixels and max_pixels:
+                    return int(min_pixels), int(max_pixels)
+            except (KeyError, TypeError):
+                pass
+        # HF `smart_resize` defaults.
+        return 3136, 1003520
+
+    def _num_vision_tokens(
+        self,
+        *,
+        width: int,
+        height: int,
+        num_frames: int = 1,
+    ) -> int:
+        """Return the encoder attention tokens (pre-merger) that result from
+        an image/video of the given pixel dimensions.
+
+        Defers to HF Qwen-VL's ``smart_resize`` (the exact resize the processor
+        applies) so the predicted token count matches what the processor
+        actually produces, **including** the ``[min_pixels, max_pixels]``
+        clamping that this method's previous inline rounding ignored -- which
+        matters because ``get_num_tokens_per_image`` / ``..._video`` use this to
+        size real requests, not just the profiling dummy.
+        """
+        grid_t, grid_h, grid_w = self._grid_thw_for_size(width=width,
+                                                         height=height,
+                                                         num_frames=num_frames)
+        return grid_t * grid_h * grid_w
+
+    def get_num_tokens_per_image(self, *, image, **kwargs) -> int:
+        """Prompt-side image token count: the encoder tokens for the image size
+        divided by ``spatial_merge_unit`` (the post-merger placeholder count)."""
+        if isinstance(image, torch.Tensor):
+            image_h, image_w = int(image.shape[-2]), int(image.shape[-1])
+        else:
+            image_h, image_w = image.height, image.width
+        encoder_tokens = self._num_vision_tokens(width=image_w,
+                                                 height=image_h,
+                                                 num_frames=1)
+        return encoder_tokens // self.spatial_merge_unit
+
+    def get_num_tokens_per_video(self, *, video, **kwargs) -> int:
+        """Prompt-side video token count: the encoder tokens for the frame stack
+        divided by ``spatial_merge_unit``."""
+        num_frames = len(video)
+        first_frame = video[0]
+        if isinstance(first_frame, torch.Tensor):
+            frame_h = int(first_frame.shape[-2])
+            frame_w = int(first_frame.shape[-1])
+        else:
+            frame_h, frame_w = first_frame.height, first_frame.width
+        encoder_tokens = self._num_vision_tokens(width=frame_w,
+                                                 height=frame_h,
+                                                 num_frames=num_frames)
+        return encoder_tokens // self.spatial_merge_unit
+
+    def _grid_thw_for_size(
+        self,
+        *,
+        width: int,
+        height: int,
+        num_frames: int = 1,
+    ) -> Tuple[int, int, int]:
+        """``(grid_t, grid_h, grid_w)`` patch-grid dimensions the processor would
+        produce for an image/video of the given pixel size, after HF
+        ``smart_resize`` (so the ``[min_pixels, max_pixels]`` clamp is honored).
+        Shared by :meth:`_num_vision_tokens` (product) and
+        :meth:`get_dummy_mm_data_for_size` (tensor shapes)."""
+        cfg = self.config.vision_config
+        patch_size = cfg.patch_size
+        merge_size = cfg.spatial_merge_size
+        temporal_patch_size = getattr(cfg, "temporal_patch_size", 1)
+        factor = patch_size * merge_size
+
+        min_pixels, max_pixels = self._vision_pixel_bounds()
+        resized_h, resized_w = smart_resize(height=height,
+                                            width=width,
+                                            factor=factor,
+                                            min_pixels=min_pixels,
+                                            max_pixels=max_pixels)
+        grid_h = resized_h // patch_size
+        grid_w = resized_w // patch_size
+
+        padded_frames = ((num_frames + temporal_patch_size - 1) //
+                         temporal_patch_size) * temporal_patch_size
+        grid_t = max(padded_frames // temporal_patch_size, 1)
+
+        return grid_t, grid_h, grid_w
+
+    def get_size_for_max_tokens(
+        self,
+        *,
+        max_tokens: int,
+    ) -> Dict[str, int]:
+        """Invert ``_num_vision_tokens``: pick the ``(width, height)`` whose
+        attention-token count is the largest value ≤ ``max_tokens`` while
+        keeping the aspect ratio bounded.
+
+        ``max_tokens`` is in the same unit as ``_num_vision_tokens`` /
+        ``encoder_max_num_tokens`` (pre-merger).
+
+        Returns a single-image geometry (``num_frames=1``). This is a valid
+        worst case for the *whole* vision encoder regardless of the runtime
+        modality: the ViT cost is a function of the total pre-merger patch
+        count (the token unit), and ``_num_vision_tokens`` already folds video
+        frames into that same count — so an image saturating ``max_tokens``
+        hits the same attention workspace as any video with the same token
+        count. Non-visual modalities (e.g. audio) live on a different input
+        processor and size their own dummy.
+        """
+        if max_tokens <= 0:
+            raise ValueError(f"max_tokens must be positive, got {max_tokens}")
+
+        def closest_factor_pair(n: int) -> Tuple[int, int]:
+            """Closest ``h*w=n`` to square; keeps dummy aspect ratio near 1:1."""
+            for d in range(math.isqrt(n), 0, -1):
+                if n % d == 0:
+                    return d, n // d
+            return 1, n
+
+        cfg = self.config.vision_config
+        patch_size = cfg.patch_size
+        merge_size = cfg.spatial_merge_size
+        unit = patch_size * merge_size
+
+        # Pre-merger tokens factor into (grid_h * grid_w) and each grid
+        # dimension is ``merge_size`` × the post-merger factor. Searching in
+        # post-merger units bounds the inner loop and lets us reuse the
+        # familiar near-square factor pair for aspect ratio bounds.
+        post_merger_budget = max(max_tokens // (merge_size * merge_size), 1)
+        # A single image can't exceed the processor's ``max_pixels`` -- past
+        # that, ``smart_resize`` (in ``_num_vision_tokens``) clamps the image
+        # back down, so an uncapped budget would produce a size whose real
+        # token count falls short of ``max_tokens``. Cap so the chosen size
+        # round-trips exactly (size the worst case by ``max_pixels``).
+        _, max_pixels = self._vision_pixel_bounds()
+        max_post_merger = max(max_pixels // (unit * unit), 1)
+        post_merger_budget = min(post_merger_budget, max_post_merger)
+        h_factor, w_factor = closest_factor_pair(post_merger_budget)
+        for seq_len in range(post_merger_budget, 0, -1):
+            h_f, w_f = closest_factor_pair(seq_len)
+            if w_f / max(h_f, 1) <= 200:
+                h_factor, w_factor = h_f, w_f
+                break
+
+        return {
+            "width": unit * w_factor,
+            "height": unit * h_factor,
+            "num_frames": 1,
+        }
+
+    def get_mm_max_tokens_per_item(self) -> Dict[str, int]:
+        """Qwen-VL runs image and video through one shared ViT, so the image
+        worst case already covers the vision encoder — only ``"image"`` is
+        declared. The value is the largest single image's encoder tokens (the
+        ``max_pixels``-capped size), used to weight the shared-budget split."""
+        size = self.get_size_for_max_tokens(max_tokens=_MAX_PIXELS_TOKEN_PROBE)
+        return {
+            "image":
+            self._num_vision_tokens(width=size["width"], height=size["height"])
+        }
+
+    def get_dummy_mm_data_for_tokens(
+        self,
+        *,
+        max_tokens_per_modality: Dict[str, int],
+        dtype: Optional[torch.dtype] = None,
+    ) -> Dict[str, Any]:
+        """Vision implementation of the modality-agnostic profiler entry: for the
+        ``"image"`` budget, pick the worst-case image size, fill it with identical
+        copies, and materialize the encoder tensors.
+
+        ``num_images`` is computed from the *realized* token count of the chosen
+        size (which the ``max_pixels`` cap may make smaller than the budget), so
+        the batch saturates the budget rather than assuming one image fills it.
+        """
+        max_tokens = max_tokens_per_modality.get("image")
+        if not max_tokens:
+            return {}
+        size = self.get_size_for_max_tokens(max_tokens=max_tokens)
+        tokens_per_image = max(
+            1,
+            self._num_vision_tokens(width=size["width"],
+                                    height=size["height"],
+                                    num_frames=size.get("num_frames", 1)))
+        num_images = max(1, max_tokens // tokens_per_image)
+        return self.get_dummy_mm_data_for_size(width=size["width"],
+                                               height=size["height"],
+                                               num_frames=size.get(
+                                                   "num_frames", 1),
+                                               num_images=num_images,
+                                               dtype=dtype)
+
+    def get_dummy_mm_data_for_size(
+        self,
+        *,
+        width: int,
+        height: int,
+        num_frames: int = 1,
+        num_images: int = 1,
+        dtype: Optional[torch.dtype] = None,
+    ) -> Dict[str, Any]:
+        """Build the *processed* multimodal tensors for ``num_images`` identical
+        ``(width, height)`` images directly, skipping PIL image creation and the
+        HF processor (the encoder profiler's worst-case dummy batch).
+
+        The vision encoder forward consumes only ``pixel_values`` (shape
+        ``[num_patches, in_dim]``) and ``image_grid_thw`` (shape
+        ``[num_images, 3]``); the pixel *content* is irrelevant for memory
+        profiling, so zero tensors of the exact shape the processor would emit
+        suffice. Returns the ``multimodal_data`` dict consumed by
+        :meth:`Qwen2VisionModelBase._parse_and_batch_multimodal_data`.
+        """
+        cfg = self.config.vision_config
+        grid_t, grid_h, grid_w = self._grid_thw_for_size(width=width,
+                                                         height=height,
+                                                         num_frames=num_frames)
+        num_images = max(num_images, 1)
+        patches_per_image = grid_t * grid_h * grid_w
+        in_channels = getattr(cfg, "in_channels", None) or getattr(
+            cfg, "in_chans", 3)
+        temporal_patch_size = getattr(cfg, "temporal_patch_size", 1)
+        in_dim = in_channels * temporal_patch_size * cfg.patch_size * cfg.patch_size
+
+        pixel_values = torch.zeros(
+            (num_images * patches_per_image, in_dim),
+            dtype=dtype or self.dtype,
+        )
+        image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]] * num_images,
+                                      dtype=torch.long)
+        return {
+            "image": {
+                "pixel_values": pixel_values,
+                "image_grid_thw": image_grid_thw,
+            }
+        }
 
     @classmethod
     def _build_temporal_block(
@@ -1053,7 +1338,7 @@ class Qwen2_5_VLPatchMerger(torch.nn.Module):
         return hidden_states
 
 
-class Qwen2_5_VisionModel(torch.nn.Module):
+class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__()
@@ -1095,9 +1380,40 @@ class Qwen2_5_VisionModel(torch.nn.Module):
         self.merger = Qwen2_5_VLPatchMerger(self.model_config, )
         self.metadata_cls = get_attention_backend(
             self.model_config.attn_backend).Metadata
-
         self.full_attn_metadata: Optional[AttentionMetadata] = None
         self.window_attn_metadata: Optional[AttentionMetadata] = None
+        # Pre-allocated `arange` for the vision block's `rope_position_ids`;
+        # per-call code slices `[:seq_len]` instead of a fresh `(seq_len,) int32`
+        # + H->D copy. Sized by `setup_attn_metadata` (engine-driven); `forward`
+        # grows it on the rare miss above the budget.
+        self.register_buffer("_rope_position_ids_buffer",
+                             None,
+                             persistent=False)
+
+    def setup_attn_metadata(self, max_num_requests: int,
+                            max_num_tokens: int) -> None:
+        # Override: Qwen2/2.5-VL uses two metadata objects (full + window
+        # attention) instead of the mixin's single ``attn_metadata``.
+        #
+        # Windowed attention splits each image into many attention sequences
+        # (one per window grid cell), so ``max_num_requests`` here is the
+        # **window** count, not the image count, and can far exceed the
+        # LLM-side ``max_batch_size`` that ``encoder_max_batch_size`` falls back
+        # to. Floor it at the same legacy fallback the mixin uses (see the TODO
+        # there: derive from ``encoder_max_num_tokens`` once the scheduler caps
+        # encoder forwards at it).
+        max_num_requests = max(max_num_requests,
+                               _ENCODER_FALLBACK_MAX_NUM_REQUESTS)
+        kwargs = dict(max_num_requests=max_num_requests,
+                      max_num_tokens=max_num_tokens,
+                      kv_cache_manager=None)
+        self.full_attn_metadata = self.metadata_cls(**kwargs)
+        self.window_attn_metadata = self.metadata_cls(**kwargs)
+        # Size the vision-block ``rope_position_ids`` scratch to the encoder
+        # token budget; ``forward`` grows it on the rare miss above the budget.
+        self._rope_position_ids_buffer = torch.arange(max_num_tokens,
+                                                      dtype=torch.int32,
+                                                      device=self.device)
 
     def get_rotary_pos_emb_window_data(
         self, grid_rows: List[List[int]]
@@ -1264,11 +1580,9 @@ class Qwen2_5_VisionModel(torch.nn.Module):
             seq_lens: List[int],
             attn_metadata: Optional[AttentionMetadata] = None):
         if attn_metadata is None:
-            attn_metadata = self.metadata_cls(
-                max_num_requests=8192,  # TODO: Make this dynamic
-                max_num_tokens=8192,  # TODO: Make this dynamic
-                kv_cache_manager=None,
-            )
+            raise RuntimeError(
+                "Vision encoder AttentionMetadata is not initialized. "
+                "It must be set up before the encoder forward runs.")
         return _prepare_qwen_vl_vision_attn_metadata(seq_lens, attn_metadata)
 
     @property
@@ -1282,9 +1596,6 @@ class Qwen2_5_VisionModel(torch.nn.Module):
         hidden_states = self.patch_embed(pixel_values)
 
         seq_len, _ = hidden_states.size()
-        rope_position_ids = torch.arange(seq_len,
-                                         dtype=torch.int32,
-                                         pin_memory=prefer_pinned())
         grid_rows = grid_thw.tolist()
 
         (rotary_pos_emb_cos, rotary_pos_emb_sin, window_indices,
@@ -1311,9 +1622,14 @@ class Qwen2_5_VisionModel(torch.nn.Module):
         # alloc + scatter pair the previous code used.
         reverse_indices = torch.argsort(window_index)
 
-        rope_position_ids = rope_position_ids.to(device=self.device,
-                                                 dtype=torch.int32,
-                                                 non_blocking=True)
+        # Pre-allocated 0..seq_len-1 positions (sized in setup_attn_metadata);
+        # slice instead of a fresh arange + H->D copy per forward.
+        if (self._rope_position_ids_buffer is None
+                or seq_len > self._rope_position_ids_buffer.numel()):
+            self._rope_position_ids_buffer = torch.arange(seq_len,
+                                                          dtype=torch.int32,
+                                                          device=self.device)
+        rope_position_ids = self._rope_position_ids_buffer[:seq_len]
         seq_lens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2],
                                            grid_thw[:, 0]).tolist()
 
@@ -1343,7 +1659,7 @@ class Qwen2_5_VisionModel(torch.nn.Module):
         return hidden_states
 
 
-class Qwen2VLModelBase(PreTrainedModel):
+class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
 
     def __init__(
         self,
@@ -1452,6 +1768,22 @@ class Qwen2VLModelBase(PreTrainedModel):
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
 
+    def encode_multimodal_inputs(self,
+                                 multimodal_params: List[MultimodalParams],
+                                 **encoder_kwargs: Any) -> torch.Tensor:
+        """Uniform encoder entry (``MultimodalModelMixin`` contract).
+
+        Runs the vision encoder over ``multimodal_params`` and returns the
+        embeddings as a single tensor (Qwen folds any deepstack streams into
+        the hidden dim, so the single-tensor contract holds). Used by the
+        startup memory profiler to invoke the encoder directly; the model's
+        own ``forward`` keeps its custom deepstack fusion path.
+        """
+        mm_embeds = get_multimodal_embeddings(
+            encoder_forward_fn=self.mm_encoder.forward,
+            multimodal_params=list(multimodal_params))
+        return mm_embeds[0]
+
     def apply_llm_torch_compile(self, *, backend: Any, fullgraph: bool) -> None:
         # TODO: Move this hook to MultimodalModelMixin once multimodal models
         # consistently expose an LLM compile contract.
@@ -1513,7 +1845,7 @@ class Qwen2VLModelBase(PreTrainedModel):
             elif not getattr(self, "support_mm_disagg", False):
                 raise NotImplementedError(
                     "Qwen2VLModel does not support disaggregated inference yet. Please unset "
-                    f"the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
+                    "the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
                 )
             # E/P prefill: encoder already ran; use attached embeddings.
             else:

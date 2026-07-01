@@ -1132,6 +1132,30 @@ def test_disaggregated_overlap_transceiver_runtime_python(
                            cwd=llm_venv.get_working_directory())
 
 
+# Exercises the disaggregated KV-cache transfer path with the Python cache transceiver runtime
+# while the KV-cache pool itself is allocated from fabric (MNNVL) VMM memory via
+# TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY=1. Restricted to GB200/GB300 since those are the only
+# platforms with MNNVL fabric-memory support; on other devices the env var would silently fall
+# back to a non-fabric allocation, which would defeat the purpose of this test.
+@pytest.mark.skip_device_not_contain(["GB200", "GB300"])
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_overlap_transceiver_runtime_python_fabric_memory(
+        disaggregated_test_root, llm_venv, disaggregated_example_root,
+        llama_model_root):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
+    env = llm_venv._new_env.copy()
+    env["UCX_TLS"] = get_ucx_tls()
+    env["TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY"] = "1"
+    run_disaggregated_test(disaggregated_example_root,
+                           "overlap_transceiver_runtime_python",
+                           env=env,
+                           model_path=llama_model_root,
+                           cwd=llm_venv.get_working_directory())
+
+
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
 def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
@@ -2317,19 +2341,22 @@ def test_llama4_long_context_kv_cache_overflow(disaggregated_test_root,
                              cwd=llm_venv.get_working_directory())
 
 
+@pytest.mark.timeout(2400)
 @pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("prompt_file", ["prompts.json", "long_prompts.json"],
+                         ids=["short_prompt", "long_prompt"])
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root):
+        deepseek_v3_model_root, prompt_file):
     setup_model_symlink(llm_venv, deepseek_v3_model_root,
                         "DeepSeek-V3-Lite/bf16")
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_bf16_tllm_gen_helix",
                            env=llm_venv._new_env,
-                           prompt_file="long_prompts.json",
+                           prompt_file=prompt_file,
                            model_path=deepseek_v3_model_root,
                            cwd=llm_venv.get_working_directory())
 

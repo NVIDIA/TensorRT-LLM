@@ -170,14 +170,17 @@ class BasePipeline(nn.Module):
                 logger.info("CUDA profiler stopped")
 
     def _setup_cuda_graphs(self):
-        """Wrap all transformer components with CUDA graph capture/replay."""
-        if not self.pipeline_config.cuda_graph.enable:
-            return
+        """Wrap all transformer components with CUDA graph capture/replay.
 
-        if self.pipeline_config.torch_compile.enable:
-            logger.warning(
-                "CUDA graphs with torch.compile not yet supported. Using torch.compile only."
-            )
+        Composes with torch.compile: the runner wraps the (outer) transformer
+        ``forward`` while torch.compile compiles the inner transformer blocks
+        (see ``torch_compile``). Graph capture happens during warmup, by which
+        point the runner's own ``WARMUP_STEPS`` eager iterations have already
+        triggered torch.compile's lazy compilation, so the captured graph
+        contains the optimized compiled kernels. (The ``LTX2Pipeline`` override
+        relies on the same ordering.)
+        """
+        if not self.pipeline_config.cuda_graph.enable:
             return
 
         if len(self.transformer_components) > 1:
@@ -188,6 +191,7 @@ class BasePipeline(nn.Module):
         else:
             shared_pool = None
 
+        compile_note = " (with torch.compile)" if self.pipeline_config.torch_compile.enable else ""
         for name in self.transformer_components:
             model = getattr(self, name, None)
             if model is None:
@@ -198,7 +202,7 @@ class BasePipeline(nn.Module):
                 shared_pool,
             )
             model.register_cuda_graph_extra_key_fns(runner)
-            logger.info(f"CUDA graph runner: wrapping {name}.forward")
+            logger.info(f"CUDA graph runner: wrapping {name}.forward{compile_note}")
             model.forward = runner.wrap(model.forward)
             self._cuda_graph_runners[name] = runner
 
