@@ -12,6 +12,7 @@ from typing import (TYPE_CHECKING, Callable, Dict, Iterable, List, Optional,
                     Tuple, Union)
 
 import torch
+from strenum import StrEnum
 
 from tensorrt_llm.llmapi import DisaggScheduleStyle
 from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
@@ -111,6 +112,31 @@ class PPCommTag(IntEnum):
     SCHEDULE_RESULT = 20001
     EXECUTED_BATCH_NUM = 20002
     SAMPLE_STATE = 20003
+
+
+class _SleepWakeupTag(IntEnum):
+    """MPI message tags for the dedicated sleep/wakeup communicator.
+
+    Because ``_sleep_wakeup_comm`` is a duplicated communicator isolated from
+    all other MPI traffic, small tag values are safe and do not conflict with
+    ``PPCommTag``.
+    """
+
+    ACTION = 0  # rank-0 -> non-rank-0: sleep/wakeup/shutdown msg
+    ACK = 1  # non-rank-0 -> rank-0: ACK after action completes
+
+
+class _SleepWakeupAction(StrEnum):
+    """Action values carried in sleep/wakeup control messages."""
+
+    SLEEP = "sleep"
+    WAKEUP = "wakeup"
+    ABORT = "abort"
+    SHUTDOWN = "shutdown"
+
+
+_SLEEP_WAKEUP_LISTENER_JOIN_TIMEOUT_S = 30.0
+_SLEEP_WAKEUP_ABORT_BARRIER_TIMEOUT_S = 30.0
 
 
 @functools.cache
@@ -854,6 +880,16 @@ class PyExecutor:
         self.worker_started = False
         self.worker_lock = threading.Lock()
         self._broadcast_mpi_comm = None
+        # Secondary MPI communicator and listener thread for multi-rank
+        # sleep/wakeup control messages.  Both are None until start_worker()
+        # calls Dup() (a collective) on the main thread.
+        self._sleep_wakeup_comm = None
+        self._sleep_wakeup_listener_thread: Optional[threading.Thread] = None
+        # Serialises concurrent sleep/wakeup calls so that the control_action
+        # + _sleep_wakeup_comm send/recv sequence is never interleaved.  Without
+        # this, two concurrent RPC calls could both pass control_request_barrier
+        # and race on the shared communicator, consuming the wrong ACKs.
+        self._sleep_wakeup_lock = threading.Lock()
 
         self.kv_connector_manager = kv_connector_manager
 
@@ -1048,6 +1084,27 @@ class PyExecutor:
                         name="broadcast_sample_state_handler",
                     )
                     self.broadcast_sample_state_handler.start()
+                # Duplicate the communicator on the main thread for
+                # sleep/wakeup control messages.  MPI_Comm_dup is collective
+                # across all ranks and must run before any worker thread
+                # starts to avoid racing with the worker's MPI traffic.
+                # Only needed when multi-rank sleep/wakeup is actually
+                # possible, i.e. MPI executor path (not Ray), sleep_config
+                # enabled, and more than one rank participating.
+                if (self.dist.world_size > 1
+                        and not self._disable_mpi and getattr(
+                            self.llm_args, "sleep_config", None) is not None):
+                    logger.info(
+                        "Create new MPI comm for sleep/wakeup control listener."
+                    )
+                    self._sleep_wakeup_comm = mpi_comm().Dup()
+                    if self.dist.rank != 0:
+                        self._sleep_wakeup_listener_thread = threading.Thread(
+                            target=self._sleep_wakeup_listener_loop,
+                            daemon=True,
+                            name="sleep_wakeup_listener_thread",
+                        )
+                        self._sleep_wakeup_listener_thread.start()
                 self.worker_thread = threading.Thread(
                     target=self._event_loop_wrapper, daemon=True)
                 self.worker_thread.start()
@@ -1148,6 +1205,64 @@ class PyExecutor:
         if self.dist.pp_size > 1:
             self.executed_batch_queue.put(None)
             self.broadcast_sample_state_handler.join()
+        # Signal non-rank-0 sleep/wakeup listener threads to exit.  This runs
+        # after the worker thread has joined, which guarantees that the non-rank-0
+        # executor loops have already processed the shutdown broadcast and are
+        # no longer driving NCCL, so the send cannot deadlock.
+        if self._sleep_wakeup_comm is not None and self.dist.world_size > 1:
+            if self.dist.rank == 0:
+                logger.info(
+                    "Sending shutdown to %d sleep/wakeup listener thread(s).",
+                    self.dist.world_size - 1,
+                )
+                shutdown_errors = []
+                shutdown_ranks = []
+                for dest in range(1, self.dist.world_size):
+                    try:
+                        self._sleep_wakeup_comm.send(
+                            {
+                                "action": _SleepWakeupAction.SHUTDOWN,
+                                "tags": []
+                            },
+                            dest=dest,
+                            tag=_SleepWakeupTag.ACTION,
+                        )
+                        shutdown_ranks.append(dest)
+                    except Exception as exc:
+                        shutdown_errors.append(
+                            f"rank {dest} shutdown send failed: {exc}")
+                        logger.warning(
+                            "Failed to send sleep/wakeup listener shutdown to "
+                            "rank %d: %s", dest, exc)
+                for src in shutdown_ranks:
+                    try:
+                        ack = self._sleep_wakeup_comm.recv(
+                            source=src, tag=_SleepWakeupTag.ACK)
+                    except Exception as exc:
+                        shutdown_errors.append(
+                            f"rank {src} shutdown ACK recv failed: {exc}")
+                        logger.warning(
+                            "Failed to receive sleep/wakeup listener shutdown "
+                            "ACK from rank %d: %s", src, exc)
+                        continue
+                    if ack.get("status") != "ok":
+                        shutdown_errors.append(
+                            ack.get("error")
+                            or f"rank {src} returned unknown shutdown ACK")
+                if shutdown_errors:
+                    logger.warning(
+                        "Sleep/wakeup listener shutdown completed with "
+                        "errors: %s", "; ".join(shutdown_errors))
+            elif self._sleep_wakeup_listener_thread is not None:
+                self._sleep_wakeup_listener_thread.join(
+                    timeout=_SLEEP_WAKEUP_LISTENER_JOIN_TIMEOUT_S)
+                if self._sleep_wakeup_listener_thread.is_alive():
+                    logger.warning(
+                        "Sleep/wakeup listener thread did not exit within "
+                        "%.1f seconds on rank %d.",
+                        _SLEEP_WAKEUP_LISTENER_JOIN_TIMEOUT_S,
+                        self.dist.rank,
+                    )
         self.worker_started = False
         # Release CUDA graphs before resource managers free their GPU memory.
         # Resource managers (e.g. SuffixAutomatonManager) allocate GPU workspace
@@ -2489,6 +2604,161 @@ class PyExecutor:
             # This retention is bounded: PyExecutor is created at most a few
             # times per process (KV-cache estimation executor and real
             # executor), and MPI reclaims the communicators on MPI_Finalize.
+            set_thread_local_mpi_comm(None)
+
+    def _sleep_wakeup_listener_loop(self) -> None:
+        """Listener loop for sleep/wakeup control messages on non-rank-0 workers.
+
+        Runs in a dedicated daemon thread on every non-rank-0 rank.  Blocks on
+        ``_sleep_wakeup_comm.recv`` waiting for a control message from rank-0, then
+        executes the requested VMM operation (``release_with_tag`` or
+        ``materialize_with_tag``) and sends an ACK back.  An ``ABORT`` message
+        unblocks the control barrier without touching VMM state when rank-0
+        could not broadcast the action to every peer.  A ``SHUTDOWN`` message
+        ACKs rank-0 and breaks the loop cleanly.
+
+        Safety notes:
+        - ``_sleep_wakeup_comm`` is a dedicated duplicated MPI communicator, isolated
+          from all regular executor MPI traffic.
+        - The ``CONTROL_REQUEST_ID`` sentinel is broadcast to all ranks via the
+          normal request-broadcaster path, so each non-rank-0 executor loop also
+          enters ``_handle_control_request()`` and blocks on ``control_action_done``.
+          This listener thread owns the ``control_action_done`` / ``control_request_barrier``
+          lifecycle on non-rank-0 ranks:
+            1. Wait on ``control_request_barrier`` to confirm the executor loop has
+               drained all in-flight work (mirroring rank-0's ``control_action()``
+               barrier handshake).
+            2. Perform the VMM operation with ``torch.cuda.synchronize()`` guards.
+            3. Clear ``control_request_barrier`` (reset for the next cycle) then set
+               ``control_action_done`` to unblock the executor loop.
+            4. Send the ACK to rank-0 only *after* step 3, so rank-0 cannot exit
+               ``control_action()`` and resume broadcasting new requests before this
+               rank's executor loop is guaranteed to have cleared the control barrier.
+        - ``gc.collect()`` and ``torch.cuda.empty_cache()`` are safe to call
+          from a non-main thread.
+        """
+        import gc
+        import sys
+
+        from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
+                                                        release_with_tag)
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        torch.cuda.set_device(self.device_id)
+        CUASSERT(cudart.cudaSetDevice(self.device_id))
+        set_thread_local_mpi_comm(self._sleep_wakeup_comm)
+        try:
+            while True:
+                msg = self._sleep_wakeup_comm.recv(source=0,
+                                                   tag=_SleepWakeupTag.ACTION)
+                if msg.get("action") == _SleepWakeupAction.SHUTDOWN:
+                    logger.debug(
+                        "Sleep/wakeup listener (rank %d): received shutdown, "
+                        "exiting.", self.dist.rank)
+                    self._sleep_wakeup_comm.send(
+                        {
+                            "status": "ok",
+                            "error": None
+                        },
+                        dest=0,
+                        tag=_SleepWakeupTag.ACK,
+                    )
+                    break
+                # Use .get() so a missing "action" key surfaces as an unknown
+                # action inside the try rather than a bare KeyError here.
+                action = msg.get("action", "<unknown>")
+                error_msg = None
+                release_control_request = True
+                try:
+                    # Decode tags inside the try so KeyError / ValueError from
+                    # a malformed message still results in an error ACK being
+                    # sent via the finally below, rather than deadlocking rank-0.
+                    tags = [ExecutorMemoryType(t) for t in msg["tags"]]
+                    # Wait for the executor loop to drain all active requests and
+                    # enter _handle_control_request().  It signals readiness by
+                    # setting control_request_barrier (the same event rank-0's
+                    # control_action() waits on locally).  This guarantees no
+                    # in-flight CUDA kernels from the executor are still running
+                    # on this rank when the VMM mapping is changed below.
+                    if action == _SleepWakeupAction.ABORT:
+                        # ABORT is sent after rank-0 fails to broadcast an
+                        # ACTION to every peer.  Usually the executor loop is
+                        # already parked in _handle_control_request(); if the
+                        # abort is stale, this bounded wait prevents the
+                        # listener from hanging forever on a message that no
+                        # longer has a matching control request.
+                        release_control_request = (
+                            self.control_request_barrier.wait(
+                                timeout=_SLEEP_WAKEUP_ABORT_BARRIER_TIMEOUT_S))
+                        error_msg = (
+                            "rank 0 aborted sleep/wakeup before local "
+                            f"execution: {msg.get('reason', 'unknown error')}")
+                        logger.warning("Sleep/wakeup listener: %s", error_msg)
+                    else:
+                        self.control_request_barrier.wait()
+                        torch.cuda.synchronize()
+                    if action == _SleepWakeupAction.SLEEP:
+                        release_with_tag(*tags)
+                        torch.cuda.synchronize()
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                    elif action == _SleepWakeupAction.WAKEUP:
+                        materialize_with_tag(*tags)
+                        torch.cuda.synchronize()
+                    else:
+                        if action != _SleepWakeupAction.ABORT:
+                            error_msg = f"unknown action '{action}'"
+                            logger.warning(
+                                "Sleep/wakeup listener: %s, ignoring.",
+                                error_msg)
+                except (KeyError, TypeError, ValueError, RuntimeError,
+                        torch.OutOfMemoryError) as exc:
+                    error_msg = (f"rank {self.dist.rank} '{action}' failed: "
+                                 f"{exc}\n{traceback.format_exc()}")
+                    logger.error("Sleep/wakeup listener: error executing '%s':",
+                                 action,
+                                 exc_info=True)
+                finally:
+                    # Always ACK so rank-0 does not deadlock; carry error
+                    # details so rank-0 can raise after all ranks respond.
+                    # If an exception bypassed the narrow except above (e.g.,
+                    # MemoryError, SystemError), detect it via sys.exc_info()
+                    # so the ACK correctly reflects failure rather than falsely
+                    # reporting status=ok while the thread is unwinding.
+                    if error_msg is None and sys.exc_info()[0] is not None:
+                        exc = sys.exc_info()[1]
+                        error_msg = (
+                            f"rank {self.dist.rank} '{action}' failed with "
+                            f"uncaught {type(exc).__name__}: {exc!r}")
+                        logger.error(
+                            "Sleep/wakeup listener: uncaught exception on "
+                            "rank %d during '%s':",
+                            self.dist.rank,
+                            action,
+                            exc_info=True,
+                        )
+                    # Unblock the executor loop that is waiting in
+                    # _handle_control_request().  Clear control_request_barrier
+                    # first so that it is clean for the next sleep/wakeup cycle
+                    # before the executor loop resumes and could potentially
+                    # set it again.  Only then signal control_action_done.
+                    if release_control_request:
+                        self.control_request_barrier.clear()
+                        self.control_action_done.set()
+                    # Send the ACK to rank-0 only after the executor loop on
+                    # this rank has been unblocked.  This prevents rank-0 from
+                    # exiting control_action() and broadcasting new requests
+                    # before our executor loop has cleared its control barrier
+                    # and is ready to participate in the next collective.
+                    self._sleep_wakeup_comm.send(
+                        {
+                            "status": "ok" if error_msg is None else "error",
+                            "error": error_msg
+                        },
+                        dest=0,
+                        tag=_SleepWakeupTag.ACK,
+                    )
+        finally:
             set_thread_local_mpi_comm(None)
 
     def _ring_broadcast_sample_state(
