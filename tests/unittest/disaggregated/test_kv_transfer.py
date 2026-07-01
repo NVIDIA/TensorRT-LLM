@@ -4,6 +4,7 @@ import os
 import random
 import time
 import uuid
+from unittest.mock import MagicMock
 
 # Exclude IB (no fabric) and gdr_copy (UCX rcache SIGABRT at teardown).
 os.environ.setdefault("UCX_TLS", "^ib,gdr_copy")
@@ -29,6 +30,7 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
 )
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
+from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -162,8 +164,6 @@ def _chunk_block_ids(all_block_ids, chunk_size_blocks, mamba_state_index=None):
     from unittest.mock import MagicMock
 
     from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice
-    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-
     base_slice = KVSlice(
         is_last_slice=True,
         block_ids_per_layer_groups=all_block_ids,
@@ -1167,7 +1167,12 @@ def test_transfer_worker_v2_with_window(
 
 @pytest.mark.timeout(120)
 @pytest.mark.parametrize("use_v2", [False, True], ids=["v1", "v2"])
-def test_transfer_with_gen_prefix_offset(use_v2):
+@pytest.mark.parametrize(
+    "chunk_size_blocks",
+    [None, 2],
+    ids=["single_slice", "sender_chunked"],
+)
+def test_transfer_with_gen_prefix_offset(use_v2, chunk_size_blocks):
     """Verify that only suffix blocks are transferred when gen has a prefix offset.
 
     Simulates gen-side prefix cache: ctx sends all blocks for [0, request_len),
@@ -1256,13 +1261,7 @@ def test_transfer_with_gen_prefix_offset(use_v2):
     ]
 
     try:
-        # Ctx sends all blocks
         tx = ctx_tw.create_tx_session(ctx_request)
-        send_slice = KVSlice(
-            is_last_slice=True,
-            block_ids_per_layer_groups=ctx_block_ids,
-            token_range=TokenRange(start=0, end=request_len),
-        )
 
         # Gen receives only the suffix list; dst_start is derived from block count.
         rx = gen_tw.create_rx_session(gen_request)
@@ -1272,7 +1271,31 @@ def test_transfer_with_gen_prefix_offset(use_v2):
             token_range=TokenRange(start=0, end=request_len),
         )
         rx.receive(recv_slice)
-        tx.send(send_slice)
+
+        if chunk_size_blocks is None:
+            tx.send(
+                KVSlice(
+                    is_last_slice=True,
+                    block_ids_per_layer_groups=ctx_block_ids,
+                    token_range=TokenRange(start=0, end=request_len),
+                )
+            )
+        else:
+            transceiver = MagicMock()
+            transceiver._chunk_size_blocks = chunk_size_blocks
+            transceiver._collect_base_slice = MagicMock(
+                return_value=KVSlice(
+                    is_last_slice=True,
+                    block_ids_per_layer_groups=ctx_block_ids,
+                    token_range=TokenRange(start=0, end=request_len),
+                )
+            )
+            transceiver._reuse_adapter.tokens_per_block = tokens_per_block
+            transceiver._create_kv_slices = KvCacheTransceiverV2._create_kv_slices.__get__(
+                transceiver
+            )
+            for kv_slice in transceiver._create_kv_slices(ctx_request):
+                tx.send(kv_slice)
 
         result = tx.wait_complete()
         assert result == WaitResult.COMPLETED, f"tx wait_complete returned {result}"
@@ -1549,8 +1572,6 @@ def add_and_verify_chunked_request(
     chunk_size_blocks,
 ):
     """Chunked transfer variant: sender sends N slices, receiver sends 1."""
-    import math
-
     ctx_transfer_workers = setup["ctx_transfer_workers"]
     gen_transfer_workers = setup["gen_transfer_workers"]
 
@@ -1561,22 +1582,19 @@ def add_and_verify_chunked_request(
 
     sender_sessions = [tw.create_tx_session(ctx_info["ctx_request"]) for tw in ctx_transfer_workers]
     for sender_session, block_ids_per_groups in zip(sender_sessions, ctx_block_ids, strict=True):
-        max_blocks = max(len(ids) for ids in block_ids_per_groups)
-        num_chunks = math.ceil(max_blocks / chunk_size_blocks)
-        chunk_offset = 0
-        for chunk_idx in range(num_chunks):
-            start = chunk_idx * chunk_size_blocks
-            end = start + chunk_size_blocks
-            is_last = chunk_idx == num_chunks - 1
-            chunk_block_ids = [ids[start:end] for ids in block_ids_per_groups]
-            kv_slice = KVSlice(
-                is_last_slice=is_last,
-                block_ids_per_layer_groups=chunk_block_ids,
+        transceiver = MagicMock()
+        transceiver._chunk_size_blocks = chunk_size_blocks
+        transceiver._collect_base_slice = MagicMock(
+            return_value=KVSlice(
+                is_last_slice=True,
+                block_ids_per_layer_groups=block_ids_per_groups,
                 token_range=token_range,
-                chunk_block_offset=chunk_offset,
             )
+        )
+        transceiver._reuse_adapter.tokens_per_block = setup["tokens_per_block"]
+        transceiver._create_kv_slices = KvCacheTransceiverV2._create_kv_slices.__get__(transceiver)
+        for kv_slice in transceiver._create_kv_slices(ctx_info["ctx_request"]):
             sender_session.send(kv_slice)
-            chunk_offset += max(len(ids) for ids in chunk_block_ids)
 
     receiver_sessions = [
         tw.create_rx_session(ctx_info["gen_request"]) for tw in gen_transfer_workers

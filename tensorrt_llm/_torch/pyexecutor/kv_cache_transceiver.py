@@ -98,9 +98,11 @@ def create_kv_cache_transceiver(
                 f"enable chunked transfer.")
     elif (runtime == "CPP"
           and cache_transceiver_config.chunk_size_blocks is not None):
-        logger.warning("chunk_size_blocks is set but transceiver_runtime='CPP' "
-                       "explicitly disables Python auto-selection; "
-                       "chunk_size_blocks will be ignored.")
+        raise ValueError(
+            "chunk_size_blocks is set but transceiver_runtime='CPP' "
+            "explicitly disables Python auto-selection; "
+            "chunk_size_blocks will be ignored."
+        )
 
     # Warn when chunk_size_blocks is below the recommended floor.  The Pydantic
     # field is PositiveInt (>=1), but values below ~16 push the per-chunk RDMA
