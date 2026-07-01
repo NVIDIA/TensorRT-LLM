@@ -1184,11 +1184,12 @@ class DFlashForCausalLM(nn.Module):
         # Head counts are read from layer 0 here and in dflash_forward; assert
         # uniformity (the target uses per-layer heads, the drafter does not).
         for a in layers_attn[1:]:
-            assert (a.q_size == q_size and a.kv_size == kv_size
-                    and a.head_dim == head_dim and a.num_heads == num_heads
-                    and a.num_key_value_heads == num_kv_heads), (
-                        "DFlash fused KV requires all drafter layers to share "
-                        "q_size / kv_size / head_dim / num_heads / num_kv_heads.")
+            assert (
+                a.q_size == q_size and a.kv_size == kv_size
+                and a.head_dim == head_dim and a.num_heads == num_heads
+                and a.num_key_value_heads == num_kv_heads), (
+                    "DFlash fused KV requires all drafter layers to share "
+                    "q_size / kv_size / head_dim / num_heads / num_kv_heads.")
 
         has_k_norm = [hasattr(a, 'k_norm') for a in layers_attn]
         assert all(has_k_norm) or not any(has_k_norm), (
