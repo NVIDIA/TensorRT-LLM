@@ -223,6 +223,7 @@ def test_create_executor_uses_cache_transceiver(cache_attention_type, expected_a
     _, _, passed_kv_cache_manager, attention_type, passed_config = create_transceiver.call_args.args
     assert passed_kv_cache_manager is kv_cache_manager
     assert attention_type == expected_attention_type
+    assert create_transceiver.call_args.kwargs["inflight_cancel_supported_by_executor"] is False
     assert passed_config is ad_config.cache_transceiver_config
     assert passed_config.max_tokens_in_buffer == mock_engine.cache_seq_interface.info.max_seq_len
     assert create_transceiver.call_args.kwargs["mamba_cache_manager"] is None

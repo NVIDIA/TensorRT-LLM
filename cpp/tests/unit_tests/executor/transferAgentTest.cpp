@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -158,6 +158,36 @@ TEST_P(TransferAgentTest, Basic2)
     TLLM_CHECK(memory0 == memory1);
 
     xferAgent0->invalidateRemoteAgent(agent1);
+}
+
+TEST_P(TransferAgentTest, NixlTransferStatusReleaseIsIdempotent)
+{
+    if (backend != "nixl")
+    {
+        GTEST_SKIP() << "Explicit transfer-handle release is implemented only by NIXL";
+    }
+
+    std::string const agent0{"agent0"}, agent1{"agent1"};
+    BaseAgentConfig config0{agent0, true, false, true}, config1{agent1, true, false, true};
+    auto xferAgent0 = makeTransferAgent(config0);
+    auto xferAgent1 = makeTransferAgent(config1);
+    std::vector<char> memory0(100, 10);
+    std::vector<char> memory1(100, 1);
+    RegisteredHostMemory regMem0(MemoryDescs{MemoryType::kDRAM, {MemoryDesc{memory0}}}, xferAgent0.get());
+    RegisteredHostMemory regMem1(MemoryDescs{MemoryType::kDRAM, {MemoryDesc{memory1}}}, xferAgent1.get());
+
+    xferAgent0->loadRemoteAgent(agent1, xferAgent1->getLocalConnectionInfo());
+    while (!xferAgent0->checkRemoteDescs(agent1, regMem1.getDescs()))
+    {
+    }
+    TransferRequest writeReq{TransferOp::kWRITE, regMem0.getDescs(), regMem1.getDescs(), agent1};
+    auto status = xferAgent0->submitTransferRequests(writeReq);
+    ASSERT_EQ(status->wait(), TransferState::kSUCCESS);
+
+    EXPECT_TRUE(status->release());
+    EXPECT_TRUE(status->release());
+    EXPECT_FALSE(status->isCompleted());
+    EXPECT_EQ(status->wait(0), TransferState::kFAILURE);
 }
 
 TEST_P(TransferAgentTest, DeviceMemory)
@@ -421,8 +451,10 @@ TEST_P(TransferAgentTest, StatusOutlivesAgent)
     // kFAILURE/false instead of dereferencing the freed agent.
     EXPECT_FALSE(status->isCompleted());
     EXPECT_EQ(status->wait(0), TransferState::kFAILURE);
-    // `status` destructor runs at scope exit: weak_ptr.lock() == nullptr ->
-    // early return (no releaseXferReq on a dangling agent).
+    // Releasing an orphaned status is safe and idempotent: no backend handle is
+    // dereferenced after the owning agent has gone away.
+    EXPECT_TRUE(status->release());
+    EXPECT_TRUE(status->release());
 }
 
 // Concurrent submitTransferRequests (#14137): submit holds a std::shared_lock and
