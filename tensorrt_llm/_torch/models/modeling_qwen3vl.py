@@ -1062,6 +1062,17 @@ class Qwen3VisionModelBase(nn.Module):
     def _parse_and_batch_multimodal_data(
         self, multimodal_params: List[MultimodalParams]
     ) -> Tuple[Dict[str, Any], Dict[str, List[Any]]]:
+        # Mixed image+video within a single request needs the ViT to see rows
+        # in prompt order. Detect and delegate; single-modality requests fall
+        # through to the unchanged per-modality contiguous path below.
+        if any(
+            mp.multimodal_data.get("mm_item_order")
+            and mp.multimodal_data.get("image") is not None
+            and mp.multimodal_data.get("video") is not None
+            for mp in multimodal_params
+        ):
+            return self._interleave_multimodal_data(multimodal_params)
+
         pixel_values_list = []
         pixel_values_videos_list = []
         image_grid_thw_list = []
@@ -1111,19 +1122,84 @@ class Qwen3VisionModelBase(nn.Module):
 
         return mm_content_dict, mm_extra_data
 
+    def _interleave_multimodal_data(
+        self, multimodal_params: List[MultimodalParams]
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Build one prompt-order pixel_values + grid_thw for mixed batches.
+
+        The ViT is modality-blind (image = grid_thw row with t=1, video = t>1),
+        so we cat everything into a single stream in prompt order. Emits only
+        the "pixel_values" + "image_grid_thw" keys so forward() takes its
+        image branch uniformly over both modalities.
+        """
+        pixels: List[torch.Tensor] = []
+        grids: List[torch.Tensor] = []
+        for mp in multimodal_params:
+            data = mp.multimodal_data
+            order = data.get("mm_item_order") or []
+            img = data.get("image") or {}
+            vid = data.get("video") or {}
+            img_pv, img_thw = img.get("pixel_values"), img.get("image_grid_thw")
+            vid_pv = vid.get("pixel_values_videos")
+            vid_thw = vid.get("video_grid_thw")
+
+            # Single-modality request piggybacking on the mixed path: append
+            # rows in natural per-modality order.
+            if not order or img_pv is None or vid_pv is None:
+                if img_pv is not None:
+                    pixels.append(img_pv)
+                    grids.append(img_thw)
+                if vid_pv is not None:
+                    pixels.append(vid_pv)
+                    grids.append(vid_thw)
+                continue
+
+            img_off = vid_off = 0
+            for entry in order:
+                modality = entry["modality"]
+                idx = entry["index"]
+                if modality == "image":
+                    thw = img_thw[idx]
+                    n = int(thw.prod().item())
+                    pixels.append(img_pv[img_off : img_off + n])
+                    img_off += n
+                elif modality == "video":
+                    thw = vid_thw[idx]
+                    n = int(thw.prod().item())
+                    pixels.append(vid_pv[vid_off : vid_off + n])
+                    vid_off += n
+                else:
+                    raise ValueError(f"Unknown modality in mm_item_order: {modality}")
+                grids.append(thw.unsqueeze(0))
+
+        return (
+            {"pixel_values": torch.cat(pixels, dim=0)},
+            {"image_grid_thw": torch.cat(grids, dim=0)},
+        )
+
     @torch.inference_mode()
     def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
         mm_content_data, mm_extra_data = self._parse_and_batch_multimodal_data(multimodal_params)
         pixel_values = mm_content_data.get("pixel_values", None)
         pixel_values_videos = mm_content_data.get("pixel_values_videos", None)
 
-        if pixel_values is not None and pixel_values_videos is not None:
-            raise ValueError("Currently only support single modality per request")
-
         image_grid_thw = mm_extra_data.get("image_grid_thw", None)
         video_grid_thw = mm_extra_data.get("video_grid_thw", None)
 
-        embeds = []
+        # When the interleave path fires, _parse_and_batch collapses both
+        # modalities into "pixel_values" + "image_grid_thw"; video_* stay None.
+        if pixel_values is not None and pixel_values_videos is not None:
+            # Fallback tripwire: if any request has both modalities but the
+            # interleave path did not fire (no mm_item_order), we cannot
+            # produce correctly-ordered embeddings.
+            raise ValueError(
+                "Qwen3-VL vision encoder received both pixel_values and "
+                "pixel_values_videos without a prompt-order manifest "
+                "(mm_item_order). Mixed-modality requests must carry "
+                "mm_item_order on multimodal_data."
+            )
+
+        embeds: List[torch.Tensor] = []
         if pixel_values is not None:
             pixel_values = pixel_values.to(self.model_dtype)
             image_embeds, deepstack_image_embeds = self.visual(
@@ -1546,6 +1622,13 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
         placeholders_separator="",
         content_format=ContentFormat.STRING,
+        # Preserve prompt order across modalities so downstream ordering
+        # (derive_mm_item_order, encoder interleave) sees `<|image_pad|>` /
+        # `<|video_pad|>` in the order the user sent them. Without this,
+        # add_multimodal_placeholders bulk-prepends all image placeholders
+        # then all video placeholders and collapses mixed prompts to
+        # modality-grouped order.
+        interleave_placeholders=True,
     ),
 )
 class Qwen3VLModel(Qwen3VLModelBase):
