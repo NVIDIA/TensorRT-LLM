@@ -36,8 +36,7 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
                                               get_ctx_gen_server_addrs,
                                               get_global_disagg_request_id)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.cluster_storage import (HttpClusterStorageServer,
-                                                create_cluster_storage)
+from tensorrt_llm.serve.cluster_storage import HttpClusterStorageServer
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
 from tensorrt_llm.serve.disagg_coordinator import (CoordinatorClient,
@@ -112,19 +111,18 @@ class OpenAIDisaggServer:
         self._metadata_server = create_metadata_server(metadata_server_cfg)
         self._perf_metrics_collector = DisaggPerfMetricsCollector(config.perf_metrics_max_requests)
 
-        self._disagg_cluster_storage = create_cluster_storage(config.disagg_cluster_config.cluster_uri, config.disagg_cluster_config.cluster_name) if config.disagg_cluster_config else None
-
         if self._coordinator_url:
             self._coordinator = CoordinatorClient(
                 self._coordinator_url, self._ctx_router, self._gen_router,
                 request_timeout_s=self._req_timeout_secs)
         else:
+            # The coordinator owns the disagg cluster storage (creates it from
+            # config); read it back for route-mounting below.
             self._coordinator = DisaggCoordinatorService(
                 self._config, self._ctx_router, self._gen_router,
                 self._create_client,
                 metadata_server=self._metadata_server,
                 metadata_config=self._metadata_server_cfg,
-                cluster_storage=self._disagg_cluster_storage,
                 server_start_timeout_secs=self._server_start_timeout_secs)
 
         self._service = OpenAIDisaggregatedService(
@@ -179,8 +177,12 @@ class OpenAIDisaggServer:
         # import prometheus_client lazily to break the `set_prometheus_multiproc_dir`
         from prometheus_client import make_asgi_app
         self.app.mount("/prometheus/metrics", make_asgi_app())
-        if self._disagg_cluster_storage and isinstance(self._disagg_cluster_storage, HttpClusterStorageServer):
-            self._disagg_cluster_storage.add_routes(self.app)
+        # Single-process (local coordinator): mount the in-process HTTP cluster
+        # storage routes on this app. In worker mode the coordinator is remote and
+        # owns those routes (CoordinatorClient has no cluster_storage).
+        cluster_storage = getattr(self._coordinator, "cluster_storage", None)
+        if isinstance(cluster_storage, HttpClusterStorageServer):
+            cluster_storage.add_routes(self.app)
 
     @staticmethod
     def _extract_conversation_id(req: UCompletionRequest, raw_req: Request):

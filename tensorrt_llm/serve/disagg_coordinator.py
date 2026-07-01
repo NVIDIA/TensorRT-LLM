@@ -27,11 +27,11 @@ Two implementations for the coordinator/worker deployment:
   server preparation/monitoring, the auto-scaling ``DisaggClusterManager`` +
   worker events, and readiness. Its :meth:`select` / :meth:`finish` are the
   coordinator's ``/select`` / ``/finish`` handlers.
-* :class:`CoordinatorClient` -- runs in each forked worker. Delegates the whole
-  service surface to the coordinator over HTTP: ``ctx_router`` / ``gen_router``
-  return :class:`CoordinatorHttpRouter` instances (placement posts to
-  ``/select``, finish posts to ``/finish``); readiness / cluster_info proxy the
-  coordinator.
+* :class:`CoordinatorClient` -- runs in each forked worker. Stateful routers
+  (conversation, centralized) are wrapped in a :class:`CoordinatorDelegatingRouter`
+  that posts the routing key to ``/select`` (finish -> ``/finish``); stateless
+  routers (round_robin, load_balancing) place locally in the worker. Readiness /
+  cluster_info proxy the coordinator over HTTP.
 """
 
 import asyncio
@@ -43,12 +43,13 @@ import aiohttp
 from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.cluster_storage import ClusterStorage, WatchEventType
+from tensorrt_llm.serve.cluster_storage import (ClusterStorage, WatchEventType,
+                                                create_cluster_storage)
 from tensorrt_llm.serve.disagg_auto_scaling import (DisaggClusterManager,
                                                     WorkerInfo)
 from tensorrt_llm.serve.metadata_server import JsonDictionary
 from tensorrt_llm.serve.openai_client import OpenAIClient
-from tensorrt_llm.serve.router import CoordinatorHttpRouter, Router
+from tensorrt_llm.serve.router import CoordinatorDelegatingRouter, Router
 
 __all__ = [
     "DisaggCoordinator",
@@ -104,7 +105,6 @@ class DisaggCoordinatorService(DisaggCoordinator):
         client_factory,
         metadata_server: Optional[JsonDictionary] = None,
         metadata_config: Optional[MetadataServerConfig] = None,
-        cluster_storage: Optional[ClusterStorage] = None,
         server_start_timeout_secs: int = 180,
         health_check_interval_secs: int = 3,
     ):
@@ -114,7 +114,13 @@ class DisaggCoordinatorService(DisaggCoordinator):
         self._client_factory = client_factory
         self._metadata_server = metadata_server
         self._metadata_config = metadata_config
-        self._cluster_storage = cluster_storage
+        # The coordinator owns the disagg cluster storage (auto-scaling backend):
+        # it drives the DisaggClusterManager below and, when the storage is an
+        # in-process HTTP server, its routes are mounted on the coordinator app.
+        self._cluster_storage: Optional[ClusterStorage] = (
+            create_cluster_storage(config.disagg_cluster_config.cluster_uri,
+                                   config.disagg_cluster_config.cluster_name)
+            if config.disagg_cluster_config else None)
         self._server_start_timeout_secs = server_start_timeout_secs
         self._health_check_interval_secs = health_check_interval_secs
 
@@ -130,6 +136,10 @@ class DisaggCoordinatorService(DisaggCoordinator):
     def gen_router(self) -> Router:
         return self._gen_router
 
+    @property
+    def cluster_storage(self) -> Optional[ClusterStorage]:
+        return self._cluster_storage
+
     def set_clients(self, ctx_client: OpenAIClient,
                     gen_client: OpenAIClient) -> None:
         self._ctx_client = ctx_client
@@ -140,8 +150,8 @@ class DisaggCoordinatorService(DisaggCoordinator):
     async def select(self, role: str, routing_key,
                      exclude_server: Optional[str]) -> Tuple[str, dict, Optional[str]]:
         router = self._router_for_role(role)
-        return await router.select_by_key(routing_key,
-                                          exclude_server=exclude_server)
+        return await router.get_next_server_by_key(routing_key,
+                                                   exclude_server=exclude_server)
 
     async def finish(self, role: str, handle: Optional[str],
                      success: bool = True) -> None:
@@ -252,12 +262,15 @@ class DisaggCoordinatorService(DisaggCoordinator):
 
 
 class CoordinatorClient(DisaggCoordinator):
-    """Worker-side coordinator: delegate the whole surface to the coordinator.
+    """Worker-side coordinator: delegate stateful routing to the coordinator.
 
-    ``ctx_router`` / ``gen_router`` return :class:`CoordinatorHttpRouter` proxies
-    (placement -> ``/select``, finish -> ``/finish``) built over local routers of
-    the configured type (used for ``extract_routing_key`` and server-pool ops).
-    Readiness / cluster_info proxy the coordinator over HTTP.
+    A *stateful* router (conversation, centralized -- it exposes
+    ``get_next_server_by_key``) is wrapped in a :class:`CoordinatorDelegatingRouter`
+    so the worker computes the small routing key locally and the coordinator makes
+    the placement (placement -> ``/select``, finish -> ``/finish``). A *stateless*
+    router (round_robin, load_balancing) is used as-is and places locally in the
+    worker -- no coordinator round-trip. Readiness / cluster_info always proxy the
+    coordinator over HTTP.
 
     Args:
         remote_url: Coordinator base URL (e.g. ``http://host:PORT``).
@@ -270,10 +283,16 @@ class CoordinatorClient(DisaggCoordinator):
         self._remote_url = remote_url.rstrip("/")
         self._request_timeout_s = request_timeout_s
         self._session: Optional[aiohttp.ClientSession] = None
-        self._ctx_router = CoordinatorHttpRouter(
-            self._remote_url, ctx_router, "context", request_timeout_s)
-        self._gen_router = CoordinatorHttpRouter(
-            self._remote_url, gen_router, "generation", request_timeout_s)
+        self._ctx_router = self._maybe_delegate(ctx_router, "context")
+        self._gen_router = self._maybe_delegate(gen_router, "generation")
+
+    def _maybe_delegate(self, local_router: Router, role: str) -> Router:
+        # Stateful routers expose get_next_server_by_key -> delegate placement to
+        # the coordinator; stateless ones place locally (used unchanged).
+        if hasattr(local_router, "get_next_server_by_key"):
+            return CoordinatorDelegatingRouter(self._remote_url, local_router,
+                                               role, self._request_timeout_s)
+        return local_router
 
     @property
     def ctx_router(self) -> Router:

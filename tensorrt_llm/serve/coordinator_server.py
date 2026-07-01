@@ -24,11 +24,11 @@ and answers the internal coordination API that the forked worker processes call:
     GET  /health   -> 200 when ready
     GET  /version
 
-The routing key is produced client-side by ``Router.extract_routing_key`` and
-consumed here by ``Router.select_by_key`` (see ``serve/router.py``), so this
-endpoint is generic across router types (centralized -> block hashes,
-conversation -> conversation_id, round-robin -> empty). Single-process by design;
-it owns the ZMQ ingest bind for centralized mode.
+The routing key is produced worker-side by ``Router.routing_key`` and consumed
+here by ``Router.get_next_server_by_key`` (see ``serve/router.py``), so this
+endpoint is generic across the stateful router types that use it (centralized ->
+block hashes, conversation -> conversation_id). Single-process by design; it owns
+the ZMQ ingest bind for centralized mode.
 """
 
 import asyncio

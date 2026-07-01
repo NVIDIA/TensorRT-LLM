@@ -19,8 +19,9 @@ with the best cache locality and capacity. See ``design`` doc for the full
 rationale.
 """
 
+from tensorrt_llm.serve.router_utils import PrefixBlockSet
+
 from .messages import KvCacheEventReport, Selection, WorkerLoadReport
-from .prefix_trie import PrefixBlockSet
 from .reporter import WorkerReporter
 from .router_core import (CentralizedKVCacheRouter,
                           CentralizedKVCacheRouterCore, block_key_hasher,

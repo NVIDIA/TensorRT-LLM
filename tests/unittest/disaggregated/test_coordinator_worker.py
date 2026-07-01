@@ -19,15 +19,16 @@ coordinator:
   * fake ctx/gen HTTP workers answer ``/health`` (readiness only),
   * a real ``CoordinatorServer`` (wrapping a ``DisaggCoordinatorService`` over the
     configured routers) runs in a uvicorn thread on an internal port,
-  * a ``CoordinatorClient`` (what a forked worker holds) exposes ctx/gen
-    ``CoordinatorHttpRouter``s whose ``get_next_server`` extracts the routing key
-    locally and POSTs it to the coordinator's ``/select``; ``finish_request``
-    releases coordinator-side state via ``/finish`` and the returned handle.
+  * a ``CoordinatorClient`` (what a worker holds) wraps only *stateful* routers
+    in a ``CoordinatorDelegatingRouter`` whose ``get_next_server`` computes the
+    routing key locally and POSTs it to the coordinator's ``/select``;
+    ``finish_request`` releases coordinator-side state via ``/finish`` and the
+    returned handle. *Stateless* routers (round_robin) are used as-is and place
+    locally in the worker.
 
-This proves the routing-key split: the worker decides *what* to send
-(``extract_routing_key`` -> empty for round-robin, conversation_id for
-conversation), and the coordinator decides *where* (``select_by_key``), over the
-same config so the keys line up.
+This proves the routing split: stateful routers (conversation, centralized)
+delegate to the coordinator via ``routing_key`` + ``get_next_server_by_key``,
+while stateless routers never touch the coordinator.
 """
 
 import asyncio
@@ -183,8 +184,11 @@ async def _wait_coord_ready(url, timeout_s=30.0):
     return False
 
 
-def test_round_robin_coordinator_select_and_finish():
-    """Worker extracts an empty key; coordinator round-robins over gen workers."""
+def test_stateless_router_places_locally_in_worker():
+    """A round-robin (stateless) router is NOT wrapped: the worker places locally
+    with the real router and never calls the coordinator."""
+    from tensorrt_llm.serve.router import (CoordinatorDelegatingRouter,
+                                           RoundRobinRouter)
     with _FakeWorker() as ctx0, _FakeWorker() as gen0, _FakeWorker() as gen1:
         config = _make_config([ctx0.url], [gen0.url, gen1.url],
                               "round_robin", "round_robin")
@@ -198,7 +202,10 @@ def test_round_robin_coordinator_select_and_finish():
                     create_router(config.ctx_router_config, [ctx0.url]),
                     create_router(config.gen_router_config,
                                   [gen0.url, gen1.url]))
-                assert await remote.is_ready() is True
+                # Stateless -> real local router, not a delegating proxy.
+                assert isinstance(remote.gen_router, RoundRobinRouter)
+                assert not isinstance(remote.gen_router,
+                                      CoordinatorDelegatingRouter)
                 picks = []
                 for _ in range(4):
                     req = CompletionRequest(model="m", prompt="hello")
@@ -210,11 +217,13 @@ def test_round_robin_coordinator_select_and_finish():
 
             picks = asyncio.run(drive())
             assert set(picks) == {gen0.url, gen1.url}, \
-                f"round-robin should hit both gen workers, got {picks}"
+                f"local round-robin should hit both gen workers, got {picks}"
 
 
 def test_conversation_coordinator_sticky_by_conv_id():
-    """Same conversation_id sticks to one gen worker across worker requests."""
+    """Same conversation_id sticks to one gen worker; a stateful (conversation)
+    router delegates placement to the coordinator via /select."""
+    from tensorrt_llm.serve.router import CoordinatorDelegatingRouter
     with _FakeWorker() as ctx0, _FakeWorker() as gen0, _FakeWorker() as gen1:
         config = _make_config([ctx0.url], [gen0.url, gen1.url],
                               "round_robin", "conversation")
@@ -233,6 +242,9 @@ def test_conversation_coordinator_sticky_by_conv_id():
                     create_router(config.ctx_router_config, [ctx0.url]),
                     create_router(config.gen_router_config,
                                   [gen0.url, gen1.url]))
+                # Stateful -> wrapped in a coordinator-delegating router.
+                assert isinstance(remote.gen_router,
+                                  CoordinatorDelegatingRouter)
                 assert await remote.is_ready() is True
                 first, _ = await remote.gen_router.get_next_server(_req("conv-A"))
                 # Repeated conv-A requests must land on the same worker.

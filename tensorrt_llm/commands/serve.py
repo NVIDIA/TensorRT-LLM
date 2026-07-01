@@ -1250,19 +1250,17 @@ def disaggregated(
     web_concurrency = int(os.environ.get("WEB_CONCURRENCY", "1") or "1")
 
     if web_concurrency > 1:
-        # Coordinator/worker mode: this process becomes a pure coordinator
-        # (owns routers + cluster state + centralized ZMQ ingest) on port-1 and
-        # launches a uvicorn worker fleet (workers=WEB_CONCURRENCY) that serves
-        # completions+metrics on the public port; each worker delegates placement
-        # to the coordinator.
-        _run_disagg_coordinator(disagg_cfg, metadata_server_cfg,
-                                config_file, metadata_server_config_file,
-                                request_timeout, server_start_timeout,
-                                metrics_log_interval, web_concurrency,
-                                log_level)
+        # workers>1: run the coordinator server in this process (on port-1) and
+        # launch a uvicorn fleet of ordinary disagg servers (workers=N) on the
+        # public port, each with a remote CoordinatorClient. See below.
+        _serve_coordinator_and_fleet(disagg_cfg, config_file,
+                                     metadata_server_config_file,
+                                     metadata_server_cfg, request_timeout,
+                                     server_start_timeout, web_concurrency)
         return
 
-    # Single process: pre-bind the socket (also validates the port) and serve.
+    # workers==1: a single disagg server with an in-process (local) coordinator.
+    # Pre-bind the socket (also validates the port) and serve.
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.bind((disagg_cfg.hostname, disagg_cfg.port))
@@ -1281,19 +1279,21 @@ def disaggregated(
         asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port, sockets=[s]))
 
 
-def _run_disagg_coordinator(disagg_cfg, metadata_server_cfg, config_file,
-                            metadata_server_config_file, request_timeout,
-                            server_start_timeout, metrics_log_interval,
-                            web_concurrency, log_level):
-    """Fork N disaggregated_worker children and run the coordinator here.
+def _serve_coordinator_and_fleet(disagg_cfg, config_file,
+                                 metadata_server_config_file,
+                                 metadata_server_cfg, request_timeout,
+                                 server_start_timeout, web_concurrency):
+    """workers>1: coordinator server here + a uvicorn disagg-server fleet.
 
-    The coordinator (this process) owns cluster state and serves the internal
-    coordination API on ``port-1``; the uvicorn worker fleet binds the public
-    ``port`` and delegates placement to the coordinator.
+    This process runs the coordinator server (owns the ctx/gen routers, cluster
+    state, and centralized ZMQ ingest) on ``port-1``. The public port is served
+    by a uvicorn fleet (``workers=N``) of *ordinary* disagg servers, each built
+    with ``coordinator_url`` so it holds a remote ``CoordinatorClient``; uvicorn
+    owns the shared socket, worker supervision, and graceful shutdown.
     """
     from tensorrt_llm.serve.coordinator_server import CoordinatorServer
-    from tensorrt_llm.serve.metadata_server import create_metadata_server
     from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
+    from tensorrt_llm.serve.metadata_server import create_metadata_server
     from tensorrt_llm.serve.router import create_router
 
     public_host, public_port = disagg_cfg.hostname, disagg_cfg.port
@@ -1301,34 +1301,11 @@ def _run_disagg_coordinator(disagg_cfg, metadata_server_cfg, config_file,
                                     public_port - 1))
     coord_url = f"http://{public_host}:{coord_port}"
 
-    # Build the coordinator's routers + local cluster manager.
-    ctx_servers, gen_servers = get_ctx_gen_server_addrs(disagg_cfg.server_configs)
-    md = create_metadata_server(metadata_server_cfg)
-    ctx_router = create_router(disagg_cfg.ctx_router_config, ctx_servers,
-                               metadata_server_cfg, md,
-                               disagg_node_id=disagg_cfg.node_id)
-    gen_router = create_router(disagg_cfg.gen_router_config, gen_servers,
-                               metadata_server_cfg, md,
-                               disagg_node_id=disagg_cfg.node_id)
-
-    def _client_factory(router, role, max_retries=1):
-        from tensorrt_llm.serve.openai_client import OpenAIHttpClient
-        return OpenAIHttpClient(router, role, request_timeout, max_retries)
-
-    cluster = DisaggCoordinatorService(
-        disagg_cfg, ctx_router, gen_router, _client_factory,
-        metadata_server=md, metadata_config=metadata_server_cfg,
-        server_start_timeout_secs=server_start_timeout)
-
-    # Launch the worker fleet as a single child that runs uvicorn with
-    # workers=N: uvicorn owns the shared listening socket, supervises the N
-    # worker processes (restart-on-crash), and handles graceful shutdown. The
-    # worker app is a stateless import-string factory (create_worker_app) that
-    # rebuilds itself in each uvicorn worker from config + coordinator URL in env.
-    #
-    # MPI/PMIX/SLURM env is stripped so a worker (plain HTTP process) never joins
-    # an MPI namespace it wasn't launched into; WEB_CONCURRENCY is dropped and
-    # re-supplied as the uvicorn worker count via the launcher flag.
+    # 1. Launch the disagg-server fleet: uvicorn workers=N over create_worker_app
+    #    (an ordinary OpenAIDisaggServer with coordinator_url). Invoked as
+    #    `python -m uvicorn` so there is no bespoke worker command. MPI/PMIX/SLURM
+    #    env is stripped so a worker (plain HTTP process) never joins an MPI
+    #    namespace; WEB_CONCURRENCY is dropped and re-supplied as --workers.
     child_env = {
         k: v for k, v in os.environ.items()
         if not k.startswith(("SLURM_", "PMIX_", "PMI_", "OMPI_", "UCX_",
@@ -1344,12 +1321,12 @@ def _run_disagg_coordinator(disagg_cfg, metadata_server_cfg, config_file,
     child_env[DisaggWorkerEnvs.TLLM_DISAGG_REQUEST_TIMEOUT] = str(request_timeout)
     child_env[DisaggWorkerEnvs.TLLM_DISAGG_SERVER_START_TIMEOUT] = str(
         server_start_timeout)
-    cmd = [sys.executable, "-m", "tensorrt_llm.commands.serve",
-           "disaggregated_worker", "--workers", str(web_concurrency),
-           "--log_level", log_level]
-
-    logger.info(f"Coordinator: launching {web_concurrency} uvicorn workers on "
-                f"{public_host}:{public_port}")
+    cmd = [sys.executable, "-m", "uvicorn", "--factory",
+           "--host", str(public_host), "--port", str(public_port),
+           "--workers", str(web_concurrency), "--timeout-keep-alive", "10",
+           "tensorrt_llm.commands.serve:create_worker_app"]
+    logger.info(f"Launching disagg fleet: {web_concurrency} uvicorn workers on "
+                f"{public_host}:{public_port}, coordinator={coord_url}")
     fleet = subprocess.Popen(cmd, env=child_env, stdout=sys.stdout,
                              stderr=sys.stderr, start_new_session=True)
 
@@ -1362,18 +1339,36 @@ def _run_disagg_coordinator(disagg_cfg, metadata_server_cfg, config_file,
             fleet.kill()
 
     atexit.register(_cleanup)
-    logger.info(f"Coordinator serving on {public_host}:{coord_port}, "
-                f"{web_concurrency} workers on public port {public_port}")
-    asyncio.run(CoordinatorServer(cluster)(public_host, coord_port))
+
+    # 2. Build + serve the coordinator in this process.
+    md = create_metadata_server(metadata_server_cfg)
+    ctx_servers, gen_servers = get_ctx_gen_server_addrs(disagg_cfg.server_configs)
+    ctx_router = create_router(disagg_cfg.ctx_router_config, ctx_servers,
+                               metadata_server_cfg, md,
+                               disagg_node_id=disagg_cfg.node_id)
+    gen_router = create_router(disagg_cfg.gen_router_config, gen_servers,
+                               metadata_server_cfg, md,
+                               disagg_node_id=disagg_cfg.node_id)
+
+    def _client_factory(router, role, max_retries=1):
+        from tensorrt_llm.serve.openai_client import OpenAIHttpClient
+        return OpenAIHttpClient(router, role, request_timeout, max_retries)
+
+    coordinator = DisaggCoordinatorService(
+        disagg_cfg, ctx_router, gen_router, _client_factory,
+        metadata_server=md, metadata_config=metadata_server_cfg,
+        server_start_timeout_secs=server_start_timeout)
+    logger.info(f"Coordinator serving on {public_host}:{coord_port}")
+    asyncio.run(CoordinatorServer(coordinator)(public_host, coord_port))
 
 
 def create_worker_app():
-    """uvicorn import-string factory: build one disagg worker's FastAPI app.
+    """uvicorn import-string factory: build one disagg server's FastAPI app.
 
     Rebuilt inside each uvicorn worker process (workers=N). Fully stateless --
-    reads config + coordinator URL from the env the ``disaggregated`` command
-    exported (see ``DisaggWorkerEnvs``); routing/readiness are delegated to the
-    coordinator (worker holds a ``CoordinatorClient``).
+    reads config + coordinator URL from the env ``_serve_coordinator_and_fleet``
+    exported (see ``DisaggWorkerEnvs``); the server holds a remote
+    ``CoordinatorClient`` so routing/readiness are delegated to the coordinator.
     """
     # A worker is a plain HTTP process, never an MPI rank; drop WEB_CONCURRENCY so
     # it is never itself re-forked into multiple uvicorn workers.
@@ -1400,39 +1395,9 @@ def create_worker_app():
         server_start_timeout_secs=server_start_timeout,
         metadata_server_cfg=metadata_server_cfg,
         coordinator_url=coordinator_url)
-    logger.info(f"Disagg worker (pid={os.getpid()}) app built, coordinator="
+    logger.info(f"Disagg server (pid={os.getpid()}) app built, coordinator="
                 f"{coordinator_url}")
     return server.app
-
-
-@click.command("disaggregated_worker")
-@click.option("--workers", type=int, default=1,
-              help="Number of uvicorn worker processes to run.")
-@click.option("-l", "--log_level", type=click.Choice(severity_map.keys()),
-              default="info", help="The logging level.")
-def disaggregated_worker(workers: int, log_level: str):
-    """Run the disagg worker fleet: serves completions + metrics only.
-
-    Runs uvicorn with ``workers`` processes over a shared listening socket (public
-    host/port from the config); uvicorn supervises the workers and handles
-    graceful shutdown. Config + coordinator URL are read from ``DisaggWorkerEnvs``
-    set by the ``disaggregated`` command; not intended to be invoked directly.
-    """
-    logger.set_level(log_level)
-    os.environ.pop("WEB_CONCURRENCY", None)
-
-    config_file = os.environ[DisaggWorkerEnvs.TLLM_DISAGG_CONFIG_FILE]
-    disagg_cfg = parse_disagg_config_file(config_file)
-
-    import uvicorn
-    logger.info(f"Disagg worker fleet: {workers} uvicorn workers on "
-                f"{disagg_cfg.hostname}:{disagg_cfg.port}")
-    uvicorn.run("tensorrt_llm.commands.serve:create_worker_app",
-                factory=True,
-                host=disagg_cfg.hostname,
-                port=disagg_cfg.port,
-                workers=workers,
-                timeout_keep_alive=10)
 
 
 def set_cuda_device():
@@ -1694,7 +1659,6 @@ main = DefaultGroup(
         "serve": serve,
         "disaggregated": disaggregated,
         "disaggregated_mpi_worker": disaggregated_mpi_worker,
-        "disaggregated_worker": disaggregated_worker,
         "mm_embedding_serve": serve_encoder
     })
 

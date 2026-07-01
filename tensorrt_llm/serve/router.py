@@ -498,43 +498,6 @@ class Router(ABC):
                              success: bool = True):
         pass
 
-    # ---- coordinator-path API (used only when workers>1; see coordinator) ----
-    # Placement is split so a worker process can compute a small routing key
-    # locally and a coordinator process can select from it. Single-process
-    # serving never uses these -- it calls get_next_server directly.
-
-    def extract_routing_key(self, request: OpenAIRequest):
-        """Client-side: the minimal JSON-serializable value the coordinator
-        needs to place *request* for this router type. Default: nothing.
-
-        Overridden by content/session routers (Centralized -> block hashes;
-        Conversation -> conversation_id).
-        """
-        return None
-
-    async def select_by_key(
-            self, routing_key,
-            exclude_server: Optional[str] = None) -> tuple[str, dict, Optional[str]]:
-        """Coordinator-side: pick a server from a pre-extracted *routing_key*.
-
-        Returns ``(server, info, handle)`` where *handle* is an opaque token the
-        worker passes back to :meth:`finish_by_handle` to release any per-request
-        state (or ``None`` for stateless routers). Routers that support
-        coordinator placement override this.
-        """
-        raise NotImplementedError(
-            f"{type(self).__name__} does not support coordinator-mode placement "
-            "(workers>1). Use a centralized or conversation router, or run "
-            "single-process (WEB_CONCURRENCY=1).")
-
-    async def finish_by_handle(self, handle: Optional[str],
-                               success: bool = True) -> None:
-        """Coordinator-side: release state for a handle from select_by_key.
-
-        Default no-op (stateless routers). Stateful routers override.
-        """
-        del handle, success
-
     @property
     def session(self) -> aiohttp.ClientSession:
         if not self._session:
@@ -776,20 +739,6 @@ class RoundRobinRouter(Router):
                         f"No available servers after excluding {exclude_server}"
                     )
         return server, {"server_info": self._server_info.get(server, {})}
-
-    async def select_by_key(self, routing_key, exclude_server=None):
-        # round-robin ignores the (empty) routing key.
-        del routing_key
-        if not self._servers:
-            raise ValueError(f"No {self._server_role} servers available")
-        async with self._lock:
-            server = self._get_next_server()
-            if exclude_server and server == exclude_server:
-                server = self._get_next_server()
-                if server == exclude_server:
-                    raise ValueError(
-                        f"No available servers after excluding {exclude_server}")
-        return server, {"server_info": self._server_info.get(server, {})}, None
 
     async def finish_request(self,
                              request: OpenAIRequest,
@@ -1542,11 +1491,11 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
     # opaque handle instead of id(request). Only explicit conversation_id sessions
     # are supported over the coordinator (no implicit content match).
 
-    def extract_routing_key(self, request: OpenAIRequest):
+    def routing_key(self, request: OpenAIRequest):
         """The conversation_id (or None); no tokenization on the worker."""
         return self._get_conversation_id(request)
 
-    async def select_by_key(self, routing_key, exclude_server=None):
+    async def get_next_server_by_key(self, routing_key, exclude_server=None):
         conv_id = routing_key
         self._validate_servers_available()
         if not hasattr(self, "_coord_handle_server"):
@@ -1680,7 +1629,7 @@ class CentralizedKVCacheRouter(BlockHashMixin, Router):
         """Placement from pre-computed block hashes (no tokenization).
 
         The hashing is done by the caller (the orchestrator surface, or a
-        worker via ``extract_routing_key``), so this is the pure selection
+        worker via ``routing_key``), so this is the pure selection
         step: pick the best server for ``block_hashes`` among the currently
         prepared servers, round-robining as fallback. Returns
         ``(server, matched_blocks, dp_rank)``. Raises ``ValueError`` when no
@@ -1723,14 +1672,14 @@ class CentralizedKVCacheRouter(BlockHashMixin, Router):
 
     # -- coordinator-path: worker sends block hashes, coordinator selects --
 
-    def extract_routing_key(self, request: OpenAIRequest):
+    def routing_key(self, request: OpenAIRequest):
         """Tokenize + block-hash locally; the flat hash list is the key."""
         cache_salt_id = self._get_request_cache_salt_id(request)
         _, block_hashes = self._tokenize_and_compute_block_hashes_with_salt(
             request, cache_salt_id)
         return [h for hl in block_hashes for h in hl]
 
-    async def select_by_key(self, routing_key, exclude_server=None):
+    async def get_next_server_by_key(self, routing_key, exclude_server=None):
         block_hashes = routing_key or []
         async with self._lock:
             server, matched, dp_rank = self.select_by_block_hashes(
@@ -1761,22 +1710,21 @@ class CentralizedKVCacheRouter(BlockHashMixin, Router):
 CentralizedKvCacheAwareRouter = CentralizedKVCacheRouter
 
 
-class CoordinatorHttpRouter(Router):
+class CoordinatorDelegatingRouter(Router):
     """Worker-side Router that delegates placement to the disagg coordinator.
 
-    In the coordinator/worker deployment each worker holds one of these per role
-    instead of a real router. It wraps a *local* router of the configured type
-    (same config as the coordinator) used only for the client half of placement
-    (:meth:`Router.extract_routing_key`) and for server-pool / prepare operations
-    (delegated by attribute passthrough). ``get_next_server`` extracts the routing
-    key locally and POSTs it to the coordinator's ``/select``; ``finish_request``
-    POSTs the returned handle to ``/finish`` so stateful (conversation) load is
-    released where the state lives.
+    Used only for *stateful* routers (conversation, centralized): the worker must
+    not keep its own copy of that state, so it wraps a local router of the same
+    type and, for each request, computes the small ``routing_key`` locally and
+    POSTs it to the coordinator's ``/select``. ``finish_request`` POSTs the
+    returned handle to ``/finish`` so the coordinator releases per-request state.
+    Server-pool / prepare / close operations delegate to the wrapped local router.
 
-    Because ``OpenAIClient`` already drives ``router.get_next_server`` /
-    ``router.finish_request``, the completions service needs no worker-specific
-    branching -- it just holds a ``CoordinatorHttpRouter`` where it would hold a
-    real router.
+    Stateless routers (round_robin, load_balancing) are NOT wrapped -- the worker
+    holds the real router and places locally, so they never reach this class (see
+    ``CoordinatorClient``). ``OpenAIClient`` already drives
+    ``router.get_next_server`` / ``router.finish_request``, so the completions
+    service needs no worker-specific branching.
     """
 
     def __init__(self, coordinator_url: str, local_router: "Router", role: str,
@@ -1793,7 +1741,7 @@ class CoordinatorHttpRouter(Router):
 
     def __getattr__(self, name):
         # servers / prepare_servers / num_prepared_servers / start_server_monitoring
-        # / close / extract_routing_key / ... all delegate to the local router.
+        # / routing_key / ... all delegate to the local router.
         return getattr(self._local, name)
 
     @property
@@ -1809,8 +1757,8 @@ class CoordinatorHttpRouter(Router):
             self,
             request: OpenAIRequest,
             exclude_server: Optional[str] = None) -> tuple[str, dict]:
-        routing_key = self._local.extract_routing_key(request)
-        payload = {"role": self._role, "routing_key": routing_key,
+        key = self._local.routing_key(request)
+        payload = {"role": self._role, "routing_key": key,
                    "exclude_server": exclude_server}
         async with self.session.post(
                 f"{self._coordinator_url}/select", json=payload,
@@ -1847,7 +1795,7 @@ class CoordinatorHttpRouter(Router):
                     logger.warning(
                         f"coordinator /finish returned {resp.status}")
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"CoordinatorHttpRouter finish failed: {e}")
+            logger.warning(f"CoordinatorDelegatingRouter finish failed: {e}")
 
     async def close(self):
         if self._session is not None:

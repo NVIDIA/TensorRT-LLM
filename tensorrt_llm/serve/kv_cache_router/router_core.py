@@ -37,11 +37,11 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 from tensorrt_llm.logger import logger
-# Single source of truth for request-side block hashing (shared with router.py).
-from tensorrt_llm.serve.router_utils import block_key_hasher
+# Single source of truth for request-side block hashing + prefix index
+# (shared with router.py).
+from tensorrt_llm.serve.router_utils import PrefixBlockSet, block_key_hasher
 
 from .messages import KvCacheEventReport, Selection, WorkerLoadReport
-from .prefix_trie import PrefixBlockSet
 
 __all__ = [
     "CentralizedKVCacheRouterCore", "CentralizedKVCacheRouter",
