@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import enum
@@ -14,6 +17,8 @@ from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import BufferKind
+from tensorrt_llm._torch.distributed.nccl_fault_tolerance import (
+    NCCL_FAULT_TOLERANCE_ENABLED, assert_nccl_group_not_reconfigured)
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
@@ -3199,6 +3204,7 @@ class Linear(nn.Module):
         )
         self.tp_size = self.mapping.tp_size
         self.tp_rank = self.mapping.tp_rank
+        self._tp_group_tuple = tuple(self.mapping.tp_group)
         self.tp_mode = tensor_parallel_mode
         self.gather_output = gather_output
         self.force_dynamic_quantization = force_dynamic_quantization
@@ -3261,10 +3267,17 @@ class Linear(nn.Module):
             "TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED", "0") == "1")
 
         self.use_fused_gemm_allreduce = all([
-            self.reduce_output, mpi_enabled, dtype_supported,
-            in_features_aligned, out_features_aligned, tp_valid, quant_valid,
-            device_supported, enable_gemm_allreduce_fusion,
-            enable_gemm_allreduce_fusion_env
+            self.reduce_output,
+            mpi_enabled,
+            dtype_supported,
+            in_features_aligned,
+            out_features_aligned,
+            tp_valid,
+            quant_valid,
+            device_supported,
+            enable_gemm_allreduce_fusion,
+            enable_gemm_allreduce_fusion_env,
+            not (NCCL_FAULT_TOLERANCE_ENABLED and mpi_enabled),
         ])
         if self.use_fused_gemm_allreduce:
             self.use_fused_gemm_allreduce = ipc_nvls_supported()
@@ -3379,8 +3392,14 @@ class Linear(nn.Module):
                                input,
                                bias,
                                layer_idx: Optional[int] | None = None):
+        tp_group = self.mapping.tp_group
+        tp_rank = self.tp_rank
+        if NCCL_FAULT_TOLERANCE_ENABLED and not mpi_disabled():
+            raise RuntimeError(
+                "NCCL error: fused GEMM allreduce has no peer-failure abort "
+                "path and is unavailable while TLLM_FAULT_TOLERANCE_MODE=1")
         output = self.quant_method.apply_linear_allreduce(
-            self, input, bias, self.tp_rank, self.mapping.tp_group)
+            self, input, bias, tp_rank, tp_group)
         return output
 
     def _maybe_fuse_bias_into_allreduce(
@@ -3408,12 +3427,19 @@ class Linear(nn.Module):
         lora_params: Optional[dict] = None,
         layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
+        if (NCCL_FAULT_TOLERANCE_ENABLED and self.tp_mode
+                in (TensorParallelMode.ROW, TensorParallelMode.COLUMN)
+                and self.tp_size > 1 and not mpi_disabled()):
+            assert_nccl_group_not_reconfigured(
+                self._tp_group_tuple,
+                f"{self.tp_mode.name.lower()}-parallel linear")
+
         if self.tp_mode == TensorParallelMode.ROW:
             use_fused_gemm_allreduce = self.use_fused_gemm_allreduce and lora_params is None
             if use_fused_gemm_allreduce and all_reduce_params is not None:
                 use_fused_gemm_allreduce = all_reduce_params.enable_allreduce and all_reduce_params.fusion_op == AllReduceFusionOp.NONE
 
-            bias = None if (self.tp_rank > 0) else self.bias
+            bias = None if self.tp_rank > 0 else self.bias
             if self.reduce_output:
                 if use_fused_gemm_allreduce:
                     output = self.apply_linear_allreduce(

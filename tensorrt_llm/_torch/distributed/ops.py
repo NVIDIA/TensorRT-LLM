@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 import os
 import platform
@@ -8,6 +11,9 @@ import torch
 from torch import nn
 
 from tensorrt_llm._mnnvl_utils import HelixCpMnnvlMemory, MnnvlMemory
+from tensorrt_llm._torch.distributed.nccl_fault_tolerance import (
+    NCCL_FAULT_TOLERANCE_ENABLED, assert_nccl_group_not_reconfigured,
+    is_nccl_group_reconfigured, resolve_nccl_group)
 from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
     SymmetricMemoryAllReduce
 from tensorrt_llm._torch.utils import get_model_extra_attrs
@@ -160,6 +166,10 @@ def get_or_scale_allreduce_mnnvl_workspace(
 def userbuffers_allreduce_finalize(
         input: torch.Tensor,
         force_applying_finalize: bool = False) -> torch.Tensor:
+    if NCCL_FAULT_TOLERANCE_ENABLED and not mpi_disabled():
+        raise RuntimeError(
+            "NCCL error: userbuffers allreduce has no peer-failure abort path "
+            "and is unavailable while TLLM_FAULT_TOLERANCE_MODE=1")
     output = torch.ops.trtllm.userbuffers_allreduce_finalize(
         input, force_applying_finalize)
     return output
@@ -307,9 +317,17 @@ def allgather(
     Returns:
         The gathered tensor or tensor list.
     '''
-    group_boxed = mapping.tp_group_pg.boxed() if mpi_disabled() else None
-    return _allgather(input, mapping.tp_group, mapping.tp_rank, group_boxed,
-                      dim, sizes)
+    if mpi_disabled():
+        group = mapping.tp_group
+        rank = mapping.tp_rank
+        group_boxed = mapping.tp_group_pg.boxed()
+    else:
+        group = mapping.tp_group
+        if NCCL_FAULT_TOLERANCE_ENABLED:
+            assert_nccl_group_not_reconfigured(group, "allgather")
+        rank = mapping.tp_rank
+        group_boxed = None
+    return _allgather(input, group, rank, group_boxed, dim, sizes)
 
 
 def cp_allgather(
@@ -331,9 +349,17 @@ def cp_allgather(
     Returns:
         The gathered tensor or tensor list.
     '''
-    group_boxed = mapping.cp_group_pg.boxed() if mpi_disabled() else None
-    return _allgather(input, mapping.cp_group, mapping.cp_rank, group_boxed,
-                      dim, sizes)
+    if mpi_disabled():
+        group = mapping.cp_group
+        rank = mapping.cp_rank
+        group_boxed = mapping.cp_group_pg.boxed()
+    else:
+        group = mapping.cp_group
+        if NCCL_FAULT_TOLERANCE_ENABLED:
+            assert_nccl_group_not_reconfigured(group, "CP allgather")
+        rank = mapping.cp_rank
+        group_boxed = None
+    return _allgather(input, group, rank, group_boxed, dim, sizes)
 
 
 def alltoall_helix(
@@ -357,6 +383,16 @@ def alltoall_helix(
         For each group of input tensors (of size group size),
         there is one output tensor with shape (group size, *input shape).
     '''
+    if NCCL_FAULT_TOLERANCE_ENABLED and not mpi_disabled():
+        original_group = list(group)
+        group = resolve_nccl_group(original_group)
+        if group != original_group:
+            raise RuntimeError(
+                "NCCL error: Helix alltoall cannot use survivor-only "
+                f"communicator {group} for statically sharded CP group "
+                f"{original_group}; redistribute the missing rank's state "
+                "and rebuild the mapping before resuming")
+
     n_ranks = len(group)
     if n_ranks == 1:
         return inputs
@@ -459,11 +495,20 @@ def reducescatter(
     dim: int = -1,
     sizes: Optional[List[int]] = None,
 ) -> Union[torch.Tensor, List[torch.Tensor]]:
-    if mapping.tp_size == 1:
+    if mpi_disabled():
+        group = mapping.tp_group
+        group_size = mapping.tp_size
+    else:
+        group = mapping.tp_group
+        if NCCL_FAULT_TOLERANCE_ENABLED:
+            assert_nccl_group_not_reconfigured(group, "reducescatter")
+        group_size = len(group)
+
+    if group_size == 1:
         return input
 
     if sizes is not None:
-        assert len(sizes) == len(mapping.tp_group)
+        assert len(sizes) == group_size
         sum_split_size = sum(sizes)
         if isinstance(input, torch.Tensor):
             assert input.shape[dim] == sum_split_size
@@ -479,7 +524,7 @@ def reducescatter(
             x = x.contiguous().view(-1, x_info['numel_base'])
         else:
             if sizes is None:
-                x_list = x.chunk(mapping.tp_size, dim=dim)
+                x_list = x.chunk(group_size, dim=dim)
             else:
                 x_list = x.split(sizes, dim=dim)
             x = torch.cat([x.reshape(-1, x_info['numel_base']) for x in x_list])
@@ -505,10 +550,9 @@ def reducescatter(
         ]
 
     if mpi_disabled():
-        output = torch_op(input, sizes, mapping.tp_group,
-                          mapping.tp_group_pg.boxed())
+        output = torch_op(input, sizes, group, mapping.tp_group_pg.boxed())
     else:
-        output = torch_op(input, sizes, mapping.tp_group)
+        output = torch_op(input, sizes, group)
 
     if isinstance(input, torch.Tensor):
         output = output.view(output_info['output_shape'])
@@ -701,11 +745,22 @@ class AllReduce(nn.Module):
         """
 
         self.mapping = mapping
+        self._tp_group_tuple = tuple(mapping.tp_group)
         self.workspace = None
         self.strategy = strategy
         self.mnnvl_allreduce = None
         self.symm_mem_allreduce = None
         self._disable_mpi = mpi_disabled()
+        self._fault_tolerant_raw_nccl = (NCCL_FAULT_TOLERANCE_ENABLED
+                                         and not self._disable_mpi)
+
+        if (self._fault_tolerant_raw_nccl and self.strategy
+                not in (AllReduceStrategy.AUTO, AllReduceStrategy.NCCL)):
+            strategy_name = AllReduceStrategy(self.strategy).name
+            raise RuntimeError(
+                "NCCL error: TLLM_FAULT_TOLERANCE_MODE=1 requires a "
+                "watchdog-managed NCCL allreduce; strategy "
+                f"{strategy_name} has no peer-failure abort path")
 
         self.all_reduce_op = torch.ops.trtllm.allreduce_pg if self._disable_mpi else torch.ops.trtllm.allreduce
 
@@ -729,7 +784,8 @@ class AllReduce(nn.Module):
 
         if self.mapping.tp_size > 1 and not self.mapping.enable_attention_dp:
             # Initialize Symmetric Memory AllReduce if needed (before workspace allocation)
-            if self.strategy == AllReduceStrategy.SYMM_MEM:
+            if (not self._fault_tolerant_raw_nccl
+                    and self.strategy == AllReduceStrategy.SYMM_MEM):
                 try:
                     symm_mem = SymmetricMemoryAllReduce(
                         self.mapping,
@@ -758,7 +814,8 @@ class AllReduce(nn.Module):
             # Allocate workspace for strategies that need it
             # Note: SYMM_MEM now also needs workspace for fallback scenarios (fused ops, etc.)
             # Only UB doesn't need workspace
-            if self.strategy != AllReduceStrategy.UB:
+            if (not self._fault_tolerant_raw_nccl
+                    and self.strategy != AllReduceStrategy.UB):
                 if self.strategy == AllReduceStrategy.LOWPRECISION:
                     allocate_low_presicion_allreduce_workspace(self.mapping)
                 if self.strategy not in (AllReduceStrategy.UB,
@@ -767,8 +824,8 @@ class AllReduce(nn.Module):
                     self.workspace = get_allreduce_workspace(self.mapping)
 
             # Initialize MNNVL if using AUTO or MNNVL strategy
-            if self.strategy in (AllReduceStrategy.AUTO,
-                                 AllReduceStrategy.MNNVL):
+            if (not self._fault_tolerant_raw_nccl and self.strategy
+                    in (AllReduceStrategy.AUTO, AllReduceStrategy.MNNVL)):
                 # Try to initialize MNNVL
                 if MNNVLAllReduce.is_mnnvl(self.mapping, dtype):
                     # ALWAYS capture the exception when creating this instance
@@ -791,6 +848,12 @@ class AllReduce(nn.Module):
         Requires TLLM_NCCL_SYMMETRIC_ZERO_COPY=1 AND NCCL_SYMMETRIC/NCCL/AUTO
         strategy AND tp_size > 1 AND MPI not disabled.
         """
+        if (NCCL_FAULT_TOLERANCE_ENABLED and not self._disable_mpi
+                and is_nccl_group_reconfigured(self._tp_group_tuple)):
+            # Window registration and its allocation workspace belong to the
+            # original communicator. Forward will reject the incomplete static
+            # shard; avoid allocating another stale window before that check.
+            return False
         return (_NCCL_SYMMETRIC_ZERO_COPY and self.strategy
                 in (AllReduceStrategy.NCCL_SYMMETRIC, AllReduceStrategy.NCCL,
                     AllReduceStrategy.AUTO) and self.mapping.tp_size > 1
@@ -802,8 +865,9 @@ class AllReduce(nn.Module):
         be passed into this allreduce.
 
         Returns int(BufferKind.NCCL_WINDOW) when zero-copy window output is
-        active, int(BufferKind.DEFAULT) otherwise.  The value depends solely on
-        compile-time constants so it is safe to branch on inside torch.compile.
+        active, int(BufferKind.DEFAULT) otherwise. Dynamo guards the survivor
+        registry lookup and recompiles after membership is published at the
+        recovery safe point, so this remains safe inside ``torch.compile``.
         """
         return (int(BufferKind.NCCL_WINDOW)
                 if self.uses_nccl_symmetric_memory_window() else int(
@@ -844,23 +908,36 @@ class AllReduce(nn.Module):
                                          == False):
             return input
 
+        active_group = self.mapping.tp_group
+        if NCCL_FAULT_TOLERANCE_ENABLED and not self._disable_mpi:
+            assert_nccl_group_not_reconfigured(self._tp_group_tuple,
+                                               "allreduce")
+
         input = input.contiguous()  # Underlying op requires contiguous input
 
         allreduce_strategy = self.strategy
+        if (self._fault_tolerant_raw_nccl
+                and allreduce_strategy == AllReduceStrategy.AUTO):
+            # AUTO includes one-shot/two-shot and other custom transports with
+            # no abort hook. NCCL_SYMMETRIC also performs MPI-local topology
+            # discovery, whose communicator may still contain the dead rank.
+            allreduce_strategy = AllReduceStrategy.NCCL
 
         if all_reduce_params is None:
             all_reduce_params = AllReduceParams()
 
         # Try Symmetric Memory AllReduce first if available
         # Note: Currently only supports NONE fusion op (plain allreduce)
-        if self.symm_mem_allreduce and all_reduce_params.fusion_op == AllReduceFusionOp.NONE:
+        if (self.symm_mem_allreduce
+                and all_reduce_params.fusion_op == AllReduceFusionOp.NONE):
             symm_mem_output = self.symm_mem_allreduce(input)
             if symm_mem_output is not None:
                 logger.debug(
                     f"Using SymmetricMemoryAllReduce (MULTIMEM) for input shape {input.shape}"
                 )
                 return symm_mem_output
-        elif self.symm_mem_allreduce and all_reduce_params.fusion_op != AllReduceFusionOp.NONE:
+        elif (self.symm_mem_allreduce
+              and all_reduce_params.fusion_op != AllReduceFusionOp.NONE):
             # Log once per rank that we're skipping symm_mem due to fusion
             logger.debug_once(
                 f"Skipping SymmetricMemoryAllReduce for fused operation (fusion_op={all_reduce_params.fusion_op}), using regular allreduce",
@@ -880,7 +957,6 @@ class AllReduce(nn.Module):
         if allreduce_strategy in (AllReduceStrategy.MNNVL,
                                   AllReduceStrategy.SYMM_MEM):
             allreduce_strategy = AllReduceStrategy.AUTO
-
         additional_args = {}
         if self._disable_mpi:
             # Get ProcessGroup from mapping
@@ -896,7 +972,8 @@ class AllReduce(nn.Module):
         disable_allreduce_autotune = os.environ.get(
             "TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "0") == "1"
 
-        if allreduce_strategy == AllReduceStrategy.AUTO and not disable_allreduce_autotune and not self._disable_mpi:
+        if (allreduce_strategy == AllReduceStrategy.AUTO
+                and not disable_allreduce_autotune and not self._disable_mpi):
             output = torch.ops.trtllm.tunable_allreduce(
                 input=input,
                 residual=all_reduce_params.residual,
@@ -904,7 +981,7 @@ class AllReduce(nn.Module):
                 scale=all_reduce_params.scale,
                 bias=all_reduce_params.bias,
                 workspace=self.workspace,
-                group=self.mapping.tp_group,
+                group=active_group,
                 strategy=allreduce_strategy,
                 op=all_reduce_params.fusion_op,
                 eps=all_reduce_params.eps,
@@ -919,7 +996,7 @@ class AllReduce(nn.Module):
                 scale=all_reduce_params.scale,
                 bias=all_reduce_params.bias,
                 workspace=self.workspace,
-                group=self.mapping.tp_group,
+                group=active_group,
                 strategy=allreduce_strategy,
                 op=all_reduce_params.fusion_op,
                 eps=all_reduce_params.eps,
@@ -961,6 +1038,11 @@ class MoEAllReduce(nn.Module):
             output_hidden_states = rms_norm(output_residual, norm_weight, eps)
         """
         super().__init__()
+        if NCCL_FAULT_TOLERANCE_ENABLED and not mpi_disabled():
+            raise RuntimeError(
+                "NCCL error: MoEAllReduce uses a custom collective without a "
+                "peer-failure abort path and is unavailable while "
+                "TLLM_FAULT_TOLERANCE_MODE=1")
         self.mapping = mapping
         self.workspace = get_allreduce_workspace(self.mapping)
         # Pls keep this value in sync with the kOneShotMaxToken in moeAllReduceFusionKernels.h
@@ -1224,6 +1306,11 @@ class MiniMaxAllReduceRMS(nn.Module):
 
     def __init__(self, mapping: Mapping):
         super().__init__()
+        if NCCL_FAULT_TOLERANCE_ENABLED and not mpi_disabled():
+            raise RuntimeError(
+                "NCCL error: MiniMaxAllReduceRMS uses a custom collective "
+                "without a peer-failure abort path and is unavailable while "
+                "TLLM_FAULT_TOLERANCE_MODE=1")
         self.mapping = mapping
         self.workspace = get_allreduce_workspace(self.mapping)
 
