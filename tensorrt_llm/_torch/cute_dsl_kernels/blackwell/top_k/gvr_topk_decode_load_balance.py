@@ -218,6 +218,14 @@ class GvrTopKLBKernel:
         min_blocks_per_mp: int = 3,
         use_256bit_load: bool = True,
         enable_warp_parallel_reduce: Optional[bool] = None,
+        # Phase-4 rank-scatter (OPT-IN, default OFF). Forwarded to BOTH
+        # underlying GvrTopKKernel instances, so the long (cluster / multi-CTA)
+        # and short (single-CTA) branches use the same P4 variant. Default off
+        # matches GvrTopKKernel: rank-scatter is faster but NOT exact on
+        # arbitrary inputs (see GvrTopKKernel docstring); the exact
+        # histogram-snap is the shipped default.
+        enable_p4_rank_scatter: bool = False,
+        enable_p4_rank_scatter_exact: bool = True,
     ):
         assert cluster_size in (2, 4, 8), (
             f"cluster_size must be 2, 4, or 8 (GPC-bound); got {cluster_size}"
@@ -247,6 +255,8 @@ class GvrTopKLBKernel:
             enable_warp_parallel_reduce=enable_warp_parallel_reduce,
             compress_ratio=compress_ratio,
             return_output_values=return_output_values,
+            enable_p4_rank_scatter=enable_p4_rank_scatter,
+            enable_p4_rank_scatter_exact=enable_p4_rank_scatter_exact,
         )
         self._cluster_kernel = GvrTopKKernel(cluster_size=cluster_size, **common_kwargs)
         self._single_kernel = GvrTopKKernel(cluster_size=1, **common_kwargs)
@@ -261,6 +271,8 @@ class GvrTopKLBKernel:
         self.return_output_values = return_output_values
         self.cluster_size = cluster_size
         self.max_batch_size = max_batch_size
+        self.enable_p4_rank_scatter = enable_p4_rank_scatter
+        self.enable_p4_rank_scatter_exact = enable_p4_rank_scatter_exact
 
         # Grid fixed at worst-case for graph capture; counters gates
         # the live clusters at runtime (dead overhead < 1us on B200).
