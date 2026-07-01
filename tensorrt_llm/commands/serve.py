@@ -1,4 +1,5 @@
 import asyncio
+import atexit
 import gc
 import importlib
 import inspect
@@ -33,6 +34,7 @@ from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole,
                                               extract_disagg_cluster_config,
+                                              get_ctx_gen_server_addrs,
                                               parse_disagg_config_file,
                                               parse_metadata_server_config_file)
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs, TrtLlmArgs
@@ -1234,6 +1236,23 @@ def disaggregated(
     if schedule_style:
         disagg_cfg.schedule_style = schedule_style
 
+    # Auto-start any local router HTTP servers (router type=remote_http with
+    # auto_start=true). Children are torn down when this process exits.
+    router_http_children = _maybe_start_router_http_servers(disagg_cfg)
+
+    def _cleanup_router_http_children():
+        for child in router_http_children:
+            if child.poll() is None:
+                child.terminate()
+        for child in router_http_children:
+            try:
+                child.wait(timeout=10)
+            except Exception:
+                child.kill()
+
+    if router_http_children:
+        atexit.register(_cleanup_router_http_children)
+
     # Generate a shared deployment ID for all workers in this disagg deployment.
     # Inherited by child processes via env var; used for deduplication at query time.
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_DEPLOYMENT_ID] = uuid.uuid4().hex
@@ -1270,6 +1289,113 @@ def disaggregated(
             gc.disable()
 
         asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port, sockets=[s]))
+
+
+@click.command("router_http_server")
+@click.option("--host", type=str, default="0.0.0.0",
+              help="Host to bind the router HTTP server to.")
+@click.option("--port", type=int, required=True,
+              help="Port to bind the router HTTP server to.")
+@click.option("--server_role", type=click.Choice(["context", "generation"],
+                                                 case_sensitive=False),
+              required=True,
+              help="Namespace/role this router places for.")
+@click.option("--servers", type=str, required=True,
+              help="Comma-separated worker server URLs (host:port).")
+@click.option("--router_args", type=str, default="{}",
+              help="JSON dict of router args (type + centralized params, e.g. "
+                   '{"type":"centralized_kv_cache_aware","rank_routing_algo":"none"}).')
+@click.option("-l", "--log_level", type=click.Choice(severity_map.keys()),
+              default="info", help="The logging level.")
+def router_http_server(host: str, port: int, server_role: str, servers: str,
+                       router_args: str, log_level: str):
+    """Run a standalone HTTP router server (serves POST /select from block hashes).
+
+    Started automatically by the disaggregated command when a router is
+    configured with type=remote_http and auto_start=true; can also be run
+    directly for an out-of-process router.
+    """
+    logger.set_level(log_level)
+    from tensorrt_llm.llmapi.disagg_utils import RouterConfig, ServerRole
+    from tensorrt_llm.serve.router_http_server import create_router_http_server
+
+    args = json.loads(router_args)
+    # This process only runs the routing server; it must NOT inherit a
+    # WEB_CONCURRENCY that would fork it into multiple uvicorn workers (each
+    # would try to bind the same port / fragment routing state).
+    os.environ.pop("WEB_CONCURRENCY", None)
+
+    role = (ServerRole.CONTEXT if server_role.lower() == "context"
+            else ServerRole.GENERATION)
+    router_type = args.pop("type", "centralized_kv_cache_aware")
+    server_list = [s.strip() for s in servers.split(",") if s.strip()]
+
+    http_server = create_router_http_server(
+        RouterConfig(type=router_type, args=args, server_role=role),
+        server_list,
+        monitor_interval_s=0.0)
+    logger.info(
+        f"router_http_server: type={router_type} role={server_role} "
+        f"servers={len(server_list)} listening on {host}:{port}")
+    asyncio.run(http_server(host, port))
+
+
+def _maybe_start_router_http_servers(disagg_cfg) -> list:
+    """Fork RouterHttpServer child processes for auto_start=true remote routers.
+
+    For each of the ctx/gen router configs whose ``type == 'remote_http'`` and
+    ``args['auto_start']`` is truthy, spawn a ``trtllm-serve router_http_server``
+    child bound to the host/port parsed from ``remote_url`` and pass the
+    centralized-router params (from the same router block) through. Returns the
+    list of child ``Popen`` handles for teardown. Servers whose ``auto_start`` is
+    unset/false are assumed external and are only connected to by the client.
+    """
+    from urllib.parse import urlparse
+    children = []
+    role_cfgs = [("context", disagg_cfg.ctx_router_config),
+                 ("generation", disagg_cfg.gen_router_config)]
+    ctx_urls, gen_urls = get_ctx_gen_server_addrs(disagg_cfg.server_configs)
+    role_servers = {"context": ctx_urls, "generation": gen_urls}
+
+    for role, rcfg in role_cfgs:
+        if rcfg is None or rcfg.type != "remote_http":
+            continue
+        args = dict(rcfg.args or {})
+        if not args.get("auto_start"):
+            continue
+        remote_url = args.get("remote_url")
+        if not remote_url:
+            raise ValueError(
+                f"{role} router type=remote_http with auto_start=true requires "
+                "'remote_url'")
+        parsed = urlparse(remote_url if "://" in remote_url
+                          else f"http://{remote_url}")
+        host, port = parsed.hostname, parsed.port
+        if port is None:
+            raise ValueError(f"remote_url '{remote_url}' must include a port")
+
+        # Server-side args: everything except the client-only knobs. The wrapped
+        # router is centralized unless overridden.
+        server_args = {k: v for k, v in args.items()
+                       if k not in ("auto_start", "remote_url",
+                                    "request_timeout_s")}
+        server_args.setdefault("type", "centralized_kv_cache_aware")
+
+        env = dict(os.environ)
+        # Never fork the routing server into multiple uvicorn workers.
+        env.pop("WEB_CONCURRENCY", None)
+        command = [
+            "python3", sys.argv[0], "router_http_server",
+            "--host", host, "--port", str(port),
+            "--server_role", role,
+            "--servers", ",".join(role_servers[role]),
+            "--router_args", json.dumps(server_args),
+        ]
+        logger.info(f"Auto-starting {role} router HTTP server: {command}")
+        children.append(
+            subprocess.Popen(command, env=env, stdout=sys.stdout,
+                             stderr=sys.stderr, start_new_session=True))
+    return children
 
 
 def set_cuda_device():
@@ -1521,6 +1647,7 @@ main = DefaultGroup(
         "serve": serve,
         "disaggregated": disaggregated,
         "disaggregated_mpi_worker": disaggregated_mpi_worker,
+        "router_http_server": router_http_server,
         "mm_embedding_serve": serve_encoder
     })
 
