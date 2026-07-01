@@ -811,8 +811,6 @@ class PyTorchModelEngine(ModelEngine):
 
         self.kv_cache_dtype_byte_size = self.get_kv_cache_dtype_byte_size()
 
-        self._prepare_inputs_event: Optional[torch.cuda.Event] = None
-
         # Cache for enc-dec cross-attention stable generation steps.
         # Populated on the first CUDA-graph generation step; cleared whenever
         # the batch composition changes (new encoder request arrives).
@@ -6154,8 +6152,6 @@ class PyTorchModelEngine(ModelEngine):
                 new_tensors_device, cache_indirection_buffer,
                 num_accepted_tokens_device, req_id_to_old_request,
                 resource_manager, can_run_graph)
-            self._prepare_inputs_event = torch.cuda.Event()
-            self._prepare_inputs_event.record()
 
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
                 if not can_run_graph:
@@ -6657,11 +6653,3 @@ class PyTorchModelEngine(ModelEngine):
                                                   logits_tensor, beam_width,
                                                   token_ids, logits_row_offset)
                 logits_row_offset += beam_width
-
-    def wait_for_input_copy(self):
-        """
-        Wait for input preparation and H2D copy of previous iteration before modifying host input,
-        otherwise the input of previous iteration will be overwritten.
-        """
-        if self._prepare_inputs_event is not None:
-            self._prepare_inputs_event.synchronize()
