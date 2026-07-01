@@ -114,6 +114,22 @@ public:
         return mArena.freeBytes();
     }
 
+    /// Largest region a fully-drained arena can ever hand out (the buddy allocator's usable capacity,
+    /// rounded DOWN to minBlock<<maxOrder). A chunk larger than this can never be granted, so callers
+    /// clamp maxChunkBytes to it.
+    [[nodiscard]] std::size_t arenaCapacity() const noexcept
+    {
+        return mArena.capacity();
+    }
+
+    /// Byte size of the buddy block backing a granted region offset (0 if not allocated). The whole
+    /// block belongs to one flow, so it bounds how far a scatter may read without touching another
+    /// flow's region. IO-thread only (mirrors the rest of the scheduler).
+    [[nodiscard]] std::size_t regionBytes(std::uint64_t offset) const noexcept
+    {
+        return mArena.blockBytes(offset);
+    }
+
     [[nodiscard]] std::size_t heldCount(std::string const& flow) const;
     [[nodiscard]] std::size_t activeFlows() const;
 
