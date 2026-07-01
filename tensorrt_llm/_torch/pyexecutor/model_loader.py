@@ -6,6 +6,7 @@ import inspect
 import os
 import traceback
 import warnings
+from enum import Enum
 from typing import Callable, Optional, Tuple
 
 import torch
@@ -37,7 +38,7 @@ from ..models import AutoModelForCausalLM, LlamaForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_utils import (MODEL_CLASS_MAPPING,
                                      DecoderModelForCausalLM, MetaInitMode,
-                                     timing)
+                                     timing_metric)
 from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, maybe_create_moe_load_balancer)
 from ..virtual_memory import RestoreMode
@@ -296,6 +297,16 @@ def _apply_to_buffers_only(model: torch.nn.Module, fn):
                 module._buffers[key] = fn(buf)
 
 
+class ModelLoaderMetricNames(Enum):
+    TOTAL_MODEL_LOADING_SECONDS = "total_model_loading_seconds"
+    CHECKPOINT_PREPARATION_SECONDS = "checkpoint_preparation_seconds"
+    WEIGHT_POPULATION_SECONDS = "weight_population_seconds"
+    DRAFT_CHECKPOINT_PREPARATION_SECONDS = (
+        "draft_checkpoint_preparation_seconds")
+    DRAFT_WEIGHT_POPULATION_SECONDS = "draft_weight_population_seconds"
+    POST_LOAD_PROCESSING_SECONDS = "post_load_processing_seconds"
+
+
 class ModelLoader:
     """
     Handles the loading, configuration, and weight initialization of a PyTorch model.
@@ -351,6 +362,13 @@ class ModelLoader:
         self.weight_mapper = None
         self._weight_pool_proxy = None
         self._gms_backend = None
+        # Mostly weight loading and processing time metrics, updated when load() is called.
+        self._metrics: dict[str, float] = {}
+
+    @property
+    def metrics(self) -> dict[str, float]:
+        """Return weight loading and processing time metrics."""
+        return self._metrics
 
     @staticmethod
     def load_config_and_apply_defaults(
@@ -436,7 +454,7 @@ class ModelLoader:
         self,
         checkpoint_dir: str,
         checkpoint_loader: BaseCheckpointLoader,
-    ):
+    ) -> tuple[DecoderModelForCausalLM, MoeLoadBalancer | None]:
         """
         Loads the model, its weights, and applies necessary configurations.
 
@@ -447,12 +465,15 @@ class ModelLoader:
         Returns:
             The loaded and initialized PyTorch model.
         """
+        self._metrics = {}
         config = self._load_and_validate_config(checkpoint_dir,
                                                 checkpoint_loader)
         load_format = self.llm_args.load_format
 
-        with timing("Model init total"), maybe_create_moe_load_balancer(
-                config, self.mapping) as moe_load_balancer:
+        with timing_metric(
+                ModelLoaderMetricNames.TOTAL_MODEL_LOADING_SECONDS.value,
+                self._metrics), maybe_create_moe_load_balancer(
+                    config, self.mapping) as moe_load_balancer:
             try:
                 # config will be modified in-place for some models, like Qwen2
                 config_copy = copy.deepcopy(config)
@@ -594,12 +615,13 @@ class ModelLoader:
                         load_weights_kwargs[
                             "prepare_post_transform_receiver"] = self._setup_aliases
 
-                if hasattr(model, 'llm_checkpoint_dir'):
+                _checkpoint_dir = getattr(model, "llm_checkpoint_dir",
+                                          checkpoint_dir)
+                with timing_metric(
+                        ModelLoaderMetricNames.CHECKPOINT_PREPARATION_SECONDS.
+                        value, self._metrics):
                     weights = checkpoint_loader.load_weights(
-                        model.llm_checkpoint_dir, **load_weights_kwargs)
-                else:
-                    weights = checkpoint_loader.load_weights(
-                        checkpoint_dir, **load_weights_kwargs)
+                        _checkpoint_dir, **load_weights_kwargs)
 
                 # When MX P2P succeeds, weights are already in model params.
                 # A non-empty dict contains size-mismatched tensors that
@@ -609,14 +631,21 @@ class ModelLoader:
                     model, config)
 
                 if weights:
-                    self._call_load_weights(model.load_weights, weights,
-                                            self.weight_mapper)
+                    with timing_metric(
+                            ModelLoaderMetricNames.WEIGHT_POPULATION_SECONDS.
+                            value, self._metrics):
+                        self._call_load_weights(model.load_weights, weights,
+                                                self.weight_mapper)
 
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
-                    weights = checkpoint_loader.load_weights(
-                        self.spec_config.speculative_model,
-                        mapping=self.mapping)
+                    with timing_metric(
+                            ModelLoaderMetricNames.
+                            DRAFT_CHECKPOINT_PREPARATION_SECONDS.value,
+                            self._metrics):
+                        weights = checkpoint_loader.load_weights(
+                            self.spec_config.speculative_model,
+                            mapping=self.mapping)
 
                     draft_model_arch = model.draft_config.pretrained_config.architectures[
                         0]
@@ -625,8 +654,12 @@ class ModelLoader:
                     draft_weight_mapper.init_model_and_config(
                         model.draft_model, model.draft_config)
 
-                    self._call_load_weights(model.load_draft_weights, weights,
-                                            draft_weight_mapper)
+                    with timing_metric(
+                            ModelLoaderMetricNames.
+                            DRAFT_WEIGHT_POPULATION_SECONDS.value,
+                            self._metrics):
+                        self._call_load_weights(model.load_draft_weights,
+                                                weights, draft_weight_mapper)
 
             elif load_format == LoadFormat.GMS:
                 # GPU Memory Service path: weight tensors live in a
@@ -720,8 +753,12 @@ class ModelLoader:
                                 if qualification.qualified:
                                     load_weights_kwargs[
                                         "prepare_post_transform_receiver"] = self._setup_aliases
-                            weights = checkpoint_loader.load_weights(
-                                weight_source, **load_weights_kwargs)
+                            with timing_metric(
+                                    ModelLoaderMetricNames.
+                                    CHECKPOINT_PREPARATION_SECONDS.value,
+                                    self._metrics):
+                                weights = checkpoint_loader.load_weights(
+                                    weight_source, **load_weights_kwargs)
 
                             # `weights` may be:
                             #   - non-empty dict: standard mapping pipeline runs
@@ -740,9 +777,13 @@ class ModelLoader:
                             if weights:
                                 self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
                                     model, config)
-                                self._call_load_weights(model.load_weights,
-                                                        weights,
-                                                        self.weight_mapper)
+                                with timing_metric(
+                                        ModelLoaderMetricNames.
+                                        WEIGHT_POPULATION_SECONDS.value,
+                                        self._metrics):
+                                    self._call_load_weights(
+                                        model.load_weights, weights,
+                                        self.weight_mapper)
                             elif not weights_preloaded:
                                 raise RuntimeError(
                                     f"GMS RW: checkpoint loader "
@@ -754,9 +795,13 @@ class ModelLoader:
 
                             if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                             ):
-                                draft_weights = checkpoint_loader.load_weights(
-                                    self.spec_config.speculative_model,
-                                    mapping=self.mapping)
+                                with timing_metric(
+                                        ModelLoaderMetricNames.
+                                        DRAFT_CHECKPOINT_PREPARATION_SECONDS.
+                                        value, self._metrics):
+                                    draft_weights = checkpoint_loader.load_weights(
+                                        self.spec_config.speculative_model,
+                                        mapping=self.mapping)
 
                                 draft_model_arch = model.draft_config.pretrained_config.architectures[
                                     0]
@@ -766,9 +811,13 @@ class ModelLoader:
                                 draft_weight_mapper.init_model_and_config(
                                     model.draft_model, model.draft_config)
 
-                                self._call_load_weights(
-                                    model.load_draft_weights, draft_weights,
-                                    draft_weight_mapper)
+                                with timing_metric(
+                                        ModelLoaderMetricNames.
+                                        DRAFT_WEIGHT_POPULATION_SECONDS.value,
+                                        self._metrics):
+                                    self._call_load_weights(
+                                        model.load_draft_weights, draft_weights,
+                                        draft_weight_mapper)
 
                             # Run post_load hooks INSIDE the pool so any
                             # tensors they create or rebind (fused QKV,
@@ -897,56 +946,60 @@ class ModelLoader:
                 raise NotImplementedError(
                     f"No load support for load format: {load_format}")
 
-            if not gms_post_load_handled:
-                checkpoint_loader.post_load_apply(
-                    model, weights_preloaded=weights_preloaded)
-                mx_staged_receiver_path = self._should_run_mx_staged_receiver_path(
-                    checkpoint_loader,
-                    model,
-                    weights_preloaded=weights_preloaded,
-                    speculative_mode=speculative_mode,
-                    loads_draft_weights=loads_draft_weights)
-                if mx_staged_receiver_path:
-                    self._setup_aliases(model)
-                    self._mark_weights_transformed(model)
-                    self._walk_cache_state(model)
-                else:
-                    self._walk_full_post_load(model)
-                self._post_load_publish(checkpoint_loader,
-                                        model,
-                                        checkpoint_dir=checkpoint_dir,
-                                        weights_preloaded=weights_preloaded,
-                                        speculative_mode=speculative_mode,
-                                        loads_draft_weights=loads_draft_weights)
+            with timing_metric(
+                    ModelLoaderMetricNames.POST_LOAD_PROCESSING_SECONDS.value,
+                    self._metrics):
+                if not gms_post_load_handled:
+                    checkpoint_loader.post_load_apply(
+                        model, weights_preloaded=weights_preloaded)
+                    mx_staged_receiver_path = self._should_run_mx_staged_receiver_path(
+                        checkpoint_loader,
+                        model,
+                        weights_preloaded=weights_preloaded,
+                        speculative_mode=speculative_mode,
+                        loads_draft_weights=loads_draft_weights)
+                    if mx_staged_receiver_path:
+                        self._setup_aliases(model)
+                        self._mark_weights_transformed(model)
+                        self._walk_cache_state(model)
+                    else:
+                        self._walk_full_post_load(model)
+                    self._post_load_publish(
+                        checkpoint_loader,
+                        model,
+                        checkpoint_dir=checkpoint_dir,
+                        weights_preloaded=weights_preloaded,
+                        speculative_mode=speculative_mode,
+                        loads_draft_weights=loads_draft_weights)
 
-            # TODO(GMS-MOE-LB): when the (MoE, GMS) combination is enabled,
-            # `register_weight_slots_after_to_cuda` and `finalize_model`
-            # must run INSIDE `mem_pool_scope` and BEFORE `finalize_write`
-            # so MoE allocations become part of the committed layout that
-            # RO peers receive. Today they run outside the pool and after
-            # commit, which would silently produce a broken MoE routing
-            # state on RO peers — that combination is REJECTED at config
-            # time by `TorchLlmArgs.validate_gms_moe_compat` in
-            # `tensorrt_llm/llmapi/llm_args.py`. When implementing the
-            # follow-up, drop the validator gate AFTER moving these calls
-            # into the pool scope.
-            if isinstance(moe_load_balancer, MoeLoadBalancer):
-                moe_load_balancer.register_weight_slots_after_to_cuda()
-                logger.info("moe_load_balancer finalizing model...")
-                moe_load_balancer.finalize_model()
-                logger.info("moe_load_balancer finalize model done")
+                # TODO(GMS-MOE-LB): when the (MoE, GMS) combination is enabled,
+                # `register_weight_slots_after_to_cuda` and `finalize_model`
+                # must run INSIDE `mem_pool_scope` and BEFORE `finalize_write`
+                # so MoE allocations become part of the committed layout that
+                # RO peers receive. Today they run outside the pool and after
+                # commit, which would silently produce a broken MoE routing
+                # state on RO peers — that combination is REJECTED at config
+                # time by `TorchLlmArgs.validate_gms_moe_compat` in
+                # `tensorrt_llm/llmapi/llm_args.py`. When implementing the
+                # follow-up, drop the validator gate AFTER moving these calls
+                # into the pool scope.
+                if isinstance(moe_load_balancer, MoeLoadBalancer):
+                    moe_load_balancer.register_weight_slots_after_to_cuda()
+                    logger.info("moe_load_balancer finalizing model...")
+                    moe_load_balancer.finalize_model()
+                    logger.info("moe_load_balancer finalize model done")
 
-            torch.cuda.current_stream().synchronize()
-            # Reclaim segments freed during per-module post_load_weights (e.g.
-            # MegaMoE _transform_main_weights releases ~5-6 GiB of redundant
-            # weight Parameters via `.data = empty(0)` that PyTorch's caching
-            # allocator otherwise holds onto). Returning them to the driver
-            # gives downstream stages (KV cache estimation, attention workspace
-            # alloc, autotuner warmup symmetric-fabric setup) full visibility
-            # of free HBM. Single one-shot call after all modules are
-            # finalized; per-layer empty_cache here is unsafe because it can
-            # perturb NVLink barrier synchronization in multi-rank DG init.
-            torch.cuda.empty_cache()
+                torch.cuda.current_stream().synchronize()
+                # Reclaim segments freed during per-module post_load_weights (e.g.
+                # MegaMoE _transform_main_weights releases ~5-6 GiB of redundant
+                # weight Parameters via `.data = empty(0)` that PyTorch's caching
+                # allocator otherwise holds onto). Returning them to the driver
+                # gives downstream stages (KV cache estimation, attention workspace
+                # alloc, autotuner warmup symmetric-fabric setup) full visibility
+                # of free HBM. Single one-shot call after all modules are
+                # finalized; per-layer empty_cache here is unsafe because it can
+                # perturb NVLink barrier synchronization in multi-rank DG init.
+                torch.cuda.empty_cache()
 
         return model, moe_load_balancer
 

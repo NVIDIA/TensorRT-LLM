@@ -335,6 +335,7 @@ def latency_command(
         logger.info("Setting up latency benchmark.")
 
         llm = get_llm(runtime_config, kwargs)
+        startup_metrics = None if options.report_json is None else llm.startup_metrics
 
         ignore_eos = True if runtime_config.decoding_config.decoding_mode == SpeculativeDecodingMode.NONE else False
         eos_id = tokenizer.eos_token_id if not ignore_eos else -1
@@ -390,8 +391,13 @@ def latency_command(
             # For multimodal models, we need to update the metadata with the correct input lengths
             metadata = update_metadata_for_multimodal(metadata, statistics)
 
-        report_utility = ReportUtility(statistics, metadata, runtime_config,
-                                       logger, kwargs, True)
+        report_utility = ReportUtility(statistics,
+                                       metadata,
+                                       runtime_config,
+                                       logger,
+                                       kwargs,
+                                       True,
+                                       startup_metrics=startup_metrics)
         # Generate reports for statistics, output tokens, and request info.
         generate_json_report(options.report_json,
                              report_utility.get_statistics_dict)

@@ -848,6 +848,19 @@ class GenerationExecutorProxy(GenerationExecutor):
             logger.warning(f"Error fetching disaggregated params via RPC: {e}")
             return {}
 
+    def get_startup_metrics(self) -> dict:
+        """Get rank-0 startup metrics from the worker runtime via RPC."""
+        if self.rpc_client is None:
+            logger.warning(
+                "RPC client not initialized, cannot get startup metrics")
+            return {}
+        try:
+            metrics = self.rpc_client.get_startup_metrics().remote()
+            return metrics if isinstance(metrics, dict) else {}
+        except RPCError as e:
+            logger.warning(f"Error fetching startup metrics via RPC: {e}")
+            return {}
+
     def aget_stats(self, timeout: float) -> IterationResult:
         """Get iteration statistics from the runtime via RPC (async).
 

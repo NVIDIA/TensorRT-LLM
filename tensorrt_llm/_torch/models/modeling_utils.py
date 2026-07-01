@@ -7,8 +7,8 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from typing import (Any, Dict, Generic, List, Literal, Optional, Tuple, Type,
-                    TypeVar, Union)
+from typing import (Any, Dict, Generic, Iterator, List, Literal, Optional,
+                    Tuple, Type, TypeVar, Union)
 
 import torch
 from torch import nn
@@ -35,11 +35,19 @@ from ..speculative import SpecMetadata
 
 
 @contextlib.contextmanager
-def timing(message: str):
+def timing(message: str) -> Iterator[None]:
     start = time.time()
     yield
     end = time.time()
     print(f"{message} -- {(end-start):.2f}s")
+
+
+@contextlib.contextmanager
+def timing_metric(metric_name: str, metric_dict: dict[str,
+                                                      float]) -> Iterator[None]:
+    start = time.perf_counter()
+    yield
+    metric_dict[metric_name] = time.perf_counter() - start
 
 
 @dataclass

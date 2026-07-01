@@ -263,7 +263,8 @@ class ReportUtility:
                  rt_cfg: RuntimeConfig,
                  logger: Logger,
                  kwargs: Dict[str, Any],
-                 streaming: bool = False) -> None:
+                 streaming: bool = False,
+                 startup_metrics: Optional[Dict[str, Any]] = None) -> None:
         """Initialize the ReportingController.
 
         Args:
@@ -272,6 +273,8 @@ class ReportUtility:
             rt_cfg (RuntimeConfig): Configuration for the run.
             logger (Logger): A logger for logging.
             streaming (bool, optional): Streaming benchmark used. Defaults to False.
+            startup_metrics (Dict[str, Any], optional): Metrics captured while
+                initializing the model.
         """
         self.dataset_metadata = dataset_metadata
         self.rt_cfg = rt_cfg
@@ -282,6 +285,7 @@ class ReportUtility:
             self.get_max_draft_len(),
             self.rt_cfg.settings_config.max_batch_size)
         self.streaming = streaming
+        self.startup_metrics = startup_metrics
 
     def _query_gpu_info(self) -> Dict[str, Any]:
         """Query first GPU info (all GPUs must be identical for TRT-LLM)."""
@@ -402,6 +406,8 @@ class ReportUtility:
                 "version": self.rt_cfg.sw_version,
             },
         }
+        if self.startup_metrics:
+            stats_dict["startup_metrics"] = self.startup_metrics
 
         # Machine / GPU details - query only first GPU (all GPUs must be identical)
         stats_dict["machine"] = self._query_gpu_info()

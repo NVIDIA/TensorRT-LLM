@@ -2362,6 +2362,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 if kv_cache_config.tokens_per_block is not None:
                     content[
                         "tokens_per_block"] = kv_cache_config.tokens_per_block
+        content["startup_metrics"] = getattr(self.generator, "startup_metrics",
+                                             {})
         return JSONResponse(content=content)
 
     async def openai_image_generation(self, request: ImageGenerationRequest,

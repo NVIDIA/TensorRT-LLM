@@ -462,6 +462,10 @@ class GenerationExecutor(ABC):
     def get_disaggregated_params(self) -> dict:
         return {}
 
+    def get_startup_metrics(self) -> dict:
+        """Return metrics captured while initializing the executor."""
+        return {}
+
     @staticmethod
     def _create_ray_executor(
         worker_kwargs: Dict,

@@ -129,6 +129,15 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
             logger.debug(f"Error fetching kv cache capacity via RPC: {e}")
             return {}
 
+    def get_startup_metrics(self) -> dict:
+        """Get rank-0 startup metrics from the worker runtime via RPC."""
+        try:
+            metrics = self.rpc_client.get_startup_metrics().remote()
+            return metrics if isinstance(metrics, dict) else {}
+        except RPCError as e:
+            logger.warning(f"Error fetching startup metrics via RPC: {e}")
+            return {}
+
     def aget_stats(self, timeout: float) -> IterationResult:
         """Get iteration statistics from the runtime via RPC (async).
 
