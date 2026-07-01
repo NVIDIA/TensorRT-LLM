@@ -1257,6 +1257,45 @@ def disaggregated(
     # Inherited by child processes via env var; used for deduplication at query time.
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_DEPLOYMENT_ID] = uuid.uuid4().hex
 
+    metadata_server_cfg = parse_metadata_server_config_file(
+        metadata_server_config_file)
+
+    # Disable GC by default (see note below).
+    if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
+        gc.disable()
+
+    # uvicorn.Config reads WEB_CONCURRENCY into `workers`. workers>1 requires an
+    # import-string app so each spawned worker can rebuild it (a FastAPI
+    # instance is unpicklable / rejected by uvicorn). Dispatch accordingly.
+    web_concurrency = int(os.environ.get("WEB_CONCURRENCY", "1") or "1")
+
+    if web_concurrency > 1:
+        # Multi-worker: hand uvicorn the disagg_app factory (import string) plus
+        # the config via env, and let it fork WEB_CONCURRENCY workers that each
+        # rebuild the app. uvicorn binds host:port itself (no pre-bound socket).
+        from tensorrt_llm.serve.disagg_app import (
+            CONFIG_FILE_ENV, METADATA_CONFIG_FILE_ENV, METRICS_INTERVAL_ENV,
+            REQUEST_TIMEOUT_ENV, SERVER_START_TIMEOUT_ENV)
+        os.environ[CONFIG_FILE_ENV] = os.path.abspath(config_file)
+        if metadata_server_config_file:
+            os.environ[METADATA_CONFIG_FILE_ENV] = os.path.abspath(
+                metadata_server_config_file)
+        os.environ[REQUEST_TIMEOUT_ENV] = str(request_timeout)
+        os.environ[SERVER_START_TIMEOUT_ENV] = str(server_start_timeout)
+        os.environ[METRICS_INTERVAL_ENV] = str(metrics_log_interval)
+        logger.info(
+            f"Disagg server: WEB_CONCURRENCY={web_concurrency}, serving via "
+            f"uvicorn factory with {web_concurrency} worker processes.")
+        import uvicorn
+        uvicorn.run("tensorrt_llm.serve.disagg_app:create_app",
+                    factory=True,
+                    host=disagg_cfg.hostname,
+                    port=disagg_cfg.port,
+                    workers=web_concurrency,
+                    timeout_keep_alive=10)
+        return
+
+    # Single process: pre-bind the socket (also validates the port) and serve.
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.bind((disagg_cfg.hostname, disagg_cfg.port))
@@ -1265,9 +1304,6 @@ def disaggregated(
                 f"Failed to bind socket to {disagg_cfg.hostname}:{disagg_cfg.port}: {e}"
             )
 
-        metadata_server_cfg = parse_metadata_server_config_file(
-            metadata_server_config_file)
-
         server = OpenAIDisaggServer(
             config=disagg_cfg,
             req_timeout_secs=request_timeout,
@@ -1275,19 +1311,11 @@ def disaggregated(
             metadata_server_cfg=metadata_server_cfg,
             metrics_interval_secs=metrics_log_interval)
 
-        # Disable GC by default
         #   When concurrency is high, the number of Python objects increases, so
         #   GC runs frequently and takes a long time to process. In this case,
         #   requests are not immediately forwarded to CTX workers and GEN workers,
         #   causing them to run with small batch sizes. Disabling GC can mitigate
         #   this problem.
-        #   By testing this feature, we didn't observe significant RSS or VMS
-        #   increment, and observed that `count0` (obtained by `gc.get_count()`)
-        #   increases by fewer than 1,000 after every 200,000 requests, while the
-        #   maximum value of `count0` exceeded 3,000,000 during the test.
-        if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
-            gc.disable()
-
         asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port, sockets=[s]))
 
 

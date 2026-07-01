@@ -137,9 +137,15 @@ class RouterHttpServer:
         return JSONResponse(content={"version": VERSION})
 
     async def __call__(self, host: str, port: int) -> None:
+        # The router server is intentionally single-process: it owns the routing
+        # state (and, for a wrapped centralized router, the single ZMQ ingest
+        # bind). workers=1 is forced so a leaked WEB_CONCURRENCY can never fork
+        # it into multiple processes that would fragment state / collide on the
+        # port.
         config = uvicorn.Config(self.app,
                                 host=host,
                                 port=port,
+                                workers=1,
                                 log_level="info",
                                 timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
         await uvicorn.Server(config).serve()
