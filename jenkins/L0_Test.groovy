@@ -2204,7 +2204,6 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
     checkStageName([stageName])
     def Boolean stageIsInterrupted = false
     def Boolean stageIsFailed = true
-    def Boolean hasTimeoutTest = false
     Throwable caughtError = null
     try {
         taskRunner()
@@ -2220,12 +2219,6 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
         if (stageIsInterrupted) {
             echo "Stage is interrupted, skip to upload test result."
         } else {
-            // Generate timeout test result xml if there are terminated unexpectedly tests
-            hasTimeoutTest = generateTimeoutTestResultXml(pipeline, stageName) as Boolean
-            if (hasTimeoutTest) {
-                echo "There is a terminated unexpectedly test, stage is failed."
-                stageIsFailed = true
-            }
             // Temporarily disable to reduce the log size
             // sh 'if [ "$(id -u)" -eq 0 ]; then dmesg || true; fi'
             if (noResultIfSuccess && !stageIsFailed) {
@@ -2266,6 +2259,9 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             if (stageIsFailed && !suppressTestReporting) {
                 if (stageIsInterrupted) {
                     echo "Stage is interrupted, skip to generate terminated unexpectedly test result."
+                } else if (!fileExists("${stageName}/results-timeout.xml")) {
+                    // Generate timeout test result xml if there are terminated unexpectedly tests
+                    generateTimeoutTestResultXml(pipeline, stageName)
                 }
                 // Generate stage fail test result xml if the stage failed and there is no result*.xml
                 def stageXml = generateStageFailTestResultXml(stageName, "Stage Failed", "Stage run failed without result", "results*.xml")
@@ -2292,13 +2288,6 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             pwd && ls -alh
             rm -rf ./*
         """
-
-        // If tests timed out but the stage itself did not throw (try block succeeded),
-        // we must explicitly fail here so Jenkins marks the stage red. Results and
-        // junit() have already been uploaded above before the workspace was cleaned.
-        if (hasTimeoutTest && caughtError == null) {
-            error("Stage failed: tests terminated unexpectedly")
-        }
 
         echo "Finished test stage execution."
     }
@@ -3734,6 +3723,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
         if (rerunFailed) {
             error "Some tests still failed after rerun attempts, please check the test report."
+        }
+
+        hasTimeoutTest = generateTimeoutTestResultXml(pipeline, stageName)
+        if (hasTimeoutTest) {
+            error "Some tests terminated unexpectedly, please check the test report."
         }
 
         if (perfMode) {
