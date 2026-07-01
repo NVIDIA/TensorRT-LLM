@@ -131,6 +131,18 @@ class BaseResourceManager(ABC):
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         pass
 
+    def is_request_resident_ready(self, request: LlmRequest) -> bool:
+        """Non-blocking check that *request*'s resources are GPU-resident.
+
+        Version-agnostic contract for the scheduler's residency-deferral
+        gate.  Returns ``True`` when the request's blocks are on-device and
+        ready for the forward pass, ``False`` when an offload/onboard
+        transfer is still in flight.  MUST NOT block the host or a CUDA
+        stream.  The default assumes always-resident (no deferral); managers
+        that offload KV blocks (e.g. ``KVCacheManagerV2``) override this.
+        """
+        return True
+
     def update_resources(self, scheduled_batch: ScheduledRequests):
         pass
 

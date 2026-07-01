@@ -1214,6 +1214,28 @@ class _KVCache:
     def is_active(self) -> bool:
         return self.status == self.Status.ACTIVE
 
+    def is_resident_ready(self) -> bool:
+        """Non-blocking poll: are all active GPU pages' transfers complete?
+
+        Backs the scheduler's residency-deferral gate.  An onboarding
+        (host->GPU) transfer dispatched by ``resume()`` records a
+        ``ready_event`` on every recalled page; this iterates the active
+        pages and returns ``False`` as soon as one page's event is still
+        pending (``cuEventQuery`` == not-ready), or ``True`` when every page
+        is resident.  It never blocks the host or the compute stream.
+
+        ``query_complete()`` closes events that have completed, so the
+        eventual lock-wait on the same event becomes a no-op — polling only
+        makes the later admit cheaper.
+        """
+        for ordinal, beam_idx, lc_idx in self._active_pages():
+            page = self._page(ordinal, beam_idx, lc_idx)
+            if page is None:
+                continue
+            if not page.page.ready_event.query_complete():
+                return False
+        return True
+
     @property
     def tokens_per_block(self) -> int:
         return self._tokens_per_block

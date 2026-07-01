@@ -165,6 +165,14 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.draft_kv_cache_manager = draft_kv_cache_manager
         self.cross_kv_cache_manager = cross_kv_cache_manager
         self.enable_prefix_aware_scheduling = enable_prefix_aware_scheduling
+        # Residency deferral: skip a request whose onboarded KV blocks are not
+        # yet GPU-resident (non-blocking poll) so the rest of the batch can
+        # launch now, bounded by a per-request deadline. Sourced from the KV
+        # cache config via the manager so the gate stays version-agnostic.
+        self.enable_residency_deferral = getattr(
+            kv_cache_manager, "enable_residency_deferral", False
+        )
+        self.max_resident_wait_iters = getattr(kv_cache_manager, "max_resident_wait_iters", 2)
         if scheduler_policy != CapacitySchedulerPolicy.MAX_UTILIZATION:
             logger.warning(
                 "KVCacheV2Scheduler only supports MAX_UTILIZATION for now, "
@@ -431,6 +439,44 @@ class KVCacheV2Scheduler(RequestScheduler):
 
     # ---- Per-type scheduling methods ----
 
+    def _should_defer_for_residency(self, req: LlmRequest, budget: BudgetTracker) -> bool:
+        """Decide whether to defer *req* one iteration for KV residency.
+
+        Returns True (skip this iter) only when residency deferral is
+        enabled, deferring would still leave useful forward work in the
+        batch, the request's onboarded (host->GPU) KV blocks are not yet
+        resident (non-blocking poll), and the request has not exhausted its
+        deferral deadline.
+
+        Must be called AFTER ``prepare_context`` (which dispatches the
+        non-blocking onboard) and BEFORE ``resize_context`` (which may
+        host-block on the transfer), so a not-ready request never reaches the
+        blocking wait and its capacity is never grown this iter — nothing to
+        revert on skip, and the ``_KVCache`` stays active so the next iter's
+        ``prepare_context`` re-polls the same event without re-dispatching.
+
+        Uses ``req.py_resident_wait_iters`` as the per-request deadline
+        counter: incremented on each defer, reset to 0 once the request is
+        admitted (resident, deadline hit, or small-batch guard).
+        """
+        if not self.enable_residency_deferral:
+            return False
+        # Small-batch guard: never defer if nothing else is scheduled yet, so
+        # a forward pass always runs (never defer the only schedulable work).
+        if budget.num_requests == 0:
+            return False
+        if self.kv_cache_manager.is_request_resident_ready(req):
+            req.py_resident_wait_iters = 0
+            return False
+        # Deadline fallback: bound TTFT and prevent starvation. Forcing a
+        # not-ready request in just host-blocks on the transfer as today.
+        waited = getattr(req, "py_resident_wait_iters", 0)
+        if waited >= self.max_resident_wait_iters:
+            req.py_resident_wait_iters = 0
+            return False
+        req.py_resident_wait_iters = waited + 1
+        return True
+
     def _try_schedule_encoder(
         self, req: LlmRequest, budget: BudgetTracker
     ) -> tuple[ScheduleAction, int]:
@@ -478,6 +524,11 @@ class KVCacheV2Scheduler(RequestScheduler):
             logger.debug("prepare_context failed for disagg gen init request %s", req.py_request_id)
             return ScheduleAction.SKIP, 0
 
+        # Defer (skip) if onboarded KV blocks aren't resident yet, before
+        # resize_context reserves capacity (see _should_defer_for_residency).
+        if self._should_defer_for_residency(req, budget):
+            return ScheduleAction.SKIP, 0
+
         if not self.kv_cache_manager.resize_context(
             req, req.context_remaining_length + get_draft_token_length(req)
         ):
@@ -523,6 +574,12 @@ class KVCacheV2Scheduler(RequestScheduler):
             logger.debug(f"prepare_context failed for context request {req.py_request_id}")
             return ScheduleAction.STOP, 0, False
 
+        # Defer (skip) if onboarded KV blocks aren't resident yet. Gated
+        # before resize_context so no capacity grows and the cache stays
+        # active for a re-poll next iter (see _should_defer_for_residency).
+        if self._should_defer_for_residency(req, budget):
+            return ScheduleAction.SKIP, 0, False
+
         context_tokens = req.context_remaining_length
         if self.enable_prefix_aware_scheduling:
             req_tokens = context_tokens + draft_len
@@ -567,6 +624,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Prepare context (create _KVCache, block reuse, resume — no resize)
         if not self.kv_cache_manager.prepare_context(req):
             logger.debug(f"prepare_context failed for chunked context request {req.py_request_id}")
+            return ScheduleAction.SKIP, 0, False
+
+        # Defer (skip) if onboarded KV blocks aren't resident yet, before any
+        # resize grows capacity (see _should_defer_for_residency).
+        if self._should_defer_for_residency(req, budget):
             return ScheduleAction.SKIP, 0, False
 
         # Calculate chunk size from remaining budget
@@ -914,7 +976,18 @@ class KVCacheV2Scheduler(RequestScheduler):
         elif scheduled_beam_width != beam_width:
             return ScheduleAction.SKIP, 0, scheduled_beam_width, req_it_end
 
-        success = self.kv_cache_manager.try_allocate_generation(req)
+        # Resume first (dispatch the host->GPU onboard) so residency can be
+        # polled BEFORE growing capacity, mirroring the context path
+        # (prepare_context then resize_context). A not-ready onboard is thus
+        # deferred before any grow: nothing to revert, and the cache stays
+        # active (resumed) so next iter re-polls the same event and converges.
+        if self.kv_cache_manager.prepare_generation(req):
+            if self._should_defer_for_residency(req, budget):
+                return ScheduleAction.SKIP, 0, scheduled_beam_width, req_it_end
+            success = self.kv_cache_manager.resize_generation(req)
+        else:
+            # resume() could not secure GPU pages; fall through to eviction.
+            success = False
 
         if not success:
             req_it_end, success = self._try_evict_for_gen(

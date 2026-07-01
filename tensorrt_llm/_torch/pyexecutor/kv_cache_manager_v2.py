@@ -801,6 +801,11 @@ class KVCacheManagerV2(BaseResourceManager):
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
         self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
         self.disk_prefetch_num_reqs = kv_cache_config.disk_prefetch_num_reqs
+        # Residency-deferral: defer a request whose onboard transfer isn't
+        # ready yet instead of stalling the whole batch on it. See
+        # KVCacheV2Scheduler for the gate and deadline logic.
+        self.enable_residency_deferral = kv_cache_config.enable_residency_deferral
+        self.max_resident_wait_iters = kv_cache_config.max_resident_wait_iters
 
         # With pipeline parallelism, multiple microbatches can be in-flight
         # simultaneously, so we need slots for all concurrent sequences.
@@ -1283,6 +1288,22 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache = self.kv_cache_map.get(request_id)
         return kv_cache is not None and kv_cache.is_active
 
+    def is_request_resident_ready(self, request: LlmRequest) -> bool:
+        """Non-blocking poll of a request's onboard/offload transfer state.
+
+        Backs the residency-deferral gate (see
+        ``BaseResourceManager.is_request_resident_ready``).  Delegates to the
+        per-sequence ``_KVCache.is_resident_ready`` which aggregates each
+        active page's ``ready_event.query_complete()`` (``cuEventQuery``).
+
+        A request with no live KV cache (nothing dispatched yet) is treated
+        as ready so the scheduler never defers on a missing cache.
+        """
+        kv_cache = self.kv_cache_map.get(request.py_request_id)
+        if kv_cache is None or not kv_cache.is_active:
+            return True
+        return kv_cache.is_resident_ready()
+
     def _effective_draft_len(self, req: LlmRequest) -> int:
         """Draft token length to use for next-step KV capacity calculation.
 
@@ -1314,24 +1335,50 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         return current_capacity + 1 + self._effective_draft_len(req)
 
+    def prepare_generation(self, req: LlmRequest) -> bool:
+        """Resume a suspended generation request WITHOUT growing capacity.
+
+        Mirrors ``prepare_context``: for a suspended sequence this calls
+        ``resume()`` (which dispatches the host->GPU onboard) and reconnects
+        the page-index buffers, but does NOT resize.  Returns True if the
+        cache is (or becomes) active, False if the cache is missing or
+        ``resume()`` could not secure GPU pages.
+
+        Splitting resume from the grow lets the scheduler poll residency
+        (``is_request_resident_ready``) BETWEEN the two, so a not-ready onboard
+        is deferred before any capacity growth — nothing to revert, and the
+        cache stays active for an idempotent re-poll next iteration.
+        """
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None:
+            return False
+        return self._resume_and_restore(req.py_request_id, kv_cache)
+
+    def resize_generation(self, req: LlmRequest) -> bool:
+        """Grow an already-resumed generation request's capacity by 1 (+draft).
+
+        The resume/onboard must already have happened (via
+        ``prepare_generation`` or a prior ``try_allocate_generation``).
+        Records the allocated draft length for ``extend_capacity_for_tokens``,
+        then resizes.  Returns True on success, False if the cache is missing
+        or the resize failed.
+        """
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None:
+            return False
+        draft_len = self._effective_draft_len(req)
+        self._allocated_draft_lens[req.py_request_id] = draft_len
+        return kv_cache.resize(self._required_gen_capacity(req, kv_cache.capacity))
+
     def try_allocate_generation(self, req: LlmRequest) -> bool:
         """Try to allocate one additional KV cache slot for a generation request.
 
         Resumes from suspended state if needed, then resizes capacity by 1 (+
         draft tokens). Returns True on success, False if allocation failed.
         """
-        kv_cache = self.kv_cache_map.get(req.py_request_id)
-        if kv_cache is None:
+        if not self.prepare_generation(req):
             return False
-
-        if not kv_cache.is_active:
-            if not kv_cache.resume(self._stream.cuda_stream):
-                return False
-            self._restore_page_index_bufs(req.py_request_id, kv_cache)
-
-        draft_len = self._effective_draft_len(req)
-        self._allocated_draft_lens[req.py_request_id] = draft_len
-        return kv_cache.resize(self._required_gen_capacity(req, kv_cache.capacity))
+        return self.resize_generation(req)
 
     def trim_to_history(self, req: LlmRequest, history_length: int) -> bool:
         """Mark *history_length* tokens of this request's KV as historic.
