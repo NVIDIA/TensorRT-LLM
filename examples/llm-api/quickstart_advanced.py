@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import argparse
 import json
 import time
@@ -275,6 +290,9 @@ def setup_llm(args, **kwargs):
     if spec_decode_algo == 'MTP':
         if not args.use_one_model:
             print("Running MTP eagle with two model style.")
+            if args.draft_model_dir is None:
+                raise ValueError(
+                    "--draft_model_dir is required for two-model MTP")
         spec_config = MTPDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
             use_relaxed_acceptance_for_thinking=args.
@@ -282,7 +300,8 @@ def setup_llm(args, **kwargs):
             relaxed_topk=args.relaxed_topk,
             relaxed_delta=args.relaxed_delta,
             mtp_eagle_one_model=args.use_one_model,
-            speculative_model=args.model_dir)
+            speculative_model=args.model_dir
+            if args.use_one_model else args.draft_model_dir)
     elif spec_decode_algo == "EAGLE3":
         spec_config = Eagle3DecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
