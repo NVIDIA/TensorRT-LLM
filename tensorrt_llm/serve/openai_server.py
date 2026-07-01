@@ -99,9 +99,11 @@ def _has_mm_placeholders(mm_placeholder_counts: list[dict[str, int]]) -> bool:
                for count in message_counts.values())
 
 
-def _count_text_prompt_tokens(tokenizer, prompt: str) -> int | None:
+def _count_text_prompt_tokens(tokenizer, prompt: str,
+                              add_special_tokens: bool) -> int | None:
     try:
-        return len(tokenizer.encode(prompt, add_special_tokens=False))
+        return len(
+            tokenizer.encode(prompt, add_special_tokens=add_special_tokens))
     except TypeError:
         try:
             return len(tokenizer.encode(prompt))
@@ -1273,7 +1275,8 @@ class OpenAIServer(_VideoRoutesMixin):
                         chat_template_kwargs=request.chat_template_kwargs or {},
                     )
                     block_reuse_stable_token_count = _count_text_prompt_tokens(
-                        self.tokenizer, stable_prompt)
+                        self.tokenizer, stable_prompt,
+                        request.add_special_tokens)
                 prompt: str = apply_chat_template(
                     model_type=resolve_top_level_model_type(self.model_config),
                     tokenizer=self.tokenizer,

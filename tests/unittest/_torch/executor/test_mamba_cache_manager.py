@@ -12,7 +12,7 @@ import torch
 
 from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     MIN_REPLAY_HISTORY_SIZE,
@@ -20,6 +20,7 @@ from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     CppMambaHybridCacheManager,
     KVCacheManagerV2MambaHybridCacheManager,
     PythonMambaCacheManager,
+    _calc_context_stop_positions_for_request,
     _get_mamba_hybrid_pool_size,
     calc_context_stop_positions,
 )
@@ -422,6 +423,67 @@ def test_v2_hybrid_prepare_expect_chunking_points_save_last_only():
     mgr.prepare_expect_chunking_points([request])
 
     assert request.expect_chunking_points == [150]
+
+
+def test_v2_hybrid_prepare_expect_chunking_points_includes_stable_boundary():
+    mgr = object.__new__(KVCacheManagerV2MambaHybridCacheManager)
+    mgr.kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True,
+        mamba_state_cache_interval=0,
+        mamba_save_last_snapshot=True,
+    )
+    mgr.tokens_per_block = 32
+    mgr._mamba_state_cache_interval = 0
+    request = SimpleNamespace(
+        prompt_len=150,
+        py_block_reuse_stable_token_count=137,
+        expect_chunking_points=None,
+    )
+
+    mgr.prepare_expect_chunking_points([request])
+
+    assert request.expect_chunking_points == [137, 150]
+
+
+def test_v2_hybrid_stable_boundary_requires_save_last_snapshot():
+    request = SimpleNamespace(
+        prompt_len=150,
+        py_block_reuse_stable_token_count=137,
+    )
+
+    assert _calc_context_stop_positions_for_request(
+        request, tokens_per_block=32, mamba_state_cache_interval=0, save_last_snapshot=False
+    ) == [150]
+
+
+def test_v2_block_reuse_commit_limit_uses_stable_boundary_for_save_last():
+    mgr = object.__new__(KVCacheManagerV2)
+    mgr.kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True,
+        mamba_state_cache_interval=0,
+        mamba_save_last_snapshot=True,
+    )
+    request = SimpleNamespace(
+        prompt_len=150,
+        py_block_reuse_stable_token_count=137,
+    )
+
+    assert mgr._get_block_reuse_commit_limit(request) == 137
+
+
+def test_v2_block_reuse_commit_limit_ignores_stable_boundary_without_save_last():
+    mgr = object.__new__(KVCacheManagerV2)
+    mgr.kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True,
+        mamba_state_cache_interval=0,
+        mamba_save_last_snapshot=False,
+    )
+    request = SimpleNamespace(
+        prompt_len=150,
+        py_block_reuse_stable_token_count=137,
+    )
+
+    assert mgr._get_block_reuse_commit_limit(request) == 150
 
 
 def test_v2_hybrid_prepare_expect_chunking_points_clears_when_reuse_disabled():
