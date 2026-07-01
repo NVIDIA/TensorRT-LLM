@@ -1197,6 +1197,10 @@ def _mla_dsa_proj_fake(
     k_pe = hidden_states.new_empty([num_tokens, mla_layer.qk_rope_head_dim])
     latent_cache = hidden_states.new_empty(
         [num_tokens, mla_layer.kv_lora_rank + mla_layer.qk_rope_head_dim])
+    if indexer is None:
+        # DSA "shared" layer: no indexer, mirror forward_dsa_proj's early
+        # return of only the 4 base tensors (no indexer intermediates).
+        return [q, compressed_kv, k_pe, latent_cache]
     # Indexer intermediates: q_fp8, k_fp8, k_scale, weights, q_scale.
     # Under FP4 q_fp8's trailing dim is head_dim // 2 (two E2M1 codes per
     # byte) and q_scale carries one int32 per (token, head) packing four
@@ -2201,6 +2205,11 @@ class MLA(nn.Module):
         if use_short_mha_for_ctx and attn_metadata.num_generations == 0:
             return [q, compressed_kv, k_pe, latent_cache]
 
+        # DSA "shared" layer: no indexer; reuses the previous full layer's
+        # top-k (in forward_dsa_attn), so skip the projection.
+        if self.mqa.indexer is None:
+            return [q, compressed_kv, k_pe, latent_cache]
+
         # pre_indexer_proj is the CUDA-graph-safe portion: pure token-wise
         # compute (cublas_mm, rope, FP4/FP8 quantize, weight scaling) with no
         # access to batch-specific metadata or the k cache. Returns q_scale
@@ -2254,6 +2263,14 @@ class MLA(nn.Module):
 
         if use_short_mha_for_ctx and num_generations == 0:
             topk_indices = None
+        elif self.mqa.indexer is None:
+            # DSA "shared" layer: reuse the previous full layer's top-k. These
+            # are local token positions, so they are layer-agnostic; each layer
+            # applies its own paged-KV transform downstream.
+            topk_indices = getattr(attn_metadata, 'shared_topk_indices', None)
+            assert topk_indices is not None, (
+                "DSA shared layer has no top-k from a preceding full indexer "
+                "layer; check the index_topk_pattern/freq schedule.")
         else:
             q_fp8, k_fp8, k_scale, weights, q_scale = indexer_intermediates
             # Slice indexer intermediates to actual num_tokens (they were
@@ -2272,6 +2289,9 @@ class MLA(nn.Module):
                 weights,
                 q_scale=q_scale,
             )
+            # Stash for subsequent DSA "shared" layers (full -> shared reuse);
+            # unused by a dense per-layer indexer.
+            attn_metadata.shared_topk_indices = topk_indices
 
         assert output is not None, "output must be provided"
 
