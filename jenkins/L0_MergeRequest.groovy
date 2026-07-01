@@ -1461,6 +1461,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     echo "Skipping x86_64 tests (GenPostMergeBuilds mode: builds only)"
                     return
                 }
+                if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
+                    echo "Skipping x86_64 tests (PLC container scanning)"
+                    return
+                }
 
                 testStageName = "[Test-x86_64-Single-GPU] Remote Run"
                 def singleGpuTestFailed = false
@@ -1571,6 +1575,11 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 
                 if (GEN_POST_MERGE_BUILDS_ONLY) {
                     echo "Skipping SBSA tests (GenPostMergeBuilds mode: builds only)"
+                    return
+                }
+
+                if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
+                    echo "Skipping SBSA tests (PLC container scanning)"
                     return
                 }
 
@@ -1718,6 +1727,88 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         stages.remove("x86_64-Linux")
         stages.remove("SBSA-Linux")
         echo "Build-Docker-Images job is set explicitly. Both x86_64-Linux and SBSA-Linux sub-pipelines will be disabled."
+    }
+
+    def plcContainerScanningJob = [
+        "PLC Container Scanning": {
+            script {
+                stage("[Build-Release-Docker-Images] Remote Run") {
+                    try {
+                        def branch = env.gitlabBranch ? env.gitlabBranch : "main"
+                        if (globalVars[GITHUB_PR_API_URL]) {
+                            branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
+                        }
+
+                        // Force the image tag suffix to be this L0_MergeRequest BUILD_NUMBER
+                        // instead of the BuildDockerImages helper job's own counter.
+                        def shortCommit = env.gitlabCommit ? env.gitlabCommit.substring(0, 7) : "undefined"
+                        def branchTag = branch.replaceAll('/', '_')
+                        def defaultTag = "${shortCommit}-${branchTag}-${env.BUILD_NUMBER}"
+
+                        def additionalParameters = [
+                            'branch': branch,
+                            'action': "push",
+                            'triggerType': "post-merge",
+                            'runSanityCheck': false,
+                            'defaultTag': defaultTag,
+                            'buildInternalRelease': false,
+                            'buildCiImage': false,
+                            'artifactPath': ARTIFACT_PATH,
+                            'nspect_id': "",
+                            'uploadPath': UPLOAD_PATH
+                        ]
+                        launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        if (BUILD_CHECK_CHOICE == STAGE_CHOICE_IGNORE) {
+                            catchError(
+                                buildResult: 'SUCCESS',
+                                stageResult: 'FAILURE') {
+                                error "Build-Docker-Images job failed but ignored due to Jenkins configuration"
+                            }
+                        } else {
+                            throw e
+                        }
+                    }
+                }
+                stage("[NGC-Container-Compliance-Check] Run") {
+                    echo "Triggering OSS Compliance (PLC) container scan for ref: "
+                    try {
+                        def params = [
+                            string(name: 'postMergePipelineName', value: env.JOB_NAME),
+                            string(name: 'postMergeBuildNumber', value: env.BUILD_NUMBER),
+                            string(name: 'scanMode', value: 'pre_merge'),
+                            string(name: 'runSourceCodeScanning', value: 'false'),
+                            string(name: 'runContainerScanning', value: 'true'),
+                            string(name: 'runSonarQube', value: 'false'),
+                        ]
+                        def logger = new Logger(pipeline)
+                        def handle = build(
+                            job: "/LLM/helpers/PLCScanningSetup",
+                            parameters: params,
+                            propagate: false
+                        )
+                        if (handle.result != "SUCCESS") {
+                            catchError(buildResult: currentBuild.result ?: 'SUCCESS', stageResult: 'UNSTABLE') {
+                                error "Risks detected on NGC Containers"
+                            }
+                        }
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                            error "OSS Compliance Check failed: ${e.getMessage()}"
+                        }
+                    }
+                }
+            }
+        }
+    ]
+    if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
+        stages += plcContainerScanningJob
+        testFilter[(TEST_STAGE_LIST)]?.remove("NGC-Container-Scanning")
+        echo "Will run job to build ngc containers and running in-pipeline scanning for them"
     }
 
     parallelJobs = stages.collectEntries{key, value -> [key, {
