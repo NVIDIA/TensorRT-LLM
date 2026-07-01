@@ -20,8 +20,10 @@ import glob
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
+import sys
 import time
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
@@ -30,7 +32,7 @@ import yaml
 from test_common.error_utils import report_error
 from test_common.http_utils import wait_for_endpoint_ready
 
-from defs.trt_test_alternative import print_info
+from defs.trt_test_alternative import print_error, print_info
 from tensorrt_llm._utils import get_free_port
 
 from ..conftest import get_llm_root, llm_models_root
@@ -966,6 +968,68 @@ class DisaggConfig:
         self.num_gen_servers = hardware.get("num_gen_servers", 0)
 
 
+def _server_exited_abnormally(pre_terminate_rc: Optional[int], final_rc: Optional[int]) -> bool:
+    """Return True if a server subprocess died on its own or exited unexpectedly.
+
+    ``pre_terminate_rc`` is ``proc.poll()`` captured *before* we call ``terminate()``:
+    if it is non-None the process had already exited by itself (a crash when the code
+    is non-zero). Otherwise the process was still alive and we terminated it, so the
+    exit code should be the signal we sent (SIGTERM, or SIGKILL if it was escalated) --
+    anything else means it died for a reason of its own.
+    """
+    if pre_terminate_rc is not None:
+        return pre_terminate_rc != 0
+    return final_rc not in (0, -signal.SIGTERM, -signal.SIGKILL)
+
+
+def _echo_server_log_tail(
+    log_path: str,
+    label: str,
+    *,
+    pre_terminate_rc: Optional[int],
+    final_rc: Optional[int],
+    failure_reason: Optional[str] = None,
+    num_lines: int = 200,
+) -> None:
+    """Echo a failed server's log tail to the pytest console, with a clear reason.
+
+    perf-sanity redirects each ``trtllm-serve`` (ctx / gen / disagg) subprocess's
+    stdout+stderr into a file under the test output dir and never streams it to the
+    console. When a worker fails -- it *crashes* on its own, never becomes ready
+    (*timeout*), or *hangs* -- that file holds the only copy of the real error, and it
+    is lost once the temporary slurm node is reclaimed, leaving triage with just
+    "Test terminated unexpectedly" and empty stdout/stderr in the CI Report DB.
+    Echoing the tail via ``print_error`` routes it into stdout -> Jenkins Raw Log ->
+    CI Report DB stderr so the failure can be diagnosed. See NVBug 6388205.
+
+    The header states *how* the worker failed so timeout/hang (server still alive,
+    terminated by us) reads differently from a real crash (server exited on its own):
+    ``pre_terminate_rc`` is ``poll()`` captured before ``terminate()``; if non-None the
+    worker had already exited by itself. ``failure_reason`` is the repr of the exception
+    propagating out of the test (e.g. the "did not become ready within Ns" timeout), if any.
+    """
+    if pre_terminate_rc is not None:
+        status = f"crashed on its own (returncode={pre_terminate_rc})"
+    else:
+        # Still running when the test failed -> the harness terminated it. This is the
+        # timeout / hang case; final_rc is just the signal we sent (e.g. -SIGTERM).
+        status = (
+            "did not exit on its own; the harness terminated it after the test failed "
+            f"(returncode={final_rc}) -- typically a startup timeout or a hang"
+        )
+    header = f"[perf-sanity] server '{label}' {status}"
+    if failure_reason:
+        header += f"; failure: {failure_reason}"
+    header += f"; last {num_lines} lines of {log_path}:"
+    try:
+        with open(log_path, "r", errors="replace") as log_file:
+            tail = "".join(log_file.readlines()[-num_lines:])
+    except OSError as err:
+        print_error(f"{header}\n<could not read server log {log_path}: {err}>")
+        return
+    print_error(f"{header}\n{tail if tail else '<server log is empty>'}")
+
+
 class AggrTestCmds(NamedTuple):
     """Commands for aggregated server perf sanity tests."""
 
@@ -1069,8 +1133,22 @@ class AggrTestCmds(NamedTuple):
 
         finally:
             if server_proc:
+                # An exception is propagating out of the try (server never became ready
+                # -> timeout/hang, or a client failed) -> the test is failing.
+                exc = sys.exc_info()[1]
+                pre_rc = server_proc.poll()
                 server_proc.terminate()
-                server_proc.wait()
+                rc = server_proc.wait()
+                # On any failure, or if the server died on its own, dump the server log
+                # tail so the real crash/timeout/hang reason reaches the console (NVBug 6388205).
+                if exc is not None or _server_exited_abnormally(pre_rc, rc):
+                    _echo_server_log_tail(
+                        server_file_path,
+                        f"aggr:{server_idx}",
+                        pre_terminate_rc=pre_rc,
+                        final_rc=rc,
+                        failure_reason=repr(exc) if exc is not None else None,
+                    )
 
         return outputs
 
@@ -1260,6 +1338,7 @@ class DisaggTestCmds(NamedTuple):
                 self._wait_for_config_file(server_cmd[config_idx])
 
             server_cmd = add_host_port_to_cmd(server_cmd, self.hostname, port)
+            server_proc = None
             try:
                 print_info(
                     f"Starting server. disagg_serving_type: {self.disagg_serving_type} cmd is {server_cmd}"
@@ -1282,10 +1361,22 @@ class DisaggTestCmds(NamedTuple):
                     self.wait_for_benchmark_ready(benchmark_status_file)
             finally:
                 print_info(f"Server {self.disagg_serving_type} stopped")
-                server_proc.terminate()
-                server_proc.wait()
+                if server_proc is not None:
+                    exc = sys.exc_info()[1]
+                    pre_rc = server_proc.poll()
+                    server_proc.terminate()
+                    rc = server_proc.wait()
+                    if exc is not None or _server_exited_abnormally(pre_rc, rc):
+                        _echo_server_log_tail(
+                            server_file_path,
+                            f"{self.disagg_serving_type}:{server_idx}",
+                            pre_terminate_rc=pre_rc,
+                            final_rc=rc,
+                            failure_reason=repr(exc) if exc is not None else None,
+                        )
 
         elif self.disagg_serving_type == "DISAGG_SERVER":
+            disagg_server_proc = None
             try:
                 self._generate_disagg_server_config(server_idx)
                 print_info(f"Starting disagg server. cmd is {disagg_cmd}")
@@ -1307,8 +1398,19 @@ class DisaggTestCmds(NamedTuple):
                     self.wait_for_benchmark_ready(benchmark_status_file)
             finally:
                 print_info(f"Disagg server {self.disagg_serving_type} stopped")
-                disagg_server_proc.terminate()
-                disagg_server_proc.wait()
+                if disagg_server_proc is not None:
+                    exc = sys.exc_info()[1]
+                    pre_rc = disagg_server_proc.poll()
+                    disagg_server_proc.terminate()
+                    rc = disagg_server_proc.wait()
+                    if exc is not None or _server_exited_abnormally(pre_rc, rc):
+                        _echo_server_log_tail(
+                            disagg_server_file_path,
+                            f"{self.disagg_serving_type}:{server_idx}",
+                            pre_terminate_rc=pre_rc,
+                            final_rc=rc,
+                            failure_reason=repr(exc) if exc is not None else None,
+                        )
 
         elif self.disagg_serving_type == "BENCHMARK":
             try:
