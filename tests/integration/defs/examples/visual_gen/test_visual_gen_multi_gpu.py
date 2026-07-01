@@ -102,7 +102,9 @@ def _distributed_worker(rank, world_size, backend, test_fn, port, kwargs, tllm_s
     # `import tensorrt_llm` would resolve to the bindings-less source tree and crash the
     # worker. Prepend the parent's installed-package location so the child imports
     # tensorrt_llm (with compiled bindings) from the wheel before any such import.
-    if tllm_site and tllm_site not in sys.path:
+    if tllm_site:
+        tllm_site = os.path.realpath(tllm_site)
+        sys.path[:] = [path for path in sys.path if os.path.realpath(path) != tllm_site]
         sys.path.insert(0, tllm_site)
     try:
         init_distributed_worker(rank, world_size, backend, port)
@@ -116,7 +118,7 @@ def _distributed_worker(rank, world_size, backend, test_fn, port, kwargs, tllm_s
 
 def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool = True, **kwargs):
     try:
-        import tensorrt_llm
+        import tensorrt_llm.bindings as tllm_bindings
         from tensorrt_llm._utils import get_free_port
     except ImportError:
         pytest.skip("Required modules not available")
@@ -127,7 +129,7 @@ def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool =
     # Directory containing the installed tensorrt_llm package (i.e. site-packages),
     # passed to spawn workers so they prepend it to sys.path and import the wheel with
     # compiled bindings instead of the source-tree package.
-    tllm_site = os.path.dirname(os.path.dirname(os.path.abspath(tensorrt_llm.__file__)))
+    tllm_site = os.path.dirname(os.path.dirname(os.path.abspath(tllm_bindings.__file__)))
     mp.spawn(
         _distributed_worker,
         args=(world_size, backend, test_fn, port, kwargs, tllm_site),
