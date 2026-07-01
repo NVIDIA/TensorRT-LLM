@@ -20,6 +20,7 @@ backend — compose around a real backend (VANILLA/TRTLLM/FA4/CUTEDSL).
 
 """
 
+import os
 from typing import TYPE_CHECKING, Callable, ClassVar, Dict, Optional
 
 import torch
@@ -118,6 +119,20 @@ class UlyssesAttention(AttentionBackend):
         # side stream so V/Q/K pushes FIFO together without intermediate
         # barrier kernels.
         self._pending_barriers: int = 0
+
+        # Prefer UBX (caliper) > NCCL for all-to-all when available.
+        # UBX Lamport wins by 1.3–1.5x in CUDA graph mode (≥64KB payloads).
+        # Async path uses TRTLLM CE ops and is not eligible for UBX.
+        self._ub_a2a = None
+        if not async_ulysses and os.environ.get("TRTLLM_FORCE_NCCL_ALLREDUCE", "0") == "0":
+            try:
+                from ..ubx_alltoall import UBXAllToAll, _ubx_available
+
+                if _ubx_available():
+                    self._ub_a2a = UBXAllToAll(process_group)
+            except Exception:
+                pass
+
         if async_ulysses:
             device = torch.cuda.current_device()
             if device not in UlyssesAttention._side_stream_by_device:
@@ -165,7 +180,10 @@ class UlyssesAttention(AttentionBackend):
     ) -> torch.Tensor:
         batch_size = q.shape[0]
         qkv = torch.stack([q, k, v], dim=2)
-        qkv = all_to_all_5d(qkv, scatter_dim=3, gather_dim=1, process_group=self.process_group)
+        if self._ub_a2a is not None:
+            qkv = self._ub_a2a(qkv, scatter_dim=3, gather_dim=1)
+        else:
+            qkv = all_to_all_5d(qkv, scatter_dim=3, gather_dim=1, process_group=self.process_group)
 
         B, seq_len, _, Hp, D = qkv.shape
 
@@ -187,9 +205,14 @@ class UlyssesAttention(AttentionBackend):
         **kwargs,
     ) -> torch.Tensor:
         batch_size = q.shape[0]
-        q = all_to_all_4d(q, scatter_dim=2, gather_dim=1, process_group=self.process_group)
-        k = all_to_all_4d(k, scatter_dim=2, gather_dim=1, process_group=self.process_group)
-        v = all_to_all_4d(v, scatter_dim=2, gather_dim=1, process_group=self.process_group)
+        if self._ub_a2a is not None:
+            q = self._ub_a2a(q, scatter_dim=2, gather_dim=1)
+            k = self._ub_a2a(k, scatter_dim=2, gather_dim=1)
+            v = self._ub_a2a(v, scatter_dim=2, gather_dim=1)
+        else:
+            q = all_to_all_4d(q, scatter_dim=2, gather_dim=1, process_group=self.process_group)
+            k = all_to_all_4d(k, scatter_dim=2, gather_dim=1, process_group=self.process_group)
+            v = all_to_all_4d(v, scatter_dim=2, gather_dim=1, process_group=self.process_group)
 
         seq_len_full = q.shape[1]
         kv_seq_len_full = k.shape[1]
@@ -341,9 +364,12 @@ class UlyssesAttention(AttentionBackend):
                 )
             output = output.contiguous()
 
-        output = all_to_all_4d(
-            output, scatter_dim=1, gather_dim=2, process_group=self.process_group
-        )
+        if self._ub_a2a is not None:
+            output = self._ub_a2a(output, scatter_dim=1, gather_dim=2)
+        else:
+            output = all_to_all_4d(
+                output, scatter_dim=1, gather_dim=2, process_group=self.process_group
+            )
 
         return output
 
