@@ -124,7 +124,10 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
             nb::arg("cache_manager"), nb::arg("num_kv_heads_per_layer"), nb::arg("size_per_head"),
             nb::arg("tokens_per_block"), nb::arg("world_config"), nb::arg("attention_layer_num_per_pp"),
             nb::arg("dtype"), nb::arg("attention_type"), nb::arg("cache_transceiver_config") = std::nullopt,
-            nb::arg("rnn_state_manager") = nullptr, nb::arg("rnn_layer_num_per_pp") = std::vector<SizeType32>{});
+            nb::arg("rnn_state_manager") = nullptr, nb::arg("rnn_layer_num_per_pp") = std::vector<SizeType32>{},
+            nb::keep_alive<1, 2>())
+        .def_prop_ro("transfer_chunk_size_blocks", &tb::CacheTransceiver::getTransferChunkSizeBlocks)
+        .def_prop_ro("transfer_early_release_enabled", &tb::CacheTransceiver::isTransferEarlyReleaseEnabled);
 
     nb::class_<tb::CacheTransceiverComm>(m, "CacheTransceiverComm")
         .def(

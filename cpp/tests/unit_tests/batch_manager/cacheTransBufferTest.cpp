@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,8 +21,11 @@
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include <chrono>
+#include <future>
 #include <gtest/gtest.h>
 #include <memory>
+#include <thread>
 using namespace tensorrt_llm::batch_manager::kv_cache_manager;
 using namespace tensorrt_llm::runtime;
 
@@ -175,6 +178,53 @@ TEST_F(CacheTransBufferTest, TestPreAllocBufferSize2)
     }
 }
 
+TEST_F(CacheTransBufferTest, TestPreAllocBufferSizeChunked)
+{
+    pid_t pid = fork();
+    ASSERT_NE(pid, -1) << "Fork failed";
+
+    if (pid == 0)
+    {
+        SizeType32 constexpr maxBlocksPerSeq = 10;
+        SizeType32 constexpr chunkSizeBlocks = 3;
+        SizeType32 constexpr tokensPerBlock = 8;
+        // The protocol chunk size must override a smaller legacy staging cap.
+        std::optional<size_t> maxNumTokens = 2 * tokensPerBlock;
+        setenv("TRTLLM_KVCACHE_TRANSFER_CHUNK_SIZE_BLOCKS", "3", 1);
+        setenv("TRTLLM_KVCACHE_TRANSFER_USE_SYNC_BUFFER", "1", 1);
+        SetUpCacheTransBuffer(4, 2, 64, tokensPerBlock, CacheType::kSELF, maxNumTokens, maxBlocksPerSeq);
+
+        size_t const recvBufferCount = tensorrt_llm::common::getEnvRequestKVCacheConcurrent()
+            ? tensorrt_llm::common::getEnvKVCacheRecvBufferCount()
+            : 1;
+        size_t const sendBufferCount = tensorrt_llm::common::getEnvKVCacheSendMaxConcurrenceNum();
+        size_t const cacheSizeBytesPerToken = kvCacheSizePerToken(4, 2, 64, CacheType::kSELF);
+        std::map<SizeType32, SizeType32> cacheSizeBytesPerTokenPerWindow{
+            {maxBlocksPerSeq * tokensPerBlock, cacheSizeBytesPerToken}};
+        tensorrt_llm::executor::CacheTransceiverConfig cacheTransceiverConfig{
+            tensorrt_llm::executor::CacheTransceiverConfig::BackendType::UCX, maxNumTokens};
+
+        size_t const bufferSizeBytes = CacheTransBufferManager::preAllocBufferSize(
+            cacheSizeBytesPerTokenPerWindow, tokensPerBlock, cacheTransceiverConfig);
+        size_t const expectedTransferBufferSize = chunkSizeBlocks * tokensPerBlock * cacheSizeBytesPerToken;
+        auto bufferId = mTransBufferManager->assignBufferIndexForSend();
+        ASSERT_TRUE(bufferId.has_value());
+        ASSERT_TRUE(mTransBufferManager->getMaxNumTokens().has_value());
+        EXPECT_EQ(
+            mTransBufferManager->getMaxNumTokens().value(), static_cast<size_t>(chunkSizeBlocks * tokensPerBlock));
+        EXPECT_EQ(mTransBufferManager->getSendBuffer(bufferId)->getSizeInBytes(), expectedTransferBufferSize);
+        EXPECT_EQ(bufferSizeBytes,
+            mTransBufferManager->getSendBuffer(bufferId)->getSizeInBytes() * (recvBufferCount + sendBufferCount));
+        mTransBufferManager->freeBufferIndexForSend(bufferId);
+        exit(testing::Test::HasFailure() ? 1 : 0);
+    }
+
+    int status;
+    ASSERT_NE(-1, waitpid(pid, &status, 0)) << "waitpid failed";
+    ASSERT_TRUE(WIFEXITED(status)) << "Child process terminated abnormally";
+    ASSERT_EQ(0, WEXITSTATUS(status)) << "Test in child process failed";
+}
+
 TEST_F(CacheTransBufferTest, TestBufferIndexAssignment0)
 {
     pid_t pid = fork();
@@ -243,6 +293,53 @@ TEST_F(CacheTransBufferTest, TestBufferIndexAssignment0)
         ASSERT_TRUE(WIFEXITED(status)) << "Child process terminated abnormally";
         ASSERT_EQ(0, WEXITSTATUS(status)) << "Test in child process failed";
     }
+}
+
+TEST_F(CacheTransBufferTest, TestAbortRecvBufferAssignmentsWakesWaiter)
+{
+    pid_t pid = fork();
+    ASSERT_NE(pid, -1) << "Fork failed";
+
+    if (pid == 0)
+    {
+        SizeType32 constexpr maxBlocksPerSeq = 10;
+        SizeType32 constexpr tokensPerBlock = 8;
+        std::optional<size_t> const maxNumTokens = maxBlocksPerSeq * tokensPerBlock;
+        SetUpCacheTransBuffer(4, 2, 64, tokensPerBlock, CacheType::kSELF, maxNumTokens, maxBlocksPerSeq);
+
+        std::vector<std::optional<int>> quarantinedIds;
+        for (size_t i = 0; i < mTransBufferManager->getRecvBufferCount(); ++i)
+        {
+            quarantinedIds.push_back(mTransBufferManager->assignBufferIndexForRecv());
+            ASSERT_TRUE(quarantinedIds.back().has_value());
+        }
+
+        auto waiter = std::async(std::launch::async,
+            [this]
+            {
+                try
+                {
+                    static_cast<void>(mTransBufferManager->assignBufferIndexForRecv());
+                }
+                catch (std::exception const&)
+                {
+                    return true;
+                }
+                return false;
+            });
+        EXPECT_EQ(waiter.wait_for(std::chrono::milliseconds(100)), std::future_status::timeout);
+
+        mTransBufferManager->abortRecvBufferAssignments();
+        EXPECT_TRUE(mTransBufferManager->areRecvBufferAssignmentsAborted());
+        EXPECT_EQ(waiter.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+        EXPECT_TRUE(waiter.get());
+        exit(testing::Test::HasFailure() ? 1 : 0);
+    }
+
+    int status;
+    ASSERT_NE(-1, waitpid(pid, &status, 0)) << "waitpid failed";
+    ASSERT_TRUE(WIFEXITED(status)) << "Child process terminated abnormally";
+    ASSERT_EQ(0, WEXITSTATUS(status)) << "Test in child process failed";
 }
 
 TEST_F(CacheTransBufferTest, TestBufferIndexAssignment1)

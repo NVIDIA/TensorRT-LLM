@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -55,6 +55,12 @@ namespace cache_formatter_utils
 {
 
 using CacheState = executor::kv_cache::CacheState;
+
+//! \brief Chunking changes wire framing, so both peers must negotiate the same optional block count.
+inline bool hasCompatibleTransferChunkSize(CacheState const& selfConfig, CacheState const& destConfig) noexcept
+{
+    return selfConfig.getTransferChunkSizeBlocks() == destConfig.getTransferChunkSizeBlocks();
+}
 
 /**
  * @brief Check if this rank should send cache data, given a pre-computed TargetRanksInfo.

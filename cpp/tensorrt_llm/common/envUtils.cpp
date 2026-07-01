@@ -16,12 +16,16 @@
  */
 
 #include "envUtils.h"
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/stringUtils.h"
+#include <algorithm>
 #include <cstddef>
 #include <cstdlib>
+#include <exception>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -393,6 +397,51 @@ bool getEnvTryZCopyForKVCacheTransfer()
 {
     static bool const zcopyForSysmmetricKVCache = getBoolEnv("TRTLLM_TRY_ZCOPY_FOR_KVCACHE_TRANSFER");
     return zcopyForSysmmetricKVCache;
+}
+
+std::optional<runtime::SizeType32> getEnvKVCacheTransferChunkSizeBlocks()
+{
+    static auto const chunkSizeBlocks = []() -> std::optional<runtime::SizeType32>
+    {
+        constexpr char const* envName = "TRTLLM_KVCACHE_TRANSFER_CHUNK_SIZE_BLOCKS";
+        char const* const env = std::getenv(envName);
+        if (env == nullptr)
+        {
+            return std::nullopt;
+        }
+
+        std::string const valueString{env};
+        TLLM_CHECK_WITH_INFO(!valueString.empty()
+                && std::all_of(valueString.begin(), valueString.end(), [](char ch) { return ch >= '0' && ch <= '9'; }),
+            "%s must be a non-negative decimal integer, got '%s'.", envName, env);
+        size_t parsedCharacters = 0;
+        long long value = 0;
+        try
+        {
+            value = std::stoll(valueString, &parsedCharacters, 10);
+        }
+        catch (std::exception const&)
+        {
+            TLLM_THROW("%s must be a non-negative decimal integer, got '%s'.", envName, env);
+        }
+        TLLM_CHECK_WITH_INFO(parsedCharacters == valueString.size(),
+            "%s must be a non-negative decimal integer, got '%s'.", envName, env);
+        TLLM_CHECK_WITH_INFO(value <= std::numeric_limits<runtime::SizeType32>::max(),
+            "%s exceeds the supported maximum (%d), got '%s'.", envName,
+            std::numeric_limits<runtime::SizeType32>::max(), env);
+        if (value == 0)
+        {
+            return std::nullopt;
+        }
+        return static_cast<runtime::SizeType32>(value);
+    }();
+    return chunkSizeBlocks;
+}
+
+bool getEnvKVCacheTransferEarlyRelease()
+{
+    static bool const earlyRelease = getBoolEnv("TRTLLM_KVCACHE_TRANSFER_EARLY_RELEASE");
+    return earlyRelease;
 }
 
 bool getEnvForceDeterministic()

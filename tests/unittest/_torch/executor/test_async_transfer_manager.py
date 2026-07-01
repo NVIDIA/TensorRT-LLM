@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,7 +15,13 @@
 
 from unittest.mock import MagicMock
 
-from tensorrt_llm._torch.pyexecutor.py_executor import AsyncTransferManager
+import pytest
+
+from tensorrt_llm._torch.pyexecutor.py_executor import (
+    KV_CACHE_TRANSFER_CHUNK_SIZE_BLOCKS_ENV_VAR_NAME,
+    AsyncTransferManager,
+    get_kv_cache_transfer_chunk_size_blocks,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.bindings import LlmRequestState
 
@@ -49,6 +55,39 @@ def create_mock_resource_manager(
         )
 
     return resource_manager
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, None), ("0", None), ("7", 7)],
+)
+def test_chunk_size_env_parsing(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv(KV_CACHE_TRANSFER_CHUNK_SIZE_BLOCKS_ENV_VAR_NAME, raising=False)
+    else:
+        monkeypatch.setenv(KV_CACHE_TRANSFER_CHUNK_SIZE_BLOCKS_ENV_VAR_NAME, value)
+
+    assert get_kv_cache_transfer_chunk_size_blocks() == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "blocks",
+        "-1",
+        "+1",
+        "1_0",
+        "1 ",
+        " 1",
+        str(2**31),
+    ],
+)
+def test_chunk_size_env_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv(KV_CACHE_TRANSFER_CHUNK_SIZE_BLOCKS_ENV_VAR_NAME, value)
+
+    with pytest.raises(ValueError):
+        get_kv_cache_transfer_chunk_size_blocks()
 
 
 def test_start_transfer_single_request():
@@ -137,6 +176,26 @@ def test_transfer_without_storing_blocks():
 
     assert manager.end_transfer(request)
 
+    kv_cache_manager.unpin_blocks_by_id.assert_not_called()
+
+
+def test_cpp_transfer_lease_skips_coarse_pin_and_unpin():
+    """The C++ lease owns exact block pins when early release is enabled."""
+    kv_cache_manager = MagicMock()
+    resource_manager = create_mock_resource_manager(kv_cache_manager=kv_cache_manager)
+    manager = AsyncTransferManager(
+        resource_manager,
+        should_store_blocks=True,
+        use_cpp_transfer_lease=True,
+    )
+
+    request = create_mock_request(42)
+    manager.start_transfer(request)
+
+    assert manager._request_transfer_metadata[42].block_id is None
+    kv_cache_manager.store_blocks_for_reuse.assert_not_called()
+
+    assert manager.end_transfer(request)
     kv_cache_manager.unpin_blocks_by_id.assert_not_called()
 
 

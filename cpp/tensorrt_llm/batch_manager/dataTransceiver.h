@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,7 +19,9 @@
 #include <fstream>
 #include <future>
 #include <map>
+#include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
@@ -124,6 +126,8 @@ public:
     // in CacheSender, the LlmRequest is not available until the sendSync is called
     void setLlmRequest(LlmRequest const& llmRequest);
 
+    void eraseAgentSenderState(LlmRequest::RequestIdType requestId) const noexcept;
+
     void setTime(TimeNames name);
 
     void appendMeasure(LlmRequest::TimePoint start, LlmRequest::TimePoint end, size_t size);
@@ -151,6 +155,22 @@ public:
         mCounterPartRanks = std::move(ranks);
     }
 
+    void setPreAssignedBufferIds(std::unordered_map<uint8_t, size_t> bufferIds)
+    {
+        mPreAssignedBufferIds = std::move(bufferIds);
+    }
+
+    [[nodiscard]] std::optional<size_t> getPreAssignedBufferId(uint8_t kind) const
+    {
+        auto const it = mPreAssignedBufferIds.find(kind);
+        return it == mPreAssignedBufferIds.end() ? std::nullopt : std::make_optional(it->second);
+    }
+
+    [[nodiscard]] std::unordered_map<uint8_t, size_t> const& getPreAssignedBufferIds() const noexcept
+    {
+        return mPreAssignedBufferIds;
+    }
+
 private:
     std::vector<Connection const*> mConnections;
     std::vector<SizeType32> mCounterPartRanks;        // Ranks corresponding to mConnections indices
@@ -162,6 +182,9 @@ private:
     std::unique_ptr<KVCacheTimes> mTimes;
     int32_t mIndexFromEnd{0};
     BlockKey mLastBlockKey{};
+    // Agent connections are shared by remote rank, so request-owned receive
+    // slots must live in the session rather than mutable connection state.
+    std::unordered_map<uint8_t, size_t> mPreAssignedBufferIds;
 };
 
 using UniqueToken = tensorrt_llm::runtime::UniqueToken;

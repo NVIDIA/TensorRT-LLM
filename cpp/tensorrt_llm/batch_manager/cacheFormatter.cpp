@@ -36,8 +36,12 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <future>
+#include <limits>
+#include <memory>
 #include <numeric>
+#include <string_view>
 
 namespace tensorrt_llm::batch_manager
 {
@@ -178,6 +182,249 @@ void sendAllBuffers(TransferSession& session, int deviceId,
             targetInfo, pickUpConnections);
     }
 }
+
+enum class ChunkControl : uint8_t
+{
+    kAbort = 0,
+    kReceiverEntered = 1,
+    kReceiverReady = 2,
+    kSenderPrepared = 3,
+    kSenderProceed = 4,
+    kChunkComplete = 5,
+    kReceiverFinished = 6,
+    kSenderDone = 7,
+};
+
+constexpr uint8_t kChunkControlBitCount{3};
+
+executor::kv_cache::DataContext getChunkControlContext(TransferSession const& session)
+{
+    auto const& dataContext = session.getDataContext();
+    // Request data tags reserve the low byte for a channel discriminator (the data
+    // channel uses 43). The adjacent tag therefore remains request-scoped while
+    // keeping control messages out of the payload stream for MPI and UCX.
+    return executor::kv_cache::DataContext{dataContext.getTag() + 1, dataContext.getTransferTerminate()};
+}
+
+void sendChunkControl(
+    TransferSession const& session, std::vector<size_t> const& pickUpConnections, ChunkControl control)
+{
+    auto const controlContext = getChunkControlContext(session);
+    auto const& connections = session.getConnections();
+    auto const encodedControl = static_cast<uint8_t>(control);
+    for (auto const connectionIdx : pickUpConnections)
+    {
+        auto const* connection = connections.at(connectionIdx);
+        auto const* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connection);
+        if (agentConnection != nullptr)
+        {
+            // ReadySignalInfo currently carries one bool. Encode the typed control
+            // message in three ordered notifications so Agent transports get the
+            // same framing and mismatch detection as MPI/UCX without touching the
+            // staging buffer used by AgentConnection::send().
+            for (uint8_t bit = 0; bit < kChunkControlBitCount; ++bit)
+            {
+                agentConnection->sendReadySignal(controlContext, (encodedControl & (uint8_t{1} << bit)) != 0);
+            }
+        }
+        else
+        {
+            connection->send(controlContext, &encodedControl, sizeof(encodedControl));
+        }
+    }
+}
+
+ChunkControl recvChunkControl(TransferSession const& session, std::vector<size_t> const& pickUpConnections)
+{
+    auto const controlContext = getChunkControlContext(session);
+    auto const& connections = session.getConnections();
+    std::optional<uint8_t> commonControl;
+    bool controlsMatch = true;
+    bool sawAbortOrInvalidControl = false;
+
+    for (auto const connectionIdx : pickUpConnections)
+    {
+        auto const* connection = connections.at(connectionIdx);
+        auto const* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connection);
+        uint8_t encodedControl{0};
+        if (agentConnection != nullptr)
+        {
+            for (uint8_t bit = 0; bit < kChunkControlBitCount; ++bit)
+            {
+                if (agentConnection->recvReadySignal(controlContext))
+                {
+                    encodedControl |= uint8_t{1} << bit;
+                }
+            }
+        }
+        else
+        {
+            connection->recv(controlContext, &encodedControl, sizeof(encodedControl));
+        }
+
+        sawAbortOrInvalidControl |= encodedControl == static_cast<uint8_t>(ChunkControl::kAbort)
+            || encodedControl > static_cast<uint8_t>(ChunkControl::kSenderDone);
+
+        if (!commonControl.has_value())
+        {
+            commonControl = encodedControl;
+        }
+        else
+        {
+            controlsMatch &= commonControl.value() == encodedControl;
+        }
+    }
+
+    TLLM_CHECK(commonControl.has_value());
+    // Treat any peer abort, malformed value, or disagreement as a collective
+    // abort. Throwing here would strand peers that already sent a valid status
+    // and are waiting for this rank to finish the current protocol phase.
+    if (sawAbortOrInvalidControl || !controlsMatch)
+    {
+        if (!controlsMatch)
+        {
+            TLLM_LOG_WARNING("Chunked KV-cache peers returned inconsistent control messages; aborting the phase.");
+        }
+        else if (commonControl.value() > static_cast<uint8_t>(ChunkControl::kSenderDone))
+        {
+            TLLM_LOG_WARNING("Chunked KV-cache peer returned invalid control message %u; aborting the phase.",
+                static_cast<unsigned>(commonControl.value()));
+        }
+        return ChunkControl::kAbort;
+    }
+    return static_cast<ChunkControl>(commonControl.value());
+}
+
+[[noreturn]] void throwUnexpectedChunkControl(ChunkControl actual, ChunkControl expected, std::string_view phase)
+{
+    TLLM_THROW("Unexpected chunked KV-cache control message %u while waiting for %u during %s.",
+        static_cast<unsigned>(actual), static_cast<unsigned>(expected), phase.data());
+}
+
+class ChunkSetupHandshake
+{
+public:
+    enum class Role : uint8_t
+    {
+        kSender,
+        kReceiver,
+    };
+
+    ChunkSetupHandshake(TransferSession const& session, std::vector<size_t> const& pickUpConnections, Role role)
+        : mSession(session)
+        , mPickUpConnections(pickUpConnections)
+        , mRole(role)
+    {
+        if (mRole == Role::kReceiver)
+        {
+            sendChunkControl(mSession, mPickUpConnections, ChunkControl::kReceiverEntered);
+        }
+        else
+        {
+            auto const control = recvChunkControl(mSession, mPickUpConnections);
+            if (control != ChunkControl::kReceiverEntered)
+            {
+                sendChunkControl(mSession, mPickUpConnections, ChunkControl::kAbort);
+                throwUnexpectedChunkControl(control, ChunkControl::kReceiverEntered, "chunked transfer initialization");
+            }
+        }
+    }
+
+    ChunkSetupHandshake(ChunkSetupHandshake const&) = delete;
+    ChunkSetupHandshake& operator=(ChunkSetupHandshake const&) = delete;
+
+    ~ChunkSetupHandshake()
+    {
+        if (!mActive)
+        {
+            return;
+        }
+
+        // A local exception during formatter setup must wake the peer. Complete
+        // the fixed receiver-status -> sender-status -> receiver-authorization
+        // exchange so simultaneous failures do not leave stale request-scoped
+        // controls behind.
+        try
+        {
+            if (mRole == Role::kReceiver)
+            {
+                sendChunkControl(mSession, mPickUpConnections, ChunkControl::kAbort);
+                static_cast<void>(recvChunkControl(mSession, mPickUpConnections));
+                sendChunkControl(mSession, mPickUpConnections, ChunkControl::kAbort);
+            }
+            else
+            {
+                static_cast<void>(recvChunkControl(mSession, mPickUpConnections));
+                sendChunkControl(mSession, mPickUpConnections, ChunkControl::kAbort);
+                static_cast<void>(recvChunkControl(mSession, mPickUpConnections));
+            }
+        }
+        catch (std::exception const& error)
+        {
+            TLLM_LOG_WARNING("Failed to abort chunked KV-cache setup: %s", error.what());
+        }
+        catch (...)
+        {
+            TLLM_LOG_WARNING("Failed to abort chunked KV-cache setup.");
+        }
+    }
+
+    void complete()
+    {
+        TLLM_CHECK(mActive);
+        // Once the explicit exchange starts, a failure is a control-transport
+        // failure. Retrying it from the destructor could consume the next phase.
+        mActive = false;
+
+        if (mRole == Role::kReceiver)
+        {
+            sendChunkControl(mSession, mPickUpConnections, ChunkControl::kReceiverReady);
+            auto const control = recvChunkControl(mSession, mPickUpConnections);
+            auto const authorization
+                = control == ChunkControl::kSenderPrepared ? ChunkControl::kSenderProceed : ChunkControl::kAbort;
+            sendChunkControl(mSession, mPickUpConnections, authorization);
+            if (control != ChunkControl::kSenderPrepared)
+            {
+                if (control == ChunkControl::kAbort)
+                {
+                    TLLM_THROW("Sender rejected chunked KV-cache setup.");
+                }
+                throwUnexpectedChunkControl(control, ChunkControl::kSenderPrepared, "formatter setup");
+            }
+        }
+        else
+        {
+            auto const control = recvChunkControl(mSession, mPickUpConnections);
+            auto const senderStatus
+                = control == ChunkControl::kReceiverReady ? ChunkControl::kSenderPrepared : ChunkControl::kAbort;
+            sendChunkControl(mSession, mPickUpConnections, senderStatus);
+            auto const authorization = recvChunkControl(mSession, mPickUpConnections);
+            if (control != ChunkControl::kReceiverReady || authorization != ChunkControl::kSenderProceed)
+            {
+                if (control == ChunkControl::kAbort)
+                {
+                    TLLM_THROW("Receiver rejected chunked KV-cache setup.");
+                }
+                if (control != ChunkControl::kReceiverReady)
+                {
+                    throwUnexpectedChunkControl(control, ChunkControl::kReceiverReady, "formatter setup");
+                }
+                if (authorization == ChunkControl::kAbort)
+                {
+                    TLLM_THROW("Receiver denied chunked KV-cache setup authorization.");
+                }
+                throwUnexpectedChunkControl(
+                    authorization, ChunkControl::kSenderProceed, "formatter setup authorization");
+            }
+        }
+    }
+
+private:
+    TransferSession const& mSession;
+    std::vector<size_t> const& mPickUpConnections;
+    Role mRole;
+    bool mActive{true};
+};
 } // namespace tensorrt_llm::batch_manager
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
@@ -186,6 +433,21 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager
 BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
     BlockKey const& lastBlockKey, int32_t indexFromEnd, bool recvSideHasCP, SizeType32 ppSize)
 {
+    auto const leasedBlockIds = cacheManager->getTransferLeaseBlockIds(llmRequest.mRequestId);
+    if (leasedBlockIds.has_value())
+    {
+        TLLM_CHECK_WITH_INFO(cacheManager->supportsTransferLeases(),
+            "Early KV-cache release requires an active transfer lease for request %ld.", llmRequest.mRequestId);
+    }
+    auto makeAllBlockRange = [&]()
+    {
+        if (leasedBlockIds.has_value())
+        {
+            return BlockRange::fromBlockIds(*cacheManager, leasedBlockIds.value(), llmRequest.mRequestId);
+        }
+        return BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
+    };
+
     auto poolNum = cacheManager->getBlockManager().getNumPools(
         /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
 
@@ -199,7 +461,7 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
         // disable reuse path, and vwsa don't support reuse.
         bool needSendAllForWindow = common::getEnvKVCacheTransferAllBlocksForWindow();
 
-        auto blockRange = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
+        auto blockRange = makeAllBlockRange();
 
         auto const& windowsMetadata = cacheManager->getBlockManager().getWindowSizesMetadata();
 
@@ -235,6 +497,12 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
 
     TLLM_CHECK_WITH_INFO(lastBlockKey.uniqueTokens.size() > 0, "lastBlockKey must be non-empty when reuse is enabled");
 
+    if (leasedBlockIds.has_value())
+    {
+        auto requestedBlockIds = selectTransferLeaseTail(leasedBlockIds.value(), indexFromEnd);
+        return BlockRange::fromBlockIds(*cacheManager, std::move(requestedBlockIds), llmRequest.mRequestId);
+    }
+
     auto multimodalHashes = llmRequest.getMultimodalHashes();
     bool isMultimodal = multimodalHashes.has_value() && *multimodalHashes && !(*multimodalHashes)->empty();
     if (isMultimodal)
@@ -248,6 +516,24 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
     }
 
     return BlockRange::fromReuseTree(*cacheManager, lastBlockKey, indexFromEnd);
+}
+
+void enqueueUntransferredLeaseBlocksForRelease(
+    BaseKVCacheManager* cacheManager, LlmRequest::RequestIdType requestId, BlockRange const& blockRange)
+{
+    auto const leasedBlockIds = cacheManager->getTransferLeaseBlockIds(requestId);
+    if (!leasedBlockIds.has_value())
+    {
+        return;
+    }
+
+    auto untransferredBlockIds
+        = getUntransferredLeaseBlockIds(leasedBlockIds.value(), blockRange.getBlockIdsPerWindow());
+
+    if (!untransferredBlockIds.empty())
+    {
+        cacheManager->enqueueTransferLeaseRelease(requestId, std::move(untransferredBlockIds));
+    }
 }
 
 BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
@@ -371,6 +657,9 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
     auto const& connections = session.getConnections();
     auto const& selfConfig = session.getSelfState().getCacheState().value();
     auto const& destConfig = session.getOtherState().getCacheState().value();
+    auto const transferChunkSizeBlocks = selfConfig.getTransferChunkSizeBlocks();
+    TLLM_CHECK_WITH_INFO(transferChunkSizeBlocks == destConfig.getTransferChunkSizeBlocks(),
+        "Chunked KV-cache transfer configuration must match on sender and receiver.");
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
     auto indexFromEnd = session.getIndexFromEnd();
     auto& bufferManager = session.getBufferManager();
@@ -389,12 +678,22 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         return;
     }
 
+    std::optional<ChunkSetupHandshake> chunkSetupHandshake;
+    if (transferChunkSizeBlocks.has_value())
+    {
+        chunkSetupHandshake.emplace(session, pickUpConnections, ChunkSetupHandshake::Role::kSender);
+        TLLM_CHECK_WITH_INFO(pickUpConnections.size() == 1,
+            "Chunked KV-cache transfer currently requires exactly one transfer peer per participating rank; "
+            "uneven TP/PP fan-in or fan-out needs global cross-rank failure consensus.");
+    }
+
     auto& blockManager = mCacheManager->getBlockManager();
     auto const& lastBlockKey = session.getLastBlockKey();
     auto const ppSize = selfConfig.getParallelConfig().mPipelineParallelism;
     bool const recvSideHasCP = destConfig.getParallelConfig().mContextParallelism > 1;
     auto blockRange
         = getBlockRangeForSending(mCacheManager, llmRequest, lastBlockKey, indexFromEnd, recvSideHasCP, ppSize);
+    enqueueUntransferredLeaseBlocksForRelease(mCacheManager, llmRequest.mRequestId, blockRange);
     auto const numPools
         = blockManager.getNumPools(/*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
     // TODO(oargov): are we sure the other side has the same number of pools? this might not hold for pp_size>1...
@@ -412,6 +711,21 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
     }
 
     SizeType32 const numKvPools = static_cast<SizeType32>(kvWindowSizes.size());
+
+    if (transferChunkSizeBlocks.has_value())
+    {
+        TLLM_CHECK_WITH_INFO(
+            kvWindowSizes.size() == 1, "Chunked KV-cache transfer currently requires exactly one KV-cache window.");
+        TLLM_CHECK_WITH_INFO(selfConfig.getParallelConfig().mContextParallelism == 1
+                && destConfig.getParallelConfig().mContextParallelism == 1,
+            "Chunked KV-cache transfer does not support context parallelism.");
+        TLLM_CHECK_WITH_INFO(!selfConfig.hasRnnConfig() && !destConfig.hasRnnConfig(),
+            "Chunked KV-cache transfer does not support RNN or hybrid cache state.");
+        TLLM_CHECK_WITH_INFO(!common::getEnvDisaggLayerwise(),
+            "Chunked KV-cache transfer does not support layer-wise disaggregated serving.");
+        TLLM_CHECK_WITH_INFO(!common::getEnvTryZCopyForKVCacheTransfer(),
+            "Chunked KV-cache transfer does not support zero-copy KV-cache transfer.");
+    }
 
     TLLM_LOG_DEBUG("CacheFormatter::format: allWindowSizes=%zu, kvWindowSizes=%d, numPools=%d, requestId=%lu",
         allWindowSizes.size(), numKvPools, numPools, llmRequest.mRequestId);
@@ -529,6 +843,229 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         // cache blocks to the corresponding buffer.
         // 5. send the buffer to the corresponding target. Ideally, we send only once (one buffer) for each target.
 
+        if (transferChunkSizeBlocks.has_value())
+        {
+            auto const windowSize = kvWindowSizes.front();
+            auto const& allBlocks = inputKvCacheBlocksPerWindow.at(windowSize);
+            auto const& allBlockIds = blockRange.getBlockIdsPerWindow().at(windowSize);
+            TLLM_CHECK_WITH_INFO(allBlocks.size() == allBlockIds.size(),
+                "Chunked KV-cache transfer block tensors and IDs must have the same size.");
+
+            auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend();
+            BufferIndexHolder sendHolder(*mCacheTransBufferManager, cacheBufferId, /*isRecv=*/false);
+            int const peerDuplicateHeadFactor = targetInfo.mPeerDupHeadFactor;
+            TLLM_CHECK_WITH_INFO(
+                peerDuplicateHeadFactor > 0, "Chunked KV-cache transfer requires a positive duplicate-head factor.");
+            TLLM_CHECK_WITH_INFO(targetNum % peerDuplicateHeadFactor == 0,
+                "Chunked KV-cache transfer target count must be divisible by the duplicate-head factor.");
+            auto const bufferTargetNum = targetNum / peerDuplicateHeadFactor;
+            auto const ppRank = selfIdx
+                / (selfConfig.getParallelConfig().mTensorParallelism
+                    * selfConfig.getParallelConfig().mContextParallelism);
+            int const selfAttentionLayerNum = selfConfig.getParallelConfig().mAttentionLayerNumPerPP.at(ppRank);
+            TLLM_CHECK_WITH_INFO(
+                selfAttentionLayerNum > 0, "Chunked KV-cache transfer requires at least one local attention layer.");
+            auto const chunkSize = static_cast<size_t>(transferChunkSizeBlocks.value());
+            auto const chunkCount = allBlocks.size() / chunkSize + (allBlocks.size() % chunkSize != 0 ? 1 : 0);
+            TLLM_CHECK_WITH_INFO(targetNum == 0 || chunkCount <= std::numeric_limits<size_t>::max() / targetNum,
+                "Chunked KV-cache transfer measurement count overflow.");
+            std::vector<TransferSession::Measure> chunkMeasures;
+            chunkMeasures.reserve(chunkCount * targetNum);
+
+            TLLM_CHECK(chunkSetupHandshake.has_value());
+            chunkSetupHandshake->complete();
+            chunkSetupHandshake.reset();
+
+            for (size_t chunkBegin = 0; chunkBegin < allBlocks.size(); chunkBegin += chunkSize)
+            {
+                auto const chunkEnd = std::min(chunkBegin + chunkSize, allBlocks.size());
+                std::vector<runtime::ITensor::SharedPtr> outputSplitCaches;
+                std::exception_ptr preparationError;
+                try
+                {
+                    auto const chunkBlockNum = chunkEnd - chunkBegin;
+                    std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> chunkBlocksPerWindow;
+                    auto& chunkBlocks = chunkBlocksPerWindow[windowSize];
+                    chunkBlocks.assign(allBlocks.begin() + static_cast<std::ptrdiff_t>(chunkBegin),
+                        allBlocks.begin() + static_cast<std::ptrdiff_t>(chunkEnd));
+                    size_t const chunkCacheBlockSize = std::accumulate(chunkBlocks.begin(), chunkBlocks.end(),
+                        size_t{0},
+                        [](size_t size, runtime::ITensor::SharedPtr const& block) { return size + block->getSize(); });
+
+                    std::vector<size_t> bufferEleSizes(bufferTargetNum, 0);
+                    size_t const sizePerBlockPerLayerPerTP = chunkCacheBlockSize * peerDuplicateHeadFactor
+                        / targetInfo.mDomainTPSize / selfAttentionLayerNum / chunkBlockNum;
+                    size_t const numTPCaches = targetInfo.mDomainTPSize / peerDuplicateHeadFactor;
+                    for (size_t tpIdx = 0; tpIdx < numTPCaches; ++tpIdx)
+                    {
+                        for (size_t ppIdx = 0; ppIdx < targetInfo.mDomainPPSize; ++ppIdx)
+                        {
+                            size_t const bufferIdx = tpIdx * targetInfo.mDomainPPSize + ppIdx;
+                            size_t const peerLayerNum = targetInfo.getPeerPPDomainLayerNum(ppIdx);
+                            bufferEleSizes[bufferIdx] = sizePerBlockPerLayerPerTP * peerLayerNum * chunkBlockNum;
+                        }
+                    }
+
+                    auto [allocatedBuffers, bufferCoverTargetNum, onlyUseDynamicBuffer]
+                        = mCacheTransBufferManager->getOrAllocateSendBuffers(
+                            cacheBufferId, static_cast<int>(bufferTargetNum), bufferEleSizes, bufferManager);
+                    TLLM_CHECK(cacheBufferId.has_value() || onlyUseDynamicBuffer);
+                    TLLM_CHECK_WITH_INFO(bufferCoverTargetNum == bufferTargetNum,
+                        "Chunked KV-cache transfer requires one complete staging buffer per target.");
+                    outputSplitCaches = std::move(allocatedBuffers);
+
+                    executor::kv_cache::splitKVCacheDispatch(
+                        chunkBlocksPerWindow, outputSplitCaches, destConfig, selfConfig, selfIdx, bufferManager);
+                    bufferManager.getStream().synchronize();
+                    session.setTime(TransferSession::kTimePreprocess);
+
+                    auto const preAllocSendBuffer = mCacheTransBufferManager->getSendBuffer(cacheBufferId);
+                    if (preAllocSendBuffer != nullptr)
+                    {
+                        TLLM_CHECK(preAllocSendBuffer->getDataType() == chunkBlocks.front()->getDataType());
+                    }
+
+                    // Everything except the transport call is validated before
+                    // announcing payload, so a local setup error can still be
+                    // reported on the control channel without stranding recv().
+                    TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
+                    for (size_t localIdx = 0; localIdx < targetNum; ++localIdx)
+                    {
+                        auto const connectionIdx = pickUpConnections.at(localIdx);
+                        TLLM_CHECK(connectionIdx < session.getConnections().size());
+                        auto const bufferIdx = computeBufferIdx(localIdx, targetInfo);
+                        TLLM_CHECK(bufferIdx < outputSplitCaches.size());
+                        TLLM_CHECK(outputSplitCaches.at(bufferIdx) != nullptr);
+                    }
+                }
+                catch (...)
+                {
+                    preparationError = std::current_exception();
+                }
+
+                // Payload starts only after the receiver-status -> sender-status
+                // -> receiver-authorization barrier has reached consensus across
+                // every participating connection.
+                auto const receiverControl = recvChunkControl(session, pickUpConnections);
+                auto const senderStatus = !preparationError && receiverControl == ChunkControl::kReceiverReady
+                    ? ChunkControl::kSenderPrepared
+                    : ChunkControl::kAbort;
+                sendChunkControl(session, pickUpConnections, senderStatus);
+                auto const authorizationControl = recvChunkControl(session, pickUpConnections);
+                if (senderStatus != ChunkControl::kSenderPrepared
+                    || authorizationControl != ChunkControl::kSenderProceed)
+                {
+                    if (preparationError)
+                    {
+                        std::rethrow_exception(preparationError);
+                    }
+                    if (receiverControl == ChunkControl::kAbort)
+                    {
+                        TLLM_THROW("Receiver rejected a chunked KV-cache chunk.");
+                    }
+                    if (receiverControl != ChunkControl::kReceiverReady)
+                    {
+                        throwUnexpectedChunkControl(receiverControl, ChunkControl::kReceiverReady, "chunk preparation");
+                    }
+                    if (authorizationControl == ChunkControl::kAbort)
+                    {
+                        TLLM_THROW("Receiver denied chunked KV-cache payload authorization.");
+                    }
+                    throwUnexpectedChunkControl(
+                        authorizationControl, ChunkControl::kSenderProceed, "chunk payload authorization");
+                }
+
+                for (size_t localIdx = 0; localIdx < targetNum; ++localIdx)
+                {
+                    auto const connectionIdx = pickUpConnections[localIdx];
+                    auto const bufferIdx = computeBufferIdx(localIdx, targetInfo);
+                    auto const& outputBuffer = outputSplitCaches[bufferIdx];
+                    auto const startTime = LlmRequest::getSteadyClockNow();
+                    session.send(connectionIdx, outputBuffer->data(), outputBuffer->getSizeInBytes());
+                    auto const endTime = LlmRequest::getSteadyClockNow();
+                    chunkMeasures.push_back(
+                        TransferSession::Measure{startTime, endTime, outputBuffer->getSizeInBytes()});
+                }
+                session.setTime(TransferSession::kTimeTransmissions);
+
+                auto const completionControl = recvChunkControl(session, pickUpConnections);
+                if (completionControl != ChunkControl::kChunkComplete)
+                {
+                    if (completionControl == ChunkControl::kAbort)
+                    {
+                        TLLM_THROW("Receiver failed to commit a chunked KV-cache chunk.");
+                    }
+                    sendChunkControl(session, pickUpConnections, ChunkControl::kAbort);
+                    throwUnexpectedChunkControl(completionControl, ChunkControl::kChunkComplete, "chunk completion");
+                }
+
+                try
+                {
+                    if (mCacheManager->hasActiveTransferLease(llmRequest.mRequestId))
+                    {
+                        TransferBlockIds completedBlockIds;
+                        completedBlockIds.emplace(windowSize,
+                            std::vector<KVCacheBlock::IdType>(
+                                allBlockIds.begin() + static_cast<std::ptrdiff_t>(chunkBegin),
+                                allBlockIds.begin() + static_cast<std::ptrdiff_t>(chunkEnd)));
+                        mCacheManager->enqueueTransferLeaseRelease(llmRequest.mRequestId, std::move(completedBlockIds));
+                    }
+                    session.setTime(TransferSession::kTimePostprocess);
+                }
+                catch (...)
+                {
+                    auto const postprocessError = std::current_exception();
+                    try
+                    {
+                        // The receiver is either preparing the next chunk or
+                        // announcing transfer completion. Consume that boundary
+                        // message before aborting so it never waits for a reply.
+                        static_cast<void>(recvChunkControl(session, pickUpConnections));
+                        sendChunkControl(session, pickUpConnections, ChunkControl::kAbort);
+                        static_cast<void>(recvChunkControl(session, pickUpConnections));
+                    }
+                    catch (std::exception const& controlError)
+                    {
+                        TLLM_LOG_WARNING(
+                            "Failed to abort chunked KV-cache transfer after sender postprocessing for "
+                            "request %ld: %s",
+                            llmRequest.mRequestId, controlError.what());
+                    }
+                    catch (...)
+                    {
+                        TLLM_LOG_WARNING(
+                            "Failed to abort chunked KV-cache transfer after sender postprocessing for request %ld.",
+                            llmRequest.mRequestId);
+                    }
+                    std::rethrow_exception(postprocessError);
+                }
+            }
+
+            auto const receiverFinishedControl = recvChunkControl(session, pickUpConnections);
+            if (receiverFinishedControl != ChunkControl::kReceiverFinished)
+            {
+                sendChunkControl(session, pickUpConnections, ChunkControl::kAbort);
+                static_cast<void>(recvChunkControl(session, pickUpConnections));
+                if (receiverFinishedControl == ChunkControl::kAbort)
+                {
+                    TLLM_THROW("Receiver aborted chunked KV-cache transfer completion.");
+                }
+                throwUnexpectedChunkControl(
+                    receiverFinishedControl, ChunkControl::kReceiverFinished, "transfer completion");
+            }
+            sendChunkControl(session, pickUpConnections, ChunkControl::kSenderDone);
+
+            for (auto const& measure : chunkMeasures)
+            {
+                session.appendMeasure(measure.start, measure.end, measure.size);
+            }
+
+            sendHolder.release();
+            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End chunked KV-cache sending for request ID: %ld.",
+                llmRequest.mRequestId);
+            return;
+        }
+
         auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend();
         BufferIndexHolder sendHolder(*mCacheTransBufferManager, cacheBufferId, /*isRecv=*/false);
         int peerDuplicateHeadFactor = targetInfo.mPeerDupHeadFactor;
@@ -632,13 +1169,21 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
     auto const& connections = session.getConnections();
     auto const& selfConfig = session.getSelfState().getCacheState().value();
     auto const& destConfig = session.getOtherState().getCacheState().value();
+    auto const transferChunkSizeBlocks = destConfig.getTransferChunkSizeBlocks();
+    TLLM_CHECK_WITH_INFO(transferChunkSizeBlocks == selfConfig.getTransferChunkSizeBlocks(),
+        "Chunked KV-cache transfer configuration must match on sender and receiver.");
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
     auto& bufferManager = session.getBufferManager();
     auto const srcPpSize = destConfig.getParallelConfig().mPipelineParallelism;
     bool const recvSideHasCP = selfConfig.getParallelConfig().mContextParallelism > 1;
-    auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest, destConfig.getEnableBlockReuse(),
-        destConfig.getEnablePartialReuse(), recvSideHasCP, srcPpSize);
-
+    std::optional<BlockRange> blockRangeStorage;
+    if (!transferChunkSizeBlocks.has_value())
+    {
+        // Preserve the legacy feature-off ordering. Chunking moves this setup
+        // behind the entry handshake so any failure can be reported to senders.
+        blockRangeStorage.emplace(getBlockRangeForReceiving(mCacheManager, llmRequest, destConfig.getEnableBlockReuse(),
+            destConfig.getEnablePartialReuse(), recvSideHasCP, srcPpSize));
+    }
     auto pickRecvConnResult
         = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks());
     auto pickUpConnections = std::get<0>(pickRecvConnResult);
@@ -648,6 +1193,20 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
         TLLM_LOG_DEBUG("No targets to receive KV cache for request ID: %ld", llmRequest.mRequestId);
         return;
     }
+
+    std::optional<ChunkSetupHandshake> chunkSetupHandshake;
+    if (transferChunkSizeBlocks.has_value())
+    {
+        chunkSetupHandshake.emplace(session, pickUpConnections, ChunkSetupHandshake::Role::kReceiver);
+        TLLM_CHECK_WITH_INFO(pickUpConnections.size() == 1,
+            "Chunked KV-cache transfer currently requires exactly one transfer peer per participating rank; "
+            "uneven TP/PP fan-in or fan-out needs global cross-rank failure consensus.");
+        blockRangeStorage.emplace(getBlockRangeForReceiving(mCacheManager, llmRequest, destConfig.getEnableBlockReuse(),
+            destConfig.getEnablePartialReuse(), recvSideHasCP, srcPpSize));
+    }
+
+    TLLM_CHECK(blockRangeStorage.has_value());
+    auto& blockRange = blockRangeStorage.value();
 
     TLLM_LOG_DEBUG("pickUpConnections size: %d connections size: %d", pickUpConnections.size(), connections.size());
     std::vector<runtime::ITensor::SharedPtr> recvBufferTmps;
@@ -670,6 +1229,21 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
         }
     }
     SizeType32 const numKvPools = static_cast<SizeType32>(kvWindowSizes.size());
+
+    if (transferChunkSizeBlocks.has_value())
+    {
+        TLLM_CHECK_WITH_INFO(
+            kvWindowSizes.size() == 1, "Chunked KV-cache transfer currently requires exactly one KV-cache window.");
+        TLLM_CHECK_WITH_INFO(selfConfig.getParallelConfig().mContextParallelism == 1
+                && destConfig.getParallelConfig().mContextParallelism == 1,
+            "Chunked KV-cache transfer does not support context parallelism.");
+        TLLM_CHECK_WITH_INFO(!selfConfig.hasRnnConfig() && !destConfig.hasRnnConfig(),
+            "Chunked KV-cache transfer does not support RNN or hybrid cache state.");
+        TLLM_CHECK_WITH_INFO(!common::getEnvDisaggLayerwise(),
+            "Chunked KV-cache transfer does not support layer-wise disaggregated serving.");
+        TLLM_CHECK_WITH_INFO(!common::getEnvTryZCopyForKVCacheTransfer(),
+            "Chunked KV-cache transfer does not support zero-copy KV-cache transfer.");
+    }
 
     TLLM_LOG_DEBUG("CacheFormatter::unformat: allWindowSizes=%zu, kvWindowSizes=%d, numPools=%d, requestId=%lu",
         allWindowSizes.size(), numKvPools, numPools, llmRequest.mRequestId);
@@ -808,6 +1382,208 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                     ctxReqId);
                 return;
             }
+
+            if (transferChunkSizeBlocks.has_value())
+            {
+                auto const windowSize = kvWindowSizes.front();
+                auto const& allOutputBlocks = outputBuffersPerWindow.at(windowSize);
+                auto const chunkSize = static_cast<size_t>(transferChunkSizeBlocks.value());
+                auto const targetNum = pickUpConnections.size();
+                auto const targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
+                auto const ppRank = selfIdx
+                    / (selfConfig.getParallelConfig().mTensorParallelism
+                        * selfConfig.getParallelConfig().mContextParallelism);
+                int const selfAttentionLayerNum = selfConfig.getParallelConfig().mAttentionLayerNumPerPP.at(ppRank);
+                TLLM_CHECK_WITH_INFO(selfAttentionLayerNum > 0,
+                    "Chunked KV-cache transfer requires at least one local attention layer.");
+                TLLM_CHECK_WITH_INFO(
+                    targetInfo.mDomainPPSize > 0, "Chunked KV-cache transfer requires a positive PP domain size.");
+                TLLM_CHECK_WITH_INFO(targetNum % targetInfo.mDomainPPSize == 0,
+                    "Chunked KV-cache transfer target count must be divisible by the PP domain size.");
+                size_t const validTpSize = targetNum / targetInfo.mDomainPPSize;
+
+                auto const preAssignedKvId = session.getPreAssignedBufferId(static_cast<uint8_t>(BufferKind::kKV));
+                std::optional<int> cacheBufferId;
+                if (preAssignedKvId.has_value())
+                {
+                    TLLM_CHECK_WITH_INFO(
+                        preAssignedKvId.value() <= static_cast<size_t>(std::numeric_limits<int>::max()),
+                        "Preassigned receive-buffer index is out of range: %zu", preAssignedKvId.value());
+                    cacheBufferId = static_cast<int>(preAssignedKvId.value());
+                }
+                else
+                {
+                    cacheBufferId = mCacheTransBufferManager->assignBufferIndexForRecv();
+                }
+                // Agent preassigned receive buffers are owned by the request-level
+                // synchronization guard, which also covers failures before the
+                // formatter is entered. Only dynamically assigned formatter
+                // buffers are released by this local holder.
+                auto const formatterOwnedBufferId = preAssignedKvId.has_value() ? std::optional<int>{} : cacheBufferId;
+                BufferIndexHolder recvHolder(*mCacheTransBufferManager, formatterOwnedBufferId, /*isRecv=*/true);
+                auto const chunkCount
+                    = allOutputBlocks.size() / chunkSize + (allOutputBlocks.size() % chunkSize != 0 ? 1 : 0);
+                TLLM_CHECK_WITH_INFO(targetNum == 0 || chunkCount <= std::numeric_limits<size_t>::max() / targetNum,
+                    "Chunked KV-cache transfer measurement count overflow.");
+                std::vector<TransferSession::Measure> chunkMeasures;
+                chunkMeasures.reserve(chunkCount * targetNum);
+
+                TLLM_CHECK(chunkSetupHandshake.has_value());
+                chunkSetupHandshake->complete();
+                chunkSetupHandshake.reset();
+
+                for (size_t chunkBegin = 0; chunkBegin < allOutputBlocks.size(); chunkBegin += chunkSize)
+                {
+                    auto const chunkEnd = std::min(chunkBegin + chunkSize, allOutputBlocks.size());
+                    std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> chunkOutputBuffersPerWindow;
+                    std::vector<runtime::ITensor::SharedPtr> recvSplitCaches;
+                    std::exception_ptr preparationError;
+                    try
+                    {
+                        auto& chunkOutputBlocks = chunkOutputBuffersPerWindow[windowSize];
+                        chunkOutputBlocks.assign(allOutputBlocks.begin() + static_cast<std::ptrdiff_t>(chunkBegin),
+                            allOutputBlocks.begin() + static_cast<std::ptrdiff_t>(chunkEnd));
+                        size_t const chunkCacheBlockSize
+                            = std::accumulate(chunkOutputBlocks.begin(), chunkOutputBlocks.end(), size_t{0},
+                                [](size_t size, runtime::ITensor::SharedPtr const& block)
+                                { return size + block->getSize(); });
+                        TLLM_CHECK_WITH_INFO(chunkCacheBlockSize % (selfAttentionLayerNum * validTpSize) == 0,
+                            "Chunked KV-cache size must be divisible by the local layer and TP counts.");
+                        size_t const cacheBlockSizePerLayer
+                            = chunkCacheBlockSize / (selfAttentionLayerNum * validTpSize);
+
+                        std::vector<size_t> bufferEleSizes(targetNum, 0);
+                        for (size_t targetIdx = 0; targetIdx < targetNum; ++targetIdx)
+                        {
+                            auto const layerNum = targetInfo.getPeerPPDomainLayerNum(
+                                static_cast<SizeType32>(localRankIndices[targetIdx]));
+                            bufferEleSizes[targetIdx] = cacheBlockSizePerLayer * layerNum;
+                        }
+
+                        auto [allocatedBuffers, bufferCoverTargetNum, onlyUseDynamicBuffer]
+                            = mCacheTransBufferManager->getOrAllocateRecvBuffers(
+                                cacheBufferId, static_cast<int>(targetNum), bufferEleSizes, bufferManager);
+                        TLLM_CHECK(cacheBufferId.has_value() || onlyUseDynamicBuffer);
+                        TLLM_CHECK_WITH_INFO(bufferCoverTargetNum == targetNum,
+                            "Chunked KV-cache transfer requires one complete staging buffer per target.");
+                        recvSplitCaches = std::move(allocatedBuffers);
+                        bufferManager.getStream().synchronize();
+                        session.setTime(TransferSession::kTimePreprocess);
+
+                        if (cacheBufferId.has_value())
+                        {
+                            auto const preAllocRecvBuffer = mCacheTransBufferManager->getRecvBuffer(cacheBufferId);
+                            TLLM_CHECK(preAllocRecvBuffer != nullptr);
+                            TLLM_CHECK(preAllocRecvBuffer->getDataType() == chunkOutputBlocks.front()->getDataType());
+                        }
+
+                        TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
+                        for (size_t targetIdx = 0; targetIdx < targetNum; ++targetIdx)
+                        {
+                            auto const& recvBuffer = recvSplitCaches.at(targetIdx);
+                            TLLM_CHECK(recvBuffer != nullptr);
+                            TLLM_CHECK(pickUpConnections.at(targetIdx) < session.getConnections().size());
+                            llmRequest.updateKvCacheSize(recvBuffer->getSizeInBytes());
+                        }
+                    }
+                    catch (...)
+                    {
+                        preparationError = std::current_exception();
+                    }
+
+                    // Mirror the sender's three-phase barrier. In particular,
+                    // always send the final authorization, including on abort,
+                    // so otherwise healthy senders cannot enter payload transfer.
+                    sendChunkControl(session, pickUpConnections,
+                        preparationError ? ChunkControl::kAbort : ChunkControl::kReceiverReady);
+                    auto const senderStatus = recvChunkControl(session, pickUpConnections);
+                    auto const authorization = !preparationError && senderStatus == ChunkControl::kSenderPrepared
+                        ? ChunkControl::kSenderProceed
+                        : ChunkControl::kAbort;
+                    sendChunkControl(session, pickUpConnections, authorization);
+                    if (authorization != ChunkControl::kSenderProceed)
+                    {
+                        if (preparationError)
+                        {
+                            std::rethrow_exception(preparationError);
+                        }
+                        if (senderStatus == ChunkControl::kAbort)
+                        {
+                            TLLM_THROW("Sender rejected a chunked KV-cache chunk.");
+                        }
+                        throwUnexpectedChunkControl(senderStatus, ChunkControl::kSenderPrepared, "chunk preparation");
+                    }
+
+                    try
+                    {
+                        for (size_t targetIdx = 0; targetIdx < targetNum; ++targetIdx)
+                        {
+                            auto const startTime = LlmRequest::getSteadyClockNow();
+                            auto const& recvBuffer = recvSplitCaches[targetIdx];
+                            session.recv(
+                                pickUpConnections[targetIdx], recvBuffer->data(), recvBuffer->getSizeInBytes());
+                            auto const endTime = LlmRequest::getSteadyClockNow();
+                            chunkMeasures.push_back(
+                                TransferSession::Measure{startTime, endTime, recvBuffer->getSizeInBytes()});
+                        }
+                        session.setTime(TransferSession::kTimeTransmissions);
+
+                        executor::kv_cache::concatKvCacheV2Dispatch(recvSplitCaches, chunkOutputBuffersPerWindow,
+                            destConfig, selfConfig, selfIdx, bufferManager);
+                        bufferManager.getStream().synchronize();
+                        session.setTime(TransferSession::kTimePostprocess);
+                    }
+                    catch (...)
+                    {
+                        try
+                        {
+                            sendChunkControl(session, pickUpConnections, ChunkControl::kAbort);
+                        }
+                        catch (std::exception const& controlError)
+                        {
+                            TLLM_LOG_WARNING("Failed to abort chunked KV-cache transfer for request %ld: %s",
+                                llmRequest.mRequestId, controlError.what());
+                        }
+                        catch (...)
+                        {
+                            TLLM_LOG_WARNING(
+                                "Failed to abort chunked KV-cache transfer for request %ld.", llmRequest.mRequestId);
+                        }
+                        throw;
+                    }
+
+                    // A chunk is complete only after its staging data has been
+                    // copied into final KV blocks. This also protects the single
+                    // reusable remote Agent staging slot from early overwrite.
+                    sendChunkControl(session, pickUpConnections, ChunkControl::kChunkComplete);
+                }
+
+                sendChunkControl(session, pickUpConnections, ChunkControl::kReceiverFinished);
+                auto const senderDoneControl = recvChunkControl(session, pickUpConnections);
+                if (senderDoneControl != ChunkControl::kSenderDone)
+                {
+                    // A sender with an extra chunk is waiting for the receiver's
+                    // authorization phase after reporting Abort. Complete that
+                    // phase before surfacing terminal/count mismatches.
+                    sendChunkControl(session, pickUpConnections, ChunkControl::kAbort);
+                    if (senderDoneControl == ChunkControl::kAbort)
+                    {
+                        TLLM_THROW("Sender aborted chunked KV-cache transfer completion.");
+                    }
+                    throwUnexpectedChunkControl(senderDoneControl, ChunkControl::kSenderDone, "transfer completion");
+                }
+
+                for (auto const& measure : chunkMeasures)
+                {
+                    session.appendMeasure(measure.start, measure.end, measure.size);
+                }
+
+                recvHolder.release();
+                TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+                    "End chunked KV-cache receiving for request ID: %ld, context request ID: %ld.",
+                    llmRequest.mRequestId, ctxReqId);
+                return;
+            }
             // unformatted flow
             // 1. collect cache blocks of the request.
             // 2. compute the buffer size for each target.
@@ -870,8 +1646,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
 
                 TLLM_CHECK(blockNum > 0);
 
-                auto preAssignedKvId
-                    = connections[pickUpConnections[0]]->getPreAssignedBufferId(static_cast<uint8_t>(BufferKind::kKV));
+                auto preAssignedKvId = session.getPreAssignedBufferId(static_cast<uint8_t>(BufferKind::kKV));
                 if (preAssignedKvId.has_value())
                 {
                     cacheBufferId = static_cast<int>(*preAssignedKvId);
@@ -1027,6 +1802,34 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
 
 [[nodiscard]] bool CacheFormatter::inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const
 {
+    if (!cache_formatter_utils::hasCompatibleTransferChunkSize(selfConfig, destConfig))
+    {
+        TLLM_LOG_WARNING(
+            "CacheFormatter::inquireSupport: chunked KV-cache transfer configuration must match on both peers");
+        return false;
+    }
+    if (selfConfig.getTransferChunkSizeBlocks().has_value())
+    {
+        if (selfConfig.getParallelConfig().mContextParallelism != 1
+            || destConfig.getParallelConfig().mContextParallelism != 1)
+        {
+            TLLM_LOG_WARNING("CacheFormatter::inquireSupport: chunked KV-cache transfer requires CP=1 on both peers");
+            return false;
+        }
+        if (selfConfig.hasRnnConfig() || destConfig.hasRnnConfig())
+        {
+            TLLM_LOG_WARNING("CacheFormatter::inquireSupport: chunked KV-cache transfer does not support RNN state");
+            return false;
+        }
+        if (common::getEnvDisaggLayerwise() || common::getEnvTryZCopyForKVCacheTransfer())
+        {
+            TLLM_LOG_WARNING(
+                "CacheFormatter::inquireSupport: chunked KV-cache transfer does not support layer-wise or zero-copy "
+                "transfer");
+            return false;
+        }
+    }
+
     if (selfConfig.getDataType() != destConfig.getDataType())
     {
         TLLM_LOG_WARNING("CacheFormatter::inquireSupport: selfConfig.getDataType() != destConfig.getDataType()");

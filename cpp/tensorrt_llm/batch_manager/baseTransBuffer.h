@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -153,6 +153,13 @@ public:
     /// @param bufferId The buffer index to free.
     void freeBufferIndexForRecv(std::optional<int> bufferId);
 
+    /// @brief Permanently fail current and future receive-buffer assignments.
+    /// @details Used after a published one-sided-write destination must be quarantined.
+    void abortRecvBufferAssignments();
+
+    /// @brief Return whether receive-buffer assignment has been permanently aborted.
+    bool areRecvBufferAssignmentsAborted();
+
     /// @brief Get or allocate send buffers for cache transfer.
     /// @param bufferId The assigned buffer ID.
     /// @param targetNum Number of target sequences.
@@ -206,6 +213,7 @@ protected:
         std::mutex mBuffersMutex;
         std::condition_variable mBuffersCV;
         std::atomic<int> mConcurrence{0};
+        bool mAssignmentsAborted{false};
     };
 
     std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> getOrAllocateBuffers(std::optional<int> bufferId,

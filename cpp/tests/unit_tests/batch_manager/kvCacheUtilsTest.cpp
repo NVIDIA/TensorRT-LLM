@@ -20,6 +20,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
 namespace tc = tensorrt_llm::common;
@@ -139,4 +140,43 @@ TEST_F(BlockIteratorTest, CacheManagerTest)
         EXPECT_EQ(iter->getSize(), numLayers * numKvHeads * sizePerHead * tokensPerBlock * 2);
     }
     EXPECT_EQ(cnt, blockIds.size());
+}
+
+TEST(TransferLeaseBlockUtilsTest, SelectsExactOrderedLeaseTail)
+{
+    SizeType32 constexpr windowSize{128};
+    TransferBlockIds const leasedBlockIds{{windowSize, {41, 7, 99, 12}}};
+
+    auto const selectedBlockIds = selectTransferLeaseTail(leasedBlockIds, /*indexFromEnd=*/1);
+
+    ASSERT_THAT(selectedBlockIds, ::testing::SizeIs(1));
+    EXPECT_THAT(selectedBlockIds.at(windowSize), ::testing::ElementsAre(99, 12));
+}
+
+TEST(TransferLeaseBlockUtilsTest, ReturnsOnlyUnselectedLeasePrefix)
+{
+    SizeType32 constexpr windowSize{128};
+    TransferBlockIds const leasedBlockIds{{windowSize, {41, 7, 99, 12}}};
+    TransferBlockIds const selectedBlockIds{{windowSize, {99, 12}}};
+
+    auto const untransferredBlockIds = getUntransferredLeaseBlockIds(leasedBlockIds, selectedBlockIds);
+
+    ASSERT_THAT(untransferredBlockIds, ::testing::SizeIs(1));
+    EXPECT_THAT(untransferredBlockIds.at(windowSize), ::testing::ElementsAre(41, 7));
+}
+
+TEST(CacheFormatterChunkConfigurationTest, RejectsMismatchedChunkSizes)
+{
+    using CacheState = tensorrt_llm::executor::kv_cache::CacheState;
+    CacheState selfConfig{/*nbAttentionLayers=*/2, /*nbKvHeads=*/4, /*sizePerHead=*/16, /*tokensPerBlock=*/8,
+        /*tensorParallelism=*/1, /*pipelineParallelism=*/1, /*contextParallelism=*/1,
+        /*attentionLayerNumPerPP=*/{2}, nvinfer1::DataType::kFLOAT};
+    auto destConfig = selfConfig;
+    selfConfig.setTransferChunkSizeBlocks(2);
+
+    EXPECT_FALSE(cache_formatter_utils::hasCompatibleTransferChunkSize(selfConfig, destConfig));
+    destConfig.setTransferChunkSizeBlocks(3);
+    EXPECT_FALSE(cache_formatter_utils::hasCompatibleTransferChunkSize(selfConfig, destConfig));
+    destConfig.setTransferChunkSizeBlocks(2);
+    EXPECT_TRUE(cache_formatter_utils::hasCompatibleTransferChunkSize(selfConfig, destConfig));
 }

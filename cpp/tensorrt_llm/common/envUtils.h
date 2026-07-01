@@ -18,6 +18,7 @@
 #pragma once
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/runtime/common.h"
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <optional>
@@ -109,6 +110,12 @@ bool getEnvEnableReceiveKVCacheParallel();
 std::string const& getEnvKVCacheTimeOutputPath();
 
 bool getEnvTryZCopyForKVCacheTransfer();
+
+/// Number of KV-cache blocks transferred in one chunk. Unset or zero disables chunking.
+std::optional<runtime::SizeType32> getEnvKVCacheTransferChunkSizeBlocks();
+
+/// Whether transferred KV-cache chunks may be released before the whole request completes.
+bool getEnvKVCacheTransferEarlyRelease();
 
 // Force deterministic behavior for all kernels.
 bool getEnvForceDeterministic();
