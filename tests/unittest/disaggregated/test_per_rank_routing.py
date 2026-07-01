@@ -343,48 +343,14 @@ def test_per_rank_stale_eviction():
 # ------------------------------------------------- layer group refcount per-rank
 
 
-def test_per_rank_layer_group_refcount():
-    """Multi-layer-group stored events tracked per rank; removal only on last."""
+def test_layer_groups_not_distinguished_first_removal_evicts():
+    """Layer groups are NOT distinguished: a removal from ANY layer group evicts
+    the block from the rank entirely, and the redundant per-group removed events
+    for the same block are harmless no-ops."""
     router = CentralizedKVCacheRouter(tokens_per_block=TPB)
-
-    # Two layer groups store the same hash on rank0
-    router.apply_event_report(
-        KvCacheEventReport("inst0:rank0", "ctx", seq=0,
-                           events=[stored_event(None, [1, 2], layer_group_id=0)]))
-    router.apply_event_report(
-        KvCacheEventReport("inst0:rank0", "ctx", seq=1,
-                           events=[stored_event(None, [1, 2], layer_group_id=1)]))
-
-    # Remove from layer_group 0 only
-    router.apply_event_report(
-        KvCacheEventReport("inst0:rank0", "ctx", seq=2,
-                           events=[removed_event([1, 2], layer_group_id=0)]))
-
-    router.apply_load_report(load_report("inst0:rank0", 0))
     router.register_worker_address("inst0", "http://host0:8000")
 
-    # Still matched — layer_group 1 retains
-    sel = router.select_worker("ctx", [1, 2])
-    assert sel.matched_blocks == 2
-
-
-def test_combined_trie_drops_block_after_all_layer_groups_evict():
-    """Regression: a block stored under multiple layer groups on one rank must
-    disappear from the instance combined trie once ALL its layer groups evict.
-
-    The combined refcount counts distinct rank-holders, so it must be bumped
-    once per rank acquisition -- NOT once per stored event. A block is re-emitted
-    once per layer group, so counting events over-counts by the layer-group
-    factor while the removed path decrements once per rank, leaving the count
-    stuck >0 and the evicted block stale in the combined trie. Stale entries
-    mis-route phase-1 to an instance that no longer holds the prefix, which
-    silently tanks the cache-hit rate. This guards 'none' mode specifically,
-    where ONLY the combined trie is consulted."""
-    router = CentralizedKVCacheRouter(tokens_per_block=TPB,
-                                      rank_routing_algo="none")
-    router.register_worker_address("inst0", "http://host0:8000")
-
-    # Same block stored under two layer groups on the same rank.
+    # Two layer groups store the same hash on rank0.
     router.apply_event_report(
         KvCacheEventReport("inst0:rank0", "ctx", seq=0,
                            events=[stored_event(None, [1, 2], layer_group_id=0)]))
@@ -396,19 +362,65 @@ def test_combined_trie_drops_block_after_all_layer_groups_evict():
     sel = router.select_worker("ctx", [1, 2])
     assert sel is not None and sel.matched_blocks == 2
 
-    # Evict BOTH layer groups -> the rank no longer holds the block at all.
+    # Remove from layer_group 0 only -> block is evicted entirely (any-group
+    # removal evicts), NOT retained because layer_group 1 still "holds" it.
     router.apply_event_report(
         KvCacheEventReport("inst0:rank0", "ctx", seq=2,
                            events=[removed_event([1, 2], layer_group_id=0)]))
+    sel = router.select_worker("ctx", [1, 2])
+    assert sel is None or sel.matched_blocks == 0, (
+        f"block should be fully evicted after any-group removal "
+        f"(matched_blocks={getattr(sel, 'matched_blocks', None)})")
+
+    # The redundant removal for layer_group 1 must be a no-op (must not
+    # double-decrement combined_refcount or corrupt state).
     router.apply_event_report(
         KvCacheEventReport("inst0:rank0", "ctx", seq=3,
                            events=[removed_event([1, 2], layer_group_id=1)]))
-
-    # Combined trie must now match nothing -- the block is fully evicted.
     sel = router.select_worker("ctx", [1, 2])
-    assert sel is None or sel.matched_blocks == 0, (
-        f"evicted block still routable (matched_blocks="
-        f"{getattr(sel, 'matched_blocks', None)}) -- stale combined-trie entry")
+    assert sel is None or sel.matched_blocks == 0
+
+
+def test_combined_trie_multi_rank_evict_with_layer_groups():
+    """With layer groups undistinguished, combined_trie still drops a block only
+    once ALL RANKS have evicted it -- and a rank that stored under multiple layer
+    groups is counted once (owned_hashes de-dup), so the first removal on that
+    rank releases its single combined_refcount hold."""
+    router = CentralizedKVCacheRouter(tokens_per_block=TPB,
+                                      rank_routing_algo="none")
+    router.register_worker_address("inst0", "http://host0:8000")
+
+    # rank0 stores block [1,2] under 2 layer groups; rank1 stores it once.
+    router.apply_event_report(
+        KvCacheEventReport("inst0:rank0", "ctx", seq=0,
+                           events=[stored_event(None, [1, 2], layer_group_id=0)]))
+    router.apply_event_report(
+        KvCacheEventReport("inst0:rank0", "ctx", seq=1,
+                           events=[stored_event(None, [1, 2], layer_group_id=1)]))
+    router.apply_event_report(
+        KvCacheEventReport("inst0:rank1", "ctx", seq=0,
+                           events=[stored_event(None, [1, 2])]))
+    router.apply_load_report(load_report("inst0:rank0", 0))
+    router.apply_load_report(load_report("inst0:rank1", 0))
+
+    sel = router.select_worker("ctx", [1, 2])
+    assert sel is not None and sel.matched_blocks == 2
+
+    # rank0 evicts (one removed event releases its single hold) -> rank1 still
+    # holds it, so combined_trie must still match.
+    router.apply_event_report(
+        KvCacheEventReport("inst0:rank0", "ctx", seq=2,
+                           events=[removed_event([1, 2], layer_group_id=0)]))
+    sel = router.select_worker("ctx", [1, 2])
+    assert sel is not None and sel.matched_blocks == 2, (
+        "rank1 still holds the block; combined_trie must still match")
+
+    # rank1 evicts -> now no rank holds it -> combined_trie drops it.
+    router.apply_event_report(
+        KvCacheEventReport("inst0:rank1", "ctx", seq=1,
+                           events=[removed_event([1, 2])]))
+    sel = router.select_worker("ctx", [1, 2])
+    assert sel is None or sel.matched_blocks == 0
 
 
 # ------------------------------------------------- full snapshot per-rank
@@ -490,6 +502,66 @@ def test_zmq_per_rank_reporter_to_router():
         finally:
             for r in reporters:
                 r.stop()
+    finally:
+        server.stop()
+
+
+def test_zmq_per_rank_reporter_inline_mode():
+    """Inline mode (poll_events=False): report_events() drives event reporting
+    on the caller thread, no event-poll thread runs, router state is built, and
+    the send races cleanly with stop() (no 'NoneType has no attribute send')."""
+    import threading
+
+    router = CentralizedKVCacheRouter(tokens_per_block=TPB)
+    server = KVCacheRouterServer(router, address="tcp://127.0.0.1:*")
+    endpoint, hmac_key = server.address
+    server.start()
+    try:
+        router.register_worker_address("inst0", "http://host0:8000")
+        events = [stored_event(None, [1, 2, 3])]
+        r = WorkerReporter(
+            worker_id="inst0:rank0",
+            namespace="ctx",
+            router_address=endpoint,
+            hmac_key=hmac_key,
+            get_events=lambda timeout_ms: list(events),
+            get_load=lambda: (0, 0),
+            max_batch_size=64,
+            load_interval_s=0.01,
+        )
+        r.start(poll_events=False)
+        # No event-poll thread; load thread still runs.
+        assert r._event_thread is None
+        assert r._load_thread is not None
+
+        # Caller (simulating the executor loop) drives event reporting.
+        errors = []
+
+        def drive():
+            try:
+                for _ in range(2000):
+                    r.report_events()
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+        t = threading.Thread(target=drive)
+        t.start()
+
+        deadline = time.time() + 5.0
+        sel = None
+        while time.time() < deadline:
+            sel = router.select_worker("ctx", [1, 2, 3])
+            if sel is not None and sel.matched_blocks == 3:
+                break
+            time.sleep(0.02)
+        assert sel is not None and sel.matched_blocks == 3
+
+        # Stop while report_events() is still hammering the socket: the send
+        # must serialize with close() and no-op after, never hit a None socket.
+        r.stop()
+        t.join(timeout=5.0)
+        assert not t.is_alive()
+        assert not errors, f"report_events raced stop() and threw: {errors[:3]}"
     finally:
         server.stop()
 

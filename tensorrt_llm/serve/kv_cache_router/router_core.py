@@ -154,8 +154,7 @@ class _RankState:
     """Per-rank state within an instance."""
 
     __slots__ = ("rank", "trie", "load", "last_event_seq", "last_load_seq",
-                 "last_load_ts", "last_seen_ts", "layer_group_refcount",
-                 "owned_hashes")
+                 "last_load_ts", "last_seen_ts", "owned_hashes")
 
     def __init__(self, rank: int) -> None:
         self.rank = rank
@@ -168,7 +167,6 @@ class _RankState:
         self.last_load_seq: int = -1
         self.last_load_ts: float = 0.0
         self.last_seen_ts: float = 0.0
-        self.layer_group_refcount: Dict[int, int] = {}
         # Flat set of block hashes this rank holds. In "none" mode the per-rank
         # trie is not maintained (never queried), so this set is what
         # _remove_rank_from_combined uses to clean the combined trie on a
@@ -198,8 +196,8 @@ class _InstanceState:
         # used for instance selection in phase 1).
         self.rr_counter = 0
         # Per-instance ("per tree") lock guarding this instance's mutable
-        # routing state: ranks, each rank's trie/load/seqs/owned_hashes/
-        # layer_group_refcount, combined_trie, combined_refcount, rr_counter.
+        # routing state: ranks, each rank's trie/load/seqs/owned_hashes,
+        # combined_trie, combined_refcount, rr_counter.
         # Splitting the formerly-global lock per instance lets event ingest for
         # one instance run concurrently with select_worker reads of (and ingest
         # to) other instances -- the ingest/query contention that dominated
@@ -241,7 +239,7 @@ class _NamespaceState:
     __slots__ = ("instances", "rr_counter",
                  # Legacy flat state for non-per-rank workers
                  "tries", "loads", "last_event_seq", "last_load_seq",
-                 "last_load_ts", "last_seen_ts", "layer_group_refcount")
+                 "last_load_ts", "last_seen_ts")
 
     def __init__(self) -> None:
         # Hierarchical per-rank state
@@ -256,7 +254,6 @@ class _NamespaceState:
         self.last_load_seq: Dict[str, int] = {}
         self.last_load_ts: Dict[str, float] = {}
         self.last_seen_ts: Dict[str, float] = {}
-        self.layer_group_refcount: Dict[str, Dict[int, int]] = {}
 
 
 class CentralizedKVCacheRouter:
@@ -443,7 +440,6 @@ class CentralizedKVCacheRouter:
             self._remove_rank_from_combined(inst, rank)
             rs.trie.remove_worker(report.worker_id)
             rs.owned_hashes.clear()
-            rs.layer_group_refcount.clear()
 
         # Apply events to per-rank trie AND combined trie
         self._apply_events_hierarchical(
@@ -464,9 +460,7 @@ class CentralizedKVCacheRouter:
             trie = ns.tries[report.worker_id] = PrefixBlockSet()
         if report.is_full_snapshot:
             trie.remove_worker(report.worker_id)
-            ns.layer_group_refcount.pop(report.worker_id, None)
-        self._apply_events(trie, report.worker_id, report.events,
-                           ns.layer_group_refcount)
+        self._apply_events(trie, report.worker_id, report.events)
 
     def apply_load_report(self, report: WorkerLoadReport) -> None:
         """Apply a worker load report. Stale (``seq``) reports are dropped."""
@@ -788,11 +782,16 @@ class CentralizedKVCacheRouter:
     def _apply_events_hierarchical(self, inst: _InstanceState,
                                    rs: _RankState, worker_id: str,
                                    events: List[dict]) -> None:
-        """Apply events to both the rank's trie and the instance's combined trie."""
+        """Apply events to both the rank's trie and the instance's combined trie.
+
+        Layer groups are not distinguished: a block is stored/removed for the
+        rank as a whole. A block re-emitted across N layer groups is counted
+        once per rank (owned_hashes de-dups the stored side; the removed side is
+        gated on owned_hashes so redundant per-group removals are no-ops).
+        """
         for event_raw in events:
             data = event_raw.get("data", event_raw)
             etype = data.get("type")
-            layer_group_id = event_raw.get("layer_group_id")
             if etype == "stored":
                 block_hashes = [
                     b["block_hash"] for b in data.get("blocks", [])
@@ -812,16 +811,13 @@ class CentralizedKVCacheRouter:
                 # Always track owned_hashes (cheap) for combined-trie cleanup.
                 if not self._skip_rank_trie:
                     rs.trie.add(worker_id, block_hashes)
-                # combined_refcount counts how many ranks of this instance hold
-                # each block, so the combined trie drops a block only once the
-                # LAST rank evicts it. It MUST be incremented per distinct rank
-                # acquisition, NOT per stored event: a block is re-emitted once
-                # per layer group (add_stored_life_cycle_event_from_block), so
-                # counting events would over-count by the layer-group factor
-                # while the removed path only ever decrements once per rank ->
-                # the count never reaches 0 and evicted blocks stay stale in the
-                # combined trie, mis-routing phase-1 to instances that no longer
-                # hold the prefix. Gate on "hash newly owned by this rank".
+                # combined_refcount counts how many RANKS of this instance hold
+                # each block; the combined trie drops a block only once the LAST
+                # rank evicts it. Increment once per distinct rank acquisition
+                # (gate on "newly owned by this rank"), symmetric with the
+                # removal below. Layer groups are NOT distinguished: a block is
+                # re-emitted once per layer group, but owned_hashes de-dups so we
+                # count the rank once regardless of how many groups hold it.
                 new_to_rank = [h for h in block_hashes
                                if h not in rs.owned_hashes]
                 rs.owned_hashes.update(block_hashes)
@@ -831,28 +827,16 @@ class CentralizedKVCacheRouter:
                 for h in new_to_rank:
                     inst.combined_refcount[h] = (
                         inst.combined_refcount.get(h, 0) + 1)
-                # Per-rank layer group refcount
-                if layer_group_id is not None:
-                    for h in block_hashes:
-                        rs.layer_group_refcount[h] = (
-                            rs.layer_group_refcount.get(h, 0) + 1)
             elif etype == "removed":
                 removed_hashes = data.get("block_hashes", [])
-                # Per-rank layer group refcount handling
-                if layer_group_id is not None:
-                    actually_removed = []
-                    for h in removed_hashes:
-                        rc = rs.layer_group_refcount.get(h, 0)
-                        if rc <= 1:
-                            rs.layer_group_refcount.pop(h, None)
-                            actually_removed.append(h)
-                        else:
-                            rs.layer_group_refcount[h] = rc - 1
-                else:
-                    actually_removed = removed_hashes
-                    for h in removed_hashes:
-                        rs.layer_group_refcount.pop(h, None)
-
+                # Layer groups are not distinguished: a removal from ANY group
+                # evicts the block from this rank entirely. Gate on owned_hashes
+                # so the FIRST removed event drops the block and the redundant
+                # per-layer-group removed events for the same block are no-ops
+                # (otherwise combined_refcount would be decremented more than
+                # once per rank and go negative / evict too early).
+                actually_removed = [h for h in removed_hashes
+                                    if h in rs.owned_hashes]
                 if actually_removed:
                     # Remove from rank trie (skipped in "none" mode).
                     if not self._skip_rank_trie:
@@ -873,14 +857,10 @@ class CentralizedKVCacheRouter:
 
     @classmethod
     def _apply_events(cls, trie: PrefixBlockSet, worker_id: str,
-                      events: List[dict],
-                      refcounts: Optional[Dict[str, Dict[int,
-                                                         int]]] = None
-                      ) -> None:
+                      events: List[dict]) -> None:
         for event_raw in events:
             data = event_raw.get("data", event_raw)
             etype = data.get("type")
-            layer_group_id = event_raw.get("layer_group_id")
             if etype == "stored":
                 block_hashes = [
                     b["block_hash"] for b in data.get("blocks", [])
@@ -897,34 +877,11 @@ class CentralizedKVCacheRouter:
                         f"types={[type(h).__name__ for h in block_hashes[:3]]} "
                         f"raw_blocks={data.get('blocks', [])[:2]}")
                 trie.add(worker_id, block_hashes)
-                if refcounts is not None and layer_group_id is not None:
-                    worker_rc = refcounts.setdefault(worker_id, {})
-                    for h in block_hashes:
-                        worker_rc[h] = worker_rc.get(h, 0) + 1
             elif etype == "removed":
-                removed_hashes = data.get("block_hashes", [])
-                if refcounts is not None and layer_group_id is not None:
-                    worker_rc = refcounts.get(worker_id)
-                    actually_removed = []
-                    for h in removed_hashes:
-                        if worker_rc is None:
-                            actually_removed.append(h)
-                            continue
-                        rc = worker_rc.get(h, 0)
-                        if rc <= 1:
-                            worker_rc.pop(h, None)
-                            actually_removed.append(h)
-                        else:
-                            worker_rc[h] = rc - 1
-                    if actually_removed:
-                        trie.remove(worker_id, actually_removed)
-                else:
-                    trie.remove(worker_id, removed_hashes)
-                    if refcounts is not None:
-                        worker_rc = refcounts.get(worker_id)
-                        if worker_rc:
-                            for h in removed_hashes:
-                                worker_rc.pop(h, None)
+                # Layer groups not distinguished: a removal from any group evicts
+                # the block. PrefixBlockSet.remove is idempotent, so redundant
+                # per-group removed events for the same block are harmless.
+                trie.remove(worker_id, data.get("block_hashes", []))
 
     def _remove_rank_from_combined(self, inst: _InstanceState,
                                    rank: int) -> None:
@@ -975,4 +932,3 @@ class CentralizedKVCacheRouter:
         ns.last_load_seq.pop(worker_id, None)
         ns.last_load_ts.pop(worker_id, None)
         ns.last_seen_ts.pop(worker_id, None)
-        ns.layer_group_refcount.pop(worker_id, None)
