@@ -26,14 +26,14 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 {
 
 // ============================================================================
-// TransferEngine — abstract bulk-write transport for the bounce data plane (DESIGN)
+// TransferEngine — abstract bulk-write transport for the bounce data plane
 // ----------------------------------------------------------------------------
 // Role
 //   The ONE operation the bounce data plane needs: "write `bytes` from my local slot
 //   buffer to a peer's slot buffer, and let me know (by polling) when it has landed
 //   at the remote". The bounce reactor gates the DATA control message on poll()==Done,
 //   which (for the real NIXL engine) already implies remote landing via NIXL's
-//   ucp_ep_flush_nbx — so v2 needs NO notifMsg (see bounce/DESIGN.md §4).
+//   ucp_ep_flush_nbx — so v2 needs NO notifMsg.
 //
 // Why abstract
 //   - NixlTransferEngine (production + tests): wraps nixlAgent registerMem / createXferReq /
