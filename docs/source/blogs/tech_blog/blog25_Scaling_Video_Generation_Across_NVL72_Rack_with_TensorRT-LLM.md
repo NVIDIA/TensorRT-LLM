@@ -460,16 +460,16 @@ Future directions:
 
 ## References
 
-- VisualGen runtime: [`tensorrt_llm/_torch/visual_gen/`](https://github.com/NVIDIA/TensorRT-LLM/tree/163be837f3e82d092eb33704747a93fb419e7099/tensorrt_llm/_torch/visual_gen)  
-  - Mesh: [`mapping.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/163be837f3e82d092eb33704747a93fb419e7099/tensorrt_llm/_torch/visual_gen/mapping.py)  
-  - Parallelism wrappers: [`attention_backend/parallel.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/163be837f3e82d092eb33704747a93fb419e7099/tensorrt_llm/_torch/visual_gen/attention_backend/parallel.py)  
-  - Pipeline base: [`pipeline.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/163be837f3e82d092eb33704747a93fb419e7099/tensorrt_llm/_torch/visual_gen/pipeline.py)  
-  - Config models: [`config.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/163be837f3e82d092eb33704747a93fb419e7099/tensorrt_llm/_torch/visual_gen/config.py)  
-  - Parallel VAE: [`modules/vae/parallel_vae_interface.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/163be837f3e82d092eb33704747a93fb419e7099/tensorrt_llm/_torch/visual_gen/modules/vae/parallel_vae_interface.py)  
+- VisualGen runtime: [`tensorrt_llm/_torch/visual_gen/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/visual_gen)  
+  - Mesh: [`mapping.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/visual_gen/mapping.py)  
+  - Parallelism wrappers: [`attention_backend/parallel.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/visual_gen/attention_backend/parallel.py)  
+  - Pipeline base: [`pipeline.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/visual_gen/pipeline.py)  
+  - Config models: [`config.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/visual_gen/config.py)  
+  - Parallel VAE: [`modules/vae/parallel_vae_interface.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/visual_gen/modules/vae/parallel_vae_interface.py)  
 - Examples:  
-  - Offline scripts: [`examples/visual_gen/`](https://github.com/NVIDIA/TensorRT-LLM/tree/163be837f3e82d092eb33704747a93fb419e7099/examples/visual_gen)  
-  - Shared YAML configs: [`examples/visual_gen/configs/`](https://github.com/NVIDIA/TensorRT-LLM/tree/163be837f3e82d092eb33704747a93fb419e7099/examples/visual_gen/configs)  
-  - Serving + benchmark: [`examples/visual_gen/serve/`](https://github.com/NVIDIA/TensorRT-LLM/tree/163be837f3e82d092eb33704747a93fb419e7099/examples/visual_gen/serve)  
+  - Offline scripts: [`examples/visual_gen/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen)  
+  - Shared YAML configs: [`examples/visual_gen/configs/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/configs)  
+  - Serving + benchmark: [`examples/visual_gen/serve/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve)  
 - Papers:  
   - DeepSpeed Ulysses: [arXiv:2309.14509](https://arxiv.org/abs/2309.14509)  
   - Attention2D: [arXiv:2503.15758](https://arxiv.org/abs/2503.15758)  
