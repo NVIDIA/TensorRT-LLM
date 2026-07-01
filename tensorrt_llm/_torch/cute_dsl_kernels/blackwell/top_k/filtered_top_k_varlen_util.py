@@ -452,7 +452,9 @@ class FilteredTopKKernelVarlen:
         idX = cute.make_identity_tensor((shape[0], aligned_size))
         input_ptr = input.iterator + vec_start
         input_addr_u64 = input_ptr.toint()
-        input_ptr_aligned = cute.make_ptr(self.dtype, input_addr_u64, assumed_align=align_bytes)
+        input_ptr_aligned = cute.make_ptr(
+            self.dtype, input_addr_u64, input.memspace, assumed_align=align_bytes
+        )
 
         input_tensor = cute.make_tensor(
             input_ptr_aligned,
@@ -462,7 +464,9 @@ class FilteredTopKKernelVarlen:
         # slice for CTAs
         gX, cX = [cute.local_tile(mT, tiler_mn, (bidx, None)) for mT in (input_tensor, idX)]
         # Note, we use gX_aligned here to avoid the alignment issue when the input is not aligned.
-        gX_aligned_ptr = cute.make_ptr(self.dtype, gX.iterator.toint(), assumed_align=align_bytes)
+        gX_aligned_ptr = cute.make_ptr(
+            self.dtype, gX.iterator.toint(), input.memspace, assumed_align=align_bytes
+        )
         gX_aligned = cute.make_tensor(gX_aligned_ptr, cute.make_layout(gX.shape, stride=gX.stride))
 
         self.num_sub_tiles = gX.shape[2]
@@ -1023,7 +1027,7 @@ class FilteredTopKKernelVarlen:
         )
 
         copy_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
+            cute.nvgpu.CopyG2ROp(),
             self.dtype,
             num_bits_per_copy=self.num_copy_bits,
         )

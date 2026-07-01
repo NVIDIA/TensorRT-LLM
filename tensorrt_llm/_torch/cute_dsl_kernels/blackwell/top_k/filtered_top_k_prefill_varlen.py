@@ -69,23 +69,27 @@ class FilteredTopKKernelVarlenPrefill(FilteredTopKKernelVarlen):
         # Output local indices: subtract row_start before writing to output.
         self.subtract_row_start_on_output = True
 
-        # Apply large_occupancy SMEM reduction table. Prefill always runs with
-        # num_rows >> num_sms, so we reduce SMEM to raise occupancy.
-        if self.max_num_cols >= 262144:
-            self.filtered_topk_smem_input_size = 4096
-        elif self.max_num_cols >= 131072:
-            self.filtered_topk_smem_input_size = 3072
-        elif self.max_num_cols >= 65536:
-            self.filtered_topk_smem_input_size = 2048
-        elif self.max_num_cols >= 32768:
-            self.filtered_topk_smem_input_size = 1024
-        elif self.max_num_cols >= 16384:
-            self.filtered_topk_smem_input_size = 1024
-        elif self.max_num_cols >= 8192:
-            self.filtered_topk_smem_input_size = 512
-        else:
-            self.filtered_topk_smem_input_size = 256
+        # Clamp filtered_topk_smem_input_size so the kernel fits 4 blocks/SM on
+        # B200 (256 KB/SM ÷ 4 = 64 KB/block budget).
+        #
+        # SMEM layout per block (worst-case top_k=2048, 128-B alignment):
+        #   fixed overhead  ~1920 B  (histogram + scalars + warp_sums)
+        #   s_indices        top_k × sizeof(index_type)
+        #   s_input_idx      num_buffer × S × sizeof(index_type)
+        #
+        # Solving 1920 + 2048*idx_sz + num_buffer*S*idx_sz <= 65536:
+        #   fp32 / Uint16  (num_buffer=2, idx=2B): S <= 7440  → pow2 cap 8192
+        #   fp32 / Uint32  (num_buffer=2, idx=4B): S <= 6928  → pow2 cap 4096
+        #   bf16 / Uint16  (num_buffer=1, idx=2B): S <= 29760 → pow2 cap 16384
+        #   bf16 / Uint32  (num_buffer=1, idx=4B): S <= 13856 → pow2 cap 8192
+        #
+        # Verification fp32/Uint16 S=8192: 1920+4096+2*8192*2 = 38784 B < 64 KB ✓
+        if self.index_type == cutlass.Uint16:
+            max_S = 8192 if self.num_buffer_smem_input_idx == 2 else 16384
+        else:  # Uint32 (max_num_cols > 65536)
+            max_S = 4096 if self.num_buffer_smem_input_idx == 2 else 8192
 
+        self.filtered_topk_smem_input_size = min(max_S, self.max_num_cols)
         self.enable_gmem_store = self.max_num_cols > self.filtered_topk_smem_input_size
 
         # Always 512 threads for large-occupancy path.
