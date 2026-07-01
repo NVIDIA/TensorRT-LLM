@@ -193,11 +193,18 @@ inline std::unique_ptr<Node> makeNode(std::string const& name, b::BounceConfig c
     return n;
 }
 
-// Bidirectional connect: NIXL metadata both ways + bounce addPeer both ways.
+// Bidirectional connect for the white-box harness. Two SEPARATE wirings are needed here because the
+// transport under test is hand-built (b::BounceTransport with its own b::ZmqControlChannel) and lives
+// OUTSIDE the agent, so — unlike production (bounceAgentE2ETest) — loadRemoteAgent cannot wire it:
+//   - loadRemoteAgent(AgentDesc) exchanges only the NIXL metadata layer (so createXferReq can resolve
+//     the remote arena). We use the AgentDesc path — the one production disagg uses
+//     (tensorrt_llm/_torch/disaggregation/native/transfer.py) — NOT the connection-info path.
+//   - addPeer() wires the control-channel layer (the DEALER to the peer's ROUTER) on the standalone
+//     transport. Production folds this into loadRemoteAgent + WANT self-bootstrap; here it is manual.
 inline void wirePair(Node& a, Node& b)
 {
-    a.agent->loadRemoteAgent(b.name, b.agent->getLocalConnectionInfo());
-    b.agent->loadRemoteAgent(a.name, a.agent->getLocalConnectionInfo());
+    a.agent->loadRemoteAgent(b.name, b.agent->getLocalAgentDesc());
+    b.agent->loadRemoteAgent(a.name, a.agent->getLocalAgentDesc());
     a.tx->addPeer(b.name, b.ch->localEndpoint());
     b.tx->addPeer(a.name, a.ch->localEndpoint());
 }
