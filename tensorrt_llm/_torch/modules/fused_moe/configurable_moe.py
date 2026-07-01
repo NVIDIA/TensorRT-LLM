@@ -429,7 +429,12 @@ class ConfigurableMoE(MoE):
         if self.use_dp and self.comm is not None:
             num_rows = self._dp_padded_num_rows(all_rank_num_tokens)
         else:
-            num_rows = sum(all_rank_num_tokens)
+            # non-DP: no cross-rank dispatch. The scheduler fills all_rank_num_tokens
+            # from [x.shape[0]] before calling here, so it must be a single-element list.
+            assert len(all_rank_num_tokens) == 1, (
+                f"non-DP path expects a single-element list, got {len(all_rank_num_tokens)}"
+            )
+            num_rows = all_rank_num_tokens[0]
         return (num_rows + self.moe_max_num_tokens - 1) // self.moe_max_num_tokens
 
     def split_chunk(self, split_token_num: int, split_num_chunks: int) -> List[int]:
