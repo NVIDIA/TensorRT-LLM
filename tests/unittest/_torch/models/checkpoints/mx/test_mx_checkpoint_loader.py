@@ -63,7 +63,9 @@ def _source_identity(rank=0, suffix="same"):
     return _identity(rank=rank, suffix=suffix)
 
 
-def _source_instance(identity: SourceIdentity | None = None, *, post_transform: bool = True, rank=0):
+def _source_instance(
+    identity: SourceIdentity | None = None, *, post_transform: bool = True, rank=0
+):
     if identity is not None:
         metadata = _build_mx_source_metadata(identity)
         if not post_transform:
