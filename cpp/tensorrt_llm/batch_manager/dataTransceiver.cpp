@@ -353,6 +353,19 @@ public:
         mRequestToSession.erase(it);
     }
 
+    void discardSession(LlmRequest::RequestIdType requestId) noexcept
+    {
+        try
+        {
+            std::unique_lock<std::mutex> lk(mMtxForMap);
+            mRequestToSession.erase(requestId);
+        }
+        catch (std::exception const& e)
+        {
+            TLLM_LOG_ERROR("Failed to discard KV cache transfer session for request %zu: %s", requestId, e.what());
+        }
+    }
+
     [[nodiscard]] std::optional<RequestInfo> recvRequestInfo()
     {
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
@@ -420,7 +433,9 @@ public:
             session = std::addressof(it->second);
         }
         session->setLlmRequest(llmRequest);
+        TLLM_LOG_DEBUG("KV cache transfer request %zu phase=transfer-submit begin.", llmRequest.mRequestId);
         mCacheTransferLayer.format(*session);
+        TLLM_LOG_DEBUG("KV cache transfer request %zu phase=transfer-complete end.", llmRequest.mRequestId);
         llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
     }
 
@@ -460,8 +475,7 @@ public:
             {
                 auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections.at(i));
                 TLLM_CHECK(agentConnection);
-                agentConnection->sendReadySignal(
-                    executor::kv_cache::DataContext{TransceiverTag::kREADY_SIGNAL_TAG}, isReady);
+                agentConnection->sendReadySignal(session->getDataContext(), isReady);
             }
             else
             {
@@ -535,14 +549,17 @@ private:
         }
         catch (tensorrt_llm::common::RequestSpecificException const& e)
         {
+            discardSession(id);
             TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: %s ", e.what());
             auto new_exception = TLLM_REQUEST_EXCEPTION(id, e.getErrorCode(), "%s", e.what());
-            resp.mPromise.set_exception(std::make_exception_ptr(new_exception));
+            failResponse(resp, std::make_exception_ptr(new_exception));
         }
         catch (std::exception const& e)
         {
+            auto const exception = std::current_exception();
+            discardSession(id);
             TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: %s request id: %ld", e.what(), id);
-            resp.mPromise.set_exception(std::current_exception());
+            failResponse(resp, exception);
         }
     }
 
@@ -613,8 +630,10 @@ private:
         }
         else
         {
-            response.mPromise.set_exception(std::make_exception_ptr(TLLM_REQUEST_EXCEPTION(reqId,
-                common::RequestErrorCode::kNETWORK_ERROR, "KV cache transfer for request %zu was cancelled", reqId)));
+            discardSession(reqId);
+            failResponse(response,
+                std::make_exception_ptr(TLLM_REQUEST_EXCEPTION(reqId, common::RequestErrorCode::kNETWORK_ERROR,
+                    "KV cache transfer for request %zu was cancelled", reqId)));
         }
     }
 
@@ -1063,7 +1082,6 @@ public:
         bool isReadyFinal = true;
         bool isReady = false;
         auto const& connections = session.getConnections();
-
         for (size_t i = 0; i < connections.size(); i++)
         {
             auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
@@ -1071,8 +1089,7 @@ public:
             {
                 auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections.at(i));
                 TLLM_CHECK(agentConnection);
-                isReady = agentConnection->recvReadySignal(
-                    executor::kv_cache::DataContext{TransceiverTag::kREADY_SIGNAL_TAG, mTerminate});
+                isReady = agentConnection->recvReadySignal(session.getDataContext());
             }
             else
             {
@@ -1102,27 +1119,51 @@ public:
 private:
     void requestSync(LlmRequest& llmRequest)
     {
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-            "Start calling requestSync for request ID: %zu, context request ID: %zu.", llmRequest.mRequestId,
-            llmRequest.getContextPhaseParams().value().getReqId());
+        auto const requestId = llmRequest.mRequestId;
+        auto const contextRequestId = llmRequest.getContextPhaseParams().value().getReqId();
+        char const* phase = "request-info";
+        TLLM_LOG_DEBUG("KV cache receive request %zu, context request %zu started.", requestId, contextRequestId);
         llmRequest.setKvCacheTransferStart(LlmRequest::getSteadyClockNow());
-        TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
-        auto session = sendRequestInfo(llmRequest);
-        session.setTime(TransferSession::kTimeRequestInfo);
-        bool isReady = receiveReadySignal(session);
-        if (!isReady)
+        try
         {
-            // Reuse the error state for the cancelled request.
-            llmRequest.setState(LlmRequestState::kDISAGG_TRANS_ERROR);
-            llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
-            return;
-        }
-        receiveSync(session);
-        llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
+            TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
+            TLLM_LOG_DEBUG("KV cache receive request %zu, context request %zu phase=%s begin.", requestId,
+                contextRequestId, phase);
+            auto session = sendRequestInfo(llmRequest);
+            session.setTime(TransferSession::kTimeRequestInfo);
+            TLLM_LOG_DEBUG(
+                "KV cache receive request %zu, context request %zu phase=%s end.", requestId, contextRequestId, phase);
 
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-            "End calling requestSync for request ID: %zu, context request ID: %zu.", llmRequest.mRequestId,
-            llmRequest.getContextPhaseParams().value().getReqId());
+            phase = "ready-signal";
+            TLLM_LOG_DEBUG("KV cache receive request %zu, context request %zu phase=%s begin.", requestId,
+                contextRequestId, phase);
+            bool const isReady = receiveReadySignal(session);
+            TLLM_LOG_DEBUG("KV cache receive request %zu, context request %zu phase=%s end: ready=%d.", requestId,
+                contextRequestId, phase, static_cast<int>(isReady));
+            if (!isReady)
+            {
+                // Reuse the error state for the cancelled request.
+                llmRequest.setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
+                return;
+            }
+
+            phase = "transfer-completion-notification";
+            TLLM_LOG_DEBUG("KV cache receive request %zu, context request %zu phase=%s begin.", requestId,
+                contextRequestId, phase);
+            receiveSync(session);
+            TLLM_LOG_DEBUG(
+                "KV cache receive request %zu, context request %zu phase=%s end.", requestId, contextRequestId, phase);
+            llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
+        }
+        catch (std::exception const& err)
+        {
+            TLLM_LOG_ERROR("KV cache receive request %zu, context request %zu failed in phase=%s: %s", requestId,
+                contextRequestId, phase, err.what());
+            throw;
+        }
+
+        TLLM_LOG_DEBUG("KV cache receive request %zu, context request %zu completed.", requestId, contextRequestId);
     }
 
     struct RequestAndPromise

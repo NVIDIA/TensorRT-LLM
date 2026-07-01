@@ -784,6 +784,11 @@ class PyExecutor:
         # normal dummy add-forward-terminate lifecycle handles taper-down.
         # Only relevant in benchmark disagg mode; False otherwise.
         self._benchmark_fill_phase_active = self.is_benchmark_disagg
+        # Set when a blocking generation transfer returns during benchmark
+        # fill. The gate consumes this signal to retry immediately instead of
+        # adding an unnecessary polling delay after synchronous progress.
+        self._sync_disagg_transfer_made_progress = False
+        self._benchmark_sync_progress_global = False
         # Slow-start admission cap for benchmark disagg fill (see
         # _pop_from_waiting_queue).  0 = uninitialised; first throttled iter
         # seeds it to tp_size and each subsequent iter doubles it.
@@ -2859,6 +2864,7 @@ class PyExecutor:
                 self._check_disagg_ctx_cache_transfer_status(0)
 
     def _prepare_and_schedule_batch(self):
+        self._sync_disagg_transfer_made_progress = False
         new_requests = self._fetch_and_activate_new_requests()
         if self.should_stop_processing:
             return None, None
@@ -3003,24 +3009,30 @@ class PyExecutor:
                 torch.cuda.current_stream())
 
     def _is_benchmark_disagg_fill_complete(
-            self, scheduled_batch: ScheduledRequests) -> bool:
+            self,
+            scheduled_batch: ScheduledRequests,
+            local_sync_progress: bool = False) -> bool:
         """State-based fill-complete predicate for benchmark disagg mode.
 
         The gate opens when all three conditions hold globally:
 
         (A) The executor has fetched at least ``benchmark_req_queues_size``
             requests cumulatively.
-        (B) Every request in ``active_requests`` on this rank is past the
-            KV-transfer phase (not in INIT or TRANS_IN_PROGRESS).
+        (B) Every request in ``active_requests`` on this rank completed the
+            KV-transfer phase (not in INIT, TRANS_IN_PROGRESS, or ERROR).
         (C) The KV cache transceiver has no pending receive sessions.
 
-        For ADP, (B) and (C) are AND-ed across TP ranks via allgather.
+        For ADP, the conditions and synchronous-progress signal are gathered
+        together across TP ranks so every rank makes the same gate and sleep
+        decision.
 
         This method must only be called when ``is_benchmark_disagg`` is True.
 
         Args:
             scheduled_batch: Passed for API compatibility with callers
                 but no longer used by this predicate.
+            local_sync_progress: Whether this rank completed a synchronous KV
+                transfer in the current iteration.
 
         Returns:
             True when the fill phase is complete and the first forward
@@ -3031,19 +3043,23 @@ class PyExecutor:
                 "_is_benchmark_disagg_fill_complete() should not be called "
                 "outside benchmark disagg mode.")
 
-        # (A) All benchmark requests have been fetched from the queue.
-        if self.num_fetch_requests < self.benchmark_req_queues_size:
+        # (A) All benchmark requests have been fetched from the queue. Keep
+        # going to the shared allgather even when this rank is not done so TP
+        # ranks cannot diverge in collective order.
+        local_all_fetched = (self.num_fetch_requests
+                             >= self.benchmark_req_queues_size)
+        if not local_all_fetched:
             if self.dist.rank == 0:
                 logger.debug(
                     f"Benchmark disagg fill: fetching "
                     f"{self.num_fetch_requests}/{self.benchmark_req_queues_size}"
                 )
-            return False
 
         # (B) Every active request on this rank is past KV-transfer states.
         local_all_past_transfer = not any(
             req.is_disagg_generation_init_state
             or req.is_disagg_generation_transmission_in_progress
+            or req.state == LlmRequestState.DISAGG_TRANS_ERROR
             for req in self.active_requests)
 
         # Also require the transceiver's async receive bookkeeping to be
@@ -3052,13 +3068,18 @@ class PyExecutor:
             self.kv_cache_transceiver is None
             or self.kv_cache_transceiver.check_gen_transfer_complete())
 
-        local_ok = int(local_all_past_transfer and local_no_inflight)
+        local_ok = int(local_all_fetched and local_all_past_transfer
+                       and local_no_inflight)
+        local_status = (local_ok, bool(local_sync_progress))
 
         if self.enable_attention_dp:
-            all_ranks_ok = self.dist.tp_allgather(local_ok)
+            all_rank_status = self.dist.tp_allgather(local_status)
         else:
-            all_ranks_ok = [local_ok]
+            all_rank_status = [local_status]
+        all_ranks_ok = [status[0] for status in all_rank_status]
         global_ok = min(all_ranks_ok) == 1
+        self._benchmark_sync_progress_global = any(
+            status[1] for status in all_rank_status)
 
         if self.dist.rank == 0:
             if global_ok:
@@ -3075,10 +3096,13 @@ class PyExecutor:
                 num_in_progress = sum(
                     1 for req in self.active_requests
                     if req.is_disagg_generation_transmission_in_progress)
+                num_errors = sum(
+                    1 for req in self.active_requests
+                    if req.state == LlmRequestState.DISAGG_TRANS_ERROR)
                 logger.debug(
                     f"Benchmark disagg fill: blocked on ranks {blocked_ranks} "
                     f"(rank {self.dist.rank} local: {num_init} INIT, "
-                    f"{num_in_progress} in-progress, "
+                    f"{num_in_progress} in-progress, {num_errors} errors, "
                     f"inflight={not local_no_inflight})")
         return global_ok
 
@@ -3091,9 +3115,10 @@ class PyExecutor:
         consolidates the check used by both ``_executor_loop`` and
         ``_executor_loop_overlap``.
 
-        A short sleep (0.1s) yields the CPU between retries while
-        keeping the polling interval short enough to avoid KV transfer
-        backpressure on the CTX server.
+        A short sleep (0.1s) yields the CPU between retries that made no
+        transfer progress while keeping the polling interval short enough to
+        avoid KV transfer backpressure on the CTX server. Synchronous receives
+        already block until they make progress, so those retries do not sleep.
 
         Args:
             scheduled_batch: The current scheduled batch.
@@ -3104,35 +3129,59 @@ class PyExecutor:
             the caller should ``continue`` to the next loop iteration.
         """
         if not self.is_warmup and not can_forward:
+            sync_transfer_made_progress = getattr(
+                self, "_sync_disagg_transfer_made_progress", False)
+            self._sync_disagg_transfer_made_progress = False
             can_forward = self._is_benchmark_disagg_fill_complete(
-                scheduled_batch)
+                scheduled_batch, sync_transfer_made_progress)
+            sync_transfer_made_progress = self._benchmark_sync_progress_global
             if can_forward:
                 self._benchmark_fill_phase_active = False
                 self._fill_admit_cap = 0
-            else:
+            elif not sync_transfer_made_progress:
                 time.sleep(0.1)
+            if not can_forward:
                 return can_forward, True
         return can_forward, False
 
     def _handle_disagg_cache_errors_synced(self):
         """ADP-safe disagg cache error handler.
 
-        Called from the top of every executor iteration so all TP ranks
-        enter ``_handle_errors`` together; otherwise the downstream
-        ``tp_gather`` in ``_enqueue_responses`` deadlocks.
+        Called from the top of every executor iteration. TP ranks vote on
+        failed request IDs and fail matching local replicas together;
+        otherwise the downstream ``tp_gather`` in ``_enqueue_responses``
+        deadlocks or leaves peer replicas running.
         """
         if not (self.kv_cache_transceiver and self.enable_attention_dp
                 and self.dist.world_size != 1):
             return
+
+        def request_vote_id(request: LlmRequest) -> int:
+            return (request.parent_request_id
+                    if request.is_child else request.py_request_id)
+
         local_error_requests = self._get_disagg_reqs_in_error_state()
-        any_has_errors = any(self.dist.tp_allgather(bool(local_error_requests)))
-        if not any_has_errors:
+        local_error_ids = [
+            request_vote_id(request) for request in local_error_requests
+        ]
+        all_error_ids = self.dist.tp_allgather(local_error_ids)
+        voted_error_ids = {
+            request_id
+            for rank_error_ids in all_error_ids
+            for request_id in rank_error_ids
+        }
+        if not voted_error_ids:
             return
+        local_voted_error_requests = [
+            request for request in self.active_requests
+            if request_vote_id(request) in voted_error_ids
+        ]
         logger.warning(f"Disagg KV cache transfer error: rank={self.dist.rank} "
-                       f"local_err_count={len(local_error_requests)}")
+                       f"local_err_count={len(local_error_requests)}, "
+                       f"voted_err_count={len(voted_error_ids)}")
         self._handle_errors(
             "Disagg KV cache transfer error",
-            requests=local_error_requests,
+            requests=local_voted_error_requests,
             charge_budget=False,
         )
 
@@ -4894,6 +4943,10 @@ class PyExecutor:
         if not self._uses_async_disagg_gen_transfer():
             for req in new_gen_reqs:
                 self.kv_cache_transceiver.request_and_receive_sync(req)
+                if req.state == LlmRequestState.DISAGG_TRANS_ERROR:
+                    break
+                if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE:
+                    self._sync_disagg_transfer_made_progress = True
             self._check_cache_transfer_errors("generation requests")
             return
 
