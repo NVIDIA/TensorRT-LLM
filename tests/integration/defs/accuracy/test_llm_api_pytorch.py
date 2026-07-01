@@ -127,12 +127,30 @@ def shared_mpi_session_4gpu(hf_weight_cache):
     yield from _shared_mpi_session(4)
 
 
+def _reset_worker_torch_compile_state():
+    """Reset per-worker torch.compile / Dynamo state (runs inside each worker).
+
+    Dynamo's recompile counter is process-global and per-code-object. When
+    worker processes are reused across LLMs (shared MpiPoolSession), each
+    torch_compile case recompiles the same model.forward code object under new
+    guards; the count accumulates and eventually trips
+    `recompile_limit` (16), which is a HARD failure under `fullgraph=True`
+    (FailOnRecompileLimitHit) and aborts the whole MPI job. Resetting between
+    cases makes each LLM start from a clean compile cache, like a fresh process.
+    """
+    import torch
+    torch._dynamo.reset()
+
+
 def _make_shared_llm(mpi_session):
     """Return an LLM factory that transparently injects a shared MPI session.
 
     Tests build the LLM by calling this factory exactly like ``LLM(...)``; the
     shared session (if any) is passed through without the test having to know it
     exists. Falls back to a private per-LLM session when ``mpi_session`` is None.
+
+    The factory carries the ``mpi_session`` so callers can reset per-worker
+    compile state between cases without threading the session separately.
     """
 
     def shared_llm(*args, **kwargs):
@@ -140,6 +158,7 @@ def _make_shared_llm(mpi_session):
             kwargs["_mpi_session"] = mpi_session
         return LLM(*args, **kwargs)
 
+    shared_llm.mpi_session = mpi_session
     return shared_llm
 
 
@@ -2512,20 +2531,28 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         if fp8kv:
             kv_cache_config.dtype = "fp8"
 
-        with make_llm(
-                f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
-                tensor_parallel_size=tp_size,
-                pipeline_parallel_size=pp_size,
-                moe_expert_parallel_size=ep_size,
-                kv_cache_config=kv_cache_config,
-                **pytorch_config,
-                enable_attention_dp=attention_dp,
-                speculative_config=mtp_config,
-        ) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+        try:
+            with make_llm(
+                    f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
+                    tensor_parallel_size=tp_size,
+                    pipeline_parallel_size=pp_size,
+                    moe_expert_parallel_size=ep_size,
+                    kv_cache_config=kv_cache_config,
+                    **pytorch_config,
+                    enable_attention_dp=attention_dp,
+                    speculative_config=mtp_config,
+            ) as llm:
+                assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
 
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+                task = GSM8K(self.MODEL_NAME)
+                task.evaluate(llm)
+        finally:
+            # On a reused MPI session, reset each worker's torch.compile/Dynamo
+            # state so recompile counts don't accumulate across cases and trip
+            # the fullgraph recompile limit (FailOnRecompileLimitHit).
+            mpi_session = getattr(make_llm, "mpi_session", None)
+            if mpi_session is not None:
+                mpi_session.submit_sync(_reset_worker_torch_compile_state)
 
     @parametrize_with_ids(
         "fp8kv,attention_dp,cuda_graph,overlap_scheduler",
