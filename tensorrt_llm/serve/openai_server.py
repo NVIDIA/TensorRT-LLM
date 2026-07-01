@@ -179,6 +179,15 @@ def _normalize_image_output(image) -> list:
 
 class OpenAIServer(_VideoRoutesMixin):
 
+    @staticmethod
+    def _iteration_stats_buffer_maxlen(
+            iter_stats_max_iterations: Optional[int]) -> Optional[int]:
+        if iter_stats_max_iterations is None or iter_stats_max_iterations == 0:
+            return 1000
+        if iter_stats_max_iterations < 0:
+            return None
+        return iter_stats_max_iterations
+
     def __init__(
             self,
             generator: Union[LLM, MultimodalEncoder, VisualGen],
@@ -289,8 +298,9 @@ class OpenAIServer(_VideoRoutesMixin):
                     # Other consumers can read it through get_iteration_stats(),
                     # which clears the buffer. Adding another queue consumer
                     # requires revisiting the buffering and clearing ownership.
-                    max_buf = getattr(self.generator.args,
-                                      "iter_stats_max_iterations", 1000) or 1000
+                    max_buf = self._iteration_stats_buffer_maxlen(
+                        getattr(self.generator.args,
+                                "iter_stats_max_iterations", 1000))
                     self._iteration_stats_buffer = deque(maxlen=max_buf)
                     self._iteration_stats_collector_task = asyncio.create_task(
                         self._iteration_stats_collector_loop())

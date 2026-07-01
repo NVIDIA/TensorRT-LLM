@@ -22,8 +22,10 @@ from tensorrt_llm.serve.openai_server import OpenAIServer
 
 
 class _FakeGenerator:
-    def __init__(self, stat_batches: list[list[dict]]):
-        self.args = SimpleNamespace(iter_stats_max_iterations=None)
+    def __init__(
+        self, stat_batches: list[list[dict]], iter_stats_max_iterations: int | None = None
+    ):
+        self.args = SimpleNamespace(iter_stats_max_iterations=iter_stats_max_iterations)
         self._stat_batches = deque(stat_batches)
         self.stats_timeouts = []
 
@@ -51,12 +53,15 @@ def _make_server(
     *,
     with_stats_buffer: bool = True,
     is_visual_gen: bool = False,
+    iter_stats_max_iterations: int | None = None,
 ) -> OpenAIServer:
     server = object.__new__(OpenAIServer)
-    server.generator = _FakeGenerator(stat_batches)
+    server.generator = _FakeGenerator(stat_batches, iter_stats_max_iterations)
     server.metrics_collector = _FakeMetricsCollector()
     server._is_visual_gen = is_visual_gen
-    max_buffer_size = server.generator.args.iter_stats_max_iterations or 1000
+    max_buffer_size = OpenAIServer._iteration_stats_buffer_maxlen(
+        server.generator.args.iter_stats_max_iterations
+    )
     server._iteration_stats_buffer = deque(maxlen=max_buffer_size) if with_stats_buffer else None
     return server
 
@@ -78,6 +83,18 @@ async def test_metrics_endpoint_reads_background_buffer():
 
     response = await server.get_iteration_stats()
     assert _response_content(response) == []
+
+
+@pytest.mark.asyncio
+async def test_metrics_endpoint_reads_unbounded_background_buffer():
+    stats = [{"iter": idx} for idx in range(3)]
+    server = _make_server([], iter_stats_max_iterations=-1)
+    assert server._iteration_stats_buffer.maxlen is None
+    server._iteration_stats_buffer.extend(stats)
+
+    response = await server.get_iteration_stats()
+
+    assert _response_content(response) == stats
 
 
 @pytest.mark.asyncio
