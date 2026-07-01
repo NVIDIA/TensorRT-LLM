@@ -12,6 +12,7 @@ TensorRT LLM offers a variety of quantization recipes to optimize LLM inference.
 * FP8 Rowwise
 * FP8 KV Cache
 * NVFP4 KV Cache
+* W8A8 SmoothQuant (INT8)
 * W4A16 GPTQ
 * W4A8 GPTQ
 * W4A16 AWQ
@@ -85,6 +86,18 @@ scripts/huggingface_example.sh --model <huggingface_model_card> --quant fp8 --kv
 ```
 
 Note that currently TRT-LLM only supports FP8 weight/activation quantization when NVFP4 KV cache is enabled. Therefore, `--quant fp8` is required here.
+
+#### W8A8 SmoothQuant (INT8)
+
+W8A8 SmoothQuant (`int8_sq`) quantizes both weights and activations to INT8. It uses [SmoothQuant](https://arxiv.org/abs/2211.10438) to migrate quantization difficulty from activations to weights before applying per-channel or per-tensor INT8 quantization. Use the `quantize.py` script from `examples/quantization/`:
+
+```bash
+python examples/quantization/quantize.py \
+    --model_dir <huggingface_model_dir> \
+    --dtype float16 \
+    --qformat int8_sq \
+    --output_dir <output_dir>
+```
 
 ## Model Support Matrix
 
