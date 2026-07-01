@@ -697,19 +697,21 @@ def wan22_bf16_video_path(_visual_gen_deps, llm_venv):
     output_path = _visual_gen_output_path(llm_venv, "wan22_bf16")
     if os.path.isfile(output_path):
         return output_path
-    _generate_wan_lpips_video(
-        _lpips_model_path("Wan2.2-T2V-A14B-Diffusers"),
-        output_path,
-        WAN22_LPIPS_PROMPT,
-        WAN22_LPIPS_NEGATIVE_PROMPT,
-        WAN22_LPIPS_HEIGHT,
-        WAN22_LPIPS_WIDTH,
-        WAN22_LPIPS_NUM_FRAMES,
-        WAN22_LPIPS_NUM_INFERENCE_STEPS,
-        WAN22_LPIPS_GUIDANCE_SCALE,
-        WAN22_LPIPS_SEED,
-        WAN22_LPIPS_FRAME_RATE,
-    )
+    # TorchCompileConfig(enable=False) does not suppress nested @torch.compile decorators.
+    with torch.compiler.set_stance("force_eager"):
+        _generate_wan_lpips_video(
+            _lpips_model_path("Wan2.2-T2V-A14B-Diffusers"),
+            output_path,
+            WAN22_LPIPS_PROMPT,
+            WAN22_LPIPS_NEGATIVE_PROMPT,
+            WAN22_LPIPS_HEIGHT,
+            WAN22_LPIPS_WIDTH,
+            WAN22_LPIPS_NUM_FRAMES,
+            WAN22_LPIPS_NUM_INFERENCE_STEPS,
+            WAN22_LPIPS_GUIDANCE_SCALE,
+            WAN22_LPIPS_SEED,
+            WAN22_LPIPS_FRAME_RATE,
+        )
     return output_path
 
 
