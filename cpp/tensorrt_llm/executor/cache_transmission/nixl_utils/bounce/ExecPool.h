@@ -29,7 +29,7 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 {
 
 // ============================================================================
-// ExecPool — gather/scatter execution contexts, decoupled from the data region (DESIGN)
+// ExecPool — gather/scatter execution contexts, decoupled from the data region
 // ----------------------------------------------------------------------------
 // With the variable-region arena, the data buffer a chunk uses is just a region (offset,len) held
 // until ACK — a LONG lifetime. The CUDA resources needed to RUN one gather/scatter kernel
