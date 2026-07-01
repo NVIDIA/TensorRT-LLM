@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,7 +18,7 @@ import os
 import platform
 import sys
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import pynvml
 import torch
@@ -400,17 +400,48 @@ class HelixCpMnnvlMemory(MnnvlMemory):
     its own isolated state separate from MnnvlMemory.
     """
 
+    comm_topology = None
+
+    @staticmethod
+    def get_comm_topology(
+        mapping: Mapping,
+    ) -> Tuple[int, int, int, Tuple[int, ...]]:
+        """Return the exact local CP topology used by ``MPI_Comm_split``."""
+        return (
+            int(mapping.world_size),
+            int(mapping.rank),
+            int(mapping.cp_rank),
+            tuple(int(rank) for rank in mapping.cp_group),
+        )
+
     @classmethod
     def get_comm(cls, mapping: Mapping):
         """Get CP-based communicator (ranks grouped by PP+TP+MOE_TP, ordered by CP rank)."""
+        topology = cls.get_comm_topology(mapping)
         if cls.comm is not None:
+            if cls.comm_topology != topology:
+                raise RuntimeError(
+                    "Helix MNNVL CP communicator is already initialized for "
+                    f"topology {cls.comm_topology}; cannot reuse it for "
+                    f"incompatible topology {topology}"
+                )
             return cls.comm
         comm = mpi_comm().Split(
             mapping.pp_rank * mapping.tp_size + mapping.tp_rank,
             mapping.cp_rank,
         )
         cls.comm = comm
+        cls.comm_topology = topology
         return comm
+
+
+def get_helix_cp_mnnvl_topology(
+    mapping: Mapping,
+) -> Optional[Tuple[int, int, int, Tuple[int, ...]]]:
+    """Return the Helix MNNVL topology relevant to communicator sharing."""
+    if mapping.has_cp_helix() and not mapping.cp_config.get("use_nccl_for_alltoall", True):
+        return HelixCpMnnvlMemory.get_comm_topology(mapping)
+    return None
 
 
 def init_helix_cp_comm(mapping: Mapping) -> None:

@@ -1,6 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import math
 import pickle  # nosec B403
+import threading
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from enum import IntEnum
 from functools import lru_cache, wraps
 from typing import Any, Callable, List, Optional, Tuple
@@ -16,7 +33,11 @@ try:
 except Exception:
     MPI = None  # deferred; functions will error if used when ENABLE_MULTI_DEVICE is True
 
-from tensorrt_llm._mnnvl_utils import init_helix_cp_comm
+from tensorrt_llm._mnnvl_utils import (get_helix_cp_mnnvl_topology,
+                                       init_helix_cp_comm)
+from tensorrt_llm._torch.distributed.nccl_fault_tolerance import (
+    NCCL_FAULT_TOLERANCE_ENABLED, _canonical_recovery_generation,
+    _recovery_rendezvous_id)
 from tensorrt_llm._utils import (mpi_allgather, mpi_barrier, mpi_comm,
                                  mpi_disabled, mpi_isend, mpi_isend_object,
                                  mpi_recv, mpi_recv_object, mpi_send,
@@ -71,6 +92,448 @@ _reduce_op_to_mpi_dict = {
 
 def reduce_op_to_mpi(op: ReduceOp) -> MPI.Op:
     return _reduce_op_to_mpi_dict[op]
+
+
+@dataclass(frozen=True)
+class MpiFtSubcommSetup:
+    """Collectively validated WideEP FT communicator startup state."""
+
+    comm: Any
+    local_rank: int
+    ep_size: int
+    ulfm_available: bool
+
+
+_MPI_FT_PROCESS_LIFETIME_REFS: list[Any] = []
+_MPI_FT_PROCESS_LIFETIME_REFS_LOCK = threading.Lock()
+
+
+def _retain_mpi_ft_comm(comm: Any) -> None:
+    """Keep a communicator with unsafe cleanup reachable until process exit."""
+    with _MPI_FT_PROCESS_LIFETIME_REFS_LOCK:
+        _MPI_FT_PROCESS_LIFETIME_REFS.append(comm)
+
+
+def _is_mpi_ft_int(value: Any) -> bool:
+    """Reject bool/float values that compare equal to MPI integer fields."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _mpi_ft_local_topology(mapping: Mapping, parent_rank: int, parent_size: int,
+                           provided_thread_level: int,
+                           health_size: Optional[int]) -> dict[str, Any]:
+    """Build a serializable startup record without raising locally."""
+    world_size = None
+    mapping_rank = None
+    ep_group = None
+    ep_size = None
+    ep_rank = None
+    mapping_error = None
+    try:
+        world_size = mapping.world_size
+        mapping_rank = mapping.rank
+        ep_group = tuple(mapping.moe_ep_group)
+        ep_size = mapping.moe_ep_size
+        ep_rank = mapping.moe_ep_rank
+    except Exception as error:
+        mapping_error = ("invalid WideEP FT mapping topology: "
+                         f"{type(error).__name__}: {error}")
+
+    error_kind = None
+    error_message = None
+    if provided_thread_level < MPI.THREAD_MULTIPLE:
+        error_kind = "runtime"
+        error_message = (
+            "WideEP FT requires MPI.THREAD_MULTIPLE because its control-plane "
+            "thread overlaps other MPI traffic "
+            f"(provided={provided_thread_level}, required={MPI.THREAD_MULTIPLE})"
+        )
+    elif mapping_error is not None:
+        error_kind = "value"
+        error_message = mapping_error
+    elif not ep_group:
+        error_kind = "value"
+        error_message = "mapping.moe_ep_group must not be empty"
+    elif len(ep_group) != ep_size:
+        error_kind = "value"
+        error_message = (
+            "mapping.moe_ep_group size must match mapping.moe_ep_size, "
+            f"got {len(ep_group)} and {ep_size}")
+    else:
+        try:
+            has_duplicate_ranks = len(set(ep_group)) != len(ep_group)
+            has_invalid_rank = any(
+                not isinstance(rank, int) or rank < 0 or rank >= parent_size
+                for rank in ep_group)
+        except TypeError as error:
+            error_kind = "value"
+            error_message = f"mapping.moe_ep_group contains invalid ranks: {error}"
+        else:
+            if has_duplicate_ranks:
+                error_kind = "value"
+                error_message = (
+                    "mapping.moe_ep_group contains duplicate ranks: "
+                    f"{ep_group}")
+            elif parent_size != world_size:
+                error_kind = "runtime"
+                error_message = (
+                    "WideEP FT parent communicator size must match "
+                    f"mapping.world_size, got {parent_size} and {world_size}")
+            elif parent_rank != mapping_rank:
+                error_kind = "runtime"
+                error_message = (
+                    "WideEP FT parent communicator rank must match mapping.rank, "
+                    f"got {parent_rank} and {mapping_rank}")
+            elif has_invalid_rank:
+                error_kind = "value"
+                error_message = (
+                    "mapping.moe_ep_group contains a rank outside the parent "
+                    f"communicator: {ep_group}")
+            elif ep_size != world_size or set(ep_group) != set(
+                    range(parent_size)):
+                error_kind = "value"
+                error_message = (
+                    "WideEP FT MVP requires one MoE EP group spanning the "
+                    "full MPI world; "
+                    f"got world_size={world_size}, moe_ep_group={ep_group}")
+            elif health_size is not None and health_size != ep_size:
+                error_kind = "value"
+                error_message = (
+                    "EPGroupHealth size must match mapping.moe_ep_size, "
+                    f"got {health_size} and {ep_size}")
+            elif parent_rank not in ep_group:
+                error_kind = "value"
+                error_message = (
+                    f"local rank {parent_rank} is not in its MoE EP group "
+                    f"{ep_group}")
+            elif ep_group.index(parent_rank) != ep_rank:
+                error_kind = "value"
+                error_message = (
+                    "mapping.moe_ep_group order must match mapping.moe_ep_rank, "
+                    f"got group index {ep_group.index(parent_rank)} and EP rank "
+                    f"{ep_rank}")
+
+    return {
+        "parent_rank": parent_rank,
+        "parent_size": parent_size,
+        "world_size": world_size,
+        "mapping_rank": mapping_rank,
+        "ep_group": ep_group,
+        "ep_size": ep_size,
+        "ep_rank": ep_rank,
+        "health_size": health_size,
+        "error_kind": error_kind,
+        "error_message": error_message,
+    }
+
+
+def _validate_mpi_ft_topologies(topologies: List[Any],
+                                parent_size: int) -> None:
+    """Raise the same validation error on every parent-communicator rank."""
+    if len(topologies) != parent_size:
+        raise RuntimeError(
+            "WideEP FT startup allgather returned an unexpected number of "
+            f"topologies: got {len(topologies)}, expected {parent_size}")
+
+    for gather_rank, topology in enumerate(topologies):
+        if not isinstance(topology, dict):
+            raise RuntimeError(
+                "WideEP FT startup allgather returned an invalid topology for "
+                f"parent rank {gather_rank}: {topology!r}")
+
+    # Object allgather returns records in communicator-rank order. Selecting the
+    # first error makes every rank raise the same exception before Split.
+    for gather_rank, topology in enumerate(topologies):
+        error_message = topology.get("error_message")
+        if error_message is None:
+            continue
+        reporting_rank = topology.get("parent_rank", gather_rank)
+        message = ("WideEP FT startup validation failed on parent rank "
+                   f"{reporting_rank}: {error_message}")
+        if topology.get("error_kind") == "value":
+            raise ValueError(message)
+        raise RuntimeError(message)
+
+    for gather_rank, topology in enumerate(topologies):
+        reported_parent_rank = topology.get("parent_rank")
+        if (not _is_mpi_ft_int(reported_parent_rank)
+                or reported_parent_rank != gather_rank):
+            raise RuntimeError(
+                "WideEP FT startup topology is inconsistent: allgather slot "
+                f"{gather_rank} reports parent rank "
+                f"{reported_parent_rank!r}")
+        reported_parent_size = topology.get("parent_size")
+        if (not _is_mpi_ft_int(reported_parent_size)
+                or reported_parent_size != parent_size):
+            raise RuntimeError(
+                "WideEP FT startup topology is inconsistent: parent rank "
+                f"{gather_rank} reports communicator size "
+                f"{reported_parent_size!r}, expected {parent_size}")
+
+        ep_group = topology.get("ep_group")
+        if not isinstance(ep_group, (list, tuple)):
+            raise RuntimeError(
+                "WideEP FT startup topology is inconsistent: parent rank "
+                f"{gather_rank} reports invalid EP group {ep_group!r}")
+        if len(ep_group) != parent_size:
+            raise RuntimeError(
+                "WideEP FT startup topology is inconsistent: parent rank "
+                f"{gather_rank} reports EP group size {len(ep_group)}, "
+                f"expected {parent_size}")
+        if any(
+                isinstance(peer_rank, bool) or not _is_mpi_ft_int(peer_rank)
+                or peer_rank < 0 or peer_rank >= parent_size
+                for peer_rank in ep_group):
+            raise RuntimeError(
+                "WideEP FT startup topology is inconsistent: parent rank "
+                f"{gather_rank} reports invalid EP group ranks {ep_group!r}")
+        if len(set(ep_group)) != parent_size:
+            raise RuntimeError(
+                "WideEP FT startup topology is inconsistent: parent rank "
+                f"{gather_rank} reports duplicate EP group ranks {ep_group!r}")
+        world_size = topology.get("world_size")
+        if not _is_mpi_ft_int(world_size) or world_size != parent_size:
+            raise RuntimeError(
+                "WideEP FT startup topology is inconsistent: parent rank "
+                f"{gather_rank} reports world size "
+                f"{world_size!r}, expected {parent_size}")
+        mapping_rank = topology.get("mapping_rank")
+        if not _is_mpi_ft_int(mapping_rank) or mapping_rank != gather_rank:
+            raise RuntimeError(
+                "WideEP FT startup topology is inconsistent: parent rank "
+                f"{gather_rank} reports mapping rank "
+                f"{mapping_rank!r}")
+        ep_size = topology.get("ep_size")
+        if not _is_mpi_ft_int(ep_size) or ep_size != parent_size:
+            raise RuntimeError(
+                "WideEP FT startup topology is inconsistent: parent rank "
+                f"{gather_rank} reports EP size {ep_size!r}, "
+                f"expected {parent_size}")
+        ep_rank = topology.get("ep_rank")
+        if (not _is_mpi_ft_int(ep_rank) or ep_rank < 0 or ep_rank >= parent_size
+                or ep_group[ep_rank] != gather_rank):
+            raise RuntimeError(
+                "WideEP FT startup topology is inconsistent: parent rank "
+                f"{gather_rank} reports invalid EP rank {ep_rank!r} for "
+                f"group {ep_group!r}")
+        health_size = topology.get("health_size")
+        if health_size is not None and (not _is_mpi_ft_int(health_size)
+                                        or health_size != parent_size):
+            raise RuntimeError(
+                "WideEP FT startup topology is inconsistent: parent rank "
+                f"{gather_rank} reports health size {health_size}, "
+                f"expected {parent_size}")
+    # Only dereference peer groups after every gathered record has passed the
+    # schema/range checks above. This keeps malformed records rank-attributed and
+    # prevents a valid earlier record from indexing into unchecked peer data.
+    for gather_rank, topology in enumerate(topologies):
+        ep_group = topology["ep_group"]
+        for peer_rank in ep_group:
+            peer_group = topologies[peer_rank].get("ep_group")
+            if peer_group != ep_group:
+                raise RuntimeError(
+                    "WideEP FT startup topology is inconsistent: parent rank "
+                    f"{gather_rank} reports EP group {ep_group}, but member "
+                    f"rank {peer_rank} reports {peer_group}")
+
+
+def _mpi_ft_post_split_status(ft_comm: Any, parent_rank: int, ep_rank: int,
+                              ep_size: int) -> dict[str, Any]:
+    """Configure a derived communicator without raising before reconciliation."""
+    error_message = None
+    ulfm_available = False
+    try:
+        # Install the non-fatal handler before any other operation on the new
+        # communicator. In particular, do not inspect a possibly broken handle
+        # while it still inherits the parent's fatal error policy.
+        ft_comm.Set_errhandler(MPI.ERRORS_RETURN)
+        actual_rank = ft_comm.Get_rank()
+        actual_size = ft_comm.Get_size()
+        if actual_size != ep_size or actual_rank != ep_rank:
+            error_message = (
+                "MPI_Comm_split created an unexpected WideEP FT communicator: "
+                f"rank={actual_rank}, size={actual_size}, "
+                f"expected rank={ep_rank}, size={ep_size}")
+    except Exception as error:
+        error_message = ("WideEP FT communicator setup raised "
+                         f"{type(error).__name__}: {error}")
+
+    if error_message is None and callable(getattr(
+            ft_comm, "Is_revoked", None)) and callable(
+                getattr(ft_comm, "Revoke", None)):
+        try:
+            already_revoked = ft_comm.Is_revoked()
+        except Exception as error:
+            if not _is_unsupported_mpi_ulfm_error(error):
+                error_message = ("WideEP FT ULFM probe raised "
+                                 f"{type(error).__name__}: {error}")
+        else:
+            if already_revoked:
+                error_message = (
+                    "WideEP FT communicator is already revoked at construction")
+            else:
+                ulfm_available = True
+    return {
+        "parent_rank": parent_rank,
+        "error_message": error_message,
+        "ulfm_available": ulfm_available,
+    }
+
+
+def _is_unsupported_mpi_ulfm_error(error: BaseException) -> bool:
+    if isinstance(error, NotImplementedError):
+        return True
+    mpi_exception = getattr(MPI, "Exception", None)
+    if not isinstance(mpi_exception, type) or not isinstance(
+            error, mpi_exception):
+        return False
+    get_error_class = getattr(error, "Get_error_class", None)
+    if not callable(get_error_class):
+        return False
+    unsupported_classes = {
+        value
+        for value in (
+            getattr(MPI, "ERR_NOT_SUPPORTED", None),
+            getattr(MPI, "ERR_UNSUPPORTED_OPERATION", None),
+        ) if value is not None
+    }
+    try:
+        error_class = get_error_class()
+    except Exception:
+        # This helper runs while building a rank-local status that must reach
+        # the parent allgather. A broken exception classifier is not evidence of
+        # an unsupported operation, but it must not strand peer ranks either.
+        return False
+    return error_class in unsupported_classes
+
+
+def _mpi_ft_post_split_result(
+    statuses: List[Any],
+    parent_size: int,
+) -> tuple[Optional[str], bool]:
+    """Reconcile setup errors and the global ULFM capability."""
+    if len(statuses) != parent_size:
+        return (
+            "WideEP FT post-split allgather returned an unexpected number of "
+            f"statuses: got {len(statuses)}, expected {parent_size}",
+            False,
+        )
+    for gather_rank, status in enumerate(statuses):
+        if not isinstance(status, dict):
+            return (
+                "WideEP FT post-split allgather returned an invalid status for "
+                f"parent rank {gather_rank}: {status!r}",
+                False,
+            )
+        if status.get("parent_rank") != gather_rank:
+            return (
+                "WideEP FT post-split status is inconsistent: allgather slot "
+                f"{gather_rank} reports parent rank "
+                f"{status.get('parent_rank')}",
+                False,
+            )
+        if not isinstance(status.get("ulfm_available"), bool):
+            return (
+                "WideEP FT post-split allgather returned incomplete capability "
+                f"state for parent rank {gather_rank}: {status!r}",
+                False,
+            )
+
+    ulfm_available = all(status["ulfm_available"] for status in statuses)
+    for gather_rank, status in enumerate(statuses):
+        error_message = status.get("error_message")
+        if error_message is not None:
+            return (
+                "WideEP FT communicator setup failed on parent rank "
+                f"{gather_rank}: {error_message}",
+                False,
+            )
+    return None, ulfm_available
+
+
+def create_mpi_ft_subcomm(
+        mapping: Mapping,
+        parent_comm: Optional[Any] = None,
+        health_size: Optional[int] = None) -> MpiFtSubcommSetup:
+    """Create the dedicated MPI control-plane communicator for WideEP FT.
+
+    This operation is collective across ``parent_comm`` and must run on every
+    rank during startup, before any background failure-broadcast threads are
+    launched. The MVP requires one MoE EP group spanning the parent world,
+    ordered by the EP-local rank used by the caller's detected-rank state.
+
+    Before splitting, ranks exchange their local validation outcome and EP
+    topology on the healthy parent communicator. This prevents one rank from
+    raising locally while its peers block forever inside ``MPI_Comm_split``.
+
+    Args:
+        mapping: Distributed topology for the local rank.
+        parent_comm: Parent MPI communicator. Defaults to TRT-LLM's active
+            ``mpi_comm()``, which wraps ``MPI.COMM_WORLD`` in the standard
+            launch path and preserves custom communicator sessions.
+        health_size: Optional local detected-rank-state size to validate
+            collectively before splitting.
+
+    Returns:
+        The world-spanning EP MPI communicator and its collectively validated
+        rank, size, and ULFM capability.
+
+    Raises:
+        RuntimeError: If MPI is unavailable, does not provide
+            ``MPI.THREAD_MULTIPLE``, or creates an unexpected communicator.
+        ValueError: If the mapping's EP group is inconsistent.
+    """
+    if MPI is None:
+        raise RuntimeError(
+            "mpi4py is required to create the WideEP FT communicator")
+
+    parent_comm = mpi_comm() if parent_comm is None else parent_comm
+    parent_rank = parent_comm.Get_rank()
+    parent_size = parent_comm.Get_size()
+    local_topology = _mpi_ft_local_topology(mapping, parent_rank, parent_size,
+                                            MPI.Query_thread(), health_size)
+    topologies = parent_comm.allgather(local_topology)
+    _validate_mpi_ft_topologies(topologies, parent_size)
+
+    ep_group = local_topology["ep_group"]
+    ep_rank = local_topology["ep_rank"]
+    ep_size = local_topology["ep_size"]
+
+    # The MVP topology gate above makes the world-spanning group's first rank
+    # a stable color shared by every process.
+    ft_comm = parent_comm.Split(color=ep_group[0], key=ep_rank)
+    try:
+        setup_status = _mpi_ft_post_split_status(ft_comm, parent_rank, ep_rank,
+                                                 ep_size)
+        setup_statuses = parent_comm.allgather(setup_status)
+        setup_error, ulfm_available = _mpi_ft_post_split_result(
+            setup_statuses, parent_size)
+        if setup_error is None:
+            setup = MpiFtSubcommSetup(
+                comm=ft_comm,
+                local_rank=ep_rank,
+                ep_size=ep_size,
+                ulfm_available=ulfm_available,
+            )
+            # Enforce process-lifetime ownership at the creation boundary. A
+            # direct or future caller must not be able to drop the last Python
+            # reference and trigger rank-local collective MPI_Comm_free.
+            _retain_mpi_ft_comm(ft_comm)
+            return setup
+    except Exception:
+        # Once Split succeeds, never let an unexpected post-Split exception
+        # drop the last reference and trigger rank-local communicator cleanup.
+        _retain_mpi_ft_comm(ft_comm)
+        raise
+
+    # MPI_Comm_free is collective. Once setup has reported any communicator
+    # invariant failure, attempting collective cleanup on that same handle is
+    # not provably bounded, even with MPI_ERRORS_RETURN installed. Keep the
+    # handle reachable and let MPI reclaim it at process teardown.
+    _retain_mpi_ft_comm(ft_comm)
+    logger.warning("WideEP FT retained a communicator after startup failure: "
+                   f"{setup_error}")
+    raise RuntimeError(setup_error)
 
 
 class Distributed(ABC):
@@ -1177,16 +1640,67 @@ class PPCommNCCL:
 
     def __init__(self, global_mapping: Mapping):
         self.mapping = global_mapping
+        self._topology = self._mapping_topology(global_mapping)
+        self._reconfigure_lock = threading.Lock()
+        self._reconfigure_generation = 0
+        self._completed_recovery = None
         self.nccl_comm = torch.classes.trtllm.NcclCommunicatorOp(
             self.mapping.world_size,
             self.mapping.rank,
         )
+        if NCCL_FAULT_TOLERANCE_ENABLED:
+            # The FT native communicator survives process-local Python wrapper
+            # churn. Mirror its actual survivor membership instead of assuming
+            # a newly-created wrapper always represents the initial world.
+            self._active_ranks = tuple(
+                int(rank) for rank in self.nccl_comm.get_active_ranks())
+        else:
+            # Preserve the legacy constructor path when FT is disabled.
+            self._active_ranks = tuple(range(self.mapping.world_size))
         self.tensor_ready_event = torch.cuda.Event()
         self.send_stream = torch.cuda.Stream()
 
+    @staticmethod
+    def _mapping_topology(mapping: Mapping) -> tuple:
+        return (
+            int(mapping.world_size),
+            int(mapping.rank),
+            tuple(mapping.pp_group),
+            get_helix_cp_mnnvl_topology(mapping),
+        )
+
+    def is_compatible(self, mapping: Mapping) -> bool:
+        """Whether another engine can share this process-local communicator."""
+        return self._topology == self._mapping_topology(mapping)
+
+    def _validate_peer(self, peer: int) -> int:
+        peer = int(peer)
+        if peer not in self._topology[2]:
+            raise RuntimeError(
+                f"NCCL error: peer world rank {peer} is not in this rank's PP group "
+                f"{list(self._topology[2])}")
+        if peer not in self._active_ranks:
+            raise RuntimeError(
+                f"NCCL error: peer world rank {peer} is not active in the current PP communicator"
+            )
+        return peer
+
+    def _required_pp_peer(self, *, next_peer: bool) -> int:
+        # Do not silently skip a failed stage: connecting non-adjacent stages
+        # would bypass model layers. A higher-level topology reconstruction may
+        # pass an explicit remapped peer once it has reassigned those layers.
+        peer = (self.mapping.next_pp_rank()
+                if next_peer else self.mapping.prev_pp_rank())
+        return self._validate_peer(peer)
+
     def send(self, tensor: torch.Tensor, dest: Optional[int] = None):
-        if dest is None:
-            dest = self.mapping.next_pp_rank()
+        if not NCCL_FAULT_TOLERANCE_ENABLED:
+            if dest is None:
+                dest = self.mapping.next_pp_rank()
+        elif dest is None:
+            dest = self._required_pp_peer(next_peer=True)
+        else:
+            dest = self._validate_peer(dest)
 
         # NCCL send kernel in send_stream cannot be captured,
         # so we send in the current stream instead in CUDA graph cases.
@@ -1204,9 +1718,109 @@ class PPCommNCCL:
             self.nccl_comm.send(tensor, dest)
 
     def recv(self, tensor: torch.Tensor, src: Optional[int] = None):
-        if src is None:
-            src = self.mapping.prev_pp_rank()
+        if not NCCL_FAULT_TOLERANCE_ENABLED:
+            if src is None:
+                src = self.mapping.prev_pp_rank()
+        elif src is None:
+            src = self._required_pp_peer(next_peer=False)
+        else:
+            src = self._validate_peer(src)
         self.nccl_comm.recv(tensor, src)
+
+    def abort(self, generation: Optional[int] = None) -> None:
+        """Abort the PP communicator on this survivor."""
+        # Capture the generation before waiting for a concurrent rebuild. If
+        # that rebuild succeeds, this abort belongs to the old communicator
+        # and must not tear down its replacement. An abort that starts after
+        # the rebuild observes the new generation and still takes effect.
+        if generation is None:
+            generation = self._reconfigure_generation
+        with self._reconfigure_lock:
+            if generation != self._reconfigure_generation:
+                return
+            self.nccl_comm.abort()
+
+    def abort_and_reinit(self,
+                         active_ranks: List[int],
+                         generation: Optional[int] = None) -> None:
+        """Rebuild the PP communicator using only surviving world ranks.
+
+        Every survivor must call this with the same rank set. The C++ wrapper
+        exchanges a fresh NCCL unique ID point-to-point, so excluded ranks do
+        not participate in communicator initialization.
+
+        ``generation`` is the coordinator's shared monotonic recovery-event
+        generation, advanced for every distinct attempt. It is required for
+        same-membership recovery so every rank enters the native rendezvous
+        even when local watchdog observations differ. Repeated callbacks with
+        the same generation and target are idempotent. A retry after any native
+        failure must use a newly advanced generation so stale rendezvous traffic
+        cannot pair different recovery attempts.
+        """
+        canonical_ranks = tuple(sorted(int(rank) for rank in active_ranks))
+        if not canonical_ranks:
+            raise ValueError("active_ranks must not be empty")
+        if len(canonical_ranks) != len(set(canonical_ranks)):
+            raise ValueError("active_ranks must not contain duplicates")
+        if self.mapping.rank not in canonical_ranks:
+            raise ValueError(
+                f"current world rank {self.mapping.rank} is not active")
+        generation = _canonical_recovery_generation(generation)
+        rendezvous_id = _recovery_rendezvous_id(generation)
+
+        # Failure notifications can be duplicated or delivered concurrently by
+        # independent control paths. Keep the native rebuild and its Python
+        # membership mirror in one transaction so a stale callback cannot
+        # widen membership after a newer shrink has completed.
+        with self._reconfigure_lock:
+            current_ranks = tuple(
+                int(rank) for rank in self.nccl_comm.get_active_ranks())
+            self._active_ranks = current_ranks
+            if generation is not None and self._completed_recovery is not None:
+                completed_generation, completed_target = self._completed_recovery
+                if generation < completed_generation:
+                    return
+                if generation == completed_generation:
+                    if canonical_ranks != completed_target:
+                        raise RuntimeError(
+                            "NCCL error: conflicting PP communicator recovery "
+                            f"target for generation {generation}: completed "
+                            f"{list(completed_target)}, requested {list(canonical_ranks)}"
+                        )
+                    return
+            if canonical_ranks == current_ranks and generation is None:
+                raise ValueError(
+                    "generation is required for same-membership PP communicator "
+                    "recovery so every survivor makes the same rebuild decision"
+                )
+            if not set(canonical_ranks).issubset(current_ranks):
+                raise ValueError(
+                    "abort_and_reinit cannot reactivate a removed rank")
+
+            self.nccl_comm.abort_and_reinit(list(canonical_ranks),
+                                            rendezvous_id)
+            native_ranks = tuple(
+                int(rank) for rank in self.nccl_comm.get_active_ranks())
+            self._active_ranks = native_ranks
+            self._reconfigure_generation += 1
+            if native_ranks != canonical_ranks:
+                raise RuntimeError(
+                    "NCCL error: rebuilt PP communicator returned unexpected "
+                    f"membership {list(native_ranks)}; expected {list(canonical_ranks)}"
+                )
+            if generation is not None:
+                self._completed_recovery = (generation, canonical_ranks)
+
+    def get_async_error(self) -> str:
+        """Return the C++ wrapper's latched NCCL abort/error reason, if any."""
+        return self.nccl_comm.get_async_error()
+
+    def get_active_ranks(self) -> List[int]:
+        """Return original world-rank IDs in the current PP communicator."""
+        with self._reconfigure_lock:
+            self._active_ranks = tuple(
+                int(rank) for rank in self.nccl_comm.get_active_ranks())
+            return list(self._active_ranks)
 
 
 class PPCommTorch:
@@ -1239,16 +1853,149 @@ class PPCommTorch:
 
 
 _pp_comm = None
+_pp_comm_refcount = 0
+_pp_comm_lock = threading.Lock()
+_pp_comm_condition = threading.Condition(_pp_comm_lock)
+_pp_comm_control_refcount = 0
+_pp_comm_final_release_pending = False
 
 
 def init_pp_comm(mapping):
-    """Initialize PPComm once at startup"""
-    global _pp_comm
-    if mpi_disabled():
-        _pp_comm = PPCommTorch(mapping)
-    else:
-        _pp_comm = PPCommNCCL(mapping)
-    init_helix_cp_comm(mapping)
+    """Acquire the process-local PP communicator for one model engine."""
+    global _pp_comm, _pp_comm_refcount
+    with _pp_comm_condition:
+        while (_pp_comm_control_refcount > 0 or _pp_comm_final_release_pending):
+            _pp_comm_condition.wait()
+        created = False
+        if mpi_disabled():
+            if _pp_comm is None:
+                _pp_comm = PPCommTorch(mapping)
+                created = True
+            elif not isinstance(_pp_comm, PPCommTorch):
+                raise RuntimeError(
+                    "PP communicator is already initialized with a different backend"
+                )
+            elif _pp_comm.mapping != mapping:
+                raise RuntimeError(
+                    "PP communicator is already initialized for a different topology"
+                )
+        else:
+            if _pp_comm is None:
+                _pp_comm = PPCommNCCL(mapping)
+                created = True
+            elif not isinstance(_pp_comm, PPCommNCCL):
+                raise RuntimeError(
+                    "NCCL error: PP communicator is already initialized with a different backend"
+                )
+            elif not _pp_comm.is_compatible(mapping):
+                raise RuntimeError(
+                    "NCCL error: PP communicator is already initialized for a "
+                    "different topology (PP or Helix MNNVL CP topology)")
+        try:
+            init_helix_cp_comm(mapping)
+        except Exception:
+            if created and _pp_comm_refcount == 0:
+                _pp_comm = None
+            raise
+        _pp_comm_refcount += 1
+
+
+def release_pp_comm() -> None:
+    """Release one model engine's ownership of the shared PP communicator."""
+    global _pp_comm, _pp_comm_refcount, _pp_comm_final_release_pending
+    with _pp_comm_condition:
+        if _pp_comm_refcount <= 0:
+            raise RuntimeError(
+                "PP communicator release has no matching acquisition")
+        _pp_comm_refcount -= 1
+        if _pp_comm_refcount == 0:
+            _pp_comm_final_release_pending = True
+            while _pp_comm_control_refcount > 0:
+                _pp_comm_condition.wait()
+            if not (NCCL_FAULT_TOLERANCE_ENABLED
+                    and isinstance(_pp_comm, PPCommNCCL)):
+                # Preserve the legacy teardown behavior when FT is disabled.
+                _pp_comm = None
+            # In FT mode both the native communicator and its Python recovery
+            # generation state are process-lifetime. A rank-local final release
+            # is not a distributed teardown barrier, and dropping either state
+            # could make only one rank enter a duplicate-generation rendezvous.
+            _pp_comm_final_release_pending = False
+            _pp_comm_condition.notify_all()
+
+
+def _get_pp_nccl_comm_locked() -> PPCommNCCL:
+    """Return the NCCL PP communicator while ``_pp_comm_lock`` is held."""
+    if not isinstance(_pp_comm, PPCommNCCL):
+        raise RuntimeError("NCCL error: PP communicator is not initialized")
+    return _pp_comm
+
+
+def _acquire_pp_nccl_control(
+        *,
+        capture_generation: bool = False) -> tuple[PPCommNCCL, Optional[int]]:
+    """Keep the shared communicator alive without holding its lifecycle lock."""
+    global _pp_comm_control_refcount
+    with _pp_comm_lock:
+        comm = _get_pp_nccl_comm_locked()
+        if _pp_comm_refcount <= 0 or _pp_comm_final_release_pending:
+            raise RuntimeError("NCCL error: PP communicator is being released")
+        _pp_comm_control_refcount += 1
+        generation = (comm._reconfigure_generation
+                      if capture_generation else None)
+        return comm, generation
+
+
+def _release_pp_nccl_control() -> None:
+    global _pp_comm_control_refcount
+    with _pp_comm_condition:
+        if _pp_comm_control_refcount <= 0:
+            raise RuntimeError(
+                "NCCL error: PP communicator control reference underflow")
+        _pp_comm_control_refcount -= 1
+        if _pp_comm_control_refcount == 0:
+            _pp_comm_condition.notify_all()
+
+
+def pp_comm_abort() -> None:
+    """Abort the process-local NCCL PP communicator."""
+    comm, generation = _acquire_pp_nccl_control(capture_generation=True)
+    try:
+        comm.abort(generation)
+    finally:
+        comm = None
+        _release_pp_nccl_control()
+
+
+def pp_comm_abort_and_reinit(active_ranks: List[int],
+                             generation: Optional[int] = None) -> None:
+    """Rebuild the NCCL PP communicator using surviving original world ranks."""
+    comm, _ = _acquire_pp_nccl_control()
+    try:
+        comm.abort_and_reinit(active_ranks, generation)
+    finally:
+        comm = None
+        _release_pp_nccl_control()
+
+
+def pp_comm_get_async_error() -> str:
+    """Return the NCCL PP communicator's latched abort/error reason."""
+    comm, _ = _acquire_pp_nccl_control()
+    try:
+        return comm.get_async_error()
+    finally:
+        comm = None
+        _release_pp_nccl_control()
+
+
+def pp_comm_get_active_ranks() -> List[int]:
+    """Return original world-rank IDs in the NCCL PP communicator."""
+    comm, _ = _acquire_pp_nccl_control()
+    try:
+        return comm.get_active_ranks()
+    finally:
+        comm = None
+        _release_pp_nccl_control()
 
 
 @TorchDist.log_op

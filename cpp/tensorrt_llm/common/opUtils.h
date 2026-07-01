@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,6 +29,8 @@
 #include <nccl.h>
 #endif // ENABLE_MULTI_DEVICE
 
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -37,6 +39,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "tensorrt_llm/common/nvmlWrapper.h"
 
@@ -216,7 +219,99 @@ inline bool isBuilding()
 
 std::unordered_map<nvinfer1::DataType, ncclDataType_t>* getDtypeMap();
 
+/// Access to a cached NCCL communicator.
+///
+/// NCCL communicators used by the raw TRT-LLM collectives are configured as
+/// nonblocking so that the fault-tolerance watchdog can abort them. NCCL does
+/// not allow host API calls and ncclCommAbort to race on the same communicator,
+/// so every FT raw collective must hold this serialized lease from its first
+/// communicator call through ncclGroupEnd (when a group is used). When FT is
+/// disabled the lease is an inline, non-locking wrapper around the legacy
+/// blocking communicator.
+class NcclCommLease
+{
+public:
+    ~NcclCommLease();
+
+    NcclCommLease(NcclCommLease const&) = delete;
+    NcclCommLease& operator=(NcclCommLease const&) = delete;
+    NcclCommLease(NcclCommLease&&) noexcept;
+    NcclCommLease& operator=(NcclCommLease&&) noexcept;
+
+    /// Return the native communicator, or throw a classifier-friendly error
+    /// when its watchdog has aborted it.
+    [[nodiscard]] ncclComm_t get() const;
+
+    /// Complete a nonblocking NCCL host call. ncclInProgress is polled via
+    /// ncclCommGetAsyncError before another host API is issued.
+    void check(ncclResult_t result, char const* operation) const;
+
+    /// Complete an optional NCCL capability call. An immediate
+    /// ncclInvalidArgument is returned as a documented, nonfatal unsupported
+    /// result. Once a call returns ncclInProgress, every eventual non-success
+    /// result is latched and aborted as an asynchronous communicator failure.
+    [[nodiscard]] ncclResult_t checkOptional(ncclResult_t result, char const* operation) const;
+
+    /// Validate an operation queued inside ncclGroupStart/ncclGroupEnd.
+    /// ncclInProgress is completed by the enclosing ncclGroupEnd call.
+    void checkEnqueue(ncclResult_t result, char const* operation) const;
+
+    /// Record a stream marker immediately before an asynchronous NCCL
+    /// operation. The timeout is armed only when this marker completes, so
+    /// unrelated work already queued on the stream cannot cause a false
+    /// timeout.
+    [[nodiscard]] uint64_t begin(cudaStream_t stream, char const* operation) const;
+
+    /// Record the matching completion marker after the NCCL operation has
+    /// been enqueued. The watchdog aborts if it does not complete by the
+    /// deadline armed by begin(). A zero token denotes the default-off legacy
+    /// path. FT mode rejects capture so a recovered communicator can never be
+    /// bypassed by stale graph nodes.
+    void track(uint64_t token, cudaStream_t stream) const;
+
+    /// Start/end an NCCL group tracked by this lease. If any intervening C++
+    /// operation throws, the lease destructor closes the group before
+    /// releasing the shared NCCL host-API gate.
+    void groupStart(char const* operation) const;
+    void groupEnd(char const* operation) const;
+
+private:
+    struct Impl;
+    explicit NcclCommLease(std::unique_ptr<Impl> impl);
+    explicit NcclCommLease(ncclComm_t legacyComm);
+    std::unique_ptr<Impl> mImpl;
+    ncclComm_t mLegacyComm{nullptr};
+    mutable bool mLegacyGroupActive{false};
+
+    friend NcclCommLease acquireComm(std::shared_ptr<ncclComm_t> const& comm);
+};
+
 std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group);
+
+/// Return the immutable original/global MPI rank associated with a managed communicator.
+int getCommWorldRank(std::shared_ptr<ncclComm_t> const& comm);
+
+/// Return the startup-cached raw-NCCL fault-tolerance mode.
+bool isNcclFaultToleranceEnabled();
+
+/// Acquire exclusive host-API access to a cached NCCL communicator.
+NcclCommLease acquireComm(std::shared_ptr<ncclComm_t> const& comm);
+
+/// Abort the communicator for oldGroup and initialize a fresh communicator
+/// containing only activeGroup. Both groups contain global MPI ranks. Only
+/// ranks in activeGroup may call this function.
+void abortAndReinitComm(std::set<int> const& oldGroup, std::set<int> const& activeGroup, std::uint64_t rendezvousId);
+
+/// Wait for a begin()/track() operation without retaining its lease. The
+/// operation timeout is armed only after its start marker reaches the head of
+/// the stream, and other communicators remain free to enqueue or abort.
+void waitCommOperation(std::shared_ptr<ncclComm_t> const& comm, std::uint64_t token, char const* operation);
+
+/// Return the stable watchdog error for a cached communicator, if any.
+std::optional<std::string> getCommAsyncError(std::set<int> const& group);
+
+/// Return the stable watchdog error for the communicator referenced by comm.
+std::optional<std::string> getCommAsyncError(std::shared_ptr<ncclComm_t> const& comm);
 
 #endif // ENABLE_MULTI_DEVICE
 

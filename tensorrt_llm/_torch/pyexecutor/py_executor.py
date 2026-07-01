@@ -51,6 +51,10 @@ from ..models.modeling_multimodal_mixin import \
     maybe_prefetch_mm_encoder_for_next_iter
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.decoder_layer import DecoderLayer
+from ..modules.fused_moe.ep_metrics import (
+    get_ep_group_health, is_ep_group_health_registration_pending,
+    pending_ep_health_metrics, serialize_ep_health_metrics,
+    validate_ep_health_metrics_topology)
 from ..speculative.drafter import Drafter
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.speculation_gate import SpeculationGate
@@ -472,6 +476,8 @@ class PyExecutor:
         self.resource_manager = resource_manager
         self.scheduler = scheduler
         self.model_engine = model_engine
+        model = getattr(model_engine, "model", None)
+        self._ep_health_model_config = getattr(model, "model_config", None)
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.dist = dist
         self.sampler = sampler
@@ -1196,6 +1202,19 @@ class PyExecutor:
         Indicates if the current process is allowed to enqueue requests
         """
         return self.executor_request_queue.can_enqueue_request()
+
+    def _get_ep_health_stats(self) -> Optional[dict]:
+        """Return committed EP membership for passive internal telemetry."""
+        ep_group_health = get_ep_group_health(self._ep_health_model_config)
+        if ep_group_health is None:
+            if is_ep_group_health_registration_pending(
+                    self._ep_health_model_config):
+                validate_ep_health_metrics_topology(
+                    self._ep_health_model_config)
+                return pending_ep_health_metrics()
+            return None
+        validate_ep_health_metrics_topology(self._ep_health_model_config)
+        return serialize_ep_health_metrics(ep_group_health)
 
     def get_latest_iteration_stats(self):
         """

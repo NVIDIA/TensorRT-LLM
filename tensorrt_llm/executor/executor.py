@@ -406,6 +406,10 @@ class GenerationExecutor(ABC):
         self._iter_stats_result.set_timeout(timeout)
         return self._iter_stats_result.get_results()
 
+    def _get_ep_health_stats(self, timeout: float = 1.0) -> Optional[dict]:
+        """Return passive committed EP membership telemetry when supported."""
+        return None
+
     def aget_stats(self, timeout: float) -> IterationResult:
         """
         Get iteration statistics from the runtime.

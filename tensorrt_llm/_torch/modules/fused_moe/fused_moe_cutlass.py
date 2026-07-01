@@ -20,6 +20,7 @@ from ...utils import (ActivationType, AuxStreamType, EventType,
                       Fp4QuantizedTensor)
 from .interface import AlltoallMethodType, MoE
 from .quantization import UnquantizedFusedMoEMethod
+from .wide_ep_ft import get_wide_ep_ft_options
 
 # isort: off
 from .quantization import (
@@ -331,6 +332,8 @@ class CutlassFusedMoE(MoE):
                         dtype,
                         self.num_experts if self.layer_load_balancer else None,
                     )
+                    ep_group_health, watchdog_timeout_s, watchdog_poll_interval_s = (
+                        get_wide_ep_ft_options(model_config))
 
                     self.moe_a2a = MoeAlltoAll(
                         mapping=self.mapping,
@@ -340,6 +343,10 @@ class CutlassFusedMoE(MoE):
                         workspace_size_per_rank=workspace_size,
                         num_experts=self.num_experts
                         if self.layer_load_balancer else None,
+                        ep_group_health=ep_group_health,
+                        alltoall_watchdog_timeout_s=watchdog_timeout_s,
+                        alltoall_watchdog_poll_interval_s=
+                        watchdog_poll_interval_s,
                     )
                 elif self.alltoall_method_type == AlltoallMethodType.DeepEP or self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                     raise NotImplementedError(

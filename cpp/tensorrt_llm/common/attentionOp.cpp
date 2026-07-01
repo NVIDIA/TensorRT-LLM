@@ -33,6 +33,7 @@
 #include "tensorrt_llm/runtime/utils/debugUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 
 using namespace tensorrt_llm::kernels;
@@ -363,20 +364,26 @@ int AttentionOp::ulyssesContextPreprocess(T const* input, T* output, T* buffer, 
 
     // Do all to all
 #if ENABLE_MULTI_DEVICE
-    ncclGroupStart();
-    for (int cpIdx = 0; cpIdx < mCpSize; cpIdx++)
     {
-        if (cpIdx != mCpRank)
+        auto commLease = acquireComm(mCpNcclComm);
+        auto const comm = commLease.get();
+        auto const watchdogToken = commLease.begin(stream, "NCCL send/recv(ulysses context preprocess)");
+        commLease.groupStart("ncclGroupStart(ulysses context preprocess)");
+        auto checkNcclEnqueue = [&](ncclResult_t result)
+        { commLease.checkEnqueue(result, "NCCL send/recv(ulysses context preprocess)"); };
+        for (int cpIdx = 0; cpIdx < mCpSize; cpIdx++)
         {
-            NCCLCHECK(ncclSend(output + cpIdx * (partialTokenNum * getHeadSize() * partialHeads),
-                (partialTokenNum * getHeadSize() * partialHeads), (*getDtypeMap())[mType], cpIdx, *mCpNcclComm,
-                stream));
-            NCCLCHECK(ncclRecv(buffer + cpIdx * (partialTokenNum * getHeadSize() * partialHeads),
-                (partialTokenNum * getHeadSize() * partialHeads), (*getDtypeMap())[mType], cpIdx, *mCpNcclComm,
-                stream));
+            if (cpIdx != mCpRank)
+            {
+                checkNcclEnqueue(ncclSend(output + cpIdx * (partialTokenNum * getHeadSize() * partialHeads),
+                    (partialTokenNum * getHeadSize() * partialHeads), (*getDtypeMap())[mType], cpIdx, comm, stream));
+                checkNcclEnqueue(ncclRecv(buffer + cpIdx * (partialTokenNum * getHeadSize() * partialHeads),
+                    (partialTokenNum * getHeadSize() * partialHeads), (*getDtypeMap())[mType], cpIdx, comm, stream));
+            }
         }
+        commLease.groupEnd("ncclGroupEnd(ulysses context preprocess)");
+        commLease.track(watchdogToken, stream);
     }
-    ncclGroupEnd();
     sync_check_cuda_error(stream);
 #endif // ENABLE_MULTI_DEVICE
 
@@ -422,28 +429,36 @@ int AttentionOp::ulyssesContextPostprocess(T* input, T* output, T* buffer, Enque
     // all-to-all
 #if ENABLE_MULTI_DEVICE
     size_t const elementNum = partialTokenNum * getHeadSize() * mNumAttnHeads;
-    ncclGroupStart();
-    for (int cpIdx = 0; cpIdx < mCpSize; cpIdx++)
     {
-        if (cpIdx != mCpRank)
+        auto commLease = acquireComm(mCpNcclComm);
+        auto const comm = commLease.get();
+        auto const watchdogToken = commLease.begin(stream, "NCCL send/recv(ulysses context postprocess)");
+        commLease.groupStart("ncclGroupStart(ulysses context postprocess)");
+        auto checkNcclEnqueue = [&](ncclResult_t result)
+        { commLease.checkEnqueue(result, "NCCL send/recv(ulysses context postprocess)"); };
+        for (int cpIdx = 0; cpIdx < mCpSize; cpIdx++)
         {
-            if (mFP8AttenOutput)
+            if (cpIdx != mCpRank)
             {
-                NCCLCHECK(ncclSend(reinterpret_cast<__nv_fp8_e4m3*>(buffer) + cpIdx * elementNum, elementNum, ncclInt8,
-                    cpIdx, *mCpNcclComm, stream));
-                NCCLCHECK(ncclRecv(reinterpret_cast<__nv_fp8_e4m3*>(input) + cpIdx * elementNum, elementNum, ncclInt8,
-                    cpIdx, *mCpNcclComm, stream));
-            }
-            else
-            {
-                NCCLCHECK(ncclSend(
-                    buffer + cpIdx * elementNum, elementNum, (*getDtypeMap())[mType], cpIdx, *mCpNcclComm, stream));
-                NCCLCHECK(ncclRecv(
-                    input + cpIdx * elementNum, elementNum, (*getDtypeMap())[mType], cpIdx, *mCpNcclComm, stream));
+                if (mFP8AttenOutput)
+                {
+                    checkNcclEnqueue(ncclSend(reinterpret_cast<__nv_fp8_e4m3*>(buffer) + cpIdx * elementNum, elementNum,
+                        ncclInt8, cpIdx, comm, stream));
+                    checkNcclEnqueue(ncclRecv(reinterpret_cast<__nv_fp8_e4m3*>(input) + cpIdx * elementNum, elementNum,
+                        ncclInt8, cpIdx, comm, stream));
+                }
+                else
+                {
+                    checkNcclEnqueue(ncclSend(
+                        buffer + cpIdx * elementNum, elementNum, (*getDtypeMap())[mType], cpIdx, comm, stream));
+                    checkNcclEnqueue(
+                        ncclRecv(input + cpIdx * elementNum, elementNum, (*getDtypeMap())[mType], cpIdx, comm, stream));
+                }
             }
         }
+        commLease.groupEnd("ncclGroupEnd(ulysses context postprocess)");
+        commLease.track(watchdogToken, stream);
     }
-    ncclGroupEnd();
 #endif // ENABLE_MULTI_DEVICE
 
     // transpose_1_reverse + view
@@ -489,20 +504,26 @@ int AttentionOp::ulyssesGenerationPreprocess(
 #if ENABLE_MULTI_DEVICE
     auto const partialHeads = mNumAttnHeads + 2 * mNumAttnKVHeads;
 
-    ncclGroupStart();
-    for (int cpIdx = 0; cpIdx < mCpSize; cpIdx++)
     {
-        if (cpIdx != mCpRank)
+        auto commLease = acquireComm(mCpNcclComm);
+        auto const comm = commLease.get();
+        auto const watchdogToken = commLease.begin(stream, "NCCL send/recv(ulysses generation preprocess)");
+        commLease.groupStart("ncclGroupStart(ulysses generation preprocess)");
+        auto checkNcclEnqueue = [&](ncclResult_t result)
+        { commLease.checkEnqueue(result, "NCCL send/recv(ulysses generation preprocess)"); };
+        for (int cpIdx = 0; cpIdx < mCpSize; cpIdx++)
         {
-            NCCLCHECK(ncclSend(buffer + cpIdx * (partialTokenNum * getHeadSize() * partialHeads),
-                (partialTokenNum * getHeadSize() * partialHeads), (*getDtypeMap())[mType], cpIdx, *mCpNcclComm,
-                stream));
-            NCCLCHECK(ncclRecv(output + cpIdx * (partialTokenNum * getHeadSize() * partialHeads),
-                (partialTokenNum * getHeadSize() * partialHeads), (*getDtypeMap())[mType], cpIdx, *mCpNcclComm,
-                stream));
+            if (cpIdx != mCpRank)
+            {
+                checkNcclEnqueue(ncclSend(buffer + cpIdx * (partialTokenNum * getHeadSize() * partialHeads),
+                    (partialTokenNum * getHeadSize() * partialHeads), (*getDtypeMap())[mType], cpIdx, comm, stream));
+                checkNcclEnqueue(ncclRecv(output + cpIdx * (partialTokenNum * getHeadSize() * partialHeads),
+                    (partialTokenNum * getHeadSize() * partialHeads), (*getDtypeMap())[mType], cpIdx, comm, stream));
+            }
         }
+        commLease.groupEnd("ncclGroupEnd(ulysses generation preprocess)");
+        commLease.track(watchdogToken, stream);
     }
-    ncclGroupEnd();
     sync_check_cuda_error(stream);
 #endif // ENABLE_MULTI_DEVICE
     return 0;
@@ -525,28 +546,36 @@ int AttentionOp::ulyssesGenerationPostprocess(T* input, T* output, T* buffer, in
     // do all-to-all
 #if ENABLE_MULTI_DEVICE
     size_t const elementNum = partialTokenNum * getHeadSize() * mNumAttnHeads;
-    ncclGroupStart();
-    for (int cpIdx = 0; cpIdx < mCpSize; cpIdx++)
     {
-        if (cpIdx != mCpRank)
+        auto commLease = acquireComm(mCpNcclComm);
+        auto const comm = commLease.get();
+        auto const watchdogToken = commLease.begin(stream, "NCCL send/recv(ulysses generation postprocess)");
+        commLease.groupStart("ncclGroupStart(ulysses generation postprocess)");
+        auto checkNcclEnqueue = [&](ncclResult_t result)
+        { commLease.checkEnqueue(result, "NCCL send/recv(ulysses generation postprocess)"); };
+        for (int cpIdx = 0; cpIdx < mCpSize; cpIdx++)
         {
-            if (mFP8AttenOutput)
+            if (cpIdx != mCpRank)
             {
-                NCCLCHECK(ncclSend(reinterpret_cast<__nv_fp8_e4m3*>(input) + cpIdx * elementNum, elementNum, ncclInt8,
-                    cpIdx, *mCpNcclComm, stream));
-                NCCLCHECK(ncclRecv(reinterpret_cast<__nv_fp8_e4m3*>(buffer) + cpIdx * elementNum, elementNum, ncclInt8,
-                    cpIdx, *mCpNcclComm, stream));
-            }
-            else
-            {
-                NCCLCHECK(ncclSend(
-                    input + cpIdx * elementNum, elementNum, (*getDtypeMap())[mType], cpIdx, *mCpNcclComm, stream));
-                NCCLCHECK(ncclRecv(
-                    buffer + cpIdx * elementNum, elementNum, (*getDtypeMap())[mType], cpIdx, *mCpNcclComm, stream));
+                if (mFP8AttenOutput)
+                {
+                    checkNcclEnqueue(ncclSend(reinterpret_cast<__nv_fp8_e4m3*>(input) + cpIdx * elementNum, elementNum,
+                        ncclInt8, cpIdx, comm, stream));
+                    checkNcclEnqueue(ncclRecv(reinterpret_cast<__nv_fp8_e4m3*>(buffer) + cpIdx * elementNum, elementNum,
+                        ncclInt8, cpIdx, comm, stream));
+                }
+                else
+                {
+                    checkNcclEnqueue(
+                        ncclSend(input + cpIdx * elementNum, elementNum, (*getDtypeMap())[mType], cpIdx, comm, stream));
+                    checkNcclEnqueue(ncclRecv(
+                        buffer + cpIdx * elementNum, elementNum, (*getDtypeMap())[mType], cpIdx, comm, stream));
+                }
             }
         }
+        commLease.groupEnd("ncclGroupEnd(ulysses generation postprocess)");
+        commLease.track(watchdogToken, stream);
     }
-    ncclGroupEnd();
 #endif // ENABLE_MULTI_DEVICE
 
     // do transpose_1_reverse
@@ -3198,11 +3227,13 @@ int AttentionOp::initialize() noexcept
         return 0;
     }
 #if ENABLE_MULTI_DEVICE
-    if (mCpSize > 1 && COMM_SESSION.getSize() > 1)
+    if (mCpSize > 1)
     {
-        TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
+        TLLM_CHECK_WITH_INFO(mCpGroup.size() == static_cast<std::size_t>(mCpSize),
+            "Context-parallel group size %zu does not match configured CP size %d", mCpGroup.size(), mCpSize);
+        TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
         mCpNcclComm = getComm(mCpGroup);
-        TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
+        TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     }
 #endif // ENABLE_MULTI_DEVICE
     return 0;

@@ -28,6 +28,7 @@ import torch
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.logger import logger
 
+from ..wide_ep_ft import get_wide_ep_ft_options
 from .allgather_reducescatter import AllGatherReduceScatter
 from .base import Communication
 from .deep_ep import DeepEP
@@ -133,6 +134,9 @@ class CommunicationFactory:
 
         try:
             enable_eplb = model_config.moe_load_balancer is not None
+            ep_group_health, watchdog_timeout_s, watchdog_poll_interval_s = get_wide_ep_ft_options(
+                model_config
+            )
             strategy = NVLinkOneSided(
                 mapping,
                 num_slots,
@@ -143,6 +147,9 @@ class CommunicationFactory:
                 dtype=act_dtype,
                 num_experts=num_experts if enable_eplb else None,
                 use_low_precision_combine=use_low_precision_combine,
+                ep_group_health=ep_group_health,
+                alltoall_watchdog_timeout_s=watchdog_timeout_s,
+                alltoall_watchdog_poll_interval_s=watchdog_poll_interval_s,
             )
             logger.info("Selected communication strategy: NVLinkOneSided")
             return strategy
@@ -285,6 +292,9 @@ class CommunicationFactory:
                 )
         elif method in ["NVLINK_ONE_SIDED"]:
             enable_eplb = model_config.moe_load_balancer is not None
+            ep_group_health, watchdog_timeout_s, watchdog_poll_interval_s = get_wide_ep_ft_options(
+                model_config
+            )
             return NVLinkOneSided(
                 mapping,
                 num_slots,
@@ -295,6 +305,9 @@ class CommunicationFactory:
                 dtype=act_dtype,
                 num_experts=num_experts if enable_eplb else None,
                 use_low_precision_combine=use_low_precision_combine,
+                ep_group_health=ep_group_health,
+                alltoall_watchdog_timeout_s=watchdog_timeout_s,
+                alltoall_watchdog_poll_interval_s=watchdog_poll_interval_s,
             )
         elif method == "DEEPEP":
             return DeepEP(

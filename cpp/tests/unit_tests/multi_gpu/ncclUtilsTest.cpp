@@ -20,7 +20,9 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include "tensorrt_llm/runtime/utils/ncclHostApi.h"
 
+#include <atomic>
 #include <gtest/gtest.h>
 #include <mutex>
 #include <nccl.h>
@@ -87,40 +89,152 @@ TEST(NCCLWindowSupportTest, RuntimeVersionAndGB10Gate)
 
 // Helper function to create a split communicator for testing
 // This allows us to test cleanup behavior explicitly by controlling the lifetime
-std::shared_ptr<ncclComm_t> createSplitComm(ncclComm_t parentComm, int color, int key)
+std::shared_ptr<ncclComm_t> createSplitComm(std::shared_ptr<ncclComm_t> const& parentComm, int color, int key)
 {
-    ncclComm_t newComm;
-    ncclResult_t result = ncclCommSplit(parentComm, color, key, &newComm, nullptr);
-    if (result != ncclSuccess)
+    ncclComm_t newComm = nullptr;
+    ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
+    // The cached parent is nonblocking. Make the test-owned child blocking so
+    // the legacy raw allocator overload and its simple deleter have an
+    // explicit blocking-communicator contract.
+    config.blocking = 1;
     {
-        TLLM_THROW("ncclCommSplit failed with error: %d", result);
+        auto lease = tensorrt_llm::acquireComm(parentComm);
+        auto const result = ncclCommSplit(lease.get(), color, key, &newComm, &config);
+        lease.check(result, "ncclCommSplit(ncclUtilsTest)");
+    }
+    if (newComm == nullptr)
+    {
+        TLLM_THROW("ncclCommSplit returned a null child communicator");
     }
 
     // Create a shared_ptr with custom deleter that cleans up resources first
     return std::shared_ptr<ncclComm_t>(new ncclComm_t(newComm),
         [](ncclComm_t* comm)
         {
-            if (comm && *comm)
+            if (comm != nullptr && *comm != nullptr)
             {
                 // STEP 1: Clean up all registered resources FIRST
-                tensorrt_llm::common::nccl_util::NcclCommResourceManager::getInstance().cleanupResources(*comm);
+                bool const resourcesCleaned
+                    = tensorrt_llm::common::nccl_util::NcclCommResourceManager::getInstance().cleanupResources(*comm);
 
-                // STEP 2: Now destroy the NCCL communicator
-                ncclResult_t result = ncclCommDestroy(*comm);
+                // STEP 2: Serialize with the cached parent's watchdog and
+                // destroy only after resource cleanup fully completed.
+                auto const hostApiLock = tensorrt_llm::runtime::acquireNcclHostApiLock();
+                ncclResult_t const result = resourcesCleaned ? ncclCommDestroy(*comm) : ncclCommAbort(*comm);
                 if (result != ncclSuccess)
                 {
-                    TLLM_LOG_WARNING("ncclCommDestroy failed with error: %d", result);
+                    TLLM_LOG_WARNING("NCCL test communicator release failed with error: %d", result);
                 }
-
-                // STEP 3: Free the memory
-                delete comm;
+                *comm = nullptr;
             }
+            // STEP 3: Free the holder even if communicator creation failed.
+            delete comm;
         });
 }
 
 //==============================================================================
 // NcclCommResourceManager Tests
 //==============================================================================
+
+TEST(NcclCommResourceManagerStandaloneTest, ReusedHandleWaitsForAbortCleanup)
+{
+    auto& manager = nccl_util::NcclCommResourceManager::getInstance();
+    int handleStorage = 0;
+    auto const comm = reinterpret_cast<ncclComm_t>(&handleStorage);
+    std::atomic<bool> waitStarted{false};
+    std::atomic<bool> waitCompleted{false};
+
+    manager.beginAbortCleanup(comm);
+    std::thread waiter(
+        [&]()
+        {
+            waitStarted.store(true, std::memory_order_release);
+            manager.waitForAbortCleanup(comm);
+            waitCompleted.store(true, std::memory_order_release);
+        });
+    while (!waitStarted.load(std::memory_order_acquire))
+    {
+        std::this_thread::yield();
+    }
+    EXPECT_FALSE(waitCompleted.load(std::memory_order_acquire));
+
+    EXPECT_TRUE(manager.cleanupResources(comm, true));
+    waiter.join();
+    EXPECT_TRUE(waitCompleted.load(std::memory_order_acquire));
+}
+
+TEST(NcclCommResourceManagerStandaloneTest, ConcurrentCleanupCannotReleaseRetiredHandleEarly)
+{
+    auto& manager = nccl_util::NcclCommResourceManager::getInstance();
+    int handleStorage = 0;
+    auto const comm = reinterpret_cast<ncclComm_t>(&handleStorage);
+    std::atomic<bool> cleanupEntered{false};
+    std::atomic<bool> releaseCleanup{false};
+    std::atomic<bool> cleanupSucceeded{false};
+    manager.registerResource(
+        comm,
+        [&]()
+        {
+            cleanupEntered.store(true, std::memory_order_release);
+            while (!releaseCleanup.load(std::memory_order_acquire))
+            {
+                std::this_thread::yield();
+            }
+            return true;
+        },
+        "BlockingAbortCleanup");
+    manager.beginAbortCleanup(comm);
+
+    std::thread cleanupOwner(
+        [&]() { cleanupSucceeded.store(manager.cleanupResources(comm, true), std::memory_order_release); });
+    while (!cleanupEntered.load(std::memory_order_acquire))
+    {
+        std::this_thread::yield();
+    }
+
+    EXPECT_TRUE(manager.cleanupResources(comm, true));
+    EXPECT_TRUE(manager.isAbortCleanup(comm));
+    releaseCleanup.store(true, std::memory_order_release);
+    cleanupOwner.join();
+    EXPECT_TRUE(cleanupSucceeded.load(std::memory_order_acquire));
+    EXPECT_FALSE(manager.isAbortCleanup(comm));
+}
+
+TEST(NcclCommResourceManagerStandaloneTest, NormalCleanupOwnsRetirementUntilCallbacksComplete)
+{
+    auto& manager = nccl_util::NcclCommResourceManager::getInstance();
+    int handleStorage = 0;
+    auto const comm = reinterpret_cast<ncclComm_t>(&handleStorage);
+    std::atomic<bool> cleanupEntered{false};
+    std::atomic<bool> releaseCleanup{false};
+    std::atomic<bool> cleanupSucceeded{false};
+    manager.registerResource(
+        comm,
+        [&]()
+        {
+            cleanupEntered.store(true, std::memory_order_release);
+            while (!releaseCleanup.load(std::memory_order_acquire))
+            {
+                std::this_thread::yield();
+            }
+            return true;
+        },
+        "BlockingNormalCleanup");
+    std::thread cleanupOwner(
+        [&]() { cleanupSucceeded.store(manager.cleanupResources(comm, false), std::memory_order_release); });
+    while (!cleanupEntered.load(std::memory_order_acquire))
+    {
+        std::this_thread::yield();
+    }
+
+    manager.beginAbortCleanup(comm);
+    EXPECT_TRUE(manager.cleanupResources(comm, true));
+    EXPECT_TRUE(manager.isAbortCleanup(comm));
+    releaseCleanup.store(true, std::memory_order_release);
+    cleanupOwner.join();
+    EXPECT_TRUE(cleanupSucceeded.load(std::memory_order_acquire));
+    EXPECT_FALSE(manager.isAbortCleanup(comm));
+}
 
 class NcclCommResourceManagerTest : public ::testing::Test
 {
@@ -170,12 +284,18 @@ TEST_F(NcclCommResourceManagerTest, ResourceRegistration)
     auto& manager = nccl_util::NcclCommResourceManager::getInstance();
 
     // Create a separate comm using split for this test
-    auto testComm = createSplitComm(*mComm, 0, mRank);
+    auto testComm = createSplitComm(mComm, 0, mRank);
 
     // Register a resource
     bool cleanupCalled = false;
     manager.registerResource(
-        *testComm, [&cleanupCalled]() { cleanupCalled = true; }, "TestResource");
+        *testComm,
+        [&cleanupCalled]()
+        {
+            cleanupCalled = true;
+            return true;
+        },
+        "TestResource");
 
     EXPECT_TRUE(manager.hasResources(*testComm));
     EXPECT_EQ(manager.getResourceCount(*testComm), 1);
@@ -202,15 +322,33 @@ TEST_F(NcclCommResourceManagerTest, MultipleResources)
     auto& manager = nccl_util::NcclCommResourceManager::getInstance();
 
     // Create a separate comm using split for this test
-    auto testComm = createSplitComm(*mComm, 0, mRank);
+    auto testComm = createSplitComm(mComm, 0, mRank);
 
     std::vector<int> cleanupOrder;
     manager.registerResource(
-        *testComm, [&cleanupOrder]() { cleanupOrder.push_back(1); }, "Resource1");
+        *testComm,
+        [&cleanupOrder]()
+        {
+            cleanupOrder.push_back(1);
+            return true;
+        },
+        "Resource1");
     manager.registerResource(
-        *testComm, [&cleanupOrder]() { cleanupOrder.push_back(2); }, "Resource2");
+        *testComm,
+        [&cleanupOrder]()
+        {
+            cleanupOrder.push_back(2);
+            return true;
+        },
+        "Resource2");
     manager.registerResource(
-        *testComm, [&cleanupOrder]() { cleanupOrder.push_back(3); }, "Resource3");
+        *testComm,
+        [&cleanupOrder]()
+        {
+            cleanupOrder.push_back(3);
+            return true;
+        },
+        "Resource3");
 
     EXPECT_EQ(manager.getResourceCount(*testComm), 3);
 
@@ -229,20 +367,32 @@ TEST_F(NcclCommResourceManagerTest, ResourceCount)
     auto& manager = nccl_util::NcclCommResourceManager::getInstance();
 
     // Create a separate comm using split for this test
-    auto testComm = createSplitComm(*mComm, 0, mRank);
+    auto testComm = createSplitComm(mComm, 0, mRank);
 
     EXPECT_FALSE(manager.hasResources(*testComm));
     EXPECT_EQ(manager.getResourceCount(*testComm), 0);
 
     manager.registerResource(
-        *testComm, []() {}, "Test1");
+        *testComm, []() { return true; }, "Test1");
     EXPECT_EQ(manager.getResourceCount(*testComm), 1);
 
     manager.registerResource(
-        *testComm, []() {}, "Test2");
+        *testComm, []() { return true; }, "Test2");
     EXPECT_EQ(manager.getResourceCount(*testComm), 2);
 
     testComm.reset();
+}
+
+TEST_F(NcclCommResourceManagerTest, CleanupFailureIsReportedToCommunicatorOwner)
+{
+    auto& manager = nccl_util::NcclCommResourceManager::getInstance();
+    auto testComm = createSplitComm(mComm, 0, mRank);
+
+    manager.registerResource(
+        *testComm, []() { return false; }, "InjectedCleanupFailure");
+
+    EXPECT_FALSE(manager.cleanupResources(*testComm));
+    EXPECT_FALSE(manager.hasResources(*testComm));
 }
 
 //==============================================================================
@@ -302,7 +452,7 @@ TEST_F(NCCLWindowAllocatorTest, BasicAllocation)
     auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
 
     const size_t bufferSize = 1024 * 1024; // 1MB
-    auto buffer = allocator.requestBuffer(*mComm, bufferSize);
+    auto buffer = allocator.requestBuffer(mComm, bufferSize);
 
     EXPECT_TRUE(buffer.isValid());
     EXPECT_NE(buffer.ptr, nullptr);
@@ -326,7 +476,7 @@ TEST_F(NCCLWindowAllocatorTest, BufferReuse)
     const size_t bufferSize = 512 * 1024; // 512KB
 
     // Allocate first buffer
-    auto buffer1 = allocator.requestBuffer(*mComm, bufferSize);
+    auto buffer1 = allocator.requestBuffer(mComm, bufferSize);
     EXPECT_TRUE(buffer1.isValid());
     void* ptr1 = buffer1.ptr;
 
@@ -334,7 +484,7 @@ TEST_F(NCCLWindowAllocatorTest, BufferReuse)
     allocator.releaseBuffer(*mComm, ptr1);
 
     // Request another buffer of the same size - should reuse
-    auto buffer2 = allocator.requestBuffer(*mComm, bufferSize);
+    auto buffer2 = allocator.requestBuffer(mComm, bufferSize);
     EXPECT_TRUE(buffer2.isValid());
     EXPECT_EQ(buffer2.ptr, ptr1); // Should be the same buffer
 
@@ -346,9 +496,9 @@ TEST_F(NCCLWindowAllocatorTest, BestFitReuse)
     auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
 
     // Allocate buffers of different sizes
-    auto buffer1MB = allocator.requestBuffer(*mComm, 1024 * 1024);
-    auto buffer2MB = allocator.requestBuffer(*mComm, 2 * 1024 * 1024);
-    auto buffer512KB = allocator.requestBuffer(*mComm, 512 * 1024);
+    auto buffer1MB = allocator.requestBuffer(mComm, 1024 * 1024);
+    auto buffer2MB = allocator.requestBuffer(mComm, 2 * 1024 * 1024);
+    auto buffer512KB = allocator.requestBuffer(mComm, 512 * 1024);
 
     void* ptr1MB = buffer1MB.ptr;
     void* ptr2MB = buffer2MB.ptr;
@@ -360,7 +510,7 @@ TEST_F(NCCLWindowAllocatorTest, BestFitReuse)
     allocator.releaseBuffer(*mComm, ptr512KB);
 
     // Request 768KB - should reuse 1MB (best fit, smallest that fits)
-    auto buffer768KB = allocator.requestBuffer(*mComm, 768 * 1024);
+    auto buffer768KB = allocator.requestBuffer(mComm, 768 * 1024);
     EXPECT_TRUE(buffer768KB.isValid());
     EXPECT_EQ(buffer768KB.ptr, ptr1MB);       // Should reuse 1MB buffer
     EXPECT_EQ(buffer768KB.size, 1024 * 1024); // Original size
@@ -371,7 +521,7 @@ TEST_F(NCCLWindowAllocatorTest, BestFitReuse)
 TEST_F(NCCLWindowAllocatorTest, FailureCacheIsSizeAwareForNewAllocations)
 {
     auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
-    auto testComm = createSplitComm(*mComm, 0, mRank);
+    auto testComm = createSplitComm(mComm, 0, mRank);
 
     constexpr size_t failureSize = 1024 * 1024;
     nccl_util::NCCLWindowAllocatorTestAccess::recordSymmetricFailure(allocator, *testComm, failureSize);
@@ -391,7 +541,7 @@ TEST_F(NCCLWindowAllocatorTest, FailureCacheIsSizeAwareForNewAllocations)
 TEST_F(NCCLWindowAllocatorTest, FailureCacheDoesNotDisableReusableBuffers)
 {
     auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
-    auto testComm = createSplitComm(*mComm, 0, mRank);
+    auto testComm = createSplitComm(mComm, 0, mRank);
 
     auto buffer1MB = allocator.requestBuffer(*testComm, 1024 * 1024);
     ASSERT_TRUE(buffer1MB.isValid());
@@ -416,7 +566,7 @@ TEST_F(NCCLWindowAllocatorTest, FailureCacheDoesNotDisableReusableBuffers)
 TEST_F(NCCLWindowAllocatorTest, FailureCacheKeepsSmallestFailureSize)
 {
     auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
-    auto testComm = createSplitComm(*mComm, 0, mRank);
+    auto testComm = createSplitComm(mComm, 0, mRank);
 
     nccl_util::NCCLWindowAllocatorTestAccess::recordSymmetricFailure(allocator, *testComm, 2 * 1024 * 1024);
     nccl_util::NCCLWindowAllocatorTestAccess::recordSymmetricFailure(allocator, *testComm, 1024 * 1024);
@@ -459,7 +609,7 @@ TEST_F(NCCLWindowAllocatorTest, MultipleBuffers)
     // Allocate multiple buffers
     for (int i = 0; i < 5; ++i)
     {
-        auto buffer = allocator.requestBuffer(*mComm, bufferSize);
+        auto buffer = allocator.requestBuffer(mComm, bufferSize);
         EXPECT_TRUE(buffer.isValid());
         ptrs.push_back(buffer.ptr);
     }
@@ -482,7 +632,7 @@ TEST_F(NCCLWindowAllocatorTest, SearchBuffer)
     auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
 
     const size_t bufferSize = 128 * 1024;
-    auto buffer = allocator.requestBuffer(*mComm, bufferSize);
+    auto buffer = allocator.requestBuffer(mComm, bufferSize);
 
     // Test searchBuffer
     auto found = allocator.searchBuffer(*mComm, buffer.ptr);
@@ -505,7 +655,7 @@ TEST_F(NCCLWindowAllocatorTest, GetWindowAndSize)
     auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
 
     const size_t bufferSize = 64 * 1024;
-    auto buffer = allocator.requestBuffer(*mComm, bufferSize);
+    auto buffer = allocator.requestBuffer(mComm, bufferSize);
 
     // Test getWindow
     auto window = allocator.getWindow(*mComm, buffer.ptr);
@@ -530,7 +680,7 @@ TEST_F(NCCLWindowAllocatorTest, GetBufferInfo)
     auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
 
     const size_t bufferSize = 32 * 1024;
-    auto buffer = allocator.requestBuffer(*mComm, bufferSize);
+    auto buffer = allocator.requestBuffer(mComm, bufferSize);
 
     auto info = allocator.getBufferInfo(*mComm, buffer.ptr);
     EXPECT_TRUE(info.isValid());
@@ -570,7 +720,7 @@ TEST_F(NCCLWindowAllocatorTest, CleanupOnCommDestroy)
     auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
 
     // Create a separate comm using split for this test
-    auto testComm = createSplitComm(*mComm, 0, mRank);
+    auto testComm = createSplitComm(mComm, 0, mRank);
 
     // Store the raw comm value before destruction
     ncclComm_t rawComm = *testComm;
@@ -627,8 +777,8 @@ TEST_F(NCCLWindowAllocatorTest, MultipleComms)
     auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
 
     // Create two different communicators using split (different colors)
-    auto comm1 = createSplitComm(*mComm, 0, mRank);
-    auto comm2 = createSplitComm(*mComm, 1, mRank);
+    auto comm1 = createSplitComm(mComm, 0, mRank);
+    auto comm2 = createSplitComm(mComm, 1, mRank);
 
     const size_t bufferSize = 4 * 1024;
 
@@ -829,6 +979,25 @@ TEST_F(CreateNCCLWindowTensorTest, TensorDeleterReleasesBuffer)
 
     // Buffer should still exist in the pool (for reuse)
     EXPECT_GE(allocator.getBufferCount(*mComm), 1);
+}
+
+TEST_F(CreateNCCLWindowTensorTest, TensorKeepsGenericCommunicatorOwnerAlive)
+{
+    if (tensorrt_llm::isNcclFaultToleranceEnabled())
+    {
+        GTEST_SKIP() << "Generic communicator holders use the legacy default-off allocator contract";
+    }
+    auto comm = createSplitComm(mComm, 0, mRank);
+    std::weak_ptr<ncclComm_t> weakComm = comm;
+    std::vector<int64_t> shape = {16, 16};
+    auto [tensor, buffer] = nccl_util::createNCCLWindowTensor(comm, shape, torch::kFloat32);
+    ASSERT_TRUE(tensor.defined());
+    ASSERT_TRUE(buffer.isValid());
+
+    comm.reset();
+    EXPECT_FALSE(weakComm.expired());
+    tensor = torch::Tensor();
+    EXPECT_TRUE(weakComm.expired());
 }
 
 TEST_F(CreateNCCLWindowTensorTest, MultipleTensors)
