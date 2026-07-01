@@ -137,6 +137,7 @@ std::tuple<at::Tensor, at::Tensor> fused_dit_layernorm_shift_scale_quant(at::Ten
     auto const v = validateInputs(x, ln_weight, ln_bias, scale_msa, shift_msa, seq_len_per_batch);
 
     CHECK_INPUT(sf_scale, torch::kFloat32);
+    TORCH_CHECK(sf_scale.device() == x.device(), "sf_scale must be on the same device as x");
     TORCH_CHECK(sf_scale.numel() == 1, "sf_scale must be a scalar tensor (1 element), got numel=", sf_scale.numel());
 
     int64_t const M = v.M;
