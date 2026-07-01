@@ -43,9 +43,23 @@ _DIST_CONFIG_DEFAULT_AUTO = "tp-only"
 # without importing it so test collection does not eagerly load every custom model.
 _AUTO_DEPLOY_PACKAGE = "tensorrt_llm._torch.auto_deploy"
 
-# ``modeling_eagle`` and ``modeling_gpt_oss`` have direct TRT-LLM dependencies
-# and therefore cannot import in standalone. Keep canonical discovery unchanged.
-_STANDALONE_DISCOVERY_EXCLUDED = {"modeling_eagle.py", "modeling_gpt_oss.py"}
+# These modeling files cannot participate in standalone LLMC auto-discovery.
+# They either depend on TRT-LLM-only router ops, need trust-remote-code config
+# classes that LLMC does not package, or are conditional-generation models not
+# registered as CausalLM classes for this harness. Keep canonical discovery
+# unchanged so the native TensorRT-LLM test matrix still covers them.
+_STANDALONE_DISCOVERY_EXCLUDED = {
+    "modeling_decilm.py",
+    "modeling_deepseek.py",
+    "modeling_eagle.py",
+    "modeling_glm4_moe.py",
+    "modeling_gpt_oss.py",
+    "modeling_hunyuan_moe.py",
+    "modeling_internlm3.py",
+    "modeling_nemotron_flash.py",
+    "modeling_nemotron_h.py",
+    "modeling_skywork_r1v2.py",
+}
 
 
 def _package_dir(package_name: str) -> Path:
