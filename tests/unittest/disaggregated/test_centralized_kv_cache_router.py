@@ -20,8 +20,8 @@ import pytest
 from tensorrt_llm.serve.kv_cache_router import (CentralizedKVCacheRouter,
                                                 KvCacheEventReport,
                                                 KVCacheRouterServer,
+                                                PrefixBlockSet,
                                                 WorkerLoadReport,
-                                                WorkerPrefixTrie,
                                                 WorkerReporter)
 
 TPB = 32  # tokens per block
@@ -64,133 +64,70 @@ def load_report(worker_id, seq, active=0, queued=0, max_bs=64, ns="ctx"):
 # --------------------------------------------------------------------- trie
 
 
-def test_trie_longest_prefix_match():
-    trie = WorkerPrefixTrie()
-    # w0 holds [1,2,3]; w1 holds [1,2]; w2 holds [9]
-    trie.add("w0", [1, 2, 3])
-    trie.add("w1", [1, 2])
-    trie.add("w2", [9])
-
-    m = trie.match([1, 2, 3, 4])
-    assert m == {"w0": 3, "w1": 2}  # w2 absent (no match at depth 1)
-
-    # Query that only shares the first block.
-    assert trie.match([1, 5]) == {"w0": 1, "w1": 1}
-    # No shared prefix at all.
-    assert trie.match([7, 8]) == {}
+def test_prefix_block_set_longest_prefix_match():
+    """match_one walks the query until the first hash the owner doesn't hold."""
+    s = PrefixBlockSet()
+    s.add("w0", [1, 2, 3])
+    assert s.match_one("w0", [1, 2, 3, 4]) == 3  # holds 1,2,3; misses 4
+    assert s.match_one("w0", [1, 5]) == 1        # shares only first block
+    assert s.match_one("w0", [7, 8]) == 0        # no shared prefix
+    assert s.match_one("w0", []) == 0
 
 
-def test_trie_remove_and_remove_worker():
-    trie = WorkerPrefixTrie()
-    trie.add("w0", [1, 2, 3])
-    trie.add("w1", [1, 2, 3])
+def test_prefix_block_set_remove_and_remove_worker():
+    s = PrefixBlockSet()
+    s.add("w0", [1, 2, 3])
+    assert s.match_one("w0", [1, 2, 3]) == 3
 
-    trie.remove("w0", [3])
-    assert trie.match([1, 2, 3]) == {"w0": 2, "w1": 3}
+    s.remove("w0", [3])
+    assert s.match_one("w0", [1, 2, 3]) == 2  # 3 gone -> prefix stops at 2
 
-    trie.remove_worker("w1")
-    assert trie.match([1, 2, 3]) == {"w0": 2}
-    assert not trie.has_worker("w1")
-
-
-def _match_one_ref(trie, worker_id, block_hashes):
-    """Reference: worker's matched depth derived from the full match() dict."""
-    return trie.match(block_hashes).get(worker_id, 0)
+    assert s.has_worker("w0")
+    s.remove_worker("w0")
+    assert not s.has_worker("w0")
+    assert s.match_one("w0", [1, 2, 3]) == 0
 
 
-def test_match_one_matches_full_match():
-    """match_one(worker) must equal match()[worker] for every worker, across a
-    range of overlapping prefixes and query lengths."""
-    import random
-    rng = random.Random(1234)
-    trie = WorkerPrefixTrie()
-    # Build overlapping prefixes: workers share a common head then diverge.
-    common = list(range(1, 41))  # shared 40-block prefix
-    workers = {}
-    for w in range(6):
-        # each worker owns the common head + a unique tail
-        tail = [1000 + w * 100 + i for i in range(rng.randint(0, 30))]
-        blocks = common[:rng.randint(5, 40)] + tail
-        workers[f"w{w}"] = blocks
-        trie.add(f"w{w}", blocks)
-
-    # Queries: the common prefix + assorted tails (some matching, some not).
-    for _ in range(50):
-        L = rng.randint(1, 80)
-        q = common[:rng.randint(0, 40)] + [rng.choice([
-            1000, 1100, 1200, 9999, common[0]]) for _ in range(L)]
-        full = trie.match(q)
-        for w in workers:
-            assert trie.match_one(w, q) == full.get(w, 0), (
-                f"match_one disagrees for {w}: "
-                f"{trie.match_one(w,q)} vs {full.get(w,0)} on query len {len(q)}")
-
-
-def test_match_equivalence_random():
-    """The optimized match() must produce identical results to a brute-force
-    per-worker reference over random tries/queries."""
+def test_prefix_block_set_match_one_brute_force_equivalence():
+    """match_one must equal a brute-force "consecutive-prefix in a set" walk
+    over random block sets and queries."""
     import random
     rng = random.Random(99)
     for trial in range(40):
-        trie = WorkerPrefixTrie()
-        owned = {}
-        for w in range(rng.randint(1, 8)):
-            blocks = [rng.randint(1, 30) for _ in range(rng.randint(1, 20))]
-            # de-dup preserving order (a worker holds a set of blocks)
-            seen = set(); blk = [b for b in blocks if not (b in seen or seen.add(b))]
-            owned[f"w{w}"] = blk
-            trie.add(f"w{w}", blk)
+        blocks = [rng.randint(1, 30) for _ in range(rng.randint(1, 20))]
+        s = PrefixBlockSet()
+        s.add("w", blocks)
+        held = set(blocks)
         q = [rng.randint(1, 30) for _ in range(rng.randint(1, 25))]
-        got = trie.match(q)
-        # brute force: for each worker, count consecutive prefix blocks it owns
-        ref = {}
-        for w, blk in owned.items():
-            s = set(blk); d = 0
-            for h in q:
-                if h in s: d += 1
-                else: break
-            if d > 0: ref[w] = d
-        assert got == ref, f"trial {trial}: {got} != {ref} (q={q})"
+        # brute force reference
+        d = 0
+        for h in q:
+            if h in held:
+                d += 1
+            else:
+                break
+        assert s.match_one("w", q) == d, f"trial {trial}: q={q}"
 
 
-def test_match_microbenchmark():
-    """Microbenchmark: realistic scale (~300-block request, several workers
-    sharing a long common prefix). Verifies the optimized path is correct AND
-    reports timing for match() vs match_one(). Not a hard perf gate (CI noise),
-    but prints numbers so a regression is visible."""
-    import random, time
-    rng = random.Random(7)
-    trie = WorkerPrefixTrie()
+def test_prefix_block_set_microbenchmark():
+    """Microbenchmark at realistic scale (~300-block request). Not a hard gate;
+    prints timing so a regression is visible. This is the exact match method the
+    orchestrator KvCacheAwareServerState uses (flat set membership walk)."""
+    import time
     NBLOCKS = 300      # ~40k tokens / 128 tpb
-    NWORKERS = 12      # e.g. several instances' combined tries
-    common = list(range(1, NBLOCKS + 1))
-    for w in range(NWORKERS):
-        # each worker shares most of the common prefix, diverges near the end
-        cut = rng.randint(NBLOCKS - 40, NBLOCKS)
-        trie.add(f"w{w}", common[:cut] + [10_000 + w])
-    query = common[:]  # full-prefix query (worst case: deep match)
+    s = PrefixBlockSet()
+    s.add("w0", list(range(1, NBLOCKS + 1)))
+    query = list(range(1, NBLOCKS + 1))  # full-prefix (worst case: deep match)
 
     ITERS = 2000
     t0 = time.perf_counter()
     for _ in range(ITERS):
-        m = trie.match(query)
-    t_match = (time.perf_counter() - t0) / ITERS * 1e6  # us
-
-    # match_one for one worker (what the centralized phase-1 actually needs)
-    t0 = time.perf_counter()
-    for _ in range(ITERS):
-        d = trie.match_one("w0", query)
+        d = s.match_one("w0", query)
     t_one = (time.perf_counter() - t0) / ITERS * 1e6
 
-    # correctness at scale
-    full = trie.match(query)
-    for w in range(NWORKERS):
-        assert trie.match_one(f"w{w}", query) == full.get(f"w{w}", 0)
-
-    print(f"\n[microbench] {NWORKERS} workers x {NBLOCKS} blocks, {ITERS} iters:"
-          f"\n  match()     = {t_match:8.1f} us/call -> dict of {len(m)} workers"
-          f"\n  match_one() = {t_one:8.1f} us/call -> single int"
-          f"\n  speedup match_one vs match: {t_match/max(t_one,1e-9):.1f}x")
+    assert d == NBLOCKS
+    print(f"\n[microbench] PrefixBlockSet.match_one {NBLOCKS} blocks, "
+          f"{ITERS} iters: {t_one:8.1f} us/call")
 
 
 # ----------------------------------------------------------------- ingest

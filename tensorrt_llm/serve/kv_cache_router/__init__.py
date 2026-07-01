@@ -20,7 +20,7 @@ rationale.
 """
 
 from .messages import KvCacheEventReport, Selection, WorkerLoadReport
-from .prefix_trie import WorkerPrefixTrie
+from .prefix_trie import PrefixBlockSet
 from .reporter import WorkerReporter
 from .router_core import (CentralizedKVCacheRouter, block_key_hasher,
                           score_kv_aware_candidates)
@@ -30,7 +30,7 @@ __all__ = [
     "CentralizedKVCacheRouter",
     "KVCacheRouterServer",
     "WorkerReporter",
-    "WorkerPrefixTrie",
+    "PrefixBlockSet",
     "KvCacheEventReport",
     "WorkerLoadReport",
     "Selection",

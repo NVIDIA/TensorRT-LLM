@@ -41,7 +41,7 @@ from tensorrt_llm.bindings.internal.batch_manager import (BlockKey,
 from tensorrt_llm.logger import logger
 
 from .messages import KvCacheEventReport, Selection, WorkerLoadReport
-from .prefix_trie import WorkerPrefixTrie
+from .prefix_trie import PrefixBlockSet
 
 __all__ = [
     "CentralizedKVCacheRouter", "block_key_hasher",
@@ -159,7 +159,10 @@ class _RankState:
 
     def __init__(self, rank: int) -> None:
         self.rank = rank
-        self.trie = WorkerPrefixTrie()
+        # Single-owner (this rank): a flat block-hash set, same structure and
+        # match method as the orchestrator KvCacheAwareServerState. Queried only
+        # via match_one for this rank's own prefix depth.
+        self.trie = PrefixBlockSet()
         self.load: Optional[WorkerLoadReport] = None
         self.last_event_seq: int = -1
         self.last_load_seq: int = -1
@@ -184,7 +187,10 @@ class _InstanceState:
     def __init__(self, instance_id: str) -> None:
         self.instance_id = instance_id
         self.ranks: Dict[int, _RankState] = {}
-        self.combined_trie = WorkerPrefixTrie()
+        # Single-owner (this instance): flat block-hash set, kvcaware-style.
+        # combined_refcount below decides when a hash leaves the set (last rank
+        # evicts). Only ever queried via match_one for this instance's depth.
+        self.combined_trie = PrefixBlockSet()
         # Tracks how many ranks in this instance still hold each hash.
         # Only remove from combined_trie when count drops to 0.
         self.combined_refcount: Dict[int, int] = {}
@@ -234,15 +240,17 @@ class _NamespaceState:
 
     __slots__ = ("instances", "rr_counter",
                  # Legacy flat state for non-per-rank workers
-                 "trie", "loads", "last_event_seq", "last_load_seq",
+                 "tries", "loads", "last_event_seq", "last_load_seq",
                  "last_load_ts", "last_seen_ts", "layer_group_refcount")
 
     def __init__(self) -> None:
         # Hierarchical per-rank state
         self.instances: Dict[str, _InstanceState] = {}
         self.rr_counter = 0
-        # Legacy flat state (for workers without :rank suffix)
-        self.trie = WorkerPrefixTrie()
+        # Legacy flat state (for workers without :rank suffix): one flat
+        # block-hash set per worker, exactly like the orchestrator
+        # KvCacheAwareServerState keeps one set per server. Created lazily.
+        self.tries: Dict[str, PrefixBlockSet] = {}
         self.loads: Dict[str, WorkerLoadReport] = {}
         self.last_event_seq: Dict[str, int] = {}
         self.last_load_seq: Dict[str, int] = {}
@@ -451,10 +459,13 @@ class CentralizedKVCacheRouter:
             return
         ns.last_event_seq[report.worker_id] = report.seq
         ns.last_seen_ts[report.worker_id] = self._clock()
+        trie = ns.tries.get(report.worker_id)
+        if trie is None:
+            trie = ns.tries[report.worker_id] = PrefixBlockSet()
         if report.is_full_snapshot:
-            ns.trie.remove_worker(report.worker_id)
+            trie.remove_worker(report.worker_id)
             ns.layer_group_refcount.pop(report.worker_id, None)
-        self._apply_events(ns.trie, report.worker_id, report.events,
+        self._apply_events(trie, report.worker_id, report.events,
                            ns.layer_group_refcount)
 
     def apply_load_report(self, report: WorkerLoadReport) -> None:
@@ -564,16 +575,19 @@ class CentralizedKVCacheRouter:
             now = self._clock()
             inst_items = list(ns.instances.items())
             # Legacy flat workers live in struct-locked namespace state; score
-            # them here while we hold the struct lock.
-            legacy_matched = (ns.trie.match(block_hashes)
-                              if block_hashes else {})
+            # them here while we hold the struct lock. Each worker has its own
+            # flat block-hash set -- match_one per worker (same as kvcaware).
+            legacy_matched: Dict[str, int] = {}
             legacy_scored: List[Tuple[str, int, float]] = []
             for w in ns.loads:
                 load_ts = ns.last_load_ts.get(w, 0.0)
                 if now - load_ts > self._load_suspend_s:
                     continue
                 load = ns.loads[w]
-                mb = legacy_matched.get(w, 0)
+                trie = ns.tries.get(w)
+                mb = (trie.match_one(w, block_hashes)
+                      if trie is not None and block_hashes else 0)
+                legacy_matched[w] = mb
                 workload = (load.num_active_requests
                             + load.num_queued_requests)
                 legacy_scored.append(
@@ -858,7 +872,7 @@ class CentralizedKVCacheRouter:
                             inst.instance_id, combined_removed)
 
     @classmethod
-    def _apply_events(cls, trie: WorkerPrefixTrie, worker_id: str,
+    def _apply_events(cls, trie: PrefixBlockSet, worker_id: str,
                       events: List[dict],
                       refcounts: Optional[Dict[str, Dict[int,
                                                          int]]] = None
@@ -955,7 +969,7 @@ class CentralizedKVCacheRouter:
 
     @staticmethod
     def _forget_legacy_locked(ns: _NamespaceState, worker_id: str) -> None:
-        ns.trie.remove_worker(worker_id)
+        ns.tries.pop(worker_id, None)
         ns.loads.pop(worker_id, None)
         ns.last_event_seq.pop(worker_id, None)
         ns.last_load_seq.pop(worker_id, None)
