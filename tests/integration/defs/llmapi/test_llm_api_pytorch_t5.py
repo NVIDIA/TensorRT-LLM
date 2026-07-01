@@ -106,6 +106,7 @@ def _test_case(
     num_return_sequences: int,
     exact_match: bool,
     feature_id: str,
+    tensor_parallel_size: int = 1,
     marks=None,
 ):
     if num_beams == 1:
@@ -140,6 +141,7 @@ def _test_case(
         num_beams,
         num_return_sequences,
         exact_match,
+        tensor_parallel_size,
         **param_kwargs,
     )
 
@@ -249,6 +251,18 @@ _TEST_CASES = [
         exact_match=True,
         feature_id="bf16-kv-v1-cuda-graph-off-greedy",
     ),
+    _test_case(
+        model_name="t5-small",
+        torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=False,
+        enable_cuda_graph=False,
+        num_beams=1,
+        num_return_sequences=1,
+        exact_match=True,
+        feature_id="bf16-kv-v1-cuda-graph-off-greedy-tp2",
+        tensor_parallel_size=2,
+        marks=pytest.mark.skip_less_device(2),
+    ),
     # Precision coverage for beam search. KVCacheManagerV2 currently requires
     # max_beam_width == 1, so beam-search precision coverage uses v1.
     _test_case(
@@ -301,6 +315,18 @@ _TEST_CASES = [
         num_return_sequences=1,
         exact_match=True,
         feature_id="bf16-kv-v2-cuda-graph-off-greedy",
+    ),
+    _test_case(
+        model_name="t5-small",
+        torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=True,
+        enable_cuda_graph=False,
+        num_beams=1,
+        num_return_sequences=1,
+        exact_match=True,
+        feature_id="bf16-kv-v2-cuda-graph-off-greedy-tp2",
+        tensor_parallel_size=2,
+        marks=pytest.mark.skip_less_device(2),
     ),
     _test_case(
         model_name="t5-small",
@@ -536,15 +562,18 @@ def _run_t5_pytorch_generate_encoder_decoder(
     num_beams: int,
     num_return_sequences: int,
     exact_match: bool,
+    tensor_parallel_size: int = 1,
 ) -> None:
-    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+    if tensor_parallel_size == 1:
+        monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
     monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
 
     model_path = _get_t5_model_path(model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     case_id = (
         f"model={model_name}, dtype={torch_dtype}, kv_v2={use_kv_cache_manager_v2}, "
-        f"cuda_graph={enable_cuda_graph}, beams={num_beams}, returns={num_return_sequences}"
+        f"cuda_graph={enable_cuda_graph}, beams={num_beams}, returns={num_return_sequences}, "
+        f"tp={tensor_parallel_size}"
     )
     sampling_params = _sampling_params(num_beams, num_return_sequences)
 
@@ -556,6 +585,7 @@ def _run_t5_pytorch_generate_encoder_decoder(
         disable_overlap_scheduler=True,
         dtype=torch_dtype,
         enable_chunked_prefill=False,
+        tensor_parallel_size=tensor_parallel_size,
         kv_cache_config=KvCacheConfig(
             enable_block_reuse=False,
             max_tokens=_MAX_KV_TOKENS,
@@ -591,7 +621,7 @@ def _run_t5_pytorch_generate_encoder_decoder(
 
 @pytest.mark.parametrize(
     "model_name,expected_output_token_ids_by_output,torch_dtype,use_kv_cache_manager_v2,"
-    "enable_cuda_graph,num_beams,num_return_sequences,exact_match",
+    "enable_cuda_graph,num_beams,num_return_sequences,exact_match,tensor_parallel_size",
     _TEST_CASES,
 )
 def test_t5_pytorch_generate_encoder_decoder_end_to_end(
@@ -604,6 +634,7 @@ def test_t5_pytorch_generate_encoder_decoder_end_to_end(
     num_beams: int,
     num_return_sequences: int,
     exact_match: bool,
+    tensor_parallel_size: int,
 ) -> None:
     _run_t5_pytorch_generate_encoder_decoder(
         monkeypatch,
@@ -615,6 +646,7 @@ def test_t5_pytorch_generate_encoder_decoder_end_to_end(
         num_beams,
         num_return_sequences,
         exact_match,
+        tensor_parallel_size,
     )
 
 

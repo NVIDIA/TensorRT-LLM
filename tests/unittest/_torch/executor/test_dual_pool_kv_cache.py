@@ -24,15 +24,44 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, ResourceManagerType
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
+from tensorrt_llm.mapping import Mapping
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+class _FakeCudaStream:
+    cuda_stream = 0
+
+
+class _FakeKVCacheManagerCpp:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.num_pools = 1
+        self.max_blocks_per_seq = 1
+        self.max_num_blocks = 1
+
+    def allocate_pools(self, _use_uvm):
+        pass
+
+    def get_block_pool_pointers(self):
+        return torch.empty(0, dtype=torch.int64)
+
+    def get_block_scale_pool_pointers(self):
+        return torch.empty(0, dtype=torch.int64)
+
+    def get_layer_to_pool_mapping(self):
+        return torch.empty(0, dtype=torch.int32)
+
+    def release_pools(self):
+        pass
 
 
 def _make_mock_kv_cache_config(
@@ -44,27 +73,27 @@ def _make_mock_kv_cache_config(
     host_cache_size=None,
 ):
     """Create a mock KvCacheConfig with the fields KvCacheCreator needs."""
-    config = Mock()
-    config.cross_kv_cache_fraction = cross_kv_cache_fraction
-    config.max_gpu_total_bytes = max_gpu_total_bytes
-    config.use_kv_cache_manager_v2 = use_kv_cache_manager_v2
-    config.max_tokens = max_tokens
-    config.free_gpu_memory_fraction = free_gpu_memory_fraction
-    config.host_cache_size = host_cache_size
-    config.max_attention_window = None
-    config.event_buffer_max_size = 0
+    config = SimpleNamespace(
+        cross_kv_cache_fraction=cross_kv_cache_fraction,
+        max_gpu_total_bytes=max_gpu_total_bytes,
+        use_kv_cache_manager_v2=use_kv_cache_manager_v2,
+        max_tokens=max_tokens,
+        free_gpu_memory_fraction=free_gpu_memory_fraction,
+        host_cache_size=host_cache_size,
+        max_attention_window=None,
+        event_buffer_max_size=0,
+        attention_dp_events_gather_period_ms=0,
+        enable_block_reuse=False,
+        enable_partial_reuse=False,
+        copy_on_partial_reuse=False,
+        secondary_offload_min_priority=0,
+        kv_cache_event_hash_algo=None,
+    )
 
     def model_copy():
-        c = Mock()
-        c.cross_kv_cache_fraction = config.cross_kv_cache_fraction
-        c.max_gpu_total_bytes = config.max_gpu_total_bytes
-        c.use_kv_cache_manager_v2 = config.use_kv_cache_manager_v2
-        c.max_tokens = config.max_tokens
-        c.free_gpu_memory_fraction = config.free_gpu_memory_fraction
-        c.host_cache_size = config.host_cache_size
-        c.max_attention_window = config.max_attention_window
-        c.event_buffer_max_size = config.event_buffer_max_size
-        return c
+        fields = vars(config).copy()
+        fields.pop("model_copy", None)
+        return SimpleNamespace(**fields)
 
     config.model_copy = model_copy
     return config
@@ -81,16 +110,18 @@ def _make_mock_model_config(
     model_config.is_generation = is_generation
     model_config.sparse_attention_config = None
 
-    pretrained = Mock()
-    pretrained.num_hidden_layers = 6
-    pretrained.num_attention_heads = 8
-    pretrained.num_key_value_heads = 8
-    pretrained.hidden_size = 512
-    pretrained.head_dim = 64
-    pretrained.vocab_size = 32000
-    pretrained.quantization = Mock()
-    pretrained.quantization.quant_algo = None
-    pretrained.quantization.kv_cache_quant_algo = None
+    pretrained = SimpleNamespace(
+        num_hidden_layers=6,
+        num_attention_heads=8,
+        num_key_value_heads=8,
+        hidden_size=512,
+        head_dim=64,
+        vocab_size=32000,
+        quantization=SimpleNamespace(
+            quant_algo=None,
+            kv_cache_quant_algo=None,
+        ),
+    )
     for key, value in pretrained_overrides.items():
         setattr(pretrained, key, value)
     if "encoder_attention_heads" not in pretrained_overrides:
@@ -114,13 +145,19 @@ def _make_mock_model_engine(model_config):
     """Minimal mock PyTorchModelEngine."""
     engine = Mock()
     engine.model.model_config = model_config
-    engine.dtype = "bfloat16"
+    engine.dtype = torch.bfloat16
     engine.is_draft_model = False
     engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
     return engine
 
 
-def _make_creator(kv_cache_config, model_config=None, is_enc_dec=False, manager_cls=None):
+def _make_creator(
+    kv_cache_config,
+    model_config=None,
+    is_enc_dec=False,
+    manager_cls=None,
+    mapping=None,
+):
     """Create a KvCacheCreator with minimal mocking.
 
     ``manager_cls`` selects the KV cache manager class the creator binds to.
@@ -146,12 +183,15 @@ def _make_creator(kv_cache_config, model_config=None, is_enc_dec=False, manager_
         creator = KvCacheCreator.__new__(KvCacheCreator)
         creator._model_engine = model_engine
         creator._draft_model_engine = None
-        creator._mapping = Mock()
-        creator._mapping.enable_attention_dp = False
-        creator._mapping.tp_size = 1
-        creator._mapping.pp_size = 1
-        creator._mapping.cp_config = {}
-        creator._mapping.is_last_pp_rank.return_value = True
+        if mapping is None:
+            creator._mapping = Mock()
+            creator._mapping.enable_attention_dp = False
+            creator._mapping.tp_size = 1
+            creator._mapping.pp_size = 1
+            creator._mapping.cp_config = {}
+            creator._mapping.is_last_pp_rank.return_value = True
+        else:
+            creator._mapping = mapping
         creator._kv_cache_config = kv_cache_config
         creator._max_kv_tokens_in = kv_cache_config.max_tokens
         creator._max_num_tokens = 4096
@@ -396,6 +436,84 @@ class TestCrossKvCacheConstruction:
 
         assert kwargs["kv_cache_type"] == (
             tensorrt_llm.bindings.internal.batch_manager.CacheType.CROSS
+        )
+
+    def test_create_cross_kv_cache_manager_uses_tp_sharded_encoder_heads(self):
+        num_decoder_layers = 10
+        encoder_num_attention_heads = 12
+        encoder_num_kv_heads = 12
+        encoder_hidden_size = 768
+        tp_size = 2
+        local_kv_heads = encoder_num_kv_heads // tp_size
+        head_dim = encoder_hidden_size // encoder_num_attention_heads
+
+        config = _make_mock_kv_cache_config(
+            cross_kv_cache_fraction=0.5,
+            max_gpu_total_bytes=8 * (1 << 30),
+            max_tokens=2048,
+            use_kv_cache_manager_v2=False,
+        )
+        model_config = _make_mock_model_config(
+            is_encoder_decoder=True,
+            decoder_layers=num_decoder_layers,
+            encoder_attention_heads=encoder_num_attention_heads,
+            encoder_num_key_value_heads=encoder_num_kv_heads,
+            d_model=encoder_hidden_size,
+            max_position_embeddings=1024,
+        )
+        mapping = Mapping(world_size=tp_size, tp_size=tp_size)
+        creator = _make_creator(
+            config,
+            model_config=model_config,
+            manager_cls=KVCacheManager,
+            mapping=mapping,
+        )
+        creator._skip_est = False
+
+        import tensorrt_llm
+
+        with (
+            patch(
+                "tensorrt_llm._torch.pyexecutor.resource_manager.KVCacheManagerCpp",
+                _FakeKVCacheManagerCpp,
+            ),
+            patch(
+                "tensorrt_llm._torch.pyexecutor.resource_manager.torch.cuda.Stream",
+                return_value=_FakeCudaStream(),
+            ),
+            patch(
+                "tensorrt_llm._torch.pyexecutor.resource_manager.prefer_pinned",
+                return_value=False,
+            ),
+        ):
+            cross_kv_cache_manager = creator._create_cross_kv_cache_manager(
+                config.model_copy(),
+                estimating_kv_cache=True,
+            )
+
+        try:
+            assert cross_kv_cache_manager.mapping is mapping
+            assert cross_kv_cache_manager.kv_cache_type == (
+                tensorrt_llm.bindings.internal.batch_manager.CacheType.CROSS
+            )
+            assert cross_kv_cache_manager.num_kv_heads == encoder_num_kv_heads
+            assert (
+                cross_kv_cache_manager.num_kv_heads_per_layer
+                == [local_kv_heads] * num_decoder_layers
+            )
+            assert (
+                cross_kv_cache_manager.total_num_kv_heads_per_layer
+                == [local_kv_heads] * num_decoder_layers
+            )
+            assert cross_kv_cache_manager.head_dim == head_dim
+        finally:
+            cross_kv_cache_manager.shutdown()
+
+        size_per_token = creator._get_cross_kv_size_per_token()
+        kv_factor = 2  # key and value caches
+        bytes_per_element = 2  # bfloat16
+        assert size_per_token == (
+            num_decoder_layers * kv_factor * local_kv_heads * head_dim * bytes_per_element
         )
 
     def test_cross_layout_uses_max_input_len_for_encoder_capacity(self):
