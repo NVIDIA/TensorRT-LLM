@@ -79,6 +79,13 @@ void TransferSession::send(size_t idx, void const* data, size_t size)
     }
     catch (std::exception const& e)
     {
+        // A RequestSpecificException must carry a real request ID. On the
+        // llmRequest-agnostic path (e.g. arbitrary reuse-tree transfer) there is
+        // no request, so throw a generic exception instead of inventing an ID.
+        if (mRequest == nullptr)
+        {
+            TLLM_THROW("%s", e.what());
+        }
         throw common::RequestSpecificException(
             __FILE__, __LINE__, e.what(), mRequest->mRequestId, common::RequestErrorCode::kNETWORK_ERROR);
     }
@@ -92,15 +99,25 @@ void TransferSession::recv(size_t idx, void* data, size_t size)
     }
     catch (std::exception const& e)
     {
+        // A RequestSpecificException must carry a real request ID. On the
+        // llmRequest-agnostic path (e.g. arbitrary reuse-tree transfer) there is
+        // no request, so throw a generic exception instead of inventing an ID.
+        if (mRequest == nullptr)
+        {
+            TLLM_THROW("%s", e.what());
+        }
         throw common::RequestSpecificException(
             __FILE__, __LINE__, e.what(), mRequest->mRequestId, common::RequestErrorCode::kNETWORK_ERROR);
     }
 }
 
-LlmRequest const& TransferSession::getLlmRequest() const
+std::optional<LlmRequest const*> TransferSession::getLlmRequest() const
 {
-    TLLM_CHECK(mRequest != nullptr);
-    return *mRequest;
+    if (mRequest == nullptr)
+    {
+        return std::nullopt;
+    }
+    return mRequest;
 }
 
 void TransferSession::setLlmRequest(LlmRequest const& llmRequest)
@@ -304,14 +321,10 @@ public:
         auto future = promise.get_future();
         llmRequest->setKvCacheTransferStart(LlmRequest::getSteadyClockNow());
         {
-            {
-                std::scoped_lock lkResp(mSenderMutex);
-                mReadyResponses.emplace(llmRequest->mRequestId, Response{llmRequest, std::move(promise)});
-            }
-            std::unique_lock lkCond(mCondMutex);
-            mAnyReady = true;
+            std::scoped_lock lkResp(mSenderMutex);
+            mReadyResponses.emplace(
+                llmRequest->mRequestId, Response{llmRequest, llmRequest->mRequestId, std::move(promise)});
         }
-        mSenderCv.notify_all();
         return future;
     }
 
@@ -364,7 +377,6 @@ public:
             : mManager->recvConnect(DataContext{TransceiverTag::kID_TAG, mTerminate}, &id, sizeof(id));
         if (connection == nullptr)
         {
-            TLLM_LOG_WARNING("recvRequestInfo connection is nullptr, maybe the server is terminating");
             return std::nullopt;
         }
 
@@ -480,8 +492,12 @@ private:
     {
         // shared_ptr so this struct co-owns the request until the promise resolves;
         // protects worker-side dereferences and the promise itself from premature destruction.
+        // May be nullptr for the arbitrary-transfer reuse-tree path, which carries no LlmRequest;
+        // mRequestId still identifies the request in that case.
         std::shared_ptr<LlmRequest> mRequest;
+        RequestIdType mRequestId;
         std::promise<void> mPromise;
+        std::vector<kv_cache_manager::KVCacheBlock::IdType> mPinnedBlockIds;
     };
 
     struct AsyncSendResource
@@ -514,12 +530,12 @@ private:
                 resp = std::move(resource.mSendQueue.front());
                 resource.mSendQueue.pop_front();
             }
-            // Sequence the read before the move: argument initializations
-            // are indeterminately sequenced, so inlining resp.mRequest->...
-            // alongside std::move(resp) is UB once mRequest is a shared_ptr.
-            TLLM_CHECK(resp.mRequest != nullptr);
-            auto const reqId = resp.mRequest->mRequestId;
-            sendAndRemoveResponse(reqId, std::move(resp));
+            // Read mRequestId (a plain value) before the move: argument
+            // initializations are indeterminately sequenced, so inlining a read
+            // of resp alongside std::move(resp) is UB. Using mRequestId rather
+            // than resp.mRequest->mRequestId also supports the reuse-tree path,
+            // where mRequest is null.
+            sendAndRemoveResponse(resp.mRequestId, std::move(resp));
         }
     }
 
@@ -528,7 +544,15 @@ private:
         try
         {
             TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
-            sendSync(*resp.mRequest);
+            if (resp.mRequest != nullptr)
+            {
+                sendSync(*resp.mRequest);
+            }
+            else
+            {
+                // Reuse tree path — no LlmRequest
+                sendSyncFromReuseTree(id);
+            }
             release(id);
             resp.mPromise.set_value();
         }
@@ -542,6 +566,12 @@ private:
         {
             TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: %s request id: %ld", e.what(), id);
             resp.mPromise.set_exception(std::current_exception());
+        }
+        // Release any reuse-tree blocks we pinned for this transfer. Safe on every exit
+        // path; the LlmRequest-backed branch never populates mPinnedBlockIds.
+        if (!resp.mPinnedBlockIds.empty())
+        {
+            mCacheTransferLayer.getCacheManager()->unpinBlocksById(resp.mPinnedBlockIds);
         }
     }
 
@@ -610,15 +640,44 @@ private:
                     TLLM_REQUEST_EXCEPTION(cancelledReqId, common::RequestErrorCode::kNETWORK_ERROR,
                         "KV cache transfer for request %zu was cancelled", cancelledReqId)));
                 mCurrentRequest = std::nullopt;
-
-                if (mReadyResponses.empty())
-                {
-                    std::unique_lock lk(mCondMutex);
-                    mAnyReady = false;
-                }
             }
         }
         mCurrentRequest = std::nullopt;
+    }
+
+    void sendSyncFromReuseTree(RequestIdType requestId)
+    {
+        TransferSession* session = nullptr;
+        {
+            std::unique_lock<std::mutex> lk(mMtxForMap);
+            auto it = mRequestToSession.find(requestId);
+            TLLM_CHECK(it != mRequestToSession.end());
+            session = std::addressof(it->second);
+        }
+        // format() without LlmRequest — uses reuse tree path
+        mCacheTransferLayer.format(*session);
+        sendReadySignal(requestId, true);
+    }
+
+    // Look up the requested chain in the sender's reuse tree and pin it so the
+    // eviction policy cannot reclaim the blocks while the transfer is in flight.
+    // Returns the pinned block IDs (caller must unpin once transfer is settled);
+    // empty vector means no matching chain was found.
+    std::vector<kv_cache_manager::KVCacheBlock::IdType> pinReuseTreeBlocks(RequestIdType requestId)
+    {
+        std::unique_lock<std::mutex> lk(mMtxForMap);
+        auto it = mRequestToSession.find(requestId);
+        auto const& lastBlockKey = it->second.getLastBlockKey();
+        auto* cacheManager = mCacheTransferLayer.getCacheManager();
+        auto windowSize = cacheManager->getBlockManager().getWindowSizesMetadata().begin()->first;
+        std::vector<kv_cache_manager::KVCacheBlock::IdType> pinnedIds;
+        auto lastBlock
+            = cacheManager->findBlocksInReuseTreeByBlockKey(lastBlockKey, windowSize, /*pinBlocks=*/true, &pinnedIds);
+        if (lastBlock == nullptr)
+        {
+            return {};
+        }
+        return pinnedIds;
     }
 
     void response() noexcept
@@ -627,59 +686,70 @@ private:
         {
             tensorrt_llm::common::setThreadName("dataTransResp");
             TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
-            while (!mTerminate || !mAnyReady)
+            while (!mTerminate)
             {
-                if (!mAnyReady)
+                // Always listen for incoming transfer requests.
+                auto requestInfo = recvRequestInfo();
+                if (!requestInfo.has_value() || mTerminate || !mManager->isRunning())
                 {
-                    std::unique_lock lk(mCondMutex);
-                    mSenderCv.wait(lk, [this]() { return (mAnyReady || mTerminate); });
+                    return;
                 }
-                if (mTerminate)
-                {
-                    break;
-                }
-                if (!mReadyResponses.empty())
-                {
-                    auto requestInfo = recvRequestInfo();
-                    if (!requestInfo.has_value() || mTerminate || !mManager->isRunning())
-                    {
-                        return;
-                    }
-                    auto reqId = requestInfo->getRequestId();
+                auto reqId = requestInfo->getRequestId();
 
-                    {
-                        std::scoped_lock lk(mSenderMutex);
-                        mCurrentRequest = reqId;
-                    }
-
-                    if (mRemainSendCount.find(reqId) == mRemainSendCount.end())
-                    {
-                        mRemainSendCount[reqId] = getCounterpartsCount(reqId);
-                    }
+                {
+                    std::scoped_lock lk(mSenderMutex);
+                    mCurrentRequest = reqId;
                 }
+
+                if (mRemainSendCount.find(reqId) == mRemainSendCount.end())
+                {
+                    mRemainSendCount[reqId] = getCounterpartsCount(reqId);
+                }
+
+                // Check if there's a matching pre-registered response (normal disagg flow)
                 auto it = getCurrentResponse();
                 if (it != mReadyResponses.end())
                 {
+                    // Normal disagg flow — has LlmRequest
                     sendResponse(it);
                 }
                 else
                 {
-                    auto it = getCurrentResponse();
-                    while (it == mReadyResponses.end())
+                    // Arbitrary transfer — no LlmRequest, use reuse tree path.
+                    // Dispatch through async send thread (same as normal UCX flow)
+                    // to avoid blocking the response() thread which shares state with recvConnect.
+                    auto count = --mRemainSendCount[reqId];
+                    TLLM_CHECK(count >= 0);
+                    if (count == 0)
                     {
-                        std::unique_lock lk(mCondMutex);
-                        mSenderCv.wait(lk, [this]() { return (mAnyReady || mTerminate); });
-                        if (mTerminate)
+                        mRemainSendCount.erase(reqId);
+                        auto pinnedIds = pinReuseTreeBlocks(reqId);
+                        if (pinnedIds.empty())
                         {
-                            break;
+                            TLLM_LOG_ERROR(
+                                "Requested blocks do not exist in the source's reuse tree (request id: %lu). Notifying "
+                                "receiver.",
+                                reqId);
+                            sendReadySignal(reqId, false);
+                            std::unique_lock<std::mutex> lkMap(mMtxForMap);
+                            mRequestToSession.erase(reqId);
                         }
-                        it = getCurrentResponse();
+                        else
+                        {
+                            sendReadySignal(reqId, true);
+                            std::promise<void> promise;
+                            Response resp{nullptr, reqId, std::move(promise), std::move(pinnedIds)};
+                            if (dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager) != nullptr)
+                            {
+                                sendAndRemoveResponse(reqId, std::move(resp));
+                            }
+                            else
+                            {
+                                asyncSendAndRemoveResponse(reqId, std::move(resp));
+                            }
+                        }
                     }
-                    if (mTerminate || it == mReadyResponses.end())
-                    {
-                        break;
-                    }
-                    sendResponse(it);
+                    mCurrentRequest = std::nullopt;
                 }
             }
         }
@@ -695,13 +765,7 @@ private:
 
     void terminate()
     {
-        {
-            std::unique_lock lk(mCondMutex);
-            mTerminate = true;
-        }
-        // We don't have to wait for the future. If another thread is sending data, it won't pay attention
-        // to the terminate flag.
-        mSenderCv.notify_all();
+        mTerminate = true;
         mAsyncSendResource.mTerminate = true;
         mAsyncSendResource.mCVforQueue.notify_all();
         for (auto& future : mAsyncSendFutures)
@@ -716,15 +780,8 @@ private:
 
     void removeResponse(std::map<RequestIdType, Response>::iterator it)
     {
-        {
-            std::scoped_lock lkResp(mSenderMutex);
-            mReadyResponses.erase(it);
-        }
-        if (mReadyResponses.empty())
-        {
-            std::unique_lock lkCond(mCondMutex);
-            mAnyReady = false;
-        }
+        std::scoped_lock lkResp(mSenderMutex);
+        mReadyResponses.erase(it);
     }
 
     [[nodiscard]] RequestIdType getCurrentRequestId() const
@@ -751,9 +808,8 @@ private:
     std::optional<RequestIdType> mCurrentRequest;
     std::set<LlmRequest::RequestIdType> mCancelledRequests;
     std::map<RequestIdType, Response> mReadyResponses;
-    std::mutex mSenderMutex, mCondMutex;
-    std::atomic<bool> mAnyReady{false}, mTerminate{false};
-    std::condition_variable mSenderCv, mResponderCv;
+    std::mutex mSenderMutex;
+    std::atomic<bool> mTerminate{false};
     std::future<void> mResponseFuture;
     std::unordered_map<LlmRequest::RequestIdType, int> mRemainSendCount;
     AsyncSendResource mAsyncSendResource;

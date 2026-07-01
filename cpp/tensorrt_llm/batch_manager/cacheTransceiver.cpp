@@ -49,6 +49,7 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/cache_transmission/mpi_utils/connection.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
+#include "tensorrt_llm/executor/serialization.h"
 #include "tensorrt_llm/executor/serializeUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
@@ -541,6 +542,15 @@ CacheTransceiver::~CacheTransceiver()
 void CacheTransceiver::initializeCommState()
 {
     mCommState = std::addressof(mCacheSender->getCommState());
+}
+
+std::vector<char> CacheTransceiver::getSerializedDataTransceiverState() const
+{
+    TLLM_CHECK(mCommState != nullptr && mCacheState != nullptr);
+    executor::DataTransceiverState state;
+    state.setCommState(*mCommState);
+    state.setCacheState(*mCacheState);
+    return executor::Serialization::serialize(state);
 }
 
 void CacheTransceiver::setContextState(LlmRequest* llmRequest)

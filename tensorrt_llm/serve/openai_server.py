@@ -658,6 +658,9 @@ class OpenAIServer(_VideoRoutesMixin):
                                methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
         self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
+        self.app.add_api_route("/v1/data_transceiver_state",
+                               self.data_transceiver_state,
+                               methods=["GET"])
         # TODO: the metrics endpoint only reports iteration stats, not the runtime stats for now
         self.app.add_api_route("/metrics",
                                self.get_iteration_stats,
@@ -825,6 +828,19 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route("/v1/videos/{video_id}",
                                self.delete_video,
                                methods=["DELETE"])
+
+    async def data_transceiver_state(self) -> JSONResponse:
+        """Return the serialized DataTransceiverState as base64-encoded JSON."""
+        state = self.generator.get_data_transceiver_state()
+        if not state:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "No transceiver state available"})
+        import base64
+        return JSONResponse(content={
+            "data_transceiver_state":
+            base64.b64encode(state).decode("utf-8")
+        })
 
     async def health(self) -> Response:
         if self._check_health():

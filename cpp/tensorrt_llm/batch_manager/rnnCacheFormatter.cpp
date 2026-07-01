@@ -80,7 +80,9 @@ void RnnCacheFormatter::formatSlotMode(TransferSession& session)
     NVTX3_SCOPED_RANGE(RnnCacheFormatter_format);
     session.setTime(TransferSession::kTimeFormatter);
 
-    auto const& llmRequest = session.getLlmRequest();
+    auto llmRequestOpt = session.getLlmRequest();
+    TLLM_CHECK_WITH_INFO(llmRequestOpt.has_value(), "LlmRequest required for RNN state transfer");
+    auto const& llmRequest = **llmRequestOpt;
     TLLM_LOG_DEBUG(
         mpi::MpiComm::world().getRank(), "Start sending RNN state for request ID: %ld.", llmRequest.mRequestId);
     TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently, only beam width 1 is supported.");
@@ -239,7 +241,9 @@ void RnnCacheFormatter::unformatSlotMode(TransferSession& session)
     NVTX3_SCOPED_RANGE(RnnCacheFormatter_unformat);
     session.setTime(TransferSession::kTimeFormatter);
 
-    auto& llmRequest = session.getLlmRequest();
+    auto llmRequestOpt = session.getLlmRequest();
+    TLLM_CHECK_WITH_INFO(llmRequestOpt.has_value(), "LlmRequest required for RNN state transfer");
+    auto const& llmRequest = **llmRequestOpt;
     TLLM_LOG_DEBUG(
         mpi::MpiComm::world().getRank(), "Start receiving RNN state for request ID: %ld.", llmRequest.mRequestId);
     TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently, only beam width 1 is supported.");
@@ -520,7 +524,9 @@ void RnnCacheFormatter::formatUnifiedPoolMode(TransferSession& session)
     NVTX3_SCOPED_RANGE(RnnCacheFormatter_formatUnifiedPool);
     session.setTime(TransferSession::kTimeFormatter);
 
-    auto const& llmRequest = session.getLlmRequest();
+    auto llmRequestOpt = session.getLlmRequest();
+    TLLM_CHECK_WITH_INFO(llmRequestOpt.has_value(), "LlmRequest required for RNN state transfer");
+    auto const& llmRequest = **llmRequestOpt;
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "Start sending unified pool RNN state for request ID: %ld.",
         llmRequest.mRequestId);
     TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently, only beam width 1 is supported.");
@@ -552,7 +558,7 @@ void RnnCacheFormatter::formatUnifiedPoolMode(TransferSession& session)
     bool const recvSideHasCP = destConfig.getParallelConfig().mContextParallelism > 1;
     auto const indexFromEnd = session.getIndexFromEnd();
     auto blockRange = kv_cache_manager::getBlockRangeForSending(
-        mKvCacheManager, llmRequest, lastBlockKey, indexFromEnd, recvSideHasCP, ppSize);
+        mKvCacheManager, llmRequestOpt, lastBlockKey, indexFromEnd, recvSideHasCP, ppSize);
 
     auto const& blockIdsPerWindow = blockRange.getBlockIdsPerWindow();
     auto const allWindowSizes = blockRange.getWindowSizes();
@@ -694,7 +700,9 @@ void RnnCacheFormatter::unformatUnifiedPoolMode(TransferSession& session)
     NVTX3_SCOPED_RANGE(RnnCacheFormatter_unformatUnifiedPool);
     session.setTime(TransferSession::kTimeFormatter);
 
-    auto const& llmRequest = session.getLlmRequest();
+    auto llmRequestOpt = session.getLlmRequest();
+    TLLM_CHECK_WITH_INFO(llmRequestOpt.has_value(), "LlmRequest required for RNN state transfer");
+    auto const& llmRequest = **llmRequestOpt;
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "Start receiving unified pool RNN state for request ID: %ld.",
         llmRequest.mRequestId);
     TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently, only beam width 1 is supported.");

@@ -226,6 +226,12 @@ public:
     [[nodiscard]] virtual bool checkGenTransferComplete() const = 0;
 
     virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) = 0;
+
+    /// Get the serialized DataTransceiverState (CacheState + CommState) for this transceiver.
+    [[nodiscard]] virtual std::vector<char> getSerializedDataTransceiverState() const
+    {
+        return {};
+    }
 };
 
 class CacheTransceiver : public BaseCacheTransceiver
@@ -272,6 +278,8 @@ public:
     [[nodiscard]] bool checkGenTransferComplete() const override;
 
     virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) override;
+
+    [[nodiscard]] std::vector<char> getSerializedDataTransceiverState() const override;
 
 private:
     void initializeCommState();

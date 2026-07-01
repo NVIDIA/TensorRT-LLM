@@ -119,7 +119,7 @@ public:
 
     void recv(size_t idx, void* data, size_t size);
 
-    [[nodiscard]] LlmRequest const& getLlmRequest() const;
+    [[nodiscard]] std::optional<LlmRequest const*> getLlmRequest() const;
 
     // in CacheSender, the LlmRequest is not available until the sendSync is called
     void setLlmRequest(LlmRequest const& llmRequest);

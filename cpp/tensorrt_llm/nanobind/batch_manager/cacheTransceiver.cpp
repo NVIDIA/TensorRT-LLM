@@ -90,6 +90,12 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
         .def("respond_and_send_async", &BaseCacheTransceiver::respondAndSendAsync)
         .def("request_and_receive_sync", &BaseCacheTransceiver::requestAndReceiveSync)
         .def("request_and_receive_async", &BaseCacheTransceiver::requestAndReceiveAsync)
+        .def("get_serialized_data_transceiver_state",
+            [](tb::BaseCacheTransceiver& self)
+            {
+                auto serialized = self.getSerializedDataTransceiverState();
+                return nb::bytes(serialized.data(), serialized.size());
+            })
         .def(
             "check_context_transfer_status",
             [](tb::BaseCacheTransceiver& self, std::optional<int> const& atLeastRequestNum, bool markComplete = false)

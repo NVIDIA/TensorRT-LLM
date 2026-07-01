@@ -1233,13 +1233,24 @@ public:
         return mEnablePartialReuse;
     }
 
-    [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey);
+    [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(
+        BlockKey const& blockKey, bool pinBlocks = false, std::vector<KVCacheBlock::IdType>* pinnedBlockIds = nullptr);
 
     [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKeys(
         std::vector<BlockKey> const& blockKeys);
 
     //! \brief Unpin blocks by block ids directly
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
+
+    //! \brief Pin a single block: claim it from the eviction policy if it is free, then take a
+    //! reference. This is the one canonical pinning primitive — all pin paths (storeBlocks,
+    //! findBlocksInReuseTreeByBlockKey, pinBlocks) must go through it so a pinned block can
+    //! neither be evicted nor handed out by the eviction policy while the pin is held.
+    void pinBlock(BlockPtr const& block);
+
+    //! \brief Inverse of pinBlock: drop one reference and release the block back to the
+    //! eviction policy once no references remain.
+    void unpinBlock(BlockPtr const& block);
 
     void truncateBlocks(LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep);
 
@@ -1812,10 +1823,10 @@ public:
         return mWindowBlockManagers.at(windowSize).getBlockById(blockId);
     }
 
-    [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(
-        BlockKey const& blockKey, SizeType32 windowSize)
+    [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey,
+        SizeType32 windowSize, bool pinBlocks = false, std::vector<KVCacheBlock::IdType>* pinnedBlockIds = nullptr)
     {
-        return mWindowBlockManagers.at(windowSize).findBlocksInReuseTreeByBlockKey(blockKey);
+        return mWindowBlockManagers.at(windowSize).findBlocksInReuseTreeByBlockKey(blockKey, pinBlocks, pinnedBlockIds);
     }
 
     [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKeys(
@@ -2188,8 +2199,8 @@ public:
 
     [[nodiscard]] virtual CacheType getCacheType() const = 0;
 
-    [[nodiscard]] virtual std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(
-        BlockKey const& blockKey, SizeType32 windowSize)
+    [[nodiscard]] virtual std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey,
+        SizeType32 windowSize, bool pinBlocks = false, std::vector<KVCacheBlock::IdType>* pinnedBlockIds = nullptr)
         = 0;
 
     [[nodiscard]] virtual std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKeys(
@@ -2608,10 +2619,10 @@ public:
         mBlockManager.flushIterationEvents();
     }
 
-    std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(
-        BlockKey const& blockKey, SizeType32 windowSize) override
+    std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey, SizeType32 windowSize,
+        bool pinBlocks = false, std::vector<KVCacheBlock::IdType>* pinnedBlockIds = nullptr) override
     {
-        return mBlockManager.findBlocksInReuseTreeByBlockKey(blockKey, windowSize);
+        return mBlockManager.findBlocksInReuseTreeByBlockKey(blockKey, windowSize, pinBlocks, pinnedBlockIds);
     }
 
     std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKeys(

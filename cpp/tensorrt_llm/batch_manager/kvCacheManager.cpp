@@ -2129,7 +2129,8 @@ bool WindowBlockManager::blockInRadixTree(BlockPtr const& block)
     return !block->getUniqueTokens().empty() && block->getPrevBlock() != nullptr;
 }
 
-std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey)
+std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKey(
+    BlockKey const& blockKey, bool pinBlocks, std::vector<KVCacheBlock::IdType>* pinnedBlockIds)
 {
     std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     auto blockedUniqueTokens
@@ -2142,7 +2143,42 @@ std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKe
         blockKeys.emplace_back(blockKey.usesExtraIds, blockKey.loraTaskId, blockedUniqueTokensList, blockKey.extraKeys,
             blockKey.cacheSalt);
     }
-    return searchReuseTree(blockKeys);
+    auto searchRoot = mCachedBlocksRoot;
+    std::vector<BlockPtr> pinnedInScope;
+    for (auto const& blockKey : blockKeys)
+    {
+        auto [partialMatch, numMatched, matchingBlock] = searchRoot != nullptr
+            ? searchRoot->findMatchingBlock(blockKey, true, true)
+            : std::make_tuple(false, 0, nullptr);
+
+        if (matchingBlock == nullptr)
+        {
+            // Roll back any pins taken during this partial walk so callers see a
+            // clean miss with no refcount or eviction-queue side-effects.
+            for (auto const& block : pinnedInScope)
+            {
+                unpinBlock(block);
+            }
+            if (pinnedBlockIds != nullptr)
+            {
+                pinnedBlockIds->clear();
+            }
+            return nullptr;
+        }
+
+        if (pinBlocks)
+        {
+            pinBlock(matchingBlock);
+            pinnedInScope.push_back(matchingBlock);
+            if (pinnedBlockIds != nullptr)
+            {
+                pinnedBlockIds->push_back(matchingBlock->getBlockId());
+            }
+        }
+
+        searchRoot = std::move(matchingBlock);
+    }
+    return searchRoot;
 }
 
 std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKeys(
@@ -2691,16 +2727,7 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
 
         if (pinBlocks)
         {
-            // If the block has no refs it sits in the eviction policy's free
-            // queue. Claim it first so that the later unpinBlocksById /
-            // releaseBlock cycle does not create a duplicate queue entry.
-            // Pass the block's existing priority and duration so that
-            // claimBlock does not clear its retention/expiry metadata.
-            if (!prevBlock->hasRefs())
-            {
-                mEvictionPolicy->claimBlock(prevBlock, prevBlock->getPriority(), prevBlock->getDurationMs());
-            }
-            prevBlock->incRefCount();
+            pinBlock(prevBlock);
             pinnedBlockIds.push_back(prevBlock->getBlockId());
         }
     }
@@ -2975,13 +3002,36 @@ void BlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const& bloc
     firstManager.unpinBlocksById(blockIds);
 }
 
+void WindowBlockManager::pinBlock(BlockPtr const& block)
+{
+    // If the block has no refs it sits in the eviction policy's free queue.
+    // Claim it first so it cannot be handed out while pinned and so the later
+    // unpin/release cycle does not create a duplicate queue entry. Pass the
+    // block's existing priority and duration so that claimBlock does not clear
+    // its retention/expiry metadata.
+    if (!block->hasRefs())
+    {
+        mEvictionPolicy->claimBlock(block, block->getPriority(), block->getDurationMs());
+    }
+    block->incRefCount();
+}
+
+void WindowBlockManager::unpinBlock(BlockPtr const& block)
+{
+    block->decRefCount();
+    if (!block->hasRefs())
+    {
+        mEvictionPolicy->releaseBlock(block);
+    }
+}
+
 void WindowBlockManager::pinBlocks(GenerationRequest& sequence)
 {
     auto const requestId = sequence.getRequestId();
     auto& allocatedBlocks = mAllocatedBlocksPerSeq.at(requestId);
     for (auto& block : allocatedBlocks)
     {
-        block->incRefCount();
+        pinBlock(block);
     }
 }
 
@@ -2999,11 +3049,7 @@ void WindowBlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const
         auto block = mAllBlocksById[blockId];
         if (block && block->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
         {
-            block->decRefCount();
-            if (!block->hasRefs())
-            {
-                mEvictionPolicy->releaseBlock(block);
-            }
+            unpinBlock(block);
         }
     }
 }

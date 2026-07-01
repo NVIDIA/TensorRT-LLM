@@ -234,6 +234,10 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
             return [remote_call.remote_future()]
         return [remote_call.remote()]
 
+    def get_data_transceiver_state(self) -> bytes:
+        """Get serialized DataTransceiverState from worker runtime via RPC."""
+        return self.rpc_client.get_data_transceiver_state().remote()
+
     def setup_engine_remote(self):
         return self.rpc_client.setup_engine().remote(need_response=True)
 
