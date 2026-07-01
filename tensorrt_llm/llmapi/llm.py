@@ -530,7 +530,7 @@ class BaseLLM:
             priority (float, List[float]): The scheduling priority for the request(s), in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.
 
         Returns:
-            Union[tensorrt_llm.llmapi.RequestOutput, List[tensorrt_llm.llmapi.RequestOutput]]: The output data of the completion request to the LLM.
+            Union[tensorrt_llm.llmapi.llm.RequestOutput, List[tensorrt_llm.llmapi.llm.RequestOutput]]: The output data of the completion request to the LLM.
         """
         unbatched = self._is_unbatched_optional_inputs(inputs)
         if inputs is not None and not unbatched:
@@ -621,7 +621,7 @@ class BaseLLM:
             priority (float): The scheduling priority for the request, in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.
 
         Returns:
-            tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.
+            tensorrt_llm.llmapi.llm.RequestOutput: The output data of the completion request to the LLM.
         """
         if self._encode_only:
             raise RuntimeError(
@@ -1162,6 +1162,25 @@ class BaseLLM:
                 "get_stats() is not available when encode_only=True. "
                 "Use llm.encode() for encoder-only models.")
         return self._executor.get_stats(timeout=timeout)
+
+    @set_api_status("beta")
+    def get_kv_cache_capacity(self) -> dict:
+        """Get the runtime's static primary/GPU KV cache capacity.
+
+        Raises:
+            RuntimeError: If called when ``encode_only=True``.
+
+        Returns:
+            dict: KV cache capacity. The returned capacity covers the primary
+                GPU KV cache pool only; CPU/host offload capacity is not
+                included.
+                e.g., {"maxNumBlocks": ..., "tokensPerBlock": ..., "maxNumTokens": ...}
+        """
+        if self._encode_only:
+            raise RuntimeError(
+                "get_kv_cache_capacity() is not available when "
+                "encode_only=True. Use llm.encode() for encoder-only models.")
+        return self._executor.get_kv_cache_capacity()
 
     @set_api_status("beta")
     def get_stats_async(self, timeout: Optional[float] = 2) -> IterationResult:
