@@ -123,15 +123,24 @@ def _load_pipeline(checkpoint_path: str, **visual_gen_kwargs):
     return PipelineLoader(args).load(skip_warmup=True)
 
 
-def _run_forward(pipeline, *, image=None, num_frames=NUM_FRAMES, **extra):
+def _run_forward(
+    pipeline,
+    *,
+    image=None,
+    num_frames=NUM_FRAMES,
+    height=HEIGHT,
+    width=WIDTH,
+    guidance_scale=GUIDANCE_SCALE,
+    **extra,
+):
     return pipeline.forward(
         prompt=PROMPT,
         image=image,
-        height=HEIGHT,
-        width=WIDTH,
+        height=height,
+        width=width,
         num_frames=num_frames,
         num_inference_steps=NUM_STEPS,
-        guidance_scale=GUIDANCE_SCALE,
+        guidance_scale=guidance_scale,
         seed=SEED,
         frame_rate=FRAME_RATE,
         use_guardrails=False,
