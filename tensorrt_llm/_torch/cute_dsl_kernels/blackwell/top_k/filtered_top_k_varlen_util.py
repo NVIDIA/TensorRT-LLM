@@ -447,37 +447,26 @@ class FilteredTopKKernelVarlen:
         vec_start = row_start + prologue_elems
         left_start = vec_start + aligned_size
 
-        shape = input.shape
-
-        idX = cute.make_identity_tensor((shape[0], aligned_size))
-        input_ptr = input.iterator + vec_start
-        input_addr_u64 = input_ptr.toint()
-        input_ptr_aligned = cute.make_ptr(
-            self.dtype, input_addr_u64, input.memspace, assumed_align=align_bytes
+        # GVR-style direct GMEM load constants (all Python ints, compile-time).
+        # Loop bounds computed from runtime aligned_size so threads past the
+        # actual row end execute zero iterations — no OOB waste for short rows.
+        vec_size = self.vec_size
+        _elem_bytes = self.dtype.width // 8
+        _align_bytes = self.num_copy_bits // 8
+        _step_vec = self.num_threads_per_cta * self.vec_size
+        # Byte address of the aligned portion start for this row (score[vec_start]).
+        _aligned_base = (score.iterator + vec_start).toint()
+        # CopyUniversalOp for direct atom-level copies with 1D layout tensors.
+        # copy_atom (CopyG2ROp) is designed for the tiled copy framework; for
+        # direct cute.copy(atom, 1D-tensor, frag) calls it must be bound in the
+        # same trace scope (GVR pattern).
+        _copy_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            self.dtype,
+            num_bits_per_copy=self.num_copy_bits,
         )
 
-        input_tensor = cute.make_tensor(
-            input_ptr_aligned,
-            cute.make_layout((shape[0], aligned_size), stride=input.stride),
-        )
-
-        # slice for CTAs
-        gX, cX = [cute.local_tile(mT, tiler_mn, (bidx, None)) for mT in (input_tensor, idX)]
-        # Note, we use gX_aligned here to avoid the alignment issue when the input is not aligned.
-        gX_aligned_ptr = cute.make_ptr(
-            self.dtype, gX.iterator.toint(), input.memspace, assumed_align=align_bytes
-        )
-        gX_aligned = cute.make_tensor(gX_aligned_ptr, cute.make_layout(gX.shape, stride=gX.stride))
-
-        self.num_sub_tiles = gX.shape[2]
-
-        thr_copy = tiled_copy.get_slice(tidx)
-
-        tXgX = thr_copy.partition_S(gX_aligned)
-        tXcX = thr_copy.partition_S(cX)[(0, None), None, None, None]
-        tXrX = cute.make_fragment_like(tXgX[None, None, None, 0])
-
-        tXcX_tile = thr_copy.partition_S(cX)
+        scan_frag = cute.make_fragment((vec_size,), self.dtype)
 
         # Trivial case: length <= top_k
         if length <= self.top_k:
@@ -514,32 +503,26 @@ class FilteredTopKKernelVarlen:
                 s_histogram[_hi] = 0
             cute.arch.barrier()
 
-            # 1.1 Build histogram with vectorized loads
-            vec_size = self.vec_size
-
-            for tile_idx in range(self.num_sub_tiles):
-                tXpX_tile = self.predicate_tile(
-                    tXcX_tile[None, None, None, tile_idx],
-                    cutlass.Int32(aligned_size),
-                )
+            # 1.1 Build histogram: GVR-style, loop bound = runtime aligned_size.
+            ic = tidx * cutlass.Int32(vec_size)
+            while ic + cutlass.Int32(vec_size - 1) < aligned_size:
                 cute.copy(
-                    copy_atom,
-                    tXgX[None, None, None, tile_idx],
-                    tXrX,
-                    pred=tXpX_tile[None, None, None],
+                    _copy_atom,
+                    cute.make_tensor(
+                        cute.make_ptr(
+                            self.dtype,
+                            _aligned_base + cutlass.Int64(ic) * cutlass.Int64(_elem_bytes),
+                            cute.AddressSpace.gmem,
+                            assumed_align=_align_bytes,
+                        ),
+                        cute.make_layout((vec_size,)),
+                    ),
+                    scan_frag,
                 )
-                self._fill_oob(
-                    tXrX,
-                    tXpX_tile[None, None, None],
-                    -tXrX.element_type.inf,
-                )
-
-                for i in cutlass.range(cute.size(tXrX), unroll_full=True):
-                    bin_val = self.to_coarse_key(tXrX[i])
-                    atomicAdd(
-                        s_histogram.iterator + cutlass.Int32(bin_val),
-                        val_one,
-                    )
+                for j in cutlass.range_constexpr(vec_size):
+                    bin_val = self.to_coarse_key(scan_frag[j])
+                    atomicAdd(s_histogram.iterator + cutlass.Int32(bin_val), val_one)
+                ic = ic + cutlass.Int32(_step_vec)
 
             # for initial scalar load part.
             for j in range(tidx, prologue_elems, self.num_threads_per_cta):
@@ -584,32 +567,28 @@ class FilteredTopKKernelVarlen:
 
             # 1.4 Collect indices
             if topk_remaining == 0:
-                # Collect indices where bin > threshold
-                for tile_idx in range(self.num_sub_tiles):
-                    tXpX_tile = self.predicate_tile(
-                        tXcX_tile[None, None, None, tile_idx],
-                        cutlass.Int32(aligned_size),
-                    )
+                # Collect indices where bin < threshold_bin
+                ic = tidx * cutlass.Int32(vec_size)
+                while ic + cutlass.Int32(vec_size - 1) < aligned_size:
                     cute.copy(
-                        copy_atom,
-                        tXgX[None, None, None, tile_idx],
-                        tXrX,
-                        pred=tXpX_tile[None, None, None],
+                        _copy_atom,
+                        cute.make_tensor(
+                            cute.make_ptr(
+                                self.dtype,
+                                _aligned_base + cutlass.Int64(ic) * cutlass.Int64(_elem_bytes),
+                                cute.AddressSpace.gmem,
+                                assumed_align=_align_bytes,
+                            ),
+                            cute.make_layout((vec_size,)),
+                        ),
+                        scan_frag,
                     )
-                    self._fill_oob(
-                        tXrX,
-                        tXpX_tile[None, None, None],
-                        -tXrX.element_type.inf,
-                    )
-                    for i in cutlass.range(cute.size(tXrX), unroll_full=True):
-                        cur_tXcX = tXcX[None, None, None, tile_idx]
-                        bin_val = self.to_coarse_key(tXrX[i])
+                    for j in cutlass.range_constexpr(vec_size):
+                        bin_val = self.to_coarse_key(scan_frag[j])
                         if bin_val < threshold_bin:
                             pos = atomicAdd(s_counter.iterator, val_one)
-                            idx = self.index_type(
-                                cur_tXcX[i // vec_size][1] + i % vec_size + vec_start
-                            )
-                            s_indices[pos] = idx
+                            s_indices[pos] = self.index_type(vec_start + ic + cutlass.Int32(j))
+                    ic = ic + cutlass.Int32(_step_vec)
 
                 # for initial scalar load part.
                 for j in range(tidx, prologue_elems, self.num_threads_per_cta):
@@ -641,28 +620,25 @@ class FilteredTopKKernelVarlen:
                 cute.arch.barrier()
 
                 # Filter and build refinement histogram
-                for tile_idx in range(self.num_sub_tiles):
-                    tXpX_tile = self.predicate_tile(
-                        tXcX_tile[None, None, None, tile_idx],
-                        cutlass.Int32(aligned_size),
-                    )
+                ic = tidx * cutlass.Int32(vec_size)
+                while ic + cutlass.Int32(vec_size - 1) < aligned_size:
                     cute.copy(
-                        copy_atom,
-                        tXgX[None, None, None, tile_idx],
-                        tXrX,
-                        pred=tXpX_tile[None, None, None],
+                        _copy_atom,
+                        cute.make_tensor(
+                            cute.make_ptr(
+                                self.dtype,
+                                _aligned_base + cutlass.Int64(ic) * cutlass.Int64(_elem_bytes),
+                                cute.AddressSpace.gmem,
+                                assumed_align=_align_bytes,
+                            ),
+                            cute.make_layout((vec_size,)),
+                        ),
+                        scan_frag,
                     )
-                    self._fill_oob(
-                        tXrX,
-                        tXpX_tile[None, None, None],
-                        -tXrX.element_type.inf,
-                    )
-
-                    for i in cutlass.range(cute.size(tXrX), unroll_full=True):
-                        raw_input = tXrX[i]
+                    for j in cutlass.range_constexpr(vec_size):
+                        raw_input = scan_frag[j]
                         bin_val = self.to_coarse_key(raw_input)
-                        cur_tXcX = tXcX[None, None, None, tile_idx]
-                        idx = self.index_type(cur_tXcX[i // vec_size][1] + i % vec_size + vec_start)
+                        idx = self.index_type(vec_start + ic + cutlass.Int32(j))
                         if bin_val < threshold_bin:
                             pos = atomicAdd(s_counter.iterator, val_one)
                             s_indices[pos] = idx
@@ -695,6 +671,7 @@ class FilteredTopKKernelVarlen:
                                     s_histogram.iterator + cutlass.Int32(sub_bin),
                                     val_one,
                                 )
+                    ic = ic + cutlass.Int32(_step_vec)
 
                 # for initial scalar load part.
                 for j in range(tidx, prologue_elems, self.num_threads_per_cta):

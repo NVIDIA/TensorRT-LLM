@@ -92,8 +92,13 @@ class FilteredTopKKernelVarlenPrefill(FilteredTopKKernelVarlen):
         self.filtered_topk_smem_input_size = min(max_S, self.max_num_cols)
         self.enable_gmem_store = self.max_num_cols > self.filtered_topk_smem_input_size
 
-        # Always 512 threads for large-occupancy path.
-        self.num_threads_per_cta = 512
+        # Cap at 512 threads for large-occupancy path.  Do NOT override upward:
+        # the parent class picks the thread count to match the tile width, so
+        # forcing 512 threads when the parent chose 256 (e.g. bf16 num_cols<=4096)
+        # makes half the threads process OOB elements, wasting work and SMEM atomics.
+        # Cap at 512 to prevent 1024-thread blocks which hurt SMEM occupancy on
+        # large fp32 configs (s_input_idx can reach 32 KB).
+        self.num_threads_per_cta = min(self.num_threads_per_cta, 512)
 
         if debug:
             print(f"dtype: {self.dtype}, vec_size: {self.vec_size}")
