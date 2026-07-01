@@ -26,7 +26,6 @@ from mpi4py.futures import MPIPoolExecutor
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.model_config import MoeLoadBalancerConfig
-from tensorrt_llm._utils import mpi_disabled
 
 # isort: off
 from tensorrt_llm.llmapi import (
@@ -75,25 +74,14 @@ def patch_mpi_pool_session_for_env(mocker, env_vars: dict):
                         patched_start_mpi_pool)
 
 
-def _restore_env_var(name: str, value: str | None) -> None:
-    if value is None:
-        os.environ.pop(name, None)
-    else:
-        os.environ[name] = value
-
-
-def _shared_mpi_session(n_workers: int):
-    if mpi_disabled():
-        yield None
-        return
-
-    from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
-
-    mpi_session = MpiPoolSession(n_workers=n_workers)
-    try:
-        yield mpi_session
-    finally:
-        mpi_session.shutdown()
+from tensorrt_llm.llmapi._grouped_test_utils import \
+    make_shared_llm as _make_shared_llm  # noqa: E402
+from tensorrt_llm.llmapi._grouped_test_utils import \
+    reset_worker_torch_compile_state as _reset_worker_torch_compile_state
+from tensorrt_llm.llmapi._grouped_test_utils import \
+    restore_env_var as _restore_env_var
+from tensorrt_llm.llmapi._grouped_test_utils import \
+    shared_mpi_session as _shared_mpi_session
 
 
 @pytest.fixture(scope="module")
@@ -125,41 +113,6 @@ def shared_mpi_session_4gpu(hf_weight_cache):
         "hf_weight_cache must be set up before the shared MPI pool spawns so "
         "the workers inherit TRTLLM_HF_WEIGHT_CACHE at spawn time.")
     yield from _shared_mpi_session(4)
-
-
-def _reset_worker_torch_compile_state():
-    """Reset per-worker torch.compile / Dynamo state (runs inside each worker).
-
-    Dynamo's recompile counter is process-global and per-code-object. When
-    worker processes are reused across LLMs (shared MpiPoolSession), each
-    torch_compile case recompiles the same model.forward code object under new
-    guards; the count accumulates and eventually trips
-    `recompile_limit` (16), which is a HARD failure under `fullgraph=True`
-    (FailOnRecompileLimitHit) and aborts the whole MPI job. Resetting between
-    cases makes each LLM start from a clean compile cache, like a fresh process.
-    """
-    import torch
-    torch._dynamo.reset()
-
-
-def _make_shared_llm(mpi_session):
-    """Return an LLM factory that transparently injects a shared MPI session.
-
-    Tests build the LLM by calling this factory exactly like ``LLM(...)``; the
-    shared session (if any) is passed through without the test having to know it
-    exists. Falls back to a private per-LLM session when ``mpi_session`` is None.
-
-    The factory carries the ``mpi_session`` so callers can reset per-worker
-    compile state between cases without threading the session separately.
-    """
-
-    def shared_llm(*args, **kwargs):
-        if mpi_session is not None:
-            kwargs["_mpi_session"] = mpi_session
-        return LLM(*args, **kwargs)
-
-    shared_llm.mpi_session = mpi_session
-    return shared_llm
 
 
 @pytest.fixture(scope="module")

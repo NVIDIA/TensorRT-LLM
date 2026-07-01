@@ -2,9 +2,14 @@ import pytest
 from utils.util import skip_ray
 
 from tensorrt_llm import LLM
-from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
 from tensorrt_llm.llmapi import KvCacheConfig
+from tensorrt_llm.llmapi._grouped_test_utils import \
+    make_shared_llm as _make_shared_llm
+from tensorrt_llm.llmapi._grouped_test_utils import \
+    mpi_session_kwargs as _mpi_session_kwargs
+from tensorrt_llm.llmapi._grouped_test_utils import \
+    shared_mpi_session as _shared_mpi_session
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -22,20 +27,6 @@ from .test_llm_pytorch import llama_7b_lora_from_dir_test_harness
 global_kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
 
 
-def _shared_mpi_session(n_workers: int):
-    if mpi_disabled():
-        yield None
-        return
-
-    from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
-
-    mpi_session = MpiPoolSession(n_workers=n_workers)
-    try:
-        yield mpi_session
-    finally:
-        mpi_session.shutdown()
-
-
 @pytest.fixture(scope="module")
 def shared_mpi_session_2gpu():
     yield from _shared_mpi_session(2)
@@ -44,26 +35,6 @@ def shared_mpi_session_2gpu():
 @pytest.fixture(scope="module")
 def shared_mpi_session_4gpu():
     yield from _shared_mpi_session(4)
-
-
-def _mpi_session_kwargs(mpi_session) -> dict:
-    return {"_mpi_session": mpi_session} if mpi_session is not None else {}
-
-
-def _make_shared_llm(mpi_session):
-    """Return an LLM factory that transparently injects a shared MPI session.
-
-    Tests that build the LLM directly can request the ``shared_llm_*`` fixture
-    and call it exactly like ``LLM(...)`` -- the shared session is passed through
-    without the test having to know it exists. Harness-based tests inject the
-    session via ``**_mpi_session_kwargs(...)`` instead, since the harness owns
-    LLM construction.
-    """
-
-    def shared_llm(*args, **kwargs):
-        return LLM(*args, **kwargs, **_mpi_session_kwargs(mpi_session))
-
-    return shared_llm
 
 
 @pytest.fixture(scope="module")
