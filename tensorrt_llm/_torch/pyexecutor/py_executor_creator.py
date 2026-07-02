@@ -406,14 +406,22 @@ def create_py_executor(
             )
             llm_args.disable_overlap_scheduler = True
 
-        # Check FLASHINFER compatibility with one-engine speculative decoding
-        if llm_args.attn_backend == "FLASHINFER":
+        # FLASHINFER + overlap scheduler + one-engine spec-dec: not supported.
+        # The overlap scheduler pipelines decode and KV-append across steps;
+        # with multi-token generation requests (MTP/EAGLE) this conflicts with
+        # how FlashInfer plans its decode wrapper.  Disable-overlap-scheduler
+        # users can use FLASHINFER + MTP without the overlap scheduler — the
+        # generation sub-batch is routed through the paged-prefill wrapper
+        # (see FlashInferAttentionMetadata._plan_mtp_gen_prefill).
+        # CUDA-graph mode is also unsupported for variable-q_len generation.
+        if (llm_args.attn_backend == "FLASHINFER"
+                and getattr(llm_args, "cuda_graph_config", None) is not None):
             raise ValueError(
                 f"FLASHINFER attention backend is not supported with one-engine speculative "
-                f"decoding mode '{spec_config.spec_dec_mode.name}'. The FLASHINFER backend's "
-                f"decode path expects exactly 1 token per sequence, but one-engine speculative "
-                f"decoding requires multiple tokens per sequence. Please use 'TRTLLM' attention "
-                f"backend instead by setting attn_backend='TRTLLM'.")
+                f"decoding mode '{spec_config.spec_dec_mode.name}' when CUDA graphs are "
+                f"enabled (cuda_graph_config is set). The FlashInfer MTP generation path "
+                f"requires variable q_len per request which is incompatible with CUDA-graph "
+                f"capture. Either disable CUDA graphs or use 'TRTLLM' attention backend.")
 
     if mm_encoder_only:
         llm_args.mm_encoder_only = True

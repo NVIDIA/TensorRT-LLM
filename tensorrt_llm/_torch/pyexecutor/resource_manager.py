@@ -406,9 +406,10 @@ class KVCacheManager(BaseResourceManager):
         self.is_linear_attention = linear_attention_metadata is not None
 
         # Calculate kv cache blocks for each window size
-        # FIXME: flashinfer.py accesses kv_cache_manager.blocks_in_primary_pool
-        # This dependency should be adjusted as it only covers the single window
-        # case and not VSWA scheme.
+        # flashinfer.py accesses kv_cache_manager.blocks_in_primary_pool.
+        # For VSWA / linear-attention paths this is now set below to the
+        # maximum primary-pool size across all windows (largest window),
+        # which is what FlashInfer needs; per-call dispatch uses layer_idx.
         if is_estimating_kv_cache:
             # If this is an estimation dry run, we have already calculated the
             # max_tokens under _util.py::try_prepare_estimation
@@ -494,6 +495,13 @@ class KVCacheManager(BaseResourceManager):
                     logger.info(
                         f"[MPI rank={mapping.rank}] Reduced blocks_per_window: {blocks_per_window}"
                     )
+                # Expose the largest-window primary/secondary block count as the
+                # scalar attribute consumed by FlashInfer (and any backend that
+                # calls kv_cache_manager.blocks_in_primary_pool directly).
+                self.blocks_in_primary_pool = max(
+                    p for p, _ in blocks_per_window.values())
+                self.blocks_in_secondary_pool = max(
+                    s for _, s in blocks_per_window.values())
             else:
                 # Standard case: use original Python implementation
                 self.blocks_in_primary_pool, self.blocks_in_secondary_pool = self.calculate_max_num_blocks(

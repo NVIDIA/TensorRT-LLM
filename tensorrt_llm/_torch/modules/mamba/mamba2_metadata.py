@@ -434,7 +434,7 @@ class Mamba2Metadata:
                 self.chunk_indices = None
                 self.chunk_offsets = None
         else:
-            self.query_start_loc = None
+            self.query_start_loc = self._arange_buffer[:batch_size + 1]
             self.query_start_loc_long = self._arange_buffer_long[:batch_size +
                                                                  1]
 
