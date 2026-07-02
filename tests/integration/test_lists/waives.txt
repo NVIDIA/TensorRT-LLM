@@ -610,6 +610,7 @@ unittest/_torch/visual_gen/multi_gpu/test_wan_tp.py::TestWanT2VTP::test_wan_t2v_
 unittest/_torch/visual_gen/multi_gpu/test_wan_tp.py::TestWanT2VTP::test_wan_t2v_tp_vs_single_gpu SKIP (https://nvbugs/6384633)
 unittest/_torch/visual_gen/test_attention_integration.py::test_sage_attention_self_attention[fp8-2-1560] SKIP (https://nvbugs/6198760)
 unittest/_torch/visual_gen/test_attention_integration.py::test_sage_attention_self_attention[int8-2-1560] SKIP (https://nvbugs/6198760)
+unittest/auto_deploy/multigpu/custom_ops/test_ad_dist_strategies.py::test_allreduce_strategies[AUTO] SKIP (https://nvbugs/6403920)
 unittest/bindings/test_executor_bindings.py SKIP (TRTLLM-13781: legacy TensorRT examples removed; tests to be removed in follow-up PR3)
 unittest/bindings/test_transfer_agent_bindings.py::TestNixlFunctionalTransfer::test_nixl_wait_in_progress_on_zero_timeout SKIP (https://nvbugs/6260897)
 unittest/executor/test_rpc.py::TestRpcCorrectness::test_incremental_task_async SKIP (https://nvbugs/5741476)
