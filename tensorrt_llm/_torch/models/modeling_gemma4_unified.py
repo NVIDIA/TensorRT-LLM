@@ -43,17 +43,33 @@ keys match). It overrides `__init__` / `forward` / `_get_image_features` /
 `_get_audio_features` / `load_weights` to drop the encoder towers and use the
 encoder-free projections instead.
 
-Note: this file does NOT pin or bump transformers. The new `gemma4_unified`
-config class requires a recent transformers (>=5.10) — that is a user/runtime
-install, never a TRT-LLM repo change.
+TRT-LLM provides its own `gemma4_unified` config classes
+(`_torch/configs/gemma4_unified.py`) and multimodal preprocessing (the vendored
+section at the end of this file), used whenever the installed transformers does
+not ship them natively — the full model (text + image + audio + video) runs on
+the repo's pinned transformers.
 """
 
 import copy
+import json
+import math
+import os
+import re
 from typing import Dict, List, Optional
 
+import numpy as np
 import torch
 from torch import nn
+from torchvision.transforms.v2 import functional as tvF
 from transformers import PreTrainedModel
+from transformers.feature_extraction_sequence_utils import SequenceFeatureExtractor
+from transformers.image_processing_backends import TorchvisionBackend
+from transformers.image_processing_utils import BatchFeature
+from transformers.image_utils import ImageInput, PILImageResampling
+from transformers.processing_utils import ImagesKwargs, Unpack, VideosKwargs
+from transformers.utils import TensorType, is_torch_available
+from transformers.video_processing_utils import BaseVideoProcessor
+from transformers.video_utils import VideoInput
 
 from ...inputs import (
     ContentFormat,
@@ -61,6 +77,7 @@ from ...inputs import (
     MultimodalPlaceholderPlacement,
     register_input_processor,
 )
+from ...inputs.multimodal import MultimodalParams
 from ..attention_backend import AttentionMetadata
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear
@@ -70,7 +87,11 @@ from .modeling_gemma4mm import (
     Gemma4InputProcessor,
     Gemma4MultimodalEmbedder,
 )
-from .modeling_multimodal_utils import find_input_mm_embeds, fuse_input_embeds
+from .modeling_multimodal_utils import (
+    find_input_mm_embeds,
+    fuse_input_embeds,
+    get_multimodal_embeddings,
+)
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
 
 # Raw HF nn.LayerNorm default eps (the unified vision LayerNorms use this, NOT
@@ -175,7 +196,17 @@ class Gemma4UnifiedInputProcessor(Gemma4InputProcessor):
     `input_features` / `input_features_mask`) match what the base processor
     already produces. `mm_bidirectional_blocks` auto-derives to True from
     `text_config.use_bidirectional_attention == "vision"`.
+
+    When `AutoProcessor` cannot resolve `Gemma4UnifiedProcessor` (the base class
+    then leaves `self._processor` as None), fall back to the vendored equivalent
+    in `gemma4_unified_processing.py` so all modalities keep working.
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self._processor is None:
+            self._processor = load_gemma4_unified_processor(self._model_path, self._tokenizer)
+            self._image_processor = self._processor.image_processor
 
 
 @register_auto_model("Gemma4UnifiedForConditionalGeneration")
@@ -320,18 +351,42 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
             "audio.audio_features_mask",
         ]
 
-    @torch.inference_mode()
-    def forward(
-        self,
-        attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        return_context_logits: bool = False,
-        **kwargs,
-    ) -> torch.Tensor:
-        multimodal_params = kwargs.get("multimodal_params", [])
+    @staticmethod
+    def _has_active_multimodal_tokens(multimodal_param: MultimodalParams) -> bool:
+        """Whether a context parameter needs embeddings in this forward.
 
+        Mirrors `Gemma4ForConditionalGeneration._has_active_multimodal_tokens`
+        from #15848 (this class overrides `forward` entirely, so the parent's
+        version would not apply here; deduplicate once #15848 lands on main).
+        """
+        runtime = multimodal_param.multimodal_runtime
+        if runtime is not None and runtime.num_mm_tokens_in_chunk == 0:
+            return False
+
+        multimodal_data = multimodal_param.multimodal_data
+        if multimodal_data.get("multimodal_embedding") is not None:
+            return True
+
+        payload_fields = (
+            ("image", "pixel_values"),
+            ("video", "pixel_values"),
+            ("audio", "audio_features"),
+        )
+        return any(
+            multimodal_data.get(modality, {}).get(field) is not None
+            for modality, field in payload_fields
+        )
+
+    def _forward_multimodal_encoder(
+        self, multimodal_params: List[MultimodalParams]
+    ) -> torch.Tensor:
+        """Run the encoder-free projectors for all uncached multimodal payloads.
+
+        Called by `get_multimodal_embeddings`, which caches the result in
+        `multimodal_data["multimodal_embedding"]` so later prefill chunks reuse
+        the embedding without re-running the projectors (mirrors the pattern in
+        `Gemma4ForConditionalGeneration._forward_multimodal_encoder` from #15848).
+        """
         pixel_values_list, image_position_ids_list = [], []
         audio_features_list, audio_mask_list = [], []
         video_pixel_values_list, video_position_ids_list = [], []
@@ -344,55 +399,83 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
             audio_data = multimodal_param.multimodal_data.get("audio", {})
             if audio_data.get("audio_features") is not None:
                 audio_features_list.append(audio_data["audio_features"])
-                if audio_data.get("audio_features_mask") is not None:
-                    audio_mask_list.append(audio_data["audio_features_mask"])
+                audio_mask_list.append(audio_data.get("audio_features_mask"))
             video_data = multimodal_param.multimodal_data.get("video", {})
             if video_data.get("pixel_values") is not None:
                 video_pixel_values_list.append(video_data["pixel_values"])
                 if video_data.get("image_position_ids") is not None:
                     video_position_ids_list.append(video_data["image_position_ids"])
 
-        mm_embeds: List[torch.Tensor] = []
-        all_mm_token_ids: List[torch.Tensor] = []
-        mm_token_type_ids = None
-
-        if len(pixel_values_list) > 0 and self.embed_vision is not None:
+        embeddings = []
+        if pixel_values_list and self.embed_vision is not None:
             pixel_values = torch.cat(pixel_values_list)
             image_position_ids = (
                 torch.cat(image_position_ids_list)
                 if len(image_position_ids_list) == len(pixel_values_list)
                 else None
             )
-            mm_embeds.append(self._get_image_features(pixel_values, image_position_ids))
-            all_mm_token_ids.append(self.image_token_ids)
+            embeddings.append(self._get_image_features(pixel_values, image_position_ids))
 
-        if len(video_pixel_values_list) > 0 and self.embed_vision is not None:
+        if video_pixel_values_list and self.embed_vision is not None:
             video_pixel_values = torch.cat(video_pixel_values_list)
             video_position_ids = (
                 torch.cat(video_position_ids_list)
                 if len(video_position_ids_list) == len(video_pixel_values_list)
                 else None
             )
-            mm_embeds.append(self._get_image_features(video_pixel_values, video_position_ids))
-            all_mm_token_ids.append(
-                self.video_token_ids if self.video_token_ids is not None else self.image_token_ids
-            )
+            embeddings.append(self._get_image_features(video_pixel_values, video_position_ids))
 
-        if len(audio_features_list) > 0 and self.embed_audio is not None:
-            audio_features_per_clip = []
+        if audio_features_list and self.embed_audio is not None:
+            per_clip = []
             for clip_index, audio_feature in enumerate(audio_features_list):
-                audio_feature_mask = (
-                    audio_mask_list[clip_index] if clip_index < len(audio_mask_list) else None
+                per_clip.append(
+                    self._get_audio_features(audio_feature, audio_mask_list[clip_index])
                 )
-                audio_features_per_clip.append(
-                    self._get_audio_features(audio_feature, audio_feature_mask)
-                )
-            mm_embeds.append(torch.cat(audio_features_per_clip, dim=0))
-            all_mm_token_ids.append(self.audio_token_ids)
+            embeddings.append(torch.cat(per_clip, dim=0))
+
+        return torch.cat(embeddings, dim=0) if embeddings else torch.empty(0)
+
+    @torch.inference_mode()
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        return_context_logits: bool = False,
+        **kwargs,
+    ) -> torch.Tensor:
+        multimodal_params = kwargs.get("multimodal_params", [])
+
+        # Filter to params that have active multimodal tokens in this chunk.
+        # get_multimodal_embeddings caches the result after the first run, so
+        # later prefill chunks reuse the embedding without re-running the projectors.
+        active_multimodal_params = [
+            mp for mp in multimodal_params if self._has_active_multimodal_tokens(mp)
+        ]
+
+        mm_embeds: List[torch.Tensor] = []
+        all_mm_token_ids: List[torch.Tensor] = []
+        mm_token_type_ids = None
+
+        if active_multimodal_params:
+            mm_embeds = get_multimodal_embeddings(
+                encoder_forward_fn=self._forward_multimodal_encoder,
+                multimodal_params=active_multimodal_params,
+            )
+            mm_embeds = find_input_mm_embeds(mm_embeds, active_multimodal_params)
+
+            # Collect every defined multimodal token id. On cache-hit chunks the
+            # raw payloads (pixel_values / audio_features) may be absent while the
+            # cached embedding is used, so the ids cannot be derived from payload
+            # presence; extra ids are harmless (they simply match no position).
+            for token_ids in (self.image_token_ids, self.video_token_ids, self.audio_token_ids):
+                if token_ids is not None:
+                    all_mm_token_ids.append(token_ids)
 
         # Integer mm_token_type_ids (0=text,1=image,2=video,3=audio) drive the
         # inherited bidirectional-vision attention mask in Gemma4ForCausalLM.
-        if len(mm_embeds) > 0 and input_ids is not None:
+        if mm_embeds and input_ids is not None:
             mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.long)
             if self.image_token_ids is not None:
                 mm_token_type_ids[torch.isin(input_ids, self.image_token_ids)] = 1
@@ -402,7 +485,6 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
                 mm_token_type_ids[torch.isin(input_ids, self.audio_token_ids)] = 3
 
         fuse_token_ids = torch.cat(all_mm_token_ids) if all_mm_token_ids else self.image_token_ids
-        mm_embeds = find_input_mm_embeds(mm_embeds, multimodal_params)
 
         input_ids, inputs_embeds = fuse_input_embeds(
             embedding_layer=self.llm.model.embed_tokens,
@@ -449,3 +531,933 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
             self.embed_vision.load_weights(vision_embedder_weights, projector_weights)
         if self.embed_audio is not None:
             self.embed_audio.load_weights(filter_weights("embed_audio", stripped_weights))
+
+
+# =============================================================================
+# Vendored multimodal preprocessing.
+#
+# From HuggingFace transformers (Apache-2.0), models/gemma4_unified at commit
+# 181beb3ba4c47098ed8cbc97ee250d1d45ae0107:
+#   feature_extraction_gemma4_unified.py (Gemma4UnifiedAudioFeatureExtractor),
+#   image_processing_gemma4_unified.py (Gemma4UnifiedImageProcessor + helpers),
+#   video_processing_gemma4_unified.py (Gemma4UnifiedVideoProcessor),
+#   processing_gemma4_unified.py (placeholder-expansion formulas).
+# Used by Gemma4UnifiedInputProcessor when AutoProcessor cannot resolve the
+# HF Gemma4UnifiedProcessor. The per-modality components are verbatim (relative
+# imports rewritten, duplicated helpers merged, doc-only decorators dropped);
+# the top-level processor reproduces the generic ProcessorMixin.__call__ flow
+# explicitly, keeping the replacement formulas byte-for-byte.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Audio: vendored from feature_extraction_gemma4_unified.py
+# ---------------------------------------------------------------------------
+
+
+class Gemma4UnifiedAudioFeatureExtractor(SequenceFeatureExtractor):
+    """Encoder-free audio feature extractor that chunks raw waveform into frames.
+
+    Unlike the standard Gemma4 audio feature extractor which computes mel spectrograms,
+    this unified version simply chunks raw 16 kHz audio into fixed-length frames
+    of `audio_samples_per_token` samples each. Each frame becomes a single audio
+    soft token with the raw waveform samples as its features.
+
+    Args:
+        feature_size (`int`, *optional*, defaults to 640):
+            The feature dimension of the extracted features (samples per token).
+        sampling_rate (`int`, *optional*, defaults to 16000):
+            The sampling rate at which the audio files should be digitalized expressed in hertz (Hz).
+        padding_value (`float`, *optional*, defaults to 0.0):
+            Padding value used to pad the audio.
+        audio_samples_per_token (`int`, *optional*, defaults to 640):
+            Number of raw audio samples per output token. At 16 kHz, 640 samples = 40ms.
+    """
+
+    model_input_names = ["input_features", "input_features_mask"]
+
+    def __init__(
+        self,
+        feature_size: int = 640,
+        sampling_rate: int = 16_000,
+        padding_value: float = 0.0,
+        audio_samples_per_token: int = 640,
+        **kwargs,
+    ):
+        super().__init__(
+            feature_size=feature_size,
+            sampling_rate=sampling_rate,
+            padding_value=padding_value,
+            **kwargs,
+        )
+        self.audio_samples_per_token = audio_samples_per_token
+
+    def _extract_waveform_features(
+        self,
+        waveform: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Chunk a raw waveform into fixed-length frames.
+
+        Each frame of `audio_samples_per_token` samples becomes one audio soft token.
+        The waveform is zero-padded to be evenly divisible by the frame size.
+
+        Args:
+            waveform: 1-D array of raw audio samples.
+
+        Returns:
+            features: (num_tokens, audio_samples_per_token) array of waveform frames.
+            mask: (num_tokens,) boolean array, True for all valid tokens.
+        """
+        # Pad waveform to be evenly divisible by samples_per_token
+        pad_len = (-len(waveform)) % self.audio_samples_per_token
+        if pad_len:
+            waveform = np.pad(waveform, (0, pad_len))
+
+        num_tokens = len(waveform) // self.audio_samples_per_token
+        features = waveform.reshape(num_tokens, self.audio_samples_per_token).astype(np.float32)
+
+        # All tokens are valid (padding is within the last frame, not creating extra frames)
+        mask = np.ones(num_tokens, dtype=bool)
+        return features, mask
+
+    def __call__(
+        self,
+        raw_speech,
+        padding: bool | str = "longest",
+        max_length: int | None = None,
+        truncation: bool = True,
+        return_tensors: str | TensorType | None = None,
+        **kwargs,
+    ) -> BatchFeature:
+        """Chunk raw audio waveforms into fixed-length frames for the unified model.
+
+        Args:
+            raw_speech:
+                The raw audio waveform(s) to process.
+            padding (`str`, *optional*, defaults to `"longest"`):
+                Padding strategy for batches with different lengths.
+            max_length (`int`, *optional*):
+                Maximum number of tokens to produce per audio.
+            truncation (`bool`, *optional*, defaults to `True`):
+                Whether to truncate audio above `max_length` tokens.
+            return_tensors (`str`, *optional*):
+                The type of tensors to return.
+        """
+        # Normalize input to list of 1-D arrays
+        if isinstance(raw_speech, np.ndarray) and raw_speech.ndim == 1:
+            raw_speech = [raw_speech]
+        elif not isinstance(raw_speech, (list, tuple)):
+            raw_speech = [np.asarray(raw_speech)]
+        else:
+            raw_speech = [np.asarray(s) for s in raw_speech]
+
+        # Extract features for each waveform
+        all_features = [
+            {"input_features": self._extract_waveform_features(waveform)[0]}
+            for waveform in raw_speech
+        ]
+
+        # Delegate padding and truncation to the parent class
+        padded_inputs = self.pad(
+            all_features,
+            padding=padding,
+            max_length=max_length,
+            truncation=truncation and max_length is not None,
+            return_attention_mask=True,
+            return_tensors=return_tensors,
+        )
+
+        # Rename attention_mask -> input_features_mask.
+        # pad() produces int32 (0/1); downstream code expects a boolean mask for indexing.
+        mask = padded_inputs.pop("attention_mask")
+        if is_torch_available() and isinstance(mask, torch.Tensor):
+            mask = mask.bool()
+        else:
+            mask = np.asarray(mask, dtype=bool)
+        padded_inputs["input_features_mask"] = mask
+
+        return padded_inputs
+
+
+# ---------------------------------------------------------------------------
+# Vision helpers: vendored from image_processing_gemma4_unified.py (the video
+# file duplicates get_aspect_ratio_preserving_size / patches_merge; one copy here)
+# ---------------------------------------------------------------------------
+
+
+class Gemma4UnifiedImageProcessorKwargs(ImagesKwargs, total=False):
+    """
+    patch_size (`int`, *optional*):
+        Size of each teacher image patch in pixels (before merging).
+    max_soft_tokens (`int`, *optional*):
+        Maximum number of soft (vision) tokens per image after patch merging.
+        Must be one of {70, 140, 280, 560, 1120}.
+    pooling_kernel_size (`int`, *optional*):
+        Kernel size for merging teacher patches into model patches.
+    """
+
+    patch_size: int
+    max_soft_tokens: int
+    pooling_kernel_size: int
+
+
+class Gemma4UnifiedVideoProcessorKwargs(VideosKwargs, total=False):
+    """
+    patch_size (`int`, *optional*):
+        Size of each image patch in pixels.
+    max_soft_tokens (`int`, *optional*):
+        Maximum number of soft (vision) tokens per video frame.
+        Must be one of {70, 140, 280, 560, 1120}.
+    pooling_kernel_size (`int`, *optional*):
+        Spatial pooling kernel size applied after patchification.
+    """
+
+    patch_size: int
+    max_soft_tokens: int
+    pooling_kernel_size: int
+
+
+_SUPPORTED_SOFT_TOKENS = (70, 140, 280, 560, 1120)
+
+
+def get_aspect_ratio_preserving_size(
+    height: int,
+    width: int,
+    patch_size: int,
+    max_patches: int,
+    pooling_kernel_size: int,
+) -> tuple[int, int]:
+    """
+    Image is resized to preserve aspect ratio so it fits within the patch budget.
+    Target dimensions are the largest that:
+    1) Produce at most `max_patches` patches when patchified with `patch_size`
+    2) Have height and width divisible by `pooling_kernel_size * patch_size`
+    """
+    total_px = height * width
+    target_px = max_patches * (patch_size**2)
+    factor = math.sqrt(target_px / total_px)
+    ideal_height = factor * height
+    ideal_width = factor * width
+    side_mult = pooling_kernel_size * patch_size
+
+    # Round down to nearest multiple of side_mult
+    target_height = int(math.floor(ideal_height / side_mult)) * side_mult
+    target_width = int(math.floor(ideal_width / side_mult)) * side_mult
+
+    # Handle edge cases where one or both dimensions round to 0
+    if target_height == 0 and target_width == 0:
+        raise ValueError(
+            "Attempting to resize to a 0 x 0 image. Resized height should be divisible by "
+            f"`pooling_kernel_size * patch_size`={pooling_kernel_size * patch_size}."
+        )
+
+    max_side_length = (max_patches // pooling_kernel_size**2) * side_mult
+    if target_height == 0:
+        target_height = side_mult
+        target_width = min(
+            int(math.floor(width / height)) * side_mult,
+            max_side_length,
+        )
+    elif target_width == 0:
+        target_width = side_mult
+        target_height = min(
+            int(math.floor(height / width)) * side_mult,
+            max_side_length,
+        )
+
+    if target_height * target_width > target_px:
+        raise ValueError(
+            f"Resizing [{height}x{width}] to [{target_height}x{target_width}] "
+            f"but this exceeds {max_patches} patches with patch_size {patch_size}"
+        )
+
+    return target_height, target_width
+
+
+def convert_image_to_patches(image: "torch.Tensor", patch_size: int) -> "torch.Tensor":
+    """
+    Convert 3D tensor image of shape (num_channels, image_height, image_width) into 2D tensor of patches of shape
+    (num_patches_height * num_patches_width, patch_size * patch_size * num_channels).
+    """
+    num_channels, image_height, image_width = image.shape
+    num_patches_height = image_height // patch_size
+    num_patches_width = image_width // patch_size
+    patched_image = image.reshape(
+        num_channels, num_patches_height, patch_size, num_patches_width, patch_size
+    )
+    patched_image = patched_image.permute(1, 3, 2, 4, 0)
+    patched_image = patched_image.reshape(num_patches_height * num_patches_width, -1)
+    return patched_image
+
+
+# Adopted from Siglip2 (mask -> position ids)
+def pad_along_first_dim(
+    image: "torch.Tensor", positions: "torch.Tensor", target_length: int
+) -> tuple["torch.Tensor", "torch.Tensor"]:
+    """
+    Pad the tensor along the first dimension.
+    """
+    current_length = image.shape[0]
+    padding_length = target_length - current_length
+    if padding_length > 0:
+        padding = [0, 0] * (image.ndim - 1) + [0, padding_length]
+        pos_padding = (0, 0, 0, padding_length)
+        image = torch.nn.functional.pad(image, padding, mode="constant", value=0)
+        positions = torch.nn.functional.pad(positions, pos_padding, mode="constant", value=-1)
+    return image, positions
+
+
+def patches_merge(
+    patches: "torch.Tensor",
+    positions_xy: "torch.Tensor",
+    length: int,
+) -> tuple["torch.Tensor", "torch.Tensor"]:
+    """Merge kxk groups of small patches into larger patches.
+
+    Given `L` input patches of dimension `D = patch_size^2 x 3`, merge groups of
+    `kxk` spatially adjacent patches into `length` output patches of dimension
+    `(k x patch_size)^2 x 3`. The spatial grouping is determined by integer-dividing
+    the XY positions by `k`.
+
+    Args:
+        patches: (*, L, D) -- input patches.
+        positions_xy: (*, L, 2) -- integer XY positions for each patch (-1 for padding).
+        length: target number of output patches. Must satisfy L = length x k^2.
+
+    Returns:
+        merged_patches: (*, length, k^2 x D) -- merged patch features.
+        merged_positions: (*, length, 2) -- new XY positions for merged patches.
+    """
+    patch_size = math.isqrt(patches.shape[-1] // 3)
+    if patches.shape[-1] != patch_size * patch_size * 3:
+        raise ValueError(
+            f"Patch dimension {patches.shape[-1]} is not a valid `patch_size * patch_size * 3`"
+        )
+
+    k = math.isqrt(patches.shape[-2] // length)
+    if k * k * length != patches.shape[-2]:
+        raise ValueError(f"Cannot merge {patches.shape} to {length}")
+
+    # Compute target ordering for reordering patches into kernel-grouped order.
+    # This ensures patches within each kxk kernel are contiguous.
+    max_x = positions_xy[..., 0].max(dim=-1, keepdim=True)[0] + 1
+    kernel_idxs = torch.div(positions_xy, k, rounding_mode="floor")
+    num_patches_from_top_left = k * k * kernel_idxs[..., 0] + k * max_x * kernel_idxs[..., 1]
+
+    position_within_kernel = torch.remainder(positions_xy, k)
+    num_patches_from_top_left_of_kernel = (
+        position_within_kernel[..., 0] + position_within_kernel[..., 1] * k
+    )
+    target_ordering = num_patches_from_top_left_of_kernel + num_patches_from_top_left
+
+    # Reorder patches by computing the inverse permutation via argsort,
+    # then gathering patches into kernel-grouped order.
+    perm = target_ordering.long().argsort(dim=-1)  # inverse permutation
+    # Expand perm indices to match patch feature dimension for gathering
+    perm_expanded = perm.unsqueeze(-1).expand_as(patches)
+    kernel_ordered_patches = patches.gather(-2, perm_expanded)
+
+    batch_shape = patches.shape[:-2]
+
+    # Reshape: (*, length*k*k, patch_size*patch_size*3) -> (*, length, (k*patch_size)*(k*patch_size)*3)
+    kernel_ordered_patches = kernel_ordered_patches.reshape(
+        *batch_shape, length, k * k, patch_size, patch_size, 3
+    )
+    # Rearrange (l, a*b, p, q, c) -> (l, a*p, b*q, c)
+    kernel_ordered_patches = kernel_ordered_patches.reshape(
+        *batch_shape, length, k, k, patch_size, patch_size, 3
+    )
+    kernel_ordered_patches = kernel_ordered_patches.permute(
+        *range(len(batch_shape)), -6, -5, -3, -4, -2, -1
+    )  # (..., l, k, p, k, q, c)
+    merged_patches = kernel_ordered_patches.reshape(
+        *batch_shape, length, k * patch_size * k * patch_size * 3
+    )
+
+    # Compute new positions for merged patches
+    perm_pos = perm.unsqueeze(-1).expand_as(positions_xy)
+    kernel_ordered_positions = positions_xy.float().gather(-2, perm_pos.long())
+
+    # Handle padding: preserve -1 positions
+    padding = (positions_xy == -1).all(dim=-1, keepdim=True)  # (..., L, 1)
+    kernel_ordered_positions = (
+        kernel_ordered_positions * (~padding).float() + positions_xy.float() * padding.float()
+    )
+
+    # Reshape positions and take min within each kernel to get the merged position
+    kernel_ordered_positions = kernel_ordered_positions.reshape(*batch_shape, length, k * k, 2)
+    new_positions = torch.div(kernel_ordered_positions, k, rounding_mode="floor")
+    # For each merged patch, take the minimum position across the kernel
+    new_positions = new_positions.min(dim=-2)[0].to(torch.long)
+
+    return merged_patches, new_positions
+
+
+class Gemma4UnifiedImageProcessor(TorchvisionBackend):
+    """Constructs a Gemma4 unified image processor."""
+
+    resample = PILImageResampling.BICUBIC
+    image_mean = [0.0, 0.0, 0.0]
+    image_std = [1.0, 1.0, 1.0]
+    size = None
+    default_to_square = True
+    do_convert_rgb = True
+    do_resize = True
+    do_rescale = True
+    do_normalize = False
+    patch_size = 16
+    max_soft_tokens = 280
+    pooling_kernel_size = 3
+    valid_kwargs = Gemma4UnifiedImageProcessorKwargs
+    model_input_names = ["pixel_values", "image_position_ids", "num_soft_tokens_per_image"]
+
+    def __init__(self, **kwargs: Unpack[Gemma4UnifiedImageProcessorKwargs]):
+        super().__init__(**kwargs)
+
+        if self.max_soft_tokens not in _SUPPORTED_SOFT_TOKENS:
+            raise ValueError(
+                f"`max_soft_tokens` must be one of {_SUPPORTED_SOFT_TOKENS}, got {self.max_soft_tokens}."
+            )
+
+    def _validate_preprocess_kwargs(self, **kwargs):
+        # Gemma4Unified uses aspect_ratio_preserving_resize driven by patch_size,
+        # max_soft_tokens, and pooling_kernel_size -- not the standard `size`
+        # parameter. Temporarily disable do_resize so the base validation
+        # doesn't require `size` to be set.
+        kwargs["do_resize"] = False
+        super()._validate_preprocess_kwargs(**kwargs)
+
+    def aspect_ratio_preserving_resize(
+        self,
+        image: torch.Tensor,
+        patch_size: int,
+        max_patches: int,
+        pooling_kernel_size: int,
+        resample: tvF.InterpolationMode,
+    ) -> torch.Tensor:
+        height, width = image.shape[-2], image.shape[-1]
+        target_height, target_width = get_aspect_ratio_preserving_size(
+            height=height,
+            width=width,
+            patch_size=patch_size,
+            max_patches=max_patches,
+            pooling_kernel_size=pooling_kernel_size,
+        )
+
+        if target_height == height and target_width == width:
+            return image
+
+        return tvF.resize(
+            image,
+            size=[target_height, target_width],
+            interpolation=resample,
+            antialias=True,
+        )
+
+    def preprocess(
+        self,
+        images: ImageInput,
+        **kwargs: Unpack[Gemma4UnifiedImageProcessorKwargs],
+    ) -> BatchFeature:
+        return super().preprocess(images, **kwargs)
+
+    def _preprocess(
+        self,
+        images: list["torch.Tensor"],
+        do_resize: bool,
+        resample: "PILImageResampling | tvF.InterpolationMode | int | None",
+        do_rescale: bool,
+        rescale_factor: float,
+        do_normalize: bool,
+        image_mean: float | list[float] | None,
+        image_std: float | list[float] | None,
+        return_tensors: str | TensorType | None,
+        patch_size: int | None = None,
+        max_soft_tokens: int | None = None,
+        pooling_kernel_size: int | None = None,
+        **kwargs,
+    ) -> BatchFeature:
+        if max_soft_tokens not in _SUPPORTED_SOFT_TOKENS:
+            raise ValueError(
+                f"`max_soft_tokens` must be one of {_SUPPORTED_SOFT_TOKENS}, got {max_soft_tokens}."
+            )
+
+        # Compute max_patches from max_soft_tokens and pooling_kernel_size
+        max_patches = max_soft_tokens * pooling_kernel_size**2
+
+        # Process each image individually: resize, rescale/normalize, patchify, pad.
+        # Images have different aspect ratios and thus different resized dimensions,
+        # so patchification and padding must happen per-image before stacking.
+        pixel_values = []
+        position_ids = []
+        num_soft_tokens_per_image = []
+
+        for image in images:
+            # Step 1: Aspect-ratio-preserving resize
+            if do_resize:
+                image = self.aspect_ratio_preserving_resize(
+                    image=image,
+                    patch_size=patch_size,
+                    max_patches=max_patches,
+                    pooling_kernel_size=pooling_kernel_size,
+                    resample=resample,
+                )
+
+            # Step 2: Rescale pixel values (typically to [0, 1]) and optionally identity normalize
+            image = self.rescale_and_normalize(
+                image, do_rescale, rescale_factor, do_normalize, image_mean, image_std
+            )
+
+            # Step 3: Patchify into teacher-size patches (16px)
+            # (num_channels, height, width) -> (num_teacher_patches, patch_size^2*3)
+            teacher_patches = convert_image_to_patches(image, patch_size)
+            patch_height = image.shape[-2] // patch_size
+            patch_width = image.shape[-1] // patch_size
+
+            # Step 4: Compute teacher-level position IDs
+            device = image.device
+            patch_grid = torch.meshgrid(
+                torch.arange(patch_width, device=device),
+                torch.arange(patch_height, device=device),
+                indexing="xy",
+            )
+            teacher_positions = torch.stack(patch_grid, dim=-1).reshape(teacher_patches.shape[0], 2)
+
+            # Step 5: Merge kxk teacher patches into model patches via patches_merge
+            # (num_teacher_patches, 768) -> (num_model_patches, 6912)
+            num_model_patches = teacher_patches.shape[0] // (pooling_kernel_size**2)
+            merged_patches, merged_positions = patches_merge(
+                teacher_patches.unsqueeze(0),  # add batch dim for patches_merge
+                teacher_positions.unsqueeze(0),
+                num_model_patches,
+            )
+            merged_patches = merged_patches.squeeze(0)  # remove batch dim
+            merged_positions = merged_positions.squeeze(0)
+            num_soft_tokens_per_image.append(merged_patches.shape[0])
+
+            # Step 6: Pad merged patches and positions to max_soft_tokens
+            merged_patches, merged_positions = pad_along_first_dim(
+                merged_patches, merged_positions, max_soft_tokens
+            )
+            pixel_values.append(merged_patches)
+            position_ids.append(merged_positions)
+
+        # Stack into batch tensors
+        pixel_values = torch.stack(
+            pixel_values, dim=0
+        )  # (batch, max_soft_tokens, model_patch_size^2*3)
+        position_ids = torch.stack(position_ids, dim=0)  # (batch, max_soft_tokens, 2)
+
+        data = {
+            "pixel_values": pixel_values,
+            "image_position_ids": position_ids,
+            "num_soft_tokens_per_image": num_soft_tokens_per_image,
+        }
+        return BatchFeature(data=data, tensor_type=return_tensors)
+
+
+# ---------------------------------------------------------------------------
+# Video: vendored from video_processing_gemma4_unified.py
+# ---------------------------------------------------------------------------
+
+
+def convert_video_to_patches(video: "torch.Tensor", patch_size: int) -> "torch.Tensor":
+    """
+    Convert 4D tensor video of shape (num_frames, num_channels, height, width) into 3D tensor of patches of shape
+    (num_frames, num_patches_height * num_patches_width, patch_size * patch_size * num_channels).
+    """
+    num_frames, num_channels, height, width = video.shape
+    num_patches_height = height // patch_size
+    num_patches_width = width // patch_size
+    patched_video = video.reshape(
+        num_frames, num_channels, num_patches_height, patch_size, num_patches_width, patch_size
+    )
+    patched_video = patched_video.permute(0, 2, 4, 3, 5, 1)
+    patched_video = patched_video.reshape(num_frames, num_patches_height * num_patches_width, -1)
+    return patched_video
+
+
+def pad_to_max_patches(
+    video: "torch.Tensor", positions: "torch.Tensor", target_length: int
+) -> tuple["torch.Tensor", "torch.Tensor"]:
+    """
+    Pad the video along to max number of patches
+    """
+    current_length = video.shape[1]
+    padding_length = target_length - current_length
+    if padding_length > 0:
+        padding = [0, 0, 0, padding_length, 0, 0]
+        pos_padding = (0, 0, 0, padding_length, 0, 0)
+        video = torch.nn.functional.pad(video, padding, mode="constant", value=0)
+        positions = torch.nn.functional.pad(positions, pos_padding, mode="constant", value=-1)
+    return video, positions
+
+
+class Gemma4UnifiedVideoProcessor(BaseVideoProcessor):
+    """Constructs a Gemma4Unified video processor that samples frames from videos
+    for use with the Gemma4Unified model."""
+
+    resample = PILImageResampling.BICUBIC
+    image_mean = [0.0, 0.0, 0.0]
+    image_std = [1.0, 1.0, 1.0]
+    size = None
+    default_to_square = True
+    do_convert_rgb = True
+    do_resize = True
+    do_rescale = True
+    do_normalize = True
+    num_frames = 32
+    do_sample_frames = True
+    patch_size = 16
+    max_soft_tokens = 70
+    pooling_kernel_size = 3
+    valid_kwargs = Gemma4UnifiedVideoProcessorKwargs
+    model_input_names = ["pixel_values_videos", "video_position_ids"]
+
+    def __init__(self, **kwargs: Unpack[Gemma4UnifiedVideoProcessorKwargs]):
+        super().__init__(**kwargs)
+
+        if self.max_soft_tokens not in _SUPPORTED_SOFT_TOKENS:
+            raise ValueError(
+                f"`max_soft_tokens` must be one of {_SUPPORTED_SOFT_TOKENS}, got {self.max_soft_tokens}."
+            )
+
+    def _validate_preprocess_kwargs(self, **kwargs):
+        # Gemma4Unified uses aspect_ratio_preserving_resize driven by patch_size,
+        # max_soft_tokens, and pooling_kernel_size -- not the standard `size`
+        # parameter. Temporarily disable do_resize so the base validation
+        # doesn't require `size` to be set.
+        kwargs["do_resize"] = False
+        super()._validate_preprocess_kwargs(**kwargs)
+
+    def aspect_ratio_preserving_resize(
+        self,
+        video: torch.Tensor,
+        patch_size: int,
+        max_patches: int,
+        pooling_kernel_size: int,
+        resample: tvF.InterpolationMode,
+    ) -> torch.Tensor:
+        height, width = video.shape[-2], video.shape[-1]
+        target_height, target_width = get_aspect_ratio_preserving_size(
+            height=height,
+            width=width,
+            patch_size=patch_size,
+            max_patches=max_patches,
+            pooling_kernel_size=pooling_kernel_size,
+        )
+
+        if target_height == height and target_width == width:
+            return video
+
+        return tvF.resize(
+            video,
+            size=[target_height, target_width],
+            interpolation=resample,
+            antialias=True,
+        )
+
+    def preprocess(
+        self,
+        videos: VideoInput,
+        **kwargs: Unpack[Gemma4UnifiedVideoProcessorKwargs],
+    ) -> BatchFeature:
+        return super().preprocess(videos, **kwargs)
+
+    def _preprocess(
+        self,
+        videos: list["torch.Tensor"],
+        do_resize: bool,
+        resample: "tvF.InterpolationMode | int | None",
+        do_rescale: bool,
+        rescale_factor: float,
+        do_normalize: bool,
+        image_mean: float | list[float] | None,
+        image_std: float | list[float] | None,
+        return_tensors: str | TensorType | None,
+        patch_size: int | None = None,
+        max_soft_tokens: int | None = None,
+        pooling_kernel_size: int | None = None,
+        **kwargs,
+    ) -> BatchFeature:
+        if max_soft_tokens not in _SUPPORTED_SOFT_TOKENS:
+            raise ValueError(
+                f"`max_soft_tokens` must be one of {_SUPPORTED_SOFT_TOKENS}, got {max_soft_tokens}."
+            )
+
+        # Compute max_patches from max_soft_tokens and pooling_kernel_size
+        max_patches = max_soft_tokens * pooling_kernel_size**2
+
+        # Process each image individually: resize, rescale/normalize, patchify, pad.
+        # Images have different aspect ratios and thus different resized dimensions,
+        # so patchification and padding must happen per-image before stacking.
+        pixel_values = []
+        position_ids = []
+        num_soft_tokens_per_video = []
+
+        for video in videos:
+            if do_resize:
+                # Step 1: Aspect-ratio-preserving resize
+                video = self.aspect_ratio_preserving_resize(
+                    video=video,
+                    patch_size=patch_size,
+                    max_patches=max_patches,
+                    pooling_kernel_size=pooling_kernel_size,
+                    resample=resample,
+                )
+
+            # Step 2: Rescale pixel values (typically to [0, 1]) and optionally identity normalize
+            video = self.rescale_and_normalize(
+                video, do_rescale, rescale_factor, do_normalize, image_mean, image_std
+            )
+
+            # Step 3: Patchify into teacher-size patches (16px)
+            num_frames = video.shape[0]
+            patches = convert_video_to_patches(video, patch_size)
+            patch_height = video.shape[-2] // patch_size
+            patch_width = video.shape[-1] // patch_size
+
+            # Step 4: Compute teacher-level position IDs
+            device = video.device
+            patch_grid = torch.meshgrid(
+                torch.arange(patch_width, device=device),
+                torch.arange(patch_height, device=device),
+                indexing="xy",
+            )
+            stacked_grid = torch.stack(patch_grid, dim=-1)
+            teacher_positions = stacked_grid.reshape(patches.shape[1], 2)
+            teacher_positions = teacher_positions[None, ...].repeat(num_frames, 1, 1)
+
+            # Step 5: Merge kxk teacher patches into model patches via patches_merge
+            # (num_frames, num_teacher_patches, 768) -> (num_frames, num_model_patches, 6912)
+            num_model_patches = patches.shape[1] // (pooling_kernel_size**2)
+            merged_patches, merged_positions = patches_merge(
+                patches, teacher_positions, num_model_patches
+            )
+            num_soft_tokens_per_video.append(merged_patches.shape[1])
+
+            # Step 6: Pad merged patches and positions to max_soft_tokens
+            merged_patches, merged_positions = pad_to_max_patches(
+                merged_patches, merged_positions, max_soft_tokens
+            )
+            pixel_values.append(merged_patches)
+            position_ids.append(merged_positions)
+
+        # Stack into batch tensors
+        pixel_values = torch.stack(pixel_values, dim=0)
+        position_ids = torch.stack(position_ids, dim=0)
+
+        data = {
+            "pixel_values_videos": pixel_values,
+            "video_position_ids": position_ids,
+            "num_soft_tokens_per_video": num_soft_tokens_per_video,
+        }
+        return BatchFeature(data=data, tensor_type=return_tensors)
+
+
+# ---------------------------------------------------------------------------
+# Top-level processor shim: a plain class reproducing the generic
+# ProcessorMixin.__call__ flow (prepare_inputs_layout / _process_images /
+# _process_audio / get_text_with_replacements) explicitly, with the upstream
+# per-modality replacement formulas (replace_image_token / replace_audio_token)
+# kept byte-for-byte.
+# ---------------------------------------------------------------------------
+
+
+class Gemma4UnifiedProcessorShim:
+    """Drop-in stand-in for HF `Gemma4UnifiedProcessor`.
+
+    Supports the call pattern TRT-LLM's Gemma4 input processor uses:
+    `processor(text=..., images=..., audio=..., return_tensors="pt")` producing
+    `input_ids` / `pixel_values` / `image_position_ids` / `input_features` /
+    `input_features_mask`, plus a `video_processor` attribute for the separate
+    video path.
+    """
+
+    def __init__(
+        self,
+        feature_extractor,
+        image_processor,
+        tokenizer,
+        video_processor,
+        image_seq_length: int = 280,
+        audio_seq_length: int = 750,
+        audio_ms_per_token: int = 40,
+        image_token: str = "<|image|>",
+        boi_token: str = "<|image>",
+        eoi_token: str = "<image|>",
+        audio_token: str = "<|audio|>",
+        boa_token: str = "<|audio>",
+        eoa_token: str = "<audio|>",
+        **kwargs,
+    ):
+        self.feature_extractor = feature_extractor
+        self.image_processor = image_processor
+        self.tokenizer = tokenizer
+        self.video_processor = video_processor
+
+        self.image_seq_length = image_seq_length
+        self.audio_seq_length = audio_seq_length
+        self.audio_ms_per_token = audio_ms_per_token
+
+        self.image_token = image_token
+        self.boi_token = boi_token
+        self.eoi_token = eoi_token
+        self.audio_token = audio_token
+        self.boa_token = boa_token
+        self.eoa_token = eoa_token
+        self.image_token_id = tokenizer.convert_tokens_to_ids(image_token)
+
+        # Upstream Gemma4UnifiedProcessor.__init__ registers the video token the
+        # same way (the checkpoint tokenizer does not declare it as an attribute).
+        tokenizer.add_special_tokens({"additional_special_tokens": ["<|video|>"]})
+        self.video_token = "<|video|>"
+        self.video_token_id = tokenizer.convert_tokens_to_ids(self.video_token)
+        self.audio_token_id = tokenizer.convert_tokens_to_ids(audio_token)
+
+    # Upstream replace_image_token, byte-for-byte.
+    def replace_image_token(self, image_inputs: dict, image_idx: int) -> str:
+        num_soft_tokens = image_inputs["num_soft_tokens_per_image"][image_idx]
+        return f"{self.boi_token}{self.image_token * num_soft_tokens}{self.eoi_token}"
+
+    # Upstream replace_audio_token, byte-for-byte.
+    def replace_audio_token(self, audio_inputs: dict, audio_idx: int) -> str:
+        """Replace the audio placeholder with the correct number of audio tokens.
+
+        Unlike standard Gemma4 which has a conformer audio encoder with two stride-2
+        convolution blocks (reducing token count ~4x), the unified model projects raw
+        waveform frames directly through RMSNorm -> Linear with **no downsampling**.
+        So the number of output soft tokens equals the number of valid input frames.
+        """
+        mask = audio_inputs["input_features_mask"][audio_idx]
+        return f"{self.boa_token}{self.audio_token * int(mask.sum())}{self.eoa_token}"
+
+    def __call__(
+        self,
+        text=None,
+        images=None,
+        audio=None,
+        videos=None,
+        return_tensors: str | TensorType | None = "pt",
+        do_rescale: bool | None = None,
+        **kwargs,
+    ) -> BatchFeature:
+        if videos is not None:
+            # TRT-LLM expands video placeholders itself and calls
+            # `self.video_processor` directly; mirror upstream by not accepting
+            # videos through the main entry point here.
+            raise ValueError(
+                "Gemma4UnifiedProcessorShim does not accept `videos`; call "
+                "`.video_processor(videos=...)` directly."
+            )
+        if isinstance(text, str):
+            text = [text]
+
+        # Mirrors ProcessorMixin.__call__: run each modality's component, then
+        # replace each placeholder occurrence in-order with its expanded string.
+        data = {}
+        images_replacements = []
+        audio_replacements = []
+
+        if images is not None:
+            images_kwargs = {}
+            if do_rescale is not None:
+                images_kwargs["do_rescale"] = do_rescale
+            processed_images = self.image_processor(
+                images, return_tensors=return_tensors, **images_kwargs
+            )
+            for idx in range(len(processed_images["num_soft_tokens_per_image"])):
+                images_replacements.append(
+                    self.replace_image_token(processed_images, image_idx=idx)
+                )
+            data["pixel_values"] = processed_images["pixel_values"]
+            data["image_position_ids"] = processed_images["image_position_ids"]
+
+        if audio is not None:
+            processed_audio = self.feature_extractor(audio, return_tensors=return_tensors)
+            for idx in range(len(processed_audio["input_features_mask"])):
+                audio_replacements.append(self.replace_audio_token(processed_audio, audio_idx=idx))
+            data["input_features"] = processed_audio["input_features"]
+            data["input_features_mask"] = processed_audio["input_features_mask"]
+
+        # In-order placeholder replacement (mirrors get_text_with_replacements):
+        # the i-th occurrence of a modality's placeholder consumes the i-th
+        # replacement string for that modality.
+        token_groups = []
+        if images_replacements:
+            token_groups.append(f"(?P<image>{re.escape(self.image_token)})")
+        if audio_replacements:
+            token_groups.append(f"(?P<audio>{re.escape(self.audio_token)})")
+        if token_groups and text is not None:
+            regex_special_mm_tokens = "|".join(token_groups)
+            replacements_iters = {
+                "image": iter(images_replacements),
+                "audio": iter(audio_replacements),
+            }
+            text = [
+                re.sub(
+                    regex_special_mm_tokens,
+                    lambda m: next(replacements_iters[m.lastgroup]),
+                    sample,
+                )
+                for sample in text
+            ]
+
+        if text is not None:
+            text_inputs = self.tokenizer(text, return_tensors=return_tensors, padding=True)
+            data["input_ids"] = text_inputs["input_ids"]
+
+        return BatchFeature(data=data)
+
+
+def load_gemma4_unified_processor(model_path: str, tokenizer) -> Gemma4UnifiedProcessorShim:
+    """Build the vendored Gemma4 unified processor from a checkpoint directory.
+
+    Reads the component parameters from `processor_config.json` and the
+    multimodal special-token strings from `tokenizer_config.json` -- the same
+    files `AutoProcessor.from_pretrained` consumes.
+    """
+    with open(os.path.join(model_path, "processor_config.json"), encoding="utf-8") as f:
+        processor_config = json.load(f)
+
+    def _component_kwargs(section: str) -> dict:
+        section_config = dict(processor_config.get(section, {}))
+        # Drop the HF class-name tags; the classes are fixed here.
+        for type_key in (
+            "image_processor_type",
+            "feature_extractor_type",
+            "video_processor_type",
+            "processor_class",
+        ):
+            section_config.pop(type_key, None)
+        return section_config
+
+    image_processor = Gemma4UnifiedImageProcessor(**_component_kwargs("image_processor"))
+    feature_extractor = Gemma4UnifiedAudioFeatureExtractor(**_component_kwargs("feature_extractor"))
+    video_processor = Gemma4UnifiedVideoProcessor(**_component_kwargs("video_processor"))
+
+    with open(os.path.join(model_path, "tokenizer_config.json"), encoding="utf-8") as f:
+        tokenizer_config = json.load(f)
+
+    token_kwargs = {
+        key: tokenizer_config[key]
+        for key in (
+            "image_token",
+            "boi_token",
+            "eoi_token",
+            "audio_token",
+            "boa_token",
+            "eoa_token",
+        )
+        if tokenizer_config.get(key) is not None
+    }
+
+    return Gemma4UnifiedProcessorShim(
+        feature_extractor=feature_extractor,
+        image_processor=image_processor,
+        tokenizer=tokenizer,
+        video_processor=video_processor,
+        image_seq_length=processor_config.get("image_seq_length", 280),
+        audio_seq_length=processor_config.get("audio_seq_length", 750),
+        audio_ms_per_token=processor_config.get("audio_ms_per_token", 40),
+        **token_kwargs,
+    )
