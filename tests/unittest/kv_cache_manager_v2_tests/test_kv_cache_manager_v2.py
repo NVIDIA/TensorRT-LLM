@@ -245,6 +245,7 @@ def create_config(
     sink_tokens: int,
     kv_buf_size: int = 8192,
     block_quant_buf_size: int | None = None,
+    enable_inclusive_host_cache: bool = False,
 ) -> KVCacheManagerConfig:
     layer_buffers = [
         BufferConfig(role=Role.KEY, size=kv_buf_size),
@@ -279,6 +280,7 @@ def create_config(
             )
             for layer_id in typed_range(LayerId(num_layers))
         ],
+        enable_inclusive_host_cache=enable_inclusive_host_cache,
     )
 
 
@@ -318,6 +320,7 @@ class TestKVCacheManagerV2(unittest.TestCase):
         tokens_per_block: int = 32,
         kv_buf_size: int = 8192,
         block_quant_buf_size: int | None = None,
+        enable_inclusive_host_cache: bool = False,
     ):
         self.cfg = create_config(
             tokens_per_block,
@@ -329,6 +332,7 @@ class TestKVCacheManagerV2(unittest.TestCase):
             sink_tokens,
             kv_buf_size,
             block_quant_buf_size,
+            enable_inclusive_host_cache,
         )
         self.engine = FakeEngine(self.cfg)
         self.manager = KVCacheManager(self.cfg)
@@ -496,6 +500,71 @@ class TestNoBatching(TestKVCacheManagerV2):
         # run another longer request and expect OutOfPagesError
         # This also tests eviction to disk.
         self.assertRaises(OutOfPagesError, lambda: self.run_naive(seq_len + 1, 1, False))
+
+    # @assert_no_ref_cycle
+    def test_inclusive_host_cache_shadow_reuse(self) -> None:
+        # With enable_inclusive_host_cache, recalling an immutable page host->GPU retains its clean
+        # host copy as a shadow; a later eviction back to host reuses that shadow (copy-free) and
+        # does not consume a fresh host slot. Drive the GPU<->host bounce via suspend/resume under
+        # GPU memory pressure and observe the per-level shadow FIFO via _num_shadow_slots().
+        HOST_LEVEL = CacheLevel(1)
+        # Small GPU pool + generous host pool so suspend offloads to host and a competing request
+        # forces the hot request's blocks to bounce GPU<->host. No disk tier: host is last level.
+        self.prepare(
+            32 << 20, 128 << 20, 0, 36, 128, 1,
+            kv_buf_size=32768, enable_inclusive_host_cache=True,
+        )
+        storage = self.manager._storage
+        assert storage._enable_inclusive_host_cache
+
+        def total_shadows() -> int:
+            return sum(
+                storage._num_shadow_slots(HOST_LEVEL, pg)
+                for pg in typed_range(storage.num_pool_groups)
+            )
+
+        def host_free() -> int:
+            host_storage = storage._levels[HOST_LEVEL].storage
+            return sum(
+                host_storage.get_num_free_slots(pg)
+                for pg in typed_range(storage.num_pool_groups)
+            )
+
+        max_seq_len = 32 * 22
+        seq_len = max_seq_len
+
+        # Warm up the hot request, then suspend it (its blocks offload GPU->host).
+        hot = self.new_request(0, None, 256, seq_len - 256)
+        with TemporaryCudaStream([]) as s:
+            stream = cast(CudaStream, s.handle)
+            assert hot.kv_cache.resume(stream)
+            self.run_request(hot, 32, False)
+        s.take_finish_event()
+        hot.kv_cache.suspend()
+
+        # No shadows yet: the hot request has only been offloaded, never recalled+re-evicted.
+        assert total_shadows() == 0
+
+        # Bounce: recall the hot request to GPU (attaches shadows), then a filler request takes the
+        # GPU pool, forcing the hot blocks back to host — reusing the retained shadows copy-free.
+        host_free_before = host_free()
+        with TemporaryCudaStream([]) as s:
+            stream = cast(CudaStream, s.handle)
+            assert hot.kv_cache.resume(stream)
+        s.take_finish_event()
+        # After recall, immutable committed blocks retained their host copy as shadows.
+        shadows_after_recall = total_shadows()
+        self.assertGreater(shadows_after_recall, 0)
+        # Shadows occupy host slots, so free host slots dropped versus before the recall.
+        self.assertLess(host_free(), host_free_before)
+
+        # Suspend again: the hot blocks evict GPU->host and reuse their shadows (no fresh host slot,
+        # no D2H copy). The shadow FIFO drains as shadows are rebound to the evicted pages.
+        hot.kv_cache.suspend()
+        self.assertLess(total_shadows(), shadows_after_recall)
+
+        hot.kv_cache.close()
+        self.manager.clear_reusable_blocks()
 
     @parameterized.expand([(1,), (2,), (4,)])
     # @assert_no_ref_cycle

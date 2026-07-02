@@ -261,6 +261,7 @@ class KVCacheManager:
             typical_batch=config.typical_step,
             constraints=config.constraints,
             event_manager=event_manager,
+            enable_inclusive_host_cache=config.enable_inclusive_host_cache,
         )
         self._living_kv_caches = set[rawref.ref[_KVCache]]()
         decay = 0.9999
