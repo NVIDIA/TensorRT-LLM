@@ -380,7 +380,7 @@ def test_cpp_add_dummy_requests_noop_on_empty_list():
     stub.mamba_impl.allocate_cache_blocks.assert_not_called()
 
 
-def test_calc_context_stop_positions_uses_prompt_end_for_v2_tail():
+def test_calc_context_stop_positions_returns_snapshot_points():
     assert calc_context_stop_positions(
         prompt_len=70,
         tokens_per_block=32,
@@ -388,12 +388,13 @@ def test_calc_context_stop_positions_uses_prompt_end_for_v2_tail():
         save_last_snapshot=True,
     ) == [70]
     assert calc_context_stop_positions(128, 32, 64, True) == [64, 128]
-    assert calc_context_stop_positions(70, 32, 256, False) == [70]
+    assert calc_context_stop_positions(128, 32, 64, False) == [64, 128]
+    assert calc_context_stop_positions(70, 32, 256, False) == []
     assert calc_context_stop_positions(70, 32, 0, True) == [70]
     assert calc_context_stop_positions(70, 32, None, True) == [70]
 
 
-def test_v2_hybrid_prepare_expect_chunking_points():
+def test_v2_hybrid_prepare_expect_snapshot_points():
     mgr = object.__new__(KVCacheManagerV2MambaHybridCacheManager)
     mgr.kv_cache_config = KvCacheConfig(
         enable_block_reuse=True,
@@ -406,10 +407,12 @@ def test_v2_hybrid_prepare_expect_chunking_points():
 
     mgr.prepare_expect_chunking_points([request])
 
-    assert request.expect_chunking_points == [64, 128, 150]
+    assert request.expect_snapshot_points == [64, 128, 150]
+    assert request.expect_chunking_points is None
+    assert request.py_block_reuse_commit_limit == 150
 
 
-def test_v2_hybrid_prepare_expect_chunking_points_save_last_only():
+def test_v2_hybrid_prepare_expect_snapshot_points_save_last_only():
     mgr = object.__new__(KVCacheManagerV2MambaHybridCacheManager)
     mgr.kv_cache_config = KvCacheConfig(
         enable_block_reuse=True,
@@ -422,10 +425,12 @@ def test_v2_hybrid_prepare_expect_chunking_points_save_last_only():
 
     mgr.prepare_expect_chunking_points([request])
 
-    assert request.expect_chunking_points == [150]
+    assert request.expect_snapshot_points == [150]
+    assert request.expect_chunking_points is None
+    assert request.py_block_reuse_commit_limit == 150
 
 
-def test_v2_hybrid_prepare_expect_chunking_points_excludes_stable_boundary():
+def test_v2_hybrid_prepare_expect_snapshot_points_uses_stable_boundary():
     mgr = object.__new__(KVCacheManagerV2MambaHybridCacheManager)
     mgr.kv_cache_config = KvCacheConfig(
         enable_block_reuse=True,
@@ -442,10 +447,12 @@ def test_v2_hybrid_prepare_expect_chunking_points_excludes_stable_boundary():
 
     mgr.prepare_expect_chunking_points([request])
 
-    assert request.expect_chunking_points == [150]
+    assert request.expect_snapshot_points == [137]
+    assert request.expect_chunking_points is None
+    assert request.py_block_reuse_commit_limit == 137
 
 
-def test_v2_hybrid_stable_boundary_does_not_force_chunking():
+def test_v2_hybrid_stable_boundary_becomes_snapshot_point():
     request = SimpleNamespace(
         prompt_len=150,
         py_block_reuse_stable_token_count=137,
@@ -453,37 +460,59 @@ def test_v2_hybrid_stable_boundary_does_not_force_chunking():
 
     assert _calc_context_stop_positions_for_request(
         request, tokens_per_block=32, mamba_state_cache_interval=0, save_last_snapshot=True
-    ) == [150]
+    ) == [137]
 
 
-def test_v2_block_reuse_commit_limit_uses_stable_boundary_for_save_last():
+def test_v2_block_reuse_commit_limit_uses_request_field():
     mgr = object.__new__(KVCacheManagerV2)
-    mgr.kv_cache_config = KvCacheConfig(
-        enable_block_reuse=True,
-        mamba_state_cache_interval=0,
-        mamba_save_last_snapshot=True,
-    )
     request = SimpleNamespace(
         prompt_len=150,
-        py_block_reuse_stable_token_count=137,
+        py_block_reuse_commit_limit=137,
     )
 
     assert mgr._get_block_reuse_commit_limit(request) == 137
 
 
-def test_v2_block_reuse_commit_limit_ignores_stable_boundary_without_save_last():
+def test_v2_block_reuse_commit_limit_ignores_stable_boundary_without_request_field():
     mgr = object.__new__(KVCacheManagerV2)
-    mgr.kv_cache_config = KvCacheConfig(
-        enable_block_reuse=True,
-        mamba_state_cache_interval=0,
-        mamba_save_last_snapshot=False,
-    )
     request = SimpleNamespace(
         prompt_len=150,
         py_block_reuse_stable_token_count=137,
     )
 
     assert mgr._get_block_reuse_commit_limit(request) == 150
+
+
+def test_v2_block_reuse_commit_saves_ssm_snapshot_at_snapshot_point():
+    mgr = object.__new__(KVCacheManagerV2)
+    mgr.enable_block_reuse = True
+    mgr.is_draft = False
+    mgr._augment_tokens_for_block_reuse = lambda tokens, request, start, end: tokens[start:end]
+    mgr._log_block_reuse_commit = MagicMock()
+    mgr._mark_context_position_as_history = MagicMock()
+
+    token_ids = list(range(150))
+    request = SimpleNamespace(
+        prompt_len=150,
+        context_current_position=137,
+        py_block_reuse_commit_limit=137,
+        expect_snapshot_points=[137],
+        is_dummy_request=False,
+        is_dummy=False,
+        py_request_id=0,
+        get_tokens=lambda beam_idx: token_ids,
+    )
+    kv_cache = SimpleNamespace(
+        num_committed_tokens=0,
+        commit=MagicMock(),
+        stop_committing=MagicMock(),
+    )
+
+    mgr.try_commit_blocks_for_reuse(request, kv_cache)
+
+    kv_cache.commit.assert_called_once_with(token_ids[:137], save_ssm_snapshot=True)
+    kv_cache.stop_committing.assert_not_called()
+    mgr._mark_context_position_as_history.assert_called_once_with(request, kv_cache)
 
 
 def test_v2_hybrid_prepare_expect_chunking_points_clears_when_reuse_disabled():
@@ -495,7 +524,9 @@ def test_v2_hybrid_prepare_expect_chunking_points_clears_when_reuse_disabled():
 
     mgr.prepare_expect_chunking_points([request])
 
+    assert request.expect_snapshot_points is None
     assert request.expect_chunking_points is None
+    assert request.py_block_reuse_commit_limit == 150
 
 
 @skip_no_cuda

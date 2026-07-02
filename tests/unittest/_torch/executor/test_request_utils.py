@@ -12,6 +12,7 @@ import pytest
 
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.request_utils import (
+    RequestBroadcaster,
     can_process_attention_dp_request,
     derive_attention_dp_per_rank_request_cap,
     get_from_waiting_queue,
@@ -198,6 +199,17 @@ def test_merge_requests_default(mock_convert):
 
     assert len(result) == 2
     assert mock_convert.call_count == 2
+
+
+def test_request_broadcaster_collects_block_reuse_stable_token_count():
+    request = Mock()
+    request.py_block_reuse_stable_token_count = 65472
+    request_item = RequestQueueItem(7, request)
+
+    broadcaster = RequestBroadcaster(Mock(), Mock())
+    py_objects = broadcaster._collect_py_objects([request_item])
+
+    assert ("py_block_reuse_stable_token_count", {7: 65472}) in py_objects
 
 
 def test_merge_requests_with_helix_cp_config():

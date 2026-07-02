@@ -878,8 +878,15 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                 current_compute_capacity -= actual_model_cost
 
     @staticmethod
+    def _get_force_chunk_points(req: LlmRequest):
+        points = getattr(req, "expect_snapshot_points", None)
+        if points is None:
+            points = getattr(req, "expect_chunking_points", None)
+        return points
+
+    @staticmethod
     def _force_chunk_size(req: LlmRequest, unit_size: int) -> int:
-        points = getattr(req, "expect_chunking_points", None)
+        points = PyMicroBatchScheduler._get_force_chunk_points(req)
         if not points:
             return min(req.context_remaining_length, unit_size)
 
@@ -894,7 +901,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
     def _chunk_forced(self, requests: RequestList, capacity: Optional[int], unit_size: int):
         """Mirrors the kFORCE_CHUNK specialization of setCtxRequestsChunkSize (microBatchScheduler.cpp).
 
-        Requests use expect_chunking_points when present; otherwise each
+        Requests use expect_snapshot_points when present; otherwise each
         request gets min(context_remaining_length, unit_size). Requests that
         would exceed the capacity budget are rounded down to the nearest lower
         unit_size multiple.

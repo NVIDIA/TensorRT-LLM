@@ -341,6 +341,7 @@ class _KVCache:
         self,
         accepted_input_tokens: Sequence[TokenIdExt],
         beam_search_indices: Sequence[int] | None = None,
+        save_ssm_snapshot: bool = False,
     ) -> None: ...
     @property
     def num_committed_tokens(self) -> int: ...

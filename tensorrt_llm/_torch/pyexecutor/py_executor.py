@@ -4307,12 +4307,43 @@ class PyExecutor:
         self.batch_wait_iters_count = 0
         return context_requests
 
+    @staticmethod
+    def _debug_agentx_reuse_enabled() -> bool:
+        return os.environ.get("TLLM_DEBUG_AGENTX_REUSE") == "1"
+
+    @staticmethod
+    def _debug_request_summary(requests: list[LlmRequest]) -> str:
+
+        def safe_attr(req: LlmRequest, name: str):
+            try:
+                return getattr(req, name)
+            except RuntimeError as exc:
+                return f"<unavailable:{str(exc).splitlines()[0]}>"
+
+        parts = []
+        for req in requests:
+            state = getattr(req.state, "name", str(req.state))
+            parts.append(
+                f"id={req.py_request_id},state={state},prompt={safe_attr(req, 'prompt_len')},"
+                f"pos={safe_attr(req, 'context_current_position')},"
+                f"chunk={safe_attr(req, 'context_chunk_size')},"
+                f"rem={safe_attr(req, 'context_remaining_length')},"
+                f"cached={getattr(req, 'cached_tokens', None)},"
+                f"limit={getattr(req, 'py_block_reuse_commit_limit', None)},"
+                f"snap={getattr(req, 'expect_snapshot_points', None)}")
+        return "[" + "; ".join(parts) + "]"
+
     @nvtx_range("_schedule")
     def _schedule(self):
         prepare_expect_chunking_points = getattr(
             self.kv_cache_manager, "prepare_expect_chunking_points", None)
         if prepare_expect_chunking_points is not None:
             prepare_expect_chunking_points(self.active_requests)
+            if self._debug_agentx_reuse_enabled():
+                logger.info(
+                    "AGENTX_DEBUG schedule after prepare_expect: "
+                    f"active={self._debug_request_summary(self.active_requests)}"
+                )
 
         scheduler_output = self.scheduler.schedule_request(
             self.active_requests, self.inflight_req_ids)
@@ -4361,6 +4392,13 @@ class PyExecutor:
         scheduled_requests.reset_context_requests(scheduled_context_requests)
         scheduled_requests.generation_requests = scheduler_output.generation_requests
         scheduled_requests.paused_requests = scheduler_output.paused_requests
+        if self._debug_agentx_reuse_enabled():
+            logger.info(
+                "AGENTX_DEBUG schedule output: "
+                f"ctx={self._debug_request_summary(scheduled_requests.context_requests)}, "
+                f"gen={self._debug_request_summary(scheduled_requests.generation_requests)}, "
+                f"paused={self._debug_request_summary(scheduled_requests.paused_requests)}, "
+                f"num_fitting={num_fitting}")
 
         return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, num_fitting
 
@@ -5085,6 +5123,13 @@ class PyExecutor:
                 a.py_return_context_logits
                 for a in scheduled_requests.context_requests)
             cache_indirection_buffer = self.sampler.get_cache_indirection()
+            if self._debug_agentx_reuse_enabled():
+                logger.info(
+                    "AGENTX_DEBUG executor forward begin: "
+                    f"iter={self.iter_counter}, "
+                    f"ctx={self._debug_request_summary(scheduled_requests.context_requests)}, "
+                    f"gen={self._debug_request_summary(scheduled_requests.generation_requests)}"
+                )
 
             # Run model forward on the execution stream for proper synchronization
             # with KVCacheTransferManager's onboard/offload operations.
@@ -5102,6 +5147,13 @@ class PyExecutor:
             torch.cuda.current_stream().wait_stream(self.execution_stream)
 
             self._kv_connector_wait_for_save()
+
+            if self._debug_agentx_reuse_enabled():
+                logger.info(
+                    "AGENTX_DEBUG executor forward end: "
+                    f"iter={self.iter_counter}, "
+                    f"output_keys={list(outputs.keys()) if isinstance(outputs, dict) else type(outputs)}"
+                )
 
             return outputs
         except Exception as e:
@@ -5168,6 +5220,12 @@ class PyExecutor:
 
     @nvtx_range("_update_request_states")
     def _update_request_states(self, scheduled_requests: ScheduledRequests):
+        if self._debug_agentx_reuse_enabled():
+            logger.info(
+                "AGENTX_DEBUG update_request_states begin: "
+                f"ctx={self._debug_request_summary(scheduled_requests.context_requests)}, "
+                f"gen={self._debug_request_summary(scheduled_requests.generation_requests)}"
+            )
         cp_config = self.dist.cp_config
         if 'cp_type' in cp_config:
             cp_type = cp_config['cp_type']
@@ -5180,11 +5238,24 @@ class PyExecutor:
                 raise NotImplementedError(
                     f'Unsupported cp type {cp_type.name}.')
         self._update_request_states_tp(scheduled_requests)
+        if self._debug_agentx_reuse_enabled():
+            logger.info(
+                "AGENTX_DEBUG update_request_states end: "
+                f"ctx={self._debug_request_summary(scheduled_requests.context_requests)}, "
+                f"gen={self._debug_request_summary(scheduled_requests.generation_requests)}"
+            )
 
     @nvtx_range("_sample_async")
     def _sample_async(self, scheduled_batch,
                       batch_outputs) -> SampleState | None:
         try:
+            if self._debug_agentx_reuse_enabled():
+                logger.info(
+                    "AGENTX_DEBUG sample_async begin: "
+                    f"ctx={self._debug_request_summary(scheduled_batch.context_requests)}, "
+                    f"gen={self._debug_request_summary(scheduled_batch.generation_requests)}, "
+                    f"output_keys={list(batch_outputs.keys()) if isinstance(batch_outputs, dict) else type(batch_outputs)}"
+                )
             if batch_outputs is not None:
                 num_context_logits_prefix_sum = [0]
                 prefix_sum = 0
@@ -5209,8 +5280,12 @@ class PyExecutor:
                                           batch_outputs, beam_width,
                                           num_context_tokens)
 
-                return self.sampler.sample_async(scheduled_batch, batch_outputs,
-                                                 num_context_logits_prefix_sum)
+                sample_state = self.sampler.sample_async(
+                    scheduled_batch, batch_outputs,
+                    num_context_logits_prefix_sum)
+                if self._debug_agentx_reuse_enabled():
+                    logger.info("AGENTX_DEBUG sample_async end")
+                return sample_state
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)

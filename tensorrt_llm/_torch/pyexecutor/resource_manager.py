@@ -2462,16 +2462,41 @@ class ResourceManager:
         attn_metadata: Optional["AttentionMetadata"] = None,
         kv_cache_dtype_byte_size: Optional[float] = None,
     ):
+        debug_agentx_reuse = os.environ.get("TLLM_DEBUG_AGENTX_REUSE") == "1"
         for _, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "update_context_resources"):
+                if debug_agentx_reuse:
+                    logger.info(
+                        "AGENTX_DEBUG resource update_context_resources begin: "
+                        f"manager={type(resource_manager).__name__}, "
+                        f"ctx={[req.py_request_id for req in scheduled_batch.context_requests]}"
+                    )
                 resource_manager.update_context_resources(scheduled_batch)
+                if debug_agentx_reuse:
+                    logger.info(
+                        "AGENTX_DEBUG resource update_context_resources end: "
+                        f"manager={type(resource_manager).__name__}, "
+                        f"ctx={[req.py_request_id for req in scheduled_batch.context_requests]}"
+                    )
             if hasattr(resource_manager, "update_resources"):
+                if debug_agentx_reuse:
+                    logger.info(
+                        "AGENTX_DEBUG resource update_resources begin: "
+                        f"manager={type(resource_manager).__name__}, "
+                        f"gen={[req.py_request_id for req in scheduled_batch.generation_requests]}"
+                    )
                 if isinstance(resource_manager, KVCacheManager):
                     resource_manager.update_resources(scheduled_batch,
                                                       attn_metadata,
                                                       kv_cache_dtype_byte_size)
                 else:
                     resource_manager.update_resources(scheduled_batch)
+                if debug_agentx_reuse:
+                    logger.info(
+                        "AGENTX_DEBUG resource update_resources end: "
+                        f"manager={type(resource_manager).__name__}, "
+                        f"gen={[req.py_request_id for req in scheduled_batch.generation_requests]}"
+                    )
 
     def free_resources(self, request: LlmRequest):
         for resource_type, resource_manager in reversed(

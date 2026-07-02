@@ -884,10 +884,11 @@ class _KVCache:
         self,
         accepted_input_tokens: Sequence[TokenIdExt],
         beam_search_indices: Sequence[int] | None = None,
+        save_ssm_snapshot: bool = False,
     ):
         if self.beam_width != 1:
             raise NotImplementedError("Not implemented yet for beam search")
-        if not accepted_input_tokens:
+        if not accepted_input_tokens and not save_ssm_snapshot:
             return
         assert beam_search_indices is None
         assert self.status == self.Status.ACTIVE
@@ -901,9 +902,30 @@ class _KVCache:
         if new_num_full_blocks > num_committed_blocks:
             with self._record_event():
                 for ordinal in typed_range(num_committed_blocks, new_num_full_blocks):
-                    self._commit_block(ordinal, False)
+                    snapshot_this_block = (
+                        save_ssm_snapshot
+                        and (ordinal + 1) * self.tokens_per_block == self.num_committed_tokens
+                    )
+                    self._commit_block(ordinal, False, snapshot_this_block)
+        finish_virtual_stop = False
+        if save_ssm_snapshot and self.num_committed_tokens > 0:
+            if self.num_committed_tokens % self.tokens_per_block != 0:
+                ordinal = _KVCache._to_block_ordinal(
+                    self.tokens_per_block, self.num_committed_tokens
+                )
+                if ordinal >= self._num_committed_blocks:
+                    with self._record_event():
+                        self._commit_block(ordinal, True, True, stop_after_commit=False)
+                    finish_virtual_stop = True
+                else:
+                    self._snapshot_last_committed_ssm_block()
+            elif new_num_full_blocks <= num_committed_blocks:
+                self._snapshot_last_committed_ssm_block()
         if self.history_length < self.num_committed_tokens:
             self.history_length = self.num_committed_tokens
+        if finish_virtual_stop and self._commit_state == self.CommitState.VIRTUAL_STOP:
+            self._commit_state = self.CommitState.USER_STOP
+            self._on_stop_committing()
 
     # Note that the tokens may not be ready yet, if the event passed to the past commit() calls are not yet signaled.
     @property
@@ -1296,6 +1318,7 @@ class _KVCache:
     def _should_snapshot_ssm_block(
         self, ordinal: BlockOrdinal, is_last: bool, save_last_ssm_snapshot: bool
     ) -> bool:
+        del is_last
         num_committed = self.num_committed_tokens
         if num_committed == 0:
             return False
@@ -1303,9 +1326,7 @@ class _KVCache:
         if block_end != num_committed:
             return False
         interval = self.manager.ssm_reuse_interval
-        return (interval > 0 and num_committed % interval == 0) or (
-            is_last and save_last_ssm_snapshot
-        )
+        return (interval > 0 and num_committed % interval == 0) or save_last_ssm_snapshot
 
     def _snapshot_last_committed_ssm_block(self) -> None:
         ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
@@ -1319,7 +1340,11 @@ class _KVCache:
             self._snapshot_ssm_to_tree_block(tree_block, ssm_lc_id, DEFAULT_BEAM_INDEX)
 
     def _commit_block(
-        self, ordinal: BlockOrdinal, is_last: bool, save_last_ssm_snapshot: bool = False
+        self,
+        ordinal: BlockOrdinal,
+        is_last: bool,
+        save_last_ssm_snapshot: bool = False,
+        stop_after_commit: bool = True,
     ) -> None:
         "Commit the block for reuse. Block must be full of tokens except for the last block."
         assert self._commit_state == self.CommitState.ALLOWED
@@ -1442,7 +1467,9 @@ class _KVCache:
                     for beam_block in seq_block.pages:
                         beam_block[lc_idx] = None
 
-        if is_last or self._commit_state == self.CommitState.VIRTUAL_STOP:
+        if is_last and self._commit_state == self.CommitState.ALLOWED:
+            self._commit_state = self.CommitState.VIRTUAL_STOP
+        if stop_after_commit and self._commit_state == self.CommitState.VIRTUAL_STOP:
             self._commit_state = self.CommitState.USER_STOP
             self._on_stop_committing()
 

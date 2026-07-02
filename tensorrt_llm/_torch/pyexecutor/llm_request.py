@@ -677,6 +677,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_lora_path: str | None = kwargs.pop("py_lora_path", None)
         self.py_block_reuse_stable_token_count: int | None = kwargs.pop(
             "py_block_reuse_stable_token_count", None)
+        self.py_block_reuse_commit_limit: int | None = kwargs.pop(
+            "py_block_reuse_commit_limit", None)
+        self.expect_snapshot_points: list[int] | None = None
+        self.expect_chunking_points: list[int] | None = None
         # Multimodal data
         self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
         encoder_input_tokens = kwargs.get("encoder_input_tokens")

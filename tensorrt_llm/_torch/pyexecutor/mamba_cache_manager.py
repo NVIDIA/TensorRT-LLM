@@ -1327,19 +1327,32 @@ def calc_context_stop_positions(prompt_len: int,
                                 save_last_snapshot: bool = False) -> list[int]:
     """Compute token positions at which mamba state snapshots should be saved.
 
-    Returns positions spaced by ``mamba_state_cache_interval`` plus the final
-    prompt length. ``tokens_per_block`` and ``save_last_snapshot`` are kept in
-    the signature because V1 used them to derive a block-aligned tail point;
-    V2 can snapshot the exact prompt end even when the last block is partial.
+    Returns regular interval boundaries, plus the final prompt length when
+    ``save_last_snapshot`` is requested. ``tokens_per_block`` is kept in the
+    signature because the C++/V1 path used it to derive block-aligned points;
+    V2 can snapshot exact partial boundaries.
     """
-    del tokens_per_block, save_last_snapshot
+    del tokens_per_block
     stop_positions = []
     if mamba_state_cache_interval is not None and mamba_state_cache_interval > 0:
         stop_positions.extend(
-            range(mamba_state_cache_interval, prompt_len,
+            range(mamba_state_cache_interval, prompt_len + 1,
                   mamba_state_cache_interval))
-    stop_positions.append(prompt_len)
+    if save_last_snapshot:
+        stop_positions.append(prompt_len)
     return sorted({pos for pos in stop_positions if 0 < pos <= prompt_len})
+
+
+def _get_request_snapshot_commit_limit(
+    request: LlmRequest,
+    save_last_snapshot: bool = False,
+) -> int:
+    if save_last_snapshot:
+        stable_token_count = getattr(request,
+                                     "py_block_reuse_stable_token_count", None)
+        if isinstance(stable_token_count, int) and stable_token_count > 0:
+            return min(stable_token_count, request.prompt_len)
+    return request.prompt_len
 
 
 def _calc_context_stop_positions_for_request(
@@ -1348,12 +1361,13 @@ def _calc_context_stop_positions_for_request(
     mamba_state_cache_interval: Optional[int],
     save_last_snapshot: bool = False,
 ) -> list[int]:
-    del save_last_snapshot
+    commit_limit = _get_request_snapshot_commit_limit(request,
+                                                      save_last_snapshot)
     return calc_context_stop_positions(
-        request.prompt_len,
+        commit_limit,
         tokens_per_block,
         mamba_state_cache_interval,
-        False,
+        save_last_snapshot,
     )
 
 
@@ -3216,22 +3230,29 @@ class KVCacheManagerV2MambaHybridCacheManager(KVCacheManagerV2,
 
     def prepare_expect_chunking_points(self,
                                        requests: List[LlmRequest]) -> None:
-        """Set absolute context positions where FORCE_CHUNK should stop."""
+        """Set absolute context positions where FORCE_CHUNK should save snapshots."""
         if not self.kv_cache_config.enable_block_reuse:
             for request in requests:
+                request.expect_snapshot_points = None
                 request.expect_chunking_points = None
+                request.py_block_reuse_commit_limit = request.prompt_len
             return
 
         interval = self._mamba_state_cache_interval
         save_last_snapshot = self.kv_cache_config.mamba_save_last_snapshot
         if (interval is None or interval <= 0) and not save_last_snapshot:
             for request in requests:
+                request.expect_snapshot_points = None
                 request.expect_chunking_points = None
+                request.py_block_reuse_commit_limit = request.prompt_len
             return
 
         for request in requests:
-            request.expect_chunking_points = _calc_context_stop_positions_for_request(
+            request.expect_snapshot_points = _calc_context_stop_positions_for_request(
                 request, self.tokens_per_block, interval, save_last_snapshot)
+            request.expect_chunking_points = None
+            request.py_block_reuse_commit_limit = _get_request_snapshot_commit_limit(
+                request, save_last_snapshot)
 
     def calc_next_context_chunk_size(self, request: LlmRequest) -> int:
         prompt_len = request.prompt_len
@@ -3243,10 +3264,12 @@ class KVCacheManagerV2MambaHybridCacheManager(KVCacheManagerV2,
                 "Expected context_current_position to be 0 when block reuse "
                 f"is disabled, but got {current}")
             return prompt_len - current
-        step = self._mamba_state_cache_interval
-        stop_positions = _calc_context_stop_positions_for_request(
-            request, self.tokens_per_block, step,
-            self.kv_cache_config.mamba_save_last_snapshot)
+        stop_positions = getattr(request, "expect_snapshot_points", None)
+        if stop_positions is None:
+            step = self._mamba_state_cache_interval
+            stop_positions = _calc_context_stop_positions_for_request(
+                request, self.tokens_per_block, step,
+                self.kv_cache_config.mamba_save_last_snapshot)
         for pos in stop_positions:
             if pos > current:
                 return pos - current

@@ -632,13 +632,22 @@ class KVCacheV2Scheduler(RequestScheduler):
             or str(policy).endswith("FORCE_CHUNK")
         )
 
+    @staticmethod
+    def _get_force_chunk_points(req: LlmRequest) -> list[int] | tuple[int, ...] | None:
+        points = getattr(req, "expect_snapshot_points", None)
+        if points is None:
+            points = getattr(req, "expect_chunking_points", None)
+        return points
+
     def _force_chunk_size(self, req: LlmRequest, context_remaining: int) -> int:
-        points = getattr(req, "expect_chunking_points", None)
-        if not isinstance(points, (list, tuple)) or not points:
+        points = self._get_force_chunk_points(req)
+        if not isinstance(points, (list, tuple)):
             raise RuntimeError(
-                "FORCE_CHUNK requires request.expect_chunking_points to be "
+                "FORCE_CHUNK requires request.expect_snapshot_points to be "
                 f"set before scheduling request {req.py_request_id}"
             )
+        if not points:
+            return context_remaining
 
         current = req.context_current_position
         next_point = min((point for point in points if point > current), default=None)
@@ -652,7 +661,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         next_position = req.context_current_position + chunk_size
         if next_position >= req.prompt_len:
             return True
-        points = getattr(req, "expect_chunking_points", None)
+        points = self._get_force_chunk_points(req)
         return bool(isinstance(points, (list, tuple)) and next_position in points)
 
     def _align_chunk_to_mm_block(

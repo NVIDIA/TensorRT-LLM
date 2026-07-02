@@ -528,6 +528,9 @@ class RequestBroadcaster:
             new_requests, "py_disaggregated_params"
         )
         py_lora_path = collect_py_objects_from_requests(new_requests, "py_lora_path")
+        py_block_reuse_stable_token_count = collect_py_objects_from_requests(
+            new_requests, "py_block_reuse_stable_token_count"
+        )
 
         return tuple(
             filter(
@@ -539,6 +542,7 @@ class RequestBroadcaster:
                     py_num_logprobs,
                     py_disaggregated_params,
                     py_lora_path,
+                    py_block_reuse_stable_token_count,
                 ],
             )
         )

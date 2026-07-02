@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import math
+import os
 from typing import Tuple
 
 import torch
@@ -24,6 +25,7 @@ from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
     CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm.logger import logger
 
 REPLAY_WORK_POSITION_IN_DECODE_BATCH = 0
 REPLAY_WORK_CACHE_SLOT = 1
@@ -414,6 +416,23 @@ class Mamba2Metadata:
                                                   device='cpu')
 
             self.has_initial_states_cpu[:num_contexts].copy_(initial_states_cpu)
+            if os.environ.get("TLLM_DEBUG_AGENTX_REUSE", "0") == "1":
+                if isinstance(num_cached_tokens_per_seq, torch.Tensor):
+                    cached_tokens_debug = num_cached_tokens_per_seq[:
+                                                                    num_contexts].detach(
+                                                                    ).cpu(
+                                                                    ).tolist()
+                else:
+                    cached_tokens_debug = list(
+                        num_cached_tokens_per_seq[:num_contexts])
+                logger.info(
+                    f"[agentx_reuse][mamba_metadata] batch_size={batch_size} "
+                    f"num_contexts={num_contexts} num_ctx_tokens={num_ctx_tokens} "
+                    f"context_lens={context_lens.detach().cpu().tolist()} "
+                    f"num_cached_tokens={cached_tokens_debug} "
+                    f"has_initial_states={self.has_initial_states_cpu[:num_contexts].tolist()} "
+                    f"state_indices={self.state_indices_cpu[:batch_size].tolist()}"
+                )
             # Mirror CPU staging flags to the CUDA-side buffer asynchronously.
             self.has_initial_states[:num_contexts].copy_(
                 self.has_initial_states_cpu[:num_contexts], non_blocking=True)

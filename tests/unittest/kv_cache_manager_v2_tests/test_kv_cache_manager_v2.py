@@ -1740,6 +1740,37 @@ class TestSSMSupport(unittest.TestCase):
         kv4.resume(stream)
         kv4.close()
 
+    def test_ssm_commit_snapshot_reuses_partial_prefix_before_prompt_end(self) -> None:
+        """commit(save_ssm_snapshot=True) can snapshot a partial shared prefix."""
+        tokens_per_block = 8
+        cfg = self._make_ssm_reuse_config(
+            tokens_per_block=tokens_per_block,
+            ssm_reuse_interval=0,
+            mamba_save_last_snapshot=True,
+        )
+        self.manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+
+        prefix = [self.next_token() for _ in range(tokens_per_block + 3)]
+        suffix = [self.next_token() for _ in range(5)]
+        full_prompt = prefix + suffix
+
+        kv1 = self.manager.create_kv_cache()
+        kv1.resume(stream)
+        kv1.capacity = len(prefix)
+        kv1.history_length = len(prefix)
+        kv1.commit(prefix, save_ssm_snapshot=True)
+
+        kv1.capacity = len(full_prompt)
+        kv1.history_length = len(full_prompt)
+        kv1.close()
+
+        kv2 = self.manager.create_kv_cache(input_tokens=full_prompt)
+        self.assertEqual(kv2.num_committed_tokens, len(prefix))
+        kv2.resume(stream)
+        kv2.close()
+
     def test_ssm_last_snapshot_partial_tail_reuses_longer_sibling_prefix(self) -> None:
         """A partial final SSM snapshot can seed a longer sibling with the same prefix."""
         tokens_per_block = 8

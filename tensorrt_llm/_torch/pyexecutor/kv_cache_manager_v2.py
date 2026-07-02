@@ -96,6 +96,14 @@ from .scheduler import ScheduledRequests
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 
+
+def _safe_debug_attr(obj, name):
+    try:
+        return getattr(obj, name)
+    except Exception as exc:
+        return f"<unavailable:{type(exc).__name__}: {exc}>"
+
+
 KV_CACHE_ITERATION_STATS_DELTA_FIELDS = tuple(
     field.name for field in fields(KVCacheIterationStatsDelta)
 )
@@ -1502,12 +1510,15 @@ class KVCacheManagerV2(BaseResourceManager):
         return int.from_bytes(hashlib.sha256(cache_salt.encode("utf-8")).digest()[:8], "little")
 
     def _get_block_reuse_commit_limit(self, request: LlmRequest) -> int:
-        if not self.kv_cache_config.mamba_save_last_snapshot:
-            return request.prompt_len
-        stable_token_count = getattr(request, "py_block_reuse_stable_token_count", None)
-        if isinstance(stable_token_count, int) and stable_token_count > 0:
-            return min(stable_token_count, request.prompt_len)
+        commit_limit = getattr(request, "py_block_reuse_commit_limit", None)
+        if isinstance(commit_limit, int) and commit_limit > 0:
+            return min(commit_limit, request.prompt_len)
         return request.prompt_len
+
+    @staticmethod
+    def _should_save_ssm_snapshot(request: LlmRequest, commit_end: int) -> bool:
+        points = getattr(request, "expect_snapshot_points", None)
+        return bool(isinstance(points, (list, tuple)) and commit_end in points)
 
     def _mark_context_position_as_history(self, request: LlmRequest, kv_cache) -> None:
         history_length = request.context_current_position
@@ -2400,6 +2411,16 @@ class KVCacheManagerV2(BaseResourceManager):
             return
         commit_limit = self._get_block_reuse_commit_limit(request)
         commit_end = min(request.context_current_position, commit_limit)
+        save_snapshot = self._should_save_ssm_snapshot(request, commit_end)
+        if os.environ.get("TLLM_DEBUG_AGENTX_REUSE") == "1":
+            logger.info(
+                "AGENTX_DEBUG v2 try_commit_blocks_for_reuse: "
+                f"request_id={request.py_request_id}, prompt={request.prompt_len}, "
+                f"pos={request.context_current_position}, commit_limit={commit_limit}, "
+                f"num_committed={kv_cache.num_committed_tokens}, commit_end={commit_end}, "
+                f"save_snapshot={save_snapshot}, "
+                f"snap={getattr(request, 'expect_snapshot_points', None)}"
+            )
         if commit_end > kv_cache.num_committed_tokens:
             commit_start = kv_cache.num_committed_tokens
             tokens = self._augment_tokens_for_block_reuse(
@@ -2408,7 +2429,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 start=commit_start,
                 end=commit_end,
             )
-            kv_cache.commit(tokens)
+            kv_cache.commit(
+                tokens,
+                save_ssm_snapshot=save_snapshot,
+            )
             self._log_block_reuse_commit(
                 request,
                 commit_start,
@@ -2416,10 +2440,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 complete=request.context_current_position >= commit_limit,
             )
         if request.context_current_position >= commit_limit:
-            kv_cache.stop_committing(
-                save_last_ssm_snapshot=self.kv_cache_config.mamba_save_last_snapshot
-            )
             self._mark_context_position_as_history(request, kv_cache)
+        if request.context_current_position >= request.prompt_len:
+            kv_cache.stop_committing()
 
     def _log_block_reuse_summary(self) -> None:
         if not self.enable_block_reuse:
@@ -2699,10 +2722,22 @@ class KVCacheManagerV2(BaseResourceManager):
         layer. In non-overlap scheduler, you should call it together with
         update_resources().
         """
+        debug_agentx_reuse = os.environ.get("TLLM_DEBUG_AGENTX_REUSE") == "1"
         for req in scheduled_batch.context_requests:
             if req.py_request_id not in self.kv_cache_map:
                 continue
             kv_cache = self.kv_cache_map[req.py_request_id]
+            if debug_agentx_reuse:
+                logger.info(
+                    "AGENTX_DEBUG v2 update_context_resources request begin: "
+                    f"request_id={req.py_request_id}, prompt={req.prompt_len}, "
+                    f"pos={_safe_debug_attr(req, 'context_current_position')}, "
+                    f"chunk={_safe_debug_attr(req, 'context_chunk_size')}, "
+                    f"remaining={_safe_debug_attr(req, 'context_remaining_length')}, "
+                    f"num_committed={kv_cache.num_committed_tokens}, "
+                    f"limit={self._get_block_reuse_commit_limit(req)}, "
+                    f"snap={getattr(req, 'expect_snapshot_points', None)}"
+                )
             # In the overlap scheduler, iteration N+1's eviction may
             # suspend a ctx request's KV cache while iteration N's
             # update still needs to process it.  Skip the resize — the
@@ -2713,6 +2748,14 @@ class KVCacheManagerV2(BaseResourceManager):
             if self.enable_block_reuse and not self.is_draft and not req.is_dummy_request:
                 commit_limit = self._get_block_reuse_commit_limit(req)
                 commit_end = min(req.context_current_position, commit_limit)
+                save_snapshot = self._should_save_ssm_snapshot(req, commit_end)
+                if debug_agentx_reuse:
+                    logger.info(
+                        "AGENTX_DEBUG v2 update_context_resources commit check: "
+                        f"request_id={req.py_request_id}, commit_end={commit_end}, "
+                        f"num_committed={kv_cache.num_committed_tokens}, "
+                        f"save_snapshot={save_snapshot}"
+                    )
                 if commit_end > kv_cache.num_committed_tokens:
                     commit_start = kv_cache.num_committed_tokens
                     tokens = self._augment_tokens_for_block_reuse(
@@ -2721,7 +2764,10 @@ class KVCacheManagerV2(BaseResourceManager):
                         start=commit_start,
                         end=commit_end,
                     )
-                    kv_cache.commit(tokens)
+                    kv_cache.commit(
+                        tokens,
+                        save_ssm_snapshot=save_snapshot,
+                    )
                     self._log_block_reuse_commit(
                         req,
                         commit_start,
@@ -2729,10 +2775,9 @@ class KVCacheManagerV2(BaseResourceManager):
                         complete=req.context_current_position >= commit_limit,
                     )
                 if req.context_current_position >= commit_limit:
-                    kv_cache.stop_committing(
-                        save_last_ssm_snapshot=(self.kv_cache_config.mamba_save_last_snapshot)
-                    )
                     self._mark_context_position_as_history(req, kv_cache)
+                if req.context_current_position >= req.prompt_len:
+                    kv_cache.stop_committing()
             else:
                 success = kv_cache.resize(None, req.context_current_position)
                 if not success:
@@ -2741,6 +2786,12 @@ class KVCacheManagerV2(BaseResourceManager):
                         f"{req.py_request_id} to {req.context_current_position} tokens "
                         "at context update"
                     )
+            if debug_agentx_reuse:
+                logger.info(
+                    "AGENTX_DEBUG v2 update_context_resources request end: "
+                    f"request_id={req.py_request_id}, num_committed={kv_cache.num_committed_tokens}, "
+                    f"history={kv_cache.history_length}, capacity={kv_cache.capacity}"
+                )
 
     def update_resources(
         self,

@@ -1609,13 +1609,13 @@ class TestForceChunkPolicy:
         assert reqs[0].context_chunk_size == 10
         assert reqs[1].context_chunk_size == 10
 
-    def test_expected_chunking_points(self):
+    def test_expected_snapshot_points(self):
         """
-        Expected chunking points are absolute context positions.
+        Expected snapshot points are absolute context positions.
         C++ ref: ForceChunkTest.ExpectedChunkingPoints
         """
         reqs = [make_context_request(0, prompt_len=30)]
-        reqs[0].expect_chunking_points = [12, 25]
+        reqs[0].expect_snapshot_points = [12, 25]
 
         self._chunk_iteration(reqs, 10)
         self._expect_positions(reqs, [12], "iter 1")
@@ -1626,7 +1626,7 @@ class TestForceChunkPolicy:
         self._chunk_iteration(reqs, 10)
         self._expect_positions(reqs, [30], "iter 3")
 
-    def test_capacity_rounds_expected_chunk_down_to_unit(self):
+    def test_capacity_rounds_expected_snapshot_down_to_unit(self):
         """
         Capacity truncation rounds expected chunks down to chunk_unit_size.
         C++ ref: ForceChunkTest.CapacityRoundsExpectedChunkDownToUnit
@@ -1636,7 +1636,7 @@ class TestForceChunkPolicy:
             max_batch_size=64, max_num_tokens=1000, ctx_chunk_config=config
         )
         reqs = [make_context_request(0, prompt_len=50)]
-        reqs[0].expect_chunking_points = [30]
+        reqs[0].expect_snapshot_points = [30]
 
         scheduler._set_ctx_requests_chunk_size(reqs, capacity=25)
 

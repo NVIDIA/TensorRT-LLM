@@ -48,7 +48,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.media.encoding import image_to_bytes
 from tensorrt_llm.media.tensor_payload import is_tensor_format
 from tensorrt_llm.metrics.collector import MetricsCollector
-from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
+from tensorrt_llm.sampling_params import GuidedDecodingParams
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines,
                                            resolve_top_level_model_type)
@@ -360,52 +360,6 @@ class OpenAIServer(_VideoRoutesMixin):
             self.register_routes()
 
         self.app.add_middleware(ServerArrivalTimeMiddleware)
-
-    def _should_prewarm_block_reuse_stable_prompt(self,
-                                                  stable_prompt: Optional[str],
-                                                  full_prompt: str) -> bool:
-        if (stable_prompt is None or stable_prompt == full_prompt
-                or not full_prompt.startswith(stable_prompt)):
-            return False
-        args = getattr(self.generator, "args", None)
-        kv_cache_config = getattr(args, "kv_cache_config", None)
-        return bool(
-            getattr(kv_cache_config, "enable_block_reuse", False)
-            and getattr(kv_cache_config, "mamba_save_last_snapshot", False))
-
-    async def _prewarm_block_reuse_stable_prompt(
-        self,
-        stable_prompt: str,
-        *,
-        add_special_tokens: bool,
-        lora_request: Any,
-        disaggregated_params: Optional[LlmDisaggregatedParams],
-        cache_salt: Optional[str],
-        trace_headers: Optional[dict[str, str]],
-        scheduling_params: SchedulingParams,
-    ) -> None:
-        sampling_params = SamplingParams(max_tokens=1,
-                                         temperature=0,
-                                         add_special_tokens=add_special_tokens)
-        prewarm_inputs = prompt_inputs(stable_prompt)
-        preprocess_fn = getattr(self.generator, "preprocess", None)
-        if preprocess_fn is not None:
-            prewarm_inputs = await asyncio.to_thread(preprocess_fn,
-                                                     prewarm_inputs,
-                                                     sampling_params,
-                                                     disaggregated_params)
-
-        promise = self.generator.generate_async(
-            inputs=prewarm_inputs,
-            sampling_params=sampling_params,
-            streaming=False,
-            lora_request=lora_request,
-            disaggregated_params=disaggregated_params,
-            cache_salt=cache_salt,
-            trace_headers=trace_headers,
-            scheduling_params=scheduling_params,
-        )
-        await promise.aresult()
 
     def _init_visual_gen(self):
         self.processor = None
@@ -1371,21 +1325,6 @@ class OpenAIServer(_VideoRoutesMixin):
 
             scheduling_params = SchedulingParams(
                 agent_hierarchy=request.agent_hierarchy)
-            full_prompt = prompt.get("prompt")
-            if (isinstance(full_prompt, str)
-                    and self._should_prewarm_block_reuse_stable_prompt(
-                        stable_prompt, full_prompt)):
-                assert stable_prompt is not None
-                await self._prewarm_block_reuse_stable_prompt(
-                    stable_prompt,
-                    add_special_tokens=request.add_special_tokens,
-                    lora_request=request.lora_request,
-                    disaggregated_params=disaggregated_params,
-                    cache_salt=request.cache_salt,
-                    trace_headers=original_trace_headers,
-                    scheduling_params=SchedulingParams(
-                        agent_hierarchy=request.agent_hierarchy),
-                )
 
             generate_inputs = prompt
             preprocess_fn = getattr(self.generator, "preprocess", None)
