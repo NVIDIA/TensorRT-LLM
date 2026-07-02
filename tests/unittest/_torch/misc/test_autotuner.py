@@ -1127,3 +1127,177 @@ def test_single_pair_shortcut(monkeypatch):
     assert len(profile_calls) == 3, (
         f"Multi-tactic op must hit _profile_single_kernel per tactic; "
         f"got {len(profile_calls)} ({profile_calls})")
+
+
+# ===========================================================================
+# Multiprocess tactic profiling (generalized subprocess profiling)
+# ===========================================================================
+
+
+class _SubprocOffRunner(TunableRunner):
+    """Does not opt into subprocess profiling (default)."""
+
+    def get_valid_tactics(self, inputs, profile, **kwargs):
+        return [0, 1, 2]
+
+    def forward(self, inputs, *, tactic=-1, **kwargs):
+        return inputs[0]
+
+
+class _SubprocOnRunner(_SubprocOffRunner):
+    """Opts in declaratively via the JIT-property flag."""
+    tactic_compile_dominates = True
+
+
+class _SubprocOverrideRunner(_SubprocOffRunner):
+    """Opts in by overriding the hook (per-tactic granularity)."""
+
+    def should_profile_tactic_in_subprocess(self, custom_op, inputs, tactic,
+                                            tuning_config, **kwargs):
+        return tactic != 1  # delegate everything except tactic 1
+
+
+class _MPParityRunner(TunableRunner):
+    """Opt-in runner whose runtime cost is data-independent and tactic-ordered
+    (tactic 0 is always fastest), using extra compute rather than delay_kernel
+    so ordering is deterministic. Records the PID of the process that runs
+    forward() so the test can confirm work happened in worker subprocesses."""
+    tactic_compile_dominates = True
+
+    def __init__(self, pid_dir=None):
+        self.pid_dir = pid_dir
+
+    def get_valid_tactics(self, inputs, profile, **kwargs):
+        return [0, 1]
+
+    def forward(self, inputs, *, tactic=-1, **kwargs):
+        if self.pid_dir is not None:
+            os.makedirs(self.pid_dir, exist_ok=True)
+            open(os.path.join(self.pid_dir, f"pid_{os.getpid()}"), "a").close()
+        x = inputs[0]
+        out = x @ x
+        for _ in range(0 if tactic in (0, -1) else 64):
+            out = (x @ x) + out
+        return out
+
+    def unique_id(self):
+        return (type(self).__name__, )
+
+
+def test_subprocess_profiling_logic(monkeypatch):
+    """Opt-in hook, tensor (de)serialization, enable-gating (env / distributed /
+    strategy), tactic selection, worker-count & lock-path config, and the
+    persistent-pool lifecycle for multiprocess tactic profiling."""
+    cfg = TuningConfig()
+
+    # --- JIT-property default + override hook ---
+    assert _SubprocOffRunner().should_profile_tactic_in_subprocess(
+        "op", [], 0, cfg) is False
+    assert _SubprocOnRunner().should_profile_tactic_in_subprocess(
+        "op", [], 0, cfg) is True
+    ov = _SubprocOverrideRunner()
+    assert ov.should_profile_tactic_in_subprocess("op", [], 0, cfg) is True
+    assert ov.should_profile_tactic_in_subprocess("op", [], 1, cfg) is False
+
+    # --- tensor spec round-trip; non-tensors map to None ---
+    t = torch.empty_strided((3, 5), (5, 1), dtype=torch.float16)
+    rebuilt = autotuner._make_subprocess_tensor(
+        autotuner._serialize_subprocess_tensor_spec(t), None)
+    assert (rebuilt.shape, rebuilt.dtype,
+            rebuilt.stride()) == (t.shape, t.dtype, t.stride())
+    assert autotuner._serialize_subprocess_tensor_spec(7)["is_tensor"] is False
+    assert autotuner._make_subprocess_tensor({"is_tensor": False}, None) is None
+
+    tuner = AutoTuner()
+    monkeypatch.setattr(tuner, "_is_distributed", lambda: False)
+    monkeypatch.setenv("TLLM_AUTOTUNER_MULTIPROCESS", "1")
+
+    # --- enable-gating: distributed and unsupported strategy disable it ---
+    assert tuner._is_subprocess_profiling_enabled(cfg) is True
+    monkeypatch.setattr(tuner, "_is_distributed", lambda: True)
+    assert tuner._is_subprocess_profiling_enabled(cfg) is False
+    monkeypatch.setattr(tuner, "_is_distributed", lambda: False)
+    assert tuner._is_subprocess_profiling_enabled(
+        TuningConfig(distributed_tuning_strategy=DistributedTuningStrategy.MERGE
+                     )) is False
+
+    # --- tactic selection: opt-in, override exclusion, opt-out, threshold ---
+    x = torch.randn(4, 8)
+    assert tuner._get_subprocess_tactics("op", _SubprocOnRunner(), [x],
+                                         [0, 1, 2], cfg) == [0, 1, 2]
+    assert tuner._get_subprocess_tactics("op", _SubprocOverrideRunner(), [x],
+                                         [0, 1, 2], cfg) == [0, 2]
+    assert tuner._get_subprocess_tactics("op", _SubprocOffRunner(), [x],
+                                         [0, 1, 2], cfg) == []
+    monkeypatch.setenv("TLLM_AUTOTUNER_MP_MIN_TACTICS", "5")
+    assert tuner._get_subprocess_tactics("op", _SubprocOnRunner(), [x],
+                                         [0, 1, 2], cfg) == []
+    monkeypatch.delenv("TLLM_AUTOTUNER_MP_MIN_TACTICS", raising=False)
+
+    # --- worker count + lock path config ---
+    monkeypatch.setenv("TLLM_AUTOTUNER_MP_WORKERS", "3")
+    assert tuner._get_subprocess_worker_count() == 3
+    monkeypatch.delenv("TLLM_AUTOTUNER_MP_WORKERS", raising=False)
+    assert tuner._get_subprocess_worker_count() >= 1
+    assert tuner._get_subprocess_profile_lock_path(
+        0) != tuner._get_subprocess_profile_lock_path(1)
+    monkeypatch.setenv("TLLM_AUTOTUNER_MP_PROFILE_LOCK", "0")
+    assert tuner._get_subprocess_profile_lock_path(0) is None
+
+    # --- persistent pool: lazily created, reused, recreated after shutdown ---
+    try:
+        pool1 = tuner._get_persistent_pool(None)
+        assert tuner._get_persistent_pool(None) is pool1
+        assert tuner._atexit_registered is True
+        tuner.shutdown_subprocess_pools()
+        assert tuner._subprocess_pools == {}
+        assert tuner._get_persistent_pool(None) is not pool1
+    finally:
+        tuner.shutdown_subprocess_pools()
+
+    # --- hard off-switch disables delegation entirely ---
+    monkeypatch.setenv("TLLM_AUTOTUNER_MULTIPROCESS", "0")
+    assert tuner._get_subprocess_tactics("op", _SubprocOnRunner(), [x],
+                                         [0, 1, 2], cfg) == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),
+                    reason="End-to-end subprocess profiling requires CUDA.")
+def test_multiprocess_profiling_runs_and_matches_local(tmp_path, monkeypatch):
+    """End-to-end: an opt-in runner profiled in subprocesses selects the same
+    (correct) best tactic as local profiling, and work really runs in workers."""
+    monkeypatch.setenv("TLLM_AUTOTUNER_MP_FALLBACK_LOCAL_ON_PROCESS_FAILURE",
+                       "0")
+    monkeypatch.setenv("TLLM_AUTOTUNER_MP_WORKERS", "2")
+    monkeypatch.setenv("TLLM_AUTOTUNER_MP_MIN_TACTICS", "2")
+
+    x = torch.randn(64, 64, device="cuda")
+    tuner = AutoTuner.get()
+
+    # Local profiling baseline.
+    monkeypatch.setenv("TLLM_AUTOTUNER_MULTIPROCESS", "0")
+    tuner.clear_cache()
+    tuner.shutdown_subprocess_pools()
+    with autotune():
+        _, local_tactic = tuner.choose_one("mp_parity", [_MPParityRunner()],
+                                           TuningConfig(), [x])
+
+    # Multiprocess profiling.
+    pid_dir = str(tmp_path / "pids")
+    monkeypatch.setenv("TLLM_AUTOTUNER_MULTIPROCESS", "1")
+    tuner.clear_cache()
+    tuner.shutdown_subprocess_pools()
+    with autotune():
+        _, mp_tactic = tuner.choose_one("mp_parity", [_MPParityRunner(pid_dir)],
+                                        TuningConfig(), [x])
+    tuner.shutdown_subprocess_pools()
+
+    child_pids = set()
+    if os.path.isdir(pid_dir):
+        for f in os.listdir(pid_dir):
+            child_pids.add(int(f.split("_")[1]))
+    # Work really happened in worker subprocesses (not the parent).
+    assert child_pids and os.getpid() not in child_pids
+    # Same correct best tactic via both paths.
+    assert local_tactic == 0
+    assert mp_tactic == 0

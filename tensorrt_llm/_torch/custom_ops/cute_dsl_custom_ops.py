@@ -380,6 +380,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.use_tvm_ffi,
             )
 
+        def should_profile_tactic_in_subprocess(
+            self,
+            custom_op: str,
+            inputs: List[torch.Tensor],
+            tactic,
+            tuning_config: TuningConfig,
+            **kwargs,
+        ) -> bool:
+            # Each tactic triggers a separate cute.compile() JIT, which dominates
+            # autotune wall time, so profile them concurrently in subprocesses.
+            # get_valid_tactics emits 4-field tuples:
+            # (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch).
+            return isinstance(tactic, tuple) and len(tactic) == 4
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
