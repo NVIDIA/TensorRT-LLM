@@ -40,9 +40,10 @@ from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
 from .rpc import RPCClient
 from .rpc.rpc_common import RPCError, get_unique_ipc_addr
-from .utils import (ErrorResponse, RequestError, WorkerCommIpcAddrs,
-                    create_mpi_comm_session, get_spawn_proxy_process_env,
-                    is_llm_response, print_alive_threads)
+from .utils import (EngineDeadError, ErrorResponse, RequestError,
+                    WorkerCommIpcAddrs, create_mpi_comm_session,
+                    get_spawn_proxy_process_env, is_llm_response,
+                    print_alive_threads)
 from .worker import GenerationExecutorWorker, worker_main
 
 __all__ = [
@@ -121,6 +122,10 @@ class GenerationExecutorProxy(GenerationExecutor):
                 "yellow")
 
         self._results: Dict[int, GenerationResult] = {}
+        # Sticky engine-dead flag: once a worker death is recorded, pending and
+        # new requests fail fast with EngineDeadError instead of blocking on a
+        # response queue whose producer is gone.
+        self._engine_dead = False
 
         self.model_world_size = model_world_size
 
@@ -242,15 +247,56 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         return True
 
+    def _set_fatal_error(self, error: BaseException) -> None:
+        """Record the fatal error, then unblock every pending request.
+
+        Extends the base behavior so that the instant a worker death is
+        recorded (from the error monitor, a health check, or a crashed future),
+        all pending GenerationResults fail fast with EngineDeadError rather than
+        blocking forever on a response queue whose producer is gone.
+        """
+        super()._set_fatal_error(error)
+        self._mark_engine_dead(error)
+
+    def _mark_engine_dead(self, error: Optional[BaseException] = None) -> None:
+        """Set the sticky flag and push EngineDeadError onto pending results."""
+        if self._engine_dead:
+            return
+        self._engine_dead = True
+        dead_error = EngineDeadError(error)
+        # Snapshot to avoid mutation-during-iteration; best-effort per result.
+        # Use put() (not put_nowait()) so the async _SyncQueue path also wakes
+        # the awaiting event loop, not just the sync Queue path.
+        for result in list(self._results.values()):
+            try:
+                result.queue.put(dead_error)
+            except Exception:  # noqa: BLE001 - a full/closed queue must not stop the sweep
+                pass
+
+    def _handle_worker_death(self, error: BaseException) -> None:
+        """Event-driven worker-death handler.
+
+        Runs from the MPI future's done-callback thread the instant a worker
+        process exits. Enqueues the error for the monitor loop to record (which
+        drives pre_shutdown) and immediately broadcasts EngineDeadError to
+        pending requests, so they fail fast without waiting for the next poll
+        tick. Propagation is therefore no longer gated by the poll interval.
+        """
+        self._error_queue.put_nowait(error)
+        self._mark_engine_dead(error)
+
     def _error_monitor_loop(self) -> None:
-        """Background thread that polls for fatal errors every ~5 seconds.
+        """Background thread that reaps a dead engine and drives pre_shutdown.
 
         Checks MPI worker futures and drains the error queue using
         the shared ``_check_mpi_futures()`` and ``_drain_error_queue()``
         helpers.
 
-        Uses ``_shutdown_event`` for clean wakeup instead of a sleep loop,
-        so shutdown is immediate rather than waiting up to 5 seconds.
+        Propagation to pending requests is event-driven via
+        ``_handle_worker_death`` (the MPI future done-callback), so this loop is
+        only the backstop that records the fatal error and runs pre_shutdown; a
+        coarse poll interval is therefore fine. Uses ``_shutdown_event`` for
+        clean wakeup instead of a sleep loop, so shutdown is immediate.
         """
         while not self.doing_shutdown and self._fatal_error is None:
             try:
@@ -266,7 +312,9 @@ class GenerationExecutorProxy(GenerationExecutor):
                 logger.debug(f"Error monitor: unexpected exception (ignored): "
                              f"{exc!r}")
 
-            # Wait up to 5s, but wake immediately if _shutdown_event is set
+            # Backstop poll only; the latency-sensitive propagation path is
+            # event-driven (see _handle_worker_death), so a coarse interval is
+            # fine. Wakes immediately if _shutdown_event is set.
             self._shutdown_event.wait(timeout=5.0)
 
     def _setup_queues(self) -> WorkerCommIpcAddrs:
@@ -396,7 +444,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             # will not block.
             if future.exception() is not None:
                 if self_ := self_ref():
-                    self_._error_queue.put_nowait(future.exception())
+                    self_._handle_worker_death(future.exception())
 
         tracer_init_kwargs = get_tracer().init_kwargs if enable_llm_tracer(
         ) else None
@@ -542,6 +590,10 @@ class GenerationExecutorProxy(GenerationExecutor):
             Forwards the request to the workers through the request queue.
         """
 
+        # Sticky fast-fail: don't accept new work once the engine is known dead.
+        if self._engine_dead or self._fatal_error is not None:
+            raise EngineDeadError(self._fatal_error)
+
         self._start_dispatch_threads()
 
         request.set_id(self._get_next_client_id())
@@ -554,6 +606,15 @@ class GenerationExecutorProxy(GenerationExecutor):
             disaggregated_params=request.disaggregated_params,
             logprob_params=logprob_params)
         self._results[request.id] = result
+
+        # Close the submit-vs-death race: _mark_engine_dead() runs on the
+        # error-monitor thread and its one-shot sweep snapshots _results, so a
+        # result registered just after that snapshot would never be unblocked
+        # and would hang forever on a dead worker. Re-check after registering
+        # and fail fast if the engine died in that window.
+        if self._engine_dead or self._fatal_error is not None:
+            self._results.pop(request.id, None)
+            raise EngineDeadError(self._fatal_error)
 
         with nvtx_range_debug("request_queue.put"):
             self.request_queue.put(request)
