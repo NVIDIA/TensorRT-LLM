@@ -936,65 +936,61 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             self,
             request: OpenAIRequest,
             exclude_server: Optional[str] = None) -> tuple[str, dict]:
+        # Standalone (in-process) entry point = routing_key(tokenize+hash) then
+        # the shared _route core -- the SAME core the coordinator path uses.
+        key = await asyncio.to_thread(self._routing_key_sync, request)
+        server, info, _handle = await self._route(
+            key, exclude_server=exclude_server, request=request)
+        return server, info
+
+    def _routing_key_sync(self, request: OpenAIRequest) -> dict:
+        """Tokenize + per-algo block-hash (CPU-bound; run in a thread). Returns a
+        plain dict so the coordinator path can send it over HTTP unchanged."""
+        cache_salt_id = self._get_request_cache_salt_id(request)
+        # Hash for every algo any server might use (usually one).
+        algos = {self._get_server_hash_algo(s)
+                 for s in self._server_state.keys()} or None
+        token_lists, block_hashes_by_algo = \
+            self._tokenize_and_compute_block_hashes_by_algo(
+                request, algos, cache_salt_id)
+        return {"token_lists": token_lists,
+                "block_hashes_by_algo": block_hashes_by_algo,
+                "conv_key": self._content_affinity_key(request)}
+
+    async def _route(self, key, exclude_server=None, request=None):
+        """THE single routing core, shared by the standalone and coordinator
+        paths. Scores each server by (matched_tokens/tokens_per_block -
+        load_weight*load), applies load_cap, conversation affinity and RR
+        tie-break, then registers load + stashes routed blocks. The ONLY
+        difference between the two callers is request identity: standalone passes
+        the request (load keyed by id(request), finished via finish_request);
+        the coordinator passes request=None and gets an opaque handle back
+        (finished via finish_by_handle). Returns (server, info, handle)."""
         import time as _time
         _rt_t0 = _time.monotonic()
+        token_lists = (key or {}).get("token_lists") or []
+        block_hashes_by_algo = (key or {}).get("block_hashes_by_algo") or {}
+        conv_key = (key or {}).get("conv_key")
         async with self._lock:
-            servers = list([
-                server for server in self._server_state.keys()
-                if server != exclude_server
-            ])
-            if not servers:
-                raise ValueError(
-                    f"No available servers after excluding {exclude_server}")
-        cache_salt_id = self._get_request_cache_salt_id(request)
-        hash_algo_by_server = {
-            server: self._get_server_hash_algo(server)
-            for server in servers
-        }
-        # Tokenize + block-hash is CPU-bound (~50 ms p50 for a 40 k-token
-        # chat request with a Rust-backed tokenizer). Running it directly
-        # inside the async handler blocks the orchestrator's event loop and
-        # serializes all concurrent requests through it; with HuggingFace
-        # tokenizers releasing the GIL, offloading to a thread lets multiple
-        # tokenize calls run in parallel and frees the event loop to
-        # dispatch HTTP traffic to the CTX/GEN workers meanwhile.
-        token_lists, block_hashes_by_algo = await asyncio.to_thread(
-            self._tokenize_and_compute_block_hashes_by_algo, request,
-            hash_algo_by_server.values(), cache_salt_id)
-        # Shared selection core (also used by the coordinator-delegated path).
-        server, hash_algo, block_hashes, matches = await self._select_server(
-            servers, hash_algo_by_server, block_hashes_by_algo,
-            conv_key=self._content_affinity_key(request))
-        async with self._lock:
-            await self._register_request(server, request)
-            self._stash_routed_blocks_on_route(request, block_hashes, hash_algo)
-        self._record_route_timing(_time.monotonic() - _rt_t0)
-        return server, {
-            "block_hashes": block_hashes,  # list[list[int | str]]
-            "hash_algo": hash_algo,
-            "token_lists": token_lists,  # list[list[int]]
-            "matches": matches,  # list[int]
-            "server_info": self._server_info.get(server, {}),
-        }
+            servers = [s for s in self._server_state.keys()
+                       if s != exclude_server]
+        if not servers:
+            raise ValueError(
+                f"No available servers after excluding {exclude_server}")
 
-    async def _select_server(self, servers, hash_algo_by_server,
-                             block_hashes_by_algo, conv_key):
-        """Shared KV-cache-aware selection: score each server by
-        (matched_tokens/tokens_per_block - load_weight*load), apply the load_cap,
-        honour conversation affinity, break ties round-robin. Used by BOTH
-        get_next_server (standalone) and get_next_server_by_key (coordinator),
-        so the two paths never diverge. Returns (server, hash_algo, block_hashes,
-        matches)."""
+        def _hashes(server):
+            algo = self._get_server_hash_algo(server)
+            return algo, block_hashes_by_algo.get(algo, [])
+
         workloads = [self._server_state[s].num_active_requests()
                      for s in servers]
         load_fractions = [workloads[i] / self._max_batch_size
                           for i in range(len(servers))]
         scores, matches = [], []
         for i, server in enumerate(servers):
-            hash_algo = hash_algo_by_server[server]
-            block_hashes = block_hashes_by_algo[hash_algo]
+            algo, bh = _hashes(server)
             matches.append(await self._server_state[server].matched_tokens(
-                block_hashes, hash_algo))
+                bh, algo))
             scores.append(matches[-1] / self._tokens_per_block
                           - self._load_weight * workloads[i])
         candidate_idx = [i for i, lf in enumerate(load_fractions)
@@ -1020,8 +1016,34 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             affinity.move_to_end(conv_key)
             while len(affinity) > ROUTE_AFFINITY_CACHE_SIZE:
                 affinity.popitem(last=False)
-        hash_algo = hash_algo_by_server[server]
-        return server, hash_algo, block_hashes_by_algo[hash_algo], matches
+        hash_algo, block_hashes = _hashes(server)
+
+        # Register load + stash routed blocks. Standalone keys by id(request);
+        # coordinator (request=None) keys by an opaque handle for finish_by_handle.
+        handle = None
+        async with self._lock:
+            await self._server_state[server].increment_load(request)
+            if request is not None:
+                self._req_routing_table[id(request)] = server
+                self._stash_routed_blocks_on_route(request, block_hashes,
+                                                   hash_algo)
+            else:
+                if not hasattr(self, "_coord_handle_server"):
+                    self._coord_handle_server = {}
+                    self._coord_handle_counter = 0
+                self._coord_handle_counter += 1
+                node_id = getattr(self, "_disagg_node_id", 0)
+                handle = f"kvc{node_id}_{self._coord_handle_counter}"
+                self._coord_handle_server[handle] = (server, block_hashes,
+                                                     hash_algo)
+        self._record_route_timing(_time.monotonic() - _rt_t0)
+        return server, {
+            "block_hashes": block_hashes,
+            "hash_algo": hash_algo,
+            "token_lists": token_lists,
+            "matches": matches,
+            "server_info": self._server_info.get(server, {}),
+        }, handle
 
     async def finish_request(self,
                              request: OpenAIRequest,
@@ -1044,69 +1066,37 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             # Fire-and-forget; poll runs in background and coalesces per server.
             self._server_state[server].schedule_poll_and_update(session)
 
-    # ---- coordinator-delegation adaptor ----------------------------------
-    # Lets KvCacheAwareRouter run UNDER the disagg coordinator (WEB_CONCURRENCY>1)
-    # like the centralized router, but keep its proven server/instance-level,
-    # ~98%-hit KV-cache-aware scoring. The fleet worker computes routing_key()
-    # locally; the coordinator (which owns _server_state via /kv_cache_events
-    # polling) runs get_next_server_by_key(). Per-request load is tracked by an
-    # opaque handle instead of id(request), which does not cross the HTTP hop.
+    # ---- coordinator delegation: thin wrappers over the shared _route core ---
+    # Under the disagg coordinator (WEB_CONCURRENCY>1) the fleet worker computes
+    # routing_key() locally and the coordinator (which owns _server_state via
+    # /kv_cache_events polling) runs get_next_server_by_key(). Both go through the
+    # exact same _route core as the standalone get_next_server -- no divergence.
 
     def routing_key(self, request: OpenAIRequest):
-        """Compute block hashes on the fleet worker (compact: ~ISL/tokens_per_block
-        ints, not the full token list) and send those to the coordinator. Uses the
-        default hash algo; valid when all servers share one algo (the common case:
-        uniform tokens_per_block + tokenizer). JSON-serializable.
-        """
-        cache_salt_id = self._get_request_cache_salt_id(request)
-        _, block_hashes = self._tokenize_and_compute_block_hashes_with_salt(
-            request, cache_salt_id)
-        return {"block_hashes": block_hashes}
+        """Worker-side: tokenize + block-hash. Same dict _route consumes, JSON-
+        serializable for the /select POST."""
+        return self._routing_key_sync(request)
 
     async def get_next_server_by_key(self, routing_key, exclude_server=None):
-        """Coordinator-side placement from precomputed block hashes. Reuses the
-        SAME _select_server scoring and the SAME per-server load counter as the
-        standalone get_next_server; the only delegated-specific state is the
-        handle->server map, standing in for id(request) which does not cross the
-        HTTP hop."""
-        block_hashes = (routing_key or {}).get("block_hashes") or []
-        async with self._lock:
-            servers = [s for s in self._server_state.keys()
-                       if s != exclude_server]
-        if not servers:
-            raise ValueError(
-                f"No available servers after excluding {exclude_server}")
-        # All servers share one hash algo in the delegated deployment.
-        hash_algo_by_server = {s: self._get_server_hash_algo(s) for s in servers}
-        block_hashes_by_algo = {
-            hash_algo_by_server[servers[0]]: block_hashes}
-        flat = [h for hl in block_hashes for h in hl]
-        conv_key = flat[0] if flat else None
-        server, _algo, _bh, matches = await self._select_server(
-            servers, hash_algo_by_server, block_hashes_by_algo, conv_key)
-        # Track load on the SAME server-state counter get_next_server uses
-        # (request=None: no token accounting). Map an opaque handle -> server so
-        # /finish can decrement it.
-        if not hasattr(self, "_coord_handle_server"):
-            self._coord_handle_server = {}
-            self._coord_handle_counter = 0
-        await self._server_state[server].increment_load(None)
-        async with self._lock:
-            self._coord_handle_counter += 1
-            node_id = getattr(self, "_disagg_node_id", 0)
-            handle = f"kvc{node_id}_{self._coord_handle_counter}"
-            self._coord_handle_server[handle] = server
-        return server, {"server_info": self._server_info.get(server, {}),
-                        "matches": matches}, handle
+        """Coordinator-side placement: the SAME _route core, request=None so load
+        is tracked by an opaque handle (id(request) doesn't cross the HTTP hop)."""
+        return await self._route(routing_key, exclude_server=exclude_server,
+                                 request=None)
 
     async def finish_by_handle(self, handle, success=True):
-        del success
+        """Coordinator-side finish, mirroring finish_request: decrement load,
+        apply routed blocks, refresh the block table -- keyed by handle."""
         if not handle:
             return
-        server = getattr(self, "_coord_handle_server", {}).pop(handle, None)
-        if server is not None and server in self._server_state:
+        entry = getattr(self, "_coord_handle_server", {}).pop(handle, None)
+        if entry is None:
+            return
+        server, block_hashes, hash_algo = entry
+        if server in self._server_state:
             await self._server_state[server].decrement_load(None)
-        # Same poll-on-finish as finish_request -- keeps the block table warm.
+            if self._track_routed_blocks and success:
+                self._server_state[server].add_blocks(
+                    [h for hl in block_hashes for h in hl], hash_algo=hash_algo)
         self._poll_server_on_finish(server)
 
     def _on_servers_updated(self, old_servers, new_servers):
