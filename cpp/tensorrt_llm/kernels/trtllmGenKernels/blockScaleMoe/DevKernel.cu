@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -90,7 +90,11 @@ __global__ void activationKernel(KernelParams params)
             for (int hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x; hiddenIdx < params.innerDim / 2;
                  hiddenIdx += blockDim.x * gridDim.x)
             {
-                int const baseIdx = permutedIdx * params.innerDim + hiddenIdx;
+                // Compute global-memory offsets in int64: under Attention DP + AllGather the
+                // permuted token count (permutedIdx up to totalNumPaddedTokens) times a hidden/inner
+                // dimension can exceed INT_MAX, so 32-bit index math would overflow. Applies to all
+                // permutedIdx/tokenIdx * dim offsets in this file.
+                int64_t const baseIdx = static_cast<int64_t>(permutedIdx) * params.innerDim + hiddenIdx;
 
                 float x1 = (float) params.inPtr[baseIdx];                       // up (linear)
                 float x2 = (float) params.inPtr[baseIdx + params.innerDim / 2]; // gate (silu input)
@@ -104,7 +108,7 @@ __global__ void activationKernel(KernelParams params)
                 float act = silu(x2);
                 Type out = (Type) (act * x1);
 
-                int const outIdx = permutedIdx * (params.innerDim / 2) + hiddenIdx;
+                int64_t const outIdx = static_cast<int64_t>(permutedIdx) * (params.innerDim / 2) + hiddenIdx;
                 params.outPtr[outIdx] = out;
             }
         }
@@ -311,11 +315,13 @@ __global__ void activationDeepSeekKernel(KernelParams params)
                     }
 
                     // Process blocks for this CTA
-                    int const baseIdx = permutedIdx * params.innerDim + hiddenIdx;
+                    int64_t const baseIdx = static_cast<int64_t>(permutedIdx) * params.innerDim + hiddenIdx;
 
-                    int const scale1Idx = permutedIdx + totalNumPaddedTokens * (hiddenIdx / 128);
-                    int const scale2Idx
-                        = permutedIdx + totalNumPaddedTokens * ((hiddenIdx / 128) + (params.innerDim / 2 / 128));
+                    int64_t const scale1Idx
+                        = permutedIdx + static_cast<int64_t>(totalNumPaddedTokens) * (hiddenIdx / 128);
+                    int64_t const scale2Idx = permutedIdx
+                        + static_cast<int64_t>(totalNumPaddedTokens)
+                            * ((hiddenIdx / 128) + (params.innerDim / 2 / 128));
 
                     scale1Arr[tokenInCtaIdx] = params.inDqSfsPtr[scale1Idx];
                     scale2Arr[tokenInCtaIdx] = params.inDqSfsPtr[scale2Idx];
@@ -380,7 +386,7 @@ __global__ void activationDeepSeekKernel(KernelParams params)
                         continue;
                     }
                     float const scaleOut = s_scaleOutArr[tokenInCtaIdx];
-                    int const outIdx = permutedIdx * (params.innerDim / 2) + hiddenIdx;
+                    int64_t const outIdx = static_cast<int64_t>(permutedIdx) * (params.innerDim / 2) + hiddenIdx;
                     params.outPtr[outIdx] = static_cast<Type>(outArr[tokenInCtaIdx] / scaleOut);
                 }
             }
@@ -669,14 +675,14 @@ __global__ void permuteKernel(KernelParams params)
         {
 
             // Load chunk of token into registers
-            const Type data = params.inPtr[tokenIdx * params.hiddenDim + hiddenIdx];
+            const Type data = params.inPtr[static_cast<int64_t>(tokenIdx) * params.hiddenDim + hiddenIdx];
 
             // Write to topK places
             for (int k = 0; k < params.topK; k++)
             {
                 int const expandedIdx = tokenIdx * params.topK + k;
                 int const permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
-                params.outPtr[permutedIdx * params.hiddenDim + hiddenIdx] = data;
+                params.outPtr[static_cast<int64_t>(permutedIdx) * params.hiddenDim + hiddenIdx] = data;
             }
         }
         if (params.useDeepSeekFp8)
@@ -689,8 +695,9 @@ __global__ void permuteKernel(KernelParams params)
                     int const expandedIdx = tokenIdx * params.topK + k;
                     int const permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
 
-                    int const idx_in = tokenIdx + params.numTokens * scaleIdx;
-                    int const idx_out = permutedIdx + params.totalNumPaddedTokens[0] * scaleIdx;
+                    int64_t const idx_in = tokenIdx + static_cast<int64_t>(params.numTokens) * scaleIdx;
+                    int64_t const idx_out
+                        = permutedIdx + static_cast<int64_t>(params.totalNumPaddedTokens[0]) * scaleIdx;
 
                     params.outDqSfsPtr[idx_out] = params.inDqSfsPtr[idx_in];
                 }
@@ -764,15 +771,16 @@ __global__ void finalizeKernel(KernelParams params)
                 if (params.expertWeightsPtr != nullptr)
                 {
                     TypeExpW const scale = params.expertWeightsPtr[expandedIdx];
-                    data += float{scale} * float{params.inPtr[permutedIdx * params.hiddenDimPadded + hiddenIdx]};
+                    data += float{scale}
+                        * float{params.inPtr[static_cast<int64_t>(permutedIdx) * params.hiddenDimPadded + hiddenIdx]};
                 }
                 else
                 {
-                    data += float{params.inPtr[permutedIdx * params.hiddenDimPadded + hiddenIdx]};
+                    data += float{params.inPtr[static_cast<int64_t>(permutedIdx) * params.hiddenDimPadded + hiddenIdx]};
                 }
             }
 
-            params.outPtr[tokenIdx * params.hiddenDim + hiddenIdx] = static_cast<Type>(data);
+            params.outPtr[static_cast<int64_t>(tokenIdx) * params.hiddenDim + hiddenIdx] = static_cast<Type>(data);
         }
     }
 }
@@ -896,13 +904,15 @@ __global__ void finalizeDeepSeekKernel(KernelParams params)
                     continue;
                 }
                 int const totalNumPaddedTokens = params.totalNumPaddedTokens[0];
-                int const scaleIdx = permutedIdx + totalNumPaddedTokens * (hiddenIdx / 128);
+                int64_t const scaleIdx = permutedIdx + static_cast<int64_t>(totalNumPaddedTokens) * (hiddenIdx / 128);
                 float const blockScale = params.inDqSfsPtr ? params.inDqSfsPtr[scaleIdx] : 1;
 
                 float const expertProb = (float) params.expertWeightsPtr[tokenIdx * params.topK + k];
 
                 float const scale = expertProb * blockScale;
-                acc += scale * static_cast<float>(params.inPtr[permutedIdx * params.hiddenDimPadded + hiddenIdx]);
+                acc += scale
+                    * static_cast<float>(
+                        params.inPtr[static_cast<int64_t>(permutedIdx) * params.hiddenDimPadded + hiddenIdx]);
             }
 
             // The largest (finite) value that can be represented using E4m3.
@@ -916,7 +926,7 @@ __global__ void finalizeDeepSeekKernel(KernelParams params)
                 if (params.outDqSfsPtr)
                 {
                     s_scaleOut = aMax / E4m3MaxVal;
-                    int const scaleOut_idx = tokenIdx + hiddenIdx / 128 * params.numTokens;
+                    int64_t const scaleOut_idx = tokenIdx + static_cast<int64_t>(hiddenIdx / 128) * params.numTokens;
                     params.outDqSfsPtr[scaleOut_idx] = aMax / E4m3MaxVal;
                 }
                 else
@@ -927,7 +937,7 @@ __global__ void finalizeDeepSeekKernel(KernelParams params)
             __syncthreads();
             float const scaleOut = s_scaleOut;
             __syncthreads();
-            params.outPtr[tokenIdx * params.hiddenDim + hiddenIdx] = (Type) (acc / scaleOut);
+            params.outPtr[static_cast<int64_t>(tokenIdx) * params.hiddenDim + hiddenIdx] = (Type) (acc / scaleOut);
         }
     }
 }
