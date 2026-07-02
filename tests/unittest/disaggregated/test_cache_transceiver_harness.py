@@ -29,10 +29,9 @@ import socket
 import subprocess
 import sys
 import time
+from unittest.mock import MagicMock, call
 
 import pytest
-
-pytest.importorskip("mpi4py")
 
 CTT_DIR = os.path.normpath(
     os.path.join(
@@ -82,8 +81,7 @@ def _wait_for_processes(processes: list[subprocess.Popen]) -> None:
         proc.wait(timeout=remaining)
 
 
-def _terminate_process_groups(processes: list[subprocess.Popen]) -> None:
-    group_ids = [proc.pid for proc in processes if proc.poll() is None]
+def _terminate_process_groups(processes: list[subprocess.Popen], group_ids: list[int]) -> None:
     for group_id in group_ids:
         try:
             os.killpg(group_id, signal.SIGTERM)
@@ -104,8 +102,62 @@ def _terminate_process_groups(processes: list[subprocess.Popen]) -> None:
             os.killpg(group_id, signal.SIGKILL)
         except ProcessLookupError:
             pass
+
+    deadline = time.monotonic() + _TERMINATE_GRACE_SECONDS
     for proc in processes:
-        proc.wait()
+        if proc.poll() is not None:
+            continue
+        try:
+            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            pass
+
+
+class TestProcessHelpers:
+    def test_wait_for_processes_uses_shared_deadline(self, monkeypatch):
+        first = MagicMock()
+        second = MagicMock()
+        monotonic = MagicMock(side_effect=[100.0, 101.0, 111.0])
+        monkeypatch.setattr(time, "monotonic", monotonic)
+
+        _wait_for_processes([first, second])
+
+        first.wait.assert_called_once_with(timeout=119.0)
+        second.wait.assert_called_once_with(timeout=109.0)
+
+    def test_terminate_process_groups_bounds_post_kill_wait(self, monkeypatch):
+        proc = MagicMock(pid=1234)
+        proc.poll.return_value = None
+        proc.wait.side_effect = [
+            subprocess.TimeoutExpired("mpirun", 4.0),
+            subprocess.TimeoutExpired("mpirun", 4.0),
+        ]
+        killpg = MagicMock()
+        monotonic = MagicMock(side_effect=[100.0, 101.0, 200.0, 201.0])
+        monkeypatch.setattr(os, "killpg", killpg)
+        monkeypatch.setattr(time, "monotonic", monotonic)
+
+        _terminate_process_groups([proc], [proc.pid])
+
+        assert proc.wait.call_args_list == [call(timeout=4.0), call(timeout=4.0)]
+        assert killpg.call_args_list == [
+            call(proc.pid, signal.SIGTERM),
+            call(proc.pid, signal.SIGKILL),
+        ]
+
+    def test_terminate_process_groups_signals_group_after_leader_exit(self, monkeypatch):
+        proc = MagicMock(pid=1234)
+        proc.poll.return_value = 1
+        killpg = MagicMock()
+        monkeypatch.setattr(os, "killpg", killpg)
+
+        _terminate_process_groups([proc], [proc.pid])
+
+        assert killpg.call_args_list == [
+            call(proc.pid, signal.SIGTERM),
+            call(proc.pid, signal.SIGKILL),
+        ]
+        proc.wait.assert_not_called()
 
 
 def _build_config(work_dir: str) -> dict:
@@ -146,6 +198,7 @@ def _build_config(work_dir: str) -> dict:
 @pytest.mark.timeout(180)
 def test_single_node_transfer(tmp_path):
     """Launch ctx and gen via mpirun on a single node, verify transfer passes."""
+    pytest.importorskip("mpi4py")
     mpirun = _find_mpirun()
 
     work_dir = str(tmp_path / "work")
@@ -165,8 +218,8 @@ def test_single_node_transfer(tmp_path):
             "CTT_SWEEP": "0",
             "CTT_SWEEP_NAME": "default",
             "CUDA_VISIBLE_DEVICES": "0",
-            # The report parser consumes full protocol-selection tables. Unlike
-            # `used`, `y` does not depend on UCX worker teardown to emit them.
+            # Emit protocol-selection tables while transfers are active so the
+            # report can deterministically identify the CUDA KV-data transport.
             "UCX_PROTO_INFO": "y",
         }
     )
@@ -192,7 +245,8 @@ def test_single_node_transfer(tmp_path):
     gen_log_path = os.path.join(log_dir, "sweep0_gen_rank0.log")
     timeout_error = None
     processes = []
-    processes_completed = False
+    process_group_ids = []
+    processes_succeeded = False
     with open(ctx_log_path, "wb") as ctx_log_file, open(gen_log_path, "wb") as gen_log_file:
         try:
             ctx_proc = subprocess.Popen(
@@ -203,6 +257,7 @@ def test_single_node_transfer(tmp_path):
                 start_new_session=True,
             )
             processes.append(ctx_proc)
+            process_group_ids.append(ctx_proc.pid)
             gen_proc = subprocess.Popen(
                 mpi_args + ["--role", "gen"],
                 env=env,
@@ -211,13 +266,14 @@ def test_single_node_transfer(tmp_path):
                 start_new_session=True,
             )
             processes.append(gen_proc)
+            process_group_ids.append(gen_proc.pid)
             _wait_for_processes(processes)
-            processes_completed = True
+            processes_succeeded = all(proc.returncode == 0 for proc in processes)
         except subprocess.TimeoutExpired as exc:
             timeout_error = exc
         finally:
-            if not processes_completed:
-                _terminate_process_groups(processes)
+            if not processes_succeeded:
+                _terminate_process_groups(processes, process_group_ids)
 
     with open(ctx_log_path, errors="replace") as f:
         ctx_log = f.read()
@@ -258,7 +314,15 @@ def test_single_node_transfer(tmp_path):
     # Verify report aggregation produces valid results.
     results_path = os.path.join(work_dir, "results.json")
     agg_result = subprocess.run(
-        [sys.executable, REPORT_SCRIPT, config_path, "--aggregate", "--out", results_path],
+        [
+            sys.executable,
+            REPORT_SCRIPT,
+            config_path,
+            "--aggregate",
+            "--require-kv-transport",
+            "--out",
+            results_path,
+        ],
         capture_output=True,
         text=True,
         timeout=30,
