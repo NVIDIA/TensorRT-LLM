@@ -1273,7 +1273,7 @@ class Gemma4UnifiedProcessorShim:
     video path.
     """
 
-    def __init__(
+    def __init__(  # nosec B107 - multimodal delimiter tokens, not passwords
         self,
         feature_extractor,
         image_processor,
@@ -1310,7 +1310,7 @@ class Gemma4UnifiedProcessorShim:
         # Upstream Gemma4UnifiedProcessor.__init__ registers the video token the
         # same way (the checkpoint tokenizer does not declare it as an attribute).
         tokenizer.add_special_tokens({"additional_special_tokens": ["<|video|>"]})
-        self.video_token = "<|video|>"
+        self.video_token = "<|video|>"  # nosec B105 - multimodal delimiter token, not a password
         self.video_token_id = tokenizer.convert_tokens_to_ids(self.video_token)
         self.audio_token_id = tokenizer.convert_tokens_to_ids(audio_token)
 
