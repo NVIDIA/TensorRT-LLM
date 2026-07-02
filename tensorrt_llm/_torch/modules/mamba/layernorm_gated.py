@@ -63,6 +63,7 @@ def _layer_norm_fwd_1pass_kernel(
     HAS_Z: tl.constexpr,
     NORM_BEFORE_GATE: tl.constexpr,
     IS_RMS_NORM: tl.constexpr,
+    REPEAT_WEIGHT: tl.constexpr,
 ):
     # Map the program id to the row of X and Y it should compute.
     row = tl.program_id(0)
@@ -76,9 +77,11 @@ def _layer_norm_fwd_1pass_kernel(
     if not IS_RMS_NORM:
         Mean += group * M
     Rstd += group * M
-    W += group * N
+    if not REPEAT_WEIGHT:
+        W += group * N
     if HAS_BIAS:
-        B += group * N
+        if not REPEAT_WEIGHT:
+            B += group * N
     # Compute mean and variance
     cols = tl.arange(0, BLOCK_N)
     x = tl.load(X + cols, mask=cols < N, other=0.0).to(tl.float32)
@@ -129,11 +132,12 @@ def _layer_norm_fwd(
     if z is not None:
         assert z.stride(-1) == 1
         assert z.shape == (M, N)
-    assert weight.shape == (N, )
+    repeat_weight = N != group_size and weight.shape == (group_size, )
+    assert weight.shape == ((group_size, ) if repeat_weight else (N, ))
     assert weight.stride(-1) == 1
     if bias is not None:
         assert bias.stride(-1) == 1
-        assert bias.shape == (N, )
+        assert bias.shape == ((group_size, ) if repeat_weight else (N, ))
     # allocate output
     if out is not None:
         assert out.shape == x.shape
@@ -170,6 +174,7 @@ def _layer_norm_fwd(
             BLOCK_N=BLOCK_N,
             NORM_BEFORE_GATE=norm_before_gate,
             IS_RMS_NORM=is_rms_norm,
+            REPEAT_WEIGHT=repeat_weight,
             num_warps=num_warps,
         )
     return out, mean, rstd

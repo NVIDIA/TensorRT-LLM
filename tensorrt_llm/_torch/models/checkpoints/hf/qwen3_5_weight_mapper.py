@@ -35,8 +35,9 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
     2. Linear-attention projections (handled in _pack_split_projections):
        Qwen3Next checkpoints store pre-packed in_proj_qkvz and in_proj_ba
        tensors.  Qwen3.5 checkpoints store them as separate in_proj_qkv + z
-       (or fully split q/k/v/z) and b + a tensors.  This mapper packs them
-       into the grouped-interleaved layout that TRT-LLM expects.
+       (or fully split q/k/v/z) and b + a tensors.  This mapper first packs
+       grouped-interleaved QKVZ/BA; attention-DP then converts it to the
+       combined consumer order [Q, K, V, Z, B, A].
        For FP8 checkpoints, the packed qkvz tensor is then dequantized to
        bf16 as a temporary workaround for TP loading
        (handled in _dequantize_linear_attn_fp8_qkvz).
