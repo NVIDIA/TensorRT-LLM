@@ -29,8 +29,6 @@ import zipfile
 import pytest
 import torch
 import torch._inductor.config as inductor_config
-from defs import conftest
-from defs.common import venv_check_call
 from defs.trt_test_alternative import check_call
 from torch._inductor.async_compile import shutdown_compile_workers
 
@@ -229,16 +227,6 @@ AESTHETIC_PREDICTOR_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", 
 
 
 @pytest.fixture(scope="session")
-def _visual_gen_deps(llm_venv):
-    """Install av + diffusers + ffmpeg once per session (shared by all video-gen fixtures)."""
-    llm_venv.run_cmd(["-m", "pip", "install", "av"])
-    llm_venv.run_cmd(["-m", "pip", "install", "diffusers>=0.37.0"])
-    # Install ffmpeg system package required by save_video() for MP4 encoding
-    check_call(["apt-get", "update", "-y"], shell=False)
-    check_call(["apt-get", "install", "-y", "ffmpeg"], shell=False)
-
-
-@pytest.fixture(scope="session")
 def vbench_repo_root(llm_venv):
     """Clone VBench repo into workspace and install; return repo root path."""
     workspace = llm_venv.get_working_directory()
@@ -343,8 +331,30 @@ def _precache_aesthetic_predictor():
                 ) from exc
 
 
+def _llm_models_root():
+    # Imported lazily so that re-importing this module in a torch.multiprocessing.spawn
+    # child (a fresh interpreter) does not run a module-level `from defs import conftest`,
+    # which pulls in `tensorrt_llm.bindings` -- a compiled extension absent from the source
+    # tree the spawned child resolves, crashing the worker before the test runs. The parent
+    # process already imports conftest during collection, so this deferral is free.
+    from defs import conftest
+
+    return conftest.llm_models_root()
+
+
+def _venv_check_call(*args, **kwargs):
+    # Deferred like _llm_models_root above: defs.common does `from tensorrt_llm import
+    # LLM`, which pulls in tensorrt_llm.bindings. Importing it at module load would
+    # crash the torch.multiprocessing.spawn child processes used by the multi-GPU LPIPS
+    # tests, which re-import this module before the worker fixes sys.path. Only the
+    # single-GPU example tests call this, and only in the parent process.
+    from defs.common import venv_check_call
+
+    return venv_check_call(*args, **kwargs)
+
+
 def _lpips_model_path(*parts):
-    return os.path.join(conftest.llm_models_root(), *parts)
+    return os.path.join(_llm_models_root(), *parts)
 
 
 def _skip_if_missing(path, label, is_dir=False):
@@ -380,7 +390,7 @@ def _golden_media_path(tmp_path, media_name, label):
 
 
 def _ltx2_lpips_text_encoder_path():
-    scratch_space = conftest.llm_models_root()
+    scratch_space = _llm_models_root()
     candidates = [
         os.path.join(scratch_space, LTX2_TEXT_ENCODER_SUBPATH),
         os.path.join(scratch_space, "gemma", LTX2_TEXT_ENCODER_SUBPATH),
@@ -410,14 +420,28 @@ def _cleanup_cuda():
 
 
 @contextlib.contextmanager
-def _lpips_deterministic_algorithms():
-    previous = torch.are_deterministic_algorithms_enabled()
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    torch.use_deterministic_algorithms(True)
+def _lpips_deterministic_algorithms(*, fully_eager=False):
+    previous_deterministic = torch.are_deterministic_algorithms_enabled()
+    previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    previous_cublas_workspace_config = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+
     try:
-        yield
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(True)
+        compiler_context = (
+            torch.compiler.set_stance("force_eager") if fully_eager else contextlib.nullcontext()
+        )
+        with compiler_context:
+            yield
     finally:
-        torch.use_deterministic_algorithms(previous)
+        torch.use_deterministic_algorithms(
+            previous_deterministic,
+            warn_only=previous_warn_only,
+        )
+        if previous_cublas_workspace_config is None:
+            os.environ.pop("CUBLAS_WORKSPACE_CONFIG", None)
+        else:
+            os.environ["CUBLAS_WORKSPACE_CONFIG"] = previous_cublas_workspace_config
 
 
 def _save_lpips_video_mp4(video, output_path, frame_rate):
@@ -605,6 +629,7 @@ def _run_wan_lpips_pipeline(
     seed,
     attention_backend="VANILLA",
     parallel=None,
+    fully_eager=False,
 ):
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
     from tensorrt_llm.visual_gen.args import AttentionConfig, TorchCompileConfig, VisualGenArgs
@@ -618,7 +643,7 @@ def _run_wan_lpips_pipeline(
     )
     if parallel is not None:
         args_kwargs["parallel_config"] = parallel
-    with _lpips_deterministic_algorithms():
+    with _lpips_deterministic_algorithms(fully_eager=fully_eager):
         args = VisualGenArgs(**args_kwargs)
         pipeline = PipelineLoader(args).load(skip_warmup=True)
         try:
@@ -653,7 +678,9 @@ def _generate_wan_lpips_video(
     guidance_scale,
     seed,
     frame_rate,
+    attention_backend="VANILLA",
     parallel=None,
+    fully_eager=False,
 ):
     generated_video = _run_wan_lpips_pipeline(
         model_path,
@@ -665,7 +692,9 @@ def _generate_wan_lpips_video(
         num_inference_steps,
         guidance_scale,
         seed,
+        attention_backend=attention_backend,
         parallel=parallel,
+        fully_eager=fully_eager,
     )
     assert generated_video is not None, "Single-GPU Wan LPIPS run produced no video"
     _save_lpips_video_mp4(generated_video, output_path, frame_rate=frame_rate)
@@ -984,7 +1013,7 @@ def _generate_wan_video(llm_venv, model_subpath, output_subdir):
     """
     from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams
 
-    scratch_space = conftest.llm_models_root()
+    scratch_space = _llm_models_root()
     model_path = os.path.join(scratch_space, model_subpath)
     if not os.path.isdir(model_path):
         pytest.skip(
@@ -1057,7 +1086,7 @@ def _generate_ltx2_two_stage_video(llm_venv, output_subdir, linear_type="default
     """
     from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams
 
-    scratch_space = conftest.llm_models_root()
+    scratch_space = _llm_models_root()
     model_path = os.path.join(scratch_space, LTX2_MODEL_CHECKPOINT_PATH)
     text_encoder_path = os.path.join(scratch_space, LTX2_TEXT_ENCODER_SUBPATH)
     upsampler_path = os.path.join(scratch_space, LTX2_UPSAMPLER_SUBPATH)
@@ -1217,7 +1246,7 @@ def _run_vbench_and_report(
         "custom_input",
     ]
     cmd.extend(["--dimension"] + VBENCH_DIMENSIONS)
-    venv_check_call(llm_venv, cmd)
+    _venv_check_call(llm_venv, cmd)
 
     pattern = os.path.join(output_path, "*_eval_results.json")
     result_files = glob.glob(pattern)
@@ -1356,7 +1385,7 @@ def test_vbench_dimension_score_ltx2_two_stage_fp8(
 
 def test_visual_gen_quickstart(_visual_gen_deps, llm_root, llm_venv):
     """Run examples/visual_gen/quickstart_example.py end-to-end."""
-    scratch_space = conftest.llm_models_root()
+    scratch_space = _llm_models_root()
     model_src = os.path.join(scratch_space, WAN_T2V_MODEL_SUBPATH)
     if not os.path.isdir(model_src):
         pytest.skip(
@@ -1370,7 +1399,7 @@ def test_visual_gen_quickstart(_visual_gen_deps, llm_root, llm_venv):
         os.symlink(model_src, model_dst, target_is_directory=True)
 
     script_path = os.path.join(llm_root, "examples", "visual_gen", "quickstart_example.py")
-    venv_check_call(llm_venv, [script_path])
+    _venv_check_call(llm_venv, [script_path])
 
     output_path = os.path.join(llm_venv.get_working_directory(), "output.avi")
     assert os.path.isfile(output_path), f"Quickstart did not produce output.avi at {output_path}"
@@ -1378,7 +1407,7 @@ def test_visual_gen_quickstart(_visual_gen_deps, llm_root, llm_venv):
 
 def test_visual_gen_api_walkthrough(_visual_gen_deps, llm_root, llm_venv):
     """Run examples/visual_gen/api_walkthrough.py end-to-end."""
-    scratch_space = conftest.llm_models_root()
+    scratch_space = _llm_models_root()
     model_src = os.path.join(scratch_space, WAN_T2V_MODEL_SUBPATH)
     if not os.path.isdir(model_src):
         pytest.skip(
@@ -1392,7 +1421,7 @@ def test_visual_gen_api_walkthrough(_visual_gen_deps, llm_root, llm_venv):
         os.symlink(model_src, model_dst, target_is_directory=True)
 
     script_path = os.path.join(llm_root, "examples", "visual_gen", "api_walkthrough.py")
-    venv_check_call(llm_venv, [script_path])
+    _venv_check_call(llm_venv, [script_path])
 
     output_path = os.path.join(llm_venv.get_working_directory(), "api_walkthrough_output.avi")
     assert os.path.isfile(output_path), f"API walkthrough did not produce {output_path}"
@@ -1415,7 +1444,7 @@ def test_wan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
     which runs the same script but with a no-quant YAML synthesized at
     runtime and additionally evaluates VBench scores.
     """
-    scratch_space = conftest.llm_models_root()
+    scratch_space = _llm_models_root()
     model_path = os.path.join(scratch_space, WAN22_A14B_NVFP4_MODEL_SUBPATH)
     assert os.path.isdir(model_path), (
         f"Model not found: {model_path} "
@@ -1433,7 +1462,7 @@ def test_wan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
     assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
-    venv_check_call(
+    _venv_check_call(
         llm_venv,
         [
             script_path,
@@ -1469,7 +1498,7 @@ def test_flux1_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
     assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
-    venv_check_call(
+    _venv_check_call(
         llm_venv,
         [
             script_path,
@@ -1505,7 +1534,7 @@ def test_flux2_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
     assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
-    venv_check_call(
+    _venv_check_call(
         llm_venv,
         [
             script_path,
@@ -1544,7 +1573,7 @@ def test_ltx2_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
     assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
-    venv_check_call(
+    _venv_check_call(
         llm_venv,
         [
             script_path,
@@ -1568,7 +1597,7 @@ def test_wan_i2v_example(_visual_gen_deps, llm_root, llm_venv):
     work together as documented. Uses the pre-quantized Wan 2.2 I2V A14B NVFP4
     checkpoint and the default input image (cat_piano.png) bundled with the examples.
     """
-    scratch_space = conftest.llm_models_root()
+    scratch_space = _llm_models_root()
     model_path = os.path.join(scratch_space, WAN22_I2V_A14B_NVFP4_MODEL_SUBPATH)
     if not os.path.isdir(model_path):
         pytest.skip(
@@ -1587,7 +1616,7 @@ def test_wan_i2v_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
     assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
-    venv_check_call(
+    _venv_check_call(
         llm_venv,
         [
             script_path,
@@ -1609,7 +1638,7 @@ def test_qwen_image_example(_visual_gen_deps, llm_root, llm_venv):
     ``configs/qwen-image-fp8-1gpu.yaml`` work together as documented. Uses the
     local Qwen-Image checkpoint and the shared FP8 blockwise dynamic-quant config.
     """
-    scratch_space = conftest.llm_models_root()
+    scratch_space = _llm_models_root()
     model_path = os.path.join(scratch_space, QWEN_IMAGE_MODEL_SUBPATH)
     _skip_if_missing(model_path, "Qwen-Image checkpoint", is_dir=True)
     model_index_path = os.path.join(model_path, "model_index.json")
@@ -1631,7 +1660,7 @@ def test_qwen_image_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
     assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
-    venv_check_call(
+    _venv_check_call(
         llm_venv,
         [
             script_path,
@@ -1669,7 +1698,7 @@ def test_cosmos3_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
     assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
-    venv_check_call(
+    _venv_check_call(
         llm_venv,
         [
             script_path,
