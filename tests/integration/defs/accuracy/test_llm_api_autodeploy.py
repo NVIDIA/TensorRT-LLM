@@ -580,7 +580,7 @@ class TestNemotronNanoV3(LlmapiAccuracyTestHarness):
         ],
     )
     def test_accuracy(self, model_id, world_size, enable_attention_dp,
-                      attn_backend):
+                      attn_backend, mocker):
         if world_size > get_device_count():
             pytest.skip(f"Not enough devices for world_size={world_size}")
         # attention-DP requires at least 2 ranks to exercise the cross-rank
@@ -602,6 +602,14 @@ class TestNemotronNanoV3(LlmapiAccuracyTestHarness):
         kwargs["attn_backend"] = attn_backend
         kwargs.setdefault("transforms", {}).setdefault(
             "detect_sharding", {})["enable_attention_dp"] = enable_attention_dp
+
+        # Nano V3 is a CoT reasoning model; the lm-eval flexible-extract
+        # regex picks up intermediate numbers from the long reasoning chain
+        # rather than the canonical "#### N" final-answer marker, so its
+        # score artificially drags the mean far below strict-match. Score
+        # against strict-match (the authoritative GSM8K-CoT filter) only.
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                          {"scores_filter": "exact_match,strict-match"})
 
         with AutoDeployLLM(model=model_path,
                            tokenizer=model_path,
