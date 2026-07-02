@@ -31,7 +31,7 @@ Key components:
 """
 
 from threading import RLock
-from typing import Any, Callable, Dict, List, TypeVar
+from typing import Any, Callable, Dict, List, Tuple, TypeVar
 
 import torch
 
@@ -49,6 +49,39 @@ T = TypeVar("T")
 # segments is incompatible with stable-address invariants required for replay.
 # Decode-only batches use the monolithic CG path and leave the flag set.
 _multi_stream_enabled: bool = True
+
+# DEBUG: counters for diagnosing why MoE layers' multi_stream doesn't fire in
+# trace. Output via atexit hook below.
+import os as _os  # noqa: E402
+
+_DEBUG_COUNTERS = _os.environ.get("AD_DEBUG_MULTI_STREAM", "") == "1"
+_begin_aux_count = 0
+_begin_aux_early_returns = 0
+_begin_aux_in_capture = 0
+_begin_aux_out_capture = 0
+_end_aux_count = 0
+_end_aux_early_returns = 0
+_wait_aux_count = 0
+_wait_aux_early_returns = 0
+
+if _DEBUG_COUNTERS:
+    import atexit as _atexit
+
+    @_atexit.register
+    def _print_multi_stream_counts():
+        pid = _os.getpid()
+        print(
+            f"[MS-COUNT pid={pid}] begin_aux calls={_begin_aux_count} early={_begin_aux_early_returns} in_capture={_begin_aux_in_capture} out_capture={_begin_aux_out_capture}",  # noqa: E501
+            flush=True,
+        )
+        print(
+            f"[MS-COUNT pid={pid}] end_aux   calls={_end_aux_count} early={_end_aux_early_returns}",
+            flush=True,
+        )
+        print(
+            f"[MS-COUNT pid={pid}] wait_aux  calls={_wait_aux_count} early={_wait_aux_early_returns}",
+            flush=True,
+        )
 
 
 def is_multi_stream_enabled() -> bool:
@@ -108,6 +141,11 @@ class CudaStreamManager(metaclass=_Singleton):
     devices: List[torch.device] = []
     events: Dict[torch.device, Dict[str, Any]] = {}
     streams: Dict[torch.device, Dict[str, Any]] = {}
+    # V13: per-fork-id event pool. Each (device, name, event_id) gets its own
+    # CUDA event so that the cuda graph capture engine does not see the same
+    # event recorded N times (which causes events to be deduplicated/dropped
+    # in the graph DAG, reducing actual aux-stream activity).
+    events_per_id: Dict[int, Dict[Tuple[str, int], Any]] = {}
     # Per-device save slot for the caller's stream.  ``begin_aux_stream_passthrough``
     # saves the real current stream here so that ``end_aux_stream_passthrough`` can
     # restore it — this is critical during CUDA graph capture where the capture stream
@@ -142,6 +180,26 @@ class CudaStreamManager(metaclass=_Singleton):
 
     def get_event(self, device: int, event_name: str) -> torch.cuda.Event:
         return self.events[device][event_name]
+
+    def get_event_for_id(self, device: int, event_name: str, event_id: int) -> torch.cuda.Event:
+        """V13: lazily allocate a unique CUDA event per (event_name, event_id) tuple.
+
+        Forks that share the same name+id share the same event (e.g., the begin/
+        end of a single MLA fork). Forks with different ids get distinct events,
+        preventing CUDA-graph-capture-time event deduplication that occurs when
+        the same event is recorded many times in one captured graph.
+        """
+        if event_id < 0:
+            # Backwards-compat: caller did not pass an id, use shared global event
+            return self.events[device][event_name]
+        if device not in self.events_per_id:
+            self.events_per_id[device] = {}
+        key = (event_name, event_id)
+        pool = self.events_per_id[device]
+        if key not in pool:
+            with torch.cuda.device(device):
+                pool[key] = torch.cuda.Event()
+        return pool[key]
 
 
 # Every device will have a singleton instance of CudaStreamManager.
@@ -209,6 +267,7 @@ def begin_aux_stream_passthrough(
     x: T,
     *,
     device: int = -1,
+    event_id: int = -1,
 ) -> T:
     """Record a CUDA event on the main stream, switch to aux, and wait for it.
 
@@ -216,9 +275,22 @@ def begin_aux_stream_passthrough(
     auxiliary stream.  All subsequent GPU ops dispatched by the FX graph
     interpreter will be recorded on aux until ``end_aux_stream_passthrough``
     switches back to main.
+
+    Args:
+        event_id: V13 — if >= 0, uses a per-id event pool so each fork gets a
+            unique CUDA event (avoids cuda graph capture deduplication of
+            shared events).
     """
+    global _begin_aux_count, _begin_aux_early_returns
+    global _begin_aux_in_capture, _begin_aux_out_capture
+    _begin_aux_count += 1
     if not _multi_stream_enabled:
+        _begin_aux_early_returns += 1
         return x
+    if torch.cuda.is_current_stream_capturing():
+        _begin_aux_in_capture += 1
+    else:
+        _begin_aux_out_capture += 1
     if device < 0:
         device = torch.cuda.current_device()
     # Save the *actual* current stream so ``end_aux`` can restore it.
@@ -227,7 +299,12 @@ def begin_aux_stream_passthrough(
     caller_stream = torch.cuda.current_stream(device)
     cuda_stream_manager._caller_streams[device] = caller_stream
     # Record where the caller's stream has reached so aux knows when data is ready.
-    main_event = cuda_stream_manager.get_event(device, cuda_stream_manager.MAIN_STREAM_NAME)
+    if event_id >= 0:
+        main_event = cuda_stream_manager.get_event_for_id(
+            device, cuda_stream_manager.MAIN_STREAM_NAME, event_id
+        )
+    else:
+        main_event = cuda_stream_manager.get_event(device, cuda_stream_manager.MAIN_STREAM_NAME)
     main_event.record(caller_stream)
     # Switch the thread-local current stream to aux.
     aux_stream = cuda_stream_manager.get_stream(device, cuda_stream_manager.AUX_STREAM_NAME)
@@ -253,6 +330,7 @@ def end_aux_stream_passthrough(
     x: torch.Tensor,
     *,
     device: int = -1,
+    event_id: int = -1,
 ) -> torch.Tensor:
     """Record a CUDA event on the aux stream and switch back to the caller's stream.
 
@@ -260,13 +338,24 @@ def end_aux_stream_passthrough(
     insert ``wait_aux_stream_passthrough`` at the point where both branches
     need to be synchronised (typically right before the ``add`` that merges
     shared-expert and routed-expert outputs).
+
+    Args:
+        event_id: V13 — if >= 0, uses a per-id event pool (paired with begin/wait).
     """
+    global _end_aux_count, _end_aux_early_returns
+    _end_aux_count += 1
     if not _multi_stream_enabled:
+        _end_aux_early_returns += 1
         return x
     if device < 0:
         device = torch.cuda.current_device()
     # Record the aux-stream progress so the caller's stream can wait for it later.
-    aux_event = cuda_stream_manager.get_event(device, cuda_stream_manager.AUX_STREAM_NAME)
+    if event_id >= 0:
+        aux_event = cuda_stream_manager.get_event_for_id(
+            device, cuda_stream_manager.AUX_STREAM_NAME, event_id
+        )
+    else:
+        aux_event = cuda_stream_manager.get_event(device, cuda_stream_manager.AUX_STREAM_NAME)
     aux_event.record()
     # Restore the caller's stream saved by ``begin_aux_stream_passthrough``.
     # This is critical during CUDA graph capture where the capture stream
@@ -286,6 +375,7 @@ def wait_aux_stream_passthrough(
     x: torch.Tensor,
     *,
     device: int = -1,
+    event_id: int = -1,
 ) -> torch.Tensor:
     """Make the current stream wait for the auxiliary stream's last recorded event.
 
@@ -295,12 +385,23 @@ def wait_aux_stream_passthrough(
 
     Uses ``torch.cuda.current_stream()`` rather than the stored default stream
     so that the correct stream is waited on during CUDA graph capture.
+
+    Args:
+        event_id: V13 — if >= 0, uses a per-id event pool (paired with begin/end).
     """
+    global _wait_aux_count, _wait_aux_early_returns
+    _wait_aux_count += 1
     if not _multi_stream_enabled:
+        _wait_aux_early_returns += 1
         return x
     if device < 0:
         device = torch.cuda.current_device()
-    aux_event = cuda_stream_manager.get_event(device, cuda_stream_manager.AUX_STREAM_NAME)
+    if event_id >= 0:
+        aux_event = cuda_stream_manager.get_event_for_id(
+            device, cuda_stream_manager.AUX_STREAM_NAME, event_id
+        )
+    else:
+        aux_event = cuda_stream_manager.get_event(device, cuda_stream_manager.AUX_STREAM_NAME)
     torch.cuda.current_stream(device).wait_event(aux_event)
     return x
 
@@ -327,3 +428,70 @@ def _make_aux_stream_impl(base_overload: Callable) -> Callable:
         return output
 
     return _impl
+
+
+# ---------------------------------------------------------------------------
+# V19: MoE shared-expert wrap helper
+# ---------------------------------------------------------------------------
+
+
+@torch._dynamo.disable
+def dsv3_moe_shared_mlp_in_aux_wrapped(
+    input_tensor: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+    gate_proj_input_scale: torch.Tensor,
+    gate_up_weight_scale: torch.Tensor,
+    gate_proj_alpha: torch.Tensor,
+    down_proj_input_scale: torch.Tensor,
+    down_proj_weight_scale: torch.Tensor,
+    down_proj_alpha: torch.Tensor,
+) -> torch.Tensor:
+    """V19: Run fused_nvfp4_swiglu_mlp (shared expert) in aux stream.
+
+    Wraps begin_aux + fused MLP + end_aux into a single @torch._dynamo.disable
+    function. The corresponding wait_aux is left as a separate fx node by the
+    transform (it does not call set_stream(), so it does not split capture).
+
+    Purpose: collapse 3 fx-graph nodes (begin_aux, fused_mlp, end_aux) into 1
+    single call_function node, so cuda graph capture does not allocate
+    per-MoE-layer dedicated streams.
+    """
+
+    def _mlp():
+        return torch.ops.auto_deploy.fused_nvfp4_swiglu_mlp.default(
+            input_tensor,
+            gate_up_weight,
+            down_proj_weight,
+            gate_proj_input_scale,
+            gate_up_weight_scale,
+            gate_proj_alpha,
+            down_proj_input_scale,
+            down_proj_weight_scale,
+            down_proj_alpha,
+        )
+
+    if not _multi_stream_enabled:
+        return _mlp()
+
+    device = torch.cuda.current_device()
+    aux_stream = cuda_stream_manager.get_stream(device, cuda_stream_manager.AUX_STREAM_NAME)
+    main_event = cuda_stream_manager.get_event(device, cuda_stream_manager.MAIN_STREAM_NAME)
+    aux_event = cuda_stream_manager.get_event(device, cuda_stream_manager.AUX_STREAM_NAME)
+
+    caller_stream = torch.cuda.current_stream(device)
+    main_event.record(caller_stream)
+    if not torch.cuda.is_current_stream_capturing():
+        input_tensor.record_stream(aux_stream)
+        gate_up_weight.record_stream(aux_stream)
+        down_proj_weight.record_stream(aux_stream)
+    with torch.cuda.stream(aux_stream):
+        aux_stream.wait_event(main_event)
+        result = _mlp()
+        aux_event.record(aux_stream)
+    # NOTE: caller_stream does NOT wait_event(aux_event) here — the wait is
+    # left as a separate wait_aux fx node placed before the merge add, so the
+    # routed-expert work on main can run concurrently with this shared MLP.
+    # We record aux_event on a shared event (cuda_stream_manager.events[...][AUX_STREAM])
+    # so the wait_aux passthrough fx node can wait on the same event.
+    return result

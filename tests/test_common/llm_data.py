@@ -41,6 +41,7 @@ HF_ID_TO_LLM_MODELS_SUBDIR = {
     "deepseek-ai/DeepSeek-V3": "DeepSeek-V3",
     "deepseek-ai/DeepSeek-R1": "DeepSeek-R1/DeepSeek-R1",
     "deepseek-ai/DeepSeek-R1-0528": "DeepSeek-R1/DeepSeek-R1-0528",
+    "nvidia/DeepSeek-R1-0528-NVFP4-v2": "DeepSeek-R1/DeepSeek-R1-0528-FP4-v2",
     "ibm-ai-platform/Bamba-9B-v2": "Bamba-9B-v2",
     "nvidia/NVIDIA-Nemotron-Nano-12B-v2": "NVIDIA-Nemotron-Nano-12B-v2",
     "nvidia/NVIDIA-Nemotron-Nano-31B-A3-v3": "NVIDIA-Nemotron-Nano-31B-A3-v3",
