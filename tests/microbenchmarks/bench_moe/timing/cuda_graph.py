@@ -25,6 +25,7 @@ import torch
 from ..utils import _sync
 from .cupti import _build_cuda_graph_kernel_stats_cupti
 from .eager import _l2_flush_buffer
+from .nsys import _NsysProfiler, measured_range
 
 
 def _time_moe_forward_cuda_graph(
@@ -37,10 +38,19 @@ def _time_moe_forward_cuda_graph(
     iters: int,
     cupti_ctx: Optional[Any] = None,
     flush_l2: bool = True,
+    nsys: bool = False,
 ) -> Tuple[List[float], Dict[str, Any]]:
-    """Time ``moe.forward`` inside an unrolled CUDA graph with EXTERNAL events."""
+    """Time ``moe.forward`` inside an unrolled CUDA graph with EXTERNAL events.
+
+    When ``nsys=True`` the ``bench_moe.measured`` NVTX range is captured INTO the
+    graph around each ``moe.forward`` (so it appears on replay), and the single
+    measured ``big_graph.replay()`` is bracketed with ``cudaProfilerStart``/``Stop``
+    (AFTER the warmup replays, so warmup / capture are excluded from the window).
+    ``nsys`` mode runs with ``cupti_ctx=None`` (CUPTI conflicts with nsys).
+    """
     device = x.device if x.numel() > 0 else torch.device("cuda")
     l2_buffer = _l2_flush_buffer(device) if flush_l2 else None
+    profiler = _NsysProfiler(nsys)
 
     if cupti_ctx is not None:
         _cupti = cupti_ctx.module
@@ -90,7 +100,11 @@ def _time_moe_forward_cuda_graph(
             if l2_buffer is not None:
                 l2_buffer.zero_()
             _record_external(starts[i])
-            moe.forward(x, router_logits, all_rank_num_tokens=all_rank_num_tokens)
+            # NVTX must be captured INTO the graph to appear on replay; it wraps
+            # ONLY the forward (between the external start/end records, excluding
+            # the L2-flush memset) so it marks the pure-forward window.
+            with measured_range(nsys):
+                moe.forward(x, router_logits, all_rank_num_tokens=all_rank_num_tokens)
             _record_external(ends[i])
 
     _sync()
@@ -103,8 +117,12 @@ def _time_moe_forward_cuda_graph(
         _cupti_kernels.clear()
         _cupti_events.clear()
 
+    # Start the nsys capture AFTER warmup replays so only the measured replay is
+    # captured (cudaProfilerStart/Stop are host-side, bracketing the replay).
+    profiler.start()
     big_graph.replay()
     _sync()
+    profiler.stop()
 
     if _cupti_available:
         _cupti.activity_flush_all(0)
