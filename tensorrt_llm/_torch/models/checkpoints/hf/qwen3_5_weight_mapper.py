@@ -110,9 +110,24 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
     ) -> None:
         if isinstance(module, MoE):
             config = self.config.pretrained_config
-            uses_fused_expert_tensors = "gate_up_proj" in module_weights
+            # ModelOpt FP8/NVFP4 checkpoints store per-expert split projections
+            # ("<e>.gate_proj.weight" + scales). Some preliminary ModelOpt
+            # exports additionally leave the original HF bf16 stacked fused
+            # tensors ("gate_up_proj"/"down_proj", shape [E, ...]) in a layer
+            # (observed in layer 0). When the per-expert tensors are present,
+            # those stacked tensors are redundant and must be ignored -- the
+            # quantized per-expert path takes precedence; otherwise the bf16
+            # stacked weights get misrouted into the fused path and crash the
+            # quantized loader.
+            per_expert_pattern = re.compile(r"^\d+\.(?:gate_proj|up_proj|down_proj)\.")
+            has_per_expert_tensors = any(per_expert_pattern.match(name) for name in module_weights)
+            uses_fused_expert_tensors = (
+                "gate_up_proj" in module_weights and not has_per_expert_tensors
+            )
             updated_module_weights = {}
             for weight_name, weight_value in module_weights.items():
+                if has_per_expert_tensors and weight_name in ("gate_up_proj", "down_proj"):
+                    continue
                 if weight_name == "gate_up_proj" and weight_value.ndim == 3:
                     if weight_value.shape[-2] == 2 * config.moe_intermediate_size and (
                         weight_value.shape[-1] == config.hidden_size
@@ -126,6 +141,10 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
                 if uses_fused_expert_tensors:
                     new_weight_name = weight_name.replace("scale_inv", "weight_scale")
                 else:
+                    # Rename per-expert projections to match MoE loader expectations.
+                    # This includes all associated scales: weight_scale, weight_scale_2,
+                    # and input_scale (for NVFP4/W4A16_NVFP4 with static activation quant).
+                    # E.g., "gate_proj.input_scale" → "w1.input_scale"
                     new_weight_name = (
                         weight_name.replace("gate_proj", "w1")
                         .replace("up_proj", "w3")
@@ -210,6 +229,62 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
             )
             updated_weights.pop(scale_name, None)
         return updated_weights
+
+    def _dequantize_linear_attn_fp8_per_tensor(self, weights: dict) -> dict:
+        """Dequantize ModelOpt per-tensor FP8 linear-attn in_proj weights to bf16.
+
+        ModelOpt MIXED_PRECISION checkpoints store the split linear-attention
+        input projections (in_proj_qkv / in_proj_z, the fully-split q/k/v
+        variants, and the in_proj_b / in_proj_a gate projections) as per-tensor
+        FP8: an FP8 ``weight`` plus scalar ``weight_scale`` / ``input_scale``.
+        TRT-LLM packs these split projections into fused ``in_proj_qkvz`` /
+        ``in_proj_ba`` Linears, which are left unquantized (the fused names do
+        not match the per-projection quant config entries), so we dequantize to
+        bf16 here -- mirroring _dequantize_linear_attn_fp8_qkvz for the
+        block-scale path -- and drop the now-unused scalar scales.  This also
+        keeps the scalar scales out of _pack_split_projections, which only knows
+        how to split [out, ...] weight/bias tensors and would index shape[0] on
+        a 0-d scalar.  in_proj_b / in_proj_a are included because
+        _SPLIT_PROJ_PATTERN packs them too, so their scalar scales would
+        otherwise reach _pack_split_projections and hit that 0-d failure.
+
+        out_proj is intentionally left untouched: it keeps its name through
+        packing, matches its FP8 quant config entry, and loads via the normal
+        FP8 path.
+        """
+        target_dtype = getattr(self.config.pretrained_config, "torch_dtype", torch.bfloat16)
+        if target_dtype is None:
+            target_dtype = torch.bfloat16
+
+        proj_pattern = re.compile(r"^(.*\.linear_attn\.in_proj_(?:qkv|q|k|v|z|b|a))\.weight$")
+        drop_keys = set()
+        dequantized = {}
+        for name, value in weights.items():
+            match = proj_pattern.match(name)
+            if match is None:
+                continue
+            scale_name = match.group(1) + ".weight_scale"
+            scale = weights.get(scale_name)
+            if scale is None:
+                continue
+            weight = value[...] if not isinstance(value, torch.Tensor) else value
+            if weight.dtype != torch.float8_e4m3fn:
+                continue
+            scale = scale[...] if not isinstance(scale, torch.Tensor) else scale
+            dequantized[name] = (
+                (weight.to(torch.float32) * scale.to(torch.float32)).to(target_dtype).contiguous()
+            )
+            drop_keys.add(scale_name)
+            drop_keys.add(match.group(1) + ".input_scale")
+
+        if not dequantized:
+            return weights
+
+        return {
+            name: dequantized.get(name, value)
+            for name, value in weights.items()
+            if name not in drop_keys
+        }
 
     def _pack_split_projections(self, weights: dict) -> dict:
         config = self.config.pretrained_config
@@ -301,6 +376,72 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
 
         return packed_weights
 
+    # E2M1 (FP4) code -> value lookup table (sign in the high bit).
+    _E2M1_VALUES = [
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
+    ]
+
+    def _dequantize_lm_head_nvfp4(self, weights: dict) -> dict:
+        """Dequantize a ModelOpt NVFP4 ``lm_head`` to bf16.
+
+        TRT-LLM's LMHead always allocates a plain (unquantized) weight, so an
+        NVFP4-quantized ``lm_head`` (uint8 packed weight + FP8 per-group
+        ``weight_scale`` + FP32 ``weight_scale_2``) cannot be loaded as-is.
+        ModelOpt MIXED_PRECISION checkpoints sometimes quantize ``lm_head``;
+        dequantize it here and drop the scales so it loads through the normal
+        bf16 path (``lm_head`` is also force-excluded from quantization in
+        ``_normalize_qwen35_exclude_modules``).
+        """
+        weight = weights.get("lm_head.weight")
+        block_scale = weights.get("lm_head.weight_scale")
+        global_scale = weights.get("lm_head.weight_scale_2")
+        if weight is None or block_scale is None or global_scale is None:
+            return weights
+        weight = weight[...] if not isinstance(weight, torch.Tensor) else weight
+        if weight.dtype != torch.uint8:
+            return weights
+
+        block_scale = (
+            block_scale[...] if not isinstance(block_scale, torch.Tensor) else block_scale
+        ).to(torch.float32)
+        global_scale = (
+            global_scale[...] if not isinstance(global_scale, torch.Tensor) else global_scale
+        ).to(torch.float32)
+        target_dtype = getattr(self.config.pretrained_config, "torch_dtype", torch.bfloat16)
+        if target_dtype is None:
+            target_dtype = torch.bfloat16
+
+        lut = torch.tensor(self._E2M1_VALUES, dtype=torch.float32)
+        out_features, packed_in = weight.shape
+        in_features = packed_in * 2
+        vals = torch.empty((out_features, in_features), dtype=torch.float32)
+        vals[:, 0::2] = lut[(weight & 0x0F).long()]
+        vals[:, 1::2] = lut[((weight >> 4) & 0x0F).long()]
+        # Per-group (16) scale = block_scale (fp8) * global_scale (fp32).
+        scale = (block_scale * global_scale).unsqueeze(-1)
+        vals = vals.view(out_features, in_features // 16, 16) * scale
+        dequantized = vals.view(out_features, in_features).to(target_dtype).contiguous()
+
+        drop = {"lm_head.weight_scale", "lm_head.weight_scale_2", "lm_head.input_scale"}
+        result = {k: v for k, v in weights.items() if k not in drop}
+        result["lm_head.weight"] = dequantized
+        return result
+
     def _remap_dense_mlp_weights(self, weights: dict) -> dict:
         """Insert extra .mlp. into dense MLP weight keys.
 
@@ -323,6 +464,15 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         normalized_weights, is_modelopt_pb_wo = self._normalize_scale_names(
             normalized_weights, quant_algo
         )
+
+        # ModelOpt MIXED_PRECISION checkpoints quantize the split linear-attn
+        # in_proj to per-tensor FP8; dequantize to bf16 before packing so the
+        # scalar scales don't reach _pack_split_projections (no-op otherwise).
+        normalized_weights = self._dequantize_linear_attn_fp8_per_tensor(normalized_weights)
+
+        # TRT-LLM's LMHead is always bf16; dequantize an NVFP4 lm_head so it
+        # loads through the unquantized path (no-op if lm_head is not NVFP4).
+        normalized_weights = self._dequantize_lm_head_nvfp4(normalized_weights)
 
         packed_weights = self._pack_split_projections(normalized_weights)
         if quant_algo == QuantAlgo.FP8_BLOCK_SCALES and not is_modelopt_pb_wo:

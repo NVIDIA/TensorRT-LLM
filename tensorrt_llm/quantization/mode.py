@@ -45,6 +45,7 @@ class QuantAlgo(StrEnum, metaclass=BaseEnumMeta):
     W4A8_MXFP4_MXFP8 = auto()
     W4A16_MXFP4 = auto()
     MXFP8 = auto()
+    W4A16_NVFP4 = auto()
     NVFP4_AWQ = auto()
     NVFP4_ARC = auto()
     NO_QUANT = auto()
@@ -440,6 +441,8 @@ class QuantMode(IntFlag):
             quant_mode = QuantMode.from_description(use_w4a16_mxfp4=True)
         elif quant_algo == QuantAlgo.MXFP8:
             quant_mode = QuantMode.from_description(use_mxfp8=True)
+        elif quant_algo == QuantAlgo.W4A16_NVFP4:
+            quant_mode = QuantMode.from_description(use_nvfp4=True)
         else:
             quant_mode = QuantMode(0)
 
