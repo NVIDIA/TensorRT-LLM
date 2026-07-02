@@ -28,6 +28,7 @@ import os
 import re
 import sys
 from typing import Callable, Dict, List, Optional, Tuple
+from weakref import WeakSet
 
 import pynvml
 import torch
@@ -44,6 +45,10 @@ from tensorrt_llm._torch.alltoall_watchdog import (
     reject_rank_mask_cuda_graph_capture,
 )
 from tensorrt_llm._torch.mnnvl_alltoall_workspace import _MnnvlAlltoAllWorkspaceLifecycle
+from tensorrt_llm._torch.moe_a2a_execution_control import (
+    MoeA2AExecutionAbortStatus,
+    MoeA2AExecutionControl,
+)
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.logger import logger as tllm_logger
 from tensorrt_llm.mapping import Mapping
@@ -486,6 +491,7 @@ class NVLinkOneSided(Communication):
                 self.eplb_stats_num_experts,
                 self.can_use_cft_counted_writes,
             )
+            execution_control = MoeA2AExecutionControl(workspace, self.ep_rank)
             workspace_state = {
                 "workspace_size_per_rank": self.workspace_size_per_rank,
                 "max_num_tokens_per_rank": self.max_num_tokens_per_rank,
@@ -502,6 +508,8 @@ class NVLinkOneSided(Communication):
                 "workspace": workspace,
                 "metainfo": metainfo,
                 "cft_initialized": False,
+                "execution_control": execution_control,
+                "instances": WeakSet(),
             }
         else:
             expected_workspace_state = {
@@ -525,8 +533,10 @@ class NVLinkOneSided(Communication):
         self._destroyed = False
         self._workspace_registered = False
         self._workspace_state = workspace_state
+        workspace_state["instances"].add(self)
         self.mnnvl_mem = workspace_state["mnnvl_mem"]
         self.workspace = workspace_state["workspace"]
+        self._execution_control = workspace_state["execution_control"]
         self.max_num_tokens_per_rank = workspace_state["max_num_tokens_per_rank"]
         self.ep_group_health = ep_group_health
         # Keep the kernel specialization stable for this communicator's lifetime.
@@ -639,8 +649,12 @@ class NVLinkOneSided(Communication):
             return
         self._workspace_registered = False
 
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        if torch.cuda.is_available() and self.workspace is not None:
+            torch.cuda.synchronize(self.workspace.device)
+
+        workspace_state = NVLinkOneSided._WORKSPACES.get(workspace_key)
+        if workspace_state is not None:
+            workspace_state["instances"].discard(self)
 
         refcount = NVLinkOneSided._WORKSPACE_REFCOUNTS.get(workspace_key, 0) - 1
         if refcount > 0:
@@ -651,12 +665,14 @@ class NVLinkOneSided(Communication):
             if NVLinkOneSided._WORKSPACE is workspace_state:
                 NVLinkOneSided._WORKSPACE = None
             if workspace_state is not None:
+                workspace_state["execution_control"].close()
                 workspace_state.clear()
 
         self.mnnvl_mem = None
         self.workspace = None
         self._workspace_state = None
         self._workspace_lifecycle = None
+        self._execution_control = None
         self._dispatch_state = {"phase": "destroyed"}
 
     def __del__(self) -> None:
@@ -868,6 +884,7 @@ class NVLinkOneSided(Communication):
         )
         active_rank_mask = active_rank_mask_snapshot.active_rank_mask
 
+        execution_epoch = self._execution_control.capture_epoch()
         recv_buffers, combine_payload_offset, eplb_gathered_stats = (
             torch.ops.trtllm.moe_a2a_dispatch(
                 token_selected_slots,
@@ -885,6 +902,8 @@ class NVLinkOneSided(Communication):
                 int(self.invalid_token_expert_id) if can_fuse_sanitize else None,
                 self._rank_mask_enabled,
                 active_rank_mask,
+                self._execution_control.tensor,
+                execution_epoch,
             )
         )
         self._watchdog_coordinator.watch_collective(
@@ -902,6 +921,7 @@ class NVLinkOneSided(Communication):
         self._dispatch_state["local_num_tokens"] = token_selected_slots.size(0)
         self._dispatch_state["runtime_max_tokens_per_rank"] = runtime_max_tokens_per_rank
         self._dispatch_state["active_rank_mask_snapshot"] = active_rank_mask_snapshot
+        self._dispatch_state["execution_epoch"] = execution_epoch
         self._dispatch_state["phase"] = "dispatched"
 
         # Extract results from recv_buffers
@@ -981,11 +1001,13 @@ class NVLinkOneSided(Communication):
         local_num_tokens = self._dispatch_state.get("local_num_tokens")
         combine_payload_offset = self._dispatch_state.get("combine_payload_offset")
         runtime_max_tokens_per_rank = self._dispatch_state.get("runtime_max_tokens_per_rank")
+        execution_epoch = self._dispatch_state.get("execution_epoch")
 
         if (
             local_num_tokens is None
             or combine_payload_offset is None
             or runtime_max_tokens_per_rank is None
+            or execution_epoch is None
         ):
             raise RuntimeError("combine called but dispatch state is missing")
 
@@ -1037,6 +1059,8 @@ class NVLinkOneSided(Communication):
             use_cft_for_combine,
             self._rank_mask_enabled,
             active_rank_mask,
+            self._execution_control.tensor,
+            int(execution_epoch),
         )
         self._watchdog_coordinator.watch_collective(
             self._alltoall_watchdog, "combine", active_rank_mask
@@ -1056,6 +1080,22 @@ class NVLinkOneSided(Communication):
         the next ``dispatch`` would raise ``dispatch called twice``.
         """
         self._dispatch_state = {"phase": "idle"}
+
+    def request_execution_abort(self) -> int:
+        """Let the recovery coordinator invalidate in-flight work without a CUDA stream."""
+        return self._execution_control.request_abort()
+
+    def get_execution_abort_status(self) -> Optional[MoeA2AExecutionAbortStatus]:
+        """Return the first kernel-observed abort/timeout, if any."""
+        return self._execution_control.status()
+
+    def begin_execution_epoch(self, execution_epoch: Optional[int] = None) -> int:
+        """Acknowledge/reset an epoch after the coordinator has quiesced old work."""
+        acknowledged_epoch = self._execution_control.begin_epoch(execution_epoch)
+        workspace_state = NVLinkOneSided._WORKSPACES[self._workspace_key]
+        for instance in list(workspace_state["instances"]):
+            instance.reset_state()
+        return acknowledged_epoch
 
     def get_combine_payload_tensor_in_workspace(
         self, runtime_max_tokens_per_rank: int, hidden_size: int, dtype: torch.dtype
