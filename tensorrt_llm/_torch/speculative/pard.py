@@ -210,7 +210,10 @@ class PARDWorker(SpecWorkerBase):
         else:
             logits_for_accept = logits
 
-        accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens_base(
+        # compare_and_accept() runs rejection sampling when the previous forward
+        # stored valid draft probs and the batch is non-greedy, else strict
+        # acceptance. logits_for_accept is the 2K->K+1 reshaped target logits.
+        accepted_tokens, num_accepted_tokens = self.compare_and_accept(
             logits_for_accept, draft_tokens, num_contexts, batch_size, spec_metadata
         )
 
@@ -252,6 +255,8 @@ class PARDWorker(SpecWorkerBase):
 
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
 
+        self.reset_draft_probs_valid_for_capture(spec_metadata)
+
         if num_gens > 0:
             with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
                 hidden_states_out = draft_model.model(**inputs)
@@ -283,14 +288,13 @@ class PARDWorker(SpecWorkerBase):
                 vocab_size = gen_logits.shape[-1]
                 gen_logits = gen_logits.reshape(num_gens, self.max_draft_len, vocab_size)
 
-                # Use torch.argmax directly to avoid cute_argmax stride issues
                 d2t = getattr(draft_model.model, "d2t", None)
-                gen_draft_tokens = torch.argmax(gen_logits, dim=-1, keepdim=False).long()
 
-                if d2t is not None:
-                    gen_draft_tokens = d2t[gen_draft_tokens] + gen_draft_tokens
-
-                gen_draft_tokens = gen_draft_tokens.type(torch.int32)
+                # Produce the K block draft tokens (rejection path for non-greedy
+                # batches; argmax otherwise).
+                gen_draft_tokens = self.produce_block_draft_tokens(
+                    gen_logits, spec_metadata, num_contexts, batch_size, d2t
+                )
 
                 if self.sa_enhancer is not None and sa_manager is not None:
                     gen_draft_tokens = self.sa_enhancer.maybe_override_all_draft_tokens(

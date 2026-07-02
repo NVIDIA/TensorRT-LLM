@@ -1170,8 +1170,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         draft_tokens = spec_metadata.draft_tokens.reshape(
             num_gens, runtime_draft_len) if num_gens > 0 else torch.empty(
                 0, runtime_draft_len, dtype=torch.int, device=logits.device)
-        return self._accept_draft_tokens(logits, draft_tokens, num_contexts,
-                                         batch_size, spec_metadata)
+        return self.compare_and_accept(logits, draft_tokens, num_contexts,
+                                       batch_size, spec_metadata)
 
     def draft_decoder(
         self,
@@ -1239,11 +1239,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 and self.model_config.mapping.tp_size > 1
                 and not self.model_config.mapping.enable_attention_dp):
             logits = allgather(logits, self.model_config.mapping, dim=-1)
-        if spec_metadata.use_rejection_sampling and draft_step is not None:
-            return self._draft_sampler_advanced_for_rejection(
-                logits, spec_metadata, batch_size, d2t, draft_step)
-        return self._draft_sampler_advanced(logits, spec_metadata, batch_size,
-                                            d2t)
+        return self.sample_draft(logits,
+                                 spec_metadata,
+                                 batch_size,
+                                 d2t=d2t,
+                                 draft_step=draft_step)
 
     def prepare_1st_drafter_inputs(
         self,

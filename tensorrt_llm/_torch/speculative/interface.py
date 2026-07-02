@@ -474,7 +474,6 @@ class SpecMetadata:
     skip_temperature: bool = False
     skip_top_k: bool = False
     skip_top_p: bool = False
-    has_greedy_requests: bool = False
     # Pre-computed top_k_max scalar (CPU-side) to avoid CUDA-graph-incompatible
     # dynamic boolean tensor indexing inside verify_dynamic_tree_rejection_from_logits_out.
     top_k_max: int = 0
@@ -486,6 +485,10 @@ class SpecMetadata:
     use_sampling_params_for_draft_tokens: bool = False
     # Vocab size used for draft_probs buffer allocation.
     vocab_size: int = 0
+    # Draft-model vocab size. full_draft_probs is allocated only when it differs
+    # from vocab_size; 0 (unknown) or a value equal to vocab_size means shared
+    # vocab and skips the buffer.
+    draft_vocab_size: int = 0
     # Draft probabilities buffer for rejection sampling, indexed by py_seq_slot
     # so per-request data is stable across iterations regardless of batch
     # composition shifts (chunking ctx, gen completion, new ctx joining).
@@ -502,50 +505,57 @@ class SpecMetadata:
     batch_slot_ids: Optional[torch.Tensor] = None
     # Draft-to-target vocab offset tensor.
     d2t: Optional[torch.Tensor] = None
-    # Pre-allocated scratch for draft probs expanded to the target vocab size.
-    # Filled with zeros once at prepare(); each rejection iter only overwrites
-    # the positions selected by d2t (or [:draft_vocab] when there is no d2t),
-    # so the zeros outside those positions persist across iterations and we
-    # avoid a per-iter 64 MB zero-fill on the (max_num_requests, max_draft_len,
-    # vocab_size) tensor. Shape: [max_num_requests, max_draft_len, vocab_size].
+    # Draft probs expanded to the target vocab size. Zero-filled once at
+    # prepare(); each rejection iter overwrites only the d2t-selected positions
+    # (or [:draft_vocab] when there is no d2t).
+    # Shape: [max_num_requests, max_draft_len, vocab_size].
     full_draft_probs: Optional[torch.Tensor] = None
-    # Cached d2t-projected target vocab indices, computed once on first use
-    # (d2t is a model-static tensor). Replaces the per-iter
-    # arange + (source + d2t) % vocab_size kernel sequence inside the d2t
-    # padding step. Shape: [draft_vocab_size], dtype long.
+    # Cached d2t-projected target vocab indices, computed once on first use.
+    # Shape: [draft_vocab_size], dtype long.
     d2t_target_indices: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         pass
 
+    def prepare_rejection_sampling_buffers(self):
+        """
+        Allocate the slot-indexed buffers used by one-model rejection sampling.
+
+        Idempotent and gated on ``use_rejection_sampling``.
+        """
+        if not self.use_rejection_sampling:
+            return
+
+        # Extra scratch row at index ``max_num_requests`` absorbs CUDA-graph
+        # dummy/padding requests (``py_seq_slot is None``); real slots are in
+        # ``[0, max_num_requests)``.
+        num_slot_rows = self.max_num_requests + 1
+
+        if self.draft_probs is None and self.vocab_size > 0:
+            # [slot, draft_step, vocab]: scatter/gather by stable slot id.
+            self.draft_probs = torch.empty(
+                (num_slot_rows, self.max_draft_len, self.vocab_size),
+                dtype=torch.float32,
+                device='cuda')
+            self.draft_probs_vocab_size = self.vocab_size
+        if self.batch_slot_ids is None and self.max_num_requests > 0:
+            self.batch_slot_ids = torch.empty((self.max_num_requests, ),
+                                              dtype=torch.long,
+                                              device='cuda')
+        # full_draft_probs (d2t-expanded) is read only when draft and target
+        # vocabularies differ; skip it otherwise. Zero-filled once.
+        if (self.full_draft_probs is None and self.vocab_size > 0
+                and self.draft_vocab_size not in (0, self.vocab_size)):
+            self.full_draft_probs = torch.zeros(
+                (num_slot_rows, self.max_draft_len, self.vocab_size),
+                dtype=torch.float32,
+                device='cuda')
+
     def prepare(self):
         """
         Hook to be called before the forward step of the model.
         """
-        if (self.use_rejection_sampling and self.draft_probs is None
-                and self.vocab_size > 0):
-            # 3D [slot, draft_step, vocab] so we can scatter/gather by slot id
-            # and avoid the brittle "batch position == buffer position" mapping.
-            self.draft_probs = torch.empty(
-                (self.max_num_requests, self.max_draft_len, self.vocab_size),
-                dtype=torch.float32,
-                device='cuda')
-            self.draft_probs_vocab_size = self.vocab_size
-        if (self.use_rejection_sampling and self.batch_slot_ids is None
-                and self.max_num_requests > 0):
-            self.batch_slot_ids = torch.empty((self.max_num_requests, ),
-                                              dtype=torch.long,
-                                              device='cuda')
-        if (self.use_rejection_sampling and self.full_draft_probs is None
-                and self.vocab_size > 0):
-            # Zero-fill once. Subsequent iters only overwrite the d2t-mapped
-            # positions (constant across iters since d2t is model-static), so
-            # untouched positions stay 0 forever — saves the per-iter 64 MB
-            # zero-fill in _sample_and_accept_draft_tokens_rejection.
-            self.full_draft_probs = torch.zeros(
-                (self.max_num_requests, self.max_draft_len, self.vocab_size),
-                dtype=torch.float32,
-                device='cuda')
+        self.prepare_rejection_sampling_buffers()
 
     def create_cuda_graph_metadata(self, max_batch_size: int):
         """
@@ -580,8 +590,8 @@ class SpecMetadata:
     ) -> tuple[list[tuple[float, int, float, int]], list[int]]:
         """Single source of truth for one-engine sampling-param detection.
 
-        Scans the batch's sampling configs and sets skip_*/has_greedy_requests/
-        is_all_greedy_sample (honoring the warmup capture override). Returns
+        Scans the batch's sampling configs and sets skip_*/is_all_greedy_sample
+        (honoring the warmup capture override). Returns
         ``(per_request_normalized, per_request_slot_ids)`` for buffer
         population. Does NOT allocate or fill GPU buffers, so it is safe to call
         before the CUDA graph key is built.
@@ -639,7 +649,7 @@ class SpecMetadata:
         temperature_enabled = False
         top_k_enabled = False
         top_p_enabled = False
-        has_greedy_requests = False
+        has_non_greedy_requests = False
         per_request_slot_ids: list[int] = []
 
         for request in requests:
@@ -668,32 +678,30 @@ class SpecMetadata:
             temperature_enabled |= use_temperature
             top_k_enabled |= use_top_k
             top_p_enabled |= use_top_p
-            has_greedy_requests |= is_greedy
+            has_non_greedy_requests |= not is_greedy
 
             per_request_normalized.append(
                 (temp_val, tk_val, tp_val, num_tokens))
-            # py_seq_slot is a stable per-request id used to scatter / gather
-            # draft probs across iterations. Dummies / unallocated slots fall
-            # back to 0 (any valid index is fine — the data at that slot will
-            # be overwritten on the next real iteration before being read).
+            # py_seq_slot is a stable per-request id used to scatter/gather draft
+            # probs across iterations. Dummy/padding requests (py_seq_slot is
+            # None) route to the scratch row at index max_num_requests.
             per_request_slot_ids.append(
-                request.py_seq_slot if request.py_seq_slot is not None else 0)
+                request.py_seq_slot if request.
+                py_seq_slot is not None else self.max_num_requests)
 
         self.skip_temperature = not temperature_enabled
         self.skip_top_k = not top_k_enabled
         self.skip_top_p = not top_p_enabled
-        self.has_greedy_requests = has_greedy_requests
         # Used in the CUDA graph key to pick the argmax / advanced variant.
-        self.is_all_greedy_sample = (self.skip_temperature and self.skip_top_k
-                                     and self.skip_top_p)
+        # All-greedy iff EVERY request is greedy. Derived from per-request
+        # greediness, not from the skip_* filter flags (a non-greedy request may
+        # enable no filter, e.g. temperature=1.0 with top_k/top_p unset).
+        self.is_all_greedy_sample = not has_non_greedy_requests
 
-        # Warmup-time override (set via runtime attribute by the model engine):
-        # force the advanced-sampling code path so the CUDA graph for the
-        # (is_all_greedy_sample=False) key gets captured. Dummy warmup requests
-        # carry no sampling params, so the natural detection above always
-        # returns True; this branch substitutes synthetic non-greedy scalars
-        # into the per-request data and lets Phase 2 run normally to populate
-        # the GPU buffers used by the captured kernels.
+        # Warmup-time override: force the advanced-sampling path so the CUDA
+        # graph for the (is_all_greedy_sample=False) key gets captured. Dummy
+        # warmup requests carry no sampling params, so substitute synthetic
+        # non-greedy scalars to populate the GPU buffers.
         if getattr(self, '_force_non_greedy_for_capture', False):
             self.skip_temperature = False
             self.skip_top_k = False
@@ -711,13 +719,8 @@ class SpecMetadata:
 
         Must be called BEFORE the CUDA graph key is built (the key includes
         ``is_all_greedy_sample`` to choose the argmax vs advanced-sampling graph
-        variant). ``populate_sampling_params_for_one_model`` runs later, inside
-        ``_prepare_inputs``, and re-derives the same flag while filling the GPU
-        sampling buffers. Computing the flag here first keeps the selected graph
-        consistent with the buffers ``populate`` fills; otherwise the key would
-        use the previous iteration's stale value and could replay the advanced
-        graph against unpopulated (greedy) buffers, which can hang/corrupt the
-        run (notably for MTP with num_nextn>=2).
+        variant), so the selected graph stays consistent with the buffers
+        ``populate_sampling_params_for_one_model`` fills later.
         """
         if not self.spec_dec_mode.use_one_engine():
             return
@@ -734,6 +737,11 @@ class SpecMetadata:
         """
         if not self.spec_dec_mode.use_one_engine():
             return
+
+        # Allocate the rejection buffers before copying py_seq_slot values into
+        # batch_slot_ids below; this runs earlier than prepare() in the
+        # model-engine flow. No-op unless use_rejection_sampling is set.
+        self.prepare_rejection_sampling_buffers()
 
         if self.temperatures is None:
             # Ensures determinism across ranks.
@@ -1171,18 +1179,120 @@ class SpecWorkerBase(nn.Module, ABC):
             stored_vocab = (spec_metadata.draft_probs_last_dim
                             if spec_metadata.draft_probs_last_dim > 0 else
                             spec_metadata.draft_probs_vocab_size)
-            # Gather the slot rows for the gen subset. The buffer was filled
-            # at the previous draft step indexed by py_seq_slot, so each gen
-            # request reads back exactly its own probs, regardless of batch
-            # composition changes since then.
-            gen_slot_ids = spec_metadata.batch_slot_ids[num_contexts:batch_size]
-            draft_probs = spec_metadata.draft_probs[
-                gen_slot_ids, :draft_len, :stored_vocab]
-            return self._sample_and_accept_draft_tokens_rejection(
-                logits, draft_tokens, draft_probs, num_contexts, batch_size,
-                spec_metadata)
+            # Fail closed: run the rejection kernel only when every buffer is
+            # present and correctly shaped; otherwise fall back to strict
+            # acceptance. draft_probs_valid is reset so stale state is not reused.
+            if self._rejection_buffers_valid(draft_tokens, draft_len,
+                                             stored_vocab, num_contexts,
+                                             batch_size, logits, spec_metadata):
+                # Gather the gen subset's slot rows, filled at the previous draft
+                # step indexed by py_seq_slot.
+                gen_slot_ids = spec_metadata.batch_slot_ids[
+                    num_contexts:batch_size]
+                draft_probs = spec_metadata.draft_probs[
+                    gen_slot_ids, :draft_len, :stored_vocab]
+                return self._sample_and_accept_draft_tokens_rejection(
+                    logits, draft_tokens, draft_probs, num_contexts, batch_size,
+                    spec_metadata)
+            spec_metadata.draft_probs_valid = False
         return self._sample_and_accept_draft_tokens_base(
             logits, draft_tokens, num_contexts, batch_size, spec_metadata)
+
+    def maybe_gather_sharded_draft_logits(self, logits, spec_metadata, mapping):
+        """All-gather TP-sharded draft logits to full vocab before advanced sampling.
+
+        Advanced (non-greedy) draft sampling needs the full-vocab distribution.
+        Gathers shards only for a non-greedy batch under plain TP when the logits
+        are sharded (``shape[-1] < vocab_size``); replicated full-vocab logits
+        are returned unchanged.
+        """
+        if (spec_metadata is not None and not spec_metadata.is_all_greedy_sample
+                and mapping is not None and getattr(mapping, "tp_size", 1) > 1
+                and not getattr(mapping, "enable_attention_dp", False)):
+            full_vocab = getattr(spec_metadata, "vocab_size", 0) or 0
+            if full_vocab and logits.shape[-1] < full_vocab:
+                from ..distributed.ops import allgather
+                return allgather(logits, mapping, dim=-1)
+        return logits
+
+    def sample_draft(self,
+                     logits: torch.Tensor,
+                     spec_metadata: "SpecMetadata",
+                     batch_size: int,
+                     d2t: Optional[torch.Tensor] = None,
+                     draft_step: Optional[int] = None):
+        """Public one-model draft-token sampler with internal rejection routing.
+
+        Shared entry point for one-model speculative workers:
+
+        - Rejection enabled with a ``draft_step``: sample via probs and scatter
+          the per-request distribution into the slot-indexed ``draft_probs``
+          buffer (producer side). The all-greedy case returns argmax internally.
+        - Otherwise: plain advanced sampling without storing probabilities.
+        """
+        if spec_metadata.use_rejection_sampling and draft_step is not None:
+            return self._draft_sampler_advanced_for_rejection(
+                logits, spec_metadata, batch_size, d2t, draft_step)
+        return self._draft_sampler_advanced(logits, spec_metadata, batch_size,
+                                            d2t)
+
+    def compare_and_accept(self, logits, draft_tokens, num_contexts, batch_size,
+                           spec_metadata):
+        """Shared public acceptance interface for one-model workers.
+
+        A thin wrapper over ``_accept_draft_tokens`` so every one-model worker
+        routes acceptance through a single named entry point. Returns
+        ``(accepted_tokens, num_accepted_tokens)``.
+        """
+        return self._accept_draft_tokens(logits, draft_tokens, num_contexts,
+                                         batch_size, spec_metadata)
+
+    def reset_draft_probs_valid_for_capture(self, spec_metadata):
+        """Clear the producer->consumer ``draft_probs_valid`` flag at the start
+        of every draft forward (when rejection is enabled), so it is trusted
+        only after the current forward finishes scattering its draft probs. This
+        fails closed across batch-composition changes: a pure-context or
+        partial/failed capture cannot leave a stale True for the next forward's
+        acceptance. The worker re-sets it to True only after a full capture.
+        """
+        if getattr(spec_metadata, "use_rejection_sampling", False):
+            spec_metadata.draft_probs_valid = False
+
+    def _rejection_buffers_valid(self, draft_tokens, draft_len, stored_vocab,
+                                 num_contexts, batch_size, logits,
+                                 spec_metadata) -> bool:
+        """Fail-closed guard: return True only when the slot-indexed draft-prob
+        buffers exist and every shape the rejection path dereferences is valid;
+        otherwise the caller falls back to strict acceptance. Inspects only
+        host-side tensor shapes -- no ``.item()`` / value read on CUDA tensors --
+        so it stays CUDA-graph-capture safe.
+        """
+        draft_probs = spec_metadata.draft_probs
+        batch_slot_ids = spec_metadata.batch_slot_ids
+        if draft_probs is None or batch_slot_ids is None:
+            return False
+        if stored_vocab <= 0:
+            return False
+        num_gens = batch_size - num_contexts
+        # draft_probs must cover the slice [:, :draft_len, :stored_vocab].
+        if draft_probs.dim() != 3:
+            return False
+        if draft_probs.shape[1] < draft_len or draft_probs.shape[
+                2] < stored_vocab:
+            return False
+        if draft_tokens.dim() != 2 or draft_tokens.shape[0] != num_gens:
+            return False
+        # logits must cover context rows (1 each) + gen rows (draft_len + 1 each).
+        logits_rows = logits.shape[0] if logits.dim() > 1 else 1
+        if logits_rows < num_contexts + num_gens * (draft_len + 1):
+            return False
+        # Slot ids for the gen subset must exist (range safety is guaranteed by
+        # construction).
+        if batch_slot_ids.shape[0] < batch_size:
+            return False
+        if batch_slot_ids[num_contexts:batch_size].shape[0] != num_gens:
+            return False
+        return True
 
     def _can_use_rejection_sampling(self, spec_metadata: SpecMetadata) -> bool:
         # Skip rejection sampling when the whole batch is greedy: the accepted
@@ -1268,14 +1378,15 @@ class SpecWorkerBase(nn.Module, ABC):
                 f"{runtime_draft_len}")
             d2t = getattr(spec_metadata, "d2t", None)
             if draft_vocab_size != vocab_size:
-                # Use the pre-allocated buffer from spec_metadata.prepare()
-                # (zero-filled once at init; untouched positions stay 0).
-                # Falls back to per-iter allocation if the buffer is not
-                # configured, e.g. when use_rejection_sampling was off at
-                # prepare() time.
                 if spec_metadata.full_draft_probs is not None:
-                    full_draft_probs = spec_metadata.full_draft_probs[:num_gens]
+                    # Slice to runtime_draft_len so the max_draft_len buffer
+                    # never passes stale extra rows to the rejection kernel.
+                    full_draft_probs = spec_metadata.full_draft_probs[:
+                                                                      num_gens, :
+                                                                      runtime_draft_len]
                 else:
+                    # Buffer not pre-allocated (e.g. rejection off at prepare()):
+                    # fall back to a per-iter allocation.
                     full_draft_probs = torch.zeros(
                         (num_gens, runtime_draft_len, vocab_size),
                         dtype=torch.float32,
@@ -1478,6 +1589,130 @@ class SpecWorkerBase(nn.Module, ABC):
             draft_tokens = d2t[draft_tokens] + draft_tokens
 
         return draft_tokens.type(torch.int32)
+
+    def sample_draft_block(self,
+                           gen_logits: torch.Tensor,
+                           spec_metadata: "SpecMetadata",
+                           num_contexts: int,
+                           batch_size: int,
+                           d2t: Optional[torch.Tensor] = None):
+        """Block draft sampler for gen-only workers (PARD, DFLASH).
+
+        Block counterpart of ``sample_draft``: these methods produce all ``K``
+        draft positions per gen request in one forward as ``[num_gens, K, vocab]``
+        logits. Samples the K positions and scatters their distributions into
+        ``draft_probs[gen_slot_ids, 0:K, :]`` (gen-only; context rows have no
+        draft logits). All-greedy batches take the argmax path with no scatter.
+        ``d2t`` remaps the returned token ids to target vocab; stored probs stay
+        in draft-vocab space (the rejection consumer expands via d2t). Returns
+        ``[num_gens, K]`` int32 draft token ids.
+        """
+        num_gens, K, vocab = gen_logits.shape
+        if num_gens == 0:
+            return torch.empty((0, K),
+                               dtype=torch.int32,
+                               device=gen_logits.device)
+
+        if spec_metadata.is_all_greedy_sample:
+            draft_tokens = torch.argmax(gen_logits, dim=-1)
+            if d2t is not None:
+                draft_tokens = d2t[draft_tokens] + draft_tokens
+            return draft_tokens.type(torch.int32)
+
+        # Take the gen slice and repeat each request's value K times to line up
+        # with the flattened [num_gens*K, vocab] logits (K rows per request).
+        temps = spec_metadata.request_temperatures[
+            num_contexts:batch_size].repeat_interleave(K)
+        top_ks = spec_metadata.request_top_ks[
+            num_contexts:batch_size].repeat_interleave(K)
+        top_ps = spec_metadata.request_top_ps[
+            num_contexts:batch_size].repeat_interleave(K)
+
+        if self.seed is None:
+            self.seed = torch.tensor([0],
+                                     dtype=torch.int64,
+                                     device=gen_logits.device)
+            self.offset = torch.tensor([0],
+                                       dtype=torch.int64,
+                                       device=gen_logits.device)
+        self.seed += 1
+        self.seed %= (2**31)
+
+        flat_logits = gen_logits.reshape(num_gens * K, vocab)
+        flat_tokens, flat_probs = sampling_batch_spec_dec_one_model_for_rejection(
+            flat_logits,
+            temps,
+            top_ks,
+            top_ps,
+            seed=self.seed,
+            offset=self.offset,
+        )
+
+        # Scatter the K prob rows per gen request into its slot row. Only when
+        # rejection is enabled (draft_probs allocated).
+        if (getattr(spec_metadata, "use_rejection_sampling", False)
+                and spec_metadata.draft_probs is not None):
+            assert spec_metadata.batch_slot_ids is not None, (
+                "batch_slot_ids must be populated before block draft prob storage"
+            )
+            gen_slot_ids = spec_metadata.batch_slot_ids[num_contexts:batch_size]
+            probs = flat_probs.reshape(num_gens, K, vocab)
+            spec_metadata.draft_probs[gen_slot_ids, :K, :vocab] = probs
+            spec_metadata.draft_probs_last_dim = vocab
+
+        draft_tokens = flat_tokens.reshape(num_gens, K)
+        if d2t is not None:
+            draft_tokens = d2t[draft_tokens] + draft_tokens
+        return draft_tokens.type(torch.int32)
+
+    def produce_block_draft_tokens(self, gen_logits, spec_metadata,
+                                   num_contexts, batch_size, d2t):
+        """Shared block draft-token production for gen-only workers (PARD, DFLASH).
+
+        A non-greedy batch takes the advanced ``sample_draft_block`` path
+        (honoring sampling params; marks ``draft_probs`` valid only for a
+        pure-gen batch); an all-greedy batch takes block argmax. Returns
+        ``[num_gens, K]`` int32 draft tokens.
+        """
+        if not spec_metadata.is_all_greedy_sample:
+            gen_logits = self.maybe_gather_sharded_draft_logits(
+                gen_logits, spec_metadata, self.mapping)
+            gen_draft_tokens = self.sample_draft_block(gen_logits,
+                                                       spec_metadata,
+                                                       num_contexts,
+                                                       batch_size,
+                                                       d2t=d2t).long()
+            if getattr(spec_metadata, "use_rejection_sampling", False):
+                # d2t for acceptance-side vocab expansion; valid only for a
+                # pure-gen batch.
+                spec_metadata.d2t = d2t.data if d2t is not None else None
+                spec_metadata.draft_probs_valid = num_contexts == 0
+        else:
+            gen_draft_tokens = torch.argmax(gen_logits, dim=-1,
+                                            keepdim=False).long()
+            if d2t is not None:
+                gen_draft_tokens = d2t[gen_draft_tokens] + gen_draft_tokens
+        return gen_draft_tokens.type(torch.int32)
+
+    def produce_step_draft_token(self, logits, spec_metadata, batch_size,
+                                 draft_step, d2t, mapping, greedy_fn):
+        """Shared per-step draft-token production for step workers (MTP, DraftTarget).
+
+        A non-greedy batch takes the advanced ``sample_draft`` path (honoring
+        temperature/top_k/top_p, scattering this step's distribution into
+        ``draft_probs`` when rejection is on); an all-greedy batch calls
+        ``greedy_fn(logits)``. ``mapping`` is the worker's LM-head TP mapping.
+        """
+        if (spec_metadata is not None and not spec_metadata.is_all_greedy_sample
+                and draft_step is not None):
+            logits = self.maybe_gather_sharded_draft_logits(
+                logits, spec_metadata, mapping)
+            return self.sample_draft(logits,
+                                     spec_metadata,
+                                     batch_size,
+                                     d2t=d2t,
+                                     draft_step=draft_step)
+        return greedy_fn(logits)
 
     def _execute_guided_decoder_if_present(self, logits):
         """Execute guided decoder on target model logits if available."""

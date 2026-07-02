@@ -184,6 +184,10 @@ class MTPSpecMetadata(SpecMetadata):
 
     def prepare(self):
         assert self.request_ids is not None
+        # Allocate the slot-indexed rejection-sampling buffers (draft_probs,
+        # batch_slot_ids, full_draft_probs). No-op unless use_rejection_sampling
+        # is set.
+        self.prepare_rejection_sampling_buffers()
         num_seqs = len(self.request_ids)
         # update batch indices
         batch_indices = torch.arange(num_seqs,
@@ -439,6 +443,15 @@ class MTPWorker(SpecWorkerBase):
         last_tokens_idx = torch.cumsum(
             attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
 
+        # Rejection sampling captures each draft step's sampling distribution
+        # into the slot-indexed spec_metadata.draft_probs buffer. Engaged only
+        # for non-greedy batches; all-greedy batches use the argmax path.
+        use_rejection = (getattr(spec_metadata, "use_rejection_sampling", False)
+                         and not spec_metadata.is_all_greedy_sample)
+        self.reset_draft_probs_valid_for_capture(spec_metadata)
+        # Vanilla MTP shares the target vocabulary; no draft->target remap (d2t).
+        draft_d2t = None
+
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(
             resource_manager)
 
@@ -460,7 +473,11 @@ class MTPWorker(SpecWorkerBase):
                     self.guided_decoder.execute_draft_batch(logits,
                                                             draft_step=i)
 
-                new_draft_token = self.draft_sampler(logits)
+                # Rejection path stores this step's distribution; greedy uses
+                # the plain draft_sampler.
+                new_draft_token = self.produce_step_draft_token(
+                    logits, spec_metadata, batch_size, i, draft_d2t,
+                    self.model_config.mapping, self.draft_sampler)
                 next_draft_tokens.append(new_draft_token)
                 # shift input_ids and hidden_states
                 input_ids = draft_inputs["input_ids"]
@@ -477,6 +494,11 @@ class MTPWorker(SpecWorkerBase):
                     "attn_metadata": draft_inputs["attn_metadata"],
                 }
             next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
+
+        # Mark draft_probs valid so the next forward's acceptance can use
+        # rejection sampling.
+        if use_rejection:
+            spec_metadata.draft_probs_valid = True
 
         # Override with SA draft tokens after all MTP layers have run,
         # so that MTP layers never see SA tokens in their inputs.
@@ -828,6 +850,18 @@ class MTPWorker(SpecWorkerBase):
             num_accepted_tokens = self._apply_force_accepted_tokens(
                 num_accepted_tokens, num_contexts,
                 spec_metadata.runtime_draft_len)
+
+        # Rejection sampling acceptance. _can_use_rejection_sampling() requires
+        # use_rejection_sampling, draft_probs_valid, and a non-all-greedy batch;
+        # otherwise falls through to strict acceptance below. Context rows take
+        # the target's first sampled token; gen rows run the rejection kernel.
+        elif self._can_use_rejection_sampling(spec_metadata):
+            draft_tokens = spec_metadata.draft_tokens.reshape(
+                num_gens, mtp_num_modules)
+            # compare_and_accept() already applies _apply_force_accepted_tokens()
+            # internally; do not apply it again here.
+            accepted_tokens, num_accepted_tokens = self.compare_and_accept(
+                logits, draft_tokens, num_contexts, batch_size, spec_metadata)
 
         # Strict acceptance
         else:
