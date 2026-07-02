@@ -78,8 +78,8 @@ class FilteredTopKKernelVarlenPrefill(FilteredTopKKernelVarlen):
         #   s_input_idx      num_buffer × S × sizeof(index_type)
         #
         # Solving 1920 + 2048*idx_sz + num_buffer*S*idx_sz <= 65536:
-        #   fp32 / Uint16  (num_buffer=2, idx=2B): S <= 7440  → pow2 cap 8192
-        #   fp32 / Uint32  (num_buffer=2, idx=4B): S <= 6928  → pow2 cap 4096
+        #   fp32 / Uint16  (num_buffer=2, idx=2B): S <= 14880 → pow2 cap 8192
+        #   fp32 / Uint32  (num_buffer=2, idx=4B): S <=  6928 → pow2 cap 4096
         #   bf16 / Uint16  (num_buffer=1, idx=2B): S <= 29760 → pow2 cap 16384
         #   bf16 / Uint32  (num_buffer=1, idx=4B): S <= 13856 → pow2 cap 8192
         #
@@ -92,13 +92,8 @@ class FilteredTopKKernelVarlenPrefill(FilteredTopKKernelVarlen):
         self.filtered_topk_smem_input_size = min(max_S, self.max_num_cols)
         self.enable_gmem_store = self.max_num_cols > self.filtered_topk_smem_input_size
 
-        # Cap at 512 threads for large-occupancy path.  Do NOT override upward:
-        # the parent class picks the thread count to match the tile width, so
-        # forcing 512 threads when the parent chose 256 (e.g. bf16 num_cols<=4096)
-        # makes half the threads process OOB elements, wasting work and SMEM atomics.
-        # Cap at 512 to prevent 1024-thread blocks which hurt SMEM occupancy on
-        # large fp32 configs (s_input_idx can reach 32 KB).
-        self.num_threads_per_cta = min(self.num_threads_per_cta, 512)
+        # Always 512 threads for large-occupancy path.
+        self.num_threads_per_cta = 512
 
         if debug:
             print(f"dtype: {self.dtype}, vec_size: {self.vec_size}")

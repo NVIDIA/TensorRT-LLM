@@ -150,62 +150,89 @@ def compare_top_k_results(
     Returns:
         True if results match within tolerance, False otherwise
     """
-    num_rows = cuda_indices.shape[0]
+    # --- vectorized implementation (no per-row .item() syncs) ---
+    row_lengths = row_ends - row_starts  # [num_rows]
+    expected_valid = torch.minimum(row_lengths, torch.full_like(row_lengths, top_k))
 
-    # Calculate valid lengths for each row (vectorized)
-    row_lengths = row_ends - row_starts
+    cuda_valid_counts = (cuda_indices != -1).sum(dim=1)
+    torch_valid_counts = (torch_indices != -1).sum(dim=1)
 
-    for row_idx in range(num_rows):
-        row_len = row_lengths[row_idx].item()
-        expected_valid = min(row_len, top_k)
+    # Count mismatch between cuda and torch
+    mismatch = (cuda_valid_counts != torch_valid_counts).nonzero(as_tuple=True)[0]
+    if mismatch.numel() > 0:
+        row_idx = mismatch[0].item()
+        print(
+            f"Row {row_idx}: Different number of valid indices - "
+            f"CUDA: {cuda_valid_counts[row_idx].item()}, "
+            f"PyTorch: {torch_valid_counts[row_idx].item()}"
+        )
+        return False
 
-        cuda_row = cuda_indices[row_idx]
-        torch_row = torch_indices[row_idx]
+    # Count mismatch vs expected
+    wrong = (cuda_valid_counts != expected_valid).nonzero(as_tuple=True)[0]
+    if wrong.numel() > 0:
+        row_idx = wrong[0].item()
+        print(
+            f"Row {row_idx}: Expected {expected_valid[row_idx].item()} valid indices, "
+            f"got {cuda_valid_counts[row_idx].item()}"
+        )
+        return False
 
-        cuda_valid_mask = cuda_row != -1
-        torch_valid_mask = torch_row != -1
+    # Value check: safe gather (-1 → 0), add row_start, gather logits, mask invalid → -inf, sort, compare.
+    # cuda_indices and torch_indices may have different column counts (e.g. decode path where
+    # torch_indices is built with min(top_k, max_row_len) columns), so use separate masks.
+    cuda_invalid = cuda_indices == -1
+    torch_invalid = torch_indices == -1
 
-        cuda_valid = cuda_row[cuda_valid_mask]
-        torch_valid = torch_row[torch_valid_mask]
+    cuda_safe = cuda_indices.clone()
+    torch_safe = torch_indices.clone()
+    cuda_safe[cuda_invalid] = 0
+    torch_safe[torch_invalid] = 0
 
-        if cuda_valid.shape[0] != torch_valid.shape[0]:
-            print(
-                f"Row {row_idx}: Different number of valid indices - "
-                f"CUDA: {cuda_valid.shape[0]}, PyTorch: {torch_valid.shape[0]}"
+    cuda_abs = cuda_safe.long() + row_starts.unsqueeze(1)
+    torch_abs = torch_safe.long() + row_starts.unsqueeze(1)
+
+    cuda_vals = logits.gather(1, cuda_abs)
+    torch_vals = logits.gather(1, torch_abs)
+    cuda_vals[cuda_invalid] = float("-inf")
+    torch_vals[torch_invalid] = float("-inf")
+
+    cuda_sorted = cuda_vals.sort(dim=1, descending=True).values
+    torch_sorted = torch_vals.sort(dim=1, descending=True).values
+
+    # Build per-tensor position masks (first expected_valid[i] positions per row).
+    # Flattening both gives the same element count because counts were verified equal above.
+    cuda_k = cuda_indices.shape[1]
+    torch_k = torch_indices.shape[1]
+    cuda_pos_mask = torch.arange(cuda_k, device=cuda_indices.device).unsqueeze(
+        0
+    ) < expected_valid.unsqueeze(1)
+    torch_pos_mask = torch.arange(torch_k, device=torch_indices.device).unsqueeze(
+        0
+    ) < expected_valid.unsqueeze(1)
+
+    if not torch.allclose(
+        cuda_sorted[cuda_pos_mask], torch_sorted[torch_pos_mask], rtol=tolerance, atol=tolerance
+    ):
+        bad = (cuda_k == torch_k) and (
+            (
+                ~torch.isclose(cuda_sorted, torch_sorted, rtol=tolerance, atol=tolerance)
+                & cuda_pos_mask
             )
-            return False
-
-        if cuda_valid.shape[0] != expected_valid:
-            print(
-                f"Row {row_idx}: Expected {expected_valid} valid indices, got {cuda_valid.shape[0]}"
-            )
-            return False
-
-        if cuda_valid.shape[0] == 0:
-            continue
-
-        row_start = row_starts[row_idx].item()
-        logits_row = logits[row_idx]
-
-        cuda_abs_indices = cuda_valid + row_start
-        torch_abs_indices = torch_valid + row_start
-
-        cuda_values = logits_row[cuda_abs_indices]
-        torch_values = logits_row[torch_abs_indices]
-
-        cuda_values_sorted, _ = torch.sort(cuda_values, descending=True)
-        torch_values_sorted, _ = torch.sort(torch_values, descending=True)
-
-        if not torch.allclose(
-            cuda_values_sorted, torch_values_sorted, rtol=tolerance, atol=tolerance
-        ):
+            .any(dim=1)
+            .nonzero(as_tuple=True)[0]
+        )
+        if bad is not False and bad.numel() > 0:
+            row_idx = bad[0].item()
+            cuda_valid = cuda_indices[row_idx][cuda_indices[row_idx] != -1]
+            torch_valid = torch_indices[row_idx][torch_indices[row_idx] != -1]
             cuda_set = set(cuda_valid.cpu().tolist())
             torch_set = set(torch_valid.cpu().tolist())
             if cuda_set != torch_set:
                 print("  Different indices selected:")
                 print(f"    Only in CUDA: {cuda_set - torch_set}")
                 print(f"    Only in Torch: {torch_set - cuda_set}")
-            return False
+        return False
 
     return True
 
