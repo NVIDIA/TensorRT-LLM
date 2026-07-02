@@ -21,6 +21,16 @@ def test_disaggregated_params_ctx_info_endpoint():
     assert params.ctx_info_endpoint == ["tcp://10.0.0.1:5000", "tcp://10.0.0.2:5000"]
 
 
+def test_receiver_ctx_info_endpoint_required():
+    from tensorrt_llm._torch.disaggregation.native.transfer import Receiver
+
+    receiver = object.__new__(Receiver)
+
+    with pytest.raises(ValueError, match="ctx_info_endpoint is required"):
+        receiver._validate_info_endpoint(None)
+    receiver._validate_info_endpoint("tcp://10.0.0.1:5000")
+
+
 @patch("tensorrt_llm.disaggregated_params.tllme")
 def test_get_context_phase_params(mock_tllme):
     mock_ctx_params = MagicMock()

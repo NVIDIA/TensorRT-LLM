@@ -97,6 +97,7 @@ class DisaggServerConfig():
     schedule_style: Literal['context_first',
                             'generation_first'] = 'context_first'
     allow_request_chat_template: bool = False
+    internal_request_auth_key: Optional[str] = None
 
 
 @dataclass
@@ -181,6 +182,7 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                            'context_first',
                            'generation_first'] = 'context_first',
                        allow_request_chat_template: bool = False,
+                       internal_request_auth_key: Optional[str] = None,
                        **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
     generation_servers = generation_servers or {}
@@ -230,6 +232,7 @@ def extract_disagg_cfg(hostname: str = 'localhost',
         config.schedule_style = schedule_style
     config.allow_request_chat_template = validate_config_bool(
         allow_request_chat_template, "allow_request_chat_template")
+    config.internal_request_auth_key = internal_request_auth_key
     return config
 
 
