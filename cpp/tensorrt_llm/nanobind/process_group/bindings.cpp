@@ -38,6 +38,11 @@ void initBindings(nb::module_& m)
             pg_utils::init_pg(common::get_intrusive_ptr<Pg, E>(world_pg_obj.ptr(), pybind11_abi),
                 common::get_intrusive_ptr<Pg, E>(local_pg_obj.ptr(), pybind11_abi));
         });
+
+    m.def("shutdown_pg", []() { pg_utils::shutdown_pg(); });
+
+    // Release references to pg_world/pg_local so they are properly destroyed.
+    nb::module_::import_("atexit").attr("register")(m.attr("shutdown_pg"));
 }
 
 } // namespace tensorrt_llm::nanobind::process_group
