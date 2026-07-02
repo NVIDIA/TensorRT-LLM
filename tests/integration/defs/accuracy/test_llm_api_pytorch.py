@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import sys
+import warnings
 from unittest import mock
 
 import pytest
@@ -85,23 +86,24 @@ from tensorrt_llm.llmapi._grouped_test_utils import \
     _reset_shared_session_torch_compile_state
 from tensorrt_llm.llmapi._grouped_test_utils import \
     shared_mpi_session as _shared_mpi_session
+from tensorrt_llm.llmapi._grouped_test_utils import \
+    submit_sync_per_worker as _submit_sync_per_worker
 
 
 @pytest.fixture(scope="module")
-def hf_weight_cache():
+def shared_mpi_session_4gpu():
+    # The weight-cache env only needs to be exported WHILE the pool spawns
+    # (workers snapshot TRTLLM*/TLLM* env at spawn; see hf_weight_cache_env).
+    # Scoping it to the spawn keeps TRTLLM_HF_WEIGHT_CACHE from leaking into
+    # non-grouped tests that run later in this module and spawn their own
+    # sessions.
+    session_gen = _shared_mpi_session(4)
     with _hf_weight_cache_env():
-        yield
-
-
-@pytest.fixture(scope="module")
-def shared_mpi_session_4gpu(hf_weight_cache):
-    # Ordering is load-bearing: the env must be exported before the pool
-    # spawns (see the hf_weight_cache_env docstring); the assertion makes a
-    # future fixture reorder fail loudly instead of silently regressing.
-    assert os.environ.get("TRTLLM_HF_WEIGHT_CACHE") == "1", (
-        "hf_weight_cache must be set up before the shared MPI pool spawns so "
-        "the workers inherit TRTLLM_HF_WEIGHT_CACHE at spawn time.")
-    yield from _shared_mpi_session(4)
+        mpi_session = next(session_gen)
+    try:
+        yield mpi_session
+    finally:
+        session_gen.close()
 
 
 @pytest.fixture(scope="module")
@@ -113,7 +115,15 @@ def shared_llm_4gpu(shared_mpi_session_4gpu):
         # session is still alive (this fixture tears down before
         # shared_mpi_session_4gpu), instead of relying on worker process exit.
         if shared_mpi_session_4gpu is not None:
-            shared_mpi_session_4gpu.submit_sync(_clear_worker_weight_cache)
+            try:
+                _submit_sync_per_worker(shared_mpi_session_4gpu,
+                                        _clear_worker_weight_cache)
+            except Exception as e:
+                # A failed case may have broken the pool; the session itself
+                # is torn down right after, so just surface the situation
+                # instead of masking the original test failure.
+                warnings.warn(
+                    f"weight-cache clear on shared MPI session failed: {e}")
 
 
 def _get_default_torch_compile_config(torch_compile):
@@ -2359,9 +2369,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         ids=[row[0] for row in _NVFP4_4GPU_PREMERGE_MATRIX],
     )
     def test_nvfp4_4gpus_premerge_grouped(self, case, shared_llm_4gpu):
-        # shared_llm_4gpu injects the shared 4-GPU MPI session and (transitively)
-        # depends on hf_weight_cache, so the weight-cache env is exported before
-        # the pool spawns (see the shared_mpi_session_4gpu fixture for details).
+        # shared_llm_4gpu injects the shared 4-GPU MPI session, whose fixture
+        # spawns the pool with the weight-cache env exported (see
+        # shared_mpi_session_4gpu for details).
         self._run_nvfp4_4gpus_case(make_llm=shared_llm_4gpu, **case)
 
     @pytest.mark.skip_less_device(4)

@@ -108,6 +108,15 @@ class GenerationExecutorProxy(GenerationExecutor):
                 logger_debug('create pool session ...\n', "yellow")
                 self.mpi_session = MpiPoolSession(n_workers=model_world_size)
         else:
+            # submit() launches one worker task per pool worker, so an
+            # external session must match the model's world size exactly;
+            # fail loudly instead of starting the wrong number of executors.
+            external_workers = getattr(mpi_session, "n_workers", None)
+            if (external_workers is not None
+                    and external_workers != model_world_size):
+                raise ValueError(
+                    f"External MPI session has {external_workers} workers but "
+                    f"the model needs world_size={model_world_size}.")
             logger_debug('using external mpi session ...\n', "yellow")
             self.mpi_session = mpi_session
 
@@ -441,7 +450,10 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         if ready_signal != GenerationExecutorProxy.READY_SIGNAL:
             logger.error(f"Executor worker initialization error: {error_trace}")
-            self.mpi_session.shutdown_abort(reason=ready_signal)
+            # Only abort a session this proxy created; an externally owned
+            # (shared) session must stay alive for its owner to tear down.
+            if self._owns_mpi_session:
+                self.mpi_session.shutdown_abort(reason=ready_signal)
             raise RuntimeError(
                 "Executor worker returned error") from ready_signal
 

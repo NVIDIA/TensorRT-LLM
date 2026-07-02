@@ -62,6 +62,34 @@ def mpi_session_kwargs(mpi_session) -> dict:
     return {"_mpi_session": mpi_session} if mpi_session is not None else {}
 
 
+def _run_on_worker_reporting_rank(fn) -> int:
+    fn()
+    from tensorrt_llm._utils import mpi_rank
+
+    return mpi_rank()
+
+
+def submit_sync_per_worker(mpi_session, fn, max_rounds: int = 8) -> None:
+    """Run ``fn`` at least once on EVERY worker of the pool.
+
+    ``MpiPoolSession.submit_sync`` enqueues ``n_workers`` tasks, but
+    ``MPIPoolExecutor`` gives no one-task-per-worker guarantee: a fast task can
+    be drained twice by one idle worker, leaving another untouched. Verify
+    coverage by collecting the worker ranks that actually ran ``fn`` and
+    resubmitting until all workers are covered.
+    """
+    expected = mpi_session.n_workers
+    seen: set = set()
+    for _ in range(max_rounds):
+        seen.update(mpi_session.submit_sync(_run_on_worker_reporting_rank, fn))
+        if len(seen) >= expected:
+            return
+    raise RuntimeError(
+        f"task only reached worker ranks {sorted(seen)} after {max_rounds} "
+        f"rounds; expected {expected} distinct workers"
+    )
+
+
 def reset_worker_torch_compile_state() -> None:
     """Reset per-worker torch.compile / Dynamo state (runs inside each worker).
 
@@ -89,7 +117,7 @@ def reset_shared_session_torch_compile_state(make_llm) -> None:
     """
     mpi_session = getattr(make_llm, "mpi_session", None)
     if mpi_session is not None:
-        mpi_session.submit_sync(reset_worker_torch_compile_state)
+        submit_sync_per_worker(mpi_session, reset_worker_torch_compile_state)
 
 
 def clear_worker_weight_cache() -> None:
