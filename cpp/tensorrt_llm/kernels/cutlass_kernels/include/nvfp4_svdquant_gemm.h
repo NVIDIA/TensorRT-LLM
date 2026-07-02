@@ -73,7 +73,7 @@ size_t nvfp4_svdquant_gemm_workspace_size(int m, int n, int k, int tactic = 0);
 
 void nvfp4_svdquant_gemm_run(void* out, void const* A, void const* B, void const* sfa, void const* sfb,
     float const* alpha, void const* D, void const* L1, void const* bias, int m, int n, int k, char* workspace,
-    size_t workspaceBytes, cudaStream_t stream, int tactic = 0, int64_t dStride = 32);
+    size_t workspaceBytes, cudaStream_t stream, int tactic = 0);
 
 } // namespace kernels::cutlass_kernels
 

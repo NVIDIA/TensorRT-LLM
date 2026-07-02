@@ -214,8 +214,8 @@ size_t workspace_size_for_tactic(int m, int n, int k, RuntimeTactic const& tacti
 
 template <class Config>
 void run_tactic(void* out, void const* A, void const* B, void const* sfa, void const* sfb, float const* alpha,
-    void const* D, int64_t dStride, void const* L1, void const* bias, int m, int n, int k, char* ws, size_t wsBytes,
-    cudaStream_t stream, RuntimeTactic const& tactic)
+    void const* D, void const* L1, void const* bias, int m, int n, int k, char* ws, size_t wsBytes, cudaStream_t stream,
+    RuntimeTactic const& tactic)
 {
     using Gemm = typename Config::Gemm;
     using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
@@ -234,7 +234,7 @@ void run_tactic(void* out, void const* A, void const* B, void const* sfa, void c
     // LoRA D[M,LoRaK] / L1[N,LoRaK] (bf16, row-major K-contiguous). 1/alpha is folded into L1.
     constexpr int64_t LoRaK = 32; // must match CollectiveMmaLoRA::LoRaK
     args.mainloop.ptr_D = static_cast<cutlass::bfloat16_t const*>(D);
-    args.mainloop.dD = cute::make_stride(dStride, cute::_1{}, int64_t(m) * dStride);
+    args.mainloop.dD = cute::make_stride(LoRaK, cute::_1{}, int64_t(m) * LoRaK);
     args.mainloop.ptr_L1 = static_cast<cutlass::bfloat16_t const*>(L1);
     args.mainloop.dL1 = cute::make_stride(LoRaK, cute::_1{}, int64_t(n) * LoRaK);
 
@@ -304,35 +304,35 @@ size_t nvfp4_svdquant_gemm_workspace_size(int m, int n, int k, int tactic)
 // collective. 1/alpha folded into L1 so the epilogue yields alpha*residual + D@L1ᵀ + bias.
 void nvfp4_svdquant_gemm_run(void* out, void const* A, void const* B, void const* sfa, void const* sfb,
     float const* alpha, void const* D, void const* L1, void const* bias, int m, int n, int k, char* ws, size_t wsBytes,
-    cudaStream_t stream, int tactic, int64_t dStride)
+    cudaStream_t stream, int tactic)
 {
     RuntimeTactic const runtime_tactic = resolve_tactic(tactic);
     switch (runtime_tactic.kernel_shape)
     {
     case KernelShape::k1Sm128x256x128:
         return run_tactic<Tactic1Sm128x256x128Config>(
-            out, A, B, sfa, sfb, alpha, D, dStride, L1, bias, m, n, k, ws, wsBytes, stream, runtime_tactic);
+            out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, ws, wsBytes, stream, runtime_tactic);
     case KernelShape::k2Sm256x256x128:
         return run_tactic<Tactic2Sm256x256x128Config>(
-            out, A, B, sfa, sfb, alpha, D, dStride, L1, bias, m, n, k, ws, wsBytes, stream, runtime_tactic);
+            out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, ws, wsBytes, stream, runtime_tactic);
     case KernelShape::k1Sm128x128x128:
         return run_tactic<Tactic1Sm128x128x128Config>(
-            out, A, B, sfa, sfb, alpha, D, dStride, L1, bias, m, n, k, ws, wsBytes, stream, runtime_tactic);
+            out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, ws, wsBytes, stream, runtime_tactic);
     case KernelShape::k2Sm256x192x128:
         return run_tactic<Tactic2Sm256x192x128Config>(
-            out, A, B, sfa, sfb, alpha, D, dStride, L1, bias, m, n, k, ws, wsBytes, stream, runtime_tactic);
+            out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, ws, wsBytes, stream, runtime_tactic);
     case KernelShape::k1Sm128x64x128:
         return run_tactic<Tactic1Sm128x64x128Config>(
-            out, A, B, sfa, sfb, alpha, D, dStride, L1, bias, m, n, k, ws, wsBytes, stream, runtime_tactic);
+            out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, ws, wsBytes, stream, runtime_tactic);
     case KernelShape::k1Sm128x128x256:
         return run_tactic<Tactic1Sm128x128x256Config>(
-            out, A, B, sfa, sfb, alpha, D, dStride, L1, bias, m, n, k, ws, wsBytes, stream, runtime_tactic);
+            out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, ws, wsBytes, stream, runtime_tactic);
     case KernelShape::k2Sm256x128x256:
         return run_tactic<Tactic2Sm256x128x256Config>(
-            out, A, B, sfa, sfb, alpha, D, dStride, L1, bias, m, n, k, ws, wsBytes, stream, runtime_tactic);
+            out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, ws, wsBytes, stream, runtime_tactic);
     case KernelShape::k2Sm256x256x256:
         return run_tactic<Tactic2Sm256x256x256Config>(
-            out, A, B, sfa, sfb, alpha, D, dStride, L1, bias, m, n, k, ws, wsBytes, stream, runtime_tactic);
+            out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, ws, wsBytes, stream, runtime_tactic);
     }
     throw std::invalid_argument("nvfp4_svdquant_gemm_run: invalid kernel shape");
 }

@@ -22,7 +22,7 @@ import torch
 
 import tensorrt_llm  # noqa: F401  (registers the trtllm torch ops)
 
-_IS_SM100 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
+_IS_SM100 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0)
 skip_sm100 = pytest.mark.skipif(
     not _IS_SM100, reason="NVFP4 SVDQuant kernels require SM100 (Blackwell)"
 )
@@ -67,6 +67,63 @@ def _sqnr_db(ref: torch.Tensor, got: torch.Tensor) -> float:
     if noise == 0:
         return float("inf")
     return float(10 * torch.log10((ref.float() ** 2).mean() / noise))
+
+
+def _make_svdquant_operator_chain():
+    """Build the production single-linear operator chain and one representative input."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    m, n, k = 129, 3072, 3072
+    x = torch.randn((m, k), dtype=torch.bfloat16, device=device)
+    pqs = (1.0 + 0.3 * torch.randn((k,), dtype=torch.bfloat16, device=device)).abs().contiguous()
+    smoothed = (x * pqs).to(torch.bfloat16)
+    act_scale = (448.0 * 6.0 / smoothed.float().abs().amax()).reshape(1)
+
+    weight = torch.randn((n, k), dtype=torch.bfloat16, device=device)
+    weight_scale = (448.0 * 6.0 / weight.float().abs().amax()).reshape(1)
+    weight_fp4, weight_sf = torch.ops.trtllm.fp4_quantize(weight, weight_scale, 16, False, True)
+    alpha = (1.0 / (act_scale * weight_scale)).reshape(1).float()
+
+    lora_a = torch.randn((_RANK, k), dtype=torch.bfloat16, device=device)
+    l2t_smoothed = (pqs.unsqueeze(1) * lora_a.t()).contiguous()
+    lora_b = torch.randn((n, _RANK), dtype=torch.bfloat16, device=device)
+    lora_b_scaled = (lora_b.float() / alpha).to(torch.bfloat16).contiguous()
+    bias = torch.randn((n,), dtype=torch.bfloat16, device=device).contiguous()
+
+    def prepare(activation: torch.Tensor):
+        act_fp4, act_sf = torch.ops.trtllm.nvfp4_quantize_smooth(activation, pqs, act_scale)
+        down = activation @ l2t_smoothed
+        return act_fp4, act_sf, down
+
+    def fused_chain(activation: torch.Tensor) -> torch.Tensor:
+        act_fp4, act_sf, down = prepare(activation)
+        return torch.ops.trtllm.nvfp4_svdquant_gemm_tuned(
+            act_fp4.view(torch.uint8),
+            weight_fp4.view(torch.uint8),
+            act_sf.view(torch.uint8),
+            weight_sf.view(torch.uint8),
+            alpha,
+            down,
+            lora_b_scaled,
+            torch.bfloat16,
+            bias,
+        )
+
+    def reference_chain(activation: torch.Tensor) -> torch.Tensor:
+        act_fp4, act_sf, down = prepare(activation)
+        residual = torch.ops.trtllm.nvfp4_gemm(
+            act_fp4,
+            weight_fp4,
+            act_sf,
+            weight_sf,
+            alpha,
+            torch.bfloat16,
+            allowed_backends="cutlass",
+            bias=bias,
+        )
+        return residual + torch.mm(down, lora_b.t()).to(residual.dtype)
+
+    return {"fused": fused_chain, "reference": reference_chain}, x
 
 
 @skip_sm100
@@ -125,75 +182,6 @@ def test_nvfp4_svdquant_gemm(m, n, k, use_bias, tactic):
 
 
 @skip_sm100
-@pytest.mark.parametrize(
-    "pack_width, down_offset, tactic",
-    [
-        (64, 0, 0),
-        (64, 32, 0),
-        (96, 64, 0),
-        (96, 64, 1),
-        (96, 64, 9),
-        (96, 64, 11),
-        (96, 64, 16),
-        (96, 64, 18),
-        (96, 64, 19),
-    ],
-)
-def test_nvfp4_svdquant_gemm_packed_down(pack_width, down_offset, tactic):
-    torch.manual_seed(0)
-    m, n, k = 44, 3072, 3072
-    dev = "cuda"
-    x = torch.randn(m, k, dtype=torch.bfloat16, device=dev) / (k**0.25)
-    w = torch.randn(n, k, dtype=torch.bfloat16, device=dev) / (k**0.25)
-    gx = ((448.0 * 6.0) / x.float().abs().max()).reshape(1).contiguous()
-    gw = ((448.0 * 6.0) / w.float().abs().max()).reshape(1).contiguous()
-    xq, x_sf = torch.ops.trtllm.fp4_quantize(x, gx, 16, False, True)
-    wq, w_sf = torch.ops.trtllm.fp4_quantize(w, gw, 16, False, True)
-    alpha = (1.0 / (gx * gw)).reshape(1).contiguous()
-    down_pack = torch.randn(m, pack_width, dtype=torch.bfloat16, device=dev)
-    assert down_pack.is_contiguous() and down_pack.stride() == (pack_width, 1)
-    down = down_pack[:, down_offset : down_offset + _RANK]
-    lora_up = torch.randn(n, _RANK, dtype=torch.bfloat16, device=dev) / (_RANK**0.25)
-    lora_up_scaled = (lora_up.float() / alpha.reshape(-1)[:1]).to(torch.bfloat16).contiguous()
-
-    ref = torch.ops.trtllm.fp4_gemm(xq, wq, x_sf, w_sf, alpha, 0, torch.bfloat16).float()
-    ref = ref + down.float() @ lora_up.float().t()
-    out = torch.ops.trtllm.nvfp4_svdquant_gemm(
-        xq.view(torch.uint8),
-        wq.view(torch.uint8),
-        x_sf.view(torch.uint8),
-        w_sf.view(torch.uint8),
-        alpha,
-        down_pack,
-        lora_up_scaled,
-        torch.bfloat16,
-        None,
-        tactic,
-        down_offset,
-    )
-    assert out.shape == (m, n) and out.dtype == torch.bfloat16
-    assert _sqnr_db(ref, out.float()) > 40.0
-
-    if pack_width == 96 and down_offset == 64 and tactic == 0:
-        from tensorrt_llm._torch.autotuner import autotune
-
-        with autotune(tune_mode=True, skip_dynamic_tuning_buckets=True):
-            tuned_out = torch.ops.trtllm.nvfp4_svdquant_gemm_tuned(
-                xq.view(torch.uint8),
-                wq.view(torch.uint8),
-                x_sf.view(torch.uint8),
-                w_sf.view(torch.uint8),
-                alpha,
-                down_pack,
-                lora_up_scaled,
-                torch.bfloat16,
-                None,
-                down_offset=down_offset,
-            )
-        assert _sqnr_db(ref, tuned_out.float()) > 40.0
-
-
-@skip_sm100
 @pytest.mark.parametrize("m, k", [(256, 3072), (6912, 12288)])
 def test_nvfp4_quantize_smooth(m, k):
     torch.manual_seed(0)
@@ -208,3 +196,62 @@ def test_nvfp4_quantize_smooth(m, k):
     xq, sf = torch.ops.trtllm.nvfp4_quantize_smooth(x, pqs, gs)
     assert torch.equal(xq.view(torch.uint8), xq_ref.view(torch.uint8))
     assert torch.equal(sf.view(torch.uint8), sf_ref.view(torch.uint8))
+
+
+@skip_sm100
+def test_nvfp4_svdquant_fused_matches_reference():
+    """The fused operator preserves the unfused single-linear computation."""
+    from tensorrt_llm._torch.autotuner import autotune
+
+    operator_chains, x = _make_svdquant_operator_chain()
+    with torch.no_grad(), autotune(tune_mode=True, skip_dynamic_tuning_buckets=True):
+        expected = operator_chains["reference"](x)
+        actual = operator_chains["fused"](x)
+
+    assert _sqnr_db(expected, actual) > 40.0
+
+
+@skip_sm100
+@pytest.mark.parametrize("implementation", ["fused", "reference"])
+def test_nvfp4_svdquant_operator_cuda_graph(implementation):
+    """The ordinary single-stream VisualGen runner captures and replays the full operator."""
+    from tensorrt_llm._torch.autotuner import autotune
+    from tensorrt_llm._torch.visual_gen.cuda_graph_runner import (
+        CUDAGraphRunner,
+        CUDAGraphRunnerConfig,
+    )
+
+    operator_chains, x = _make_svdquant_operator_chain()
+    operator_chain = operator_chains[implementation]
+    runner = CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
+    graph_chain = runner.wrap(operator_chain)
+
+    with torch.no_grad(), autotune(tune_mode=True, skip_dynamic_tuning_buckets=True):
+        eager = operator_chain(x).clone()
+        captured = graph_chain(x).clone()
+        assert len(runner.graphs) == 1
+
+        replay_input = x + 0.125
+        replay_eager = operator_chain(replay_input).clone()
+        replay_actual = graph_chain(replay_input).clone()
+        assert len(runner.graphs) == 1
+
+    assert _sqnr_db(eager, captured) > 80.0
+    assert _sqnr_db(replay_eager, replay_actual) > 80.0
+
+
+@skip_sm100
+@pytest.mark.parametrize("implementation", ["fused", "reference"])
+def test_nvfp4_svdquant_operator_torch_compile(implementation):
+    """The full operator compiles without graph breaks when CUDA graph mode is not used."""
+    from tensorrt_llm._torch.autotuner import autotune
+
+    operator_chains, x = _make_svdquant_operator_chain()
+    operator_chain = operator_chains[implementation]
+    compiled_chain = torch.compile(operator_chain, fullgraph=True)
+
+    with torch.no_grad(), autotune(tune_mode=True, skip_dynamic_tuning_buckets=True):
+        eager = operator_chain(x).clone()
+        actual = compiled_chain(x).clone()
+
+    assert _sqnr_db(eager, actual) > 80.0
