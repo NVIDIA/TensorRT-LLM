@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import re
@@ -17,6 +18,7 @@ from pathlib import Path
 from typing import (Annotated, Any, AsyncGenerator, AsyncIterator, List,
                     Optional, Union)
 
+import aiohttp
 import uvicorn
 from fastapi import Body, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -202,6 +204,21 @@ class OpenAIServer(_VideoRoutesMixin):
         self.binding_addr = None
         self.host = None
         self.port = None
+        self._kvt_stats = {
+            "fired": 0,
+            "transferred": 0,
+            "failed": 0,
+            "deduped": 0,
+            "skipped_busy": 0
+        }
+        self._kvt_seen = {}
+        self._kvt_inflight = 0
+        self._kvt_max = int(os.environ.get("KV_TRANSFER_MAX_INFLIGHT", "4"))
+        self._kvt_dedup_ttl = float(
+            os.environ.get("KV_TRANSFER_DEDUP_TTL", "300"))
+        _allow = os.environ.get("KV_TRANSFER_SOURCE_ALLOW", "").strip()
+        self._kvt_allow = set(s.strip() for s in _allow.split(",")
+                              if s.strip()) if _allow else None
 
         model_dir = Path(model)
         if model_dir.exists() and model_dir.is_dir():
@@ -651,6 +668,149 @@ class OpenAIServer(_VideoRoutesMixin):
             return self.generator._check_health()
         return True
 
+    async def kv_transfer(self, request: Request):
+        """Start a background KV-cache transfer and return 202 immediately.
+
+        Request JSON:
+          source:   base URL of a context-capable server to pull the KV from.
+          messages | prompt: the prompt to transfer (chat or completions form).
+          model:    optional; defaults to this server's served model.
+
+        Fetches the prompt's KV from `source` over the disaggregated-serving
+        transceiver and commits it to this server's reuse cache; no tokens are
+        generated. The transfer runs in the background -- the response does not
+        wait for it.
+
+        Returns 202 with {status, request_hash}, where status is one of
+        `accepted`, `deduped` (an identical prompt was seen within the dedup
+        TTL), or `skipped_busy` (the in-flight transfer cap was reached).
+        Returns 400 if `source` or the prompt is missing, 403 if `source` is
+        not in the configured allowlist.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse(status_code=400, content={"error": "bad json"})
+        source = body.get("source")
+        model = body.get("model") or self.model
+        messages = body.get("messages")
+        prompt = body.get("prompt")
+        if not source or (messages is None and prompt is None):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "require source and messages|prompt"})
+        # Fail closed: this endpoint makes the server POST to `source`, so require an
+        # explicit allowlist (KV_TRANSFER_SOURCE_ALLOW) to avoid an SSRF primitive.
+        if self._kvt_allow is None:
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error":
+                    "kv_transfer disabled: set KV_TRANSFER_SOURCE_ALLOW to enable"
+                })
+        if source not in self._kvt_allow:
+            return JSONResponse(
+                status_code=403,
+                content={"error": f"source not allowed: {source}"})
+        key = json.dumps(
+            messages, sort_keys=True) if messages is not None else str(prompt)
+        h = hashlib.sha1(key.encode(), usedforsecurity=False).hexdigest()
+        now = time.monotonic()
+        last = self._kvt_seen.get(h)
+        if last is not None and (now - last) < self._kvt_dedup_ttl:
+            self._kvt_stats["deduped"] += 1
+            return JSONResponse(status_code=202,
+                                content={
+                                    "status": "deduped",
+                                    "request_hash": h
+                                })
+        if self._kvt_inflight >= self._kvt_max:
+            self._kvt_stats["skipped_busy"] += 1
+            return JSONResponse(status_code=202,
+                                content={
+                                    "status": "skipped_busy",
+                                    "request_hash": h
+                                })
+        self._kvt_seen[h] = now
+        if len(self._kvt_seen) > 20000:
+            self._kvt_seen = {
+                k: v
+                for k, v in self._kvt_seen.items()
+                if now - v < self._kvt_dedup_ttl
+            }
+        self._kvt_inflight += 1
+        self._kvt_stats["fired"] += 1
+        asyncio.create_task(
+            self._do_kv_transfer(model, messages, prompt, source, h))
+        return JSONResponse(status_code=202,
+                            content={
+                                "status": "accepted",
+                                "request_hash": h,
+                                "deduped": False
+                            })
+
+    async def _do_kv_transfer(self, model, messages, prompt, source, h):
+        """Background worker: pull the prompt's KV from `source` and commit it locally.
+
+        Runs the two-phase disagg flow -- context_only on `source`, then
+        generation_only with kv_transfer_only on self -- checking both responses
+        before counting the transfer as successful. On failure, clears the dedup
+        entry so a transient error can be retried before the TTL elapses.
+        """
+        is_chat = messages is not None
+        path = "/v1/chat/completions" if is_chat else "/v1/completions"
+        ctx_body = {
+            "model": model,
+            "max_tokens": 1,
+            "temperature": 0,
+            "stream": False,
+            "disaggregated_params": {
+                "request_type": "context_only"
+            }
+        }
+        ctx_body["messages"
+                 if is_chat else "prompt"] = messages if is_chat else prompt
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(
+                    total=self._kvt_dedup_ttl)) as session:
+                async with session.post(source.rstrip("/") + path,
+                                        json=ctx_body) as r:
+                    if r.status >= 300:
+                        raise RuntimeError(
+                            f"source context_only returned {r.status}")
+                    ctx = await r.json()
+                dp = ctx.get("disaggregated_params") or (ctx.get(
+                    "choices", [{}])[0].get("disaggregated_params"))
+                if not dp:
+                    raise RuntimeError(
+                        "no disaggregated_params ticket from source")
+                gen_body = dict(ctx_body)
+                gen_body["disaggregated_params"] = dict(
+                    dp, request_type="generation_only", kv_transfer_only=True)
+                async with session.post(f"http://127.0.0.1:{self.port}{path}",
+                                        json=gen_body) as r2:
+                    await r2.read()
+                    if r2.status >= 300:
+                        raise RuntimeError(
+                            f"local generation_only returned {r2.status}")
+            self._kvt_stats["transferred"] += 1
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError,
+                RuntimeError) as e:
+            self._kvt_stats["failed"] += 1
+            self._kvt_seen.pop(h, None)  # not a real dedup hit -> allow retry
+            logger.warning(f"[kv-transfer] {h[:8]} failed: {repr(e)[:120]}")
+        finally:
+            self._kvt_inflight -= 1
+
+    async def kv_transfer_stats(self, request: Request):
+        """Return KV-transfer counters plus live inflight, dedup-table size, cap."""
+        return JSONResponse(
+            content={
+                **self._kvt_stats, "inflight": self._kvt_inflight,
+                "seen": len(self._kvt_seen),
+                "max_inflight": self._kvt_max
+            })
+
     def register_routes(self):
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/health_generate",
@@ -713,6 +873,12 @@ class OpenAIServer(_VideoRoutesMixin):
             "/v1/chat/completions",
             self.openai_chat if not self.use_harmony else self.chat_harmony,
             methods=["POST"])
+        self.app.add_api_route("/v1/kv_transfer",
+                               self.kv_transfer,
+                               methods=["POST"])
+        self.app.add_api_route("/v1/kv_transfer/stats",
+                               self.kv_transfer_stats,
+                               methods=["GET"])
         self.app.add_api_route("/v1/responses",
                                self.openai_responses,
                                methods=["POST"])
