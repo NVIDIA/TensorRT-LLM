@@ -1408,9 +1408,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
          ),
         ("cutedsl_mtp2_tp4_compile_off", "CUTEDSL", 2, 4, 1, 1, False, False),
     )
+    # Each case is pure _run_nvfp4_4gpus_case kwargs; the id (row[0]) stays in
+    # the matrix and is used only for the parametrize ids.
     _NVFP4_4GPU_PREMERGE_CASES = tuple(
-        dict(id=row[0],
-             moe_backend=row[1],
+        dict(moe_backend=row[1],
              mtp_nextn=row[2],
              tp_size=row[3],
              pp_size=row[4],
@@ -2315,14 +2316,13 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "case",
         _NVFP4_4GPU_PREMERGE_CASES,
-        ids=[case["id"] for case in _NVFP4_4GPU_PREMERGE_CASES],
+        ids=[row[0] for row in _NVFP4_4GPU_PREMERGE_MATRIX],
     )
     def test_nvfp4_4gpus_premerge_grouped(self, case, shared_llm_4gpu):
         # shared_llm_4gpu injects the shared 4-GPU MPI session and (transitively)
         # depends on hf_weight_cache, so the weight-cache env is exported before
         # the pool spawns (see the shared_mpi_session_4gpu fixture for details).
-        case_kwargs = {key: value for key, value in case.items() if key != "id"}
-        self._run_nvfp4_4gpus_case(make_llm=shared_llm_4gpu, **case_kwargs)
+        self._run_nvfp4_4gpus_case(make_llm=shared_llm_4gpu, **case)
 
     def _run_nvfp4_4gpus_case(self,
                               *,
