@@ -100,9 +100,7 @@ def make_shared_llm(mpi_session):
     from tensorrt_llm import LLM
 
     def shared_llm(*args, **kwargs):
-        if mpi_session is not None:
-            kwargs["_mpi_session"] = mpi_session
-        return LLM(*args, **kwargs)
+        return LLM(*args, **kwargs, **mpi_session_kwargs(mpi_session))
 
     shared_llm.mpi_session = mpi_session
     return shared_llm
