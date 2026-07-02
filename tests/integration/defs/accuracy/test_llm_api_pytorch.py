@@ -1402,6 +1402,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         ("trtllm_mtp0_ep4_compile_off", "TRTLLM", 0, 4, 1, 4, False, False),
         ("cutlass_mtp0_tp4_lpc_compile_off", "CUTLASS", 0, 4, 1, 1, False,
          True),
+        # CUTEDSL coverage (skipped off SM100/103 by _run_nvfp4_4gpus_case);
+        # preserves the pre-merge CUTEDSL cases upstream carried individually.
+        ("cutedsl_mtp0_tp2pp2_compile_off", "CUTEDSL", 0, 2, 2, 1, False, False
+         ),
+        ("cutedsl_mtp2_tp4_compile_off", "CUTEDSL", 2, 4, 1, 1, False, False),
     )
     _NVFP4_4GPU_PREMERGE_CASES = tuple(
         dict(id=row[0],
