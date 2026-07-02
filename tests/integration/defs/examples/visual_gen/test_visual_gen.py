@@ -1647,7 +1647,7 @@ def test_qwen_image_example(_visual_gen_deps, llm_root, llm_venv):
 
 
 def test_cosmos3_example(_visual_gen_deps, llm_root, llm_venv):
-    """Run examples/visual_gen/models/cosmos3_ti2v.py with FP8 config end-to-end.
+    """Run examples/visual_gen/models/cosmos3/cosmos3.py with FP8 config end-to-end.
 
     Validates that the Cosmos3-Nano example script and ``configs/cosmos3-nano-1gpu.yaml``
     work together as documented. Uses the local Cosmos3-Nano checkpoint and
@@ -1660,7 +1660,9 @@ def test_cosmos3_example(_visual_gen_deps, llm_root, llm_venv):
     os.makedirs(out_dir, exist_ok=True)
     output_path = os.path.join(out_dir, "cosmos3_output.mp4")
 
-    script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "cosmos3_ti2v.py")
+    script_path = os.path.join(
+        llm_root, "examples", "visual_gen", "models", "cosmos3", "cosmos3.py"
+    )
     config_path = os.path.join(
         llm_root, "examples", "visual_gen", "configs", "cosmos3-nano-1gpu.yaml"
     )
