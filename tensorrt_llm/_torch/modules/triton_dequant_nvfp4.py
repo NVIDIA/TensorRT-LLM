@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Active-only NVFP4 weight dequant for MoE on SM<100 (used by
 W4A16NVFP4CutlassFusedMoEMethod). Static shapes -> CUDA-graph capturable.
@@ -10,8 +10,10 @@ rows uninitialized is safe.
 """
 
 import torch
-import triton  # type: ignore[import]
-import triton.language as tl  # type: ignore[import]
+import triton
+import triton.language as tl
+
+from tensorrt_llm.quantization.utils.fp4_utils import pad_up
 
 # E2M1 codebook (signed-magnitude nibble layout). Index 0b1000 nominally
 # encodes "-0" and is treated as 0.0. Kept as a Python list so we can build
@@ -152,15 +154,41 @@ def dequant_nvfp4_active_triton(
         Tiles belonging to inactive experts are left uninitialized; they
         are never read by the downstream MoE kernel.
     """
-    assert packed_weight.dim() == 3, "packed_weight must be 3D [E, N, K/2]"
-    assert sf_vec_size == 16, "NVFP4 fixed at 16-element blocks"
-    assert block_k % sf_vec_size == 0, (
-        f"block_k={block_k} must be a multiple of sf_vec_size={sf_vec_size}"
-    )
+    if packed_weight.dim() != 3:
+        raise ValueError("packed_weight must be 3D [E, N, K/2]")
+    if sf_vec_size != 16:
+        raise ValueError("NVFP4 fixed at 16-element blocks")
+    if block_k % sf_vec_size != 0:
+        raise ValueError(f"block_k={block_k} must be a multiple of sf_vec_size={sf_vec_size}")
 
     E, N, K_packed = packed_weight.shape
     K = K_packed * 2
     device = packed_weight.device
+
+    if packed_weight.stride(-1) != 1:
+        raise ValueError("packed_weight innermost stride must be 1 (contiguous K dim)")
+    if scale_linear.dim() != 3:
+        raise ValueError(f"scale_linear must be 3D, got {tuple(scale_linear.shape)}")
+    if scale_linear.stride(-1) != 1:
+        raise ValueError("scale_linear innermost stride must be 1 (contiguous K_sf dim)")
+    if scale_linear.shape[0] != E:
+        raise ValueError(f"scale_linear E mismatch: {scale_linear.shape[0]} vs packed_weight E={E}")
+    if not (active_mask.dim() == 1 and active_mask.is_contiguous() and active_mask.shape[0] == E):
+        raise ValueError(
+            f"active_mask must be 1D contiguous of length E={E}, got "
+            f"shape={tuple(active_mask.shape)} "
+            f"contiguous={active_mask.is_contiguous()}"
+        )
+    if not (
+        weight_scale_2.dim() == 1
+        and weight_scale_2.is_contiguous()
+        and weight_scale_2.shape[0] == E
+    ):
+        raise ValueError(
+            f"weight_scale_2 must be 1D contiguous of length E={E}, got "
+            f"shape={tuple(weight_scale_2.shape)} "
+            f"contiguous={weight_scale_2.is_contiguous()}"
+        )
 
     if active_mask.dtype != torch.uint8:
         active_mask = active_mask.to(torch.uint8)
@@ -287,32 +315,41 @@ def dequant_nvfp4_2d_triton(
     Returns:
         ``[N, K]`` in ``target_dtype``.
     """
-    assert packed_weight.dim() == 2, "packed_weight must be 2D [N, K/2]"
-    assert sf_vec_size == 16, "NVFP4 fixed at 16-element blocks"
-    assert block_k % sf_vec_size == 0, (
-        f"block_k={block_k} must be a multiple of sf_vec_size={sf_vec_size}"
-    )
+    if packed_weight.dim() != 2:
+        raise ValueError("packed_weight must be 2D [N, K/2]")
+    if sf_vec_size != 16:
+        raise ValueError("NVFP4 fixed at 16-element blocks")
+    if block_k % sf_vec_size != 0:
+        raise ValueError(f"block_k={block_k} must be a multiple of sf_vec_size={sf_vec_size}")
 
     N, K_packed = packed_weight.shape
     K = K_packed * 2
     device = packed_weight.device
 
+    if packed_weight.stride(-1) != 1:
+        raise ValueError("packed_weight innermost stride must be 1 (contiguous K dim)")
+
     # Reshape (possibly flat) scale to its 2D [pad_rows, pad_cols] form so
     # the kernel can use ``scale.stride(0)`` directly.
     if weight_scale.dim() == 1:
-        from tensorrt_llm.quantization.utils.fp4_utils import pad_up
-
         pad_rows = pad_up(N, 128)
         pad_cols = pad_up(K // sf_vec_size, 4)
         weight_scale = weight_scale.view(pad_rows, pad_cols)
     elif weight_scale.dim() != 2:
         raise ValueError(f"weight_scale must be 1D or 2D, got shape {tuple(weight_scale.shape)}")
+    if weight_scale.stride(-1) != 1:
+        raise ValueError("weight_scale innermost stride must be 1 (contiguous K_sf dim)")
 
     out = torch.empty(N, K, dtype=target_dtype, device=device)
     e2m1_table = _get_e2m1_codebook(device)
 
-    # The kernel reads the per-tensor scale via a single pointer load; flatten
-    # to ensure a contiguous, 1-D-addressable buffer regardless of caller shape.
+    # The kernel does ``tl.load(weight_scale_2_ptr)`` -- a single scalar read.
+    # Reject multi-element buffers explicitly: any trailing values would be
+    # silently dropped and the matrix would dequantize against the wrong scale.
+    if weight_scale_2.numel() != 1:
+        raise ValueError(
+            f"weight_scale_2 must have exactly 1 element, got {weight_scale_2.numel()}"
+        )
     weight_scale_2 = weight_scale_2.reshape(-1)
 
     grid = (triton.cdiv(N, block_n), triton.cdiv(K, block_k))
