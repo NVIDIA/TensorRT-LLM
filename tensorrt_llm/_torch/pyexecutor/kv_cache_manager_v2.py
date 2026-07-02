@@ -669,6 +669,8 @@ class KVCacheManagerV2(BaseResourceManager):
         from ..speculative import get_num_extra_kv_tokens
 
         self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
+        # Mirror V1: expose max_draft_len so the native disagg AuxBuffer
+        # (_make_aux_buffer's getattr fallback) is sized for MTP/spec decoding.
         self.max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
         self.max_total_draft_tokens = (
             spec_config.max_total_draft_tokens if spec_config is not None else 0
@@ -3069,6 +3071,20 @@ class KVCacheManagerV2(BaseResourceManager):
             self._stream.cuda_stream,
         )
 
+    @staticmethod
+    def _derive_reuse_salt(cache_salt: str | None) -> int | None:
+        """Derive ``ReuseScope.salt`` (int|None) from the ``cache_salt`` string.
+
+        Deterministic so the same string yields the same reuse namespace across
+        processes (matches C++ blockKey hashing on cacheSalt). Shared by cache
+        creation, prefetch, and the cache-aware router probe so they all hit the
+        same radix-tree namespace.
+        """
+        if cache_salt is None:
+            return None
+        digest = hashlib.sha256(cache_salt.encode("utf-8")).digest()
+        return int.from_bytes(digest[:8], "little")
+
     def _create_kv_cache(
         self,
         request_id: int,
@@ -3092,14 +3108,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 self.index_mapper.size(),
             )
             return None
-        # ReuseScope.salt is int|None; derive a deterministic int from the
-        # cache_salt string so the same string yields the same reuse namespace
-        # across processes (matches C++ blockKey hashing on cacheSalt).
-        salt_int = (
-            int.from_bytes(hashlib.sha256(cache_salt.encode("utf-8")).digest()[:8], "little")
-            if cache_salt is not None
-            else None
-        )
+        salt_int = self._derive_reuse_salt(cache_salt)
         kv_cache = self.impl.create_kv_cache(
             ReuseScope(lora_id=lora_task_id, salt=salt_int),
             input_tokens,
@@ -3119,6 +3128,28 @@ class KVCacheManagerV2(BaseResourceManager):
                 kv_cache.set_base_page_index_buf(i, pool_idx, memoryview(buffer.numpy()))
         return kv_cache
 
+    def probe_prefix_match_length(self, input_tokens, lora_task_id=None, cache_salt=None):
+        """Probe the v2 KV cache radix tree for prefix match length.
+
+        Returns the number of prefix tokens already cached on this rank,
+        without acquiring page ownership. Mirrors the v1 ``KVCacheManager``
+        adapter so ``KVCacheAwareADPRouter`` works on both KV cache backends.
+
+        ``cache_salt`` (and ``lora_task_id``) must match the values used by
+        ``_create_kv_cache``; the salt is derived from the ``cache_salt``
+        string the same way, so the probe queries the same reuse namespace.
+        Otherwise the router would see an incorrect match length.
+        """
+        if not self.enable_block_reuse:
+            return 0
+        if not input_tokens:
+            return 0
+        salt_int = self._derive_reuse_salt(cache_salt)
+        return self.impl.probe_reuse(
+            ReuseScope(lora_id=lora_task_id, salt=salt_int),
+            input_tokens,
+        )
+
     def prefetch_for_context_tokens(self, requests: list) -> bool:
         """Prefetch radix-tree blocks from disk→host for upcoming context requests.
 
@@ -3134,14 +3165,9 @@ class KVCacheManagerV2(BaseResourceManager):
         for req in requests:
             all_tokens = req.get_tokens(DEFAULT_BEAM_INDEX)
             tokens = self._augment_tokens_for_block_reuse(all_tokens, req, end=len(all_tokens) - 1)
-            # Match the ReuseScope salt derivation used in _create_kv_cache so
-            # the transient cache hits the same radix-tree blocks.
-            cache_salt = req.cache_salt
-            salt_int = (
-                int.from_bytes(hashlib.sha256(cache_salt.encode("utf-8")).digest()[:8], "little")
-                if cache_salt is not None
-                else None
-            )
+            # Use the same salt derivation as _create_kv_cache so the transient
+            # cache hits the same radix-tree blocks.
+            salt_int = self._derive_reuse_salt(req.cache_salt)
             kv_cache = self.impl.create_kv_cache(
                 ReuseScope(lora_id=req.lora_task_id, salt=salt_int), tokens
             )

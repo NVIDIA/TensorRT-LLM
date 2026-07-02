@@ -402,3 +402,33 @@ def test_peer_registrar_get_kv_map_head_mismatch():
     reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
     mapper = reg.get_kv_map(peer_ri, (0, 0), (0, 0))
     assert isinstance(mapper, HeadMismatchMapper)
+
+
+def test_peer_registrar_tpb_divisible_warns_but_compatible():
+    # local=16, peer=32: 32 % 16 == 0 → compatible with warning, register succeeds
+    self_rankinfo = make_rankinfo(instance_name="local", tokens_per_block=16)
+    reg = _make_peer_registrar(self_rankinfo)
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=5,
+        tokens_per_block=32,
+        layer_num_per_pp=[2],
+        page_table=make_page_table(),
+    )
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+    assert reg.get_peer_rank_info(peer_ri.instance_name, peer_ri.instance_rank) is not None
+
+
+def test_peer_registrar_tpb_not_divisible_raises():
+    # local=16, peer=24: 24 % 16 != 0 → incompatible, register raises ValueError
+    self_rankinfo = make_rankinfo(instance_name="local", tokens_per_block=16)
+    reg = _make_peer_registrar(self_rankinfo)
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=6,
+        tokens_per_block=24,
+        layer_num_per_pp=[2],
+        page_table=make_page_table(),
+    )
+    with pytest.raises(ValueError):
+        reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
