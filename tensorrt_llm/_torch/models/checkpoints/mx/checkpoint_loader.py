@@ -19,7 +19,7 @@ Thin adapter on top of the upstream `modelexpress` Python client
 (`ai-dynamo/modelexpress`). All NIXL/RDMA mechanics (agent setup,
 tensor registration, source-target name matching, dtype-cast handling,
 PVC fallback, etc.) live in the upstream `MxLiveWeightLoader` and
-`publish_model_params` helpers — we only call them at the right
+`publish_model_params` helpers. This class only calls them at the right
 points in TRT-LLM's loading lifecycle.
 
 When no MX server is reachable (or the upstream library is not
@@ -96,9 +96,8 @@ class MXCheckpointLoader(HfCheckpointLoader):
 
     All transport-level mechanics (NIXL, dtype casts, source matching,
     fallback) are delegated to `modelexpress.trtllm_live_transfer`
-    so that this class stays a thin adapter — when the MX wire
-    protocol or transport evolves, only the upstream library needs
-    to track it.
+    so that this class stays a thin adapter. When the MX wire protocol or
+    transport evolves, only the upstream library needs to track it.
     """
 
     def __init__(
@@ -189,11 +188,10 @@ class MXCheckpointLoader(HfCheckpointLoader):
     def is_post_transform_weights_preloaded(self) -> bool:
         """Whether the last successful MX preload delivered transformed bytes.
 
-        Wave 4 wires the receiver-side staged hook path, but the MX publisher
-        still emits raw pre-transform bytes. Keep this false until Wave 5 wires
-        explicit MX metadata for post-transform publication. The source
-        identity bit is included here so callers have one conservative signal:
-        no identity match, no transform skip.
+        MX does not yet expose whether the selected source publishes raw
+        checkpoint bytes or transformed runtime bytes. Keep this signal false
+        until the published layout is explicit. Source identity must also match
+        before callers skip transforms.
         """
         return (
             self._p2p_succeeded
@@ -446,10 +444,9 @@ class MXCheckpointLoader(HfCheckpointLoader):
     ) -> bool:
         """Whether the selected MX source publishes post-transform bytes.
 
-        Wave 4 keeps production behavior dormant: Modelexpress metadata does
-        not yet expose raw-vs-transformed layout state, and the TRT-LLM MX
-        publisher still publishes before module transforms. Wave 5 should wire
-        this seam to explicit source metadata when flipping the publisher.
+        ModelExpress metadata does not yet expose whether a source publishes
+        raw checkpoint bytes or transformed runtime bytes. Wire this to
+        explicit source metadata before enabling transformed publication.
         """
         return False
 

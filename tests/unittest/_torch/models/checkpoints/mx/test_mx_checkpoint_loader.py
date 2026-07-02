@@ -6,12 +6,11 @@
 # You may obtain a copy of the License at
 #
 # http://www.apache.org/licenses/LICENSE-2.0
-"""Unit tests for ``MXCheckpointLoader`` (``checkpoint_format='MX'``).
+"""Unit tests for MXCheckpointLoader with checkpoint_format='MX'.
 
-These tests intentionally do NOT exercise the upstream ``modelexpress``
-library. Tests for the import-failure fallback path mock
-``modelexpress.*`` symbols out of ``sys.modules`` so the assertion is
-about *our* fallback behavior, not about the upstream API.
+These tests intentionally do not exercise the upstream modelexpress library.
+The import-failure path blocks modelexpress symbols from sys.modules so the
+assertion is about our fallback behavior, not the upstream API.
 """
 
 import os
@@ -70,9 +69,8 @@ class TestConstruction:
         assert loader.checkpoint_format == "MX"
 
     def test_checkpoint_format_backing_attr(self):
-        # Several call sites read ``self._checkpoint_format`` directly
-        # (instead of going through the property). The constructor must
-        # align the backing attribute with the property override.
+        # Some call sites read self._checkpoint_format directly. Keep the
+        # backing attribute aligned with the property override.
         loader = MXCheckpointLoader()
         assert loader._checkpoint_format == "MX"
 
@@ -99,12 +97,8 @@ class TestConstruction:
 
 class TestRegistry:
     def test_registered_under_mx(self):
-        # ``ModelLoader.load`` resolves a checkpoint loader from
-        # ``checkpoint_format`` via ``BaseCheckpointLoader.get``. PR #13045
-        # registers ``MX`` via ``@register_checkpoint_loader("MX")``.
-        # The real call site (in _construct_checkpoint_loader) passes
-        # weight_loader=, weight_mapper=, config_loader=, plus optional
-        # mx_server_url= — so test with the same call shape.
+        # BaseCheckpointLoader.get resolves MX through the loader registry.
+        # Use the same constructor shape as _construct_checkpoint_loader.
         loader = BaseCheckpointLoader.get(
             checkpoint_format="MX",
             weight_loader=None,
@@ -130,7 +124,7 @@ class TestMxMapperFallback:
 
 
 # ---------------------------------------------------------------------------
-# load_weights — disk-fallback paths (no upstream library involved)
+# load_weights: disk-fallback paths with no upstream library involved.
 # ---------------------------------------------------------------------------
 
 
@@ -138,15 +132,13 @@ class TestLoadWeightsFallback:
     """Disk-fallback paths that should not touch the upstream MX library.
 
     All four fallback triggers share the same observable contract:
-    ``is_weights_preloaded()`` stays False, the parent ``HfCheckpointLoader.
-    load_weights`` is invoked exactly once, and its return value is
-    propagated unchanged. We parameterize the trigger to keep that
-    contract in one place.
+    is_weights_preloaded() stays False, HfCheckpointLoader.load_weights is
+    invoked exactly once, and its return value is propagated unchanged.
     """
 
     # Trigger setup builders.
     @staticmethod
-    def _no_url(stack):  # noqa: ARG004 — stack unused for this trigger
+    def _no_url(stack):  # noqa: ARG004 - stack unused for this trigger.
         return MXCheckpointLoader(), {"model": MagicMock()}
 
     @staticmethod
@@ -202,7 +194,7 @@ class TestLoadWeightsFallback:
 
 
 # ---------------------------------------------------------------------------
-# load_weights — MX-success and mixed-success paths (mocked upstream)
+# load_weights: MX-success and mixed-success paths with mocked upstream.
 # ---------------------------------------------------------------------------
 
 
@@ -210,9 +202,8 @@ class TestLoadWeightsFallback:
 class TestLoadWeightsMxPath:
     def test_p2p_full_success_returns_empty_dict(self):
         # Empty fallback dict means MX delivered all weights into model
-        # params; ``ModelLoader`` interprets the empty dict + the
-        # ``is_weights_preloaded()`` signal as "skip the standard
-        # weight-mapping pipeline".
+        # params. ModelLoader uses the empty dict plus is_weights_preloaded()
+        # to skip the standard weight-mapping pipeline.
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
         loader._source_identity_compatible = MagicMock(return_value=True)
         fake_mx = _build_fake_modelexpress(load_weights_return={})
@@ -258,11 +249,9 @@ class TestLoadWeightsMxPath:
         mock_super_load.assert_not_called()
 
     def test_post_transform_mixed_success_falls_back_to_full_disk_load(self):
-        # Wave 5 will let MX advertise post-transform sources. If such a
-        # source only partially succeeds, merging raw fallback tensors would
-        # force ModelLoader onto the full post-load path and double-transform
-        # the P2P subset. Lock the safer behavior now: abandon the partial
-        # post-transform transfer and return a full disk load instead.
+        # Post-transform sources are safe only when all tensors arrive via P2P.
+        # If MX returns raw fallback tensors, avoid mixing layouts by falling
+        # back to a full disk load.
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
         loader._source_identity_compatible = MagicMock(return_value=True)
         loader._source_metadata_is_post_transform = MagicMock(return_value=True)
@@ -488,11 +477,10 @@ def _install_fake_modelexpress(fake_pkg):
 
 
 class TestMxSourceQueryTimeoutDefault:
-    """``load_weights`` caps upstream's source-query timeout on P2P attempts.
+    """load_weights caps upstream's source-query timeout on P2P attempts.
 
     The first replica on a cold cluster should not block for the upstream
-    default of 1 hour. ``setdefault`` semantics — never overrides an
-    explicit user value.
+    default of 1 hour. Existing user values are preserved.
     """
 
     @pytest.fixture(autouse=True)
@@ -625,7 +613,7 @@ class TestNormalizeModelIdentity:
 
     def test_hf_snapshot_unmangling(self):
         # HF cache layout: ".../models--<org>--<name>/snapshots/<sha>/"
-        # → "<org>/<name>" (not the commit sha).
+        # to "<org>/<name>" instead of the commit sha.
         snapshot = (
             "/cache/huggingface/hub/models--Qwen--Qwen2.5-72B-Instruct/snapshots/abc123def456789"
         )
@@ -638,8 +626,7 @@ class TestNormalizeModelIdentity:
 
 
 class TestResolveMxModelName:
-    """``_resolve_mx_model_name`` is the priority-ordered lookup used by
-    ``publish_as_source``. Verifying the ordering."""
+    """_resolve_mx_model_name uses publish_as_source's lookup order."""
 
     @pytest.fixture(autouse=True)
     def _isolated_env(self, monkeypatch):
@@ -672,9 +659,9 @@ class TestResolveMxModelName:
 
 
 class TestPublishAsSourceModelName:
-    """``publish_as_source`` must set ``MODEL_NAME`` from the resolved
-    identity so upstream's ``publish_model_params`` reads it via env,
-    and must restore the prior env value afterwards.
+    """publish_as_source sets MODEL_NAME for upstream publish_model_params.
+
+    The prior environment value must be restored afterwards.
     """
 
     @pytest.fixture(autouse=True)

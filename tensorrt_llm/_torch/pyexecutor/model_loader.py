@@ -510,8 +510,8 @@ class ModelLoader:
                 if checkpoint_loader.checkpoint_format == "MX":
                     # If a separate draft model still needs a raw disk load,
                     # do not accept post-transform bytes for only the target
-                    # model. Wave 5 can relax this after the target/draft
-                    # subgraphs have an explicit mixed-layout policy.
+                    # model. Enable this only after target and draft subgraphs
+                    # have an explicit mixed-layout policy.
                     load_weights_kwargs["allow_post_transform_weights"] = (
                         not loads_draft_weights)
 
@@ -870,10 +870,9 @@ class ModelLoader:
             loads_draft_weights: bool = False) -> bool:
         """Whether an MX receiver can skip one-shot weight transforms.
 
-        The Wave 4 path is intentionally dormant for production: the allow-list
-        is empty, and MX still reports raw pre-transform bytes. Tests can opt in
-        a synthetic model by patching the allow-list and checkpoint-loader
-        signal, proving the staged receiver branch without enabling real models.
+        Production keeps this dormant until model validation and source
+        metadata are explicit. Tests opt in a synthetic model by patching both
+        signals.
         """
         if checkpoint_loader.checkpoint_format != "MX" or not weights_preloaded:
             return False
@@ -905,10 +904,10 @@ class ModelLoader:
             )
             return True
 
-        # WAVE 5 NOTE: once MX can publish real post-transform bytes, this
-        # fallthrough must not run the full post_load_weights() path on those
-        # bytes for a non-allow-listed model. Wave 5 should either fail/fallback
-        # before accepting the transfer or allow-list the model after validation.
+        # TODO(MX-POST-TRANSFORM): When MX can publish transformed bytes,
+        # reject non-allow-listed transfers before P2P or validate the model
+        # and add it to the allow-list. Do not run the full post-load path on
+        # transformed bytes.
         logger.info(
             "MX receiver got post-transform weights for %s, but the model is "
             "not allow-listed for staged post-load transform protocol v%d. "
@@ -922,7 +921,7 @@ class ModelLoader:
     def _mark_weights_transformed(model: DecoderModelForCausalLM) -> None:
         """Mark modules with transform guards as already transformed.
 
-        Post-transform sharing paths skip ``transform_weights()`` because the
+        Post-transform sharing paths skip transform_weights() because the
         incoming bytes already use the final runtime layout. Preserve that
         lifecycle state on modules that participate in the transform guard
         protocol so a later orchestrator/refactor does not treat them as raw

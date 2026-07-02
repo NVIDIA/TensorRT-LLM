@@ -76,10 +76,9 @@ class BaseCheckpointLoader(ABC):
         """Whether the last direct preload delivered post-transform weights.
 
         This is narrower than :meth:`is_weights_preloaded`: a loader may write
-        bytes directly into the model while those bytes are still the raw
-        checkpoint layout. Only return ``True`` when the source identity was
-        verified and the incoming bytes can safely skip module
-        ``transform_weights()`` hooks.
+        bytes directly into the model while those bytes still use the raw
+        checkpoint layout. Return True only when the source identity was
+        verified and the incoming bytes can safely skip module transform hooks.
         """
         return False
 
