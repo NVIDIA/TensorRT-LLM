@@ -303,6 +303,24 @@ commands:
         is_flag: false
         flags:
         - "--num_postprocess_workers"
+      input_processor_workers:
+        type: int
+        default: 8
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--input-processor-workers"
+      media_load_workers:
+        type: int
+        default: 8
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--media-load-workers"
       otlp_traces_endpoint:
         type: str
         default: null
