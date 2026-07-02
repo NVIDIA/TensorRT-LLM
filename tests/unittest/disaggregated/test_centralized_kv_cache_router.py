@@ -18,11 +18,17 @@ import time
 import pytest
 
 from tensorrt_llm.serve.kv_cache_router import (CentralizedKVCacheRouter,
+                                                CentralizedKVCacheRouterCore,
                                                 KvCacheEventReport,
                                                 KVCacheRouterServer,
                                                 PrefixBlockSet,
                                                 WorkerLoadReport,
                                                 WorkerReporter)
+# The router *surface* (Router subclass) is distinct from the core; import it
+# and ServerRole explicitly for the owner/client injection tests.
+from tensorrt_llm.serve.router import \
+    CentralizedKVCacheRouter as CentralizedKVCacheRouterSurface
+from tensorrt_llm.llmapi.disagg_utils import ServerRole
 
 TPB = 32  # tokens per block
 
@@ -515,6 +521,71 @@ def test_shared_scorer_matches_adp_semantics():
 
     # Empty candidates -> None.
     assert score_kv_aware_candidates([], **common) is None
+
+
+# ------------------------------- one shared core owns the one ingest server
+
+
+def test_one_core_serves_both_namespaces():
+    """ONE namespace-aware core holds ctx and gen state at once. The ctx and gen
+    router surfaces share this single core (and thus its single ingest server),
+    passing their own namespace on each call -- the shape that avoids the ZMQ
+    "Address already in use" crash from two cores binding one port."""
+    core = CentralizedKVCacheRouterCore(tokens_per_block=TPB)
+    core.apply_load_report(load_report("ctx0", 0, ns="ctx"))
+    core.apply_load_report(load_report("gen0", 0, ns="gen"))
+    # Each namespace only sees its own workers.
+    assert core.select_worker("ctx", [1, 2, 3]).worker_id == "ctx0"
+    assert core.select_worker("gen", [1, 2, 3]).worker_id == "gen0"
+
+
+def test_ingest_server_binds_once_and_is_idempotent():
+    """The core owns the single ingest server; start is idempotent so both
+    surfaces sharing the core never bind a second socket."""
+    core = CentralizedKVCacheRouterCore(ingest_address="tcp://127.0.0.1:*",
+                                        tokens_per_block=TPB)
+    try:
+        endpoint, _ = core.start_ingest_server()
+        server = core._ingest_server
+        assert server is not None
+        # Second start (e.g. the other surface's owner path) is a no-op.
+        assert core.start_ingest_server()[0] == endpoint
+        assert core._ingest_server is server
+    finally:
+        core.stop_ingest_server()
+        assert core._ingest_server is None
+
+
+def test_delegating_client_router_has_no_core():
+    """A fleet-worker surface is built with is_delegating_client=True and no
+    core: it exists only for local routing_key() extraction and must never touch
+    the core (placement is delegated to the coordinator over HTTP)."""
+    client = CentralizedKVCacheRouterSurface(server_role=ServerRole.CONTEXT,
+                                             servers=["h:1"],
+                                             tokens_per_block=TPB,
+                                             core=None,
+                                             is_delegating_client=True)
+    assert client._core is None
+    # Core-dependent placement asserts rather than dereferencing None.
+    with pytest.raises(AssertionError):
+        client.select_by_block_hashes([1, 2, 3])
+
+
+def test_owner_router_requires_injected_core():
+    """An owner surface must be given the shared core -- no fallback creation."""
+    core = CentralizedKVCacheRouterCore(tokens_per_block=TPB)
+    ctx = CentralizedKVCacheRouterSurface(server_role=ServerRole.CONTEXT,
+                                          servers=["h:1"], tokens_per_block=TPB,
+                                          core=core)
+    gen = CentralizedKVCacheRouterSurface(server_role=ServerRole.GENERATION,
+                                          servers=["h:2"], tokens_per_block=TPB,
+                                          core=core)
+    assert ctx._core is core and gen._core is core  # same shared object
+    assert ctx._namespace == "ctx" and gen._namespace == "gen"
+    with pytest.raises(AssertionError):
+        CentralizedKVCacheRouterSurface(server_role=ServerRole.CONTEXT,
+                                        servers=["h:1"], tokens_per_block=TPB,
+                                        core=None)
 
 
 if __name__ == "__main__":

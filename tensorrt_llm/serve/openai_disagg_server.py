@@ -49,7 +49,7 @@ from tensorrt_llm.serve.openai_protocol import (DisaggregatedParams,
 from tensorrt_llm.serve.perf_metrics import DisaggPerfMetricsCollector
 from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
                                                 get_steady_clock_now_in_seconds)
-from tensorrt_llm.serve.router import Router, create_router
+from tensorrt_llm.serve.router import Router, build_disagg_routers
 from tensorrt_llm.version import __version__ as VERSION
 
 # yapf: enale
@@ -106,8 +106,18 @@ class OpenAIDisaggServer:
         self._coordinator_url = coordinator_url
 
         self._ctx_servers, self._gen_servers = get_ctx_gen_server_addrs(config.server_configs)
-        self._ctx_router = create_router(config.ctx_router_config, self._ctx_servers, metadata_server_cfg, create_metadata_server(metadata_server_cfg), self._sync_server_clock, disagg_node_id=config.node_id)
-        self._gen_router = create_router(config.gen_router_config, self._gen_servers, metadata_server_cfg, create_metadata_server(metadata_server_cfg), self._sync_server_clock, disagg_node_id=config.node_id)
+        # Build ctx+gen routers together so a centralized deployment shares ONE
+        # namespace-aware core + ONE ZMQ ingest server. When coordinator_url is
+        # set, this is a delegating fleet worker: it builds coreless surfaces
+        # (routing_key() only) and never binds the ingest port -- the remote
+        # coordinator owns all routing state. Otherwise this process is the owner
+        # (single-process server) and its core starts the one ingest server.
+        self._ctx_router, self._gen_router = build_disagg_routers(
+            config.ctx_router_config, config.gen_router_config,
+            self._ctx_servers, self._gen_servers, metadata_server_cfg,
+            create_metadata_server(metadata_server_cfg), self._sync_server_clock,
+            disagg_node_id=config.node_id,
+            is_delegating_client=bool(self._coordinator_url))
         self._metadata_server = create_metadata_server(metadata_server_cfg)
         self._perf_metrics_collector = DisaggPerfMetricsCollector(config.perf_metrics_max_requests)
 

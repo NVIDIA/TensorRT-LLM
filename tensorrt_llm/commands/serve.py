@@ -1294,7 +1294,7 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     from tensorrt_llm.serve.coordinator_server import CoordinatorServer
     from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
     from tensorrt_llm.serve.metadata_server import create_metadata_server
-    from tensorrt_llm.serve.router import create_router
+    from tensorrt_llm.serve.router import build_disagg_routers
 
     public_host, public_port = disagg_cfg.hostname, disagg_cfg.port
     coord_port = int(os.environ.get("TLLM_DISAGG_COORDINATOR_PORT",
@@ -1347,12 +1347,14 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     ctx_servers, gen_servers = get_ctx_gen_server_addrs(disagg_cfg.server_configs)
     logger.info(f"Coordinator building routers: ctx={ctx_servers} "
                 f"gen={gen_servers}")
-    ctx_router = create_router(disagg_cfg.ctx_router_config, ctx_servers,
-                               metadata_server_cfg, md,
-                               disagg_node_id=disagg_cfg.node_id)
-    gen_router = create_router(disagg_cfg.gen_router_config, gen_servers,
-                               metadata_server_cfg, md,
-                               disagg_node_id=disagg_cfg.node_id)
+    # This coordinator process OWNS routing state: build ctx+gen together so a
+    # centralized deployment shares ONE namespace-aware core + ONE ZMQ ingest
+    # server (started once, here). The uvicorn fleet workers are delegating
+    # clients and never build a core, so they can't race this bind.
+    ctx_router, gen_router = build_disagg_routers(
+        disagg_cfg.ctx_router_config, disagg_cfg.gen_router_config,
+        ctx_servers, gen_servers, metadata_server_cfg, md,
+        disagg_node_id=disagg_cfg.node_id, is_delegating_client=False)
 
     def _client_factory(router, role, max_retries=1):
         from tensorrt_llm.serve.openai_client import OpenAIHttpClient

@@ -82,13 +82,17 @@ class ServerState:
         return self._session_provider() if self._session_provider else None
 
     async def increment_load(self, request: OpenAIRequest):
-        num_tokens = get_request_num_tokens(request) if self._use_tokens else 0
+        # request may be None on the coordinator-delegated path (no request
+        # object crosses the HTTP hop); token accounting is skipped then.
+        num_tokens = (get_request_num_tokens(request)
+                      if self._use_tokens and request is not None else 0)
         async with self._lock:
             self._num_active_requests += 1
             self._num_active_tokens += num_tokens
 
     async def decrement_load(self, request: OpenAIRequest):
-        num_tokens = get_request_num_tokens(request) if self._use_tokens else 0
+        num_tokens = (get_request_num_tokens(request)
+                      if self._use_tokens and request is not None else 0)
         async with self._lock:
             self._num_active_requests -= 1
             self._num_active_tokens -= num_tokens
@@ -957,43 +961,47 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         token_lists, block_hashes_by_algo = await asyncio.to_thread(
             self._tokenize_and_compute_block_hashes_by_algo, request,
             hash_algo_by_server.values(), cache_salt_id)
-        # select the server by (KV match - load), bounded by load_cap
-        workloads = [
-            self._server_state[server].num_active_requests()
-            for server in servers
-        ]
-        load_fractions = [
-            workloads[i] / self._max_batch_size for i in range(len(servers))
-        ]
-        scores = []
-        matches = []
-        for i in range(len(servers)):
-            server = servers[i]
+        # Shared selection core (also used by the coordinator-delegated path).
+        server, hash_algo, block_hashes, matches = await self._select_server(
+            servers, hash_algo_by_server, block_hashes_by_algo,
+            conv_key=self._content_affinity_key(request))
+        async with self._lock:
+            await self._register_request(server, request)
+            self._stash_routed_blocks_on_route(request, block_hashes, hash_algo)
+        self._record_route_timing(_time.monotonic() - _rt_t0)
+        return server, {
+            "block_hashes": block_hashes,  # list[list[int | str]]
+            "hash_algo": hash_algo,
+            "token_lists": token_lists,  # list[list[int]]
+            "matches": matches,  # list[int]
+            "server_info": self._server_info.get(server, {}),
+        }
+
+    async def _select_server(self, servers, hash_algo_by_server,
+                             block_hashes_by_algo, conv_key):
+        """Shared KV-cache-aware selection: score each server by
+        (matched_tokens/tokens_per_block - load_weight*load), apply the load_cap,
+        honour conversation affinity, break ties round-robin. Used by BOTH
+        get_next_server (standalone) and get_next_server_by_key (coordinator),
+        so the two paths never diverge. Returns (server, hash_algo, block_hashes,
+        matches)."""
+        workloads = [self._server_state[s].num_active_requests()
+                     for s in servers]
+        load_fractions = [workloads[i] / self._max_batch_size
+                          for i in range(len(servers))]
+        scores, matches = [], []
+        for i, server in enumerate(servers):
             hash_algo = hash_algo_by_server[server]
             block_hashes = block_hashes_by_algo[hash_algo]
-            # https://github.com/ai-dynamo/dynamo/blob/main/docs/kv_cache_routing.md#kv-cache-routing-and-load-balancing
             matches.append(await self._server_state[server].matched_tokens(
                 block_hashes, hash_algo))
-            score = matches[-1] / self._tokens_per_block - self._load_weight * \
-                workloads[i]
-            scores.append(score)
-        # Optional hard cap: drop servers at/over load_cap; fall back to all if
-        # none remain. Disabled by default (load_cap=inf) to match the original
-        # score-only selection.
-        candidate_idx = [
-            i for i, lf in enumerate(load_fractions) if lf < self._load_cap
-        ]
-        if not candidate_idx:
-            candidate_idx = list(range(len(servers)))
-        # Conversation affinity: pin all turns of a conversation (keyed by a
-        # content-derived prefix hash, no conversation-id header) to the server
-        # it first landed on, so a worker eviction shrinking the match score
-        # cannot scatter the conversation off its warm home. New conversations
-        # (no pin yet) fall through to the score, which balances them by load.
+            scores.append(matches[-1] / self._tokens_per_block
+                          - self._load_weight * workloads[i])
+        candidate_idx = [i for i, lf in enumerate(load_fractions)
+                         if lf < self._load_cap] or list(range(len(servers)))
         affinity = getattr(self, "_route_affinity", None)
         if affinity is None:
             affinity = self._route_affinity = OrderedDict()
-        conv_key = self._content_affinity_key(request)
         winner = None
         if conv_key is not None:
             pinned = affinity.get(conv_key)
@@ -1013,18 +1021,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             while len(affinity) > ROUTE_AFFINITY_CACHE_SIZE:
                 affinity.popitem(last=False)
         hash_algo = hash_algo_by_server[server]
-        block_hashes = block_hashes_by_algo[hash_algo]
-        async with self._lock:
-            await self._register_request(server, request)
-            self._stash_routed_blocks_on_route(request, block_hashes, hash_algo)
-        self._record_route_timing(_time.monotonic() - _rt_t0)
-        return server, {
-            "block_hashes": block_hashes,  # list[list[int | str]]
-            "hash_algo": hash_algo,
-            "token_lists": token_lists,  # list[list[int]]
-            "matches": matches,  # list[int]
-            "server_info": self._server_info.get(server, {}),
-        }
+        return server, hash_algo, block_hashes_by_algo[hash_algo], matches
 
     async def finish_request(self,
                              request: OpenAIRequest,
@@ -1035,10 +1032,82 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             if server is not None and server in self._server_state:
                 await self._server_state[server].decrement_load(request)
         self._apply_routed_blocks_on_finish(request, server, success)
+        self._poll_server_on_finish(server, session)
+
+    def _poll_server_on_finish(self, server, session=None):
+        """Refresh a server's KV-cache block table from /kv_cache_events after a
+        request finishes. Shared by finish_request (standalone) and
+        finish_by_handle (coordinator) so the block table always stays warm --
+        the delegated path is inert without this (matches score 0)."""
         if (server is not None and server in self._server_state
                 and self._events_aligned(server)):
             # Fire-and-forget; poll runs in background and coalesces per server.
             self._server_state[server].schedule_poll_and_update(session)
+
+    # ---- coordinator-delegation adaptor ----------------------------------
+    # Lets KvCacheAwareRouter run UNDER the disagg coordinator (WEB_CONCURRENCY>1)
+    # like the centralized router, but keep its proven server/instance-level,
+    # ~98%-hit KV-cache-aware scoring. The fleet worker computes routing_key()
+    # locally; the coordinator (which owns _server_state via /kv_cache_events
+    # polling) runs get_next_server_by_key(). Per-request load is tracked by an
+    # opaque handle instead of id(request), which does not cross the HTTP hop.
+
+    def routing_key(self, request: OpenAIRequest):
+        """Compute block hashes on the fleet worker (compact: ~ISL/tokens_per_block
+        ints, not the full token list) and send those to the coordinator. Uses the
+        default hash algo; valid when all servers share one algo (the common case:
+        uniform tokens_per_block + tokenizer). JSON-serializable.
+        """
+        cache_salt_id = self._get_request_cache_salt_id(request)
+        _, block_hashes = self._tokenize_and_compute_block_hashes_with_salt(
+            request, cache_salt_id)
+        return {"block_hashes": block_hashes}
+
+    async def get_next_server_by_key(self, routing_key, exclude_server=None):
+        """Coordinator-side placement from precomputed block hashes. Reuses the
+        SAME _select_server scoring and the SAME per-server load counter as the
+        standalone get_next_server; the only delegated-specific state is the
+        handle->server map, standing in for id(request) which does not cross the
+        HTTP hop."""
+        block_hashes = (routing_key or {}).get("block_hashes") or []
+        async with self._lock:
+            servers = [s for s in self._server_state.keys()
+                       if s != exclude_server]
+        if not servers:
+            raise ValueError(
+                f"No available servers after excluding {exclude_server}")
+        # All servers share one hash algo in the delegated deployment.
+        hash_algo_by_server = {s: self._get_server_hash_algo(s) for s in servers}
+        block_hashes_by_algo = {
+            hash_algo_by_server[servers[0]]: block_hashes}
+        flat = [h for hl in block_hashes for h in hl]
+        conv_key = flat[0] if flat else None
+        server, _algo, _bh, matches = await self._select_server(
+            servers, hash_algo_by_server, block_hashes_by_algo, conv_key)
+        # Track load on the SAME server-state counter get_next_server uses
+        # (request=None: no token accounting). Map an opaque handle -> server so
+        # /finish can decrement it.
+        if not hasattr(self, "_coord_handle_server"):
+            self._coord_handle_server = {}
+            self._coord_handle_counter = 0
+        await self._server_state[server].increment_load(None)
+        async with self._lock:
+            self._coord_handle_counter += 1
+            node_id = getattr(self, "_disagg_node_id", 0)
+            handle = f"kvc{node_id}_{self._coord_handle_counter}"
+            self._coord_handle_server[handle] = server
+        return server, {"server_info": self._server_info.get(server, {}),
+                        "matches": matches}, handle
+
+    async def finish_by_handle(self, handle, success=True):
+        del success
+        if not handle:
+            return
+        server = getattr(self, "_coord_handle_server", {}).pop(handle, None)
+        if server is not None and server in self._server_state:
+            await self._server_state[server].decrement_load(None)
+        # Same poll-on-finish as finish_request -- keeps the block table warm.
+        self._poll_server_on_finish(server)
 
     def _on_servers_updated(self, old_servers, new_servers):
         new_state = {}
@@ -1536,11 +1605,22 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
 class CentralizedKVCacheRouter(BlockHashMixin, Router):
     """Thin Router adaptor over the centralized KV-cache router core.
 
-    Owns the ZMQ ingest server lifecycle and translates the ``Router`` API into
-    core calls: tokenize + block-hash the request, ask the core for a placement,
-    inject the per-rank ``route_hint``, and record timing. All routing state and
-    logic (selection, fallback, diagnostics, address bookkeeping) live in
-    :class:`CentralizedKVCacheRouterCore`.
+    Translates the ``Router`` API into core calls: tokenize + block-hash the
+    request, ask the core for a placement, inject the per-rank ``route_hint``,
+    and record timing. All routing state (selection, load, address bookkeeping)
+    plus the single ZMQ ingest server live in :class:`CentralizedKVCacheRouterCore`.
+
+    There is exactly ONE namespace-aware core per deployment, owned by the
+    coordinator, which injects the same core object into both the ctx and gen
+    surfaces (each passes its own namespace on every call). Construct via
+    :func:`build_centralized_routers` (owner) or with ``is_delegating_client=True``
+    (fleet worker): a client has no core -- it only runs ``routing_key()``
+    locally and delegates placement to the coordinator over HTTP, so it never
+    touches the core or binds the ingest port.
+
+    Note: block-hashing knobs (tokens_per_block, tokenizer) live on the surface;
+    routing knobs (router_port, load_weight, rank_routing_algo, ...) live on the
+    core and are consumed by the builder, not here.
     """
 
     def __init__(self,
@@ -1551,59 +1631,45 @@ class CentralizedKVCacheRouter(BlockHashMixin, Router):
                  tokens_per_block: Optional[int] = None,
                  custom_tokenizer: Optional[str] = None,
                  tokenizer_dir: Optional[str] = None,
-                 router_port: int = 5557,
-                 load_weight: float = 0.25,
-                 rank_routing_algo: str = "instance",
-                 fair_share_multiplier: float = 2.0,
-                 match_rate_threshold: float = 0.1,
-                 load_suspend_s: float = 100.0,
-                 stale_timeout_s: float = 30.0,
+                 core=None,
+                 is_delegating_client: bool = False,
                  **kwargs):
+        # Swallow core-only routing knobs (router_port, load_weight, etc.) that
+        # create_router forwards from router_args: the builder uses them to make
+        # the core; the surface does not.
+        for core_only in ("router_port", "load_weight", "rank_routing_algo",
+                          "fair_share_multiplier", "match_rate_threshold",
+                          "load_suspend_s", "stale_timeout_s"):
+            kwargs.pop(core_only, None)
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
         self._init_block_hashing(tokens_per_block, custom_tokenizer,
                                  tokenizer_dir)
 
-        from tensorrt_llm.serve.kv_cache_router import \
-            CentralizedKVCacheRouterCore
-
-        import base64
-        import os
-        hmac_key_b64 = os.environ.get("TLLM_CENTRALIZED_ROUTER_HMAC_KEY")
-        hmac_key = (base64.b64decode(hmac_key_b64)
-                    if hmac_key_b64 else None)
-
-        tpb = self._tokens_per_block
-        # The core owns the ZMQ ingest server (how workers PUSH events/load).
-        self._core = CentralizedKVCacheRouterCore(
-            tokens_per_block=tpb,
-            load_weight=load_weight,
-            rank_routing_algo=rank_routing_algo,
-            fair_share_multiplier=fair_share_multiplier,
-            match_rate_threshold=match_rate_threshold,
-            load_suspend_s=load_suspend_s,
-            stale_timeout_s=stale_timeout_s,
-            ingest_address=f"tcp://0.0.0.0:{router_port}",
-            ingest_hmac_key=hmac_key)
-        endpoint, _ = self._core.start_ingest_server()
-        logger.info(
-            f"CentralizedKVCacheRouter: rank_routing_algo={rank_routing_algo} "
-            f"load_weight={load_weight} "
-            f"fair_share_multiplier={fair_share_multiplier} "
-            f"match_rate_threshold={match_rate_threshold}")
+        # Owner injects the shared core; delegating client has none. No fallback
+        # creation and no ingest bind here -- see class docstring.
+        self._is_delegating_client = is_delegating_client
+        if is_delegating_client:
+            assert core is None, "delegating client must not be given a core"
+        else:
+            assert core is not None, "owner must inject the shared routing core"
+        self._core = core
         self._namespace = ("ctx" if server_role == ServerRole.CONTEXT
                            else "gen")
         self._rr_counter = 0
         logger.info(
-            f"CentralizedKVCacheRouter: ZMQ ingest server at "
-            f"{endpoint}, namespace={self._namespace}, tpb={tpb}")
+            f"CentralizedKVCacheRouter: namespace={self._namespace}, "
+            f"tpb={self._tokens_per_block}, "
+            f"role={'delegating-client' if is_delegating_client else 'owner'}")
 
     @property
     def router_endpoint(self) -> str:
+        assert self._core is not None, "no core: delegating client has no ingest"
         return self._core.ingest_endpoint
 
     @property
     def router_hmac_key(self) -> Optional[bytes]:
+        assert self._core is not None, "no core: delegating client has no ingest"
         return self._core.ingest_hmac_key
 
     async def _prepare_server(self, server: str):
@@ -1613,6 +1679,8 @@ class CentralizedKVCacheRouter(BlockHashMixin, Router):
         info = self._server_info.get(server, {})
         worker_id = info.get("worker_id")
         if worker_id:
+            assert self._core is not None, \
+                "no core: delegating client does not prepare servers"
             self._core.register_worker_address(worker_id, server)
             logger.info(
                 f"CentralizedKVCacheRouter: registered "
@@ -1636,6 +1704,8 @@ class CentralizedKVCacheRouter(BlockHashMixin, Router):
         server is available. Safe to call directly (in-process) or from the
         HTTP server handler.
         """
+        assert self._core is not None, \
+            "no core: placement runs on the coordinator, not a delegating client"
         servers = [s for s in self._prepared_ready_servers
                    if s != exclude_server]
         if not servers:
@@ -1688,6 +1758,7 @@ class CentralizedKVCacheRouter(BlockHashMixin, Router):
 
     def _address_worker_for(self, address: str) -> Optional[str]:
         """Resolve server address to worker_id (reverse lookup)."""
+        assert self._core is not None, "no core: delegating client"
         return self._core.address_worker_for(address)
 
     async def finish_request(self,
@@ -1697,12 +1768,16 @@ class CentralizedKVCacheRouter(BlockHashMixin, Router):
         pass
 
     def _on_servers_updated(self, old_servers, new_servers):
+        if self._core is None:  # delegating client: coordinator owns addresses
+            return
         removed = set(old_servers) - set(new_servers)
         for server in removed:
             self._core.unregister_worker_address(address=server)
 
     async def close(self):
-        self._core.stop_ingest_server()
+        # The surface does not own the core: the coordinator that created and
+        # injected the shared core stops its ingest server. A delegating client
+        # has no core. So there is nothing to tear down here.
         await super().close()
 
 
@@ -1850,3 +1925,94 @@ def create_router(
                         metadata_server,
                         server_preparation_func=server_preparation_func,
                         **extra_args)
+
+
+def _is_centralized(router_config: Optional[RouterConfig]) -> bool:
+    return (router_config is not None
+            and (router_config.type or "").lower() == "centralized_kv_cache_aware")
+
+
+def _build_centralized_core(router_config: RouterConfig):
+    """Create the ONE namespace-aware routing core (owns the ZMQ ingest server)
+    from a centralized RouterConfig's args. Ingest is NOT started here -- the
+    caller (owner) starts it once after building both surfaces."""
+    from tensorrt_llm.serve.kv_cache_router import CentralizedKVCacheRouterCore
+    import base64
+    import os
+    args = dict(router_config.args or {})
+    router_port = args.get("router_port", 5557)
+    hmac_key_b64 = os.environ.get("TLLM_CENTRALIZED_ROUTER_HMAC_KEY")
+    hmac_key = base64.b64decode(hmac_key_b64) if hmac_key_b64 else None
+    core_kwargs = {
+        k: args[k]
+        for k in ("tokens_per_block", "load_weight", "rank_routing_algo",
+                  "fair_share_multiplier", "match_rate_threshold",
+                  "load_suspend_s", "stale_timeout_s") if k in args
+    }
+    return CentralizedKVCacheRouterCore(
+        ingest_address=f"tcp://0.0.0.0:{router_port}",
+        ingest_hmac_key=hmac_key,
+        **core_kwargs)
+
+
+def _build_one_router(router_config, servers, metadata_server_cfg,
+                      metadata_server, server_preparation_func, disagg_node_id,
+                      core, is_delegating_client):
+    """Build a single surface. Centralized surfaces take the injected core (owner)
+    or none (delegating client); everything else goes through create_router."""
+    if not _is_centralized(router_config):
+        return create_router(router_config, servers, metadata_server_cfg,
+                             metadata_server, server_preparation_func,
+                             disagg_node_id)
+    extra_args = dict(router_config.args or {})
+    extra_args["disagg_node_id"] = disagg_node_id
+    return CentralizedKVCacheRouter(
+        router_config.server_role, servers, metadata_server_cfg,
+        metadata_server, server_preparation_func=server_preparation_func,
+        core=core, is_delegating_client=is_delegating_client, **extra_args)
+
+
+def build_disagg_routers(
+    ctx_router_config: Optional[RouterConfig],
+    gen_router_config: Optional[RouterConfig],
+    ctx_servers: Optional[List[str]],
+    gen_servers: Optional[List[str]],
+    metadata_server_cfg: Optional[MetadataServerConfig] = None,
+    metadata_server: Optional[JsonDictionary] = None,
+    server_preparation_func: Optional[Callable[[str], Awaitable[None]]] = None,
+    disagg_node_id: int = 0,
+    is_delegating_client: bool = False,
+) -> tuple[Router, Router]:
+    """Build the ctx and gen routers for one disagg process.
+
+    Ownership model: there is ONE namespace-aware centralized core owning the ONE
+    ZMQ ingest server. When either side is centralized and this process OWNS state
+    (``is_delegating_client=False``), a single core is created and injected into
+    BOTH centralized surfaces (ctx and gen route by namespace over it), then its
+    ingest server is started exactly once. A delegating client builds coreless
+    centralized surfaces (routing_key() only) and never binds the port. Stateless
+    router types are built unchanged via create_router.
+    """
+    shared_core = None
+    if not is_delegating_client and (_is_centralized(ctx_router_config)
+                                     or _is_centralized(gen_router_config)):
+        # Prefer ctx's args for the core config; fall back to gen's.
+        core_cfg = (ctx_router_config if _is_centralized(ctx_router_config)
+                    else gen_router_config)
+        shared_core = _build_centralized_core(core_cfg)
+
+    ctx_router = _build_one_router(
+        ctx_router_config, ctx_servers, metadata_server_cfg, metadata_server,
+        server_preparation_func, disagg_node_id,
+        core=shared_core if _is_centralized(ctx_router_config) else None,
+        is_delegating_client=is_delegating_client)
+    gen_router = _build_one_router(
+        gen_router_config, gen_servers, metadata_server_cfg, metadata_server,
+        server_preparation_func, disagg_node_id,
+        core=shared_core if _is_centralized(gen_router_config) else None,
+        is_delegating_client=is_delegating_client)
+
+    # Owner starts the single ingest server once, after both surfaces exist.
+    if shared_core is not None:
+        shared_core.start_ingest_server()
+    return ctx_router, gen_router

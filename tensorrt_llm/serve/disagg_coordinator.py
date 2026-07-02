@@ -114,6 +114,10 @@ class DisaggCoordinatorService(DisaggCoordinator):
         self._client_factory = client_factory
         self._metadata_server = metadata_server
         self._metadata_config = metadata_config
+        # Routers are already built (and, for a centralized owner deployment, the
+        # single shared core's ZMQ ingest server already started) by
+        # build_disagg_routers before construction. The coordinator does not
+        # create or start routers itself.
         # The coordinator owns the disagg cluster storage (auto-scaling backend):
         # it drives the DisaggClusterManager below and, when the storage is an
         # in-process HTTP server, its routes are mounted on the coordinator app.
@@ -205,6 +209,13 @@ class DisaggCoordinatorService(DisaggCoordinator):
 
     async def cluster_info(self) -> Dict[str, Any]:
         info = {"is_ready": await self.is_ready()}
+        # Expose the block-hash granularity so a delegating client hashes with
+        # the SAME tokens_per_block as the workers (the owner adopts it from
+        # /server_info). Clients don't monitor servers, so they can't learn it
+        # otherwise.
+        tpb = getattr(self._ctx_router, "_tokens_per_block", None)
+        if tpb is not None:
+            info["tokens_per_block"] = tpb
         if self._disagg_cluster_manager:
             info.update(await self._disagg_cluster_manager.cluster_info())
         return info
@@ -307,6 +318,23 @@ class CoordinatorClient(DisaggCoordinator):
         if self._session is None:
             self._session = aiohttp.ClientSession()
         return self._session
+
+    async def start(self) -> None:
+        # A delegating client doesn't monitor servers, so it can't learn the
+        # workers' tokens_per_block from /server_info. Fetch it from the
+        # coordinator and apply it to the local routers' block-hashing so the
+        # keys the client computes line up with the coordinator/workers.
+        info = await self.cluster_info()
+        tpb = info.get("tokens_per_block")
+        if tpb is not None:
+            for router in (self._ctx_router, self._gen_router):
+                local = getattr(router, "_local", router)
+                if getattr(local, "_tokens_per_block", None) != tpb:
+                    local._tokens_per_block = tpb
+                    local._tpb_auto = False
+                    logger.info(
+                        f"CoordinatorClient: adopted coordinator "
+                        f"tokens_per_block={tpb} for {getattr(local, '_namespace', '?')}")
 
     async def is_ready(self) -> bool:
         try:
