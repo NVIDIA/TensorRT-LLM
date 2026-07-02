@@ -5,7 +5,8 @@ from typing import Optional
 
 import click
 
-from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm import LLM, SamplingParams, logger
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi import (Eagle3DecodingConfig, KvCacheConfig,
                                  MTPDecodingConfig, NGramDecodingConfig)
 
@@ -16,6 +17,14 @@ prompts = [
 
 
 def run_MTP(model: Optional[str] = None):
+    sm_version = get_sm_version()
+    if sm_version < 90:
+        logger.warning(
+            f"Skipping the MTP example: it requires the DeepSeek MLA "
+            "generation FMHA kernel, which is only available on "
+            f"Hopper+ (SM>=90). Detected SM{sm_version}.")
+        return
+
     spec_config = MTPDecodingConfig(use_relaxed_acceptance_for_thinking=True,
                                     relaxed_topk=10,
                                     relaxed_delta=0.01)
