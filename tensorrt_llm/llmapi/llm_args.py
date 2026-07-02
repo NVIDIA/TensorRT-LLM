@@ -3370,6 +3370,30 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "Set to 0 to disable prefetch. Only effective with KV cache manager v2 and block reuse enabled."
     )
 
+    enable_residency_deferral: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Opt in to residency deferral: when a context request's onboarded "
+        "(host->GPU) KV blocks are not yet resident, defer that request to a "
+        "later iteration and launch the forward with the rest of the batch, "
+        "instead of stalling the whole batch on the transfer. Bounded by "
+        "``max_resident_wait_iters``. When False (default) the request is "
+        "admitted immediately and the compute stream waits on the transfer as "
+        "before. Only used when using KV cache manager v2 (experimental).")
+
+    max_resident_wait_iters: int = Field(
+        default=2,
+        ge=1,
+        status="prototype",
+        description=
+        "Deadline for ``enable_residency_deferral``: the maximum number of "
+        "consecutive iterations a request may be deferred while waiting for "
+        "its onboarded KV blocks to become resident. After this many "
+        "deferrals the request is admitted regardless (falling back to the "
+        "blocking transfer wait) to bound TTFT and prevent starvation. Only "
+        "used when using KV cache manager v2 (experimental).")
+
     def _to_pybind(self):
         config = _KvCacheConfig(
             enable_block_reuse=self.enable_block_reuse,

@@ -57,6 +57,7 @@ def make_gen_request(
     req.is_generation_in_progress_state = True
     req.is_first_context_chunk = is_first_context_chunk
     req.py_encoder_output_ready_event = None
+    req.py_resident_wait_iters = 0
     return req
 
 
@@ -89,6 +90,7 @@ def make_ctx_request(
     req.encoder_output_len = encoder_output_len
     req.py_encoder_output_ready_event = None
     req.py_skip_cross_kv_projection = False
+    req.py_resident_wait_iters = 0
     return req
 
 
@@ -120,6 +122,7 @@ def make_disagg_request(
     req.num_draft_tokens = num_draft_tokens
     req.has_draft_tokens = num_draft_tokens > 0
     req.py_draft_tokens = [0] * num_draft_tokens if num_draft_tokens > 0 else []
+    req.py_resident_wait_iters = 0
     return req
 
 
@@ -155,6 +158,9 @@ def make_kv_cache_manager(
     prepare_context_fn=None,
     resize_context_fn=None,
     try_allocate_generation_fn=None,
+    enable_residency_deferral=False,
+    max_resident_wait_iters=2,
+    is_request_resident_ready_fn=None,
 ):
     mgr = Mock()
     mgr.tokens_per_block = tokens_per_block
@@ -162,8 +168,20 @@ def make_kv_cache_manager(
     mgr.prepare_context.side_effect = prepare_context_fn or (lambda req: True)
     mgr.resize_context.side_effect = resize_context_fn or (lambda req, n: True)
     mgr.try_allocate_generation.side_effect = try_allocate_generation_fn or (lambda req: True)
+    # Generation allocation is split into resume (prepare_generation, dispatches
+    # the onboard) and grow (resize_generation). The main scheduler path calls
+    # these two; the eviction-retry path calls try_allocate_generation. Model
+    # resume as always-succeeding and let the grow carry the allocation
+    # success/failure semantics, sharing the same (possibly stateful) fn so the
+    # call sequence matches the pre-split behavior.
+    mgr.prepare_generation.side_effect = lambda req: True
+    mgr.resize_generation.side_effect = try_allocate_generation_fn or (lambda req: True)
     mgr.suspend_request.return_value = None
     mgr.is_request_active.side_effect = lambda req_id: mgr.kv_cache_map[req_id].is_active
+    # Residency deferral knobs (default OFF so existing tests are unaffected).
+    mgr.enable_residency_deferral = enable_residency_deferral
+    mgr.max_resident_wait_iters = max_resident_wait_iters
+    mgr.is_request_resident_ready.side_effect = is_request_resident_ready_fn or (lambda req: True)
     return mgr
 
 
@@ -2506,3 +2524,149 @@ class TestTrimToHistory:
         kv = Mock(is_active=True, history_length=10, capacity=100)
         kv.resize.side_effect = RuntimeError("internal state assert")
         assert self._call(kv, 64) is False
+
+
+# ===========================================================================
+# Residency deferral
+# ===========================================================================
+
+
+class TestResidencyDeferral:
+    """Gate that defers a request whose onboarded (host->GPU) KV blocks are
+    not yet resident, instead of stalling the whole batch on the transfer."""
+
+    @staticmethod
+    def _budget(num_requests=1, max_num_requests=100):
+        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import BudgetTracker
+
+        b = BudgetTracker(max_num_tokens=None, max_num_requests=max_num_requests)
+        b.num_requests = num_requests
+        return b
+
+    # ---- _should_defer_for_residency unit behaviour ----
+
+    def test_disabled_never_defers_and_skips_poll(self):
+        mgr = make_kv_cache_manager(
+            enable_residency_deferral=False,
+            is_request_resident_ready_fn=lambda req: False,
+        )
+        sched = make_scheduler(mgr)
+        req = make_ctx_request(0, context_remaining_length=80)
+        assert sched._should_defer_for_residency(req, self._budget()) is False
+        mgr.is_request_resident_ready.assert_not_called()
+
+    def test_ready_request_not_deferred_resets_counter(self):
+        mgr = make_kv_cache_manager(
+            enable_residency_deferral=True,
+            is_request_resident_ready_fn=lambda req: True,
+        )
+        sched = make_scheduler(mgr)
+        req = make_ctx_request(0, context_remaining_length=80)
+        req.py_resident_wait_iters = 1
+        assert sched._should_defer_for_residency(req, self._budget()) is False
+        assert req.py_resident_wait_iters == 0
+
+    def test_not_ready_request_deferred_and_counter_increments(self):
+        mgr = make_kv_cache_manager(
+            enable_residency_deferral=True,
+            max_resident_wait_iters=3,
+            is_request_resident_ready_fn=lambda req: False,
+        )
+        sched = make_scheduler(mgr)
+        req = make_ctx_request(0, context_remaining_length=80)
+        req.py_resident_wait_iters = 0
+        assert sched._should_defer_for_residency(req, self._budget()) is True
+        assert req.py_resident_wait_iters == 1
+        assert sched._should_defer_for_residency(req, self._budget()) is True
+        assert req.py_resident_wait_iters == 2
+
+    def test_deadline_forces_admission_and_resets(self):
+        mgr = make_kv_cache_manager(
+            enable_residency_deferral=True,
+            max_resident_wait_iters=2,
+            is_request_resident_ready_fn=lambda req: False,
+        )
+        sched = make_scheduler(mgr)
+        req = make_ctx_request(0, context_remaining_length=80)
+        req.py_resident_wait_iters = 2  # deadline reached
+        assert sched._should_defer_for_residency(req, self._budget()) is False
+        assert req.py_resident_wait_iters == 0
+
+    def test_small_batch_guard_never_defers_empty_batch(self):
+        mgr = make_kv_cache_manager(
+            enable_residency_deferral=True,
+            is_request_resident_ready_fn=lambda req: False,
+        )
+        sched = make_scheduler(mgr)
+        req = make_ctx_request(0, context_remaining_length=80)
+        # num_requests == 0 => keep forward work, do not defer (poll skipped).
+        assert sched._should_defer_for_residency(req, self._budget(num_requests=0)) is False
+        mgr.is_request_resident_ready.assert_not_called()
+
+    # ---- end-to-end schedule_request behaviour ----
+
+    def test_schedule_loop_defers_not_ready_context(self):
+        mgr = make_kv_cache_manager(
+            enable_residency_deferral=True,
+            max_resident_wait_iters=5,
+            is_request_resident_ready_fn=lambda req: False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        gen = make_gen_request(0)
+        ctx = make_ctx_request(1, context_remaining_length=80)
+        out = sched.schedule_request([gen, ctx], set())
+        assert len(out.generation_requests) == 1
+        assert len(out.context_requests) == 0  # deferred
+        assert ctx.py_resident_wait_iters == 1
+        # No capacity grew for the deferred request => resize_context not called.
+        resized_ids = [c.args[0].request_id for c in mgr.resize_context.call_args_list]
+        assert 1 not in resized_ids
+
+    def test_schedule_loop_admits_ready_context(self):
+        mgr = make_kv_cache_manager(
+            enable_residency_deferral=True,
+            is_request_resident_ready_fn=lambda req: True,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        gen = make_gen_request(0)
+        ctx = make_ctx_request(1, context_remaining_length=80)
+        out = sched.schedule_request([gen, ctx], set())
+        assert len(out.generation_requests) == 1
+        assert len(out.context_requests) == 1
+
+    def test_schedule_loop_lone_context_admitted_by_guard(self):
+        mgr = make_kv_cache_manager(
+            enable_residency_deferral=True,
+            is_request_resident_ready_fn=lambda req: False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        ctx = make_ctx_request(0, context_remaining_length=80)
+        out = sched.schedule_request([ctx], set())
+        # Only schedulable work => small-batch guard admits despite not-ready.
+        assert len(out.context_requests) == 1
+
+    def test_gen_deferred_before_grow(self):
+        """A not-ready generation resume is deferred BEFORE resize_generation.
+
+        The resume (prepare_generation) dispatches the onboard so residency can
+        be polled, but the +1 grow (resize_generation) must not run for the
+        deferred request — so there is nothing to revert.
+        """
+        mgr = make_kv_cache_manager(
+            enable_residency_deferral=True,
+            max_resident_wait_iters=5,
+            is_request_resident_ready_fn=lambda req: False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        # gen0 admitted by the small-batch guard (num_requests==0); gen1 then
+        # has forward work behind it and is not resident => deferred.
+        gen0 = make_gen_request(0)
+        gen1 = make_gen_request(1)
+        out = sched.schedule_request([gen0, gen1], set())
+        assert ids(out.generation_requests) == [0]
+        # Both resumed (polled); only the admitted one grew.
+        prepared = [c.args[0].request_id for c in mgr.prepare_generation.call_args_list]
+        grew = [c.args[0].request_id for c in mgr.resize_generation.call_args_list]
+        assert 1 in prepared  # gen1 was resumed so its onboard could be polled
+        assert 1 not in grew  # but never grown => nothing to revert
+        assert gen1.py_resident_wait_iters == 1
