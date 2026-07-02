@@ -252,8 +252,7 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
                     hidden_states[gather_ids], draft_model.lm_head, attn_metadata, True
                 )
                 if self.guided_decoder is not None:
-                    d2t = getattr(draft_model.model, "d2t", None)
-                    self.guided_decoder.execute_draft_batch(logits, d2t, draft_step=i)
+                    self.guided_decoder.execute_draft_batch(logits, self._d2t, draft_step=i)
 
                 new_draft_token = self.draft_decoder(
                     logits,
@@ -291,8 +290,7 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
         # Mark draft_probs valid so the next forward's compare_and_accept can run
         # rejection sampling. Record d2t for acceptance-side vocab expansion.
         if use_rejection:
-            d2t_param = getattr(getattr(draft_model, "model", None), "d2t", None)
-            spec_metadata.d2t = d2t_param.data if d2t_param is not None else None
+            spec_metadata.d2t = self._d2t.data if self._d2t is not None else None
             spec_metadata.draft_probs_valid = True
 
         # Restore attention metadata to original state
@@ -347,7 +345,6 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
         batch_size: Optional[int] = None,
         draft_step: Optional[int] = None,
     ):
-        d2t = getattr(draft_model.model, "d2t", None)
         # Rejection path stores this step's distribution; greedy uses the plain
         # greedy sampler.
         return self.produce_step_draft_token(
@@ -355,9 +352,9 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
             spec_metadata,
             batch_size,
             draft_step,
-            d2t,
+            self._d2t,
             self.mapping,
-            lambda step_logits: self._draft_sampler_greedy(step_logits, d2t),
+            lambda step_logits: self._draft_sampler_greedy(step_logits, self._d2t),
         )
 
     def prepare_1st_drafter_inputs(

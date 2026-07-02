@@ -449,8 +449,8 @@ class MTPWorker(SpecWorkerBase):
         use_rejection = (getattr(spec_metadata, "use_rejection_sampling", False)
                          and not spec_metadata.is_all_greedy_sample)
         self.reset_draft_probs_valid_for_capture(spec_metadata)
-        # Vanilla MTP shares the target vocabulary; no draft->target remap (d2t).
-        draft_d2t = None
+        # Vanilla MTP shares the target vocabulary, so self._d2t is None here.
+        draft_d2t = self._d2t
 
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(
             resource_manager)

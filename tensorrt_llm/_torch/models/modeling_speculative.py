@@ -1756,6 +1756,10 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 model_config.mapping,
                 use_separate_draft_kv_cache=self.use_separate_draft_kv_cache)
             if self.spec_worker is not None:
+                # Cache the static draft->target vocab map now that the draft
+                # model is loaded, so workers read self._d2t instead of probing
+                # draft_model.model.d2t on every forward.
+                self.spec_worker.set_draft_model(self.draft_model)
                 self.epilogue.append(self.spec_worker)
         self.layer_idx = -1
 

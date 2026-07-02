@@ -492,12 +492,10 @@ class DFlashWorker(SpecWorkerBase):
                 vocab_size = gen_logits.shape[-1]
                 gen_logits = gen_logits.reshape(num_gens, self.max_draft_len, vocab_size)
 
-                d2t = getattr(draft_model.model, "d2t", None)
-
                 # Produce the K block draft tokens (rejection path for non-greedy
                 # batches; argmax otherwise).
                 gen_draft_tokens = self.produce_block_draft_tokens(
-                    gen_logits, spec_metadata, num_contexts, batch_size, d2t
+                    gen_logits, spec_metadata, num_contexts, batch_size, self._d2t
                 )
 
         else:

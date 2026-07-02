@@ -864,6 +864,9 @@ class SpecWorkerBase(nn.Module, ABC):
         self.seed: Optional[torch.Tensor] = None
         self.offset: Optional[torch.Tensor] = None
         self.use_separate_draft_kv_cache = use_separate_draft_kv_cache
+        # Static draft->target vocab offset map, cached once the draft model is
+        # loaded (see set_draft_model). None when draft and target share a vocab.
+        self._d2t: Optional[torch.Tensor] = None
         # Lazily-initialized state for the fractional synthetic acceptance
         # rate. The pool is a fixed-seed, rank-independent table of uniform
         # [0, 1) values; the counter is a device-side int64 advanced in-place
@@ -971,6 +974,13 @@ class SpecWorkerBase(nn.Module, ABC):
                            guided_decoder: "CapturableGuidedDecoder") -> bool:
         self.guided_decoder = guided_decoder
         return True
+
+    def set_draft_model(self, draft_model) -> None:
+        """Cache the static draft->target vocab offset map (``d2t``) once the
+        draft model is loaded. ``d2t`` is a model-static parameter present only
+        when the draft and target vocabularies differ; stays None otherwise.
+        """
+        self._d2t = getattr(getattr(draft_model, "model", None), "d2t", None)
 
     def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
         """

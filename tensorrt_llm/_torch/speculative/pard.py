@@ -288,12 +288,10 @@ class PARDWorker(SpecWorkerBase):
                 vocab_size = gen_logits.shape[-1]
                 gen_logits = gen_logits.reshape(num_gens, self.max_draft_len, vocab_size)
 
-                d2t = getattr(draft_model.model, "d2t", None)
-
                 # Produce the K block draft tokens (rejection path for non-greedy
                 # batches; argmax otherwise).
                 gen_draft_tokens = self.produce_block_draft_tokens(
-                    gen_logits, spec_metadata, num_contexts, batch_size, d2t
+                    gen_logits, spec_metadata, num_contexts, batch_size, self._d2t
                 )
 
                 if self.sa_enhancer is not None and sa_manager is not None:
@@ -359,13 +357,12 @@ class PARDWorker(SpecWorkerBase):
 
         Args:
             logits: [num_tokens, vocab_size] from the draft model.
-            draft_model: The draft model (used to read the d2t mapping).
+            draft_model: The draft model (kept for signature compatibility).
 
         Returns:
             draft_tokens: [batch_size * max_draft_len] flattened token ids.
         """
-        d2t = getattr(draft_model.model, "d2t", None)
-        return self._draft_sampler_greedy(logits, d2t)
+        return self._draft_sampler_greedy(logits, self._d2t)
 
     def prepare_1st_drafter_inputs(
         self,

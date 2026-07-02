@@ -857,9 +857,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                         self.guided_decoder.execute_draft_batch(logits,
                                                                 draft_step=i)
                     else:
-                        d2t = getattr(draft_model.model, "d2t", None)
                         self.guided_decoder.execute_draft_batch(logits,
-                                                                d2t,
+                                                                self._d2t,
                                                                 draft_step=i)
 
                 # When ADP+LM-head-TP pads logits to max_num_requests, the
@@ -950,9 +949,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # flag and d2t for next-iter target-side verification.
         if spec_metadata.use_rejection_sampling:
             if not spec_metadata.is_all_greedy_sample:
-                d2t_param = getattr(getattr(draft_model, 'model', None), "d2t",
-                                    None)
-                spec_metadata.d2t = d2t_param.data if d2t_param is not None else None
+                spec_metadata.d2t = self._d2t.data if self._d2t is not None else None
                 spec_metadata.draft_probs_valid = True
             else:
                 spec_metadata.draft_probs_valid = False
@@ -1199,7 +1196,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 the correct slice of spec_metadata.draft_probs.
         '''
 
-        d2t = getattr(getattr(draft_model, 'model', None), "d2t", None)
+        d2t = self._d2t
         # All-greedy fast path must stay TP-aware. When the draft LM head is
         # tensor-parallel (tp_size>1 without attention DP, or LM-head-TP in
         # ADP), the draft logits are sharded along the vocab dim. A plain
