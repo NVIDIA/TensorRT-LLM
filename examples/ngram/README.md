@@ -47,7 +47,7 @@ return None                                         # No any candidate exists
 + `--use_paged_context_fmha=enable` must be specified since we need KVcache reuse in this approach.
 + `--speculative_decoding_mode=draft_tokens_external` must be specified.
 + `--max_draft_len` must be specified as the length maximum of the draft tokens.
-+ `--ngram_config` is corresponding configuration of NGram, we can see its usage in [util.py](../util.py).
++ `--ngram_config` is corresponding configuration of NGram, we can see its usage in [utils.py](../utils.py).
   + As an example, `[10,2,[0]]` means `max_draft_len=10`, `max_matching_ngram_size=2`, and device of target model is `GPU0`.
 + `--kv_cache_enable_block_reuse` must be specified for this approach.
 + Only CPP session is supported, so `--use_py_session` must not be specified.
