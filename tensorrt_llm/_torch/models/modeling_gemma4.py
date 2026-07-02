@@ -1609,8 +1609,8 @@ class Gemma4AssistantForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4
 
     def load_weights(self, weights: Dict, weight_mapper: BaseWeightMapper):
         weights = weight_mapper.preprocess_weights(weights)
-        token_ordering_key = "masked_embedding.token_ordering"
-        if self.masked_embedding is not None and token_ordering_key in weights:
-            self.masked_embedding.token_ordering.copy_(weights[token_ordering_key])
-            del weights[token_ordering_key]
+        ordering_weight_name = "masked_embedding.token_ordering"
+        if self.masked_embedding is not None and ordering_weight_name in weights:
+            self.masked_embedding.token_ordering.copy_(weights[ordering_weight_name])
+            del weights[ordering_weight_name]
         super().load_weights(weights, weight_mapper)
