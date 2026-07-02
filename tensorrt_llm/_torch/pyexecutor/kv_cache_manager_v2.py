@@ -2488,13 +2488,34 @@ class KVCacheManagerV2(BaseResourceManager):
                 if req.state in (LlmRequestState.GENERATION_COMPLETE, LlmRequestState.CONTEXT_INIT)
                 else kv_cache.capacity - req.py_rewind_len
             )
-            success = kv_cache.resize(new_capacity, req.max_beam_num_tokens - 1)
+            capacity_only = getattr(req, "py_kv_cache_generation_capacity_only", False) is True
+            history_length = None if capacity_only else req.max_beam_num_tokens - 1
+            compaction = getattr(req, "py_kv_cache_compaction", None)
+            consume_compaction = capacity_only and compaction is not None
+            if consume_compaction:
+                target_capacity, published_capacity, event = compaction
+                capacity_growth = kv_cache.capacity - published_capacity
+                if capacity_growth < 0:
+                    raise ValueError(
+                        f"Request {req.py_request_id} capacity {kv_cache.capacity} "
+                        f"fell below published capacity {published_capacity}"
+                    )
+                # K+1 retains every block addressable by this forward. Resizing
+                # may race the full-table offset copy, but only rewrites the
+                # unreachable tail; the stream event protects page reuse.
+                if event is not None:
+                    self._stream.wait_event(event)
+                if new_capacity is not None:
+                    new_capacity = target_capacity + capacity_growth - req.py_rewind_len
+            success = kv_cache.resize(new_capacity, history_length)
             if not success:
                 raise ValueError(
                     f"Failed to resize KV cache for request {req.py_request_id} "
                     f"to capacity {new_capacity} and history length "
-                    f"{req.max_beam_num_tokens - 1} tokens at generation update"
+                    f"{history_length} tokens at generation update"
                 )
+            if consume_compaction:
+                req.py_kv_cache_compaction = None
 
     def copy_batch_block_offsets(
         self,
