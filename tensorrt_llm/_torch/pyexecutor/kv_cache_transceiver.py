@@ -181,8 +181,7 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
         self.kv_transfer_sender_future_timeout_ms = cache_transceiver_config.kv_transfer_sender_future_timeout_ms
         self.kv_transfer_poll_interval_ms = cache_transceiver_config.kv_transfer_poll_interval_ms
 
-        # Get RNN state manager and layer distribution if mamba_cache_manager is provided.
-        rnn_state_manager = None
+        # Get RNN layer distribution if mamba_cache_manager is provided.
         rnn_layer_num_per_pp_rank = []
         if mamba_cache_manager is not None:
             if isinstance(mamba_cache_manager, CppMambaHybridCacheManager):
@@ -191,21 +190,20 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
                 rnn_layer_num_per_pp_rank = dist.pp_allgather(
                     mamba_cache_manager.local_num_mamba_layers)
             else:
-                rnn_state_manager = mamba_cache_manager._impl.mamba_impl
-                # Get the number of local RNN layers and allgather across PP ranks
-                rnn_local_layer_num = rnn_state_manager.get_num_local_layers()
+                # MixedMambaHybridCacheManager with PythonMambaCacheManager.
                 rnn_layer_num_per_pp_rank = dist.pp_allgather(
-                    rnn_local_layer_num)
+                    len(mamba_cache_manager._impl.mamba_layer_offsets))
                 logger.info(
                     f"RNN state transfer enabled: rnn_layer_num_per_pp={rnn_layer_num_per_pp_rank}"
                 )
 
-        self.impl = CacheTransceiverCpp(
-            kv_cache_manager.impl, total_num_kv_heads_per_layer, head_dim,
-            tokens_per_block, world_config,
-            pp_layer_num_per_pp_rank, dtype, attention_type,
-            cache_transceiver_config._to_pybind(), rnn_state_manager,
-            rnn_layer_num_per_pp_rank)
+        self.impl = CacheTransceiverCpp(kv_cache_manager.impl,
+                                        total_num_kv_heads_per_layer, head_dim,
+                                        tokens_per_block, world_config,
+                                        pp_layer_num_per_pp_rank, dtype,
+                                        attention_type,
+                                        cache_transceiver_config._to_pybind(),
+                                        rnn_layer_num_per_pp_rank)
 
     def respond_and_send_async(self, req: LlmRequest):
         return self.impl.respond_and_send_async(req)
