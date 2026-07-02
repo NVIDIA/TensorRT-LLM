@@ -1389,41 +1389,41 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
 class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
-    # (id, moe_backend, mtp_nextn, tp_size, pp_size, ep_size, torch_compile,
+    # (moe_backend, mtp_nextn, tp_size, pp_size, ep_size, torch_compile,
     #  low_precision_combine). fp8kv / attention_dp / cuda_graph /
     #  overlap_scheduler are True for every case (see _NVFP4_4GPU_PREMERGE_CASES).
+    # Case ids live as a LITERAL list in the parametrize decorator of
+    # test_nvfp4_4gpus_premerge_grouped, in this row order: the test-list
+    # validator can only statically check test-db [id] entries against literal
+    # ids, so keeping them inline makes a stale/typo'd yml entry fail
+    # pre-commit instead of being silently deselected in CI.
     _NVFP4_4GPU_PREMERGE_MATRIX = (
-        ("cutlass_mtp0_tp4_compile_off", "CUTLASS", 0, 4, 1, 1, False, False),
-        ("cutlass_mtp0_tp4_compile_on", "CUTLASS", 0, 4, 1, 1, True, False),
-        ("cutlass_mtp0_ep4_compile_on", "CUTLASS", 0, 4, 1, 4, True, False),
-        ("cutlass_mtp0_tp2pp2_compile_off", "CUTLASS", 0, 2, 2, 1, False,
-         False),
-        ("cutlass_mtp0_tp2pp2_compile_on", "CUTLASS", 0, 2, 2, 1, True, False),
-        ("cutlass_mtp2_tp4_compile_off", "CUTLASS", 2, 4, 1, 1, False, False),
-        ("trtllm_mtp2_ep4_compile_off", "TRTLLM", 2, 4, 1, 4, False, False),
-        ("cutlass_mtp2_pp4_compile_off", "CUTLASS", 2, 1, 4, 1, False, False),
-        ("cutlass_mtp0_pp4_compile_off", "CUTLASS", 0, 1, 4, 1, False, False),
-        ("cutlass_mtp0_pp4_compile_on", "CUTLASS", 0, 1, 4, 1, True, False),
-        ("trtllm_mtp0_tp4_compile_off", "TRTLLM", 0, 4, 1, 1, False, False),
-        ("trtllm_mtp0_ep4_compile_off", "TRTLLM", 0, 4, 1, 4, False, False),
-        ("cutlass_mtp0_tp4_lpc_compile_off", "CUTLASS", 0, 4, 1, 1, False,
-         True),
+        ("CUTLASS", 0, 4, 1, 1, False, False),
+        ("CUTLASS", 0, 4, 1, 1, True, False),
+        ("CUTLASS", 0, 4, 1, 4, True, False),
+        ("CUTLASS", 0, 2, 2, 1, False, False),
+        ("CUTLASS", 0, 2, 2, 1, True, False),
+        ("CUTLASS", 2, 4, 1, 1, False, False),
+        ("TRTLLM", 2, 4, 1, 4, False, False),
+        ("CUTLASS", 2, 1, 4, 1, False, False),
+        ("CUTLASS", 0, 1, 4, 1, False, False),
+        ("CUTLASS", 0, 1, 4, 1, True, False),
+        ("TRTLLM", 0, 4, 1, 1, False, False),
+        ("TRTLLM", 0, 4, 1, 4, False, False),
+        ("CUTLASS", 0, 4, 1, 1, False, True),
         # CUTEDSL coverage (skipped off SM100/103 by _run_nvfp4_4gpus_case);
         # preserves the pre-merge CUTEDSL cases upstream carried individually.
-        ("cutedsl_mtp0_tp2pp2_compile_off", "CUTEDSL", 0, 2, 2, 1, False, False
-         ),
-        ("cutedsl_mtp2_tp4_compile_off", "CUTEDSL", 2, 4, 1, 1, False, False),
+        ("CUTEDSL", 0, 2, 2, 1, False, False),
+        ("CUTEDSL", 2, 4, 1, 1, False, False),
     )
-    # Each case is pure _run_nvfp4_4gpus_case kwargs; the id (row[0]) stays in
-    # the matrix and is used only for the parametrize ids.
     _NVFP4_4GPU_PREMERGE_CASES = tuple(
-        dict(moe_backend=row[1],
-             mtp_nextn=row[2],
-             tp_size=row[3],
-             pp_size=row[4],
-             ep_size=row[5],
-             torch_compile=row[6],
-             low_precision_combine=row[7],
+        dict(moe_backend=row[0],
+             mtp_nextn=row[1],
+             tp_size=row[2],
+             pp_size=row[3],
+             ep_size=row[4],
+             torch_compile=row[5],
+             low_precision_combine=row[6],
              fp8kv=True,
              attention_dp=True,
              cuda_graph=True,
@@ -1432,17 +1432,18 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     # bf16 pre-merge cases share the SAME 4-GPU MPI session as the nvfp4 group
     # (both are 4-worker DeepSeek-V3-Lite, so world_size matches). mtp_nextn /
     # attention_dp / cuda_graph / overlap_scheduler are True for every case.
-    # (id, tp_size, pp_size, ep_size, torch_compile).
+    # (tp_size, pp_size, ep_size, torch_compile); ids are a literal list on
+    # test_bfloat16_4gpus_premerge_grouped, same reason as the nvfp4 matrix.
     _BF16_4GPU_PREMERGE_MATRIX = (
-        ("tp4_compile_on", 4, 1, 1, True),
-        ("ep4_compile_off", 4, 1, 4, False),
-        ("tp2pp2_compile_off", 2, 2, 1, False),
+        (4, 1, 1, True),
+        (4, 1, 4, False),
+        (2, 2, 1, False),
     )
     _BF16_4GPU_PREMERGE_CASES = tuple(
-        dict(tp_size=row[1],
-             pp_size=row[2],
-             ep_size=row[3],
-             torch_compile=row[4],
+        dict(tp_size=row[0],
+             pp_size=row[1],
+             ep_size=row[2],
+             torch_compile=row[3],
              mtp_nextn=2,
              attention_dp=True,
              cuda_graph=True,
@@ -2366,7 +2367,25 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "case",
         _NVFP4_4GPU_PREMERGE_CASES,
-        ids=[row[0] for row in _NVFP4_4GPU_PREMERGE_MATRIX],
+        # Literal ids (one per matrix row, in row order) so the test-list
+        # validator can check l0_gb200_multi_gpus.yml entries against them.
+        ids=[
+            "cutlass_mtp0_tp4_compile_off",
+            "cutlass_mtp0_tp4_compile_on",
+            "cutlass_mtp0_ep4_compile_on",
+            "cutlass_mtp0_tp2pp2_compile_off",
+            "cutlass_mtp0_tp2pp2_compile_on",
+            "cutlass_mtp2_tp4_compile_off",
+            "trtllm_mtp2_ep4_compile_off",
+            "cutlass_mtp2_pp4_compile_off",
+            "cutlass_mtp0_pp4_compile_off",
+            "cutlass_mtp0_pp4_compile_on",
+            "trtllm_mtp0_tp4_compile_off",
+            "trtllm_mtp0_ep4_compile_off",
+            "cutlass_mtp0_tp4_lpc_compile_off",
+            "cutedsl_mtp0_tp2pp2_compile_off",
+            "cutedsl_mtp2_tp4_compile_off",
+        ],
     )
     def test_nvfp4_4gpus_premerge_grouped(self, case, shared_llm_4gpu):
         # shared_llm_4gpu injects the shared 4-GPU MPI session, whose fixture
@@ -2380,7 +2399,12 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "case",
         _BF16_4GPU_PREMERGE_CASES,
-        ids=[row[0] for row in _BF16_4GPU_PREMERGE_MATRIX],
+        # Literal ids (one per matrix row, in row order); see the nvfp4 group.
+        ids=[
+            "tp4_compile_on",
+            "ep4_compile_off",
+            "tp2pp2_compile_off",
+        ],
     )
     def test_bfloat16_4gpus_premerge_grouped(self, case, shared_llm_4gpu):
         # Reuses the same module-scoped shared_llm_4gpu session as the nvfp4
