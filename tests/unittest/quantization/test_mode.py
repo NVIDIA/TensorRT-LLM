@@ -18,7 +18,6 @@ from tensorrt_llm.quantization import QuantMode
 
 
 class TestQuantMode(unittest.TestCase):
-
     def test_all(self):
         # Set activations and weights flags.
         qm = QuantMode.ACTIVATIONS | QuantMode.INT8_WEIGHTS
@@ -28,8 +27,7 @@ class TestQuantMode(unittest.TestCase):
         # Make sure _all returns False when asked only for ACTIVATIONS.
         self.assertFalse(qm._all(QuantMode.ACTIVATIONS))
         # Make sure _all returns True when asked only for ACTIVATIONS if limited to ACTIVATIONS flag.
-        self.assertTrue(
-            qm._all(QuantMode.ACTIVATIONS, mask=QuantMode.ACTIVATIONS))
+        self.assertTrue(qm._all(QuantMode.ACTIVATIONS, mask=QuantMode.ACTIVATIONS))
 
     def test_any(self):
         # Set activations and weights flags.
@@ -171,15 +169,11 @@ class TestQuantMode(unittest.TestCase):
 
     def test_failure_quant(self):
         # Expect failure if weights are not quantized, but activations are.
-        self.assertRaises(
-            ValueError,
-            lambda: QuantMode.from_description(False, True, False, False))
+        self.assertRaises(ValueError, lambda: QuantMode.from_description(False, True, False, False))
 
         # Expect failure if per token and per channel quantization, but weights and activations are not quantized.
-        self.assertRaises(
-            ValueError,
-            lambda: QuantMode.from_description(False, False, True, True))
+        self.assertRaises(ValueError, lambda: QuantMode.from_description(False, False, True, True))
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()
