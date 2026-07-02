@@ -20,7 +20,7 @@ from defs.common import get_free_port_in_ci as get_free_port
 
 from tensorrt_llm.executor.result import GenerationResultBase
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
-from tensorrt_llm.llmapi.llm_args import LlmArgs
+from tensorrt_llm.llmapi.llm_args import LlmArgs, MTPDecodingConfig
 from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
 
 from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
@@ -2557,5 +2557,12 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
                                       gen_server_config,
                                       self.MODEL_PATH,
                                       max_workers=128) as llm:
+            # launch_disaggregated_llm builds a bare LlmArgs for the DuckLLM,
+            # so the specs used for the accuracy reference lookup must be
+            # filled in to match the registered entry (NVFP4 + FP8 KV cache
+            # + MTP).
+            llm.args.quant_config.kv_cache_quant_algo = "FP8"
+            llm.args.speculative_config = MTPDecodingConfig(
+                max_draft_len=speculative_config["max_draft_len"])
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
