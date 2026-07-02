@@ -149,7 +149,9 @@ def _load_lora_deltas(
     sft_paths = _find_safetensors_files(lora_path)
     if not sft_paths:
         raise ValueError(f"No safetensors files found at {lora_path}")
-    _prefetch_ltx2_safetensors_files(sft_paths)
+    # This helper can run in a background thread while base components load.
+    # Avoid distributed prefetch collectives here; every rank must enter those
+    # from the same foreground load sequence to avoid hangs.
 
     raw: Dict[str, torch.Tensor] = {}
     alpha_dict: Dict[str, float] = {}

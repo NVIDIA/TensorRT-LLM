@@ -1003,16 +1003,29 @@ class TestTwoStageLoRALoadingOverlap:
             assert device == torch.device("cpu")
 
         monkeypatch.setattr(pipeline_ltx2_two_stages, "ThreadPoolExecutor", FakeExecutor)
+        monkeypatch.setattr(
+            pipeline_ltx2_two_stages,
+            "_get_free_gpu_memory_gib",
+            lambda device=None: None,
+        )
         monkeypatch.setattr(LTX2Pipeline, "load_standard_components", fake_base_load)
 
+        class FakeTransformer:
+            def named_modules(self):
+                return []
+
+            def named_parameters(self):
+                return []
+
         pipeline = LTX2TwoStagesPipeline.__new__(LTX2TwoStagesPipeline)
-        pipeline.model_config = SimpleNamespace(
+        pipeline.pipeline_config = SimpleNamespace(
             torch_dtype=torch.float32,
             extra_attrs={
                 "distilled_lora_path": "/fake/lora.safetensors",
             },
         )
-        pipeline.transformer = object()
+        pipeline.model_config = pipeline.pipeline_config
+        pipeline.transformer = FakeTransformer()
 
         pipeline.load_standard_components("/fake/checkpoint", torch.device("cpu"))
 
