@@ -1069,6 +1069,17 @@ class PyTorchModelEngine(ModelEngine):
                 resource_manager)
             self._general_warmup(resource_manager, warmup_requests_configs)
 
+        # Pre-JIT Mamba SSD HAS_INITSTATES=True Triton kernels so the first
+        # prefill that carries a cached prefix does not pay the compile cost
+        # inline. Runs for all cache-manager kinds (incl. MambaHybridCacheManager),
+        # since that manager is exactly the one that exposes the cold path.
+        model_root = getattr(self, "model", None)
+        if model_root is not None:
+            for module in model_root.modules():
+                hook = getattr(module, "warmup_ssd_initstates_kernels", None)
+                if callable(hook):
+                    hook()
+
     def _general_warmup(self, resource_manager: ResourceManager,
                         warmup_requests_configs: List[Tuple[int, int]]):
         """
