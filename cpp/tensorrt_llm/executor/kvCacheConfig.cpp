@@ -202,6 +202,26 @@ void KvCacheConfig::setHostCacheSize(size_t hostCacheSize)
     mHostCacheSize = hostCacheSize;
 }
 
+std::optional<size_t> KvCacheConfig::getDiskCacheSize() const
+{
+    return mDiskCacheSize;
+}
+
+std::string const& KvCacheConfig::getDiskCachePath() const
+{
+    return mDiskCachePath;
+}
+
+void KvCacheConfig::setDiskCacheSize(std::optional<size_t> diskCacheSize)
+{
+    mDiskCacheSize = diskCacheSize;
+}
+
+void KvCacheConfig::setDiskCachePath(std::string const& diskCachePath)
+{
+    mDiskCachePath = diskCachePath;
+}
+
 void KvCacheConfig::setSecondaryOffloadMinPriority(std::optional<RetentionPriority> secondaryOffloadMinPriority)
 {
     mSecondaryOffloadMinPriority = secondaryOffloadMinPriority;

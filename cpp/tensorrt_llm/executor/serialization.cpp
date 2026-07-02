@@ -1353,10 +1353,15 @@ KvCacheConfig Serialization::deserializeKvCacheConfig(std::istream& is)
     auto eventBufferMaxSize = su::deserialize<size_t>(is);
     auto useUvm = su::deserialize<bool>(is);
     auto attentionDpEventsGatherPeriodMs = su::deserialize<SizeType32>(is);
+    auto diskCacheSize = su::deserialize<std::optional<size_t>>(is);
+    auto diskCachePath = su::deserialize<std::string>(is);
 
-    return KvCacheConfig{enableBlockReuse, maxTokens, maxAttentionWindowVec, sinkTokenLength, freeGpuMemoryFraction,
-        hostCacheSize, crossKvCacheFraction, secondaryOffloadMinPriority, eventBufferMaxSize, enablePartialReuse,
-        copyOnPartialReuse, useUvm, attentionDpEventsGatherPeriodMs};
+    auto kvCacheConfig = KvCacheConfig{enableBlockReuse, maxTokens, maxAttentionWindowVec, sinkTokenLength,
+        freeGpuMemoryFraction, hostCacheSize, crossKvCacheFraction, secondaryOffloadMinPriority, eventBufferMaxSize,
+        enablePartialReuse, copyOnPartialReuse, useUvm, attentionDpEventsGatherPeriodMs};
+    kvCacheConfig.setDiskCacheSize(diskCacheSize);
+    kvCacheConfig.setDiskCachePath(diskCachePath);
+    return kvCacheConfig;
 }
 
 void Serialization::serialize(KvCacheConfig const& kvCacheConfig, std::ostream& os)
@@ -1374,6 +1379,8 @@ void Serialization::serialize(KvCacheConfig const& kvCacheConfig, std::ostream& 
     su::serialize(kvCacheConfig.getEventBufferMaxSize(), os);
     su::serialize(kvCacheConfig.getUseUvm(), os);
     su::serialize(kvCacheConfig.getAttentionDpEventsGatherPeriodMs(), os);
+    su::serialize(kvCacheConfig.getDiskCacheSize(), os);
+    su::serialize(kvCacheConfig.getDiskCachePath(), os);
 }
 
 size_t Serialization::serializedSize(KvCacheConfig const& kvCacheConfig)
@@ -1393,6 +1400,8 @@ size_t Serialization::serializedSize(KvCacheConfig const& kvCacheConfig)
     totalSize += su::serializedSize(kvCacheConfig.getEventBufferMaxSize());
     totalSize += su::serializedSize(kvCacheConfig.getUseUvm());
     totalSize += su::serializedSize(kvCacheConfig.getAttentionDpEventsGatherPeriodMs());
+    totalSize += su::serializedSize(kvCacheConfig.getDiskCacheSize());
+    totalSize += su::serializedSize(kvCacheConfig.getDiskCachePath());
     return totalSize;
 }
 

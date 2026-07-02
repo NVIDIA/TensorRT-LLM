@@ -391,6 +391,62 @@ void KVCacheTransferManager::offload(BlockPtr const& block, BlockPtr const& offl
     mOffloadManager.getStream().record(mPendingWrites[offloadBlockIndex]);
 }
 
+namespace
+{
+std::string diskSlotFilename(std::string const& directory, SizeType32 diskSlot, size_t poolIdx)
+{
+    char buf[512];
+    std::snprintf(buf, sizeof(buf), "%s/slot_%d_pool_%zu.bin", directory.c_str(), diskSlot, poolIdx);
+    return std::string(buf);
+}
+} // namespace
+
+void KVCacheTransferManager::spillToFile(BlockPtr const& srcHostBlock, SizeType32 diskSlot,
+    std::vector<KVCacheBlockPool> const& pools, std::string const& directory)
+{
+    TLLM_CHECK_WITH_INFO(!directory.empty(), "disk tier requires a directory");
+    // The victim's bytes may still be the target of an in-flight async GPU->host copy;
+    // wait it out before reading host memory (same event discipline as copyBlock).
+    auto const idx = getPendingTransferIndex(srcHostBlock);
+    if (auto it = mPendingWrites.find(idx); it != mPendingWrites.end())
+    {
+        it->second.synchronize();
+    }
+    for (size_t poolIdx = 0; poolIdx < pools.size(); ++poolIdx)
+    {
+        TLLM_CHECK_WITH_INFO(!pools[poolIdx].layerFirstLayout, "disk tier does not support layer-first layout pools");
+        auto ptr = computeBlockPointer(srcHostBlock, pools, poolIdx);
+        auto const filename = diskSlotFilename(directory, diskSlot, poolIdx);
+        int fd = ::open(filename.c_str(), O_CREAT | O_WRONLY, 0644);
+        TLLM_CHECK_WITH_INFO(fd >= 0, "disk tier: cannot open %s", filename.c_str());
+        auto const bytes = static_cast<ssize_t>(ptr->getSizeInBytes());
+        auto const written = ::pwrite(fd, ptr->data(), bytes, 0);
+        ::close(fd);
+        TLLM_CHECK_WITH_INFO(written == bytes, "disk tier: short write to %s", filename.c_str());
+    }
+}
+
+void KVCacheTransferManager::loadFromFile(BlockPtr const& dstPrimaryBlock, SizeType32 diskSlot,
+    std::vector<KVCacheBlockPool> const& pools, std::string const& directory)
+{
+    TLLM_CHECK_WITH_INFO(!directory.empty(), "disk tier requires a directory");
+    auto const idx = getPendingTransferIndex(dstPrimaryBlock);
+    if (auto it = mPendingWrites.find(idx); it != mPendingWrites.end())
+    {
+        it->second.synchronize();
+    }
+    if (auto it = mPendingReads.find(idx); it != mPendingReads.end())
+    {
+        it->second.synchronize();
+    }
+    for (size_t poolIdx = 0; poolIdx < pools.size(); ++poolIdx)
+    {
+        TLLM_CHECK_WITH_INFO(!pools[poolIdx].layerFirstLayout, "disk tier does not support layer-first layout pools");
+        auto ptr = computeBlockPointer(dstPrimaryBlock, pools, poolIdx);
+        fileToGpuPosix(ptr, diskSlotFilename(directory, diskSlot, poolIdx));
+    }
+}
+
 void KVCacheTransferManager::syncWithBufferManager()
 {
     tr::CudaEvent readyForOffloadEvent;

@@ -3541,6 +3541,9 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             attention_dp_events_gather_period_ms=self.
             attention_dp_events_gather_period_ms,
             max_gpu_total_bytes=self.max_gpu_total_bytes)
+        if self.disk_cache_size:
+            config.disk_cache_size = self.disk_cache_size
+            config.disk_cache_path = self.disk_cache_path or ""
         return config
 
     @field_validator('free_gpu_memory_fraction')

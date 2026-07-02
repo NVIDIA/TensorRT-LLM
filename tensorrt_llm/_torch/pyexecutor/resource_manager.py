@@ -612,6 +612,17 @@ class KVCacheManager(BaseResourceManager):
                 kwargs['event_manager'] = KVCacheEventManagerCpp(
                     max_kv_event_entries=self.event_buffer_max_size)
 
+        disk_cache_size = getattr(kv_cache_config, "disk_cache_size", None) or 0
+        blocks_in_disk_pool = 0
+        if disk_cache_size:
+            max_tokens_disk = disk_cache_size // self.get_cache_bytes_per_token(
+            )
+            blocks_in_disk_pool = int(max_tokens_disk // self.tokens_per_block)
+            logger.info(f"[disk-tier] {blocks_in_disk_pool} blocks "
+                        f"({disk_cache_size / (1 << 30):.1f} GiB)")
+        kwargs['blocks_in_disk_pool'] = blocks_in_disk_pool
+        kwargs['disk_cache_path'] = getattr(kv_cache_config, "disk_cache_path",
+                                            None) or ""
         self.impl = KVCacheManagerCpp(**kwargs)
         # Warmup baseline for cumulative counters (set by snapshot_warmup_baseline)
         self._warmup_reused_blocks = 0

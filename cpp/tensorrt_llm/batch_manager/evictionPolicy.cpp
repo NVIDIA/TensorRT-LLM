@@ -33,8 +33,9 @@ auto const kNumPriorities = kMaxPriority - kMinPriority + 1;
 auto const kDefaultPriority = executor::KvCacheRetentionConfig::kDefaultRetentionPriority;
 executor::RetentionPriority const kDefaultSecondaryOffloadMinPriority = 30;
 
-int const kNumCacheLevels = 2;
-int const kPlaceholderLevel = kNumCacheLevels; // placeholder blocks live at level 2
+int const kNumCacheLevels = 3;                 // 0 = GPU (primary), 1 = host (secondary), 2 = disk
+int const kDiskLevel = 2;
+int const kPlaceholderLevel = kNumCacheLevels; // placeholders live one past the real cache levels
 
 namespace
 {
@@ -43,6 +44,10 @@ SizeType32 getCacheLevel(BlockPtr const& block)
     if (block->isPlaceholder())
     {
         return kPlaceholderLevel;
+    }
+    if (block->isOnDisk())
+    {
+        return kDiskLevel;
     }
     return block->isPrimary() ? 0 : 1;
 }
@@ -58,6 +63,8 @@ constexpr auto defaultPriorityIdx = getPriorityIdx(kDefaultPriority);
 void LRUEvictionPolicy::initialize(std::vector<BlockPtr>& mAllBlocksById, std::vector<SizeType32> sizes,
     std::optional<executor::RetentionPriority> secondaryOffloadMinPriority)
 {
+    TLLM_CHECK_WITH_INFO(static_cast<int>(sizes.size()) == kNumCacheLevels,
+        "initialize expects one block count per cache level (%d), got %zu", kNumCacheLevels, sizes.size());
     SizeType32 startIdx = 0;
 
     // Create queues for all levels: primary, secondary, and placeholder (initially empty).

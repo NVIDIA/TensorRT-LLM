@@ -1097,6 +1097,10 @@ public:
     void setUseUvm(bool useUvm);
     void setAttentionDpEventsGatherPeriodMs(SizeType32 attentionDpEventsGatherPeriodMs);
     void setMaxGpuTotalBytes(uint64_t maxGpuTotalBytes);
+    [[nodiscard]] std::optional<size_t> getDiskCacheSize() const;
+    [[nodiscard]] std::string const& getDiskCachePath() const;
+    void setDiskCacheSize(std::optional<size_t> diskCacheSize);
+    void setDiskCachePath(std::string const& diskCachePath);
 
     void fillEmptyFieldsFromRuntimeDefaults(tensorrt_llm::runtime::RuntimeDefaults const& runtimeDefaults);
 
@@ -1156,6 +1160,12 @@ private:
     /// If both mMaxGpuTotalBytes and mFreeGpuMemoryFraction are specified, memory corresponding to the minimum will
     /// be allocated.
     uint64_t mMaxGpuTotalBytes;
+
+    /// @brief Size in bytes of the disk tier backing explicit-cache blocks. Disabled when unset or 0.
+    std::optional<size_t> mDiskCacheSize;
+
+    /// @brief Directory holding the disk tier's block files. Must be non-empty when mDiskCacheSize > 0.
+    std::string mDiskCachePath;
 };
 
 /// @brief Configuration class for the runtime perf knobs
