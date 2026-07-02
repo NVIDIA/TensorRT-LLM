@@ -50,6 +50,8 @@ from .base import PRInputs, Rule, RuleResult
 #   debug tools that run at decision time. Edits change narrowing logic
 #   for future PRs but cannot affect the outcome of any test stage in
 #   the current PR.
+# - jenkins/L0_MergeRequest.groovy     : pre-merge pipeline definition;
+#   orchestration only, not exercised by any L0 test stage.
 OUT_OF_SCOPE_PREFIXES: tuple[str, ...] = (
     "tests/integration/test_lists/qa/",
     "tests/integration/test_lists/dev/",
@@ -57,6 +59,7 @@ OUT_OF_SCOPE_PREFIXES: tuple[str, ...] = (
     "tests/integration/defs/agg_unit_mem_df.csv",
     "tests/microbenchmarks/",
     "jenkins/scripts/cbts/",
+    "jenkins/L0_MergeRequest.groovy",
 )
 
 # Path suffixes (extensions) with no test-execution impact, anywhere in
