@@ -195,6 +195,13 @@ RuntimeTactic resolve_tactic(int tactic)
         return {KernelShape::k2Sm256x256x256, dim3(4, 4, 1), dim3(2, 1, 1)};
     case Nvfp4SvdquantGemmTactic::k2Sm256x256x256Cluster4x1:
         return {KernelShape::k2Sm256x256x256, dim3(4, 1, 1), dim3(2, 1, 1)};
+    case Nvfp4SvdquantGemmTactic::k2Sm256x256x256Cluster4x2:
+        return {KernelShape::k2Sm256x256x256, dim3(4, 2, 1), dim3(2, 1, 1)};
+    case Nvfp4SvdquantGemmTactic::k2Sm256x256x256Cluster2x4:
+        return {KernelShape::k2Sm256x256x256, dim3(2, 4, 1), dim3(2, 1, 1)};
+    case Nvfp4SvdquantGemmTactic::k1Sm128x128x256: return {KernelShape::k1Sm128x128x256, dim3(1, 1, 1), dim3(1, 1, 1)};
+    case Nvfp4SvdquantGemmTactic::k2Sm256x128x256Cluster2x2:
+        return {KernelShape::k2Sm256x128x256, dim3(2, 2, 1), dim3(2, 1, 1)};
     default: throw std::invalid_argument("nvfp4_svdquant_gemm: invalid tactic");
     }
 }

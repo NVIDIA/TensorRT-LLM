@@ -64,9 +64,16 @@ enum class Nvfp4SvdquantGemmTactic : int
     k2Sm256x256x256Cluster2x2 = 20,
     k2Sm256x256x256Cluster4x4 = 21,
     k2Sm256x256x256Cluster4x1 = 22,
+    // Appended runtime-cluster variants of existing kernel shapes (no new template
+    // instantiations). These mirror the stock CUTLASS NVFP4 runner's per-shape winners
+    // (128x256x256B/4x2, /2x4; 128x128x256B/1x1; /2x2) that the original set lacked.
+    k2Sm256x256x256Cluster4x2 = 23,
+    k2Sm256x256x256Cluster2x4 = 24,
+    k1Sm128x128x256 = 25,
+    k2Sm256x128x256Cluster2x2 = 26,
 };
 
-inline constexpr int kNvfp4SvdquantGemmNumTactics = 23;
+inline constexpr int kNvfp4SvdquantGemmNumTactics = 27;
 
 // Tactic 0 preserves the original 1SM kernel and remains the source-compatible default.
 size_t nvfp4_svdquant_gemm_workspace_size(int m, int n, int k, int tactic = 0);

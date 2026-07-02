@@ -59,6 +59,11 @@ _GEMM_CASES.extend((44, 3072, 3072, True, tactic) for tactic in range(13, 16))
 # K=256 residual tiles use a BF16 K=64 storage/TMA box with logical rank 32;
 # cover every runtime cluster, including 2SM multicast, on a non-multiple M tail.
 _GEMM_CASES.extend((129, 3072, 3072, True, tactic) for tactic in range(16, 23))
+# Appended runtime-cluster variants (23-26) mirroring the stock runner's per-shape
+# winners: 256x256x256 at 4x2/2x4 (image-size M), 128x128x256 at 1x1 and
+# 256x128x256 at 2x2 (token-tail M).
+_GEMM_CASES.extend((6912, 3072, 3072, True, tactic) for tactic in [23, 24])
+_GEMM_CASES.extend([(44, 3072, 3072, True, 25), (129, 3072, 12288, True, 26)])
 
 
 def _sqnr_db(ref: torch.Tensor, got: torch.Tensor) -> float:
