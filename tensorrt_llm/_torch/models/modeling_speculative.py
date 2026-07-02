@@ -992,6 +992,15 @@ class DFlashForCausalLM(nn.Module):
         # Laguna DFlash checkpoints may ship a fused self_attn.qkv_proj; the draft
         # loader expects split q/k/v (a fused key is silently dropped otherwise).
         if any(k.endswith('self_attn.qkv_proj.weight') for k in weights):
+            for attr in ('num_attention_heads_per_layer',
+                         'num_key_value_heads_per_layer'):
+                per_layer = getattr(self.config, attr, None)
+                if per_layer is not None and len(set(per_layer)) > 1:
+                    raise ValueError(
+                        "DFlash load_weights() splits the fused qkv_proj using "
+                        "the global head count, but the drafter has heterogeneous "
+                        f"{attr} {sorted(set(per_layer))}; per-layer qkv splitting "
+                        "is required for this checkpoint.")
             head_dim = getattr(
                 self.config, 'head_dim',
                 self.config.hidden_size // self.config.num_attention_heads)
