@@ -171,9 +171,6 @@ def _run_with_env(
         monkeypatch.setattr(
             TorchSampler, "_predict_beam_search_is_likely_finishing", predictor_override
         )
-    if sampler_method_patches:
-        for name, replacement in sampler_method_patches.items():
-            monkeypatch.setattr(TorchSampler, name, replacement)
 
     gc.collect(2)
     llm = _build_llm(
@@ -184,6 +181,15 @@ def _run_with_env(
     )
     try:
         with llm:
+            # Install sample_async/update_requests hooks only after the engine
+            # is fully constructed. configure_kv_cache_capacity issues a dummy
+            # warmup request that legitimately syncs inside flashinfer's
+            # _prepare_logits_with_temperature; wrapping that in
+            # assert_no_cuda_sync() would trip on a sync unrelated to the
+            # speculative beam-history D2H path under test.
+            if sampler_method_patches:
+                for name, replacement in sampler_method_patches.items():
+                    monkeypatch.setattr(TorchSampler, name, replacement)
             return _generate(
                 llm, input_prompts, _make_sampling_params(fixed_params, stop_token_ids)
             )
