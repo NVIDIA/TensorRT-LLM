@@ -549,10 +549,6 @@ class KVCacheManager:
         return self._init_config.enable_partial_reuse
 
     @property
-    def ssm_reuse_interval(self) -> int:
-        return self._init_config.ssm_reuse_interval
-
-    @property
     def enable_swa_scratch_reuse(self) -> bool:
         return self._init_config.enable_swa_scratch_reuse
 
@@ -825,3 +821,7 @@ class KVCacheManager:
     @property
     def init_config(self) -> KVCacheManagerConfig:
         return self._init_config
+
+    @property
+    def commit_min_snapshot(self) -> bool:
+        return self.init_config.commit_min_snapshot
