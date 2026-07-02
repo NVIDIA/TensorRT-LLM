@@ -1827,7 +1827,8 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
                                      return_generation_logits: bool,
                                      tp_size=1,
                                      streaming=False,
-                                     backend=None):
+                                     backend=None,
+                                     **extra_llm_kwargs):
     LLM_CLASS = LLM
     llm_args_extra = {}
     kv_cache_args_extra = {}
@@ -1849,77 +1850,82 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
         tensor_parallel_size=tp_size,
         gather_generation_logits=True,
         **llm_args_extra,
+        **extra_llm_kwargs,
     )
+    try:
 
-    prompts = ["A B C D E F G H I J K"]
-    sampling_params = SamplingParams(
-        logprobs=logprobs,
-        prompt_logprobs=prompt_logprobs,
-        return_context_logits=return_context_logits,
-        return_generation_logits=return_generation_logits)
+        prompts = ["A B C D E F G H I J K"]
+        sampling_params = SamplingParams(
+            logprobs=logprobs,
+            prompt_logprobs=prompt_logprobs,
+            return_context_logits=return_context_logits,
+            return_generation_logits=return_generation_logits)
 
-    for output in llm.generate(prompts, sampling_params):
-        context_logits = output.context_logits
-        generation_logits = output.outputs[0].generation_logits
-        logprobs_result = output.outputs[0].logprobs
-        prompt_logprobs_result = output.outputs[0].prompt_logprobs
-        token_ids = output.outputs[0].token_ids
+        for output in llm.generate(prompts, sampling_params):
+            context_logits = output.context_logits
+            generation_logits = output.outputs[0].generation_logits
+            logprobs_result = output.outputs[0].logprobs
+            prompt_logprobs_result = output.outputs[0].prompt_logprobs
+            token_ids = output.outputs[0].token_ids
 
-        # ensure logits are dropped unless users specify return_context_logits=True
-        if prompt_logprobs and not return_context_logits:
-            assert context_logits is None
+            # ensure logits are dropped unless users specify return_context_logits=True
+            if prompt_logprobs and not return_context_logits:
+                assert context_logits is None
 
-        if logprobs and not return_generation_logits:
-            assert generation_logits is None
+            if logprobs and not return_generation_logits:
+                assert generation_logits is None
 
-        if return_context_logits:
-            assert isinstance(context_logits, torch.Tensor)
+            if return_context_logits:
+                assert isinstance(context_logits, torch.Tensor)
 
-        if return_generation_logits:
-            assert isinstance(generation_logits, torch.Tensor)
+            if return_generation_logits:
+                assert isinstance(generation_logits, torch.Tensor)
 
-        if prompt_logprobs:
-            assert prompt_logprobs_result and len(
-                prompt_logprobs_result[0].keys()) == prompt_logprobs
-            print("prompt_logprobs[0]: ", prompt_logprobs_result[0])
+            if prompt_logprobs:
+                assert prompt_logprobs_result and len(
+                    prompt_logprobs_result[0].keys()) == prompt_logprobs
+                print("prompt_logprobs[0]: ", prompt_logprobs_result[0])
 
-        if logprobs:
-            assert logprobs_result and len(
-                logprobs_result[0].keys()) in {logprobs, logprobs + 1}
-            # Most contain log prob of the sample token, even if it's not within K
-            assert token_ids[0] in logprobs_result[0].keys()
-            for step_logprobs in logprobs_result:
-                assert len(step_logprobs) == logprobs
-                logprob_items = [(logprob_obj.logprob, logprob_obj.rank)
-                                 for logprob_obj in step_logprobs.values()]
-                sorted_by_rank = sorted(logprob_items, key=lambda x: x[1])
+            if logprobs:
+                assert logprobs_result and len(
+                    logprobs_result[0].keys()) in {logprobs, logprobs + 1}
+                # Most contain log prob of the sample token, even if it's not within K
+                assert token_ids[0] in logprobs_result[0].keys()
+                for step_logprobs in logprobs_result:
+                    assert len(step_logprobs) == logprobs
+                    logprob_items = [(logprob_obj.logprob, logprob_obj.rank)
+                                     for logprob_obj in step_logprobs.values()]
+                    sorted_by_rank = sorted(logprob_items, key=lambda x: x[1])
 
-                for i in range(logprobs - 1):
-                    current_logprob, current_rank = sorted_by_rank[i]
-                    next_logprob, next_rank = sorted_by_rank[i + 1]
-                    assert current_logprob >= next_logprob
-                    assert current_rank == i + 1
-                    assert next_rank == current_rank + 1
-            print("logprobs[0]: ", logprobs_result[0])
+                    for i in range(logprobs - 1):
+                        current_logprob, current_rank = sorted_by_rank[i]
+                        next_logprob, next_rank = sorted_by_rank[i + 1]
+                        assert current_logprob >= next_logprob
+                        assert current_rank == i + 1
+                        assert next_rank == current_rank + 1
+                print("logprobs[0]: ", logprobs_result[0])
 
-    if streaming:
+        if streaming:
 
-        async def task(id: int, prompt: str):
-            logprobs_result_streaming = []
-            async for output in llm.generate_async(prompt,
-                                                   sampling_params,
-                                                   streaming=True):
-                logprobs_result_streaming += output.outputs[0].logprobs_diff
+            async def task(id: int, prompt: str):
+                logprobs_result_streaming = []
+                async for output in llm.generate_async(prompt,
+                                                       sampling_params,
+                                                       streaming=True):
+                    logprobs_result_streaming += output.outputs[0].logprobs_diff
 
-            # comparing streaming logprobs result to non-streaming
-            assert logprobs_result_streaming == logprobs_result
-            assert output.outputs[0].prompt_logprobs == prompt_logprobs_result
+                # comparing streaming logprobs result to non-streaming
+                assert logprobs_result_streaming == logprobs_result
+                assert output.outputs[
+                    0].prompt_logprobs == prompt_logprobs_result
 
-        async def main():
-            tasks = [task(id, prompt) for id, prompt in enumerate(prompts)]
-            await asyncio.gather(*tasks)
+            async def main():
+                tasks = [task(id, prompt) for id, prompt in enumerate(prompts)]
+                await asyncio.gather(*tasks)
 
-        asyncio.run(main())
+            asyncio.run(main())
+    finally:
+        llm.shutdown()
 
 
 @force_ampere
@@ -2205,7 +2211,8 @@ def llm_get_stats_test_harness(tp_size: int = 1,
                                pytorch_backend: bool = False,
                                use_overlap: bool = False,
                                enable_chunked_prefill: bool = False,
-                               enable_iter_req_stats: bool = False):
+                               enable_iter_req_stats: bool = False,
+                               **extra_llm_kwargs):
 
     if return_context_logits and pytorch_backend:
         pytest.skip("pytorch backend does not support context logits")
@@ -2252,7 +2259,8 @@ def llm_get_stats_test_harness(tp_size: int = 1,
                             kv_cache_config=global_kvcache_config,
                             tensor_parallel_size=tp_size,
                             pipeline_parallel_size=pp_size,
-                            **llm_args_extra) as llm:
+                            **llm_args_extra,
+                            **extra_llm_kwargs) as llm:
 
         max_tokens = 5
         sampling_params = SamplingParams(max_tokens=max_tokens,
@@ -2354,7 +2362,8 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
                                      pytorch_backend: bool = False,
                                      use_overlap: bool = False,
                                      enable_chunked_prefill: bool = False,
-                                     enable_iter_req_stats: bool = False):
+                                     enable_iter_req_stats: bool = False,
+                                     **extra_llm_kwargs):
 
     if return_context_logits and pytorch_backend:
         pytest.skip("pytorch backend does not support context logits")
@@ -2395,7 +2404,8 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
                    kv_cache_config=global_kvcache_config,
                    tensor_parallel_size=tp_size,
                    pipeline_parallel_size=pp_size,
-                   **llm_args_extra) as llm:
+                   **llm_args_extra,
+                   **extra_llm_kwargs) as llm:
 
         max_tokens = 6
         sampling_params = SamplingParams(max_tokens=max_tokens,
@@ -2491,7 +2501,9 @@ def test_llm_chunked_prefill():
     success_path()
 
 
-def _test_llm_capture_request_error(pytorch_backend: bool, tp_size: int = 1):
+def _test_llm_capture_request_error(pytorch_backend: bool,
+                                    tp_size: int = 1,
+                                    **extra_llm_kwargs):
     llm_args_extra = {}
     if pytorch_backend:
         LLM_CLASS = LLM_torch
@@ -2507,12 +2519,16 @@ def _test_llm_capture_request_error(pytorch_backend: bool, tp_size: int = 1):
         model=llama_model_path,
         tensor_parallel_size=tp_size,
         **llm_args_extra,
+        **extra_llm_kwargs,
     )
 
     prompt = 'A ' * 65  # the minimum max_num_tokens is 64
     # Both backends now consistently raise RequestError for max_num_tokens validation
-    with pytest.raises(RequestError):
-        llm.generate(prompt)
+    try:
+        with pytest.raises(RequestError):
+            llm.generate(prompt)
+    finally:
+        llm.shutdown()
 
 
 def test_llm_capture_request_error():

@@ -82,9 +82,11 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
     def launch_workers(self):
         logger.debug(f"Launching workers")
         assert self.mpi_session is not None
-        self.mpi_session.submit(RpcWorker.main_task,
-                                rpc_addr=self.rpc_addr,
-                                **self.worker_kwargs)
+        # Keep the futures: on an externally owned (shared) session, shutdown
+        # waits on them so worker teardown finishes before the pool is reused.
+        self.worker_futures = self.mpi_session.submit(RpcWorker.main_task,
+                                                      rpc_addr=self.rpc_addr,
+                                                      **self.worker_kwargs)
 
     def _setup_mainloop_with_tasks(self):
         """Setup mainloop with tasks needed for RpcProxy.
@@ -276,8 +278,23 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         # 3. shutdown the mpi session, this should wait until all the PyExecutor
         # processes are shutdown
         if self.mpi_session is not None:
-            logger_debug(f"Shutting down mpi session", color="yellow")
-            self.mpi_session.shutdown()
+            if self._owns_mpi_session:
+                logger_debug(f"Shutting down mpi session", color="yellow")
+                self.mpi_session.shutdown()
+            else:
+                # Externally owned (shared) session: leave the pool alive, but
+                # wait for this executor's worker tasks to finish so the next
+                # LLM on the pool doesn't race with PyExecutor teardown. Block
+                # without a timeout, mirroring the owned path above
+                # (mpi_session.shutdown() also waits indefinitely); a timeout
+                # that expires would just reintroduce the race it prevents.
+                for future in getattr(self, "worker_futures", []):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        logger.warning(
+                            f"RPC worker task raised during shutdown on "
+                            f"shared MPI session: {e}")
             logger_debug(f"Mpi session shutdown", color="yellow")
             self.mpi_session = None
 
@@ -291,8 +308,12 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
 
     def _create_mpi_session(self, model_world_size: int,
                             mpi_session: Optional[MpiSession]):
+        # Ownership is decided here, next to the create-vs-adopt branch: a
+        # session this proxy created is shut down by it; an external one is
+        # owned (and shut down) by the caller.
         mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
         if mpi_session is None:
+            self._owns_mpi_session = True
             if mpi_process_pre_spawned:
                 logger_debug('[proxy] create comm session ...\n', "yellow")
                 self.mpi_session = create_mpi_comm_session(model_world_size)
@@ -300,5 +321,15 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
                 logger_debug('[proxy] create pool session ...\n', "yellow")
                 self.mpi_session = MpiPoolSession(n_workers=model_world_size)
         else:
+            # submit() launches one worker task per pool worker, so an
+            # external session must match the model's world size exactly;
+            # fail loudly instead of starting the wrong number of executors.
+            external_workers = getattr(mpi_session, "n_workers", None)
+            if (external_workers is not None
+                    and external_workers != model_world_size):
+                raise ValueError(
+                    f"External MPI session has {external_workers} workers but "
+                    f"the model needs world_size={model_world_size}.")
+            self._owns_mpi_session = False
             logger_debug('[proxy] using external mpi session ...\n', "yellow")
             self.mpi_session = mpi_session
