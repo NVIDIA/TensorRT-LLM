@@ -31,6 +31,7 @@ from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2 import GpuCacheTierConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
 _RequestCache = Dict[
@@ -62,6 +63,33 @@ def test_cache_size_estimation_uses_model_attention_layer_count():
     )
 
     assert size_per_token > 0
+
+
+def test_mtp_extra_tokens_are_in_context_capacity():
+    cache_manager = object.__new__(DeepseekV4CacheManager)
+    cache_manager.pp_layers = [0]
+    cache_manager._compress_ratios = [1]
+    cache_manager._get_attn_bytes_per_block = lambda _attn_type, _layer_idx: 1
+    cache_manager._get_window_size = lambda _compress_ratio, _attn_type: 128
+    cache_manager.max_batch_size = 1
+    cache_manager.max_seq_len = 264
+    cache_manager._max_num_tokens = 256
+    cache_manager._max_draft_len = 3
+    cache_manager.num_extra_kv_tokens = 2
+    cache_manager.enable_stats = False
+
+    config = cache_manager._build_cache_config(
+        KvCacheConfig(),
+        tokens_per_block=128,
+        vocab_size=129280,
+        cache_tiers=[GpuCacheTierConfig(quota=1024)],
+    )
+
+    assert config.typical_step is not None
+    assert config.typical_step.kv_caches[0].capacity == 258
+    assert config.typical_step.kv_caches[0].history_length == 0
+    assert config.constraints[1].kv_caches[0].capacity == 258
+    assert config.constraints[1].kv_caches[0].history_length == 0
 
 
 def _view_fp8_as_uint8(buffer: torch.Tensor) -> torch.Tensor:
