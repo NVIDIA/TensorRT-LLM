@@ -283,14 +283,17 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
                 self.mpi_session.shutdown()
             else:
                 # Externally owned (shared) session: leave the pool alive, but
-                # still wait for this executor's worker tasks to finish so the
-                # next LLM on the pool doesn't race with PyExecutor teardown.
+                # wait for this executor's worker tasks to finish so the next
+                # LLM on the pool doesn't race with PyExecutor teardown. Block
+                # without a timeout, mirroring the owned path above
+                # (mpi_session.shutdown() also waits indefinitely); a timeout
+                # that expires would just reintroduce the race it prevents.
                 for future in getattr(self, "worker_futures", []):
                     try:
-                        future.result(timeout=30)
+                        future.result()
                     except Exception as e:
                         logger.warning(
-                            f"RPC worker did not exit cleanly within 30s on "
+                            f"RPC worker task raised during shutdown on "
                             f"shared MPI session: {e}")
             logger_debug(f"Mpi session shutdown", color="yellow")
             self.mpi_session = None

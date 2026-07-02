@@ -75,18 +75,17 @@ def patch_mpi_pool_session_for_env(mocker, env_vars: dict):
                         patched_start_mpi_pool)
 
 
-from tensorrt_llm.llmapi._grouped_test_utils import \
+from test_common.grouped_test_utils import \
     clear_worker_weight_cache as _clear_worker_weight_cache  # noqa: E402
-from tensorrt_llm.llmapi._grouped_test_utils import \
+from test_common.grouped_test_utils import \
     hf_weight_cache_env as _hf_weight_cache_env
-from tensorrt_llm.llmapi._grouped_test_utils import \
-    make_shared_llm as _make_shared_llm
-from tensorrt_llm.llmapi._grouped_test_utils import \
+from test_common.grouped_test_utils import make_shared_llm as _make_shared_llm
+from test_common.grouped_test_utils import \
     reset_shared_session_torch_compile_state as \
     _reset_shared_session_torch_compile_state
-from tensorrt_llm.llmapi._grouped_test_utils import \
+from test_common.grouped_test_utils import \
     shared_mpi_session as _shared_mpi_session
-from tensorrt_llm.llmapi._grouped_test_utils import \
+from test_common.grouped_test_utils import \
     submit_sync_per_worker as _submit_sync_per_worker
 
 

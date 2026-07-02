@@ -1,13 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Shared helpers for grouped multi-GPU tests that reuse one ``MpiPoolSession``
-across many ``LLM`` instances.
+"""Shared helpers for grouped multi-GPU tests reusing one ``MpiPoolSession``.
 
-This lives in-package (rather than under ``tests/``) because the unittest and
-integration test roots have separate ``sys.path`` bases and cannot import a
-single shared module otherwise. It is test-infrastructure only and must not be
-used on production inference paths. Heavy imports are done lazily so importing
-this module never triggers a circular import during package initialization.
+The session is shared across many ``LLM`` instances. This is
+test-infrastructure only and must not be used on production inference paths.
+Heavy imports are done lazily so importing this module never triggers a
+circular import during package initialization.
 """
 
 import os
@@ -38,9 +36,11 @@ def hf_weight_cache_env(max_entries: str = "1"):
 
 
 def shared_mpi_session(n_workers: int):
-    """Generator yielding a shared ``MpiPoolSession`` (or ``None`` when MPI is
-    disabled), shutting it down on teardown. Intended to back a module-scoped
-    pytest fixture so a pool of workers is reused across many LLMs."""
+    """Yield a shared ``MpiPoolSession`` (``None`` when MPI is disabled).
+
+    Shuts the session down on teardown. Intended to back a module-scoped
+    pytest fixture so a pool of workers is reused across many LLMs.
+    """
     from tensorrt_llm._utils import mpi_disabled
 
     if mpi_disabled():
@@ -57,8 +57,11 @@ def shared_mpi_session(n_workers: int):
 
 
 def mpi_session_kwargs(mpi_session) -> dict:
-    """LLM kwargs that inject a shared MPI session, or ``{}`` when there is
-    none (e.g. MPI disabled). Lets harness-based tests forward the session."""
+    """LLM kwargs injecting a shared MPI session (``{}`` when there is none).
+
+    There is no session e.g. when MPI is disabled. Lets harness-based tests
+    forward the session.
+    """
     return {"_mpi_session": mpi_session} if mpi_session is not None else {}
 
 
@@ -108,9 +111,9 @@ def reset_worker_torch_compile_state() -> None:
 
 
 def reset_shared_session_torch_compile_state(make_llm) -> None:
-    """Reset per-worker torch.compile state on the shared session behind a
-    ``make_shared_llm`` factory (no-op if there is no shared session).
+    """Reset per-worker torch.compile state behind a ``make_shared_llm`` factory.
 
+    No-op if the factory has no shared session.
     Call from a grouped test's per-case teardown so recompile counts don't
     accumulate across cases on reused workers (see
     ``reset_worker_torch_compile_state`` for the failure it prevents).

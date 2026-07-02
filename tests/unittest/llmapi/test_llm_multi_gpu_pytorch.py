@@ -1,15 +1,14 @@
 import pytest
+from test_common.grouped_test_utils import make_shared_llm as _make_shared_llm
+from test_common.grouped_test_utils import \
+    mpi_session_kwargs as _mpi_session_kwargs
+from test_common.grouped_test_utils import \
+    shared_mpi_session as _shared_mpi_session
 from utils.util import skip_ray
 
 from tensorrt_llm import LLM
 from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
 from tensorrt_llm.llmapi import KvCacheConfig
-from tensorrt_llm.llmapi._grouped_test_utils import \
-    make_shared_llm as _make_shared_llm
-from tensorrt_llm.llmapi._grouped_test_utils import \
-    mpi_session_kwargs as _mpi_session_kwargs
-from tensorrt_llm.llmapi._grouped_test_utils import \
-    shared_mpi_session as _shared_mpi_session
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
