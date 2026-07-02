@@ -4762,6 +4762,15 @@ class TorchLlmArgs(BaseLlmArgs):
         "scheduler is disabled.",
         status="prototype")
 
+    enable_low_latency_host_dispatch: bool = Field(
+        default=False,
+        description="Use low-latency spin-wait mode for CUDA host task dispatch "
+        "(cudaLaunchHostFunc_v2 with cudaHostTaskSpinWait). "
+        "Reduces callback latency at the cost of a CPU core spinning while "
+        "waiting for the GPU event. Requires CUDA 13.2+; silently falls back "
+        "to the default blocking mode on older drivers.",
+        status="prototype")
+
     enable_iter_perf_stats: bool = Field(
         default=False,
         description="Enable iteration performance statistics.",
