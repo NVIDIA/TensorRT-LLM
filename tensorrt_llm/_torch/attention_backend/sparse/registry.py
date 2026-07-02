@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from typing import TYPE_CHECKING, Union
 
 if TYPE_CHECKING:
@@ -13,6 +16,19 @@ if TYPE_CHECKING:
 # function: they pull in ``trtllm`` and ``resource_manager``, which import
 # ``interface`` and would otherwise form an import cycle when this package is
 # loaded.
+
+
+def lower_sparse_attention_params(sparse_attention_config,
+                                  pretrained_config=None,
+                                  layer_idx=None):
+    """Lower a user-facing sparse config to backend-owned parameters."""
+    if getattr(sparse_attention_config, "algorithm", None) == "deepseek_v4":
+        from .deepseek_v4 import make_deepseek_v4_sparse_params
+
+        return make_deepseek_v4_sparse_params(
+            sparse_attention_config, pretrained_config=pretrained_config)
+    return sparse_attention_config.to_sparse_params(
+        pretrained_config=pretrained_config, layer_idx=layer_idx)
 
 
 def get_sparse_attn_kv_cache_manager(
