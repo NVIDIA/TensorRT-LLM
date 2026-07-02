@@ -43,6 +43,7 @@ from functools import lru_cache
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
+from packaging.version import Version
 
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
 
@@ -758,6 +759,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 )
                 if not supported:
                     return False, reason
+                # TODO: Remove this fallback after upgrading FlashInfer to 0.6.14 or later.
                 head_dim_qk = (attn.kv_lora_rank or 0) + (attn.qk_rope_head_dim or 0)
                 head_dim_v = attn.kv_lora_rank or 0
                 is_multi_token = meta.num_generations > 0 and q.size(0) > meta.num_generations
@@ -770,6 +772,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                         tokens_per_block,
                     )
                     == (576, 512, 32)
+                    and Version(flashinfer.__version__) < Version("0.6.14")
                 ):
                     return (
                         False,
