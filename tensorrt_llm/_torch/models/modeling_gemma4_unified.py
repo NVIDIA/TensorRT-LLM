@@ -206,7 +206,11 @@ class Gemma4UnifiedInputProcessor(Gemma4InputProcessor):
         # AutoProcessor may fail outright (None) or fall back to a bare tokenizer
         # when it cannot resolve Gemma4UnifiedProcessor; either way it lacks the
         # per-modality components, so install the vendored processor instead.
-        if self._processor is None or not hasattr(self._processor, "image_processor"):
+        # The engine-side instance is constructed without a tokenizer and does
+        # no text preprocessing, so it keeps whatever the base class produced.
+        if (
+            self._processor is None or not hasattr(self._processor, "image_processor")
+        ) and self._tokenizer is not None:
             self._processor = load_gemma4_unified_processor(self._model_path, self._tokenizer)
             self._image_processor = self._processor.image_processor
 
