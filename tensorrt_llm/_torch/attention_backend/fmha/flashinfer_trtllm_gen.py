@@ -758,6 +758,24 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 )
                 if not supported:
                     return False, reason
+                head_dim_qk = (attn.kv_lora_rank or 0) + (attn.qk_rope_head_dim or 0)
+                head_dim_v = attn.kv_lora_rank or 0
+                is_multi_token = meta.num_generations > 0 and q.size(0) > meta.num_generations
+                if (
+                    has_fp8_kv
+                    and is_multi_token
+                    and (
+                        head_dim_qk,
+                        head_dim_v,
+                        tokens_per_block,
+                    )
+                    == (576, 512, 32)
+                ):
+                    return (
+                        False,
+                        "[Generation][MLA] FP8 multi-token generation is not supported for "
+                        "headDimQk=576, headDimV=512, tokens_per_block=32.",
+                    )
 
         if tokens_per_block <= 0:
             return False, "tokens_per_block must be positive."
