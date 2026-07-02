@@ -353,7 +353,6 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
             batch_size,
             draft_step,
             self._d2t,
-            self.mapping,
             lambda step_logits: self._draft_sampler_greedy(step_logits, self._d2t),
         )
 

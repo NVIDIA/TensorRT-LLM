@@ -286,6 +286,9 @@ class MTPWorker(SpecWorkerBase):
         super().__init__(use_separate_draft_kv_cache)
         self.spec_config = spec_config
         self.model_config = model_config
+        # Alias so the shared producer path can read self.mapping uniformly
+        # (other workers store it directly); MTP keeps it under model_config.
+        self.mapping = getattr(model_config, "mapping", None)
         self.is_thop = False
         self.sa_enhancer: Optional[SADraftEnhancer] = None
         if spec_config.sa_config is not None:
@@ -477,7 +480,7 @@ class MTPWorker(SpecWorkerBase):
                 # the plain draft_sampler.
                 new_draft_token = self.produce_step_draft_token(
                     logits, spec_metadata, batch_size, i, draft_d2t,
-                    self.model_config.mapping, self.draft_sampler)
+                    self.draft_sampler)
                 next_draft_tokens.append(new_draft_token)
                 # shift input_ids and hidden_states
                 input_ids = draft_inputs["input_ids"]

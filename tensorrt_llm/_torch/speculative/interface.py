@@ -1705,18 +1705,18 @@ class SpecWorkerBase(nn.Module, ABC):
         return gen_draft_tokens.type(torch.int32)
 
     def produce_step_draft_token(self, logits, spec_metadata, batch_size,
-                                 draft_step, d2t, mapping, greedy_fn):
+                                 draft_step, d2t, greedy_fn):
         """Shared per-step draft-token production for step workers (MTP, DraftTarget).
 
         A non-greedy batch takes the advanced ``sample_draft`` path (honoring
         temperature/top_k/top_p, scattering this step's distribution into
         ``draft_probs`` when rejection is on); an all-greedy batch calls
-        ``greedy_fn(logits)``. ``mapping`` is the worker's LM-head TP mapping.
+        ``greedy_fn(logits)``. Uses ``self.mapping`` as the LM-head TP mapping.
         """
         if (spec_metadata is not None and not spec_metadata.is_all_greedy_sample
                 and draft_step is not None):
             logits = self.maybe_gather_sharded_draft_logits(
-                logits, spec_metadata, mapping)
+                logits, spec_metadata, self.mapping)
             return self.sample_draft(logits,
                                      spec_metadata,
                                      batch_size,
