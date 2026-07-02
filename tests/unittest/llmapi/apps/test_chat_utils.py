@@ -117,6 +117,131 @@ class TestParseAssistantMessages:
         }
         assert result == expected
 
+    def test_assistant_message_tool_call_missing_function(self, mock_mm_data_tracker) -> None:
+        message = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "call_123", "type": "function"}],
+        }
+
+        with pytest.raises(ValueError, match=r"tool_calls\[0\]\.function is required"):
+            parse_chat_message_content(message, mock_mm_data_tracker)
+
+    def test_assistant_message_tool_call_invalid_json_arguments(self, mock_mm_data_tracker) -> None:
+        message = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_123",
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": "not json {",
+                    },
+                }
+            ],
+        }
+
+        with pytest.raises(
+            ValueError,
+            match=r"tool_calls\[0\]\.function\.arguments must be valid JSON",
+        ):
+            parse_chat_message_content(message, mock_mm_data_tracker)
+
+    @pytest.mark.parametrize(
+        ("arguments", "match"),
+        [
+            ("", r"tool_calls\[0\]\.function\.arguments must be valid JSON"),
+            ("[]", r"tool_calls\[0\]\.function\.arguments must be a JSON object"),
+            ("0", r"tool_calls\[0\]\.function\.arguments must be a JSON object"),
+        ],
+    )
+    def test_assistant_message_tool_call_rejects_non_object_json_arguments(
+        self, mock_mm_data_tracker, arguments, match
+    ) -> None:
+        message = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_123",
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": arguments,
+                    },
+                }
+            ],
+        }
+
+        with pytest.raises(ValueError, match=match):
+            parse_chat_message_content(message, mock_mm_data_tracker)
+
+    @pytest.mark.parametrize(
+        "function_value",
+        [None, 123, "hi", ["a", "b"]],
+    )
+    def test_assistant_message_tool_call_non_object_function(
+        self, mock_mm_data_tracker, function_value
+    ) -> None:
+        # A present-but-non-object `function` must raise a clean ValueError (HTTP 400) rather than
+        # an opaque TypeError/ValueError from dict() coercion.
+        message = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "x", "type": "function", "function": function_value}],
+        }
+
+        with pytest.raises(ValueError, match=r"tool_calls\[0\]\.function"):
+            parse_chat_message_content(message, mock_mm_data_tracker)
+
+    @pytest.mark.parametrize("tool_call", [123, "foo", None])
+    def test_assistant_message_tool_call_non_object_item(
+        self, mock_mm_data_tracker, tool_call
+    ) -> None:
+        """A tool_call that is not an object must raise a clean ValueError."""
+        message = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [tool_call],
+        }
+
+        with pytest.raises(ValueError, match=r"tool_calls\[0\]"):
+            parse_chat_message_content(message, mock_mm_data_tracker)
+
+    def test_assistant_message_tool_call_preserves_extra_fields(self, mock_mm_data_tracker) -> None:
+        # Extra fields and omitted optional id/type are preserved through the lenient fallback
+        # validation (the tau2-bench leniency).
+        message = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    # No `id`/`type`; an arbitrary extra field.
+                    "index": 0,
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": '{"location": "NYC"}',
+                        "extra": "kept",
+                    },
+                }
+            ],
+        }
+
+        result = parse_chat_message_content(message, mock_mm_data_tracker)
+
+        assert result["tool_calls"] == [
+            {
+                "index": 0,
+                "function": {
+                    "name": "get_weather",
+                    "arguments": {"location": "NYC"},
+                    "extra": "kept",
+                },
+            }
+        ]
+
     def test_assistant_message_with_multiple_tool_calls(self, mock_mm_data_tracker):
         """Test parsing an assistant message with multiple tool calls."""
         message = {
