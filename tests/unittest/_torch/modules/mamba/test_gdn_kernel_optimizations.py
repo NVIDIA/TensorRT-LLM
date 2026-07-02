@@ -76,6 +76,103 @@ def test_fused_gdn_gating_with_sigmoid(batch_size, num_heads, dtype):
     torch.testing.assert_close(beta_fused.float(), beta_ref.float(), rtol=1e-2, atol=1e-2)
 
 
+@skip_no_cuda
+def test_fused_gdn_gating_with_sigmoid_strided_inputs():
+    """Gating kernels must consume views from combined [QKV|Z|B|A]."""
+    from tensorrt_llm._torch.modules.mamba.gdn_mixer import (
+        fused_gdn_gating,
+        fused_gdn_gating_with_sigmoid,
+    )
+
+    batch_size, num_heads, row_padding = 16, 64, 37
+    device = torch.device("cuda")
+    torch.manual_seed(42)
+    a_storage = torch.randn(
+        batch_size,
+        num_heads + row_padding,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    b_storage = torch.randn_like(a_storage)
+    a = a_storage[:, :num_heads]
+    b = b_storage[:, :num_heads]
+    A_log = torch.randn(num_heads, dtype=torch.float32, device=device)
+    dt_bias = torch.randn(num_heads, dtype=torch.float32, device=device)
+
+    g_ref, beta_ref = _ref_gdn_gating_with_sigmoid(A_log, a, dt_bias, b)
+    g, beta = fused_gdn_gating_with_sigmoid(A_log, a, dt_bias, b)
+    g_only = fused_gdn_gating(A_log, a, dt_bias)
+
+    assert a.stride(0) > num_heads
+    assert b.stride(0) > num_heads
+    torch.testing.assert_close(g, g_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(g_only, g_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(beta, beta_ref.float(), rtol=1e-2, atol=1e-2)
+
+
+@skip_no_cuda
+def test_extract_transpose_prefill_slice_strided_input():
+    """Prefill extraction must use the source view's actual token stride."""
+    from tensorrt_llm._torch.modules.mamba.fuse_elementwise_ops import (
+        extract_transpose_prefill_slice,
+    )
+
+    num_tokens, start_col, width, row_padding = 73, 11, 384, 29
+    storage = torch.randn(
+        num_tokens,
+        start_col + width + row_padding,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    src = storage[:, : start_col + width]
+    out = extract_transpose_prefill_slice(src, num_tokens, start_col, width)
+    ref = src[:, start_col : start_col + width].transpose(0, 1).contiguous()
+
+    assert src.stride(0) > src.shape[1]
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+
+
+@skip_no_cuda
+def test_causal_conv1d_update_strided_input_preserves_adjacent_features():
+    """Decode conv updates only QKV in a combined projection row."""
+    from tensorrt_llm._torch.modules.mamba.causal_conv1d import causal_conv1d_update
+
+    batch_size, conv_dim, adjacent_dim, width = 16, 384, 29, 4
+    device = torch.device("cuda")
+    torch.manual_seed(42)
+    storage = torch.randn(
+        batch_size,
+        conv_dim + adjacent_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    x = storage[:, :conv_dim]
+    adjacent_before = storage[:, conv_dim:].clone()
+    conv_state = torch.randn(
+        batch_size,
+        conv_dim,
+        width - 1,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    weight = torch.randn(
+        conv_dim,
+        width,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+    x_ref = x.clone()
+    conv_state_ref = conv_state.clone()
+    causal_conv1d_update(x_ref, conv_state_ref, weight, activation="silu")
+    causal_conv1d_update(x, conv_state, weight, activation="silu")
+
+    assert x.stride(0) > conv_dim
+    torch.testing.assert_close(x, x_ref, rtol=0, atol=0)
+    torch.testing.assert_close(conv_state, conv_state_ref, rtol=0, atol=0)
+    torch.testing.assert_close(storage[:, conv_dim:], adjacent_before, rtol=0, atol=0)
+
+
 # ---- Tests for split_qkv_contiguous ----
 
 
@@ -159,7 +256,13 @@ def test_transpose_and_split_qkv(
 
     total_dim = q_dim + k_dim + v_dim
     prefill_t = torch.randn(total_dim, num_prefill, dtype=dtype, device=device)  # [D, T_p]
-    decode = torch.randn(num_decode, total_dim, dtype=dtype, device=device)  # [T_d, D]
+    decode_storage = torch.randn(
+        num_decode,
+        total_dim + 17,
+        dtype=dtype,
+        device=device,
+    )
+    decode = decode_storage[:, :total_dim]  # [T_d, D] with padded token stride
 
     q_ref, k_ref, v_ref = _ref_transpose_and_split_qkv(
         prefill_t,
@@ -188,3 +291,45 @@ def test_transpose_and_split_qkv(
     torch.testing.assert_close(q_out.view(total_seq, -1), q_ref, rtol=0, atol=0)
     torch.testing.assert_close(k_out.view(total_seq, -1), k_ref, rtol=0, atol=0)
     torch.testing.assert_close(v_out.view(total_seq, -1), v_ref, rtol=0, atol=0)
+
+
+@skip_no_cuda
+def test_grouped_gated_rmsnorm_with_strided_z():
+    """One norm launch handles all heads without packing the Z view."""
+    from tensorrt_llm._torch.modules.mamba.layernorm_gated import RMSNorm
+
+    num_tokens, num_heads, head_dim, row_padding = 32, 64, 128, 41
+    value_dim = num_heads * head_dim
+    device = torch.device("cuda")
+    torch.manual_seed(42)
+    x = torch.randn(num_tokens, value_dim, dtype=torch.bfloat16, device=device)
+    z_storage = torch.randn(
+        num_tokens,
+        value_dim + row_padding,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    z = z_storage[:, :value_dim]
+    norm = RMSNorm(
+        head_dim,
+        eps=1e-6,
+        group_size=head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    norm.weight.data.normal_()
+
+    out = norm(x, z)
+    x_head = x.float().view(num_tokens, num_heads, head_dim)
+    z_head = z.float().view(num_tokens, num_heads, head_dim)
+    rms = torch.rsqrt(x_head.square().mean(dim=-1, keepdim=True) + norm.eps)
+    ref = x_head * rms * norm.weight.float()
+    ref *= z_head * torch.sigmoid(z_head)
+
+    assert z.stride(0) > value_dim
+    torch.testing.assert_close(
+        out.float().view_as(ref),
+        ref,
+        rtol=2e-2,
+        atol=2e-2,
+    )

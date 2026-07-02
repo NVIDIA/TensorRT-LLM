@@ -85,9 +85,18 @@ def _normalize_qwen35_exclude_modules(model_config):
             if translated is not None:
                 normalized.add(translated)
             continue
-        # Map split projection names to packed TRT-LLM names
-        name = re.sub(r"\.in_proj_[ab](\b|\*)", ".in_proj_ba*", name)
-        name = re.sub(r"\.in_proj_(q|k|v|z|qkv)(\b|\*)", ".in_proj_qkvz*", name)
+        # Map split projection names to the runtime layout. Attention-DP uses
+        # one consumer-ordered QKVZBA projection; tensor-parallel execution
+        # retains the established grouped QKVZ and BA projections.
+        if model_config.mapping.enable_attention_dp:
+            name = re.sub(
+                r"\.in_proj_(qkvz|qkv|q|k|v|z|ba|b|a)(\b|\*)",
+                ".in_proj_qkvzba*",
+                name,
+            )
+        else:
+            name = re.sub(r"\.in_proj_[ab](\b|\*)", ".in_proj_ba*", name)
+            name = re.sub(r"\.in_proj_(q|k|v|z|qkv)(\b|\*)", ".in_proj_qkvz*", name)
         normalized.add(name)
 
     # gdn_mixer uses Linear module for weight management of depthwise conv1d
