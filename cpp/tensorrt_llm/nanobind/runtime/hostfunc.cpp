@@ -21,6 +21,7 @@
 
 #include <cuda_runtime.h>
 #include <memory>
+#include <mutex>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/function.h>
 #include <nanobind/stl/optional.h>
@@ -94,7 +95,9 @@ std::optional<uintptr_t> launchHostFunc(uintptr_t streamPtr, bool freeUserData, 
 #else
     if (lowLatency)
     {
-        TLLM_LOG_WARNING("Low-latency host task dispatch requires CUDA 13.2+; falling back to default.");
+        static std::once_flag sWarnOnce;
+        std::call_once(sWarnOnce,
+            []() { TLLM_LOG_WARNING("Low-latency host task dispatch requires CUDA 13.2+; falling back to default."); });
     }
     err = cudaLaunchHostFunc(stream, cudaHostFuncTrampoline, hostFuncUserData.get());
 #endif
