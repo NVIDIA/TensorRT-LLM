@@ -36,13 +36,20 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 try:
+    import sys
+    from pathlib import Path
+
     from tensorrt_llm._torch.visual_gen.config import (
         AttentionConfig,
         DiffusionModelConfig,
         TorchCompileConfig,
     )
     from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
-    from tensorrt_llm._utils import get_free_port
+
+    # Spawn distributed workers via a helper that retries with a fresh master
+    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _visual_gen_dist_utils import spawn_with_retry
 
     MODULES_AVAILABLE = True
 except ImportError:
@@ -52,10 +59,15 @@ try:
     from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
         _flash_attn_fwd as _fa4_fwd,
     )
+    from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
+        _flash_attn_combine as _fa_combine,
+    )
 
     _flash_attn4_available = _fa4_fwd is not None
+    _attn2d_available = _fa4_fwd is not None and _fa_combine is not None
 except (ImportError, OSError):
     _flash_attn4_available = False
+    _attn2d_available = False
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -100,12 +112,13 @@ def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool =
     if use_cuda and torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
     backend = "nccl" if use_cuda else "gloo"
-    port = get_free_port()
-    mp.spawn(
-        _distributed_worker,
-        args=(world_size, backend, test_fn, port, kwargs),
-        nprocs=world_size,
-        join=True,
+    spawn_with_retry(
+        lambda port: mp.spawn(
+            _distributed_worker,
+            args=(world_size, backend, test_fn, port, kwargs),
+            nprocs=world_size,
+            join=True,
+        )
     )
 
 
@@ -401,6 +414,22 @@ class TestWanTransformerParallel:
             test_fn=_logic_wan_transformer_parallel_vs_single_gpu,
             parallel_cfg_kwargs=dict(dit_attn2d_row_size=2, dit_attn2d_col_size=2),
             label="attn2d(2x2)-4gpu",
+        )
+
+    def test_parallel_attn2d_2x2_ulysses2_vs_single_gpu_8gpu(self):
+        """world=8, attn2d=2×2, ulysses=2 vs single-GPU FA4 reference."""
+        self._skip_if_unavailable()
+        if not _attn2d_available:
+            pytest.skip("FA4 / flash_attn_combine JIT kernels not available")
+        run_test_in_distributed(
+            world_size=8,
+            test_fn=_logic_wan_transformer_parallel_vs_single_gpu,
+            parallel_cfg_kwargs=dict(
+                dit_attn2d_row_size=2,
+                dit_attn2d_col_size=2,
+                dit_ulysses_size=2,
+            ),
+            label="attn2d(2x2),ul=2-8gpu",
         )
 
     def test_parallel_ring4_vs_single_gpu_4gpu(self):

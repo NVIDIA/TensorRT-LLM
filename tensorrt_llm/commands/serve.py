@@ -11,7 +11,7 @@ import subprocess  # nosec B404
 import sys
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Literal, Mapping, Optional, Sequence
+from typing import Any, Dict, Mapping, Optional, Sequence, Set
 
 import click
 import torch
@@ -23,7 +23,9 @@ from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._utils import mpi_rank
-from tensorrt_llm.commands.utils import get_is_diffusion_model
+from tensorrt_llm.commands._serve_stability import stability_option
+from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
+                                         get_is_diffusion_only_model)
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
@@ -33,7 +35,8 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole,
                                               extract_disagg_cluster_config,
                                               parse_disagg_config_file,
-                                              parse_metadata_server_config_file)
+                                              parse_metadata_server_config_file,
+                                              validate_config_bool)
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs, TrtLlmArgs
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr
@@ -57,6 +60,10 @@ _child_p_global: Optional[subprocess.Popen] = None
 _GRPC_MAX_MESSAGE_LENGTH_BYTES = 32 * 1024 * 1024
 
 
+def _pop_bool_config_option(config: dict[str, Any], key: str) -> bool:
+    return validate_config_bool(config.pop(key, False), key)
+
+
 def _apply_fastapi_middlewares(app, middlewares: Sequence[str]) -> None:
     """Import and register middleware objects on a FastAPI app."""
     for middleware in middlewares:
@@ -74,13 +81,6 @@ def _apply_fastapi_middlewares(app, middlewares: Sequence[str]) -> None:
         else:
             raise ValueError(f"Invalid middleware {middleware}. "
                              "Must be a class or an async function.")
-
-
-def help_info_with_stability_tag(
-        help_str: str, tag: Literal["stable", "beta", "prototype",
-                                    "deprecated"]) -> str:
-    """Append stability info to help string."""
-    return f":tag:`{tag}` {help_str}"
 
 
 def _signal_handler_cleanup_child(signum, frame):
@@ -119,17 +119,19 @@ def _signal_handler_cleanup_child(signum, frame):
     sys.exit(128 + signum)
 
 
-def is_non_default_or_required(param_name, value, backend):
+def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
     """
     Check if a parameter should be explicitly included in llm_args.
 
     Returns True if parameter is either:
     1. Always required (core params that must be present), OR
-    2. Different from its default value in the backend's LlmArgs class
+    2. Set explicitly on the CLI (its name or one of its constructor
+       scalars is in `explicit_cli_keys`), OR
+    3. Different from its default value in the backend's LlmArgs class
     """
     always_include = {
         "model", "backend", "tokenizer", "custom_tokenizer",
-        "postprocess_tokenizer_dir"
+        "post_processor_hook", "postprocess_tokenizer_dir"
     }
 
     if param_name in always_include:
@@ -137,6 +139,20 @@ def is_non_default_or_required(param_name, value, backend):
 
     if value is None:
         return False
+
+    if param_name in explicit_cli_keys:
+        return True
+
+    # LlmArgs fields built from CLI scalars whose names differ from the field
+    # name (e.g. `--free_gpu_memory_fraction` constructs `kv_cache_config`).
+    cli_derived_fields = {
+        "kv_cache_config": ("free_gpu_memory_fraction", "kv_cache_dtype"),
+        "build_config":
+        ("max_batch_size", "max_num_tokens", "max_beam_width", "max_seq_len"),
+    }
+    if any(s in explicit_cli_keys
+           for s in cli_derived_fields.get(param_name, ())):
+        return True
 
     if backend == "tensorrt":
         llm_args_class = TrtLlmArgs
@@ -164,6 +180,7 @@ def get_llm_args(
         model: str,
         tokenizer: Optional[str] = None,
         custom_tokenizer: Optional[str] = None,
+        post_processor_hook: Optional[str] = None,
         backend: str = "pytorch",
         max_beam_width: int = BuildConfig.model_fields["max_beam_width"].
     default,
@@ -192,7 +209,10 @@ def get_llm_args(
         telemetry: bool = True,
         agent_percentage: float = 0.0,
         agent_types: Optional[str] = None,
+        explicit_cli_keys: Optional[Set[str]] = None,
         **llm_args_extra_dict: Any):
+
+    explicit_cli_keys = explicit_cli_keys or set()
 
     if gpus_per_node is None:
         gpus_per_node = device_count()
@@ -209,9 +229,6 @@ def get_llm_args(
             raise ValueError(f"Invalid cp_type: {cp_config['cp_type']}. " \
                              f"Must be one of: {', '.join([t.name for t in CpType])}")
 
-    kv_cache_default_fraction = KvCacheConfig.model_fields[
-        'free_gpu_memory_fraction'].default
-
     cli_maybe_overrides = {
         "model":
         model,
@@ -221,12 +238,13 @@ def get_llm_args(
         tokenizer,
         "custom_tokenizer":
         custom_tokenizer,
+        "post_processor_hook":
+        post_processor_hook,
         "postprocess_tokenizer_dir":
         tokenizer or model,
         "kv_cache_config":
         KvCacheConfig(free_gpu_memory_fraction=free_gpu_memory_fraction,
-                      dtype=kv_cache_dtype) if free_gpu_memory_fraction
-        != kv_cache_default_fraction or kv_cache_dtype != "auto" else None,
+                      dtype=kv_cache_dtype),
         "cp_config":
         cp_config,
         "build_config":
@@ -291,10 +309,33 @@ def get_llm_args(
     llm_args = {
         param: value
         for param, value in cli_maybe_overrides.items()
-        if is_non_default_or_required(param, value, backend)
+        if is_non_default_or_required(param, value, backend, explicit_cli_keys)
     }
 
     return llm_args, llm_args_extra_dict
+
+
+def _build_llm_args_from_disagg_server_cfg(other_args: Dict) -> Dict:
+    """Construct llm_args from a disaggregated server config's `other_args`.
+
+    `other_args` is a single source — there is no separate CLI / YAML
+    distinction here. Every key is user-set, so we pass all keys as
+    `explicit_cli_keys` to `get_llm_args` to bypass the value-based filter
+    that would otherwise drop fields equal to their LlmArgs class defaults
+    (e.g. `tensor_parallel_size: 1`).
+
+    Do NOT pass `explicit_cli_keys` to `update_llm_args_with_extra_dict`:
+    `llm_args_extra_dict` here is just the catch-all for kwargs that didn't
+    match `get_llm_args`'s named signature (e.g. `quant_config`,
+    `lora_config`, `pytorch_backend_config`) — it isn't a separate YAML
+    being overridden. Passing the explicit set would trigger the merge
+    function's "drop YAML keys claimed by explicit CLI" filter and
+    silently lose those kwargs.
+    """
+    disagg_explicit_keys = set(other_args)
+    llm_args, llm_args_extra_dict = get_llm_args(
+        **other_args, explicit_cli_keys=disagg_explicit_keys)
+    return update_llm_args_with_extra_dict(llm_args, llm_args_extra_dict)
 
 
 def launch_server(
@@ -308,7 +349,8 @@ def launch_server(
         server_role: Optional[ServerRole] = None,
         disagg_cluster_config: Optional[DisaggClusterConfig] = None,
         multimodal_server_config: Optional[MultimodalServerConfig] = None,
-        served_model_name: Optional[str] = None):
+        served_model_name: Optional[str] = None,
+        allow_request_chat_template: bool = False):
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
@@ -343,14 +385,16 @@ def launch_server(
                 f"{backend} is not a known backend, check help for available options.",
                 param_hint="backend")
 
-        server = OpenAIServer(generator=llm,
-                              model=model,
-                              tool_parser=tool_parser,
-                              server_role=server_role,
-                              metadata_server_cfg=metadata_server_cfg,
-                              disagg_cluster_config=disagg_cluster_config,
-                              multimodal_server_config=multimodal_server_config,
-                              chat_template=chat_template)
+        server = OpenAIServer(
+            generator=llm,
+            model=model,
+            tool_parser=tool_parser,
+            server_role=server_role,
+            metadata_server_cfg=metadata_server_cfg,
+            disagg_cluster_config=disagg_cluster_config,
+            multimodal_server_config=multimodal_server_config,
+            chat_template=chat_template,
+            allow_request_chat_template=allow_request_chat_template)
         _apply_fastapi_middlewares(server.app, middleware)
 
         # Optionally disable GC (default: not disabled)
@@ -491,16 +535,19 @@ def launch_mm_encoder_server(
     port: int,
     encoder_args: dict,
     metadata_server_cfg: Optional[MetadataServerConfig] = None,
+    allow_request_chat_template: bool = False,
 ):
     model = encoder_args["model"]
     encoder_args.pop("build_config", None)
     mm_encoder = MultimodalEncoder(**encoder_args)
 
-    server = OpenAIServer(generator=mm_encoder,
-                          model=model,
-                          server_role=ServerRole.MM_ENCODER,
-                          metadata_server_cfg=metadata_server_cfg,
-                          tool_parser=None)
+    server = OpenAIServer(
+        generator=mm_encoder,
+        model=model,
+        server_role=ServerRole.MM_ENCODER,
+        metadata_server_cfg=metadata_server_cfg,
+        tool_parser=None,
+        allow_request_chat_template=allow_request_chat_template)
     asyncio.run(server(host, port))
 
 
@@ -521,23 +568,40 @@ def launch_visual_gen_server(
         visual_gen_args: Optional validated VisualGenArgs for model configuration.
         metadata_server_cfg: Optional metadata server configuration.
     """
-    logger.info(f"Initializing VisualGen ({model})")
+    # Reserve the listening (host, port) by binding the socket *before*
+    # constructing the VisualGen pipeline, then hand the bound socket to
+    # uvicorn. VisualGen initialization can take many minutes; if we deferred
+    # the bind until uvicorn started, anything else on the host could grab the
+    # port in that window and trtllm-serve would die at bind() time.
+    addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
+                                   socket.SOCK_STREAM)
+    address_family = socket.AF_INET6 if all(
+        [info[0] == socket.AF_INET6 for info in addr_info]) else socket.AF_INET
+    with socket.socket(address_family, socket.SOCK_STREAM) as s:
+        try:
+            s.bind((host, port))
+        except OSError as e:
+            raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}")
 
-    visual_gen_model = VisualGen(model=model, args=visual_gen_args)
+        logger.info(f"Initializing VisualGen ({model})")
 
-    n_workers = visual_gen_model.args.parallel_config.n_workers
-    logger.info(f"World size: {n_workers}")
-    logger.info(f"CFG size: {visual_gen_model.args.parallel_config.cfg_size}")
-    logger.info(
-        f"Ulysses size: {visual_gen_model.args.parallel_config.ulysses_size}")
+        visual_gen_model = VisualGen(model=model, args=visual_gen_args)
 
-    server = OpenAIServer(generator=visual_gen_model,
-                          model=model,
-                          server_role=ServerRole.VISUAL_GEN,
-                          metadata_server_cfg=metadata_server_cfg,
-                          tool_parser=None)
-    _apply_fastapi_middlewares(server.app, middleware)
-    asyncio.run(server(host, port))
+        n_workers = visual_gen_model.args.parallel_config.n_workers
+        logger.info(f"World size: {n_workers}")
+        logger.info(
+            f"CFG size: {visual_gen_model.args.parallel_config.cfg_size}")
+        logger.info(
+            f"Ulysses size: {visual_gen_model.args.parallel_config.ulysses_size}"
+        )
+
+        server = OpenAIServer(generator=visual_gen_model,
+                              model=model,
+                              server_role=ServerRole.VISUAL_GEN,
+                              metadata_server_cfg=metadata_server_cfg,
+                              tool_parser=None)
+        _apply_fastapi_middlewares(server.app, middleware)
+        asyncio.run(server(host, port, sockets=[s]))
 
 
 class ChoiceWithAlias(click.Choice):
@@ -563,305 +627,322 @@ class ChoiceWithAlias(click.Choice):
 
 @click.command("serve")
 @click.argument("model", type=str)
-@click.option(
+@stability_option(
     "--tokenizer",
     type=str,
     default=None,
-    help=help_info_with_stability_tag(
-        "Path or name of the tokenizer. When using the PyTorch backend, "
-        "this replaces the default HuggingFace tokenizer.", "beta"))
-@click.option(
+    help="Path or name of the tokenizer. When using the PyTorch backend, "
+    "this replaces the default HuggingFace tokenizer.",
+    status="beta")
+@stability_option(
     "--custom_tokenizer",
     type=str,
     default=None,
-    help=help_info_with_stability_tag(
-        "Custom tokenizer type: alias (e.g., 'deepseek_v32') or Python import path "
-        "(e.g., 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer').",
-        "prototype"))
-@click.option("--host",
-              type=str,
-              default="localhost",
-              help=help_info_with_stability_tag("Hostname of the server.",
-                                                "beta"))
-@click.option("--port",
-              type=int,
-              default=8000,
-              help=help_info_with_stability_tag("Port of the server.", "beta"))
-@click.option(
+    help=
+    "Custom tokenizer type: alias (e.g., 'deepseek_v32') or Python import path "
+    "(e.g., 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer').",
+    status="prototype")
+@stability_option(
+    "--post_processor_hook",
+    type=str,
+    default=None,
+    help="Python import path of a user post-processing hook applied after "
+    "detokenization and before the per-endpoint response formatter (e.g. "
+    "'my_pkg.guardrail.MyPostProcessorHook'). The class must be importable "
+    "and picklable, take no constructor arguments, and be callable as "
+    "'__call__(chunk) -> verdict' (see tensorrt_llm.executor.postprocessor_hook). "
+    "It runs once per output, per streaming chunk, and may rewrite, "
+    "suppress, or terminate the output; it owns its own per-request state.",
+    status="prototype")
+@stability_option("--host",
+                  type=str,
+                  default="localhost",
+                  help="Hostname of the server.",
+                  status="beta")
+@stability_option("--port",
+                  type=int,
+                  default=8000,
+                  help="Port of the server.",
+                  status="beta")
+@stability_option(
     "--backend",
     type=ChoiceWithAlias(["pytorch", "tensorrt", "_autodeploy"],
                          {"trt": "tensorrt"}),
     default="pytorch",
-    help=help_info_with_stability_tag(
-        "The backend to use to serve the model. Default is pytorch backend.",
-        "beta"))
-@click.option(
-    "--custom_module_dirs",
-    type=click.Path(exists=True,
-                    readable=True,
-                    path_type=Path,
-                    resolve_path=True),
-    default=None,
-    multiple=True,
-    help=help_info_with_stability_tag(
-        "Paths to custom module directories to import.", "prototype"),
-)
-@click.option('--log_level',
-              type=click.Choice(severity_map.keys()),
-              default='info',
-              help=help_info_with_stability_tag("The logging level.", "beta"))
-@click.option("--max_beam_width",
-              type=int,
-              default=BuildConfig.model_fields["max_beam_width"].default,
-              help=help_info_with_stability_tag(
-                  "Maximum number of beams for beam search decoding.", "beta"))
-@click.option("--max_batch_size",
-              type=int,
-              default=BuildConfig.model_fields["max_batch_size"].default,
-              help=help_info_with_stability_tag(
-                  "Maximum number of requests that the engine can schedule.",
-                  "beta"))
-@click.option(
+    help="The backend to use to serve the model. Default is pytorch backend.",
+    status="beta")
+@stability_option("--custom_module_dirs",
+                  type=click.Path(exists=True,
+                                  readable=True,
+                                  path_type=Path,
+                                  resolve_path=True),
+                  default=None,
+                  multiple=True,
+                  help="Paths to custom module directories to import.",
+                  status="prototype")
+@stability_option('--log_level',
+                  type=click.Choice(severity_map.keys()),
+                  default='info',
+                  help="The logging level.",
+                  status="beta")
+@stability_option("--max_beam_width",
+                  type=int,
+                  default=BuildConfig.model_fields["max_beam_width"].default,
+                  help="Maximum number of beams for beam search decoding.",
+                  status="beta")
+@stability_option(
+    "--max_batch_size",
+    type=int,
+    default=BuildConfig.model_fields["max_batch_size"].default,
+    help="Maximum number of requests that the engine can schedule.",
+    status="beta")
+@stability_option(
     "--max_num_tokens",
     type=int,
     default=BuildConfig.model_fields["max_num_tokens"].default,
-    help=help_info_with_stability_tag(
-        "Maximum number of batched input tokens after padding is removed in each batch.",
-        "beta"))
-@click.option(
+    help=
+    "Maximum number of batched input tokens after padding is removed in each batch.",
+    status="beta")
+@stability_option(
     "--max_seq_len",
     type=int,
     default=BuildConfig.model_fields["max_seq_len"].default,
-    help=help_info_with_stability_tag(
-        "Maximum total length of one request, including prompt and outputs. "
-        "If unspecified, the value is deduced from the model config.", "beta"))
-@click.option("--tensor_parallel_size",
-              "--tp_size",
-              type=int,
-              default=1,
-              help=help_info_with_stability_tag('Tensor parallelism size.',
-                                                'beta'))
-@click.option("--pipeline_parallel_size",
-              "--pp_size",
-              type=int,
-              default=1,
-              help=help_info_with_stability_tag('Pipeline parallelism size.',
-                                                'beta'))
-@click.option("--context_parallel_size",
-              "--cp_size",
-              type=int,
-              default=1,
-              help=help_info_with_stability_tag('Context parallelism size.',
-                                                'beta'))
-@click.option("--moe_expert_parallel_size",
-              "--ep_size",
-              type=int,
-              default=None,
-              help=help_info_with_stability_tag("expert parallelism size",
-                                                "beta"))
-@click.option(
+    help="Maximum total length of one request, including prompt and outputs. "
+    "If unspecified, the value is deduced from the model config.",
+    status="beta")
+@stability_option("--tensor_parallel_size",
+                  "--tp_size",
+                  type=int,
+                  default=1,
+                  help='Tensor parallelism size.',
+                  status='beta')
+@stability_option("--pipeline_parallel_size",
+                  "--pp_size",
+                  type=int,
+                  default=1,
+                  help='Pipeline parallelism size.',
+                  status='beta')
+@stability_option("--context_parallel_size",
+                  "--cp_size",
+                  type=int,
+                  default=1,
+                  help='Context parallelism size.',
+                  status='beta')
+@stability_option("--moe_expert_parallel_size",
+                  "--ep_size",
+                  type=int,
+                  default=None,
+                  help="expert parallelism size",
+                  status="beta")
+@stability_option(
     "--moe_cluster_parallel_size",
     "--cluster_size",
     type=int,
     default=None,
-    help=help_info_with_stability_tag(
-        "[Deprecated] Expert cluster parallelism size. "
-        "This option is no longer supported and will be removed in a future release.",
-        "deprecated"))
-@click.option(
+    help="[Deprecated] Expert cluster parallelism size. "
+    "This option is no longer supported and will be removed in a future release.",
+    status="deprecated")
+@stability_option(
     "--gpus_per_node",
     type=int,
     default=None,
-    help=help_info_with_stability_tag(
-        "Number of GPUs per node. Default to None, and it will be detected automatically.",
-        "beta"))
-@click.option("--free_gpu_memory_fraction",
-              "--kv_cache_free_gpu_memory_fraction",
-              type=float,
-              default=0.9,
-              help=help_info_with_stability_tag(
-                  "Free GPU memory fraction reserved for KV Cache, "
-                  "after allocating model weights and buffers.", "beta"))
-@click.option(
+    help=
+    "Number of GPUs per node. Default to None, and it will be detected automatically.",
+    status="beta")
+@stability_option("--free_gpu_memory_fraction",
+                  "--kv_cache_free_gpu_memory_fraction",
+                  type=float,
+                  default=0.9,
+                  help="Free GPU memory fraction reserved for KV Cache, "
+                  "after allocating model weights and buffers.",
+                  status="beta")
+@stability_option(
     "--kv_cache_dtype",
     type=click.Choice(("auto", "fp8", "nvfp4")),
     default="auto",
-    help=help_info_with_stability_tag(
-        "KV cache quantization dtype for PyTorch backend. "
-        "'auto' uses checkpoint/model metadata; explicit values force override.",
-        "prototype"))
-@click.option("--num_postprocess_workers",
-              type=int,
-              default=0,
-              help=help_info_with_stability_tag(
-                  "Number of workers to postprocess raw responses "
-                  "to comply with OpenAI protocol.", "prototype"))
-@click.option("--trust_remote_code",
-              is_flag=True,
-              default=False,
-              help=help_info_with_stability_tag("Flag for HF transformers.",
-                                                "beta"))
-@click.option("--hf_revision",
-              "--revision",
-              "revision",
-              type=str,
-              default=None,
-              help=help_info_with_stability_tag(
-                  "The revision to use for the HuggingFace model "
+    help="KV cache quantization dtype for PyTorch backend. "
+    "'auto' uses checkpoint/model metadata; explicit values force override.",
+    status="prototype")
+@stability_option("--num_postprocess_workers",
+                  type=int,
+                  default=0,
+                  help="Number of workers to postprocess raw responses "
+                  "to comply with OpenAI protocol.",
+                  status="prototype")
+@stability_option("--trust_remote_code",
+                  is_flag=True,
+                  default=False,
+                  help="Flag for HF transformers.",
+                  status="beta")
+@stability_option("--hf_revision",
+                  "--revision",
+                  "revision",
+                  type=str,
+                  default=None,
+                  help="The revision to use for the HuggingFace model "
                   "(branch name, tag name, or commit id). "
-                  "Prefer --hf_revision over --revision.", "beta"))
-@click.option(
+                  "Prefer --hf_revision over --revision.",
+                  status="beta")
+@stability_option(
     "--config",
     "--extra_llm_api_options",
     "extra_llm_api_options",
     type=str,
     default=None,
-    help=help_info_with_stability_tag(
-        "Path to a YAML file that overwrites the parameters specified by trtllm-serve. "
-        "Can be specified as either --config or --extra_llm_api_options.",
-        "prototype"))
-@click.option(
-    "--reasoning_parser",
-    type=click.Choice(["auto"] + list(ReasoningParserFactory.keys())),
-    default=None,
-    help=help_info_with_stability_tag(
-        "Specify the parser for reasoning models. "
-        "Use 'auto' to automatically select based on the model.", "prototype"),
-)
-@click.option(
-    "--tool_parser",
-    type=click.Choice(["auto"] + list(ToolParserFactory.parsers.keys())),
-    default=None,
-    help=help_info_with_stability_tag(
-        "Specify the parser for tool models. "
-        "Use 'auto' to automatically select based on the model.", "prototype"),
-)
-@click.option("--metadata_server_config_file",
-              type=str,
-              default=None,
-              help=help_info_with_stability_tag(
-                  "Path to metadata server config file", "prototype"))
-@click.option(
+    help="Path to a YAML configuration file. Explicit CLI flags take precedence "
+    "over values in this file. Can be specified as either --config or "
+    "--extra_llm_api_options.",
+    status="prototype")
+@stability_option("--reasoning_parser",
+                  type=click.Choice(["auto"] +
+                                    list(ReasoningParserFactory.keys())),
+                  default=None,
+                  help="Specify the parser for reasoning models. "
+                  "Use 'auto' to automatically select based on the model.",
+                  status="prototype")
+@stability_option("--tool_parser",
+                  type=click.Choice(["auto"] +
+                                    list(ToolParserFactory.parsers.keys())),
+                  default=None,
+                  help="Specify the parser for tool models. "
+                  "Use 'auto' to automatically select based on the model.",
+                  status="prototype")
+@stability_option("--metadata_server_config_file",
+                  type=str,
+                  default=None,
+                  help="Path to metadata server config file",
+                  status="prototype")
+@stability_option(
     "--server_role",
     type=str,
     default=None,
-    help=help_info_with_stability_tag(
-        "Server role for disaggregated serving. "
-        "CONTEXT=prefill (prompt processing), GENERATION=decode (token generation), "
-        "MM_ENCODER=multimodal encoder, VISUAL_GEN=visual generation. "
-        "Required when using service registry.", "prototype"))
-@click.option(
+    help="Server role for disaggregated serving. "
+    "CONTEXT=prefill (prompt processing), GENERATION=decode (token generation), "
+    "MM_ENCODER=multimodal encoder, VISUAL_GEN=visual generation. "
+    "Required when using service registry.",
+    status="prototype")
+@stability_option(
     "--fail_fast_on_attention_window_too_large",
     is_flag=True,
     default=True,
-    help=help_info_with_stability_tag(
-        "[Deprecated] Exit with runtime error when attention window is too large "
-        "to fit even a single sequence in the KV cache. Now defaults to True. "
-        "This flag only affects the TRT backend and will be removed in a future release.",
-        "deprecated"))
-@click.option("--otlp_traces_endpoint",
-              type=str,
-              default=None,
-              help=help_info_with_stability_tag(
-                  "Target URL to which OpenTelemetry traces will be sent.",
-                  "prototype"))
-@click.option("--telemetry/--no-telemetry",
-              default=True,
-              help="Enable or disable anonymous usage telemetry collection.")
-@click.option("--disagg_cluster_uri",
-              type=str,
-              default=None,
-              help=help_info_with_stability_tag(
-                  "URI of the disaggregated cluster.", "prototype"))
-@click.option("--enable_chunked_prefill",
-              is_flag=True,
-              default=False,
-              help=help_info_with_stability_tag("Enable chunked prefill",
-                                                "prototype"))
-@click.option("--enable_attention_dp",
-              is_flag=True,
-              default=False,
-              help=help_info_with_stability_tag(
-                  "Enable attention data parallel.", "beta"))
-@click.option("--media_io_kwargs",
-              type=str,
-              default=None,
-              help=help_info_with_stability_tag(
-                  "Keyword arguments for media I/O as a JSON string. "
+    help=
+    "[Deprecated] Exit with runtime error when attention window is too large "
+    "to fit even a single sequence in the KV cache. Now defaults to True. "
+    "This flag only affects the TRT backend and will be removed in a future release.",
+    status="deprecated")
+@stability_option("--otlp_traces_endpoint",
+                  type=str,
+                  default=None,
+                  help="Target URL to which OpenTelemetry traces will be sent.",
+                  status="prototype")
+@stability_option(
+    "--telemetry/--no-telemetry",
+    default=True,
+    help="Enable or disable anonymous usage telemetry collection.",
+    status="beta")
+@stability_option("--disagg_cluster_uri",
+                  type=str,
+                  default=None,
+                  help="URI of the disaggregated cluster.",
+                  status="prototype")
+@stability_option("--enable_chunked_prefill",
+                  is_flag=True,
+                  default=False,
+                  help="Enable chunked prefill",
+                  status="prototype")
+@stability_option("--enable_attention_dp",
+                  is_flag=True,
+                  default=False,
+                  help="Enable attention data parallel.",
+                  status="beta")
+@stability_option("--media_io_kwargs",
+                  type=str,
+                  default=None,
+                  help="Keyword arguments for media I/O as a JSON string. "
                   "Keys are modality names (\"video\", \"image\", \"audio\") "
                   "whose values are dicts of keyword arguments forwarded to "
                   "the corresponding loader. "
                   "Example: '{\"video\": {\"extract_audio\": true, "
                   "\"num_frames\": 16}}' to enable audio extraction from "
-                  "video files.", "prototype"))
-@click.option("--video_pruning_rate",
-              type=float,
-              default=None,
-              help=help_info_with_stability_tag(
-                  "Pruning rate for video frames in multimodal models. "
+                  "video files.",
+                  status="prototype")
+@stability_option("--video_pruning_rate",
+                  type=float,
+                  default=None,
+                  help="Pruning rate for video frames in multimodal models. "
                   "Applied by Efficient Video Sampling (EVS). "
                   "None disables EVS, values in [0, 1) enable pruning.",
-                  "prototype"))
-@click.option("--chat_template",
-              type=str,
-              default=None,
-              help=help_info_with_stability_tag(
-                  "Specify a custom chat template. "
+                  status="prototype")
+@stability_option("--chat_template",
+                  type=str,
+                  default=None,
+                  help="Specify a custom chat template. "
                   "Can be a file path or one-liner template string",
-                  "prototype"))
-@click.option(
+                  status="prototype")
+@stability_option(
+    "--allow_request_chat_template",
+    is_flag=True,
+    default=False,
+    help="Allow clients to supply per-request chat_template values. "
+    "Only enable this for trusted clients.",
+    status="prototype")
+@stability_option(
     "--middleware",
     multiple=True,
     type=str,
-    help=help_info_with_stability_tag(
-        "FastAPI middleware import path to add to the server app. "
-        "Can be specified multiple times. Each value must point to either "
-        "a middleware class or an async HTTP middleware function.",
-        "prototype"))
-@click.option(
+    help="FastAPI middleware import path to add to the server app. "
+    "Can be specified multiple times. Each value must point to either "
+    "a middleware class or an async HTTP middleware function.",
+    status="prototype")
+@stability_option(
     "--grpc",
     is_flag=True,
     default=False,
     help="Run gRPC server instead of OpenAI HTTP server. "
-    "gRPC server accepts pre-tokenized requests and returns raw token IDs.")
-@click.option(
+    "gRPC server accepts pre-tokenized requests and returns raw token IDs.",
+    status="prototype")
+@stability_option(
     "--served_model_name",
     type=str,
     default=None,
-    help=help_info_with_stability_tag(
-        "The model name used in the API. If not specified, the model path is "
-        "used as the model name. This is useful when the model path is long or "
-        "when you want to expose a custom name to clients.", "prototype"))
-@click.option(
-    "--visual_gen_args",
-    "--extra_visual_gen_options",
-    "visual_gen_args",
-    type=str,
-    default=None,
-    help=help_info_with_stability_tag(
-        "Path to a YAML file with VisualGen engine args.",
-        "prototype",
-    ),
-)
-@click.option(
+    help="The model name used in the API. If not specified, the model path is "
+    "used as the model name. This is useful when the model path is long or "
+    "when you want to expose a custom name to clients.",
+    status="prototype")
+@stability_option(
+    "--enable_visual_gen",
+    is_flag=True,
+    default=False,
+    help="Enable VisualGen runtime for model checkpoints that support both LLM "
+    "and Visual Generation. Not required if --visual_gen_args specified "
+    "or the model supports Visual Generation only.",
+    status="prototype")
+@stability_option("--visual_gen_args",
+                  type=str,
+                  default=None,
+                  help="Path to a YAML file with VisualGen engine args.",
+                  status="prototype")
+@stability_option(
     "--agent_percentage",
     type=float,
     default=0.0,
-    help=
-    "The percentage of agent requests to schedule. Defaults to 0.0. Should be between 0.0 and 1.0."
-)
-@click.option(
+    help="The percentage of agent requests to schedule. Defaults to 0.0. "
+    "Should be between 0.0 and 1.0.",
+    status="prototype")
+@stability_option(
     "--agent_types",
     type=str,
     default=None,
     help=
-    "Types of agents to schedule. Now Only Support Open Deep Research agent.")
+    "Types of agents to schedule. Now Only Support Open Deep Research agent.",
+    status="prototype")
 def serve(
         model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
-        host: str, port: int, log_level: str, backend: str, max_beam_width: int,
-        max_batch_size: int, max_num_tokens: int, max_seq_len: int,
-        tensor_parallel_size: int, pipeline_parallel_size: int,
-        context_parallel_size: int, moe_expert_parallel_size: Optional[int],
+        post_processor_hook: Optional[str], host: str, port: int,
+        log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
+        max_num_tokens: int, max_seq_len: int, tensor_parallel_size: int,
+        pipeline_parallel_size: int, context_parallel_size: int,
+        moe_expert_parallel_size: Optional[int],
         moe_cluster_parallel_size: Optional[int], gpus_per_node: Optional[int],
         free_gpu_memory_fraction: float, kv_cache_dtype: str,
         num_postprocess_workers: int, trust_remote_code: bool,
@@ -874,7 +955,8 @@ def serve(
         media_io_kwargs: Optional[str], agent_percentage: float,
         agent_types: Optional[str], video_pruning_rate: Optional[float],
         telemetry: bool, custom_module_dirs: list[Path],
-        chat_template: Optional[str], middleware: tuple[str, ...], grpc: bool,
+        chat_template: Optional[str], allow_request_chat_template: bool,
+        middleware: tuple[str, ...], grpc: bool, enable_visual_gen: bool,
         served_model_name: Optional[str], visual_gen_args: Optional[str]):
     """Running an OpenAI API compatible server
 
@@ -915,7 +997,7 @@ def serve(
                 f"Cannot auto-detect reasoning parser for model '{model}'. "
                 f"Supported model types for auto-detection: qwen3, qwen3_moe, "
                 f"qwen3_5, qwen3_5_moe, qwen3_next, deepseek_v3 (R1 only), "
-                f"deepseek_v32 (R1 only), nemotron_h, gemma4, "
+                f"deepseek_v32 (R1 only), deepseek_v4, nemotron_h, gemma4, "
                 f"kimi_k2, kimi_k25. "
                 f"Please specify a parser explicitly: "
                 f"{list(ReasoningParserFactory.keys())}",
@@ -933,12 +1015,16 @@ def serve(
                 f"Failed to import custom module from {custom_module_dir}: {e}")
             raise e
 
+    explicit_cli_keys = collect_explicit_cli_keys(
+        exclude=("extra_llm_api_options", "config"))
+
     def _serve_llm():
-        nonlocal server_role
+        nonlocal server_role, allow_request_chat_template
         llm_args, _ = get_llm_args(
             model=model,
             tokenizer=tokenizer,
             custom_tokenizer=custom_tokenizer,
+            post_processor_hook=post_processor_hook,
             backend=backend,
             max_beam_width=max_beam_width,
             max_batch_size=max_batch_size,
@@ -964,14 +1050,19 @@ def serve(
             video_pruning_rate=video_pruning_rate,
             telemetry=telemetry,
             agent_percentage=agent_percentage,
-            agent_types=agent_types)
+            agent_types=agent_types,
+            explicit_cli_keys=explicit_cli_keys)
 
         llm_args_extra_dict = {}
         if extra_llm_api_options is not None:
             with open(extra_llm_api_options, 'r') as f:
-                llm_args_extra_dict = yaml.safe_load(f)
-        llm_args = update_llm_args_with_extra_dict(llm_args,
-                                                   llm_args_extra_dict)
+                llm_args_extra_dict = yaml.safe_load(f) or {}
+        extra_allow_request_chat_template = _pop_bool_config_option(
+            llm_args_extra_dict, "allow_request_chat_template")
+        allow_request_chat_template = (allow_request_chat_template
+                                       or extra_allow_request_chat_template)
+        llm_args = update_llm_args_with_extra_dict(
+            llm_args, llm_args_extra_dict, explicit_cli_keys=explicit_cli_keys)
 
         # CLI --no-telemetry always wins over YAML config
         if not telemetry:
@@ -1015,12 +1106,21 @@ def serve(
             # gRPC mode: launch gRPC server instead of OpenAI HTTP server
             # Check for unsupported arguments that are silently ignored in gRPC mode
             unsupported_args = {
-                "tool_parser": tool_parser,
-                "middleware": middleware if middleware else None,
-                "chat_template": chat_template,
-                "metadata_server_config_file": metadata_server_config_file,
-                "server_role": server_role,
-                "disagg_cluster_config": disagg_cluster_config,
+                "tool_parser":
+                tool_parser,
+                "middleware":
+                middleware if middleware else None,
+                "chat_template":
+                chat_template,
+                "allow_request_chat_template":
+                allow_request_chat_template
+                if allow_request_chat_template else None,
+                "metadata_server_config_file":
+                metadata_server_config_file,
+                "server_role":
+                server_role,
+                "disagg_cluster_config":
+                disagg_cluster_config,
             }
             for name, value in unsupported_args.items():
                 if value is not None:
@@ -1034,17 +1134,19 @@ def serve(
                                served_model_name=served_model_name)
         else:
             # Default: launch OpenAI HTTP server
-            launch_server(host,
-                          port,
-                          llm_args,
-                          tool_parser,
-                          middleware,
-                          chat_template,
-                          metadata_server_cfg,
-                          server_role,
-                          disagg_cluster_config,
-                          multimodal_server_config,
-                          served_model_name=served_model_name)
+            launch_server(
+                host,
+                port,
+                llm_args,
+                tool_parser,
+                middleware,
+                chat_template,
+                metadata_server_cfg,
+                server_role,
+                disagg_cluster_config,
+                multimodal_server_config,
+                served_model_name=served_model_name,
+                allow_request_chat_template=allow_request_chat_template)
 
     def _serve_visual_gen():
         parsed_visual_gen_args = (VisualGenArgs.from_yaml(visual_gen_args)
@@ -1056,7 +1158,8 @@ def serve(
         launch_visual_gen_server(host, port, model, parsed_visual_gen_args,
                                  metadata_server_cfg, middleware)
 
-    is_visual_gen = visual_gen_args is not None or get_is_diffusion_model(model)
+    is_visual_gen = (enable_visual_gen or visual_gen_args is not None
+                     or get_is_diffusion_only_model(model))
     if is_visual_gen:
         _serve_visual_gen()
     else:
@@ -1065,74 +1168,99 @@ def serve(
 
 @click.command("mm_embedding_serve")
 @click.argument("model", type=str)
-@click.option("--host",
-              type=str,
-              default="localhost",
-              help="Hostname of the server.")
-@click.option("--port", type=int, default=8000, help="Port of the server.")
-@click.option('--log_level',
-              type=click.Choice(severity_map.keys()),
-              default='info',
-              help="The logging level.")
-@click.option("--max_batch_size",
-              type=int,
-              default=BuildConfig.model_fields["max_batch_size"].default,
-              help="Maximum number of requests that the engine can schedule.")
-@click.option(
+@stability_option("--host",
+                  type=str,
+                  default="localhost",
+                  help="Hostname of the server.",
+                  status="beta")
+@stability_option("--port",
+                  type=int,
+                  default=8000,
+                  help="Port of the server.",
+                  status="beta")
+@stability_option('--log_level',
+                  type=click.Choice(severity_map.keys()),
+                  default='info',
+                  help="The logging level.",
+                  status="beta")
+@stability_option(
+    "--max_batch_size",
+    type=int,
+    default=BuildConfig.model_fields["max_batch_size"].default,
+    help="Maximum number of requests that the engine can schedule.",
+    status="beta")
+@stability_option(
     "--max_num_tokens",
     type=int,
     default=16384,  # set higher default max_num_tokens for multimodal encoder
     help=
-    "Maximum number of batched input tokens after padding is removed in each batch."
-)
-@click.option("--gpus_per_node",
-              type=int,
-              default=None,
-              help="Number of GPUs per node. Default to None, and it will be "
-              "detected automatically.")
-@click.option("--trust_remote_code",
-              is_flag=True,
-              default=False,
-              help="Flag for HF transformers.")
-@click.option(
+    "Maximum number of batched input tokens after padding is removed in each batch.",
+    status="beta")
+@stability_option(
+    "--gpus_per_node",
+    type=int,
+    default=None,
+    help="Number of GPUs per node. Default to None, and it will be "
+    "detected automatically.",
+    status="beta")
+@stability_option("--trust_remote_code",
+                  is_flag=True,
+                  default=False,
+                  help="Flag for HF transformers.",
+                  status="beta")
+@stability_option(
     "--config",
     "--extra_encoder_options",
     "extra_encoder_options",
     type=str,
     default=None,
-    help=
-    "Path to a YAML file that overwrites the parameters specified by trtllm-serve. "
-    "Prefer --config over --extra_encoder_options.")
-@click.option("--hf_revision",
-              "--revision",
-              "revision",
-              type=str,
-              default=None,
-              help="The revision to use for the HuggingFace model "
-              "(branch name, tag name, or commit id).")
-@click.option("--free_gpu_memory_fraction",
-              type=float,
-              default=0.9,
-              help="Free GPU memory fraction reserved for KV Cache, "
-              "after allocating model weights and buffers.")
-@click.option("--tensor_parallel_size",
-              "--tp_size",
-              type=int,
-              default=1,
-              help="Tensor parallelism size.")
-@click.option("--metadata_server_config_file",
-              type=str,
-              default=None,
-              help="Path to metadata server config file")
-@click.option("--telemetry/--no-telemetry",
-              default=True,
-              help="Enable or disable anonymous usage telemetry collection.")
+    help="Path to a YAML configuration file. Explicit CLI flags take precedence "
+    "over values in this file. Prefer --config over --extra_encoder_options.",
+    status="prototype")
+@stability_option("--hf_revision",
+                  "--revision",
+                  "revision",
+                  type=str,
+                  default=None,
+                  help="The revision to use for the HuggingFace model "
+                  "(branch name, tag name, or commit id).",
+                  status="beta")
+@stability_option("--free_gpu_memory_fraction",
+                  type=float,
+                  default=0.9,
+                  help="Free GPU memory fraction reserved for KV Cache, "
+                  "after allocating model weights and buffers.",
+                  status="beta")
+@stability_option("--tensor_parallel_size",
+                  "--tp_size",
+                  type=int,
+                  default=1,
+                  help="Tensor parallelism size.",
+                  status="beta")
+@stability_option("--metadata_server_config_file",
+                  type=str,
+                  default=None,
+                  help="Path to metadata server config file",
+                  status="prototype")
+@stability_option(
+    "--allow_request_chat_template",
+    is_flag=True,
+    default=False,
+    help="Allow clients to supply per-request chat_template values. "
+    "Only enable this for trusted clients.",
+    status="prototype")
+@stability_option(
+    "--telemetry/--no-telemetry",
+    default=True,
+    help="Enable or disable anonymous usage telemetry collection.",
+    status="beta")
 def serve_encoder(model: str, host: str, port: int, log_level: str,
                   max_batch_size: int, max_num_tokens: int,
                   gpus_per_node: Optional[int], trust_remote_code: bool,
                   extra_encoder_options: Optional[str], revision: Optional[str],
                   free_gpu_memory_fraction: float, tensor_parallel_size: int,
-                  metadata_server_config_file: Optional[str], telemetry: bool):
+                  metadata_server_config_file: Optional[str],
+                  allow_request_chat_template: bool, telemetry: bool):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -1143,6 +1271,9 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
         logger.warning(
             "--extra_encoder_options is deprecated, use --config instead.")
 
+    explicit_cli_keys = collect_explicit_cli_keys(
+        exclude=("extra_encoder_options", "config"))
+
     llm_args, _ = get_llm_args(
         model=model,
         max_batch_size=max_batch_size,
@@ -1152,14 +1283,19 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
         revision=revision,
         free_gpu_memory_fraction=free_gpu_memory_fraction,
         tensor_parallel_size=tensor_parallel_size,
-        telemetry=telemetry)
+        telemetry=telemetry,
+        explicit_cli_keys=explicit_cli_keys)
 
     encoder_args_extra_dict = {}
     if extra_encoder_options is not None:
         with open(extra_encoder_options, 'r') as f:
-            encoder_args_extra_dict = yaml.safe_load(f)
-    encoder_args = update_llm_args_with_extra_dict(llm_args,
-                                                   encoder_args_extra_dict)
+            encoder_args_extra_dict = yaml.safe_load(f) or {}
+    extra_allow_request_chat_template = _pop_bool_config_option(
+        encoder_args_extra_dict, "allow_request_chat_template")
+    allow_request_chat_template = (allow_request_chat_template
+                                   or extra_allow_request_chat_template)
+    encoder_args = update_llm_args_with_extra_dict(
+        llm_args, encoder_args_extra_dict, explicit_cli_keys=explicit_cli_keys)
 
     # CLI --no-telemetry always wins over YAML config
     if not telemetry:
@@ -1169,50 +1305,62 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
 
-    launch_mm_encoder_server(host, port, encoder_args, metadata_server_cfg)
+    launch_mm_encoder_server(
+        host,
+        port,
+        encoder_args,
+        metadata_server_cfg,
+        allow_request_chat_template=allow_request_chat_template)
 
 
 @click.command("disaggregated")
-@click.option("-c",
-              "--config",
-              "--config_file",
-              "config_file",
-              type=str,
-              default=None,
-              help="Path to the disaggregated serving configuration YAML file.")
-@click.option("-m",
-              "--metadata_server_config_file",
-              type=str,
-              default=None,
-              help="Path to metadata server config file")
-@click.option("-t",
-              "--server_start_timeout",
-              type=int,
-              default=180,
-              help="Server start timeout")
-@click.option("-r",
-              "--request_timeout",
-              type=int,
-              default=180,
-              help="Request timeout")
-@click.option("-l",
-              '--log_level',
-              type=click.Choice(severity_map.keys()),
-              default='info',
-              help="The logging level.")
-@click.option("-s",
-              "--schedule_style",
-              type=click.Choice(["context_first", "generation_first"],
-                                case_sensitive=False),
-              default=None,
-              help="The schedule style for the disaggregated server.")
-@click.option(
+@stability_option(
+    "-c",
+    "--config",
+    "--config_file",
+    "config_file",
+    type=str,
+    default=None,
+    help="Path to the disaggregated serving configuration YAML file.",
+    status="beta")
+@stability_option("-m",
+                  "--metadata_server_config_file",
+                  type=str,
+                  default=None,
+                  help="Path to metadata server config file",
+                  status="prototype")
+@stability_option("-t",
+                  "--server_start_timeout",
+                  type=int,
+                  default=180,
+                  help="Server start timeout",
+                  status="beta")
+@stability_option("-r",
+                  "--request_timeout",
+                  type=int,
+                  default=180,
+                  help="Request timeout",
+                  status="beta")
+@stability_option("-l",
+                  '--log_level',
+                  type=click.Choice(severity_map.keys()),
+                  default='info',
+                  help="The logging level.",
+                  status="beta")
+@stability_option("-s",
+                  "--schedule_style",
+                  type=click.Choice(["context_first", "generation_first"],
+                                    case_sensitive=False),
+                  default=None,
+                  help="The schedule style for the disaggregated server.",
+                  status="beta")
+@stability_option(
     "--metrics-log-interval",
     type=int,
     default=0,
     help="[Deprecated] The interval of logging metrics in seconds. "
-    "This option is not connected to any functionality and will be removed in a future release."
-)
+    "This option is not connected to any functionality and will be removed in a future release.",
+    status="deprecated")
 def disaggregated(
     config_file: Optional[str],
     metadata_server_config_file: Optional[str],
@@ -1291,17 +1439,20 @@ def set_cuda_device():
 
 
 @click.command("disaggregated_mpi_worker")
-@click.option("-c",
-              "--config",
-              "--config_file",
-              "config_file",
-              type=str,
-              default=None,
-              help="Path to the disaggregated serving configuration YAML file.")
-@click.option('--log_level',
-              type=click.Choice(severity_map.keys()),
-              default='info',
-              help="The logging level.")
+@stability_option(
+    "-c",
+    "--config",
+    "--config_file",
+    "config_file",
+    type=str,
+    default=None,
+    help="Path to the disaggregated serving configuration YAML file.",
+    status="beta")
+@stability_option('--log_level',
+                  type=click.Choice(severity_map.keys()),
+                  default='info',
+                  help="The logging level.",
+                  status="beta")
 def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
     """Launching disaggregated MPI worker"""
 
@@ -1324,9 +1475,7 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
             DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX)
         server_cfg = disagg_cfg.server_configs[int(instance_idx)]
 
-        llm_args, llm_args_extra_dict = get_llm_args(**server_cfg.other_args)
-        llm_args = update_llm_args_with_extra_dict(llm_args,
-                                                   llm_args_extra_dict)
+        llm_args = _build_llm_args_from_disagg_server_cfg(server_cfg.other_args)
 
         # Ignore the non-LLM args
         llm_args.pop("router", None)
@@ -1349,9 +1498,10 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
             instance_idx)
         server_cfg = disagg_cfg.server_configs[instance_idx]
 
-        llm_args, llm_args_extra_dict = get_llm_args(**server_cfg.other_args)
-        llm_args = update_llm_args_with_extra_dict(llm_args,
-                                                   llm_args_extra_dict)
+        # NOTE: the resulting llm_args is currently unused; _launch_disaggregated_leader
+        # does not take it. Keeping the call symmetric with the client branch above
+        # so any future use of llm_args here behaves the same way.
+        _build_llm_args_from_disagg_server_cfg(server_cfg.other_args)
 
         _launch_disaggregated_leader(sub_comm, instance_idx, config_file,
                                      log_level)
@@ -1386,9 +1536,11 @@ def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
     logger.info(
         f"rank {mpi_rank()} for index {instance_idx} launch the disagg server")
 
-    launch_server(host=server_cfg.hostname,
-                  port=server_cfg.port,
-                  llm_args=llm_args)
+    launch_server(
+        host=server_cfg.hostname,
+        port=server_cfg.port,
+        llm_args=llm_args,
+        allow_request_chat_template=disagg_config.allow_request_chat_template)
 
 
 def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,

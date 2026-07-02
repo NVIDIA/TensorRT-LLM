@@ -609,7 +609,7 @@ def _build_gemma4_kv_cache_manager(config, num_blocks=4, tokens_per_block=32, ba
     sizes line up with what the model actually requests at runtime.
     """
     import tensorrt_llm
-    from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig as KvCacheConfigV2
 
     dtype = config.torch_dtype
@@ -3294,29 +3294,27 @@ class TestGemma4VisionCrossImageBatching(unittest.TestCase):
         )
 
     def test_vision_attn_metadata_max_num_requests_is_not_one(self):
-        """The vision tower's ``attn_metadata`` was hardcoded to
-        ``max_num_requests=1`` while the caller loop fed one image per
-        forward. After lifting the loop, the bound must accept ``B>1``
-        cross-image batches (capped vision-scale, not LLM-scale, to keep
-        unfused-MHA workspace under control)."""
-        import re
+        """The vision tower's ``attn_metadata`` must accept ``B>1`` cross-image
+        batches (capped vision-scale, not LLM-scale, to keep unfused-MHA
+        workspace under control). It is now sized by the engine through
+        ``MultimodalEncoderMixin.setup_attn_metadata`` -- a parameterized
+        ``max_num_requests`` -- rather than a hardcoded literal, so assert the
+        tower opts into that mixin and never pins ``max_num_requests=1``."""
 
         from tensorrt_llm._torch.models import modeling_gemma4_vision as mv
 
         src = open(mv.__file__).read()
-        # Find the Gemma4VisionModel.attn_metadata = self.metadata_cls(...) block.
-        m = re.search(
-            r"self\.attn_metadata\s*=\s*self\.metadata_cls\((.*?)\)",
+        # Engine-driven sizing: the tower must derive ``attn_metadata`` from the
+        # mixin (parameterized ``max_num_requests``), not a hardcoded literal.
+        self.assertIn(
+            "MultimodalEncoderMixin",
             src,
-            re.DOTALL,
+            "Vision tower must size ``attn_metadata`` via "
+            "``MultimodalEncoderMixin`` so ``max_num_requests`` is engine-driven.",
         )
-        self.assertIsNotNone(
-            m, "Could not locate ``self.attn_metadata = self.metadata_cls(...)`` in vision tower."
-        )
-        block = m.group(1)
-        # Reject the legacy ``max_num_requests=1,`` literal.
+        # Reject the legacy ``max_num_requests=1,`` literal anywhere in the tower.
         self.assertNotRegex(
-            block,
+            src,
             r"max_num_requests\s*=\s*1\s*,",
             "Vision tower ``max_num_requests`` must not be hardcoded to 1 — "
             "the caller no longer loops per-image, so the metadata must allow "

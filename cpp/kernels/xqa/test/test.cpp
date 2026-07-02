@@ -307,17 +307,35 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
     std::unique_ptr<CUevent_st, cudaError (*)(cudaEvent_t)> const ticEv{tic, &cudaEventDestroy};
     std::unique_ptr<CUevent_st, cudaError (*)(cudaEvent_t)> const tocEv{toc, &cudaEventDestroy};
 
-    auto const ropeCosSin = ManagedMemBuf<Vec<float, validElemsPerKHead>>(seqLen);
+    // The cos/sin cache only covers the rope region (validRopeElemsPerHead elements per position);
+    // for full rotary this equals the head size, for partial rotary it is smaller.
+    auto const ropeCosSin = ManagedMemBuf<Vec<float, validRopeElemsPerHead>>(seqLen);
+#if USE_INPUT_KV && ROPE_STYLE != 0
+    auto const fullHeadRopeCosSin = ManagedMemBuf<Vec<float, validElemsPerHead>>(seqLen);
+#endif
 #if USE_INPUT_KV && defined(ROPE_STYLE) && ROPE_STYLE
     for (uint32_t m = 0; m < seqLen; m++)
     {
         auto& pairs = ropeCosSin[m];
-        constexpr uint32_t nbPairs = exactDiv(validElemsPerKHead, 2);
+#if USE_INPUT_KV && ROPE_STYLE != 0
+        auto& fullHeadPairs = fullHeadRopeCosSin[m];
+        constexpr uint32_t nbFullHeadPairs = exactDiv(validElemsPerHead, 2);
+        for (uint32_t i = 0; i < nbFullHeadPairs; i++)
+        {
+            fullHeadPairs[i * 2] = 1.F;
+            fullHeadPairs[i * 2 + 1] = 0.F;
+        }
+#endif
+        constexpr uint32_t nbPairs = exactDiv(validRopeElemsPerHead, 2);
         for (uint32_t i = 0; i < nbPairs; i++)
         {
             float const theta = m * std::pow(1E4F, (-1.F / nbPairs) * i);
             pairs[i * 2] = std::cos(theta);
             pairs[i * 2 + 1] = std::sin(theta);
+#if USE_INPUT_KV && ROPE_STYLE != 0
+            fullHeadPairs[i * 2] = pairs[i * 2];
+            fullHeadPairs[i * 2 + 1] = pairs[i * 2 + 1];
+#endif
         }
     }
 #endif
@@ -785,62 +803,115 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
     }();
     auto runKernel = [&]()
     {
-        auto const launchFunc = useQGMMA ? &launchHopperF8MHA : &launchMHA;
-
 #if SPEC_DEC
         SpecDecParams const specDecParams{.qSeqLen = qSeqLen,
             .qCuSeqLens = reinterpret_cast<uint32_t const*>(deviceCuQSeqLen),
             .mask = reinterpret_cast<MaskType const*>(devicePackedMask)};
 #endif
-        launchFunc(prop, nbKHeads,
+        if (useQGMMA)
+        {
+            launchHopperF8MHA(prop, nbKHeads,
 #if SLIDING_WINDOW
-            slidingWinSize,
+                slidingWinSize,
 #endif
-            qScale,
+                qScale,
 #if SPEC_DEC
-            &output[0][0][0][0],
+                &output[0][0][0][0],
 #else
-            &output[0][0][0],
+                &output[0][0][0],
 #endif
 #if LOW_PREC_OUTPUT
-            rcpOutScale.get(),
+                rcpOutScale.get(),
 #endif
 #if USE_INPUT_KV
-            &qkvHeads[0][0][0],
+                &qkvHeads[0][0][0],
 #if ROPE_STYLE != 0
-            ropeCosSin.get(),
+                ropeCosSin.get(),
 #endif
 #else
 #if SPEC_DEC
-            &qHeads[0][0][0][0],
+                &qHeads[0][0][0][0],
 #else
-            &qHeads[0][0][0],
+                &qHeads[0][0][0],
 #endif
 #endif
-            attentionSinksPtr,
+                attentionSinksPtr,
 #if PAGED_KV_CACHE_LAYOUT == 1 && USE_PAGED_KV_CACHE
-            cacheKHeads.get(), cacheVHeads.get(),
+                cacheKHeads.get(), cacheVHeads.get(),
 #else
-            cacheHeads.get(),
+                cacheHeads.get(),
 #endif
 #if USE_PAGED_KV_CACHE
-            pageListArg,
+                pageListArg,
 #endif
-            maxSeqLen, &seqLenList[0][0],
+                maxSeqLen, &seqLenList[0][0],
 #if BEAM_WIDTH > 1
-            beamSearchParams,
+                beamSearchParams,
 #endif
-            batchSize, kvCacheScale.get(),
+                batchSize, kvCacheScale.get(),
 #if SPEC_DEC
-            specDecParams,
+                specDecParams,
 #endif
 #if SKIP_SOFTMAX_ATTN
-            skipSoftmaxThresholdScaleFactor,
+                skipSoftmaxThresholdScaleFactor,
 #if SKIP_SOFTMAX_ATTN_BLOCK_STATS
-            kernelSkippedBlockCount.get(), kernelTotalBlockCount.get(),
+                kernelSkippedBlockCount.get(), kernelTotalBlockCount.get(),
 #endif
 #endif
-            semaphores.get(), scratch, stream);
+                semaphores.get(), scratch, stream);
+        }
+        else
+        {
+            launchMHA(prop, nbKHeads,
+#if SLIDING_WINDOW
+                slidingWinSize,
+#endif
+                qScale,
+#if SPEC_DEC
+                &output[0][0][0][0],
+#else
+                &output[0][0][0],
+#endif
+#if LOW_PREC_OUTPUT
+                rcpOutScale.get(),
+#endif
+#if USE_INPUT_KV
+                &qkvHeads[0][0][0],
+#if ROPE_STYLE != 0
+                fullHeadRopeCosSin.get(),
+#endif
+#else
+#if SPEC_DEC
+                &qHeads[0][0][0][0],
+#else
+                &qHeads[0][0][0],
+#endif
+#endif
+                attentionSinksPtr,
+#if PAGED_KV_CACHE_LAYOUT == 1 && USE_PAGED_KV_CACHE
+                cacheKHeads.get(), cacheVHeads.get(),
+#else
+                cacheHeads.get(),
+#endif
+#if USE_PAGED_KV_CACHE
+                pageListArg,
+#endif
+                maxSeqLen, &seqLenList[0][0],
+#if BEAM_WIDTH > 1
+                beamSearchParams,
+#endif
+                batchSize, kvCacheScale.get(),
+#if SPEC_DEC
+                specDecParams,
+#endif
+#if SKIP_SOFTMAX_ATTN
+                skipSoftmaxThresholdScaleFactor,
+#if SKIP_SOFTMAX_ATTN_BLOCK_STATS
+                kernelSkippedBlockCount.get(), kernelTotalBlockCount.get(),
+#endif
+#endif
+                semaphores.get(), scratch, stream);
+        }
         checkCuda(cudaGetLastError());
     };
 #endif
@@ -1154,15 +1225,15 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
 
 #endif
 #endif
+                        auto const refAttentionSinks
+                            = hasAttentionSinks ? attentionSinksPtr + headGrpSize * idxKHead : nullptr;
 #if SPEC_DEC
                         Eigen::Matrix<float, runtimeHeadGrpSize, validElemsPerHead, Eigen::RowMajor> refOutput;
                         refOutput = refAttention<InputElem>(&qHeads[req][b][q_len][runtimeHeadGrpSize * idxKHead],
                             kCacheSeq, vCacheSeq, seqLen, qScaleForRef, kvCacheScale[0], xScale, slidingWinSize,
-                            hostMask, qSeqLen, q_len);
+                            refAttentionSinks, hostMask, qSeqLen, q_len);
 #else
                     Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refOutput;
-                    auto const refAttentionSinks
-                        = hasAttentionSinks ? attentionSinksPtr + headGrpSize * idxKHead : nullptr;
                     if (useQGMMA)
                     {
                         refOutput = refFlashAttention<CacheElem, 64>(&qHeads[req][b][headGrpSize * idxKHead], kCacheSeq,
@@ -1289,6 +1360,20 @@ TEST(RefCheck, llama_V2_70b_3)
 
 #endif
 }
+
+#if SLIDING_WINDOW && !IS_SPEC_DEC_TREE
+TEST(RefCheck, gpt_oss_spec_swa_rows)
+{
+    runTest<8, HEAD_GROUP_SIZE, 2>(1, 258, false, true, true, false, true, ~0U, 128);
+    runTest<8, HEAD_GROUP_SIZE, 4>(1, 260, false, true, true, false, true, ~0U, 128);
+    runTest<8, HEAD_GROUP_SIZE, 2>(4, 258, false, true, true, false, true, ~0U, 128);
+    runTest<8, HEAD_GROUP_SIZE, 4>(4, 260, false, true, true, false, true, ~0U, 128);
+    runTest<2, HEAD_GROUP_SIZE, 2>(1, 258, false, true, true, false, true, ~0U, 128);
+    runTest<2, HEAD_GROUP_SIZE, 4>(1, 260, false, true, true, false, true, ~0U, 128);
+    runTest<2, HEAD_GROUP_SIZE, 2>(4, 258, false, true, true, false, true, ~0U, 128);
+    runTest<2, HEAD_GROUP_SIZE, 4>(4, 260, false, true, true, false, true, ~0U, 128);
+}
+#endif
 
 #endif
 
@@ -1506,9 +1591,9 @@ TEST(NVRTC, compile)
         "gmma.cuh", "gmma_impl.cuh", "barriers.cuh", "tma.h", "cuda_bf16.h", "cuda_bf16.hpp", "cuda_fp16.h",
         "cuda_fp16.hpp", "cuda_fp8.h", "cuda_fp8.hpp", "vector_types.h", "vector_functions.h", "device_types.h"};
     assert(headers_content.size() == headers_name.size());
-    auto test
-        = [&](int input_fp16, int cache_enum, int head_dim, int head_grp_size, bool use_paged_kv_cache,
-              int paged_kv_cache_layout, int beam_width, char const* source_file, int compileMajor, int compileMinor)
+    auto test = [&](int input_fp16, int cache_enum, int head_dim, int head_grp_size, bool use_paged_kv_cache,
+                    int paged_kv_cache_layout, int beam_width, char const* source_file, int compileMajor,
+                    int compileMinor, int rope_elems = 0)
     {
         std::string arch_flag = "-arch=sm_" + std::to_string(compileMajor) + std::to_string(compileMinor);
         if ((compileMajor == 9 || compileMajor == 10 || compileMajor == 12) && compileMinor == 0)
@@ -1540,6 +1625,7 @@ TEST(NVRTC, compile)
             options.push_back("-DROPE_STYLE=1");
             options.push_back("-DSLIDING_WINDOW=1");
             options.push_back("-DLOW_PREC_OUTPUT=1");
+            options.push_back("-DROPE_ELEMS=" + std::to_string(rope_elems != 0 ? rope_elems : head_dim));
         }
         std::vector<char const*> options_cstr;
         for (auto const& option : options)
@@ -1619,6 +1705,14 @@ TEST(NVRTC, compile)
                                 }
                                 test(input_fp16, cache_enum, head_dim, 8, use_paged_kv_cache, paged_kv_cache_layout,
                                     beam_width, source_file, major, minor);
+                                // Verify the partial-rotary in-kernel RoPE path also compiles (rope dim
+                                // = head_dim/2, a 16-multiple for these head dims) on the sm90 fused path.
+                                if (source_file == tensorrt_llm::kernels::mha_sm90_cu_content && cache_enum == 2
+                                    && (head_dim / 2) % 16 == 0)
+                                {
+                                    test(input_fp16, cache_enum, head_dim, 8, use_paged_kv_cache, paged_kv_cache_layout,
+                                        beam_width, source_file, major, minor, head_dim / 2);
+                                }
                             }
                         }
                     }

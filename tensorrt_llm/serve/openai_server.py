@@ -20,7 +20,8 @@ from typing import (Annotated, Any, AsyncGenerator, AsyncIterator, List,
 import uvicorn
 from fastapi import Body, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import (FileResponse, JSONResponse, Response,
+                               StreamingResponse)
 from pydantic import ValidationError
 from starlette.routing import Mount
 from transformers import AutoProcessor
@@ -44,31 +45,27 @@ from tensorrt_llm.llmapi.thinking_budget import \
     add_thinking_budget_logits_processor
 from tensorrt_llm.logger import logger
 from tensorrt_llm.media.encoding import image_to_bytes
+from tensorrt_llm.media.tensor_payload import is_tensor_format
 from tensorrt_llm.metrics.collector import MetricsCollector
+from tensorrt_llm.runtime.kv_cache_hash import \
+    get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines,
                                            resolve_top_level_model_type)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
+from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.metadata_server import create_metadata_server
-from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
-                                                ChatCompletionResponse,
-                                                ChatCompletionResponseChoice,
-                                                ChatMessage, CompletionRequest,
-                                                CompletionResponse,
-                                                CompletionResponseChoice,
-                                                ErrorResponse, ImageEditRequest,
-                                                ImageGenerationRequest,
-                                                ImageGenerationResponse,
-                                                ImageObject,
-                                                MemoryUpdateRequest, ModelCard,
-                                                ModelList, PromptTokensDetails,
-                                                ResponseFormat,
-                                                ResponsesRequest,
-                                                ResponsesResponse,
-                                                UpdateWeightsRequest, UsageInfo,
-                                                to_llm_disaggregated_params)
+from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionRequest, ChatCompletionResponse, ChatCompletionResponseChoice,
+    ChatMessage, CompletionRequest, CompletionResponse,
+    CompletionResponseChoice, ErrorResponse, ImageGenerationRequest,
+    ImageGenerationResponse, ImageObject, MemoryUpdateRequest, ModelCard,
+    ModelList, PromptTokensDetails, ResponseFormat, ResponsesRequest,
+    ResponsesResponse, UpdateWeightsRequest, UsageInfo,
+    ensure_request_chat_template_allowed, to_llm_conversation_params,
+    to_llm_disaggregated_params)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatCompletionPostprocArgs, ChatPostprocArgs, CompletionPostprocArgs,
@@ -195,13 +192,15 @@ class OpenAIServer(_VideoRoutesMixin):
             metadata_server_cfg: MetadataServerConfig,
             disagg_cluster_config: Optional[DisaggClusterConfig] = None,
             multimodal_server_config: Optional[MultimodalServerConfig] = None,
-            chat_template: Optional[str] = None):
+            chat_template: Optional[str] = None,
+            allow_request_chat_template: bool = False):
         self.generator = generator
         self._is_visual_gen = isinstance(generator, VisualGen)
         self.tool_parser = tool_parser
         self.metadata_server = create_metadata_server(metadata_server_cfg)
         self.disagg_cluster_config = disagg_cluster_config
         self.multimodal_server_config = multimodal_server_config
+        self.allow_request_chat_template = allow_request_chat_template
         self.server_role = server_role
         # Will be set in __call__
         self.binding_addr = None
@@ -321,6 +320,14 @@ class OpenAIServer(_VideoRoutesMixin):
 
         @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(_, exc):
+            if self.server_role is ServerRole.VISUAL_GEN:
+                return self._create_visual_gen_validation_error_response(exc)
+            # Non-visual-gen roles keep the shared 400 + ``{"error": ...}``
+            # response shape that integration tests (e.g.
+            # ``test_malformed_json_request``) and existing clients
+            # expect.
+            if self.metrics_collector:
+                self.metrics_collector.log_request_error(http_code=400)
             return JSONResponse(status_code=400, content={"error": str(exc)})
 
         if self.server_role is ServerRole.VISUAL_GEN:
@@ -393,6 +400,10 @@ class OpenAIServer(_VideoRoutesMixin):
         else:
             self.use_harmony = (type(self.model_config).model_type == "gpt_oss")
 
+        self._ensure_post_processor_hook_supported(
+            self.use_harmony,
+            getattr(self.generator.args, "post_processor_hook", None))
+
         self.tool_call_id_type = "random"  # default tool call id type is random
         if self.model_config is not None:
             # NOTE: Use the instance-level ``model_type`` (JSON-derived) here, not
@@ -436,6 +447,22 @@ class OpenAIServer(_VideoRoutesMixin):
             if max_perf_metrics > 0:
                 self.perf_metrics = deque(maxlen=max_perf_metrics)
                 self.perf_metrics_lock = asyncio.Lock()
+
+    @staticmethod
+    def _ensure_post_processor_hook_supported(
+            use_harmony: bool, post_processor_hook: Optional[str]) -> None:
+        """Reject ``--post_processor_hook`` combined with a harmony/gpt-oss model.
+
+        The harmony output path is rebuilt from raw token ids, not detokenized
+        text, so the text-based hook cannot act there.
+        """
+        if use_harmony and post_processor_hook:
+            raise ValueError(
+                "--post_processor_hook is not supported with harmony/gpt-oss models "
+                "in this version: the harmony output path is reconstructed from "
+                "raw token ids and would bypass the text-based hook. Disable the "
+                "hook or set DISABLE_HARMONY_ADAPTER=1 if the harmony path is "
+                "not needed.")
 
     def _logit_bias_vocab_size(self) -> int:
         for config in (self.model_config,
@@ -590,6 +617,36 @@ class OpenAIServer(_VideoRoutesMixin):
             status_code=HTTPStatus.NOT_IMPLEMENTED,
         )
 
+    def _create_visual_gen_validation_error_response(
+            self, exc: RequestValidationError) -> Response:
+        """Render a ``RequestValidationError`` as the visual-gen 422 envelope.
+
+        The body has the LLM-style ``{message, type, code}`` shape with
+        HTTP 422. The ``message`` field names the offending field(s) for
+        each error in ``exc.errors()`` so clients can fix the request
+        without parsing the full Pydantic payload.
+        """
+        parts: List[str] = []
+        for err in exc.errors():
+            loc = ".".join(
+                str(seg) for seg in err.get("loc", ()) if seg != "body")
+            etype = err.get("type", "")
+            msg = err.get("msg", "")
+            if etype == "extra_forbidden":
+                parts.append(
+                    f"Unknown request field {loc!r}. Pass model-specific "
+                    "parameters via 'extra_params' instead.")
+            elif loc:
+                parts.append(f"{loc}: {msg}")
+            else:
+                parts.append(msg)
+        message = "; ".join(parts) if parts else str(exc)
+        return self.create_error_response(
+            message=message,
+            err_type="BadRequestError",
+            status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
+        )
+
     def _check_health(self) -> bool:
         if isinstance(self.generator, LLM):
             return self.generator._check_health()
@@ -634,6 +691,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 tokenizer=self.tokenizer,
                 model_config=self.model_config,
                 processor=self.processor,
+                allow_request_chat_template=self.allow_request_chat_template,
                 harmony_adapter_factory=get_harmony_adapter
                 if self.use_harmony else None,
             )
@@ -747,6 +805,9 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route("/v1/images/edits",
                                self.openai_image_edit,
                                methods=["POST"])
+        self.app.add_api_route("/v1/images/{image_id}/content",
+                               self.get_image_content,
+                               methods=["GET"])
 
         # Video generation endpoints (Extended OpenAI API)
         # Asynchronous video generation (returns immediately with job metadata, OpenAI API)
@@ -852,6 +913,19 @@ class OpenAIServer(_VideoRoutesMixin):
         return JSONResponse(content=model_list.model_dump())
 
     async def get_iteration_stats(self) -> JSONResponse:
+        # Visual-gen deployments use a separate iteration-stats producer
+        # (see ``DiffusionRemoteClient._iter_stats``).  The LLM PyExecutor
+        # stats queue is empty in visual-gen mode, so route /metrics to the
+        # visual-gen-shaped producer instead. Each snapshot mirrors LLM
+        # field names where it makes sense (numActiveRequests,
+        # numQueuedRequests) so downstream consumers that already parse the
+        # LLM /metrics shape work for visual-gen with minimal changes.
+        if self._is_visual_gen:
+            stats = []
+            async for stat in self.generator.get_stats_async(timeout=None):
+                stats.append(stat)
+            return JSONResponse(content=stats)
+
         # When the background collector loop is active it is the sole
         # consumer of the engine stats queue; serve /metrics from the tee
         # buffer it populates so we do not race it for queue items. Racing
@@ -1140,6 +1214,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 raise
 
         try:
+            ensure_request_chat_template_allowed(
+                request, self.allow_request_chat_template)
             conversation: List[ConversationMessage] = []
             tool_dicts = None if request.tools is None else [
                 tool.model_dump() for tool in request.tools
@@ -1222,6 +1298,9 @@ class OpenAIServer(_VideoRoutesMixin):
                     "Passing 'multi_modal_data' and 'multi_modal_embeddings' at the same time is not supported."
                 )
 
+            if request.mm_processor_kwargs:
+                prompt["mm_processor_kwargs"] = request.mm_processor_kwargs
+
             postproc_args.reasoning_parser = self.generator.args.reasoning_parser
             postproc_args.tool_parser = self.tool_parser
             postproc_args.tool_call_id_type = self.tool_call_id_type
@@ -1237,6 +1316,10 @@ class OpenAIServer(_VideoRoutesMixin):
             trace_headers = (None if raw_request is None else
                              tracing.extract_trace_headers(raw_request.headers))
 
+            resolve_request_conversation_id(
+                request, None if raw_request is None else raw_request.headers)
+            conversation_params = to_llm_conversation_params(
+                request.conversation_params)
             scheduling_params = SchedulingParams(
                 agent_hierarchy=request.agent_hierarchy)
 
@@ -1255,6 +1338,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 streaming=request.stream,
                 lora_request=request.lora_request,
                 disaggregated_params=disaggregated_params,
+                conversation_params=conversation_params,
                 cache_salt=request.cache_salt,
                 trace_headers=trace_headers,
                 scheduling_params=scheduling_params,
@@ -1277,6 +1361,8 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
             signal.raise_signal(signal.SIGINT)
+        except ValueError as e:
+            return self.create_error_response(str(e))
         except Exception as e:
             logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
@@ -1324,6 +1410,8 @@ class OpenAIServer(_VideoRoutesMixin):
             )
 
         try:
+            ensure_request_chat_template_allowed(
+                request, self.allow_request_chat_template)
             conversation: List[ConversationMessage] = []
             tool_dicts = None if request.tools is None else [
                 tool.model_dump() for tool in request.tools
@@ -1522,6 +1610,10 @@ class OpenAIServer(_VideoRoutesMixin):
                 sampling_params.return_perf_metrics = True
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
+            resolve_request_conversation_id(
+                request, None if raw_request is None else raw_request.headers)
+            conversation_params = to_llm_conversation_params(
+                request.conversation_params)
             for idx, prompt in enumerate(prompts):
                 postproc_args = CompletionPostprocArgs.from_request(request)
                 postproc_args.prompt_idx = idx
@@ -1557,6 +1649,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     streaming=request.stream,
                     lora_request=request.lora_request,
                     disaggregated_params=disaggregated_params,
+                    conversation_params=conversation_params,
                     trace_headers=trace_headers)
                 asyncio.create_task(
                     self.await_disconnected(raw_request, promise))
@@ -1597,6 +1690,7 @@ class OpenAIServer(_VideoRoutesMixin):
     async def chat_harmony(self, request: ChatCompletionRequest,
                            raw_request: Request) -> Response:
         """Chat Completion API with harmony format support.
+
         Supports both streaming and non-streaming modes.
         """
 
@@ -1632,6 +1726,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 raise
 
         try:
+            ensure_request_chat_template_allowed(
+                request, self.allow_request_chat_template)
             # Initialize HarmonyAdapter
             # NOTE: WAR for Disagg failure, may affect perf if no warmup
             if not self.harmony_adapter:
@@ -1696,6 +1792,10 @@ class OpenAIServer(_VideoRoutesMixin):
                 postproc_args=postproc_args,
             )
 
+            resolve_request_conversation_id(
+                request, None if raw_request is None else raw_request.headers)
+            conversation_params = to_llm_conversation_params(
+                request.conversation_params)
             scheduling_params = SchedulingParams(
                 agent_hierarchy=request.agent_hierarchy)
 
@@ -1709,6 +1809,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 lora_request=request.lora_request,
                 scheduling_params=scheduling_params,
                 disaggregated_params=disaggregated_params,
+                conversation_params=conversation_params,
                 trace_headers=trace_headers,
             )
             if not self.postproc_worker_enabled:
@@ -1727,6 +1828,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     promise, postproc_params, raw_request, disaggregated_params)
                 return JSONResponse(response.model_dump())
 
+        except ValueError as e:
+            return self.create_error_response(str(e))
         except Exception as e:
             logger.error("Error in harmony chat completion: %s", e)
             logger.debug("Error details: %s", traceback.format_exc())
@@ -1933,27 +2036,54 @@ class OpenAIServer(_VideoRoutesMixin):
         return JSONResponse(content={"status": "success"})
 
     async def get_server_info(self) -> JSONResponse:
-        return JSONResponse(
-            content={
-                "disaggregated_params": self.generator.disaggregated_params
-            })
+        content = {"disaggregated_params": self.generator.disaggregated_params}
+        args = getattr(self.generator, "args", None)
+        if args is not None:
+            if args.max_batch_size is not None:
+                content["max_batch_size"] = args.max_batch_size
+            kv_cache_config = args.kv_cache_config
+            if kv_cache_config is not None:
+                content[
+                    "kv_cache_hash_algo"] = get_effective_kv_cache_event_hash_algo(
+                        kv_cache_config.kv_cache_event_hash_algo,
+                        kv_cache_config.use_kv_cache_manager_v2)
+                if kv_cache_config.tokens_per_block is not None:
+                    content[
+                        "tokens_per_block"] = kv_cache_config.tokens_per_block
+        return JSONResponse(content=content)
 
     async def openai_image_generation(self, request: ImageGenerationRequest,
                                       raw_request: Request) -> Response:
         """OpenAI-compatible image generation endpoint.
 
-        Follows the OpenAI Images API specification for image generation.
+        Follows the OpenAI Images API specification for image generation,
+        with ``request.format`` extended to accept tensor payloads
+        (``"safetensors"``/``"pt"``) alongside the PNG/WebP/JPEG encoders.
         """
         try:
             image_id = f"image_{uuid.uuid4().hex}"
-            params = parse_visual_gen_params(request, image_id, self.generator)
-            logger.info(
-                f"Generating image: {image_id} with params: {params} and prompt: {request.prompt}"
-            )
 
-            image_gen_start = time.perf_counter()
-            output = self.generator.generate(inputs=request.prompt,
-                                             params=params)
+            # Client-side ValueErrors from request translation and
+            # parameter validation are 400. Serialization failures below
+            # (server-side: missing media, inconsistent batch) fall
+            # through to the outer ``except Exception`` → 500 so the
+            # client doesn't get blamed for a server-internal failure.
+            try:
+                params = parse_visual_gen_params(request, image_id,
+                                                 self.generator)
+                logger.info(
+                    f"Generating image: {image_id} with params: {params} and prompt: {request.prompt}"
+                )
+                image_gen_start = time.perf_counter()
+                output = self.generator.generate(inputs=request.prompt,
+                                                 params=params)
+            except ValueError as exc:
+                logger.error(f"Image request error: {exc}")
+                return self.create_error_response(
+                    message=str(exc),
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+
             if output.image is None:
                 return self.create_error_response(
                     message="Image generation failed",
@@ -1961,29 +2091,78 @@ class OpenAIServer(_VideoRoutesMixin):
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
 
-            # Build response
-            output_images = _normalize_image_output(output.image)
+            if is_tensor_format(request.format):
+                # Tensor payloads carry every populated modality in a
+                # single file. Match the image-encoder fan-out by
+                # emitting one ``ImageObject`` per batch item.
+                from tensorrt_llm.media.tensor_payload import infer_batch_size
 
-            if request.response_format == "b64_json":
-                data = [
-                    ImageObject(
-                        b64_json=base64.b64encode(
-                            image_to_bytes(image)).decode('utf-8'),
-                        revised_prompt=request.prompt,
-                    ) for image in output_images
-                ]
-
+                ext = f".{request.format}"
+                batch_size = infer_batch_size(output)
+                if request.response_format == "b64_json":
+                    data = [
+                        ImageObject(
+                            b64_json=base64.b64encode(
+                                output._save_bytes(
+                                    request.format,
+                                    batch_index=i)).decode("utf-8"),
+                            revised_prompt=request.prompt,
+                        ) for i in range(batch_size)
+                    ]
+                else:
+                    paths_in = [
+                        self.media_storage_path / f"{image_id}_{i}{ext}"
+                        for i in range(batch_size)
+                    ]
+                    output.save(paths_in, format=request.format)
+                    data = [
+                        ImageObject(
+                            url=self._build_image_content_url(
+                                raw_request, image_id, i),
+                            revised_prompt=request.prompt,
+                        ) for i in range(batch_size)
+                    ]
                 response = ImageGenerationResponse(
                     created=int(time.time()),
                     data=data,
+                    output_format=request.format,
                     size=f"{params.width}x{params.height}",
                 )
-
-            elif request.response_format == "url":
-                output.save(self.media_storage_path / f"{image_id}.png")
-                # TODO: Support URL mode
-                return self._create_not_supported_error(
-                    "URL mode is not supported for image generation")
+            else:
+                output_images = _normalize_image_output(output.image)
+                # Pillow's format name is the upper-case form of our
+                # request token. The on-disk extension matches the
+                # request token directly; ``.jpeg`` is interchangeable
+                # with ``.jpg`` for Pillow, the OS, and the OpenAI API.
+                pil_format = request.format.upper()
+                ext = f".{request.format}"
+                if request.response_format == "b64_json":
+                    data = [
+                        ImageObject(
+                            b64_json=base64.b64encode(
+                                image_to_bytes(
+                                    image, format=pil_format)).decode("utf-8"),
+                            revised_prompt=request.prompt,
+                        ) for image in output_images
+                    ]
+                else:
+                    data = []
+                    for i, image in enumerate(output_images):
+                        path = self.media_storage_path / f"{image_id}_{i}{ext}"
+                        path.write_bytes(
+                            image_to_bytes(image, format=pil_format))
+                        data.append(
+                            ImageObject(
+                                url=self._build_image_content_url(
+                                    raw_request, image_id, i),
+                                revised_prompt=request.prompt,
+                            ))
+                response = ImageGenerationResponse(
+                    created=int(time.time()),
+                    data=data,
+                    output_format=request.format,
+                    size=f"{params.width}x{params.height}",
+                )
 
             latency = time.perf_counter() - image_gen_start  # seconds
             metrics = output.metrics
@@ -1998,20 +2177,59 @@ class OpenAIServer(_VideoRoutesMixin):
 
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            return self.create_error_response(
+                message=str(e),
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
-    async def openai_image_edit(self, request: ImageEditRequest,
-                                raw_request: Request) -> Response:
-        """OpenAI-compatible image editing endpoint.
+    async def get_image_content(
+        self,
+        image_id: str,
+        raw_request: Request,
+        i: int = 0,
+    ) -> Response:
+        """Serve a generated image by ID and batch index.
 
-        Follows the OpenAI Images API specification for image editing.
-        Creates an edited or extended image given an original image and a prompt.
+        ``GET /v1/images/{image_id}/content?i=<batch_index>`` returns
+        the image file the corresponding ``POST /v1/images/generations``
+        wrote into ``media_storage_path``. ``i`` defaults to ``0`` for
+        single-image requests; URL responses for ``n > 1`` requests
+        carry ``?i=N`` per item.
+        """
+        for ext in (".png", ".webp", ".jpg", ".jpeg", ".safetensors", ".pt"):
+            candidate = self.media_storage_path / f"{image_id}_{i}{ext}"
+            if candidate.exists():
+                media_type = ("application/octet-stream"
+                              if ext in (".safetensors", ".pt") else
+                              f"image/{ext.lstrip('.').replace('jpg', 'jpeg')}")
+                return FileResponse(
+                    str(candidate),
+                    media_type=media_type,
+                    filename=candidate.name,
+                )
+        return self.create_error_response(
+            message=f"Image {image_id!r} (batch index {i}) not found",
+            err_type="NotFoundError",
+            status_code=HTTPStatus.NOT_FOUND,
+        )
+
+    @staticmethod
+    def _build_image_content_url(raw_request: Request, image_id: str,
+                                 i: int) -> str:
+        """Return a fetchable HTTP URL for a generated image item."""
+        base = str(raw_request.base_url).rstrip("/")
+        return f"{base}/v1/images/{image_id}/content?i={i}"
+
+    async def openai_image_edit(self, raw_request: Request) -> Response:
+        """OpenAI-compatible image editing endpoint — returns HTTP 501.
 
         No in-tree pipeline implements image editing today: Flux/Flux2 are
         text-to-image only and ignore ``params.image``; Wan and LTX-2 produce
-        video, not edited images. Return 501 here so callers get an honest
-        NotImplemented signal instead of a 500 from a downstream None check.
-        Re-enable the full handler when an edit-capable pipeline lands.
+        video, not edited images. The route is registered so callers get an
+        honest NotImplemented signal instead of a 404. The request body is
+        not parsed because no schema is committed for this endpoint yet —
+        bring a typed request model back when an edit-capable pipeline lands.
         """
         return self._create_not_supported_error(
             "Image editing is not supported by any in-tree pipeline yet.")

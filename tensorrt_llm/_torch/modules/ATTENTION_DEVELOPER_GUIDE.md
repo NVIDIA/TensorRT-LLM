@@ -5,6 +5,7 @@
 This guide covers the TRT-LLM PyTorch attention stack:
 
 - `tensorrt_llm/_torch/modules/attention.py`
+- `tensorrt_llm/_torch/modules/mla.py`
 - `tensorrt_llm/_torch/attention_backend/`
 - `tensorrt_llm/_torch/attention_backend/sparse/`
 
@@ -92,7 +93,7 @@ without changing the outer runtime contract.
 
 ### 1.2 `MLA`: a separate module on top of the same backend system
 
-`MLA` (Multi-head Latent Attention) is a separate module in `attention.py`.
+`MLA` (Multi-head Latent Attention) is a separate module in `mla.py`.
 Like `Attention`, it keeps module-level projection logic in the module,
 delegates core execution to a backend object, and depends on metadata and
 KV-cache contract. At a high level, it owns:
@@ -116,15 +117,18 @@ For MLA-related tasks, first check whether the work fits the current
 projection structure, can stay on an existing backend and metadata family, and
 can preserve the current latent-cache / paged-KV contract. If it can, the
 task usually stays within the existing MLA stack. If it depends on sparse
-helper-level control flow, read `attention.py` and the relevant sparse
+helper-level control flow, read `mla.py` and the relevant sparse
 backend code directly.
 
 ## 2. Backend Layer Reference
 
 ### 2.1 Backend selection
 
-The backend is chosen from `config.attn_backend`, optional
-`sparse_attention_config`, and optional MLA parameters.
+`config.attn_backend` selects the base backend family. If
+`ModelConfig.sparse_attention_config` is set, the backend class is selected
+from that user-facing config's algorithm. The attention module separately
+lowers the config to `SparseParams` and passes those params to the constructed
+backend instance. MLA parameters can further affect backend construction.
 
 Base backend families:
 
@@ -136,9 +140,13 @@ Base backend families:
 
 ### 2.2 Sparse backend families
 
-Sparse attention is not selected by a separate top-level module. It is resolved
-through `sparse_attention_config` on top of a base backend family. Sparse
-selection can change the backend class, metadata subtype, and KV-cache manager.
+Sparse attention is not selected by a separate top-level module. User-facing
+`SparseAttentionConfig` objects live in LLM / VisualGen args and `ModelConfig`.
+Attention modules use those configs to select sparse backend classes, then
+lower the configs into `SparseParams` for backend construction. KV-cache
+managers stay model-scope and consume the user-facing config directly.
+Sparse metadata consumes `SparseMetadataParams`, derived independently from the
+same user-facing config.
 
 Sparse registrations are defined in `attention_backend/sparse/utils.py`. Check
 that file for the current supported combinations, as they may change over time.
@@ -181,8 +189,9 @@ metadata and cache behavior.
 
 All backend metadata types inherit from `AttentionMetadata`. The base contract
 includes sequence-length and request-level state, KV-cache manager and
-parameters, runtime feature flags, optional sparse state, and optional
-CUDA-graph buffer management.
+parameters, runtime feature flags, and optional CUDA-graph buffer management.
+Sparse metadata subtypes consume only `SparseMetadataParams`, not
+backend-owned `SparseParams`.
 
 **`TrtllmAttentionMetadata`** is the main metadata family. It adds paged-KV
 block information, TRTLLM runtime state, chunked-prefill/speculative-decode/Helix
@@ -235,13 +244,32 @@ The main differences across backends:
 | `VANILLA` | Python-side | Python-side slicing |
 | `FLASHINFER` | Python-side (explicit append) | Page-table metadata |
 
-#### 3.2.2 `TRTLLM` internal `trtllm_gen` path
+#### 3.2.2 `TRTLLM` internal FMHA libraries
 
-`trtllm_gen.py` integrates trtllm-gen kernels from FlashInfer into the
-`TRTLLM` backend. It is not a separate backend. It is an internal fast path
-disabled by default (`TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION`). It bridges the
-TRTLLM block-offset format into the page-table shape expected by those kernels.
-If it does not apply, `TrtllmAttention` stays on its regular runtime path.
+`TrtllmAttention` dispatches attention through an ordered list of internal FMHA
+libraries. `FlashInferTrtllmGenFmha` integrates trtllm-gen kernels from
+FlashInfer into the `TRTLLM` backend, and `FallbackFmha` calls the regular
+`thop.attention` runtime path. These are not separate attention backends.
+
+`TLLM_FMHA_LIBS` controls the ordered list. Unset means
+`flashinfer_trtllm_gen,fallback`; use `TLLM_FMHA_LIBS=fallback` or
+`TLLM_FMHA_LIBS=-flashinfer_trtllm_gen` to force the fallback path. Each FMHA
+library exposes `is_available()` for module/static environment checks and
+`is_supported()` for per-forward request checks.
+
+The FMHA package is split by role:
+
+- `fmha/interface.py` defines the `Fmha` runtime contract.
+- `fmha/phased.py` defines `PhasedFmha`, which handles mixed context/generation
+  requests and dispatches them to phase-specific hooks.
+- `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
+  library.
+- `fmha/fallback.py` implements the regular `thop.attention` fallback library.
+- `fmha/registry.py` owns `TLLM_FMHA_LIBS` parsing and library ordering.
+
+Use `PhasedFmha` for libraries that need separate context/generation or MHA/MLA
+entry points. Use `Fmha` directly for libraries that already own the full
+request shape.
 
 #### 3.2.3 MLA cached-context semantics
 
@@ -251,7 +279,7 @@ appending, RoPE application, and loading cached state for attention use.
 
 MLA fit cannot be judged from attention math alone. The module and backend must
 agree on latent-cache layout, paged-KV read/write paths, and cached/chunked
-context behavior. Read the MLA section of `attention.py` and the relevant
+context behavior. Read `mla.py` and the relevant
 backend code for the current implementation details.
 
 #### 3.2.4 Sparse side-cache semantics
@@ -326,11 +354,12 @@ Working rules:
 
 | File | Role |
 |------|------|
-| `tensorrt_llm/_torch/modules/attention.py` | Standard attention and MLA module logic |
+| `tensorrt_llm/_torch/modules/attention.py` | Standard attention module logic and shared Helix CP helpers |
+| `tensorrt_llm/_torch/modules/mla.py` | MLA module logic, MLA custom ops, and MLA-specific dispatch |
 | `tensorrt_llm/_torch/attention_backend/interface.py` | Backend contract, base metadata, capability hooks |
 | `tensorrt_llm/_torch/attention_backend/utils.py` | Backend and sparse-backend selection |
 | `tensorrt_llm/_torch/attention_backend/trtllm.py` | TRTLLM backend and metadata |
-| `tensorrt_llm/_torch/attention_backend/trtllm_gen.py` | Internal dense fast path |
+| `tensorrt_llm/_torch/attention_backend/fmha/` | Internal TRTLLM FMHA libraries |
 | `tensorrt_llm/_torch/attention_backend/vanilla.py` | Torch fallback backend and metadata |
 | `tensorrt_llm/_torch/attention_backend/flashinfer.py` | FlashInfer backend and metadata |
 | `tensorrt_llm/_torch/attention_backend/sparse/` | DSA, Rocket sparse backends, metadata, cache managers |

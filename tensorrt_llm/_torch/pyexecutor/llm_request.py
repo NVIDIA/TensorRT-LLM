@@ -12,6 +12,8 @@ from tensorrt_llm.executor.result import SimpleTokenLogprobs, TokenLogprobs
 from tensorrt_llm.sampling_params import LogprobMode
 
 SamplingConfig = tensorrt_llm.bindings.SamplingConfig
+
+MAX_SPEC_DECODE_POSITIONS = 16
 '''
 CONTEXT_INIT: typing.ClassVar[LlmRequestState]  # value = <LlmRequestState.CONTEXT_INIT: 2>
 ENCODER_INIT: typing.ClassVar[LlmRequestState]  # value = <LlmRequestState.ENCODER_INIT: 1>
@@ -281,6 +283,7 @@ class PyResult:
         generation_logits_list: list[torch.Tensor] = field(default_factory=list)
         reset_log_probs: tuple[list[TokenLogprobs] | list[SimpleTokenLogprobs],
                                list[float] | None] | None = None
+        first_gen_log_probs: TokenLogprobs | None = None
         mm_embeddings: list[dict[str, Any] | None] = None
         mrope_position_ids: dict[str, Any] | None = None
         mrope_position_deltas: dict[str, Any] | None = None
@@ -289,6 +292,7 @@ class PyResult:
         additional_generation_outputs_list: list[tuple[str,
                                                        torch.Tensor]] = field(
                                                            default_factory=list)
+        encoder_output: torch.Tensor | None = None
 
     def __init__(self,
                  *,
@@ -324,6 +328,7 @@ class PyResult:
             use_chunked_generation_logits=use_chunked_generation_logits,
             chunk_size=self._chunk_size) if return_generation_logits else None
         self._log_probs = LogProbStorage() if return_log_probs else None
+        self._first_gen_log_probs: Optional[TokenLogprobs] = None
         self._mm_embeddings: Optional[List[Dict[str, Any]]] = None
         self._mrope_position_ids = None
         self._mrope_position_deltas = None
@@ -335,6 +340,7 @@ class PyResult:
             name: []
             for name in additional_outputs
         } if additional_outputs else None
+        self._encoder_output: Optional[torch.Tensor] = None
         self.diff = PyResult.Diff()
 
     def reset_diff(self):
@@ -345,6 +351,8 @@ class PyResult:
             self.diff.context_logits_list[i] = context_logits.to("cpu")
         for i, generation_logits in enumerate(self.diff.generation_logits_list):
             self.diff.generation_logits_list[i] = generation_logits.to("cpu")
+        if self.diff.encoder_output is not None:
+            self.diff.encoder_output = self.diff.encoder_output.detach().cpu()
         return self.diff
 
     def apply_diff(self, diff: Diff):
@@ -358,11 +366,15 @@ class PyResult:
                 self._generation_logits.append(generation_logits)
         if diff.reset_log_probs is not None:
             self._log_probs.set_log_probs(*diff.reset_log_probs)
+        if diff.first_gen_log_probs is not None:
+            self._first_gen_log_probs = diff.first_gen_log_probs
         if diff.mm_embeddings is not None:
             self._mm_embeddings = diff.mm_embeddings
         if diff.mrope_position_ids is not None:
             self._mrope_position_ids = diff.mrope_position_ids
             self._mrope_position_deltas = diff.mrope_position_deltas
+        if diff.encoder_output is not None:
+            self._encoder_output = diff.encoder_output
         if len(diff.additional_context_outputs_list) > 0:
             for name, additional_context_outputs in diff.additional_context_outputs_list:
                 self._additional_context_outputs[name].append(
@@ -395,21 +407,18 @@ class PyResult:
             self._log_probs.append(log_probs, cum_log_probs)
 
     def append_mm_embeddings(self, mm_embeddings: torch.Tensor,
-                             multimodal_lengths: List[int]):
+                             mm_embedding_lengths: List[int]):
         """Split concatenated embeddings by per-item lengths and create handles.
 
         Args:
             mm_embeddings: Concatenated multimodal embeddings tensor of shape
                 [total_tokens, hidden_dim].
-            multimodal_lengths: Current per-item split lengths.
+            mm_embedding_lengths: Per-item encoder-output embedding lengths.
         """
-        # TODO(TRTLLM-12175): callers currently pass request.multimodal_lengths,
-        # a prompt-side MM-token count that may include non-embedding
-        # special/framing tokens. This split needs per-item encoder-output
-        # embedding lengths instead.
-        split_embeddings = torch.split(mm_embeddings, multimodal_lengths, dim=0)
+        split_embeddings = torch.split(mm_embeddings,
+                                       mm_embedding_lengths,
+                                       dim=0)
 
-        # Create a SharedTensorContainer handle for each split
         self._mm_embeddings = [
             SharedTensorContainer.from_tensor(emb).dump_to_dict()
             for emb in split_embeddings
@@ -421,12 +430,16 @@ class PyResult:
         mrope_position_ids: torch.Tensor,
         mrope_position_deltas: torch.Tensor,
     ):
-        self._mrope_position_ids = (SharedTensorContainer.from_tensor(
-            mrope_position_ids).dump_to_dict())
-        self._mrope_position_deltas = (SharedTensorContainer.from_tensor(
-            mrope_position_deltas).dump_to_dict())
+        self._mrope_position_ids = SharedTensorContainer.from_tensor(
+            mrope_position_ids).dump_to_dict()
+        self._mrope_position_deltas = SharedTensorContainer.from_tensor(
+            mrope_position_deltas).dump_to_dict()
         self.diff.mrope_position_ids = self._mrope_position_ids
         self.diff.mrope_position_deltas = self._mrope_position_deltas
+
+    def set_encoder_output(self, encoder_output: torch.Tensor):
+        self._encoder_output = encoder_output
+        self.diff.encoder_output = encoder_output
 
     def transfer_remaining_device_logits(self):
         """Finalize any remaining generation logits transfers (for chunked mode)"""
@@ -457,6 +470,10 @@ class PyResult:
         if self._log_probs:
             self._log_probs.set_log_probs(log_probs, cum_log_probs)
             self.diff.reset_log_probs = (log_probs, cum_log_probs)
+
+    def set_first_gen_log_probs(self, log_probs: TokenLogprobs):
+        self._first_gen_log_probs = log_probs
+        self.diff.first_gen_log_probs = log_probs
 
     @property
     def context_logits(self) -> torch.Tensor | None:
@@ -509,6 +526,10 @@ class PyResult:
         return self._log_probs.cum_log_probs
 
     @property
+    def first_gen_log_probs(self) -> TokenLogprobs | None:
+        return self._first_gen_log_probs
+
+    @property
     def mm_embedding_handles(self) -> List[Dict[str, Any]] | None:
         """Returns a list of SharedTensorContainer handles, one per multimodal item."""
         return self._mm_embeddings
@@ -549,13 +570,18 @@ class PyResult:
                 output_list, dim=0) if len(output_list) > 1 else output_list[0]
         return outputs
 
+    @property
+    def encoder_output(self) -> torch.Tensor | None:
+        return self._encoder_output
+
 
 class LlmResult:
     """LlmResult wraps `bindings.executor.Result` but detour some features to Python implementation"""
     py_result_properties = frozenset(
         ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs',
-         'mm_embedding_handles', 'additional_context_outputs',
-         'additional_generation_outputs', 'mrope_position_ids_handle',
+         'first_gen_log_probs', 'mm_embedding_handles',
+         'additional_context_outputs', 'additional_generation_outputs',
+         'encoder_output', 'mrope_position_ids_handle',
          'mrope_position_deltas_handle'))
 
     def __init__(self,
@@ -567,6 +593,9 @@ class LlmResult:
         self._py_result = py_result
         self.is_final = is_final
         self.cached_tokens = 0
+        # Context-worker usage for gen-first disagg, delivered via the
+        # KV-transfer aux buffer (see _maybe_attach_ctx_usage).
+        self.ctx_usage = None
         # Time breakdown metrics for performance analysis
         # Contains: step_metrics (list), ctx_gpu_forward_time (float), ctx_gpu_sample_time (float)
         self.time_breakdown_metrics = time_breakdown_metrics
@@ -648,6 +677,22 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_lora_path: str | None = kwargs.pop("py_lora_path", None)
         # Multimodal data
         self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
+        encoder_input_tokens = kwargs.get("encoder_input_tokens")
+        encoder_output_len = kwargs.get("encoder_output_len")
+        return_encoder_output = bool(kwargs.get("return_encoder_output", False))
+        if return_encoder_output:
+            kwargs["return_encoder_output"] = False
+        if (llm_request is None and encoder_input_tokens is not None
+                and encoder_output_len is None):
+            encoder_output_len = len(encoder_input_tokens)
+            kwargs["encoder_output_len"] = encoder_output_len
+
+        # Cross-iter MM encoder prefetch event: stamped by the side-stream
+        # producer in `modeling_multimodal_mixin._dispatch_cross_iter_prefetch`
+        # and consumed (then cleared) in `model_engine._prepare_inputs` when
+        # the request is next scheduled.
+        self.py_mm_encoder_event: Optional[torch.cuda.Event] = None
+
         if llm_request is not None:
             super().__init__(llm_request)
         else:
@@ -661,6 +706,15 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                 stop_words_list=torch.tensor(stop_words_list, dtype=torch.int32)
                 if stop_words_list else None,
                 **kwargs)
+        if encoder_output_len is not None and not hasattr(
+                self, "encoder_output_len"):
+            self.encoder_output_len = int(encoder_output_len)
+        if encoder_input_tokens is not None and not hasattr(
+                self, "encoder_tokens"):
+            encoder_tokens = (encoder_input_tokens.tolist() if hasattr(
+                encoder_input_tokens, "tolist") else list(encoder_input_tokens))
+            self.encoder_tokens = encoder_tokens
+        self.py_return_encoder_output = return_encoder_output
         self.py_client_id = client_id
         self.py_request_id = self.request_id
         self.py_llm_request_type = self.llm_request_type
@@ -684,11 +738,29 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_num_accepted_draft_tokens = 0
         self.py_num_accepted_draft_tokens_indices = []
         self.py_rewind_draft_token_separate_adjustment = 0
+        self.py_per_pos_drafted = [0] * MAX_SPEC_DECODE_POSITIONS
+        self.py_per_pos_accepted = [0] * MAX_SPEC_DECODE_POSITIONS
         self.py_decoding_iter = 0
         self.is_attention_dp_dummy = False
         self.is_cuda_graph_dummy = False
         self.py_kv_transfer_start_time = None
         self.py_kv_transfer_timed_out = False
+
+        # Encoder-decoder runtime state. ``py_encoder_output`` holds the
+        # packed encoder hidden states produced by the encoder iteration as
+        # a GPU buffer for cross-attention projection and fallback paths.
+        # ``py_encoder_output_ready_event`` is
+        # recorded on the encoder stream when those hidden states become
+        # available; the scheduler queries it before admitting the request
+        # to a decoder context step. ``py_skip_cross_kv_projection`` controls
+        # whether the decoder's cross-attention projects K/V from
+        # ``encoder_output`` (False on the first context step, the only step
+        # that writes the cross pool) or reads cross-KV without projection
+        # (True on later decoder steps and chunks). All three are unused for
+        # decoder-only models.
+        self.py_encoder_output: Optional[torch.Tensor] = None
+        self.py_encoder_output_ready_event: Optional[torch.cuda.Event] = None
+        self.py_skip_cross_kv_projection: bool = False
 
         # Performance timing info (step metrics, GPU events, context GPU timing)
         # Lazily created only when return_perf_metrics is enabled to avoid
@@ -729,6 +801,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_logprobs_mode = LogprobMode(
             logprobs_mode)  # handle passed a raw string
         self.py_disaggregated_params = None
+        self.py_conversation_params = None
 
         self.py_num_connector_matched_tokens = 0
 
@@ -886,7 +959,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             if attr_name.startswith('py_'):
                 attr_value = getattr(self, attr_name)
                 setattr(py_request, attr_name, deepcopy(attr_value))
-            elif attr_name in ['is_attention_dp_dummy', 'is_cuda_graph_dummy']:
+            elif attr_name in [
+                    'is_attention_dp_dummy', 'is_cuda_graph_dummy',
+                    'encoder_tokens', 'encoder_output_len'
+            ]:
                 setattr(py_request, attr_name, attr_value)
 
         # Rewrite specific attributes that should use child_request values.
@@ -939,6 +1015,50 @@ def convert_wordlist(word_list) -> List[List[int]]:
     if len(tokens) > len(offsets):
         offsets.extend([-1] * (len(tokens) - len(offsets)))
     return [tokens, offsets]
+
+
+def _validate_optional_int_list(values: Any,
+                                field_name: str) -> Optional[List[int]]:
+    if values is None:
+        return None
+    if not isinstance(values, list):
+        raise TypeError(f"{field_name} must be a list")
+    if not all(isinstance(value, int) for value in values):
+        raise TypeError(f"{field_name} must contain only integers")
+    return values
+
+
+def get_multimodal_embedding_lengths(
+        request: LlmRequest) -> Optional[List[int]]:
+    """Return explicit per-item encoder-output lengths for a multimodal request."""
+    py_multimodal_data = request.py_multimodal_data
+    if py_multimodal_data is not None and not isinstance(
+            py_multimodal_data, dict):
+        raise TypeError("py_multimodal_data must be a dict")
+    # `multimodal_embedding_lengths` is Python-side layout metadata, not a
+    # nanobind request field, so validate the flat handoff contract here.
+    multimodal_embedding_lengths = _validate_optional_int_list(
+        py_multimodal_data.get("multimodal_embedding_lengths")
+        if py_multimodal_data is not None else None,
+        "multimodal_embedding_lengths")
+    if multimodal_embedding_lengths is None:
+        return None
+
+    if any(length < 0 for length in multimodal_embedding_lengths):
+        raise ValueError("multimodal_embedding_lengths must be non-negative")
+    multimodal_lengths = request.multimodal_lengths
+    if multimodal_lengths is not None:
+        if len(multimodal_embedding_lengths) != len(multimodal_lengths):
+            raise ValueError("multimodal_embedding_lengths length must match "
+                             "multimodal_lengths")
+        for item_idx, (embedding_length, prompt_length) in enumerate(
+                zip(multimodal_embedding_lengths, multimodal_lengths)):
+            if embedding_length > prompt_length:
+                raise ValueError(
+                    f"multimodal_embedding_lengths[{item_idx}] exceeds "
+                    f"multimodal_lengths[{item_idx}]")
+
+    return multimodal_embedding_lengths
 
 
 def executor_request_to_llm_request(
@@ -1046,14 +1166,15 @@ def executor_request_to_llm_request(
         guided_decoding_params=executor_request.guided_decoding_params,
         py_logits_post_processors=getattr(executor_request,
                                           "py_logits_post_processors", None),
-        encoder_input_tokens=None,
-        return_encoder_output=False,
+        encoder_input_tokens=executor_request.encoder_input_token_ids,
+        return_encoder_output=executor_request.output_config.
+        return_encoder_output,
         client_id=executor_request.client_id
         if executor_request.client_id is not None else req_id,
         priority=executor_request.priority,
         llm_request_type=llm_request_type,
         context_phase_params=executor_request.context_phase_params,
-        cache_salt_id=executor_request.cache_salt_id,
+        cache_salt=executor_request.cache_salt,
         arrival_time=getattr(executor_request, "py_arrival_time", None),
         py_multimodal_data=getattr(executor_request, "py_multimodal_data",
                                    None),
@@ -1071,6 +1192,8 @@ def executor_request_to_llm_request(
     llm_request.py_disaggregated_params = getattr(executor_request,
                                                   "py_disaggregated_params",
                                                   None)
+    llm_request.py_conversation_params = getattr(executor_request,
+                                                 "py_conversation_params", None)
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)

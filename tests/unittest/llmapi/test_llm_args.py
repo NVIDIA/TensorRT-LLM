@@ -1,9 +1,10 @@
+import math
 import tempfile
 from collections import defaultdict
 from dataclasses import is_dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Any, Literal, get_args, get_origin
+from typing import Annotated, Any, ClassVar, Literal, get_args, get_origin
 
 import pydantic_core
 import pytest
@@ -31,6 +32,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           CudaGraphConfig,
                                           DecodeCudaGraphConfig,
                                           DecodingBaseConfig,
+                                          DeepSeekV4SparseAttentionConfig,
                                           DynamicBatchConfig,
                                           Eagle3DecodingConfig,
                                           EagleDecodingConfig,
@@ -39,8 +41,11 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           ExtendedRuntimePerfKnobConfig,
                                           KvCacheConfig,
                                           LookaheadDecodingConfig, MoeConfig,
-                                          MTPDecodingConfig, PeftCacheConfig,
-                                          PybindMirror, RayPlacementConfig,
+                                          MTPDecodingConfig, MultimodalConfig,
+                                          MultimodalEncoderCudaGraphConfig,
+                                          PeftCacheConfig, PybindMirror,
+                                          RayPlacementConfig,
+                                          SkipSoftmaxAttentionConfig,
                                           SleepConfig, SpeculativeConfig,
                                           StrictBaseModel, TorchCompileConfig,
                                           TorchLlmArgs, TrtLlmArgs,
@@ -187,6 +192,63 @@ model_kwargs:
         assert llm_args.model_kwargs['num_hidden_layers'] == 2
 
 
+@pytest.mark.parametrize("llm_args_cls", [TorchLlmArgs])
+class TestEncoderRuntimeSizes:
+    """Cover encoder runtime size fields and fallback to LLM limits.
+
+    `encoder_max_batch_size` / `encoder_max_num_tokens` are user-facing
+    knobs that size multimodal encoder AttentionMetadata; when unset they
+    fall back to the LLM-side `max_batch_size` / `max_num_tokens`. They are
+    PyTorch-backend only (the multimodal encoder profiling path), so they
+    live on `TorchLlmArgs` rather than the shared `BaseLlmArgs`.
+    """
+
+    def test_defaults_are_none(self, llm_args_cls):
+        llm_args = llm_args_cls(model=llama_model_path)
+        assert llm_args.encoder_max_batch_size is None
+        assert llm_args.encoder_max_num_tokens is None
+
+    @pytest.mark.parametrize(
+        "kwargs, expected_runtime_sizes",
+        [
+            # Neither encoder knob set -- falls back to LLM limits.
+            (dict(max_batch_size=64, max_num_tokens=2048), (64, 2048)),
+            # Only encoder_max_batch_size overrides.
+            (dict(max_batch_size=64,
+                  max_num_tokens=2048,
+                  encoder_max_batch_size=512), (512, 2048)),
+            # Only encoder_max_num_tokens overrides.
+            (dict(max_batch_size=64,
+                  max_num_tokens=2048,
+                  encoder_max_num_tokens=32768), (64, 32768)),
+            # Both encoder knobs override.
+            (dict(max_batch_size=64,
+                  max_num_tokens=2048,
+                  encoder_max_batch_size=512,
+                  encoder_max_num_tokens=32768), (512, 32768)),
+        ],
+        ids=["fallback", "only_batch", "only_tokens", "both"],
+    )
+    def test_get_encoder_runtime_sizes(self, llm_args_cls, kwargs,
+                                       expected_runtime_sizes):
+        llm_args = llm_args_cls(model=llama_model_path, **kwargs)
+        assert llm_args.get_encoder_runtime_sizes() == expected_runtime_sizes
+
+    @pytest.mark.parametrize(
+        "field_name, invalid_value",
+        [
+            ("encoder_max_batch_size", 0),
+            ("encoder_max_batch_size", -1),
+            ("encoder_max_num_tokens", 0),
+            ("encoder_max_num_tokens", -1),
+        ],
+    )
+    def test_rejects_non_positive(self, llm_args_cls, field_name,
+                                  invalid_value):
+        with pytest.raises(ValidationError):
+            llm_args_cls(model=llama_model_path, **{field_name: invalid_value})
+
+
 def test_decoding_type_eagle3_parses_to_eagle3_decoding_config():
     adapter = TypeAdapter(SpeculativeConfig)
     spec_cfg = adapter.validate_python(
@@ -222,6 +284,20 @@ def test_decoding_type_eagle3_errors_on_tensorrt_backend():
     with pytest.raises(ValueError,
                        match="only supported on the PyTorch backend"):
         TrtLlmArgs(model=llama_model_path, speculative_config=spec_cfg)
+
+
+def test_post_processor_hook_rejected_with_skip_tokenizer_init():
+    """post_processor_hook + skip_tokenizer_init must fail fast.
+
+    The hook is a text-based guardrail; pairing it with skip_tokenizer_init (no
+    detokenized text) must be rejected rather than silently disabling it.
+    """
+    with pytest.raises(ValidationError, match="skip_tokenizer_init"):
+        TorchLlmArgs(model="/tmp/dummy_model",
+                     skip_tokenizer_init=True,
+                     post_processor_hook="my_pkg.guardrail.Hook")
+    # skip_tokenizer_init alone (no hook) is still fine.
+    TorchLlmArgs(model="/tmp/dummy_model", skip_tokenizer_init=True)
 
 
 class TestModelDefaults:
@@ -331,14 +407,19 @@ class TestModelDefaults:
 
 
 def test_KvCacheConfig_declaration():
+    assert KvCacheConfig().kv_cache_event_hash_algo == "auto"
+
     config = KvCacheConfig(enable_block_reuse=True,
                            max_tokens=1024,
                            max_attention_window=[1024, 1024, 1024],
                            free_gpu_memory_fraction=0.5,
                            host_cache_size=1024,
+                           disk_cache_size=2048,
+                           disk_cache_path="/tmp",
                            cross_kv_cache_fraction=0.5,
                            secondary_offload_min_priority=1,
                            event_buffer_max_size=0,
+                           kv_cache_event_hash_algo="v2_sha256_64",
                            enable_partial_reuse=True,
                            copy_on_partial_reuse=True,
                            attention_dp_events_gather_period_ms=10)
@@ -349,12 +430,109 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.max_attention_window == [1024, 1024, 1024]
     assert pybind_config.free_gpu_memory_fraction == 0.5
     assert pybind_config.host_cache_size == 1024
+    assert config.disk_cache_size == 2048
+    assert config.disk_cache_path == "/tmp"
     assert pybind_config.cross_kv_cache_fraction == 0.5
     assert pybind_config.secondary_offload_min_priority == 1
     assert pybind_config.event_buffer_max_size == 0
+    assert config.kv_cache_event_hash_algo == "v2_sha256_64"
+    assert KvCacheConfig(
+        kv_cache_event_hash_algo="auto").kv_cache_event_hash_algo == "auto"
+    assert KvCacheConfig(kv_cache_event_hash_algo="v1_block_key"
+                         ).kv_cache_event_hash_algo == "v1_block_key"
     assert pybind_config.enable_partial_reuse == True
     assert pybind_config.copy_on_partial_reuse == True
     assert pybind_config.attention_dp_events_gather_period_ms == 10
+
+
+def test_KvCacheConfig_disk_cache_validation(tmp_path):
+    config = KvCacheConfig(disk_cache_size=2048, disk_cache_path=str(tmp_path))
+
+    assert config.disk_cache_size == 2048
+    assert config.disk_cache_path == str(tmp_path)
+
+    with pytest.raises(ValidationError) as exc_info:
+        KvCacheConfig(disk_cache_size=2048)
+    assert "disk_cache_path" in str(exc_info.value)
+
+
+class TestMultimodalEncoderCudaGraphConfig:
+
+    def test_minimal_required_fields(self):
+        config = MultimodalEncoderCudaGraphConfig(buckets=[(1035, 1)])
+        assert config.buckets == [(1035, 1)]
+        assert config.enable_padding is True
+        assert config.warmup_steps == 2
+        assert config.enable_replay_stats is False
+
+        config = MultimodalEncoderCudaGraphConfig(buckets=[(1035, 1)],
+                                                  enable_replay_stats=True)
+        assert config.enable_replay_stats is True
+
+    def test_explicit_buckets_deduped_and_sorted(self):
+        config = MultimodalEncoderCudaGraphConfig(buckets=[(2069,
+                                                            2), (1035,
+                                                                 1), (2069, 2)])
+        assert config.buckets == [(1035, 1), (2069, 2)]
+
+    def test_explicit_buckets_accept_yaml_style_lists(self):
+        config = MultimodalEncoderCudaGraphConfig(
+            buckets=[[2069, 2], [1035, 1]])
+        assert config.buckets == [(1035, 1), (2069, 2)]
+
+    @pytest.mark.parametrize("kwargs", [{
+        "buckets": []
+    }, {}],
+                             ids=["empty", "missing"])
+    def test_rejects_absent_buckets(self, kwargs):
+        with pytest.raises(ValidationError):
+            MultimodalEncoderCudaGraphConfig(**kwargs)
+
+    @pytest.mark.parametrize("buckets", [[(0, 1)], [(1, -2)], [(3, 0)]])
+    def test_rejects_non_positive_buckets(self, buckets):
+        with pytest.raises(ValidationError):
+            MultimodalEncoderCudaGraphConfig(buckets=buckets)
+
+    def test_rejects_buckets_with_too_few_tokens(self):
+        with pytest.raises(ValidationError):
+            MultimodalEncoderCudaGraphConfig(buckets=[(1, 2)])
+
+
+class TestMultimodalConfig:
+
+    def test_default_encoder_cuda_graph_is_none(self):
+        assert MultimodalConfig().encoder_cuda_graph is None
+
+    def test_torch_llm_args_default_multimodal_config(self):
+        args = TorchLlmArgs(model=llama_model_path)
+        assert isinstance(args.multimodal_config, MultimodalConfig)
+        assert args.multimodal_config.encoder_cuda_graph is None
+
+    def test_torch_llm_args_with_encoder_cuda_graph_buckets(self):
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            multimodal_config=MultimodalConfig(
+                encoder_cuda_graph={
+                    "vision":
+                    MultimodalEncoderCudaGraphConfig(buckets=[(1035,
+                                                               1), (2069, 2)])
+                }))
+        encoder_graph = args.multimodal_config.encoder_cuda_graph
+        assert encoder_graph["vision"].buckets == [(1035, 1), (2069, 2)]
+
+    def test_torch_llm_args_with_encoder_cuda_graph_buckets_yaml(self):
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            multimodal_config={
+                "encoder_cuda_graph": {
+                    "vision": {
+                        "buckets": [[2069, 2], [1035, 1]]
+                    }
+                }
+            },
+        )
+        encoder_graph = args.multimodal_config.encoder_cuda_graph
+        assert encoder_graph["vision"].buckets == [(1035, 1), (2069, 2)]
 
 
 def test_CapacitySchedulerPolicy():
@@ -463,20 +641,27 @@ def test_DynamicBatchConfig_declaration():
     assert pybind_config.dynamic_batch_moving_average_window == 10
 
 
-def test_SchedulerConfig_declaration():
+def test_SchedulerConfig_declaration() -> None:
+    default_config = SchedulerConfig()
+    default_pybind_config = PybindMirror.maybe_to_pybind(default_config)
+    assert default_config.enable_prefix_aware_scheduling is True
+    assert default_pybind_config.enable_prefix_aware_scheduling is True
+
     config = SchedulerConfig(
         capacity_scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
         context_chunking_policy=ContextChunkingPolicy.EQUAL_PROGRESS,
         dynamic_batch_config=DynamicBatchConfig(
             enable_batch_size_tuning=True,
             enable_max_num_tokens_tuning=True,
-            dynamic_batch_moving_average_window=10))
+            dynamic_batch_moving_average_window=10),
+        enable_prefix_aware_scheduling=False)
 
     pybind_config = PybindMirror.maybe_to_pybind(config)
     assert pybind_config.capacity_scheduler_policy == tle.CapacitySchedulerPolicy.MAX_UTILIZATION
     assert pybind_config.context_chunking_policy == tle.ContextChunkingPolicy.EQUAL_PROGRESS
     assert PybindMirror.pybind_equals(pybind_config.dynamic_batch_config,
                                       config.dynamic_batch_config._to_pybind())
+    assert pybind_config.enable_prefix_aware_scheduling is False
 
 
 def test_PeftCacheConfig_declaration():
@@ -618,7 +803,14 @@ def test_update_llm_args_with_extra_dict_with_nested_dict():
 
 
 class TestTelemetryConfigPrecedence:
-    """Test that telemetry config follows: default < YAML < CLI precedence."""
+    """Telemetry-config precedence in the merge helper.
+
+    Two modes are exercised:
+    - `explicit_cli_keys is None` (legacy / programmatic): YAML wins on
+      conflicts; `usage_context` carve-out still applies.
+    - `explicit_cli_keys` provided (CLI mode): explicit keys win on
+      conflicts; see `TestExplicitCliKeysPrecedence` for that path.
+    """
 
     def test_default_telemetry_config_preserved_when_no_yaml(self):
         """Default telemetry_config survives YAML merge when YAML has none."""
@@ -679,8 +871,15 @@ class TestTelemetryConfigPrecedence:
         assert tc.usage_context == UsageContext.CLI_SERVE
         assert tc.disabled is True
 
-    def test_cli_disabled_overrides_yaml_enabled(self):
-        """CLI --telemetry-disabled wins over YAML disabled=false."""
+    def test_cli_disabled_overrides_yaml_enabled_legacy_fixup(self):
+        """Legacy post-merge fixup pattern (preserved for back-compat).
+
+        This exercises the pre-`explicit_cli_keys` flow where the CLI entry
+        point overrode `disabled` after the merge by hand. The CLI tools no
+        longer use this pattern (they pass `explicit_cli_keys={"telemetry"}`
+        instead — see `TestExplicitCliKeysPrecedence`), but third-party
+        callers may still build the merge this way.
+        """
         from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
         base = {
             "model":
@@ -691,7 +890,6 @@ class TestTelemetryConfigPrecedence:
         }
         yaml_dict = {"telemetry_config": {"disabled": False}}
         merged = update_llm_args_with_extra_dict(base, yaml_dict)
-        # Simulate CLI --no-telemetry (as done in eval.py / serve.py)
         telemetry = False
         if not telemetry:
             merged["telemetry_config"] = merged["telemetry_config"].model_copy(
@@ -701,7 +899,7 @@ class TestTelemetryConfigPrecedence:
         assert tc.usage_context == UsageContext.CLI_EVAL
 
     def test_yaml_disabled_respected_when_cli_not_set(self):
-        """When CLI doesn't set --no-telemetry, YAML disabled=true is kept."""
+        """YAML disabled=true is honored when explicit_cli_keys is None."""
         from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
         base = {
             "model":
@@ -712,11 +910,6 @@ class TestTelemetryConfigPrecedence:
         }
         yaml_dict = {"telemetry_config": {"disabled": True}}
         merged = update_llm_args_with_extra_dict(base, yaml_dict)
-        # CLI flag not set (--telemetry is default True) — no override
-        telemetry = True
-        if not telemetry:
-            merged["telemetry_config"] = merged["telemetry_config"].model_copy(
-                update={"disabled": True})
         tc = merged["telemetry_config"]
         assert tc.disabled is True
         assert tc.usage_context == UsageContext.CLI_SERVE
@@ -738,6 +931,270 @@ class TestTelemetryConfigPrecedence:
         assert isinstance(tc, TelemetryConfig)
         assert tc.usage_context == UsageContext.CLI_SERVE
         assert tc.disabled is False
+
+
+class TestExplicitCliKeysPrecedence:
+    """`explicit_cli_keys` makes the CLI side win over YAML on conflicts."""
+
+    def test_explicit_cli_key_wins_over_yaml_scalar(self):
+        base = {"model": "dummy", "tensor_parallel_size": 4}
+        yaml_dict = {"tensor_parallel_size": 8}
+        merged = update_llm_args_with_extra_dict(
+            base, yaml_dict, explicit_cli_keys={"tensor_parallel_size"})
+        assert merged["tensor_parallel_size"] == 4
+
+    def test_non_explicit_value_loses_to_yaml_scalar(self):
+        # Backward-compat: when explicit_cli_keys is None, today's "YAML wins"
+        # behavior is preserved.
+        base = {"model": "dummy", "tensor_parallel_size": 4}
+        yaml_dict = {"tensor_parallel_size": 8}
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        assert merged["tensor_parallel_size"] == 8
+
+    def test_kv_cache_config_explicit_field_wins_yaml_siblings_preserved(self):
+        # CLI builds a KvCacheConfig from --free_gpu_memory_fraction; YAML
+        # provides a partial kv_cache_config with sibling fields that should
+        # survive the merge.
+        base = {
+            "model": "dummy",
+            "kv_cache_config": KvCacheConfig(free_gpu_memory_fraction=0.85),
+        }
+        yaml_dict = {
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.5,
+                "enable_block_reuse": False,
+            }
+        }
+        merged = update_llm_args_with_extra_dict(
+            base, yaml_dict, explicit_cli_keys={"free_gpu_memory_fraction"})
+        kv = merged["kv_cache_config"]
+        assert kv.free_gpu_memory_fraction == 0.85
+        assert kv.enable_block_reuse is False
+
+    def test_build_config_tier_cli_wins(self):
+        # Tier 1: explicit CLI scalar wins over both top-level YAML and nested.
+        base = {
+            "model": "dummy",
+            "max_batch_size": 64,
+            "build_config": BuildConfig(max_batch_size=64),
+        }
+        yaml_dict = {
+            "max_batch_size": 256,
+            "build_config": {
+                "max_batch_size": 300
+            },
+        }
+        merged = update_llm_args_with_extra_dict(
+            base, yaml_dict, explicit_cli_keys={"max_batch_size"})
+        assert merged["max_batch_size"] == 64
+        assert merged["build_config"].max_batch_size == 64
+
+    def test_build_config_tier_yaml_top_level_wins(self):
+        # Tier 2: no explicit CLI, but YAML top-level scalar -> propagate to
+        # build_config (legacy behavior).
+        base = {
+            "model": "dummy",
+            "build_config": BuildConfig(max_batch_size=8),
+        }
+        yaml_dict = {"max_batch_size": 256}
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        assert merged["max_batch_size"] == 256
+        assert merged["build_config"].max_batch_size == 256
+
+    def test_build_config_tier_yaml_nested_only_leaves_alone(self):
+        # Tier 3: no explicit CLI, no top-level YAML scalar; nested YAML
+        # build_config is imported by the outer merge.
+        base = {
+            "model": "dummy",
+            "build_config": BuildConfig(max_batch_size=8),
+        }
+        yaml_dict = {"build_config": {"max_batch_size": 256}}
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        assert merged["build_config"].max_batch_size == 256
+
+    def test_telemetry_explicit_disabled_wins_over_yaml(self):
+        from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
+        base = {
+            "model":
+            "dummy",
+            "telemetry_config":
+            TelemetryConfig(disabled=True,
+                            usage_context=UsageContext.CLI_SERVE),
+        }
+        yaml_dict = {"telemetry_config": {"disabled": False}}
+        merged = update_llm_args_with_extra_dict(
+            base, yaml_dict, explicit_cli_keys={"telemetry"})
+        assert merged["telemetry_config"].disabled is True
+
+    def test_kv_cache_dtype_explicit_wins_over_yaml(self):
+        # Mirrors the kv_cache_config tier-2 path for the second mapped CLI
+        # scalar (`--kv_cache_dtype` -> `kv_cache_config.dtype`).
+        base = {
+            "model": "dummy",
+            "kv_cache_config": KvCacheConfig(dtype="fp8"),
+        }
+        yaml_dict = {"kv_cache_config": {"dtype": "auto"}}
+        merged = update_llm_args_with_extra_dict(
+            base, yaml_dict, explicit_cli_keys={"kv_cache_dtype"})
+        assert merged["kv_cache_config"].dtype == "fp8"
+
+    def test_enable_block_reuse_explicit_wins_over_yaml(self):
+        # Mirrors the kv_cache_config tier-2 path for `--disable_kv_cache_reuse`,
+        # which translates to `enable_block_reuse` in explicit_cli_keys.
+        base = {
+            "model": "dummy",
+            "kv_cache_config": KvCacheConfig(enable_block_reuse=False),
+        }
+        yaml_dict = {"kv_cache_config": {"enable_block_reuse": True}}
+        merged = update_llm_args_with_extra_dict(
+            base, yaml_dict, explicit_cli_keys={"enable_block_reuse"})
+        assert merged["kv_cache_config"].enable_block_reuse is False
+
+
+class TestEvalTranslationMap:
+    """eval's _CLICK_TO_LLM_ARG via the shared helper."""
+
+    def _collect(self, click_param_names):
+        """Simulate a Click ctx with the given params explicitly set."""
+        import click as _click
+
+        from tensorrt_llm.commands import eval as eval_mod
+        from tensorrt_llm.commands.utils import collect_explicit_cli_keys
+
+        class _FakeCtx:
+            params = {name: object() for name in click_param_names}
+
+            @staticmethod
+            def get_parameter_source(name):
+                from click.core import ParameterSource
+                return ParameterSource.COMMANDLINE
+
+        original = _click.get_current_context
+        _click.get_current_context = lambda: _FakeCtx
+        try:
+            return collect_explicit_cli_keys(
+                exclude=("extra_llm_api_options", "config"),
+                translate=eval_mod._CLICK_TO_LLM_ARG)
+        finally:
+            _click.get_current_context = original
+
+    @pytest.mark.parametrize(
+        "click_name,expected",
+        [
+            ("tp_size", "tensor_parallel_size"),
+            ("pp_size", "pipeline_parallel_size"),
+            ("ep_size", "moe_expert_parallel_size"),
+            ("kv_cache_free_gpu_memory_fraction", "free_gpu_memory_fraction"),
+            ("disable_kv_cache_reuse", "enable_block_reuse"),
+            ("max_batch_size", "max_batch_size"),  # unmapped: identity
+        ])
+    def test_translation(self, click_name, expected):
+        assert expected in self._collect({click_name})
+
+    def test_meta_flags_excluded(self):
+        assert self._collect({"extra_llm_api_options", "config"}) == set()
+
+
+class TestBenchTranslationMap:
+    """`collect_explicit_cli_keys` in bench.benchmark rewrites Click param names."""
+
+    def _collect(self, click_param_names):
+        import click as _click
+
+        from tensorrt_llm.bench import benchmark as bench_mod
+
+        class _FakeCtx:
+            params = {name: object() for name in click_param_names}
+
+            @staticmethod
+            def get_parameter_source(name):
+                from click.core import ParameterSource
+                return ParameterSource.COMMANDLINE
+
+        # `bench_mod.collect_explicit_cli_keys()` calls `click.get_current_context()`.
+        original = _click.get_current_context
+        _click.get_current_context = lambda: _FakeCtx
+        try:
+            return bench_mod.collect_explicit_cli_keys()
+        finally:
+            _click.get_current_context = original
+
+    @pytest.mark.parametrize(
+        "click_name,expected",
+        [
+            ("tp", "tensor_parallel_size"),
+            ("pp", "pipeline_parallel_size"),
+            ("ep", "moe_expert_parallel_size"),
+            ("cluster_size", "moe_cluster_parallel_size"),
+            ("kv_cache_free_gpu_mem_fraction", "free_gpu_memory_fraction"),
+            ("enable_chunked_context", "enable_chunked_prefill"),
+            ("max_batch_size", "max_batch_size"),  # unmapped: identity
+        ])
+    def test_translation(self, click_name, expected):
+        assert expected in self._collect({click_name})
+
+    def test_beam_width_does_not_participate(self):
+        # `--beam_width` is a SamplingParams flag, not an llm_args field, so
+        # it must be left out of the translation map. Otherwise an explicit
+        # `--beam_width N` would silently drop YAML's `max_beam_width`
+        # without anything in llm_args to replace it.
+        explicit = self._collect({"beam_width"})
+        assert "max_beam_width" not in explicit
+        assert "beam_width" in explicit
+
+    def test_meta_flags_excluded(self):
+        assert self._collect({"extra_llm_api_options", "config"}) == set()
+
+
+class TestDisaggLauncherKwargsPreservation:
+    """Regression tests for `_build_llm_args_from_disagg_server_cfg`.
+
+    The disagg launcher takes a single `server_cfg.other_args` dict and
+    must produce an llm_args dict that contains every user-set field —
+    including kwargs that fell through `get_llm_args`'s named signature
+    into its `**llm_args_extra_dict` catch-all (e.g. `quant_config`,
+    `lora_config`, `pytorch_backend_config`).
+    """
+
+    def test_extra_kwargs_survive(self):
+        from tensorrt_llm.commands.serve import \
+            _build_llm_args_from_disagg_server_cfg
+
+        other_args = {
+            "model": llama_model_path,
+            "backend": "pytorch",
+            "tensor_parallel_size": 1,
+            "gpus_per_node": 1,
+            # These do not match get_llm_args's named params; they go into
+            # **llm_args_extra_dict and must reach the LLM constructor.
+            "quant_config": {
+                "quant_algo": "FP8"
+            },
+            "lora_config": {
+                "lora_dir": ["/tmp/lora-test"]
+            },
+        }
+
+        final = _build_llm_args_from_disagg_server_cfg(other_args)
+
+        assert "quant_config" in final
+        assert "lora_config" in final
+        assert isinstance(final["quant_config"], QuantConfig)
+        assert isinstance(final["lora_config"], LoraConfig)
+
+    def test_default_valued_named_params_survive(self):
+        """A disagg-YAML field equal to its LlmArgs class default survives."""
+        from tensorrt_llm.commands.serve import \
+            _build_llm_args_from_disagg_server_cfg
+
+        other_args = {
+            "model": llama_model_path,
+            "backend": "pytorch",
+            "tensor_parallel_size": 1,  # equals LlmArgs class default
+            "gpus_per_node": 1,
+        }
+        final = _build_llm_args_from_disagg_server_cfg(other_args)
+        assert final.get("tensor_parallel_size") == 1
 
 
 class TestTorchLlmArgsCudaGraphSettings:
@@ -1362,6 +1819,7 @@ class TestStrictBaseModelArbitraryArgs:
                                         max_tokens_in_buffer=1024)
         assert config.backend == "UCX"
         assert config.max_tokens_in_buffer == 1024
+        assert config.kv_transfer_poll_interval_ms == 5000
 
         # Arbitrary arguments should be rejected
         with pytest.raises(
@@ -1485,89 +1943,121 @@ class TestStrictBaseModelArbitraryArgs:
 class TestServeDefaults:
 
     def test_serve_get_llm_args_preserves_model_defaults(self):
-        # Get llm_args with default values (simulating serve.py behavior)
+        # No explicit CLI flags: only required params and serve-side defaults
+        # reach the constructor; everything else is left for YAML / model
+        # defaults to provide.
         llm_args, _ = get_llm_args(
             model=llama_model_path,
             backend="pytorch",
-            # Don't pass parameters to test default behavior
         )
 
-        # Verify that required params are present
         assert "model" in llm_args
         assert "backend" in llm_args
         assert "postprocess_tokenizer_dir" in llm_args
 
-        # For PyTorch backend, build_config and scheduler_config should NOT be included
+        # PyTorch backend: build_config / scheduler_config stay None and are
+        # filtered out.
         assert "build_config" not in llm_args
         assert "scheduler_config" not in llm_args
 
-        # Test that when we DO pass values, they're included appropriately
+        # Explicit CLI flags survive the filter.
         llm_args_with_values, _ = get_llm_args(
             model=llama_model_path,
             backend="pytorch",
-            max_batch_size=128,  # Non-default value
-            tensor_parallel_size=4,  # Non-default value
+            max_batch_size=128,
+            tensor_parallel_size=4,
+            explicit_cli_keys={"max_batch_size", "tensor_parallel_size"},
         )
         assert llm_args_with_values.get("max_batch_size") == 128
         assert llm_args_with_values.get("tensor_parallel_size") == 4
 
     def test_serve_filters_default_values(self):
-        # Test with all defaults for PyTorch backend
+        # All defaults, no explicit CLI flags.
         llm_args, _ = get_llm_args(model=llama_model_path, backend="pytorch")
 
-        # Should only include required params
         assert "model" in llm_args
         assert "backend" in llm_args
         assert "postprocess_tokenizer_dir" in llm_args
 
-        # Should NOT include build_config or scheduler_config for PyTorch
         assert "build_config" not in llm_args
         assert "scheduler_config" not in llm_args
 
-        # Test with custom values
+        # Custom values survive only when listed in explicit_cli_keys.
         llm_args, _ = get_llm_args(
             model=llama_model_path,
             backend="pytorch",
-            max_batch_size=128,  # Non-default value
-            tensor_parallel_size=4,  # Non-default value
+            max_batch_size=128,
+            tensor_parallel_size=4,
+            explicit_cli_keys={"max_batch_size", "tensor_parallel_size"},
         )
 
-        # Custom values should be included
         assert llm_args.get("max_batch_size") == 128
         assert llm_args.get("tensor_parallel_size") == 4
 
     def test_serve_backend_specific_configs(self):
-        # Test PyTorch backend
+        # PyTorch backend: build_config / scheduler_config stay None and are
+        # filtered out.
         llm_args_pytorch, _ = get_llm_args(model=llama_model_path,
                                            backend="pytorch")
         assert "build_config" not in llm_args_pytorch
         assert "scheduler_config" not in llm_args_pytorch
 
-        # Test TensorRT backend
+        # TensorRT backend: both are non-None and differ from the LlmArgs
+        # class default, so the value-based filter keeps them.
         llm_args_trt, _ = get_llm_args(model=llama_model_path,
                                        backend="tensorrt")
         assert "build_config" in llm_args_trt
         assert "scheduler_config" in llm_args_trt
 
+    def test_serve_explicit_cli_default_value_wins_over_yaml(self):
+        """Typing --tensor_parallel_size 1 (the default) must beat YAML."""
+        llm_args, _ = get_llm_args(
+            model=llama_model_path,
+            backend="pytorch",
+            tensor_parallel_size=1,
+            explicit_cli_keys={"tensor_parallel_size"},
+        )
+        # The CLI value lands in llm_args because it is explicit.
+        assert llm_args["tensor_parallel_size"] == 1
+        merged = update_llm_args_with_extra_dict(
+            llm_args,
+            {"tensor_parallel_size": 8},
+            explicit_cli_keys={"tensor_parallel_size"},
+        )
+        assert merged["tensor_parallel_size"] == 1
+
     def test_serve_is_non_default_or_required_helper(self):
         # Test always_include parameters
-        assert is_non_default_or_required("model", "test-model", "pytorch")
-        assert is_non_default_or_required("backend", "pytorch", "pytorch")
+        assert is_non_default_or_required("model", "test-model", "pytorch",
+                                          set())
+        assert is_non_default_or_required("backend", "pytorch", "pytorch",
+                                          set())
         assert is_non_default_or_required("tokenizer", "test-tokenizer",
-                                          "pytorch")
+                                          "pytorch", set())
 
         # Test None values
-        assert not is_non_default_or_required("max_batch_size", None, "pytorch")
+        assert not is_non_default_or_required("max_batch_size", None, "pytorch",
+                                              set())
 
         # Test default values (should return False)
         assert not is_non_default_or_required("tensor_parallel_size", 1,
-                                              "pytorch")
+                                              "pytorch", set())
         assert not is_non_default_or_required("pipeline_parallel_size", 1,
-                                              "pytorch")
+                                              "pytorch", set())
 
         # Test non-default values (should return True)
-        assert is_non_default_or_required("tensor_parallel_size", 4, "pytorch")
-        assert is_non_default_or_required("max_batch_size", 128, "pytorch")
+        assert is_non_default_or_required("tensor_parallel_size", 4, "pytorch",
+                                          set())
+        assert is_non_default_or_required("max_batch_size", 128, "pytorch",
+                                          set())
+
+        # Test explicit CLI source overrides the default-equals-value check
+        assert is_non_default_or_required("tensor_parallel_size", 1, "pytorch",
+                                          {"tensor_parallel_size"})
+        # Test CLI-derived field (--free_gpu_memory_fraction -> kv_cache_config)
+        assert is_non_default_or_required("kv_cache_config", KvCacheConfig(),
+                                          "pytorch",
+                                          {"free_gpu_memory_fraction"})
 
 
 class TestPyTorchBackendModelDefaults:
@@ -1852,11 +2342,16 @@ class TestPydanticBestPractices:
                 annotation, _ALLOWED_CLASS_BASES):
             return False, f"class '{annotation.__name__}' is not a Pydantic model (convert to StrictBaseModel)"
 
-        # Require user-facing Pydantic models to inherit from StrictBaseModel
-        if isinstance(annotation, type) and issubclass(
-                annotation,
-                BaseModel) and not issubclass(annotation, StrictBaseModel):
-            return False, f"Pydantic model '{annotation.__name__}' is not a StrictBaseModel (convert to StrictBaseModel)"
+        # Require user-facing Pydantic models to forbid extra fields. StrictBaseModel
+        # enforces this; usage-local models (e.g. TelemetryConfig) may instead set
+        # model_config extra="forbid" directly so they stay importable without the
+        # heavy llmapi.utils dependency chain (which would otherwise pull torch/HF and
+        # create a circular import via llm_args).
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            is_strict = issubclass(annotation, StrictBaseModel)
+            forbids_extra = annotation.model_config.get("extra") == "forbid"
+            if not (is_strict or forbids_extra):
+                return False, f"Pydantic model '{annotation.__name__}' does not forbid extra fields (inherit StrictBaseModel or set model_config extra='forbid')"
 
         # Recursively check generic type arguments for disallowed types
         origin = get_origin(annotation)
@@ -2036,75 +2531,331 @@ class TestPydanticBestPractices:
 
 
 class TestSkipSoftmaxAttentionConfig:
+    """Test LLM Skip Softmax Attention config behavior."""
 
-    def test_resolve_computes_thresholds(self):
-        import math
-
-        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
-
-        formula = {
-            'prefill': {
-                'a': 7e-5,
-                'b': 7.929109
+    CHECKPOINT_SPARSE_ATTENTION_CONFIG: ClassVar[dict] = {
+        "config_groups": {
+            "group_0": {
+                "algorithm": "skip_softmax",
+                "threshold_scale_factor": {
+                    "formula": "a * exp(b * target_sparsity)",
+                    "prefill": {
+                        "a": 100.0,
+                        "b": 5.0
+                    },
+                    "decode": {
+                        "a": 0.05,
+                        "b": 10.0
+                    },
+                },
+                "target_sparsity": {
+                    "prefill": 0.5,
+                    "decode": 0.3
+                },
             },
-            'decode': {
-                'a': 7e-5,
-                'b': 16.9025
+        },
+    }
+    CHECKPOINT_CONFIG: ClassVar[dict] = {
+        "sparse_attention_config": CHECKPOINT_SPARSE_ATTENTION_CONFIG,
+    }
+
+    @classmethod
+    def _checkpoint_config(cls) -> dict:
+        import copy
+
+        return copy.deepcopy(cls.CHECKPOINT_CONFIG)
+
+    @staticmethod
+    def _kernel_params(config: SkipSoftmaxAttentionConfig, **kwargs):
+        sparse_params = config.to_sparse_params(**kwargs)
+        return sparse_params.scheduler.get_kernel_params()
+
+    def test_python_api_parses_skip_softmax_config(self):
+        args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            sparse_attention_config={
+                "algorithm": "skip_softmax",
+                "threshold_scale_factor": {
+                    "prefill": 1000.0,
+                    "decode": 500.0,
+                },
+            },
+        )
+
+        config = args.sparse_attention_config
+
+        assert isinstance(config, SkipSoftmaxAttentionConfig)
+        assert config.threshold_scale_factor == {
+            "prefill": 1000.0,
+            "decode": 500.0,
+        }
+
+    def test_yaml_api_parses_skip_softmax_config(self):
+        config_dict = yaml.safe_load("""
+sparse_attention_config:
+  algorithm: skip_softmax
+  target_sparsity:
+    prefill: 0.5
+    decode: 0.3
+""")
+
+        args = TorchLlmArgs(model="/tmp/dummy_model", **config_dict)
+
+        config = args.sparse_attention_config
+        assert isinstance(config, SkipSoftmaxAttentionConfig)
+        assert config.target_sparsity == {
+            "prefill": 0.5,
+            "decode": 0.3,
+        }
+
+    @pytest.mark.parametrize("target_sparsity", [-0.1, 1.1])
+    def test_target_sparsity_scalar_must_be_in_unit_interval(
+            self, target_sparsity):
+        with pytest.raises(ValidationError, match="target_sparsity"):
+            SkipSoftmaxAttentionConfig(target_sparsity=target_sparsity)
+
+    @pytest.mark.parametrize("target_sparsity", [
+        {
+            "prefill": -0.1,
+            "decode": 0.3,
+        },
+        {
+            "prefill": 0.5,
+            "decode": 1.1,
+        },
+    ])
+    def test_target_sparsity_phase_values_must_be_in_unit_interval(
+            self, target_sparsity):
+        with pytest.raises(ValidationError, match="target_sparsity"):
+            SkipSoftmaxAttentionConfig(target_sparsity=target_sparsity)
+
+    def test_direct_threshold_scale_factor_scalar_does_not_need_checkpoint(
+            self):
+        config = SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0)
+
+        params = self._kernel_params(config)
+
+        assert params.threshold_scale_factor_prefill == pytest.approx(1000.0)
+        assert params.threshold_scale_factor_decode == pytest.approx(1000.0)
+
+    def test_direct_threshold_scale_factor_can_be_configured_per_phase(self):
+        config = SkipSoftmaxAttentionConfig(threshold_scale_factor={
+            "prefill": 1000.0,
+            "decode": 500.0,
+        })
+
+        params = self._kernel_params(config)
+
+        assert params.threshold_scale_factor_prefill == pytest.approx(1000.0)
+        assert params.threshold_scale_factor_decode == pytest.approx(500.0)
+
+    def test_target_sparsity_scalar_uses_checkpoint_formula_for_each_phase(
+            self):
+        config = SkipSoftmaxAttentionConfig(target_sparsity=0.3)
+
+        params = self._kernel_params(
+            config,
+            checkpoint_config=self._checkpoint_config(),
+        )
+
+        assert params.threshold_scale_factor_prefill == pytest.approx(
+            100.0 * math.exp(5.0 * 0.3))
+        assert params.threshold_scale_factor_decode == pytest.approx(
+            0.05 * math.exp(10.0 * 0.3))
+
+    def test_target_sparsity_can_be_configured_per_phase(self):
+        config = SkipSoftmaxAttentionConfig(target_sparsity={
+            "prefill": 0.5,
+            "decode": 0.3,
+        })
+
+        params = self._kernel_params(
+            config,
+            checkpoint_config=self._checkpoint_config(),
+        )
+
+        assert params.threshold_scale_factor_prefill == pytest.approx(
+            100.0 * math.exp(5.0 * 0.5))
+        assert params.threshold_scale_factor_decode == pytest.approx(
+            0.05 * math.exp(10.0 * 0.3))
+
+    def test_checkpoint_target_sparsity_default_is_used_when_user_omits_it(
+            self):
+        config = SkipSoftmaxAttentionConfig()
+
+        params = self._kernel_params(
+            config,
+            checkpoint_config=self._checkpoint_config(),
+        )
+
+        assert params.threshold_scale_factor_prefill == pytest.approx(
+            100.0 * math.exp(5.0 * 0.5))
+        assert params.threshold_scale_factor_decode == pytest.approx(
+            0.05 * math.exp(10.0 * 0.3))
+
+    def test_checkpoint_formula_can_be_shared_by_prefill_and_decode(self):
+        checkpoint_config = {
+            "sparse_attention_config": {
+                "config_groups": {
+                    "group_0": {
+                        "algorithm": "skip_softmax",
+                        "threshold_scale_factor": {
+                            "formula": "sqrt(a + target_sparsity)",
+                            "a": 0.75,
+                        },
+                        "target_sparsity": 0.25,
+                    },
+                },
             },
         }
-        cfg = SkipSoftmaxAttentionConfig(target_sparsity={
-            'prefill': 0.5,
-            'decode': 0.5
+        config = SkipSoftmaxAttentionConfig()
+
+        params = self._kernel_params(config,
+                                     checkpoint_config=checkpoint_config)
+
+        assert params.threshold_scale_factor_prefill == pytest.approx(1.0)
+        assert params.threshold_scale_factor_decode == pytest.approx(1.0)
+
+    def test_user_target_sparsity_overrides_checkpoint_default(self):
+        config = SkipSoftmaxAttentionConfig(target_sparsity={
+            "prefill": 0.2,
+            "decode": 0.4,
         })
-        resolved = cfg.resolve_for_target_sparsity(formula)
 
-        expected_prefill = 7e-5 * math.exp(7.929109 * 0.5)
-        expected_decode = 7e-5 * math.exp(16.9025 * 0.5)
-        assert resolved.threshold_scale_factor_prefill == pytest.approx(
-            expected_prefill)
-        assert resolved.threshold_scale_factor_decode == pytest.approx(
-            expected_decode)
+        params = self._kernel_params(
+            config,
+            checkpoint_config=self._checkpoint_config(),
+        )
 
-    def test_resolve_scalar_target_sparsity(self):
-        import math
+        assert params.threshold_scale_factor_prefill == pytest.approx(
+            100.0 * math.exp(5.0 * 0.2))
+        assert params.threshold_scale_factor_decode == pytest.approx(
+            0.05 * math.exp(10.0 * 0.4))
 
-        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
-
-        formula = {
-            'prefill': {
-                'a': 7e-5,
-                'b': 7.929109
+    def test_threshold_scale_factor_wins_over_target_sparsity_without_checkpoint(
+            self):
+        config = SkipSoftmaxAttentionConfig(
+            threshold_scale_factor={
+                "prefill": 1000.0,
+                "decode": 500.0,
             },
-            'decode': {
-                'a': 7e-5,
-                'b': 16.9025
-            },
+            target_sparsity=0.9,
+        )
+
+        params = self._kernel_params(config)
+
+        assert params.threshold_scale_factor_prefill == pytest.approx(1000.0)
+        assert params.threshold_scale_factor_decode == pytest.approx(500.0)
+
+    def test_target_sparsity_requires_checkpoint_formula(self):
+        config = SkipSoftmaxAttentionConfig(target_sparsity=0.5)
+
+        with pytest.raises(ValueError, match="formula"):
+            config.to_sparse_params(
+                checkpoint_config={
+                    "sparse_attention_config": {
+                        "config_groups": {
+                            "group_0": {
+                                "algorithm": "skip_softmax",
+                                "target_sparsity": 0.5,
+                            },
+                        },
+                    },
+                })
+
+    def test_other_checkpoint_groups_do_not_affect_skip_softmax_group_selection(
+            self):
+        checkpoint_config = self._checkpoint_config()
+        checkpoint_config["sparse_attention_config"]["config_groups"][
+            "group_1"] = {
+                "algorithm": "rocket",
+                "prompt_budget": 2048,
+            }
+        config = SkipSoftmaxAttentionConfig(target_sparsity=0.5)
+
+        params = self._kernel_params(config,
+                                     checkpoint_config=checkpoint_config)
+
+        assert params.threshold_scale_factor_prefill == pytest.approx(
+            100.0 * math.exp(5.0 * 0.5))
+
+    def test_checkpoint_ignore_patterns_disable_matching_module_name(self):
+        checkpoint_config = self._checkpoint_config()
+        group = checkpoint_config["sparse_attention_config"]["config_groups"][
+            "group_0"]
+        group["ignore"] = [
+            "model.layers.0.self_attn",
+            "model.layers.1.*",
+        ]
+        config = SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0)
+
+        assert (config.to_sparse_params(
+            module_name="model.layers.0.self_attn",
+            checkpoint_config=checkpoint_config,
+        ) is None)
+        assert (config.to_sparse_params(
+            module_name="model.layers.1.self_attn",
+            checkpoint_config=checkpoint_config,
+        ) is None)
+        params = self._kernel_params(
+            config,
+            module_name="model.layers.2.self_attn",
+            checkpoint_config=checkpoint_config,
+        )
+        assert params.threshold_scale_factor_prefill == pytest.approx(1000.0)
+
+    def test_checkpoint_ignore_patterns_match_layer_idx_aliases(self):
+        checkpoint_config = self._checkpoint_config()
+        group = checkpoint_config["sparse_attention_config"]["config_groups"][
+            "group_0"]
+        group["ignore"] = ["model.layers.0.self_attn"]
+        config = SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0)
+
+        assert (config.to_sparse_params(
+            layer_idx=0,
+            checkpoint_config=checkpoint_config,
+        ) is None)
+        params = self._kernel_params(
+            config,
+            layer_idx=1,
+            checkpoint_config=checkpoint_config,
+        )
+        assert params.threshold_scale_factor_prefill == pytest.approx(1000.0)
+
+    def test_multiple_skip_softmax_checkpoint_groups_are_invalid(self):
+        checkpoint_config = self._checkpoint_config()
+        groups = checkpoint_config["sparse_attention_config"]["config_groups"]
+        groups["group_1"] = {
+            "algorithm": "rocket",
+            "prompt_budget": 2048,
         }
-        cfg = SkipSoftmaxAttentionConfig(target_sparsity=0.3)
-        resolved = cfg.resolve_for_target_sparsity(formula)
+        groups["group_2"] = dict(groups["group_0"])
+        config = SkipSoftmaxAttentionConfig(target_sparsity=0.5)
 
-        assert resolved.threshold_scale_factor_prefill == pytest.approx(
-            7e-5 * math.exp(7.929109 * 0.3))
-        assert resolved.threshold_scale_factor_decode == pytest.approx(
-            7e-5 * math.exp(16.9025 * 0.3))
+        with pytest.raises(ValueError, match="multiple skip-softmax"):
+            config.to_sparse_params(checkpoint_config=checkpoint_config)
 
-    def test_resolve_missing_coefficients_raises(self):
-        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+    def test_ckpt_sparse_attention_config_can_be_passed_directly(self):
+        config = SkipSoftmaxAttentionConfig(target_sparsity=0.5)
 
-        cfg = SkipSoftmaxAttentionConfig(target_sparsity={
-            'prefill': 0.5,
-            'decode': 0.5
-        })
-        with pytest.raises(ValueError, match="missing formula coefficients"):
-            cfg.resolve_for_target_sparsity({})
+        params = self._kernel_params(
+            config,
+            ckpt_sparse_attention_config=self.
+            CHECKPOINT_SPARSE_ATTENTION_CONFIG,
+        )
 
-    def test_threshold_scale_factor_unaffected(self):
-        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+        assert params.threshold_scale_factor_prefill == pytest.approx(
+            100.0 * math.exp(5.0 * 0.5))
 
-        cfg = SkipSoftmaxAttentionConfig(threshold_scale_factor={
-            'prefill': 0.001,
-            'decode': 0.002
-        })
-        assert cfg.target_sparsity is None
-        assert cfg.threshold_scale_factor_prefill == pytest.approx(0.001)
-        assert cfg.threshold_scale_factor_decode == pytest.approx(0.002)
+
+class TestDeepSeekV4SparseAttentionConfig:
+
+    def test_zero_compress_ratios_are_normalized(self):
+        config = DeepSeekV4SparseAttentionConfig(compress_ratios=[0, 4, 128])
+
+        assert config.compress_ratios == [1, 4, 128]
+
+    @pytest.mark.parametrize("compress_ratios", [[], [-1, 4, 128]])
+    def test_invalid_compress_ratios_raise(self, compress_ratios):
+        with pytest.raises(ValidationError, match="compress_ratios"):
+            DeepSeekV4SparseAttentionConfig(compress_ratios=compress_ratios)

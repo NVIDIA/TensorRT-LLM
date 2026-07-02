@@ -14,6 +14,8 @@
 # limitations under the License.
 """Unit tests for MetricsCollector and process_req_perf_metrics."""
 
+from typing import Dict
+
 import pytest
 from prometheus_client import REGISTRY
 
@@ -802,6 +804,48 @@ class TestLogIterationStatsKvCacheIteration:
             collector, "kv_cache_intra_device_copy_bytes_total"
         ) - before_intra_device == pytest.approx(16384)
 
+    def test_v2_lifecycle_and_pool_group_stats_are_aggregated(self):
+        """V2 split stats should aggregate reuse from lifecycle and storage from PG."""
+        collector = _make_kv_iter_collector()
+        stats = {
+            "kvCacheIterationStatsByLifecycle": {
+                "0": {
+                    "iterReusedBlocks": 5,
+                    "iterFullReusedBlocks": 4,
+                    "iterPartialReusedBlocks": 1,
+                    "iterMissedBlocks": 3,
+                }
+            },
+            "kvCacheIterationStatsByPoolGroup": {
+                "0": {
+                    "secondaryMaxNumBlocks": 50,
+                    "secondaryUsedNumBlocks": 20,
+                    "iterGenAllocBlocks": 2,
+                    "iterOnboardBytes": 4096,
+                    "iterOffloadBytes": 2048,
+                    "iterIntraDeviceCopyBytes": 8192,
+                }
+            },
+        }
+
+        before_reused = _get_counter_value(collector, "kv_cache_iter_reused_blocks")
+        before_gen_alloc = _get_counter_value(collector, "kv_cache_gen_alloc_blocks_total")
+        before_onboard = _get_counter_value(collector, "kv_cache_onboard_bytes_total")
+
+        collector.log_iteration_stats(stats)
+
+        assert _get_gauge_value(collector, "kv_cache_host_utilization") == pytest.approx(0.4)
+        assert _get_gauge_value(collector, "kv_cache_iter_reuse_rate") == pytest.approx(5 / 8)
+        assert _get_counter_value(
+            collector, "kv_cache_iter_reused_blocks"
+        ) - before_reused == pytest.approx(5)
+        assert _get_counter_value(
+            collector, "kv_cache_gen_alloc_blocks_total"
+        ) - before_gen_alloc == pytest.approx(2)
+        assert _get_counter_value(
+            collector, "kv_cache_onboard_bytes_total"
+        ) - before_onboard == pytest.approx(4096)
+
     def test_multiple_windows_aggregated(self):
         """Stats from multiple window sizes should be summed."""
         collector = _make_kv_iter_collector()
@@ -897,3 +941,295 @@ class TestLogIterationStatsKvCacheIteration:
         assert _get_counter_value(collector, "kv_cache_iter_missed_blocks") == pytest.approx(
             before_missed
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests for metrics added by this PR (prompt cache, per-position spec
+# decode, perplexity, prefill batch occupancy, request errors)
+# ---------------------------------------------------------------------------
+
+
+def _counter_value_with_labels(metric, labels: Dict[str, str]) -> float:
+    """Get the current value of a Prometheus counter with extra labels."""
+    return metric.labels(**labels)._value.get()
+
+
+class TestPromptCacheMetrics:
+    """trtllm_prompt_cached_tokens_total counter + trtllm_prompt_cached_tokens histogram."""
+
+    def test_cached_tokens_counter_incremented(self, collector):
+        metrics = {
+            MetricsCollector.labelname_finish_reason: "end_id",
+            MetricNames.PROMPT_CACHE_CACHED_TOKENS: 256,
+        }
+        collector.log_request_metrics_dict(metrics)
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt") == 256
+
+    def test_cached_tokens_histogram_observed(self, collector):
+        metrics = {
+            MetricsCollector.labelname_finish_reason: "end_id",
+            MetricNames.PROMPT_CACHE_CACHED_TOKENS: 256,
+        }
+        collector.log_request_metrics_dict(metrics)
+        assert _get_histogram_count(collector, "histogram_tokens_cached_prompt") == 1
+        assert _get_histogram_sum(collector, "histogram_tokens_cached_prompt") == pytest.approx(
+            256.0
+        )
+
+    def test_zero_cached_tokens_histogram_but_not_counter(self, collector):
+        """Zero cache hits must reach the histogram (cache-miss bucket) without bumping the counter."""
+        metrics = {
+            MetricsCollector.labelname_finish_reason: "end_id",
+            MetricNames.PROMPT_CACHE_CACHED_TOKENS: 0,
+        }
+        collector.log_request_metrics_dict(metrics)
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt") == 0
+        assert _get_histogram_count(collector, "histogram_tokens_cached_prompt") == 1
+        assert _get_histogram_sum(collector, "histogram_tokens_cached_prompt") == pytest.approx(0.0)
+
+    def test_cached_tokens_accumulate(self, collector):
+        metrics = {
+            MetricsCollector.labelname_finish_reason: "end_id",
+            MetricNames.PROMPT_CACHE_CACHED_TOKENS: 128,
+        }
+        collector.log_request_metrics_dict(metrics)
+        collector.log_request_metrics_dict(metrics)
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt") == 256
+        assert _get_histogram_count(collector, "histogram_tokens_cached_prompt") == 2
+
+    def test_cache_metrics_absent_no_increment(self, collector):
+        metrics = {
+            MetricsCollector.labelname_finish_reason: "end_id",
+            MetricNames.E2E: 1.0,
+        }
+        collector.log_request_metrics_dict(metrics)
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt") == 0
+        assert _get_histogram_count(collector, "histogram_tokens_cached_prompt") == 0
+
+    def test_no_observation_without_finish_reason(self, collector):
+        """Per-request metrics must only fire on finish_reason."""
+        metrics = {MetricNames.PROMPT_CACHE_CACHED_TOKENS: 64}
+        collector.log_request_metrics_dict(metrics)
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt") == 0
+        assert _get_histogram_count(collector, "histogram_tokens_cached_prompt") == 0
+
+
+class TestPerPositionSpecDecodeMetrics:
+    """Per-position drafted/accepted counters labeled by token_position."""
+
+    def test_per_position_counters_incremented(self, collector):
+        drafted = [3, 3, 2, 1] + [0] * 12
+        accepted = [3, 2, 1, 0] + [0] * 12
+        metrics = {
+            MetricsCollector.labelname_finish_reason: "end_id",
+            MetricNames.SPEC_DEC_DRAFTED_PER_POS: drafted,
+            MetricNames.SPEC_DEC_ACCEPTED_PER_POS: accepted,
+        }
+        collector.log_request_metrics_dict(metrics)
+        # Positions 0..3 have non-zero drafted; the loop walks up to the last
+        # non-zero drafted position inclusive.
+        for pos in range(4):
+            labels = {**collector.labels, "token_position": str(pos)}
+            d_val = _counter_value_with_labels(
+                collector.counter_tokens_drafted_per_position, labels
+            )
+            a_val = _counter_value_with_labels(
+                collector.counter_tokens_accepted_per_position, labels
+            )
+            assert d_val == drafted[pos]
+            assert a_val == accepted[pos]
+
+    def test_trailing_zeros_do_not_create_series(self, collector):
+        """Positions past the last non-zero drafted index must not appear in label series."""
+        drafted = [5, 4] + [0] * 14
+        accepted = [5, 3] + [0] * 14
+        metrics = {
+            MetricsCollector.labelname_finish_reason: "end_id",
+            MetricNames.SPEC_DEC_DRAFTED_PER_POS: drafted,
+            MetricNames.SPEC_DEC_ACCEPTED_PER_POS: accepted,
+        }
+        collector.log_request_metrics_dict(metrics)
+        existing_pos = {
+            sample.labels.get("token_position")
+            for metric in REGISTRY.collect()
+            if metric.name == collector.counter_tokens_drafted_per_position._name
+            for sample in metric.samples
+            if sample.name.endswith("_total")
+        }
+        # Only positions 0 and 1 should have label series.
+        assert existing_pos == {"0", "1"}
+
+    def test_aggregate_fallback_single_position(self, collector):
+        """When the C++ fallback supplies a single-element array, only position 0 is updated."""
+        metrics = {
+            MetricsCollector.labelname_finish_reason: "end_id",
+            MetricNames.SPEC_DEC_DRAFTED_PER_POS: [10],
+            MetricNames.SPEC_DEC_ACCEPTED_PER_POS: [7],
+        }
+        collector.log_request_metrics_dict(metrics)
+        labels0 = {**collector.labels, "token_position": "0"}
+        assert (
+            _counter_value_with_labels(collector.counter_tokens_drafted_per_position, labels0) == 10
+        )
+        assert (
+            _counter_value_with_labels(collector.counter_tokens_accepted_per_position, labels0) == 7
+        )
+
+    def test_absent_arrays_no_error(self, collector):
+        metrics = {MetricsCollector.labelname_finish_reason: "end_id"}
+        collector.log_request_metrics_dict(metrics)  # must not raise
+
+    def test_no_observation_without_finish_reason(self, collector):
+        """No per-position counter updates when finish_reason is missing."""
+        metrics = {
+            MetricNames.SPEC_DEC_DRAFTED_PER_POS: [3, 2],
+            MetricNames.SPEC_DEC_ACCEPTED_PER_POS: [3, 1],
+        }
+        collector.log_request_metrics_dict(metrics)
+        existing_pos = {
+            sample.labels.get("token_position")
+            for metric in REGISTRY.collect()
+            if metric.name == collector.counter_tokens_drafted_per_position._name
+            for sample in metric.samples
+            if sample.name.endswith("_total")
+        }
+        assert existing_pos == set()
+
+
+class TestPerplexityHistograms:
+    """trtllm_prefill_perplexity and trtllm_generation_perplexity histograms."""
+
+    def test_prefill_perplexity_observed(self, collector):
+        metrics = {
+            MetricsCollector.labelname_finish_reason: "end_id",
+            MetricNames.PREFILL_PERPLEXITY: 5.5,
+        }
+        collector.log_request_metrics_dict(metrics)
+        assert _get_histogram_count(collector, "histogram_prefill_perplexity") == 1
+        assert _get_histogram_sum(collector, "histogram_prefill_perplexity") == pytest.approx(5.5)
+
+    def test_generation_perplexity_observed(self, collector):
+        metrics = {
+            MetricsCollector.labelname_finish_reason: "end_id",
+            MetricNames.GENERATION_PERPLEXITY: 12.3,
+        }
+        collector.log_request_metrics_dict(metrics)
+        assert _get_histogram_count(collector, "histogram_generation_perplexity") == 1
+        assert _get_histogram_sum(collector, "histogram_generation_perplexity") == pytest.approx(
+            12.3
+        )
+
+    def test_perplexity_absent_no_observation(self, collector):
+        metrics = {
+            MetricsCollector.labelname_finish_reason: "end_id",
+            MetricNames.E2E: 1.0,
+        }
+        collector.log_request_metrics_dict(metrics)
+        assert _get_histogram_count(collector, "histogram_prefill_perplexity") == 0
+        assert _get_histogram_count(collector, "histogram_generation_perplexity") == 0
+
+    @pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
+    def test_non_finite_perplexity_dropped(self, collector, value):
+        """Non-finite values (inf / -inf / NaN) must be filtered out by math.isfinite guard."""
+        metrics = {
+            MetricsCollector.labelname_finish_reason: "end_id",
+            MetricNames.PREFILL_PERPLEXITY: value,
+            MetricNames.GENERATION_PERPLEXITY: value,
+        }
+        collector.log_request_metrics_dict(metrics)
+        assert _get_histogram_count(collector, "histogram_prefill_perplexity") == 0
+        assert _get_histogram_count(collector, "histogram_generation_perplexity") == 0
+
+    def test_no_observation_without_finish_reason(self, collector):
+        metrics = {
+            MetricNames.PREFILL_PERPLEXITY: 4.2,
+            MetricNames.GENERATION_PERPLEXITY: 8.1,
+        }
+        collector.log_request_metrics_dict(metrics)
+        assert _get_histogram_count(collector, "histogram_prefill_perplexity") == 0
+        assert _get_histogram_count(collector, "histogram_generation_perplexity") == 0
+
+
+class TestPrefillBatchOccupancy:
+    """Iteration-level: trtllm_prefill_batch_occupancy and trtllm_prefill_batch_tokens."""
+
+    def test_occupancy_computed(self, collector):
+        # numContextRequests=2 / maxNumActiveRequests=10 = 0.2
+        collector.log_iteration_stats(SAMPLE_ITERATION_STATS)
+        assert _get_gauge_value(collector, "gauge_prefill_batch_occupancy") == pytest.approx(0.2)
+
+    def test_prefill_batch_tokens_histogram(self, collector):
+        # numCtxTokens=256 observed once
+        collector.log_iteration_stats(SAMPLE_ITERATION_STATS)
+        assert _get_histogram_count(collector, "histogram_prefill_batch_tokens") == 1
+        assert _get_histogram_sum(collector, "histogram_prefill_batch_tokens") == pytest.approx(
+            256.0
+        )
+
+    def test_zero_ctx_tokens_no_histogram_observation(self, collector):
+        stats = {
+            **SAMPLE_ITERATION_STATS,
+            "inflightBatchingStats": {
+                **SAMPLE_ITERATION_STATS["inflightBatchingStats"],
+                "numCtxTokens": 0,
+            },
+        }
+        collector.log_iteration_stats(stats)
+        assert _get_histogram_count(collector, "histogram_prefill_batch_tokens") == 0
+
+    def test_zero_max_active_no_divide_by_zero(self, collector):
+        """maxNumActiveRequests=0 must not divide-by-zero or update the gauge."""
+        stats = {**SAMPLE_ITERATION_STATS, "maxNumActiveRequests": 0}
+        collector.log_iteration_stats(stats)
+        # Gauge default is 0; the guard skips the update so the value stays 0.
+        assert _get_gauge_value(collector, "gauge_prefill_batch_occupancy") == 0
+
+    def test_occupancy_full(self, collector):
+        """When numContextRequests == maxNumActiveRequests, occupancy = 1.0."""
+        stats = {
+            **SAMPLE_ITERATION_STATS,
+            "maxNumActiveRequests": 4,
+            "inflightBatchingStats": {
+                **SAMPLE_ITERATION_STATS["inflightBatchingStats"],
+                "numContextRequests": 4,
+            },
+        }
+        collector.log_iteration_stats(stats)
+        assert _get_gauge_value(collector, "gauge_prefill_batch_occupancy") == pytest.approx(1.0)
+
+    def test_missing_ifb_stats_no_error(self, collector):
+        """No inflightBatchingStats → no histogram observation and no gauge update."""
+        stats = {k: v for k, v in SAMPLE_ITERATION_STATS.items() if k != "inflightBatchingStats"}
+        collector.log_iteration_stats(stats)
+        assert _get_histogram_count(collector, "histogram_prefill_batch_tokens") == 0
+
+
+class TestRequestErrorCounter:
+    """trtllm_request_error_total counter via log_request_error()."""
+
+    def test_error_counter_incremented_by_code(self, collector):
+        collector.log_request_error(http_code=400)
+        labels = {**collector.labels, "http_code": "400"}
+        assert _counter_value_with_labels(collector.counter_request_error, labels) == 1
+
+    def test_error_counter_accumulates_per_code(self, collector):
+        collector.log_request_error(http_code=400)
+        collector.log_request_error(http_code=400)
+        collector.log_request_error(http_code=500)
+        labels_400 = {**collector.labels, "http_code": "400"}
+        labels_500 = {**collector.labels, "http_code": "500"}
+        assert _counter_value_with_labels(collector.counter_request_error, labels_400) == 2
+        assert _counter_value_with_labels(collector.counter_request_error, labels_500) == 1
+
+    def test_error_counter_accepts_string_code(self, collector):
+        """log_request_error stringifies the code, so int and str arguments produce the same series."""
+        collector.log_request_error(http_code=400)
+        collector.log_request_error(http_code="400")
+        labels = {**collector.labels, "http_code": "400"}
+        assert _counter_value_with_labels(collector.counter_request_error, labels) == 2
+
+    def test_error_counter_default_empty_code(self, collector):
+        """Default http_code='' should still produce a valid series."""
+        collector.log_request_error()
+        labels = {**collector.labels, "http_code": ""}
+        assert _counter_value_with_labels(collector.counter_request_error, labels) == 1

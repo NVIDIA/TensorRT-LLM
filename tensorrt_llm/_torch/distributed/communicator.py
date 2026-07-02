@@ -179,6 +179,10 @@ class Distributed(ABC):
         pass
 
     @abstractmethod
+    def tp_allreduce(self, obj, op: ReduceOp = ReduceOp.SUM):
+        pass
+
+    @abstractmethod
     def tp_broadcast(self, obj, root=0, **kwargs):
         pass
 
@@ -308,18 +312,12 @@ def safe_broadcast(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
         offset += cur
 
     # ---- Reconstruction and deserialization ----
-    # Validate the received byte count and unpickle.
     if rank == root:
-        # Root already has `serialized`
-        if len(serialized) != total_size:
-            raise RuntimeError(
-                f"Data size mismatch at root: expected {total_size}, got {len(serialized)}"
-            )
-        try:
-            return pickle.loads(serialized)  # nosec B301
-        except Exception as e:
-            raise RuntimeError(f"Deserialization failed: {str(e)}") from e
+        # Root already holds `obj`; rebuilding it from its own serialized bytes
+        # would be a needless deep copy.
+        return obj
     else:
+        # Validate the received byte count and unpickle.
         if len(dst_buf) != total_size:
             raise RuntimeError(
                 f"Data size mismatch at rank {rank}: expected {total_size}, got {len(dst_buf)}"
@@ -766,6 +764,10 @@ class MPIDist(Distributed):
         reduce_op = reduce_op_to_mpi(op)
         return mpi_comm().allreduce(obj, reduce_op)
 
+    def tp_allreduce(self, obj, op: ReduceOp = ReduceOp.SUM):
+        reduce_op = reduce_op_to_mpi(op)
+        return self.tp_comm.allreduce(obj, reduce_op)
+
 
 class MultiHandleWrapper:
     """
@@ -993,6 +995,25 @@ class TorchDist(Distributed):
             obj = torch.tensor(obj)
 
         dist.all_reduce(obj, op=reduce_op_to_torch(op))
+
+        if is_base_type:
+            obj = obj.item()
+
+        return obj
+
+    @log_op
+    def tp_allreduce(
+        self,
+        obj: int | float | torch.Tensor,
+        op: ReduceOp = ReduceOp.SUM,
+    ):
+        is_base_type = isinstance(obj, int) or isinstance(obj, float)
+        if is_base_type:
+            obj = torch.tensor(obj)
+
+        dist.all_reduce(obj,
+                        op=reduce_op_to_torch(op),
+                        group=self.mapping.tp_group_pg)
 
         if is_base_type:
             obj = obj.item()

@@ -1,0 +1,3945 @@
+{
+  "TorchLlmArgs": [
+    {
+      "allowed_values": [
+        "AUTO",
+        "NCCL",
+        "UB",
+        "MINLATENCY",
+        "ONESHOT",
+        "TWOSHOT",
+        "LOWPRECISION",
+        "MNNVL",
+        "NCCL_SYMMETRIC"
+      ],
+      "annotation": "Optional[Literal['AUTO', 'NCCL', 'UB', 'MINLATENCY', 'ONESHOT', 'TWOSHOT', 'LOWPRECISION', 'MNNVL', 'NCCL_SYMMETRIC']]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "allreduce_strategy"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "attention_dp_config.batching_wait_iters"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "attention_dp_config.enable_balance"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "attention_dp_config.enable_kv_cache_aware_routing"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "attention_dp_config.kv_cache_routing_cold_start_warmup"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'float'>",
+      "converter": "",
+      "kind": "value",
+      "path": "attention_dp_config.kv_cache_routing_fair_share_multiplier"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'float'>",
+      "converter": "",
+      "kind": "value",
+      "path": "attention_dp_config.kv_cache_routing_load_balance_weight"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'float'>",
+      "converter": "",
+      "kind": "value",
+      "path": "attention_dp_config.kv_cache_routing_match_rate_threshold"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "attention_dp_config.timeout_iters"
+    },
+    {
+      "allowed_values": [
+        "VANILLA",
+        "TRTLLM",
+        "FLASHINFER",
+        "FLASHINFER_STAR_ATTENTION"
+      ],
+      "annotation": "<class 'str'>",
+      "converter": "allowlist",
+      "kind": "categorical",
+      "path": "attn_backend"
+    },
+    {
+      "allowed_values": [
+        "pytorch"
+      ],
+      "annotation": "Literal['pytorch']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "backend"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'float'>",
+      "converter": "",
+      "kind": "value",
+      "path": "batch_wait_max_tokens_ratio"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "batch_wait_timeout_iters"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'float'>",
+      "converter": "",
+      "kind": "value",
+      "path": "batch_wait_timeout_ms"
+    },
+    {
+      "allowed_values": [
+        "DEFAULT",
+        "UCX",
+        "NIXL",
+        "MOONCAKE",
+        "MPI"
+      ],
+      "annotation": "Optional[Literal['DEFAULT', 'UCX', 'NIXL', 'MOONCAKE', 'MPI']]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "cache_transceiver_config.backend"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[Annotated[int, Gt(gt=0)]]",
+      "converter": "",
+      "kind": "value",
+      "path": "cache_transceiver_config.kv_transfer_sender_future_timeout_ms"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[Annotated[int, Gt(gt=0)]]",
+      "converter": "",
+      "kind": "value",
+      "path": "cache_transceiver_config.kv_transfer_timeout_ms"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "cache_transceiver_config.max_tokens_in_buffer"
+    },
+    {
+      "allowed_values": [
+        "CPP",
+        "PYTHON"
+      ],
+      "annotation": "Optional[Literal['CPP', 'PYTHON']]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "cache_transceiver_config.transceiver_runtime"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "context_parallel_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "cp_config.block_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "cp_config.cp_anchor_size"
+    },
+    {
+      "allowed_values": [
+        "ULYSSES",
+        "STAR",
+        "RING",
+        "HELIX"
+      ],
+      "annotation": "<enum 'CpType'>",
+      "converter": "",
+      "kind": "categorical",
+      "path": "cp_config.cp_type"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "cp_config.fifo_version"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "cp_config.tokens_per_block"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[bool]",
+      "converter": "",
+      "kind": "value",
+      "path": "cp_config.use_nccl_for_alltoall"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[int]]",
+      "converter": "",
+      "kind": "value",
+      "path": "cuda_graph_config.batch_sizes"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "cuda_graph_config.enable_padding"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "cuda_graph_config.max_batch_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "cuda_graph_config.max_num_token"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "cuda_graph_config.max_seq_len"
+    },
+    {
+      "allowed_values": [
+        "decode",
+        "encode"
+      ],
+      "annotation": "Literal['decode']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "cuda_graph_config.mode"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[Annotated[int, Gt(gt=0)]]]",
+      "converter": "",
+      "kind": "value",
+      "path": "cuda_graph_config.num_tokens"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[Annotated[int, Gt(gt=0)]]]",
+      "converter": "",
+      "kind": "value",
+      "path": "cuda_graph_config.seq_lens"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "disable_flashinfer_sampling"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "disable_overlap_scheduler"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "float16",
+        "bfloat16",
+        "float32"
+      ],
+      "annotation": "<class 'str'>",
+      "converter": "allowlist",
+      "kind": "categorical",
+      "path": "dtype"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "dwdp_config.contention_opt"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "dwdp_config.dwdp_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "dwdp_config.num_experts_per_worker"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "dwdp_config.num_groups"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "dwdp_config.num_prefetch_experts"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "enable_attention_dp"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "enable_autotuner"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "enable_chunked_prefill"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "enable_early_first_token_response"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "enable_energy_metrics"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "enable_iter_perf_stats"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "enable_iter_req_stats"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "enable_layerwise_nvtx_marker"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "enable_lm_head_tp_in_adp"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "enable_lora"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "enable_min_latency"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "enable_resource_governor"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "enable_speculative_beam_history_d2h"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "encode_only"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "force_dynamic_quantization"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "garbage_collection_gen0_threshold"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "gather_generation_logits"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "rw",
+        "ro"
+      ],
+      "annotation": "Literal['auto', 'rw', 'ro']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "gms_config.mode"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "gpus_per_node"
+    },
+    {
+      "allowed_values": [
+        "xgrammar",
+        "llguidance"
+      ],
+      "annotation": "Optional[Literal['xgrammar', 'llguidance']]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "guided_decoding_backend"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "iter_stats_max_iterations"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.attention_dp_events_gather_period_ms"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.copy_on_partial_reuse"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[float]",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.cross_kv_cache_fraction"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "float16",
+        "bfloat16",
+        "float32",
+        "fp8",
+        "nvfp4"
+      ],
+      "annotation": "<class 'str'>",
+      "converter": "allowlist",
+      "kind": "categorical",
+      "path": "kv_cache_config.dtype"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.enable_block_reuse"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.enable_partial_reuse"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.event_buffer_max_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[float]",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.free_gpu_memory_fraction"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.host_cache_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.iteration_stats_interval"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "float16",
+        "bfloat16",
+        "float32"
+      ],
+      "annotation": "Literal['auto', 'float16', 'bfloat16', 'float32']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "kv_cache_config.mamba_ssm_cache_dtype"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.mamba_ssm_philox_rounds"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.mamba_ssm_stochastic_rounding"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.mamba_state_cache_interval"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[int]]",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.max_attention_window"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.max_gpu_total_bytes"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.max_tokens"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'float'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.max_util_for_resume"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.secondary_offload_min_priority"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.sink_token_length"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.tokens_per_block"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.use_kv_cache_manager_v2"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.use_uvm"
+    },
+    {
+      "allowed_values": [
+        "lmcache",
+        "lmcache-mp",
+        "kvbm"
+      ],
+      "annotation": "Optional[str]",
+      "converter": "allowlist",
+      "kind": "categorical",
+      "path": "kv_connector_config.connector"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[int]]",
+      "converter": "",
+      "kind": "value",
+      "path": "layer_wise_benchmarks_config.calibration_layer_indices"
+    },
+    {
+      "allowed_values": [
+        "NONE",
+        "MARK",
+        "COLLECT"
+      ],
+      "annotation": "Literal['NONE', 'MARK', 'COLLECT']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "layer_wise_benchmarks_config.calibration_mode"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "dummy",
+        "vision_only",
+        "gms"
+      ],
+      "annotation": "Union[str, tensorrt_llm.llmapi.llm_args.LoadFormat]",
+      "converter": "allowlist",
+      "kind": "categorical",
+      "path": "load_format"
+    },
+    {
+      "allowed_values": [
+        "hf",
+        "nemo"
+      ],
+      "annotation": "Literal['hf', 'nemo']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "lora_config.lora_ckpt_source"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "lora_config.max_cpu_loras"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "lora_config.max_lora_rank"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "lora_config.max_loras"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "lora_config.swap_gate_up_proj_lora_b_weight"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "max_batch_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "max_beam_width"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "max_input_len"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "max_num_tokens"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "max_seq_len"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "max_stats_len"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "mm_encoder_only"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "moe_cluster_parallel_size"
+    },
+    {
+      "allowed_values": [
+        "AUTO",
+        "CUTLASS",
+        "CUTEDSL",
+        "WIDEEP",
+        "TRTLLM",
+        "DEEPGEMM",
+        "DENSEGEMM",
+        "VANILLA",
+        "TRITON"
+      ],
+      "annotation": "Literal['AUTO', 'CUTLASS', 'CUTEDSL', 'WIDEEP', 'TRTLLM', 'DEEPGEMM', 'DENSEGEMM', 'VANILLA', 'TRITON']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "moe_config.backend"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "moe_config.disable_finalize_fusion"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "moe_config.max_num_tokens"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "moe_config.use_low_precision_moe_combine"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "moe_expert_parallel_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "moe_tensor_parallel_size"
+    },
+    {
+      "allowed_values": [
+        "per_module"
+      ],
+      "annotation": "<class 'str'>",
+      "converter": "allowlist",
+      "kind": "categorical",
+      "path": "mx_config.preshard_strategy"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[Annotated[int, Ge(ge=0)]]",
+      "converter": "",
+      "kind": "value",
+      "path": "mx_config.server_query_timeout_s"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "num_postprocess_workers"
+    },
+    {
+      "allowed_values": [
+        "cutlass",
+        "cublaslt",
+        "cutedsl",
+        "cuda_core"
+      ],
+      "annotation": "List[Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core']]",
+      "converter": "",
+      "kind": "value",
+      "path": "nvfp4_gemm_config.allowed_backends"
+    },
+    {
+      "allowed_values": [
+        "rpc",
+        "ray"
+      ],
+      "annotation": "Optional[Literal['rpc', 'ray']]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "orchestrator_type"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'float'>",
+      "converter": "",
+      "kind": "value",
+      "path": "peft_cache_config.device_cache_percent"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "peft_cache_config.host_cache_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "peft_cache_config.max_adapter_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "peft_cache_config.max_pages_per_block_device"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "peft_cache_config.max_pages_per_block_host"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "peft_cache_config.num_copy_streams"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "peft_cache_config.num_device_module_layer"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "peft_cache_config.num_ensure_workers"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "peft_cache_config.num_host_module_layer"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "peft_cache_config.num_put_workers"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "peft_cache_config.optimal_adapter_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "perf_metrics_max_requests"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "pipeline_parallel_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[int]]",
+      "converter": "",
+      "kind": "value",
+      "path": "pp_partition"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "print_iter_log"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[float]]",
+      "converter": "",
+      "kind": "value",
+      "path": "prometheus_metrics_config.e2e_request_latency_buckets"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[float]]",
+      "converter": "",
+      "kind": "value",
+      "path": "prometheus_metrics_config.request_decode_time_buckets"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[float]]",
+      "converter": "",
+      "kind": "value",
+      "path": "prometheus_metrics_config.request_inference_time_buckets"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[float]]",
+      "converter": "",
+      "kind": "value",
+      "path": "prometheus_metrics_config.request_prefill_time_buckets"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[float]]",
+      "converter": "",
+      "kind": "value",
+      "path": "prometheus_metrics_config.request_queue_time_buckets"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[float]]",
+      "converter": "",
+      "kind": "value",
+      "path": "prometheus_metrics_config.time_per_output_token_buckets"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[float]]",
+      "converter": "",
+      "kind": "value",
+      "path": "prometheus_metrics_config.time_to_first_token_buckets"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "ray_placement_config.defer_workers_init"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[float]",
+      "converter": "",
+      "kind": "value",
+      "path": "ray_placement_config.per_worker_gpu_share"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[List[int]]]",
+      "converter": "",
+      "kind": "value",
+      "path": "ray_placement_config.placement_bundle_indices"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "deepseek-r1",
+        "laguna",
+        "qwen3",
+        "qwen3_5",
+        "minimax_m2",
+        "minimax_m2_append_think",
+        "nano-v3",
+        "gemma4",
+        "kimi_k2",
+        "kimi_k25"
+      ],
+      "annotation": "Optional[str]",
+      "converter": "allowlist",
+      "kind": "categorical",
+      "path": "reasoning_parser"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "reorder_policy_config.policy_args.agent_inflight_seq_num"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'float'>",
+      "converter": "",
+      "kind": "value",
+      "path": "reorder_policy_config.policy_args.agent_percentage"
+    },
+    {
+      "allowed_values": [
+        "AgentTree"
+      ],
+      "annotation": "Optional[Literal['AgentTree']]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "reorder_policy_config.policy_name"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "request_stats_max_iterations"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "return_perf_metrics"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sampler_force_async_worker"
+    },
+    {
+      "allowed_values": [
+        "TRTLLMSampler",
+        "TorchSampler",
+        "auto"
+      ],
+      "annotation": "Union[str, tensorrt_llm.llmapi.llm_args.SamplerType]",
+      "converter": "allowlist",
+      "kind": "categorical",
+      "path": "sampler_type"
+    },
+    {
+      "allowed_values": [
+        "MAX_UTILIZATION",
+        "GUARANTEED_NO_EVICT",
+        "STATIC_BATCH"
+      ],
+      "annotation": "<enum 'CapacitySchedulerPolicy'>",
+      "converter": "",
+      "kind": "categorical",
+      "path": "scheduler_config.capacity_scheduler_policy"
+    },
+    {
+      "allowed_values": [
+        "FIRST_COME_FIRST_SERVED",
+        "EQUAL_PROGRESS",
+        "FORCE_CHUNK"
+      ],
+      "annotation": "Optional[tensorrt_llm.llmapi.llm_args.ContextChunkingPolicy]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "scheduler_config.context_chunking_policy"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "scheduler_config.dynamic_batch_config.dynamic_batch_moving_average_window"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "scheduler_config.dynamic_batch_config.enable_batch_size_tuning"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "scheduler_config.dynamic_batch_config.enable_max_num_tokens_tuning"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "scheduler_config.enable_prefix_aware_scheduling"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "scheduler_config.use_python_scheduler"
+    },
+    {
+      "allowed_values": [
+        "fcfs",
+        "priority"
+      ],
+      "annotation": "<enum 'WaitingQueuePolicy'>",
+      "converter": "",
+      "kind": "categorical",
+      "path": "scheduler_config.waiting_queue_policy"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "skip_tokenizer_init"
+    },
+    {
+      "allowed_values": [
+        "dsa",
+        "rocket",
+        "skip_softmax"
+      ],
+      "annotation": "Literal['dsa']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "sparse_attention_config.algorithm"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.enable_heuristic_topk"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.index_head_dim"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.index_n_heads"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.index_topk"
+    },
+    {
+      "allowed_values": [
+        "fp8",
+        "fp4"
+      ],
+      "annotation": "Literal['fp8', 'fp4']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "sparse_attention_config.indexer_k_dtype"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.indexer_max_chunk_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.indexer_rope_interleave"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.kernel_size"
+    },
+    {
+      "allowed_values": [
+        "bfloat16",
+        "float8_e5m2"
+      ],
+      "annotation": "Optional[str]",
+      "converter": "allowlist",
+      "kind": "categorical",
+      "path": "sparse_attention_config.kt_cache_dtype"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.page_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.prompt_budget"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.q_split_threshold"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.seq_len_threshold"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.skip_indexer_for_short_seqs"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.topk"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Union[int, float, NoneType]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.topr"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.use_cute_dsl_paged_mqa_logits"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.use_cute_dsl_topk"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.window_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[Annotated[float, Ge(ge=0)]]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.acceptance_length_threshold"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[Annotated[int, Ge(ge=0)]]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.acceptance_window"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.allow_advanced_sampling"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.begin_thinking_phase_token"
+    },
+    {
+      "allowed_values": [
+        "AUTO",
+        "DFlash",
+        "Draft_Target",
+        "Eagle3",
+        "Eagle",
+        "Lookahead",
+        "MTP",
+        "Medusa",
+        "NGram",
+        "PARD",
+        "SA",
+        "SaveState",
+        "User_Provided"
+      ],
+      "annotation": "Literal['AUTO']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "speculative_config.decoding_type"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.dynamic_tree_max_topK"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[Set[int]]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.eagle3_layers_to_capture"
+    },
+    {
+      "allowed_values": [
+        "llama3",
+        "mistral_large3"
+      ],
+      "annotation": "Literal['llama3', 'mistral_large3']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "speculative_config.eagle3_model_arch"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[bool]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.eagle3_one_model"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[List[int]]]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.eagle_choices"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.enable_global_pool"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.end_thinking_phase_token"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[Annotated[int, Gt(gt=0)]]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.global_pool_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[bool]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.greedy_sampling"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.is_keep_all"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.is_public_pool"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.is_use_oldest"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.mask_token_id"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[Annotated[int, Gt(gt=0)]]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.max_concurrency"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[Annotated[int, Ge(ge=0)]]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.max_draft_len"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.max_matching_ngram_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.max_ngram_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.max_non_leaves_per_layer"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.max_total_draft_tokens"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.max_verification_set_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.max_window_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[List[int]]]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.medusa_choices"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.mtp_eagle_one_model"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.num_eagle_layers"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.num_medusa_heads"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.num_nextn_predict_layers"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[float]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.posterior_threshold"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'float'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.relaxed_delta"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.relaxed_topk"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.sa_config.enable_global_pool"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.sa_config.threshold"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[int]]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.target_layer_ids"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[bool]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.use_dynamic_tree"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.use_mtp_vanilla"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.use_rejection_sampling"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.use_relaxed_acceptance_for_thinking"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.write_interval"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "stream_interval"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "telemetry_config.disabled"
+    },
+    {
+      "allowed_values": [
+        "unknown",
+        "llm_class",
+        "cli_serve",
+        "cli_bench",
+        "cli_eval"
+      ],
+      "annotation": "<enum 'UsageContext'>",
+      "converter": "",
+      "kind": "categorical",
+      "path": "telemetry_config.usage_context"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "tensor_parallel_size"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "slow"
+      ],
+      "annotation": "Literal['auto', 'slow']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "tokenizer_mode"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[Annotated[int, Gt(gt=0)]]]",
+      "converter": "",
+      "kind": "value",
+      "path": "torch_compile_config.capture_num_tokens"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "torch_compile_config.enable_fullgraph"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "torch_compile_config.enable_inductor"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "torch_compile_config.enable_piecewise_cuda_graph"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "torch_compile_config.enable_userbuffers"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "torch_compile_config.max_num_streams"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "trust_remote_code"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "use_cute_dsl_bf16_bmm"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "use_cute_dsl_bf16_gemm"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "use_cute_dsl_blockscaling_bmm"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "use_cute_dsl_blockscaling_mm"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[float]",
+      "converter": "",
+      "kind": "value",
+      "path": "video_pruning_rate"
+    }
+  ],
+  "TrtLlmArgs": [
+    {
+      "allowed_values": [
+        "pytorch",
+        "tensorrt",
+        "_autodeploy"
+      ],
+      "annotation": "Optional[str]",
+      "converter": "allowlist",
+      "kind": "categorical",
+      "path": "backend"
+    },
+    {
+      "allowed_values": [
+        "STATIC",
+        "INFLIGHT"
+      ],
+      "annotation": "Optional[tensorrt_llm.llmapi.llm_args.BatchingType]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "batching_type"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.dry_run"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.enable_debug_output"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.force_num_profiles"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.gather_context_logits"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.gather_generation_logits"
+    },
+    {
+      "allowed_values": [
+        "continuous",
+        "paged",
+        "disabled"
+      ],
+      "annotation": "Optional[tensorrt_llm.llmapi.kv_cache_type.KVCacheType]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "build_config.kv_cache_type"
+    },
+    {
+      "allowed_values": [
+        "hf",
+        "nemo"
+      ],
+      "annotation": "Literal['hf', 'nemo']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "build_config.lora_config.lora_ckpt_source"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.lora_config.max_cpu_loras"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.lora_config.max_lora_rank"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.lora_config.max_loras"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.lora_config.swap_gate_up_proj_lora_b_weight"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.max_batch_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.max_beam_width"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.max_draft_len"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.max_encoder_input_len"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.max_input_len"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.max_num_tokens"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.max_prompt_embedding_table_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.max_seq_len"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.monitor_memory"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.opt_batch_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.opt_num_tokens"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "float16",
+        "float32",
+        "bfloat16",
+        "int32",
+        "None"
+      ],
+      "annotation": "Optional[Literal['auto', 'float16', 'float32', 'bfloat16', 'int32', None]]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "build_config.plugin_config.bert_attention_plugin"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.plugin_config.bert_context_fmha_fp32_acc"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.plugin_config.context_fmha"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.plugin_config.dora_plugin"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "float16",
+        "float32",
+        "bfloat16",
+        "int32",
+        "None"
+      ],
+      "annotation": "Optional[Literal['auto', 'float16', 'float32', 'bfloat16', 'int32', None]]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "build_config.plugin_config.fp8_rowwise_gemm_plugin"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.plugin_config.fuse_fp4_quant"
+    },
+    {
+      "allowed_values": [
+        "float16",
+        "bfloat16",
+        "None"
+      ],
+      "annotation": "Optional[Literal['float16', 'bfloat16', None]]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "build_config.plugin_config.gemm_allreduce_plugin"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "float16",
+        "float32",
+        "bfloat16",
+        "int32",
+        "fp8",
+        "nvfp4",
+        "None"
+      ],
+      "annotation": "Optional[Literal['auto', 'float16', 'float32', 'bfloat16', 'int32', 'fp8', 'nvfp4', None]]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "build_config.plugin_config.gemm_plugin"
+    },
+    {
+      "allowed_values": [
+        "fp8",
+        "None"
+      ],
+      "annotation": "Optional[Literal['fp8', None]]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "build_config.plugin_config.gemm_swiglu_plugin"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "float16",
+        "float32",
+        "bfloat16",
+        "int32",
+        "None"
+      ],
+      "annotation": "Optional[Literal['auto', 'float16', 'float32', 'bfloat16', 'int32', None]]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "build_config.plugin_config.gpt_attention_plugin"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "float16",
+        "float32",
+        "bfloat16",
+        "int32",
+        "None"
+      ],
+      "annotation": "Optional[Literal['auto', 'float16', 'float32', 'bfloat16', 'int32', None]]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "build_config.plugin_config.identity_plugin"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "float16",
+        "float32",
+        "bfloat16",
+        "int32",
+        "None"
+      ],
+      "annotation": "Optional[Literal['auto', 'float16', 'float32', 'bfloat16', 'int32', None]]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "build_config.plugin_config.layernorm_quantization_plugin"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "float16",
+        "float32",
+        "bfloat16",
+        "int32",
+        "None"
+      ],
+      "annotation": "Optional[Literal['auto', 'float16', 'float32', 'bfloat16', 'int32', None]]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "build_config.plugin_config.lora_plugin"
+    },
+    {
+      "allowed_values": [
+        "fp8",
+        "None"
+      ],
+      "annotation": "Optional[Literal['fp8', None]]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "build_config.plugin_config.low_latency_gemm_plugin"
+    },
+    {
+      "allowed_values": [
+        "fp8",
+        "None"
+      ],
+      "annotation": "Optional[Literal['fp8', None]]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "build_config.plugin_config.low_latency_gemm_swiglu_plugin"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "float16",
+        "float32",
+        "bfloat16",
+        "int32",
+        "None"
+      ],
+      "annotation": "Optional[Literal['auto', 'float16', 'float32', 'bfloat16', 'int32', None]]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "build_config.plugin_config.mamba_conv1d_plugin"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.plugin_config.manage_weights"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "float16",
+        "float32",
+        "bfloat16",
+        "int32",
+        "None"
+      ],
+      "annotation": "Optional[Literal['auto', 'float16', 'float32', 'bfloat16', 'int32', None]]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "build_config.plugin_config.moe_plugin"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.plugin_config.multiple_profiles"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "float16",
+        "float32",
+        "bfloat16",
+        "int32",
+        "None"
+      ],
+      "annotation": "Optional[Literal['auto', 'float16', 'float32', 'bfloat16', 'int32', None]]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "build_config.plugin_config.nccl_plugin"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.plugin_config.norm_quant_fusion"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[bool]",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.plugin_config.paged_kv_cache"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.plugin_config.paged_state"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.plugin_config.pp_reduce_scatter"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "float16",
+        "float32",
+        "bfloat16",
+        "int32",
+        "None"
+      ],
+      "annotation": "Optional[Literal['auto', 'float16', 'float32', 'bfloat16', 'int32', None]]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "build_config.plugin_config.qserve_gemm_plugin"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.plugin_config.quantize_per_token_plugin"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.plugin_config.quantize_tensor_plugin"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.plugin_config.reduce_fusion"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.plugin_config.remove_input_padding"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "float16",
+        "float32",
+        "bfloat16",
+        "int32",
+        "None"
+      ],
+      "annotation": "Optional[Literal['auto', 'float16', 'float32', 'bfloat16', 'int32', None]]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "build_config.plugin_config.rmsnorm_quantization_plugin"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "float16",
+        "float32",
+        "bfloat16",
+        "int32",
+        "None"
+      ],
+      "annotation": "Optional[Literal['auto', 'float16', 'float32', 'bfloat16', 'int32', None]]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "build_config.plugin_config.smooth_quant_gemm_plugin"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.plugin_config.smooth_quant_plugins"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.plugin_config.streamingllm"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.plugin_config.tokens_per_block"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.plugin_config.use_fp8_context_fmha"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.plugin_config.use_fused_mlp"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.plugin_config.use_paged_context_fmha"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.plugin_config.user_buffer"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "float16",
+        "float32",
+        "bfloat16",
+        "int32",
+        "None"
+      ],
+      "annotation": "Optional[Literal['auto', 'float16', 'float32', 'bfloat16', 'int32', None]]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "build_config.plugin_config.weight_only_groupwise_quant_matmul_plugin"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "float16",
+        "float32",
+        "bfloat16",
+        "int32",
+        "None"
+      ],
+      "annotation": "Optional[Literal['auto', 'float16', 'float32', 'bfloat16', 'int32', None]]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "build_config.plugin_config.weight_only_quant_matmul_plugin"
+    },
+    {
+      "allowed_values": [
+        "NONE",
+        "DRAFT_TOKENS_EXTERNAL",
+        "MEDUSA",
+        "LOOKAHEAD_DECODING",
+        "EXPLICIT_DRAFT_TOKENS",
+        "EAGLE",
+        "NGRAM",
+        "USER_PROVIDED",
+        "SAVE_HIDDEN_STATES",
+        "AUTO"
+      ],
+      "annotation": "<flag 'SpeculativeDecodingMode'>",
+      "converter": "",
+      "kind": "categorical",
+      "path": "build_config.speculative_decoding_mode"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.strongly_typed"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.use_mrope"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.use_refit"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.use_strip_plan"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.weight_sparsity"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "build_config.weight_streaming"
+    },
+    {
+      "allowed_values": [
+        "DEFAULT",
+        "UCX",
+        "NIXL",
+        "MOONCAKE",
+        "MPI"
+      ],
+      "annotation": "Optional[Literal['DEFAULT', 'UCX', 'NIXL', 'MOONCAKE', 'MPI']]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "cache_transceiver_config.backend"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[Annotated[int, Gt(gt=0)]]",
+      "converter": "",
+      "kind": "value",
+      "path": "cache_transceiver_config.kv_transfer_sender_future_timeout_ms"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[Annotated[int, Gt(gt=0)]]",
+      "converter": "",
+      "kind": "value",
+      "path": "cache_transceiver_config.kv_transfer_timeout_ms"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "cache_transceiver_config.max_tokens_in_buffer"
+    },
+    {
+      "allowed_values": [
+        "CPP",
+        "PYTHON"
+      ],
+      "annotation": "Optional[Literal['CPP', 'PYTHON']]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "cache_transceiver_config.transceiver_runtime"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "calib_config.calib_batch_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "calib_config.calib_batches"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "calib_config.calib_max_seq_length"
+    },
+    {
+      "allowed_values": [
+        "cuda",
+        "cpu"
+      ],
+      "annotation": "Literal['cuda', 'cpu']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "calib_config.device"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "calib_config.random_seed"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "calib_config.tokenizer_max_seq_length"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "context_parallel_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "cp_config.block_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "cp_config.cp_anchor_size"
+    },
+    {
+      "allowed_values": [
+        "ULYSSES",
+        "STAR",
+        "RING",
+        "HELIX"
+      ],
+      "annotation": "<enum 'CpType'>",
+      "converter": "",
+      "kind": "categorical",
+      "path": "cp_config.cp_type"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "cp_config.fifo_version"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "cp_config.tokens_per_block"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[bool]",
+      "converter": "",
+      "kind": "value",
+      "path": "cp_config.use_nccl_for_alltoall"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "float16",
+        "bfloat16",
+        "float32"
+      ],
+      "annotation": "<class 'str'>",
+      "converter": "allowlist",
+      "kind": "categorical",
+      "path": "dtype"
+    },
+    {
+      "allowed_values": [
+        "NONE",
+        "SHARDING_ALONG_VOCAB",
+        "SHARDING_ALONG_HIDDEN"
+      ],
+      "annotation": "Literal['NONE', 'SHARDING_ALONG_VOCAB', 'SHARDING_ALONG_HIDDEN']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "embedding_parallel_mode"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "enable_attention_dp"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'float'>",
+      "converter": "",
+      "kind": "value",
+      "path": "enable_build_cache.max_cache_storage_gb"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "enable_build_cache.max_records"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "enable_chunked_prefill"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "enable_energy_metrics"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "enable_lm_head_tp_in_adp"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "enable_lora"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "enable_prompt_adapter"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "enable_tqdm"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "extended_runtime_perf_knob_config.cuda_graph_cache_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "extended_runtime_perf_knob_config.cuda_graph_mode"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "extended_runtime_perf_knob_config.enable_context_fmha_fp32_acc"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "extended_runtime_perf_knob_config.multi_block_mode"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "fail_fast_on_attention_window_too_large"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "fast_build"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "gather_generation_logits"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "gpus_per_node"
+    },
+    {
+      "allowed_values": [
+        "xgrammar",
+        "llguidance"
+      ],
+      "annotation": "Optional[Literal['xgrammar', 'llguidance']]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "guided_decoding_backend"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "iter_stats_max_iterations"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.attention_dp_events_gather_period_ms"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.copy_on_partial_reuse"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[float]",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.cross_kv_cache_fraction"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "float16",
+        "bfloat16",
+        "float32",
+        "fp8",
+        "nvfp4"
+      ],
+      "annotation": "<class 'str'>",
+      "converter": "allowlist",
+      "kind": "categorical",
+      "path": "kv_cache_config.dtype"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.enable_block_reuse"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.enable_partial_reuse"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.event_buffer_max_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[float]",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.free_gpu_memory_fraction"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.host_cache_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.iteration_stats_interval"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "float16",
+        "bfloat16",
+        "float32"
+      ],
+      "annotation": "Literal['auto', 'float16', 'bfloat16', 'float32']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "kv_cache_config.mamba_ssm_cache_dtype"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.mamba_ssm_philox_rounds"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.mamba_ssm_stochastic_rounding"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.mamba_state_cache_interval"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[int]]",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.max_attention_window"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.max_gpu_total_bytes"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.max_tokens"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'float'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.max_util_for_resume"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.secondary_offload_min_priority"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.sink_token_length"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.tokens_per_block"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.use_kv_cache_manager_v2"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.use_uvm"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "dummy"
+      ],
+      "annotation": "Literal['auto', 'dummy']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "load_format"
+    },
+    {
+      "allowed_values": [
+        "hf",
+        "nemo"
+      ],
+      "annotation": "Literal['hf', 'nemo']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "lora_config.lora_ckpt_source"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "lora_config.max_cpu_loras"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "lora_config.max_lora_rank"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "lora_config.max_loras"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "lora_config.swap_gate_up_proj_lora_b_weight"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "max_batch_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "max_beam_width"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "max_input_len"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "max_num_tokens"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "max_prompt_adapter_token"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "max_seq_len"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "moe_cluster_parallel_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "moe_expert_parallel_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "moe_tensor_parallel_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "normalize_log_probs"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "num_postprocess_workers"
+    },
+    {
+      "allowed_values": [
+        "rpc",
+        "ray"
+      ],
+      "annotation": "Optional[Literal['rpc', 'ray']]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "orchestrator_type"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'float'>",
+      "converter": "",
+      "kind": "value",
+      "path": "peft_cache_config.device_cache_percent"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "peft_cache_config.host_cache_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "peft_cache_config.max_adapter_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "peft_cache_config.max_pages_per_block_device"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "peft_cache_config.max_pages_per_block_host"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "peft_cache_config.num_copy_streams"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "peft_cache_config.num_device_module_layer"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "peft_cache_config.num_ensure_workers"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "peft_cache_config.num_host_module_layer"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "peft_cache_config.num_put_workers"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "peft_cache_config.optimal_adapter_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "perf_metrics_max_requests"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "pipeline_parallel_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[int]]",
+      "converter": "",
+      "kind": "value",
+      "path": "pp_partition"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[float]]",
+      "converter": "",
+      "kind": "value",
+      "path": "prometheus_metrics_config.e2e_request_latency_buckets"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[float]]",
+      "converter": "",
+      "kind": "value",
+      "path": "prometheus_metrics_config.request_decode_time_buckets"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[float]]",
+      "converter": "",
+      "kind": "value",
+      "path": "prometheus_metrics_config.request_inference_time_buckets"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[float]]",
+      "converter": "",
+      "kind": "value",
+      "path": "prometheus_metrics_config.request_prefill_time_buckets"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[float]]",
+      "converter": "",
+      "kind": "value",
+      "path": "prometheus_metrics_config.request_queue_time_buckets"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[float]]",
+      "converter": "",
+      "kind": "value",
+      "path": "prometheus_metrics_config.time_per_output_token_buckets"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[float]]",
+      "converter": "",
+      "kind": "value",
+      "path": "prometheus_metrics_config.time_to_first_token_buckets"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[float]]",
+      "converter": "",
+      "kind": "value",
+      "path": "quant_config.clamp_val"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "quant_config.group_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "quant_config.has_zero_point"
+    },
+    {
+      "allowed_values": [
+        "W8A16",
+        "W4A16",
+        "W4A16_AWQ",
+        "W4A8_AWQ",
+        "W8A16_GPTQ",
+        "W4A16_GPTQ",
+        "W8A8_SQ_PER_CHANNEL",
+        "W8A8_SQ_PER_TENSOR_PLUGIN",
+        "W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN",
+        "W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN",
+        "W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN",
+        "W4A8_QSERVE_PER_GROUP",
+        "W4A8_QSERVE_PER_CHANNEL",
+        "FP8",
+        "FP8_PER_CHANNEL_PER_TOKEN",
+        "FP8_BLOCK_SCALES",
+        "INT8",
+        "MIXED_PRECISION",
+        "NVFP4",
+        "W4A8_NVFP4_FP8",
+        "W4A8_MXFP4_FP8",
+        "W4A8_MXFP4_MXFP8",
+        "W4A16_MXFP4",
+        "NVFP4_AWQ",
+        "NVFP4_ARC",
+        "NO_QUANT"
+      ],
+      "annotation": "Optional[tensorrt_llm.quantization.mode.QuantAlgo]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "quant_config.kv_cache_quant_algo"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "quant_config.mamba_ssm_philox_rounds"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "quant_config.mamba_ssm_stochastic_rounding"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "quant_config.pre_quant_scale"
+    },
+    {
+      "allowed_values": [
+        "W8A16",
+        "W4A16",
+        "W4A16_AWQ",
+        "W4A8_AWQ",
+        "W8A16_GPTQ",
+        "W4A16_GPTQ",
+        "W8A8_SQ_PER_CHANNEL",
+        "W8A8_SQ_PER_TENSOR_PLUGIN",
+        "W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN",
+        "W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN",
+        "W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN",
+        "W4A8_QSERVE_PER_GROUP",
+        "W4A8_QSERVE_PER_CHANNEL",
+        "FP8",
+        "FP8_PER_CHANNEL_PER_TOKEN",
+        "FP8_BLOCK_SCALES",
+        "INT8",
+        "MIXED_PRECISION",
+        "NVFP4",
+        "W4A8_NVFP4_FP8",
+        "W4A8_MXFP4_FP8",
+        "W4A8_MXFP4_MXFP8",
+        "W4A16_MXFP4",
+        "NVFP4_AWQ",
+        "NVFP4_ARC",
+        "NO_QUANT"
+      ],
+      "annotation": "Optional[tensorrt_llm.quantization.mode.QuantAlgo]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "quant_config.quant_algo"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'float'>",
+      "converter": "",
+      "kind": "value",
+      "path": "quant_config.smoothquant_val"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "quant_config.use_meta_recipe"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "deepseek-r1",
+        "laguna",
+        "qwen3",
+        "qwen3_5",
+        "minimax_m2",
+        "minimax_m2_append_think",
+        "nano-v3",
+        "gemma4",
+        "kimi_k2",
+        "kimi_k25"
+      ],
+      "annotation": "Optional[str]",
+      "converter": "allowlist",
+      "kind": "categorical",
+      "path": "reasoning_parser"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "request_stats_max_iterations"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "return_perf_metrics"
+    },
+    {
+      "allowed_values": [
+        "MAX_UTILIZATION",
+        "GUARANTEED_NO_EVICT",
+        "STATIC_BATCH"
+      ],
+      "annotation": "<enum 'CapacitySchedulerPolicy'>",
+      "converter": "",
+      "kind": "categorical",
+      "path": "scheduler_config.capacity_scheduler_policy"
+    },
+    {
+      "allowed_values": [
+        "FIRST_COME_FIRST_SERVED",
+        "EQUAL_PROGRESS",
+        "FORCE_CHUNK"
+      ],
+      "annotation": "Optional[tensorrt_llm.llmapi.llm_args.ContextChunkingPolicy]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "scheduler_config.context_chunking_policy"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "scheduler_config.dynamic_batch_config.dynamic_batch_moving_average_window"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "scheduler_config.dynamic_batch_config.enable_batch_size_tuning"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "scheduler_config.dynamic_batch_config.enable_max_num_tokens_tuning"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "scheduler_config.enable_prefix_aware_scheduling"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "scheduler_config.use_python_scheduler"
+    },
+    {
+      "allowed_values": [
+        "fcfs",
+        "priority"
+      ],
+      "annotation": "<enum 'WaitingQueuePolicy'>",
+      "converter": "",
+      "kind": "categorical",
+      "path": "scheduler_config.waiting_queue_policy"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "skip_tokenizer_init"
+    },
+    {
+      "allowed_values": [
+        "dsa",
+        "rocket",
+        "skip_softmax"
+      ],
+      "annotation": "Literal['dsa']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "sparse_attention_config.algorithm"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.enable_heuristic_topk"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.index_head_dim"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.index_n_heads"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.index_topk"
+    },
+    {
+      "allowed_values": [
+        "fp8",
+        "fp4"
+      ],
+      "annotation": "Literal['fp8', 'fp4']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "sparse_attention_config.indexer_k_dtype"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.indexer_max_chunk_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.indexer_rope_interleave"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.kernel_size"
+    },
+    {
+      "allowed_values": [
+        "bfloat16",
+        "float8_e5m2"
+      ],
+      "annotation": "Optional[str]",
+      "converter": "allowlist",
+      "kind": "categorical",
+      "path": "sparse_attention_config.kt_cache_dtype"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.page_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.prompt_budget"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.q_split_threshold"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.seq_len_threshold"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.skip_indexer_for_short_seqs"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.topk"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Union[int, float, NoneType]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.topr"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.use_cute_dsl_paged_mqa_logits"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.use_cute_dsl_topk"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.window_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[Annotated[float, Ge(ge=0)]]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.acceptance_length_threshold"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[Annotated[int, Ge(ge=0)]]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.acceptance_window"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.allow_advanced_sampling"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.begin_thinking_phase_token"
+    },
+    {
+      "allowed_values": [
+        "AUTO",
+        "DFlash",
+        "Draft_Target",
+        "Eagle3",
+        "Eagle",
+        "Lookahead",
+        "MTP",
+        "Medusa",
+        "NGram",
+        "PARD",
+        "SA",
+        "SaveState",
+        "User_Provided"
+      ],
+      "annotation": "Literal['AUTO']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "speculative_config.decoding_type"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.dynamic_tree_max_topK"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[Set[int]]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.eagle3_layers_to_capture"
+    },
+    {
+      "allowed_values": [
+        "llama3",
+        "mistral_large3"
+      ],
+      "annotation": "Literal['llama3', 'mistral_large3']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "speculative_config.eagle3_model_arch"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[bool]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.eagle3_one_model"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[List[int]]]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.eagle_choices"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.enable_global_pool"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.end_thinking_phase_token"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[Annotated[int, Gt(gt=0)]]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.global_pool_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[bool]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.greedy_sampling"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.is_keep_all"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.is_public_pool"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.is_use_oldest"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.mask_token_id"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[Annotated[int, Gt(gt=0)]]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.max_concurrency"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[Annotated[int, Ge(ge=0)]]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.max_draft_len"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.max_matching_ngram_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.max_ngram_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.max_non_leaves_per_layer"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.max_total_draft_tokens"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.max_verification_set_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.max_window_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[List[int]]]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.medusa_choices"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.mtp_eagle_one_model"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.num_eagle_layers"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.num_medusa_heads"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.num_nextn_predict_layers"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[float]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.posterior_threshold"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'float'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.relaxed_delta"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.relaxed_topk"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.sa_config.enable_global_pool"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.sa_config.threshold"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[int]]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.target_layer_ids"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[bool]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.use_dynamic_tree"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.use_mtp_vanilla"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.use_rejection_sampling"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.use_relaxed_acceptance_for_thinking"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.write_interval"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "telemetry_config.disabled"
+    },
+    {
+      "allowed_values": [
+        "unknown",
+        "llm_class",
+        "cli_serve",
+        "cli_bench",
+        "cli_eval"
+      ],
+      "annotation": "<enum 'UsageContext'>",
+      "converter": "",
+      "kind": "categorical",
+      "path": "telemetry_config.usage_context"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "tensor_parallel_size"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "slow"
+      ],
+      "annotation": "Literal['auto', 'slow']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "tokenizer_mode"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "trust_remote_code"
+    }
+  ]
+}

@@ -1,0 +1,1521 @@
+# Stability reference for the `trtllm-serve` HTTP request/response schemas.
+#
+# This YAML is the *single source of truth* for the stability status of every
+# field on the Pydantic request and response models in
+# `tensorrt_llm/serve/openai_protocol.py`. The models themselves carry no
+# inline stability annotations — `openai_protocol.py` is an internal module
+# that is not surfaced in any public document, so the metadata stays here.
+#
+# Field kinds
+# -----------
+# Every entry carries a `kind:`:
+#
+#   * `openai`     — defined by OpenAI's HTTP API (matched against
+#                    https://github.com/openai/openai-openapi). We follow OAI's
+#                    contract for these; status is `stable` by default.
+#   * `extension`  — TensorRT-LLM extension on top of the OAI schema. We own
+#                    the stability promise. Status is one of:
+#                        prototype | beta | stable | deprecated
+#
+# How statuses are chosen
+# -----------------------
+# For extension fields, the initial status reflects the field's age in this
+# file's git history (probed via `git log -S<field>`):
+#
+#   * added in the last 6 months  →  prototype
+#   * added 6–12 months ago       →  beta
+#   * added more than 12 months ago →  stable
+#
+# After the initial classification, statuses move only forward:
+#
+#   prototype → beta → stable → deprecated
+#
+# The CI test (`tests/unittest/api_stability/test_serve_api.py`) verifies:
+#   * every YAML-listed field still exists on the live Pydantic model
+#     (catches silent renames / removals);
+#   * every live field on a listed model is in the YAML (catches new fields
+#     landing without a YAML row — the forcing function);
+#   * the YAML `default:` matches the live `model_fields[fname].default`
+#     (catches accidental default changes);
+#   * the YAML `required:` matches `FieldInfo.is_required()` (catches a
+#     required→optional flip, which `default:` alone cannot distinguish
+#     because both render to `None`);
+#   * every `status:` is one of the allowed tags and every `kind:` is one
+#     of the allowed kinds.
+#
+# Helper / inner classes (e.g. `StreamOptions`, `UsageInfo`, `ToolCall`,
+# `DisaggregatedParams`, `ResponseFormat`) are not listed — they ship as
+# part of the OAI protocol shape and the user-facing request/response models
+# above already gate them indirectly through their nested types.
+#
+# The `type:` value on each entry is documentation-only; the gate enforces
+# `(kind, status, default, required)`. Type drift typically surfaces via a
+# default change or a rename, both of which the gate does catch.
+
+models:
+  CompletionRequest:
+    fields:
+      model:
+        kind: openai
+        type: str
+        default: null
+        status: stable
+        required: true
+      prompt:
+        kind: openai
+        type: Union[List[int], List[List[int]], str, List[str]]
+        default: null
+        status: stable
+        required: true
+      best_of:
+        kind: openai
+        type: Optional[int]
+        default: null
+        status: stable
+        required: false
+      echo:
+        kind: openai
+        type: Optional[bool]
+        default: false
+        status: stable
+        required: false
+      frequency_penalty:
+        kind: openai
+        type: Optional[float]
+        default: 0.0
+        status: stable
+        required: false
+      logit_bias:
+        kind: openai
+        type: Optional[Dict[str, float]]
+        default: null
+        status: stable
+        required: false
+      logprobs:
+        kind: openai
+        type: Optional[int]
+        default: null
+        status: stable
+        required: false
+      max_tokens:
+        kind: openai
+        type: Optional[int]
+        default: null
+        status: stable
+        required: false
+      n:
+        kind: openai
+        type: int
+        default: 1
+        status: stable
+        required: false
+      presence_penalty:
+        kind: openai
+        type: Optional[float]
+        default: 0.0
+        status: stable
+        required: false
+      seed:
+        kind: openai
+        type: Optional[int]
+        default: null
+        status: stable
+        required: false
+      stop:
+        kind: openai
+        type: Optional[Union[str, List[str]]]
+        default: <factory:list>
+        status: stable
+        required: false
+      stream:
+        kind: openai
+        type: Optional[bool]
+        default: false
+        status: stable
+        required: false
+      stream_options:
+        kind: openai
+        type: Optional[StreamOptions]
+        default: null
+        status: stable
+        required: false
+      suffix:
+        kind: openai
+        type: Optional[str]
+        default: null
+        status: stable
+        required: false
+      temperature:
+        kind: openai
+        type: Optional[float]
+        default: null
+        status: stable
+        required: false
+      top_p:
+        kind: openai
+        type: Optional[float]
+        default: null
+        status: stable
+        required: false
+      user:
+        kind: openai
+        type: Optional[str]
+        default: null
+        status: stable
+        required: false
+      lora_request:
+        kind: extension
+        type: Optional[LoRARequest]
+        default: null
+        status: beta
+        required: false
+      prompt_ignore_length:
+        kind: extension
+        type: Optional[int]
+        default: 0
+        status: beta
+        required: false
+      use_beam_search:
+        kind: extension
+        type: bool
+        default: false
+        status: stable
+        required: false
+      top_k:
+        kind: extension
+        type: int
+        default: 0
+        status: stable
+        required: false
+      top_p_min:
+        kind: extension
+        type: float
+        default: 0.0
+        status: stable
+        required: false
+      min_p:
+        kind: extension
+        type: float
+        default: 0.0
+        status: stable
+        required: false
+      repetition_penalty:
+        kind: extension
+        type: float
+        default: 1.0
+        status: stable
+        required: false
+      length_penalty:
+        kind: extension
+        type: float
+        default: 1.0
+        status: stable
+        required: false
+      early_stopping:
+        kind: extension
+        type: bool
+        default: false
+        status: stable
+        required: false
+      stop_token_ids:
+        kind: extension
+        type: Optional[List[int]]
+        default: <factory:list>
+        status: stable
+        required: false
+      include_stop_str_in_output:
+        kind: extension
+        type: bool
+        default: false
+        status: stable
+        required: false
+      ignore_eos:
+        kind: extension
+        type: bool
+        default: false
+        status: stable
+        required: false
+      min_tokens:
+        kind: extension
+        type: int
+        default: 0
+        status: stable
+        required: false
+      skip_special_tokens:
+        kind: extension
+        type: bool
+        default: true
+        status: stable
+        required: false
+      spaces_between_special_tokens:
+        kind: extension
+        type: bool
+        default: true
+        status: stable
+        required: false
+      truncate_prompt_tokens:
+        kind: extension
+        type: Optional[Annotated[int, Field(ge=1)]]
+        default: null
+        status: stable
+        required: false
+      return_context_logits:
+        kind: extension
+        type: bool
+        default: false
+        status: stable
+        required: false
+      detokenize:
+        kind: extension
+        type: bool
+        default: true
+        status: beta
+        required: false
+      thinking_token_budget:
+        kind: extension
+        type: Optional[int]
+        default: null
+        status: prototype
+        required: false
+      add_special_tokens:
+        kind: extension
+        type: bool
+        default: true
+        status: stable
+        required: false
+      response_format:
+        kind: extension
+        type: Optional[ResponseFormat]
+        default: null
+        status: stable
+        required: false
+      disaggregated_params:
+        kind: extension
+        type: Optional[DisaggregatedParams]
+        default: null
+        status: stable
+        required: false
+      conversation_params:
+        kind: extension
+        type: Optional[ConversationParams]
+        default: null
+        status: prototype
+        required: false
+
+  CompletionResponseChoice:
+    fields:
+      index:
+        kind: openai
+        type: int
+        default: null
+        status: stable
+        required: true
+      text:
+        kind: openai
+        type: str
+        default: null
+        status: stable
+        required: true
+      token_ids:
+        kind: extension
+        type: Optional[List[int]]
+        default: null
+        status: stable
+        required: false
+      logprobs:
+        kind: openai
+        type: Optional[CompletionLogProbs]
+        default: null
+        status: stable
+        required: false
+      context_logits:
+        kind: extension
+        type: Optional[Union[List[float], List[List[float]]]]
+        default: null
+        status: stable
+        required: false
+      finish_reason:
+        kind: openai
+        type: Optional[str]
+        default: null
+        status: stable
+        required: false
+      stop_reason:
+        kind: extension
+        type: Optional[Union[int, str]]
+        default: null
+        status: stable
+        required: false
+      disaggregated_params:
+        kind: extension
+        type: Optional[DisaggregatedParams]
+        default: null
+        status: stable
+        required: false
+      avg_decoded_tokens_per_iter:
+        kind: extension
+        type: Optional[float]
+        default: null
+        status: beta
+        required: false
+
+  CompletionResponse:
+    fields:
+      id:
+        kind: openai
+        type: str
+        default: <factory:<lambda>>
+        status: stable
+        required: false
+      object:
+        kind: openai
+        type: str
+        default: text_completion
+        status: stable
+        required: false
+      created:
+        kind: openai
+        type: int
+        default: <factory:<lambda>>
+        status: stable
+        required: false
+      model:
+        kind: openai
+        type: str
+        default: null
+        status: stable
+        required: true
+      choices:
+        kind: openai
+        type: List[CompletionResponseChoice]
+        default: null
+        status: stable
+        required: true
+      usage:
+        kind: openai
+        type: UsageInfo
+        default: null
+        status: stable
+        required: true
+      prompt_token_ids:
+        kind: extension
+        type: Optional[Union[List[List[int]], List[int]]]
+        default: null
+        status: stable
+        required: false
+
+  CompletionResponseStreamChoice:
+    fields:
+      index:
+        kind: openai
+        type: int
+        default: null
+        status: stable
+        required: true
+      text:
+        kind: openai
+        type: str
+        default: null
+        status: stable
+        required: true
+      token_ids:
+        kind: extension
+        type: Optional[List[int]]
+        default: null
+        status: stable
+        required: false
+      logprobs:
+        kind: openai
+        type: Optional[CompletionLogProbs]
+        default: null
+        status: stable
+        required: false
+      finish_reason:
+        kind: openai
+        type: Optional[str]
+        default: null
+        status: stable
+        required: false
+      stop_reason:
+        kind: extension
+        type: Optional[Union[int, str]]
+        default: null
+        status: stable
+        required: false
+      avg_decoded_tokens_per_iter:
+        kind: extension
+        type: Optional[float]
+        default: null
+        status: beta
+        required: false
+
+  CompletionStreamResponse:
+    fields:
+      id:
+        kind: openai
+        type: str
+        default: <factory:<lambda>>
+        status: stable
+        required: false
+      object:
+        kind: openai
+        type: str
+        default: text_completion
+        status: stable
+        required: false
+      created:
+        kind: openai
+        type: int
+        default: <factory:<lambda>>
+        status: stable
+        required: false
+      model:
+        kind: openai
+        type: str
+        default: null
+        status: stable
+        required: true
+      choices:
+        kind: openai
+        type: List[CompletionResponseStreamChoice]
+        default: null
+        status: stable
+        required: true
+      usage:
+        kind: openai
+        type: Optional[UsageInfo]
+        default: null
+        status: stable
+        required: false
+
+  ChatCompletionRequest:
+    fields:
+      messages:
+        kind: openai
+        type: List[ChatCompletionMessageParam]
+        default: null
+        status: stable
+        required: true
+      prompt_token_ids:
+        kind: extension
+        type: Optional[List[int]]
+        default: null
+        status: stable
+        required: false
+      model:
+        kind: openai
+        type: str
+        default: null
+        status: stable
+        required: true
+      frequency_penalty:
+        kind: openai
+        type: Optional[float]
+        default: 0.0
+        status: stable
+        required: false
+      logit_bias:
+        kind: openai
+        type: Optional[Dict[str, float]]
+        default: null
+        status: stable
+        required: false
+      logprobs:
+        kind: openai
+        type: Optional[bool]
+        default: false
+        status: stable
+        required: false
+      top_logprobs:
+        kind: openai
+        type: Optional[int]
+        default: 0
+        status: stable
+        required: false
+      max_completion_tokens:
+        kind: openai
+        type: Optional[int]
+        default: null
+        status: stable
+        required: false
+      n:
+        kind: openai
+        type: int
+        default: 1
+        status: stable
+        required: false
+      presence_penalty:
+        kind: openai
+        type: Optional[float]
+        default: 0.0
+        status: stable
+        required: false
+      response_format:
+        kind: openai
+        type: Optional[ResponseFormat]
+        default: null
+        status: stable
+        required: false
+      seed:
+        kind: openai
+        type: Optional[int]
+        default: null
+        status: stable
+        required: false
+      stop:
+        kind: openai
+        type: Optional[Union[str, List[str]]]
+        default: <factory:list>
+        status: stable
+        required: false
+      stream:
+        kind: openai
+        type: Optional[bool]
+        default: false
+        status: stable
+        required: false
+      stream_options:
+        kind: openai
+        type: Optional[StreamOptions]
+        default: null
+        status: stable
+        required: false
+      temperature:
+        kind: openai
+        type: Optional[float]
+        default: null
+        status: stable
+        required: false
+      top_p:
+        kind: openai
+        type: Optional[float]
+        default: null
+        status: stable
+        required: false
+      tools:
+        kind: openai
+        type: Optional[List[ChatCompletionToolsParam]]
+        default: null
+        status: stable
+        required: false
+      tool_choice:
+        kind: openai
+        type: Optional[Union[Literal['none', 'auto'], ChatCompletionNamedToolChoiceParam]]
+        default: none
+        status: stable
+        required: false
+      user:
+        kind: openai
+        type: Optional[str]
+        default: null
+        status: stable
+        required: false
+      reasoning_effort:
+        kind: openai
+        type: Optional[ReasoningEffort | Literal['low', 'medium', 'high']]
+        default: "ReasoningEffort.LOW"
+        status: stable
+        required: false
+      thinking_token_budget:
+        kind: extension
+        type: Optional[int]
+        default: null
+        status: prototype
+        required: false
+      prompt_ignore_length:
+        kind: extension
+        type: Optional[int]
+        default: 0
+        status: beta
+        required: false
+      best_of:
+        kind: extension
+        type: Optional[int]
+        default: null
+        status: stable
+        required: false
+      use_beam_search:
+        kind: extension
+        type: bool
+        default: false
+        status: stable
+        required: false
+      top_k:
+        kind: extension
+        type: int
+        default: 0
+        status: stable
+        required: false
+      top_p_min:
+        kind: extension
+        type: float
+        default: 0.0
+        status: stable
+        required: false
+      min_p:
+        kind: extension
+        type: float
+        default: 0.0
+        status: stable
+        required: false
+      repetition_penalty:
+        kind: extension
+        type: float
+        default: 1.0
+        status: stable
+        required: false
+      length_penalty:
+        kind: extension
+        type: float
+        default: 1.0
+        status: stable
+        required: false
+      early_stopping:
+        kind: extension
+        type: bool
+        default: false
+        status: stable
+        required: false
+      stop_token_ids:
+        kind: extension
+        type: Optional[List[int]]
+        default: <factory:list>
+        status: stable
+        required: false
+      include_stop_str_in_output:
+        kind: extension
+        type: bool
+        default: false
+        status: stable
+        required: false
+      ignore_eos:
+        kind: extension
+        type: bool
+        default: false
+        status: stable
+        required: false
+      min_tokens:
+        kind: extension
+        type: int
+        default: 0
+        status: stable
+        required: false
+      skip_special_tokens:
+        kind: extension
+        type: bool
+        default: true
+        status: stable
+        required: false
+      spaces_between_special_tokens:
+        kind: extension
+        type: bool
+        default: true
+        status: stable
+        required: false
+      truncate_prompt_tokens:
+        kind: extension
+        type: Optional[Annotated[int, Field(ge=1)]]
+        default: null
+        status: stable
+        required: false
+      lora_request:
+        kind: extension
+        type: Optional[LoRARequest]
+        default: null
+        status: beta
+        required: false
+      echo:
+        kind: extension
+        type: bool
+        default: false
+        status: stable
+        required: false
+      add_generation_prompt:
+        kind: extension
+        type: bool
+        default: true
+        status: stable
+        required: false
+      add_special_tokens:
+        kind: extension
+        type: bool
+        default: false
+        status: stable
+        required: false
+      documents:
+        kind: extension
+        type: Optional[List[Dict[str, str]]]
+        default: null
+        status: stable
+        required: false
+      chat_template:
+        kind: extension
+        type: Optional[str]
+        default: null
+        status: stable
+        required: false
+      chat_template_kwargs:
+        kind: extension
+        type: Optional[Dict[str, Any]]
+        default: null
+        status: stable
+        required: false
+      media_io_kwargs:
+        kind: extension
+        type: Optional[Dict[MediaModality, Dict[str, Any]]]
+        default: null
+        status: prototype
+        required: false
+      disaggregated_params:
+        kind: extension
+        type: Optional[DisaggregatedParams]
+        default: null
+        status: stable
+        required: false
+      conversation_params:
+        kind: extension
+        type: Optional[ConversationParams]
+        default: null
+        status: prototype
+        required: false
+      cache_salt:
+        kind: extension
+        type: Optional[str]
+        default: null
+        status: beta
+        required: false
+      agent_hierarchy:
+        kind: extension
+        type: Optional[AgentHierarchy]
+        default: null
+        status: prototype
+        required: false
+      mm_processor_kwargs:
+        kind: extension
+        type: Optional[Dict[str, Any]]
+        default: null
+        status: beta
+        required: false
+
+  ChatCompletionResponseChoice:
+    fields:
+      index:
+        kind: openai
+        type: int
+        default: null
+        status: stable
+        required: true
+      message:
+        kind: openai
+        type: ChatMessage
+        default: null
+        status: stable
+        required: true
+      logprobs:
+        kind: openai
+        type: Optional[ChatCompletionLogProbs]
+        default: null
+        status: stable
+        required: false
+      finish_reason:
+        kind: openai
+        type: Optional[str]
+        default: null
+        status: stable
+        required: false
+      stop_reason:
+        kind: extension
+        type: Optional[Union[int, str]]
+        default: null
+        status: stable
+        required: false
+      mm_embedding_handle:
+        kind: extension
+        type: Optional[Dict[str, Any]]
+        default: null
+        status: beta
+        required: false
+      disaggregated_params:
+        kind: extension
+        type: Optional[DisaggregatedParams]
+        default: null
+        status: stable
+        required: false
+      avg_decoded_tokens_per_iter:
+        kind: extension
+        type: Optional[float]
+        default: null
+        status: beta
+        required: false
+
+  ChatCompletionResponse:
+    fields:
+      id:
+        kind: openai
+        type: str
+        default: <factory:<lambda>>
+        status: stable
+        required: false
+      object:
+        kind: openai
+        type: Literal['chat.completion']
+        default: chat.completion
+        status: stable
+        required: false
+      created:
+        kind: openai
+        type: int
+        default: <factory:<lambda>>
+        status: stable
+        required: false
+      model:
+        kind: openai
+        type: str
+        default: null
+        status: stable
+        required: true
+      choices:
+        kind: openai
+        type: List[ChatCompletionResponseChoice]
+        default: null
+        status: stable
+        required: true
+      usage:
+        kind: openai
+        type: UsageInfo
+        default: null
+        status: stable
+        required: true
+      prompt_token_ids:
+        kind: extension
+        type: Optional[List[int]]
+        default: null
+        status: stable
+        required: false
+
+  ChatCompletionResponseStreamChoice:
+    fields:
+      index:
+        kind: openai
+        type: int
+        default: null
+        status: stable
+        required: true
+      delta:
+        kind: openai
+        type: DeltaMessage
+        default: null
+        status: stable
+        required: true
+      logprobs:
+        kind: openai
+        type: Optional[ChatCompletionLogProbs]
+        default: null
+        status: stable
+        required: false
+      finish_reason:
+        kind: openai
+        type: Optional[str]
+        default: null
+        status: stable
+        required: false
+      stop_reason:
+        kind: extension
+        type: Optional[Union[int, str]]
+        default: null
+        status: stable
+        required: false
+      avg_decoded_tokens_per_iter:
+        kind: extension
+        type: Optional[float]
+        default: null
+        status: beta
+        required: false
+
+  ChatCompletionStreamResponse:
+    fields:
+      id:
+        kind: openai
+        type: str
+        default: <factory:<lambda>>
+        status: stable
+        required: false
+      object:
+        kind: openai
+        type: Literal['chat.completion.chunk']
+        default: chat.completion.chunk
+        status: stable
+        required: false
+      created:
+        kind: openai
+        type: int
+        default: <factory:<lambda>>
+        status: stable
+        required: false
+      model:
+        kind: openai
+        type: str
+        default: null
+        status: stable
+        required: true
+      choices:
+        kind: openai
+        type: List[ChatCompletionResponseStreamChoice]
+        default: null
+        status: stable
+        required: true
+      usage:
+        kind: openai
+        type: Optional[UsageInfo]
+        default: null
+        status: stable
+        required: false
+
+  ResponsesRequest:
+    fields:
+      background:
+        kind: openai
+        type: Optional[bool]
+        default: false
+        status: stable
+        required: false
+      include:
+        kind: openai
+        type: Optional[list[Literal['code_interpreter_call.outputs', 'computer_call_output.output.image_url', 'file_search_call.results', 'message.input_image.image_url', 'message.output_text.logprobs', 'reasoning.encrypted_content'],]]
+        default: null
+        status: stable
+        required: false
+      input:
+        kind: openai
+        type: Union[str, list[ResponseInputOutputItem]]
+        default: null
+        status: stable
+        required: true
+      instructions:
+        kind: openai
+        type: Optional[str]
+        default: null
+        status: stable
+        required: false
+      max_output_tokens:
+        kind: openai
+        type: Optional[int]
+        default: null
+        status: stable
+        required: false
+      max_tool_calls:
+        kind: openai
+        type: Optional[int]
+        default: null
+        status: stable
+        required: false
+      metadata:
+        kind: openai
+        type: Optional[Metadata]
+        default: null
+        status: stable
+        required: false
+      model:
+        kind: openai
+        type: str
+        default: null
+        status: stable
+        required: true
+      parallel_tool_calls:
+        kind: openai
+        type: Optional[bool]
+        default: false
+        status: stable
+        required: false
+      previous_response_id:
+        kind: openai
+        type: Optional[str]
+        default: null
+        status: stable
+        required: false
+      prompt:
+        kind: openai
+        type: Optional[ResponsePrompt]
+        default: null
+        status: stable
+        required: false
+      reasoning:
+        kind: openai
+        type: Optional[Reasoning]
+        default: null
+        status: stable
+        required: false
+      thinking_token_budget:
+        kind: extension
+        type: Optional[int]
+        default: null
+        status: prototype
+        required: false
+      service_tier:
+        kind: openai
+        type: Literal['auto', 'default', 'flex', 'scale', 'priority']
+        default: auto
+        status: stable
+        required: false
+      store:
+        kind: openai
+        type: Optional[bool]
+        default: true
+        status: stable
+        required: false
+      stream:
+        kind: openai
+        type: Optional[bool]
+        default: false
+        status: stable
+        required: false
+      temperature:
+        kind: openai
+        type: Optional[float]
+        default: null
+        status: stable
+        required: false
+      text:
+        kind: openai
+        type: Optional[ResponseTextConfig]
+        default: null
+        status: stable
+        required: false
+      tool_choice:
+        kind: openai
+        type: ToolChoice
+        default: auto
+        status: stable
+        required: false
+      tools:
+        kind: openai
+        type: list[Tool]
+        default: <factory:list>
+        status: stable
+        required: false
+      top_logprobs:
+        kind: openai
+        type: Optional[int]
+        default: 0
+        status: stable
+        required: false
+      top_p:
+        kind: openai
+        type: Optional[float]
+        default: null
+        status: stable
+        required: false
+      truncation:
+        kind: openai
+        type: Optional[Literal['auto', 'disabled']]
+        default: disabled
+        status: stable
+        required: false
+      user:
+        kind: openai
+        type: Optional[str]
+        default: null
+        status: stable
+        required: false
+      request_id:
+        kind: extension
+        type: str
+        default: <factory:<lambda>>
+        status: stable
+        required: false
+
+  ResponsesResponse:
+    fields:
+      id:
+        kind: openai
+        type: str
+        default: <factory:<lambda>>
+        status: stable
+        required: false
+      created_at:
+        kind: openai
+        type: int
+        default: <factory:<lambda>>
+        status: stable
+        required: false
+      instructions:
+        kind: openai
+        type: Optional[str]
+        default: null
+        status: stable
+        required: false
+      metadata:
+        kind: openai
+        type: Optional[Metadata]
+        default: null
+        status: stable
+        required: false
+      model:
+        kind: openai
+        type: str
+        default: null
+        status: stable
+        required: true
+      object:
+        kind: openai
+        type: Literal['response']
+        default: response
+        status: stable
+        required: false
+      output:
+        kind: openai
+        type: list[ResponseOutputItem]
+        default: null
+        status: stable
+        required: true
+      parallel_tool_calls:
+        kind: openai
+        type: bool
+        default: null
+        status: stable
+        required: true
+      temperature:
+        kind: openai
+        type: float
+        default: null
+        status: stable
+        required: true
+      tool_choice:
+        kind: openai
+        type: ToolChoice
+        default: null
+        status: stable
+        required: true
+      tools:
+        kind: openai
+        type: list[Tool]
+        default: null
+        status: stable
+        required: true
+      top_p:
+        kind: openai
+        type: float
+        default: null
+        status: stable
+        required: true
+      background:
+        kind: openai
+        type: bool
+        default: null
+        status: stable
+        required: true
+      max_output_tokens:
+        kind: openai
+        type: Optional[int]
+        default: null
+        status: stable
+        required: false
+      max_tool_calls:
+        kind: openai
+        type: Optional[int]
+        default: null
+        status: stable
+        required: false
+      previous_response_id:
+        kind: openai
+        type: Optional[str]
+        default: null
+        status: stable
+        required: false
+      prompt:
+        kind: openai
+        type: Optional[ResponsePrompt]
+        default: null
+        status: stable
+        required: false
+      reasoning:
+        kind: openai
+        type: Optional[Reasoning]
+        default: null
+        status: stable
+        required: false
+      service_tier:
+        kind: openai
+        type: Literal['auto', 'default', 'flex', 'scale', 'priority']
+        default: null
+        status: stable
+        required: true
+      status:
+        kind: openai
+        type: ResponseStatus
+        default: null
+        status: stable
+        required: true
+      text:
+        kind: openai
+        type: Optional[ResponseTextConfig]
+        default: null
+        status: stable
+        required: false
+      top_logprobs:
+        kind: openai
+        type: int
+        default: null
+        status: stable
+        required: true
+      truncation:
+        kind: openai
+        type: Literal['auto', 'disabled']
+        default: null
+        status: stable
+        required: true
+      usage:
+        kind: openai
+        type: Optional[ResponseUsage]
+        default: null
+        status: stable
+        required: false
+      user:
+        kind: openai
+        type: Optional[str]
+        default: null
+        status: stable
+        required: false
+
+  ImageGenerationRequest:
+    fields:
+      prompt:
+        kind: openai
+        type: str
+        default: null
+        status: stable
+        required: true
+      response_format:
+        kind: openai
+        type: Literal['url', 'b64_json']
+        default: url
+        status: stable
+        required: false
+      format:
+        kind: extension
+        type: Literal['png', 'webp', 'jpeg', 'safetensors', 'pt']
+        default: png
+        status: stable
+        required: false
+      seed:
+        kind: extension
+        type: Optional[int]
+        default: null
+        status: stable
+        required: false
+      size:
+        kind: openai
+        type: Optional[str]
+        default: null
+        status: stable
+        required: false
+      width:
+        kind: extension
+        type: Optional[int]
+        default: null
+        status: stable
+        required: false
+      height:
+        kind: extension
+        type: Optional[int]
+        default: null
+        status: prototype
+        required: false
+      num_inference_steps:
+        kind: extension
+        type: Optional[int]
+        default: null
+        status: prototype
+        required: false
+      guidance_scale:
+        kind: extension
+        type: Optional[float]
+        default: null
+        status: prototype
+        required: false
+      max_sequence_length:
+        kind: extension
+        type: Optional[int]
+        default: null
+        status: prototype
+        required: false
+      negative_prompt:
+        kind: extension
+        type: Optional[str]
+        default: null
+        status: prototype
+        required: false
+      n:
+        kind: openai
+        type: Optional[int]
+        default: null
+        status: stable
+        required: false
+      extra_params:
+        kind: extension
+        type: Optional[Dict[str, Any]]
+        default: null
+        status: prototype
+        required: false
+      model:
+        kind: openai
+        type: Optional[str]
+        default: null
+        status: stable
+        required: false
+      quality:
+        kind: openai
+        type: Optional[Literal['standard', 'hd']]
+        default: null
+        status: stable
+        required: false
+      style:
+        kind: openai
+        type: Optional[Literal['vivid', 'natural']]
+        default: null
+        status: stable
+        required: false
+      user:
+        kind: openai
+        type: Optional[str]
+        default: null
+        status: stable
+        required: false
+
+  ImageGenerationResponse:
+    fields:
+      created:
+        kind: openai
+        type: int
+        default: <factory:<lambda>>
+        status: stable
+        required: false
+      data:
+        kind: openai
+        type: List[ImageObject]
+        default: null
+        status: stable
+        required: true
+      output_format:
+        kind: extension
+        type: Literal['png', 'webp', 'jpeg', 'safetensors', 'pt']
+        default: png
+        status: prototype
+        required: false
+      quality:
+        kind: extension
+        type: Literal['low', 'medium', 'high']
+        default: medium
+        status: prototype
+        required: false
+      size:
+        kind: extension
+        type: Optional[str]
+        default: null
+        status: beta
+        required: false
+
+  VideoGenerationRequest:
+    fields:
+      prompt:
+        kind: extension
+        type: str
+        default: null
+        status: stable
+        required: true
+      response_format:
+        kind: extension
+        type: Literal['url', 'b64_json']
+        default: url
+        status: stable
+        required: false
+      format:
+        kind: extension
+        type: Literal['mp4', 'avi', 'auto', 'safetensors', 'pt']
+        default: auto
+        status: stable
+        required: false
+      seed:
+        kind: extension
+        type: Optional[int]
+        default: null
+        status: stable
+        required: false
+      input_reference:
+        kind: extension
+        type: Optional[Union[str, UploadFile]]
+        default: null
+        status: prototype
+        required: false
+      size:
+        kind: extension
+        type: Optional[str]
+        default: null
+        status: beta
+        required: false
+      width:
+        kind: extension
+        type: Optional[int]
+        default: null
+        status: stable
+        required: false
+      height:
+        kind: extension
+        type: Optional[int]
+        default: null
+        status: prototype
+        required: false
+      num_frames:
+        kind: extension
+        type: Optional[int]
+        default: null
+        status: prototype
+        required: false
+      seconds:
+        kind: extension
+        type: Optional[float]
+        default: null
+        status: prototype
+        required: false
+      frame_rate:
+        kind: extension
+        type: Optional[float]
+        default: null
+        status: prototype
+        required: false
+      num_inference_steps:
+        kind: extension
+        type: Optional[int]
+        default: null
+        status: prototype
+        required: false
+      guidance_scale:
+        kind: extension
+        type: Optional[float]
+        default: null
+        status: prototype
+        required: false
+      max_sequence_length:
+        kind: extension
+        type: Optional[int]
+        default: null
+        status: prototype
+        required: false
+      negative_prompt:
+        kind: extension
+        type: Optional[str]
+        default: null
+        status: prototype
+        required: false
+      extra_params:
+        kind: extension
+        type: Optional[Dict[str, Any]]
+        default: null
+        status: prototype
+        required: false
+      model:
+        kind: extension
+        type: Optional[str]
+        default: null
+        status: stable
+        required: false

@@ -39,11 +39,6 @@ bool getBoolEnv(char const* name);
 // XQA kernels (optimized kernels for generation phase).
 bool forceXQAKernels();
 
-// Whether XQA JIT is enabled.
-//
-// Returns the value of TRTLLM_ENABLE_XQA_JIT env var. If such env var doesn't exist, std::nullopt is returned.
-std::optional<bool> getEnvEnableXQAJIT();
-
 // 0 means to use heuristics.
 std::optional<int32_t> getEnvXqaBlocksPerSequence();
 
@@ -143,6 +138,8 @@ bool getEnvKVCacheTransferUseSyncBuffer();
 size_t getEnvKVCacheSendMaxConcurrenceNum();
 
 size_t getEnvMemSizeForKVCacheTransferBuffer();
+
+bool getEnvKVCachePoolUseFabricMemory();
 
 uint16_t getEnvNixlPort();
 

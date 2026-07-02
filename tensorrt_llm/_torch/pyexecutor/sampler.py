@@ -83,6 +83,7 @@ from tensorrt_llm.sampling_params import (
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..speculative.interface import get_force_num_accepted_tokens
 from ..speculative.spec_tree_manager import SpecTreeManager
+from ..utils import torch_multi_arange
 from .finish_reason import FinishedState
 from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from .resource_manager import ResourceManager, ResourceManagerType
@@ -100,7 +101,6 @@ from .sampling_utils import (
     resolve_sampling_strategy,
     sample,
     sample_rejected,
-    torch_multi_arange,
 )
 from .scheduler import ScheduledRequests
 
@@ -291,8 +291,64 @@ class EarlyStopSampler(Sampler[SampleState[SampleStateTensors, SampleStateTensor
 @dataclass(kw_only=True)
 class MultimodalResult:
     mm_embeddings: List[torch.Tensor]
+    # needed to torch.split the mm_embeddings into item-wise chunks
+    mm_embedding_lengths: List[List[int]]
+    # needed when requests mix text-only and multimodal ones
+    mm_embedding_request_indices: List[int]
+    # number of context requests in the batch
+    num_context_requests: int
     # Can be used to include e.g. `mrope_position_ids`, etc.
     extra_data: Optional[Dict[str, Any]] = None
+
+    def __post_init__(self) -> None:
+        num_embeddings = len(self.mm_embeddings)
+        num_lengths = len(self.mm_embedding_lengths)
+        if num_lengths != num_embeddings:
+            raise ValueError(
+                "mm_embedding_lengths batch size does not match mm_embeddings: "
+                f"{num_lengths} != {num_embeddings}"
+            )
+        num_request_indices = len(self.mm_embedding_request_indices)
+        if num_request_indices != num_embeddings:
+            raise ValueError(
+                "mm_embedding_request_indices batch size does not match "
+                f"mm_embeddings: {num_request_indices} != {num_embeddings}"
+            )
+        for result_index, (mm_embedding, mm_embedding_lengths) in enumerate(
+            zip(self.mm_embeddings, self.mm_embedding_lengths, strict=True)
+        ):
+            actual_rows = len(mm_embedding)
+            expected_rows = sum(mm_embedding_lengths)
+            if actual_rows != expected_rows:
+                raise ValueError(
+                    f"mm_embedding shape mismatch for result {result_index}: "
+                    f"{actual_rows} != {expected_rows}"
+                )
+        for request_index in self.mm_embedding_request_indices:
+            if request_index < 0 or request_index >= self.num_context_requests:
+                raise ValueError(
+                    "mm_embedding_request_indices contains an invalid request "
+                    f"index: {request_index} not in [0, {self.num_context_requests})"
+                )
+
+    @classmethod
+    def from_model_outputs(
+        cls, model_outputs: Dict[str, Any], num_context_requests: int
+    ) -> "MultimodalResult":
+        result_keys = {
+            "mm_embeddings",
+            "mm_embedding_lengths",
+            "mm_embedding_request_indices",
+        }
+        return cls(
+            mm_embeddings=model_outputs["mm_embeddings"],
+            mm_embedding_lengths=model_outputs["mm_embedding_lengths"],
+            mm_embedding_request_indices=model_outputs["mm_embedding_request_indices"],
+            num_context_requests=num_context_requests,
+            extra_data={
+                key: value for key, value in model_outputs.items() if key not in result_keys
+            },
+        )
 
 
 @dataclass(kw_only=True)
@@ -336,11 +392,10 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
         resource_manager: Optional[ResourceManager] = None,
     ) -> SampleState:
         # from model_outputs to MultimodalResult
-        data = MultimodalResult(
-            mm_embeddings=model_outputs.pop("mm_embeddings"),
-            extra_data={**model_outputs},
-        )
         assert not scheduled_requests.generation_requests
+        data = MultimodalResult.from_model_outputs(
+            model_outputs, scheduled_requests.num_context_requests
+        )
         return self.SampleState(requests=scheduled_requests.context_requests, data=data)
 
     @override
@@ -356,26 +411,28 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
         extra_data = state.data.extra_data or {}
         mrope_position_ids = extra_data.get("mrope_position_ids", None)
         mrope_position_deltas = extra_data.get("mrope_position_deltas", None)
-        for i, (request, mm_embedding) in enumerate(zip(requests, mm_embeddings)):
+        for request in requests:
             request.state = LlmRequestState.GENERATION_COMPLETE
             # NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
-            assert request.multimodal_lengths is not None
-            # TODO(TRTLLM-12175): request.multimodal_lengths is a
-            # prompt-side MM-token count and may include non-embedding
-            # special/framing tokens. This validation needs per-item
-            # encoder-output embedding lengths instead.
-            if len(mm_embedding) != sum(request.multimodal_lengths):
-                raise ValueError(
-                    f"mm_embedding shape mismatch: {len(mm_embedding)} != {sum(request.multimodal_lengths)}"
-                )
 
-            request.py_result.append_mm_embeddings(mm_embedding, request.multimodal_lengths)
+        request_indices = state.data.mm_embedding_request_indices
+        for result_index, (request_index, mm_embedding) in enumerate(
+            zip(request_indices, mm_embeddings, strict=True)
+        ):
+            request = requests[request_index]
+            mm_embedding_lengths = state.data.mm_embedding_lengths[result_index]
+
+            request.py_result.append_mm_embeddings(mm_embedding, mm_embedding_lengths)
 
             # Store mrope data if available
             if mrope_position_ids is not None and mrope_position_deltas is not None:
+                mrope_index = (
+                    request_index if len(mrope_position_ids) == len(requests) else result_index
+                )
                 request.py_result.set_mrope_position(
-                    mrope_position_ids[i], mrope_position_deltas[i]
+                    mrope_position_ids[mrope_index],
+                    mrope_position_deltas[mrope_index],
                 )
 
     @override
@@ -3643,6 +3700,26 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     self._prev_first_finish_reasons_host[req.py_seq_slot] = (
                         first_finish_reasons_host[req.py_seq_slot]
                     )
+                if req.is_context_only_request:
+                    beam_search_store = self.store.beam_search_store
+                    assert beam_search_store is not None
+                    assert req.py_seq_slot is not None
+                    beam_width = req.py_beam_width
+                    first_gen_scores = (
+                        beam_search_store.cum_log_probs[req.py_seq_slot, :beam_width]
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    )
+                    first_gen_tokens = [
+                        new_tokens_list[0][req.py_seq_slot][beam_idx]
+                        for beam_idx in range(beam_width)
+                    ]
+                    first_gen_log_probs = [
+                        {token_id: Logprob(logprob=log_prob, rank=None)}
+                        for token_id, log_prob in zip(first_gen_tokens, first_gen_scores)
+                    ]
+                    req.py_result.set_first_gen_log_probs(first_gen_log_probs)
                 req.py_num_accepted_draft_tokens = 0
                 req.py_rewind_len = 0
             else:
@@ -4222,9 +4299,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         new_tokens_cuda.view(-1, *new_tokens_cuda.shape[2:]).scatter_(
             0, batch_dest_indices_1d_cuda, batch_next_tokens_cuda_int
         )
-        new_tokens_host = self._copy_to_host(new_tokens_cuda)
-
-        return new_tokens_host
+        return self._copy_to_host(new_tokens_cuda)
 
     @staticmethod
     @torch.inference_mode()

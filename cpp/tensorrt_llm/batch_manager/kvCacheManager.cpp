@@ -17,12 +17,14 @@
 
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 
+#include "tensorrt_llm/batch_manager/cacheTransBuffer.h"
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/evictionPolicy.h"
 #include "tensorrt_llm/batch_manager/kvCacheTransferManager.h"
 #include "tensorrt_llm/batch_manager/radixBlockTree.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/executor/executor.h"
@@ -518,6 +520,14 @@ bool KVCacheBlock::isFull() const
 bool KVCacheBlock::isLeaf() const
 {
     return !mLookupNode || !mLookupNode->hasChildren();
+}
+
+bool KVCacheBlock::isDetached() const
+{
+    // A block is "detached" when it is not registered in the reuse lookup tree
+    // (mLookupNode == nullptr), i.e. it holds no state that future requests can reuse.
+    // This mirrors the reuse condition used by isShared().
+    return mLookupNode == nullptr;
 }
 
 // This function calculates the number of block a layer should have, given
@@ -1084,6 +1094,23 @@ void WindowBlockManager::allocatePools(bool useUvm)
 {
     constexpr nvinfer1::DataType kScaleDtypeNVFP4 = nvinfer1::DataType::kFP8;
 
+    bool const requestFabricMemory = tc::getEnvKVCachePoolUseFabricMemory();
+    bool const fabricMemorySupported = FabricMemory::supportFabricMemory();
+    if (requestFabricMemory && !fabricMemorySupported)
+    {
+        TLLM_LOG_WARNING(
+            "[%s] TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY=1 was set but fabric memory is not supported on this "
+            "platform (FabricMemory::supportFabricMemory() returned false); falling back to standard GPU "
+            "allocation.",
+            mLogPrefix.c_str());
+    }
+    bool const useFabricMemory = requestFabricMemory && fabricMemorySupported;
+
+    if (useFabricMemory)
+    {
+        TLLM_LOG_INFO("[%s] KV cache pool using fabric memory for MNNVL support", mLogPrefix.c_str());
+    }
+
     // Allocate a memory pool backing the blocks for each numKvHeads
     // TODO(oargov): allocate pools in a single buffer and split it, to avoid fragmentation
     for (auto& pool : mPools)
@@ -1116,9 +1143,27 @@ void WindowBlockManager::allocatePools(bool useUvm)
             cacheShape.d[2], cacheShape.d[3], pool.layerFirstLayout ? " (layer-first)" : "");
 
         if (useUvm)
+        {
             pool.primaryPtr = BufferManager::managed(cacheShape, poolDtype);
+        }
+        else if (useFabricMemory)
+        {
+            auto const numElements = ITensor::volume(cacheShape);
+            auto const elementSize = tc::getDTypeSize(poolDtype);
+            auto const totalBytes = static_cast<size_t>(numElements) * elementSize;
+
+            // Record ownership before exposing the raw pointer: if FabricMemory's ctor throws nothing
+            // is wrapped; if ITensor::wrap throws afterwards, the unique_ptr in mFabricMemoryPools
+            // still owns and will free the allocation.
+            mFabricMemoryPools.reserve(mFabricMemoryPools.size() + 1);
+            mFabricMemoryPools.emplace_back(std::make_unique<FabricMemory>(totalBytes));
+            pool.primaryPtr = ITensor::wrap(mFabricMemoryPools.back()->getPtr(), poolDtype, cacheShape, numElements);
+        }
         else
+        {
             pool.primaryPtr = mBufferManager.gpuSync(cacheShape, poolDtype);
+        }
+
         if (mNumSecondaryBlocks > 0)
         {
             nvinfer1::Dims cacheShapeOffload = isRecurrentState()
@@ -1141,6 +1186,12 @@ void BlockManager::releasePools()
 
 void WindowBlockManager::releasePools()
 {
+    if (mTransferManager)
+    {
+        mTransferManager->syncTransfers();
+    }
+    mBufferManager.getStream().synchronize();
+
     for (auto& pool : mPools)
     {
         if (pool.primaryPtr)
@@ -1152,7 +1203,8 @@ void WindowBlockManager::releasePools()
             pool.secondaryPtr->release();
         }
     }
-    mBufferManager.getStream().synchronize();
+    // Release fabric memory backing (must happen after ITensor release).
+    mFabricMemoryPools.clear();
     mBufferManager.memoryPoolTrimTo(0);
 }
 
@@ -1905,7 +1957,19 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
         }
     }
 
-    // Finalize matched token count (purge trailing placeholders for recurrent states)
+    // Finalize matched token count
+
+    // claimResult.totalMatchedTokens > claimResult.numSharedContextBlocks * mTokensPerBlock means that the KV block of
+    // the last matched tokens was not copied we need to regenerate the KV of the last matched tokens, so we round down
+    // the prepopulated prompt length to the last shared context block
+    if (claimResult.totalMatchedTokens > claimResult.numSharedContextBlocks * mTokensPerBlock)
+    {
+        TLLM_LOG_DEBUG("onboardAndAllocateBlocks - rounding down claimResult.totalMatchedTokens to %d",
+            claimResult.totalMatchedTokens);
+        claimResult.totalMatchedTokens = claimResult.numSharedContextBlocks * mTokensPerBlock;
+    }
+
+    // purge trailing placeholders for recurrent states
     auto numMatchedTokens = claimResult.totalMatchedTokens;
     if (isRecurrentState())
     {
@@ -2076,7 +2140,7 @@ std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKe
     for (auto const& blockedUniqueTokensList : blockedUniqueTokens)
     {
         blockKeys.emplace_back(blockKey.usesExtraIds, blockKey.loraTaskId, blockedUniqueTokensList, blockKey.extraKeys,
-            blockKey.cacheSaltID);
+            blockKey.cacheSalt);
     }
     return searchReuseTree(blockKeys);
 }
@@ -3118,7 +3182,9 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
         // mRefCount==0 and are silently ignored by EvictionPolicy::releaseBlock().
         if (!block->hasRefs())
         {
-            mEvictionPolicy->releaseBlock(block);
+            // Send block to front of free queue if it has no reusable state,
+            // so detached blocks are evicted before blocks cached for reuse.
+            mEvictionPolicy->releaseBlock(block, /*toFront = */ block->isDetached());
         }
     }
     // Remove stored block ids in sequence
@@ -3376,19 +3442,26 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
             // Use the cached summary if provided; otherwise perform a fresh tree walk.
             auto const summary
                 = cachedSummary.has_value() ? cachedSummary.value() : analyzePrefixReuse(req.getUniqueTokens(0), req);
-            auto const numReusableBlocks = summary.reusableBlocksAllocated;
             auto const promptInputLen = std::min(req.mPromptLen, windowSize + mChunkSize);
             // Sequence insertion ignores the last prompt token because its KV cannot be recovered.
             // When the prompt lands exactly on a block boundary, counting reusable full blocks from
             // all unique tokens can over-credit one extra shared block.
             TLLM_CHECK_WITH_INFO(promptInputLen > 0, "Unexpected: promptInputLen == 0");
             auto const maxRecoverableSharedBlocks = (promptInputLen - 1) / getTokensPerBlock();
-            // Only subtract from shared blocks (reusable blocks are always shared)
-            auto const reusableSharedBlocks
-                = std::min(numReusableBlocks, std::min(numSharedBlocks, maxRecoverableSharedBlocks));
-            numRequiredBlocks -= reusableSharedBlocks;
-            // Store on request so the micro batch scheduler can use it for token budget
-            req.setEstimatedReusableTokens(reusableSharedBlocks * getTokensPerBlock());
+            // Block (capacity) budget: only allocated reuse reduces free-pool demand. A free-but-cached
+            // block still pulls one block from the free pool when reused, so crediting it here would
+            // double-count the eviction policy's free count and over-admit requests. Only subtract from
+            // shared blocks, since reusable blocks are always shared.
+            auto const reusableAllocatedBlocks
+                = std::min({summary.reusableBlocksAllocated, numSharedBlocks, maxRecoverableSharedBlocks});
+            numRequiredBlocks -= reusableAllocatedBlocks;
+            // Token (compute) budget: all cached prefix blocks skip recompute regardless of ref state,
+            // since the engine recovers their KV via prepopulatedPromptLen. This matches the accounting
+            // in getRemainingBlocksToCompletion (GUARANTEED_NO_EVICT) so the micro batch scheduler does
+            // not under-credit reuse and serialize context requests.
+            auto const reusableAllBlocks
+                = std::min({summary.reusableBlocksAll, numSharedBlocks, maxRecoverableSharedBlocks});
+            req.setEstimatedReusableTokens(reusableAllBlocks * getTokensPerBlock());
         }
         return numRequiredBlocks;
     }
@@ -4406,6 +4479,79 @@ std::vector<std::vector<SizeType32>> const& KVCacheManager::getCacheBlockIds(
     RequestIdType requestId, SizeType32 windowSize) const
 {
     return getSequence(requestId).getCacheBlockIds(windowSize);
+}
+
+std::vector<executor::IdType> KVCacheManager::commitAndGetBlockHashesForRequest(
+    LlmRequest const& llmRequest, SizeType32 windowSize)
+{
+    constexpr SizeType32 beamIdx = 0;
+    TLLM_CHECK_WITH_INFO(
+        llmRequest.getTokens().size() == 1, "commitAndGetBlockHashesForRequest only supports beam width 1.");
+
+    auto const& sequence = getSequence(llmRequest.mRequestId);
+
+    // Under sliding-window attention, detached front blocks remain in the cache block ID list
+    // (see WindowBlockManager::detachFrontBlock) but no longer correspond to token range
+    // [b * tokensPerBlock, ...). Walking them here would hash/mutate recycled blocks and break
+    // the index<->token alignment this method relies on, so fail fast until SWA is supported.
+    TLLM_CHECK_WITH_INFO(sequence.getNumFrontBlocksRemoved(windowSize) == 0,
+        "commitAndGetBlockHashesForRequest does not support sliding-window attention with detached front blocks "
+        "(windowSize=%d, request %lu).",
+        windowSize, static_cast<unsigned long>(llmRequest.mRequestId));
+
+    auto const& perBeamBlockIds = sequence.getCacheBlockIds(windowSize);
+    if (perBeamBlockIds.empty() || perBeamBlockIds[beamIdx].empty())
+    {
+        return {};
+    }
+    auto const& blockIds = perBeamBlockIds[beamIdx];
+
+    auto const& uniqueTokens = llmRequest.getUniqueTokens(beamIdx);
+    auto const tokensPerBlock = getTokensPerBlock();
+    // Count full blocks from uniqueTokens.size() (NOT getUsableUniqueTokenCountForReuse).
+    // This is intentional: the connector chain front-runs storeBlocks, committing a block's
+    // hash the moment the block fills -- including a trailing block that lands exactly on a
+    // block boundary. getUsableUniqueTokenCountForReuse subtracts the final unmaterialized
+    // token, which would drop that just-filled trailing block and silently disable
+    // front-running. See KVCacheManagerTest.CommitAndGetBlockHashesFrontRunsTrailingFullBlock.
+    auto const numFullTokenBlocks = static_cast<SizeType32>(uniqueTokens.size()) / tokensPerBlock;
+    auto const numAllocatedBlocks = static_cast<SizeType32>(blockIds.size());
+    // The allocator may have allocated a (partial) trailing block; clip to whichever count is
+    // smaller so we never index past either side.
+    auto const limit = std::min(numFullTokenBlocks, numAllocatedBlocks);
+    if (limit == 0)
+    {
+        return {};
+    }
+
+    bool const usesExtraIds = llmRequest.getInputTokensExtraIds().has_value();
+    auto const loraTaskId = llmRequest.getLoraTaskId();
+    auto const cacheSalt = llmRequest.getCacheSalt();
+
+    std::vector<executor::IdType> hashes;
+    hashes.reserve(static_cast<size_t>(limit));
+    for (SizeType32 b = 0; b < limit; ++b)
+    {
+        auto block = mBlockManager.getBlockById(blockIds[b], windowSize);
+        TLLM_CHECK_WITH_INFO(block != nullptr,
+            "commitAndGetBlockHashesForRequest: null block at index %d (blockId=%d, request %lu).", b, blockIds[b],
+            static_cast<unsigned long>(llmRequest.mRequestId));
+        if (!block->isFull())
+        {
+            SizeType32 const tokenStart = b * tokensPerBlock;
+            SizeType32 const tokenEnd = tokenStart + tokensPerBlock;
+            auto extraKeys = generateBlockHashExtraKeys(llmRequest, tokenStart, tokenEnd);
+            VecUniqueTokens blockTokens(uniqueTokens.begin() + tokenStart, uniqueTokens.begin() + tokenEnd);
+            BlockKey blockKey(usesExtraIds, loraTaskId, std::move(blockTokens), std::move(extraKeys), cacheSalt);
+            block->setBlockKey(blockKey, /*isFull=*/true);
+            // setHash() chains through mPrevBlockInSeq, which was wired in addBlockToBeam. The
+            // loop walks blocks in allocation order, so by the time we reach block b its
+            // predecessor (if any) has already been committed and exposes a stable hash.
+            block->setHash();
+        }
+        hashes.push_back(static_cast<executor::IdType>(block->getHash()));
+    }
+    return hashes;
 }
 
 std::vector<std::vector<std::vector<SizeType32>>> KVCacheManager::getBatchCacheBlockIds(

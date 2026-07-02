@@ -714,8 +714,9 @@ public:
     /// @param allottedTimeMs The allotted time in milliseconds after which the request is cancelled with a timedOut
     /// finish reason. The request may exceed this time slightly, but at most by 1 forward pass (in pipeline parallelism
     /// that may involve multiple micro-batches). A request can be timed-out before ever being scheduled.
-    /// @param cacheSaltID Salt ID for KV cache blocks to limit the kv cache reuse to the requests with the same string.
     /// @param disaggRequestId Disaggregated request ID.
+    /// @param cacheSalt Optional cache salt string. If provided, KV cache blocks are tagged so reuse is limited to
+    /// requests with the same salt. The string is also surfaced in KV cache events. Defaults to std::nullopt.
     Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming = false,
         SamplingConfig const& samplingConfig = SamplingConfig(), OutputConfig const& outputConfig = OutputConfig(),
         std::optional<SizeType32> const& endId = std::nullopt, std::optional<SizeType32> const& padId = std::nullopt,
@@ -743,8 +744,7 @@ public:
         std::optional<GuidedDecodingParams> guidedDecodingParams = std::nullopt,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt,
-        std::optional<IdType> disaggRequestId = std::nullopt);
+        std::optional<IdType> disaggRequestId = std::nullopt, std::optional<std::string> cacheSalt = std::nullopt);
 
     /// @brief This logits postprocessor name will dispatch to the batched logits postprocessor
     static auto constexpr kBatchedPostProcessorName = "batched";
@@ -758,6 +758,7 @@ public:
     ~Request();
 
     [[nodiscard]] VecTokens getInputTokenIds() const;
+    [[nodiscard]] SizeType32 getNumInputTokens() const;
     [[nodiscard]] SizeType32 getMaxTokens() const;
     [[nodiscard]] bool getStreaming() const;
     [[nodiscard]] SamplingConfig getSamplingConfig() const;
@@ -792,7 +793,7 @@ public:
     [[nodiscard]] std::optional<GuidedDecodingParams> getGuidedDecodingParams() const;
     [[nodiscard]] std::optional<SizeType32> getLanguageAdapterUid() const;
     [[nodiscard]] std::optional<MillisecondsType> getAllottedTimeMs() const;
-    [[nodiscard]] std::optional<CacheSaltIDType> getCacheSaltID() const;
+    [[nodiscard]] std::optional<std::string> getCacheSalt() const;
     [[nodiscard]] std::optional<std::vector<std::string>> getAdditionalOutputNames() const;
     [[nodiscard]] std::optional<IdType> getDisaggRequestId() const;
 
@@ -829,7 +830,7 @@ public:
     void setGuidedDecodingParams(GuidedDecodingParams const& guidedDecodingParams);
     void setLanguageAdapterUid(SizeType32 languageAdapterUid);
     void setAllottedTimeMs(MillisecondsType allottedTimeMs);
-    void setCacheSaltID(CacheSaltIDType cacheSaltID);
+    void setCacheSalt(std::optional<std::string> cacheSalt);
     void setDisaggRequestId(IdType disaggRequestId);
 
 private:
@@ -989,6 +990,8 @@ public:
 
     [[nodiscard]] std::vector<std::pair<SizeType32, SizeType32>> getBatchSizeTable() const;
 
+    bool operator==(DynamicBatchConfig const& other) const;
+
     /// @brief The default value of batch size table
     static std::vector<std::pair<SizeType32, SizeType32>> const kDefaultBatchSizeTable;
 
@@ -1019,7 +1022,7 @@ public:
     explicit SchedulerConfig(
         CapacitySchedulerPolicy capacitySchedulerPolicy = CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT,
         std::optional<ContextChunkingPolicy> contextChunkingPolicy = std::nullopt,
-        std::optional<DynamicBatchConfig> dynamicBatchConfig = std::nullopt);
+        std::optional<DynamicBatchConfig> dynamicBatchConfig = std::nullopt, bool enablePrefixAwareScheduling = true);
 
     bool operator==(SchedulerConfig const& other) const;
 
@@ -1028,6 +1031,8 @@ public:
     [[nodiscard]] std::optional<ContextChunkingPolicy> getContextChunkingPolicy() const;
 
     [[nodiscard]] std::optional<DynamicBatchConfig> getDynamicBatchConfig() const;
+
+    [[nodiscard]] bool getEnablePrefixAwareScheduling() const;
 
 private:
     friend class Serialization;
@@ -1040,6 +1045,9 @@ private:
 
     /// @brief The config for tuning batch size dynamically. See DynamicBatchSizeConfig.
     std::optional<DynamicBatchConfig> mDynamicBatchConfig;
+
+    /// @brief Whether schedulers use KV prefix-reuse estimates for admission and token-budget decisions.
+    bool mEnablePrefixAwareScheduling;
 };
 
 /// @brief Configuration class for the KV cache
@@ -1501,20 +1509,25 @@ public:
         NIXL = 3,
         MOONCAKE = 4
     };
+    static constexpr int kDefaultKvTransferPollIntervalMs = 5000;
+
     explicit CacheTransceiverConfig(std::optional<BackendType> backendType = std::nullopt,
         std::optional<size_t> maxNumTokens = std::nullopt, std::optional<int> kvTransferTimeoutMs = std::nullopt,
-        std::optional<int> kvTransferSenderFutureTimeoutMs = std::nullopt);
+        std::optional<int> kvTransferSenderFutureTimeoutMs = std::nullopt,
+        std::optional<int> kvTransferPollIntervalMs = kDefaultKvTransferPollIntervalMs);
 
     bool operator==(CacheTransceiverConfig const& other) const;
     void setBackendType(std::optional<BackendType> backendType);
     void setMaxTokensInBuffer(std::optional<size_t> maxTokensInBuffer);
     void setKvTransferTimeoutMs(std::optional<int> kvTransferTimeoutMs);
     void setKvTransferSenderFutureTimeoutMs(std::optional<int> kvTransferSenderFutureTimeoutMs);
+    void setKvTransferPollIntervalMs(std::optional<int> kvTransferPollIntervalMs);
 
     [[nodiscard]] std::optional<size_t> getMaxTokensInBuffer() const;
     [[nodiscard]] std::optional<BackendType> getBackendType() const;
     [[nodiscard]] std::optional<int> getKvTransferTimeoutMs() const;
     [[nodiscard]] std::optional<int> getKvTransferSenderFutureTimeoutMs() const;
+    [[nodiscard]] std::optional<int> getKvTransferPollIntervalMs() const;
 
 private:
     std::optional<BackendType> mBackendType;
@@ -1526,6 +1539,9 @@ private:
     // @brief Timeout in milliseconds to wait for the sender future to be ready when scheduled batch size is 0. This
     // allows the request to be eventually cancelled by the user or because of kv_transfer_timeout_ms
     std::optional<int> mKvTransferSenderFutureTimeoutMs;
+    // @brief Bounded wait interval in milliseconds for polling KV transfer progress when active transfers block
+    // disaggregated admission.
+    std::optional<int> mKvTransferPollIntervalMs;
 };
 
 /// @brief Configuration class for the model executor
@@ -1729,13 +1745,14 @@ struct KVCacheStoredBlockData
 
     KVCacheStoredBlockData(IdType blockHash, tensorrt_llm::runtime::VecUniqueTokens tokens,
         std::optional<tensorrt_llm::runtime::LoraTaskIdType> loraId, SizeType32 cacheLevel, SizeType32 priority,
-        std::vector<MmKey> mmKeys = {})
+        std::vector<MmKey> mmKeys = {}, std::optional<std::string> cacheSalt = std::nullopt)
         : blockHash{blockHash}
         , tokens{std::move(tokens)}
         , loraId{loraId}
         , cacheLevel{cacheLevel}
         , priority{priority}
         , mmKeys{std::move(mmKeys)}
+        , cacheSalt{std::move(cacheSalt)}
     {
     }
 
@@ -1751,6 +1768,8 @@ struct KVCacheStoredBlockData
     SizeType32 priority;
     /// @brief The multimodal keys of the block
     std::vector<MmKey> mmKeys;
+    /// @brief The original cache salt string of the block, if any
+    std::optional<std::string> cacheSalt;
 };
 
 struct KVCacheStoredData

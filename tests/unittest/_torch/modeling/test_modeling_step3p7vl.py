@@ -17,11 +17,14 @@
 The text decoder + MTP wiring is covered by ``test_modeling_step3p7.py``; this
 module focuses on the Perception-Encoder vision tower and the VLM registration.
 
-TestStep3p7VisionTower — vision tower component tests (no checkpoint, no GPU).
+TestStep3p7VisionTower — vision tower component tests (no checkpoint).
 A shrunken synthetic ``vision_config`` (see ``_make_tiny_vision_config``) keeps
 the real per-layer geometry (Conv2d patch embed -> pre-LN transformer blocks
 with 2D RoPE + LayerScale -> two stride-2 Conv2d downsamplers -> linear
-projector) while letting the tower build and run on CPU in well under a second:
+projector) while letting the tower build and run in well under a second. The
+2D-RoPE / LayerScale / MLP invariants stay on CPU (float32); the attention,
+block, encoder and tower forwards dispatch through the TRT-LLM ``Attention``
+(TRTLLM FMHA backend) and are therefore GPU-only:
   - 2D RoPE helpers (zero-frequency identity at grid position 0, freq-cache
     shape, dynamic sub-grid selection)
   - LayerScale / fused-QKV attention / MLP / pre-LN block component contracts
@@ -53,6 +56,18 @@ from PIL import Image
 from transformers import PretrainedConfig
 from utils.llm_data import llm_models_root
 
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm.mapping import Mapping
+
+# The PerceptionEncoder head_dim is not in the FMHA cubin set, so the vision
+# attention is dispatched through TRT-LLM's ``Attention`` (TRTLLM backend) with
+# head_dim zero-padding — that path needs a GPU. Module-forward tests are
+# therefore GPU-only; the pure-PyTorch component invariants (2D RoPE, LayerScale,
+# MLP) stay on CPU and remain numerically exact in float32.
+requires_gpu = unittest.skipUnless(
+    torch.cuda.is_available(), "vision attention dispatch requires a GPU"
+)
+
 # The multimodal checkpoint is the same on disk as the text one; the FP8
 # block-scale, NVFP4, and BF16 reference checkpoints all ship the same
 # PerceptionEncoder vision tower (only the text decoder's routed-expert
@@ -67,6 +82,19 @@ def _load_config(checkpoint_dir: str) -> dict:
         return json.load(f)
 
 
+# The vision tower runs through the FMHA dispatch, which requires a bf16/fp16
+# activation dtype; the GPU module-forward tests therefore build the tiny tower
+# in bf16. The CPU component tests construct their modules directly in float32.
+_GPU_DTYPE = torch.bfloat16
+
+# Mirror the engine's encoder runtime sizes (``get_encoder_runtime_sizes`` ->
+# ``encoder_max_batch_size`` / ``encoder_max_num_tokens``, defaulting to
+# ``max_batch_size`` / ``max_num_tokens``). Two distinct axes: requests =
+# image/sequence count budget, tokens = total patch budget.
+_ENCODER_TEST_MAX_NUM_REQUESTS = 2048
+_ENCODER_TEST_MAX_NUM_TOKENS = 8192
+
+
 def _make_tiny_vision_config(
     width: int = 64,
     heads: int = 4,
@@ -77,14 +105,16 @@ def _make_tiny_vision_config(
     use_cls_token: bool = False,
     use_ln_post: bool = False,
     hidden_act: str = "quick_gelu",
+    torch_dtype: torch.dtype = _GPU_DTYPE,
 ) -> PretrainedConfig:
     """Tiny ``vision_config`` mirroring the Step-3.7-Flash PerceptionEncoder.
 
     Field names match the real checkpoint (``width`` / ``heads`` / ``layers``
     rather than ``hidden_size`` / ``num_heads`` / ``num_hidden_layers``) so the
     encoder reads them exactly as it would from ``config.json``. Sizes are
-    shrunk so the tower builds and runs on CPU in well under a second; float32
-    keeps the identity invariants below numerically exact.
+    shrunk so the tower builds and runs in well under a second. The shrunken
+    head_dim (``width // heads`` = 16) is zero-padded to the FMHA-supported 64,
+    exercising the same padding path the real 96 → 128 case uses.
     """
     cfg = PretrainedConfig()
     cfg.model_type = "perception_encoder"
@@ -97,22 +127,22 @@ def _make_tiny_vision_config(
     cfg.ls_init_value = ls_init_value
     cfg.use_cls_token = use_cls_token
     cfg.use_ln_post = use_ln_post
-    cfg.torch_dtype = torch.float32
+    cfg.torch_dtype = torch_dtype
     return cfg
 
 
-def _make_tiny_vision_model_config(text_hidden_size: int = 32, **vision_kwargs):
+def _make_tiny_vision_model_config(
+    text_hidden_size: int = 32, torch_dtype: torch.dtype = _GPU_DTYPE, **vision_kwargs
+):
     """Wrap a tiny vision config in a ``ModelConfig`` the vision tower accepts.
 
     ``Step3p7VisionTower`` reads ``vision_config``, ``text_config.hidden_size``,
     ``torch_dtype``, ``image_token_id`` and ``projector_bias`` off the top-level
     pretrained config; supply just those.
     """
-    from tensorrt_llm._torch.model_config import ModelConfig
-
-    vision_cfg = _make_tiny_vision_config(**vision_kwargs)
+    vision_cfg = _make_tiny_vision_config(torch_dtype=torch_dtype, **vision_kwargs)
     top = PretrainedConfig()
-    top.torch_dtype = torch.float32
+    top.torch_dtype = torch_dtype
     top.vision_config = vision_cfg
     text_cfg = PretrainedConfig()
     text_cfg.hidden_size = text_hidden_size
@@ -122,8 +152,76 @@ def _make_tiny_vision_model_config(text_hidden_size: int = 32, **vision_kwargs):
     return ModelConfig(pretrained_config=top)
 
 
+def _vision_attention_model_config(vision_config: PretrainedConfig) -> ModelConfig:
+    """Single-rank, quant-disabled ``ModelConfig`` for the vision submodules.
+
+    Mirrors what ``Step3p7VisionTower`` builds internally so the attention /
+    block / encoder can be constructed in isolation by the component tests.
+    """
+    return ModelConfig(
+        pretrained_config=vision_config,
+        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        attn_backend="TRTLLM",
+        skip_create_weights_in_init=False,
+    )
+
+
+def _vision_attn_metadata(seq_lens):
+    """Context-only (no KV cache) attention metadata for a flat varlen stream."""
+    from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+
+    md = get_attention_backend("TRTLLM").Metadata(
+        # Non-fan-out: one attention sequence per image, so the request count is
+        # exactly len(seq_lens) and the token count the actual sum.
+        max_num_requests=len(seq_lens),
+        max_num_tokens=int(sum(seq_lens)),
+        kv_cache_manager=None,
+    )
+    md.num_contexts = len(seq_lens)
+    md.request_ids = list(range(1, len(seq_lens) + 1))
+    md.prompt_lens = list(seq_lens)
+    md.seq_lens = torch.tensor(seq_lens, dtype=torch.int)
+    md.max_seq_len = max(seq_lens)
+    md.prepare()
+    return md
+
+
+def _setup_encoder_attn_metadata(module, max_num_tokens: int = _ENCODER_TEST_MAX_NUM_TOKENS):
+    """Mirror the engine's ``_set_up_multimodal_encoder_attn_metadata`` walk.
+
+    The encoder builds its ``AttentionMetadata`` via the engine-driven
+    ``MultimodalEncoderMixin.setup_attn_metadata`` after model load; standalone
+    tests that construct the encoder/tower directly must do the same before the
+    encoder forward. Returns ``module`` for chaining.
+    """
+    from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
+
+    for m in module.modules():
+        if isinstance(m, MultimodalEncoderMixin):
+            m.setup_attn_metadata(
+                max_num_requests=_ENCODER_TEST_MAX_NUM_REQUESTS, max_num_tokens=max_num_tokens
+            )
+    return module
+
+
+@torch.no_grad()
+def _init_finite_weights(module, std: float = 0.02):
+    """Fill all parameters with small finite values.
+
+    TRT-LLM ``Linear`` / ``Attention`` allocate their weights uninitialized;
+    on GPU that surfaces as garbage (``inf``) until a checkpoint is loaded.
+    Value-comparing tests seed deterministic finite weights instead."""
+    for p in module.parameters():
+        p.normal_(0.0, std)
+
+
 class TestStep3p7VisionTower(unittest.TestCase):
-    """Perception-Encoder vision tower tests — no checkpoint and no GPU."""
+    """Perception-Encoder vision tower tests (no checkpoint).
+
+    The 2D-RoPE / LayerScale / MLP component invariants run on CPU in float32.
+    Module-forward tests (attention, block, encoder, tower) dispatch through the
+    TRT-LLM ``Attention`` (TRTLLM FMHA backend) and are GPU-only.
+    """
 
     @staticmethod
     def _downsampled_tokens(grid: int) -> int:
@@ -189,97 +287,204 @@ class TestStep3p7VisionTower(unittest.TestCase):
         self.assertTrue(torch.allclose(ls(x), x * 2.0))
 
     def test_vision_mlp_names_and_shape(self):
-        """The FFN keeps the HF ``c_fc`` / ``c_proj`` parameter names."""
+        """The FFN reuses the TRT-LLM ``MLP`` module (``up_proj`` / ``down_proj``)."""
         from tensorrt_llm._torch.models.modeling_step3p7vl import Step3VisionMLP
 
-        mlp = Step3VisionMLP(hidden_size=8, intermediate_size=16, hidden_act="quick_gelu")
-        self.assertTrue(hasattr(mlp, "c_fc"))
-        self.assertTrue(hasattr(mlp, "c_proj"))
+        mc = _vision_attention_model_config(_make_tiny_vision_config(width=8, heads=2))
+        mlp = Step3VisionMLP(
+            model_config=mc,
+            hidden_size=8,
+            intermediate_size=16,
+            hidden_act="quick_gelu",
+            dtype=torch.float32,
+        )
+        # HF ``c_fc`` / ``c_proj`` are remapped onto the base module's
+        # ``up_proj`` / ``down_proj`` in ``_remap_vision_weights``.
+        self.assertTrue(hasattr(mlp, "up_proj"))
+        self.assertTrue(hasattr(mlp, "down_proj"))
+        self.assertEqual(tuple(mlp.up_proj.weight.shape), (16, 8))
+        self.assertEqual(tuple(mlp.down_proj.weight.shape), (8, 16))
         out = mlp(torch.randn(2, 5, 8))
         self.assertEqual(out.shape, (2, 5, 8))
 
+    @requires_gpu
     def test_vision_attention_fused_qkv_layout_and_shape(self):
-        """HF fused-QKV layout (``in_proj_weight`` / ``in_proj_bias``) and shape."""
-        from tensorrt_llm._torch.models.modeling_step3p7vl import Step3VisionAttention
+        """Ported attention exposes fused ``qkv_proj`` / ``o_proj`` with the
+        FMHA-padded head_dim, and returns the flat ``(num_tokens, hidden)`` shape.
+        """
+        from tensorrt_llm._torch.models.modeling_step3p7vl import (
+            Step3VisionAttention,
+            Step3VisionRope2D,
+        )
 
         hidden, heads, gh, gw = 64, 4, 4, 4
-        attn = Step3VisionAttention(
-            hidden_size=hidden,
-            num_heads=heads,
-            max_grid_height=gh,
-            max_grid_width=gw,
-            use_cls_token=False,
-            use_rope2d=True,
+        mc = _vision_attention_model_config(_make_tiny_vision_config(width=hidden, heads=heads))
+        attn = (
+            Step3VisionAttention(
+                mc, hidden_size=hidden, num_heads=heads, layer_idx=0, dtype=_GPU_DTYPE
+            )
+            .cuda()
+            .eval()
         )
-        self.assertEqual(tuple(attn.in_proj_weight.shape), (3 * hidden, hidden))
-        self.assertEqual(tuple(attn.in_proj_bias.shape), (3 * hidden,))
-        out = attn(torch.randn(2, gh * gw, hidden), grid_hw=(gh, gw))
-        self.assertEqual(out.shape, (2, gh * gw, hidden))
+        # head_dim 16 is padded up to the FMHA-supported 64.
+        self.assertEqual(attn.hf_head_dim, 16)
+        self.assertEqual(attn.head_dim, 64)
+        self.assertEqual(tuple(attn.qkv_proj.weight.shape), (3 * heads * 64, hidden))
+        self.assertEqual(tuple(attn.o_proj.weight.shape), (hidden, heads * 64))
+
+        seq = gh * gw
+        x = torch.randn(2 * seq, hidden, device="cuda", dtype=_GPU_DTYPE)
+        md = _vision_attn_metadata([seq, seq])
+        rope = Step3VisionRope2D(dim=16, max_grid_height=gh, max_grid_width=gw).cuda()
+        freqs = rope.freqs_for_grid((gh, gw), x.device).unsqueeze(1).repeat(2, 1, 1)
+        out = attn(x, md, (freqs.cos(), freqs.sin()))
+        self.assertEqual(out.shape, (2 * seq, hidden))
 
     def test_vision_attention_rejects_indivisible_heads(self):
         """``hidden_size`` not divisible by ``num_heads`` is rejected up front."""
         from tensorrt_llm._torch.models.modeling_step3p7vl import Step3VisionAttention
 
+        mc = _vision_attention_model_config(_make_tiny_vision_config())
         with self.assertRaises(ValueError):
-            Step3VisionAttention(
-                hidden_size=65,
-                num_heads=4,
-                max_grid_height=4,
-                max_grid_width=4,
-                use_cls_token=False,
-                use_rope2d=False,
-            )
+            Step3VisionAttention(mc, hidden_size=65, num_heads=4, layer_idx=0, dtype=torch.float32)
 
+    @requires_gpu
+    def test_vision_attention_matches_reference_sdpa(self):
+        """The padded FMHA path is numerically equal to a raw-SDPA reference.
+
+        Guards the head_dim zero-padding + ``q_scaling`` (softmax scale must be
+        ``hf_head_dim ** -0.5``) + the FULL (bidirectional) mask + 2D RoPE on the
+        real channels: a reference built from the attention's own real (unpadded)
+        QKV/o_proj channels must match the kernel output.
+        """
+        import torch.nn.functional as F
+
+        from tensorrt_llm._torch.models.modeling_step3p7vl import (
+            Step3VisionAttention,
+            Step3VisionRope2D,
+            _apply_rotary_emb,
+        )
+
+        hidden, heads, gh, gw = 64, 4, 4, 4
+        mc = _vision_attention_model_config(_make_tiny_vision_config(width=hidden, heads=heads))
+        attn = (
+            Step3VisionAttention(
+                mc, hidden_size=hidden, num_heads=heads, layer_idx=0, dtype=_GPU_DTYPE
+            )
+            .cuda()
+            .eval()
+        )
+        _init_finite_weights(attn)
+        nh, pd, hf = attn.num_heads, attn.head_dim, attn.hf_head_dim
+        seq = gh * gw
+        x = torch.randn(seq, hidden, device="cuda", dtype=_GPU_DTYPE)
+        rope = Step3VisionRope2D(dim=hf, max_grid_height=gh, max_grid_width=gw).cuda()
+        freqs = rope.freqs_for_grid((gh, gw), x.device).unsqueeze(1)
+
+        out = attn(x, _vision_attn_metadata([seq]), (freqs.cos(), freqs.sin()))
+
+        # Reference: real (unpadded) channels + SDPA with scale = hf ** -0.5.
+        qkv_w = attn.qkv_proj.weight.view(3, nh, pd, hidden)[:, :, :hf, :].reshape(
+            3 * nh * hf, hidden
+        )
+        qkv_b = attn.qkv_proj.bias.view(3, nh, pd)[:, :, :hf].reshape(-1)
+        q, k, v = F.linear(x, qkv_w, qkv_b).chunk(3, dim=-1)
+        q = _apply_rotary_emb(freqs, q.view(seq, nh, hf))
+        k = _apply_rotary_emb(freqs, k.view(seq, nh, hf))
+        v = v.view(seq, nh, hf)
+        ref = F.scaled_dot_product_attention(
+            q.permute(1, 0, 2).unsqueeze(0),
+            k.permute(1, 0, 2).unsqueeze(0),
+            v.permute(1, 0, 2).unsqueeze(0),
+            is_causal=False,
+            scale=hf**-0.5,
+        )
+        ref = ref.squeeze(0).permute(1, 0, 2).reshape(seq, nh * hf)
+        o_w = attn.o_proj.weight.view(hidden, nh, pd)[:, :, :hf].reshape(hidden, nh * hf)
+        ref = F.linear(ref, o_w, attn.o_proj.bias)
+        torch.testing.assert_close(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
+
+    @requires_gpu
     def test_vision_block_zero_layerscale_is_identity(self):
         """With ``ls_init_value=0`` both residual branches are scaled to zero, so
         a pre-LN block reduces to the identity."""
-        from tensorrt_llm._torch.models.modeling_step3p7vl import Step3VisionBlock
+        from tensorrt_llm._torch.models.modeling_step3p7vl import (
+            Step3VisionBlock,
+            Step3VisionRope2D,
+        )
 
         hidden, heads, gh, gw = 64, 4, 4, 4
-        block = Step3VisionBlock(
-            hidden_size=hidden,
-            num_heads=heads,
-            mlp_ratio=2.0,
-            hidden_act="quick_gelu",
-            layer_norm_eps=1e-5,
-            ls_init_value=0.0,
-            max_grid_height=gh,
-            max_grid_width=gw,
-            use_cls_token=False,
-            use_rope2d=True,
-            rope_theta=10000.0,
-            rope_theta_rescale_factor=1.0,
+        mc = _vision_attention_model_config(_make_tiny_vision_config(width=hidden, heads=heads))
+        block = (
+            Step3VisionBlock(
+                mc,
+                layer_idx=0,
+                hidden_size=hidden,
+                num_heads=heads,
+                mlp_ratio=2.0,
+                hidden_act="quick_gelu",
+                layer_norm_eps=1e-5,
+                ls_init_value=0.0,
+                dtype=_GPU_DTYPE,
+            )
+            # The encoder normally casts the whole tower to the model dtype;
+            # do the same here so the directly-built LayerScale/MLP are bf16.
+            .to(_GPU_DTYPE)
+            .cuda()
+            .eval()
         )
-        x = torch.randn(1, gh * gw, hidden)
-        out = block(x, grid_hw=(gh, gw))
-        self.assertTrue(torch.allclose(out, x, atol=1e-6))
+        # Finite attention weights (so 0 * attn is 0, not 0 * inf = NaN), but
+        # keep the LayerScale gammas at their constructed 0 to test the identity.
+        _init_finite_weights(block)
+        block.ls_1.gamma.data.zero_()
+        block.ls_2.gamma.data.zero_()
+        seq = gh * gw
+        x = torch.randn(seq, hidden, device="cuda", dtype=_GPU_DTYPE)
+        rope = Step3VisionRope2D(dim=16, max_grid_height=gh, max_grid_width=gw).cuda()
+        freqs = rope.freqs_for_grid((gh, gw), x.device).unsqueeze(1)
+        out = block(x, _vision_attn_metadata([seq]), (freqs.cos(), freqs.sin()))
+        # ls=0 ⇒ both residual branches contribute nothing ⇒ output == input.
+        self.assertTrue(torch.allclose(out.float(), x.float(), atol=1e-6))
 
     # ----- encoder -------------------------------------------------------
 
+    @requires_gpu
     def test_vision_encoder_forward_output_shape(self):
         """Encoder returns ``(B, (Gh//4)*(Gw//4), 4*width)`` post-downsample."""
         from tensorrt_llm._torch.models.modeling_step3p7vl import Step3p7VisionEncoder
 
         width, patch, image = 64, 8, 64
-        enc = Step3p7VisionEncoder(_make_tiny_vision_config(width=width), dtype=torch.float32)
+        vision_cfg = _make_tiny_vision_config(width=width, patch_size=patch, image_size=image)
+        enc = _setup_encoder_attn_metadata(
+            Step3p7VisionEncoder(
+                _vision_attention_model_config(vision_cfg), vision_cfg, dtype=_GPU_DTYPE
+            )
+            .cuda()
+            .eval()
+        )
         with torch.inference_mode():
-            feats = enc(torch.randn(1, 3, image, image))
+            feats = enc(torch.randn(1, 3, image, image, device="cuda", dtype=_GPU_DTYPE))
         grid = image // patch
         self.assertEqual(feats.shape, (1, self._downsampled_tokens(grid), 4 * width))
 
+    @requires_gpu
     def test_vision_encoder_smaller_image_interpolates_posemb(self):
         """An off-grid (smaller) image triggers bilinear abs-posemb interpolation
         and the RoPE sub-grid path, still yielding a well-formed feature map."""
         from tensorrt_llm._torch.models.modeling_step3p7vl import Step3p7VisionEncoder
 
         width, patch, image = 64, 8, 128  # base grid 16
-        enc = Step3p7VisionEncoder(
-            _make_tiny_vision_config(width=width, patch_size=patch, image_size=image),
-            dtype=torch.float32,
+        vision_cfg = _make_tiny_vision_config(width=width, patch_size=patch, image_size=image)
+        enc = _setup_encoder_attn_metadata(
+            Step3p7VisionEncoder(
+                _vision_attention_model_config(vision_cfg), vision_cfg, dtype=_GPU_DTYPE
+            )
+            .cuda()
+            .eval()
         )
         smaller = 64  # grid 8 < base grid 16
         with torch.inference_mode():
-            feats = enc(torch.randn(1, 3, smaller, smaller))
+            feats = enc(torch.randn(1, 3, smaller, smaller, device="cuda", dtype=_GPU_DTYPE))
         grid = smaller // patch
         self.assertEqual(feats.shape, (1, self._downsampled_tokens(grid), 4 * width))
 
@@ -293,21 +498,27 @@ class TestStep3p7VisionTower(unittest.TestCase):
         self.assertEqual(tower.vit_large_projector.in_features, 4 * 64)
         self.assertEqual(tower.vit_large_projector.out_features, 32)
         self.assertIsNone(tower.vit_large_projector.bias)  # projector_bias=False
-        self.assertEqual(tower.dtype, torch.float32)
+        self.assertEqual(tower.dtype, _GPU_DTYPE)
 
+    @requires_gpu
     def test_vision_tower_encode_projects_to_text_hidden(self):
         """``_encode`` runs the encoder + projector to the text hidden size."""
         from tensorrt_llm._torch.models.modeling_step3p7vl import Step3p7VisionTower
 
-        tower = Step3p7VisionTower(
-            _make_tiny_vision_model_config(
-                text_hidden_size=32, width=64, patch_size=8, image_size=64
+        tower = _setup_encoder_attn_metadata(
+            Step3p7VisionTower(
+                _make_tiny_vision_model_config(
+                    text_hidden_size=32, width=64, patch_size=8, image_size=64
+                )
             )
+            .cuda()
+            .eval()
         )
         with torch.inference_mode():
-            out = tower._encode(torch.randn(1, 3, 64, 64))
+            out = tower._encode(torch.randn(1, 3, 64, 64, device="cuda", dtype=_GPU_DTYPE))
         self.assertEqual(out.shape, (1, self._downsampled_tokens(64 // 8), 32))
 
+    @requires_gpu
     def test_vision_tower_forward_flattens_patches_then_image(self):
         """``forward`` lays each request out as ``[patches... | full image]``.
 
@@ -318,16 +529,23 @@ class TestStep3p7VisionTower(unittest.TestCase):
         from tensorrt_llm._torch.models.modeling_step3p7vl import Step3p7VisionTower
         from tensorrt_llm.inputs.multimodal import MultimodalParams
 
-        tower = Step3p7VisionTower(
-            _make_tiny_vision_model_config(
-                text_hidden_size=32, width=64, patch_size=8, image_size=64
+        tower = _setup_encoder_attn_metadata(
+            Step3p7VisionTower(
+                _make_tiny_vision_model_config(
+                    text_hidden_size=32, width=64, patch_size=8, image_size=64
+                )
             )
+            .cuda()
+            .eval()
         )
         tokens_per_tile = self._downsampled_tokens(64 // 8)
 
+        def _img(*shape):
+            return torch.randn(*shape, device="cuda", dtype=_GPU_DTYPE)
+
         # One full image, no patches → just the full-image block.
         mm_image_only = MultimodalParams(
-            multimodal_data={"image": {"pixel_values": torch.randn(1, 3, 64, 64)}}
+            multimodal_data={"image": {"pixel_values": _img(1, 3, 64, 64)}}
         )
         out = tower.forward([mm_image_only])
         self.assertEqual(len(out), 1)
@@ -337,8 +555,8 @@ class TestStep3p7VisionTower(unittest.TestCase):
         mm_with_patches = MultimodalParams(
             multimodal_data={
                 "image": {
-                    "pixel_values": torch.randn(1, 3, 64, 64),
-                    "patch_pixel_values": torch.randn(2, 3, 64, 64),
+                    "pixel_values": _img(1, 3, 64, 64),
+                    "patch_pixel_values": _img(2, 3, 64, 64),
                     "num_patches": [2],
                 }
             }
@@ -350,18 +568,89 @@ class TestStep3p7VisionTower(unittest.TestCase):
         # No image payload → no embeddings produced.
         self.assertEqual(tower.forward([MultimodalParams(multimodal_data={})]), [])
 
-    def test_vision_tower_load_weights_splits_prefixes(self):
-        """``load_weights`` routes ``vision_model.*`` to the encoder and
-        ``vit_large_projector.*`` to the projector, ignoring unrelated keys."""
+    @requires_gpu
+    def test_vision_tower_batches_across_requests(self):
+        """Batching images across requests yields the same per-request features
+        as encoding each request alone (TODO #2 correctness)."""
+        from tensorrt_llm._torch.models.modeling_step3p7vl import Step3p7VisionTower
+        from tensorrt_llm.inputs.multimodal import MultimodalParams
+
+        tower = _setup_encoder_attn_metadata(
+            Step3p7VisionTower(
+                _make_tiny_vision_model_config(
+                    text_hidden_size=32, width=64, patch_size=8, image_size=64
+                )
+            )
+            .cuda()
+            .eval()
+        )
+        _init_finite_weights(tower)
+        img_a = torch.randn(1, 3, 64, 64, device="cuda", dtype=_GPU_DTYPE)
+        img_b = torch.randn(1, 3, 64, 64, device="cuda", dtype=_GPU_DTYPE)
+        mm_a = MultimodalParams(multimodal_data={"image": {"pixel_values": img_a}})
+        mm_b = MultimodalParams(multimodal_data={"image": {"pixel_values": img_b}})
+
+        with torch.inference_mode():
+            batched = tower.forward([mm_a, mm_b])[0]
+            only_a = tower.forward([mm_a])[0]
+            only_b = tower.forward([mm_b])[0]
+
+        half = batched.shape[0] // 2
+        torch.testing.assert_close(batched[:half].float(), only_a.float(), atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(batched[half:].float(), only_b.float(), atol=2e-2, rtol=2e-2)
+
+    def test_vision_tower_load_weights_remaps_and_routes(self):
+        """``load_weights`` remaps HF fused ``in_proj`` / ``out_proj`` onto the
+        ported ``qkv_proj`` / ``o_proj`` (with head_dim zero-padding) and HF
+        ``mlp.c_fc`` / ``mlp.c_proj`` onto the ported ``up_proj`` / ``down_proj``,
+        routes ``vision_model.*`` / ``vit_large_projector.*`` correctly, and
+        ignores unrelated text-decoder keys."""
         from tensorrt_llm._torch.models.modeling_step3p7vl import Step3p7VisionTower
 
         tower = Step3p7VisionTower(_make_tiny_vision_model_config(text_hidden_size=32, width=64))
-        # ``load_weights`` loads each subtree with ``strict=True``, so supply a
-        # complete vision/projector state built from the modules' own keys, then
-        # override two routed tensors with sentinels to assert correct routing.
-        weights = {
-            f"vision_model.{k}": v.clone() for k, v in tower.vision_model.state_dict().items()
-        }
+        # Seed finite weights so the inverted HF state is meaningful (freshly
+        # allocated TRT-LLM weights are uninitialized and may contain NaN).
+        _init_finite_weights(tower)
+        nh = tower.vision_model.num_heads
+        hidden = tower.vision_model.hidden_size
+        hf = hidden // nh
+
+        # Build an HF-style vision state (in_proj_*/out_proj) by inverting the
+        # current ported state: drop the padded head channels.
+        hf_vision = {}
+        for key, val in tower.vision_model.state_dict().items():
+            if key.endswith(".attn.qkv_proj.weight"):
+                pref = key[: -len("qkv_proj.weight")]
+                pd = val.shape[0] // (3 * nh)
+                hf_vision[pref + "in_proj_weight"] = (
+                    val.view(3, nh, pd, hidden)[:, :, :hf, :].reshape(3 * nh * hf, hidden).clone()
+                )
+            elif key.endswith(".attn.qkv_proj.bias"):
+                pref = key[: -len("qkv_proj.bias")]
+                pd = val.shape[0] // (3 * nh)
+                hf_vision[pref + "in_proj_bias"] = (
+                    val.view(3, nh, pd)[:, :, :hf].reshape(-1).clone()
+                )
+            elif key.endswith(".attn.o_proj.weight"):
+                pref = key[: -len("o_proj.weight")]
+                pd = val.shape[1] // nh
+                hf_vision[pref + "out_proj.weight"] = (
+                    val.view(hidden, nh, pd)[:, :, :hf].reshape(hidden, nh * hf).clone()
+                )
+            elif key.endswith(".attn.o_proj.bias"):
+                hf_vision[key[: -len("o_proj.bias")] + "out_proj.bias"] = val.clone()
+            elif key.endswith(".mlp.up_proj.weight"):
+                hf_vision[key[: -len("up_proj.weight")] + "c_fc.weight"] = val.clone()
+            elif key.endswith(".mlp.up_proj.bias"):
+                hf_vision[key[: -len("up_proj.bias")] + "c_fc.bias"] = val.clone()
+            elif key.endswith(".mlp.down_proj.weight"):
+                hf_vision[key[: -len("down_proj.weight")] + "c_proj.weight"] = val.clone()
+            elif key.endswith(".mlp.down_proj.bias"):
+                hf_vision[key[: -len("down_proj.bias")] + "c_proj.bias"] = val.clone()
+            else:
+                hf_vision[key] = val.clone()
+
+        weights = {f"vision_model.{k}": v for k, v in hf_vision.items()}
         weights.update(
             {
                 f"vit_large_projector.{k}": v.clone()
@@ -378,6 +667,35 @@ class TestStep3p7VisionTower(unittest.TestCase):
         tower.load_weights(weights)
         self.assertTrue(torch.equal(tower.vit_large_projector.weight.detach(), proj_w))
         self.assertTrue(torch.equal(tower.vision_model.conv1.weight.detach(), conv_w))
+
+        # Remap correctness: the loaded fused qkv real channels equal the HF
+        # in_proj, and the appended (padded) channels are exactly zero.
+        blk0 = tower.vision_model.transformer.resblocks[0].attn
+        pd = blk0.head_dim
+        qkv = blk0.qkv_proj.weight.detach().view(3, nh, pd, hidden)
+        self.assertTrue(
+            torch.allclose(
+                qkv[:, :, :hf, :].reshape(3 * nh * hf, hidden),
+                hf_vision["transformer.resblocks.0.attn.in_proj_weight"],
+            )
+        )
+        self.assertEqual(qkv[:, :, hf:, :].abs().max().item(), 0.0)
+
+        # MLP remap: HF ``c_fc`` / ``c_proj`` land verbatim on ``up_proj`` /
+        # ``down_proj`` (no padding -- the FFN dims are kernel-agnostic).
+        blk0_mlp = tower.vision_model.transformer.resblocks[0].mlp
+        self.assertTrue(
+            torch.equal(
+                blk0_mlp.up_proj.weight.detach(),
+                hf_vision["transformer.resblocks.0.mlp.c_fc.weight"],
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                blk0_mlp.down_proj.weight.detach(),
+                hf_vision["transformer.resblocks.0.mlp.c_proj.weight"],
+            )
+        )
 
 
 class TestStep3p7VLRegistration(unittest.TestCase):

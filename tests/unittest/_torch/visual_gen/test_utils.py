@@ -60,7 +60,7 @@ class TestSequenceSharderInactive:
         s = SequenceSharder(size=1, rank=0, group=None)
         cos = torch.randn(1, 4, 8)
         rope = (cos, cos)
-        assert s.shard_rope(rope, seq_len=4) is rope
+        assert s.shard_rope(rope, seq_len=4, seq_dim=1) is rope
 
     def test_disable_enable_no_collectives(self):
         s = SequenceSharder(size=4, rank=0, group=None)
@@ -102,20 +102,24 @@ class TestSequenceSharderShardRope:
         B, S, D = 1, 8, 16
         cos = torch.arange(B * S * D).view(B, S, D).float()
         sin = cos + 1000
-        out = s.shard_rope((cos, sin), seq_len=S)
+        out = s.shard_rope((cos, sin), seq_len=S, seq_dim=1)
         assert out is not None
         oc, osin = out
         assert oc.shape == (1, 4, 16)
         assert torch.equal(oc, cos[:, 4:8].contiguous())
 
-    def test_shard_rope_ambiguous_returns_unchanged(self):
-        """Two axes equal seq_len → no unique dim → passthrough."""
+    def test_shard_rope_explicit_seq_dim_handles_square_layout(self):
+        """``shard_rope`` requires an explicit ``seq_dim``. Square
+        ``(B, S, S)`` layouts dispatch on the caller-supplied axis;
+        the helper does not infer the sequence dimension."""
         s = SequenceSharder(size=2, rank=0, group=None)
         S = 8
         cos = torch.zeros(2, S, S)
         sin = torch.ones(2, S, S)
-        rope = (cos, sin)
-        assert s.shard_rope(rope, seq_len=S) is rope
+        out = s.shard_rope((cos, sin), seq_len=S, seq_dim=1)
+        assert out is not None
+        oc, _osin = out
+        assert oc.shape == (2, 4, S)
 
 
 class TestSequenceSharderFromVgm:
@@ -124,10 +128,14 @@ class TestSequenceSharderFromVgm:
         assert s.size == 1 and s.rank == 0 and not s.is_active
 
     def test_from_vgm_head_divisibility(self):
+        # ``seq_group`` is a callable returning the process group on
+        # the current ``SequenceSharder`` API; the stub uses a fresh
+        # ``object()`` to stand in for a real ``ProcessGroup``.
+        stub_group = object()
         vgm = SimpleNamespace(
             seq_size=4,
             seq_rank=0,
-            seq_group=None,
+            seq_group=lambda: stub_group,
             ulysses_size=2,
         )
         SequenceSharder.from_vgm(vgm, num_attention_heads=8, num_kv_heads=4)

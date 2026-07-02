@@ -178,6 +178,198 @@ def masked_index_copy_group_quant_fp8(
 
 
 @triton.jit
+def _fused_expand_group_quant_fp8(
+    # Source input (original hidden states before expansion)
+    source_input_ptr,
+    # Permutation mapping: expanded_idx -> unpermuted expanded idx
+    perm_to_unperm_ptr,
+    # Output pointers
+    out_q_ptr,
+    out_s_ptr,
+    # Expert offset metadata
+    start_offsets_ptr,
+    row_indices_ptr,
+    # Dimensions
+    row_size,
+    col_size,
+    dim_size,
+    group_size,
+    # Output scale factor size
+    aligned_col,
+    aligned_dim,
+    # Parameters
+    num_source_tokens,
+    eps,
+    fp8_max,
+    # Block size
+    BLOCK: tl.constexpr,
+    NUM_STAGE: tl.constexpr,
+):
+    """Fused expand + group quantize FP8 kernel.
+
+    Combines expandInputRowsKernel and _masked_index_copy_group_quant_fp8
+    into a single pass. Instead of reading from an intermediate expanded
+    buffer, this kernel reads directly from the original (compact) input
+    using the permutation map to find the source row.
+
+    The permuted_row_to_unpermuted_row mapping encodes the original expanded
+    index as: unpermuted_idx = k_rank * num_source_tokens + token_id.
+    Therefore: source_row = unpermuted_idx % num_source_tokens.
+    """
+    group_block = tl.program_id(0)
+    token_block = tl.program_id(1)
+    token_block_num = tl.num_programs(1)
+
+    # calculate group and element offsets
+    num_tokens = tl.load(start_offsets_ptr + row_size)
+    elem_offsets = group_block * group_size * 4 + tl.arange(0, BLOCK)
+    output_s_offs = out_s_ptr + group_block * aligned_col
+
+    # process tokens
+    for token_index in tl.range(token_block,
+                                num_tokens,
+                                token_block_num,
+                                num_stages=NUM_STAGE):
+        # load indices for output placement
+        row_idx = tl.load(row_indices_ptr + token_index)
+        start_offset = tl.load(start_offsets_ptr + row_idx)
+        idx = row_idx * col_size + token_index - start_offset
+        idx_s = row_idx * aligned_dim * aligned_col + token_index - start_offset
+
+        # Compute source row: unpermuted_idx = k_rank * num_source_tokens + token_id
+        unpermuted_idx = tl.load(perm_to_unperm_ptr + token_index)
+        source_row = unpermuted_idx % num_source_tokens
+
+        output_s_int32 = 0
+        for group_index in tl.range(4):
+            # load input data directly from original (compact) source
+            dim_offset = elem_offsets + group_index * group_size
+            valid = dim_offset < dim_size
+            input_data = tl.load(source_input_ptr + source_row * dim_size +
+                                 dim_offset,
+                                 mask=valid,
+                                 other=0.0)
+            # quantization (identical to _masked_index_copy_group_quant_fp8)
+            _absmax = tl.maximum(tl.max(tl.abs(input_data)), eps)
+            output_s = _absmax / fp8_max
+            output_s = tl.exp2(tl.ceil(tl.log2(tl.abs(output_s))))
+            output_q = tl.clamp(input_data / output_s, -fp8_max,
+                                fp8_max).to(out_q_ptr.dtype.element_ty)
+            output_s = output_s.to(tl.int32, bitcast=True) >> 23
+            output_s_int32 += output_s << (group_index * 8)
+
+            # store quantized values
+            tl.store(out_q_ptr + idx * dim_size + dim_offset,
+                     output_q,
+                     mask=valid)
+        tl.store(output_s_offs + idx_s, output_s_int32)
+
+
+def fused_expand_group_quant_fp8(
+    output: torch.Tensor,
+    output_s: torch.Tensor,
+    source_input: torch.Tensor,
+    perm_to_unperm: torch.Tensor,
+    start_offsets: torch.Tensor,
+    row_indices: torch.Tensor,
+    experts_per_token: int,
+    group_size: int,
+    eps: float = 1e-10,
+):
+    """Fused expand + group quantize FP8.
+
+    Instead of reading from the expanded intermediate buffer (permuted_data),
+    this reads directly from the original input using the permutation map.
+    This eliminates the 3.5MB intermediate buffer read, replacing it with
+    indirect reads from the 448KB source (which fits in L2 cache).
+
+    The permutation map encodes: unpermuted_idx = k_rank * num_tokens + token_id.
+    To recover the source row: source_row = unpermuted_idx % num_tokens.
+
+    Args:
+        output: Pre-allocated FP8 output [num_experts, col_size, dim_size]
+        output_s: Pre-allocated scale output
+        source_input: Original input hidden states [num_tokens, dim_size]
+        perm_to_unperm: Mapping from expanded idx to unpermuted expanded idx
+        start_offsets: Expert first token offsets [num_experts + 1]
+        row_indices: Token-to-expert map [num_expanded_tokens]
+        experts_per_token: Number of experts per token (top_k)
+        group_size: Quantization group size (128)
+        eps: Epsilon for numerical stability
+    """
+    assert (
+        source_input.shape[-1] % group_size == 0
+    ), "the last dimension of `source_input` cannot be divisible by `group_size`"
+    assert source_input.is_contiguous(), "`source_input` is not contiguous"
+    assert source_input.ndim == 2, "source_input must be a 2D tensor"
+    assert output.ndim == 3, "Output must be a 3D tensor, [row, col, dim]"
+    assert start_offsets.shape[
+        0] == output.shape[0] + 1, "Start offsets must be (num_experts + 1)"
+
+    row_size = output.shape[0]
+    col_size = output.shape[1]
+    dim_size = output.shape[2]
+
+    alignment = 4
+    scale_dim = (dim_size + group_size - 1) // group_size
+    padded_dim_size = (scale_dim + alignment - 1) // alignment * alignment
+    padded_col_size = (col_size + alignment - 1) // alignment * alignment
+
+    # get block/grid/stage/warp - use num_expanded_tokens for workload sizing
+    num_expanded_tokens = perm_to_unperm.shape[0]
+    num_groups = (dim_size + group_size - 1) // group_size
+    BLOCK = group_size
+    if num_expanded_tokens <= 1000 or col_size <= 256:  # Small workload
+        TOKEN_BLOCK_NUM = 256
+        NUM_STAGES = 4
+        num_warps = 2
+    elif num_expanded_tokens <= 10000 or col_size <= 2048:  # Medium workload
+        TOKEN_BLOCK_NUM = 1024
+        NUM_STAGES = 2
+        num_warps = 1
+    else:  # Large workload
+        TOKEN_BLOCK_NUM = 2048
+        NUM_STAGES = 2
+        num_warps = 1
+    grid = (
+        (num_groups + 3) // 4,
+        TOKEN_BLOCK_NUM,
+    )
+
+    # FP8 quantization parameters
+    finfo = torch.finfo(torch.float8_e4m3fn)
+    fp8_max = finfo.max
+
+    # num_source_tokens is the number of original (compact) input tokens
+    # The perm_to_unperm map encodes: value = k_rank * num_source_tokens + token_id
+    # So source_row = value % num_source_tokens
+    num_source_tokens = source_input.shape[0]
+
+    _fused_expand_group_quant_fp8[grid](
+        source_input,
+        perm_to_unperm,
+        output,
+        output_s,
+        start_offsets,
+        row_indices,
+        row_size,
+        col_size,
+        dim_size,
+        group_size,
+        padded_col_size,
+        padded_dim_size // 4,
+        num_source_tokens,
+        eps,
+        fp8_max,
+        BLOCK=BLOCK,
+        NUM_STAGE=NUM_STAGES,
+        num_warps=num_warps,
+    )
+    output_s = output_s.transpose(1, 2)[:, :col_size, :]
+    return output_s
+
+
+@triton.jit
 def masked_index_gather_kernel(output_ptr, input_ptr, start_offsets_ptr,
                                row_indices_ptr, row_size, col_size, dim_size,
                                BLOCK_SIZE: tl.constexpr):
@@ -418,12 +610,17 @@ def _preprocess_after_permute_kernel(
 
 @nvtx_range("[DG] preprocess_after_permute")
 def preprocess_after_permute(expert_first_token_offset_tensor,
-                             permuted_data_tensor):
+                             num_permuted_tokens):
     """
     Python wrapper that launches a single fused kernel to get the token-to-expert map
     and the number of tokens per expert.
+
+    Only the number of permuted (expanded) tokens is needed here, not the
+    permuted activations themselves. Callers that run moe_permute_op with
+    skip_data_expand=True leave permuted_data_tensor uninitialized, so the count
+    must come from a populated tensor (e.g. permuted_row_to_unpermuted_row_tensor.shape[0]).
     """
-    total_tokens = permuted_data_tensor.shape[0]
+    total_tokens = num_permuted_tokens
     num_experts = expert_first_token_offset_tensor.shape[0] - 1
 
     # create output tensors
@@ -600,6 +797,8 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         VANILLA,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
+        swiglu_limit: Optional[torch.Tensor] = None,
+        swiglu_limit_scalar: Optional[float] = None,
         init_load_balancer: bool = True,
         without_comm: bool = False,
     ):
@@ -629,6 +828,8 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
+            swiglu_limit=swiglu_limit,
+            swiglu_limit_scalar=swiglu_limit_scalar,
             init_load_balancer=init_load_balancer,
             without_comm=without_comm,
         )
@@ -770,13 +971,20 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         assert token_selected_experts is not None
         assert token_final_scales is not None
 
-        # Permutation
+        # Permutation.
+        # skip_data_expand=True computes the permutation maps but skips the
+        # data-copy step (expandInputRowsKernel), so permuted_data_tensor and
+        # permuted_token_final_scales_tensor are returned with UNINITIALIZED
+        # contents (still full-size, just never written). The fused expand+quant
+        # kernel re-derives the activations from x via
+        # permuted_row_to_unpermuted_row_tensor instead, so all unused outputs are
+        # discarded with `_`.
         (
             permuted_row_to_unpermuted_row_tensor,
-            permuted_token_selected_experts_tensor,
-            permuted_data_tensor,
+            _,  # permuted_token_selected_experts_tensor (unused)
+            _,  # permuted_data_tensor (uninitialized under skip_data_expand)
             expert_first_token_offset_tensor,
-            permuted_token_final_scales_tensor,
+            _,  # permuted_token_final_scales_tensor (uninitialized under skip_data_expand)
             unpermuted_row_to_permuted_row_tensor,
         ) = torch.ops.trtllm.moe_permute_op(
             x,
@@ -795,14 +1003,19 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             cluster_rank=self.cluster_rank,
             min_latency_mode=False,
             use_fp8_block_scaling=True,
+            skip_data_expand=True,
         )
 
-        if permuted_data_tensor.numel() == 0:
+        # permuted_row_to_unpermuted_row_tensor has one entry per permuted
+        # (expanded) token, so its length is the expanded token count. Use it
+        # instead of the uninitialized permuted_data_tensor.
+        num_permuted_tokens = permuted_row_to_unpermuted_row_tensor.shape[0]
+        if num_permuted_tokens == 0:
             return torch.zeros_like(x)
 
         # Preprocess after permute
         masked_m, token_to_expert_map = preprocess_after_permute(
-            expert_first_token_offset_tensor, permuted_data_tensor)
+            expert_first_token_offset_tensor, num_permuted_tokens)
 
         expected_m = (token_selected_experts.numel() +
                       self.expert_size_per_partition -
@@ -821,12 +1034,14 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
                                    self.expert_size_per_partition,
                                    scale_k_padded // 4, m_padded)
 
-        act_input_sf = masked_index_copy_group_quant_fp8(
+        act_input_sf = fused_expand_group_quant_fp8(
             act_input_fp8,
             act_input_sf,
-            permuted_data_tensor,
+            x,
+            permuted_row_to_unpermuted_row_tensor,
             expert_first_token_offset_tensor,
             token_to_expert_map,
+            experts_per_token=token_selected_experts.shape[1],
             group_size=128)
 
         # Grouped gemm 1
@@ -861,7 +1076,8 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             input=h1,
             quant_group_size=128,
             masked_m=masked_m,
-            scale_ue8m0=True)
+            scale_ue8m0=True,
+            swiglu_limit=self.swiglu_limit_scalar)
 
         # Grouped gemm 2
         h3 = set_strides(workspace["workspace_1"],
@@ -907,6 +1123,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
+        input_ids: Optional[torch.IntTensor] = None,
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
@@ -919,7 +1136,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
 
         # apply routing
         token_selected_experts, token_final_scales = self.routing_method.apply(
-            router_logits)
+            router_logits, input_ids)
         assert token_selected_experts.shape[
             1] == self.routing_method.experts_per_token
         assert token_selected_experts.shape == token_final_scales.shape
@@ -968,6 +1185,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
         *,
+        input_ids: Optional[torch.IntTensor] = None,
         do_finalize: bool = True,  # used by other MoE backends
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
@@ -1004,7 +1222,8 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             outputs = self.forward_chunk(
                 x,
                 router_logits,
-                output_dtype,
+                input_ids=input_ids,
+                output_dtype=output_dtype,
                 all_rank_num_tokens=all_rank_num_tokens_padded,
                 use_dp_padding=use_dp_padding,
                 workspace=workspaces[0])
@@ -1037,15 +1256,19 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
 
             x_list = x.split(chunk_size_list)
             router_logits_list = router_logits.split(chunk_size_list)
+            input_ids_list = input_ids.split(
+                chunk_size_list) if input_ids is not None else [None
+                                                                ] * num_chunks
 
             self.event_dict[EventType.Main].record()
             with torch.cuda.stream(self.aux_stream):
                 self.event_dict[EventType.Main].wait()
 
-            def _forward_chunk(x_, router_logits_, idx, workspace):
+            def _forward_chunk(x_, router_logits_, input_ids_, idx, workspace):
                 return self.forward_chunk(
                     x_,
                     router_logits_,
+                    input_ids=input_ids_,
                     all_rank_num_tokens=all_rank_num_tokens_list[idx]
                     if self.use_dp else None,
                     use_dp_padding=use_dp_padding,
@@ -1059,19 +1282,20 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
 
             outputs_list = []
             # Postpone reduce-scatter/all-reduce to the next iteration to achieve better overlap
-            for idx_chunk, (x, router_logits) in enumerate(
-                    zip(x_list, router_logits_list)):
+            for idx_chunk, (x, router_logits, input_ids_chunk) in enumerate(
+                    zip(x_list, router_logits_list, input_ids_list)):
 
                 if idx_chunk % 2 == 0:
                     with torch.cuda.stream(self.aux_stream):
-                        outputs = _forward_chunk(x, router_logits, idx_chunk,
+                        outputs = _forward_chunk(x, router_logits,
+                                                 input_ids_chunk, idx_chunk,
                                                  workspace_0)
                     if idx_chunk > 0:
                         outputs_list[-1] = _reducescatter_or_allreduce(
                             outputs_list[-1], idx_chunk - 1)
                 else:
-                    outputs = _forward_chunk(x, router_logits, idx_chunk,
-                                             workspace_1)
+                    outputs = _forward_chunk(x, router_logits, input_ids_chunk,
+                                             idx_chunk, workspace_1)
                     with torch.cuda.stream(self.aux_stream):
                         outputs_list[-1] = _reducescatter_or_allreduce(
                             outputs_list[-1], idx_chunk - 1)

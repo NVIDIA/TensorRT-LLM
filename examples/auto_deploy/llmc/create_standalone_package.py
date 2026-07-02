@@ -67,6 +67,16 @@ AD_TESTS_DIR = os.path.join(REPO_ROOT, "tests", "unittest", "auto_deploy")
 AD_UTILS_TEST_DIR = os.path.join(AD_TESTS_DIR, "_utils_test")
 AD_TORCH_TESTS_DIR = os.path.join(REPO_ROOT, "tests", "unittest", "_torch", "auto_deploy")
 
+# Example/e2e harness sources (Tier-1 e2e: build_and_run_ad.py + model registry).
+# These ship with the package so the standalone install can run e2e models via
+# the same entrypoint as TRT-LLM. Python is rewritten auto_deploy -> llmc; the
+# model_registry YAML is data and copied verbatim.
+AD_EXAMPLES_SRC = os.path.join(REPO_ROOT, "examples", "auto_deploy")
+# Source filename -> destination filename in the standalone package. The e2e
+# entrypoint is renamed to make its scope explicit in the llmc distribution.
+EXAMPLE_FILES = {"build_and_run_ad.py": "build_and_run_llmc_trtllm.py"}
+EXAMPLE_DIRS = ["model_registry"]
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -153,6 +163,8 @@ EXCLUDE_TEST_FILES = {
     "test_torch_gated_delta_rule_cache.py",
     "test_gated_delta_rule_cache.py",
     "test_kv_cache_transformers.py",
+    # trtllm attention backend (insert_cached_attention backend=trtllm) not available standalone
+    "test_kv_cache_trtllm_multipool.py",
     # Require TRT-LLM CUDA causal conv / mamba kernels (ops not registered standalone)
     "test_cuda_causal_conv_cached_op.py",
     "test_triton_causal_conv_cached_op.py",
@@ -183,6 +195,10 @@ EXCLUDE_TEST_FILES = {
     # Imports utils.util.skip_pre_blackwell (not shipped in standalone) and exercises
     # fuse_finegrained_fp8_swiglu which depends on TRT-LLM runtime.
     "test_finegrained_fp8_swiglu.py",
+    # Exercise trtllm-gen MXFP4 MoE kernels (Blackwell-only) and import the
+    # prepare_trtllm_gen_moe_mxfp4_weights / utils.util helpers not in standalone.
+    "test_fuse_mxfp4_moe.py",
+    "test_trtllm_quant_mxfp4_trtllm_gen_moe.py",
 }
 
 # Import path rewrite: old -> new (applied to test files only).
@@ -195,6 +211,7 @@ _IMPORT_TARGET = "llmc"
 _MANAGED_PATHS = [
     "llmc",
     "tests",
+    "runners",
     "pyproject.toml",
     "README.md",
     "LICENSE",
@@ -470,6 +487,35 @@ def _create_test_common_stub(tests_dir: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Example / e2e harness copying
+# ---------------------------------------------------------------------------
+def _copy_runners(output_dir: str) -> int:
+    """Copy the Tier-1 e2e harness into the standalone package under ``runners/trtllm/``.
+
+    ``examples/auto_deploy/build_and_run_ad.py`` is copied to
+    ``runners/trtllm/build_and_run_llmc_trtllm.py`` (see ``EXAMPLE_FILES``) together
+    with its sibling ``model_registry/``. Because the script resolves the registry
+    relative to its own location (``Path(__file__).parent / "model_registry"``),
+    the rename + relocation are safe and ``--use-registry`` keeps working.
+    ``.py`` files get the usual ``auto_deploy -> llmc`` import rewrite (applied by
+    the caller); the ``model_registry`` YAML is data, copied verbatim.
+    """
+    runners_dst = os.path.join(output_dir, "runners", "trtllm")
+    count = 0
+    for src_name, dst_name in EXAMPLE_FILES.items():
+        src = os.path.join(AD_EXAMPLES_SRC, src_name)
+        if os.path.isfile(src):
+            os.makedirs(runners_dst, exist_ok=True)
+            shutil.copy2(src, os.path.join(runners_dst, dst_name))
+            count += 1
+    for dname in EXAMPLE_DIRS:
+        src = os.path.join(AD_EXAMPLES_SRC, dname)
+        if os.path.isdir(src):
+            count += _copy_tree(src, os.path.join(runners_dst, dname))
+    return count
+
+
+# ---------------------------------------------------------------------------
 # Package generation
 # ---------------------------------------------------------------------------
 def _create_pyproject_toml(output_dir: str, dependencies: list, dev_dependencies: list) -> None:
@@ -546,6 +592,15 @@ def create_standalone_package(output_dir: str) -> None:
     rewrite_count = _rewrite_imports_in_dir(os.path.join(output_dir, "tests"))
     print(f"  Copied {test_count} test files to tests/ ({rewrite_count} import rewrites)")
 
+    # 2b. Copy the Tier-1 e2e harness into runners/ (build_and_run_llmc_trtllm.py
+    #     + model_registry) and rewrite its imports auto_deploy -> llmc. YAML is
+    #     left untouched.
+    runner_count = _copy_runners(output_dir)
+    runner_rewrites = _rewrite_imports_in_dir(os.path.join(output_dir, "runners"))
+    print(
+        f"  Copied {runner_count} runner files to runners/trtllm/ ({runner_rewrites} import rewrites)"
+    )
+
     # 3. Resolve dependencies and create pyproject.toml
     pinned = _read_pinned_versions(TRTLLM_REQUIREMENTS)
     dev_pinned = _read_pinned_versions(TRTLLM_DEV_REQUIREMENTS)
@@ -602,6 +657,10 @@ def create_standalone_package(output_dir: str) -> None:
     print("\nTo run tests:     pytest tests/")
     print(
         'To verify:        python -c "from llmc._compat import TRTLLM_AVAILABLE; print(TRTLLM_AVAILABLE)"'
+    )
+    print(
+        "To run e2e:       python runners/trtllm/build_and_run_llmc_trtllm.py "
+        "--model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --use-registry  (needs tensorrt-llm installed)"
     )
 
 

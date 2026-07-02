@@ -13,6 +13,18 @@
       "scenario": "Max Throughput"
     },
     {
+      "command": "trtllm-serve nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4 --config ${TRTLLM_DIR}/examples/configs/curated/nemotron-3-ultra-throughput.yaml",
+      "config_filename": "nemotron-3-ultra-throughput.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/nemotron-3-ultra-throughput.yaml",
+      "config_path": "examples/configs/curated/nemotron-3-ultra-throughput.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/curated/nemotron-3-ultra-throughput.yaml",
+      "gpu_compatibility": "B200, B300, GB200, GB300, H100, H200",
+      "model": "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
+      "model_display_name": "Nemotron v3 Ultra (NVFP4)",
+      "model_url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
+      "scenario": "Max Throughput"
+    },
+    {
       "command": "trtllm-serve Qwen/Qwen3-Next-80B-A3B-Thinking --config ${TRTLLM_DIR}/examples/configs/curated/qwen3-next.yaml",
       "config_filename": "qwen3-next.yaml",
       "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/qwen3-next.yaml",
@@ -22,6 +34,18 @@
       "model": "Qwen/Qwen3-Next-80B-A3B-Thinking",
       "model_display_name": "Qwen3-Next-80B",
       "model_url": "https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Thinking",
+      "scenario": "Max Throughput"
+    },
+    {
+      "command": "trtllm-serve nvidia/Qwen3.5-397B-A17B-NVFP4 --config ${TRTLLM_DIR}/examples/configs/curated/qwen3.5.yaml",
+      "config_filename": "qwen3.5.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/qwen3.5.yaml",
+      "config_path": "examples/configs/curated/qwen3.5.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/curated/qwen3.5.yaml",
+      "gpu_compatibility": "B200, B300, GB200, GB300",
+      "model": "nvidia/Qwen3.5-397B-A17B-NVFP4",
+      "model_display_name": "Qwen3.5-397B-A17B (NVFP4)",
+      "model_url": "https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4",
       "scenario": "Max Throughput"
     },
     {
@@ -142,6 +166,18 @@
       "model": "nvidia/Llama-4-Scout-17B-16E-Instruct-FP8",
       "model_display_name": "Llama 4 Scout (FP8)",
       "model_url": "https://huggingface.co/nvidia/Llama-4-Scout-17B-16E-Instruct-FP8",
+      "scenario": "Max Throughput"
+    },
+    {
+      "command": "trtllm-serve MiniMaxAI/MiniMax-M3-MXFP8 --config ${TRTLLM_DIR}/examples/configs/curated/minimax-m3-throughput.yaml",
+      "config_filename": "minimax-m3-throughput.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/minimax-m3-throughput.yaml",
+      "config_path": "examples/configs/curated/minimax-m3-throughput.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/curated/minimax-m3-throughput.yaml",
+      "gpu_compatibility": "GB200",
+      "model": "MiniMaxAI/MiniMax-M3-MXFP8",
+      "model_display_name": "MiniMax-M3 (MXFP8)",
+      "model_url": "https://huggingface.co/MiniMaxAI/MiniMax-M3-MXFP8",
       "scenario": "Max Throughput"
     }
   ],
@@ -3480,6 +3516,10 @@
     }
   ],
   "models": {
+    "MiniMaxAI/MiniMax-M3-MXFP8": {
+      "display_name": "MiniMax-M3 (MXFP8)",
+      "url": "https://huggingface.co/MiniMaxAI/MiniMax-M3-MXFP8"
+    },
     "Qwen/Qwen3-30B-A3B": {
       "display_name": "Qwen3-30B-A3B",
       "url": "https://huggingface.co/Qwen/Qwen3-30B-A3B"
@@ -3515,6 +3555,14 @@
     "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4": {
       "display_name": "Nemotron v3 Super (NVFP4)",
       "url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+    },
+    "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4": {
+      "display_name": "Nemotron v3 Ultra (NVFP4)",
+      "url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4"
+    },
+    "nvidia/Qwen3.5-397B-A17B-NVFP4": {
+      "display_name": "Qwen3.5-397B-A17B (NVFP4)",
+      "url": "https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4"
     },
     "openai/gpt-oss-120b": {
       "display_name": "gpt-oss-120b",

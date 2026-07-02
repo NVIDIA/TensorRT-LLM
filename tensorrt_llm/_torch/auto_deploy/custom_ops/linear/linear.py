@@ -15,9 +15,19 @@
 
 """Custom ops for linear layers."""
 
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import torch
+
+from ..._compat import get_sm_version
+
+
+def _get_trtllm_cublas_mm() -> Optional[Callable[..., torch.Tensor]]:
+    """Return TRT-LLM's cublas_mm op when it is registered in this process."""
+    try:
+        return torch.ops.trtllm.cublas_mm
+    except (AttributeError, RuntimeError):
+        return None
 
 
 @torch.library.custom_op("auto_deploy::torch_linear_simple", mutates_args=())
@@ -65,6 +75,35 @@ def simple(
     Returns:
         Output tensor of shape ``(..., out_features)``.
     """
+    # Blackwell (sm>=100) + bf16: route any bf16 linear to trtllm::cublas_mm.
+    # Selects single-pass cluster-mode cubins instead of cuBLAS-default
+    # split-K + reduce + zero-fill for small-M (decode) projection GEMMs.
+    # (Same trick PT introduced for GPT-OSS via use_custom_cublas_mm in
+    # modeling_gpt_oss.py; we apply it model-agnostically based on dtype + SM.)
+    if (
+        input.is_cuda
+        and weight.is_cuda
+        and (bias is None or bias.is_cuda)
+        and input.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and get_sm_version() >= 100
+    ):
+        trtllm_cublas_mm = _get_trtllm_cublas_mm()
+        if trtllm_cublas_mm is None:
+            return torch.ops.aten.linear(input, weight, bias)
+
+        # cublas_mm requires 2D mat_a/mat_b. Flatten leading dims and unflatten on exit.
+        in_shape = input.shape
+        input_2d = input.reshape(-1, in_shape[-1])
+        out_2d = trtllm_cublas_mm(
+            input_2d,
+            weight.t(),
+            bias,
+            None,  # out_dtype
+            0,  # output_buffer_kind = DEFAULT
+            None,  # group (no TP)
+        )
+        return out_2d.view(*in_shape[:-1], out_2d.shape[-1])
     return torch.ops.aten.linear(input, weight, bias)
 
 

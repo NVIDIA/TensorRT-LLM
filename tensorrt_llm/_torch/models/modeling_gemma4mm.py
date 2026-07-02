@@ -23,7 +23,6 @@ is native TRT-LLM (``modeling_gemma4_audio.py``). Both replace the previous
 import copy
 import dataclasses
 import math
-import os
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -51,7 +50,12 @@ from ..modules.linear import Linear
 from .modeling_gemma4 import Gemma4ForCausalLM
 from .modeling_gemma4_audio import Gemma4AudioModel
 from .modeling_gemma4_vision import Gemma4VisionModel
-from .modeling_multimodal_utils import find_input_mm_embeds, fuse_input_embeds
+from .modeling_multimodal_utils import (
+    _MULTIMODAL_ENV_NAME,
+    _is_mm_disagg,
+    find_input_mm_embeds,
+    fuse_input_embeds,
+)
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
 
 _MIN_TRANSFORMERS_FOR_GEMMA4 = "5.5.0"
@@ -68,12 +72,6 @@ from transformers import (  # noqa: E402
     PretrainedConfig,
     PreTrainedModel,
 )
-
-_MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
-
-
-def _is_disagg() -> bool:
-    return os.getenv(_MULTIMODAL_ENV_NAME, "0") == "1"
 
 
 class RMSNormNoScale(nn.Module):
@@ -602,7 +600,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         return None
 
     def __init__(self, model_config: ModelConfig[Gemma4Config]):
-        if _is_disagg():
+        if _is_mm_disagg():
             raise NotImplementedError(
                 "Gemma4ForConditionalGeneration does not support "
                 "disaggregated inference yet. Please unset the "
@@ -636,6 +634,13 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             if getattr(config, "video_token_id", None) is not None
             else None
         )
+
+        _mm_ids = [config.image_token_id]
+        if getattr(config, "audio_token_id", None) is not None:
+            _mm_ids.append(config.audio_token_id)
+        if getattr(config, "video_token_id", None) is not None:
+            _mm_ids.append(config.video_token_id)
+        self._mm_token_ids = torch.tensor(_mm_ids, dtype=torch.int32)
 
         model_config_cp = copy.deepcopy(model_config)
         self.model_config = model_config_cp
@@ -769,6 +774,10 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
+
+    @property
+    def vocab_size_padded(self) -> int:
+        return self.llm.vocab_size_padded
 
     @property
     def multimodal_data_device_paths(self) -> List[str]:
@@ -1032,7 +1041,8 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             input_ids=input_ids,
             mm_embeds=mm_embeds,
             mm_token_ids=fuse_token_ids,
-            **kwargs,
+            mm_token_indices=kwargs.get("mm_token_indices"),
+            text_token_indices=kwargs.get("text_token_indices"),
         )
         logits = self.llm.forward(
             attn_metadata=attn_metadata,
@@ -1047,8 +1057,5 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         return logits
 
     @property
-    def mm_token_ids(self):
-        ids = [self.image_token_ids]
-        if self.audio_token_ids is not None:
-            ids.append(self.audio_token_ids)
-        return torch.cat(ids) if len(ids) > 1 else self.image_token_ids
+    def mm_token_ids(self) -> torch.Tensor:
+        return self._mm_token_ids

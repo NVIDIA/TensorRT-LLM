@@ -31,7 +31,8 @@ import numpy as np
 import pytest
 import yaml
 from defs.common import get_free_port_in_ci as get_free_port
-from defs.common import parse_gsm8k_output, wait_for_server
+from defs.common import (parse_gsm8k_output, resolve_llm_model_path,
+                         wait_for_server)
 from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
                            skip_no_hopper, skip_pre_blackwell, skip_pre_hopper)
 from defs.trt_test_alternative import check_call, check_output, print_info
@@ -280,6 +281,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_cache_aware_balance_deepseek_v3.yaml",
         "deepseek_v3_lite_bf16_conditional":
         f"{test_configs_root}/disagg_config_conditional_deepseek_v3.yaml",
+        "deepseek_v3_lite_bf16_conditional_v2":
+        f"{test_configs_root}/disagg_config_conditional_deepseek_v3_v2.yaml",
         "deepseek_v3_lite_fp8_tp1_two_mtp":
         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_two_mtp.yaml",
         "deepseek_v3_lite_fp8_ctxpp2_gentp2_one_mtp":
@@ -308,6 +311,10 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_triton.yaml",
         "qwen3_5_4b_fp8_stress":
         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_qwen3_5_4b_fp8_tllm.yaml",
+        "glm5_nvfp4_tp4_ep4_dp_stress":
+        f"{test_configs_root}/disagg_config_ctxtp4ep4_gentp4ep4_glm5_nvfp4_dp_tllm.yaml",
+        "qwen3_32b_fp8_stress":
+        f"{test_configs_root}/disagg_config_ctxtp1_gentp4_qwen3_32b_fp8.yaml",
         "gpt_oss_120b_harmony":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm.yaml",
         "cancel_stress_test":
@@ -492,6 +499,11 @@ def run_client_tests(example_dir,
                         "The capital of Germany is Berlin",
                         "Using `asyncio` in Python"
                     ]
+                elif "qwen3_32b_fp8" in test_desc:
+                    expected_strings = [
+                        "The capital of Germany is Berlin",
+                        "Asyncio in Python is a library"
+                    ]
                 else:
                     expected_strings = [
                         "The capital of Germany is Berlin",
@@ -618,6 +630,13 @@ def setup_disagg_cluster(
     with open(config_file, 'r') as f:
         config = yaml.safe_load(f)
 
+    speculative_config = config.get("speculative_config")
+    if isinstance(speculative_config, dict):
+        speculative_model = speculative_config.get("speculative_model")
+        if speculative_model:
+            speculative_config["speculative_model"] = resolve_llm_model_path(
+                speculative_model)
+
     disagg_cluster = get_default_disagg_cluster_config()
     server_host = config.get("hostname", "localhost")
     server_port = get_free_port()
@@ -648,6 +667,8 @@ def setup_disagg_cluster(
 
     # Launch workers
     model = model_name or config.get("model")
+    if model:
+        model = resolve_llm_model_path(model)
     ctx_workers = []
     gen_workers = []
     disagg_server = None
@@ -1104,6 +1125,30 @@ def test_disaggregated_overlap_transceiver_runtime_python(
 
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
+    run_disaggregated_test(disaggregated_example_root,
+                           "overlap_transceiver_runtime_python",
+                           env=env,
+                           model_path=llama_model_root,
+                           cwd=llm_venv.get_working_directory())
+
+
+# Exercises the disaggregated KV-cache transfer path with the Python cache transceiver runtime
+# while the KV-cache pool itself is allocated from fabric (MNNVL) VMM memory via
+# TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY=1. Restricted to GB200/GB300 since those are the only
+# platforms with MNNVL fabric-memory support; on other devices the env var would silently fall
+# back to a non-fabric allocation, which would defeat the purpose of this test.
+@pytest.mark.skip_device_not_contain(["GB200", "GB300"])
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_overlap_transceiver_runtime_python_fabric_memory(
+        disaggregated_test_root, llm_venv, disaggregated_example_root,
+        llama_model_root):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
+    env = llm_venv._new_env.copy()
+    env["UCX_TLS"] = get_ucx_tls()
+    env["TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY"] = "1"
     run_disaggregated_test(disaggregated_example_root,
                            "overlap_transceiver_runtime_python",
                            env=env,
@@ -1709,6 +1754,53 @@ def test_disaggregated_deepseek_v3_lite_bf16_conditional(
                            cwd=llm_venv.get_working_directory())
 
 
+# V2 variant of the conditional disagg test: KV manager V2 + Python NIXL transceiver.
+@skip_no_hopper
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_bf16_conditional_v2(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/bf16")
+
+    # Conditional disagg handles short-prefill requests locally on the gen
+    # server (bypassing the ctx handoff + add_per_request_metrics), while routed
+    # requests are recorded in the disagg /perf_metrics. Verify ONCE after all
+    # client iterations via post_client_test (not per-iteration): routed-request
+    # metrics are recorded asynchronously (add_per_request_metrics via
+    # create_task on response completion) and surface only after the client
+    # traffic settles, so a per-iteration read races that lag; /perf_metrics is
+    # also consume-on-read, so query it exactly once at the end.
+    def _check_routed_recorded(server_url: str):
+        import requests as http_requests
+        metrics = []
+        deadline = time.time() + 60
+        while True:
+            resp = http_requests.get(f"{server_url}/perf_metrics", timeout=10)
+            assert resp.status_code == 200, \
+                f"perf_metrics fetch failed: {resp.status_code}"
+            metrics = resp.json()
+            if metrics or time.time() >= deadline:
+                break
+            time.sleep(2)
+        logger.info(f"conditional_v2 perf_metrics len={len(metrics)} "
+                    f"(routed requests recorded; bypassed ones absent)")
+        # With short prompts every prompt's first occurrence routes through the
+        # context server (match=0 -> need_ctx), so at least one routed request
+        # must be recorded; an empty result means conditional routing never
+        # engaged.
+        assert metrics, \
+            "no per-request metrics recorded after client runs; conditional routing may be misconfigured"
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "deepseek_v3_lite_bf16_conditional_v2",
+                           env=llm_venv._new_env,
+                           post_client_test=_check_routed_recorded,
+                           model_path=deepseek_v3_model_root,
+                           cwd=llm_venv.get_working_directory())
+
+
 @skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
@@ -2249,19 +2341,22 @@ def test_llama4_long_context_kv_cache_overflow(disaggregated_test_root,
                              cwd=llm_venv.get_working_directory())
 
 
+@pytest.mark.timeout(2400)
 @pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("prompt_file", ["prompts.json", "long_prompts.json"],
+                         ids=["short_prompt", "long_prompt"])
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root):
+        deepseek_v3_model_root, prompt_file):
     setup_model_symlink(llm_venv, deepseek_v3_model_root,
                         "DeepSeek-V3-Lite/bf16")
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_bf16_tllm_gen_helix",
                            env=llm_venv._new_env,
-                           prompt_file="long_prompts.json",
+                           prompt_file=prompt_file,
                            model_path=deepseek_v3_model_root,
                            cwd=llm_venv.get_working_directory())
 
@@ -2275,8 +2370,30 @@ def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
     model_dir = f"{llm_models_root()}/{model_path}"
     setup_model_symlink(llm_venv, model_dir, model_path)
 
+    env = llm_venv._new_env.copy()
+    tiktoken_vocab = os.path.join(llm_models_root(), "datasets",
+                                  "tiktoken_vocab")
+    env["TIKTOKEN_RS_CACHE_DIR"] = tiktoken_vocab
+    env["TIKTOKEN_ENCODINGS_BASE"] = tiktoken_vocab
+
     run_disaggregated_test(disaggregated_example_root,
                            "gpt_oss_120b_harmony",
+                           env=env,
+                           model_path=model_dir,
+                           cwd=llm_venv.get_working_directory())
+
+
+@skip_pre_hopper
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("model_path", ['Qwen3/Qwen3-32B-FP8'])
+def test_disaggregated_qwen3_32b_fp8(disaggregated_test_root,
+                                     disaggregated_example_root, llm_venv,
+                                     model_path):
+    model_dir = resolve_llm_model_path(model_path)
+    setup_model_symlink(llm_venv, model_dir, model_path)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "qwen3_32b_fp8_stress",
                            env=llm_venv._new_env,
                            model_path=model_dir,
                            cwd=llm_venv.get_working_directory())
@@ -2343,6 +2460,18 @@ def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
                             cancellation_rate=10,
                             cancellation_delay=0.5),
                  marks=(pytest.mark.skip_less_device(2), skip_no_hopper)),
+    pytest.param(TestConfig(model_path='GLM-5-NVFP4',
+                            test_desc='glm5_nvfp4_tp4_ep4_dp_stress',
+                            request_count=35000,
+                            accuracy_threshold=0.90,
+                            cancellation_rate=10,
+                            cancellation_delay=0.5),
+                 marks=(pytest.mark.skip_less_device(8), skip_pre_blackwell)),
+    pytest.param(TestConfig(model_path='Qwen3/Qwen3-32B-FP8',
+                            test_desc='qwen3_32b_fp8_stress',
+                            request_count=10000,
+                            accuracy_threshold=0.42),
+                 marks=(pytest.mark.skip_less_device(8), skip_pre_hopper)),
 ],
                          ids=lambda x: x.test_desc)
 @pytest.mark.parametrize("concurrency", [512], ids=lambda x: f"conc{x}")
@@ -2357,7 +2486,7 @@ def test_disaggregated_stress_test(disaggregated_test_root,
     # Unpack configuration from dataclass
     model_path = test_config.model_path
     test_desc = test_config.test_desc
-    model_dir = f"{llm_models_root()}/{model_path}"
+    model_dir = resolve_llm_model_path(model_path)
     setup_model_symlink(llm_venv, model_dir, model_path)
 
     config_file = get_test_config(test_desc, disaggregated_example_root,

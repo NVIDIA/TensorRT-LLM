@@ -6,6 +6,7 @@ from typing import List, Optional
 import torch
 import transformers
 
+from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.logger import logger
 
 
@@ -251,6 +252,12 @@ def extract_mamba_kv_cache_params(
 
     mamba_ssm_cache_dtype = (quant_config.mamba_ssm_cache_dtype
                              if quant_config is not None else None)
+    if mamba_ssm_cache_dtype is None:
+        config_mamba_ssm_dtype = getattr(config, "mamba_ssm_dtype", None)
+        if isinstance(config_mamba_ssm_dtype, torch.dtype):
+            mamba_ssm_cache_dtype = config_mamba_ssm_dtype
+        elif isinstance(config_mamba_ssm_dtype, str):
+            mamba_ssm_cache_dtype = str_dtype_to_torch(config_mamba_ssm_dtype)
 
     return MambaKVCacheParams(
         state_size=state_size,
@@ -267,6 +274,23 @@ def extract_mamba_kv_cache_params(
     )
 
 
+class _Qwen35MoeVLMConfig(transformers.Qwen3NextConfig):
+    """Thin subclass that restores the top-level model_type for Qwen3.5 MoE.
+
+    ``_Qwen35ConfigCompat`` normalizes the HF config into Qwen3NextConfig
+    (needed by the PyTorch backend model), but that loses the original
+    ``model_type``.  The serving layer needs ``model_type = "qwen3_5_moe"``
+    for ``MULTIMODAL_PLACEHOLDER_REGISTRY`` lookup; without it,
+    ``resolve_top_level_model_type`` returns ``"qwen3_next"`` and multimodal
+    requests fail with "Unknown modality".
+
+    To remove: when ``_Qwen35ConfigCompat`` is removed and the PyTorch backend
+    consumes ``Qwen3_5MoeConfig`` directly.
+    """
+
+    model_type = "qwen3_5_moe"
+
+
 class _Qwen35ConfigCompat:
     """Temporary shim that normalizes Qwen3.5 HF configs into Qwen3NextConfig.
 
@@ -275,9 +299,16 @@ class _Qwen35ConfigCompat:
     """
 
     @staticmethod
-    def normalize(config_dict: dict) -> dict:
-        """Entry point: raw config.json dict -> flat Qwen3NextConfig-compatible dict."""
-        text_config = _Qwen35ConfigCompat._extract_text_config(config_dict)
+    def normalize(config_dict: dict, require_text_config: bool = False) -> dict:
+        """Return a Qwen3NextConfig-compatible text config.
+
+        Qwen-Image-Bench publishes a composite VLM config with a nested
+        ``text_config``.  TRT-LLM keeps the top-level config for multimodal
+        metadata, but normalizes that nested text config for the Qwen3.5
+        decoder.  Text-only checkpoints can still pass a flat config directly.
+        """
+        text_config = _Qwen35ConfigCompat._extract_text_config(
+            config_dict, require_text_config=require_text_config)
         text_config = _Qwen35ConfigCompat._inherit_quantization_config(
             config_dict, text_config)
         text_config = _Qwen35ConfigCompat._flatten_rope(text_config)
@@ -300,14 +331,58 @@ class _Qwen35ConfigCompat:
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
     }
+    _QWEN_IMAGE_BENCH_ARCHITECTURE = "QwenImageBenchForConditionalGeneration"
 
     @staticmethod
-    def _extract_text_config(config_dict: dict) -> dict:
-        """Pull nested text_config from VLM checkpoints, or use dict as-is."""
+    def is_qwen_image_bench_config(config_dict: dict) -> bool:
+        """Detect Qwen-Image-Bench's composite VLM checkpoint config.
+
+        The checkpoint advertises the generic Qwen3.5 VLM architecture, but
+        TRT-LLM needs a dedicated architecture key to route it to
+        QwenImageBenchModel. Generic Qwen3.5 text checkpoints can also publish
+        composite text/vision metadata, so require the explicit
+        ``language_model_only: false`` marker from Qwen-Image-Bench before
+        rewriting the architecture.
+        """
         architectures = config_dict.get("architectures") or []
-        if architectures and architectures[
-                0] in _Qwen35ConfigCompat._VLM_ARCHITECTURES:
-            text_config = dict(config_dict.get("text_config") or {})
+        text_config = config_dict.get("text_config")
+        vision_config = config_dict.get("vision_config")
+        required_multimodal_token_ids = {
+            "image_token_id",
+            "video_token_id",
+            "vision_start_token_id",
+            "vision_end_token_id",
+        }
+        return (config_dict.get("language_model_only") is False
+                and architectures[:1] == ["Qwen3_5ForConditionalGeneration"]
+                and isinstance(text_config, dict) and bool(text_config)
+                and isinstance(vision_config, dict) and bool(vision_config)
+                and required_multimodal_token_ids.issubset(config_dict))
+
+    @staticmethod
+    def _extract_text_config(config_dict: dict,
+                             require_text_config: bool = False) -> dict:
+        """Pull nested text_config from VLM checkpoints, or use dict as-is."""
+        if require_text_config:
+            text_config = config_dict.get("text_config")
+            if not isinstance(text_config, dict) or not text_config:
+                raise ValueError(
+                    "Qwen3.5 composite config is missing a usable text_config")
+            return dict(text_config)
+
+        architectures = config_dict.get("architectures") or []
+        if (architectures
+                and architectures[0] in _Qwen35ConfigCompat._VLM_ARCHITECTURES
+                and isinstance(config_dict.get("vision_config"), dict)):
+            text_config = config_dict.get("text_config")
+            if not isinstance(text_config, dict) or not text_config:
+                raise ValueError(
+                    "Qwen3.5 composite config is missing a usable text_config")
+            text_config = dict(text_config)
+        elif (architectures
+              and architectures[0] in _Qwen35ConfigCompat._VLM_ARCHITECTURES
+              and isinstance(config_dict.get("text_config"), dict)):
+            text_config = dict(config_dict["text_config"])
         else:
             text_config = dict(config_dict)
         if not text_config:
@@ -424,6 +499,9 @@ class LazyConfigDict(dict):
 
 
 _CONFIG_REGISTRY: dict[str, type[transformers.PretrainedConfig]] = LazyConfigDict(
+    cosmos3="Cosmos3Config",
+    cosmos3_omni=
+    "Cosmos3Config",  # backward-compat alias for pre-rename checkpoints
     deepseek_v32="DeepseekV3Config",
     kimi_k2="DeepseekV3Config",
     glm_moe_dsa="DeepseekV3Config",
@@ -445,6 +523,29 @@ def load_pretrained_config(model_name_or_path: str,
             MistralConfigLoader
         model_config = MistralConfigLoader().load(
             model_name_or_path).pretrained_config
+    elif _Qwen35ConfigCompat.is_qwen_image_bench_config(config_dict):
+        model_config = transformers.AutoConfig.from_pretrained(
+            model_name_or_path, trust_remote_code=trust_remote_code)
+        # Keep the composite VLM config so the vision encoder and multimodal
+        # token IDs remain available, but normalize the text side to the
+        # Qwen3Next-compatible shape used by TRT-LLM's Qwen3.5 decoder.
+        model_config.architectures = [
+            _Qwen35ConfigCompat._QWEN_IMAGE_BENCH_ARCHITECTURE
+        ]
+        model_config.text_config = transformers.Qwen3NextConfig.from_dict(
+            _Qwen35ConfigCompat.normalize(config_dict,
+                                          require_text_config=True))
+    elif model_type == "glm_moe_dsa":
+        # GLM-MoE-DSA configs tag every layer with
+        # layer_types=['deepseek_sparse_attention', ...] for HF bookkeeping.
+        # TRT-LLM never reads it (get_layer_types is Gemma3-only; DSA layer
+        # routing is driven by index_topk_freq / index_skip_topk_offset), and
+        # transformers' validate_layer_type rejects the unknown entry. Drop the
+        # unused field and build from the dict via the registered config class,
+        # mirroring the exaone4 handling below.
+        config_dict.pop("layer_types", None)
+        model_config = _CONFIG_REGISTRY[model_type].from_dict(
+            config_dict, **kwargs)
     elif model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,
@@ -457,8 +558,11 @@ def load_pretrained_config(model_name_or_path: str,
                                 "Qwen3_5ForCausalLM",
                                 "Qwen3_5ForConditionalGeneration",
                             )):
-        model_config = transformers.Qwen3NextConfig.from_dict(
-            _Qwen35ConfigCompat.normalize(config_dict))
+        normalized = _Qwen35ConfigCompat.normalize(config_dict)
+        if model_type in ("qwen3_5_moe", "qwen3_5_moe_text"):
+            model_config = _Qwen35MoeVLMConfig.from_dict(normalized)
+        else:
+            model_config = transformers.Qwen3NextConfig.from_dict(normalized)
     elif (model_type == "exaone4" and config_dict.get("sliding_window") is None
           and config_dict.get("layer_types") is None):
         # transformers 5.5.x Exaone4Config.__post_init__ first forces

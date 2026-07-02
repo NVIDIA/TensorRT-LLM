@@ -133,7 +133,9 @@ class QuantConfig(StrictBaseModel):
     """Serializable quantization configuration class, part of the PretrainedConfig."""
 
     quant_algo: Optional[QuantAlgo] = Field(
-        default=None, description="Quantization algorithm.")
+        default=None,
+        description="Quantization algorithm.",
+        json_schema_extra={"telemetry": True})
     kv_cache_quant_algo: Optional[QuantAlgo] = Field(
         default=None, description="KV cache quantization algorithm.")
     group_size: Optional[int] = Field(
@@ -255,6 +257,13 @@ class QuantConfig(StrictBaseModel):
         module (without a glob suffix) implicitly excludes all of its
         children.
 
+        A trailing ``.*`` subtree wildcard also matches the parent node
+        itself, so an entry like ``model.layers.1.*`` excludes both
+        ``model.layers.1`` and everything under it. This keeps a subtree
+        exclusion consistent regardless of whether the producer wrote it as
+        ``model.layers.1`` / ``model.layers.1*`` / ``model.layers.1.*``
+        (modelopt mixes these forms within a single checkpoint).
+
         Args:
             name (str): The name of the module.
 
@@ -270,6 +279,9 @@ class QuantConfig(StrictBaseModel):
                     if re.fullmatch(exclude_module[3:], candidate):
                         return True
                 elif fnmatch.fnmatchcase(candidate, exclude_module):
+                    return True
+                elif exclude_module.endswith(".*") and fnmatch.fnmatchcase(
+                        candidate, exclude_module[:-2]):
                     return True
             if '.' not in candidate:
                 return False

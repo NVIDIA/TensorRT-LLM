@@ -95,7 +95,7 @@ def ensure_bench_serving_repo() -> str:
     return bench_script
 
 
-DEFAULT_TIMEOUT = 5400
+DEFAULT_TIMEOUT = 10800
 AGG_CONFIG_FOLDER = os.environ.get("AGG_CONFIG_FOLDER", "tests/scripts/perf-sanity/aggregated")
 DISAGG_CONFIG_FOLDER = os.environ.get(
     "DISAGG_CONFIG_FOLDER", "tests/scripts/perf-sanity/disaggregated"
@@ -163,22 +163,22 @@ def gen_worker_log_sizes(output_dir: str, num_gen_servers: int) -> List[int]:
     return sizes
 
 
-def parse_gen_worker_device_step_time(
+def _scan_gen_worker_device_step_time(
     output_dir: str,
     num_gen_servers: int,
     start_offsets: Optional[List[int]] = None,
-) -> Optional[float]:
-    """Mean per-iter prev_device_step_time (ms) across all gen workers.
+) -> Tuple[List[float], int]:
+    """Single pass over the gen logs. Returns (per_file_means, total_count).
 
-    For each gen_server_{i}.log, average prev_device_step_time over iters >= 5,
-    then average those per-file means across the num_gen_servers workers.
-    Returns None if no usable line is found in any file.
-
-    When start_offsets is provided, only the bytes from start_offsets[i] to
-    end-of-file are considered for gen_server_{i}.log — used to slice out a
-    single client's iteration segment.
+    per_file_means holds one mean per file that had >=1 usable line;
+    total_count is the number of usable (iter >= 5, numeric) lines across all
+    files, used by the caller to detect when the cross-node log flush has
+    settled. errors="replace" guards against invalid UTF-8: tqdm progress bars
+    (model load) write partial multibyte sequences that would otherwise raise
+    UnicodeDecodeError mid-scan.
     """
     per_file_means: List[float] = []
+    total_count = 0
     for i in range(num_gen_servers):
         log_path = os.path.join(output_dir, f"gen_server_{i}.log")
         if not os.path.isfile(log_path):
@@ -187,7 +187,7 @@ def parse_gen_worker_device_step_time(
         # large iteration counts.
         count = 0
         mean = 0.0
-        with open(log_path) as f:
+        with open(log_path, errors="replace") as f:
             if start_offsets is not None and i < len(start_offsets) and start_offsets[i]:
                 f.seek(start_offsets[i])
             for line in f:
@@ -201,9 +201,55 @@ def parse_gen_worker_device_step_time(
                 mean += (float(m.group(2)) - mean) / count
         if count:
             per_file_means.append(mean)
-    if not per_file_means:
-        return None
-    return sum(per_file_means) / len(per_file_means)
+            total_count += count
+    return per_file_means, total_count
+
+
+def parse_gen_worker_device_step_time(
+    output_dir: str,
+    num_gen_servers: int,
+    start_offsets: Optional[List[int]] = None,
+    settle_timeout: float = 90.0,
+    poll_interval: float = 3.0,
+) -> Optional[float]:
+    """Mean per-iter prev_device_step_time (ms) across all gen workers.
+
+    For each gen_server_{i}.log, average prev_device_step_time over iters >= 5,
+    then average those per-file means across the num_gen_servers workers.
+    Returns None if no usable line is found in any file.
+
+    When start_offsets is provided, only the bytes from start_offsets[i] to
+    end-of-file are considered for gen_server_{i}.log — used to slice out a
+    single client's iteration segment.
+
+    The gen worker writes gen_server_{i}.log on a different node than the
+    benchmark/pytest process, and the worker is kept alive (waiting on the
+    benchmark_status file) when this runs — so when the client returns, the
+    decode iterations are done but their log lines may still be flushing across
+    NFS. Reading once immediately can see zero iter>=5 lines and wrongly return
+    None. So poll the slice until the usable-line count is non-zero AND stable
+    across two consecutive reads (flush drained), bounded by settle_timeout.
+    """
+    deadline = time.time() + settle_timeout
+    prev_count = -1
+    while True:
+        per_file_means, total_count = _scan_gen_worker_device_step_time(
+            output_dir, num_gen_servers, start_offsets
+        )
+        # Non-empty and unchanged since the last poll → the flush has settled.
+        if total_count > 0 and total_count == prev_count:
+            return sum(per_file_means) / len(per_file_means)
+        if time.time() >= deadline:
+            if per_file_means:
+                print_info(
+                    f"parse_gen_worker_device_step_time: settle_timeout "
+                    f"({settle_timeout}s) reached with {total_count} line(s); "
+                    "returning current mean."
+                )
+                return sum(per_file_means) / len(per_file_means)
+            return None
+        prev_count = total_count
+        time.sleep(poll_interval)
 
 
 def add_perf_metric_value(

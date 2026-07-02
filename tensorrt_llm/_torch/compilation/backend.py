@@ -5,7 +5,7 @@ from typing import List, Optional
 import torch
 import torch._inductor.config as inductor_config
 from torch._functorch.aot_autograd import aot_module_simplified
-from torch._inductor.compile_fx import compile_fx, select_decomp_table
+from torch._inductor.compile_fx import compile_fx_inner, select_decomp_table
 from torch._inductor.pattern_matcher import PatternMatcherPass
 from torch._subclasses import FakeTensor
 from torch.fx import GraphModule
@@ -153,7 +153,7 @@ class Backend:
             self.generate_events(num_events)
             return gm
         elif self.enable_inductor:
-            return compile_fx(gm, example_inputs)
+            return compile_fx_inner(gm, example_inputs)
         else:
             return gm
 
@@ -167,9 +167,19 @@ class Backend:
             return gm
 
         self.input_num_tokens = None
+        # On multimodal wrappers (e.g. Qwen2/3-VL) the LM forward is
+        # invoked with `input_ids=None` and `inputs_embeds=<tensor>`,
+        # so dynamo eliminates the `input_ids` placeholder; the
+        # `inputs_embeds` placeholder carries the (num_tokens, H)
+        # tensor whose leading dim is the same num_tokens.
         for node in gm.graph.nodes:
             if node.op == "placeholder":
-                if node.name in ["l_input_ids_", "l_kwargs_input_ids_"]:
+                if node.name in [
+                        "l_input_ids_",
+                        "l_kwargs_input_ids_",
+                        "l_inputs_embeds_",
+                        "l_kwargs_inputs_embeds_",
+                ]:
                     example_value = node.meta["example_value"]
                     assert isinstance(example_value, FakeTensor)
                     self.input_num_tokens = example_value.shape[0]

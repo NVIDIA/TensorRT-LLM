@@ -12,22 +12,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import copy
 import datetime
 import enum
 import gc
 import json
-import os
 import weakref
 from pathlib import Path
 from queue import Queue
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
-import psutil
 import torch
 
 from tensorrt_llm.logger import logger
 
+from .._torch.pyexecutor.kv_cache_stats import append_kv_cache_iteration_stats
 from .._torch.pyexecutor.llm_request import LlmResponse
 from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
                       nvtx_range_debug)
@@ -36,7 +34,7 @@ from ..builder import ConfigEncoder, Engine, EngineConfig
 from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType, PybindMirror
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import _SyncQueue, get_numa_aware_cpu_affinity, logger_debug
+from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
 from ..lora_manager import LoraManager
 from ..prompt_adapter_manager import PromptAdapterManager
 from ..runtime import ModelConfig
@@ -138,58 +136,6 @@ class BaseWorker(GenerationExecutor):
     def resource_governor_queue(self):
         return self._resource_governor_queue
 
-    def _configure_affinity(self, device_id):
-        '''Probe and configure the CPU affinity of the worker based on NUMA topology.
-
-        Args:
-            device_id: The CUDA device ID to determine optimal CPU affinity.
-
-        Note:
-            If the process already has constrained affinity, a warning is logged.
-            Configuration is handled as follows:
-                TLLM_NUMA_AWARE_WORKER_AFFINITY = <unset>
-                    -> Affinity is automatically configured if it is unconstrained,
-                       and deleted if it is constrained externally by the user.
-                TLLM_NUMA_AWARE_WORKER_AFFINITY = 1
-                    -> Affinity is unconditionally auto-configured.
-                TLLM_NUMA_AWARE_WORKER_AFFINITY = 0 or any other value
-                    -> Affinity is unconditionally _not_ auto-configured.
-        '''
-
-        # Get the current affinity setting
-        pid = os.getpid()
-        process = psutil.Process(pid)
-        cpu_affinity = process.cpu_affinity()
-
-        all_cpus = list(range(psutil.cpu_count()))
-
-        constrained_affinity = (cpu_affinity != all_cpus)
-        numa_aware_affinity = os.environ.get("TLLM_NUMA_AWARE_WORKER_AFFINITY")
-
-        # If affinity is constrained but the user hasn't explicitly
-        # requested NUMA-aware affinity, remove the constraints.
-        if constrained_affinity:
-            logger.warning(
-                f"Worker process {pid} is affined to run on the following CPUs: "
-                f"{cpu_affinity} (subset of all logical CPUs). This may harm "
-                f"performance if set incorrectly.")
-            if numa_aware_affinity is None:
-                logger.warning(
-                    f"Worker process {pid} has constrained CPU affinity "
-                    f"but `TLLM_NUMA_AWARE_WORKER_AFFINITY` is not set. "
-                    f"Removing CPU affinity constraints.")
-                process.cpu_affinity(all_cpus)
-
-        # If affinity is unconstrained and the user hasn't explicitly
-        # prohibited it or the user has explicitly requested it, choose the
-        # optimal affinity based upon the NUMA topology
-        if ((numa_aware_affinity is None and not constrained_affinity)
-                or (numa_aware_affinity == "1")):
-            process.cpu_affinity(get_numa_aware_cpu_affinity(device_id))
-            logger.info(
-                f"Worker process {pid} CPU affinity set to "
-                f"{process.cpu_affinity()} for optimal NUMA-aware scheduling.")
-
     def _get_comm_ranks_device_id(self):
         device_id = self.global_rank % torch.cuda.device_count()
         torch.cuda.set_device(device_id)
@@ -198,7 +144,7 @@ class BaseWorker(GenerationExecutor):
         comm_ranks = mpi_comm().allgather(global_rank)
         device_ids = mpi_comm().allgather(device_id)
 
-        self._configure_affinity(device_id)
+        configure_cpu_affinity(device_id)
 
         return comm_ranks, device_ids
 
@@ -449,7 +395,7 @@ class BaseWorker(GenerationExecutor):
         else:
             lora_config = None
 
-        prompt_token_ids = copy.deepcopy(request.prompt_token_ids)
+        prompt_token_ids = list(request.prompt_token_ids)
         prompt_tuning_config = None
         if request.prompt_adapter_request is not None:
             self._load_prompt_adapter(request.prompt_adapter_request)
@@ -468,21 +414,8 @@ class BaseWorker(GenerationExecutor):
         if request.multimodal_params is not None and request.multimodal_params.has_content(
         ):
             if request.multimodal_params.multimodal_input is not None:
-                multimodal_input = tllm.MultimodalInput(
-                    multimodal_hashes=request.multimodal_params.
-                    multimodal_input.multimodal_hashes,
-                    multimodal_positions=request.multimodal_params.
-                    multimodal_input.multimodal_positions,
-                    multimodal_lengths=request.multimodal_params.
-                    multimodal_input.multimodal_lengths,
-                    multimodal_uuids=request.multimodal_params.multimodal_input.
-                    multimodal_uuids,
-                    multimodal_item_run_cu_offsets=request.multimodal_params.
-                    multimodal_input.multimodal_item_run_cu_offsets,
-                    multimodal_run_positions=request.multimodal_params.
-                    multimodal_input.multimodal_run_positions,
-                    multimodal_run_lengths=request.multimodal_params.
-                    multimodal_input.multimodal_run_lengths)
+                multimodal_input = request.multimodal_params.multimodal_input.to_binding(
+                    tllm)
             # NOTE: Setting to None here to avoid sending multimodal_input again through the 'py_multimodal_data' field
             request.multimodal_params.multimodal_input = None
 
@@ -606,9 +539,10 @@ class BaseWorker(GenerationExecutor):
                 request.sampling_params.logits_processor,
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
+                encoder_input_token_ids=request.encoder_input_token_ids,
                 type=request_type,
-                cache_salt_id=request.cache_salt_id,
                 disagg_request_id=disagg_request_id,
+                cache_salt=request.cache_salt,
                 priority=request.priority)
             executor_request.py_original_end_id = request.sampling_params.end_id
             executor_request.py_num_logprobs = request.sampling_params.logprobs
@@ -622,7 +556,8 @@ class BaseWorker(GenerationExecutor):
                 executor_request.py_disaggregated_params = request.disaggregated_params
             if self._is_pytorch_backend and request.multimodal_params is not None:
                 if request.multimodal_params.multimodal_data is not None:
-                    # NOTE: Deserialize SharedTensor handle to actual tensor
+                    # Resolve SharedTensorContainer dicts inside multimodal_data, including
+                    # E/P handoff embedding handles parked under "multimodal_embedding".
                     request.multimodal_params.to_tensor("multimodal_data")
                     executor_request.py_multimodal_data = request.multimodal_params.multimodal_data
 
@@ -636,6 +571,10 @@ class BaseWorker(GenerationExecutor):
             executor_request.py_scheduling_params = None
             if self._is_pytorch_backend and request.scheduling_params is not None:
                 executor_request.py_scheduling_params = request.scheduling_params
+
+            executor_request.py_conversation_params = None
+            if self._is_pytorch_backend and request.conversation_params is not None:
+                executor_request.py_conversation_params = request.conversation_params
 
             if request.arrival_time is not None:
                 executor_request.py_arrival_time = request.arrival_time
@@ -816,7 +755,6 @@ class BaseWorker(GenerationExecutor):
             return {}
         return self.engine.kv_cache_transceiver.get_disaggregated_params()
 
-    # Define a Callable to join iteration and request stats
     @staticmethod
     def _stats_serializer(stats) -> str:
         # Per-rank path: stats is ("per_rank_dict", {..., "rank": N}).
@@ -833,6 +771,7 @@ class BaseWorker(GenerationExecutor):
         host_step_time_ms = stats[4] if len(stats) > 4 else None
         prev_device_step_time_ms = stats[5] if len(stats) > 5 else None
         scheduler_mode = stats[6] if len(stats) > 6 else None
+        gpu_forward_time_ms = stats[7] if len(stats) > 7 else None
 
         stats_dict = json.loads(iteration_stats.to_json_str())
         # Always tag the row so Dynamo's adapter can read
@@ -847,34 +786,7 @@ class BaseWorker(GenerationExecutor):
                 stats_dict["requestStats"].append(
                     json.loads(req_stat.to_json_str()))
 
-        # Inject per-iteration KV cache stats (keyed by window size)
-        if kv_iter_stats is not None:
-            stats_dict["kvCacheIterationStats"] = {
-                str(window_size): {
-                    "primaryMaxNumBlocks": s.primary_max_num_blocks,
-                    "primaryFreeNumBlocks": s.primary_free_num_blocks,
-                    "primaryUsedNumBlocks": s.primary_used_num_blocks,
-                    "secondaryMaxNumBlocks": s.secondary_max_num_blocks,
-                    "secondaryFreeNumBlocks": s.secondary_free_num_blocks,
-                    "secondaryUsedNumBlocks": s.secondary_used_num_blocks,
-                    "iterAllocTotalBlocks": s.iter_alloc_total_blocks,
-                    "iterAllocNewBlocks": s.iter_alloc_new_blocks,
-                    "iterReusedBlocks": s.iter_reused_blocks,
-                    "iterFullReusedBlocks": s.iter_full_reused_blocks,
-                    "iterPartialReusedBlocks": s.iter_partial_reused_blocks,
-                    "iterMissedBlocks": s.iter_missed_blocks,
-                    "iterCacheHitRate": s.iter_cache_hit_rate,
-                    "iterGenAllocBlocks": s.iter_gen_alloc_blocks,
-                    "iterOnboardBlocks": s.iter_onboard_blocks,
-                    "iterOnboardBytes": s.iter_onboard_bytes,
-                    "iterOffloadBlocks": s.iter_offload_blocks,
-                    "iterOffloadBytes": s.iter_offload_bytes,
-                    "iterIntraDeviceCopyBlocks":
-                    s.iter_intra_device_copy_blocks,
-                    "iterIntraDeviceCopyBytes": s.iter_intra_device_copy_bytes,
-                }
-                for window_size, s in kv_iter_stats.items()
-            }
+        append_kv_cache_iteration_stats(stats_dict, kv_iter_stats)
 
         # Per-loop CPU wall captured by profile_step() — always a clean
         # single-loop measurement, matching the log line's `host_step_time`.
@@ -891,6 +803,11 @@ class BaseWorker(GenerationExecutor):
         # comment in PyExecutor._profiler for the design rationale.
         if prev_device_step_time_ms is not None:
             stats_dict["prevDeviceStepTimeMS"] = prev_device_step_time_ms
+        # Batch-matched GPU forward time measured from the CUDA events around
+        # this record's _forward_step. This is the preferred field for
+        # ForwardPassMetrics wall_time.
+        if gpu_forward_time_ms is not None:
+            stats_dict["gpuForwardTimeMS"] = gpu_forward_time_ms
         # Scheduler mode for this record. "overlap" means iterLatencyMS
         # spans ~2 loops (use hostStepTimeMS for clean per-loop cost);
         # "non_overlap" means iterLatencyMS is itself the clean per-loop

@@ -1,7 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import os
 from dataclasses import dataclass
-from typing import List, Optional
+from types import SimpleNamespace
+from typing import List, Optional, Type
 
+import pytest
 import torch
 from _torch.helpers import create_mock_cuda_graph_runner
 from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal
@@ -13,8 +18,11 @@ from utils.llm_data import llm_models_root
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2vl_weight_mapper import \
     Qwen2VLHfWeightMapper
 from tensorrt_llm._torch.models.modeling_qwen2vl import (
-    Qwen2_5_VLModel, Qwen2VLInputProcessorBase)
+    Qwen2_5_VLModel, Qwen2VLInputProcessorBase, _prepare_qwen_vl_mrope_config)
+from tensorrt_llm._torch.models.modeling_qwen3vl import \
+    Qwen3VLInputProcessorBase
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 QWEN2_5_VL_7B_CONFIG = {
     "architectures": ["Qwen2_5_VLForConditionalGeneration"],
@@ -149,16 +157,40 @@ class TestQwen2_5_VL(TestModelingMultimodal):
                     target_keywords=["mrope_config.mrope_position_deltas"])
                 gen_multimodal_params_list.append(multimodal_param)
             trtllm_inputs["multimodal_params"] = gen_multimodal_params_list
+            trtllm_inputs["mrope_delta_read_seq_slots"] = torch.arange(
+                len(multimodal_params_list),
+                device=self.device,
+                dtype=torch.long)
         else:
-            # Mrope position ids
+            # Mrope position ids. For chunked prefill / KV cache reuse we must
+            # mirror production `PyTorchModelEngine` behavior and slice the
+            # request's full `mrope_position_ids` to the current chunk's
+            # range -- the model now indexes mrope cos/sin by batch-flat
+            # per-token index, so the position_ids tensor must contain only
+            # the tokens of the current forward (chunk-local) with their
+            # correct (T, H, W) values.
+            chunk_len = input_ids.shape[-1]
+            if num_cached_tokens_per_seq is None:
+                begin_offsets = [0] * len(multimodal_params_list)
+            elif isinstance(num_cached_tokens_per_seq, int):
+                begin_offsets = [num_cached_tokens_per_seq
+                                 ] * len(multimodal_params_list)
+            else:
+                begin_offsets = list(num_cached_tokens_per_seq)
             mrope_position_ids = []
-            for multimodal_param in multimodal_params_list:
-                mrope_position_ids.append(
-                    multimodal_param.multimodal_data["mrope_config"]
-                    ["mrope_position_ids"])
+            for multimodal_param, begin in zip(multimodal_params_list,
+                                               begin_offsets):
+                full_mrope = multimodal_param.multimodal_data["mrope_config"][
+                    "mrope_position_ids"]
+                mrope_position_ids.append(full_mrope[:, :,
+                                                     begin:begin + chunk_len])
             position_ids = torch.cat(mrope_position_ids, dim=-1)
             position_ids = position_ids.cuda()
             trtllm_inputs["position_ids"] = position_ids
+            trtllm_inputs["mrope_delta_write_seq_slots"] = torch.arange(
+                len(multimodal_params_list),
+                device=self.device,
+                dtype=torch.long)
 
         return trtllm_inputs
 
@@ -302,3 +334,312 @@ class TestQwen2_5_VL(TestModelingMultimodal):
                 load_weights=True,
                 hf_model_state_dict=self.hf_model.state_dict(),
                 disable_fuse_rope=True)
+
+
+class _FakeRotaryEmbedding:
+
+    def __init__(self, rotary_dim: int):
+        self.rotary_dim = rotary_dim
+
+    def get_cos_sin(self, position_ids):
+        num_tokens = position_ids.shape[-1]
+        cos = torch.arange(num_tokens * self.rotary_dim,
+                           device=position_ids.device,
+                           dtype=torch.float32).reshape(1, num_tokens,
+                                                        self.rotary_dim)
+        return cos, cos + 1000
+
+
+def _mrope_param(delta: int) -> MultimodalParams:
+    return MultimodalParams(
+        multimodal_data={
+            "mrope_config": {
+                "mrope_position_deltas":
+                torch.tensor([delta], device="cuda", dtype=torch.int32)
+            }
+        })
+
+
+def test_prepare_qwen_vl_mrope_config_mixed_context_generation():
+    rotary_dim = 2
+    num_tokens = 5
+    position_ids = torch.arange(3 * num_tokens,
+                                device="cuda",
+                                dtype=torch.int32).reshape(3, 1, num_tokens)
+    mrope_position_deltas_cache = torch.zeros(8,
+                                              device="cuda",
+                                              dtype=torch.int32)
+    mrope_rotary_cos_sin_workspace = torch.empty((1, 8 * rotary_dim * 2),
+                                                 device="cuda",
+                                                 dtype=torch.float32)
+
+    config = _prepare_qwen_vl_mrope_config(
+        multimodal_params=[_mrope_param(11), _mrope_param(22)],
+        num_generation_requests=2,
+        position_ids=position_ids,
+        rotary_emb=_FakeRotaryEmbedding(rotary_dim),
+        mrope_position_deltas_cache=mrope_position_deltas_cache,
+        mrope_rotary_cos_sin_workspace=mrope_rotary_cos_sin_workspace,
+        mrope_delta_write_seq_slots=torch.tensor([2, 5],
+                                                 device="cuda",
+                                                 dtype=torch.long),
+        mrope_delta_read_seq_slots=torch.tensor([2, 5],
+                                                device="cuda",
+                                                dtype=torch.long))
+
+    torch.testing.assert_close(
+        mrope_position_deltas_cache[[2, 5]],
+        torch.tensor([11, 22], device="cuda", dtype=torch.int32))
+    torch.testing.assert_close(
+        config["mrope_position_deltas"],
+        torch.tensor([[11], [22]], device="cuda", dtype=torch.int32))
+
+    packed = config["mrope_rotary_cos_sin"].view(1, num_tokens, rotary_dim, 2)
+    cos, sin = _FakeRotaryEmbedding(rotary_dim).get_cos_sin(position_ids)
+    torch.testing.assert_close(packed[..., 0], cos)
+    torch.testing.assert_close(packed[..., 1], sin)
+
+
+def test_prepare_qwen_vl_mrope_config_pure_generation_reads_deltas_only():
+    rotary_dim = 2
+    position_ids = torch.zeros((3, 1, 2), device="cuda", dtype=torch.int32)
+    mrope_position_deltas_cache = torch.zeros(8,
+                                              device="cuda",
+                                              dtype=torch.int32)
+    mrope_position_deltas_cache[[2, 5]] = torch.tensor([11, 22],
+                                                       device="cuda",
+                                                       dtype=torch.int32)
+    mrope_rotary_cos_sin_workspace = torch.empty((1, 8 * rotary_dim * 2),
+                                                 device="cuda",
+                                                 dtype=torch.float32)
+
+    config = _prepare_qwen_vl_mrope_config(
+        multimodal_params=[],
+        num_generation_requests=2,
+        position_ids=position_ids,
+        rotary_emb=_FakeRotaryEmbedding(rotary_dim),
+        mrope_position_deltas_cache=mrope_position_deltas_cache,
+        mrope_rotary_cos_sin_workspace=mrope_rotary_cos_sin_workspace,
+        mrope_delta_read_seq_slots=torch.tensor([2, 5],
+                                                device="cuda",
+                                                dtype=torch.long))
+
+    assert "mrope_rotary_cos_sin" not in config
+    torch.testing.assert_close(
+        config["mrope_position_deltas"],
+        torch.tensor([[11], [22]], device="cuda", dtype=torch.int32))
+
+
+# ---------------------------------------------------------------------------
+# Deterministic dummy-input sizing (Qwen2/2.5/3-VL input processors).
+#
+# CPU-only unit tests that reach into the InputProcessorBase classes directly
+# (no model load) and stub just enough of the HF config so the encoder-side
+# ``_num_vision_tokens`` / ``get_size_for_max_tokens`` / ``get_dummy_mm_data_*``
+# math runs. Token unit is pre-merger encoder attention, matching
+# ``encoder_max_num_tokens``.
+# ---------------------------------------------------------------------------
+def _make_dummy_processor(
+    processor_cls: Type,
+    *,
+    patch_size: int = 16,
+    spatial_merge_size: int = 2,
+    temporal_patch_size: int = 2,
+    min_pixels: int = 3136,
+    max_pixels: int = 1 << 30,
+):
+    """Construct a processor stub with stubbed vision_config attrs.
+
+    Bypasses the real ``__init__`` (which loads tokenizers/processors) and pins
+    just the fields the deterministic math reads. ``min_pixels`` / ``max_pixels``
+    stub the HF image processor's ``size`` config that ``_num_vision_tokens``
+    reads for its ``smart_resize`` clamp; the default ``max_pixels`` is generous
+    so the factor-pair tests aren't clamped (the clamp itself is covered by
+    ``test_dummy_size_capped_at_max_pixels``).
+    """
+    instance = processor_cls.__new__(processor_cls)
+    vision_config = SimpleNamespace(
+        patch_size=patch_size,
+        spatial_merge_size=spatial_merge_size,
+        temporal_patch_size=temporal_patch_size,
+        in_channels=3,
+    )
+    instance._config = SimpleNamespace(vision_config=vision_config)
+    instance._processor = SimpleNamespace(image_processor=SimpleNamespace(
+        size={
+            "shortest_edge": min_pixels,
+            "longest_edge": max_pixels
+        }))
+    return instance
+
+
+_DUMMY_PROCESSORS = [Qwen2VLInputProcessorBase, Qwen3VLInputProcessorBase]
+
+
+@pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
+@pytest.mark.parametrize("spatial_merge_size, expected_spatial_merge_unit",
+                         [(2, 4), (3, 9)])
+def test_spatial_merge_unit_is_merge_size_squared(processor_cls,
+                                                  spatial_merge_size,
+                                                  expected_spatial_merge_unit):
+    proc = _make_dummy_processor(processor_cls,
+                                 spatial_merge_size=spatial_merge_size)
+    assert proc.spatial_merge_unit == expected_spatial_merge_unit
+
+
+@pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
+def test_num_vision_tokens_matches_manual_grid(processor_cls):
+    proc = _make_dummy_processor(processor_cls,
+                                 patch_size=16,
+                                 spatial_merge_size=2,
+                                 temporal_patch_size=2)
+    # 224x224 image, patch=16, merge=2 -> resize-to-multiple-of-(16*2=32)
+    # 224/32 -> rounds to 224 (already a multiple), grid 14*14 = 196.
+    assert proc._num_vision_tokens(width=224, height=224) == 14 * 14
+
+
+@pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
+def test_num_vision_tokens_rounds_to_unit(processor_cls):
+    proc = _make_dummy_processor(processor_cls,
+                                 patch_size=16,
+                                 spatial_merge_size=2,
+                                 temporal_patch_size=2)
+    # 220x220 -> rounds half-up to nearest multiple of 32 = 224 -> 14*14.
+    assert proc._num_vision_tokens(width=220, height=220) == 14 * 14
+
+
+@pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
+def test_num_vision_tokens_temporal_padding(processor_cls):
+    proc = _make_dummy_processor(processor_cls,
+                                 patch_size=16,
+                                 spatial_merge_size=2,
+                                 temporal_patch_size=2)
+    # Single frame still pads to temporal_patch_size, grid_t = 1.
+    single = proc._num_vision_tokens(width=224, height=224, num_frames=1)
+    three = proc._num_vision_tokens(width=224, height=224, num_frames=3)
+    # 3 frames -> pad to 4 -> grid_t = 2.
+    assert three == 2 * single
+
+
+@pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
+@pytest.mark.parametrize("budget", [256, 1024, 4096, 8192, 16384, 32768])
+def test_invertibility_fits_within_budget(processor_cls, budget):
+    proc = _make_dummy_processor(processor_cls)
+    size = proc.get_size_for_max_tokens(max_tokens=budget)
+    actual = proc._num_vision_tokens(width=size["width"],
+                                     height=size["height"],
+                                     num_frames=size["num_frames"])
+    assert actual <= budget, f"Got {actual} tokens for size {size}, budget was {budget}"
+
+
+@pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
+@pytest.mark.parametrize("budget", [256, 1024, 4096, 8192, 16384, 32768])
+def test_invertibility_saturates_budget(processor_cls, budget):
+    """Power-of-2 budgets fit the encoder's unit grid exactly."""
+    proc = _make_dummy_processor(processor_cls)
+    size = proc.get_size_for_max_tokens(max_tokens=budget)
+    actual = proc._num_vision_tokens(width=size["width"],
+                                     height=size["height"],
+                                     num_frames=size["num_frames"])
+    # Budgets above are all powers of 2 with merge_size=2 squared as a factor,
+    # so saturation should be exact.
+    assert actual == budget
+
+
+@pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
+def test_aspect_ratio_is_bounded(processor_cls):
+    """The returned size stays within the model's aspect bound (200x)."""
+    proc = _make_dummy_processor(processor_cls)
+    size = proc.get_size_for_max_tokens(max_tokens=1_000_000)
+    long_edge = max(size["width"], size["height"])
+    short_edge = min(size["width"], size["height"])
+    assert long_edge / short_edge <= 200, size
+
+
+@pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
+def test_dummy_size_capped_at_max_pixels(processor_cls):
+    """A single image cannot exceed the processor's ``max_pixels``."""
+    max_pixels = 512 * 512
+    proc = _make_dummy_processor(processor_cls, max_pixels=max_pixels)
+    size = proc.get_size_for_max_tokens(max_tokens=1_000_000)
+
+    # The chosen image must fit within max_pixels and round-trip exactly, so the
+    # realized token count is the single-image max, below the huge budget.
+    assert size["width"] * size["height"] <= max_pixels, size
+    actual = proc._num_vision_tokens(width=size["width"],
+                                     height=size["height"],
+                                     num_frames=size["num_frames"])
+    assert 0 < actual < 1_000_000
+
+
+@pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
+def test_get_size_rejects_non_positive_budget(processor_cls):
+    proc = _make_dummy_processor(processor_cls)
+    with pytest.raises(ValueError, match=r"max_tokens must be positive"):
+        proc.get_size_for_max_tokens(max_tokens=0)
+    with pytest.raises(ValueError, match=r"max_tokens must be positive"):
+        proc.get_size_for_max_tokens(max_tokens=-1)
+
+
+@pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
+def test_get_dummy_mm_data_shapes_match_token_count(processor_cls):
+    """Direct tensor build: pixel_values rows and the grid_thw product match ``_num_vision_tokens`` per image."""
+    proc = _make_dummy_processor(processor_cls)
+    cfg = proc._config.vision_config
+    width = height = 224
+    per_image = proc._num_vision_tokens(width=width, height=height)
+    in_dim = 3 * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size
+
+    data = proc.get_dummy_mm_data_for_size(width=width,
+                                           height=height,
+                                           num_images=3,
+                                           dtype=torch.float32)
+    image = data["image"]
+    assert image["pixel_values"].shape == (3 * per_image, in_dim)
+    assert image["pixel_values"].dtype == torch.float32
+    assert image["image_grid_thw"].shape == (3, 3)
+    # Each grid row's product equals the per-image token count.
+    grid = image["image_grid_thw"]
+    assert int(grid[0].prod().item()) == per_image
+    assert torch.equal(grid[0], grid[1]) and torch.equal(grid[1], grid[2])
+
+
+@pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
+def test_get_dummy_mm_data_single_image_default(processor_cls):
+    """Defaults to a single image; grid_thw is ``[1, 3]``."""
+    proc = _make_dummy_processor(processor_cls)
+    data = proc.get_dummy_mm_data_for_size(width=224,
+                                           height=224,
+                                           dtype=torch.float16)
+    assert data["image"]["image_grid_thw"].shape == (1, 3)
+    assert data["image"]["pixel_values"].dtype == torch.float16
+
+
+@pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
+def test_mm_max_tokens_per_item_is_image_only(processor_cls):
+    """Qwen-VL declares only ``image`` (image+video share one ViT), valued at the max single-image token count."""
+    proc = _make_dummy_processor(processor_cls, max_pixels=512 * 512)
+    demand = proc.get_mm_max_tokens_per_item()
+    assert set(demand) == {"image"}
+    # The declared per-item demand is exactly the max single-image token count.
+    cap_size = proc.get_size_for_max_tokens(max_tokens=10**9)
+    assert demand["image"] == proc._num_vision_tokens(width=cap_size["width"],
+                                                      height=cap_size["height"])
+    assert demand["image"] > 0
+
+
+@pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
+@pytest.mark.parametrize("budget", [1024, 4096, 16384])
+def test_get_dummy_mm_data_for_tokens_saturates_budget(processor_cls, budget):
+    """Agnostic entry: total pre-merger patches are ``<= budget`` and within one image of it (saturates the budget)."""
+    proc = _make_dummy_processor(processor_cls)
+    data = proc.get_dummy_mm_data_for_tokens(
+        max_tokens_per_modality={"image": budget}, dtype=torch.float32)
+    grid = data["image"]["image_grid_thw"]
+    total_patches = int(grid.prod(dim=1).sum().item())
+    per_image = int(grid[0].prod().item())
+    # pixel_values rows == total patches across all batched images.
+    assert data["image"]["pixel_values"].shape[0] == total_patches
+    # Saturates: within the budget, and adding one more image would exceed it.
+    assert total_patches <= budget
+    assert total_patches + per_image > budget

@@ -33,7 +33,7 @@ respective model files and registered via get_eagle_layers().
 
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, ClassVar, Dict, Optional, Union
+from typing import Any, ClassVar, Dict, Optional, Set, Union
 
 import torch
 import torch.nn as nn
@@ -323,8 +323,22 @@ class EagleMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
+        # Sharding IR (SwiGLU MLP): gate/up colwise, down rowwise + all_reduce.
+        gate = torch.ops.auto_deploy.torch_linear_simple(
+            x, self.gate_proj.weight, self.gate_proj.bias, tp_mode="colwise", layer_type="mlp"
+        )
+        up = torch.ops.auto_deploy.torch_linear_simple(
+            x, self.up_proj.weight, self.up_proj.bias, tp_mode="colwise", layer_type="mlp"
+        )
+        down = torch.ops.auto_deploy.torch_linear_simple(
+            self.act_fn(gate) * up,
+            self.down_proj.weight,
+            self.down_proj.bias,
+            tp_mode="rowwise",
+            layer_type="mlp",
+        )
+        down = torch.ops.auto_deploy.all_reduce(down, layer_type="mlp")
+        return down
 
 
 class Eagle3Attention(nn.Module):
@@ -378,15 +392,54 @@ class Eagle3Attention(nn.Module):
         bsz, q_len, _ = hidden_states.size()
         cos, sin = position_embeddings
 
-        # Projections
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        # Sharding IR (MHA): q/k/v colwise (the 2*hidden_size input is the replicated
+        # concat of normed embeds + hidden; only the head output dim is sharded, so the
+        # colwise rule is unchanged), o_proj rowwise + all_reduce. tp_min_local_shape keeps
+        # whole heads together when num_heads is not divisible by world_size.
+        query_states = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.q_proj.weight,
+            self.q_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
+        key_states = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.k_proj.weight,
+            self.k_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
+        value_states = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.v_proj.weight,
+            self.v_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
 
-        # Reshape to [Batch, Seq, Heads, Dim]
-        query_states = query_states.view(bsz, q_len, -1, self.head_dim)
-        key_states = key_states.view(bsz, q_len, -1, self.head_dim)
-        value_states = value_states.view(bsz, q_len, -1, self.head_dim)
+        # Reshape to [Batch, Seq, Heads, Dim] -- head-count dim scales with TP.
+        query_states = torch.ops.auto_deploy.view(
+            query_states,
+            [bsz, q_len, self.num_attention_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        key_states = torch.ops.auto_deploy.view(
+            key_states,
+            [bsz, q_len, self.num_key_value_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        value_states = torch.ops.auto_deploy.view(
+            value_states,
+            [bsz, q_len, self.num_key_value_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
 
         query_states, key_states = apply_rotary_pos_emb(
             query_states, key_states, cos, sin, unsqueeze_dim=2
@@ -402,9 +455,21 @@ class Eagle3Attention(nn.Module):
             layout="bsnd",
         )
 
-        attn_output = attn_output.view(bsz, q_len, self.num_attention_heads * self.head_dim)
+        attn_output = torch.ops.auto_deploy.view(
+            attn_output,
+            [bsz, q_len, self.num_attention_heads * self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
 
-        attn_output = self.o_proj(attn_output)
+        attn_output = torch.ops.auto_deploy.torch_linear_simple(
+            attn_output,
+            self.o_proj.weight,
+            self.o_proj.bias,
+            tp_mode="rowwise",
+            layer_type="mha",
+        )
+        attn_output = torch.ops.auto_deploy.all_reduce(attn_output, layer_type="mha")
 
         return attn_output
 
@@ -913,9 +978,13 @@ class EagleWrapper(nn.Module):
     # ================================================================== #
 
     @staticmethod
+    def _submodule_placeholder_names(submodule: nn.Module) -> Set[str]:
+        return {node.name for node in submodule.graph.nodes if node.op == "placeholder"}
+
+    @staticmethod
     def _filter_kwargs_for_submodule(kwargs: dict, submodule: nn.Module) -> dict:
         """Filter kwargs to only include those accepted by submodule's forward (GraphModule)."""
-        expected_names = {node.name for node in submodule.graph.nodes if node.op == "placeholder"}
+        expected_names = EagleWrapper._submodule_placeholder_names(submodule)
         return {k: v for k, v in kwargs.items() if k in expected_names}
 
     @staticmethod
@@ -1096,6 +1165,7 @@ class EagleWrapper(nn.Module):
         next_new_tokens[:, 0] = csi.info.maybe_gather_and_squeeze(csi.get_arg("input_ids"))
 
         # ---- Phase 5: Draft loop ----
+        draft_arg_names = self._submodule_placeholder_names(self.draft_model)
         for draft_idx in range(self.max_draft_len):
             # run forward pass on the draft model in shape [num_sequences, 1]
             draft_output = self.draft_model(
@@ -1123,9 +1193,9 @@ class EagleWrapper(nn.Module):
             # switch to generate (if not done already), store new tokens, and offset cache
             # can be skipped for last iteration since after we return metadata will be reset
             if draft_idx < self.max_draft_len - 1:
-                csi.info.switch_to_generate_()
+                csi.info.switch_to_generate_(active_args_override=draft_arg_names)
                 csi.info.copy_("input_ids", draft_tokens)
-                csi.info.offset_pos_and_cache_(c_offset)
+                csi.info.offset_pos_and_cache_(c_offset, active_args_override=draft_arg_names)
 
         # ---- Phase 6: Package output ----
         return EagleWrapperOutput(

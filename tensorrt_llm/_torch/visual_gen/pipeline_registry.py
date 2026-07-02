@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pipeline registry for unified config flow.
 
-Follows: VisualGenArgs → PipelineLoader → DiffusionModelConfig → AutoPipeline → BasePipeline
+Follows: VisualGenArgs → PipelineLoader → DiffusionPipelineConfig → AutoPipeline → BasePipeline
 
 All pipelines (Wan, Flux, Flux2, LTX2, QwenImage) register via @register_pipeline decorator.
 
@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
-    from .config import DiffusionModelConfig
+    from .config import DiffusionPipelineConfig
     from .pipeline import BasePipeline
 
 
@@ -56,6 +56,7 @@ class PipelineComponent(str, Enum):
     SCHEDULER = "scheduler"
     IMAGE_ENCODER = "image_encoder"
     IMAGE_PROCESSOR = "image_processor"
+    SOUND_TOKENIZER = "sound_tokenizer"
 
 
 @dataclass
@@ -123,11 +124,11 @@ class AutoPipeline:
 
     @staticmethod
     def from_config(
-        config: "DiffusionModelConfig",
+        config: "DiffusionPipelineConfig",
         checkpoint_dir: str,
     ) -> "BasePipeline":
         """
-        Create pipeline instance from DiffusionModelConfig.
+        Create pipeline instance from DiffusionPipelineConfig.
         """
         # Detect pipeline type from model_index.json or from model safetensors
         class_name = AutoPipeline._detect_from_checkpoint(checkpoint_dir)
@@ -147,7 +148,7 @@ class AutoPipeline:
 
         logger.info(f"AutoPipeline: Creating {pipeline_class.__name__} from {checkpoint_dir}")
 
-        # Instantiate pipeline with DiffusionModelConfig
+        # Instantiate pipeline with DiffusionPipelineConfig
         return pipeline_class(config)
 
     @staticmethod

@@ -151,21 +151,6 @@ bool forceXQAKernels()
     return forceXQA;
 }
 
-std::optional<bool> getEnvEnableXQAJIT()
-{
-    static std::optional<bool> val = []
-    {
-        std::optional<bool> val = std::nullopt;
-        auto const tmp = getIntEnv("TRTLLM_ENABLE_XQA_JIT");
-        if (tmp.has_value())
-        {
-            val = static_cast<bool>(tmp.value());
-        }
-        return val;
-    }();
-    return val;
-}
-
 std::optional<int> getEnvXqaBlocksPerSequence()
 {
     static auto const xqaBlocksPerSeq = []()
@@ -506,6 +491,12 @@ bool getEnvKVCacheTransferAllBlocksForWindow()
 {
     static bool const allBlocksForWindow = getBoolEnv("TRTLLM_KVCACHE_TRANSFER_ALL_BLOCKS_FOR_WINDOW");
     return allBlocksForWindow;
+}
+
+bool getEnvKVCachePoolUseFabricMemory()
+{
+    static bool const useFabricMemory = getBoolEnv("TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY");
+    return useFabricMemory;
 }
 
 uint16_t getEnvNixlPort()

@@ -53,6 +53,7 @@ FmhaDispatcher::FmhaDispatcher(MHARunnerFixedParams fixedParams)
     // The exception will fall back to fmha v2.
     // Please update fmha_v2/setup.py if you want to add more supported head sizes.
     , mUseTllmGen(tensorrt_llm::common::isSM100Family() && fixedParams.headSize != 72)
+    , mMultiProcessorCount(tensorrt_llm::common::getMultiProcessorCount())
 {
     if (mUseTllmGen)
     {
@@ -128,7 +129,7 @@ bool FmhaDispatcher::isSupported()
         tllmRunnerParams.mHeadDimV = mFixedParams.headSizeV;
         tllmRunnerParams.mNumTokensPerPage = (qkvLayout == QkvLayout::PagedKv) ? mFixedParams.numTokensPerBlock : 0;
         tllmRunnerParams.mNumHeadsQPerKv = mFixedParams.numQHeads / mFixedParams.numKvHeads;
-        tllmRunnerParams.mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
+        tllmRunnerParams.mMultiProcessorCount = mMultiProcessorCount;
         // Set the chunked attention size and sliding window size to INT_MAX to disable them when checking if
         // the kernel is supported.
         tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
@@ -238,12 +239,16 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         tllmRunnerParams.mChunkedAttentionSize = runnerParams.chunkedAttentionSize;
         tllmRunnerParams.mSumOfSeqLensQ = runnerParams.totalQSeqLen;
         tllmRunnerParams.mSumOfSeqLensKv = runnerParams.totalKvSeqLen;
+        tllmRunnerParams.mJITWarmup = runnerParams.trtllmGenJITWarmup;
+        tllmRunnerParams.mJITWarmupMaxNumRequests = runnerParams.trtllmGenJITWarmupMaxNumRequests;
+        tllmRunnerParams.mJITWarmupMaxSeqLenQ = runnerParams.trtllmGenJITWarmupMaxSeqLenQ;
+        tllmRunnerParams.mJITWarmupMaxSeqLenKv = runnerParams.trtllmGenJITWarmupMaxSeqLenKv;
         tllmRunnerParams.mMaxNumPagesPerSeqKv = maxBlocksPerSeq;
         tllmRunnerParams.mNumTokensPerPage = (qkvLayout == QkvLayout::PagedKv) ? numTokensPerBlock : 0;
         tllmRunnerParams.mScaleQ = mFixedParams.qScaling;
         // Set it to INT_MAX as the kv cache pageOffsets will ensure that there is no out-of-bounds access.
         tllmRunnerParams.mNumPagesInMemPool = INT_MAX;
-        tllmRunnerParams.mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
+        tllmRunnerParams.mMultiProcessorCount = mMultiProcessorCount;
         tllmRunnerParams.mSfStartTokenIdx = 0;
         // SageAttention scaling factors.
         tllmRunnerParams.sageAttnSfsQPtr = runnerParams.qScalePtr;
@@ -267,6 +272,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
             tllmRunnerParams.mSparseTopK = runnerParams.sparse_params.num_sparse_topk;
             tllmRunnerParams.ptrSparseMlaTopKLens = runnerParams.sparse_params.sparse_mla_topk_lens;
             tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
+            tllmRunnerParams.mUseGenKernelForPrefill = true;
             tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
             tllmRunnerParams.kvPageIdxPtr
                 = reinterpret_cast<int const*>(runnerParams.sparse_params.sparse_attn_indices);

@@ -23,9 +23,9 @@ from tensorrt_llm._torch.models.checkpoints.mistral.weight_mapper import \
 from tensorrt_llm._torch.models.modeling_mistral_large3 import (
     Mistral3Gate, MistralLarge3ForCausalLM)
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
-    MultimodalEncoderOutput, MultimodalModelMixin, PreparedLlmInputs)
+    MultimodalModelMixin, PreparedLlmInputs)
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
-    _MULTIMODAL_ENV_NAME, _is_disagg)
+    _MULTIMODAL_ENV_NAME, _is_mm_disagg)
 from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
                                                        DecoderModelForCausalLM,
                                                        _load_weights_impl,
@@ -463,6 +463,112 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
 
         return input_ids, extra_processed_inputs
 
+    # ------------------------------------------------------------------
+    # Deterministic dummy sizing for KV-cache encoder profiling.
+    #
+    # These power the modality-agnostic dummy contract
+    # (``get_mm_max_tokens_per_item`` / ``get_dummy_mm_data_for_tokens``) and
+    # are deliberately kept separate from the hashing path: the hashing path
+    # (``get_num_tokens_per_image``) keeps using the processor's LLM-side
+    # token count (Pixtral grid + ``[IMG_BREAK]``/``[IMG_END]`` framing), while
+    # encoder profiling needs the ViT attention-sequence length (pre-merge patch
+    # count). Different units, so the dummy path uses the private ``_vit_*``
+    # helpers below.
+    # ------------------------------------------------------------------
+    def _vision_geometry(self) -> Tuple[int, int, int, int]:
+        """``(patch_size, spatial_merge_size, num_channels, max_image_size)``,
+        read from the processor (mistral_common) or the HF ``vision_config``."""
+
+        vcfg = self.config.vision_config
+        proc = self.processor
+        patch = getattr(proc, "patch_size", None) or vcfg.patch_size
+        max_size = getattr(proc, "image_size", None) or getattr(
+            vcfg, "image_size", None)
+        merge = (getattr(self.config, "spatial_merge_size", None)
+                 or vcfg.spatial_merge_size)
+        channels = getattr(vcfg, "num_channels", None) or 3
+        return int(patch), int(merge), int(channels), int(max_size)
+
+    @staticmethod
+    def _vit_tokens(*, width: int, height: int, patch: int) -> int:
+        """ViT attention-sequence length (pre-merge patches) for a patch-aligned
+        image -- the encoder-side unit matching ``encoder_max_num_tokens``."""
+        return (height // patch) * (width // patch)
+
+    def get_size_for_max_tokens(self, *, max_tokens: int) -> Dict[str, int]:
+        """Largest square image (aligned to ``patch * spatial_merge_size`` so the
+        projector's merge tiles evenly, capped at ``max_image_size``) whose ViT
+        patch count is ``<= max_tokens``."""
+        if max_tokens <= 0:
+            raise ValueError(f"max_tokens must be positive, got {max_tokens}")
+        patch, merge, _, max_size = self._vision_geometry()
+        unit = patch * merge
+        edge = (max_size // unit) * unit
+        while edge > unit and self._vit_tokens(
+                width=edge, height=edge, patch=patch) > max_tokens:
+            edge -= unit
+        return {"width": edge, "height": edge, "num_frames": 1}
+
+    def get_dummy_mm_data_for_size(
+        self,
+        *,
+        width: int,
+        height: int,
+        num_frames: int = 1,
+        num_images: int = 1,
+        dtype: torch.dtype | None = None,
+    ) -> Dict[str, Any]:
+        """Processed Pixtral encoder tensors for ``num_images`` identical
+        ``(width, height)`` images: a ``[num_images, C, H, W]`` ``pixel_values``
+        zero tensor (content is irrelevant for memory profiling) plus the
+        matching ``image_sizes`` list the vision tower consumes."""
+        _, _, channels, _ = self._vision_geometry()
+        num_images = max(num_images, 1)
+        pixel_values = torch.zeros((num_images, channels, height, width),
+                                   dtype=dtype or self.dtype)
+        image_sizes = [[height, width]] * num_images
+        return {
+            "image": {
+                "pixel_values": pixel_values,
+                "image_sizes": image_sizes,
+            }
+        }
+
+    def get_mm_max_tokens_per_item(self) -> Dict[str, int]:
+        """Largest single image's ViT patch count (the ``max_image_size``-capped
+        square), used to weight the shared-budget split. Image only -- image and
+        video share the Pixtral ViT."""
+        patch, merge, _, max_size = self._vision_geometry()
+        unit = patch * merge
+        edge = max((max_size // unit) * unit, unit)
+        return {"image": self._vit_tokens(width=edge, height=edge, patch=patch)}
+
+    def get_dummy_mm_data_for_tokens(
+        self,
+        *,
+        max_tokens_per_modality: Dict[str, int],
+        dtype: torch.dtype | None = None,
+    ) -> Dict[str, Any]:
+        """Vision implementation of the agnostic profiler entry: fill the
+        ``"image"`` budget with identical worst-case images. ``num_images`` is
+        derived from the realized patch count so the batch saturates the
+        budget."""
+        budget = max_tokens_per_modality.get("image")
+        if not budget:
+            return {}
+        patch, _, _, _ = self._vision_geometry()
+        size = self.get_size_for_max_tokens(max_tokens=budget)
+        tokens_per_image = max(
+            1,
+            self._vit_tokens(width=size["width"],
+                             height=size["height"],
+                             patch=patch))
+        num_images = max(1, budget // tokens_per_image)
+        return self.get_dummy_mm_data_for_size(width=size["width"],
+                                               height=size["height"],
+                                               num_images=num_images,
+                                               dtype=dtype)
+
     def get_vocab_size(self) -> int:
         """Return the vocab size of the model."""
         # Unlike some other VLMs, mistral3's vocab size is stored in its `text_config`, not the top-level
@@ -567,7 +673,8 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         self,
         model_config: ModelConfig[Mistral3Config],
     ):
-        if _is_disagg():
+        # No MM E/P handoff here yet. Fail before partial model setup.
+        if _is_mm_disagg():
             raise NotImplementedError(
                 "Mistral3VLM does not support disaggregated inference yet. Please unset "
                 f"the {_MULTIMODAL_ENV_NAME} environment variable, or set it to '0'."
@@ -611,7 +718,7 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         # NOTE: attn_backend: Pixtral head size not always divisible by 128
         vision_model_config = self._get_sub_model_config(model_config_cp,
                                                          "vision_config",
-                                                         attn_backend="VANILLA",
+                                                         attn_backend="TRTLLM",
                                                          quant_config=None)
 
         self._vision_tower = modeling_pixtral.PixtralVisionModel(
@@ -704,10 +811,9 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
     def encode_multimodal_inputs(
         self,
         multimodal_params: Sequence[MultimodalParams],
-        **encoder_kwargs: Any,
-    ) -> MultimodalEncoderOutput:
+    ) -> torch.Tensor:
         mm_embeds = self._vision_forward(list(multimodal_params))
-        return MultimodalEncoderOutput(embeddings=mm_embeds[0])
+        return mm_embeds[0]
 
     def get_language_model_forward_kwargs(
         self,
