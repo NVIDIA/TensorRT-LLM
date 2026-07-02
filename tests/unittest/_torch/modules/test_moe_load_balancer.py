@@ -294,6 +294,11 @@ class TestMoeLoadBalancer(unittest.TestCase):
         mock_load_balancer_impl.return_value.set_warm_up_iter_count.assert_called_once_with(
             10)
 
+        # reconfigure_mask_only
+        balancer.reconfigure_mask_only([2])
+        mock_load_balancer_impl.return_value.reconfigure_mask_only.assert_called_once_with(
+            [2])
+
         balancer.set_iter_info(True, True)
 
         with MoeLoadBalancerIterContext(balancer):
@@ -305,6 +310,22 @@ class TestMoeLoadBalancer(unittest.TestCase):
         # shutdown
         balancer.shutdown()
         mock_load_balancer_impl.return_value.shutdown.assert_called_once()
+
+    @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
+    def test_reconfigure_mask_only_rejects_active_iteration(
+            self, mock_load_balancer_impl):
+        """Test mask-only reconfigure is rejected during an active iteration."""
+
+        torch.cuda.set_device(0)
+
+        balancer = MoeLoadBalancer(0, 4, 2)
+        balancer.in_iter = True
+
+        with self.assertRaisesRegex(RuntimeError, "iteration is active"):
+            balancer.reconfigure_mask_only([2])
+
+        mock_load_balancer_impl.return_value.reconfigure_mask_only.assert_not_called(
+        )
 
     def test_real_statistic_kernel(self):
         """Test the real statistic kernel functionality."""

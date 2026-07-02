@@ -13,6 +13,13 @@ import json
 import pytest
 import torch
 
+from tensorrt_llm._torch.modules.linear import (
+    FP8QDQLinearMethod,
+    Linear,
+    NVFP4LinearMethod,
+    UnquantizedLinearMethod,
+)
+
 # Importing the models package side-effects the ``@register_pipeline``
 # decorator on ``QwenImagePipeline`` being applied, which is what we are
 # testing here.
@@ -24,17 +31,16 @@ from tensorrt_llm._torch.visual_gen.models.qwen_image import (
 )
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.visual_gen.args import AttentionConfig
 
 
-def _tiny_static_nvfp4_model() -> QwenImageTransformer2DModel:
-    """Build a CPU-sized static NVFP4 model with representative exclusions."""
-    from tensorrt_llm.models.modeling_utils import QuantConfig
-    from tensorrt_llm.quantization.mode import QuantAlgo
-
+def _tiny_static_quant_model(quant_algo: QuantAlgo) -> QwenImageTransformer2DModel:
+    """Build a CPU-sized static FP8/NVFP4 model with representative exclusions."""
     quant_config = QuantConfig(
-        quant_algo=QuantAlgo.NVFP4,
-        group_size=16,
+        quant_algo=quant_algo,
+        group_size=16 if quant_algo == QuantAlgo.NVFP4 else None,
         exclude_modules=[
             "img_in",
             "txt_in",
@@ -45,6 +51,8 @@ def _tiny_static_nvfp4_model() -> QwenImageTransformer2DModel:
     )
     model_config = DiffusionModelConfig(
         quant_config=quant_config,
+        dynamic_weight_quant=False,
+        force_dynamic_quantization=False,
         skip_create_weights_in_init=False,
     )
     return QwenImageTransformer2DModel(
@@ -99,51 +107,136 @@ def test_transformer_load_weights_detects_mismatch():
         model.load_weights({})
 
 
-def test_static_quant_excludes_high_precision_layers():
+def test_transformer_applies_quant_config_ignore_list() -> None:
+    """Qwen-Image should honor selective dynamic quantization exclusions."""
+    model_config = DiffusionModelConfig(
+        quant_config=QuantConfig(
+            quant_algo=QuantAlgo.NVFP4,
+            exclude_modules=[
+                "transformer_blocks.0*",
+                "img_in",
+                "proj_out",
+            ],
+        ),
+        dynamic_weight_quant=True,
+        force_dynamic_quantization=True,
+    )
+    model = QwenImageTransformer2DModel(model_config=model_config, num_layers=2)
+
+    assert model.img_in.quant_config.quant_algo is None
+    assert model.proj_out.quant_config.quant_algo is None
+    assert model.transformer_blocks[0].attn.add_q_proj.quant_config.quant_algo is None
+    assert model.transformer_blocks[0].img_mlp.up_proj.quant_config.quant_algo is None
+    assert isinstance(model.img_in.quant_method, UnquantizedLinearMethod)
+    assert isinstance(model.proj_out.quant_method, UnquantizedLinearMethod)
+    assert isinstance(
+        model.transformer_blocks[0].attn.add_q_proj.quant_method, UnquantizedLinearMethod
+    )
+    assert isinstance(
+        model.transformer_blocks[0].img_mlp.up_proj.quant_method, UnquantizedLinearMethod
+    )
+
+    assert model.txt_in.quant_config.quant_algo == QuantAlgo.NVFP4
+    assert model.transformer_blocks[1].attn.add_q_proj.quant_config.quant_algo == QuantAlgo.NVFP4
+    assert isinstance(model.txt_in.quant_method, NVFP4LinearMethod)
+    assert isinstance(model.transformer_blocks[1].attn.add_q_proj.quant_method, NVFP4LinearMethod)
+
+
+@pytest.mark.parametrize("quant_algo", [QuantAlgo.NVFP4, QuantAlgo.FP8], ids=["nvfp4", "fp8"])
+def test_static_quant_excludes_high_precision_layers(quant_algo: QuantAlgo) -> None:
     """Layers in the checkpoint's ``ignore`` list build as unquantized.
 
-    A statically pre-quantized ModelOpt NVFP4 checkpoint stores the excluded
-    layers (embedders, output projection, first/last transformer blocks) in
-    BF16 with no scales, so they must fall back to the unquantized Linear
-    method while the rest stay NVFP4.
+    When a static ModelOpt checkpoint excludes layers, those layers are stored
+    in BF16 without scales. Embedders, the output projection, and selected
+    transformer blocks must therefore use the unquantized Linear method while
+    included layers retain the checkpoint's quantization format.
     """
-    from tensorrt_llm.quantization.mode import QuantAlgo
-
-    model = _tiny_static_nvfp4_model()
+    model = _tiny_static_quant_model(quant_algo)
 
     # Excluded layers materialize directly in their unquantized layout.
-    assert model.img_in.quant_config is None
-    assert model.txt_in.quant_config is None
-    assert model.proj_out.quant_config is None
-    assert model.norm_out.linear.quant_config is None
-    assert model.transformer_blocks[0].attn.to_q.quant_config is None
+    excluded = (
+        model.img_in,
+        model.txt_in,
+        model.proj_out,
+        model.norm_out.linear,
+        model.transformer_blocks[0].attn.to_q,
+    )
+    for module in excluded:
+        assert module.quant_config is not None
+        assert module.quant_config.quant_algo is None
+        assert module.quant_config.kv_cache_quant_algo is None
+        assert isinstance(module.quant_method, UnquantizedLinearMethod)
     assert model.img_in._weights_created
     assert model.img_in.weight.shape == (16, 16)
+    assert model.img_in.weight.dtype == torch.bfloat16
     assert not hasattr(model.img_in, "weight_scale")
 
-    # Included layers materialize in the NVFP4 layout.
+    # Included layers materialize in the selected static-quant layout.
     keep = model.transformer_blocks[1].attn.to_q.quant_config
-    assert keep is not None and keep.quant_algo == QuantAlgo.NVFP4
+    assert keep is not None and keep.quant_algo == quant_algo
+    assert keep.kv_cache_quant_algo is None
     quantized = model.transformer_blocks[1].attn.to_q
     assert quantized._weights_created
-    assert quantized.weight.shape == (16, 8)
     assert hasattr(quantized, "weight_scale")
+    assert hasattr(quantized, "input_scale")
+
+    if quant_algo == QuantAlgo.NVFP4:
+        assert isinstance(quantized.quant_method, NVFP4LinearMethod)
+        assert quantized.weight.dtype == torch.uint8
+        assert quantized.weight.shape == (16, 8)
+        assert quantized.weight_scale.dtype == torch.uint8
+        assert quantized.weight_scale_2.dtype == torch.float32
+    else:
+        assert isinstance(quantized.quant_method, FP8QDQLinearMethod)
+        assert quantized.weight.dtype == torch.float8_e4m3fn
+        assert quantized.weight.shape == (16, 16)
+        assert quantized.input_scale.dtype == torch.float32
+        assert quantized.input_scale.shape == torch.Size([])
+        assert quantized.weight_scale.dtype == torch.float32
+        assert quantized.weight_scale.shape == torch.Size([])
+        assert not hasattr(quantized, "weight_scale_2")
+
+    # Applying module-local exclusions must not mutate the global config.
+    assert model.model_config.quant_config is not None
+    assert model.model_config.quant_config.quant_algo == quant_algo
+    assert model.model_config.quant_config.kv_cache_quant_algo is None
 
 
-def test_static_quant_load_allows_only_missing_derived_parameters(monkeypatch):
-    """Static loading ignores quant helpers but still requires real weights."""
-    model = _tiny_static_nvfp4_model()
+@pytest.mark.parametrize("quant_algo", [QuantAlgo.NVFP4, QuantAlgo.FP8], ids=["nvfp4", "fp8"])
+def test_static_quant_load_allows_only_missing_non_serialized_parameters(
+    monkeypatch: pytest.MonkeyPatch, quant_algo: QuantAlgo
+) -> None:
+    """Static loading allows only format-specific, non-serialized helpers to be missing."""
+    model = _tiny_static_quant_model(quant_algo)
     expected = dict(model.named_parameters())
-    derived_param_names = ("alpha", "inv_input_scale", "kv_scales", "inv_kv_scales")
-    derived = {
+    non_serialized_suffixes = {
+        QuantAlgo.NVFP4: ("alpha", "inv_input_scale", "kv_scales", "inv_kv_scales"),
+        QuantAlgo.FP8: ("inv_input_scale", "kv_scales", "inv_kv_scales"),
+    }[quant_algo]
+    quantized_module_names = {
         name
-        for name in expected
-        if any(name.endswith(f".{param_name}") for param_name in derived_param_names)
+        for name, module in model.named_modules()
+        if isinstance(module, Linear)
+        and module.quant_config is not None
+        and module.quant_config.quant_algo == quant_algo
     }
-    for param_name in derived_param_names:
-        assert any(name.endswith(f".{param_name}") for name in derived)
+    assert quantized_module_names
+    assert "transformer_blocks.1.attn.to_q" in quantized_module_names
+    assert all(name.startswith("transformer_blocks.1.") for name in quantized_module_names)
 
-    checkpoint = {name: param.detach() for name, param in expected.items() if name not in derived}
+    non_serialized = {
+        f"{module_name}.{suffix}"
+        for module_name in quantized_module_names
+        for suffix in non_serialized_suffixes
+    }
+    assert model._non_serialized_quant_parameter_names() == non_serialized
+    assert non_serialized <= expected.keys()
+    if quant_algo == QuantAlgo.FP8:
+        assert not any(name.endswith(".alpha") for name in expected)
+
+    checkpoint = {
+        name: param.detach() for name, param in expected.items() if name not in non_serialized
+    }
     monkeypatch.setattr(
         DynamicLinearWeightLoader,
         "get_linear_weights",
@@ -157,13 +250,44 @@ def test_static_quant_load_allows_only_missing_derived_parameters(monkeypatch):
 
     model.load_weights(checkpoint)
 
-    real_weight = "transformer_blocks.1.attn.to_q.weight"
-    checkpoint_missing_weight = checkpoint.copy()
-    checkpoint_missing_weight.pop(real_weight)
-    with pytest.raises(RuntimeError) as exc_info:
-        model.load_weights(checkpoint_missing_weight)
-    assert real_weight in str(exc_info.value)
-    assert not any(name in str(exc_info.value) for name in derived)
+    # These keys are present in real static ModelOpt checkpoints and are not
+    # derived by TensorRT-LLM. Strict loading must reject each one if absent.
+    required_suffixes = ["weight", "bias", "input_scale", "weight_scale"]
+    if quant_algo == QuantAlgo.NVFP4:
+        required_suffixes.append("weight_scale_2")
+    for suffix in required_suffixes:
+        required_key = f"transformer_blocks.1.attn.to_q.{suffix}"
+        checkpoint_missing_key = checkpoint.copy()
+        checkpoint_missing_key.pop(required_key)
+        with pytest.raises(RuntimeError, match="Missing keys") as exc_info:
+            model.load_weights(checkpoint_missing_key)
+        assert required_key in str(exc_info.value)
+
+
+def test_static_fp8_loads_serialized_weights_and_derives_inverse_scale() -> None:
+    """Static FP8 loading copies checkpoint tensors and derives inverse input scales."""
+    model = _tiny_static_quant_model(QuantAlgo.FP8)
+    expected = dict(model.named_parameters())
+    non_serialized = model._non_serialized_quant_parameter_names()
+    checkpoint = {
+        name: torch.zeros_like(param)
+        for name, param in expected.items()
+        if name not in non_serialized
+    }
+    for name, value in checkpoint.items():
+        if name.endswith(".input_scale"):
+            value.fill_(2.0)
+        elif name.endswith(".weight_scale"):
+            value.fill_(0.25)
+
+    model.load_weights(checkpoint)
+
+    target_name = "transformer_blocks.1.attn.to_q"
+    target = model.transformer_blocks[1].attn.to_q
+    assert torch.equal(target.weight, checkpoint[f"{target_name}.weight"])
+    assert target.input_scale.item() == pytest.approx(2.0)
+    assert target.inv_input_scale.item() == pytest.approx(0.5)
+    assert target.weight_scale.item() == pytest.approx(0.25)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

@@ -24,7 +24,7 @@ from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
-                                         get_is_diffusion_model)
+                                         get_is_diffusion_only_model)
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
@@ -137,7 +137,7 @@ def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
     """
     always_include = {
         "model", "backend", "tokenizer", "custom_tokenizer",
-        "postprocess_tokenizer_dir"
+        "post_processor_hook", "postprocess_tokenizer_dir"
     }
 
     if param_name in always_include:
@@ -186,6 +186,7 @@ def get_llm_args(
         model: str,
         tokenizer: Optional[str] = None,
         custom_tokenizer: Optional[str] = None,
+        post_processor_hook: Optional[str] = None,
         backend: str = "pytorch",
         max_beam_width: int = BuildConfig.model_fields["max_beam_width"].
     default,
@@ -243,6 +244,8 @@ def get_llm_args(
         tokenizer,
         "custom_tokenizer":
         custom_tokenizer,
+        "post_processor_hook":
+        post_processor_hook,
         "postprocess_tokenizer_dir":
         tokenizer or model,
         "kv_cache_config":
@@ -645,6 +648,19 @@ class ChoiceWithAlias(click.Choice):
         "Custom tokenizer type: alias (e.g., 'deepseek_v32') or Python import path "
         "(e.g., 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer').",
         "prototype"))
+@click.option(
+    "--post_processor_hook",
+    type=str,
+    default=None,
+    help=help_info_with_stability_tag(
+        "Python import path of a user post-processing hook applied after "
+        "detokenization and before the per-endpoint response formatter (e.g. "
+        "'my_pkg.guardrail.MyPostProcessorHook'). The class must be importable "
+        "and picklable, take no constructor arguments, and be callable as "
+        "'__call__(chunk) -> verdict' (see tensorrt_llm.executor.postprocessor_hook). "
+        "It runs once per output, per streaming chunk, and may rewrite, "
+        "suppress, or terminate the output; it owns its own per-request state.",
+        "prototype"))
 @click.option("--host",
               type=str,
               default="localhost",
@@ -906,6 +922,17 @@ class ChoiceWithAlias(click.Choice):
         "used as the model name. This is useful when the model path is long or "
         "when you want to expose a custom name to clients.", "prototype"))
 @click.option(
+    "--enable_visual_gen",
+    is_flag=True,
+    default=False,
+    help=help_info_with_stability_tag(
+        "Enable VisualGen runtime for model checkpoints that support both LLM "
+        "and Visual Generation. Not required if --visual_gen_args specified "
+        "or the model supports Visual Generation only.",
+        "prototype",
+    ),
+)
+@click.option(
     "--visual_gen_args",
     type=str,
     default=None,
@@ -929,10 +956,11 @@ class ChoiceWithAlias(click.Choice):
     "Types of agents to schedule. Now Only Support Open Deep Research agent.")
 def serve(
         model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
-        host: str, port: int, log_level: str, backend: str, max_beam_width: int,
-        max_batch_size: int, max_num_tokens: int, max_seq_len: int,
-        tensor_parallel_size: int, pipeline_parallel_size: int,
-        context_parallel_size: int, moe_expert_parallel_size: Optional[int],
+        post_processor_hook: Optional[str], host: str, port: int,
+        log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
+        max_num_tokens: int, max_seq_len: int, tensor_parallel_size: int,
+        pipeline_parallel_size: int, context_parallel_size: int,
+        moe_expert_parallel_size: Optional[int],
         moe_cluster_parallel_size: Optional[int], gpus_per_node: Optional[int],
         free_gpu_memory_fraction: float, kv_cache_dtype: str,
         num_postprocess_workers: int, trust_remote_code: bool,
@@ -946,7 +974,7 @@ def serve(
         agent_types: Optional[str], video_pruning_rate: Optional[float],
         telemetry: bool, custom_module_dirs: list[Path],
         chat_template: Optional[str], allow_request_chat_template: bool,
-        middleware: tuple[str, ...], grpc: bool,
+        middleware: tuple[str, ...], grpc: bool, enable_visual_gen: bool,
         served_model_name: Optional[str], visual_gen_args: Optional[str]):
     """Running an OpenAI API compatible server
 
@@ -1014,6 +1042,7 @@ def serve(
             model=model,
             tokenizer=tokenizer,
             custom_tokenizer=custom_tokenizer,
+            post_processor_hook=post_processor_hook,
             backend=backend,
             max_beam_width=max_beam_width,
             max_batch_size=max_batch_size,
@@ -1147,7 +1176,8 @@ def serve(
         launch_visual_gen_server(host, port, model, parsed_visual_gen_args,
                                  metadata_server_cfg, middleware)
 
-    is_visual_gen = visual_gen_args is not None or get_is_diffusion_model(model)
+    is_visual_gen = (enable_visual_gen or visual_gen_args is not None
+                     or get_is_diffusion_only_model(model))
     if is_visual_gen:
         _serve_visual_gen()
     else:

@@ -19,22 +19,37 @@ This module implements the ``apply_sharding_hints`` and ``strip_sharding_hints``
 transforms, which apply deterministic, node-local sharding based on explicit
 hint kwargs on custom ops and a runtime ``DistConfig``.
 
-This is the replacement for the legacy heuristic-based sharding pipeline in
-``sharding.py``.  See the design documents in ``sharding_architecture_documents/``
-for background.
+This is the default AutoDeploy sharding pipeline. ``is_shardingIR_enabled``
+auto-detects whether the exported FX graph carries the IR's ``all_reduce``
+markers; ``apply_sharding_hints`` consumes them and short-circuits the
+heuristic-detection fallback in ``sharding.py``. Both stay registered in
+``default.yaml`` so the long-tail of modeling files not yet ported to IR
+keeps working transparently. See the design documents in
+``sharding_architecture_documents/`` for background.
 """
 
 import operator
 from abc import ABC, abstractmethod
+from enum import IntEnum
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 
 import torch
+import torch.nn as nn
 from pydantic import Field, field_validator
 from torch._ops import OpOverload, OpOverloadPacket
 from torch.fx import GraphModule, Node
 
 from ..._compat import AllReduceStrategy
+
+try:
+    from ...custom_ops.distributed.trtllm_dist import is_trtllm_op_available
+except ImportError:
+
+    def is_trtllm_op_available():
+        return False
+
+
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import del_attr_by_name, eliminate_dead_code
@@ -48,10 +63,15 @@ from ...utils.node_utils import (
     extract_weight_nodes,
     invalidate_weight_node_cache,
     is_any_lin_op,
+    is_op,
     set_op_args,
     shape,
 )
 from ...utils.pipeline_cache_hooks import mark_pipeline_cache_hook
+from ...utils.quantization_utils import (
+    cutlass_fp4_scale_to_modelopt_fp4_scale,
+    modelopt_fp4_scale_to_cutlass_fp4_scale,
+)
 from ..interface import (
     BaseTransform,
     SharedConfig,
@@ -60,16 +80,312 @@ from ..interface import (
     TransformRegistry,
 )
 
-# NOTE: sharding.py module will be deprecated in the future. The following
-# imports will move into sharding_ir.py when legacy sharding is removed.
-from .sharding import (
-    SplitDimension,
-    _get_dist_ops,
-    _load_hook,
-    _shard_fp4_weight_scale,
-    shard_weight_tensor,
-    validate_allreduce_strategy,
-)
+# ---------------------------------------------------------------------------
+# Shared sharding primitives.
+#
+# These weight-splitting / hook / dist-op helpers are the canonical sharding
+# building blocks and live here, in the now-default IR pipeline. The legacy
+# heuristic pipeline (``sharding.py``) imports them from this module -- the
+# dependency points legacy -> IR, never the reverse, so ``sharding_ir.py`` has
+# no import dependency on ``sharding.py``.
+# ---------------------------------------------------------------------------
+
+
+class SplitDimension(IntEnum):
+    """Enum for tensor split dimensions in sharding."""
+
+    # NOTE: The names COLUMN/ROW reflect the hugging face
+    # base_tp_plan sharding notation, but since we assume Y = W @ X^T,
+    # when splitting weight matrix W^T across columns, the actual split
+    # is over dimension 0
+    COLUMN = 0
+    ROW = 1
+
+
+def validate_allreduce_strategy(v):
+    """Convert string names like 'AUTO' to AllReduceStrategy enum.
+
+    This is a shared validator for allreduce_strategy fields across all config classes.
+
+    Args:
+        v: Value to validate - can be AllReduceStrategy enum, string name, or integer value
+
+    Returns:
+        AllReduceStrategy enum value
+
+    Raises:
+        ValueError: If the input is an invalid strategy string
+    """
+    if isinstance(v, AllReduceStrategy):
+        return v
+    if isinstance(v, str):
+        # Try to get enum by name
+        try:
+            return AllReduceStrategy[v]
+        except KeyError:
+            raise ValueError(
+                f"Invalid allreduce strategy: {v}. "
+                f"Valid options: {', '.join(s.name for s in AllReduceStrategy)}"
+            )
+    if isinstance(v, int):
+        return AllReduceStrategy(v)
+    return v  # Let Pydantic handle other types
+
+
+_LOGGED_DIST_BACKEND_CHOICES: set[tuple[str, str]] = set()
+
+
+def _log_dist_backend_choice(configured_backend: str, resolved_backend: str):
+    key = (configured_backend, resolved_backend)
+    if key in _LOGGED_DIST_BACKEND_CHOICES:
+        return
+    _LOGGED_DIST_BACKEND_CHOICES.add(key)
+    ad_logger.info(
+        f"AutoDeploy selected distributed backend: {resolved_backend} "
+        f"(configured: {configured_backend})"
+    )
+
+
+def _get_dist_ops(backend: str):
+    """Get the (all_gather, all_reduce) op pair for *backend*.
+
+    backend may be 'auto', 'trtllm', or 'torch'. 'auto' resolves to TRT-LLM
+    ops when available, else PyTorch distributed ops. Strategies (allgather
+    SYMM_MEM, allreduce NCCL/etc.) are passed as op arguments at the call
+    site, not selected here.
+    """
+    if hasattr(backend, "value"):
+        backend = backend.value
+    configured_backend = str(backend)
+
+    if backend == "trtllm":
+        _log_dist_backend_choice(configured_backend, "trtllm")
+        return (
+            torch.ops.auto_deploy.trtllm_dist_all_gather.default,
+            torch.ops.auto_deploy.trtllm_dist_all_reduce.default,
+        )
+    if backend == "torch":
+        _log_dist_backend_choice(configured_backend, "torch")
+        return (
+            torch.ops.auto_deploy.torch_dist_all_gather.default,
+            torch.ops.auto_deploy.torch_dist_all_reduce.default,
+        )
+    if is_trtllm_op_available():
+        _log_dist_backend_choice(configured_backend, "trtllm")
+        return (
+            torch.ops.auto_deploy.trtllm_dist_all_gather.default,
+            torch.ops.auto_deploy.trtllm_dist_all_reduce.default,
+        )
+    _log_dist_backend_choice(configured_backend, "torch")
+    return (
+        torch.ops.auto_deploy.torch_dist_all_gather.default,
+        torch.ops.auto_deploy.torch_dist_all_reduce.default,
+    )
+
+
+def _load_hook(
+    state_dict,
+    prefix,
+    *args,
+    f_split: Callable[[torch.Tensor, int], torch.Tensor],
+    param_key: str,
+    param_shape: torch.Size,
+):
+    # TODO: we need to support loading either a sharded or unsharded checkpoint.
+    # Otherwise, basic workflows like
+    # model.load_state_dict(model.state_dict()) will fail.
+    # This is quite a hacky solution. A better solution would be to store extra_state in
+    # the state_dict to identify whether the state_dict is sharded or not.
+    key = prefix + param_key
+    if key not in state_dict:
+        return
+    p_to_load = state_dict[key]
+    did_split = param_shape != p_to_load.shape
+    p_to_load = p_to_load if not did_split else f_split(p_to_load)
+    state_dict[key] = p_to_load
+
+
+def _split_tensor_for_tp(
+    t: torch.Tensor,
+    dim: int,
+    rank: int,
+    world_size: int,
+    min_local_shape: int = 1,
+) -> torch.Tensor:
+    """Split a tensor for tensor-parallelism, respecting min_local_shape.
+
+    When world_size exceeds the maximum number of even splits (e.g. GQA with
+    num_kv_heads < world_size), multiple ranks share the same shard.
+
+    TODO: support num_units % world_size != 0 via GCD-based partial replication.
+    When num_heads doesn't divide by world_size (e.g. 28 Q heads at tp_size=8),
+    use effective_splits = gcd(num_heads, world_size) to split at head
+    boundaries and replicate each shard across world_size // effective_splits
+    ranks. To compensate the duplication in all_reduce, scale rowwise weights
+    by 1 / replication_factor during sharding (baked into the weight tensor,
+    no changes to all_reduce or the graph needed).
+    """
+    max_split_size = t.shape[dim] // min_local_shape
+    if max_split_size == 0:
+        # dim is smaller than a single local-shard unit. With min_local_shape=1
+        # (the default) this never happens; it only arises once a per-op floor is
+        # imposed (e.g. NVFP4 nodes set min_local_shape=32 so each shard stays a
+        # whole 16-element FP4 scale block). Raise an actionable error instead of
+        # the bare ``ZeroDivisionError`` the ``world_size % max_split_size`` below
+        # would otherwise throw.
+        raise ValueError(
+            f"Cannot tensor-parallel split dim {dim} of size {t.shape[dim]}: it is "
+            f"smaller than min_local_shape ({min_local_shape}). For NVFP4 weights this "
+            f"means the dimension is below the 16-element FP4 block / MIN_LOCAL_SHAPE "
+            f"floor and cannot be sharded across {world_size} ranks; widen the dim or "
+            f"exclude this node from sharding."
+        )
+    if world_size > max_split_size:
+        assert world_size % max_split_size == 0, (
+            f"world_size ({world_size}) must be divisible by max_split_size ({max_split_size}). "
+            f"GQA with num_kv_heads not dividing world_size is not supported."
+        )
+        num_groups = world_size // max_split_size
+        ad_logger.debug(
+            f"World size {world_size} is greater than the max split size {max_split_size}. "
+            f"Splitting tensor to {num_groups} chunks"
+        )
+        return torch.tensor_split(t, max_split_size, dim=dim)[rank // num_groups]
+
+    assert max_split_size % world_size == 0, (
+        f"Number of units ({max_split_size}, dim {dim} size {t.shape[dim]} / "
+        f"min_local_shape {min_local_shape}) must be divisible by world_size "
+        f"({world_size}). For attention heads, use a world_size that divides "
+        f"num_heads evenly (e.g. for {max_split_size} heads, try world_size in "
+        f"{[d for d in range(2, max_split_size + 1) if max_split_size % d == 0]})."
+    )
+    return torch.tensor_split(t, world_size, dim=dim)[rank]
+
+
+def _shard_fp4_weight_scale(
+    weight_scale,
+    original_uint8_weight_shape,
+    dim,
+    rank,
+    world_size,
+    min_local_shape=1,
+    fused_weight_dims=None,
+):
+    # Convert original uint8 shape to element shape (FP4 packs 2 elements per byte)
+    weight_shape_elements = list(original_uint8_weight_shape)
+    weight_shape_elements[-1] *= 2
+    modelopt_weight_scale = cutlass_fp4_scale_to_modelopt_fp4_scale(
+        weight_scale, tuple(weight_shape_elements)
+    )
+    if fused_weight_dims is not None:
+        # Fused weights (e.g. Mamba in_proj) are split per-component then sharded.
+        # The scale must follow the same per-component splitting to stay aligned.
+        sharded_scale = torch.cat(
+            [
+                _split_tensor_for_tp(chunk, dim, rank, world_size, min_local_shape)
+                for chunk in torch.split(modelopt_weight_scale, list(fused_weight_dims), dim=dim)
+            ],
+            dim=dim,
+        )
+    else:
+        sharded_scale = _split_tensor_for_tp(
+            modelopt_weight_scale, dim, rank, world_size, min_local_shape
+        )
+    return modelopt_fp4_scale_to_cutlass_fp4_scale(sharded_scale)
+
+
+def shard_weight_tensor(
+    gm: GraphModule,
+    weight_tensor: torch.Tensor,
+    param_key: str,
+    dim: int,
+    rank: int,
+    world_size: int,
+    min_local_shape: int = 1,
+    fused_weight_dims: Optional[list] = None,
+    requires_grad: bool = False,
+    custom_shard_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+) -> Tuple[torch.Tensor, torch.Size]:
+    """Shard a weight tensor across ranks and register load hook.
+
+    Args:
+        gm: GraphModule containing the weight
+        weight_tensor: The weight tensor to shard
+        param_key: Parameter key for registering load hook
+        dim: Dimension to shard along
+        rank: Current rank
+        world_size: Total number of ranks
+        min_local_shape: Minimum local shape constraint (for GQA)
+        fused_weight_dims: List of dimensions for fused weights
+        custom_shard_fn: Optional custom function to shard the tensor
+        requires_grad: Whether the parameter should require gradients
+
+    Returns:
+        Tuple of (sharded_tensor, sharded_shape)
+    """
+
+    # Handle fused weights
+    if fused_weight_dims is not None:
+
+        def f_split(
+            t: torch.Tensor,
+            fused_dims: list = fused_weight_dims,
+            d: int = dim,
+        ) -> torch.Tensor:
+            return torch.cat(
+                [
+                    _split_tensor_for_tp(w, dim, rank, world_size, min_local_shape)
+                    for w in torch.split(t, fused_dims, dim=d)
+                ],
+                dim=d,
+            )
+
+    else:
+        f_split = partial(
+            _split_tensor_for_tp,
+            dim=dim,
+            rank=rank,
+            world_size=world_size,
+            min_local_shape=min_local_shape,
+        )
+
+    sharded_weight = f_split(weight_tensor)
+    sharded_shape = sharded_weight.shape
+
+    # Update the parameter in the module
+    modname, _, param_name = param_key.rpartition(".")
+    submod = gm.get_submodule(modname)
+
+    # Register load hook on the owning submodule (not the top-level gm).
+    # This ensures the hook runs *after* any parent-level hooks that transform
+    # the state_dict (e.g., unfusing fused MoE checkpoint weights into
+    # individual expert keys). With the hook on gm, it would run before
+    # unfusing and fail to find the individual expert keys.
+    hook = partial(
+        _load_hook,
+        f_split=f_split,
+        param_key=param_name,
+        param_shape=sharded_shape,
+    )
+    submod._register_load_state_dict_pre_hook(
+        mark_pipeline_cache_hook(
+            hook,
+            {
+                "type": "shard_tp",
+                "param_key": param_name,
+                "param_shape": list(sharded_shape),
+                "dim": dim,
+                "rank": rank,
+                "world_size": world_size,
+                "min_local_shape": min_local_shape,
+                "fused_weight_dims": list(fused_weight_dims) if fused_weight_dims else None,
+            },
+        )
+    )
+    param_new = nn.Parameter(sharded_weight.detach().clone(), requires_grad=requires_grad)
+    setattr(submod, param_name, param_new)
+
+    return sharded_weight, sharded_shape
 
 
 def _split_fp8_block_scale(
@@ -212,6 +528,15 @@ class ShardableNode(ABC):
 
     _REGISTRY: Dict[OpOverload, Type["ShardableNode"]] = {}
 
+    # Minimum per-rank shard size (in elements along the split dim) this op
+    # requires, independent of any model/layer/config hint. The TP split is
+    # rounded down to a multiple of this value (see ``_split_tensor_for_tp``).
+    # NVFP4 linears override this to 32 because the NVFP4 GEMM requires the
+    # local ``n`` dimension to be divisible by 32 -- a hard dtype constraint,
+    # not a tunable. The effective floor is ``max(MIN_LOCAL_SHAPE, hint)`` so
+    # larger constraints (e.g. GQA head_dim) still win.
+    MIN_LOCAL_SHAPE: int = 1
+
     def __init__(self, node: Node):
         self.node = node
 
@@ -352,10 +677,16 @@ class LinearShardableNode(ShardableNode):
         )
         if tp_mode == "none":
             return 0
-
         split_dim = SplitDimension.COLUMN if tp_mode == "colwise" else SplitDimension.ROW
         fused = tuple(output_sizes) if output_sizes else None
-        min_shape = tp_min_local_shape if tp_min_local_shape else 1
+        # Honor the op's dtype floor (e.g. 32 for NVFP4) on top of any hint so the
+        # per-rank shard stays GEMM-valid regardless of model/layer config. The
+        # NVFP4 GEMM constrains the *output* (column) dim to a multiple of 32; the
+        # input (row) dim is FP4-packed (2 values/byte) so a column floor must NOT
+        # be applied there (it would over-constrain the packed dim and reject
+        # otherwise-valid shards).
+        col_floor = self.MIN_LOCAL_SHAPE if split_dim == SplitDimension.COLUMN else 1
+        min_shape = max(tp_min_local_shape if tp_min_local_shape else 1, col_floor)
 
         weight_nodes = extract_weight_nodes(self.node)
 
@@ -426,6 +757,10 @@ class FineGrainedFP8LinearShardableNode(LinearShardableNode):
 )
 class FP4LinearShardableNode(LinearShardableNode):
     """NVFP4 linear: shards cutlass-format ``weight_scale`` buffers."""
+
+    # NVFP4 GEMM requires the local ``n`` dimension divisible by 32; floor the
+    # TP split granularity so every rank's shard stays kernel-valid.
+    MIN_LOCAL_SHAPE: int = 32
 
     def _shard_scales(self, gm, dc, weight_nodes, dim, min_shape=1, fused=None):
         weight_shape = weight_nodes.weights[0].tensor.shape if weight_nodes.weights else None
@@ -589,13 +924,24 @@ class Conv1dShardableNode(ShardableNode):
     torch.ops.auto_deploy.torch_ssm,
     torch.ops.auto_deploy.torch_gated_delta_rule,
     torch.ops.auto_deploy.torch_mla,
+    torch.ops.auto_deploy.torch_attention,
 )
 class WeightedParamShardableNode(ShardableNode):
     """Ops whose weight parameters are sharded along dim 0 (head dimension).
 
-    Covers SSM (A, D, dt_bias), GatedDeltaNet (A_log, dt_bias), and MLA
-    (kv_b_proj).  All share identical sharding logic: when ``enable_sharding``
-    is ``True``, every discovered weight parameter is split along dim 0.
+    Covers SSM (A, D, dt_bias), GatedDeltaNet (A_log, dt_bias), MLA
+    (kv_b_proj), and ``torch_attention`` (per-head free Parameters such as
+    GPT-OSS's ``sinks``). All share identical sharding logic: when
+    ``enable_sharding`` is ``True``, every discovered weight parameter is
+    split along dim 0.
+
+    For ``torch_attention``: q/k/v projection weights belong to the preceding
+    ``torch_linear_simple`` nodes and are sharded by ``LinearShardableNode``;
+    only direct ``get_attr`` args of the ``torch_attention`` node itself
+    (e.g. ``sinks``) are sliced here. Models that pass no head-wise Parameter
+    to ``torch_attention`` (qwen3, llama, smollm3, ...) leave
+    ``enable_sharding`` at its default ``False`` and this handler no-ops for
+    them.
     """
 
     def apply(self, gm: GraphModule, dc: DistConfig, max_num_tokens: int = 0) -> int:
@@ -721,13 +1067,19 @@ class SwiGLUShardableNode(ShardableNode):
             return 0
 
         for wn in weight_nodes.weights:
+            wdim = self._dim_for_key(wn.node_key)
+            # Column floor (e.g. 32 for NVFP4) applies only to the output dim;
+            # the row dim is FP4-packed and must not inherit it (see
+            # LinearShardableNode.apply).
+            min_ls = self.MIN_LOCAL_SHAPE if wdim == SplitDimension.COLUMN else 1
             shard_weight_tensor(
                 gm=gm,
                 weight_tensor=wn.tensor,
                 param_key=wn.node_key,
-                dim=self._dim_for_key(wn.node_key),
+                dim=wdim,
                 rank=dc.tp_rank,
                 world_size=dc.tp_size,
+                min_local_shape=min_ls,
             )
 
         for bn in weight_nodes.biases:
@@ -778,19 +1130,38 @@ class FineGrainedFP8SwiGLUShardableNode(SwiGLUShardableNode):
 class FP4SwiGLUShardableNode(SwiGLUShardableNode):
     """NVFP4 SwiGLU: shards cutlass-format ``weight_scale`` buffers."""
 
+    # NVFP4 GEMM requires the local ``n`` dimension divisible by 32 (see
+    # FP4LinearShardableNode); apply the same floor to the fused SwiGLU split.
+    MIN_LOCAL_SHAPE: int = 32
+
     def _shard_scales(self, gm, dc, weight_nodes):
-        weight_shape = weight_nodes.weights[0].tensor.shape if weight_nodes.weights else None
-        if weight_shape is None:
+        if not weight_nodes.weights:
             return
+
+        # Each NVFP4 weight_scale must be de-swizzled with ITS OWN weight's uint8
+        # shape. The fused SwiGLU carries gate/up/down weights whose shapes differ
+        # (down_proj's in/out are transposed vs gate/up), so using weights[0] for
+        # every scale corrupts the down_proj scale -> garbage MLP output. Pair each
+        # scale with its weight by module prefix (strip the trailing ``.weight`` /
+        # ``.weight_scale`` leaf).
+        def _module_prefix(node_key: str) -> str:
+            return node_key.rsplit(".", 1)[0]
+
+        shape_by_prefix = {
+            _module_prefix(wn.node_key): wn.tensor.shape for wn in weight_nodes.weights
+        }
+        fallback_shape = weight_nodes.weights[0].tensor.shape
         for sn in weight_nodes.scales:
+            weight_shape = shape_by_prefix.get(_module_prefix(sn.node_key), fallback_shape)
             dim = self._dim_for_key(sn.node_key)
+            min_ls = self.MIN_LOCAL_SHAPE if dim == SplitDimension.COLUMN else 1
             f_split = partial(
                 _shard_fp4_weight_scale,
                 original_uint8_weight_shape=weight_shape,
                 dim=dim,
                 rank=dc.tp_rank,
                 world_size=dc.tp_size,
-                min_local_shape=1,
+                min_local_shape=min_ls,
                 fused_weight_dims=None,
             )
             sharded = f_split(sn.tensor)
@@ -800,7 +1171,7 @@ class FP4SwiGLUShardableNode(SwiGLUShardableNode):
                 sharded,
                 f_split,
                 _fp4_weight_scale_pipeline_cache_spec(
-                    sn, sharded, weight_shape, dim, dc.tp_rank, dc.tp_size, 1
+                    sn, sharded, weight_shape, dim, dc.tp_rank, dc.tp_size, min_ls
                 ),
             )
 
@@ -888,21 +1259,36 @@ class MoEShardableNode(ShardableNode):
                 nodes_to_remove.extend(removed)
         self.node.args = tuple(args)
 
-        if enable_alltoall:
-            mapping_config = dc.serialize()
-            batch_info_host_nodes = gm.graph.find_nodes(op="placeholder", target="batch_info_host")
-            batch_info_host_node = batch_info_host_nodes[0] if batch_info_host_nodes else None
-            set_op_args(
-                self.node,
-                mapping_config=mapping_config,
-                max_num_tokens=max_num_tokens,
-                batch_info_host=batch_info_host_node,
-            )
-        else:
-            # with pure EP/TP parallelism, global expert indices must be localized
+        # Localize global expert indices to per-rank-local indices on the all-reduce
+        # path (attention-DP off): each rank computes only its expert slice and the
+        # partials are summed by all_reduce. The all-to-all path (attention-DP on)
+        # keeps GLOBAL expert IDs -- dispatch/combine handles routing.
+        if not enable_alltoall:
             self._localize_expert_indices(
                 gm, selected_experts, routing_weights, experts_per_rank, ep_rank, ep_size
             )
+
+        # Always record the MoE grid + workspace inputs on the op, mirroring legacy
+        # ``_insert_sharded_moe`` (which sets these unconditionally). The gate on the
+        # parallelism mode is *localization* (above), not the mapping metadata -- the
+        # latter is consumed by multiple backends/paths regardless of all-to-all:
+        #   * all-to-all: ``mapping_config`` + ``max_num_tokens`` + ``batch_info_host``
+        #     drive dispatch/combine and workspace sizing.
+        #   * all-reduce + TRTLLM-Gen internal routing: ``mapping_config`` lets the
+        #     fused kernel recover the GLOBAL expert count and per-rank expert offset;
+        #     without it the op falls back to ``num_experts = local_num_experts`` while
+        #     ``router_logits`` keeps the global width -> "routing_logits has incorrect
+        #     shape" (or silent misrouting).
+        # Args a given path does not consume (e.g. ``max_num_tokens`` on all-reduce)
+        # are harmless.
+        batch_info_host_nodes = gm.graph.find_nodes(op="placeholder", target="batch_info_host")
+        batch_info_host_node = batch_info_host_nodes[0] if batch_info_host_nodes else None
+        set_op_args(
+            self.node,
+            mapping_config=dc.serialize(),
+            max_num_tokens=max_num_tokens,
+            batch_info_host=batch_info_host_node,
+        )
 
         ad_logger.debug(
             f"  sharded MoE: {num_experts} experts, ep={ep_size}, ep_rank={ep_rank}, "
@@ -1033,6 +1419,104 @@ except AttributeError:
     pass
 
 
+@ShardableNode.register(torch.ops.auto_deploy.torch_moe_dense_mlp)
+class DenseMLPMoEShardableNode(ShardableNode):
+    """EP sharding for ``torch_moe_dense_mlp`` (stacked-tensor dense MoE).
+
+    The op signature (see ``custom_ops/fused_moe/torch_moe.py``) is::
+
+        torch_moe_dense_mlp(
+            hidden_states,    # [B, S, H]
+            routing_weights,  # [B*S, E]
+            gate_up_w,        # [E, H, 2I]
+            gate_up_b,        # [E, 2I]
+            down_w,           # [E, I, H]
+            down_b,           # [E, H]
+            alpha,            # float
+            limit,            # float
+        ) -> [B, S, H]
+
+    The op is additive over experts (``next_states.sum(dim=0)`` at the end), so
+    EP sharding is just "give each rank a slice of experts and ``all_reduce`` at
+    the end". We slice the four stacked expert tensors at dim 0 plus the
+    routing_weights at dim 1 (matching ``num_experts``, which the op reads from
+    ``routing_weights.shape[1]``), then insert an ``all_reduce`` after the op
+    so partial per-rank sums combine into the full expert sum.
+
+    Slicing is graph-level (``aten.slice``), mirroring
+    :class:`StackedMoEShardableNode` for ``triton_mxfp4_moe``. Parameters stay
+    full-size on every rank; only the runtime forward uses the rank's slice.
+    Memory-wise not optimal, but the math is bit-correct for the equivalence
+    test and matches the existing stacked-MoE precedent. A follow-up could
+    replace this with true per-rank param slicing via load hooks.
+    """
+
+    _IDX_ROUTING_WEIGHTS = 1
+    _IDX_GATE_UP_W = 2
+    _IDX_GATE_UP_B = 3
+    _IDX_DOWN_W = 4
+    _IDX_DOWN_B = 5
+
+    def apply(self, gm: GraphModule, dc: DistConfig, max_num_tokens: int = 0) -> int:
+        ep_size = dc.moe_ep_size
+        ep_rank = dc.moe_ep_rank
+
+        if ep_size <= 1:
+            return 0
+
+        expert_shape = shape(self.node.args[self._IDX_GATE_UP_W])
+        assert expert_shape is not None, (
+            f"Cannot determine num_experts: gate_up_w arg has no shape metadata "
+            f"(node: {self.node.name})"
+        )
+        num_experts = expert_shape[0]
+        assert num_experts % ep_size == 0, (
+            f"num_experts ({num_experts}) must be divisible by ep_size ({ep_size})"
+        )
+        per = num_experts // ep_size
+        lo = per * ep_rank
+        hi = num_experts if ep_rank == ep_size - 1 else lo + per
+
+        # Graph-level slice of every expert-stacked arg along the expert dim.
+        args = list(self.node.args)
+        for idx in (
+            self._IDX_GATE_UP_W,
+            self._IDX_GATE_UP_B,
+            self._IDX_DOWN_W,
+            self._IDX_DOWN_B,
+        ):
+            with gm.graph.inserting_after(args[idx]):
+                args[idx] = gm.graph.call_function(
+                    torch.ops.aten.slice.Tensor,
+                    args=(args[idx], 0, lo, hi, 1),
+                )
+        # routing_weights is sliced along the expert column (dim 1) so the op's
+        # internal ``num_experts = routing_weights.shape[1]`` matches the sliced
+        # weight stacks.
+        with gm.graph.inserting_before(self.node):
+            args[self._IDX_ROUTING_WEIGHTS] = gm.graph.call_function(
+                torch.ops.aten.slice.Tensor,
+                args=(args[self._IDX_ROUTING_WEIGHTS], 1, lo, hi, 1),
+            )
+        self.node.args = tuple(args)
+
+        # Sum the per-rank partial (over local experts) into the full expert sum.
+        _, all_reduce_op = _get_dist_ops("auto")
+        with gm.graph.inserting_after(self.node):
+            red = gm.graph.call_function(
+                all_reduce_op,
+                args=(self.node, dc.allreduce_strategy),
+            )
+            self.node.replace_all_uses_with(red)
+            red.replace_input_with(red, self.node)
+
+        ad_logger.debug(
+            f"  sharded torch_moe_dense_mlp: {num_experts} experts, "
+            f"ep={ep_size}, rank slice [{lo}:{hi}]"
+        )
+        return 1
+
+
 # =============================================================================
 # IR sharding config
 # =============================================================================
@@ -1041,10 +1525,9 @@ except AttributeError:
 class IRShardingConfig(TransformConfig):
     """Minimal configuration for the hint-driven IR sharding transform.
 
-    This replaces the legacy ``ShardingTransformConfig`` for
-    ``ApplyShardingHints``, carrying only the fields that the IR path actually
-    reads.  When the legacy sharding path is removed, this is the only sharding
-    config class.
+    Carries only the fields the IR pipeline reads. ``ShardingTransformConfig``
+    in ``sharding.py`` is the parallel config used by the heuristic-detection
+    fallback for modeling files not yet ported to IR.
     """
 
     allreduce_strategy: AllReduceStrategy = Field(
@@ -1220,6 +1703,27 @@ class StripShardingHints(BaseTransform):
         )
 
 
+def is_shardingIR_enabled(gm: GraphModule) -> bool:
+    """Whether the FX graph contains sharding-IR marker nodes.
+
+    The sharding-IR pipeline inserts ``torch.ops.auto_deploy.all_reduce`` nodes
+    in the modeling source (per ad-sharding-ir-port skill rule A3) to mark
+    rowwise-projection / MoE-merge points. Legacy ``detect_sharding`` never
+    emits this op (it inserts ``dist.all_reduce`` later), so the presence of
+    any such node is a sufficient signal that the modeling file was authored
+    against the sharding IR.
+
+    This is the marker the default-sharding dispatcher uses to decide between
+    the IR pipeline (``apply_sharding_hints``) and the legacy pipeline
+    (``detect_sharding`` + ``sharding_transform_executor``).
+    """
+    target = torch.ops.auto_deploy.all_reduce
+    for node in gm.graph.nodes:
+        if is_op(node, target):
+            return True
+    return False
+
+
 @TransformRegistry.register("apply_sharding_hints")
 class ApplyShardingHints(BaseTransform):
     """Deterministic, node-local sharding transform driven by hint kwargs.
@@ -1227,6 +1731,12 @@ class ApplyShardingHints(BaseTransform):
     Iterates graph nodes and applies sharding based on explicit hint arguments
     (tp_mode, tp_scaled_dim, tp_scale_sizes, etc.) together with the runtime
     DistConfig.  No cross-node propagation, no topology inference.
+
+    When the FX graph contains no sharding-IR markers (no
+    ``torch.ops.auto_deploy.all_reduce`` node), this transform is a no-op and
+    leaves the graph for the legacy ``detect_sharding`` pipeline. Otherwise it
+    sets ``gm.meta["sharding_ir_applied"] = True`` after applying, which
+    ``Sharding`` / ``ShardingTransformExecutor`` read to skip themselves.
     """
 
     config: IRShardingConfig
@@ -1261,6 +1771,19 @@ class ApplyShardingHints(BaseTransform):
         _log_sharding_prelude(dc)
 
         if shared_config.world_size < 2:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        # Auto-detect dispatcher: if the FX graph contains no sharding-IR markers,
+        # this modeling file was not authored against the sharding IR. Skip and
+        # let the legacy detect_sharding pipeline handle it.
+        if not is_shardingIR_enabled(gm):
+            ad_logger.info(
+                "apply_sharding_hints: no sharding-IR markers in graph "
+                "(no torch.ops.auto_deploy.all_reduce node); deferring to legacy "
+                "detect_sharding pipeline."
+            )
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
@@ -1323,6 +1846,12 @@ class ApplyShardingHints(BaseTransform):
                         pass
 
             _log_sharding_result(dc, num_updates, num_skipped, shard_layers=shard_layers)
+
+        # Signal to the legacy detect_sharding pipeline that IR has handled this
+        # graph. Sharding (detect_sharding) and ShardingTransformExecutor read
+        # this flag and short-circuit themselves; without it they would re-shard
+        # the same nodes via the heuristic path.
+        gm.meta["sharding_ir_applied"] = True
 
         return gm, TransformInfo(
             skipped=False,

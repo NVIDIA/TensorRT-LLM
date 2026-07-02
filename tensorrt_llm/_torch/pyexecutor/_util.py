@@ -2131,6 +2131,9 @@ def create_py_executor_instance(
         scheduler_policy = (scheduler_config.capacity_scheduler_policy
                             if scheduler_config is not None else
                             CapacitySchedulerPolicy.MAX_UTILIZATION)
+        enable_prefix_aware_scheduling = (
+            scheduler_config.enable_prefix_aware_scheduling
+            if scheduler_config is not None else True)
         scheduler = KVCacheV2Scheduler(
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
@@ -2143,9 +2146,11 @@ def create_py_executor_instance(
             draft_kv_cache_manager=draft_kv_cache_manager,
             cross_kv_cache_manager=cross_kv_cache_manager,
             no_schedule_until_state=no_schedule_until_state,
+            enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
         )
     elif (scheduler_config is not None
           and scheduler_config.use_python_scheduler):
+        enable_prefix_aware_scheduling = scheduler_config.enable_prefix_aware_scheduling
         scheduler = SimpleUnifiedScheduler(
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
@@ -2159,8 +2164,13 @@ def create_py_executor_instance(
             if cross_kv_cache_manager is not None else None,
             two_step_lookahead=mapping.has_pp(),
             scheduler_capacity=scheduler_capacity,
-            no_schedule_until_state=no_schedule_until_state)
+            no_schedule_until_state=no_schedule_until_state,
+            enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
+        )
     else:
+        enable_prefix_aware_scheduling = (
+            scheduler_config.enable_prefix_aware_scheduling
+            if scheduler_config is not None else True)
         capacity_scheduler = BindCapacityScheduler(
             scheduler_capacity,
             kv_cache_manager.impl if kv_cache_manager is not None else None,
@@ -2169,7 +2179,9 @@ def create_py_executor_instance(
             cross_kv_cache_manager=cross_kv_cache_manager.impl
             if cross_kv_cache_manager is not None else None,
             two_step_lookahead=mapping.has_pp(),
-            no_schedule_until_state=no_schedule_until_state)
+            no_schedule_until_state=no_schedule_until_state,
+            enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
+        )
 
         mb_scheduler = BindMicroBatchScheduler(max_batch_size, max_num_tokens,
                                                ctx_chunk_config)

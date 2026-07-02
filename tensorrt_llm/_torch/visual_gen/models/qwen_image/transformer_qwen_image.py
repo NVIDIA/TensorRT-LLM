@@ -33,19 +33,22 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 _WEIGHT_KEY_REMAPS = [
     (".net.0.proj.", ".up_proj."),
     (".net.2.", ".down_proj."),
 ]
 
-# Helper parameters that FP8/NVFP4 ``Linear.create_weights()`` registers but that
-# are derived from the stored scales at load time (``alpha`` and
-# ``inv_input_scale``) or default to ones (the NVFP4 KV-cache scales). They are
-# never serialized in a ModelOpt checkpoint, so they must be excluded from the
-# strict key check when loading a statically pre-quantized checkpoint
-# (``dynamic_weight_quant=False``).
-_QUANT_DERIVED_PARAM_NAMES = (
+# Parameters created by the shared FP8/NVFP4 Linear methods that ModelOpt does
+# not serialize. ``alpha`` and ``inv_input_scale`` are derived from serialized
+# scales by the shared ``Linear.load_weights()`` path. ``kv_scales`` and
+# ``inv_kv_scales`` are placeholders for the LLM fused-QKV path; Qwen-Image
+# uses separate Q/K/V projections without a KV cache, so they remain at their
+# defaults and are never read. Keep the list scoped to parameters actually
+# registered on each Linear so other missing checkpoint weights still fail
+# strict validation.
+_NON_SERIALIZED_QUANT_PARAM_NAMES = (
     "alpha",
     "inv_input_scale",
     "kv_scales",
@@ -1212,11 +1215,6 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
     ):
         model_config = model_config or DiffusionModelConfig()
         super().__init__(model_config)
-        # Exclusion patterns can only be applied after the complete module
-        # names are known. Always defer Linear weight creation while building
-        # the module tree, then materialize eagerly below if the caller did
-        # not request deferred creation.
-        construction_config = model_config.model_copy(update={"skip_create_weights_in_init": True})
         self.attn_backend = attn_backend
 
         self.patch_size = patch_size
@@ -1238,9 +1236,9 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         )
         linear_kwargs = {
             "dtype": self.model_config.torch_dtype,
-            "quant_config": construction_config.get_quant_config(),
-            "skip_create_weights_in_init": construction_config.skip_create_weights_in_init,
-            "force_dynamic_quantization": construction_config.force_dynamic_quantization,
+            "quant_config": self.model_config.get_quant_config(),
+            "skip_create_weights_in_init": self.model_config.skip_create_weights_in_init,
+            "force_dynamic_quantization": self.model_config.force_dynamic_quantization,
         }
         self.img_in = Linear(in_channels, self.inner_dim, bias=True, **linear_kwargs)
         self.txt_in = Linear(joint_attention_dim, self.inner_dim, bias=True, **linear_kwargs)
@@ -1252,7 +1250,7 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
                     dtype=self.model_config.torch_dtype,
-                    config=construction_config,
+                    config=self.model_config,
                     layer_idx=layer_idx,
                 )
                 for layer_idx in range(num_layers)
@@ -1265,9 +1263,9 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
             elementwise_affine=False,
             eps=1e-6,
             dtype=self.model_config.torch_dtype,
-            quant_config=construction_config.get_quant_config(),
-            skip_create_weights=construction_config.skip_create_weights_in_init,
-            force_dynamic_quant=construction_config.force_dynamic_quantization,
+            quant_config=self.model_config.get_quant_config(),
+            skip_create_weights=self.model_config.skip_create_weights_in_init,
+            force_dynamic_quant=self.model_config.force_dynamic_quantization,
         )
         self.proj_out = Linear(
             self.inner_dim,
@@ -1277,11 +1275,7 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         )
         self._svdquant_qkv_aux_stream = None
 
-        self._clear_quant_config_on_excluded_layers()
-        if not self.model_config.skip_create_weights_in_init:
-            for _, module in self.named_modules():
-                if callable(getattr(module, "create_weights", None)):
-                    module.create_weights()
+        self.apply_quant_config_exclude_modules()
 
     @property
     def device(self) -> torch.device:
@@ -1331,41 +1325,39 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
                     buffer.data = buffer.data.to(target_dtype)
         return self
 
-    def _clear_quant_config_on_excluded_layers(self) -> None:
-        """Build the checkpoint's excluded layers as unquantized.
-
-        ModelOpt keeps some layers in high precision (the ``ignore`` list in
-        the checkpoint's ``quantization_config`` -- e.g. img_in / txt_in /
-        proj_out / norm_out / time_text_embed and the first/last transformer
-        blocks), storing plain BF16 weights with no scales for them.
-        ``get_quant_method()`` selects the Linear method purely from
-        ``module.quant_config``, so clear it on the excluded Linear modules to
-        fall back to the unquantized method. Must run before any
-        ``create_weights()`` call, since parent modules (e.g. ``MLP``) may
-        materialize their child Linears eagerly.
-        """
+    def apply_quant_config_exclude_modules(self) -> None:
         quant_config = self.model_config.quant_config
-        if quant_config is None or quant_config.quant_algo is None:
+        if quant_config is None or quant_config.exclude_modules is None:
             return
-        for name, module in self.named_modules():
-            if isinstance(module, Linear) and quant_config.is_module_excluded_from_quantization(
-                name
-            ):
-                module.quant_config = None
 
-    def _quant_derived_parameter_names(self) -> set[str]:
-        """Return non-serialized helper parameters owned by quantized Linears."""
-        derived = set()
+        kv_cache_quant_algo = quant_config.kv_cache_quant_algo if quant_config else None
+        no_quant_config = QuantConfig(kv_cache_quant_algo=kv_cache_quant_algo)
+
+        for name, module in self.named_modules():
+            if isinstance(module, Linear):
+                is_excluded = quant_config.is_module_excluded_from_quantization(name)
+                if is_excluded and getattr(module, "quant_config", None) is not None:
+                    module.quant_config = no_quant_config
+                    if getattr(module, "_weights_created", False):
+                        # Rebuild weights so quant_method and parameter layout match the no-quant config.
+                        module._weights_created = False
+                        module._parameters.clear()
+                        module._buffers.clear()
+                        module.create_weights()
+
+    def _non_serialized_quant_parameter_names(self) -> set[str]:
+        """Return shared Linear parameters absent from ModelOpt checkpoints."""
+        non_serialized = set()
         for module_name, module in self.named_modules():
             if not isinstance(module, Linear) or module.quant_config is None:
                 continue
             prefix = f"{module_name}." if module_name else ""
-            derived.update(
+            non_serialized.update(
                 f"{prefix}{param_name}"
-                for param_name in _QUANT_DERIVED_PARAM_NAMES
+                for param_name in _NON_SERIALIZED_QUANT_PARAM_NAMES
                 if module._parameters.get(param_name) is not None
             )
-        return derived
+        return non_serialized
 
     def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
         """Load HF ``transformer/*.safetensors`` state_dict.
@@ -1376,9 +1368,6 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         weights = _remap_checkpoint_keys(weights)
 
         device = self._weight_loading_device()
-        # Build excluded layers (the checkpoint's quantization ``ignore`` list)
-        # as unquantized, before any create_weights() call.
-        self._clear_quant_config_on_excluded_layers()
         for _, module in self.named_modules():
             if callable(getattr(module, "create_weights", None)):
                 module.create_weights()
@@ -1386,10 +1375,10 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
 
         expected = {name for name, _ in self.named_parameters()}
         provided = set(weights)
-        # FP8/NVFP4 Linear.create_weights() registers helper parameters that are
-        # derived at load time and never stored in a checkpoint; drop them so a
-        # statically pre-quantized ModelOpt checkpoint passes the key check.
-        missing = sorted((expected - provided) - self._quant_derived_parameter_names())
+        # WAN uses the same shared Linear methods but does not perform this
+        # model-vs-checkpoint key check. Exempt only their known non-serialized
+        # parameters while retaining strict validation for real Qwen weights.
+        missing = sorted((expected - provided) - self._non_serialized_quant_parameter_names())
         # SVDQuant LoRA factors + pre_quant_scale are loaded by the quant method
         # (not module params at this point), so they are not "unexpected".
         unexpected = sorted(

@@ -139,6 +139,8 @@ size_t getEnvKVCacheSendMaxConcurrenceNum();
 
 size_t getEnvMemSizeForKVCacheTransferBuffer();
 
+bool getEnvKVCachePoolUseFabricMemory();
+
 uint16_t getEnvNixlPort();
 
 bool getEnvNixlEnableCoalesce();
