@@ -74,6 +74,53 @@ def patch_mpi_pool_session_for_env(mocker, env_vars: dict):
                         patched_start_mpi_pool)
 
 
+from tensorrt_llm.llmapi._grouped_test_utils import \
+    clear_worker_weight_cache as _clear_worker_weight_cache  # noqa: E402
+from tensorrt_llm.llmapi._grouped_test_utils import \
+    hf_weight_cache_env as _hf_weight_cache_env
+from tensorrt_llm.llmapi._grouped_test_utils import \
+    make_shared_llm as _make_shared_llm
+from tensorrt_llm.llmapi._grouped_test_utils import \
+    reset_shared_session_torch_compile_state as \
+    _reset_shared_session_torch_compile_state
+from tensorrt_llm.llmapi._grouped_test_utils import \
+    shared_mpi_session as _shared_mpi_session
+
+
+@pytest.fixture(scope="module")
+def hf_weight_cache():
+    with _hf_weight_cache_env():
+        yield
+
+
+@pytest.fixture(scope="module")
+def shared_mpi_session_4gpu(hf_weight_cache):
+    # Ordering is load-bearing: MpiPoolSession snapshots TRTLLM*/TLLM* env at
+    # spawn time and passes that copy to the workers. Any env exported AFTER the
+    # pool spawns never reaches them. Depending on hf_weight_cache guarantees
+    # TRTLLM_HF_WEIGHT_CACHE is exported before MpiPoolSession spawns, otherwise
+    # the weight cache would be silently disabled in the workers (which are the
+    # processes that actually load weights) and only session reuse would speed
+    # things up. The assertion pins this contract so a future fixture reorder
+    # fails loudly instead of silently regressing the optimization.
+    assert os.environ.get("TRTLLM_HF_WEIGHT_CACHE") == "1", (
+        "hf_weight_cache must be set up before the shared MPI pool spawns so "
+        "the workers inherit TRTLLM_HF_WEIGHT_CACHE at spawn time.")
+    yield from _shared_mpi_session(4)
+
+
+@pytest.fixture(scope="module")
+def shared_llm_4gpu(shared_mpi_session_4gpu):
+    try:
+        yield _make_shared_llm(shared_mpi_session_4gpu)
+    finally:
+        # Explicitly invalidate the per-worker HF weight cache while the shared
+        # session is still alive (this fixture tears down before
+        # shared_mpi_session_4gpu), instead of relying on worker process exit.
+        if shared_mpi_session_4gpu is not None:
+            shared_mpi_session_4gpu.submit_sync(_clear_worker_weight_cache)
+
+
 def _get_default_torch_compile_config(torch_compile):
     return TorchCompileConfig(enable_fullgraph=True,
                               enable_piecewise_cuda_graph=True,
@@ -1337,6 +1384,64 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
 class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
+    # (id, moe_backend, mtp_nextn, tp_size, pp_size, ep_size, torch_compile,
+    #  low_precision_combine). fp8kv / attention_dp / cuda_graph /
+    #  overlap_scheduler are True for every case (see _NVFP4_4GPU_PREMERGE_CASES).
+    _NVFP4_4GPU_PREMERGE_MATRIX = (
+        ("cutlass_mtp0_tp4_compile_off", "CUTLASS", 0, 4, 1, 1, False, False),
+        ("cutlass_mtp0_tp4_compile_on", "CUTLASS", 0, 4, 1, 1, True, False),
+        ("cutlass_mtp0_ep4_compile_on", "CUTLASS", 0, 4, 1, 4, True, False),
+        ("cutlass_mtp0_tp2pp2_compile_off", "CUTLASS", 0, 2, 2, 1, False,
+         False),
+        ("cutlass_mtp0_tp2pp2_compile_on", "CUTLASS", 0, 2, 2, 1, True, False),
+        ("cutlass_mtp2_tp4_compile_off", "CUTLASS", 2, 4, 1, 1, False, False),
+        ("trtllm_mtp2_ep4_compile_off", "TRTLLM", 2, 4, 1, 4, False, False),
+        ("cutlass_mtp2_pp4_compile_off", "CUTLASS", 2, 1, 4, 1, False, False),
+        ("cutlass_mtp0_pp4_compile_off", "CUTLASS", 0, 1, 4, 1, False, False),
+        ("cutlass_mtp0_pp4_compile_on", "CUTLASS", 0, 1, 4, 1, True, False),
+        ("trtllm_mtp0_tp4_compile_off", "TRTLLM", 0, 4, 1, 1, False, False),
+        ("trtllm_mtp0_ep4_compile_off", "TRTLLM", 0, 4, 1, 4, False, False),
+        ("cutlass_mtp0_tp4_lpc_compile_off", "CUTLASS", 0, 4, 1, 1, False,
+         True),
+        # CUTEDSL coverage (skipped off SM100/103 by _run_nvfp4_4gpus_case);
+        # preserves the pre-merge CUTEDSL cases upstream carried individually.
+        ("cutedsl_mtp0_tp2pp2_compile_off", "CUTEDSL", 0, 2, 2, 1, False, False
+         ),
+        ("cutedsl_mtp2_tp4_compile_off", "CUTEDSL", 2, 4, 1, 1, False, False),
+    )
+    # Each case is pure _run_nvfp4_4gpus_case kwargs; the id (row[0]) stays in
+    # the matrix and is used only for the parametrize ids.
+    _NVFP4_4GPU_PREMERGE_CASES = tuple(
+        dict(moe_backend=row[1],
+             mtp_nextn=row[2],
+             tp_size=row[3],
+             pp_size=row[4],
+             ep_size=row[5],
+             torch_compile=row[6],
+             low_precision_combine=row[7],
+             fp8kv=True,
+             attention_dp=True,
+             cuda_graph=True,
+             overlap_scheduler=True) for row in _NVFP4_4GPU_PREMERGE_MATRIX)
+
+    # bf16 pre-merge cases share the SAME 4-GPU MPI session as the nvfp4 group
+    # (both are 4-worker DeepSeek-V3-Lite, so world_size matches). mtp_nextn /
+    # attention_dp / cuda_graph / overlap_scheduler are True for every case.
+    # (id, tp_size, pp_size, ep_size, torch_compile).
+    _BF16_4GPU_PREMERGE_MATRIX = (
+        ("tp4_compile_on", 4, 1, 1, True),
+        ("ep4_compile_off", 4, 1, 4, False),
+        ("tp2pp2_compile_off", 2, 2, 1, False),
+    )
+    _BF16_4GPU_PREMERGE_CASES = tuple(
+        dict(tp_size=row[1],
+             pp_size=row[2],
+             ep_size=row[3],
+             torch_compile=row[4],
+             mtp_nextn=2,
+             attention_dp=True,
+             cuda_graph=True,
+             overlap_scheduler=True) for row in _BF16_4GPU_PREMERGE_MATRIX)
 
     @pytest.mark.skip_less_device_memory(60000)
     @parametrize_with_ids("v2_kv_cache", [True, False])
@@ -1515,6 +1620,26 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     def test_bfloat16_4gpus(self, tp_size, pp_size, ep_size, mtp_nextn,
                             attention_dp, cuda_graph, overlap_scheduler,
                             torch_compile):
+        self._run_bfloat16_4gpus_case(tp_size=tp_size,
+                                      pp_size=pp_size,
+                                      ep_size=ep_size,
+                                      mtp_nextn=mtp_nextn,
+                                      attention_dp=attention_dp,
+                                      cuda_graph=cuda_graph,
+                                      overlap_scheduler=overlap_scheduler,
+                                      torch_compile=torch_compile)
+
+    def _run_bfloat16_4gpus_case(self,
+                                 *,
+                                 tp_size,
+                                 pp_size,
+                                 ep_size,
+                                 mtp_nextn,
+                                 attention_dp,
+                                 cuda_graph,
+                                 overlap_scheduler,
+                                 torch_compile,
+                                 make_llm=LLM):
         if pp_size > 1 and mtp_nextn > 0:
             num_hidden_layers = 30
             pp_partition = [num_hidden_layers // pp_size + 1] * pp_size
@@ -1533,17 +1658,23 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         mtp_config = None
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
-        with LLM(self.MODEL_PATH,
-                 tensor_parallel_size=tp_size,
-                 pipeline_parallel_size=pp_size,
-                 pp_partition=pp_partition,
-                 moe_expert_parallel_size=ep_size,
-                 kv_cache_config=kv_cache_config,
-                 **pytorch_config,
-                 enable_attention_dp=attention_dp,
-                 speculative_config=mtp_config) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+        try:
+            with make_llm(self.MODEL_PATH,
+                          tensor_parallel_size=tp_size,
+                          pipeline_parallel_size=pp_size,
+                          pp_partition=pp_partition,
+                          moe_expert_parallel_size=ep_size,
+                          kv_cache_config=kv_cache_config,
+                          **pytorch_config,
+                          enable_attention_dp=attention_dp,
+                          speculative_config=mtp_config) as llm:
+                task = GSM8K(self.MODEL_NAME)
+                task.evaluate(llm)
+        finally:
+            # On a reused MPI session, reset each worker's torch.compile/Dynamo
+            # state so recompile counts don't accumulate across cases and trip
+            # the fullgraph recompile limit (FailOnRecompileLimitHit).
+            _reset_shared_session_torch_compile_state(make_llm)
 
     @pytest.mark.skip_less_device(4)
     @parametrize_with_ids("mtp_nextn",
@@ -2207,6 +2338,67 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                          overlap_scheduler, low_precision_combine, tp_size,
                          pp_size, ep_size, torch_compile, mtp_nextn,
                          moe_backend):
+        self._run_nvfp4_4gpus_case(
+            fp8kv=fp8kv,
+            attention_dp=attention_dp,
+            cuda_graph=cuda_graph,
+            overlap_scheduler=overlap_scheduler,
+            low_precision_combine=low_precision_combine,
+            tp_size=tp_size,
+            pp_size=pp_size,
+            ep_size=ep_size,
+            torch_compile=torch_compile,
+            mtp_nextn=mtp_nextn,
+            moe_backend=moe_backend,
+        )
+
+    @pytest.mark.skip_less_device(4)
+    @skip_pre_blackwell
+    # The shared module-scoped MPI session is intentionally kept alive across the
+    # parametrized cases (that is the whole point of reuse), so mpi4py's
+    # `_manager_spawn` management thread outlives each test. Disable the
+    # threadleak check here, consistent with other session/proxy-based tests.
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize(
+        "case",
+        _NVFP4_4GPU_PREMERGE_CASES,
+        ids=[row[0] for row in _NVFP4_4GPU_PREMERGE_MATRIX],
+    )
+    def test_nvfp4_4gpus_premerge_grouped(self, case, shared_llm_4gpu):
+        # shared_llm_4gpu injects the shared 4-GPU MPI session and (transitively)
+        # depends on hf_weight_cache, so the weight-cache env is exported before
+        # the pool spawns (see the shared_mpi_session_4gpu fixture for details).
+        self._run_nvfp4_4gpus_case(make_llm=shared_llm_4gpu, **case)
+
+    @pytest.mark.skip_less_device(4)
+    @skip_pre_hopper
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize(
+        "case",
+        _BF16_4GPU_PREMERGE_CASES,
+        ids=[row[0] for row in _BF16_4GPU_PREMERGE_MATRIX],
+    )
+    def test_bfloat16_4gpus_premerge_grouped(self, case, shared_llm_4gpu):
+        # Reuses the same module-scoped shared_llm_4gpu session as the nvfp4
+        # group. The HF weight cache is keyed by checkpoint file fingerprint, so
+        # the bf16 model gets its own entry; with max_entries=1 the LRU evicts
+        # the other model on the first miss, bounding CPU cache to one model.
+        self._run_bfloat16_4gpus_case(make_llm=shared_llm_4gpu, **case)
+
+    def _run_nvfp4_4gpus_case(self,
+                              *,
+                              fp8kv,
+                              attention_dp,
+                              cuda_graph,
+                              overlap_scheduler,
+                              low_precision_combine,
+                              tp_size,
+                              pp_size,
+                              ep_size,
+                              torch_compile,
+                              mtp_nextn,
+                              moe_backend,
+                              make_llm=LLM):
         sm_version = get_sm_version()
         if moe_backend == "TRTLLM" and sm_version in (120, 121):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
@@ -2233,20 +2425,26 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         if fp8kv:
             kv_cache_config.dtype = "fp8"
 
-        with LLM(
-                f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
-                tensor_parallel_size=tp_size,
-                pipeline_parallel_size=pp_size,
-                moe_expert_parallel_size=ep_size,
-                kv_cache_config=kv_cache_config,
-                **pytorch_config,
-                enable_attention_dp=attention_dp,
-                speculative_config=mtp_config,
-        ) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+        try:
+            with make_llm(
+                    f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
+                    tensor_parallel_size=tp_size,
+                    pipeline_parallel_size=pp_size,
+                    moe_expert_parallel_size=ep_size,
+                    kv_cache_config=kv_cache_config,
+                    **pytorch_config,
+                    enable_attention_dp=attention_dp,
+                    speculative_config=mtp_config,
+            ) as llm:
+                assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
 
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+                task = GSM8K(self.MODEL_NAME)
+                task.evaluate(llm)
+        finally:
+            # On a reused MPI session, reset each worker's torch.compile/Dynamo
+            # state so recompile counts don't accumulate across cases and trip
+            # the fullgraph recompile limit (FailOnRecompileLimitHit).
+            _reset_shared_session_torch_compile_state(make_llm)
 
     @parametrize_with_ids(
         "fp8kv,attention_dp,cuda_graph,overlap_scheduler",
