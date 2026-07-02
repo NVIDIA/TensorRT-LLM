@@ -2259,12 +2259,20 @@ class PyTorchModelEngine(ModelEngine):
     def _set_spec_metadata_all_rank_num_tokens(
             self, spec_metadata: SpecMetadata,
             spec_all_rank_num_tokens: List[int],
-            all_rank_num_seqs: List[int]) -> None:
+            all_rank_num_seqs: List[int],
+            all_rank_num_gens: Optional[List[int]] = None) -> None:
         # Eagle3 / MTP-eagle one-model use subseq_all_rank_num_tokens for
         # draft loop iterations i>0 (per-sequence counts, since each
         # sequence contributes one token per iteration).
         spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
         spec_metadata.all_rank_num_seqs = all_rank_num_seqs
+        # Per-rank generation-request counts. External drafters (DSpark) run the
+        # draft only over generation requests, so num_seqs (which includes
+        # context requests) over-counts on mixed steps; the draft MoE needs the
+        # gen-only per-rank counts to keep a FUSED_COMM (DeepGEMM MegaMoE) chunk
+        # loop identical across EP ranks.
+        if all_rank_num_gens is not None:
+            spec_metadata.all_rank_num_gens = all_rank_num_gens
         if (spec_metadata.spec_dec_mode.is_mtp_eagle_one_model()
                 or spec_metadata.spec_dec_mode.is_eagle3_one_model()):
             spec_metadata.subseq_all_rank_num_tokens = all_rank_num_seqs
@@ -2629,10 +2637,12 @@ class PyTorchModelEngine(ModelEngine):
                 sequence_lengths = spec_metadata.seq_lens
                 all_rank_num_tokens = self.dist.tp_cp_allgather(
                     [spec_metadata.num_tokens,
-                     len(sequence_lengths)])
+                     len(sequence_lengths),
+                     attn_metadata.num_generations])
                 self._set_spec_metadata_all_rank_num_tokens(
                     spec_metadata, [item[0] for item in all_rank_num_tokens],
-                    [item[1] for item in all_rank_num_tokens])
+                    [item[1] for item in all_rank_num_tokens],
+                    [item[2] for item in all_rank_num_tokens])
 
         # Set iteration states - batch dictionary updates
         self.iter_states.update({
@@ -3990,10 +4000,12 @@ class PyTorchModelEngine(ModelEngine):
             if self.enable_attention_dp:
                 all_rank_num_tokens = self.dist.tp_cp_allgather(
                     [spec_metadata.num_tokens,
-                     len(sequence_lengths)])
+                     len(sequence_lengths),
+                     spec_metadata.num_generations])
                 self._set_spec_metadata_all_rank_num_tokens(
                     spec_metadata, [item[0] for item in all_rank_num_tokens],
-                    [item[1] for item in all_rank_num_tokens])
+                    [item[1] for item in all_rank_num_tokens],
+                    [item[2] for item in all_rank_num_tokens])
 
         if mm_token_indices is not None:
             self._ship_multimodal_indices(
@@ -4184,14 +4196,15 @@ class PyTorchModelEngine(ModelEngine):
             if spec_metadata is not None:
                 all_rank_num_tokens = self.dist.tp_cp_allgather([
                     attn_metadata.num_tokens, spec_metadata.num_tokens,
-                    len(sequence_lengths)
+                    len(sequence_lengths), spec_metadata.num_generations
                 ])
                 attn_metadata.all_rank_num_tokens = [
                     item[0] for item in all_rank_num_tokens
                 ]
                 self._set_spec_metadata_all_rank_num_tokens(
                     spec_metadata, [item[1] for item in all_rank_num_tokens],
-                    [item[2] for item in all_rank_num_tokens])
+                    [item[2] for item in all_rank_num_tokens],
+                    [item[3] for item in all_rank_num_tokens])
             else:
                 all_rank_num_tokens = self.dist.tp_cp_allgather(
                     attn_metadata.num_tokens)
