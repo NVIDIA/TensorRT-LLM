@@ -44,6 +44,7 @@ class QuantAlgo(StrEnum, metaclass=BaseEnumMeta):
     W4A8_MXFP4_FP8 = auto()
     W4A8_MXFP4_MXFP8 = auto()
     W4A16_MXFP4 = auto()
+    W4A16_NVFP4 = auto()
     MXFP8 = auto()
     NVFP4_AWQ = auto()
     NVFP4_ARC = auto()
