@@ -801,6 +801,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_logprobs_mode = LogprobMode(
             logprobs_mode)  # handle passed a raw string
         self.py_disaggregated_params = None
+        self.py_conversation_params = None
 
         self.py_num_connector_matched_tokens = 0
 
@@ -1191,6 +1192,8 @@ def executor_request_to_llm_request(
     llm_request.py_disaggregated_params = getattr(executor_request,
                                                   "py_disaggregated_params",
                                                   None)
+    llm_request.py_conversation_params = getattr(executor_request,
+                                                 "py_conversation_params", None)
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)
