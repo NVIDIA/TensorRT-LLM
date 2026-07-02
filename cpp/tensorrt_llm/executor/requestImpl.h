@@ -135,6 +135,11 @@ public:
         return mInputTokenIds;
     }
 
+    [[nodiscard]] SizeType32 getNumInputTokens() const
+    {
+        return static_cast<SizeType32>(mInputTokenIds.size());
+    }
+
     [[nodiscard]] SizeType32 getMaxNewTokens() const
     {
         return mMaxNewTokens;
@@ -510,7 +515,12 @@ public:
 private:
     void validate()
     {
-        TLLM_CHECK(!mInputTokenIds.empty());
+        if (mInputTokenIds.empty())
+        {
+            TLLM_LOG_WARNING(
+                "Request created with empty inputTokenIds; expected only on empty Helix CP ranks when num_total_blocks "
+                "< cp_size.");
+        }
         TLLM_CHECK(mMaxNewTokens > 0);
 
         // Show warning message unless mNumReturnSequences is the default value.

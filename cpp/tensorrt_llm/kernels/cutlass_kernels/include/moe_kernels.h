@@ -21,7 +21,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
-#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_device_path.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_grouped_gemm.h"
 #include <cstdint>
 #ifdef ENABLE_FP4
 #include <cuda_fp4.h>
@@ -69,13 +69,14 @@ struct LoraParams
 
     cudaEvent_t* memcpy_event_ptr;
 
-    // Device-side capture-safe LoRA path scratch. When device_path.enabled is
+    // Capture-safe grouped-GEMM LoRA core scratch. When grouped_gemm.enabled is
     // true, the kernel uses launchMoeLoraPointerExpand, launchMoeLoraProblemBuilder,
-    // and cudaGraph(SplitK)GroupedGemm instead of the legacy host-pointer
-    // LoraImpl::run path. The pointers refer to persistent allocations owned by
-    // the calling FusedMoeRunner, so their addresses are stable across
-    // CUDA-graph captures and replays.
-    ::tensorrt_llm::kernels::cutlass_kernels::MoeLoraDevicePath device_path;
+    // and cudaGraph(SplitK)GroupedGemm instead of the host-pointer LoraImpl::run
+    // path. The pointers refer to persistent allocations owned by the calling
+    // FusedMoeRunner, so their addresses are stable across CUDA-graph captures
+    // and replays. Default-constructed (enabled == false) for the legacy
+    // TensorRT MoE plugin, which uses its own cuBLAS LoraImpl path.
+    ::tensorrt_llm::kernels::cutlass_kernels::MoeLoraGroupedGemm grouped_gemm;
 
     LoraParams() = default;
 

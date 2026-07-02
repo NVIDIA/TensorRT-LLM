@@ -216,6 +216,15 @@ class GatedMLP(nn.Module):
         if not isinstance(x, (tuple, Fp4QuantizedTensor)) and x.dim() > 2:
             original_shape = x.shape
             x = x.reshape(-1, x.shape[-1])
+        elif isinstance(x, Fp4QuantizedTensor) and x.fp4_tensor.dim() > 2:
+            # Fused GEMM needs a 2D mat1: flatten a rank-3 fp4 activation's data
+            # to [M, D/2] (its SF is already flat-M, so reuse it); unflatten below.
+            original_shape = x.fp4_tensor.shape
+            x = Fp4QuantizedTensor(
+                fp4_tensor=x.fp4_tensor.reshape(-1, x.fp4_tensor.shape[-1]),
+                scaling_factor=x.scaling_factor,
+                is_sf_swizzled=x.is_sf_swizzled,
+            )
 
         # Get quantized inputs from Linear's NVFP4 pipeline
         act_fp4, act_sf, alpha = module.quant_method._input_prepare(module, x)
@@ -271,11 +280,10 @@ class GatedMLP(nn.Module):
             if torch.compiler.is_compiling():
                 fp4_out = True
             else:
-                if isinstance(x, (tuple, Fp4QuantizedTensor)):
-                    m = x[0].shape[0] if isinstance(x, tuple) else x.shape[0]
-                else:
-                    m = x.reshape(
-                        -1, x.shape[-1]).shape[0] if x.dim() > 2 else x.shape[0]
+                t = x.fp4_tensor if isinstance(x, Fp4QuantizedTensor) else (
+                    x[0] if isinstance(x, tuple) else x)
+                m = t.reshape(
+                    -1, t.shape[-1]).shape[0] if t.dim() > 2 else t.shape[0]
                 fp4_out = m >= GatedMLP._FP4OUT_MIN_M
             h2 = self._fused_gate_up_swiglu(x, fp4_out=fp4_out)
         elif self._can_fuse_gate_up_swiglu():

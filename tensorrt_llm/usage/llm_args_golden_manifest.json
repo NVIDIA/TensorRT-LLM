@@ -1189,6 +1189,13 @@
       "annotation": "<class 'bool'>",
       "converter": "",
       "kind": "value",
+      "path": "scheduler_config.enable_prefix_aware_scheduling"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
       "path": "scheduler_config.use_python_scheduler"
     },
     {
@@ -3397,6 +3404,13 @@
       "converter": "",
       "kind": "value",
       "path": "scheduler_config.dynamic_batch_config.enable_max_num_tokens_tuning"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "scheduler_config.enable_prefix_aware_scheduling"
     },
     {
       "allowed_values": [],

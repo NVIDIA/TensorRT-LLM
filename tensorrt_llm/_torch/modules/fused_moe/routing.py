@@ -677,9 +677,16 @@ class MiniMaxM3MoeRoutingMethod(MiniMaxM2MoeRoutingMethod):
         )
         self.routed_scaling_factor = float(routed_scaling_factor)
 
-    def apply(self,
-              router_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        topk_idx, top_k_weights = super().apply(router_logits)
+    def apply(
+        self,
+        router_logits: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # ``moe_scheduler.MoEScheduler`` calls ``routing_method.apply(router_logits,
+        # input_ids)`` positionally; mirror the parent's signature so the
+        # MiniMax-M3 routing accepts (but ignores) the optional ``input_ids``
+        # argument — M3's sigmoid+bias+top-k+renorm flow doesn't consume it.
+        topk_idx, top_k_weights = super().apply(router_logits, input_ids)
         if self.routed_scaling_factor != 1.0:
             top_k_weights = top_k_weights * self.routed_scaling_factor
         return topk_idx, top_k_weights
