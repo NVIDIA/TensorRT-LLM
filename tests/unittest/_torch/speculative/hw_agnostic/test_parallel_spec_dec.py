@@ -22,7 +22,12 @@ import torch
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import CudaGraphConfig, DFlashDecodingConfig, KvCacheConfig
+from tensorrt_llm.llmapi import (
+    CudaGraphConfig,
+    DFlashDecodingConfig,
+    DominoDecodingConfig,
+    KvCacheConfig,
+)
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -32,19 +37,28 @@ PROMPTS = [
     "The future of AI is",
 ]
 
+# (algo, target_subpath, draft_subpath, min_total_mem_gb)
+_SPEC_CASES = [
+    ("dflash", DFlashDecodingConfig, "Qwen3/Qwen3-8B", "Qwen3-8B-DFlash-b16", 35),
+    ("dflash", DFlashDecodingConfig, "Qwen3.5-4B", "Qwen3.5-4B-DFlash", 20),
+    ("domino", DominoDecodingConfig, "Qwen3/Qwen3-8B", "Qwen3-8B-Domino-b16", 35),
+    ("domino", DominoDecodingConfig, "Qwen3/Qwen3-4B", "Qwen3-4B-Domino-b16", 20),
+]
+
 
 def _make_llm_config(
     target_model_dir: str,
-    dflash_model_dir: str,
+    draft_model_dir: str,
+    spec_cls,
     disable_overlap_scheduler: bool,
     max_draft_len: int = 4,
     max_batch_size: int = 4,
 ):
     kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=2048)
     cuda_graph_config = CudaGraphConfig(batch_sizes=[1, 2, 4], enable_padding=True)
-    spec_config = DFlashDecodingConfig(
+    spec_config = spec_cls(
         max_draft_len=max_draft_len,
-        speculative_model=dflash_model_dir,
+        speculative_model=draft_model_dir,
     )
     return dict(
         model=target_model_dir,
@@ -73,32 +87,32 @@ def _run_and_check(llm_config: dict, min_avg_accepted: float):
 
 
 @pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
-def test_dflash_qwen3_8b(disable_overlap_scheduler: bool):
-    """Test DFlash with Qwen3-8B BF16: CUDA graphs, padding, and draft acceptance."""
+@pytest.mark.parametrize(
+    "spec_cls,target_subpath,draft_subpath,min_total_mem_gb",
+    [c[1:] for c in _SPEC_CASES],
+    ids=[
+        f"{algo}-{target.split('/')[-1].lower().replace('.', '_').replace('-', '_')}"
+        for algo, _, target, _, _ in _SPEC_CASES
+    ],
+)
+def test_parallel_spec_dec(
+    spec_cls,
+    target_subpath: str,
+    draft_subpath: str,
+    min_total_mem_gb: int,
+    disable_overlap_scheduler: bool,
+):
+    """Parallel speculative decoding (DFlash / Domino): verifies CUDA graphs,
+    padding, draft acceptance, and the parallel-draft head implementations."""
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    if total_mem_gb < 35:
+    if total_mem_gb < min_total_mem_gb:
         pytest.skip("Not enough memory to load target + draft model")
 
     models_path = llm_models_root()
     llm_config = _make_llm_config(
-        target_model_dir=f"{models_path}/Qwen3/Qwen3-8B",
-        dflash_model_dir=f"{models_path}/Qwen3-8B-DFlash-b16",
-        disable_overlap_scheduler=disable_overlap_scheduler,
-    )
-    _run_and_check(llm_config, min_avg_accepted=1.0)
-
-
-@pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
-def test_dflash_qwen3_5_4b(disable_overlap_scheduler: bool):
-    """Test DFlash with Qwen3.5-4B BF16: CUDA graphs, padding, and draft acceptance."""
-    total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    if total_mem_gb < 20:
-        pytest.skip("Not enough memory to load target + draft model")
-
-    models_path = llm_models_root()
-    llm_config = _make_llm_config(
-        target_model_dir=f"{models_path}/Qwen3.5-4B",
-        dflash_model_dir=f"{models_path}/Qwen3.5-4B-DFlash",
+        target_model_dir=f"{models_path}/{target_subpath}",
+        draft_model_dir=f"{models_path}/{draft_subpath}",
+        spec_cls=spec_cls,
         disable_overlap_scheduler=disable_overlap_scheduler,
     )
     _run_and_check(llm_config, min_avg_accepted=1.0)

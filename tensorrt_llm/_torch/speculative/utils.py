@@ -14,6 +14,7 @@ from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.seq_slot_manager import SeqSlotManager
 from ..speculative.interface import SpecMetadata
 from .dflash import DFlashSpecMetadata, DFlashWorker
+from .domino import DominoSpecMetadata, DominoWorker
 from .draft_target import (DraftTargetOneModelSampler,
                            DraftTargetOneModelSpecMetadata,
                            DraftTargetOneModelWorker)
@@ -129,9 +130,13 @@ def get_spec_metadata(spec_config,
             max_num_requests=max_num_requests,
             spec_resource_manager=spec_resource_manager,
         )
-    if spec_config.spec_dec_mode.is_dflash():
+    if spec_config.spec_dec_mode.is_dflash(
+    ) or spec_config.spec_dec_mode.is_domino():
+        metadata_cls = (DominoSpecMetadata
+                        if spec_config.spec_dec_mode.is_domino() else
+                        DFlashSpecMetadata)
         target_layer_ids = getattr(spec_config, 'target_layer_ids', None)
-        return DFlashSpecMetadata(
+        return metadata_cls(
             max_draft_len=spec_config.max_draft_len,
             max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
             spec_dec_mode=spec_config.spec_dec_mode,
@@ -395,6 +400,8 @@ def get_spec_worker(spec_config,
         return PARDWorker(spec_config, mapping, use_separate_draft_kv_cache)
     if spec_dec_mode.is_dflash():
         return DFlashWorker(spec_config, mapping, use_separate_draft_kv_cache)
+    if spec_dec_mode.is_domino():
+        return DominoWorker(spec_config, mapping, use_separate_draft_kv_cache)
     if spec_dec_mode.is_sa():
         return SAWorker(spec_config, model_config)
     if spec_dec_mode.is_draft_target_one_model():

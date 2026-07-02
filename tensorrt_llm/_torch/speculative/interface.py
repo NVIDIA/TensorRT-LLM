@@ -233,6 +233,7 @@ class SpeculativeDecodingMode(IntEnum):
     SAVE_HIDDEN_STATES = auto()
     PARD = auto()
     DFLASH = auto()
+    DOMINO = auto()
     NONE = auto()
     AUTO = auto()
 
@@ -267,8 +268,11 @@ class SpeculativeDecodingMode(IntEnum):
     def is_dflash(self):
         return self == SpeculativeDecodingMode.DFLASH
 
+    def is_domino(self):
+        return self == SpeculativeDecodingMode.DOMINO
+
     def is_parallel_draft(self):
-        return self.is_pard() or self.is_dflash()
+        return self.is_pard() or self.is_dflash() or self.is_domino()
 
     def is_ngram(self):
         return self == SpeculativeDecodingMode.NGRAM

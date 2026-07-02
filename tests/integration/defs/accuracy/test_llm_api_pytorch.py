@@ -30,8 +30,8 @@ from tensorrt_llm._torch.model_config import MoeLoadBalancerConfig
 # isort: off
 from tensorrt_llm.llmapi import (
     AttentionDpConfig, CudaGraphConfig, DeepSeekSparseAttentionConfig,
-    DFlashDecodingConfig, Eagle3DecodingConfig, KvCacheConfig,
-    MiniMaxM3SparseAttentionConfig, MoeConfig, MTPDecodingConfig,
+    DFlashDecodingConfig, DominoDecodingConfig, Eagle3DecodingConfig,
+    KvCacheConfig, MiniMaxM3SparseAttentionConfig, MoeConfig, MTPDecodingConfig,
     NGramDecodingConfig, PARDDecodingConfig, RocketSparseAttentionConfig,
     SADecodingConfig, SamplingParams, SchedulerConfig,
     SkipSoftmaxAttentionConfig, SAEnhancerConfig, TorchCompileConfig)
@@ -4131,6 +4131,30 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
 
         spec_config = DFlashDecodingConfig(max_draft_len=4,
                                            speculative_model=dflash_model_dir)
+
+        with LLM(model=target_model_dir,
+                 **pytorch_config,
+                 kv_cache_config=kv_cache_config,
+                 speculative_config=spec_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_hopper
+    def test_domino(self):
+        pytorch_config = dict(
+            max_batch_size=8,
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=8,
+                                              enable_padding=True),
+        )
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.6)
+
+        domino_model_dir = f"{llm_models_root()}/Qwen3-8B-Domino-b16"
+        target_model_dir = f"{llm_models_root()}/Qwen3/Qwen3-8B"
+
+        spec_config = DominoDecodingConfig(max_draft_len=4,
+                                           speculative_model=domino_model_dir)
 
         with LLM(model=target_model_dir,
                  **pytorch_config,
