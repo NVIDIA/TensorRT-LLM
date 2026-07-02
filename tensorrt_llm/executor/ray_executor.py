@@ -465,6 +465,10 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
                 f"[Strategy={strategy}] Bundles: {bundles} for tp_size: {tp_size} and world_size: {self.world_size}"
             )
             pg = placement_group(bundles, strategy=strategy)
+            # Block until bundles are reserved before scheduling actors on
+            # them; otherwise, on busy CI hosts the raylet can reap pending
+            # RayWorkerWrapper actors as ActorDiedError before they start.
+            ray.get(pg.ready(), timeout=120)
 
             return pg, bundle_indices
 
