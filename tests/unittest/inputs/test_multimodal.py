@@ -2,6 +2,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Tests for MultimodalRuntimeData cumsum math and the flat-mask producer."""
 
+from unittest.mock import patch
+
 import pytest
 import torch
 
@@ -124,7 +126,10 @@ class _KwargsHashFakeProcessor:
 
 
 def test_mm_processor_kwargs_hash_is_stable_for_canonical_values():
-    input_processor = create_input_processor_with_hash(_KwargsHashFakeProcessor())
+    input_processor = create_input_processor_with_hash(
+        _KwargsHashFakeProcessor(),
+        encoder_cache_enabled=True,
+    )
     mm_data = {"image": [torch.tensor([1])]}
 
     _, first = input_processor(
@@ -158,7 +163,10 @@ def test_mm_processor_kwargs_hash_is_stable_for_canonical_values():
 
 
 def test_unserializable_mm_processor_kwargs_disable_persistent_cache_keying():
-    input_processor = create_input_processor_with_hash(_KwargsHashFakeProcessor())
+    input_processor = create_input_processor_with_hash(
+        _KwargsHashFakeProcessor(),
+        encoder_cache_enabled=True,
+    )
 
     _, extra = input_processor(
         {
@@ -170,6 +178,23 @@ def test_unserializable_mm_processor_kwargs_disable_persistent_cache_keying():
     )
 
     assert extra["multimodal_data"]["mm_processor_kwargs_hash"] is None
+
+
+def test_disabled_encoder_cache_skips_mm_processor_kwargs_hash():
+    input_processor = create_input_processor_with_hash(_KwargsHashFakeProcessor())
+
+    with patch("tensorrt_llm.inputs.registry._hash_mm_processor_kwargs") as kwargs_hash:
+        _, extra = input_processor(
+            {
+                "prompt": "unused",
+                "multi_modal_data": {"image": [torch.tensor([1])]},
+                "mm_processor_kwargs": {"image_sizes": torch.tensor([1, 2])},
+            },
+            sampling_params=None,
+        )
+
+    kwargs_hash.assert_not_called()
+    assert "mm_processor_kwargs_hash" not in extra["multimodal_data"]
 
 
 def test_multimodal_embedding_lengths_exclude_special_tokens():

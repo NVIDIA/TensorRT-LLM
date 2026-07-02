@@ -34,13 +34,16 @@ def test_put_get_pop_and_clear_update_byte_accounting() -> None:
     assert cache.max_bytes == 32
     assert cache.get("missing") is None
     assert cache.put("a", tensor)
+    cached = cache.get("a")
 
     assert len(cache) == 1
     assert cache.current_bytes == 16
-    assert cache.get("a") is tensor
+    assert cached is not None
+    assert cached is not tensor
+    torch.testing.assert_close(cached, tensor)
 
     assert cache.pop("missing") is None
-    assert cache.pop("a") is tensor
+    assert cache.pop("a") is cached
     assert len(cache) == 0
     assert cache.current_bytes == 0
 
@@ -58,7 +61,9 @@ def test_stats_track_hits_misses_insertions_and_replacements() -> None:
 
     assert cache.get("missing") is None
     assert cache.put("key", tensor)
-    assert cache.get("key") is tensor
+    cached = cache.get("key")
+    assert cached is not None
+    torch.testing.assert_close(cached, tensor)
     assert cache.put("key", replacement)
 
     stats = cache.stats()
@@ -109,12 +114,16 @@ def test_get_promotes_entry_before_lru_eviction() -> None:
 
     assert cache.put("first", first)
     assert cache.put("second", second)
-    assert cache.get("first") is first
+    cached_first = cache.get("first")
+    assert cached_first is not None
+    torch.testing.assert_close(cached_first, first)
     assert cache.put("third", third)
 
     assert cache.get("second") is None
-    assert cache.get("first") is first
-    assert cache.get("third") is third
+    assert cache.get("first") is cached_first
+    cached_third = cache.get("third")
+    assert cached_third is not None
+    torch.testing.assert_close(cached_third, third)
     assert len(cache) == 2
     assert cache.current_bytes == 16
 
@@ -129,15 +138,17 @@ def test_replace_updates_size_and_oversized_replace_leaves_old_value() -> None:
     assert cache.current_bytes == 8
     assert cache.put("key", larger)
     assert cache.current_bytes == 12
-    assert cache.get("key") is larger
+    cached = cache.get("key")
+    assert cached is not None
+    torch.testing.assert_close(cached, larger)
 
     assert not cache.put("key", oversized)
-    assert cache.get("key") is larger
+    assert cache.get("key") is cached
     assert cache.current_bytes == 12
 
 
-def test_clone_on_insert_detaches_and_owns_inserted_tensor_content() -> None:
-    cache = TensorLRUCache[str](max_bytes=32, clone_on_insert=True)
+def test_insert_detaches_and_owns_inserted_tensor_content() -> None:
+    cache = TensorLRUCache[str](max_bytes=32)
     tensor = torch.tensor([1.0, 2.0], requires_grad=True)
 
     assert cache.put("key", tensor)

@@ -158,11 +158,13 @@ def _filter_piecewise_capture_num_tokens(
 
 def _build_request_multimodal_input(
         request: LlmRequest, cache_enabled: bool) -> Optional[MultimodalInput]:
-    # `multimodal_input` is consumed only by the encoder-cache key path
-    # (`MultimodalModelMixin._encoder_cache_keys`), so skip building it (and its
-    # `from_components` validation) when the cache is disabled.
+    # Skip building this input (and its `from_components` validation) when the cache is disabled.
     if not cache_enabled or request.multimodal_hashes is None:
         return None
+    # `multimodal_input` is consumed only by the encoder-cache key path
+    # (`MultimodalModelMixin._encoder_cache_keys`), which uses UUID-aware multimodal hashes
+    # internally. Although the `multimodal_uuids` are not exposed as an attribute, they remain in
+    # the backing C++ request for KV-cache block keys and cache events.
     return MultimodalInput.from_components(
         request.multimodal_hashes,
         request.multimodal_positions,
@@ -378,7 +380,11 @@ class PyTorchModelEngine(ModelEngine):
             trust_remote_code=llm_args.trust_remote_code,
             **input_processor_kwargs)
         self.input_processor_with_hash = create_input_processor_with_hash(
-            self.input_processor)
+            self.input_processor,
+            encoder_cache_enabled=(
+                llm_args.multimodal_config is not None
+                and llm_args.multimodal_config.encoder_cache_max_bytes > 0),
+        )
         if model is None:
             lora_config: Optional[
                 LoraConfig] = None if is_draft_model else llm_args.lora_config

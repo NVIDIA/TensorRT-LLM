@@ -512,14 +512,18 @@ class MultimodalEncoderCudaGraphConfig(StrictBaseModel):
         return self
 
 
-_BYTE_STRING_PATTERN = re.compile(r"^\s*(\d+)\s*([kmgt]ib|b)?\s*$",
+_BYTE_STRING_PATTERN = re.compile(r"^\s*(\d+)\s*([kmgt]i?b|b)?\s*$",
                                   re.IGNORECASE)
 _BINARY_BYTE_UNITS: dict[Optional[str], int] = {
     None: 1,
     "b": 1,
+    "kb": 1024,
     "kib": 1024,
+    "mb": 1024**2,
     "mib": 1024**2,
+    "gb": 1024**3,
     "gib": 1024**3,
+    "tb": 1024**4,
     "tib": 1024**4,
 }
 
@@ -532,7 +536,7 @@ def _parse_binary_byte_string(value: Any) -> Any:
     if match is None:
         raise ValueError(
             "Byte strings must be non-negative integers with optional "
-            "B/KiB/MiB/GiB/TiB suffix.")
+            "B/KB/MB/GB/TB or KiB/MiB/GiB/TiB suffix.")
 
     amount = int(match.group(1))
     unit = match.group(2)
@@ -568,7 +572,7 @@ class MultimodalConfig(StrictBaseModel):
         default=134_217_728,  # 128 MiB.
         description=
         ("Maximum bytes for the per-model cross-request multimodal encoder embedding cache. "
-         "Set to 0 to disable. String values such as '512MiB' and '1GiB' use binary units. "
+         "Set to 0 to disable. String values such as '512MB' and '1GiB' use binary units. "
          "Cache entries are per multimodal item, but reuse is all-or-nothing for each request: "
          "every item in the request must hit the cache before cached embeddings are reused. "
          "Only single-modality requests are cacheable for the time being. "
@@ -4566,6 +4570,16 @@ class TorchLlmArgs(BaseLlmArgs):
         default_factory=MultimodalConfig,
         description="Multimodal model configuration.",
         status="prototype")
+
+    @field_validator('multimodal_config', mode='before')
+    @classmethod
+    def init_multimodal_config(cls, v):
+        # The field is non-Optional, but callers (e.g. the multimodal
+        # quickstart) pass None to mean "unset". Coerce None back to the
+        # default so it does not fail type validation.
+        if v is None:
+            return MultimodalConfig()
+        return v
 
     attention_dp_config: Optional[AttentionDpConfig] = Field(
         default=None,

@@ -1,3 +1,19 @@
+# Copyright 2026 NVIDIA CORPORATION & AFFILIATES
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+
 import enum
 import traceback
 from abc import ABC, abstractmethod
@@ -1062,6 +1078,8 @@ def maybe_compute_mm_embed_cumsum(
 def create_input_processor_with_hash(
     input_processor: BaseMultimodalInputProcessor,
     hash_lib=default_hasher,
+    *,
+    encoder_cache_enabled: bool = False,
 ) -> Callable[[TextPrompt, SamplingParams], Tuple[
         List[int], Optional[ExtraProcessedInputs]]]:
     """Creates a modified processor that applies additional logic like (hashing, find mm chunk positions) to the input processor
@@ -1069,6 +1087,8 @@ def create_input_processor_with_hash(
     Args:
         original_processor: The original input processor to wrap.
         hash_lib: hasher to use (default: blake3)
+        encoder_cache_enabled: Whether to generate processor-kwargs hashes for
+            persistent multimodal encoder-cache keys.
 
     Returns:
         A wrapped processor that modifies prompts before processing.
@@ -1099,8 +1119,6 @@ def create_input_processor_with_hash(
 
         prompt_token_ids, extra_processed_inputs = input_processor(
             inputs, sampling_params)
-        mm_processor_kwargs_hash = _hash_mm_processor_kwargs(
-            inputs.get("mm_processor_kwargs") or {}, hash_lib)
         if extra_processed_inputs is None:
             extra_processed_inputs = {}
         multimodal_data = extra_processed_inputs.setdefault(
@@ -1108,7 +1126,10 @@ def create_input_processor_with_hash(
         if not isinstance(multimodal_data, dict):
             raise TypeError(
                 "extra_processed_inputs['multimodal_data'] must be a dict")
-        multimodal_data["mm_processor_kwargs_hash"] = mm_processor_kwargs_hash
+        if encoder_cache_enabled:
+            multimodal_data[
+                "mm_processor_kwargs_hash"] = _hash_mm_processor_kwargs(
+                    inputs.get("mm_processor_kwargs") or {}, hash_lib)
 
         # TODO: here we assume there is only one modality for now
         num_mm_tokens_by_key = find_mm_token_lengths(

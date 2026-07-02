@@ -669,6 +669,8 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
     `tensorrt_llm/inputs/utils.py`).
     """
 
+    supports_encoder_cache = True
+
     def __init__(
         self,
         model_config: ModelConfig[Mistral3Config],

@@ -66,12 +66,19 @@ class TensorLRUCache(Generic[K]):
     """Thread-safe LRU cache from hashable keys to tensor values.
 
     Size accounting uses logical tensor bytes: `tensor.numel() * tensor.element_size()`.
-    Returned tensors are the cached tensor objects themselves, so callers should treat them as
-    immutable while they remain cache-owned.
+    Returned tensors alias the cache-owned tensor objects. Callers must treat them as immutable
+    while they remain cache-owned.
+
+    The cache owns a detached copy rather than the caller's tensor or view. This prevents later
+    caller mutations from changing a cached value and prevents a small cached view from retaining
+    the caller's larger backing allocation. The copy is made before acquiring the lock and before
+    replacement or eviction, preserving existing cache entries if copying fails. Consequently,
+    `max_bytes` bounds steady-state logical cache contents, not peak allocation: insertion
+    temporarily needs both the source tensor and its copy and may exceed the cache limit until
+    eviction completes.
 
     Args:
         max_bytes: Maximum logical tensor bytes held by this cache.
-        clone_on_insert: Store `value.detach().clone()` instead of the caller's tensor object.
         name: Short label used in debug log messages.
     """
 
@@ -79,14 +86,12 @@ class TensorLRUCache(Generic[K]):
         self,
         max_bytes: int,
         *,
-        clone_on_insert: bool = False,
         name: str = "tensor_lru_cache",
     ) -> None:
         if max_bytes <= 0:
             raise ValueError("max_bytes must be positive")
 
         self._max_bytes = max_bytes
-        self._clone_on_insert = clone_on_insert
         self._name = name
         self._current_bytes = 0
         self._items: OrderedDict[K, _Entry] = OrderedDict()
@@ -107,7 +112,10 @@ class TensorLRUCache(Generic[K]):
             return len(self._items)
 
     def get(self, key: K) -> torch.Tensor | None:
-        """Return a cached tensor and promote it to most-recently-used."""
+        """Return a cache-owned, immutable tensor and promote it to most-recently-used.
+
+        The returned tensor aliases the cached value. Callers must not mutate it.
+        """
         with self._lock:
             entry = self._items.get(key)
             if entry is None:
@@ -135,7 +143,7 @@ class TensorLRUCache(Generic[K]):
             )
             return False
 
-        stored_value = value.detach().clone() if self._clone_on_insert else value
+        stored_value = value.detach().clone()
 
         with self._lock:
             old_entry = self._items.pop(key, None)

@@ -16,7 +16,17 @@
 
 import contextlib
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Hashable, Iterable, Iterator, Optional, Sequence
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Dict,
+    Hashable,
+    Iterable,
+    Iterator,
+    Optional,
+    Sequence,
+)
 
 import torch
 
@@ -119,6 +129,9 @@ class MultimodalModelMixin:
       hit the cache before cached embeddings are reused. Mixed-modality `MultimodalParams` objects
       bypass the persistent cache.
     """
+
+    supports_encoder_cache: ClassVar[bool] = False
+    """Whether the model's production forward path uses the persistent encoder cache."""
 
     model_config: ModelConfig
     _multimodal_encoder_cache: Optional[TensorLRUCache] = None
@@ -299,17 +312,20 @@ class MultimodalModelMixin:
         the single tensor contract for both encoded and cached-only paths.
         """
         encoder_cache = self._get_multimodal_encoder_cache()
+        cache_hits = [False] * len(multimodal_params)
         if encoder_cache is not None:
-            for param in multimodal_params:
-                self._attach_encoder_cache_hit(param, encoder_cache)
+            cache_hits = [
+                self._attach_encoder_cache_hit(param, encoder_cache) for param in multimodal_params
+            ]
 
         embeddings = get_multimodal_embeddings(
             encoder_forward_fn=self.encode_multimodal_inputs,
             multimodal_params=list(multimodal_params),
         )
         if encoder_cache is not None:
-            for param in multimodal_params:
-                self._write_encoder_cache_entries(param, encoder_cache)
+            for param, cache_hit in zip(multimodal_params, cache_hits, strict=True):
+                if not cache_hit:
+                    self._write_encoder_cache_entries(param, encoder_cache)
 
         # Validate post-gather so cached-only paths (KV reuse, all-cached chunked prefill) are also
         # checked, not just paths that ran the encoder.
@@ -336,9 +352,13 @@ class MultimodalModelMixin:
             return None
 
         if self._multimodal_encoder_cache is None:
+            # Per-item embeddings are views produced by splitting a request-level encoder output.
+            # Clone them so a cached item neither aliases mutable caller output nor retains the
+            # entire batch allocation while cache accounting charges only its logical size. This
+            # briefly needs source and clone memory during insertion, but preserves existing cache
+            # entries when the copy cannot be allocated.
             self._multimodal_encoder_cache = TensorLRUCache(
                 max_bytes,
-                clone_on_insert=True,
                 name=_MM_ENCODER_CACHE_LOG_NAME,
             )
             try:
@@ -347,8 +367,8 @@ class MultimodalModelMixin:
             except NotImplementedError:
                 logger.info(
                     f"{_MM_ENCODER_CACHE_LOG_NAME}: created with max_bytes={max_bytes}, "
-                    "clone_on_insert=True; embedding row capacity unavailable because the "
-                    "model does not implement embedding_dim and embedding_dtype."
+                    "embedding row capacity unavailable because the model does not implement "
+                    "embedding_dim and embedding_dtype."
                 )
             else:
                 bytes_per_embedding_row = (
@@ -358,7 +378,7 @@ class MultimodalModelMixin:
                 logger.info(
                     f"{_MM_ENCODER_CACHE_LOG_NAME}: created with max_bytes={max_bytes}, "
                     f"max_embedding_rows={max_embedding_rows}, embedding_dim={embedding_dim}, "
-                    f"embedding_dtype={embedding_dtype}, clone_on_insert=True"
+                    f"embedding_dtype={embedding_dtype}"
                 )
         return self._multimodal_encoder_cache
 
@@ -371,11 +391,17 @@ class MultimodalModelMixin:
         not cache mixed-modality params today.
         """
         mm_data = param.multimodal_data or {}
+        modalities = [key for key in _MM_DATA_INPUT_MODALITY_KEYS if key in mm_data]
+
         modality = mm_data.get("modality_type")
         if isinstance(modality, str):
-            return modality
+            # Trust the explicit `modality_type` only when it agrees with the actual data keys.
+            # Otherwise fall through to the mixed-modality skip so an inconsistent producer (e.g.
+            # `modality_type="image"` while both image and audio data are present) cannot bypass the
+            # safety check below and have the cache serve embeddings for the wrong modality.
+            if modalities == [modality]:
+                return modality
 
-        modalities = [key for key in _MM_DATA_INPUT_MODALITY_KEYS if key in mm_data]
         if len(modalities) != 1:
             # Mixed-modality params are skipped because the cache key metadata is request-item
             # oriented: `multimodal_hashes` and `multimodal_embedding_lengths` are parallel per
@@ -451,17 +477,18 @@ class MultimodalModelMixin:
         cls,
         param: MultimodalParams,
         encoder_cache: TensorLRUCache,
-    ) -> None:
+    ) -> bool:
+        """Attach a full persistent-cache hit and report whether one was found."""
         if param.multimodal_data.get("multimodal_embedding") is not None:
             logger.debug(
                 f"{_MM_ENCODER_CACHE_LOG_NAME}: request-local multimodal embedding present; "
                 "skipping persistent cache lookup"
             )
-            return
+            return False
 
         keys = cls._encoder_cache_keys(param)
         if not keys:
-            return
+            return False
 
         cached_embeddings = []
         for key in keys:
@@ -475,14 +502,18 @@ class MultimodalModelMixin:
                     f"{_MM_ENCODER_CACHE_LOG_NAME}: cache miss; hit_items={len(cached_embeddings)},"
                     f" total_items={len(keys)}."
                 )
-                return
+                return False
             cached_embeddings.append(cached_embedding)
 
-        param.multimodal_data["multimodal_embedding"] = torch.cat(cached_embeddings, dim=0)
+        if len(cached_embeddings) == 1:
+            param.multimodal_data["multimodal_embedding"] = cached_embeddings[0]
+        else:
+            param.multimodal_data["multimodal_embedding"] = torch.cat(cached_embeddings, dim=0)
         logger.debug(
             f"{_MM_ENCODER_CACHE_LOG_NAME}: full cache hit for {len(keys)} item entries, "
             f"rows={param.multimodal_data['multimodal_embedding'].shape[0]}."
         )
+        return True
 
     @classmethod
     def _write_encoder_cache_entries(

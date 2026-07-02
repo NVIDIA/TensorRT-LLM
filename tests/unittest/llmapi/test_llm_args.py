@@ -515,7 +515,7 @@ class TestMultimodalConfig:
     def test_default_encoder_cuda_graph_is_none(self):
         assert MultimodalConfig().encoder_cuda_graph is None
         assert MultimodalConfig().encoder_side_stream_max_ahead == 0
-        assert MultimodalConfig().encoder_cache_max_bytes == 0
+        assert MultimodalConfig().encoder_cache_max_bytes == 128 * 1024**2
         assert MultimodalConfig().video_pruning_rate is None
 
     def test_torch_llm_args_default_multimodal_config(self):
@@ -523,7 +523,7 @@ class TestMultimodalConfig:
         assert isinstance(args.multimodal_config, MultimodalConfig)
         assert args.multimodal_config.encoder_cuda_graph is None
         assert args.multimodal_config.encoder_side_stream_max_ahead == 0
-        assert args.multimodal_config.encoder_cache_max_bytes == 0
+        assert args.multimodal_config.encoder_cache_max_bytes == 128 * 1024**2
         assert args.multimodal_config.video_pruning_rate is None
 
     @pytest.mark.parametrize(
@@ -531,6 +531,7 @@ class TestMultimodalConfig:
         [
             (0, 0),
             ("0", 0),
+            ("4KB", 4 * 1024),
             ("512MB", 512 * 1024**2),
             ("1GB", 1024**3),
             ("1GiB", 1024**3),

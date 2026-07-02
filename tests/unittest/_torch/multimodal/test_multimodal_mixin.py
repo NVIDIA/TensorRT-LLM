@@ -268,7 +268,7 @@ def test_encoder_cache_creation_logs_embedding_row_capacity():
     messages = [" ".join(map(str, call.args)) for call in info.call_args_list]
     assert any(
         "mm_encoder_cache: created with max_bytes=4096, max_embedding_rows=256, "
-        "embedding_dim=4, embedding_dtype=torch.float32, clone_on_insert=True" in message
+        "embedding_dim=4, embedding_dtype=torch.float32" in message
         for message in messages
     )
 
@@ -284,8 +284,8 @@ def test_encoder_cache_creation_logs_byte_capacity_without_embedding_metadata():
 
     messages = [" ".join(map(str, call.args)) for call in info.call_args_list]
     assert any(
-        "mm_encoder_cache: created with max_bytes=4096, clone_on_insert=True; "
-        "embedding row capacity unavailable because the model does not implement "
+        "mm_encoder_cache: created with max_bytes=4096, embedding row capacity unavailable "
+        "because the model does not implement "
         "embedding_dim and embedding_dtype." in message
         for message in messages
     )
@@ -305,6 +305,23 @@ def test_encoder_cache_repeated_item_across_requests_skips_encoder():
 
     assert model.encode_calls == 1
     torch.testing.assert_close(second_embeddings, first_embeddings)
+
+
+def test_encoder_cache_full_hit_does_not_rewrite_entries():
+    model = CountingEncoderMultimodalModel(
+        make_embedding(hidden_size=4),
+        torch.tensor([7]),
+        encoder_cache_max_bytes=4096,
+    )
+    model._get_or_encode_multimodal_embeddings([make_keyed_multimodal_param()])
+    cache = model._multimodal_encoder_cache
+    assert cache is not None
+
+    with patch.object(cache, "put", wraps=cache.put) as put:
+        model._get_or_encode_multimodal_embeddings([make_keyed_multimodal_param()])
+
+    assert model.encode_calls == 1
+    put.assert_not_called()
 
 
 def test_encoder_cache_partial_hit_logs_and_uses_encoder():
