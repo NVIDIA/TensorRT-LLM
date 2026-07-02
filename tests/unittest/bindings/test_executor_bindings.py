@@ -1377,6 +1377,7 @@ def test_scheduler_config():
     config = trtllm.SchedulerConfig()
     assert config.capacity_scheduler_policy == capacity_scheduler_policy
     assert config.context_chunking_policy is None
+    assert config.enable_prefix_aware_scheduling is True
 
     capacity_scheduler_policy = trtllm.CapacitySchedulerPolicy.MAX_UTILIZATION
     config = trtllm.SchedulerConfig(capacity_scheduler_policy)
@@ -1402,12 +1403,13 @@ def test_scheduler_config():
     dynamic_batch_config = trtllm.DynamicBatchConfig(True, True, 128)
     config = trtllm.SchedulerConfig(capacity_scheduler_policy,
                                     context_chunking_policy,
-                                    dynamic_batch_config)
+                                    dynamic_batch_config, False)
     assert config.capacity_scheduler_policy == capacity_scheduler_policy
     assert config.context_chunking_policy == context_chunking_policy
     assert config.dynamic_batch_config.enable_batch_size_tuning == True
     assert config.dynamic_batch_config.enable_max_num_tokens_tuning == True
     assert config.dynamic_batch_config.dynamic_batch_moving_average_window == 128
+    assert config.enable_prefix_aware_scheduling is False
 
 
 def test_kv_cache_config():
@@ -2490,12 +2492,14 @@ def test_request_stats_per_iteration():
     assert stats_json["requestStats"][0]["id"] == 1
 
 
-def test_scheduler_config_pickle():
+def test_scheduler_config_pickle() -> None:
     policy = trtllm.CapacitySchedulerPolicy.MAX_UTILIZATION
-    config = trtllm.SchedulerConfig(policy)
+    config = trtllm.SchedulerConfig(policy,
+                                    enable_prefix_aware_scheduling=False)
     config_str = pickle.dumps(config)
     config_copy = pickle.loads(config_str)
     assert config.capacity_scheduler_policy == config_copy.capacity_scheduler_policy
+    assert config_copy.enable_prefix_aware_scheduling is False
 
 
 def test_kv_cache_config_pickle():
@@ -2627,7 +2631,7 @@ def test_cache_transceiver_config_pickle():
     assert config_copy.kv_transfer_poll_interval_ms == config.kv_transfer_poll_interval_ms
 
 
-def test_executor_config_pickle():
+def test_executor_config_pickle() -> None:
     beam_width = 2
     config = trtllm.ExecutorConfig(beam_width)
 
@@ -2639,7 +2643,8 @@ def test_executor_config_pickle():
         "max_num_tokens":
         128,
         "scheduler_config":
-        trtllm.SchedulerConfig(trtllm.CapacitySchedulerPolicy.MAX_UTILIZATION),
+        trtllm.SchedulerConfig(trtllm.CapacitySchedulerPolicy.MAX_UTILIZATION,
+                               enable_prefix_aware_scheduling=False),
         "kv_cache_config":
         trtllm.KvCacheConfig(enable_block_reuse=True,
                              free_gpu_memory_fraction=0.5),
@@ -2697,6 +2702,7 @@ def test_executor_config_pickle():
     assert config.max_batch_size == config_copy.max_batch_size
     assert config.max_num_tokens == config_copy.max_num_tokens
     assert config.scheduler_config.capacity_scheduler_policy == config_copy.scheduler_config.capacity_scheduler_policy
+    assert config_copy.scheduler_config.enable_prefix_aware_scheduling is False
     assert config.kv_cache_config.enable_block_reuse == config_copy.kv_cache_config.enable_block_reuse
     assert config.enable_chunked_context == config_copy.enable_chunked_context
     assert config.normalize_log_probs == config_copy.normalize_log_probs

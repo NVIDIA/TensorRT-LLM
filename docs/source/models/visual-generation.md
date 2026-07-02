@@ -59,7 +59,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 [^3]: LTX-2 has no built-in TeaCache coefficient table in TRT-LLM; set `teacache.coefficients` explicitly when enabling TeaCache.
 
-[^4]: Qwen-Image ships a native BF16 implementation with per-module numerical parity vs `diffusers.QwenImagePipeline` (cosine >= 0.999 on the full 20B transformer) and `trtllm-serve` / `/v1/images/generations` support. FP8 blockwise and NVFP4 work both as VisualGen dynamic quantization from a BF16 checkpoint and by loading a pre-quantized ModelOpt checkpoint with static scales. For pre-quantized checkpoints, the checkpoint's `quantization_config` `ignore` list keeps the embedders, output projection, and first/last transformer blocks in high precision. ModelOpt **NVFP4 SVDQuant** checkpoints (`quant_algo` `NVFP4_SVD`: an NVFP4 residual plus a per-input-channel `pre_quant_scale` and a rank-r BF16 LoRA correction) are also supported.
+[^4]: Qwen-Image ships a native BF16 implementation with per-module numerical parity against `diffusers.QwenImagePipeline` (cosine similarity >= 0.999 on the full 20B transformer) and supports `trtllm-serve` / `/v1/images/generations`. VisualGen supports FP8 blockwise and NVFP4 dynamic quantization from BF16 checkpoints, as well as direct loading of statically quantized FP8 and NVFP4 ModelOpt checkpoints. ModelOpt **NVFP4 SVDQuant** checkpoints (`quant_algo` `NVFP4_SVD`: an NVFP4 residual plus a per-input-channel `pre_quant_scale` and a rank-r BF16 LoRA correction) are also supported.
 
 ## Quick Start
 
