@@ -575,7 +575,11 @@ class KvCacheCreator:
                     max_gpu_total_bytes = min(max_gpu_total_bytes,
                                               self._max_gpu_total_bytes_in)
                 self._kv_cache_config.max_gpu_total_bytes = max_gpu_total_bytes
-                self._kv_cache_config.max_tokens = max_tokens
+                # V2 pool capacity is governed by max_gpu_total_bytes; for V2
+                # _get_token_num_for_estimation() returns only the dummy-workload token
+                # count, so writing it into max_tokens starves the real pool. Restore the
+                # incoming config value (None => no artificial cap).
+                self._kv_cache_config.max_tokens = self._max_kv_tokens_in
             else:
                 self._kv_cache_config.max_tokens = max_tokens
         return estimating_kv_cache
