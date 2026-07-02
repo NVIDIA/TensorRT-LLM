@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Tests for PyExecutor request handling functionality.
 
 This module tests the request handling logic that was moved from ExecutorRequestQueue
@@ -1074,16 +1089,23 @@ def _err_req():
     return _make_adp_request(LlmRequestState.DISAGG_TRANS_ERROR)
 
 
+_DEFAULT_KV_CACHE_TRANSCEIVER = object()
+
+
 def _make_disagg_err_stub(
     *,
     enable_attention_dp=True,
-    kv_cache_transceiver=object(),
+    kv_cache_transceiver=_DEFAULT_KV_CACHE_TRANSCEIVER,
     world_size=2,
     active_requests=None,
     tp_allgather_result=None,
 ):
     stub = types.SimpleNamespace()
     stub.enable_attention_dp = enable_attention_dp
+    if kv_cache_transceiver is _DEFAULT_KV_CACHE_TRANSCEIVER:
+        kv_cache_transceiver = Mock()
+        kv_cache_transceiver.supports_inflight_request_cancellation.return_value = False
+        kv_cache_transceiver.has_poisoned_transfer_buffer.return_value = False
     stub.kv_cache_transceiver = kv_cache_transceiver
     stub.active_requests = active_requests if active_requests is not None else []
     stub.dist = Mock()

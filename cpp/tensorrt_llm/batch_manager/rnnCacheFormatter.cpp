@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,6 +23,7 @@
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/dataType.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
@@ -184,7 +185,9 @@ void RnnCacheFormatter::formatSlotMode(TransferSession& session)
             / targetInfo.mDomainTPSize;
     }
 
-    auto cacheBufferId = mRnnCacheTransBufferManager->assignBufferIndexForSend();
+    auto const* sendCancelFlag = &session.getDataContext().getTransferTerminate();
+    auto cacheBufferId = mRnnCacheTransBufferManager->assignBufferIndexForSend(sendCancelFlag);
+    BufferIndexHolder sendHolder(*mRnnCacheTransBufferManager, cacheBufferId, /*isRecv=*/false);
     auto allocationResult = mRnnCacheTransBufferManager->getOrAllocateSendBuffers(
         cacheBufferId, static_cast<int>(bufferTargetNum), bufferSizesPerTarget, bufferManager);
     auto& outputBuffers = std::get<0>(allocationResult);
@@ -222,12 +225,23 @@ void RnnCacheFormatter::formatSlotMode(TransferSession& session)
 
     auto preAllocSendBuffer = mRnnCacheTransBufferManager->getSendBuffer(cacheBufferId);
 
-    sendAllBuffers(session, deviceId, outputBuffers, bufferCoverTargetNum, preAllocSendBuffer, bufferManager,
-        targetInfo, pickUpConnections);
+    try
+    {
+        sendAllBuffers(session, deviceId, outputBuffers, bufferCoverTargetNum, preAllocSendBuffer, bufferManager,
+            targetInfo, pickUpConnections);
+    }
+    catch (...)
+    {
+        if (agentConnection != nullptr && session.isInflightCancelEnabled())
+        {
+            sendHolder.poison();
+        }
+        throw;
+    }
 
     session.setTime(TransferSession::kTimeTransmissions);
 
-    mRnnCacheTransBufferManager->freeBufferIndexForSend(cacheBufferId);
+    sendHolder.release();
     session.setTime(TransferSession::kTimePostprocess);
 
     TLLM_LOG_DEBUG(
@@ -348,6 +362,7 @@ void RnnCacheFormatter::unformatSlotMode(TransferSession& session)
     size_t remainNoCoverSourceNum = 0;
     size_t bufferCoverSourceNum = 0;
     std::optional<int> cacheBufferId = std::nullopt;
+    BufferIndexHolder recvHolder;
 
     auto preAssignedRnnId
         = connections[pickUpConnections[0]]->getPreAssignedBufferId(static_cast<uint8_t>(BufferKind::kRNN));
@@ -358,6 +373,7 @@ void RnnCacheFormatter::unformatSlotMode(TransferSession& session)
     else
     {
         cacheBufferId = mRnnCacheTransBufferManager->assignBufferIndexForRecv();
+        recvHolder = BufferIndexHolder(*mRnnCacheTransBufferManager, cacheBufferId, /*isRecv=*/true);
     }
 
     auto allocationResult = mRnnCacheTransBufferManager->getOrAllocateRecvBuffers(
@@ -505,10 +521,7 @@ void RnnCacheFormatter::unformatSlotMode(TransferSession& session)
 
     bufferManager.getStream().synchronize();
 
-    if (cacheBufferId.has_value())
-    {
-        mRnnCacheTransBufferManager->freeBufferIndexForRecv(cacheBufferId);
-    }
+    recvHolder.release();
     session.setTime(TransferSession::kTimePostprocess);
 
     TLLM_LOG_DEBUG(
@@ -643,11 +656,16 @@ void RnnCacheFormatter::formatUnifiedPoolMode(TransferSession& session)
                 bufferSizesPerTarget[t] = ssmBufBytes + convBufBytes;
             }
 
-            auto cacheBufferId = mRnnCacheTransBufferManager->assignBufferIndexForSend();
+            auto const* sendCancelFlag = &session.getDataContext().getTransferTerminate();
+            auto cacheBufferId = mRnnCacheTransBufferManager->assignBufferIndexForSend(sendCancelFlag);
+            BufferIndexHolder sendHolder(*mRnnCacheTransBufferManager, cacheBufferId, /*isRecv=*/false);
             auto allocationResult = mRnnCacheTransBufferManager->getOrAllocateSendBuffers(
                 cacheBufferId, static_cast<int>(bufferTargetNum), bufferSizesPerTarget, bufferManager);
             auto& outputBuffers = std::get<0>(allocationResult);
             auto& bufferCoverTargetNum = std::get<1>(allocationResult);
+            auto const* agentConnection = rnnSendConns.empty()
+                ? nullptr
+                : dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[rnnSendConns[0]]);
 
             // Split each outputBuffer into SSM and conv portions.
             std::vector<runtime::ITensor::SharedPtr> ssmOutputBuffers(numTargets);
@@ -677,11 +695,22 @@ void RnnCacheFormatter::formatUnifiedPoolMode(TransferSession& session)
             int deviceId;
             TLLM_CUDA_CHECK(cudaGetDevice(&deviceId));
             auto preAllocSendBuffer = mRnnCacheTransBufferManager->getSendBuffer(cacheBufferId);
-            sendAllBuffers(session, deviceId, outputBuffers, bufferCoverTargetNum, preAllocSendBuffer, bufferManager,
-                targetInfo, rnnSendConns);
+            try
+            {
+                sendAllBuffers(session, deviceId, outputBuffers, bufferCoverTargetNum, preAllocSendBuffer,
+                    bufferManager, targetInfo, rnnSendConns);
+            }
+            catch (...)
+            {
+                if (agentConnection != nullptr && session.isInflightCancelEnabled())
+                {
+                    sendHolder.poison();
+                }
+                throw;
+            }
 
             session.setTime(TransferSession::kTimeTransmissions);
-            mRnnCacheTransBufferManager->freeBufferIndexForSend(cacheBufferId);
+            sendHolder.release();
         }
     }
 
@@ -821,6 +850,7 @@ void RnnCacheFormatter::unformatUnifiedPoolMode(TransferSession& session)
 
             // Use pre-assigned buffer ID from NIXL connection if available (same as slot mode).
             std::optional<int> cacheBufferId = std::nullopt;
+            BufferIndexHolder recvHolder;
             auto preAssignedRnnId
                 = connections[rnnRecvConns[0]]->getPreAssignedBufferId(static_cast<uint8_t>(BufferKind::kRNN));
             if (preAssignedRnnId.has_value())
@@ -830,6 +860,7 @@ void RnnCacheFormatter::unformatUnifiedPoolMode(TransferSession& session)
             else
             {
                 cacheBufferId = mRnnCacheTransBufferManager->assignBufferIndexForRecv();
+                recvHolder = BufferIndexHolder(*mRnnCacheTransBufferManager, cacheBufferId, /*isRecv=*/true);
             }
 
             auto allocationResult = mRnnCacheTransBufferManager->getOrAllocateRecvBuffers(
@@ -876,7 +907,7 @@ void RnnCacheFormatter::unformatUnifiedPoolMode(TransferSession& session)
 
             bufferManager.getStream().synchronize();
 
-            mRnnCacheTransBufferManager->freeBufferIndexForRecv(cacheBufferId);
+            recvHolder.release();
         }
     }
 
