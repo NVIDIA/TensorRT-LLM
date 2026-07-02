@@ -115,7 +115,12 @@ def _install(monkeypatch, state):
         holder["tokens"] = None
         holder["probs"] = None
         out = orig_blk(self, gen_logits, spec_metadata, num_contexts, batch_size, d2t)
-        if holder["probs"] is not None and not spec_metadata.is_all_greedy_sample:
+        if (
+            holder["probs"] is not None
+            and not spec_metadata.is_all_greedy_sample
+            and spec_metadata.batch_slot_ids is not None
+            and spec_metadata.draft_probs is not None
+        ):
             num_gens, K, vocab = gen_logits.shape
             gen_slot_ids = spec_metadata.batch_slot_ids[num_contexts:batch_size]
             stored = spec_metadata.draft_probs[gen_slot_ids, :K, :vocab]

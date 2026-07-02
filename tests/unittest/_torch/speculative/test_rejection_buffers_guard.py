@@ -35,6 +35,7 @@ def _alloc_meta(**over):
         use_rejection_sampling=True,
         draft_probs=None,
         vocab_size=V,
+        draft_vocab_size=V,
         max_num_requests=R,
         max_draft_len=K,
         batch_slot_ids=None,
@@ -46,13 +47,22 @@ def _alloc_meta(**over):
 
 
 def test_prepare_buffers_allocates_when_enabled():
+    # Shared draft/target vocab: draft_probs + batch_slot_ids are allocated;
+    # full_draft_probs is skipped (only needed when the vocabs differ).
     m = _alloc_meta()
     SpecMetadata.prepare_rejection_sampling_buffers(m)
-    assert m.draft_probs is not None and tuple(m.draft_probs.shape) == (R, K, V)
+    assert m.draft_probs is not None and tuple(m.draft_probs.shape) == (R + 1, K, V)
     assert m.batch_slot_ids is not None and m.batch_slot_ids.shape[0] == R
     assert m.batch_slot_ids.dtype == torch.long
-    assert m.full_draft_probs is not None and tuple(m.full_draft_probs.shape) == (R, K, V)
+    assert m.full_draft_probs is None
     assert m.draft_probs_vocab_size == V
+
+
+def test_prepare_buffers_allocates_full_draft_probs_on_vocab_mismatch():
+    # Distinct draft vocab: full_draft_probs (d2t-expanded) is allocated.
+    m = _alloc_meta(draft_vocab_size=V - 1)
+    SpecMetadata.prepare_rejection_sampling_buffers(m)
+    assert m.full_draft_probs is not None and tuple(m.full_draft_probs.shape) == (R + 1, K, V)
 
 
 def test_prepare_buffers_noop_when_disabled():

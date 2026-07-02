@@ -107,10 +107,18 @@ def test_mtp_sa_rejection_default_silently_disabled():
     assert args.speculative_config.use_rejection_sampling is False
 
 
-def test_mtp_tp_explicit_raises():
+def test_mtp_plain_tp_allowed():
+    # Plain tensor parallelism is supported: the draft path all-gathers the
+    # vocab-sharded draft logits before rejection.
+    spec = MTPDecodingConfig(use_mtp_vanilla=True, use_rejection_sampling=True)
+    args = _make_args(spec, tensor_parallel_size=2)
+    assert args.speculative_config.use_rejection_sampling is True
+
+
+def test_mtp_attention_dp_explicit_raises():
     spec = MTPDecodingConfig(use_mtp_vanilla=True, use_rejection_sampling=True)
     with pytest.raises(ValueError):
-        _make_args(spec, tensor_parallel_size=2)
+        _make_args(spec, tensor_parallel_size=2, enable_attention_dp=True)
 
 
 def test_mtp_guided_decoding_explicit_raises():
@@ -120,8 +128,8 @@ def test_mtp_guided_decoding_explicit_raises():
 
 
 def test_mtp_tp_default_silently_disabled():
-    # Not an explicit opt-in (value omitted): TP-active vanilla MTP silently
-    # disables rejection instead of raising.
+    # Plain TP is supported; with rejection left at its default (False) it
+    # simply stays disabled.
     spec = MTPDecodingConfig(use_mtp_vanilla=True)
     args = _make_args(spec, tensor_parallel_size=2)
     assert args.speculative_config.use_rejection_sampling is False
@@ -155,7 +163,7 @@ def test_pard_guided_decoding_explicit_raises():
 
 
 def test_pard_tp_default_silently_disabled():
-    # Not an explicit opt-in: TP-active PARD silently disables rejection.
+    # Plain TP is supported; PARD with default (False) rejection stays disabled.
     spec = PARDDecodingConfig(max_draft_len=4, speculative_model=MODEL)
     args = _make_args(spec, tensor_parallel_size=2)
     assert args.speculative_config.use_rejection_sampling is False
