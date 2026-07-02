@@ -13,18 +13,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# 1-GPU Qwen-Image with NVFP4 SVDQuant (NVFP4 residual + rank-r BF16 LoRA).
-#
-# Point --model at a ModelOpt-quantized Qwen-Image SVDQuant checkpoint
-# (quant_algo NVFP4_SVD). The quantization (NVFP4 residual, per-input-channel
-# pre_quant_scale smoothing, and the low-rank LoRA factors) is read from the
-# checkpoint's transformer/config.json + weights, so no quant_config is needed
-# here. The same per-block "ignore" list as plain NVFP4 keeps the embedders,
-# output projection, and first/last transformer blocks in high precision.
+# 1-GPU Qwen-Image CUDA graph configuration. Quantization is read from the
+# checkpoint, so this same runtime configuration can be used for BF16 and
+# statically quantized ModelOpt checkpoints.
 attention_config:
   backend: VANILLA
 parallel_config:
   cfg_size: 1
   ulysses_size: 1
-cuda_graph_config:
+  tp_size: 1
+cache_config: null
+compilation_config:
+  resolutions:
+    - [1024, 1024]
+  num_frames: [1]
+  skip_warmup: false
+torch_compile_config:
   enable: false
+  enable_fullgraph: false
+  enable_autotune: true
+cuda_graph_config:
+  enable: true
+enable_layerwise_nvtx_marker: false
