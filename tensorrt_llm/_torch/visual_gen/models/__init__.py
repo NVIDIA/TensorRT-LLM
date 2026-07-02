@@ -35,6 +35,7 @@ from ..pipeline import BasePipeline
 from ..pipeline_registry import AutoPipeline, register_pipeline
 from .cosmos3 import Cosmos3OmniMoTPipeline
 from .flux import Flux2Pipeline, FluxPipeline
+from .hunyuandit import HunyuanDiTPipeline
 from .ltx2 import LTX2Pipeline  # noqa: F401
 from .qwen_image import QwenImagePipeline
 from .wan import WanImageToVideoPipeline, WanPipeline
@@ -44,6 +45,7 @@ __all__ = [
     "BasePipeline",
     "FluxPipeline",
     "Flux2Pipeline",
+    "HunyuanDiTPipeline",
     "QwenImagePipeline",
     "WanPipeline",
     "WanImageToVideoPipeline",

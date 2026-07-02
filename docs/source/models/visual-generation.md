@@ -38,6 +38,9 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `Qwen/Qwen-Image-2512` | Text-to-Image |
 | `nvidia/Cosmos3-Nano` | Text-to-Image, Text-to-Video, Image-to-Video |
 | `nvidia/Cosmos3-Super` | Text-to-Image, Text-to-Video, Image-to-Video |
+| `Tencent-Hunyuan/HunyuanDiT-v1.2-Diffusers` | Text-to-Image |
+| `Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers` | Text-to-Image |
+| `Tencent-Hunyuan/HunyuanDiT-v1.0-Diffusers` | Text-to-Image |
 
 Models are auto-detected from the checkpoint directory. Diffusers-format models are detected via `model_index.json`; LTX-2 monolithic safetensors checkpoints are detected via embedded metadata. The `AutoPipeline` registry selects the appropriate pipeline class automatically.
 
@@ -52,6 +55,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **LTX-2** | Yes | Yes | Yes [^3] | Yes | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No |
 | **Qwen-Image** [^4] | Yes | Yes | No | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | No |
 | **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
+| **HunyuanDiT** [^5] | No | No | No | No | No | Yes | No | No | No | Yes | No | No | No |
 
 [^1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
 
@@ -60,6 +64,8 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 [^3]: LTX-2 has no built-in TeaCache coefficient table in TRT-LLM; set `teacache.coefficients` explicitly when enabling TeaCache.
 
 [^4]: Qwen-Image ships a native BF16 implementation with per-module numerical parity vs `diffusers.QwenImagePipeline` (cosine >= 0.999 on the full 20B transformer) and `trtllm-serve` / `/v1/images/generations` support. FP8 blockwise and NVFP4 use VisualGen dynamic quantization from BF16 checkpoints; no pre-quantized checkpoint is required.
+
+[^5]: HunyuanDiT uses bilingual (Chinese/English) text conditioning via a BertModel CLIP encoder and an MT5EncoderModel. Ulysses sequence parallelism is supported: after the patch-embed the latent sequence is sharded across ranks; a custom attention processor injects all-to-all collectives around self-attention while text cross-attention remains standard SDPA (text tokens are replicated). Set `ulysses_size` to the desired number of sequence-parallel ranks (must divide `num_attention_heads=16`). Quantization and ring-attention optimizations are planned for future releases.
 
 ## Quick Start
 
