@@ -336,18 +336,18 @@ class BaseLLM:
             logger.info(
                 f'start MpiSession with {self.args.parallel_config.world_size} workers'
             )
+            # _owns_mpi_session is already True here: this branch only runs
+            # when no external session was supplied.
             if not self.mpi_session:
                 mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
                 if not mpi_process_pre_spawned:
                     logger_debug("LLM create MpiPoolSession\n", "yellow")
                     self.mpi_session = MpiPoolSession(
                         n_workers=self.args.parallel_config.world_size)
-                    self._owns_mpi_session = True
                 else:
                     logger_debug("LLM create MpiCommSession\n", "yellow")
                     self.mpi_session = create_mpi_comm_session(
                         self.args.parallel_config.world_size)
-                    self._owns_mpi_session = True
 
         try:
             # Due to the Executor can only accept a engine path, we need to save the engine to a directory
@@ -370,8 +370,9 @@ class BaseLLM:
             self._build_model()
 
         except Exception:
-            if (self.mpi_session is not None
-                    and getattr(self, "_owns_mpi_session", True)):
+            # _owns_mpi_session is assigned before this try block, so it is
+            # always present here.
+            if self.mpi_session is not None and self._owns_mpi_session:
                 self.mpi_session.shutdown()
             raise
 

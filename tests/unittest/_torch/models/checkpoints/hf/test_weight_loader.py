@@ -11,6 +11,13 @@ class MyError(Exception):
     pass
 
 
+@pytest.fixture(autouse=True)
+def clean_weight_cache():
+    HfWeightLoader._clear_weight_cache()
+    yield
+    HfWeightLoader._clear_weight_cache()
+
+
 @pytest.mark.parametrize(
     "dir_name, safetensor_filenames, expected_safetensor_filenames, use_consolidated",
     [
@@ -102,7 +109,6 @@ def test_load_weights_ignores_consolidated_ckpt_when_sharded_ckpt_exists(
 
 def test_weight_cache_reuses_raw_weights_with_fresh_consumable_wrapper(tmp_path, monkeypatch):
     monkeypatch.setenv("TRTLLM_HF_WEIGHT_CACHE", "1")
-    HfWeightLoader._clear_weight_cache()
 
     checkpoint_dir = tmp_path / "foo"
     checkpoint_dir.mkdir()
@@ -111,26 +117,23 @@ def test_weight_cache_reuses_raw_weights_with_fresh_consumable_wrapper(tmp_path,
     raw_weight = object()
     loader = HfWeightLoader()
 
-    try:
-        with (
-            mock.patch.object(
-                loader,
-                "_load_weights_in_parallel",
-                return_value=ConsumableWeightsDict({"foo.weight": raw_weight}),
-            ) as load_weights_in_parallel,
-            mock.patch.object(loader, "prefetch_files"),
-        ):
-            first = loader.load_weights(str(checkpoint_dir), mapping=Mapping())
-            assert first["foo.weight"] is raw_weight
-            assert first.mark_consumed("foo") == 1
-            assert len(first) == 0
+    with (
+        mock.patch.object(
+            loader,
+            "_load_weights_in_parallel",
+            return_value=ConsumableWeightsDict({"foo.weight": raw_weight}),
+        ) as load_weights_in_parallel,
+        mock.patch.object(loader, "prefetch_files"),
+    ):
+        first = loader.load_weights(str(checkpoint_dir), mapping=Mapping())
+        assert first["foo.weight"] is raw_weight
+        assert first.mark_consumed("foo") == 1
+        assert len(first) == 0
 
-            second = loader.load_weights(str(checkpoint_dir), mapping=Mapping())
+        second = loader.load_weights(str(checkpoint_dir), mapping=Mapping())
 
-        load_weights_in_parallel.assert_called_once()
-        assert second["foo.weight"] is raw_weight
-    finally:
-        HfWeightLoader._clear_weight_cache()
+    load_weights_in_parallel.assert_called_once()
+    assert second["foo.weight"] is raw_weight
 
 
 def test_weight_cache_evicts_before_load_on_miss(tmp_path, monkeypatch):
@@ -141,7 +144,6 @@ def test_weight_cache_evicts_before_load_on_miss(tmp_path, monkeypatch):
 
     monkeypatch.setenv("TRTLLM_HF_WEIGHT_CACHE", "1")
     monkeypatch.setenv("TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES", "1")
-    HfWeightLoader._clear_weight_cache()
 
     dir_a = tmp_path / "a"
     dir_a.mkdir()
@@ -151,36 +153,32 @@ def test_weight_cache_evicts_before_load_on_miss(tmp_path, monkeypatch):
     (dir_b / "model.safetensors").touch()
 
     loader = HfWeightLoader()
-    try:
-        with mock.patch.object(loader, "prefetch_files"):
-            with mock.patch.object(
-                loader,
-                "_load_weights_in_parallel",
-                return_value=ConsumableWeightsDict({"foo.weight": object()}),
-            ):
-                loader.load_weights(str(dir_a), mapping=Mapping())
-            assert len(wl._WEIGHT_CACHE) == 1
-
-            def assert_room_freed_before_load(*args, **kwargs):
-                # The old (A) entry must already be gone by the time B loads.
-                assert len(wl._WEIGHT_CACHE) == 0
-                return ConsumableWeightsDict({"foo.weight": object()})
-
-            with mock.patch.object(
-                loader,
-                "_load_weights_in_parallel",
-                side_effect=assert_room_freed_before_load,
-            ):
-                loader.load_weights(str(dir_b), mapping=Mapping())
-
+    with mock.patch.object(loader, "prefetch_files"):
+        with mock.patch.object(
+            loader,
+            "_load_weights_in_parallel",
+            return_value=ConsumableWeightsDict({"foo.weight": object()}),
+        ):
+            loader.load_weights(str(dir_a), mapping=Mapping())
         assert len(wl._WEIGHT_CACHE) == 1
-    finally:
-        HfWeightLoader._clear_weight_cache()
+
+        def assert_room_freed_before_load(*args, **kwargs):
+            # The old (A) entry must already be gone by the time B loads.
+            assert len(wl._WEIGHT_CACHE) == 0
+            return ConsumableWeightsDict({"foo.weight": object()})
+
+        with mock.patch.object(
+            loader,
+            "_load_weights_in_parallel",
+            side_effect=assert_room_freed_before_load,
+        ):
+            loader.load_weights(str(dir_b), mapping=Mapping())
+
+    assert len(wl._WEIGHT_CACHE) == 1
 
 
 def test_weight_cache_disabled_by_default(tmp_path, monkeypatch):
     monkeypatch.delenv("TRTLLM_HF_WEIGHT_CACHE", raising=False)
-    HfWeightLoader._clear_weight_cache()
 
     checkpoint_dir = tmp_path / "foo"
     checkpoint_dir.mkdir()
@@ -188,21 +186,18 @@ def test_weight_cache_disabled_by_default(tmp_path, monkeypatch):
 
     loader = HfWeightLoader()
 
-    try:
-        with (
-            mock.patch.object(
-                loader,
-                "_load_weights_in_parallel",
-                side_effect=[
-                    ConsumableWeightsDict({"foo.weight": object()}),
-                    ConsumableWeightsDict({"foo.weight": object()}),
-                ],
-            ) as load_weights_in_parallel,
-            mock.patch.object(loader, "prefetch_files"),
-        ):
-            loader.load_weights(str(checkpoint_dir), mapping=Mapping())
-            loader.load_weights(str(checkpoint_dir), mapping=Mapping())
+    with (
+        mock.patch.object(
+            loader,
+            "_load_weights_in_parallel",
+            side_effect=[
+                ConsumableWeightsDict({"foo.weight": object()}),
+                ConsumableWeightsDict({"foo.weight": object()}),
+            ],
+        ) as load_weights_in_parallel,
+        mock.patch.object(loader, "prefetch_files"),
+    ):
+        loader.load_weights(str(checkpoint_dir), mapping=Mapping())
+        loader.load_weights(str(checkpoint_dir), mapping=Mapping())
 
-        assert load_weights_in_parallel.call_count == 2
-    finally:
-        HfWeightLoader._clear_weight_cache()
+    assert load_weights_in_parallel.call_count == 2

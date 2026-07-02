@@ -37,7 +37,10 @@ from tensorrt_llm.mapping import Mapping
 
 _WEIGHT_CACHE_ENV = "TRTLLM_HF_WEIGHT_CACHE"
 _WEIGHT_CACHE_MAX_ENTRIES_ENV = "TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES"
-_DEFAULT_WEIGHT_CACHE_MAX_ENTRIES = 2
+# Default to a single cached checkpoint: each entry pins a full copy of the
+# raw weights in CPU RAM, so callers wanting cross-model caching must opt in
+# via TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES.
+_DEFAULT_WEIGHT_CACHE_MAX_ENTRIES = 1
 _WEIGHT_CACHE_LOCK = threading.Lock()
 _WEIGHT_CACHE: OrderedDict[tuple, dict[str, Any]] = OrderedDict()
 
@@ -97,27 +100,14 @@ class HfWeightLoader(BaseWeightLoader):
                 _WEIGHT_CACHE.popitem(last=False)
 
     @staticmethod
-    def _wrap_cached_weights(weights: dict[str, Any]) -> ConsumableWeightsDict:
-        # Return a fresh dict wrapper because model loaders call mark_consumed().
-        # Tensor values are intentionally shared: this cache targets read-only
-        # raw checkpoint tensors, not per-config materialized module weights.
-        return ConsumableWeightsDict(dict(weights))
-
-    @staticmethod
     def _cache_loaded_weights(cache_key: tuple,
                               loaded_weights: dict[str, Any]) -> None:
         max_entries = HfWeightLoader._weight_cache_max_entries()
         if max_entries <= 0:
             return
 
-        if isinstance(loaded_weights, ConsumableWeightsDict):
-            cache_weights = dict(loaded_weights.items())
-        else:
-            cache_weights = dict(loaded_weights)
-
         with _WEIGHT_CACHE_LOCK:
-            _WEIGHT_CACHE[cache_key] = cache_weights
-            _WEIGHT_CACHE.move_to_end(cache_key)
+            _WEIGHT_CACHE[cache_key] = dict(loaded_weights)
             while len(_WEIGHT_CACHE) > max_entries:
                 _WEIGHT_CACHE.popitem(last=False)
 
@@ -128,7 +118,11 @@ class HfWeightLoader(BaseWeightLoader):
             if weights is None:
                 return None
             _WEIGHT_CACHE.move_to_end(cache_key)
-            return HfWeightLoader._wrap_cached_weights(weights)
+            # Return a fresh dict wrapper because model loaders call
+            # mark_consumed(). Tensor values are intentionally shared: this
+            # cache targets read-only raw checkpoint tensors, not per-config
+            # materialized module weights.
+            return ConsumableWeightsDict(dict(weights))
 
     @staticmethod
     def _get_local_available_host_memory() -> int:

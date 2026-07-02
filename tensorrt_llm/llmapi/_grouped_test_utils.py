@@ -12,15 +12,7 @@ this module never triggers a circular import during package initialization.
 
 import os
 from contextlib import contextmanager
-from typing import Optional
-
-
-def restore_env_var(name: str, value: Optional[str]) -> None:
-    """Restore an env var to a previously captured value (or remove it)."""
-    if value is None:
-        os.environ.pop(name, None)
-    else:
-        os.environ[name] = value
+from unittest import mock
 
 
 @contextmanager
@@ -35,15 +27,14 @@ def hf_weight_cache_env(max_entries: str = "1"):
     fixture with this and have the session fixture depend on that fixture so the
     env is exported first.
     """
-    prev = os.environ.get("TRTLLM_HF_WEIGHT_CACHE")
-    prev_entries = os.environ.get("TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES")
-    os.environ["TRTLLM_HF_WEIGHT_CACHE"] = "1"
-    os.environ["TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES"] = max_entries
-    try:
+    with mock.patch.dict(
+        os.environ,
+        {
+            "TRTLLM_HF_WEIGHT_CACHE": "1",
+            "TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES": max_entries,
+        },
+    ):
         yield
-    finally:
-        restore_env_var("TRTLLM_HF_WEIGHT_CACHE", prev)
-        restore_env_var("TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES", prev_entries)
 
 
 def shared_mpi_session(n_workers: int):

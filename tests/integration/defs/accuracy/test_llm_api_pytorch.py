@@ -95,14 +95,9 @@ def hf_weight_cache():
 
 @pytest.fixture(scope="module")
 def shared_mpi_session_4gpu(hf_weight_cache):
-    # Ordering is load-bearing: MpiPoolSession snapshots TRTLLM*/TLLM* env at
-    # spawn time and passes that copy to the workers. Any env exported AFTER the
-    # pool spawns never reaches them. Depending on hf_weight_cache guarantees
-    # TRTLLM_HF_WEIGHT_CACHE is exported before MpiPoolSession spawns, otherwise
-    # the weight cache would be silently disabled in the workers (which are the
-    # processes that actually load weights) and only session reuse would speed
-    # things up. The assertion pins this contract so a future fixture reorder
-    # fails loudly instead of silently regressing the optimization.
+    # Ordering is load-bearing: the env must be exported before the pool
+    # spawns (see the hf_weight_cache_env docstring); the assertion makes a
+    # future fixture reorder fail loudly instead of silently regressing.
     assert os.environ.get("TRTLLM_HF_WEIGHT_CACHE") == "1", (
         "hf_weight_cache must be set up before the shared MPI pool spawns so "
         "the workers inherit TRTLLM_HF_WEIGHT_CACHE at spawn time.")
@@ -1671,9 +1666,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 task = GSM8K(self.MODEL_NAME)
                 task.evaluate(llm)
         finally:
-            # On a reused MPI session, reset each worker's torch.compile/Dynamo
-            # state so recompile counts don't accumulate across cases and trip
-            # the fullgraph recompile limit (FailOnRecompileLimitHit).
+            # See reset_shared_session_torch_compile_state for why this must
+            # run between cases on a reused MPI session.
             _reset_shared_session_torch_compile_state(make_llm)
 
     @pytest.mark.skip_less_device(4)
@@ -2441,9 +2435,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 task = GSM8K(self.MODEL_NAME)
                 task.evaluate(llm)
         finally:
-            # On a reused MPI session, reset each worker's torch.compile/Dynamo
-            # state so recompile counts don't accumulate across cases and trip
-            # the fullgraph recompile limit (FailOnRecompileLimitHit).
+            # See reset_shared_session_torch_compile_state for why this must
+            # run between cases on a reused MPI session.
             _reset_shared_session_torch_compile_state(make_llm)
 
     @parametrize_with_ids(

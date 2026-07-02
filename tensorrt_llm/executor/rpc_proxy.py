@@ -64,7 +64,6 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         )
 
         self.model_world_size = model_world_size
-        self._owns_mpi_session = mpi_session is None
         self._create_mpi_session(model_world_size, mpi_session)
 
         # Inject the generated HMAC key into worker_kwargs for workers
@@ -292,8 +291,12 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
 
     def _create_mpi_session(self, model_world_size: int,
                             mpi_session: Optional[MpiSession]):
+        # Ownership is decided here, next to the create-vs-adopt branch: a
+        # session this proxy created is shut down by it; an external one is
+        # owned (and shut down) by the caller.
         mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
         if mpi_session is None:
+            self._owns_mpi_session = True
             if mpi_process_pre_spawned:
                 logger_debug('[proxy] create comm session ...\n', "yellow")
                 self.mpi_session = create_mpi_comm_session(model_world_size)
@@ -301,5 +304,6 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
                 logger_debug('[proxy] create pool session ...\n', "yellow")
                 self.mpi_session = MpiPoolSession(n_workers=model_world_size)
         else:
+            self._owns_mpi_session = False
             logger_debug('[proxy] using external mpi session ...\n', "yellow")
             self.mpi_session = mpi_session

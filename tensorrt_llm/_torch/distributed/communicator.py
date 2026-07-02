@@ -1259,6 +1259,15 @@ def init_pp_comm(mapping):
         # as None, so the first call still constructs a fresh PPCommNCCL.
         _pp_comm.mapping = mapping
     else:
+        if _pp_comm is not None:
+            # Rebinding drops the old comm; its ncclCommDestroy runs at an
+            # unsynchronized point and can deadlock on reused worker processes
+            # (see the reuse branch above). Surface it instead of hanging
+            # silently -- pools sharing workers must keep one world_size.
+            logger.warning(
+                "init_pp_comm: replacing existing PP comm (world_size "
+                f"{_pp_comm.mapping.world_size} -> {mapping.world_size}) on a "
+                "live process; this can deadlock on reused MPI workers.")
         _pp_comm = PPCommNCCL(mapping)
     init_helix_cp_comm(mapping)
 
