@@ -4870,8 +4870,9 @@ class TorchLlmArgs(BaseLlmArgs):
         description="Use low-latency spin-wait mode for CUDA host task dispatch "
         "(cudaLaunchHostFunc_v2 with cudaHostTaskSpinWait). "
         "Reduces callback latency at the cost of a CPU core spinning while "
-        "waiting for the GPU event. Requires CUDA 13.2+; silently falls back "
-        "to the default blocking mode on older drivers.",
+        "waiting for the GPU event. Requires CUDA 13.2+; on older CUDA "
+        "versions, falls back to the default blocking mode and logs a "
+        "one-time warning.",
         status="prototype")
 
     enable_iter_perf_stats: bool = Field(
