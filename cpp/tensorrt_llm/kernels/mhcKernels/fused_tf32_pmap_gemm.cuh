@@ -108,11 +108,11 @@ __device__ __forceinline__ void stsm_x4_b16_rout(void* smem_dst, uint32_t a, uin
 
 template <uint32_t SHAPE_N, uint32_t HIDDEN, uint32_t HC_MULT, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
     uint32_t kSwizzleCDMode, uint32_t N_B_STAGES, uint32_t N_INPUT_STAGES, uint32_t kNumMMAThreads,
-    uint32_t kNumPmapThreads, uint32_t kNumSplits = 1, bool kEarlyRelease = false>
+    uint32_t kNumPmapThreads, uint32_t kNumSplits = 1, bool kEarlyRelease = false, uint32_t kXSplit = 1>
 __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf32_pmap_gemm_rout_atomic_impl(
-    const uint32_t shape_m, const __grid_constant__ cute::TmaDescriptor tensor_map_residual,
-    const __grid_constant__ cute::TmaDescriptor tensor_map_x, const __grid_constant__ cute::TmaDescriptor tensor_map_b,
-    const __grid_constant__ cute::TmaDescriptor tensor_map_residual_out,
+    uint32_t const shape_m, __grid_constant__ const cute::TmaDescriptor tensor_map_residual,
+    __grid_constant__ const cute::TmaDescriptor tensor_map_x, __grid_constant__ const cute::TmaDescriptor tensor_map_b,
+    __grid_constant__ const cute::TmaDescriptor tensor_map_residual_out,
     float* __restrict__ D, // [M, SHAPE_N]  (caller memsets to 0)
     float const* __restrict__ post_mix, float const* __restrict__ comb_mix, float* __restrict__ sqr_sum)
 {                          // [M]            (caller memsets to 0)
@@ -175,6 +175,8 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
     auto smem_res = PatternVisitor(
         [&, base = cursor](uint32_t const& i) { return reinterpret_cast<nv_bfloat16*>(base + i * SMEM_RES_PER_ISTG); });
     cursor += N_INPUT_STAGES * SMEM_RES_PER_ISTG;
+    // For kXSplit>1 these buffers form a ring of single-partial x tiles. The
+    // consumer drains and sums them in FP32, so no additional data SMEM is needed.
     auto smem_x_stg = PatternVisitor(
         [&, base = cursor](uint32_t const& i) { return reinterpret_cast<nv_bfloat16*>(base + i * SMEM_X_PER_ISTG); });
     cursor += N_INPUT_STAGES * SMEM_X_PER_ISTG;
@@ -192,13 +194,18 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
     auto full_input = PatternVisitor([=](uint32_t const& i) { return barrier_start_ptr + 2 * N_B_STAGES + i; });
     auto empty_input
         = PatternVisitor([=](uint32_t const& i) { return barrier_start_ptr + 2 * N_B_STAGES + N_INPUT_STAGES + i; });
-    auto full_cast = PatternVisitor(
+    constexpr uint32_t kXBarriers = (kXSplit > 1) ? 2 * N_INPUT_STAGES : 0;
+    auto full_x = PatternVisitor(
         [=](uint32_t const& i) { return barrier_start_ptr + 2 * N_B_STAGES + 2 * N_INPUT_STAGES + i; });
+    auto empty_x = PatternVisitor(
+        [=](uint32_t const& i) { return barrier_start_ptr + 2 * N_B_STAGES + 3 * N_INPUT_STAGES + i; });
+    auto full_cast = PatternVisitor(
+        [=](uint32_t const& i) { return barrier_start_ptr + 2 * N_B_STAGES + 2 * N_INPUT_STAGES + kXBarriers + i; });
     auto empty_cast = PatternVisitor([=](uint32_t const& i)
-        { return barrier_start_ptr + 2 * N_B_STAGES + 2 * N_INPUT_STAGES + kNumCastStages + i; });
-    auto tmem_full_barrier = barrier_start_ptr + 2 * N_B_STAGES + 2 * N_INPUT_STAGES + 2 * kNumCastStages;
+        { return barrier_start_ptr + 2 * N_B_STAGES + 2 * N_INPUT_STAGES + kXBarriers + kNumCastStages + i; });
+    auto tmem_full_barrier = barrier_start_ptr + 2 * N_B_STAGES + 2 * N_INPUT_STAGES + kXBarriers + 2 * kNumCastStages;
 
-    cursor += (2 * N_B_STAGES + 2 * N_INPUT_STAGES + 2 * kNumCastStages + 1) * sizeof(Barrier);
+    cursor += (2 * N_B_STAGES + 2 * N_INPUT_STAGES + kXBarriers + 2 * kNumCastStages + 1) * sizeof(Barrier);
     auto tmem_ptr_in_smem = reinterpret_cast<uint32_t*>(cursor);
 
     if (warp_idx == 1 and cute::elect_one_sync())
@@ -214,6 +221,15 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
         {
             full_input[i]->init(1);
             empty_input[i]->init(kNumPmapThreads);
+        }
+        if constexpr (kXSplit > 1)
+        {
+#pragma unroll
+            for (uint32_t i = 0; i < N_INPUT_STAGES; ++i)
+            {
+                full_x[i]->init(1);
+                empty_x[i]->init(kNumPmapThreads);
+            }
         }
 #pragma unroll
         for (uint32_t i = 0; i < kNumCastStages; ++i)
@@ -278,6 +294,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
             uint32_t b_stage = 0;
             uint32_t i_stage = 0;
             uint32_t s = 0;
+            uint32_t xs = 0;
             for (uint32_t ht = 0; ht < H_TILES_PER_SPLIT; ++ht)
             {
                 const uint32_t h_tile = h_tile_start + ht;
@@ -290,10 +307,27 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
                     tma_copy<BLOCK_K, BLOCK_M, kSwizzleResMode>(&tensor_map_residual, full_input[i_stage],
                         smem_res[i_stage] + j * BLOCK_M * BLOCK_K, j * HIDDEN + h_idx, m_idx);
                 }
-                tma_copy<BLOCK_K, BLOCK_M, kSwizzleXMode>(
-                    &tensor_map_x, full_input[i_stage], smem_x_stg[i_stage], h_idx, m_idx);
-                constexpr uint32_t kInputBytes = SMEM_RES_PER_ISTG + SMEM_X_PER_ISTG;
-                full_input[i_stage]->arrive_and_expect_tx(kInputBytes);
+                if constexpr (kXSplit == 1)
+                {
+                    tma_copy<BLOCK_K, BLOCK_M, kSwizzleXMode>(
+                        &tensor_map_x, full_input[i_stage], smem_x_stg[i_stage], h_idx, m_idx);
+                    constexpr uint32_t kInputBytes = SMEM_RES_PER_ISTG + SMEM_X_PER_ISTG;
+                    full_input[i_stage]->arrive_and_expect_tx(kInputBytes);
+                }
+                else
+                {
+                    full_input[i_stage]->arrive_and_expect_tx(SMEM_RES_PER_ISTG);
+#pragma unroll
+                    for (uint32_t xp = 0; xp < kXSplit; ++xp)
+                    {
+                        uint32_t const xslot = xs % N_INPUT_STAGES;
+                        empty_x[xslot]->wait(((xs / N_INPUT_STAGES) & 1) ^ 1);
+                        tma_copy<BLOCK_K, BLOCK_M, kSwizzleXMode>(
+                            &tensor_map_x, full_x[xslot], smem_x_stg[xslot], h_idx, xp * shape_m + m_idx);
+                        full_x[xslot]->arrive_and_expect_tx(SMEM_X_PER_ISTG);
+                        ++xs;
+                    }
+                }
 
 #pragma unroll
                 for (uint32_t hc = 0; hc < HC_MULT; ++hc)
@@ -448,19 +482,6 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
             const uint32_t i_stage = ht % N_INPUT_STAGES;
             full_input[i_stage]->wait((ht / N_INPUT_STAGES) & 1);
 
-            uint32_t x_vals[2][kNumLoads];
-            {
-                uint8_t const* x_base
-                    = reinterpret_cast<uint8_t*>(smem_x_stg[i_stage]) + sub_warp_idx * BLOCK_M_PER_WARP * kSwizzleXMode;
-#pragma unroll
-                for (uint32_t i = 0; i < kNumLoads; i += 2)
-                {
-                    auto smem_ptr = x_base + get_swizzled_smem_offset<kSwizzleXMode>(i + lane_idx / 16, lane_idx % 16);
-                    deep_gemm::sm90::SM90_U32x4_LDSM_N::copy(x_vals[0][i + 0], x_vals[1][i + 0], x_vals[0][i + 1],
-                        x_vals[1][i + 1], const_cast<uint8_t*>(smem_ptr));
-                }
-            }
-
             uint32_t r_vals[HC_MULT][2][kNumLoads];
 #pragma unroll
             for (uint32_t j = 0; j < HC_MULT; ++j)
@@ -480,12 +501,48 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
             float2 xf[2][kNumLoads];
 #pragma unroll
             for (uint32_t u = 0; u < 2; ++u)
-            {
 #pragma unroll
                 for (uint32_t i = 0; i < kNumLoads; ++i)
+                    xf[u][i] = make_float2(0.f, 0.f);
+#pragma unroll
+            for (uint32_t xp = 0; xp < kXSplit; ++xp)
+            {
+                nv_bfloat16* x_buf;
+                if constexpr (kXSplit == 1)
                 {
-                    xf[u][i] = __bfloat1622float2(*reinterpret_cast<nv_bfloat162*>(&x_vals[u][i]));
+                    x_buf = smem_x_stg[i_stage];
                 }
+                else
+                {
+                    uint32_t const xsg = ht * kXSplit + xp;
+                    uint32_t const xslot = xsg % N_INPUT_STAGES;
+                    full_x[xslot]->wait((xsg / N_INPUT_STAGES) & 1);
+                    x_buf = smem_x_stg[xslot];
+                }
+
+                uint32_t x_vals[2][kNumLoads];
+                uint8_t const* x_base
+                    = reinterpret_cast<uint8_t*>(x_buf) + sub_warp_idx * BLOCK_M_PER_WARP * kSwizzleXMode;
+#pragma unroll
+                for (uint32_t i = 0; i < kNumLoads; i += 2)
+                {
+                    auto smem_ptr = x_base + get_swizzled_smem_offset<kSwizzleXMode>(i + lane_idx / 16, lane_idx % 16);
+                    deep_gemm::sm90::SM90_U32x4_LDSM_N::copy(x_vals[0][i + 0], x_vals[1][i + 0], x_vals[0][i + 1],
+                        x_vals[1][i + 1], const_cast<uint8_t*>(smem_ptr));
+                }
+                if constexpr (kXSplit > 1)
+                {
+                    empty_x[(ht * kXSplit + xp) % N_INPUT_STAGES]->arrive();
+                }
+#pragma unroll
+                for (uint32_t u = 0; u < 2; ++u)
+#pragma unroll
+                    for (uint32_t i = 0; i < kNumLoads; ++i)
+                    {
+                        float2 value = __bfloat1622float2(*reinterpret_cast<nv_bfloat162*>(&x_vals[u][i]));
+                        xf[u][i].x += value.x;
+                        xf[u][i].y += value.y;
+                    }
             }
 
             if constexpr (kEarlyRelease)

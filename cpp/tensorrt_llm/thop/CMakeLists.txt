@@ -120,6 +120,7 @@ add_library(
   finegrained_mixed_dtype_gemm_thop.cpp
   tinygemm2.cpp
   dsv3RopeOp.cpp
+  dsv4Fp8SplitKGemmOp.cpp
   fusedGemmAllreduceOp.cpp
   convertReqIndexToGlobalOp.cpp
   trtllmGenQKVProcessOp.cpp

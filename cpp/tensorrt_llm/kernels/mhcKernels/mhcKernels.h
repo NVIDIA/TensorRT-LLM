@@ -18,12 +18,23 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <cstdint>
+
 #include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels::mhc
 {
+
+// DSV4-Pro O_b FP8 block-scaled GEMM. Emits split-major BF16 partials
+// [num_splits, M, N]; mHC consumes and reduces them in its x input path.
+// The current specialization supports N=7168, K=16384, positive M, and
+// num_splits in {2, 4} on the SM100 family. Attention dispatches it only for
+// M<=128, where split-K improves occupancy.
+void dsv4Fp8SplitKGemmLaunch(void const* a, int32_t const* sfa, void const* b, int32_t const* sfb,
+    __nv_bfloat16* partials, int M, int N, int K, int sfa_k_stride, int sfb_k_stride, int num_splits,
+    cudaStream_t stream);
 
 // `norm_weight` (bf16 [hidden_size], optional) enables fused next-layer RMSNorm
 // on `layer_input`: when non-null, layer_input is written normalized
@@ -43,6 +54,11 @@ void mhcHcHeadApplyLaunch(float const* mixes, float const* sqrsum, __nv_bfloat16
 
 void mhcPostMappingLaunch(__nv_bfloat16 const* residual, __nv_bfloat16 const* x, float const* post_mix,
     float const* comb_mix, __nv_bfloat16* out, int B, int hidden_size, cudaStream_t stream);
+
+// Reduce split-major BF16 O-projection partials [num_splits, M, hidden]
+// into [M, hidden], accumulating in FP32 and rounding once to BF16.
+void mhcReduceSplitXLaunch(
+    __nv_bfloat16 const* partials, __nv_bfloat16* reduced, int M, int hidden_size, int num_splits, cudaStream_t stream);
 
 // Single-launch fused hyper-connection boundary op (SM100 only).
 //
@@ -68,7 +84,7 @@ void mhcFusedHcLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual
     __nv_bfloat16* residual_cur, float* post_mix_cur, float* comb_mix_cur, __nv_bfloat16* layer_input_cur,
     float* y_acc_workspace, float* r_acc_workspace, int M, int hidden_size, int hc_mult, int num_k_splits,
     int bigfuse_block_size, float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value,
-    int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream);
+    int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream, int x_num_splits = 1);
 
 // FMA-path fused hyper-connection boundary launcher.
 //
@@ -96,7 +112,7 @@ void mhcFusedHcFmaLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* resid
     __nv_bfloat16* residual_cur, float* post_mix_cur, float* comb_mix_cur, __nv_bfloat16* layer_input_cur,
     float* y_acc_workspace, float* r_acc_workspace, int M, int hidden_size, int hc_mult, int tile_n, int num_k_splits,
     int bigfuse_block_size, float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value,
-    int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream);
+    int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream, int x_num_splits = 1);
 
 // Single-kernel all-in-one fused hyper-connection boundary launcher (TF32 tcgen05 path).
 //
