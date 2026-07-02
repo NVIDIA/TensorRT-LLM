@@ -47,7 +47,7 @@ from tensorrt_llm._torch.pyexecutor.sampler import (
     _request_get_sampling_params,
     _request_strategy,
 )
-from tensorrt_llm._torch.pyexecutor.sampling_utils import (
+from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import (
     GREEDY,
     BeamSearch,
     FlashInferGroupedStrategySampler,

@@ -27,7 +27,7 @@ from typing import Any
 import torch
 
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from tensorrt_llm._torch.pyexecutor.sampling_utils import (
+from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import (
     FlashInferGroupedStrategySampler,
     SimpleGroupedStrategySampler,
 )

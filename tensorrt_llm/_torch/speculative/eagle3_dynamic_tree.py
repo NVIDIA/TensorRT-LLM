@@ -24,7 +24,7 @@ import triton.language as tl
 from tensorrt_llm._utils import get_sm_version, nvtx_range
 
 from ..attention_backend import AttentionMetadata
-from ..pyexecutor.sampling_utils import sampling_batch_spec_dec_one_model
+from ..pyexecutor.sampler.sampling_utils import sampling_batch_spec_dec_one_model
 from .eagle3 import Eagle3OneModelWorker
 
 if TYPE_CHECKING:
