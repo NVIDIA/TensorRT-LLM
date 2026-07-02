@@ -20,6 +20,7 @@ from _dist_test_utils import get_device_counts
 from torch.distributed import DistNetworkError
 from torch.export import export
 
+import tensorrt_llm._torch.auto_deploy.custom_ops.distributed.cute_dist as _cute_dist_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.custom_ops.distributed.trtllm_dist import (
     is_trtllm_op_available,
 )
@@ -211,6 +212,75 @@ def test_allreduce_fusion(device_count, ModuleCls, strategy, rmsnorm_op):
                 ModuleCls=ModuleCls,
                 strategy=strategy,
                 rmsnorm_op=rmsnorm_op,
+            )
+            return
+        except DistNetworkError as e:
+            last_exc = e
+            if "EADDRINUSE" not in str(e) and "address already in use" not in str(e).lower():
+                raise
+        finally:
+            mpi_pool.shutdown()
+    raise RuntimeError(
+        f"Failed to initialize distributed group after {max_retries} attempts due to repeated port conflicts"
+    ) from last_exc
+
+
+def _test_cute_allreduce_fusion_backend_selection(port: int | None):
+    if not is_trtllm_op_available():
+        pytest.skip("Require trtllm ops to run test_allreduce_fusion.")
+
+    if port is None:
+        port = mpi_broadcast(get_free_port() if mpi_rank() == 0 else None)
+
+    _, _ = initialize_or_skip(port=port)
+
+    try:
+        dtype = torch.bfloat16
+        x = torch.randn(16, 16).to(dtype).cuda()
+        residual = torch.randn(16, 16).to(dtype).cuda()
+
+        model = AllreduceResidualNorm(16, dtype, strategy="AUTO")
+        gm = torch_export_to_gm(model, args=(x, residual), clone=True)
+        gm_transformed = InferenceOptimizer(
+            None,
+            {
+                "match_rmsnorm_pattern": {"stage": "pattern_matcher"},
+                "detect_sharding": {
+                    "stage": "post_export",
+                    "allreduce_strategy": "AUTO",
+                },
+                "fuse_allreduce_residual_rmsnorm": {
+                    "stage": "post_load_fusion",
+                    "backend": "cute",
+                },
+            },
+        )(None, gm)
+
+        assert any(
+            is_op(node, torch.ops.auto_deploy.cute_dist_fused_allreduce_residual_rmsnorm)
+            for node in gm_transformed.graph.nodes
+        )
+
+    finally:
+        if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+            torch.distributed.barrier()
+        cleanup()
+
+
+@pytest.mark.parametrize("device_count", get_device_counts())
+def test_allreduce_fusion_cute_backend_selection(device_count):
+    if device_count <= 1:
+        pytest.skip("Require multi GPUs to run test_allreduce_fusion_cute_backend_selection.")
+
+    n_workers = device_count
+    max_retries = 5
+    last_exc: Exception | None = None
+    for _ in range(max_retries):
+        mpi_pool = MpiPoolSession(n_workers=n_workers)
+        try:
+            mpi_pool.submit_sync(
+                _test_cute_allreduce_fusion_backend_selection,
+                port=None,
             )
             return
         except DistNetworkError as e:
