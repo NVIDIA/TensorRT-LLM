@@ -208,6 +208,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void beamStage3Kernel(
     __shared__ float smemCumLogProbs[PBM];
     __shared__ int smemSeqLen[PBM];
     __shared__ KVPair smemTopKV[(IS_V2) ? 1 : PBM * 2]; // Just a placeholder in V2 workflow
+    __shared__ int smemNBeamForNextStep;
 
     if (bh.numBeamsCBA != nullptr)
     {
@@ -217,14 +218,11 @@ __launch_bounds__(BLOCK_SIZE) __global__ void beamStage3Kernel(
             // Initialize worst score in the first call
             bh.minNormedScoresCBA[slot] = 0.0f; // logProbs is in range (-inf, 0]
         }
-        else if (earlyStopping == 1 && bh.numBeamsCBA[slot] == nBM
-            || earlyStopping != 1 && bh.finished[slot * nBM].isFinished())
+        else if (earlyStopping == 1 && bh.numBeamsCBA[slot] >= nBM || earlyStopping != 1 && bh.batchDones[slot])
         {
             // Condition of early return:
             // 1. In EarlyStopping mode, and we have got enough beams
             // 2. In NonEarlyStopping mode, and this batch has been marked as done
-            // TODO: improve the condition like below
-            // earlyStopping == 1 && bh.numBeamsCBA[slot] == nBM || earlyStopping != 1 && bh.batchDones[slot]
             return;
         }
     }
@@ -324,10 +322,14 @@ __launch_bounds__(BLOCK_SIZE) __global__ void beamStage3Kernel(
             {
                 // Condition of this branch:
                 // This token is end-token and belongs to top nBM range in Beam search mode
-                int const nSeqLen = bh.sequenceLengths[slot * nBM + i] + 1 - bh.inputLengths[slot * nBM + i];
+                // Use the actual parent beam index (topId / nV) % nBM, not the candidate rank i,
+                // to look up the correct sequenceLength and inputLength for length-penalty scoring.
+                int const parentBeam = (topId / nV) % nBM;
+                int const nSeqLen
+                    = bh.sequenceLengths[slot * nBM + parentBeam] + 1 - bh.inputLengths[slot * nBM + parentBeam];
                 float const score = applyLengthPenalty(topLogProb, nSeqLen, lengthPenalty);
                 int nCBA = bh.numBeamsCBA[slot];
-                if (nCBA == nBM)
+                if (nCBA >= nBM)
                 {
                     // There are already nBM beams
                     if (score < bh.minNormedScoresCBA[slot])
@@ -437,6 +439,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void beamStage3Kernel(
                 break;
             }
         }
+        smemNBeamForNextStep = nBeamForNextStep;
     }
 
     // Update bh.batchDones
@@ -481,23 +484,31 @@ __launch_bounds__(BLOCK_SIZE) __global__ void beamStage3Kernel(
     if (tid < nBMOut)
     {
         int const indexBatchBeam = slot * nBM + tid;
-        int const step = smemSeqLen[tid];
-        if (!bh.finished[indexBatchBeam].isFinished())
+        if (tid < smemNBeamForNextStep)
         {
-            smemSeqLen[tid]++;
+            // This slot received a valid next-step token from the selection phase.
+            int const step = smemSeqLen[tid];
+            int const newId = bh.outputIdsPtr[slot][tid * nMSL + step];
+            int const newBeamId = (newId / nV) % nBM;
+            int const newTokenId = newId % nV;
+            int const indexParentBeam = slot * nBM + newBeamId;
+            int const parentSeqLen = smemSeqLen[newBeamId];
+            bh.sequenceLengths[indexBatchBeam] = parentSeqLen + (!bh.finished[indexParentBeam].isFinished() ? 1 : 0);
+            if (newTokenId == bh.endIds[slot])
+            {
+                bh.finished[indexBatchBeam].setFinishedEOS();
+            }
+            bh.parentIdsPtr[slot][tid * nMSL + step] = newBeamId;
+            bh.outputIdsPtr[slot][tid * nMSL + step] = newTokenId;
         }
-        int const newId = bh.outputIdsPtr[slot][tid * nMSL + step];
-        int const newBeamId = (newId / nV) % nBM;
-        int const newTokenId = newId % nV;
-        bh.sequenceLengths[indexBatchBeam] = smemSeqLen[newBeamId];
-        if (newTokenId == bh.endIds[slot])
+        else
         {
-            bh.finished[indexBatchBeam].setFinishedEOS();
+            // No valid next-step token for this slot: all top candidates went to CBA.
+            // Mark as finished so downstream stages (cache indirection, next decode) skip it.
+            bh.finished[indexBatchBeam].setFinished();
         }
-        bh.parentIdsPtr[slot][tid * nMSL + step] = newBeamId;
-        bh.outputIdsPtr[slot][tid * nMSL + step] = newTokenId;
 
-        if ((earlyStopping == 1) && (bh.numBeamsCBA != nullptr && bh.numBeamsCBA[slot] == nBM)
+        if ((earlyStopping == 1) && (bh.numBeamsCBA != nullptr && bh.numBeamsCBA[slot] >= nBM)
             || (earlyStopping != 1) && bh.batchDones[slot])
         {
             bh.batchDones[slot] = true;
@@ -631,7 +642,7 @@ void beamSearchKernelLauncher(
         sync_check_cuda_error(stream);
 
         int nThread = min(roundUp(nBMIn * nBMOut * 2, 32), 1024);
-        addCumLogProbs<<<nBS, nThread, 0, stream>>>(pStage1LogProbs, bh.cumLogProbs, bh.finished, bh.endIds,
+        addCumLogProbs<<<nBS, nThread, 0, stream>>>(pStage1LogProbs, pStage1Ids, bh.cumLogProbs, bh.finished, bh.endIds,
             bh.diversityRates, bh.batchSlots, nBS, nBMIn, nBMOut, nBM);
         sync_check_cuda_error(stream);
 

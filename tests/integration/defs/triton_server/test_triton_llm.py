@@ -2,6 +2,7 @@ import os
 import re
 import sys
 
+import numpy as np
 import pytest
 import torch
 import yaml
@@ -143,6 +144,102 @@ def test_mistral_v1_7b_ifb(
         ]
 
     venv_check_call(llm_backend_venv, run_cmd)
+
+
+def test_qwen25_15b_beam_search_regression_bls_ifb(llm_backend_venv):
+    engine_path = os.environ.get("TRTLLM_QWEN25_15B_ENGINE_DIR", "")
+    tokenizer_path = os.environ.get("TRTLLM_QWEN25_15B_TOKENIZER_DIR", "")
+
+    if not engine_path or not tokenizer_path:
+        pytest.skip(
+            "Set TRTLLM_QWEN25_15B_ENGINE_DIR and TRTLLM_QWEN25_15B_TOKENIZER_DIR to enable this regression test."
+        )
+
+    gpu_name = query_gpu_name()
+    if "L40S" not in gpu_name:
+        pytest.skip(
+            f"This regression test targets L40S. Current GPU: {gpu_name}")
+
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
+    new_model_repo = os.path.join(llm_backend_repo_root, "triton_repo")
+    prepare_ib_model_repo(llm_backend_repo_root, new_model_repo)
+
+    modify_ib_config_pbtxt(
+        new_model_repo,
+        engine_path,
+        tokenizer_path,
+        llm_backend_repo_root,
+        DECOUPLED_MODE="False",
+        MAX_TOKENS_IN_KV_CACHE="",
+        MAX_ATTENTION_WINDOW_SIZE="",
+        BATCH_SCHEDULER_POLICY="max_utilization",
+        BATCHING_STRATEGY="inflight_fused_batching",
+        KV_CACHE_FREE_GPU_MEM_FRACTION="",
+        EXCLUDE_INPUT_IN_OUTPUT="False",
+        ENABLE_TRT_OVERLAP="False",
+        TRITON_MAX_BATCH_SIZE="128",
+        MAX_QUEUE_DELAY_MICROSECONDS="0",
+        MAX_BEAM_WIDTH="10",
+        ENABLE_KV_CACHE_REUSE="False",
+        NORMALIZE_LOG_PROBS="True",
+        ENABLE_CHUNKED_CONTEXT="False",
+        GPU_DEVICE_IDS="",
+        DECODING_MODE="",
+        PREPROCESSING_INSTANCE_COUNT="1",
+        POSTPROCESSING_INSTANCE_COUNT="1",
+        ACCUMULATE_TOKEN="False",
+        BLS_INSTANCE_COUNT="1",
+    )
+
+    launch_server_py = os.path.join(llm_backend_repo_root, "scripts",
+                                    "launch_triton_server.py")
+    check_call(
+        f"python3 {launch_server_py} --force --world_size 1 --model_repo={new_model_repo}",
+        shell=True,
+    )
+    check_server_ready()
+
+    try:
+        import tritonclient.grpc as grpcclient
+        from tritonclient.utils import np_to_triton_dtype
+    except ImportError as e:
+        pytest.skip(f"tritonclient is required for this test: {e}")
+
+    def _prepare_tensor(name, value):
+        tensor = grpcclient.InferInput(name, value.shape,
+                                       np_to_triton_dtype(value.dtype))
+        tensor.set_data_from_numpy(value)
+        return tensor
+
+    # Regression scenario:
+    # - Model: Qwen2.5-1.5B fine-tuned (provided by env path)
+    # - Engine: max_beam_width=10
+    # - Sampling: beam search with diversity + early stopping + length penalty
+    inputs = [
+        _prepare_tensor(
+            "text_input",
+            np.array([["Please summarize this in one sentence."]],
+                     dtype=object)),
+        _prepare_tensor("max_tokens", np.array([[20]], dtype=np.int32)),
+        _prepare_tensor("stream", np.array([[False]], dtype=bool)),
+        _prepare_tensor("beam_width", np.array([[10]], dtype=np.int32)),
+        _prepare_tensor("beam_search_diversity_rate",
+                        np.array([[0.5]], dtype=np.float32)),
+        _prepare_tensor("early_stopping", np.array([[True]], dtype=bool)),
+        _prepare_tensor("length_penalty", np.array([[0.5]], dtype=np.float32)),
+        _prepare_tensor("end_id", np.array([[16600]], dtype=np.int32)),
+        _prepare_tensor("pad_id", np.array([[2]], dtype=np.int32)),
+        _prepare_tensor("top_k", np.array([[1]], dtype=np.int32)),
+        _prepare_tensor("top_p", np.array([[1.0]], dtype=np.float32)),
+        _prepare_tensor("temperature", np.array([[1.0]], dtype=np.float32)),
+    ]
+
+    client = grpcclient.InferenceServerClient(url="localhost:8001",
+                                              verbose=False)
+    result = client.infer(model_name="tensorrt_llm_bls", inputs=inputs)
+    text_output = result.as_numpy("text_output")
+    assert text_output is not None
+    assert text_output.size > 0
 
 
 @pytest.mark.parametrize("E2E_MODEL_NAME", ["ensemble"])
