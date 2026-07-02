@@ -52,6 +52,16 @@ class Qwen3ToolParser(BaseToolParser):
         idx = text.find(self.bot_token)
         normal_text = text[:idx].strip() if idx != -1 else text
         if self.bot_token not in text:
+            # Some Qwen3 chat templates (e.g. Qwen3.6 FP8 with thinking enabled)
+            # emit tool calls as bare JSON without a <tool_call> wrapper. Try to
+            # recover those before dropping the text into normal_text.
+            try:
+                parsed = json.loads(text.strip())
+                calls = self.parse_base_json(parsed, tools)
+                if calls:
+                    return StreamingParseResult(normal_text="", calls=calls)
+            except (json.JSONDecodeError, AttributeError):
+                pass
             return StreamingParseResult(normal_text=normal_text, calls=[])
 
         # Find all <tool_call>\n...\n</tool_call> blocks
