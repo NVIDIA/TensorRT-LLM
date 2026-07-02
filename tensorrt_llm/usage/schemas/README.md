@@ -185,6 +185,7 @@ exhaustive field table at docs build time under **Developer Guide > Telemetry**.
 | `kv_cache_config.enable_block_reuse` | Whether KV cache block reuse/prefix caching is enabled. |
 | `cuda_graph_config.batch_sizes` | CUDA graph batch sizes when configured. |
 | `scheduler_config.capacity_scheduler_policy` | Scheduler capacity policy. |
+| `scheduler_config.enable_prefix_aware_scheduling` | Whether scheduler admission and token budgeting use KV prefix-reuse estimates. |
 | `torch_compile_config.enable_inductor` | Whether Torch Inductor compilation is enabled. |
 | `moe_config.backend` | MoE backend selection (`AUTO`, `CUTLASS`, `TRTLLM`, ...), an annotation-derived categorical. |
 | `speculative_config.decoding_type` | Speculative decoding mode discriminator (e.g. `User_Provided`); other arms expose their own numeric/boolean knobs under `speculative_config.*`. |

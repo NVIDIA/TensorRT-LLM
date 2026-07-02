@@ -515,7 +515,12 @@ public:
 private:
     void validate()
     {
-        TLLM_CHECK(!mInputTokenIds.empty());
+        if (mInputTokenIds.empty())
+        {
+            TLLM_LOG_WARNING(
+                "Request created with empty inputTokenIds; expected only on empty Helix CP ranks when num_total_blocks "
+                "< cp_size.");
+        }
         TLLM_CHECK(mMaxNewTokens > 0);
 
         // Show warning message unless mNumReturnSequences is the default value.

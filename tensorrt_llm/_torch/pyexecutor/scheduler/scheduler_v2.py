@@ -141,16 +141,17 @@ class KVCacheV2Scheduler(RequestScheduler):
         self,
         max_batch_size: int,
         max_num_tokens: Optional[int],
-        kv_cache_manager,  # KVCacheManagerV2
+        kv_cache_manager: object,  # KVCacheManagerV2
         scheduler_policy: CapacitySchedulerPolicy,
         ctx_chunk_config: Optional[tuple] = None,
-        peft_cache_manager=None,
+        peft_cache_manager: object | None = None,
         scheduler_capacity: Optional[int] = None,
         no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
         no_schedule_after_state: LlmRequestState = LlmRequestState.GENERATION_TO_COMPLETE,
-        draft_kv_cache_manager=None,  # KVCacheManagerV2 for MTP draft layers
-        cross_kv_cache_manager=None,  # KVCacheManagerV2 for enc-dec cross-attn
-    ):
+        draft_kv_cache_manager: object | None = None,  # KVCacheManagerV2 for MTP draft layers
+        cross_kv_cache_manager: object | None = None,  # KVCacheManagerV2 for enc-dec cross-attn
+        enable_prefix_aware_scheduling: bool = True,
+    ) -> None:
         self.max_num_tokens = max_num_tokens
         self.max_num_requests = (
             scheduler_capacity if scheduler_capacity is not None else max_batch_size
@@ -163,6 +164,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.kv_cache_manager = kv_cache_manager
         self.draft_kv_cache_manager = draft_kv_cache_manager
         self.cross_kv_cache_manager = cross_kv_cache_manager
+        self.enable_prefix_aware_scheduling = enable_prefix_aware_scheduling
         if scheduler_policy != CapacitySchedulerPolicy.MAX_UTILIZATION:
             logger.warning(
                 "KVCacheV2Scheduler only supports MAX_UTILIZATION for now, "
@@ -186,7 +188,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         logger.info(
             f"KVCacheV2Scheduler: tokens_per_block={self.tokens_per_block}, "
             f"max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}, "
-            f"draft_mgr={draft_mgr_name}, cross_mgr={cross_mgr_name}"
+            f"draft_mgr={draft_mgr_name}, cross_mgr={cross_mgr_name}, "
+            f"enable_prefix_aware_scheduling={enable_prefix_aware_scheduling}"
         )
         if ctx_chunk_config is not None:
             self.chunking_enabled = True
@@ -495,6 +498,19 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         Returns ``(action, tokens, chunking_flag)``.
         """
+        pre_prepare_context_tokens = req.context_remaining_length
+        draft_len = get_draft_token_length(req)
+        if not self.enable_prefix_aware_scheduling:
+            req_tokens = pre_prepare_context_tokens + draft_len
+            if not budget.can_fit_tokens(req_tokens):
+                return ScheduleAction.STOP, 0, False
+            assert (
+                self.max_context_length is None
+                or pre_prepare_context_tokens <= self.max_context_length
+            ), (
+                f"Context tokens ({pre_prepare_context_tokens}) exceeds limit ({self.max_context_length})"
+            )
+
         # Prepare first so block reuse updates context_remaining_length
         # before budget check.
         if not self.kv_cache_manager.prepare_context(req):
@@ -502,19 +518,19 @@ class KVCacheV2Scheduler(RequestScheduler):
             return ScheduleAction.STOP, 0, False
 
         context_tokens = req.context_remaining_length
-        draft_len = get_draft_token_length(req)
-        req_tokens = context_tokens + draft_len
+        if self.enable_prefix_aware_scheduling:
+            req_tokens = context_tokens + draft_len
 
-        if not budget.can_fit_tokens(req_tokens):
-            return ScheduleAction.STOP, 0, False
+            if not budget.can_fit_tokens(req_tokens):
+                return ScheduleAction.STOP, 0, False
 
-        assert self.max_context_length is None or context_tokens <= self.max_context_length, (
-            f"Context tokens ({context_tokens}) exceeds limit ({self.max_context_length})"
-        )
+            assert self.max_context_length is None or context_tokens <= self.max_context_length, (
+                f"Context tokens ({context_tokens}) exceeds limit ({self.max_context_length})"
+            )
 
         # V2 resizes KV cache directly in the scheduler (no separate
         # prepareResources for main cache), so include draft tokens.
-        if not self.kv_cache_manager.resize_context(req, req_tokens):
+        if not self.kv_cache_manager.resize_context(req, context_tokens + draft_len):
             return ScheduleAction.SKIP, 0, False
 
         cross_action = self._try_schedule_cross_context(req)
@@ -536,6 +552,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         (needing only ~1 token) to still be scheduled.
         """
         remaining_budget = budget.remaining_tokens
+        pre_prepare_context_remaining = req.context_remaining_length
 
         # Min budget check — need at least one chunk unit
         if remaining_budget is not None and remaining_budget < self.chunk_unit_size:
@@ -549,17 +566,22 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Calculate chunk size from remaining budget
         #    (context_remaining_length is now correct after block reuse)
         context_remaining = req.context_remaining_length
+        budget_context_remaining = (
+            context_remaining
+            if self.enable_prefix_aware_scheduling
+            else pre_prepare_context_remaining
+        )
         chunk_size = (
-            min(remaining_budget, context_remaining)
+            min(remaining_budget, budget_context_remaining)
             if remaining_budget is not None
-            else context_remaining
+            else budget_context_remaining
         )
 
         if self.max_context_length is not None:
             chunk_size = min(chunk_size, self.max_context_length)
 
         # Round down to chunk_unit_size boundary (unless last chunk).
-        if chunk_size < context_remaining:
+        if chunk_size < budget_context_remaining:
             chunk_size = (chunk_size // self.chunk_unit_size) * self.chunk_unit_size
 
         if chunk_size <= 0:
@@ -579,18 +601,21 @@ class KVCacheV2Scheduler(RequestScheduler):
         if chunk_size <= 0:
             return ScheduleAction.SKIP, 0, False
 
-        req.context_chunk_size = chunk_size
+        budget_chunk_size = chunk_size
+        req.context_chunk_size = min(chunk_size, context_remaining)
 
         # Draft tokens only matter for last chunk (budget + resize)
-        chunk_tokens = chunk_size
+        chunk_tokens = budget_chunk_size
+        resize_tokens = req.context_chunk_size
         if req.is_last_context_chunk:
             draft_len = get_draft_token_length(req)
             if draft_len > 0:
                 chunk_tokens += draft_len
+                resize_tokens += draft_len
 
         # V2 resizes KV cache directly in the scheduler, so include
         # draft tokens for last chunk.
-        if not self.kv_cache_manager.resize_context(req, chunk_tokens):
+        if not self.kv_cache_manager.resize_context(req, resize_tokens):
             return ScheduleAction.SKIP, 0, False
 
         cross_action = self._try_schedule_cross_context(req)

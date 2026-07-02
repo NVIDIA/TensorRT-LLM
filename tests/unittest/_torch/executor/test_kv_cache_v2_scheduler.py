@@ -180,16 +180,17 @@ def make_peft_cache_manager(max_device_pages, pages_per_task=1):
 
 
 def make_scheduler(
-    kv_cache_manager,
-    max_batch_size=100,
-    max_num_tokens=1024,
-    ctx_chunk_config=None,
-    peft_cache_manager=None,
-    scheduler_capacity=None,
-    no_schedule_until_state=None,
-    no_schedule_after_state=None,
-    cross_kv_cache_manager=None,
-):
+    kv_cache_manager: Mock,
+    max_batch_size: int = 100,
+    max_num_tokens: int | None = 1024,
+    ctx_chunk_config: tuple | None = None,
+    peft_cache_manager: Mock | None = None,
+    scheduler_capacity: int | None = None,
+    no_schedule_until_state: LlmRequestState | None = None,
+    no_schedule_after_state: LlmRequestState | None = None,
+    cross_kv_cache_manager: Mock | None = None,
+    enable_prefix_aware_scheduling: bool = True,
+) -> object:
     """Create KVCacheV2Scheduler, patching isinstance check for mock mgr."""
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 
@@ -212,6 +213,7 @@ def make_scheduler(
             ctx_chunk_config=ctx_chunk_config,
             peft_cache_manager=peft_cache_manager,
             scheduler_capacity=scheduler_capacity,
+            enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
             **kwargs,
         )
 
@@ -2000,6 +2002,44 @@ class TestPrepareBeforeBudget:
         req = make_ctx_request(0, context_remaining_length=1000)
         out = sched.schedule_request([req], set())
         assert ids(out.context_requests) == [0]
+
+    def test_prefix_aware_scheduling_disabled_charges_pre_reuse_tokens(self) -> None:
+        """Actual KV resize uses post-reuse length, but scheduler budget uses the pre-reuse length."""
+        resize_calls: list[int] = []
+
+        def prepare_with_reuse(req: Mock) -> bool:
+            req.context_remaining_length = 500
+            return True
+
+        def track_resize(req: Mock, num_tokens: int) -> bool:
+            resize_calls.append(num_tokens)
+            return True
+
+        mgr = make_kv_cache_manager(
+            prepare_context_fn=prepare_with_reuse,
+            resize_context_fn=track_resize,
+        )
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=1000,
+            enable_prefix_aware_scheduling=False,
+        )
+        req = make_ctx_request(0, context_remaining_length=1000)
+        out = sched.schedule_request([req], set())
+        assert ids(out.context_requests) == [0]
+        assert resize_calls == [500]
+
+        mgr = make_kv_cache_manager(prepare_context_fn=prepare_with_reuse)
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=1000,
+            enable_prefix_aware_scheduling=False,
+        )
+        gen = make_gen_request(1)
+        ctx = make_ctx_request(2, context_remaining_length=1000)
+        out = sched.schedule_request([gen, ctx], set())
+        assert ids(out.generation_requests) == [1]
+        assert ids(out.context_requests) == []
 
 
 # ===========================================================================
