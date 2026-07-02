@@ -212,6 +212,9 @@ class KVCacheManagerConfig:
     If True, we will try to reuse tokens from partially matched blocks.
     """
 
+    enable_partial_match: bool = field(init=False)
+    enable_partial_commit: bool = field(init=False)
+
     constraints: list[BatchDesc] = field(default_factory=list)
     """
     A list of step configurations that must always be supported.
@@ -256,6 +259,8 @@ class KVCacheManagerConfig:
         return self.swa_scratch_reuse is not None
 
     def __post_init__(self) -> None:
+        self.enable_partial_match = self.enable_partial_reuse
+        self.enable_partial_commit = self.enable_partial_reuse
         assert self.cache_tiers and self.cache_tiers[0].tier == CacheTier.GPU_MEM
         assert len(set(layer.layer_id for layer in self.layers)) == len(self.layers), (
             "duplicate layer id"

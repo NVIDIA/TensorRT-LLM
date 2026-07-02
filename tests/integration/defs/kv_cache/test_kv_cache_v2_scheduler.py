@@ -125,24 +125,50 @@ def _assert_all_completed(outputs, expected_count=None):
         assert len(outputs) == expected_count
     for i, out in enumerate(outputs):
         assert len(out.outputs) > 0, f"Output {i} has no outputs"
-        assert len(out.outputs[0].token_ids) > 0, f"Output {i} has empty token_ids"
+        for beam_idx, beam in enumerate(out.outputs):
+            assert len(beam.token_ids) > 0, f"Output {i} beam {beam_idx} has empty token_ids"
 
 
-def _assert_outputs_match(outputs_a, outputs_b, label_a="A", label_b="B"):
-    """Assert two output lists produce identical text."""
+def _assert_outputs_match(
+    outputs_a,
+    outputs_b,
+    label_a="A",
+    label_b="B",
+    *,
+    assert_token_ids_match=False,
+):
+    """Assert two output lists produce identical text for all beams."""
     assert len(outputs_a) == len(outputs_b), (
         f"Output count mismatch: {label_a}={len(outputs_a)}, {label_b}={len(outputs_b)}"
     )
     for i, (oa, ob) in enumerate(zip(outputs_a, outputs_b)):
-        assert oa.outputs[0].text == ob.outputs[0].text, (
-            f"Prompt {i}: {label_a} vs {label_b} outputs differ.\n"
-            f"{label_a}: {oa.outputs[0].text[:500]}\n"
-            f"{label_b}: {ob.outputs[0].text[:500]}"
+        assert len(oa.outputs) == len(ob.outputs), (
+            f"Prompt {i}: output beam count mismatch: "
+            f"{label_a}={len(oa.outputs)}, {label_b}={len(ob.outputs)}"
         )
+        for beam_idx, (beam_a, beam_b) in enumerate(zip(oa.outputs, ob.outputs)):
+            if assert_token_ids_match:
+                assert beam_a.token_ids == beam_b.token_ids, (
+                    f"Prompt {i} beam {beam_idx}: {label_a} vs {label_b} token IDs differ.\n"
+                    f"{label_a}: {beam_a.token_ids}\n"
+                    f"{label_b}: {beam_b.token_ids}"
+                )
+            assert beam_a.text == beam_b.text, (
+                f"Prompt {i} beam {beam_idx}: {label_a} vs {label_b} text differs.\n"
+                f"{label_a}: {beam_a.text[:500]}\n"
+                f"{label_b}: {beam_b.text[:500]}"
+            )
 
 
 def _run_v1_v2_compare(
-    model_path, prompts, sampling_params, kv_extra=None, *, assert_outputs_match=True, **llm_kwargs
+    model_path,
+    prompts,
+    sampling_params,
+    kv_extra=None,
+    *,
+    assert_outputs_match=True,
+    assert_token_ids_match=False,
+    **llm_kwargs,
 ):
     """Run same prompts on V1 and V2; optionally assert identical output.
 
@@ -153,6 +179,7 @@ def _run_v1_v2_compare(
         kv_extra: Extra kwargs for both V1 and V2 KvCacheConfig (e.g. enable_block_reuse).
         assert_outputs_match: If True, assert V1 and V2 outputs are identical (text).
             Set False for MTP/speculative tests where scheduler differences can diverge.
+        assert_token_ids_match: If True, also require token ID parity for each returned beam.
         **llm_kwargs: Extra kwargs for both V1 and V2 LLM (e.g. max_num_tokens).
     """
     kv_extra = kv_extra or {}
@@ -174,7 +201,13 @@ def _run_v1_v2_compare(
     _assert_all_completed(outputs_v2, expected_count=len(prompts))
     if assert_outputs_match:
         _assert_all_completed(outputs_v1, expected_count=len(prompts))
-        _assert_outputs_match(outputs_v1, outputs_v2, "V1", "V2")
+        _assert_outputs_match(
+            outputs_v1,
+            outputs_v2,
+            "V1",
+            "V2",
+            assert_token_ids_match=assert_token_ids_match,
+        )
     return outputs_v1, outputs_v2
 
 
@@ -241,6 +274,26 @@ class TestKVCacheV2Llama:
     # Basic greedy — V2 matches V1
     def test_v2_vs_v1_basic(self):
         self._compare(SHORT_PROMPTS[:5])
+
+    # Beam search: V2 matches V1 across all returned beams
+    def test_beam_search_v2_vs_v1(self):
+        max_beam_width = 2
+        prompts = SHORT_PROMPTS[:3]
+        _run_v1_v2_compare(
+            self.MODEL_PATH,
+            prompts,
+            SamplingParams(
+                max_tokens=32,
+                temperature=0.0,
+                n=max_beam_width,
+                best_of=max_beam_width,
+                use_beam_search=True,
+            ),
+            max_batch_size=len(prompts) * max_beam_width,
+            max_beam_width=max_beam_width,
+            max_seq_len=2048,
+            assert_token_ids_match=True,
+        )
 
     # Token budget limited — V2 matches V1
     def test_token_budget_limited(self):
