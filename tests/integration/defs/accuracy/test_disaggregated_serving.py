@@ -2491,31 +2491,28 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 @skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(80000)
-class TestGLM5FP4(LlmapiAccuracyTestHarness):
-    # GLM-5 NVFP4 MoE checkpoint exercised in disaggregated serving. Context and
-    # generation each run TP4/EP4 (8 GPUs total), mirroring the GLM-5 NVFP4
-    # disagg stress config. The KV cache is exchanged over the NIXL Python
-    # transceiver (transceiver v2). Only KV cache manager v1 is covered here.
-    MODEL_NAME = "zai-org/GLM-5"
-    MODEL_PATH = f"{llm_models_root()}/GLM-5-NVFP4"
+class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "zai-org/GLM-5.2"
+    MODEL_PATH = f"{llm_models_root()}/GLM-5.2-NVFP4"
 
     @pytest.mark.skip_less_device(8)
     @pytest.mark.parametrize("use_kv_cache_manager_v2", [False],
                              ids=["cache_mgr_v1"])
     def test_nvfp4_nixl_python(self, use_kv_cache_manager_v2):
-        """GLM-5 NVFP4 disagg, ctx TP4/EP4 + gen TP4/EP4 (8 GPUs), NIXL Python
-        transceiver (v2), KV cache manager v1."""
         kv_cache_config = {
             "free_gpu_memory_fraction": 0.7,
             "enable_block_reuse": False,
-            "dtype": "fp8",
             "use_kv_cache_manager_v2": use_kv_cache_manager_v2,
         }
         cache_transceiver_config = {
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
         }
-        moe_config = {"backend": "TRTLLM"}
+        moe_config = {"backend": "CUTEDSL"}
+        speculative_config = {
+            "decoding_type": "MTP",
+            "max_draft_len": 1,
+        }
         ctx_server_config = {
             "tensor_parallel_size": 4,
             "pipeline_parallel_size": 1,
@@ -2524,8 +2521,11 @@ class TestGLM5FP4(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": True,
             "enable_chunked_prefill": True,
             "cuda_graph_config": None,
+            "trust_remote_code": True,
+            "max_seq_len": 8192,
             "kv_cache_config": kv_cache_config,
             "moe_config": moe_config,
+            "speculative_config": speculative_config,
             "cache_transceiver_config": cache_transceiver_config,
         }
         gen_server_config = {
@@ -2535,8 +2535,11 @@ class TestGLM5FP4(LlmapiAccuracyTestHarness):
             "enable_attention_dp": True,
             "disable_overlap_scheduler": False,
             "enable_chunked_prefill": True,
+            "trust_remote_code": True,
+            "max_seq_len": 8192,
             "kv_cache_config": kv_cache_config,
             "moe_config": moe_config,
+            "speculative_config": speculative_config,
             "cache_transceiver_config": cache_transceiver_config,
         }
         disaggregated_server_config = {
@@ -2555,3 +2558,4 @@ class TestGLM5FP4(LlmapiAccuracyTestHarness):
                                       self.MODEL_PATH,
                                       max_workers=128) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
