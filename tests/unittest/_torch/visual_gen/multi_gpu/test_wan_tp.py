@@ -83,30 +83,34 @@ def init_distributed_worker(rank: int, world_size: int, backend: str = "nccl", p
 
 def cleanup_distributed():
     """Clean up distributed environment."""
-    # Reset the DeviceMesh singleton before destroying the process group
-    # to prevent NCCL process group destructor segfaults during interpreter exit.
-    try:
-        from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
-
-        DeviceMeshTopologyImpl.device_mesh = None
-        DeviceMeshTopologyImpl.tp_mesh = None
-    except ImportError:
-        pass
     if dist.is_initialized():
         dist.barrier()
         dist.destroy_process_group()
 
 
 def _distributed_worker(rank, world_size, backend, test_fn, port):
-    """Worker function that runs in each process. Module-level for pickling."""
+    """Worker function that runs in each process. Module-level for pickling.
+
+    On the success path we call ``os._exit(0)`` to skip Python interpreter
+    finalization. The nanobind ``init_pg`` call performed by
+    ``VisualGenMapping.setup_communicators`` (fired whenever ``tp_size > 1``)
+    stashes the NCCL ``c10d::ProcessGroup`` inside C++ file-scope globals
+    ``pg_world`` / ``pg_local`` (``cpp/tensorrt_llm/runtime/utils/pgUtils.cpp``).
+    Those intrusive_ptrs outlive ``dist.destroy_process_group()`` and their C++
+    static destructors then fire after ``torch.cuda`` has been torn down,
+    aborting with ``c10::AcceleratorError`` inside ``~ProcessGroupNCCL``. There
+    is no Python API to reset those globals. On failure we still raise so
+    ``mp.spawn`` reports the test error to the parent.
+    """
     try:
         init_distributed_worker(rank, world_size, backend, port)
         test_fn(rank, world_size)
     except Exception as e:
         print(f"Rank {rank} failed with error: {e}")
-        raise
-    finally:
         cleanup_distributed()
+        raise
+    cleanup_distributed()
+    os._exit(0)
 
 
 def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool = True):
