@@ -888,7 +888,7 @@ _PERFECT_ROUTER_ROUTING_SPECS = {
 _PERFECT_ROUTER_ROUTING_NAMES = list(_PERFECT_ROUTER_ROUTING_SPECS)
 
 
-def _reset_perfect_router_comm_state():
+def _reset_perfect_router_comm_state() -> None:
     """Reset process-global router/comm state between reused-pool cases.
 
     The shared module-scoped ``mpi_pool_executor`` keeps one set of worker
@@ -902,6 +902,13 @@ def _reset_perfect_router_comm_state():
     import gc
 
     from tensorrt_llm._torch.modules.fused_moe import routing as moe_routing
+
+    # Wait for any in-flight GPU work first. This teardown runs from a
+    # ``finally`` block, so on the error path a worker may raise while kernels
+    # are still running; clearing the cache / NVLink symmetric-memory
+    # workspaces before syncing could free memory that is still in use.
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
     moe_routing._PERFECT_ROUTER_LOGITS_CACHE.clear()
     try:
@@ -918,14 +925,13 @@ def _reset_perfect_router_comm_state():
             _NVOS._WORKSPACE = None
     gc.collect()
     if torch.cuda.is_available():
-        torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
 
-def _perfect_router_worker_entry(*worker_args):
+def _perfect_router_worker_entry(*worker_args) -> None:
     """Run one perfect-router case, then reset state for the reused worker."""
     try:
-        return _perfect_router_worker(*worker_args)
+        _perfect_router_worker(*worker_args)
     finally:
         _reset_perfect_router_comm_state()
 
@@ -941,7 +947,7 @@ def _perfect_router_worker_entry(*worker_args):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_perfect_router_load_balanced_multi_gpu(parallel_mode, routing_name,
                                                 num_tokens, dtype,
-                                                mpi_pool_executor):
+                                                mpi_pool_executor) -> None:
     """Verify ENABLE_PERFECT_ROUTER produces balanced EP dispatch on 4 GPUs.
 
     Covers both DEP (attention DP + MoE EP) and TEP (attention TP + MoE EP)
