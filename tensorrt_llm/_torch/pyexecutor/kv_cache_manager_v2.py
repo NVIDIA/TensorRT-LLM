@@ -704,6 +704,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"KV cache manager v2 disk cache quota set to {disk_cache_size / (1 << 30):.2f}GiB at {disk_cache_path}"
             )
 
+        self.has_host_cache_tier = any(
+            isinstance(tier, HostCacheTierConfig) for tier in cache_tiers
+        )
+
         self.vocab_size = vocab_size
 
         config = self._build_cache_config(
@@ -718,13 +722,15 @@ class KVCacheManagerV2(BaseResourceManager):
         try:
             self.impl = KVCacheManagerPy(config, event_manager=self.event_manager)
         except (CuError, KVCacheOutOfMemoryError):
-            if len(cache_tiers) > 1:
+            if self.has_host_cache_tier:
                 logger.warning(
                     "Failed to initialize KV cache manager with host cache "
                     "tier (cuMemHostRegister may have failed). "
                     "Retrying without host cache tier."
                 )
-                cache_tiers_gpu_only = [t for t in cache_tiers if isinstance(t, GpuCacheTierConfig)]
+                cache_tiers_gpu_only = [
+                    tier for tier in cache_tiers if isinstance(tier, GpuCacheTierConfig)
+                ]
                 config = self._build_cache_config(
                     kv_cache_config,
                     tokens_per_block=tokens_per_block,
@@ -732,6 +738,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     cache_tiers=cache_tiers_gpu_only,
                 )
                 cache_tiers = cache_tiers_gpu_only
+                self.has_host_cache_tier = False
                 self.kv_cache_manager_py_config = config
                 self.impl = KVCacheManagerPy(config, event_manager=self.event_manager)
             else:
