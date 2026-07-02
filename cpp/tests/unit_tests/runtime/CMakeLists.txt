@@ -22,6 +22,7 @@ add_gtest(gptDecoderTest gptDecoderTest.cpp)
 add_gtest(hostAccessibleDeviceAllocatorTest
           hostAccessibleDeviceAllocatorTest.cu)
 add_gtest(iBufferTest iBufferTest.cpp)
+add_gtest(ipcNvlsMemoryTest ipcNvlsMemoryTest.cpp)
 add_gtest(iTensorTest iTensorTest.cpp)
 add_gtest(loraCacheTest loraCacheTest.cpp)
 add_gtest(loraManagerTest loraManagerTest.cpp)

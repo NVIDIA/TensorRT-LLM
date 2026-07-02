@@ -162,9 +162,9 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
     setenv("NCCL_RUNTIME_CONNECT", "0", 0);
     setenv("NCCL_GRAPH_REGISTER", "0", 0);
     // NCCL aborts during init if it tries NVLS multicast but the fabric/IMEX
-    // plane can't bind it. Disable NVLS when it isn't actually usable so NCCL
+    // plane can't bind it. Disable NVLS when the fabric is not usable so NCCL
     // falls back to NVLink P2P. No-overwrite preserves an explicit user setting.
-    if (!tensorrt_llm::runtime::ipcNvlsSupported())
+    if (!tensorrt_llm::runtime::ipcNvlsFabricUsable())
     {
         setenv("NCCL_NVLS_ENABLE", "0", 0);
     }

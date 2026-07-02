@@ -148,7 +148,7 @@ private:
 // Returns CU_MEM_HANDLE_TYPE_FABRIC when fabric-handle memory can actually be
 // allocated and exported on the current device (i.e. the fabric/IMEX plane is
 // provisioned), else CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR. Used both to pick
-// the NVLS allocation handle type and by ipcNvlsSupported() to gauge usability.
+// the NVLS allocation handle type and by ipcNvlsFabricUsable() to gauge usability.
 static CUmemAllocationHandleType getMemHandleType()
 {
     int device_id;
@@ -453,13 +453,13 @@ void MPI_group_barrier(std::set<int> group)
 bool ipcNvlsSupported()
 {
 #if ENABLE_MULTI_DEVICE
-    // The result is static for the process and the fabric probe below is
-    // relatively heavy (it allocates and exports fabric-handle memory), so
-    // compute it once and cache it.
+    // Static capability check only (driver version + the multicast attribute on
+    // every device). This is the precondition for allocating NVLS multicast
+    // memory: ipcNvlsAllocate() selects a fabric or POSIX-FD handle itself, so
+    // single-node NVLS works without a provisioned fabric/IMEX plane. The result
+    // is static for the process, so compute it once and cache it.
     static bool const supported = []() -> bool
     {
-        // Cheap static capability check first (driver version + the multicast
-        // attribute on every device); short-circuits the fabric probe.
         int cuda_driver_version = -1;
         TLLM_CUDA_CHECK(cudaDriverGetVersion(&cuda_driver_version));
         if (cuda_driver_version < 12010)
@@ -483,6 +483,26 @@ bool ipcNvlsSupported()
                 return false;
             }
         }
+        return true;
+    }();
+    return supported;
+#else
+    return false;
+#endif
+}
+
+bool ipcNvlsFabricUsable()
+{
+#if ENABLE_MULTI_DEVICE
+    // Extends ipcNvlsSupported() with a live fabric probe. The probe is
+    // relatively heavy (it allocates and exports fabric-handle memory), so
+    // compute it once and cache it.
+    static bool const usable = []() -> bool
+    {
+        if (!ipcNvlsSupported())
+        {
+            return false;
+        }
 #if !ENABLE_NVSHMEM
         // The multicast attribute is a false positive when the fabric/IMEX plane
         // is not provisioned (e.g. nvidia-imex not running): NVLS multicast
@@ -497,13 +517,13 @@ bool ipcNvlsSupported()
                 TLLM_LOG_WARNING(
                     "\n"
                     "**************************************************************************\n"
-                    "* NVLS (NVLink SHARP) DISABLED -- falling back to NVLink P2P              *\n"
+                    "* NVLS (NVLink SHARP) DISABLED for NCCL -- falling back to NVLink P2P     *\n"
                     "**************************************************************************\n"
                     "* The GPU advertises multicast support, but the NVLink fabric/IMEX plane *\n"
                     "* is NOT provisioned on this node, so NVLS multicast memory cannot be    *\n"
                     "* bound. Collectives will still work over NVLink P2P, but NVLS-           *\n"
-                    "* accelerated paths (NCCL NVLS, fused GEMM-allreduce / MNNVL) are off    *\n"
-                    "* and performance may be reduced.                                        *\n"
+                    "* accelerated NCCL is off and performance may be reduced. (Single-node   *\n"
+                    "* NVLS over POSIX-FD, e.g. MNNVL allreduce, is unaffected.)              *\n"
                     "*                                                                        *\n"
                     "* To enable NVLS: start nvidia-imex and expose                           *\n"
                     "* /dev/nvidia-caps-imex-channels to the container. Set                   *\n"
@@ -519,7 +539,7 @@ bool ipcNvlsSupported()
 #endif // !ENABLE_NVSHMEM
         return true;
     }();
-    return supported;
+    return usable;
 #else
     return false;
 #endif
