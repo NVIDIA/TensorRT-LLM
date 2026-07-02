@@ -216,13 +216,23 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             if cutlass.const_expr(not self.merge_blocks):
                 self.num_threads_per_cta = 512
             else:
-                # For merge_blocks, cap num_threads_per_cta so that the tile
-                # width (num_threads_per_cta * vec_size) does not exceed
-                # max_num_cols. Otherwise, out-of-bounds padding elements
-                # created by _fill_oob are counted in the radix histogram
-                # and may be selected as top-k candidates with invalid
-                # indices, causing incorrect results.
-                self.num_threads_per_cta = min(self.max_num_cols // self.vec_size, 512)
+                # For merge_blocks keep num_threads_per_cta=512 so that the
+                # prefix sum stays single-pass (radix=256 <= 512).  Instead,
+                # cap vec_size so tile_width (512 * vec_size) <= max_num_cols,
+                # preventing OOB s_indices from _fill_oob padding positions.
+                self.num_threads_per_cta = 512
+                _vec_cap = max(1, 2 ** int(math.log2(max(self.max_num_cols // 512, 1))))
+                self.num_copy_bits = min(self.num_copy_bits, _vec_cap * self.dtype.width)
+                self.vec_size = self.num_copy_bits // self.dtype.width
+        elif cutlass.const_expr(merge_blocks):
+            # For merge_blocks keep num_threads_per_cta (256) so that the prefix
+            # sum stays single-pass (radix=256 == num_threads_per_cta).  Instead,
+            # cap vec_size so tile_width (num_threads_per_cta * vec_size) <=
+            # max_num_cols, preventing OOB s_indices from _fill_oob padding.
+            _tgt = self.num_threads_per_cta
+            _vec_cap = max(1, 2 ** int(math.log2(max(self.max_num_cols // _tgt, 1))))
+            self.num_copy_bits = min(self.num_copy_bits, _vec_cap * self.dtype.width)
+            self.vec_size = self.num_copy_bits // self.dtype.width
 
         # only used for debug info
         if cutlass.const_expr(debug):

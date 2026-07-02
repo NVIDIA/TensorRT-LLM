@@ -58,8 +58,11 @@ class FilteredTopKKernelVarlen:
         self.num_ctas_per_row = num_ctas_per_row
         self.merge_blocks = merge_blocks
 
-        # Note: now we only support top_k <= 2048, we could change the code here to support larger top_k.
-        self.filtered_topk_max_k = 2048
+        # Tested with top_k in {512, 1024, 2048}. Other values may work but
+        # have not been validated and may require minor changes.
+        assert top_k <= 2048, f"top_k must be <= 2048, but got {top_k}"
+        # s_indices only needs top_k slots; size to top_k to save SMEM.
+        self.filtered_topk_max_k = top_k
         # 8 bits for radix-based filter.
         self.radix = 256
 
@@ -498,8 +501,10 @@ class FilteredTopKKernelVarlen:
             val_one_negative = cutlass.Int32(-1)
 
             # Stage 1: Coarse histogram.
-            if tidx < self.radix + 1:
-                s_histogram[tidx] = 0
+            # Use a strided loop so every bin is cleared even when
+            # num_threads_per_cta < radix (e.g. 128 < 256).
+            for _hi in range(tidx, self.radix + 1, self.num_threads_per_cta):
+                s_histogram[_hi] = 0
             cute.arch.barrier()
 
             # 1.1 Build histogram with vectorized loads
@@ -624,8 +629,8 @@ class FilteredTopKKernelVarlen:
             else:
                 # Reset histogram for refinement
                 cute.arch.barrier()
-                if tidx < self.radix + 1:
-                    s_histogram[tidx] = 0
+                for _hi in range(tidx, self.radix + 1, self.num_threads_per_cta):
+                    s_histogram[_hi] = 0
                 cute.arch.barrier()
 
                 # Filter and build refinement histogram
@@ -834,8 +839,8 @@ class FilteredTopKKernelVarlen:
                         else:
                             # Reset histogram
                             cute.arch.barrier()
-                            if tidx < self.radix + 1:
-                                s_histogram[tidx] = 0
+                            for _hi in range(tidx, self.radix + 1, self.num_threads_per_cta):
+                                s_histogram[_hi] = 0
                             cute.arch.barrier()
 
                             for i in range(tidx, num_input, self.num_threads_per_cta):
