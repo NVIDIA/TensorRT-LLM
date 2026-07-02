@@ -8,6 +8,7 @@ import torch
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
+from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.llm_utils import KvCacheRetentionConfig
 from ..sampling_params import SamplingParams
@@ -107,6 +108,7 @@ class GenerationRequest:
         postproc_params: Optional[PostprocParams] = None,
         multimodal_params: Optional[MultimodalParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
+        conversation_params: Optional[ConversationParams] = None,
         cache_salt: Optional[str] = None,
         arrival_time: Optional[float] = None,
         encoder_input_token_ids: Optional[Union[torch.Tensor, np.ndarray,
@@ -138,6 +140,7 @@ class GenerationRequest:
         self.disaggregated_params = disaggregated_params
         self.trace_headers = trace_headers
         self.scheduling_params = scheduling_params
+        self.conversation_params = conversation_params
         if cache_salt is not None:
             if not isinstance(cache_salt, str):
                 raise TypeError(

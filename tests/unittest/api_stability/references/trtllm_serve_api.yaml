@@ -295,6 +295,12 @@ models:
         default: null
         status: stable
         required: false
+      conversation_params:
+        kind: extension
+        type: Optional[ConversationParams]
+        default: null
+        status: prototype
+        required: false
 
   CompletionResponseChoice:
     fields:
@@ -765,6 +771,12 @@ models:
         type: Optional[DisaggregatedParams]
         default: null
         status: stable
+        required: false
+      conversation_params:
+        kind: extension
+        type: Optional[ConversationParams]
+        default: null
+        status: prototype
         required: false
       cache_salt:
         kind: extension
