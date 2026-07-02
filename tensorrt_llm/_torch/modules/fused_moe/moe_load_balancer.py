@@ -1099,6 +1099,14 @@ moe_model_arch_list = [
     'Qwen2MoeForCausalLM',
     'Qwen3MoeForCausalLM',
     'Qwen3_5MoeForCausalLM',
+    # Composite MoE VLMs are routed through their top-level
+    # ConditionalGeneration arch, so EPLB setup must recognize those here (the
+    # text-only arches above never match for the VLM wrapper). The inner MoE LM
+    # (Qwen3MoeForCausalLM / Qwen3_5MoeForCausalLM) inherits the setup() state
+    # via the wrapper's deepcopy of model_config. Same pattern as
+    # Llama4ForConditionalGeneration.
+    'Qwen3VLMoeForConditionalGeneration',
+    'Qwen3_5MoeForConditionalGeneration',
 ]
 
 
