@@ -53,7 +53,6 @@ import cutlass.utils as utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-from .custom_pipeline import PipelineTmaUmma, PipelineUmmaAsync
 from .utils import (
     TRTLLM_ENABLE_PDL,
     griddepcontrol_launch_dependents,
@@ -391,13 +390,14 @@ class PersistentDenseGemmKernel:
         ab_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, num_tma_producer
         )
-        ab_producer, ab_consumer = PipelineTmaUmma.create(
+        ab_producer, ab_consumer = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.ab_full_mbar_ptr.data_ptr(),
             num_stages=self.num_ab_stage,
             producer_group=ab_pipeline_producer_group,
             consumer_group=ab_pipeline_consumer_group,
             tx_count=self.num_tma_load_bytes,
             cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
         ).make_participants()
 
         # Initialize acc_pipeline (barrier) and states
@@ -406,12 +406,13 @@ class PersistentDenseGemmKernel:
         acc_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, num_acc_consumer_threads
         )
-        acc_pipeline = PipelineUmmaAsync.create(
+        acc_pipeline = pipeline.PipelineUmmaAsync.create(
             barrier_storage=storage.acc_full_mbar_ptr.data_ptr(),
             num_stages=self.num_acc_stage,
             producer_group=acc_pipeline_producer_group,
             consumer_group=acc_pipeline_consumer_group,
             cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
         )
 
         tmem_alloc_barrier = pipeline.NamedBarrier(

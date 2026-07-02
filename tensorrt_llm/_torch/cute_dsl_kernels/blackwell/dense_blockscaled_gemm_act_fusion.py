@@ -56,7 +56,6 @@ from cutlass._mlir.dialects import math
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from ...utils import ActivationType, is_gated_activation
-from .custom_pipeline import PipelineTmaUmma, PipelineUmmaAsync
 from .utils import (
     TRTLLM_ENABLE_PDL,
     fmin,
@@ -726,13 +725,14 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
         ab_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, num_tma_producer
         )
-        ab_pipeline = PipelineTmaUmma.create(
+        ab_pipeline = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.ab_full_mbar_ptr.data_ptr(),
             num_stages=self.num_ab_stage,
             producer_group=ab_pipeline_producer_group,
             consumer_group=ab_pipeline_consumer_group,
             tx_count=self.num_tma_load_bytes,
             cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
         )
 
         # Initialize acc_pipeline (barrier) and states
@@ -741,12 +741,13 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
         acc_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, num_acc_consumer_threads
         )
-        acc_pipeline = PipelineUmmaAsync.create(
+        acc_pipeline = pipeline.PipelineUmmaAsync.create(
             barrier_storage=storage.acc_full_mbar_ptr.data_ptr(),
             num_stages=self.num_acc_stage,
             producer_group=acc_pipeline_producer_group,
             consumer_group=acc_pipeline_consumer_group,
             cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
         )
 
         # Tensor memory dealloc barrier init
