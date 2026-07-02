@@ -1377,7 +1377,7 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
 
         return gemm2_output
 
-    def post_load_weights(self, module: torch.nn.Module):
+    def transform_weights(self, module: torch.nn.Module) -> None:
         if 'w3_w1_weight' in module._parameters:
             w31_scale = shuffle_weight_for_activation_kernel(
                 module.fc31_dequant.data)
@@ -1391,7 +1391,7 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                 module.fc31_input_dequant = None
                 module.fc2_input_dequant = None
 
-        super().post_load_weights(module)
+        super().transform_weights(module)
 
 
 class TritonFusedMoE(MoE):
@@ -1595,6 +1595,3 @@ class TritonFusedMoE(MoE):
         weights = weights[0]
 
         self.quant_method.load_weights(self, weights, self.weight_loading_mode)
-
-    def post_load_weights(self):
-        self.quant_method.post_load_weights(self)
