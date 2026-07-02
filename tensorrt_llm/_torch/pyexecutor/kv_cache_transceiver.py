@@ -66,16 +66,63 @@ def create_kv_cache_transceiver(
             "MPI CacheTransceiver is deprecated, UCX or NIXL is recommended")
     elif cache_transceiver_config.backend == "UCX":
         logger.info(
-            f"Using UCX kv-cache transceiver. If your devices are not in the same domain, please consider setting "
-            f"UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
-            f"hangs or lower-than-expected performance.")
+            "Using UCX kv-cache transceiver. If your devices are not in the same domain, please consider setting "
+            "UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
+            "hangs or lower-than-expected performance.")
+
+    # Auto-select Python transceiver when transfer_chunk_size is set,
+    # since the C++ transceiver does not support chunked transfer.
+    # Only applies to NIXL/DEFAULT backends (the Python transceiver
+    # does not support UCX, MPI, or MOONCAKE).
+    runtime = cache_transceiver_config.transceiver_runtime
+    use_python = runtime == "PYTHON"
+    if (runtime is None
+            and cache_transceiver_config.transfer_chunk_size is not None):
+        if cache_transceiver_config.backend in (None, "DEFAULT", "NIXL"):
+            # Use warning (not info) so users notice the transceiver swap and
+            # the implied perf / staging-buffer characteristics change.  Set
+            # transceiver_runtime='CPP' explicitly to opt out (and lose
+            # chunked transfer).
+            logger.warning(
+                "transfer_chunk_size is set; auto-selecting the Python "
+                "transceiver instead of the C++ transceiver to enable "
+                "chunked KV cache transfer. "
+                "Set transceiver_runtime='CPP' to disable this auto-selection.")
+            use_python = True
+        else:
+            logger.warning(
+                f"transfer_chunk_size is set but backend "
+                f"'{cache_transceiver_config.backend}' requires the C++ "
+                f"transceiver, which does not support chunked transfer. "
+                f"transfer_chunk_size will be ignored. Use NIXL backend to "
+                f"enable chunked transfer.")
+    elif (runtime == "CPP"
+          and cache_transceiver_config.transfer_chunk_size is not None):
+        raise ValueError(
+            "transfer_chunk_size is set but transceiver_runtime='CPP' "
+            "explicitly disables Python auto-selection; "
+            "transfer_chunk_size will be ignored.")
+
+    # Warn when transfer_chunk_size is below the recommended floor.  The Pydantic
+    # field is PositiveInt (>=1), but values below ~16 push the per-chunk RDMA
+    # overhead into the regime where it dominates transfer throughput.
+    _MIN_RECOMMENDED_TRANSFER_CHUNK_SIZE = 16
+    if (cache_transceiver_config.transfer_chunk_size is not None
+            and cache_transceiver_config.transfer_chunk_size
+            < _MIN_RECOMMENDED_TRANSFER_CHUNK_SIZE):
+        logger.warning(
+            f"transfer_chunk_size={cache_transceiver_config.transfer_chunk_size} "
+            f"is below the recommended floor of "
+            f"{_MIN_RECOMMENDED_TRANSFER_CHUNK_SIZE}; per-chunk RDMA overhead "
+            f"may dominate transfer throughput. Consider 64-128 for "
+            f"long-context workloads (ISL >= 32K).")
 
     # Select transceiver implementation based on transceiver_runtime
     # transceiver_runtime == None or "CPP" -> use C++ transceiver (default)
     # transceiver_runtime == "PYTHON" -> use Python transceiver
-    if cache_transceiver_config.transceiver_runtime == "PYTHON":
+    if use_python:
         # Python transceiver currently only supports NIXL and DEFAULT backend
-        if cache_transceiver_config.backend not in ("DEFAULT", "NIXL"):
+        if cache_transceiver_config.backend not in (None, "DEFAULT", "NIXL"):
             raise ValueError(
                 f"Python transceiver currently only supports NIXL or DEFAULT backend, "
                 f"got {cache_transceiver_config.backend}. "

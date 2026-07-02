@@ -4,6 +4,7 @@ import os
 import random
 import time
 import uuid
+from unittest.mock import MagicMock
 
 # Exclude IB (no fabric) and gdr_copy (UCX rcache SIGABRT at teardown).
 os.environ.setdefault("UCX_TLS", "^ib,gdr_copy")
@@ -29,6 +30,7 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
 )
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
+from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -150,6 +152,95 @@ def test_session_status_enum():
         assert hasattr(SessionStatus, name)
         assert SessionStatus[name].value == name
     assert len(SessionStatus) == 7
+
+
+# ---------------------------------------------------------------------------
+# Chunked KV slice creation tests
+# ---------------------------------------------------------------------------
+
+
+def _chunk_block_ids(all_block_ids, transfer_chunk_size, mamba_state_index=None):
+    """Call the real _create_kv_slices via a mock transceiver."""
+    from unittest.mock import MagicMock
+
+    from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice
+
+    base_slice = KVSlice(
+        is_last_slice=True,
+        block_ids_per_layer_groups=all_block_ids,
+        mamba_state_index=mamba_state_index,
+    )
+
+    transceiver = MagicMock()
+    transceiver._transfer_chunk_size = transfer_chunk_size
+    transceiver._collect_base_slice = MagicMock(return_value=base_slice)
+    transceiver._reuse_adapter.tokens_per_block = 1
+    transceiver._create_kv_slices = KvCacheTransceiverV2._create_kv_slices.__get__(transceiver)
+
+    req = MagicMock()
+    return transceiver._create_kv_slices(req)
+
+
+@pytest.mark.parametrize(
+    "all_block_ids,chunk_size,expected_num_slices",
+    [
+        ([[0, 1, 2, 3, 4, 5, 6, 7]], None, 1),
+        ([[0, 1, 2, 3, 4, 5, 6, 7]], 4, 2),
+        ([list(range(10))], 4, 3),
+        ([[], []], 4, 1),
+        ([[0, 1, 2]], 64, 1),
+    ],
+    ids=["no_chunking", "even_split", "uneven_split", "empty_blocks", "chunk_larger_than_total"],
+)
+def test_create_kv_slices_basic(all_block_ids, chunk_size, expected_num_slices):
+    """Chunking produces the expected number of slices."""
+    slices = _chunk_block_ids(all_block_ids, transfer_chunk_size=chunk_size)
+    assert len(slices) == expected_num_slices
+    assert slices[-1].is_last_slice is True
+    if expected_num_slices > 1:
+        for s in slices[:-1]:
+            assert s.is_last_slice is False
+
+
+def test_create_kv_slices_integrity_check():
+    """Reassembled block IDs from all slices must match the original."""
+    all_block_ids = [list(range(17)), list(range(5))]
+    slices = _chunk_block_ids(all_block_ids, transfer_chunk_size=4)
+    for lg_idx, original in enumerate(all_block_ids):
+        reassembled = []
+        for s in slices:
+            reassembled.extend(s.block_ids_per_layer_groups[lg_idx])
+        assert reassembled == original
+
+
+def test_create_kv_slices_multiple_layer_groups():
+    """Shorter layer groups are projected into the overlapping global chunk."""
+    all_block_ids = [list(range(8)), list(range(3))]
+    slices = _chunk_block_ids(all_block_ids, transfer_chunk_size=4)
+    assert len(slices) == 2
+    assert np.array_equal(slices[0].block_ids_per_layer_groups[0], np.array([0, 1, 2, 3]))
+    assert np.array_equal(slices[1].block_ids_per_layer_groups[0], np.array([4, 5, 6, 7]))
+    assert len(slices[0].block_ids_per_layer_groups[1]) == 0
+    assert np.array_equal(slices[1].block_ids_per_layer_groups[1], np.array([0, 1, 2]))
+    assert slices[0].token_range == TokenRange(start=0, end=4)
+    assert slices[1].token_range == TokenRange(start=4, end=8)
+
+
+def test_create_kv_slices_preserves_mamba_state_index():
+    """mamba_state_index is propagated to every chunk slice."""
+    all_block_ids = [list(range(8))]
+    slices = _chunk_block_ids(all_block_ids, transfer_chunk_size=4, mamba_state_index=42)
+    assert len(slices) == 2
+    for s in slices:
+        assert s.mamba_state_index == 42
+
+
+def test_create_kv_slices_none_mamba_state_index():
+    """mamba_state_index=None is preserved when not set."""
+    all_block_ids = [list(range(4))]
+    slices = _chunk_block_ids(all_block_ids, transfer_chunk_size=4)
+    assert len(slices) == 1
+    assert slices[0].mamba_state_index is None
 
 
 def create_transfer_worker_setup(
@@ -1078,7 +1169,12 @@ def test_transfer_worker_v2_with_window(
 
 @pytest.mark.timeout(120)
 @pytest.mark.parametrize("use_v2", [False, True], ids=["v1", "v2"])
-def test_transfer_with_gen_prefix_offset(use_v2):
+@pytest.mark.parametrize(
+    "transfer_chunk_size",
+    [None, 2],
+    ids=["single_slice", "sender_chunked"],
+)
+def test_transfer_with_gen_prefix_offset(use_v2, transfer_chunk_size):
     """Verify that only suffix blocks are transferred when gen has a prefix offset.
 
     Simulates gen-side prefix cache: ctx sends all blocks for [0, request_len),
@@ -1167,13 +1263,7 @@ def test_transfer_with_gen_prefix_offset(use_v2):
     ]
 
     try:
-        # Ctx sends all blocks
         tx = ctx_tw.create_tx_session(ctx_request)
-        send_slice = KVSlice(
-            is_last_slice=True,
-            block_ids_per_layer_groups=ctx_block_ids,
-            token_range=TokenRange(start=0, end=request_len),
-        )
 
         # Gen receives only the suffix list; dst_start is derived from block count.
         rx = gen_tw.create_rx_session(gen_request)
@@ -1183,7 +1273,31 @@ def test_transfer_with_gen_prefix_offset(use_v2):
             token_range=TokenRange(start=0, end=request_len),
         )
         rx.receive(recv_slice)
-        tx.send(send_slice)
+
+        if transfer_chunk_size is None:
+            tx.send(
+                KVSlice(
+                    is_last_slice=True,
+                    block_ids_per_layer_groups=ctx_block_ids,
+                    token_range=TokenRange(start=0, end=request_len),
+                )
+            )
+        else:
+            transceiver = MagicMock()
+            transceiver._transfer_chunk_size = transfer_chunk_size
+            transceiver._collect_base_slice = MagicMock(
+                return_value=KVSlice(
+                    is_last_slice=True,
+                    block_ids_per_layer_groups=ctx_block_ids,
+                    token_range=TokenRange(start=0, end=request_len),
+                )
+            )
+            transceiver._reuse_adapter.tokens_per_block = tokens_per_block
+            transceiver._create_kv_slices = KvCacheTransceiverV2._create_kv_slices.__get__(
+                transceiver
+            )
+            for kv_slice in transceiver._create_kv_slices(ctx_request):
+                tx.send(kv_slice)
 
         result = tx.wait_complete()
         assert result == WaitResult.COMPLETED, f"tx wait_complete returned {result}"
@@ -1281,7 +1395,7 @@ def test_session_cancel_before_send():
 
 @pytest.mark.timeout(60)
 def test_session_cancel_after_send():
-    """TxSession cancelled after send() queues INIT tasks; future raises."""
+    """TxSession cancelled after send() queues INIT tasks fails the event wait."""
     tensorrt_llm.logger.set_level("debug")
     setup = create_transfer_worker_setup(
         ctx_tp=1,
@@ -1316,19 +1430,236 @@ def test_session_cancel_after_send():
         page_table = ctx_transfer_worker._rank_info.page_table
         block_ids_per_groups = [np.array([], dtype=np.int64) for _ in page_table.layer_groups]
         kv_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=block_ids_per_groups)
-        future = tx_session.send(kv_slice)
+        tx_session.send(kv_slice)
 
         # No receiver registered yet; task is INIT.
         tx_session.cancel()
 
         assert tx_session.status == SessionStatus.CANCELLED
         assert tx_session.has_failed()
-        # Future for the cancelled INIT task must raise.
-        with pytest.raises(Exception):
-            future.result(timeout=5.0)
+        assert tx_session.wait_complete() == WaitResult.FAILED
         tx_session.close()
     finally:
         ctx_transfer_worker.shutdown()
+
+
+def _setup_chunked_request(setup, ctx_request_id, gen_request_id, request_len):
+    """Create requests, allocate KV, and collect block IDs for chunked transfer tests."""
+    ctx_transfer_workers = setup["ctx_transfer_workers"]
+    ctx_kv_cache_managers = setup["ctx_kv_cache_managers"]
+    gen_transfer_workers = setup["gen_transfer_workers"]
+    gen_kv_cache_managers = setup["gen_kv_cache_managers"]
+    ctx_info_endpoint = setup["ctx_info_endpoint"]
+    use_v2 = setup["use_v2"]
+    tokens_per_block = setup["tokens_per_block"]
+
+    sampling_params = SamplingParams()
+    unique_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+
+    ctx_request = LlmRequest(
+        request_id=ctx_request_id,
+        max_new_tokens=1,
+        input_tokens=list(range(request_len)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()
+        ),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
+    )
+    ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
+
+    gen_request = LlmRequest(
+        request_id=gen_request_id,
+        max_new_tokens=1,
+        input_tokens=list(range(request_len)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()
+        ),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+    )
+    gen_request.py_disaggregated_params = DisaggregatedParams(
+        ctx_request_id=ctx_request.py_request_id,
+        ctx_dp_rank=0,
+        ctx_info_endpoint=ctx_info_endpoint,
+        disagg_request_id=unique_rid,
+    )
+
+    ctx_kv_caches, gen_kv_caches = [], []
+    for mgr in ctx_kv_cache_managers:
+        if use_v2:
+            kv = mgr._create_kv_cache(ctx_request.py_request_id, None, None)
+            assert kv.resume(torch.cuda.current_stream().cuda_stream)
+            assert kv.resize(request_len)
+            ctx_kv_caches.append(kv)
+        else:
+            mgr.impl.add_sequence_batch(
+                [(ctx_request.py_request_id, request_len, 1)], [ctx_request]
+            )
+
+    for mgr in gen_kv_cache_managers:
+        if use_v2:
+            kv = mgr._create_kv_cache(gen_request.py_request_id, None, None)
+            assert kv.resume(torch.cuda.current_stream().cuda_stream)
+            assert kv.resize(request_len)
+            gen_kv_caches.append(kv)
+        else:
+            mgr.impl.add_sequence_batch(
+                [(gen_request.py_request_id, request_len, 1)], [gen_request]
+            )
+
+    ctx_block_ids = [
+        get_block_ids_per_layer_groups(mgr, tw, ctx_request.py_request_id, use_v2, tokens_per_block)
+        for mgr, tw in zip(ctx_kv_cache_managers, ctx_transfer_workers, strict=True)
+    ]
+    gen_block_ids = [
+        get_block_ids_per_layer_groups(mgr, tw, gen_request.py_request_id, use_v2, tokens_per_block)
+        for mgr, tw in zip(gen_kv_cache_managers, gen_transfer_workers, strict=True)
+    ]
+
+    return {
+        "ctx_request": ctx_request,
+        "gen_request": gen_request,
+        "ctx_kv_caches": ctx_kv_caches,
+        "gen_kv_caches": gen_kv_caches,
+        "ctx_block_ids": ctx_block_ids,
+        "gen_block_ids": gen_block_ids,
+    }
+
+
+def _verify_and_cleanup_chunked(setup, ctx_info, sender_sessions, receiver_sessions):
+    """Shared verification and cleanup for chunked transfer tests."""
+    ctx_kv_cache_managers = setup["ctx_kv_cache_managers"]
+    gen_kv_cache_managers = setup["gen_kv_cache_managers"]
+    use_v2 = setup["use_v2"]
+
+    ctx_block_ids = ctx_info["ctx_block_ids"]
+    gen_block_ids = ctx_info["gen_block_ids"]
+
+    for session in sender_sessions:
+        assert session.status == SessionStatus.KV_TRANSFERRED
+    for session in receiver_sessions:
+        assert session.status == SessionStatus.KV_TRANSFERRED
+
+    num_layer_groups = len(ctx_block_ids[0])
+    for lg_id in range(num_layer_groups):
+        ctx_data = [
+            get_block_data(mgr, bids[lg_id], lg_id, use_v2, ctx_info["ctx_request"].py_request_id)
+            for mgr, bids in zip(ctx_kv_cache_managers, ctx_block_ids, strict=True)
+        ]
+        gen_data = [
+            get_block_data(mgr, bids[lg_id], lg_id, use_v2, ctx_info["gen_request"].py_request_id)
+            for mgr, bids in zip(gen_kv_cache_managers, gen_block_ids, strict=True)
+        ]
+        for c, g in zip(ctx_data, gen_data, strict=True):
+            assert c.equal(g), f"Layer group {lg_id}: data mismatch with chunked transfer"
+
+    for s in receiver_sessions:
+        s.close()
+    for s in sender_sessions:
+        s.close()
+    if use_v2:
+        torch.cuda.current_stream().synchronize()
+        for kv in ctx_info["ctx_kv_caches"]:
+            kv.close()
+        for kv in ctx_info["gen_kv_caches"]:
+            kv.close()
+
+
+def add_and_verify_chunked_request(
+    setup,
+    ctx_request_id,
+    gen_request_id,
+    request_len,
+    transfer_chunk_size,
+):
+    """Chunked transfer variant: sender sends N slices, receiver sends 1."""
+    ctx_transfer_workers = setup["ctx_transfer_workers"]
+    gen_transfer_workers = setup["gen_transfer_workers"]
+
+    ctx_info = _setup_chunked_request(setup, ctx_request_id, gen_request_id, request_len)
+    ctx_block_ids = ctx_info["ctx_block_ids"]
+    gen_block_ids = ctx_info["gen_block_ids"]
+    token_range = TokenRange(start=0, end=request_len)
+
+    sender_sessions = [tw.create_tx_session(ctx_info["ctx_request"]) for tw in ctx_transfer_workers]
+    for sender_session, block_ids_per_groups in zip(sender_sessions, ctx_block_ids, strict=True):
+        transceiver = MagicMock()
+        transceiver._transfer_chunk_size = transfer_chunk_size
+        transceiver._collect_base_slice = MagicMock(
+            return_value=KVSlice(
+                is_last_slice=True,
+                block_ids_per_layer_groups=block_ids_per_groups,
+                token_range=token_range,
+            )
+        )
+        transceiver._reuse_adapter.tokens_per_block = setup["tokens_per_block"]
+        transceiver._create_kv_slices = KvCacheTransceiverV2._create_kv_slices.__get__(transceiver)
+        for kv_slice in transceiver._create_kv_slices(ctx_info["ctx_request"]):
+            sender_session.send(kv_slice)
+
+    receiver_sessions = [
+        tw.create_rx_session(ctx_info["gen_request"]) for tw in gen_transfer_workers
+    ]
+    for recv_session, block_ids_per_groups in zip(receiver_sessions, gen_block_ids, strict=True):
+        full_slice = KVSlice(
+            is_last_slice=True,
+            block_ids_per_layer_groups=block_ids_per_groups,
+            token_range=token_range,
+        )
+        recv_session.receive(full_slice)
+
+    for session in sender_sessions:
+        result = session.wait_complete()
+        assert result == WaitResult.COMPLETED, f"tx wait_complete returned {result}"
+    for session in receiver_sessions:
+        result = session.wait_complete(blocking=True)
+        assert result == WaitResult.COMPLETED, f"rx wait_complete returned {result}"
+
+    _verify_and_cleanup_chunked(setup, ctx_info, sender_sessions, receiver_sessions)
+
+
+CHUNKED_TEST_CONFIGS = [
+    (1, 1, False, 1, 1, False, False, True, "v2_tp1_pp1_chunked"),
+    (1, 1, False, 1, 1, False, False, False, "v1_tp1_pp1_chunked"),
+]
+
+
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize(
+    "ctx_tp,ctx_pp,ctx_enable_dp,gen_tp,gen_pp,gen_enable_dp,is_mla,use_v2",
+    [(c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]) for c in CHUNKED_TEST_CONFIGS],
+    ids=[c[8] for c in CHUNKED_TEST_CONFIGS],
+)
+def test_transfer_worker_chunked(
+    ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_enable_dp, is_mla, use_v2
+):
+    """Test transfer worker with sender-side chunking for V1 and V2."""
+    tensorrt_llm.logger.set_level("info")
+    logger.info(f"Test transfer worker {'V2' if use_v2 else 'V1'} with chunked transfer")
+
+    setup = create_transfer_worker_setup(
+        ctx_tp=ctx_tp,
+        ctx_pp=ctx_pp,
+        ctx_enable_dp=ctx_enable_dp,
+        gen_tp=gen_tp,
+        gen_pp=gen_pp,
+        gen_enable_dp=gen_enable_dp,
+        is_mla=is_mla,
+        use_v2=use_v2,
+    )
+
+    request_len = setup["request_len"]
+    tokens_per_block = setup["tokens_per_block"]
+    total_blocks = (request_len + tokens_per_block - 1) // tokens_per_block
+    chunk_size = max(1, total_blocks // 2)
+
+    try:
+        add_and_verify_chunked_request(setup, 0, 1, request_len, transfer_chunk_size=chunk_size)
+        add_and_verify_chunked_request(setup, 2, 3, request_len * 2, transfer_chunk_size=chunk_size)
+    finally:
+        for worker in setup["ctx_transfer_workers"]:
+            worker.shutdown()
         for worker in setup["gen_transfer_workers"]:
             worker.shutdown()
 
