@@ -121,6 +121,27 @@ def shared_llm_4gpu(shared_mpi_session_4gpu):
             shared_mpi_session_4gpu.submit_sync(_clear_worker_weight_cache)
 
 
+@pytest.fixture(scope="module")
+def shared_mpi_session_8gpu(hf_weight_cache):
+    # See shared_mpi_session_4gpu for why hf_weight_cache must be set up before
+    # the pool spawns.
+    assert os.environ.get("TRTLLM_HF_WEIGHT_CACHE") == "1", (
+        "hf_weight_cache must be set up before the shared MPI pool spawns so "
+        "the workers inherit TRTLLM_HF_WEIGHT_CACHE at spawn time.")
+    yield from _shared_mpi_session(8)
+
+
+@pytest.fixture(scope="module")
+def shared_llm_8gpu(shared_mpi_session_8gpu):
+    try:
+        yield _make_shared_llm(shared_mpi_session_8gpu)
+    finally:
+        # See shared_llm_4gpu for why the worker weight cache is invalidated
+        # here rather than on worker process exit.
+        if shared_mpi_session_8gpu is not None:
+            shared_mpi_session_8gpu.submit_sync(_clear_worker_weight_cache)
+
+
 def _get_default_torch_compile_config(torch_compile):
     return TorchCompileConfig(enable_fullgraph=True,
                               enable_piecewise_cuda_graph=True,
@@ -915,88 +936,161 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     @parametrize_with_ids("torch_compile", [False, True])
     def test_fp8_tp4(self, torch_compile):
+        self._run_fp8_tp4_case(torch_compile=torch_compile)
+
+    @pytest.mark.skip_less_device(4)
+    @skip_pre_hopper
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize("case", [
+        dict(torch_compile=False),
+        dict(torch_compile=True),
+    ],
+                             ids=["compile_off", "compile_on"])
+    def test_fp8_tp4_premerge_grouped(self, case, shared_llm_4gpu):
+        # Shares the module-scoped 4-GPU MPI session; the FP8 checkpoint is a
+        # separate weight-cache entry from the FP4 one used by the nvfp4
+        # grouped tests, so keep same-checkpoint cases adjacent in the test-db
+        # yml (weight-cache LRU max_entries=1).
+        self._run_fp8_tp4_case(make_llm=shared_llm_4gpu, **case)
+
+    def _run_fp8_tp4_case(self, *, torch_compile, make_llm=LLM):
         model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct-FP8"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
-        with LLM(model_path,
-                 tensor_parallel_size=4,
-                 max_seq_len=8192,
-                 max_batch_size=32,
-                 kv_cache_config=kv_cache_config,
-                 torch_compile_config=torch_compile_config) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
-            sampling_params = SamplingParams(
-                max_tokens=256,
-                temperature=0.0,
-                add_special_tokens=False,
-            )
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=sampling_params)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=sampling_params)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
+        try:
+            with make_llm(model_path,
+                          tensor_parallel_size=4,
+                          max_seq_len=8192,
+                          max_batch_size=32,
+                          kv_cache_config=kv_cache_config,
+                          torch_compile_config=torch_compile_config) as llm:
+                assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+                sampling_params = SamplingParams(
+                    max_tokens=256,
+                    temperature=0.0,
+                    add_special_tokens=False,
+                )
+                task = MMLU(self.MODEL_NAME)
+                task.evaluate(llm, sampling_params=sampling_params)
+                task = GSM8K(self.MODEL_NAME)
+                task.evaluate(llm, sampling_params=sampling_params)
+                task = GPQADiamond(self.MODEL_NAME)
+                task.evaluate(
+                    llm, extra_evaluator_kwargs=dict(apply_chat_template=True))
+        finally:
+            # On a reused MPI session, reset each worker's torch.compile/Dynamo
+            # state so recompile counts don't accumulate across cases and trip
+            # the fullgraph recompile limit (FailOnRecompileLimitHit).
+            _reset_shared_session_torch_compile_state(make_llm)
 
     @pytest.mark.skip_less_device(4)
     @skip_pre_blackwell
     @parametrize_with_ids("torch_compile", [False, True])
     def test_nvfp4_tp4(self, torch_compile):
+        self._run_nvfp4_tp4_case(torch_compile=torch_compile)
+
+    @pytest.mark.skip_less_device(4)
+    @skip_pre_blackwell
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize("case", [
+        dict(torch_compile=False),
+        dict(torch_compile=True),
+    ],
+                             ids=["compile_off", "compile_on"])
+    def test_nvfp4_tp4_premerge_grouped(self, case, shared_llm_4gpu):
+        # Shares the 4-GPU session and the FP4 weight-cache entry with
+        # test_fp4_tp2pp2_premerge_grouped (same checkpoint).
+        self._run_nvfp4_tp4_case(make_llm=shared_llm_4gpu, **case)
+
+    def _run_nvfp4_tp4_case(self, *, torch_compile, make_llm=LLM):
         model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct-FP4"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
-        with LLM(model_path,
-                 tensor_parallel_size=4,
-                 max_batch_size=32,
-                 kv_cache_config=kv_cache_config,
-                 torch_compile_config=torch_compile_config) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-            sampling_params = SamplingParams(
-                max_tokens=256,
-                temperature=0.0,
-                add_special_tokens=False,
-            )
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=sampling_params)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=sampling_params)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
+        try:
+            with make_llm(model_path,
+                          tensor_parallel_size=4,
+                          max_batch_size=32,
+                          kv_cache_config=kv_cache_config,
+                          torch_compile_config=torch_compile_config) as llm:
+                assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+                sampling_params = SamplingParams(
+                    max_tokens=256,
+                    temperature=0.0,
+                    add_special_tokens=False,
+                )
+                task = MMLU(self.MODEL_NAME)
+                task.evaluate(llm, sampling_params=sampling_params)
+                task = GSM8K(self.MODEL_NAME)
+                task.evaluate(llm, sampling_params=sampling_params)
+                task = GPQADiamond(self.MODEL_NAME)
+                task.evaluate(
+                    llm, extra_evaluator_kwargs=dict(apply_chat_template=True))
+        finally:
+            # See _run_fp8_tp4_case for why torch.compile state is reset.
+            _reset_shared_session_torch_compile_state(make_llm)
 
     @pytest.mark.skip_less_device(4)
     @skip_pre_blackwell
     @parametrize_with_ids("enable_gemm_allreduce_fusion", [False, True])
     @parametrize_with_ids("torch_compile", [False, True])
     def test_fp4_tp2pp2(self, enable_gemm_allreduce_fusion, torch_compile):
+        self._run_fp4_tp2pp2_case(
+            enable_gemm_allreduce_fusion=enable_gemm_allreduce_fusion,
+            torch_compile=torch_compile)
+
+    @pytest.mark.skip_less_device(4)
+    @skip_pre_blackwell
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize(
+        "case", [dict(enable_gemm_allreduce_fusion=False, torch_compile=True)],
+        ids=["fusion_off_compile_on"])
+    def test_fp4_tp2pp2_premerge_grouped(self, case, shared_llm_4gpu):
+        # Only the fusion=False case may run on a shared session: the shared
+        # pool snapshots TRTLLM* env at spawn, so the mock.patch.dict in the
+        # runner never reaches the workers. That is only correct when the
+        # requested value equals the workers' default (fusion is opt-in,
+        # default "0" — see tensorrt_llm/_torch/modules/linear.py). A
+        # fusion=True case must stay on the non-grouped test.
+        assert case["enable_gemm_allreduce_fusion"] is False
+        self._run_fp4_tp2pp2_case(make_llm=shared_llm_4gpu, **case)
+
+    def _run_fp4_tp2pp2_case(self,
+                             *,
+                             enable_gemm_allreduce_fusion,
+                             torch_compile,
+                             make_llm=LLM):
         model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct-FP4"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
 
-        with (mock.patch.dict(
-                os.environ, {
-                    "TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED":
-                    str(int(enable_gemm_allreduce_fusion))
-                }),
-              LLM(model_path,
-                  tensor_parallel_size=2,
-                  pipeline_parallel_size=2,
-                  max_batch_size=32,
-                  kv_cache_config=kv_cache_config,
-                  torch_compile_config=torch_compile_config) as llm):
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-            sampling_params = SamplingParams(
-                max_tokens=256,
-                temperature=0.0,
-                add_special_tokens=False,
-            )
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=sampling_params)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=sampling_params)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
+        try:
+            with (mock.patch.dict(
+                    os.environ, {
+                        "TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED":
+                        str(int(enable_gemm_allreduce_fusion))
+                    }),
+                  make_llm(model_path,
+                           tensor_parallel_size=2,
+                           pipeline_parallel_size=2,
+                           max_batch_size=32,
+                           kv_cache_config=kv_cache_config,
+                           torch_compile_config=torch_compile_config) as llm):
+                assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+                sampling_params = SamplingParams(
+                    max_tokens=256,
+                    temperature=0.0,
+                    add_special_tokens=False,
+                )
+                task = MMLU(self.MODEL_NAME)
+                task.evaluate(llm, sampling_params=sampling_params)
+                task = GSM8K(self.MODEL_NAME)
+                task.evaluate(llm, sampling_params=sampling_params)
+                task = GPQADiamond(self.MODEL_NAME)
+                task.evaluate(
+                    llm, extra_evaluator_kwargs=dict(apply_chat_template=True))
+        finally:
+            # See _run_fp8_tp4_case for why torch.compile state is reset.
+            _reset_shared_session_torch_compile_state(make_llm)
 
 
 class TestMinistral8BInstruct(LlmapiAccuracyTestHarness):
@@ -1443,6 +1537,58 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
              cuda_graph=True,
              overlap_scheduler=True) for row in _BF16_4GPU_PREMERGE_MATRIX)
 
+    # fp8 (block scales) pre-merge cases (l0_dgx_h100) sharing the same 4-GPU
+    # session; the fp8 checkpoint is a separate weight-cache entry. Defaults per
+    # id: fp8kv/attention_dp on ("nofp8kv"/"adp_off" mark exceptions),
+    # sampler_async_worker off ("async_sampler" marks it on). cuda_graph /
+    # overlap_scheduler are True for every case.
+    # (id, tp_size, pp_size, ep_size, mtp_nextn, fp8kv, attention_dp,
+    #  torch_compile, sampler_async_worker).
+    _FP8_BLOCK_SCALES_4GPU_PREMERGE_MATRIX = (
+        ("tp4_mtp0_compile_off", 4, 1, 1, 0, True, True, False, False),
+        ("ep4_mtp0_compile_off", 4, 1, 4, 0, True, True, False, False),
+        ("ep4_mtp2_compile_off", 4, 1, 4, 2, True, True, False, False),
+        ("tp2pp2_mtp0_compile_off", 2, 2, 1, 0, True, True, False, False),
+        ("pp4_mtp0_nofp8kv_compile_off", 1, 4, 1, 0, False, True, False, False),
+        ("tp4_mtp0_adp_off_compile_on", 4, 1, 1, 0, True, False, True, False),
+        ("tp4_mtp0_compile_on", 4, 1, 1, 0, True, True, True, False),
+        ("pp4_mtp0_adp_off_compile_on", 1, 4, 1, 0, True, False, True, False),
+        ("tp2pp2_mtp0_adp_off_compile_on", 2, 2, 1, 0, True, False, True,
+         False),
+        ("tp2pp2_mtp0_compile_on", 2, 2, 1, 0, True, True, True, False),
+        ("tp4_mtp2_adp_off_compile_on", 4, 1, 1, 2, True, False, True, False),
+        # sampler_async_worker spawns an extra per-worker sampler thread; keep
+        # these cases last so a leak surfaces at the end of the group.
+        ("tp4_mtp0_compile_off_async_sampler", 4, 1, 1, 0, True, True, False,
+         True),
+        ("ep4_mtp2_compile_off_async_sampler", 4, 1, 4, 2, True, True, False,
+         True),
+        ("tp4_mtp0_compile_on_async_sampler", 4, 1, 1, 0, True, True, True,
+         True),
+    )
+    _FP8_BLOCK_SCALES_4GPU_PREMERGE_CASES = tuple(
+        dict(tp_size=row[1],
+             pp_size=row[2],
+             ep_size=row[3],
+             mtp_nextn=row[4],
+             fp8kv=row[5],
+             attention_dp=row[6],
+             torch_compile=row[7],
+             sampler_async_worker=row[8],
+             cuda_graph=True,
+             overlap_scheduler=True)
+        for row in _FP8_BLOCK_SCALES_4GPU_PREMERGE_MATRIX)
+
+    # cuda-graph-padding pre-merge cases (l0_dgx_h100): (id, mtp_nextn);
+    # attention_dp is True for both.
+    _FP8_BLOCK_SCALES_CUDA_GRAPH_PADDING_4GPU_PREMERGE_MATRIX = (
+        ("adp_mtp0", 0),
+        ("adp_mtp2", 2),
+    )
+    _FP8_BLOCK_SCALES_CUDA_GRAPH_PADDING_4GPU_PREMERGE_CASES = tuple(
+        dict(mtp_nextn=row[1], attention_dp=True)
+        for row in _FP8_BLOCK_SCALES_CUDA_GRAPH_PADDING_4GPU_PREMERGE_MATRIX)
+
     @pytest.mark.skip_less_device_memory(60000)
     @parametrize_with_ids("v2_kv_cache", [True, False])
     # Chunked Prefill for MLA can only be enabled on SM100
@@ -1860,6 +2006,29 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("attention_dp", [False, True])
     def test_fp8_block_scales_cuda_graph_padding_4gpus(self, mtp_nextn,
                                                        attention_dp):
+        self._run_fp8_block_scales_cuda_graph_padding_4gpus_case(
+            mtp_nextn=mtp_nextn, attention_dp=attention_dp)
+
+    @pytest.mark.skip_less_device(4)
+    @skip_pre_hopper
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize(
+        "case",
+        _FP8_BLOCK_SCALES_CUDA_GRAPH_PADDING_4GPU_PREMERGE_CASES,
+        ids=[
+            row[0]
+            for row in _FP8_BLOCK_SCALES_CUDA_GRAPH_PADDING_4GPU_PREMERGE_MATRIX
+        ],
+    )
+    def test_fp8_block_scales_cuda_graph_padding_4gpus_premerge_grouped(
+            self, case, shared_llm_4gpu):
+        # Shares the 4-GPU session and the fp8 weight-cache entry with
+        # test_fp8_block_scales_4gpus_premerge_grouped.
+        self._run_fp8_block_scales_cuda_graph_padding_4gpus_case(
+            make_llm=shared_llm_4gpu, **case)
+
+    def _run_fp8_block_scales_cuda_graph_padding_4gpus_case(
+            self, *, mtp_nextn, attention_dp, make_llm=LLM):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         mtp_config = None
         if mtp_nextn > 0:
@@ -1871,12 +2040,12 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 backend="DEEPGEMM" if get_sm_version() >= 100 else "CUTLASS"),
         )
 
-        with LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
-                 tensor_parallel_size=4,
-                 kv_cache_config=kv_cache_config,
-                 **pytorch_config,
-                 enable_attention_dp=attention_dp,
-                 speculative_config=mtp_config) as llm:
+        with make_llm(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
+                      tensor_parallel_size=4,
+                      kv_cache_config=kv_cache_config,
+                      **pytorch_config,
+                      enable_attention_dp=attention_dp,
+                      speculative_config=mtp_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
@@ -1902,6 +2071,47 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                     fp8kv, attention_dp, cuda_graph,
                                     overlap_scheduler, torch_compile,
                                     sampler_async_worker):
+        self._run_fp8_block_scales_4gpus_case(
+            tp_size=tp_size,
+            pp_size=pp_size,
+            ep_size=ep_size,
+            mtp_nextn=mtp_nextn,
+            fp8kv=fp8kv,
+            attention_dp=attention_dp,
+            cuda_graph=cuda_graph,
+            overlap_scheduler=overlap_scheduler,
+            torch_compile=torch_compile,
+            sampler_async_worker=sampler_async_worker)
+
+    @pytest.mark.skip_less_device(4)
+    @skip_pre_hopper
+    @skip_ray
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize(
+        "case",
+        _FP8_BLOCK_SCALES_4GPU_PREMERGE_CASES,
+        ids=[row[0] for row in _FP8_BLOCK_SCALES_4GPU_PREMERGE_MATRIX],
+    )
+    def test_fp8_block_scales_4gpus_premerge_grouped(self, case,
+                                                     shared_llm_4gpu):
+        # Same 4-GPU shared MPI session as the other DeepSeek-V3-Lite grouped
+        # tests; the fp8 checkpoint gets its own weight-cache entry keyed by
+        # file fingerprints (see shared_mpi_session_4gpu for details).
+        self._run_fp8_block_scales_4gpus_case(make_llm=shared_llm_4gpu, **case)
+
+    def _run_fp8_block_scales_4gpus_case(self,
+                                         *,
+                                         tp_size,
+                                         pp_size,
+                                         ep_size,
+                                         mtp_nextn,
+                                         fp8kv,
+                                         attention_dp,
+                                         cuda_graph,
+                                         overlap_scheduler,
+                                         torch_compile,
+                                         sampler_async_worker,
+                                         make_llm=LLM):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
         pytorch_config = dict(
@@ -1920,19 +2130,25 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
 
-        with LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
-                 tensor_parallel_size=tp_size,
-                 pipeline_parallel_size=pp_size,
-                 moe_expert_parallel_size=ep_size,
-                 kv_cache_config=kv_cache_config,
-                 **pytorch_config,
-                 enable_attention_dp=attention_dp,
-                 speculative_config=mtp_config) as llm:
+        try:
+            with make_llm(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
+                          tensor_parallel_size=tp_size,
+                          pipeline_parallel_size=pp_size,
+                          moe_expert_parallel_size=ep_size,
+                          kv_cache_config=kv_cache_config,
+                          **pytorch_config,
+                          enable_attention_dp=attention_dp,
+                          speculative_config=mtp_config) as llm:
 
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+                assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
 
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+                task = GSM8K(self.MODEL_NAME)
+                task.evaluate(llm)
+        finally:
+            # On a reused MPI session, reset each worker's torch.compile/Dynamo
+            # state so recompile counts don't accumulate across cases and trip
+            # the fullgraph recompile limit (FailOnRecompileLimitHit).
+            _reset_shared_session_torch_compile_state(make_llm)
 
     @pytest.mark.skip_less_device(4)
     @skip_pre_blackwell
@@ -3373,6 +3589,52 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                                                    attention_dp, max_batch_size,
                                                    moe_backend, fp8kv,
                                                    chunked_prefill):
+        self._run_nvfp4_multi_gpus_piecewise_cuda_graph_case(
+            tp_size=tp_size,
+            pp_size=pp_size,
+            ep_size=ep_size,
+            mtp_nextn=mtp_nextn,
+            attention_dp=attention_dp,
+            max_batch_size=max_batch_size,
+            moe_backend=moe_backend,
+            fp8kv=fp8kv,
+            chunked_prefill=chunked_prefill)
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @skip_pre_blackwell
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize("case", [
+        dict(tp_size=8,
+             pp_size=1,
+             ep_size=8,
+             mtp_nextn=0,
+             attention_dp=True,
+             max_batch_size=24,
+             moe_backend="CUTLASS",
+             fp8kv=False,
+             chunked_prefill=False),
+    ],
+                             ids=["baseline"])
+    def test_nvfp4_multi_gpus_piecewise_cuda_graph_premerge_grouped(
+            self, case, shared_llm_8gpu):
+        # Shares the 8-GPU session and the FP4-v2 weight-cache entry with
+        # test_nvfp4_multi_gpus_premerge_grouped. The mtp3_fp8kv_chunked case
+        # is waived on the non-grouped test and must not move here.
+        self._run_nvfp4_multi_gpus_piecewise_cuda_graph_case(
+            make_llm=shared_llm_8gpu, **case)
+
+    def _run_nvfp4_multi_gpus_piecewise_cuda_graph_case(self,
+                                                        *,
+                                                        tp_size,
+                                                        pp_size,
+                                                        ep_size,
+                                                        mtp_nextn,
+                                                        attention_dp,
+                                                        max_batch_size,
+                                                        moe_backend,
+                                                        fp8kv,
+                                                        chunked_prefill,
+                                                        make_llm=LLM):
         sm_version = get_sm_version()
         if moe_backend == "TRTLLM" and sm_version in (120, 121):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
@@ -3418,13 +3680,19 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                 max_num_tokens=8192,
             )
 
-        with LLM(f"{llm_models_root()}/DeepSeek-V3.2-Exp-FP4-v2",
-                 **pytorch_config, **llm_kwargs) as llm:
+        try:
+            with make_llm(f"{llm_models_root()}/DeepSeek-V3.2-Exp-FP4-v2",
+                          **pytorch_config, **llm_kwargs) as llm:
 
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+                task = MMLU(self.MODEL_NAME)
+                task.evaluate(llm)
+                task = GSM8K(self.MODEL_NAME)
+                task.evaluate(llm)
+        finally:
+            # Piecewise CUDA graphs go through torch.compile; on a reused MPI
+            # session reset each worker's Dynamo state so recompile counts
+            # don't accumulate across cases (FailOnRecompileLimitHit).
+            _reset_shared_session_torch_compile_state(make_llm)
 
     @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_blackwell
@@ -3470,6 +3738,66 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                               attention_dp, cuda_graph, overlap_scheduler,
                               max_batch_size, moe_backend, disable_skip_indexer,
                               indexer_k_fp4, use_cute_dsl):
+        self._run_nvfp4_multi_gpus_case(
+            tp_size=tp_size,
+            pp_size=pp_size,
+            ep_size=ep_size,
+            mtp_nextn=mtp_nextn,
+            fp8kv=fp8kv,
+            attention_dp=attention_dp,
+            cuda_graph=cuda_graph,
+            overlap_scheduler=overlap_scheduler,
+            max_batch_size=max_batch_size,
+            moe_backend=moe_backend,
+            disable_skip_indexer=disable_skip_indexer,
+            indexer_k_fp4=indexer_k_fp4,
+            use_cute_dsl=use_cute_dsl)
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @skip_pre_blackwell
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize("case", [
+        dict(mtp_nextn=0),
+        dict(mtp_nextn=1),
+    ],
+                             ids=["baseline", "baseline_mtp1"])
+    def test_nvfp4_multi_gpus_premerge_grouped(self, case, shared_llm_8gpu):
+        # Shares the module-scoped 8-GPU MPI session and one
+        # DeepSeek-V3.2-Exp-FP4-v2 weight-cache entry (also reused by
+        # test_nvfp4_multi_gpus_piecewise_cuda_graph_premerge_grouped). Only
+        # non-waived pre-merge baselines live here; other test_nvfp4_multi_gpus
+        # cases stay on the non-grouped test.
+        self._run_nvfp4_multi_gpus_case(make_llm=shared_llm_8gpu,
+                                        tp_size=8,
+                                        pp_size=1,
+                                        ep_size=8,
+                                        fp8kv=False,
+                                        attention_dp=True,
+                                        cuda_graph=True,
+                                        overlap_scheduler=True,
+                                        max_batch_size=24,
+                                        moe_backend="CUTLASS",
+                                        disable_skip_indexer=False,
+                                        indexer_k_fp4=False,
+                                        use_cute_dsl=False,
+                                        **case)
+
+    def _run_nvfp4_multi_gpus_case(self,
+                                   *,
+                                   tp_size,
+                                   pp_size,
+                                   ep_size,
+                                   mtp_nextn,
+                                   fp8kv,
+                                   attention_dp,
+                                   cuda_graph,
+                                   overlap_scheduler,
+                                   max_batch_size,
+                                   moe_backend,
+                                   disable_skip_indexer,
+                                   indexer_k_fp4,
+                                   use_cute_dsl,
+                                   make_llm=LLM):
         sm_version = get_sm_version()
         if moe_backend == "TRTLLM" and sm_version in (120, 121):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
@@ -3513,16 +3841,16 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
         mtp_config = None
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
-        with LLM(f"{llm_models_root()}/DeepSeek-V3.2-Exp-FP4-v2",
-                 max_batch_size=max_batch_size,
-                 tensor_parallel_size=tp_size,
-                 pipeline_parallel_size=pp_size,
-                 moe_expert_parallel_size=ep_size,
-                 kv_cache_config=kv_cache_config,
-                 **pytorch_config,
-                 enable_attention_dp=attention_dp,
-                 speculative_config=mtp_config,
-                 sparse_attention_config=dsa_config) as llm:
+        with make_llm(f"{llm_models_root()}/DeepSeek-V3.2-Exp-FP4-v2",
+                      max_batch_size=max_batch_size,
+                      tensor_parallel_size=tp_size,
+                      pipeline_parallel_size=pp_size,
+                      moe_expert_parallel_size=ep_size,
+                      kv_cache_config=kv_cache_config,
+                      **pytorch_config,
+                      enable_attention_dp=attention_dp,
+                      speculative_config=mtp_config,
+                      sparse_attention_config=dsa_config) as llm:
 
             # GPQA Diamond takes too long to run, we enable it only for fp8kv.
             if fp8kv:
@@ -4876,6 +5204,138 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         get_sm_version() not in (100, 103),
         reason="TRTLLM Gen MoE supports SM100 and SM103 only")
 
+    # Pre-merge w4_4gpus cases grouped onto the shared 4-GPU MPI session; the
+    # union across platforms (Hopper: TRITON/CUTLASS; Blackwell: TRTLLM) —
+    # per-platform test-db ymls select their own ids. Layouts: tp4=(4,1,1),
+    # ep4/dp4=(4,1,4) with dp4 enabling attention_dp; cuda_graph /
+    # overlap_scheduler are True for every case. Cases waived on test_w4_4gpus
+    # are deliberately absent (a new test id would un-waive them).
+    _W4_4GPU_PREMERGE_CASES = [
+        # (v2_kv_cache, kv_cache_reuse, kv_cache_dtype, moe_backend,
+        #  tp_size, pp_size, ep_size, attention_dp)
+        pytest.param(dict(v2_kv_cache=False,
+                          kv_cache_reuse=True,
+                          kv_cache_dtype="auto",
+                          moe_backend="TRITON",
+                          tp_size=4,
+                          pp_size=1,
+                          ep_size=1,
+                          attention_dp=False,
+                          cuda_graph=True,
+                          overlap_scheduler=True),
+                     id="v1_tp4_triton_auto",
+                     marks=[skip_no_hopper, skip_no_mxfp4_swizzle]),
+        pytest.param(dict(v2_kv_cache=False,
+                          kv_cache_reuse=True,
+                          kv_cache_dtype="auto",
+                          moe_backend="TRITON",
+                          tp_size=4,
+                          pp_size=1,
+                          ep_size=4,
+                          attention_dp=False,
+                          cuda_graph=True,
+                          overlap_scheduler=True),
+                     id="v1_ep4_triton_auto",
+                     marks=[skip_no_hopper, skip_no_mxfp4_swizzle]),
+        pytest.param(dict(v2_kv_cache=False,
+                          kv_cache_reuse=True,
+                          kv_cache_dtype="auto",
+                          moe_backend="TRITON",
+                          tp_size=4,
+                          pp_size=1,
+                          ep_size=4,
+                          attention_dp=True,
+                          cuda_graph=True,
+                          overlap_scheduler=True),
+                     id="v1_dp4_triton_auto",
+                     marks=[skip_no_hopper, skip_no_mxfp4_swizzle]),
+        pytest.param(dict(v2_kv_cache=True,
+                          kv_cache_reuse=True,
+                          kv_cache_dtype="auto",
+                          moe_backend="TRITON",
+                          tp_size=4,
+                          pp_size=1,
+                          ep_size=4,
+                          attention_dp=False,
+                          cuda_graph=True,
+                          overlap_scheduler=True),
+                     id="v2_ep4_triton_auto",
+                     marks=[skip_no_hopper, skip_no_mxfp4_swizzle]),
+        pytest.param(dict(v2_kv_cache=True,
+                          kv_cache_reuse=True,
+                          kv_cache_dtype="auto",
+                          moe_backend="TRITON",
+                          tp_size=4,
+                          pp_size=1,
+                          ep_size=4,
+                          attention_dp=True,
+                          cuda_graph=True,
+                          overlap_scheduler=True),
+                     id="v2_dp4_triton_auto",
+                     marks=[skip_no_hopper, skip_no_mxfp4_swizzle]),
+        pytest.param(dict(v2_kv_cache=True,
+                          kv_cache_reuse=False,
+                          kv_cache_dtype="auto",
+                          moe_backend="CUTLASS",
+                          tp_size=4,
+                          pp_size=1,
+                          ep_size=1,
+                          attention_dp=False,
+                          cuda_graph=True,
+                          overlap_scheduler=True),
+                     id="v2_no_reuse_tp4_cutlass_auto"),
+        pytest.param(dict(v2_kv_cache=False,
+                          kv_cache_reuse=True,
+                          kv_cache_dtype="auto",
+                          moe_backend="TRTLLM",
+                          tp_size=4,
+                          pp_size=1,
+                          ep_size=1,
+                          attention_dp=False,
+                          cuda_graph=True,
+                          overlap_scheduler=True),
+                     id="v1_tp4_trtllm_auto",
+                     marks=[skip_no_trtllm_gen_moe_support]),
+        pytest.param(dict(v2_kv_cache=True,
+                          kv_cache_reuse=True,
+                          kv_cache_dtype="auto",
+                          moe_backend="TRTLLM",
+                          tp_size=4,
+                          pp_size=1,
+                          ep_size=1,
+                          attention_dp=False,
+                          cuda_graph=True,
+                          overlap_scheduler=True),
+                     id="v2_tp4_trtllm_auto",
+                     marks=[skip_no_trtllm_gen_moe_support]),
+        pytest.param(dict(v2_kv_cache=False,
+                          kv_cache_reuse=True,
+                          kv_cache_dtype="fp8",
+                          moe_backend="TRTLLM",
+                          tp_size=4,
+                          pp_size=1,
+                          ep_size=4,
+                          attention_dp=True,
+                          cuda_graph=True,
+                          overlap_scheduler=True),
+                     id="v1_dp4_trtllm_fp8",
+                     marks=[skip_no_trtllm_gen_moe_support,
+                            skip_pre_blackwell]),
+        pytest.param(dict(v2_kv_cache=True,
+                          kv_cache_reuse=True,
+                          kv_cache_dtype="fp8",
+                          moe_backend="TRTLLM",
+                          tp_size=4,
+                          pp_size=1,
+                          ep_size=4,
+                          attention_dp=True,
+                          cuda_graph=True,
+                          overlap_scheduler=True),
+                     id="v2_dp4_trtllm_fp8",
+                     marks=[skip_no_trtllm_gen_moe_support,
+                            skip_pre_blackwell]),
+    ]
+
     @pytest.mark.parametrize(
         "kv_cache_dtype",
         ["auto", pytest.param("fp8", marks=skip_pre_blackwell)])
@@ -5019,6 +5479,44 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     def test_w4_4gpus(self, v2_kv_cache, kv_cache_reuse, kv_cache_dtype,
                       moe_backend, tp_size, pp_size, ep_size, attention_dp,
                       cuda_graph, overlap_scheduler, mocker):
+        self._run_w4_4gpus_case(v2_kv_cache=v2_kv_cache,
+                                kv_cache_reuse=kv_cache_reuse,
+                                kv_cache_dtype=kv_cache_dtype,
+                                moe_backend=moe_backend,
+                                tp_size=tp_size,
+                                pp_size=pp_size,
+                                ep_size=ep_size,
+                                attention_dp=attention_dp,
+                                cuda_graph=cuda_graph,
+                                overlap_scheduler=overlap_scheduler,
+                                mocker=mocker)
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize("case", _W4_4GPU_PREMERGE_CASES)
+    def test_w4_4gpus_premerge_grouped(self, case, shared_llm_4gpu, mocker):
+        # Union matrix across platforms; each platform's test-db yml lists only
+        # its own case ids. All cases share the module-scoped 4-GPU MPI session
+        # and one gpt-oss-120b weight-cache entry. Cases currently waived on
+        # test_w4_4gpus (waives.txt) are intentionally NOT in this matrix:
+        # moving a waived case to a new (grouped) test id would silently
+        # un-waive it.
+        self._run_w4_4gpus_case(make_llm=shared_llm_4gpu, mocker=mocker, **case)
+
+    def _run_w4_4gpus_case(self,
+                           *,
+                           v2_kv_cache,
+                           kv_cache_reuse,
+                           kv_cache_dtype,
+                           moe_backend,
+                           tp_size,
+                           pp_size,
+                           ep_size,
+                           attention_dp,
+                           cuda_graph,
+                           overlap_scheduler,
+                           mocker,
+                           make_llm=LLM):
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
 
@@ -5040,15 +5538,15 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                                         use_kv_cache_manager_v2=v2_kv_cache)
 
         max_seq_len = MAX_INPUT_LEN + MAX_OUTPUT_LEN
-        llm = LLM(self.MODEL_PATH,
-                  tensor_parallel_size=tp_size,
-                  pipeline_parallel_size=pp_size,
-                  moe_expert_parallel_size=ep_size,
-                  kv_cache_config=kv_cache_config,
-                  max_seq_len=max_seq_len,
-                  max_batch_size=720,
-                  **pytorch_config,
-                  enable_attention_dp=attention_dp)
+        llm = make_llm(self.MODEL_PATH,
+                       tensor_parallel_size=tp_size,
+                       pipeline_parallel_size=pp_size,
+                       moe_expert_parallel_size=ep_size,
+                       kv_cache_config=kv_cache_config,
+                       max_seq_len=max_seq_len,
+                       max_batch_size=720,
+                       **pytorch_config,
+                       enable_attention_dp=attention_dp)
 
         with llm:
             model_name = "GPT-OSS/120B-MXFP4"
@@ -6725,6 +7223,48 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     def test_nvfp4_4gpus_block_reuse(self, tp_size, ep_size,
                                      mamba_state_cache_interval, attention_dp,
                                      use_mtp):
+        self._run_nvfp4_4gpus_block_reuse_case(
+            tp_size=tp_size,
+            ep_size=ep_size,
+            mamba_state_cache_interval=mamba_state_cache_interval,
+            attention_dp=attention_dp,
+            use_mtp=use_mtp)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize("case", [
+        dict(tp_size=4,
+             ep_size=4,
+             mamba_state_cache_interval=256,
+             attention_dp=False,
+             use_mtp=False),
+        dict(tp_size=4,
+             ep_size=4,
+             mamba_state_cache_interval=256,
+             attention_dp=True,
+             use_mtp=False),
+        dict(tp_size=4,
+             ep_size=4,
+             mamba_state_cache_interval=512,
+             attention_dp=True,
+             use_mtp=True),
+    ],
+                             ids=["TEP4", "TEP4_ADP", "TEP4_ADP_MTP"])
+    def test_nvfp4_4gpus_block_reuse_premerge_grouped(self, case,
+                                                      shared_llm_4gpu):
+        # Shares the module-scoped 4-GPU MPI session; all cases reuse one
+        # Nemotron-3-Super NVFP4 weight-cache entry.
+        self._run_nvfp4_4gpus_block_reuse_case(make_llm=shared_llm_4gpu, **case)
+
+    def _run_nvfp4_4gpus_block_reuse_case(self,
+                                          *,
+                                          tp_size,
+                                          ep_size,
+                                          mamba_state_cache_interval,
+                                          attention_dp,
+                                          use_mtp,
+                                          make_llm=LLM):
         gpu_needed = max(tp_size, ep_size)
         if get_device_count() < gpu_needed:
             pytest.skip(
@@ -6734,7 +7274,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             num_nextn_predict_layers=3,
             mtp_eagle_one_model=True,
         )
-        with LLM(
+        with make_llm(
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
                 kv_cache_config=KvCacheConfig(
                     enable_block_reuse=True,
@@ -7221,12 +7761,44 @@ class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
     def test_nvfp4_4gpus_block_reuse(self, tp_size, ep_size,
                                      mamba_state_cache_interval, attention_dp,
                                      use_mtp):
+        self._run_nvfp4_4gpus_block_reuse_case(
+            tp_size=tp_size,
+            ep_size=ep_size,
+            mamba_state_cache_interval=mamba_state_cache_interval,
+            attention_dp=attention_dp,
+            use_mtp=use_mtp)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize("case", [
+        dict(tp_size=4,
+             ep_size=4,
+             mamba_state_cache_interval=512,
+             attention_dp=True,
+             use_mtp=True),
+    ],
+                             ids=["ADP4_MTP"])
+    def test_nvfp4_4gpus_block_reuse_premerge_grouped(self, case,
+                                                      shared_llm_4gpu):
+        # Shares the 4-GPU session and one Nemotron-3-Ultra NVFP4 weight-cache
+        # entry with the other Ultra premerge-grouped tests.
+        self._run_nvfp4_4gpus_block_reuse_case(make_llm=shared_llm_4gpu, **case)
+
+    def _run_nvfp4_4gpus_block_reuse_case(self,
+                                          *,
+                                          tp_size,
+                                          ep_size,
+                                          mamba_state_cache_interval,
+                                          attention_dp,
+                                          use_mtp,
+                                          make_llm=LLM):
         mtp_config = MTPDecodingConfig(
             num_nextn_predict_layers=3,
             mtp_eagle_one_model=True,
         )
         max_batch_size = 4 if attention_dp else 32
-        with LLM(
+        with make_llm(
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
                 kv_cache_config=KvCacheConfig(
                     enable_block_reuse=True,
@@ -7264,8 +7836,33 @@ class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
         ids=["TP2_PP2", "TEP2_PP2", "ADP2_PP2"],
     )
     def test_nvfp4_parallelism(self, tp_size, ep_size, pp_size, attention_dp):
+        self._run_nvfp4_parallelism_case(tp_size=tp_size,
+                                         ep_size=ep_size,
+                                         pp_size=pp_size,
+                                         attention_dp=attention_dp)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize("case", [
+        dict(tp_size=2, ep_size=2, pp_size=2, attention_dp=True),
+    ],
+                             ids=["ADP2_PP2"])
+    def test_nvfp4_parallelism_premerge_grouped(self, case, shared_llm_4gpu):
+        # tp2pp2 on the same 4-worker pool as the tp4/ep4 Ultra cases: the pool
+        # is sized by world_size (4), not layout; init_pp_comm reuses the world
+        # NCCL communicator across layout changes on reused workers.
+        self._run_nvfp4_parallelism_case(make_llm=shared_llm_4gpu, **case)
+
+    def _run_nvfp4_parallelism_case(self,
+                                    *,
+                                    tp_size,
+                                    ep_size,
+                                    pp_size,
+                                    attention_dp,
+                                    make_llm=LLM):
         max_batch_size = 8 if attention_dp else 32
-        with LLM(
+        with make_llm(
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
                 kv_cache_config=KvCacheConfig(
                     enable_block_reuse=False,
@@ -7293,6 +7890,19 @@ class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(80000)
     def test_nvfp4_4gpu_mtp_ar(self):
+        self._run_nvfp4_4gpu_mtp_ar_case()
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.threadleak(enabled=False)
+    def test_nvfp4_4gpu_mtp_ar_premerge_grouped(self, shared_llm_4gpu):
+        # Single case, but sharing the module-scoped session lets it reuse the
+        # pool spawn and the Ultra NVFP4 weight-cache entry populated by the
+        # other Ultra premerge-grouped tests.
+        self._run_nvfp4_4gpu_mtp_ar_case(make_llm=shared_llm_4gpu)
+
+    def _run_nvfp4_4gpu_mtp_ar_case(self, make_llm=LLM):
         max_draft_len = 7
         mtp_config = MTPDecodingConfig(
             max_draft_len=max_draft_len,
@@ -7317,8 +7927,8 @@ class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
             moe_config=MoeConfig(backend="CUTLASS"),
         )
 
-        with LLM(**llm_common_config,
-                 speculative_config=mtp_config) as llm_spec:
+        with make_llm(**llm_common_config,
+                      speculative_config=mtp_config) as llm_spec:
             raw_prompts = [
                 "The capital of France is",
                 "The president of the United States is",
