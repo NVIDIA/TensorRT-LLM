@@ -39,50 +39,60 @@ def shared_mpi_session_4gpu():
 
 @pytest.fixture(scope="module")
 def shared_llm_2gpu(shared_mpi_session_2gpu):
+    # Factory for tests that construct the LLM directly (see RPC tests below).
     return _make_shared_llm(shared_mpi_session_2gpu)
 
 
+@pytest.fixture(scope="module")
+def mpi_kwargs_2gpu(shared_mpi_session_2gpu):
+    # Ready-to-spread LLM kwargs that inject the shared 2-GPU session (or {} when
+    # MPI is disabled). Harness-based tests just spread this; they never touch the
+    # raw session object.
+    return _mpi_session_kwargs(shared_mpi_session_2gpu)
+
+
+@pytest.fixture(scope="module")
+def mpi_kwargs_4gpu(shared_mpi_session_4gpu):
+    return _mpi_session_kwargs(shared_mpi_session_4gpu)
+
+
 @pytest.mark.gpu2
-def test_llm_capture_request_error(shared_mpi_session_2gpu):
-    _test_llm_capture_request_error(
-        pytorch_backend=True,
-        tp_size=2,
-        **_mpi_session_kwargs(shared_mpi_session_2gpu))
+def test_llm_capture_request_error(mpi_kwargs_2gpu):
+    _test_llm_capture_request_error(pytorch_backend=True,
+                                    tp_size=2,
+                                    **mpi_kwargs_2gpu)
 
 
 @pytest.mark.gpu4
-def test_tinyllama_logits_processor_tp2pp2(shared_mpi_session_4gpu):
-    tinyllama_logits_processor_test_harness(
-        backend="pytorch",
-        tensor_parallel_size=2,
-        pipeline_parallel_size=2,
-        **_mpi_session_kwargs(shared_mpi_session_4gpu))
+def test_tinyllama_logits_processor_tp2pp2(mpi_kwargs_4gpu):
+    tinyllama_logits_processor_test_harness(backend="pytorch",
+                                            tensor_parallel_size=2,
+                                            pipeline_parallel_size=2,
+                                            **mpi_kwargs_4gpu)
 
 
 @pytest.mark.gpu2
 @pytest.mark.part0
 @pytest.mark.parametrize("tp_size, pp_size", [(1, 2), (2, 1)])
 def test_tinyllama_logits_processor_2gpu(tp_size: int, pp_size: int,
-                                         shared_mpi_session_2gpu):
-    tinyllama_logits_processor_test_harness(
-        backend="pytorch",
-        tensor_parallel_size=tp_size,
-        pipeline_parallel_size=pp_size,
-        **_mpi_session_kwargs(shared_mpi_session_2gpu))
+                                         mpi_kwargs_2gpu):
+    tinyllama_logits_processor_test_harness(backend="pytorch",
+                                            tensor_parallel_size=tp_size,
+                                            pipeline_parallel_size=pp_size,
+                                            **mpi_kwargs_2gpu)
 
 
 @pytest.mark.gpu2
-def test_llama_7b_lora_tp2(shared_mpi_session_2gpu):
-    llama_7b_lora_from_dir_test_harness(
-        tensor_parallel_size=2,
-        kv_cache_config=global_kv_cache_config,
-        **_mpi_session_kwargs(shared_mpi_session_2gpu))
+def test_llama_7b_lora_tp2(mpi_kwargs_2gpu):
+    llama_7b_lora_from_dir_test_harness(tensor_parallel_size=2,
+                                        kv_cache_config=global_kv_cache_config,
+                                        **mpi_kwargs_2gpu)
 
 
 @pytest.mark.gpu4
 @skip_ray  # https://nvbugs/5682551
 @test_lora_with_and_without_cuda_graph
-def test_llama_7b_multi_lora_tp4(cuda_graph_config, shared_mpi_session_4gpu):
+def test_llama_7b_multi_lora_tp4(cuda_graph_config, mpi_kwargs_4gpu):
     # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
     # (1) specify lora_target_modules, or
     # (2) provide a lora_dir to infer the lora_target_modules.
@@ -96,7 +106,7 @@ def test_llama_7b_multi_lora_tp4(cuda_graph_config, shared_mpi_session_4gpu):
         tensor_parallel_size=4,
         kv_cache_config=global_kv_cache_config,
         cuda_graph_config=cuda_graph_config,
-        **_mpi_session_kwargs(shared_mpi_session_4gpu))
+        **mpi_kwargs_4gpu)
 
 
 @skip_ray  # https://nvbugs/5727075
@@ -161,16 +171,15 @@ async def _run_llm_rpc_streaming_tp2(make_llm=LLM):
 def test_llm_return_logprobs_streaming_tp2(prompt_logprobs, logprobs,
                                            return_context_logits,
                                            return_generation_logits,
-                                           shared_mpi_session_2gpu):
-    llm_return_logprobs_test_harness(
-        prompt_logprobs,
-        logprobs,
-        return_context_logits,
-        return_generation_logits,
-        streaming=True,
-        backend="pytorch",
-        tp_size=2,
-        **_mpi_session_kwargs(shared_mpi_session_2gpu))
+                                           mpi_kwargs_2gpu):
+    llm_return_logprobs_test_harness(prompt_logprobs,
+                                     logprobs,
+                                     return_context_logits,
+                                     return_generation_logits,
+                                     streaming=True,
+                                     backend="pytorch",
+                                     tp_size=2,
+                                     **mpi_kwargs_2gpu)
 
 
 @skip_ray
@@ -183,7 +192,7 @@ def test_llm_return_logprobs_streaming_tp2(prompt_logprobs, logprobs,
     ],
 )
 def test_llm_get_stats_pp2(return_context_logits, enable_chunked_prefill,
-                           enable_iter_req_stats, shared_mpi_session_2gpu):
+                           enable_iter_req_stats, mpi_kwargs_2gpu):
     llm_get_stats_test_harness(
         tp_size=1,
         pp_size=2,
@@ -191,7 +200,7 @@ def test_llm_get_stats_pp2(return_context_logits, enable_chunked_prefill,
         pytorch_backend=True,
         enable_chunked_prefill=enable_chunked_prefill,
         enable_iter_req_stats=enable_iter_req_stats,
-        **_mpi_session_kwargs(shared_mpi_session_2gpu),
+        **mpi_kwargs_2gpu,
     )
 
 
@@ -205,7 +214,7 @@ def test_llm_get_stats_pp2(return_context_logits, enable_chunked_prefill,
     ],
 )
 def test_llm_get_stats_pp4(return_context_logits, enable_chunked_prefill,
-                           enable_iter_req_stats, shared_mpi_session_4gpu):
+                           enable_iter_req_stats, mpi_kwargs_4gpu):
     llm_get_stats_test_harness(
         tp_size=1,
         pp_size=4,
@@ -213,31 +222,29 @@ def test_llm_get_stats_pp4(return_context_logits, enable_chunked_prefill,
         pytorch_backend=True,
         enable_chunked_prefill=enable_chunked_prefill,
         enable_iter_req_stats=enable_iter_req_stats,
-        **_mpi_session_kwargs(shared_mpi_session_4gpu),
+        **mpi_kwargs_4gpu,
     )
 
 
 @skip_ray
 @pytest.mark.gpu2
-def test_llm_get_stats_tp2(shared_mpi_session_2gpu):
+def test_llm_get_stats_tp2(mpi_kwargs_2gpu):
     llm_get_stats_test_harness(tp_size=2,
                                pytorch_backend=True,
-                               **_mpi_session_kwargs(shared_mpi_session_2gpu))
+                               **mpi_kwargs_2gpu)
 
 
 @skip_ray
 @pytest.mark.gpu2
-def test_llm_get_stats_async_tp2(shared_mpi_session_2gpu):
-    llm_get_stats_async_test_harness(
-        tp_size=2,
-        pytorch_backend=True,
-        **_mpi_session_kwargs(shared_mpi_session_2gpu))
+def test_llm_get_stats_async_tp2(mpi_kwargs_2gpu):
+    llm_get_stats_async_test_harness(tp_size=2,
+                                     pytorch_backend=True,
+                                     **mpi_kwargs_2gpu)
 
 
 @skip_ray
 @pytest.mark.gpu2
-def test_llm_get_stats_async_pp2(shared_mpi_session_2gpu):
-    llm_get_stats_async_test_harness(
-        pp_size=2,
-        pytorch_backend=True,
-        **_mpi_session_kwargs(shared_mpi_session_2gpu))
+def test_llm_get_stats_async_pp2(mpi_kwargs_2gpu):
+    llm_get_stats_async_test_harness(pp_size=2,
+                                     pytorch_backend=True,
+                                     **mpi_kwargs_2gpu)
