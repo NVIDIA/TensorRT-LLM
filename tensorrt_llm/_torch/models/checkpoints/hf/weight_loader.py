@@ -81,7 +81,7 @@ class HfWeightLoader(BaseWeightLoader):
         return (tuple(file_fingerprint), use_consolidated)
 
     @classmethod
-    def clear_weight_cache(cls) -> None:
+    def _clear_weight_cache(cls) -> None:
         with _WEIGHT_CACHE_LOCK:
             _WEIGHT_CACHE.clear()
 

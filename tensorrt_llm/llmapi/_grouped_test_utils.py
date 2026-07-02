@@ -98,7 +98,7 @@ def clear_worker_weight_cache() -> None:
     """
     from tensorrt_llm._torch.models.checkpoints import HfWeightLoader
 
-    HfWeightLoader.clear_weight_cache()
+    HfWeightLoader._clear_weight_cache()
 
 
 def make_shared_llm(mpi_session):

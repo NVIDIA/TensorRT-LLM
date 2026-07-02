@@ -102,7 +102,7 @@ def test_load_weights_ignores_consolidated_ckpt_when_sharded_ckpt_exists(
 
 def test_weight_cache_reuses_raw_weights_with_fresh_consumable_wrapper(tmp_path, monkeypatch):
     monkeypatch.setenv("TRTLLM_HF_WEIGHT_CACHE", "1")
-    HfWeightLoader.clear_weight_cache()
+    HfWeightLoader._clear_weight_cache()
 
     checkpoint_dir = tmp_path / "foo"
     checkpoint_dir.mkdir()
@@ -130,12 +130,12 @@ def test_weight_cache_reuses_raw_weights_with_fresh_consumable_wrapper(tmp_path,
         load_weights_in_parallel.assert_called_once()
         assert second["foo.weight"] is raw_weight
     finally:
-        HfWeightLoader.clear_weight_cache()
+        HfWeightLoader._clear_weight_cache()
 
 
 def test_weight_cache_disabled_by_default(tmp_path, monkeypatch):
     monkeypatch.delenv("TRTLLM_HF_WEIGHT_CACHE", raising=False)
-    HfWeightLoader.clear_weight_cache()
+    HfWeightLoader._clear_weight_cache()
 
     checkpoint_dir = tmp_path / "foo"
     checkpoint_dir.mkdir()
@@ -160,4 +160,4 @@ def test_weight_cache_disabled_by_default(tmp_path, monkeypatch):
 
         assert load_weights_in_parallel.call_count == 2
     finally:
-        HfWeightLoader.clear_weight_cache()
+        HfWeightLoader._clear_weight_cache()
