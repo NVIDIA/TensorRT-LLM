@@ -2859,3 +2859,28 @@ class TestDeepSeekV4SparseAttentionConfig:
     def test_invalid_compress_ratios_raise(self, compress_ratios):
         with pytest.raises(ValidationError, match="compress_ratios"):
             DeepSeekV4SparseAttentionConfig(compress_ratios=compress_ratios)
+
+
+class TestEnableLowLatencyHostDispatch:
+
+    def test_default_is_false(self):
+        args = TorchLlmArgs(model="gpt2")
+        assert args.enable_low_latency_host_dispatch is False
+
+    @pytest.mark.parametrize("value", [True, False])
+    def test_accepts_bool(self, value):
+        args = TorchLlmArgs(model="gpt2",
+                            enable_low_latency_host_dispatch=value)
+        assert args.enable_low_latency_host_dispatch is value
+
+    def test_yaml_round_trip(self):
+        args = TorchLlmArgs(model="gpt2", enable_low_latency_host_dispatch=True)
+        data = args.model_dump()
+        assert data["enable_low_latency_host_dispatch"] is True
+        restored = TorchLlmArgs(**data)
+        assert restored.enable_low_latency_host_dispatch is True
+
+    def test_rejects_non_bool(self):
+        with pytest.raises(ValidationError):
+            TorchLlmArgs(model="gpt2",
+                         enable_low_latency_host_dispatch={"val": 1})
