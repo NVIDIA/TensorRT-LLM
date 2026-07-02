@@ -13,7 +13,7 @@
 # limitations under the License.
 """Wire messages exchanged between TRT-LLM workers and the centralized KV-cache router.
 
-Two report types flow over the same ZMQ channel, each keyed by the worker's
+The worker pushes one report type over the ZMQ channel, keyed by the worker's
 instance UUID (``worker_id``), a routing ``namespace``, and a per-stream
 monotonic ``seq`` used to drop stale / out-of-order messages:
 
@@ -21,8 +21,10 @@ monotonic ``seq`` used to drop stale / out-of-order messages:
   high frequency, event-driven. Carries the same dict payload that
   ``KVCacheEventSerializer`` already produces for the ``/kv_cache_events`` HTTP
   endpoint, so no new schema is introduced.
-* :class:`WorkerLoadReport` -- a workload snapshot (active + queued requests),
-  low frequency, state-replacing.
+
+Load is no longer reported by the worker: the coordinator tracks routed-request
+load itself (shared LoadBalancingMixin counter, fed to the core via
+``set_instance_load``), so only KV-cache events cross the wire.
 
 Routing is at instance granularity; attention-DP ranks report as a single
 gathered instance (see the design doc).
@@ -33,7 +35,6 @@ from typing import List, Optional
 
 __all__ = [
     "KvCacheEventReport",
-    "WorkerLoadReport",
     "Selection",
 ]
 
@@ -67,34 +68,6 @@ class KvCacheEventReport:
     # on the disagg-synced timebase shared with the router. Lets the router
     # measure worker->router propagation lag. 0.0 if the worker did not stamp.
     send_ts: float = 0.0
-
-
-@dataclass
-class WorkerLoadReport:
-    """A periodic workload snapshot for one worker instance.
-
-    Attributes:
-        worker_id: Instance UUID.
-        namespace: Routing group this worker serves.
-        seq: Monotonically increasing sequence number for this worker's load
-            stream (independent of the event stream's ``seq``).
-        num_active_requests: Requests currently running on the instance
-            (summed across attention-DP ranks).
-        num_queued_requests: Queued context + generation requests.
-        max_batch_size: Engine ``max_batch_size``, used to normalize load in the
-            routing score.
-    """
-
-    worker_id: str
-    namespace: str
-    seq: int
-    num_active_requests: int = 0
-    num_queued_requests: int = 0
-    max_batch_size: int = 1
-    # Active KV tokens on this worker/rank (cache-discounted compute load), the
-    # metric the worker KVCacheAwareADPRouter scores on. 0 if the reporter does
-    # not supply it (older reporters) -> consumers fall back to request count.
-    num_active_tokens: int = 0
 
 
 @dataclass

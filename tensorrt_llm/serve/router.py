@@ -1595,7 +1595,7 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                     0, self._server_content_load[server] - 1)
 
 
-class CentralizedKVCacheRouter(BlockHashMixin, Router):
+class CentralizedKVCacheRouter(BlockHashMixin, LoadBalancingMixin, Router):
     """Thin Router adaptor over the centralized KV-cache router core.
 
     Translates the ``Router`` API into core calls: tokenize + block-hash the
@@ -1632,12 +1632,16 @@ class CentralizedKVCacheRouter(BlockHashMixin, Router):
         # the core; the surface does not.
         for core_only in ("router_port", "load_weight", "rank_routing_algo",
                           "fair_share_multiplier", "match_rate_threshold",
-                          "load_suspend_s", "stale_timeout_s"):
+                          "stale_timeout_s"):
             kwargs.pop(core_only, None)
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
         self._init_block_hashing(tokens_per_block, custom_tokenizer,
                                  tokenizer_dir)
+        # Shared coordinator-side load counter (same mechanism as KvCacheAware /
+        # Conversation): _server_state[server].increment/decrement_load, keyed by
+        # _req_routing_table[id(request) or req_id]. Feeds the core's scoring.
+        self._init_load_balancing(servers, use_tokens=False)
 
         # Owner injects the shared core; delegating client has none. No fallback
         # creation and no ingest bind here -- see class docstring.
@@ -1649,7 +1653,6 @@ class CentralizedKVCacheRouter(BlockHashMixin, Router):
         self._core = core
         self._namespace = ("ctx" if server_role == ServerRole.CONTEXT
                            else "gen")
-        self._rr_counter = 0
         logger.info(
             f"CentralizedKVCacheRouter: namespace={self._namespace}, "
             f"tpb={self._tokens_per_block}, "
@@ -1704,6 +1707,10 @@ class CentralizedKVCacheRouter(BlockHashMixin, Router):
         if not servers:
             raise ValueError(
                 f"No available servers after excluding {exclude_server}")
+        # Feed the coordinator-side routed load (shared LoadBalancingMixin
+        # counter) into the core's scoring, replacing worker-reported load.
+        self._core.set_instance_load(
+            {s: self._get_server_load(s) for s in servers})
         server, matched, dp_rank, _ = self._core.select_address(
             self._namespace, block_hashes, servers, self._rr_counter)
         self._rr_counter += 1
@@ -1724,6 +1731,9 @@ class CentralizedKVCacheRouter(BlockHashMixin, Router):
         async with self._lock:
             server, matched, dp_rank = self.select_by_block_hashes(
                 flat_hashes, exclude_server)
+            # Count this routed request as load on the chosen server (shared
+            # counter); finish_request decrements it. Keyed by id(request).
+            await self._register_request(server, request)
 
         # Inject route_hint when per-rank routing selected a specific dp_rank.
         if dp_rank is not None:
@@ -1732,6 +1742,15 @@ class CentralizedKVCacheRouter(BlockHashMixin, Router):
         self._record_route_timing(time.monotonic() - _rt_t0)
         return server, {"matched_blocks": matched,
                         "token_lists": token_lists}
+
+    async def finish_request(self,
+                             request: OpenAIRequest,
+                             session: Optional[aiohttp.ClientSession] = None,
+                             success: bool = True):
+        # Standalone: decrement the routed-load counter (keyed by id(request)).
+        del session, success
+        async with self._lock:
+            await self._unregister_request(request)
 
     # -- coordinator-path: worker sends block hashes, coordinator selects --
 
@@ -1748,29 +1767,41 @@ class CentralizedKVCacheRouter(BlockHashMixin, Router):
         async with self._lock:
             server, matched, dp_rank = self.select_by_block_hashes(
                 block_hashes, exclude_server)
-        return server, {"matched_blocks": matched, "dp_rank": dp_rank}, None
+            # Count routed load on the chosen server, keyed by the disagg req_id
+            # (id(request) doesn't cross the HTTP hop). finish_request_by_id
+            # decrements it. Uses the SAME server_state counter as standalone.
+            if req_id is not None and server in self._server_state:
+                await self._server_state[server].increment_load(None)
+                self._req_routing_table[req_id] = server
+        return server, {"matched_blocks": matched, "dp_rank": dp_rank}, req_id
 
     async def finish_request_by_id(self, req_id, success=True):
-        # Centralized router keeps no per-request coordinator state (placement is
-        # scored from the shared core's live trie), so finish is a no-op.
-        pass
+        # Decrement the routed-load counter for req_id's server (same counter as
+        # standalone finish_request, keyed by req_id).
+        del success
+        if req_id is None:
+            return
+        async with self._lock:
+            server = self._req_routing_table.pop(req_id, None)
+            if server is not None and server in self._server_state:
+                await self._server_state[server].decrement_load(None)
 
     def _address_worker_for(self, address: str) -> Optional[str]:
         """Resolve server address to worker_id (reverse lookup)."""
         assert self._core is not None, "no core: delegating client"
         return self._core.address_worker_for(address)
 
-    async def finish_request(self,
-                             request: OpenAIRequest,
-                             session: Optional[aiohttp.ClientSession] = None,
-                             success: bool = True):
-        pass
-
     def _on_servers_updated(self, old_servers, new_servers):
+        # Keep the shared load-counter server_state in sync with the live set
+        # (same as KvCacheAware), preserving existing per-server load counts.
+        new_state = {}
+        for server in new_servers:
+            new_state[server] = (self._server_state.get(server)
+                                 or self._create_server_state(server))
+        self._server_state = new_state
         if self._core is None:  # delegating client: coordinator owns addresses
             return
-        removed = set(old_servers) - set(new_servers)
-        for server in removed:
+        for server in set(old_servers) - set(new_servers):
             self._core.unregister_worker_address(address=server)
 
     async def close(self):
@@ -1956,7 +1987,7 @@ def _build_centralized_core(router_config: RouterConfig):
         k: args[k]
         for k in ("tokens_per_block", "load_weight", "rank_routing_algo",
                   "fair_share_multiplier", "match_rate_threshold",
-                  "load_suspend_s", "stale_timeout_s") if k in args
+                  "stale_timeout_s") if k in args
     }
     return CentralizedKVCacheRouterCore(
         ingest_address=f"tcp://0.0.0.0:{router_port}",

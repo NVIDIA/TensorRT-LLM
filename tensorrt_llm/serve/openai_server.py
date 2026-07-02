@@ -1967,20 +1967,14 @@ class OpenAIServer(_VideoRoutesMixin):
                 logger.error(f"CentralizedReporter get_events error: {e}")
                 return []
 
-        lock = self._active_request_count_lock
-
-        def get_load():
-            with lock:
-                return (self._active_request_count, 0)
-
+        # Load is tracked coordinator-side (routed-request counter); the worker
+        # only reports KV-cache events.
         self._centralized_reporter = WorkerReporter(
             worker_id=worker_id,
             namespace=namespace,
             router_address=router_address,
             hmac_key=hmac_key,
             get_events=get_events,
-            get_load=get_load,
-            max_batch_size=max_batch_size,
         )
         self._centralized_reporter.start()
         logger.info(

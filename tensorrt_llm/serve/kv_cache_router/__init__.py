@@ -13,15 +13,15 @@
 # limitations under the License.
 """Centralized, push-based, KV-cache-aware router.
 
-Workers push KV-cache events and load to a shared router over ZMQ; callers query
+Workers push KV-cache events to a shared router over ZMQ; callers query
 ``select_worker(namespace, block_hashes)`` to place a request on the instance
-with the best cache locality and capacity. See ``design`` doc for the full
-rationale.
+with the best cache locality and capacity. Load is tracked coordinator-side from
+routed requests (not worker-reported). See ``design`` doc for the full rationale.
 """
 
 from tensorrt_llm.serve.router_utils import PrefixBlockSet
 
-from .messages import KvCacheEventReport, Selection, WorkerLoadReport
+from .messages import KvCacheEventReport, Selection
 from .reporter import WorkerReporter
 from .router_core import (CentralizedKVCacheRouter,
                           CentralizedKVCacheRouterCore, block_key_hasher,
@@ -35,7 +35,6 @@ __all__ = [
     "WorkerReporter",
     "PrefixBlockSet",
     "KvCacheEventReport",
-    "WorkerLoadReport",
     "Selection",
     "block_key_hasher",
     "score_kv_aware_candidates",

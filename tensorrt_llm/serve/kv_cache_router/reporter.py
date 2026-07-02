@@ -40,7 +40,7 @@ from tensorrt_llm._utils import KVCacheEventSerializer
 from tensorrt_llm.executor.ipc import ZeroMqQueue
 from tensorrt_llm.logger import logger
 
-from .messages import KvCacheEventReport, WorkerLoadReport
+from .messages import KvCacheEventReport
 
 __all__ = ["WorkerReporter"]
 
@@ -59,7 +59,10 @@ def _now_on_synced_clock() -> float:
 
 
 class WorkerReporter:
-    """Pushes KV-cache event and load reports from one worker instance.
+    """Pushes KV-cache event reports from one worker instance.
+
+    Load is no longer reported: the coordinator tracks routed-request load itself
+    (shared LoadBalancingMixin counter), so the worker only pushes KV-cache events.
 
     Args:
         worker_id: Stable instance id (the ``llm_id`` advertised via
@@ -73,11 +76,8 @@ class WorkerReporter:
             owner the radix tree enqueues into -- not the executor RPC API. The
             return value may be raw ``KVCacheEvent`` objects or already-serialized
             dicts; both are handled.
-        get_load: Callable returning ``(num_active_requests, num_queued_requests)``.
-        max_batch_size: Engine ``max_batch_size`` (sent in every load report).
         event_interval_s: Deprecated/ignored. Events are reported inline at each
             engine iteration flush (see :meth:`report_events`), not polled.
-        load_interval_s: Send period for the load stream.
     """
 
     def __init__(self,
@@ -86,19 +86,13 @@ class WorkerReporter:
                  router_address: str,
                  hmac_key: Optional[bytes],
                  get_events: Callable[[float], list],
-                 get_load: Callable[[], tuple[int, int]],
-                 max_batch_size: int,
-                 event_interval_s: float = 0.01,
-                 load_interval_s: float = 0.5) -> None:
+                 event_interval_s: float = 0.01) -> None:
         self._worker_id = worker_id
         self._namespace = namespace
         self._get_events = get_events
-        self._get_load = get_load
-        self._max_batch_size = max_batch_size
         # event_interval_s is accepted for backward compatibility but ignored:
         # events are reported inline at each engine iteration flush (see
         # report_events), not polled on a timer.
-        self._load_interval_s = load_interval_s
 
         self._queue = ZeroMqQueue(
             address=(router_address, hmac_key),
@@ -107,30 +101,23 @@ class WorkerReporter:
             name=f"kv_cache_reporter[{worker_id}]",
         )
         self._event_seq = 0
-        self._load_seq = 0
         self._stop = threading.Event()
-        self._load_thread: Optional[threading.Thread] = None
-        # The ZMQ socket is not thread-safe and multiple threads send on it
-        # (report_events from the executor loop, the load loop). Serialize sends
-        # and gate on _closed so a send racing stop() no-ops instead of hitting a
-        # closed (None) socket.
+        self._started = False
+        # The ZMQ socket is not thread-safe; report_events (executor loop) and
+        # stop() may race. Serialize sends and gate on _closed so a send racing
+        # stop() no-ops instead of hitting a closed (None) socket.
         self._send_lock = threading.Lock()
         self._closed = False
 
     def start(self) -> None:
-        """Send the initial snapshot and start the periodic load thread.
-
-        Events are reported inline via :meth:`report_events` (called at the
-        engine's per-iteration KV-event flush), so there is no event poll thread.
-        """
-        if self._load_thread is not None:
+        """Send the initial event snapshot. Events are then reported inline via
+        :meth:`report_events` (called at the engine's per-iteration KV-event
+        flush), so there is no background thread."""
+        if self._started:
             raise RuntimeError("WorkerReporter already started")
+        self._started = True
         # Initial snapshot lets a (re)started router rebuild this worker's table.
         self._push_events(self._drain_events(), is_full_snapshot=True)
-        self._load_thread = threading.Thread(target=self._run_load_loop,
-                                             name="kv_cache_reporter_load",
-                                             daemon=True)
-        self._load_thread.start()
 
     def report_events(self) -> None:
         """Drain and push pending events once, on the calling thread.
@@ -142,45 +129,14 @@ class WorkerReporter:
             self._push_events(events)
 
     def stop(self) -> None:
-        """Stop the load loop and close the socket. Idempotent."""
+        """Close the socket. Idempotent."""
         self._stop.set()
-        if self._load_thread is not None:
-            self._load_thread.join(timeout=5.0)
-        self._load_thread = None
         # Take the send lock so we never close the socket underneath an
-        # in-flight send (report_events on the executor thread / load loop).
+        # in-flight send (report_events on the executor thread).
         with self._send_lock:
             if not self._closed:
                 self._closed = True
                 self._queue.close()
-
-    # ----------------------------------------------------------------- loops
-
-    def _run_load_loop(self) -> None:
-        while not self._stop.is_set():
-            try:
-                load = self._get_load()
-                # get_load may return (active, queued) or
-                # (active, queued, active_tokens); accept both for compat.
-                num_active, num_queued = load[0], load[1]
-                num_active_tokens = load[2] if len(load) > 2 else 0
-                report = WorkerLoadReport(
-                    worker_id=self._worker_id,
-                    namespace=self._namespace,
-                    seq=self._load_seq,
-                    num_active_requests=num_active,
-                    num_queued_requests=num_queued,
-                    max_batch_size=self._max_batch_size,
-                    num_active_tokens=num_active_tokens,
-                )
-                with self._send_lock:
-                    if self._closed:
-                        return
-                    self._queue.put_noblock(report)
-                self._load_seq += 1
-            except Exception as e:  # noqa: BLE001 - keep the daemon alive
-                logger.error(f"WorkerReporter load loop error: {e}")
-            self._stop.wait(self._load_interval_s)
 
     # -------------------------------------------------------------- internals
 

@@ -41,7 +41,7 @@ from tensorrt_llm.logger import logger
 # (shared with router.py).
 from tensorrt_llm.serve.router_utils import PrefixBlockSet, block_key_hasher
 
-from .messages import KvCacheEventReport, Selection, WorkerLoadReport
+from .messages import KvCacheEventReport, Selection
 
 __all__ = [
     "CentralizedKVCacheRouterCore", "CentralizedKVCacheRouter",
@@ -141,8 +141,8 @@ def _parse_worker_id(worker_id: str) -> Tuple[str, Optional[int]]:
 class _RankState:
     """Per-rank state within an instance."""
 
-    __slots__ = ("rank", "trie", "load", "last_event_seq", "last_load_seq",
-                 "last_load_ts", "last_seen_ts", "owned_hashes")
+    __slots__ = ("rank", "trie", "last_event_seq", "last_seen_ts",
+                 "owned_hashes")
 
     def __init__(self, rank: int) -> None:
         self.rank = rank
@@ -150,10 +150,7 @@ class _RankState:
         # match method as the orchestrator KvCacheAwareServerState. Queried only
         # via match_one for this rank's own prefix depth.
         self.trie = PrefixBlockSet()
-        self.load: Optional[WorkerLoadReport] = None
         self.last_event_seq: int = -1
-        self.last_load_seq: int = -1
-        self.last_load_ts: float = 0.0
         self.last_seen_ts: float = 0.0
         # Flat set of block hashes this rank holds. In "none" mode the per-rank
         # trie is not maintained (never queried), so this set is what
@@ -194,24 +191,6 @@ class _InstanceState:
         # while taking an instance lock, so there is no cycle.
         self.lock = threading.Lock()
 
-    def total_load(self) -> Tuple[int, int]:
-        """Sum of (active_requests, queued_requests) across all ranks."""
-        active = 0
-        queued = 0
-        for rs in self.ranks.values():
-            if rs.load is not None:
-                active += rs.load.num_active_requests
-                queued += rs.load.num_queued_requests
-        return active, queued
-
-    def freshest_load_ts(self) -> float:
-        """Most recent load timestamp across all ranks."""
-        ts = 0.0
-        for rs in self.ranks.values():
-            if rs.last_load_ts > ts:
-                ts = rs.last_load_ts
-        return ts
-
     def freshest_seen_ts(self) -> float:
         """Most recent seen timestamp across all ranks."""
         ts = 0.0
@@ -226,8 +205,7 @@ class _NamespaceState:
 
     __slots__ = ("instances", "rr_counter",
                  # Legacy flat state for non-per-rank workers
-                 "tries", "loads", "last_event_seq", "last_load_seq",
-                 "last_load_ts", "last_seen_ts")
+                 "tries", "last_event_seq", "last_seen_ts")
 
     def __init__(self) -> None:
         # Hierarchical per-rank state
@@ -237,10 +215,7 @@ class _NamespaceState:
         # block-hash set per worker, exactly like the orchestrator
         # KvCacheAwareServerState keeps one set per server. Created lazily.
         self.tries: Dict[str, PrefixBlockSet] = {}
-        self.loads: Dict[str, WorkerLoadReport] = {}
         self.last_event_seq: Dict[str, int] = {}
-        self.last_load_seq: Dict[str, int] = {}
-        self.last_load_ts: Dict[str, float] = {}
         self.last_seen_ts: Dict[str, float] = {}
 
 
@@ -255,14 +230,8 @@ class CentralizedKVCacheRouterCore:
     Args:
         tokens_per_block: KV-cache block size, used to convert matched blocks to
             matched tokens in the score. Must match the workers' configuration.
-        load_suspend_s: A worker whose most recent *load* report is older than
-            this is **suspended** -- excluded from selection until it reports load
-            again. Its KV-cache entries are retained (so it can resume instantly),
-            but without a fresh load reading the router cannot trust its capacity.
-            Should be a small multiple of the reporter's ``load_interval_s``.
-        stale_timeout_s: A worker with no report of *any* kind newer than this is
-            fully evicted (trie + load) by :meth:`evict_stale_workers`. This is a
-            longer, harder timeout than ``load_suspend_s``.
+        stale_timeout_s: A worker with no KV-cache *event* report newer than this
+            is fully evicted (trie) by :meth:`evict_stale_workers`.
         clock: Injectable time source (seconds); defaults to ``time.monotonic``.
     """
 
@@ -280,7 +249,6 @@ class CentralizedKVCacheRouterCore:
                  rank_routing_algo: str = RANK_ALGO_INSTANCE,
                  fair_share_multiplier: float = 2.0,
                  match_rate_threshold: float = 0.1,
-                 load_suspend_s: float = 3.0,
                  stale_timeout_s: float = 30.0,
                  clock=time.monotonic,
                  ingest_address: Optional[str] = None,
@@ -323,11 +291,14 @@ class CentralizedKVCacheRouterCore:
                       "matched_partial": 0, "matched_full": 0,
                       "total_hashes": 0, "total_matched": 0}
         self._diag_log_every = 50
-        self._load_suspend_s = load_suspend_s
         self._stale_timeout_s = stale_timeout_s
         self._clock = clock
         self._lock = threading.Lock()
         self._namespaces: Dict[str, _NamespaceState] = {}
+        # Per-instance in-flight routed-request load, set by the surface (which
+        # owns the coordinator-side LoadBalancingMixin counter) on each select via
+        # set_instance_load(). Replaces the worker-reported WorkerLoadReport.
+        self._instance_load: Dict[str, int] = {}
         # instance_id -> server address, learned from /server_info.
         self._worker_address: Dict[str, str] = {}
         # Reverse index so a re-registered address (worker restarted under a new
@@ -340,6 +311,16 @@ class CentralizedKVCacheRouterCore:
         self._ingest_address = ingest_address
         self._ingest_hmac_key = ingest_hmac_key
         self._ingest_server = None
+
+    def set_instance_load(self, load_by_address: Dict[str, int]) -> None:
+        """Coordinator pushes the current per-server routed-request load before a
+        select. select_worker uses this (not worker-reported load) as the load
+        term. Keyed by server address; resolved to instance via _address_worker."""
+        with self._lock:
+            self._instance_load = dict(load_by_address)
+
+    def _address_load(self, address: Optional[str]) -> int:
+        return self._instance_load.get(address, 0) if address else 0
 
     def start_ingest_server(self) -> Tuple[str, Optional[bytes]]:
         """Start the ZMQ PULL ingest server feeding this core; idempotent.
@@ -494,50 +475,6 @@ class CentralizedKVCacheRouterCore:
             trie.remove_worker(report.worker_id)
         self._apply_events(trie, report.worker_id, report.events)
 
-    def apply_load_report(self, report: WorkerLoadReport) -> None:
-        """Apply a worker load report. Stale (``seq``) reports are dropped."""
-        instance_id, rank = _parse_worker_id(report.worker_id)
-        if rank is None:
-            with self._lock:
-                ns = self._namespaces.setdefault(report.namespace,
-                                                  _NamespaceState())
-                self._apply_legacy_load_locked(ns, report)
-            return
-        inst = self._get_or_create_instance(report.namespace, instance_id)
-        with inst.lock:
-            self._apply_per_rank_load_inst_locked(inst, rank, report)
-
-    def _apply_per_rank_load_inst_locked(self, inst: _InstanceState,
-                                         rank: int,
-                                         report: WorkerLoadReport) -> None:
-        """Apply a per-rank load report. Caller must hold ``inst.lock``."""
-        rs = inst.ranks.setdefault(rank, _RankState(rank))
-
-        if report.seq <= rs.last_load_seq:
-            logger.debug(
-                f"KVCacheRouter: drop stale load report from "
-                f"{report.worker_id} seq={report.seq} <= {rs.last_load_seq}")
-            return
-
-        now = self._clock()
-        rs.last_load_seq = report.seq
-        rs.last_load_ts = now
-        rs.last_seen_ts = now
-        rs.load = report
-
-    def _apply_legacy_load_locked(self, ns: _NamespaceState,
-                                  report: WorkerLoadReport) -> None:
-        last = ns.last_load_seq.get(report.worker_id, -1)
-        if report.seq <= last:
-            logger.debug(
-                f"KVCacheRouter: drop stale load report from "
-                f"{report.worker_id} seq={report.seq} <= {last}")
-            return
-        now = self._clock()
-        ns.last_load_seq[report.worker_id] = report.seq
-        ns.last_load_ts[report.worker_id] = now
-        ns.last_seen_ts[report.worker_id] = now
-        ns.loads[report.worker_id] = report
 
     def drop_worker(self, namespace: str, worker_id: str) -> None:
         """Forget a worker entirely (e.g. on disconnect)."""
@@ -603,19 +540,18 @@ class CentralizedKVCacheRouterCore:
             # Legacy flat workers live in struct-locked namespace state; score
             # them here while we hold the struct lock. Each worker has its own
             # flat block-hash set -- match_one per worker (same as kvcaware).
+            # Load is the coordinator's routed-request count per server address
+            # (set_instance_load), not a worker report. A worker with a live
+            # trie (registered/reporting events) is eligible; no load-staleness
+            # gate (there are no load reports to go stale).
             legacy_matched: Dict[str, int] = {}
             legacy_scored: List[Tuple[str, int, float]] = []
-            for w in ns.loads:
-                load_ts = ns.last_load_ts.get(w, 0.0)
-                if now - load_ts > self._load_suspend_s:
-                    continue
-                load = ns.loads[w]
+            for w in ns.tries:
                 trie = ns.tries.get(w)
                 mb = (trie.match_one(w, block_hashes)
                       if trie is not None and block_hashes else 0)
                 legacy_matched[w] = mb
-                workload = (load.num_active_requests
-                            + load.num_queued_requests)
+                workload = self._address_load(self._worker_address.get(w))
                 legacy_scored.append(
                     (w, mb, mb - self._load_weight * workload))
 
@@ -626,15 +562,12 @@ class CentralizedKVCacheRouterCore:
                                     Optional[_InstanceState]]] = []
         for inst_id, inst in inst_items:
             with inst.lock:
-                if now - inst.freshest_load_ts() > self._load_suspend_s:
-                    continue
                 if block_hashes:
                     matched_blocks = inst.combined_trie.match_one(
                         inst_id, block_hashes)
                 else:
                     matched_blocks = 0
-                active, queued = inst.total_load()
-            workload = active + queued
+            workload = self._address_load(self._worker_address.get(inst_id))
             score = (matched_blocks - self._load_weight * workload
                      if block_hashes else -self._load_weight * workload)
             if best_score is None or score > best_score:
@@ -706,28 +639,20 @@ class CentralizedKVCacheRouterCore:
         tpb = self._tokens_per_block
         adp = self._rank_routing_algo == self.RANK_ALGO_ADP
         candidates: List[Tuple[int, int, float]] = []
+        # Per-rank load is no longer reported by workers; the coordinator only
+        # knows instance-level routed load. Split it evenly across the instance's
+        # ranks as an approximation so adp/instance rank scoring still balances.
+        inst_load = self._address_load(self._worker_address.get(inst.instance_id))
         with inst.lock:
+            n_ranks = max(len(inst.ranks), 1)
+            per_rank_load = inst_load / n_ranks
             for rank, rs in inst.ranks.items():
-                if now - rs.last_load_ts > self._load_suspend_s:
-                    continue
                 if block_hashes:
                     matched_blocks = rs.trie.match_one(
                         f"{inst.instance_id}:rank{rank}", block_hashes)
                 else:
                     matched_blocks = 0
-                load = 0.0
-                if rs.load is not None:
-                    if adp:
-                        # Token-scale load, mirroring KVCacheAwareADPRouter
-                        # (compute-weighted). Prefer reported active_tokens; fall
-                        # back to request-count * block size if unavailable.
-                        nat = getattr(rs.load, "num_active_tokens", 0)
-                        load = float(nat) if nat else float(
-                            (rs.load.num_active_requests
-                             + rs.load.num_queued_requests) * tpb)
-                    else:
-                        load = float(rs.load.num_active_requests
-                                     + rs.load.num_queued_requests)
+                load = per_rank_load * tpb if adp else per_rank_load
                 # ADP scores in tokens (match in tokens, load in tokens);
                 # instance algo scores in blocks (match in blocks, load in
                 # request count) to stay identical to phase-1.
@@ -867,7 +792,6 @@ class CentralizedKVCacheRouterCore:
                 "namespace": namespace,
                 "instances": instances,
                 "legacy_blocks": legacy_blocks,
-                "loads": len(ns.loads),
             }
 
     # --------------------------------------------------------------- internals
@@ -1022,10 +946,7 @@ class CentralizedKVCacheRouterCore:
     @staticmethod
     def _forget_legacy_locked(ns: _NamespaceState, worker_id: str) -> None:
         ns.tries.pop(worker_id, None)
-        ns.loads.pop(worker_id, None)
         ns.last_event_seq.pop(worker_id, None)
-        ns.last_load_seq.pop(worker_id, None)
-        ns.last_load_ts.pop(worker_id, None)
         ns.last_seen_ts.pop(worker_id, None)
 
 

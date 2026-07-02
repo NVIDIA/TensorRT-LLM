@@ -27,7 +27,7 @@ import zmq
 from tensorrt_llm.executor.ipc import ZeroMqQueue
 from tensorrt_llm.logger import logger
 
-from .messages import KvCacheEventReport, WorkerLoadReport
+from .messages import KvCacheEventReport
 from .reporter import _now_on_synced_clock
 from .router_core import CentralizedKVCacheRouterCore
 
@@ -132,14 +132,6 @@ class KVCacheRouterServer:
                     f"report_lag_ms(avg={avg:.1f} max={getattr(self, '_lag_max_ms', 0.0):.1f} "
                     f"n={n} skew_drops={getattr(self, '_lag_skew_drops', 0)})")
             self._router.apply_event_report(report)
-        elif isinstance(report, WorkerLoadReport):
-            self._load_count = getattr(self, "_load_count", 0) + 1
-            if self._load_count % 500 == 0:
-                logger.info(
-                    f"KVCacheRouterServer: ingested {self._load_count} "
-                    f"load reports, latest from {report.worker_id} "
-                    f"active={report.num_active_requests}")
-            self._router.apply_load_report(report)
         else:
             logger.warning(
                 f"KVCacheRouterServer: ignoring unknown report type "

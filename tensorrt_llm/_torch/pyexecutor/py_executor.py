@@ -859,28 +859,14 @@ class PyExecutor:
         def get_events(timeout_ms):
             return kv_mgr.get_latest_events(0)
 
-        def get_load():
-            # Report (active_requests, queued_requests, active_tokens). The
-            # active-token load mirrors KVCacheAwareADPRouter.create_rank_state
-            # (cache-discounted: orig_prompt_len - cached_tokens), so the
-            # centralized "adp" rank scorer uses the same compute-weighted load
-            # the worker router does -- not a coarse request count.
-            active = self.active_requests
-            num_active_tokens = sum(
-                max(getattr(r, "py_orig_prompt_len", 0)
-                    - getattr(r, "cached_tokens", 0), 0)
-                for r in active)
-            num_queued = len(getattr(self, "waiting_queue", None) or [])
-            return (len(active), num_queued, num_active_tokens)
-
+        # Load is tracked coordinator-side (routed-request counter); the worker
+        # only reports KV-cache events.
         self._per_rank_reporter = WorkerReporter(
             worker_id=worker_id,
             namespace=namespace,
             router_address=router_address,
             hmac_key=hmac_key,
             get_events=get_events,
-            get_load=get_load,
-            max_batch_size=self.max_batch_size,
         )
         # Drive event reporting inline from the per-iteration event flush (see
         # _add_kv_cache_events): the KV-cache event queue is filled exactly once
