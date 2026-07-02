@@ -502,7 +502,7 @@ class ModelConfig(Generic[TConfig]):
                 or hf_quant_config.get("activation_scheme") == "static"):
             quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
 
-            block_size = hf_quant_config.get("weight_block_size") or [128, 128]
+            block_size = hf_quant_config.get("weight_block_size", [128, 128])
             assert tuple(block_size) == (
                 128, 128), "FP8_BLOCK_SCALES only supports block_size=(128,128)"
             quant_config.group_size = block_size[0]

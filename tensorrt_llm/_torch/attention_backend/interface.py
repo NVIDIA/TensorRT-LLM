@@ -692,9 +692,7 @@ class RopeParams:
                         f"{list(hf_rope_parameters.keys())}.")
                     normalized_rope_parameters = hf_rope_parameters[
                         fallback_key]
-                config.update(normalized_rope_parameters)
-            else:
-                config.update(normalized_rope_parameters)
+            config.update(normalized_rope_parameters)
 
         # get rotary parameters.
         hidden_size = config.hidden_size
