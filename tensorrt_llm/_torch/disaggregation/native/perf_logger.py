@@ -130,11 +130,13 @@ class PerfTimer:
 class PerfLogManager:
     """Singleton manager for KV transfer performance logging.
 
-    Logic:
-    - TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO not set: no output
-    - TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO set, TLLM_KV_TRANSFER_PERF_LOG_FILE not set:
-      logger.info to stdout
-    - Both set: CSV output to {TLLM_KV_TRANSFER_PERF_LOG_FILE}_{instance_name}_{instance_rank}.csv
+    Logic (checked in priority order):
+    1. TRTLLM_KVCACHE_TIME_OUTPUT_PATH set (C++ standard): enabled, CSV to
+       ``{path}/{instance_name}_{instance_rank}.csv``
+    2. TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO=1 with TLLM_KV_TRANSFER_PERF_LOG_FILE:
+       enabled, CSV to ``{base}_{instance_name}_{instance_rank}.csv``
+    3. TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO=1 alone: enabled, logger.info to stdout
+    4. None of the above: disabled
     """
 
     _instance = None
@@ -154,8 +156,18 @@ class PerfLogManager:
         self._initialized = True
         self._file_loggers = {}  # (instance_name, instance_rank) -> logger
         self._file_lock = threading.Lock()
-        self._perf_enabled = os.getenv("TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO", "0") == "1"
-        self._log_file_base = os.getenv("TLLM_KV_TRANSFER_PERF_LOG_FILE")
+
+        # Primary: C++ standard env var (directory path)
+        cpp_output_path = os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH")
+        if cpp_output_path:
+            self._perf_enabled = True
+            self._log_file_base = cpp_output_path
+            self._use_cpp_naming = True
+        else:
+            # Fallback: existing Python env vars
+            self._perf_enabled = os.getenv("TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO", "0") == "1"
+            self._log_file_base = os.getenv("TLLM_KV_TRANSFER_PERF_LOG_FILE")
+            self._use_cpp_naming = False
 
     @property
     def enabled(self) -> bool:
@@ -175,8 +187,12 @@ class PerfLogManager:
             if key in self._file_loggers:
                 return self._file_loggers[key]
 
-            # Create file path: {base}_{instance_name}_{instance_rank}.csv
-            log_file = f"{self._log_file_base}_{instance_name}_{instance_rank}.csv"
+            if self._use_cpp_naming:
+                # C++ pattern: {dir}/{instance_name}_{instance_rank}.csv
+                log_file = os.path.join(self._log_file_base, f"{instance_name}_{instance_rank}.csv")
+            else:
+                # Legacy Python pattern: {base}_{instance_name}_{instance_rank}.csv
+                log_file = f"{self._log_file_base}_{instance_name}_{instance_rank}.csv"
 
             try:
                 # Create directory if needed
@@ -314,6 +330,73 @@ class PerfLogManager:
             f"peer_rank={peer_rank}, task_latency={task_latency_ms:.3f} ms"
         )
         self.log(instance_name, instance_rank, csv_line, info_msg)
+
+    def log_gen_transfer_summary(
+        self,
+        unique_rid: int,
+        instance_name: str,
+        instance_rank: int,
+        gen_side_transfer_time_ms: float,
+        kv_cache_size: int,
+    ):
+        """Log a gen-side transfer summary row to a separate CSV.
+
+        Written after timing sync across ranks so values are globally
+        consistent.  Only active when ``TRTLLM_KVCACHE_TIME_OUTPUT_PATH``
+        is set.
+
+        Args:
+            unique_rid: Unique request id.
+            instance_name: Instance name for file naming.
+            instance_rank: Instance rank for file naming.
+            gen_side_transfer_time_ms: Synced gen-side transfer time in ms.
+            kv_cache_size: Total KV cache size across ranks (bytes).
+        """
+        cpp_output_path = os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH")
+        if not cpp_output_path:
+            return
+
+        _GEN_SUMMARY_HEADER = "timestamp,RequestID,gen_side_transfer_time(ms),kv_cache_size"
+        key = ("gen_summary", instance_name, instance_rank)
+
+        if key not in self._file_loggers:
+            with self._file_lock:
+                if key not in self._file_loggers:
+                    log_file = os.path.join(
+                        cpp_output_path,
+                        f"{instance_name}_{instance_rank}_gen_transfer_summary.csv",
+                    )
+                    try:
+                        log_dir = os.path.dirname(log_file)
+                        if log_dir and not os.path.exists(log_dir):
+                            os.makedirs(log_dir, exist_ok=True)
+
+                        write_header = not os.path.exists(log_file)
+                        file_logger = logging.getLogger(
+                            f"kv_gen_summary_{instance_name}_{instance_rank}"
+                        )
+                        file_logger.setLevel(logging.INFO)
+                        file_logger.propagate = False
+                        file_handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+                        formatter = logging.Formatter(
+                            fmt="%(asctime)s.%(msecs)03d,%(message)s",
+                            datefmt="%Y-%m-%d %H:%M:%S",
+                        )
+                        file_handler.setFormatter(formatter)
+                        file_logger.addHandler(file_handler)
+                        if write_header:
+                            file_handler.stream.write(_GEN_SUMMARY_HEADER + "\n")
+                            file_handler.stream.flush()
+                        self._file_loggers[key] = file_logger
+                    except Exception as e:
+                        sys.stderr.write(
+                            f"[KV Transfer] Warning: Failed to create gen summary log file {log_file}: {e}\n"
+                        )
+                        return
+
+        file_logger = self._file_loggers.get(key)
+        if file_logger:
+            file_logger.info(f"{unique_rid},{gen_side_transfer_time_ms:.3f},{kv_cache_size}")
 
 
 # Singleton instance
