@@ -49,8 +49,7 @@ def get_visual_gen_attention_backend(
                     Better performance but requires fused QKV
         - "FA4": Flash Attention 4; provides higher speedup on Blackwell GPUs (sm100)
                  Requires flash-attn package with cute interface
-        - "CUTEDSL": CuTe DSL FMHA kernels; Best performance on Blackwell GPUs (sm100/sm103)
-                     Compiles from CuTe DSL source
+        - "CUTEDSL": CuTe DSL FMHA kernels
     """
     # Lazy imports to avoid circular dependency
     from .cute_dsl import CuTeDSLAttention
