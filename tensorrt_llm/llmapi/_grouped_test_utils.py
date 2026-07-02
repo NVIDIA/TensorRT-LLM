@@ -88,6 +88,19 @@ def reset_worker_torch_compile_state() -> None:
     torch._dynamo.reset()
 
 
+def reset_shared_session_torch_compile_state(make_llm) -> None:
+    """Reset per-worker torch.compile state on the shared session behind a
+    ``make_shared_llm`` factory (no-op if there is no shared session).
+
+    Call from a grouped test's per-case teardown so recompile counts don't
+    accumulate across cases on reused workers (see
+    ``reset_worker_torch_compile_state`` for the failure it prevents).
+    """
+    mpi_session = getattr(make_llm, "mpi_session", None)
+    if mpi_session is not None:
+        mpi_session.submit_sync(reset_worker_torch_compile_state)
+
+
 def clear_worker_weight_cache() -> None:
     """Drop the per-worker HF raw-weight cache (runs inside each worker).
 

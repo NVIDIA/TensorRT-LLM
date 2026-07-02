@@ -81,7 +81,8 @@ from tensorrt_llm.llmapi._grouped_test_utils import \
 from tensorrt_llm.llmapi._grouped_test_utils import \
     make_shared_llm as _make_shared_llm
 from tensorrt_llm.llmapi._grouped_test_utils import \
-    reset_worker_torch_compile_state as _reset_worker_torch_compile_state
+    reset_shared_session_torch_compile_state as \
+    _reset_shared_session_torch_compile_state
 from tensorrt_llm.llmapi._grouped_test_utils import \
     shared_mpi_session as _shared_mpi_session
 
@@ -1673,9 +1674,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             # On a reused MPI session, reset each worker's torch.compile/Dynamo
             # state so recompile counts don't accumulate across cases and trip
             # the fullgraph recompile limit (FailOnRecompileLimitHit).
-            mpi_session = getattr(make_llm, "mpi_session", None)
-            if mpi_session is not None:
-                mpi_session.submit_sync(_reset_worker_torch_compile_state)
+            _reset_shared_session_torch_compile_state(make_llm)
 
     @pytest.mark.skip_less_device(4)
     @parametrize_with_ids("mtp_nextn",
@@ -2445,9 +2444,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             # On a reused MPI session, reset each worker's torch.compile/Dynamo
             # state so recompile counts don't accumulate across cases and trip
             # the fullgraph recompile limit (FailOnRecompileLimitHit).
-            mpi_session = getattr(make_llm, "mpi_session", None)
-            if mpi_session is not None:
-                mpi_session.submit_sync(_reset_worker_torch_compile_state)
+            _reset_shared_session_torch_compile_state(make_llm)
 
     @parametrize_with_ids(
         "fp8kv,attention_dp,cuda_graph,overlap_scheduler",

@@ -87,14 +87,8 @@ class HfWeightLoader(BaseWeightLoader):
 
     @staticmethod
     def _evict_to_make_room() -> None:
-        """Evict LRU entries so a newly loaded entry stays within the cap.
-
-        Called on a cache miss BEFORE loading the new weights. Evicting first
-        frees the old raw tensors before the new load allocates, so CPU never
-        holds more than ``max_entries`` models even momentarily. Without this,
-        switching models on a reused worker would transiently hold both the
-        old (still-cached) and the new (loading) weights (a ~2x CPU peak).
-        """
+        """Evict LRU entries on a miss BEFORE the new load, so CPU never holds
+        the old (cached) and new (loading) weights at once (a ~2x peak)."""
         max_entries = HfWeightLoader._weight_cache_max_entries()
         if max_entries <= 0:
             return
