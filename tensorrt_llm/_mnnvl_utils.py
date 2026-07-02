@@ -12,11 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import ctypes
 import functools
 import os
 import platform
+import socket
 import sys
+import tempfile
+import uuid
 from dataclasses import dataclass
 from typing import List, Optional, Union
 
@@ -153,6 +155,83 @@ class MnnvlMemory:
         return allocation_prop
 
     @staticmethod
+    def _exchange_fds_via_unix_socket(comm, local_fd: int) -> List[int]:
+        """Share ``local_fd`` across all ranks of ``comm`` using SCM_RIGHTS.
+
+        Why this exists: the alternative — pidfd_open()/pidfd_getfd() — needs
+        PTRACE_MODE_ATTACH_REALCREDS, which fails with EPERM in containers
+        that drop CAP_SYS_PTRACE. SCM_RIGHTS over an AF_UNIX socket goes
+        through the socket layer and never invokes ptrace_may_access, so it
+        works regardless of the container's capabilities.
+
+        Returns a list ``out`` of length ``comm.Get_size()``. ``out[i]`` is a
+        new file descriptor in this process referring to the same kernel
+        object as rank ``i``'s ``local_fd``, except ``out[comm_rank] == -1``
+        (a placeholder; ``open_mnnvl_memory``'s cuMemMap loop uses
+        ``allocated_mem_handle`` directly when ``i == comm_rank``).
+        """
+        rank = comm.Get_rank()
+        size = comm.Get_size()
+        received_fds: List[int] = [-1] * size
+        if size <= 1:
+            return received_fds
+
+        sock_path = os.path.join(
+            tempfile.gettempdir(),
+            f"trtllm_mnnvl_fd_{os.getpid()}_{rank}_{uuid.uuid4().hex}.sock",
+        )
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            listener.bind(sock_path)
+            listener.listen(size)
+            all_paths: List[str] = comm.allgather(sock_path)
+
+            try:
+                # Round-robin: in round r, rank r is the sole fd source.
+                # All other ranks connect to rank r and receive the fd.
+                # Using a barrier between rounds is unnecessary because each
+                # rank's listener was already bound+listening before
+                # allgather completed, so connect() will not see ECONNREFUSED.
+                for r in range(size):
+                    if r == rank:
+                        for _ in range(size - 1):
+                            conn, _addr = listener.accept()
+                            try:
+                                socket.send_fds(conn, [b"x"], [local_fd])
+                            finally:
+                                conn.close()
+                    else:
+                        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                        try:
+                            client.connect(all_paths[r])
+                            _msg, fds, _flags, _addr = socket.recv_fds(client, 4, 1)
+                        finally:
+                            client.close()
+                        if not fds:
+                            raise RuntimeError(
+                                f"SCM_RIGHTS exchange: rank {rank} got no fd from rank {r}"
+                            )
+                        received_fds[r] = fds[0]
+                return received_fds
+            except Exception:
+                for fd in received_fds:
+                    if fd >= 0:
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
+                raise
+        finally:
+            try:
+                listener.close()
+            except OSError:
+                pass
+            try:
+                os.unlink(sock_path)
+            except OSError:
+                pass
+
+    @staticmethod
     def get_allocation_granularity(dev_id: int):
         if MnnvlMemory.allocation_granularity != 0:
             return MnnvlMemory.allocation_granularity
@@ -216,8 +295,7 @@ class MnnvlMemory:
                 allocated_mem_handle, allocation_prop.requestedHandleTypes, 0
             )
         )
-        pidfds = []
-        remote_fds = []
+        remote_fds: List[int] = []
         try:
             if (
                 allocation_prop.requestedHandleTypes
@@ -225,36 +303,14 @@ class MnnvlMemory:
             ):
                 all_handles_data = comm.allgather(exported_fabric_handle.data)
             else:
-                all_handles_data = comm.allgather(exported_fabric_handle)
-                all_pids = comm.allgather(os.getpid())
-                libc = ctypes.CDLL(None, use_errno=True)
-                syscall = libc.syscall
-                SYS_pidfd_open = 434
-                SYS_pidfd_getfd = 438
-                for i, pid in enumerate(all_pids):
-                    pidfd = syscall(SYS_pidfd_open, pid, 0)
-                    if pidfd < 0:
-                        err = ctypes.get_errno()
-                        raise RuntimeError(
-                            f"pidfd_open({pid}) failed with errno {err}: {os.strerror(err)}"
-                        )
-                    pidfds.append(pidfd)
-
-                for i, (pidfd, fd) in enumerate(zip(pidfds, all_handles_data)):
-                    remote_fd = syscall(SYS_pidfd_getfd, pidfd, fd, 0)
-                    if remote_fd < 0:
-                        err = ctypes.get_errno()
-                        error_msg = f"pidfd_getfd(pidfd={pidfd}, fd={fd}) failed with errno {err}: {os.strerror(err)}."
-                        if err == 1:  # EPERM
-                            error_msg += (
-                                " Permission denied. If running in a container, try adding --cap-add=SYS_PTRACE "
-                                "to your docker run command."
-                            )
-                        else:
-                            error_msg += " This may be due to kernel version (requires Linux 5.6+)."
-                        raise RuntimeError(error_msg)
-                    remote_fds.append(remote_fd)
-
+                # Use SCM_RIGHTS over AF_UNIX sockets to share the
+                # POSIX-fd-typed shareable handle across ranks. SCM_RIGHTS is
+                # dispatched through the socket layer and never invokes
+                # ptrace_may_access, so it works in containers that drop
+                # CAP_SYS_PTRACE (where pidfd_getfd returns EPERM).
+                remote_fds = MnnvlMemory._exchange_fds_via_unix_socket(
+                    comm, int(exported_fabric_handle)
+                )
                 all_handles_data = remote_fds
         except Exception:
             # Release resources on failure path to avoid leaks; then re-raise.
@@ -273,16 +329,12 @@ class MnnvlMemory:
                     "cuMemRelease failed during error cleanup (original error will be raised): %s",
                     e,
                 )
-            for _pidfd in pidfds:
-                try:
-                    os.close(_pidfd)
-                except OSError:
-                    pass
             for _rfd in remote_fds:
-                try:
-                    os.close(_rfd)
-                except OSError:
-                    pass
+                if _rfd >= 0:
+                    try:
+                        os.close(_rfd)
+                    except OSError:
+                        pass
             raise
         # all_handles_data like b'\x00\x00\x00 \x00\x00\x00\x00\x8f\xec\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\t\x00\x00\x00\x00\x00\x1d\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'  # noqa: E501
         # can use buf = memoryview(data) to import if using plain buffer for data.
