@@ -327,6 +327,14 @@ class AttentionMetadata:
         """
         self._prepare_mamba_metadata()
 
+    def prepare_encoder_only(self) -> None:
+        """Hook for encoder-only (no-KV-cache) forward setup.
+
+        Defaults to the full ``prepare()``; backends with a leaner encoder-only
+        path override this.
+        """
+        self.prepare()
+
     def _prepare_mamba_metadata(self):
         if self.mamba_metadata is False:
             return

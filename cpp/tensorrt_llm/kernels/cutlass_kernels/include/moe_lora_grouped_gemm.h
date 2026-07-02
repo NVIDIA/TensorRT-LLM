@@ -29,10 +29,10 @@ namespace kernels::cutlass_kernels
 {
 
 // Forward declaration; the typedef below references it by name.
-struct MoeLoraDevicePathModule;
+struct MoeLoraGroupedGemmModule;
 
 // Function-pointer dispatch for the libtorch-dependent GEMM stage of the MoE
-// LoRA device path. The implementation lives in th_common (moeOp.cpp) because
+// LoRA grouped-GEMM core. The implementation lives in th_common (moeOp.cpp) because
 // the underlying cudaGraph(SplitK)GroupedGemm wrappers allocate workspace via
 // at::Tensor, which is not linkable from libmoe_gemm_src.a (that archive ends
 // up inside the TensorRT plugin shared object, which deliberately does not
@@ -54,7 +54,7 @@ struct MoeLoraDevicePathModule;
 //   data_type:           scalar dtype expected by the GEMM wrappers
 //                        (fp16/bf16/fp32).
 //   stream:              CUDA stream to launch onto.
-using MoeLoraDeviceRunFn = void (*)(MoeLoraDevicePathModule const& mod, int64_t num_permuted_tokens,
+using MoeLoraGroupedGemmRunFn = void (*)(MoeLoraGroupedGemmModule const& mod, int64_t num_permuted_tokens,
     int64_t in_hidden_size, int64_t max_lora_rank, int64_t dtype_bytes, int64_t splitk_slices, void const* input_base,
     void* output_base, nvinfer1::DataType data_type, cudaStream_t stream);
 
@@ -80,8 +80,8 @@ using MoeLoraDeviceRunFn = void (*)(MoeLoraDevicePathModule const& mod, int64_t 
 //
 // out_hidden_size is the trailing dimension of the module's output buffer; it
 // is inter_size for fc1/gated and hidden_size for fc2. The output base address
-// itself is passed directly to runMoeLoraDeviceModule at the call site.
-struct MoeLoraDevicePathModule
+// itself is passed directly to runMoeLoraGroupedGemmModule at the call site.
+struct MoeLoraGroupedGemmModule
 {
     // Per-source-token (rank, A_ptr, B_ptr) device mirrors, staged via a
     // pinned-host to device async H2D in FusedMoeRunner::buildMoeLoraParams.
@@ -128,14 +128,15 @@ struct MoeLoraDevicePathModule
 
     // Trailing dimension of the module's output buffer (inter_size for
     // fc1/gated, hidden_size for fc2). The output base address is supplied
-    // directly to runMoeLoraDeviceModule at the call site.
+    // directly to runMoeLoraGroupedGemmModule at the call site.
     int64_t out_hidden_size = 0;
 };
 
-// Top-level device-path bundle attached to LoraParams when the device LoRA
-// path is active. enabled == false means the FusedMoeRunner runs the legacy
-// host path.
-struct MoeLoraDevicePath
+// Top-level grouped-GEMM bundle attached to LoraParams when the MoE op runs the
+// capture-safe grouped-GEMM LoRA core. enabled == false is the default and means
+// this consumer does not use the core (the legacy TensorRT MoE plugin leaves it
+// false and runs its own cuBLAS LoRA path).
+struct MoeLoraGroupedGemm
 {
     bool enabled = false;
 
@@ -149,13 +150,13 @@ struct MoeLoraDevicePath
     bool has_gated = false;
 
     // libtorch-bound GEMM dispatch entry point, populated by moeOp.cpp when the
-    // device path is enabled. nullptr means the device path is unavailable from
+    // grouped-GEMM core is enabled. nullptr means the core is unavailable from
     // this consumer (for example, the TensorRT plugin).
-    MoeLoraDeviceRunFn run = nullptr;
+    MoeLoraGroupedGemmRunFn run = nullptr;
 
-    MoeLoraDevicePathModule fc1;
-    MoeLoraDevicePathModule fc2;
-    MoeLoraDevicePathModule gated;
+    MoeLoraGroupedGemmModule fc1;
+    MoeLoraGroupedGemmModule fc2;
+    MoeLoraGroupedGemmModule gated;
 };
 
 } // namespace kernels::cutlass_kernels
