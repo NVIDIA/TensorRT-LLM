@@ -86,6 +86,23 @@ class HfWeightLoader(BaseWeightLoader):
             _WEIGHT_CACHE.clear()
 
     @staticmethod
+    def _evict_to_make_room() -> None:
+        """Evict LRU entries so a newly loaded entry stays within the cap.
+
+        Called on a cache miss BEFORE loading the new weights. Evicting first
+        frees the old raw tensors before the new load allocates, so CPU never
+        holds more than ``max_entries`` models even momentarily. Without this,
+        switching models on a reused worker would transiently hold both the
+        old (still-cached) and the new (loading) weights (a ~2x CPU peak).
+        """
+        max_entries = HfWeightLoader._weight_cache_max_entries()
+        if max_entries <= 0:
+            return
+        with _WEIGHT_CACHE_LOCK:
+            while len(_WEIGHT_CACHE) >= max_entries:
+                _WEIGHT_CACHE.popitem(last=False)
+
+    @staticmethod
     def _wrap_cached_weights(weights: dict[str, Any]) -> ConsumableWeightsDict:
         # Return a fresh dict wrapper because model loaders call mark_consumed().
         # Tensor values are intentionally shared: this cache targets read-only
@@ -171,6 +188,9 @@ class HfWeightLoader(BaseWeightLoader):
                     # another rank is about to enter.
                     local_mpi_barrier()
                     return cached_weights
+                # Cache miss: evict now so the upcoming load doesn't transiently
+                # hold the old (cached) and new (loading) weights together.
+                self._evict_to_make_room()
 
             # Prefetch the weight files to CPU memory if the size is less than 90% of the available memory.
             # This is a heuristic to avoid prefetching files that are too large and causing file cache thrashing.
@@ -215,6 +235,9 @@ class HfWeightLoader(BaseWeightLoader):
                         f"Reusing cached HF checkpoint weights from {checkpoint_dir}."
                     )
                     return cached_weights
+                # Cache miss: evict now so the upcoming load doesn't transiently
+                # hold the old (cached) and new (loading) weights together.
+                self._evict_to_make_room()
 
             weights = self._load_weights_in_parallel(
                 weight_files, self._load_bin_or_path_file,
