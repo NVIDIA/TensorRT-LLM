@@ -628,6 +628,98 @@ class FP4GemmRunner(TunableRunner):
         return out
 
 
+class NVFP4SVDQuantGemmRunner(TunableRunner):
+    """Exact-shape tuner for the native residual-plus-rank-32 CUTLASS GEMM."""
+
+    runner_dict = dict()
+    # Image-token counts such as 6889 and 8192 must remain distinct. The regular NVFP4
+    # power-of-two M bucketing is intentionally not used for this composite kernel. Rotate
+    # cloned operands while profiling so cluster selection reflects the model's hundreds of
+    # distinct weights instead of repeatedly hitting one weight in L2.
+    tuning_config = TuningConfig(use_cold_l2_cache=True)
+
+    def __init__(self, output_dtype: torch.dtype):
+        self.output_dtype = output_dtype
+        if output_dtype not in NVFP4SVDQuantGemmRunner.runner_dict:
+            NVFP4SVDQuantGemmRunner.runner_dict[
+                output_dtype] = torch.classes.trtllm.NVFP4SVDQuantGemmRunner()
+        self.cpp_runner = NVFP4SVDQuantGemmRunner.runner_dict[output_dtype]
+
+    def unique_id(self):
+        # The version invalidates persisted tactic IDs if the native tactic order changes.
+        return ("nvfp4-svdquant-sm100-v9", self.output_dtype)
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+        **kwargs,
+    ) -> List[int]:
+        del inputs, profile, kwargs
+        return list(range(self.cpp_runner.get_num_configs()))
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = -1,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        act_fp4, weight, act_sf, weight_sf, alpha, down, lora_up = inputs
+        return self.cpp_runner.run_gemm(
+            act_fp4,
+            weight,
+            act_sf,
+            weight_sf,
+            alpha,
+            down,
+            lora_up,
+            self.output_dtype,
+            bias,
+            tactic,
+        )
+
+
+@fast_custom_op("trtllm::nvfp4_svdquant_gemm_tuned", mutates_args=())
+def nvfp4_svdquant_gemm_tuned(
+    act_fp4: torch.Tensor,
+    weight: torch.Tensor,
+    act_sf: torch.Tensor,
+    weight_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    down: torch.Tensor,
+    lora_up: torch.Tensor,
+    output_dtype: torch.dtype,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    runner = NVFP4SVDQuantGemmRunner(output_dtype)
+    inputs = [act_fp4, weight, act_sf, weight_sf, alpha, down, lora_up]
+    _, best_tactic = AutoTuner.get().choose_one(
+        "trtllm::nvfp4_svdquant_gemm::cutlass_v9",
+        [runner],
+        runner.tuning_config,
+        inputs,
+        bias=bias,
+    )
+    return runner(inputs, tactic=best_tactic, bias=bias)
+
+
+@nvfp4_svdquant_gemm_tuned.register_fake
+def _(
+    act_fp4: torch.Tensor,
+    weight: torch.Tensor,
+    act_sf: torch.Tensor,
+    weight_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    down: torch.Tensor,
+    lora_up: torch.Tensor,
+    output_dtype: torch.dtype,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    del act_sf, weight_sf, alpha, down, lora_up, bias
+    return act_fp4.new_empty((act_fp4.shape[0], weight.shape[0]),
+                             dtype=output_dtype)
+
+
 class CublasLtFP4GemmRunner(TunableRunner):
     """CublasLt-based FP4 GEMM runner with auto-tuning support.
 
