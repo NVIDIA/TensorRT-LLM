@@ -189,6 +189,11 @@ class KvCacheAwareServerState(ServerState):
         async with session.post(
                 f"{self._base_url}/kv_cache_events") as response:
             events_raw = await response.json()
+        # DIAG: confirm which servers actually get polled and how many events
+        # each returns (diagnoses single-server block-table population).
+        logger.info(
+            f"POLL_DIAG server={self._server} "
+            f"n_events={len(events_raw) if events_raw is not None else 'None'}")
         return events_raw
 
     _event_match_log_counter = 0
@@ -823,6 +828,8 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         self._load_weight = load_weight
         self._load_cap = load_cap
         self._track_routed_blocks = track_routed_blocks
+        # request key -> (flat block hashes, hash_algo). Key is id(request) on the
+        # standalone path, the disagg req_id on the coordinator path.
         self._pending_routed_blocks: dict[int, tuple[list[BlockHash], str]] = {}
 
     def _create_server_state(self, server: str) -> KvCacheAwareServerState:
@@ -835,19 +842,19 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             await state.cancel_poll_task()
         await super().close()
 
-    def _stash_routed_blocks_on_route(self, request: OpenAIRequest,
+    def _stash_routed_blocks_on_route(self, key: int,
                                       block_hashes: list[list[BlockHash]],
                                       hash_algo: str) -> None:
         if not self._track_routed_blocks:
             return
         flat = [h for hl in block_hashes for h in hl]
-        self._pending_routed_blocks[id(request)] = (flat, hash_algo)
+        self._pending_routed_blocks[key] = (flat, hash_algo)
 
-    def _apply_routed_blocks_on_finish(self, request: OpenAIRequest,
+    def _apply_routed_blocks_on_finish(self, key: int,
                                        server: Optional[str],
                                        success: bool) -> None:
         # Pop unconditionally to avoid leaks; apply only when eligible.
-        entry = self._pending_routed_blocks.pop(id(request), None)
+        entry = self._pending_routed_blocks.pop(key, None)
         if not (self._track_routed_blocks and success):
             return
         if entry is None:
@@ -957,15 +964,15 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                 "block_hashes_by_algo": block_hashes_by_algo,
                 "conv_key": self._content_affinity_key(request)}
 
-    async def _route(self, key, exclude_server=None, request=None):
+    async def _route(self, key, exclude_server=None, request=None, req_id=None):
         """THE single routing core, shared by the standalone and coordinator
         paths. Scores each server by (matched_tokens/tokens_per_block -
         load_weight*load), applies load_cap, conversation affinity and RR
-        tie-break, then registers load + stashes routed blocks. The ONLY
+        tie-break, then registers load + remembers routed blocks. The ONLY
         difference between the two callers is request identity: standalone passes
         the request (load keyed by id(request), finished via finish_request);
-        the coordinator passes request=None and gets an opaque handle back
-        (finished via finish_by_handle). Returns (server, info, handle)."""
+        the coordinator passes req_id (the disagg request id) and finishes via
+        finish_request_by_id(req_id). Returns (server, info, req_id-or-None)."""
         import time as _time
         _rt_t0 = _time.monotonic()
         token_lists = (key or {}).get("token_lists") or []
@@ -1018,24 +1025,16 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                 affinity.popitem(last=False)
         hash_algo, block_hashes = _hashes(server)
 
-        # Register load + stash routed blocks. Standalone keys by id(request);
-        # coordinator (request=None) keys by an opaque handle for finish_by_handle.
-        handle = None
+        # Register load + remember routed blocks in the SAME maps the standalone
+        # path uses; only the KEY differs. Standalone keys by id(request); the
+        # coordinator path keys by the disagg request id (req_id) -- the sole id
+        # that crosses the HTTP hop on /finish. No invented token, no fallback,
+        # no parallel map.
+        key = id(request) if req_id is None else req_id
         async with self._lock:
             await self._server_state[server].increment_load(request)
-            if request is not None:
-                self._req_routing_table[id(request)] = server
-                self._stash_routed_blocks_on_route(request, block_hashes,
-                                                   hash_algo)
-            else:
-                if not hasattr(self, "_coord_handle_server"):
-                    self._coord_handle_server = {}
-                    self._coord_handle_counter = 0
-                self._coord_handle_counter += 1
-                node_id = getattr(self, "_disagg_node_id", 0)
-                handle = f"kvc{node_id}_{self._coord_handle_counter}"
-                self._coord_handle_server[handle] = (server, block_hashes,
-                                                     hash_algo)
+            self._req_routing_table[key] = server
+            self._stash_routed_blocks_on_route(key, block_hashes, hash_algo)
         self._record_route_timing(_time.monotonic() - _rt_t0)
         return server, {
             "block_hashes": block_hashes,
@@ -1043,23 +1042,34 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             "token_lists": token_lists,
             "matches": matches,
             "server_info": self._server_info.get(server, {}),
-        }, handle
+        }, req_id
 
     async def finish_request(self,
                              request: OpenAIRequest,
                              session: Optional[aiohttp.ClientSession] = None,
                              success: bool = True):
+        # Standalone entry point: key by id(request); pass request so token-load
+        # accounting matches the increment_load(request) done at route time.
+        await self._finish(id(request), success, request=request,
+                           session=session)
+
+    async def _finish(self, key, success, request=None, session=None):
+        """THE single finish core, shared by finish_request (standalone, key =
+        id(request), request passed) and finish_request_by_id (coordinator, key =
+        disagg req_id, request=None -- symmetric with its increment_load(None)).
+        Pops the SAME maps _route filled, decrements load, commits routed blocks
+        on success, and refreshes the block table."""
         async with self._lock:
-            server = self._req_routing_table.pop(id(request), None)
+            server = self._req_routing_table.pop(key, None)
             if server is not None and server in self._server_state:
                 await self._server_state[server].decrement_load(request)
-        self._apply_routed_blocks_on_finish(request, server, success)
+        self._apply_routed_blocks_on_finish(key, server, success)
         self._poll_server_on_finish(server, session)
 
     def _poll_server_on_finish(self, server, session=None):
         """Refresh a server's KV-cache block table from /kv_cache_events after a
         request finishes. Shared by finish_request (standalone) and
-        finish_by_handle (coordinator) so the block table always stays warm --
+        finish_request_by_id (coordinator) so the block table always stays warm --
         the delegated path is inert without this (matches score 0)."""
         if (server is not None and server in self._server_state
                 and self._events_aligned(server)):
@@ -1077,27 +1087,19 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         serializable for the /select POST."""
         return self._routing_key_sync(request)
 
-    async def get_next_server_by_key(self, routing_key, exclude_server=None):
-        """Coordinator-side placement: the SAME _route core, request=None so load
-        is tracked by an opaque handle (id(request) doesn't cross the HTTP hop)."""
+    async def get_next_server_by_key(self, routing_key, exclude_server=None,
+                                     req_id=None):
+        """Coordinator-side placement: the SAME _route core, keyed by the
+        caller's disagg request id (req_id) instead of id(request)."""
         return await self._route(routing_key, exclude_server=exclude_server,
-                                 request=None)
+                                 request=None, req_id=req_id)
 
-    async def finish_by_handle(self, handle, success=True):
-        """Coordinator-side finish, mirroring finish_request: decrement load,
-        apply routed blocks, refresh the block table -- keyed by handle."""
-        if not handle:
+    async def finish_request_by_id(self, req_id, success=True):
+        """Coordinator-side finish: the SAME _finish core, keyed by the disagg
+        request id instead of id(request)."""
+        if req_id is None:
             return
-        entry = getattr(self, "_coord_handle_server", {}).pop(handle, None)
-        if entry is None:
-            return
-        server, block_hashes, hash_algo = entry
-        if server in self._server_state:
-            await self._server_state[server].decrement_load(None)
-            if self._track_routed_blocks and success:
-                self._server_state[server].add_blocks(
-                    [h for hl in block_hashes for h in hl], hash_algo=hash_algo)
-        self._poll_server_on_finish(server)
+        await self._finish(req_id, success)
 
     def _on_servers_updated(self, old_servers, new_servers):
         new_state = {}
@@ -1247,6 +1249,9 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
         }
         # id(request) -> (server, weight, monotonic_timestamp)
         self._req_content_entry: dict[int, tuple[str, int, float]] = {}
+        # Coordinator-delegated path only: disagg req_id -> server, between
+        # select and finish (id(request) can't cross the HTTP hop).
+        self._coord_pending: dict = {}
 
     # ── content-based load tracking ──
 
@@ -1554,12 +1559,10 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
         """The conversation_id (or None); no tokenization on the worker."""
         return self._get_conversation_id(request)
 
-    async def get_next_server_by_key(self, routing_key, exclude_server=None):
+    async def get_next_server_by_key(self, routing_key, exclude_server=None,
+                                     req_id=None):
         conv_id = routing_key
         self._validate_servers_available()
-        if not hasattr(self, "_coord_handle_server"):
-            self._coord_handle_server: dict[str, str] = {}
-            self._coord_handle_counter = 0
         async with self._lock:
             entry = self._session_table.get(conv_id) if conv_id else None
             if (entry is not None and entry[0] in self._server_state
@@ -1573,20 +1576,20 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                         f"No available servers after excluding {exclude_server}")
                 if conv_id:
                     self._update_session(conv_id, server, [])
-            # Request-count load (no request object at the coordinator).
+            # Request-count load (no request object at the coordinator). Keyed by
+            # the disagg req_id -- the sole id crossing the HTTP hop on /finish.
             self._server_content_load[server] = (
                 self._server_content_load.get(server, 0) + 1)
-            self._coord_handle_counter += 1
-            handle = f"h{self._disagg_node_id}_{self._coord_handle_counter}"
-            self._coord_handle_server[handle] = server
-        return server, {"server_info": self._server_info.get(server, {})}, handle
+            if req_id is not None:
+                self._coord_pending[req_id] = server
+        return server, {"server_info": self._server_info.get(server, {})}, req_id
 
-    async def finish_by_handle(self, handle, success=True):
+    async def finish_request_by_id(self, req_id, success=True):
         del success
-        if not handle:
+        if req_id is None:
             return
         async with self._lock:
-            server = getattr(self, "_coord_handle_server", {}).pop(handle, None)
+            server = self._coord_pending.pop(req_id, None)
             if server and server in self._server_content_load:
                 self._server_content_load[server] = max(
                     0, self._server_content_load[server] - 1)
@@ -1739,12 +1742,18 @@ class CentralizedKVCacheRouter(BlockHashMixin, Router):
             request, cache_salt_id)
         return [h for hl in block_hashes for h in hl]
 
-    async def get_next_server_by_key(self, routing_key, exclude_server=None):
+    async def get_next_server_by_key(self, routing_key, exclude_server=None,
+                                     req_id=None):
         block_hashes = routing_key or []
         async with self._lock:
             server, matched, dp_rank = self.select_by_block_hashes(
                 block_hashes, exclude_server)
         return server, {"matched_blocks": matched, "dp_rank": dp_rank}, None
+
+    async def finish_request_by_id(self, req_id, success=True):
+        # Centralized router keeps no per-request coordinator state (placement is
+        # scored from the shared core's live trie), so finish is a no-op.
+        pass
 
     def _address_worker_for(self, address: str) -> Optional[str]:
         """Resolve server address to worker_id (reverse lookup)."""
@@ -1801,8 +1810,6 @@ class CoordinatorDelegatingRouter(Router):
         self._role = role  # "context" | "generation"
         self._request_timeout_s = request_timeout_s
         self._session: Optional[aiohttp.ClientSession] = None
-        # id(request) -> handle, so finish_request releases coordinator state.
-        self._handles: dict[int, Optional[str]] = {}
 
     def __getattr__(self, name):
         # servers / prepare_servers / num_prepared_servers / start_server_monitoring
@@ -1818,12 +1825,29 @@ class CoordinatorDelegatingRouter(Router):
     def _on_servers_updated(self, old_servers, new_servers):
         pass
 
+    def _request_id(self, request: OpenAIRequest) -> int:
+        """The request's disagg id -- the sole cross-process key for select/finish.
+        Context requests carry disagg_request_id; generation requests inherit it
+        as ctx_request_id. OpenAIDisaggregatedService always sets it before
+        routing, so a missing id is a bug -- assert, don't paper over."""
+        dp = request.disaggregated_params
+        assert dp is not None, "delegated routing requires disaggregated_params"
+        rid = (dp.disagg_request_id if self._role == "context"
+               else dp.ctx_request_id)
+        assert rid is not None, (
+            f"delegated {self._role} routing requires a disagg request id "
+            f"(disagg_request_id/ctx_request_id) on the request")
+        return rid
+
     async def get_next_server(
             self,
             request: OpenAIRequest,
             exclude_server: Optional[str] = None) -> tuple[str, dict]:
         key = self._local.routing_key(request)
+        # Send the disagg request id as the sole cross-process request key; the
+        # coordinator keys its pending-request state by it for /finish.
         payload = {"role": self._role, "routing_key": key,
+                   "req_id": self._request_id(request),
                    "exclude_server": exclude_server}
         async with self.session.post(
                 f"{self._coordinator_url}/select", json=payload,
@@ -1833,9 +1857,6 @@ class CoordinatorDelegatingRouter(Router):
                     f"coordinator /select returned {resp.status}: "
                     f"{await resp.text()}")
             body = await resp.json()
-        handle = body.get("handle")
-        if handle is not None:
-            self._handles[id(request)] = handle
         info = body.get("info") or {}
         dp_rank = info.get("dp_rank")
         if dp_rank is not None:
@@ -1847,13 +1868,11 @@ class CoordinatorDelegatingRouter(Router):
                              session: Optional[aiohttp.ClientSession] = None,
                              success: bool = True):
         del session
-        handle = self._handles.pop(id(request), None)
-        if handle is None:
-            return
         try:
             async with self.session.post(
                     f"{self._coordinator_url}/finish",
-                    json={"role": self._role, "handle": handle,
+                    json={"role": self._role,
+                          "req_id": self._request_id(request),
                           "success": success},
                     timeout=self._request_timeout_s) as resp:
                 if resp.status != 200:

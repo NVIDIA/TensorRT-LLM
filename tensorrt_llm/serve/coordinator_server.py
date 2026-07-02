@@ -17,9 +17,9 @@ One coordinator process owns all cluster state (routers, readiness, worker
 events, and -- for the centralized router -- the single ZMQ event-ingest bind)
 and answers the internal coordination API that the forked worker processes call:
 
-    POST /select   {"role", "routing_key", "exclude_server"}
-      -> {"server": "host:port", "info": {...}, "handle": <str|null>}
-    POST /finish   {"role", "handle", "success"}  -> {}
+    POST /select   {"role", "routing_key", "req_id", "exclude_server"}
+      -> {"server": "host:port", "info": {...}, "req_id": <int|null>}
+    POST /finish   {"role", "req_id", "success"}  -> {}
     GET  /cluster_info -> {...}
     GET  /health   -> 200 when ready
     GET  /version
@@ -76,8 +76,8 @@ class CoordinatorServer:
                 status_code=400,
                 content={"error": "body must include 'role' and 'routing_key'"})
         try:
-            server, info, handle = await self._cluster.select(
-                body["role"], body.get("routing_key"),
+            server, info, req_id = await self._cluster.select(
+                body["role"], body.get("routing_key"), body.get("req_id"),
                 body.get("exclude_server"))
         except ValueError as e:
             return JSONResponse(status_code=503, content={"error": str(e)})
@@ -85,7 +85,7 @@ class CoordinatorServer:
             logger.error(f"CoordinatorServer.select failed: {e}")
             return JSONResponse(status_code=500, content={"error": str(e)})
         return JSONResponse(content={"server": server, "info": info,
-                                     "handle": handle})
+                                     "req_id": req_id})
 
     async def finish(self, raw_req: Request) -> Response:
         try:
@@ -93,7 +93,7 @@ class CoordinatorServer:
         except Exception as e:
             return JSONResponse(status_code=400,
                                 content={"error": f"invalid JSON body: {e}"})
-        await self._cluster.finish(body.get("role", "gen"), body.get("handle"),
+        await self._cluster.finish(body.get("role", "gen"), body.get("req_id"),
                                    body.get("success", True))
         return JSONResponse(content={})
 

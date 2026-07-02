@@ -151,15 +151,15 @@ class DisaggCoordinatorService(DisaggCoordinator):
 
     # -- coordinator-path placement (workers call these via the HTTP server) --
 
-    async def select(self, role: str, routing_key,
+    async def select(self, role: str, routing_key, req_id,
                      exclude_server: Optional[str]) -> Tuple[str, dict, Optional[str]]:
         router = self._router_for_role(role)
-        return await router.get_next_server_by_key(routing_key,
+        return await router.get_next_server_by_key(routing_key, req_id=req_id,
                                                    exclude_server=exclude_server)
 
-    async def finish(self, role: str, handle: Optional[str],
+    async def finish(self, role: str, req_id,
                      success: bool = True) -> None:
-        await self._router_for_role(role).finish_by_handle(handle, success)
+        await self._router_for_role(role).finish_request_by_id(req_id, success)
 
     def _router_for_role(self, role: str) -> Router:
         return (self._ctx_router
