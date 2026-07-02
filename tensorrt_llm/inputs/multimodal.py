@@ -964,6 +964,7 @@ def find_mm_token_lengths(
 
     mm_video_dict = (multimodal_data or {}).get("video") or {}
     video_grid_thw = mm_video_dict.get("video_grid_thw")
+    video_temporal_ids = mm_video_dict.get("temporal_ids")
     if video_grid_thw is not None:
         video_grid_thw = torch.as_tensor(video_grid_thw)
         assert video_grid_thw.device.type == "cpu", (
@@ -990,6 +991,19 @@ def find_mm_token_lengths(
                     f"({video_grid_thw.shape[0]}) does not match number of "
                     f"videos in mm_data ({len(items)}); falling back to "
                     "per-item recompute without video_grid_thw.")
+
+        video_temporal_ids_for_items = None
+        if modality == "video" and video_temporal_ids is not None:
+            if len(items) == 1:
+                video_temporal_ids_for_items = video_temporal_ids
+            elif len(video_temporal_ids) == len(items):
+                video_temporal_ids_for_items = video_temporal_ids
+            else:
+                logger.warning(
+                    "find_mm_token_lengths: temporal_ids item count "
+                    f"({len(video_temporal_ids)}) does not match number "
+                    f"of videos in mm_data ({len(items)}); falling back "
+                    "to per-item recompute without temporal_ids.")
 
         modality_token_lengths = []
         for idx, item in enumerate(items):
@@ -1021,6 +1035,10 @@ def find_mm_token_lengths(
                     call_kwargs["video_grid_thw"] = (
                         video_grid_thw_for_items if len(items) == 1 else
                         video_grid_thw_for_items[idx:idx + 1])
+                if video_temporal_ids_for_items is not None:
+                    call_kwargs["temporal_ids"] = (
+                        video_temporal_ids_for_items if len(items) == 1 else
+                        video_temporal_ids_for_items[idx])
                 num_tokens = input_processor.get_num_tokens_per_video(
                     **call_kwargs)
                 modality_token_lengths.append(num_tokens)
