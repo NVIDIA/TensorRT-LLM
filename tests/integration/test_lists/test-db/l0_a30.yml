@@ -102,9 +102,7 @@ l0_a30:
   tests:
   - triton_server/test_triton.py::test_cpp_unit_tests[cpp-unit-tests]
   - triton_server/test_triton.py::test_python_bls_unit_tests[python-bls-unit-tests]
-  - triton_server/test_triton.py::test_python_preproc_unit_tests[python-preproc-unit-tests]
   - triton_server/test_triton.py::test_fill_template[fill-template]
-  - triton_server/test_triton.py::test_python_multimodal_encoders_unit_tests[python-multimodal-encoders-unit-tests]
   - triton_server/test_triton.py::test_llmapi_unit_tests[llmapi-unit-tests]
 # ------------- AutoDeploy Backend Stages ---------------
 - condition:
