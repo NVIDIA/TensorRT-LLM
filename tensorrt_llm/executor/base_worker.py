@@ -16,7 +16,9 @@ import datetime
 import enum
 import gc
 import json
+import time
 import traceback
+import uuid
 import weakref
 from pathlib import Path
 from queue import Queue
@@ -672,12 +674,14 @@ class BaseWorker(GenerationExecutor):
         1. Enter ``control_action()`` to drain in-flight requests and pause
            rank-0's event loop.  Non-rank-0 event loops become idle (starved
            of NCCL collectives from rank-0) once the current iteration drains.
-        2. Broadcast the control message to every non-rank-0 rank via the
-           dedicated ``_sleep_wakeup_comm`` communicator.
+        2. Send PREPARE to every non-rank-0 rank via the dedicated
+           ``_sleep_wakeup_comm`` communicator.  Peers quiesce and ACK without
+           changing VMM state.
         3. Execute the VMM operation (``release_with_tag`` or
            ``materialize_with_tag``) locally on rank-0.
-        4. Collect ACKs from all non-rank-0 ranks to confirm they have
-           finished their local VMM operations.
+        4. Send COMMIT to prepared peers and collect ACKs after their local VMM
+           operations.  If PREPARE or rank-0 local execution fails, send ABORT
+           so peers leave the control barrier without changing VMM state.
         5. Exit ``control_action()``, resuming rank-0's event loop.
 
         Args:
@@ -686,6 +690,7 @@ class BaseWorker(GenerationExecutor):
                 values; forwarded verbatim to each rank's VMM call.
         """
         from tensorrt_llm._torch.pyexecutor.py_executor import (
+            _SLEEP_WAKEUP_ACK_TIMEOUT_S, _recv_sleep_wakeup_ack_until,
             _SleepWakeupAction, _SleepWakeupTag)
         from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
                                                         release_with_tag)
@@ -706,31 +711,104 @@ class BaseWorker(GenerationExecutor):
                 "_multi_rank_sleep_wakeup requires world_size greater than 1")
 
         tag_strings = [t.value for t in tags]
-        msg = {"action": _SleepWakeupAction(action), "tags": tag_strings}
+        op_id = uuid.uuid4().hex
+        target_action = _SleepWakeupAction(action)
+        prepare_msg = {
+            "action": _SleepWakeupAction.PREPARE,
+            "target_action": target_action,
+            "tags": tag_strings,
+            "op_id": op_id,
+        }
+        commit_msg = {
+            "action": _SleepWakeupAction.COMMIT,
+            "target_action": target_action,
+            "tags": tag_strings,
+            "op_id": op_id,
+        }
 
         # Serialise concurrent sleep/wakeup calls.  control_action() uses an
         # Event-based barrier, not a mutex, so two concurrent callers can both
         # pass the barrier and then interleave sends/recvs on _sleep_wakeup_comm,
         # consuming the wrong ACKs or resuming the event loop prematurely.
         # _sleep_wakeup_lock turns the whole sequence into a critical section.
-        with self.engine._sleep_wakeup_lock, self.engine.control_action():
-            action_ranks = []
-            abort_ranks = []
+        with self.engine._sleep_wakeup_lock, self.engine.control_action(
+                control_id=op_id):
+            prepared_ranks = []
             errors = []
             local_error = None
+            abort_sent = False
+
+            def send_abort(reason: str,
+                           ranks: Optional[list[int]] = None) -> list[int]:
+                abort_ranks = []
+                abort_dests = ranks if ranks is not None else range(
+                    1, world_size)
+                abort_msg = {
+                    "action": _SleepWakeupAction.ABORT,
+                    "tags": [],
+                    "op_id": op_id,
+                    "reason": reason,
+                }
+                for abort_dest in abort_dests:
+                    try:
+                        sleep_wakeup_comm.send(
+                            abort_msg,
+                            dest=abort_dest,
+                            tag=_SleepWakeupTag.ACTION,
+                        )
+                        abort_ranks.append(abort_dest)
+                    except Exception as abort_exc:
+                        abort_error = (
+                            "rank 0 failed to send sleep/wakeup abort "
+                            f"to rank {abort_dest}: {abort_exc}")
+                        errors.append(abort_error)
+                        logger.error(
+                            "_multi_rank_sleep_wakeup: %s",
+                            abort_error,
+                            exc_info=True,
+                        )
+                return abort_ranks
+
+            def drain_acks(ranks: list[int], phase: _SleepWakeupAction) -> None:
+                ack_deadline = time.monotonic() + _SLEEP_WAKEUP_ACK_TIMEOUT_S
+                for src in ranks:
+                    try:
+                        ack = _recv_sleep_wakeup_ack_until(sleep_wakeup_comm,
+                                                           src,
+                                                           ack_deadline,
+                                                           expected_op_id=op_id,
+                                                           expected_phase=phase)
+                    except Exception as exc:
+                        errors.append(
+                            f"rank 0 failed to receive {phase} ACK from "
+                            f"rank {src}: {exc}")
+                        logger.error(
+                            "_multi_rank_sleep_wakeup: failed to receive %s "
+                            "ACK from rank %d",
+                            phase,
+                            src,
+                            exc_info=True,
+                        )
+                        continue
+                    if ack.get("status") != "ok":
+                        errors.append(
+                            ack.get("error")
+                            or f"rank {src} returned unknown {phase} ACK")
+
             try:
-                # Broadcast control message to non-rank-0 listeners.  Keep
-                # this inside the try/finally so a partial broadcast still
-                # drains ACKs from peers that received an action or abort.
+                # Phase 1: prepare peers.  A prepared peer has reached the
+                # control barrier and synchronized CUDA, but has not modified
+                # VMM state yet.  This keeps send/local failures from leaving
+                # a subset of ranks slept/woken while rank 0 did not commit.
                 for dest in range(1, world_size):
                     try:
-                        sleep_wakeup_comm.send(msg,
+                        sleep_wakeup_comm.send(prepare_msg,
                                                dest=dest,
                                                tag=_SleepWakeupTag.ACTION)
-                        action_ranks.append(dest)
+                        prepared_ranks.append(dest)
                     except Exception as exc:
                         send_error = (
-                            f"rank 0 failed to send '{action}' to rank "
+                            f"rank 0 failed to send '{action}' prepare to rank "
                             f"{dest}: {exc}")
                         errors.append(send_error)
                         logger.error(
@@ -738,35 +816,20 @@ class BaseWorker(GenerationExecutor):
                             send_error,
                             exc_info=True,
                         )
-                        abort_msg = {
-                            "action": _SleepWakeupAction.ABORT,
-                            "tags": [],
-                            "reason": send_error,
-                        }
-                        for abort_dest in range(dest, world_size):
-                            try:
-                                sleep_wakeup_comm.send(
-                                    abort_msg,
-                                    dest=abort_dest,
-                                    tag=_SleepWakeupTag.ACTION,
-                                )
-                                abort_ranks.append(abort_dest)
-                            except Exception as abort_exc:
-                                abort_error = (
-                                    "rank 0 failed to send sleep/wakeup abort "
-                                    f"to rank {abort_dest}: {abort_exc}")
-                                errors.append(abort_error)
-                                logger.error(
-                                    "_multi_rank_sleep_wakeup: %s",
-                                    abort_error,
-                                    exc_info=True,
-                                )
+                        abort_ranks = send_abort(send_error)
+                        abort_sent = True
+                        drain_acks(prepared_ranks, _SleepWakeupAction.PREPARE)
+                        drain_acks(abort_ranks, _SleepWakeupAction.ABORT)
                         break
 
                 if not errors:
+                    drain_acks(prepared_ranks, _SleepWakeupAction.PREPARE)
+
+                if not errors:
                     # Execute locally on rank-0.  Only CUDA/VMM errors are
-                    # captured as local_error; unexpected exceptions are
-                    # re-raised after the finally has drained peer ACKs.
+                    # captured as local_error. Peers are still prepared but
+                    # uncommitted, so local failure can abort them without
+                    # changing their VMM state.
                     torch.cuda.synchronize()
                     if action == _SleepWakeupAction.SLEEP:
                         release_with_tag(*tags)
@@ -785,30 +848,40 @@ class BaseWorker(GenerationExecutor):
                     exc_info=True,
                 )
             finally:
-                # Always drain all ACKs to keep the communicator clean even
-                # if rank-0's send/local op failed or raised unexpectedly.
                 if local_error:
                     errors.append(local_error)
-                ack_ranks = action_ranks + abort_ranks
-                for src in ack_ranks:
-                    try:
-                        ack = sleep_wakeup_comm.recv(source=src,
-                                                     tag=_SleepWakeupTag.ACK)
-                    except Exception as exc:
-                        errors.append(
-                            f"rank 0 failed to receive ACK from rank {src}: "
-                            f"{exc}")
-                        logger.error(
-                            "_multi_rank_sleep_wakeup: failed to receive ACK "
-                            "from rank %d",
-                            src,
-                            exc_info=True,
-                        )
-                        continue
-                    if ack.get("status") != "ok":
-                        errors.append(
-                            ack.get("error")
-                            or f"rank {src} returned unknown ACK")
+
+                if errors and prepared_ranks and not abort_sent:
+                    abort_ranks = send_abort("\n".join(errors))
+                    drain_acks(abort_ranks, _SleepWakeupAction.ABORT)
+                elif not errors:
+                    commit_ranks = []
+                    commit_failed_ranks = []
+                    for dest in prepared_ranks:
+                        try:
+                            sleep_wakeup_comm.send(
+                                commit_msg,
+                                dest=dest,
+                                tag=_SleepWakeupTag.ACTION,
+                            )
+                            commit_ranks.append(dest)
+                        except Exception as exc:
+                            commit_error = (
+                                f"rank 0 failed to send '{action}' commit to "
+                                f"rank {dest}: {exc}")
+                            errors.append(commit_error)
+                            commit_failed_ranks.append(dest)
+                            logger.error(
+                                "_multi_rank_sleep_wakeup: %s",
+                                commit_error,
+                                exc_info=True,
+                            )
+                    if commit_failed_ranks:
+                        abort_ranks = send_abort("\n".join(errors),
+                                                 ranks=commit_failed_ranks)
+                        drain_acks(abort_ranks, _SleepWakeupAction.ABORT)
+                    drain_acks(commit_ranks, _SleepWakeupAction.COMMIT)
+
                 if errors:
                     raise RuntimeError(
                         f"{action}() failed on {len(errors)} rank(s):\n" +

@@ -172,14 +172,33 @@ class TestMultiRankSleepWakeupLock:
                 lock_events.append("release")
                 return real_lock.__exit__(*args)
 
-        # Stub out _sleep_wakeup_comm; send/recv are no-ops, recv returns ok ACK.
-        mock_comm = SimpleNamespace(
-            send=lambda *a, **kw: None,
-            recv=lambda *a, **kw: {"status": "ok"},
-        )
+        # Stub out _sleep_wakeup_comm; send captures op_id, recv returns ok ACK.
+        class MockComm:
+            def __init__(self):
+                self.op_id = None
+                self.phase_by_source = {}
+
+            def send(self, payload, *args, **kwargs):
+                self.op_id = payload.get("op_id", self.op_id)
+                dest = kwargs.get("dest")
+                if dest is not None:
+                    self.phase_by_source[dest] = payload.get("action")
+
+            def iprobe(self, *args, **kwargs):
+                return True
+
+            def recv(self, *args, **kwargs):
+                source = kwargs.get("source")
+                return {
+                    "status": "ok",
+                    "op_id": self.op_id,
+                    "phase": self.phase_by_source.get(source),
+                }
+
+        mock_comm = MockComm()
 
         @contextmanager
-        def _noop_control_action():
+        def _noop_control_action(**kwargs):
             yield None
 
         w.engine = SimpleNamespace(
@@ -238,6 +257,10 @@ class TestMultiRankSleepWakeupLock:
 
         def slow_send(*args, **kwargs):
             """Simulate work inside the critical section."""
+            payload = args[0]
+            w.engine._sleep_wakeup_comm.op_id = payload.get(
+                "op_id", w.engine._sleep_wakeup_comm.op_id
+            )
             if inside.is_set():
                 overlap_detected.set()
             inside.set()
@@ -311,17 +334,34 @@ def _make_proto_worker(recv_responses, world_size=3):
 
     recv_calls: list = []
 
-    def fake_recv(source, tag):
-        recv_calls.append(source)
-        return responses.pop(0)
+    class FakeComm:
+        def __init__(self):
+            self.op_id = None
+            self.phase_by_source = {}
+
+        def send(self, payload, *args, **kwargs):
+            self.op_id = payload.get("op_id", self.op_id)
+            dest = kwargs.get("dest")
+            if dest is not None:
+                self.phase_by_source[dest] = payload.get("action")
+
+        def iprobe(self, *args, **kwargs):
+            return True
+
+        def recv(self, source, tag):
+            recv_calls.append(source)
+            ack = responses.pop(0) if responses else {"status": "ok"}
+            ack.setdefault("op_id", self.op_id)
+            ack.setdefault("phase", self.phase_by_source.get(source))
+            return ack
 
     @contextmanager
-    def _noop_control_action():
+    def _noop_control_action(**kwargs):
         yield None
 
     w.engine = SimpleNamespace(
         _sleep_wakeup_lock=threading.Lock(),
-        _sleep_wakeup_comm=SimpleNamespace(send=lambda *a, **kw: None, recv=fake_recv),
+        _sleep_wakeup_comm=FakeComm(),
         control_action=_noop_control_action,
     )
     return w, recv_calls
@@ -404,22 +444,30 @@ class TestMultiRankSendFailureRecovery:
         recv_calls = []
 
         class FakeComm:
+            def __init__(self):
+                self.op_id = None
+
             def send(self, payload, dest, tag):
+                self.op_id = payload.get("op_id", self.op_id)
                 send_calls.append((payload["action"], dest, tag))
-                if payload["action"] == _SleepWakeupAction.SLEEP and dest == 2:
+                if payload["action"] == _SleepWakeupAction.PREPARE and dest == 2:
                     raise RuntimeError("simulated mid-broadcast send failure")
+
+            def iprobe(self, source, tag):
+                return True
 
             def recv(self, source, tag):
                 recv_calls.append((source, tag))
                 if source == 1:
-                    return {"status": "ok"}
+                    return {"status": "ok", "op_id": self.op_id}
                 return {
                     "status": "error",
                     "error": "rank 0 aborted sleep/wakeup before local execution",
+                    "op_id": self.op_id,
                 }
 
         @contextmanager
-        def _noop_control_action():
+        def _noop_control_action(**kwargs):
             yield None
 
         w = object.__new__(BaseWorker)
@@ -451,11 +499,13 @@ class TestMultiRankSendFailureRecovery:
         assert "rank 0 aborted sleep/wakeup" in msg
         assert release.call_count == 0
         assert send_calls == [
-            (_SleepWakeupAction.SLEEP, 1, _SleepWakeupTag.ACTION),
-            (_SleepWakeupAction.SLEEP, 2, _SleepWakeupTag.ACTION),
+            (_SleepWakeupAction.PREPARE, 1, _SleepWakeupTag.ACTION),
+            (_SleepWakeupAction.PREPARE, 2, _SleepWakeupTag.ACTION),
+            (_SleepWakeupAction.ABORT, 1, _SleepWakeupTag.ACTION),
             (_SleepWakeupAction.ABORT, 2, _SleepWakeupTag.ACTION),
         ]
         assert recv_calls == [
+            (1, _SleepWakeupTag.ACK),
             (1, _SleepWakeupTag.ACK),
             (2, _SleepWakeupTag.ACK),
         ]
@@ -482,6 +532,137 @@ class TestMultiRankSendFailureRecovery:
 
         with pytest.raises(RuntimeError, match="_sleep_wakeup_comm"):
             w._multi_rank_sleep_wakeup("sleep", [ExecutorMemoryType.KV_CACHE])
+
+    def test_action_ack_drain_is_bounded(self, monkeypatch):
+        """A missing action ACK must not block _multi_rank_sleep_wakeup forever."""
+        import threading
+        from contextlib import contextmanager
+        from unittest.mock import patch
+
+        from tensorrt_llm._torch.pyexecutor import py_executor
+        from tensorrt_llm.executor.base_worker import BaseWorker
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        class FakeComm:
+            def send(self, payload, dest, tag):
+                pass
+
+            def iprobe(self, source, tag):
+                return False
+
+            def recv(self, source, tag):
+                raise AssertionError("ACK drain must probe before recv")
+
+        @contextmanager
+        def _noop_control_action(**kwargs):
+            yield None
+
+        w = object.__new__(BaseWorker)
+        w._backend = "pytorch"
+        w.rank = 0
+        w.llm_args = SimpleNamespace(
+            backend="pytorch",
+            parallel_config=SimpleNamespace(world_size=2),
+            sleep_config=object(),
+        )
+        w.engine = SimpleNamespace(
+            _sleep_wakeup_lock=threading.Lock(),
+            _sleep_wakeup_comm=FakeComm(),
+            control_action=_noop_control_action,
+        )
+
+        monkeypatch.setattr(py_executor, "_SLEEP_WAKEUP_ACK_TIMEOUT_S", 0.0)
+        monkeypatch.setattr(py_executor, "_SLEEP_WAKEUP_ACK_POLL_INTERVAL_S", 0.0)
+
+        with (
+            patch("tensorrt_llm._torch.virtual_memory.release_with_tag"),
+            patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag"),
+            patch("torch.cuda.synchronize"),
+            patch("gc.collect"),
+            patch("torch.cuda.empty_cache"),
+        ):
+            with pytest.raises(RuntimeError, match="timed out waiting"):
+                w._multi_rank_sleep_wakeup("sleep", [ExecutorMemoryType.KV_CACHE])
+
+    def test_commit_send_failure_aborts_uncommitted_rank(self):
+        """A prepared rank that misses COMMIT must receive ABORT to unblock."""
+        import threading
+        from contextlib import contextmanager
+        from unittest.mock import patch
+
+        from tensorrt_llm._torch.pyexecutor.py_executor import _SleepWakeupAction, _SleepWakeupTag
+        from tensorrt_llm.executor.base_worker import BaseWorker
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        send_calls = []
+        recv_calls = []
+
+        class FakeComm:
+            def __init__(self):
+                self.op_id = None
+                self.ack_phases = {}
+
+            def send(self, payload, dest, tag):
+                self.op_id = payload.get("op_id", self.op_id)
+                send_calls.append((payload["action"], dest, tag))
+                self.ack_phases.setdefault(dest, []).append(payload["action"])
+                if payload["action"] == _SleepWakeupAction.COMMIT and dest == 2:
+                    raise RuntimeError("simulated commit send failure")
+
+            def iprobe(self, source, tag):
+                return True
+
+            def recv(self, source, tag):
+                recv_calls.append((source, tag))
+                return {
+                    "status": "ok",
+                    "op_id": self.op_id,
+                    "phase": self.ack_phases[source].pop(0),
+                }
+
+        @contextmanager
+        def _noop_control_action(**kwargs):
+            yield None
+
+        w = object.__new__(BaseWorker)
+        w._backend = "pytorch"
+        w.rank = 0
+        w.llm_args = SimpleNamespace(
+            backend="pytorch",
+            parallel_config=SimpleNamespace(world_size=3),
+            sleep_config=object(),
+        )
+        w.engine = SimpleNamespace(
+            _sleep_wakeup_lock=threading.Lock(),
+            _sleep_wakeup_comm=FakeComm(),
+            control_action=_noop_control_action,
+        )
+
+        with (
+            patch("tensorrt_llm._torch.virtual_memory.release_with_tag") as release,
+            patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag"),
+            patch("torch.cuda.synchronize"),
+            patch("gc.collect"),
+            patch("torch.cuda.empty_cache"),
+        ):
+            with pytest.raises(RuntimeError, match="commit send failure"):
+                w._multi_rank_sleep_wakeup("sleep", [ExecutorMemoryType.KV_CACHE])
+
+        release.assert_called_once()
+        assert send_calls == [
+            (_SleepWakeupAction.PREPARE, 1, _SleepWakeupTag.ACTION),
+            (_SleepWakeupAction.PREPARE, 2, _SleepWakeupTag.ACTION),
+            (_SleepWakeupAction.COMMIT, 1, _SleepWakeupTag.ACTION),
+            (_SleepWakeupAction.COMMIT, 2, _SleepWakeupTag.ACTION),
+            (_SleepWakeupAction.ABORT, 2, _SleepWakeupTag.ACTION),
+        ]
+        assert recv_calls == [
+            (1, _SleepWakeupTag.ACK),
+            (2, _SleepWakeupTag.ACK),
+            (2, _SleepWakeupTag.ACK),
+            (2, _SleepWakeupTag.ACK),
+            (1, _SleepWakeupTag.ACK),
+        ]
 
 
 class TestListenerUncaughtExceptionSendsErrorAck:
@@ -560,6 +741,67 @@ class TestListenerUncaughtExceptionSendsErrorAck:
 class TestListenerAbortAndShutdown:
     """Listener control messages must unblock cleanly and ACK rank-0."""
 
+    def test_prepare_does_not_execute_vmm_or_release_control(self):
+        """Prepare quiesces the peer but leaves VMM and control_action_done untouched."""
+        import threading
+        from unittest.mock import patch
+
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, _SleepWakeupAction
+
+        sent_acks = []
+        op_id = "prepare-only-op"
+
+        class FakeComm:
+            def __init__(self):
+                self.recv_count = 0
+
+            def recv(self, source, tag):
+                self.recv_count += 1
+                if self.recv_count > 1:
+                    raise StopIteration
+                return {
+                    "action": _SleepWakeupAction.PREPARE,
+                    "target_action": _SleepWakeupAction.SLEEP,
+                    "tags": ["kv_cache"],
+                    "op_id": op_id,
+                }
+
+            def send(self, payload, dest, tag):
+                sent_acks.append(payload)
+
+        executor = object.__new__(PyExecutor)
+        executor._sleep_wakeup_comm = FakeComm()
+        executor.device_id = 0
+        executor.dist = SimpleNamespace(rank=1)
+        executor.control_request_barrier = threading.Event()
+        executor.control_request_barrier.set()
+        executor.control_action_done = threading.Event()
+        executor._active_control_id = op_id
+
+        with (
+            patch("torch.cuda.set_device"),
+            patch("tensorrt_llm._torch.pyexecutor.py_executor.CUASSERT"),
+            patch("tensorrt_llm._torch.pyexecutor.py_executor.cudart.cudaSetDevice"),
+            patch("tensorrt_llm._torch.pyexecutor.py_executor.set_thread_local_mpi_comm"),
+            patch("torch.cuda.synchronize"),
+            patch("tensorrt_llm._torch.virtual_memory.release_with_tag") as release,
+        ):
+            try:
+                executor._sleep_wakeup_listener_loop()
+            except StopIteration:
+                pass
+
+        release.assert_not_called()
+        assert executor.control_request_barrier.is_set()
+        assert not executor.control_action_done.is_set()
+        assert sent_acks == [
+            {
+                "status": "ok",
+                "error": None,
+                "op_id": op_id,
+            }
+        ]
+
     def test_abort_unblocks_control_request_and_sends_error_ack(self):
         """Abort messages release the non-rank executor control barrier."""
         import threading
@@ -568,6 +810,7 @@ class TestListenerAbortAndShutdown:
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, _SleepWakeupAction
 
         sent_acks = []
+        op_id = "abort-active-op"
 
         class FakeComm:
             def __init__(self):
@@ -580,6 +823,7 @@ class TestListenerAbortAndShutdown:
                 return {
                     "action": _SleepWakeupAction.ABORT,
                     "tags": [],
+                    "op_id": op_id,
                     "reason": "rank 0 send failed",
                 }
 
@@ -593,6 +837,7 @@ class TestListenerAbortAndShutdown:
         executor.control_request_barrier = threading.Event()
         executor.control_request_barrier.set()
         executor.control_action_done = threading.Event()
+        executor._active_control_id = op_id
 
         with (
             patch("torch.cuda.set_device"),
@@ -612,14 +857,19 @@ class TestListenerAbortAndShutdown:
         assert sent_acks[0]["status"] == "error"
         assert "rank 0 send failed" in sent_acks[0]["error"]
 
-    def test_abort_before_control_barrier_waits_to_unblock_request(self):
-        """An early ABORT must not ACK before control_action_done is set."""
+    def test_abort_before_control_barrier_unblocks_later_control_request(self):
+        """An early ABORT is recorded and later consumed by matching control."""
         import threading
         from unittest.mock import patch
 
+        from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
+            CONTROL_REQUEST_ID,
+            RequestQueueItem,
+        )
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, _SleepWakeupAction
 
         sent_acks = []
+        op_id = "abort-before-barrier-op"
 
         class FakeComm:
             def __init__(self):
@@ -632,6 +882,7 @@ class TestListenerAbortAndShutdown:
                 return {
                     "action": _SleepWakeupAction.ABORT,
                     "tags": [],
+                    "op_id": op_id,
                     "reason": "rank 0 send failed",
                 }
 
@@ -644,12 +895,9 @@ class TestListenerAbortAndShutdown:
         executor.dist = SimpleNamespace(rank=1)
         executor.control_request_barrier = threading.Event()
         executor.control_action_done = threading.Event()
-
-        def run_listener():
-            try:
-                executor._sleep_wakeup_listener_loop()
-            except StopIteration:
-                pass
+        executor.control_requests = [RequestQueueItem(id=CONTROL_REQUEST_ID, control_id=op_id)]
+        executor.active_requests = []
+        executor.waiting_queue = []
 
         with (
             patch("torch.cuda.set_device"),
@@ -658,16 +906,17 @@ class TestListenerAbortAndShutdown:
             patch("tensorrt_llm._torch.pyexecutor.py_executor.set_thread_local_mpi_comm"),
             patch("torch.cuda.synchronize"),
         ):
-            listener = threading.Thread(target=run_listener)
-            listener.start()
-            assert not executor.control_action_done.wait(timeout=0.05)
-            assert sent_acks == []
+            try:
+                executor._sleep_wakeup_listener_loop()
+            except StopIteration:
+                pass
+            assert sent_acks
+            assert not executor.control_request_barrier.is_set()
 
-            executor.control_request_barrier.set()
-            listener.join(timeout=1.0)
+            executor._handle_control_request()
 
-        assert not listener.is_alive()
-        assert executor.control_action_done.is_set()
+        assert executor.control_requests == []
+        assert not executor.control_request_barrier.is_set()
         assert sent_acks
         assert sent_acks[0]["status"] == "error"
 
@@ -727,7 +976,7 @@ class TestListenerAbortAndShutdown:
         executor._sleep_wakeup_listener_thread = None
         executor.dist = SimpleNamespace(rank=0, world_size=3)
 
-        monkeypatch.setattr(py_executor, "_SLEEP_WAKEUP_SHUTDOWN_ACK_TIMEOUT_S", 0.0)
+        monkeypatch.setattr(py_executor, "_SLEEP_WAKEUP_ACK_TIMEOUT_S", 0.0)
         monkeypatch.setattr(py_executor, "_SLEEP_WAKEUP_ACK_POLL_INTERVAL_S", 0.0)
 
         executor._shutdown_sleep_wakeup_listeners()
@@ -753,7 +1002,7 @@ class TestMultiRankRank0LocalFailureDrainsAcks:
 
         from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
 
-        # Two peers return ok; we only care that recv() is called for both.
+        # Two peers prepare ok, then abort ok after rank-0 local failure.
         responses = [{"status": "ok"}, {"status": "ok"}]
         w, recv_calls = _make_proto_worker(responses, world_size=3)
 
@@ -770,10 +1019,12 @@ class TestMultiRankRank0LocalFailureDrainsAcks:
             with pytest.raises(RuntimeError, match="rank 0 VMM fault"):
                 w._multi_rank_sleep_wakeup("sleep", [ExecutorMemoryType.KV_CACHE])
 
-        # Both peers must have been ACK-drained despite the local failure.
-        assert len(recv_calls) == 2, (
-            f"Expected 2 recv() calls (one per peer), got {len(recv_calls)}; "
-            "stale ACKs would corrupt the next sleep/wakeup call."
+        # Both peers must have prepare and abort ACKs drained despite the local
+        # failure.
+        assert len(recv_calls) == 4, (
+            f"Expected 4 recv() calls (prepare + abort per peer), got "
+            f"{len(recv_calls)}; stale ACKs would corrupt the next "
+            "sleep/wakeup call."
         )
 
     def test_local_failure_plus_peer_error_both_reported(self):
@@ -786,6 +1037,8 @@ class TestMultiRankRank0LocalFailureDrainsAcks:
         from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
 
         responses = [
+            {"status": "ok"},
+            {"status": "ok"},
             {"status": "ok"},
             {"status": "error", "error": "rank 2 also failed"},
         ]

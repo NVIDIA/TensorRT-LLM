@@ -131,12 +131,14 @@ class _SleepWakeupAction(StrEnum):
 
     SLEEP = "sleep"
     WAKEUP = "wakeup"
+    PREPARE = "prepare"
+    COMMIT = "commit"
     ABORT = "abort"
     SHUTDOWN = "shutdown"
 
 
 _SLEEP_WAKEUP_LISTENER_JOIN_TIMEOUT_S = 30.0
-_SLEEP_WAKEUP_SHUTDOWN_ACK_TIMEOUT_S = 30.0
+_SLEEP_WAKEUP_ACK_TIMEOUT_S = 30.0
 _SLEEP_WAKEUP_ACK_POLL_INTERVAL_S = 0.01
 
 
@@ -150,17 +152,48 @@ def _sleep_wakeup_ack_ready(comm, source: int, tag: _SleepWakeupTag) -> bool:
         "_sleep_wakeup_comm does not support nonblocking ACK probe")
 
 
-def _recv_sleep_wakeup_ack(comm, source: int, timeout_s: float) -> dict:
-    """Receive a sleep/wakeup ACK with a bounded nonblocking poll loop."""
-    deadline = time.monotonic() + timeout_s
+def _recv_sleep_wakeup_ack_until(comm,
+                                 source: int,
+                                 deadline: float,
+                                 expected_op_id: Optional[str] = None,
+                                 expected_phase: Optional[str] = None) -> dict:
+    """Receive a sleep/wakeup ACK before an absolute monotonic deadline."""
     while True:
         if _sleep_wakeup_ack_ready(comm, source, _SleepWakeupTag.ACK):
-            return comm.recv(source=source, tag=_SleepWakeupTag.ACK)
+            ack = comm.recv(source=source, tag=_SleepWakeupTag.ACK)
+            if (expected_op_id is not None
+                    and ack.get("op_id") != expected_op_id):
+                logger.warning(
+                    "Ignoring stale sleep/wakeup ACK from rank %d for op_id=%s "
+                    "(expected op_id=%s).",
+                    source,
+                    ack.get("op_id"),
+                    expected_op_id,
+                )
+                continue
+            ack_phase = ack.get("phase")
+            if (expected_phase is not None and ack_phase is not None
+                    and ack_phase != expected_phase):
+                logger.warning(
+                    "Ignoring stale sleep/wakeup ACK from rank %d for phase=%s "
+                    "(expected phase=%s).",
+                    source,
+                    ack_phase,
+                    expected_phase,
+                )
+                continue
+            return ack
         if time.monotonic() >= deadline:
             raise TimeoutError(
                 f"timed out waiting for sleep/wakeup ACK from rank {source} "
-                f"after {timeout_s:.1f} seconds")
+                f"by deadline {deadline:.6f}")
         time.sleep(_SLEEP_WAKEUP_ACK_POLL_INTERVAL_S)
+
+
+def _recv_sleep_wakeup_ack(comm, source: int, timeout_s: float) -> dict:
+    """Receive a sleep/wakeup ACK with a bounded nonblocking poll loop."""
+    return _recv_sleep_wakeup_ack_until(comm, source,
+                                        time.monotonic() + timeout_s)
 
 
 @functools.cache
@@ -797,6 +830,9 @@ class PyExecutor:
 
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()
+        self._active_control_id: Optional[str] = None
+        self._sleep_wakeup_pending_aborts: Dict[str, str] = {}
+        self._sleep_wakeup_pending_abort_lock = threading.Lock()
 
         # Resource governor queue (IpcQueue in multi-process mode,
         # IntraProcessQueue in single-process mode) for receiving cache-
@@ -1229,6 +1265,8 @@ class PyExecutor:
                 "Sending shutdown to %d sleep/wakeup listener thread(s).",
                 self.dist.world_size - 1,
             )
+            shutdown_ack_deadline = (time.monotonic() +
+                                     _SLEEP_WAKEUP_ACK_TIMEOUT_S)
             shutdown_errors = []
             shutdown_ranks = []
             for dest in range(1, self.dist.world_size):
@@ -1250,11 +1288,9 @@ class PyExecutor:
                         "rank %d: %s", dest, exc)
             for src in shutdown_ranks:
                 try:
-                    ack = _recv_sleep_wakeup_ack(
-                        self._sleep_wakeup_comm,
-                        source=src,
-                        timeout_s=_SLEEP_WAKEUP_SHUTDOWN_ACK_TIMEOUT_S,
-                    )
+                    ack = _recv_sleep_wakeup_ack_until(self._sleep_wakeup_comm,
+                                                       src,
+                                                       shutdown_ack_deadline)
                 except Exception as exc:
                     shutdown_errors.append(
                         f"rank {src} shutdown ACK recv failed: {exc}")
@@ -1280,6 +1316,28 @@ class PyExecutor:
                     _SLEEP_WAKEUP_LISTENER_JOIN_TIMEOUT_S,
                     self.dist.rank,
                 )
+
+    def _record_sleep_wakeup_abort(self, control_id: str,
+                                   error_msg: str) -> None:
+        """Remember an early ABORT until the matching control request fires."""
+        if not hasattr(self, "_sleep_wakeup_pending_abort_lock"):
+            self._sleep_wakeup_pending_abort_lock = threading.Lock()
+        if not hasattr(self, "_sleep_wakeup_pending_aborts"):
+            self._sleep_wakeup_pending_aborts = {}
+        with self._sleep_wakeup_pending_abort_lock:
+            self._sleep_wakeup_pending_aborts[control_id] = error_msg
+
+    def _pop_sleep_wakeup_abort(self,
+                                control_id: Optional[str]) -> Optional[str]:
+        """Pop a pending ABORT for a control request, if one arrived early."""
+        if control_id is None:
+            return None
+        if not hasattr(self, "_sleep_wakeup_pending_abort_lock"):
+            self._sleep_wakeup_pending_abort_lock = threading.Lock()
+        if not hasattr(self, "_sleep_wakeup_pending_aborts"):
+            self._sleep_wakeup_pending_aborts = {}
+        with self._sleep_wakeup_pending_abort_lock:
+            return self._sleep_wakeup_pending_aborts.pop(control_id, None)
 
     def enqueue_requests(
             self,
@@ -2684,12 +2742,14 @@ class PyExecutor:
         """Listener loop for sleep/wakeup control messages on non-rank-0 workers.
 
         Runs in a dedicated daemon thread on every non-rank-0 rank.  Blocks on
-        ``_sleep_wakeup_comm.recv`` waiting for a control message from rank-0, then
-        executes the requested VMM operation (``release_with_tag`` or
-        ``materialize_with_tag``) and sends an ACK back.  An ``ABORT`` message
-        unblocks the control barrier without touching VMM state when rank-0
-        could not broadcast the action to every peer.  A ``SHUTDOWN`` message
-        ACKs rank-0 and breaks the loop cleanly.
+        ``_sleep_wakeup_comm.recv`` waiting for a control message from rank-0.
+        ``PREPARE`` quiesces the rank and ACKs without changing VMM state;
+        ``COMMIT`` executes the requested VMM operation
+        (``release_with_tag`` or ``materialize_with_tag``), releases the local
+        control barrier, and ACKs.  ``ABORT`` either releases the matching
+        active control barrier or records the ``op_id`` so the executor loop can
+        skip that control request when it arrives later.  ``SHUTDOWN`` ACKs
+        rank-0 and breaks the loop cleanly.
 
         Safety notes:
         - ``_sleep_wakeup_comm`` is a dedicated duplicated MPI communicator, isolated
@@ -2702,10 +2762,12 @@ class PyExecutor:
             1. Wait on ``control_request_barrier`` to confirm the executor loop has
                drained all in-flight work (mirroring rank-0's ``control_action()``
                barrier handshake).
-            2. Perform the VMM operation with ``torch.cuda.synchronize()`` guards.
-            3. Clear ``control_request_barrier`` (reset for the next cycle) then set
+            2. ACK ``PREPARE`` while keeping the executor loop parked.
+            3. On ``COMMIT``, perform the VMM operation with
+               ``torch.cuda.synchronize()`` guards.
+            4. Clear ``control_request_barrier`` (reset for the next cycle) then set
                ``control_action_done`` to unblock the executor loop.
-            4. Send the ACK to rank-0 only *after* step 3, so rank-0 cannot exit
+            5. Send the final ACK to rank-0 only *after* step 4, so rank-0 cannot exit
                ``control_action()`` and resume broadcasting new requests before this
                rank's executor loop is guaranteed to have cleared the control barrier.
         - ``gc.collect()`` and ``torch.cuda.empty_cache()`` are safe to call
@@ -2732,7 +2794,8 @@ class PyExecutor:
                     self._sleep_wakeup_comm.send(
                         {
                             "status": "ok",
-                            "error": None
+                            "error": None,
+                            "phase": _SleepWakeupAction.SHUTDOWN,
                         },
                         dest=0,
                         tag=_SleepWakeupTag.ACK,
@@ -2741,12 +2804,15 @@ class PyExecutor:
                 # Use .get() so a missing "action" key surfaces as an unknown
                 # action inside the try rather than a bare KeyError here.
                 action = msg.get("action", "<unknown>")
+                op_id = msg.get("op_id")
                 error_msg = None
+                release_control_request = True
                 try:
                     # Decode tags inside the try so KeyError / ValueError from
                     # a malformed message still results in an error ACK being
                     # sent via the finally below, rather than deadlocking rank-0.
                     tags = [ExecutorMemoryType(t) for t in msg["tags"]]
+                    target_action = msg.get("target_action", action)
                     # Wait for the executor loop to drain all active requests and
                     # enter _handle_control_request().  It signals readiness by
                     # setting control_request_barrier (the same event rank-0's
@@ -2755,35 +2821,62 @@ class PyExecutor:
                     # on this rank when the VMM mapping is changed below.
                     if action == _SleepWakeupAction.ABORT:
                         # ABORT is sent after rank-0 fails to broadcast an
-                        # ACTION to every peer.  Wait until the executor loop
-                        # parks on the matching control request before ACKing
-                        # rank-0; otherwise the executor loop could reach the
-                        # barrier later and wait forever on control_action_done.
-                        # Rank-0 drains ACKs with a timeout, so a stale abort
-                        # cannot wedge the coordinator during shutdown/error
-                        # handling.
-                        self.control_request_barrier.wait()
+                        # ACTION to every peer.  If the matching control
+                        # request is already parked, release it below.  If the
+                        # ABORT arrived early, record it so _handle_control_request()
+                        # can skip the matching sentinel later.  This keeps
+                        # stale ABORT messages from clearing the wrong barrier
+                        # or parking the listener thread forever.
                         error_msg = (
                             "rank 0 aborted sleep/wakeup before local "
                             f"execution: {msg.get('reason', 'unknown error')}")
+                        active_control_id = getattr(self, "_active_control_id",
+                                                    None)
+                        if op_id is None:
+                            release_control_request = False
+                        elif (not self.control_request_barrier.is_set()
+                              or active_control_id != op_id):
+                            self._record_sleep_wakeup_abort(op_id, error_msg)
+                            release_control_request = False
                         logger.warning("Sleep/wakeup listener: %s", error_msg)
-                    else:
+                    elif action in (_SleepWakeupAction.PREPARE,
+                                    _SleepWakeupAction.COMMIT,
+                                    _SleepWakeupAction.SLEEP,
+                                    _SleepWakeupAction.WAKEUP):
                         self.control_request_barrier.wait()
-                        torch.cuda.synchronize()
-                    if action == _SleepWakeupAction.SLEEP:
-                        release_with_tag(*tags)
-                        torch.cuda.synchronize()
-                        gc.collect()
-                        torch.cuda.empty_cache()
-                    elif action == _SleepWakeupAction.WAKEUP:
-                        materialize_with_tag(*tags)
-                        torch.cuda.synchronize()
+                        active_control_id = getattr(self, "_active_control_id",
+                                                    None)
+                        if op_id is not None and active_control_id != op_id:
+                            error_msg = (
+                                f"stale control message for op_id={op_id}; "
+                                f"active control_id={active_control_id}")
+                            release_control_request = False
+                            logger.warning("Sleep/wakeup listener: %s",
+                                           error_msg)
+                        else:
+                            torch.cuda.synchronize()
+                            if action == _SleepWakeupAction.PREPARE:
+                                # Prepared means this rank is quiesced and
+                                # ready to commit, but VMM state is unchanged.
+                                release_control_request = False
+                            elif target_action == _SleepWakeupAction.SLEEP:
+                                release_with_tag(*tags)
+                                torch.cuda.synchronize()
+                                gc.collect()
+                                torch.cuda.empty_cache()
+                            elif target_action == _SleepWakeupAction.WAKEUP:
+                                materialize_with_tag(*tags)
+                                torch.cuda.synchronize()
+                            else:
+                                error_msg = (
+                                    f"unknown target action '{target_action}'")
+                                logger.warning(
+                                    "Sleep/wakeup listener: %s, ignoring.",
+                                    error_msg)
                     else:
-                        if action != _SleepWakeupAction.ABORT:
-                            error_msg = f"unknown action '{action}'"
-                            logger.warning(
-                                "Sleep/wakeup listener: %s, ignoring.",
-                                error_msg)
+                        error_msg = f"unknown action '{action}'"
+                        logger.warning("Sleep/wakeup listener: %s, ignoring.",
+                                       error_msg)
                 except (KeyError, TypeError, ValueError, RuntimeError,
                         torch.OutOfMemoryError) as exc:
                     error_msg = (f"rank {self.dist.rank} '{action}' failed: "
@@ -2815,8 +2908,9 @@ class PyExecutor:
                     # first so that it is clean for the next sleep/wakeup cycle
                     # before the executor loop resumes and could potentially
                     # set it again.  Only then signal control_action_done.
-                    self.control_request_barrier.clear()
-                    self.control_action_done.set()
+                    if release_control_request:
+                        self.control_request_barrier.clear()
+                        self.control_action_done.set()
                     # Send the ACK to rank-0 only after the executor loop on
                     # this rank has been unblocked.  This prevents rank-0 from
                     # exiting control_action() and broadcasting new requests
@@ -2825,7 +2919,9 @@ class PyExecutor:
                     self._sleep_wakeup_comm.send(
                         {
                             "status": "ok" if error_msg is None else "error",
-                            "error": error_msg
+                            "error": error_msg,
+                            "op_id": op_id,
+                            "phase": action,
                         },
                         dest=0,
                         tag=_SleepWakeupTag.ACK,
@@ -3751,9 +3847,23 @@ class PyExecutor:
         # freeing memory) could race with kernels still reading those tensors.
         torch.cuda.synchronize()
         self.control_requests.pop(0)
+        control_id = getattr(pending, "control_id", None)
+        self._active_control_id = control_id
+        pending_abort = self._pop_sleep_wakeup_abort(control_id)
+        if pending_abort is not None:
+            logger.warning(
+                "[control_action] skipping aborted control request %s: %s",
+                control_id,
+                pending_abort,
+            )
+            self.control_request_barrier.set()
+            self.control_request_barrier.clear()
+            self._active_control_id = None
+            return
         self.control_request_barrier.set()
         self.control_action_done.wait()
         self.control_action_done.clear()
+        self._active_control_id = None
         logger.debug("[control_action] control request finished")
 
     def _sync_and_process_resource_governor_queue(self):
@@ -3872,7 +3982,10 @@ class PyExecutor:
             mgr.resume_request(req)
 
     @contextmanager
-    def control_action(self, *, drain: bool = True):
+    def control_action(self,
+                       *,
+                       drain: bool = True,
+                       control_id: Optional[str] = None):
         """Run an action at a scheduler step boundary.
 
         drain=True  (default): block until ``active_requests`` and
@@ -3884,7 +3997,8 @@ class PyExecutor:
         """
 
         if self.dist.rank == 0:
-            self.executor_request_queue.enqueue_control_request(drain=drain)
+            self.executor_request_queue.enqueue_control_request(
+                drain=drain, control_id=control_id)
 
         self.control_request_barrier.wait()
 
