@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 MoE All-to-All Operations
 
@@ -11,6 +25,7 @@ import os
 import sys
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional
+from weakref import WeakSet
 
 import torch
 
@@ -20,6 +35,8 @@ from tensorrt_llm._torch.alltoall_watchdog import (
     DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S, ActiveRankMaskSnapshot,
     AlltoAllWatchdog, AlltoAllWatchdogCoordinator, AlltoAllWatchdogTimeout,
     EPGroupHealthLike)
+from tensorrt_llm._torch.moe_a2a_execution_control import (
+    MoeA2AExecutionAbortStatus, MoeA2AExecutionControl)
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.logger import logger as tllm_logger
 from tensorrt_llm.mapping import Mapping
@@ -33,6 +50,7 @@ class _A2AState:
     combine_payload_offset: int | None = None
     eplb_gathered_stats: torch.Tensor | None = None
     active_rank_mask_snapshot: ActiveRankMaskSnapshot | None = None
+    execution_epoch: int | None = None
 
 
 class MoeAlltoAll:
@@ -205,6 +223,7 @@ class MoeAlltoAll:
             metainfo = torch.ops.trtllm.moe_a2a_initialize(
                 workspace, self.ep_rank, self.ep_size, self.max_num_tokens,
                 self.eplb_stats_num_experts)
+            execution_control = MoeA2AExecutionControl(workspace, self.ep_rank)
             MoeAlltoAll._WORKSPACE = {
                 "workspace_size_per_rank": workspace_size_per_rank,
                 "max_num_tokens": self.max_num_tokens,
@@ -214,6 +233,8 @@ class MoeAlltoAll:
                 "mnnvl_mem": mnnvl_mem,
                 "workspace": workspace,
                 "metainfo": metainfo,
+                "execution_control": execution_control,
+                "instances": WeakSet(),
             }
         else:
             assert self._WORKSPACE[
@@ -228,9 +249,12 @@ class MoeAlltoAll:
                 "eplb_stats_num_experts"] == self.eplb_stats_num_experts, (
                     "reuse workspace with different eplb_stats_num_experts")
 
-        self.mnnvl_mem = self._WORKSPACE["mnnvl_mem"]
-        self.workspace = self._WORKSPACE["workspace"]
-        self.metainfo = self._WORKSPACE["metainfo"]
+        workspace_state = self._WORKSPACE
+        workspace_state["instances"].add(self)
+        self.mnnvl_mem = workspace_state["mnnvl_mem"]
+        self.workspace = workspace_state["workspace"]
+        self.metainfo = workspace_state["metainfo"]
+        self._execution_control = workspace_state["execution_control"]
         # Internal state
         self._state: _A2AState = _A2AState()
         self.ep_group_health = ep_group_health
@@ -311,6 +335,7 @@ class MoeAlltoAll:
         active_rank_mask_snapshot = self._watchdog_coordinator.capture_active_rank_mask(
             active_rank_mask)
         active_rank_mask = active_rank_mask_snapshot.active_rank_mask
+        execution_epoch = self._execution_control.capture_epoch()
         recv_tensors, combine_payload_offset, eplb_gathered_stats = torch.ops.trtllm.moe_a2a_dispatch(
             token_selected_experts,
             input_payloads,
@@ -323,6 +348,8 @@ class MoeAlltoAll:
             self.num_experts,
             eplb_local_stats,
             active_rank_mask,
+            self._execution_control.tensor,
+            execution_epoch,
         )
         self._watchdog_coordinator.watch_collective(self._alltoall_watchdog,
                                                     "dispatch",
@@ -335,6 +362,7 @@ class MoeAlltoAll:
         self._state.combine_payload_offset = combine_payload_offset
         self._state.eplb_gathered_stats = eplb_gathered_stats
         self._state.active_rank_mask_snapshot = active_rank_mask_snapshot
+        self._state.execution_epoch = execution_epoch
         self._state.phase = "dispatched"
 
         if invalid_token_expert_id is not None:
@@ -375,6 +403,7 @@ class MoeAlltoAll:
         """
         assert self._state.phase == "dispatched", "combine called before a successful dispatch"
         assert runtime_max_tokens_per_rank <= self.max_num_tokens, "runtime_max_tokens_per_rank must not exceed max_num_tokens"
+        assert self._state.execution_epoch is not None, "combine called without a captured execution epoch"
 
         active_rank_mask_snapshot = self._state.active_rank_mask_snapshot
         assert active_rank_mask_snapshot is not None
@@ -384,7 +413,8 @@ class MoeAlltoAll:
             payload, self._state.local_num_tokens, self.workspace,
             self.metainfo, runtime_max_tokens_per_rank, self.ep_rank,
             self.ep_size, self.top_k, self._state.combine_payload_offset,
-            payload_in_workspace, use_low_precision_combine, active_rank_mask)
+            payload_in_workspace, use_low_precision_combine, active_rank_mask,
+            self._execution_control.tensor, self._state.execution_epoch)
         self._watchdog_coordinator.watch_collective(self._alltoall_watchdog,
                                                     "combine", active_rank_mask)
 
@@ -402,6 +432,24 @@ class MoeAlltoAll:
         the next ``dispatch`` would fire the assert at line 239.
         """
         self._state = _A2AState()
+
+    def request_execution_abort(self) -> int:
+        """Let the recovery coordinator invalidate in-flight work without a CUDA stream."""
+        return self._execution_control.request_abort()
+
+    def get_execution_abort_status(
+            self) -> Optional[MoeA2AExecutionAbortStatus]:
+        """Return the first kernel-observed abort/timeout, if any."""
+        return self._execution_control.status()
+
+    def begin_execution_epoch(self,
+                              execution_epoch: Optional[int] = None) -> int:
+        """Acknowledge/reset an epoch after the coordinator has quiesced old work."""
+        acknowledged_epoch = self._execution_control.begin_epoch(
+            execution_epoch)
+        for instance in list(MoeAlltoAll._WORKSPACE["instances"]):
+            instance.reset_state()
+        return acknowledged_epoch
 
     def get_combine_payload_tensor_in_workspace(
             self, runtime_max_tokens_per_rank: int, hidden_size: int,

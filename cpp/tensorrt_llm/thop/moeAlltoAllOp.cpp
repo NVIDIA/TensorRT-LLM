@@ -20,10 +20,23 @@
 #include "tensorrt_llm/thop/moeAlltoAllMeta.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
+#include <algorithm>
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+#include <cstdint>
+#include <limits>
+#include <memory>
+#include <mutex>
 #include <torch/extension.h>
 #include <torch/types.h>
+#include <tuple>
+#include <unordered_map>
+#include <utility>
 #include <vector>
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -34,12 +47,147 @@ namespace moe_comm
 {
 
 static constexpr size_t CACHELINE_ALIGNMENT = 128;
+static constexpr size_t kExecutionDeviceStatusOffset = CACHELINE_ALIGNMENT;
+static constexpr size_t kExecutionDeviceAdmissionOffset = kExecutionDeviceStatusOffset + sizeof(uint64_t);
+static constexpr int64_t kExecutionControlLiveEpochWord = 0;
+static constexpr int64_t kExecutionControlAcknowledgedEpochWord = 1;
+static constexpr int64_t kExecutionControlTimeoutCyclesWord = 2;
+static constexpr int64_t kExecutionControlHostStatusWord = CACHELINE_ALIGNMENT / sizeof(uint64_t);
+static constexpr int64_t kExecutionControlNumWords = 2 * CACHELINE_ALIGNMENT / sizeof(uint64_t);
+static constexpr uint64_t kExecutionStatusEpochMask = (uint64_t{1} << 39) - 1;
+
+// The custom op launches asynchronously while its control tensor lives in CPU
+// memory, so PyTorch's CUDA allocator cannot defer that tensor's deletion for us.
+// Retain each tiny control allocation until an explicit, post-quiescence release.
+class ExecutionControlRegistration
+{
+public:
+    ExecutionControlRegistration(
+        torch::Tensor tensor, torch::Tensor workspace, uint64_t* deviceWords, int deviceIndex, int64_t epRank)
+        : mTensor{std::move(tensor)}
+        , mWorkspace{std::move(workspace)}
+        , mDeviceWords{deviceWords}
+        , mDeviceIndex{deviceIndex}
+        , mEpRank{epRank}
+    {
+    }
+
+    uint64_t* getDeviceWords() const
+    {
+        return mDeviceWords;
+    }
+
+    int getDeviceIndex() const
+    {
+        return mDeviceIndex;
+    }
+
+    void const* getWorkspaceBasePtr() const
+    {
+        return mWorkspace.const_data_ptr();
+    }
+
+    int64_t getEpRank() const
+    {
+        return mEpRank;
+    }
+
+    bool matchesWorkspace(torch::Tensor const& workspace) const
+    {
+        if (workspace.device() != mWorkspace.device() || workspace.const_data_ptr() != mWorkspace.const_data_ptr()
+            || workspace.dim() != mWorkspace.dim() || workspace.storage_offset() != mWorkspace.storage_offset())
+        {
+            return false;
+        }
+        for (int64_t dimension = 0; dimension < workspace.dim(); ++dimension)
+        {
+            if (workspace.size(dimension) != mWorkspace.size(dimension)
+                || workspace.stride(dimension) != mWorkspace.stride(dimension))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+private:
+    [[maybe_unused]] torch::Tensor mTensor; // Owns the mapped allocation until explicit release.
+    torch::Tensor mWorkspace;               // Keeps the device-status words alive for every asynchronous launch.
+    uint64_t* mDeviceWords{};
+    int mDeviceIndex{};
+    int64_t mEpRank{};
+};
+
+struct ExecutionControlRegistry
+{
+    std::mutex mutex;
+    std::unordered_map<void const*, ExecutionControlRegistration> controls;
+};
+
+struct ExecutionControlMapping
+{
+    uint64_t const* hostWords{};
+    uint64_t* deviceWords{};
+};
+
+ExecutionControlRegistry& getExecutionControlRegistry()
+{
+    // Intentionally process-lifetime state. Explicit release is the normal path;
+    // leaking the registry avoids cudaFreeHost calls during CUDA/DSO teardown.
+    static auto* registry = new ExecutionControlRegistry{};
+    return *registry;
+}
+
+inline uint64_t atomicLoadAcquire(uint64_t const* ptr)
+{
+#if defined(_MSC_VER)
+    auto* value = reinterpret_cast<__int64 volatile*>(const_cast<uint64_t*>(ptr));
+    return static_cast<uint64_t>(_InterlockedCompareExchange64(value, 0, 0));
+#else
+    return __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
+#endif
+}
+
+inline void atomicStoreRelease(uint64_t* ptr, uint64_t value)
+{
+#if defined(_MSC_VER)
+    auto* destination = reinterpret_cast<__int64 volatile*>(ptr);
+    (void) _InterlockedExchange64(destination, static_cast<__int64>(value));
+#else
+    __atomic_store_n(ptr, value, __ATOMIC_RELEASE);
+#endif
+}
+
+inline bool atomicCompareExchangeAcqRel(uint64_t* ptr, uint64_t& expected, uint64_t desired)
+{
+#if defined(_MSC_VER)
+    auto* destination = reinterpret_cast<__int64 volatile*>(ptr);
+    auto const observed = static_cast<uint64_t>(
+        _InterlockedCompareExchange64(destination, static_cast<__int64>(desired), static_cast<__int64>(expected)));
+    if (observed == expected)
+    {
+        return true;
+    }
+    expected = observed;
+    return false;
+#else
+    return __atomic_compare_exchange_n(ptr, &expected, desired, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+#endif
+}
 
 // TODO: Is Alignment necessary?
 // Helper function to align offset to specified byte boundary
 inline size_t alignOffset(size_t offset, size_t alignment)
 {
     return (offset + alignment - 1) & ~(alignment - 1);
+}
+
+inline void validateWorkspaceCudaTensor(
+    torch::Tensor const& tensor, torch::Tensor const& workspace, char const* tensorName)
+{
+    TORCH_CHECK(tensor.is_cuda(), tensorName, " must be a CUDA tensor");
+    TORCH_CHECK(tensor.device() == workspace.device(), tensorName, " must be on the same CUDA device as workspace (",
+        workspace.device(), "), but got ", tensor.device());
 }
 
 // Resolve an optional rank-mask tensor into a fixed-width uint64 array.
@@ -79,6 +227,222 @@ inline void resolveActiveRankMask(torch::optional<torch::Tensor> const& maskTens
         ") as active");
 }
 
+inline uint64_t const* validateExecutionControlHostTensor(torch::Tensor const& control)
+{
+    TORCH_CHECK(control.is_cpu(), "execution_control must be a CPU tensor");
+    TORCH_CHECK(control.scalar_type() == torch::kUInt64, "execution_control must have dtype uint64");
+    TORCH_CHECK(control.dim() == 1, "execution_control must be a 1D tensor");
+    TORCH_CHECK(control.numel() == kExecutionControlNumWords, "execution_control must have exactly ",
+        kExecutionControlNumWords, " uint64 elements");
+    TORCH_CHECK(control.is_contiguous(), "execution_control must be contiguous");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(control.const_data_ptr()) % alignof(uint64_t) == 0,
+        "execution_control must be naturally aligned");
+    return static_cast<uint64_t const*>(control.const_data_ptr());
+}
+
+inline uint64_t* validateMutableExecutionControlHostTensor(torch::Tensor& control)
+{
+    (void) validateExecutionControlHostTensor(control);
+    return control.data_ptr<uint64_t>();
+}
+
+inline ExecutionControlMapping getExecutionControlRegistration(
+    torch::Tensor const& control, torch::Tensor const* expectedWorkspace = nullptr, int64_t expectedEpRank = -1)
+{
+    void const* hostPtr = validateExecutionControlHostTensor(control);
+    auto& registry = getExecutionControlRegistry();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    auto const it = registry.controls.find(hostPtr);
+    TORCH_CHECK(it != registry.controls.end(),
+        "execution_control is not registered or was already released; create it with "
+        "moe_a2a_create_execution_control");
+    if (expectedWorkspace != nullptr)
+    {
+        TORCH_CHECK(it->second.getDeviceIndex() == expectedWorkspace->get_device(),
+            "execution_control was mapped for CUDA device ", it->second.getDeviceIndex(),
+            " but the workspace is on CUDA device ", expectedWorkspace->get_device());
+        TORCH_CHECK(it->second.matchesWorkspace(*expectedWorkspace),
+            "execution_control belongs to a different workspace on CUDA device ", expectedWorkspace->get_device());
+        TORCH_CHECK(it->second.getEpRank() == expectedEpRank, "execution_control belongs to ep_rank ",
+            it->second.getEpRank(), " but was used with ep_rank ", expectedEpRank);
+    }
+    return {static_cast<uint64_t const*>(hostPtr), it->second.getDeviceWords()};
+}
+
+inline uint64_t* getExecutionDeviceStatusPtr(torch::Tensor const& workspace, int64_t epRank)
+{
+    TORCH_CHECK(workspace.dim() == 2, "workspace must be a 2D tensor");
+    TORCH_CHECK(epRank >= 0 && epRank < workspace.size(0), "ep_rank out of range");
+    TORCH_CHECK(workspace.size(1) >= static_cast<int64_t>(kExecutionDeviceAdmissionOffset + sizeof(uint64_t)),
+        "workspace row is too small for execution abort device state");
+    uint8_t* rankWorkspacePtr = workspace.data_ptr<uint8_t>() + epRank * workspace.stride(0);
+    auto* statusPtr = reinterpret_cast<uint64_t*>(rankWorkspacePtr + kExecutionDeviceStatusOffset);
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(statusPtr) % alignof(uint64_t) == 0,
+        "execution abort device status must be naturally aligned");
+    return statusPtr;
+}
+
+inline tensorrt_llm::kernels::moe_comm::MoeA2AExecutionControl resolveExecutionControl(
+    torch::optional<torch::Tensor> const& controlTensor, int64_t expectedEpoch, torch::Tensor const& workspace,
+    int64_t epRank)
+{
+    using tensorrt_llm::kernels::moe_comm::MoeA2AExecutionControl;
+    TORCH_CHECK(expectedEpoch >= 0, "expected_execution_epoch must be non-negative");
+    TORCH_CHECK(static_cast<uint64_t>(expectedEpoch) <= kExecutionStatusEpochMask,
+        "expected_execution_epoch exceeds the 39-bit status range");
+    TORCH_CHECK(controlTensor.has_value() && controlTensor.value().defined(),
+        "execution_control is required so an aborted epoch cannot return unobserved partial output");
+
+    torch::Tensor const& controlTensorValue = controlTensor.value();
+    auto const registration = getExecutionControlRegistration(controlTensorValue, &workspace, epRank);
+    MoeA2AExecutionControl control{};
+    control.expected_epoch = static_cast<uint64_t>(expectedEpoch);
+    control.device_status = getExecutionDeviceStatusPtr(workspace, epRank);
+    control.device_admission = control.device_status + 1;
+    control.live_epoch = registration.deviceWords + kExecutionControlLiveEpochWord;
+    control.host_status = registration.deviceWords + kExecutionControlHostStatusWord;
+    control.timeout_cycles = atomicLoadAcquire(registration.hostWords + kExecutionControlTimeoutCyclesWord);
+    return control;
+}
+
+torch::Tensor moeA2ACreateExecutionControlOp(torch::Tensor const& workspace, int64_t epRank)
+{
+    CHECK_TH_CUDA(workspace);
+    CHECK_TYPE(workspace, torch::kUInt8);
+    TORCH_CHECK(workspace.dim() == 2, "workspace must be a 2D uint8 tensor");
+    TORCH_CHECK(workspace.size(0) > 0, "workspace must contain at least one rank row");
+    TORCH_CHECK(epRank >= 0 && epRank < workspace.size(0), "ep_rank out of range for execution_control workspace");
+    TORCH_CHECK(workspace.size(1) >= static_cast<int64_t>(kExecutionDeviceAdmissionOffset + sizeof(uint64_t)),
+        "workspace row is too small for execution abort device state");
+    at::cuda::CUDAGuard deviceGuard(workspace.device());
+    int const device = workspace.get_device();
+
+    cudaDeviceProp properties{};
+    cudaError_t result = cudaGetDeviceProperties(&properties, device);
+    TORCH_CHECK(result == cudaSuccess, "failed to query CUDA device properties: ", cudaGetErrorString(result));
+    TORCH_CHECK(properties.canMapHostMemory,
+        "NVLinkOneSided execution abort requires mapped page-locked host memory on the current CUDA device");
+
+    void* hostPtr = nullptr;
+    result = cudaHostAlloc(
+        &hostPtr, kExecutionControlNumWords * sizeof(uint64_t), cudaHostAllocMapped | cudaHostAllocPortable);
+    TORCH_CHECK(result == cudaSuccess, "failed to allocate mapped execution_control: ", cudaGetErrorString(result));
+    auto deleter = [](void* ptr) { (void) cudaFreeHost(ptr); };
+    std::unique_ptr<void, decltype(deleter)> hostAllocation{hostPtr, deleter};
+
+    void* devicePtr = nullptr;
+    result = cudaHostGetDevicePointer(&devicePtr, hostPtr, 0);
+    if (result != cudaSuccess)
+    {
+        TORCH_CHECK(
+            false, "failed to map execution_control into the current CUDA device: ", cudaGetErrorString(result));
+    }
+    std::fill_n(static_cast<uint64_t*>(hostPtr), kExecutionControlNumWords, uint64_t{0});
+
+    torch::Tensor control = torch::from_blob(hostPtr, {kExecutionControlNumWords}, deleter,
+        torch::TensorOptions().dtype(torch::kUInt64).device(torch::kCPU));
+    (void) hostAllocation.release();
+    {
+        auto& registry = getExecutionControlRegistry();
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        for (auto const& registeredControl : registry.controls)
+        {
+            TORCH_CHECK(registeredControl.second.getWorkspaceBasePtr() != workspace.const_data_ptr()
+                    || registeredControl.second.getDeviceIndex() != device
+                    || registeredControl.second.getEpRank() != epRank,
+                "workspace ep_rank ", epRank, " already has a registered execution_control");
+        }
+        bool const inserted = registry.controls
+                                  .emplace(hostPtr,
+                                      ExecutionControlRegistration{
+                                          control, workspace, static_cast<uint64_t*>(devicePtr), device, epRank})
+                                  .second;
+        TORCH_CHECK(inserted, "execution_control allocation is already registered");
+    }
+    return control;
+}
+
+void moeA2AReleaseExecutionControlOp(torch::Tensor const& control)
+{
+    void const* hostPtr = validateExecutionControlHostTensor(control);
+    auto& registry = getExecutionControlRegistry();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    TORCH_CHECK(registry.controls.erase(hostPtr) == 1, "execution_control is not registered or was already released");
+}
+
+int64_t moeA2ARequestExecutionAbortOp(torch::Tensor& control)
+{
+    // This path is used by a recovery-coordinator callback thread. Keep it CPU-only:
+    // validation must not make a CUDA runtime call that could couple abort publication
+    // to device work. Detection/watchdog threads report evidence; they do not own this write.
+    (void) getExecutionControlRegistration(control);
+    uint64_t* words = validateMutableExecutionControlHostTensor(control);
+    uint64_t* liveEpoch = words + kExecutionControlLiveEpochWord;
+    uint64_t current = atomicLoadAcquire(liveEpoch);
+    while (true)
+    {
+        TORCH_CHECK(current < kExecutionStatusEpochMask, "execution abort epoch exhausted its 39-bit status range");
+        uint64_t const next = current + 1;
+        if (atomicCompareExchangeAcqRel(liveEpoch, current, next))
+        {
+            return static_cast<int64_t>(next);
+        }
+    }
+}
+
+std::tuple<int64_t, int64_t> moeA2AGetExecutionAbortStateOp(torch::Tensor const& control)
+{
+    (void) getExecutionControlRegistration(control);
+    uint64_t const* words = validateExecutionControlHostTensor(control);
+    uint64_t const liveEpoch = atomicLoadAcquire(words + kExecutionControlLiveEpochWord);
+    uint64_t const hostStatus = atomicLoadAcquire(words + kExecutionControlHostStatusWord);
+    TORCH_CHECK(liveEpoch <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()),
+        "execution abort epoch exceeds int64 range");
+    TORCH_CHECK(hostStatus <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()),
+        "execution abort status exceeds int64 range");
+    return {static_cast<int64_t>(liveEpoch), static_cast<int64_t>(hostStatus)};
+}
+
+void moeA2ASetExecutionTimeoutForTestingOp(torch::Tensor& control, int64_t timeoutCycles)
+{
+    TORCH_CHECK(timeoutCycles >= 0, "timeout_cycles must be non-negative");
+    (void) getExecutionControlRegistration(control);
+    uint64_t* words = validateMutableExecutionControlHostTensor(control);
+    atomicStoreRelease(words + kExecutionControlTimeoutCyclesWord, static_cast<uint64_t>(timeoutCycles));
+}
+
+void moeA2ABeginExecutionEpochOp(
+    torch::Tensor& workspace, int64_t epRank, torch::Tensor& control, int64_t executionEpoch)
+{
+    CHECK_TH_CUDA(workspace);
+    CHECK_TYPE(workspace, torch::kUInt8);
+    TORCH_CHECK(workspace.dim() == 2, "workspace must be a 2D tensor");
+    TORCH_CHECK(epRank >= 0 && epRank < workspace.size(0), "ep_rank out of range");
+    TORCH_CHECK(executionEpoch >= 0, "execution_epoch must be non-negative");
+    TORCH_CHECK(static_cast<uint64_t>(executionEpoch) <= kExecutionStatusEpochMask,
+        "execution_epoch exceeds the 39-bit status range");
+
+    (void) getExecutionControlRegistration(control, &workspace, epRank);
+    uint64_t* words = validateMutableExecutionControlHostTensor(control);
+    uint64_t const liveEpoch = atomicLoadAcquire(words + kExecutionControlLiveEpochWord);
+    uint64_t const acknowledgedEpoch = atomicLoadAcquire(words + kExecutionControlAcknowledgedEpochWord);
+    TORCH_CHECK(liveEpoch == static_cast<uint64_t>(executionEpoch), "cannot begin execution epoch ", executionEpoch,
+        "; the latest requested epoch is ", liveEpoch);
+    TORCH_CHECK(static_cast<uint64_t>(executionEpoch) > acknowledgedEpoch,
+        "execution_epoch must advance beyond the acknowledged epoch ", acknowledgedEpoch);
+
+    at::cuda::CUDAGuard deviceGuard(workspace.device());
+    uint64_t* deviceStatus = getExecutionDeviceStatusPtr(workspace, epRank);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(workspace.get_device());
+    cudaError_t result = cudaMemsetAsync(deviceStatus, 0, 2 * sizeof(uint64_t), stream);
+    TORCH_CHECK(result == cudaSuccess, "failed to clear execution abort device state: ", cudaGetErrorString(result));
+    result = cudaStreamSynchronize(stream);
+    TORCH_CHECK(
+        result == cudaSuccess, "failed to synchronize execution abort status reset: ", cudaGetErrorString(result));
+    atomicStoreRelease(words + kExecutionControlHostStatusWord, uint64_t{0});
+    atomicStoreRelease(words + kExecutionControlAcknowledgedEpochWord, static_cast<uint64_t>(executionEpoch));
+}
+
 // Calculate auxiliary data offsets
 MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens, int eplbStatsNumExperts)
 {
@@ -92,6 +456,14 @@ MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens, int eplbStatsNu
     // flag_val
     offsets[FLAG_VAL_OFFSET_INDEX] = offset;
     offset += SIZEOF_INT32;
+
+    // Local device-side sticky execution status and combine admission word. Keep
+    // both on a dedicated cacheline; their offsets are intentionally private so
+    // the ten-entry metainfo ABI remains stable.
+    offset = alignOffset(offset, CACHELINE_ALIGNMENT);
+    TLLM_CHECK(offset == kExecutionDeviceStatusOffset);
+    offset += 2 * sizeof(uint64_t);
+    offset = alignOffset(offset, CACHELINE_ALIGNMENT);
 
     // local_token_counter
     offsets[LOCAL_TOKEN_COUNTER_OFFSET_INDEX] = offset;
@@ -222,7 +594,8 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     torch::Tensor const& tokenSelectedExperts, std::vector<torch::Tensor> const& inputPayloads,
     torch::Tensor const& workspace, torch::Tensor const& metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank,
     int64_t epSize, int64_t topK, int64_t numExperts, torch::optional<torch::Tensor> eplbLocalStats,
-    torch::optional<torch::Tensor> activeRankMask)
+    torch::optional<torch::Tensor> activeRankMask, torch::optional<torch::Tensor> executionControl,
+    int64_t expectedExecutionEpoch)
 {
     using tensorrt_llm::kernels::moe_comm::PayloadDescriptor;
     using tensorrt_llm::kernels::moe_comm::MoeA2ADispatchParams;
@@ -231,13 +604,21 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     using tensorrt_llm::kernels::moe_comm::kMaxPayloads;
     using tensorrt_llm::kernels::moe_comm::kMaxRanks;
 
+    CHECK_TH_CUDA(workspace);
+    CHECK_TYPE(workspace, torch::kUInt8);
+    at::cuda::CUDAGuard deviceGuard(workspace.device());
+    int const workspaceDevice = workspace.get_device();
+
     // Validate inputs
     CHECK_INPUT(tokenSelectedExperts, torch::kInt32);
+    validateWorkspaceCudaTensor(tokenSelectedExperts, workspace, "tokenSelectedExperts");
     TORCH_CHECK(tokenSelectedExperts.dim() == 2, "tokenSelectedExperts must be a 2D tensor");
     TORCH_CHECK(tokenSelectedExperts.size(1) == topK, "tokenSelectedExperts must have topK columns");
 
     CHECK_CPU(metainfo);
+    TORCH_CHECK(metainfo.is_cpu(), "metainfo must be a CPU tensor");
     CHECK_TYPE(metainfo, torch::kInt64);
+    TORCH_CHECK(metainfo.is_contiguous(), "metainfo must be contiguous");
     TORCH_CHECK(metainfo.dim() == 1, "metainfo must be a 1D tensor");
     TORCH_CHECK(metainfo.size(0) == static_cast<int64_t>(NUM_METAINFO_FIELDS),
         "metainfo must have NUM_METAINFO_FIELDS elements");
@@ -264,6 +645,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
         TORCH_CHECK(eplbStatsNumExperts > 0, "eplb_local_stats must not be empty");
         TORCH_CHECK(eplbStatsNumExperts <= numExperts, "eplb_local_stats size must be <= numExperts (slots)");
         CHECK_INPUT(eplbLocalStatsTensor, torch::kInt32);
+        validateWorkspaceCudaTensor(eplbLocalStatsTensor, workspace, "eplb_local_stats");
         TORCH_CHECK(eplbLocalStatsTensor.is_contiguous(), "eplb_local_stats must be contiguous");
         TORCH_CHECK(eplbLocalStatsTensor.dim() == 1, "eplb_local_stats must be a 1D tensor");
     }
@@ -293,6 +675,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     {
         CHECK_CONTIGUOUS(payload);
         CHECK_TH_CUDA(payload);
+        validateWorkspaceCudaTensor(payload, workspace, "payload");
         TORCH_CHECK(payload.dim() == 2, "payload must be a 2D tensor");
         TORCH_CHECK(
             payload.size(0) == localNumTokens, "payload must have the same first dimension as tokenSelectedExperts");
@@ -316,8 +699,6 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
         currentOffset = alignOffset(currentOffset, CACHELINE_ALIGNMENT);
     }
 
-    CHECK_TH_CUDA(workspace);
-    CHECK_TYPE(workspace, torch::kUInt8);
     // Don't check contiguous - MnnvlMemory creates strided tensors for multi-GPU
     TORCH_CHECK(workspace.dim() == 2, "workspace must be a 2D tensor of shape [epSize, sizePerRank]");
     TORCH_CHECK(workspace.size(0) == epSize, "workspace first dimension must equal epSize");
@@ -406,14 +787,16 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     // Resolve the optional active-rank mask. Default (no mask) = all bits set, which
     // exactly reproduces the pre-fault-tolerance kernel behavior.
     resolveActiveRankMask(activeRankMask, epRank, params.active_rank_mask);
+    auto const resolvedExecutionControl
+        = resolveExecutionControl(executionControl, expectedExecutionEpoch, workspace, epRank);
 
-    params.stream = at::cuda::getCurrentCUDAStream();
+    params.stream = at::cuda::getCurrentCUDAStream(workspaceDevice);
 
     // Prepare for dispatch (zero counters/indices and increment flag_val)
-    moe_a2a_prepare_dispatch_launch(params);
+    moe_a2a_prepare_dispatch_launch(params, resolvedExecutionControl);
 
     // Launch the dispatch kernel
-    moe_a2a_dispatch_launch(params);
+    moe_a2a_dispatch_launch(params, resolvedExecutionControl);
     cudaError_t result = cudaGetLastError();
     TORCH_CHECK(result == cudaSuccess, "moe_a2a_dispatch kernel launch failed: ", cudaGetErrorString(result));
 
@@ -461,15 +844,22 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
 torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumTokens, torch::Tensor const& workspace,
     torch::Tensor const& metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank, int64_t epSize, int64_t topK,
     int64_t combinePayloadOffset, bool payloadInWorkspace, bool useLowPrecision = false,
-    torch::optional<torch::Tensor> activeRankMask = torch::nullopt)
+    torch::optional<torch::Tensor> activeRankMask = torch::nullopt,
+    torch::optional<torch::Tensor> executionControl = torch::nullopt, int64_t expectedExecutionEpoch = 0)
 {
     using tensorrt_llm::kernels::moe_comm::MoeA2ACombineParams;
     using tensorrt_llm::kernels::moe_comm::moe_a2a_combine_launch;
     using tensorrt_llm::kernels::moe_comm::kMaxTopK;
     using tensorrt_llm::kernels::moe_comm::kMaxRanks;
 
+    CHECK_TH_CUDA(workspace);
+    CHECK_TYPE(workspace, torch::kUInt8);
+    at::cuda::CUDAGuard deviceGuard(workspace.device());
+    int const workspaceDevice = workspace.get_device();
+
     // Validate inputs
     CHECK_TH_CUDA(payload);
+    validateWorkspaceCudaTensor(payload, workspace, "payload");
     CHECK_CONTIGUOUS(payload);
     TORCH_CHECK(payload.dim() == 3, "payload must be a 3D tensor [ep_size, max_tokens_per_rank, elements_per_token]");
     TORCH_CHECK(payload.size(0) == epSize, "payload first dimension must equal epSize");
@@ -506,15 +896,15 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     // use_low_precision is passed through to the kernel via params.use_low_precision; dtype is not mutated.
 
     CHECK_CPU(metainfo);
+    TORCH_CHECK(metainfo.is_cpu(), "metainfo must be a CPU tensor");
     CHECK_TYPE(metainfo, torch::kInt64);
+    TORCH_CHECK(metainfo.is_contiguous(), "metainfo must be contiguous");
     TORCH_CHECK(metainfo.dim() == 1, "metainfo must be a 1D tensor");
     TORCH_CHECK(metainfo.size(0) == static_cast<int64_t>(NUM_METAINFO_FIELDS),
         "metainfo must have NUM_METAINFO_FIELDS elements");
     MoeA2ADataOffsets const& offsets = *reinterpret_cast<MoeA2ADataOffsets const*>(metainfo.data_ptr<int64_t>());
 
     // Validate workspace and set synchronization pointers
-    CHECK_TH_CUDA(workspace);
-    CHECK_TYPE(workspace, torch::kUInt8);
     TORCH_CHECK(workspace.dim() == 2 && workspace.size(0) == epSize, "workspace must be [ep_size, size_per_rank]");
     uint8_t* workspacePtr = workspace.data_ptr<uint8_t>();
     int64_t sizePerRank = workspace.size(1);
@@ -572,13 +962,15 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
 
     // Resolve the optional active-rank mask. Default (no mask) = all bits set.
     resolveActiveRankMask(activeRankMask, epRank, params.active_rank_mask);
+    auto const resolvedExecutionControl
+        = resolveExecutionControl(executionControl, expectedExecutionEpoch, workspace, epRank);
 
-    params.stream = at::cuda::getCurrentCUDAStream();
+    params.stream = at::cuda::getCurrentCUDAStream(workspaceDevice);
 
-    moe_a2a_prepare_combine_launch(params);
+    moe_a2a_prepare_combine_launch(params, resolvedExecutionControl);
 
     // Launch the combine kernel
-    moe_a2a_combine_launch(params);
+    moe_a2a_combine_launch(params, resolvedExecutionControl);
     cudaError_t result = cudaGetLastError();
     TORCH_CHECK(result == cudaSuccess, "moe_a2a_combine kernel launch failed: ", cudaGetErrorString(result));
 
@@ -667,13 +1059,15 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "Tensor(a!->*) workspace, Tensor metainfo, int runtime_max_tokens_per_rank, "
         "int ep_rank, int ep_size, int top_k, int num_experts, "
         "Tensor? eplb_local_stats=None, "
-        "Tensor? active_rank_mask=None) -> (Tensor(a!)[], int, Tensor(a!))");
+        "Tensor? active_rank_mask=None, Tensor(b!)? execution_control=None, "
+        "int expected_execution_epoch=0) -> (Tensor(a!)[], int, Tensor(a!))");
     module.def(
         "moe_a2a_combine(Tensor(a) payload, int local_num_tokens,"
         "Tensor(a!) workspace, Tensor metainfo, int runtime_max_tokens_per_rank, "
         "int ep_rank, int ep_size, int top_k, int combine_payload_offset, "
         "bool payload_in_workspace, bool use_low_precision=False, "
-        "Tensor? active_rank_mask=None) -> Tensor");
+        "Tensor? active_rank_mask=None, Tensor(b!)? execution_control=None, "
+        "int expected_execution_epoch=0) -> Tensor");
     module.def(
         "moe_a2a_initialize(Tensor(a!) workspace, int ep_rank, int ep_size, int max_num_tokens_per_rank, "
         "int? eplb_stats_num_experts=None) -> Tensor");
@@ -686,6 +1080,19 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "int combine_payload_offset, ScalarType out_dtype, int hidden_size) -> Tensor(a)");
     module.def("moe_a2a_get_aux_data_size(int ep_size, int max_num_tokens, int? eplb_stats_num_experts=None) -> int",
         &tensorrt_llm::torch_ext::moe_comm::moeA2AGetAuxDataSizeOp);
+    module.def("moe_a2a_create_execution_control(Tensor workspace, int ep_rank) -> Tensor",
+        &tensorrt_llm::torch_ext::moe_comm::moeA2ACreateExecutionControlOp);
+    module.def("moe_a2a_request_execution_abort(Tensor(a!) execution_control) -> int",
+        &tensorrt_llm::torch_ext::moe_comm::moeA2ARequestExecutionAbortOp);
+    module.def("moe_a2a_get_execution_abort_state(Tensor execution_control) -> (int, int)",
+        &tensorrt_llm::torch_ext::moe_comm::moeA2AGetExecutionAbortStateOp);
+    module.def("moe_a2a_set_execution_timeout_for_testing(Tensor(a!) execution_control, int timeout_cycles) -> ()",
+        &tensorrt_llm::torch_ext::moe_comm::moeA2ASetExecutionTimeoutForTestingOp);
+    module.def("moe_a2a_release_execution_control(Tensor(a!) execution_control) -> ()",
+        &tensorrt_llm::torch_ext::moe_comm::moeA2AReleaseExecutionControlOp);
+    module.def(
+        "moe_a2a_begin_execution_epoch(Tensor(a!) workspace, int ep_rank, Tensor(b!) execution_control, int "
+        "execution_epoch) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, module)
@@ -696,4 +1103,5 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, module)
     module.impl("moe_a2a_sanitize_expert_ids", &tensorrt_llm::torch_ext::moe_comm::moeA2ASanitizeExpertIdsOp);
     module.impl(
         "moe_a2a_get_combine_payload_tensor", &tensorrt_llm::torch_ext::moe_comm::moeA2AGetCombinePayloadTensorOp);
+    module.impl("moe_a2a_begin_execution_epoch", &tensorrt_llm::torch_ext::moe_comm::moeA2ABeginExecutionEpochOp);
 }

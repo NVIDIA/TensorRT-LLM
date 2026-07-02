@@ -65,6 +65,9 @@ l0_gb200_multi_gpus:
   - accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_mode_b_overlap
   - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm
   - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_postquant
+  - unittest/_torch/test_moe_a2a_execution_control.py
+  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_running_dispatch_abort_keeps_cuda_context TIMEOUT (60)
+  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_running_combine_abort_keeps_cuda_context TIMEOUT (60)
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python_fabric_memory[TinyLlama-1.1B-Chat-v1.0]
 
 - condition:

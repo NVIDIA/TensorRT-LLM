@@ -50,6 +50,7 @@ import atexit
 import os
 import pickle
 import sys
+import time
 import traceback
 from dataclasses import dataclass
 from functools import lru_cache
@@ -75,6 +76,7 @@ from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_two_sided_flashi
 )
 from tensorrt_llm._torch.modules.fused_moe.deep_ep_utils import deep_ep_installed
 from tensorrt_llm._torch.modules.fused_moe.ep_group_health import EPGroupHealth
+from tensorrt_llm._torch.moe_a2a_execution_control import MoeA2AExecutionAbortStatus
 from tensorrt_llm.deep_ep.buffer import Buffer
 from tensorrt_llm.mapping import Mapping
 
@@ -115,6 +117,16 @@ FIXED_NUM_EXPERTS = 32
 # Force consistent NVLinkOneSided workspace size across varying top_k
 # to avoid _WORKSPACE singleton assertion failures.
 NVLINK_WORKSPACE_MB = "512"
+
+# Running-kernel abort tests use a real missing participant but keep all MPI
+# processes alive. These bounds guard CI against regressing to the legacy
+# 300-second trap path.
+EXECUTION_ABORT_READY_TIMEOUT_S = 5.0
+EXECUTION_ABORT_RETURN_TIMEOUT_S = 5.0
+EXECUTION_ABORT_EXECUTOR_TIMEOUT_S = 30.0
+EXECUTION_ABORT_TEST_TIMEOUT_CYCLES = 20_000_000
+EXECUTION_ABORT_SOURCE_HOST = "host_requested"
+EXECUTION_ABORT_SOURCE_TIMEOUT = "timeout"
 
 # ============================================================================
 # Test Configuration
@@ -268,6 +280,7 @@ def _run_nvlink_rank_mask_dispatch(
     payload: torch.Tensor,
     runtime_max_tokens_per_rank: int,
     active_rank_mask: Optional[torch.Tensor],
+    execution_epoch: int,
 ) -> Tuple[List[torch.Tensor], int, torch.Tensor, torch.Tensor]:
     """Run raw NVLink one-sided dispatch with an optional active rank mask."""
     recv_tensors, combine_payload_offset, _ = torch.ops.trtllm.moe_a2a_dispatch(
@@ -282,6 +295,8 @@ def _run_nvlink_rank_mask_dispatch(
         comm.num_experts,
         None,  # eplb_local_stats
         active_rank_mask,
+        comm._execution_control.tensor,
+        execution_epoch,
     )
 
     topk_target_ranks = _read_nvlink_topk_target_ranks(
@@ -304,6 +319,7 @@ def _run_nvlink_rank_mask_combine(
     runtime_max_tokens_per_rank: int,
     combine_payload_offset: int,
     active_rank_mask: Optional[torch.Tensor],
+    execution_epoch: int,
 ) -> torch.Tensor:
     """Run raw NVLink one-sided combine with an optional active rank mask."""
     return torch.ops.trtllm.moe_a2a_combine(
@@ -319,6 +335,8 @@ def _run_nvlink_rank_mask_combine(
         False,  # payload_in_workspace
         False,  # use_low_precision
         active_rank_mask,
+        comm._execution_control.tensor,
+        execution_epoch,
     )
 
 
@@ -330,12 +348,14 @@ def _run_nvlink_rank_mask_dispatch_combine(
     active_rank_mask: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run raw NVLink one-sided dispatch/combine with an optional active rank mask."""
+    execution_epoch = comm._execution_control.capture_epoch()
     recv_tensors, combine_payload_offset, topk_target_ranks, _ = _run_nvlink_rank_mask_dispatch(
         comm,
         token_selected_experts,
         payload,
         runtime_max_tokens_per_rank,
         active_rank_mask,
+        execution_epoch,
     )
     combined = _run_nvlink_rank_mask_combine(
         comm,
@@ -344,6 +364,7 @@ def _run_nvlink_rank_mask_dispatch_combine(
         runtime_max_tokens_per_rank,
         combine_payload_offset,
         active_rank_mask,
+        execution_epoch,
     )
     return combined.cpu(), topk_target_ranks
 
@@ -1345,6 +1366,7 @@ def _worker_rank_mask_inactive_before_combine(
             device="cuda",
         )
         payload = _make_rank_mask_payload(local_num_tokens, config.hidden_size, rank)
+        execution_epoch = comm._execution_control.capture_epoch()
 
         recv_tensors, combine_payload_offset, topk_target_ranks, topk_send_indices = (
             _run_nvlink_rank_mask_dispatch(
@@ -1353,6 +1375,7 @@ def _worker_rank_mask_inactive_before_combine(
                 payload,
                 local_num_tokens,
                 active_rank_mask=_ep_mask_words(config.ep_size, dead_ranks=set()),
+                execution_epoch=execution_epoch,
             )
         )
 
@@ -1377,6 +1400,7 @@ def _worker_rank_mask_inactive_before_combine(
             local_num_tokens,
             combine_payload_offset,
             active_rank_mask=_ep_mask_words(config.ep_size, dead_ranks=dead_ranks),
+            execution_epoch=execution_epoch,
         ).cpu()
 
         MPI.COMM_WORLD.barrier()
@@ -1392,6 +1416,488 @@ def _worker_rank_mask_inactive_before_combine(
     finally:
         if comm is not None and hasattr(comm, "destroy"):
             comm.destroy()
+
+
+def _set_execution_timeout_for_testing(comm: NVLinkOneSided, timeout_cycles: int) -> None:
+    torch.ops.trtllm.moe_a2a_set_execution_timeout_for_testing(
+        comm._execution_control.tensor,
+        timeout_cycles,
+    )
+
+
+def _poll_execution_abort_status(
+    comm: NVLinkOneSided,
+) -> tuple[MoeA2AExecutionAbortStatus, float]:
+    """Poll mapped host status without making a CUDA runtime call."""
+    start = time.monotonic()
+    deadline = start + EXECUTION_ABORT_RETURN_TIMEOUT_S
+    while time.monotonic() < deadline:
+        status = comm.get_execution_abort_status()
+        if status is not None:
+            return status, time.monotonic() - start
+        time.sleep(0.001)
+    raise TimeoutError("kernel abort status was not visible to the CPU before CUDA synchronization")
+
+
+def _finish_running_abort(
+    comm: NVLinkOneSided,
+    abort_source: str,
+    probe_multiplier: int,
+    probe_offset: int,
+) -> dict:
+    """Observe abort status from the CPU, quiesce CUDA, and reset the epoch."""
+    drain_start = time.monotonic()
+    if abort_source == EXECUTION_ABORT_SOURCE_HOST:
+        requested_epoch = comm.request_execution_abort()
+    elif abort_source == EXECUTION_ABORT_SOURCE_TIMEOUT:
+        requested_epoch = None
+    else:
+        raise ValueError(f"unsupported abort source: {abort_source}")
+
+    status, abort_elapsed_s = _poll_execution_abort_status(comm)
+    # Status visibility is not a quiescence signal. Synchronize only after the
+    # CPU-only poll has observed the system-scope status publication.
+    torch.cuda.synchronize()
+    drain_elapsed_s = time.monotonic() - drain_start
+
+    probe_input = torch.arange(16, dtype=torch.int64, device="cuda")
+    probe_output = probe_input * probe_multiplier + probe_offset
+    torch.cuda.synchronize()
+    expected_probe = torch.arange(16, dtype=torch.int64) * probe_multiplier + probe_offset
+    probe_ok = torch.equal(probe_output.cpu(), expected_probe)
+
+    if requested_epoch is None:
+        # A kernel timeout does not itself publish the next host execution epoch.
+        requested_epoch = comm.request_execution_abort()
+    _set_execution_timeout_for_testing(comm, 0)
+    acknowledged_epoch = comm.begin_execution_epoch(requested_epoch)
+    status_cleared = comm.get_execution_abort_status() is None
+
+    return {
+        "requested_epoch": requested_epoch,
+        "acknowledged_epoch": acknowledged_epoch,
+        "abort_elapsed_s": abort_elapsed_s,
+        "drain_elapsed_s": drain_elapsed_s,
+        "probe_ok": probe_ok,
+        "status_cleared": status_cleared,
+        "status_visible_before_sync": True,
+        "status": {
+            "execution_epoch": status.execution_epoch,
+            "phase": status.phase,
+            "reason": status.reason,
+            "waiting_peer": status.waiting_peer,
+        },
+    }
+
+
+def _finish_prelaunch_stale_epoch_abort(
+    comm: NVLinkOneSided,
+    requested_epoch: int,
+) -> dict:
+    """Observe a pre-launch epoch mismatch before any CUDA synchronization."""
+    status, abort_elapsed_s = _poll_execution_abort_status(comm)
+    torch.cuda.synchronize()
+    acknowledged_epoch = comm.begin_execution_epoch(requested_epoch)
+    return {
+        "requested_epoch": requested_epoch,
+        "acknowledged_epoch": acknowledged_epoch,
+        "abort_elapsed_s": abort_elapsed_s,
+        "status_cleared": comm.get_execution_abort_status() is None,
+        "status": {
+            "execution_epoch": status.execution_epoch,
+            "phase": status.phase,
+            "reason": status.reason,
+            "waiting_peer": status.waiting_peer,
+        },
+    }
+
+
+def _run_clean_post_reset_collective(
+    comm: NVLinkOneSided,
+    config: CommTestConfig,
+    rank: int,
+) -> bool:
+    """Prove device status was cleared by completing one healthy collective."""
+    local_num_tokens = config.all_num_tokens[rank]
+    hidden_states = _make_rank_mask_payload(local_num_tokens, config.hidden_size, rank)
+    target_experts = [
+        _compute_ep_partition(config.num_experts, config.ep_size, target_rank)[1]
+        for target_rank in range(config.top_k)
+    ]
+    token_selected_slots = torch.tensor(target_experts, dtype=torch.int32, device="cuda").repeat(
+        local_num_tokens,
+        1,
+    )
+    dispatched_hidden_states, _, _, _ = comm.dispatch(
+        hidden_states,
+        None,
+        token_selected_slots,
+        None,
+        config.all_num_tokens,
+    )
+    combined = comm.combine(dispatched_hidden_states)
+    torch.cuda.synchronize()
+    expected = hidden_states * config.top_k
+    return torch.equal(combined.cpu(), expected.cpu()) and comm.get_execution_abort_status() is None
+
+
+def _realign_completion_round_for_synthetic_rejoin(comm: NVLinkOneSided) -> None:
+    """Realign only flag rounds after the synthetic missing rank rejoins.
+
+    A real failed rank stays excluded. This test keeps it alive for MPI-pool
+    reuse, so all ranks need one common completion generation before the clean
+    all-rank probe. Do not touch the hidden device-status slot: the subsequent
+    collective must still prove that begin_execution_epoch cleared it.
+    """
+    common_flag_value = 4096
+    flag_offset = int(comm.moe_a2a_metainfo[comm.FLAG_VAL_OFFSET_INDEX].item())
+    dispatch_offset = int(comm.moe_a2a_metainfo[comm.DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX].item())
+    combine_offset = int(comm.moe_a2a_metainfo[comm.COMBINE_COMPLETION_FLAGS_OFFSET_INDEX].item())
+    local_workspace = comm.workspace[comm.ep_rank]
+    local_workspace[flag_offset : flag_offset + 4].view(torch.int32).fill_(common_flag_value)
+    local_workspace[dispatch_offset : dispatch_offset + comm.ep_size * 4].zero_()
+    local_workspace[combine_offset : combine_offset + comm.ep_size * 4].zero_()
+    torch.cuda.synchronize()
+
+
+def _worker_running_dispatch_abort(
+    config: CommTestConfig,
+    missing_rank: int,
+    abort_source: str,
+) -> dict:
+    """Abort dispatch after proving one all-active peer did not participate.
+
+    The missing rank keeps its process and GPU alive so it can observe the
+    survivors' release stores in its local MNNVL completion-flag row. It does
+    not launch dispatch. Once every survivor has signaled, an MPI barrier
+    releases their host threads to update the mapped execution epoch. This
+    makes host-request and shortened-timeout injections deterministic without
+    killing the MPI pool used by the unit-test fixture.
+    """
+    rank = tllm.mpi_rank()
+    torch.cuda.set_device(rank)
+
+    comm = None
+    queued_combine_output = None
+    result: dict = {"rank": rank, "role": "missing" if rank == missing_rank else "survivor"}
+    errors: list[str] = []
+    try:
+        mapping = Mapping(
+            rank=rank,
+            tp_size=config.ep_size,
+            moe_ep_size=config.ep_size,
+            world_size=config.ep_size,
+        )
+        comm = create_comm_object(config.comm_type, mapping, config)
+        if abort_source == EXECUTION_ABORT_SOURCE_TIMEOUT:
+            _set_execution_timeout_for_testing(comm, EXECUTION_ABORT_TEST_TIMEOUT_CYCLES)
+    except Exception:
+        # Workspace construction is itself collective. This catch is primarily
+        # diagnostic; a construction failure may still require the outer test
+        # timeout to terminate peers blocked inside initialization.
+        result["error"] = traceback.format_exc()
+        return result
+
+    # All symmetric workspaces and execution-control allocations must exist
+    # before one rank intentionally stops participating in dispatch.
+    MPI.COMM_WORLD.barrier()
+
+    try:
+        if rank == missing_rank:
+            completion_offset = int(
+                comm.moe_a2a_metainfo[comm.DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX].item()
+            )
+            completion_flags = comm.workspace[
+                rank,
+                completion_offset : completion_offset + config.ep_size * 4,
+            ].view(torch.int32)
+            live_ranks = tuple(r for r in range(config.ep_size) if r != missing_rank)
+            deadline = time.monotonic() + EXECUTION_ABORT_READY_TIMEOUT_S
+            observed = [0] * config.ep_size
+            while time.monotonic() < deadline:
+                observed = [int(value) for value in completion_flags.cpu().tolist()]
+                if all(observed[live_rank] != 0 for live_rank in live_ranks):
+                    break
+                time.sleep(0.001)
+            result["all_survivors_signaled"] = all(
+                observed[live_rank] != 0 for live_rank in live_ranks
+            )
+            result["observed_flags"] = observed
+        else:
+            local_num_tokens = config.all_num_tokens[rank]
+            torch.manual_seed(0xA2A + rank)
+            token_selected_slots = torch.randint(
+                0,
+                config.num_experts,
+                (local_num_tokens, config.top_k),
+                dtype=torch.int32,
+                device="cuda",
+            )
+            hidden_states = _make_rank_mask_payload(
+                local_num_tokens,
+                config.hidden_size,
+                rank,
+            )
+            # Prime the exact combine-output allocation while the stream is
+            # healthy. This prevents an allocator miss/retry from synchronizing
+            # the blocked dispatch before every survivor reaches the host
+            # rendezvous below.
+            combine_output_cache_seed = torch.empty_like(hidden_states)
+            torch.cuda.synchronize()
+            del combine_output_cache_seed
+            dispatched_hidden_states, _, _, _ = comm.dispatch(
+                hidden_states,
+                None,
+                token_selected_slots,
+                None,
+                config.all_num_tokens,
+            )
+            queued_epoch = int(comm._dispatch_state["execution_epoch"])
+            if abort_source == EXECUTION_ABORT_SOURCE_TIMEOUT:
+                # Dispatch already captured the short timeout by value. Restore
+                # the production timeout before combine resolves its control so
+                # the queued combine can drain promptly only through dispatch's
+                # sticky device status, not through its own short deadline.
+                _set_execution_timeout_for_testing(comm, 0)
+            # Queue combine immediately on the same stream while dispatch is
+            # blocked on the missing peer. Once dispatch latches an abort, this
+            # combine must drain from the sticky device status without waiting
+            # for its own host-epoch poll (critical for native timeout).
+            queued_combine_output = comm.combine(dispatched_hidden_states)
+            result["queued_same_epoch_combine"] = True
+            result["queued_combine_epoch"] = queued_epoch
+            result["queued_combine_shape"] = tuple(queued_combine_output.shape)
+            result["queued_combine_expected_shape"] = (local_num_tokens, config.hidden_size)
+    except Exception:
+        errors.append(traceback.format_exc())
+
+    # The missing rank enters only after it observed every survivor's release
+    # store. Survivors therefore request abort (or observe the short test
+    # timeout) while their dispatch kernels are already polling the absent rank.
+    # Every rank reaches this rendezvous even if setup failed, so one worker-side
+    # assertion cannot strand the MPI pool.
+    MPI.COMM_WORLD.barrier()
+
+    try:
+        if rank != missing_rank:
+            result.update(_finish_running_abort(comm, abort_source, 3, 1))
+            result["queued_combine_retained_through_drain"] = queued_combine_output is not None
+    except Exception:
+        errors.append(traceback.format_exc())
+
+    # Advance the synthetic missing rank too, then prove every survivor's sticky
+    # device status was cleared by completing a healthy all-rank collective.
+    MPI.COMM_WORLD.barrier()
+    try:
+        if rank == missing_rank:
+            requested_epoch = comm.request_execution_abort()
+            _set_execution_timeout_for_testing(comm, 0)
+            comm.begin_execution_epoch(requested_epoch)
+        _realign_completion_round_for_synthetic_rejoin(comm)
+    except Exception:
+        errors.append(traceback.format_exc())
+
+    MPI.COMM_WORLD.barrier()
+    try:
+        result["post_reset_collective_ok"] = _run_clean_post_reset_collective(comm, config, rank)
+    except Exception:
+        errors.append(traceback.format_exc())
+        result["post_reset_collective_ok"] = False
+
+    # With every rank participating, completion flags are immediately
+    # satisfiable. Advancing the host epoch before launch must still reject the
+    # stale dispatch at its publication gate.
+    MPI.COMM_WORLD.barrier()
+    try:
+        requested_epoch = comm.request_execution_abort()
+        local_num_tokens = config.all_num_tokens[rank]
+        token_selected_slots = torch.randint(
+            0,
+            config.num_experts,
+            (local_num_tokens, config.top_k),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        hidden_states = _make_rank_mask_payload(local_num_tokens, config.hidden_size, rank)
+        comm.dispatch(
+            hidden_states,
+            None,
+            token_selected_slots,
+            None,
+            config.all_num_tokens,
+        )
+        result["prelaunch_stale_abort"] = _finish_prelaunch_stale_epoch_abort(
+            comm,
+            requested_epoch,
+        )
+    except Exception:
+        errors.append(traceback.format_exc())
+
+    MPI.COMM_WORLD.barrier()
+    if comm is not None and hasattr(comm, "destroy"):
+        try:
+            comm.destroy()
+        except Exception:
+            result["destroy_error"] = traceback.format_exc()
+    if errors:
+        result["error"] = "\n".join(errors)
+
+    return result
+
+
+def _worker_running_combine_abort(
+    config: CommTestConfig,
+    missing_rank: int,
+    abort_source: str,
+) -> dict:
+    """Abort a multi-CTA combine after one rank intentionally skips it."""
+    rank = tllm.mpi_rank()
+    torch.cuda.set_device(rank)
+
+    comm = None
+    result: dict = {"rank": rank, "role": "missing" if rank == missing_rank else "survivor"}
+    errors: list[str] = []
+    try:
+        mapping = Mapping(
+            rank=rank,
+            tp_size=config.ep_size,
+            moe_ep_size=config.ep_size,
+            world_size=config.ep_size,
+        )
+        comm = create_comm_object(config.comm_type, mapping, config)
+    except Exception:
+        result["error"] = traceback.format_exc()
+        return result
+
+    MPI.COMM_WORLD.barrier()
+
+    dispatched_hidden_states = None
+    try:
+        local_num_tokens = config.all_num_tokens[rank]
+        torch.manual_seed(0xA2A + rank)
+        token_selected_slots = torch.randint(
+            0,
+            config.num_experts,
+            (local_num_tokens, config.top_k),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        hidden_states = _make_rank_mask_payload(
+            local_num_tokens,
+            config.hidden_size,
+            rank,
+        )
+        dispatched_hidden_states, _, _, _ = comm.dispatch(
+            hidden_states,
+            None,
+            token_selected_slots,
+            None,
+            config.all_num_tokens,
+        )
+        # Establish a clean dispatch baseline before selectively omitting one
+        # rank from combine. This also makes the combine failure phase precise.
+        torch.cuda.synchronize()
+        if abort_source == EXECUTION_ABORT_SOURCE_TIMEOUT:
+            _set_execution_timeout_for_testing(comm, EXECUTION_ABORT_TEST_TIMEOUT_CYCLES)
+    except Exception:
+        errors.append(traceback.format_exc())
+
+    MPI.COMM_WORLD.barrier()
+
+    try:
+        if rank == missing_rank:
+            completion_offset = int(
+                comm.moe_a2a_metainfo[comm.COMBINE_COMPLETION_FLAGS_OFFSET_INDEX].item()
+            )
+            completion_flags = comm.workspace[
+                rank,
+                completion_offset : completion_offset + config.ep_size * 4,
+            ].view(torch.int32)
+            live_ranks = tuple(r for r in range(config.ep_size) if r != missing_rank)
+            deadline = time.monotonic() + EXECUTION_ABORT_READY_TIMEOUT_S
+            observed = [0] * config.ep_size
+            while time.monotonic() < deadline:
+                observed = [int(value) for value in completion_flags.cpu().tolist()]
+                if all(observed[live_rank] != 0 for live_rank in live_ranks):
+                    break
+                time.sleep(0.001)
+            result["all_survivors_signaled"] = all(
+                observed[live_rank] != 0 for live_rank in live_ranks
+            )
+            result["observed_flags"] = observed
+        elif dispatched_hidden_states is not None:
+            # local_num_tokens=16 launches 16 combine CTAs and exercises the
+            # uniform post-__syncthreads abort return in every blocked CTA.
+            comm.combine(dispatched_hidden_states)
+    except Exception:
+        errors.append(traceback.format_exc())
+
+    MPI.COMM_WORLD.barrier()
+
+    try:
+        if rank != missing_rank:
+            result.update(_finish_running_abort(comm, abort_source, 5, -2))
+    except Exception:
+        errors.append(traceback.format_exc())
+
+    MPI.COMM_WORLD.barrier()
+    try:
+        if rank == missing_rank:
+            requested_epoch = comm.request_execution_abort()
+            _set_execution_timeout_for_testing(comm, 0)
+            comm.begin_execution_epoch(requested_epoch)
+        _realign_completion_round_for_synthetic_rejoin(comm)
+    except Exception:
+        errors.append(traceback.format_exc())
+
+    MPI.COMM_WORLD.barrier()
+    try:
+        result["post_reset_collective_ok"] = _run_clean_post_reset_collective(comm, config, rank)
+    except Exception:
+        errors.append(traceback.format_exc())
+        result["post_reset_collective_ok"] = False
+
+    # Establish valid dispatch data, then invalidate the epoch before combine.
+    # All ranks enter combine, so readiness flags cannot hide a missing
+    # admission-time epoch check.
+    MPI.COMM_WORLD.barrier()
+    try:
+        local_num_tokens = config.all_num_tokens[rank]
+        token_selected_slots = torch.randint(
+            0,
+            config.num_experts,
+            (local_num_tokens, config.top_k),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        hidden_states = _make_rank_mask_payload(local_num_tokens, config.hidden_size, rank)
+        dispatched_hidden_states, _, _, _ = comm.dispatch(
+            hidden_states,
+            None,
+            token_selected_slots,
+            None,
+            config.all_num_tokens,
+        )
+        torch.cuda.synchronize()
+        requested_epoch = comm.request_execution_abort()
+        comm.combine(dispatched_hidden_states)
+        result["prelaunch_stale_abort"] = _finish_prelaunch_stale_epoch_abort(
+            comm,
+            requested_epoch,
+        )
+    except Exception:
+        errors.append(traceback.format_exc())
+
+    MPI.COMM_WORLD.barrier()
+    if comm is not None and hasattr(comm, "destroy"):
+        try:
+            comm.destroy()
+        except Exception:
+            result["destroy_error"] = traceback.format_exc()
+    if errors:
+        result["error"] = "\n".join(errors)
+
+    return result
 
 
 # ============================================================================
@@ -1909,7 +2415,6 @@ def verify_combine_results(
 # ============================================================================
 # Test Parameter Generation
 # ============================================================================
-
 
 POSTQUANT_COMM_MAP: Dict[str, List[str]] = {
     "fp8": [
@@ -2438,6 +2943,121 @@ def _run_rank_mask_inactive_before_combine_test(
     assert saw_dead, f"dead rank {dead_rank} did not appear in results"
 
 
+def _run_running_dispatch_abort_test(
+    mpi_pool_executor,
+    missing_rank: int,
+    local_num_tokens: int,
+    top_k: int,
+    abort_source: str,
+) -> None:
+    ep_size = mpi_pool_executor.num_workers
+    config = _make_rank_mask_config(ep_size, local_num_tokens, top_k)
+    _skip_if_rank_mask_config_unsupported(config)
+    assert 0 <= missing_rank < ep_size
+
+    worker_args = [(config, missing_rank, abort_source)] * config.ep_size
+    results = list(
+        mpi_pool_executor.map(
+            _worker_running_dispatch_abort,
+            *zip(*worker_args),
+            timeout=EXECUTION_ABORT_EXECUTOR_TIMEOUT_S,
+        )
+    )
+
+    _assert_running_abort_results(
+        results,
+        missing_rank,
+        expected_phase="dispatch",
+        expected_reason=abort_source,
+    )
+
+
+def _run_running_combine_abort_test(
+    mpi_pool_executor,
+    missing_rank: int,
+    local_num_tokens: int,
+    top_k: int,
+    abort_source: str,
+) -> None:
+    ep_size = mpi_pool_executor.num_workers
+    config = _make_rank_mask_config(ep_size, local_num_tokens, top_k)
+    _skip_if_rank_mask_config_unsupported(config)
+    assert 0 <= missing_rank < ep_size
+
+    worker_args = [(config, missing_rank, abort_source)] * config.ep_size
+    results = list(
+        mpi_pool_executor.map(
+            _worker_running_combine_abort,
+            *zip(*worker_args),
+            timeout=EXECUTION_ABORT_EXECUTOR_TIMEOUT_S,
+        )
+    )
+
+    _assert_running_abort_results(
+        results,
+        missing_rank,
+        expected_phase="combine",
+        expected_reason=abort_source,
+    )
+
+
+def _assert_running_abort_results(
+    results: List[dict],
+    missing_rank: int,
+    expected_phase: str,
+    expected_reason: str,
+) -> None:
+    missing_results = [result for result in results if result["role"] == "missing"]
+    assert len(missing_results) == 1
+    missing_result = missing_results[0]
+    assert missing_result["rank"] == missing_rank
+    assert "error" not in missing_result, missing_result.get("error")
+    assert "destroy_error" not in missing_result, missing_result.get("destroy_error")
+    assert missing_result["all_survivors_signaled"], missing_result["observed_flags"]
+
+    for result in results:
+        assert "error" not in result, result.get("error")
+        assert "destroy_error" not in result, result.get("destroy_error")
+        assert result["post_reset_collective_ok"], (
+            f"rank {result['rank']}: clean collective failed after execution-epoch reset"
+        )
+        prelaunch_stale_abort = result["prelaunch_stale_abort"]
+        assert prelaunch_stale_abort["abort_elapsed_s"] < EXECUTION_ABORT_RETURN_TIMEOUT_S
+        assert prelaunch_stale_abort["status_cleared"]
+        assert (
+            prelaunch_stale_abort["acknowledged_epoch"] == prelaunch_stale_abort["requested_epoch"]
+        )
+        stale_status = prelaunch_stale_abort["status"]
+        assert stale_status["execution_epoch"] == prelaunch_stale_abort["requested_epoch"] - 1
+        assert stale_status["phase"] == expected_phase
+        assert stale_status["reason"] == EXECUTION_ABORT_SOURCE_HOST
+        assert stale_status["waiting_peer"] is None
+        if result["role"] == "missing":
+            continue
+        assert result["abort_elapsed_s"] < EXECUTION_ABORT_RETURN_TIMEOUT_S
+        assert result["drain_elapsed_s"] < EXECUTION_ABORT_RETURN_TIMEOUT_S
+        if expected_phase == "dispatch":
+            assert result["queued_same_epoch_combine"]
+            assert result["queued_combine_retained_through_drain"]
+            assert result["queued_combine_epoch"] == result["status"]["execution_epoch"]
+            assert result["queued_combine_shape"] == result["queued_combine_expected_shape"]
+        assert result["probe_ok"], f"rank {result['rank']}: CUDA context probe failed"
+        assert result["status_cleared"]
+        assert result["status_visible_before_sync"]
+        assert result["acknowledged_epoch"] == result["requested_epoch"]
+
+        status = result["status"]
+        assert status is not None
+        assert status["execution_epoch"] == result["requested_epoch"] - 1
+        assert status["phase"] == expected_phase
+        assert status["reason"] == expected_reason
+        # The first peer observed incomplete is timing-dependent. Preserve it
+        # as diagnostic context without making the test depend on iteration
+        # order or inter-rank scheduling.
+        waiting_peer = status["waiting_peer"]
+        assert waiting_peer is None or 0 <= waiting_peer < len(results)
+
+
 # ============================================================================
 # Test Class
 # ============================================================================
@@ -2555,4 +3175,58 @@ class TestMoEComm:
             dead_rank,
             local_num_tokens,
             top_k,
+        )
+
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.timeout(45)
+    @pytest.mark.parametrize(
+        "mpi_pool_executor,missing_rank,local_num_tokens,top_k,abort_source",
+        [
+            (4, 2, 16, 2, EXECUTION_ABORT_SOURCE_HOST),
+            (4, 2, 16, 2, EXECUTION_ABORT_SOURCE_TIMEOUT),
+        ],
+        indirect=["mpi_pool_executor"],
+    )
+    def test_moe_comm_running_dispatch_abort_keeps_cuda_context(
+        self,
+        mpi_pool_executor,
+        missing_rank: int,
+        local_num_tokens: int,
+        top_k: int,
+        abort_source: str,
+    ) -> None:
+        """Abort an in-flight missing-peer dispatch without poisoning CUDA."""
+        _run_running_dispatch_abort_test(
+            mpi_pool_executor,
+            missing_rank,
+            local_num_tokens,
+            top_k,
+            abort_source,
+        )
+
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.timeout(45)
+    @pytest.mark.parametrize(
+        "mpi_pool_executor,missing_rank,local_num_tokens,top_k,abort_source",
+        [
+            (4, 2, 16, 2, EXECUTION_ABORT_SOURCE_HOST),
+            (4, 2, 16, 2, EXECUTION_ABORT_SOURCE_TIMEOUT),
+        ],
+        indirect=["mpi_pool_executor"],
+    )
+    def test_moe_comm_running_combine_abort_keeps_cuda_context(
+        self,
+        mpi_pool_executor,
+        missing_rank: int,
+        local_num_tokens: int,
+        top_k: int,
+        abort_source: str,
+    ) -> None:
+        """Abort a multi-CTA missing-peer combine without poisoning CUDA."""
+        _run_running_combine_abort_test(
+            mpi_pool_executor,
+            missing_rank,
+            local_num_tokens,
+            top_k,
+            abort_source,
         )
