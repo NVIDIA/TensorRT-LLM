@@ -46,6 +46,8 @@ from tensorrt_llm.serve.tool_parser.gemma4_parser import (  # isort: skip
     _parse_gemma4_value,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 # Test fixtures for common tools
 @pytest.fixture

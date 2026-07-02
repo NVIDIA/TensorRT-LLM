@@ -606,6 +606,7 @@ def test_full_model_equivalence():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.cpu_only
 def test_export():
     device = "cpu"
     dtype = torch.float32

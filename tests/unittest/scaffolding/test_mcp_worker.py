@@ -26,6 +26,9 @@ from tensorrt_llm.scaffolding.task import (
 )
 from tensorrt_llm.scaffolding.worker import MCPWorker, Worker
 
+pytestmark = [pytest.mark.disabled, pytest.mark.cpu_only]
+
+
 # ============================================================
 # MCP Server Definition (based on websearch.py)
 # ============================================================

@@ -79,6 +79,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
 
     waives_file = request.config.getoption("--waives-file")
     run_ray = request.config.getoption("--run-ray")
+    unittest_markexpr = request.config.getoption("--unittest-markexpr")
 
     num_workers = 1
 
@@ -159,6 +160,9 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
 
     if run_ray:
         command += ["--run-ray"]
+
+    if unittest_markexpr:
+        command += ["-m", unittest_markexpr]
 
     command += arg_list
 

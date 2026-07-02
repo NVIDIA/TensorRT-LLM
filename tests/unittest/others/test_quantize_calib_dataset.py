@@ -15,8 +15,11 @@
 import os
 import tempfile
 
+import pytest
 import torch
 from utils.util import skip_no_modelopt
+
+pytestmark = pytest.mark.cpu_only
 
 
 @skip_no_modelopt

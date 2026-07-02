@@ -723,6 +723,7 @@ def _model_available():
     return os.path.isfile(os.path.join(MODEL_26B_PATH, "config.json"))
 
 
+@pytest.mark.cpu_only
 class TestGemma4InputProcessor(unittest.TestCase):
     """Tests for Gemma4InputProcessor with real model tokenizer/processor files."""
 

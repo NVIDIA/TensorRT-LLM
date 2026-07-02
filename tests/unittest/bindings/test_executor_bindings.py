@@ -850,6 +850,7 @@ def test_single_request_invalid_inputs(model_files, model_path):
     assert done
 
 
+@pytest.mark.cpu_only
 def test_sampling_config():
     beam_width = 1
     kwargs = {
@@ -880,6 +881,7 @@ def test_sampling_config():
         assert getattr(config, k) is None
 
 
+@pytest.mark.cpu_only
 def test_output_config():
     config = trtllm.OutputConfig()
     assert config.return_log_probs == False
@@ -905,6 +907,7 @@ def test_output_config():
     assert additional_model_output.gather_context == True
 
 
+@pytest.mark.cpu_only
 def test_output_config_pickle():
     config = trtllm.OutputConfig(
         True, False, True, False, True, False,
@@ -1005,6 +1008,7 @@ def test_multimodal_embedding():
         small_embedding), "Multimodal embedding with different shape failed"
 
 
+@pytest.mark.cpu_only
 def test_multimodal_input():
     multimodal_hashes = [[1, 2, 3], [4, 5, 6]]
     multimodal_positions = [1, 2, 3]
@@ -1035,6 +1039,7 @@ def test_multimodal_input():
         (None, None),
     ],
     ids=["all_uuids", "partial_uuids", "empty_list", "none_default"])
+@pytest.mark.cpu_only
 def test_multimodal_input_with_uuids(multimodal_uuids, expected_uuids):
     """Test MultimodalInput with user-provided UUIDs."""
     multimodal_hashes = [[1, 2, 3, 4, 5, 6, 7, 8], [8, 7, 6, 5, 4, 3, 2, 1]]
@@ -1049,6 +1054,7 @@ def test_multimodal_input_with_uuids(multimodal_uuids, expected_uuids):
     assert config.multimodal_uuids == expected_uuids
 
 
+@pytest.mark.cpu_only
 def test_multimodal_input_with_exact_run_buffers():
     """Test MultimodalInput with exact flat run buffers."""
     multimodal_hashes = [[1, 2, 3, 4, 5, 6, 7, 8], [8, 7, 6, 5, 4, 3, 2, 1]]
@@ -1077,6 +1083,7 @@ def test_multimodal_input_with_exact_run_buffers():
     assert config.multimodal_run_lengths == run_lengths
 
 
+@pytest.mark.cpu_only
 def test_multimodal_input_pickle_with_uuids():
     """Test pickling and unpickling of MultimodalInput with UUIDs."""
     multimodal_hashes = [[1, 2, 3, 4, 5, 6, 7, 8], [8, 7, 6, 5, 4, 3, 2, 1]]
@@ -1179,6 +1186,7 @@ def test_wakeup(model_files, model_path):
     assert not thread.is_alive()
 
 
+@pytest.mark.cpu_only
 def test_guided_decoding_params():
     guided_decoding_params = trtllm.GuidedDecodingParams(
         trtllm.GuidedDecodingParams.GuideType.JSON)
@@ -1249,6 +1257,7 @@ def test_request():
     assert isinstance(request.lora_config, trtllm.LoraConfig)
 
 
+@pytest.mark.cpu_only
 def test_spec_dec_fast_logits_info():
     fast_logits_info = trtllm.SpeculativeDecodingFastLogitsInfo()
     fast_logits_info.draft_request_id = 3
@@ -1334,6 +1343,7 @@ def test_result_pickle():
     assert result.request_perf_metrics.last_iter == result_copy.request_perf_metrics.last_iter
 
 
+@pytest.mark.cpu_only
 def test_response():
     request_id = 0
     error_msg = "error"
@@ -1353,6 +1363,7 @@ def test_response():
     assert response.result.output_token_ids == [[1, 2, 3]]
 
 
+@pytest.mark.cpu_only
 def test_dynamic_batch_config():
     config = trtllm.DynamicBatchConfig(enable_batch_size_tuning=True,
                                        enable_max_num_tokens_tuning=True,
@@ -1362,6 +1373,7 @@ def test_dynamic_batch_config():
     assert config.dynamic_batch_moving_average_window == 128
 
 
+@pytest.mark.cpu_only
 def test_dynamic_batch_config_pickle():
     config = trtllm.DynamicBatchConfig(enable_batch_size_tuning=True,
                                        enable_max_num_tokens_tuning=True,
@@ -1372,6 +1384,7 @@ def test_dynamic_batch_config_pickle():
     assert config_copy.dynamic_batch_moving_average_window == 128
 
 
+@pytest.mark.cpu_only
 def test_scheduler_config():
     capacity_scheduler_policy = trtllm.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
     config = trtllm.SchedulerConfig()
@@ -1412,6 +1425,7 @@ def test_scheduler_config():
     assert config.enable_prefix_aware_scheduling is False
 
 
+@pytest.mark.cpu_only
 def test_kv_cache_config():
     config = trtllm.KvCacheConfig()
     assert config.enable_block_reuse == True
@@ -1500,6 +1514,7 @@ def test_kv_cache_config():
         ), "passing runtime_defaults to the constructor or settings it manually should be equivalent"
 
 
+@pytest.mark.cpu_only
 def test_kv_cache_retention_config():
 
     TokenRangeRetentionConfig = trtllm.KvCacheRetentionConfig.TokenRangeRetentionConfig
@@ -1563,12 +1578,14 @@ def test_speculative_decoding_config():
         assert getattr(config, k) == v
 
 
+@pytest.mark.cpu_only
 def test_speculative_decoding_config_pickle():
     config = trtllm.SpeculativeDecodingConfig(True)
     config_copy = pickle.loads(pickle.dumps(config))
     assert config_copy.fast_logits == True
 
 
+@pytest.mark.cpu_only
 def test_lookahead_decoding_config():
     config = trtllm.LookaheadDecodingConfig(3, 5, 7)
     assert config.max_window_size == 3
@@ -1591,6 +1608,7 @@ def test_lookahead_decoding_config():
         assert getattr(config, k) == v
 
 
+@pytest.mark.cpu_only
 def test_lookahead_decoding_config_pickle():
     config = trtllm.LookaheadDecodingConfig(3, 5, 7)
     config_copy = pickle.loads(pickle.dumps(config))
@@ -1599,6 +1617,7 @@ def test_lookahead_decoding_config_pickle():
     assert config_copy.max_verification_set_size == 7
 
 
+@pytest.mark.cpu_only
 def test_eagle_config():
     config = trtllm.EagleConfig([[0, 0], [0, 1]], False, 0.5)
     assert config.eagle_choices == [[0, 0], [0, 1]]
@@ -1651,6 +1670,7 @@ def test_eagle_config():
         assert getattr(config, k) == v
 
 
+@pytest.mark.cpu_only
 def test_eagle_config_pickle():
     config = trtllm.EagleConfig([[0, 0], [0, 1]], False, 0.5)
     config_copy = pickle.loads(pickle.dumps(config))
@@ -1669,6 +1689,7 @@ def test_eagle_config_pickle():
     assert config.dynamic_tree_max_topK == config_copy.dynamic_tree_max_topK
 
 
+@pytest.mark.cpu_only
 def test_decoding_mode():
     mode = trtllm.DecodingMode.Auto()
     assert mode.isAuto()
@@ -1698,6 +1719,7 @@ def test_decoding_mode():
     assert mode.isEagle()
 
 
+@pytest.mark.cpu_only
 def test_speculative_decoding_config():
     config = trtllm.DecodingConfig()
     assert config.decoding_mode is None
@@ -1741,6 +1763,7 @@ def test_speculative_decoding_config():
     assert config.eagle_config.eagle_choices == [[0, 0], [0, 1]]
 
 
+@pytest.mark.cpu_only
 def test_logits_post_processor_config():
     config = trtllm.LogitsPostProcessorConfig()
     assert config.processor_map is None
@@ -1759,6 +1782,7 @@ def test_logits_post_processor_config():
         assert getattr(config, k) == v
 
 
+@pytest.mark.cpu_only
 def test_guided_decoding_config():
     encoded_vocab = ["eos", "a", "b", "c", "d"]
     tokenizer_str = None
@@ -1774,6 +1798,7 @@ def test_guided_decoding_config():
     assert guided_decoding_config.stop_token_ids == stop_token_ids
 
 
+@pytest.mark.cpu_only
 def test_executor_config():
     config = trtllm.ExecutorConfig()
     assert config.max_beam_width == 1
@@ -1880,6 +1905,7 @@ def test_executor_config():
     assert config.enable_trt_overlap is True
 
 
+@pytest.mark.cpu_only
 def test_parallel_config():
     comm_type = trtllm.CommunicationType.MPI
     comm_mode = trtllm.CommunicationMode.LEADER
@@ -1912,6 +1938,7 @@ def test_parallel_config():
     assert parallel_config.orchestrator_config.spawn_processes == True
 
 
+@pytest.mark.cpu_only
 def test_parallel_config_pickle():
     comm_type = trtllm.CommunicationType.MPI
     comm_mode = trtllm.CommunicationMode.LEADER
@@ -1931,6 +1958,7 @@ def test_parallel_config_pickle():
     assert parallel_config_copy.num_nodes == num_nodes
 
 
+@pytest.mark.cpu_only
 def test_peft_cache_config():
     num_host_module_layer = 1
     num_device_module_layer = 2
@@ -2386,6 +2414,7 @@ def test_kv_event_stream_timeout(model_path):
     assert len(events) == 0
 
 
+@pytest.mark.cpu_only
 def test_request_perf_metrics_pickle():
     metrics = trtllm.RequestPerfMetrics()
     random_delta = datetime.timedelta(seconds=42, milliseconds=123)
@@ -2430,6 +2459,7 @@ def test_request_perf_metrics_pickle():
     assert metrics.last_iter == metrics_copy.last_iter
 
 
+@pytest.mark.cpu_only
 def test_iteration_stats():
     stats = trtllm.IterationStats()
     stats.timestamp = "01:23:56"
@@ -2459,6 +2489,7 @@ def test_iteration_stats():
     assert stats_json["inflightBatchingStats"] is None
 
 
+@pytest.mark.cpu_only
 def test_request_stats():
     stats = trtllm.RequestStats()
     stats.id = 1
@@ -2481,6 +2512,7 @@ def test_request_stats():
     assert stats_json["disServingStats"] is None
 
 
+@pytest.mark.cpu_only
 def test_request_stats_per_iteration():
     stats = trtllm.RequestStatsPerIteration()
     stats.iter = 1
@@ -2492,6 +2524,7 @@ def test_request_stats_per_iteration():
     assert stats_json["requestStats"][0]["id"] == 1
 
 
+@pytest.mark.cpu_only
 def test_scheduler_config_pickle() -> None:
     policy = trtllm.CapacitySchedulerPolicy.MAX_UTILIZATION
     config = trtllm.SchedulerConfig(policy,
@@ -2502,6 +2535,7 @@ def test_scheduler_config_pickle() -> None:
     assert config_copy.enable_prefix_aware_scheduling is False
 
 
+@pytest.mark.cpu_only
 def test_kv_cache_config_pickle():
     config = trtllm.KvCacheConfig(free_gpu_memory_fraction=0.5)
     config.enable_block_reuse = True
@@ -2531,6 +2565,7 @@ def test_kv_cache_config_pickle():
     assert config.use_uvm == config_copy.use_uvm
 
 
+@pytest.mark.cpu_only
 def test_kv_cache_retention_config_pickle():
     config = trtllm.KvCacheRetentionConfig([
         trtllm.KvCacheRetentionConfig.TokenRangeRetentionConfig(
@@ -2540,6 +2575,7 @@ def test_kv_cache_retention_config_pickle():
     assert config == config_copy
 
 
+@pytest.mark.cpu_only
 def test_peft_cache_config_pickle():
     config = trtllm.PeftCacheConfig(1, 2, 3, 4, 5, 6, 7, 8, 9, 0.9, 1024)
     config_copy = pickle.loads(pickle.dumps(config))
@@ -2556,6 +2592,7 @@ def test_peft_cache_config_pickle():
     assert config.host_cache_size == config_copy.host_cache_size
 
 
+@pytest.mark.cpu_only
 def test_decoding_config_pickle():
     config = trtllm.DecodingConfig(
         decoding_mode=trtllm.DecodingMode.BeamSearch())
@@ -2565,6 +2602,7 @@ def test_decoding_config_pickle():
     assert config.medusa_choices == config_copy.medusa_choices
 
 
+@pytest.mark.cpu_only
 def test_debug_config_pickle():
     config = trtllm.DebugConfig(debug_input_tensors=True,
                                 debug_output_tensors=True,
@@ -2577,6 +2615,7 @@ def test_debug_config_pickle():
     assert config.debug_tensors_max_iterations == config_copy.debug_tensors_max_iterations
 
 
+@pytest.mark.cpu_only
 def test_logits_post_processor_config_pickle():
     kwargs = {
         "processor_map": {
@@ -2591,6 +2630,7 @@ def test_logits_post_processor_config_pickle():
         assert getattr(config, k) == getattr(config_copy, k)
 
 
+@pytest.mark.cpu_only
 def test_guided_decoding_params_pickle():
 
     class Answer(BaseModel):
@@ -2604,6 +2644,7 @@ def test_guided_decoding_params_pickle():
     assert params_copy.guide == params.guide
 
 
+@pytest.mark.cpu_only
 def test_guided_decoding_config_pickle():
     encoded_vocab = ["eos", "a", "b", "c", "d"]
     tokenizer_str = None
@@ -2620,6 +2661,7 @@ def test_guided_decoding_config_pickle():
     assert config_copy.stop_token_ids == config.stop_token_ids
 
 
+@pytest.mark.cpu_only
 def test_cache_transceiver_config_pickle():
     config = trtllm.CacheTransceiverConfig(
         backend=trtllm.CacheTransceiverBackendType.UCX,
@@ -2631,6 +2673,7 @@ def test_cache_transceiver_config_pickle():
     assert config_copy.kv_transfer_poll_interval_ms == config.kv_transfer_poll_interval_ms
 
 
+@pytest.mark.cpu_only
 def test_executor_config_pickle() -> None:
     beam_width = 2
     config = trtllm.ExecutorConfig(beam_width)
@@ -2734,6 +2777,7 @@ def test_executor_config_pickle() -> None:
     assert config.enable_trt_overlap == config_copy.enable_trt_overlap
 
 
+@pytest.mark.cpu_only
 def test_return_full_tokens():
     max_tokens = 5
     input_tokens = [1, 2, 3, 4]
@@ -2747,6 +2791,7 @@ def test_return_full_tokens():
     assert request.return_all_generated_tokens == False
 
 
+@pytest.mark.cpu_only
 def test_getters_return_references():
     config = trtllm.ExecutorConfig()
     # Make sure kv_cache_config is a reference. Returning a value
@@ -2756,6 +2801,7 @@ def test_getters_return_references():
     assert config.kv_cache_config.max_tokens == 42
 
 
+@pytest.mark.cpu_only
 def test_allotted_time_ms():
     allotted_time = datetime.timedelta(milliseconds=2)
     input_tokens = [1, 2, 3, 4]
@@ -2768,6 +2814,7 @@ def test_allotted_time_ms():
     assert request.allotted_time_ms == datetime.timedelta(milliseconds=2)
 
 
+@pytest.mark.cpu_only
 def test_executor_version():
     assert trtllm.__version__ == trtllm_version.__version__
 
@@ -2780,6 +2827,7 @@ def get_all_field_names_of_class(cls: type) -> list[str]:
     ]
 
 
+@pytest.mark.cpu_only
 def test_runtime_defaults():
     full_runtime_defaults: dict[str, tp.Any] = json.loads("""{
         "max_attention_window": [1, 2],
@@ -2804,6 +2852,7 @@ def test_runtime_defaults():
         assert getattr(default_runtime_defaults, key) is None
 
 
+@pytest.mark.cpu_only
 def test_request_pickle():
 
     samplingConfig = trtllm.SamplingConfig(beam_width=1,

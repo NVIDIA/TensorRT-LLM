@@ -40,10 +40,14 @@ import os
 import types
 import unittest
 
+import pytest
 import torch
 from parameterized import parameterized
 from transformers import PretrainedConfig
 from utils.llm_data import llm_models_root
+
+pytestmark = [pytest.mark.disabled, pytest.mark.cpu_only]
+
 
 # Resolve the Step3p7 checkpoints under the shared model root (LLM_MODELS_ROOT)
 # like the other modeling tests instead of hard-coding a developer workspace

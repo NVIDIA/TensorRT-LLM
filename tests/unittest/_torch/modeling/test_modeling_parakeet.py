@@ -59,6 +59,7 @@ def _make_sound_config(**overrides):
     return SimpleNamespace(**defaults)
 
 
+@pytest.mark.cpu_only
 class TestParakeetExtractor:
     def test_clip_sizes_short_audio(self):
         ext = _make_extractor()

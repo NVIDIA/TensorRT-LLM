@@ -28,7 +28,6 @@ import numpy as np
 import torch
 from accelerate.hooks import remove_hook_from_module
 from datasets import load_dataset
-from modelopt.torch.utils import print_rank_0
 from safetensors.torch import load_file, save_file
 from torch import nn
 from torch.utils.data import DataLoader
@@ -126,6 +125,11 @@ def quant_cfg_choices():
     if hasattr(mtq, "NVFP4_DEFAULT_CFG"):
         QUANT_CFG_CHOICES["nvfp4"] = mtq.NVFP4_DEFAULT_CFG
     return QUANT_CFG_CHOICES
+
+
+def print_rank_0(*args, **kwargs):
+    from modelopt.torch.utils import print_rank_0 as _print_rank_0
+    _print_rank_0(*args, **kwargs)
 
 
 def model_type_is_enc_dec(model_type):

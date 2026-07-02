@@ -19,6 +19,8 @@ import pytest
 
 from tensorrt_llm._torch.auto_deploy import LLM, DemoLLM, LlmArgs
 
+pytestmark = pytest.mark.cpu_only
+
 
 def test_custom_values():
     """Test that AutoDeploy LlmArgs correctly accepts custom values."""
@@ -112,27 +114,28 @@ def test_cache_transceiver_rejects_unmanaged_persistent_caches():
 # ================================
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def test_config_params():
     """Common test configuration parameters."""
-    return {
-        "model": "test-model",
-        "model_factory": "AutoModelForImageTextToText",
-        "skip_loading_weights": True,
-        "max_seq_len": 19,
-        "max_batch_size": 128,
-        "world_size": 3,
-        "transforms": {
-            "detect_sharding": {
-                "stage": "sharding",
-                "simple_shard_only": True,
+    with patch("tensorrt_llm.llmapi.llm.get_device_count", return_value=3):
+        yield {
+            "model": "test-model",
+            "model_factory": "AutoModelForImageTextToText",
+            "skip_loading_weights": True,
+            "max_seq_len": 19,
+            "max_batch_size": 128,
+            "world_size": 3,
+            "transforms": {
+                "detect_sharding": {
+                    "stage": "sharding",
+                    "simple_shard_only": True,
+                },
+                "insert_cached_attention": {
+                    "stage": "cache_init",
+                    "backend": "flashinfer",
+                },
             },
-            "insert_cached_attention": {
-                "stage": "cache_init",
-                "backend": "flashinfer",
-            },
-        },
-    }
+        }
 
 
 @pytest.mark.parametrize(
@@ -174,7 +177,7 @@ def test_config_flow(
     mock_seq_info.return_value = mock_seq_info_instance
 
     # Merge extra kwargs for the specific API
-    config_params = {**test_config_params, **extra_kwargs}
+    config_params = {**test_config_params, **extra_kwargs, "gpus_per_node": 1}
 
     # Create instance with appropriate mocking
     with patch.object(api_class, "_try_load_tokenizer", return_value=MagicMock()):

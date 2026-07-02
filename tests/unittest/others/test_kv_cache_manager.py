@@ -14,12 +14,15 @@
 # limitations under the License.
 import unittest
 
+import pytest
 import torch
 
 import tensorrt_llm
 from tensorrt_llm.runtime.kv_cache_manager import (Block, BlocksManager,
                                                    GenerationSequence,
                                                    KVCacheManager)
+
+pytestmark = pytest.mark.cpu_only
 
 
 class TestKVCacheManager(unittest.TestCase):

@@ -17,7 +17,12 @@
 import json
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from tensorrt_llm.usage import schema, usage_lib
+
+pytestmark = pytest.mark.cpu_only
+
 
 # ---------------------------------------------------------------------------
 # System info tests

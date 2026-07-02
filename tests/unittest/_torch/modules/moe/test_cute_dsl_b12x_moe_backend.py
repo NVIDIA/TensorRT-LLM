@@ -35,6 +35,9 @@ from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl_b12x import CuteDs
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
+pytestmark = pytest.mark.cpu_only
+
+
 _FUSED_MOE_MODULE = "tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl_b12x"
 
 

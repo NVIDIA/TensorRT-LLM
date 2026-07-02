@@ -15,9 +15,13 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from tensorrt_llm._torch.pyexecutor import py_executor_creator
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.quantization import QuantAlgo
+
+pytestmark = pytest.mark.cpu_only
 
 
 class _DummyCalibrator:

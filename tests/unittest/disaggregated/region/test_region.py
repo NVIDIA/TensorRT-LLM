@@ -8,6 +8,8 @@ from tensorrt_llm._torch.disaggregation.base.region import (
     RegionSpec,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 def test_index_range_valid():
     r = IndexRange(start=0, end=10)

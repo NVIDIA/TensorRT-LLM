@@ -744,6 +744,7 @@ def test_fuse_rmsnorm_quant_fp8_rewrites_through_post_norm_reshape():
     assert not any(is_op(n, torch.ops.auto_deploy.trtllm_quant_fp8_linear) for n in gm.graph.nodes)
 
 
+@pytest.mark.cpu_only
 def test_get_out_dtype_str_returns_none_when_norm_meta_missing():
     graph = torch.fx.Graph()
     x = graph.placeholder("x")
@@ -757,6 +758,7 @@ def test_get_out_dtype_str_returns_none_when_norm_meta_missing():
     assert _get_out_dtype_str(norm) is None
 
 
+@pytest.mark.cpu_only
 def test_passthrough_helpers_handle_method_views_and_optional_dtype_cast():
     graph = torch.fx.Graph()
     x = graph.placeholder("x")
@@ -809,6 +811,7 @@ def _get_fused_getitem(gm, fused_op, index):
     return matches[0]
 
 
+@pytest.mark.cpu_only
 def test_fuse_gated_rmsnorm_quant_nvfp4_rewrites_graph():
     root = _make_nvfp4_graph_root()
     graph = torch.fx.Graph()
@@ -856,6 +859,7 @@ def test_fuse_gated_rmsnorm_quant_nvfp4_rewrites_graph():
     assert scale_node.meta["val"].dtype == torch.uint8
 
 
+@pytest.mark.cpu_only
 def test_fuse_gated_rmsnorm_quant_nvfp4_accepts_dtype_cast():
     root = _make_nvfp4_graph_root()
     graph = torch.fx.Graph()
@@ -895,6 +899,7 @@ def test_fuse_gated_rmsnorm_quant_nvfp4_accepts_dtype_cast():
     assert not any(is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_linear) for n in gm.graph.nodes)
 
 
+@pytest.mark.cpu_only
 def test_fuse_gated_rmsnorm_quant_nvfp4_preserves_mixed_consumer_dtypes():
     root = _make_nvfp4_graph_root()
     graph = torch.fx.Graph()
@@ -940,6 +945,7 @@ def test_fuse_gated_rmsnorm_quant_nvfp4_preserves_mixed_consumer_dtypes():
     assert not any(is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_linear) for n in gm.graph.nodes)
 
 
+@pytest.mark.cpu_only
 def test_fuse_allreduce_rmsnorm_quant_nvfp4_rewrites_graph():
     root = _make_nvfp4_graph_root()
     graph = torch.fx.Graph()
@@ -982,6 +988,7 @@ def test_fuse_allreduce_rmsnorm_quant_nvfp4_rewrites_graph():
     assert not any(is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_linear) for n in gm.graph.nodes)
 
 
+@pytest.mark.cpu_only
 def test_fuse_allreduce_rmsnorm_quant_nvfp4_keeps_norm_for_mixed_consumers():
     root = _make_nvfp4_graph_root()
     graph = torch.fx.Graph()
@@ -1024,6 +1031,7 @@ def test_fuse_allreduce_rmsnorm_quant_nvfp4_keeps_norm_for_mixed_consumers():
     assert not any(is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_linear) for n in gm.graph.nodes)
 
 
+@pytest.mark.cpu_only
 def test_fuse_allreduce_rmsnorm_quant_nvfp4_clones_late_input_scale():
     root = _make_nvfp4_graph_root()
     graph = torch.fx.Graph()
@@ -1064,6 +1072,7 @@ def test_fuse_allreduce_rmsnorm_quant_nvfp4_clones_late_input_scale():
     )
 
 
+@pytest.mark.cpu_only
 def test_fuse_add_rmsnorm_quant_nvfp4_rewrites_graph():
     hidden_size = 2048
     root = _make_nvfp4_graph_root(hidden_size)
@@ -1104,6 +1113,7 @@ def test_fuse_add_rmsnorm_quant_nvfp4_rewrites_graph():
     assert not any(is_op(n, torch.ops.aten.add.Tensor) for n in gm.graph.nodes)
 
 
+@pytest.mark.cpu_only
 def test_fuse_add_cast_rmsnorm_quant_nvfp4_rewrites_graph():
     hidden_size = 2048
     root = _make_nvfp4_graph_root(hidden_size)
@@ -1148,6 +1158,7 @@ def test_fuse_add_cast_rmsnorm_quant_nvfp4_rewrites_graph():
     assert not any(is_op(n, torch.ops.aten.add.Tensor) for n in gm.graph.nodes)
 
 
+@pytest.mark.cpu_only
 def test_fuse_add_cast_rmsnorm_quant_nvfp4_clones_late_norm_weight():
     hidden_size = 2048
     root = _make_nvfp4_graph_root(hidden_size)
@@ -1187,6 +1198,7 @@ def test_fuse_add_cast_rmsnorm_quant_nvfp4_clones_late_norm_weight():
     )
 
 
+@pytest.mark.cpu_only
 def test_fuse_add_rmsnorm_quant_nvfp4_keeps_norm_for_mixed_consumers():
     hidden_size = 2048
     root = _make_nvfp4_graph_root(hidden_size)

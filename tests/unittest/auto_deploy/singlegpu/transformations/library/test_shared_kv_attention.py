@@ -152,6 +152,7 @@ def _make_layer_inputs(offset: float, seq_len: int, decode: bool = False):
     return q, k, v
 
 
+@pytest.mark.cpu_only
 def test_shared_kv_transform_aliases_source_cache_placeholders():
     module = _TinySharedKVModule().eval()
     gm = torch_export_to_gm(module, (torch.randn(1, 4, 8),))
@@ -198,6 +199,7 @@ def test_shared_kv_transform_aliases_source_cache_placeholders():
     assert shared_node.args[-1] is True
 
 
+@pytest.mark.cpu_only
 def test_shared_kv_cached_attention_reads_without_writing():
     q = torch.tensor([[[[1.0, 0.0], [0.0, 1.0]]]], dtype=torch.float32)
     dummy_k = torch.full((1, 1, 2, 2), 123.0, dtype=torch.float32)
@@ -245,6 +247,7 @@ def test_shared_kv_cached_attention_reads_without_writing():
     torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.cpu_only
 def test_torch_backend_attention_metadata_for_shared_kv_node():
     module = _TinySharedKVModule().eval()
     gm = torch_export_to_gm(module, (torch.randn(1, 4, 8),))
@@ -267,6 +270,7 @@ def test_torch_backend_attention_metadata_for_shared_kv_node():
     assert TorchBackendAttention.get_shared_kv_source_layer_idx(shared) == 0
 
 
+@pytest.mark.cpu_only
 def test_flashinfer_backend_attention_metadata_for_shared_kv_node():
     module = _TinySharedKVModule().eval()
     gm = torch_export_to_gm(module, (torch.randn(1, 4, 8),))
@@ -292,6 +296,7 @@ def test_flashinfer_backend_attention_metadata_for_shared_kv_node():
     )
 
 
+@pytest.mark.cpu_only
 def test_shared_kv_transform_aliases_source_cache_placeholders_for_flashinfer():
     module = _TinySharedKVModule().eval()
     gm = torch_export_to_gm(module, (torch.randn(1, 4, 8),))
@@ -335,6 +340,7 @@ def test_shared_kv_transform_aliases_source_cache_placeholders_for_flashinfer():
     assert shared_node.args[-1] is True
 
 
+@pytest.mark.cpu_only
 def test_flashinfer_cached_attention_is_dynamic_for_piecewise():
     shared_op_name = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache.default.name()
 
@@ -350,6 +356,7 @@ def test_flashinfer_cached_attention_is_dynamic_for_piecewise():
     )
 
 
+@pytest.mark.cpu_only
 def test_triton_backend_attention_metadata_for_shared_kv_node():
     module = _TinySharedKVModule().eval()
     gm = torch_export_to_gm(module, (torch.randn(1, 4, 8),))
@@ -375,6 +382,7 @@ def test_triton_backend_attention_metadata_for_shared_kv_node():
     )
 
 
+@pytest.mark.cpu_only
 def test_shared_kv_transform_aliases_source_cache_placeholders_for_triton():
     module = _TinySharedKVModule().eval()
     gm = torch_export_to_gm(module, (torch.randn(1, 4, 8),))
@@ -610,6 +618,7 @@ def test_triton_shared_kv_prefill_sdpa_reads_aliased_cache_without_writing():
     torch.testing.assert_close(output.float(), expected.float(), rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.cpu_only
 @torch.no_grad()
 def test_torch_shared_kv_cached_attention_supports_out_buffer():
     q = torch.randn(1, 3, 2, 4)
@@ -660,6 +669,7 @@ def test_torch_shared_kv_cached_attention_supports_out_buffer():
     torch.testing.assert_close(out, expected)
 
 
+@pytest.mark.cpu_only
 def test_shared_kv_self_alias_raises():
     class _SelfAliasingSharedKVModule(torch.nn.Module):
         def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -685,6 +695,7 @@ def test_shared_kv_self_alias_raises():
         transform._apply(gm, cm, factory=None, shared_config=SharedConfig())
 
 
+@pytest.mark.cpu_only
 def test_duplicate_cache_owner_layer_idx_raises():
     module = _DuplicateLayerOwnerSharedKVModule().eval()
     gm = torch_export_to_gm(module, (torch.randn(1, 4, 8),))
@@ -770,6 +781,7 @@ def test_flashinfer_shared_kv_cached_attention_reads_aliased_cache_without_writi
     torch.testing.assert_close(output.float(), expected.float(), rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.cpu_only
 def test_shared_kv_six_layer_stack_matches_reference_for_prefill_and_decode():
     layer_sources = {4: 2, 5: 3}
     sliding_layers = {2, 4}

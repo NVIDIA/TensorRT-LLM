@@ -32,6 +32,8 @@ from tensorrt_llm.inputs.multimodal import (
 )
 from tensorrt_llm.inputs.multimodal_data import AudioData
 
+pytestmark = pytest.mark.cpu_only
+
 
 def make_tiler(**overrides):
     """Create a DynamicResolutionImageTiler with sensible defaults."""

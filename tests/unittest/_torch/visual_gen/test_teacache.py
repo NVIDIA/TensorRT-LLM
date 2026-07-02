@@ -25,6 +25,8 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm.visual_gen.args import TeaCacheConfig
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _PipelineConfigShim:
     """Minimal pipeline_config shim that delegates all reads back to a DiffusionModelConfig.

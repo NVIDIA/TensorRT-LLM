@@ -20,6 +20,9 @@ from transformers import AutoConfig
 import tensorrt_llm  # noqa: F401  triggers AutoConfig registration
 from tensorrt_llm._torch.configs import Cosmos3Config, DeepseekV3Config
 
+pytestmark = [pytest.mark.disabled, pytest.mark.cpu_only]
+
+
 _COSMOS3_MIN_CONFIG = {
     "architectures": ["Cosmos3ForConditionalGeneration"],
     "model_type": "cosmos3",

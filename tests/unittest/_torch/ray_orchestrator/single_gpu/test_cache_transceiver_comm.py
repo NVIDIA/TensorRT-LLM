@@ -2,11 +2,14 @@ import importlib
 import os
 import unittest
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from tensorrt_llm._utils import get_free_port, torch_pybind11_abi
+
+pytestmark = pytest.mark.cpu_only
 
 
 class TestCacheTransceiverComm(unittest.TestCase):

@@ -12,11 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import pytest
 import torch
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention.torch_backend_attention import (
     _update_kv_cache,
 )
+
+pytestmark = pytest.mark.cpu_only
 
 
 def test_update_kv_cache():

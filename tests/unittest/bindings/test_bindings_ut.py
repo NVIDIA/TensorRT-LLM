@@ -6,6 +6,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 from utils.runtime_defaults import assert_runtime_defaults_are_parsed_correctly
 
@@ -417,6 +418,7 @@ def test_llm_request():
     assert torch.equal(llm_request.draft_logits, logits)
 
 
+@pytest.mark.cpu_only
 def test_llm_request_kv_cache_transfer_metric_bindings():
     request = _tb.internal.batch_manager.LlmRequest(
         request_id=0,

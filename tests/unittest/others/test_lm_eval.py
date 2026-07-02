@@ -29,6 +29,8 @@ import importlib
 import os
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from tensorrt_llm.evaluate.covost2 import CoVoST2
 from tensorrt_llm.evaluate.lm_eval import (
     LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER,
@@ -44,6 +46,9 @@ from tensorrt_llm.evaluate.lm_eval_tasks.aime.utils import (
 )
 from tensorrt_llm.inputs.content_format import ContentFormat
 from tensorrt_llm.sampling_params import SamplingParams
+
+pytestmark = pytest.mark.cpu_only
+
 
 # ===========================================================================
 # AIME utils — last_boxed_only_string / remove_boxed / is_equiv / strip_string
@@ -288,12 +293,20 @@ def test_sampling_override_no_cli_falls_back_to_yaml():
 
 # Uses ``gemma3`` by default because it is always registered regardless of
 # transformers version; the wrapper's interleave logic itself is generic.
-def _make_multimodal_wrapper(model_type: str = "gemma3") -> MultimodalLmEvalWrapper:
+def _make_multimodal_wrapper(
+    model_type: str = "gemma3", interleave_placeholders: bool = False
+) -> MultimodalLmEvalWrapper:
     fake_llm = MagicMock()
     fake_llm.tokenizer = MagicMock()
     fake_llm.input_processor = MagicMock()
     fake_llm.input_processor.processor = MagicMock()
-    with patch.object(MultimodalLmEvalWrapper, "_get_model_type", return_value=model_type):
+    with (
+        patch.object(MultimodalLmEvalWrapper, "_get_model_type", return_value=model_type),
+        patch(
+            "tensorrt_llm.evaluate.lm_eval.MULTIMODAL_PLACEHOLDER_REGISTRY.get_interleave_placeholders",
+            return_value=interleave_placeholders,
+        ),
+    ):
         return MultimodalLmEvalWrapper(
             fake_llm,
             sampling_params=None,
@@ -352,7 +365,7 @@ def test_multi_image_openai_builds_content_parts():
 
     ``_build_openai_content`` then emits media entries at the correct positions.
     """
-    wrapper = _make_multimodal_wrapper()
+    wrapper = _make_multimodal_wrapper(interleave_placeholders=True)
     ph = LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER
     text = f"Consider {ph}. What does {ph} show?"
     conv = _call_apply(wrapper, text, content_format=ContentFormat.OPENAI)
@@ -391,7 +404,7 @@ def test_trailing_text_after_last_image_preserved():
     Otherwise the question suffix ('Answer:') is dropped before it reaches
     the model.
     """
-    wrapper = _make_multimodal_wrapper()
+    wrapper = _make_multimodal_wrapper(interleave_placeholders=True)
     ph = LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER
     text = f"Compare {ph} with {ph}. Answer with a letter."
     conv = _call_apply(wrapper, text, content_format=ContentFormat.OPENAI)
@@ -406,7 +419,7 @@ def test_leading_image_no_empty_text_segment():
 
     content_parts must begin with the image entry itself.
     """
-    wrapper = _make_multimodal_wrapper()
+    wrapper = _make_multimodal_wrapper(interleave_placeholders=True)
     ph = LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER
     text = f"{ph} {ph} Answer?"
     conv = _call_apply(wrapper, text, content_format=ContentFormat.OPENAI)

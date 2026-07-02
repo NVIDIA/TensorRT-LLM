@@ -196,6 +196,7 @@ def test_build_page_table():
     manager.shutdown()
 
 
+@pytest.mark.cpu_only
 def test_layer_group_meta_serialization():
     import numpy as np
 
@@ -242,6 +243,7 @@ def test_layer_group_meta_serialization():
     assert len(restored_lg.pool_views[0].buffer_entries) == 2
 
 
+@pytest.mark.cpu_only
 def test_mamba_layer_group_serialization():
     from tensorrt_llm._torch.disaggregation.resource.page import MambaLayerGroup, PhysicalPool
 
@@ -275,6 +277,7 @@ def test_mamba_layer_group_serialization():
     assert restored.ssm_bytes_per_head == 128
 
 
+@pytest.mark.cpu_only
 def test_mixed_page_table_serialization():
     import numpy as np
 

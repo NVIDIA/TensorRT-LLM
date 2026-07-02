@@ -76,6 +76,7 @@ def test_llm_fp8_quantization_modelOpt_ckpt():
         assert output.outputs[0].text == " D E F G H I"
 
 
+@pytest.mark.cpu_only
 def test_quant_cfg_from_quant_cfg_json():
     """
     Test loading MIXED_PRECISION config from quant_cfg.json with per-layer quantization.
@@ -139,6 +140,7 @@ def test_quant_cfg_from_quant_cfg_json():
         assert awq_layer.pre_quant_scale is True
 
 
+@pytest.mark.cpu_only
 def test_quant_cfg_top_level_overlay():
     """quant_cfg.json's top-level group_size/exclude_modules override hf_quant_config.json."""
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -179,6 +181,7 @@ def test_quant_cfg_top_level_overlay():
         assert quant_config.exclude_modules == ["lm_head", "model.embed_tokens"]
 
 
+@pytest.mark.cpu_only
 def test_quant_cfg_from_hf_quant_config():
     """Test fallback to hf_quant_config.json when quant_cfg.json is missing."""
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -224,6 +227,7 @@ def _write_hf_quant_config(model_dir: Path, content: dict) -> Path:
     return path
 
 
+@pytest.mark.cpu_only
 def test_quant_cfg_fp8_legacy_shape():
     """Plain FP8 modelopt 0.x checkpoint: legacy 'quantization' wrapper."""
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -248,6 +252,7 @@ def test_quant_cfg_fp8_legacy_shape():
         assert layer_quant_config is None
 
 
+@pytest.mark.cpu_only
 def test_quant_cfg_flat_shape_with_ignore_rename():
     """Modelopt 1.x flat shape: ``ignore`` is renamed to ``exclude_modules``."""
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -268,6 +273,7 @@ def test_quant_cfg_flat_shape_with_ignore_rename():
         assert quant_config.exclude_modules == ["lm_head", "model.embed_tokens"]
 
 
+@pytest.mark.cpu_only
 def test_quant_cfg_flat_shape_kv_cache_scheme_dict():
     """Flat shape with compressed-tensors-style kv_cache_scheme dict (FP8)."""
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -292,6 +298,7 @@ def test_quant_cfg_flat_shape_kv_cache_scheme_dict():
         assert quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
 
+@pytest.mark.cpu_only
 def test_quant_cfg_flat_shape_kv_cache_scheme_string_nvfp4():
     """Flat shape with bare-string kv_cache_scheme fallback (NVFP4)."""
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -313,6 +320,7 @@ def test_quant_cfg_flat_shape_kv_cache_scheme_string_nvfp4():
         assert quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
 
 
+@pytest.mark.cpu_only
 def test_quant_cfg_fp8_pb_wo_alias_canonicalized():
     """Legacy ``fp8_pb_wo`` alias is canonicalized to FP8_BLOCK_SCALES."""
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -333,6 +341,7 @@ def test_quant_cfg_fp8_pb_wo_alias_canonicalized():
         assert quant_config.group_size == 128
 
 
+@pytest.mark.cpu_only
 def test_quant_cfg_fp8_block_scales_trtllm_default_excludes():
     """TRTLLM moe_backend + FP8_BLOCK_SCALES + no excludes → defaults applied."""
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -353,6 +362,7 @@ def test_quant_cfg_fp8_block_scales_trtllm_default_excludes():
         ]
 
 
+@pytest.mark.cpu_only
 def test_quant_cfg_explicit_empty_excludes_preserved():
     """Explicit ``exclude_modules: []`` is preserved (no defaults applied)."""
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -373,6 +383,7 @@ def test_quant_cfg_explicit_empty_excludes_preserved():
         assert quant_config.exclude_modules == []
 
 
+@pytest.mark.cpu_only
 def test_quant_cfg_mixed_precision_kv_cache_conflict_raises():
     """quant_cfg.json kv_cache_quant_algo conflicting with hf_quant_config.json raises."""
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -403,6 +414,7 @@ def test_quant_cfg_mixed_precision_kv_cache_conflict_raises():
                                                    model_dir, None)
 
 
+@pytest.mark.cpu_only
 def test_quant_cfg_awq_extra_fields_preserved_via_load_hf_quant_config():
     """AWQ extras (``has_zero_point``, ``pre_quant_scale``) flow through ``load_hf_quant_config``."""
     inline_modelopt_awq = {
@@ -449,6 +461,7 @@ def test_quant_cfg_awq_extra_fields_preserved_via_load_hf_quant_config():
     ("not a dict", False),
     (None, False),
 ])
+@pytest.mark.cpu_only
 def test_is_modelopt_quant_config(config, expected):
     """Producer name or quant_method prefix must signal modelopt."""
     from tensorrt_llm.quantization.modelopt_config import \
@@ -486,6 +499,7 @@ def test_is_modelopt_quant_config(config, expected):
         }, None),
         (123, None),
     ])
+@pytest.mark.cpu_only
 def test_kv_cache_scheme_to_algo(scheme, expected):
     """``_kv_cache_scheme_to_algo`` covers string + dict + None inputs."""
     from tensorrt_llm.quantization.modelopt_config import \
@@ -507,6 +521,7 @@ def test_kv_cache_scheme_to_algo(scheme, expected):
         "quantization": "not a dict",
     }, "'quantization' must be a dict"),
 ])
+@pytest.mark.cpu_only
 def test_read_modelopt_quant_config_invalid_raises(raw, match):
     """Non-dict / non-modelopt / malformed configs raise ValueError."""
     from tensorrt_llm.quantization.modelopt_config import \
@@ -515,6 +530,7 @@ def test_read_modelopt_quant_config_invalid_raises(raw, match):
         read_modelopt_quant_config(raw)
 
 
+@pytest.mark.cpu_only
 def test_quant_cfg_quant_algo_fields_are_enum_typed():
     """Top-level and per-layer ``quant_algo``/``kv_cache_quant_algo`` are QuantAlgo enums."""
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -548,6 +564,7 @@ def test_quant_cfg_quant_algo_fields_are_enum_typed():
         assert layer.kv_cache_quant_algo is QuantAlgo.FP8
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("scheme", ["INT8", {"type": "int", "num_bits": 8}])
 def test_quant_cfg_flat_shape_kv_cache_scheme_int8(scheme):
     """Flat shape: INT8 ``kv_cache_scheme`` honored via both string and dict forms."""
@@ -565,6 +582,7 @@ def test_quant_cfg_flat_shape_kv_cache_scheme_int8(scheme):
         assert quant_config.kv_cache_quant_algo is QuantAlgo.INT8
 
 
+@pytest.mark.cpu_only
 def test_quant_cfg_awq_extras_default_when_absent():
     """When AWQ extras are absent from the JSON, ``QuantConfig`` defaults are preserved."""
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -585,6 +603,7 @@ def test_quant_cfg_awq_extras_default_when_absent():
         assert quant_config.pre_quant_scale is False
 
 
+@pytest.mark.cpu_only
 def test_load_hf_quant_config_fp8_block_scales_deepseek_v3():
     """DeepSeek V3 ``quant_method=fp8`` with weight_block_size=(128,128)."""
     quant_config, _ = ModelConfig.load_hf_quant_config(
@@ -603,6 +622,7 @@ def test_load_hf_quant_config_fp8_block_scales_deepseek_v3():
     ("channel", "token", QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN),
     ("block", "group", QuantAlgo.FP8_BLOCK_SCALES),
 ])
+@pytest.mark.cpu_only
 def test_load_hf_quant_config_compressed_tensors(weights_strategy,
                                                  inputs_strategy,
                                                  expected_algo):
@@ -629,6 +649,7 @@ def test_load_hf_quant_config_compressed_tensors(weights_strategy,
     assert quant_config.exclude_modules == ["lm_head"]
 
 
+@pytest.mark.cpu_only
 def test_load_hf_quant_config_nvfp4_native_with_modules_to_not_convert():
     """HF nvfp4 schema: ``modules_to_not_convert`` is merged into ``exclude_modules``."""
     quant_config, _ = ModelConfig.load_hf_quant_config(
@@ -645,6 +666,7 @@ def test_load_hf_quant_config_nvfp4_native_with_modules_to_not_convert():
     assert "lm_head" in quant_config.exclude_modules  # default
 
 
+@pytest.mark.cpu_only
 def test_load_hf_quant_config_no_match_returns_empty_quant_config():
     """An unrecognized ``quant_method`` returns an empty QuantConfig (no algo set)."""
     quant_config, _ = ModelConfig.load_hf_quant_config(

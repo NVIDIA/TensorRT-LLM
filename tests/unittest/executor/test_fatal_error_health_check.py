@@ -39,6 +39,9 @@ from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
+
 logger = logging.getLogger(__name__)
 
 _mod_path = (

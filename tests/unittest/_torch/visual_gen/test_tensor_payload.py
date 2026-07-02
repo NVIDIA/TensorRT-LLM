@@ -22,6 +22,8 @@ from tensorrt_llm.media.tensor_payload import (
 )
 from tensorrt_llm.visual_gen.output import VisualGenOutput
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _safetensors_load(data: bytes) -> dict:
     from safetensors.torch import load as load_safetensors

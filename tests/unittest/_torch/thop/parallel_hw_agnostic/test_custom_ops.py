@@ -4,6 +4,8 @@ import torch._library.utils as library_utils
 
 import tensorrt_llm  # noqa: F401
 
+pytestmark = pytest.mark.cpu_only
+
 
 def discover_namespace_ops(namespace: str, prefix: str = ""):
     """Discover custom ops in a specific namespace."""

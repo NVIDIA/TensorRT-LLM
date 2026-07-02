@@ -77,6 +77,7 @@ def _run_multi_gpu(world_size, test_fn):
 # =============================================================================
 
 
+@pytest.mark.cpu_only
 class TestConstruction:
     def test_single_gpu_defaults(self):
         vgm = VisualGenMapping(world_size=1, rank=0)
@@ -174,6 +175,7 @@ class TestConstruction:
             )
 
 
+@pytest.mark.cpu_only
 class TestSingleGPURanksAndGroups:
     def test_ranks_are_zero(self):
         vgm = VisualGenMapping(world_size=1, rank=0)
@@ -205,6 +207,7 @@ class TestSingleGPURanksAndGroups:
         assert vgm.attn2d_col_group is None
 
 
+@pytest.mark.cpu_only
 class TestToLlmMapping:
     def test_single_gpu(self):
         vgm = VisualGenMapping(world_size=1, rank=0)

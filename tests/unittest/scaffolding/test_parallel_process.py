@@ -4,8 +4,12 @@ import time
 from enum import Enum
 from typing import List
 
+import pytest
+
 from tensorrt_llm.scaffolding import (Controller, ParallelProcess,
                                       ScaffoldingLlm, Task, TaskStatus, Worker)
+
+pytestmark = pytest.mark.cpu_only
 
 
 class DummyTask(Task):

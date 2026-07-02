@@ -37,11 +37,6 @@ from pydantic import (NonNegativeFloat, NonNegativeInt, PositiveInt,
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
-try:
-    from ray.util.placement_group import PlacementGroup
-except ImportError:
-    PlacementGroup = None
-
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
@@ -2622,6 +2617,8 @@ class RayPlacementConfig(StrictBaseModel):
 
     @model_validator(mode='after')
     def validate_ray_placement(self) -> 'RayPlacementConfig':
+        from ray.util.placement_group import PlacementGroup
+
         has_pgs = self.placement_groups is not None
         has_indices = self.placement_bundle_indices is not None
 
@@ -2636,9 +2633,6 @@ class RayPlacementConfig(StrictBaseModel):
                     f"placement_groups length ({len(self.placement_groups)}) must equal "
                     f"placement_bundle_indices length ({len(self.placement_bundle_indices)})"
                 )
-            if PlacementGroup is None:
-                raise ValueError(
-                    "Ray must be installed to use `placement_groups`")
 
             for i, pg in enumerate(self.placement_groups):
                 if not isinstance(pg, PlacementGroup):
@@ -3990,16 +3984,6 @@ class BaseLlmArgs(StrictBaseModel):
         with open(yaml_path, "r") as f:
             config_dict = yaml.safe_load(f)
         return cls(**config_dict)
-
-    @field_validator("dtype")
-    @classmethod
-    def validate_dtype(cls, v, info):
-        if torch.cuda.get_device_properties(0).major < 8:
-            if v == 'auto':
-                v = 'float16'
-            if v == 'bfloat16':
-                raise RuntimeError("Pre SM 80 GPUs do not support bfloat16")
-        return v
 
     @field_validator("gpus_per_node", mode='before')
     @classmethod

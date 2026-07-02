@@ -8,6 +8,9 @@ from parameterized import parameterized
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 
+pytestmark = pytest.mark.cpu_only
+
+
 TEST_CASES = [
     {
         "name": "valid_message",

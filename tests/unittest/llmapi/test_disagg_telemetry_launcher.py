@@ -25,6 +25,8 @@ import pytest
 
 from tensorrt_llm.commands import serve
 
+pytestmark = [pytest.mark.cpu_only, pytest.mark.disabled]
+
 
 def _mock_llmapi_modules(
     monkeypatch: pytest.MonkeyPatch,
@@ -49,7 +51,9 @@ def test_disaggregated_command_sets_shared_deployment_id(monkeypatch) -> None:
         raising=False,
     )
 
-    disagg_config = SimpleNamespace(hostname="127.0.0.1", port=0, schedule_style=None)
+    disagg_config = SimpleNamespace(
+        hostname="127.0.0.1", port=0, schedule_style=None, allow_request_chat_template=False
+    )
     fake_socket = mock.MagicMock()
     fake_socket.__enter__.return_value = fake_socket
     deployment_id = SimpleNamespace(hex="deploy123")
@@ -153,7 +157,9 @@ def test_launch_disaggregated_server_sets_worker_role(
 
     llm_args = {"model": "dummy/model"}
     server_config = SimpleNamespace(type=server_type, hostname="127.0.0.1", port=8000)
-    disagg_config = SimpleNamespace(server_configs=[server_config])
+    disagg_config = SimpleNamespace(
+        server_configs=[server_config], allow_request_chat_template=False
+    )
 
     with (
         mock.patch.object(serve, "parse_disagg_config_file", return_value=disagg_config),

@@ -41,6 +41,8 @@ from tensorrt_llm._torch.memory.gpu_memory_backend import (
     _storage_nbytes,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture(autouse=True)
 def _stub_current_device(monkeypatch):

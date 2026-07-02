@@ -1,8 +1,12 @@
 import os
 
+import pytest
+
 from tensorrt_llm.tools.plugin_gen.core import *
 
 from .kernel_config import get_fmha_kernel_meta_data
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _mkdir(path: str):

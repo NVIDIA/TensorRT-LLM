@@ -805,6 +805,8 @@ def release_gc():
 
 @lru_cache(maxsize=1)
 def get_sm_version():
+    if torch.cuda.device_count() == 0:
+        return -1
     prop = torch.cuda.get_device_properties(0)
     return prop.major * 10 + prop.minor
 
@@ -1376,7 +1378,7 @@ def prefer_pinned() -> bool:
     pageable (and not pinned) memory across the board is preferred in CC mode
     to maintain asynchronous execution.
     """
-    return not confidential_compute_enabled()
+    return torch.cuda.device_count() > 0 and not confidential_compute_enabled()
 
 
 def maybe_pin_memory(tensor: torch.Tensor) -> torch.Tensor:

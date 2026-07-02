@@ -27,11 +27,6 @@ from tensorrt_llm.bindings.internal.process_group import init_pg
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-try:
-    import ray
-except ModuleNotFoundError:
-    from tensorrt_llm import ray_stub as ray
-
 
 class ReduceOp(IntEnum):
     SUM = 0
@@ -832,6 +827,8 @@ class TorchDist(Distributed):
     def _get_cluster_info(self):
         if self.cluster_info is not None:
             return self.cluster_info
+
+        import ray
 
         if ray.is_initialized():
             node_ip = ray.util.get_node_ip_address()

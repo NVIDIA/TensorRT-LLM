@@ -9,6 +9,9 @@ from tensorrt_llm.llmapi.disagg_utils import (
     MIN_GLOBAL_ID, CtxGenServerConfig, DisaggServerConfig, extract_ctx_gen_cfgs,
     extract_router_config, extract_disagg_cfg, get_global_disagg_request_id,
     get_local_request_id, get_server_configs_dict, parse_disagg_config_file)
+
+pytestmark = pytest.mark.cpu_only
+
 # isort: on
 
 

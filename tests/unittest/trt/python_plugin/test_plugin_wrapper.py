@@ -3,7 +3,6 @@ from typing import Sequence
 import pytest
 import torch
 from plugin_wrapper_utils import DummyPlugin
-from python_plugin.plugin_lib import LookUpPlugin
 from utils.util import create_session, run_session
 
 import tensorrt_llm
@@ -33,6 +32,8 @@ def use_cuda_as_default_device():
 @pytest.mark.parametrize("to_torch", [False, True])
 @pytest.mark.parametrize("fp32_output", [False, True])
 def test_triton_plugin(dtype, to_torch, fp32_output):
+    from python_plugin.plugin_lib import LookUpPlugin
+
     # meta data
     batch_size = 10
     vocab_size = 1000
@@ -85,6 +86,7 @@ def test_triton_plugin(dtype, to_torch, fp32_output):
     torch.testing.assert_close(trt_plugin_out, torch_out)
 
 
+@pytest.mark.cpu_only
 def test_redefinition():
 
     class Plugin(PluginBase):
@@ -123,6 +125,7 @@ def test_redefinition():
                 pass
 
 
+@pytest.mark.cpu_only
 def test_no_register():
 
     class NoRegisterNoOutputNumPlugin(PluginBase):
@@ -157,6 +160,7 @@ def test_no_register():
                 pass
 
 
+@pytest.mark.cpu_only
 def test_single_creator():
     a = DummyPlugin()
     b = DummyPlugin()

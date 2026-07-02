@@ -34,6 +34,9 @@ import pytest
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
 
+pytestmark = pytest.mark.cpu_only
+
+
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #

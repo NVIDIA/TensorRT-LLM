@@ -455,6 +455,7 @@ def test_gemma_model_can_be_exported():
 # =========================================================================
 
 
+@pytest.mark.cpu_only
 def test_gemma_config_registration():
     """Test that the config is properly recognized."""
     config = _create_small_config()
@@ -465,6 +466,7 @@ def test_gemma_config_registration():
     assert hasattr(config, "head_dim")
 
 
+@pytest.mark.cpu_only
 def test_gemma_mha_structure():
     """Test that attention uses MHA (same Q and KV head count)."""
     config = _create_small_config()
@@ -475,6 +477,7 @@ def test_gemma_mha_structure():
     assert attn.num_kv_heads == 4, f"Expected 4 KV heads (MHA), got {attn.num_kv_heads}"
 
 
+@pytest.mark.cpu_only
 def test_gemma_state_dict_keys():
     """Test that state_dict keys match expected checkpoint format."""
     config = _create_small_config()
@@ -502,6 +505,7 @@ def test_gemma_state_dict_keys():
         )
 
 
+@pytest.mark.cpu_only
 def test_gemma_embedding_normalization():
     """Test that Gemma applies sqrt(hidden_size) normalization to embeddings."""
     config = _create_small_config()
@@ -514,6 +518,7 @@ def test_gemma_embedding_normalization():
     )
 
 
+@pytest.mark.cpu_only
 def test_gemma_tied_weights():
     """Test that Gemma properly supports tied embed/lm_head weights."""
     config = _create_small_config()

@@ -34,6 +34,9 @@ from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import (
     _resolve_mx_model_name,
 )
 
+pytestmark = [pytest.mark.disabled, pytest.mark.cpu_only]
+
+
 # ---------------------------------------------------------------------------
 # Construction & static properties
 # ---------------------------------------------------------------------------

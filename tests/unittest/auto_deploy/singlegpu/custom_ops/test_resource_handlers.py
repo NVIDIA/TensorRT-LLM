@@ -284,7 +284,8 @@ def test_resolve_cache_dtype_explicit_float32():
 
 
 @pytest.mark.skipif(
-    torch.cuda.get_device_capability(0) < (8, 9), reason="FP8 requires compute capability >= 8.9"
+    torch.cuda.device_count() == 0 or torch.cuda.get_device_capability(0) < (8, 9),
+    reason="FP8 requires compute capability >= 8.9",
 )
 def test_resolve_cache_dtype_explicit_fp8():
     """Test explicit 'fp8' dtype string resolves correctly."""

@@ -1998,6 +1998,12 @@ def pytest_addoption(parser):
         "Enable Ray orchestrator path for integration tests (disables MPI).",
     )
     parser.addoption(
+        "--unittest-markexpr",
+        action="store",
+        default=None,
+        help="Marker expression forwarded to nested unittest pytest runs.",
+    )
+    parser.addoption(
         "--perf-log-formats",
         help=
         "Supply either 'yaml' or 'csv' as values. Supply multiple same flags for multiple formats.",

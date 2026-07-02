@@ -831,6 +831,7 @@ def _logic_init_guard_missing_head_attrs(rank, world_size):
         assert "head_dim" in str(e) or "num_heads" in str(e), f"Unexpected RuntimeError: {e}"
 
 
+@pytest.mark.cpu_only
 class TestAttn2DAttentionInitGuards:
     """Attention2DAttention.__init__ rejects invalid inner backends."""
 
