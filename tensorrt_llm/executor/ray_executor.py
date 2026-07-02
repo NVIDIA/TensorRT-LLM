@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
@@ -40,6 +41,9 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
                  tp_size=1):
         os.environ['RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES'] = '1'
         os.environ["RAY_DEDUP_LOGS"] = "0"  # for debug
+        # Give the raylet enough time to register with the GCS on busy hosts;
+        # mirrors the mitigation already in tests/unittest/conftest.py.
+        os.environ.setdefault("RAY_raylet_start_wait_time_s", "120")
 
         super().__init__(model_world_size, postproc_worker_config,
                          is_llm_executor)
@@ -67,10 +71,10 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
                     logger.info(f"Ray cluster not found, starting a new one.")
 
                 if not ray.is_initialized():
-                    ray.init(**ray_init_args)
+                    self._ray_init_local_with_retry(ray_init_args)
                     self.has_start_local_cluser = True
             else:
-                ray.init(address="local", **ray_init_args)
+                self._ray_init_local_with_retry(ray_init_args, address="local")
                 self.has_start_local_cluser = True
 
             self.world_size = model_world_size
@@ -106,6 +110,27 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             self.shutdown()
             logger.error(f"Failed to initialize RayExecutor: {e}")
             raise e
+
+    @staticmethod
+    def _ray_init_local_with_retry(ray_init_args: Dict,
+                                   address: Optional[str] = None) -> None:
+        # Local raylet/GCS startup occasionally times out on busy CI hosts
+        # ("The current node timed out during start... GCS has become
+        # overloaded"). Retry the local-cluster init a few times before giving
+        # up; matches the mitigation in tests/unittest/conftest.py.
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                ray.init(address=address, **ray_init_args)
+                break
+            except Exception:
+                if ray.is_initialized():
+                    ray.shutdown()
+                if attempt == max_retries - 1:
+                    raise
+                time.sleep(5)
+        # Allow raylet to complete GCS registration before workers are scheduled.
+        time.sleep(2)
 
     def create_workers(self, worker_cls, worker_kwargs):
         llm_args = worker_kwargs.get("llm_args")
