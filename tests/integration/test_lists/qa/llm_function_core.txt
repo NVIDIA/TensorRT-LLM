@@ -34,7 +34,7 @@ accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[False]
 accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[True]
 accuracy/test_disaggregated_serving.py::TestGPTOSS::test_kv_cache_v2_nixl_python[cache_mgr_v1]
 accuracy/test_disaggregated_serving.py::TestGPTOSS::test_kv_cache_v2_nixl_python[cache_mgr_v2]
-accuracy/test_disaggregated_serving.py::TestGLM5FP4::test_nvfp4_nixl_python[cache_mgr_v1]
+accuracy/test_disaggregated_serving.py::TestGLM52NVFP4::test_nvfp4_nixl_python[cache_mgr_v1]
 accuracy/test_disaggregated_serving.py::TestKimiK2::test_nvfp4
 accuracy/test_disaggregated_serving.py::TestKimiK25::test_nvfp4
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[False-False-False-False]
