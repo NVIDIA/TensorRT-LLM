@@ -436,6 +436,11 @@ class SpecMetadata:
 
     # The number of sequences for speculative model/layer of different rank
     all_rank_num_seqs: Optional[List[int]] = None
+    # The number of generation requests for the speculative model/layer of each
+    # rank (num_seqs - num_contexts). Used by external drafters (e.g. DSpark)
+    # whose draft forward processes only generation requests and must size a
+    # FUSED_COMM MoE (DeepGEMM MegaMoE) chunk loop identically across EP ranks.
+    all_rank_num_gens: Optional[List[int]] = None
     # The number of extra kv tokens
     # Some speculative decoding methods need to use different kv lengths for the
     # draft/target layers. But KVCacheManager can only support kv caches with the
