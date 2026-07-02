@@ -48,14 +48,14 @@ TIMEOUT_KEEP_ALIVE = 10  # seconds
 class CoordinatorServer:
     """Serve a :class:`DisaggCoordinatorService`'s coordination API over HTTP."""
 
-    def __init__(self, cluster_manager: DisaggCoordinatorService) -> None:
-        self._cluster = cluster_manager
+    def __init__(self, coordinator: DisaggCoordinatorService) -> None:
+        self._coordinator = coordinator
 
         @asynccontextmanager
         async def lifespan(app: FastAPI):
-            await self._cluster.start()
+            await self._coordinator.start()
             yield
-            await self._cluster.stop()
+            await self._coordinator.stop()
 
         self.app = FastAPI(lifespan=lifespan)
         self.app.add_api_route("/select", self.select, methods=["POST"])
@@ -76,7 +76,7 @@ class CoordinatorServer:
                 status_code=400,
                 content={"error": "body must include 'role' and 'routing_key'"})
         try:
-            server, info, req_id = await self._cluster.select(
+            server, info, req_id = await self._coordinator.select(
                 body["role"], body.get("routing_key"), body.get("req_id"),
                 body.get("exclude_server"))
         except ValueError as e:
@@ -93,15 +93,16 @@ class CoordinatorServer:
         except Exception as e:
             return JSONResponse(status_code=400,
                                 content={"error": f"invalid JSON body: {e}"})
-        await self._cluster.finish(body.get("role", "gen"), body.get("req_id"),
-                                   body.get("success", True))
+        await self._coordinator.finish(body.get("role", "gen"),
+                                       body.get("req_id"),
+                                       body.get("success", True))
         return JSONResponse(content={})
 
     async def cluster_info(self) -> Response:
-        return JSONResponse(content=await self._cluster.cluster_info())
+        return JSONResponse(content=await self._coordinator.cluster_info())
 
     async def health(self) -> Response:
-        return Response(status_code=200 if await self._cluster.is_ready()
+        return Response(status_code=200 if await self._coordinator.is_ready()
                         else 503)
 
     async def version(self) -> Response:
@@ -117,5 +118,5 @@ class CoordinatorServer:
 
 
 def serve_coordinator(host: str, port: int,
-                      cluster_manager: DisaggCoordinatorService) -> None:
-    asyncio.run(CoordinatorServer(cluster_manager)(host, port))
+                      coordinator: DisaggCoordinatorService) -> None:
+    asyncio.run(CoordinatorServer(coordinator)(host, port))

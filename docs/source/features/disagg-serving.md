@@ -233,6 +233,95 @@ Example (two-node deployment):
 - **Client entrypoint**
   - Send requests or use a load balancer forwarding to `node-a:8000` and `node-b:8000`
 
+### Coordinator and Worker Fleet
+
+A single disaggregated server process is itself a single-threaded orchestrator and can become a throughput bottleneck (it terminates every client connection, runs routing, and proxies the ctx→gen hop). To scale the orchestrator on one node without standing up multiple independent instances, `trtllm-serve disaggregated` can run a **fleet** of stateless disaggregated-server worker processes behind a shared **coordinator**.
+
+The two roles split as follows:
+
+- **Coordinator** — a single process that owns all cluster state: the ctx/gen routers, worker readiness, and (for the KV-cache-aware router) the single ZMQ event-ingest endpoint. It exposes an internal coordination API (`/select`, `/finish`, `/cluster_info`, `/health`).
+- **Fleet workers** — `num_workers` stateless disaggregated servers sharing the public port (via uvicorn `--workers`). Each holds a lightweight delegating client: it computes the routing key locally (e.g. block hashes) and delegates the placement decision to the coordinator over HTTP. Workers own no routing state, so routing stays globally consistent no matter which worker terminates a connection.
+
+This is controlled by two fields in the disaggregated config:
+
+- `num_workers` (int, default `1`) — number of disaggregated-server worker processes to run on the public port.
+- `disagg_coordinator_url` (str, optional) — URL of an already-running coordinator. When set, this process starts **no** coordinator and its fleet delegates to that external one.
+
+The three resulting topologies:
+
+| `num_workers` | `disagg_coordinator_url` | Behavior |
+|---------------|--------------------------|----------|
+| `1` | unset | Single self-contained server with an in-process coordinator (the default; unchanged from earlier examples). |
+| `> 1` | unset | An **implicit** coordinator starts in this process (on `port - 1`) and a fleet of `num_workers` delegating servers runs on the public port. |
+| any | set | **No** coordinator starts here; a fleet of `num_workers` delegating servers points at the external `disagg_coordinator_url`. |
+
+```{note}
+The fleet is most useful with a *stateful* router (`kv_cache_aware`, `conversation`) where placement must be globally consistent — that decision is delegated to the coordinator. With a *stateless* router (`round_robin`, `load_balancing`) each worker simply places locally and no coordinator round-trip occurs.
+```
+
+#### Example: implicit coordinator + 4-worker fleet
+
+Extend the `disagg_config.yaml` from the [trtllm-serve](#trtllm-serve) example with `num_workers` and a router type:
+
+```yaml
+hostname: localhost
+port: 8000
+backend: pytorch
+# Run 4 stateless disaggregated-server workers on port 8000, with an implicit
+# coordinator started in-process on port 7999 (port - 1).
+num_workers: 4
+context_servers:
+  num_instances: 2
+  urls:
+      - "localhost:8001"
+      - "localhost:8002"
+  router:
+    type: kv_cache_aware
+generation_servers:
+  num_instances: 1
+  urls:
+      - "localhost:8003"
+  router:
+    type: kv_cache_aware
+```
+
+Launch it exactly as before — the coordinator and fleet are started for you:
+
+```
+trtllm-serve disaggregated -c disagg_config.yaml
+```
+
+Clients still send requests to the public endpoint (`localhost:8000`); the fleet transparently delegates routing to the coordinator.
+
+#### Example: external coordinator
+
+To point a fleet at a coordinator already running elsewhere (for example, one shared across nodes), set `disagg_coordinator_url` and omit the coordinator from this process:
+
+```yaml
+hostname: localhost
+port: 8000
+backend: pytorch
+num_workers: 4
+disagg_coordinator_url: "http://coordinator-host:7999"
+context_servers:
+  num_instances: 2
+  urls:
+      - "localhost:8001"
+      - "localhost:8002"
+  router:
+    type: kv_cache_aware
+generation_servers:
+  num_instances: 1
+  urls:
+      - "localhost:8003"
+  router:
+    type: kv_cache_aware
+```
+
+```{note}
+A fleet worker fails fast if its coordinator is unreachable: on startup it probes the coordinator's `/cluster_info` with bounded retry (up to `--server_start_timeout` seconds) and exits with an error rather than coming up and returning `Cluster is not ready` for every request.
+```
+
 ## Environment Variables
 
 TRT-LLM uses some environment variables to control the behavior of disaggregated service.

@@ -54,7 +54,6 @@ from tensorrt_llm.serve.coordinator_server import CoordinatorServer
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 from tensorrt_llm.serve.openai_client import OpenAIHttpClient
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
-from tensorrt_llm.serve.router import create_router
 
 GEN_TEXT = "HELLO_FROM_GEN"
 
@@ -213,11 +212,9 @@ class _CoordinatorThread:
     def __init__(self, config):
         self.port = _free_port()
         self.url = f"http://127.0.0.1:{self.port}"
-        ctx_urls, gen_urls = _split(config)
-        ctx_router = create_router(config.ctx_router_config, ctx_urls)
-        gen_router = create_router(config.gen_router_config, gen_urls)
+        # The coordinator builds its own owner routers from config.
         self._coordinator = DisaggCoordinatorService(
-            config, ctx_router, gen_router,
+            config,
             client_factory=lambda router, role, mr=1: _ReadinessClient(router))
         self._impl = _UvicornThread(CoordinatorServer(self._coordinator).app,
                                     self.port)
@@ -228,11 +225,6 @@ class _CoordinatorThread:
 
     def __exit__(self, *a):
         self._impl.__exit__(*a)
-
-
-def _split(config):
-    from tensorrt_llm.llmapi.disagg_utils import get_ctx_gen_server_addrs
-    return get_ctx_gen_server_addrs(config.server_configs)
 
 
 async def _wait_healthy(url, timeout_s=30.0):

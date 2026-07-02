@@ -57,11 +57,13 @@ def _client_factory(*_args, **_kwargs):
 
 def _make_service(schedule_style: str) -> OpenAIDisaggregatedService:
     config = DisaggServerConfig(server_configs=[], schedule_style=schedule_style)
+    # The coordinator builds its own (empty) routers from config; override them
+    # with mocks so tests can stub placement / readiness directly.
+    cluster = DisaggCoordinatorService(config, client_factory=_client_factory)
     ctx_router = AsyncMock(spec=Router)
     gen_router = AsyncMock(spec=Router)
-    cluster = DisaggCoordinatorService(
-        config, ctx_router, gen_router, client_factory=_client_factory
-    )
+    cluster._ctx_router = ctx_router
+    cluster._gen_router = gen_router
     service = OpenAIDisaggregatedService(
         config, cluster, client_factory=_client_factory
     )

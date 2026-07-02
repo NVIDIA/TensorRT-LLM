@@ -49,7 +49,6 @@ from tensorrt_llm.serve.disagg_coordinator import (CoordinatorClient,
                                                    DisaggCoordinatorService)
 from tensorrt_llm.serve.openai_protocol import (CompletionRequest,
                                                 DisaggregatedParams)
-from tensorrt_llm.serve.router import create_router
 
 
 @pytest.fixture(autouse=True)
@@ -141,11 +140,8 @@ class _CoordinatorThread:
     def __init__(self, config):
         self.port = _free_port()
         self.url = f"http://127.0.0.1:{self.port}"
-        ctx_urls, gen_urls = _split(config)
-        ctx_router = create_router(config.ctx_router_config, ctx_urls)
-        gen_router = create_router(config.gen_router_config, gen_urls)
-        self._cluster = DisaggCoordinatorService(config, ctx_router, gen_router,
-                                                 _client_factory)
+        # The coordinator builds its own owner routers from config.
+        self._cluster = DisaggCoordinatorService(config, _client_factory)
         self._server = uvicorn.Server(
             uvicorn.Config(CoordinatorServer(self._cluster).app,
                            host="127.0.0.1", port=self.port,
@@ -163,11 +159,6 @@ class _CoordinatorThread:
     def __exit__(self, *a):
         self._server.should_exit = True
         self._thread.join(timeout=10)
-
-
-def _split(config):
-    from tensorrt_llm.llmapi.disagg_utils import get_ctx_gen_server_addrs
-    return get_ctx_gen_server_addrs(config.server_configs)
 
 
 async def _wait_coord_ready(url, timeout_s=30.0):
@@ -197,11 +188,7 @@ def test_stateless_router_places_locally_in_worker():
                 "coordinator never became healthy"
 
             async def drive():
-                remote = CoordinatorClient(
-                    coord.url,
-                    create_router(config.ctx_router_config, [ctx0.url]),
-                    create_router(config.gen_router_config,
-                                  [gen0.url, gen1.url]))
+                remote = CoordinatorClient(coord.url, config)
                 # Stateless -> real local router, not a delegating proxy.
                 assert isinstance(remote.gen_router, RoundRobinRouter)
                 assert not isinstance(remote.gen_router,
@@ -237,11 +224,7 @@ def test_conversation_coordinator_sticky_by_conv_id():
                         request_type="context_only", conversation_id=conv_id))
 
             async def drive():
-                remote = CoordinatorClient(
-                    coord.url,
-                    create_router(config.ctx_router_config, [ctx0.url]),
-                    create_router(config.gen_router_config,
-                                  [gen0.url, gen1.url]))
+                remote = CoordinatorClient(coord.url, config)
                 # Stateful -> wrapped in a coordinator-delegating router.
                 assert isinstance(remote.gen_router,
                                   CoordinatorDelegatingRouter)

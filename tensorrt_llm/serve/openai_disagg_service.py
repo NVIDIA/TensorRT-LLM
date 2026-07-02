@@ -411,10 +411,10 @@ class OpenAIDisaggregatedService(OpenAIService):
             return True
         return False
 
-    async def cluster_info(self) -> Dict[str, Any]:
-        return await self._cluster.cluster_info()
-
     async def is_ready(self) -> bool:
+        # Per-request readiness gate for the /v1/ handlers (the server's /health
+        # and /cluster_info hook the coordinator directly). Cluster topology
+        # (cluster_info) is the coordinator's concern, not the request service's.
         return await self._cluster.is_ready()
 
     @property

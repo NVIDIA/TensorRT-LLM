@@ -33,11 +33,9 @@ from tensorrt_llm.executor.executor import CppExecutorError
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
                                               MetadataServerConfig, ServerRole,
-                                              get_ctx_gen_server_addrs,
                                               get_global_disagg_request_id)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.cluster_storage import HttpClusterStorageServer
-from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
 from tensorrt_llm.serve.disagg_coordinator import (CoordinatorClient,
                                                    DisaggCoordinatorService)
@@ -49,7 +47,7 @@ from tensorrt_llm.serve.openai_protocol import (DisaggregatedParams,
 from tensorrt_llm.serve.perf_metrics import DisaggPerfMetricsCollector
 from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
                                                 get_steady_clock_now_in_seconds)
-from tensorrt_llm.serve.router import Router, build_disagg_routers
+from tensorrt_llm.serve.router import Router
 from tensorrt_llm.version import __version__ as VERSION
 
 # yapf: enale
@@ -105,35 +103,26 @@ class OpenAIDisaggServer:
         # process owns the routers + cluster state (DisaggCoordinatorService).
         self._coordinator_url = coordinator_url
 
-        self._ctx_servers, self._gen_servers = get_ctx_gen_server_addrs(config.server_configs)
-        # Build ctx+gen routers together so a centralized deployment shares ONE
-        # namespace-aware core + ONE ZMQ ingest server. When coordinator_url is
-        # set, this is a delegating fleet worker: it builds coreless surfaces
-        # (routing_key() only) and never binds the ingest port -- the remote
-        # coordinator owns all routing state. Otherwise this process is the owner
-        # (single-process server) and its core starts the one ingest server.
-        self._ctx_router, self._gen_router = build_disagg_routers(
-            config.ctx_router_config, config.gen_router_config,
-            self._ctx_servers, self._gen_servers, metadata_server_cfg,
-            create_metadata_server(metadata_server_cfg), self._sync_server_clock,
-            disagg_node_id=config.node_id,
-            is_delegating_client=bool(self._coordinator_url))
-        self._metadata_server = create_metadata_server(metadata_server_cfg)
         self._perf_metrics_collector = DisaggPerfMetricsCollector(config.perf_metrics_max_requests)
 
+        # The server does NOT build routers. Router ownership is decided (and the
+        # routers built) by the coordinator object: DisaggCoordinatorService is
+        # the owner (builds core + ingest); CoordinatorClient is the delegating
+        # client (builds coreless surfaces). The server just holds whichever one
+        # matches its deployment and reads .ctx_router / .gen_router off it.
         if self._coordinator_url:
             self._coordinator = CoordinatorClient(
-                self._coordinator_url, self._ctx_router, self._gen_router,
-                request_timeout_s=self._req_timeout_secs)
+                self._coordinator_url, self._config, metadata_server_cfg,
+                request_timeout_s=self._req_timeout_secs,
+                startup_timeout_s=self._server_start_timeout_secs)
         else:
-            # The coordinator owns the disagg cluster storage (creates it from
-            # config); read it back for route-mounting below.
             self._coordinator = DisaggCoordinatorService(
-                self._config, self._ctx_router, self._gen_router,
-                self._create_client,
-                metadata_server=self._metadata_server,
+                self._config, self._create_client,
                 metadata_config=self._metadata_server_cfg,
+                server_preparation_func=self._sync_server_clock,
                 server_start_timeout_secs=self._server_start_timeout_secs)
+        self._ctx_router = self._coordinator.ctx_router
+        self._gen_router = self._coordinator.gen_router
 
         self._service = OpenAIDisaggregatedService(
             self._config, self._coordinator, self._create_client,
@@ -178,6 +167,9 @@ class OpenAIDisaggServer:
         return client
 
     def register_routes(self):
+        # The disagg service owns only the request-serving endpoints (/v1/*) and
+        # perf metrics. Readiness / cluster topology are the coordinator's state,
+        # so /health and /cluster_info hook straight to self._coordinator.
         self.app.add_api_route("/v1/completions", self._wrap_entry_point(self._service.openai_completion), methods=["POST"])
         self.app.add_api_route("/v1/chat/completions", self._wrap_entry_point(self._service.openai_chat_completion), methods=["POST"])
         self.app.add_api_route("/health", self.health, methods=["GET"])
@@ -264,12 +256,12 @@ class OpenAIDisaggServer:
 
 
     async def health(self) -> Response:
-        if not await self._service.is_ready():
+        if not await self._coordinator.is_ready():
             return Response(status_code=500)
         return Response(status_code=200)
 
     async def cluster_info(self) -> JSONResponse:
-        return JSONResponse(content=await self._service.cluster_info())
+        return JSONResponse(content=await self._coordinator.cluster_info())
 
     async def version(self) -> JSONResponse:
         return JSONResponse(content={"version": VERSION})

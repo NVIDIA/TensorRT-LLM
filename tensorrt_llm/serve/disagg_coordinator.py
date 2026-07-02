@@ -41,15 +41,17 @@ from typing import Any, Dict, Optional, Tuple
 import aiohttp
 
 from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
-                                              MetadataServerConfig, ServerRole)
+                                              MetadataServerConfig, ServerRole,
+                                              get_ctx_gen_server_addrs)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.cluster_storage import (ClusterStorage, WatchEventType,
                                                 create_cluster_storage)
 from tensorrt_llm.serve.disagg_auto_scaling import (DisaggClusterManager,
                                                     WorkerInfo)
-from tensorrt_llm.serve.metadata_server import JsonDictionary
+from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_client import OpenAIClient
-from tensorrt_llm.serve.router import CoordinatorDelegatingRouter, Router
+from tensorrt_llm.serve.router import (CoordinatorDelegatingRouter, Router,
+                                       build_disagg_routers)
 
 __all__ = [
     "DisaggCoordinator",
@@ -100,24 +102,30 @@ class DisaggCoordinatorService(DisaggCoordinator):
     def __init__(
         self,
         config: DisaggServerConfig,
-        ctx_router: Router,
-        gen_router: Router,
         client_factory,
-        metadata_server: Optional[JsonDictionary] = None,
         metadata_config: Optional[MetadataServerConfig] = None,
+        server_preparation_func=None,
         server_start_timeout_secs: int = 180,
         health_check_interval_secs: int = 3,
     ):
         self._config = config
-        self._ctx_router = ctx_router
-        self._gen_router = gen_router
         self._client_factory = client_factory
-        self._metadata_server = metadata_server
         self._metadata_config = metadata_config
-        # Routers are already built (and, for a centralized owner deployment, the
-        # single shared core's ZMQ ingest server already started) by
-        # build_disagg_routers before construction. The coordinator does not
-        # create or start routers itself.
+        # The coordinator OWNS routing state, so it builds the owner routers here
+        # (is_delegating_client=False): a centralized deployment gets ONE shared
+        # namespace-aware core and starts its single ZMQ ingest server exactly
+        # once. This is the sole place owner routers are created -- the fleet
+        # worker holds no owner router, only a CoordinatorClient's delegating
+        # surfaces. server_preparation_func (e.g. steady-clock sync) is wired into
+        # the routers at build time.
+        self._metadata_server = create_metadata_server(metadata_config)
+        ctx_servers, gen_servers = get_ctx_gen_server_addrs(
+            config.server_configs)
+        self._ctx_router, self._gen_router = build_disagg_routers(
+            config.ctx_router_config, config.gen_router_config,
+            ctx_servers, gen_servers, metadata_config, self._metadata_server,
+            server_preparation_func, disagg_node_id=config.node_id,
+            is_delegating_client=False)
         # The coordinator owns the disagg cluster storage (auto-scaling backend):
         # it drives the DisaggClusterManager below and, when the storage is an
         # in-process HTTP server, its routes are mounted on the coordinator app.
@@ -285,15 +293,30 @@ class CoordinatorClient(DisaggCoordinator):
 
     Args:
         remote_url: Coordinator base URL (e.g. ``http://host:PORT``).
-        ctx_router / gen_router: local routers of the configured type (same config
-            as the coordinator so extracted keys line up).
+        config: The disagg config; the client builds its own delegating routers
+            of the configured type (same config as the coordinator so the keys it
+            extracts line up).
     """
 
-    def __init__(self, remote_url: str, ctx_router: Router, gen_router: Router,
-                 request_timeout_s: float = 5.0):
+    def __init__(self, remote_url: str, config: DisaggServerConfig,
+                 metadata_config: Optional[MetadataServerConfig] = None,
+                 request_timeout_s: float = 5.0,
+                 startup_timeout_s: float = 180.0):
         self._remote_url = remote_url.rstrip("/")
         self._request_timeout_s = request_timeout_s
+        self._startup_timeout_s = startup_timeout_s
         self._session: Optional[aiohttp.ClientSession] = None
+        # A delegating client builds coreless surfaces (is_delegating_client=True):
+        # they compute the routing key locally (routing_key()) but never bind an
+        # ingest port or own a core -- placement is delegated to the coordinator.
+        # This is the sole place delegating routers are created.
+        ctx_servers, gen_servers = get_ctx_gen_server_addrs(
+            config.server_configs)
+        ctx_router, gen_router = build_disagg_routers(
+            config.ctx_router_config, config.gen_router_config,
+            ctx_servers, gen_servers, metadata_config,
+            create_metadata_server(metadata_config),
+            disagg_node_id=config.node_id, is_delegating_client=True)
         self._ctx_router = self._maybe_delegate(ctx_router, "context")
         self._gen_router = self._maybe_delegate(gen_router, "generation")
 
@@ -320,11 +343,15 @@ class CoordinatorClient(DisaggCoordinator):
         return self._session
 
     async def start(self) -> None:
+        # Fail fast: a delegating server is useless without its coordinator. Probe
+        # /cluster_info with bounded retry; if it never becomes reachable within
+        # startup_timeout_s, raise so the server exits non-zero instead of coming
+        # up and 500-ing every request against a missing coordinator.
+        info = await self._await_coordinator()
         # A delegating client doesn't monitor servers, so it can't learn the
         # workers' tokens_per_block from /server_info. Fetch it from the
-        # coordinator and apply it to the local routers' block-hashing so the
-        # keys the client computes line up with the coordinator/workers.
-        info = await self.cluster_info()
+        # coordinator (above) and apply it to the local routers' block-hashing so
+        # the keys the client computes line up with the coordinator/workers.
         tpb = info.get("tokens_per_block")
         if tpb is not None:
             for router in (self._ctx_router, self._gen_router):
@@ -335,6 +362,39 @@ class CoordinatorClient(DisaggCoordinator):
                     logger.info(
                         f"CoordinatorClient: adopted coordinator "
                         f"tokens_per_block={tpb} for {getattr(local, '_namespace', '?')}")
+
+    async def _await_coordinator(self) -> Dict[str, Any]:
+        """Poll the coordinator's /cluster_info until reachable, or raise.
+
+        Returns the cluster_info dict once the coordinator answers HTTP 200. A 200
+        means the coordinator process is up (not that all workers are ready --
+        that's is_ready's job). Raises RuntimeError if it stays unreachable past
+        startup_timeout_s so the delegating server fails fast instead of serving
+        against a missing coordinator."""
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + self._startup_timeout_s
+        attempt = 0
+        while True:
+            try:
+                async with self.session.get(
+                        f"{self._remote_url}/cluster_info",
+                        timeout=self._request_timeout_s) as resp:
+                    if resp.status == 200:
+                        logger.info("CoordinatorClient: coordinator reachable at "
+                                    f"{self._remote_url}")
+                        return await resp.json()
+                    last_err = f"HTTP {resp.status}"
+            except Exception as e:  # noqa: BLE001
+                last_err = str(e)
+            attempt += 1
+            if loop.time() >= deadline:
+                raise RuntimeError(
+                    f"Coordinator at {self._remote_url} not reachable after "
+                    f"{self._startup_timeout_s}s ({attempt} attempts, last "
+                    f"error: {last_err}); aborting delegating server startup")
+            logger.info(f"CoordinatorClient: waiting for coordinator at "
+                        f"{self._remote_url} (attempt {attempt}, {last_err})")
+            await asyncio.sleep(2.0)
 
     async def is_ready(self) -> bool:
         try:
