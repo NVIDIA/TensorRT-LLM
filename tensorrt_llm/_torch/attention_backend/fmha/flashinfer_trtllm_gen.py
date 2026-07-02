@@ -408,6 +408,9 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         (320, 256),
         (576, 512),
     }
+    MISSING_MLA_GENERATION_KERNELS = {
+        (576, 512, 32),
+    }
 
     def __init__(self, attn: "TrtllmAttention"):
         super().__init__(attn)
@@ -562,6 +565,14 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 False,
                 f"[Generation][MLA] Unsupported head dimensions: "
                 f"headDimQk={head_dim_qk}, headDimV={head_dim_v}. Supported: {supported}.",
+            )
+
+        if (head_dim_qk, head_dim_v, tokens_per_block) in cls.MISSING_MLA_GENERATION_KERNELS:
+            return (
+                False,
+                f"[Generation][MLA] Missing TRTLLM-GEN decode kernel for "
+                f"headDimQk={head_dim_qk}, headDimV={head_dim_v}, "
+                f"tokens_per_block={tokens_per_block}.",
             )
 
         return True, ""
