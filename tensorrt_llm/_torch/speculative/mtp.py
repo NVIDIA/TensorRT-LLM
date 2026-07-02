@@ -5,10 +5,8 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from tensorrt_llm._utils import prefer_pinned
-from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
-from ..distributed.ops import allgather
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import TorchSampler
@@ -1106,80 +1104,3 @@ class MTPWorker(SpecWorkerBase):
             "hidden_states": return_hidden_states,
             "attn_metadata": attn_metadata,
         }
-
-    @torch.compile(options={"max-autotune": True})
-    def get_local_max_and_combined(self, logits, mapping_lm_tp=None):
-        local_max_values, local_argmax = torch.max(logits, dim=-1, keepdim=True)
-        # Adjust indices based on TP rank and size
-        vocab_per_rank = logits.shape[-1]
-        mapping_lm_tp = mapping_lm_tp if mapping_lm_tp is not None else self.model_config.mapping
-        max_index_per_rank = local_argmax.type(
-            torch.int32) + (mapping_lm_tp.tp_rank * vocab_per_rank)
-        # Use torch.stack and flatten instead of view+cat to avoid torch.compile issues
-        # Convert both to float32 to ensure consistent dtype
-        max_index_per_rank_float = max_index_per_rank.float()
-        local_max_values_float32 = local_max_values.float()
-
-        # Stack and flatten to get interleaved layout: [idx0, val0, idx1, val1, ...]
-        combined = torch.stack(
-            [max_index_per_rank_float, local_max_values_float32],
-            dim=-1).flatten(-2)
-        return combined
-
-    @torch.compile(options={"max-autotune": True})
-    def get_draft_tokens_from_gathered(self, gathered):
-        gathered_indices_float = gathered[..., 0::2]  # Even positions: indices
-        gathered_values_float = gathered[..., 1::2]  # Odd positions: values
-
-        # Find the rank with maximum value
-        max_indices = torch.argmax(gathered_values_float, dim=-1, keepdim=True)
-
-        # Get the corresponding token indices and convert back to int32
-        draft_tokens = torch.gather(gathered_indices_float, -1,
-                                    max_indices).squeeze(-1).type(torch.int32)
-        return draft_tokens
-
-    def draft_sampler(
-        self,
-        logits: torch.Tensor,
-        mapping_lm_head_tp: Mapping = None,
-    ):
-        '''
-        Sampling draft tokens.
-
-        Args:
-            logits: torch.Tensor
-                [num_tokens, vocab_size]
-                Logits produced by the draft model.
-
-        Returns:
-            draft_tokens: torch.Tensor
-                [batch_size * max_draft_len]
-                Draft token ids. Flattened.
-        '''
-        if (self.model_config is not None
-                and hasattr(self.model_config, 'mapping')
-                and self.model_config.mapping.tp_size
-                > 1) and not (self.model_config.mapping.enable_attention_dp):
-            combined = self.get_local_max_and_combined(logits)
-            gathered = allgather(combined, self.model_config.mapping, dim=-1)
-            draft_tokens = self.get_draft_tokens_from_gathered(gathered)
-        elif (self.model_config is not None
-              and hasattr(self.model_config, 'mapping')
-              and self.model_config.mapping.tp_size
-              > 1) and self.model_config.mapping.enable_lm_head_tp_in_adp:
-            # For ADP + LM head TP mode, we need to find the global argmax across all TP ranks
-            combined = self.get_local_max_and_combined(logits,
-                                                       mapping_lm_head_tp)
-            gathered = allgather(combined, mapping_lm_head_tp, dim=-1)
-            batch_size = logits.shape[0]
-            local_batch_size = batch_size // mapping_lm_head_tp.tp_size
-            gathered = gathered.view(mapping_lm_head_tp.tp_size,
-                                     local_batch_size, -1)
-            sliced_gathered = gathered[mapping_lm_head_tp.tp_rank]
-            draft_tokens = self.get_draft_tokens_from_gathered(sliced_gathered)
-        else:
-            # Simple argmax if no TP or no model config
-            draft_tokens = self._draft_sampler_greedy(logits)
-
-        return draft_tokens

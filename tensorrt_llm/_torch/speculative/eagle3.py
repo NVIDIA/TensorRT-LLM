@@ -1007,62 +1007,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             reorder_block_ids_per_seq, non_blocking=True)
 
     @torch.compile(options={"max-autotune": True})
-    def _get_local_max_and_combined(self, logits, mapping_lm_tp=None):
-        local_max_values, local_argmax = torch.max(logits, dim=-1, keepdim=True)
-        vocab_per_rank = logits.shape[-1]
-        mapping_lm_tp = mapping_lm_tp if mapping_lm_tp is not None else \
-            self.model_config.mapping
-        max_index_per_rank = local_argmax.type(
-            torch.int32) + (mapping_lm_tp.tp_rank * vocab_per_rank)
-        max_index_per_rank_float = max_index_per_rank.float()
-        local_max_values_float32 = local_max_values.float()
-        combined = torch.stack(
-            [max_index_per_rank_float, local_max_values_float32],
-            dim=-1).flatten(-2)
-        return combined
-
-    @torch.compile(options={"max-autotune": True})
-    def _get_draft_tokens_from_gathered(self, gathered):
-        gathered_indices_float = gathered[..., 0::2]
-        gathered_values_float = gathered[..., 1::2]
-        max_indices = torch.argmax(gathered_values_float, dim=-1, keepdim=True)
-        draft_tokens = torch.gather(gathered_indices_float, -1,
-                                    max_indices).squeeze(-1).type(torch.int32)
-        return draft_tokens
-
-    def draft_sampler(
-        self,
-        logits: torch.Tensor,
-        mapping_lm_head_tp=None,
-    ):
-        """TP-aware greedy draft token sampler (MTP Eagle path).
-
-        Falls back to simple argmax when no tensor parallelism is active or
-        when only attention DP is enabled without LM-head TP.
-        """
-        if (self.model_config is not None
-                and hasattr(self.model_config, 'mapping')
-                and self.model_config.mapping.tp_size > 1
-                and not self.model_config.mapping.enable_attention_dp):
-            combined = self._get_local_max_and_combined(logits)
-            gathered = allgather(combined, self.model_config.mapping, dim=-1)
-            return self._get_draft_tokens_from_gathered(gathered)
-        elif (self.model_config is not None
-              and hasattr(self.model_config, 'mapping')
-              and self.model_config.mapping.tp_size > 1
-              and self.model_config.mapping.enable_lm_head_tp_in_adp):
-            combined = self._get_local_max_and_combined(logits,
-                                                        mapping_lm_head_tp)
-            gathered = allgather(combined, mapping_lm_head_tp, dim=-1)
-            batch_size = logits.shape[0]
-            local_batch_size = batch_size // mapping_lm_head_tp.tp_size
-            gathered = gathered.view(mapping_lm_head_tp.tp_size,
-                                     local_batch_size, -1)
-            sliced_gathered = gathered[mapping_lm_head_tp.tp_rank]
-            return self._get_draft_tokens_from_gathered(sliced_gathered)
-        else:
-            return self._draft_sampler_greedy(logits)
-
     @torch.compile(options={"max-autotune": True})
     def _topk_kernel(self, gen_logprobs, num_gens, mtp_num_modules,
                      spec_metadata):

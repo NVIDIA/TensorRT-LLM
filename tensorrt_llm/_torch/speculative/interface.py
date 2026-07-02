@@ -1479,6 +1479,65 @@ class SpecWorkerBase(nn.Module, ABC):
 
         return draft_tokens.type(torch.int32)
 
+    def _get_local_max_and_combined(self, logits, mapping_lm_tp=None):
+        """Pack each rank's local (global_argmax_index, max_value) for a
+        distributed argmax over a vocab-sharded draft LM head.
+        """
+        local_max_values, local_argmax = torch.max(logits, dim=-1, keepdim=True)
+        vocab_per_rank = logits.shape[-1]
+        mapping_lm_tp = mapping_lm_tp if mapping_lm_tp is not None else self.mapping
+        max_index_per_rank = local_argmax.type(
+            torch.int32) + (mapping_lm_tp.tp_rank * vocab_per_rank)
+        max_index_per_rank_float = max_index_per_rank.float()
+        local_max_values_float32 = local_max_values.float()
+        # Interleaved layout: [idx0, val0, idx1, val1, ...] after all-gather.
+        combined = torch.stack(
+            [max_index_per_rank_float, local_max_values_float32],
+            dim=-1).flatten(-2)
+        return combined
+
+    @torch.compile(options={"max-autotune": True})
+    def _get_draft_tokens_from_gathered(self, gathered):
+        """Pick the global-argmax token id from the all-gathered per-rank
+        (index, value) pairs produced by ``_get_local_max_and_combined``.
+        """
+        gathered_indices_float = gathered[..., 0::2]
+        gathered_values_float = gathered[..., 1::2]
+        max_indices = torch.argmax(gathered_values_float, dim=-1, keepdim=True)
+        draft_tokens = torch.gather(gathered_indices_float, -1,
+                                    max_indices).squeeze(-1).type(torch.int32)
+        return draft_tokens
+
+    def draft_sampler(self, logits: torch.Tensor, mapping_lm_head_tp=None):
+        """TP-aware greedy draft-token sampler.
+
+        When the draft LM head is vocab-sharded under plain tensor parallelism,
+        a per-rank argmax disagrees across ranks and desyncs speculative
+        decoding. Gather only each rank's local (index, value) and pick the
+        global argmax. Falls back to plain argmax when no TP gather is needed.
+        Expects 2D ``[num_tokens, vocab_shard]`` logits.
+        """
+        mapping = self.mapping
+        if (mapping is not None and getattr(mapping, "tp_size", 1) > 1
+                and not mapping.enable_attention_dp):
+            from ..distributed.ops import allgather
+            combined = self._get_local_max_and_combined(logits)
+            gathered = allgather(combined, mapping, dim=-1)
+            return self._get_draft_tokens_from_gathered(gathered)
+        elif (mapping is not None and getattr(mapping, "tp_size", 1) > 1
+              and mapping.enable_lm_head_tp_in_adp):
+            from ..distributed.ops import allgather
+            combined = self._get_local_max_and_combined(logits,
+                                                        mapping_lm_head_tp)
+            gathered = allgather(combined, mapping_lm_head_tp, dim=-1)
+            batch_size = logits.shape[0]
+            local_batch_size = batch_size // mapping_lm_head_tp.tp_size
+            gathered = gathered.view(mapping_lm_head_tp.tp_size,
+                                     local_batch_size, -1)
+            sliced_gathered = gathered[mapping_lm_head_tp.tp_rank]
+            return self._get_draft_tokens_from_gathered(sliced_gathered)
+        return self._draft_sampler_greedy(logits)
+
     def _draft_sampler_advanced(
         self,
         logits: torch.Tensor,
