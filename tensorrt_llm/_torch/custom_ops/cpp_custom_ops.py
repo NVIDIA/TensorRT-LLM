@@ -333,9 +333,8 @@ def _register_fake():
         out_dtype: Optional[torch.dtype],
         bias: Optional[torch.Tensor] = None,
         tactic: int = -1,
-        down_offset: int = 0,
     ):
-        del a_sf, w_sf, alpha, down, lora_up, bias, tactic, down_offset
+        del a_sf, w_sf, alpha, down, lora_up, bias, tactic
         return a.new_empty(
             (a.shape[0], wq.shape[0]),
             dtype=out_dtype if out_dtype is not None else torch.bfloat16,

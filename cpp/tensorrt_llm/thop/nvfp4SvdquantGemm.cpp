@@ -71,8 +71,7 @@ std::tuple<at::Tensor, at::Tensor> nvfp4_quantize_smooth(
 // and L1 [n,r]=svdquant_lora_b/alpha (1/alpha folded so the epilogue out=alpha*acc yields the LoRA).
 at::Tensor nvfp4_svdquant_gemm(at::Tensor const& a, at::Tensor const& wq, at::Tensor const& a_sf,
     at::Tensor const& w_sf, at::Tensor const& alpha, at::Tensor const& D, at::Tensor const& L1,
-    std::optional<c10::ScalarType> out_dtype, std::optional<at::Tensor> const& bias = std::nullopt, int64_t tactic = -1,
-    int64_t down_offset = 0)
+    std::optional<c10::ScalarType> out_dtype, std::optional<at::Tensor> const& bias = std::nullopt, int64_t tactic = -1)
 {
     TORCH_CHECK(a.is_cuda(), "a must be a CUDA tensor");
     TORCH_CHECK(wq.is_cuda() && a_sf.is_cuda() && w_sf.is_cuda() && alpha.is_cuda(),
@@ -102,13 +101,10 @@ at::Tensor nvfp4_svdquant_gemm(at::Tensor const& a, at::Tensor const& wq, at::Te
     TORCH_CHECK(a_sf.numel() >= expectedActSfSize, "a_sf is smaller than the required swizzled scale layout");
     TORCH_CHECK(w_sf.numel() >= expectedWeightSfSize, "w_sf is smaller than the required swizzled scale layout");
     TORCH_CHECK(D.device() == a.device(), "D must reside on the same CUDA device as a");
-    TORCH_CHECK(D.size(0) == m, "D must have m rows");
-    TORCH_CHECK(D.stride(1) == 1, "D must be contiguous in its inner dimension");
-    TORCH_CHECK(down_offset >= 0, "down_offset must be non-negative");
-    TORCH_CHECK(D.size(1) >= 32 && down_offset <= D.size(1) - 32, "down_offset + 32 must not exceed D.size(1)");
-    auto const downAddress = reinterpret_cast<std::uintptr_t>(D.const_data_ptr<at::BFloat16>() + down_offset);
-    TORCH_CHECK(downAddress % 16 == 0, "D + down_offset must be 16-byte aligned for TMA");
-    TORCH_CHECK(D.stride(0) % 8 == 0, "D row stride must be a multiple of 8 bf16 elements for TMA");
+    TORCH_CHECK(D.size(0) == m && D.size(1) == 32, "D must have shape [m, 32]");
+    TORCH_CHECK(D.is_contiguous(), "D must be contiguous");
+    auto const downAddress = reinterpret_cast<std::uintptr_t>(D.const_data_ptr<at::BFloat16>());
+    TORCH_CHECK(downAddress % 16 == 0, "D must be 16-byte aligned for TMA");
     TORCH_CHECK(L1.device() == a.device(), "L1 must reside on the same CUDA device as a");
     TORCH_CHECK(L1.size(0) == n && L1.size(1) == 32, "L1 must have shape [n, 32]");
     auto const outType = out_dtype.value_or(at::kBFloat16);
@@ -138,12 +134,10 @@ at::Tensor nvfp4_svdquant_gemm(at::Tensor const& a, at::Tensor const& wq, at::Te
         = tensorrt_llm::kernels::cutlass_kernels::nvfp4_svdquant_gemm_workspace_size(m, n, k, tacticId);
     at::Tensor workspace = at::empty({static_cast<int64_t>(wsBytes > 0 ? wsBytes : 1)}, a.options().dtype(at::kByte));
     auto stream = at::cuda::getCurrentCUDAStream(a.get_device()).stream();
-    auto const* downPtr = D.const_data_ptr<at::BFloat16>() + down_offset;
-    int64_t const downStride = D.stride(0);
     tensorrt_llm::kernels::cutlass_kernels::nvfp4_svdquant_gemm_run(out.data_ptr(), a_.const_data_ptr(),
-        wq_.const_data_ptr(), aSf_.const_data_ptr(), wSf_.const_data_ptr(), alpha_.const_data_ptr<float>(), downPtr,
-        L1_.const_data_ptr(), biasPtr, m, n, k, reinterpret_cast<char*>(workspace.data_ptr()), wsBytes, stream,
-        tacticId, downStride);
+        wq_.const_data_ptr(), aSf_.const_data_ptr(), wSf_.const_data_ptr(), alpha_.const_data_ptr<float>(),
+        D.const_data_ptr(), L1_.const_data_ptr(), biasPtr, m, n, k, reinterpret_cast<char*>(workspace.data_ptr()),
+        wsBytes, stream, tacticId);
     return out;
 }
 
@@ -152,9 +146,9 @@ class NVFP4SVDQuantGemmRunner : public torch::CustomClassHolder
 public:
     at::Tensor runGemm(at::Tensor const& a, at::Tensor const& wq, at::Tensor const& a_sf, at::Tensor const& w_sf,
         at::Tensor const& alpha, at::Tensor const& D, at::Tensor const& L1, std::optional<c10::ScalarType> out_dtype,
-        std::optional<at::Tensor> const& bias, int64_t tactic, int64_t down_offset) const
+        std::optional<at::Tensor> const& bias, int64_t tactic) const
     {
-        return nvfp4_svdquant_gemm(a, wq, a_sf, w_sf, alpha, D, L1, out_dtype, bias, tactic, down_offset);
+        return nvfp4_svdquant_gemm(a, wq, a_sf, w_sf, alpha, D, L1, out_dtype, bias, tactic);
     }
 
     int64_t getNumConfigs() const
@@ -175,7 +169,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def("nvfp4_quantize_smooth(Tensor x, Tensor pqs, Tensor global_scale) -> (Tensor, Tensor)");
     m.def(
         "nvfp4_svdquant_gemm(Tensor a, Tensor wq, Tensor a_sf, Tensor w_sf, Tensor alpha, "
-        "Tensor D, Tensor L1, ScalarType? out_dtype, Tensor? bias=None, int tactic=-1, int down_offset=0) -> Tensor");
+        "Tensor D, Tensor L1, ScalarType? out_dtype, Tensor? bias=None, int tactic=-1) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

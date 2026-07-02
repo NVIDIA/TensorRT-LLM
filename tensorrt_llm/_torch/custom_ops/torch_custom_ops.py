@@ -665,7 +665,6 @@ class NVFP4SVDQuantGemmRunner(TunableRunner):
         inputs: List[torch.Tensor],
         tactic: int = -1,
         bias: Optional[torch.Tensor] = None,
-        down_offset: int = 0,
     ) -> torch.Tensor:
         act_fp4, weight, act_sf, weight_sf, alpha, down, lora_up = inputs
         return self.cpp_runner.run_gemm(
@@ -679,7 +678,6 @@ class NVFP4SVDQuantGemmRunner(TunableRunner):
             self.output_dtype,
             bias,
             tactic,
-            down_offset,
         )
 
 
@@ -694,7 +692,6 @@ def nvfp4_svdquant_gemm_tuned(
     lora_up: torch.Tensor,
     output_dtype: torch.dtype,
     bias: Optional[torch.Tensor] = None,
-    down_offset: int = 0,
 ) -> torch.Tensor:
     runner = NVFP4SVDQuantGemmRunner(output_dtype)
     inputs = [act_fp4, weight, act_sf, weight_sf, alpha, down, lora_up]
@@ -704,12 +701,8 @@ def nvfp4_svdquant_gemm_tuned(
         runner.tuning_config,
         inputs,
         bias=bias,
-        down_offset=down_offset,
     )
-    return runner(inputs,
-                  tactic=best_tactic,
-                  bias=bias,
-                  down_offset=down_offset)
+    return runner(inputs, tactic=best_tactic, bias=bias)
 
 
 @nvfp4_svdquant_gemm_tuned.register_fake
@@ -723,9 +716,8 @@ def _(
     lora_up: torch.Tensor,
     output_dtype: torch.dtype,
     bias: Optional[torch.Tensor] = None,
-    down_offset: int = 0,
 ) -> torch.Tensor:
-    del act_sf, weight_sf, alpha, down, lora_up, bias, down_offset
+    del act_sf, weight_sf, alpha, down, lora_up, bias
     return act_fp4.new_empty((act_fp4.shape[0], weight.shape[0]),
                              dtype=output_dtype)
 
