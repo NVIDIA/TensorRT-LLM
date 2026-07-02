@@ -170,7 +170,6 @@ package_data += [
     # Include CUDA source for fused MoE align extension so runtime JIT can find it in wheels
     '_torch/auto_deploy/custom_ops/fused_moe/moe_align_kernel.cu',
     '_torch/auto_deploy/custom_ops/fused_moe/triton_fused_moe_configs/*',
-    '_torch/visual_gen/cute_dsl_kernels/blackwell/attention/cubins/**/*.so',
     'usage/schemas/*.json',
 ]
 
