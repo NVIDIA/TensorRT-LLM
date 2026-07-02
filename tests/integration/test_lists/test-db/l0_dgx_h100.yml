@@ -57,6 +57,8 @@ l0_dgx_h100:
   # llmapi
   - unittest/llmapi/test_mpi_session.py::test_llmapi_launch_multiple_tasks
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_gen_only_spec_dec
+  # ------------- Model specific tests ---------------
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8[tp2_ep1]
 - condition:
     ranges:
       system_gpu_count:
