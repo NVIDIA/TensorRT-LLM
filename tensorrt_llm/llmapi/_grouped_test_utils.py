@@ -88,6 +88,19 @@ def reset_worker_torch_compile_state() -> None:
     torch._dynamo.reset()
 
 
+def clear_worker_weight_cache() -> None:
+    """Drop the per-worker HF raw-weight cache (runs inside each worker).
+
+    The cache is a process-global keyed by checkpoint file fingerprints, so it
+    otherwise lives until the worker process exits. Submit this to each worker
+    via ``mpi_session.submit_sync(...)`` on group teardown to invalidate it
+    explicitly instead of relying on process death.
+    """
+    from tensorrt_llm._torch.models.checkpoints import HfWeightLoader
+
+    HfWeightLoader.clear_weight_cache()
+
+
 def make_shared_llm(mpi_session):
     """Return an ``LLM`` factory that transparently injects a shared MPI session.
 

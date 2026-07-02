@@ -75,7 +75,9 @@ def patch_mpi_pool_session_for_env(mocker, env_vars: dict):
 
 
 from tensorrt_llm.llmapi._grouped_test_utils import \
-    hf_weight_cache_env as _hf_weight_cache_env  # noqa: E402
+    clear_worker_weight_cache as _clear_worker_weight_cache  # noqa: E402
+from tensorrt_llm.llmapi._grouped_test_utils import \
+    hf_weight_cache_env as _hf_weight_cache_env
 from tensorrt_llm.llmapi._grouped_test_utils import \
     make_shared_llm as _make_shared_llm
 from tensorrt_llm.llmapi._grouped_test_utils import \
@@ -108,7 +110,14 @@ def shared_mpi_session_4gpu(hf_weight_cache):
 
 @pytest.fixture(scope="module")
 def shared_llm_4gpu(shared_mpi_session_4gpu):
-    return _make_shared_llm(shared_mpi_session_4gpu)
+    try:
+        yield _make_shared_llm(shared_mpi_session_4gpu)
+    finally:
+        # Explicitly invalidate the per-worker HF weight cache while the shared
+        # session is still alive (this fixture tears down before
+        # shared_mpi_session_4gpu), instead of relying on worker process exit.
+        if shared_mpi_session_4gpu is not None:
+            shared_mpi_session_4gpu.submit_sync(_clear_worker_weight_cache)
 
 
 def _get_default_torch_compile_config(torch_compile):
