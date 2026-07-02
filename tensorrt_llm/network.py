@@ -26,6 +26,14 @@ from typing import (Any, Dict, Iterable, List, Optional, OrderedDict, Set,
 
 import numpy as np
 import onnx
+import tensorrt as trt
+
+from tensorrt_llm.module import Module
+
+from ._common import set_network
+from ._utils import get_extra_attr, has_extra_attr, set_extra_attr
+from .logger import logger
+from .plugin import PluginConfig
 
 
 def _ensure_onnx_graphsurgeon_helper_compat() -> None:
@@ -67,15 +75,7 @@ def _ensure_onnx_graphsurgeon_helper_compat() -> None:
 
 
 _ensure_onnx_graphsurgeon_helper_compat()
-import onnx_graphsurgeon as gs
-import tensorrt as trt
-
-from tensorrt_llm.module import Module
-
-from ._common import set_network
-from ._utils import get_extra_attr, has_extra_attr, set_extra_attr
-from .logger import logger
-from .plugin import PluginConfig
+import onnx_graphsurgeon as gs  # noqa: E402
 
 
 class _UniqueNameGenerator(object):
