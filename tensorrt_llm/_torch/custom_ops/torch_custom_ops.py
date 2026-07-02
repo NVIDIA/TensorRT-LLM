@@ -353,33 +353,31 @@ def fused_moe(
             "Provide either (fc1_lora_ranks, ...) or (fc1_slot_lora_ranks, ..., token_to_slot), not both."
         )
     run_moe = moe_runner.fused_moe_runner.run_moe_min_latency if min_latency_mode else moe_runner.fused_moe_runner.run_moe
+    # Both run_moe overloads share this positional prefix. The TorchBind schemas
+    # do not honor C++ default arguments, so every positional must be supplied.
+    run_moe_args = [
+        input, token_selected_experts, token_final_scales, fc1_expert_weights,
+        fc1_expert_biases, fc2_expert_weights, fc2_expert_biases, quant_scales,
+        input_sf, swizzled_input_sf, swiglu_alpha, swiglu_beta, swiglu_limit,
+        tp_size, tp_rank, ep_size, ep_rank, cluster_size,
+        cluster_rank, enable_alltoall, min_latency_mode,
+        [gemm_tactic_1, gemm_tactic_2
+         ], activation_type, unpadded_hidden_size, tuner_num_tokens, out_tensor
+    ]
+    if not min_latency_mode:
+        # run_moe takes use_dynamic_fc2_scale plus the eager (per-request) and
+        # CUDA-graph (slot-indexed) LoRA tensor families; run_moe_min_latency
+        # stops at out_tensor.
+        run_moe_args += [
+            use_dynamic_fc2_scale, fc1_lora_ranks, fc1_lora_weight_ptrs,
+            fc2_lora_ranks, fc2_lora_weight_ptrs, gated_lora_ranks,
+            gated_lora_weight_ptrs, host_request_types, host_context_lengths,
+            lora_max_low_rank, fc1_slot_lora_ranks, fc1_slot_lora_weight_ptrs,
+            fc2_slot_lora_ranks, fc2_slot_lora_weight_ptrs,
+            gated_slot_lora_ranks, gated_slot_lora_weight_ptrs, token_to_slot
+        ]
     try:
-        if min_latency_mode:
-            output = run_moe(input, token_selected_experts, token_final_scales,
-                             fc1_expert_weights, fc1_expert_biases,
-                             fc2_expert_weights, fc2_expert_biases,
-                             quant_scales, input_sf, swizzled_input_sf,
-                             swiglu_alpha, swiglu_beta, swiglu_limit, tp_size,
-                             tp_rank, ep_size, ep_rank, cluster_size,
-                             cluster_rank, enable_alltoall, min_latency_mode,
-                             [gemm_tactic_1, gemm_tactic_2], activation_type,
-                             unpadded_hidden_size, tuner_num_tokens, out_tensor)
-        else:
-            output = run_moe(
-                input, token_selected_experts, token_final_scales,
-                fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
-                fc2_expert_biases, quant_scales, input_sf, swizzled_input_sf,
-                swiglu_alpha, swiglu_beta, swiglu_limit, tp_size, tp_rank,
-                ep_size, ep_rank, cluster_size, cluster_rank, enable_alltoall,
-                min_latency_mode, [gemm_tactic_1, gemm_tactic_2],
-                activation_type, unpadded_hidden_size, tuner_num_tokens,
-                out_tensor, use_dynamic_fc2_scale, fc1_lora_ranks,
-                fc1_lora_weight_ptrs, fc2_lora_ranks, fc2_lora_weight_ptrs,
-                gated_lora_ranks, gated_lora_weight_ptrs, host_request_types,
-                host_context_lengths, lora_max_low_rank, fc1_slot_lora_ranks,
-                fc1_slot_lora_weight_ptrs, fc2_slot_lora_ranks,
-                fc2_slot_lora_weight_ptrs, gated_slot_lora_ranks,
-                gated_slot_lora_weight_ptrs, token_to_slot)
+        output = run_moe(*run_moe_args)
     except RuntimeError as e:
         error_msg = str(e)
         if "DeepGEMM only supports Hopper" in error_msg:

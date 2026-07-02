@@ -2471,6 +2471,34 @@ class PyTorchModelEngine(ModelEngine):
             "skip_cross_kv_projection": skip_cross_kv_projection,
         }
 
+    def _ship_multimodal_indices(
+        self,
+        inputs: dict,
+        *,
+        mm_token_indices_cpu: torch.Tensor,
+        text_token_indices_cpu: torch.Tensor,
+        num_ctx_tokens: int,
+        total_num_tokens: int,
+    ) -> None:
+        """Pin and async-copy executor-precomputed MM/text token indices into
+        ``inputs`` so ``fuse_input_embeds`` can skip its ``torch.where`` host
+        sync. If ``total_num_tokens > num_ctx_tokens`` (KV-cache path with
+        extend/draft tokens appended after the indices were computed), the
+        post-context positions are appended as text. Current speculative decode
+        paths do not append multimodal placeholders after the context tokens."""
+        mm_token_indices_cpu = maybe_pin_memory(mm_token_indices_cpu)
+        inputs['mm_token_indices'] = mm_token_indices_cpu.to("cuda",
+                                                             non_blocking=True)
+        if total_num_tokens > num_ctx_tokens:
+            extra_text = torch.arange(num_ctx_tokens,
+                                      total_num_tokens,
+                                      dtype=text_token_indices_cpu.dtype)
+            text_token_indices_cpu = torch.cat(
+                [text_token_indices_cpu, extra_text])
+        text_token_indices_cpu = maybe_pin_memory(text_token_indices_cpu)
+        inputs['text_token_indices'] = text_token_indices_cpu.to(
+            "cuda", non_blocking=True)
+
     def _can_use_incremental_update(
             self, scheduled_requests: ScheduledRequests,
             new_tokens_device: Optional[torch.Tensor],
@@ -2990,6 +3018,10 @@ class PyTorchModelEngine(ModelEngine):
                 num_accepted_tokens_device, req_id_to_old_request,
                 resource_manager)
 
+        # Hoist self.use_mrope to a function-scope local so the per-request /
+        # per-context-request mrope branches use LOAD_FAST instead of LOAD_ATTR.
+        _use_mrope = self.use_mrope
+
         # if new_tensors_device exist, input_ids will only contain new context tokens
         input_ids = []  # per sequence
         sequence_lengths = []  # per sequence
@@ -3147,7 +3179,7 @@ class PyTorchModelEngine(ModelEngine):
                                                 self.model,
                                                 "multimodal_data_device_paths",
                                                 None))
-                if self.use_mrope:
+                if _use_mrope:
                     mrope_config = multimodal_params.multimodal_data[
                         'mrope_config']
                     mrope_pos_ids = mrope_config['mrope_position_ids']
@@ -3175,7 +3207,7 @@ class PyTorchModelEngine(ModelEngine):
                 # This creates new IPC handles owned by the prefill worker, so the decode worker
                 # can access them even after the encode worker's GC deallocates the original memory.
                 # Without this, the decode worker would receive handles pointing to freed memory.
-                if (request.is_context_only_request and self.use_mrope and
+                if (request.is_context_only_request and _use_mrope and
                         "mrope_config" in multimodal_params.multimodal_data):
                     mrope_config = multimodal_params.multimodal_data[
                         "mrope_config"]
@@ -3190,13 +3222,19 @@ class PyTorchModelEngine(ModelEngine):
 
             request.py_batch_idx = request.py_seq_slot
 
-        if len(multimodal_params_list) > 0:
-            # discard the text token indices as it only includes context tokens at this moment
-            _, mm_token_indices = self._prepare_multimodal_indices(input_ids)
-        else:
-            mm_token_indices = None
         num_ctx_requests = scheduled_requests.num_context_requests
         num_ctx_tokens = len(input_ids)
+        if len(multimodal_params_list) > 0:
+            # input_ids holds only context tokens here; extend/draft tokens are
+            # appended below and are by construction text, so we reuse the
+            # CPU-side text_token_indices and just extend it with the
+            # post-context arange instead of recomputing via a bool mask +
+            # torch.where over the full range.
+            text_token_indices_ctx, mm_token_indices = \
+                self._prepare_multimodal_indices(input_ids)
+        else:
+            text_token_indices_ctx = None
+            mm_token_indices = None
 
         # Requests with draft tokens are treated like extend requests. Dummy extend requests should be
         # at the end of extend_requests.
@@ -3370,6 +3408,13 @@ class PyTorchModelEngine(ModelEngine):
         # Cache invariant method result to avoid repeated calls per-request
         _has_cp_helix = self.mapping.has_cp_helix()
         _n_gen = len(generation_requests)
+        # One-shot batch-level flag — True iff any generation request actually
+        # carries multimodal payload. Lets the strip_mm_data branch below
+        # short-circuit on a LOAD_FAST rather than a per-request LOAD_ATTR
+        # of py_multimodal_data for non-multimodal models (the gpt-oss-120b
+        # GEN case).
+        _has_any_multimodal_request = any(r.py_multimodal_data is not None
+                                          for r in generation_requests)
         if _n_gen > 0:
             # All generation requests have the same beam width
             beam_width = generation_requests[0].py_beam_width
@@ -3382,9 +3427,6 @@ class PyTorchModelEngine(ModelEngine):
 
             for request in generation_requests:
                 request_ids.append(request.py_request_id)
-                # py_batch_idx is set after a request occupies a generation slot.
-                # None means this is its first generation step on this worker.
-                is_generation_admission = request.py_batch_idx is None
                 # the request has no previous tensor:
                 # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
                 # (2) a dummy request; or
@@ -3437,7 +3479,7 @@ class PyTorchModelEngine(ModelEngine):
                     prompt_lengths.append(request.py_prompt_len)
                     gather_ids.append(len(position_ids) - 1)
 
-                if self.use_mrope:
+                if _use_mrope:
                     mrope_position_delta = getattr(request,
                                                    "py_mrope_position_delta",
                                                    None)
@@ -3488,7 +3530,12 @@ class PyTorchModelEngine(ModelEngine):
                                  gen_mrope_position_ids))
                             mrope_delta_read_seq_slots.append(
                                 delta_read_seq_slot)
-                if is_generation_admission and request.py_multimodal_data:
+                # Equivalent to the original `is_generation_admission and
+                # request.py_multimodal_data`. The batch-level flag is checked
+                # first so non-multimodal models pay one LOAD_FAST per request
+                # instead of LOAD_ATTR(py_multimodal_data) + LOAD_ATTR(py_batch_idx).
+                if (_has_any_multimodal_request and request.py_multimodal_data
+                        and request.py_batch_idx is None):
                     strip_mm_data_for_generation(request.py_multimodal_data)
 
                 request.py_batch_idx = request.py_seq_slot
@@ -3962,13 +4009,13 @@ class PyTorchModelEngine(ModelEngine):
                     [item[1] for item in all_rank_num_tokens])
 
         if mm_token_indices is not None:
-            mask = torch.ones(total_num_tokens, dtype=torch.bool)
-            mask[mm_token_indices] = False
-            mm_idx = maybe_pin_memory(mm_token_indices)
-            inputs['mm_token_indices'] = mm_idx.to("cuda", non_blocking=True)
-            text_idx = maybe_pin_memory(torch.where(mask)[0])
-            inputs['text_token_indices'] = text_idx.to("cuda",
-                                                       non_blocking=True)
+            self._ship_multimodal_indices(
+                inputs,
+                mm_token_indices_cpu=mm_token_indices,
+                text_token_indices_cpu=text_token_indices_ctx,
+                num_ctx_tokens=num_ctx_tokens,
+                total_num_tokens=total_num_tokens,
+            )
 
         num_generation_tokens = len(generation_requests) + len(
             extend_requests) + sum(draft_lens) + len(first_draft_requests)
@@ -4034,6 +4081,21 @@ class PyTorchModelEngine(ModelEngine):
         num_tokens = len(input_ids)
         assert num_tokens <= self.max_num_tokens, (
             "num_tokens should be less than or equal to max_num_tokens")
+        # Compute MM/text token indices on CPU input_ids so that
+        # fuse_input_embeds can skip its torch.where host sync. Must run before
+        # the input_ids list is rebound to a tensor below. Skipped when
+        # ``self.model`` is a vision encoder (no ``config.vocab_size`` to filter
+        # against, and its forward doesn't consume the indices anyway); this
+        # is a structural check on the model rather than a flag lookup, so it
+        # naturally extends to any future "LLM-less" engine setup.
+        _model_config = getattr(self.model, "config", None)
+        if (len(multimodal_params_list) > 0
+                and getattr(_model_config, "vocab_size", None) is not None):
+            text_token_indices_cpu, mm_token_indices_cpu = \
+                self._prepare_multimodal_indices(input_ids)
+        else:
+            text_token_indices_cpu = None
+            mm_token_indices_cpu = None
         input_ids = torch.tensor(input_ids,
                                  dtype=torch.int,
                                  pin_memory=prefer_pinned())
@@ -4102,6 +4164,17 @@ class PyTorchModelEngine(ModelEngine):
             "multimodal_params": multimodal_params_list,
             'resource_manager': resource_manager,
         }
+
+        if mm_token_indices_cpu is not None:
+            # No extend/draft tokens in the no-cache path, so num_tokens covers
+            # the full range and the helper's arange/cat branch is skipped.
+            self._ship_multimodal_indices(
+                inputs,
+                mm_token_indices_cpu=mm_token_indices_cpu,
+                text_token_indices_cpu=text_token_indices_cpu,
+                num_ctx_tokens=num_tokens,
+                total_num_tokens=num_tokens,
+            )
 
         if bool(lora_params):
             inputs['lora_params'] = lora_params
@@ -5073,7 +5146,11 @@ class PyTorchModelEngine(ModelEngine):
         with self.cuda_graph_runner.pad_batch(
                 scheduled_requests, resource_manager,
                 self.runtime_draft_len) as padded_requests:
-            self._pad_batch_seed_mrope_delta_cache(padded_requests)
+            # Callee already no-ops when use_mrope=False, but the Python call /
+            # frame setup itself is non-trivial under high concurrency. Gating
+            # at the caller avoids that overhead for non-mrope models.
+            if self.use_mrope:
+                self._pad_batch_seed_mrope_delta_cache(padded_requests)
 
             # Refresh is_all_greedy_sample for the *current* batch BEFORE the
             # CUDA graph key is built below. The key includes this flag to pick

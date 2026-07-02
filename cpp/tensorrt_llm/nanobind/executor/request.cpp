@@ -728,6 +728,7 @@ void initRequestBindings(nb::module_& m)
         nb::arg("cache_salt") = nb::none()
     )                // clang-format on
         .def_prop_ro("input_token_ids", &tle::Request::getInputTokenIds)
+        .def_prop_ro("num_input_tokens", &tle::Request::getNumInputTokens)
         .def_prop_ro("max_tokens", &tle::Request::getMaxTokens)
         .def_prop_rw("streaming", &tle::Request::getStreaming, &tle::Request::setStreaming)
         .def_prop_rw("sampling_config", &tle::Request::getSamplingConfig, &tle::Request::setSamplingConfig)
