@@ -41,6 +41,7 @@ from .fuse_elementwise_ops import (extract_transpose_xbc_prefill,
                                    fused_split_rearrange_after_conv1d)
 from .layernorm_gated import RMSNorm as RMSNormGated
 from .layernorm_gated import fused_gated_rmsnorm_quant_shape_ok
+from .mamba2_metadata import cu_seqlens_to_chunk_indices_offsets_triton
 from .replay_selective_state_update import replay_selective_state_update
 from .selective_state_update import \
     selective_state_update as selective_state_update_native
@@ -284,6 +285,81 @@ class Mamba2Mixer(nn.Module):
             self.norm.nvfp4_scale = self.out_proj.input_scale
         else:
             self.norm.is_nvfp4 = False
+
+    @torch.inference_mode()
+    def warmup_ssd_initstates_kernels(self) -> None:
+        # Pre-JIT the mamba_chunk_scan_combined + _state_passing_fwd Triton
+        # kernels with HAS_INITSTATES=True. Without this, the first prefill
+        # step that carries a non-empty cached prefix pays a one-shot
+        # kernel-compile cost that shows up as a ~20% latency spike in
+        # bench iteration ~2000 (Nemotron-Nano-12B-v2, bia B300).
+        try:
+            weight = self.conv1d.weight
+            device = weight.device
+            in_dtype = weight.dtype
+            state_dtype = self._mamba_ssm_cache_dtype or in_dtype
+            num_prefills = 2
+            seq_per = int(self.chunk_size) * 2
+            total = num_prefills * seq_per
+            x_p = torch.zeros((1, total, self.tp_nheads, self.head_dim),
+                              dtype=in_dtype,
+                              device=device)
+            dt_p = torch.zeros((1, total, self.tp_nheads),
+                               dtype=in_dtype,
+                               device=device)
+            B_p = torch.zeros((1, total, self.tp_ngroups, self.d_state),
+                              dtype=in_dtype,
+                              device=device)
+            C_p = torch.zeros((1, total, self.tp_ngroups, self.d_state),
+                              dtype=in_dtype,
+                              device=device)
+            initial_states = torch.zeros(
+                (num_prefills, self.tp_nheads, self.head_dim, self.d_state),
+                dtype=state_dtype,
+                device=device)
+            cu_seqlens = torch.arange(0,
+                                      total + 1,
+                                      seq_per,
+                                      dtype=torch.int32,
+                                      device=device)
+            seq_idx = torch.repeat_interleave(
+                torch.arange(num_prefills, dtype=torch.int32, device=device),
+                seq_per).unsqueeze(0)
+            chunk_indices, chunk_offsets = (
+                cu_seqlens_to_chunk_indices_offsets_triton(
+                    cu_seqlens=cu_seqlens,
+                    chunk_size=int(self.chunk_size),
+                    total_seqlens=total))
+            out_buf = torch.empty((1, total, self.tp_nheads, self.head_dim),
+                                  dtype=in_dtype,
+                                  device=device)
+            mamba_chunk_scan_combined(
+                x_p,
+                dt_p,
+                self.A,
+                B_p,
+                C_p,
+                chunk_size=int(self.chunk_size),
+                D=self.D,
+                z=None,
+                dt_bias=self.dt_bias,
+                initial_states=initial_states,
+                chunk_indices=chunk_indices,
+                chunk_offsets=chunk_offsets,
+                dt_softplus=self.delta_softplus,
+                dt_limit=(0.0, float("inf")),
+                cu_seqlens=cu_seqlens,
+                seq_idx=seq_idx,
+                return_varlen_states=True,
+                return_final_states=False,
+                out=out_buf,
+                state_dtype=state_dtype,
+            )
+            torch.cuda.synchronize()
+        except Exception as e:
+            logger.warning_once(
+                f"Mamba SSD HAS_INITSTATES=True kernel warmup skipped: {e}",
+                key="mamba_ssd_initstates_warmup_skipped")
 
     def forward(
         self,
