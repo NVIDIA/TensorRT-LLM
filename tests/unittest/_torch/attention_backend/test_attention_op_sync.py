@@ -61,7 +61,6 @@ _SOURCE_CLASSES = {
 }
 
 _THOP_KWARG_SOURCE_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
-    "beam_width": ("metadata", ("effective_beam_width",)),
     "context_lengths": ("metadata", ("prompt_lens_cuda_runtime",)),
     "head_size": ("attn", ("head_dim",)),
     "host_context_lengths": ("metadata", ("prompt_lens_cpu_runtime",)),
@@ -71,6 +70,14 @@ _THOP_KWARG_SOURCE_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
     "spec_decoding_target_max_draft_tokens": (
         "metadata",
         ("max_total_draft_tokens",),
+    ),
+    "skip_softmax_threshold_scale_factor_decode": (
+        "skip_softmax_kernel_params",
+        ("threshold_scale_factor_decode",),
+    ),
+    "skip_softmax_threshold_scale_factor_prefill": (
+        "skip_softmax_kernel_params",
+        ("threshold_scale_factor_prefill",),
     ),
     "workspace_": ("metadata", ("effective_workspace",)),
 }
