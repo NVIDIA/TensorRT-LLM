@@ -476,9 +476,11 @@ class MTPWorker(SpecWorkerBase):
 
                 # Rejection path stores this step's distribution; greedy uses
                 # the plain draft_sampler.
-                new_draft_token = self.produce_step_draft_token(
-                    logits, spec_metadata, batch_size, i, draft_d2t,
-                    self.draft_sampler)
+                new_draft_token = self.produce_draft_tokens(logits,
+                                                            spec_metadata,
+                                                            batch_size,
+                                                            d2t=draft_d2t,
+                                                            draft_step=i)
                 next_draft_tokens.append(new_draft_token)
                 # shift input_ids and hidden_states
                 input_ids = draft_inputs["input_ids"]

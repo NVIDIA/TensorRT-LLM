@@ -347,13 +347,12 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
     ):
         # Rejection path stores this step's distribution; greedy uses the plain
         # greedy sampler.
-        return self.produce_step_draft_token(
+        return self.produce_draft_tokens(
             logits,
             spec_metadata,
             batch_size,
-            draft_step,
-            self._d2t,
-            lambda step_logits: self._draft_sampler_greedy(step_logits, self._d2t),
+            d2t=self._d2t,
+            draft_step=draft_step,
         )
 
     def prepare_1st_drafter_inputs(

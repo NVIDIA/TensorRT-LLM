@@ -1734,6 +1734,30 @@ class SpecWorkerBase(nn.Module, ABC):
             draft_tokens = d2t[draft_tokens] + draft_tokens
         return draft_tokens.type(torch.int32)
 
+    def produce_draft_tokens(self,
+                             logits,
+                             spec_metadata,
+                             batch_size,
+                             *,
+                             d2t=None,
+                             num_contexts=0,
+                             draft_step=None):
+        """Unified draft-token production entry for all one-model workers.
+
+        Routes by logits rank: 3D ``[num_gens, K, vocab]`` goes to the block
+        producer (gen-only workers that emit all K positions in one forward,
+        e.g. PARD/DFlash); 2D ``[num_tokens, vocab]`` goes to the per-step
+        producer (autoregressive workers called once per draft step, e.g.
+        MTP/DraftTarget). The step-only arg ``draft_step`` and the block-only
+        arg ``num_contexts`` are ignored by the other path.
+        """
+        if logits.dim() == 3:
+            return self.produce_block_draft_tokens(logits, spec_metadata,
+                                                   num_contexts, batch_size,
+                                                   d2t)
+        return self.produce_step_draft_token(logits, spec_metadata, batch_size,
+                                             draft_step, d2t)
+
     def produce_block_draft_tokens(self, gen_logits, spec_metadata,
                                    num_contexts, batch_size, d2t):
         """Shared block draft-token production for gen-only workers (PARD, DFLASH).
@@ -1771,13 +1795,14 @@ class SpecWorkerBase(nn.Module, ABC):
         return gen_draft_tokens.type(torch.int32)
 
     def produce_step_draft_token(self, logits, spec_metadata, batch_size,
-                                 draft_step, d2t, greedy_fn):
+                                 draft_step, d2t):
         """Shared per-step draft-token production for step workers (MTP, DraftTarget).
 
         A non-greedy batch takes the advanced ``sample_draft`` path (honoring
         temperature/top_k/top_p, scattering this step's distribution into
-        ``draft_probs`` when rejection is on); an all-greedy batch calls
-        ``greedy_fn(logits)``. Uses ``self.mapping`` as the LM-head TP mapping.
+        ``draft_probs`` when rejection is on); an all-greedy batch takes the
+        TP-aware ``draft_sampler`` (mirroring the block greedy path) and applies
+        ``d2t``. Uses ``self.mapping`` as the LM-head TP mapping.
         """
         if (spec_metadata is not None and not spec_metadata.is_all_greedy_sample
                 and draft_step is not None):
@@ -1788,7 +1813,10 @@ class SpecWorkerBase(nn.Module, ABC):
                                      batch_size,
                                      d2t=d2t,
                                      draft_step=draft_step)
-        return greedy_fn(logits)
+        draft_tokens = self.draft_sampler(logits)
+        if d2t is not None:
+            draft_tokens = d2t[draft_tokens] + draft_tokens
+        return draft_tokens.type(torch.int32)
 
     def _execute_guided_decoder_if_present(self, logits):
         """Execute guided decoder on target model logits if available."""
