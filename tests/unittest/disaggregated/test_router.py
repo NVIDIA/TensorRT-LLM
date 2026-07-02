@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import random
 import threading
 from unittest import mock
 
@@ -7,12 +8,54 @@ import aiohttp
 import pytest
 
 from tensorrt_llm.llmapi.disagg_utils import RouterConfig
+from tensorrt_llm.runtime.kv_cache_hash import (get_cache_salt_id,
+                                                hash_v1_block_key,
+                                                truncate_sha256_hash_to_int64)
+from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
+    ReuseScope, sequence_to_blockchain_keys)
+# yapf: disable
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
+                                                ChatCompletionToolsParam,
                                                 CompletionRequest,
-                                                DisaggregatedParams)
-from tensorrt_llm.serve.router import (BlockHashMixin, ConversationRouter,
-                                       KvCacheAwareRouter, LoadBalancingRouter,
-                                       RoundRobinRouter, create_router)
+                                                ConversationParams,
+                                                DisaggregatedParams,
+                                                FunctionDefinition)
+from tensorrt_llm.serve.router import (KV_CACHE_HASH_ALGO_V1,
+                                       KV_CACHE_HASH_ALGO_V2,
+                                       KV_CACHE_HASH_ALGO_V2_SHA256_64,
+                                       BlockHashMixin, ConversationRouter,
+                                       KvCacheAwareRouter,
+                                       KvCacheAwareServerState,
+                                       LoadBalancingRouter, RoundRobinRouter,
+                                       block_key_hasher, create_router)
+
+# yapf: enable
+
+
+def test_native_block_key_hasher_matches_python_v1():
+    """Native C++ BlockKeyHasher must be bit-exact with hash_v1_block_key.
+
+    Covers single blocks and the chained per-block pattern used by
+    BlockHashMixin._compute_block_hashes.
+    """
+    random.seed(0)
+    for _ in range(500):
+        n = random.choice([1, 2, 31, 32, 33, 64, 97])
+        toks = [random.randint(0, 300000) for _ in range(n)]
+        parent = random.choice([None, 0, random.randint(1, 2**64 - 1)])
+        ref = hash_v1_block_key(toks,
+                                parent_hash=0 if parent is None else parent)
+        assert block_key_hasher(toks, parent) == ref
+
+    # chained per-block (the real _compute_block_hashes pattern)
+    toks = [random.randint(0, 300000) for _ in range(2000)]
+    parent = None
+    for t in range(0, len(toks) - 1, 32):
+        t_end = min(t + 32, len(toks) - 1)
+        h = block_key_hasher(toks[t:t_end], parent)
+        assert h == hash_v1_block_key(
+            toks[t:t_end], parent_hash=0 if parent is None else parent)
+        parent = h
 
 
 def _make_mock_aiohttp_session(return_value=None):
@@ -253,6 +296,830 @@ async def test_gen_tokens_balancing_router(servers, requests_fixture, request):
         await router.get_next_server(requests[0])
 
 
+def test_v2_sha256_block_hashes_match_kv_cache_manager_v2(servers):
+    tokens_per_block = 4
+    token_lists = [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]]
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=tokens_per_block)
+
+    block_hashes = router._compute_block_hashes(token_lists,
+                                                hash_algo=KV_CACHE_HASH_ALGO_V2)
+    expected_block_hashes = [
+        block_key.hex()
+        for token_block, block_key in sequence_to_blockchain_keys(
+            tokens_per_block, ReuseScope(), token_lists[0][:-1]) if token_block
+    ]
+
+    assert block_hashes == [expected_block_hashes]
+
+
+def test_v2_sha256_64_block_hashes_match_truncated_kv_cache_manager_v2(servers):
+    tokens_per_block = 4
+    token_lists = [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]]
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=tokens_per_block)
+
+    block_hashes = router._compute_block_hashes(
+        token_lists, hash_algo=KV_CACHE_HASH_ALGO_V2_SHA256_64)
+    expected_block_hashes = [
+        truncate_sha256_hash_to_int64(block_key)
+        for token_block, block_key in sequence_to_blockchain_keys(
+            tokens_per_block, ReuseScope(), token_lists[0][:-1]) if token_block
+    ]
+
+    assert block_hashes == [expected_block_hashes]
+    assert all(isinstance(block_hash, int) for block_hash in block_hashes[0])
+
+
+def test_cache_aware_router_block_hashes_include_cache_salt_id(servers):
+    tokens_per_block = 4
+    cache_salt_id = 123
+    token_lists = [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]]
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=tokens_per_block)
+
+    salted_v1_block_hashes = router._compute_block_hashes(
+        token_lists,
+        hash_algo=KV_CACHE_HASH_ALGO_V1,
+        cache_salt_id=cache_salt_id)
+    expected_v1_block_hashes = []
+    parent_hash = None
+    for t in range(0, len(token_lists[0]) - 1, tokens_per_block):
+        t_end = min(t + tokens_per_block, len(token_lists[0]) - 1)
+        parent_hash = hash_v1_block_key(
+            token_lists[0][t:t_end],
+            parent_hash=0 if parent_hash is None else parent_hash,
+            cache_salt_id=cache_salt_id)
+        expected_v1_block_hashes.append(parent_hash)
+
+    salted_v2_block_hashes = router._compute_block_hashes(
+        token_lists,
+        hash_algo=KV_CACHE_HASH_ALGO_V2,
+        cache_salt_id=cache_salt_id)
+    reuse_scope = ReuseScope(salt=cache_salt_id)
+    expected_v2_block_hashes = [
+        block_key.hex()
+        for token_block, block_key in sequence_to_blockchain_keys(
+            tokens_per_block, reuse_scope, token_lists[0][:-1]) if token_block
+    ]
+
+    salted_v2_64_block_hashes = router._compute_block_hashes(
+        token_lists,
+        hash_algo=KV_CACHE_HASH_ALGO_V2_SHA256_64,
+        cache_salt_id=cache_salt_id)
+    expected_v2_64_block_hashes = [
+        truncate_sha256_hash_to_int64(block_key)
+        for token_block, block_key in sequence_to_blockchain_keys(
+            tokens_per_block, reuse_scope, token_lists[0][:-1]) if token_block
+    ]
+
+    assert salted_v1_block_hashes == [expected_v1_block_hashes]
+    assert salted_v2_block_hashes == [expected_v2_block_hashes]
+    assert salted_v2_64_block_hashes == [expected_v2_64_block_hashes]
+    assert salted_v1_block_hashes != router._compute_block_hashes(
+        token_lists, hash_algo=KV_CACHE_HASH_ALGO_V1)
+    assert salted_v2_block_hashes != router._compute_block_hashes(
+        token_lists, hash_algo=KV_CACHE_HASH_ALGO_V2)
+    assert salted_v2_64_block_hashes != router._compute_block_hashes(
+        token_lists, hash_algo=KV_CACHE_HASH_ALGO_V2_SHA256_64)
+
+
+def test_cache_salt_id_derivation_matches_worker_path():
+    from tensorrt_llm.inputs.utils import \
+        get_cache_salt_id as worker_get_cache_salt_id
+
+    assert get_cache_salt_id("abc") == 3697813978277427044
+    assert get_cache_salt_id("tenant-a") == get_cache_salt_id("tenant-a")
+    assert get_cache_salt_id("tenant-a") != get_cache_salt_id("tenant-b")
+    assert get_cache_salt_id("tenant-a") == worker_get_cache_salt_id("tenant-a")
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_server_state_uses_hash_algo():
+    tokens_per_block = 4
+    token_lists = [[1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008]]
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server1"],
+                                tokens_per_block=tokens_per_block)
+    v1_block_hashes = router._compute_block_hashes(
+        token_lists, hash_algo=KV_CACHE_HASH_ALGO_V1)
+    v2_block_hashes = router._compute_block_hashes(
+        token_lists, hash_algo=KV_CACHE_HASH_ALGO_V2)
+    v2_64_block_hashes = router._compute_block_hashes(
+        token_lists, hash_algo=KV_CACHE_HASH_ALGO_V2_SHA256_64)
+    state = KvCacheAwareServerState("server1",
+                                    tokens_per_block=tokens_per_block)
+
+    state.update_with_events([{
+        "event_id": 0,
+        "hash_algo": KV_CACHE_HASH_ALGO_V2,
+        "data": {
+            "type":
+            "stored",
+            "parent_hash":
+            None,
+            "blocks": [{
+                "block_hash": block_hash
+            } for block_hash in v2_block_hashes[0]],
+        },
+    }])
+
+    assert state.hash_algo == KV_CACHE_HASH_ALGO_V2
+    assert await state.matched_tokens(v2_block_hashes,
+                                      hash_algo=KV_CACHE_HASH_ALGO_V2) == 8
+    assert await state.matched_tokens(v1_block_hashes,
+                                      hash_algo=KV_CACHE_HASH_ALGO_V1) == 0
+    state.add_blocks(["manual-v2-block"])
+    assert state.hash_algo == KV_CACHE_HASH_ALGO_V2
+    assert await state.matched_tokens([["manual-v2-block"]],
+                                      hash_algo=KV_CACHE_HASH_ALGO_V2) == 4
+    assert await state.matched_tokens([["manual-v2-block"]],
+                                      hash_algo=KV_CACHE_HASH_ALGO_V1) == 0
+    state.remove_blocks(["manual-v2-block"])
+    assert await state.matched_tokens([["manual-v2-block"]],
+                                      hash_algo=KV_CACHE_HASH_ALGO_V2) == 0
+
+    state.update_with_events([{
+        "event_id": 1,
+        "hash_algo": KV_CACHE_HASH_ALGO_V2_SHA256_64,
+        "data": {
+            "type":
+            "stored",
+            "parent_hash":
+            None,
+            "blocks": [{
+                "block_hash": block_hash
+            } for block_hash in v2_64_block_hashes[0]],
+        },
+    }])
+
+    assert state.hash_algo == KV_CACHE_HASH_ALGO_V2_SHA256_64
+    assert await state.matched_tokens(
+        v2_64_block_hashes, hash_algo=KV_CACHE_HASH_ALGO_V2_SHA256_64) == 8
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_routes_to_v2_server(servers):
+    tokens_per_block = 4
+    token_lists = [[1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008]]
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=tokens_per_block)
+    v2_block_hashes = router._compute_block_hashes(
+        token_lists, hash_algo=KV_CACHE_HASH_ALGO_V2)
+    v2_server = servers[1]
+    router._server_state[v2_server].update_with_events([{
+        "event_id": 0,
+        "hash_algo": KV_CACHE_HASH_ALGO_V2,
+        "data": {
+            "type":
+            "stored",
+            "parent_hash":
+            None,
+            "blocks": [{
+                "block_hash": block_hash
+            } for block_hash in v2_block_hashes[0]],
+        },
+    }])
+
+    request = CompletionRequest(model="TinyLlama",
+                                prompt=copy.deepcopy(token_lists))
+    server, info = await router.get_next_server(request)
+    await router.finish_request(request)
+
+    assert server == v2_server
+    assert info["hash_algo"] == KV_CACHE_HASH_ALGO_V2
+    assert info["block_hashes"] == v2_block_hashes
+    assert info["matches"] == [0, 8, 0]
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_routes_with_cache_salt(
+        servers, monkeypatch):
+
+    class SaltedRequest:
+        model = "TinyLlama"
+        cache_salt = "tenant-a"
+
+        def __init__(self, prompt):
+            self.prompt = prompt
+
+    tokens_per_block = 4
+    cache_salt_id = 123
+    token_lists = [[1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008]]
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=tokens_per_block)
+    monkeypatch.setattr("tensorrt_llm.serve.router.get_cache_salt_id",
+                        lambda cache_salt: cache_salt_id)
+    for server in servers:
+        router._server_info[server] = {
+            "kv_cache_hash_algo": KV_CACHE_HASH_ALGO_V2
+        }
+
+    salted_block_hashes = router._compute_block_hashes(
+        token_lists,
+        hash_algo=KV_CACHE_HASH_ALGO_V2,
+        cache_salt_id=cache_salt_id)
+    unsalted_block_hashes = router._compute_block_hashes(
+        token_lists, hash_algo=KV_CACHE_HASH_ALGO_V2)
+    salted_server = servers[1]
+    router._server_state[salted_server].update_with_events([{
+        "event_id": 0,
+        "hash_algo": KV_CACHE_HASH_ALGO_V2,
+        "data": {
+            "type":
+            "stored",
+            "parent_hash":
+            None,
+            "blocks": [{
+                "block_hash": block_hash
+            } for block_hash in salted_block_hashes[0]],
+        },
+    }])
+
+    request = SaltedRequest(prompt=copy.deepcopy(token_lists))
+    server, info = await router.get_next_server(request)
+    await router.finish_request(request)
+
+    assert salted_block_hashes != unsalted_block_hashes
+    assert server == salted_server
+    assert info["hash_algo"] == KV_CACHE_HASH_ALGO_V2
+    assert info["block_hashes"] == salted_block_hashes
+    assert info["matches"] == [0, 8, 0]
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_uses_server_info_hash_algo(servers):
+    tokens_per_block = 4
+    token_lists = [[1000, 1001, 1002, 1003, 1004]]
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=[servers[0]],
+                                tokens_per_block=tokens_per_block)
+    # _prepare_server seeds server state from the handshake; simulate it here.
+    router._server_info[servers[0]] = {
+        "kv_cache_hash_algo": KV_CACHE_HASH_ALGO_V2
+    }
+    router._server_state[servers[0]].set_hash_algo(KV_CACHE_HASH_ALGO_V2)
+
+    request = CompletionRequest(model="TinyLlama",
+                                prompt=copy.deepcopy(token_lists))
+    server, info = await router.get_next_server(request)
+    await router.finish_request(request)
+
+    assert server == servers[0]
+    assert info["hash_algo"] == KV_CACHE_HASH_ALGO_V2
+    assert router._server_state[servers[0]].hash_algo == KV_CACHE_HASH_ALGO_V2
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_finish_request_polls_events(servers):
+
+    class MockPostResponse:
+
+        def __init__(self, events):
+            self._events = events
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            pass
+
+        async def json(self):
+            return self._events
+
+    class MockSession:
+
+        def __init__(self, events):
+            self._events = events
+            self.post_url = None
+
+        def post(self, url):
+            self.post_url = url
+            return MockPostResponse(self._events)
+
+    tokens_per_block = 4
+    token_lists = [[1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008]]
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=[servers[0]],
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=tokens_per_block)
+    block_hashes = router._compute_block_hashes(token_lists,
+                                                hash_algo=KV_CACHE_HASH_ALGO_V1)
+    events = [{
+        "event_id": 0,
+        "hash_algo": KV_CACHE_HASH_ALGO_V1,
+        "data": {
+            "type":
+            "stored",
+            "parent_hash":
+            None,
+            "blocks": [{
+                "block_hash": block_hash
+            } for block_hash in block_hashes[0]],
+        },
+    }]
+    session = MockSession(events)
+
+    request = CompletionRequest(model="TinyLlama",
+                                prompt=copy.deepcopy(token_lists))
+    await router.get_next_server(request)
+    await router.finish_request(request, session)
+    # Poll runs in a background task; await it before asserting.
+    await router._server_state[servers[0]]._poll_task
+
+    assert session.post_url == f"http://{servers[0]}/kv_cache_events"
+    assert await router._server_state[servers[0]].matched_tokens(
+        block_hashes, hash_algo=KV_CACHE_HASH_ALGO_V1) == 8
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_finish_request_decrements_on_poll_error(
+        servers):
+
+    class FailingSession:
+
+        def post(self, url):
+            raise RuntimeError(f"failed to post to {url}")
+
+    tokens_per_block = 4
+    token_lists = [[1000, 1001, 1002, 1003, 1004]]
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=[servers[0]],
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=tokens_per_block)
+
+    request = CompletionRequest(model="TinyLlama",
+                                prompt=copy.deepcopy(token_lists))
+    await router.get_next_server(request)
+    assert router._server_state[servers[0]].num_active_requests() == 1
+
+    await router.finish_request(request, FailingSession())
+
+    assert router._server_state[servers[0]].num_active_requests() == 0
+    assert id(request) not in router._req_routing_table
+
+
+def test_kv_cache_aware_server_state_add_blocks_set_update_fast_path():
+    state = KvCacheAwareServerState("server-x", tokens_per_block=4)
+    state.set_hash_algo(KV_CACHE_HASH_ALGO_V1)
+
+    state.add_blocks([1, 2, 3], hash_algo=KV_CACHE_HASH_ALGO_V1)
+    assert state._block_table(KV_CACHE_HASH_ALGO_V1) == {1, 2, 3}
+
+    state.add_blocks((h for h in [4, 5]), hash_algo=KV_CACHE_HASH_ALGO_V1)
+    assert state._block_table(KV_CACHE_HASH_ALGO_V1) == {1, 2, 3, 4, 5}
+
+    state.add_blocks([1, 1, 2], hash_algo=KV_CACHE_HASH_ALGO_V1)
+    assert state._block_table(KV_CACHE_HASH_ALGO_V1) == {1, 2, 3, 4, 5}
+
+    state.add_blocks([], hash_algo=KV_CACHE_HASH_ALGO_V1)
+    state.add_blocks(iter([]), hash_algo=KV_CACHE_HASH_ALGO_V1)
+    assert state._block_table(KV_CACHE_HASH_ALGO_V1) == {1, 2, 3, 4, 5}
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_server_state_schedule_poll_coalesces():
+    state = KvCacheAwareServerState("server-x", tokens_per_block=4)
+    ready = asyncio.Event()
+
+    async def slow_poll(session=None):
+        await ready.wait()
+
+    with mock.patch.object(state, "poll_and_update", side_effect=slow_poll):
+        state.schedule_poll_and_update(session=None)
+        first_task = state._poll_task
+        state.schedule_poll_and_update(session=None)
+        assert state._poll_task is first_task
+        ready.set()
+        await first_task
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_server_state_schedule_poll_relaunches_after_done(
+):
+    state = KvCacheAwareServerState("server-x", tokens_per_block=4)
+    calls = 0
+
+    async def fake_poll(session=None):
+        nonlocal calls
+        calls += 1
+
+    with mock.patch.object(state, "poll_and_update", side_effect=fake_poll):
+        state.schedule_poll_and_update(session=None)
+        await state._poll_task
+        first_task = state._poll_task
+        state.schedule_poll_and_update(session=None)
+        await state._poll_task
+        assert state._poll_task is not first_task
+
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_server_state_schedule_poll_rearms_pending():
+    # A poll requested while one is in flight must re-run once more so the last
+    # finish_request can never strand its events behind a coalesced poll.
+    state = KvCacheAwareServerState("server-x", tokens_per_block=4)
+    calls = 0
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_poll(session=None):
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+
+    with mock.patch.object(state, "poll_and_update", side_effect=slow_poll):
+        state.schedule_poll_and_update(session=None)
+        await started.wait()  # first poll is now actually in flight
+        started.clear()
+        # Second request arrives while the first poll is still blocked.
+        state.schedule_poll_and_update(session=None)
+        release.set()
+        await state._poll_task
+
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_server_state_cancel_poll_task():
+    state = KvCacheAwareServerState("server-x", tokens_per_block=4)
+    started = asyncio.Event()
+
+    async def blocking_poll(session=None):
+        started.set()
+        await asyncio.Event().wait()
+
+    with mock.patch.object(state, "poll_and_update", side_effect=blocking_poll):
+        state.schedule_poll_and_update(session=None)
+        await started.wait()
+        await state.cancel_poll_task()
+
+    assert state._poll_task is None
+    assert state._poll_pending is False
+
+
+def test_kv_cache_aware_server_state_remove_blocks_silent_on_missing():
+    state = KvCacheAwareServerState("server-x", tokens_per_block=4)
+    state.add_blocks([10, 20, 30], hash_algo=KV_CACHE_HASH_ALGO_V1)
+
+    state.remove_blocks([20, 99, 100], hash_algo=KV_CACHE_HASH_ALGO_V1)
+    assert state._block_table(KV_CACHE_HASH_ALGO_V1) == {10, 30}
+
+    state.remove_blocks([777, 888], hash_algo=KV_CACHE_HASH_ALGO_V1)
+    assert state._block_table(KV_CACHE_HASH_ALGO_V1) == {10, 30}
+
+    state.remove_blocks((h for h in [10]), hash_algo=KV_CACHE_HASH_ALGO_V1)
+    assert state._block_table(KV_CACHE_HASH_ALGO_V1) == {30}
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_tracks_routed_blocks_at_routing(servers):
+    tokens_per_block = 4
+    token_lists = [[1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008]]
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=tokens_per_block,
+                                track_routed_blocks=True)
+
+    request = CompletionRequest(model="TinyLlama",
+                                prompt=copy.deepcopy(token_lists))
+    server, info = await router.get_next_server(request)
+
+    assert id(request) in router._pending_routed_blocks
+    stashed, stashed_algo = router._pending_routed_blocks[id(request)]
+    expected_flat = [h for hl in info["block_hashes"] for h in hl]
+    assert stashed == expected_flat
+    assert stashed and not isinstance(stashed[0], list)
+    assert stashed_algo == info["hash_algo"]
+
+    await router.finish_request(request)
+    assert id(request) not in router._pending_routed_blocks
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_inserts_routed_blocks_on_finish(servers):
+    tokens_per_block = 4
+    token_lists = [[2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008]]
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=tokens_per_block,
+                                track_routed_blocks=True)
+
+    request = CompletionRequest(model="TinyLlama",
+                                prompt=copy.deepcopy(token_lists))
+    server, info = await router.get_next_server(request)
+    flat_expected = [h for hl in info["block_hashes"] for h in hl]
+    hash_algo = info["hash_algo"]
+
+    assert await router._server_state[server].matched_tokens(
+        info["block_hashes"], hash_algo=hash_algo) == 0
+
+    await router.finish_request(request)
+
+    assert router._server_state[server]._block_table(hash_algo).issuperset(
+        flat_expected)
+    assert await router._server_state[server].matched_tokens(
+        info["block_hashes"], hash_algo=hash_algo) == 8
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_routed_blocks_disabled_skips_pending(
+        servers):
+    tokens_per_block = 4
+    token_lists = [[3000, 3001, 3002, 3003, 3004, 3005, 3006, 3007, 3008]]
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=tokens_per_block,
+                                track_routed_blocks=False)
+
+    request = CompletionRequest(model="TinyLlama",
+                                prompt=copy.deepcopy(token_lists))
+    server, info = await router.get_next_server(request)
+
+    assert router._pending_routed_blocks == {}
+
+    await router.finish_request(request)
+
+    assert await router._server_state[server].matched_tokens(
+        info["block_hashes"], hash_algo=info["hash_algo"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_drops_routed_blocks_on_failure(servers):
+    tokens_per_block = 4
+    token_lists = [[4000, 4001, 4002, 4003, 4004, 4005, 4006, 4007, 4008]]
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=tokens_per_block,
+                                track_routed_blocks=True)
+
+    request = CompletionRequest(model="TinyLlama",
+                                prompt=copy.deepcopy(token_lists))
+    server, info = await router.get_next_server(request)
+    assert id(request) in router._pending_routed_blocks
+
+    await router.finish_request(request, success=False)
+
+    assert id(request) not in router._pending_routed_blocks
+    assert await router._server_state[server].matched_tokens(
+        info["block_hashes"], hash_algo=info["hash_algo"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_load_cap_excludes_overloaded(servers):
+    tokens_per_block = 4
+    token_lists = [[5000] * 16]
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                use_tokens=False,
+                                max_batch_size=10,
+                                tokens_per_block=tokens_per_block,
+                                load_cap=0.8)
+    router._server_state[servers[0]]._num_active_requests = 9
+    router._server_state[servers[1]]._num_active_requests = 9
+    router._server_state[servers[2]]._num_active_requests = 1
+
+    request = CompletionRequest(model="TinyLlama",
+                                prompt=copy.deepcopy(token_lists))
+    chosen, _ = await router.get_next_server(request)
+    assert chosen == servers[2]
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_load_cap_fallback_when_all_overloaded(
+        servers):
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                use_tokens=False,
+                                max_batch_size=10,
+                                tokens_per_block=4,
+                                load_cap=0.5)
+    router._server_state[servers[0]]._num_active_requests = 8
+    router._server_state[servers[1]]._num_active_requests = 6
+    router._server_state[servers[2]]._num_active_requests = 9
+
+    request = CompletionRequest(model="TinyLlama", prompt=[[100] * 16])
+    chosen, _ = await router.get_next_server(request)
+    assert chosen == servers[1]
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_load_weight_scales_load_penalty(servers):
+    tokens_per_block = 4
+    token_lists = [[6000] * 16]
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                use_tokens=False,
+                                max_batch_size=10,
+                                tokens_per_block=tokens_per_block,
+                                load_weight=5.0,
+                                load_cap=1.0)
+    block_hashes = router._compute_block_hashes(token_lists)
+    router._server_state[servers[0]].add_blocks(
+        [h for hl in block_hashes for h in hl])
+    router._server_state[servers[0]]._num_active_requests = 7
+    router._server_state[servers[1]]._num_active_requests = 1
+    router._server_state[servers[2]]._num_active_requests = 1
+
+    request = CompletionRequest(model="TinyLlama",
+                                prompt=copy.deepcopy(token_lists))
+    chosen, _ = await router.get_next_server(request)
+    assert chosen != servers[0]
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_prepare_server_warns_on_tpb_mismatch_divisible(
+):
+    # router=32, worker=64: 64 % 32 == 0 → warning only, server stays ready
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server-a"],
+                                tokens_per_block=32)
+
+    async def fake_fetch(server, timeout):
+        return {"tokens_per_block": 64, "kv_cache_hash_algo": "v1_block_key"}
+
+    with mock.patch.object(router, "_fetch_server_info",
+                           side_effect=fake_fetch):
+        await router._prepare_server("server-a")
+
+    assert "server-a" in router._prepared_ready_servers
+    assert router._server_info["server-a"]["tokens_per_block"] == 64
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_prepare_server_raises_on_tpb_not_divisible(
+):
+    # router=32, worker=48: 48 % 32 != 0 → RuntimeError, server removed
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server-a"],
+                                tokens_per_block=32)
+
+    async def fake_fetch(server, timeout):
+        return {"tokens_per_block": 48, "kv_cache_hash_algo": "v1_block_key"}
+
+    with mock.patch.object(router, "_fetch_server_info",
+                           side_effect=fake_fetch):
+        with pytest.raises(RuntimeError, match="not divisible"):
+            await router._prepare_server("server-a")
+
+    assert "server-a" not in router._prepared_ready_servers
+    assert "server-a" not in router._server_info
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_prepare_server_keeps_on_tpb_match():
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server-a"],
+                                tokens_per_block=32)
+
+    async def fake_fetch(server, timeout):
+        return {"tokens_per_block": 32, "kv_cache_hash_algo": "v1_block_key"}
+
+    with mock.patch.object(router, "_fetch_server_info",
+                           side_effect=fake_fetch):
+        await router._prepare_server("server-a")
+
+    assert "server-a" in router._prepared_ready_servers
+    assert router._server_info["server-a"]["tokens_per_block"] == 32
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_prepare_server_keeps_when_worker_omits_tpb(
+):
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server-a"],
+                                tokens_per_block=32)
+
+    async def fake_fetch(server, timeout):
+        return {"kv_cache_hash_algo": "v1_block_key"}
+
+    with mock.patch.object(router, "_fetch_server_info",
+                           side_effect=fake_fetch):
+        await router._prepare_server("server-a")
+
+    assert "server-a" in router._prepared_ready_servers
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_prepare_server_adopts_worker_tpb_when_unset(
+):
+    router = KvCacheAwareRouter(server_role=None, servers=["server-a"])
+    assert router._tpb_auto is True
+    assert router._tokens_per_block == 32
+
+    async def fake_fetch(server, timeout):
+        return {"tokens_per_block": 128, "kv_cache_hash_algo": "v1_block_key"}
+
+    with mock.patch.object(router, "_fetch_server_info",
+                           side_effect=fake_fetch):
+        await router._prepare_server("server-a")
+
+    assert "server-a" in router._prepared_ready_servers
+    assert router._tokens_per_block == 128
+    assert router._tpb_auto is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("worker_tpb", [32, 64, 128])
+async def test_kv_cache_aware_router_auto_tpb_equals_worker(worker_tpb):
+    router = KvCacheAwareRouter(server_role=None, servers=["server-a"])
+
+    async def fake_fetch(server, timeout):
+        return {
+            "tokens_per_block": worker_tpb,
+            "kv_cache_hash_algo": "v1_block_key"
+        }
+
+    with mock.patch.object(router, "_fetch_server_info",
+                           side_effect=fake_fetch):
+        await router._prepare_server("server-a")
+
+    assert router._tokens_per_block == worker_tpb
+    assert "server-a" in router._prepared_ready_servers
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_prepare_server_warns_on_missing_algo():
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server-a"],
+                                tokens_per_block=32)
+
+    async def fake_fetch(server, timeout):
+        return {"tokens_per_block": 32}
+
+    with mock.patch("tensorrt_llm.serve.router.logger") as mock_logger:
+        with mock.patch.object(router,
+                               "_fetch_server_info",
+                               side_effect=fake_fetch):
+            await router._prepare_server("server-a")
+
+    assert "server-a" in router._prepared_ready_servers
+    assert any("did not expose kv_cache_hash_algo" in str(call.args[0])
+               for call in mock_logger.warning.call_args_list)
+    assert router._get_server_hash_algo("server-a") == KV_CACHE_HASH_ALGO_V1
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_prepare_server_raises_on_unknown_algo():
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server-a"],
+                                tokens_per_block=32)
+
+    async def fake_fetch(server, timeout):
+        return {"tokens_per_block": 32, "kv_cache_hash_algo": "bogus_algo"}
+
+    with mock.patch.object(router, "_fetch_server_info",
+                           side_effect=fake_fetch):
+        with pytest.raises(RuntimeError, match="Unknown kv_cache_hash_algo"):
+            await router._prepare_server("server-a")
+
+    assert "server-a" not in router._prepared_ready_servers
+    assert "server-a" not in router._server_info
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_prepare_server_persists_algo_for_lock_free_read(
+):
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server-a"],
+                                tokens_per_block=32)
+
+    async def fake_fetch(server, timeout):
+        return {
+            "tokens_per_block": 32,
+            "kv_cache_hash_algo": KV_CACHE_HASH_ALGO_V2,
+        }
+
+    with mock.patch.object(router, "_fetch_server_info",
+                           side_effect=fake_fetch):
+        await router._prepare_server("server-a")
+
+    # Per-request read is now sync; no lock/await on the hot path.
+    assert router._get_server_hash_algo("server-a") == KV_CACHE_HASH_ALGO_V2
+    assert router._server_state["server-a"].hash_algo == KV_CACHE_HASH_ALGO_V2
+
+
 @pytest.mark.asyncio
 async def test_kv_cache_aware_router(servers, mock_aiohttp_session):
     # create tokenized requests to skip tokenization
@@ -268,7 +1135,8 @@ async def test_kv_cache_aware_router(servers, mock_aiohttp_session):
                                 servers=servers,
                                 use_tokens=False,
                                 max_batch_size=32,
-                                tokens_per_block=32)
+                                tokens_per_block=32,
+                                track_routed_blocks=False)
     results = [await router.get_next_server(req) for req in requests]
     assigned_servers, infos = zip(*results)
     # Initial routing (empty caches): all 3 should get distinct servers
@@ -665,11 +1533,15 @@ async def test_get_next_server_exclude_server_insufficient(router_class):
 
 
 def _make_request(conversation_id=None, prompt="the " * 100):
-    params = DisaggregatedParams(request_type="context_only",
-                                 conversation_id=conversation_id)
+    params = DisaggregatedParams(request_type="context_only")
+    conversation_params = None
+    if conversation_id is not None:
+        conversation_params = ConversationParams(
+            conversation_id=conversation_id)
     return CompletionRequest(model="TinyLlama",
                              prompt=[prompt],
-                             disaggregated_params=params)
+                             disaggregated_params=params,
+                             conversation_params=conversation_params)
 
 
 @pytest.mark.asyncio
@@ -927,3 +1799,362 @@ async def test_finish_request_forwards_explicit_session(servers):
     call = explicit_session.post.call_args
     posted_url = call.args[0] if call.args else call.kwargs.get("url", "")
     assert "kv_cache_events" in posted_url
+
+
+# ---------------------------------------------------------------------------
+# _tokenize: tools + chat_template_kwargs forwarding (PR #13232)
+# ---------------------------------------------------------------------------
+
+
+def _get_weather_tool() -> ChatCompletionToolsParam:
+    """Build a sample tool definition matching the OpenAI schema."""
+    return ChatCompletionToolsParam(function=FunctionDefinition(
+        name="get_current_weather",
+        description="Get the current weather for a city.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "city": {
+                    "type": "string",
+                    "description": "City name"
+                }
+            },
+            "required": ["city"],
+        },
+    ))
+
+
+def _mock_tokenizer(token_ids=None):
+    """Return a mock tokenizer with a recorded apply_chat_template.
+
+    ``apply_chat_template`` records its kwargs and returns the supplied
+    token id list.
+    """
+    tok = mock.MagicMock()
+    tok.apply_chat_template.return_value = token_ids or [1, 2, 3, 4, 5]
+    return tok
+
+
+@pytest.mark.parametrize("router_class",
+                         [KvCacheAwareRouter, ConversationRouter])
+def test_tokenize_forwards_tools_and_chat_template_kwargs(router_class):
+    """Regression test for PR #13232.
+
+    ``BlockHashMixin._tokenize`` must forward the request's ``tools`` (as a
+    list of dicts) and ``chat_template_kwargs`` to
+    ``tokenizer.apply_chat_template``. Without this, custom tokenizers that
+    render tool schemas into the prompt (e.g. DeepSeek-V3.2) produce
+    truncated token ids, breaking cache-aware routing decisions and the
+    ``prompt_token_ids`` handed to the worker downstream.
+    """
+    router = router_class(server_role=None,
+                          servers=["server1"],
+                          use_tokens=False,
+                          max_batch_size=32,
+                          tokens_per_block=32)
+
+    tok = _mock_tokenizer()
+    with mock.patch.object(router, "_get_tokenizer", return_value=tok):
+        req = ChatCompletionRequest(
+            model="TinyLlama",
+            messages=[{
+                "role": "user",
+                "content": "what's the weather in Paris?"
+            }],
+            tools=[_get_weather_tool()],
+            chat_template_kwargs={"thinking": True},
+        )
+        router._tokenize(req)
+
+    tok.apply_chat_template.assert_called_once()
+    kwargs = tok.apply_chat_template.call_args.kwargs
+    # tools must be forwarded as a list of dicts (model_dump), not the
+    # Pydantic objects themselves.
+    assert isinstance(kwargs["tools"], list) and len(kwargs["tools"]) == 1
+    tool_dict = kwargs["tools"][0]
+    assert isinstance(tool_dict, dict)
+    assert tool_dict["type"] == "function"
+    assert tool_dict["function"]["name"] == "get_current_weather"
+    assert "parameters" in tool_dict["function"]
+    # chat_template_kwargs must be forwarded as **kwargs (not nested).
+    assert kwargs.get("thinking") is True
+
+
+@pytest.mark.parametrize("router_class",
+                         [KvCacheAwareRouter, ConversationRouter])
+def test_tokenize_without_tools_passes_none(router_class):
+    """Bare chat request: no tools, no chat_template_kwargs.
+
+    ``apply_chat_template`` still runs but receives ``tools=None`` and no
+    extra keyword arguments.
+    """
+    router = router_class(server_role=None,
+                          servers=["server1"],
+                          use_tokens=False,
+                          max_batch_size=32,
+                          tokens_per_block=32)
+
+    tok = _mock_tokenizer()
+    with mock.patch.object(router, "_get_tokenizer", return_value=tok):
+        req = ChatCompletionRequest(model="TinyLlama",
+                                    messages=[{
+                                        "role": "user",
+                                        "content": "hello"
+                                    }])
+        router._tokenize(req)
+
+    tok.apply_chat_template.assert_called_once()
+    kwargs = tok.apply_chat_template.call_args.kwargs
+    assert kwargs["tools"] is None
+    assert "thinking" not in kwargs
+    # messages and add_generation_prompt must still flow through unchanged.
+    assert kwargs["tokenize"] is False
+
+
+def test_tokenize_preserves_empty_tools_list():
+    """Preserve empty tools list distinct from ``None``.
+
+    ``tools=[]`` is semantically distinct from ``tools=None``; preserve it
+    so the router's call matches what the worker's own
+    ``apply_chat_template`` would pass (see ``serve/openai_server.py``
+    tool_dicts assignment).
+    """
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server1"],
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=32)
+
+    tok = _mock_tokenizer()
+    with mock.patch.object(router, "_get_tokenizer", return_value=tok):
+        req = ChatCompletionRequest(model="TinyLlama",
+                                    messages=[{
+                                        "role": "user",
+                                        "content": "hi"
+                                    }],
+                                    tools=[])
+        router._tokenize(req)
+
+    kwargs = tok.apply_chat_template.call_args.kwargs
+    assert kwargs["tools"] == []
+
+
+def test_tokenize_skipped_when_prompt_token_ids_already_set():
+    """Skip tokenization when ``prompt_token_ids`` is already populated.
+
+    When the caller pre-tokenizes (``prompt_token_ids`` set), the router
+    must not invoke ``apply_chat_template`` at all — the cached token ids
+    are returned as-is.
+    """
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server1"],
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=32)
+
+    tok = _mock_tokenizer()
+    with mock.patch.object(router, "_get_tokenizer",
+                           return_value=tok) as get_tok:
+        req = ChatCompletionRequest(
+            model="TinyLlama",
+            messages=[{
+                "role": "user",
+                "content": "irrelevant"
+            }],
+            tools=[_get_weather_tool()],
+            chat_template_kwargs={"thinking": True},
+            prompt_token_ids=[10, 20, 30],
+        )
+        out = router._tokenize(req)
+
+    assert out == [[10, 20, 30]]
+    get_tok.assert_not_called()
+    tok.apply_chat_template.assert_not_called()
+
+
+class _PrefixCacheFakeTokenizer:
+
+    _SPECIAL = {"<bos>": 1, "<sys>": 2, "<user>": 3, "<asst>": 4, "<eot>": 5}
+
+    def apply_chat_template(self,
+                            messages,
+                            add_generation_prompt=False,
+                            tokenize=False,
+                            return_dict=False,
+                            tools=None,
+                            **kwargs):
+        tag = {"system": "<sys>", "user": "<user>", "assistant": "<asst>"}
+        parts = ["<bos>"]
+        for m in messages:
+            role = m["role"] if isinstance(m, dict) else m.role
+            content = m["content"] if isinstance(m, dict) else m.content
+            parts.append(tag.get(role, "<user>") + str(content) + "<eot>")
+        if add_generation_prompt:
+            parts.append("<asst>")
+        return "".join(parts)
+
+    def encode(self, text, add_special_tokens=False):
+        ids = []
+        i = 0
+        n = len(text)
+        while i < n:
+            special = None
+            for token, tid in self._SPECIAL.items():
+                if text.startswith(token, i):
+                    special = (token, tid)
+                    break
+            if special is not None:
+                ids.append(special[1])
+                i += len(special[0])
+                continue
+            j = i
+            while j < n and not any(
+                    text.startswith(token, j) for token in self._SPECIAL):
+                j += 1
+            run = text[i:j]
+            ids.append(9000 + len(run))
+            ids.extend(ord(c) for c in run)
+            i = j
+        return ids
+
+
+def _grow_conversation():
+    convo = [{
+        "role": "system",
+        "content": "SYS " * 40
+    }, {
+        "role": "user",
+        "content": "hello " * 20
+    }]
+    yield [dict(m) for m in convo]
+    for turn in range(4):
+        convo.append({"role": "assistant", "content": f"resp{turn} " * 30})
+        convo.append({"role": "user", "content": f"q{turn} " * 12})
+        yield [dict(m) for m in convo]
+
+
+def test_prefix_cache_tokenize_matches_full_encode(servers):
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=4)
+    tok = _PrefixCacheFakeTokenizer()
+    with mock.patch.object(router, "_get_tokenizer", return_value=tok):
+        for convo in _grow_conversation():
+            req = ChatCompletionRequest(model="mock", messages=convo)
+            rendered = tok.apply_chat_template(
+                convo,
+                add_generation_prompt=req.add_generation_prompt,
+                tokenize=False)
+            reference = tok.encode(rendered, add_special_tokens=False)
+            result = router._tokenize(req)[0]
+            assert result == reference
+            assert req.prompt_token_ids == reference
+
+
+def test_prefix_cache_tokenize_encodes_only_delta(servers):
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=4)
+    tok = _PrefixCacheFakeTokenizer()
+    encoded_lengths = []
+    real_encode = tok.encode
+
+    def _recording_encode(text, add_special_tokens=False):
+        encoded_lengths.append(len(text))
+        return real_encode(text, add_special_tokens=add_special_tokens)
+
+    tok.encode = _recording_encode
+    with mock.patch.object(router, "_get_tokenizer", return_value=tok):
+        for index, convo in enumerate(_grow_conversation()):
+            encoded_lengths.clear()
+            req = ChatCompletionRequest(model="mock", messages=convo)
+            rendered = tok.apply_chat_template(
+                convo,
+                add_generation_prompt=req.add_generation_prompt,
+                tokenize=False)
+            router._tokenize(req)
+            assert encoded_lengths
+            if index >= 1:
+                assert min(encoded_lengths) < len(rendered)
+
+
+def test_prefix_cache_tokenize_falls_back_on_divergent_prefix(servers):
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=4)
+    tok = _PrefixCacheFakeTokenizer()
+    convo_a = [{
+        "role": "system",
+        "content": "A " * 30
+    }, {
+        "role": "user",
+        "content": "alpha"
+    }]
+    convo_b = [{
+        "role": "system",
+        "content": "B " * 30
+    }, {
+        "role": "user",
+        "content": "beta"
+    }]
+    with mock.patch.object(router, "_get_tokenizer", return_value=tok):
+        for convo in (convo_a, convo_b, convo_a):
+            req = ChatCompletionRequest(model="mock",
+                                        messages=[dict(m) for m in convo])
+            rendered = tok.apply_chat_template(
+                [dict(m) for m in convo],
+                add_generation_prompt=req.add_generation_prompt,
+                tokenize=False)
+            reference = tok.encode(rendered, add_special_tokens=False)
+            assert router._tokenize(req)[0] == reference
+
+
+@pytest.mark.asyncio
+async def test_conversation_affinity_pins_across_load(servers):
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=4,
+                                load_weight=1.0)
+    tok = mock.MagicMock()
+    tok.apply_chat_template.return_value = [1, 2, 3, 4, 5, 6, 7, 8]
+    convo = [{
+        "role": "system",
+        "content": "S"
+    }, {
+        "role": "user",
+        "content": "u1"
+    }]
+    with mock.patch.object(router, "_get_tokenizer", return_value=tok):
+        req1 = ChatCompletionRequest(model="m",
+                                     messages=[dict(m) for m in convo])
+        home, _ = await router.get_next_server(req1)
+        # Saturate the home server so a fresh request would avoid it.
+        for _ in range(64):
+            await router._server_state[home].increment_load(
+                ChatCompletionRequest(model="m",
+                                      messages=[{
+                                          "role": "user",
+                                          "content": "x"
+                                      }]))
+        # Same conversation (same first-2-message content) -> pinned to home
+        # even though the score now favours the idle servers.
+        req2 = ChatCompletionRequest(model="m",
+                                     messages=[dict(m) for m in convo] +
+                                     [{
+                                         "role": "assistant",
+                                         "content": "a1"
+                                     }, {
+                                         "role": "user",
+                                         "content": "u2"
+                                     }])
+        assert (await router.get_next_server(req2))[0] == home
+        # A different conversation is free to avoid the saturated home.
+        req3 = ChatCompletionRequest(model="m",
+                                     messages=[{
+                                         "role": "system",
+                                         "content": "OTHER"
+                                     }, {
+                                         "role": "user",
+                                         "content": "v1"
+                                     }])
+        assert (await router.get_next_server(req3))[0] != home

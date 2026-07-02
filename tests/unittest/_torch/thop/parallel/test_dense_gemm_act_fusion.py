@@ -228,3 +228,57 @@ def test_mlp_fp4out_min_m_switch():
         assert seen["fp4_out"] == expected, (
             f"m={m}: expected fp4_out={expected}, got {seen['fp4_out']}"
         )
+
+
+# ---------------------------------------------------------------------------
+# The fused MLP flattens a rank-3 Fp4QuantizedTensor to 2D before the (2D-only)
+# GEMM. A fused rmsnorm hands it [B, S, D/2]; the path previously flattened only
+# plain tensors, tripping `assert inputs[0].dim() == 2`.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("kind", ["gelu", "swiglu"])
+def test_fused_act_flattens_3d_fp4_input(kind):
+    """Fused NVFP4 MLP flattens a rank-3 Fp4QuantizedTensor to 2D before the GEMM."""
+    import types
+
+    from tensorrt_llm._torch.utils import Fp4QuantizedTensor, gelu_tanh
+
+    B, S, K = 2, 8, 64
+    if kind == "gelu":
+        from tensorrt_llm._torch.modules.mlp import MLP
+
+        mod = MLP(hidden_size=K, intermediate_size=128, bias=False, activation=gelu_tanh)
+        proj = mod.up_proj
+        run = lambda x: mod._fused_gelu(x)  # noqa: E731
+    else:
+        from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+
+        mod = GatedMLP(hidden_size=K, intermediate_size=128, bias=False)
+        proj = mod.gate_up_proj
+        run = lambda x: mod._fused_gate_up_swiglu(x)  # noqa: E731
+
+    captured = {}
+
+    class _Stop(Exception):
+        pass
+
+    def fake_input_prepare(module, x):
+        captured["dim"] = x.fp4_tensor.dim() if isinstance(x, Fp4QuantizedTensor) else x.dim()
+        captured["shape"] = (
+            tuple(x.fp4_tensor.shape) if isinstance(x, Fp4QuantizedTensor) else tuple(x.shape)
+        )
+        raise _Stop  # short-circuit before the real (HW-only) GEMM
+
+    proj.quant_method = types.SimpleNamespace(_input_prepare=fake_input_prepare)
+
+    fp4_3d = Fp4QuantizedTensor(
+        fp4_tensor=torch.zeros(B, S, K // 2, dtype=torch.uint8),
+        scaling_factor=torch.zeros(B * S, K // 16, dtype=torch.uint8),
+    )
+    with pytest.raises(_Stop):
+        run(fp4_3d)
+
+    assert captured["dim"] == 2, (
+        f"{kind}: rank-3 Fp4QuantizedTensor not flattened before the GEMM "
+        f"(kernel would see rank {captured['dim']})"
+    )
+    assert captured["shape"] == (B * S, K // 2)
