@@ -1509,22 +1509,6 @@ class MTPDraftModel(nn.Module):
         elif model_type in ["exaone_moe"]:
             from .modeling_exaone_moe import ExaoneMoeMTP
             mtp_layer = ExaoneMoeMTP(model_config, layer_idx, aux_stream_dict)
-
-        elif model_type == "nemotron_h":
-            from .modeling_nemotron_h import NemotronHMTP
-            mtp_layer = NemotronHMTP(model_config,
-                                     layer_idx,
-                                     aux_stream_dict,
-                                     is_separate_draft_engine=False)
-        elif model_type == "qwen3_next":
-            from .modeling_qwen3_next import Qwen3NextMTP
-            mtp_layer = Qwen3NextMTP(model_config, layer_idx, aux_stream_dict)
-        elif model_type == "deepseek_v4":
-            from .modeling_deepseekv4 import DeepseekV4MTP
-            mtp_layer = DeepseekV4MTP(model_config,
-                                      layer_idx,
-                                      aux_stream_dict,
-                                      is_separate_draft_engine=True)
         else:
             raise ValueError(
                 f"MTPDraftModel does not support model_type: {model_type}")
