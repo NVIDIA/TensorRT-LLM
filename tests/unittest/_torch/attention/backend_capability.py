@@ -155,28 +155,6 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
     ):
         return f"TRTLLM Blackwell paged attention does not support head_dim {case.head_dim}"
 
-    # On Blackwell, TRTLLM-Gen is the supported MLA generation path. The current
-    # kernel set explicitly lacks the DeepSeek-family decode shape at page_size
-    # 32, and the generic fallback then tries to JIT an unsupported generated
-    # kernel. FlashInfer/Vanilla still validate these standalone MLA gen cases.
-    if (
-        backend == "TRTLLM"
-        and sm >= 100
-        and getattr(case, "is_mla", False)
-        and getattr(case, "num_contexts", 0) == 0
-    ):
-        head_dim_qk = getattr(case, "kv_lora_rank", 0) + getattr(case, "qk_rope_head_dim", 0)
-        head_dim_v = getattr(case, "kv_lora_rank", 0)
-        if (head_dim_qk, head_dim_v, getattr(case, "page_size", None)) == (
-            576,
-            512,
-            32,
-        ):
-            return (
-                "TRTLLM-Gen Blackwell MLA generation is missing the decode "
-                "kernel for headDimQk=576, headDimV=512, page_size=32"
-            )
-
     # TRTLLM's Blackwell no-cache fallback mismatches the Vanilla golden for the
     # Qwen2-VL vision tower's head_dim 80 workload; other no-cache head dims in
     # this sweep still pass on Blackwell.
