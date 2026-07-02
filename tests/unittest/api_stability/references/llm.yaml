@@ -167,6 +167,10 @@ methods:
         annotation: bool
         default: False
         status: prototype
+      enable_low_latency_host_dispatch:
+        annotation: bool
+        default: False
+        status: prototype
       enable_iter_perf_stats:
         annotation: bool
         default: False
