@@ -4223,6 +4223,12 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
         pytorch_config = dict(cuda_graph_config=CudaGraphConfig(
             max_batch_size=32, enable_padding=True),
                               torch_compile_config=torch_compile_config)
+        # Piecewise CUDA-graph capture (torch_compile=True) needs extra
+        # workspace beyond what the default KV-cache fraction reserves on
+        # 44 GiB L40S; lower the fraction in that case to avoid executor OOM.
+        if torch_compile:
+            pytorch_config["kv_cache_config"] = KvCacheConfig(
+                free_gpu_memory_fraction=0.6)
 
         with LLM(f"{llm_models_root()}/Qwen3/saved_models_Qwen3-30B-A3B_fp8_hf",
                  tensor_parallel_size=tp_size,
