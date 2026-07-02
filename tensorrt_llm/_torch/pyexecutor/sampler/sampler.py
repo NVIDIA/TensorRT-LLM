@@ -80,13 +80,14 @@ from tensorrt_llm.sampling_params import (
     check_logprobs_limit,
 )
 
-from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from ..speculative.interface import get_force_num_accepted_tokens
-from ..speculative.spec_tree_manager import SpecTreeManager
-from ..utils import torch_multi_arange
-from .finish_reason import FinishedState
-from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
-from .resource_manager import ResourceManager, ResourceManagerType
+from ...flashinfer_utils import IS_FLASHINFER_AVAILABLE
+from ...speculative.interface import get_force_num_accepted_tokens
+from ...speculative.spec_tree_manager import SpecTreeManager
+from ...utils import torch_multi_arange
+from ..finish_reason import FinishedState
+from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
+from ..resource_manager import ResourceManager, ResourceManagerType
+from ..scheduler import ScheduledRequests
 from .sampling_utils import (
     BEAM_SEARCH_PAD_TOKEN,
     GREEDY,
@@ -101,7 +102,6 @@ from .sampling_utils import (
     sample,
     sample_rejected,
 )
-from .scheduler import ScheduledRequests
 
 if sys.version_info[:2] >= (3, 12):
     from typing import override
@@ -2347,11 +2347,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self.LOGPROBS_SHAPE = (self.max_num_sequences, self.max_beam_width, self.max_tokens)
         self.TOPK_LOGPROBS_SHAPE = (self.max_num_sequences, self.max_tokens, self.max_topk_logprobs)
 
-        from .sampling_backend.interface import (
-            BoundSamplingBackend,
-            SamplerConfig,
-            resolve_sampling_backend,
-        )
+        from .kernels.interface import BoundSamplingBackend, SamplerConfig, resolve_sampling_backend
 
         self._bound_backend: BoundSamplingBackend = resolve_sampling_backend(
             torch.device("cuda"),

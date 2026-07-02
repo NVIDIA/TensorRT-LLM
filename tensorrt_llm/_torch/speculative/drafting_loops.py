@@ -15,7 +15,7 @@ from typing import Optional, final
 import torch
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
-from tensorrt_llm._torch.pyexecutor.sampling_utils import greedy
+from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import greedy
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3SpecMetadata
 from tensorrt_llm._torch.speculative.interface import SpecMetadata
 from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager

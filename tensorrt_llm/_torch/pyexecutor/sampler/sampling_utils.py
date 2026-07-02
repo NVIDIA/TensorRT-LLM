@@ -27,28 +27,38 @@ from typing import Any, Generic, Literal, Optional, Type, TypeAlias, TypeVar, ca
 import torch
 
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from tensorrt_llm._torch.pyexecutor.sampling_backend import trtllm, vanilla
-from tensorrt_llm._torch.pyexecutor.sampling_backend.vanilla import (
+from tensorrt_llm._torch.pyexecutor.sampler.kernels import vanilla
+from tensorrt_llm._torch.pyexecutor.sampler.kernels.vanilla import (
     BeamSearchMetadata as BeamSearchMetadata,
 )
-from tensorrt_llm._torch.pyexecutor.sampling_backend.vanilla import (
+from tensorrt_llm._torch.pyexecutor.sampler.kernels.vanilla import (
     StrategyMetadata as StrategyMetadata,
 )
-from tensorrt_llm._torch.pyexecutor.sampling_backend.vanilla import _Fusions as _Fusions
-from tensorrt_llm._torch.pyexecutor.sampling_backend.vanilla import (
-    beam_search_sampling_batch,
-    greedy_search_sampling_batch,
-    temperature_sampling_batch,
-    top_k_sampling_batch,
-    top_k_top_p_sampling_batch,
-    top_p_sampling_batch,
+from tensorrt_llm._torch.pyexecutor.sampler.kernels.vanilla import _Fusions as _Fusions
+from tensorrt_llm._torch.pyexecutor.sampler.kernels.vanilla import (
+    beam_search_sampling_batch as beam_search_sampling_batch,
 )
-from tensorrt_llm._torch.pyexecutor.sampling_backend.vanilla import (
+from tensorrt_llm._torch.pyexecutor.sampler.kernels.vanilla import (
     get_rejected_indices as get_rejected_indices,
 )
-from tensorrt_llm._torch.pyexecutor.sampling_backend.vanilla import greedy as _torch_greedy
-from tensorrt_llm._torch.pyexecutor.sampling_backend.vanilla import (
+from tensorrt_llm._torch.pyexecutor.sampler.kernels.vanilla import greedy as _torch_greedy
+from tensorrt_llm._torch.pyexecutor.sampler.kernels.vanilla import (
+    greedy_search_sampling_batch as greedy_search_sampling_batch,
+)
+from tensorrt_llm._torch.pyexecutor.sampler.kernels.vanilla import (
     sample_rejected as sample_rejected,
+)
+from tensorrt_llm._torch.pyexecutor.sampler.kernels.vanilla import (
+    temperature_sampling_batch as temperature_sampling_batch,
+)
+from tensorrt_llm._torch.pyexecutor.sampler.kernels.vanilla import (
+    top_k_sampling_batch as top_k_sampling_batch,
+)
+from tensorrt_llm._torch.pyexecutor.sampler.kernels.vanilla import (
+    top_k_top_p_sampling_batch as top_k_top_p_sampling_batch,
+)
+from tensorrt_llm._torch.pyexecutor.sampler.kernels.vanilla import (
+    top_p_sampling_batch as top_p_sampling_batch,
 )
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.sampling_params import SamplingParams
@@ -891,8 +901,8 @@ def sanitize_top_k(top_k: torch.Tensor, vocab_size: int) -> torch.Tensor:
 
 
 if IS_FLASHINFER_AVAILABLE:
-    from tensorrt_llm._torch.pyexecutor.sampling_backend import flashinfer
-    from tensorrt_llm._torch.pyexecutor.sampling_backend.flashinfer import (
+    from tensorrt_llm._torch.pyexecutor.sampler.kernels import flashinfer
+    from tensorrt_llm._torch.pyexecutor.sampler.kernels.flashinfer import (
         sampling_from_probs_generator_op,
         softmax_op,
         top_k_mask_logits_op,
@@ -921,7 +931,11 @@ def compute_probs_from_logits(
     if logits.is_cuda and IS_FLASHINFER_AVAILABLE:
         return flashinfer.compute_probs_from_logits_op(logits, temperatures, top_k, top_p)
     if logits.is_cuda:
-        return trtllm.compute_probs_from_logits_op(logits, temperatures, top_k, top_p)
+        # TRT-LLM C++ op (CUDA, no flashinfer). The op keeps a skip_temperature
+        # flag; temperature is always applied here.
+        return torch.ops.trtllm.compute_probs_from_logits_op(
+            logits, temperatures, top_k, top_p, False
+        )
     return vanilla.compute_probs_from_logits_op(logits, temperatures, top_k, top_p)
 
 
