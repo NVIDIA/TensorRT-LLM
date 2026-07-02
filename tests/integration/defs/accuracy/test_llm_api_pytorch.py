@@ -7261,16 +7261,20 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
-    @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
+    @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
     def test_mxfp8(self, tp_size, ep_size):
         # MXFP8 checkpoint: weights are MXFP8 (e4m3 + UE8M0 1x32 block
         # scales) with MXFP8 dynamic activations; the KV cache stays in
         # BF16 and the sparse attention path is unchanged from BF16.
         model_name = "MiniMaxAI/MiniMax-M3-MXFP8"
         model_path = f"{llm_models_root()}/MiniMax-M3-MXFP8"
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
+        # Halving TP from the BF16 reference (TP=8) doubles per-rank
+        # model + KV footprint; cap KV cache at 0.4 of free memory and
+        # constrain batch / token budget so the runtime allocator stays
+        # under the PyTorch cap.
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
                                         enable_block_reuse=False)
         sparse_attention_config = MiniMaxM3SparseAttentionConfig()
         with LLM(model_path,
@@ -7279,6 +7283,8 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config,
                  sparse_attention_config=sparse_attention_config,
                  max_seq_len=4096,
+                 max_batch_size=32,
+                 max_num_tokens=4096,
                  trust_remote_code=True) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MXFP8
             task = MMLU(model_name)
