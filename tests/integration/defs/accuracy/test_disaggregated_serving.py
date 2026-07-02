@@ -2231,6 +2231,79 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
 
+@pytest.mark.timeout(10800)
+@skip_pre_blackwell
+class TestKimiK25(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "moonshotai/Kimi-K2.5"
+    MODEL_PATH = f"{llm_models_root()}/Kimi-K2.5-NVFP4"
+
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_device_memory(180000)
+    def test_nvfp4(self):
+        """Disaggregated GSM8K accuracy for Kimi-K2.5 (NVFP4).
+
+        ctx and gen servers are each TP4 (8 GPUs total) over the default cache
+        transceiver. GSM8K is text-only, so requests run through the DeepSeek-V3
+        MLA backbone (no vision) and the ctx->gen KV transfer is the MLA latent.
+        Kimi-K2.5 ships custom HF modeling code (auto_map in config.json), so
+        trust_remote_code must be set on both servers or executor init fails at
+        config parse time.
+
+        Kimi-K2.5 has a ~256k default context. Without an explicit cap the
+        context server tries to allocate a ~234k-token KV window and stalls in
+        warmup before it registers as a disagg worker (the generation worker
+        registers, the context worker never does, so the cluster never reports
+        is_ready and the test hangs). GSM8K prompts are short, so cap the
+        sequence/token budget to keep startup fast and the KV pool small.
+        """
+        ctx_server_config = {
+            "max_batch_size": 16,
+            "max_seq_len": 8192,
+            "max_num_tokens": 8192,
+            "disable_overlap_scheduler": True,
+            "cache_transceiver_config": {
+                "backend": "DEFAULT",
+                "max_tokens_in_buffer": 4096
+            },
+            "tensor_parallel_size": 4,
+            "enable_attention_dp": True,
+            "trust_remote_code": True,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.6,
+            },
+        }
+        gen_server_config = {
+            "max_batch_size": 16,
+            "max_seq_len": 8192,
+            "max_num_tokens": 8192,
+            "disable_overlap_scheduler": True,
+            "cache_transceiver_config": {
+                "backend": "DEFAULT",
+                "max_tokens_in_buffer": 4096
+            },
+            "tensor_parallel_size": 4,
+            "enable_attention_dp": True,
+            "trust_remote_code": True,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.6,
+            },
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 @skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(80000)
