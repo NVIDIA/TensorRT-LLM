@@ -748,7 +748,8 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         def diffs = [:]
         for (f in changedFiles) {
             if (_cbtsMatchesAnyPattern(f, needsDiffFor)) {
-                diffs[f] = getMergeRequestOneFileChanges(pipeline, globalVars, f)
+                // Null (patch omitted for binary / rename / too-large diffs) coerces to empty.
+                diffs[f] = getMergeRequestOneFileChanges(pipeline, globalVars, f) ?: ""
             }
         }
 
