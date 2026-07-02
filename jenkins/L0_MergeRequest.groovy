@@ -1538,8 +1538,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
-                        catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
-                            error "OSS Compliance Check failed: ${e.getMessage()}"
+                        catchError(buildResult: 'Failure', stageResult: 'Failure') {
+                            error "OSS Compliance Check failed: ${e.getMessage()}, please rerun."
                         }
                     }
                 }
