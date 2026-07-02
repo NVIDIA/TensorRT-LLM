@@ -337,10 +337,13 @@ def torch_empty_cache() -> None:
         torch.cuda.empty_cache()
 
 
-@pytest.fixture(scope="module", params=[2, 4, 8])
+@pytest.fixture(scope="module")
 def mpi_pool_executor(request):
     """
     Start an MPIPoolExecutor with `request.param` workers.
+
+    Consumers must set the worker count via indirect parametrization, e.g.
+    ``@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)``.
     """
     num_workers = request.param
     with MPIPoolExecutor(num_workers) as executor:
