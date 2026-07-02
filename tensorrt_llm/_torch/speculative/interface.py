@@ -1750,6 +1750,27 @@ class SpecWorkerBase(nn.Module, ABC):
         producer (autoregressive workers called once per draft step, e.g.
         MTP/DraftTarget). The step-only arg ``draft_step`` and the block-only
         arg ``num_contexts`` are ignored by the other path.
+
+        Why the two shapes differ on context (prefill) requests in a mixed
+        batch:
+
+        - Step workers (MTP/DraftTarget) draft from the target's hidden states,
+          which are available for a context request right after its prefill
+          forward. So a context request produces draft tokens on the same
+          iteration: the worker gathers one position per request (context
+          included) and this receives 2D ``[batch_size, vocab]`` logits whose
+          rows all need sampling. Nothing is sliced out here; ``num_contexts``
+          is not needed because the logits and the per-request metadata are
+          both laid out over the full batch and already aligned.
+        - Block workers (PARD/DFlash) draft from previously accepted tokens,
+          which a freshly-prefilled context request does not have yet, so a
+          context request produces no draft this iteration (its rows are zero
+          filled by the worker). The worker therefore feeds only gen positions
+          through the LM head, and this receives already-gen-only 3D
+          ``[num_gens, K, vocab]`` logits. ``num_contexts`` is used inside the
+          block path to slice the full-batch per-request metadata (slot ids,
+          sampling params) down to the gen segment so it lines up with those
+          gen-only logits -- it does not slice the logits themselves.
         """
         if logits.dim() == 3:
             return self.produce_block_draft_tokens(logits, spec_metadata,
