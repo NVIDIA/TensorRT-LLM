@@ -1503,6 +1503,7 @@ class PerfSanityTestConfig:
     def __init__(self, test_case_name: str, output_dir: str):
         self._output_dir = output_dir
         self._perf_results: Dict[int, List[Dict[str, float]]] = {}
+        self._timeout = DEFAULT_TIMEOUT
 
         # Initialize server configs
         self.server_configs: List = []
@@ -1529,7 +1530,8 @@ class PerfSanityTestConfig:
                 raise RuntimeError("Failed to get GPU type")
 
         self.upload_to_db = "upload" in test_case_name.split("-")[0] and bool(
-            os.environ.get("OPEN_SEARCH_DB_BASE_URL", "")
+            os.environ.get("OPEN_SEARCH_DB_BASE_URL")
+            and os.environ.get("OPEN_SEARCH_DB_CREDENTIALS_USR")
         )
         self.gpu_type = get_gpu_type()
 
@@ -1567,6 +1569,22 @@ class PerfSanityTestConfig:
             # Normal aggregated mode
             self._parse_aggr_config_file(config_file_path)
 
+    @staticmethod
+    def _resolve_timeout(slurm_config: dict) -> int:
+        """Resolve test timeout from a YAML slurm section.
+
+        Honors slurm.timeout if set, otherwise parses slurm.job_time (HH:MM:SS),
+        falling back to DEFAULT_TIMEOUT.
+        """
+        timeout = slurm_config.get("timeout", None)
+        if timeout is not None:
+            return int(timeout)
+        job_time = slurm_config.get("job_time", "")
+        if job_time:
+            parts = job_time.split(":")
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+        return DEFAULT_TIMEOUT
+
     def _parse_aggr_config_file(self, config_file_path: str):
         """Parse YAML config file for aggregated server."""
         # Parse selection pattern (server config names)
@@ -1581,6 +1599,7 @@ class PerfSanityTestConfig:
         metadata = config.get("metadata", {})
         hardware = config.get("hardware", {})
         gpus_per_node = hardware.get("gpus_per_node", 0)
+        self._timeout = self._resolve_timeout(config.get("slurm", {}))
 
         model_name = metadata.get("model_name", "")
 
@@ -1648,7 +1667,7 @@ class PerfSanityTestConfig:
         slurm_config = config.get("slurm", {})
         worker_config = config.get("worker_config", {})
 
-        timeout = slurm_config.get("timeout", DEFAULT_TIMEOUT)
+        self._timeout = self._resolve_timeout(slurm_config)
         numa_bind = slurm_config.get("numa_bind", False)
         gpus_per_node = hardware.get("gpus_per_node", 0)
         model_name = metadata.get("model_name", "")
@@ -1728,7 +1747,7 @@ class PerfSanityTestConfig:
                 disagg_serving_type=disagg_serving_type,
                 hostname=socket.gethostname(),
                 numa_bind=numa_bind,
-                timeout=timeout,
+                timeout=self._timeout,
                 benchmark_mode=benchmark_mode,
                 model_name=model_name,
                 hardware=hardware,
@@ -1761,7 +1780,7 @@ class PerfSanityTestConfig:
             client_config_data = {
                 "concurrency": concurrency,
                 "iterations": 1
-                if benchmark_mode == "gen_only"
+                if benchmark_mode in ("gen_only", "ctx_only")
                 else benchmark.get("multi_round", 1),
                 "isl": benchmark.get("input_length", 1024),
                 "osl": osl,
@@ -1826,7 +1845,7 @@ class PerfSanityTestConfig:
         return AggrTestCmds(
             server_cmds=server_cmds,
             client_cmds=client_cmds,
-            timeout=DEFAULT_TIMEOUT,
+            timeout=self._timeout,
             output_dir=output_dir,
             test_output_dir=test_output_dir,
             client_configs=self.server_client_configs,
