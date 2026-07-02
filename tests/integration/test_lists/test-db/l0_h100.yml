@@ -67,6 +67,7 @@ l0_h100:
   - unittest/disaggregated/region/test_region.py
   - unittest/disaggregated/test_disaggregated_params.py
   - unittest/disaggregated/test_perf_logger.py
+  - unittest/disaggregated/test_sync_transfer_timing.py
   - unittest/disaggregated/test_rank_info.py
   - unittest/disaggregated/test_request_id.py
   - unittest/disaggregated/test_kv_transfer.py

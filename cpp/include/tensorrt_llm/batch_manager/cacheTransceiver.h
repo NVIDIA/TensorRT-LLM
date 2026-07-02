@@ -26,11 +26,13 @@
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
+#include <fstream>
 #include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <pybind11/pybind11.h>
+#include <string>
 #include <torch/csrc/jit/python/pybind_utils.h>
 #include <torch/custom_class.h>
 #include <torch/python.h>
@@ -278,6 +280,10 @@ private:
 
     void setContextState(LlmRequest* llmRequest);
 
+    // Append one row per completed request to the gen-side transfer summary CSV. Opens the file
+    // lazily on first use; expects timing to already be synced across ranks by the caller.
+    void writeGenTransferSummary(std::vector<LlmRequest*> const& completedRequests);
+
     std::unique_ptr<CacheSender> mCacheSender;
     std::unique_ptr<CacheReceiver> mCacheReceiver;
     // shared_ptr (not raw LlmRequest*) so the futures hold a strong reference for
@@ -309,6 +315,13 @@ private:
     rnn_state_manager::RnnStateManager* mRnnStateManager{nullptr};
     // TODO(shreyasm): update this to use same container as kv by using base trans buffers instead
     std::unique_ptr<rnn_state_manager::RnnCacheTransBufferManager> mRnnCacheTransBufferManager{nullptr};
+
+    // Unique instance identifier for CSV file naming (avoids collisions across gen instances)
+    std::string mInstanceId;
+
+    // Gen-side transfer summary CSV (written after timing sync)
+    std::ofstream mGenTransferSummaryFile;
+    std::mutex mGenTransferSummaryMutex;
 
     // library handle to the communicator related features,
     // this is used to defer dependency resolution until needed.
