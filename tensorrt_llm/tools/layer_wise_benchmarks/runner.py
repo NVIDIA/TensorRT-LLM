@@ -605,18 +605,22 @@ class Runner:
     ):
         world_size = mpi_world_size()
         pretrained_config = self.model_config.pretrained_config
+        sparse_attention_config = self.model_config.sparse_attention_config
+        sparse_params = (
+            sparse_attention_config.to_sparse_params(pretrained_config=pretrained_config)
+            if sparse_attention_config is not None
+            else None
+        )
         AttentionCls = get_attention_backend(
-            self.model_config.attn_backend,
-            sparse_attention_config=self.model_config.sparse_attention_config,
+            self.model_config.attn_backend, sparse_params=sparse_params
         )
         metadata_cls = AttentionCls.Metadata
-        sparse_attention_config = self.model_config.sparse_attention_config
         sparse_metadata_params = (
             sparse_attention_config.to_sparse_metadata_params(pretrained_config=pretrained_config)
             if sparse_attention_config is not None
             else None
         )
-        metadata_kwargs = dict(
+        attn_metadata = metadata_cls(
             seq_lens=torch.tensor([seq_len_q] * batch_size, dtype=torch.int),
             request_ids=list(range(request_id_begin, request_id_begin + batch_size)),
             max_num_requests=kv_cache_manager.max_batch_size,
@@ -641,7 +645,6 @@ class Runner:
             mapping=self.model_config.mapping,
             sparse_metadata_params=sparse_metadata_params,
         )
-        attn_metadata = metadata_cls(**metadata_kwargs)
         attn_metadata.all_rank_num_tokens = [batch_size * seq_len_q] * world_size
         attn_metadata.prepare()
         hidden_size = pretrained_config.hidden_size

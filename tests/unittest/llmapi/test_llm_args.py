@@ -2855,6 +2855,17 @@ class TestDeepSeekV4SparseAttentionConfig:
 
         assert config.compress_ratios == [1, 4, 128]
 
+    def test_lowers_to_deepseek_v4_sparse_params(self):
+        config = DeepSeekV4SparseAttentionConfig(compress_ratios=[0, 4, 128])
+
+        sparse_params = config.to_sparse_params()
+        sparse_metadata_params = config.to_sparse_metadata_params()
+
+        assert sparse_params.algorithm == "deepseek_v4"
+        assert sparse_params.compress_ratios == [1, 4, 128]
+        assert sparse_metadata_params.compress_ratios == [1, 4, 128]
+        assert sparse_metadata_params.window_size == 128
+
     @pytest.mark.parametrize("compress_ratios", [[], [-1, 4, 128]])
     def test_invalid_compress_ratios_raise(self, compress_ratios):
         with pytest.raises(ValidationError, match="compress_ratios"):
