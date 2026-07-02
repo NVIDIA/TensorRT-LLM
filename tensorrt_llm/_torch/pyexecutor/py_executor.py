@@ -136,7 +136,31 @@ class _SleepWakeupAction(StrEnum):
 
 
 _SLEEP_WAKEUP_LISTENER_JOIN_TIMEOUT_S = 30.0
-_SLEEP_WAKEUP_ABORT_BARRIER_TIMEOUT_S = 30.0
+_SLEEP_WAKEUP_SHUTDOWN_ACK_TIMEOUT_S = 30.0
+_SLEEP_WAKEUP_ACK_POLL_INTERVAL_S = 0.01
+
+
+def _sleep_wakeup_ack_ready(comm, source: int, tag: _SleepWakeupTag) -> bool:
+    """Return whether an ACK is ready without blocking on recv."""
+    if hasattr(comm, "iprobe"):
+        return comm.iprobe(source=source, tag=tag)
+    if hasattr(comm, "Iprobe"):
+        return comm.Iprobe(source=source, tag=tag)
+    raise RuntimeError(
+        "_sleep_wakeup_comm does not support nonblocking ACK probe")
+
+
+def _recv_sleep_wakeup_ack(comm, source: int, timeout_s: float) -> dict:
+    """Receive a sleep/wakeup ACK with a bounded nonblocking poll loop."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if _sleep_wakeup_ack_ready(comm, source, _SleepWakeupTag.ACK):
+            return comm.recv(source=source, tag=_SleepWakeupTag.ACK)
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"timed out waiting for sleep/wakeup ACK from rank {source} "
+                f"after {timeout_s:.1f} seconds")
+        time.sleep(_SLEEP_WAKEUP_ACK_POLL_INTERVAL_S)
 
 
 @functools.cache
@@ -1140,6 +1164,68 @@ class PyExecutor:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.shutdown()
 
+    def _shutdown_sleep_wakeup_listeners(self) -> None:
+        """Signal sleep/wakeup listener threads to exit and drain bounded ACKs."""
+        if self._sleep_wakeup_comm is None or self.dist.world_size <= 1:
+            return
+
+        if self.dist.rank == 0:
+            logger.info(
+                "Sending shutdown to %d sleep/wakeup listener thread(s).",
+                self.dist.world_size - 1,
+            )
+            shutdown_errors = []
+            shutdown_ranks = []
+            for dest in range(1, self.dist.world_size):
+                try:
+                    self._sleep_wakeup_comm.send(
+                        {
+                            "action": _SleepWakeupAction.SHUTDOWN,
+                            "tags": []
+                        },
+                        dest=dest,
+                        tag=_SleepWakeupTag.ACTION,
+                    )
+                    shutdown_ranks.append(dest)
+                except Exception as exc:
+                    shutdown_errors.append(
+                        f"rank {dest} shutdown send failed: {exc}")
+                    logger.warning(
+                        "Failed to send sleep/wakeup listener shutdown to "
+                        "rank %d: %s", dest, exc)
+            for src in shutdown_ranks:
+                try:
+                    ack = _recv_sleep_wakeup_ack(
+                        self._sleep_wakeup_comm,
+                        source=src,
+                        timeout_s=_SLEEP_WAKEUP_SHUTDOWN_ACK_TIMEOUT_S,
+                    )
+                except Exception as exc:
+                    shutdown_errors.append(
+                        f"rank {src} shutdown ACK recv failed: {exc}")
+                    logger.warning(
+                        "Failed to receive sleep/wakeup listener shutdown ACK "
+                        "from rank %d: %s", src, exc)
+                    continue
+                if ack.get("status") != "ok":
+                    shutdown_errors.append(
+                        ack.get("error")
+                        or f"rank {src} returned unknown shutdown ACK")
+            if shutdown_errors:
+                logger.warning(
+                    "Sleep/wakeup listener shutdown completed with errors: %s",
+                    "; ".join(shutdown_errors))
+        elif self._sleep_wakeup_listener_thread is not None:
+            self._sleep_wakeup_listener_thread.join(
+                timeout=_SLEEP_WAKEUP_LISTENER_JOIN_TIMEOUT_S)
+            if self._sleep_wakeup_listener_thread.is_alive():
+                logger.warning(
+                    "Sleep/wakeup listener thread did not exit within %.1f "
+                    "seconds on rank %d.",
+                    _SLEEP_WAKEUP_LISTENER_JOIN_TIMEOUT_S,
+                    self.dist.rank,
+                )
+
     def enqueue_requests(
             self,
             requests: List[ExecutorRequest],
@@ -1209,60 +1295,7 @@ class PyExecutor:
         # after the worker thread has joined, which guarantees that the non-rank-0
         # executor loops have already processed the shutdown broadcast and are
         # no longer driving NCCL, so the send cannot deadlock.
-        if self._sleep_wakeup_comm is not None and self.dist.world_size > 1:
-            if self.dist.rank == 0:
-                logger.info(
-                    "Sending shutdown to %d sleep/wakeup listener thread(s).",
-                    self.dist.world_size - 1,
-                )
-                shutdown_errors = []
-                shutdown_ranks = []
-                for dest in range(1, self.dist.world_size):
-                    try:
-                        self._sleep_wakeup_comm.send(
-                            {
-                                "action": _SleepWakeupAction.SHUTDOWN,
-                                "tags": []
-                            },
-                            dest=dest,
-                            tag=_SleepWakeupTag.ACTION,
-                        )
-                        shutdown_ranks.append(dest)
-                    except Exception as exc:
-                        shutdown_errors.append(
-                            f"rank {dest} shutdown send failed: {exc}")
-                        logger.warning(
-                            "Failed to send sleep/wakeup listener shutdown to "
-                            "rank %d: %s", dest, exc)
-                for src in shutdown_ranks:
-                    try:
-                        ack = self._sleep_wakeup_comm.recv(
-                            source=src, tag=_SleepWakeupTag.ACK)
-                    except Exception as exc:
-                        shutdown_errors.append(
-                            f"rank {src} shutdown ACK recv failed: {exc}")
-                        logger.warning(
-                            "Failed to receive sleep/wakeup listener shutdown "
-                            "ACK from rank %d: %s", src, exc)
-                        continue
-                    if ack.get("status") != "ok":
-                        shutdown_errors.append(
-                            ack.get("error")
-                            or f"rank {src} returned unknown shutdown ACK")
-                if shutdown_errors:
-                    logger.warning(
-                        "Sleep/wakeup listener shutdown completed with "
-                        "errors: %s", "; ".join(shutdown_errors))
-            elif self._sleep_wakeup_listener_thread is not None:
-                self._sleep_wakeup_listener_thread.join(
-                    timeout=_SLEEP_WAKEUP_LISTENER_JOIN_TIMEOUT_S)
-                if self._sleep_wakeup_listener_thread.is_alive():
-                    logger.warning(
-                        "Sleep/wakeup listener thread did not exit within "
-                        "%.1f seconds on rank %d.",
-                        _SLEEP_WAKEUP_LISTENER_JOIN_TIMEOUT_S,
-                        self.dist.rank,
-                    )
+        self._shutdown_sleep_wakeup_listeners()
         self.worker_started = False
         # Release CUDA graphs before resource managers free their GPU memory.
         # Resource managers (e.g. SuffixAutomatonManager) allocate GPU workspace
@@ -2668,7 +2701,6 @@ class PyExecutor:
                 # action inside the try rather than a bare KeyError here.
                 action = msg.get("action", "<unknown>")
                 error_msg = None
-                release_control_request = True
                 try:
                     # Decode tags inside the try so KeyError / ValueError from
                     # a malformed message still results in an error ACK being
@@ -2682,14 +2714,14 @@ class PyExecutor:
                     # on this rank when the VMM mapping is changed below.
                     if action == _SleepWakeupAction.ABORT:
                         # ABORT is sent after rank-0 fails to broadcast an
-                        # ACTION to every peer.  Usually the executor loop is
-                        # already parked in _handle_control_request(); if the
-                        # abort is stale, this bounded wait prevents the
-                        # listener from hanging forever on a message that no
-                        # longer has a matching control request.
-                        release_control_request = (
-                            self.control_request_barrier.wait(
-                                timeout=_SLEEP_WAKEUP_ABORT_BARRIER_TIMEOUT_S))
+                        # ACTION to every peer.  Wait until the executor loop
+                        # parks on the matching control request before ACKing
+                        # rank-0; otherwise the executor loop could reach the
+                        # barrier later and wait forever on control_action_done.
+                        # Rank-0 drains ACKs with a timeout, so a stale abort
+                        # cannot wedge the coordinator during shutdown/error
+                        # handling.
+                        self.control_request_barrier.wait()
                         error_msg = (
                             "rank 0 aborted sleep/wakeup before local "
                             f"execution: {msg.get('reason', 'unknown error')}")
@@ -2742,9 +2774,8 @@ class PyExecutor:
                     # first so that it is clean for the next sleep/wakeup cycle
                     # before the executor loop resumes and could potentially
                     # set it again.  Only then signal control_action_done.
-                    if release_control_request:
-                        self.control_request_barrier.clear()
-                        self.control_action_done.set()
+                    self.control_request_barrier.clear()
+                    self.control_action_done.set()
                     # Send the ACK to rank-0 only after the executor loop on
                     # this rank has been unblocked.  This prevents rank-0 from
                     # exiting control_action() and broadcasting new requests

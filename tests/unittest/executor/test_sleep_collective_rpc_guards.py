@@ -612,6 +612,65 @@ class TestListenerAbortAndShutdown:
         assert sent_acks[0]["status"] == "error"
         assert "rank 0 send failed" in sent_acks[0]["error"]
 
+    def test_abort_before_control_barrier_waits_to_unblock_request(self):
+        """An early ABORT must not ACK before control_action_done is set."""
+        import threading
+        from unittest.mock import patch
+
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, _SleepWakeupAction
+
+        sent_acks = []
+
+        class FakeComm:
+            def __init__(self):
+                self.recv_count = 0
+
+            def recv(self, source, tag):
+                self.recv_count += 1
+                if self.recv_count > 1:
+                    raise StopIteration
+                return {
+                    "action": _SleepWakeupAction.ABORT,
+                    "tags": [],
+                    "reason": "rank 0 send failed",
+                }
+
+            def send(self, payload, dest, tag):
+                sent_acks.append(payload)
+
+        executor = object.__new__(PyExecutor)
+        executor._sleep_wakeup_comm = FakeComm()
+        executor.device_id = 0
+        executor.dist = SimpleNamespace(rank=1)
+        executor.control_request_barrier = threading.Event()
+        executor.control_action_done = threading.Event()
+
+        def run_listener():
+            try:
+                executor._sleep_wakeup_listener_loop()
+            except StopIteration:
+                pass
+
+        with (
+            patch("torch.cuda.set_device"),
+            patch("tensorrt_llm._torch.pyexecutor.py_executor.CUASSERT"),
+            patch("tensorrt_llm._torch.pyexecutor.py_executor.cudart.cudaSetDevice"),
+            patch("tensorrt_llm._torch.pyexecutor.py_executor.set_thread_local_mpi_comm"),
+            patch("torch.cuda.synchronize"),
+        ):
+            listener = threading.Thread(target=run_listener)
+            listener.start()
+            assert not executor.control_action_done.wait(timeout=0.05)
+            assert sent_acks == []
+
+            executor.control_request_barrier.set()
+            listener.join(timeout=1.0)
+
+        assert not listener.is_alive()
+        assert executor.control_action_done.is_set()
+        assert sent_acks
+        assert sent_acks[0]["status"] == "error"
+
     def test_shutdown_sends_ack_before_listener_exits(self):
         """Shutdown messages are acknowledged so rank-0 can drain them."""
         from unittest.mock import patch
@@ -641,6 +700,42 @@ class TestListenerAbortAndShutdown:
             executor._sleep_wakeup_listener_loop()
 
         assert sent_acks == [{"status": "ok", "error": None}]
+
+    def test_rank0_shutdown_ack_drain_is_bounded(self, monkeypatch):
+        """Rank 0 shutdown must not block forever if listener ACKs never arrive."""
+        from tensorrt_llm._torch.pyexecutor import py_executor
+        from tensorrt_llm._torch.pyexecutor.py_executor import (
+            PyExecutor,
+            _SleepWakeupAction,
+            _SleepWakeupTag,
+        )
+
+        sent_messages = []
+
+        class FakeComm:
+            def send(self, payload, dest, tag):
+                sent_messages.append((payload["action"], dest, tag))
+
+            def iprobe(self, source, tag):
+                return False
+
+            def recv(self, source, tag):
+                raise AssertionError("shutdown ACK drain must probe before recv")
+
+        executor = object.__new__(PyExecutor)
+        executor._sleep_wakeup_comm = FakeComm()
+        executor._sleep_wakeup_listener_thread = None
+        executor.dist = SimpleNamespace(rank=0, world_size=3)
+
+        monkeypatch.setattr(py_executor, "_SLEEP_WAKEUP_SHUTDOWN_ACK_TIMEOUT_S", 0.0)
+        monkeypatch.setattr(py_executor, "_SLEEP_WAKEUP_ACK_POLL_INTERVAL_S", 0.0)
+
+        executor._shutdown_sleep_wakeup_listeners()
+
+        assert sent_messages == [
+            (_SleepWakeupAction.SHUTDOWN, 1, _SleepWakeupTag.ACTION),
+            (_SleepWakeupAction.SHUTDOWN, 2, _SleepWakeupTag.ACTION),
+        ]
 
 
 class TestMultiRankRank0LocalFailureDrainsAcks:
