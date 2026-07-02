@@ -989,6 +989,19 @@ class MoeLoadBalancer:
         if enable_update_weights is not None:
             self.enable_update_weights = enable_update_weights
 
+    def reconfigure_mask_only(self, dead_ranks: list[int]) -> None:
+        """
+        Reconfigure EPLB routing so slots on dead EP ranks are unreachable.
+
+        This validates that every expert still has at least one surviving
+        replica. The caller must separately gate degraded-mode capacity/HBM
+        headroom before invoking this method.
+        """
+        if self.in_iter:
+            raise RuntimeError(
+                "Cannot reconfigure EPLB mask while an iteration is active")
+        self.load_balancer_impl.reconfigure_mask_only(list(dead_ranks))
+
     def start_iter(self):
         """
         Start a new iteration.
@@ -1076,13 +1089,16 @@ class MoeLoadBalancer:
 moe_model_arch_list = [
     'DeepseekV3ForCausalLM',
     'DeepseekV32ForCausalLM',
+    'DeepseekV4ForCausalLM',
     'GlmMoeDsaForCausalLM',
     'GptOssForCausalLM',
+    'KimiK25ForConditionalGeneration',
     'MixtralForCausalLM',
     'Llama4ForConditionalGeneration',
     'NemotronHForCausalLM',
     'Qwen2MoeForCausalLM',
     'Qwen3MoeForCausalLM',
+    'Qwen3_5MoeForCausalLM',
 ]
 
 

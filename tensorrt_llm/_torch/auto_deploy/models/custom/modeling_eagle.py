@@ -323,8 +323,22 @@ class EagleMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
+        # Sharding IR (SwiGLU MLP): gate/up colwise, down rowwise + all_reduce.
+        gate = torch.ops.auto_deploy.torch_linear_simple(
+            x, self.gate_proj.weight, self.gate_proj.bias, tp_mode="colwise", layer_type="mlp"
+        )
+        up = torch.ops.auto_deploy.torch_linear_simple(
+            x, self.up_proj.weight, self.up_proj.bias, tp_mode="colwise", layer_type="mlp"
+        )
+        down = torch.ops.auto_deploy.torch_linear_simple(
+            self.act_fn(gate) * up,
+            self.down_proj.weight,
+            self.down_proj.bias,
+            tp_mode="rowwise",
+            layer_type="mlp",
+        )
+        down = torch.ops.auto_deploy.all_reduce(down, layer_type="mlp")
+        return down
 
 
 class Eagle3Attention(nn.Module):
@@ -378,15 +392,54 @@ class Eagle3Attention(nn.Module):
         bsz, q_len, _ = hidden_states.size()
         cos, sin = position_embeddings
 
-        # Projections
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        # Sharding IR (MHA): q/k/v colwise (the 2*hidden_size input is the replicated
+        # concat of normed embeds + hidden; only the head output dim is sharded, so the
+        # colwise rule is unchanged), o_proj rowwise + all_reduce. tp_min_local_shape keeps
+        # whole heads together when num_heads is not divisible by world_size.
+        query_states = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.q_proj.weight,
+            self.q_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
+        key_states = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.k_proj.weight,
+            self.k_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
+        value_states = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.v_proj.weight,
+            self.v_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
 
-        # Reshape to [Batch, Seq, Heads, Dim]
-        query_states = query_states.view(bsz, q_len, -1, self.head_dim)
-        key_states = key_states.view(bsz, q_len, -1, self.head_dim)
-        value_states = value_states.view(bsz, q_len, -1, self.head_dim)
+        # Reshape to [Batch, Seq, Heads, Dim] -- head-count dim scales with TP.
+        query_states = torch.ops.auto_deploy.view(
+            query_states,
+            [bsz, q_len, self.num_attention_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        key_states = torch.ops.auto_deploy.view(
+            key_states,
+            [bsz, q_len, self.num_key_value_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        value_states = torch.ops.auto_deploy.view(
+            value_states,
+            [bsz, q_len, self.num_key_value_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
 
         query_states, key_states = apply_rotary_pos_emb(
             query_states, key_states, cos, sin, unsqueeze_dim=2
@@ -402,9 +455,21 @@ class Eagle3Attention(nn.Module):
             layout="bsnd",
         )
 
-        attn_output = attn_output.view(bsz, q_len, self.num_attention_heads * self.head_dim)
+        attn_output = torch.ops.auto_deploy.view(
+            attn_output,
+            [bsz, q_len, self.num_attention_heads * self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
 
-        attn_output = self.o_proj(attn_output)
+        attn_output = torch.ops.auto_deploy.torch_linear_simple(
+            attn_output,
+            self.o_proj.weight,
+            self.o_proj.bias,
+            tp_mode="rowwise",
+            layer_type="mha",
+        )
+        attn_output = torch.ops.auto_deploy.all_reduce(attn_output, layer_type="mha")
 
         return attn_output
 
@@ -746,6 +811,12 @@ class EagleWrapperConfig:
     load_lm_head_from_target: bool
     normalize_target_hidden_state: bool = False
     sync_before_hidden_state_capture: bool = False
+    # When attention-DP is enabled, each rank holds a different slice of the
+    # global batch and produces legitimately different per-rank tokens. The
+    # rank-0 token broadcast applied for TP-replication consistency (see
+    # `sample_greedy`) must be skipped in that mode to avoid overwriting
+    # peers' real samples.
+    enable_attention_dp: bool = False
 
 
 class EagleWrapper(nn.Module):
@@ -767,6 +838,7 @@ class EagleWrapper(nn.Module):
         self.load_lm_head_from_target = config.load_lm_head_from_target
         self.normalize_target_hidden_state = config.normalize_target_hidden_state
         self.sync_before_hidden_state_capture = config.sync_before_hidden_state_capture
+        self.enable_attention_dp = config.enable_attention_dp
 
     @property
     def _draft_inner_model(self):
@@ -832,12 +904,19 @@ class EagleWrapper(nn.Module):
 
     def sample_greedy(self, logits: torch.Tensor) -> torch.Tensor:
         ret = torch.argmax(logits, dim=-1)
-        # Broadcast rank 0's sampled tokens to all ranks. We have observed slight
-        # differences in logits across ranks. This can cause different acceptance patterns,
-        # inconsistent input_pos, and a hang. This synchronizes every
-        # validation step to prevent this. See:
+        # Under TP-replication, all ranks compute the same logits but small
+        # floating-point differences can drive different argmax results,
+        # producing divergent acceptance patterns / input_pos and an
+        # eventual hang. The broadcast below synchronizes rank 0's tokens
+        # to all ranks each validation step. See:
         # https://github.com/NVIDIA/TensorRT-LLM/issues/13134
-        broadcast(ret, src=0)
+        #
+        # Under attention-DP, each rank holds a *different* slice of the
+        # global batch so per-rank tokens are legitimately different;
+        # broadcasting would overwrite peers' real samples with rank 0's
+        # values and corrupt per-request state.
+        if not self.enable_attention_dp:
+            broadcast(ret, src=0)
         return ret
 
     def forward(self, cache_seq_interface: Optional[CachedSequenceInterface] = None, **kwargs):

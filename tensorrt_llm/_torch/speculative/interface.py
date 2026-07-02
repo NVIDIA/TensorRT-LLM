@@ -1005,8 +1005,11 @@ class SpecWorkerBase(nn.Module, ABC):
                                                      dtype=torch.int64,
                                                      device=device)
 
-    def _apply_force_accepted_tokens(self, num_accepted_tokens, num_contexts,
-                                     runtime_draft_len: int):
+    def _apply_force_accepted_tokens(self,
+                                     num_accepted_tokens,
+                                     num_contexts,
+                                     runtime_draft_len: int,
+                                     spec_metadata=None):
         """
         Apply a forced (synthetic) number of accepted draft tokens if the
         ``TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS`` environment variable is
@@ -1033,12 +1036,23 @@ class SpecWorkerBase(nn.Module, ABC):
                 accepted counts (target token + accepted draft tokens).
             num_contexts: Number of context (prefill) requests in the batch.
             runtime_draft_len: The draft length for the current iteration.
+            spec_metadata: Optional SpecMetadata. When provided, used to
+                detect eager CUDA-graph warmup so the override is skipped
+                there — warmup batches use dummy requests whose KV cache and
+                draft buffers are not populated for an inflated accepted
+                count, which would drive downstream MTP ops out-of-bounds.
 
         Returns:
             Modified num_accepted_tokens tensor.
         """
         if self.force_num_accepted_tokens == 0.0:
             return num_accepted_tokens
+
+        if spec_metadata is not None:
+            is_warmup = (spec_metadata.is_cuda_graph
+                         and not torch.cuda.is_current_stream_capturing())
+            if is_warmup:
+                return num_accepted_tokens
 
         # Decompose into a deterministic integer part (always accepted) and a
         # probabilistic fractional part. ``int(...)`` truncates toward zero,
@@ -1151,7 +1165,10 @@ class SpecWorkerBase(nn.Module, ABC):
 
         # Apply force override if set
         num_accepted_tokens = self._apply_force_accepted_tokens(
-            num_accepted_tokens, num_contexts, runtime_draft_len)
+            num_accepted_tokens,
+            num_contexts,
+            runtime_draft_len,
+            spec_metadata=spec_metadata)
 
         return accepted_tokens, num_accepted_tokens
 
@@ -1324,11 +1341,22 @@ class SpecWorkerBase(nn.Module, ABC):
                 offset=self.offset,
             )
 
+            if self.force_num_accepted_tokens != 0.0:
+                # Fill gen_accepted positions 1..runtime_draft_len with all draft tokens
+                # so that when _apply_force_accepted_tokens inflates num_accepted_tokens
+                # the decoder reads valid draft tokens instead of zeros.
+                # Slice bounds are Python ints (static at CUDA-graph capture time).
+                gen_accepted[:,
+                             1:runtime_draft_len + 1].copy_(full_draft_tokens)
+
             accepted_tokens[num_contexts:] = gen_accepted
             num_accepted_tokens[num_contexts:] = gen_num_accepted
 
         num_accepted_tokens = self._apply_force_accepted_tokens(
-            num_accepted_tokens, num_contexts, runtime_draft_len)
+            num_accepted_tokens,
+            num_contexts,
+            runtime_draft_len,
+            spec_metadata=spec_metadata)
         return accepted_tokens, num_accepted_tokens
 
     def _draft_sampler_greedy(self, logits: torch.Tensor, d2t=None):
@@ -1381,7 +1409,6 @@ class SpecWorkerBase(nn.Module, ABC):
         top_ps = spec_metadata.request_top_ps[:batch_size]
 
         if self.use_flashinfer:
-            top_ks = top_ks.clamp(min=1, max=logits.shape[-1] - 1)
             if self.seed is None:
                 self.seed = torch.tensor([0],
                                          dtype=torch.int64,
@@ -1613,7 +1640,6 @@ class SpecWorkerBase(nn.Module, ABC):
             top_ps = spec_metadata.top_ps[:num_tokens]
 
             if self.use_flashinfer:
-                top_ks = top_ks.clamp(min=1, max=logits.shape[-1] - 1)
                 # Lazily initialize seed/offset tensors on correct device
                 if self.seed is None:
                     self.seed = torch.tensor([0],

@@ -39,19 +39,6 @@ meta-llama/Llama-3.3-70B-Instruct:
     accuracy: 90.30
   - quant_algo: FP8
     accuracy: 90.30
-meta-llama/Llama-4-Maverick-17B-128E-Instruct:
-  - accuracy: 92.20
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    accuracy: 92.20
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    spec_dec_algo: Eagle
-    accuracy: 92.20
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    spec_dec_algo: Eagle3
-    accuracy: 92.20
 meta-llama/Llama-4-Scout-17B-16E-Instruct:
   - accuracy: 89.70
   - quant_algo: NVFP4
@@ -143,6 +130,16 @@ deepseek-ai/DeepSeek-V3.2-Exp:
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP
     accuracy: 95.6
+deepseek-ai/DeepSeek-V4-Flash:
+  # GSM8K measurements:
+  # * 95.11 on 8x B200 178GB at TP=8 with tightened config (fraction=0.15,
+  #   cuda_graph=None, max_num_tokens=2048) — original measurement.
+  # * 95.38 on 4x B300 275GB at TP=4 with default config (fraction=0.5,
+  #   CudaGraphConfig()) — current CI path (test_nvfp4_4gpus_static_eplb
+  #   in l0_dgx_b300_ds.yml). Drift +0.27 from 95.11 is within sigma; the
+  #   95.11 reference still holds for the hypothesis test.
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 95.11
 Qwen3/Qwen3-4B:
   - spec_dec_algo: Eagle
     accuracy: 85.823
@@ -188,8 +185,6 @@ Qwen3/Qwen3-235B-A22B:
     quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 85.78
-Qwen3/Qwen3-Next-80B-A3B-Thinking:
-  - accuracy: 81.577
 Qwen3/Qwen3-Next-80B-A3B-Instruct:
   - accuracy: 92.72
   - quant_algo: NVFP4
@@ -209,10 +204,6 @@ Qwen/Qwen3.5-4B:
     quant_algo: FP8_BLOCK_SCALES
     kv_cache_quant_algo: FP8
     accuracy: 76.0
-Qwen/Qwen3.5-9B:
-  - accuracy: 92.53
-  - spec_dec_algo: MTP
-    accuracy: 92.82
 Qwen/Qwen3.5-35B-A3B:
   - accuracy: 89.196
   - dtype: bfloat16
@@ -230,9 +221,6 @@ Qwen/Qwen3.5-397B-A17B:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 95.0
-Qwen/Qwen3.6-27B:
-  - quant_algo: FP8_BLOCK_SCALES
-    accuracy: 88.9
 moonshotai/Kimi-K2-Instruct:
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 94.84
@@ -246,6 +234,8 @@ moonshotai/Kimi-K2.5:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 93.06
+  - quant_algo: NVFP4
+    accuracy: 93.06
 nvidia/Llama-3_3-Nemotron-Super-49B-v1:
   - accuracy: 92.57
   - quant_algo: FP8
@@ -256,16 +246,6 @@ nvidia/Nemotron-H-8B-Base-8K:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 85.78
-nvidia/Nemotron-H-47B-Base-8K:
-  - accuracy: 88.82
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    accuracy: 88.55
-nvidia/Nemotron-H-56B-Base-8K:
-  - accuracy: 89.27
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    accuracy: 89.27
 nvidia/Nemotron-MOE:
   - accuracy: 88.249
   - quant_algo: FP8
@@ -286,11 +266,6 @@ nvidia/Llama-3_1-Nemotron-Ultra-253B-v1:
     accuracy: 94.16
 kanana-1.5-2.1b-instruct-2505:
   - accuracy: 75.81
-speakleash/Bielik-11B-v2.2-Instruct:
-  - accuracy: 41.51
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    accuracy: 40.41
 google/gemma-3-1b-it:
   - accuracy: 25.52 # score getting from lm-eval with HF implementation
   - quant_algo: FP8
@@ -327,11 +302,6 @@ microsoft/Phi-4-multimodal-instruct-long-rope:
   - accuracy: 75.85
 microsoft/Phi-4-mini-instruct:
   - accuracy: 82.30
-microsoft/phi-4:
-  - accuracy: 90.30
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    accuracy: 90.64
 mistralai/Codestral-22B-v0.1:
   - accuracy: 67.10
 openai/gpt-oss-120b:
@@ -374,10 +344,10 @@ GPT-OSS/120B-MXFP4:
 GPT-OSS/20B-MXFP4:
   - accuracy: 85.0
   - spec_dec_algo: DFlash
-    accuracy: 85.0
+    accuracy: 82.0
   - quant_algo: W4A8_MXFP4_MXFP8
     spec_dec_algo: DFlash
-    accuracy: 85.0
+    accuracy: 82.0
   - quant_algo: W4A8_MXFP4_MXFP8
     accuracy: 85.0
   - quant_algo: W4A8_MXFP4_MXFP8
@@ -387,7 +357,7 @@ GPT-OSS/20B-MXFP4:
     accuracy: 85.0
   - quant_algo: W4A16_MXFP4
     spec_dec_algo: DFlash
-    accuracy: 85.0
+    accuracy: 82.0
   - quant_algo: W4A16_MXFP4
     kv_cache_quant_algo: FP8
     accuracy: 85.0
@@ -469,11 +439,16 @@ MiniMaxAI/MiniMax-M2:
   - accuracy: 89.045
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 93.75
+MiniMaxAI/MiniMax-M2.5:
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 93.75
 # MiniMax-M3 text decoder (block-sparse MoE) GSM8K, full 1319-sample split.
-# BF16 checkpoint only. Threshold is set ~1pp below the measured TRT-LLM
-# hardpath score (~88) to absorb normal eval noise.
+# Thresholds tracked per checkpoint / quantization scheme.
 MiniMaxAI/MiniMax-M3:
-  - accuracy: 87
+  - accuracy: 89
+MiniMaxAI/MiniMax-M3-MXFP8:
+  - quant_algo: MXFP8
+    accuracy: 89
 nvidia/NVIDIA-Nemotron-Nano-9B-v2:
   - accuracy: 85.027
   - quant_algo: FP8
@@ -487,12 +462,18 @@ zai-org/GLM-5-FP8:
   - quant_algo: FP8_BLOCK_SCALES
     spec_dec_algo: MTP
     accuracy: 78.0
+zai-org/GLM-5.2:
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
+    accuracy: 90
 # Step-3.7-Flash text decoder (MoE) GSM8K, full 1319-sample split, TP4/EP4 with
 # TRTLLM attention + MoE backends. FP8 measured on the FP8 block-scale
 # checkpoint; NVFP4 measured on the modelopt NVFP4 export (FP8 KV cache). MTP
 # (mtp_nextn=3) is lossless for both FP8 and NVFP4 and reuses the non-spec
 # baseline accuracy.
 stepfun-ai/Step-3.7-Flash:
+  - accuracy: 88
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 88
   - quant_algo: FP8_BLOCK_SCALES

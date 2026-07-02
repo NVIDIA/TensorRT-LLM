@@ -223,8 +223,8 @@ args:
   max_seq_len: 2048
   max_batch_size: 16
   transforms:
-    detect_sharding:
-      support_partial_config: true
+    apply_sharding_hints:
+      allreduce_strategy: SYMM_MEM
     insert_cached_attention:
       backend: triton
     compile_model:

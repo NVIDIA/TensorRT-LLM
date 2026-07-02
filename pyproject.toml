@@ -19,7 +19,6 @@ column_limit = 80
 
 [tool.codespell]
 skip = ".git,3rdparty,triton_kernels,tests/integration/test_input_files**,**.jsonl,**.json"
-exclude-file = "examples/models/core/whisper/tokenizer.py"
 ignore-words-list = "rouge,inout,atleast,strat,nd,subtile,thrid,improbe,NotIn,te,iteract,anythin,tru,Tracin,vEw,dOut,indext,asend,medias"
 
 [tool.autoflake]
@@ -1081,7 +1080,6 @@ exclude = [
     "tests/unittest/_torch/ray_orchestrator/single_gpu/test_cache_transceiver_comm.py",
     "tests/unittest/_torch/sampler/test_beam_search.py",
     "tests/unittest/_torch/sampler/test_best_of_n.py",
-    "tests/unittest/_torch/sampler/test_torch_multi_arange.py",
     "tests/unittest/_torch/sampler/test_trtllm_sampler.py",
     "tests/unittest/_torch/speculative/test_draft_target.py",
     "tests/unittest/_torch/speculative/test_draft_token_tree_sampling.py",
@@ -1096,6 +1094,7 @@ exclude = [
     "tests/unittest/_torch/speculative/test_torch_rejection_sampling.py",
     "tests/unittest/_torch/speculative/test_user_provided.py",
     "tests/unittest/_torch/test_connector.py",
+    "tests/unittest/_torch/test_torch_multi_arange.py",
     "tests/unittest/_torch/thop/parallel/deep_gemm_tests.py",
     "tests/unittest/_torch/thop/parallel/test_causal_conv1d_op.py",
     "tests/unittest/_torch/thop/parallel/test_cublas_mm.py",

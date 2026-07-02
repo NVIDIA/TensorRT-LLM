@@ -33,13 +33,15 @@ def get_num_child_requests(request: ExecutorRequest) -> int:
 
 
 def collect_py_objects_from_requests(
-    requests: List, attribute_name: str
+    requests: List, attribute_name: str, include_none: bool = False
 ) -> Optional[Tuple[str, Dict]]:
     """Collect Python-only objects from requests.
 
     Args:
         requests: List of RequestQueueItem objects.
         attribute_name: Name of the attribute to collect.
+        include_none: Include requests whose attribute value is None. When
+            enabled, the source request must have the attribute.
 
     Returns:
         Tuple of (attribute_name, dict mapping request_id to object) or None if empty.
@@ -49,9 +51,12 @@ def collect_py_objects_from_requests(
         if not item.is_normal_request:
             continue
         if item.request:
-            obj = getattr(item.request, attribute_name, None)
-            if obj is not None:
-                req_id_to_obj[item.id] = obj
+            if include_none:
+                req_id_to_obj[item.id] = getattr(item.request, attribute_name)
+            else:
+                obj = getattr(item.request, attribute_name, None)
+                if obj is not None:
+                    req_id_to_obj[item.id] = obj
     return None if not req_id_to_obj else (attribute_name, req_id_to_obj)
 
 
@@ -65,9 +70,8 @@ def attach_py_objects_to_requests(requests: List, py_request_objects: Tuple) -> 
     for attr_name, req_obj_dict in py_request_objects:
         for item in requests:
             if item.request:
-                py_obj = req_obj_dict.get(item.id)
-                if py_obj is not None:
-                    setattr(item.request, attr_name, py_obj)
+                if item.id in req_obj_dict:
+                    setattr(item.request, attr_name, req_obj_dict[item.id])
 
 
 def derive_attention_dp_per_rank_request_cap(
@@ -252,19 +256,25 @@ def partition_context_for_helix(
     Returns:
         Tuple of (input_ids_this_rank, position_ids_this_rank, input_len, padding_len).
 
+        When num_total_blocks < cp_size, the highest-indexed CP ranks own no blocks
+        for this sequence; those empty ranks return empty token and position lists.
+        input_len still reflects the full prompt length so global position ids stay
+        correct.
+
     Raises:
-        ValueError: If there aren't enough tokens for at least one block per CP rank.
+        ValueError: If the prompt is empty (no blocks to distribute).
     """
     all_input_ids = torch.tensor(input_token_ids, dtype=torch.int64).unsqueeze(0)
     input_len = all_input_ids.shape[-1]
 
     num_total_blocks = (input_len + tokens_per_block - 1) // tokens_per_block
-    if num_total_blocks < cp_size:
-        raise ValueError(
-            f"There aren't enough tokens to get at least one block per CP rank. "
-            f"num_total_blocks {num_total_blocks} < num_cp_ranks {cp_size}. "
-            f"Please use smaller tokens_per_block for KV cache or reduce the number of CP ranks."
-        )
+    if num_total_blocks == 0:
+        raise ValueError("Cannot partition an empty prompt for Helix CP: num_total_blocks == 0.")
+    # NOTE: When num_total_blocks < cp_size, CP ranks in [num_total_blocks, cp_size)
+    # own zero blocks ("empty" ranks). This is supported: such ranks contribute a
+    # no-op (-inf, 0) to the Helix attention combine and receive zero KV blocks
+    # during cache transmission. Rank 0 always owns global block 0, so the combine
+    # denominator is never zero.
 
     # Pad the last (partial) block so every block has exactly tokens_per_block tokens.
     padding_len = 0
@@ -280,10 +290,14 @@ def partition_context_for_helix(
     input_id_blocks = list(all_input_ids.split(tokens_per_block, dim=-1))
     position_id_blocks = list(all_position_ids.split(tokens_per_block, dim=-1))
 
-    input_ids_this_rank = torch.cat(input_id_blocks[cp_rank::cp_size], dim=-1).flatten().tolist()
-    position_ids_this_rank = (
-        torch.cat(position_id_blocks[cp_rank::cp_size], dim=-1).flatten().tolist()
-    )
+    curank_input_blocks = input_id_blocks[cp_rank::cp_size]
+    curank_position_blocks = position_id_blocks[cp_rank::cp_size]
+    # Empty rank: this CP rank owns no blocks for this sequence (num_total_blocks < cp_size).
+    if len(curank_input_blocks) == 0:
+        return [], [], input_len, padding_len
+
+    input_ids_this_rank = torch.cat(curank_input_blocks, dim=-1).flatten().tolist()
+    position_ids_this_rank = torch.cat(curank_position_blocks, dim=-1).flatten().tolist()
 
     # The (single) padded block is the global last block; under round-robin it is owned by rank
     # (num_total_blocks - 1) % cp_size, and is the last local block on that rank. Strip its padding.
@@ -527,6 +541,9 @@ class RequestBroadcaster:
         py_disaggregated_params = collect_py_objects_from_requests(
             new_requests, "py_disaggregated_params"
         )
+        py_conversation_params = collect_py_objects_from_requests(
+            new_requests, "py_conversation_params", include_none=True
+        )
         py_lora_path = collect_py_objects_from_requests(new_requests, "py_lora_path")
 
         return tuple(
@@ -538,6 +555,7 @@ class RequestBroadcaster:
                     py_scheduling_params,
                     py_num_logprobs,
                     py_disaggregated_params,
+                    py_conversation_params,
                     py_lora_path,
                 ],
             )

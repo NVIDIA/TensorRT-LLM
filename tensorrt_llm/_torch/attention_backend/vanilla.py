@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 from typing import Optional
 
@@ -11,9 +14,9 @@ try:
 except ImportError:
     AttentionMaskConverter = None
 
-from .interface import (AttentionBackend, AttentionForwardArgs, AttentionMask,
-                        AttentionMetadata, PredefinedAttentionMask,
-                        merge_attention_forward_args)
+from .interface import (AttentionBackend, AttentionForwardArgs,
+                        AttentionInputType, AttentionMask, AttentionMetadata,
+                        PredefinedAttentionMask, merge_attention_forward_args)
 from .sparse.kernel import triton_index_gather
 from .sparse.params import SparseParams
 
@@ -60,6 +63,10 @@ def generate_sliding_window_mask(batch_size: int, target_length: int,
 
 class VanillaAttentionMetadata(AttentionMetadata):
 
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.kv_layout = "NHD"
+
     def prepare(self) -> None:
         super().prepare()
         # indices of used cache blocks for each sequence
@@ -99,6 +106,17 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         self.sparse_params = sparse_params
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
         self.q_scaling = q_scaling
+        mla_params = kwargs.get("mla_params", None)
+        self.is_mla_enable = mla_params is not None
+        if self.is_mla_enable:
+            self.kv_lora_rank = mla_params.kv_lora_rank
+            self.qk_rope_head_dim = mla_params.qk_rope_head_dim
+            self.qk_nope_head_dim = mla_params.qk_nope_head_dim
+            self.v_head_dim = mla_params.v_head_dim
+
+    @classmethod
+    def support_mla(cls) -> bool:
+        return True
 
     def _single_request_sparse_attn_predict(
             self, q: torch.Tensor, k: Optional[torch.Tensor],
@@ -241,26 +259,20 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         key_states = key_states.transpose(1, 2).to(q.dtype)
         value_states = value_states.transpose(1, 2).to(q.dtype)
 
-        # repeat kv to support MQA/GQA
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-
         # get qk scale
         qk_scale = None
         if self.q_scaling is not None:
             qk_scale = 1 / (math.sqrt(self.head_dim) * self.q_scaling)
 
-        # attention
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
+        return torch.nn.functional.scaled_dot_product_attention(
             q,
             key_states,
             value_states,
             is_causal=is_causal,
             attn_mask=attn_mask,
             scale=qk_scale,
+            enable_gqa=True,
         )
-
-        return attn_output
 
     def _single_request_forward(self,
                                 q,
@@ -294,12 +306,12 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             sparse_indices, kv_len = self._single_request_sparse_attn_predict(
                 q, k, v, kv_cache_tensor, metadata, past_seen_token, sample_idx)
 
-        # create attention mask
+        # Create attention mask.
         attn_mask, is_causal = self._single_request_create_attention_mask(
             attention_mask, past_seen_token, kv_len, q.device, q.size(2),
             attention_window_size)
 
-        # attention
+        # Run attention.
         attn_output = self._single_request_attn_forward(q, key_states,
                                                         value_states, is_causal,
                                                         attn_mask,
@@ -442,7 +454,6 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         """
         del max_seqlen_q, max_seqlen_k  # only seqlens / cu_seqlens are used
         is_causal = (attention_mask == PredefinedAttentionMask.CAUSAL)
-        num_kv_groups = num_heads // num_kv_heads
         num_requests = seqlens_q.numel()
 
         if seqlens_kv is None or cu_seqlens_k is None:
@@ -458,8 +469,6 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             q_s = q[start_q:end_q].transpose(0, 1).unsqueeze(0)
             k_s = k[start_k:end_k].transpose(0, 1).unsqueeze(0)
             v_s = v[start_k:end_k].transpose(0, 1).unsqueeze(0)
-            k_s = repeat_kv(k_s, num_kv_groups)
-            v_s = repeat_kv(v_s, num_kv_groups)
 
             qk_scale = None
             if self.q_scaling is not None:
@@ -473,11 +482,140 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                                                  k_s,
                                                  v_s,
                                                  is_causal=sdpa_is_causal,
-                                                 scale=qk_scale)
+                                                 scale=qk_scale,
+                                                 enable_gqa=True)
             outputs.append(out.squeeze(0).transpose(0, 1))
 
         result = torch.cat(outputs, dim=0)
         return result.reshape(result.size(0), -1)
+
+    def _mla_forward_generation(self, fused_q: torch.Tensor,
+                                metadata: VanillaAttentionMetadata,
+                                latent_cache: torch.Tensor) -> torch.Tensor:
+        """Absorbed MLA generation: MQA of ``fused_q`` over the latent cache.
+
+        The latent cache stores ``[compressed_kv | k_pe]`` with a single KV head
+        (head_dim ``kv_lora_rank + qk_rope_head_dim``). Each query head attends to
+        it (MQA); the value is the ``kv_lora_rank`` slice of the same entries, so
+        the output head_dim is ``kv_lora_rank``. RoPE is already applied to the
+        rope portions of ``fused_q`` / ``latent_cache`` by the MLA module
+        (``forward_absorption_generation``) before ``forward`` is called.
+
+        Mirrors :meth:`FlashInferAttention._mla_forward_generation`: the new
+        ``latent_cache`` tokens are appended to the paged cache, then attention
+        runs over the cached prefix plus the new tokens.
+        """
+        num_tokens = fused_q.shape[0]
+        d_latent = self.kv_lora_rank + self.qk_rope_head_dim
+        q = fused_q.view(num_tokens, self.num_heads, d_latent)
+
+        # MLA KV cache: NHD [num_pages, kv_factor=1, page_size, num_kv_heads=1,
+        # kv_lora_rank + qk_rope_head_dim]. Vanilla is single-block per sequence.
+        from .utils import append_mla_latent_cache
+        kv_cache = append_mla_latent_cache(
+            metadata.kv_cache_manager,
+            self.layer_idx,
+            metadata.request_ids,
+            metadata.seq_lens.tolist(),
+            metadata.kv_cache_params.num_cached_tokens_per_seq,
+            latent_cache,
+            kv_layout=metadata.kv_layout,
+        )
+        past = metadata.kv_cache_params.num_cached_tokens_per_seq
+        cache_indices = [
+            block_ids[0] for block_ids in metadata.block_ids_per_seq
+        ]
+
+        # MLA scales by the q/k head_dim (qk_nope + qk_rope), not the latent dim.
+        qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        scale = 1.0 / (math.sqrt(qk_head_dim) * (self.q_scaling or 1.0))
+
+        outputs = []
+        offset = 0
+        for i, q_len in enumerate(metadata.seq_lens.tolist()):
+            past_i = int(past[i])
+            ci = cache_indices[i]
+            kv_len = past_i + q_len
+
+            # K is the full latent ([compressed_kv | k_pe]); V is the kv_lora
+            # slice. One latent head broadcast (MQA) to all query heads.
+            latent = kv_cache[ci, 0, :kv_len, 0, :].to(q.dtype)
+            k = latent[None, None]  # [1, 1, kv_len, d_latent]
+            v = latent[None,
+                       None, :, :self.kv_lora_rank]  # [1, 1, kv_len, kv_lora]
+            qi = q[offset:offset + q_len].transpose(0,
+                                                    1)[None]  # [1, H, q_len, d]
+
+            attn_mask = None
+            if q_len > 1:
+                # MTP/causal: query j (cached position kv_len - q_len + j) may
+                # attend up to and including its own position. SDPA bool mask:
+                # True == participate.
+                rows = kv_len - q_len + torch.arange(q_len, device=q.device)
+                keep = (torch.arange(kv_len, device=q.device)[None, :]
+                        <= rows[:, None])
+                attn_mask = keep.view(1, 1, q_len, kv_len)
+
+            # enable_gqa broadcasts the single latent head to all query heads.
+            out = torch.nn.functional.scaled_dot_product_attention(
+                qi,
+                k,
+                v,
+                is_causal=False,
+                attn_mask=attn_mask,
+                scale=scale,
+                enable_gqa=True)  # [1, H, q_len, kv_lora]
+            outputs.append(out[0].transpose(0, 1).reshape(
+                q_len, self.num_heads * self.kv_lora_rank))
+            offset += q_len
+
+        return torch.cat(outputs, dim=0)
+
+    def _mla_forward_context(self, q: torch.Tensor, k: torch.Tensor,
+                             v: torch.Tensor,
+                             metadata: VanillaAttentionMetadata,
+                             latent_cache: torch.Tensor) -> torch.Tensor:
+        """Up-projected MLA context: causal MHA with asymmetric K/V.
+
+        The module up-projects compressed_kv to full per-head K/V, so this is
+        ordinary causal self-attention except the K head_dim (qk_nope + qk_rope)
+        differs from the V head_dim (v_head_dim). The latent cache append does
+        not affect this prefill output, but later generation reads it from the
+        same cache manager, so Vanilla mirrors the production backends and
+        appends it here.
+        """
+        from .utils import append_mla_latent_cache
+        append_mla_latent_cache(
+            metadata.kv_cache_manager,
+            self.layer_idx,
+            metadata.request_ids,
+            metadata.seq_lens.tolist(),
+            metadata.kv_cache_params.num_cached_tokens_per_seq,
+            latent_cache,
+            kv_layout=metadata.kv_layout,
+        )
+
+        qk_head = self.qk_nope_head_dim + self.qk_rope_head_dim
+        H = self.num_heads
+        q = q.view(-1, H, qk_head)
+        k = k.view(-1, self.num_kv_heads, qk_head)
+        v = v.view(-1, self.num_kv_heads, self.v_head_dim)
+        scale = 1.0 / (math.sqrt(qk_head) * (self.q_scaling or 1.0))
+
+        outputs = []
+        offset = 0
+        for s in metadata.seq_lens.tolist():
+            qi = q[offset:offset + s].transpose(0,
+                                                1)[None]  # [1, H, s, qk_head]
+            ki = k[offset:offset + s].transpose(0, 1)[None]
+            vi = v[offset:offset + s].transpose(0, 1)[None]
+            out = torch.nn.functional.scaled_dot_product_attention(
+                qi, ki, vi, is_causal=True, scale=scale,
+                enable_gqa=True)  # [1, H, s, v_head]
+            outputs.append(out[0].transpose(0,
+                                            1).reshape(s, H * self.v_head_dim))
+            offset += s
+        return torch.cat(outputs, dim=0)
 
     def forward(self,
                 q: torch.Tensor,
@@ -488,9 +626,27 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 **kwargs) -> torch.Tensor:
         forward_args = merge_attention_forward_args(forward_args, kwargs)
 
-        if forward_args.multi_item_part_lens is not None:
+        if metadata.multi_item_part_lens is not None:
             raise ValueError(
                 "Vanilla Attention does not support multi-item scoring")
+
+        if self.is_mla_enable:
+            if metadata.kv_cache_manager is None:
+                raise ValueError("Vanilla MLA requires a KV cache manager.")
+            if forward_args.latent_cache is None:
+                raise ValueError("Vanilla MLA requires latent_cache.")
+            if forward_args.attention_input_type == AttentionInputType.context_only:
+                assert k is not None and v is not None
+                return self._mla_forward_context(q, k, v, metadata,
+                                                 forward_args.latent_cache)
+            elif forward_args.attention_input_type == AttentionInputType.generation_only:
+                assert k is None and v is None
+                return self._mla_forward_generation(q, metadata,
+                                                    forward_args.latent_cache)
+            else:
+                raise ValueError(
+                    f"Unsupported attention input type: {forward_args.attention_input_type}"
+                )
 
         if metadata.kv_cache_manager is None:
             # NOTE: WAR for no kv cache attn e.g. BERT,
@@ -510,7 +666,8 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         cache_indices = [
             block_ids[0] for block_ids in metadata.block_ids_per_seq
         ]
-        kv_cache_tensor = metadata.kv_cache_manager.get_buffers(self.layer_idx)
+        kv_cache_tensor = metadata.kv_cache_manager.get_buffers(
+            self.layer_idx, kv_layout=metadata.kv_layout)
 
         q_len = q.size(0)
 

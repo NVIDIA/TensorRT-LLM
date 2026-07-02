@@ -389,7 +389,7 @@ accuracy_dict = {
 )
 def test_mla_chunked_prefill_dispatch_by_sm(sm_version, expected_path,
                                             monkeypatch):
-    import tensorrt_llm._torch.modules.attention as attention_module
+    import tensorrt_llm._torch.modules.mla as mla_module
 
     class FakeTrtllmAttention:
 
@@ -425,11 +425,9 @@ def test_mla_chunked_prefill_dispatch_by_sm(sm_version, expected_path,
         def forward_context_default(*_args, **_kwargs):
             return "default"
 
-    monkeypatch.setattr(attention_module, "TrtllmAttention",
-                        FakeTrtllmAttention)
-    monkeypatch.setattr(attention_module, "TrtllmAttentionMetadata",
-                        FakeMetadata)
-    monkeypatch.setattr(attention_module, "get_sm_version", lambda: sm_version)
+    monkeypatch.setattr(mla_module, "TrtllmAttention", FakeTrtllmAttention)
+    monkeypatch.setattr(mla_module, "TrtllmAttentionMetadata", FakeMetadata)
+    monkeypatch.setattr(mla_module, "get_sm_version", lambda: sm_version)
 
     q = torch.empty((1, 8), dtype=torch.float16)
     compressed_kv = torch.empty((1, 4), dtype=torch.float16)
@@ -438,7 +436,7 @@ def test_mla_chunked_prefill_dispatch_by_sm(sm_version, expected_path,
     output = torch.empty((1, 8), dtype=torch.float16)
     latent_cache = torch.empty((1, 1, 8), dtype=torch.float16)
 
-    result = attention_module.MLA.forward_context(
+    result = mla_module.MLA.forward_context(
         FakeAttention(),
         q,
         compressed_kv,

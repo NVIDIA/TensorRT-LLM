@@ -12,7 +12,7 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: Qwen/Qwen3-0.6B
   config_id: default_ws_1
-  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'enable_sharder_ir.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: apple/OpenELM-270M-Instruct
   config_id: openelm
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
@@ -63,10 +63,10 @@ models:
 #   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: Qwen/Qwen3-4B
   config_id: default_ws_1
-  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'enable_sharder_ir.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: Qwen/Qwen3-8B
   config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'enable_sharder_ir.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 # RuntimeError: a and b must have same reduction dim, but got [s44*s70, 5120] X [2560, 5120]. See https://github.com/NVIDIA/TensorRT-LLM/issues/14679
 # - name: microsoft/phi-4
 #   config_id: default_ws_2
@@ -176,10 +176,10 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: nvidia/NVIDIA-Nemotron-Nano-9B-v2-FP8
   config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'enable_sharder_ir.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4
   config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'enable_sharder_ir.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 # ValueError: Unrecognized configuration class <class 'transformers_modules._7394488badb786e1decc0e00e308de1cab9560e6.configuration.NemotronH_Nano_VL_V2_Config'> for this kind of AutoModel: AutoModelForImageTextToText.
 # - name: nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-FP8
 #   config_id: multimodal
@@ -242,7 +242,7 @@ models:
 # torch.AcceleratorError: CUDA error: device-side assert triggered
 # - name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8
 #   config_id: nano_v3
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'nano_v3.yaml', 'enable_sharder_ir.yaml']
+#   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'nano_v3.yaml']
 - name: Qwen/QwQ-32B-Preview
   config_id: default_ws_4
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
@@ -305,10 +305,10 @@ models:
 # OOM during AutoDeploy run.
 # - name: deepseek-ai/DeepSeek-R1
 #   config_id: deepseek_r1
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'deepseek-r1.yaml', 'enable_sharder_ir.yaml']
+#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'deepseek-r1.yaml']
 - name: deepseek-ai/DeepSeek-R1-0528
   config_id: deepseek_r1
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'deepseek-r1.yaml', 'enable_sharder_ir.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'deepseek-r1.yaml']
 # OOM during AutoDeploy run.
 # - name: deepseek-ai/DeepSeek-Coder-V2-Instruct
 #   config_id: deepseek_v2_ep
@@ -348,7 +348,7 @@ models:
 # - name: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
 #   config_id: super_v3_mtp
 #   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'super_v3_mtp.yaml',
-#     'enable_sharder_ir.yaml']
+#     ]
 - name: zai-org/GLM-4.7-Flash
   config_id: glm_4_7_flash
   yaml_extra: ['glm-4.7-flash.yaml']
@@ -370,10 +370,10 @@ models:
 # --- Qwen3.5 MoE (Feb 2026) ---
 - name: Qwen/Qwen3.5-35B-A3B
   config_id: qwen3_5_moe_35b
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'qwen3.5_moe_35b.yaml', 'enable_sharder_ir.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'qwen3.5_moe_35b.yaml']
 - name: Qwen/Qwen3.5-397B-A17B
   config_id: qwen3_5_moe_400b
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'qwen3.5_moe_400b.yaml', 'enable_sharder_ir.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'qwen3.5_moe_400b.yaml']
 # --- GLM-5 (Feb 2026) ---
 - name: zai-org/GLM-5
   config_id: glm_5
@@ -512,7 +512,7 @@ models:
 # --- Qwen3 Instruct 2507 update ---
 - name: Qwen/Qwen3-4B-Instruct-2507
   config_id: default_ws_1
-  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'enable_sharder_ir.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 # --- SmolLM3 (Jul 2025) ---
 - name: HuggingFaceTB/SmolLM3-3B
   config_id: default_ws_1
@@ -539,7 +539,13 @@ models:
 - name: google/gemma-4-26B-A4B-it
   config_id: gemma4_moe
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'gemma4_moe.yaml']
+- name: nvidia/Gemma-4-26B-A4B-NVFP4
+  config_id: gemma4_moe
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'gemma4_moe.yaml']
 # --- Gemma 4 (2026) - Dense 31B ---
+- name: nvidia/Gemma-4-31B-IT-NVFP4
+  config_id: gemma4_dense
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'gemma4_dense.yaml']
 # AttributeError: 'GraphModule' object has no attribute 'get_per_layer_inputs'
 # - name: google/gemma-4-31B-it
 #   config_id: gemma4_dense
@@ -551,14 +557,14 @@ models:
 # --- Qwen3 missing sizes (May 2025) ---
 - name: Qwen/Qwen3-1.7B
   config_id: default_ws_1
-  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'enable_sharder_ir.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: Qwen/Qwen3-32B
   config_id: default_ws_4
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'enable_sharder_ir.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 # --- DeepSeek R1-0528 (May 2025) ---
 - name: deepseek-ai/DeepSeek-R1-0528-Qwen3-8B
   config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'enable_sharder_ir.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 # --- Llama 4 base models (Apr 2025) ---
 # OOM during AutoDeploy run.
 # - name: meta-llama/Llama-4-Scout-17B-16E
@@ -641,7 +647,7 @@ models:
 # RuntimeError: NVRTC compilation failed. See https://github.com/NVIDIA/TensorRT-LLM/issues/14676
 # - name: deepseek-ai/DeepSeek-Prover-V2-671B
 #   config_id: num_hidden_layers_5
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml', 'enable_sharder_ir.yaml']
+#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']
 # --- OLMo 2 (Mar 2025) ---
 - name: allenai/OLMo-2-0325-32B-Instruct
   config_id: default_ws_1
@@ -695,12 +701,12 @@ models:
 # --- Qwen3-14B (May 2025) ---
 - name: Qwen/Qwen3-14B
   config_id: default_ws_4
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'enable_sharder_ir.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 # --- DeepSeek V3 (Jan 2025) ---
 # RuntimeError: NVRTC compilation failed. See https://github.com/NVIDIA/TensorRT-LLM/issues/14676
 # - name: deepseek-ai/DeepSeek-V3
 #   config_id: num_hidden_layers_5
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml', 'enable_sharder_ir.yaml']
+#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']
 # --- Qwen2.5 larger sizes ---
 - name: Qwen/Qwen2.5-14B-Instruct
   config_id: default_ws_4
@@ -716,7 +722,7 @@ models:
 # --- Nvidia Nemotron 3 Nano (2025) ---
 - name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
   config_id: nano_v3
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'nano_v3.yaml', 'enable_sharder_ir.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'nano_v3.yaml']
 - name: nvidia/NVIDIA-Nemotron-Nano-12B-v2
   config_id: default_ws_2
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
@@ -727,7 +733,7 @@ models:
 # RuntimeError: NVRTC compilation failed. See https://github.com/NVIDIA/TensorRT-LLM/issues/14676
 # - name: Qwen/Qwen3-0.6B-FP8
 #   config_id: qwen3_fp8_bf16
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'qwen3_fp8_bf16.yaml', 'enable_sharder_ir.yaml']
+#   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'qwen3_fp8_bf16.yaml']
 # --- Qwen3-VL 2B (2025) ---
 # Timed out after AutoDeploy compile in multimodal run.
 # - name: Qwen/Qwen3-VL-2B-Instruct
@@ -826,8 +832,8 @@ models:
 # tensorrt_llm.executor.utils.RequestError: Triton Error [CUDA]: device-side assert triggered
 # - name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8
 #   config_id: nano_v3__enable_sharder_ir
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'nano_v3.yaml', 'enable_sharder_ir.yaml']
+#   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'nano_v3.yaml']
 # OOM during AutoDeploy run.
 # - name: deepseek-ai/DeepSeek-R1
 #   config_id: num_hidden_layers_5__enable_sharder_ir
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml', 'enable_sharder_ir.yaml']
+#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']

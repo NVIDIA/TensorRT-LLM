@@ -17,6 +17,7 @@ from tensorrt_llm._torch.attention_backend.interface import AttentionRuntimeFeat
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -193,6 +194,21 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
                     module, "_weights_removed", False
                 ):
                     module.post_load_weights()
+
+        # PyTorchModelEngine builds the vision encoders' AttentionMetadata after
+        # load via `_set_up_multimodal_encoder_attn_metadata`. These standalone
+        # model tests don't go through the engine, so mirror that walk here --
+        # otherwise the encoder forward raises on an uninitialized attn_metadata.
+        for module in model.modules():
+            if isinstance(module, MultimodalEncoderMixin):
+                module.setup_attn_metadata(
+                    # Encoder batch axis (image/sequence count) is a distinct
+                    # budget from the token axis; mirror the engine's
+                    # max_batch_size default. Qwen-family subclasses floor this
+                    # up to max_num_tokens internally for windowed fan-out.
+                    max_num_requests=2048,
+                    max_num_tokens=model_config.max_num_tokens,
+                )
 
         return model, model_config
 

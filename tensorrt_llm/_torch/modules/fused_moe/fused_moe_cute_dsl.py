@@ -852,6 +852,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             self,
             x: Union[torch.Tensor, Fp4QuantizedTensor],
             router_logits: torch.Tensor,
+            input_ids: Optional[torch.IntTensor] = None,
             output_dtype: Optional[torch.dtype] = None,
             all_rank_num_tokens: Optional[List[int]] = None,
             use_dp_padding: Optional[bool] = None,
@@ -861,7 +862,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         # This forward_chunk method is a reference implementation of the legacy path.
         # Apply routing
         token_selected_experts, token_final_scales = self.routing_method.apply(
-            router_logits)
+            router_logits, input_ids)
         assert token_selected_experts.shape[
             1] == self.routing_method.experts_per_token
         assert token_selected_experts.shape == token_final_scales.shape

@@ -32,6 +32,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           CudaGraphConfig,
                                           DecodeCudaGraphConfig,
                                           DecodingBaseConfig,
+                                          DeepSeekV4SparseAttentionConfig,
                                           DynamicBatchConfig,
                                           Eagle3DecodingConfig,
                                           EagleDecodingConfig,
@@ -40,8 +41,10 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           ExtendedRuntimePerfKnobConfig,
                                           KvCacheConfig,
                                           LookaheadDecodingConfig, MoeConfig,
-                                          MTPDecodingConfig, PeftCacheConfig,
-                                          PybindMirror, RayPlacementConfig,
+                                          MTPDecodingConfig, MultimodalConfig,
+                                          MultimodalEncoderCudaGraphConfig,
+                                          PeftCacheConfig, PybindMirror,
+                                          RayPlacementConfig,
                                           SkipSoftmaxAttentionConfig,
                                           SleepConfig, SpeculativeConfig,
                                           StrictBaseModel, TorchCompileConfig,
@@ -189,6 +192,63 @@ model_kwargs:
         assert llm_args.model_kwargs['num_hidden_layers'] == 2
 
 
+@pytest.mark.parametrize("llm_args_cls", [TorchLlmArgs])
+class TestEncoderRuntimeSizes:
+    """Cover encoder runtime size fields and fallback to LLM limits.
+
+    `encoder_max_batch_size` / `encoder_max_num_tokens` are user-facing
+    knobs that size multimodal encoder AttentionMetadata; when unset they
+    fall back to the LLM-side `max_batch_size` / `max_num_tokens`. They are
+    PyTorch-backend only (the multimodal encoder profiling path), so they
+    live on `TorchLlmArgs` rather than the shared `BaseLlmArgs`.
+    """
+
+    def test_defaults_are_none(self, llm_args_cls):
+        llm_args = llm_args_cls(model=llama_model_path)
+        assert llm_args.encoder_max_batch_size is None
+        assert llm_args.encoder_max_num_tokens is None
+
+    @pytest.mark.parametrize(
+        "kwargs, expected_runtime_sizes",
+        [
+            # Neither encoder knob set -- falls back to LLM limits.
+            (dict(max_batch_size=64, max_num_tokens=2048), (64, 2048)),
+            # Only encoder_max_batch_size overrides.
+            (dict(max_batch_size=64,
+                  max_num_tokens=2048,
+                  encoder_max_batch_size=512), (512, 2048)),
+            # Only encoder_max_num_tokens overrides.
+            (dict(max_batch_size=64,
+                  max_num_tokens=2048,
+                  encoder_max_num_tokens=32768), (64, 32768)),
+            # Both encoder knobs override.
+            (dict(max_batch_size=64,
+                  max_num_tokens=2048,
+                  encoder_max_batch_size=512,
+                  encoder_max_num_tokens=32768), (512, 32768)),
+        ],
+        ids=["fallback", "only_batch", "only_tokens", "both"],
+    )
+    def test_get_encoder_runtime_sizes(self, llm_args_cls, kwargs,
+                                       expected_runtime_sizes):
+        llm_args = llm_args_cls(model=llama_model_path, **kwargs)
+        assert llm_args.get_encoder_runtime_sizes() == expected_runtime_sizes
+
+    @pytest.mark.parametrize(
+        "field_name, invalid_value",
+        [
+            ("encoder_max_batch_size", 0),
+            ("encoder_max_batch_size", -1),
+            ("encoder_max_num_tokens", 0),
+            ("encoder_max_num_tokens", -1),
+        ],
+    )
+    def test_rejects_non_positive(self, llm_args_cls, field_name,
+                                  invalid_value):
+        with pytest.raises(ValidationError):
+            llm_args_cls(model=llama_model_path, **{field_name: invalid_value})
+
+
 def test_decoding_type_eagle3_parses_to_eagle3_decoding_config():
     adapter = TypeAdapter(SpeculativeConfig)
     spec_cfg = adapter.validate_python(
@@ -224,6 +284,20 @@ def test_decoding_type_eagle3_errors_on_tensorrt_backend():
     with pytest.raises(ValueError,
                        match="only supported on the PyTorch backend"):
         TrtLlmArgs(model=llama_model_path, speculative_config=spec_cfg)
+
+
+def test_post_processor_hook_rejected_with_skip_tokenizer_init():
+    """post_processor_hook + skip_tokenizer_init must fail fast.
+
+    The hook is a text-based guardrail; pairing it with skip_tokenizer_init (no
+    detokenized text) must be rejected rather than silently disabling it.
+    """
+    with pytest.raises(ValidationError, match="skip_tokenizer_init"):
+        TorchLlmArgs(model="/tmp/dummy_model",
+                     skip_tokenizer_init=True,
+                     post_processor_hook="my_pkg.guardrail.Hook")
+    # skip_tokenizer_init alone (no hook) is still fine.
+    TorchLlmArgs(model="/tmp/dummy_model", skip_tokenizer_init=True)
 
 
 class TestModelDefaults:
@@ -333,6 +407,8 @@ class TestModelDefaults:
 
 
 def test_KvCacheConfig_declaration():
+    assert KvCacheConfig().kv_cache_event_hash_algo == "auto"
+
     config = KvCacheConfig(enable_block_reuse=True,
                            max_tokens=1024,
                            max_attention_window=[1024, 1024, 1024],
@@ -343,6 +419,7 @@ def test_KvCacheConfig_declaration():
                            cross_kv_cache_fraction=0.5,
                            secondary_offload_min_priority=1,
                            event_buffer_max_size=0,
+                           kv_cache_event_hash_algo="v2_sha256_64",
                            enable_partial_reuse=True,
                            copy_on_partial_reuse=True,
                            attention_dp_events_gather_period_ms=10)
@@ -358,6 +435,11 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.cross_kv_cache_fraction == 0.5
     assert pybind_config.secondary_offload_min_priority == 1
     assert pybind_config.event_buffer_max_size == 0
+    assert config.kv_cache_event_hash_algo == "v2_sha256_64"
+    assert KvCacheConfig(
+        kv_cache_event_hash_algo="auto").kv_cache_event_hash_algo == "auto"
+    assert KvCacheConfig(kv_cache_event_hash_algo="v1_block_key"
+                         ).kv_cache_event_hash_algo == "v1_block_key"
     assert pybind_config.enable_partial_reuse == True
     assert pybind_config.copy_on_partial_reuse == True
     assert pybind_config.attention_dp_events_gather_period_ms == 10
@@ -372,6 +454,85 @@ def test_KvCacheConfig_disk_cache_validation(tmp_path):
     with pytest.raises(ValidationError) as exc_info:
         KvCacheConfig(disk_cache_size=2048)
     assert "disk_cache_path" in str(exc_info.value)
+
+
+class TestMultimodalEncoderCudaGraphConfig:
+
+    def test_minimal_required_fields(self):
+        config = MultimodalEncoderCudaGraphConfig(buckets=[(1035, 1)])
+        assert config.buckets == [(1035, 1)]
+        assert config.enable_padding is True
+        assert config.warmup_steps == 2
+        assert config.enable_replay_stats is False
+
+        config = MultimodalEncoderCudaGraphConfig(buckets=[(1035, 1)],
+                                                  enable_replay_stats=True)
+        assert config.enable_replay_stats is True
+
+    def test_explicit_buckets_deduped_and_sorted(self):
+        config = MultimodalEncoderCudaGraphConfig(buckets=[(2069,
+                                                            2), (1035,
+                                                                 1), (2069, 2)])
+        assert config.buckets == [(1035, 1), (2069, 2)]
+
+    def test_explicit_buckets_accept_yaml_style_lists(self):
+        config = MultimodalEncoderCudaGraphConfig(
+            buckets=[[2069, 2], [1035, 1]])
+        assert config.buckets == [(1035, 1), (2069, 2)]
+
+    @pytest.mark.parametrize("kwargs", [{
+        "buckets": []
+    }, {}],
+                             ids=["empty", "missing"])
+    def test_rejects_absent_buckets(self, kwargs):
+        with pytest.raises(ValidationError):
+            MultimodalEncoderCudaGraphConfig(**kwargs)
+
+    @pytest.mark.parametrize("buckets", [[(0, 1)], [(1, -2)], [(3, 0)]])
+    def test_rejects_non_positive_buckets(self, buckets):
+        with pytest.raises(ValidationError):
+            MultimodalEncoderCudaGraphConfig(buckets=buckets)
+
+    def test_rejects_buckets_with_too_few_tokens(self):
+        with pytest.raises(ValidationError):
+            MultimodalEncoderCudaGraphConfig(buckets=[(1, 2)])
+
+
+class TestMultimodalConfig:
+
+    def test_default_encoder_cuda_graph_is_none(self):
+        assert MultimodalConfig().encoder_cuda_graph is None
+
+    def test_torch_llm_args_default_multimodal_config(self):
+        args = TorchLlmArgs(model=llama_model_path)
+        assert isinstance(args.multimodal_config, MultimodalConfig)
+        assert args.multimodal_config.encoder_cuda_graph is None
+
+    def test_torch_llm_args_with_encoder_cuda_graph_buckets(self):
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            multimodal_config=MultimodalConfig(
+                encoder_cuda_graph={
+                    "vision":
+                    MultimodalEncoderCudaGraphConfig(buckets=[(1035,
+                                                               1), (2069, 2)])
+                }))
+        encoder_graph = args.multimodal_config.encoder_cuda_graph
+        assert encoder_graph["vision"].buckets == [(1035, 1), (2069, 2)]
+
+    def test_torch_llm_args_with_encoder_cuda_graph_buckets_yaml(self):
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            multimodal_config={
+                "encoder_cuda_graph": {
+                    "vision": {
+                        "buckets": [[2069, 2], [1035, 1]]
+                    }
+                }
+            },
+        )
+        encoder_graph = args.multimodal_config.encoder_cuda_graph
+        assert encoder_graph["vision"].buckets == [(1035, 1), (2069, 2)]
 
 
 def test_CapacitySchedulerPolicy():
@@ -480,20 +641,27 @@ def test_DynamicBatchConfig_declaration():
     assert pybind_config.dynamic_batch_moving_average_window == 10
 
 
-def test_SchedulerConfig_declaration():
+def test_SchedulerConfig_declaration() -> None:
+    default_config = SchedulerConfig()
+    default_pybind_config = PybindMirror.maybe_to_pybind(default_config)
+    assert default_config.enable_prefix_aware_scheduling is True
+    assert default_pybind_config.enable_prefix_aware_scheduling is True
+
     config = SchedulerConfig(
         capacity_scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
         context_chunking_policy=ContextChunkingPolicy.EQUAL_PROGRESS,
         dynamic_batch_config=DynamicBatchConfig(
             enable_batch_size_tuning=True,
             enable_max_num_tokens_tuning=True,
-            dynamic_batch_moving_average_window=10))
+            dynamic_batch_moving_average_window=10),
+        enable_prefix_aware_scheduling=False)
 
     pybind_config = PybindMirror.maybe_to_pybind(config)
     assert pybind_config.capacity_scheduler_policy == tle.CapacitySchedulerPolicy.MAX_UTILIZATION
     assert pybind_config.context_chunking_policy == tle.ContextChunkingPolicy.EQUAL_PROGRESS
     assert PybindMirror.pybind_equals(pybind_config.dynamic_batch_config,
                                       config.dynamic_batch_config._to_pybind())
+    assert pybind_config.enable_prefix_aware_scheduling is False
 
 
 def test_PeftCacheConfig_declaration():
@@ -1651,6 +1819,7 @@ class TestStrictBaseModelArbitraryArgs:
                                         max_tokens_in_buffer=1024)
         assert config.backend == "UCX"
         assert config.max_tokens_in_buffer == 1024
+        assert config.kv_transfer_poll_interval_ms == 5000
 
         # Arbitrary arguments should be rejected
         with pytest.raises(
@@ -2677,3 +2846,16 @@ sparse_attention_config:
 
         assert params.threshold_scale_factor_prefill == pytest.approx(
             100.0 * math.exp(5.0 * 0.5))
+
+
+class TestDeepSeekV4SparseAttentionConfig:
+
+    def test_zero_compress_ratios_are_normalized(self):
+        config = DeepSeekV4SparseAttentionConfig(compress_ratios=[0, 4, 128])
+
+        assert config.compress_ratios == [1, 4, 128]
+
+    @pytest.mark.parametrize("compress_ratios", [[], [-1, 4, 128]])
+    def test_invalid_compress_ratios_raise(self, compress_ratios):
+        with pytest.raises(ValidationError, match="compress_ratios"):
+            DeepSeekV4SparseAttentionConfig(compress_ratios=compress_ratios)

@@ -75,6 +75,7 @@ Welcome to TensorRT LLM's Documentation!
    features/quantization.md
    features/sampling.md
    features/additional-outputs.md
+   features/post-processor-hook.md
    features/guided-decoding.md
    features/speculative-decoding.md
    features/checkpoint-loading.md
@@ -127,10 +128,9 @@ Welcome to TensorRT LLM's Documentation!
 
 .. toctree::
    :maxdepth: 2
-   :caption: Use TensorRT Engine
-   :hidden:
+   :caption: Migration
 
-   legacy/tensorrt_quickstart.md
+   legacy/tensorrt-backend-removal.md
 
 Indices and tables
 ==================

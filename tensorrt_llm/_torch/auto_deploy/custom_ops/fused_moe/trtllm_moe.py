@@ -19,13 +19,86 @@ import torch
 
 from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._torch.modules.fused_moe.routing import RoutingMethodType
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
 
 from ..._compat import ActivationType, is_sm_100f
+from ...utils.cuda_graph import cuda_graph_state
 from ...utils.dist_config import DistConfig
 from ..quantization.quant import TRTLLM_NVFP4_SCALING_VECTOR_SIZE
 
 _f32_scale_cache: dict = {}
+
+
+def _hybrid_runtime_max_tokens_per_rank(
+    local_num_tokens: int,
+    ep_size: int,
+    max_num_tokens: int,
+) -> int:
+    """Pick the MoE all-to-all per-rank token budget (dispatch/sanitize/combine/GEMM stride).
+
+    Hybrid of the cross-rank-max (per-layer ``.item()``) and static-``max_num_tokens``
+    strategies that avoids the pitfalls of each. Callers never pad ``x``: the dispatch kernel
+    writes only the real ``local_num_tokens`` rows and ``moe_a2a_sanitize_expert_ids``
+    invalidates the unfilled slots, so the returned value controls only the workspace stride /
+    recv-view / GEMM row count, not how many real rows are moved.
+
+    - **Capture / warm-up path** (decode/extend): use ``local_num_tokens``. Under attention-DP
+      every rank pads to the same ``cg_batch_size``, so the per-rank count already equals the
+      cross-rank max for the captured bucket, and at pure-decode replay it stays consistent.
+      It is a *shape*, not a device scalar, so there is **no per-layer ``.item()`` host read**
+      (the cost that made the cross-rank-max read regress at low concurrency). Mixed
+      prefill/decode — where a captured value would be stale — is routed to eager by
+      ``maybe_pad_for_cuda_graph`` via ``BypassCapturedGraphs()`` (#13718), so the captured
+      path only sees the uniform decode shape. The tight budget is taken only while the
+      resulting MoE-GEMM row count (``budget * ep_size``) stays in the fast small-M
+      ``bmm_E2m1`` tactic region; above the gate the trtllm-gen autotuner picks a
+      launch-latency-bound tactic, so fall back to the big-M
+      ``max_num_tokens`` budget.
+
+    - **Eager path** (prefill, or any step the bypass forced eager): use ``max_num_tokens``.
+      It is a constant every rank computes identically (layout agrees across ranks) and
+      involves no host sync. Prefill is compute-bound, so the fat recv view is amortized.
+    """
+    if torch.cuda.is_current_stream_capturing() or cuda_graph_state.in_warm_up():
+        budget = local_num_tokens
+        # Only take the tight budget while the MoE-GEMM row count (budget * ep_size) stays in
+        # the fast small-M trtllm-gen tactic region; above it the autotuner switches to a
+        # launch-latency-bound tactic.
+        # The threshold is on the FC1 grouped-GEMM's row dimension M, because that's what the
+        # trtllm-gen autotuner selects the kernel tactic from — and that M is budget × ep_size
+        # TODO: remove this WAR https://github.com/NVIDIA/TensorRT-LLM/issues/15167
+        # See: https://nvbugspro.nvidia.com/bug/6247543
+        if budget > 0 and budget * ep_size * 4 <= max_num_tokens:
+            return budget
+    return max_num_tokens
+
+
+def _router_use_tinygemm(x2d: torch.Tensor, weight: torch.Tensor, bias) -> bool:
+    """Whether the router GEMM may use tinygemm2 (else fall back to F.linear).
+
+    Encodes tinygemm2's hard preconditions (thop CHECK_INPUT: CUDA + contiguous +
+    bf16; bias required; SM90/100/103) plus the small-M decode regime where it wins.
+    Any unmet condition (prefill, non-bf16, non-contiguous, no bias, other arch)
+    silently falls back to F.linear — no hard failure.
+    """
+    # Router GEMM uses TRT-LLM tinygemm2 (single-kernel tall-skinny GEMM, no cuBLAS split-K + splitKreduce) for small-M
+    # decode, matching PT's compute_gate_output. Above this token count cuBLAS GEMM is preferred (tinygemm2
+    # specialization no longer wins and its accumulation diverges); same threshold PT uses.
+    _MIN_LATENCY_TINYGEMM_NUM_TOKENS = 128
+    # tinygemm2 only supports these SM archs (see thop/tinygemm2.cpp).
+    _TINYGEMM_SM = (90, 100, 103)
+    return (
+        bias is not None
+        and get_sm_version() in _TINYGEMM_SM
+        and x2d.shape[0] <= _MIN_LATENCY_TINYGEMM_NUM_TOKENS
+        and x2d.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and bias.dtype == torch.bfloat16
+        and x2d.is_contiguous()
+        and weight.is_contiguous()
+        and bias.is_contiguous()
+    )
 
 
 def _get_cached_f32_scale(scale: torch.Tensor) -> torch.Tensor:
@@ -180,7 +253,6 @@ def _run_moe_with_alltoall(
     use_deepseek_fp8_block_scale: bool = False,
     finegrained_fp8_block_scales: Tuple[torch.Tensor, torch.Tensor] | None = None,
     is_gated_mlp: bool = True,
-    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Execute MoE with all-to-all dispatch/combine pattern.
@@ -224,11 +296,6 @@ def _run_moe_with_alltoall(
             ``use_deepseek_fp8_block_scale`` internally.
         is_gated_mlp: Whether gated MLP is used. Needed by the Blackwell finegrained
             FP8 path to compute ``intermediate_size``.
-        batch_info_host: Pinned-host int tensor managed by ``BatchInfo``. When
-            provided, slot 14 (``max_dp_num_tokens``) is read at capture time as
-            ``runtime_max_tokens_per_rank`` (the cross-rank max of
-            ``total_num_tokens``, computed pre-forward by the AD shim via
-            ``tp_allgather``). When ``None``, falls back to ``max_num_tokens``.
 
     Returns:
         2-D output tensor ``(num_tokens, hidden_size)`` — the caller reshapes to the
@@ -241,18 +308,12 @@ def _run_moe_with_alltoall(
     local_num_experts = fc1_expert_weights.shape[0]
     global_num_experts = local_num_experts * mapping.moe_ep_size
 
-    # runtime_max_tokens_per_rank: max(total_num_tokens) across DP ranks.
-    # Mirrors base TRT-LLM's `runtime_max_tokens_per_rank = max(all_rank_num_tokens)`
-    # in fused_moe_cutlass.py / fused_moe_trtllm_gen.py. AD's shim writes slot 14
-    # pre-forward via `tp_allgather` of `total_num_tokens` (when attention-DP is on);
-    # nest_sequences seeds slot 14 with the local total as a safe default. See
-    # ``BatchInfo`` in attention_interface.py for the full slot layout.
-    if batch_info_host is not None:
-        runtime_max_tokens_per_rank = int(batch_info_host[14].item())
-        if runtime_max_tokens_per_rank <= 0:
-            runtime_max_tokens_per_rank = max_num_tokens
-    else:
-        runtime_max_tokens_per_rank = max_num_tokens
+    # Hybrid per-rank token budget: tight (= local count) under capture, static under eager.
+    # See _hybrid_runtime_max_tokens_per_rank.
+    local_num_tokens = x.shape[0]
+    runtime_max_tokens_per_rank = _hybrid_runtime_max_tokens_per_rank(
+        local_num_tokens, mapping.moe_ep_size, max_num_tokens
+    )
 
     # Workspace must be sized for the LARGEST element type used by dispatch or combine.
     # The input x may be quantized (fp8/fp4), but combine outputs in the model dtype
@@ -271,20 +332,10 @@ def _run_moe_with_alltoall(
 
     invalid_expert_id = global_num_experts
 
-    # Pad inputs to runtime_max_tokens_per_rank so all ranks send the same number
-    # of rows through dispatch.  Padding expert IDs must route to a VALID rank
-    # (the local rank's first expert), otherwise the dispatch kernel computes an
-    # out-of-bounds target rank.  Zero routing weights ensure padding tokens
-    # contribute nothing to the output.
-    local_num_tokens = x.shape[0]
-    pad_expert_id = mapping.moe_ep_rank * local_num_experts  # routes to local rank
-    pad_size = runtime_max_tokens_per_rank - local_num_tokens
-    if pad_size > 0:
-        x = torch.nn.functional.pad(x, (0, 0, 0, pad_size))  # pad rows with zeros
-        selected_experts = torch.nn.functional.pad(
-            selected_experts, (0, 0, 0, pad_size), value=pad_expert_id
-        )
-        routing_weights = torch.nn.functional.pad(routing_weights, (0, 0, 0, pad_size))
+    # Do NOT pad x to runtime_max_tokens_per_rank: the dispatch kernel writes only the real
+    # ``local_num_tokens`` rows per rank, and moe_a2a_sanitize_expert_ids marks the unfilled
+    # slots invalid so the downstream MoE GEMM skips them. ``runtime_max_tokens_per_rank``
+    # controls only the workspace stride / recv-view shape.
 
     # Build payload list: x, selected_experts, routing_weights
     payloads = [x.contiguous(), selected_experts.contiguous(), routing_weights.contiguous()]
@@ -415,7 +466,6 @@ def _run_trtllm_gen_nvfp4_moe_with_alltoall(
     mapping: Mapping,
     max_num_tokens: int,
     act_type: int,
-    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run TRTLLM-Gen NVFP4 MoE through the all-to-all dispatch/combine path."""
 
@@ -423,13 +473,12 @@ def _run_trtllm_gen_nvfp4_moe_with_alltoall(
     hidden_size = x.shape[-1]
     local_num_experts = int(fc1_expert_weights_fp4.shape[0])
     global_num_experts = local_num_experts * mapping.moe_ep_size
-    # See _run_moe_with_alltoall above for the slot-14 contract.
-    if batch_info_host is not None:
-        runtime_max_tokens_per_rank = int(batch_info_host[14].item())
-        if runtime_max_tokens_per_rank <= 0:
-            runtime_max_tokens_per_rank = max_num_tokens
-    else:
-        runtime_max_tokens_per_rank = max_num_tokens
+    # Hybrid per-rank token budget (see _hybrid_runtime_max_tokens_per_rank): tight local
+    # shape under capture, static max_num_tokens under eager; no slot-13 .item(), no x pad.
+    local_num_tokens = x.shape[0]
+    runtime_max_tokens_per_rank = _hybrid_runtime_max_tokens_per_rank(
+        local_num_tokens, mapping.moe_ep_size, max_num_tokens
+    )
 
     moe_a2a = _GlobalMoeAll2AllCache.get_alltoall(
         mapping=mapping,
@@ -442,16 +491,7 @@ def _run_trtllm_gen_nvfp4_moe_with_alltoall(
     )
 
     invalid_expert_id = global_num_experts
-    local_num_tokens = x.shape[0]
-    pad_expert_id = mapping.moe_ep_rank * local_num_experts
-    pad_size = runtime_max_tokens_per_rank - local_num_tokens
-    if pad_size > 0:
-        x = torch.nn.functional.pad(x, (0, 0, 0, pad_size))
-        selected_experts = torch.nn.functional.pad(
-            selected_experts, (0, 0, 0, pad_size), value=pad_expert_id
-        )
-        routing_weights = torch.nn.functional.pad(routing_weights, (0, 0, 0, pad_size))
-
+    # No x padding: dispatch writes only the real rows; sanitize invalidates the rest.
     recv_results = moe_a2a.dispatch(
         selected_experts,
         [x.contiguous(), selected_experts.contiguous(), routing_weights.contiguous()],
@@ -521,7 +561,6 @@ def trtllm_moe_fused(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
-    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     x_shape = x.shape
     x = x.view(-1, x_shape[-1])
@@ -567,7 +606,6 @@ def trtllm_moe_fused(
             activation_type=activation_type,
             mapping=mapping,
             max_num_tokens=max_num_tokens,
-            batch_info_host=batch_info_host,
         ).view(x_shape)
 
     # EP WITH ALL-REDUCE PATH: Expert IDs are in LOCAL coordinates (from sharding.py),
@@ -598,7 +636,6 @@ def trtllm_moe_fused_fake(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
-    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -638,7 +675,6 @@ def trtllm_quant_fp8_moe_fused(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
-    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """TensorRT-LLM Cutlass FP8 (W8A8) MoE for gated and non-gated MLP.
 
@@ -716,7 +752,6 @@ def trtllm_quant_fp8_moe_fused(
             activation_type=act_fn,
             mapping=mapping,
             max_num_tokens=max_num_tokens,
-            batch_info_host=batch_info_host,
         ).view(x_shape)
 
     # EP WITH ALL-REDUCE PATH: Expert IDs are in LOCAL coordinates.
@@ -754,7 +789,6 @@ def trtllm_quant_fp8_moe_fused_fake(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
-    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
     return torch.empty_like(x)
@@ -778,7 +812,6 @@ def trtllm_quant_nvfp4_moe_fused(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
-    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """TensorRT-LLM Cutlass NVFP4 W8A8 MoE for gated and non-gated MLP.
 
@@ -848,7 +881,6 @@ def trtllm_quant_nvfp4_moe_fused(
             mapping=mapping,
             max_num_tokens=max_num_tokens,
             nvfp4_act_global_scale=fc1_act_global_scale,
-            batch_info_host=batch_info_host,
         ).view(x.shape)
 
     # EP WITH ALL-REDUCE PATH: Expert IDs are in LOCAL coordinates.
@@ -895,7 +927,6 @@ def trtllm_quant_nvfp4_moe_fused_fake(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
-    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -914,7 +945,6 @@ def trtllm_quant_finegrained_fp8_moe_fused(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
-    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """TensorRT-LLM Cutlass FP8 Block Scale MoE for FineGrainedFP8 format.
 
@@ -977,7 +1007,6 @@ def trtllm_quant_finegrained_fp8_moe_fused(
             max_num_tokens=max_num_tokens,
             finegrained_fp8_block_scales=(fc1_weight_scale, fc2_weight_scale),
             is_gated_mlp=is_gated_mlp,
-            batch_info_host=batch_info_host,
         ).view(x_shape)
 
     # EP WITH ALL-REDUCE PATH: Expert IDs are in LOCAL coordinates (from sharding.py),
@@ -1064,7 +1093,6 @@ def trtllm_quant_finegrained_fp8_moe_fused_fake(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
-    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
     return torch.empty_like(x)
@@ -1093,7 +1121,6 @@ def _trtllm_nvfp4_trtllm_gen_moe_impl(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
-    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
     if act_fn in (ActivationType.Gelu, ActivationType.Geglu):
@@ -1170,7 +1197,6 @@ def _trtllm_nvfp4_trtllm_gen_moe_impl(
             mapping=mapping,
             max_num_tokens=max_num_tokens,
             act_type=act_type,
-            batch_info_host=batch_info_host,
         )
         if final_hidden_states.shape[1] > x_shape[-1]:
             final_hidden_states = final_hidden_states[:, : x_shape[-1]].contiguous()
@@ -1243,7 +1269,6 @@ def trtllm_nvfp4_trtllm_gen_moe_fused(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
-    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return _trtllm_nvfp4_trtllm_gen_moe_impl(
         x,
@@ -1268,7 +1293,6 @@ def trtllm_nvfp4_trtllm_gen_moe_fused(
         mapping_config=mapping_config,
         max_num_tokens=max_num_tokens,
         apply_routing_on_input=apply_routing_on_input,
-        batch_info_host=batch_info_host,
     )
 
 
@@ -1296,7 +1320,6 @@ def trtllm_nvfp4_trtllm_gen_moe_fused_fake(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
-    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -1394,14 +1417,21 @@ def trtllm_quant_mxfp4_trtllm_gen_moe_fused(
 
     # Routing: compute router logits and hand them to the C++ runner which performs
     # fused topk + softmax + cast internally. routing_bias is None — the linear-layer
-    # bias was already folded into router_logits via F.linear.
-    router_logits = torch.nn.functional.linear(x2d, router_weight, router_bias)
+    # bias is fused into router_logits here.
+    # For the small-M (decode) router GEMM, TRT-LLM tinygemm2 is a single-kernel tall-skinny GEMM that avoids cuBLAS's
+    # split-K + splitKreduce round-trip (matches PT's compute_gate_output). Router-only (small N=num_experts);
+    # attention/lm_head keep their cublas_mm path. See _router_use_tinygemm for the support guard.
+    if _router_use_tinygemm(x2d, router_weight, router_bias):
+        router_logits = torch.ops.trtllm.tinygemm2(x2d, router_weight, router_bias)
+    else:
+        router_logits = torch.nn.functional.linear(x2d, router_weight, router_bias)
 
     # Pad activations to the kernel's expected hidden (H_pad, multiple of 512).
+    # Hidden must be padded to the kernel's 512-aligned expected width. The mxfp8 path's
+    # mxfp8_quantize(alignment=512) already pads internally (2880->3072), so only the
+    # bf16 path needs an explicit F.pad (applied in that branch) — skipping the redundant
+    # per-token pad kernel on the mxfp8 decode path.
     expected_hidden = int(fc1_weights_mxfp4.shape[-1] * 2)
-    pad_size = expected_hidden - int(x2d.shape[-1])
-    if pad_size > 0:
-        x2d = torch.nn.functional.pad(x2d, (0, pad_size))
 
     num_experts_total = int(router_weight.shape[0])
     if local_num_experts < 0:
@@ -1447,6 +1477,10 @@ def trtllm_quant_mxfp4_trtllm_gen_moe_fused(
             topk_ids=None,
         )
     elif act_dtype == "bf16":
+        # bf16 runner takes the activation directly, so pad hidden to 512-aligned here.
+        pad_size = expected_hidden - int(x2d.shape[-1])
+        if pad_size > 0:
+            x2d = torch.nn.functional.pad(x2d, (0, pad_size))
         result = torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
             router_logits,
             None,  # routing_bias

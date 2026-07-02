@@ -120,6 +120,13 @@ class CudaGraphLoraParams:
             self.slot_ranks, device="cpu", pin_memory=prefer_pinned()
         )
 
+        # Per-(layer_idx, module_id) packed [max_lora_size, 3] (A, B, dora) host
+        # pointer tables for the routed-expert MoE LoRA path, populated lazily by
+        # get_moe_slot_inputs and refreshed in place by _refresh_moe_slot_ptr_cache.
+        # Initialized here (not lazily) so the refresh path cannot silently no-op
+        # out of order.
+        self._moe_slot_ptrs_cache: Dict[Tuple[int, int], torch.Tensor] = {}
+
         for key, info in self.layer_info.items():
             assert (
                 info.module_num > 0
@@ -324,7 +331,7 @@ class CudaGraphLoraParams:
         pinned buffers are updated in place to keep their addresses stable (the
         captured H2D copy reads them by address at replay).
         """
-        cache = getattr(self, "_moe_slot_ptrs_cache", None)
+        cache = self._moe_slot_ptrs_cache
         if not cache:
             return
         for (layer_idx, module_id), packed in cache.items():
@@ -456,10 +463,7 @@ class CudaGraphLoraParams:
         # the existing storage isn't laid out as (A, B, dora) per slot. To
         # keep this graph-capture safe, cache the packed buffer per (layer_idx,
         # module_id) so its address is stable across calls.
-        cache = getattr(self, "_moe_slot_ptrs_cache", None)
-        if cache is None:
-            cache = {}
-            self._moe_slot_ptrs_cache = cache
+        cache = self._moe_slot_ptrs_cache
         cache_key = (layer_idx, module_id)
         packed = cache.get(cache_key)
         if packed is None:
