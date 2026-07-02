@@ -22,7 +22,12 @@ from tensorrt_llm.llmapi.thinking_budget import (
     ThinkingBudgetLogitsProcessor,
     add_thinking_budget_logits_processor,
 )
-from tensorrt_llm.sampling_params import MAX_TOP_LOGPROBS, SamplingParams, check_logprobs_limit
+from tensorrt_llm.sampling_params import (
+    MAX_TOP_LOGPROBS,
+    MIN_SAMPLING_TEMPERATURE,
+    SamplingParams,
+    check_logprobs_limit,
+)
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
     CompletionRequest,
@@ -51,6 +56,24 @@ def test_logprobs_request_limit(field):
 
     with pytest.raises(ValueError, match=f"less than or equal to {MAX_TOP_LOGPROBS}"):
         SamplingParams(**{field: MAX_TOP_LOGPROBS + 1})
+
+
+@pytest.mark.parametrize(
+    ("temperature", "expected"),
+    [
+        (0.0, 0.0),
+        (1e-6, MIN_SAMPLING_TEMPERATURE),
+        (MIN_SAMPLING_TEMPERATURE - 1e-3, MIN_SAMPLING_TEMPERATURE),
+        (MIN_SAMPLING_TEMPERATURE, MIN_SAMPLING_TEMPERATURE),
+        (1.0, 1.0),
+    ],
+)
+def test_temperature_clamps_small_nonzero_values(temperature, expected):
+    """Small non-zero temperatures are clamped while zero remains greedy."""
+    sampling_params = SamplingParams(temperature=temperature, top_k=2)
+
+    assert sampling_params.temperature == expected
+    assert sampling_params._get_sampling_config().temperature == pytest.approx(expected)
 
 
 def test_chat_top_logprobs_request_limit():
