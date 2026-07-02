@@ -77,6 +77,8 @@ class OpenAIDisaggregatedService(OpenAIService):
         self._perf_metrics_collector = perf_metrics_collector
         self._cluster_storage = disagg_cluster_storage
         self._health_check_interval_secs = health_check_interval_secs
+        # Opt-in body-shrink for generation_only requests; see _get_gen_request.
+        self._strip_gen_message_history = config.gen_strip_message_history
 
         self._ctx_client = None
         self._gen_client = None
@@ -147,15 +149,15 @@ class OpenAIDisaggregatedService(OpenAIService):
                 ctx_req, server=ctx_server, hooks=hooks
             )
             await self._verify_ctx_response(ctx_response)
+            ctx_response_disagg_params = ctx_response.choices[0].disaggregated_params
+            if ctx_response_disagg_params.disagg_request_id is not None:
+                disagg_request_id = ctx_response_disagg_params.disagg_request_id
             gen_req = self._get_gen_request(request, ctx_response, disagg_request_id)
         else:
-            # Clear synthetic disaggregated_params that may have been
-            # injected by _extract_conversation_id (e.g. from the
-            # X-Correlation-ID header).  When need_ctx=False the gen
-            # server handles full generation and must not see a stale
-            # request_type="context_only".
+            # When need_ctx=False the gen server handles full generation and
+            # must not see a stale request_type="context_only".
             # _check_gen_only_disagg already sets proper generation_only
-            # params when applicable, so only clear the synthetic ones.
+            # params when applicable.
             if (
                 gen_req.disaggregated_params is not None
                 and gen_req.disaggregated_params.request_type == "context_only"
@@ -185,6 +187,8 @@ class OpenAIDisaggregatedService(OpenAIService):
 
     @staticmethod
     def _get_conversation_id(request: UCompletionRequest) -> Optional[str]:
+        if request.conversation_params is not None:
+            return request.conversation_params.conversation_id
         if request.disaggregated_params is not None:
             return request.disaggregated_params.conversation_id
         return None
@@ -192,13 +196,14 @@ class OpenAIDisaggregatedService(OpenAIService):
     def _get_ctx_request(
         self, request: UCompletionRequest, disagg_request_id: Optional[int]
     ) -> UCompletionRequest:
+        conversation_id = self._get_conversation_id(request)
         ctx_request = request.model_copy(
             update={
                 "disaggregated_params": DisaggregatedParams(
                     request_type="context_only",
                     disagg_request_id=disagg_request_id,
                     schedule_style=self._schedule_style,
-                    conversation_id=self._get_conversation_id(request),
+                    conversation_id=conversation_id,
                 ),
                 "stream": False,
                 "stream_options": None,
@@ -225,6 +230,17 @@ class OpenAIDisaggregatedService(OpenAIService):
                 request.prompt = ctx_response.prompt_token_ids
             elif isinstance(request, ChatCompletionRequest):
                 request.prompt_token_ids = ctx_response.prompt_token_ids
+                # Opt-in: drop conversation history so the gen worker doesn't
+                # re-parse the full conversation JSON (dominates its GIL at high
+                # concurrency). It uses prompt_token_ids and only reads the last
+                # message; tools are preserved. Config-gated because it's unsafe
+                # for harmony/multimodal workers (model type is fixed per deploy).
+                if (
+                    self._strip_gen_message_history
+                    and request.messages
+                    and len(request.messages) > 1
+                ):
+                    request.messages = request.messages[-1:]
         else:
             # no ctx response, it's either a generation-only request or a generation-first disagg request
             request.disaggregated_params = DisaggregatedParams(
@@ -257,13 +273,20 @@ class OpenAIDisaggregatedService(OpenAIService):
             gen_server, info = await self._gen_router.get_next_server(request)
             match_length = sum(info["matches"])
             total_length = sum(len(token_list) for token_list in info["token_lists"])
-            if (
+            need_ctx_decision = (
                 match_length == 0
                 or total_length - match_length
                 > self.conditional_disagg_config.max_local_prefill_length
-            ):
-                return gen_server, True
-            return gen_server, False
+            )
+            # Visibility hook for verifying bypass triggers in disagg deployments.
+            logger.debug(
+                f"[conditional_disagg] gen={gen_server} match={match_length} "
+                f"total={total_length} residual={total_length - match_length} "
+                f"max_local_prefill_length="
+                f"{self.conditional_disagg_config.max_local_prefill_length} "
+                f"→ need_ctx={need_ctx_decision}"
+            )
+            return gen_server, need_ctx_decision
         return None, True
 
     async def _check_gen_only_disagg(self, request: UCompletionRequest) -> bool:

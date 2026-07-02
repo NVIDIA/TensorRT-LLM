@@ -41,7 +41,12 @@ def _mock_dist(tp_rank=0, tp_size=1, has_cp_helix=False):
 
 
 def _make_request_item(
-    req_id, num_tokens=10, target_dp_rank=None, attention_dp_relax=True, lora_task_id=None
+    req_id,
+    num_tokens=10,
+    target_dp_rank=None,
+    attention_dp_relax=True,
+    lora_task_id=None,
+    cache_salt=None,
 ):
     """Create a mock RequestQueueItem for testing."""
     item = MagicMock()
@@ -53,6 +58,7 @@ def _make_request_item(
     item.request = MagicMock()
     item.request.py_scheduling_params = scheduling_params
     item.request.input_token_ids = list(range(num_tokens))
+    item.request.cache_salt = cache_salt
     if lora_task_id is not None:
         lora_config = MagicMock()
         lora_config.task_id = lora_task_id
@@ -66,14 +72,15 @@ def _mock_kv_cache_manager(probe_results=None):
     """Create mock KV cache manager with configurable probe results.
 
     Args:
-        probe_results: dict mapping (tuple(input_tokens), lora_task_id) -> match_length.
+        probe_results: dict mapping (tuple(input_tokens), lora_task_id, cache_salt)
+            -> match_length.
             If None, all probes return 0.
     """
     mgr = MagicMock()
     probe_results = probe_results or {}
 
-    def mock_probe(input_tokens, lora_task_id=None):
-        key = (tuple(input_tokens), lora_task_id)
+    def mock_probe(input_tokens, lora_task_id=None, cache_salt=None):
+        key = (tuple(input_tokens), lora_task_id, cache_salt)
         return probe_results.get(key, 0)
 
     mgr.probe_prefix_match_length = Mock(side_effect=mock_probe)
@@ -120,8 +127,8 @@ class TestKVCacheAwareADPRouter:
         tokens_a = list(range(100))
         tokens_b = list(range(50))
         probe_results = {
-            (tuple(tokens_a[:-1]), None): 64,
-            (tuple(tokens_b[:-1]), None): 0,
+            (tuple(tokens_a[:-1]), None, None): 64,
+            (tuple(tokens_b[:-1]), None, None): 0,
         }
 
         dist = _mock_dist(tp_rank=0, tp_size=1)
@@ -139,7 +146,7 @@ class TestKVCacheAwareADPRouter:
     def test_gather_prefix_matches_two_ranks(self):
         tokens_a = list(range(100))
         probe_results = {
-            (tuple(tokens_a[:-1]), None): 64,
+            (tuple(tokens_a[:-1]), None, None): 64,
         }
 
         dist = _mock_dist(tp_rank=0, tp_size=2)
@@ -159,7 +166,7 @@ class TestKVCacheAwareADPRouter:
     def test_gather_prefix_matches_with_lora(self):
         tokens_a = list(range(100))
         probe_results = {
-            (tuple(tokens_a[:-1]), 42): 64,
+            (tuple(tokens_a[:-1]), 42, None): 64,
         }
 
         dist = _mock_dist(tp_rank=0, tp_size=1)
@@ -170,6 +177,24 @@ class TestKVCacheAwareADPRouter:
         req_a = _make_request_item(1, num_tokens=100, lora_task_id=42)
         router.gather_prefix_matches([req_a])
         assert router._all_ranks_prefix_matches[0] == {1: 64}
+
+    def test_gather_prefix_matches_with_cache_salt(self):
+        tokens_a = list(range(100))
+        probe_results = {
+            (tuple(tokens_a[:-1]), None, "tenant-a"): 64,
+        }
+
+        dist = _mock_dist(tp_rank=0, tp_size=1)
+        dist.tp_allgather = Mock(side_effect=lambda x: [x])
+        mgr = _mock_kv_cache_manager(probe_results)
+        router = KVCacheAwareADPRouter(dist=dist, kv_cache_manager=mgr)
+
+        req_a = _make_request_item(1, num_tokens=100, cache_salt="tenant-a")
+        router.gather_prefix_matches([req_a])
+        assert router._all_ranks_prefix_matches[0] == {1: 64}
+        mgr.probe_prefix_match_length.assert_called_once_with(
+            tokens_a[:-1], None, cache_salt="tenant-a"
+        )
 
     def test_gather_prefix_matches_empty(self):
         dist = _mock_dist(tp_rank=0, tp_size=1)
@@ -566,3 +591,24 @@ class TestProbeOnV1KVCacheManager:
         result = KVCacheManager.probe_prefix_match_length(mgr, input_tokens=list(range(200)))
         assert result == 192  # 3 blocks * 64 tokens/block
         mgr.impl.analyze_prefix_reuse.assert_called_once()
+
+    def test_cache_salt_uses_cpp_request_cache_salt_kwarg(self):
+        """Salted probes must construct the C++ request with cache_salt."""
+        from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+
+        mgr = Mock(spec=KVCacheManager)
+        mgr.enable_block_reuse = True
+        mgr.impl = Mock()
+        mgr.impl.is_variable_window = False
+        mock_summary = Mock()
+        mock_summary.reusable_blocks_all = 1
+        mgr.impl.analyze_prefix_reuse = Mock(return_value=mock_summary)
+        mgr.tokens_per_block = 64
+
+        result = KVCacheManager.probe_prefix_match_length(
+            mgr, input_tokens=list(range(128)), cache_salt="tenant-a"
+        )
+
+        assert result == 64
+        dummy_req = mgr.impl.analyze_prefix_reuse.call_args.args[1]
+        assert dummy_req.cache_salt == "tenant-a"
