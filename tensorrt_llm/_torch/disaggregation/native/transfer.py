@@ -56,8 +56,6 @@ from tensorrt_llm.runtime.generation import CUASSERT
 
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
-_ALLOWED_CTX_INFO_ENDPOINTS_ENV = "TLLM_DISAGG_ALLOWED_CTX_INFO_ENDPOINTS"
-
 # Number of worker threads for KV transfer queues (default: 1)
 KV_TRANSFER_NUM_THREADS = int(os.environ.get("TRTLLM_KV_TRANSFER_NUM_THREADS", "1"))
 
@@ -1512,17 +1510,6 @@ class Receiver(ReceiverBase):
     def _validate_info_endpoint(self, endpoint: Optional[str]) -> None:
         if endpoint is None:
             raise ValueError("Receiver: ctx_info_endpoint is required")
-        if endpoint in self._sender_ep_instance_map:
-            return
-        allowed = {
-            ep.strip()
-            for ep in os.getenv(_ALLOWED_CTX_INFO_ENDPOINTS_ENV, "").split(",")
-            if ep.strip()
-        }
-        if endpoint not in allowed:
-            raise ValueError(
-                f"Receiver: ctx_info_endpoint must be listed in {_ALLOWED_CTX_INFO_ENDPOINTS_ENV}"
-            )
 
     def _get_or_connect_dealer(self, endpoint: Optional[str]):
         if endpoint is None:

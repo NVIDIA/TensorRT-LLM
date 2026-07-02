@@ -16,6 +16,7 @@ import collections
 import contextlib
 import hashlib
 import inspect
+import struct
 import weakref
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
@@ -25,6 +26,47 @@ from typing import (Any, Dict, Iterable, List, Optional, OrderedDict, Set,
 
 import numpy as np
 import onnx
+
+
+def _ensure_onnx_graphsurgeon_helper_compat() -> None:
+    if not hasattr(onnx.helper, "float32_to_bfloat16"):
+
+        def float32_to_bfloat16(fval: float, truncate: bool = False) -> int:
+            ival = int.from_bytes(struct.pack("<f", np.float32(fval)), "little")
+            if truncate:
+                return ival >> 16
+            if np.isnan(fval):
+                return 0x7FC0
+            rounded = ((ival >> 16) & 1) + 0x7FFF
+            return (ival + rounded) >> 16
+
+        onnx.helper.float32_to_bfloat16 = float32_to_bfloat16
+
+    if not hasattr(onnx.helper, "float32_to_float8e4m3"):
+
+        def float32_to_float8e4m3(fval: float,
+                                  scale: float = 1.0,
+                                  fn: bool = True,
+                                  uz: bool = False,
+                                  saturate: bool = True) -> int:
+            if not fn or uz or not saturate:
+                raise NotImplementedError(
+                    "float32_to_float8e4m3 compatibility shim only supports "
+                    "fn=True, uz=False, saturate=True")
+            try:
+                import ml_dtypes
+            except ImportError as e:
+                raise RuntimeError(
+                    "ONNX no longer provides float32_to_float8e4m3 and "
+                    "ml_dtypes is not available for conversion") from e
+            converted = np.asarray(np.float32(fval / scale)).astype(
+                ml_dtypes.float8_e4m3fn)
+            return int(converted.view(np.uint8))
+
+        onnx.helper.float32_to_float8e4m3 = float32_to_float8e4m3
+
+
+_ensure_onnx_graphsurgeon_helper_compat()
 import onnx_graphsurgeon as gs
 import tensorrt as trt
 

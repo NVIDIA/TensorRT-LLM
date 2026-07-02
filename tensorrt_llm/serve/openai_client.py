@@ -22,6 +22,10 @@ import aiohttp
 
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve.disagg_auth import (
+    build_internal_disagg_auth_headers,
+    request_requires_internal_disagg_auth,
+)
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -104,6 +108,7 @@ class OpenAIHttpClient(OpenAIClient):
         retry_interval_sec: int = 1,
         session: Optional[aiohttp.ClientSession] = None,
         disagg_id_generator: Optional[Callable[[], int]] = None,
+        internal_disagg_auth_key: Optional[str] = None,
     ):
         self._router = router
         self._role = role
@@ -121,6 +126,19 @@ class OpenAIHttpClient(OpenAIClient):
         self._max_retries = max_retries
         self._retry_interval_sec = retry_interval_sec
         self._disagg_id_generator = disagg_id_generator
+        self._internal_disagg_auth_key = internal_disagg_auth_key
+
+    def _get_request_headers(self, request: UCompletionRequest) -> Optional[Dict[str, str]]:
+        if self._role != ServerRole.GENERATION:
+            return None
+        if not request_requires_internal_disagg_auth(request):
+            return None
+        if not self._internal_disagg_auth_key:
+            raise ValueError(
+                "Internal disaggregated authentication key is required for "
+                "generation requests with ctx_info_endpoint"
+            )
+        return build_internal_disagg_auth_headers(self._internal_disagg_auth_key, request)
 
     async def _send_request(
         self,
@@ -186,13 +204,17 @@ class OpenAIHttpClient(OpenAIClient):
             # model_dump(mode="json") + aiohttp json= (json.dumps). Decodes to
             # identical JSON (pydantic just emits compact UTF-8 vs spaced ASCII).
             body = request.model_dump_json(exclude_unset=True)
+            headers = {"Content-Type": "application/json"}
+            auth_headers = self._get_request_headers(request)
+            if auth_headers:
+                headers.update(auth_headers)
             try:
                 lines_yielded = 0
                 start_time = get_steady_clock_now_in_seconds()
                 async with self._session.post(
                     url,
                     data=body,
-                    headers={"Content-Type": "application/json"},
+                    headers=headers,
                 ) as http_response:
                     content_type = http_response.headers.get("Content-Type", "")
                     if not is_stream and "text/event-stream" in content_type:

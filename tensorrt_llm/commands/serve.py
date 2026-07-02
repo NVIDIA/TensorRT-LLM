@@ -64,6 +64,16 @@ def _pop_bool_config_option(config: dict[str, Any], key: str) -> bool:
     return validate_config_bool(config.pop(key, False), key)
 
 
+def _pop_optional_str_config_option(config: dict[str, Any],
+                                    key: str) -> Optional[str]:
+    value = config.pop(key, None)
+    if value is None:
+        return None
+    if isinstance(value, str) and value:
+        return value
+    raise ValueError(f"{key} must be a non-empty string")
+
+
 def _apply_fastapi_middlewares(app, middlewares: Sequence[str]) -> None:
     """Import and register middleware objects on a FastAPI app."""
     for middleware in middlewares:
@@ -350,7 +360,8 @@ def launch_server(
         disagg_cluster_config: Optional[DisaggClusterConfig] = None,
         multimodal_server_config: Optional[MultimodalServerConfig] = None,
         served_model_name: Optional[str] = None,
-        allow_request_chat_template: bool = False):
+        allow_request_chat_template: bool = False,
+        internal_disagg_auth_key: Optional[str] = None):
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
@@ -394,7 +405,8 @@ def launch_server(
             disagg_cluster_config=disagg_cluster_config,
             multimodal_server_config=multimodal_server_config,
             chat_template=chat_template,
-            allow_request_chat_template=allow_request_chat_template)
+            allow_request_chat_template=allow_request_chat_template,
+            internal_disagg_auth_key=internal_disagg_auth_key)
         _apply_fastapi_middlewares(server.app, middleware)
 
         # Optionally disable GC (default: not disabled)
@@ -1061,6 +1073,8 @@ def serve(
             llm_args_extra_dict, "allow_request_chat_template")
         allow_request_chat_template = (allow_request_chat_template
                                        or extra_allow_request_chat_template)
+        internal_disagg_auth_key = _pop_optional_str_config_option(
+            llm_args_extra_dict, "internal_request_auth_key")
         llm_args = update_llm_args_with_extra_dict(
             llm_args, llm_args_extra_dict, explicit_cli_keys=explicit_cli_keys)
 
@@ -1121,6 +1135,8 @@ def serve(
                 server_role,
                 "disagg_cluster_config":
                 disagg_cluster_config,
+                "internal_request_auth_key":
+                internal_disagg_auth_key,
             }
             for name, value in unsupported_args.items():
                 if value is not None:
@@ -1146,7 +1162,8 @@ def serve(
                 disagg_cluster_config,
                 multimodal_server_config,
                 served_model_name=served_model_name,
-                allow_request_chat_template=allow_request_chat_template)
+                allow_request_chat_template=allow_request_chat_template,
+                internal_disagg_auth_key=internal_disagg_auth_key)
 
     def _serve_visual_gen():
         parsed_visual_gen_args = (VisualGenArgs.from_yaml(visual_gen_args)
@@ -1540,7 +1557,8 @@ def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
         host=server_cfg.hostname,
         port=server_cfg.port,
         llm_args=llm_args,
-        allow_request_chat_template=disagg_config.allow_request_chat_template)
+        allow_request_chat_template=disagg_config.allow_request_chat_template,
+        internal_disagg_auth_key=disagg_config.internal_request_auth_key)
 
 
 def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
