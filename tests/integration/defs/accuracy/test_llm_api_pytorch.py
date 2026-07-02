@@ -7233,16 +7233,17 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
     # config requires ``trust_remote_code`` and the runtime requires the
     # MiniMax-M3 sparse attention backend + matching KV-cache manager v2
     # (selected by ``sparse_attention_config``). Blackwell-only (SM100+).
-    # Two checkpoints are covered: the upstream BF16 checkpoint and the
+    # Three checkpoints are covered: the upstream BF16 checkpoint, the
     # NVIDIA MXFP8 checkpoint (weights in MXFP8, activations / KV cache
-    # remain BF16; the runtime path is identical aside from the quant
-    # config).
+    # remain BF16), and the NVIDIA NVFP4 checkpoint (MXFP8 base layers +
+    # NVFP4 routed experts); the runtime path is identical aside from the
+    # quant config.
     MODEL_NAME = "MiniMaxAI/MiniMax-M3"
     MODEL_PATH = f"{llm_models_root()}/MiniMax-M3"
 
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
-    @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
+    @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
     def test_auto_dtype(self, tp_size, ep_size):
         # Sparse-path block reuse is not yet validated; disable to match the
         # configuration the M3 bring-up evaluated against the SGLang reference.
@@ -7261,9 +7262,9 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
-    @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
+    @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
     def test_mxfp8(self, tp_size, ep_size):
         # MXFP8 checkpoint: weights are MXFP8 (e4m3 + UE8M0 1x32 block
         # scales) with MXFP8 dynamic activations; the KV cache stays in
@@ -7281,6 +7282,31 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                  max_seq_len=4096,
                  trust_remote_code=True) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MXFP8
+            task = MMLU(model_name)
+            task.evaluate(llm)
+            task = GSM8K(model_name)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
+    def test_nvfp4(self, tp_size, ep_size):
+        # NVFP4 checkpoint: MXFP8 base layers with NVFP4 routed experts
+        # (MIXED_PRECISION checkpoint); the KV cache stays in BF16 and the
+        # sparse attention path is unchanged from BF16.
+        model_name = "nvidia/MiniMax-M3-NVFP4"
+        model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
+                                        enable_block_reuse=False)
+        sparse_attention_config = MiniMaxM3SparseAttentionConfig()
+        with LLM(model_path,
+                 tensor_parallel_size=tp_size,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 sparse_attention_config=sparse_attention_config,
+                 max_seq_len=4096,
+                 trust_remote_code=True) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
             task = MMLU(model_name)
             task.evaluate(llm)
             task = GSM8K(model_name)
