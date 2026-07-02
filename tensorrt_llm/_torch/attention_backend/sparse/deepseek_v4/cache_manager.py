@@ -472,7 +472,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         # the typical step. An all-generation typical_step over-provisions the
         # compressed-cache pool at the expense of the SWA pool, starving the
         # SWA pool and artificially capping the achievable batch size.
-        ctx_capacity = max_num_tokens if max_num_tokens is not None else max_seq_len
+        ctx_capacity = (
+            max_num_tokens if max_num_tokens is not None else max_seq_len
+        ) + self.num_extra_kv_tokens
         typical_step = BatchDesc(
             kv_caches=[
                 KVCacheDesc(capacity=ctx_capacity, history_length=0),
@@ -494,7 +496,16 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         # Constraint 2: general / chunked-prefill warmup — one fresh context request
         # at max_num_tokens (the per-iteration token budget).
         if max_num_tokens is not None:
-            constraints.append(BatchDesc([KVCacheDesc(capacity=max_num_tokens, history_length=0)]))
+            constraints.append(
+                BatchDesc(
+                    [
+                        KVCacheDesc(
+                            capacity=max_num_tokens + self.num_extra_kv_tokens,
+                            history_length=0,
+                        )
+                    ]
+                )
+            )
 
         return KVCacheManagerConfigPy(
             tokens_per_block=tokens_per_block,

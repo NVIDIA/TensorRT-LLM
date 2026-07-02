@@ -3449,6 +3449,41 @@ def _make_deepseekv4_eplb_config(model_path, layer_updates_per_iter, ep_size=8):
         layer_updates_per_iter=0)
 
 
+_DEEPSEEK_V4_GSM8K_SYSTEM_PROMPT = (
+    "Solve the problem carefully. End your response with a final line exactly "
+    "in the form #### <answer>, using the simplest numeric form without units "
+    "or trailing zeros.")
+
+
+def _deepseekv4_pro_agg_llm_kwargs(**overrides):
+    kwargs = dict(
+        tensor_parallel_size=8,
+        moe_expert_parallel_size=8,
+        moe_config=MoeConfig(backend="TRTLLM"),
+        enable_attention_dp=True,
+        max_seq_len=4096,
+        max_batch_size=16,
+        max_num_tokens=8192,
+        custom_tokenizer="deepseek_v4",
+        # Cap the KV cache so the padded CUDA-graph capture (batch sizes up to
+        # 1024) and other post-KV resources have headroom; without this the
+        # default fraction (~0.9) leaves too little and engine init OOMs on
+        # large-memory GPUs. These tests need very little KV.
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False,
+                                      tokens_per_block=128,
+                                      dtype="fp8",
+                                      host_cache_size=0,
+                                      free_gpu_memory_fraction=0.6),
+        cuda_graph_config=CudaGraphConfig(batch_sizes=[
+            1, 2, 4, 8, 16, 32, 64, 128, 192, 256, 320, 384, 448, 512, 768, 1024
+        ],
+                                          enable_padding=True),
+        speculative_config=MTPDecodingConfig(max_draft_len=1),
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
 def _run_deepseekv4_eplb(model_name,
                          model_path,
                          moe_backend,
@@ -3508,6 +3543,25 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
             task.evaluate(llm, is_integration_test=True)
 
     @pytest.mark.skip_less_mpi_world_size(4)
+    def test_mtp(self):
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.5,
+            use_kv_cache_manager_v2=True,
+        )
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=4,
+                 moe_expert_parallel_size=4,
+                 moe_config=MoeConfig(backend="TRTLLM"),
+                 enable_attention_dp=True,
+                 max_batch_size=1350,
+                 max_seq_len=4096,
+                 max_num_tokens=8192,
+                 kv_cache_config=kv_cache_config,
+                 speculative_config=MTPDecodingConfig(max_draft_len=3)) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_mpi_world_size(4)
     @parametrize_with_ids("moe_backend", [
         pytest.param(
             "WIDEEP",
@@ -3549,6 +3603,36 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                              moe_backend,
                              eplb_config,
                              mtp_nextn=mtp_nextn)
+
+
+@pytest.mark.timeout(14400)
+@pytest.mark.skip_less_device(8)
+@pytest.mark.skip_less_device_memory(140000)
+@skip_pre_blackwell
+class TestDeepSeekV4Pro(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "deepseek-ai/DeepSeek-V4-Pro"
+    MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4-Pro"
+    EXTRA_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        system_prompt=_DEEPSEEK_V4_GSM8K_SYSTEM_PROMPT,
+    )
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    def test_gsm8k_full_accuracy(self):
+        with LLM(self.MODEL_PATH, **_deepseekv4_pro_agg_llm_kwargs()) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            acc_params = task.get_hypothesis_testing_params(
+                dtype=llm.args.dtype,
+                quant_algo=llm.args.quant_config.quant_algo,
+                kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
+                spec_dec_algo=llm.args.speculative_config.decoding_type)
+            assert acc_params.num_samples == GSM8K.NUM_SAMPLES
+            with mock.patch.dict(os.environ, {"INTEGRATION_TEST": "0"}):
+                score = task.evaluate(
+                    llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            assert score >= acc_params.ref_accuracy, (
+                f"GSM8K accuracy {score:.3f} is below recorded reference "
+                f"{acc_params.ref_accuracy:.3f}")
 
 
 @pytest.mark.timeout(14400)
