@@ -24,9 +24,11 @@ Requires: 1 GPU, mpirun, mpi4py, tensorrt_llm.
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -47,6 +49,9 @@ CTT_DIR = os.path.normpath(
 
 DRIVER_SCRIPT = os.path.join(CTT_DIR, "run_cache_transceiver_test.py")
 REPORT_SCRIPT = os.path.join(CTT_DIR, "report.py")
+_LOG_TAIL_CHARS = 16 * 1024
+_PROCESS_TIMEOUT_SECONDS = 120
+_TERMINATE_GRACE_SECONDS = 5
 
 
 def _find_free_port():
@@ -61,6 +66,46 @@ def _find_mpirun():
     if path is None:
         pytest.skip("mpirun not found on PATH")
     return path
+
+
+def _log_tail(log: str) -> str:
+    if len(log) <= _LOG_TAIL_CHARS:
+        return log
+    omitted = len(log) - _LOG_TAIL_CHARS
+    return f"... {omitted} earlier characters omitted ...\n{log[-_LOG_TAIL_CHARS:]}"
+
+
+def _wait_for_processes(processes: list[subprocess.Popen]) -> None:
+    deadline = time.monotonic() + _PROCESS_TIMEOUT_SECONDS
+    for proc in processes:
+        remaining = max(0.0, deadline - time.monotonic())
+        proc.wait(timeout=remaining)
+
+
+def _terminate_process_groups(processes: list[subprocess.Popen]) -> None:
+    group_ids = [proc.pid for proc in processes if proc.poll() is None]
+    for group_id in group_ids:
+        try:
+            os.killpg(group_id, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+    deadline = time.monotonic() + _TERMINATE_GRACE_SECONDS
+    for proc in processes:
+        if proc.poll() is not None:
+            continue
+        try:
+            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            pass
+
+    for group_id in group_ids:
+        try:
+            os.killpg(group_id, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    for proc in processes:
+        proc.wait()
 
 
 def _build_config(work_dir: str) -> dict:
@@ -120,7 +165,9 @@ def test_single_node_transfer(tmp_path):
             "CTT_SWEEP": "0",
             "CTT_SWEEP_NAME": "default",
             "CUDA_VISIBLE_DEVICES": "0",
-            "UCX_PROTO_INFO": "used",
+            # The report parser consumes full protocol-selection tables. Unlike
+            # `used`, `y` does not depend on UCX worker teardown to emit them.
+            "UCX_PROTO_INFO": "y",
         }
     )
     sweep_env = cfg["ucx_env_sweep"][0].get("env") or {}
@@ -136,37 +183,63 @@ def test_single_node_transfer(tmp_path):
         DRIVER_SCRIPT,
     ]
 
-    ctx_proc = subprocess.Popen(
-        mpi_args + ["--role", "ctx"], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
-    )
-    gen_proc = subprocess.Popen(
-        mpi_args + ["--role", "gen"], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
-    )
-
-    ctx_out, _ = ctx_proc.communicate(timeout=120)
-    gen_out, _ = gen_proc.communicate(timeout=120)
-
-    ctx_log = ctx_out.decode(errors="replace")
-    gen_log = gen_out.decode(errors="replace")
-
-    # Persist logs to work_dir matching the glob pattern that report.py expects
-    # (sweep<N>_<role>_rank<R>.log). mpirun merges all rank outputs into one
-    # stream, so we write the combined output as rank0; report still picks it up.
+    # Write directly to the filenames report.py consumes. Full UCX protocol
+    # tables are verbose, so files also prevent either child from blocking on a
+    # full stdout pipe while the other child is being drained.
     log_dir = os.path.join(work_dir, "logs")
     os.makedirs(log_dir, exist_ok=True)
-    for role, content in [("ctx", ctx_log), ("gen", gen_log)]:
-        with open(os.path.join(log_dir, f"sweep0_{role}_rank0.log"), "w") as f:
-            f.write(content)
+    ctx_log_path = os.path.join(log_dir, "sweep0_ctx_rank0.log")
+    gen_log_path = os.path.join(log_dir, "sweep0_gen_rank0.log")
+    timeout_error = None
+    processes = []
+    processes_completed = False
+    with open(ctx_log_path, "wb") as ctx_log_file, open(gen_log_path, "wb") as gen_log_file:
+        try:
+            ctx_proc = subprocess.Popen(
+                mpi_args + ["--role", "ctx"],
+                env=env,
+                stdout=ctx_log_file,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            processes.append(ctx_proc)
+            gen_proc = subprocess.Popen(
+                mpi_args + ["--role", "gen"],
+                env=env,
+                stdout=gen_log_file,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            processes.append(gen_proc)
+            _wait_for_processes(processes)
+            processes_completed = True
+        except subprocess.TimeoutExpired as exc:
+            timeout_error = exc
+        finally:
+            if not processes_completed:
+                _terminate_process_groups(processes)
+
+    with open(ctx_log_path, errors="replace") as f:
+        ctx_log = f.read()
+    with open(gen_log_path, errors="replace") as f:
+        gen_log = f.read()
+
+    if timeout_error is not None:
+        pytest.fail(
+            f"mpirun timed out: {timeout_error}\n"
+            f"ctx log tail:\n{_log_tail(ctx_log)}\n"
+            f"gen log tail:\n{_log_tail(gen_log)}"
+        )
 
     if ctx_proc.returncode != 0:
-        pytest.fail(f"ctx mpirun failed (rc={ctx_proc.returncode}):\n{ctx_log}")
+        pytest.fail(f"ctx mpirun failed (rc={ctx_proc.returncode}):\n{_log_tail(ctx_log)}")
     if gen_proc.returncode != 0:
-        pytest.fail(f"gen mpirun failed (rc={gen_proc.returncode}):\n{gen_log}")
+        pytest.fail(f"gen mpirun failed (rc={gen_proc.returncode}):\n{_log_tail(gen_log)}")
 
     # Parse gen status JSONL and verify all entries are PASS.
     status_path = os.path.join(work_dir, "status", "sweep0_gen.jsonl")
     assert os.path.exists(status_path), (
-        f"gen status file not found at {status_path}\ngen log:\n{gen_log}"
+        f"gen status file not found at {status_path}\ngen log tail:\n{_log_tail(gen_log)}"
     )
 
     with open(status_path) as f:
@@ -179,7 +252,7 @@ def test_single_node_transfer(tmp_path):
             f"(combination_idx={rec.get('combination_idx')}, "
             f"reqlen_idx={rec.get('reqlen_idx')}, "
             f"reason={rec.get('reason', '')})\n"
-            f"gen log:\n{gen_log}"
+            f"gen log tail:\n{_log_tail(gen_log)}"
         )
 
     # Verify report aggregation produces valid results.
@@ -212,8 +285,9 @@ def test_single_node_transfer(tmp_path):
             )
             assert sweep["selected_transport"], (
                 f"selected_transport is empty for {combo['combination']} "
-                f"sweep={sweep['sweep']} — UCX_PROTO_INFO may not be set or "
-                f"log filenames may not match report.py's glob pattern"
+                f"sweep={sweep['sweep']} — UCX did not emit a parseable protocol table\n"
+                f"ctx log tail:\n{_log_tail(ctx_log)}\n"
+                f"gen log tail:\n{_log_tail(gen_log)}"
             )
 
     best_path = os.path.splitext(results_path)[0] + ".best.json"
