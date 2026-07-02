@@ -145,6 +145,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     kv_cache_block_offsets: Optional[torch.Tensor] = None
     host_kv_cache_block_offsets: Optional[torch.Tensor] = None
     draft_kv_cache_block_offsets: Optional[torch.Tensor] = None
+    # Block IDs per sequence; populated in __post_init__ when a KV cache
+    # manager is present. Declared here so encoder-only metadata (no KV cache)
+    # still exposes the attribute.
+    block_ids_per_seq: Optional[torch.Tensor] = None
+    kv_block_ids_per_seq: Optional[torch.Tensor] = None
 
     # Pre-computed FlashMLA tile-scheduler metadata and num_splits.
     # Computed once per forward pass in TrtllmAttention.forward() and reused across layers.
@@ -156,7 +161,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     use_paged_context_fmha: bool = field(init=False, default=False, repr=False)
 
-    # ``DSAtrtllmAttentionMetadata`` overrides this; the dense path keeps 0.
+    # `DSAtrtllmAttentionMetadata` overrides this; the dense path keeps 0.
     num_sparse_topk: int = 0
 
     @property
@@ -475,6 +480,26 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.helix_is_inactive_rank[:batch_size].copy_(
                 self.helix_is_inactive_rank_cpu[:batch_size], non_blocking=True)
 
+    def _bind_runtime_views(
+        self,
+        *,
+        kv_lens_cuda: torch.Tensor,
+        kv_lens: torch.Tensor,
+        prompt_lens_cuda: torch.Tensor,
+        prompt_lens_cpu: torch.Tensor,
+        host_request_types: torch.Tensor,
+    ) -> None:
+        """Bind the per-forward ``*_runtime`` views the FMHA kernels read.
+
+        Shared by ``prepare``, ``prepare_encoder_only`` and the encoder CUDA
+        graph binding so the set of runtime views stays in sync across paths.
+        """
+        self.kv_lens_cuda_runtime = kv_lens_cuda
+        self.kv_lens_runtime = kv_lens
+        self.prompt_lens_cuda_runtime = prompt_lens_cuda
+        self.prompt_lens_cpu_runtime = prompt_lens_cpu
+        self.host_request_types_runtime = host_request_types
+
     def prepare(self) -> None:
         super().prepare()
         extra_attrs = get_model_extra_attrs()
@@ -565,15 +590,17 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     self.draft_kv_cache_block_offsets, self.request_ids,
                     self.beam_width, self.num_contexts, self.num_seqs)
 
-        self.kv_lens_cuda_runtime = self.kv_lens_cuda[:self.num_seqs]
-        # Don't use self.kv_lens here because it includes extra tokens.
-        # Use actual KV length (without extra tokens) for kv_lens_runtime,
-        # which becomes host_past_key_value_lengths and eventually mMaxSeqLenKv.
-        self.kv_lens_runtime = kv_lens[:self.num_seqs]
-        self.prompt_lens_cuda_runtime = self.prompt_lens_cuda[:self.num_seqs]
-        self.prompt_lens_cpu_runtime = self.prompt_lens_cpu[:self.num_seqs]
-        self.host_request_types_runtime = self.host_request_types[:self.
-                                                                  num_seqs]
+        # Don't pass self.kv_lens as kv_lens here because it includes extra
+        # tokens. Use the actual KV length (without extra tokens) for
+        # kv_lens_runtime, which becomes host_past_key_value_lengths and
+        # eventually mMaxSeqLenKv.
+        self._bind_runtime_views(
+            kv_lens_cuda=self.kv_lens_cuda[:self.num_seqs],
+            kv_lens=kv_lens[:self.num_seqs],
+            prompt_lens_cuda=self.prompt_lens_cuda[:self.num_seqs],
+            prompt_lens_cpu=self.prompt_lens_cpu[:self.num_seqs],
+            host_request_types=self.host_request_types[:self.num_seqs],
+        )
 
     def prepare_encoder_only(self) -> None:
         """Fast path for encoder-only forward (eager + CUDA graph capture)."""
@@ -581,19 +608,33 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if extra_attrs is None:
             get_global_attrs().attention_metadata = weakref.ref(self)
 
+        # Encoder batches run without a KV cache. The block-offset / block-id
+        # attributes default to None (declared as dataclass fields).
+        self.kv_cache_params = KVCacheParams(use_cache=False)
+
         # For encoder batches every request is a context request, so total
         # kv-tokens equals total q-tokens.
         self.host_total_kv_lens[0] = self._num_tokens
 
+        # `host_request_types` is allocated with `torch.empty_like` (not
+        # zeroed), and the full `prepare()` is what normally fills it. This
+        # fast path skips `prepare()`, so explicitly mark every request as a
+        # context request (type 0) here -- otherwise the FMHA reads whatever
+        # garbage the buffer happened to hold and may treat a context segment
+        # as a generation step.
+        n = self.num_seqs
+        self.host_request_types[:n].fill_(0)
+
         # Graph metadata binds these views once per key; eager refreshes them
         # because batch shape can vary between calls.
         if not self.is_cuda_graph:
-            n = self.num_seqs
-            self.kv_lens_cuda_runtime = self._seq_lens_cuda[:n]
-            self.kv_lens_runtime = self._seq_lens[:n]
-            self.prompt_lens_cuda_runtime = self._seq_lens_cuda[:n]
-            self.prompt_lens_cpu_runtime = self._seq_lens[:n]
-            self.host_request_types_runtime = self.host_request_types[:n]
+            self._bind_runtime_views(
+                kv_lens_cuda=self._seq_lens_cuda[:n],
+                kv_lens=self._seq_lens[:n],
+                prompt_lens_cuda=self._seq_lens_cuda[:n],
+                prompt_lens_cpu=self._seq_lens[:n],
+                host_request_types=self.host_request_types[:n],
+            )
 
     def bind_encoder_cuda_graph_seq_lens(self, seq_lens_host: torch.Tensor,
                                          padded_batch_size: int) -> None:
@@ -602,13 +643,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self._num_contexts = padded_batch_size
         self._num_generations = 0
 
-        self.kv_lens_cuda_runtime = self._seq_lens_cuda[:padded_batch_size]
-        self.kv_lens_runtime = self._seq_lens
-        self.prompt_lens_cuda_runtime = self._seq_lens_cuda[:padded_batch_size]
-        self.prompt_lens_cpu_runtime = self._seq_lens
         self.host_request_types[:padded_batch_size].fill_(0)
-        self.host_request_types_runtime = self.host_request_types[:
-                                                                  padded_batch_size]
+        self._bind_runtime_views(
+            kv_lens_cuda=self._seq_lens_cuda[:padded_batch_size],
+            kv_lens=self._seq_lens,
+            prompt_lens_cuda=self._seq_lens_cuda[:padded_batch_size],
+            prompt_lens_cpu=self._seq_lens,
+            host_request_types=self.host_request_types[:padded_batch_size],
+        )
         self.host_total_kv_lens[1] = 0
 
     def prepare_encoder_cuda_graph_replay(self, seq_lens: List[int],
@@ -1187,9 +1229,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # PyTorch backend, which never overrides them. They guarantee the
         # kernel always receives a valid pointer, since several non-MLA
         # XQA kernels (cpp/kernels/xqa/mha.cu, mha_sm90.cu) deref
-        # ``kvCacheScale[0]`` whenever ``isKVCacheQuantized`` is true and
-        # do not check for nullptr. ``modules/attention.py`` only assigns
-        # ``forward_args.kv_scale_*`` for fp4 KV cache, so without this
+        # `kvCacheScale[0]` whenever `isKVCacheQuantized` is true and
+        # do not check for nullptr. `modules/attention.py` only assigns
+        # `forward_args.kv_scale_*` for fp4 KV cache, so without this
         # fallback the kernel takes nullptr on fp8-KV models → illegal
         # memory access.
         self.kv_cache_scaling_factor = torch.ones(1,
@@ -1429,7 +1471,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # Cross-attention uses the THOP path; the trtllm-gen backend API does
         # not carry encoder K/V tensors yet.
 
-        # SM90 forces ``use_paged_context_fmha`` on for correctness
+        # SM90 forces `use_paged_context_fmha` on for correctness
         # (https://nvbugs/5624818).
         if get_sm_version() == 90:
             metadata.use_paged_context_fmha = True
@@ -1618,8 +1660,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         self._ensure_rope_table_size(metadata.max_seq_len)
 
-        # Prime ``self.local_layer_idx`` so FMHA implementations read a
-        # populated int rather than the ``None`` placeholder.
+        # Prime `self.local_layer_idx` so FMHA implementations read a
+        # populated int rather than the `None` placeholder.
         # The call is a fast cache hit after the first forward.
         self.local_layer_idx = self.get_local_layer_idx(metadata)
         if metadata.spec_decoding_bl_tree_mask is not None and self.local_layer_idx == 0:
@@ -1641,21 +1683,21 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if forward_args.attention_window_size is None:
             forward_args.attention_window_size = metadata.max_seq_len
 
-        # Promote ``out_scale_sf`` -> ``out_scale`` for the NVFP4-output path
-        # (kernel reads a single ``out_scale`` and interprets it as the SF
-        # quant scale when ``output_sf`` is allocated). ``output_sf`` is
-        # populated by ``create_output`` in ``forward`` above, so the
+        # Promote `out_scale_sf` -> `out_scale` for the NVFP4-output path
+        # (kernel reads a single `out_scale` and interprets it as the SF
+        # quant scale when `output_sf` is allocated). `output_sf` is
+        # populated by `create_output` in `forward` above, so the
         # decision is correct only here, not at the modules/attention.py
-        # call site where ``output_sf`` is always ``None``.
+        # call site where `output_sf` is always `None`.
         if forward_args.output_sf is not None and forward_args.out_scale_sf is not None:
             forward_args.out_scale = forward_args.out_scale_sf
 
-        # Default ``forward_args.kv_scale_*`` to the layer-level mirrors when
-        # the caller didn't populate them. ``modules/attention.py`` only sets
-        # these for fp4 KV cache; fp8-KV models leave them ``None``. Several
-        # XQA kernels (mha.cu, mha_sm90.cu) deref ``kvCacheScale[0]`` when
-        # ``isKVCacheQuantized`` is true and don't check for nullptr, so
-        # passing ``None`` crashes with illegal memory access.
+        # Default `forward_args.kv_scale_*` to the layer-level mirrors when
+        # the caller didn't populate them. `modules/attention.py` only sets
+        # these for fp4 KV cache; fp8-KV models leave them `None`. Several
+        # XQA kernels (mha.cu, mha_sm90.cu) deref `kvCacheScale[0]` when
+        # `isKVCacheQuantized` is true and don't check for nullptr, so
+        # passing `None` crashes with illegal memory access.
         if forward_args.kv_scale_orig_quant is None:
             forward_args.kv_scale_orig_quant = self.kv_scale_orig_quant
         if forward_args.kv_scale_quant_orig is None:

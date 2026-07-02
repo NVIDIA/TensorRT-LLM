@@ -180,10 +180,12 @@ class MLP(nn.Module):
 
     @staticmethod
     def _token_count(x: Union[torch.Tensor, tuple, Fp4QuantizedTensor]) -> int:
-        if isinstance(x, (tuple, Fp4QuantizedTensor)):
-            return x[0].shape[0] if isinstance(x, tuple) else x.shape[0]
-        return x.reshape(-1,
-                         x.shape[-1]).shape[0] if x.dim() > 2 else x.shape[0]
+        # Row count M = product of leading dims (B*S for [B, S, ...]); keeps the
+        # fp4-out switch correct for rank-3 / pre-quantized inputs.
+        t = x.fp4_tensor if isinstance(
+            x, Fp4QuantizedTensor) else (x[0] if isinstance(x, tuple) else x)
+        return t.reshape(-1,
+                         t.shape[-1]).shape[0] if t.dim() > 2 else t.shape[0]
 
     def _fused_gelu(
         self,
@@ -205,6 +207,15 @@ class MLP(nn.Module):
         if not isinstance(x, (tuple, Fp4QuantizedTensor)) and x.dim() > 2:
             original_shape = x.shape
             x = x.reshape(-1, x.shape[-1])
+        elif isinstance(x, Fp4QuantizedTensor) and x.fp4_tensor.dim() > 2:
+            # Fused GEMM needs a 2D mat1: flatten a rank-3 fp4 activation's data
+            # to [M, D/2] (its SF is already flat-M, so reuse it); unflatten below.
+            original_shape = x.fp4_tensor.shape
+            x = Fp4QuantizedTensor(
+                fp4_tensor=x.fp4_tensor.reshape(-1, x.fp4_tensor.shape[-1]),
+                scaling_factor=x.scaling_factor,
+                is_sf_swizzled=x.is_sf_swizzled,
+            )
 
         act_fp4, act_sf, alpha = module.quant_method._input_prepare(module, x)
 

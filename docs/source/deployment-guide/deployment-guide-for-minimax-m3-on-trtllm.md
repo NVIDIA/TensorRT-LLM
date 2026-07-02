@@ -6,7 +6,12 @@ This deployment guide provides step-by-step instructions for running the MiniMax
 
 MiniMax-M3 is a Mixture-of-Experts (MoE) model that uses MiniMax block-sparse attention. The first few layers use dense attention with a dense MLP, while the remaining layers combine a sparse attention path (an index-K block selector followed by sparse grouped-query attention) with MoE (top-4 of 128 routed experts plus one shared expert). In TensorRT LLM it is served through the `MiniMaxM3SparseForConditionalGeneration` architecture (text, image, and video) and the text-only `MiniMaxM3SparseForCausalLM` architecture.
 
-MiniMax-M3 is served in **BF16**; no FP8/NVFP4 serving path is supported at this time. The block-sparse attention path does **not** currently support KV cache reuse or Multi-Token Prediction (MTP) in this release.
+TensorRT LLM supports two precisions for MiniMax-M3:
+
+* **BF16** — the official upstream checkpoint from MiniMaxAI.
+* **MXFP8** — an NVIDIA-published checkpoint that quantizes the MoE/Linear weights to MXFP8 while keeping activations and the KV cache in BF16. The weights occupy ~half the memory of BF16, which is the recommended choice for throughput-oriented deployments and is the default for this guide.
+
+The block-sparse attention path does **not** currently support KV cache reuse or Multi-Token Prediction (MTP) in this release.
 
 This guide deploys MiniMax-M3 on **8x NVIDIA GB200 GPUs across 2 nodes** (4 GPUs per node) using Slurm and the `trtllm-llmapi-launch` multi-node launcher, with the MoE experts distributed via expert parallelism. The attention layers can run with either Tensor-Expert Parallelism (TEP) or Data-Expert Parallelism (DEP); see [Choosing the Parallelism Strategy](#choosing-the-parallelism-strategy-tep-vs-dep).
 
@@ -14,7 +19,7 @@ The guide is intended for developers and practitioners seeking high-throughput o
 
 ## Prerequisites
 
-* GPU: 8x NVIDIA GB200 GPUs across 2 nodes (4 GPUs per node). Tensor/expert parallelism of 8 (`--tp_size 8 --moe_expert_parallel_size 8`) spans all 8 GPUs, and the model is served in BF16, so plan for the corresponding memory footprint.
+* GPU: 8x NVIDIA GB200 GPUs across 2 nodes (4 GPUs per node). Tensor/expert parallelism of 8 (`tensor_parallel_size: 8`, `moe_expert_parallel_size: 8` in the curated YAML) spans all 8 GPUs. Plan for the corresponding memory footprint — MXFP8 weights occupy roughly half of BF16.
 * Multi-node launcher: Slurm with the pyxis/enroot container plugin (or an equivalent MPI launcher) to start one rank per GPU across both nodes.
 * High-speed inter-node interconnect (e.g., InfiniBand) for tensor/expert-parallel traffic.
 * Shared filesystem visible to both nodes for the model weights and the configuration file.
@@ -24,24 +29,36 @@ The guide is intended for developers and practitioners seeking high-throughput o
 
 ## Models
 
-The following checkpoint is available:
+Two checkpoints are supported. Both are loaded through the same `MiniMaxM3SparseForConditionalGeneration` / `MiniMaxM3SparseForCausalLM` architectures and share the same chat template and serving CLI; the only difference is the on-disk weight format.
 
-* [MiniMaxAI/MiniMax-M3](https://huggingface.co/MiniMaxAI/MiniMax-M3) — Official BF16 checkpoint
+### MXFP8 (recommended for throughput)
+
+* [MiniMaxAI/MiniMax-M3-MXFP8](https://huggingface.co/MiniMaxAI/MiniMax-M3-MXFP8) — MiniMaxAI-published MXFP8-quantized checkpoint. Weights are stored in MXFP8 (block size 1×32); activations and the KV cache stay in BF16.
+
+```bash
+git lfs install
+git clone https://huggingface.co/MiniMaxAI/MiniMax-M3-MXFP8 /models/MiniMax-M3-MXFP8
+```
+
+### BF16 (upstream)
+
+* [MiniMaxAI/MiniMax-M3](https://huggingface.co/MiniMaxAI/MiniMax-M3) — Official BF16 checkpoint from MiniMaxAI.
 
 ```bash
 git lfs install
 git clone https://huggingface.co/MiniMaxAI/MiniMax-M3 /models/MiniMax-M3
 ```
 
-The checkpoint ships its own chat template (`chat_template.jinja`), which is passed explicitly to the server (see [Launch the TensorRT LLM Server](#launch-the-tensorrt-llm-server)).
+Both checkpoints ship their own chat template (`chat_template.jinja`), which is passed explicitly to the server (see [Launch the TensorRT LLM Server](#launch-the-tensorrt-llm-server)).
 
 ## Feature Support Notes
 
 * **Block-sparse attention is required.** MiniMax-M3 runs on the block-sparse attention backend, which must be selected via `sparse_attention_config.algorithm: minimax_m3` in the YAML configuration. There is no dense fallback for the sparse layers.
-* **BF16 only.** MiniMax-M3 is served in BF16. No FP8/NVFP4 serving path is supported at this time. The default MoE backend is used.
+* **Supported precisions: BF16 and MXFP8.** No additional FP8/NVFP4 serving paths are supported at this time. MXFP8 quantizes only the weights; activations and the KV cache stay in BF16, so the curated YAML is identical for both checkpoints. The default MoE backend is used.
 * **KV cache reuse must be disabled.** KV cache reuse is not supported on the sparse-attention path, so set `kv_cache_config.enable_block_reuse: false`.
 * **MTP is not supported** on the sparse-attention path in this release.
-* **Parallelism**: MoE experts run with expert parallelism. The attention layers support both Tensor-Expert Parallelism (TEP) and Data-Expert Parallelism (DEP, via `--enable_attention_dp`). The overlap scheduler and CUDA graphs are also supported.
+* **`max_seq_len` must be capped for CUDA graphs.** The dense GQA expansion in the first few attention layers and the per-Q FP32 expansion in the sparse decode kernel allocate temporary tensors whose size grows linearly with the warmup decode's `max_k`. If `max_seq_len` is left at the checkpoint default, that `max_k` follows `max_position_embeddings` (1M for MXFP8, 512K for BF16) and the resulting gigabyte-scale single-allocation request exceeds the caching allocator's CUDA-graph-safe path, so capture fails with `cudaErrorStreamCaptureUnsupported` / OOM. The curated YAML therefore sets `max_seq_len` to a small value just above ISL+OSL (`2068` for the 1k/1k benchmark) so CUDA graphs can capture cleanly. Raise it for longer-context workloads, but expect a corresponding cut in `max_batch_size`.
+* **Parallelism.** MoE experts run with expert parallelism. The attention layers support both Tensor-Expert Parallelism (TEP) and Data-Expert Parallelism (DEP, via `enable_attention_dp: true`). The overlap scheduler is enabled by default.
 * **Multimodal.** `MiniMaxM3SparseForConditionalGeneration` supports text, image, and video inputs. The text decoder is also usable standalone (text-only) via the `MiniMaxM3SparseForCausalLM` architecture.
 
 ## Deployment Steps
@@ -89,7 +106,7 @@ The configuration uses Data-Expert Parallelism (DEP): `enable_attention_dp: true
 MiniMax-M3 is launched through the `trtllm-llmapi-launch` wrapper, which sets up the multi-rank (MPI/Slurm) environment that the parallel server requires. The wrapper is run once per rank by Slurm (`srun`), with one task (rank) per GPU. The example below launches the server across 2 nodes (`-N 2`), 4 GPUs per node (`--ntasks-per-node 4`, 8 ranks total), using the curated YAML to drive parallelism, batching, and the MiniMax-M3 sparse-attention backend:
 
 ```bash
-export MODEL=/models/MiniMax-M3   # path on the shared filesystem; mounted into the container
+export MODEL=/models/MiniMax-M3-MXFP8   # MXFP8 (recommended); use /models/MiniMax-M3 for BF16
 
 srun -N 2 \
     --ntasks 8 --ntasks-per-node 4 \
@@ -107,7 +124,7 @@ srun -N 2 \
           --extra_llm_api_options $EXTRA_LLM_API_FILE"
 ```
 
-The parallelism, batch, KV-cache, sparse-attention, and CUDA-graph settings all live in the YAML; no CLI flags need to change to tune them.
+The parallelism, batch, KV-cache, sparse-attention, and CUDA-graph settings all live in the YAML; no CLI flags need to change to tune them. The same `$EXTRA_LLM_API_FILE` is used for both the MXFP8 and BF16 checkpoints — point `$MODEL` at the directory of whichever checkpoint you want to serve.
 
 > [!NOTE]
 > Adjust `-N`, `--ntasks`, `--ntasks-per-node`, and `--gres=gpu:` to match your cluster's GPUs-per-node. The total number of tasks (ranks) must equal `tensor_parallel_size` (`8`). Add the partition / account / node-list flags (`-p`, `-A`, `-w`) required by your Slurm setup, and ensure `/models`, `/workspace`, and the TensorRT LLM repository resolve to the same shared paths on both nodes.
@@ -156,7 +173,7 @@ After the TensorRT LLM server is set up and shows *Application startup complete*
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-      "model": "MiniMaxAI/MiniMax-M3",
+      "model": "MiniMaxAI/MiniMax-M3-MXFP8",
       "messages": [
           {"role": "user", "content": "What is the capital of France?"}
       ],
@@ -171,7 +188,7 @@ Example response:
 {
   "id": "chatcmpl-...",
   "object": "chat.completion",
-  "model": "MiniMaxAI/MiniMax-M3",
+  "model": "MiniMaxAI/MiniMax-M3-MXFP8",
   "choices": [
     {
       "index": 0,
@@ -220,7 +237,7 @@ result_dir=/tmp/minimax_m3_output
 for concurrency in ${concurrency_list}; do
     num_prompts=$((concurrency * multi_round))
     python -m tensorrt_llm.serve.scripts.benchmark_serving \
-        --model MiniMaxAI/MiniMax-M3 \
+        --model MiniMaxAI/MiniMax-M3-MXFP8 \
         --backend openai \
         --dataset-name "random" \
         --random-input-len ${isl} \

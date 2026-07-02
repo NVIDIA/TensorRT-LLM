@@ -1242,6 +1242,28 @@ class Sharding(BaseTransform):
             if ShardingDim.EP in config.sharding_dims:
                 ad_logger.info("Running autodeploy EP sharding heuristics")
                 info += detect_ep_shard(gm, transform_container)
+                # Under attention-DP, EP-sharding the draft submodel forces its
+                # MoE op into the alltoall path. Target and draft share a
+                # single process-wide MoeAlltoAll workspace + flag_val counter
+                # (singleton in MoeAlltoAll._WORKSPACE), so a misconfigured
+                # draft alltoall corrupts the workspace and the subsequent
+                # target alltoall calls hang or fault. Replicating the draft
+                # (no EP sharding, no alltoall) is the safe choice: the draft
+                # is small enough that the 4x weight memory is negligible,
+                # and each rank computes its local-batch slice locally with no
+                # cross-rank communication needed.
+                # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/15168
+                if (
+                    _is_draft
+                    and config.dist_config.enable_attention_dp
+                    and transform_container.ep_transforms
+                ):
+                    ad_logger.info(
+                        "Reverting %d EP sharding transform(s) on draft submodel "
+                        "under attention_dp (replicating instead).",
+                        len(transform_container.ep_transforms),
+                    )
+                    transform_container.ep_transforms.clear()
             if ShardingDim.BMM in config.sharding_dims:
                 # While BMM nodes are most likely used for MoE (e.g. LLama4),
                 # technically, this is a different transformation.
@@ -1355,17 +1377,6 @@ class ShardingTransformExecutor(BaseTransform):
             f"BMM={len(transforms.bmm_transforms)}, "
             f"RMSNorm={len(transforms.rmsnorm_transforms)}"
         )
-
-        # If there are EP transforms and we have a CachedSequenceInterface, ensure
-        # batch_info_host is added to the graph as a placeholder and activated on
-        # the SequenceInfo so the runtime DP-aware max_num_tokens (slot 14) flows
-        # into the MoE all-to-all op as a kwarg. _add_or_retrieve_input is
-        # idempotent — safe even if another transform (e.g.
-        # gather_logits_before_lm_head) already added the placeholder.
-        # When cm is None (e.g., unit tests that drive the sharding transform
-        # standalone), skip — the MoE op falls back to max_num_tokens.
-        if transforms.ep_transforms and cm is not None:
-            self._add_or_retrieve_input(gm, cm, "batch_info_host", init_val=True)
 
         with WeightBiasInfoCache():
             for tp_transform in transforms.weight_sharding_transforms:
@@ -2005,13 +2016,6 @@ def _insert_sharded_moe(
     # (Will be used inside the op to determine enable_alltoall and workspace size)
     mapping_config = config.dist_config.serialize()
 
-    # Look up batch_info_host placeholder if present. ShardingTransformExecutor
-    # ensures it's added/activated when there are EP transforms; if it's missing
-    # (e.g., a different code path bypasses the executor), the MoE op falls back
-    # to max_num_tokens for runtime padding.
-    batch_info_host_nodes = gm.graph.find_nodes(op="placeholder", target="batch_info_host")
-    batch_info_host_node = batch_info_host_nodes[0] if batch_info_host_nodes else None
-
     # Write back weight/scale list updates (applied above) and inject mapping args.
     # set_op_args uses the op schema to place values into kwargs or the correct
     # positional slot, avoiding manual index arithmetic.
@@ -2020,7 +2024,6 @@ def _insert_sharded_moe(
         node,
         mapping_config=mapping_config,
         max_num_tokens=config.max_num_tokens,
-        batch_info_host=batch_info_host_node,
     )
 
     if not enable_alltoall:
