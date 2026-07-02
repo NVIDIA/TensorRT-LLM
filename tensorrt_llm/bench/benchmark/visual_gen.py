@@ -26,7 +26,7 @@ import os
 import tempfile
 import time
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 import click
 
@@ -52,6 +52,18 @@ def _parse_size(size_str: str) -> tuple[Optional[int], Optional[int]]:
             f"Size must be 'auto' or WxH format (e.g. 480x832), got '{size_str}'"
         )
     return int(parts[0]), int(parts[1])
+
+
+def _add_frame_rate_if_supported(
+    gen_params_kwargs: dict[str, Any],
+    *,
+    fps: int,
+    pipeline_defaults: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply the benchmark FPS only when the pipeline declares frame_rate."""
+    if "frame_rate" not in pipeline_defaults:
+        return gen_params_kwargs
+    return {**gen_params_kwargs, "frame_rate": float(fps)}
 
 
 @click.command(name="visual-gen", context_settings={"show_default": True})
@@ -229,7 +241,7 @@ def visual_gen_command(
         seconds = num_frames / fps
         logger.info(f"Computed seconds={seconds:.3f} from num_frames={num_frames} / fps={fps}")
 
-    gen_params_kwargs: dict = {"seed": seed, "frame_rate": float(fps)}
+    gen_params_kwargs: dict = {"seed": seed}
     if height is not None:
         gen_params_kwargs["height"] = height
     if width is not None:
@@ -242,8 +254,6 @@ def visual_gen_command(
         gen_params_kwargs["guidance_scale"] = guidance_scale
     if negative_prompt is not None:
         gen_params_kwargs["negative_prompt"] = negative_prompt
-
-    gen_params = VisualGenParams(**gen_params_kwargs)
 
     gen_params_for_report = {
         "size": size,
@@ -270,6 +280,14 @@ def visual_gen_command(
     )
 
     try:
+        pipeline_defaults = visual_gen.default_params.model_dump(exclude_unset=True)
+        gen_params_kwargs = _add_frame_rate_if_supported(
+            gen_params_kwargs,
+            fps=fps,
+            pipeline_defaults=pipeline_defaults,
+        )
+        gen_params = VisualGenParams(**gen_params_kwargs)
+
         # Warmup
         if warmup > 0:
             logger.info(f"Running {warmup} warmup request(s)...")
