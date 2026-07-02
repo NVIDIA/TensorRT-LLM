@@ -3543,6 +3543,25 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
             task.evaluate(llm, is_integration_test=True)
 
     @pytest.mark.skip_less_mpi_world_size(4)
+    def test_mtp(self):
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.5,
+            use_kv_cache_manager_v2=True,
+        )
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=4,
+                 moe_expert_parallel_size=4,
+                 moe_config=MoeConfig(backend="TRTLLM"),
+                 enable_attention_dp=True,
+                 max_batch_size=1350,
+                 max_seq_len=4096,
+                 max_num_tokens=8192,
+                 kv_cache_config=kv_cache_config,
+                 speculative_config=MTPDecodingConfig(max_draft_len=3)) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_mpi_world_size(4)
     @parametrize_with_ids("moe_backend", [
         pytest.param(
             "WIDEEP",
