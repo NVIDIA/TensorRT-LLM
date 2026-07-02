@@ -42,6 +42,43 @@ if(NIXL_ROOT)
   # Link against CUDA runtime (for cudaMemcpy in posix fallback)
   target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE CUDA::cudart)
 
+  # ------------------------------------------------------------------------
+  # Bounce v2 transport. Its real dependencies are NIXL (data plane, gated by
+  # the NIXL_ROOT block above) + zmq (control plane) — NOT UCX. So compile it
+  # whenever zmq is available, INDEPENDENT of ENABLE_UCX. cppzmq (header-only)
+  # is fetched at the top level when NIXL or UCX is on. Activates the
+  # TLLM_BOUNCE_V2 code paths; runtime use is still opt-in via
+  # TRTLLM_NIXL_BOUNCE_ENABLE.
+  # ------------------------------------------------------------------------
+  find_package(PkgConfig)
+  if(PKG_CONFIG_FOUND)
+    pkg_check_modules(ZMQ libzmq) # optional: bounce is skipped if libzmq is
+                                  # absent
+  endif()
+  if(ZMQ_FOUND)
+    target_sources(
+      ${NIXL_WRAPPER_TARGET}
+      PRIVATE bounce/BounceTransferPlan.cpp
+              bounce/BuddyAllocator.cpp
+              bounce/CreditScheduler.cpp
+              bounce/BounceMessage.cpp
+              bounce/BounceArena.cpp
+              bounce/ExecPool.cpp
+              bounce/GatherScatterKernel.cu
+              bounce/ZmqControlChannel.cpp
+              bounce/NixlTransferEngine.cpp
+              bounce/BounceTransport.cpp)
+    target_include_directories(
+      ${NIXL_WRAPPER_TARGET} PRIVATE ${CMAKE_BINARY_DIR}/_deps/cppzmq-src
+                                     ${ZMQ_INCLUDE_DIRS})
+    target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE ${ZMQ_LIBRARIES}
+                                                         ${NIXL_BUILD_LIBRARY})
+    target_compile_definitions(${NIXL_WRAPPER_TARGET} PRIVATE TLLM_BOUNCE_V2=1)
+    # The .cu device symbols must resolve into this shared lib.
+    set_target_properties(${NIXL_WRAPPER_TARGET}
+                          PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  endif()
+
   set(NIXL_ENABLED TRUE)
 else()
   set(NIXL_ENABLED FALSE)

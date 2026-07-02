@@ -269,8 +269,15 @@ include_directories(${CMAKE_BINARY_DIR}/_deps/nanobind-src/include)
 
 FetchContent_MakeAvailable(cutlass cxxopts flashmla json xgrammar)
 
+# cppzmq (header-only) is the bounce v2 control-plane dependency AND the UCX
+# bootstrap dependency. Make it available whenever NIXL (-> bounce) or UCX is
+# enabled, so bounce does NOT require UCX (its real deps are NIXL + zmq,
+# orthogonal to UCX). ucxx stays UCX-only.
+if(NIXL_ROOT OR ENABLE_UCX)
+  FetchContent_MakeAvailable(cppzmq)
+endif()
 if(ENABLE_UCX)
-  FetchContent_MakeAvailable(cppzmq ucxx)
+  FetchContent_MakeAvailable(ucxx)
 endif()
 
 if(NOT NVTX_DISABLE)
