@@ -66,7 +66,8 @@ from ..utils import (get_model_extra_attrs,
                      set_per_request_piecewise_cuda_graph_flag,
                      set_torch_compiling, with_model_extra_attrs)
 from .config_utils import is_mla
-from .cuda_graph_runner import (CUDAGraphRunner, CUDAGraphRunnerConfig,
+from .cuda_graph_runner import (ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
+                                CUDAGraphRunner, CUDAGraphRunnerConfig,
                                 EncoderCUDAGraphRunner,
                                 EncoderCUDAGraphRunnerConfig)
 from .guided_decoder import CapturableGuidedDecoder
@@ -1398,6 +1399,15 @@ class PyTorchModelEngine(ModelEngine):
 
         def prepare_cross_batch(batch: ScheduledRequests,
                                 resource_manager: ResourceManager) -> None:
+            """Populate dummy gen requests' cross-KV cache before capture.
+
+            Dummy generation requests used for graph capture never ran a
+            context step, so their cross-KV cache blocks are uninitialized
+            and captured kernels would read garbage. Temporarily switch each
+            request to a one-token context chunk with a fake encoder output
+            to run just the cross-KV projection (via _populate_cross_kv_cache),
+            then restore generation state for the actual capture.
+            """
             if not batch.generation_requests:
                 return
 
@@ -1765,8 +1775,9 @@ class PyTorchModelEngine(ModelEngine):
             self._get_max_encoder_output_len(resource_manager)
             if is_enc_dec else None)
 
-        # Add (batch_size - 1) dummy requests with seq_len=1.
-        token_nums = ([2] * (batch_size - 1)) if is_enc_dec else None
+        # Add (batch_size - 1) dummy requests with the minimal seq_len.
+        token_nums = ([ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM] *
+                      (batch_size - 1)) if is_enc_dec else None
         encoder_output_lens = ([max_encoder_output_len] *
                                (batch_size - 1)) if is_enc_dec else None
         requests = kv_cache_manager.add_dummy_requests(
@@ -1812,7 +1823,7 @@ class PyTorchModelEngine(ModelEngine):
             available_tokens = min(available_tokens, draft_available_tokens)
 
         token_num = max(
-            2 if is_enc_dec else 1,
+            ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM if is_enc_dec else 1,
             min(
                 available_tokens, max_seq_len - 1 -
                 get_num_extra_kv_tokens(self.spec_config) - _kv_draft))
@@ -5651,25 +5662,6 @@ class PyTorchModelEngine(ModelEngine):
         if callable(loader):
             loader(target_model)
 
-    @staticmethod
-    def _apply_logits_processors(request, logits_processors, logits_tensor,
-                                 beam_width, token_ids, logits_row_offset):
-        logits_rows = logits_tensor[logits_row_offset:logits_row_offset +
-                                    beam_width]
-        # Reshape to align w/ the shape used in the TRT backend,
-        # so the same logit processors can be used across both backends.
-        logits_rows = logits_rows.view(beam_width, 1, -1)
-        for lp in logits_processors:
-            lp_params = inspect.signature(lp).parameters
-
-            assert 4 <= len(lp_params) <= 5, (
-                "Logit post processor signature must match the `LogitsProcessor` interface "
-                "defined in `tensorrtllm.sampling_params`.")
-            lp(request.py_request_id, logits_rows, token_ids, None, None)
-
-        logits_tensor[logits_row_offset:logits_row_offset +
-                      beam_width] = logits_rows.view(beam_width, -1)
-
     def _execute_logit_post_processors(self,
                                        scheduled_requests: ScheduledRequests,
                                        outputs: dict):
@@ -5682,40 +5674,35 @@ class PyTorchModelEngine(ModelEngine):
             # TODO: support models that don't return outputs as dict
             return
 
+        num_ctx_req = scheduled_requests.num_context_requests
         logits_tensor = outputs["logits"]
 
-        logits_row_offset = 0
-        request_groups = (
-            (scheduled_requests.context_requests, True),
-            (scheduled_requests.generation_requests, False),
-        )
+        for idx, request in enumerate(scheduled_requests.all_requests()):
+            logits_processors = getattr(request, "py_logits_post_processors",
+                                        None)
+            if not logits_processors:
+                continue
 
-        for requests, is_context_request in request_groups:
-            for request in requests:
-                if is_context_request:
-                    beam_width = 1
-                else:
-                    beam_width = request.get_beam_width_by_iter(
-                        for_next_iteration=False)
+            token_ids = request.get_tokens(0)
+            if idx < num_ctx_req and request.py_orig_prompt_len < len(
+                    token_ids):
+                # Skip as we only need to apply logit processor on the last context request
+                continue
 
-                logits_processors = getattr(request,
-                                            "py_logits_post_processors", None)
-                if logits_processors:
-                    token_ids = ([request.get_tokens(0)]
-                                 if is_context_request else [
-                                     request.get_tokens(beam_idx)
-                                     for beam_idx in range(beam_width)
-                                 ])
-                    if (is_context_request
-                            and request.py_orig_prompt_len < len(token_ids[0])):
-                        # Skip as we only need to apply logit processor on the last context request
-                        logits_row_offset += beam_width
-                        continue
+            logits_row = logits_tensor[idx]
+            # Reshape to align w/ the shape used in the TRT backend,
+            # so the same logit processors can be used across both backends.
+            logits_row = logits_row.view(1, 1, -1)
+            token_ids = [token_ids]
+            for lp in logits_processors:
+                lp_params = inspect.signature(lp).parameters
 
-                    self._apply_logits_processors(request, logits_processors,
-                                                  logits_tensor, beam_width,
-                                                  token_ids, logits_row_offset)
-                logits_row_offset += beam_width
+                assert 4 <= len(lp_params) <= 5, (
+                    "Logit post processor signature must match the `LogitsProcessor` interface "
+                    "defined in `tensorrtllm.sampling_params`.")
+                lp(request.py_request_id, logits_row, token_ids, None, None)
+
+            logits_tensor[idx] = logits_row.view(-1)
 
     def wait_for_input_copy(self):
         """

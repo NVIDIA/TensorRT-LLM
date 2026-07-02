@@ -31,6 +31,11 @@ from .scheduler import ScheduledRequests
 
 # A large prime number used for dummy request IDs to avoid collisions
 CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
+# Gen dummies get prompt_len = token_num - 1. Before capturing enc-dec decode
+# graphs, prepare_cross_batch temporarily runs each dummy generation request
+# as a one-token context chunk to write its cross-KV cache, so enc-dec
+# dummies need one prompt token plus one generated token.
+ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM = 2
 KeyType: TypeAlias = Tuple[int, int, bool, bool, bool]
 
 
@@ -525,7 +530,7 @@ class CUDAGraphRunner:
                 if cross_kv_cache_manager is None:
                     return 0
                 dummy_encoder_output_len = self._get_padding_dummy_encoder_output_len(
-                    batch, cross_kv_cache_manager)
+                    cross_kv_cache_manager)
 
             # Get draft KV cache manager only for one-model speculative decoding.
             # In two-model mode, each model has its own KV cache manager, so
@@ -537,7 +542,8 @@ class CUDAGraphRunner:
             dummy_request_id = CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len
             dummy_request = kv_cache_manager.add_dummy_requests(
                 [dummy_request_id],
-                token_nums=[2] if self.is_encoder_decoder else None,
+                token_nums=[ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM]
+                if self.is_encoder_decoder else None,
                 is_gen=True,
                 max_num_draft_tokens=runtime_draft_len,
                 use_mrope=self.config.use_mrope,
@@ -598,15 +604,8 @@ class CUDAGraphRunner:
 
     @staticmethod
     def _get_padding_dummy_encoder_output_len(
-            batch: ScheduledRequests, cross_kv_cache_manager: Any) -> int:
+            cross_kv_cache_manager: Any) -> int:
         encoder_output_len = 1
-        for request in batch.generation_requests:
-            request_encoder_output_len = getattr(request, "encoder_output_len",
-                                                 None)
-            if request_encoder_output_len is not None:
-                encoder_output_len = max(1, int(request_encoder_output_len))
-                break
-
         max_seq_len = getattr(cross_kv_cache_manager, "max_seq_len", None)
         if max_seq_len is not None:
             encoder_output_len = min(encoder_output_len, int(max_seq_len))
