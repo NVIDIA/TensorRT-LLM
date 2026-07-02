@@ -154,7 +154,9 @@ def test_deepseek_v4_model_defaults_keep_tokens_per_block():
 
     defaults = DeepseekV4ForCausalLM.get_model_defaults(LlmArgs())
 
-    assert defaults == {"kv_cache_config": {"tokens_per_block": 128}}
+    assert defaults == {
+        "kv_cache_config": {"tokens_per_block": 128, "use_kv_cache_manager_v2": True}
+    }
 
 
 def test_deepseek_v4_weight_remap_for_mxfp4_routed_experts():
@@ -627,6 +629,50 @@ def test_deepseek_v4_sparse_ratios_prefer_checkpoint_defaults(tmp_path, monkeypa
     # the runtime assertion in deepseek_v4.py:DeepseekV4TrtllmAttentionMetadata
     # __post_init__), so this is the only legal value here.
     assert model_config.sparse_attention_config.window_size == 128
+
+
+def test_deepseek_v4_model_config_defaults_to_fp4_indexer(tmp_path, monkeypatch):
+    checkpoint_ratios = [128, 128, 4, 128, 4, 128, 0, 4]
+    config = DeepseekV4Config(
+        architectures=["DeepseekV4ForCausalLM"],
+        num_hidden_layers=len(checkpoint_ratios),
+        compress_ratios=checkpoint_ratios,
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.model_config.load_pretrained_config", lambda *args, **kwargs: config
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr("tensorrt_llm._utils.get_sm_version", lambda: 100)
+
+    model_config = ModelConfig.from_pretrained(
+        str(tmp_path),
+        attn_backend="TRTLLM",
+        moe_backend="TRTLLM",
+    )
+
+    assert model_config.sparse_attention_config.indexer_k_dtype == "fp4"
+
+
+def test_deepseek_v4_model_config_defaults_to_fp8_before_blackwell(tmp_path, monkeypatch):
+    checkpoint_ratios = [128, 128, 4, 128, 4, 128, 0, 4]
+    config = DeepseekV4Config(
+        architectures=["DeepseekV4ForCausalLM"],
+        num_hidden_layers=len(checkpoint_ratios),
+        compress_ratios=checkpoint_ratios,
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.model_config.load_pretrained_config", lambda *args, **kwargs: config
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr("tensorrt_llm._utils.get_sm_version", lambda: 90)
+
+    model_config = ModelConfig.from_pretrained(
+        str(tmp_path),
+        attn_backend="TRTLLM",
+        moe_backend="TRTLLM",
+    )
+
+    assert model_config.sparse_attention_config.indexer_k_dtype == "fp8"
 
 
 def test_deepseek_v4_sparse_ratios_keep_checkpoint_length_without_mtp(tmp_path, monkeypatch):

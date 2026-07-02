@@ -85,7 +85,6 @@ class TestDeepseekV4CacheManager:
     # indexer quantization config
     indexer_dtype = DataType.FP8
     indexer_scale_dtype = DataType.FLOAT
-    indexer_quant_block_size = 128
 
     # cache manager specific param
     tokens_per_block = 128
@@ -158,14 +157,23 @@ class TestDeepseekV4CacheManager:
         dtype: DataType,
         compressor_dtype: DataType,
         max_input_len: Optional[int] = None,
+        is_draft: bool = False,
+        tp_size: int = 1,
+        enable_attention_dp: bool = False,
+        spec_config: object | None = None,
+        indexer_k_dtype: str | None = None,
     ) -> Tuple[DeepseekV4CacheManager, DeepSeekV4SparseAttentionConfig]:
         """Helper to create a DeepseekV4CacheManager for testing."""
 
         # Create sparse attention config
+        config_kwargs = {}
+        if indexer_k_dtype is not None:
+            config_kwargs["indexer_k_dtype"] = indexer_k_dtype
         sparse_attn_config = DeepSeekV4SparseAttentionConfig(
             index_head_dim=self.index_head_dim,
             window_size=self.window_size,
             compress_ratios=compress_ratios,
+            **config_kwargs,
         )
 
         # Create KV cache config
@@ -281,15 +289,16 @@ class TestDeepseekV4CacheManager:
                 )
 
             if self._is_sparse_layer(ratio):
-                # indexer kv cache is blockwise FP8 quantized
+                # Indexer KV cache stores raw quantized bytes plus raw scale bytes.
                 indexer_dim = sparse_attn_config.index_head_dim
                 indexer_num_tokens = seq_len // ratio
-                num_scales = indexer_dim // self.indexer_quant_block_size
+                indexer_k_dtype = sparse_attn_config.indexer_k_dtype
+                value_dim, scale_dim, scale_dtype = self._indexer_cache_layout(indexer_k_dtype)
                 indexer_values = self._rand_tensor(
-                    (indexer_num_tokens, indexer_dim), torch.uint8, device
+                    (indexer_num_tokens, value_dim), torch.uint8, device
                 )
                 indexer_scales = self._rand_tensor(
-                    (indexer_num_tokens, num_scales), torch.float32, device
+                    (indexer_num_tokens, scale_dim), scale_dtype, device
                 )
                 cache[layer, DeepseekV4AttentionType.INDEXER_COMPRESS] = (
                     indexer_values,
@@ -308,32 +317,41 @@ class TestDeepseekV4CacheManager:
 
         return cache
 
-    def _split_blockwise_buffer(self, buffer: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Split a blockwise FP8 quantized buffer into value and scale buffers.
+    def _indexer_cache_layout(self, indexer_k_dtype: str) -> Tuple[int, int, torch.dtype]:
+        if indexer_k_dtype == "fp8":
+            return self.index_head_dim, self.index_head_dim // 128, torch.float32
+        if indexer_k_dtype == "fp4":
+            return self.index_head_dim // 2, self.index_head_dim // 32, torch.uint8
+        raise ValueError(f"Unsupported indexer_k_dtype {indexer_k_dtype!r}")
+
+    def _split_blockwise_buffer(
+        self,
+        buffer: torch.Tensor,
+        indexer_k_dtype: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Split an indexer K cache buffer into value and scale buffers.
 
         Args:
-            buffer: The blockwise FP8 quantized buffer (shape: [num_blocks, tokens_per_block, bytes_per_token])
+            buffer: The raw indexer K cache buffer.
 
         Returns:
             Tuple of (value_buffer, scale_buffer)
         """
         num_blocks, tokens_per_block, bytes_per_token = buffer.shape
         bytes_per_block = bytes_per_token * tokens_per_block
+        value_dim, scale_dim, scale_dtype = self._indexer_cache_layout(indexer_k_dtype)
+        scale_bytes = scale_dim * scale_dtype.itemsize
 
         # Get value buffer
-        value_shape = (num_blocks, tokens_per_block, self.index_head_dim)
-        value_stride = (bytes_per_block, self.index_head_dim, 1)
+        value_shape = (num_blocks, tokens_per_block, value_dim)
+        value_stride = (bytes_per_block, value_dim, 1)
         value_buffer = buffer.as_strided(value_shape, value_stride, 0).view(torch.uint8)
 
         # Get scale buffer
-        scale_dim = self.index_head_dim // self.indexer_quant_block_size
-        scale_bytes = scale_dim * 4  # float32 = 4 bytes
         scale_shape = (num_blocks, tokens_per_block, scale_bytes)
         scale_stride = (bytes_per_block, scale_bytes, 1)
-        scale_offset = self.index_head_dim * tokens_per_block
-        scale_buffer = buffer.as_strided(scale_shape, scale_stride, scale_offset).view(
-            torch.float32
-        )
+        scale_offset = value_dim * tokens_per_block
+        scale_buffer = buffer.as_strided(scale_shape, scale_stride, scale_offset).view(scale_dtype)
 
         return value_buffer, scale_buffer
 
@@ -469,8 +487,9 @@ class TestDeepseekV4CacheManager:
 
             buffer = _view_fp8_as_uint8(cache_manager.get_buffers(layer_idx, attn_type))
             if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
-                # indexer compress is blockwise FP8 quantized
-                values_buffer, scales_buffer = self._split_blockwise_buffer(buffer)
+                values_buffer, scales_buffer = self._split_blockwise_buffer(
+                    buffer, cache_manager._indexer_k_dtype
+                )
                 self._prefill_write_paged_cache(
                     buffer=values_buffer,
                     block_indices=page_indices,
@@ -526,7 +545,9 @@ class TestDeepseekV4CacheManager:
 
             buffer = _view_fp8_as_uint8(cache_manager.get_buffers(layer_idx, attn_type))
             if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
-                values_buffer, scales_buffer = self._split_blockwise_buffer(buffer)
+                values_buffer, scales_buffer = self._split_blockwise_buffer(
+                    buffer, cache_manager._indexer_k_dtype
+                )
                 self._decode_write_paged_cache(
                     buffer=values_buffer,
                     block_indices=block_indices,
@@ -606,7 +627,9 @@ class TestDeepseekV4CacheManager:
 
                 buffer = _view_fp8_as_uint8(cache_manager.get_buffers(layer, attn_type))
                 if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
-                    values_buffer, scales_buffer = self._split_blockwise_buffer(buffer)
+                    values_buffer, scales_buffer = self._split_blockwise_buffer(
+                        buffer, cache_manager._indexer_k_dtype
+                    )
                     values = self._read_paged_cache(
                         buffer=values_buffer,
                         block_indices=page_indices,
@@ -702,7 +725,7 @@ class TestDeepseekV4CacheManager:
                 )
 
     def test_indexer_cache_layout_default(self):
-        """Indexer compressor cache: FP8 blockwise (128 fp8 + per-128 fp32 scale)."""
+        """DeepSeek-V4 defaults to FP4 indexer K cache on Blackwell+."""
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
             max_batch_size=1,
@@ -710,6 +733,25 @@ class TestDeepseekV4CacheManager:
             compress_ratios=[4],
             dtype=DataType.BF16,
             compressor_dtype=DataType.FLOAT,
+        )
+        try:
+            buffer = cache_manager.get_buffers(0, DeepseekV4AttentionType.INDEXER_COMPRESS)
+            assert buffer.dtype == torch.uint8
+            assert buffer.shape[-1] == 64 + 4
+            assert cache_manager.quant_block_size == 32
+        finally:
+            cache_manager.shutdown()
+
+    def test_indexer_cache_layout_fp8(self):
+        """The legacy FP8 blockwise indexer K cache remains available."""
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=1,
+            max_seq_len=512,
+            compress_ratios=[4],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+            indexer_k_dtype="fp8",
         )
         try:
             buffer = cache_manager.get_buffers(0, DeepseekV4AttentionType.INDEXER_COMPRESS)
