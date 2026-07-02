@@ -1296,11 +1296,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             or metadata.runtime_features.has_speculative_draft_tokens
         ) if metadata.runtime_features else False
 
-        # This is a workaround for https://nvbugs/5624818
-        # Paged context FMHA is forced on SM90 for correctness
-        if get_sm_version() == 90:
-            use_paged_context_fmha = True
-
         return self._is_nvfp4_output_kernel_available(
             tokens_per_block=metadata.tokens_per_block,
             attention_mask=attention_mask,
@@ -1470,11 +1465,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         )
         # Cross-attention uses the THOP path; the trtllm-gen backend API does
         # not carry encoder K/V tensors yet.
-
-        # SM90 forces `use_paged_context_fmha` on for correctness
-        # (https://nvbugs/5624818).
-        if get_sm_version() == 90:
-            metadata.use_paged_context_fmha = True
 
         # Sparse mqa/gqa attention uses generation kernel which reads Q from qPtr (separate buffer).
         # Force paged context FMHA so QKV preprocessing writes Q to q_buf_2_.
