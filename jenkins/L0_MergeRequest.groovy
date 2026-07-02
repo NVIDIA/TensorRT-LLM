@@ -1218,14 +1218,15 @@ def collectTestResults(pipeline, testFilter, globalVars)
         }
         parallelTasks["Test Coverage"] = {
             try {
-            timeout(time: 10, unit: 'MINUTES') {
+            timeout(time: 30, unit: 'MINUTES') {
             try {
                 stage("Test Coverage") {
                     sh "ls"
                     def CUR_PATH = sh(returnStdout: true, script: 'pwd').replaceAll("\\s","")
                     sh "echo ${CUR_PATH}"
                     sh "rm -rf cov && mkdir -p cov"
-                    sh "find . -type f -wholename '*/.coverage.*' -exec mv {} cov/ \\; || true"
+                    // Batch moves with `mv -t ... +` to avoid per-file fork/exec on the large post-merge file set.
+                    sh "find . -type f -wholename '*/.coverage.*' -exec mv -t cov/ {} + || true"
                     sh "cd cov && find . -type f"
                     def fileCount = sh(returnStdout: true, script: 'find cov -type f | wc -l').replaceAll("\\s","").toInteger()
                     if (fileCount == 0) {
@@ -1238,18 +1239,35 @@ def collectTestResults(pipeline, testFilter, globalVars)
                     sh "cp llm/examples/openai_triton/manual_plugin/fmha_triton.py llm/examples/openai_triton/plugin_autogen/"
                     def coverageConfigFile = "cov/.coveragerc"
                     sh """
-                        echo '[paths]' > ${coverageConfigFile}
-                        echo 'source1=\n    ${CUR_PATH}/llm/examples/\n    */TensorRT-LLM/src/examples/' >> ${coverageConfigFile}
-                        echo 'source2=\n    ${CUR_PATH}/llm/tensorrt_llm/\n    */tensorrt_llm/' >> ${coverageConfigFile}
+                        cat > ${coverageConfigFile} <<'EOF'
+[paths]
+source1 =
+    ${CUR_PATH}/llm/examples/
+    */TensorRT-LLM/src/examples/
+source2 =
+    ${CUR_PATH}/llm/tensorrt_llm/
+    */tensorrt_llm/
+
+[html]
+show_contexts = True
+EOF
                         cat ${coverageConfigFile}
                     """
 
                     sh "cd cov && coverage combine"
                     sh "cd cov && find . -type f"
-                    sh "cd cov && coverage report -i"   // -i: ignore errors. Ignore the error that the source code file cannot be found.
-                    sh "cd cov && coverage html -d test_coverage_html -i"
-                    trtllm_utils.uploadArtifacts("cov/test_coverage_html/*", "${UPLOAD_PATH}/test-results/coverage-report/")
-                    echo "Test coverage report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/coverage-report/index.html"
+                    // Render the HTML report from the combined data (default .coverage) before renaming.
+                    // --show-contexts emits the per-test covering-test annotations captured via switch_context.
+                    sh "cd cov && coverage report -i || true"
+                    sh "cd cov && coverage html --show-contexts -d test_coverage_html -i"
+                    // The HTML report is a directory of many files; compress it into a single tarball before upload.
+                    sh "cd cov && tar czf coverage-report.tar.gz test_coverage_html"
+                    trtllm_utils.uploadArtifacts("cov/coverage-report.tar.gz", "${UPLOAD_PATH}/cbts-coverage/")
+                    echo "Test coverage HTML report (tar.gz): https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/cbts-coverage/coverage-report.tar.gz"
+                    // Upload the merged DB as a single uncompressed file; rename so the dotfile is visible in Artifactory's web UI.
+                    sh "cd cov && mv .coverage coverage.sqlite"
+                    trtllm_utils.uploadArtifacts("cov/coverage.sqlite", "${UPLOAD_PATH}/cbts-coverage/")
+                    echo "Merged coverage DB: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/cbts-coverage/coverage.sqlite"
                 } // Test coverage
             }
             catch (InterruptedException e)
@@ -1260,7 +1278,7 @@ def collectTestResults(pipeline, testFilter, globalVars)
             {
                 pipeline.echo("Test coverage failed execution.")
             }
-            } // timeout 10 min
+            } // timeout 30 min
             } catch (Exception e) {
                 echo "Test Coverage failed or timed out: ${e.toString()}"
             }

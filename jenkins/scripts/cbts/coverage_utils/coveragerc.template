@@ -1,0 +1,32 @@
+# Coverage.py config template, substituted by make_coveragerc.sh.
+
+[run]
+core = sysmon
+# branch=False: sysmon core does not support branch tracing without falling back to settrace.
+branch = False
+parallel = True
+concurrency = multiprocessing,thread
+sigterm = True
+# Suppress no-data-collected warnings from subprocesses that never trace product source.
+disable_warnings = no-data-collected
+source =
+    @TRTLLM_WHEEL_PATH@/tensorrt_llm/
+omit =
+    **/test_*
+    */__pycache__/*
+    **/sitecustomize.py
+    **/coverage_utils/*
+    */tmp*/*
+data_file = @JOB_WORKSPACE@/.coverage.@STAGE_NAME@
+
+[paths]
+source =
+    @TRTLLM_SRC_PATH@/tensorrt_llm/
+    @TRTLLM_WHEEL_PATH@/tensorrt_llm/
+
+[report]
+ignore_errors = True
+
+[html]
+# Emit per-line covering-test annotations in the HTML report.
+show_contexts = True
