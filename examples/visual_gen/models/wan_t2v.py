@@ -58,6 +58,8 @@ def main():
     params.height = 480
     params.width = 832
     params.num_frames = 165
+    # Pinned seed so VBench accuracy tests are deterministic (see nvbugs/6357628).
+    params.seed = 42
 
     output = visual_gen.generate(
         inputs="A cute cat playing piano",
