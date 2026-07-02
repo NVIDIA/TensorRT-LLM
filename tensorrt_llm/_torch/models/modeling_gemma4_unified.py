@@ -149,7 +149,6 @@ class Gemma4UnifiedVisionEmbedder(nn.Module):
             mapping=mapping,
         )
 
-    @torch.inference_mode()
     def forward(self, pixel_values: torch.Tensor, image_position_ids: torch.Tensor) -> torch.Tensor:
         hidden_states = pixel_values.to(self.patch_dense.weight.dtype)  # (B, P, patch_dim)
         hidden_states = self.patch_ln1(hidden_states)
@@ -204,7 +203,10 @@ class Gemma4UnifiedInputProcessor(Gemma4InputProcessor):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if self._processor is None:
+        # AutoProcessor may fail outright (None) or fall back to a bare tokenizer
+        # when it cannot resolve Gemma4UnifiedProcessor; either way it lacks the
+        # per-modality components, so install the vendored processor instead.
+        if self._processor is None or not hasattr(self._processor, "image_processor"):
             self._processor = load_gemma4_unified_processor(self._model_path, self._tokenizer)
             self._image_processor = self._processor.image_processor
 
@@ -317,7 +319,6 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
 
     # --- Encoder-free feature extractors (override the tower-based parents) ---
 
-    @torch.inference_mode()
     def _get_image_features(self, pixel_values, image_position_ids=None, image_seq_lens=None):
         with torch.autocast(device_type="cuda", dtype=self.model_dtype):
             features = self.embed_vision(pixel_values, image_position_ids)  # (B, P, H)
@@ -329,7 +330,6 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
             features = features.reshape(-1, features.shape[-1])
         return features.contiguous()
 
-    @torch.inference_mode()
     def _get_audio_features(self, audio_features, audio_features_mask=None):
         target_dtype = self.embed_audio.embedding_projection.weight.dtype
         with torch.autocast(device_type="cuda", dtype=self.model_dtype):
@@ -435,7 +435,6 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
 
         return torch.cat(embeddings, dim=0) if embeddings else torch.empty(0)
 
-    @torch.inference_mode()
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -1434,6 +1433,11 @@ def load_gemma4_unified_processor(model_path: str, tokenizer) -> Gemma4UnifiedPr
     image_processor = Gemma4UnifiedImageProcessor(**_component_kwargs("image_processor"))
     feature_extractor = Gemma4UnifiedAudioFeatureExtractor(**_component_kwargs("feature_extractor"))
     video_processor = Gemma4UnifiedVideoProcessor(**_component_kwargs("video_processor"))
+
+    # TRT-LLM hands over its TransformersTokenizer wrapper; the HF methods the
+    # shim calls (add_special_tokens, convert_tokens_to_ids) live on the
+    # underlying tokenizer.
+    tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
 
     with open(os.path.join(model_path, "tokenizer_config.json"), encoding="utf-8") as f:
         tokenizer_config = json.load(f)

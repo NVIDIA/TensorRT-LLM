@@ -66,9 +66,9 @@ class Gemma4UnifiedVisionConfig(PretrainedConfig):
 class Gemma4UnifiedAudioConfig(PretrainedConfig):
     """Sub-config for the encoder-free audio projector.
 
-    `output_proj_dims` is a property returning `audio_embed_dim` (the raw
-    audio frame width), matching the HF implementation where both fields alias
-    the same value.
+    `output_proj_dims` and `hidden_size` alias `audio_embed_dim` (the raw audio
+    frame width) when not given, matching the HF implementation; they are plain
+    attributes here so a checkpoint config.json that spells them out loads as-is.
     """
 
     model_type = "gemma4_unified_audio"
@@ -77,19 +77,17 @@ class Gemma4UnifiedAudioConfig(PretrainedConfig):
         self,
         audio_embed_dim: int = 640,
         rms_norm_eps: float = 1e-6,
+        output_proj_dims: int | None = None,
+        hidden_size: int | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.audio_embed_dim = audio_embed_dim
         self.rms_norm_eps = rms_norm_eps
-
-    @property
-    def output_proj_dims(self) -> int:
-        return self.audio_embed_dim
-
-    @property
-    def hidden_size(self) -> int:
-        return self.audio_embed_dim
+        self.output_proj_dims = (
+            output_proj_dims if output_proj_dims is not None else audio_embed_dim
+        )
+        self.hidden_size = hidden_size if hidden_size is not None else audio_embed_dim
 
 
 class Gemma4UnifiedConfig(PretrainedConfig):

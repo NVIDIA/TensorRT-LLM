@@ -21,6 +21,9 @@ from .modeling_exaone4_5 import Exaone4_5_ForConditionalGeneration
 from .modeling_exaone_moe import ExaoneMoeForCausalLM
 from .modeling_gemma3 import Gemma3ForCausalLM
 from .modeling_gemma3vl import Gemma3VLM
+from .modeling_gemma4 import Gemma4ForCausalLM
+from .modeling_gemma4_unified import Gemma4UnifiedForConditionalGeneration
+from .modeling_gemma4mm import Gemma4ForConditionalGeneration
 from .modeling_glm import Glm4MoeForCausalLM
 from .modeling_gpt_oss import GptOssForCausalLM
 from .modeling_hunyuan_dense import HunYuanDenseV1ForCausalLM
@@ -75,6 +78,9 @@ __all__ = [
     "ExaoneMoeForCausalLM",
     "Gemma3ForCausalLM",
     "Gemma3VLM",
+    "Gemma4ForCausalLM",
+    "Gemma4ForConditionalGeneration",
+    "Gemma4UnifiedForConditionalGeneration",
     "HCXVisionForCausalLM",
     "LagunaForCausalLM",
     "HunYuanDenseV1ForCausalLM",
@@ -131,18 +137,3 @@ else:
     print(
         f"Failed to import MllamaForConditionalGeneration as transformers.__version__ {transformers.__version__} < 4.45.1"
     )
-
-# Gemma 4 (native and the encoder-free "unified" 12B) needs transformers>=5.5.0,
-# guaranteed by the repo pin (5.5.4). The unified flavor's config classes are
-# provided by TRT-LLM shims in _torch/configs/gemma4_unified.py on transformers
-# releases that do not ship them natively.
-from .modeling_gemma4 import Gemma4ForCausalLM  # noqa
-from .modeling_gemma4_unified import \
-    Gemma4UnifiedForConditionalGeneration  # noqa
-from .modeling_gemma4mm import Gemma4ForConditionalGeneration  # noqa
-
-__all__.extend([
-    "Gemma4ForCausalLM",
-    "Gemma4ForConditionalGeneration",
-    "Gemma4UnifiedForConditionalGeneration",
-])

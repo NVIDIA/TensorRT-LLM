@@ -34,11 +34,11 @@ from tensorrt_llm._torch.configs import (
     Gemma4UnifiedVisionConfig,
 )
 from tensorrt_llm._torch.models.checkpoints.hf.gemma4_weight_mapper import Gemma4HfWeightMapper
-from tensorrt_llm._torch.models.gemma4_unified_processing import (
+from tensorrt_llm._torch.models.modeling_gemma4_unified import (
     Gemma4UnifiedAudioFeatureExtractor,
+    Gemma4UnifiedForConditionalGeneration,
     Gemma4UnifiedImageProcessor,
 )
-from tensorrt_llm._torch.models.modeling_gemma4_unified import Gemma4UnifiedForConditionalGeneration
 from tensorrt_llm._torch.models.modeling_utils import (
     _GEMMA4_ARCHITECTURES,
     MODEL_CLASS_MAPPER_MAPPING,
@@ -78,6 +78,9 @@ _UNIFIED_CONFIG_DICT = {
     "audio_config": {
         "model_type": "gemma4_unified_audio",
         "audio_embed_dim": 640,
+        # The real checkpoint spells out the aliases; they must load as-is.
+        "output_proj_dims": 640,
+        "hidden_size": 640,
         "rms_norm_eps": 1e-6,
     },
 }
