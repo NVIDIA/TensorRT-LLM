@@ -3,13 +3,14 @@ import inspect
 import os
 import traceback
 import warnings
+from contextlib import nullcontext
 from typing import Callable, Optional, Tuple
 
 import torch
 
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
     AutoCheckpointMapper, BaseCheckpointLoader)
-from tensorrt_llm._utils import str_dtype_to_torch
+from tensorrt_llm._utils import is_device_integrated, str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import (ExecutorMemoryType,
                                           ModelExpressConfig, TorchLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
@@ -348,137 +349,170 @@ class ModelLoader:
                 is_meta_init = False
 
             memo = dict()
+            defer_weight_allocation = (is_meta_init and is_device_integrated()
+                                       and load_format == LoadFormat.AUTO)
+            if defer_weight_allocation:
+                logger.info(
+                    "Integrated GPU (unified memory): deferring CUDA weight "
+                    "allocation until checkpoint load to reduce peak memory.")
+
+            def materialize_cuda_tensor(t: torch.Tensor) -> torch.Tensor:
+                if t not in memo:
+                    if t.device == torch.device('meta'):
+                        cuda_t = torch.empty_like(t, device='cuda')
+                    elif not t.is_cuda:
+                        cuda_t = t.cuda()
+                    else:
+                        cuda_t = t
+                    memo[t] = cuda_t
+                    memo[cuda_t] = cuda_t
+                return memo[t]
 
             if self.model_weights_memory_tag is not None:
                 # Allocate buffers to the outer virtual_memory_scope,
                 # but parameters (weights) to the dedicated inner virtual_memory_scope.
 
-                def allocate_buffer_on_cuda(t: torch.Tensor):
-                    if t not in memo:
-                        if t.device == torch.device('meta'):
+                _apply_to_buffers_only(model, materialize_cuda_tensor)
+
+                if not defer_weight_allocation:
+                    need_initialized_weights = load_format not in (
+                        LoadFormat.AUTO, LoadFormat.DUMMY)
+
+                    def allocate_weights_on_cuda(t: torch.Tensor):
+                        if t not in memo:
                             cuda_t = torch.empty_like(t, device='cuda')
-                        else:
-                            cuda_t = t.cuda()
-                        memo[t] = cuda_t
-                        memo[cuda_t] = cuda_t
-                    return memo[t]
+                            if t.device != torch.device('meta') and (
+                                    need_initialized_weights or is_meta_init):
+                                if t.is_cuda:
+                                    memory_type_map = {
+                                        ExecutorMemoryType.MODEL_WEIGHTS_MAIN:
+                                        ExecutorMemoryType.MODEL_ENGINE_MAIN,
+                                        ExecutorMemoryType.MODEL_WEIGHTS_DRAFT:
+                                        ExecutorMemoryType.MODEL_ENGINE_DRAFT,
+                                    }
 
-                _apply_to_buffers_only(model, allocate_buffer_on_cuda)
+                                    warnings.warn(
+                                        f"A weight tensor of shape {t.shape} is already allocated on CUDA device before "
+                                        f"the weight allocation stage. This will cause extra CUDA memory usage in the "
+                                        f"'{memory_type_map[self.model_weights_memory_tag]}' scope."
+                                    )
+                                cuda_t.copy_(t)
+                            memo[t] = cuda_t
+                            memo[cuda_t] = cuda_t
+                        return memo[t]
 
-                need_initialized_weights = load_format not in (LoadFormat.AUTO,
-                                                               LoadFormat.DUMMY)
-
-                def allocate_weights_on_cuda(t: torch.Tensor):
-                    if t not in memo:
-                        cuda_t = torch.empty_like(t, device='cuda')
-                        if t.device != torch.device('meta') and (
-                                need_initialized_weights or is_meta_init):
-                            if t.is_cuda:
-                                memory_type_map = {
-                                    ExecutorMemoryType.MODEL_WEIGHTS_MAIN:
-                                    ExecutorMemoryType.MODEL_ENGINE_MAIN,
-                                    ExecutorMemoryType.MODEL_WEIGHTS_DRAFT:
-                                    ExecutorMemoryType.MODEL_ENGINE_DRAFT,
-                                }
-
-                                warnings.warn(
-                                    f"A weight tensor of shape {t.shape} is already allocated on CUDA device before "
-                                    f"the weight allocation stage. This will cause extra CUDA memory usage in the "
-                                    f"'{memory_type_map[self.model_weights_memory_tag]}' scope."
-                                )
-                            cuda_t.copy_(t)
-                        memo[t] = cuda_t
-                        memo[cuda_t] = cuda_t
-                    return memo[t]
-
-                with virtual_memory_scope(
-                        self.model_weights_memory_tag,
-                        self.model_weights_restore_mode) as pool:
-                    model._apply(allocate_weights_on_cuda)
-                self._weight_pool_proxy = pool
+                    with virtual_memory_scope(
+                            self.model_weights_memory_tag,
+                            self.model_weights_restore_mode) as pool:
+                        model._apply(allocate_weights_on_cuda)
+                    self._weight_pool_proxy = pool
             elif is_meta_init:
+                if defer_weight_allocation:
+                    _apply_to_buffers_only(model, materialize_cuda_tensor)
+                else:
 
-                def init_meta_tensor(t: torch.Tensor):
-                    if t.device != torch.device('meta'):
-                        return t
+                    def init_meta_tensor(t: torch.Tensor):
+                        if t.device != torch.device('meta'):
+                            return t
 
-                    if t not in memo:
-                        memo[t] = torch.empty_like(t, device='cuda')
-                    return memo[t]
+                        if t not in memo:
+                            memo[t] = torch.empty_like(t, device='cuda')
+                        return memo[t]
 
-                model._apply(init_meta_tensor)
+                    model._apply(init_meta_tensor)
 
-            # Ensure everything is at least on CUDA
-            # No-op if worked as expected
-            model.to("cuda")
+            if not defer_weight_allocation:
+                # Ensure everything is at least on CUDA
+                # No-op if worked as expected
+                model.to("cuda")
             del memo
 
-            rank_model_storage = get_rank_model_storage(model)
-            logger.info(
-                f"Use {rank_model_storage / (1024**3):.2f} GB for model weights."
-            )
-            weights_preloaded = False
-            if load_format == LoadFormat.AUTO:
-                # Pass model= so format-specific loaders (e.g. MX) can
-                # write weights directly into parameter buffers via P2P.
-                # Generic loaders ignore model=; loaders that can consume a
-                # live module reference (MX) use it for direct writes.
-                load_weights_kwargs: dict = {
-                    "mapping": self.mapping,
-                    "model": model,
-                }
-
-                if hasattr(model, 'llm_checkpoint_dir'):
-                    weights = checkpoint_loader.load_weights(
-                        model.llm_checkpoint_dir, **load_weights_kwargs)
-                else:
-                    weights = checkpoint_loader.load_weights(
-                        checkpoint_dir, **load_weights_kwargs)
-
-                # When MX P2P succeeds, weights are already in model params.
-                # A non-empty dict contains size-mismatched tensors that
-                # should be merged via the standard disk pipeline.
-                weights_preloaded = checkpoint_loader.is_weights_preloaded()
-                self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
-                    model, config)
-
-                if weights:
-                    self._call_load_weights(model.load_weights, weights,
-                                            self.weight_mapper)
-
-                if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
-                ):
-                    weights = checkpoint_loader.load_weights(
-                        self.spec_config.speculative_model,
-                        mapping=self.mapping)
-
-                    draft_model_arch = model.draft_config.pretrained_config.architectures[
-                        0]
-                    draft_weight_mapper = AutoCheckpointMapper.get(
-                        checkpoint_loader.checkpoint_format, draft_model_arch)
-                    draft_weight_mapper.init_model_and_config(
-                        model.draft_model, model.draft_config)
-
-                    self._call_load_weights(model.load_draft_weights, weights,
-                                            draft_weight_mapper)
-
-            elif load_format == LoadFormat.DUMMY:
-                self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
-                    model, config)
-                initialize_dummy_weights(model)
-                if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
-                ):
-                    model.draft_model.load_weights_from_target_model(model)
-
-            elif load_format == LoadFormat.VISION_ONLY:
-                # Vision weights are already loaded within the model.
+            if not defer_weight_allocation:
+                rank_model_storage = get_rank_model_storage(model)
                 logger.info(
-                    "LoadFormat.VISION_ONLY: skipping weight loading; using preloaded vision weights."
+                    f"Use {rank_model_storage / (1024**3):.2f} GB for model weights."
                 )
 
-            else:
-                raise NotImplementedError(
-                    f"No load support for load format: {load_format}")
+            weight_vm_ctx = nullcontext()
+            if defer_weight_allocation and self.model_weights_memory_tag is not None:
+                weight_vm_ctx = virtual_memory_scope(
+                    self.model_weights_memory_tag,
+                    self.model_weights_restore_mode)
+
+            weights_preloaded = False
+            with weight_vm_ctx as weight_pool:
+                if defer_weight_allocation and self.model_weights_memory_tag is not None:
+                    self._weight_pool_proxy = weight_pool
+
+                if load_format == LoadFormat.AUTO:
+                    # Pass model= so format-specific loaders (e.g. MX) can
+                    # write weights directly into parameter buffers via P2P.
+                    # Generic loaders ignore model=; loaders that can consume a
+                    # live module reference (MX) use it for direct writes.
+                    load_weights_kwargs: dict = {
+                        "mapping": self.mapping,
+                        "model": model,
+                    }
+
+                    if hasattr(model, 'llm_checkpoint_dir'):
+                        weights = checkpoint_loader.load_weights(
+                            model.llm_checkpoint_dir, **load_weights_kwargs)
+                    else:
+                        weights = checkpoint_loader.load_weights(
+                            checkpoint_dir, **load_weights_kwargs)
+
+                    # When MX P2P succeeds, weights are already in model params.
+                    # A non-empty dict contains size-mismatched tensors that
+                    # should be merged via the standard disk pipeline.
+                    weights_preloaded = checkpoint_loader.is_weights_preloaded()
+                    self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
+                        model, config)
+
+                    if weights:
+                        self._call_load_weights(model.load_weights, weights,
+                                                self.weight_mapper)
+
+                    if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
+                    ):
+                        weights = checkpoint_loader.load_weights(
+                            self.spec_config.speculative_model,
+                            mapping=self.mapping)
+
+                        draft_model_arch = model.draft_config.pretrained_config.architectures[
+                            0]
+                        draft_weight_mapper = AutoCheckpointMapper.get(
+                            checkpoint_loader.checkpoint_format,
+                            draft_model_arch)
+                        draft_weight_mapper.init_model_and_config(
+                            model.draft_model, model.draft_config)
+
+                        self._call_load_weights(model.load_draft_weights,
+                                                weights, draft_weight_mapper)
+
+                elif load_format == LoadFormat.DUMMY:
+                    self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
+                        model, config)
+                    initialize_dummy_weights(model)
+                    if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
+                    ):
+                        model.draft_model.load_weights_from_target_model(model)
+
+                elif load_format == LoadFormat.VISION_ONLY:
+                    # Vision weights are already loaded within the model.
+                    logger.info(
+                        "LoadFormat.VISION_ONLY: skipping weight loading; using preloaded vision weights."
+                    )
+
+                else:
+                    raise NotImplementedError(
+                        f"No load support for load format: {load_format}")
+
+            if defer_weight_allocation:
+                model.to("cuda")
+                rank_model_storage = get_rank_model_storage(model)
+                logger.info(
+                    f"Use {rank_model_storage / (1024**3):.2f} GB for model weights "
+                    f"after integrated GPU lazy allocation.")
 
             checkpoint_loader.post_load_apply(
                 model, weights_preloaded=weights_preloaded)

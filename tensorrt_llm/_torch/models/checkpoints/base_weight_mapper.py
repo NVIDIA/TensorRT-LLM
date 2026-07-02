@@ -81,8 +81,12 @@ class BaseWeightMapper(ABC):
         """
         import re
 
-        from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
-            ConsumableWeightsDict
+        from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
+            ConsumableWeightsDict, MmappedSafetensorsWeights,
+            rename_weight_keys_with_regex)
+
+        if isinstance(weights, MmappedSafetensorsWeights):
+            return rename_weight_keys_with_regex(weights, params_map)
 
         # Check if input is a ConsumableWeightsDict to preserve the type
         is_consumable = isinstance(weights, ConsumableWeightsDict)

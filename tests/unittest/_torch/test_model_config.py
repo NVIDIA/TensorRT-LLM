@@ -243,7 +243,7 @@ def test_load_modelopt_mixed_precision_w4a16_uses_layer_quant_config(tmp_path):
     assert layer_quant_config["model.layers.0.mlp.experts"].quant_algo == QuantAlgo.W4A16_NVFP4
 
 
-def test_qwen35_compat_adds_qkvz_excludes_to_modelopt_ignore():
+def test_qwen35_compat_normalizes_modelopt_ignore_without_qkvz_override():
     config_dict = {
         "architectures": ["Qwen3_5MoeForConditionalGeneration"],
         "model_type": "qwen3_5_moe",
@@ -263,7 +263,7 @@ def test_qwen35_compat_adds_qkvz_excludes_to_modelopt_ignore():
             "quant_method": "modelopt",
             "quant_algo": "MIXED_PRECISION",
             "ignore": [
-                "model.language_model.layers.0.linear_attn.in_proj_qkv",
+                "model.language_model.layers.0.linear_attn.out_proj",
                 "mtp.layers.0*",
             ],
             "quantized_layers": {},
@@ -273,15 +273,14 @@ def test_qwen35_compat_adds_qkvz_excludes_to_modelopt_ignore():
     normalized = _Qwen35ConfigCompat.normalize(config_dict)
 
     ignore = normalized["quantization_config"]["ignore"]
-    assert "model.language_model.layers.0.linear_attn.in_proj_qkv" in ignore
-    assert "mtp.layers.0*" in ignore
-    assert "model.layers.0.linear_attn.in_proj_qkvz" in ignore
-    assert "model.layers.2.linear_attn.in_proj_qkvz" in ignore
-    assert "model.layers.3.linear_attn.in_proj_qkvz" in ignore
+    assert ignore == ["model.layers.0.linear_attn.out_proj"]
+    assert "model.layers.0.linear_attn.in_proj_qkvz" not in ignore
+    assert "model.layers.2.linear_attn.in_proj_qkvz" not in ignore
+    assert "model.layers.3.linear_attn.in_proj_qkvz" not in ignore
     assert "model.layers.1.linear_attn.in_proj_qkvz" not in ignore
 
 
-def test_qwen35_file_modelopt_config_adds_qkvz_excludes(tmp_path):
+def test_qwen35_file_modelopt_config_preserves_excludes_without_qkvz_override(tmp_path):
     config_dict = {
         "architectures": ["Qwen3_5MoeForConditionalGeneration"],
         "model_type": "qwen3_5_moe",
@@ -341,9 +340,9 @@ def test_qwen35_file_modelopt_config_adds_qkvz_excludes(tmp_path):
     exclude_modules = model_config.quant_config.exclude_modules
     assert "mtp.layers.0*" in exclude_modules
     assert "mtp*" in exclude_modules
-    assert "model.layers.0.linear_attn.in_proj_qkvz" in exclude_modules
-    assert "model.layers.2.linear_attn.in_proj_qkvz" in exclude_modules
-    assert "model.layers.3.linear_attn.in_proj_qkvz" in exclude_modules
+    assert "model.layers.0.linear_attn.in_proj_qkvz" not in exclude_modules
+    assert "model.layers.2.linear_attn.in_proj_qkvz" not in exclude_modules
+    assert "model.layers.3.linear_attn.in_proj_qkvz" not in exclude_modules
     assert "model.layers.1.linear_attn.in_proj_qkvz" not in exclude_modules
 
 

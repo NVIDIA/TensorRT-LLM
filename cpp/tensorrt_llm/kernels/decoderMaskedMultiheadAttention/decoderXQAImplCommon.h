@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -83,6 +83,20 @@ struct XQAKernelRuntimeHashKey
 
 uint32_t getKernelMTileSize(
     uint32_t headGrpSize, bool isSpecDec, uint32_t qSeqLen, bool isXqaJit, bool supportQGMMA, bool supportMLA);
+
+inline uint32_t getSpecDecHmmaMTileSize(uint32_t headGrpSize, uint32_t qSeqLen)
+{
+    return getKernelMTileSize(
+        headGrpSize, /*isSpecDec=*/true, qSeqLen, /*isXqaJit=*/true, /*supportQGMMA=*/false, /*supportMLA=*/false);
+}
+
+inline uint32_t getSpecDecHmmaTokenBlocksPerGroup(uint32_t headGrpSize, uint32_t qSeqLen)
+{
+    uint32_t const mTileSize = getSpecDecHmmaMTileSize(headGrpSize, qSeqLen);
+    TLLM_CHECK_WITH_INFO(mTileSize > 0U, "Spec-dec HMMA M tile size must be positive.");
+    uint32_t const headTokens = qSeqLen * headGrpSize;
+    return (headTokens + mTileSize - 1U) / mTileSize;
+}
 
 XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQAParams const& xqaParams, bool isXqaJit, int SM);
 
@@ -397,7 +411,7 @@ inline int computeMultiBlockCountForMLA(XQAParams const& xqaParams, int multipro
     return 1; // disable multi-block for MLA kernel for now.
 }
 
-inline int computeMultiBlockCountSpecDecGMMA(
+inline int computeMultiBlockCountSpecDec(
     XQAParams const& xqaParams, int batch_size, int multiprocessor_count, int specDecBlocks)
 {
     auto const userSpecified = tensorrt_llm::common::getEnvXqaBlocksPerSequence();
@@ -416,7 +430,7 @@ inline int computeMultiBlockCountSpecDecGMMA(
         return multi_block_count;
     }
 
-    // gridDim = dim3{specDecBlocks, multi_block, nbKVHeads * xqaParams.batch_size}
+    // GMMA uses specDecBlocks along grid.x. HMMA passes its token blocks per group, which is folded into grid.y.
     int single_block_count = specDecBlocks * num_kv_heads * batch_size;
     double wave_count = (double) single_block_count / (double) multiprocessor_count;
 

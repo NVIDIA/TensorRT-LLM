@@ -1,5 +1,6 @@
 import unittest
 from dataclasses import dataclass
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import torch
@@ -143,6 +144,43 @@ def create_model_engine_and_kvcache(llm_args: TorchLlmArgs = None,
 
 
 class PyTorchModelEngineTestCase(unittest.TestCase):
+
+    def test_create_warmup_request_rejects_zero_token_batch(self) -> None:
+        """A zero-token warmup must not create an empty scheduled batch."""
+
+        class ZeroTokenKvCacheManager:
+            tokens_per_block = 32
+
+            def get_num_available_tokens(self, **kwargs):
+                return 0
+
+            def get_num_free_blocks(self):
+                return 1
+
+            def add_dummy_requests(self, *args, **kwargs):
+                raise AssertionError(
+                    "zero-token warmup should not allocate dummy requests")
+
+        model_engine = SimpleNamespace(
+            kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
+            spec_config=None,
+            max_total_draft_tokens=0,
+            max_draft_loop_tokens=0,
+            max_beam_width=1,
+            max_num_tokens=4096,
+            batch_size=1,
+            max_seq_len=4096,
+            use_mrope=False,
+            _get_draft_kv_cache_manager=lambda resource_manager: None,
+            _get_num_extra_decoding_steps=lambda: 0,
+        )
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: ZeroTokenKvCacheManager()})
+
+        warmup_request = PyTorchModelEngine._create_warmup_request(
+            model_engine, resource_manager, num_tokens=0, num_gen_requests=0)
+
+        self.assertIsNone(warmup_request)
 
     def test_pad_generation_requests(self) -> None:
         model_engine, kv_cache_manager = create_model_engine_and_kvcache()

@@ -486,13 +486,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.kv_cache_block_offsets, self.request_ids, self.beam_width,
                 self.num_contexts, self.num_seqs)
 
-            error_message = (
-                f"The max KV cache length of input sequences ({self.kv_lens[:self.num_seqs].max()}) "
-                f"exceeds the KV cache manager's maximum supported length "
-                f"({self.kv_cache_manager.max_seq_len}).")
+            if self.num_seqs > 0:
+                max_kv_len = self.kv_lens[:self.num_seqs].max()
+                error_message = (
+                    f"The max KV cache length of input sequences ({max_kv_len}) "
+                    f"exceeds the KV cache manager's maximum supported length "
+                    f"({self.kv_cache_manager.max_seq_len}).")
 
-            assert self.kv_lens[:self.num_seqs].max(
-            ) <= self.kv_cache_manager.max_seq_len, error_message
+                assert max_kv_len <= self.kv_cache_manager.max_seq_len, error_message
 
             # Also prepare draft KV cache block offsets if draft_kv_cache_manager exists
             if self.draft_kv_cache_manager is not None:

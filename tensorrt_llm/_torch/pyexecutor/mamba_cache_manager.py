@@ -1484,11 +1484,10 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             stats = self.impl.get_kv_cache_stats()
             rs_free = stats.num_free_blocks_per_window_size.get(
                 LinearCacheType.RECURRENT_STATES.value, 0)
-            # Reserve 1 block for the always-allocated last block (corner case
-            # / final live state) so we don't promise more tokens than the
-            # pool can actually back at allocation time.
-            usable_rs_blocks = max(0, rs_free - 1)
-            rs_token_cap = usable_rs_blocks * interval
+            # Each recurrent-state block backs one context stop position.
+            # For prompts shorter than the snapshot interval, the only stop
+            # position is the final/live state, so one free block is enough.
+            rs_token_cap = max(0, rs_free) * interval
             result = min(result, rs_token_cap)
         return max(result, 0)
 

@@ -1,6 +1,5 @@
 import dataclasses
 import re
-from types import SimpleNamespace
 from typing import List, Optional
 
 import torch
@@ -317,12 +316,7 @@ class _Qwen35ConfigCompat:
     @staticmethod
     def _inherit_quantization_config(config_dict: dict,
                                      text_config: dict) -> dict:
-        """Copy top-level quantization_config into text_config with name normalization.
-
-        Also adds a temporary workaround that keeps packed linear-attention
-        in_proj_qkvz on the bf16 path until FP8 block-scale TP loading is
-        fixed for that layout.
-        """
+        """Copy top-level quantization_config into text_config with name normalization."""
         if "quantization_config" in text_config:
             return text_config
         if "quantization_config" not in config_dict:
@@ -332,12 +326,10 @@ class _Qwen35ConfigCompat:
         if "modules_to_not_convert" in quantization_config:
             modules = _Qwen35ConfigCompat._normalize_exclude_modules(
                 quantization_config["modules_to_not_convert"])
-            modules = _Qwen35ConfigCompat._add_qkvz_bf16_workaround(
-                text_config, modules)
             quantization_config["modules_to_not_convert"] = sorted(set(modules))
         if "ignore" in quantization_config:
-            modules = _Qwen35ConfigCompat._add_qkvz_bf16_workaround(
-                text_config, list(quantization_config["ignore"]))
+            modules = _Qwen35ConfigCompat._normalize_exclude_modules(
+                list(quantization_config["ignore"]))
             quantization_config["ignore"] = sorted(set(modules))
         text_config["quantization_config"] = quantization_config
         return text_config
@@ -360,24 +352,6 @@ class _Qwen35ConfigCompat:
             name = re.sub(r"\.in_proj_(q|k|v|z|qkv)$", ".in_proj_qkvz", name)
             normalized.add(name)
         return sorted(normalized)
-
-    @staticmethod
-    def _add_qkvz_bf16_workaround(text_config: dict,
-                                  modules: list[str]) -> list[str]:
-        """Keep packed linear-attention qkvz on bf16 path for all linear-attention layers.
-
-        Temporary until FP8 block-scale TP loading is fixed for this layout.
-        """
-        try:
-            layer_types = get_qwen3_hybrid_layer_types(
-                SimpleNamespace(**text_config))
-        except (ValueError, AttributeError):
-            return modules
-        for layer_idx, layer_type in enumerate(layer_types):
-            if layer_type == "linear_attention":
-                modules.append(
-                    f"model.layers.{layer_idx}.linear_attn.in_proj_qkvz")
-        return modules
 
     @staticmethod
     def _flatten_rope(text_config: dict) -> dict:

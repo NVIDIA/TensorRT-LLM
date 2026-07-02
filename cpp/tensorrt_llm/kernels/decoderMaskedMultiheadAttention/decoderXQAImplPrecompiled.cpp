@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -276,10 +276,8 @@ public:
             // MultiQueryTokens (generation_input_length > 1) need extra parameters (like qSeqLen, headGrpSize, and
             // mask). Input parameters for MultiQueryTokens kernels.
             unsigned int headGrpSize = num_q_heads_over_kv;
-            // Use mTileSize = 16 kernels when qSeqLen <= 16.
             unsigned int qSeqLen = static_cast<unsigned int>(xqaParams.generation_input_length);
-            unsigned int mTileSize = qSeqLen <= 16 ? 16 : 32;
-            unsigned int nbTokenBlocksPerGrp = divUp(qSeqLen * headGrpSize, mTileSize);
+            unsigned int nbTokenBlocksPerGrp = getSpecDecHmmaTokenBlocksPerGroup(headGrpSize, qSeqLen);
             int const* maskPtr = xqaParams.spec_decoding_packed_mask;
             int const* cuQSeqLens = launchParams.cu_seq_lens;
             unsigned int maxQSeqLen = xqaParams.spec_decoding_is_generation_length_variable ? // true for ReDrafter

@@ -13,7 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
+    ConsumableWeightsDict,
+    MmappedSafetensorsWeights,
+)
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 
@@ -22,6 +25,13 @@ from tensorrt_llm._torch.models.modeling_utils import register_mapper
 class Exaone4_5HfWeightMapper(HfWeightMapper):
     def preprocess_weights(self, weights: dict):
         """Rename HF checkpoint prefixes; supports plain dict and ConsumableWeightsDict."""
+        if isinstance(weights, MmappedSafetensorsWeights):
+            return weights.transform_keys(
+                lambda key: key.replace("model.visual.", "visual.")
+                if key.startswith("model.visual.")
+                else key
+            )
+
         is_consumable = isinstance(weights, ConsumableWeightsDict)
         renamed = {}
         for key, value in weights.items():

@@ -12,7 +12,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_any_only
 from tqdm import tqdm
 
-from tensorrt_llm._utils import local_mpi_rank
+from tensorrt_llm._utils import is_device_integrated, local_mpi_rank
 from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
@@ -831,8 +831,12 @@ def rename_weights_with_regex(pattern_mapping: Dict[str, str], weights: Dict):
     """
     import re
 
-    from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
-        ConsumableWeightsDict
+    from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
+        ConsumableWeightsDict, rename_weight_keys_with_regex)
+
+    if isinstance(weights, ConsumableWeightsDict) or hasattr(
+            weights, "rename_by_regex"):
+        return rename_weight_keys_with_regex(weights, pattern_mapping)
 
     # Check if input is a ConsumableWeightsDict to preserve the type
     is_consumable = isinstance(weights, ConsumableWeightsDict)
@@ -872,6 +876,29 @@ def filter_weights(prefix, weights: Dict):
             new_k = k[len(prefix) + 1:]
             result[new_k] = v
     return result
+
+
+def materialize_meta_parameters(module: nn.Module) -> None:
+    """Materialize meta parameters on CUDA for integrated GPU lazy loading."""
+    for key, param in list(module._parameters.items()):
+        if param is None:
+            continue
+        if param.is_meta:
+            module._parameters[key] = nn.Parameter(
+                torch.empty_like(param, device='cuda'),
+                requires_grad=False,
+            )
+        elif param.device.type != 'cuda':
+            module._parameters[key] = nn.Parameter(param.cuda(),
+                                                   requires_grad=False)
+
+
+def _should_load_weights_serially() -> bool:
+    env_flag = os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
+                              "False")
+    return is_device_integrated() or env_flag in [
+        "True", "true", "1", "yes", "y"
+    ]
 
 
 def run_concurrently(func,
@@ -945,6 +972,8 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
     def load_single_module(name, module):
         torch.cuda.set_device(device_id)
         if len(module._parameters) > 0:
+            if is_device_integrated():
+                materialize_meta_parameters(module)
             # skip load weights if module is in skip_modules
             if any(skip_module in name for skip_module in skip_modules):
                 return
@@ -1029,8 +1058,7 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                     if hasattr(weights, 'mark_consumed'):
                         weights.mark_consumed(name)
 
-    if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
-                      "False") in ["True", "true", "1", "yes", "y"]:
+    if _should_load_weights_serially():
         for name, module in tqdm(list(
                 model.named_modules(remove_duplicate=False)),
                                  desc="Loading weights"):
@@ -1081,6 +1109,8 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
     def load_single_module(name, module):
         torch.cuda.set_device(device_id)
         if len(module._parameters) > 0:
+            if is_device_integrated():
+                materialize_meta_parameters(module)
             if weight_mapper.should_skip_module(name):
                 return
 
@@ -1144,8 +1174,7 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                     if hasattr(weights, 'mark_consumed'):
                         weights.mark_consumed(name)
 
-    if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
-                      "False") in ["True", "true", "1", "yes", "y"]:
+    if _should_load_weights_serially():
         for name, module in tqdm(list(
                 model.named_modules(remove_duplicate=False)),
                                  desc="Loading weights"):

@@ -41,24 +41,55 @@ def test_qwen35_modelopt_preprocess_preserves_scalar_fp8_scale_name():
     assert weights["model.layers.0.linear_attn.out_proj.weight_scale"].shape == torch.Size([])
 
 
-def test_qwen35_dequantizes_per_tensor_fp8_linear_attention_projection():
+def test_qwen35_rescales_per_tensor_fp8_linear_attention_qkvz_projection():
     mapper = _make_mapper(dtype=torch.bfloat16)
+    mapper._config.pretrained_config.linear_num_key_heads = 1
+    mapper._config.pretrained_config.linear_num_value_heads = 1
+    mapper._config.pretrained_config.linear_key_head_dim = 2
+    mapper._config.pretrained_config.linear_value_head_dim = 2
     weight_name = "model.layers.0.linear_attn.in_proj_qkv.weight"
     scale_name = "model.layers.0.linear_attn.in_proj_qkv.weight_scale"
     input_scale_name = "model.layers.0.linear_attn.in_proj_qkv.input_scale"
+    z_weight_name = "model.layers.0.linear_attn.in_proj_z.weight"
+    z_scale_name = "model.layers.0.linear_attn.in_proj_z.weight_scale"
+    z_input_scale_name = "model.layers.0.linear_attn.in_proj_z.input_scale"
 
     weights = {
-        weight_name: torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32),
+        weight_name: torch.tensor(
+            [
+                [1.0, 2.0],
+                [3.0, 4.0],
+                [1.0, 2.0],
+                [3.0, 4.0],
+                [1.0, 2.0],
+                [3.0, 4.0],
+            ],
+            dtype=torch.float8_e4m3fn,
+        ),
         scale_name: torch.tensor(0.5, dtype=torch.float32),
-        input_scale_name: torch.tensor(1.0, dtype=torch.float32),
+        input_scale_name: torch.tensor(2.0, dtype=torch.float32),
+        z_weight_name: torch.tensor([[5.0, 6.0], [7.0, 8.0]], dtype=torch.float8_e4m3fn),
+        z_scale_name: torch.tensor(1.0, dtype=torch.float32),
+        z_input_scale_name: torch.tensor(1.0, dtype=torch.float32),
     }
 
-    updated = mapper._dequantize_linear_attn_per_tensor_fp8(weights)
+    updated = mapper._rescale_linear_attn_qkvz_per_tensor_fp8(weights)
+    packed = mapper._pack_split_projections(updated)
 
     assert scale_name not in updated
     assert input_scale_name not in updated
-    assert updated[weight_name].dtype == torch.bfloat16
+    assert z_scale_name not in updated
+    assert z_input_scale_name not in updated
+    assert packed["model.layers.0.linear_attn.in_proj_qkvz.weight"].dtype == torch.float8_e4m3fn
     torch.testing.assert_close(
-        updated[weight_name],
-        torch.tensor([[0.5, 1.0], [1.5, 2.0]], dtype=torch.bfloat16),
+        packed["model.layers.0.linear_attn.in_proj_qkvz.weight_scale"],
+        torch.tensor(1.0, dtype=torch.float32),
+    )
+    torch.testing.assert_close(
+        packed["model.layers.0.linear_attn.in_proj_qkvz.input_scale"],
+        torch.tensor(2.0, dtype=torch.float32),
+    )
+    torch.testing.assert_close(
+        packed["model.layers.0.linear_attn.in_proj_qkvz.weight"][:6].to(torch.float32),
+        weights[weight_name].to(torch.float32) * 0.5,
     )

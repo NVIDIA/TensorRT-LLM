@@ -32,8 +32,11 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
        tensors.  Qwen3.5 checkpoints store them as separate in_proj_qkv + z
        (or fully split q/k/v/z) and b + a tensors.  This mapper packs them
        into the grouped-interleaved layout that TRT-LLM expects.
-       For FP8 checkpoints, the packed qkvz tensor is then dequantized to
-       bf16 as a temporary workaround for TP loading
+       For FP8 checkpoints with per-tensor scales, qkv/z weights are rescaled
+       to one packed-module scale before packing
+       (handled in _rescale_linear_attn_qkvz_per_tensor_fp8).
+       Existing per-block FP8 checkpoints still dequantize the packed qkvz
+       tensor to bf16 as a temporary workaround for TP loading
        (handled in _dequantize_linear_attn_fp8_qkvz).
 
     3. MoE expert tensors (handled in handle_special_instance_module):
@@ -197,50 +200,79 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
             updated_weights.pop(scale_name, None)
         return updated_weights
 
-    def _dequantize_linear_attn_per_tensor_fp8(self, weights: dict) -> dict:
-        """Dequantize per-tensor FP8 linear-attn split projections to BF16.
+    def _rescale_linear_attn_qkvz_per_tensor_fp8(self, weights: dict) -> dict:
+        """Rescale per-tensor FP8 qkv/z shards to one packed qkvz scale.
 
-        MIXED_PRECISION checkpoints (e.g. Qwen3.6 NVFP4) store the linear-attn
-        ``in_proj_*`` split projections (in_proj_qkv, in_proj_z, in_proj_q/k/v,
-        etc.) as per-tensor FP8: scalar ``weight_scale`` or
-        ``weight_scale_inv`` (and matching scalar ``input_scale``). The packer
-        below assumes BF16 weights or per-block FP8 with block-shaped scales,
-        so dequantize here and drop the scale tensors. The packed BF16 tensor
-        is then concatenated with the already-BF16 ``in_proj_a`` /
-        ``in_proj_b`` / ``in_proj_z`` weights and TP-sharded by the standard
-        path.
+        Qwen3.6 MIXED_PRECISION checkpoints store ``in_proj_qkv`` and
+        ``in_proj_z`` as separate per-tensor FP8 projections with scalar
+        ``weight_scale`` / ``input_scale`` metadata. TRT-LLM packs them into a
+        single ``in_proj_qkvz`` Linear, which has one scalar ``weight_scale``
+        and one scalar ``input_scale``. Match the fused-FP8 Linear loader: pick
+        the max scale and requantize each split weight into that shared scale
+        before packing.
         """
-        target_dtype = getattr(self.config.pretrained_config, "torch_dtype", torch.bfloat16)
-        if target_dtype is None:
-            target_dtype = torch.bfloat16
         updated = dict(weights)
-        drop = []
-        for name in list(weights):
-            if not name.endswith(".weight"):
+
+        qkvz_groups = defaultdict(dict)
+        for name, tensor in weights.items():
+            match = self._SPLIT_PROJ_PATTERN.match(name)
+            if match is None:
                 continue
-            if self._SPLIT_PROJ_PATTERN.match(name) is None:
+            prefix, projection_name, suffix = match.groups()
+            if projection_name not in {"qkv", "q", "k", "v", "z"}:
                 continue
-            prefix = name[: -len(".weight")]
-            scale_name = prefix + ".weight_scale_inv"
-            if scale_name not in weights:
-                scale_name = prefix + ".weight_scale"
-            if scale_name not in weights:
+            if suffix not in {"weight", "weight_scale", "input_scale"}:
                 continue
-            scale = weights[scale_name]
-            # Per-tensor scalar scale → dequantize. Per-block (n-D) handled elsewhere.
-            if scale.ndim != 0:
+            qkvz_groups[(prefix, projection_name)][suffix] = (name, tensor)
+
+        prefixes = {prefix for prefix, _ in qkvz_groups}
+        for prefix in prefixes:
+            projection_names = {
+                name for group_prefix, name in qkvz_groups if group_prefix == prefix
+            }
+            if "qkv" in projection_names:
+                shard_names = ["qkv", "z"]
+            else:
+                shard_names = ["q", "k", "v", "z"]
+            if not all((prefix, name) in qkvz_groups for name in shard_names):
                 continue
-            updated[name] = (
-                (weights[name].to(torch.float32) * scale.to(torch.float32))
-                .to(target_dtype)
-                .contiguous()
-            )
-            drop.append(scale_name)
-            input_scale_name = name[: -len(".weight")] + ".input_scale"
-            if input_scale_name in weights:
-                drop.append(input_scale_name)
-        for k in drop:
-            updated.pop(k, None)
+
+            shard_groups = [qkvz_groups[(prefix, name)] for name in shard_names]
+            if not all("weight" in group and "weight_scale" in group for group in shard_groups):
+                continue
+
+            weight_scales = [group["weight_scale"][1].reshape([]) for group in shard_groups]
+            if not all(scale.ndim == 0 for scale in weight_scales):
+                continue
+            max_weight_scale = torch.stack(
+                [scale.to(torch.float32) for scale in weight_scales]
+            ).max()
+
+            input_scale_groups = [group for group in shard_groups if "input_scale" in group]
+            if input_scale_groups:
+                if len(input_scale_groups) != len(shard_groups):
+                    raise ValueError(
+                        f"Expected input_scale for every split qkvz shard under {prefix}"
+                    )
+                input_scales = [group["input_scale"][1].reshape([]) for group in shard_groups]
+                if not all(scale.ndim == 0 for scale in input_scales):
+                    raise ValueError(
+                        f"Expected scalar input_scale for every split qkvz shard under {prefix}"
+                    )
+                max_input_scale = torch.stack(
+                    [scale.to(torch.float32) for scale in input_scales]
+                ).max()
+                for group in shard_groups:
+                    updated.pop(group["input_scale"][0], None)
+                updated[f"{prefix}.in_proj_qkvz.input_scale"] = max_input_scale
+
+            for group, weight_scale in zip(shard_groups, weight_scales):
+                weight_name, weight = group["weight"]
+                rescaled_weight = weight.to(torch.float32).mul(weight_scale.to(torch.float32))
+                rescaled_weight = rescaled_weight.div(max_weight_scale.to(rescaled_weight.device))
+                updated[weight_name] = rescaled_weight.to(torch.float8_e4m3fn).contiguous()
+                updated.pop(group["weight_scale"][0], None)
+            updated[f"{prefix}.in_proj_qkvz.weight_scale"] = max_weight_scale
         return updated
 
     def _pack_split_projections(self, weights: dict) -> dict:
@@ -359,10 +391,10 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         is_modelopt_ckpt, normalized_weights = self._preprocess_modelopt_ckpt(normalized_weights)
 
         # MIXED_PRECISION modelopt checkpoints store the linear-attn split
-        # projections as per-tensor FP8 (scalar scales). Dequantize to BF16
-        # before packing so the packer can run its existing BF16 path.
+        # qkv/z projections as per-tensor FP8 (scalar scales). Rescale them to
+        # one packed-module scale before packing.
         if is_modelopt_ckpt:
-            normalized_weights = self._dequantize_linear_attn_per_tensor_fp8(normalized_weights)
+            normalized_weights = self._rescale_linear_attn_qkvz_per_tensor_fp8(normalized_weights)
 
         packed_weights = self._pack_split_projections(normalized_weights)
         if not is_modelopt_ckpt:

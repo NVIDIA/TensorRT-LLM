@@ -16,7 +16,7 @@ from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     CppMambaHybridCacheManager,
     PythonMambaCacheManager,
 )
-from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
+from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, KVCacheManager
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
@@ -440,6 +440,28 @@ def test_cpp_hybrid_recurrent_pool_floor_with_block_reuse():
         f"need >= max_batch_size + 1 = {max_batch_size + 1} to prevent the padding "
         f"sentinel from evicting live recurrent state"
     )
+
+
+def test_cpp_hybrid_available_tokens_allows_live_state_only(monkeypatch):
+    """One recurrent-state block can hold a prompt shorter than the snapshot interval."""
+
+    interval = 8192
+    token_num_upper_bound = 4095
+    mgr = object.__new__(CppMambaHybridCacheManager)
+    mgr.linear_attention_metadata = SimpleNamespace(states_snapshot_interval=interval)
+    mgr.impl = SimpleNamespace(
+        get_kv_cache_stats=lambda: SimpleNamespace(
+            num_free_blocks_per_window_size={LinearCacheType.RECURRENT_STATES.value: 1}
+        )
+    )
+
+    monkeypatch.setattr(
+        KVCacheManager,
+        "get_num_available_tokens",
+        lambda self, token_num_upper_bound, max_num_draft_tokens=0, **kwargs: token_num_upper_bound,
+    )
+
+    assert mgr.get_num_available_tokens(token_num_upper_bound) == token_num_upper_bound
 
 
 # ---------------------------------------------------------------------------

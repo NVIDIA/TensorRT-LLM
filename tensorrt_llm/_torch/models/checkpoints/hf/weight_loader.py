@@ -25,11 +25,12 @@ import tqdm
 from mpi4py import MPI as _MPI
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
-    BaseWeightLoader, ConsumableWeightsDict)
+    BaseWeightLoader, ConsumableWeightsDict, MmappedSafetensorsWeights)
 from tensorrt_llm._torch.models.modeling_utils import (
     register_checkpoint_weight_loader, run_concurrently)
-from tensorrt_llm._utils import (ENABLE_MULTI_DEVICE, local_mpi_barrier,
-                                 local_mpi_comm, local_mpi_rank, local_mpi_size)
+from tensorrt_llm._utils import (ENABLE_MULTI_DEVICE, is_device_integrated,
+                                 local_mpi_barrier, local_mpi_comm,
+                                 local_mpi_rank, local_mpi_size)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -77,12 +78,19 @@ class HfWeightLoader(BaseWeightLoader):
         if len(filtered_weight_files) > 0:
             weight_files = filtered_weight_files
         if weight_files:
+            num_layers = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM", "0"))
+            if is_device_integrated():
+                logger.info(
+                    "Integrated GPU: using mmap-backed safetensors loading "
+                    "(no prefetch, no parallel shard load).")
+                local_mpi_barrier()
+                return MmappedSafetensorsWeights(weight_files)
+
             # Prefetch the weight files to CPU memory if the size is less than 90% of the available memory.
             # This is a heuristic to avoid prefetching files that are too large and causing file cache thrashing.
             prefetch_size = sum(os.path.getsize(file) for file in weight_files)
             # If the layer number is overridden, it indicates that only a subset of layers are loaded.
             # Prefetching all layers is unnecessary.
-            num_layers = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM", "0"))
             enable_prefetch = (prefetch_size
                                < self._get_local_available_host_memory() * 0.9
                                and num_layers == 0)
@@ -107,14 +115,20 @@ class HfWeightLoader(BaseWeightLoader):
             weight_files = glob.glob(f"{checkpoint_dir}/*.pth")
 
         if weight_files:
+            num_workers = 1 if is_device_integrated() else None
             return self._load_weights_in_parallel(
-                weight_files, self._load_bin_or_path_file,
-                "Loading bin weights in parallel")
+                weight_files,
+                self._load_bin_or_path_file,
+                "Loading bin weights in parallel",
+                num_workers=num_workers)
 
         raise RuntimeError(f"No weight files found in {checkpoint_dir}.")
 
-    def _load_weights_in_parallel(self, weight_files: List[str], load_func,
-                                  description: str) -> ConsumableWeightsDict:
+    def _load_weights_in_parallel(self,
+                                  weight_files: List[str],
+                                  load_func,
+                                  description: str,
+                                  num_workers=None) -> ConsumableWeightsDict:
         """
         Load weight files in parallel using the specified loading function.
 
@@ -133,7 +147,8 @@ class HfWeightLoader(BaseWeightLoader):
         # specifically the comma right after the w is important to make it a tuple.
         run_concurrently(load_func, [(w, ) for w in weight_files],
                          reduce_func=weights.update,
-                         pbar=pbar)
+                         pbar=pbar,
+                         num_workers=num_workers)
 
         return ConsumableWeightsDict(weights)
 

@@ -12,8 +12,8 @@ import transformers
 from transformers.utils import HF_MODULES_CACHE
 
 from tensorrt_llm._torch.pyexecutor.config_utils import (
-    get_qwen3_hybrid_layer_types, get_qwen3_hybrid_num_attention_layers,
-    is_nemotron_hybrid, is_qwen3_5, is_qwen3_hybrid, load_pretrained_config)
+    get_qwen3_hybrid_num_attention_layers, is_nemotron_hybrid, is_qwen3_hybrid,
+    load_pretrained_config)
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
@@ -445,24 +445,6 @@ class ModelConfig(Generic[TConfig]):
         return quant_config, layer_quant_config
 
     @staticmethod
-    def _add_qwen35_qkvz_bf16_excludes(json_quant_configs,
-                                       pretrained_config) -> None:
-        """Keep packed Qwen3.5 linear-attention qkvz on the BF16 path."""
-        if pretrained_config is None or not is_qwen3_5(pretrained_config):
-            return
-        try:
-            layer_types = get_qwen3_hybrid_layer_types(pretrained_config)
-        except (ValueError, AttributeError):
-            return
-
-        exclude_modules = list(json_quant_configs.get('exclude_modules') or [])
-        for layer_idx, layer_type in enumerate(layer_types):
-            if layer_type == "linear_attention":
-                exclude_modules.append(
-                    f"model.layers.{layer_idx}.linear_attn.in_proj_qkvz")
-        json_quant_configs['exclude_modules'] = sorted(set(exclude_modules))
-
-    @staticmethod
     def get_mxfp4_quant_algo(moe_backend, is_dynamic_quant=False):
         quant_algo = ModelConfig.override_quant_algo()
         if quant_algo is None and not is_dynamic_quant:
@@ -756,7 +738,6 @@ class ModelConfig(Generic[TConfig]):
                                             'hf_quant_config.json'):
             with open(quant_config_file) as f:
                 normalized = read_modelopt_quant_config(json.load(f))
-            cls._add_qwen35_qkvz_bf16_excludes(normalized, pretrained_config)
             # The file is authoritative; warn if the inline copy disagrees.
             # Done before _build_modelopt_quant_config since the builder may
             # mutate ``normalized`` via ``.update`` from quant_cfg.json.

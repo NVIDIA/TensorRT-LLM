@@ -45,7 +45,30 @@ class MistralWeightMapper(HfWeightMapper):
     # Adapted from:
     # https://github.com/vllm-project/vllm/blob/883b42896a9ed9791750d721fad26005b7569eba/vllm/model_executor/models/llama.py#L657
     def rename_by_params_map(self, params_map: dict[str, str], weights: dict) -> dict:
-        from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
+        from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
+            ConsumableWeightsDict,
+            MmappedSafetensorsWeights,
+            remap_weight_keys,
+        )
+
+        if isinstance(weights, MmappedSafetensorsWeights):
+            key_mapping = {}
+            for key in weights.keys():
+                new_key = key
+                modules = key.split(".")
+                num_modules = len(modules)
+                for i in range(num_modules):
+                    item = modules[i]
+                    next_item = modules[i + 1] if i < num_modules - 1 else None
+
+                    combined_item = f"{item}.{next_item}" if next_item is not None else None
+
+                    if combined_item in params_map:
+                        new_key = new_key.replace(combined_item, params_map[combined_item])
+                    elif item in params_map:
+                        new_key = new_key.replace(item, params_map[item])
+                key_mapping[key] = new_key
+            return remap_weight_keys(weights, key_mapping)
 
         # Check if input is a ConsumableWeightsDict to preserve the type
         is_consumable = isinstance(weights, ConsumableWeightsDict)
