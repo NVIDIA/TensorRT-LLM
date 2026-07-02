@@ -495,7 +495,7 @@ class DFlashWorker(SpecWorkerBase):
                 # Produce the K block draft tokens (rejection path for non-greedy
                 # batches; argmax otherwise).
                 gen_draft_tokens = self.produce_draft_tokens(
-                    gen_logits, spec_metadata, batch_size, d2t=self._d2t, num_contexts=num_contexts
+                    gen_logits, spec_metadata, batch_size, num_contexts=num_contexts
                 )
 
         else:

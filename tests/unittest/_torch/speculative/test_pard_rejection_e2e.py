@@ -110,11 +110,11 @@ def _install(monkeypatch, state):
 
     orig_blk = SpecWorkerBase.sample_draft_block
 
-    def _blk(self, gen_logits, spec_metadata, num_contexts, batch_size, d2t=None):
+    def _blk(self, gen_logits, spec_metadata, num_contexts, batch_size):
         state["block"] += 1
         holder["tokens"] = None
         holder["probs"] = None
-        out = orig_blk(self, gen_logits, spec_metadata, num_contexts, batch_size, d2t)
+        out = orig_blk(self, gen_logits, spec_metadata, num_contexts, batch_size)
         if (
             holder["probs"] is not None
             and not spec_metadata.is_all_greedy_sample
@@ -128,7 +128,7 @@ def _install(monkeypatch, state):
             state["order_checked"] += 1
             if not torch.equal(stored, expected):
                 state["order_mismatch"] += 1
-            if d2t is None:
+            if self._d2t is None:
                 exp_tok = holder["tokens"].reshape(num_gens, K).type(out.dtype)
                 if not torch.equal(out, exp_tok):
                     state["token_mismatch"] += 1

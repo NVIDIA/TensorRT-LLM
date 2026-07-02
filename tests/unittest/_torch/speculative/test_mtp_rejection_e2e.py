@@ -102,12 +102,12 @@ def test_mtp_vanilla_rejection_runtime(monkeypatch):
 
     orig_sample_draft = SpecWorkerBase.sample_draft
 
-    def _wrapped_sample_draft(self, logits, spec_metadata, batch_size, d2t=None, draft_step=None):
+    def _wrapped_sample_draft(self, logits, spec_metadata, batch_size, draft_step=None):
         # Producer side: validity must be False while the draft is being
         # captured (it is only set True after the full draft loop).
         if draft_step is not None and getattr(spec_metadata, "use_rejection_sampling", False):
             state["valid_at_capture"].append(bool(spec_metadata.draft_probs_valid))
-        token = orig_sample_draft(self, logits, spec_metadata, batch_size, d2t, draft_step)
+        token = orig_sample_draft(self, logits, spec_metadata, batch_size, draft_step)
         # After the step, the scattered proposal row must be a valid prob dist.
         if (
             draft_step is not None
@@ -234,8 +234,8 @@ def test_mtp_rejection_exact_provenance_and_gather(monkeypatch):
 
     orig_draft = SpecWorkerBase._draft_sampler_advanced_for_rejection
 
-    def _wrapped_draft(self, logits, spec_metadata, batch_size, d2t=None, draft_step=0):
-        token = orig_draft(self, logits, spec_metadata, batch_size, d2t, draft_step)
+    def _wrapped_draft(self, logits, spec_metadata, batch_size, draft_step=0):
+        token = orig_draft(self, logits, spec_metadata, batch_size, draft_step)
         if (
             not spec_metadata.is_all_greedy_sample
             and state["last_probs"] is not None
@@ -328,11 +328,11 @@ def test_mtp_greedy_after_nongreedy_no_stale_reuse(monkeypatch):
 
     orig_draft = SpecWorkerBase._draft_sampler_advanced_for_rejection
 
-    def _counting_draft(self, logits, spec_metadata, batch_size, d2t=None, draft_step=0):
+    def _counting_draft(self, logits, spec_metadata, batch_size, draft_step=0):
         # A non-all-greedy call is the only path that scatters probs.
         if not spec_metadata.is_all_greedy_sample:
             state["scatter"][state["phase"]] += 1
-        return orig_draft(self, logits, spec_metadata, batch_size, d2t, draft_step)
+        return orig_draft(self, logits, spec_metadata, batch_size, draft_step)
 
     monkeypatch.setattr(SpecWorkerBase, "_draft_sampler_advanced_for_rejection", _counting_draft)
 
@@ -493,8 +493,8 @@ def test_mtp_rejection_multi_request_slot_identity(monkeypatch):
 
     orig_draft = SpecWorkerBase._draft_sampler_advanced_for_rejection
 
-    def _wrapped_draft(self, logits, spec_metadata, batch_size, d2t=None, draft_step=0):
-        token = orig_draft(self, logits, spec_metadata, batch_size, d2t, draft_step)
+    def _wrapped_draft(self, logits, spec_metadata, batch_size, draft_step=0):
+        token = orig_draft(self, logits, spec_metadata, batch_size, draft_step)
         if (
             not spec_metadata.is_all_greedy_sample
             and state["last_probs"] is not None
@@ -615,8 +615,8 @@ def test_mtp_rejection_slot_reuse_across_generations(monkeypatch):
 
     orig_draft = SpecWorkerBase._draft_sampler_advanced_for_rejection
 
-    def _wrapped_draft(self, logits, spec_metadata, batch_size, d2t=None, draft_step=0):
-        token = orig_draft(self, logits, spec_metadata, batch_size, d2t, draft_step)
+    def _wrapped_draft(self, logits, spec_metadata, batch_size, draft_step=0):
+        token = orig_draft(self, logits, spec_metadata, batch_size, draft_step)
         if (
             not spec_metadata.is_all_greedy_sample
             and state["last_probs"] is not None

@@ -1140,7 +1140,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 the correct slice of spec_metadata.draft_probs.
         '''
 
-        d2t = self._d2t
         # All-greedy fast path must stay TP-aware. When the draft LM head is
         # tensor-parallel (tp_size>1 without attention DP, or LM-head-TP in
         # ADP), the draft logits are sharded along the vocab dim. A plain
@@ -1164,7 +1163,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     and self.model_config.mapping.tp_size > 1
                     and not self.model_config.mapping.enable_attention_dp):
                 return self.draft_sampler(logits)
-            return self._draft_sampler_greedy(logits, d2t)
+            return self._draft_sampler_greedy(logits)
         # Non-greedy (advanced) draft sampling has the same TP hazard as the
         # greedy path: when the draft LM head is plain tensor-parallel
         # (tp_size>1 without attention DP), each rank only holds a vocab shard
@@ -1183,7 +1182,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         return self.sample_draft(logits,
                                  spec_metadata,
                                  batch_size,
-                                 d2t=d2t,
                                  draft_step=draft_step)
 
     def prepare_1st_drafter_inputs(

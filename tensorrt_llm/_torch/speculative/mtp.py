@@ -450,8 +450,6 @@ class MTPWorker(SpecWorkerBase):
         use_rejection = (getattr(spec_metadata, "use_rejection_sampling", False)
                          and not spec_metadata.is_all_greedy_sample)
         self.reset_draft_probs_valid_for_capture(spec_metadata)
-        # Vanilla MTP shares the target vocabulary, so self._d2t is None here.
-        draft_d2t = self._d2t
 
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(
             resource_manager)
@@ -479,7 +477,6 @@ class MTPWorker(SpecWorkerBase):
                 new_draft_token = self.produce_draft_tokens(logits,
                                                             spec_metadata,
                                                             batch_size,
-                                                            d2t=draft_d2t,
                                                             draft_step=i)
                 next_draft_tokens.append(new_draft_token)
                 # shift input_ids and hidden_states

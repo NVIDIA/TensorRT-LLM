@@ -291,7 +291,7 @@ class PARDWorker(SpecWorkerBase):
                 # Produce the K block draft tokens (rejection path for non-greedy
                 # batches; argmax otherwise).
                 gen_draft_tokens = self.produce_draft_tokens(
-                    gen_logits, spec_metadata, batch_size, d2t=self._d2t, num_contexts=num_contexts
+                    gen_logits, spec_metadata, batch_size, num_contexts=num_contexts
                 )
 
                 if self.sa_enhancer is not None and sa_manager is not None:
@@ -362,7 +362,7 @@ class PARDWorker(SpecWorkerBase):
         Returns:
             draft_tokens: [batch_size * max_draft_len] flattened token ids.
         """
-        return self._draft_sampler_greedy(logits, self._d2t)
+        return self._draft_sampler_greedy(logits)
 
     def prepare_1st_drafter_inputs(
         self,

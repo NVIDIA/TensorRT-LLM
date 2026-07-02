@@ -351,7 +351,6 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
             logits,
             spec_metadata,
             batch_size,
-            d2t=self._d2t,
             draft_step=draft_step,
         )
 

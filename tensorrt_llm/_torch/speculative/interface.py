@@ -1229,11 +1229,11 @@ class SpecWorkerBase(nn.Module, ABC):
                      logits: torch.Tensor,
                      spec_metadata: "SpecMetadata",
                      batch_size: int,
-                     d2t: Optional[torch.Tensor] = None,
                      draft_step: Optional[int] = None):
         """Public one-model draft-token sampler with internal rejection routing.
 
-        Shared entry point for one-model speculative workers:
+        Shared entry point for one-model speculative workers. Applies the cached
+        draft->target vocab map ``self._d2t`` internally:
 
         - Rejection enabled with a ``draft_step``: sample via probs and scatter
           the per-request distribution into the slot-indexed ``draft_probs``
@@ -1242,9 +1242,8 @@ class SpecWorkerBase(nn.Module, ABC):
         """
         if spec_metadata.use_rejection_sampling and draft_step is not None:
             return self._draft_sampler_advanced_for_rejection(
-                logits, spec_metadata, batch_size, d2t, draft_step)
-        return self._draft_sampler_advanced(logits, spec_metadata, batch_size,
-                                            d2t)
+                logits, spec_metadata, batch_size, draft_step)
+        return self._draft_sampler_advanced(logits, spec_metadata, batch_size)
 
     def compare_and_accept(self, logits, draft_tokens, num_contexts, batch_size,
                            spec_metadata):
@@ -1460,22 +1459,21 @@ class SpecWorkerBase(nn.Module, ABC):
             num_accepted_tokens, num_contexts, runtime_draft_len)
         return accepted_tokens, num_accepted_tokens
 
-    def _draft_sampler_greedy(self, logits: torch.Tensor, d2t=None):
+    def _draft_sampler_greedy(self, logits: torch.Tensor):
         """
         Simple greedy draft token sampling using argmax.
 
         Args:
             logits: [num_tokens, vocab_size] - Draft model logits
-            d2t: Optional dictionary offset tensor for vocab mapping
 
         Returns:
             draft_tokens: [num_tokens] - Sampled draft token ids (int32)
         """
         draft_tokens = torch.argmax(logits, dim=-1)
 
-        # Apply d2t (offsets between draft and target model dictionaries)
-        if d2t is not None:
-            draft_tokens = d2t[draft_tokens] + draft_tokens
+        # Apply the cached draft->target vocab offset map.
+        if self._d2t is not None:
+            draft_tokens = self._d2t[draft_tokens] + draft_tokens
 
         return draft_tokens.type(torch.int32)
 
@@ -1543,12 +1541,11 @@ class SpecWorkerBase(nn.Module, ABC):
         logits: torch.Tensor,
         spec_metadata: "SpecMetadata",
         batch_size: int,
-        d2t: Optional[torch.Tensor] = None,
     ):
         """
         Draft token sampling using per-request sampling parameters from the
         target's sampling config. Falls back to argmax when the batch is
-        all-greedy.
+        all-greedy. Applies the cached draft->target vocab map ``self._d2t``.
 
         Args:
             logits: [batch_size, vocab_size] - Draft model logits (one row per
@@ -1556,13 +1553,12 @@ class SpecWorkerBase(nn.Module, ABC):
             spec_metadata: Source of per-request temperatures / top_k / top_p
                 tensors populated by populate_sampling_params_for_one_model.
             batch_size: Number of active requests in the batch.
-            d2t: Optional dictionary offset tensor for vocab mapping.
 
         Returns:
             draft_tokens: [batch_size] - Sampled draft token ids (int32)
         """
         if spec_metadata.is_all_greedy_sample:
-            return self._draft_sampler_greedy(logits, d2t)
+            return self._draft_sampler_greedy(logits)
 
         temperatures = spec_metadata.request_temperatures[:batch_size]
         top_ks = spec_metadata.request_top_ks[:batch_size]
@@ -1588,8 +1584,8 @@ class SpecWorkerBase(nn.Module, ABC):
             seed=self.seed,
             offset=self.offset)
 
-        if d2t is not None:
-            draft_tokens = d2t[draft_tokens] + draft_tokens
+        if self._d2t is not None:
+            draft_tokens = self._d2t[draft_tokens] + draft_tokens
 
         return draft_tokens.type(torch.int32)
 
@@ -1598,7 +1594,6 @@ class SpecWorkerBase(nn.Module, ABC):
         logits: torch.Tensor,
         spec_metadata: "SpecMetadata",
         batch_size: int,
-        d2t: Optional[torch.Tensor] = None,
         draft_step: int = 0,
     ):
         """
@@ -1617,7 +1612,7 @@ class SpecWorkerBase(nn.Module, ABC):
         ``_can_use_rejection_sampling`` will bypass rejection for those anyway.
         """
         if spec_metadata.is_all_greedy_sample:
-            return self._draft_sampler_greedy(logits, d2t)
+            return self._draft_sampler_greedy(logits)
 
         temperatures = spec_metadata.request_temperatures[:batch_size]
         top_ks = spec_metadata.request_top_ks[:batch_size]
@@ -1654,8 +1649,8 @@ class SpecWorkerBase(nn.Module, ABC):
         spec_metadata.draft_probs[batch_slots, draft_step, :vocab] = probs
         spec_metadata.draft_probs_last_dim = vocab
 
-        if d2t is not None:
-            draft_tokens = d2t[draft_tokens] + draft_tokens
+        if self._d2t is not None:
+            draft_tokens = self._d2t[draft_tokens] + draft_tokens
 
         return draft_tokens.type(torch.int32)
 
@@ -1663,8 +1658,7 @@ class SpecWorkerBase(nn.Module, ABC):
                            gen_logits: torch.Tensor,
                            spec_metadata: "SpecMetadata",
                            num_contexts: int,
-                           batch_size: int,
-                           d2t: Optional[torch.Tensor] = None):
+                           batch_size: int):
         """Block draft sampler for gen-only workers (PARD, DFLASH).
 
         Block counterpart of ``sample_draft``: these methods produce all ``K``
@@ -1672,9 +1666,9 @@ class SpecWorkerBase(nn.Module, ABC):
         logits. Samples the K positions and scatters their distributions into
         ``draft_probs[gen_slot_ids, 0:K, :]`` (gen-only; context rows have no
         draft logits). All-greedy batches take the argmax path with no scatter.
-        ``d2t`` remaps the returned token ids to target vocab; stored probs stay
-        in draft-vocab space (the rejection consumer expands via d2t). Returns
-        ``[num_gens, K]`` int32 draft token ids.
+        The cached ``self._d2t`` remaps the returned token ids to target vocab;
+        stored probs stay in draft-vocab space (the rejection consumer expands
+        via d2t). Returns ``[num_gens, K]`` int32 draft token ids.
         """
         num_gens, K, vocab = gen_logits.shape
         if num_gens == 0:
@@ -1684,8 +1678,8 @@ class SpecWorkerBase(nn.Module, ABC):
 
         if spec_metadata.is_all_greedy_sample:
             draft_tokens = torch.argmax(gen_logits, dim=-1)
-            if d2t is not None:
-                draft_tokens = d2t[draft_tokens] + draft_tokens
+            if self._d2t is not None:
+                draft_tokens = self._d2t[draft_tokens] + draft_tokens
             return draft_tokens.type(torch.int32)
 
         # Take the gen slice and repeat each request's value K times to line up
@@ -1730,8 +1724,8 @@ class SpecWorkerBase(nn.Module, ABC):
             spec_metadata.draft_probs_last_dim = vocab
 
         draft_tokens = flat_tokens.reshape(num_gens, K)
-        if d2t is not None:
-            draft_tokens = d2t[draft_tokens] + draft_tokens
+        if self._d2t is not None:
+            draft_tokens = self._d2t[draft_tokens] + draft_tokens
         return draft_tokens.type(torch.int32)
 
     def produce_draft_tokens(self,
@@ -1739,7 +1733,6 @@ class SpecWorkerBase(nn.Module, ABC):
                              spec_metadata,
                              batch_size,
                              *,
-                             d2t=None,
                              num_contexts=0,
                              draft_step=None):
         """Unified draft-token production entry for all one-model workers.
@@ -1749,7 +1742,8 @@ class SpecWorkerBase(nn.Module, ABC):
         e.g. PARD/DFlash); 2D ``[num_tokens, vocab]`` goes to the per-step
         producer (autoregressive workers called once per draft step, e.g.
         MTP/DraftTarget). The step-only arg ``draft_step`` and the block-only
-        arg ``num_contexts`` are ignored by the other path.
+        arg ``num_contexts`` are ignored by the other path. The draft->target
+        vocab map is read internally from ``self._d2t``.
 
         Why the two shapes differ on context (prefill) requests in a mixed
         batch:
@@ -1774,18 +1768,18 @@ class SpecWorkerBase(nn.Module, ABC):
         """
         if logits.dim() == 3:
             return self.produce_block_draft_tokens(logits, spec_metadata,
-                                                   num_contexts, batch_size,
-                                                   d2t)
+                                                   num_contexts, batch_size)
         return self.produce_step_draft_token(logits, spec_metadata, batch_size,
-                                             draft_step, d2t)
+                                             draft_step)
 
     def produce_block_draft_tokens(self, gen_logits, spec_metadata,
-                                   num_contexts, batch_size, d2t):
+                                   num_contexts, batch_size):
         """Shared block draft-token production for gen-only workers (PARD, DFLASH).
 
         A non-greedy batch takes the advanced ``sample_draft_block`` path
         (honoring sampling params; marks ``draft_probs`` valid only for a
-        pure-gen batch); an all-greedy batch takes block argmax. Returns
+        pure-gen batch); an all-greedy batch takes block argmax. The
+        draft->target vocab map is read from ``self._d2t``. Returns
         ``[num_gens, K]`` int32 draft tokens.
         """
         if not spec_metadata.is_all_greedy_sample:
@@ -1794,12 +1788,12 @@ class SpecWorkerBase(nn.Module, ABC):
             gen_draft_tokens = self.sample_draft_block(gen_logits,
                                                        spec_metadata,
                                                        num_contexts,
-                                                       batch_size,
-                                                       d2t=d2t).long()
+                                                       batch_size).long()
             if getattr(spec_metadata, "use_rejection_sampling", False):
                 # d2t for acceptance-side vocab expansion; valid only for a
                 # pure-gen batch.
-                spec_metadata.d2t = d2t.data if d2t is not None else None
+                spec_metadata.d2t = (self._d2t.data
+                                     if self._d2t is not None else None)
                 spec_metadata.draft_probs_valid = num_contexts == 0
         else:
             # Greedy: flatten the [num_gens, K, vocab] block to [num_gens*K,
@@ -1811,19 +1805,20 @@ class SpecWorkerBase(nn.Module, ABC):
             flat_tokens = self.draft_sampler(
                 gen_logits.reshape(num_gens * K, vocab))
             gen_draft_tokens = flat_tokens.reshape(num_gens, K).long()
-            if d2t is not None:
-                gen_draft_tokens = d2t[gen_draft_tokens] + gen_draft_tokens
+            if self._d2t is not None:
+                gen_draft_tokens = self._d2t[gen_draft_tokens] + gen_draft_tokens
         return gen_draft_tokens.type(torch.int32)
 
     def produce_step_draft_token(self, logits, spec_metadata, batch_size,
-                                 draft_step, d2t):
+                                 draft_step):
         """Shared per-step draft-token production for step workers (MTP, DraftTarget).
 
         A non-greedy batch takes the advanced ``sample_draft`` path (honoring
         temperature/top_k/top_p, scattering this step's distribution into
         ``draft_probs`` when rejection is on); an all-greedy batch takes the
-        TP-aware ``draft_sampler`` (mirroring the block greedy path) and applies
-        ``d2t``. Uses ``self.mapping`` as the LM-head TP mapping.
+        TP-aware ``draft_sampler`` (mirroring the block greedy path). The
+        draft->target vocab map is read from ``self._d2t``. Uses ``self.mapping``
+        as the LM-head TP mapping.
         """
         if (spec_metadata is not None and not spec_metadata.is_all_greedy_sample
                 and draft_step is not None):
@@ -1832,11 +1827,10 @@ class SpecWorkerBase(nn.Module, ABC):
             return self.sample_draft(logits,
                                      spec_metadata,
                                      batch_size,
-                                     d2t=d2t,
                                      draft_step=draft_step)
         draft_tokens = self.draft_sampler(logits)
-        if d2t is not None:
-            draft_tokens = d2t[draft_tokens] + draft_tokens
+        if self._d2t is not None:
+            draft_tokens = self._d2t[draft_tokens] + draft_tokens
         return draft_tokens.type(torch.int32)
 
     def _execute_guided_decoder_if_present(self, logits):
