@@ -587,10 +587,12 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
     @classmethod
     def get_model_defaults(cls, llm_args) -> dict:
-        """Gemma4-specific defaults — see Gemma4ForCausalLM.get_model_defaults."""
-        return {
-            "attn_backend": "FLASHINFER",
-        }
+        """Gemma4-specific defaults — see Gemma4ForCausalLM.get_model_defaults.
+
+        Delegates to the text model so the SM100-family architecture guard
+        lives in a single place.
+        """
+        return Gemma4ForCausalLM.get_model_defaults(llm_args)
 
     def _check_and_adjust_experts_implementation(self, *args, **kwargs):
         # transformers 5.x ``PreTrainedModel.__init__`` calls this with an

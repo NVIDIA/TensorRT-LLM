@@ -1999,6 +1999,24 @@ class TestGemma4HFComparison(unittest.TestCase):
 class TestGemma4ModelDefaults(unittest.TestCase):
     """Tests for Gemma4 model defaults (get_model_defaults)."""
 
+    # The FLASHINFER default is only emitted on SM100-family GPUs; on other
+    # architectures get_model_defaults raises early (see the architecture guard
+    # tests below). Force the supported architecture so these tests are
+    # deterministic regardless of the GPU the CI runner happens to use.
+    def _patch_sm(self, sm_version):
+        """Patch the SM-version helpers used by Gemma4.get_model_defaults."""
+        is_supported = sm_version in (100, 103)
+        return (
+            unittest.mock.patch(
+                "tensorrt_llm._torch.models.modeling_gemma4.get_sm_version",
+                return_value=sm_version,
+            ),
+            unittest.mock.patch(
+                "tensorrt_llm._torch.models.modeling_gemma4.is_sm_100f",
+                return_value=is_supported,
+            ),
+        )
+
     def test_causal_lm_requires_flashinfer_backend(self):
         """Gemma4ForCausalLM must default to FLASHINFER attention backend.
 
@@ -2009,7 +2027,9 @@ class TestGemma4ModelDefaults(unittest.TestCase):
         Without this default, models crash with:
             'TrtllmAttentionMetadata' object has no attribute 'kv_layout'
         """
-        defaults = Gemma4ForCausalLM.get_model_defaults(None)
+        p1, p2 = self._patch_sm(100)
+        with p1, p2:
+            defaults = Gemma4ForCausalLM.get_model_defaults(None)
         self.assertIn("attn_backend", defaults, "get_model_defaults must set attn_backend")
         self.assertEqual(
             defaults["attn_backend"], "FLASHINFER", "Gemma4 requires FLASHINFER (exact uppercase)"
@@ -2017,14 +2037,18 @@ class TestGemma4ModelDefaults(unittest.TestCase):
 
     def test_causal_lm_does_not_disable_cuda_graphs(self):
         """Gemma4ForCausalLM must not disable CUDA graphs."""
-        defaults = Gemma4ForCausalLM.get_model_defaults(None)
+        p1, p2 = self._patch_sm(100)
+        with p1, p2:
+            defaults = Gemma4ForCausalLM.get_model_defaults(None)
         self.assertNotIn("cuda_graph_config", defaults)
 
     def test_conditional_gen_requires_flashinfer_backend(self):
         """Gemma4ForConditionalGeneration must also default to FLASHINFER."""
         from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4ForConditionalGeneration
 
-        defaults = Gemma4ForConditionalGeneration.get_model_defaults(None)
+        p1, p2 = self._patch_sm(100)
+        with p1, p2:
+            defaults = Gemma4ForConditionalGeneration.get_model_defaults(None)
         self.assertIn("attn_backend", defaults)
         self.assertEqual(defaults["attn_backend"], "FLASHINFER")
 
@@ -2032,7 +2056,9 @@ class TestGemma4ModelDefaults(unittest.TestCase):
         """Gemma4ForConditionalGeneration must not disable CUDA graphs."""
         from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4ForConditionalGeneration
 
-        defaults = Gemma4ForConditionalGeneration.get_model_defaults(None)
+        p1, p2 = self._patch_sm(100)
+        with p1, p2:
+            defaults = Gemma4ForConditionalGeneration.get_model_defaults(None)
         self.assertNotIn("cuda_graph_config", defaults)
 
     def test_attn_backend_dispatches_to_flashinfer(self):
@@ -2044,7 +2070,9 @@ class TestGemma4ModelDefaults(unittest.TestCase):
         """
         from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 
-        defaults = Gemma4ForCausalLM.get_model_defaults(None)
+        p1, p2 = self._patch_sm(100)
+        with p1, p2:
+            defaults = Gemma4ForCausalLM.get_model_defaults(None)
         backend_cls = get_attention_backend(defaults["attn_backend"])
 
         # Must be FlashInferAttention, not TrtllmAttention
@@ -2053,6 +2081,31 @@ class TestGemma4ModelDefaults(unittest.TestCase):
             "FlashInferAttention",
             "FLASHINFER must dispatch to FlashInferAttention",
         )
+
+    def test_causal_lm_raises_on_unsupported_arch(self):
+        """On non-SM100 GPUs (e.g. SM89 / L4) Gemma4 must fail early and clearly.
+
+        The trtllm-gen FMHA runner only supports the SM100 family; without this
+        guard the model fails deep inside the kernel during warmup with an
+        opaque 'Unsupported architecture' RuntimeError.
+        """
+        p1, p2 = self._patch_sm(89)
+        with p1, p2:
+            with self.assertRaises(RuntimeError) as ctx:
+                Gemma4ForCausalLM.get_model_defaults(None)
+        self.assertIn("SM100", str(ctx.exception))
+        self.assertIn("SM89", str(ctx.exception))
+
+    def test_conditional_gen_raises_on_unsupported_arch(self):
+        """The multimodal class must also fail early on unsupported architectures."""
+        from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4ForConditionalGeneration
+
+        p1, p2 = self._patch_sm(89)
+        with p1, p2:
+            with self.assertRaises(RuntimeError) as ctx:
+                Gemma4ForConditionalGeneration.get_model_defaults(None)
+        self.assertIn("SM100", str(ctx.exception))
+        self.assertIn("SM89", str(ctx.exception))
 
     def test_all_layers_use_trtllm_gen(self):
         """All Gemma4 layers use trtllm-gen backend uniformly.
