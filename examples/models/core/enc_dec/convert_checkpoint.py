@@ -759,18 +759,18 @@ def parse_bart_config(args, hf_model):
                 fallback=component_config.encoder_hidden_size //
                 component_config.encoder_num_heads)
 
-            # nougat has decoder_start_token_id = None, special handling
-            decoder_start_token_id = config.get('decoder',
-                                                'decoder_start_token_id')
-            component_config.decoder_start_token_id = int(
-                decoder_start_token_id
-            ) if decoder_start_token_id != "None" else None
-            component_config.eos_token_id = config.getint(
-                'decoder', 'eos_token_id')
-            component_config.bos_token_id = config.getint(
-                'decoder', 'bos_token_id')
-            component_config.pad_token_id = config.getint(
-                'decoder', 'pad_token_id')
+            # transformers 5.x may omit decoder token-id keys; fall back to
+            # canonical BART defaults. nougat sets decoder_start_token_id to
+            # the literal string "None", which must also map to Python None.
+            def _opt_int(key, fallback=None):
+                v = config.get('decoder', key, fallback=None)
+                return int(v) if v not in (None, "None") else fallback
+
+            component_config.decoder_start_token_id = _opt_int(
+                'decoder_start_token_id')
+            component_config.bos_token_id = _opt_int('bos_token_id')
+            component_config.eos_token_id = _opt_int('eos_token_id', fallback=2)
+            component_config.pad_token_id = _opt_int('pad_token_id', fallback=1)
 
         return component_config
 

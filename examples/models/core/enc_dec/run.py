@@ -403,8 +403,14 @@ if __name__ == "__main__":
                     hf_model, args.lora_dir[0]).to('cuda').eval()
 
             tik = time.time()
+            # Pass attention_mask so HF ignores tokenizer padding; without it,
+            # batched inputs of mixed length silently produce degenerate output
+            # (only the longest, unpadded entry decodes correctly), making the
+            # comparison with TRT-LLM diverge.
             hf_gen_output = hf_model.generate(
                 input_ids=input_ids,
+                attention_mask=tokenized_inputs.attention_mask.to(
+                    input_ids.device),
                 decoder_input_ids=decoder_input_ids,
                 max_new_tokens=max_new_tokens,
                 num_beams=args.num_beams,
