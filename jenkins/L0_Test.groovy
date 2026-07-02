@@ -1078,7 +1078,7 @@ def getPytestBaseCommandLine(
     if (stageName.contains("-Ray-")) {
         testCmdLine += ["--run-ray"]
     }
-    def unittestMarkExpr = (stageName.startsWith("CPU-") || stageName.contains("-CPU-")) ? "cpu_only and not disabled" : "not cpu_only"
+    def unittestMarkExpr = (stageName.startsWith("CPU-")) ? "cpu_only and not disabled" : "not cpu_only"
     testCmdLine += ["--unittest-markexpr=${unittestMarkExpr}"]
     if (extraArgs) {
         testCmdLine += extraArgs
@@ -2911,7 +2911,7 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
 
     if (!makoOpts) {
         def makoArgs = getMakoArgsFromStageName(stageName)
-        if (stageName.startsWith("CPU-") || stageName.contains("-CPU-")) {
+        if (stageName.startsWith("CPU-")) {
             def cpuName = env.targetArch == AARCH64_TRIPLE ? "aarch64" : "x86_64"
             makoOpts = transformMakoArgsToJson(
                 ["Mako options:"] + makoArgs + [
@@ -3519,6 +3519,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         echoNodeAndGpuInfo(pipeline, stageName)
         sh "cat ${MODEL_CACHE_DIR}/README"
         sh "nvidia-smi && nvidia-smi -q && nvidia-smi topo -m || echo nvidia-smi missing"
+        if (stageName.startsWith("CPU-")) {
+            sh "ln -s /usr/local/cuda/compat/lib.real /usr/local/cuda/compat/lib && ln -s /usr/local/cuda/lib64/stubs/libnvidia-ml.so /usr/local/cuda/compat/lib/libnvidia-ml.so.1"
+        }
         sh "df -h"
 
         // setup HF_HOME to cache model and datasets
