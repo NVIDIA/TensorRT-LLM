@@ -5,7 +5,7 @@
 Two payload formats are supported:
 
 - ``"safetensors"``: writes a single file with named tensors
-  (``image``/``video``/``audio``). Scalar metadata (``frame_rate``,
+  (``image``/``video``/``audio``/``action``). Scalar metadata (``frame_rate``,
   ``audio_sample_rate``) is stored two ways: as a 0-d tensor under
   the same key (so ``safetensors.torch.load(bytes)`` returns it
   alongside the media tensors — consumers call ``.item()`` to
@@ -49,12 +49,14 @@ def is_tensor_format(fmt: Optional[str]) -> bool:
 # canonical ``(H, W, C)`` shape is unbatched at rank 3 and batched at
 # rank 4; video is unbatched at rank 4 ``(T, H, W, C)`` and batched at
 # rank 5; audio is unbatched at rank 2 ``(channels, T_audio)`` and
-# batched at rank 3. The serializer uses these to decide whether a
+# batched at rank 3; action is unbatched at rank 2 ``(T, action_dim)``
+# and batched at rank 3. The serializer uses these to decide whether a
 # media tensor has a true batch axis to slice along.
 _BATCHED_RANKS: Dict[str, int] = {
     "image": 4,
     "video": 5,
     "audio": 3,
+    "action": 3,
 }
 
 
@@ -63,14 +65,15 @@ def _modalities(output: "VisualGenOutput") -> Tuple[Tuple[str, Optional[torch.Te
         ("image", output.image),
         ("video", output.video),
         ("audio", output.audio),
+        ("action", output.action),
     )
 
 
 def infer_batch_size(output: "VisualGenOutput") -> int:
     """Return the leading batch dimension across the populated media tensors.
 
-    Image is batched only at rank 4, video at rank 5, audio at rank 3.
-    An unbatched media tensor reports a batch size of 1 so list-path
+    Image is batched only at rank 4, video at rank 5, audio and action
+    at rank 3. An unbatched media tensor reports a batch size of 1 so list-path
     callers can still ask for ``[0]`` and get a single-item payload.
     Raises :class:`ValueError` when *output* carries no media tensor.
     """

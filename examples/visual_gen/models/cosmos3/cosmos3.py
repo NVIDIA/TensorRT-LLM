@@ -367,7 +367,6 @@ def main():
     params.extra_params["enable_audio"] = enable_audio
     params.extra_params["use_guardrails"] = not args.disable_guardrails
     params.extra_params["output_type"] = output_type
-    params.extra_params["action_resolution"] = args.action_resolution
 
     if args.action_mode is not None:
         params.extra_params["action_mode"] = args.action_mode
@@ -379,6 +378,8 @@ def main():
         params.extra_params["raw_action_dim"] = args.raw_action_dim
     if args.action_chunk_size is not None:
         params.extra_params["action_chunk_size"] = args.action_chunk_size
+    if args.action_resolution is not None:
+        params.extra_params["action_resolution"] = args.action_resolution
     if args.action_fps is not None:
         params.extra_params["action_fps"] = args.action_fps
     if args.action_json is not None:
