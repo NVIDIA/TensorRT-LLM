@@ -288,6 +288,7 @@ class DSparkWorker(SpecWorkerBase):
         num_contexts: int,
         batch_size: int,
         total_target_tokens: int,
+        all_rank_num_tokens: Optional[List[int]] = None,
     ):
         """Legacy per-request gen draft (eager only; default when the flag is off).
 
@@ -343,6 +344,7 @@ class DSparkWorker(SpecWorkerBase):
                 kv_windows=win_slice,
                 temperature=0.0,
                 confidence_threshold=conf_thr,
+                all_rank_num_tokens=all_rank_num_tokens,
             )
             out_tokens[i] = toks[0].to(torch.int32)
         return out_tokens
@@ -357,6 +359,7 @@ class DSparkWorker(SpecWorkerBase):
         num_contexts: int,
         batch_size: int,
         total_target_tokens: int,
+        all_rank_num_tokens: Optional[List[int]] = None,
     ) -> torch.Tensor:
         """CUDA-graph-safe batched gen draft (all gen requests in one forward).
 
@@ -427,6 +430,7 @@ class DSparkWorker(SpecWorkerBase):
             slots=slots,
             temperature=0.0,
             confidence_threshold=0.0,
+            all_rank_num_tokens=all_rank_num_tokens,
         )
         return toks.to(torch.int32)
 
@@ -508,6 +512,33 @@ class DSparkWorker(SpecWorkerBase):
                     draft_model.write_context_windows(hid, idx, self._kv_windows[slot])
                 ctx_off += seq_len
 
+        # FUSED_COMM MoE backends (DeepGEMM MegaMoE) synchronize EP ranks with an
+        # in-kernel phase-flip NVLink barrier that flips on every kernel call, so
+        # every rank must invoke the draft MoE the same number of times and with
+        # the same globally-gathered per-rank token list, or the barrier desyncs
+        # (hang / "unspecified launch failure"). The draft runs over generation
+        # requests only, each expanded to ``block`` positions, so the per-rank
+        # draft-MoE token count is ``num_gens * block``. ``all_rank_num_gens`` is
+        # gathered at metadata-prep time (model_engine, outside any CUDA-graph
+        # capture region); it is None for non-ADP / single-rank runs, where the
+        # local ``[num_tokens]`` fallback in ``_forward_stage`` is correct.
+        block = int(draft_model.block_size)
+        all_rank_num_gens = getattr(spec_metadata, "all_rank_num_gens", None)
+        # A rank with zero local gen requests still has to cross the draft MoE's
+        # cross-rank barrier, but DeepseekV4MoE's router / shared-expert dense
+        # GEMMs reject a 0-row input (cuBLAS CUBLAS_STATUS_INVALID_VALUE), so such
+        # a rank runs a single 1-row dummy through the MoE (like ADP padding).
+        # Encode that as ``1`` in the globally-shared per-rank token list so every
+        # rank agrees on the FUSED_COMM chunk count and per-rank slice.
+        all_rank_draft_tokens = (
+            [max(1, int(g) * block) for g in all_rank_num_gens]
+            if all_rank_num_gens is not None else None
+        )
+        global_has_gen = (
+            max(all_rank_num_gens) > 0
+            if all_rank_num_gens is not None else num_gens > 0
+        )
+
         if num_gens > 0:
             # Both gen-block variants take the same args and return [num_gens, K]
             # draft tokens; the batched one is the default (CUDA-graph-safe), the
@@ -524,8 +555,16 @@ class DSparkWorker(SpecWorkerBase):
                 num_contexts,
                 batch_size,
                 total_target_tokens,
+                all_rank_num_tokens=all_rank_draft_tokens,
             )
         else:
+            # No local generation requests: if any peer EP rank has some, we must
+            # still cross the draft MoE's cross-rank barrier the same number of
+            # times (zero-token) so a FUSED_COMM phase-flip barrier stays lockstep.
+            if global_has_gen:
+                draft_model.run_moe_lockstep_noop(
+                    all_rank_draft_tokens, accepted_tokens.device
+                )
             gen_draft_tokens = torch.empty((0, K), dtype=torch.int32, device="cuda")
 
         if num_contexts > 0:

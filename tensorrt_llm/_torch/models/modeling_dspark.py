@@ -37,7 +37,7 @@ are the reference-faithful, unit-validated I/O stages.
 import copy
 import os
 import re
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -892,6 +892,7 @@ class DSparkDraftModel(nn.Module):
         moe_input_ids: torch.Tensor,
         stage_window: Optional[torch.Tensor] = None,
         slots: Optional[torch.Tensor] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
     ) -> torch.Tensor:
         """One DSpark stage = reference ``Block.forward`` with captured-context attn.
 
@@ -980,10 +981,20 @@ class DSparkDraftModel(nn.Module):
         post_mix, comb_mix, layer_input = stage.hc_ffn.pre_mapping(residual)
         layer_input = stage.post_attention_layernorm(layer_input)
         num_tokens = T * block
+        # FUSED_COMM MoE backends (DeepGEMM MegaMoE) size their in-kernel
+        # NVLink-barrier chunk loop from ``max(all_rank_num_tokens)`` and index
+        # the local slice by ``moe_ep_rank``, so every EP rank must pass the same
+        # globally-gathered per-rank list (here: gen tokens = num_gens * block per
+        # rank). Passing only the local ``[num_tokens]`` desyncs the phase-flip
+        # barrier across ranks (hang / "unspecified launch failure"). Fall back to
+        # the local count for single-rank / non-ADP runs where no list is threaded.
+        moe_all_rank_num_tokens = (
+            all_rank_num_tokens if all_rank_num_tokens is not None else [num_tokens]
+        )
         moe_out = stage.mlp(
             layer_input.reshape(num_tokens, hidden),
             input_ids=moe_input_ids,
-            all_rank_num_tokens=[num_tokens],
+            all_rank_num_tokens=moe_all_rank_num_tokens,
             final_all_reduce_params=AllReduceParams(enable_allreduce=False),
             do_finalize=True,
         ).reshape(T, block, hidden)
@@ -1002,6 +1013,7 @@ class DSparkDraftModel(nn.Module):
         temperature: float = 0.0,
         confidence_threshold: float = 0.0,
         return_logits: bool = False,
+        all_rank_num_tokens: Optional[List[int]] = None,
     ) -> tuple:
         """Full block-draft forward: chain the ``num_stages`` DSpark stages.
 
@@ -1036,7 +1048,8 @@ class DSparkDraftModel(nn.Module):
         for s, stage in enumerate(self.mtp_layers):
             stage_window = kv_windows[:, s] if kv_windows is not None else None
             h = self._forward_stage(
-                stage, h, main_x, start_pos, freqs_cis, moe_input_ids, stage_window
+                stage, h, main_x, start_pos, freqs_cis, moe_input_ids, stage_window,
+                all_rank_num_tokens=all_rank_num_tokens,
             )
 
         return self.forward_head(
@@ -1058,6 +1071,7 @@ class DSparkDraftModel(nn.Module):
         temperature: float = 0.0,
         confidence_threshold: float = 0.0,
         return_logits: bool = False,
+        all_rank_num_tokens: Optional[List[int]] = None,
     ) -> tuple:
         """CUDA-graph-safe batched block-draft forward (all gen requests at once).
 
@@ -1101,7 +1115,8 @@ class DSparkDraftModel(nn.Module):
         for s, stage in enumerate(self.mtp_layers):
             stage_window = kv_windows[:, s]  # [N, window_size, head_dim]
             h = self._forward_stage(
-                stage, h, main_x, start_pos, freqs_cis, moe_input_ids, stage_window, slots
+                stage, h, main_x, start_pos, freqs_cis, moe_input_ids, stage_window, slots,
+                all_rank_num_tokens=all_rank_num_tokens,
             )
 
         return self.forward_head(
@@ -1111,6 +1126,45 @@ class DSparkDraftModel(nn.Module):
             confidence_threshold=confidence_threshold,
             return_logits=return_logits,
         )
+
+    def run_moe_lockstep_noop(
+        self, all_rank_num_tokens: Optional[List[int]], device: torch.device
+    ) -> None:
+        """Cross the FUSED_COMM MoE NVLink barrier the same number of times as
+        gen-bearing ranks, for an EP rank whose local draft batch is empty.
+
+        DeepGEMM MegaMoE (``scheduler_kind == FUSED_COMM``) synchronizes EP ranks
+        with an in-kernel phase-flip NVLink barrier that flips on every kernel
+        call, so every rank must invoke the MoE the same number of times or the
+        barrier desyncs (hang / "unspecified launch failure"). In the DSpark
+        draft only the MoE carries a cross-rank barrier (the captured-context
+        attention and the markov/confidence heads are per-rank), so a rank with
+        zero local generation requests replays just the per-stage MoE call with a
+        single 1-row dummy (its entry in ``all_rank_num_tokens`` is ``1``). The
+        scheduler runs its ``max``-derived chunk count, slicing this rank to the
+        1 dummy row and zero-padding the remaining chunks, keeping the barrier
+        lockstep. No-op when there is no cross-rank work (single-rank / non-ADP,
+        or every rank is empty).
+        """
+        if all_rank_num_tokens is None or max(all_rank_num_tokens) == 0:
+            return
+        hidden = self.config.hidden_size
+        # Use a 1-row dummy, NOT a 0-row tensor: DeepseekV4MoE's router /
+        # shared-expert dense GEMMs reject a 0-row input (cuBLAS
+        # CUBLAS_STATUS_INVALID_VALUE). The paired ``all_rank_num_tokens`` encodes
+        # 1 for this rank, so the FUSED_COMM scheduler slices to this 1 dummy row
+        # and still launches ``num_chunks`` cross-rank barrier crossings in
+        # lockstep with the gen-bearing ranks.
+        dummy_x = torch.zeros((1, hidden), dtype=torch.bfloat16, device=device)
+        dummy_ids = torch.zeros((1, ), dtype=torch.long, device=device)
+        for stage in self.mtp_layers:
+            stage.mlp(
+                dummy_x,
+                input_ids=dummy_ids,
+                all_rank_num_tokens=all_rank_num_tokens,
+                final_all_reduce_params=AllReduceParams(enable_allreduce=False),
+                do_finalize=True,
+            )
 
     def forward_head(
         self,
@@ -1187,6 +1241,10 @@ class DSparkForCausalLM(nn.Module):
     def forward_batched(self, main_hidden, bonus_token_ids, start_pos, **kwargs):
         """CUDA-graph-safe batched draft forward (delegates to the draft model)."""
         return self.dspark_model.forward_batched(main_hidden, bonus_token_ids, start_pos, **kwargs)
+
+    def run_moe_lockstep_noop(self, all_rank_num_tokens, device):
+        """Empty-batch MoE barrier lockstep (delegates to the draft model)."""
+        return self.dspark_model.run_moe_lockstep_noop(all_rank_num_tokens, device)
 
     def write_context_windows(self, main_hidden, positions, stage_windows):
         """Seed / back-fill the rolling KV windows (delegates to the draft model)."""
