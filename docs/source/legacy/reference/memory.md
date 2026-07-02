@@ -2,6 +2,10 @@
 
 # Memory Usage of TensorRT-LLM
 
+```{caution}
+The legacy TensorRT backend has been removed and is no longer supported. This page is retained for cross-reference only.
+```
+
 
 This document summarizes the memory usage of TensorRT-LLM, and addresses common issues and questions reported by users.
 

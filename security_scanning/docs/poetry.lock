@@ -912,14 +912,14 @@ test = ["cython (>=3.0)", "defusedxml (>=0.7.1)", "pytest (>=8.0)", "setuptools 
 
 [[package]]
 name = "sphinx-argparse"
-version = "0.5.2"
+version = "0.6.0"
 description = "A sphinx extension that automatically documents argparse commands and options"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "sphinx_argparse-0.5.2-py3-none-any.whl", hash = "sha256:d771b906c36d26dee669dbdbb5605c558d9440247a5608b810f7fa6e26ab1fd3"},
-    {file = "sphinx_argparse-0.5.2.tar.gz", hash = "sha256:e5352f8fa894b6fb6fda0498ba28a9f8d435971ef4bbc1a6c9c6414e7644f032"},
+    {file = "sphinx_argparse-0.6.0-py3-none-any.whl", hash = "sha256:abbf4445b7e477efadf0046871fe10e3dd4fe725c00763e55133585b3e03787a"},
+    {file = "sphinx_argparse-0.6.0.tar.gz", hash = "sha256:d072bb67dd52b294375f0eedc203cb8e50d0329910dbceb6764e9386bff94e9d"},
 ]
 
 [package.dependencies]
@@ -930,7 +930,7 @@ sphinx = ">=5.1.0"
 docs = ["CommonMark (>=0.5.6)", "furo (>=2024)"]
 lint = ["lxml-stubs (>=0.4)", "mypy (>=1.10)", "ruff (>=0.5)", "types-docutils (>=0.21)"]
 markdown = ["CommonMark (>=0.5.6)"]
-test = ["coverage (>=6.5)", "lxml (>=4.9)", "pytest (>=8.0)", "setuptools (>=70.0)", "typing_extensions (>=4.9)"]
+test = ["lxml (>=4.9)", "pytest (>=8.0)", "pytest-cov", "setuptools (>=70.0)", "typing_extensions (>=4.9)"]
 
 [[package]]
 name = "sphinx-click"
@@ -1234,4 +1234,4 @@ packaging = ">=24.0"
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "74958a6216bc9a4715ad6d5c879aeebb2675369d383da8d99d4f672978c560c2"
+content-hash = "69f02cb55fe15f20b0c06e9a4371471c6bddedfe5520b78d624ec5290174219b"

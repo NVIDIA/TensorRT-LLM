@@ -234,6 +234,8 @@ moonshotai/Kimi-K2.5:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 93.06
+  - quant_algo: NVFP4
+    accuracy: 93.06
 nvidia/Llama-3_3-Nemotron-Super-49B-v1:
   - accuracy: 92.57
   - quant_algo: FP8
@@ -441,10 +443,12 @@ MiniMaxAI/MiniMax-M2.5:
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 93.75
 # MiniMax-M3 text decoder (block-sparse MoE) GSM8K, full 1319-sample split.
-# BF16 checkpoint only. Threshold is set ~1pp below the measured TRT-LLM
-# hardpath score (~88) to absorb normal eval noise.
+# Thresholds tracked per checkpoint / quantization scheme.
 MiniMaxAI/MiniMax-M3:
-  - accuracy: 87
+  - accuracy: 89
+MiniMaxAI/MiniMax-M3-MXFP8:
+  - quant_algo: MXFP8
+    accuracy: 89
 nvidia/NVIDIA-Nemotron-Nano-9B-v2:
   - accuracy: 85.027
   - quant_algo: FP8
@@ -458,6 +462,11 @@ zai-org/GLM-5-FP8:
   - quant_algo: FP8_BLOCK_SCALES
     spec_dec_algo: MTP
     accuracy: 78.0
+zai-org/GLM-5.2:
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
+    accuracy: 90
 # Step-3.7-Flash text decoder (MoE) GSM8K, full 1319-sample split, TP4/EP4 with
 # TRTLLM attention + MoE backends. FP8 measured on the FP8 block-scale
 # checkpoint; NVFP4 measured on the modelopt NVFP4 export (FP8 KV cache). MTP

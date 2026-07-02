@@ -12,12 +12,12 @@ Guards both layers of the fix that landed in PR #13723 for the conc=32 NaN
 regression on MoE all-to-all under attention-DP:
 
   Level 1 (leaf): ``CapturedGraph.forward`` honours the
-    ``BypassCapturedGraphs()`` context manager. A Python int read inside the
-    captured graph (``int(host_tensor[0].item())``, mirroring
-    ``int(batch_info_host[14].item())`` in ``trtllm_moe.py``, where slot 14 of
-    ``BatchInfo`` is ``max_dp_num_tokens``) is baked into the captured
-    kernel-launch as a scalar argument. Replay reuses it regardless of
-    post-capture host updates. While inside ``BypassCapturedGraphs()`` (i.e.
+    ``BypassCapturedGraphs()`` context manager. A capture-time scalar read inside
+    the captured graph (``int(host_tensor[0].item())``, mirroring how the MoE
+    all-to-all op in ``trtllm_moe.py`` derives ``runtime_max_tokens_per_rank``
+    from the capture-time input shape) is baked into the captured kernel-launch as
+    a scalar argument. Replay reuses it regardless of post-capture host updates.
+    While inside ``BypassCapturedGraphs()`` (i.e.
     ``cuda_graph_state.in_bypass() == True``), the wrapper short-circuits to
     eager and reads the host fresh.
 
@@ -27,7 +27,7 @@ regression on MoE all-to-all under attention-DP:
     Captured graphs whose shapes happen to match are bypassed too — this is the
     actual cross-rank divergence the conc=32 NaN bug exposed when one rank ran
     prefill (eager) while another ran decode (replay) with a stale capture-time
-    ``max_dp_num_tokens``.
+    ``runtime_max_tokens_per_rank``.
 
 The cross-rank decision is propagated via the process-wide
 ``cuda_graph_state.BYPASS`` flag toggled by ``BypassCapturedGraphs()``, NOT by
@@ -53,7 +53,7 @@ from tensorrt_llm._torch.auto_deploy.utils.cuda_graph import BypassCapturedGraph
 
 
 class _SlotReadingModel(nn.Module):
-    """Mimics the ``int(batch_info_host[14].item())`` scalar read in the MoE A2A op.
+    """Mimics a capture-time scalar read baked into the MoE A2A op's kernel launch.
 
     The Python int returned by ``.item()`` is consumed as a kernel-launch
     argument by ``torch.full``; under cuda graph capture that argument value is
@@ -82,9 +82,8 @@ def _run_bypass_test(rank: int, world_size: int) -> None:
     capture_bs = [1, 2, 4]
 
     def get_args_kwargs(bs: int):
-        # Mimic ``SequenceInfo.set_capture_batch`` seeding ``max_dp_num_tokens``
-        # with the local total at capture time. Each captured graph thus bakes
-        # its own value.
+        # Mimic the MoE A2A op deriving its per-rank dispatch budget from the
+        # capture-time input shape. Each captured graph thus bakes its own value.
         host[0] = bs
         return (torch.zeros(bs, device=device),), {}
 
