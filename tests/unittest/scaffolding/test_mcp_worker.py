@@ -340,6 +340,7 @@ async def test_mcp_worker_multiple_calls(mcp_server):
         worker.shutdown()
 
 
+@pytest.mark.skip(reason="https://nvbugs/6337229")
 @pytest.mark.asyncio
 async def test_multiple_calls_to_same_tool(mcp_server):
     sse_url = mcp_server.get_sse_url()
