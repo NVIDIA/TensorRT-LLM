@@ -57,6 +57,21 @@ NGC_REPO           ?= nvcr.io/nvidia/tensorrt-llm
 NGC_USE_STAGING    ?= 0
 NGC_AUTO_REPO      ?= $(if $(filter 1,$(NGC_USE_STAGING)),$(NGC_STAGING_REPO),$(NGC_REPO))
 
+# Helper: literal comma for use inside $(if ...) expansions
+comma := ,
+
+# BuildKit cache configuration for registry-based layer caching.
+# Set DOCKER_CACHE_REPO to enable; leave empty to disable (default).
+# DOCKER_CACHE_FROM accepts additional --cache-from flags (space-separated)
+# to pull cached layers from multiple sources (e.g., branch-specific + main).
+DOCKER_CACHE_REPO  ?=
+DOCKER_CACHE_TAG   ?= $(if $(STAGE),$(STAGE)-)$(IMAGE_TAG)
+DOCKER_CACHE_FROM  ?=
+DOCKER_CACHE_OPTS  ?= $(if $(DOCKER_CACHE_REPO),\
+  --cache-to type=registry$(comma)ref=$(DOCKER_CACHE_REPO):$(DOCKER_CACHE_TAG)$(comma)mode=max \
+  --cache-from type=registry$(comma)ref=$(DOCKER_CACHE_REPO):$(DOCKER_CACHE_TAG) \
+  $(DOCKER_CACHE_FROM))
+
 define add_local_user
 	docker build \
 		--progress $(DOCKER_PROGRESS) \
@@ -86,7 +101,7 @@ base_pull:
     				   | grep '^BASH_ENV=' | sed 's/^[^=]*=//' 2>/dev/null)
 %_build: base_pull
 	@echo "Building docker image: $(IMAGE_WITH_TAG)"
-	docker buildx build $(DOCKER_BUILD_OPTS) $(DOCKER_BUILD_ARGS) \
+	docker buildx build $(DOCKER_BUILD_OPTS) $(DOCKER_BUILD_ARGS) $(DOCKER_CACHE_OPTS) \
 		--progress $(DOCKER_PROGRESS) \
 		$(if $(BASE_IMAGE), --build-arg BASE_IMAGE=$(BASE_IMAGE)) \
 		$(if $(BASE_TAG), --build-arg BASE_TAG=$(BASE_TAG)) \

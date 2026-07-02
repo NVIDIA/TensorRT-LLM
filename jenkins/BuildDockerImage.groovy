@@ -39,6 +39,10 @@ BUILD_JOBS_RELEASE_SBSA = "32"
 
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 
+// Registry for Docker BuildKit layer cache (--cache-to / --cache-from).
+// Set to empty string to disable caching.
+DOCKER_CACHE_REGISTRY = env.dockerCacheRegistry ?: "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-cache"
+
 @Field
 def GITHUB_PR_API_URL = "github_pr_api_url"
 @Field
@@ -239,6 +243,35 @@ def prepareWheelFromBuildStage(dockerfileStage, arch) {
     return " BUILD_WHEEL_SCRIPT=${wheelScript} BUILD_WHEEL_ARGS='${wheelArgs}'"
 }
 
+/**
+ * Generate Makefile variables for Docker BuildKit registry cache.
+ *
+ * Produces up to 3 cache-from sources tried in order by BuildKit:
+ *   1. Branch+stage-specific  (exact match for rebuild on the same branch)
+ *   2. main branch+stage      (good fallback for new feature branches)
+ *   3. latest stable+stage    (updated after each successful post-merge)
+ *
+ * @param stage  Dockerfile target stage (e.g. "tritondevel", "release", "devel")
+ * @param arch   Architecture label       (e.g. "x86_64", "sbsa")
+ * @return       String with Makefile variable overrides, empty when caching is disabled
+ */
+def buildCacheArgs(stage, arch) {
+    if (!DOCKER_CACHE_REGISTRY) {
+        return ""
+    }
+
+    def cacheRepo = DOCKER_CACHE_REGISTRY
+    def branchTag = "${stage}-${arch}-${LLM_BRANCH_TAG}"
+
+    // Build the list of --cache-from flags for the Makefile DOCKER_CACHE_FROM variable.
+    // The Makefile already adds one --cache-from for DOCKER_CACHE_TAG (the branch-specific tag).
+    // Here we supply the additional fallback sources.
+    def cacheFromFlags = "--cache-from type=registry,ref=${cacheRepo}:${stage}-${arch}-main"
+    cacheFromFlags += " --cache-from type=registry,ref=${cacheRepo}:${stage}-${arch}-latest"
+
+    return " DOCKER_CACHE_REPO=${cacheRepo} DOCKER_CACHE_TAG=${branchTag} DOCKER_CACHE_FROM='${cacheFromFlags}'"
+}
+
 def buildImage(config, imageKeyToTag)
 {
     def target = config.target
@@ -267,6 +300,9 @@ def buildImage(config, imageKeyToTag)
     }
 
     args += " GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote"
+
+    // Compute BuildKit cache flags for this build's stage and architecture.
+    def cacheArgs = buildCacheArgs(dockerfileStage, arch)
 
     stage (config.stageName) {
         // Step 1: Clone TRT-LLM source codes
@@ -315,6 +351,7 @@ def buildImage(config, imageKeyToTag)
         TRITON_IMAGE = TRITON_IMAGE.replace("nvcr.io/", "urm.nvidia.com/docker/")
 
         if (dependent) {
+            def dependentCacheArgs = buildCacheArgs(dependent.dockerfileStage, arch)
             stage ("make ${dependent.target}_${action} (${arch})") {
                 def randomSleep = (Math.random() * 600 + 600).toInteger()
                 trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
@@ -325,7 +362,7 @@ def buildImage(config, imageKeyToTag)
                 TORCH_INSTALL_TYPE=${torchInstallType} \
                 IMAGE_WITH_TAG=${dependentImageWithTag} \
                 STAGE=${dependent.dockerfileStage} \
-                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
+                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}${dependentCacheArgs}
                 """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
                 args += " DEVEL_IMAGE=${dependentImageWithTag}"
                 if (target == "ngc-release") {
@@ -355,7 +392,7 @@ def buildImage(config, imageKeyToTag)
                 TORCH_INSTALL_TYPE=${torchInstallType} \
                 IMAGE_WITH_TAG=${imageWithTag} \
                 STAGE=${dockerfileStage} \
-                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
+                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}${cacheArgs}
                 """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
             } catch (InterruptedException ex) {
                 throw ex
@@ -372,7 +409,7 @@ def buildImage(config, imageKeyToTag)
                 TORCH_INSTALL_TYPE=${torchInstallType} \
                 IMAGE_WITH_TAG=${imageWithTag} \
                 STAGE=${dockerfileStage} \
-                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
+                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}${cacheArgs}
                 """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
             }
             if (target == "ngc-release") {
@@ -389,7 +426,7 @@ def buildImage(config, imageKeyToTag)
                 TORCH_INSTALL_TYPE=${torchInstallType} \
                 IMAGE_WITH_TAG=${customImageWithTag} \
                 STAGE=${dockerfileStage} \
-                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
+                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}${cacheArgs}
                 """
             }
         }
