@@ -55,7 +55,7 @@ class VisualGenRequestOutput:
 class VisualGenBenchmarkMetrics:
     """Aggregated benchmark metrics across all requests.
 
-    All ``*_latency`` and ``*_generation`` fields are wall-clock seconds.
+    All ``*_latency``, ``*_generation``, and ``*_denoise`` fields are seconds.
     The relationship ``latency >= generation`` should hold per request;
     the gap is the encode + persist + IPC overhead the bench measures
     around the engine, and is the headroom available for overlap-style
@@ -77,6 +77,12 @@ class VisualGenBenchmarkMetrics:
     min_generation: float
     max_generation: float
     percentiles_generation: list[tuple[float, float]]
+    mean_denoise: float
+    median_denoise: float
+    std_denoise: float
+    min_denoise: float
+    max_denoise: float
+    percentiles_denoise: list[tuple[float, float]]
     num_gpus: int = 1
     per_gpu_throughput: float = 0.0
     mean_ttff: float = -1.0
@@ -97,6 +103,7 @@ def calculate_metrics(
     # otherwise a backend that doesn't report metrics would push the mean
     # toward zero and obscure the latency comparison.
     generations: list[float] = []
+    denoises: list[float] = []
     error_counts: dict[str, int] = {}
     completed = 0
 
@@ -107,6 +114,8 @@ def calculate_metrics(
             latencies.append(out.latency)
             if out.generation > 0:
                 generations.append(out.generation)
+            if out.denoise > 0:
+                denoises.append(out.denoise)
             completed += 1
 
     total_error_count = sum(error_counts.values())
@@ -144,6 +153,12 @@ def calculate_metrics(
         min_generation=float(np.min(generations)) if generations else 0,
         max_generation=float(np.max(generations)) if generations else 0,
         percentiles_generation=_pcts(generations),
+        mean_denoise=float(np.mean(denoises)) if denoises else 0,
+        median_denoise=float(np.median(denoises)) if denoises else 0,
+        std_denoise=float(np.std(denoises)) if denoises else 0,
+        min_denoise=float(np.min(denoises)) if denoises else 0,
+        max_denoise=float(np.max(denoises)) if denoises else 0,
+        percentiles_denoise=_pcts(denoises),
         num_gpus=num_gpus,
         per_gpu_throughput=request_throughput / num_gpus,
     )
@@ -194,6 +209,16 @@ def print_visual_gen_results(
     for p, v in metrics.percentiles_generation:
         p_word = str(int(p)) if int(p) == p else str(p)
         print("{:<40} {:<10.4f}".format(f"P{p_word} Generation (s):", v))
+
+    print("{s:{c}^{n}}".format(s=" Denoise ", n=60, c="-"))
+    print("{:<40} {:<10.4f}".format("Mean Denoise (s):", metrics.mean_denoise))
+    print("{:<40} {:<10.4f}".format("Median Denoise (s):", metrics.median_denoise))
+    print("{:<40} {:<10.4f}".format("Std Dev Denoise (s):", metrics.std_denoise))
+    print("{:<40} {:<10.4f}".format("Min Denoise (s):", metrics.min_denoise))
+    print("{:<40} {:<10.4f}".format("Max Denoise (s):", metrics.max_denoise))
+    for p, v in metrics.percentiles_denoise:
+        p_word = str(int(p)) if int(p) == p else str(p)
+        print("{:<40} {:<10.4f}".format(f"P{p_word} Denoise (s):", v))
 
     print("{s:{c}^{n}}".format(s=" Placeholder Metrics ", n=60, c="-"))
     print("{:<40} {:<10}".format("TTFF (s):", "N/A (placeholder)"))
@@ -278,8 +303,17 @@ def build_visual_gen_result_dict(
         "percentiles_generation": {
             f"p{int(p) if int(p) == p else p}": v for p, v in metrics.percentiles_generation
         },
+        "mean_denoise": metrics.mean_denoise,
+        "median_denoise": metrics.median_denoise,
+        "std_denoise": metrics.std_denoise,
+        "min_denoise": metrics.min_denoise,
+        "max_denoise": metrics.max_denoise,
+        "percentiles_denoise": {
+            f"p{int(p) if int(p) == p else p}": v for p, v in metrics.percentiles_denoise
+        },
         "latencies": [out.latency for out in outputs],
         "generations": [out.generation for out in outputs],
+        "denoises": [out.denoise for out in outputs],
         "errors": [out.error for out in outputs],
         "gen_params": gen_params,
     }
