@@ -776,7 +776,8 @@ class PARDForCausalLM(nn.Module):
             draft_config.pretrained_config)
 
         # Remove spec_config to prevent recursive spec-dec initialization
-        draft_config_no_spec = replace(draft_config, spec_config=None,
+        draft_config_no_spec = replace(draft_config,
+                                       spec_config=None,
                                        lm_head_gather_output=False)
 
         # Weights will be loaded later by ModelLoader.load_draft_weights()
@@ -863,7 +864,8 @@ class DFlashForCausalLM(nn.Module):
                 pretrained_cfg.architectures = original_archs
 
         # Remove spec_config to prevent recursive spec-dec initialization
-        draft_config_no_spec = replace(draft_config, spec_config=None,
+        draft_config_no_spec = replace(draft_config,
+                                       spec_config=None,
                                        lm_head_gather_output=False)
 
         # Weights will be loaded later by ModelLoader.load_draft_weights()

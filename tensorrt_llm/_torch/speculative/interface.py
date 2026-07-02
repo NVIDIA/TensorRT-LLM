@@ -1757,8 +1757,15 @@ class SpecWorkerBase(nn.Module, ABC):
                 spec_metadata.d2t = d2t.data if d2t is not None else None
                 spec_metadata.draft_probs_valid = num_contexts == 0
         else:
-            gen_draft_tokens = torch.argmax(gen_logits, dim=-1,
-                                            keepdim=False).long()
+            # Greedy: flatten the [num_gens, K, vocab] block to [num_gens*K,
+            # vocab] and route through the TP-aware draft_sampler so a
+            # vocab-sharded draft LM head resolves the global argmax via the
+            # lighter per-rank gather (a plain argmax on sharded logits would
+            # disagree across ranks). Reshape back to [num_gens, K].
+            num_gens, K, vocab = gen_logits.shape
+            flat_tokens = self.draft_sampler(
+                gen_logits.reshape(num_gens * K, vocab))
+            gen_draft_tokens = flat_tokens.reshape(num_gens, K).long()
             if d2t is not None:
                 gen_draft_tokens = d2t[gen_draft_tokens] + gen_draft_tokens
         return gen_draft_tokens.type(torch.int32)
