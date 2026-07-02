@@ -43,6 +43,13 @@ class MiniMaxM3SparseParams(SparseParams):
     local_blocks: int = 1
     score_type: str = "max"
     disable_index_value: bool = True
+    # When True, the layer dispatches the sparse forward through the
+    # MSA-backed FMHA runtime (``fmha_sm100`` + ``sparse_topk_select``)
+    # instead of the in-tree Triton + SDPA reference path. The MSA stack
+    # is only available on SM100 and requires the external
+    # ``fmha_sm100`` package; the layer raises a descriptive error if
+    # it is requested without those preconditions met.
+    use_msa: bool = False
 
 
 @dataclass(frozen=True)
