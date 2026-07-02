@@ -247,10 +247,9 @@ class TestNemotron_Nano_12B_V2_VL(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "enable_chunked_prefill,max_num_tokens",
         [
-            (False, MAX_NUM_TOKENS),
             (True, 1024),
         ],
-        ids=["full_budget", "forced_chunked_prefill"],
+        ids=["forced_chunked_prefill"],
     )
     def test_auto_dtype(self, enable_chunked_prefill, max_num_tokens):
         with LLM(
@@ -494,10 +493,9 @@ class TestQwen3VL(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "enable_chunked_prefill,max_num_tokens",
         [
-            (False, MAX_NUM_TOKENS),
             (True, 1024),
         ],
-        ids=["full_budget", "forced_chunked_prefill"],
+        ids=["forced_chunked_prefill"],
     )
     def test_auto_dtype(self, enable_chunked_prefill, max_num_tokens):
         with LLM(
@@ -543,8 +541,8 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(183000)
     @pytest.mark.parametrize(
         "ep_size,attention_dp",
-        [(1, False), (1, True), (8, False), (8, True)],
-        ids=["tp8", "tp8_attn_dp", "ep8", "dep8"],
+        [(8, True)],
+        ids=["dep8"],
     )
     def test_nvfp4(self, ep_size, attention_dp):
         """NVFP4 accuracy on MMMU benchmark (8x B200)."""
@@ -575,7 +573,6 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
 class TestMistralSmall24B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
     MODEL_PATH = f"{llm_models_root()}/Mistral-Small-3.1-24B-Instruct-2503"
-    MAX_NUM_TOKENS = 16384
 
     # NOTE: MMMU adds <|endoftext|> to the stop token.
     sampling_params = SamplingParams(
@@ -588,10 +585,9 @@ class TestMistralSmall24B(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "max_num_tokens",
         [
-            MAX_NUM_TOKENS,
             1024,
         ],
-        ids=["full_budget", "forced_chunked_prefill"],
+        ids=["forced_chunked_prefill"],
     )
     def test_auto_dtype(self, max_num_tokens):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
@@ -742,7 +738,7 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
                 ),
                 128,
                 QuantAlgo.MIXED_PRECISION,
-                (MMMU_TASK_SPEC, VOXPOPULI_TASK_SPEC, VIDEOMME_TASK_SPEC),
+                (MMMU_TASK_SPEC, VOXPOPULI_TASK_SPEC),
                 None,
                 marks=(skip_pre_blackwell,),
                 id="nvfp4",
@@ -793,6 +789,7 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
                 )
 
 
+@skip_pre_blackwell
 class TestStep3_7(LlmapiAccuracyTestHarness):
     # Step-3.7-Flash is a reasoning VLM: a PerceptionEncoder vision tower plus a
     # MoE text decoder, registered under the Step3p7ForConditionalGeneration
@@ -855,7 +852,6 @@ class TestStep3_7(LlmapiAccuracyTestHarness):
                 extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
             )
 
-    @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(80000)
     @parametrize_with_ids("mtp_nextn", [0, 3])

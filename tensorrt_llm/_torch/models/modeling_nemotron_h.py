@@ -972,9 +972,14 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
             if not hasattr(config, attr) or getattr(config, attr) is None:
                 setattr(config, attr, _bc_getattr(fallback, attr))
 
-    def load_weights(self, weights: dict, weight_mapper: BaseWeightMapper):
+    def load_weights(self,
+                     weights: dict,
+                     weight_mapper: BaseWeightMapper,
+                     allow_partial_loading: bool = False):
         new_weights = weight_mapper.preprocess_weights(weights)
-        super().load_weights(weights=new_weights, weight_mapper=weight_mapper)
+        super().load_weights(weights=new_weights,
+                             weight_mapper=weight_mapper,
+                             allow_partial_loading=allow_partial_loading)
 
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:

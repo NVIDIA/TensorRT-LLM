@@ -502,11 +502,29 @@ TEST(SerializeUtilsTest, KvCacheConfig)
 
 TEST(SerializeUtilsTest, SchedulerConfig)
 {
-    texec::SchedulerConfig schedulerConfig(
-        texec::CapacitySchedulerPolicy::kMAX_UTILIZATION, texec::ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED);
+    texec::SchedulerConfig defaultSchedulerConfig;
+    EXPECT_TRUE(defaultSchedulerConfig.getEnablePrefixAwareScheduling());
+
+    texec::DynamicBatchConfig dynamicBatchConfig{/*enableBatchSizeTuning=*/true,
+        /*enableMaxNumTokensTuning=*/true, /*dynamicBatchMovingAverageWindow=*/64};
+    texec::SchedulerConfig schedulerConfig(texec::CapacitySchedulerPolicy::kMAX_UTILIZATION,
+        texec::ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED, dynamicBatchConfig, false);
     auto schedulerConfig2 = serializeDeserialize(schedulerConfig);
     EXPECT_EQ(schedulerConfig.getCapacitySchedulerPolicy(), schedulerConfig2.getCapacitySchedulerPolicy());
     EXPECT_EQ(schedulerConfig.getContextChunkingPolicy(), schedulerConfig2.getContextChunkingPolicy());
+    EXPECT_EQ(schedulerConfig, schedulerConfig2);
+    ASSERT_TRUE(schedulerConfig2.getDynamicBatchConfig().has_value());
+    EXPECT_TRUE(schedulerConfig2.getDynamicBatchConfig()->getEnableBatchSizeTuning());
+    EXPECT_TRUE(schedulerConfig2.getDynamicBatchConfig()->getEnableMaxNumTokensTuning());
+    EXPECT_EQ(schedulerConfig2.getDynamicBatchConfig()->getDynamicBatchMovingAverageWindow(), 64);
+    EXPECT_FALSE(schedulerConfig2.getEnablePrefixAwareScheduling());
+
+    texec::SchedulerConfig differentDynamicBatchConfig(texec::CapacitySchedulerPolicy::kMAX_UTILIZATION,
+        texec::ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED,
+        texec::DynamicBatchConfig{/*enableBatchSizeTuning=*/false, /*enableMaxNumTokensTuning=*/true,
+            /*dynamicBatchMovingAverageWindow=*/64},
+        false);
+    EXPECT_FALSE(schedulerConfig == differentDynamicBatchConfig);
 }
 
 TEST(SerializeUtilsTest, ParallelConfig)
@@ -1068,6 +1086,8 @@ TEST(SerializeUtilsTest, CacheTransceiverConfig)
     EXPECT_EQ(cacheTransceiverConfig.getKvTransferTimeoutMs(), cacheTransceiverConfig2.getKvTransferTimeoutMs());
     EXPECT_EQ(cacheTransceiverConfig.getKvTransferSenderFutureTimeoutMs(),
         cacheTransceiverConfig2.getKvTransferSenderFutureTimeoutMs());
+    EXPECT_EQ(
+        cacheTransceiverConfig.getKvTransferPollIntervalMs(), cacheTransceiverConfig2.getKvTransferPollIntervalMs());
 }
 
 TEST(SerializeUtilsTest, BlockKeyBasic)

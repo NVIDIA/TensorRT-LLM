@@ -25,6 +25,7 @@ aux_stream_name_list = [
     'MoeBalancer',
     'MoeOutputMemset',
     'MoeFc2Alpha',
+    'EngramPrecompute',
 ]
 AuxStreamType = Enum(
     'AuxStreamType',
@@ -462,6 +463,10 @@ def relu2(x: torch.Tensor) -> torch.Tensor:
     return torch.square(F.relu(x))
 
 
+def gelu_tanh(x: torch.Tensor) -> torch.Tensor:
+    return F.gelu(x, approximate="tanh")
+
+
 def tensor_to_str(x: torch.Tensor, num_elements: int = 10) -> str:
     # Pass num_elements=-1 will print the whole tensor
     if num_elements < 0:
@@ -529,3 +534,112 @@ def replace_parameter_and_save_metadata(
             raise ValueError(f"Invalid type {type(new_param)} for new_param")
 
     module.register_parameter(param_name, saved_param)
+
+
+class _AcceptSyncCompute:
+    pass
+
+
+ACCEPT_SYNC_COMPUTE = _AcceptSyncCompute()
+
+
+# Inspired by https://github.com/pytorch/pytorch/issues/80577; note also the
+# suggestion to consider torch.nested.
+def torch_multi_arange(
+    ends: torch.Tensor,
+    *,
+    output_length: int | _AcceptSyncCompute,
+    starts: torch.Tensor | None = None,
+    steps: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Efficiently compute torch.cat([torch.arange(b, e, d) for b, e, d in zip(starts, ends, steps)]).
+
+    Starts, ends, steps need to share dtype and shape. Invalid ranges like range(1, 2, -1) are
+    silently discarded. 'steps' defaults to 1 and 'starts' defaults to 0.
+
+    Provide 'output_length' to avoid synchronization when using device tensors or pass
+    `ACCEPT_SYNC_COMPUTE` to explicitly accept the possibility of a device sync (for device tensors)
+    or when tensors are known to reside on the host.
+    """
+    if not ((steps is None or
+             (ends.dtype == steps.dtype and ends.shape == steps.shape
+              and ends.device == steps.device)) and
+            (starts is None or
+             (ends.dtype == starts.dtype and ends.shape == starts.shape
+              and ends.device == starts.device))):
+        raise ValueError("Incompatible input tensors")
+    output_length_arg = None if isinstance(
+        output_length, _AcceptSyncCompute) else output_length
+
+    if ends.numel() == 0:
+        return ends.clone()
+
+    # This algorithm combines torch.repeat_interleaved() and torch.cumsum() to
+    # construct the result.
+    #
+    # 1. Given N ranges (characterized by starts, ends, steps), construct a sequence
+    #    of 2N numbers, in which the non-overlapping pairs of consecutive numbers
+    #    correspond to the ranges. For a given range, the pair (a, b) is chosen such
+    #    that upon torch.cumsum() application 'a' turns the last element of the
+    #    preceding range into the start element for the current range and 'b' is
+    #    simply the step size for the current range.
+    #
+    repeats = ends - starts if starts is not None else ends
+    if steps is not None:
+        if repeats is not ends:
+            repeats *= steps.sign()
+        else:
+            repeats = repeats * steps.sign()
+        steps_abs = steps.abs()
+        repeats = (repeats + steps_abs - 1).div(steps_abs,
+                                                rounding_mode="floor")
+    repeats = repeats.clip(min=0)  # ignore invalid ranges
+    ones = torch.ones((), dtype=ends.dtype, device=ends.device)
+    zeros = torch.zeros((), dtype=ends.dtype, device=ends.device)
+    if steps is None:
+        steps = ones.broadcast_to(ends.shape)
+
+    range_ends = repeats - 1  # last element in each range
+    if steps is not None:
+        range_ends *= steps
+    if starts is not None:
+        range_ends += starts
+    #
+    # Handling of zero-repeats requires extra care. Need to track index of last non-zero
+    # repeat for each non-zero repeat.
+    #   pad values: repeats.size(0) for scatter, 0 for gather
+    nz_repeats_idx = torch.nonzero_static(
+        repeats, size=repeats.size(0), fill_value=repeats.size(0)).squeeze(-1)
+    next_nz_repeats_idx = nz_repeats_idx.roll(-1)
+    next_nz_repeats_idx[-1].fill_(repeats.size(0))
+    nz_repeats_idx.masked_fill_(nz_repeats_idx == repeats.size(0), 0)
+    #
+    # contains end of last non-empty range for each index with non-zero repeat (other
+    # entries zero)
+    last_nonempty_range_ends = torch.zeros(
+        device=range_ends.device,
+        dtype=range_ends.dtype,
+        size=(repeats.size(0) + 1, ),
+    ).scatter(
+        dim=0,
+        index=next_nz_repeats_idx,
+        src=range_ends.gather(dim=0, index=nz_repeats_idx),
+    )[:-1]
+
+    jumps = -last_nonempty_range_ends  # delta from one non-empty range to the next
+    if starts is not None:
+        jumps += starts
+    seq = torch.cat((jumps.unsqueeze(-1), steps.unsqueeze(-1)), dim=1).view(-1)
+    #
+    # 2. Construct output via torch.repeat_interleave() and torch.cumsum()
+    #     NB: For a resulting empty range, repeats - 1 == -1. In this case, we
+    #         should set repeats for delta and increment both to 0 instead.
+    zero_repeats_mask = (repeats == 0)
+    jump_repeats = torch.where(zero_repeats_mask, zeros, ones)
+    step_repeats = torch.where(zero_repeats_mask, zeros, repeats - 1)
+    seq_repeats = torch.cat(
+        (jump_repeats.unsqueeze(-1), step_repeats.unsqueeze(-1)),
+        dim=1).view(-1)
+    seq = seq.repeat_interleave(seq_repeats, output_size=output_length_arg)
+    seq = seq.cumsum(0, dtype=ends.dtype)
+    return seq

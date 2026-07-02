@@ -14,7 +14,7 @@
 # limitations under the License.
 import functools
 from contextlib import contextmanager
-from typing import Callable
+from typing import Callable, Optional
 
 try:
     import ray
@@ -30,14 +30,29 @@ def unwrap_ray_errors():
         raise e.as_instanceof_cause() from e
 
 
-def control_action_decorator(func: Callable) -> Callable:
-    """
-    Decorator that wraps a method to use control_action context manager.
+def control_action_decorator(func: Optional[Callable] = None,
+                             *,
+                             drain: bool = True) -> Callable:
+    """Wrap a method in the ``control_action`` context manager.
+
+    Supports both bare and parameterized forms::
+
+        @control_action_decorator                  # drain=True (default)
+        def shutdown(self): ...
+
+        @control_action_decorator(drain=False)     # non-draining variant
+        def update_weights_via_ipc_zmq(self): ...
     """
 
-    @functools.wraps(func)
-    def wrapper(self, *args, **kwargs):
-        with self.engine.control_action():
-            return func(self, *args, **kwargs)
+    def decorator(f: Callable) -> Callable:
 
-    return wrapper
+        @functools.wraps(f)
+        def wrapper(self, *args, **kwargs):
+            with self.engine.control_action(drain=drain):
+                return f(self, *args, **kwargs)
+
+        return wrapper
+
+    if func is None:
+        return decorator
+    return decorator(func)
