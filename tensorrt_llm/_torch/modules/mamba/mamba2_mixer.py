@@ -434,16 +434,47 @@ class Mamba2Mixer(nn.Module):
                         f"{draft_token_num} must match fixed replay step "
                         f"width {replay_step_width}.")
 
-                intermediate_state_indices = _cached_arange(
-                    attn_metadata.kv_cache_manager.get_max_resource_count(),
-                    state_indices_d.device)[:num_decodes]
+                # Dynamic-tree verify uses per-request links; linear MTP skips it.
+                is_dyn_tree = getattr(spec_metadata, 'is_spec_dec_dynamic_tree',
+                                      False)
+                retrieve_next_token = retrieve_next_sibling = None
+                retrieve_parent_token = None
+                if is_dyn_tree:
+                    if use_replay:
+                        raise NotImplementedError(
+                            "Dynamic-tree Mamba verify is not supported with "
+                            "the replay SSM-cache path (TRTLLM_USE_MAMBA_REPLAY)."
+                        )
+                    retrieve_next_token = spec_metadata.retrieve_next_token
+                    retrieve_next_sibling = spec_metadata.retrieve_next_sibling
+                    assert (retrieve_next_token is not None
+                            and retrieve_next_sibling is not None), (
+                                "Dynamic-tree verify requires retrieve link "
+                                "tensors on spec_metadata.")
+                    retrieve_next_token = retrieve_next_token[:num_decodes]
+                    retrieve_next_sibling = retrieve_next_sibling[:num_decodes]
+                    # conv1d fills parent links used by tree-aware SSM restore.
+                    retrieve_parent_token = torch.empty(
+                        (num_decodes, draft_token_num),
+                        dtype=torch.int32,
+                        device=state_indices_d.device)
 
-                # Reshape for batch processing
-                xbc_d_reshaped = xbc_d.view(num_decodes, draft_token_num,
-                                            -1).transpose(1, 2)
+                # Prefer the cache_manager-owned arange; cached fallback storage
+                # can be recycled by CUDA graph warmup.
+                _km_isi = getattr(attn_metadata.kv_cache_manager,
+                                  'intermediate_state_indices', None)
+                if _km_isi is not None:
+                    intermediate_state_indices = _km_isi[:num_decodes]
+                else:
+                    intermediate_state_indices = _cached_arange(
+                        attn_metadata.kv_cache_manager.get_max_resource_count(),
+                        state_indices_d.device)[:num_decodes]
+
+                # Use reshape because dynamic-tree tokens may be non-contiguous.
+                xbc_d_reshaped = xbc_d.reshape(num_decodes, draft_token_num,
+                                               -1).transpose(1, 2)
 
                 def conv1d():
-                    # TODO:support tree structure [TRTLLM-10320]
                     xbc_d_processed = causal_conv1d_update_triton(
                         xbc_d_reshaped,
                         conv_states,
@@ -453,11 +484,15 @@ class Mamba2Mixer(nn.Module):
                         conv_state_indices=state_indices_d[:num_decodes],
                         intermediate_conv_window=intermediate_conv_states,
                         intermediate_state_indices=intermediate_state_indices,
+                        # None on linear MTP.
+                        retrieve_next_token=retrieve_next_token,
+                        retrieve_next_sibling=retrieve_next_sibling,
+                        retrieve_parent_token=retrieve_parent_token,
                         # PDL chain: conv1d → precompute → main (replay only)
                         launch_dependent_kernels=use_replay,
                     )
 
-                    return xbc_d_processed.transpose(1, 2).view(
+                    return xbc_d_processed.transpose(1, 2).reshape(
                         num_decode_tokens, -1)
 
             else:
@@ -592,13 +627,23 @@ class Mamba2Mixer(nn.Module):
                         state_batch_indices=state_batch_indices,
                         disable_state_update=True,
                         intermediate_state_indices=intermediate_state_indices,
+                        # None for linear MTP; tree parent map for dynamic tree.
+                        retrieve_parent_token=retrieve_parent_token,
                     )
                 else:
                     # Triton kernel + flashinfer need contiguous for alignment.
                     x_d_4d = x_d_4d.contiguous()
                     B_d_4d = B_d_4d.contiguous()
                     C_d_4d = C_d_4d.contiguous()
-                    self.selective_state_update_func(
+                    if is_dyn_tree:
+                        # flashinfer SSU cannot restore tree-parent states.
+                        ssu_func = selective_state_update_native
+                        ssu_extra = dict(
+                            retrieve_parent_token=retrieve_parent_token)
+                    else:
+                        ssu_func = self.selective_state_update_func
+                        ssu_extra = {}
+                    ssu_func(
                         ssm_states,
                         x_d_4d,
                         dt_d_4d,
@@ -615,6 +660,7 @@ class Mamba2Mixer(nn.Module):
                         intermediate_states_buffer=intermediate_ssm_states,
                         cache_steps=draft_token_num,
                         intermediate_state_indices=intermediate_state_indices,
+                        **ssu_extra,
                         **philox_kwargs,
                     )
             else:
