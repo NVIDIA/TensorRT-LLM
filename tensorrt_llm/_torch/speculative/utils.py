@@ -32,6 +32,35 @@ from .save_hidden_state import (SaveHiddenStatesResourceManager,
 from .suffix_automaton import SuffixAutomatonManager
 
 
+def _get_draft_vocab_size(spec_config, target_vocab_size: int) -> int:
+    """Draft-model vocab size, used to decide whether rejection sampling needs
+    the d2t-expanded ``full_draft_probs`` buffer (only when it differs from the
+    target vocab).
+
+    Reads the draft model's ``config.json`` (``vocab_size``, or a nested
+    ``text_config.vocab_size``) from ``spec_config.speculative_model``. Returns
+    ``target_vocab_size`` (shared vocab, no buffer needed) when there is no
+    separate draft model or the config cannot be read.
+    """
+    draft_dir = getattr(spec_config, "speculative_model", None)
+    if not draft_dir:
+        return target_vocab_size
+    try:
+        import json
+        import os
+        cfg_path = os.path.join(str(draft_dir), "config.json")
+        if not os.path.isfile(cfg_path):
+            return target_vocab_size
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        vs = cfg.get("vocab_size")
+        if vs is None:
+            vs = (cfg.get("text_config") or {}).get("vocab_size")
+        return int(vs) if vs else target_vocab_size
+    except Exception:
+        return target_vocab_size
+
+
 def get_spec_metadata(spec_config,
                       model_config,
                       max_num_requests,
@@ -42,6 +71,9 @@ def get_spec_metadata(spec_config,
     use_rejection_sampling = getattr(spec_config, "use_rejection_sampling",
                                      False)
     vocab_size = getattr(model_config, "vocab_size", 0)
+    # Draft-model vocab size, used to gate the d2t-expanded full_draft_probs
+    # buffer allocation (see SpecMetadata.prepare_rejection_sampling_buffers).
+    draft_vocab_size = _get_draft_vocab_size(spec_config, vocab_size)
     if spec_config.spec_dec_mode.is_mtp_eagle_one_model():
         # MTP Eagle one-model reuses Eagle3 one-model metadata for the
         # unified worker/sampler/slot_ids plumbing, but skips per-layer
@@ -60,6 +92,7 @@ def get_spec_metadata(spec_config,
             max_num_tokens=max_num_tokens,
             use_rejection_sampling=use_rejection_sampling,
             vocab_size=vocab_size,
+            draft_vocab_size=draft_vocab_size,
             spec_resource_manager=spec_resource_manager,
         )
     if spec_config.spec_dec_mode.is_mtp_vanilla():
@@ -70,6 +103,9 @@ def get_spec_metadata(spec_config,
             mtp_num_modules=spec_config.max_draft_len,
             max_num_requests=max_num_requests,
             mtp_hidden_states_manager=spec_resource_manager,
+            use_rejection_sampling=use_rejection_sampling,
+            vocab_size=vocab_size,
+            draft_vocab_size=draft_vocab_size,
         )
     if spec_config.spec_dec_mode.is_mtp_eagle():
         return Eagle3SpecMetadata(
@@ -117,6 +153,7 @@ def get_spec_metadata(spec_config,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
             use_rejection_sampling=use_rejection_sampling,
             vocab_size=vocab_size,
+            draft_vocab_size=draft_vocab_size,
             spec_resource_manager=spec_resource_manager,
             use_dynamic_tree=spec_config.use_dynamic_tree,
             eagle_choices=spec_config.eagle_choices,
@@ -128,6 +165,9 @@ def get_spec_metadata(spec_config,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_num_requests=max_num_requests,
             spec_resource_manager=spec_resource_manager,
+            use_rejection_sampling=use_rejection_sampling,
+            vocab_size=vocab_size,
+            draft_vocab_size=draft_vocab_size,
         )
     if spec_config.spec_dec_mode.is_dflash():
         target_layer_ids = getattr(spec_config, 'target_layer_ids', None)
@@ -140,6 +180,9 @@ def get_spec_metadata(spec_config,
             hidden_size=model_config.hidden_size,
             max_num_tokens=max_num_tokens,
             dtype=model_config.torch_dtype,
+            use_rejection_sampling=use_rejection_sampling,
+            vocab_size=vocab_size,
+            draft_vocab_size=draft_vocab_size,
         )
     if spec_config.spec_dec_mode.is_draft_target_one_model():
         return DraftTargetOneModelSpecMetadata(
@@ -148,6 +191,9 @@ def get_spec_metadata(spec_config,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_num_requests=max_num_requests,
             max_num_tokens=max_num_tokens,
+            use_rejection_sampling=use_rejection_sampling,
+            vocab_size=vocab_size,
+            draft_vocab_size=draft_vocab_size,
         )
     if spec_config.spec_dec_mode.is_save_hidden_states():
         return SaveHiddenStatesSpecMetadata(

@@ -5,10 +5,8 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from tensorrt_llm._utils import prefer_pinned
-from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
-from ..distributed.ops import allgather
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import TorchSampler
@@ -184,6 +182,10 @@ class MTPSpecMetadata(SpecMetadata):
 
     def prepare(self):
         assert self.request_ids is not None
+        # Allocate the slot-indexed rejection-sampling buffers (draft_probs,
+        # batch_slot_ids, full_draft_probs). No-op unless use_rejection_sampling
+        # is set.
+        self.prepare_rejection_sampling_buffers()
         num_seqs = len(self.request_ids)
         # update batch indices
         batch_indices = torch.arange(num_seqs,
@@ -282,6 +284,9 @@ class MTPWorker(SpecWorkerBase):
         super().__init__(use_separate_draft_kv_cache)
         self.spec_config = spec_config
         self.model_config = model_config
+        # Alias so the shared producer path can read self.mapping uniformly
+        # (other workers store it directly); MTP keeps it under model_config.
+        self.mapping = getattr(model_config, "mapping", None)
         self.is_thop = False
         self.sa_enhancer: Optional[SADraftEnhancer] = None
         if spec_config.sa_config is not None:
@@ -439,6 +444,13 @@ class MTPWorker(SpecWorkerBase):
         last_tokens_idx = torch.cumsum(
             attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
 
+        # Rejection sampling captures each draft step's sampling distribution
+        # into the slot-indexed spec_metadata.draft_probs buffer. Engaged only
+        # for non-greedy batches; all-greedy batches use the argmax path.
+        use_rejection = (getattr(spec_metadata, "use_rejection_sampling", False)
+                         and not spec_metadata.is_all_greedy_sample)
+        self.reset_draft_probs_valid_for_capture(spec_metadata)
+
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(
             resource_manager)
 
@@ -460,7 +472,12 @@ class MTPWorker(SpecWorkerBase):
                     self.guided_decoder.execute_draft_batch(logits,
                                                             draft_step=i)
 
-                new_draft_token = self.draft_sampler(logits)
+                # Rejection path stores this step's distribution; greedy uses
+                # the plain draft_sampler.
+                new_draft_token = self.produce_draft_tokens(logits,
+                                                            spec_metadata,
+                                                            batch_size,
+                                                            draft_step=i)
                 next_draft_tokens.append(new_draft_token)
                 # shift input_ids and hidden_states
                 input_ids = draft_inputs["input_ids"]
@@ -477,6 +494,11 @@ class MTPWorker(SpecWorkerBase):
                     "attn_metadata": draft_inputs["attn_metadata"],
                 }
             next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
+
+        # Mark draft_probs valid so the next forward's acceptance can use
+        # rejection sampling.
+        if use_rejection:
+            spec_metadata.draft_probs_valid = True
 
         # Override with SA draft tokens after all MTP layers have run,
         # so that MTP layers never see SA tokens in their inputs.
@@ -831,6 +853,18 @@ class MTPWorker(SpecWorkerBase):
                 spec_metadata.runtime_draft_len,
                 spec_metadata=spec_metadata)
 
+        # Rejection sampling acceptance. _can_use_rejection_sampling() requires
+        # use_rejection_sampling, draft_probs_valid, and a non-all-greedy batch;
+        # otherwise falls through to strict acceptance below. Context rows take
+        # the target's first sampled token; gen rows run the rejection kernel.
+        elif self._can_use_rejection_sampling(spec_metadata):
+            draft_tokens = spec_metadata.draft_tokens.reshape(
+                num_gens, mtp_num_modules)
+            # compare_and_accept() already applies _apply_force_accepted_tokens()
+            # internally; do not apply it again here.
+            accepted_tokens, num_accepted_tokens = self.compare_and_accept(
+                logits, draft_tokens, num_contexts, batch_size, spec_metadata)
+
         # Strict acceptance
         else:
             if self.is_thop:
@@ -1073,80 +1107,3 @@ class MTPWorker(SpecWorkerBase):
             "hidden_states": return_hidden_states,
             "attn_metadata": attn_metadata,
         }
-
-    @torch.compile(options={"max-autotune": True})
-    def get_local_max_and_combined(self, logits, mapping_lm_tp=None):
-        local_max_values, local_argmax = torch.max(logits, dim=-1, keepdim=True)
-        # Adjust indices based on TP rank and size
-        vocab_per_rank = logits.shape[-1]
-        mapping_lm_tp = mapping_lm_tp if mapping_lm_tp is not None else self.model_config.mapping
-        max_index_per_rank = local_argmax.type(
-            torch.int32) + (mapping_lm_tp.tp_rank * vocab_per_rank)
-        # Use torch.stack and flatten instead of view+cat to avoid torch.compile issues
-        # Convert both to float32 to ensure consistent dtype
-        max_index_per_rank_float = max_index_per_rank.float()
-        local_max_values_float32 = local_max_values.float()
-
-        # Stack and flatten to get interleaved layout: [idx0, val0, idx1, val1, ...]
-        combined = torch.stack(
-            [max_index_per_rank_float, local_max_values_float32],
-            dim=-1).flatten(-2)
-        return combined
-
-    @torch.compile(options={"max-autotune": True})
-    def get_draft_tokens_from_gathered(self, gathered):
-        gathered_indices_float = gathered[..., 0::2]  # Even positions: indices
-        gathered_values_float = gathered[..., 1::2]  # Odd positions: values
-
-        # Find the rank with maximum value
-        max_indices = torch.argmax(gathered_values_float, dim=-1, keepdim=True)
-
-        # Get the corresponding token indices and convert back to int32
-        draft_tokens = torch.gather(gathered_indices_float, -1,
-                                    max_indices).squeeze(-1).type(torch.int32)
-        return draft_tokens
-
-    def draft_sampler(
-        self,
-        logits: torch.Tensor,
-        mapping_lm_head_tp: Mapping = None,
-    ):
-        '''
-        Sampling draft tokens.
-
-        Args:
-            logits: torch.Tensor
-                [num_tokens, vocab_size]
-                Logits produced by the draft model.
-
-        Returns:
-            draft_tokens: torch.Tensor
-                [batch_size * max_draft_len]
-                Draft token ids. Flattened.
-        '''
-        if (self.model_config is not None
-                and hasattr(self.model_config, 'mapping')
-                and self.model_config.mapping.tp_size
-                > 1) and not (self.model_config.mapping.enable_attention_dp):
-            combined = self.get_local_max_and_combined(logits)
-            gathered = allgather(combined, self.model_config.mapping, dim=-1)
-            draft_tokens = self.get_draft_tokens_from_gathered(gathered)
-        elif (self.model_config is not None
-              and hasattr(self.model_config, 'mapping')
-              and self.model_config.mapping.tp_size
-              > 1) and self.model_config.mapping.enable_lm_head_tp_in_adp:
-            # For ADP + LM head TP mode, we need to find the global argmax across all TP ranks
-            combined = self.get_local_max_and_combined(logits,
-                                                       mapping_lm_head_tp)
-            gathered = allgather(combined, mapping_lm_head_tp, dim=-1)
-            batch_size = logits.shape[0]
-            local_batch_size = batch_size // mapping_lm_head_tp.tp_size
-            gathered = gathered.view(mapping_lm_head_tp.tp_size,
-                                     local_batch_size, -1)
-            sliced_gathered = gathered[mapping_lm_head_tp.tp_rank]
-            draft_tokens = self.get_draft_tokens_from_gathered(sliced_gathered)
-        else:
-            # Simple argmax if no TP or no model config
-            draft_tokens = self._draft_sampler_greedy(logits)
-
-        return draft_tokens

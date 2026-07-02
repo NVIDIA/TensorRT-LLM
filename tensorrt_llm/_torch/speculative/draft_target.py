@@ -200,6 +200,14 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
         next_draft_tokens = []
         original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
+        # Rejection sampling (producer side): set True only after every draft
+        # step has scattered its probs below.
+        use_rejection = (
+            getattr(spec_metadata, "use_rejection_sampling", False)
+            and not spec_metadata.is_all_greedy_sample
+        )
+        self.reset_draft_probs_valid_for_capture(spec_metadata)
+
         # Get the draft KV cache manager if using separate layouts
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
 
@@ -244,10 +252,15 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
                     hidden_states[gather_ids], draft_model.lm_head, attn_metadata, True
                 )
                 if self.guided_decoder is not None:
-                    d2t = getattr(draft_model.model, "d2t", None)
-                    self.guided_decoder.execute_draft_batch(logits, d2t, draft_step=i)
+                    self.guided_decoder.execute_draft_batch(logits, self._d2t, draft_step=i)
 
-                new_draft_token = self.draft_decoder(logits, draft_model)
+                new_draft_token = self.draft_decoder(
+                    logits,
+                    draft_model,
+                    spec_metadata=spec_metadata,
+                    batch_size=batch_size,
+                    draft_step=i,
+                )
                 next_draft_tokens.append(new_draft_token)
 
                 # Update inputs and metadata for next draft step
@@ -273,6 +286,12 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
                 }
 
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
+
+        # Mark draft_probs valid so the next forward's compare_and_accept can run
+        # rejection sampling. Record d2t for acceptance-side vocab expansion.
+        if use_rejection:
+            spec_metadata.d2t = self._d2t.data if self._d2t is not None else None
+            spec_metadata.draft_probs_valid = True
 
         # Restore attention metadata to original state
         self._restore_attn_metadata_from_spec_dec(attn_metadata)
@@ -314,7 +333,7 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
         else:
             draft_tokens = spec_metadata.draft_tokens.reshape(num_gens, self.max_draft_len)
 
-        return self._sample_and_accept_draft_tokens_base(
+        return self.compare_and_accept(
             logits, draft_tokens, num_contexts, batch_size, spec_metadata
         )
 
@@ -322,9 +341,18 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
         self,
         logits: torch.Tensor,
         draft_model: nn.Module,
+        spec_metadata: Optional["SpecMetadata"] = None,
+        batch_size: Optional[int] = None,
+        draft_step: Optional[int] = None,
     ):
-        d2t = getattr(draft_model.model, "d2t", None)
-        return self._draft_sampler_greedy(logits, d2t)
+        # Rejection path stores this step's distribution; greedy uses the plain
+        # greedy sampler.
+        return self.produce_draft_tokens(
+            logits,
+            spec_metadata,
+            batch_size,
+            draft_step=draft_step,
+        )
 
     def prepare_1st_drafter_inputs(
         self,

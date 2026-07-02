@@ -777,7 +777,9 @@ class PARDForCausalLM(nn.Module):
             draft_config.pretrained_config)
 
         # Remove spec_config to prevent recursive spec-dec initialization
-        draft_config_no_spec = replace(draft_config, spec_config=None)
+        draft_config_no_spec = replace(draft_config,
+                                       spec_config=None,
+                                       lm_head_gather_output=False)
 
         # Weights will be loaded later by ModelLoader.load_draft_weights()
         self.draft_model_full = DraftModelClass(draft_config_no_spec)
@@ -863,7 +865,9 @@ class DFlashForCausalLM(nn.Module):
                 pretrained_cfg.architectures = original_archs
 
         # Remove spec_config to prevent recursive spec-dec initialization
-        draft_config_no_spec = replace(draft_config, spec_config=None)
+        draft_config_no_spec = replace(draft_config,
+                                       spec_config=None,
+                                       lm_head_gather_output=False)
 
         # Weights will be loaded later by ModelLoader.load_draft_weights()
         self.draft_model_full = DraftModelClass(draft_config_no_spec)
@@ -1669,6 +1673,9 @@ def get_draft_model(model_config, draft_config, lm_head, model):
     elif spec_dec_mode.is_dflash():
         return DFlashForCausalLM(draft_config)
     elif spec_dec_mode.is_draft_target_one_model():
+        # Keep the draft LM head vocab-sharded so greedy draft sampling uses the
+        # lighter TP gather (see SpecWorkerBase.draft_sampler).
+        draft_config.lm_head_gather_output = False
         return AutoModelForCausalLM.from_config(draft_config)
     else:
         raise NotImplementedError(
@@ -1757,6 +1764,10 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 model_config.mapping,
                 use_separate_draft_kv_cache=self.use_separate_draft_kv_cache)
             if self.spec_worker is not None:
+                # Cache the static draft->target vocab map now that the draft
+                # model is loaded, so workers read self._d2t instead of probing
+                # draft_model.model.d2t on every forward.
+                self.spec_worker.set_draft_model(self.draft_model)
                 self.epilogue.append(self.spec_worker)
         self.layer_idx = -1
 
