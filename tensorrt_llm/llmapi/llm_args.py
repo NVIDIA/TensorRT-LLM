@@ -18,6 +18,7 @@ import functools
 import json
 import math
 import os
+import re
 import types
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -515,8 +516,34 @@ class MultimodalEncoderCudaGraphConfig(StrictBaseModel):
         return self
 
 
-# TODO(TRTLLM-13352): migrate `TorchLlmArgs.mm_encoder_only` and
-# `TorchLlmArgs.video_pruning_rate` into this class in a follow-up change.
+_BYTE_STRING_PATTERN = re.compile(r"^\s*(\d+)\s*([kmgt]ib|b)?\s*$",
+                                  re.IGNORECASE)
+_BINARY_BYTE_UNITS: dict[Optional[str], int] = {
+    None: 1,
+    "b": 1,
+    "kib": 1024,
+    "mib": 1024**2,
+    "gib": 1024**3,
+    "tib": 1024**4,
+}
+
+
+def _parse_binary_byte_string(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+
+    match = _BYTE_STRING_PATTERN.fullmatch(value)
+    if match is None:
+        raise ValueError(
+            "Byte strings must be non-negative integers with optional "
+            "B/KiB/MiB/GiB/TiB suffix.")
+
+    amount = int(match.group(1))
+    unit = match.group(2)
+    multiplier = _BINARY_BYTE_UNITS[unit.lower() if unit is not None else None]
+    return amount * multiplier
+
+
 class MultimodalConfig(StrictBaseModel):
     """Multimodal model configuration."""
 
@@ -530,6 +557,56 @@ class MultimodalConfig(StrictBaseModel):
          "`tensorrt_llm/_torch/models/multimodal_encoder_graph.py`)."),
         status="prototype",
     )
+
+    encoder_side_stream_max_ahead: NonNegativeInt = Field(
+        default=0,
+        description=
+        ("Maximum number of pending multimodal requests whose encoder work can be prefetched "
+         "on a side CUDA stream ahead of admission. 0 disables side-stream prefetch. "
+         "Incompatible with encoder_cuda_graph because graph replay uses static buffers."
+         ),
+        status="prototype",
+    )
+
+    encoder_cache_max_bytes: NonNegativeInt = Field(
+        default=134_217_728,  # 128 MiB.
+        description=
+        ("Maximum bytes for the per-model cross-request multimodal encoder embedding cache. "
+         "Set to 0 to disable. String values such as '512MiB' and '1GiB' use binary units. "
+         "Cache entries are per multimodal item, but reuse is all-or-nothing for each request: "
+         "every item in the request must hit the cache before cached embeddings are reused. "
+         "Only single-modality requests are cacheable for the time being. "
+         "NOTE: This is only valid for child implementations of the `MultimodalModelMixin`."
+         ),
+        status="prototype",
+    )
+
+    video_pruning_rate: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        lt=1.0,
+        description=
+        ("Pruning rate for video frames in multimodal models. Applied by Efficient Video "
+         "Sampling (EVS) in NemotronH_Nano_VL_V2. None (default) disables EVS, values "
+         "in [0, 1) enable pruning."),
+        status="prototype",
+    )
+
+    @field_validator('encoder_cache_max_bytes', mode='before')
+    @classmethod
+    def parse_encoder_cache_max_bytes(cls, value):
+        return _parse_binary_byte_string(value)
+
+    @model_validator(mode='after')
+    def validate_side_stream_cuda_graph_exclusive(self) -> 'MultimodalConfig':
+        if (self.encoder_cuda_graph is not None
+                and self.encoder_side_stream_max_ahead > 0):
+            raise ValueError(
+                "multimodal_config.encoder_cuda_graph and "
+                "multimodal_config.encoder_side_stream_max_ahead > 0 are "
+                "mutually exclusive. Disable side-stream MM prefetch or "
+                "disable MM encoder CUDA graphs.")
+        return self
 
 
 class GuidedDecodingConfig(StrictBaseModel):
@@ -4985,15 +5062,6 @@ class TorchLlmArgs(BaseLlmArgs):
         description="Configuration for layer-wise benchmarks calibration.",
         status="prototype")
 
-    video_pruning_rate: Optional[float] = Field(
-        default=None,
-        ge=0.0,
-        lt=1.0,
-        description="Pruning rate for video frames in multimodal models. "
-        "Applied by Efficient Video Sampling (EVS) in NemotronH_Nano_VL_V2. "
-        "None (default) disables EVS, values in [0, 1) enable pruning.",
-        status="prototype")
-
     @property
     def quant_config(self) -> QuantConfig:
         if self._quant_config is None:
@@ -5531,6 +5599,21 @@ def update_llm_args_with_extra_dict(
                 merged['disabled'] = base_tc['disabled']
             llm_args_dict['telemetry_config'] = merged
 
+    if 'multimodal_config' in llm_args_dict:
+        yaml_mm = llm_args_dict['multimodal_config']
+        if yaml_mm is None:
+            yaml_mm = {}
+        if isinstance(yaml_mm, MultimodalConfig):
+            yaml_mm = yaml_mm.model_dump(exclude_unset=True)
+        if isinstance(yaml_mm, dict):
+            base_mm = llm_args.get('multimodal_config', {})
+            if isinstance(base_mm, MultimodalConfig):
+                base_mm = base_mm.model_dump(exclude_unset=True)
+            if not isinstance(base_mm, dict):
+                base_mm = {}
+            merged = dict(base_mm) | dict(yaml_mm)
+            llm_args_dict['multimodal_config'] = merged
+
     # Drop YAML keys claimed by explicit CLI flags so the outer merge below
     # cannot overwrite them. Warn only when the CLI value actually differs from
     # the YAML value, so users who relied on the previous "YAML wins" behavior
@@ -5561,6 +5644,7 @@ def update_llm_args_with_extra_dict(
         "reorder_policy_config": ReorderRequestPolicyConfig,
         "kv_cache_config": KvCacheConfig,
         "dwdp_config": DwdpConfig,
+        "multimodal_config": MultimodalConfig,
         "telemetry_config": TelemetryConfig,
     }
     for field_name, field_type in field_mapping.items():
