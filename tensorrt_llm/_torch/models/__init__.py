@@ -1,8 +1,9 @@
 import transformers
 
 # Importing _torch.configs triggers AutoConfig registration for TRT-LLM-only
-# model_types (deepseek_v32, kimi_k2) so AutoTokenizer.from_pretrained works
-# under transformers >= 5.5; see _torch/configs/__init__.py.
+# model_types (deepseek_v32, kimi_k2, gemma4_unified) so AutoConfig /
+# AutoTokenizer.from_pretrained work under transformers >= 5.5; see
+# _torch/configs/__init__.py.
 import tensorrt_llm._torch.configs  # noqa: F401
 
 from .modeling_afmoe import AfmoeForCausalLM
@@ -131,14 +132,17 @@ else:
         f"Failed to import MllamaForConditionalGeneration as transformers.__version__ {transformers.__version__} < 4.45.1"
     )
 
-# Gemma4 requires transformers>=5.5.0 (native Gemma4 config/model classes).
-# Import silently on failure -- `get_model_architecture` in modeling_utils.py
-# raises a targeted "upgrade transformers" error only when the user actually
-# tries to load a Gemma4 model.
-try:
-    from .modeling_gemma4 import Gemma4ForCausalLM  # noqa
-    from .modeling_gemma4mm import Gemma4ForConditionalGeneration  # noqa
+# Gemma 4 (native and the encoder-free "unified" 12B) needs transformers>=5.5.0,
+# guaranteed by the repo pin (5.5.4). The unified flavor's config classes are
+# provided by TRT-LLM shims in _torch/configs/gemma4_unified.py on transformers
+# releases that do not ship them natively.
+from .modeling_gemma4 import Gemma4ForCausalLM  # noqa
+from .modeling_gemma4_unified import \
+    Gemma4UnifiedForConditionalGeneration  # noqa
+from .modeling_gemma4mm import Gemma4ForConditionalGeneration  # noqa
 
-    __all__.extend(["Gemma4ForCausalLM", "Gemma4ForConditionalGeneration"])
-except ImportError:
-    pass
+__all__.extend([
+    "Gemma4ForCausalLM",
+    "Gemma4ForConditionalGeneration",
+    "Gemma4UnifiedForConditionalGeneration",
+])
