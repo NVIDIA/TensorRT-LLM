@@ -1716,20 +1716,11 @@ class SequenceInfo:
 
         # --- position_ids (device) ---
         position_ids = self.get_arg("position_ids", truncate=True, unflatten=False)
-        # position_ids is per-token while offset is per-sequence; expand if needed
-        if self.is_generate_only:
-            offset_for_pos_ids = offset
-        elif self.is_extend_only:
-            _, num_extend, _ = self.batch_info.get_num_sequences()
-            _, num_extend_tokens, _ = self.batch_info.get_num_tokens()
-            tokens_per_seq = num_extend_tokens // num_extend
-            offset_for_pos_ids = offset[:num_extend].repeat_interleave(tokens_per_seq)
-        else:
-            # mixed prefill + (extend/decode). Need to use seq_len in the generic case. Causes host sync.
-            # TODO: Can special case for cases where we know offset of prefill sequences to avoid host sync.
-            seq_len = self.get_arg("seq_len", truncate=True)
-            offset_for_pos_ids = torch.repeat_interleave(offset, seq_len.to(torch.int64))
-
+        # position_ids is per-token while offset is per-sequence.
+        seq_len = self.get_arg("seq_len", truncate=True)
+        offset_for_pos_ids = torch.repeat_interleave(
+            offset, seq_len.to(torch.int64), output_size=position_ids.numel()
+        )
         position_ids += offset_for_pos_ids
 
         # --- seq_len_with_cache (device) ---
