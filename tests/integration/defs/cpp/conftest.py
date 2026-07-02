@@ -17,6 +17,19 @@ from build_wheel import main as build_trt_llm
 from defs.conftest import llm_models_root
 
 
+@pytest.hookimpl(trylast=True)
+def pytest_sessionfinish(session, exitstatus):
+    # The cpp test driver imports tensorrt_llm (and thus loads the bindings
+    # C-extension) at collection time. Those native static destructors race and
+    # segfault during CPython Py_FinalizeEx, crashing the process (SIGSEGV,
+    # "<no Python frame>", exit 139) after all tests have already passed. Exit
+    # immediately once pytest has finished reporting so the unsafe native
+    # finalizers never run, preserving the real exit status.
+    _sys.stdout.flush()
+    _sys.stderr.flush()
+    _os._exit(int(exitstatus))
+
+
 @pytest.fixture(scope="session")
 def build_type():
     """CMake build type for C++ builds."""
