@@ -362,13 +362,6 @@ class OpenAIDisaggregatedService(OpenAIService):
                 )
 
         request.disaggregated_params.disagg_request_id = disagg_request_id
-        # Clear any context-pool route_hint before the gen hop: a route_hint.dp_rank
-        # is a ctx-pool per-rank decision, but the gen pool has its own independent
-        # DP layout, so a ctx rank is meaningless there and would pin gen traffic
-        # onto low ranks. The gen request inherits the ctx response's
-        # disaggregated_params above, so null it so gen routes via its own path.
-        if request.disaggregated_params is not None:
-            request.disaggregated_params.route_hint = None
         return request
 
     async def _check_conditional_disagg(self, request: UCompletionRequest) -> bool:

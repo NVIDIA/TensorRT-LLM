@@ -18,11 +18,6 @@ class DisaggScheduleStyle(IntEnum):
 
 
 @dataclass(slots=True, kw_only=True)
-class RouteHint:
-    dp_rank: Optional[int] = None
-
-
-@dataclass(slots=True, kw_only=True)
 class DisaggregatedParams:
     """Disaggregated serving parameters.
 
@@ -60,9 +55,6 @@ class DisaggregatedParams:
     # carried through so worker-side consumers (e.g. the ADP router) can see
     # the same id the disagg orchestrator routed on.
     conversation_id: Optional[str] = None
-
-    # Route hint from centralized KV-cache router (per-rank routing)
-    route_hint: Optional[RouteHint] = None
 
     # E-P Disaggregated Params
     multimodal_embedding_handles: Optional[List[Dict[str, Any]]] = (

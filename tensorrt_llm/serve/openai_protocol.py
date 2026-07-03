@@ -40,7 +40,7 @@ from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.inputs.media_io import MediaModality
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import (DisaggScheduleStyle, GuidedDecodingParams,
-                                 RouteHint as LlmRouteHint, SamplingParams)
+                                 SamplingParams)
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.scheduling_params import AgentHierarchy
 
@@ -124,10 +124,6 @@ class ResponseFormat(OpenAIBaseModel):
     format: Optional[xgrammar.structural_tag.Format] = None
 
 
-class RouteHint(OpenAIBaseModel):
-    dp_rank: Optional[int] = None
-
-
 class DisaggregatedParams(OpenAIBaseModel):
     request_type: str
     first_gen_tokens: Optional[List[int]] = None
@@ -141,7 +137,6 @@ class DisaggregatedParams(OpenAIBaseModel):
     ctx_info_endpoint: Optional[str] = None
     schedule_style: Optional[DisaggScheduleStyle] = None
     conversation_id: Optional[str] = None
-    route_hint: Optional[RouteHint] = None
 
 
 class ErrorResponse(OpenAIBaseModel):
@@ -1233,9 +1228,6 @@ def to_disaggregated_params(
         tllm_disagg_params: LlmDisaggregatedParams) -> DisaggregatedParams:
     if tllm_disagg_params is None:
         return None
-    route_hint = None
-    if tllm_disagg_params.route_hint is not None:
-        route_hint = RouteHint(dp_rank=tllm_disagg_params.route_hint.dp_rank)
     return DisaggregatedParams(
         request_type=tllm_disagg_params.request_type,
         first_gen_tokens=tllm_disagg_params.first_gen_tokens,
@@ -1252,7 +1244,6 @@ def to_disaggregated_params(
         ctx_info_endpoint=tllm_disagg_params.ctx_info_endpoint,
         schedule_style=tllm_disagg_params.schedule_style,
         conversation_id=tllm_disagg_params.conversation_id,
-        route_hint=route_hint,
     )
 
 
@@ -1260,9 +1251,6 @@ def to_llm_disaggregated_params(
         disaggregated_params: DisaggregatedParams) -> LlmDisaggregatedParams:
     if disaggregated_params is None:
         return None
-    route_hint = None
-    if disaggregated_params.route_hint is not None:
-        route_hint = LlmRouteHint(dp_rank=disaggregated_params.route_hint.dp_rank)
     return LlmDisaggregatedParams(
         request_type=disaggregated_params.request_type,
         first_gen_tokens=disaggregated_params.first_gen_tokens,
@@ -1279,7 +1267,6 @@ def to_llm_disaggregated_params(
         ctx_info_endpoint=disaggregated_params.ctx_info_endpoint,
         schedule_style=disaggregated_params.schedule_style,
         conversation_id=disaggregated_params.conversation_id,
-        route_hint=route_hint,
     )
 
 
