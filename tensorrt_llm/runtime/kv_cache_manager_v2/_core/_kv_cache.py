@@ -1265,6 +1265,11 @@ class _KVCache:
         if new_num_full_blocks > num_committed_blocks:
             with self._record_event():
                 for ordinal in typed_range(num_committed_blocks, new_num_full_blocks):
+                    if self._commit_state != self.CommitState.ALLOWED:
+                        # A block in this batch hit a commit conflict
+                        # (virtual stop); the remaining tokens stay virtually
+                        # committed, same as the entry guard above.
+                        break
                     self._commit_block(ordinal, False)
         if self.history_length < self.num_committed_tokens:
             self.history_length = self.num_committed_tokens
@@ -1814,6 +1819,25 @@ class _KVCache:
             )
             for (lc, _), lock in zip(reuse_list, locks):
                 beam_block[lc] = lock
+            seq_block.tree_block = tree_block
+            assert self._get_tree_block(ordinal) is tree_block
+            self._num_committed_blocks = BlockOrdinal(ordinal + 1)
+        elif tree_block.is_full and is_full and self._arena_ranges is not None:
+            # Arena mode: another sequence committed the same tokens first
+            # (common for shared system prompts under concurrency). Rebasing
+            # onto its pages would share GPU pages across arenas (§4.4
+            # invariant), so keep our own pages as sequence-private committed
+            # copies referencing the existing tree block, and keep committing.
+            skip_lcs = {ssm_lc_id} if ssm_lc_id is not None else None
+            uncommitted_pages = self._take_uncommitted_page(ordinal, beam_idx, skip_lcs)
+            for lc, (page, locked) in typed_enumerate(uncommitted_pages):
+                if page is None:
+                    continue
+                p = page.convert_to_private_committed(tree_block, self.finish_event)
+                # The page comes from an uncommitted page of self, so safe to skip wait.
+                beam_block[lc] = (
+                    p.lock(self, beam_idx, ordinal, lc, skip_wait=True) if locked else p.hold()
+                )
             seq_block.tree_block = tree_block
             assert self._get_tree_block(ordinal) is tree_block
             self._num_committed_blocks = BlockOrdinal(ordinal + 1)

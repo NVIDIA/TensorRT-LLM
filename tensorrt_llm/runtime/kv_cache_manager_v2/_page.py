@@ -183,6 +183,24 @@ class UncommittedPage(Page):
         block.storage[self.life_cycle] = rawref.ref(committed_page)
         return committed_page
 
+    def convert_to_private_committed(
+        self, block: Block, ready_event: CachedCudaEvent
+    ) -> "PrivateCommittedPage":
+        """Arena-mode intra-batch commit conflict (§4.4): another sequence
+        committed the same tokens first, and rebasing onto its pages would
+        share GPU pages across arenas. Keep this sequence's own storage as a
+        sequence-private committed copy referencing the existing tree block;
+        ``block.storage`` (the canonical entry) is left untouched. The
+        uncommitted page becomes invalid."""
+        assert not self.scheduled_for_eviction
+        assert self.status == PageStatus.DROPPABLE, "Release holder/lock first"
+        self.ready_event = ready_event
+        private = PrivateCommittedPage(
+            self.manager, block, self.life_cycle, self.cache_level, self, self.priority
+        )
+        assert not self.has_valid_slot and private.has_valid_slot
+        return private
+
     def __del__(self) -> None:
         def check_page(p: "BlockPage") -> bool:
             return p is None or isinstance(p.page, CommittedPage)

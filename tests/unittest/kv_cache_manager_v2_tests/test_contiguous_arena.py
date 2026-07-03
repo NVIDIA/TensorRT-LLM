@@ -1075,6 +1075,41 @@ class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
         manager.drain_gpu_reclaim()
         self.assertEqual(budget.used_pages, 0)
 
+    def test_intra_batch_commit_conflict_keeps_committing(self) -> None:
+        """§4.4 intra-batch commit conflict.
+
+        When another sequence committed the same tokens first (shared system
+        prompts under concurrency), the loser must keep its own pages as
+        private committed copies and continue committing -- not assert and
+        not stop (rebasing is disabled in arena mode).
+        """
+        manager = self.manager
+        budget = manager._storage.gpu_page_budget
+        tokens = [600 + i for i in range(2 * self.TPB)]
+        kv1 = manager.create_kv_cache(max_capacity=4 * self.TPB)
+        kv2 = manager.create_kv_cache(max_capacity=4 * self.TPB)
+        with TemporaryCudaStream([]) as s:
+            stream = CudaStream(s.handle)
+            self.assertTrue(kv1.resume(stream))
+            self.assertTrue(kv2.resume(stream))
+            self.assertTrue(kv1.resize(2 * self.TPB))
+            self.assertTrue(kv2.resize(2 * self.TPB))
+            kv1.commit(tokens)  # registers both blocks in the radix tree
+            kv2.commit(tokens)  # conflict: same tokens, must go private
+            self.assertEqual(kv2.num_committed_tokens, 2 * self.TPB)
+            self.assertEqual(int(kv2._num_committed_blocks), 2)
+            kv1.close()
+            kv2.close()
+        s.take_finish_event().synchronize()
+        self.assertEqual(manager.drain_gpu_reclaim(), 2)
+        self.assertEqual(budget.used_pages, 0)
+        # only the canonical copies were offloaded: no duplicates on host
+        self.assertEqual(self._host_used(), 2)
+        # and the canonical entries remain reusable
+        kv3 = manager.create_kv_cache(input_tokens=tokens, max_capacity=4 * self.TPB)
+        self.assertEqual(kv3.history_length, 2 * self.TPB)
+        kv3.close()
+
     def test_suspend_resume_roundtrip(self) -> None:
         """§4.5 suspend/resume round-trip.
 
