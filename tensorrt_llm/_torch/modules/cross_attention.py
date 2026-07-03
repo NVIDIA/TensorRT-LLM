@@ -84,14 +84,22 @@ class CrossAttention(nn.Module):
         pp_size = self.mapping.pp_size
         cp_size = self.mapping.cp_size
         dp_size = 1
+        # Unreachable for enc-dec models today (validate_encoder_decoder_tp_scope
+        # rejects attention DP); kept for parity with Attention.__init__.
         if self.mapping.enable_attention_dp:
             dp_size = tp_size
             tp_size = 1
 
         assert self.num_heads % tp_size == 0
+        if self.num_key_value_heads % tp_size != 0:
+            raise ValueError(
+                "Cross-attention requires the encoder KV head count "
+                f"({self.num_key_value_heads}) to be divisible by tp_size ({tp_size}); "
+                "KV head duplication is not supported for cross-attention."
+            )
 
         self.num_heads = self.num_heads // tp_size
-        self.num_key_value_heads = (self.num_key_value_heads + tp_size - 1) // tp_size
+        self.num_key_value_heads = self.num_key_value_heads // tp_size
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_key_value_heads * self.head_dim
 

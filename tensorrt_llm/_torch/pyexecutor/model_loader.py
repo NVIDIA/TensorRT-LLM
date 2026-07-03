@@ -129,12 +129,17 @@ def validate_encoder_decoder_tp_scope(model_config: ModelConfig) -> None:
     if mapping.enable_attention_dp:
         raise ValueError(
             "Encoder-decoder models do not support attention DP yet. "
-            "Set mapping.enable_attention_dp=False.")
+            "Set enable_attention_dp=False.")
 
     if mapping.cp_size > 1:
         raise ValueError(
             "Encoder-decoder models do not support context parallelism yet. "
-            "Set mapping.cp_size=1.")
+            "Set context_parallel_size=1.")
+
+    if mapping.pp_size > 1:
+        raise ValueError(
+            "Encoder-decoder models do not support pipeline parallelism yet. "
+            "Set pipeline_parallel_size=1.")
 
     if mapping.tp_size > 1 and model_config.attn_backend != "TRTLLM":
         raise ValueError(
