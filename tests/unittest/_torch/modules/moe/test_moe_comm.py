@@ -32,7 +32,7 @@ Combine verification:
   Uses simple_moe (weighted sum of hidden_states, no expert-specific
   computation).  Reference matches kernel behavior per comm type:
   - NVLinkOneSided lpc: fp8 quant/dequant simulation (moeA2ACombineKernel)
-  - NVLinkTwoSided lpc: float32 accum (NVFP4 too complex to simulate)
+  - NVLinkTwoSided lpc: NVFP4 quant/dequant simulation
   - DeepEPLL: weighted reduction with real topk_weights
   - Default: float32 accumulation matching kernel registers
   This isolates purely the combine communication error.
@@ -46,12 +46,13 @@ Singleton safety:
 Run with: mpirun -np 8 pytest test_moe_comm.py -x -v
 """
 
+import atexit
 import os
 import pickle
-import struct
 import sys
 import traceback
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Dict, List, Optional, Set, Tuple
 from unittest.mock import MagicMock
 
@@ -170,6 +171,25 @@ class DispatchOutputs:
     recv_scales: Optional[torch.Tensor]
 
 
+@dataclass
+class CommTestGroup:
+    """A group of configs sharing one MPI pool size and communication type."""
+
+    configs: List[CommTestConfig]
+
+    def __str__(self) -> str:
+        first = self.configs[0]
+        return f"{first.comm_type}_ep{first.ep_size}_n{len(self.configs)}"
+
+
+@dataclass
+class PendingWorkerResults:
+    """Worker futures for one config submitted to the MPI pool."""
+
+    config: CommTestConfig
+    futures: List
+
+
 # ============================================================================
 # MPI Serialization Helpers
 # ============================================================================
@@ -285,15 +305,25 @@ def encode_source_info(
     Works regardless of dtype because we operate on the raw byte view.
     """
     hs = hidden_states.clone()
-    flat_bytes = hs.view(torch.uint8).reshape(-1)
     row_bytes = hidden_states.shape[1] * hidden_states.element_size()
     num_tokens = hidden_states.shape[0]
 
-    for i in range(num_tokens):
-        offset = i * row_bytes + (row_bytes - 4)
-        packed = struct.pack(">HH", rank_id, i)
-        for j, b in enumerate(packed):
-            flat_bytes[offset + j] = b
+    if num_tokens == 0:
+        return hs
+    if not (0 <= rank_id <= 0xFFFF) or num_tokens > 0x10000:
+        raise ValueError(
+            f"Source encoding requires uint16 rank/token, got rank_id={rank_id}, "
+            f"num_tokens={num_tokens}"
+        )
+
+    row_bytes_view = hs.view(torch.uint8).reshape(num_tokens, row_bytes)
+    tail = row_bytes_view[:, -4:]
+    token_idx = torch.arange(num_tokens, device=hidden_states.device, dtype=torch.int32)
+
+    tail[:, 0] = rank_id >> 8
+    tail[:, 1] = rank_id & 0xFF
+    tail[:, 2] = (token_idx >> 8).to(torch.uint8)
+    tail[:, 3] = (token_idx & 0xFF).to(torch.uint8)
 
     return hs
 
@@ -302,21 +332,21 @@ def decode_source_info(
     hidden_states: torch.Tensor,
     dtype: torch.dtype,
     hidden_size: int,
-) -> List[Tuple[int, int]]:
+) -> torch.Tensor:
     """Decode (rank_id, token_idx) from the last 4 bytes of each row."""
     element_size = torch.tensor([], dtype=dtype).element_size()
     row_bytes = hidden_size * element_size
     flat_bytes = hidden_states.contiguous().view(torch.uint8).reshape(-1)
     num_rows = flat_bytes.numel() // row_bytes
-    results = []
 
-    for i in range(num_rows):
-        offset = i * row_bytes + (row_bytes - 4)
-        raw = bytes(flat_bytes[offset : offset + 4].cpu().tolist())
-        rank_id, token_idx = struct.unpack(">HH", raw)
-        results.append((rank_id, token_idx))
+    if num_rows == 0:
+        return torch.empty(0, 2, dtype=torch.int64)
 
-    return results
+    tail = flat_bytes.reshape(num_rows, row_bytes)[:, -4:].cpu().to(torch.int32)
+    rank_ids = (tail[:, 0] << 8) | tail[:, 1]
+    token_idxs = (tail[:, 2] << 8) | tail[:, 3]
+
+    return torch.stack((rank_ids, token_idxs), dim=1).to(torch.int64)
 
 
 # ============================================================================
@@ -370,14 +400,9 @@ def simple_moe(
     - AllGatherRS / NVLink / DeepEP: real scales (MoE applies them)
     - DeepEPLL: all-ones (combine applies real scales internally)
     """
-    output = torch.zeros_like(hidden_states, dtype=torch.float32)
-
-    for i in range(hidden_states.shape[0]):
-        for k in range(token_selected_slots.shape[1]):
-            eid = token_selected_slots[i, k].item()
-            if not (slot_start <= eid < slot_end):
-                continue
-            output[i] += hidden_states[i].float() * token_final_scales[i, k].float()
+    local_mask = (token_selected_slots >= slot_start) & (token_selected_slots < slot_end)
+    local_scale_sum = (token_final_scales.float() * local_mask.float()).sum(dim=1)
+    output = hidden_states.float() * local_scale_sum.unsqueeze(-1)
 
     return output.to(hidden_states.dtype)
 
@@ -475,11 +500,98 @@ def create_comm_object(
         raise ValueError(f"Unknown comm type: {comm_type}")
 
 
+_WORKER_COMM_KEY = None
+_WORKER_COMM = None
+
+
+def _comm_reuse_key(config: CommTestConfig) -> Tuple:
+    """Return the constructor-affecting key used for worker-side comm reuse."""
+    if config.comm_type == COMM_ALLGATHER_RS:
+        return (config.comm_type, config.ep_size)
+
+    if config.comm_type == COMM_DEEP_EP:
+        return (
+            config.comm_type,
+            config.ep_size,
+            config.num_experts,
+            config.hidden_size,
+            config.quant_mode,
+        )
+
+    if config.comm_type == COMM_DEEP_EP_LL:
+        return (
+            config.comm_type,
+            config.ep_size,
+            config.num_experts,
+            config.hidden_size,
+            config.quant_mode,
+            max(config.all_num_tokens),
+            config.use_low_precision_combine,
+        )
+
+    if config.comm_type == COMM_NVLINK_ONE_SIDED:
+        return (
+            config.comm_type,
+            config.ep_size,
+            config.num_experts,
+            config.top_k,
+            config.hidden_size,
+            max(config.all_num_tokens),
+            config.use_low_precision_combine,
+        )
+
+    if config.comm_type == COMM_NVLINK_TWO_SIDED:
+        return (
+            config.comm_type,
+            config.ep_size,
+            config.num_experts,
+            config.top_k,
+            config.use_low_precision_combine,
+        )
+
+    if config.comm_type == COMM_NVLINK_TWO_SIDED_FLASHINFER:
+        return (
+            config.comm_type,
+            config.ep_size,
+            config.num_experts,
+            config.top_k,
+        )
+
+    return (config.comm_type,)
+
+
+def _destroy_cached_worker_comm():
+    """Destroy the cached worker comm object, if present."""
+    global _WORKER_COMM_KEY, _WORKER_COMM
+    if _WORKER_COMM is not None and hasattr(_WORKER_COMM, "destroy"):
+        _WORKER_COMM.destroy()
+    _WORKER_COMM_KEY = None
+    _WORKER_COMM = None
+
+
+def _get_worker_comm(mapping: Mapping, config: CommTestConfig):
+    """Reuse the current worker comm object when the constructor key matches."""
+    global _WORKER_COMM_KEY, _WORKER_COMM
+    key = _comm_reuse_key(config)
+    if _WORKER_COMM is not None and _WORKER_COMM_KEY != key:
+        _destroy_cached_worker_comm()
+
+    if _WORKER_COMM is None:
+        _WORKER_COMM = create_comm_object(config.comm_type, mapping, config)
+        _WORKER_COMM_KEY = key
+
+    return _WORKER_COMM
+
+
+atexit.register(_destroy_cached_worker_comm)
+
+
 # ============================================================================
 # Platform / Feasibility Checks
 # ============================================================================
 
 
+@lru_cache(maxsize=None)
 def _check_mnnvl_support() -> Optional[str]:
     """Return skip reason if MNNVL is not supported, else None."""
     try:
@@ -491,6 +603,7 @@ def _check_mnnvl_support() -> Optional[str]:
     return None
 
 
+@lru_cache(maxsize=None)
 def _check_flashinfer_mnnvl_support() -> Optional[str]:
     """Return skip reason if FlashInfer MNNVL is not supported, else None."""
     try:
@@ -501,6 +614,7 @@ def _check_flashinfer_mnnvl_support() -> Optional[str]:
     return None
 
 
+@lru_cache(maxsize=None)
 def check_platform_support(comm_type: str) -> Optional[str]:
     """Return skip reason string if comm type is unsupported, else None."""
     if comm_type == COMM_ALLGATHER_RS:
@@ -813,9 +927,10 @@ def _build_worker_result(
     dispatch_outputs: DispatchOutputs,
     combined: torch.Tensor,
     moe_output: torch.Tensor,
-    recv_source_info: List[Tuple[int, int]],
+    recv_source_info: torch.Tensor,
     config: CommTestConfig,
     recv_hs_bf16: Optional[torch.Tensor] = None,
+    moe_output_for_ref: Optional[torch.Tensor] = None,
 ) -> dict:
     """Collect tensors needed by host-side verification."""
     result = {
@@ -831,9 +946,13 @@ def _build_worker_result(
             dispatch_outputs.recv_scales.cpu() if dispatch_outputs.recv_scales is not None else None
         ),
         "combined": combined.cpu(),
-        "moe_output": moe_output.cpu(),
         "recv_source_info": recv_source_info,
     }
+    if moe_output_for_ref is not None:
+        result["moe_output_for_ref"] = moe_output_for_ref.cpu()
+    else:
+        result["moe_output"] = moe_output.cpu()
+
     if recv_hs_bf16 is not None:
         result["recv_hs_bf16"] = recv_hs_bf16.cpu()
 
@@ -842,6 +961,23 @@ def _build_worker_result(
         result["w4afp8_roundtrip_ok"] = worker_inputs.w4afp8_roundtrip_ok
 
     return result
+
+
+def _prepare_moe_output_for_combine_reference(
+    moe_output: torch.Tensor,
+    config: CommTestConfig,
+) -> Optional[torch.Tensor]:
+    """Precompute low-precision combine reference payload on the worker GPU."""
+    if not config.use_low_precision_combine:
+        return None
+
+    if config.comm_type == COMM_NVLINK_ONE_SIDED:
+        return moe_output.to(torch.float8_e4m3fn).to(torch.bfloat16)
+
+    if config.comm_type == COMM_NVLINK_TWO_SIDED:
+        return _simulate_nvfp4_round_trip(moe_output)
+
+    return None
 
 
 def _worker_full_pipeline(config: CommTestConfig) -> dict:
@@ -859,7 +995,6 @@ def _worker_full_pipeline(config: CommTestConfig) -> dict:
     rank = tllm.mpi_rank()
     torch.cuda.set_device(rank)
 
-    comm = None
     try:
         mapping = Mapping(
             rank=rank,
@@ -868,7 +1003,7 @@ def _worker_full_pipeline(config: CommTestConfig) -> dict:
             world_size=config.ep_size,
         )
 
-        comm = create_comm_object(config.comm_type, mapping, config)
+        comm = _get_worker_comm(mapping, config)
 
         worker_inputs = _prepare_worker_inputs(rank, config)
         dispatch_outputs = _run_worker_dispatch(comm, worker_inputs, config)
@@ -915,6 +1050,7 @@ def _worker_full_pipeline(config: CommTestConfig) -> dict:
         # Save recv_hs_bf16 for DeepEPLL combine reference (weighted reduce
         # needs raw dispatched hidden_states, not accumulated moe_output).
         saved_recv_hs_bf16 = recv_hs_bf16.clone() if config.comm_type == COMM_DEEP_EP_LL else None
+        moe_output_for_ref = _prepare_moe_output_for_combine_reference(moe_output, config)
 
         return _build_worker_result(
             rank,
@@ -925,13 +1061,12 @@ def _worker_full_pipeline(config: CommTestConfig) -> dict:
             recv_source_info,
             config,
             recv_hs_bf16=saved_recv_hs_bf16,
+            moe_output_for_ref=moe_output_for_ref,
         )
     except Exception:
+        _destroy_cached_worker_comm()
         traceback.print_exc()
         raise
-    finally:
-        if comm is not None and hasattr(comm, "destroy"):
-            comm.destroy()
 
 
 def _make_rank_mask_config(
@@ -1211,7 +1346,7 @@ def _validate_dispatch_row_slots(
 
 def _record_received_token(
     recv_hs: torch.Tensor,
-    decoded: List[Tuple[int, int]],
+    decoded: torch.Tensor,
     token_idx: int,
     recv_rank: int,
     original_data: Dict[Tuple[int, int], torch.Tensor],
@@ -1219,7 +1354,7 @@ def _record_received_token(
     actually_received: Set[Tuple[int, int]],
 ) -> None:
     """Record one received token and optionally verify row content."""
-    src_rank, src_idx = decoded[token_idx]
+    src_rank, src_idx = decoded[token_idx].tolist()
     key = (src_rank, src_idx)
     actually_received.add(key)
     if key in original_data and not skip_content_check:
@@ -1273,10 +1408,7 @@ def verify_dispatch_alltoall(
     """
     num_experts = config.num_experts
 
-    # For fp8/w4afp8, data is transported as fp8 viewed as bf16 (half width).
-    # For nvfp4, data is packed uint8 (half width).
     qm = config.quant_mode
-    decode_dtype, decode_hidden = _get_dispatch_decode_spec(config)
 
     # Global lookup: (src_rank, token_idx) -> original hidden_states row.
     # For w4afp8, use original_fp8 (fp8 domain) for content comparison.
@@ -1296,7 +1428,7 @@ def verify_dispatch_alltoall(
         # Per-rank slot range — handles non-divisible EP.
         _, slot_start, slot_end = _compute_ep_partition(num_experts, config.ep_size, recv_rank)
 
-        decoded = decode_source_info(recv_hs, decode_dtype, decode_hidden)
+        decoded = result["recv_source_info"]
         actually_received: Set[Tuple[int, int]] = set()
 
         for i in range(recv_hs.shape[0]):
@@ -1391,9 +1523,13 @@ def _simulate_nvfp4_round_trip(tensor: torch.Tensor, group_size: int = 16) -> to
 
     # output_scale = SFScaleVal / float(sf8)
     # Kernel uses reciprocal_approximate_ftz (~1 ULP); we use exact division.
+    # If the per-group fp8 scale underflows to zero, that group dequantizes to
+    # zero. Avoid computing 0 * inf for zero elements in such groups.
+    valid_scale = (vec_max > 0) & (sf_narrow > 0)
+    safe_sf_narrow = torch.where(valid_scale, sf_narrow, torch.ones_like(sf_narrow))
     output_scale = torch.where(
-        vec_max > 0,
-        sf_scale_val / sf_narrow,
+        valid_scale,
+        sf_scale_val / safe_sf_narrow,
         torch.zeros_like(sf_narrow),
     )
 
@@ -1405,10 +1541,37 @@ def _simulate_nvfp4_round_trip(tensor: torch.Tensor, group_size: int = 16) -> to
     e2m1_quantized = e2m1_pos_vals[idx] * sign
 
     # Dequantize: result = e2m1_val * float(sf8) / SFScaleVal
-    dequant_scale = sf_narrow / sf_scale_val
+    dequant_scale = torch.where(
+        sf_narrow > 0,
+        sf_narrow / sf_scale_val,
+        torch.zeros_like(sf_narrow),
+    )
     result = e2m1_quantized * dequant_scale.unsqueeze(-1)
 
     return result.reshape(N, H).to(torch.bfloat16)
+
+
+def _valid_recv_row_mask(proc_result: dict, config: CommTestConfig) -> torch.Tensor:
+    """Return rows that correspond to real dispatched tokens, not padding."""
+    recv_slots = proc_result["recv_slots"]
+    if config.comm_type == COMM_ALLGATHER_RS:
+        return torch.ones(recv_slots.shape[0], dtype=torch.bool)
+
+    proc_rank = proc_result["rank"]
+    _, slot_start, slot_end = _compute_ep_partition(config.num_experts, config.ep_size, proc_rank)
+    return ((recv_slots >= slot_start) & (recv_slots < slot_end)).any(dim=1)
+
+
+def _target_source_mask(
+    proc_result: dict,
+    target_rank: int,
+    num_tokens: int,
+    config: CommTestConfig,
+) -> torch.Tensor:
+    """Return valid rows in proc_result that contribute to target_rank."""
+    source_info = proc_result["recv_source_info"]
+    valid_rows = _valid_recv_row_mask(proc_result, config)
+    return valid_rows & (source_info[:, 0] == target_rank) & (source_info[:, 1] < num_tokens)
 
 
 def _build_combine_reference(
@@ -1446,16 +1609,14 @@ def _build_combine_reference(
 
     if config.use_low_precision_combine and config.comm_type == COMM_NVLINK_ONE_SIDED:
         # Path 1a: NVLinkOneSided fp8 quantize/dequantize + float32 accumulation.
-        # moeA2APrepareCombineKernel does vectorized_quant bf16->fp8
-        # (per-element cast, no scale). moeA2ACombineKernel loads fp8,
-        # casts to float32, accumulates in float32, then casts to bf16.
+        # The fp8 round-trip is precomputed on the worker GPU to keep parent-side
+        # verification from repeating per-row quantization work on CPU tensors.
         for proc_result in all_results:
-            moe_out = proc_result["moe_output"]
+            moe_out = proc_result["moe_output_for_ref"]
             source_info = proc_result["recv_source_info"]
-            for i, (src_rank, token_idx) in enumerate(source_info):
-                if src_rank == target_rank and token_idx < num_tokens:
-                    fp8_val = moe_out[i].to(torch.float8_e4m3fn)
-                    ref[token_idx] += fp8_val.float()
+            target_mask = _target_source_mask(proc_result, target_rank, num_tokens, config)
+            if target_mask.any():
+                ref.index_add_(0, source_info[target_mask, 1], moe_out[target_mask].float())
 
     elif config.use_low_precision_combine and config.comm_type == COMM_NVLINK_TWO_SIDED:
         # Path 1b: NVLinkTwoSided NVFP4 simulation + float32 accumulation.
@@ -1463,14 +1624,14 @@ def _build_combine_reference(
         # scaling: per-row global fp32 scale + per-group-of-16 fp8 scale,
         # with E2M1 quantization. After NVLink transfer,
         # dequantize_nvfp4_sharedmem reverses the process. The top_k
-        # reduction is then done in bf16 by torch.sum in _mnnvl_utils.py.
+        # reduction is then done in bf16 by torch.sum in _mnnvl_utils.py. The
+        # NVFP4 round-trip is precomputed on the worker GPU.
         for proc_result in all_results:
-            moe_out = proc_result["moe_output"]
-            nvfp4_out = _simulate_nvfp4_round_trip(moe_out)
+            nvfp4_out = proc_result["moe_output_for_ref"]
             source_info = proc_result["recv_source_info"]
-            for i, (src_rank, token_idx) in enumerate(source_info):
-                if src_rank == target_rank and token_idx < num_tokens:
-                    ref[token_idx] += nvfp4_out[i].float()
+            target_mask = _target_source_mask(proc_result, target_rank, num_tokens, config)
+            if target_mask.any():
+                ref.index_add_(0, source_info[target_mask, 1], nvfp4_out[target_mask].float())
 
     elif config.comm_type == COMM_DEEP_EP_LL:
         # Path 2: DeepEPLL weighted reduction.
@@ -1490,13 +1651,16 @@ def _build_combine_reference(
                 config.num_experts, config.ep_size, proc_rank
             )
 
-            for i, (src_rank, token_idx) in enumerate(source_info):
-                if src_rank == target_rank and token_idx < num_tokens:
-                    for k in range(config.top_k):
-                        eid = recv_slots[i, k].item()
-                        if slot_start <= eid < slot_end:
-                            weight = target_original_scales[token_idx, k].float()
-                            ref[token_idx] += recv_hs_bf16[i].float() * weight
+            target_mask = _target_source_mask(proc_result, target_rank, num_tokens, config)
+            if target_mask.any():
+                target_source_info = source_info[target_mask]
+                local_slot_mask = (recv_slots[target_mask] >= slot_start) & (
+                    recv_slots[target_mask] < slot_end
+                )
+                weights = target_original_scales[target_source_info[:, 1]].float()
+                local_scale_sum = (weights * local_slot_mask.float()).sum(dim=1)
+                contributions = recv_hs_bf16[target_mask].float() * local_scale_sum.unsqueeze(-1)
+                ref.index_add_(0, target_source_info[:, 1], contributions)
 
     else:
         # Path 3: Default — float32 accumulation.
@@ -1505,9 +1669,9 @@ def _build_combine_reference(
         for proc_result in all_results:
             moe_out = proc_result["moe_output"]
             source_info = proc_result["recv_source_info"]
-            for i, (src_rank, token_idx) in enumerate(source_info):
-                if src_rank == target_rank and token_idx < num_tokens:
-                    ref[token_idx] += moe_out[i].float()
+            target_mask = _target_source_mask(proc_result, target_rank, num_tokens, config)
+            if target_mask.any():
+                ref.index_add_(0, source_info[target_mask, 1], moe_out[target_mask].float())
 
     return ref.to(torch.bfloat16)
 
@@ -1615,6 +1779,11 @@ def _supports_low_precision_combine(config: CommTestConfig) -> bool:
     return False
 
 
+def _is_static_feasible(config: CommTestConfig) -> bool:
+    """Return whether a generated config can run before platform checks."""
+    return check_feasibility(config.comm_type, config) is None
+
+
 def _make_workloads(ep_size: int) -> List[List[int]]:
     """Generate token distributions: uniform, non-uniform, minimal."""
     workloads = [[32] * ep_size]
@@ -1628,15 +1797,35 @@ def _make_workloads(ep_size: int) -> List[List[int]]:
     return workloads
 
 
-def _make_test_params():
-    """Generate full-pipeline test parameters.
+def _make_grouped_params(configs: List[CommTestConfig]) -> List:
+    """Group configs so each pytest item can pipeline same-comm workloads."""
+    grouped: Dict[Tuple[int, str], List[CommTestConfig]] = {}
+    for config in configs:
+        grouped.setdefault((config.ep_size, config.comm_type), []).append(config)
 
-    Each entry is (ep_size, config).  ep_size is passed to mpi_pool_executor
-    via indirect parametrization; config is passed directly to the test.
+    # Sort each group by the worker-side comm reuse key so configs sharing a
+    # constructor key run back-to-back and actually hit the single-slot cache
+    # (e.g. postquant NVLinkOneSided variants differing only in quant_mode).
+    return [
+        pytest.param(
+            ep_size,
+            CommTestGroup(sorted(group_configs, key=_comm_reuse_key)),
+            id=str(CommTestGroup(group_configs)),
+        )
+        for (ep_size, _), group_configs in grouped.items()
+    ]
+
+
+def _make_test_params():
+    """Generate grouped full-pipeline test parameters.
+
+    Each entry is (ep_size, group). ep_size is passed to mpi_pool_executor
+    via indirect parametrization; group is passed directly to the test.
     """
-    params = []
-    for comm_type in ALL_COMM_TYPES:
-        for ep_size in [2, 4]:
+    configs = []
+    # Keep equal-sized MPI pools adjacent to reduce MPIPoolExecutor churn.
+    for ep_size in [2, 4]:
+        for comm_type in ALL_COMM_TYPES:
             for top_k in [2, 4, 8]:
                 for workload in _make_workloads(ep_size):
                     for use_low_precision_combine in [False, True]:
@@ -1649,94 +1838,99 @@ def _make_test_params():
                             all_num_tokens=workload,
                             use_low_precision_combine=use_low_precision_combine,
                         )
-                        if use_low_precision_combine and not _supports_low_precision_combine(
-                            config
-                        ):
+                        if not _is_static_feasible(config):
                             continue
-                        params.append(pytest.param(ep_size, config, id=str(config)))
-    return params
+                        configs.append(config)
+    return _make_grouped_params(configs)
 
 
 def _make_boundary_test_params():
     """Generate boundary / edge-case test parameters."""
-    params = []
-    for comm_type in ALL_COMM_TYPES:
-        boundary_cases = [
-            (
-                2,
-                CommTestConfig(
-                    comm_type=comm_type,
-                    ep_size=2,
-                    num_experts=FIXED_NUM_EXPERTS,
-                    top_k=1,
-                    hidden_size=DEFAULT_HIDDEN_SIZE,
-                    all_num_tokens=[8, 8],
-                ),
-                f"{comm_type}_topk1",
-            ),
-            (
-                2,
-                CommTestConfig(
-                    comm_type=comm_type,
-                    ep_size=2,
-                    num_experts=FIXED_NUM_EXPERTS,
-                    top_k=2,
-                    hidden_size=2048,
-                    all_num_tokens=[16, 16],
-                ),
-                f"{comm_type}_h2048",
-            ),
-            (
-                4,
-                CommTestConfig(
-                    comm_type=comm_type,
-                    ep_size=4,
-                    num_experts=FIXED_NUM_EXPERTS,
-                    top_k=2,
-                    hidden_size=DEFAULT_HIDDEN_SIZE,
-                    all_num_tokens=[1, 1, 1, 1],
-                ),
-                f"{comm_type}_single_token",
-            ),
-        ]
-
-        # Zero tokens on some ranks (DeepEPLL kernel does not support this).
-        if comm_type != COMM_DEEP_EP_LL:
-            boundary_cases.append(
-                (
-                    4,
-                    CommTestConfig(
-                        comm_type=comm_type,
-                        ep_size=4,
-                        num_experts=FIXED_NUM_EXPERTS,
-                        top_k=2,
-                        hidden_size=DEFAULT_HIDDEN_SIZE,
-                        all_num_tokens=[32, 0, 16, 0],
-                    ),
-                    f"{comm_type}_zero_tokens",
+    configs = []
+    for target_ep_size in [2, 4]:
+        for comm_type in ALL_COMM_TYPES:
+            aligned_top_k = 8 if comm_type == COMM_NVLINK_TWO_SIDED_FLASHINFER else 2
+            boundary_cases = []
+            if comm_type != COMM_NVLINK_TWO_SIDED_FLASHINFER:
+                boundary_cases.append(
+                    (
+                        2,
+                        CommTestConfig(
+                            comm_type=comm_type,
+                            ep_size=2,
+                            num_experts=FIXED_NUM_EXPERTS,
+                            top_k=1,
+                            hidden_size=DEFAULT_HIDDEN_SIZE,
+                            all_num_tokens=[8, 8],
+                        ),
+                        f"{comm_type}_topk1",
+                    )
                 )
+            boundary_cases.extend(
+                [
+                    (
+                        2,
+                        CommTestConfig(
+                            comm_type=comm_type,
+                            ep_size=2,
+                            num_experts=FIXED_NUM_EXPERTS,
+                            top_k=aligned_top_k,
+                            hidden_size=2048,
+                            all_num_tokens=[16, 16],
+                        ),
+                        f"{comm_type}_h2048",
+                    ),
+                    (
+                        4,
+                        CommTestConfig(
+                            comm_type=comm_type,
+                            ep_size=4,
+                            num_experts=FIXED_NUM_EXPERTS,
+                            top_k=aligned_top_k,
+                            hidden_size=DEFAULT_HIDDEN_SIZE,
+                            all_num_tokens=[1, 1, 1, 1],
+                        ),
+                        f"{comm_type}_single_token",
+                    ),
+                ]
             )
 
-        for ep_size, base_config, case_id in boundary_cases:
-            for use_low_precision_combine in [False, True]:
-                config = CommTestConfig(
-                    comm_type=base_config.comm_type,
-                    ep_size=base_config.ep_size,
-                    num_experts=base_config.num_experts,
-                    top_k=base_config.top_k,
-                    hidden_size=base_config.hidden_size,
-                    all_num_tokens=base_config.all_num_tokens,
-                    quant_mode=base_config.quant_mode,
-                    use_low_precision_combine=use_low_precision_combine,
+            # Zero tokens on some ranks (DeepEPLL kernel does not support this).
+            if comm_type != COMM_DEEP_EP_LL:
+                boundary_cases.append(
+                    (
+                        4,
+                        CommTestConfig(
+                            comm_type=comm_type,
+                            ep_size=4,
+                            num_experts=FIXED_NUM_EXPERTS,
+                            top_k=aligned_top_k,
+                            hidden_size=DEFAULT_HIDDEN_SIZE,
+                            all_num_tokens=[32, 0, 16, 0],
+                        ),
+                        f"{comm_type}_zero_tokens",
+                    )
                 )
-                if use_low_precision_combine and not _supports_low_precision_combine(config):
-                    continue
-                param_id = case_id
-                if use_low_precision_combine:
-                    param_id += "_lpcombine"
-                params.append(pytest.param(ep_size, config, id=param_id))
 
-    return params
+            for ep_size, base_config, case_id in boundary_cases:
+                if ep_size != target_ep_size:
+                    continue
+                for use_low_precision_combine in [False, True]:
+                    config = CommTestConfig(
+                        comm_type=base_config.comm_type,
+                        ep_size=base_config.ep_size,
+                        num_experts=base_config.num_experts,
+                        top_k=base_config.top_k,
+                        hidden_size=base_config.hidden_size,
+                        all_num_tokens=base_config.all_num_tokens,
+                        quant_mode=base_config.quant_mode,
+                        use_low_precision_combine=use_low_precision_combine,
+                    )
+                    if not _is_static_feasible(config):
+                        continue
+                    configs.append(config)
+
+    return _make_grouped_params(configs)
 
 
 def _make_non_divisible_ep_test_params():
@@ -1751,7 +1945,7 @@ def _make_non_divisible_ep_test_params():
     Limited to NVLinkOneSided because other comm backends still require
     num_experts divisible by ep_size (enforced by check_feasibility).
     """
-    params = []
+    configs = []
     # (ep_size, num_experts, top_k, all_num_tokens) — picked to cover both
     # uneven ratios (5 / 2 = 2 + 1) and a larger remainder (17 / 4).
     cases = [
@@ -1770,8 +1964,10 @@ def _make_non_divisible_ep_test_params():
                 all_num_tokens=all_num_tokens,
                 use_low_precision_combine=use_low_precision_combine,
             )
-            params.append(pytest.param(ep_size, config, id=str(config)))
-    return params
+            if not _is_static_feasible(config):
+                continue
+            configs.append(config)
+    return _make_grouped_params(configs)
 
 
 def _make_postquant_test_params():
@@ -1781,24 +1977,25 @@ def _make_postquant_test_params():
     the matrix manageable while covering all valid (comm_type, quant_mode)
     combinations.
     """
-    params = []
+    configs = []
     for quant_mode, comm_types in POSTQUANT_COMM_MAP.items():
         for comm_type in comm_types:
+            top_k = 8 if comm_type == COMM_NVLINK_TWO_SIDED_FLASHINFER else 2
             for use_low_precision_combine in [False, True]:
                 config = CommTestConfig(
                     comm_type=comm_type,
                     ep_size=2,
                     num_experts=FIXED_NUM_EXPERTS,
-                    top_k=2,
+                    top_k=top_k,
                     hidden_size=DEFAULT_HIDDEN_SIZE,
                     all_num_tokens=[16, 16],
                     quant_mode=quant_mode,
                     use_low_precision_combine=use_low_precision_combine,
                 )
-                if use_low_precision_combine and not _supports_low_precision_combine(config):
+                if not _is_static_feasible(config):
                     continue
-                params.append(pytest.param(2, config, id=str(config)))
-    return params
+                configs.append(config)
+    return _make_grouped_params(configs)
 
 
 # ============================================================================
@@ -1812,48 +2009,119 @@ def setup_test():
     tllm.logger.set_level("error")
 
 
-def _run_full_test(mpi_pool_executor, config: CommTestConfig):
-    """Run dispatch -> verify dispatch -> simple_moe -> combine -> verify combine."""
+def _get_skip_reason(config: CommTestConfig) -> Optional[str]:
+    """Return skip reason for a config, or None if it should run."""
     skip_reason = check_platform_support(config.comm_type)
     if skip_reason:
-        pytest.skip(skip_reason)
+        return skip_reason
 
     skip_reason = check_feasibility(config.comm_type, config)
     if skip_reason:
-        pytest.skip(skip_reason)
+        return skip_reason
 
     if config.ep_size > torch.cuda.device_count():
-        pytest.skip(f"Need {config.ep_size} GPUs but only {torch.cuda.device_count()} available")
+        return f"Need {config.ep_size} GPUs but only {torch.cuda.device_count()} available"
 
-    results = mpi_pool_executor.map(
-        _worker_full_pipeline,
-        *zip(*[(config,)] * config.ep_size),
-    )
-    all_results = list(results)
+    return None
 
-    verify_dispatch_results(all_results, config)
 
-    # Reference matches kernel behavior per comm type:
-    # - NVLinkOneSided lpc: fp8 simulation (matches moeA2ACombineKernel)
-    # - NVLinkTwoSided lpc: NVFP4 simulation (matches fusedMoeCommKernels.cu)
-    # - DeepEPLL: weighted reduce with real topk_weights
-    # - Default: float32 accumulation (matches kernel registers)
-    if config.use_low_precision_combine:
-        if config.comm_type == COMM_NVLINK_ONE_SIDED:
-            # FP8 simulation closely matches kernel — tight tolerance
-            verify_combine_results(all_results, config, rtol=0.02, atol=0.15)
+def _submit_worker_pipeline(mpi_pool_executor, config: CommTestConfig) -> PendingWorkerResults:
+    """Submit one config to all MPI workers without waiting for verification."""
+    futures = [
+        mpi_pool_executor.submit(_worker_full_pipeline, config) for _ in range(config.ep_size)
+    ]
+    return PendingWorkerResults(config=config, futures=futures)
+
+
+def _collect_worker_results(pending: PendingWorkerResults) -> List[dict]:
+    """Collect worker results in rank order for host-side verification."""
+    return sorted((future.result() for future in pending.futures), key=lambda r: r["rank"])
+
+
+def _drain_pending_results(pending: PendingWorkerResults):
+    """Wait for already-submitted work before propagating a verification error."""
+    for future in pending.futures:
+        try:
+            future.result()
+        except Exception:
+            pass
+
+
+def _verify_full_test_results(all_results: List[dict], config: CommTestConfig):
+    """Run host-side dispatch and combine verification for one config."""
+    try:
+        verify_dispatch_results(all_results, config)
+
+        # Reference matches kernel behavior per comm type:
+        # - NVLinkOneSided lpc: fp8 simulation (matches moeA2ACombineKernel)
+        # - NVLinkTwoSided lpc: NVFP4 simulation (matches fusedMoeCommKernels.cu)
+        # - DeepEPLL: weighted reduce with real topk_weights
+        # - Default: float32 accumulation (matches kernel registers)
+        if config.use_low_precision_combine:
+            if config.comm_type == COMM_NVLINK_ONE_SIDED:
+                # FP8 simulation closely matches kernel — tight tolerance
+                verify_combine_results(all_results, config, rtol=0.02, atol=0.15)
+            elif config.comm_type == COMM_NVLINK_TWO_SIDED:
+                # NVFP4 simulation matches kernel's two-level scaling.
+                # Residual error from rcp.approx.ftz.f32 vs exact division
+                # causes ~0.35/element boundary effects at E2M1 midpoints
+                # (fp8 scale rounding difference pushes elements across
+                # quantization boundaries). Scales linearly with top_k.
+                nvfp4_atol = 0.4 * config.top_k
+                verify_combine_results(all_results, config, rtol=0.1, atol=nvfp4_atol)
+            else:
+                # DeepEPLL low-precision combine transfers in fp8 while the
+                # reference reduction stays unquantized, so it needs a bound
+                # looser than the non-lpc DeepEPLL branch below. Keep the
+                # previous (conservative) top_k-scaled tolerance.
+                verify_combine_results(all_results, config, rtol=0.1, atol=0.4 * config.top_k)
+        elif config.comm_type == COMM_DEEP_EP_LL:
+            verify_combine_results(all_results, config, rtol=0.05, atol=0.3)
         else:
-            # NVFP4 simulation matches kernel's two-level scaling.
-            # Residual error from rcp.approx.ftz.f32 vs exact division
-            # causes ~0.35/element boundary effects at E2M1 midpoints
-            # (fp8 scale rounding difference pushes elements across
-            # quantization boundaries). Scales linearly with top_k.
-            nvfp4_atol = 0.4 * config.top_k
-            verify_combine_results(all_results, config, rtol=0.1, atol=nvfp4_atol)
-    elif config.comm_type == COMM_DEEP_EP_LL:
-        verify_combine_results(all_results, config, rtol=0.05, atol=0.3)
-    else:
-        verify_combine_results(all_results, config, rtol=0.02, atol=0.15)
+            verify_combine_results(all_results, config, rtol=0.02, atol=0.15)
+    except Exception as e:
+        raise AssertionError(f"{config}: {e}") from e
+
+
+def _run_full_test(mpi_pool_executor, config: CommTestConfig):
+    """Run dispatch -> verify dispatch -> simple_moe -> combine -> verify combine."""
+    skip_reason = _get_skip_reason(config)
+    if skip_reason:
+        pytest.skip(skip_reason)
+
+    pending = _submit_worker_pipeline(mpi_pool_executor, config)
+    all_results = _collect_worker_results(pending)
+    _verify_full_test_results(all_results, config)
+
+
+def _run_full_test_group(mpi_pool_executor, group: CommTestGroup):
+    """Run a same-comm group, overlapping parent verification with next dispatch."""
+    runnable_configs = []
+    skip_reasons = []
+    for config in group.configs:
+        skip_reason = _get_skip_reason(config)
+        if skip_reason:
+            skip_reasons.append(f"{config}: {skip_reason}")
+        else:
+            runnable_configs.append(config)
+
+    if not runnable_configs:
+        pytest.skip("; ".join(skip_reasons[:3]))
+
+    pending = _submit_worker_pipeline(mpi_pool_executor, runnable_configs[0])
+
+    for next_config in runnable_configs[1:]:
+        current_pending = pending
+        all_results = _collect_worker_results(current_pending)
+        pending = _submit_worker_pipeline(mpi_pool_executor, next_config)
+        try:
+            _verify_full_test_results(all_results, current_pending.config)
+        except Exception:
+            _drain_pending_results(pending)
+            raise
+
+    all_results = _collect_worker_results(pending)
+    _verify_full_test_results(all_results, pending.config)
 
 
 def _skip_if_rank_mask_config_unsupported(config: CommTestConfig) -> None:
@@ -1967,43 +2235,43 @@ class TestMoEComm:
 
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize(
-        "mpi_pool_executor,config",
+        "mpi_pool_executor,group",
         _make_test_params(),
         indirect=["mpi_pool_executor"],
     )
-    def test_moe_comm(self, mpi_pool_executor, config: CommTestConfig):
+    def test_moe_comm(self, mpi_pool_executor, group: CommTestGroup):
         """Verify full dispatch -> compute -> combine pipeline."""
-        _run_full_test(mpi_pool_executor, config)
+        _run_full_test_group(mpi_pool_executor, group)
 
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize(
-        "mpi_pool_executor,config",
+        "mpi_pool_executor,group",
         _make_boundary_test_params(),
         indirect=["mpi_pool_executor"],
     )
-    def test_moe_comm_boundary(self, mpi_pool_executor, config: CommTestConfig):
+    def test_moe_comm_boundary(self, mpi_pool_executor, group: CommTestGroup):
         """Test full pipeline with boundary / edge-case parameters."""
-        _run_full_test(mpi_pool_executor, config)
+        _run_full_test_group(mpi_pool_executor, group)
 
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize(
-        "mpi_pool_executor,config",
+        "mpi_pool_executor,group",
         _make_postquant_test_params(),
         indirect=["mpi_pool_executor"],
     )
-    def test_moe_comm_postquant(self, mpi_pool_executor, config: CommTestConfig):
+    def test_moe_comm_postquant(self, mpi_pool_executor, group: CommTestGroup):
         """Verify post-quant dispatch -> dequant -> MoE -> combine pipeline."""
-        _run_full_test(mpi_pool_executor, config)
+        _run_full_test_group(mpi_pool_executor, group)
 
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize(
-        "mpi_pool_executor,config",
+        "mpi_pool_executor,group",
         _make_non_divisible_ep_test_params(),
         indirect=["mpi_pool_executor"],
     )
-    def test_moe_comm_non_divisible_ep(self, mpi_pool_executor, config: CommTestConfig):
+    def test_moe_comm_non_divisible_ep(self, mpi_pool_executor, group: CommTestGroup):
         """Verify NVLinkOneSided with non-divisible EP (num_experts % ep_size != 0)."""
-        _run_full_test(mpi_pool_executor, config)
+        _run_full_test_group(mpi_pool_executor, group)
 
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize(
