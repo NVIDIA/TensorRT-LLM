@@ -863,8 +863,9 @@ class FilteredTopKKernelVarlen:
         _step_vec = self.num_threads_per_cta * self.vec_size
         # Byte address of the aligned portion start for this row (score[vec_start]).
         _aligned_base = (score.iterator + vec_start).toint()
+        # TODO: add invariant=True for .CONSTANT cache hint once validated
         _copy_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyG2ROp(invariant=True),
+            cute.nvgpu.CopyG2ROp(),
             self.dtype,
             num_bits_per_copy=self.num_copy_bits,
         )
