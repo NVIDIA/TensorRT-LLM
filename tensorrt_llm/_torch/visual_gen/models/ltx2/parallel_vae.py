@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import torch.distributed as dist
 
+from tensorrt_llm.logger import logger
+
 from .ltx2_core.types import VideoLatentShape
 
 if TYPE_CHECKING:
@@ -35,6 +37,9 @@ def _tile_in_volume(tile) -> int:
     return (c[2].stop - c[2].start) * (c[3].stop - c[3].start) * (c[4].stop - c[4].start)
 
 
+_ZERO_TILE_WARNED = False
+
+
 def assign_tiles_lpt(tiles: list, world: int, rank: int) -> list:
     """LPT (longest-processing-time) greedy assignment by input volume.
 
@@ -44,13 +49,28 @@ def assign_tiles_lpt(tiles: list, world: int, rank: int) -> list:
     (no tile decoded twice or skipped). Balances by work (volume), not tile
     count, since boundary tiles are smaller than interior ones.
     """
+    global _ZERO_TILE_WARNED
     load = [0] * world
+    count = [0] * world
     mine = []
     for t in sorted(tiles, key=lambda t: -_tile_in_volume(t)):
         r = min(range(world), key=lambda i: load[i])
         load[r] += _tile_in_volume(t)
+        count[r] += 1
         if r == rank:
             mine.append(t)
+    if rank == 0:
+        if world > len(tiles) and not _ZERO_TILE_WARNED:
+            idle = sum(1 for c in count if c == 0)
+            logger.warning(
+                f"tile_parallel_decode: {idle} of {world} vae_ranks got 0 tiles "
+                f"({len(tiles)} tiles < {world} ranks); consider parallel_vae_size <= {len(tiles)}."
+            )
+            _ZERO_TILE_WARNED = True
+        logger.debug(
+            f"tile_parallel_decode load: tiles/rank={count}, volume/rank={load}, "
+            f"imbalance(max/min)={max(load) / max(min(load), 1):.2f}"
+        )
     return mine
 
 
