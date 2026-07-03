@@ -115,9 +115,9 @@ from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
 # msgspec msgpack is an opt-in transport for the disagg orchestrator->worker
 # request body: the large agentic chat body otherwise blocks the serving event
 # loop on stdlib json.loads. Enable with TRTLLM_SERVE_ENABLE_MSGSPEC=1 (must be
-# set on both orchestrator and worker). The worker decodes application/msgpack
-# bodies with msgspec and falls back to stdlib json for everything else, so the
-# JSON path is byte-for-byte unchanged when the flag is off.
+# set on both orchestrator and worker). The worker decodes bodies flagged with
+# the X-TRTLLM-Msgpack header via msgspec and falls back to stdlib json for
+# everything else, so the JSON path is byte-for-byte unchanged when the flag is off.
 _MSGSPEC_ENABLED = os.getenv("TRTLLM_SERVE_ENABLE_MSGSPEC", "0") == "1"
 if _MSGSPEC_ENABLED:
     try:
@@ -129,15 +129,19 @@ if _MSGSPEC_ENABLED:
     _msgpack_decoder = msgspec.msgpack.Decoder()
 
     class _MsgspecRequest(Request):
-        """Request that decodes application/msgpack bodies with msgspec."""
+        """Request that decodes msgpack bodies (X-TRTLLM-Msgpack: 1) with msgspec.
+
+        The orchestrator sends Content-Type application/json (so FastAPI still
+        routes the body through Request.json()) with the X-TRTLLM-Msgpack header
+        flagging a msgspec-msgpack payload; everything else is stdlib json.
+        """
 
         async def json(self):
             if not hasattr(self, "_json_body"):
                 body = await self.body()
                 if not body:
                     self._json_body = {}
-                elif self.headers.get("content-type",
-                                      "").startswith("application/msgpack"):
+                elif self.headers.get("x-trtllm-msgpack") == "1":
                     self._json_body = _msgpack_decoder.decode(body)
                 else:
                     self._json_body = json.loads(body)
