@@ -76,6 +76,7 @@ from ._utils import (
     get_uniform_attribute,
     intersect,
     make_typed,
+    merge_events,
     partition,
     remove_if,
     round_up,
@@ -550,12 +551,20 @@ class StorageManager:
         for p in pages:
             self.schedule_for_eviction(p)
 
-    def write_through_pages(self, pg_idx: PoolGroupIndex, pages: Sequence[Page]) -> list[Slot]:
+    def write_through_pages(
+        self,
+        pg_idx: PoolGroupIndex,
+        pages: Sequence[Page],
+        prior_event: CachedCudaEvent = CachedCudaEvent.NULL,
+    ) -> list[Slot]:
         """Write-through on commit (§4.3): copy committed (immutable) GPU
         pages to fresh host slots without touching the sources. Returns the
         host slots; each slot's ready event completes when its copy does. The
-        caller owns associating the slots with the pages and validating them
-        on event completion."""
+        caller owns associating the slots with the pages (see
+        :meth:`adopt_stale_copies`). ``prior_event`` orders the copies after
+        outstanding work on the owning sequence's stream -- required when the
+        sources are still locked, since their own ready events do not cover
+        in-flight writes from earlier steps."""
         assert self.is_arena_mode
         assert self.num_cache_levels > 1, "write-through requires a host tier"
         if not pages:
@@ -564,9 +573,43 @@ class StorageManager:
         requirements = filled_list(0, self.num_pool_groups)
         requirements[pg_idx] = len(pages)
         self.prepare_free_slots(host_lvl, requirements)
-        dst_slots = self._batched_migrate(pg_idx, host_lvl, GPU_LEVEL, pages, update_src=False)
+        dst_slots = self._batched_migrate(
+            pg_idx,
+            host_lvl,
+            GPU_LEVEL,
+            pages,
+            update_src=False,
+            extra_prior_event=prior_event,
+        )
         assert dst_slots is not None
         return list(dst_slots)
+
+    def adopt_stale_copies(
+        self, pg_idx: PoolGroupIndex, pages: Sequence[Page], host_slots: Sequence[Slot]
+    ) -> None:
+        """Copy-free free path for written-through blocks (§4.3): each page
+        releases its arena slot and takes ownership of its pre-copied host
+        slot. The arena slot's reclaim gate includes the write-through copy's
+        finish event (the copy reads the slot) in addition to the page's own
+        last consumers; the page's ready event becomes the copy's finish
+        event, so future consumers of the host copy wait for its validity."""
+        assert self.is_arena_mode
+        if not pages:
+            return
+        host_lvl = CacheLevel(GPU_LEVEL + 1)
+        gpu_pool = self._pool_group(GPU_LEVEL, pg_idx)
+        emitted: set[tuple[bytes, LifeCycleId]] = set()
+        for page, host_slot in zip(pages, host_slots, strict=True):
+            assert page.cache_level == GPU_LEVEL
+            if page.scheduled_for_eviction:
+                self.exclude_from_eviction(page)
+            released = page.move_to_new_slot()
+            released.ready_event = merge_events([released.ready_event, host_slot.ready_event])
+            gpu_pool.release(released)
+            page.set_slot(host_slot)
+            page.cache_level = host_lvl
+            self._emit_cache_level_updated_event(page, GPU_LEVEL, host_lvl, emitted)
+            self.schedule_for_eviction(page)
 
     # ------------------------------------------------------------------------
 
@@ -767,6 +810,7 @@ class StorageManager:
         migration_recorder: MigrationRecorder | None = None,
         defrag: bool = False,  # we are doing defragmentation
         dst_slots: list[Slot] | None = None,
+        extra_prior_event: CachedCudaEvent | None = None,
     ) -> Sequence[Slot] | None:
         """Free slots must be prepared before calling this function.
 
@@ -796,6 +840,8 @@ class StorageManager:
         try:
             assert len(dst_slots) == num_slots
             prior_events: set[CachedCudaEvent] = set()
+            if extra_prior_event is not None and extra_prior_event is not CachedCudaEvent.NULL:
+                prior_events.add(extra_prior_event)
             tasks_per_pool: TypedIndexList[PoolIndex, list[CopyTask]] = make_typed(
                 lambda _: list[CopyTask](), num_pools
             )

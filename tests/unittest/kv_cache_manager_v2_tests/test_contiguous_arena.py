@@ -1121,5 +1121,93 @@ class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
         self.assertEqual(self._host_used(), 2)
 
 
+@requires_cuda
+class TestArenaWriteThroughOnCommit(TestArenaKVCacheManagerEndToEnd):
+    """The §4.3 ON_COMMIT write-through policy.
+
+    Every end-to-end scenario must behave identically (inherited tests);
+    additionally, copies happen at commit time and the free path adopts them
+    instead of copying.
+    """
+
+    def setUp(self) -> None:
+        init_cuda_once()
+        cfg = _make_manager_config(gpu_quota=32 * MiB, host_quota=32 * MiB)
+        cfg.contiguous_arena = ContiguousArenaConfig(
+            map_ahead_pages=0, write_through=WriteThroughPolicy.ON_COMMIT
+        )
+        self.manager = KVCacheManager(cfg)
+
+    def test_copies_at_commit_and_adopts_on_close(self) -> None:
+        manager = self.manager
+        tokens = [700 + i for i in range(2 * self.TPB)]
+        kv = manager.create_kv_cache(max_capacity=4 * self.TPB)
+        with TemporaryCudaStream([]) as s:
+            stream = CudaStream(s.handle)
+            self.assertTrue(kv.resume(stream))
+            self.assertTrue(kv.resize(2 * self.TPB))
+            for j, idx in enumerate(kv.get_base_page_indices(LifeCycleId(0))):
+                self._block_floats(idx).fill_(7.0 + j)
+            torch.cuda.synchronize()
+            self.assertEqual(self._host_used(), 0)
+            kv.commit(tokens)
+            # write-through happened at commit: host copies exist while the
+            # blocks are still live on the GPU
+            self.assertEqual(self._host_used(), 2)
+            wt_ids = sorted(slot.slot_id for slot in kv._write_through_slots.values())
+            self.assertEqual(len(wt_ids), 2)
+            kv.close()
+        s.take_finish_event().synchronize()
+        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        # the free path adopted the write-through copies: no new host slots
+        self.assertEqual(self._host_used(), 2)
+        # the canonical pages now live in exactly those pre-copied slots
+        kv2 = manager.create_kv_cache(input_tokens=tokens, max_capacity=4 * self.TPB)
+        self.assertEqual(kv2.history_length, 2 * self.TPB)
+        host_ids = sorted(kv2._blocks[o].pages[0][LifeCycleId(0)].page.slot_id for o in range(2))
+        self.assertEqual(host_ids, wt_ids)
+        # and the data survived: onboard and verify
+        with TemporaryCudaStream([]) as s2:
+            stream2 = CudaStream(s2.handle)
+            self.assertTrue(kv2.resume(stream2))
+            torch.cuda.synchronize()
+            for j, idx in enumerate(kv2.get_base_page_indices(LifeCycleId(0))):
+                data = self._block_floats(idx)
+                self.assertTrue(bool((data == 7.0 + j).all().item()))
+            kv2.close()
+        s2.take_finish_event().synchronize()
+        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        self.assertEqual(self._host_used(), 2)
+
+    def test_suspend_adopts_write_through_copies(self) -> None:
+        manager = self.manager
+        kv = manager.create_kv_cache(max_capacity=4 * self.TPB)
+        with TemporaryCudaStream([]) as s:
+            stream = CudaStream(s.handle)
+            self.assertTrue(kv.resume(stream))
+            self.assertTrue(kv.resize(3 * self.TPB))
+            for j, idx in enumerate(kv.get_base_page_indices(LifeCycleId(0))):
+                self._block_floats(idx).fill_(9.0 + j)
+            torch.cuda.synchronize()
+            kv.commit([800 + i for i in range(2 * self.TPB)])
+            self.assertEqual(self._host_used(), 2)  # written through at commit
+            kv.suspend()
+        s.take_finish_event().synchronize()
+        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        # committed blocks adopted (still 2) + the uncommitted block moved (1)
+        self.assertEqual(self._host_used(), 3)
+        with TemporaryCudaStream([]) as s2:
+            stream2 = CudaStream(s2.handle)
+            self.assertTrue(kv.resume(stream2))
+            torch.cuda.synchronize()
+            for j, idx in enumerate(kv.get_base_page_indices(LifeCycleId(0))):
+                data = self._block_floats(idx)
+                self.assertTrue(bool((data == 9.0 + j).all().item()))
+            kv.close()
+        s2.take_finish_event().synchronize()
+        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        self.assertEqual(self._host_used(), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

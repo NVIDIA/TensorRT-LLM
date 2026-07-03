@@ -40,6 +40,7 @@ from .._common import (
     Priority,
     TokenIdExt,
 )
+from .._config import WriteThroughPolicy
 from .._copy_engine import CopyTask, batched_copy
 from .._exceptions import LogicError, OutOfPagesError
 from .._life_cycle_registry import (
@@ -200,6 +201,7 @@ class _KVCache:
         "_pending_stats",
         "_max_capacity",
         "_arena_ranges",
+        "_write_through_slots",
         "__rawref__",
     )
 
@@ -254,6 +256,10 @@ class _KVCache:
     # ranges are held.
     _max_capacity: int | None
     _arena_ranges: TypedIndexList[PoolGroupIndex, SequenceRange] | None
+    # Write-through host copies (§4.3, WriteThroughPolicy.ON_COMMIT), keyed by
+    # (ordinal, life cycle). A slot's ready event completes when its copy is
+    # valid; close()/suspend() adopt these instead of copying.
+    _write_through_slots: dict[tuple[int, int], Slot]
 
     def __init__(
         self,
@@ -300,6 +306,7 @@ class _KVCache:
         self._pending_stats = _PendingStats()
         self._max_capacity = max_capacity
         self._arena_ranges = None
+        self._write_through_slots = {}
         # Arena-mode preconditions are validated by KVCacheManager.create_kv_cache
         # (raising here would leave a partially constructed object for __del__).
         assert not manager._storage.is_arena_mode or (max_capacity is not None and max_capacity > 0)
@@ -516,11 +523,10 @@ class _KVCache:
             manager._num_sampled_kv_caches += 1
             manager._try_update_target_ratios()
         arena_ranges = self._arena_ranges
-        arena_offload: TypedIndexList[PoolGroupIndex, list[CommittedPage]] | None = None
-        arena_private: list[CommittedPage] = []
+        arena_closing: _KVCache._ArenaClosingPages | None = None
         arena_last_consumer = CachedCudaEvent.NULL
         if arena_ranges is not None:
-            arena_offload, arena_private = self._arena_collect_committed_gpu_pages()
+            arena_closing = self._arena_collect_committed_gpu_pages()
         with self._record_event():
             self._clear_blocks()
             # _record_event clears _finish_event on exit; capture it as the
@@ -529,21 +535,25 @@ class _KVCache:
                 arena_last_consumer = self._finish_event
         if arena_ranges is not None:
             storage = manager._storage
-            assert arena_offload is not None
-            for pg_idx, pages in typed_enumerate(arena_offload):
+            assert arena_closing is not None
+            for pg_idx in typed_range(storage.num_pool_groups):
+                # Written-through blocks move copy-free (§4.3).
+                storage.adopt_stale_copies(
+                    pg_idx, arena_closing.adopt_pages[pg_idx], arena_closing.adopt_slots[pg_idx]
+                )
                 try:
-                    storage.offload_arena_pages(pg_idx, pages)
+                    storage.offload_arena_pages(pg_idx, arena_closing.offload[pg_idx])
                 except OutOfPagesError:
                     # Host tier cannot take the write-out: drop the blocks
                     # instead of keeping them (reuse loss only, never an
                     # error on the free path).
-                    for page in pages:
+                    for page in arena_closing.offload[pg_idx]:
                         if page.scheduled_for_eviction:
                             storage.exclude_from_eviction(page)
             # Private copies are never evictable (nothing queues them); they
             # die with our refs, freeing their slots into their range.
-            arena_offload = None  # drop our strong refs before range release
-            arena_private.clear()
+            arena_closing = None  # drop our strong refs before range release
+            self._arena_release_unused_write_through()
             for pg_idx, rng in typed_enumerate(arena_ranges):
                 storage.free_gpu_sequence(pg_idx, rng, arena_last_consumer)
             self._arena_ranges = None
@@ -669,16 +679,24 @@ class _KVCache:
             case PageIndexMode.SHARED:
                 return not self.has_scratch_slots
 
-    def _arena_collect_committed_gpu_pages(
-        self,
-    ) -> tuple[TypedIndexList[PoolGroupIndex, list[CommittedPage]], list[CommittedPage]]:
+    class _ArenaClosingPages(NamedTuple):
+        # canonical committed pages without a write-through copy: copy-on-free
+        offload: "TypedIndexList[PoolGroupIndex, list[CommittedPage]]"
+        # canonical committed pages with a valid write-through host copy, and
+        # those copies: adopted copy-free (§4.3)
+        adopt_pages: "TypedIndexList[PoolGroupIndex, list[CommittedPage]]"
+        adopt_slots: "TypedIndexList[PoolGroupIndex, list[Slot]]"
+        # sequence-private reuse copies (§4.4): dropped
+        private: list[CommittedPage]
+
+    def _arena_collect_committed_gpu_pages(self) -> "_KVCache._ArenaClosingPages":
         """Collect this sequence's committed GPU pages before the block chain
-        is cleared at close(). Canonical pages (first return, per pool group)
-        move to the host tier (active->stale copy-on-free, DESIGN.md §4.3) so
-        the arena range can be reclaimed; sequence-private reuse copies
-        (second return, §4.4) are dropped -- their canonical stale copy
-        already exists. In arena mode GPU pages are never shared across
-        sequences, so they are ours to move or drop.
+        is cleared at close(), partitioned by how they leave the arena:
+        written-through pages adopt their host copy (copy-free), the rest are
+        copied out on free (§4.3), and private reuse copies are dropped --
+        their canonical stale copy already exists (§4.4). In arena mode GPU
+        pages are never shared across sequences, so they are ours to move or
+        drop.
 
         A separate method so its loop locals cannot outlive the collection: a
         lingering reference to a block's lock chain would delay the holder's
@@ -686,25 +704,32 @@ class _KVCache:
         the (otherwise unused) GPU eviction queue.
         """
         storage = self.manager._storage
-        arena_offload: TypedIndexList[PoolGroupIndex, list[CommittedPage]] = make_typed(
-            lambda _: list[CommittedPage](), storage.num_pool_groups
+        ret = _KVCache._ArenaClosingPages(
+            make_typed(lambda _: list[CommittedPage](), storage.num_pool_groups),
+            make_typed(lambda _: list[CommittedPage](), storage.num_pool_groups),
+            make_typed(lambda _: list[Slot](), storage.num_pool_groups),
+            [],
         )
-        arena_private: list[CommittedPage] = []
-        for block in self._blocks:
+        for ordinal, block in enumerate(self._blocks):
             if not block.is_committed:
                 continue
             for beam_pages in block.pages:
-                for p in beam_pages:
+                for lc_idx, p in typed_enumerate(beam_pages):
                     if p is None:
                         continue
                     page = p.page
                     if isinstance(page, CommittedPage) and page.cache_level == GPU_LEVEL:
-                        if type(page) is CommittedPage:
-                            pg_idx = storage.get_pool_group_index(page.life_cycle)
-                            arena_offload[pg_idx].append(page)
+                        if type(page) is not CommittedPage:
+                            ret.private.append(page)
+                            continue
+                        pg_idx = storage.get_pool_group_index(lc_idx)
+                        wt_slot = self._arena_take_write_through_slot(ordinal, lc_idx)
+                        if wt_slot is not None:
+                            ret.adopt_pages[pg_idx].append(page)
+                            ret.adopt_slots[pg_idx].append(wt_slot)
                         else:
-                            arena_private.append(page)
-        return arena_offload, arena_private
+                            ret.offload[pg_idx].append(page)
+        return ret
 
     @staticmethod
     def _find_canonical(page: CommittedPage, lc_idx: LifeCycleId) -> "CommittedPage | None":
@@ -722,12 +747,13 @@ class _KVCache:
         """Suspend-side write-out (DESIGN.md §4.5): move this sequence's GPU
         pages out of its arena ranges so the ranges can be unmapped.
 
-        Canonical committed pages and uncommitted pages migrate to the host
-        tier -- the block chain's holders follow their pages, so the logical
-        chain survives suspension unchanged. Sequence-private reuse copies
-        (§4.4) are swapped back to holding their canonical entry and dropped;
-        if the canonical entry is gone, the private copy is the sole copy and
-        migrates like a canonical page.
+        Written-through committed pages adopt their host copy (copy-free,
+        §4.3); other canonical committed pages and uncommitted pages migrate
+        to the host tier -- the block chain's holders follow their pages, so
+        the logical chain survives suspension unchanged. Sequence-private
+        reuse copies (§4.4) are swapped back to holding their canonical entry
+        and dropped; if the canonical entry is gone, the private copy is the
+        sole copy and migrates like a canonical page.
 
         Raises ``OutOfPagesError`` if the host tier cannot absorb the
         write-out even after eviction -- host-quota sizing (§4.6) must
@@ -741,6 +767,12 @@ class _KVCache:
         beam_idx = DEFAULT_BEAM_INDEX
         move: TypedIndexList[PoolGroupIndex, list[Page]] = make_typed(
             lambda _: list[Page](), storage.num_pool_groups
+        )
+        adopt_pages: TypedIndexList[PoolGroupIndex, list[Page]] = make_typed(
+            lambda _: list[Page](), storage.num_pool_groups
+        )
+        adopt_slots: TypedIndexList[PoolGroupIndex, list[Slot]] = make_typed(
+            lambda _: list[Slot](), storage.num_pool_groups
         )
         swaps = list[tuple[BlockOrdinal, LifeCycleId, CommittedPage]]()
         dropped = list[CommittedPage]()
@@ -756,7 +788,17 @@ class _KVCache:
                     swaps.append((ordinal, lc_idx, canonical))
                     dropped.append(page)
                     continue
-            move[storage.get_pool_group_index(lc_idx)].append(page)
+            pg_idx = storage.get_pool_group_index(lc_idx)
+            wt_slot = (
+                self._arena_take_write_through_slot(int(ordinal), lc_idx)
+                if type(page) is CommittedPage
+                else None
+            )
+            if wt_slot is not None:
+                adopt_pages[pg_idx].append(page)
+                adopt_slots[pg_idx].append(wt_slot)
+            else:
+                move[pg_idx].append(page)
         for ordinal, lc_idx, canonical in swaps:
             # Holding the canonical page keeps it recallable for resume; the
             # private copy's holder dies with this assignment. Private copies
@@ -765,8 +807,53 @@ class _KVCache:
             # eviction queue.
             self._block(ordinal, beam_idx)[lc_idx] = canonical.hold()
         dropped.clear()
-        for pg_idx, pages in typed_enumerate(move):
-            storage.offload_arena_pages(pg_idx, pages)
+        for pg_idx in typed_range(storage.num_pool_groups):
+            storage.adopt_stale_copies(pg_idx, adopt_pages[pg_idx], adopt_slots[pg_idx])
+            storage.offload_arena_pages(pg_idx, move[pg_idx])
+        self._arena_release_unused_write_through()
+
+    def _arena_write_through(self, ordinal: BlockOrdinal) -> None:
+        """Write-through on commit (§4.3, ``WriteThroughPolicy.ON_COMMIT``):
+        copy the just-committed block's pages to fresh host slots now, so the
+        free path (close/suspend) adopts them instead of copying. Skipped
+        silently if the host tier cannot take the copy -- the copy-on-free
+        fallback covers the block."""
+        storage = self._storage
+        beam_idx = DEFAULT_BEAM_INDEX
+        beam_block = self._block(ordinal, beam_idx)
+        per_pg_pages: dict[PoolGroupIndex, list[Page]] = {}
+        per_pg_lcs: dict[PoolGroupIndex, list[LifeCycleId]] = {}
+        for lc_idx, p in typed_enumerate(beam_block):
+            if p is None:
+                continue
+            page = p.page
+            if type(page) is not CommittedPage or page.cache_level != GPU_LEVEL:
+                continue
+            pg_idx = storage.get_pool_group_index(lc_idx)
+            per_pg_pages.setdefault(pg_idx, []).append(page)
+            per_pg_lcs.setdefault(pg_idx, []).append(lc_idx)
+        if not per_pg_pages:
+            return
+        # The sources are still locked; order the copies after all work
+        # enqueued so far on the sequence's stream (the block's writes).
+        prior = CachedCudaEvent(self.cuda_stream)
+        for pg_idx, pages in per_pg_pages.items():
+            try:
+                slots = storage.write_through_pages(pg_idx, pages, prior_event=prior)
+            except OutOfPagesError:
+                continue  # fall back to copy-on-free for this block
+            for lc_idx, slot in zip(per_pg_lcs[pg_idx], slots):
+                self._write_through_slots[(int(ordinal), int(lc_idx))] = slot
+
+    def _arena_take_write_through_slot(self, ordinal: int, lc_idx: LifeCycleId) -> Slot | None:
+        return self._write_through_slots.pop((int(ordinal), int(lc_idx)), None)
+
+    def _arena_release_unused_write_through(self) -> None:
+        """Return any unconsumed write-through host slots to their pool."""
+        storage = self.manager._storage
+        for (_, lc_int), slot in self._write_through_slots.items():
+            storage.release_slot(LifeCycleId(lc_int), CacheLevel(GPU_LEVEL + 1), slot)
+        self._write_through_slots.clear()
 
     def _arena_ensure_mapped(self, num_valid_blocks: int) -> bool:
         """Demand-map physical pages covering the first ``num_valid_blocks`` of
@@ -1677,6 +1764,14 @@ class _KVCache:
             event_manager = self.manager.event_manager
             if event_manager is not None:
                 event_manager.add_stored_block_event_from_block(tree_block)
+            arena_cfg = self.manager._storage.arena_config
+            if (
+                self._arena_ranges is not None
+                and arena_cfg is not None
+                and arena_cfg.write_through == WriteThroughPolicy.ON_COMMIT
+                and self.manager._storage.num_cache_levels > 1
+            ):
+                self._arena_write_through(ordinal)
         elif tree_block.is_full and self.manager.allow_seq_rebasing and is_full:
             # Happens when a concurrent request committed the same tokens before us.
             # Try to replace our pages with pages from the existing block to save memory.
