@@ -1057,20 +1057,6 @@ class ADEngine(ModelEngine):
         )
         self.iter_counter += 1
 
-        # Compute DP-aware max(total_num_tokens) and write to BatchInfo slot 14
-        # (``max_dp_num_tokens``). Mirrors base TRT-LLM's pattern in
-        # ``model_engine._get_all_rank_num_tokens``: MoE all-to-all needs the
-        # cross-rank max to size dispatch padding without over-padding to the
-        # static config ``max_num_tokens``. ``nest_sequences`` already
-        # initialized slot 14 to the local ``total_num_tokens``; this overrides
-        # with the cross-rank max only when attention-DP requires it.
-        if self.enable_attention_dp and self.dist_config.tp_size > 1:
-            assert self.dist is not None, "Distributed object is required for attention DP mode"
-            info = self.cache_seq_interface.info
-            local_total_num_tokens = info.batch_info.get_total_num_tokens()
-            all_rank_num_tokens = list(self.dist.tp_allgather(local_total_num_tokens))
-            info.batch_info.update_max_dp_num_tokens(max(all_rank_num_tokens))
-
         # compute outputs
         outputs = self._run_forward()
 
@@ -1315,6 +1301,14 @@ def create_autodeploy_executor(
             vocab_size_padded=vocab_size_padded,
         )
 
+    # Speculative-decoding draft sizes must be forwarded to PyExecutor so that the
+    # attention-DP dummy created in `_pad_attention_dp_dummy_request` is materialized
+    # with `py_draft_tokens = [1] * max_total_draft_tokens` instead of `[]`. An empty
+    # `py_draft_tokens` makes the dummy classify as decode in `_prepare_inputs` and
+    # trips the eagle wrapper's `assert num_decode == 0` under MTP + attention_dp.
+    max_draft_len = 0 if spec_config is None else spec_config.max_draft_len
+    max_total_draft_tokens = 0 if spec_config is None else spec_config.tokens_per_gen_step - 1
+
     # creating the executor object
     py_executor = PyExecutor(
         resource_manager,
@@ -1327,6 +1321,8 @@ def create_autodeploy_executor(
         max_input_len=ad_config.max_input_len,
         max_batch_size=ad_config.max_batch_size,
         max_beam_width=ad_config.max_beam_width,
+        max_draft_len=max_draft_len,
+        max_total_draft_tokens=max_total_draft_tokens,
         guided_decoder=guided_decoder,
         kv_cache_transceiver=kv_cache_transceiver,
         resource_governor_queue=resource_governor_queue,

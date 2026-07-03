@@ -281,6 +281,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_cache_aware_balance_deepseek_v3.yaml",
         "deepseek_v3_lite_bf16_conditional":
         f"{test_configs_root}/disagg_config_conditional_deepseek_v3.yaml",
+        "deepseek_v3_lite_bf16_conditional_v2":
+        f"{test_configs_root}/disagg_config_conditional_deepseek_v3_v2.yaml",
         "deepseek_v3_lite_fp8_tp1_two_mtp":
         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_two_mtp.yaml",
         "deepseek_v3_lite_fp8_ctxpp2_gentp2_one_mtp":
@@ -1748,6 +1750,53 @@ def test_disaggregated_deepseek_v3_lite_bf16_conditional(
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_bf16_conditional",
                            env=llm_venv._new_env,
+                           model_path=deepseek_v3_model_root,
+                           cwd=llm_venv.get_working_directory())
+
+
+# V2 variant of the conditional disagg test: KV manager V2 + Python NIXL transceiver.
+@skip_no_hopper
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_bf16_conditional_v2(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/bf16")
+
+    # Conditional disagg handles short-prefill requests locally on the gen
+    # server (bypassing the ctx handoff + add_per_request_metrics), while routed
+    # requests are recorded in the disagg /perf_metrics. Verify ONCE after all
+    # client iterations via post_client_test (not per-iteration): routed-request
+    # metrics are recorded asynchronously (add_per_request_metrics via
+    # create_task on response completion) and surface only after the client
+    # traffic settles, so a per-iteration read races that lag; /perf_metrics is
+    # also consume-on-read, so query it exactly once at the end.
+    def _check_routed_recorded(server_url: str):
+        import requests as http_requests
+        metrics = []
+        deadline = time.time() + 60
+        while True:
+            resp = http_requests.get(f"{server_url}/perf_metrics", timeout=10)
+            assert resp.status_code == 200, \
+                f"perf_metrics fetch failed: {resp.status_code}"
+            metrics = resp.json()
+            if metrics or time.time() >= deadline:
+                break
+            time.sleep(2)
+        logger.info(f"conditional_v2 perf_metrics len={len(metrics)} "
+                    f"(routed requests recorded; bypassed ones absent)")
+        # With short prompts every prompt's first occurrence routes through the
+        # context server (match=0 -> need_ctx), so at least one routed request
+        # must be recorded; an empty result means conditional routing never
+        # engaged.
+        assert metrics, \
+            "no per-request metrics recorded after client runs; conditional routing may be misconfigured"
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "deepseek_v3_lite_bf16_conditional_v2",
+                           env=llm_venv._new_env,
+                           post_client_test=_check_routed_recorded,
                            model_path=deepseek_v3_model_root,
                            cwd=llm_venv.get_working_directory())
 

@@ -477,8 +477,11 @@ class LTX2Attention(Attention):
             and self.qk_norm
         )
 
-        # SEPARATE_QKV self-attn 3x fp4_quantize dedup; see Attention.forward_async.
-        if self._maybe_share_qkv_quantize and getattr(self.to_q, "input_scale", None) is not None:
+        # SEPARATE_QKV self-attn shares ONE input quant across to_q/to_k/to_v (mirrors
+        # Attention.forward_async): reuse x if already fp4, else quantize once.
+        if isinstance(x, Fp4QuantizedTensor):
+            qkv_input = x
+        elif self._maybe_share_qkv_quantize and getattr(self.to_q, "input_scale", None) is not None:
             x_2d = x.reshape(-1, x.shape[-1])
             fp4, sf = torch.ops.trtllm.tunable_fp4_quantize(
                 x_2d, self.to_q.input_scale, self.to_q.scaling_vector_size, False

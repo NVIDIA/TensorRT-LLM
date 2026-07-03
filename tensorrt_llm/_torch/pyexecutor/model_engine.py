@@ -85,6 +85,7 @@ from .resource_manager import (BaseResourceManager, KVCacheManager,
                                ResourceManagerType)
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
+from .trace_log_utils import log_mem_snapshot
 
 
 class ModelEngine(ABC):
@@ -225,6 +226,20 @@ def _filter_cuda_graph_seq_lens(cuda_graph_seq_lens: list[int],
     return result
 
 
+_DEEP_GEMM_PDL_CONFIGURED = False
+
+
+def _configure_deep_gemm_pdl() -> None:
+    global _DEEP_GEMM_PDL_CONFIGURED
+    if _DEEP_GEMM_PDL_CONFIGURED:
+        return
+
+    from tensorrt_llm import deep_gemm
+
+    deep_gemm.set_pdl(os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1")
+    _DEEP_GEMM_PDL_CONFIGURED = True
+
+
 class PyTorchModelEngine(ModelEngine):
 
     def __init__(
@@ -244,6 +259,8 @@ class PyTorchModelEngine(ModelEngine):
         model_weights_memory_tag: Optional[str] = None,
         model_weights_restore_mode=None,
     ):
+        _configure_deep_gemm_pdl()
+
         self.forward_pass_callable = None
         self.ub_buffers = None
         if llm_args.encode_only and llm_args.mm_encoder_only:
@@ -1038,6 +1055,7 @@ class PyTorchModelEngine(ModelEngine):
             and not self.mapping.has_cp_helix() and self.guided_decoder is None
             and not isinstance(kv_cache_manager, MambaHybridCacheManager))
 
+        log_mem_snapshot("warmup/before_warmup")
         if not is_enc_dec:
             self._run_attention_warmup(resource_manager, can_run_general_warmup)
 
@@ -1056,10 +1074,12 @@ class PyTorchModelEngine(ModelEngine):
                 # Memory pool will be warmed up later.
                 gc.collect()
                 torch.cuda.empty_cache()
+
         # Autotuner warmup uses context-only requests. Helix CP
         # is decode-only and runs into issues with autotuner warmup.
         if not is_enc_dec and not self.mapping.has_cp_helix():
             self._run_autotuner_warmup(resource_manager)
+            log_mem_snapshot("warmup/after_autotuner")
             # Release the autotuner's exploration-mode intermediates. The
             # exploration leftovers are pure waste that hide tens of GiB from
             # non-torch allocators (cuBLAS handle workspace, UCX/NIXL,
@@ -1068,12 +1088,14 @@ class PyTorchModelEngine(ModelEngine):
             torch.cuda.empty_cache()
         with self.cuda_graph_runner.allow_capture():
             self._run_cuda_graph_warmup(resource_manager)
+        log_mem_snapshot("warmup/after_cuda_graph_capture")
         if can_run_general_warmup:
             # Pre-populate the memory pool with max-shape allocations to reduce
             # fragmentation at runtime.
             warmup_requests_configs = self._get_max_shape_warmup_requests(
                 resource_manager)
             self._general_warmup(resource_manager, warmup_requests_configs)
+            log_mem_snapshot("warmup/after_memory_pool_prepop")
 
     def _general_warmup(self, resource_manager: ResourceManager,
                         warmup_requests_configs: List[Tuple[int, int]]):
@@ -2788,9 +2810,14 @@ class PyTorchModelEngine(ModelEngine):
 
         # Set iteration states - batch dictionary updates
         self.iter_states.update({
-            'num_ctx_requests': 0,
-            'num_ctx_tokens': 0,
-            'num_generation_tokens': num_generation_tokens
+            'num_ctx_requests':
+            0,
+            'num_ctx_tokens':
+            0,
+            'num_generation_tokens':
+            num_generation_tokens,
+            'cached_kv_tokens':
+            sum(num_cached_tokens_per_seq),
         })
 
         return lora_params
@@ -3170,6 +3197,10 @@ class PyTorchModelEngine(ModelEngine):
                 num_accepted_tokens_device, req_id_to_old_request,
                 resource_manager)
 
+        # Hoist self.use_mrope to a function-scope local so the per-request /
+        # per-context-request mrope branches use LOAD_FAST instead of LOAD_ATTR.
+        _use_mrope = self.use_mrope
+
         # if new_tensors_device exist, input_ids will only contain new context tokens
         input_ids = []  # per sequence
         sequence_lengths = []  # per sequence
@@ -3329,7 +3360,7 @@ class PyTorchModelEngine(ModelEngine):
                                                 self.model,
                                                 "multimodal_data_device_paths",
                                                 None))
-                if self.use_mrope:
+                if _use_mrope:
                     mrope_config = multimodal_params.multimodal_data[
                         'mrope_config']
                     mrope_pos_ids = mrope_config['mrope_position_ids']
@@ -3357,7 +3388,7 @@ class PyTorchModelEngine(ModelEngine):
                 # This creates new IPC handles owned by the prefill worker, so the decode worker
                 # can access them even after the encode worker's GC deallocates the original memory.
                 # Without this, the decode worker would receive handles pointing to freed memory.
-                if (request.is_context_only_request and self.use_mrope and
+                if (request.is_context_only_request and _use_mrope and
                         "mrope_config" in multimodal_params.multimodal_data):
                     mrope_config = multimodal_params.multimodal_data[
                         "mrope_config"]
@@ -3558,6 +3589,13 @@ class PyTorchModelEngine(ModelEngine):
         # Cache invariant method result to avoid repeated calls per-request
         _has_cp_helix = self.mapping.has_cp_helix()
         _n_gen = len(generation_requests)
+        # One-shot batch-level flag — True iff any generation request actually
+        # carries multimodal payload. Lets the strip_mm_data branch below
+        # short-circuit on a LOAD_FAST rather than a per-request LOAD_ATTR
+        # of py_multimodal_data for non-multimodal models (the gpt-oss-120b
+        # GEN case).
+        _has_any_multimodal_request = any(r.py_multimodal_data is not None
+                                          for r in generation_requests)
         if _n_gen > 0:
             # All generation requests have the same beam width
             beam_width = generation_requests[0].py_beam_width
@@ -3570,9 +3608,6 @@ class PyTorchModelEngine(ModelEngine):
 
             for request in generation_requests:
                 request_ids.append(request.py_request_id)
-                # py_batch_idx is set after a request occupies a generation slot.
-                # None means this is its first generation step on this worker.
-                is_generation_admission = request.py_batch_idx is None
                 # the request has no previous tensor:
                 # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
                 # (2) a dummy request; or
@@ -3625,7 +3660,7 @@ class PyTorchModelEngine(ModelEngine):
                     prompt_lengths.append(request.py_prompt_len)
                     gather_ids.append(len(position_ids) - 1)
 
-                if self.use_mrope:
+                if _use_mrope:
                     mrope_position_delta = getattr(request,
                                                    "py_mrope_position_delta",
                                                    None)
@@ -3676,7 +3711,12 @@ class PyTorchModelEngine(ModelEngine):
                                  gen_mrope_position_ids))
                             mrope_delta_read_seq_slots.append(
                                 delta_read_seq_slot)
-                if is_generation_admission and request.py_multimodal_data:
+                # Equivalent to the original `is_generation_admission and
+                # request.py_multimodal_data`. The batch-level flag is checked
+                # first so non-multimodal models pay one LOAD_FAST per request
+                # instead of LOAD_ATTR(py_multimodal_data) + LOAD_ATTR(py_batch_idx).
+                if (_has_any_multimodal_request and request.py_multimodal_data
+                        and request.py_batch_idx is None):
                     strip_mm_data_for_generation(request.py_multimodal_data)
 
                 request.py_batch_idx = request.py_seq_slot
@@ -4162,6 +4202,8 @@ class PyTorchModelEngine(ModelEngine):
         self.iter_states['num_ctx_requests'] = num_ctx_requests
         self.iter_states['num_ctx_tokens'] = num_ctx_tokens
         self.iter_states['num_generation_tokens'] = num_generation_tokens
+        # Count the already-cached prefix for the sequences scheduled this iteration.
+        self.iter_states['cached_kv_tokens'] = sum(num_cached_tokens_per_seq)
 
         if not self.is_warmup:
             self.previous_request_ids = all_gen_request_ids
@@ -5286,7 +5328,11 @@ class PyTorchModelEngine(ModelEngine):
         with self.cuda_graph_runner.pad_batch(
                 scheduled_requests, resource_manager,
                 self.runtime_draft_len) as padded_requests:
-            self._pad_batch_seed_mrope_delta_cache(padded_requests)
+            # Callee already no-ops when use_mrope=False, but the Python call /
+            # frame setup itself is non-trivial under high concurrency. Gating
+            # at the caller avoids that overhead for non-mrope models.
+            if self.use_mrope:
+                self._pad_batch_seed_mrope_delta_cache(padded_requests)
 
             # Refresh is_all_greedy_sample for the *current* batch BEFORE the
             # CUDA graph key is built below. The key includes this flag to pick

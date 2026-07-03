@@ -3449,6 +3449,9 @@ def _make_deepseekv4_eplb_config(model_path, layer_updates_per_iter, ep_size=8):
         layer_updates_per_iter=0)
 
 
+DEEPSEEKV4_TEST_MAX_BATCH_SIZE = 128
+
+
 def _run_deepseekv4_eplb(model_name,
                          model_path,
                          moe_backend,
@@ -3470,6 +3473,7 @@ def _run_deepseekv4_eplb(model_name,
              moe_expert_parallel_size=tensor_parallel_size,
              kv_cache_config=kv_cache_config,
              enable_attention_dp=True,
+             max_batch_size=DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
              max_seq_len=4096,
              **pytorch_config,
              speculative_config=mtp_config) as llm:
@@ -3498,7 +3502,7 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                  moe_expert_parallel_size=4,
                  moe_config=MoeConfig(backend="TRTLLM"),
                  enable_attention_dp=True,
-                 max_batch_size=4,
+                 max_batch_size=DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
                  max_seq_len=4096,
                  max_num_tokens=4096,
                  kv_cache_config=kv_cache_config) as llm:
@@ -3570,6 +3574,7 @@ class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
                  moe_expert_parallel_size=4,
                  moe_config=MoeConfig(backend=moe_backend),
                  enable_attention_dp=True,
+                 max_batch_size=DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
                  max_seq_len=4096,
                  kv_cache_config=kv_cache_config) as llm:
             task = MMLU(self.MODEL_NAME)
@@ -3586,11 +3591,12 @@ class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
                  tensor_parallel_size=4,
                  moe_expert_parallel_size=4,
                  moe_config=MoeConfig(backend="WIDEEP"),
-                 cuda_graph_config=CudaGraphConfig(max_batch_size=16,
-                                                   enable_padding=True),
+                 cuda_graph_config=CudaGraphConfig(
+                     max_batch_size=DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
+                     enable_padding=True),
                  enable_attention_dp=True,
                  enable_chunked_prefill=True,
-                 max_batch_size=16,
+                 max_batch_size=DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
                  max_num_tokens=128,
                  max_seq_len=4096,
                  kv_cache_config=kv_cache_config) as llm:

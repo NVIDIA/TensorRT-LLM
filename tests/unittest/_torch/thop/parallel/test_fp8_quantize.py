@@ -201,6 +201,104 @@ def test_mxfp8_quantize_alignment_torch_device(m, k, dtype,
                                   a.cpu().to(torch.float32), 8, 0, 0.999)
 
 
+def _run_megamoe_prepare(hidden_states, token_selected_experts,
+                         token_final_scales):
+    m, k = hidden_states.shape
+    top_k = token_selected_experts.shape[1]
+
+    ref_x, ref_x_sf_u8 = torch.ops.trtllm.mxfp8_quantize(
+        hidden_states, False, 32)
+    ref_x_sf = ref_x_sf_u8.view(m, k // 32).view(torch.int32)
+
+    buf_rows = m + 3
+    x_out = torch.empty((buf_rows, k), dtype=torch.float8_e4m3fn, device="cuda")
+    x_sf_out = torch.empty((buf_rows, k // 128),
+                           dtype=torch.int32,
+                           device="cuda")
+    topk_idx_out = torch.empty((buf_rows, top_k),
+                               dtype=torch.int64,
+                               device="cuda")
+    topk_weights_out = torch.empty((buf_rows, top_k),
+                                   dtype=torch.float32,
+                                   device="cuda")
+
+    torch.ops.trtllm.megamoe_prepare(hidden_states, token_selected_experts,
+                                     token_final_scales, x_out, x_sf_out,
+                                     topk_idx_out, topk_weights_out)
+    torch.cuda.synchronize()
+
+    assert torch.equal(x_out[:m].view(torch.uint8), ref_x.view(torch.uint8))
+    assert torch.equal(x_sf_out[:m], ref_x_sf)
+    assert torch.equal(topk_idx_out[:m], token_selected_experts.to(torch.int64))
+    assert torch.equal(topk_weights_out[:m],
+                       token_final_scales.to(torch.float32))
+
+
+@pytest.mark.parametrize("m", [1, 7, 128])
+@pytest.mark.parametrize("k", [128, 512])
+@pytest.mark.parametrize("top_k", [1, 6])
+@skip_pre_blackwell_unittest
+def test_megamoe_prepare_matches_mxfp8_quantize(m, k, top_k):
+    torch.random.manual_seed(123)
+    hidden_states = (torch.randn([m, k], dtype=torch.float) * 16).to(
+        torch.bfloat16).cuda().contiguous()
+    token_selected_experts = torch.randint(0,
+                                           384, (m, top_k),
+                                           dtype=torch.int32,
+                                           device="cuda")
+    token_final_scales = torch.randn((m, top_k),
+                                     dtype=torch.float32,
+                                     device="cuda")
+
+    _run_megamoe_prepare(hidden_states, token_selected_experts,
+                         token_final_scales)
+
+
+@pytest.mark.parametrize("expert_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("scale_dtype",
+                         [torch.float32, torch.float16, torch.bfloat16])
+@skip_pre_blackwell_unittest
+def test_megamoe_prepare_accepts_supported_topk_dtypes(expert_dtype,
+                                                       scale_dtype):
+    torch.random.manual_seed(123)
+    m, k, top_k = 5, 256, 3
+    hidden_states = (torch.randn([m, k], dtype=torch.float) * 16).to(
+        torch.bfloat16).cuda().contiguous()
+    token_selected_experts = torch.randint(0,
+                                           384, (m, top_k),
+                                           dtype=expert_dtype,
+                                           device="cuda")
+    token_final_scales = torch.randn((m, top_k),
+                                     dtype=scale_dtype,
+                                     device="cuda")
+
+    _run_megamoe_prepare(hidden_states, token_selected_experts,
+                         token_final_scales)
+
+
+@skip_pre_blackwell_unittest
+def test_megamoe_prepare_allows_zero_tokens():
+    k, top_k = 256, 3
+    hidden_states = torch.empty((0, k), dtype=torch.bfloat16, device="cuda")
+    token_selected_experts = torch.empty((0, top_k),
+                                         dtype=torch.int32,
+                                         device="cuda")
+    token_final_scales = torch.empty((0, top_k),
+                                     dtype=torch.float32,
+                                     device="cuda")
+    x_out = torch.empty((1, k), dtype=torch.float8_e4m3fn, device="cuda")
+    x_sf_out = torch.empty((1, k // 128), dtype=torch.int32, device="cuda")
+    topk_idx_out = torch.empty((1, top_k), dtype=torch.int64, device="cuda")
+    topk_weights_out = torch.empty((1, top_k),
+                                   dtype=torch.float32,
+                                   device="cuda")
+
+    torch.ops.trtllm.megamoe_prepare(hidden_states, token_selected_experts,
+                                     token_final_scales, x_out, x_sf_out,
+                                     topk_idx_out, topk_weights_out)
+    torch.cuda.synchronize()
+
+
 @pytest.mark.skipif(
     getSMVersion() != 103 and getSMVersion() != 90,
     reason="Only test on Blackwell and Hopper",
