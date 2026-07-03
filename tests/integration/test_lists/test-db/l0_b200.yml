@@ -149,7 +149,11 @@ l0_b200:
   # _get_moe_config_for_blackwell); dense bf16 variants are covered on Hopper.
   # The other 5 multimodal files are HW-agnostic Python plumbing and run on Hopper only.
   - unittest/_torch/multimodal/test_mm_encoder_standalone.py -k "qwen3_30b_a3b_fp8"
-  - unittest/_torch/sampler
+  # test_speculative_d2h_parity_real_predictor (both no_stop_token and
+  # stop_token_15) is a HW-agnostic sampler D2H-parity invariant (plain CUDA
+  # stream/event, no SM gating), covered on A30 pre-merge; drop that whole
+  # function's leaves on Blackwell, keep the rest of the sampler dir.
+  - unittest/_torch/sampler -k "not test_speculative_d2h_parity_real_predictor"
   - unittest/_torch/speculative/test_eagle3.py
   - unittest/_torch/thop/parallel TIMEOUT (90)
   - unittest/_torch/thop/serial
@@ -169,7 +173,7 @@ l0_b200:
   - unittest/tools/test_layer_wise_benchmarks.py::test_nemotron_gen_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_qwen3_next_gen_tep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_performance_alignment[1]
-  - unittest/kv_cache_manager_v2_tests/
+  - unittest/kv_cache_manager_v2_tests
   # ------------- KV Cache V2 Scheduler IT ---------------
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_v2_vs_v1_basic
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_token_budget_limited
@@ -281,6 +285,8 @@ l0_b200:
   - unittest/trt/attention/test_gpt_attention.py -k "trtllm_gen"
   - unittest/llmapi/test_llm_quant.py # 3.5 mins on B200
   - unittest/trt/functional/test_fp4_gemm.py # 3 mins on B200
+  - unittest/disaggregated/test_router.py
+  - unittest/disaggregated/test_openai_server_info.py
 - condition:
     ranges:
       system_gpu_count:
