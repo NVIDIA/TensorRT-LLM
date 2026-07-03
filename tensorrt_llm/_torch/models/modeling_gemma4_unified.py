@@ -263,6 +263,16 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
             else None
         )
 
+        # Backs the inherited mm_token_ids property; the executor uses it to
+        # precompute multimodal token indices (Gemma4 soft-token ids are
+        # in-vocab, so the base >= vocab_size heuristic would find none).
+        _mm_ids = [config.image_token_id]
+        if config.audio_token_id is not None:
+            _mm_ids.append(config.audio_token_id)
+        if config.video_token_id is not None:
+            _mm_ids.append(config.video_token_id)
+        self._mm_token_ids = torch.tensor(_mm_ids, dtype=torch.int32)
+
         # --- Text backbone (reused verbatim) ---
         model_config_cp = copy.deepcopy(model_config)
         self.model_config = model_config_cp
