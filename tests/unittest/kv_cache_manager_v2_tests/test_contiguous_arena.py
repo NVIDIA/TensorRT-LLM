@@ -913,6 +913,23 @@ class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
         host_stats = manager._storage.get_statistics(CacheLevel(1))[0]
         self.assertEqual(host_stats.total - host_stats.free, 4)
 
+    def test_clamp_max_seq_len_counts_pages(self) -> None:
+        """§4.6 capacity planning in arena mode counts physical pages.
+
+        Not VA slots: 16 budget pages x 64 blocks/page x 16 tokens/block.
+        """
+        manager = self.manager
+        blocks_per_page = (2 * MiB) // (4 * 8192)  # 64: 32 KiB block record
+        self.assertEqual(
+            manager.clamp_max_seq_len_for_mem(1, 10**6), 16 * blocks_per_page * self.TPB
+        )
+        # batch 4: the 3 other single-token sequences take a page each
+        self.assertEqual(
+            manager.clamp_max_seq_len_for_mem(4, 10**6), 13 * blocks_per_page * self.TPB
+        )
+        # a bound below capacity is returned unchanged
+        self.assertEqual(manager.clamp_max_seq_len_for_mem(1, 500), 500)
+
     def test_max_capacity_required_and_enforced(self) -> None:
         manager = self.manager
         with self.assertRaises(ValueError):

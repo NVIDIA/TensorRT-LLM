@@ -3330,6 +3330,16 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         status="prototype",
         description="Whether to use the KV cache manager v2 (experimental).")
 
+    use_contiguous_kv_arena: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Whether active KV cache blocks of a sequence are contiguous in "
+        "virtual memory (per-sequence VMM arenas with demand paging; "
+        "experimental). Requires use_kv_cache_manager_v2 and a host cache "
+        "tier; incompatible with sliding-window attention, SSM layers and "
+        "beam search.")
+
     kv_cache_event_hash_algo: Literal[
         "auto", "v1_block_key", "v2_sha256", "v2_sha256_64"] = Field(
             default="auto",
@@ -3470,6 +3480,13 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             raise ValueError(
                 "kv_cache_config.max_util_for_resume must be between 0 and 1")
         return v
+
+    @model_validator(mode='after')
+    def sync_contiguous_kv_arena(self) -> 'KvCacheConfig':
+        # The contiguous arena is a KV cache manager v2 storage mode.
+        if self.use_contiguous_kv_arena:
+            self.use_kv_cache_manager_v2 = True
+        return self
 
 
 @PybindMirror.mirror_pybind_fields(_ExtendedRuntimePerfKnobConfig)

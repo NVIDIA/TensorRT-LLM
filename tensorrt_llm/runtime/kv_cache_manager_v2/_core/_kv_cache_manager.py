@@ -827,18 +827,44 @@ class KVCacheManager:
                 ret[pg_idx] += num_slots
             return ret
 
-        for pg in typed_range(num_pool_groups):
-            remaining_slots[pg] -= get_num_slots(1)[pg] * (batch_size - 1)
-            if remaining_slots[pg] < 0:
+        if storage.is_arena_mode:
+            # Arena mode (DESIGN.md §4.6): GPU capacity is the shared physical
+            # page budget, not per-pool-group slot counts (which describe VA).
+            # A sequence of B blocks consumes, per (pool group, pool),
+            # ceil(B * slot_size / page) physical pages.
+            arena_config = storage.arena_config
+            assert arena_config is not None
+            page_size = arena_config.phys_page_size
+            slot_sizes = [storage.slot_size(pg) for pg in typed_range(num_pool_groups)]
+
+            def pages_for(seq_len: int) -> int:
+                blocks = get_num_slots(seq_len)
+                return sum(
+                    div_up(blocks[pg] * size, page_size)
+                    for pg in typed_range(num_pool_groups)
+                    for size in slot_sizes[pg]
+                )
+
+            remaining_pages = storage.gpu_page_budget.total_pages
+            remaining_pages -= pages_for(1) * (batch_size - 1)
+            if remaining_pages < 0:
                 return 0
 
-        def is_enough(num_blocks: int) -> bool:
-            return all(
-                cnt <= rem
-                for cnt, rem in zip(
-                    get_num_slots(num_blocks * tokens_per_block), remaining_slots, strict=True
+            def is_enough(num_blocks: int) -> bool:
+                return pages_for(num_blocks * tokens_per_block) <= remaining_pages
+        else:
+            for pg in typed_range(num_pool_groups):
+                remaining_slots[pg] -= get_num_slots(1)[pg] * (batch_size - 1)
+                if remaining_slots[pg] < 0:
+                    return 0
+
+            def is_enough(num_blocks: int) -> bool:
+                return all(
+                    cnt <= rem
+                    for cnt, rem in zip(
+                        get_num_slots(num_blocks * tokens_per_block), remaining_slots, strict=True
+                    )
                 )
-            )
 
         if not is_enough(1):
             return 0

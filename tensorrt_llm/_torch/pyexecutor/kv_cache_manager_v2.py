@@ -40,6 +40,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BufferConfig,
     CacheTierConfig,
+    ContiguousArenaConfig,
     DiskCacheTierConfig,
     GpuCacheTierConfig,
     HostCacheTierConfig,
@@ -47,6 +48,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     LayerId,
     ReuseScope,
     TokenIdExt,
+    WriteThroughPolicy,
     _KVCache,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as KVCacheManagerPy
@@ -714,10 +716,15 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
         self.kv_cache_manager_py_config = config
+        self._arena_enabled = config.contiguous_arena is not None
 
         try:
             self.impl = KVCacheManagerPy(config, event_manager=self.event_manager)
         except (CuError, KVCacheOutOfMemoryError):
+            if self._arena_enabled:
+                # The GPU-only fallback below would silently drop the stale
+                # tier the arena's write-out path depends on (§4.3).
+                raise
             if len(cache_tiers) > 1:
                 logger.warning(
                     "Failed to initialize KV cache manager with host cache "
@@ -1041,6 +1048,15 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
             )
 
+        contiguous_arena = None
+        if kv_cache_config.use_contiguous_kv_arena:
+            assert any(isinstance(t, HostCacheTierConfig) for t in cache_tiers), (
+                "use_contiguous_kv_arena requires a host cache tier (the stale tier, "
+                "DESIGN.md contiguous_primary_kvcache §4.3); configure host_cache_size "
+                "or leave the default host quota enabled"
+            )
+            contiguous_arena = self._build_arena_config()
+
         return KVCacheManagerConfigPy(
             tokens_per_block=tokens_per_block,
             vocab_size=vocab_size,
@@ -1048,6 +1064,37 @@ class KVCacheManagerV2(BaseResourceManager):
             max_util_for_resume=kv_cache_config.max_util_for_resume,
             enable_stats=self.enable_stats,
             layers=layer_configs,
+            contiguous_arena=contiguous_arena,
+        )
+
+    @staticmethod
+    def _build_arena_config() -> ContiguousArenaConfig:
+        """Resolve the contiguous-arena prototype config (DESIGN.md
+        contiguous_primary_kvcache). The enable switch is the public
+        ``KvCacheConfig.use_contiguous_kv_arena``; tuning knobs stay on env
+        vars while the feature is a prototype:
+
+        - ``TRTLLM_KV_ARENA_PHYS_PAGE_SIZE_MB``: physical mapping granularity
+          ("super-page", multiple of 2; default 2). Larger pages amortize the
+          fixed per-mapping cuMemSetAccess cost (§4.8).
+        - ``TRTLLM_KV_ARENA_MAP_AHEAD_PAGES``: demand-paging margin (§4.2,
+          default 1).
+        - ``TRTLLM_KV_ARENA_WRITE_THROUGH``: ``on_free`` (default) or
+          ``on_commit`` (§4.3).
+        """
+        page_mb = int(os.environ.get("TRTLLM_KV_ARENA_PHYS_PAGE_SIZE_MB", "2"))
+        map_ahead = int(os.environ.get("TRTLLM_KV_ARENA_MAP_AHEAD_PAGES", "1"))
+        write_through_env = os.environ.get("TRTLLM_KV_ARENA_WRITE_THROUGH", "on_free").lower()
+        assert write_through_env in ("on_free", "on_commit"), (
+            f"TRTLLM_KV_ARENA_WRITE_THROUGH must be 'on_free' or 'on_commit', "
+            f"got {write_through_env!r}"
+        )
+        return ContiguousArenaConfig(
+            phys_page_size=page_mb << 20,
+            map_ahead_pages=map_ahead,
+            write_through=WriteThroughPolicy.ON_COMMIT
+            if write_through_env == "on_commit"
+            else WriteThroughPolicy.ON_FREE,
         )
 
     def _extra_buffers_per_layer(
@@ -1250,6 +1297,20 @@ class KVCacheManagerV2(BaseResourceManager):
         assert len(self.kv_cache_map) == 0, (
             "get_num_free_blocks is only used when the kv cache manager is empty"
         )
+        if self._arena_enabled:
+            # Page-index bounds describe VA in arena mode; physical capacity
+            # is the page budget (§4.6). Count whole per-sequence block
+            # columns (one block in every pool group) the budget can back.
+            storage = self.impl._storage
+            arena_cfg = storage.arena_config
+            assert arena_cfg is not None
+            total_bytes = storage.gpu_page_budget.total_pages * arena_cfg.phys_page_size
+            bytes_per_block_column = sum(
+                size
+                for pg_idx in range(int(storage.num_pool_groups))
+                for size in storage.slot_size(pg_idx)
+            )
+            return total_bytes // bytes_per_block_column
         max_num_pages = max(
             [
                 self.impl.get_page_index_upper_bound(layer_id, Role.KEY)
@@ -1598,6 +1659,12 @@ class KVCacheManagerV2(BaseResourceManager):
 
     @nvtx_range("prepare_resources_kv_cache_manager_v2")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
+        if self._arena_enabled:
+            # Arena mode: unmap and recycle freed sequence ranges whose gating
+            # events completed (deferred reclaim, DESIGN.md §4.2). Growth
+            # paths also drain on demand; this keeps the page budget fresh at
+            # iteration boundaries.
+            self.impl.drain_gpu_reclaim()
         if self.is_draft:
             # Draft V2 manager: mirror the main manager by creating/resizing
             # KV caches for scheduled requests (the main V2 scheduler does not
@@ -2551,6 +2618,11 @@ class KVCacheManagerV2(BaseResourceManager):
             input_tokens,
             id=request_id,
             expected_prompt_length=expected_prompt_length,
+            # Arena mode: size the sequence's contiguous VA reservation for
+            # the per-request maximum (matches the offset-table sizing).
+            max_capacity=(
+                self.max_blocks_per_seq * self.tokens_per_block if self._arena_enabled else None
+            ),
         )
         self.kv_cache_map[request_id] = kv_cache
         if is_dummy:
