@@ -54,6 +54,7 @@ DEFAULT_TEST_TIMEOUT = 3600
 DEFAULT_SERVER_WAITING_TIMEOUT = 2100
 # Timeout for the accuracy evaluation
 DEFAULT_ACC_EVALUATION_TIMEOUT = 1500
+_TEST_INTERNAL_DISAGG_AUTH_KEY = "test-internal-disagg-auth-key"
 
 
 @functools.lru_cache(maxsize=1)
@@ -208,6 +209,16 @@ def launch_disaggregated_llm(
     # Inject into worker configs
     ctx_server_config = {**ctx_server_config, "disagg_cluster": disagg_cluster}
     gen_server_config = {**gen_server_config, "disagg_cluster": disagg_cluster}
+
+    internal_auth_key = (disaggregated_server_config.get(
+        "internal_request_auth_key")
+                         or ctx_server_config.get("internal_request_auth_key")
+                         or gen_server_config.get("internal_request_auth_key")
+                         or _TEST_INTERNAL_DISAGG_AUTH_KEY)
+    disaggregated_server_config.setdefault("internal_request_auth_key",
+                                           internal_auth_key)
+    ctx_server_config.setdefault("internal_request_auth_key", internal_auth_key)
+    gen_server_config.setdefault("internal_request_auth_key", internal_auth_key)
 
     with open(disaggregated_serving_config_path, "w") as f:
         yaml.dump(disaggregated_server_config, f)
