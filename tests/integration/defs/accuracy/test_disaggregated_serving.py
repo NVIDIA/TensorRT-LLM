@@ -210,11 +210,11 @@ def launch_disaggregated_llm(
     ctx_server_config = {**ctx_server_config, "disagg_cluster": disagg_cluster}
     gen_server_config = {**gen_server_config, "disagg_cluster": disagg_cluster}
 
-    internal_auth_key = (disaggregated_server_config.get(
-        "internal_request_auth_key")
-                         or ctx_server_config.get("internal_request_auth_key")
-                         or gen_server_config.get("internal_request_auth_key")
-                         or _TEST_INTERNAL_DISAGG_AUTH_KEY)
+    internal_auth_key = (
+        disaggregated_server_config.get("internal_request_auth_key")
+        or ctx_server_config.get("internal_request_auth_key")
+        or gen_server_config.get("internal_request_auth_key")
+        or _TEST_INTERNAL_DISAGG_AUTH_KEY)
     disaggregated_server_config.setdefault("internal_request_auth_key",
                                            internal_auth_key)
     ctx_server_config.setdefault("internal_request_auth_key", internal_auth_key)
