@@ -180,6 +180,7 @@ l0_a30:
   tests:
   - unittest/auto_deploy/singlegpu/compile
   - unittest/auto_deploy/singlegpu/custom_ops
+  - unittest/auto_deploy/singlegpu/mlir
   - unittest/auto_deploy/singlegpu/models
   - unittest/auto_deploy/singlegpu/shim
   - unittest/auto_deploy/singlegpu/smoke

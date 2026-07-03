@@ -55,6 +55,11 @@ int getEnvMmhaKernelBlockSize();
 // Whether PDL is enabled.
 bool getEnvEnablePDL();
 
+// Whether the experimental cascade attention kernel is enabled (replaces
+// masked_multihead_attention_kernel for beam-search decoding).
+// Controlled by env var TRTLLM_ENABLE_CASCADE_MMHA (default: false).
+bool getEnvEnableCascadeMmha();
+
 // Whether PDL is enabled for MoE Renormalize routing kernel.
 // Disabled by default to avoid NaN corruption (https://nvbugs/5955170).
 // Set TRTLLM_ENABLE_TRTLLMGEN_MOE_ROUTING_RENORM_PDL=1 to re-enable.

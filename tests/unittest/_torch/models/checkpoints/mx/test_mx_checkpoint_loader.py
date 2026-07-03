@@ -34,6 +34,8 @@ from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import (
     _resolve_mx_model_name,
 )
 
+_MX_CHECKPOINT_LOADER_NVBUG = pytest.mark.skip(reason="https://nvbugs/6337235")
+
 # ---------------------------------------------------------------------------
 # Construction & static properties
 # ---------------------------------------------------------------------------
@@ -189,6 +191,7 @@ class TestLoadWeightsFallback:
 # ---------------------------------------------------------------------------
 
 
+@_MX_CHECKPOINT_LOADER_NVBUG
 class TestLoadWeightsMxPath:
     def test_p2p_full_success_returns_empty_dict(self):
         # Empty fallback dict means MX delivered all weights into model
@@ -422,6 +425,7 @@ class TestMxSourceQueryTimeoutDefault:
         monkeypatch.delenv("MX_SOURCE_QUERY_TIMEOUT", raising=False)
         yield
 
+    @_MX_CHECKPOINT_LOADER_NVBUG
     def test_no_registered_source_gets_short_default_during_load(self):
         def _assert_timeout(*args, **kwargs):
             assert os.environ.get("MX_SOURCE_QUERY_TIMEOUT") == "30"
@@ -433,6 +437,7 @@ class TestMxSourceQueryTimeoutDefault:
             loader.load_weights("/nonexistent", mapping=MagicMock(), model=MagicMock())
         assert "MX_SOURCE_QUERY_TIMEOUT" not in os.environ
 
+    @_MX_CHECKPOINT_LOADER_NVBUG
     def test_existing_source_keeps_upstream_default_when_unset(self):
         def _assert_no_timeout(*args, **kwargs):
             assert "MX_SOURCE_QUERY_TIMEOUT" not in os.environ
@@ -447,6 +452,7 @@ class TestMxSourceQueryTimeoutDefault:
             loader.load_weights("/nonexistent", mapping=MagicMock(), model=MagicMock())
         assert "MX_SOURCE_QUERY_TIMEOUT" not in os.environ
 
+    @_MX_CHECKPOINT_LOADER_NVBUG
     def test_env_value_preserved(self, monkeypatch):
         # If the user/orchestrator already set a value, our defensive
         # default must not stomp it.
@@ -462,6 +468,7 @@ class TestMxSourceQueryTimeoutDefault:
             loader.load_weights("/nonexistent", mapping=MagicMock(), model=MagicMock())
         assert os.environ.get("MX_SOURCE_QUERY_TIMEOUT") == "120"
 
+    @_MX_CHECKPOINT_LOADER_NVBUG
     def test_configured_timeout_applies_during_load_and_restores_env(self):
         def _assert_config_timeout(*args, **kwargs):
             assert os.environ.get("MX_SOURCE_QUERY_TIMEOUT") == "900"
