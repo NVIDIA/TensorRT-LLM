@@ -39,6 +39,7 @@ _THOP_EXCLUDED_FIELDS: frozenset = frozenset(
         "topk_indices",  # DSA-only
         "attention_mask_data",  # custom-mask code path
         "out_scale_sf",  # promoted into ``out_scale`` in ``TrtllmAttention.forward`` for NVFP4 path
+        "skip_mla_rope_generation",  # handled in ``TrtllmAttention.forward`` for the test-only MLA path
     }
 )
 
