@@ -295,6 +295,127 @@ class FilteredTopKKernelVarlen:
         cute.arch.barrier()
 
     @cute.jit
+    def _filter_and_histogram_per_elem_coarse(
+        self,
+        bin_val,
+        threshold_bin,
+        idx,
+        raw_input,
+        s_counter,
+        s_indices,
+        s_input_idx,
+        s_num_input,
+        s_histogram,
+        val_one,
+        g_num_input,
+        buffer,
+    ):
+        """Per-element if/elif handler for the coarse filter pass.
+
+        bin_val < threshold_bin  → write to s_indices.
+        bin_val == threshold_bin → store to s_input_idx (+ optional buffer) and
+                                   update s_histogram for the next refinement round.
+        """
+        if bin_val < threshold_bin:
+            pos = atomicAdd(s_counter.iterator, val_one)
+            s_indices[pos] = idx
+        elif bin_val == threshold_bin:
+            if cutlass.const_expr(self.enable_gmem_store):
+                pos = atomicAdd(s_num_input.iterator, val_one)
+                if pos < self.filtered_topk_smem_input_size:
+                    s_input_idx[0, pos] = idx
+                else:
+                    buffer_pos = atomicAdd(g_num_input.iterator, val_one)
+                    buffer[0, buffer_pos] = cutlass.Int32(cutlass.Uint32(idx))
+                ordered = self.to_ordered(raw_input)
+                sub_bin = (ordered >> self.first_refine_shift) & 0xFF
+                atomicAdd(s_histogram.iterator + cutlass.Int32(sub_bin), val_one)
+            elif cutlass.const_expr(self.enable_truncate):
+                if cutlass.const_expr(self.dtype == cutlass.Float32):
+                    ordered = cutlass.Uint32(0)
+                    sub_bin = cutlass.Uint32(0)
+                else:
+                    ordered = cutlass.Uint16(0)
+                    sub_bin = cutlass.Int32(0)
+                pos = atomicAdd(s_num_input.iterator, val_one)
+                if pos < self.filtered_topk_smem_input_size:
+                    s_input_idx[0, pos] = idx
+                    ordered = self.to_ordered(raw_input)
+                    sub_bin = (ordered >> self.first_refine_shift) & 0xFF
+                    atomicAdd(s_histogram.iterator + cutlass.Int32(sub_bin), val_one)
+            else:
+                pos = atomicAdd(s_num_input.iterator, val_one)
+                if pos < self.filtered_topk_smem_input_size:
+                    s_input_idx[0, pos] = idx
+                ordered = self.to_ordered(raw_input)
+                sub_bin = (ordered >> self.first_refine_shift) & 0xFF
+                atomicAdd(s_histogram.iterator + cutlass.Int32(sub_bin), val_one)
+
+    @cute.jit
+    def _filter_and_histogram_per_elem_refine(
+        self,
+        bin_val,
+        threshold,
+        idx_int32,
+        idx,
+        raw_input,
+        offset,
+        r_idx,
+        is_last_round,
+        s_counter,
+        s_indices,
+        s_input_idx,
+        s_num_input,
+        s_histogram,
+        s_last_remain,
+        val_one,
+        val_one_negative,
+        g_num_input,
+        buffer,
+    ):
+        """Per-element if/elif handler for refinement rounds.
+
+        idx_int32  – Int32 column index, used for score lookup and buffer writes.
+        idx        – self.index_type version, used for s_indices / s_input_idx writes.
+
+        bin_val < threshold  → write to s_indices.
+        bin_val == threshold → last round: s_last_remain countdown;
+                               otherwise: store to s_input_idx[r_idx^1] (+ optional
+                               buffer) and update s_histogram for the next round.
+        """
+        if bin_val < threshold:
+            pos = atomicAdd(s_counter.iterator, val_one)
+            s_indices[pos] = idx
+        elif bin_val == threshold:
+            if is_last_round:
+                cur_pos = atomicAdd(s_last_remain.iterator, val_one_negative)
+                if cur_pos > 0:
+                    s_indices[self.top_k - cur_pos] = idx
+            else:
+                cur_pos = atomicAdd(s_num_input.iterator + (r_idx ^ 1), val_one)
+                if cutlass.const_expr(self.enable_gmem_store):
+                    if cur_pos < self.filtered_topk_smem_input_size:
+                        s_input_idx[r_idx ^ 1, cur_pos] = idx
+                    else:
+                        buffer_pos = atomicAdd(g_num_input.iterator + (r_idx ^ 1), val_one)
+                        buffer[r_idx ^ 1, buffer_pos] = idx_int32
+                    bin32 = self.to_ordered(raw_input)
+                    sub_bin = (bin32 >> (offset - 8)) & 0xFF
+                    atomicAdd(s_histogram.iterator + cutlass.Int32(sub_bin), val_one)
+                else:
+                    if cutlass.const_expr(self.dtype == cutlass.Float32):
+                        bin32 = cutlass.Uint32(0)
+                        sub_bin = cutlass.Uint32(0)
+                    else:
+                        bin32 = cutlass.Uint16(0)
+                        sub_bin = cutlass.Int32(0)
+                    if cur_pos < self.filtered_topk_smem_input_size:
+                        s_input_idx[r_idx ^ 1, cur_pos] = idx
+                        bin32 = self.to_ordered(raw_input)
+                        sub_bin = (bin32 >> (offset - 8)) & 0xFF
+                        atomicAdd(s_histogram.iterator + cutlass.Int32(sub_bin), val_one)
+
+    @cute.jit
     def prefix_sum_and_find_threshold_coarse(
         self,
         tidx,
@@ -602,7 +723,7 @@ class FilteredTopKKernelVarlen:
                 s_histogram[_hi] = 0
             cute.arch.barrier()
 
-            # 1.1 Build histogram: GVR-style, loop bound = runtime aligned_size.
+            # 1.1 Build histogram
             ic = tidx * cutlass.Int32(vec_size)
             while ic + cutlass.Int32(vec_size - 1) < aligned_size:
                 cute.copy(
@@ -713,52 +834,20 @@ class FilteredTopKKernelVarlen:
                         raw_input = scan_frag[j]
                         bin_val = self.to_coarse_key(raw_input)
                         idx = self.index_type(vec_start + ic + cutlass.Int32(j))
-                        if bin_val < threshold_bin:
-                            pos = atomicAdd(s_counter.iterator, val_one)
-                            s_indices[pos] = idx
-                        elif bin_val == threshold_bin:
-                            if cutlass.const_expr(self.enable_gmem_store):
-                                pos = atomicAdd(s_num_input.iterator, val_one)
-                                if pos < self.filtered_topk_smem_input_size:
-                                    s_input_idx[0, pos] = idx
-                                else:
-                                    buffer_pos = atomicAdd(
-                                        g_num_input.iterator,
-                                        val_one,
-                                    )
-                                    buffer[0, buffer_pos] = cutlass.Int32(cutlass.Uint32(idx))
-                                ordered = self.to_ordered(raw_input)
-                                sub_bin = (ordered >> self.first_refine_shift) & 0xFF
-                                atomicAdd(
-                                    s_histogram.iterator + cutlass.Int32(sub_bin),
-                                    val_one,
-                                )
-                            elif cutlass.const_expr(self.enable_truncate):
-                                if cutlass.const_expr(self.dtype == cutlass.Float32):
-                                    ordered = cutlass.Uint32(0)
-                                    sub_bin = cutlass.Uint32(0)
-                                else:
-                                    ordered = cutlass.Uint16(0)
-                                    sub_bin = cutlass.Int32(0)
-                                pos = atomicAdd(s_num_input.iterator, val_one)
-                                if pos < self.filtered_topk_smem_input_size:
-                                    s_input_idx[0, pos] = idx
-                                    ordered = self.to_ordered(raw_input)
-                                    sub_bin = (ordered >> self.first_refine_shift) & 0xFF
-                                    atomicAdd(
-                                        s_histogram.iterator + cutlass.Int32(sub_bin),
-                                        val_one,
-                                    )
-                            else:
-                                pos = atomicAdd(s_num_input.iterator, val_one)
-                                if pos < self.filtered_topk_smem_input_size:
-                                    s_input_idx[0, pos] = idx
-                                ordered = self.to_ordered(raw_input)
-                                sub_bin = (ordered >> self.first_refine_shift) & 0xFF
-                                atomicAdd(
-                                    s_histogram.iterator + cutlass.Int32(sub_bin),
-                                    val_one,
-                                )
+                        self._filter_and_histogram_per_elem_coarse(
+                            bin_val,
+                            threshold_bin,
+                            idx,
+                            raw_input,
+                            s_counter,
+                            s_indices,
+                            s_input_idx,
+                            s_num_input,
+                            s_histogram,
+                            val_one,
+                            g_num_input,
+                            buffer,
+                        )
                     ic = ic + cutlass.Int32(_step_vec)
 
                 # for initial scalar load part.
@@ -766,118 +855,42 @@ class FilteredTopKKernelVarlen:
                     col_idx = cutlass.Int32(row_start + j)
                     raw = score[col_idx]
                     bin_val = self.to_coarse_key(raw)
-                    if bin_val < threshold_bin:
-                        pos = atomicAdd(s_counter.iterator, val_one)
-                        idx = self.index_type(col_idx)
-                        s_indices[pos] = idx
-                    elif bin_val == threshold_bin:
-                        if cutlass.const_expr(self.enable_gmem_store):
-                            pos = atomicAdd(s_num_input.iterator, val_one)
-                            if pos < self.filtered_topk_smem_input_size:
-                                s_input_idx[0, pos] = self.index_type(col_idx)
-                            else:
-                                buffer_pos = atomicAdd(
-                                    g_num_input.iterator,
-                                    val_one,
-                                )
-                                buffer[0, buffer_pos] = cutlass.Int32(col_idx)
-                            ordered = self.to_ordered(raw)
-                            sub_bin = (ordered >> self.first_refine_shift) & 0xFF
-                            atomicAdd(
-                                s_histogram.iterator + cutlass.Int32(sub_bin),
-                                val_one,
-                            )
-                        elif cutlass.const_expr(self.enable_truncate):
-                            if cutlass.const_expr(self.dtype == cutlass.Float32):
-                                ordered = cutlass.Uint32(0)
-                                sub_bin = cutlass.Uint32(0)
-                            else:
-                                ordered = cutlass.Uint16(0)
-                                sub_bin = cutlass.Int32(0)
-                            pos = atomicAdd(s_num_input.iterator, val_one)
-                            if pos < self.filtered_topk_smem_input_size:
-                                s_input_idx[0, pos] = self.index_type(col_idx)
-                                ordered = self.to_ordered(raw)
-                                sub_bin = (ordered >> self.first_refine_shift) & 0xFF
-                                atomicAdd(
-                                    s_histogram.iterator + cutlass.Int32(sub_bin),
-                                    val_one,
-                                )
-                        else:
-                            if cutlass.const_expr(self.dtype == cutlass.Float32):
-                                ordered = cutlass.Uint32(0)
-                                sub_bin = cutlass.Uint32(0)
-                            else:
-                                ordered = cutlass.Uint16(0)
-                                sub_bin = cutlass.Int32(0)
-                            pos = atomicAdd(s_num_input.iterator, val_one)
-                            if pos < self.filtered_topk_smem_input_size:
-                                s_input_idx[0, pos] = self.index_type(col_idx)
-                                ordered = self.to_ordered(raw)
-                                sub_bin = (ordered >> self.first_refine_shift) & 0xFF
-                                atomicAdd(
-                                    s_histogram.iterator + cutlass.Int32(sub_bin),
-                                    val_one,
-                                )
+                    idx = self.index_type(col_idx)
+                    self._filter_and_histogram_per_elem_coarse(
+                        bin_val,
+                        threshold_bin,
+                        idx,
+                        raw,
+                        s_counter,
+                        s_indices,
+                        s_input_idx,
+                        s_num_input,
+                        s_histogram,
+                        val_one,
+                        g_num_input,
+                        buffer,
+                    )
 
                 # for left part
                 for j in range(tidx, left_size, self.num_threads_per_cta):
                     col_idx = cutlass.Int32(left_start + j)
                     raw = score[col_idx]
                     bin_val = self.to_coarse_key(raw)
-                    if bin_val < threshold_bin:
-                        pos = atomicAdd(s_counter.iterator, val_one)
-                        idx = self.index_type(col_idx)
-                        s_indices[pos] = idx
-                    elif bin_val == threshold_bin:
-                        if cutlass.const_expr(self.enable_gmem_store):
-                            pos = atomicAdd(s_num_input.iterator, val_one)
-                            if pos < self.filtered_topk_smem_input_size:
-                                s_input_idx[0, pos] = self.index_type(col_idx)
-                            else:
-                                buffer_pos = atomicAdd(
-                                    g_num_input.iterator,
-                                    val_one,
-                                )
-                                buffer[0, buffer_pos] = cutlass.Int32(col_idx)
-                            ordered = self.to_ordered(raw)
-                            sub_bin = (ordered >> self.first_refine_shift) & 0xFF
-                            atomicAdd(
-                                s_histogram.iterator + cutlass.Int32(sub_bin),
-                                val_one,
-                            )
-                        elif cutlass.const_expr(self.enable_truncate):
-                            if cutlass.const_expr(self.dtype == cutlass.Float32):
-                                ordered = cutlass.Uint32(0)
-                                sub_bin = cutlass.Uint32(0)
-                            else:
-                                ordered = cutlass.Uint16(0)
-                                sub_bin = cutlass.Int32(0)
-                            pos = atomicAdd(s_num_input.iterator, val_one)
-                            if pos < self.filtered_topk_smem_input_size:
-                                s_input_idx[0, pos] = self.index_type(col_idx)
-                                ordered = self.to_ordered(raw)
-                                sub_bin = (ordered >> self.first_refine_shift) & 0xFF
-                                atomicAdd(
-                                    s_histogram.iterator + cutlass.Int32(sub_bin),
-                                    val_one,
-                                )
-                        else:
-                            if cutlass.const_expr(self.dtype == cutlass.Float32):
-                                ordered = cutlass.Uint32(0)
-                                sub_bin = cutlass.Uint32(0)
-                            else:
-                                ordered = cutlass.Uint16(0)
-                                sub_bin = cutlass.Int32(0)
-                            pos = atomicAdd(s_num_input.iterator, val_one)
-                            if pos < self.filtered_topk_smem_input_size:
-                                s_input_idx[0, pos] = self.index_type(col_idx)
-                                ordered = self.to_ordered(raw)
-                                sub_bin = (ordered >> self.first_refine_shift) & 0xFF
-                                atomicAdd(
-                                    s_histogram.iterator + cutlass.Int32(sub_bin),
-                                    val_one,
-                                )
+                    idx = self.index_type(col_idx)
+                    self._filter_and_histogram_per_elem_coarse(
+                        bin_val,
+                        threshold_bin,
+                        idx,
+                        raw,
+                        s_counter,
+                        s_indices,
+                        s_input_idx,
+                        s_num_input,
+                        s_histogram,
+                        val_one,
+                        g_num_input,
+                        buffer,
+                    )
                 fence_acq_rel_cta()
                 cute.arch.barrier()
 
@@ -936,63 +949,31 @@ class FilteredTopKKernelVarlen:
 
                             # Filter and build next round histogram.
                             for i in range(tidx, num_input, self.num_threads_per_cta):
-                                idx = s_input_idx[r_idx, i]
-                                idx_int32 = cutlass.Int32(cutlass.Uint32(idx))
+                                idx_tmp = s_input_idx[r_idx, i]
+                                idx_int32 = cutlass.Int32(cutlass.Uint32(idx_tmp))
                                 raw_input = score[idx_int32]
                                 idx = self.index_type(idx_int32)
                                 bin_val = (self.to_ordered(raw_input) >> offset) & 0xFF
-                                if bin_val < threshold:
-                                    pos = atomicAdd(s_counter.iterator, val_one)
-                                    s_indices[pos] = idx
-                                elif bin_val == threshold:
-                                    if is_last_round:
-                                        cur_pos = atomicAdd(
-                                            s_last_remain.iterator,
-                                            val_one_negative,
-                                        )
-                                        if cur_pos > 0:
-                                            s_indices[self.top_k - cur_pos] = idx
-                                    else:
-                                        # pos = atomicAdd(s_num_input[r_idx ^ 1], 1)
-                                        cur_pos = atomicAdd(
-                                            s_num_input.iterator + (r_idx ^ 1),
-                                            val_one,
-                                        )
-                                        # TODO: remove this if logic for gmem store?
-                                        # num_input < filter_topk_smem_input_size
-                                        if cutlass.const_expr(self.enable_gmem_store):
-                                            if cur_pos < self.filtered_topk_smem_input_size:
-                                                s_input_idx[r_idx ^ 1, cur_pos] = idx
-                                            else:
-                                                buffer_pos = atomicAdd(
-                                                    g_num_input.iterator + (r_idx ^ 1),
-                                                    val_one,
-                                                )
-                                                buffer[r_idx ^ 1, buffer_pos] = idx_int32
-                                            bin32 = self.to_ordered(raw_input)
-                                            sub_bin = (bin32 >> (offset - 8)) & 0xFF
-                                            # atomicAdd(s_histogram[sub_bin], 1)
-                                            atomicAdd(
-                                                s_histogram.iterator + cutlass.Int32(sub_bin),
-                                                val_one,
-                                            )
-                                        else:
-                                            # TODO: how to handle the type of sub_bin and bin32?
-                                            if cutlass.const_expr(self.dtype == cutlass.Float32):
-                                                bin32 = cutlass.Uint32(0)
-                                                sub_bin = cutlass.Uint32(0)
-                                            else:
-                                                bin32 = cutlass.Uint16(0)
-                                                sub_bin = cutlass.Int32(0)
-                                            if cur_pos < self.filtered_topk_smem_input_size:
-                                                s_input_idx[r_idx ^ 1, cur_pos] = idx
-                                                bin32 = self.to_ordered(raw_input)
-                                                sub_bin = (bin32 >> (offset - 8)) & 0xFF
-                                                # atomicAdd(s_histogram[sub_bin], 1)
-                                                atomicAdd(
-                                                    s_histogram.iterator + cutlass.Int32(sub_bin),
-                                                    val_one,
-                                                )
+                                self._filter_and_histogram_per_elem_refine(
+                                    bin_val,
+                                    threshold,
+                                    idx_int32,
+                                    idx,
+                                    raw_input,
+                                    offset,
+                                    r_idx,
+                                    is_last_round,
+                                    s_counter,
+                                    s_indices,
+                                    s_input_idx,
+                                    s_num_input,
+                                    s_histogram,
+                                    s_last_remain,
+                                    val_one,
+                                    val_one_negative,
+                                    g_num_input,
+                                    buffer,
+                                )
 
                             cute.arch.barrier()
                             if cutlass.const_expr(self.enable_gmem_store):
@@ -1001,61 +982,30 @@ class FilteredTopKKernelVarlen:
                                     cur_g_num_input,
                                     self.num_threads_per_cta,
                                 ):
-                                    # int32
-                                    idx = buffer[r_idx, i]
-                                    raw_input = score[idx]
+                                    idx_int32 = buffer[r_idx, i]
+                                    raw_input = score[idx_int32]
+                                    idx = self.index_type(idx_int32)
                                     bin_val = (self.to_ordered(raw_input) >> offset) & 0xFF
-                                    if bin_val < threshold:
-                                        pos = atomicAdd(
-                                            s_counter.iterator,
-                                            val_one,
-                                        )
-                                        s_indices[pos] = self.index_type(idx)
-                                    elif bin_val == threshold:
-                                        if is_last_round:
-                                            cur_pos = atomicAdd(
-                                                s_last_remain.iterator,
-                                                val_one_negative,
-                                            )
-                                            if cur_pos > 0:
-                                                s_indices[self.top_k - cur_pos] = self.index_type(
-                                                    idx
-                                                )
-                                        else:
-                                            # pos = atomicAdd(s_num_input[r_idx ^ 1], 1)
-                                            cur_pos = atomicAdd(
-                                                s_num_input.iterator + (r_idx ^ 1),
-                                                val_one,
-                                            )
-                                            if cutlass.const_expr(self.enable_gmem_store):
-                                                if cur_pos < self.filtered_topk_smem_input_size:
-                                                    s_input_idx[r_idx ^ 1, cur_pos] = (
-                                                        self.index_type(idx)
-                                                    )
-                                                else:
-                                                    buffer_pos = atomicAdd(
-                                                        g_num_input.iterator + (r_idx ^ 1),
-                                                        val_one,
-                                                    )
-                                                    buffer[r_idx ^ 1, buffer_pos] = idx
-                                                bin32 = self.to_ordered(raw_input)
-                                                sub_bin = (bin32 >> (offset - 8)) & 0xFF
-                                                # atomicAdd(s_histogram[sub_bin], 1)
-                                                atomicAdd(
-                                                    s_histogram.iterator + cutlass.Int32(sub_bin),
-                                                    val_one,
-                                                )
-                                            else:
-                                                if cur_pos < self.filtered_topk_smem_input_size:
-                                                    s_input_idx[r_idx ^ 1, cur_pos] = idx
-                                                    bin32 = self.to_ordered(raw_input)
-                                                    sub_bin = (bin32 >> (offset - 8)) & 0xFF
-                                                    # atomicAdd(s_histogram[sub_bin], 1)
-                                                    atomicAdd(
-                                                        s_histogram.iterator
-                                                        + cutlass.Int32(sub_bin),
-                                                        val_one,
-                                                    )
+                                    self._filter_and_histogram_per_elem_refine(
+                                        bin_val,
+                                        threshold,
+                                        idx_int32,
+                                        idx,
+                                        raw_input,
+                                        offset,
+                                        r_idx,
+                                        is_last_round,
+                                        s_counter,
+                                        s_indices,
+                                        s_input_idx,
+                                        s_num_input,
+                                        s_histogram,
+                                        s_last_remain,
+                                        val_one,
+                                        val_one_negative,
+                                        g_num_input,
+                                        buffer,
+                                    )
                             fence_acq_rel_cta()
                             cute.arch.barrier()
 
