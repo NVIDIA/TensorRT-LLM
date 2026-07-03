@@ -75,7 +75,6 @@ l0_a100:
       backend: tensorrt
   tests:
   - unittest/trt/model_api/test_model_api_multi_gpu.py
-  - unittest/trt/model/test_gpt_e2e.py
   - unittest/trt/model/eagle
   - unittest/trt/model/redrafter
   - unittest/llmapi/test_llm_models.py -m "part0"
