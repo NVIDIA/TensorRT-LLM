@@ -287,6 +287,8 @@ examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-
 examples/test_whisper.py::test_whisper_beam_search_generation_logits[large-v3-nb:4] SKIP (TRTLLM-13781: legacy TensorRT examples removed; tests to be removed in follow-up PR3)
 examples/test_whisper.py::test_whisper_log_probs_determinism[large-v3-bs:4-nb:4] SKIP (TRTLLM-13781: legacy TensorRT examples removed; tests to be removed in follow-up PR3)
 examples/visual_gen/test_visual_gen.py::test_cosmos3_nano_t2v_lpips_against_golden SKIP (https://nvbugs/6410082)
+examples/visual_gen/test_visual_gen.py::test_ltx2_lpips_against_golden SKIP (https://nvbugs/6410332)
+examples/visual_gen/test_visual_gen.py::test_wan21_t2v_lpips_against_golden SKIP (https://nvbugs/6410336)
 examples/visual_gen/test_visual_gen.py::test_wan22_t2v_lpips_against_golden SKIP (https://nvbugs/6401921)
 examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[attn2d_2x2] SKIP (https://nvbugs/6272644)
 examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[cfg2_ulysses2] SKIP (https://nvbugs/6272644)
