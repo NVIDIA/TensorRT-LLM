@@ -42,6 +42,7 @@ class _StatsRequest:
     tokens: list[int]
     context_remaining_length: int
     py_request_id: int = field(init=False)
+    py_beam_width: int = 1
     lora_task_id: int | None = None
     cache_salt: str | None = None
     cache_salt_id: int | None = None

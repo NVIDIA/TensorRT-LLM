@@ -33,6 +33,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         DEFAULT_BEAM_INDEX,
         AttentionLayerConfig,
         BatchDesc,
+        BeamIndex,
         BufferConfig,
         BufferId,
         CacheLevel,
@@ -86,6 +87,7 @@ else:
         DEFAULT_BEAM_INDEX,
         AttentionLayerConfig,
         BatchDesc,
+        BeamIndex,
         BufferConfig,
         BufferId,
         CacheLevel,
@@ -147,7 +149,7 @@ from parameterized import parameterized
 
 with temporary_sys_path(os.path.dirname(os.path.abspath(__file__))):
     from fake_engine import FakeEngine, Role, Step
-    from kernels import enable_kernel_delay
+    from kernels import check_values, enable_kernel_delay
 
 seed = int.from_bytes(os.urandom(8), "little")
 print(f"seed: {seed}")
@@ -334,12 +336,448 @@ class TestKVCacheManagerV2(unittest.TestCase):
         self.manager = KVCacheManager(self.cfg)
 
 
+class TestPartialReuseGuard(TestKVCacheManagerV2):
+    def _commit_prompt(self, prompt: list[TokenIdExt], stream: CudaStream) -> _KVCache:
+        kv_cache = self.manager.create_kv_cache(None, None, expected_prompt_length=len(prompt))
+        kv_cache.cuda_stream = stream
+        assert kv_cache.resume(stream)
+        assert kv_cache.resize(len(prompt))
+        kv_cache.commit(prompt)
+        kv_cache.stop_committing()
+        return kv_cache
+
+    def test_partial_reuse_gate(self) -> None:
+        tokens_per_block = 4
+        self.prepare(
+            128 << 20,
+            0,
+            0,
+            1,
+            128,
+            0,
+            tokens_per_block=tokens_per_block,
+        )
+        published_prompt = [self.next_token() for _ in range(tokens_per_block + 2)]
+        unpublished_prompt = published_prompt[:tokens_per_block] + [
+            self.next_token(),
+            self.next_token(),
+        ]
+
+        with TemporaryCudaStream([]) as stream:
+            cuda_stream = cast(CudaStream, stream.handle)
+            producer = self._commit_prompt(published_prompt, cuda_stream)
+            assert self.manager.enable_partial_match
+            assert self.manager.enable_partial_commit
+
+            partial_consumer = self.manager.create_kv_cache(None, published_prompt)
+            assert partial_consumer.num_committed_tokens == len(published_prompt)
+
+            self.manager._init_config.enable_partial_match = False
+            partial_consumer.close()
+            exact_consumer = self.manager.create_kv_cache(None, published_prompt)
+            assert exact_consumer.num_committed_tokens == len(published_prompt)
+            assert exact_consumer.history_length == len(published_prompt)
+            exact_consumer.close()
+
+            self.manager._init_config.enable_partial_commit = False
+            partial_producer = self.manager.create_kv_cache(None, unpublished_prompt)
+            partial_producer.cuda_stream = cuda_stream
+            assert partial_producer.num_committed_tokens == tokens_per_block
+            assert partial_producer.resume(cuda_stream)
+            assert partial_producer.resize(len(unpublished_prompt))
+            partial_producer.commit(unpublished_prompt[tokens_per_block:])
+            partial_producer.stop_committing()
+            assert partial_producer.num_committed_tokens == len(unpublished_prompt)
+            assert partial_producer.history_length == len(unpublished_prompt)
+            assert (
+                partial_producer._num_committed_blocks
+                == len(unpublished_prompt) // tokens_per_block
+            )
+
+            self.manager._init_config.enable_partial_commit = True
+            unpublished_consumer = self.manager.create_kv_cache(None, unpublished_prompt)
+            assert unpublished_consumer.num_committed_tokens == tokens_per_block
+
+            unpublished_consumer.close()
+            partial_producer.close()
+            producer.close()
+        stream.take_finish_event().synchronize()
+
+
 class TestNoBatching(TestKVCacheManagerV2):
     class Request(NamedTuple):
         id: int
         kv_cache: _KVCache
         prompt: list[TokenIdExt]
         decode_len: int
+
+    def disable_partial_commit(self) -> None:
+        self.manager._init_config.enable_partial_commit = False
+        assert not self.manager.enable_partial_commit
+
+    def check_block_token_sources(
+        self,
+        kv_cache: _KVCache,
+        beam: BeamIndex,
+        block_ordinal: int,
+        tokens: list[TokenIdExt],
+        source_beam: int,
+    ) -> None:
+        manager = kv_cache.manager
+        stream = kv_cache.cuda_stream
+        for layer_id, layer_cfg in self.engine.layers.items():
+            if isinstance(layer_cfg, SsmLayerConfig):
+                continue
+            lc_id = manager._storage._layer_to_life_cycle_ids[layer_id]
+            base_pages = kv_cache.get_base_page_indices(lc_id, beam)
+            base_page = base_pages[block_ordinal]
+            assert base_page != BAD_PAGE_INDEX
+            for buf_id, buf in enumerate(layer_cfg.buffers):
+                tokens_per_block = self.engine.tokens_per_block_map[layer_id][buf_id]
+                token_bytes = exact_div(buf.size, tokens_per_block)
+                head_bytes = exact_div(token_bytes, self.engine.num_heads)
+                pool = manager.get_mem_pool_base_address(layer_id, buf.role)
+                stride = manager.get_page_stride(layer_id, buf.role)
+                page_converter = manager.get_page_index_converter(layer_id, buf.role)
+                converted_pages = page_converter(base_pages)
+                begin = block_ordinal * page_converter.expansion
+                end = begin + page_converter.expansion
+                for page in converted_pages[begin:end]:
+                    check_values(
+                        MemAddress(pool + stride * page),
+                        head_bytes,
+                        self.engine.num_heads,
+                        tokens_per_block,
+                        layer_id,
+                        buf_id,
+                        source_beam,
+                        tokens,
+                        stream,
+                    )
+
+    def make_context_kv_cache(
+        self, prompt_len: int, tokens_per_block: int, stream: CudaStream
+    ) -> tuple[_KVCache, list[TokenIdExt]]:
+        self.prepare(
+            128 << 20,
+            0,
+            0,
+            1,
+            128,
+            0,
+            tokens_per_block=tokens_per_block,
+        )
+        prompt = [self.next_token() for _ in range(prompt_len)]
+        kv_cache = self.manager.create_kv_cache(None, None, expected_prompt_length=prompt_len)
+        kv_cache.cuda_stream = stream
+        assert kv_cache.resume(stream)
+        kv_cache.stop_committing()
+        assert kv_cache.resize(prompt_len)
+        self.engine.execute([Step(kv_cache, prompt, [])], stream)
+        assert kv_cache.resize(None, prompt_len)
+        return kv_cache, prompt
+
+    def make_unfinalized_context_kv_cache(
+        self, prompt_len: int, tokens_per_block: int, stream: CudaStream
+    ) -> tuple[_KVCache, list[TokenIdExt]]:
+        self.prepare(
+            128 << 20,
+            0,
+            0,
+            1,
+            128,
+            0,
+            tokens_per_block=tokens_per_block,
+        )
+        prompt = [self.next_token() for _ in range(prompt_len)]
+        kv_cache = self.manager.create_kv_cache(None, None, expected_prompt_length=prompt_len)
+        kv_cache.cuda_stream = stream
+        assert kv_cache.resume(stream)
+        kv_cache.stop_committing()
+        assert kv_cache.resize(prompt_len)
+        self.engine.execute([Step(kv_cache, prompt, [])], stream)
+        assert kv_cache.history_length == 0
+        return kv_cache, prompt
+
+    def test_beam_full_unmapped(self) -> None:
+        tokens_per_block = 4
+        with TemporaryCudaStream([]) as stream:
+            cuda_stream = cast(CudaStream, stream.handle)
+            kv_cache, _ = self.make_context_kv_cache(
+                prompt_len=2 * tokens_per_block,
+                tokens_per_block=tokens_per_block,
+                stream=cuda_stream,
+            )
+            self.disable_partial_commit()
+
+            kv_cache.beam_width = BeamIndex(2)
+
+            for ordinal in range(2):
+                assert len(kv_cache._blocks[ordinal].pages) == 1
+                beam0_page = kv_cache.get_base_page_indices(LayerGroupId(0), BeamIndex(0))[ordinal]
+                beam1_page = kv_cache.get_base_page_indices(LayerGroupId(0), BeamIndex(1))[ordinal]
+                assert beam0_page != BAD_PAGE_INDEX
+                assert beam1_page == BAD_PAGE_INDEX
+            assert list(kv_cache.get_aggregated_page_indices(LayerGroupId(0), BeamIndex(1))) == [
+                BAD_PAGE_INDEX,
+                BAD_PAGE_INDEX,
+            ]
+            assert (
+                list(
+                    kv_cache.get_aggregated_page_indices(
+                        LayerGroupId(0), BeamIndex(1), valid_only=True
+                    )
+                )
+                == []
+            )
+
+            assert kv_cache.resize(kv_cache.capacity + 1)
+            beam0_gen_page = kv_cache.get_base_page_indices(LayerGroupId(0), BeamIndex(0))[2]
+            beam1_gen_page = kv_cache.get_base_page_indices(LayerGroupId(0), BeamIndex(1))[2]
+            assert beam0_gen_page != BAD_PAGE_INDEX
+            assert beam1_gen_page != BAD_PAGE_INDEX
+            assert beam0_gen_page != beam1_gen_page
+        stream.take_finish_event().synchronize()
+
+    def test_beam_expected_prompt_unmapped_without_history_update(self) -> None:
+        tokens_per_block = 4
+        with TemporaryCudaStream([]) as stream:
+            cuda_stream = cast(CudaStream, stream.handle)
+            prompt_len = 2 * tokens_per_block
+            kv_cache, _ = self.make_unfinalized_context_kv_cache(
+                prompt_len=prompt_len,
+                tokens_per_block=tokens_per_block,
+                stream=cuda_stream,
+            )
+            self.disable_partial_commit()
+
+            kv_cache.beam_width = BeamIndex(2)
+
+            assert kv_cache.history_length == 0
+            for ordinal in range(2):
+                assert len(kv_cache._blocks[ordinal].pages) == 1
+                beam0_page = kv_cache.get_base_page_indices(LayerGroupId(0), BeamIndex(0))[ordinal]
+                beam1_page = kv_cache.get_base_page_indices(LayerGroupId(0), BeamIndex(1))[ordinal]
+                assert beam0_page != BAD_PAGE_INDEX
+                assert beam1_page == BAD_PAGE_INDEX
+
+            assert kv_cache.resize(kv_cache.capacity + 1)
+            beam0_gen_page = kv_cache.get_base_page_indices(LayerGroupId(0), BeamIndex(0))[2]
+            beam1_gen_page = kv_cache.get_base_page_indices(LayerGroupId(0), BeamIndex(1))[2]
+            assert beam0_gen_page != BAD_PAGE_INDEX
+            assert beam1_gen_page != BAD_PAGE_INDEX
+            assert beam0_gen_page != beam1_gen_page
+        stream.take_finish_event().synchronize()
+
+    def test_beam_tail_copy(self) -> None:
+        tokens_per_block = 4
+        with TemporaryCudaStream([]) as stream:
+            cuda_stream = cast(CudaStream, stream.handle)
+            kv_cache, prompt = self.make_context_kv_cache(
+                prompt_len=tokens_per_block + 2,
+                tokens_per_block=tokens_per_block,
+                stream=cuda_stream,
+            )
+            self.disable_partial_commit()
+
+            kv_cache.beam_width = BeamIndex(2)
+
+            beam0_full_page = kv_cache.get_base_page_indices(LayerGroupId(0), BeamIndex(0))[0]
+            beam1_full_page = kv_cache.get_base_page_indices(LayerGroupId(0), BeamIndex(1))[0]
+            assert beam0_full_page != BAD_PAGE_INDEX
+            assert beam1_full_page == BAD_PAGE_INDEX
+
+            beam0_tail_page = kv_cache.get_base_page_indices(LayerGroupId(0), BeamIndex(0))[1]
+            beam1_tail_page = kv_cache.get_base_page_indices(LayerGroupId(0), BeamIndex(1))[1]
+            assert beam0_tail_page != BAD_PAGE_INDEX
+            assert beam1_tail_page != BAD_PAGE_INDEX
+            assert beam0_tail_page != beam1_tail_page
+            self.check_block_token_sources(
+                kv_cache,
+                BeamIndex(1),
+                1,
+                prompt[tokens_per_block:],
+                source_beam=0,
+            )
+        stream.take_finish_event().synchronize()
+
+    def test_beam_full_after_history_copy(self) -> None:
+        tokens_per_block = 4
+        with TemporaryCudaStream([]) as stream:
+            cuda_stream = cast(CudaStream, stream.handle)
+            self.prepare(
+                128 << 20,
+                0,
+                0,
+                1,
+                128,
+                0,
+                tokens_per_block=tokens_per_block,
+            )
+            history = [self.next_token() for _ in range(tokens_per_block)]
+            input_tokens = [self.next_token() for _ in range(tokens_per_block)]
+            kv_cache = self.manager.create_kv_cache(None, None, expected_prompt_length=len(history))
+            kv_cache.cuda_stream = cuda_stream
+            assert kv_cache.resume(cuda_stream)
+            assert kv_cache.resize(len(history))
+            self.engine.execute([Step(kv_cache, history, [])], cuda_stream)
+            assert kv_cache.resize(None, len(history))
+            assert kv_cache.resize(len(history) + len(input_tokens))
+            self.engine.execute([Step(kv_cache, input_tokens, history)], cuda_stream)
+            self.disable_partial_commit()
+
+            kv_cache.beam_width = BeamIndex(2)
+
+            beam0_history_page = kv_cache.get_base_page_indices(LayerGroupId(0), BeamIndex(0))[0]
+            beam1_history_page = kv_cache.get_base_page_indices(LayerGroupId(0), BeamIndex(1))[0]
+            assert beam0_history_page != BAD_PAGE_INDEX
+            assert beam1_history_page == BAD_PAGE_INDEX
+
+            beam0_live_page = kv_cache.get_base_page_indices(LayerGroupId(0), BeamIndex(0))[1]
+            beam1_live_page = kv_cache.get_base_page_indices(LayerGroupId(0), BeamIndex(1))[1]
+            assert beam0_live_page != BAD_PAGE_INDEX
+            assert beam1_live_page != BAD_PAGE_INDEX
+            assert beam0_live_page != beam1_live_page
+            self.check_block_token_sources(
+                kv_cache,
+                BeamIndex(1),
+                1,
+                input_tokens,
+                source_beam=0,
+            )
+        stream.take_finish_event().synchronize()
+
+    def test_beam_expected_prompt_tail_copy_without_history_update(self) -> None:
+        tokens_per_block = 4
+        with TemporaryCudaStream([]) as stream:
+            cuda_stream = cast(CudaStream, stream.handle)
+            prompt_len = tokens_per_block + 2
+            kv_cache, prompt = self.make_unfinalized_context_kv_cache(
+                prompt_len=prompt_len,
+                tokens_per_block=tokens_per_block,
+                stream=cuda_stream,
+            )
+            self.disable_partial_commit()
+
+            kv_cache.beam_width = BeamIndex(2)
+
+            assert kv_cache.history_length == 0
+            beam0_full_page = kv_cache.get_base_page_indices(LayerGroupId(0), BeamIndex(0))[0]
+            beam1_full_page = kv_cache.get_base_page_indices(LayerGroupId(0), BeamIndex(1))[0]
+            assert beam0_full_page != BAD_PAGE_INDEX
+            assert beam1_full_page == BAD_PAGE_INDEX
+
+            beam0_tail_page = kv_cache.get_base_page_indices(LayerGroupId(0), BeamIndex(0))[1]
+            beam1_tail_page = kv_cache.get_base_page_indices(LayerGroupId(0), BeamIndex(1))[1]
+            assert beam0_tail_page != BAD_PAGE_INDEX
+            assert beam1_tail_page != BAD_PAGE_INDEX
+            assert beam0_tail_page != beam1_tail_page
+            self.check_block_token_sources(
+                kv_cache,
+                BeamIndex(1),
+                1,
+                prompt[tokens_per_block:],
+                source_beam=0,
+            )
+        stream.take_finish_event().synchronize()
+
+    def test_beam_tail_no_partial_reuse(self) -> None:
+        tokens_per_block = 4
+        with TemporaryCudaStream([]) as stream:
+            cuda_stream = cast(CudaStream, stream.handle)
+            self.prepare(
+                128 << 20,
+                0,
+                0,
+                1,
+                128,
+                0,
+                tokens_per_block=tokens_per_block,
+            )
+            self.manager._init_config.enable_partial_match = False
+            self.manager._init_config.enable_partial_commit = False
+            prompt = [self.next_token() for _ in range(tokens_per_block + 2)]
+            producer = self.manager.create_kv_cache(None, None)
+            producer.cuda_stream = cuda_stream
+            assert producer.resume(cuda_stream)
+            assert producer.resize(len(prompt))
+            self.engine.execute([Step(producer, prompt, [])], cuda_stream)
+            producer.commit(prompt)
+            producer.stop_committing()
+            assert producer.num_committed_tokens == len(prompt)
+            assert producer._num_committed_blocks == len(prompt) // tokens_per_block
+
+            kv_cache = self.manager.create_kv_cache(None, prompt)
+            assert kv_cache.num_committed_tokens == tokens_per_block
+            kv_cache.cuda_stream = cuda_stream
+            assert kv_cache.resume(cuda_stream)
+            assert kv_cache.resize(len(prompt))
+            self.engine.execute(
+                [
+                    Step(
+                        kv_cache,
+                        prompt[tokens_per_block:],
+                        prompt[:tokens_per_block],
+                    )
+                ],
+                cuda_stream,
+            )
+            kv_cache.commit(prompt[tokens_per_block:])
+            assert kv_cache.num_committed_tokens == len(prompt)
+            assert kv_cache.num_committed_tokens % tokens_per_block != 0
+
+            kv_cache.beam_width = BeamIndex(2)
+
+            beam0_full_page = kv_cache.get_base_page_indices(LayerGroupId(0), BeamIndex(0))[0]
+            beam1_full_page = kv_cache.get_base_page_indices(LayerGroupId(0), BeamIndex(1))[0]
+            assert beam0_full_page != BAD_PAGE_INDEX
+            assert beam1_full_page == BAD_PAGE_INDEX
+
+            beam0_tail_page = kv_cache.get_base_page_indices(LayerGroupId(0), BeamIndex(0))[1]
+            beam1_tail_page = kv_cache.get_base_page_indices(LayerGroupId(0), BeamIndex(1))[1]
+            assert beam0_tail_page != BAD_PAGE_INDEX
+            assert beam1_tail_page != BAD_PAGE_INDEX
+            assert beam0_tail_page != beam1_tail_page
+            self.check_block_token_sources(
+                kv_cache,
+                BeamIndex(1),
+                1,
+                prompt[tokens_per_block:],
+                source_beam=0,
+            )
+
+            kv_cache.close()
+            producer.close()
+        stream.take_finish_event().synchronize()
+
+    def test_beam_close_stop(self) -> None:
+        tokens_per_block = 4
+        with TemporaryCudaStream([]) as stream:
+            cuda_stream = cast(CudaStream, stream.handle)
+            self.prepare(
+                128 << 20,
+                0,
+                0,
+                1,
+                128,
+                0,
+                tokens_per_block=tokens_per_block,
+            )
+            prompt = [self.next_token() for _ in range(tokens_per_block + 2)]
+            kv_cache = self.manager.create_kv_cache(
+                None, None, expected_prompt_length=tokens_per_block
+            )
+            kv_cache.cuda_stream = cuda_stream
+            assert kv_cache.resume(cuda_stream)
+            assert kv_cache.resize(len(prompt))
+            self.engine.execute([Step(kv_cache, prompt, [])], cuda_stream)
+            kv_cache.commit(prompt[:tokens_per_block])
+            assert kv_cache.resize(None, len(prompt))
+            self.disable_partial_commit()
+            kv_cache.beam_width = BeamIndex(2)
+
+            kv_cache.close()
+        stream.take_finish_event().synchronize()
 
     def new_request(
         self, req_id: int, lora_task_id: int | None, prompt_len: int, decode_len: int
@@ -2213,6 +2651,37 @@ class TestScratchReuse(TestKVCacheManagerV2):
 
         s.take_finish_event().synchronize()
         kv.close()
+
+    def test_beam_expansion_uses_logical_prompt_block_with_scratch(self) -> None:
+        tokens_per_block = 4
+        prompt = [self.next_token() for _ in range(2 * tokens_per_block + 2)]
+        self._prepare_scratch(
+            num_layers=1,
+            window_size=tokens_per_block,
+            tokens_per_block=tokens_per_block,
+            gpu_quota=16 << 20,
+        )
+        kv_cache = self.manager.create_kv_cache(None, None, expected_prompt_length=len(prompt))
+
+        with TemporaryCudaStream([]) as stream:
+            cuda_stream = cast(CudaStream, stream.handle)
+            assert kv_cache.resume(cuda_stream)
+            kv_cache.stop_committing()
+            assert kv_cache.resize(len(prompt))
+            self.engine.execute([Step(kv_cache, prompt, [])], cuda_stream)
+            assert kv_cache.history_length == 0
+            assert kv_cache.get_scratch_desc(LayerGroupId(0)) is not None
+
+            self.manager._init_config.enable_partial_commit = False
+            kv_cache.beam_width = BeamIndex(2)
+
+            assert [len(block.pages) for block in kv_cache._blocks] == [1, 1, 2]
+            beam1_pages = kv_cache.get_base_page_indices(LayerGroupId(0), BeamIndex(1))
+            assert list(beam1_pages[:2]) == [BAD_PAGE_INDEX, BAD_PAGE_INDEX]
+            assert beam1_pages[2] != BAD_PAGE_INDEX
+
+            kv_cache.close()
+        stream.take_finish_event().synchronize()
 
     def test_scratch_slot_count(self):
         """Verify peak slot count is reduced with scratch reuse.
