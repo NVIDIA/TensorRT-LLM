@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import asyncio
 import base64
+import datetime as _dt
 import functools
 import json
 import os
@@ -45,6 +46,7 @@ from tensorrt_llm.llmapi import MultimodalEncoder, SchedulingParams, tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.llmapi.llm import RequestOutput
+from tensorrt_llm.llmapi.llm_utils import KvCacheRetentionConfig as _KvRetention
 from tensorrt_llm.llmapi.thinking_budget import \
     add_thinking_budget_logits_processor
 from tensorrt_llm.logger import logger
@@ -1387,8 +1389,14 @@ class OpenAIServer(_VideoRoutesMixin):
                     functools.partial(preprocess_fn, prompt, sampling_params,
                                       disaggregated_params))
 
+            _kv_retention = None
+            _ttl_s = getattr(request, "kv_cache_ttl_seconds", None)
+            if _ttl_s:
+                _kv_retention = _KvRetention([])
+                _kv_retention.disk_retention_ms = _dt.timedelta(seconds=_ttl_s)
             promise = self.generator.generate_async(
                 inputs=generate_inputs,
+                kv_cache_retention_config=_kv_retention,
                 sampling_params=sampling_params,
                 _postproc_params=postproc_params
                 if self.postproc_worker_enabled else None,
@@ -1872,8 +1880,14 @@ class OpenAIServer(_VideoRoutesMixin):
                 agent_hierarchy=request.agent_hierarchy)
 
             # Generate
+            _kv_retention = None
+            _ttl_s = getattr(request, "kv_cache_ttl_seconds", None)
+            if _ttl_s:
+                _kv_retention = _KvRetention([])
+                _kv_retention.disk_retention_ms = _dt.timedelta(seconds=_ttl_s)
             promise = self.generator.generate_async(
                 inputs=harmony_tokens,
+                kv_cache_retention_config=_kv_retention,
                 sampling_params=sampling_params,
                 _postproc_params=postproc_params
                 if self.postproc_worker_enabled else None,

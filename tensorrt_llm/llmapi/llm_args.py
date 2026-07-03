@@ -3354,6 +3354,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "Directory used for disk KV cache files. Must be set when `disk_cache_size` is positive."
     )
+    disk_cache_retained_only: bool = Field(
+        default=False,
+        description=
+        "When true, only blocks whose request carried a disk retention TTL may enter the disk cache tier."
+    )
     cross_kv_cache_fraction: Optional[float] = Field(
         default=None,
         description=
@@ -3544,6 +3549,8 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         if self.disk_cache_size:
             config.disk_cache_size = self.disk_cache_size
             config.disk_cache_path = self.disk_cache_path or ""
+            config.disk_cache_retained_only = bool(
+                self.disk_cache_retained_only)
         return config
 
     @field_validator('free_gpu_memory_fraction')

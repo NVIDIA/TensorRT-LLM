@@ -222,6 +222,16 @@ void KvCacheConfig::setDiskCachePath(std::string const& diskCachePath)
     mDiskCachePath = diskCachePath;
 }
 
+bool KvCacheConfig::getDiskCacheRetainedOnly() const
+{
+    return mDiskCacheRetainedOnly;
+}
+
+void KvCacheConfig::setDiskCacheRetainedOnly(bool diskCacheRetainedOnly)
+{
+    mDiskCacheRetainedOnly = diskCacheRetainedOnly;
+}
+
 void KvCacheConfig::setSecondaryOffloadMinPriority(std::optional<RetentionPriority> secondaryOffloadMinPriority)
 {
     mSecondaryOffloadMinPriority = secondaryOffloadMinPriority;

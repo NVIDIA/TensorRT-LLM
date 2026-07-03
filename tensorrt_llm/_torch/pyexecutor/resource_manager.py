@@ -623,6 +623,8 @@ class KVCacheManager(BaseResourceManager):
         kwargs['blocks_in_disk_pool'] = blocks_in_disk_pool
         kwargs['disk_cache_path'] = getattr(kv_cache_config, "disk_cache_path",
                                             None) or ""
+        kwargs['disk_cache_retained_only'] = bool(
+            getattr(kv_cache_config, "disk_cache_retained_only", False))
         self.impl = KVCacheManagerCpp(**kwargs)
         # Warmup baseline for cumulative counters (set by snapshot_warmup_baseline)
         self._warmup_reused_blocks = 0

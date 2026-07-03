@@ -416,6 +416,11 @@ class CompletionRequest(OpenAIBaseModel):
     # doc: begin-completion-sampling-params
     use_beam_search: bool = False
     top_k: int = 0
+    kv_cache_ttl_seconds: Optional[int] = Field(
+        default=None,
+        description=
+        "Keep this request's KV cache reusable for this many seconds (disk-tier retention)."
+    )
     top_p_min: float = 0.0
     min_p: float = 0.0
     repetition_penalty: float = 1.0
@@ -762,6 +767,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
     best_of: Optional[int] = None
     use_beam_search: bool = False
     top_k: int = 0
+    kv_cache_ttl_seconds: Optional[int] = Field(
+        default=None,
+        description=
+        "Keep this request's KV cache reusable for this many seconds (disk-tier retention)."
+    )
     top_p_min: float = 0.0
     min_p: float = 0.0
     repetition_penalty: float = 1.0
