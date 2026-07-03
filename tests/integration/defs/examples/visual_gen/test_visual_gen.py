@@ -14,6 +14,7 @@
 # limitations under the License.
 """Integration tests for VisualGen examples and visual quality checks."""
 
+import base64
 import contextlib
 import gc
 import glob
@@ -536,6 +537,19 @@ def _preserve_lpips_candidate_on_failure(request, score, threshold, candidate_pa
     dest = os.path.join(dest_dir, artifact_name)
     shutil.copy2(str(candidate_path), dest)
     print(f"[LPIPS] candidate preserved for golden refresh: {dest}")
+    # CI's per-stage results tarball only collects flat files (results.xml etc.), not
+    # this subdirectory — and junit stdout IS collected. Small candidates therefore
+    # also go into stdout as base64 so a threshold failure is recoverable from the
+    # archived results.xml alone (goldens for these tests must be CI-generated: wan22
+    # measured a 0.059 cross-fleet eager offset that no dev-machine regen can close).
+    size = os.path.getsize(dest)
+    if size <= 8 * 1024 * 1024:
+        with open(dest, "rb") as fh:
+            encoded = base64.b64encode(fh.read()).decode("ascii")
+        print(f"[LPIPS-B64-BEGIN {artifact_name} {size}]")
+        for i in range(0, len(encoded), 3072):
+            print(encoded[i : i + 3072])
+        print(f"[LPIPS-B64-END {artifact_name}]")
 
 
 def _generate_flux_lpips_image(model_path, output_path):
