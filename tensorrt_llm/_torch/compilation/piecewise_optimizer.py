@@ -16,20 +16,21 @@ from ..utils import (get_model_extra_attrs,
                      get_piecewise_cuda_graph_flag, make_weak_ref,
                      set_piecewise_running)
 from .multi_stream.auto_multi_stream import multi_stream_schedule
-from .utils import get_capture_piecewise_cuda_graph_flag, is_call_function
+from .utils import (get_capture_piecewise_cuda_graph_flag,
+                    get_optional_trtllm_op, is_call_function)
 
 
 def _piecewise_boundary_ops():
-    ops = [
-        torch.ops.trtllm.attn_custom_op_inplace.default,
-        torch.ops.trtllm.mla_custom_op_inplace.default,
-        torch.ops.trtllm.mla_dsa_attn_inplace.default,
+    op_names = [
+        "attn_custom_op_inplace",
+        "mla_custom_op_inplace",
+        "mla_dsa_attn_inplace",
+        "gdn_custom_op_inplace",
     ]
-    try:
-        ops.append(torch.ops.trtllm.gdn_custom_op_inplace.default)
-    except AttributeError:
-        pass
-    return ops
+    return [
+        op for op in (get_optional_trtllm_op(op_name) for op_name in op_names)
+        if op is not None
+    ]
 
 
 class PiecewiseInterpreter(Interpreter):
