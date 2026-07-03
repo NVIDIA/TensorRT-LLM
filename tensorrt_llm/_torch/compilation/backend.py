@@ -1,6 +1,7 @@
 import os
 from collections import OrderedDict
 from typing import List, Optional
+from weakref import WeakSet
 
 import torch
 import torch._inductor.config as inductor_config
@@ -19,7 +20,7 @@ from .patterns import MATCHER_SUBSYSTEM
 from .patterns.ar_residual_norm import register_ar_fusions
 from .patterns.residual_add_norm import (register_add_norm,
                                          register_add_norm_quant)
-from .piecewise_optimizer import piecewise_optimizer
+from .piecewise_optimizer import PiecewiseRunner, piecewise_optimizer
 from .recover_pass import recover_pass
 from .remove_copy_pass import remove_copy_for_mutates_args
 
@@ -56,6 +57,7 @@ class Backend:
         self.enable_inductor = enable_inductor
         self.capture_num_tokens = sorted(capture_num_tokens or [])
         self.piecewise_cuda_graph = enable_piecewise_cuda_graph
+        self._piecewise_runners: WeakSet[PiecewiseRunner] = WeakSet()
         self.no_optimization = False
         self.num_streams = max_num_streams
         self.events = Backend.Events()
@@ -107,6 +109,10 @@ class Backend:
                 torch.cuda.Event() for _ in range(num_events - len(self.events))
             ]
 
+    def clear_piecewise_cuda_graphs(self):
+        for runner in list(self._piecewise_runners):
+            runner.clear_cuda_graphs()
+
     def optimize(
         self,
         gm: GraphModule,
@@ -141,7 +147,7 @@ class Backend:
         gm.recompile()
 
         if self.piecewise_cuda_graph:
-            gm, num_events = piecewise_optimizer(
+            gm, num_events, runners = piecewise_optimizer(
                 gm,
                 example_inputs,
                 self.enable_inductor,
@@ -150,6 +156,7 @@ class Backend:
                 self._graph_pool_handle,
                 self.num_streams,
             )
+            self._piecewise_runners.update(runners)
             self.generate_events(num_events)
             return gm
         elif self.enable_inductor:
