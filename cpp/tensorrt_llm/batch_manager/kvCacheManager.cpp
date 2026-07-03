@@ -876,6 +876,9 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
         auto diskBlock = std::make_shared<KVCacheBlock>(
             blocksInPrimaryPool + blocksInSecondaryPool + blockId, tk::KVCacheIndex::nullIndex);
         diskBlock->setDiskSlot(blockId);
+        // Empty slots must be the first displacement choice: bucket 0, below any
+        // retained block. Freed cards are reset to this same bucket on disk exit.
+        diskBlock->setPriority(executor::KvCacheRetentionConfig::kMinRetentionPriority);
         mAllBlocksById.emplace_back(std::move(diskBlock));
     }
     if (blocksInDiskPool > 0)
@@ -1291,21 +1294,36 @@ void WindowBlockManager::releaseSubtree(BlockPtr const& block)
     }
 }
 
-namespace
+BlockPtr WindowBlockManager::claimDiskTarget()
 {
-// Disk-level eviction order only: unmarked/expired evict first (bucket 0), marked
-// blocks by minutes-to-expiry capped at 100. Restored to default on disk exit.
-executor::RetentionPriority diskEvictionBucket(BlockPtr const& block)
-{
-    if (!block->isRetainedNow())
+    // Cheap victims (empty slots; unmarked content in spill-all mode) live in bucket 0,
+    // so the policy's front candidate is only a retained block when nothing cheap exists.
+    auto candidate = std::get<0>(mEvictionPolicy->getFreeBlock(kDiskLevel));
+    if (!candidate->isRetainedNow())
     {
-        return executor::KvCacheRetentionConfig::kMinRetentionPriority;
+        mEvictionPolicy->claimBlock(candidate);
+        return candidate;
     }
-    auto const remaining = *block->getRetentionExpiry() - std::chrono::steady_clock::now().time_since_epoch();
-    auto const minutes = std::chrono::duration_cast<std::chrono::minutes>(remaining).count();
-    return static_cast<executor::RetentionPriority>(std::clamp<long long>(minutes, 1, 100));
+    // Every free disk block is retained: displace the earliest real deadline; among
+    // equal deadlines the first-spilled block goes first (leaf-first arrival makes this
+    // suffix-first within a chain). Entries are validated against live block state on
+    // pop; failures mean the entry describes the past (block left disk, was re-stamped,
+    // or is mid-transfer and about to leave) and are discarded.
+    while (!mDiskDeadlines.empty())
+    {
+        auto const top = mDiskDeadlines.top();
+        mDiskDeadlines.pop();
+        if (top.block->isOnDisk() && !top.block->hasRefs() && mEvictionPolicy->isEnqueued(top.block)
+            && top.block->getRetentionExpiry() == std::optional{top.expiry})
+        {
+            mEvictionPolicy->claimBlock(top.block);
+            return top.block;
+        }
+    }
+    // Heap drained by stale entries while a retained candidate exists: fall back.
+    mEvictionPolicy->claimBlock(candidate);
+    return candidate;
 }
-} // namespace
 
 BlockPtr WindowBlockManager::reclaimSecondaryBlock()
 {
@@ -1322,15 +1340,25 @@ BlockPtr WindowBlockManager::reclaimSecondaryBlock()
         {
             TLLM_LOG_INFO("[disk-tier] gate dropped=%zu (windowSize=%d)", mDiskGateDropped, mWindowSize);
         }
-        return victim; // unmarked or expired: discard, exactly as stock
+        return victim;                     // unmarked or expired: discard, exactly as stock
     }
-    auto diskTarget = std::get<0>(mEvictionPolicy->getFreeBlock(kDiskLevel));
-    mEvictionPolicy->claimBlock(diskTarget);         // claim BOTH before the swap (cf. #11879)
+    auto diskTarget = claimDiskTarget();   // empties -> unmarked -> earliest deadline; claimed
     mTransferManager->spillToFile(victim, diskTarget->getDiskSlot(), mPools, mDiskCachePath);
-    victim->swapDiskResidency(diskTarget);           // victim's identity now disk-resident, tree intact
-    victim->setDurationMs(std::nullopt);             // keep it out of the TTL-heap machinery
-    victim->setPriority(diskEvictionBucket(victim)); // disk ordering via the (unused) priority field
-    mEvictionPolicy->releaseBlock(victim);           // re-enters the free queues at kDiskLevel
+    victim->swapDiskResidency(diskTarget); // victim's identity now disk-resident, tree intact
+    victim->setDurationMs(std::nullopt);   // keep it out of upstream's expiring-block machinery
+    if (victim->isRetainedNow())
+    {
+        // Parked at max priority: displacement order among retained blocks is decided by
+        // mDiskDeadlines (exact deadline, suffix-first within a chain), not queue order.
+        victim->setPriority(executor::KvCacheRetentionConfig::kMaxRetentionPriority);
+        mDiskDeadlines.push({*victim->getRetentionExpiry(), ++mDiskSpillSeq, victim});
+    }
+    else
+    {
+        // Spill-all mode only: unmarked content is displaced before any retained block.
+        victim->setPriority(executor::KvCacheRetentionConfig::kMinRetentionPriority);
+    }
+    mEvictionPolicy->releaseBlock(victim); // re-enters the free queues at kDiskLevel
     ++mDiskSpills;
     if (mDiskSpills == 1 || mDiskSpills % 1000 == 0)
     {
@@ -1481,7 +1509,7 @@ void WindowBlockManager::onboardBlock(GenerationRequest& sequence, BlockPtr cons
         offloadBlock->swapDiskResidency(block); // matched identity now GPU-resident
         offloadBlock->setPriority(executor::KvCacheRetentionConfig::kDefaultRetentionPriority);
         block->clearRetention();
-        block->setPriority(executor::KvCacheRetentionConfig::kDefaultRetentionPriority);
+        block->setPriority(executor::KvCacheRetentionConfig::kMinRetentionPriority); // freed card = empty slot again
         mEvictionPolicy->releaseBlock(block); // freed card returns to the disk free queue
         ++mDiskOnboards;
         if (mDiskOnboards == 1 || mDiskOnboards % 1000 == 0)
@@ -1960,6 +1988,12 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
                 sequence.getRequestId(), matchingBlockId);
         }
 
+        if (auto const diskRetentionMs = sequence.getDiskRetentionMs())
+        {
+            // Reused blocks bypass getFreeBlock, so the disk-retention stamp must also
+            // happen here; markRetained max-merges, keeping the later deadline.
+            claimed.block->markRetained(std::chrono::steady_clock::now().time_since_epoch() + *diskRetentionMs);
+        }
         onboardBlock(sequence, claimed.block, claimResult.mode, claimResult.directory);
         addBlockToAllBeams(claimed.block, sequence);
         if (!claimed.isPlaceholder)

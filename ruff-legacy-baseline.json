@@ -1,7 +1,7 @@
 {
   "_meta": {
     "generated_by": "scripts/legacy_utils.py lint-update-violations",
-    "total_violations": 5338,
+    "total_violations": 5336,
     "total_files": 492
   },
   ".github/scripts/label_community_user.py": {
@@ -1572,9 +1572,7 @@
     "F811": 1
   },
   "tensorrt_llm/serve/openai_server.py": {
-    "D205": 1,
-    "D212": 2,
-    "F821": 2
+    "F821": 3
   },
   "tensorrt_llm/serve/responses_utils.py": {
     "D200": 2,

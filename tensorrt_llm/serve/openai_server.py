@@ -99,6 +99,20 @@ from .._utils import nvtx_mark, set_prometheus_multiproc_dir
 from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
                               maybe_transform_reasoning_effort)
 
+
+def _disk_retention_config(request):
+    """Build a retention config from the request's kv_cache_ttl_seconds.
+
+    Carries only disk_retention_ms; returns None (the stock path) when the field
+    is absent or falsy.
+    """
+    ttl_s = getattr(request, "kv_cache_ttl_seconds", None)
+    if not ttl_s:
+        return None
+    cfg = _KvRetention([])
+    cfg.disk_retention_ms = _dt.timedelta(seconds=ttl_s)
+    return cfg
+
 # yapf: enable
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
 
@@ -1389,14 +1403,9 @@ class OpenAIServer(_VideoRoutesMixin):
                     functools.partial(preprocess_fn, prompt, sampling_params,
                                       disaggregated_params))
 
-            _kv_retention = None
-            _ttl_s = getattr(request, "kv_cache_ttl_seconds", None)
-            if _ttl_s:
-                _kv_retention = _KvRetention([])
-                _kv_retention.disk_retention_ms = _dt.timedelta(seconds=_ttl_s)
             promise = self.generator.generate_async(
                 inputs=generate_inputs,
-                kv_cache_retention_config=_kv_retention,
+                kv_cache_retention_config=_disk_retention_config(request),
                 sampling_params=sampling_params,
                 _postproc_params=postproc_params
                 if self.postproc_worker_enabled else None,
@@ -1533,7 +1542,9 @@ class OpenAIServer(_VideoRoutesMixin):
             if mm_data is not None:
                 prompt["multi_modal_data"] = mm_data
 
-            promise = self.generator.generate_async(inputs=prompt, )
+            promise = self.generator.generate_async(
+                inputs=prompt,
+                kv_cache_retention_config=_disk_retention_config(request))
             asyncio.create_task(self.await_disconnected(raw_request, promise))
 
             response = await create_mm_embedding_response(promise)
@@ -1724,6 +1735,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
                 promise = self.generator.generate_async(
                     inputs=tokens_prompt,
+                    kv_cache_retention_config=_disk_retention_config(request),
                     sampling_params=sampling_params,
                     _postproc_params=postproc_params,
                     streaming=request.stream,
@@ -1880,14 +1892,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 agent_hierarchy=request.agent_hierarchy)
 
             # Generate
-            _kv_retention = None
-            _ttl_s = getattr(request, "kv_cache_ttl_seconds", None)
-            if _ttl_s:
-                _kv_retention = _KvRetention([])
-                _kv_retention.disk_retention_ms = _dt.timedelta(seconds=_ttl_s)
             promise = self.generator.generate_async(
                 inputs=harmony_tokens,
-                kv_cache_retention_config=_kv_retention,
+                kv_cache_retention_config=_disk_retention_config(request),
                 sampling_params=sampling_params,
                 _postproc_params=postproc_params
                 if self.postproc_worker_enabled else None,
@@ -2030,6 +2037,7 @@ class OpenAIServer(_VideoRoutesMixin):
             )
             promise = self.generator.generate_async(
                 inputs=input_tokens,
+                kv_cache_retention_config=_disk_retention_config(request),
                 sampling_params=sampling_params,
                 streaming=request.stream,
                 _postproc_params=postproc_params

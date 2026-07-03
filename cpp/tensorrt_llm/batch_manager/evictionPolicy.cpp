@@ -167,6 +167,11 @@ std::tuple<BlockPtr, bool> LRUEvictionPolicy::getFreeBlock(SizeType32 cacheLevel
     TLLM_THROW("No free block found. This shouldn't happen!");
 }
 
+bool LRUEvictionPolicy::isEnqueued(BlockPtr const& block)
+{
+    return mFreeBlockIterators[block->getBlockId()] != std::nullopt;
+}
+
 void LRUEvictionPolicy::releaseBlock(BlockPtr block)
 {
     releaseBlock(block, false);

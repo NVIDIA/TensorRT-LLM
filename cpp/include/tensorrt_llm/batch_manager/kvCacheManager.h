@@ -43,6 +43,7 @@
 #include <mutex>
 #include <optional>
 #include <ostream>
+#include <queue>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -1432,6 +1433,34 @@ private:
     std::size_t mDiskSpills{0};
     std::size_t mDiskGateDropped{0};
     std::size_t mDiskOnboards{0};
+
+    //! Disk-tier displacement order among retained blocks: exact earliest deadline;
+    //! among equal deadlines, first-spilled first. Upstream releases and evicts chains
+    //! leaf-first, so arrival order at the disk is deepest-first and FIFO here equals
+    //! suffix-first within a chain (and LRU-like across requests). Entries are lazy:
+    //! validated against live block state on pop, stale ones discarded.
+    struct DiskDeadline
+    {
+        std::chrono::steady_clock::time_point::duration expiry;
+        std::uint64_t seq;
+        BlockPtr block;
+
+        bool operator>(DiskDeadline const& other) const
+        {
+            if (expiry != other.expiry)
+            {
+                return expiry > other.expiry;
+            }
+            return seq > other.seq; // first-arrived pops first among equal deadlines
+        }
+    };
+
+    std::priority_queue<DiskDeadline, std::vector<DiskDeadline>, std::greater<DiskDeadline>> mDiskDeadlines;
+    std::uint64_t mDiskSpillSeq{0};
+
+    //! \brief Pick and claim the disk block to overwrite: empty slots first, then
+    //! unmarked content, then the retained block with the earliest deadline.
+    [[nodiscard]] BlockPtr claimDiskTarget();
 
     // List of allocated blocks for each sequences
     std::unordered_map<LlmRequest::RequestIdType, std::vector<BlockPtr>> mAllocatedBlocksPerSeq;
