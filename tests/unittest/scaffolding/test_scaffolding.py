@@ -1,14 +1,11 @@
 # autoflake: skip_file
 
-import pytest
 from scaffolding.test_worker import (create_trtllm_worker,
                                      deepseek_distill_7b_path, default_prompt)
 
 from tensorrt_llm.scaffolding import (MajorityVoteController,
                                       NativeGenerationController,
                                       ScaffoldingLlm)
-
-_SCAFFOLDING_EXECUTOR_NVBUG = pytest.mark.skip(reason="https://nvbugs/6341070")
 
 
 def create_scaffolding_llm_with_native_generation_controller(
@@ -48,7 +45,6 @@ def create_scaffolding_llm_with_majority_vote_controller(
     return llm
 
 
-@_SCAFFOLDING_EXECUTOR_NVBUG
 def test_unbatched_scaffolding_sync(default_prompt, deepseek_distill_7b_path):
     scaffolding_llm = create_scaffolding_llm_with_native_generation_controller(
         deepseek_distill_7b_path)
@@ -58,7 +54,6 @@ def test_unbatched_scaffolding_sync(default_prompt, deepseek_distill_7b_path):
     scaffolding_llm.shutdown(shutdown_workers=True)
 
 
-@_SCAFFOLDING_EXECUTOR_NVBUG
 def test_batched_scaffolding_sync(default_prompt, deepseek_distill_7b_path):
     scaffolding_llm = create_scaffolding_llm_with_native_generation_controller(
         deepseek_distill_7b_path)
@@ -72,7 +67,6 @@ def test_batched_scaffolding_sync(default_prompt, deepseek_distill_7b_path):
     scaffolding_llm.shutdown(shutdown_workers=True)
 
 
-@_SCAFFOLDING_EXECUTOR_NVBUG
 def test_async_scaffolding_generation(default_prompt, deepseek_distill_7b_path):
 
     async def run_async_test():
@@ -88,7 +82,6 @@ def test_async_scaffolding_generation(default_prompt, deepseek_distill_7b_path):
     asyncio.run(run_async_test())
 
 
-@_SCAFFOLDING_EXECUTOR_NVBUG
 def test_majority_vote(default_prompt, deepseek_distill_7b_path):
     scaffolding_llm = create_scaffolding_llm_with_majority_vote_controller(
         deepseek_distill_7b_path, samples_num=3)
