@@ -89,6 +89,13 @@ from .scheduler.adp_router import ADPRouter
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
 
+_UNBOUNDED_STATS_MAX_LEN = -1
+
+
+def _stats_buffer_is_unbounded(max_stats_len: int) -> bool:
+    return max_stats_len == _UNBOUNDED_STATS_MAX_LEN
+
+
 # Environment variable to specify iteration ranges for profiling start/stop.
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
 PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
@@ -490,7 +497,7 @@ class PyExecutor:
         self.max_draft_len = max_draft_len
         self.max_total_draft_tokens = max_total_draft_tokens
         self.llm_args = self.model_engine.llm_args
-        self.max_stats_len = max(self.llm_args.max_stats_len, 1)
+        self.max_stats_len = self.llm_args.max_stats_len
         self.max_num_tokens = self.llm_args.max_num_tokens
         self.print_log = self.llm_args.print_iter_log
         self.enable_iter_perf_stats = self.llm_args.enable_iter_perf_stats
@@ -545,14 +552,10 @@ class PyExecutor:
         # kv cache events
         self.kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
-        # V2 manager owns KV alloc + suspend during scheduling: it
-        # eagerly grows ctx/gen capacity in the schedule loop and calls
-        # suspend_request() when needed (offloads GPU pages while
-        # preserving the radix tree).  The executor therefore does not
-        # need to call _terminate_requests (GPU resources are already
-        # freed by suspend) or _pause_requests (V2's prepare_context
-        # handles resume internally, so resetting to CONTEXT_INIT is
-        # unnecessary).  Several revert/skip paths gate on this flag.
+        # V2 owns KV allocation, suspend, resume, and context finalization.
+        # The executor skips the V1 terminate/pause paths and finalizes V2
+        # context resources before transfer or response handling can terminate
+        # a request.
         self._is_kv_manager_v2 = isinstance(self.kv_cache_manager,
                                             KVCacheManagerV2)
         self._prefetched_request_ids: set[int] = set()
@@ -1032,11 +1035,13 @@ class PyExecutor:
         if not rank_dicts:
             return
         with self.stats_lock:
+            if not _stats_buffer_is_unbounded(self.max_stats_len):
+                cap = self.max_stats_len * tp_size
+                overflow = max(0, len(self.stats) + len(rank_dicts) - cap)
+                if overflow:
+                    del self.stats[:overflow]
             for d in rank_dicts:
                 self.stats.append(("per_rank_dict", d))
-            cap = self.max_stats_len * tp_size
-            if len(self.stats) > cap:
-                del self.stats[:len(self.stats) - cap]
 
     # Performance metrics methods are in PerfMetricsManager (self.perf_manager)
 
@@ -1977,7 +1982,8 @@ class PyExecutor:
         #   [6] scheduler_mode: "overlap" | "non_overlap"
         #   [7] gpu_forward_time_ms: Optional[float]
         with self.stats_lock:
-            if len(self.stats) > self.max_stats_len:
+            if (not _stats_buffer_is_unbounded(self.max_stats_len)
+                    and len(self.stats) > self.max_stats_len):
                 self.stats.pop(0)
             self.stats.append(
                 (stats, req_stats, kv_iter_stats, attention_dp_rank,
@@ -2580,6 +2586,11 @@ class PyExecutor:
                 self._update_requests(executed_batch.sample_state)
 
                 scheduled_requests = executed_batch.scheduled_requests
+                if self._is_kv_manager_v2:
+                    # Finalize V2 context KV before disagg transfer/response
+                    # handling can terminate the request.
+                    self.kv_cache_manager.update_context_resources(
+                        scheduled_requests)
                 if self.kv_cache_transceiver:
                     finished_ctx_reqs = scheduled_requests.context_requests_last_chunk
                     self._send_kv_async(finished_ctx_reqs)
@@ -2716,18 +2727,7 @@ class PyExecutor:
                 self.kv_cache_manager.revert_allocate_generation(req)
 
     def _revert_ctx_alloc(self, dropped_context_requests):
-        """Revert KV cache capacity growth for ctx requests deferred by
-        delay batching.
-
-        With KV cache manager V2 + scheduler V2, ctx KV cache is grown
-        during scheduling (``resize_context``).  When delay batching
-        (``_balance_adp_requests`` for ADP, or ``_waiting_requests``
-        for non-ADP batch waiting) defers ctx requests, the
-        freshly-allocated pages would otherwise sit idle until the
-        request is re-scheduled, blocking pool space — particularly
-        painful for long-context workloads where each deferred ctx can
-        hold GBs of KV.
-        """
+        """Revert V2 context KV growth for requests deferred after scheduling."""
         for req in dropped_context_requests:
             self.kv_cache_manager.revert_allocate_context(req)
 
@@ -3336,6 +3336,11 @@ class PyExecutor:
                     self._update_request_states(scheduled_batch)
                     self._update_requests(sample_state, self.resource_manager)
 
+                    if self._is_kv_manager_v2:
+                        # Finalize V2 context KV before disagg transfer/response
+                        # handling can terminate the request.
+                        self.kv_cache_manager.update_context_resources(
+                            scheduled_batch)
                     self._send_kv_async(scheduled_batch.all_requests())
                     self._flush_pending_transfer_responses()
 
@@ -3593,6 +3598,12 @@ class PyExecutor:
             self.control_action_done.set()
             self.control_request_barrier.clear()
 
+    def _wait_for_model_engine_input_copy(self):
+        wait_for_input_copy = getattr(self.model_engine, "wait_for_input_copy",
+                                      None)
+        if wait_for_input_copy is not None:
+            wait_for_input_copy()
+
     def _executor_loop_overlap(self):
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
@@ -3617,6 +3628,12 @@ class PyExecutor:
 
                 self._handle_disagg_cache_errors_synced()
 
+                # Need to wait for the copy of previous iteration before
+                # modifying any host memory copied to GPU. Scheduler V2
+                # modifies the host page table, so wait before scheduling.
+                # This wait is also needed for legacy scheduler, but it can
+                # be pushed later, e.g. before model_engine._prepare_inputs().
+                self._wait_for_model_engine_input_copy()
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
 
                 if scheduled_batch is None:
@@ -3802,11 +3819,29 @@ class PyExecutor:
                     # causing _sample_async to fail when accessing context_chunk_size property.
                     self._handle_guided_decoder_errors(
                         scheduled_batch, guided_decoder_failed_requests)
+                    # _update_request_states() can terminate attention-DP
+                    # dummy requests, which frees V2 KV pages and overwrites
+                    # host page-index entries with BAD_PAGE_INDEX. Wait until
+                    # the current input preparation has consumed those buffers.
+                    self._wait_for_model_engine_input_copy()
                     self._update_request_states(scheduled_batch)
+
+                    # Update context requests' KV cache so that sliding-window
+                    # blocks freed by this chunk are visible to the next
+                    # iteration's scheduler.
+                    # Only applies to KV cache manager V2 + scheduler V2.
+                    if (self._is_kv_manager_v2
+                            and scheduled_batch.context_requests):
+                        self.kv_cache_manager.update_context_resources(
+                            scheduled_batch)
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._commit_kv_cache_stats(
                         self.previous_batch.scheduled_requests)
+                    # _process_previous_batch may terminate requests or resize
+                    # generation KV caches, both of which can mutate V2 page
+                    # indices used by the current batch's input preparation.
+                    self._wait_for_model_engine_input_copy()
                     self._process_previous_batch()
                     self.perf_manager.compute_batch_gpu_times(
                         self.previous_batch.scheduled_requests.all_requests())
@@ -4051,7 +4086,9 @@ class PyExecutor:
                 new_requests.extend(
                     self.executor_request_queue.get_from_request_queue(timeout))
 
-        # Broadcast requests and handle Python objects
+        # Broadcast requests and handle Python objects. RequestBroadcaster probes
+        # the request count first and can skip the heavy payload broadcast on
+        # empty iterations.
         new_requests, py_request_objects = self.request_broadcaster.broadcast(
             new_requests)
 
@@ -4157,7 +4194,8 @@ class PyExecutor:
 
         # 6. Schedule requests across ranks (DP only)
         if self.enable_attention_dp:
-            if self.adp_router.needs_prefix_matches:
+            # Symmetric skip — after _pop_from_waiting_queue all ranks see identical new_requests.
+            if self.adp_router.needs_prefix_matches and new_requests:
                 self.adp_router.gather_prefix_matches(new_requests)
 
             all_ranks_new_requests, self.expected_num_active_requests = \
@@ -4377,8 +4415,7 @@ class PyExecutor:
         scheduler_output = self.scheduler.schedule_request(
             self.active_requests, self.inflight_req_ids)
 
-        original_ctx_requests = scheduler_output.context_requests
-        scheduled_context_requests = original_ctx_requests
+        scheduled_context_requests = scheduler_output.context_requests
         if self.enable_attention_dp and self.attention_dp_enable_balance:
             scheduled_context_requests = self._balance_adp_requests(
                 scheduler_output.context_requests,
@@ -4389,6 +4426,8 @@ class PyExecutor:
             scheduler_output.context_requests) > 0 and len(
                 scheduler_output.generation_requests) > 0
         if should_check_waiting:
+            # With KV cache manager V2, scheduling has already grown context request KV cache capacity. Requests dropped
+            # for batch waiting still occupy KV cache and may reduce the batch size available for generation requests.
             scheduled_context_requests = self._waiting_requests(
                 scheduler_output.context_requests,
                 scheduler_output.generation_requests)
@@ -4402,19 +4441,6 @@ class PyExecutor:
                 scheduled_context_requests = self.kv_cache_manager.filter_ctx_requests_by_capacity(
                     scheduled_context_requests)
                 num_fitting = len(scheduled_context_requests)
-
-        # V2 scheduler grew KV cache for ctx during scheduling; release
-        # those pages for any ctx that delay batching has dropped, so
-        # the wait window does not hold pool capacity hostage.  V1
-        # allocates after delay batching, so skip the dropped-set
-        # computation entirely on V1.
-        if (self._is_kv_manager_v2 and len(scheduled_context_requests)
-                < len(original_ctx_requests)):
-            kept = {r.py_request_id for r in scheduled_context_requests}
-            dropped = [
-                r for r in original_ctx_requests if r.py_request_id not in kept
-            ]
-            self._revert_ctx_alloc(dropped)
 
         scheduled_requests = ScheduledRequests()
         scheduled_requests.encoder_requests = scheduler_output.encoder_requests
