@@ -40,7 +40,7 @@ class ZeroMqQueue:
                  use_hmac_encryption: bool = True):
         '''
         Parameters:
-            address (tuple[str, Optional[bytes]], optional): The address (tcp-ip_port, hmac_auth_key) for the IPC. Defaults to None. If hmac_auth_key is None and use_hmac_encryption is False, the queue will not use HMAC encryption.
+            address (tuple[str, Optional[bytes]], optional): The address (tcp-ip_port, hmac_auth_key) for the IPC. Defaults to None. Servers generate an HMAC key when none is provided; clients must receive one.
             socket_type (int): The type of socket to use. Defaults to zmq.PAIR.
             is_server (bool): Whether the current process is the server or the client.
             is_async (bool): Whether to use asyncio for the socket. Defaults to False.
@@ -48,7 +48,11 @@ class ZeroMqQueue:
             use_hmac_encryption (bool): Whether to use HMAC encryption for pickled data. Defaults to True.
         '''
 
-        assert use_hmac_encryption, "HMAC encryption is always required. Turning off HMAC encryption risks security vulnerability of unauthorized data serialization and deserialization. "
+        if not use_hmac_encryption:
+            raise ValueError(
+                "HMAC encryption is always required. Turning off HMAC "
+                "encryption risks unauthorized data serialization and "
+                "deserialization.")
 
         self.socket_type = socket_type
         self.address_endpoint = address[

@@ -257,6 +257,18 @@ class TestIpcBasics:
                 use_hmac_encryption=True,  # But encryption enabled
             )
 
+    def test_hmac_encryption_cannot_be_disabled(self):
+        """Test that HMAC cannot be disabled by optimized Python removing asserts."""
+        with pytest.raises(ValueError, match="HMAC encryption is always required"):
+            ZeroMqQueue(
+                address=None,
+                socket_type=zmq.PAIR,
+                is_server=True,
+                is_async=False,
+                name="test_hmac_disabled",
+                use_hmac_encryption=False,
+            )
+
     def test_put_noblock_retry(self):
         """Test put_noblock with retry mechanism."""
         server = ZeroMqQueue(
