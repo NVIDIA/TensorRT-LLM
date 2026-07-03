@@ -1549,6 +1549,18 @@ class DFlashLagunaForCausalLM(DFlashForCausalLM):
     per-aux fc_norm applied to captured target features before fc.
     """
 
+    @staticmethod
+    def _normalize_config(config: PretrainedConfig) -> None:
+        """Fill TRT-LLM Laguna defaults missing from dense DFlash drafts."""
+        if getattr(config, "num_experts", None) is None:
+            config.num_experts = 0
+        if getattr(config, "mlp_layer_types", None) is None:
+            config.mlp_layer_types = ["dense"] * config.num_hidden_layers
+        if getattr(config, "block_size", None) is None:
+            dflash_config = getattr(config, "dflash_config", {})
+            if isinstance(dflash_config, dict):
+                config.block_size = dflash_config.get("block_size", None)
+
     def __init__(self, draft_config):
         """Pin the Laguna draft-layer class and enable Laguna-specific behaviors
         (context input_layernorm, causal sliding blocks); reject non-per-head
@@ -1556,6 +1568,7 @@ class DFlashLagunaForCausalLM(DFlashForCausalLM):
         # The checkpoint labels itself with the vLLM name (model_type "llama");
         # remap to the Laguna architecture so TRT-LLM builds the Laguna layers.
         draft_config.pretrained_config.architectures = ["LagunaForCausalLM"]
+        self._normalize_config(draft_config.pretrained_config)
         super().__init__(draft_config)
         self._context_input_layernorm = True
         self._sliding_layers_causal = True

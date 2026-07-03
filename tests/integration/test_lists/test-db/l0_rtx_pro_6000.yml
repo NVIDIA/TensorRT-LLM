@@ -35,6 +35,7 @@ l0_rtx_pro_6000:
   - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B_nvfp4_hf-Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf] # 2mins
   - test_e2e.py::test_ptp_quickstart_advanced[GPT-OSS-20B-gpt_oss/gpt-oss-20b]
   - accuracy/test_llm_api_pytorch.py::TestLagunaXS::test_bf16
+  - accuracy/test_llm_api_pytorch.py::TestLagunaXS_2_1::test_bf16_dflash
   - accuracy/test_llm_api_pytorch.py::TestLagunaXS::test_fp8
   - accuracy/test_llm_api_pytorch.py::TestLagunaXS::test_nvfp4
 
