@@ -238,10 +238,7 @@ def begin_aux_stream_passthrough(
     # record_stream is the idiomatic PyTorch solution for this cross-stream
     # liveness problem: it is a CPU-only allocator hint, never a GPU sync,
     # so it cannot deadlock with in-flight NCCL collectives.
-    # NOTE: skip during CUDA graph capture — passthrough partitions are
-    # reclassified as dynamic and won't be captured anyway.
-    if not torch.cuda.is_current_stream_capturing():
-        _record_stream_for_tensor_outputs(x, aux_stream)
+    _record_stream_for_tensor_outputs(x, aux_stream)
     torch.cuda.set_stream(aux_stream)
     # Make aux wait for the main-stream event before executing any work.
     aux_stream.wait_event(main_event)

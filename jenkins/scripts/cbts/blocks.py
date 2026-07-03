@@ -168,6 +168,11 @@ def _strip_params(s: str) -> str:
     return s.rsplit("[", 1)[0] if "[" in s else s
 
 
+def _normalize_target_path(target: str) -> str:
+    """Normalize directory-style targets without changing the root sentinel."""
+    return target.rstrip("/") or target
+
+
 def _entry_target(entry: str) -> str:
     """Canonical "target" key for indexing/lookup.
 
@@ -176,7 +181,7 @@ def _entry_target(entry: str) -> str:
     `file.py::TestC::test_m[a-b] TIMEOUT (90)` → `file.py::TestC::test_m`
     `file.py -k "kw"`                          → `file.py`
     """
-    return _strip_params(_strip_pytest_options(normalize_test_id(entry)))
+    return _normalize_target_path(_strip_params(_strip_pytest_options(normalize_test_id(entry))))
 
 
 def _target_in_filter_subtree(target: str, filter_prefix: str) -> bool:
@@ -185,6 +190,8 @@ def _target_in_filter_subtree(target: str, filter_prefix: str) -> bool:
     `target` matches when it is `filter_prefix` itself or a descendant of it
     (params / method / file / dir component below) in the pytest tree.
     """
+    target = _normalize_target_path(target)
+    filter_prefix = _normalize_target_path(filter_prefix)
     if target == filter_prefix:
         return True
     return (
@@ -204,6 +211,7 @@ def _path_lookup_anchor(yaml_path: str) -> str:
     cover most blocks. Test files anchor on themselves. A top-level
     helper with no enclosing dir returns "" — caller treats as no-match.
     """
+    yaml_path = _normalize_target_path(yaml_path)
     base = yaml_path.rsplit("/", 1)[-1]
     if not base.startswith("test_"):
         return yaml_path.rsplit("/", 1)[0] if "/" in yaml_path else ""
@@ -256,7 +264,7 @@ class YAMLIndex:
             for test in tests:
                 seen: set[str] = set()
                 norm = normalize_test_id(test)
-                canonical = _strip_params(_strip_pytest_options(norm))
+                canonical = _normalize_target_path(_strip_params(_strip_pytest_options(norm)))
                 for key in (test, norm, _strip_pytest_options(norm), canonical):
                     if key and key not in seen:
                         seen.add(key)

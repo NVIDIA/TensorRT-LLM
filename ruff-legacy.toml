@@ -1305,7 +1305,6 @@ include = [
     "tests/unittest/trt/model/test_nemotron_nas.py",
     "tests/unittest/trt/model/test_phi.py",
     "tests/unittest/trt/model/test_unet.py",
-    "tests/unittest/trt/model_api/profile_utils.py",
     "tests/unittest/trt/model_api/test_model_api_multi_gpu.py",
     "tests/unittest/trt/model_api/test_model_level_api.py",
     "tests/unittest/trt/model_api/test_model_quantization.py",

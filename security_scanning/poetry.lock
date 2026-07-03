@@ -2227,6 +2227,7 @@ files = [
     {file = "llvmlite-0.48.0-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:1d9f952dff6c350c529997423d4fa43abae9722a884ac7ffafc37a3af676e7db"},
     {file = "llvmlite-0.48.0-cp314-cp314t-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:054aa7d46595935565f276cf0c1659b4f10929c996dd4a606875fae26fba2a23"},
     {file = "llvmlite-0.48.0-cp314-cp314t-win_amd64.whl", hash = "sha256:d0b3c61aac83b42fb48cc96bffbf57c81b82b2aa92276b7ed6420c814629a99a"},
+    {file = "llvmlite-0.48.0.tar.gz", hash = "sha256:543b19f9ef8f3c7c60d1468191e4ee1b1537bf9f8a3d56f64c0ddd98de92edd2"},
 ]
 
 [[package]]
@@ -3803,20 +3804,21 @@ demo = ["fastapi", "uvicorn"]
 
 [[package]]
 name = "opencv-python-headless"
-version = "4.13.0.92"
+version = "5.0.0.93"
 description = "Wrapper package for OpenCV python bindings."
 optional = false
 python-versions = ">=3.6"
 groups = ["main"]
 files = [
-    {file = "opencv_python_headless-4.13.0.92-cp37-abi3-macosx_13_0_arm64.whl", hash = "sha256:1a7d040ac656c11b8c38677cc8cccdc149f98535089dbe5b081e80a4e5903209"},
-    {file = "opencv_python_headless-4.13.0.92-cp37-abi3-macosx_14_0_x86_64.whl", hash = "sha256:3e0a6f0a37994ec6ce5f59e936be21d5d6384a4556f2d2da9c2f9c5dc948394c"},
-    {file = "opencv_python_headless-4.13.0.92-cp37-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:5c8cfc8e87ed452b5cecb9419473ee5560a989859fe1d10d1ce11ae87b09a2cb"},
-    {file = "opencv_python_headless-4.13.0.92-cp37-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:0525a3d2c0b46c611e2130b5fdebc94cf404845d8fa64d2f3a3b679572a5bd22"},
-    {file = "opencv_python_headless-4.13.0.92-cp37-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:eb60e36b237b1ebd40a912da5384b348df8ed534f6f644d8e0b4f103e272ba7d"},
-    {file = "opencv_python_headless-4.13.0.92-cp37-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:0bd48544f77c68b2941392fcdf9bcd2b9cdf00e98cb8c29b2455d194763cf99e"},
-    {file = "opencv_python_headless-4.13.0.92-cp37-abi3-win32.whl", hash = "sha256:a7cf08e5b191f4ebb530791acc0825a7986e0d0dee2a3c491184bd8599848a4b"},
-    {file = "opencv_python_headless-4.13.0.92-cp37-abi3-win_amd64.whl", hash = "sha256:77a82fe35ddcec0f62c15f2ba8a12ecc2ed4207c17b0902c7a3151ae29f37fb6"},
+    {file = "opencv_python_headless-5.0.0.93-cp37-abi3-macosx_13_0_arm64.whl", hash = "sha256:030ca5e0837a2963ab36ef896baa9767eb8d2b83353fb28af5a521e40dd8756f"},
+    {file = "opencv_python_headless-5.0.0.93-cp37-abi3-macosx_14_0_x86_64.whl", hash = "sha256:1e55af3abfb462eeeabe5c775f12bdb36216d8a93a3583d69e6bd6e1d6ba7d00"},
+    {file = "opencv_python_headless-5.0.0.93-cp37-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:10818d91510e05c04568ae12b5cd120779c70c01bf897b001a6221fe430df80f"},
+    {file = "opencv_python_headless-5.0.0.93-cp37-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:09a872a157c1376ab922a69bbf22f9a95bcc7b658a9d8b436a60212b02b2eeb4"},
+    {file = "opencv_python_headless-5.0.0.93-cp37-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:840bd717c21e5c11cadadc022a823315ea417f961213d06b4df010e019eb16f4"},
+    {file = "opencv_python_headless-5.0.0.93-cp37-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:ed709fdf9aa0bd1f2ed8549e71d19449b03a675bb581eb292285f6861953be37"},
+    {file = "opencv_python_headless-5.0.0.93-cp37-abi3-win32.whl", hash = "sha256:c6bcd96b185975ea240d22cfdb15a1f6d080cc95264cfbe2621f21bb144d89b9"},
+    {file = "opencv_python_headless-5.0.0.93-cp37-abi3-win_amd64.whl", hash = "sha256:829717b6a95554f273e49e357cee3b3a2a26b6f4842fbc1bed2b45bdd8f87e0e"},
+    {file = "opencv_python_headless-5.0.0.93.tar.gz", hash = "sha256:b82f9831daab90b725c7c1ee1b36cb5732c367096ac76d119e64e14eb70d5f3c"},
 ]
 
 [package.dependencies]
@@ -6872,14 +6874,14 @@ shellingham = ">=1.3.0"
 
 [[package]]
 name = "typing-extensions"
-version = "4.15.0"
+version = "4.16.0"
 description = "Backported and Experimental Type Hints for Python 3.9+"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "typing_extensions-4.15.0-py3-none-any.whl", hash = "sha256:f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548"},
-    {file = "typing_extensions-4.15.0.tar.gz", hash = "sha256:0cea48d173cc12fa28ecabc3b837ea3cf6f38c6d1136f85cbaaf598984861466"},
+    {file = "typing_extensions-4.16.0-py3-none-any.whl", hash = "sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8"},
+    {file = "typing_extensions-4.16.0.tar.gz", hash = "sha256:dc983d19a509c94dba722ee6abd33940f7c05a89e243c47e907eb4db6f1a43e5"},
 ]
 
 [[package]]
@@ -7379,4 +7381,4 @@ type = ["pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "3bdfae038389de98974f3eb288a93cd863646eb9c411ca63d5b451f3fa89f9b9"
+content-hash = "421fc9a6e6ed91ae915a8d899d21b5d3a4121ef4da6941bc7ee6ff096c5dce84"
