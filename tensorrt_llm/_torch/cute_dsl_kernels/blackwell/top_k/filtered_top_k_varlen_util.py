@@ -208,11 +208,8 @@ class FilteredTopKKernelVarlen:
         _copy_atom,
         scan_frag,
         _aligned_base,
-        _elem_bytes,
-        _align_bytes,
         vec_start,
         aligned_size,
-        _step_vec,
         score,
         row_start,
         prologue_elems,
@@ -220,6 +217,9 @@ class FilteredTopKKernelVarlen:
         left_size,
     ):
         """Collect all indices with coarse bin < threshold_bin from GMEM, then barrier."""
+        _elem_bytes = self.dtype.width // 8
+        _align_bytes = self.num_copy_bits // 8
+        _step_vec = self.num_threads_per_cta * self.vec_size
         vec_size = self.vec_size
         ic = tidx * cutlass.Int32(vec_size)
         while ic + cutlass.Int32(vec_size - 1) < aligned_size:
@@ -357,7 +357,7 @@ class FilteredTopKKernelVarlen:
         bin_val,
         threshold,
         idx_int32,
-        raw_input,
+        ordered_val,
         offset,
         r_idx,
         is_last_round,
@@ -374,7 +374,9 @@ class FilteredTopKKernelVarlen:
     ):
         """Per-element if/elif handler for refinement rounds.
 
-        idx_int32  – Int32 column index, used for score lookup and buffer writes.
+        idx_int32   – Int32 column index, used for score lookup and buffer writes.
+        ordered_val – pre-computed self.to_ordered(raw_input); avoids recomputing
+                      it for sub_bin extraction when bin_val == threshold.
 
         bin_val < threshold  → write to s_indices.
         bin_val == threshold → last round: s_last_remain countdown;
@@ -398,20 +400,16 @@ class FilteredTopKKernelVarlen:
                     else:
                         buffer_pos = atomicAdd(g_num_input.iterator + (r_idx ^ 1), val_one)
                         buffer[r_idx ^ 1, buffer_pos] = idx_int32
-                    bin32 = self.to_ordered(raw_input)
-                    sub_bin = (bin32 >> (offset - 8)) & 0xFF
+                    sub_bin = (ordered_val >> (offset - 8)) & 0xFF
                     atomicAdd(s_histogram.iterator + cutlass.Int32(sub_bin), val_one)
                 else:
                     if cutlass.const_expr(self.dtype == cutlass.Float32):
-                        bin32 = cutlass.Uint32(0)
                         sub_bin = cutlass.Uint32(0)
                     else:
-                        bin32 = cutlass.Uint16(0)
                         sub_bin = cutlass.Int32(0)
                     if cur_pos < self.filtered_topk_smem_input_size:
                         s_input_idx[r_idx ^ 1, cur_pos] = idx
-                        bin32 = self.to_ordered(raw_input)
-                        sub_bin = (bin32 >> (offset - 8)) & 0xFF
+                        sub_bin = (ordered_val >> (offset - 8)) & 0xFF
                         atomicAdd(s_histogram.iterator + cutlass.Int32(sub_bin), val_one)
 
     @cute.jit
@@ -430,11 +428,8 @@ class FilteredTopKKernelVarlen:
         _copy_atom,
         scan_frag,
         _aligned_base,
-        _elem_bytes,
-        _align_bytes,
         vec_start,
         aligned_size,
-        _step_vec,
         score,
         row_start,
         prologue_elems,
@@ -445,6 +440,9 @@ class FilteredTopKKernelVarlen:
 
         Covers vec-aligned GMEM, prologue scalar, and left scalar segments.
         """
+        _elem_bytes = self.dtype.width // 8
+        _align_bytes = self.num_copy_bits // 8
+        _step_vec = self.num_threads_per_cta * self.vec_size
         cute.arch.barrier()
         for _hi in range(tidx, self.radix + 1, self.num_threads_per_cta):
             s_histogram[_hi] = 0
@@ -563,12 +561,13 @@ class FilteredTopKKernelVarlen:
             idx_tmp = s_input_idx[r_idx, i]
             idx_int32 = cutlass.Int32(cutlass.Uint32(idx_tmp))
             raw_input = score[idx_int32]
-            bin_val = (self.to_ordered(raw_input) >> offset) & 0xFF
+            ordered_val = self.to_ordered(raw_input)
+            bin_val = (ordered_val >> offset) & 0xFF
             self._filter_and_histogram_per_elem_refine(
                 bin_val,
                 threshold,
                 idx_int32,
-                raw_input,
+                ordered_val,
                 offset,
                 r_idx,
                 is_last_round,
@@ -589,12 +588,13 @@ class FilteredTopKKernelVarlen:
             for i in range(tidx, cur_g_num_input, self.num_threads_per_cta):
                 idx_int32 = buffer[r_idx, i]
                 raw_input = score[idx_int32]
-                bin_val = (self.to_ordered(raw_input) >> offset) & 0xFF
+                ordered_val = self.to_ordered(raw_input)
+                bin_val = (ordered_val >> offset) & 0xFF
                 self._filter_and_histogram_per_elem_refine(
                     bin_val,
                     threshold,
                     idx_int32,
-                    raw_input,
+                    ordered_val,
                     offset,
                     r_idx,
                     is_last_round,
@@ -993,11 +993,8 @@ class FilteredTopKKernelVarlen:
                     _copy_atom,
                     scan_frag,
                     _aligned_base,
-                    _elem_bytes,
-                    _align_bytes,
                     vec_start,
                     aligned_size,
-                    _step_vec,
                     score,
                     row_start,
                     prologue_elems,
@@ -1019,11 +1016,8 @@ class FilteredTopKKernelVarlen:
                     _copy_atom,
                     scan_frag,
                     _aligned_base,
-                    _elem_bytes,
-                    _align_bytes,
                     vec_start,
                     aligned_size,
-                    _step_vec,
                     score,
                     row_start,
                     prologue_elems,
