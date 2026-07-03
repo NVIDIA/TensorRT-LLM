@@ -32,6 +32,7 @@ from ._config import (
     BatchDesc,
     BufferConfig,
     CacheTierConfig,
+    ContiguousArenaConfig,
     DataRole,
     DiskCacheTierConfig,
     GpuCacheTierConfig,
@@ -40,6 +41,7 @@ from ._config import (
     KVCacheManagerConfig,
     SsmLayerConfig,
     SwaScratchReuseConfig,
+    WriteThroughPolicy,
 )
 from ._core import (
     DEFAULT_BEAM_INDEX,
@@ -93,6 +95,8 @@ __all__ = [
     "NDEBUG",
     "KVCacheManagerConfig",
     "SwaScratchReuseConfig",
+    "ContiguousArenaConfig",
+    "WriteThroughPolicy",
     "AttentionLayerConfig",
     "SsmLayerConfig",
     "BufferConfig",

@@ -188,6 +188,64 @@ class SwaScratchReuseConfig:
         assert self.max_rewind_len >= 0, "max_rewind_len must be non-negative"
 
 
+class WriteThroughPolicy(IntEnum):
+    """When active (GPU) blocks are copied out to the host (stale) tier.
+
+    See ``contiguous_primary_kvcache/DESIGN.md`` §4.3.
+    """
+
+    # Copy a committed block to host only when its arena pages are freed
+    # (sequence completion / preemption). Simplest; bursts D2H at free time.
+    ON_FREE = 0
+    # Copy a committed block to host opportunistically the moment it commits
+    # (blocks are immutable once committed), making the common free path
+    # copy-free. Must be rate-limited (DESIGN.md §4.3 risk #4).
+    ON_COMMIT = 1
+
+
+@dataclass(slots=True)
+class ContiguousArenaConfig:
+    """Enables the contiguous-in-VA active KV cache (per-sequence arenas backed
+    by CUDA VMM demand paging).
+
+    This is a **prototype** feature; see ``contiguous_primary_kvcache/DESIGN.md``
+    for the full design. When this config is ``None`` on
+    :class:`KVCacheManagerConfig`, behavior is unchanged (classic paged v2).
+
+    Args:
+        phys_page_size: Physical mapping granularity in bytes ("super-page").
+            Must be a multiple of the VMM allocation granularity (2 MiB). Larger
+            pages amortize the fixed per-mapping ``cuMemSetAccess`` cost (~8x
+            cheaper per byte at 16 MiB vs 2 MiB) at the cost of more tail waste
+            (~page_size/2 per sequence per pool group). See DESIGN.md §4.8.
+        map_ahead_pages: Number of physical pages to keep mapped ahead of a
+            growing sequence's write frontier, to hide driver-call latency and
+            absorb speculative-decoding bursts (DESIGN.md §4.2).
+        write_through: See :class:`WriteThroughPolicy`.
+        lazy_gpu_retention: If True, keep a freed sequence's pages mapped
+            (LRU-ordered) until the shared pool needs them, so a reuse hit on a
+            still-resident block is a D2D copy instead of H2D (DESIGN.md §4.4,
+            phase 1). P0 default is False (stale is host-only).
+        max_va_bytes_per_pool: Hard cap on the VA reservation per (pool group,
+            pool) arena. 0 means derive from per-request maxima at startup.
+    """
+
+    phys_page_size: int = 2 << 20
+    map_ahead_pages: int = 1
+    write_through: WriteThroughPolicy = WriteThroughPolicy.ON_FREE
+    lazy_gpu_retention: bool = False
+    max_va_bytes_per_pool: int = 0
+
+    def __post_init__(self) -> None:
+        _MIN_GRANULARITY = 2 << 20
+        assert self.phys_page_size > 0 and self.phys_page_size % _MIN_GRANULARITY == 0, (
+            f"phys_page_size ({self.phys_page_size}) must be a positive multiple of "
+            f"the 2 MiB VMM granularity"
+        )
+        assert self.map_ahead_pages >= 0, "map_ahead_pages must be non-negative"
+        assert self.max_va_bytes_per_pool >= 0, "max_va_bytes_per_pool must be non-negative"
+
+
 @dataclass(slots=True)
 class KVCacheManagerConfig:
     """
@@ -248,6 +306,15 @@ class KVCacheManagerConfig:
     Collect V2 KV cache allocation, reuse, and transfer statistics.
     """
 
+    contiguous_arena: ContiguousArenaConfig | None = None
+    """
+    When set, enables the prototype contiguous-in-VA active KV cache: each
+    sequence's active blocks are laid out contiguously in a per-sequence virtual
+    address range backed by CUDA VMM demand paging, and stale (reusable) blocks
+    live in the host tier. When None (default), behavior is unchanged.
+    See ``contiguous_primary_kvcache/DESIGN.md``.
+    """
+
     # unsupported yet
     helix_config: HelixConfig | None = None
 
@@ -274,4 +341,10 @@ class KVCacheManagerConfig:
             )
             assert not self.enable_partial_reuse, (
                 "enable_partial_reuse must be False when SSM layers are present"
+            )
+        if self.contiguous_arena is not None:
+            # Prototype feature; a few combinations are not wired up yet (P0 scope,
+            # DESIGN.md §7). Fail loudly rather than silently misbehave.
+            assert self.helix_config is None, (
+                "contiguous_arena is not yet supported together with helix_config"
             )

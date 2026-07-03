@@ -119,12 +119,20 @@ class PooledPhysMemAllocator(PooledFactoryBase[drv.CUmemGenericAllocationHandle,
 
 # Virtual memory
 class VirtMem:
-    __slots__ = ("_vm_size", "_allocator", "_address", "_pm_stack", "_access_desc")
+    # NOTE: `_page_map` backs the *sparse* mapping mode used by the contiguous
+    # primary KV cache (per-sequence arenas, see `_sequence_arena.py` and
+    # `contiguous_primary_kvcache/DESIGN.md` §4.1-§4.2). It maps physical chunks
+    # at arbitrary granularity-aligned offsets inside the reservation, in
+    # contrast to `_pm_stack` which is tail-only LIFO. A single `VirtMem`
+    # instance uses one mode or the other, never both (asserted below).
+    __slots__ = ("_vm_size", "_allocator", "_address", "_pm_stack", "_access_desc", "_page_map")
     _vm_size: int
     _allocator: PooledPhysMemAllocator
     _address: drv.CUdeviceptr
     _pm_stack: list[PhysMem]
     _access_desc: drv.CUmemAccessDesc
+    # chunk_index -> mapped PhysMem, for sparse mode. chunk_index = byte_offset // phys_mem_size.
+    _page_map: dict[int, PhysMem]
 
     def __init__(
         self, vm_size: int, phys_mem_allocator: PooledPhysMemAllocator, init_num_phys_mem: int = 0
@@ -135,6 +143,7 @@ class VirtMem:
         self._address = _unwrap(drv.cuMemAddressReserve(vm_size, 0, 0, 0))
         self._vm_size = vm_size
         self._pm_stack = []
+        self._page_map = {}
         self._access_desc = drv.CUmemAccessDesc()
         self._access_desc.location.type = drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
         self._access_desc.location.id = device_id
@@ -151,6 +160,13 @@ class VirtMem:
         _unwrap(drv.cuCtxSynchronize())
         while self._pm_stack:
             self._pop().close()
+        # Tear down any sparse mappings (see `_page_map`). Unmap each chunk's VA
+        # and return its handle to the shared pool.
+        for chunk_index, phys_mem in self._page_map.items():
+            vm_ptr = drv.CUdeviceptr(int(self._address) + self.phys_mem_size * chunk_index)
+            _unwrap(drv.cuMemUnmap(vm_ptr, self.phys_mem_size))
+            phys_mem.close()
+        self._page_map = {}
         _unwrap(drv.cuMemAddressFree(self._address, self._vm_size))
         self._address = drv.CUdeviceptr(0)
         self._vm_size = 0
@@ -184,6 +200,8 @@ class VirtMem:
             self.shrink(self.num_phys_mem - required_num_phys_mem)
 
     def _push(self, phy_mem: PhysMem) -> None:
+        # Tail-stack and sparse modes are mutually exclusive on one reservation.
+        assert not self._page_map, "cannot use tail-stack extend() on a sparse-mapped VirtMem"
         phys_mem_size = self.phys_mem_size
         assert phys_mem_size * (len(self._pm_stack) + 1) <= self._vm_size
         vm_ptr = drv.CUdeviceptr(self.address + phys_mem_size * len(self._pm_stack))
@@ -213,3 +231,88 @@ class VirtMem:
     @property
     def address(self) -> MemAddress:
         return MemAddress(int(self._address))
+
+    # ------------------------------------------------------------------
+    # Sparse mapping mode (contiguous primary KV cache)
+    #
+    # Maps/unmaps physical chunks at arbitrary granularity-aligned offsets
+    # inside the reservation, so per-sequence arenas can page memory in on
+    # demand ahead of the write frontier and recycle it on free. See
+    # `_sequence_arena.py` and DESIGN.md §4.2. Callers must ensure that
+    # `unmap_range` is only issued once no in-flight GPU work can touch the
+    # range (deferred-reclaim gating lives in the arena layer, DESIGN.md §4.2
+    # "Shrink/free"): `cuMemUnmap` of a still-referenced range is an IMA.
+    # ------------------------------------------------------------------
+
+    def _chunk_index(self, byte_offset: int) -> int:
+        phys_mem_size = self.phys_mem_size
+        assert byte_offset % phys_mem_size == 0, "byte_offset must be granularity-aligned"
+        assert 0 <= byte_offset < self._vm_size
+        return byte_offset // phys_mem_size
+
+    def map_range(self, byte_offset: int, num_chunks: int) -> None:
+        """Map ``num_chunks`` physical chunks into the reservation starting at
+        ``byte_offset`` (must be a multiple of ``phys_mem_size``).
+
+        Chunks are pulled from the shared physical pool. Access is granted with
+        a single ``cuMemSetAccess`` spanning the whole contiguous run (its cost
+        is per-mapping, not per-byte -- see the microbenchmark in
+        ``contiguous_primary_kvcache/``). On OOM the partial mapping is rolled
+        back so the call behaves atomically.
+        """
+        assert not self._pm_stack, "cannot use sparse map_range() on a tail-stack VirtMem"
+        assert num_chunks >= 0
+        if num_chunks == 0:
+            return
+        phys_mem_size = self.phys_mem_size
+        start_chunk = self._chunk_index(byte_offset)
+        assert (start_chunk + num_chunks) * phys_mem_size <= self._vm_size
+        mapped: list[int] = []
+        try:
+            for i in range(num_chunks):
+                chunk_index = start_chunk + i
+                assert chunk_index not in self._page_map, f"chunk {chunk_index} already mapped"
+                phys_mem = self._allocator.create()
+                vm_ptr = drv.CUdeviceptr(int(self._address) + phys_mem_size * chunk_index)
+                _unwrap(drv.cuMemMap(vm_ptr, phys_mem_size, 0, phys_mem.handle, 0))
+                self._page_map[chunk_index] = phys_mem
+                mapped.append(chunk_index)
+            span_ptr = drv.CUdeviceptr(int(self._address) + phys_mem_size * start_chunk)
+            _unwrap(
+                drv.cuMemSetAccess(span_ptr, phys_mem_size * num_chunks, (self._access_desc,), 1)
+            )
+        except Exception:  # roll back to keep map_range atomic on OOM
+            for chunk_index in mapped:
+                vm_ptr = drv.CUdeviceptr(int(self._address) + phys_mem_size * chunk_index)
+                _unwrap(drv.cuMemUnmap(vm_ptr, phys_mem_size))
+                self._page_map.pop(chunk_index).close()
+            raise
+
+    def unmap_range(self, byte_offset: int, num_chunks: int) -> None:
+        """Unmap ``num_chunks`` chunks starting at ``byte_offset`` and return
+        their physical handles to the shared pool.
+
+        The caller MUST guarantee no in-flight GPU work references this range
+        (deferred-reclaim gating, DESIGN.md §4.2). ``cuMemUnmap`` is host-side
+        and not stream-ordered.
+        """
+        assert num_chunks >= 0
+        if num_chunks == 0:
+            return
+        phys_mem_size = self.phys_mem_size
+        start_chunk = self._chunk_index(byte_offset)
+        for i in range(num_chunks):
+            chunk_index = start_chunk + i
+            phys_mem = self._page_map.pop(chunk_index, None)
+            assert phys_mem is not None, f"chunk {chunk_index} is not mapped"
+            vm_ptr = drv.CUdeviceptr(int(self._address) + phys_mem_size * chunk_index)
+            _unwrap(drv.cuMemUnmap(vm_ptr, phys_mem_size))
+            phys_mem.close()
+
+    def is_mapped(self, byte_offset: int) -> bool:
+        return self._chunk_index(byte_offset) in self._page_map
+
+    @property
+    def num_sparse_chunks(self) -> int:
+        """Number of chunks currently mapped via the sparse path."""
+        return len(self._page_map)
