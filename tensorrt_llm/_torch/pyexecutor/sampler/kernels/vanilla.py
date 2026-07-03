@@ -334,8 +334,10 @@ def greedy(
     return greedy_search_sampling_batch(logits, return_probs=return_probs)
 
 
-def _safely_apply_temperature(logits: torch.Tensor, temp: torch.Tensor) -> torch.Tensor:
-    """Divide logits by per-row temperature, guarding against the greedy sentinel.
+def _safely_apply_temperature_inplace(
+    logits_inout: torch.Tensor, temp: torch.Tensor
+) -> torch.Tensor:
+    """Divide logits by per-row temperature in place, guarding the greedy sentinel.
 
     Greedy requests carry a temperature of 0 / <= ``_GREEDY_TEMPERATURE_THRESHOLD``.
     Dividing by it would blow logits up to inf/nan and corrupt downstream sampling
@@ -344,10 +346,11 @@ def _safely_apply_temperature(logits: torch.Tensor, temp: torch.Tensor) -> torch
     rows with their argmax result afterwards (e.g. via ``torch.where(is_greedy, ...)``),
     so the value used for the clamped rows here does not affect the final output.
 
-    ``logits`` is modified in place (``div_``); ``temp`` is left untouched.
+    ``logits_inout`` is modified in place (``div_``) and also returned for
+    convenience; ``temp`` is left untouched.
     """
     safe_temp = torch.where(temp <= _GREEDY_TEMPERATURE_THRESHOLD, torch.ones_like(temp), temp)
-    return logits.div_(safe_temp.unsqueeze(dim=1))
+    return logits_inout.div_(safe_temp.unsqueeze(dim=1))
 
 
 def _apply_top_k_top_p(
@@ -394,17 +397,25 @@ def compute_probs_from_logits_op(
 ) -> torch.Tensor:
     """Pure-PyTorch CPU fallback for probability computation."""
     is_greedy = temperatures <= _GREEDY_TEMPERATURE_THRESHOLD
-    # Compute the greedy one-hot from the *original* logits, before applying
-    # temperature, so greedy rows pick the true argmax. _safely_apply_temperature
-    # guards the division against the greedy sentinel; the greedy rows' probs are
-    # overwritten with this one-hot by torch.where below.
+    # Greedy rows must pick the argmax of the *original* logits (before temperature).
+    # Capture the argmax up front; _safely_apply_temperature_inplace then guards the
+    # division against the greedy sentinel.
     argmax_ids = logits.argmax(dim=-1, keepdim=True)
-    one_hot = torch.zeros_like(logits, dtype=torch.float32).scatter_(1, argmax_ids, 1.0)
 
-    logits = _safely_apply_temperature(logits, temperatures)
+    logits = _safely_apply_temperature_inplace(logits, temperatures)
     logits = _apply_top_k_top_p(logits, top_k, top_p)
     probs = logits.softmax(dim=-1, dtype=torch.float32)
-    return torch.where(is_greedy.unsqueeze(1), one_hot, probs)
+
+    # Turn the greedy rows into a one-hot at argmax by editing `probs` in place,
+    # instead of building a full [batch, vocab] one-hot buffer and a [batch, vocab]
+    # torch.where copy. The torch.where here only runs on a [batch, 1] tensor.
+    # NB: argwhere/index-select on the greedy rows would give a data-dependent shape
+    # that breaks the surrounding torch.compile graph, so we keep it dense.
+    greedy_col = is_greedy.unsqueeze(1)
+    new_at_argmax = torch.where(greedy_col, 1.0, probs.gather(1, argmax_ids))
+    probs.masked_fill_(greedy_col, 0.0)
+    probs.scatter_(1, argmax_ids, new_at_argmax)
+    return probs
 
 
 class _Fusions:

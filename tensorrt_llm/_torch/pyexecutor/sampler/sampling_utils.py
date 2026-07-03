@@ -27,7 +27,32 @@ from typing import Any, Generic, Literal, Optional, Type, TypeAlias, TypeVar, ca
 import torch
 
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from tensorrt_llm._torch.pyexecutor.sampler.kernels import vanilla
+from tensorrt_llm._torch.pyexecutor.sampler.kernels import flashinfer, vanilla
+
+# NB: these flashinfer op wrappers are plain Python functions that are safe to
+# import even without flashinfer installed (the flashinfer import inside
+# kernels/flashinfer.py is itself guarded); they are only *called* under
+# IS_FLASHINFER_AVAILABLE. Importing them unconditionally keeps them defined for
+# static analysis (they are referenced unconditionally in the strategy impls).
+from tensorrt_llm._torch.pyexecutor.sampler.kernels.flashinfer import (
+    sampling_from_probs_generator_op as sampling_from_probs_generator_op,
+)
+from tensorrt_llm._torch.pyexecutor.sampler.kernels.flashinfer import softmax_op as softmax_op
+from tensorrt_llm._torch.pyexecutor.sampler.kernels.flashinfer import (
+    top_k_mask_logits_op as top_k_mask_logits_op,
+)
+from tensorrt_llm._torch.pyexecutor.sampler.kernels.flashinfer import (
+    top_k_sampling_from_probs_generator_op as top_k_sampling_from_probs_generator_op,
+)
+from tensorrt_llm._torch.pyexecutor.sampler.kernels.flashinfer import (
+    top_k_top_p_sampling_from_logits_with_generator_op as top_k_top_p_sampling_from_logits_with_generator_op,  # noqa: E501
+)
+from tensorrt_llm._torch.pyexecutor.sampler.kernels.flashinfer import (
+    top_p_renorm_probs_op as top_p_renorm_probs_op,
+)
+from tensorrt_llm._torch.pyexecutor.sampler.kernels.flashinfer import (
+    top_p_sampling_from_probs_generator_op as top_p_sampling_from_probs_generator_op,
+)
 from tensorrt_llm._torch.pyexecutor.sampler.kernels.vanilla import (
     BeamSearchMetadata as BeamSearchMetadata,
 )
@@ -900,19 +925,6 @@ def sanitize_top_k(top_k: torch.Tensor, vocab_size: int) -> torch.Tensor:
     return torch.where(top_k > 0, top_k, torch.full_like(top_k, vocab_size)).clamp(max=vocab_size)
 
 
-if IS_FLASHINFER_AVAILABLE:
-    from tensorrt_llm._torch.pyexecutor.sampler.kernels import flashinfer
-    from tensorrt_llm._torch.pyexecutor.sampler.kernels.flashinfer import (
-        sampling_from_probs_generator_op,
-        softmax_op,
-        top_k_mask_logits_op,
-        top_k_sampling_from_probs_generator_op,
-        top_k_top_p_sampling_from_logits_with_generator_op,
-        top_p_renorm_probs_op,
-        top_p_sampling_from_probs_generator_op,
-    )
-
-
 @torch.compile(options={"max-autotune": True})
 def compute_probs_from_logits(
     logits: torch.Tensor,
@@ -947,18 +959,18 @@ def sampling_batch_spec_dec_one_model(
     top_p: torch.Tensor,
     seed: Optional[int] = None,
     offset: Optional[int] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """CUDA-graph compatible sampling; supports mixed sampling params."""
+) -> torch.Tensor:
+    """CUDA-graph compatible sampling; supports mixed sampling params. Returns sampled tokens."""
     top_k = sanitize_top_k(top_k, logits.shape[-1])
     # Greedy rows (temperature <= threshold) must return the argmax token, not a
     # sample from the temperature-scaled distribution. Capture the argmax from the
-    # *original* logits up front; _safely_apply_temperature then guards the division
+    # *original* logits up front; _safely_apply_temperature_inplace then guards the division
     # against the greedy sentinel, and torch.where restores the greedy rows below.
     # All ops are branch-free (no data-dependent control flow), so this stays
     # CUDA-graph safe.
     is_greedy = temperatures <= vanilla._GREEDY_TEMPERATURE_THRESHOLD
     greedy_tokens = logits.argmax(dim=-1)
-    logits = vanilla._safely_apply_temperature(logits, temperatures)
+    logits = vanilla._safely_apply_temperature_inplace(logits, temperatures)
     if IS_FLASHINFER_AVAILABLE:
         sampled = flashinfer.top_k_top_p_sampling_from_logits_op(
             logits, top_k, top_p, seed=seed, offset=offset

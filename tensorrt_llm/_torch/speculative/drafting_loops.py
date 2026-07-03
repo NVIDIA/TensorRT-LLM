@@ -150,7 +150,7 @@ class LinearDraftingLoopWrapper(BaseDraftingLoopWrapper):
 
     def sample(self, logits: torch.Tensor) -> torch.Tensor:
         # TODO: inject the sampler here so we can support non-greedy
-        tokens = greedy(logits, return_probs=False)[0]
+        tokens, _ = greedy(logits, return_probs=False)
         if hasattr(self.draft_model.model, "d2t"):
             d2t = self.draft_model.model.d2t.data
             return tokens + d2t[tokens]

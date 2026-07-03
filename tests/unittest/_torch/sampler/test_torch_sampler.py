@@ -1615,17 +1615,7 @@ class TestBatchedSampling:
         expected_cls = (
             FlashInferGroupedStrategySampler if use_flashinfer else SimpleGroupedStrategySampler
         )
-        # Verify the full strategy-grouping contract bound into _bound_backend, not
-        # just one callable: a partial/mismatched bind must fail this test.
-        assert (
-            sampler._bound_backend.sample_grouped_strategies
-            == expected_cls.sample_grouped_strategies
-        )
-        assert sampler._bound_backend.strategy_grouping_key == expected_cls.strategy_grouping_key
-        assert (
-            sampler._bound_backend.get_metadata_type_for_group
-            == expected_cls.get_metadata_type_for_group
-        )
+        assert sampler._grouped_sampler_cls == expected_cls
 
     @pytest.mark.parametrize(
         (
@@ -1926,11 +1916,8 @@ class TestBatchedSampling:
         flashinfer_keys_seen: set[Any] = set()
 
         if use_flashinfer:
-            assert (
-                sampler._bound_backend.sample_grouped_strategies
-                == FlashInferGroupedStrategySampler.sample_grouped_strategies
-            )
-            sample_grouped_strategies_orig = sampler._bound_backend.sample_grouped_strategies
+            assert sampler._grouped_sampler_cls == FlashInferGroupedStrategySampler
+            sample_grouped_strategies_orig = sampler._grouped_sampler_cls.sample_grouped_strategies
 
             def _sample_grouped_strategies(
                 group_key: FlashInferGroupedStrategySampler.STRATEGY_KEY_TYPE,
@@ -1959,11 +1946,14 @@ class TestBatchedSampling:
                     return_probs=return_probs,
                 )
 
-            patch_ctx.setattr(
-                sampler._bound_backend,
-                "sample_grouped_strategies",
-                _sample_grouped_strategies,
+            # _grouped_sampler_cls is a class; point the instance at a subclass
+            # that overrides the callable, rather than mutating the shared class.
+            instrumented_cls = type(
+                "InstrumentedFlashInferGroupedStrategySampler",
+                (FlashInferGroupedStrategySampler,),
+                {"sample_grouped_strategies": staticmethod(_sample_grouped_strategies)},
             )
+            patch_ctx.setattr(sampler, "_grouped_sampler_cls", instrumented_cls)
 
             sample_async_orig = sampler.sample_async
 

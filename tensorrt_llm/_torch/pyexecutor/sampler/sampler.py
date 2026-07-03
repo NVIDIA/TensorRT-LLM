@@ -80,7 +80,6 @@ from tensorrt_llm.sampling_params import (
     check_logprobs_limit,
 )
 
-from ...flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ...speculative.interface import get_force_num_accepted_tokens
 from ...speculative.spec_tree_manager import SpecTreeManager
 from ...utils import torch_multi_arange
@@ -88,6 +87,7 @@ from ..finish_reason import FinishedState
 from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..resource_manager import ResourceManager, ResourceManagerType
 from ..scheduler import ScheduledRequests
+from .kernels.interface import SamplerConfig, resolve_sampling_backend
 from .sampling_utils import (
     BEAM_SEARCH_PAD_TOKEN,
     GREEDY,
@@ -2347,12 +2347,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self.LOGPROBS_SHAPE = (self.max_num_sequences, self.max_beam_width, self.max_tokens)
         self.TOPK_LOGPROBS_SHAPE = (self.max_num_sequences, self.max_tokens, self.max_topk_logprobs)
 
-        from .kernels.interface import SamplerConfig, resolve_sampling_backend
-
-        self._bound_backend = resolve_sampling_backend(
-            torch.device("cuda"),
-            SamplerConfig(
-                use_flashinfer=IS_FLASHINFER_AVAILABLE and not args.disable_flashinfer_sampling,
+        self._grouped_sampler_cls = resolve_sampling_backend(
+            is_cuda=True,
+            config=SamplerConfig(
+                # IS_FLASHINFER_AVAILABLE is checked inside resolve_sampling_backend.
+                use_flashinfer=not args.disable_flashinfer_sampling,
             ),
         )
 
@@ -4046,7 +4045,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         grouped_requests = self._request_grouper.group_requests_by_strategy_key(
             requests,
             pin_memory=prefer_pinned(),
-            strategy_to_key=self._bound_backend.strategy_grouping_key,
+            strategy_to_key=self._grouped_sampler_cls.strategy_grouping_key,
             seq_slots=seq_slots,
             vocab_size=logits_cuda.size(1),  # Dummy value; strategy should already be cached
         )
@@ -4055,7 +4054,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             grouped_requests,
             seq_slots,
             seq_lens,
-            get_metadata_type_for_group_fn=self._bound_backend.get_metadata_type_for_group,
+            get_metadata_type_for_group_fn=self._grouped_sampler_cls.get_metadata_type_for_group,
             seq_slots_cuda=seq_slots_cuda,
             seq_lens_cuda=seq_lens_cuda,
         )
@@ -4181,7 +4180,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             ]
 
             group_next_tokens_cuda, group_softmax_cuda, group_temperature_cuda = (
-                self._bound_backend.sample_grouped_strategies(
+                self._grouped_sampler_cls.sample_grouped_strategies(
                     strategy_key,
                     group_strategies_per_step,
                     group_logits_cuda,
