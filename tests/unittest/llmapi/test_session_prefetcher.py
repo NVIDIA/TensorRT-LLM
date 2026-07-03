@@ -104,6 +104,32 @@ def test_cls_n_gpus_fallback():
     assert session_prefetcher._spec_of(item) == 8
 
 
+class _FakePool:
+    def __init__(self, n_workers):
+        self.n_workers = n_workers
+        self.shut = False
+
+    def shutdown(self):
+        self.shut = True
+
+
+@pytest.mark.prefetch_session(2)
+def test_fixture_hands_over_prefetched_pool(request, monkeypatch):
+    pool = _FakePool(2)
+    monkeypatch.setattr(session_prefetcher.PREFETCHER, "take", lambda spec: pool)
+    assert request.getfixturevalue("prefetched_mpi_session") is pool
+
+
+@pytest.mark.prefetch_session(2)
+def test_fixture_falls_back_to_sync_build(request, monkeypatch):
+    import tensorrt_llm.llmapi.mpi_session as mpi_session_mod
+
+    monkeypatch.setattr(session_prefetcher.PREFETCHER, "take", lambda spec: None)
+    monkeypatch.setattr(mpi_session_mod, "MpiPoolSession", _FakePool)
+    session = request.getfixturevalue("prefetched_mpi_session")
+    assert isinstance(session, _FakePool) and session.n_workers == 2
+
+
 def test_warm_page_cache_reads_weight_files(tmp_path):
     payload = b"x" * (1 << 20)
     (tmp_path / "model-00001.safetensors").write_bytes(payload)
