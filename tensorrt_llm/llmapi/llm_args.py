@@ -3407,6 +3407,15 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "Set to 0 to disable prefetch. Only effective with KV cache manager v2 and block reuse enabled."
     )
 
+    enable_inclusive_host_cache: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Keep a block's clean host copy when it is recalled host->GPU so a later eviction can "
+        "reuse it instead of re-writing to host, avoiding redundant device-to-host copies for "
+        "blocks that bounce GPU<->host. Requires a host cache tier (``host_cache_size`` > 0). "
+        "Default False. Only used with KV cache manager v2 (experimental).")
+
     def _to_pybind(self):
         config = _KvCacheConfig(
             enable_block_reuse=self.enable_block_reuse,

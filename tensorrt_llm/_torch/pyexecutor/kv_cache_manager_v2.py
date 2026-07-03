@@ -1051,6 +1051,8 @@ class KVCacheManagerV2(BaseResourceManager):
             max_util_for_resume=kv_cache_config.max_util_for_resume,
             enable_stats=self.enable_stats,
             layers=layer_configs,
+            enable_inclusive_host_cache=kv_cache_config.
+            enable_inclusive_host_cache,
         )
 
     def _extra_buffers_per_layer(
