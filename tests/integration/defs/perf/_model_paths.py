@@ -109,6 +109,8 @@ MODEL_PATH_DICT = {
     "deepseek_v3.2_fp4": "DeepSeek-V3.2-NVFP4",
     # DeepSeek V4 Pro (1.6T MoE / 49B activated)
     "deepseek_v4_pro_fp4": "DeepSeek-V4-Pro",
+    # DeepSeek V4 (sparse-MLA MoE, FP8 block-scale)
+    "deepseek_v4_flash_base_fp8": "DeepSeek-V4-Flash-Base",
     # GLM-5 FP8 (MoE)
     "glm_5_fp8": "GLM-5-FP8",
     # Kimi K2.5 NVFP4 (~1T MoE multimodal)

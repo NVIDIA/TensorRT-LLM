@@ -90,6 +90,19 @@ def get_model_yaml_config(model_label: str,
                 'enable_attention_dp': True,
             }
         },
+        # DeepSeek V4-Flash-Base (FP8 block-scale, sparse-MLA). Mirrors the
+        # accuracy test config: attention DP on, TRTLLM MoE backend (CUTLASS FP8
+        # block-scale JITs DeepGEMM kernels that only target Hopper), seq len 4096.
+        {
+            'patterns': ['deepseek_v4_flash_base'],
+            'config': {
+                'enable_attention_dp': True,
+                'moe_config': {
+                    'backend': 'TRTLLM',
+                },
+                'max_seq_len': 4096,
+            }
+        },
         # DeepSeek R1 models with MTP speculative decoding
         {
             'patterns': [
