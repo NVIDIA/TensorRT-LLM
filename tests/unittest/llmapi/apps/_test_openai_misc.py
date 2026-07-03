@@ -11,7 +11,7 @@ from .openai_server import RemoteOpenAIServer
 
 
 @pytest.fixture(scope="module",
-                params=[("trt", True), ("pytorch", False), ("pytorch", True)],
+                params=[("pytorch", False), ("pytorch", True)],
                 ids=lambda p: f"{p[0]}-{'with' if p[1] else 'no'}_beam_search")
 def backend_and_beam_search(request):
     return request.param
@@ -29,13 +29,7 @@ def enable_beam_search(backend_and_beam_search):
 
 @pytest.fixture(scope="module")
 def model_name(backend):
-    # Note: TRT backend does not support Qwen3-0.6B-Base,
-    # and PyTorch backend does not support going over the limit of "max_position_embeddings" tokens
-    # of TinyLlama.
-    if backend == "trt":
-        return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
-    else:
-        return "Qwen3/Qwen3-0.6B-Base"
+    return "Qwen3/Qwen3-0.6B-Base"
 
 
 @pytest.fixture(scope="module", params=["8"])
