@@ -1,4 +1,3 @@
-RequestTest/invalidInputs.py::RequestTest.invalidInputs SKIP (https://nvbugs/6412081)
 accuracy/test_cli_flow.py::TestGemma2_9BIt::test_auto_dtype SKIP (TRTLLM-13781: legacy TensorRT examples removed; tests to be removed in follow-up PR3)
 accuracy/test_cli_flow.py::TestGptNext::test_auto_dtype SKIP (TRTLLM-13781: legacy TensorRT examples removed; tests to be removed in follow-up PR3)
 accuracy/test_cli_flow.py::TestLlama3_1_8B::test_fp8_rowwise_meta_recipe SKIP (TRTLLM-13781: legacy TensorRT examples removed; tests to be removed in follow-up PR3)
