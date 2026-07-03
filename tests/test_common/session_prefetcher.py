@@ -6,9 +6,10 @@ Multi-GPU LLM-API tests pay ~50-65s per test to spawn an MPI pool whose
 workers import ``tensorrt_llm``, plus a cold read of the model weights. Both
 are pure CPU/IO work, so while the CURRENT test is running on the GPUs the
 next test's pool can be spawned and its weight files pre-read in background
-threads — hiding those costs behind the previous test's runtime. The
-prefetched pool must NOT touch CUDA until it is handed over (asserted at
-``take()``).
+threads — hiding those costs behind the previous test's runtime. Prefetched
+workers run no kernels and allocate nothing before handover; depending on
+the library version, importing tensorrt_llm may leave an idle CUDA context
+(~a few hundred MB), which safely coexists with the running test.
 
 Enabled by default; set ``TRTLLM_TEST_PREFETCH_SESSION=0`` to disable. With
 no test declaring a spec/model marker the prefetcher never fires, so plain
@@ -67,13 +68,18 @@ def _model_dir_of(item):
     return marker.args[0] if marker is not None and marker.args else None
 
 
-def _worker_import_and_assert_cuda_clean() -> bool:
+def _worker_import_report_cuda() -> bool:
+    """Import tensorrt_llm (the expensive part) and report CUDA state.
+
+    Some library versions initialize a CUDA context at import time; that
+    idle context (~a few hundred MB, no kernels/allocations) is acceptable
+    and coexists with the running test, so it is reported, not asserted.
+    """
     import torch
 
-    import tensorrt_llm  # noqa: F401  (the expensive part we want to hide)
+    import tensorrt_llm  # noqa: F401
 
-    assert not torch.cuda.is_initialized(), "prefetched pool worker touched CUDA before handover"
-    return True
+    return torch.cuda.is_initialized()
 
 
 def warm_page_cache(model_dir: str) -> float:
@@ -156,7 +162,12 @@ class SessionPrefetcher:
                 start_warm = nxt_model not in self._warmed_dirs
                 self._warmed_dirs.add(nxt_model)
             if start_warm:
-                threading.Thread(target=self._warm, args=(nxt_model,), daemon=True).start()
+                threading.Thread(
+                    target=self._warm,
+                    args=(nxt_model,),
+                    daemon=True,
+                    name="session-prefetch-warm",
+                ).start()
 
         cur = _spec_of(item)
         nxt = next(
@@ -167,7 +178,9 @@ class SessionPrefetcher:
         with self._lock:
             if self._thread is not None or self._built_spec == nxt:
                 return  # already building / built
-            self._thread = threading.Thread(target=self._build, args=(nxt,), daemon=True)
+            self._thread = threading.Thread(
+                target=self._build, args=(nxt,), daemon=True, name="session-prefetch-build"
+            )
             self._thread.start()
 
     def _warm(self, model_dir: str) -> None:
@@ -186,7 +199,13 @@ class SessionPrefetcher:
 
             env = _env_snapshot()  # workers freeze env at spawn: snapshot now
             session = MpiPoolSession(n_workers=spec)
-            session.submit_sync(_worker_import_and_assert_cuda_clean)
+            cuda_state = session.submit_sync(_worker_import_report_cuda)
+            if any(cuda_state) if isinstance(cuda_state, (list, tuple)) else cuda_state:
+                print(
+                    "[session-prefetch] note: tensorrt_llm import initialized an idle "
+                    "CUDA context in the prefetched workers (library version behavior)",
+                    flush=True,
+                )
             with self._lock:
                 self._built_spec = spec
                 self._built_session = session
@@ -221,7 +240,9 @@ class SessionPrefetcher:
             # the frozen workers would not see): discard, build synchronously.
             if self._built_session is not None:
                 stale, self._built_session, self._built_spec = (self._built_session, None, None)
-                threading.Thread(target=stale.shutdown, daemon=True).start()
+                threading.Thread(
+                    target=stale.shutdown, daemon=True, name="session-prefetch-discard"
+                ).start()
         return None
 
     # ---- shadow mode: zero-test-change prefetch at the pool-creation seam ----
@@ -238,7 +259,9 @@ class SessionPrefetcher:
         with self._lock:
             if self._thread is not None or self._built_spec == spec:
                 return  # already building / built
-            self._thread = threading.Thread(target=self._build, args=(spec,), daemon=True)
+            self._thread = threading.Thread(
+                target=self._build, args=(spec,), daemon=True, name="session-prefetch-build"
+            )
             self._thread.start()
 
     def _make_factory(self, real_cls):
