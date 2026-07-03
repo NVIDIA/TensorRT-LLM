@@ -100,7 +100,7 @@ def top_k_top_p_sampling_from_logits_with_generator_op(
     )
 
 
-def top_k_sampling_from_probs_op(
+def top_k_sampling_from_probs_generator_op(
     probs: torch.Tensor,
     top_k: torch.Tensor,
     generator: Optional[torch.Generator],
@@ -115,7 +115,7 @@ def top_k_sampling_from_probs_op(
     )
 
 
-def top_p_sampling_from_probs_op(
+def top_p_sampling_from_probs_generator_op(
     probs: torch.Tensor,
     top_p: torch.Tensor,
     generator: Optional[torch.Generator],

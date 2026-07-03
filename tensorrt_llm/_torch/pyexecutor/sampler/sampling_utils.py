@@ -660,7 +660,7 @@ class _StrategyImpls:
             probs = self._prepare_probs_with_temperature(
                 logits, group_logit_indices, self._temperature
             )
-            return top_k_sampling_from_probs_op(
+            return top_k_sampling_from_probs_generator_op(
                 probs, self._top_k, generator, check_nan=self._flashinfer_check_nans(probs)
             ), None
 
@@ -691,7 +691,7 @@ class _StrategyImpls:
             probs = self._prepare_probs_with_temperature(
                 logits, group_logit_indices, self._temperature
             )
-            return top_p_sampling_from_probs_op(
+            return top_p_sampling_from_probs_generator_op(
                 probs, self._top_p, generator, check_nan=self._flashinfer_check_nans(probs)
             ), None
 
@@ -906,10 +906,10 @@ if IS_FLASHINFER_AVAILABLE:
         sampling_from_probs_generator_op,
         softmax_op,
         top_k_mask_logits_op,
-        top_k_sampling_from_probs_op,
+        top_k_sampling_from_probs_generator_op,
         top_k_top_p_sampling_from_logits_with_generator_op,
         top_p_renorm_probs_op,
-        top_p_sampling_from_probs_op,
+        top_p_sampling_from_probs_generator_op,
     )
 
 

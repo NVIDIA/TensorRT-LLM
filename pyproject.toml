@@ -1524,6 +1524,7 @@ ignore_errors = true
 [[tool.mypy.overrides]]
 module = [
     "tensorrt_llm._torch.pyexecutor.sampler",
+    "tensorrt_llm._torch.pyexecutor.sampler.*",
 ]
 disable_error_code = [
     "no-untyped-call"
