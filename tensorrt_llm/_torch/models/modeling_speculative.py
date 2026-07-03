@@ -1426,6 +1426,151 @@ class DFlashForCausalLM(nn.Module):
         return hidden_states_out, hidden_states_out
 
 
+class DominoForCausalLM(DFlashForCausalLM):
+    """Draft model wrapper for Domino speculative decoding.
+
+    Domino draft models share DFlash's cross-attention forward and per-slot
+    K/V pool; the only structural addition is a small causal correction head
+    used at draft-token sampling time:
+
+    - ``prefix_gru``: a single-layer GRU over committed prefix-token embeddings
+      that produces a causal hidden state ``s_i`` per draft position.
+    - ``embed_proj``: a 2-layer MLP (Linear -> SiLU -> Linear) that maps
+      ``[z_i, s_i]`` to a per-vocab bias added to the base draft logits.
+
+    Weight loading extends ``DFlashForCausalLM`` to recognize ``prefix_gru.*``
+    and ``embed_proj.*`` keys present in Domino checkpoints.
+    """
+
+    def __init__(self, draft_config):
+        super().__init__(draft_config)
+
+        pretrained_config = draft_config.pretrained_config
+        dflash_config = getattr(pretrained_config, 'dflash_config', {}) or {}
+        self._gru_hidden_dim = int(
+            dflash_config.get('gru_hidden_dim')
+            or getattr(pretrained_config, 'gru_hidden_dim', None) or 0)
+        self._embed_proj_dim = int(
+            dflash_config.get('emb_dim')
+            or getattr(pretrained_config, 'emb_dim', None) or 0)
+
+        # prefix_gru / embed_proj are constructed lazily during load_weights so
+        # that the parameter dtypes / shapes match the checkpoint exactly.
+        self.prefix_gru = None
+        self.embed_proj = None
+
+        logger.info(
+            f"Domino draft model initialized (gru_hidden_dim={self._gru_hidden_dim}, "
+            f"embed_proj_dim={self._embed_proj_dim})")
+
+    def _build_domino_head(self, weights: Dict) -> None:
+        """Materialize prefix_gru and embed_proj from checkpoint weights."""
+        gru_w_ih = weights.get('prefix_gru.weight_ih_l0')
+        gru_w_hh = weights.get('prefix_gru.weight_hh_l0')
+        emb0 = weights.get('embed_proj.0.weight')
+        emb2 = weights.get('embed_proj.2.weight')
+        if any(t is None for t in (gru_w_ih, gru_w_hh, emb0, emb2)):
+            raise ValueError(
+                "Domino checkpoint missing required weights: expected "
+                "prefix_gru.weight_ih_l0, prefix_gru.weight_hh_l0, "
+                "embed_proj.0.weight, embed_proj.2.weight.")
+
+        # prefix_gru: GRU(input=hidden_size, hidden=gru_hidden_dim,
+        #                 num_layers=1, batch_first=True, bias=False)
+        # weight_ih shape: [3*gru_hidden, hidden_size]
+        # weight_hh shape: [3*gru_hidden, gru_hidden]
+        gru_hidden = gru_w_hh.shape[1]
+        input_size = gru_w_ih.shape[1]
+        if self._gru_hidden_dim and self._gru_hidden_dim != gru_hidden:
+            logger.warning(
+                "Domino: config gru_hidden_dim=%d disagrees with checkpoint "
+                "shape %d; using checkpoint shape.", self._gru_hidden_dim,
+                gru_hidden)
+        self._gru_hidden_dim = gru_hidden
+
+        gru = nn.GRU(input_size=input_size,
+                     hidden_size=gru_hidden,
+                     num_layers=1,
+                     batch_first=True,
+                     bias=False,
+                     device='cuda',
+                     dtype=gru_w_ih.dtype)
+        with torch.no_grad():
+            gru.weight_ih_l0.data.copy_(gru_w_ih)
+            gru.weight_hh_l0.data.copy_(gru_w_hh)
+        # Repack weights into a single contiguous chunk so cuDNN does not
+        # re-flatten on every forward call (silences the warning and removes
+        # per-call overhead — relevant since this GRU runs O(K) times per
+        # draft step on the hot path).
+        gru.flatten_parameters()
+        self.prefix_gru = gru
+        # Cache contiguous transposed copies of the GRU weight matrices for the
+        # hand-rolled fused-cell path used by the K-step Domino draft loop.
+        # cuDNN's single-step GRU launches several distinct kernels per call,
+        # which adds up across K iterations in the hot path; the hand-rolled
+        # cell expresses the same math as 2 GEMMs + a few elementwise ops and
+        # composes better into the outer CUDA graph. We pull the weights from
+        # the GRU module (CUDA-resident after the .data.copy_ above) — using
+        # the original `gru_w_*` source would leave the buffer on CPU.
+        # persistent=False: these are derivable from prefix_gru / embed_proj
+        # weights at load time; persisting them would bloat saved checkpoints
+        # by several hundred MB with no inference benefit.
+        self.register_buffer("prefix_gru_w_ih_t",
+                             gru.weight_ih_l0.detach().t().contiguous(),
+                             persistent=False)
+        self.register_buffer("prefix_gru_w_hh_t",
+                             gru.weight_hh_l0.detach().t().contiguous(),
+                             persistent=False)
+
+        # embed_proj: Linear(in, emb_dim) -> SiLU -> Linear(emb_dim, vocab)
+        emb_dim = emb0.shape[0]
+        in_dim = emb0.shape[1]
+        vocab_size = emb2.shape[0]
+        if self._embed_proj_dim and self._embed_proj_dim != emb_dim:
+            logger.warning(
+                "Domino: config emb_dim=%d disagrees with checkpoint %d; "
+                "using checkpoint value.", self._embed_proj_dim, emb_dim)
+        self._embed_proj_dim = emb_dim
+
+        proj = nn.Sequential(
+            nn.Linear(in_dim,
+                      emb_dim,
+                      bias=False,
+                      device='cuda',
+                      dtype=emb0.dtype),
+            nn.SiLU(),
+            nn.Linear(emb_dim,
+                      vocab_size,
+                      bias=False,
+                      device='cuda',
+                      dtype=emb2.dtype),
+        )
+        with torch.no_grad():
+            proj[0].weight.data.copy_(emb0)
+            proj[2].weight.data.copy_(emb2)
+        self.embed_proj = proj
+
+    def load_weights(self, weights: Dict, weight_mapper=None, **kwargs):
+        """Load Domino-specific Domino-head weights, then defer to DFlash."""
+        domino_head_keys = (
+            'prefix_gru.weight_ih_l0',
+            'prefix_gru.weight_hh_l0',
+            'embed_proj.0.weight',
+            'embed_proj.2.weight',
+        )
+        head_weights = {k: weights[k] for k in domino_head_keys if k in weights}
+        if head_weights:
+            self._build_domino_head(head_weights)
+            # Avoid `pop` — `weights` may be a ConsumableWeightsDict, which
+            # supports `__delitem__` but not `pop`.
+            for k in domino_head_keys:
+                if k in weights:
+                    del weights[k]
+        super().load_weights(weights=weights,
+                             weight_mapper=weight_mapper,
+                             **kwargs)
+
+
 class MTPForCausalLM(nn.Module):
 
     def __init__(
@@ -1668,6 +1813,8 @@ def get_draft_model(model_config, draft_config, lm_head, model):
         return PARDForCausalLM(draft_config)
     elif spec_dec_mode.is_dflash():
         return DFlashForCausalLM(draft_config)
+    elif spec_dec_mode.is_domino():
+        return DominoForCausalLM(draft_config)
     elif spec_dec_mode.is_draft_target_one_model():
         return AutoModelForCausalLM.from_config(draft_config)
     else:
@@ -1847,7 +1994,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
 
         if self.spec_config and (
                 not self.spec_config.spec_dec_mode.is_external_drafter()
-                or self.spec_config.spec_dec_mode.is_dflash()):
+                or self.spec_config.spec_dec_mode.is_dflash()
+                or self.spec_config.spec_dec_mode.is_domino()):
             self.draft_model.load_weights_from_target_model(self)
 
     def set_guided_decoder(self,
