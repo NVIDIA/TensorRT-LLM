@@ -404,11 +404,23 @@ class KVCacheManager:
         if reuse_scope is None:
             reuse_scope = ReuseScope()
         assert type(reuse_scope) is ReuseScope
-        # Arena mode P0: reuse onboarding (stale->active copy into the arena,
-        # DESIGN.md §4.4) is not wired up yet, so skip matching rather than
-        # locking radix pages in place.
-        match_allowed = input_tokens is not None and not self._storage.is_arena_mode
-        reuse_match = self._match_reuse(reuse_scope, input_tokens) if match_allowed else None
+        reuse_match = (
+            self._match_reuse(reuse_scope, input_tokens) if input_tokens is not None else None
+        )
+        if self._storage.is_arena_mode:
+            # Validate arena preconditions here: raising inside _KVCache.__init__
+            # would leave a partially constructed object for __del__.
+            if max_capacity is None or max_capacity <= 0:
+                raise ValueError(
+                    "contiguous-arena mode requires a positive max_capacity to size the "
+                    "sequence's VA reservation (DESIGN.md §4.1)"
+                )
+            if reuse_match is not None and reuse_match.num_tokens > max_capacity:
+                raise ValueError(
+                    f"reuse match ({reuse_match.num_tokens} tokens) exceeds max_capacity "
+                    f"({max_capacity}); the matched prefix must fit the VA reservation "
+                    f"(DESIGN.md §4.1)"
+                )
         if expected_prompt_length is None and input_tokens is not None:
             expected_prompt_length = len(input_tokens)
         return _KVCache(
@@ -563,7 +575,10 @@ class KVCacheManager:
 
     @property
     def enable_partial_match(self) -> bool:
-        return self._init_config.enable_partial_reuse
+        # Arena mode P0 onboards full committed blocks only; partial-block
+        # reuse needs the deferred private-copy path adapted to arena slots
+        # (DESIGN.md §4.4/§7).
+        return self._init_config.enable_partial_reuse and not self._storage.is_arena_mode
 
     @property
     def ssm_reuse_interval(self) -> int:

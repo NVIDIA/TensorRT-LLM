@@ -772,14 +772,16 @@ class StorageManager:
         coalesced: adjacent (dst, src) pairs merge into fewer, larger
         transfers.
         """
-        assert defrag or dst_level != src_level, (
+        explicit_dst = dst_slots is not None
+        # Same-level copies are legal when defragmenting or when copying into
+        # explicit arena destinations (D2D reuse onboarding, §4.4).
+        assert defrag or explicit_dst or dst_level != src_level, (
             "dst_level and src_level must be different unless performing defragmentation"
         )
         num_slots = len(src_pages)
         num_pools = self.num_pools(pool_group_index)
         src_pool_group = self._pool_group(src_level, pool_group_index)
         dst_pool_group = self._pool_group(dst_level, pool_group_index)
-        explicit_dst = dst_slots is not None
         if dst_slots is None:
             if dst_pool_group.num_free_slots < num_slots:
                 raise OutOfPagesError("Not enough free slots")

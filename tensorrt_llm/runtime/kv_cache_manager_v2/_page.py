@@ -246,6 +246,23 @@ class CommittedPage(Page):
         self.__rawref__.invalidate()
 
 
+class PrivateCommittedPage(CommittedPage):
+    """A sequence-private copy of a committed block (contiguous-arena reuse
+    onboarding, DESIGN.md §4.4): same immutable content and tree-block
+    association as the canonical :class:`CommittedPage`, but it is never
+    registered in ``block.storage`` and its death must not unset the canonical
+    radix entry. Dropped (not offloaded) when its sequence frees -- the
+    canonical copy in the stale tier already covers reuse (§4.3)."""
+
+    __slots__ = ()
+
+    def __del__(self) -> None:
+        # Deliberately bypass CommittedPage.__del__: this page does not own
+        # the tree entry.
+        Page.__del__(self)
+        self.__rawref__.invalidate()
+
+
 @dataclass(slots=True)
 class _PageHolder:
     "Prevents pages from being dropped."

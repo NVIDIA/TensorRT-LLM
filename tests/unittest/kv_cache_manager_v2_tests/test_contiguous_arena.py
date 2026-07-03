@@ -948,10 +948,70 @@ class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
         s.take_finish_event().synchronize()
         manager.drain_gpu_reclaim()
 
-    def test_reuse_matching_disabled(self) -> None:
+    def _block_floats(self, page_index: int) -> "torch.Tensor":
+        addr = int(
+            self.manager._storage.slot_address(
+                GPU_LEVEL, PoolGroupIndex(0), page_index, PoolIndex(0)
+            )
+        )
+        return TestSparseVirtMem._tensor_at(addr, (4 * 8192) // 4)
+
+    def test_reuse_onboarding_roundtrip(self) -> None:
+        """§4.4 stale->active reuse round-trip.
+
+        A reuse hit copies the matched prefix from the host tier into the new
+        sequence's arena range as private pages; the canonical host copies
+        survive the second sequence's close (no duplicates).
+        """
         manager = self.manager
+        budget = manager._storage.gpu_page_budget
         tokens = [200 + i for i in range(2 * self.TPB)]
         kv1 = manager.create_kv_cache(input_tokens=tokens, max_capacity=4 * self.TPB)
+        self.assertEqual(kv1.history_length, 0)  # empty radix tree: no match
+        with TemporaryCudaStream([]) as s:
+            stream = CudaStream(s.handle)
+            self.assertTrue(kv1.resume(stream))
+            self.assertTrue(kv1.resize(2 * self.TPB))
+            for j, idx in enumerate(kv1.get_base_page_indices(LifeCycleId(0))):
+                self._block_floats(idx).fill_(1.0 + j)
+            torch.cuda.synchronize()
+            kv1.commit(tokens)
+            kv1.close()
+        s.take_finish_event().synchronize()
+        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        host_stats = manager._storage.get_statistics(CacheLevel(1))[0]
+        self.assertEqual(host_stats.total - host_stats.free, 2)
+
+        # arena mode matches full blocks only (partial matching disabled)
+        kv2 = manager.create_kv_cache(
+            input_tokens=tokens + [900, 901, 902], max_capacity=4 * self.TPB
+        )
+        self.assertEqual(kv2.history_length, 2 * self.TPB)
+        with TemporaryCudaStream([]) as s:
+            stream = CudaStream(s.handle)
+            self.assertTrue(kv2.resume(stream))
+            torch.cuda.synchronize()
+            indices = list(kv2.get_base_page_indices(LifeCycleId(0)))
+            self.assertEqual(indices, list(range(indices[0], indices[0] + 2)))
+            for j, idx in enumerate(indices):
+                data = self._block_floats(idx)
+                self.assertTrue(bool((data == 1.0 + j).all().item()))
+            # growth continues the same consecutive run past the reused prefix
+            self.assertTrue(kv2.resize(3 * self.TPB))
+            indices = list(kv2.get_base_page_indices(LifeCycleId(0)))
+            self.assertEqual(indices, list(range(indices[0], indices[0] + 3)))
+            kv2.close()
+        s.take_finish_event().synchronize()
+        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        self.assertEqual(budget.used_pages, 0)
+        # private copies were dropped, not offloaded: still exactly 2 host blocks
+        host_stats = manager._storage.get_statistics(CacheLevel(1))[0]
+        self.assertEqual(host_stats.total - host_stats.free, 2)
+
+    def test_reuse_match_must_fit_max_capacity(self) -> None:
+        manager = self.manager
+        tokens = [300 + i for i in range(2 * self.TPB)]
+        kv1 = manager.create_kv_cache(input_tokens=tokens, max_capacity=2 * self.TPB)
         with TemporaryCudaStream([]) as s:
             stream = CudaStream(s.handle)
             self.assertTrue(kv1.resume(stream))
@@ -960,11 +1020,8 @@ class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
             kv1.close()
         s.take_finish_event().synchronize()
         manager.drain_gpu_reclaim()
-        # the blocks are in the radix tree (host), but arena-mode creation
-        # skips matching until §4.4 onboarding lands
-        kv2 = manager.create_kv_cache(input_tokens=tokens, max_capacity=4 * self.TPB)
-        self.assertEqual(kv2.history_length, 0)
-        kv2.close()
+        with self.assertRaises(ValueError):
+            manager.create_kv_cache(input_tokens=tokens, max_capacity=self.TPB)
 
     def test_suspend_not_supported_yet(self) -> None:
         manager = self.manager

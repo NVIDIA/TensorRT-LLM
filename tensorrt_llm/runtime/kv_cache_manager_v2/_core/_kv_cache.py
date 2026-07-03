@@ -55,6 +55,7 @@ from .._page import (
     BlockPage,
     CommittedPage,
     Page,
+    PrivateCommittedPage,
     ScratchSlotLock,
     UncommittedPage,
     _PageHolder,
@@ -299,15 +300,9 @@ class _KVCache:
         self._pending_stats = _PendingStats()
         self._max_capacity = max_capacity
         self._arena_ranges = None
-        if manager._storage.is_arena_mode:
-            if max_capacity is None or max_capacity <= 0:
-                raise ValueError(
-                    "contiguous-arena mode requires a positive max_capacity to size the "
-                    "sequence's VA reservation (DESIGN.md §4.1)"
-                )
-            assert reuse_match is None, (
-                "reuse onboarding is not wired up in arena mode yet (DESIGN.md §4.4)"
-            )
+        # Arena-mode preconditions are validated by KVCacheManager.create_kv_cache
+        # (raising here would leave a partially constructed object for __del__).
+        assert not manager._storage.is_arena_mode or (max_capacity is not None and max_capacity > 0)
         self.__rawref__ = rawref.NULL
         if reuse_match is not None:
             self._setup_for_reuse(reuse_match)
@@ -522,25 +517,9 @@ class _KVCache:
             manager._try_update_target_ratios()
         arena_ranges = self._arena_ranges
         arena_offload: TypedIndexList[PoolGroupIndex, list[CommittedPage]] | None = None
+        arena_private: list[CommittedPage] = []
         if arena_ranges is not None:
-            # Collect this sequence's committed GPU pages before the block
-            # chain is cleared; they move to the host tier (active->stale
-            # copy-on-free, DESIGN.md §4.3) so the arena range can be
-            # reclaimed. In arena mode GPU pages are never shared across
-            # sequences (reuse copies, §4.4), so they are ours to move.
-            storage = manager._storage
-            arena_offload = make_typed(lambda _: list[CommittedPage](), storage.num_pool_groups)
-            for block in self._blocks:
-                if not block.is_committed:
-                    continue
-                for beam_pages in block.pages:
-                    for p in beam_pages:
-                        if p is None:
-                            continue
-                        page = p.page
-                        if isinstance(page, CommittedPage) and page.cache_level == GPU_LEVEL:
-                            pg_idx = storage.get_pool_group_index(page.life_cycle)
-                            arena_offload[pg_idx].append(page)
+            arena_offload, arena_private = self._arena_collect_committed_gpu_pages()
         with self._record_event():
             self._clear_blocks()
         if arena_ranges is not None:
@@ -556,7 +535,11 @@ class _KVCache:
                     for page in pages:
                         if page.scheduled_for_eviction:
                             storage.exclude_from_eviction(page)
+            for page in arena_private:
+                if page.scheduled_for_eviction:
+                    storage.exclude_from_eviction(page)
             arena_offload = None  # drop our strong refs before range release
+            arena_private.clear()  # private copies die here, freeing their slots
             last_consumer = (
                 self._finish_event if self._finish_event is not None else CachedCudaEvent.NULL
             )
@@ -685,6 +668,43 @@ class _KVCache:
             case PageIndexMode.SHARED:
                 return not self.has_scratch_slots
 
+    def _arena_collect_committed_gpu_pages(
+        self,
+    ) -> tuple[TypedIndexList[PoolGroupIndex, list[CommittedPage]], list[CommittedPage]]:
+        """Collect this sequence's committed GPU pages before the block chain
+        is cleared at close(). Canonical pages (first return, per pool group)
+        move to the host tier (active->stale copy-on-free, DESIGN.md §4.3) so
+        the arena range can be reclaimed; sequence-private reuse copies
+        (second return, §4.4) are dropped -- their canonical stale copy
+        already exists. In arena mode GPU pages are never shared across
+        sequences, so they are ours to move or drop.
+
+        A separate method so its loop locals cannot outlive the collection: a
+        lingering reference to a block's lock chain would delay the holder's
+        death past close()'s eviction-exclusion pass, leaking the page into
+        the (otherwise unused) GPU eviction queue.
+        """
+        storage = self.manager._storage
+        arena_offload: TypedIndexList[PoolGroupIndex, list[CommittedPage]] = make_typed(
+            lambda _: list[CommittedPage](), storage.num_pool_groups
+        )
+        arena_private: list[CommittedPage] = []
+        for block in self._blocks:
+            if not block.is_committed:
+                continue
+            for beam_pages in block.pages:
+                for p in beam_pages:
+                    if p is None:
+                        continue
+                    page = p.page
+                    if isinstance(page, CommittedPage) and page.cache_level == GPU_LEVEL:
+                        if type(page) is CommittedPage:
+                            pg_idx = storage.get_pool_group_index(page.life_cycle)
+                            arena_offload[pg_idx].append(page)
+                        else:
+                            arena_private.append(page)
+        return arena_offload, arena_private
+
     def _arena_ensure_mapped(self, num_valid_blocks: int) -> bool:
         """Demand-map physical pages covering the first ``num_valid_blocks`` of
         this sequence's range in every pool group (DESIGN.md §4.2). On page
@@ -704,6 +724,70 @@ class _KVCache:
                     storage.ensure_gpu_mapped(pg_idx, rng, num_valid_blocks)
                 except OutOfPagesError:
                     return False
+        return True
+
+    def _arena_onboard_matched(self) -> bool:
+        """Copy the matched committed prefix into this sequence's arena ranges
+        (stale->active reuse, DESIGN.md §4.4).
+
+        Each matched block becomes a sequence-private
+        :class:`PrivateCommittedPage` at ``range base + ordinal``; the
+        canonical radix entries are left untouched wherever they live (host,
+        disk, or another sequence's arena -- committed blocks are immutable, so
+        reading them concurrently is safe). Consecutive ordinals give the
+        explicit-destination migrate path contiguous targets to coalesce.
+        Returns False (onboarding nothing) if physical pages are unavailable.
+        """
+        storage = self._storage
+        ranges = self._arena_ranges
+        assert ranges is not None
+        beam_idx = DEFAULT_BEAM_INDEX
+        entries = list[tuple[BlockOrdinal, LifeCycleId, _PageHolder]]()
+        for ordinal, entry_beam, lc_idx in self._active_pages():
+            assert entry_beam == beam_idx
+            holder = expect_type(_PageHolder, self._block(ordinal, beam_idx)[lc_idx])
+            entries.append((ordinal, lc_idx, holder))
+        if not entries:
+            return True
+        if not self._arena_ensure_mapped(self.num_blocks):
+            return False
+        # One explicit-destination migrate per (pool group, source level).
+        dst_slots = list[Slot]()
+        groups: dict[tuple[PoolGroupIndex, CacheLevel], list[int]] = {}
+        for i, (ordinal, lc_idx, holder) in enumerate(entries):
+            pg_idx = storage.get_pool_group_index(lc_idx)
+            dst_slots.append(storage.take_gpu_sequence_slot(pg_idx, ranges[pg_idx], int(ordinal)))
+            groups.setdefault((pg_idx, holder.page.cache_level), []).append(i)
+        copied: list[Slot | None] = [None] * len(entries)
+        for (pg_idx, src_level), idx_list in groups.items():
+            ret = storage._batched_migrate(
+                pg_idx,
+                GPU_LEVEL,
+                src_level,
+                [entries[i][2].page for i in idx_list],
+                update_src=False,
+                migration_recorder=self._record_migrated_slots,
+                dst_slots=[dst_slots[i] for i in idx_list],
+            )
+            assert ret is not None
+            for i, slot in zip(idx_list, ret):
+                copied[i] = slot
+        stream_wait_events(self.cuda_stream, (s.ready_event for s in copied if s is not None))
+        # Wrap the copies as sequence-private committed pages and lock them;
+        # dropping the holders releases the canonical pages back to eviction
+        # control at their current level.
+        for (ordinal, lc_idx, holder), slot in zip(entries, copied):
+            src_page = holder.page
+            assert type(src_page) is CommittedPage, "arena mode matches full committed blocks only"
+            tree_block = src_page.block()
+            assert tree_block is not None
+            assert slot is not None
+            private = PrivateCommittedPage(
+                storage, tree_block, lc_idx, GPU_LEVEL, slot, src_page.priority
+            )
+            self._block(ordinal, beam_idx)[lc_idx] = private.lock(
+                self, beam_idx, ordinal, lc_idx, skip_wait=True
+            )
         return True
 
     # reserve space for next inference. Request new blocks from KVCacheManager if necessary.
@@ -1157,33 +1241,42 @@ class _KVCache:
                         ScratchSlotLock(slot, self, lc_idx, skip_wait=True)
                     )
 
-        tasks = list[BatchedLockTarget]()
-        for ordinal, beam_idx, lc_idx in self._active_pages():
-            beam_block = (
-                self._block(ordinal, beam_idx)
-                if lc_idx != ssm_lc_id
-                else self._ssm_blocks[beam_idx]
-            )
-            page = expect_type(_PageHolder, beam_block[lc_idx]).page
-            tasks.append(BatchedLockTarget(page, beam_idx, ordinal, lc_idx))
-        try:
-            locks = batched_lock_to_gpu(self, tasks, self._record_migrated_slots)
-        except OutOfPagesError:
-            for lc_idx, slot in typed_enumerate(deferred_slots):
-                if slot is not None:
-                    storage.release_slot(lc_idx, GPU_LEVEL, slot)
-            return False
+        if self._arena_ranges is not None:
+            # Stale->active onboarding into this sequence's arena ranges
+            # (DESIGN.md §4.4) instead of locking radix pages in place. No
+            # deferred slots exist in arena mode (no SSM / scratch / partial
+            # matches).
+            assert all(slot is None for slot in deferred_slots)
+            if not self._arena_onboard_matched():
+                return False
+        else:
+            tasks = list[BatchedLockTarget]()
+            for ordinal, beam_idx, lc_idx in self._active_pages():
+                beam_block = (
+                    self._block(ordinal, beam_idx)
+                    if lc_idx != ssm_lc_id
+                    else self._ssm_blocks[beam_idx]
+                )
+                page = expect_type(_PageHolder, beam_block[lc_idx]).page
+                tasks.append(BatchedLockTarget(page, beam_idx, ordinal, lc_idx))
+            try:
+                locks = batched_lock_to_gpu(self, tasks, self._record_migrated_slots)
+            except OutOfPagesError:
+                for lc_idx, slot in typed_enumerate(deferred_slots):
+                    if slot is not None:
+                        storage.release_slot(lc_idx, GPU_LEVEL, slot)
+                return False
 
-        # Replace all holders with locks.
-        for (ordinal, beam_idx, lc_idx), lock in zip(self._active_pages(), locks):
-            beam_block = (
-                self._block(ordinal, beam_idx)
-                if lc_idx != ssm_lc_id
-                else self._ssm_blocks[beam_idx]
-            )
-            page = expect_type(_PageHolder, beam_block[lc_idx]).page
-            assert page is lock.page
-            beam_block[lc_idx] = lock
+            # Replace all holders with locks.
+            for (ordinal, beam_idx, lc_idx), lock in zip(self._active_pages(), locks):
+                beam_block = (
+                    self._block(ordinal, beam_idx)
+                    if lc_idx != ssm_lc_id
+                    else self._ssm_blocks[beam_idx]
+                )
+                page = expect_type(_PageHolder, beam_block[lc_idx]).page
+                assert page is lock.page
+                beam_block[lc_idx] = lock
 
         # Deferred copy: for partial blocks and SSM, copy from now-locked source pages
         # to pre-allocated GPU slots, then unlock sources and replace with new pages.
