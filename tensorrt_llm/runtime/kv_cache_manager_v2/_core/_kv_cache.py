@@ -518,10 +518,15 @@ class _KVCache:
         arena_ranges = self._arena_ranges
         arena_offload: TypedIndexList[PoolGroupIndex, list[CommittedPage]] | None = None
         arena_private: list[CommittedPage] = []
+        arena_last_consumer = CachedCudaEvent.NULL
         if arena_ranges is not None:
             arena_offload, arena_private = self._arena_collect_committed_gpu_pages()
         with self._record_event():
             self._clear_blocks()
+            # _record_event clears _finish_event on exit; capture it as the
+            # range-reclaim gate (§4.2) while it is live.
+            if self._finish_event is not None:
+                arena_last_consumer = self._finish_event
         if arena_ranges is not None:
             storage = manager._storage
             assert arena_offload is not None
@@ -535,16 +540,12 @@ class _KVCache:
                     for page in pages:
                         if page.scheduled_for_eviction:
                             storage.exclude_from_eviction(page)
-            for page in arena_private:
-                if page.scheduled_for_eviction:
-                    storage.exclude_from_eviction(page)
+            # Private copies are never evictable (nothing queues them); they
+            # die with our refs, freeing their slots into their range.
             arena_offload = None  # drop our strong refs before range release
-            arena_private.clear()  # private copies die here, freeing their slots
-            last_consumer = (
-                self._finish_event if self._finish_event is not None else CachedCudaEvent.NULL
-            )
+            arena_private.clear()
             for pg_idx, rng in typed_enumerate(arena_ranges):
-                storage.free_gpu_sequence(pg_idx, rng, last_consumer)
+                storage.free_gpu_sequence(pg_idx, rng, arena_last_consumer)
             self._arena_ranges = None
         self._status = self.Status.CLOSED
         manager._living_kv_caches.remove(self.__rawref__)
@@ -705,6 +706,68 @@ class _KVCache:
                             arena_private.append(page)
         return arena_offload, arena_private
 
+    @staticmethod
+    def _find_canonical(page: CommittedPage, lc_idx: LifeCycleId) -> "CommittedPage | None":
+        """The canonical radix-tree page for a private copy's block, or None
+        if the tree entry is gone (orphaned block / dropped page)."""
+        blk = page.block()
+        if blk is None or blk.is_orphan:
+            return None
+        ref = blk.storage[lc_idx]
+        if ref is None:
+            return None
+        return ref()
+
+    def _arena_evacuate(self) -> None:
+        """Suspend-side write-out (DESIGN.md §4.5): move this sequence's GPU
+        pages out of its arena ranges so the ranges can be unmapped.
+
+        Canonical committed pages and uncommitted pages migrate to the host
+        tier -- the block chain's holders follow their pages, so the logical
+        chain survives suspension unchanged. Sequence-private reuse copies
+        (§4.4) are swapped back to holding their canonical entry and dropped;
+        if the canonical entry is gone, the private copy is the sole copy and
+        migrates like a canonical page.
+
+        Raises ``OutOfPagesError`` if the host tier cannot absorb the
+        write-out even after eviction -- host-quota sizing (§4.6) must
+        guarantee preemption headroom.
+
+        A separate method so loop locals cannot outlive it (see
+        :meth:`_arena_collect_committed_gpu_pages`).
+        """
+        storage = self.manager._storage
+        assert storage.num_cache_levels > 1, "suspend in arena mode requires a host tier"
+        beam_idx = DEFAULT_BEAM_INDEX
+        move: TypedIndexList[PoolGroupIndex, list[Page]] = make_typed(
+            lambda _: list[Page](), storage.num_pool_groups
+        )
+        swaps = list[tuple[BlockOrdinal, LifeCycleId, CommittedPage]]()
+        dropped = list[CommittedPage]()
+        for ordinal, entry_beam, lc_idx in self._active_pages():
+            assert entry_beam == beam_idx
+            holder = expect_type(_PageHolder, self._block(ordinal, beam_idx)[lc_idx])
+            page = holder.page
+            if page.cache_level != GPU_LEVEL:
+                continue
+            if type(page) is PrivateCommittedPage:
+                canonical = self._find_canonical(page, lc_idx)
+                if canonical is not None and canonical is not page:
+                    swaps.append((ordinal, lc_idx, canonical))
+                    dropped.append(page)
+                    continue
+            move[storage.get_pool_group_index(lc_idx)].append(page)
+        for ordinal, lc_idx, canonical in swaps:
+            # Holding the canonical page keeps it recallable for resume; the
+            # private copy's holder dies with this assignment. Private copies
+            # are never evictable, so they die with the last reference
+            # (returning their arena slots) rather than lingering in an
+            # eviction queue.
+            self._block(ordinal, beam_idx)[lc_idx] = canonical.hold()
+        dropped.clear()
+        for pg_idx, pages in typed_enumerate(move):
+            storage.offload_arena_pages(pg_idx, pages)
+
     def _arena_ensure_mapped(self, num_valid_blocks: int) -> bool:
         """Demand-map physical pages covering the first ``num_valid_blocks`` of
         this sequence's range in every pool group (DESIGN.md §4.2). On page
@@ -727,16 +790,21 @@ class _KVCache:
         return True
 
     def _arena_onboard_matched(self) -> bool:
-        """Copy the matched committed prefix into this sequence's arena ranges
-        (stale->active reuse, DESIGN.md §4.4).
+        """Bring this sequence's resident pages into its arena ranges
+        (stale->active, DESIGN.md §4.4/§4.5). Serves both a fresh sequence
+        with a reuse match and a post-suspend resume.
 
-        Each matched block becomes a sequence-private
-        :class:`PrivateCommittedPage` at ``range base + ordinal``; the
-        canonical radix entries are left untouched wherever they live (host,
-        disk, or another sequence's arena -- committed blocks are immutable, so
-        reading them concurrently is safe). Consecutive ordinals give the
-        explicit-destination migrate path contiguous targets to coalesce.
-        Returns False (onboarding nothing) if physical pages are unavailable.
+        Committed sources (canonical radix entries, or a private copy that
+        outlived its entry) are *copied*: each becomes a sequence-private
+        :class:`PrivateCommittedPage` at ``range base + ordinal`` and the
+        source is left untouched wherever it lives (host, disk, or another
+        sequence's arena -- committed blocks are immutable, so reading them
+        concurrently is safe). Uncommitted pages (a suspended sequence's
+        tail) are sequence-private already, so they are *moved*: the page
+        object relocates into the arena slot and its host slot is freed.
+        Consecutive ordinals give the explicit-destination migrate path
+        contiguous targets to coalesce. Returns False (onboarding nothing)
+        if physical pages are unavailable.
         """
         storage = self._storage
         ranges = self._arena_ranges
@@ -751,43 +819,61 @@ class _KVCache:
             return True
         if not self._arena_ensure_mapped(self.num_blocks):
             return False
-        # One explicit-destination migrate per (pool group, source level).
+        # One explicit-destination migrate per (pool group, source level,
+        # copy-vs-move).
         dst_slots = list[Slot]()
-        groups: dict[tuple[PoolGroupIndex, CacheLevel], list[int]] = {}
+        groups: dict[tuple[PoolGroupIndex, CacheLevel, bool], list[int]] = {}
         for i, (ordinal, lc_idx, holder) in enumerate(entries):
             pg_idx = storage.get_pool_group_index(lc_idx)
             dst_slots.append(storage.take_gpu_sequence_slot(pg_idx, ranges[pg_idx], int(ordinal)))
-            groups.setdefault((pg_idx, holder.page.cache_level), []).append(i)
+            page = holder.page
+            if page.scheduled_for_eviction:
+                # Migration requires unscheduled sources; being held again on
+                # the other side of onboarding re-schedules them as usual.
+                storage.exclude_from_eviction(page)
+            is_move = not page.is_committed()
+            groups.setdefault((pg_idx, page.cache_level, is_move), []).append(i)
         copied: list[Slot | None] = [None] * len(entries)
-        for (pg_idx, src_level), idx_list in groups.items():
+        for (pg_idx, src_level, is_move), idx_list in groups.items():
             ret = storage._batched_migrate(
                 pg_idx,
                 GPU_LEVEL,
                 src_level,
                 [entries[i][2].page for i in idx_list],
-                update_src=False,
+                update_src=is_move,
                 migration_recorder=self._record_migrated_slots,
                 dst_slots=[dst_slots[i] for i in idx_list],
             )
-            assert ret is not None
-            for i, slot in zip(idx_list, ret):
-                copied[i] = slot
-        stream_wait_events(self.cuda_stream, (s.ready_event for s in copied if s is not None))
-        # Wrap the copies as sequence-private committed pages and lock them;
-        # dropping the holders releases the canonical pages back to eviction
-        # control at their current level.
+            if not is_move:
+                assert ret is not None
+                for i, slot in zip(idx_list, ret):
+                    copied[i] = slot
+        stream_wait_events(
+            self.cuda_stream,
+            (
+                slot.ready_event if slot is not None else entries[i][2].page.ready_event
+                for i, slot in enumerate(copied)
+            ),
+        )
+        # Lock everything in place. For copies, the private page replaces the
+        # holder; dropping it releases the source back to eviction control at
+        # its current level. Moved pages keep their holder and simply lock.
         for (ordinal, lc_idx, holder), slot in zip(entries, copied):
             src_page = holder.page
-            assert type(src_page) is CommittedPage, "arena mode matches full committed blocks only"
-            tree_block = src_page.block()
-            assert tree_block is not None
-            assert slot is not None
-            private = PrivateCommittedPage(
-                storage, tree_block, lc_idx, GPU_LEVEL, slot, src_page.priority
-            )
-            self._block(ordinal, beam_idx)[lc_idx] = private.lock(
-                self, beam_idx, ordinal, lc_idx, skip_wait=True
-            )
+            if slot is None:  # moved uncommitted page, now living in the arena
+                assert src_page.cache_level == GPU_LEVEL
+                lock = holder.lock(self, beam_idx, ordinal, lc_idx, skip_wait=True)
+            else:
+                assert isinstance(src_page, CommittedPage), (
+                    "arena mode matches full committed blocks only"
+                )
+                tree_block = src_page.block()
+                assert tree_block is not None, "committed page lost its tree block while held"
+                private = PrivateCommittedPage(
+                    storage, tree_block, lc_idx, GPU_LEVEL, slot, src_page.priority
+                )
+                lock = private.lock(self, beam_idx, ordinal, lc_idx, skip_wait=True)
+            self._block(ordinal, beam_idx)[lc_idx] = lock
         return True
 
     # reserve space for next inference. Request new blocks from KVCacheManager if necessary.
@@ -1128,12 +1214,6 @@ class _KVCache:
     # suspend+resume allows us to implement dynamic batch size. May also be used to support HSTU model.
     def suspend(self) -> None:
         assert self.status == self.Status.ACTIVE
-        if self._arena_ranges is not None:
-            # Requires the §4.5 write-out/range-release path; until then a
-            # sequence can only leave the arena via close().
-            raise LogicError(
-                "suspend/resume is not wired up in contiguous-arena mode yet (DESIGN.md §4.5)"
-            )
         assert self._check_sanity()
         assert self._finish_event is None
         for beam_idx, beam_indices in typed_enumerate(self._base_page_indices):
@@ -1141,6 +1221,7 @@ class _KVCache:
                 if type(indices) is memoryview:
                     self.set_base_page_index_buf(beam_idx, lc, None)
         ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
+        arena_last_consumer = CachedCudaEvent.NULL
         with self._record_event():  # used by _SharedPageLock.__del__
             for ordinal, beam_idx, lc_idx in self._active_pages():
                 beam_block = (
@@ -1154,6 +1235,19 @@ class _KVCache:
                 beam_block[lc_idx] = holder
             # Free scratch slots on suspend since the data is ephemeral
             self._free_scratch_slots()
+            # _record_event clears _finish_event on exit; capture it as the
+            # range-reclaim gate (§4.2) while it is live.
+            if self._finish_event is not None:
+                arena_last_consumer = self._finish_event
+        if self._arena_ranges is not None:
+            # §4.5: move this sequence's pages out of its arena ranges, then
+            # release the whole VA reservation (event-gated unmap). Resume
+            # reserves fresh ranges and copies the resident state back in.
+            self._arena_evacuate()
+            storage = self.manager._storage
+            for pg_idx, rng in typed_enumerate(self._arena_ranges):
+                storage.free_gpu_sequence(pg_idx, rng, arena_last_consumer)
+            self._arena_ranges = None
         self._status = self.Status.SUSPENDED
 
     # Resume, migrate buffers to GPU memory.
@@ -1170,10 +1264,11 @@ class _KVCache:
         if storage.is_arena_mode and self._arena_ranges is None:
             # Reserve this sequence's contiguous block-index range in every
             # pool group, sized for max_capacity (DESIGN.md §4.1). Pure VA
-            # bookkeeping; pages are mapped on demand by resize().
-            assert self._never_resumed, (
-                "resume after suspend is not wired up in arena mode yet (§4.5)"
-            )
+            # bookkeeping; pages are mapped by _arena_onboard_matched below
+            # (resident prefix) and on demand by resize() (growth). Fresh and
+            # post-suspend resumes take the same path; the base block index
+            # may change across suspend/resume -- harmless, offset tables are
+            # rebuilt from the locks (§4.5).
             max_capacity = self._max_capacity
             assert max_capacity is not None
             max_blocks = div_up(max_capacity, self.tokens_per_block)

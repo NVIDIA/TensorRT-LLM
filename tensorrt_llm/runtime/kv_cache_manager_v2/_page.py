@@ -287,7 +287,9 @@ class _PageHolder:
             if not page.scheduled_for_eviction:
                 page.manager.schedule_for_eviction(page)
             block = page.block()
-            if block is None or block.is_orphan:
+            # scheduled_for_eviction re-check: never-evictable pages (e.g.
+            # sequence-private arena copies) were not scheduled above.
+            if (block is None or block.is_orphan) and page.scheduled_for_eviction:
                 page.manager.exclude_from_eviction(page)
         elif page.scheduled_for_eviction:
             page = cast(UncommittedPage, self.page)

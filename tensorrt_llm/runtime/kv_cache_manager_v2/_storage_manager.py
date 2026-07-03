@@ -47,7 +47,7 @@ from ._event_manager import KVCacheEventDiff
 from ._eviction_controller import EvictablePage, PerLevelEvictionController
 from ._exceptions import LogicError, OutOfPagesError
 from ._life_cycle_registry import LifeCycleId, LifeCycleRegistry, compute_scratch_range
-from ._page import CommittedPage, Page
+from ._page import CommittedPage, Page, PrivateCommittedPage
 from ._sequence_arena import INT31_MAX, PageBudget
 from ._storage import CacheLevelStorage
 from ._storage._config import BufferAttr, BufferId, LayerAttr, SlotDesc, StorageConfig
@@ -601,6 +601,11 @@ class StorageManager:
         Check if a page is evictable. If level is specified, check if the page will be evictable after
         migrating to the given level.
         """
+        # Sequence-private reuse copies (arena mode, DESIGN.md §4.4) are not
+        # managed by the eviction machinery at all: their canonical entry is,
+        # and they die with (or before) their owning sequence.
+        if isinstance(page, PrivateCommittedPage):
+            return False
         status = page.status
         level = page.cache_level if level is None else level
         # droppable pages that are not committed should be dropped immediately.

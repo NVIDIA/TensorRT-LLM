@@ -1023,17 +1023,102 @@ class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
         with self.assertRaises(ValueError):
             manager.create_kv_cache(input_tokens=tokens, max_capacity=self.TPB)
 
-    def test_suspend_not_supported_yet(self) -> None:
+    def _host_used(self) -> int:
+        stats = self.manager._storage.get_statistics(CacheLevel(1))[0]
+        return stats.total - stats.free
+
+    def test_suspend_resume_roundtrip(self) -> None:
+        """§4.5 suspend/resume round-trip.
+
+        Suspend writes committed AND uncommitted blocks out to host and
+        releases the VA ranges; resume reserves fresh ranges and copies the
+        resident state back, byte-identical.
+        """
         manager = self.manager
-        kv = manager.create_kv_cache(max_capacity=2 * self.TPB)
+        budget = manager._storage.gpu_page_budget
+        kv = manager.create_kv_cache(max_capacity=4 * self.TPB)
         with TemporaryCudaStream([]) as s:
             stream = CudaStream(s.handle)
             self.assertTrue(kv.resume(stream))
-            with self.assertRaises(LogicError):
-                kv.suspend()
-            kv.close()
+            self.assertTrue(kv.resize(3 * self.TPB))
+            for j, idx in enumerate(kv.get_base_page_indices(LifeCycleId(0))):
+                self._block_floats(idx).fill_(1.0 + j)
+            torch.cuda.synchronize()
+            kv.commit([400 + i for i in range(2 * self.TPB)])  # block 2 stays uncommitted
+            kv.suspend()
         s.take_finish_event().synchronize()
-        manager.drain_gpu_reclaim()
+        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        self.assertEqual(budget.used_pages, 0)
+        self.assertEqual(self._host_used(), 3)  # 2 canonical + 1 uncommitted
+
+        with TemporaryCudaStream([]) as s2:
+            stream2 = CudaStream(s2.handle)
+            self.assertTrue(kv.resume(stream2))
+            torch.cuda.synchronize()
+            indices = list(kv.get_base_page_indices(LifeCycleId(0)))
+            self.assertEqual(indices, list(range(indices[0], indices[0] + 3)))
+            for j, idx in enumerate(indices):
+                data = self._block_floats(idx)
+                self.assertTrue(bool((data == 1.0 + j).all().item()))
+            # the moved-back uncommitted block freed its host slot
+            self.assertEqual(self._host_used(), 2)
+            # growth continues the same consecutive run
+            self.assertTrue(kv.resize(4 * self.TPB))
+            indices = list(kv.get_base_page_indices(LifeCycleId(0)))
+            self.assertEqual(indices, list(range(indices[0], indices[0] + 4)))
+            kv.close()
+        s2.take_finish_event().synchronize()
+        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        self.assertEqual(budget.used_pages, 0)
+        self.assertEqual(self._host_used(), 2)
+
+    def test_suspend_drops_private_copies(self) -> None:
+        """§4.5 x §4.4 interaction.
+
+        Suspending a sequence whose prefix was onboarded from the radix tree
+        swaps its private copies back to the canonical entries (no host
+        duplication) and re-onboards them on resume.
+        """
+        manager = self.manager
+        budget = manager._storage.gpu_page_budget
+        tokens = [500 + i for i in range(2 * self.TPB)]
+        kv1 = manager.create_kv_cache(input_tokens=tokens, max_capacity=2 * self.TPB)
+        with TemporaryCudaStream([]) as s:
+            stream = CudaStream(s.handle)
+            self.assertTrue(kv1.resume(stream))
+            self.assertTrue(kv1.resize(2 * self.TPB))
+            for j, idx in enumerate(kv1.get_base_page_indices(LifeCycleId(0))):
+                self._block_floats(idx).fill_(5.0 + j)
+            torch.cuda.synchronize()
+            kv1.commit(tokens)
+            kv1.close()
+        s.take_finish_event().synchronize()
+        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        self.assertEqual(self._host_used(), 2)
+
+        kv2 = manager.create_kv_cache(input_tokens=tokens, max_capacity=4 * self.TPB)
+        self.assertEqual(kv2.history_length, 2 * self.TPB)
+        with TemporaryCudaStream([]) as s2:
+            stream2 = CudaStream(s2.handle)
+            self.assertTrue(kv2.resume(stream2))
+            torch.cuda.synchronize()
+            kv2.suspend()
+        s2.take_finish_event().synchronize()
+        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        self.assertEqual(budget.used_pages, 0)
+        self.assertEqual(self._host_used(), 2)  # privates dropped, no duplicates
+
+        with TemporaryCudaStream([]) as s3:
+            stream3 = CudaStream(s3.handle)
+            self.assertTrue(kv2.resume(stream3))
+            torch.cuda.synchronize()
+            for j, idx in enumerate(kv2.get_base_page_indices(LifeCycleId(0))):
+                data = self._block_floats(idx)
+                self.assertTrue(bool((data == 5.0 + j).all().item()))
+            kv2.close()
+        s3.take_finish_event().synchronize()
+        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        self.assertEqual(self._host_used(), 2)
 
 
 if __name__ == "__main__":
