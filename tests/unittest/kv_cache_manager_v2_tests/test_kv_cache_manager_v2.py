@@ -750,22 +750,6 @@ class TestNoBatching(TestKVCacheManagerV2):
             producer.close()
         stream.take_finish_event().synchronize()
 
-    def test_commit_rejects_beam_search_indices(self) -> None:
-        tokens_per_block = 4
-        with TemporaryCudaStream([]) as stream:
-            cuda_stream = cast(CudaStream, stream.handle)
-            kv_cache, _ = self.make_context_kv_cache(
-                prompt_len=tokens_per_block + 1,
-                tokens_per_block=tokens_per_block,
-                stream=cuda_stream,
-            )
-            self.disable_partial_commit()
-            kv_cache.beam_width = BeamIndex(2)
-
-            with self.assertRaises(AssertionError):
-                kv_cache.commit([self.next_token()], [0])
-        stream.take_finish_event().synchronize()
-
     def test_beam_close_stop(self) -> None:
         tokens_per_block = 4
         with TemporaryCudaStream([]) as stream:
@@ -2667,6 +2651,37 @@ class TestScratchReuse(TestKVCacheManagerV2):
 
         s.take_finish_event().synchronize()
         kv.close()
+
+    def test_beam_expansion_uses_logical_prompt_block_with_scratch(self) -> None:
+        tokens_per_block = 4
+        prompt = [self.next_token() for _ in range(2 * tokens_per_block + 2)]
+        self._prepare_scratch(
+            num_layers=1,
+            window_size=tokens_per_block,
+            tokens_per_block=tokens_per_block,
+            gpu_quota=16 << 20,
+        )
+        kv_cache = self.manager.create_kv_cache(None, None, expected_prompt_length=len(prompt))
+
+        with TemporaryCudaStream([]) as stream:
+            cuda_stream = cast(CudaStream, stream.handle)
+            assert kv_cache.resume(cuda_stream)
+            kv_cache.stop_committing()
+            assert kv_cache.resize(len(prompt))
+            self.engine.execute([Step(kv_cache, prompt, [])], cuda_stream)
+            assert kv_cache.history_length == 0
+            assert kv_cache.get_scratch_desc(LayerGroupId(0)) is not None
+
+            self.manager._init_config.enable_partial_commit = False
+            kv_cache.beam_width = BeamIndex(2)
+
+            assert [len(block.pages) for block in kv_cache._blocks] == [1, 1, 2]
+            beam1_pages = kv_cache.get_base_page_indices(LayerGroupId(0), BeamIndex(1))
+            assert list(beam1_pages[:2]) == [BAD_PAGE_INDEX, BAD_PAGE_INDEX]
+            assert beam1_pages[2] != BAD_PAGE_INDEX
+
+            kv_cache.close()
+        stream.take_finish_event().synchronize()
 
     def test_scratch_slot_count(self):
         """Verify peak slot count is reduced with scratch reuse.

@@ -41,7 +41,8 @@ from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.executor import RequestError
 from tensorrt_llm.executor.result import (CompletionOutput, GenerationResult,
                                           Logprob)
-from tensorrt_llm.llmapi import (CacheTransceiverConfig, CudaGraphConfig,
+from tensorrt_llm.llmapi import (CacheTransceiverConfig,
+                                 CapacitySchedulerPolicy, CudaGraphConfig,
                                  KvCacheConfig, SchedulerConfig)
 
 
@@ -101,9 +102,7 @@ def _build_llm(fixed_params, input_prompts, llm_kwargs: dict[str, Any]):
         )
     return LLM(
         **llm_kwargs,
-        kv_cache_config=KvCacheConfig(
-            max_tokens=10000,  # pyright: ignore
-        ),
+        kv_cache_config=kv_cache_config,
         max_seq_len=32,
         max_beam_width=fixed_params["max_beam_width"],
     )
@@ -568,7 +567,7 @@ def test_beam_search_cache_indirection_kv_cache_manager_v2(
             use_kv_cache_manager_v2=True,
         ),
         scheduler_config=SchedulerConfig(
-            capacity_scheduler_policy="MAX_UTILIZATION"),
+            capacity_scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION),
     )
     with _build_llm(fixed_params, input_prompts, llm_kwargs=llm_kwargs) as llm:
         sampling_params = SamplingParams(

@@ -894,13 +894,7 @@ class _KVCache:
     # Committed tokens are always history, so history_length will be automatically updated to maintain
     # (num_committed_tokens <= history_length). Note that history_length increase may trigger out-of-window
     # block eviction/dropping for SWA layers.
-    # beam_search_indices is reserved for future use and must be None.
-    def commit(
-        self,
-        accepted_input_tokens: Sequence[TokenIdExt],
-        beam_search_indices: Sequence[int] | None = None,
-    ):
-        assert beam_search_indices is None
+    def commit(self, accepted_input_tokens: Sequence[TokenIdExt]) -> None:
         if not accepted_input_tokens:
             return
         assert self.status == self.Status.ACTIVE
@@ -1565,9 +1559,11 @@ class _KVCache:
         num_life_cycles = storage.num_life_cycles
         slot_counts = filled_list(0, num_life_cycles)
         num_new_beams = int(new_beam_width - old_beam_width)
-        for ordinal, block in typed_enumerate(self._blocks):
-            if self._is_block_shared_across_beams(ordinal, block):
-                continue
+        prompt_length = value_or(self._expected_prompt_length, 0)
+        first_generation_block = BlockOrdinal(prompt_length // self.tokens_per_block)
+        for ordinal in typed_range(first_generation_block, BlockOrdinal(self.num_blocks)):
+            block = self._blocks[ordinal]
+            assert not block.is_committed
             source_beam_block = block.pages[DEFAULT_BEAM_INDEX]
             for lc, source_holder in typed_enumerate(source_beam_block):
                 if source_holder is not None:
@@ -1591,26 +1587,13 @@ class _KVCache:
                 )
             )
 
-        new_slot_ready_events = tuple(slot.ready_event for slot in chain.from_iterable(new_slots))
-        if any(
-            type(indices) is memoryview
-            for beam_indices in self._base_page_indices
-            for indices in beam_indices
-        ):
-            pending_ready_events = [
-                event for event in set(new_slot_ready_events) if not event.query_complete()
-            ]
-            for event in pending_ready_events:
-                event.synchronize()
-            for slot in chain.from_iterable(new_slots):
-                slot.ready_event = CachedCudaEvent.NULL
-        if new_slot_ready_events:
-            stream_wait_events(self.cuda_stream, new_slot_ready_events)
+        stream_wait_events(
+            self.cuda_stream, (slot.ready_event for slot in chain.from_iterable(new_slots))
+        )
 
-        for ordinal, block in typed_enumerate(self._blocks):
+        for ordinal in typed_range(first_generation_block, BlockOrdinal(self.num_blocks)):
+            block = self._blocks[ordinal]
             source_beam_block = block.pages[DEFAULT_BEAM_INDEX]
-            if self._is_block_shared_across_beams(ordinal, block):
-                continue
             for beam_idx in typed_range(old_beam_width, new_beam_width):
                 new_beam_block: TypedIndexList[LifeCycleId, BlockPage] = filled_list(
                     cast(BlockPage, None), num_life_cycles
@@ -1621,8 +1604,8 @@ class _KVCache:
 
                     source_page = source_holder.page
                     slot = new_slots[lc].pop()
-                    # Beam expansion copies only per-beam GPU pages. Context
-                    # and committed blocks remain unmapped for new beams.
+                    # Beam expansion copies only per-beam GPU pages. Full
+                    # prompt blocks remain unmapped for new beams.
                     assert source_page.cache_level == GPU_LEVEL
                     source_lock = source_page.lock(self, beam_idx, ordinal, lc, skip_wait=False)
                     self._copy_gpu_page_storage_to_slot(source_lock.page, slot)
@@ -1658,14 +1641,6 @@ class _KVCache:
             self._ssm_blocks.append(new_ssm_block)
 
         assert all(len(slots) == 0 for slots in new_slots)
-
-    def _is_block_before_expected_prompt(self, ordinal: BlockOrdinal) -> bool:
-        if self._expected_prompt_length is None:
-            return False
-        return int(ordinal + 1) * self.tokens_per_block <= self._expected_prompt_length
-
-    def _is_block_shared_across_beams(self, ordinal: BlockOrdinal, block: SeqBlock) -> bool:
-        return block.is_committed or self._is_block_before_expected_prompt(ordinal)
 
     def _copy_gpu_page_storage_to_slot(self, source_page: Page, dst_slot: Slot) -> None:
         assert source_page.cache_level == GPU_LEVEL
@@ -1740,6 +1715,8 @@ class _KVCache:
         stale_ranges = typed_map(self.manager._life_cycles.get(), get_range)
         num_life_cycles = self.manager._life_cycles.size
         ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
+        prompt_length = value_or(self._expected_prompt_length, 0)
+        first_generation_block = BlockOrdinal(prompt_length // self.tokens_per_block)
         for ordinal, block in typed_enumerate(self._blocks):
             is_committed = self._never_resumed or ordinal < self._num_committed_blocks
             assert is_committed == block.is_committed
@@ -1771,7 +1748,7 @@ class _KVCache:
                         elif (
                             holder is None
                             and beam_idx != DEFAULT_BEAM_INDEX
-                            and self._is_block_shared_across_beams(ordinal, block)
+                            and ordinal < first_generation_block
                         ):
                             pass
                         else:

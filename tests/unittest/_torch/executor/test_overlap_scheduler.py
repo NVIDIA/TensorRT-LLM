@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import json
 from pathlib import Path
 
@@ -7,7 +10,8 @@ from utils.llm_data import llm_models_root
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import CudaGraphConfig
 from tensorrt_llm.llmapi import KvCacheConfig as TRT_KvCacheConfig
-from tensorrt_llm.llmapi.llm_args import SchedulerConfig
+from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
+                                          SchedulerConfig)
 
 
 # A test case of mmlu_llama from lm_eval
@@ -161,10 +165,10 @@ def test_overlap_scheduler_block_reuse_cache_hit(model_path, test_case,
 @pytest.mark.mpi_ray_parity
 def test_overlap_scheduler_v2_beam_search_block_reuse_cache_hit(
         model_path, test_case):
-    """Verify that V2 KV cache manager can reuse blocks with real beam search
-    and the overlap scheduler enabled."""
+    """Verify that V2 KV cache manager can reuse full blocks with real beam
+    search and the overlap scheduler enabled."""
     # Use a prompt longer than one KV block so a second request can report a
-    # real cache hit.
+    # real cache hit. Partial reuse remains disabled for beam search.
     prompt = test_case["prompts"][2]
     max_new_tokens = test_case["max_new_tokens"]
     temperature = test_case["temperature"]
@@ -185,7 +189,8 @@ def test_overlap_scheduler_v2_beam_search_block_reuse_cache_hit(
             disable_overlap_scheduler=False,
             sampler_type="TorchSampler",
             scheduler_config=SchedulerConfig(
-                capacity_scheduler_policy="MAX_UTILIZATION"),
+                capacity_scheduler_policy=CapacitySchedulerPolicy.
+                MAX_UTILIZATION),
             enable_block_reuse=True,
             use_kv_cache_manager_v2=True,
             max_beam_width=max_beam_width,

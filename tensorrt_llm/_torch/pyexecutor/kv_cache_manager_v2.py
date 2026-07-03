@@ -63,11 +63,10 @@ from tensorrt_llm.runtime.kv_cache_manager_v2._common import (
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
 from tensorrt_llm.runtime.kv_cache_manager_v2._event_manager import KVCacheEventManager
-from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import CuError
+from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import CuError, OutOfPagesError
 from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import (
     OutOfMemoryError as KVCacheOutOfMemoryError,
 )
-from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
 from tensorrt_llm.runtime.kv_cache_manager_v2._life_cycle_registry import AttnLifeCycle, LifeCycleId
 from tensorrt_llm.runtime.kv_cache_manager_v2._utils import exact_div, typed_range
 from tensorrt_llm.sampling_params import SamplingParams
@@ -799,7 +798,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.max_blocks_per_seq % 4 != 0:
             self.max_blocks_per_seq = ((self.max_blocks_per_seq + 3) // 4) * 4
 
-        self.enable_block_reuse = kv_cache_config.enable_block_reuse and max_beam_width == 1
+        self.enable_block_reuse = kv_cache_config.enable_block_reuse
         self.enable_partial_reuse = kv_cache_config.enable_partial_reuse and max_beam_width == 1
         self.disk_prefetch_num_reqs = kv_cache_config.disk_prefetch_num_reqs
 
