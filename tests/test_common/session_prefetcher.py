@@ -37,9 +37,18 @@ host; a wasted warm (test skipped or reordered) costs only IO bandwidth.
 
 import glob
 import os
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+
+# The only places in the library that construct MpiPoolSession for a bare
+# LLM(...); tests passing their own _mpi_session never reach these lines.
+_PATCH_TARGETS = (
+    "tensorrt_llm.executor.proxy",
+    "tensorrt_llm.executor.rpc_proxy",
+    "tensorrt_llm.llmapi.llm",
+)
 
 _WEIGHT_GLOBS = ("*.safetensors", "*.bin")
 _READ_CHUNK = 64 << 20  # 64MB
@@ -121,6 +130,7 @@ class SessionPrefetcher:
         self._built_env = None
         self._items = []
         self._warmed_dirs = set()
+        self._patched = set()
 
     @property
     def enabled(self) -> bool:
@@ -279,27 +289,29 @@ class SessionPrefetcher:
 
         return factory
 
-    def install_pool_factory(self) -> None:
-        """Patch the pool-creation seams for zero-test-change prefetch.
+    def install_pool_factory_if_loaded(self) -> None:
+        """Lazily patch the pool-creation seams for zero-test-change prefetch.
 
-        Bare ``LLM(...)`` tests then consume prefetched pools automatically.
+        Only patches target modules ALREADY imported by the test suite, so
+        suites that never touch tensorrt_llm pay nothing (not even the
+        import). Idempotent — called from ``pytest_runtest_setup``.
         Only the ``mpi_session is None`` branches construct ``MpiPoolSession``
         directly, so tests passing their own session (shared/grouped pools)
         are never intercepted.
         """
-        import importlib
-
+        if not self.enabled:
+            return
+        pending = [n for n in _PATCH_TARGETS if n in sys.modules and n not in self._patched]
+        if not pending:
+            return
         from tensorrt_llm.llmapi.mpi_session import MpiPoolSession as real_cls
 
         factory = self._make_factory(real_cls)
-        for name in (
-            "tensorrt_llm.executor.proxy",
-            "tensorrt_llm.executor.rpc_proxy",
-            "tensorrt_llm.llmapi.llm",
-        ):
-            mod = importlib.import_module(name)
+        for name in pending:
+            mod = sys.modules[name]
             if getattr(mod, "MpiPoolSession", None) is real_cls:
                 mod.MpiPoolSession = factory
+            self._patched.add(name)
 
     def dispose(self) -> None:
         """Shut down any unconsumed shadow pool (end-of-session cleanup)."""
