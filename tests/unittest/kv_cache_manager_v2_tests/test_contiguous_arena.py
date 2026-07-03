@@ -11,12 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for the contiguous primary KV cache scaffold (DESIGN.md in
-``contiguous_primary_kvcache/``): the block-range allocator, int31 index-width
-check, sparse ``VirtMem`` mapping, and the ``SequenceArena`` demand-paging layer.
+"""Tests for the contiguous primary KV cache storage layer.
 
-The allocator / index-width / config tests are pure logic and always run. The
-sparse ``VirtMem`` and ``SequenceArena`` tests require a CUDA device.
+Covers (see ``contiguous_primary_kvcache/DESIGN.md``): the block-range
+allocator, int31 index-width check, page budget, sparse ``VirtMem`` mapping,
+the ``SequenceArena`` demand-paging layer, and the ``ArenaPoolGroup`` /
+``GpuArenaCacheLevelStorage`` storage seam.
+
+The allocator / index-width / budget / config tests are pure logic and always
+run. The sparse ``VirtMem``, ``SequenceArena``, and pool-group tests require a
+CUDA device.
 """
 
 import unittest
@@ -34,32 +38,35 @@ except ImportError:  # pragma: no cover
 if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     from kv_cache_manager_v2 import ContiguousArenaConfig, WriteThroughPolicy
     from kv_cache_manager_v2._cuda_virt_mem import PooledPhysMemAllocator, VirtMem
+    from kv_cache_manager_v2._exceptions import LogicError, OutOfPagesError
     from kv_cache_manager_v2._sequence_arena import (
         INT31_MAX,
         BlockRangeAllocator,
+        PageBudget,
         SequenceArena,
         check_index_width,
     )
+    from kv_cache_manager_v2._storage._core import ArenaPoolGroup, GpuArenaCacheLevelStorage
     from kv_cache_manager_v2._utils import CachedCudaEvent, init_cuda_once
 else:
-    from tensorrt_llm.runtime.kv_cache_manager_v2 import (
-        ContiguousArenaConfig,
-        WriteThroughPolicy,
-    )
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import ContiguousArenaConfig, WriteThroughPolicy
     from tensorrt_llm.runtime.kv_cache_manager_v2._cuda_virt_mem import (
         PooledPhysMemAllocator,
         VirtMem,
     )
+    from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import LogicError, OutOfPagesError
     from tensorrt_llm.runtime.kv_cache_manager_v2._sequence_arena import (
         INT31_MAX,
         BlockRangeAllocator,
+        PageBudget,
         SequenceArena,
         check_index_width,
     )
-    from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
-        CachedCudaEvent,
-        init_cuda_once,
+    from tensorrt_llm.runtime.kv_cache_manager_v2._storage._core import (
+        ArenaPoolGroup,
+        GpuArenaCacheLevelStorage,
     )
+    from tensorrt_llm.runtime.kv_cache_manager_v2._utils import CachedCudaEvent, init_cuda_once
 
 MiB = 1 << 20
 requires_cuda = unittest.skipUnless(_CUDA_AVAILABLE, "requires CUDA")
@@ -301,6 +308,232 @@ class TestSequenceArena(unittest.TestCase):
             self.assertGreater(arena.mapped_pages, pages_a)
         finally:
             arena.destroy()
+
+
+class TestPageBudget(unittest.TestCase):
+    def test_consume_release(self) -> None:
+        b = PageBudget(4)
+        self.assertEqual(b.free_pages, 4)
+        b.consume(3)
+        self.assertEqual(b.used_pages, 3)
+        self.assertEqual(b.free_pages, 1)
+        b.release(2)
+        self.assertEqual(b.used_pages, 1)
+
+    def test_over_consume_raises_without_side_effects(self) -> None:
+        b = PageBudget(4)
+        b.consume(3)
+        with self.assertRaises(OutOfPagesError):
+            b.consume(2)
+        self.assertEqual(b.used_pages, 3)  # unchanged after the failed consume
+
+
+class TestMultiPoolAlignment(unittest.TestCase):
+    def test_alignment_is_lcm_across_pools(self) -> None:
+        # stride 1MiB -> align 2; stride 512KiB -> align 4; lcm = 4
+        a = BlockRangeAllocator(
+            capacity_blocks=64, record_stride=(1 * MiB, MiB // 2), phys_page_size=2 * MiB
+        )
+        self.assertEqual(a.align_blocks, 4)
+        # whole-page stride (align 1) with a half-page stride (align 2) -> 2
+        a = BlockRangeAllocator(
+            capacity_blocks=64, record_stride=(2 * MiB, 1 * MiB), phys_page_size=2 * MiB
+        )
+        self.assertEqual(a.align_blocks, 2)
+
+    def test_ranges_page_disjoint_in_every_pool(self) -> None:
+        strides = (1 * MiB, MiB // 2)
+        a = BlockRangeAllocator(capacity_blocks=64, record_stride=strides, phys_page_size=2 * MiB)
+        bases = [a.allocate(1) for _ in range(4)]
+        for base in bases:
+            for stride in strides:
+                self.assertEqual((base * stride) % (2 * MiB), 0)
+
+
+@requires_cuda
+class TestSequenceArenaMultiPool(unittest.TestCase):
+    def setUp(self) -> None:
+        init_cuda_once()
+        self.allocator = PooledPhysMemAllocator(2 * MiB)
+
+    def test_maps_all_pools(self) -> None:
+        # pool 0: 1 block = 1 page; pool 1: 2 blocks = 1 page
+        arena = SequenceArena(
+            block_capacity=8,
+            record_stride=(2 * MiB, 1 * MiB),
+            phys_mem_allocator=self.allocator,
+            map_ahead_pages=0,
+        )
+        try:
+            self.assertEqual(arena.num_pools, 2)
+            base = arena.reserve(4)
+            new_pages = arena.ensure_mapped(base, 4)
+            # pool 0: 4 pages, pool 1: 2 pages
+            self.assertEqual(new_pages, 6)
+            self.assertEqual(arena.mapped_pages, 6)
+            self.assertNotEqual(int(arena.base_address(0)), int(arena.base_address(1)))
+        finally:
+            arena.destroy()
+
+    def test_budget_enforced_atomically(self) -> None:
+        budget = PageBudget(4)
+        arena = SequenceArena(
+            block_capacity=8,
+            record_stride=(2 * MiB, 1 * MiB),
+            phys_mem_allocator=self.allocator,
+            map_ahead_pages=0,
+            page_budget=budget,
+        )
+        try:
+            base = arena.reserve(4)  # full mapping would need 6 pages > 4
+            with self.assertRaises(OutOfPagesError):
+                arena.ensure_mapped(base, 4)
+            # nothing was mapped or consumed by the failed call
+            self.assertEqual(arena.mapped_pages, 0)
+            self.assertEqual(budget.used_pages, 0)
+            # a smaller frontier fits: 2 blocks -> 2 + 1 = 3 pages
+            self.assertEqual(arena.ensure_mapped(base, 2), 3)
+            self.assertEqual(budget.used_pages, 3)
+            # reclaim returns the pages to the budget
+            arena.enqueue_free(base, CachedCudaEvent.NULL)
+            self.assertEqual(arena.drain_reclaim(), 1)
+            self.assertEqual(budget.used_pages, 0)
+        finally:
+            arena.destroy()
+
+
+@requires_cuda
+class TestArenaPoolGroup(unittest.TestCase):
+    PAGE = 2 * MiB
+
+    def setUp(self) -> None:
+        init_cuda_once()
+        self.allocator = PooledPhysMemAllocator(self.PAGE)
+        self.budget = PageBudget(64)
+
+    def _group(self, block_capacity: int = 16, map_ahead: int = 0) -> "ArenaPoolGroup":
+        return ArenaPoolGroup(
+            block_capacity=block_capacity,
+            slot_size_list=[2 * MiB, 1 * MiB],
+            shared_phys_mem_pool=self.allocator,
+            page_budget=self.budget,
+            map_ahead_pages=map_ahead,
+            page_index_scale=64,
+        )
+
+    def test_int31_check_wired_into_construction(self) -> None:
+        with self.assertRaises(ValueError):
+            ArenaPoolGroup(
+                block_capacity=INT31_MAX,
+                slot_size_list=[2 * MiB],
+                shared_phys_mem_pool=self.allocator,
+                page_budget=self.budget,
+                map_ahead_pages=0,
+                page_index_scale=2,
+            )
+
+    def test_sequence_slots_are_consecutive_and_addressable(self) -> None:
+        group = self._group()
+        try:
+            rng = group.reserve_sequence(4)
+            group.ensure_mapped(rng, 4)
+            slots = [group.take_slot(rng, j) for j in range(4)]
+            ids = [s.slot_id for s in slots]
+            self.assertEqual(ids, list(range(rng.base_block, rng.base_block + 4)))
+            for pool_idx, stride in enumerate((2 * MiB, 1 * MiB)):
+                addrs = [group._pools[pool_idx].slot_address(i) for i in ids]
+                deltas = [addrs[j + 1] - addrs[j] for j in range(len(addrs) - 1)]
+                self.assertEqual(deltas, [stride] * 3)  # contiguous in VA
+            for s in slots:
+                group.release(s)
+            group.free_sequence(rng, CachedCudaEvent.NULL)
+            self.assertEqual(group.drain_reclaim(), 1)
+            self.assertEqual(group.mapped_pages, 0)
+            self.assertEqual(self.budget.used_pages, 0)
+        finally:
+            group.destroy()
+
+    def test_reclaim_gated_on_outstanding_slots(self) -> None:
+        group = self._group()
+        try:
+            rng = group.reserve_sequence(2)
+            group.ensure_mapped(rng, 2)
+            slot = group.take_slot(rng, 0)
+            group.free_sequence(rng, CachedCudaEvent.NULL)
+            self.assertEqual(group.drain_reclaim(), 0)  # slot still outstanding
+            group.release(slot)
+            self.assertEqual(group.drain_reclaim(), 1)
+        finally:
+            group.destroy()
+
+    def test_scattered_allocation_retired(self) -> None:
+        group = self._group()
+        try:
+            with self.assertRaises(LogicError):
+                group.allocate()
+            with self.assertRaises(LogicError):
+                group.allocate_multiple(2)
+        finally:
+            group.destroy()
+
+    def test_va_exhaustion_raises_memory_error(self) -> None:
+        group = self._group(block_capacity=8)
+        try:
+            rng = group.reserve_sequence(8)
+            with self.assertRaises(MemoryError):
+                group.reserve_sequence(1)
+            group.free_sequence(rng, CachedCudaEvent.NULL)
+            group.drain_reclaim()
+        finally:
+            group.destroy()
+
+
+@requires_cuda
+class TestGpuArenaCacheLevelStorage(unittest.TestCase):
+    PAGE = 2 * MiB
+
+    def setUp(self) -> None:
+        init_cuda_once()
+
+    def test_budget_shared_across_pool_groups(self) -> None:
+        storage = GpuArenaCacheLevelStorage(
+            slot_size_lists=[[2 * MiB], [1 * MiB]],
+            block_capacity_list=[16, 16],
+            page_index_scale_list=[64, 32],
+            quota=8 * self.PAGE,
+            phys_page_size=self.PAGE,
+            map_ahead_pages=0,
+        )
+        try:
+            self.assertEqual(storage.page_budget.total_pages, 8)
+            g0 = storage.pool_group(0)
+            g1 = storage.pool_group(1)
+            r0 = g0.reserve_sequence(6)  # 6 pages in pool group 0
+            g0.ensure_mapped(r0, 6)
+            self.assertEqual(storage.page_budget.used_pages, 6)
+            r1 = g1.reserve_sequence(8)  # would need 4 pages; only 2 left
+            with self.assertRaises(OutOfPagesError):
+                g1.ensure_mapped(r1, 8)
+            g1.ensure_mapped(r1, 4)  # 2 pages fit
+            self.assertEqual(storage.page_budget.used_pages, 8)
+            # free the first sequence; the second can now finish mapping
+            g0.free_sequence(r0, CachedCudaEvent.NULL)
+            g1.free_sequence(r1, CachedCudaEvent.NULL)
+            self.assertEqual(storage.drain_reclaim(), 2)
+            self.assertEqual(storage.page_budget.used_pages, 0)
+        finally:
+            storage.destroy()
+
+    def test_int31_violation_fails_before_cuda_setup(self) -> None:
+        with self.assertRaises(ValueError):
+            GpuArenaCacheLevelStorage(
+                slot_size_lists=[[2 * MiB]],
+                block_capacity_list=[INT31_MAX],
+                page_index_scale_list=[2],
+                quota=8 * self.PAGE,
+                phys_page_size=self.PAGE,
+                map_ahead_pages=0,
+            )
 
 
 if __name__ == "__main__":

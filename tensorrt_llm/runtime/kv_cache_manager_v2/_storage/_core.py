@@ -19,6 +19,7 @@ import os
 import sys
 import tempfile
 import warnings
+from bisect import bisect_right, insort
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -40,6 +41,7 @@ from .._common import (
 )
 from .._cuda_virt_mem import PooledPhysMemAllocator, VirtMem
 from .._exceptions import LogicError, OutOfPagesError
+from .._sequence_arena import PageBudget, SequenceArena, check_index_width
 from .._utils import (
     CachedCudaEvent,
     DynamicBitset,
@@ -153,6 +155,48 @@ class GpuSlotPool(SlotPoolBase):
     @staticmethod
     def _compute_num_slots(slot_size: int, num_phys_mem: int, phys_mem_size: int) -> int:
         return num_phys_mem * phys_mem_size // slot_size
+
+
+@final
+class ArenaSlotPool(SlotPoolBase):
+    """Per-pool *view* over one plane of a :class:`SequenceArena` (contiguous
+    primary KV cache, DESIGN.md §4.1). Exists so the ``PoolGroupBase``
+    machinery (addresses, sizes, statistics) works unchanged in arena mode.
+
+    The arena owns the VA reservation and all mappings; this view owns
+    nothing. ``num_slots``/``num_bytes`` describe the *VA* extent (block-index
+    capacity), not physical residency -- physical capacity is governed by the
+    shared :class:`PageBudget`.
+    """
+
+    __slots__ = ("_arena", "_pool_index")
+    _arena: SequenceArena
+    _pool_index: int
+
+    def __init__(self, arena: SequenceArena, pool_index: int, slot_size: int) -> None:
+        super().__init__(slot_size)
+        self._arena = arena
+        self._pool_index = pool_index
+
+    @override
+    def destroy(self) -> None:
+        pass  # the owning ArenaPoolGroup destroys the arena
+
+    @override
+    def resize(self, new_num_slots: int) -> None:
+        raise LogicError(
+            "arena-backed pools have a fixed VA extent; physical capacity is "
+            "governed by the shared page budget"
+        )
+
+    @override
+    def slot_address(self, slot: int) -> MemAddress:
+        return MemAddress(int(self._arena.base_address(self._pool_index)) + self.slot_size * slot)
+
+    @property
+    @override
+    def num_slots(self) -> int:
+        return self._arena.capacity_blocks
 
 
 class HostSlotPool(SlotPoolBase):
@@ -611,6 +655,242 @@ class GpuPoolGroup(PoolGroupBase):
         )
 
 
+class SequenceRange:
+    """Handle for one sequence's contiguous block-index range in an
+    :class:`ArenaPoolGroup` (DESIGN.md §4.1).
+
+    Tracks the slots issued from the range and the CUDA events that must
+    complete before the range's physical pages can be unmapped (deferred
+    reclaim, §4.2): the ready events of released slots (e.g. D2H write-out
+    copies) plus the sequence's last-consumer event passed to
+    ``free_sequence``.
+    """
+
+    __slots__ = (
+        "base_block",
+        "num_blocks",
+        "_outstanding",
+        "_freed",
+        "_gate_events",
+        "_free_event",
+    )
+    base_block: int
+    num_blocks: int  # reserved (padded) length in blocks
+    _outstanding: int  # slots issued and not yet released
+    _freed: bool
+    _gate_events: list[CachedCudaEvent]  # pending ready events of released slots
+    _free_event: CachedCudaEvent
+
+    def __init__(self, base_block: int, num_blocks: int) -> None:
+        self.base_block = base_block
+        self.num_blocks = num_blocks
+        self._outstanding = 0
+        self._freed = False
+        self._gate_events = []
+        self._free_event = CachedCudaEvent.NULL
+
+    @property
+    def end_block(self) -> int:
+        return self.base_block + self.num_blocks
+
+    def _scrub_gate_events(self) -> None:
+        self._gate_events = [ev for ev in self._gate_events if not ev.query_complete()]
+
+    def _ready_to_reclaim(self) -> bool:
+        if not self._freed or self._outstanding != 0:
+            return False
+        if not self._free_event.query_complete():
+            return False
+        self._scrub_gate_events()
+        return not self._gate_events
+
+
+@final
+class ArenaPoolGroup(PoolGroupBase):
+    """GPU pool group backed by a :class:`SequenceArena` instead of a
+    ``SlotAllocator`` (contiguous primary KV cache, DESIGN.md §4.1-§4.2).
+
+    Allocation is *per-sequence*: :meth:`reserve_sequence` carves a contiguous,
+    page-aligned block-index range sized for the sequence's maximum block
+    count; :meth:`take_slot` then issues ``Slot`` objects with
+    ``slot_id = base_block + ordinal``, so every downstream consumer of slot
+    ids (pages, offset tables, ``slot_address``) works unchanged -- but the ids
+    a sequence sees are consecutive. Physical pages are mapped on demand via
+    :meth:`ensure_mapped` against the level-wide :class:`PageBudget`.
+
+    Scattered allocation (``allocate``/``allocate_multiple``) is retired at the
+    GPU level in arena mode and raises ``LogicError``: growth goes through the
+    owning sequence's range, and reuse onboarding copies into explicit
+    destinations inside that range (§4.4).
+    """
+
+    __slots__ = ("_arena", "_ranges", "_range_bases", "_pending_reclaim")
+    _arena: SequenceArena
+    _ranges: dict[int, SequenceRange]  # base_block -> live range
+    _range_bases: list[int]  # sorted, for slot_id -> range lookup on release
+    _pending_reclaim: list[SequenceRange]
+
+    def __init__(
+        self,
+        block_capacity: int,
+        slot_size_list: TypedIndexList[PoolIndex, int],
+        shared_phys_mem_pool: PooledPhysMemAllocator,
+        page_budget: PageBudget,
+        map_ahead_pages: int,
+        page_index_scale: int,
+    ) -> None:
+        # The int31 kernel-offset ceiling must hold for every offset this
+        # arena can emit (DESIGN.md §4.1); fail loudly at startup.
+        check_index_width(block_capacity, page_index_scale)
+        # SlotAllocator is retired at the GPU level in arena mode; the base
+        # class gets an empty one so its teardown logic is a no-op.
+        super().__init__(0)
+        self._arena = SequenceArena(
+            block_capacity,
+            tuple(slot_size_list),
+            shared_phys_mem_pool,
+            map_ahead_pages,
+            page_budget,
+        )
+        arena = self._arena
+        self._pools = make_typed(
+            lambda pool_idx: ArenaSlotPool(arena, pool_idx, slot_size_list[pool_idx]),
+            typed_len(slot_size_list),
+        )
+        self._ranges = {}
+        self._range_bases = []
+        self._pending_reclaim = []
+
+    @override
+    def destroy(self) -> None:
+        # The int31 check makes __init__ raise before base construction; a
+        # partially constructed group has nothing to tear down.
+        if not hasattr(self, "_destroyed") or self._destroyed:
+            return
+        assert not self._ranges and not self._pending_reclaim, (
+            "destroying ArenaPoolGroup with live sequence ranges"
+        )
+        super().destroy()
+        self._arena.destroy()
+
+    # -- per-sequence API (replaces scattered slot allocation) --------------
+
+    def reserve_sequence(self, max_blocks: int) -> SequenceRange:
+        """Reserve a contiguous block-index range for a sequence's maximum
+        block count. Pure VA bookkeeping; no physical memory is mapped.
+        Raises ``MemoryError`` on VA exhaustion (see DESIGN.md §4.8 sizing)."""
+        base_block = self._arena.reserve(max_blocks)
+        rng = SequenceRange(base_block, self._arena.reserved_len(base_block))
+        self._ranges[base_block] = rng
+        insort(self._range_bases, base_block)
+        return rng
+
+    def take_slot(self, rng: SequenceRange, ordinal: int) -> Slot:
+        """Issue the slot at ``rng.base_block + ordinal``. The caller (the
+        sequence growth path) guarantees each ordinal is taken at most once
+        while the range is live."""
+        assert not rng._freed, "cannot take slots from a freed range"
+        assert 0 <= ordinal < rng.num_blocks
+        rng._outstanding += 1
+        # Newly mapped arena pages have no previous owner, so no ready event.
+        return Slot(SlotId(rng.base_block + ordinal), CachedCudaEvent.NULL)
+
+    def ensure_mapped(self, rng: SequenceRange, num_valid_blocks: int) -> int:
+        """Map physical pages (in every pool) covering the first
+        ``num_valid_blocks`` of the range plus the map-ahead margin. Returns
+        the number of newly mapped pages; raises ``OutOfPagesError`` (mapping
+        nothing) if the page budget is exhausted (§4.6)."""
+        assert num_valid_blocks <= rng.num_blocks
+        return self._arena.ensure_mapped(rng.base_block, num_valid_blocks)
+
+    def free_sequence(self, rng: SequenceRange, last_consumer: CachedCudaEvent) -> None:
+        """Queue the whole range for deferred reclaim (§4.2). The range is
+        unmapped and its block indices reused only once ``last_consumer``, the
+        ready events of all released slots, and the release of every
+        outstanding slot have all happened -- see :meth:`drain_reclaim`."""
+        assert not rng._freed, "double free of a sequence range"
+        rng._freed = True
+        rng._free_event = last_consumer
+        self._pending_reclaim.append(rng)
+
+    def drain_reclaim(self) -> int:
+        """Unmap and recycle every freed range whose gating conditions have
+        all completed. Returns the number of ranges reclaimed. Call at
+        iteration boundaries."""
+        remaining: list[SequenceRange] = []
+        reclaimed = 0
+        for rng in self._pending_reclaim:
+            if rng._ready_to_reclaim():
+                self._arena.reclaim(rng.base_block)
+                del self._ranges[rng.base_block]
+                idx = bisect_right(self._range_bases, rng.base_block) - 1
+                assert self._range_bases[idx] == rng.base_block
+                self._range_bases.pop(idx)
+                reclaimed += 1
+            else:
+                remaining.append(rng)
+        self._pending_reclaim = remaining
+        return reclaimed
+
+    def _find_range(self, slot_id: int) -> SequenceRange:
+        idx = bisect_right(self._range_bases, slot_id) - 1
+        assert idx >= 0, f"slot {slot_id} does not belong to any live range"
+        rng = self._ranges[self._range_bases[idx]]
+        assert rng.base_block <= slot_id < rng.end_block, (
+            f"slot {slot_id} does not belong to any live range"
+        )
+        return rng
+
+    # -- PoolGroupBase interface overrides ----------------------------------
+
+    @override
+    def allocate(self) -> Slot:
+        raise LogicError(
+            "scattered slot allocation is retired in arena mode; use reserve_sequence()/take_slot()"
+        )
+
+    @override
+    def allocate_multiple(self, num_slots: int) -> list[Slot]:
+        raise LogicError(
+            "scattered slot allocation is retired in arena mode; use reserve_sequence()/take_slot()"
+        )
+
+    @override
+    def release(self, slot: Slot) -> None:
+        """Return one issued slot. The block index stays reserved for the
+        owning sequence; the slot's ready event (if still pending) gates the
+        range's eventual reclaim."""
+        slot = slot.move_to_new_slot()
+        rng = self._find_range(slot.slot_id)
+        assert rng._outstanding > 0
+        rng._outstanding -= 1
+        ev = slot.ready_event
+        if ev is not CachedCudaEvent.NULL and not ev.query_complete():
+            rng._gate_events.append(ev)
+        # Detach so Slot.__del__ does not warn; the range owns the index.
+        slot._slot_id = None
+        slot.ready_event = CachedCudaEvent.NULL
+
+    @property
+    @override
+    def num_slots(self) -> int:
+        return self._arena.capacity_blocks
+
+    @property
+    @override
+    def num_free_slots(self) -> int:
+        """Free *VA* blocks. Physical availability is governed by the shared
+        :class:`PageBudget`, not per-group slot counts (§4.6)."""
+        return self._arena.free_blocks
+
+    @property
+    def mapped_pages(self) -> int:
+        return self._arena.mapped_pages
+
+    def _check(self, allow_mismatch: bool = False) -> bool:
+        return True  # the base invariant (SlotAllocator vs pools) does not apply
+
+
 class HostPoolGroup(PoolGroupBase):
     __slots__ = ()
 
@@ -935,6 +1215,89 @@ class GpuCacheLevelStorage(CacheLevelStorage):
 
     @override
     def destroy(self) -> None:
+        super().destroy()
+        self.shared_phys_mem_pool.clear()
+
+
+class GpuArenaCacheLevelStorage(CacheLevelStorage):
+    """GPU cache level backed by per-sequence contiguous arenas
+    (contiguous primary KV cache, DESIGN.md §4). Flag-gated alternative to
+    :class:`GpuCacheLevelStorage`; selected by
+    ``KVCacheManagerConfig.contiguous_arena``.
+
+    Capacity is a level-wide physical :class:`PageBudget` (``quota //
+    phys_page_size`` pages) that every pool group's arena maps against --
+    per-pool-group slot partitioning and copy-based GPU defrag are retired
+    (§4.2/§4.6). ``block_capacity_list`` sizes each pool group's *VA* extent in
+    blocks (see §4.8 sizing); ``page_index_scale_list`` carries each group's
+    maximum kernel page-index scale for the int31 startup check (§4.1).
+    """
+
+    TIER: ClassVar[CacheTier] = CacheTier.GPU_MEM
+    __slots__ = ("shared_phys_mem_pool", "page_budget")
+    shared_phys_mem_pool: PooledPhysMemAllocator
+    page_budget: PageBudget
+
+    def __init__(
+        self,
+        slot_size_lists: TypedIndexList[PoolGroupIndex, TypedIndexList[PoolIndex, int]],
+        block_capacity_list: TypedIndexList[PoolGroupIndex, int],
+        page_index_scale_list: TypedIndexList[PoolGroupIndex, int],
+        quota: int,
+        phys_page_size: int,
+        map_ahead_pages: int,
+    ):
+        num_pool_groups = typed_len(slot_size_lists)
+        assert num_pool_groups == typed_len(block_capacity_list), (
+            "slot_size_lists and block_capacity_list must have the same length"
+        )
+        assert num_pool_groups == typed_len(page_index_scale_list), (
+            "slot_size_lists and page_index_scale_list must have the same length"
+        )
+        assert quota >= phys_page_size, "GPU quota must cover at least one physical page"
+        # Run the int31 startup check (§4.1) for every group before touching
+        # CUDA, so a mis-sized arena fails cleanly with nothing constructed.
+        for pg_idx in typed_range(num_pool_groups):
+            check_index_width(block_capacity_list[pg_idx], page_index_scale_list[pg_idx])
+        super().__init__()
+        self.shared_phys_mem_pool = PooledPhysMemAllocator(phys_page_size)
+        self.page_budget = PageBudget(quota // phys_page_size)
+        self._pool_groups = make_typed(
+            lambda pg_idx: ArenaPoolGroup(
+                block_capacity_list[pg_idx],
+                slot_size_lists[pg_idx],
+                self.shared_phys_mem_pool,
+                self.page_budget,
+                map_ahead_pages,
+                page_index_scale_list[pg_idx],
+            ),
+            num_pool_groups,
+        )
+
+    def pool_group(self, pool_group_index: PoolGroupIndex) -> ArenaPoolGroup:
+        pg = self._pool_groups[pool_group_index]
+        assert type(pg) is ArenaPoolGroup
+        return pg
+
+    def drain_reclaim(self) -> int:
+        """Drain every pool group's deferred-reclaim queue (call at iteration
+        boundaries). Returns the number of sequence ranges reclaimed."""
+        reclaimed = 0
+        for pg in self._pool_groups:
+            assert type(pg) is ArenaPoolGroup
+            reclaimed += pg.drain_reclaim()
+        return reclaimed
+
+    @property
+    def pool_size_granularity(self) -> int:
+        return self.shared_phys_mem_pool.phys_mem_size
+
+    @override
+    def destroy(self) -> None:
+        # __init__ raises by design on an int31 violation (§4.1); a partially
+        # constructed level has nothing to tear down.
+        if not hasattr(self, "_pool_groups"):
+            return
         super().destroy()
         self.shared_phys_mem_pool.clear()
 

@@ -26,21 +26,28 @@ Contents (bottom-up):
 
 * :func:`check_index_width` -- the int31 kernel-offset ceiling check (§4.1),
   meant to run at startup.
-* :class:`BlockRangeAllocator` -- allocates page-aligned, contiguous block-index
-  ranges from the arena's index space (§4.1). Pure logic, no CUDA.
-* :class:`SequenceArena` -- ties a sparse :class:`VirtMem` reservation to a
-  :class:`BlockRangeAllocator` and implements demand paging with map-ahead
-  margin (§4.2) and an event-gated deferred-reclaim queue.
+* :class:`PageBudget` -- the GPU-level physical-page quota (§4.6). Shared by
+  every arena of a cache level; replaces per-pool-group slot partitioning.
+* :class:`BlockRangeAllocator` -- allocates page-aligned, contiguous
+  block-index ranges from an arena's index space (§4.1). Pure logic, no CUDA.
+* :class:`SequenceArena` -- one block-index space for a whole *pool group*:
+  a shared :class:`BlockRangeAllocator` plus one sparse :class:`VirtMem` per
+  pool (a block index addresses all pools of its group, exactly like a slot id
+  does today). Implements demand paging with map-ahead margin (§4.2) and an
+  event-gated deferred-reclaim queue.
 
 The pieces that wire this into the rest of v2 (per-sequence growth in
 ``_KVCache``, capacity accounting in the scheduler, active<->stale copies) are
-NOT here yet; see the "Integration points" stubs at the bottom of the file.
+NOT here; the storage-side seam (``ArenaPoolGroup``) lives in
+``_storage/_core.py``.
 """
 
+from collections.abc import Sequence
 from math import gcd
 
 from ._common import MemAddress
 from ._cuda_virt_mem import PooledPhysMemAllocator, VirtMem
+from ._exceptions import OutOfPagesError
 from ._utils import CachedCudaEvent, div_up
 
 # Kernel-facing offsets are int32, and v1's KVCacheIndex steals the high bit for
@@ -57,6 +64,7 @@ def check_index_width(block_capacity: int, num_coalesced_subbuffers: int) -> Non
     ``num_coalesced_subbuffers`` is the per-slot ``scale`` factor (number of
     coalesced sub-buffers per block, e.g. ``num_layers * kv_factor`` plus any
     extra buffers) -- the same value the existing offset-table converter uses.
+    For a pool group whose pools have different scales, pass the maximum.
 
     Raises ``ValueError`` (a clear startup-time error, per DESIGN.md §4.1)
     rather than letting the kernels silently read garbage.
@@ -72,15 +80,71 @@ def check_index_width(block_capacity: int, num_coalesced_subbuffers: int) -> Non
         )
 
 
+class PageBudget:
+    """GPU-level physical-page quota (DESIGN.md §4.6).
+
+    In arena mode the KV GPU quota is enforced here, at *mapping* time, instead
+    of by pre-partitioned per-pool-group slot counts: all arenas of a cache
+    level share one budget and compete for pages. Pure bookkeeping (the actual
+    handles live in the shared :class:`PooledPhysMemAllocator`).
+    """
+
+    __slots__ = ("_total", "_used")
+    _total: int
+    _used: int
+
+    def __init__(self, total_pages: int) -> None:
+        assert total_pages > 0
+        self._total = total_pages
+        self._used = 0
+
+    @property
+    def total_pages(self) -> int:
+        return self._total
+
+    @property
+    def used_pages(self) -> int:
+        return self._used
+
+    @property
+    def free_pages(self) -> int:
+        return self._total - self._used
+
+    def consume(self, num_pages: int) -> None:
+        """Take ``num_pages`` from the budget; raises ``OutOfPagesError``
+        (without side effects) if the budget cannot cover them. This is the
+        signal for the caller to reclaim/preempt (§4.6)."""
+        assert num_pages >= 0
+        if self._used + num_pages > self._total:
+            raise OutOfPagesError(
+                f"KV page budget exhausted: need {num_pages} pages, "
+                f"{self.free_pages}/{self._total} free"
+            )
+        self._used += num_pages
+
+    def release(self, num_pages: int) -> None:
+        assert 0 <= num_pages <= self._used
+        self._used -= num_pages
+
+
+def _normalize_strides(record_stride: "int | Sequence[int]") -> tuple[int, ...]:
+    if isinstance(record_stride, int):
+        return (record_stride,)
+    strides = tuple(record_stride)
+    assert strides, "at least one pool record stride is required"
+    return strides
+
+
 class BlockRangeAllocator:
-    """First-fit free-list allocator over an arena's block-index space.
+    """First-fit free-list allocator over a pool group's block-index space.
 
     Hands out contiguous ``[base_block, base_block + length)`` ranges. Every
-    allocation is aligned and padded to a physical-page boundary so that two
-    sequences never share a physical page (which would couple their map/unmap
-    lifetimes). Alignment is expressed in blocks:
-    ``align = phys_page_size / gcd(record_stride, phys_page_size)`` -- the
-    smallest block count whose byte extent is a whole number of physical pages.
+    allocation is aligned and padded to a physical-page boundary *in every
+    pool of the group* so that two sequences never share a physical page
+    (which would couple their map/unmap lifetimes). Per-pool alignment,
+    expressed in blocks, is ``phys_page_size / gcd(record_stride,
+    phys_page_size)`` -- the smallest block count whose byte extent is a whole
+    number of physical pages; the group alignment is the lcm across pools.
 
     Live allocations are tracked (``base_block -> padded length``) so ranges can
     be freed by base alone. Pure Python logic (no CUDA); unit-testable on its own.
@@ -93,9 +157,19 @@ class BlockRangeAllocator:
     _free: list[list[int]]
     _live: dict[int, int]  # base_block -> padded length in blocks
 
-    def __init__(self, capacity_blocks: int, record_stride: int, phys_page_size: int) -> None:
-        assert capacity_blocks > 0 and record_stride > 0 and phys_page_size > 0
-        align = phys_page_size // gcd(record_stride, phys_page_size)
+    def __init__(
+        self,
+        capacity_blocks: int,
+        record_stride: "int | Sequence[int]",
+        phys_page_size: int,
+    ) -> None:
+        strides = _normalize_strides(record_stride)
+        assert capacity_blocks > 0 and phys_page_size > 0
+        assert all(s > 0 for s in strides)
+        align = 1
+        for stride in strides:
+            pool_align = phys_page_size // gcd(stride, phys_page_size)
+            align = align * pool_align // gcd(align, pool_align)  # lcm
         # The arena's usable capacity is floored to a whole number of alignment units.
         capacity = (capacity_blocks // align) * align
         assert capacity >= align, "arena too small to hold even one page-aligned range"
@@ -116,6 +190,9 @@ class BlockRangeAllocator:
         """Padded length (in blocks) of the live allocation starting at
         ``base_block``."""
         return self._live[base_block]
+
+    def is_live(self, base_block: int) -> bool:
+        return base_block in self._live
 
     def _round_up(self, num_blocks: int) -> int:
         align = self._align
@@ -197,101 +274,179 @@ class _ReclaimEntry:
 
 
 class SequenceArena:
-    """One arena (one ``cuMemAddressReserve``) shared by all sequences of a
-    (pool group, pool). Carves page-aligned block-index ranges and maps physical
-    pages on demand, recycling them through the shared physical pool on free.
+    """The contiguous block-index space of one *pool group*: one shared
+    :class:`BlockRangeAllocator` and one sparse ``cuMemAddressReserve`` per
+    pool. Carves page-aligned block-index ranges for sequences and maps
+    physical pages on demand (in every pool), recycling them through the
+    shared physical pool on free.
 
-    The arena base pointer is fixed for the process lifetime, preserving the
-    kernel/CUDA-graph contract ``pool_base + page_index * page_stride``
-    (DESIGN.md §3). ``record_stride`` is the byte size of one block's coalesced
-    record; the physical mapping granularity (super-page) is the shared
-    allocator's ``phys_mem_size`` -- see :class:`ContiguousArenaConfig`.
+    A block index addresses *all* pools of the group -- byte address in pool
+    ``p`` is ``base_address(p) + block_index * record_stride[p]`` -- mirroring
+    how one slot id addresses every pool today. Arena base pointers are fixed
+    for the process lifetime, preserving the kernel/CUDA-graph contract
+    ``pool_base + page_index * page_stride`` (DESIGN.md §3).
+
+    ``record_stride`` is the byte size of one block's coalesced record per
+    pool (a single int for one-pool groups); the physical mapping granularity
+    (super-page) is the shared allocator's ``phys_mem_size`` -- see
+    :class:`ContiguousArenaConfig`. If ``page_budget`` is given, every page
+    mapped/unmapped is accounted against it (§4.6); ``ensure_mapped`` raises
+    ``OutOfPagesError`` (mapping nothing) when the budget is exhausted.
     """
 
     __slots__ = (
-        "_vm",
+        "_vms",
         "_alloc",
-        "_record_stride",
+        "_strides",
         "_phys_page_size",
         "_map_ahead_pages",
+        "_budget",
         "_reclaim",
     )
-    _vm: VirtMem
+    _vms: list[VirtMem]
     _alloc: BlockRangeAllocator
-    _record_stride: int
+    _strides: tuple[int, ...]
     _phys_page_size: int
     _map_ahead_pages: int
+    _budget: "PageBudget | None"
     _reclaim: list[_ReclaimEntry]
 
     def __init__(
         self,
         block_capacity: int,
-        record_stride: int,
+        record_stride: "int | Sequence[int]",
         phys_mem_allocator: PooledPhysMemAllocator,
         map_ahead_pages: int = 1,
+        page_budget: "PageBudget | None" = None,
     ) -> None:
+        strides = _normalize_strides(record_stride)
         phys_page_size = phys_mem_allocator.phys_mem_size
-        va_size = div_up(block_capacity * record_stride, phys_page_size) * phys_page_size
-        self._vm = VirtMem(va_size, phys_mem_allocator)
-        self._alloc = BlockRangeAllocator(block_capacity, record_stride, phys_page_size)
-        self._record_stride = record_stride
+        self._vms = [
+            VirtMem(
+                div_up(block_capacity * stride, phys_page_size) * phys_page_size,
+                phys_mem_allocator,
+            )
+            for stride in strides
+        ]
+        self._alloc = BlockRangeAllocator(block_capacity, strides, phys_page_size)
+        self._strides = strides
         self._phys_page_size = phys_page_size
         self._map_ahead_pages = map_ahead_pages
+        self._budget = page_budget
         self._reclaim = []
 
     @property
-    def base_address(self) -> MemAddress:
-        return self._vm.address
+    def num_pools(self) -> int:
+        return len(self._vms)
+
+    def base_address(self, pool: int = 0) -> MemAddress:
+        return self._vms[pool].address
 
     @property
     def mapped_pages(self) -> int:
-        return self._vm.num_sparse_chunks
+        total = 0
+        for vm in self._vms:
+            total += vm.num_sparse_chunks
+        return total
+
+    @property
+    def capacity_blocks(self) -> int:
+        return self._alloc.capacity_blocks
+
+    @property
+    def free_blocks(self) -> int:
+        return self._alloc.free_blocks()
+
+    def reserved_len(self, base_block: int) -> int:
+        return self._alloc.reserved_len(base_block)
 
     def reserve(self, max_blocks: int) -> int:
         """Reserve VA for a sequence's maximum block count; returns base_block.
         No physical memory is mapped yet (that happens in :meth:`ensure_mapped`)."""
         return self._alloc.allocate(max_blocks)
 
-    def _chunk_range(self, base_block: int, num_blocks: int) -> tuple[int, int]:
-        """Half-open physical-chunk index range covering ``num_blocks`` blocks
-        starting at ``base_block``. Ranges are page-aligned per sequence, so a
-        chunk belongs to exactly one sequence."""
-        stride = self._record_stride
+    def _chunk_range(self, pool: int, base_block: int, num_blocks: int) -> tuple[int, int]:
+        """Half-open physical-chunk index range in ``pool`` covering
+        ``num_blocks`` blocks starting at ``base_block``. Ranges are
+        page-aligned per sequence in every pool, so a chunk belongs to exactly
+        one sequence."""
+        stride = self._strides[pool]
         page = self._phys_page_size
         lo = (base_block * stride) // page
         hi = div_up((base_block + num_blocks) * stride, page)
         return lo, hi
 
-    def ensure_mapped(self, base_block: int, num_valid_blocks: int) -> None:
+    def _missing_runs(self, pool: int, lo: int, hi: int) -> list[tuple[int, int]]:
+        """Contiguous runs of unmapped chunks in ``pool`` within ``[lo, hi)``,
+        as (start_chunk, num_chunks) pairs."""
+        vm = self._vms[pool]
+        page = self._phys_page_size
+        runs: list[tuple[int, int]] = []
+        run_start = -1
+        chunk = lo
+        while chunk < hi:
+            if not vm.is_mapped(chunk * page):
+                if run_start < 0:
+                    run_start = chunk
+            elif run_start >= 0:
+                runs.append((run_start, chunk - run_start))
+                run_start = -1
+            chunk += 1
+        if run_start >= 0:
+            runs.append((run_start, hi - run_start))
+        return runs
+
+    def ensure_mapped(self, base_block: int, num_valid_blocks: int) -> int:
         """Map physical pages covering ``[base_block, base_block + num_valid_blocks)``
-        plus ``map_ahead_pages`` of margin, skipping already-mapped pages.
+        plus ``map_ahead_pages`` of margin, in every pool, skipping
+        already-mapped pages. Returns the number of newly mapped pages.
 
         Maps are issued as contiguous runs (one :meth:`VirtMem.map_range` per
         run) so a single ``cuMemSetAccess`` covers each run (DESIGN.md §4.2).
         Safe to call concurrently with running kernels: it only touches pages
         strictly ahead of the write frontier.
+
+        If a page budget is attached and cannot cover the new pages, raises
+        ``OutOfPagesError`` *before mapping anything* — the caller reclaims or
+        preempts and retries (§4.6).
         """
         assert num_valid_blocks >= 0
-        lo, hi = self._chunk_range(base_block, num_valid_blocks)
-        hi += self._map_ahead_pages
-        # Clamp to this sequence's reserved extent so map-ahead never spills into
-        # a neighbour's pages.
-        max_hi = self._chunk_range(base_block, self._alloc.reserved_len(base_block))[1]
-        if hi > max_hi:
-            hi = max_hi
+        reserved = self._alloc.reserved_len(base_block)
+        margin = self._map_ahead_pages
+        runs_per_pool: list[list[tuple[int, int]]] = []
+        total_new = 0
+        for pool in range(len(self._vms)):
+            lo, hi = self._chunk_range(pool, base_block, num_valid_blocks)
+            hi += margin
+            # Clamp to this sequence's reserved extent so map-ahead never
+            # spills into a neighbour's pages.
+            max_hi = self._chunk_range(pool, base_block, reserved)[1]
+            if hi > max_hi:
+                hi = max_hi
+            runs = self._missing_runs(pool, lo, hi)
+            runs_per_pool.append(runs)
+            for _, num_chunks in runs:
+                total_new += num_chunks
+        if total_new == 0:
+            return 0
+        budget = self._budget
+        if budget is not None:
+            budget.consume(total_new)  # raises OutOfPagesError; nothing mapped yet
         page = self._phys_page_size
-        run_start = -1
-        chunk = lo
-        while chunk < hi:
-            if not self._vm.is_mapped(chunk * page):
-                if run_start < 0:
-                    run_start = chunk
-            elif run_start >= 0:
-                self._vm.map_range(run_start * page, chunk - run_start)
-                run_start = -1
-            chunk += 1
-        if run_start >= 0:
-            self._vm.map_range(run_start * page, hi - run_start)
+        num_mapped = 0
+        try:
+            for pool in range(len(self._vms)):
+                vm = self._vms[pool]
+                for start_chunk, num_chunks in runs_per_pool[pool]:
+                    vm.map_range(start_chunk * page, num_chunks)
+                    num_mapped += num_chunks
+        except Exception:
+            # map_range rolls itself back; return the unmapped remainder to
+            # the budget (already-mapped runs stay mapped and accounted).
+            if budget is not None:
+                budget.release(total_new - num_mapped)
+            raise
+        return total_new
 
     def enqueue_free(self, base_block: int, last_consumer: CachedCudaEvent) -> None:
         """Queue a freed range for deferred unmap once ``last_consumer`` (the
@@ -301,6 +456,7 @@ class SequenceArena:
         The block-index range stays reserved (not returned to the allocator)
         until :meth:`drain_reclaim` actually unmaps it, so it cannot be reissued
         to another sequence while pages are still live."""
+        assert self._alloc.is_live(base_block)
         self._reclaim.append(_ReclaimEntry(base_block, last_consumer))
 
     def drain_reclaim(self) -> int:
@@ -311,54 +467,57 @@ class SequenceArena:
         reclaimed = 0
         for entry in self._reclaim:
             if entry.event.query_complete():
-                num_blocks = self._alloc.reserved_len(entry.base_block)
-                lo, hi = self._chunk_range(entry.base_block, num_blocks)
-                # Unmap only the pages we actually mapped for this range.
-                self._unmap_mapped_run(lo, hi)
-                self._alloc.free(entry.base_block)
+                self._reclaim_now(entry.base_block)
                 reclaimed += 1
             else:
                 remaining.append(entry)
         self._reclaim = remaining
         return reclaimed
 
-    def _unmap_mapped_run(self, lo: int, hi: int) -> None:
+    def reclaim(self, base_block: int) -> None:
+        """Immediately unmap a range's pages and return its block indices to
+        the allocator. The caller must itself guarantee that no in-flight GPU
+        work references the range (e.g. ``ArenaPoolGroup`` gates on slot
+        release and CUDA events before calling this). For simple single-event
+        gating use :meth:`enqueue_free` + :meth:`drain_reclaim` instead."""
+        self._reclaim_now(base_block)
+
+    def _reclaim_now(self, base_block: int) -> None:
+        """Unmap a range's pages in every pool and return the block range to
+        the allocator. Caller guarantees no in-flight work references it."""
+        num_blocks = self._alloc.reserved_len(base_block)
+        num_unmapped = 0
+        for pool in range(len(self._vms)):
+            lo, hi = self._chunk_range(pool, base_block, num_blocks)
+            # Unmap only the pages we actually mapped for this range.
+            num_unmapped += self._unmap_mapped_run(pool, lo, hi)
+        self._alloc.free(base_block)
+        if self._budget is not None:
+            self._budget.release(num_unmapped)
+
+    def _unmap_mapped_run(self, pool: int, lo: int, hi: int) -> int:
+        vm = self._vms[pool]
         page = self._phys_page_size
+        num_unmapped = 0
         run_start = -1
         chunk = lo
         while chunk < hi:
-            if self._vm.is_mapped(chunk * page):
+            if vm.is_mapped(chunk * page):
                 if run_start < 0:
                     run_start = chunk
             elif run_start >= 0:
-                self._vm.unmap_range(run_start * page, chunk - run_start)
+                vm.unmap_range(run_start * page, chunk - run_start)
+                num_unmapped += chunk - run_start
                 run_start = -1
             chunk += 1
         if run_start >= 0:
-            self._vm.unmap_range(run_start * page, hi - run_start)
+            vm.unmap_range(run_start * page, hi - run_start)
+            num_unmapped += hi - run_start
+        return num_unmapped
 
     def destroy(self) -> None:
-        self._vm.destroy()
-
-
-# ---------------------------------------------------------------------------
-# Integration points (NOT yet implemented -- P0 remaining work, DESIGN.md §5)
-#
-# The following seams connect SequenceArena to the rest of v2. They are called
-# out here so the scaffold documents the full P0 surface; each needs GPU
-# integration testing to build for real.
-#
-# * _storage/_core.py: `GpuSlotPool` -> `GpuArenaPool` holding a SequenceArena
-#   instead of a tail-stack VirtMem; `SlotAllocator` retired for the GPU level.
-# * _core/_kv_cache.py `resize`: grow = extend own range + `ensure_mapped`;
-#   block-index emission = `base_block + ordinal` (replaces scattered slot ids);
-#   suspend/resume = write-out/copy-in + range release/realloc.
-# * _storage_manager.py: GPU-level eviction becomes reclaim/preempt;
-#   `_batched_migrate` gains an explicit-destination mode for reuse placement
-#   (§4.4) and the write-through-on-commit path (§4.3).
-# * pyexecutor/kv_cache_manager_v2.py: capacity API in physical pages (§4.6);
-#   batched `ensure_mapped` sweep in the prepare step; call `drain_reclaim` at
-#   iteration boundaries. Offset-table plumbing is otherwise unchanged.
-# * Startup: call `check_index_width(block_capacity, scale)` when building the
-#   arena for each pool (§4.1).
-# ---------------------------------------------------------------------------
+        if self._budget is not None:
+            self._budget.release(self.mapped_pages)
+        for vm in self._vms:
+            vm.destroy()
+        self._reclaim = []
