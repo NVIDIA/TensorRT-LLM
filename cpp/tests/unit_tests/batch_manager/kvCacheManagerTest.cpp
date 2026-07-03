@@ -10627,7 +10627,7 @@ private:
 // Small-pool BlockManager with a disk tier. tokensPerBlock=4; window fits maxBlocksPerSeq.
 std::unique_ptr<BlockManager> makeDiskTierBlockManager(std::shared_ptr<tr::CudaStream> const& stream,
     std::string const& diskPath, bool retainedOnly, SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool,
-    SizeType32 blocksInDiskPool)
+    SizeType32 blocksInDiskPool, bool protectUnexpired = false)
 {
     auto constexpr numLayers = 2;
     auto constexpr numKvHeads = 2;
@@ -10649,7 +10649,8 @@ std::unique_ptr<BlockManager> makeDiskTierBlockManager(std::shared_ptr<tr::CudaS
         /*enablePartialReuse=*/false, /*copyOnPartialReuse=*/false, /*kvCacheConnectorManager=*/nullptr,
         /*agentConfig=*/std::nullopt, /*enableIndexerKCache=*/false, /*indexerKCacheQuantBlockSize=*/128,
         /*indexerKCacheIndexHeadDim=*/0, /*indexerKCacheUseFp4=*/false, /*linearAttentionMetadata=*/std::nullopt,
-        /*poolConfigurations=*/std::vector<PoolConfiguration>{}, blocksInDiskPool, diskPath, retainedOnly);
+        /*poolConfigurations=*/std::vector<PoolConfiguration>{}, blocksInDiskPool, diskPath, retainedOnly,
+        protectUnexpired);
     blockManager->allocatePools(false);
     return blockManager;
 }
@@ -10851,40 +10852,52 @@ TEST_F(KVCacheManagerTest, DiskTierDeadlineDisplacementTest)
     releaseDiskTierSequence(blockManager, seqA2);
 }
 
-// Equal deadlines: FIFO = first-spilled dies first, i.e. suffix-first within a chain
-// (releaseBlocks iterates leaf-first, so the deepest blocks reach disk first).
-// DISABLED: asserting suffix-first (FIFO among equal deadlines) end-to-end requires
-// exact control of which/how-many blocks spill, which the full manager path does not
-// give (single-block/last-block reuse exclusion makes displacement demand nondeterministic).
-// Deadline ORDERING is covered by DiskTierDeadlineDisplacementTest; the FIFO tiebreak
-// belongs in a dedicated eviction-policy-level test. TODO(disk-tier): add that harness.
-TEST_F(KVCacheManagerTest, DISABLED_DiskTierSuffixFirstDisplacementTest)
+// Protect mode: a disk full of unexpired blocks refuses new admissions; existing
+// TTL promises are served in full.
+TEST_F(KVCacheManagerTest, DiskTierProtectUnexpiredTest)
 {
     auto const stream = std::make_shared<tr::CudaStream>();
     DiskTierDir dir;
-    // Disk holds the entire 4-block chain of sequence A; a later single-block spill
-    // then displaces EXACTLY one victim, which must be the deepest (first-spilled)
-    // block of the chain.
-    auto blockManagerPtr
-        = makeDiskTierBlockManager(stream, dir.str(), /*retainedOnly=*/true, /*prim=*/4, /*sec=*/2, /*disk=*/4);
+    auto blockManagerPtr = makeDiskTierBlockManager(
+        stream, dir.str(), /*retainedOnly=*/true, /*prim=*/4, /*sec=*/2, /*disk=*/4, /*protectUnexpired=*/true);
     auto& blockManager = *blockManagerPtr;
 
-    auto seqA = addDiskTierSequence(blockManager, 0, iotaTokens(0, 16), std::chrono::milliseconds(300000));
+    // Drive distinct long-TTL sequences through eviction until the disk fills with live
+    // blocks and a further admission is refused.
+    std::size_t refused = 0;
+    for (SizeType32 i = 0; i < 12 && refused == 0; ++i)
+    {
+        auto s = addDiskTierSequence(blockManager, i, iotaTokens(i * 100, 16), std::chrono::milliseconds(600000));
+        releaseDiskTierSequence(blockManager, s);
+        churnOnce(blockManager, 100 + i, 5000 + i * 100);
+        refused = blockManager.getNumDiskAdmissionRefused();
+    }
+    // Invariants: admissions were refused, and total spills never exceeded disk capacity
+    // (exceeding it would require displacing a live block, which protect mode refuses).
+    EXPECT_GE(refused, 1u);
+    EXPECT_LE(blockManager.getNumDiskSpills(), 4u);
+}
+
+// Protect mode still reclaims EXPIRED disk blocks (their promise is over).
+TEST_F(KVCacheManagerTest, DiskTierProtectEvictsExpiredTest)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    DiskTierDir dir;
+    auto blockManagerPtr = makeDiskTierBlockManager(
+        stream, dir.str(), /*retainedOnly=*/true, /*prim=*/4, /*sec=*/2, /*disk=*/2, /*protectUnexpired=*/true);
+    auto& blockManager = *blockManagerPtr;
+
+    auto seqA = addDiskTierSequence(blockManager, 0, iotaTokens(0, 16), std::chrono::milliseconds(50));
     releaseDiskTierSequence(blockManager, seqA);
     churnOnce(blockManager, 1, 100);
-    churnOnce(blockManager, 2, 150);
-    EXPECT_EQ(blockManager.getNumDiskSpills(), 4u); // whole chain disk-resident
+    auto const spillsFilled = blockManager.getNumDiskSpills();
+    EXPECT_GE(spillsFilled, 2u);
+    std::this_thread::sleep_for(std::chrono::milliseconds(120)); // A's disk blocks now expired
 
-    // Same-deadline single-block displacer: displacement demand is exactly 1.
-    auto seqB = addDiskTierSequence(blockManager, 3, iotaTokens(200, 4), std::chrono::milliseconds(300000));
+    // New victim: the expired blocks ARE evictable even in protect mode => it spills.
+    auto seqB = addDiskTierSequence(blockManager, 2, iotaTokens(200, 16), std::chrono::milliseconds(600000));
     releaseDiskTierSequence(blockManager, seqB);
-    churnOnce(blockManager, 4, 300);
-    EXPECT_GE(blockManager.getNumDiskSpills(), 5u); // displacer reached disk
-
-    auto seqA2 = addDiskTierSequence(blockManager, 5, iotaTokens(0, 16), std::chrono::milliseconds(300000));
-    // Suffix-first: the displaced block is the DEEPEST -> the prefix survives (>= 3
-    // full blocks reusable). Prefix-first displacement would break the reuse chain at
-    // the first block -> position near 0.
-    EXPECT_GE(seqA2.req->getContextCurrentPosition(), 12);
-    releaseDiskTierSequence(blockManager, seqA2);
+    churnOnce(blockManager, 3, 300);
+    EXPECT_GT(blockManager.getNumDiskSpills(), spillsFilled);
+    EXPECT_EQ(blockManager.getNumDiskAdmissionRefused(), 0u);
 }

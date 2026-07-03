@@ -1363,6 +1363,7 @@ KvCacheConfig Serialization::deserializeKvCacheConfig(std::istream& is)
     kvCacheConfig.setDiskCacheSize(diskCacheSize);
     kvCacheConfig.setDiskCachePath(diskCachePath);
     kvCacheConfig.setDiskCacheRetainedOnly(su::deserialize<bool>(is));
+    kvCacheConfig.setDiskCacheProtectUnexpired(su::deserialize<bool>(is));
     return kvCacheConfig;
 }
 
@@ -1384,6 +1385,7 @@ void Serialization::serialize(KvCacheConfig const& kvCacheConfig, std::ostream& 
     su::serialize(kvCacheConfig.getDiskCacheSize(), os);
     su::serialize(kvCacheConfig.getDiskCachePath(), os);
     su::serialize(kvCacheConfig.getDiskCacheRetainedOnly(), os);
+    su::serialize(kvCacheConfig.getDiskCacheProtectUnexpired(), os);
 }
 
 size_t Serialization::serializedSize(KvCacheConfig const& kvCacheConfig)
@@ -1406,6 +1408,7 @@ size_t Serialization::serializedSize(KvCacheConfig const& kvCacheConfig)
     totalSize += su::serializedSize(kvCacheConfig.getDiskCacheSize());
     totalSize += su::serializedSize(kvCacheConfig.getDiskCachePath());
     totalSize += su::serializedSize(kvCacheConfig.getDiskCacheRetainedOnly());
+    totalSize += su::serializedSize(kvCacheConfig.getDiskCacheProtectUnexpired());
     return totalSize;
 }
 

@@ -1109,6 +1109,8 @@ public:
     void setDiskCachePath(std::string const& diskCachePath);
     [[nodiscard]] bool getDiskCacheRetainedOnly() const;
     void setDiskCacheRetainedOnly(bool diskCacheRetainedOnly);
+    [[nodiscard]] bool getDiskCacheProtectUnexpired() const;
+    void setDiskCacheProtectUnexpired(bool diskCacheProtectUnexpired);
 
     void fillEmptyFieldsFromRuntimeDefaults(tensorrt_llm::runtime::RuntimeDefaults const& runtimeDefaults);
 
@@ -1177,6 +1179,10 @@ private:
 
     /// @brief When true, only blocks whose request carried diskRetentionMs may enter the disk tier.
     bool mDiskCacheRetainedOnly{false};
+
+    /// @brief When true, unexpired disk blocks are never evicted to admit a new one;
+    /// the new block is refused instead (only expired blocks are reclaimable).
+    bool mDiskCacheProtectUnexpired{false};
 };
 
 /// @brief Configuration class for the runtime perf knobs

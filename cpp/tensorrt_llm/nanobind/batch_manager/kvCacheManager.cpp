@@ -665,7 +665,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
                  tbk::CacheType, std::optional<tensorrt_llm::executor::RetentionPriority>,
                  std::shared_ptr<tbk::KVCacheEventManager>, bool, bool, std::shared_ptr<tbc::KvCacheConnectorManager>,
                  bool, SizeType32, SizeType32, bool, std::optional<tbk::LinearAttentionMetadata>,
-                 std::vector<tbk::PoolConfiguration> const&, SizeType32, std::string const&, bool>(),
+                 std::vector<tbk::PoolConfiguration> const&, SizeType32, std::string const&, bool, bool>(),
             nb::arg("num_kv_heads_per_layer"), nb::arg("size_per_head"), nb::arg("tokens_per_block"),
             nb::arg("blocks_per_window"), nb::arg("max_num_sequences"), nb::arg("max_beam_width"),
             nb::arg("max_attention_window_vec"), nb::arg("dtype"), nb::arg("sink_token_length"), nb::arg("stream"),
@@ -678,7 +678,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("linear_attention_metadata").none() = std::nullopt,
             nb::arg("pool_configurations") = std::vector<tbk::PoolConfiguration>{}, nb::arg("blocks_in_disk_pool") = 0,
             nb::arg("disk_cache_path") = "", nb::arg("disk_cache_retained_only") = false,
-            nb::call_guard<nb::gil_scoped_release>())
+            nb::arg("disk_cache_protect_unexpired") = false, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "scheduling_has_free_blocks",
             [](tbk::KVCacheManager& self, SizeType32 numRequired, SizeType32 windowSize)

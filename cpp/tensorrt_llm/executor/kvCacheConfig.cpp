@@ -232,6 +232,16 @@ void KvCacheConfig::setDiskCacheRetainedOnly(bool diskCacheRetainedOnly)
     mDiskCacheRetainedOnly = diskCacheRetainedOnly;
 }
 
+bool KvCacheConfig::getDiskCacheProtectUnexpired() const
+{
+    return mDiskCacheProtectUnexpired;
+}
+
+void KvCacheConfig::setDiskCacheProtectUnexpired(bool diskCacheProtectUnexpired)
+{
+    mDiskCacheProtectUnexpired = diskCacheProtectUnexpired;
+}
+
 void KvCacheConfig::setSecondaryOffloadMinPriority(std::optional<RetentionPriority> secondaryOffloadMinPriority)
 {
     mSecondaryOffloadMinPriority = secondaryOffloadMinPriority;
