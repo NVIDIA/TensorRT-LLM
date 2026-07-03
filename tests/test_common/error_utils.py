@@ -99,7 +99,7 @@ def report_error(
 # flush sleep after detection covers the last srun `&> file` redirect
 # finalization.
 
-SIBLING_LOG_WAIT_TIMEOUT_S = 180
+SIBLING_LOG_WAIT_TIMEOUT_S = 120
 SIBLING_LOG_POLL_INTERVAL_S = 3
 SIBLING_LOG_STABILITY_POLLS = 3
 SIBLING_LOG_FLUSH_SLEEP_S = 3
