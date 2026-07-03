@@ -233,7 +233,7 @@ class SessionPrefetcher:
         the current one. A miss is discarded at ``take()`` and the sync build
         is no slower than without prefetch.
         """
-        if not self.enabled or spec <= 1:
+        if not self.enabled or spec < 1:
             return
         with self._lock:
             if self._thread is not None or self._built_spec == spec:
@@ -245,8 +245,11 @@ class SessionPrefetcher:
         """A drop-in for ``MpiPoolSession`` that consumes and re-arms the shadow."""
 
         def factory(n_workers, *args, **kwargs):
-            if args or kwargs or n_workers <= 1:
+            if args or kwargs:
                 return real_cls(n_workers, *args, **kwargs)
+            # n_workers == 1 included: the default single-GPU path also spawns
+            # a 1-worker pool (executor.py -> proxy.py) costing ~50s of
+            # spawn+import, the same as multi-GPU pools.
             session = self.take(n_workers) or real_cls(n_workers=n_workers)
             self.schedule_shadow(n_workers)  # re-arm for the NEXT test
             return session

@@ -167,11 +167,14 @@ def test_take_discards_on_env_mismatch(prefetcher, monkeypatch):
     assert pool.shut  # stale shadow torn down in the background
 
 
-def test_factory_single_worker_passthrough(prefetcher):
+def test_factory_single_worker_also_prefetches(prefetcher):
+    # The default single-GPU path spawns a 1-worker pool too (executor.py ->
+    # proxy.py), paying the same ~50s spawn+import: it must benefit as well.
     factory = prefetcher._make_factory(_FakePool)
     session = factory(1)
     assert isinstance(session, _FakePool)
-    assert prefetcher._thread is None  # no shadow for 1-GPU pools
+    prefetcher._thread.join(timeout=10)
+    assert prefetcher.built == [1]  # shadow armed for the next 1-GPU test
 
 
 def test_warm_page_cache_reads_weight_files(tmp_path):
