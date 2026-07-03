@@ -188,6 +188,16 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, is_integration_test=True)
 
+    @pytest.mark.skip_less_device_memory(32000)
+    def test_gather_generation_logits_cuda_graph(self):
+        """RCCA: https://nvbugs/5365525."""
+        llm = LLM(self.MODEL_PATH,
+                  gather_generation_logits=True,
+                  cuda_graph_config=CudaGraphConfig())
+        with llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @pytest.mark.parametrize("use_dynamic_tree", [False, True],
                              ids=["no_dynamic_tree", "dynamic_tree"])
     def test_eagle3_rejection_dynamic_tree_smoke(self, use_dynamic_tree,
