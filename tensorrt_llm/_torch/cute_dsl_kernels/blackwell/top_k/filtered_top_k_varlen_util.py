@@ -198,6 +198,103 @@ class FilteredTopKKernelVarlen:
             return cute.Uint16(key)
 
     @cute.jit
+    def _collect_below_threshold_coarse(
+        self,
+        tidx,
+        threshold_bin,
+        s_counter,
+        s_indices,
+        val_one,
+        _copy_atom,
+        scan_frag,
+        _aligned_base,
+        _elem_bytes,
+        _align_bytes,
+        vec_start,
+        aligned_size,
+        _step_vec,
+        score,
+        row_start,
+        prologue_elems,
+        left_start,
+        left_size,
+    ):
+        """Collect all indices with coarse bin < threshold_bin from GMEM, then barrier."""
+        vec_size = self.vec_size
+        ic = tidx * cutlass.Int32(vec_size)
+        while ic + cutlass.Int32(vec_size - 1) < aligned_size:
+            cute.copy(
+                _copy_atom,
+                cute.make_tensor(
+                    cute.make_ptr(
+                        self.dtype,
+                        _aligned_base + cutlass.Int64(ic) * cutlass.Int64(_elem_bytes),
+                        cute.AddressSpace.gmem,
+                        assumed_align=_align_bytes,
+                    ),
+                    cute.make_layout((vec_size,)),
+                ),
+                scan_frag,
+            )
+            for j in cutlass.range_constexpr(vec_size):
+                bin_val = self.to_coarse_key(scan_frag[j])
+                if bin_val < threshold_bin:
+                    pos = atomicAdd(s_counter.iterator, val_one)
+                    s_indices[pos] = self.index_type(vec_start + ic + cutlass.Int32(j))
+            ic = ic + cutlass.Int32(_step_vec)
+
+        for j in range(tidx, prologue_elems, self.num_threads_per_cta):
+            col_idx = cutlass.Int32(row_start + j)
+            raw = score[col_idx]
+            bin_val = self.to_coarse_key(raw)
+            if bin_val < threshold_bin:
+                pos = atomicAdd(s_counter.iterator, val_one)
+                s_indices[pos] = self.index_type(col_idx)
+
+        for j in range(tidx, left_size, self.num_threads_per_cta):
+            col_idx = cutlass.Int32(left_start + j)
+            raw = score[col_idx]
+            bin_val = self.to_coarse_key(raw)
+            if bin_val < threshold_bin:
+                pos = atomicAdd(s_counter.iterator, val_one)
+                s_indices[pos] = self.index_type(col_idx)
+
+        cute.arch.barrier()
+
+    @cute.jit
+    def _collect_below_threshold_refine(
+        self,
+        tidx,
+        threshold,
+        offset,
+        num_input,
+        r_idx,
+        s_input_idx,
+        score,
+        s_counter,
+        s_indices,
+        val_one,
+        cur_g_num_input,
+        buffer,
+    ):
+        """Collect all indices with refined bin < threshold from SMEM (and GMEM buffer), then barrier."""
+        for i in range(tidx, num_input, self.num_threads_per_cta):
+            idx = s_input_idx[r_idx, i]
+            idx = cutlass.Int32(cutlass.Uint32(idx))
+            bin_val = (self.to_ordered(score[idx]) >> offset) & 0xFF
+            if bin_val < threshold:
+                pos = atomicAdd(s_counter.iterator, val_one)
+                s_indices[pos] = self.index_type(idx)
+        if cutlass.const_expr(self.enable_gmem_store):
+            for i in range(tidx, cur_g_num_input, self.num_threads_per_cta):
+                idx = buffer[r_idx, i]
+                bin_val = (self.to_ordered(score[idx]) >> offset) & 0xFF
+                if bin_val < threshold:
+                    pos = atomicAdd(s_counter.iterator, val_one)
+                    s_indices[pos] = self.index_type(idx)
+        cute.arch.barrier()
+
+    @cute.jit
     def prefix_sum_and_find_threshold_coarse(
         self,
         tidx,
@@ -419,6 +516,7 @@ class FilteredTopKKernelVarlen:
             if cutlass.const_expr(self.return_val):
                 dst_values = output_values[bidx, None]
         # Note, for multi-cta version, each ctas must have its own extra_buffer.
+        buffer = None
         if cutlass.const_expr(self.enable_gmem_store):
             if cutlass.const_expr(self.enable_multi_cta):
                 grid_dim_x, grid_dim_y, _ = cute.arch.grid_dim()
@@ -568,51 +666,26 @@ class FilteredTopKKernelVarlen:
 
             # 1.4 Collect indices
             if topk_remaining == 0:
-                # Collect indices where bin < threshold_bin
-                ic = tidx * cutlass.Int32(vec_size)
-                while ic + cutlass.Int32(vec_size - 1) < aligned_size:
-                    cute.copy(
-                        _copy_atom,
-                        cute.make_tensor(
-                            cute.make_ptr(
-                                self.dtype,
-                                _aligned_base + cutlass.Int64(ic) * cutlass.Int64(_elem_bytes),
-                                cute.AddressSpace.gmem,
-                                assumed_align=_align_bytes,
-                            ),
-                            cute.make_layout((vec_size,)),
-                        ),
-                        scan_frag,
-                    )
-                    for j in cutlass.range_constexpr(vec_size):
-                        bin_val = self.to_coarse_key(scan_frag[j])
-                        if bin_val < threshold_bin:
-                            pos = atomicAdd(s_counter.iterator, val_one)
-                            s_indices[pos] = self.index_type(vec_start + ic + cutlass.Int32(j))
-                    ic = ic + cutlass.Int32(_step_vec)
-
-                # for initial scalar load part.
-                for j in range(tidx, prologue_elems, self.num_threads_per_cta):
-                    col_idx = cutlass.Int32(row_start + j)
-                    raw = score[col_idx]
-                    bin_val = self.to_coarse_key(raw)
-                    if bin_val < threshold_bin:
-                        pos = atomicAdd(s_counter.iterator, val_one)
-                        idx = self.index_type(col_idx)
-                        s_indices[pos] = idx
-
-                # for left part (left_size)
-                for j in range(tidx, left_size, self.num_threads_per_cta):
-                    col_idx = cutlass.Int32(left_start + j)
-                    raw = score[col_idx]
-                    bin_val = self.to_coarse_key(raw)
-                    if bin_val < threshold_bin:
-                        pos = atomicAdd(s_counter.iterator, val_one)
-                        idx = self.index_type(col_idx)
-                        s_indices[pos] = idx
-
-                cute.arch.barrier()
-
+                self._collect_below_threshold_coarse(
+                    tidx,
+                    threshold_bin,
+                    s_counter,
+                    s_indices,
+                    val_one,
+                    _copy_atom,
+                    scan_frag,
+                    _aligned_base,
+                    _elem_bytes,
+                    _align_bytes,
+                    vec_start,
+                    aligned_size,
+                    _step_vec,
+                    score,
+                    row_start,
+                    prologue_elems,
+                    left_start,
+                    left_size,
+                )
             else:
                 # Reset histogram for refinement
                 cute.arch.barrier()
@@ -828,6 +901,7 @@ class FilteredTopKKernelVarlen:
                             s_num_input_idx=r_idx ^ 1,
                         )
                         num_input = min(s_num_input[r_idx], self.filtered_topk_smem_input_size)
+                        cur_g_num_input = cutlass.Int32(0)
                         if cutlass.const_expr(self.enable_gmem_store):
                             cur_g_num_input = g_num_input[r_idx]
 
@@ -838,27 +912,20 @@ class FilteredTopKKernelVarlen:
                         is_last_round = round == self.num_refine_rounds - 1
 
                         if topk_remaining == 0:
-                            # Collect indices where bin < threshold_bin.
-                            for i in range(tidx, num_input, self.num_threads_per_cta):
-                                idx = s_input_idx[r_idx, i]
-                                idx = cutlass.Int32(cutlass.Uint32(idx))
-                                bin_val = (self.to_ordered(score[idx]) >> offset) & 0xFF
-                                if bin_val < threshold:
-                                    pos = atomicAdd(s_counter.iterator, val_one)
-                                    s_indices[pos] = self.index_type(idx)
-                            if cutlass.const_expr(self.enable_gmem_store):
-                                for i in range(
-                                    tidx,
-                                    cur_g_num_input,
-                                    self.num_threads_per_cta,
-                                ):
-                                    idx = buffer[r_idx, i]
-                                    bin_val = (self.to_ordered(score[idx]) >> offset) & 0xFF
-                                    if bin_val < threshold:
-                                        pos = atomicAdd(s_counter.iterator, val_one)
-                                        s_indices[pos] = self.index_type(idx)
-                            cute.arch.barrier()
-                            # break
+                            self._collect_below_threshold_refine(
+                                tidx,
+                                threshold,
+                                offset,
+                                num_input,
+                                r_idx,
+                                s_input_idx,
+                                score,
+                                s_counter,
+                                s_indices,
+                                val_one,
+                                cur_g_num_input,
+                                buffer,
+                            )
                             run_next_round = False
                         else:
                             # Reset histogram
