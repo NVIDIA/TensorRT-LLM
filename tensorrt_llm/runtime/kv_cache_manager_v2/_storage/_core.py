@@ -767,6 +767,15 @@ class ArenaPoolGroup(PoolGroupBase):
         # partially constructed group has nothing to tear down.
         if not hasattr(self, "_destroyed") or self._destroyed:
             return
+        # Teardown can run right after sequences finished, with their ranges
+        # still in the event-gated deferred-reclaim queue (§4.2). Teardown is
+        # allowed to block: synchronize the gates and drain, then anything
+        # left is a genuine leak.
+        for rng in self._pending_reclaim:
+            rng._free_event.synchronize()
+            for ev in rng._gate_events:
+                ev.synchronize()
+        self.drain_reclaim()
         assert not self._ranges and not self._pending_reclaim, (
             "destroying ArenaPoolGroup with live sequence ranges"
         )

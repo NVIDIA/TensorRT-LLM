@@ -1044,6 +1044,37 @@ class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
         stats = self.manager._storage.get_statistics(CacheLevel(1))[0]
         return stats.total - stats.free
 
+    def test_resume_gate_drains_deferred_reclaim(self) -> None:
+        """Anti-livelock (§4.2 x §4.6).
+
+        Arena frees are deferred, so page utilization can stay pinned above
+        max_util_for_resume after other sequences finished. resume() must
+        drain the reclaim queue before evaluating the gate, or a scheduler
+        retrying resume forever livelocks (observed in the KV-cache-capacity
+        estimation phase).
+        """
+        manager = self.manager
+        budget = manager._storage.gpu_page_budget
+        kv1 = manager.create_kv_cache(max_capacity=1024 * self.TPB)
+        with TemporaryCudaStream([]) as s:
+            stream = CudaStream(s.handle)
+            self.assertTrue(kv1.resume(stream))
+            self.assertTrue(kv1.resize(1024 * self.TPB))  # maps the full budget
+            self.assertEqual(budget.used_pages, budget.total_pages)
+            kv1.close()
+        s.take_finish_event().synchronize()
+        # reclaim is queued but deliberately NOT drained: utilization reads 100%
+        self.assertEqual(budget.used_pages, budget.total_pages)
+        kv2 = manager.create_kv_cache(max_capacity=2 * self.TPB)
+        with TemporaryCudaStream([]) as s2:
+            stream2 = CudaStream(s2.handle)
+            self.assertTrue(kv2.resume(stream2))  # must drain, not refuse
+            self.assertTrue(kv2.resize(2 * self.TPB))
+            kv2.close()
+        s2.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim()
+        self.assertEqual(budget.used_pages, 0)
+
     def test_suspend_resume_roundtrip(self) -> None:
         """§4.5 suspend/resume round-trip.
 

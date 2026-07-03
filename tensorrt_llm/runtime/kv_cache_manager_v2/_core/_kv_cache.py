@@ -1342,6 +1342,14 @@ class _KVCache:
         assert self.status == self.Status.SUSPENDED
         if cuda_stream is not None:
             self.cuda_stream = cuda_stream
+        if self._storage.is_arena_mode:
+            # Arena frees are deferred (event-gated unmap, §4.2), so page
+            # utilization can stay pinned above the resume gate after other
+            # sequences finished. Classic mode returns slots synchronously and
+            # never needs this. Without the drain here, a caller that retries
+            # resume() in a loop (e.g. the scheduler) can livelock: nothing is
+            # schedulable, so no other path drains either.
+            self._storage.drain_gpu_reclaim()
         utilization = max(self._storage.get_utilization(GPU_LEVEL))
         if utilization > self.manager._init_config.max_util_for_resume:
             return False

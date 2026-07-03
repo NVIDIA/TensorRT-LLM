@@ -1122,6 +1122,16 @@ class KVCacheManagerV2(BaseResourceManager):
         return self.impl.get_page_index_upper_bound(0, Role.KEY)
 
     def get_buffers(self, layer_idx: int, kv_layout: str = "NHD") -> Optional[torch.Tensor]:
+        if self._arena_enabled:
+            # A dense pool-wide tensor view is incompatible with sparsely
+            # mapped arena pools; consumers that need it (FlashInfer-style
+            # backends, MLA latent append) are later-phase work (DESIGN.md
+            # contiguous_primary_kvcache §7).
+            raise NotImplementedError(
+                "get_buffers is not supported with use_contiguous_kv_arena: arena "
+                "pools are sparse VA reservations and cannot be viewed as one dense "
+                "tensor. Use the TRTLLM attention backend, or disable the arena."
+            )
         layer_offset = self.layer_offsets[layer_idx]
         addr_key = self.impl.get_mem_pool_base_address(layer_offset, Role.KEY)
         if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
@@ -2389,6 +2399,14 @@ class KVCacheManagerV2(BaseResourceManager):
         return get_size_in_bytes(cache_size // quant_vector_size, scaling_factor_dtype)
 
     def check_invalid_values_in_kv_cache(self, fill_with_zero: bool = False) -> bool:
+        if self._arena_enabled:
+            # Arena pools are sparse VA reservations; a dense tensor view over
+            # the whole pool would touch unmapped pages (and warmup sequences'
+            # pages are already unmapped by the time this runs). Skip the scan.
+            logger.debug(
+                "Skipping KV cache NaN/Inf warmup scan: contiguous-arena pools are sparsely mapped"
+            )
+            return False
         some_checks_unavailable = False
         has_invalid_values = torch.tensor(
             [False], dtype=torch.bool, device=torch.cuda.current_device()
