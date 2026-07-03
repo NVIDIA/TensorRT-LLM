@@ -26,9 +26,26 @@ import time
 IMMEDIATE_FATAL_PATTERNS: list[str] = [
     "cudaerrorillegaladdress",
     "cudaerrorlaunchfailure",
+    "cudaerrorcontextisdestroyed",
+    "cudaerrornodevice",
     "illegal memory access",
     "device-side assert",
-    "unrecoverable",
+    "cuda context destroyed",
+    "cuda context is destroyed",
+    "cuda context was destroyed",
+    "cuda context is unrecoverable",
+    "unrecoverable error in the engine",
+    "cuda error no device",
+    "gpu has fallen off the bus",
+    "xid 79",
+    "nccl communicator abort",
+    "nccl communicator was aborted",
+    "ncclcommabort",
+    "nvshmem peer unreachable",
+    "mpi rank terminated",
+    "mpi worker terminated",
+    "mpi rank exited unexpectedly",
+    "mpi worker exited unexpectedly",
 ]
 
 # Patterns that are serious but may be transient (e.g. a single OOM
@@ -38,6 +55,20 @@ SEVERE_ERROR_PATTERNS: list[str] = [
     "cuda out of memory",
     "cuda error",
     "nccl error",
+    "nccl timeout",
+    "nccl operation timed out",
+    "alltoall timeout",
+    "all-to-all timeout",
+    "alltoall watchdog",
+    "completion_flags timeout",
+    "deep_ep buffer barrier hang",
+    "deepep buffer barrier hang",
+    "intranode::barrier",
+    "symmetric memory access violation",
+    "rdma timeout",
+    "nixl transfer failed",
+    "nixl transfer entered error state",
+    "nixl transfer wait timed out",
 ]
 
 

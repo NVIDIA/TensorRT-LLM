@@ -819,6 +819,8 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                 **kwargs,
         ) as llm:
             _set_quant_config(llm, model_id)
+            # The NVFP4 Super V3 checkpoint is mixed precision; resolve gsm8k
+            # thresholds against the MIXED_PRECISION reference (matches test_accuracy).
             if model_id == "nvfp4":
                 llm.args.quant_config.quant_algo = QuantAlgo.MIXED_PRECISION
             print_memory_usage("after engine build")
