@@ -5469,22 +5469,28 @@ class PyTorchModelEngine(ModelEngine):
                 else:
                     spec_metadata = None
 
-            # Fill slot-ID buffer for scatter inside draft loop
-            if (self.enable_spec_decode and spec_tree_manager is not None
-                    and spec_tree_manager.use_dynamic_tree
-                    and not self.is_draft_model):
-                spec_tree_manager.slot_storage.fill_all_slot_ids(
-                    padded_requests.context_requests,
-                    padded_requests.generation_requests,
-                )
+            def prepare_forward_inputs_fn(
+            ) -> Tuple[Dict[str, Any], Optional[torch.Tensor]]:
+                # Fill slot-ID buffer for scatter inside draft loop
+                if (self.enable_spec_decode and spec_tree_manager is not None
+                        and spec_tree_manager.use_dynamic_tree
+                        and not self.is_draft_model):
+                    spec_tree_manager.slot_storage.fill_all_slot_ids(
+                        padded_requests.context_requests,
+                        padded_requests.generation_requests,
+                    )
 
-            inputs, gather_ids = self._prepare_inputs(
-                padded_requests, kv_cache_manager, attn_metadata, spec_metadata,
-                new_tensors_device, cache_indirection_buffer,
-                num_accepted_tokens_device, req_id_to_old_request,
-                resource_manager, can_run_graph)
-            self._prepare_inputs_event = torch.cuda.Event()
-            self._prepare_inputs_event.record()
+                inputs, gather_ids = self._prepare_inputs(
+                    padded_requests, kv_cache_manager, attn_metadata,
+                    spec_metadata, new_tensors_device, cache_indirection_buffer,
+                    num_accepted_tokens_device, req_id_to_old_request,
+                    resource_manager, can_run_graph)
+
+                self._prepare_inputs_event = torch.cuda.Event()
+                self._prepare_inputs_event.record()
+                return inputs, gather_ids
+
+            inputs, gather_ids = prepare_forward_inputs_fn()
 
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
                 if not can_run_graph:
@@ -5512,7 +5518,8 @@ class PyTorchModelEngine(ModelEngine):
                             capture_forward_fn,
                             inputs,
                             enable_spec_decode=self.enable_spec_decode,
-                            postprocess_fn=capture_postprocess_fn)
+                            postprocess_fn=capture_postprocess_fn,
+                            prepare_inputs_fn=prepare_forward_inputs_fn)
 
                         # Pre-replay: set DSA slot mappings for current batch's draft cache (fixes 2nd warmup)
                         saved_draft = prepare_attn_metadata_for_draft_replay(

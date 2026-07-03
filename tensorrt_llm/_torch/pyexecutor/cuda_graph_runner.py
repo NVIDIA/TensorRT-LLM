@@ -378,7 +378,8 @@ class CUDAGraphRunner:
                 forward_fn: Callable,
                 initial_inputs: Dict[str, Any],
                 enable_spec_decode: bool = False,
-                postprocess_fn: Optional[Callable] = None):
+                postprocess_fn: Optional[Callable] = None,
+                prepare_inputs_fn: Optional[Callable] = None):
         """Captures the forward pass for a given batch size."""
         batch_size = key[0]
         # [CUDA graph spec decode padding]
@@ -413,6 +414,15 @@ class CUDAGraphRunner:
             "spec_metadata": initial_inputs.get("spec_metadata", None),
         }
 
+        def _refresh_capture_inputs():
+            # A warmup forward can mutate attention/speculative metadata
+            # Rebuild it through the same path used before a normal replay
+            if prepare_inputs_fn is None:
+                return
+            refreshed_inputs, _ = prepare_inputs_fn()
+            capture_inputs.update(refreshed_inputs)
+            capture_inputs.update(sliced_static_tensors)
+
         def _setup_spec_decoding_and_forward(key: KeyType, forward_fn: Callable,
                                              capture_inputs: Dict[str, Any]):
             is_first_draft = key[2]
@@ -428,17 +438,19 @@ class CUDAGraphRunner:
         # This also lets us initialize states in the attn_metadata.
         graph = torch.cuda.CUDAGraph()
         with with_multi_stream(True), piecewise_cuda_graph(False):
-            for _ in range(self.WARMUP_STEPS):
+            for warmup_iter in range(self.WARMUP_STEPS):
+                if warmup_iter != 0:
+                    _refresh_capture_inputs()
                 _setup_spec_decoding_and_forward(key, forward_fn,
                                                  capture_inputs)
                 if postprocess_fn is not None:
                     postprocess_fn(capture_inputs)
 
+            _refresh_capture_inputs()
+            # Capture has no kernel execution, so no post-process or refresh.
             with torch.cuda.graph(graph, pool=self.memory_pool):
                 output = _setup_spec_decoding_and_forward(
                     key, forward_fn, capture_inputs)
-            if postprocess_fn is not None:
-                postprocess_fn(capture_inputs)
 
         self.graphs[key] = graph
         self.graph_outputs[key] = make_weak_ref(output)
