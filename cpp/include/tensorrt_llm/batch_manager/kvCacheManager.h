@@ -1434,6 +1434,23 @@ private:
     std::size_t mDiskGateDropped{0};
     std::size_t mDiskOnboards{0};
 
+public:
+    [[nodiscard]] std::size_t getNumDiskSpills() const
+    {
+        return mDiskSpills;
+    }
+
+    [[nodiscard]] std::size_t getNumDiskGateDropped() const
+    {
+        return mDiskGateDropped;
+    }
+
+    [[nodiscard]] std::size_t getNumDiskOnboards() const
+    {
+        return mDiskOnboards;
+    }
+
+private:
     //! Disk-tier displacement order among retained blocks: exact earliest deadline;
     //! among equal deadlines, first-spilled first. Upstream releases and evicts chains
     //! leaf-first, so arrival order at the disk is deepest-first and FIFO here equals
@@ -1581,11 +1598,10 @@ public:
     //!        full-attention head_dim=512).  Empty vector = uniform @p sizePerHead / @p dtype
     //!        across all windows.
     explicit BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead,
-        SizeType32 tokensPerBlock, BlocksPerWindow const& blocksPerWindow, SizeType32 blocksInDiskPool,
-        std::string const& diskCachePath, bool diskRetainedOnly, SizeType32 maxNumSequences, CudaStreamPtr stream,
-        SizeType32 maxSequenceLength, SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec,
-        nvinfer1::DataType dtype, SizeType32 sinkBubbleLength, SizeType32 chunkSize,
-        CacheType cacheType = CacheType::kSELF,
+        SizeType32 tokensPerBlock, BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences,
+        CudaStreamPtr stream, SizeType32 maxSequenceLength, SizeType32 maxBeamWidth,
+        std::vector<SizeType32> const& maxAttentionWindowVec, nvinfer1::DataType dtype, SizeType32 sinkBubbleLength,
+        SizeType32 chunkSize, CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enablePartialReuse = true,
         bool copyOnPartialReuse = true,
@@ -1593,7 +1609,8 @@ public:
         std::optional<kvc::BaseAgentConfig> agentConfig = std::nullopt, bool enableIndexerKCache = false,
         SizeType32 indexerKCacheQuantBlockSize = 128, SizeType32 indexerKCacheIndexHeadDim = 0,
         bool indexerKCacheUseFp4 = false, std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
-        std::vector<PoolConfiguration> const& poolConfigurations = {});
+        std::vector<PoolConfiguration> const& poolConfigurations = {}, SizeType32 blocksInDiskPool = 0,
+        std::string const& diskCachePath = {}, bool diskRetainedOnly = false);
 
     [[nodiscard]] bool isEnableIndexerKCache() const
     {
@@ -2049,6 +2066,39 @@ private:
     // Stored before mWindowBlockManagers so it is constructed first and its address
     // is stable when passed to each WindowBlockManager constructor.
     radix_block_tree::UnifiedBlockTree mLookupTree;
+
+public:
+    [[nodiscard]] std::size_t getNumDiskSpills() const
+    {
+        std::size_t total = 0;
+        for (auto const& [windowSize, manager] : mWindowBlockManagers)
+        {
+            total += manager.getNumDiskSpills();
+        }
+        return total;
+    }
+
+    [[nodiscard]] std::size_t getNumDiskGateDropped() const
+    {
+        std::size_t total = 0;
+        for (auto const& [windowSize, manager] : mWindowBlockManagers)
+        {
+            total += manager.getNumDiskGateDropped();
+        }
+        return total;
+    }
+
+    [[nodiscard]] std::size_t getNumDiskOnboards() const
+    {
+        std::size_t total = 0;
+        for (auto const& [windowSize, manager] : mWindowBlockManagers)
+        {
+            total += manager.getNumDiskOnboards();
+        }
+        return total;
+    }
+
+private:
     std::map<SizeType32, WindowBlockManager> mWindowBlockManagers;
     std::map<SizeType32, WindowSizeMetadata> mWindowSizeToMetadata;
     std::vector<SizeType32> mLayerToWindowSize;
@@ -2378,8 +2428,7 @@ public:
     //!        + full head_dim=512) so the existing block reuse, scheduling, MPI reduction,
     //!        and disagg transfer machinery applies natively.  Empty vector = uniform.
     KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
-        BlocksPerWindow const& blocksPerWindow, SizeType32 blocksInDiskPool, std::string const& diskCachePath,
-        bool diskRetainedOnly, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
+        BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
         std::vector<SizeType32> const& maxAttentionWindowVec, nvinfer1::DataType dtype, SizeType32 sinkTokenLength,
         CudaStreamPtr stream, SizeType32 maxSequenceLength, SizeType32 chunkSize, bool enableBlockReuse = false,
         CacheType cacheType = CacheType::kSELF,
@@ -2390,11 +2439,11 @@ public:
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
         std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
-        std::vector<PoolConfiguration> const& poolConfigurations = {});
+        std::vector<PoolConfiguration> const& poolConfigurations = {}, SizeType32 blocksInDiskPool = 0,
+        std::string const& diskCachePath = {}, bool diskRetainedOnly = false);
 
     KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
-        BlocksPerWindow const& blocksPerWindow, SizeType32 blocksInDiskPool, std::string const& diskCachePath,
-        bool diskRetainedOnly, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
+        BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
         std::vector<SizeType32> const& maxAttentionWindowVec, nvinfer1::DataType dtype, SizeType32 sinkTokenLength,
         int64_t stream, SizeType32 maxSequenceLength, SizeType32 chunkSize, bool enableBlockReuse = false,
         CacheType cacheType = CacheType::kSELF,
@@ -2405,11 +2454,11 @@ public:
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
         std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
-        std::vector<PoolConfiguration> const& poolConfigurations = {});
+        std::vector<PoolConfiguration> const& poolConfigurations = {}, SizeType32 blocksInDiskPool = 0,
+        std::string const& diskCachePath = {}, bool diskRetainedOnly = false);
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
-        BlocksPerWindow const& blocksPerWindow, SizeType32 blocksInDiskPool, std::string const& diskCachePath,
-        bool diskRetainedOnly, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
+        BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
         std::vector<SizeType32> const& maxAttentionWindowVec, nvinfer1::DataType dtype, SizeType32 sinkTokenLength,
         CudaStreamPtr stream, SizeType32 maxSequenceLength, SizeType32 chunkSize, bool enableBlockReuse = true,
         CacheType cacheType = CacheType::kSELF,
@@ -2420,18 +2469,19 @@ public:
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
         std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
-        std::vector<PoolConfiguration> const& poolConfigurations = {});
+        std::vector<PoolConfiguration> const& poolConfigurations = {}, SizeType32 blocksInDiskPool = 0,
+        std::string const& diskCachePath = {}, bool diskRetainedOnly = false);
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
-        BlocksPerWindow const& blocksPerWindow, SizeType32 blocksInDiskPool, std::string const& diskCachePath,
-        bool diskRetainedOnly, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
+        BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
         std::vector<SizeType32> const& maxAttentionWindowVec, nvinfer1::DataType dtype, SizeType32 sinkTokenLength,
         int64_t stream, SizeType32 maxSequenceLength, SizeType32 chunkSize, bool enableBlockReuse = false,
         CacheType cacheType = CacheType::kSELF, bool enablePartialReuse = true, bool copyOnpartialReuse = true,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
         std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
-        std::vector<PoolConfiguration> const& poolConfigurations = {});
+        std::vector<PoolConfiguration> const& poolConfigurations = {}, SizeType32 blocksInDiskPool = 0,
+        std::string const& diskCachePath = {}, bool diskRetainedOnly = false);
 
     ~KVCacheManager() override = default;
 

@@ -63,8 +63,12 @@ constexpr auto defaultPriorityIdx = getPriorityIdx(kDefaultPriority);
 void LRUEvictionPolicy::initialize(std::vector<BlockPtr>& mAllBlocksById, std::vector<SizeType32> sizes,
     std::optional<executor::RetentionPriority> secondaryOffloadMinPriority)
 {
-    TLLM_CHECK_WITH_INFO(static_cast<int>(sizes.size()) == kNumCacheLevels,
-        "initialize expects one block count per cache level (%d), got %zu", kNumCacheLevels, sizes.size());
+    TLLM_CHECK_WITH_INFO(static_cast<int>(sizes.size()) <= kNumCacheLevels,
+        "initialize expects at most one block count per cache level (%d), got %zu", kNumCacheLevels, sizes.size());
+    // Callers may pass fewer sizes than levels (e.g. legacy {primary, secondary}); missing
+    // trailing levels (disk) default to 0 blocks.
+    auto sizesPadded = sizes;
+    sizesPadded.resize(kNumCacheLevels, 0);
     SizeType32 startIdx = 0;
 
     // Create queues for all levels: primary, secondary, and placeholder (initially empty).
@@ -76,15 +80,15 @@ void LRUEvictionPolicy::initialize(std::vector<BlockPtr>& mAllBlocksById, std::v
     {
         auto& freeQueue = mFreeQueues[cacheLevel][defaultPriorityIdx];
 
-        for (SizeType32 blockId = 0; blockId < sizes[cacheLevel]; blockId++)
+        for (SizeType32 blockId = 0; blockId < sizesPadded[cacheLevel]; blockId++)
         {
             // Initialize all blocks to be the default priority level
             mFreeBlockIterators[startIdx + blockId]
                 = freeQueue.insert(freeQueue.end(), mAllBlocksById[startIdx + blockId]);
         }
 
-        mNumFreeBlocksPerLevel[cacheLevel] = sizes[cacheLevel];
-        startIdx += sizes[cacheLevel];
+        mNumFreeBlocksPerLevel[cacheLevel] = sizesPadded[cacheLevel];
+        startIdx += sizesPadded[cacheLevel];
     }
 
     mSecondaryOffloadMinPriority = secondaryOffloadMinPriority.value_or(kDefaultSecondaryOffloadMinPriority);
