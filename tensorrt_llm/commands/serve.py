@@ -64,6 +64,14 @@ def _pop_bool_config_option(config: dict[str, Any], key: str) -> bool:
     return validate_config_bool(config.pop(key, False), key)
 
 
+def _pop_optional_str_config_option(config: dict[str, Any],
+                                    key: str) -> Optional[str]:
+    value = config.pop(key, None)
+    if value is not None and not isinstance(value, str):
+        raise ValueError(f"{key} must be a string")
+    return value
+
+
 def _apply_fastapi_middlewares(app, middlewares: Sequence[str]) -> None:
     """Import and register middleware objects on a FastAPI app."""
     for middleware in middlewares:
@@ -350,7 +358,8 @@ def launch_server(
         disagg_cluster_config: Optional[DisaggClusterConfig] = None,
         multimodal_server_config: Optional[MultimodalServerConfig] = None,
         served_model_name: Optional[str] = None,
-        allow_request_chat_template: bool = False):
+        allow_request_chat_template: bool = False,
+        internal_disagg_auth_key: Optional[str] = None):
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
@@ -394,7 +403,8 @@ def launch_server(
             disagg_cluster_config=disagg_cluster_config,
             multimodal_server_config=multimodal_server_config,
             chat_template=chat_template,
-            allow_request_chat_template=allow_request_chat_template)
+            allow_request_chat_template=allow_request_chat_template,
+            internal_disagg_auth_key=internal_disagg_auth_key)
         _apply_fastapi_middlewares(server.app, middleware)
 
         # Optionally disable GC (default: not disabled)
@@ -1061,6 +1071,8 @@ def serve(
             llm_args_extra_dict, "allow_request_chat_template")
         allow_request_chat_template = (allow_request_chat_template
                                        or extra_allow_request_chat_template)
+        internal_disagg_auth_key = _pop_optional_str_config_option(
+            llm_args_extra_dict, "internal_request_auth_key")
         llm_args = update_llm_args_with_extra_dict(
             llm_args, llm_args_extra_dict, explicit_cli_keys=explicit_cli_keys)
 
@@ -1115,6 +1127,8 @@ def serve(
                 "allow_request_chat_template":
                 allow_request_chat_template
                 if allow_request_chat_template else None,
+                "internal_request_auth_key":
+                internal_disagg_auth_key,
                 "metadata_server_config_file":
                 metadata_server_config_file,
                 "server_role":
@@ -1146,7 +1160,8 @@ def serve(
                 disagg_cluster_config,
                 multimodal_server_config,
                 served_model_name=served_model_name,
-                allow_request_chat_template=allow_request_chat_template)
+                allow_request_chat_template=allow_request_chat_template,
+                internal_disagg_auth_key=internal_disagg_auth_key)
 
     def _serve_visual_gen():
         parsed_visual_gen_args = (VisualGenArgs.from_yaml(visual_gen_args)
@@ -1536,11 +1551,18 @@ def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
     logger.info(
         f"rank {mpi_rank()} for index {instance_idx} launch the disagg server")
 
-    launch_server(
-        host=server_cfg.hostname,
-        port=server_cfg.port,
-        llm_args=llm_args,
-        allow_request_chat_template=disagg_config.allow_request_chat_template)
+    launch_kwargs = {}
+    if getattr(disagg_config, "allow_request_chat_template", False):
+        launch_kwargs["allow_request_chat_template"] = True
+    internal_disagg_auth_key = getattr(disagg_config,
+                                       "internal_request_auth_key", None)
+    if internal_disagg_auth_key is not None:
+        launch_kwargs["internal_disagg_auth_key"] = internal_disagg_auth_key
+
+    launch_server(host=server_cfg.hostname,
+                  port=server_cfg.port,
+                  llm_args=llm_args,
+                  **launch_kwargs)
 
 
 def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,

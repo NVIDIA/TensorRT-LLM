@@ -128,23 +128,17 @@ def test_disaggregated_params_conversation_id():
     assert to_disaggregated_params(llm_params).conversation_id == "conv-roundtrip"
 
 
-def test_opaque_state_rejected_in_openai_protocol():
-    from tensorrt_llm.serve.openai_protocol import DisaggregatedParams as OpenAIDisaggregatedParams
+def test_opaque_state_round_trips_through_openai_protocol():
     from tensorrt_llm.serve.openai_protocol import (
         to_disaggregated_params,
         to_llm_disaggregated_params,
     )
 
-    openai_params = OpenAIDisaggregatedParams(
-        request_type="generation_only", encoded_opaque_state="opaque"
+    openai_params = to_disaggregated_params(
+        DisaggregatedParams(request_type="context_only", opaque_state=b"opaque")
     )
-    with pytest.raises(ValueError, match="encoded_opaque_state"):
-        to_llm_disaggregated_params(openai_params)
-
-    with pytest.raises(ValueError, match="opaque_state"):
-        to_disaggregated_params(
-            DisaggregatedParams(request_type="context_only", opaque_state=b"opaque")
-        )
+    assert openai_params.encoded_opaque_state == "b3BhcXVl"
+    assert to_llm_disaggregated_params(openai_params).opaque_state == b"opaque"
 
 
 @patch("tensorrt_llm.disaggregated_params.tllme")
