@@ -36,9 +36,23 @@ except ImportError:  # pragma: no cover
     _CUDA_AVAILABLE = False
 
 if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
-    from kv_cache_manager_v2 import ContiguousArenaConfig, WriteThroughPolicy
+    from kv_cache_manager_v2 import (
+        AttentionLayerConfig,
+        BufferConfig,
+        ContiguousArenaConfig,
+        DataRole,
+        GpuCacheTierConfig,
+        HostCacheTierConfig,
+        KVCacheManagerConfig,
+        WriteThroughPolicy,
+        rawref,
+    )
+    from kv_cache_manager_v2._common import GPU_LEVEL, CacheLevel, LayerId, Priority
+    from kv_cache_manager_v2._copy_engine import CopyTask
     from kv_cache_manager_v2._cuda_virt_mem import PooledPhysMemAllocator, VirtMem
     from kv_cache_manager_v2._exceptions import LogicError, OutOfPagesError
+    from kv_cache_manager_v2._life_cycle_registry import LifeCycleId, LifeCycleRegistry
+    from kv_cache_manager_v2._page import Page
     from kv_cache_manager_v2._sequence_arena import (
         INT31_MAX,
         BlockRangeAllocator,
@@ -46,15 +60,44 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         SequenceArena,
         check_index_width,
     )
-    from kv_cache_manager_v2._storage._core import ArenaPoolGroup, GpuArenaCacheLevelStorage
+    from kv_cache_manager_v2._storage._config import create_storage_config
+    from kv_cache_manager_v2._storage._core import (
+        ArenaPoolGroup,
+        GpuArenaCacheLevelStorage,
+        PoolGroupIndex,
+        PoolIndex,
+    )
+    from kv_cache_manager_v2._storage_manager import StorageManager, _coalesce_copy_tasks
     from kv_cache_manager_v2._utils import CachedCudaEvent, init_cuda_once
 else:
-    from tensorrt_llm.runtime.kv_cache_manager_v2 import ContiguousArenaConfig, WriteThroughPolicy
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+        AttentionLayerConfig,
+        BufferConfig,
+        ContiguousArenaConfig,
+        DataRole,
+        GpuCacheTierConfig,
+        HostCacheTierConfig,
+        KVCacheManagerConfig,
+        WriteThroughPolicy,
+        rawref,
+    )
+    from tensorrt_llm.runtime.kv_cache_manager_v2._common import (
+        GPU_LEVEL,
+        CacheLevel,
+        LayerId,
+        Priority,
+    )
+    from tensorrt_llm.runtime.kv_cache_manager_v2._copy_engine import CopyTask
     from tensorrt_llm.runtime.kv_cache_manager_v2._cuda_virt_mem import (
         PooledPhysMemAllocator,
         VirtMem,
     )
     from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import LogicError, OutOfPagesError
+    from tensorrt_llm.runtime.kv_cache_manager_v2._life_cycle_registry import (
+        LifeCycleId,
+        LifeCycleRegistry,
+    )
+    from tensorrt_llm.runtime.kv_cache_manager_v2._page import Page
     from tensorrt_llm.runtime.kv_cache_manager_v2._sequence_arena import (
         INT31_MAX,
         BlockRangeAllocator,
@@ -62,9 +105,16 @@ else:
         SequenceArena,
         check_index_width,
     )
+    from tensorrt_llm.runtime.kv_cache_manager_v2._storage._config import create_storage_config
     from tensorrt_llm.runtime.kv_cache_manager_v2._storage._core import (
         ArenaPoolGroup,
         GpuArenaCacheLevelStorage,
+        PoolGroupIndex,
+        PoolIndex,
+    )
+    from tensorrt_llm.runtime.kv_cache_manager_v2._storage_manager import (
+        StorageManager,
+        _coalesce_copy_tasks,
     )
     from tensorrt_llm.runtime.kv_cache_manager_v2._utils import CachedCudaEvent, init_cuda_once
 
@@ -534,6 +584,277 @@ class TestGpuArenaCacheLevelStorage(unittest.TestCase):
                 phys_page_size=self.PAGE,
                 map_ahead_pages=0,
             )
+
+
+class TestCoalesceCopyTasks(unittest.TestCase):
+    SIZE = 1024
+
+    def test_contiguous_run_merges(self) -> None:
+        tasks = [CopyTask(1000 + i * self.SIZE, 5000 + i * self.SIZE) for i in range(4)]
+        merged = _coalesce_copy_tasks(self.SIZE, tasks)
+        self.assertEqual(merged, {4 * self.SIZE: [tasks[0]]})
+
+    def test_broken_run_splits(self) -> None:
+        # dst contiguous but src jumps after 2 tasks -> two runs of 2
+        tasks = [
+            CopyTask(1000, 5000),
+            CopyTask(1000 + self.SIZE, 5000 + self.SIZE),
+            CopyTask(1000 + 2 * self.SIZE, 9000),
+            CopyTask(1000 + 3 * self.SIZE, 9000 + self.SIZE),
+        ]
+        merged = _coalesce_copy_tasks(self.SIZE, tasks)
+        self.assertEqual(merged, {2 * self.SIZE: [tasks[0], tasks[2]]})
+
+    def test_scattered_tasks_pass_through(self) -> None:
+        tasks = [CopyTask(0, 8 * self.SIZE), CopyTask(4 * self.SIZE, 0)]
+        merged = _coalesce_copy_tasks(self.SIZE, tasks)
+        self.assertEqual(merged, {self.SIZE: tasks})
+
+
+def _make_manager_config(
+    gpu_quota: int, host_quota: int, tokens_per_block: int = 16, kv_buf_size: int = 8192
+) -> "KVCacheManagerConfig":
+    """A minimal two-tier (GPU + host) manager config.
+
+    Two attention layers, KEY+VALUE buffers of one size -> a single pool
+    group with one coalesced pool of slot size 4 * kv_buf_size and page-index
+    scale 4.
+    """
+    return KVCacheManagerConfig(
+        tokens_per_block=tokens_per_block,
+        vocab_size=4096,
+        cache_tiers=[
+            GpuCacheTierConfig(quota=gpu_quota),
+            HostCacheTierConfig(quota=host_quota),
+        ],
+        layers=[
+            AttentionLayerConfig(
+                layer_id=LayerId(layer_id),
+                buffers=[
+                    BufferConfig(role=DataRole("key"), size=kv_buf_size),
+                    BufferConfig(role=DataRole("value"), size=kv_buf_size),
+                ],
+            )
+            for layer_id in range(2)
+        ],
+    )
+
+
+@requires_cuda
+class TestStorageManagerArenaMode(unittest.TestCase):
+    """The storage-manager seam (DESIGN.md §5, `_storage_manager.py` row).
+
+    Covers arena-mode construction, retired-path guards, per-sequence
+    pass-throughs, page-based utilization, and explicit-destination
+    migration (§4.3/§4.4).
+    """
+
+    PAGE = 2 * MiB
+    GPU_QUOTA = 32 * MiB  # 16 pages
+    SLOT_SIZE = 4 * 8192  # 2 layers x (KEY+VALUE) coalesced
+    PG0 = PoolGroupIndex(0)
+    LC0 = LifeCycleId(0)
+
+    def setUp(self) -> None:
+        init_cuda_once()
+        cfg = _make_manager_config(gpu_quota=self.GPU_QUOTA, host_quota=32 * MiB)
+        self.storage = StorageManager(
+            LifeCycleRegistry(cfg),
+            create_storage_config(cfg),
+            cfg.tokens_per_block,
+            None,
+            arena_config=ContiguousArenaConfig(phys_page_size=self.PAGE, map_ahead_pages=0),
+        )
+
+    def tearDown(self) -> None:
+        self.storage.destroy()
+        del self.storage
+
+    def _gpu_page(self, slot) -> "Page":
+        page = Page(
+            None,
+            CachedCudaEvent.NULL,
+            rawref.ref(self.storage),
+            self.LC0,
+            GPU_LEVEL,
+            Priority(50),
+            None,
+            None,
+        )
+        page.set_slot(slot)
+        return page
+
+    def _host_page(self, slot) -> "Page":
+        page = Page(
+            None,
+            CachedCudaEvent.NULL,
+            rawref.ref(self.storage),
+            self.LC0,
+            CacheLevel(1),
+            Priority(50),
+            None,
+            None,
+        )
+        page.set_slot(slot)
+        return page
+
+    def _slot_floats(self, level: "CacheLevel", slot_id: int) -> "torch.Tensor":
+        addr = int(self.storage.slot_address(level, self.PG0, slot_id, PoolIndex(0)))
+        n = self.SLOT_SIZE // 4
+        if level == GPU_LEVEL:
+            return TestSparseVirtMem._tensor_at(addr, n)
+        import ctypes
+
+        buf = (ctypes.c_float * n).from_address(addr)
+        return torch.frombuffer(buf, dtype=torch.float32)
+
+    def test_construction_and_sizing(self) -> None:
+        storage = self.storage
+        self.assertTrue(storage.is_arena_mode)
+        gpu_storage = storage._levels[GPU_LEVEL].storage
+        self.assertIs(type(gpu_storage), GpuArenaCacheLevelStorage)
+        self.assertEqual(storage.gpu_page_budget.total_pages, self.GPU_QUOTA // self.PAGE)
+        # 4 coalesced sub-buffers, expansion 1 -> scale 4
+        self.assertEqual(storage._compute_page_index_scales(), [4])
+        # default VA: overcommit x (quota // record_stride)
+        self.assertEqual(storage.num_slots(self.PG0), 8 * (self.GPU_QUOTA // self.SLOT_SIZE))
+        # host level is a classic slot pool, unaffected
+        self.assertGreater(storage.num_slots(self.PG0, CacheLevel(1)), 0)
+
+    def test_retired_paths_raise(self) -> None:
+        storage = self.storage
+        with self.assertRaises(LogicError):
+            storage.new_gpu_slots([1])
+        with self.assertRaises(LogicError):
+            storage.new_slots_for_pool_group(GPU_LEVEL, self.PG0, 1)
+        with self.assertRaises(LogicError):
+            storage.prepare_free_slots(GPU_LEVEL, [1])
+        with self.assertRaises(LogicError):
+            storage.adjust_cache_level(GPU_LEVEL, None, [1.0])
+        # host-level allocation still works
+        slots = storage.new_slots(CacheLevel(1), [2])
+        for s in slots[self.LC0]:
+            storage.release_slot(self.LC0, CacheLevel(1), s)
+
+    def test_sequence_lifecycle_and_utilization(self) -> None:
+        storage = self.storage
+        self.assertEqual(storage.get_utilization(GPU_LEVEL), [0.0])
+        rng = storage.reserve_gpu_sequence(self.PG0, 64)
+        mapped = storage.ensure_gpu_mapped(self.PG0, rng, 64)  # 64 x 32 KiB = 1 page
+        self.assertEqual(mapped, 1)
+        budget = storage.gpu_page_budget
+        self.assertEqual(budget.used_pages, 1)
+        self.assertEqual(storage.get_utilization(GPU_LEVEL), [1 / budget.total_pages])
+        self.assertEqual(storage.get_overall_utilization(GPU_LEVEL), 1 / budget.total_pages)
+        slot = storage.take_gpu_sequence_slot(self.PG0, rng, 0)
+        self.assertEqual(slot.slot_id, rng.base_block)
+        storage.release_slot(self.LC0, GPU_LEVEL, slot)
+        storage.free_gpu_sequence(self.PG0, rng, CachedCudaEvent.NULL)
+        self.assertEqual(storage.drain_gpu_reclaim(), 1)
+        self.assertEqual(budget.used_pages, 0)
+
+    def test_offload_migrates_data_and_gates_reclaim(self) -> None:
+        """§4.3 active->stale mechanics.
+
+        Explicit GPU->host migration of arena slots moves the bytes,
+        retargets the pages, and returns the arena slots to their range with
+        the copy event gating reclaim.
+        """
+        storage = self.storage
+        rng = storage.reserve_gpu_sequence(self.PG0, 64)
+        storage.ensure_gpu_mapped(self.PG0, rng, 2)
+        pages = []
+        for ordinal, value in ((0, 1.25), (1, -3.0)):
+            slot = storage.take_gpu_sequence_slot(self.PG0, rng, ordinal)
+            self._slot_floats(GPU_LEVEL, slot.slot_id).fill_(value)
+            pages.append(self._gpu_page(slot))
+        torch.cuda.synchronize()
+
+        storage._batched_migrate(self.PG0, CacheLevel(1), GPU_LEVEL, pages, update_src=True)
+        torch.cuda.synchronize()
+
+        for page, value in zip(pages, (1.25, -3.0)):
+            self.assertEqual(page.cache_level, CacheLevel(1))
+            host_data = self._slot_floats(CacheLevel(1), page.slot_id)
+            self.assertTrue(bool((host_data == value).all().item()))
+        # the vacated arena slots returned to the range: reclaim succeeds
+        storage.free_gpu_sequence(self.PG0, rng, CachedCudaEvent.NULL)
+        self.assertEqual(storage.drain_gpu_reclaim(), 1)
+        self.assertEqual(storage.gpu_page_budget.used_pages, 0)
+        for page in pages:
+            storage.release_slot(self.LC0, CacheLevel(1), page)
+
+    def test_onboard_explicit_destination(self) -> None:
+        """§4.4 stale->active mechanics.
+
+        Copies host pages into explicit, consecutive arena destinations
+        without touching the sources (the host copies stay valid for the
+        radix tree).
+        """
+        storage = self.storage
+        host_slots = storage.new_slots(CacheLevel(1), [2])[self.LC0]
+        src_pages = []
+        for slot, value in zip(host_slots, (7.5, 0.5)):
+            self._slot_floats(CacheLevel(1), slot.slot_id).fill_(value)
+            src_pages.append(self._host_page(slot))
+
+        rng = storage.reserve_gpu_sequence(self.PG0, 64)
+        storage.ensure_gpu_mapped(self.PG0, rng, 2)
+        dst_slots = [storage.take_gpu_sequence_slot(self.PG0, rng, j) for j in range(2)]
+        ret = storage._batched_migrate(
+            self.PG0,
+            GPU_LEVEL,
+            CacheLevel(1),
+            src_pages,
+            update_src=False,
+            dst_slots=dst_slots,
+        )
+        assert ret is not None
+        torch.cuda.synchronize()
+
+        for slot, value in zip(ret, (7.5, 0.5)):
+            gpu_data = self._slot_floats(GPU_LEVEL, slot.slot_id)
+            self.assertTrue(bool((gpu_data == value).all().item()))
+        # sources untouched: still valid host pages with their data
+        for page, value in zip(src_pages, (7.5, 0.5)):
+            self.assertEqual(page.cache_level, CacheLevel(1))
+            host_data = self._slot_floats(CacheLevel(1), page.slot_id)
+            self.assertTrue(bool((host_data == value).all().item()))
+
+        for slot in ret:
+            storage.release_slot(self.LC0, GPU_LEVEL, slot)
+        storage.free_gpu_sequence(self.PG0, rng, CachedCudaEvent.NULL)
+        self.assertEqual(storage.drain_gpu_reclaim(), 1)
+        for page in src_pages:
+            storage.release_slot(self.LC0, CacheLevel(1), page)
+
+    def test_write_through_copies_without_moving(self) -> None:
+        """§4.3 write-through-on-commit mechanics.
+
+        Host copies materialize; sources keep their GPU slots.
+        """
+        storage = self.storage
+        rng = storage.reserve_gpu_sequence(self.PG0, 64)
+        storage.ensure_gpu_mapped(self.PG0, rng, 1)
+        slot = storage.take_gpu_sequence_slot(self.PG0, rng, 0)
+        gpu_slot_id = slot.slot_id
+        self._slot_floats(GPU_LEVEL, gpu_slot_id).fill_(42.0)
+        page = self._gpu_page(slot)
+        torch.cuda.synchronize()
+
+        host_slots = storage.write_through_pages(self.PG0, [page])
+        torch.cuda.synchronize()
+
+        self.assertEqual(len(host_slots), 1)
+        self.assertEqual(page.cache_level, GPU_LEVEL)  # source not moved
+        self.assertEqual(page.slot_id, gpu_slot_id)
+        host_data = self._slot_floats(CacheLevel(1), host_slots[0].slot_id)
+        self.assertTrue(bool((host_data == 42.0).all().item()))
+
+        storage.release_slot(self.LC0, CacheLevel(1), host_slots[0])
+        storage.release_slot(self.LC0, GPU_LEVEL, page)
+        storage.free_gpu_sequence(self.PG0, rng, CachedCudaEvent.NULL)
+        self.assertEqual(storage.drain_gpu_reclaim(), 1)
 
 
 if __name__ == "__main__":

@@ -36,6 +36,7 @@ from ._common import (
 from ._config import (
     BatchDesc,
     CacheTierConfig,
+    ContiguousArenaConfig,
     DataRole,
     DiskCacheTierConfig,
     KVCacheDesc,
@@ -44,18 +45,21 @@ from ._config import (
 from ._copy_engine import CopyTask, batched_copy
 from ._event_manager import KVCacheEventDiff
 from ._eviction_controller import EvictablePage, PerLevelEvictionController
-from ._exceptions import OutOfPagesError
+from ._exceptions import LogicError, OutOfPagesError
 from ._life_cycle_registry import LifeCycleId, LifeCycleRegistry, compute_scratch_range
 from ._page import CommittedPage, Page
+from ._sequence_arena import INT31_MAX, PageBudget
 from ._storage import CacheLevelStorage
 from ._storage._config import BufferAttr, BufferId, LayerAttr, SlotDesc, StorageConfig
 from ._storage._core import (
     DiskCacheLevelStorage,
+    GpuArenaCacheLevelStorage,
     GpuCacheLevelStorage,
     HostCacheLevelStorage,
     PoolGroupBase,
     PoolGroupIndex,
     PoolIndex,
+    SequenceRange,
     Slot,
     SlotId,
 )
@@ -84,6 +88,22 @@ from ._utils import (
 if TYPE_CHECKING:
     from ._event_manager import KVCacheEventManager
 
+# Default VA over-reservation factor for arena mode, relative to the maximum
+# number of physical blocks the GPU quota could back for a pool group. VA is
+# nearly free (DESIGN.md §4.8); headroom absorbs per-sequence max-length
+# reservations and range fragmentation. Overridable via
+# ContiguousArenaConfig.max_va_bytes_per_pool.
+_ARENA_VA_OVERCOMMIT: int = 8
+
+
+@dataclass(slots=True, frozen=True)
+class _ArenaSpec:
+    """Resolved arena-mode parameters for the GPU cache level (DESIGN.md §4.8)."""
+
+    config: ContiguousArenaConfig
+    block_capacity_list: TypedIndexList[PoolGroupIndex, int]
+    page_index_scale_list: TypedIndexList[PoolGroupIndex, int]
+
 
 class CacheLevelManager:
     __slots__ = ("cache_level", "storage", "controller")
@@ -102,9 +122,12 @@ class CacheLevelManager:
         config: CacheTierConfig,
         slot_size_lists: TypedIndexList[PoolGroupIndex, TypedIndexList[PoolIndex, int]],
         slot_count_list: TypedIndexList[PoolGroupIndex, int],
+        arena_spec: _ArenaSpec | None = None,
     ):
         self.cache_level = cache_level
-        self.storage = self._create_cache_level_storage(config, slot_size_lists, slot_count_list)
+        self.storage = self._create_cache_level_storage(
+            config, slot_size_lists, slot_count_list, arena_spec
+        )
         self.controller = PerLevelEvictionController(life_cycle_grouping, cache_level)
 
     @property
@@ -131,9 +154,19 @@ class CacheLevelManager:
         config: CacheTierConfig,
         slot_size_lists: TypedIndexList[PoolGroupIndex, TypedIndexList[PoolIndex, int]],
         slot_count_list: TypedIndexList[PoolGroupIndex, int],
+        arena_spec: _ArenaSpec | None = None,
     ) -> CacheLevelStorage:
         match config.tier:
             case CacheTier.GPU_MEM:
+                if arena_spec is not None:
+                    return GpuArenaCacheLevelStorage(
+                        slot_size_lists,
+                        arena_spec.block_capacity_list,
+                        arena_spec.page_index_scale_list,
+                        config.quota,
+                        arena_spec.config.phys_page_size,
+                        arena_spec.config.map_ahead_pages,
+                    )
                 granularity = CacheLevelManager.cache_tier_granularity(
                     CacheTier.GPU_MEM, config.quota
                 )
@@ -172,6 +205,33 @@ class StorageStatistics:
 MigrationRecorder = Callable[[Sequence[Page], Sequence[Slot], CacheLevel, CacheLevel], None]
 
 
+def _coalesce_copy_tasks(num_bytes: int, tasks: Sequence[CopyTask]) -> dict[int, list[CopyTask]]:
+    """Merge runs of copy tasks whose dst AND src are both byte-contiguous into
+    fewer, larger transfers (DESIGN.md §4.4), grouped by merged size so each
+    group still dispatches as one ``batched_copy`` call. Non-memory addresses
+    (disk) pass through unmerged."""
+    merged: dict[int, list[CopyTask]] = {}
+    i = 0
+    n = len(tasks)
+    while i < n:
+        head = tasks[i]
+        run = 1
+        if isinstance(head.dst, int) and isinstance(head.src, int):
+            while i + run < n:
+                t = tasks[i + run]
+                if not (
+                    isinstance(t.dst, int)
+                    and isinstance(t.src, int)
+                    and t.dst == head.dst + run * num_bytes
+                    and t.src == head.src + run * num_bytes
+                ):
+                    break
+                run += 1
+        merged.setdefault(run * num_bytes, []).append(head)
+        i += run
+    return merged
+
+
 class StorageManager:
     __slots__ = (
         "_life_cycles",
@@ -184,6 +244,7 @@ class StorageManager:
         "_slot_desc_list",
         "_levels",
         "_min_slots",
+        "_arena_config",
         "_event_manager",
         "__rawref__",
     )
@@ -197,6 +258,7 @@ class StorageManager:
     _slot_desc_list: TypedIndexList[PoolGroupIndex, SlotDesc]
     _levels: TypedIndexList[CacheLevel, CacheLevelManager]
     _min_slots: TypedIndexList[PoolGroupIndex, int]
+    _arena_config: ContiguousArenaConfig | None
     _event_manager: "KVCacheEventManager | None"
     __rawref__: rawref.ref["StorageManager"]
 
@@ -209,6 +271,7 @@ class StorageManager:
         typical_batch: BatchDesc | None = None,
         constraints: list[BatchDesc] | None = None,
         event_manager: "KVCacheEventManager | None" = None,
+        arena_config: ContiguousArenaConfig | None = None,
     ) -> None:
         self.__rawref__ = rawref.NULL
         self._event_manager = event_manager
@@ -255,6 +318,18 @@ class StorageManager:
                 gpu_granularity,
             )
 
+        self._arena_config = arena_config
+        arena_spec: _ArenaSpec | None = None
+        if arena_config is not None:
+            scales = self._compute_page_index_scales()
+            arena_spec = _ArenaSpec(
+                arena_config,
+                self._compute_arena_block_capacities(
+                    arena_config, slot_size_lists, gpu_quota, scales
+                ),
+                scales,
+            )
+
         num_levels = CacheLevel(len(config.cache_tiers))
         self._levels = cast(
             TypedIndexList,
@@ -267,6 +342,7 @@ class StorageManager:
                     self._compute_slot_count_for_level(
                         config.cache_tiers[i], slot_size_lists, init_ratio
                     ),
+                    arena_spec if i == GPU_LEVEL else None,
                 )
                 for i in typed_range(num_levels)
             ],
@@ -300,6 +376,11 @@ class StorageManager:
         num_slots: TypedIndexList[LifeCycleId, int],
         migration_recorder: MigrationRecorder | None = None,
     ) -> TypedIndexList[LifeCycleId, list[Slot]]:
+        if level == GPU_LEVEL and self.is_arena_mode:
+            raise LogicError(
+                "scattered GPU slot allocation is retired in arena mode; use "
+                "reserve_gpu_sequence()/take_gpu_sequence_slot() (DESIGN.md §4.1)"
+            )
         lc2pg = self._life_cycle_grouping
         pg_num_slots = filled_list(0, self.num_pool_groups)
         for lc in typed_range(self.num_life_cycles):
@@ -335,6 +416,11 @@ class StorageManager:
         num_slots: int,
         migration_recorder: MigrationRecorder | None = None,
     ) -> list[Slot]:
+        if level == GPU_LEVEL and self.is_arena_mode:
+            raise LogicError(
+                "scattered GPU slot allocation is retired in arena mode; use "
+                "reserve_gpu_sequence()/take_gpu_sequence_slot() (DESIGN.md §4.1)"
+            )
         storage = self._levels[level].storage
         if num_slots > storage.get_num_free_slots(pg_idx):
             num_slots_list = filled_list(0, self.num_pool_groups)
@@ -346,6 +432,140 @@ class StorageManager:
         except Exception:
             warnings.warn("Exception not expected here. Please report a bug.")
             raise
+
+    # -- contiguous-arena mode (DESIGN.md §4; flag-gated) --------------------
+
+    @property
+    def is_arena_mode(self) -> bool:
+        return self._arena_config is not None
+
+    @property
+    def arena_config(self) -> ContiguousArenaConfig | None:
+        return self._arena_config
+
+    def _gpu_arena_storage(self) -> GpuArenaCacheLevelStorage:
+        storage = self._levels[GPU_LEVEL].storage
+        assert type(storage) is GpuArenaCacheLevelStorage, "not in arena mode"
+        return storage
+
+    @property
+    def gpu_page_budget(self) -> PageBudget:
+        """The level-wide physical page budget governing GPU capacity in arena
+        mode (§4.6)."""
+        return self._gpu_arena_storage().page_budget
+
+    def _compute_page_index_scales(self) -> TypedIndexList[PoolGroupIndex, int]:
+        """Maximum kernel page-index scale per pool group: the largest
+        multiplier any buffer's :class:`PageIndexConverter` applies to a base
+        page index (coalesced sub-buffer count x expansion). Feeds the int31
+        startup check (§4.1)."""
+        scales = filled_list(1, self.num_pool_groups)
+        for attr in self._buffer_attr.values():
+            pg_idx = self._life_cycle_grouping[attr.life_cycle_id]
+            scale = self._slot_to_page_indices[attr.life_cycle_id][attr.pool_index]
+            scales[pg_idx] = max(scales[pg_idx], scale * attr.expansion)
+        return scales
+
+    def _compute_arena_block_capacities(
+        self,
+        arena_config: ContiguousArenaConfig,
+        slot_size_lists: TypedIndexList[PoolGroupIndex, TypedIndexList[PoolIndex, int]],
+        gpu_quota: int,
+        scales: TypedIndexList[PoolGroupIndex, int],
+    ) -> TypedIndexList[PoolGroupIndex, int]:
+        """VA extent, in blocks, of each pool group's arena (§4.8).
+
+        Defaults to ``_ARENA_VA_OVERCOMMIT`` x the physical block count the
+        whole GPU quota could back for the group, clamped to the int31
+        kernel-offset ceiling for the group's scale. An explicit
+        ``max_va_bytes_per_pool`` bounds the byte extent of the group's largest
+        pool instead. ``min_slots`` constraints are honored as a floor; if the
+        floor itself violates int31, level construction fails loudly (§4.1).
+        """
+        caps = filled_list(0, self.num_pool_groups)
+        for pg_idx in typed_range(self.num_pool_groups):
+            record_stride = sum(slot_size_lists[pg_idx])
+            if arena_config.max_va_bytes_per_pool > 0:
+                cap = arena_config.max_va_bytes_per_pool // max(slot_size_lists[pg_idx])
+            else:
+                cap = _ARENA_VA_OVERCOMMIT * max(1, gpu_quota // record_stride)
+            cap = min(cap, (INT31_MAX + 1) // scales[pg_idx])
+            caps[pg_idx] = max(cap, self._min_slots[pg_idx], 1)
+        return caps
+
+    def reserve_gpu_sequence(self, pg_idx: PoolGroupIndex, max_blocks: int) -> SequenceRange:
+        """Reserve a contiguous block-index range for a sequence's maximum
+        block count in every pool of the group (§4.1). Pure VA bookkeeping;
+        physical pages are mapped by :meth:`ensure_gpu_mapped`."""
+        return self._gpu_arena_storage().pool_group(pg_idx).reserve_sequence(max_blocks)
+
+    def take_gpu_sequence_slot(
+        self, pg_idx: PoolGroupIndex, rng: SequenceRange, ordinal: int
+    ) -> Slot:
+        """Issue the slot at ``rng.base_block + ordinal`` (§4.1)."""
+        return self._gpu_arena_storage().pool_group(pg_idx).take_slot(rng, ordinal)
+
+    def ensure_gpu_mapped(
+        self, pg_idx: PoolGroupIndex, rng: SequenceRange, num_valid_blocks: int
+    ) -> int:
+        """Demand-map physical pages covering the range's first
+        ``num_valid_blocks`` plus the map-ahead margin (§4.2). Raises
+        ``OutOfPagesError``, mapping nothing, when the page budget is
+        exhausted (§4.6)."""
+        return self._gpu_arena_storage().pool_group(pg_idx).ensure_mapped(rng, num_valid_blocks)
+
+    def free_gpu_sequence(
+        self, pg_idx: PoolGroupIndex, rng: SequenceRange, last_consumer: CachedCudaEvent
+    ) -> None:
+        """Queue a sequence's whole range for event-gated deferred reclaim
+        (§4.2)."""
+        self._gpu_arena_storage().pool_group(pg_idx).free_sequence(rng, last_consumer)
+
+    def drain_gpu_reclaim(self) -> int:
+        """Unmap and recycle freed ranges whose gating events completed; call
+        at iteration boundaries (§4.2). Returns the number of ranges
+        reclaimed."""
+        return self._gpu_arena_storage().drain_reclaim()
+
+    def offload_arena_pages(self, pg_idx: PoolGroupIndex, pages: Sequence[Page]) -> None:
+        """Active->stale copy-on-free (§4.3): migrate a freeing sequence's
+        committed GPU pages to the host tier and schedule them for host-level
+        eviction. The vacated arena slots return to their sequence range with
+        the copy's finish event as a reclaim gate."""
+        if not pages:
+            return
+        assert self.is_arena_mode
+        assert self.num_cache_levels > 1, "active->stale write-out requires a host tier"
+        host_lvl = CacheLevel(GPU_LEVEL + 1)
+        requirements = filled_list(0, self.num_pool_groups)
+        requirements[pg_idx] = len(pages)
+        self.prepare_free_slots(host_lvl, requirements)
+        self._batched_migrate(pg_idx, host_lvl, GPU_LEVEL, pages, update_src=True)
+        for p in pages:
+            # _batched_migrate re-schedules pages that were already queued for
+            # eviction at the source level; only schedule the rest.
+            if not p.scheduled_for_eviction:
+                self.schedule_for_eviction(p)
+
+    def write_through_pages(self, pg_idx: PoolGroupIndex, pages: Sequence[Page]) -> list[Slot]:
+        """Write-through on commit (§4.3): copy committed (immutable) GPU
+        pages to fresh host slots without touching the sources. Returns the
+        host slots; each slot's ready event completes when its copy does. The
+        caller owns associating the slots with the pages and validating them
+        on event completion."""
+        assert self.is_arena_mode
+        assert self.num_cache_levels > 1, "write-through requires a host tier"
+        if not pages:
+            return []
+        host_lvl = CacheLevel(GPU_LEVEL + 1)
+        requirements = filled_list(0, self.num_pool_groups)
+        requirements[pg_idx] = len(pages)
+        self.prepare_free_slots(host_lvl, requirements)
+        dst_slots = self._batched_migrate(pg_idx, host_lvl, GPU_LEVEL, pages, update_src=False)
+        assert dst_slots is not None
+        return list(dst_slots)
+
+    # ------------------------------------------------------------------------
 
     @property
     def life_cycles(self) -> LifeCycleRegistry:
@@ -392,6 +612,11 @@ class StorageManager:
         requirements: TypedIndexList[PoolGroupIndex, int],
         migration_recorder: MigrationRecorder | None = None,
     ) -> None:
+        if level == GPU_LEVEL and self.is_arena_mode:
+            raise LogicError(
+                "GPU-level slot eviction is retired in arena mode; capacity is "
+                "physical pages (§4.6) and reclaim is per-sequence (§4.2)"
+            )
         goals = filled_array2d(self.num_cache_levels, self.num_pool_groups, 0)
         for pg in typed_range(self.num_pool_groups):
             goals[level, pg] = requirements[pg]
@@ -531,8 +756,17 @@ class StorageManager:
         update_src: bool,
         migration_recorder: MigrationRecorder | None = None,
         defrag: bool = False,  # we are doing defragmentation
+        dst_slots: list[Slot] | None = None,
     ) -> Sequence[Slot] | None:
-        "Free slots must be prepared before calling this function."
+        """Free slots must be prepared before calling this function.
+
+        When ``dst_slots`` is given (arena mode, DESIGN.md §4.4/§4.5), data is
+        copied into those explicit destinations instead of freshly allocated
+        slots — ownership of the slots transfers to this call (they are
+        released back on failure). Copies into explicit destinations are
+        coalesced: adjacent (dst, src) pairs merge into fewer, larger
+        transfers.
+        """
         assert defrag or dst_level != src_level, (
             "dst_level and src_level must be different unless performing defragmentation"
         )
@@ -540,9 +774,13 @@ class StorageManager:
         num_pools = self.num_pools(pool_group_index)
         src_pool_group = self._pool_group(src_level, pool_group_index)
         dst_pool_group = self._pool_group(dst_level, pool_group_index)
-        if dst_pool_group.num_free_slots < num_slots:
-            raise OutOfPagesError("Not enough free slots")
-        dst_slots = dst_pool_group.allocate_multiple(num_slots)
+        explicit_dst = dst_slots is not None
+        if dst_slots is None:
+            if dst_pool_group.num_free_slots < num_slots:
+                raise OutOfPagesError("Not enough free slots")
+            dst_slots = dst_pool_group.allocate_multiple(num_slots)
+        else:
+            assert len(dst_slots) == num_slots
         try:
             assert len(dst_slots) == num_slots
             prior_events: set[CachedCudaEvent] = set()
@@ -563,7 +801,16 @@ class StorageManager:
             with TemporaryCudaStream(prior_events) as stream:
                 slot_sizes = self.slot_size(pool_group_index)
                 for pool_idx, tasks in typed_enumerate(tasks_per_pool):
-                    batched_copy(dst_tier, src_tier, slot_sizes[pool_idx], tasks, stream.get())
+                    if explicit_dst:
+                        # Consecutive ordinals target contiguous arena
+                        # addresses; merge adjacent copies (§4.4).
+                        merged = _coalesce_copy_tasks(slot_sizes[pool_idx], tasks)
+                        for merged_size, merged_tasks in merged.items():
+                            batched_copy(
+                                dst_tier, src_tier, merged_size, merged_tasks, stream.get()
+                            )
+                    else:
+                        batched_copy(dst_tier, src_tier, slot_sizes[pool_idx], tasks, stream.get())
             finish_event = stream.take_finish_event()
             emit_cache_level_updates = (
                 update_src
@@ -689,6 +936,11 @@ class StorageManager:
     def get_utilization(
         self, level: CacheLevel = GPU_LEVEL
     ) -> TypedIndexList[PoolGroupIndex, float]:
+        if level == GPU_LEVEL and self.is_arena_mode:
+            # Slot counts describe VA in arena mode; physical utilization is
+            # the shared page budget (§4.6), identical for every pool group.
+            budget = self.gpu_page_budget
+            return filled_list(budget.used_pages / budget.total_pages, self.num_pool_groups)
         ret = filled_list(0.0, self.num_pool_groups)
         stats = self.get_statistics(level)
         for pg_idx in typed_range(self.num_pool_groups):
@@ -696,6 +948,9 @@ class StorageManager:
         return ret
 
     def get_overall_utilization(self, level: CacheLevel = GPU_LEVEL) -> float:
+        if level == GPU_LEVEL and self.is_arena_mode:
+            budget = self.gpu_page_budget
+            return budget.used_pages / budget.total_pages
         stats = self.get_statistics(level)
         return sum(sum(s.slot_size) * s.unavailable for s in stats) / sum(
             sum(s.slot_size) * s.total for s in stats
@@ -781,6 +1036,11 @@ class StorageManager:
         persistent_pages: TypedIndexList[PoolGroupIndex, list[Page]] | None = None,
     ) -> None:
         """Adapt the cache level by adjusting the ratio list. Persistent pages are those held and not evictable."""
+        if level == GPU_LEVEL and self.is_arena_mode:
+            raise LogicError(
+                "GPU pool-group rebalancing is retired in arena mode: pools "
+                "compete for pages via the shared budget (§4.2/§4.6)"
+            )
         num_cache_levels = self.num_cache_levels
         lvl_storage = self._levels[level].storage
         old_num_slots = lvl_storage.slot_count_list

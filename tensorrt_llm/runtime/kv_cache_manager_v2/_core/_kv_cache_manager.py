@@ -261,6 +261,7 @@ class KVCacheManager:
             typical_batch=config.typical_step,
             constraints=config.constraints,
             event_manager=event_manager,
+            arena_config=config.contiguous_arena,
         )
         self._living_kv_caches = set[rawref.ref[_KVCache]]()
         decay = 0.9999
