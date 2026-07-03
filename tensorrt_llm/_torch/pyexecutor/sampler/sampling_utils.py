@@ -27,62 +27,58 @@ from typing import Any, Generic, Literal, Optional, Type, TypeAlias, TypeVar, ca
 import torch
 
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from tensorrt_llm._torch.pyexecutor.sampler.kernels import flashinfer, vanilla
+from tensorrt_llm._torch.pyexecutor.sampler.ops import flashinfer, vanilla
 
 # NB: these flashinfer op wrappers are plain Python functions that are safe to
 # import even without flashinfer installed (the flashinfer import inside
-# kernels/flashinfer.py is itself guarded); they are only *called* under
+# ops/flashinfer.py is itself guarded); they are only *called* under
 # IS_FLASHINFER_AVAILABLE. Importing them unconditionally keeps them defined for
 # static analysis (they are referenced unconditionally in the strategy impls).
-from tensorrt_llm._torch.pyexecutor.sampler.kernels.flashinfer import (
+from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
     sampling_from_probs_generator_op as sampling_from_probs_generator_op,
 )
-from tensorrt_llm._torch.pyexecutor.sampler.kernels.flashinfer import softmax_op as softmax_op
-from tensorrt_llm._torch.pyexecutor.sampler.kernels.flashinfer import (
+from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import softmax_op as softmax_op
+from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
     top_k_mask_logits_op as top_k_mask_logits_op,
 )
-from tensorrt_llm._torch.pyexecutor.sampler.kernels.flashinfer import (
+from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
     top_k_sampling_from_probs_generator_op as top_k_sampling_from_probs_generator_op,
 )
-from tensorrt_llm._torch.pyexecutor.sampler.kernels.flashinfer import (
+from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
     top_k_top_p_sampling_from_logits_with_generator_op as top_k_top_p_sampling_from_logits_with_generator_op,  # noqa: E501
 )
-from tensorrt_llm._torch.pyexecutor.sampler.kernels.flashinfer import (
+from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
     top_p_renorm_probs_op as top_p_renorm_probs_op,
 )
-from tensorrt_llm._torch.pyexecutor.sampler.kernels.flashinfer import (
+from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
     top_p_sampling_from_probs_generator_op as top_p_sampling_from_probs_generator_op,
 )
-from tensorrt_llm._torch.pyexecutor.sampler.kernels.vanilla import (
+from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
     BeamSearchMetadata as BeamSearchMetadata,
 )
-from tensorrt_llm._torch.pyexecutor.sampler.kernels.vanilla import (
-    StrategyMetadata as StrategyMetadata,
-)
-from tensorrt_llm._torch.pyexecutor.sampler.kernels.vanilla import _Fusions as _Fusions
-from tensorrt_llm._torch.pyexecutor.sampler.kernels.vanilla import (
+from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import StrategyMetadata as StrategyMetadata
+from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import _Fusions as _Fusions
+from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
     beam_search_sampling_batch as beam_search_sampling_batch,
 )
-from tensorrt_llm._torch.pyexecutor.sampler.kernels.vanilla import (
+from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
     get_rejected_indices as get_rejected_indices,
 )
-from tensorrt_llm._torch.pyexecutor.sampler.kernels.vanilla import greedy as _torch_greedy
-from tensorrt_llm._torch.pyexecutor.sampler.kernels.vanilla import (
+from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import greedy as _torch_greedy
+from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
     greedy_search_sampling_batch as greedy_search_sampling_batch,
 )
-from tensorrt_llm._torch.pyexecutor.sampler.kernels.vanilla import (
-    sample_rejected as sample_rejected,
-)
-from tensorrt_llm._torch.pyexecutor.sampler.kernels.vanilla import (
+from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import sample_rejected as sample_rejected
+from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
     temperature_sampling_batch as temperature_sampling_batch,
 )
-from tensorrt_llm._torch.pyexecutor.sampler.kernels.vanilla import (
+from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
     top_k_sampling_batch as top_k_sampling_batch,
 )
-from tensorrt_llm._torch.pyexecutor.sampler.kernels.vanilla import (
+from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
     top_k_top_p_sampling_batch as top_k_top_p_sampling_batch,
 )
-from tensorrt_llm._torch.pyexecutor.sampler.kernels.vanilla import (
+from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
     top_p_sampling_batch as top_p_sampling_batch,
 )
 from tensorrt_llm._utils import prefer_pinned
