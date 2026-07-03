@@ -584,8 +584,8 @@ class FilteredTopKKernelVarlen:
                 buffer,
             )
 
-        cute.arch.barrier()
         if cutlass.const_expr(self.enable_gmem_store):
+            cute.arch.barrier()
             for i in range(tidx, cur_g_num_input, self.num_threads_per_cta):
                 idx_int32 = buffer[r_idx, i]
                 raw_input = score[idx_int32]
@@ -609,7 +609,7 @@ class FilteredTopKKernelVarlen:
                     g_num_input,
                     buffer,
                 )
-        fence_acq_rel_cta()
+            fence_acq_rel_cta()
         cute.arch.barrier()
 
     @cute.jit
