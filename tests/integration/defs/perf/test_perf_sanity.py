@@ -22,13 +22,19 @@ import re
 import shutil
 import socket
 import subprocess
-import sys
 import time
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import pytest
 import yaml
-from test_common.error_utils import report_error
+from test_common.error_utils import (
+    SIBLING_LOG_FLUSH_SLEEP_S,
+    dump_sibling_logs,
+    expected_sibling_marker_paths,
+    report_error,
+    wait_for_sibling_completion,
+    write_pytest_done_marker,
+)
 from test_common.http_utils import wait_for_endpoint_ready
 
 from defs.trt_test_alternative import print_info
@@ -2326,148 +2332,6 @@ MULTI_TEST_TEST_CASES = []
 PERF_SANITY_TEST_CASES = get_aggr_test_cases() + get_disagg_test_cases() + MULTI_TEST_TEST_CASES
 
 
-# --- Disagg BENCHMARK sibling-log dump -------------------------------------
-#
-# In CI, only the BENCHMARK srun step's stdout is displayed. To make debugging
-# convenient, BENCHMARK's test_e2e dumps every sibling log (CTX/GEN/DISAGG_SERVER
-# pytest srun outputs and the nested trtllm-serve subprocess logs) into its own
-# stdout at teardown.
-#
-# Coordination follows option C from the design discussion:
-#   1. Each worker (CTX_x / GEN_x / DISAGG_SERVER) writes a pytest_done marker
-#      at the end of its test_e2e so BENCHMARK can tell the worker's stdout has
-#      (nearly) drained.
-#   2. BENCHMARK polls for all expected markers, falling back to log-file size
-#      stability so a crashed worker that never wrote a marker doesn't block.
-#   3. Both are bounded by a max timeout; BENCHMARK dumps whatever it has if
-#      neither condition is met in time.
-#   4. A short flush sleep after detection covers the last srun `&> file`
-#      redirect finalization.
-
-_SIBLING_LOG_WAIT_TIMEOUT_S = 180
-_SIBLING_LOG_POLL_INTERVAL_S = 3
-_SIBLING_LOG_STABILITY_POLLS = 3
-_SIBLING_LOG_FLUSH_SLEEP_S = 3
-
-
-def _pytest_done_marker_path(test_output_dir: str, disagg_serving_type: str, server_idx: int) -> str:
-    return os.path.join(
-        test_output_dir, f"pytest_done.{disagg_serving_type}.{server_idx}.txt"
-    )
-
-
-def _expected_sibling_marker_paths(
-    test_output_dir: str, num_ctx_servers: int, num_gen_servers: int, server_idx: int
-) -> List[str]:
-    markers = []
-    for i in range(num_ctx_servers):
-        markers.append(_pytest_done_marker_path(test_output_dir, f"CTX_{i}", server_idx))
-    for i in range(num_gen_servers):
-        markers.append(_pytest_done_marker_path(test_output_dir, f"GEN_{i}", server_idx))
-    markers.append(_pytest_done_marker_path(test_output_dir, "DISAGG_SERVER", server_idx))
-    return markers
-
-
-def _write_pytest_done_marker(
-    test_output_dir: str, disagg_serving_type: str, server_idx: int
-) -> None:
-    """Signal to BENCHMARK that this worker's pytest is finishing.
-
-    Best-effort: any exception is logged and swallowed since a failed marker
-    write must not fail the test — BENCHMARK will fall back to size stability.
-    """
-    try:
-        os.makedirs(test_output_dir, exist_ok=True)
-        marker_path = _pytest_done_marker_path(test_output_dir, disagg_serving_type, server_idx)
-        with open(marker_path, "w") as f:
-            f.write("done")
-    except Exception as e:
-        print_info(f"Failed to write pytest_done marker: {e}")
-
-
-def _wait_for_sibling_completion(
-    marker_paths: List[str],
-    log_paths: List[str],
-    timeout_s: int = _SIBLING_LOG_WAIT_TIMEOUT_S,
-    poll_interval_s: int = _SIBLING_LOG_POLL_INTERVAL_S,
-    stability_polls: int = _SIBLING_LOG_STABILITY_POLLS,
-) -> str:
-    """Wait until sibling workers are done, or their logs stop growing, or timeout.
-
-    Returns the reason for exit: "markers", "stable", or "timeout". A crashed
-    worker that never wrote a marker still lets us exit via size stability, so
-    BENCHMARK never blocks the full timeout on a worker failure.
-    """
-    start = time.time()
-    prev_sizes = {p: -1 for p in log_paths}
-    stable_counts = {p: 0 for p in log_paths}
-
-    while time.time() - start < timeout_s:
-        if all(os.path.exists(m) for m in marker_paths):
-            print_info(
-                f"All worker pytest_done markers found after "
-                f"{time.time() - start:.1f}s."
-            )
-            return "markers"
-
-        for p in log_paths:
-            try:
-                size = os.path.getsize(p) if os.path.exists(p) else 0
-            except OSError:
-                size = 0
-            if size == prev_sizes[p]:
-                stable_counts[p] += 1
-            else:
-                stable_counts[p] = 0
-            prev_sizes[p] = size
-
-        # A log is "stable" once we've seen `stability_polls` consecutive same-size
-        # polls. Missing files count as stable so a worker that crashed before
-        # writing anything doesn't block. Require at least one non-empty log to
-        # avoid returning immediately on the first tick before any worker started.
-        all_stable = all(stable_counts[p] >= stability_polls for p in log_paths)
-        any_nonempty = any(prev_sizes[p] > 0 for p in log_paths)
-        if all_stable and any_nonempty:
-            print_info(
-                f"All sibling logs stable after {time.time() - start:.1f}s "
-                f"(marker fallback)."
-            )
-            return "stable"
-
-        time.sleep(poll_interval_s)
-
-    missing = [m for m in marker_paths if not os.path.exists(m)]
-    print_info(
-        f"Timed out after {timeout_s}s waiting for sibling completion. "
-        f"Missing markers: {missing}. Dumping logs anyway."
-    )
-    return "timeout"
-
-
-def _dump_sibling_logs(log_paths: List[str]) -> None:
-    """Print full content of each sibling log so it lands in BENCHMARK's stdout."""
-    separator = "=" * 80
-    print(f"\n{separator}")
-    print("=== Sibling log dump (from BENCHMARK pytest for CI visibility) ===")
-    print(f"{separator}")
-    for log_path in log_paths:
-        print(f"\n----- BEGIN {log_path} -----")
-        if not os.path.exists(log_path):
-            print("(file does not exist)")
-        else:
-            try:
-                with open(log_path, "r", errors="replace") as f:
-                    shutil.copyfileobj(f, sys.stdout)
-                # Ensure the footer starts on its own line even if the log
-                # didn't end with a newline.
-                sys.stdout.write("\n")
-            except Exception as e:
-                print(f"(failed to read: {e})")
-        print(f"----- END {log_path} -----")
-    print(f"{separator}\n")
-    sys.stdout.flush()
-
-
 @pytest.mark.parametrize("perf_sanity_test_case", PERF_SANITY_TEST_CASES)
 def test_e2e(output_dir, perf_sanity_test_case):
     # Create config and parse test case name
@@ -2515,7 +2379,7 @@ def test_e2e(output_dir, perf_sanity_test_case):
                 log_paths: List[str] = []
                 for server_idx in range(len(commands.server_cmds)):
                     marker_paths.extend(
-                        _expected_sibling_marker_paths(
+                        expected_sibling_marker_paths(
                             commands.test_output_dir,
                             commands.num_ctx_servers,
                             commands.num_gen_servers,
@@ -2523,15 +2387,15 @@ def test_e2e(output_dir, perf_sanity_test_case):
                         )
                     )
                     log_paths.extend(commands.get_server_logs(server_idx))
-                _wait_for_sibling_completion(marker_paths, log_paths)
+                wait_for_sibling_completion(marker_paths, log_paths)
                 # Small flush sleep so the srun `&> file` redirect finalizes
                 # the last few lines of the worker's stdout.
-                time.sleep(_SIBLING_LOG_FLUSH_SLEEP_S)
-                _dump_sibling_logs(log_paths)
+                time.sleep(SIBLING_LOG_FLUSH_SLEEP_S)
+                dump_sibling_logs(log_paths)
             else:
                 # Worker: drop a marker so BENCHMARK stops waiting on us. This
                 # runs whether the test passed, failed, or raised.
                 for server_idx in range(len(commands.server_cmds)):
-                    _write_pytest_done_marker(
+                    write_pytest_done_marker(
                         commands.test_output_dir, disagg_serving_type, server_idx
                     )
