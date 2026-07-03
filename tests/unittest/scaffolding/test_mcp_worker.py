@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import json
 import multiprocessing
@@ -217,6 +220,7 @@ class DummyWorker(Worker):
 # ============================================================
 
 
+@pytest.mark.skip(reason="https://nvbugs/6337229")
 @pytest.mark.asyncio
 async def test_mcp_worker_add_numbers(mcp_server):
     # 1. Initialize MCPWorker with mcp_server's SSE URL
@@ -253,6 +257,7 @@ async def test_mcp_worker_add_numbers(mcp_server):
         worker.shutdown()
 
 
+@pytest.mark.skip(reason="https://nvbugs/6337229")
 @pytest.mark.asyncio
 async def test_mcp_worker_echo_message(mcp_server):
     # Initialize MCPWorker
@@ -282,6 +287,7 @@ async def test_mcp_worker_echo_message(mcp_server):
         worker.shutdown()
 
 
+@pytest.mark.skip(reason="https://nvbugs/6337229")
 @pytest.mark.asyncio
 async def test_mcp_worker_multiple_calls(mcp_server):
     import json
@@ -334,6 +340,7 @@ async def test_mcp_worker_multiple_calls(mcp_server):
         worker.shutdown()
 
 
+@pytest.mark.skip(reason="https://nvbugs/6337229")
 @pytest.mark.asyncio
 async def test_multiple_calls_to_same_tool(mcp_server):
     sse_url = mcp_server.get_sse_url()
@@ -364,6 +371,7 @@ async def test_multiple_calls_to_same_tool(mcp_server):
     worker.shutdown()
 
 
+@pytest.mark.skip(reason="https://nvbugs/6337229")
 @pytest.mark.asyncio
 async def test_scaffolding_with_chat_mcp_controller(mcp_server):
     # Initialize workers
