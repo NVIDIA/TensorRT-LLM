@@ -4812,7 +4812,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         @classmethod
         def _compile(cls, dtype, bucketed_num_cols, top_k, next_n, return_val,
-                     num_copy_bits, load_balance, large_occupancy):
+                     num_copy_bits, load_balance, large_occupancy,
+                     overflow_policy):
             """Compile and cache a single-CTA top-k kernel for the given config."""
             key = (
                 dtype,
@@ -4823,6 +4824,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 num_copy_bits,
                 load_balance,
                 large_occupancy,
+                overflow_policy,
             )
             if key in cls.kernel_cache:
                 return
@@ -4834,12 +4836,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                                                stride_order=(1,
                                                                              0),
                                                                assumed_align=32)
-            buffer_fake = cute.runtime.make_fake_compact_tensor(
-                cutlass.Int32,
-                (n_rows, cute.sym_int(), n_cols),
-                stride_order=(2, 1, 0),
-                assumed_align=32,
-            )
+            if overflow_policy == "GMEM_SPILL":
+                buffer_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Int32,
+                    (n_rows, cute.sym_int(), n_cols),
+                    stride_order=(2, 1, 0),
+                    assumed_align=32,
+                )
+            else:
+                buffer_fake = None
             seqlen_fake = cute.runtime.make_fake_compact_tensor(
                 cutlass.Int32,
                 (n_batch, ),
@@ -4870,6 +4875,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 return_val=return_val,
                 large_occupancy=large_occupancy,
                 num_sms=_get_num_sms(),
+                overflow_policy=overflow_policy,
             )
             if load_balance:
                 g_global_counter_fake = cute.runtime.make_fake_compact_tensor(
@@ -4902,6 +4908,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return_val: bool = False,
             num_copy_bits: int = 256,
             load_balance: bool = False,
+            overflow_policy: str = "GMEM_SPILL",
             output_indices: Optional[torch.Tensor] = None,
         ):
             """Execute filtered top-k selection on input logits."""
@@ -4922,6 +4929,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 num_copy_bits,
                 load_balance,
                 large_occupancy,
+                overflow_policy,
             )
             cls._compile(*key)
             compiled_kernel = cls.kernel_cache[key]
@@ -4945,20 +4953,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
             else:
                 output_values_torch = None
 
-            # Prepare buffer
-            # extra buffer: num_rows * buffer_numbers * num_cols * 4 bytes
-            # fp32: up to 256 MB (256 * 2 * 262144 * 4)
-            # fp16/bf16: up to 128 MB (256 * 1 * 262144 * 4)
-            if dtype == cutlass.Float32:
-                buffer_numbers = 2
+            # Prepare buffer (GMEM_SPILL only; other policies use None)
+            if overflow_policy == "GMEM_SPILL":
+                # extra buffer: num_rows * buffer_numbers * num_cols * 4 bytes
+                # fp32: up to 256 MB (256 * 2 * 262144 * 4)
+                # fp16/bf16: up to 128 MB (256 * 1 * 262144 * 4)
+                buffer_numbers = 2 if dtype == cutlass.Float32 else 1
+                buffer_torch = cls.buffers.get_buffer(
+                    [num_rows, buffer_numbers, bucketed_num_cols],
+                    torch.int32,
+                    buffer_name="single_cta_buffer",
+                    reserve_buffer=reserve)
+                buffer_torch = buffer_torch[:, :, :num_cols]
             else:
-                buffer_numbers = 1
-            buffer_torch = cls.buffers.get_buffer(
-                [num_rows, buffer_numbers, bucketed_num_cols],
-                torch.int32,
-                buffer_name="single_cta_buffer",
-                reserve_buffer=reserve)
-            buffer_torch = buffer_torch[:, :, :num_cols]
+                buffer_torch = None
             # Prepare global counter for persistent dynamic scheduling
             if load_balance:
                 g_global_counter_torch = cls.buffers.get_buffer(
@@ -5088,9 +5096,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         @classmethod
         def _compile(cls, dtype, bucketed_num_cols, top_k, return_val,
-                     num_copy_bits):
+                     num_copy_bits, overflow_policy):
             """Compile and cache a single-CTA prefill top-k kernel."""
-            key = (dtype, bucketed_num_cols, top_k, return_val, num_copy_bits)
+            key = (dtype, bucketed_num_cols, top_k, return_val, num_copy_bits,
+                   overflow_policy)
             if key in cls.kernel_cache:
                 return
             n_rows = cute.sym_int()
@@ -5111,16 +5120,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 (n_rows, ),
                 stride_order=(0, ),
             )
-            if dtype == cutlass.Float32:
-                pass
+            if overflow_policy == "GMEM_SPILL":
+                buffer_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Int32,
+                    (n_rows, cute.sym_int(), n_cols),
+                    stride_order=(2, 1, 0),
+                    assumed_align=32,
+                )
             else:
-                pass
-            buffer_fake = cute.runtime.make_fake_compact_tensor(
-                cutlass.Int32,
-                (n_rows, cute.sym_int(), n_cols),
-                stride_order=(2, 1, 0),
-                assumed_align=32,
-            )
+                buffer_fake = None
             output_indices_fake = cute.runtime.make_fake_compact_tensor(
                 cutlass.Int32,
                 (n_rows, top_k),
@@ -5143,6 +5151,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 top_k,
                 num_copy_bits=num_copy_bits,
                 return_val=return_val,
+                overflow_policy=overflow_policy,
             )
             compiled_kernel = cute.compile(
                 filtered_topk_func,
@@ -5167,6 +5176,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             top_k: int,
             return_val: bool = False,
             num_copy_bits: int = 256,
+            overflow_policy: str = "GMEM_SPILL",
             output_indices: Optional[torch.Tensor] = None,
         ):
             """Execute filtered top-k selection for prefill rows."""
@@ -5175,7 +5185,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_rows, num_cols = input_values.shape
             bucketed_num_cols = next_positive_power_of_2(num_cols)
 
-            key = (dtype, bucketed_num_cols, top_k, return_val, num_copy_bits)
+            key = (dtype, bucketed_num_cols, top_k, return_val, num_copy_bits,
+                   overflow_policy)
             cls._compile(*key)
             compiled_kernel = cls.kernel_cache[key]
             reserve = torch.cuda.is_current_stream_capturing()
@@ -5199,17 +5210,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
             else:
                 output_values_torch = None
 
-            if dtype == cutlass.Float32:
-                buffer_numbers = 2
+            if overflow_policy == "GMEM_SPILL":
+                buffer_numbers = 2 if dtype == cutlass.Float32 else 1
+                buffer_torch = cls.buffers.get_buffer(
+                    [num_rows, buffer_numbers, bucketed_num_cols],
+                    torch.int32,
+                    buffer_name="prefill_single_cta_buffer",
+                    reserve_buffer=reserve,
+                )
+                buffer_torch = buffer_torch[:, :, :num_cols]
             else:
-                buffer_numbers = 1
-            buffer_torch = cls.buffers.get_buffer(
-                [num_rows, buffer_numbers, bucketed_num_cols],
-                torch.int32,
-                buffer_name="prefill_single_cta_buffer",
-                reserve_buffer=reserve,
-            )
-            buffer_torch = buffer_torch[:, :, :num_cols]
+                buffer_torch = None
 
             compiled_kernel(
                 input_values,
@@ -5232,15 +5243,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
         row_ends: torch.Tensor,
         top_k: int,
         num_copy_bits: int = 256,
+        overflow_policy: str = "GMEM_SPILL",
     ) -> torch.Tensor:
         """CuTE DSL radix-based top-k for prefill.
 
         Args:
-            input_values: Logits tensor of shape (num_rows, num_cols).
-            row_starts:   Per-row start column (inclusive), shape (num_rows,), int32.
-            row_ends:     Per-row end column (exclusive), shape (num_rows,), int32.
-            top_k:        Number of top-k indices to select per row.
-            num_copy_bits: Vector copy width in bits (default 256).
+            input_values:   Logits tensor of shape (num_rows, num_cols).
+            row_starts:     Per-row start column (inclusive), shape (num_rows,), int32.
+            row_ends:       Per-row end column (exclusive), shape (num_rows,), int32.
+            top_k:          Number of top-k indices to select per row.
+            num_copy_bits:  Vector copy width in bits (default 256).
+            overflow_policy: How to handle threshold-bucket SMEM overflow.
+                             "GMEM_SPILL" (default, exact) or "TRUNCATE" (non-exact,
+                             no extra buffer).
 
         Returns:
             indices: Int32 tensor of shape (num_rows, top_k) with LOCAL indices
@@ -5254,6 +5269,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             top_k,
             return_val=False,
             num_copy_bits=num_copy_bits,
+            overflow_policy=overflow_policy,
         )
         return indices
 
@@ -5265,6 +5281,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         row_ends: torch.Tensor,
         top_k: int,
         num_copy_bits: int = 256,
+        overflow_policy: str = "GMEM_SPILL",
     ):
         num_rows = input_values.shape[0]
         return input_values.new_empty((num_rows, top_k), dtype=torch.int32)
@@ -6023,6 +6040,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         dynamic: bool = True,
         single_pass_multi_cta: bool = False,
         single_pass_multi_cta_cluster: bool = False,
+        overflow_policy: str = "GMEM_SPILL",
     ) -> None:
         """Unified CuTE DSL Top-K that auto-selects single-CTA or multi-CTA (2-pass multi-CTA) or
         single-pass multi-CTA. When single_pass_multi_cta=True, it selects between single-CTA
@@ -6153,6 +6171,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     next_n=next_n,
                     return_val=False,
                     num_copy_bits=num_copy_bits,
+                    overflow_policy=overflow_policy,
                     output_indices=output_indices,
                 )
         else:
@@ -6196,6 +6215,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     next_n=next_n,
                     return_val=False,
                     num_copy_bits=num_copy_bits,
+                    overflow_policy=overflow_policy,
                     output_indices=output_indices,
                 )
 
@@ -6210,6 +6230,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         dynamic: bool = True,
         single_pass_multi_cta: bool = False,
         single_pass_multi_cta_cluster: bool = False,
+        overflow_policy: str = "GMEM_SPILL",
     ) -> None:
         return None
 

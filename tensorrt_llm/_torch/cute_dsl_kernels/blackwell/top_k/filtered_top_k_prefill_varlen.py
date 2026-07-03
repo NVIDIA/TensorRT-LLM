@@ -52,6 +52,7 @@ class FilteredTopKKernelVarlenPrefill(FilteredTopKKernelVarlen):
         top_k: int,
         num_copy_bits: int = 256,
         return_val: bool = False,
+        overflow_policy: str = "GMEM_SPILL",
         debug: bool = False,
     ):
         super().__init__(
@@ -64,6 +65,7 @@ class FilteredTopKKernelVarlenPrefill(FilteredTopKKernelVarlen):
             chunk_size_per_cta=16384,
             num_ctas_per_row=1,
             merge_blocks=False,
+            overflow_policy=overflow_policy,
         )
 
         # Output local indices: subtract row_start before writing to output.
@@ -90,7 +92,9 @@ class FilteredTopKKernelVarlenPrefill(FilteredTopKKernelVarlen):
             max_S = 4096 if self.num_buffer_smem_input_idx == 2 else 8192
 
         self.filtered_topk_smem_input_size = min(max_S, self.max_num_cols)
-        self.enable_gmem_store = self.max_num_cols > self.filtered_topk_smem_input_size
+        _needs_extra = self.max_num_cols > self.filtered_topk_smem_input_size
+        self.enable_gmem_store = (overflow_policy == "GMEM_SPILL") and _needs_extra
+        self.enable_truncate = (overflow_policy == "TRUNCATE") and _needs_extra
 
         # Always 512 threads for large-occupancy path.
         self.num_threads_per_cta = 512
@@ -102,7 +106,10 @@ class FilteredTopKKernelVarlenPrefill(FilteredTopKKernelVarlen):
                 f"num_threads_per_cta: {self.num_threads_per_cta}"
             )
             print(f"filtered_topk_smem_input_size: {self.filtered_topk_smem_input_size}")
-            print(f"enable_gmem_store: {self.enable_gmem_store}")
+            print(
+                f"overflow_policy: {overflow_policy}, enable_gmem_store: {self.enable_gmem_store}, "
+                f"enable_truncate: {self.enable_truncate}"
+            )
             print(f"subtract_row_start_on_output: {self.subtract_row_start_on_output}")
 
     @cute.kernel
@@ -240,3 +247,6 @@ class FilteredTopKKernelVarlenPrefill(FilteredTopKKernelVarlen):
             use_pdl=TRTLLM_ENABLE_PDL,
             min_blocks_per_mp=min_blocks_per_mp,
         )
+
+
+# TODO: add wrapper function and unit test here.

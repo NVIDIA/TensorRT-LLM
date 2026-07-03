@@ -167,6 +167,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         enable_dynamic_multi_cta: bool = False,
         varlen_merge_input: bool = False,
         num_sms: int = 148,
+        overflow_policy: str = "GMEM_SPILL",
         debug: bool = False,
     ):
         super().__init__(
@@ -179,6 +180,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             chunk_size_per_cta,
             num_ctas_per_row,
             merge_blocks,
+            overflow_policy=overflow_policy,
         )
         self.next_n = next_n
         self.enable_multi_cta = enable_multi_cta
@@ -212,10 +214,9 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
                 max_S = 4096 if self.num_buffer_smem_input_idx == 2 else 8192
             self.filtered_topk_smem_input_size = min(max_S, self.max_num_cols)
 
-            if cutlass.const_expr(self.max_num_cols > self.filtered_topk_smem_input_size):
-                self.enable_gmem_store = True
-            else:
-                self.enable_gmem_store = False
+            _needs_extra = self.max_num_cols > self.filtered_topk_smem_input_size
+            self.enable_gmem_store = (overflow_policy == "GMEM_SPILL") and _needs_extra
+            self.enable_truncate = (overflow_policy == "TRUNCATE") and _needs_extra
 
             # set the number of threads per cta to 512.
             if cutlass.const_expr(not self.merge_blocks):
@@ -670,6 +671,7 @@ def cute_dsl_topk_wrapper(
     return_val=True,
     load_balance=False,
     num_copy_bits=256,
+    overflow_policy: str = "GMEM_SPILL",
 ):
     torch_dtype = input_values.dtype
     dtype = _TORCH_TO_CUTLASS_DTYPE[torch_dtype]
@@ -689,6 +691,7 @@ def cute_dsl_topk_wrapper(
         num_copy_bits,
         load_balance,
         large_occupancy,
+        overflow_policy,
     )
     if key not in compiled_filter_topk_dict:
         # Create fake tensors for compilation
@@ -698,13 +701,16 @@ def cute_dsl_topk_wrapper(
         input_fake = cute.runtime.make_fake_compact_tensor(
             dtype, (n_rows, n_cols), stride_order=(1, 0), assumed_align=32
         )
-        # used for large num_cols
-        buffer_fake = cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32,
-            (cute.sym_int(), cute.sym_int(), cute.sym_int()),
-            stride_order=(2, 1, 0),
-            assumed_align=32,
-        )
+        # used for large num_cols (GMEM_SPILL only)
+        if overflow_policy == "GMEM_SPILL":
+            buffer_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (cute.sym_int(), cute.sym_int(), cute.sym_int()),
+                stride_order=(2, 1, 0),
+                assumed_align=32,
+            )
+        else:
+            buffer_fake = None
         seqlen_fake = cute.runtime.make_fake_compact_tensor(
             cute.Int32,
             (n_batch,),
@@ -733,6 +739,7 @@ def cute_dsl_topk_wrapper(
             num_copy_bits=num_copy_bits,
             return_val=return_val,
             large_occupancy=large_occupancy,
+            overflow_policy=overflow_policy,
         )
 
         # Compile the kernel
@@ -760,12 +767,13 @@ def cute_dsl_topk_wrapper(
     else:
         output_values_torch = None
 
-    if dtype == cutlass.Float32:
-        buffer_numbers = 2
+    if overflow_policy == "GMEM_SPILL":
+        buffer_numbers = 2 if dtype == cutlass.Float32 else 1
+        buffer_torch = torch.empty(
+            num_rows, buffer_numbers, num_cols, dtype=torch.int32, device="cuda"
+        )
     else:
-        buffer_numbers = 1
-    # Note: zeros will trigger an elementwise_add kernel.
-    buffer_torch = torch.empty(num_rows, buffer_numbers, num_cols, dtype=torch.int32, device="cuda")
+        buffer_torch = None
     g_global_counter_torch = None
 
     # TVM FFI uses env stream automatically

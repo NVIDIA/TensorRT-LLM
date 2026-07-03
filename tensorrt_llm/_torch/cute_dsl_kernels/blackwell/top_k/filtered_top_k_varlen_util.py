@@ -48,6 +48,7 @@ class FilteredTopKKernelVarlen:
         chunk_size_per_cta: int = 16384,
         num_ctas_per_row: int = 1,
         merge_blocks: bool = False,
+        overflow_policy: str = "GMEM_SPILL",
     ):
         self.dtype = dtype
         self.max_num_cols = max_num_cols
@@ -57,6 +58,10 @@ class FilteredTopKKernelVarlen:
         self.chunk_size_per_cta = chunk_size_per_cta
         self.num_ctas_per_row = num_ctas_per_row
         self.merge_blocks = merge_blocks
+        self.overflow_policy = overflow_policy
+        assert overflow_policy in ("GMEM_SPILL", "TRUNCATE"), (
+            f"Unknown overflow_policy: {overflow_policy}"
+        )
 
         # Tested with top_k in {512, 1024, 2048}. Other values may work but
         # have not been validated and may require minor changes.
@@ -92,10 +97,9 @@ class FilteredTopKKernelVarlen:
 
         self.filtered_topk_smem_input_size = min(self.max_smem_input_size, self.max_num_cols)
 
-        if cutlass.const_expr(self.max_num_cols > self.filtered_topk_smem_input_size):
-            self.enable_gmem_store = True
-        else:
-            self.enable_gmem_store = False
+        _needs_extra = self.max_num_cols > self.filtered_topk_smem_input_size
+        self.enable_gmem_store = (overflow_policy == "GMEM_SPILL") and _needs_extra
+        self.enable_truncate = (overflow_policy == "TRUNCATE") and _needs_extra
 
         self.return_val = return_val
         # Subclasses set to True to subtract row_start from absolute indices before
@@ -456,10 +460,7 @@ class FilteredTopKKernelVarlen:
         _step_vec = self.num_threads_per_cta * self.vec_size
         # Byte address of the aligned portion start for this row (score[vec_start]).
         _aligned_base = (score.iterator + vec_start).toint()
-        # CopyUniversalOp for direct atom-level copies with 1D layout tensors.
-        # copy_atom (CopyG2ROp) is designed for the tiled copy framework; for
-        # direct cute.copy(atom, 1D-tensor, frag) calls it must be bound in the
-        # same trace scope (GVR pattern).
+        # TODO: check if we need to use CopyG2ROp here?
         _copy_atom = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             self.dtype,
@@ -619,7 +620,7 @@ class FilteredTopKKernelVarlen:
                     s_histogram[_hi] = 0
                 cute.arch.barrier()
 
-                # Filter and build refinement histogram
+                # Filter and build next round histogram
                 ic = tidx * cutlass.Int32(vec_size)
                 while ic + cutlass.Int32(vec_size - 1) < aligned_size:
                     cute.copy(
@@ -643,9 +644,8 @@ class FilteredTopKKernelVarlen:
                             pos = atomicAdd(s_counter.iterator, val_one)
                             s_indices[pos] = idx
                         elif bin_val == threshold_bin:
-                            # pos = atomicAdd(s_num_input[0], 1)
-                            pos = atomicAdd(s_num_input.iterator, val_one)
                             if cutlass.const_expr(self.enable_gmem_store):
+                                pos = atomicAdd(s_num_input.iterator, val_one)
                                 if pos < self.filtered_topk_smem_input_size:
                                     s_input_idx[0, pos] = idx
                                 else:
@@ -656,17 +656,32 @@ class FilteredTopKKernelVarlen:
                                     buffer[0, buffer_pos] = cutlass.Int32(cutlass.Uint32(idx))
                                 ordered = self.to_ordered(raw_input)
                                 sub_bin = (ordered >> self.first_refine_shift) & 0xFF
-                                # atomicAdd(s_histogram[sub_bin], 1)
                                 atomicAdd(
                                     s_histogram.iterator + cutlass.Int32(sub_bin),
                                     val_one,
                                 )
+                            elif cutlass.const_expr(self.enable_truncate):
+                                if cutlass.const_expr(self.dtype == cutlass.Float32):
+                                    ordered = cutlass.Uint32(0)
+                                    sub_bin = cutlass.Uint32(0)
+                                else:
+                                    ordered = cutlass.Uint16(0)
+                                    sub_bin = cutlass.Int32(0)
+                                pos = atomicAdd(s_num_input.iterator, val_one)
+                                if pos < self.filtered_topk_smem_input_size:
+                                    s_input_idx[0, pos] = idx
+                                    ordered = self.to_ordered(raw_input)
+                                    sub_bin = (ordered >> self.first_refine_shift) & 0xFF
+                                    atomicAdd(
+                                        s_histogram.iterator + cutlass.Int32(sub_bin),
+                                        val_one,
+                                    )
                             else:
+                                pos = atomicAdd(s_num_input.iterator, val_one)
                                 if pos < self.filtered_topk_smem_input_size:
                                     s_input_idx[0, pos] = idx
                                 ordered = self.to_ordered(raw_input)
                                 sub_bin = (ordered >> self.first_refine_shift) & 0xFF
-                                # atomicAdd(s_histogram[sub_bin], 1)
                                 atomicAdd(
                                     s_histogram.iterator + cutlass.Int32(sub_bin),
                                     val_one,
@@ -683,12 +698,8 @@ class FilteredTopKKernelVarlen:
                         idx = self.index_type(col_idx)
                         s_indices[pos] = idx
                     elif bin_val == threshold_bin:
-                        pos = atomicAdd(
-                            s_num_input.iterator,
-                            val_one,
-                        )
-                        # TODO: add gmem buffer here.
                         if cutlass.const_expr(self.enable_gmem_store):
+                            pos = atomicAdd(s_num_input.iterator, val_one)
                             if pos < self.filtered_topk_smem_input_size:
                                 s_input_idx[0, pos] = self.index_type(col_idx)
                             else:
@@ -703,14 +714,30 @@ class FilteredTopKKernelVarlen:
                                 s_histogram.iterator + cutlass.Int32(sub_bin),
                                 val_one,
                             )
-                        else:
-                            # TODO: how to handle the type of sub_bin and ordered?
+                        elif cutlass.const_expr(self.enable_truncate):
                             if cutlass.const_expr(self.dtype == cutlass.Float32):
                                 ordered = cutlass.Uint32(0)
                                 sub_bin = cutlass.Uint32(0)
                             else:
                                 ordered = cutlass.Uint16(0)
                                 sub_bin = cutlass.Int32(0)
+                            pos = atomicAdd(s_num_input.iterator, val_one)
+                            if pos < self.filtered_topk_smem_input_size:
+                                s_input_idx[0, pos] = self.index_type(col_idx)
+                                ordered = self.to_ordered(raw)
+                                sub_bin = (ordered >> self.first_refine_shift) & 0xFF
+                                atomicAdd(
+                                    s_histogram.iterator + cutlass.Int32(sub_bin),
+                                    val_one,
+                                )
+                        else:
+                            if cutlass.const_expr(self.dtype == cutlass.Float32):
+                                ordered = cutlass.Uint32(0)
+                                sub_bin = cutlass.Uint32(0)
+                            else:
+                                ordered = cutlass.Uint16(0)
+                                sub_bin = cutlass.Int32(0)
+                            pos = atomicAdd(s_num_input.iterator, val_one)
                             if pos < self.filtered_topk_smem_input_size:
                                 s_input_idx[0, pos] = self.index_type(col_idx)
                                 ordered = self.to_ordered(raw)
@@ -730,12 +757,8 @@ class FilteredTopKKernelVarlen:
                         idx = self.index_type(col_idx)
                         s_indices[pos] = idx
                     elif bin_val == threshold_bin:
-                        pos = atomicAdd(
-                            s_num_input.iterator,
-                            val_one,
-                        )
-                        # TODO: add gmem buffer here.
                         if cutlass.const_expr(self.enable_gmem_store):
+                            pos = atomicAdd(s_num_input.iterator, val_one)
                             if pos < self.filtered_topk_smem_input_size:
                                 s_input_idx[0, pos] = self.index_type(col_idx)
                             else:
@@ -750,14 +773,30 @@ class FilteredTopKKernelVarlen:
                                 s_histogram.iterator + cutlass.Int32(sub_bin),
                                 val_one,
                             )
-                        else:
-                            # TODO: how to handle the type of sub_bin and ordered?
+                        elif cutlass.const_expr(self.enable_truncate):
                             if cutlass.const_expr(self.dtype == cutlass.Float32):
                                 ordered = cutlass.Uint32(0)
                                 sub_bin = cutlass.Uint32(0)
                             else:
                                 ordered = cutlass.Uint16(0)
                                 sub_bin = cutlass.Int32(0)
+                            pos = atomicAdd(s_num_input.iterator, val_one)
+                            if pos < self.filtered_topk_smem_input_size:
+                                s_input_idx[0, pos] = self.index_type(col_idx)
+                                ordered = self.to_ordered(raw)
+                                sub_bin = (ordered >> self.first_refine_shift) & 0xFF
+                                atomicAdd(
+                                    s_histogram.iterator + cutlass.Int32(sub_bin),
+                                    val_one,
+                                )
+                        else:
+                            if cutlass.const_expr(self.dtype == cutlass.Float32):
+                                ordered = cutlass.Uint32(0)
+                                sub_bin = cutlass.Uint32(0)
+                            else:
+                                ordered = cutlass.Uint16(0)
+                                sub_bin = cutlass.Int32(0)
+                            pos = atomicAdd(s_num_input.iterator, val_one)
                             if pos < self.filtered_topk_smem_input_size:
                                 s_input_idx[0, pos] = self.index_type(col_idx)
                                 ordered = self.to_ordered(raw)
@@ -799,6 +838,7 @@ class FilteredTopKKernelVarlen:
                         is_last_round = round == self.num_refine_rounds - 1
 
                         if topk_remaining == 0:
+                            # Collect indices where bin < threshold_bin.
                             for i in range(tidx, num_input, self.num_threads_per_cta):
                                 idx = s_input_idx[r_idx, i]
                                 idx = cutlass.Int32(cutlass.Uint32(idx))
@@ -827,6 +867,7 @@ class FilteredTopKKernelVarlen:
                                 s_histogram[_hi] = 0
                             cute.arch.barrier()
 
+                            # Filter and build next round histogram.
                             for i in range(tidx, num_input, self.num_threads_per_cta):
                                 idx = s_input_idx[r_idx, i]
                                 idx_int32 = cutlass.Int32(cutlass.Uint32(idx))
