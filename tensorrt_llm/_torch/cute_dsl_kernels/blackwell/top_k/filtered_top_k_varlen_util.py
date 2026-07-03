@@ -791,9 +791,6 @@ class FilteredTopKKernelVarlen:
         extra_buffer: cute.Tensor,
         output_indices: cute.Tensor,
         output_values: cute.Tensor,
-        tiler_mn: cute.Shape,
-        copy_atom: cute.CopyAtom,
-        tiled_copy: cute.TiledCopy,
         row_start: int,
         length: int,
         bidx: int,
@@ -866,9 +863,8 @@ class FilteredTopKKernelVarlen:
         _step_vec = self.num_threads_per_cta * self.vec_size
         # Byte address of the aligned portion start for this row (score[vec_start]).
         _aligned_base = (score.iterator + vec_start).toint()
-        # TODO: check if we need to use CopyG2ROp here?
         _copy_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
+            cute.nvgpu.CopyG2ROp(invariant=True),
             self.dtype,
             num_bits_per_copy=self.num_copy_bits,
         )
@@ -1121,32 +1117,6 @@ class FilteredTopKKernelVarlen:
                     cute.autovec_copy(topk_indices[None, i], mIndices_store[None, col])
                     if cutlass.const_expr(self.return_val):
                         cute.autovec_copy(topk_vals[None, i], mValues_store[None, col])
-
-    def _get_tiled_copy(self):
-        threads_per_row = self.num_threads_per_cta
-        tiler_mn = (
-            1,
-            self.vec_size * threads_per_row,
-        )
-
-        copy_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyG2ROp(),
-            self.dtype,
-            num_bits_per_copy=self.num_copy_bits,
-        )
-
-        thr_layout = cute.make_ordered_layout(
-            (1, threads_per_row),
-            order=(1, 0),
-        )
-        val_layout = cute.make_layout((1, self.vec_size))
-        tiled_copy = cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
-
-        return (
-            copy_atom,
-            tiled_copy,
-            tiler_mn,
-        )
 
 
 def create_random_logits(

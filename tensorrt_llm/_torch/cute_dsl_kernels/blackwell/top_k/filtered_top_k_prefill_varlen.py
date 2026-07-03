@@ -107,9 +107,6 @@ class FilteredTopKKernelVarlenPrefill(FilteredTopKKernelVarlen):
         extra_buffer: cute.Tensor,
         output_indices: cute.Tensor,
         output_values: cute.Tensor,
-        tiler_mn: cute.Shape,
-        copy_atom: cute.CopyAtom,
-        tiled_copy: cute.TiledCopy,
     ):
         """CuTe DSL top-k kernel for the prefill phase."""
         griddepcontrol_wait()
@@ -181,9 +178,6 @@ class FilteredTopKKernelVarlenPrefill(FilteredTopKKernelVarlen):
             extra_buffer,
             output_indices,
             output_values,
-            tiler_mn,
-            copy_atom,
-            tiled_copy,
             row_start,
             length,
             bidx,
@@ -215,7 +209,6 @@ class FilteredTopKKernelVarlenPrefill(FilteredTopKKernelVarlen):
     ):
         """Host function: launch one CTA per row."""
         num_rows = input_values.shape[0]
-        copy_atom, tiled_copy, tiler_mn = self._get_tiled_copy()
         self.filtered_topk_kernel(
             input_values,
             row_starts,
@@ -223,12 +216,9 @@ class FilteredTopKKernelVarlenPrefill(FilteredTopKKernelVarlen):
             extra_buffer,
             output_indices,
             output_values,
-            tiler_mn,
-            copy_atom,
-            tiled_copy,
         ).launch(
             grid=(num_rows, 1, 1),
-            block=(tiled_copy.size, 1, 1),
+            block=(self.num_threads_per_cta, 1, 1),
             stream=stream,
             use_pdl=TRTLLM_ENABLE_PDL,
             min_blocks_per_mp=min_blocks_per_mp,

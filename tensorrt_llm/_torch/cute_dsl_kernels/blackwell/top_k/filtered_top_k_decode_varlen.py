@@ -239,61 +239,6 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             self.num_copy_bits = min(self.num_copy_bits, _vec_cap * self.dtype.width)
             self.vec_size = self.num_copy_bits // self.dtype.width
 
-    @cute.jit
-    def run_kernel(
-        self,
-        input,
-        indices,
-        extra_buffer,
-        output_indices,
-        output_values,
-        tiler_mn,
-        copy_atom,
-        tiled_copy,
-        seqlen,
-        task_id,
-        s_histogram,
-        s_counter,
-        s_threshold_bin_id,
-        s_num_input,
-        g_num_input,
-        s_indices,
-        s_input_idx,
-        s_last_remain,
-        num_warps,
-        s_warp_sums,
-    ):
-        # TODO: update row_start to align with multi-cta version.
-        row_start = 0
-        seq_len = seqlen[task_id // self.next_n]
-        row_end = seq_len - self.next_n + (task_id % self.next_n) + 1
-
-        length = row_end - row_start
-
-        self.filtered_topk_kernel_per_row(
-            input,
-            indices,
-            extra_buffer,
-            output_indices,
-            output_values,
-            tiler_mn,
-            copy_atom,
-            tiled_copy,
-            row_start,
-            length,
-            task_id,
-            s_histogram,
-            s_counter,
-            s_threshold_bin_id,
-            s_num_input,
-            g_num_input,
-            s_indices,
-            s_input_idx,
-            s_last_remain,
-            num_warps,
-            s_warp_sums,
-        )
-
     @cute.kernel
     def filtered_topk_kernel(
         self,
@@ -304,9 +249,6 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         seqlen: cute.Tensor,
         output_indices: cute.Tensor,
         output_values: cute.Tensor,
-        tiler_mn: cute.Shape,
-        copy_atom: cute.CopyAtom,
-        tiled_copy: cute.TiledCopy,
         enable_persistent_dynamic_scheduling: cutlass.Constexpr[bool] = False,
         min_blocks_per_mp: cutlass.Constexpr[int] = 1,
     ):
@@ -444,9 +386,6 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
                     extra_buffer,
                     output_indices,
                     output_values,
-                    tiler_mn,
-                    copy_atom,
-                    tiled_copy,
                     row_start,
                     length,
                     bidx,
@@ -495,9 +434,6 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
                     extra_buffer,
                     output_indices,
                     output_values,
-                    tiler_mn,
-                    copy_atom,
-                    tiled_copy,
                     row_start,
                     length,
                     task_id,
@@ -541,9 +477,6 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
                         extra_buffer,
                         output_indices,
                         output_values,
-                        tiler_mn,
-                        copy_atom,
-                        tiled_copy,
                         row_start,
                         length,
                         task_id,
@@ -591,11 +524,6 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         else:
             blocks = (min(self.num_sms * min_blocks_per_mp, num_rows), self.num_ctas_per_row, 1)
 
-        (
-            copy_atom,
-            tiled_copy,
-            tiler_mn,
-        ) = self._get_tiled_copy()
         self.filtered_topk_kernel(
             input_values,
             indices,
@@ -604,14 +532,11 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             seqlen,
             output_indices,
             output_values,
-            tiler_mn,
-            copy_atom,
-            tiled_copy,
             enable_persistent_dynamic_scheduling,
             min_blocks_per_mp,
         ).launch(
             grid=blocks,
-            block=(tiled_copy.size, 1, 1),
+            block=(self.num_threads_per_cta, 1, 1),
             stream=stream,
             use_pdl=TRTLLM_ENABLE_PDL,
         )
