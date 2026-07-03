@@ -2355,8 +2355,8 @@ def test_forward_sparse_mla_unified_fused_q_fp8(monkeypatch, batch_name):
     """
     monkeypatch.setenv("TRTLLM_DISABLE_FUSED_Q_FP8_QUANT", "0")
 
-    from tensorrt_llm._torch.modules import attention as attn_mod
-    original_fwd = attn_mod.MLA.forward_context_sparse_mla
+    from tensorrt_llm._torch.modules.mla import MLA
+    original_fwd = MLA.forward_context_sparse_mla
 
     def patched_fwd(self, q, compressed_kv, k_pe, attn_metadata, output,
                     **kwargs):
@@ -2384,7 +2384,7 @@ def test_forward_sparse_mla_unified_fused_q_fp8(monkeypatch, batch_name):
         return original_fwd(self, q, compressed_kv, k_pe, attn_metadata, output,
                             **kwargs)
 
-    monkeypatch.setattr(attn_mod.MLA, 'forward_context_sparse_mla', patched_fwd)
+    monkeypatch.setattr(MLA, 'forward_context_sparse_mla', patched_fwd)
     test_forward_sparse_mla_unified(batch_name=batch_name,
                                     kv_cache_dtype="fp8",
                                     sparse_attn_algo="deepseek_v4")

@@ -211,7 +211,7 @@ def test_deepseek_v4_q_b_layernorm_fused_fp8_returns_3d_q_pe(num_tokens):
     import types
     from types import SimpleNamespace
 
-    from tensorrt_llm._torch.modules.attention import MLA
+    from tensorrt_llm._torch.modules.mla import MLA
 
     num_heads = 16
     qk_head_dim = 512

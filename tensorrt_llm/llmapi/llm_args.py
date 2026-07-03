@@ -818,8 +818,9 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
 
     @model_validator(mode="after")
     def _warn_heuristic_topk_unsupported(self):
-        """Warn (not raise) when GVR Top-K is enabled with an index_topk the
-        kernel cannot accelerate.
+        """Warn when GVR Top-K cannot accelerate the configured index_topk.
+
+        This warning does not reject the configuration.
 
         The C++ ``indexer_topk_decode`` dispatcher silently falls back to the
         radix Top-K path for unsupported K, so without this warning a user may

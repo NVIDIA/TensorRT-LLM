@@ -897,9 +897,7 @@ class MLA(nn.Module):
         assert q_proj.dim() == 2
         assert q_proj.shape[1] == self.num_heads_tp * self.qk_head_dim
         if getattr(self, "_quant_scale_qkv", None) is None:
-            self._quant_scale_qkv = torch.tensor(
-                [1.0], dtype=torch.float32, device=q_proj.device
-            )
+            self._quant_scale_qkv = torch.tensor([1.0], dtype=torch.float32, device=q_proj.device)
         # q_pe is 3D so thop.attention's sparse-MLA context branch passes its
         # q_pe->dim() == 3 check; the kernel op consumes the flat 2D view.
         num_tokens = q_proj.shape[0]
@@ -1516,9 +1514,9 @@ class MLA(nn.Module):
             # would never apply anyway, but assert to make the contract
             # explicit and catch any future config drift).
             if _use_q_b_cute:
-                assert not self._is_fused_q_fp8_quant_enabled(
-                    num_generations=num_generations
-                ), "CuTe DSL q_b_proj path is incompatible with the fused FP8 q-quant branch"
+                assert not self._is_fused_q_fp8_quant_enabled(num_generations=num_generations), (
+                    "CuTe DSL q_b_proj path is incompatible with the fused FP8 q-quant branch"
+                )
                 q_proj = _q_b_proj_cute_dsl_bf16(q, self.q_b_proj.weight)
                 # Cross-iter cleanup: forward_absorption_* downstream gates
                 # the fused-FP8 attention path on these attrs being non-None.
