@@ -31,7 +31,11 @@ from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import AttentionMetadata, FlashInferAttentionMetadata
+from ..attention_backend import (
+    AttentionMetadata,
+    FlashInferAttentionMetadata,
+    TrtllmAttentionMetadata,
+)
 from ..attention_backend.interface import (
     AttentionMask,
     CustomAttentionMask,
@@ -212,6 +216,9 @@ class Gemma4Attention(QKNormRoPEAttention):
             dense_bias=False,
             config=model_config,
             q_scaling=q_scaling,
+            # Gemma4's H512 proportional RoPE pairs dimensions across the
+            # full head, so rotate Q/K at the module layer before fusing QKV.
+            rope_fusion=layer_head_dim <= 256,
         )
 
         # Restore original config head_dim
@@ -260,14 +267,11 @@ class Gemma4Attention(QKNormRoPEAttention):
             # the rotate split, matching HF's rotate_half(head_dim//2) pairing.
             self.rotary_emb.head_dim = layer_head_dim
 
-        # Use trtllm-gen for ALL layers.  trtllm-gen has pre-compiled cubins
-        # for both H256+SWA and H512 across all supported dtypes.
-        # For FP8 KV cache (NVFP4), Q is also cast to FP8 in the FlashInfer
-        # backend so that QkvE4m3OBfloat16 context cubins can be used
-        # (context cubins require same Q/KV dtype; decode cubins support
-        # mixed dtypes natively).  Uniform backend avoids workspace
-        # corruption between different wrapper types under CUDA graphs.
-        self.attn.flashinfer_backend = "trtllm-gen"
+        # When FlashInfer is explicitly selected, keep its trtllm-gen path for
+        # both H256+SWA and H512. The default TRTLLM backend selects phased
+        # trtllm-gen FMHA directly and does not expose this FlashInfer option.
+        if hasattr(self.attn, "flashinfer_backend"):
+            self.attn.flashinfer_backend = "trtllm-gen"
 
         # KV shared layers: use target layer's index for KV cache access
         # so the attention backend reads from the target layer's cache slot.
@@ -370,9 +374,10 @@ class Gemma4Attention(QKNormRoPEAttention):
         **kwargs,
     ) -> torch.Tensor:
         if attention_mask_data is not None:
-            assert isinstance(attn_metadata, FlashInferAttentionMetadata), (
-                "Only FlashInfer backend supports custom attention mask currently."
-            )
+            assert isinstance(
+                attn_metadata,
+                (FlashInferAttentionMetadata, TrtllmAttentionMetadata),
+            ), "Only FlashInfer and TRTLLM backends support custom attention masks."
             assert attention_mask == CustomAttentionMask.CUSTOM
         return super().forward(
             position_ids=position_ids,
@@ -939,12 +944,11 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
     def get_model_defaults(cls, llm_args) -> dict:
         """Gemma4-specific defaults.
 
-        FlashInfer backend is required for hybrid attention (per-layer
-        head_dim 256/512 with VSWA), trtllm-gen cubin dispatch, and
-        bidirectional attention masks for multimodal tokens.
+        The TRTLLM attention backend uses trtllm-gen for the regular attention
+        phases and a Triton context phase for bidirectional multimodal masks.
         """
         return {
-            "attn_backend": "FLASHINFER",
+            "attn_backend": "TRTLLM",
         }
 
     def _get_token_type_mask(self, mm_token_type_ids: torch.Tensor):
@@ -1026,9 +1030,6 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
         effective_sliding_window: Optional[int] = None,
     ) -> torch.Tensor:
         """Build FlashInfer custom mask for context requests."""
-        assert isinstance(attn_metadata, FlashInferAttentionMetadata), (
-            "Only FlashInfer backend supports custom mask currently."
-        )
         num_contexts = attn_metadata.num_contexts
         assert num_contexts > 0
 

@@ -18,6 +18,7 @@ from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .interface import Fmha
 from .phased import FmhaParams, PhasedFmha
 from .registry import DEFAULT_FMHA_LIBS, FMHA_LIBS, FmhaCls, get_enabled_fmha_lib_classes
+from .triton_custom_mask import TritonCustomMaskFmha
 
 __all__ = [
     "DEFAULT_FMHA_LIBS",
@@ -28,5 +29,6 @@ __all__ = [
     "FmhaCls",
     "FmhaParams",
     "PhasedFmha",
+    "TritonCustomMaskFmha",
     "get_enabled_fmha_lib_classes",
 ]

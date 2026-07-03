@@ -54,11 +54,11 @@ from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import SkipSoftma
 from tensorrt_llm._utils import get_sm_version, is_sm_100f, torch_dtype_to_binding
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal import thop
-from tensorrt_llm.functional import AttentionMaskType
+from tensorrt_llm.functional import AttentionMaskType, PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantMode
 
-from .phased import FmhaParams, PhasedFmha
+from .phased import FmhaParams, PhasedFmha, get_trtllm_gen_context_workspace_size
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.trtllm import (
@@ -228,52 +228,6 @@ def _trtllm_gen_batch_context_with_kv_cache(
 
 
 @lru_cache(maxsize=128)
-def _get_context_workspace_layout(
-    dtype: torch.dtype,
-    batch_size: int,
-    num_tokens: int,
-    num_heads: int,
-    head_size: int,
-    rotary_embedding_dim: int,
-    fp8_context_fmha: bool,
-) -> dict[str, int]:
-    return thop.get_trtllm_gen_context_workspace_layout(
-        dtype,
-        batch_size,
-        num_tokens,
-        num_heads,
-        head_size,
-        rotary_embedding_dim,
-        True,
-        fp8_context_fmha,
-    )
-
-
-@lru_cache(maxsize=128)
-def _get_context_workspace_size(
-    dtype: torch.dtype,
-    max_num_seq: int,
-    max_num_tokens: int,
-    num_heads: int,
-    head_size: int,
-    rotary_embedding_dim: int,
-    fp8_context_fmha: bool,
-) -> int:
-    if max_num_tokens == 0:
-        return 0
-    layout = _get_context_workspace_layout(
-        dtype,
-        max_num_seq,
-        max_num_tokens,
-        num_heads,
-        head_size,
-        rotary_embedding_dim,
-        fp8_context_fmha,
-    )
-    return int(layout["total_size"])
-
-
-@lru_cache(maxsize=128)
 def _get_generation_workspace_layout(
     dtype: torch.dtype,
     batch_beam: int,
@@ -332,7 +286,7 @@ def _get_workspace_size(
     rotary_embedding_dim: int,
     fp8_context_fmha: bool,
 ) -> int:
-    context_size = _get_context_workspace_size(
+    context_size = get_trtllm_gen_context_workspace_size(
         dtype,
         max_num_requests,
         num_tokens,
@@ -417,18 +371,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
 
         # Lazily set on the first forward() call from the query device.
         self._multi_processor_count: Optional[int] = None
-
-    def _get_total_num_blocks(self, meta: "TrtllmAttentionMetadata") -> int:
-        kv_cache_manager = meta.kv_cache_manager
-        if kv_cache_manager is not None:
-            get_page_index_upper_bound = getattr(
-                getattr(kv_cache_manager, "impl", None), "get_page_index_upper_bound", None
-            )
-            # KVCacheManagerV2 exposes this implementation-only API and reports an
-            # already-flattened page-index bound, unlike the legacy logical block count.
-            if get_page_index_upper_bound is not None:
-                return int(kv_cache_manager.blocks_in_primary_pool)
-        return super()._get_total_num_blocks(meta)
 
     @classmethod
     def is_available(cls, attn: "TrtllmAttention") -> bool:
@@ -565,13 +507,14 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
 
         return True, ""
 
-    def is_supported(
+    def _is_phase_supported(
         self,
         q: torch.Tensor,
         k: Optional[torch.Tensor],
         v: Optional[torch.Tensor],
         metadata: "TrtllmAttentionMetadata",
         forward_args: AttentionForwardArgs,
+        phase: str,
     ) -> bool:
         supported, reason = self._is_supported_with_reason(
             q,
@@ -582,8 +525,38 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             forward_args,
         )
         if not supported:
-            logger.debug(f"FlashInfer trtllm-gen fmha library does not support {reason}")
+            logger.debug(f"FlashInfer trtllm-gen fmha library does not support {phase}: {reason}")
         return supported
+
+    def is_context_supported(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+    ) -> bool:
+        return self._is_phase_supported(q, k, v, metadata, forward_args, "context")
+
+    def is_generation_supported(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+    ) -> bool:
+        return self._is_phase_supported(q, k, v, metadata, forward_args, "generation")
+
+    def is_mla_generation_supported(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+    ) -> bool:
+        return self._is_phase_supported(q, k, v, metadata, forward_args, "MLA generation")
 
     def _is_supported_with_reason(
         self,
@@ -647,8 +620,35 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         attn_input_type = fwd.attention_input_type
         has_context_phase = attn_input_type != AttentionInputType.generation_only
         has_generation_phase = attn_input_type != AttentionInputType.context_only
+        has_separate_qkv = not fwd.is_fused_qkv and k is not None and v is not None
+        has_q_only = k is None and v is None and q.size(-1) == attn.num_heads * attn.head_dim
+        needs_preprocessed_generation = (
+            has_generation_phase
+            and not is_mla_enable
+            and attn.head_dim > 256
+            and not fwd.is_fused_qkv
+        )
+        has_preprocessed_generation = needs_preprocessed_generation and (
+            has_separate_qkv or has_q_only
+        )
         q_dtype = q.dtype
         o_dtype = output.dtype
+
+        if needs_preprocessed_generation and not has_preprocessed_generation:
+            return (
+                False,
+                "[Generation] Head dimensions above 256 require module-side Q/K/V preprocessing.",
+            )
+        if has_preprocessed_generation:
+            supported, reason = self._check_preprocessed_generation_with_reason(
+                q,
+                k,
+                v,
+                meta,
+                fwd,
+            )
+            if not supported:
+                return False, reason
 
         if q_dtype not in self.SUPPORTED_INPUT_DTYPES:
             return False, f"input dtype {q_dtype}. Supported: FP16, BF16, FP8 (E4M3)."
@@ -687,10 +687,11 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             if attn.head_dim in self.UNSUPPORTED_HEAD_SIZES_CONTEXT:
                 return False, f"[Context] head size {attn.head_dim}."
             try:
-                if AttentionMaskType(fwd.mask_type) == AttentionMaskType.custom_mask:
-                    return False, "[Context] custom mask."
+                mask_type = AttentionMaskType(fwd.mask_type)
             except ValueError:
                 return False, f"[Context] invalid mask_type: {fwd.mask_type}."
+            if mask_type == AttentionMaskType.custom_mask:
+                return False, "[Context] custom mask."
             if has_alibi:
                 return False, "[Context] ALiBi."
             if (q_dtype, kv_cache_dtype, o_dtype) not in self.SUPPORTED_DTYPE_COMBOS_CONTEXT:
@@ -743,6 +744,39 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             supported = sorted(self.SUPPORTED_TOKENS_PER_BLOCK)
             return False, f"tokens_per_block ({tokens_per_block}). Supported: {supported}."
 
+        return True, ""
+
+    def _check_preprocessed_generation_with_reason(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+    ) -> tuple[bool, str]:
+        if metadata.is_cross:
+            return False, "Preprocessed generation does not support cross attention."
+        if metadata.kv_cache_block_offsets is None:
+            return False, "Preprocessed generation requires paged KV cache."
+        has_separate_qkv = not forward_args.is_fused_qkv and k is not None and v is not None
+        has_q_only = (
+            k is None and v is None and q.size(-1) == self.attn.num_heads * self.attn.head_dim
+        )
+        if not has_separate_qkv and not has_q_only:
+            return False, "Preprocessed generation requires separate Q/K/V or Q-only input."
+        if q.dtype not in self.SUPPORTED_INPUT_DTYPES:
+            return False, f"Input dtype {q.dtype} is not supported."
+        output = forward_args.output
+        if output is None or output.dtype != q.dtype:
+            return False, "Preprocessed generation requires output to match the input dtype."
+        if forward_args.output_sf is not None:
+            return False, "Preprocessed generation does not support NVFP4 output."
+        if QuantMode(self.attn.quant_mode).has_kv_cache_quant():
+            return False, "Preprocessed generation does not support quantized KV cache."
+        if forward_args.attention_sinks is not None:
+            return False, "Preprocessed generation does not support attention sinks."
+        if PositionEmbeddingType(self.attn.position_embedding_type).is_rope():
+            return False, "Preprocessed generation requires RoPE before the backend."
         return True, ""
 
     @staticmethod
@@ -1009,10 +1043,299 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             self._multi_processor_count,  # multi_processor_count
         )
 
+    @staticmethod
+    def _split_preprocessed_qkv(
+        params: FmhaParams,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        attn = params.attn
+        if params.qkv_input is None:
+            raise RuntimeError("Preprocessed attention requires Q input.")
+        if params.key_input is None or params.value_input is None:
+            raise RuntimeError("Preprocessed attention requires separate K and V input.")
+        q = params.qkv_input.view(
+            params.num_tokens,
+            attn.num_heads,
+            attn.head_dim,
+        )
+        k = params.key_input.view(
+            params.num_tokens,
+            attn.num_kv_heads,
+            attn.head_dim,
+        )
+        v = params.value_input.view(
+            params.num_tokens,
+            attn.num_kv_heads,
+            attn.head_dim,
+        )
+        return q, k, v
+
+    @staticmethod
+    def _append_preprocessed_kv(
+        params: FmhaParams,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        qo_indptr: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        seq_offset: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int]]:
+        attn = params.attn
+        meta = params.meta
+        if meta.kv_cache_manager is None:
+            raise RuntimeError("Preprocessed attention requires a KV cache manager.")
+
+        num_sequences = qo_indptr.numel() - 1
+        extend_lens = meta.seq_lens[seq_offset : seq_offset + num_sequences].tolist()
+        cached_lens = meta.kv_cache_params.num_cached_tokens_per_seq[
+            seq_offset : seq_offset + num_sequences
+        ]
+        total_lens = [cached + extend for cached, extend in zip(cached_lens, extend_lens)]
+        page_counts = [
+            (total_len + params.tokens_per_block - 1) // params.tokens_per_block
+            for total_len in total_lens
+        ]
+
+        layer_idx = attn.local_layer_idx
+        cache_key = (
+            layer_idx,
+            seq_offset,
+            tuple(total_lens),
+            params.tokens_per_block,
+        )
+        page_metadata_cache = getattr(meta, "_preprocessed_page_metadata", None)
+        if page_metadata_cache is None:
+            page_metadata_cache = {}
+            meta._preprocessed_page_metadata = page_metadata_cache
+        page_metadata = page_metadata_cache.get(cache_key)
+        if page_metadata is None:
+            block_ids_per_seq = meta.kv_cache_manager.get_batch_cache_indices(
+                meta.request_ids[seq_offset : seq_offset + num_sequences],
+                layer_idx=layer_idx,
+            )
+            page_indices = [
+                page_id
+                for block_ids, page_count in zip(block_ids_per_seq, page_counts)
+                for page_id in block_ids[:page_count]
+            ]
+            page_table_indices = torch.tensor(
+                page_indices,
+                dtype=torch.int32,
+                device=q.device,
+            )
+            page_table_indptr = torch.zeros(
+                num_sequences + 1,
+                dtype=torch.int32,
+                device=q.device,
+            )
+            page_table_indptr[1:] = torch.cumsum(
+                torch.tensor(page_counts, dtype=torch.int32, device=q.device),
+                dim=0,
+            )
+            last_page_lens = torch.tensor(
+                [
+                    total_len - (page_count - 1) * params.tokens_per_block
+                    for total_len, page_count in zip(total_lens, page_counts)
+                ],
+                dtype=torch.int32,
+                device=q.device,
+            )
+            batch_indices = torch.repeat_interleave(
+                torch.arange(num_sequences, dtype=torch.int32, device=q.device),
+                qo_indptr[1:] - qo_indptr[:-1],
+            )
+            positions = (
+                torch.arange(params.num_tokens, dtype=torch.int32, device=q.device)
+                - qo_indptr[:-1][batch_indices]
+                + prefix_lens[batch_indices]
+            )
+            page_metadata = (
+                page_table_indptr,
+                page_table_indices,
+                last_page_lens,
+                batch_indices,
+                positions,
+            )
+            page_metadata_cache[cache_key] = page_metadata
+        (
+            page_table_indptr,
+            page_table_indices,
+            last_page_lens,
+            batch_indices,
+            positions,
+        ) = page_metadata
+        kv_cache = meta.kv_cache_manager.get_buffers(layer_idx, kv_layout=meta.kv_layout)
+        flashinfer.page.append_paged_kv_cache(
+            append_key=k,
+            append_value=v,
+            batch_indices=batch_indices,
+            positions=positions,
+            paged_kv_cache=kv_cache,
+            kv_indices=page_table_indices,
+            kv_indptr=page_table_indptr,
+            kv_last_page_len=last_page_lens,
+            kv_layout=meta.kv_layout,
+        )
+        return (
+            kv_cache,
+            page_table_indptr,
+            page_table_indices,
+            last_page_lens,
+            total_lens,
+        )
+
+    @staticmethod
+    def _pad_generation_block_tables(
+        block_tables: torch.Tensor,
+        tokens_per_block: int,
+    ) -> torch.Tensor:
+        pages_per_superblock = 128 // tokens_per_block
+        if pages_per_superblock <= 1:
+            return block_tables
+        remainder = block_tables.size(-1) % pages_per_superblock
+        if remainder == 0:
+            return block_tables
+        return torch.nn.functional.pad(
+            block_tables,
+            (0, pages_per_superblock - remainder),
+            value=0,
+        )
+
+    def _run_preprocessed_generation(self, params: FmhaParams) -> None:
+        attn = params.attn
+        meta = params.meta
+        fwd = params.fwd
+        if params.context_buf is None or params.sequence_lengths is None:
+            raise RuntimeError("Preprocessed generation requires output and sequence lengths.")
+        if meta.kv_cache_manager is None:
+            raise RuntimeError("Preprocessed generation requires a KV cache manager.")
+        if QuantMode(attn.quant_mode).has_kv_cache_quant():
+            raise RuntimeError("Preprocessed generation does not support quantized KV cache.")
+
+        if params.qkv_input is None:
+            raise RuntimeError("Preprocessed generation requires Q input.")
+        q = params.qkv_input.view(
+            params.num_tokens,
+            attn.num_heads,
+            attn.head_dim,
+        )
+        num_sequences = meta.num_generations
+        extend_lens = meta.seq_lens[params.seq_offset : params.seq_offset + num_sequences].tolist()
+        cached_lens = meta.kv_cache_params.num_cached_tokens_per_seq[
+            params.seq_offset : params.seq_offset + num_sequences
+        ]
+        lengths_key = (params.seq_offset, tuple(extend_lens), tuple(cached_lens))
+        lengths_cache = getattr(meta, "_preprocessed_generation_lengths", None)
+        if lengths_cache is None:
+            lengths_cache = {}
+            meta._preprocessed_generation_lengths = lengths_cache
+        length_tensors = lengths_cache.get(lengths_key)
+        if length_tensors is None:
+            qo_indptr = torch.zeros(
+                num_sequences + 1,
+                dtype=torch.int32,
+                device=q.device,
+            )
+            qo_indptr[1:] = torch.cumsum(
+                torch.tensor(extend_lens, dtype=torch.int32, device=q.device),
+                dim=0,
+            )
+            prefix_lens = torch.tensor(
+                cached_lens,
+                dtype=torch.int32,
+                device=q.device,
+            )
+            length_tensors = (qo_indptr, prefix_lens)
+            lengths_cache[lengths_key] = length_tensors
+        qo_indptr, prefix_lens = length_tensors
+        if params.key_input is not None and params.value_input is not None:
+            _, k, v = self._split_preprocessed_qkv(params)
+            self._append_preprocessed_kv(
+                params,
+                q,
+                k,
+                v,
+                qo_indptr,
+                prefix_lens,
+                seq_offset=params.seq_offset,
+            )
+
+        batch_beam = params.num_requests * meta.beam_width
+        kv_metadata = thop.build_trtllm_gen_kv_cache_metadata(
+            meta.host_kv_cache_pool_pointers,
+            meta.host_kv_cache_pool_mapping,
+            meta.kv_cache_block_offsets,
+            attn.local_layer_idx,
+            attn.num_kv_heads,
+            params.tokens_per_block,
+            attn.head_dim,
+            params.kv_factor,
+            params.total_num_blocks,
+            attn.quant_mode,
+            params.seq_offset,
+            batch_beam,
+            q.dtype,
+        )
+        kv_pool = kv_metadata[0]
+        block_tables = self._pad_generation_block_tables(
+            kv_metadata[1],
+            params.tokens_per_block,
+        )
+        kv_scale_pool = kv_metadata[2] if len(kv_metadata) > 2 else None
+
+        fmha_workspace = params.workspace
+        _clear_multi_ctas_kv_counter_workspace(
+            fmha_workspace,
+            attn.num_heads,
+            meta.max_num_requests,
+            self._multi_processor_count,
+        )
+        is_multi_token_gen = any(extend_len != 1 for extend_len in extend_lens)
+        q_len_per_req = None if is_multi_token_gen else params.input_seq_length
+        decode_max_q_len = max(extend_lens) if is_multi_token_gen else None
+        decode_cu_seqlens = qo_indptr if is_multi_token_gen else None
+        window_left = self._compute_window_left(
+            params.cyclic_attention_window_size,
+            params.max_past_kv_length,
+            self._get_attention_chunk_size(attn),
+        )
+
+        _trtllm_gen_batch_decode_with_kv_cache(
+            q,
+            kv_pool,
+            fmha_workspace,
+            block_tables,
+            params.sequence_lengths,
+            params.max_past_kv_length,
+            self._get_bmm1_scale(attn),
+            1.0,
+            window_left,
+            params.context_buf,
+            fwd.attention_sinks,
+            self._enable_pdl,
+            q_len_per_req,
+            decode_max_q_len,
+            decode_cu_seqlens,
+            kv_scale_pool,
+            self.USE_SHARED_PAGED_KV_IDX,
+        )
+
     def run_generation(
         self,
         params: FmhaParams,
     ) -> None:
+        q_only_hidden_size = params.attn.num_heads * params.attn.head_dim
+        uses_preprocessed_qkv = (
+            params.attn.head_dim > 256
+            and params.qkv_input is not None
+            and (
+                (params.key_input is not None and params.value_input is not None)
+                or params.qkv_input.size(-1) == q_only_hidden_size
+            )
+        )
+        if uses_preprocessed_qkv:
+            self._run_preprocessed_generation(params)
+            return
+
         attn = params.attn
         meta = params.meta
         fwd = params.fwd
@@ -1167,14 +1490,10 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             batch_beam,  # batch_size
             params.attention_input.dtype,  # dtype
         )
-
-        pages_per_superblock = 128 // params.tokens_per_block
-        if pages_per_superblock > 1:
-            num_blocks = block_tables.size(-1)
-            remainder = num_blocks % pages_per_superblock
-            if remainder != 0:
-                pad = pages_per_superblock - remainder
-                block_tables = torch.nn.functional.pad(block_tables, (0, pad), value=0)
+        block_tables = self._pad_generation_block_tables(
+            block_tables,
+            params.tokens_per_block,
+        )
 
         kv_lora_rank = attn.kv_lora_rank or 0
         qk_nope_head_dim = attn.qk_nope_head_dim or 0

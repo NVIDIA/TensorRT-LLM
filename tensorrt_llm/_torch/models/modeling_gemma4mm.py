@@ -592,7 +592,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
     def get_model_defaults(cls, llm_args) -> dict:
         """Gemma4-specific defaults — see Gemma4ForCausalLM.get_model_defaults."""
         return {
-            "attn_backend": "FLASHINFER",
+            "attn_backend": "TRTLLM",
         }
 
     def _check_and_adjust_experts_implementation(self, *args, **kwargs):
@@ -726,11 +726,10 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         )
         pretrained_config = getattr(model_config.pretrained_config, name)
         quant_config = model_config.quant_config if name == "text_config" else None
-        preferred_backend = "FLASHINFER" if name == "text_config" else "TRTLLM"
         sub_config: ModelConfig = dataclasses.replace(
             model_config,
             pretrained_config=pretrained_config,
-            attn_backend=preferred_backend,
+            attn_backend="TRTLLM",
             quant_config=quant_config,
         )
         if (
