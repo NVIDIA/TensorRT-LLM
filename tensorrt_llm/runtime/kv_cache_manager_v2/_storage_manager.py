@@ -540,12 +540,15 @@ class StorageManager:
         requirements = filled_list(0, self.num_pool_groups)
         requirements[pg_idx] = len(pages)
         self.prepare_free_slots(host_lvl, requirements)
+        # Pages freshly released by a closing sequence are typically already in
+        # the (otherwise unused) GPU eviction queue; migration requires them
+        # unscheduled.
+        for p in pages:
+            if p.scheduled_for_eviction:
+                self.exclude_from_eviction(p)
         self._batched_migrate(pg_idx, host_lvl, GPU_LEVEL, pages, update_src=True)
         for p in pages:
-            # _batched_migrate re-schedules pages that were already queued for
-            # eviction at the source level; only schedule the rest.
-            if not p.scheduled_for_eviction:
-                self.schedule_for_eviction(p)
+            self.schedule_for_eviction(p)
 
     def write_through_pages(self, pg_idx: PoolGroupIndex, pages: Sequence[Page]) -> list[Slot]:
         """Write-through on commit (§4.3): copy committed (immutable) GPU
@@ -613,6 +616,8 @@ class StorageManager:
         migration_recorder: MigrationRecorder | None = None,
     ) -> None:
         if level == GPU_LEVEL and self.is_arena_mode:
+            if not any(requirements):
+                return  # nothing requested; keep zero-requirement callers working
             raise LogicError(
                 "GPU-level slot eviction is retired in arena mode; capacity is "
                 "physical pages (§4.6) and reclaim is per-sequence (§4.2)"

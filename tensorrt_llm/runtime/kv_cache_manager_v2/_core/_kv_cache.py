@@ -62,7 +62,7 @@ from .._page import (
     batched_lock_to_gpu,
 )
 from .._stats import KVCacheIterationStatsDelta, KVCacheStatsDelta
-from .._storage._core import Slot
+from .._storage._core import PoolGroupIndex, SequenceRange, Slot
 from .._storage_manager import StorageManager
 from .._utils import (
     CachedCudaEvent,
@@ -197,6 +197,8 @@ class _KVCache:
         "_enable_swa_scratch_reuse",
         "_scratch_slots",
         "_pending_stats",
+        "_max_capacity",
+        "_arena_ranges",
         "__rawref__",
     )
 
@@ -245,6 +247,12 @@ class _KVCache:
     # only the additional needed slots are allocated. Freed on teardown/suspend.
     _scratch_slots: TypedIndexList[LifeCycleId, list[ScratchSlotLock]]
     _pending_stats: _PendingStats
+    # Contiguous-arena mode (DESIGN.md §4.1): the request's capacity ceiling in
+    # tokens (sizes the VA reservation) and, while active, one contiguous
+    # block-index range per pool group. None outside arena mode / while no
+    # ranges are held.
+    _max_capacity: int | None
+    _arena_ranges: TypedIndexList[PoolGroupIndex, SequenceRange] | None
 
     def __init__(
         self,
@@ -254,6 +262,7 @@ class _KVCache:
         id: int | None,
         custom_priority_callback: Callable[[BlockOrdinal, LifeCycle], Priority],
         expected_prompt_length: int | None = None,
+        max_capacity: int | None = None,
     ):
         self.id = id
         self._manager = manager
@@ -288,6 +297,17 @@ class _KVCache:
             lambda _: list[ScratchSlotLock](), manager._storage.num_life_cycles
         )
         self._pending_stats = _PendingStats()
+        self._max_capacity = max_capacity
+        self._arena_ranges = None
+        if manager._storage.is_arena_mode:
+            if max_capacity is None or max_capacity <= 0:
+                raise ValueError(
+                    "contiguous-arena mode requires a positive max_capacity to size the "
+                    "sequence's VA reservation (DESIGN.md §4.1)"
+                )
+            assert reuse_match is None, (
+                "reuse onboarding is not wired up in arena mode yet (DESIGN.md §4.4)"
+            )
         self.__rawref__ = rawref.NULL
         if reuse_match is not None:
             self._setup_for_reuse(reuse_match)
@@ -500,8 +520,49 @@ class _KVCache:
             manager._avg_sqr_history_length.update(self._avg_history_length.value**2)
             manager._num_sampled_kv_caches += 1
             manager._try_update_target_ratios()
+        arena_ranges = self._arena_ranges
+        arena_offload: TypedIndexList[PoolGroupIndex, list[CommittedPage]] | None = None
+        if arena_ranges is not None:
+            # Collect this sequence's committed GPU pages before the block
+            # chain is cleared; they move to the host tier (active->stale
+            # copy-on-free, DESIGN.md §4.3) so the arena range can be
+            # reclaimed. In arena mode GPU pages are never shared across
+            # sequences (reuse copies, §4.4), so they are ours to move.
+            storage = manager._storage
+            arena_offload = make_typed(lambda _: list[CommittedPage](), storage.num_pool_groups)
+            for block in self._blocks:
+                if not block.is_committed:
+                    continue
+                for beam_pages in block.pages:
+                    for p in beam_pages:
+                        if p is None:
+                            continue
+                        page = p.page
+                        if isinstance(page, CommittedPage) and page.cache_level == GPU_LEVEL:
+                            pg_idx = storage.get_pool_group_index(page.life_cycle)
+                            arena_offload[pg_idx].append(page)
         with self._record_event():
             self._clear_blocks()
+        if arena_ranges is not None:
+            storage = manager._storage
+            assert arena_offload is not None
+            for pg_idx, pages in typed_enumerate(arena_offload):
+                try:
+                    storage.offload_arena_pages(pg_idx, pages)
+                except OutOfPagesError:
+                    # Host tier cannot take the write-out: drop the blocks
+                    # instead of keeping them (reuse loss only, never an
+                    # error on the free path).
+                    for page in pages:
+                        if page.scheduled_for_eviction:
+                            storage.exclude_from_eviction(page)
+            arena_offload = None  # drop our strong refs before range release
+            last_consumer = (
+                self._finish_event if self._finish_event is not None else CachedCudaEvent.NULL
+            )
+            for pg_idx, rng in typed_enumerate(arena_ranges):
+                storage.free_gpu_sequence(pg_idx, rng, last_consumer)
+            self._arena_ranges = None
         self._status = self.Status.CLOSED
         manager._living_kv_caches.remove(self.__rawref__)
 
@@ -624,6 +685,27 @@ class _KVCache:
             case PageIndexMode.SHARED:
                 return not self.has_scratch_slots
 
+    def _arena_ensure_mapped(self, num_valid_blocks: int) -> bool:
+        """Demand-map physical pages covering the first ``num_valid_blocks`` of
+        this sequence's range in every pool group (DESIGN.md §4.2). On page
+        exhaustion, drains deferred reclaim and retries once; returns False if
+        pages are still unavailable — the caller backs off exactly like a
+        failed slot allocation (§4.6)."""
+        storage = self._storage
+        ranges = self._arena_ranges
+        assert ranges is not None
+        for pg_idx, rng in typed_enumerate(ranges):
+            try:
+                storage.ensure_gpu_mapped(pg_idx, rng, num_valid_blocks)
+            except OutOfPagesError:
+                if storage.drain_gpu_reclaim() == 0:
+                    return False
+                try:
+                    storage.ensure_gpu_mapped(pg_idx, rng, num_valid_blocks)
+                except OutOfPagesError:
+                    return False
+        return True
+
     # reserve space for next inference. Request new blocks from KVCacheManager if necessary.
     # if capacity is increased and beam_width > 1, blocks containing new tokens should be allocated for each beam.
     # Decrease of capacity may destroy stale blocks (if not used by other requests).
@@ -651,6 +733,12 @@ class _KVCache:
             raise ValueError("History length cannot be decreased")
         if capacity < history_length:
             raise ValueError("History length cannot be greater than capacity")
+        if self._arena_ranges is not None and capacity > unwrap_optional(self._max_capacity):
+            raise ValueError(
+                f"capacity ({capacity}) exceeds the max_capacity "
+                f"({self._max_capacity}) declared at creation (contiguous-arena mode, "
+                f"DESIGN.md §4.1)"
+            )
         manager = self.manager
         # Scratch reuse: compute scratch ranges and slot delta
         enable_scratch = self.enable_swa_scratch_reuse
@@ -729,7 +817,21 @@ class _KVCache:
                 lambda lc: num_new_slots[lc] + delta_scratch_slots[lc], num_life_cycles
             )
             storage = self._storage
-            if any(c > 0 for c in net_alloc_counts):
+            arena_ranges = self._arena_ranges
+            if arena_ranges is not None:
+                # Arena growth (DESIGN.md §4.2): no scattered slot allocation.
+                # Demand-map physical pages covering the new block frontier in
+                # every pool group; block-index slots are issued per ordinal in
+                # the construction loop below.
+                assert self.beam_width == 1
+                if new_num_blocks > old_num_blocks and not self._arena_ensure_mapped(
+                    int(new_num_blocks)
+                ):
+                    self._recover_excess_scratch_slots(excess_scratch_slots)
+                    self._lock_held_blocks(backup_holders)
+                    return False
+                new_slots = make_typed(lambda _: list[Slot](), num_life_cycles)
+            elif any(c > 0 for c in net_alloc_counts):
                 try:
                     new_slots = storage.new_gpu_slots(
                         make_typed(lambda lc: max(0, net_alloc_counts[lc]), num_life_cycles),
@@ -764,7 +866,7 @@ class _KVCache:
                             slot.ready_event = self.finish_event
                             storage.release_slot(lc, GPU_LEVEL, slot)
 
-            assert all(
+            assert arena_ranges is not None or all(
                 len(slots[lc]) == num_new_slots[lc] + max(0, delta_scratch_slots[lc])
                 for lc in typed_range(num_life_cycles)
             )
@@ -816,7 +918,15 @@ class _KVCache:
                             stale_beg, stale_end = stale_ranges[lc]
                             if stale_beg <= ordinal < stale_end:
                                 continue
-                        slot = slots[lc].pop()
+                        if arena_ranges is not None:
+                            # slot_id = range base + ordinal: the sequence's
+                            # blocks are consecutive in VA (DESIGN.md §4.1).
+                            pg_idx = storage.get_pool_group_index(lc)
+                            slot = storage.take_gpu_sequence_slot(
+                                pg_idx, arena_ranges[pg_idx], int(ordinal)
+                            )
+                        else:
+                            slot = slots[lc].pop()
                         # We have already waited for ready_event of the slots.
                         block[beam_index][lc] = UncommittedPage(
                             self, ordinal, lc, GPU_LEVEL, slot, beam_index
@@ -934,6 +1044,12 @@ class _KVCache:
     # suspend+resume allows us to implement dynamic batch size. May also be used to support HSTU model.
     def suspend(self) -> None:
         assert self.status == self.Status.ACTIVE
+        if self._arena_ranges is not None:
+            # Requires the §4.5 write-out/range-release path; until then a
+            # sequence can only leave the arena via close().
+            raise LogicError(
+                "suspend/resume is not wired up in contiguous-arena mode yet (DESIGN.md §4.5)"
+            )
         assert self._check_sanity()
         assert self._finish_event is None
         for beam_idx, beam_indices in typed_enumerate(self._base_page_indices):
@@ -967,6 +1083,28 @@ class _KVCache:
         assert self._cuda_stream is not None, "cuda_stream is never set"
         assert self._finish_event is None
         storage = self._storage
+        if storage.is_arena_mode and self._arena_ranges is None:
+            # Reserve this sequence's contiguous block-index range in every
+            # pool group, sized for max_capacity (DESIGN.md §4.1). Pure VA
+            # bookkeeping; pages are mapped on demand by resize().
+            assert self._never_resumed, (
+                "resume after suspend is not wired up in arena mode yet (§4.5)"
+            )
+            max_capacity = self._max_capacity
+            assert max_capacity is not None
+            max_blocks = div_up(max_capacity, self.tokens_per_block)
+            ranges = list[SequenceRange]()
+            try:
+                for pg_idx in typed_range(storage.num_pool_groups):
+                    ranges.append(storage.reserve_gpu_sequence(pg_idx, max_blocks))
+            except MemoryError:
+                # VA exhaustion / fragmentation: back off like any other
+                # resource shortage. Nothing was mapped; undo the bookkeeping.
+                for pg_idx, rng in typed_enumerate(cast(TypedIndexList, ranges)):
+                    storage.free_gpu_sequence(pg_idx, rng, CachedCudaEvent.NULL)
+                storage.drain_gpu_reclaim()
+                return False
+            self._arena_ranges = cast(TypedIndexList, ranges)
         ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
         life_cycles = self.manager._life_cycles
         num_life_cycles = life_cycles.size

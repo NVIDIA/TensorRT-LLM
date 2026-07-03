@@ -384,12 +384,16 @@ class KVCacheManager:
         custom_priority_callback: Callable[[BlockOrdinal, LifeCycle], Priority] = lambda _,
         __: PRIORITY_DEFAULT,
         expected_prompt_length: int | None = None,
+        max_capacity: int | None = None,
     ) -> _KVCache:
         """
         reuse_scope: namespace to match before matching any tokens.
         custom_priority_callback: takes block index and layer sliding window size, returns priority.
         If priority returned is higher than existing priority for reused blocks, the block priority is updated.
         expected_prompt_length: optional prompt length hint used to size SWA scratch slots.
+        max_capacity: upper bound on this request's capacity, in tokens. Required in
+        contiguous-arena mode, where it sizes the sequence's VA reservation
+        (DESIGN.md §4.1); resize() beyond it fails. Ignored otherwise.
         Newly created KV cache is suspended. You need to call resume() with a cuda stream to make it active
         & ready in that stream.
         Returns None if suspended=False and we don't have enough resource.
@@ -400,9 +404,11 @@ class KVCacheManager:
         if reuse_scope is None:
             reuse_scope = ReuseScope()
         assert type(reuse_scope) is ReuseScope
-        reuse_match = (
-            self._match_reuse(reuse_scope, input_tokens) if input_tokens is not None else None
-        )
+        # Arena mode P0: reuse onboarding (stale->active copy into the arena,
+        # DESIGN.md §4.4) is not wired up yet, so skip matching rather than
+        # locking radix pages in place.
+        match_allowed = input_tokens is not None and not self._storage.is_arena_mode
+        reuse_match = self._match_reuse(reuse_scope, input_tokens) if match_allowed else None
         if expected_prompt_length is None and input_tokens is not None:
             expected_prompt_length = len(input_tokens)
         return _KVCache(
@@ -412,6 +418,7 @@ class KVCacheManager:
             id,
             custom_priority_callback,
             expected_prompt_length,
+            max_capacity,
         )
 
     def _match_reuse(
@@ -543,7 +550,16 @@ class KVCacheManager:
         same tokens and reuse that block instead to save some memory. Intra-batch reuse will be enabled
         if this is True.
         """
-        return True
+        # Arena mode P0: rebasing locks another sequence's pages in place, which
+        # conflicts with per-sequence contiguous ranges until the stale->active
+        # copy path (DESIGN.md §4.4) lands.
+        return not self._storage.is_arena_mode
+
+    def drain_gpu_reclaim(self) -> int:
+        """Arena mode (DESIGN.md §4.2): unmap and recycle freed sequence ranges
+        whose gating events completed. Call at iteration boundaries. Returns
+        the number of ranges reclaimed."""
+        return self._storage.drain_gpu_reclaim()
 
     @property
     def enable_partial_match(self) -> bool:

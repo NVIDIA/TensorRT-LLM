@@ -40,9 +40,11 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         AttentionLayerConfig,
         BufferConfig,
         ContiguousArenaConfig,
+        CudaStream,
         DataRole,
         GpuCacheTierConfig,
         HostCacheTierConfig,
+        KVCacheManager,
         KVCacheManagerConfig,
         WriteThroughPolicy,
         rawref,
@@ -68,15 +70,17 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         PoolIndex,
     )
     from kv_cache_manager_v2._storage_manager import StorageManager, _coalesce_copy_tasks
-    from kv_cache_manager_v2._utils import CachedCudaEvent, init_cuda_once
+    from kv_cache_manager_v2._utils import CachedCudaEvent, TemporaryCudaStream, init_cuda_once
 else:
     from tensorrt_llm.runtime.kv_cache_manager_v2 import (
         AttentionLayerConfig,
         BufferConfig,
         ContiguousArenaConfig,
+        CudaStream,
         DataRole,
         GpuCacheTierConfig,
         HostCacheTierConfig,
+        KVCacheManager,
         KVCacheManagerConfig,
         WriteThroughPolicy,
         rawref,
@@ -116,7 +120,11 @@ else:
         StorageManager,
         _coalesce_copy_tasks,
     )
-    from tensorrt_llm.runtime.kv_cache_manager_v2._utils import CachedCudaEvent, init_cuda_once
+    from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
+        CachedCudaEvent,
+        TemporaryCudaStream,
+        init_cuda_once,
+    )
 
 MiB = 1 << 20
 requires_cuda = unittest.skipUnless(_CUDA_AVAILABLE, "requires CUDA")
@@ -855,6 +863,120 @@ class TestStorageManagerArenaMode(unittest.TestCase):
         storage.release_slot(self.LC0, GPU_LEVEL, page)
         storage.free_gpu_sequence(self.PG0, rng, CachedCudaEvent.NULL)
         self.assertEqual(storage.drain_gpu_reclaim(), 1)
+
+
+@requires_cuda
+class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
+    """The `_KVCache` growth seam (DESIGN.md §5, `_core/_kv_cache.py` row).
+
+    Covers create -> resume (VA reserve) -> resize growth (demand map +
+    consecutive slots) -> commit -> close (copy-on-free write-out +
+    deferred reclaim).
+    """
+
+    TPB = 16  # tokens per block
+
+    def setUp(self) -> None:
+        init_cuda_once()
+        cfg = _make_manager_config(gpu_quota=32 * MiB, host_quota=32 * MiB)
+        cfg.contiguous_arena = ContiguousArenaConfig(map_ahead_pages=0)
+        self.manager = KVCacheManager(cfg)
+
+    def tearDown(self) -> None:
+        self.manager.shutdown()
+        del self.manager
+
+    def test_grow_commit_close_roundtrip(self) -> None:
+        manager = self.manager
+        budget = manager._storage.gpu_page_budget
+        kv = manager.create_kv_cache(max_capacity=8 * self.TPB)
+        with TemporaryCudaStream([]) as s:
+            stream = CudaStream(s.handle)
+            self.assertTrue(kv.resume(stream))
+            self.assertEqual(budget.used_pages, 0)  # VA reserve maps nothing
+            self.assertTrue(kv.resize(4 * self.TPB))
+            self.assertGreater(budget.used_pages, 0)
+            # the sequence's kernel-visible page indices are consecutive
+            indices = list(kv.get_base_page_indices(LifeCycleId(0)))
+            self.assertEqual(indices, list(range(indices[0], indices[0] + 4)))
+            # growth extends the same run
+            self.assertTrue(kv.resize(6 * self.TPB))
+            indices = list(kv.get_base_page_indices(LifeCycleId(0)))
+            self.assertEqual(indices, list(range(indices[0], indices[0] + 6)))
+            kv.commit([100 + i for i in range(4 * self.TPB)])
+            kv.close()
+        s.take_finish_event().synchronize()
+        # copy-on-free write-out finished -> the range is reclaimable
+        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        self.assertEqual(budget.used_pages, 0)
+        # the 4 committed blocks live on in the host tier
+        host_stats = manager._storage.get_statistics(CacheLevel(1))[0]
+        self.assertEqual(host_stats.total - host_stats.free, 4)
+
+    def test_max_capacity_required_and_enforced(self) -> None:
+        manager = self.manager
+        with self.assertRaises(ValueError):
+            manager.create_kv_cache()  # arena mode requires max_capacity
+        kv = manager.create_kv_cache(max_capacity=2 * self.TPB)
+        with TemporaryCudaStream([]) as s:
+            stream = CudaStream(s.handle)
+            self.assertTrue(kv.resume(stream))
+            self.assertTrue(kv.resize(2 * self.TPB))
+            with self.assertRaises(ValueError):
+                kv.resize(3 * self.TPB)  # beyond the VA reservation
+            kv.close()
+        s.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim()
+
+    def test_growth_backs_off_on_page_exhaustion(self) -> None:
+        manager = self.manager
+        # 16 budget pages; 1 block = 32 KiB -> 64 blocks per 2 MiB page.
+        kv1 = manager.create_kv_cache(max_capacity=1024 * self.TPB)
+        kv2 = manager.create_kv_cache(max_capacity=512 * self.TPB)
+        with TemporaryCudaStream([]) as s:
+            stream = CudaStream(s.handle)
+            self.assertTrue(kv1.resume(stream))
+            self.assertTrue(kv2.resume(stream))
+            self.assertTrue(kv1.resize(1024 * self.TPB))  # takes all 16 pages
+            self.assertFalse(kv2.resize(512 * self.TPB))  # backs off, no crash
+            kv1.close()
+            # kv1's range reclaim is gated on its finish event; once complete,
+            # kv2's next growth attempt drains it and succeeds.
+            torch.cuda.synchronize()
+            self.assertTrue(kv2.resize(512 * self.TPB))
+            kv2.close()
+        s.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim()
+
+    def test_reuse_matching_disabled(self) -> None:
+        manager = self.manager
+        tokens = [200 + i for i in range(2 * self.TPB)]
+        kv1 = manager.create_kv_cache(input_tokens=tokens, max_capacity=4 * self.TPB)
+        with TemporaryCudaStream([]) as s:
+            stream = CudaStream(s.handle)
+            self.assertTrue(kv1.resume(stream))
+            self.assertTrue(kv1.resize(2 * self.TPB))
+            kv1.commit(tokens)
+            kv1.close()
+        s.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim()
+        # the blocks are in the radix tree (host), but arena-mode creation
+        # skips matching until §4.4 onboarding lands
+        kv2 = manager.create_kv_cache(input_tokens=tokens, max_capacity=4 * self.TPB)
+        self.assertEqual(kv2.history_length, 0)
+        kv2.close()
+
+    def test_suspend_not_supported_yet(self) -> None:
+        manager = self.manager
+        kv = manager.create_kv_cache(max_capacity=2 * self.TPB)
+        with TemporaryCudaStream([]) as s:
+            stream = CudaStream(s.handle)
+            self.assertTrue(kv.resume(stream))
+            with self.assertRaises(LogicError):
+                kv.suspend()
+            kv.close()
+        s.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim()
 
 
 if __name__ == "__main__":
