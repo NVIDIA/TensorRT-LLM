@@ -2706,6 +2706,91 @@ class TestScratchReuse(TestKVCacheManagerV2):
         kv.close()
         self.manager.clear_reusable_blocks()
 
+    def test_reuse_across_prefill_turns_keeps_only_window_minus_one(self) -> None:
+        """SWA scratch reuse preserves winSize-1 history tokens across prefill turns.
+
+        Two prefill turns, window=64, tokens_per_block=32, scratch reuse ON,
+        commit_min_snapshot OFF:
+
+        Turn 1 commits a 127-token prompt (= 2*window - 1). With scratch reuse the
+        out-of-window input blocks share scratch slots, so after the turn the only
+        preserved KV data is the last winSize-1 = 63 tokens (blocks 2 and 3,
+        positions 64..126). Blocks 0 and 1 (positions 0..63) keep no page.
+
+        Turn 2's prompt shares those first 127 tokens. It must still reuse the whole
+        127-token committed prefix: for reuse at token 127, the first input token
+        (position 127) is itself in the window, so only winSize-1 = 63 history tokens
+        are required, and those are exactly the preserved blocks 2 and 3. The
+        out-of-window blocks 0 and 1 are not needed even though they hold no page.
+        """
+        tokens_per_block = 32
+        window_size = 64
+        self._prepare_scratch(
+            num_layers=1,
+            window_size=window_size,
+            tokens_per_block=tokens_per_block,
+            gpu_quota=64 << 20,
+        )
+        swa_lc_id = next(
+            lc_id
+            for lc_id, lc in self.manager._life_cycles.attention_life_cycles()
+            if lc.window_size is not None
+        )
+
+        prompt1 = [TokenId(i) for i in range(2 * window_size - 1)]  # 127 tokens
+        prompt2 = [TokenId(i) for i in range(200)]  # first 127 tokens identical to prompt1
+
+        # ---- Turn 1: prefill + commit 127 tokens with scratch reuse, then close. ----
+        with TemporaryCudaStream([]) as s:
+            stream = cast(CudaStream, s.handle)
+            kv1 = self.manager.create_kv_cache()
+            self.assertTrue(kv1.resume(stream))
+            # resize(capacity, history_length): scratch reuse forbids the capacity setter.
+            self.assertTrue(kv1.resize(len(prompt1), 0))
+            self.assertTrue(kv1.has_scratch_slots)
+            self.engine.execute([Step(kv1, prompt1, [])], stream)
+            kv1.commit(prompt1)
+            self.assertEqual(kv1.num_committed_tokens, len(prompt1))
+            kv1.close()  # close() -> stop_committing() commits the partial tail block.
+        s.take_finish_event().synchronize()
+
+        # Turn 1 kept KV data only for the last winSize-1 = 63 tokens (blocks 2 and 3).
+        # match() is documented volatile, so read what we need and drop the reference before
+        # mutating the tree again (holding live Block refs across a later clear would leave the
+        # eviction accounting inconsistent).
+        match1 = self.manager._radix_tree.match(ReuseScope(), prompt1)
+        self.assertEqual(match1.num_tokens, len(prompt1))
+        self.assertEqual(len(match1.blocks), 4)
+        has_page = [b.storage[swa_lc_id] is not None for b in match1.blocks]
+        del match1
+        self.assertEqual(
+            has_page,
+            [False, False, True, True],  # positions 0..63 out of window; 64..126 in window
+        )
+
+        # Turn 2 reuses the full 127-token committed prefix despite blocks 0,1 lacking pages.
+        self.assertEqual(self.manager.probe_reuse(input_tokens=prompt2), len(prompt1))
+
+        # ---- Turn 2: reuse, prefill the rest, and validate the reused KV data. ----
+        with TemporaryCudaStream([]) as s:
+            stream = cast(CudaStream, s.handle)
+            kv2 = self.manager.create_kv_cache(input_tokens=prompt2)
+            num_reused = kv2.num_committed_tokens
+            self.assertEqual(num_reused, len(prompt1))
+            self.assertTrue(kv2.resume(stream))
+            self.assertTrue(kv2.resize(len(prompt2), num_reused))
+            history = list(prompt2[:num_reused])
+            inp = list(prompt2[num_reused:])
+            # engine.execute checks the reused history KV against expected values, so a
+            # successful run proves the reused blocks 2,3 hold correct (not scratch) data.
+            self.engine.execute([Step(kv2, inp, history)], stream)
+            kv2.commit(inp)
+            kv2.stop_committing()
+            self.engine.execute([Step(kv2, [], list(prompt2))], stream)
+            kv2.close()
+        s.take_finish_event().synchronize()
+        self.manager.clear_reusable_blocks()
+
 
 class TestSlotAllocatorShrink(unittest.TestCase):
     def test_shrink_underused_pool(self) -> None:
