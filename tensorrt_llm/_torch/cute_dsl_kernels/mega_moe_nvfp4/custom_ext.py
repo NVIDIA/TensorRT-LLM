@@ -39,13 +39,9 @@ class SwapABSwigluFp4Fc12WorkTileInfo(MoEWorkTileInfo):
         cumulative_data_physical_row: Int32,
         cumulative_sf_physical_row: Int32,
         cumulative_token_block_count: Int32,
-        valid_tokens_in_tile: Int32,
+        valid_tokens_in_cta_tile: Int32,
         phase_and_peek: Int32,
-        # Transient scheduler field — carried through MLIR serialization but
-        # NOT written to SMEM.  Default: tile_n_idx (correct for swap-AB).
-        fc1_counter_index: Int32,
     ):
-        # Slot 3 reuses base k_tile_cnt storage.
         super().__init__(
             expert_idx,
             tile_m_idx,
@@ -55,13 +51,12 @@ class SwapABSwigluFp4Fc12WorkTileInfo(MoEWorkTileInfo):
         self.cumulative_data_physical_row = self.k_tile_cnt
         self.cumulative_sf_physical_row = cumulative_sf_physical_row
         self.cumulative_token_block_count = cumulative_token_block_count
-        self.valid_tokens_in_tile = valid_tokens_in_tile
+        self.valid_tokens_in_cta_tile = valid_tokens_in_cta_tile
         # Slot 7 is the packed (BlockPhase | (peek_ready << 16)) field.
         # The ``.phase`` and ``.peek_ready`` properties below unpack it;
         # consumers call them directly so the codebase reads as if the
         # two pieces were separate fields.
         self.phase_and_peek = phase_and_peek
-        self.fc1_counter_index = fc1_counter_index
 
     @property
     def phase(self) -> Int32:
@@ -87,15 +82,14 @@ class SwapABSwigluFp4Fc12WorkTileInfo(MoEWorkTileInfo):
         values = super().__extract_mlir_values__()
         values.extend(extract_mlir_values(self.cumulative_sf_physical_row))
         values.extend(extract_mlir_values(self.cumulative_token_block_count))
-        values.extend(extract_mlir_values(self.valid_tokens_in_tile))
+        values.extend(extract_mlir_values(self.valid_tokens_in_cta_tile))
         values.extend(extract_mlir_values(self.phase_and_peek))
-        values.extend(extract_mlir_values(self.fc1_counter_index))
         return values
 
     def __new_from_mlir_values__(
             self, values: List[ir.Value]) -> "SwapABSwigluFp4Fc12WorkTileInfo":
-        assert len(values) == 9
-        return SwapABSwigluFp4Fc12WorkTileInfo(
+        assert len(values) == 8
+        return type(self)(
             expert_idx=new_from_mlir_values(self.expert_idx, [values[0]]),
             tile_m_idx=new_from_mlir_values(self.tile_m_idx, [values[1]]),
             tile_n_idx=new_from_mlir_values(self.tile_n_idx, [values[2]]),
@@ -105,12 +99,10 @@ class SwapABSwigluFp4Fc12WorkTileInfo(MoEWorkTileInfo):
                 self.cumulative_sf_physical_row, [values[4]]),
             cumulative_token_block_count=new_from_mlir_values(
                 self.cumulative_token_block_count, [values[5]]),
-            valid_tokens_in_tile=new_from_mlir_values(self.valid_tokens_in_tile,
-                                                      [values[6]]),
+            valid_tokens_in_cta_tile=new_from_mlir_values(
+                self.valid_tokens_in_cta_tile, [values[6]]),
             phase_and_peek=new_from_mlir_values(self.phase_and_peek,
                                                 [values[7]]),
-            fc1_counter_index=new_from_mlir_values(self.fc1_counter_index,
-                                                   [values[8]]),
         )
 
     def to_rmem(self) -> cute.Tensor:
@@ -121,7 +113,7 @@ class SwapABSwigluFp4Fc12WorkTileInfo(MoEWorkTileInfo):
         rmem[3] = self.k_tile_cnt  # = cumulative_data_physical_row
         rmem[4] = self.cumulative_sf_physical_row
         rmem[5] = self.cumulative_token_block_count
-        rmem[6] = self.valid_tokens_in_tile
+        rmem[6] = self.valid_tokens_in_cta_tile
         rmem[7] = self.phase_and_peek
         return rmem
 
@@ -134,9 +126,131 @@ class SwapABSwigluFp4Fc12WorkTileInfo(MoEWorkTileInfo):
             cumulative_data_physical_row=rmem[3],  # type: ignore[arg-type]
             cumulative_sf_physical_row=rmem[4],  # type: ignore[arg-type]
             cumulative_token_block_count=rmem[5],  # type: ignore[arg-type]
-            valid_tokens_in_tile=rmem[6],  # type: ignore[arg-type]
+            valid_tokens_in_cta_tile=rmem[6],  # type: ignore[arg-type]
             phase_and_peek=rmem[7],  # type: ignore[arg-type]
-            fc1_counter_index=rmem[2],  # type: ignore[arg-type]
+        )
+
+
+# =============================================================================
+# MXFP8 WorkTileInfo (non-swapAB)
+# =============================================================================
+
+
+class GluMxFp8WorkTileInfo(MoEWorkTileInfo):
+    """WorkTileInfo for the MXFP8 non-swapAB kernel.
+
+    Inherits directly from ``MoEWorkTileInfo`` (not from the swap-AB subclass)
+    because the MXFP8 field layout is distinct: slot 6 holds
+    ``valid_tokens_in_cta_cluster_tile`` — a packed Int32 (high 16 bits =
+    per-CTA tile count, low 16 bits = cluster-level count).
+
+    Class-level constant ``_cluster_m`` must be set by
+    ``GluMxFp8Fc12SchedExtension.__init__`` before JIT compilation.
+    """
+
+    TotalFields = 8
+    _cluster_m: int = 1
+
+    def __init__(
+        self,
+        expert_idx: Int32,
+        tile_m_idx: Int32,
+        tile_n_idx: Int32,
+        cumulative_data_physical_row: Int32,
+        cumulative_sf_physical_row: Int32,
+        cumulative_token_block_count: Int32,
+        # Packed token counts: high 16 bits = per-CTA valid_tokens_in_cta_tile,
+        #                      low  16 bits = valid_tokens_in_cluster_tile.
+        valid_tokens_in_cta_cluster_tile: Int32,
+        phase_and_peek: Int32,
+        # Transient scheduler field — carried through MLIR but NOT written to SMEM.
+        # fc1_counter_index: cluster_token_block_idx (intra-expert cluster token-block index).
+        fc1_counter_index: Int32,
+    ):
+        super().__init__(expert_idx, tile_m_idx, tile_n_idx,
+                         cumulative_data_physical_row)
+        self.cumulative_data_physical_row = self.k_tile_cnt
+        self.cumulative_sf_physical_row = cumulative_sf_physical_row
+        self.cumulative_token_block_count = cumulative_token_block_count
+        self.valid_tokens_in_cta_cluster_tile = valid_tokens_in_cta_cluster_tile
+        self.phase_and_peek = phase_and_peek
+        self.fc1_counter_index = fc1_counter_index
+
+    @property
+    def phase(self) -> Int32:
+        return self.phase_and_peek & Int32(PhaseMask)
+
+    @property
+    def peek_ready(self):
+        return ((self.phase_and_peek >> Int32(PhaseBits))
+                & Int32(1)) != Int32(0)
+
+    @property
+    def valid_tokens_in_cta_tile(self) -> Int32:
+        return self.valid_tokens_in_cta_cluster_tile >> Int32(16)
+
+    @property
+    def valid_tokens_in_cluster_tile(self) -> Int32:
+        return self.valid_tokens_in_cta_cluster_tile & Int32(0xFFFF)
+
+    def __extract_mlir_values__(self) -> List[ir.Value]:
+        values = super().__extract_mlir_values__()  # [0..3]
+        values.extend(extract_mlir_values(
+            self.cumulative_sf_physical_row))  # [4]
+        values.extend(extract_mlir_values(
+            self.cumulative_token_block_count))  # [5]
+        values.extend(extract_mlir_values(
+            self.valid_tokens_in_cta_cluster_tile))  # [6]
+        values.extend(extract_mlir_values(self.phase_and_peek))  # [7]
+        values.extend(extract_mlir_values(self.fc1_counter_index))  # [8]
+        return values
+
+    def __new_from_mlir_values__(
+            self, values: List[ir.Value]) -> "GluMxFp8WorkTileInfo":
+        assert len(values) == 9
+        return type(self)(
+            expert_idx=new_from_mlir_values(self.expert_idx, [values[0]]),
+            tile_m_idx=new_from_mlir_values(self.tile_m_idx, [values[1]]),
+            tile_n_idx=new_from_mlir_values(self.tile_n_idx, [values[2]]),
+            cumulative_data_physical_row=new_from_mlir_values(
+                self.cumulative_data_physical_row, [values[3]]),
+            cumulative_sf_physical_row=new_from_mlir_values(
+                self.cumulative_sf_physical_row, [values[4]]),
+            cumulative_token_block_count=new_from_mlir_values(
+                self.cumulative_token_block_count, [values[5]]),
+            valid_tokens_in_cta_cluster_tile=new_from_mlir_values(
+                self.valid_tokens_in_cta_cluster_tile, [values[6]]),
+            phase_and_peek=new_from_mlir_values(self.phase_and_peek,
+                                                [values[7]]),
+            fc1_counter_index=new_from_mlir_values(self.fc1_counter_index,
+                                                   [values[8]]),
+        )
+
+    def to_rmem(self) -> cute.Tensor:
+        rmem = cute.make_rmem_tensor((self.TotalFields, ), cutlass.Int32)
+        rmem[0] = self.expert_idx
+        rmem[1] = self.tile_m_idx
+        rmem[2] = self.tile_n_idx
+        rmem[3] = self.k_tile_cnt  # = cumulative_data_physical_row
+        rmem[4] = self.cumulative_sf_physical_row
+        rmem[5] = self.cumulative_token_block_count
+        rmem[6] = self.valid_tokens_in_cta_cluster_tile
+        rmem[7] = self.phase_and_peek
+        return rmem
+
+    @classmethod
+    def from_rmem(cls, rmem: cute.Tensor) -> "GluMxFp8WorkTileInfo":
+        return cls(
+            expert_idx=rmem[0],  # type: ignore[arg-type]
+            tile_m_idx=rmem[1],  # type: ignore[arg-type]
+            tile_n_idx=rmem[2],  # type: ignore[arg-type]
+            cumulative_data_physical_row=rmem[3],  # type: ignore[arg-type]
+            cumulative_sf_physical_row=rmem[4],  # type: ignore[arg-type]
+            cumulative_token_block_count=rmem[5],  # type: ignore[arg-type]
+            valid_tokens_in_cta_cluster_tile=rmem[6],  # type: ignore[arg-type]
+            phase_and_peek=rmem[7],  # type: ignore[arg-type]
+            fc1_counter_index=rmem[1] //
+            cutlass.Int32(cls._cluster_m),  # type: ignore[arg-type]
         )
 
 
@@ -170,7 +284,7 @@ class SwapABSwigluFp4Fc12SchedExtension(MoESchedExtension):
         # shows enough arrivals.  Mirrors ``fc1_done_counter_ptr`` for the
         # fc1->fc2 link: this side is "fc1 input ready", that side is
         # "fc1 output done".  The threshold per-tile is the tile's
-        # ``valid_tokens_in_tile`` (dispatch does not pull padding
+        # ``valid_tokens_in_cta_tile`` (dispatch does not pull padding
         # tokens), read straight off the base work tile -- no separate
         # threshold field needed.  ``None`` in the lean fc1+fc2 path keeps
         # ``enrich_work_tile_info`` to its existing fc2-only peek shape and
@@ -246,7 +360,7 @@ class SwapABSwigluFp4Fc12SchedExtension(MoESchedExtension):
           ``cumulative_token_block_count + tile_n_idx`` against
           ``self.fc2_spin_threshold`` (work-tile-invariant const).
         - fc1 tiles peek the dispatch->fc1 ``fc1_ready_counter`` at the
-          same slot index but with ``valid_tokens_in_tile`` as threshold
+          same slot index (``tile_n_idx``) but with ``valid_tokens_in_cta_tile`` as threshold
           (per-tile dynamic).  This branch only emits when
           ``self.fc1_ready_counter_ptr is not None`` (MegaMoE mode).
         """
@@ -257,24 +371,23 @@ class SwapABSwigluFp4Fc12SchedExtension(MoESchedExtension):
         if is_valid:
             # Same slot index for both phases -- fc1 release-add (dispatch
             # pull) and fc2 release-add (fc1 epi) target the per-task-tile
-            # counter slot indexed by ``cumulative_token_block_count +
-            # fc1_counter_index``.
+            # counter slot indexed by ``cumulative_token_block_count + tile_n_idx``.
             counter_slot = (base_work.cumulative_token_block_count +
-                            base_work.fc1_counter_index)
+                            base_work.tile_n_idx)
             is_fc1 = base_work.phase == Int32(int(BlockPhase.Linear1))
             is_fc2 = base_work.phase == Int32(int(BlockPhase.Linear2))
 
             # MegaMoE-only: fc1 phase peek on fc1_ready_counter.  Threshold
             # is dynamic (per-tile valid count) because dispatch does not
             # pull padding tokens, so the counter's terminal value matches
-            # the tile's valid_tokens_in_tile (cluster_tile_m for full
+            # the tile's valid_tokens_in_cta_tile (cluster_tile_m for full
             # tiles, less for an expert's last partial tile).
             if cutlass.const_expr(self.fc1_ready_counter_ptr is not None):
                 if is_fc1:
                     counter_ptr = self.fc1_ready_counter_ptr + counter_slot
                     peek_ready = spin_wait(
                         counter_ptr,
-                        lambda v: v >= base_work.valid_tokens_in_tile,
+                        lambda v: v >= base_work.valid_tokens_in_cta_tile,
                         peek_only=True,
                     )
                     peek_bit = Int32(0)
@@ -309,9 +422,8 @@ class SwapABSwigluFp4Fc12SchedExtension(MoESchedExtension):
             cumulative_data_physical_row=base_work.cumulative_data_physical_row,
             cumulative_sf_physical_row=base_work.cumulative_sf_physical_row,
             cumulative_token_block_count=base_work.cumulative_token_block_count,
-            valid_tokens_in_tile=base_work.valid_tokens_in_tile,
+            valid_tokens_in_cta_tile=base_work.valid_tokens_in_cta_tile,
             phase_and_peek=new_phase_and_peek,
-            fc1_counter_index=base_work.fc1_counter_index,
         )
 
     # --------------------------------------------------------------
@@ -425,12 +537,15 @@ class GluMxFp8Fc12SchedExtension(SwapABSwigluFp4Fc12SchedExtension):
     """Sched extension for the fused fc1+fc2 GLU MXFP8 kernel.
     """
 
+    WorkTileInfo = GluMxFp8WorkTileInfo
+
     def __init__(
         self,
         sf_vec_size: int,
         fc1_done_counter_ptr: Pointer,
         fc2_spin_threshold: Union[int, Int32],
         fc1_ready_counter_ptr: Optional[Pointer] = None,
+        cluster_m: int = 1,
     ):
         super().__init__(
             sf_vec_size=sf_vec_size,
@@ -438,6 +553,8 @@ class GluMxFp8Fc12SchedExtension(SwapABSwigluFp4Fc12SchedExtension):
             fc2_spin_threshold=fc2_spin_threshold,
             fc1_ready_counter_ptr=fc1_ready_counter_ptr,
         )
+        self.cluster_m = cluster_m
+        GluMxFp8WorkTileInfo._cluster_m = cluster_m
 
     def __new_from_mlir_values__(
             self, values: List[ir.Value]) -> "GluMxFp8Fc12SchedExtension":
@@ -448,16 +565,79 @@ class GluMxFp8Fc12SchedExtension(SwapABSwigluFp4Fc12SchedExtension):
         result.fc1_done_counter_ptr = base.fc1_done_counter_ptr
         result.fc2_spin_threshold = base.fc2_spin_threshold
         result.fc1_ready_counter_ptr = base.fc1_ready_counter_ptr
+        result.cluster_m = self.cluster_m
         return result
 
     @cute.jit
     def enrich_work_tile_info(
         self,
-        base_work: SwapABSwigluFp4Fc12WorkTileInfo,
-    ) -> SwapABSwigluFp4Fc12WorkTileInfo:
-        """Delegate to base; defined here so ``ext`` keeps one MLIR struct across warps."""
-        return SwapABSwigluFp4Fc12SchedExtension.enrich_work_tile_info(
-            self, base_work)
+        base_work: GluMxFp8WorkTileInfo,
+    ) -> GluMxFp8WorkTileInfo:
+        """MXFP8 (non-swapAB) override: use cluster-level slot for FC1 arrival counter.
+
+        The swap-AB extension uses ``tile_n_idx`` directly for the
+        dispatch->fc1 ready-counter slot.  For NVFP4 swap-AB that is correct
+        because N is the token direction.  For MXFP8 non-swap-AB, M is the
+        token direction, so the FC1 peek must index by
+        ``cumulative_token_block_count + tile_m_idx // cluster_m``
+        to match the cluster-granular slot that dispatch_pull increments.
+
+        The scheduler packs per-CTA and cluster-level token counts into
+        ``valid_tokens_in_cta_cluster_tile``; this function passes it through
+        unchanged and uses the ``valid_tokens_in_cluster_tile`` property for the
+        FC1 peek threshold.
+        """
+        is_valid = base_work.is_valid_tile
+        new_phase_and_peek = base_work.phase_and_peek
+
+        if is_valid:
+            is_fc1 = base_work.phase == Int32(int(BlockPhase.Linear1))
+            is_fc2 = base_work.phase == Int32(int(BlockPhase.Linear2))
+
+            # FC1 arrival peek: cluster-granular slot = cumul + tile_m_idx // cluster_m.
+            if cutlass.const_expr(self.fc1_ready_counter_ptr is not None):
+                if is_fc1:
+                    fc1_counter_slot = (
+                        base_work.cumulative_token_block_count +
+                        base_work.tile_m_idx // Int32(self.cluster_m))
+                    counter_ptr = self.fc1_ready_counter_ptr + fc1_counter_slot
+                    peek_ready = spin_wait(
+                        counter_ptr,
+                        lambda v: v >= base_work.valid_tokens_in_cluster_tile,
+                        peek_only=True,
+                    )
+                    peek_bit = Int32(0)
+                    if peek_ready:
+                        peek_bit = Int32(PeekReadyBit)
+                    new_phase_and_peek = base_work.phase_and_peek | peek_bit
+
+            # FC2 peek: MXFP8 TMA-A always spins (peek_ready never checked)
+            if is_fc2:
+                fc2_counter_slot = (base_work.cumulative_token_block_count +
+                                    base_work.fc1_counter_index)
+                counter_ptr = self.fc1_done_counter_ptr + fc2_counter_slot
+                peek_ready = spin_wait(
+                    counter_ptr,
+                    lambda v: v >= self.fc2_spin_threshold,
+                    peek_only=True,
+                )
+                peek_bit = Int32(0)
+                if peek_ready:
+                    peek_bit = Int32(PeekReadyBit)
+                new_phase_and_peek = base_work.phase_and_peek | peek_bit
+
+        return GluMxFp8WorkTileInfo(
+            expert_idx=base_work.expert_idx,
+            tile_m_idx=base_work.tile_m_idx,
+            tile_n_idx=base_work.tile_n_idx,
+            cumulative_data_physical_row=base_work.cumulative_data_physical_row,
+            cumulative_sf_physical_row=base_work.cumulative_sf_physical_row,
+            cumulative_token_block_count=base_work.cumulative_token_block_count,
+            valid_tokens_in_cta_cluster_tile=base_work.
+            valid_tokens_in_cta_cluster_tile,
+            phase_and_peek=new_phase_and_peek,
+            fc1_counter_index=base_work.fc1_counter_index,
+        )
 
     @cute.jit
     def prefetch_for_expert(self, expert_idx: Int32) -> None:

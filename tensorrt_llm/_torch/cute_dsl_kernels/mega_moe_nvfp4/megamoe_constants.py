@@ -1,21 +1,30 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Shared constants for the fused fc1+fc2 MegaMoE path.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+"""Shared constants for the fused fc1+fc2 MegaMoE path."""
 
-Deliberately cutlass-free (a TRT-LLM-local trim of the upstream
-``common/megamoe_constants.py``): the package ``__init__`` imports these for
-capability probing on non-SM100 / no-cutlass-dsl hosts, so this module must NOT
-``from cutlass...`` import. Only the constants actually consumed by the ported
-kernel package are kept; the cutlass-typed ``Log2E`` / ``Fp32Max`` upstream
-constants are unused here (the kernels inline their own ``cutlass.Float32``).
-"""
+from cutlass.cutlass_dsl import Float32
+
+Log2E = Float32(1.4426950408889634)
+Fp32Max = Float32(3.40282346638528859812e38)
 
 Nvfp4BlockSize = 16
+Mxfp8BlockSize = 32
 SfPaddingBlock = 128
 TmaLeadingDimByteAlign = 16
 
 Nvfp4E2M1Max = 6.0
 Fp8E4M3FNMax = 448.0
+Fp8E5M2Max = 57344.0
+
+Nvfp4E2M1RcpLimit = 1.0 / Nvfp4E2M1Max
+Fp8E4M3RcpLimit = 1.0 / Fp8E4M3FNMax
+Fp8E5M2RcpLimit = 1.0 / Fp8E5M2Max
+
+Nvfp4E2M1RcpLimit = 1.0 / Nvfp4E2M1Max
+Fp8E4M3RcpLimit = 1.0 / Fp8E4M3FNMax
+Fp8E5M2RcpLimit = 1.0 / Fp8E5M2Max
 
 SupportedMmaTileM = (128, 256)
 SupportedMmaTileN = (64, 128, 256)

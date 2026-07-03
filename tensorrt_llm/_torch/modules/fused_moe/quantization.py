@@ -3312,6 +3312,27 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         if self.need_load_shared_weights(module):
             self._register_mega_shared_staging(module)
 
+        # ---- Release the now-dead source NVFP4 routed weights ----
+        # ``run_moe`` reads only ``mega_fc1/fc2_weight(_sf)``; the source
+        # ``w3_w1_weight`` / ``w2_weight`` (+ block scales) were fully consumed
+        # by ``_build_mega_format_weights`` above and are never read at runtime.
+        # Free them -- EXCEPT under dynamic EPLB (``need_load_shared_weights``),
+        # which re-reads the source to rebuild mega buffers. Freeing goes through
+        # ``replace_parameter_and_save_metadata`` so ``pre_reload_weights`` can
+        # restore the original shape on a later reload.
+        if not self.need_load_shared_weights(module):
+            for _name in ("w3_w1_weight", "w3_w1_weight_scale", "w2_weight",
+                          "w2_weight_scale"):
+                _p = getattr(module, _name, None)
+                if _p is not None and _p.data.numel() > 0:
+                    replace_parameter_and_save_metadata(
+                        module, _name,
+                        nn.Parameter(torch.empty(0,
+                                                 dtype=_p.data.dtype,
+                                                 device=_p.data.device),
+                                     requires_grad=False),
+                        module.rebuild_tensor_metadata)
+
     @staticmethod
     def _build_fc1_norm_const_tensor(raw_input_scales: Dict,
                                      expert_ids: List[int],

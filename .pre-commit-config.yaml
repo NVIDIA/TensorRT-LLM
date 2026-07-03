@@ -304,6 +304,7 @@ common-files: &common_files |
         tensorrt_llm/_torch/cute_dsl_kernels/blackwell/utils.py |
         tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/__init__.py |
         tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/blocked_scale.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/common_moe_utils.py |
         tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/contract.py |
         tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/custom_ext.py |
         tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/dynamic_mainloop.py |
@@ -1679,6 +1680,7 @@ legacy-files: &legacy_files |
         tensorrt_llm/_torch/cute_dsl_kernels/blackwell/utils.py |
         tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/__init__.py |
         tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/blocked_scale.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/common_moe_utils.py |
         tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/contract.py |
         tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/custom_ext.py |
         tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/dynamic_mainloop.py |
@@ -2835,7 +2837,7 @@ repos:
         additional_dependencies:
         - tomli
         # add ignore words list
-        args: ["-L", "Mor,ans,thirdparty,subtiles,PARD,pard,indx,therefrom", "--skip", "ATTRIBUTIONS-*.md,*.svg", "--skip", "security_scanning/*", "--skip", "tensorrt_llm/_torch/visual_gen/jit_kernels/*"]
+        args: ["-L", "Mor,ans,thirdparty,subtiles,PARD,pard,indx,therefrom", "--skip", "ATTRIBUTIONS-*.md,*.svg", "--skip", "security_scanning/*", "--skip", "tensorrt_llm/_torch/visual_gen/jit_kernels/*", "--skip", "tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/*"]
         exclude: 'scripts/attribution/data/cas/.*$'
 -   repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.9.4

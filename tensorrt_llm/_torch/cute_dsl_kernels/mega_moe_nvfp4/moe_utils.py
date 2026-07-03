@@ -89,7 +89,8 @@ def spin_wait(
     ip: Optional[ir.InsertionPoint] = None,
 ) -> Boolean:
     """Spin until condition is true, or do one condition check with peek_only."""
-    current = cute.arch.load(ptr, ptr.dtype, cop="cg", loc=loc, ip=ip)
+    # The first load must be acquire to build the mem order.
+    current = cute.arch.load(ptr, ptr.dtype, sem="acquire", scope="gpu")
     if cutlass.const_expr(peek_only):
         # One-shot peek: forward the condition Boolean to the caller.
         return Boolean(condition(current))
@@ -97,7 +98,7 @@ def spin_wait(
         # Load with L1 cache bypass (ld.global.cg)
         if cutlass.const_expr(fail_sleep_cycles > 0):
             _nanosleep(fail_sleep_cycles, loc=loc, ip=ip)
-        current = cute.arch.load(ptr, ptr.dtype, cop="cg", loc=loc, ip=ip)
+        current = cute.arch.load(ptr, ptr.dtype, sem="acquire", scope="gpu")
     # Spin-path: condition was satisfied; uniformize return type with the
     # peek path so callers always see a Boolean.
     return Boolean(True)

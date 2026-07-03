@@ -10,15 +10,9 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 
-# Keep these as separate handlers (NOT a tuple `except (A, B)`): CuteDSL's
-# preprocessor import-walker (cutlass-dsl 4.5.0) raises AttributeError on
-# tuple except types, which silently disables AST preprocessing for this
-# module and breaks dynamic `if` control flow in the kernel.
 try:
     from cutlass.cute import iket  # type: ignore
-except ImportError:  # pragma: no cover
-    from .iket_compat import iket
-except NotImplementedError:  # pragma: no cover
+except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
     from .iket_compat import iket
 
 import cutlass.pipeline as pipeline
@@ -30,11 +24,12 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from . import dynamic_mainloop
 from .custom_ext import SwapABSwigluFp4Fc12SchedExtension
-from .epilogue_refactor import NvFp4OptionalEpiArgs, SwapABSwigluFp4Epilogue
+from .epilogue_refactor import NvFp4OptinalEpiArgs, SwapABSwigluFp4Epilogue
 from .fc1_fc2_fuse_sched import BlockPhase, MoEFusedFc12SchedulerParams
 from .megamoe_constants import (Nvfp4BlockSize, SupportedMmaTileM,
                                 SupportedMmaTileN)
 from .moe_utils import spin_wait
+from .token_comm import CombineFormat
 
 # token_comm_args is an opaque subclass-owned bundle.  The base only forwards it
 # to hook methods; ``None`` keeps the lean fc1+fc2 path free of token-comm IR.
@@ -172,6 +167,34 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         self.smem_capacity = utils.get_smem_capacity_in_bytes(self.arch)
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(self.arch)
 
+    def name(self) -> str:
+        """Canonical encoding of the codegen-affecting constexpr -- the compiled-
+        kernel cache key. ``local_rank`` excluded (deployment detail); only
+        ``force_static_sched`` / ``clc_bundle_size`` / ``num_sched_stages`` /
+        ``scenario`` are dropped -- every other constexpr is kept."""
+        m, n, k = self.mma_tiler_mnk
+        cm, cn = self.cluster_shape_mn
+        exp = "x".join(map(
+            str,
+            self.static_expert_shape)) if self.static_expert_shape else "dyn"
+        epiflag = "x".join(map(
+            str, self.epi_flag_batch)) if self.epi_flag_batch else "none"
+        cta = "2_cta" if self.use_2cta_instrs else "1_cta"
+        fc2store = "fc2store_stg" if self.non_ubulk_fc2_store else "fc2store_ublk"
+        inkred = "inkernel_redg" if self.in_kernel_fc2_reduce else "no_inkernel_redg"
+        apply_topk = "apply_topk_fc1_pre_quant" if self.apply_topk_in_fc1 else "apply_topk_after_fc2"
+        # token-back is a token-communication concept -- it lives in the MegaMoE
+        # subclass name(), not the lean base.
+        return (
+            "moe_fc12_fuse_nvfp4"
+            f"_mmatiler_{m}x{n}x{k}_cluster_{cm}x{cn}_{cta}_sched_{self.load_balance_mode}"
+            f"_expert_shape_{exp}_grouphint_{self.group_hint}"
+            f"_padding_{self.token_padding_block}x{self.sf_padding_block}"
+            f"_{fc2store}_{inkred}_{apply_topk}"
+            f"_fc2out{self.fc2_output_dtype.__name__}_sfvec{self.sf_vec_size}"
+            f"_acc{self.acc_dtype.__name__}_clamp{self.gate_up_clamp}_epiflag{epiflag}"
+        )
+
     def _validate_mma_tiler_and_cluster_shape(self) -> None:
         """Validate user-provided geometry against v1 fused-fc12 constraints.
 
@@ -207,9 +230,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                 f"cluster_shape M ({cm}) must be even when use_2cta_instrs=True"
             )
 
-        def is_pow2(x):
-            return x > 0 and (x & (x - 1)) == 0
-
+        is_pow2 = lambda x: x > 0 and (x & (x - 1)) == 0
         if cm * cn > 16 or not is_pow2(cm) or not is_pow2(
                 cn) or cm > 4 or cn > 4:
             raise ValueError(
@@ -318,13 +339,19 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         # dtype that lives in sC).  fc2 output dtype is hard-coded as
         # ``BFloat16`` inside the epilogue's ``Fc2UnpackPermuteStg`` and
         # does not flow through this knob.
+        # combine_format is comm-side state: the MegaMoE subclass injects
+        # ``self.combine_format`` before super().__init__, so it is already on
+        # ``self`` here; the standalone base defaults to the bf16 (no-quant)
+        # combine. Only hooks / token_comm_args otherwise cross into this base.
+        if not hasattr(self, "combine_format"):
+            self.combine_format = CombineFormat.parse("bf16")
         self.epilogue = SwapABSwigluFp4Epilogue(
             mma_tiler_mnk=self.mma_tiler,
             cluster_shape_mn=self.cluster_shape_mn,
             use_2cta_instrs=self.use_2cta_instrs,
             sf_vec_size=self.sf_vec_size,
             fc1_output_dtype=self.fc1_output_dtype,
-            fc2_output_dtype=self.fc2_output_dtype,
+            combine_format=self.combine_format,
             non_ubulk_fc2_store=self.non_ubulk_fc2_store,
             in_kernel_fc2_reduce=self.in_kernel_fc2_reduce,
             token_back_by_dispatch=self.token_back_by_dispatch,
@@ -358,6 +385,13 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             self.num_sched_stages,
             self._smem_misc_budget_bytes(),
         )
+        # print(
+        #     f"[fc12 stages] num_ab_stage={self.num_ab_stage} "
+        #     f"num_acc_stage={self.num_acc_stage} "
+        #     f"misc_budget={self._smem_misc_budget_bytes()} "
+        #     f"c_bytes_total={c_bytes_total} smem_cap={self.smem_capacity} "
+        #     f"token_back_standalone={self.token_back_standalone}"
+        # )
 
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
             tiled_mma,
@@ -588,7 +622,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         """Emitted on the TMA-B warp at the head of each fc1-phase task tile,
         before its K-loop.  Default: no-op.  MegaMoE: blocking spin on the
         dispatch->fc1 release counter at ``cumulative_token_block_count +
-        tile_n_idx`` until it reaches ``work_tile_info.valid_tokens_in_tile``,
+        tile_n_idx`` until it reaches ``work_tile_info.valid_tokens_in_cta_tile``,
         unless ``work_tile_info.peek_ready`` already saturated it.  Skipping
         this in the lean path is correct because in the lean path the
         per-tile input is already resident in GMEM at launch time."""
@@ -754,13 +788,20 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         c1 = cutlass.Int32(1)
         cutlass.Int32(0)
 
+        def round_up(value, multiple):
+            return ((value + multiple - 1) // multiple) * multiple
+
+        def is_constexpr_int(*values) -> bool:
+            return all(isinstance(value, int) for value in values)
+
         # A_gemm (fc1 weights): (experts, hidden, intermediate_gateup)
         # -> (M=intermediate_gateup, K=hidden, L=experts).
         experts, hidden_b, intermediate_gateup = fc1_weight.shape
         fc1_weight_gemm = cute.make_tensor(
             fc1_weight.iterator,
             cute.make_layout(
-                (intermediate_gateup, hidden_b, experts),
+                (cutlass.Int32(intermediate_gateup), cutlass.Int32(hidden_b),
+                 cutlass.Int32(experts)),
                 stride=(fc1_weight.stride[2], fc1_weight.stride[1],
                         fc1_weight.stride[0]),
             ),
@@ -771,7 +812,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         activation_gemm = cute.make_tensor(
             activation.iterator,
             cute.make_layout(
-                (tokens_sum, hidden, 1),
+                (tokens_sum, cutlass.Int32(hidden), c1),
                 stride=(activation.stride[0], activation.stride[1], 0),
             ),
         )
@@ -781,7 +822,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         fc1_output_gemm = cute.make_tensor(
             fc1_output.iterator,
             cute.make_layout(
-                (tokens_sum, intermediate_downproj, 1),
+                (tokens_sum, cutlass.Int32(intermediate_downproj), c1),
                 stride=(fc1_output.stride[0], fc1_output.stride[1], 0),
             ),
         )
@@ -794,16 +835,30 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         activation_sf_gemm = cute.make_tensor(
             activation_sf.iterator,
             blockscaled_utils.tile_atom_to_shape_SF(
-                (tokens_sum_padded, hidden_padded, 1), self.sf_vec_size),
+                (tokens_sum_padded, cutlass.Int32(hidden_padded), c1),
+                self.sf_vec_size),
         )
-        intermediate_gateup_padded_mul_hidden_padded = fc1_weight_sf.shape[1]
-        intermediate_gateup_padded = (
-            intermediate_gateup_padded_mul_hidden_padded *
-            self.sf_vec_size) // hidden_padded
+        intermediate_gateup_padded = round_up(
+            intermediate_gateup,
+            self.sf_vec_size * 4,
+        )
+        expected_fc1_weight_sf_cols = (intermediate_gateup_padded *
+                                       hidden_padded // self.sf_vec_size)
+        if cutlass.const_expr(
+                is_constexpr_int(fc1_weight_sf.shape[1],
+                                 expected_fc1_weight_sf_cols)):
+            if cutlass.const_expr(
+                    fc1_weight_sf.shape[1] != expected_fc1_weight_sf_cols):
+                raise ValueError(
+                    f"fc1_weight_sf.shape[1] ({fc1_weight_sf.shape[1]}) does not "
+                    f"match intermediate_padded({intermediate_gateup_padded}) * "
+                    f"hidden_padded({hidden_padded}) / sf_vec_size({self.sf_vec_size}) "
+                    f"= {expected_fc1_weight_sf_cols}.")
         fc1_weight_sf_gemm = cute.make_tensor(
             fc1_weight_sf.iterator,
             blockscaled_utils.tile_atom_to_shape_SF(
-                (intermediate_gateup_padded, hidden_padded, experts),
+                (cutlass.Int32(intermediate_gateup_padded),
+                 cutlass.Int32(hidden_padded), cutlass.Int32(experts)),
                 self.sf_vec_size,
             ),
         )
@@ -818,7 +873,9 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         fc2_weight_gemm = cute.make_tensor(
             fc2_weight.iterator,
             cute.make_layout(
-                (hidden_b2, intermediate_downproj_b2, experts2),
+                (cutlass.Int32(hidden_b2),
+                 cutlass.Int32(intermediate_downproj_b2),
+                 cutlass.Int32(experts2)),
                 stride=(fc2_weight.stride[2], fc2_weight.stride[1],
                         fc2_weight.stride[0]),
             ),
@@ -844,18 +901,36 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         fc1_output_sf_gemm_for_fc2_load = cute.make_tensor(
             fc1_output_sf.iterator,
             blockscaled_utils.tile_atom_to_shape_SF(
-                (tokens_sum_padded_sf, intermediate_downproj_padded, 1),
+                (tokens_sum_padded_sf,
+                 cutlass.Int32(intermediate_downproj_padded), c1),
                 self.sf_vec_size,
             ),
         )
-        hidden_padded_fc2_mul_intermediate_downproj_padded = fc2_weight_sf.shape[
-            1]
-        hidden_padded_fc2 = (hidden_padded_fc2_mul_intermediate_downproj_padded
-                             * self.sf_vec_size) // intermediate_downproj_padded
+        hidden_padded_fc2 = round_up(hidden_b2, 128)
+        intermediate_downproj_padded = round_up(
+            intermediate_downproj_b2,
+            self.sf_vec_size * 4,
+        )
+        expected_fc2_weight_sf_cols = (hidden_padded_fc2 *
+                                       intermediate_downproj_padded //
+                                       self.sf_vec_size)
+        if cutlass.const_expr(
+                is_constexpr_int(fc2_weight_sf.shape[1],
+                                 expected_fc2_weight_sf_cols)):
+            if cutlass.const_expr(
+                    fc2_weight_sf.shape[1] != expected_fc2_weight_sf_cols):
+                raise ValueError(
+                    f"fc2_weight_sf.shape[1] ({fc2_weight_sf.shape[1]}) does not "
+                    f"match hidden_padded({hidden_padded_fc2}) * "
+                    f"intermediate_padded({intermediate_downproj_padded}) / "
+                    f"sf_vec_size({self.sf_vec_size}) = {expected_fc2_weight_sf_cols}."
+                )
         fc2_weight_sf_gemm = cute.make_tensor(
             fc2_weight_sf.iterator,
             blockscaled_utils.tile_atom_to_shape_SF(
-                (hidden_padded_fc2, intermediate_downproj_padded, experts2),
+                (cutlass.Int32(hidden_padded_fc2),
+                 cutlass.Int32(intermediate_downproj_padded),
+                 cutlass.Int32(experts2)),
                 self.sf_vec_size,
             ),
         )
@@ -926,7 +1001,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             self.mma_tiler,
             tiled_mma,
             self.cluster_layout_vmnk.shape,
-            internal_type=cutlass.Uint64,
+            internal_type=cutlass.Uint16,
         )
 
         # TMA load SFB1 (= activation_sf, fc1 activation SFs)
@@ -941,7 +1016,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             self.mma_tiler_sfb,
             tiled_mma_sfb,
             self.cluster_layout_sfb_vmnk.shape,
-            internal_type=cutlass.Uint64,
+            internal_type=cutlass.Uint16,
         )
 
         # TMA store for fc1 NVFP4 output (via SMEM-staged bulk store).
@@ -999,7 +1074,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             self.mma_tiler,
             tiled_mma,
             self.cluster_layout_vmnk.shape,
-            internal_type=cutlass.Uint64,
+            internal_type=cutlass.Uint16,
         )
         tma_atom_fc1_output_sf_as_fc2_input, tma_tensor_fc1_output_sf_as_fc2_input = cute.nvgpu.make_tiled_tma_atom_B(
             sfb_op,
@@ -1008,7 +1083,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             self.mma_tiler_sfb,
             tiled_mma_sfb,
             self.cluster_layout_sfb_vmnk.shape,
-            internal_type=cutlass.Uint64,
+            internal_type=cutlass.Uint16,
         )
 
         # ── Scheduler params + grid + launch ──
@@ -1750,7 +1825,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                         if not is_leader_cta:
                             load_shift = dynamic_mainloop.compute_non_leader_cta_load_shift(
                                 valid_tokens_in_tile=work_tile_info.
-                                valid_tokens_in_tile,
+                                valid_tokens_in_cta_tile,
                                 mma_tiler_n=self.mma_tiler[1],
                             )
                             real_b = cute.domain_offset((load_shift, 0, 0),
@@ -1876,7 +1951,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                         if not is_leader_cta:
                             load_shift = dynamic_mainloop.compute_non_leader_cta_load_shift(
                                 valid_tokens_in_tile=work_tile_info.
-                                valid_tokens_in_tile,
+                                valid_tokens_in_cta_tile,
                                 mma_tiler_n=self.mma_tiler[1],
                             )
                             real_b = cute.domain_offset((load_shift, 0, 0),
@@ -2092,7 +2167,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                             sfb_tensor=tCtSFB_mma,
                             k_tile_idx=k_tile,
                             valid_tokens_in_tile=work_tile_info.
-                            valid_tokens_in_tile,
+                            valid_tokens_in_cta_tile,
                             mma_tiler_mnk=self.mma_tiler_mnk,
                         )
                         handle.release()
@@ -2129,7 +2204,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             tmem.wait_for_alloc()
             acc_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
 
-            optional_epi_args = NvFp4OptionalEpiArgs(
+            optional_epi_args = NvFp4OptinalEpiArgs(
                 fc1_alpha=fc1_alpha,
                 fc2_alpha=fc2_alpha,
                 fc1_norm_const=fc1_norm_const,

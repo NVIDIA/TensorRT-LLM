@@ -21,7 +21,7 @@ freeing those slots lets all 16 byval lanes hold offsets (EP16, not EP14).
 """
 
 from dataclasses import dataclass
-from typing import Any, Tuple
+from typing import Any, Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -113,27 +113,44 @@ class SymBufferDeviceBase:
         return local_ptr + off + byte_off
 
     @cute.jit
-    def ptr_map_to_rank(self, ptr, dst_rank_idx: Int32):
+    def ptr_map_to_rank(self,
+                        ptr,
+                        dst_rank_idx: Int32,
+                        byte_align: Optional[int] = None):
         if cutlass.const_expr(ptr.memspace != AddressSpace.gmem):
             raise ValueError(
                 f"ptr_map_to_rank: source pointer must live in GMEM "
                 f"(NVSHMEM symmetric heap), got memspace={ptr.memspace}.")
+        if cutlass.const_expr(byte_align is None):
+            byte_align = ptr.max_alignment
         peer_addr = self.map(ptr.toint(), dst_rank_idx, Int64(0))
         return cute.make_ptr(
             ptr.dtype,
             peer_addr,
             ptr.memspace,
-            assumed_align=ptr.max_alignment,
+            assumed_align=byte_align,
         )
 
 
 @dataclass(frozen=True)
 class SymBufferHost:
-    """Runtime launch payload for a device-side ``SymBuffer{N}``."""
+    """Runtime launch payload for a device-side ``SymBuffer{N}``.
 
-    base_addr: int
-    offsets: Tuple[int, ...]
-    rank_idx: int
+    Field annotations are tvm-ffi-aware (the args-spec converter dispatches the
+    dataclass field-by-field): ``Int64`` / ``Int32`` make the scalar fields land on
+    the converter's typed-scalar branch (``arg_type in AcceptableNumericTypesForScalar``,
+    i64/i32) even when the held value is a plain Python ``int`` -- the AOT-compile
+    spec is what fixes the width, runtime values just marshal into it. ``offsets`` is
+    a bare ``tuple`` (not ``Tuple[int, ...]``): the converter's variadic-``Tuple``
+    handling assumes a fixed arity (``get_args`` -> ``(elem, Ellipsis)``) and would
+    raise a length mismatch for ``world != 1``; a bare ``tuple`` takes the generic
+    element-by-element path whose per-element width is driven by the value type
+    (so the fake's offset values are built as ``Int64`` -> i64). The non-tvm
+    ``_SymBufferHostAdapter`` is unaffected (it re-wraps with ``Int64(...)``)."""
+
+    base_addr: Int64
+    offsets: tuple
+    rank_idx: Int32
     num_max_ranks: cutlass.Constexpr[int]
 
     @staticmethod

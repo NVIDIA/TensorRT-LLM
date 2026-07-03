@@ -3,8 +3,9 @@
 """CuteDSL MegaMoE NVFP4 kernel package.
 
 Hosts the ported MegaMoE fused dispatch + FC1 + activation + FC2 + combine
-CuteDSL kernel (flattened from the upstream ``moe_nvfp4_swapab/`` + ``src/``
-split). The package is loaded
+CuteDSL kernel, flattened from the upstream ``moe_nvfp4_swapab/`` + ``src/``
+split of https://gitlab-master.nvidia.com/bangyus/cutedsl_megamoe.git at
+revision ce712016ae6470dfaac31e5a7e7d87d88cc306f6 (2026-06-30). The package is loaded
 lazily by :mod:`tensorrt_llm._torch.modules.fused_moe.mega_moe.mega_moe_cute_dsl`
 through :func:`import_kernel` so environments without a CUDA 13 Cutlass DSL
 runtime can still import the backend file for capability probing.

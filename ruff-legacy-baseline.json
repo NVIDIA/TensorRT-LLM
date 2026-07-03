@@ -1,8 +1,8 @@
 {
   "_meta": {
     "generated_by": "scripts/legacy_utils.py lint-update-violations",
-    "total_violations": 5341,
-    "total_files": 493
+    "total_violations": 5342,
+    "total_files": 494
   },
   ".github/scripts/label_community_user.py": {
     "D212": 1
@@ -526,6 +526,9 @@
   },
   "tensorrt_llm/_torch/cute_dsl_kernels/blackwell/dense_blockscaled_gemm_persistent.py": {
     "E741": 3
+  },
+  "tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/kernel_fc12.py": {
+    "E731": 1
   },
   "tensorrt_llm/_torch/distributed/ops.py": {
     "E712": 1,

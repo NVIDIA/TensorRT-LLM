@@ -8,7 +8,7 @@ Current implementation: token-in pull with token-back push.  The standalone
 
 import dataclasses
 import os
-from typing import Any, ClassVar, Dict, List, Literal, Union
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -18,15 +18,9 @@ from cutlass.cute.typing import AddressSpace
 from cutlass.cutlass_dsl import (Float32, Int32, Int64, Uint8, Uint32,
                                  extract_mlir_values, new_from_mlir_values)
 
-# Keep these as separate handlers (NOT a tuple `except (A, B)`): CuteDSL's
-# preprocessor import-walker (cutlass-dsl 4.5.0) raises AttributeError on
-# tuple except types, which silently disables AST preprocessing for this
-# module and breaks dynamic `if` control flow in the kernel.
 try:
     from cutlass.cute import iket as _iket  # type: ignore
-except ImportError:  # pragma: no cover
-    from .iket_compat import iket as _iket
-except NotImplementedError:  # pragma: no cover
+except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
     from .iket_compat import iket as _iket
 
 from cutlass._mlir import ir
@@ -40,6 +34,111 @@ from .ptx_helpers import (cp_reduce_async_bulk_add_noftz_bf16_s2g, fns_b32,
                           red_add_release_sys_s32_raw, stg_b32_raw, stg_b64_raw,
                           tma_load_1d_raw, tma_store_1d)
 from .sf_swizzle import sf_atom_int32_offset
+
+# ---------------------------------------------------------------------------
+# Low-precision combine wire format (the central driver for the token-back
+# quantized combine path: fc2 epilogue encoder, token_comm push, and the
+# topk_reduce receiver all describe themselves through one CombineFormat).
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class CombineFormat:
+    """Wire format of the cross-rank combine (token-back) payload.
+
+    The fc2 epilogue quantizes each token's hidden vector into a packed data
+    plane (``combine_quant``) plus a per-block scale plane (``combine_sf``); the
+    receiver (topk_reduce) dequantizes and reduces over topk. The consumer is
+    ALWAYS a software dequant -- never a tensor-core MMA -- so the format is
+    fully self-defined here, with no hardware scale-layout constraint.
+
+    Canonical string ``"{scale_block}{act}x{scale}"`` (leading number = scale
+    block size in hidden elements), e.g. ``"16e2m1xbf16"`` (per-16 bf16 amax +
+    fp4 data) or ``"32e4m3xe8m0"`` (standard MXFP8). ``"bf16"`` is the
+    no-staging baseline: bf16 fc2 terms reduced directly, no scale plane.
+    """
+
+    # Element/scale tag <-> cuTe dtype.  Only the dtypes a real format uses
+    # today (the bf16 baseline is ``scale_dtype is None``); extend when a new
+    # format is actually added rather than ahead of need.
+    _act_by_tag: ClassVar[Dict[str, type]] = {
+        "e2m1": cutlass.Float4E2M1FN,
+        "e4m3": cutlass.Float8E4M3FN,
+    }
+    _scale_by_tag: ClassVar[Dict[str, type]] = {
+        "bf16": cutlass.BFloat16,
+        "e8m0": cutlass.Float8E8M0FNU,
+    }
+
+    act_dtype: type  # cuTe dtype of the packed data-plane element
+    scale_dtype: Optional[
+        type]  # cuTe dtype of a scale entry; None == bf16 baseline
+    scale_block: Optional[
+        int]  # hidden elements per scale entry; None == baseline
+
+    def __post_init__(self):
+        allowed_act = {cutlass.BFloat16, *self._act_by_tag.values()}
+        if self.act_dtype not in allowed_act:
+            raise ValueError(
+                f"combine act_dtype {self.act_dtype} not in {allowed_act}.")
+        allowed_scale = {None, *self._scale_by_tag.values()}
+        if self.scale_dtype not in allowed_scale:
+            raise ValueError(
+                f"combine scale_dtype {self.scale_dtype} not in {allowed_scale}."
+            )
+        if self.scale_dtype is None:  # bf16 no-staging baseline
+            if self.act_dtype is not cutlass.BFloat16 or self.scale_block is not None:
+                raise ValueError(
+                    "baseline must be bf16 act with scale_block=None.")
+            return
+        if self.act_dtype is cutlass.BFloat16:
+            raise ValueError("a quantized combine cannot use a bf16 act dtype.")
+        # The scale dtype pins the block: per-16 bf16 amax / per-32 e8m0 power-of-two.
+        if self.scale_dtype is cutlass.BFloat16 and self.scale_block != 16:
+            raise ValueError("bf16 amax scale requires scale_block == 16.")
+        if self.scale_dtype is cutlass.Float8E8M0FNU and self.scale_block != 32:
+            raise ValueError("e8m0 scale requires scale_block == 32.")
+
+    @property
+    def is_quantized(self) -> bool:
+        """``False`` for the bf16 (no-staging) baseline."""
+        return self.scale_dtype is not None
+
+    @property
+    def name(self) -> str:
+        if not self.is_quantized:
+            return "bf16"
+        act_tag = next(t for t, d in self._act_by_tag.items()
+                       if d is self.act_dtype)
+        scale_tag = next(t for t, d in self._scale_by_tag.items()
+                         if d is self.scale_dtype)
+        return f"{self.scale_block}{act_tag}x{scale_tag}"
+
+    def __str__(self) -> str:
+        return self.name
+
+    @classmethod
+    def parse(cls, text: str) -> "CombineFormat":
+        """Build a CombineFormat from its canonical string (the argparser entry).
+
+        Only the handful of supported wire formats are accepted; each key is the
+        exact string ``name`` produces (so ``parse(str(fmt)) == fmt``).
+        """
+        # (act_dtype, scale_dtype, scale_block); None scale == bf16 baseline.
+        specs = {
+            "bf16": (cutlass.BFloat16, None, None),
+            "16e2m1xbf16": (cutlass.Float4E2M1FN, cutlass.BFloat16, 16),
+            "32e4m3xe8m0": (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, 32),
+        }
+        token = text.strip().lower()
+        if token not in specs:
+            raise ValueError(
+                f"invalid combine_format {text!r}: expected one of {tuple(specs)}."
+            )
+        act_dtype, scale_dtype, scale_block = specs[token]
+        return cls(act_dtype=act_dtype,
+                   scale_dtype=scale_dtype,
+                   scale_block=scale_block)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -97,18 +196,22 @@ _MLIR_VALUE_FIELDS = (
     "fc1_ready_counter",
     "token_src_metadata",
     "combine_output",
+    "combine_sf",
     "fc2_output_workspace",
+    "fc2_output_sf",
     "fc2_done_counter",
     "token_back_schedule_counter",
     "nvlink_barrier_signal",
     "nvlink_barrier_counter",
     "grid_sync_counter",
+    "local_zero_prefix",
+    "shared_zero_prefix",
     "peer_rank_ptr_mapper",
+    "local_rank",
 )
 
 _CONST_FIELDS = (
     "world_size",
-    "local_rank",
     "num_total_experts",
     "num_experts_per_rank",
     "num_topk",
@@ -143,6 +246,8 @@ class TokenCommArgs:
         nvlink_barrier_signal: cute.Tensor,
         nvlink_barrier_counter: cute.Tensor,
         grid_sync_counter: cute.Tensor,
+        local_zero_prefix: cute.Tensor,
+        shared_zero_prefix: cute.Tensor,
         peer_rank_ptr_mapper: Any,
         world_size: int,
         local_rank: int,
@@ -157,6 +262,8 @@ class TokenCommArgs:
         fc2_output_workspace: cute.Tensor = None,
         fc2_done_counter: cute.Tensor = None,
         token_back_schedule_counter: cute.Pointer = None,
+        combine_sf: cute.Tensor = None,
+        fc2_output_sf: cute.Tensor = None,
     ):
         self.input_token_buffer = input_token_buffer
         self.input_sf_buffer = input_sf_buffer
@@ -172,12 +279,16 @@ class TokenCommArgs:
         self.fc1_ready_counter = fc1_ready_counter
         self.token_src_metadata = token_src_metadata
         self.combine_output = combine_output
+        self.combine_sf = combine_sf
         self.fc2_output_workspace = fc2_output_workspace
+        self.fc2_output_sf = fc2_output_sf
         self.fc2_done_counter = fc2_done_counter
         self.token_back_schedule_counter = token_back_schedule_counter
         self.nvlink_barrier_signal = nvlink_barrier_signal
         self.nvlink_barrier_counter = nvlink_barrier_counter
         self.grid_sync_counter = grid_sync_counter
+        self.local_zero_prefix = local_zero_prefix
+        self.shared_zero_prefix = shared_zero_prefix
         self.peer_rank_ptr_mapper = peer_rank_ptr_mapper
         self.world_size = world_size
         self.local_rank = local_rank
@@ -247,7 +358,6 @@ class TokenInPullTokenBackPush:
         self,
         *,
         world_size: int,
-        local_rank: int,
         num_topk: int,
         num_experts_per_rank: int,
         num_total_experts: int,
@@ -260,16 +370,17 @@ class TokenInPullTokenBackPush:
         cluster_shape_mn,
         dispatch_warp_start: int,
         num_other_warps: int,
-        fc2_output_dtype=None,
+        combine_format: "CombineFormat" = None,
+        token_back_by_dispatch: bool = False,
         fc2_publishes_per_token_cluster_tile: int = 0,
         token_back_reduce_topk: bool = False,
         token_back_standalone: bool = False,
         flag_batch: int = 1,
+        is_swap_ab: bool = False,
         token_back_schedule_mode: Literal["static",
                                           "atomic_counter"] = "static",
     ) -> None:
         self.world_size = world_size
-        self.local_rank = local_rank
         self.num_topk = num_topk
         self.num_experts_per_rank = num_experts_per_rank
         self.num_total_experts = num_total_experts
@@ -287,6 +398,7 @@ class TokenInPullTokenBackPush:
         # Release-flag batch size consumed by dispatch_pull as a Python int.
         # One warp lane carries one delayed release target.
         self._flag_batch = flag_batch
+        self.is_swap_ab = is_swap_ab
 
         if token_back_schedule_mode not in ("static", "atomic_counter"):
             raise ValueError(
@@ -302,11 +414,19 @@ class TokenInPullTokenBackPush:
         self.num_other_warps = num_other_warps
         self.num_other_threads = num_other_warps * self.warp_threads
 
+        if combine_format is None:
+            combine_format = CombineFormat(
+                act_dtype=cutlass.BFloat16,
+                scale_dtype=None,
+                scale_block=None,
+            )
+        self.combine_format = combine_format
+        self.token_back_by_dispatch = token_back_by_dispatch
+        self.push_data = token_back_by_dispatch
+        self.push_sf = combine_format.is_quantized
+
         # Standalone token-back: a dedicated warpgroup (size == dispatch group)
-        # right after the dispatch warps, active only when token-back is enabled.
-        # It joins the dispatch->sched handshake and the kernel-tail rendezvous.
-        self.token_back_standalone = (fc2_output_dtype
-                                      is not None) and token_back_standalone
+        self.token_back_standalone = token_back_standalone
         self.num_token_back_warps = self.num_dispatch_warps if self.token_back_standalone else 0
         self.num_token_back_threads = self.num_token_back_warps * self.warp_threads
         self.token_back_warp_start = dispatch_warp_start + self.num_dispatch_warps
@@ -323,19 +443,23 @@ class TokenInPullTokenBackPush:
             self.num_token_back_warps) * self.warp_threads
         self.kernel_tail_threads = self.num_total_threads
 
-        self.fc2_output_dtype = fc2_output_dtype
+        # The DATA wire dtype is the combine act dtype (bf16 baseline -> bf16;
+        # fp4/e4m3 quantized), NOT the kernel's fc2 output dtype: the cross-rank
+        # payload is what the receiver dequantizes.
+        self.fc2_output_dtype = combine_format.act_dtype
         if token_back_reduce_topk:
-            if fc2_output_dtype is None:
+            if not token_back_by_dispatch:
                 raise ValueError(
-                    "token_back_reduce_topk=True requires fc2_output_dtype "
-                    "to enable token-back.")
-            if fc2_output_dtype is not cutlass.BFloat16:
+                    "token_back_reduce_topk=True requires the dispatch "
+                    "token-back DATA path (token_back_by_dispatch).")
+            if combine_format.act_dtype is not cutlass.BFloat16:
                 raise NotImplementedError(
-                    "token_back_reduce_topk currently supports BF16 fc2 "
-                    f"output only, got {fc2_output_dtype}.")
+                    "token_back_reduce_topk currently supports a bf16 combine "
+                    f"only, got {combine_format}.")
         self.token_back_reduce_topk = token_back_reduce_topk
-        if fc2_output_dtype is not None:
-            self.fc2_token_bytes = hidden * int(fc2_output_dtype.width) // 8
+        if self.enable_token_back:
+            self.fc2_token_bytes = hidden * int(
+                combine_format.act_dtype.width) // 8
             if self.fc2_token_bytes % self.hidden_bytes != 0:
                 raise ValueError(
                     f"fc2_token_bytes={self.fc2_token_bytes} must be a "
@@ -345,7 +469,7 @@ class TokenInPullTokenBackPush:
             if fc2_publishes_per_token_cluster_tile <= 0:
                 raise ValueError(
                     "fc2_publishes_per_token_cluster_tile must be > 0 when "
-                    "fc2_output_dtype is set (token_back_by_push enabled).")
+                    "token-back is enabled (it gates the per-expert push).")
             self.fc2_publishes_per_token_cluster_tile = (
                 fc2_publishes_per_token_cluster_tile)
         else:
@@ -355,7 +479,8 @@ class TokenInPullTokenBackPush:
 
     @property
     def enable_token_back(self) -> bool:
-        return self.fc2_output_dtype is not None
+        # token-back warps run if they push the DATA plane, the SF plane, or both.
+        return self.push_data or self.push_sf
 
     def extra_smem_storage_class(self) -> type:
         hidden_bytes = self.hidden_bytes
@@ -399,14 +524,21 @@ class TokenInPullTokenBackPush:
 
     @cute.jit
     def fc1_tma_b_predispatch_spin(self, token_comm_args, work_tile_info):
-        counter_slot = (work_tile_info.cumulative_token_block_count +
-                        work_tile_info.tile_n_idx)
+        if cutlass.const_expr(self.is_swap_ab):
+            counter_slot = work_tile_info.cumulative_token_block_count + work_tile_info.tile_n_idx
+            peek_threshold = work_tile_info.valid_tokens_in_cta_tile
+        else:
+            counter_slot = (work_tile_info.cumulative_token_block_count +
+                            work_tile_info.tile_m_idx //
+                            cutlass.Int32(self.cluster_shape_mn[0]))
+            peek_threshold = work_tile_info.valid_tokens_in_cluster_tile
+
         counter_ptr = token_comm_args.fc1_ready_counter.iterator + counter_slot
         if not work_tile_info.peek_ready:
             _iket.range_push("tma_token_fc1_wait")
             spin_wait(
                 counter_ptr,
-                lambda v: v >= work_tile_info.valid_tokens_in_tile,
+                lambda v: v >= peek_threshold,
                 fail_sleep_cycles=1000,
             )
             _iket.range_pop()
@@ -423,6 +555,7 @@ class TokenInPullTokenBackPush:
         warp_idx,
         lane_idx,
         *,
+        local_rank,
         num_tokens,
         num_sms,
     ):
@@ -512,8 +645,9 @@ class TokenInPullTokenBackPush:
                                             topk_slot)
                     MAX_SLOT_C: cutlass.Constexpr[
                         int] = num_tokens * self.num_topk
-                    elem_off = ((local_expert * Int32(self.world_size) + Int32(
-                        self.local_rank)) * Int32(MAX_SLOT_C) + slot) * Int32(4)
+                    elem_off = ((local_expert * Int32(self.world_size) +
+                                 Int32(local_rank)) * Int32(MAX_SLOT_C) +
+                                slot) * Int32(4)
                     peer_addr = peer_rank_ptr_mapper.map(
                         src_token_topk_idx.iterator.toint(),
                         dst_rank,
@@ -536,8 +670,9 @@ class TokenInPullTokenBackPush:
         warp_idx,
         lane_idx,
         *,
+        local_rank,
         num_sms,
-        nvlink_barrier_counter=None,
+        nvlink_barrier_counter,
     ):
         # software_grid_sync expects a dispatch-group-relative thread id.
         tid_in_group = warp_idx * Int32(self.warp_threads) + lane_idx
@@ -568,9 +703,9 @@ class TokenInPullTokenBackPush:
                     )
                     token_count_u32 = Int32(status_u64 & Int64(0xFFFFFFFF))
                     erc_local_base = expert_recv_count.iterator.toint()
-                    erc_elem_off = (Int32(self.local_rank) *
-                                    Int32(self.num_experts_per_rank) +
-                                    dst_local_expert) * Int32(8)
+                    erc_elem_off = (
+                        Int32(local_rank) * Int32(self.num_experts_per_rank) +
+                        dst_local_expert) * Int32(8)
                     erc_peer_addr = peer_rank_ptr_mapper.map(
                         erc_local_base,
                         dst_rank,
@@ -598,7 +733,6 @@ class TokenInPullTokenBackPush:
             sm_idx,
             warp_idx,
             lane_idx,
-            slot=0,
             num_sms=num_sms,
             prologue_grid_sync=False,
             epilogue_grid_sync=True,
@@ -896,6 +1030,7 @@ class TokenInPullTokenBackPush:
                 # current address.
                 task_tile_idx = expert_task_tile_offset + (
                     token_idx_in_expert // Int32(self.cluster_tile_tokens))
+
                 task_tile_addr = (fc1_ready_counter.iterator +
                                   task_tile_idx).toint()
                 flag_tracker = flag_tracker.accumulate(
@@ -957,6 +1092,8 @@ class TokenInPullTokenBackPush:
         fc2_done_counter,
         token_src_metadata,
         combine_output,
+        combine_sf,
+        fc2_output_sf,
         token_back_schedule_counter,
         peer_rank_ptr_mapper,
         phase_bit,
@@ -965,6 +1102,7 @@ class TokenInPullTokenBackPush:
         warp_idx,
         lane_idx,
         *,
+        local_rank,
         num_sms,
         chunk_bytes: cutlass.Constexpr[int],
     ):
@@ -978,6 +1116,16 @@ class TokenInPullTokenBackPush:
                                               1) // chunk_bytes
         last_chunk_bytes: cutlass.Constexpr[int] = (
             fc2_token_bytes - (num_chunks - 1) * chunk_bytes)
+
+        if cutlass.const_expr(self.push_sf):
+            # (token, topk, hidden):(d_topkxhidden, d_hidden, 1)
+            combine_sf_u8 = cute.recast_tensor(combine_sf, Uint8)
+            sf_token_bytes: cutlass.Constexpr[int] = cute.size(
+                combine_sf_u8[0, None, 0].stride)
+            num_sf_chunks: cutlass.Constexpr[int] = (
+                sf_token_bytes + chunk_bytes - 1) // chunk_bytes
+            last_sf_chunk_bytes: cutlass.Constexpr[int] = (
+                sf_token_bytes - (num_sf_chunks - 1) * chunk_bytes)
 
         num_experts_per_lane: cutlass.Constexpr[int] = (
             self.num_experts_per_rank + 31) // 32
@@ -1100,23 +1248,7 @@ class TokenInPullTokenBackPush:
                 src_rank = md.src_rank
                 src_token = md.src_token
                 src_topk = md.src_topk
-                is_remote_token_back = src_rank != Int32(self.local_rank)
-
-                local_token_addr = (
-                    fc2_output_workspace.iterator.toint() +
-                    Int64(pool_token_idx) * Int64(fc2_token_bytes))
-                peer_combine_ptr = peer_rank_ptr_mapper.ptr_map_to_rank(
-                    combine_output.iterator,
-                    src_rank,
-                )
-                if cutlass.const_expr(self.token_back_reduce_topk):
-                    peer_token_offset = Int64(src_token) * Int64(
-                        fc2_token_bytes)
-                else:
-                    peer_token_offset = (
-                        Int64(src_token * Int32(self.num_topk) + src_topk) *
-                        Int64(fc2_token_bytes))
-                peer_token_ptr = peer_combine_ptr + peer_token_offset
+                is_remote_token_back = src_rank != Int32(local_rank)
 
                 smem_ptr_warp = pull_buffer_ptr + warp_idx * Int32(chunk_bytes)
                 mbar_ptr_warp = pull_mbar_ptr + warp_idx
@@ -1125,52 +1257,111 @@ class TokenInPullTokenBackPush:
                     _iket.range_push("token_back")
                 cute.arch.sync_warp()
 
-                for chunk in cutlass.range(num_chunks, unroll=1):
-                    t0 = read_clock64()
-                    chunk_off = Int64(chunk * chunk_bytes)
-                    peer_chunk_ptr = peer_token_ptr + chunk_off
+                # DATA plane: only the dispatch DATA path pushes here; epi_warps
+                # has the epilogue STG/UBLK the data straight to the peer.
+                if cutlass.const_expr(self.push_data):
+                    local_token_addr = (
+                        fc2_output_workspace.iterator.toint() +
+                        Int64(pool_token_idx) * Int64(fc2_token_bytes))
+                    peer_combine_ptr = peer_rank_ptr_mapper.ptr_map_to_rank(
+                        combine_output.iterator,
+                        src_rank,
+                    )
+                    if cutlass.const_expr(self.token_back_reduce_topk):
+                        peer_token_offset = Int64(src_token) * Int64(
+                            fc2_token_bytes)
+                    else:
+                        peer_token_offset = (
+                            Int64(src_token * Int32(self.num_topk) + src_topk) *
+                            Int64(fc2_token_bytes))
+                    peer_token_ptr = peer_combine_ptr + peer_token_offset
 
-                    this_bytes = Int32(chunk_bytes)
-                    if cutlass.const_expr(last_chunk_bytes != chunk_bytes):
-                        if chunk == Int32(num_chunks - 1):
-                            this_bytes = Int32(last_chunk_bytes)
+                    for chunk in cutlass.range(num_chunks, unroll=1):
+                        t0 = read_clock64()
+                        chunk_off = Int64(chunk * chunk_bytes)
+                        peer_chunk_ptr = peer_token_ptr + chunk_off
 
-                    with cute.arch.elect_one():
-                        tma_load_1d_raw(
-                            smem_ptr_warp,
-                            local_token_addr + chunk_off,
-                            mbar_ptr_warp,
-                            this_bytes,
-                        )
-                        cute.arch.mbarrier_arrive_and_expect_tx(
-                            mbar_ptr_warp,
-                            this_bytes,
-                        )
-                        cute.arch.mbarrier_wait(mbar_ptr_warp, phase_bit)
-                        if cutlass.const_expr(self.token_back_reduce_topk):
-                            cp_reduce_async_bulk_add_noftz_bf16_s2g(
-                                peer_chunk_ptr,
+                        this_bytes = Int32(chunk_bytes)
+                        if cutlass.const_expr(last_chunk_bytes != chunk_bytes):
+                            if chunk == Int32(num_chunks - 1):
+                                this_bytes = Int32(last_chunk_bytes)
+
+                        with cute.arch.elect_one():
+                            tma_load_1d_raw(
                                 smem_ptr_warp,
+                                local_token_addr + chunk_off,
+                                mbar_ptr_warp,
                                 this_bytes,
                             )
-                        else:
+                            cute.arch.mbarrier_arrive_and_expect_tx(
+                                mbar_ptr_warp,
+                                this_bytes,
+                            )
+                            cute.arch.mbarrier_wait(mbar_ptr_warp, phase_bit)
+                            if cutlass.const_expr(self.token_back_reduce_topk):
+                                cp_reduce_async_bulk_add_noftz_bf16_s2g(
+                                    peer_chunk_ptr,
+                                    smem_ptr_warp,
+                                    this_bytes,
+                                )
+                            else:
+                                tma_store_1d(
+                                    peer_chunk_ptr,
+                                    smem_ptr_warp,
+                                    this_bytes,
+                                )
+                        phase_bit = phase_bit ^ Int32(1)
+                        cute.arch.cp_async_bulk_commit_group()
+                        cute.arch.cp_async_bulk_wait_group(0)
+                        t1 = read_clock64()
+                        current_window = Int32(t1 - t0)
+                        if is_remote_token_back and remain_experts > Int32(4):
+                            avg_token_back_window = self._adaptive_pace(
+                                avg_token_back_window,
+                                current_window,
+                                lo=1000,
+                                hi=5000,
+                            )
+
+                if cutlass.const_expr(self.push_sf):
+                    sf_local_addr = fc2_output_sf[pool_token_idx, 0,
+                                                  None].iterator.toint()
+                    sf_peer_ptr = peer_rank_ptr_mapper.ptr_map_to_rank(
+                        combine_sf_u8[src_token, src_topk, None].iterator,
+                        src_rank,
+                    )
+                    for chunk in cutlass.range(num_sf_chunks, unroll=1):
+                        t0 = read_clock64()
+                        chunk_off = Int64(chunk * chunk_bytes)
+                        this_bytes = Int32(chunk_bytes)
+                        if cutlass.const_expr(
+                                last_sf_chunk_bytes != chunk_bytes):
+                            if chunk == Int32(num_sf_chunks - 1):
+                                this_bytes = Int32(last_sf_chunk_bytes)
+                        with cute.arch.elect_one():
+                            tma_load_1d_raw(
+                                smem_ptr_warp,
+                                sf_local_addr + chunk_off,
+                                mbar_ptr_warp,
+                                this_bytes,
+                            )
+                            cute.arch.mbarrier_arrive_and_expect_tx(
+                                mbar_ptr_warp,
+                                this_bytes,
+                            )
+                            cute.arch.mbarrier_wait(mbar_ptr_warp, phase_bit)
                             tma_store_1d(
-                                peer_chunk_ptr,
+                                sf_peer_ptr + chunk_off,
                                 smem_ptr_warp,
                                 this_bytes,
                             )
-                    phase_bit = phase_bit ^ Int32(1)
-                    cute.arch.cp_async_bulk_commit_group()
-                    cute.arch.cp_async_bulk_wait_group(0)
-                    t1 = read_clock64()
-                    current_window = Int32(t1 - t0)
-                    if is_remote_token_back and remain_experts > Int32(4):
-                        avg_token_back_window = self._adaptive_pace(
-                            avg_token_back_window,
-                            current_window,
-                            lo=1000,
-                            hi=5000,
-                        )
+                        phase_bit = phase_bit ^ Int32(1)
+                        cute.arch.cp_async_bulk_commit_group()
+                        cute.arch.cp_async_bulk_wait_group(0)
+                        if is_remote_token_back:
+                            round_trip = Int32(read_clock64() - t0)
+                            if round_trip <= this_bytes * Int32(5) // Int32(4):
+                                _nanosleep(this_bytes // Int32(4))
 
                 if _iket_emit:
                     _iket.range_pop()
@@ -1184,8 +1375,6 @@ class TokenInPullTokenBackPush:
                     atomic_batch,
                     num_global_warps,
                 )
-        # if lane_idx == 0:
-        #     cute.printf("<{}>", avg_token_back_window)
 
         cute.arch.fence_acq_rel_sys()
         # _fence_rel_sys()
@@ -1201,7 +1390,6 @@ class TokenInPullTokenBackPush:
         warp_idx,
         lane_idx,
         *,
-        slot: cutlass.Constexpr[int],
         num_sms,
         prologue_grid_sync: cutlass.Constexpr[bool],
         epilogue_grid_sync: cutlass.Constexpr[bool],
@@ -1218,16 +1406,20 @@ class TokenInPullTokenBackPush:
 
         if sm_idx == 0:
             if warp_idx == 0:
-                signal_phase = Int32(slot)
+                # Sense-reversing ping-pong barrier. The low 2 bits of the counter
+                # pick the signal slot (phase 0/1) and the direction (+1 up to
+                # world_size, then -1 back to 0), so the two slots self-cancel over
+                # a 4-call cycle and never need an explicit reset -- required
+                # because the signal is symmetric peer memory that ncu kernel
+                # replay cannot snapshot/restore.
+                status = nvlink_barrier_counter[0] & Int32(3)
+                signal_phase = status & Int32(1)
+                signal_sign = status >> Int32(1)
                 signal_delta = Int32(1)
                 target = Int32(self.world_size)
-                if cutlass.const_expr(nvlink_barrier_counter is not None):
-                    status = nvlink_barrier_counter[0] & Int32(3)
-                    signal_phase = status & Int32(1)
-                    signal_sign = status >> Int32(1)
-                    if signal_sign != Int32(0):
-                        signal_delta = Int32(-1)
-                        target = Int32(0)
+                if signal_sign != Int32(0):
+                    signal_delta = Int32(-1)
+                    target = Int32(0)
 
                 nbs_local_base = nvlink_barrier_signal.iterator.toint()
                 if lane_idx < Int32(self.world_size):
@@ -1240,26 +1432,18 @@ class TokenInPullTokenBackPush:
                 cute.arch.sync_warp()
 
                 if lane_idx == 0:
-                    if cutlass.const_expr(nvlink_barrier_counter is not None):
-                        cute.arch.atomic_add(
-                            nvlink_barrier_counter.iterator,
-                            Int32(1),
-                            sem="relaxed",
-                            scope="gpu",
-                        )
+                    cute.arch.atomic_add(
+                        nvlink_barrier_counter.iterator,
+                        Int32(1),
+                        sem="relaxed",
+                        scope="gpu",
+                    )
                     local_signal_ptr = nvlink_barrier_signal.iterator + signal_phase
-                    if cutlass.const_expr(nvlink_barrier_counter is None):
-                        while cute.arch.load(local_signal_ptr,
-                                             Int32,
-                                             sem="acquire",
-                                             scope="sys") < target:
-                            pass
-                    else:
-                        while cute.arch.load(local_signal_ptr,
-                                             Int32,
-                                             sem="acquire",
-                                             scope="sys") != target:
-                            pass
+                    while cute.arch.load(local_signal_ptr,
+                                         Int32,
+                                         sem="acquire",
+                                         scope="sys") != target:
+                        pass
 
         if epilogue_grid_sync:
             software_grid_sync(grid_sync_counter,
@@ -1299,6 +1483,7 @@ class TokenInPullTokenBackPush:
             cta_linear_id,
             local_warp_idx,
             lane_idx,
+            local_rank=token_comm_args.local_rank,
             num_tokens=token_comm_args.input_token_buffer.shape[0],
             num_sms=token_comm_args.sm_count,
         )
@@ -1317,6 +1502,7 @@ class TokenInPullTokenBackPush:
             cta_linear_id,
             local_warp_idx,
             lane_idx,
+            local_rank=token_comm_args.local_rank,
             num_sms=token_comm_args.sm_count,
             nvlink_barrier_counter=token_comm_args.nvlink_barrier_counter,
         )
@@ -1366,6 +1552,8 @@ class TokenInPullTokenBackPush:
                 token_comm_args.fc2_done_counter,
                 token_comm_args.token_src_metadata,
                 token_comm_args.combine_output,
+                token_comm_args.combine_sf,
+                token_comm_args.fc2_output_sf,
                 token_comm_args.token_back_schedule_counter,
                 token_comm_args.peer_rank_ptr_mapper,
                 phase_bit,
@@ -1373,6 +1561,7 @@ class TokenInPullTokenBackPush:
                 cta_linear_id,
                 local_warp_idx,
                 lane_idx,
+                local_rank=token_comm_args.local_rank,
                 num_sms=token_comm_args.sm_count,
                 chunk_bytes=self.hidden_bytes,
             )
@@ -1436,6 +1625,8 @@ class TokenInPullTokenBackPush:
             token_comm_args.fc2_done_counter,
             token_comm_args.token_src_metadata,
             token_comm_args.combine_output,
+            token_comm_args.combine_sf,
+            token_comm_args.fc2_output_sf,
             token_comm_args.token_back_schedule_counter,
             token_comm_args.peer_rank_ptr_mapper,
             Int32(0),
@@ -1443,6 +1634,7 @@ class TokenInPullTokenBackPush:
             cta_linear_id,
             local_warp_idx,
             lane_idx,
+            local_rank=token_comm_args.local_rank,
             num_sms=token_comm_args.sm_count,
             chunk_bytes=self.tb_chunk_bytes,
         )
@@ -1451,43 +1643,42 @@ class TokenInPullTokenBackPush:
             _iket.range_pop()
 
     @cute.jit
-    def tail_reset_shared_counters(
+    def tail_reset_counters(
         self,
         token_comm_args,
+        target_zero_tensor,
         *,
         cta_linear_id,
         local_warp_idx,
         lane_idx,
     ):
+        """Per-lane 4B (Int32) bulk-zero of one accumulating-counter prefix.
+
+        ``target_zero_tensor`` is an Int32 view over a workspace's front counter
+        region (megamoe_kernel front-places every counter that must restart at 0
+        each launch; data buffers and the phase-flip ``nvlink_barrier_signal`` sit
+        after the prefix and are untouched). The zeroing is spread across all
+        dispatch threads grid-wide. kernel_tail calls this twice:
+          * SHARED prefix (expert_recv_count / _sum) BETWEEN the two nvlink
+            barriers, so the final barrier publishes the zeros cross-rank -- needed
+            when the next launch is another MegaMoE reusing the shared workspace
+            with no intervening rank sync;
+          * LOCAL prefix (l1_arrival / expert_send / grid_sync / nvlink_barrier /
+            fc1_done [+ fc2_done / token_back_schedule / load_balance]) AFTER the
+            last barrier -- rank-local (next kernel sees it via stream order) and
+            grid_sync/nvlink barrier counters stay live until that last barrier.
+        Only the FIRST launch relies on a caller-zeroed workspace.
+        """
         thread_linear = (
             (cta_linear_id * Int32(self.num_dispatch_warps) + local_warp_idx) *
             Int32(self.warp_threads) + lane_idx)
         stride = Int32(token_comm_args.sm_count * self.num_dispatch_threads)
 
-        recv_total: cutlass.Constexpr[int] = (self.world_size *
-                                              self.num_experts_per_rank)
+        count = cute.size(target_zero_tensor)
         i = thread_linear
-        while i < Int32(recv_total):
-            rank_idx = i // Int32(self.num_experts_per_rank)
-            expert_idx = i % Int32(self.num_experts_per_rank)
-            token_comm_args.expert_recv_count[rank_idx, expert_idx] = Int64(0)
+        while i < Int32(count):
+            target_zero_tensor[i] = Int32(0)
             i = i + stride
-
-        i = thread_linear
-        while i < Int32(self.num_experts_per_rank):
-            token_comm_args.expert_recv_count_sum[i] = Int64(0)
-            i = i + stride
-
-        if cutlass.const_expr(self.enable_token_back):
-            i = thread_linear
-            while i < Int32(self.num_experts_per_rank):
-                token_comm_args.fc2_done_counter[i] = Int32(0)
-                i = i + stride
-
-        if cutlass.const_expr(self.token_back_schedule_mode ==
-                              "atomic_counter"):  # nosec B105
-            if thread_linear == Int32(0):
-                token_comm_args.token_back_schedule_counter.store(Int32(0))
 
     @cute.jit
     def kernel_tail(
@@ -1514,6 +1705,31 @@ class TokenInPullTokenBackPush:
                 Int32(self.cluster_shape_mn[1] * self.cluster_shape_mn[0]) *
                 Int32(bidz))
             local_warp_idx = Int32(warp_idx) - Int32(self.dispatch_warp_start)
+            # Per-launch nvlink barrier count must be a multiple of 4 so the
+            # sense-reversing signal self-cancels back to its start state. The
+            # launch already does 1 (dispatch_barrier) + 2 below (drain + publish,
+            # around the shared reset) = 3. Under ncu kernel replay the signal is
+            # cross-device and can't be restored across passes, so pad with one
+            # extra drain to reach 4. Non-ncu rides the phase counter across launch
+            # boundaries and needs only 3.
+            #
+            # MEGA_USE_NCU is a dev-only profiling hack -- read inline here on
+            # purpose: it is never exposed to customers and the ncu path is not
+            # kept in production, so it must NOT become a constructor field or a
+            # kernel-name constexpr.
+            if cutlass.const_expr(os.environ.get("MEGA_USE_NCU", "0") == "1"):
+                self.nvlink_barrier(
+                    token_comm_args.nvlink_barrier_signal,
+                    token_comm_args.nvlink_barrier_counter,
+                    token_comm_args.grid_sync_counter,
+                    token_comm_args.peer_rank_ptr_mapper,
+                    cta_linear_id,
+                    local_warp_idx,
+                    lane_idx,
+                    num_sms=token_comm_args.sm_count,
+                    prologue_grid_sync=True,
+                    epilogue_grid_sync=True,
+                )
             self.nvlink_barrier(
                 token_comm_args.nvlink_barrier_signal,
                 token_comm_args.nvlink_barrier_counter,
@@ -1522,26 +1738,15 @@ class TokenInPullTokenBackPush:
                 cta_linear_id,
                 local_warp_idx,
                 lane_idx,
-                slot=1,
                 num_sms=token_comm_args.sm_count,
                 prologue_grid_sync=True,
                 epilogue_grid_sync=True,
             )
-            self.nvlink_barrier(
-                token_comm_args.nvlink_barrier_signal,
-                token_comm_args.nvlink_barrier_counter,
-                token_comm_args.grid_sync_counter,
-                token_comm_args.peer_rank_ptr_mapper,
-                cta_linear_id,
-                local_warp_idx,
-                lane_idx,
-                slot=1,
-                num_sms=token_comm_args.sm_count,
-                prologue_grid_sync=True,
-                epilogue_grid_sync=True,
-            )
-            self.tail_reset_shared_counters(
+            # Shared counters between the barriers: the slot=0 barrier below
+            # publishes these zeros cross-rank for a back-to-back MegaMoE relaunch.
+            self.tail_reset_counters(
                 token_comm_args,
+                token_comm_args.shared_zero_prefix,
                 cta_linear_id=cta_linear_id,
                 local_warp_idx=local_warp_idx,
                 lane_idx=lane_idx,
@@ -1554,8 +1759,16 @@ class TokenInPullTokenBackPush:
                 cta_linear_id,
                 local_warp_idx,
                 lane_idx,
-                slot=0,
                 num_sms=token_comm_args.sm_count,
                 prologue_grid_sync=True,
                 epilogue_grid_sync=True,
+            )
+            # Local counters last: rank-local, and grid_sync/nvlink_barrier
+            # counters above stay live until this final barrier completes.
+            self.tail_reset_counters(
+                token_comm_args,
+                token_comm_args.local_zero_prefix,
+                cta_linear_id=cta_linear_id,
+                local_warp_idx=local_warp_idx,
+                lane_idx=lane_idx,
             )

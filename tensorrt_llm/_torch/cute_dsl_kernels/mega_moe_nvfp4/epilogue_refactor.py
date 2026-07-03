@@ -14,7 +14,8 @@ the per-token metadata is fetched.
 """
 
 import dataclasses
-from typing import Callable, List, Optional, Tuple, Type, Union
+from typing import (Any, Callable, ClassVar, List, Literal, Optional, Tuple,
+                    Type, Union)
 
 import cutlass
 import cutlass.cute as cute
@@ -22,16 +23,18 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass._mlir import ir
-from cutlass._mlir.dialects import llvm
+from cutlass._mlir.dialects import llvm, vector
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.typing import AddressSpace
-from cutlass.cutlass_dsl import Int64
+from cutlass.cutlass_dsl import Int64, T
 
+from .common_moe_utils import cvt_f32_to_f8_to_f32
 from .contract import Contract, FunctionMapping, Space, eval_function_mapping
 from .fc1_fc2_fuse_sched import BlockPhase
 from .flag_batch import GpuReleaseFlagBatchTracker
 from .iket_compat import iket
-from .megamoe_constants import Nvfp4BlockSize
+from .megamoe_constants import (Fp8E4M3RcpLimit, Fp8E5M2RcpLimit, Fp32Max,
+                                Nvfp4BlockSize, Nvfp4E2M1RcpLimit)
 from .moe_persistent_scheduler import (MoESchedConsumer, MoESchedExtension,
                                        MoEWorkTileInfo)
 from .ptx_helpers import cp_async_bulk_s2g as _cp_async_bulk_s2g
@@ -41,7 +44,484 @@ from .ptx_helpers import \
 from .ptx_helpers import \
     red_add_relaxed_sys_v2_bf16x2 as _red_add_relaxed_sys_v2_bf16x2
 from .sym_buffer import SymBufferDeviceBase
-from .token_comm import TokenCommArgs, TokenSrcMetadata
+from .token_comm import CombineFormat, TokenCommArgs, TokenSrcMetadata
+
+
+@dataclasses.dataclass(frozen=True)
+class QuantImpl:
+    """Register-level block quantizer shared by the fc1 / fc2 epilogues.
+
+    Returns ``(data_regs, sf_regs)`` ONLY: the caller pre-multiplies the topk
+    weight / global scale into ``prequant_reg`` beforehand and owns the data /
+    sf plane stores afterwards. ``sf_vec_direction`` selects the per-block amax
+    reduction:
+
+      * ``regs_in_thread``            -- a block is ``sf_vec`` contiguous regs of
+        one thread; amax is thread-local (packed bf16x2 abs-max for combine,
+        fp32 ``fmax`` for orthodox).
+      * ``threads_with_the_same_reg`` -- a block is one reg across ``sf_vec`` warp
+        lanes; amax is a warp CREDUX (full warp for vec=32, lane-predicated
+        halves for vec=16) and is fp32-only, so bf16 is upconverted first.
+
+    ``prequant_reg`` must be 1D with size divisible by ``sf_vec``. Combine inputs
+    are bf16 (fc2's bf16 reorder regs); orthodox nvfp4 input is fp32 (swiglu).
+    """
+
+    quant_kind: Union[str, CombineFormat]
+    sf_vec_direction: Literal["regs_in_thread", "threads_with_the_same_reg"]
+    lane_idx: Optional[Any] = None  # Int32; only the across-lane path needs it
+
+    _orthodox_kinds: ClassVar[Tuple[str, ...]] = ("nvfp4", "mxfp4",
+                                                  "mxfp8_e4m3", "mxfp8_e5m2")
+
+    # -- config / validation --------------------------------------------------
+
+    def __post_init__(self):
+        if isinstance(self.quant_kind, CombineFormat):
+            if not self.quant_kind.is_quantized:
+                raise ValueError(
+                    f"QuantImpl combine path needs a quantized CombineFormat, "
+                    f"got {self.quant_kind}.")
+        elif self.quant_kind in self._orthodox_kinds:
+            if self.quant_kind != "nvfp4":
+                raise NotImplementedError(
+                    f"orthodox {self.quant_kind} quant is reserved but not wired "
+                    f"(only orthodox 'nvfp4' is implemented).")
+        else:
+            raise ValueError(
+                f"quant_kind must be a CombineFormat or one of "
+                f"{self._orthodox_kinds}, got {self.quant_kind!r}.")
+        if self.sf_vec_direction not in ("regs_in_thread",
+                                         "threads_with_the_same_reg"):
+            raise ValueError(
+                f"sf_vec_direction must be 'regs_in_thread' or "
+                f"'threads_with_the_same_reg', got {self.sf_vec_direction!r}.")
+        # Orthodox nvfp4 only sees the transposed (regs-in-thread) layout fc1
+        # produces via its TMEM transpose.
+        if not isinstance(self.quant_kind, CombineFormat) and (
+                self.sf_vec_direction != "regs_in_thread"):
+            raise NotImplementedError(
+                "orthodox nvfp4 quant is regs_in_thread only.")
+        if self.sf_vec_direction == "threads_with_the_same_reg" and (
+                self.lane_idx is None):
+            raise ValueError(
+                "across-lane quant needs lane_idx for the CREDUX half-warp predicate."
+            )
+
+    @property
+    def data_dtype(self):
+        if isinstance(self.quant_kind, CombineFormat):
+            return self.quant_kind.act_dtype
+        return cutlass.Float4E2M1FN  # orthodox nvfp4
+
+    @property
+    def scale_dtype(self):
+        if isinstance(self.quant_kind, CombineFormat):
+            return self.quant_kind.scale_dtype
+        return cutlass.Float8E4M3FN  # orthodox nvfp4 e4m3 sfc
+
+    @property
+    def sf_vec_size(self) -> int:
+        if isinstance(self.quant_kind, CombineFormat):
+            return self.quant_kind.scale_block
+        return Nvfp4BlockSize  # 16
+
+    @property
+    def _is_combine(self) -> bool:
+        return isinstance(self.quant_kind, CombineFormat)
+
+    @property
+    def _data_rcp_limit(self) -> float:
+        # 1 / max representable magnitude of the data element type.
+        dt = self.data_dtype
+        if dt is cutlass.Float4E2M1FN:
+            return Nvfp4E2M1RcpLimit  # 1/6
+        if dt is cutlass.Float8E4M3FN:
+            return Fp8E4M3RcpLimit  # 1/448
+        return Fp8E5M2RcpLimit  # 1/57344
+
+    # -- dispatch -------------------------------------------------------------
+
+    @cute.jit
+    def __call__(self, prequant_reg: cute.Tensor, *, norm_const=None):
+        if cutlass.const_expr(cute.size(prequant_reg) % self.sf_vec_size != 0):
+            raise ValueError("prequant_reg size must be divisible by sf_vec.")
+        # Combine quantizes fc2's bf16 reorder regs; orthodox nvfp4 the fp32 swiglu.
+        expected_in = cutlass.BFloat16 if self._is_combine else cutlass.Float32
+        if cutlass.const_expr(prequant_reg.element_type is not expected_in):
+            raise TypeError(
+                f"QuantImpl({self.quant_kind}) expects {expected_in} prequant "
+                f"input, got {prequant_reg.element_type}.")
+        if cutlass.const_expr(not self._is_combine):
+            return self.nvfp4_quant_impl(prequant_reg, norm_const=norm_const)
+        if cutlass.const_expr(self.data_dtype is cutlass.Float4E2M1FN):
+            if cutlass.const_expr(self.sf_vec_direction == "regs_in_thread"):
+                return self.nvfp4_combine_quant_regs_in_thread_impl(
+                    prequant_reg)
+            return self.nvfp4_combine_quant_threads_with_the_same_reg_impl(
+                prequant_reg)
+        if cutlass.const_expr(self.sf_vec_direction == "regs_in_thread"):
+            return self.mxfp8_combine_quant_regs_in_thread_impl(prequant_reg)
+        return self.mxfp8_combine_quant_threads_with_the_same_reg_impl(
+            prequant_reg)
+
+    # -- impls ----------------------------------------------------------------
+
+    # regs_in_thread only; fc1 promises the vec direction via its TMEM transpose.
+    @cute.jit
+    def nvfp4_quant_impl(
+        self,
+        prequant_reg: cute.Tensor,
+        *,
+        norm_const: Optional[cutlass.Float32] = None,
+    ) -> Tuple[cute.Tensor, cute.Tensor]:
+        # fp32 in -> e2m1 data + e4m3 sfc. Mirrors the prior nvfp4_quant scale
+        # math (sfc -> capped/masked acc_scale); topk pre-mult + sf store are the
+        # caller's job now.
+        vec = self.sf_vec_size
+        n_blocks = cute.size(prequant_reg) // vec
+        data = cute.make_rmem_tensor((cute.size(prequant_reg), ),
+                                     cutlass.Float4E2M1FN)
+        sf = cute.make_rmem_tensor((n_blocks, ), cutlass.Float8E4M3FN)
+        in_blocks = cute.zipped_divide(prequant_reg,
+                                       (vec, ))  # ((vec,), (n_blocks,))
+        data_blocks = []
+        sf_values = []
+        rcp_limit = cutlass.Float32(self._data_rcp_limit)
+        for vec_block_idx in cutlass.range_constexpr(n_blocks):
+            block = in_blocks[None, vec_block_idx]
+            amax = self._amax_thread_fp32(block)
+            if cutlass.const_expr(norm_const is not None):
+                sfc_fp32 = amax * rcp_limit * norm_const
+            else:
+                sfc_fp32 = amax * rcp_limit
+            sfc_e4m3 = sfc_fp32.to(cutlass.Float8E4M3FN)
+            sfc_rt = cutlass.Float32(sfc_e4m3)
+            if cutlass.const_expr(norm_const is not None):
+                acc_scale = norm_const * cute.arch.rcp_approx(sfc_rt)
+            else:
+                acc_scale = cute.arch.rcp_approx(sfc_rt)
+            acc_scale = cute.arch.fmin(acc_scale, Fp32Max)
+            mask = cute.arch.fmin(sfc_rt * cutlass.Float32(1e30),
+                                  cutlass.Float32(1.0))
+            acc_scale = acc_scale * mask
+            sf_values.append(sfc_e4m3)
+            data_blocks.append(self._scale_to_e2m1_ssa(block, acc_scale))
+        self._store_packed_blocks(data, data_blocks)
+        sf.store(self._values_to_ssa(sf_values, cutlass.Float8E4M3FN))
+        return data, sf
+
+    @cute.jit
+    def nvfp4_combine_quant_regs_in_thread_impl(
+        self,
+        prequant_reg: cute.Tensor,
+    ) -> Tuple[cute.Tensor, cute.Tensor]:
+        # bf16 in -> e2m1 data + per-16 bf16 amax. amax found on bf16 (packed).
+        vec = self.sf_vec_size
+        n_blocks = cute.size(prequant_reg) // vec
+        data = cute.make_rmem_tensor((cute.size(prequant_reg), ),
+                                     cutlass.Float4E2M1FN)
+        sf = cute.make_rmem_tensor((n_blocks, ), cutlass.BFloat16)
+        in_blocks = cute.zipped_divide(prequant_reg,
+                                       (vec, ))  # ((vec,), (n_blocks,))
+        data_blocks = []
+        sf_values = []
+        for vec_block_idx in cutlass.range_constexpr(n_blocks):
+            block = in_blocks[None, vec_block_idx]
+            amax = self._amax_thread_bf16(block)
+            sf_values.append(amax)
+            decode_scale = cutlass.Float32(amax) * cutlass.Float32(
+                self._data_rcp_limit)
+            data_blocks.append(
+                self._scale_to_e2m1_ssa(block, self._enc_nvfp4(decode_scale)))
+        self._store_packed_blocks(data, data_blocks)
+        sf.store(self._values_to_ssa(sf_values, cutlass.BFloat16))
+        return data, sf
+
+    # Mapping: (lane_idx, selected_sf_idx) -> (token_64, hidden_32)
+    # token_idx = lane_idx % 16 + selected_sf_idx * 16
+    # hidden_idx = lane_idx // 16 * 16
+    @cute.jit
+    def nvfp4_combine_quant_threads_with_the_same_reg_impl(
+        self,
+        prequant_reg: cute.Tensor,
+    ) -> Tuple[cute.Tensor, cute.Tensor]:
+        # UBLK has lane == hidden, so the warp's 32 lanes are 32 consecutive
+        # hidden. A scale block = sf_vec hidden, so the lanes split along hidden
+        # into 32 // sf_vec blocks of sf_vec lanes each (warp = blocks_per_warp *
+        # lanes_per_block, the EP x TP split). Only the sf_vec lanes inside a
+        # block share its CREDUX scale, so they pool the subtile tokens: sf_vec
+        # == 32 pools the whole warp, sf_vec < 32 pools fewer (more per lane).
+        lanes_per_block = self.sf_vec_size
+        n_tokens = cute.size(prequant_reg)
+        lane_in_block = self.lane_idx % cutlass.Int32(lanes_per_block)
+        data = cute.make_rmem_tensor((n_tokens, ), cutlass.Float4E2M1FN)
+        selected_sf = cute.make_rmem_tensor((n_tokens // lanes_per_block, ),
+                                            cutlass.BFloat16)
+        scaled_vec = cute.full((n_tokens, ), cutlass.Float32(0.0),
+                               cutlass.Float32)
+        for token_idx in cutlass.range_constexpr(n_tokens):
+            value = cutlass.Float32(prequant_reg[token_idx])
+            amax_bf16 = self._amax_lane(value).to(cutlass.BFloat16)
+            slot = token_idx // lanes_per_block
+            if (token_idx % lanes_per_block) == lane_in_block:
+                selected_sf[slot] = amax_bf16
+            else:
+                selected_sf[slot] = selected_sf[slot]
+            decode_scale = cutlass.Float32(amax_bf16) * cutlass.Float32(
+                self._data_rcp_limit)
+            scaled_value = value * self._enc_nvfp4(decode_scale)
+            scaled_vec = cute.TensorSSA(
+                vector.insert(
+                    scaled_value.ir_value(),
+                    scaled_vec.ir_value(),
+                    [],
+                    [token_idx],
+                ),
+                (n_tokens, ),
+                cutlass.Float32,
+            )
+        self._store_packed_data(data, scaled_vec.to(cutlass.Float4E2M1FN))
+        return data, selected_sf
+
+    @cute.jit
+    def mxfp8_combine_quant_regs_in_thread_impl(
+        self,
+        prequant_reg: cute.Tensor,
+    ) -> Tuple[cute.Tensor, cute.Tensor]:
+        # bf16 in -> e4m3 data + per-32 e8m0. amax found on bf16 (packed).
+        vec = self.sf_vec_size
+        n_blocks = cute.size(prequant_reg) // vec
+        data = cute.make_rmem_tensor((cute.size(prequant_reg), ),
+                                     cutlass.Float8E4M3FN)
+        sf = cute.make_rmem_tensor((n_blocks, ), cutlass.Float8E8M0FNU)
+        in_blocks = cute.zipped_divide(prequant_reg,
+                                       (vec, ))  # ((vec,), (n_blocks,))
+        data_blocks = []
+        sf_values = []
+        for vec_block_idx in cutlass.range_constexpr(n_blocks):
+            block = in_blocks[None, vec_block_idx]
+            # widen the native-bf16 amax to fp32 for the e8m0 round-up math.
+            scale_e8m0, scale_f32 = self._e8m0(
+                cutlass.Float32(self._amax_thread_bf16(block)))
+            sf_values.append(scale_e8m0)
+            data_blocks.append(
+                self._scale_to_e4m3_ssa(block, self._enc_mxfp8(scale_f32)))
+        self._store_packed_blocks(data, data_blocks)
+        sf.store(self._values_to_ssa(sf_values, cutlass.Float8E8M0FNU))
+        return data, sf
+
+    # Mapping: (lane_idx, selected_sf_idx) -> (token_64, hidden_32)
+    # token_idx = lane_idx + selected_sf_idx * 32
+    # hidden_idx = 0
+    @cute.jit
+    def mxfp8_combine_quant_threads_with_the_same_reg_impl(
+        self,
+        prequant_reg: cute.Tensor,
+    ) -> Tuple[cute.Tensor, cute.Tensor]:
+        # UBLK has lane == hidden, so the warp's 32 lanes are 32 consecutive
+        # hidden. A scale block = sf_vec hidden, so the lanes split along hidden
+        # into 32 // sf_vec blocks of sf_vec lanes each (warp = blocks_per_warp *
+        # lanes_per_block, the EP x TP split). Only the sf_vec lanes inside a
+        # block share its CREDUX scale, so they pool the subtile tokens. mxfp8
+        # sf_vec == 32 -> the whole warp is one block, all 32 lanes pool.
+        lanes_per_block = self.sf_vec_size
+        n_tokens = cute.size(prequant_reg)
+        lane_in_block = self.lane_idx % cutlass.Int32(lanes_per_block)
+        data = cute.make_rmem_tensor((n_tokens, ), cutlass.Float8E4M3FN)
+        selected_sf = cute.make_rmem_tensor((n_tokens // lanes_per_block, ),
+                                            cutlass.Float8E8M0FNU)
+        scaled_vec = cute.full((n_tokens, ), cutlass.Float32(0.0),
+                               cutlass.Float32)
+        for token_idx in cutlass.range_constexpr(n_tokens):
+            value = cutlass.Float32(prequant_reg[token_idx])
+            scale_e8m0, scale_f32 = self._e8m0(self._amax_lane(value))
+            slot = token_idx // lanes_per_block
+            if (token_idx % lanes_per_block) == lane_in_block:
+                selected_sf[slot] = scale_e8m0
+            else:
+                selected_sf[slot] = selected_sf[slot]
+            scaled_value = value * self._enc_mxfp8(scale_f32)
+            scaled_vec = cute.TensorSSA(
+                vector.insert(
+                    scaled_value.ir_value(),
+                    scaled_vec.ir_value(),
+                    [],
+                    [token_idx],
+                ),
+                (n_tokens, ),
+                cutlass.Float32,
+            )
+        self._store_packed_data(data, scaled_vec.to(cutlass.Float8E4M3FN))
+        return data, selected_sf
+
+    # -- shared sub-steps -----------------------------------------------------
+
+    @cute.jit
+    def _scale_to_e2m1_ssa(
+        self,
+        block: cute.Tensor,
+        enc: cutlass.Float32,
+    ) -> cute.TensorSSA:
+        block_f32 = block.load().to(cutlass.Float32)
+        enc_vec = cute.full_like(block_f32, enc, cutlass.Float32)
+        return (block_f32 * enc_vec).to(cutlass.Float4E2M1FN)
+
+    @cute.jit
+    def _scale_to_e4m3_ssa(
+        self,
+        block: cute.Tensor,
+        enc: cutlass.Float32,
+    ) -> cute.TensorSSA:
+        block_f32 = block.load().to(cutlass.Float32)
+        enc_vec = cute.full_like(block_f32, enc, cutlass.Float32)
+        return (block_f32 * enc_vec).to(cutlass.Float8E4M3FN)
+
+    @cute.jit
+    def _concat_blocks_ssa(self, blocks,
+                           dtype: Type[cutlass.Numeric]) -> cute.TensorSSA:
+        values = []
+        for block_idx in cutlass.range_constexpr(len(blocks)):
+            block = blocks[block_idx]
+            for elem_idx in cutlass.range_constexpr(cute.size(block.shape)):
+                values.append(block[elem_idx].ir_value())
+        vec = vector.from_elements(
+            T.vector(len(values), dtype.mlir_type),
+            values,
+        )
+        return cute.TensorSSA(vec, (len(values), ), dtype)
+
+    @cute.jit
+    def _values_to_ssa(self, values,
+                       dtype: Type[cutlass.Numeric]) -> cute.TensorSSA:
+        vec = vector.from_elements(
+            T.vector(len(values), dtype.mlir_type),
+            [values[i].ir_value() for i in range(len(values))],
+        )
+        return cute.TensorSSA(vec, (len(values), ), dtype)
+
+    @cute.jit
+    def _concat_i32_blocks_ssa(self, blocks) -> cute.TensorSSA:
+        values = []
+        for block_idx in cutlass.range_constexpr(len(blocks)):
+            packed_block = blocks[block_idx].bitcast(cutlass.Int32)
+            for elem_idx in cutlass.range_constexpr(
+                    cute.size(packed_block.shape)):
+                values.append(packed_block[elem_idx].ir_value())
+        vec = vector.from_elements(
+            T.vector(len(values), cutlass.Int32.mlir_type),
+            values,
+        )
+        return cute.TensorSSA(vec, (len(values), ), cutlass.Int32)
+
+    @cute.jit
+    def _store_packed_blocks(self, data: cute.Tensor, blocks) -> None:
+        packed_data = cute.recast_tensor(data, cutlass.Int32)
+        packed_data.store(self._concat_i32_blocks_ssa(blocks))
+
+    @cute.jit
+    def _store_packed_data(self, data: cute.Tensor,
+                           data_ssa: cute.TensorSSA) -> None:
+        packed_data = cute.recast_tensor(data, cutlass.Int32)
+        packed_data.store(data_ssa.bitcast(cutlass.Int32))
+
+    @cute.jit
+    def _amax_thread_fp32(self, block: cute.Tensor) -> cutlass.Float32:
+        # max.xorsign.abs reduces |.| in one op per element; the result sign is
+        # the xor of the inputs (junk for an amax), so clear it at the end.
+        def max_abs(lhs: cutlass.Float32,
+                    rhs: cutlass.Float32) -> cutlass.Float32:
+            return cutlass.Float32(
+                llvm.inline_asm(
+                    T.f32(),
+                    [
+                        cutlass.Float32(lhs).ir_value(),
+                        cutlass.Float32(rhs).ir_value()
+                    ],
+                    "max.xorsign.abs.f32 $0, $1, $2;",
+                    "=f,f,f",
+                    has_side_effects=False,
+                    is_align_stack=False,
+                    asm_dialect=llvm.AsmDialect.AD_ATT,
+                ))
+
+        acc = block[0]
+        for elem_idx in cutlass.range_constexpr(1, cute.size(block)):
+            acc = max_abs(acc, block[elem_idx])
+        mag_bits = cutlass.Int32(
+            llvm.bitcast(
+                T.i32(),
+                cutlass.Float32(acc).ir_value())) & cutlass.Int32(0x7FFFFFFF)
+        return cutlass.Float32(llvm.bitcast(T.f32(), mag_bits.ir_value()))
+
+    @cute.jit
+    def _amax_thread_bf16(self, block: cute.Tensor) -> cutlass.BFloat16:
+        # Packed bf16x2 abs-max: tree-reduce the pairs, then fold the survivor's
+        # two halves (high shifted into low). max.xorsign.abs leaves a junk sign,
+        # so the low bf16 is masked before being read back. The amax is natively
+        # bf16 -- exactly what the wire format stores.
+        def max_abs(lhs: cutlass.Int32, rhs: cutlass.Int32) -> cutlass.Int32:
+            return cutlass.Int32(
+                llvm.inline_asm(
+                    T.i32(),
+                    [
+                        cutlass.Int32(lhs).ir_value(),
+                        cutlass.Int32(rhs).ir_value()
+                    ],
+                    "max.xorsign.abs.bf16x2 $0, $1, $2;",
+                    "=r,r,r",
+                    has_side_effects=False,
+                    is_align_stack=False,
+                    asm_dialect=llvm.AsmDialect.AD_ATT,
+                ))
+
+        pairs = cute.recast_tensor(block, cutlass.Int32)  # (vec/2,) bf16x2
+        acc = cutlass.Int32(pairs[0])
+        for pair_idx in cutlass.range_constexpr(1, cute.size(pairs)):
+            acc = max_abs(acc, pairs[pair_idx])
+        acc = max_abs(acc, acc >> cutlass.Int32(16))
+        amax_bits = cute.make_rmem_tensor((1, ), cutlass.Int32)
+        amax_bits[0] = acc & cutlass.Int32(0x7FFF)
+        return cute.recast_tensor(amax_bits, cutlass.BFloat16)[0]
+
+    @cute.jit
+    def _amax_lane(self, v: cutlass.Float32) -> cutlass.Float32:
+        if cutlass.const_expr(self.sf_vec_size == 32):
+            return cute.arch.warp_redux_sync(v, "fmax", abs=True)
+        first_half = (self.lane_idx % cutlass.Int32(32)) < cutlass.Int32(16)
+        vsel = cutlass.Float32(0.0)
+        if first_half:
+            vsel = v
+        amax = cute.arch.warp_redux_sync(vsel, "fmax", abs=True)
+        if not first_half:
+            amax = cute.arch.warp_redux_sync(v, "fmax", abs=True)
+        return amax
+
+    @cute.jit
+    def _e8m0(
+            self, amax: cutlass.Float32
+    ) -> Tuple[cutlass.Float8E8M0FNU, cutlass.Float32]:
+        candidate = amax * cutlass.Float32(self._data_rcp_limit)
+        scale_f32 = cutlass.Float32(
+            cvt_f32_to_f8_to_f32(candidate, cutlass.Float8E8M0FNU))
+        return scale_f32.to(cutlass.Float8E8M0FNU), scale_f32
+
+    @cute.jit
+    def _enc_nvfp4(self, decode_scale: cutlass.Float32) -> cutlass.Float32:
+        # rcp.approx.ftz with the fc1 cap+mask idiom (amax==0 -> 0, no inf*0 NaN).
+        enc = cute.arch.fmin(cute.arch.rcp_approx(decode_scale), Fp32Max)
+        mask = cute.arch.fmin(decode_scale * cutlass.Float32(1e30),
+                              cutlass.Float32(1.0))
+        return enc * mask
+
+    @cute.jit
+    def _enc_mxfp8(self, scale_f32: cutlass.Float32) -> cutlass.Float32:
+        # Skip nan
+        enc = cute.arch.fmin(cute.arch.rcp_approx(scale_f32), Fp32Max)
+        mask = cute.arch.fmin(scale_f32 * cutlass.Float32(1e30),
+                              cutlass.Float32(1.0))
+        return enc * mask
+
 
 # =============================================================================
 # Region tag
@@ -475,7 +955,7 @@ class TmemTranspose32x32Inplace:
 
 
 @dataclasses.dataclass(frozen=True)
-class NvFp4OptionalEpiArgs:
+class NvFp4OptinalEpiArgs:
     # MoE domain (experts), nvfp4 only?
     fc1_alpha: Optional[cute.Tensor]
     fc2_alpha: Optional[cute.Tensor]
@@ -519,7 +999,8 @@ class SwapABSwigluFp4Epilogue:
             use_2cta_instrs: bool,
             sf_vec_size: int,
             fc1_output_dtype: Type[cutlass.Numeric],
-            fc2_output_dtype: Type[cutlass.Numeric],
+            combine_format:
+        CombineFormat,  # fc2 combine wire: act_dtype (data) + scale_dtype (sf)
             non_ubulk_fc2_store:
         bool,  # Whether epilogue warps use STG or UBLK in fc2
             in_kernel_fc2_reduce:
@@ -528,9 +1009,6 @@ class SwapABSwigluFp4Epilogue:
         bool = False,  # Whether epilogue warps store fc2 to local or peer
             acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
             fc1_output_sf_dtype: Type[cutlass.Numeric] = cutlass.Float8E4M3FN,
-            fc2_output_sf_dtype: Optional[Type[
-                cutlass.
-                Numeric]] = None,  # Reserve for later low precision combine
             allow_overlap_acc: bool = True,
             static_expert_shape: Optional[Tuple[
                 int, int, int]] = None,  # [expert, intermediate, hidden]
@@ -554,7 +1032,7 @@ class SwapABSwigluFp4Epilogue:
         self.fc2_use_bulk = not non_ubulk_fc2_store
         self.reduce_topk_in_kernel = in_kernel_fc2_reduce
         self.token_back_by_dispatch = token_back_by_dispatch
-        self.fc2_output_dtype = fc2_output_dtype
+        self.combine_format = combine_format
         self.fc1_output_dtype = fc1_output_dtype
         self.acc_dtype = acc_dtype
         self.fc1_output_sf_dtype = fc1_output_sf_dtype
@@ -653,11 +1131,11 @@ class SwapABSwigluFp4Epilogue:
             fc1_done_counter: cute.Tensor,  # 1D tensor
             tidx: cutlass.Int32,
             optional_epi_args:
-        NvFp4OptionalEpiArgs = None,  # Epilogue optional runtime arguments.
+        NvFp4OptinalEpiArgs = None,  # Epilogue optional runtime arguments.
             token_comm_args=None,  # Only valid when enable token communication
     ):
         if cutlass.const_expr(optional_epi_args is None):
-            optional_epi_args = NvFp4OptionalEpiArgs(
+            optional_epi_args = NvFp4OptinalEpiArgs(
                 fc1_alpha=None,
                 fc2_alpha=None,
                 fc1_norm_const=None,
@@ -777,7 +1255,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         fc1_output: cute.Tensor,  # fake (m,n,l) domain
         fc1_output_sf: cute.Tensor,  # fake (m,n,l) domain
         fc1_done_counter: cute.Tensor,  # 1D tensor
-        optional_epi_args: NvFp4OptionalEpiArgs,
+        optional_epi_args: NvFp4OptinalEpiArgs,
     ):
         self.base = base
         self.tidx = tidx % (base._EpilogueWarpCnt * 32)
@@ -881,7 +1359,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
 
         acc_pipeline.consumer_wait(acc_consumer_state)
         iket.range_push("fc1_epi")
-        valid_tokens = work_tile_info.valid_tokens_in_tile
+        valid_tokens = work_tile_info.valid_tokens_in_cta_tile
 
         # Overlap path preloads two subtiles before releasing acc TMEM.
         unroll_tile_cnt = 2 if cutlass.const_expr(self.overlapping_accum) else 0
@@ -1129,6 +1607,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         if self.warp_idx == subtile_idx:
             tma_ready_to_read_smem_named_barrier.arrive_and_wait()
             with cute.arch.elect_one():
+                # if work_tile_info.tile_m_idx * (self.cta_tile_m // 2) < cute.size(fc1_output, 1):
                 cute.copy(self.fc1_tma_atom, tma_smem_src, tma_gmem_dst)
         else:
             tma_ready_to_read_smem_named_barrier.arrive()
@@ -1284,8 +1763,6 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         fc1_output_sf: cute.
         Tensor,  # MoE domain (token_this_rank, intermediate_down, 1)
         subtile_idx: cutlass.Int32):
-        _Nvfp4RcpLimit = 1.0 / 6.0  # 1 / max abs of Float4E2M1FN (= 6.0)
-        _Fp32Max = 3.40282346638528859812e38
         # ``two_token`` are the two post-swiglu, transposed token rmem tensors;
         # each lane holds one token's ``sf_vec_size`` (=16, one NVFP4 SF block)
         # intermediate-output values.  half 0 -> token (lane), half 1 -> (lane+32).
@@ -1303,8 +1780,10 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         # norm_const is treated like alpha_val: None => behaves as 1.0 (factors
         # const-elided, not multiplied by 1.0).
         n = cute.size(two_token[0])
-        rcp_limit = cutlass.Float32(_Nvfp4RcpLimit)
-        fp32_max = cutlass.Float32(_Fp32Max)
+        # The core block quant (amax + e4m3 sfc + capped/masked acc_scale + e2m1
+        # cvt) is QuantImpl's job; this method still owns the topk pre-multiply,
+        # the sfc store, and the STS.64 into the shared output stage.
+        quant = QuantImpl("nvfp4", "regs_in_thread")
 
         intermediate_idx = (work_tile_info.tile_m_idx * (self.cta_tile_m // 2) +
                             self.warp_idx * Nvfp4BlockSize)
@@ -1344,39 +1823,12 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
                 for i in cutlass.range_constexpr(0, n):
                     weighted[i] = tok[i]
 
-            # 2) absmax over the block.
-            absmax = cutlass.Float32(0.0)
-            for i in cutlass.range_constexpr(0, n):
-                v = weighted[i]
-                absmax = cute.arch.fmax(absmax, cute.arch.fmax(v, -v))
+            # 2) Core block quant: amax + e4m3 sfc + capped/masked acc_scale +
+            #    e2m1 cvt. One 16-wide block -> one e2m1 reg tensor + one sfc.
+            fp4_regs, sfc_regs = quant(weighted, norm_const=norm_const)
+            sfc_e4m3 = sfc_regs[0]
 
-            # 3) scale factor.
-            if cutlass.const_expr(norm_const is not None):
-                sfc_fp32 = absmax * rcp_limit * norm_const
-            else:
-                sfc_fp32 = absmax * rcp_limit
-            sfc_e4m3 = sfc_fp32.to(self.fc1_output_sf_dtype)
-            sfc_rt = cutlass.Float32(sfc_e4m3)
-
-            # 4) acc_scale = norm_const * rcp(sfc), capped, with sfc==0 guard.
-            if cutlass.const_expr(norm_const is not None):
-                acc_scale = norm_const * cute.arch.rcp_approx(sfc_rt)
-            else:
-                acc_scale = cute.arch.rcp_approx(sfc_rt)
-            acc_scale = cute.arch.fmin(acc_scale, fp32_max)
-            mask = cute.arch.fmin(sfc_rt * cutlass.Float32(1e30),
-                                  cutlass.Float32(1.0))
-            acc_scale = acc_scale * mask
-
-            scaled = cute.make_rmem_tensor((n, ), cutlass.Float32)
-            acc_scale_pair = (acc_scale, acc_scale)
-            for i in cutlass.range_constexpr(0, n, 2):
-                s0, s1 = cute.arch.mul_packed_f32x2(
-                    (weighted[i], weighted[i + 1]), acc_scale_pair)
-                scaled[i] = s0
-                scaled[i + 1] = s1
-
-            # 5) scale-factor store (predicate const-elided when statically
+            # 3) scale-factor store (predicate const-elided when statically
             #    in-bound, mirroring signal_fc1_done's intermediate predicate).
             if cutlass.const_expr(self.static_expert_shape is None
                                   or self.intermediate_downproj %
@@ -1388,9 +1840,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
                 fc1_output_sf[token_idx_pair[half], intermediate_idx,
                               0] = sfc_e4m3
 
-            # 6) NVFP4 cvt + STS.64 into this subtile's shared output stage.
-            fp4_regs = cute.make_rmem_tensor((n, ), cutlass.Float4E2M1FN)
-            fp4_regs.store(scaled.load().to(cutlass.Float4E2M1FN))
+            # 4) STS.64 the e2m1 into this subtile's shared output stage.
             # ((1, 16), (token_tile_size, warp_cnt)) -> (16)
             smem_thread_row = smem_tiled[(0, None), (self.lane_idx + 32 * half,
                                                      self.warp_idx)]
@@ -1411,8 +1861,10 @@ class Fc2ProcessPipeline():
     # (never evaluated); ``store_out_mapping`` is the per-issue form that the
     # router actually evaluates at runtime to drive metadata / pointer math.
     fc2_cta_tile_contract: Contract
-    store_out_mapping: Contract
+    store_out_mapping: Contract  # data plane, per-issue
     require_tmem_trans: bool
+    # SF plane per-issue mapping; None for the bf16 (unquantized) paths.
+    sf_store_out_mapping: Optional[Contract] = None
 
 
 # Device only object
@@ -1425,7 +1877,7 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
         epi_smem_storage,
         fc2_output: cute.Tensor,  # MoE domain (token, topk, hidden)
         token_comm_args: TokenCommArgs,
-        optional_epi_args: NvFp4OptionalEpiArgs,
+        optional_epi_args: NvFp4OptinalEpiArgs,
     ):
         self.base = base
         self.tidx = tidx % (base._EpilogueWarpCnt * 32)
@@ -1435,17 +1887,16 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
         self.token_comm_args = token_comm_args
         self.optional_epi_args = optional_epi_args
         if cutlass.const_expr(base.fc2_use_bulk):
-            fc2_smem_rows = (base.epi_smem_bytes * 8 //
-                             base._EpilogueFc2HiddenTileSize //
-                             base.fc2_output_dtype.width)
-            if cutlass.const_expr(fc2_smem_rows != 32):
-                raise NotImplementedError(
-                    "Remember to adjust fc2 smem structure if switch to non-bf16 combine."
-                )
+            wire_dtype = base.combine_format.act_dtype
+            fc2_smem_rows = 32
+            if cutlass.const_expr(fc2_smem_rows *
+                                  base._EpilogueFc2HiddenTileSize *
+                                  wire_dtype.width // 8 > base.epi_smem_bytes):
+                raise ValueError("fc2 UBLK data smem exceeds epi_smem budget.")
             self.smem_tensor = cute.make_tensor(
                 cute.recast_ptr(
                     epi_smem_storage.epi_smem.data_ptr(),
-                    dtype=base.fc2_output_dtype,
+                    dtype=wire_dtype,
                 ),
                 cute.make_layout(
                     (fc2_smem_rows, base._EpilogueFc2HiddenTileSize),
@@ -1453,7 +1904,7 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
                 ),
             )
             self.process_pipeline = make_fc2_ublk_process_pipeline(
-                fc2_output_dtype=base.fc2_output_dtype,
+                combine_format=base.combine_format,
                 cta_token_tile_size=base.cta_tile_n,
                 cta_hidden_tile_size=base.cta_tile_m,
             )
@@ -1461,13 +1912,13 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
             self.smem_tensor = None
             if cutlass.const_expr(base.reduce_topk_in_kernel):
                 self.process_pipeline = make_fc2_redg_process_pipeline(
-                    fc2_output_dtype=base.fc2_output_dtype,
+                    combine_format=base.combine_format,
                     cta_token_tile_size=base.cta_tile_n,
                     cta_hidden_tile_size=base.cta_tile_m,
                 )
             else:
                 self.process_pipeline = make_fc2_stg_process_pipeline(
-                    fc2_output_dtype=base.fc2_output_dtype,
+                    combine_format=base.combine_format,
                     cta_token_tile_size=base.cta_tile_n,
                     cta_hidden_tile_size=base.cta_tile_m,
                 )
@@ -1491,15 +1942,14 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
     @cute.jit
     def signal_fc2_done(self, work_tile_info, next_work_tile_info,
                         flag_tracker):
-        # fc2 publishes only under token_back_by_dispatch; otherwise null slot.
-        # Either way the accumulate call's phase switch flushes the pending fc1
-        # batch at the Linear1->Linear2 boundary.
-        if cutlass.const_expr(self.token_back_by_dispatch):
+        publish: cutlass.Constexpr = (self.token_back_by_dispatch
+                                      or self.combine_format.is_quantized)
+        if cutlass.const_expr(publish):
             flag_addr = (self.token_comm_args.fc2_done_counter.iterator +
                          work_tile_info.expert_idx).toint()
         else:
             flag_addr = Int64(0)
-        no_fire: cutlass.Constexpr = not self.token_back_by_dispatch
+        no_fire: cutlass.Constexpr = not publish
         return flag_tracker.accumulate(next_work_tile_info.phase,
                                        self.fc2_epi_flag_batch, flag_addr,
                                        no_fire)
@@ -1523,7 +1973,7 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
 
         metadata_u32 = None
         peer_rank_ptr_mapper = None
-        direct_token_base_this_cta_tile = task_tile_data_row_start
+        data_token_base = task_tile_data_row_start
         if cutlass.const_expr(self.token_comm_args is not None
                               and not self.token_back_by_dispatch):
             metadata_u32 = cute.domain_offset(
@@ -1534,19 +1984,32 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
                 ),
             )
             peer_rank_ptr_mapper = self.token_comm_args.peer_rank_ptr_mapper
-            direct_token_base_this_cta_tile = None
+            data_token_base = None
+
+        if cutlass.const_expr(self.combine_format.is_quantized):
+            base_outputs = (self.fc2_output, self.token_comm_args.fc2_output_sf)
+            token_bases = (data_token_base, task_tile_data_row_start)
+            output_mappings = (
+                self.process_pipeline.store_out_mapping,
+                self.process_pipeline.sf_store_out_mapping,
+            )
+        else:
+            base_outputs = self.fc2_output
+            token_bases = data_token_base
+            output_mappings = self.process_pipeline.store_out_mapping
 
         return Fc2OutputRouter(
             metadata=metadata_u32,
-            direct_token_base_this_cta_tile=direct_token_base_this_cta_tile,
-            base_output=self.fc2_output,
+            token_bases=token_bases,
+            base_outputs=base_outputs,
             hidden_base_this_cta_tile=hidden_base_this_cta_tile,
             peer_rank_ptr_mapper=peer_rank_ptr_mapper,
-            valid_tokens_this_cta_tile=work_tile_info.valid_tokens_in_tile,
+            valid_tokens_this_cta_tile=work_tile_info.valid_tokens_in_cta_tile,
             valid_hidden_this_cta_tile=valid_hidden_this_cta_tile,
             reduce_topk_in_kernel=self.reduce_topk_in_kernel,
-            output_mapping=self.process_pipeline.store_out_mapping,
+            output_mappings=output_mappings,
             epi_tid=self.tidx,
+            combine_format=self.combine_format,
         ).prefetch()
 
     @cute.jit
@@ -1576,7 +2039,7 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
 
         acc_pipeline.consumer_wait(acc_consumer_state, acc_ready)
         iket.range_push("fc2_epi")
-        valid_tokens = work_tile_info.valid_tokens_in_tile
+        valid_tokens = work_tile_info.valid_tokens_in_cta_tile
 
         # Overlap path preloads two subtiles before releasing acc TMEM.
         unroll_tile_cnt = 2 if cutlass.const_expr(
@@ -1698,14 +2161,12 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
 
         casted = process_pipeline.f2fp(
             *loaded,
-            fc2_output_dtype=self.fc2_output_dtype,
             alpha_val=alpha_val,
         )
         # reorder returns a bare RMEM fragment in the store's expected pre-store
         # distribution; reorder + store are paired 1:1 inside the pipeline.
         pre_store = process_pipeline.post_f2fp_reorder(
             casted=casted,
-            fc2_output_dtype=self.fc2_output_dtype,
             tmem_subtile_view=tmem_subtile_tensor,
         )
         process_pipeline.store_function(
@@ -1722,28 +2183,63 @@ class Fc2OutputRouter:
     # Later this will be changed to (token, 2), where top_k and rank_idx will be fused into 32bit.
     # If metadata is None then this is a local write.
     metadata: Optional[cute.Tensor]
-    direct_token_base_this_cta_tile: Optional[cutlass.Int32]
-    base_output: cute.Tensor  # (token, topk, hidden)
+    # token + possible sf
+    token_bases: Union[Tuple[Optional[cutlass.Int32], cutlass.Int32],
+                       Optional[cutlass.Int32]]
+    base_outputs: Union[Tuple[cute.Tensor, cute.Tensor],
+                        cute.Tensor]  # (token, topk, hidden)
     hidden_base_this_cta_tile: Union[cutlass.Int32, int]
     peer_rank_ptr_mapper: Optional[SymBufferDeviceBase]
     valid_tokens_this_cta_tile: cutlass.Int32
     valid_hidden_this_cta_tile: Union[cutlass.Int32, int]
     reduce_topk_in_kernel: bool
-    output_mapping: Contract  # (epi_tid, iter_idx) -> (token_cta_tile, hidden_cta_tile).
+    # Per-issue (epi_tid, iter_idx) -> (token_cta_tile, hidden_cta_tile). Data
+    # mapping, or (data mapping, sf mapping) when quantized.
+    output_mappings: Union[Tuple[Contract, Contract], Contract]
     epi_tid: cutlass.Int32
-
+    combine_format: CombineFormat
     # After metadata prefetch
     dst_ptrs: Optional[
         cute.
         Tensor] = None  # i64 x (copy_iters_this_thread_cta_tile), fundamentally the pointers.
     valid: Optional[cute.Tensor] = None  # (copy_iters_this_thread_cta_tile)
 
+    @property
+    def data_output(self) -> cute.Tensor:
+        return self.base_outputs[0] if isinstance(self.base_outputs,
+                                                  tuple) else self.base_outputs
+
+    @property
+    def sf_output(self) -> Optional[cute.Tensor]:
+        # Present iff quantized; (pool_token, 1, hidden // sf_vec) rank-local.
+        return self.base_outputs[1] if isinstance(self.base_outputs,
+                                                  tuple) else None
+
+    @property
+    def data_token_base(self) -> Optional[cutlass.Int32]:
+        return self.token_bases[0] if isinstance(self.token_bases,
+                                                 tuple) else self.token_bases
+
+    @property
+    def sf_token_base(self) -> Optional[cutlass.Int32]:
+        return self.token_bases[1] if isinstance(self.token_bases,
+                                                 tuple) else None
+
+    @property
+    def data_mapping(self) -> Contract:
+        return self.output_mappings[0] if isinstance(
+            self.output_mappings, tuple) else self.output_mappings
+
+    @property
+    def sf_mapping(self) -> Optional[Contract]:
+        return self.output_mappings[1] if isinstance(self.output_mappings,
+                                                     tuple) else None
+
     def __post_init__(self) -> None:
-        if (self.metadata is None) == (self.direct_token_base_this_cta_tile
-                                       is None):
+        if (self.metadata is None) == (self.data_token_base is None):
             raise ValueError(
                 "Fc2OutputRouter requires exactly one of metadata or "
-                "direct_token_base_this_cta_tile.")
+                "a (data) token base.")
         if (self.metadata is None) != (self.peer_rank_ptr_mapper is None):
             raise ValueError(
                 "Fc2OutputRouter requires peer_rank_ptr_mapper iff metadata is set."
@@ -1761,8 +2257,8 @@ class Fc2OutputRouter:
         # get_dst() -- no array, hence no runtime-indexed local-memory spill.
         if cutlass.const_expr(self.metadata is None):
             return self
-        iter_axis = self.output_mapping.domain.names.index("iter_idx")
-        copy_iters: cutlass.Constexpr[int] = self.output_mapping.domain.sizes[
+        iter_axis = self.data_mapping.domain.names.index("iter_idx")
+        copy_iters: cutlass.Constexpr[int] = self.data_mapping.domain.sizes[
             iter_axis]
 
         valid = cute.make_rmem_tensor((copy_iters, ), cutlass.Int32)
@@ -1772,7 +2268,7 @@ class Fc2OutputRouter:
         # We should check the SASS to ensure this happens.
         for iter_idx in cutlass.range_constexpr(copy_iters):
             coord = eval_function_mapping(
-                self.output_mapping,
+                self.data_mapping,
                 epi_tid=self.epi_tid,
                 iter_idx=iter_idx,
             )
@@ -1788,10 +2284,12 @@ class Fc2OutputRouter:
             if token_valid and hidden_valid:
                 valid[iter_idx] = cutlass.Int32(1)
                 if cutlass.const_expr(self.metadata is None):
-                    dst_tokens = self.direct_token_base_this_cta_tile + token_in_tile
+                    dst_tokens = self.data_token_base + token_in_tile
                     dst_hidden = hidden_in_tile + self.hidden_base_this_cta_tile
-                    dst_ptrs[iter_idx] = self.base_output[
-                        dst_tokens, None, dst_hidden].iterator.toint()
+                    # Int64 token coord: dst_tokens*K*H overflows int32 once
+                    # T*K*H exceeds 2^31 (data_output is (token, topk, hidden)).
+                    dst_ptrs[iter_idx] = self.data_output[
+                        Int64(dst_tokens), None, dst_hidden].iterator.toint()
 
                 else:
                     md = TokenSrcMetadata.load(self.metadata.iterator.toint() +
@@ -1804,11 +2302,15 @@ class Fc2OutputRouter:
                         dst_topk = md.src_topk
                     else:
                         dst_topk = 0
+                    # Int64 token coord: domain_offset on (token, topk, hidden)
+                    # computes dst_token*K*H, which overflows int32 once T*K*H > 2^31.
                     dst_ptrs[
                         iter_idx] = self.peer_rank_ptr_mapper.ptr_map_to_rank(
                             cute.domain_offset(
-                                (dst_token, dst_topk, dst_hidden),
-                                self.base_output).iterator, dst_rank).toint()
+                                (Int64(dst_token), dst_topk, dst_hidden),
+                                self.data_output).iterator,
+                            dst_rank,
+                            byte_align=32).toint()
 
         return dataclasses.replace(
             self,
@@ -1817,15 +2319,15 @@ class Fc2OutputRouter:
         )
 
     @cute.jit
-    def get_dst(
+    def get_data_dst(
         self,
         iter_idx: Union[int, cutlass.Int32],
     ) -> Tuple[cute.Pointer, cutlass.Int32]:
-        """Per-issue destination: gmem pointer + validity predicate.
+        """Per-issue DATA destination: gmem pointer + validity predicate.
 
-        Replaces resolve().  The router owns ``base_output`` so the caller
-        never re-assembles a pointer from a raw int; it just builds its own
-        copy tensor (STG) or feeds the pointer to inline asm (REDG/UBLK).
+        The router owns ``data_output`` so the caller never re-assembles a
+        pointer from a raw int; it just builds its own copy tensor (STG) or
+        feeds the pointer to inline asm (REDG/UBLK).
 
         Alignment is unified at 32 B: only STG feeds this pointer to a real
         ``cute.copy`` (256 b vector store, genuinely 32 B aligned); REDG/UBLK
@@ -1836,7 +2338,7 @@ class Fc2OutputRouter:
             # invariant base hoists out of the caller's loop via CSE; a
             # constexpr iter folds the per-issue offset into the store.
             coord = eval_function_mapping(
-                self.output_mapping,
+                self.data_mapping,
                 epi_tid=self.epi_tid,
                 iter_idx=iter_idx,
             )
@@ -1848,73 +2350,73 @@ class Fc2OutputRouter:
                     and hidden_in_tile < cutlass.Int32(
                         self.valid_hidden_this_cta_tile)):
                 pred = cutlass.Int32(1)
-                dst_tokens = self.direct_token_base_this_cta_tile + token_in_tile
+                dst_tokens = self.data_token_base + token_in_tile
                 dst_hidden = hidden_in_tile + self.hidden_base_this_cta_tile
-                addr = self.base_output[dst_tokens, None,
+                # Int64 token coord: dst_tokens*K*H overflows int32 once T*K*H > 2^31.
+                addr = self.data_output[Int64(dst_tokens), None,
                                         dst_hidden].iterator.toint()
         else:
             # comm: read the pointer / validity prefetched by prefetch().
             addr = self.dst_ptrs[iter_idx]
             pred = self.valid[iter_idx]
         ptr = cute.make_ptr(
-            self.base_output.element_type,
+            self.data_output.element_type,
             addr,
             AddressSpace.gmem,
             assumed_align=32,
         )
         return ptr, pred
 
+    @cute.jit
+    def get_sf_dst(
+        self,
+        iter_idx: Union[int, cutlass.Int32],
+    ) -> Tuple[cute.Pointer, cutlass.Int32]:
+        """Per-issue SF destination: rank-local gmem pointer + validity predicate.
 
-# =============================================================================
-# fc2 STG strategy callables (subtile granularity)
-#
-# Faithful port of the original transpose+STG path, re-cut into the four
-# Fc2ProcessPipeline steps. Originals in epilogue.py:
-#   - load        : _TmemTranspose16x32Core.load_subtile_raw_acc
-#   - pack        : Fc2AccLoadAndPack.__init__  (L986-997)
-#   - transpose   : TmemTranspose16x32 (+ from_r1_perm_until_last_store), each
-#                   32-bit slot carrying one packed bf16x2 pair
-#   - unpack      : Fc2UnpackPermuteStg._init_direct  (L1510-1520)
-#   - store       : Fc2UnpackPermuteStg._stg_direct   (L1522-1605)
-#
-# All callables take the unified kwargs + ``**_`` (extras ignored; missing
-# required -> TypeError). ``epi`` is the SwapABFc2Epilogue device object.
-# =============================================================================
-
-# Per-subtile pre-store RMEM distributions (each lane holds 64 bf16 values).
-# These are fixed properties of the reorder step that produces them and are
-# paired 1:1 with their store function inside ``make_fc2_*_process_pipeline``;
-# the store derives its per-thread element count from ``cute.size`` directly.
-# Documented here for reference -- ``(lane_idx, vid_or_elem) -> (token, hidden)``:
-#
-#   STG  (fc2_stg_post_f2fp_reorder): the pivot order
-#     token  = lane_idx + 32 * (vid // 32)   # vid<32 -> lane, else lane+32
-#     hidden = vid % 32                       # this warp's 32-hidden span
-#
-#   UBLK (post_f2fp_reorder_identity): warp-local + subtile-local; each lane
-#     owns one hidden element across the 64 token positions of the subtile.
-#     token  = vid
-#     hidden = lane_idx
-#
-#   REDG (fc2_redg_post_f2fp_reorder): after the extra STTM + LDTM(16x256b.x2)
-#     reshuffle, every 4 consecutive elem_idx form one red.v2.bf16x2 payload.
-#     token  = ((elem_idx // 2) // 16) * 32
-#            + (((elem_idx // 2) // 8) % 2) * 16
-#            + (((elem_idx // 2) // 2) % 2) * 8
-#            + lane_idx // 4
-#     hidden = (lane_idx % 4) * 4
-#            + (((elem_idx // 2) // 4) % 2) * 16
-#            + ((elem_idx // 2) % 2) * 2
-#            + (elem_idx % 2)
+        SF never goes to a peer (it is staged locally and pushed token-contiguously
+        by the dispatch / standalone warps), so this is always the affine local
+        address -- no metadata routing, no prefetch. ``sf_output`` is the broadcast
+        plane ``(pool_token, 1, (sf_vec, hidden//sf_vec)):(., ., (0, 1))``, so the
+        logical hidden coordinate folds to its scale block on indexing.
+        """
+        coord = eval_function_mapping(
+            self.sf_mapping,
+            epi_tid=self.epi_tid,
+            iter_idx=iter_idx,
+        )
+        token_in_tile = cutlass.Int32(coord["token_in_cta_tile"])
+        hidden_in_tile = cutlass.Int32(coord["hidden_in_cta_tile"])
+        pred = cutlass.Int32(0)
+        addr = cutlass.Int64(0)
+        if (token_in_tile < self.valid_tokens_this_cta_tile and hidden_in_tile
+                < cutlass.Int32(self.valid_hidden_this_cta_tile)):
+            pred = cutlass.Int32(1)
+            sf_row = self.sf_token_base + token_in_tile
+            sf_hidden = hidden_in_tile + self.hidden_base_this_cta_tile
+            addr = self.sf_output[Int64(sf_row), None,
+                                  sf_hidden].iterator.toint()
+        # Per-block scale offsets are element-granular; claim the scale dtype's
+        # natural element alignment (e8m0 1 B / bf16 2 B).
+        sf_ptr = cute.make_ptr(
+            self.sf_output.element_type,
+            addr,
+            AddressSpace.gmem,
+            assumed_align=4,
+        )
+        return sf_ptr, pred
 
 
-# TODO: Enable for non-BF16 dtypes
-def make_fc2_stg_cta_store_out_contract(fc2_output_dtype: Type[cutlass.Numeric],
+def make_fc2_stg_cta_store_out_contract(combine_format: CombineFormat,
                                         cta_token_tile_size: int,
                                         cta_hidden_tile_size: int):
     assert (cta_hidden_tile_size == 128)
     assert (cta_token_tile_size % 64 == 0)
-    assert (fc2_output_dtype.width == 16)
+    wire_dtype = combine_format.act_dtype
+    assert wire_dtype.width in (4, 8,
+                                16), "fc2 STG wire dtype must be fp4/fp8/bf16."
+    elems_per_stg = min(256 // wire_dtype.width, 32)
+    stgs_per_hidden32 = 32 // elems_per_stg
     fundamental_mapping = Contract(
         domain=Space(("epi_tid", "elem_idx"), (128, cta_token_tile_size)),
         codomain=Space(("token_in_cta_tile", "hidden_in_cta_tile"),
@@ -1926,23 +2428,45 @@ def make_fc2_stg_cta_store_out_contract(fc2_output_dtype: Type[cutlass.Numeric],
             }))
     store_out_mapping = Contract(
         domain=Space(("epi_tid", "iter_idx"),
-                     (128, 32 // 16 * cta_token_tile_size // 32)),
+                     (128, stgs_per_hidden32 * cta_token_tile_size // 32)),
         codomain=Space(("token_in_cta_tile", "hidden_in_cta_tile"),
                        (cta_token_tile_size, cta_hidden_tile_size)),
         mapping=FunctionMapping(
             lambda epi_tid, iter_idx: {
-                "token_in_cta_tile": epi_tid % 32 + iter_idx // 2 * 32,
-                "hidden_in_cta_tile": (iter_idx % 2) * 16 + epi_tid // 32 * 32,
+                "token_in_cta_tile":
+                epi_tid % 32 + iter_idx // stgs_per_hidden32 * 32,
+                "hidden_in_cta_tile": (iter_idx % stgs_per_hidden32) *
+                elems_per_stg + epi_tid // 32 * 32,
             }))
-    return store_out_mapping, fundamental_mapping
+    sf_store_out_mapping = None
+    if combine_format.is_quantized:
+
+        def stg_sf_mapping(epi_tid, iter_idx):
+            lane = epi_tid % 32
+            warp = epi_tid // 32
+            return {
+                "token_in_cta_tile": lane + iter_idx * 32,
+                "hidden_in_cta_tile": warp * 32,
+            }
+
+        sf_store_out_mapping = Contract(
+            domain=Space(("epi_tid", "iter_idx"),
+                         (128, cta_token_tile_size // 32)),
+            codomain=Space(("token_in_cta_tile", "hidden_in_cta_tile"),
+                           (cta_token_tile_size, cta_hidden_tile_size)),
+            mapping=FunctionMapping(stg_sf_mapping),
+        )
+    return store_out_mapping, sf_store_out_mapping, fundamental_mapping
 
 
-def make_fc2_redg_cta_store_out_contract(
-        fc2_output_dtype: Type[cutlass.Numeric], cta_token_tile_size: int,
-        cta_hidden_tile_size: int):
+def make_fc2_redg_cta_store_out_contract(combine_format: CombineFormat,
+                                         cta_token_tile_size: int,
+                                         cta_hidden_tile_size: int):
     assert (cta_hidden_tile_size == 128)
     assert (cta_token_tile_size % 64 == 0)
-    assert (fc2_output_dtype.width == 16)
+    # In-kernel reduce is bf16-only and never quantized, so there is no SF plane.
+    assert (combine_format.act_dtype.width == 16)
+    assert not combine_format.is_quantized
     fundamental_mapping = Contract(
         domain=Space(("epi_tid", "elem_idx"), (128, cta_token_tile_size)),
         codomain=Space(("token_in_cta_tile", "hidden_in_cta_tile"),
@@ -1973,15 +2497,18 @@ def make_fc2_redg_cta_store_out_contract(
                 "hidden_in_cta_tile": ((epi_tid // 32) * 32 + (epi_tid % 4) * 4
                                        + ((iter_idx % 4) // 2) * 16),
             }))
-    return store_out_mapping, fundamental_mapping
+    return store_out_mapping, None, fundamental_mapping
 
 
-def make_fc2_ublk_store_out_contract(fc2_output_dtype: Type[cutlass.Numeric],
+def make_fc2_ublk_store_out_contract(combine_format: CombineFormat,
                                      cta_token_tile_size: int,
                                      cta_hidden_tile_size: int):
     assert (cta_hidden_tile_size == 128)
     assert (cta_token_tile_size % 64 == 0)
-    assert (fc2_output_dtype.width == 16)
+    # UBLK pushes whole hidden rows by byte count, so the token/hidden mapping
+    # is element-indexed and dtype-independent (wire dtype only sets copy bytes).
+    assert combine_format.act_dtype.width in (
+        4, 8, 16), "fc2 UBLK wire dtype must be fp4/fp8/bf16."
     assert (cta_token_tile_size <= 256)
     max_token_cta_tile = 256
     fundamental_mapping = Contract(
@@ -2008,7 +2535,40 @@ def make_fc2_ublk_store_out_contract(fc2_output_dtype: Type[cutlass.Numeric],
                 "hidden_in_cta_tile":
                 0,
             }))
-    return store_out_mapping, fundamental_mapping
+    # SF mapping: each lane owns one hidden across a 64-token subtile, and the
+    # sf_vec lanes of a block share the CREDUX scale -- so they split the block's
+    # tokens. sf_iter flattens (subtile, slot) to keep the whole cta-tile domain.
+    sf_store_out_mapping = None
+    if combine_format.is_quantized:
+        sf_vec = combine_format.scale_block
+        lanes_per_block = sf_vec
+        subtile_tokens = SwapABSwigluFp4Epilogue._EpilogueTokenTileSize
+        iters_per_subtile = subtile_tokens // lanes_per_block
+        n_subtiles = cta_token_tile_size // subtile_tokens
+
+        def ublk_sf_mapping(epi_tid, iter_idx):
+            subtile_idx = iter_idx // iters_per_subtile
+            slot = iter_idx % iters_per_subtile
+            lane = epi_tid % 32
+            warp = epi_tid // 32
+            lane_in_block = lane % lanes_per_block
+            block_in_warp = lane // lanes_per_block
+            return {
+                "token_in_cta_tile":
+                subtile_idx * subtile_tokens + lane_in_block +
+                slot * lanes_per_block,
+                "hidden_in_cta_tile":
+                warp * 32 + block_in_warp * sf_vec,
+            }
+
+        sf_store_out_mapping = Contract(
+            domain=Space(("epi_tid", "iter_idx"),
+                         (128, n_subtiles * iters_per_subtile)),
+            codomain=Space(("token_in_cta_tile", "hidden_in_cta_tile"),
+                           (max_token_cta_tile, cta_hidden_tile_size)),
+            mapping=FunctionMapping(ublk_sf_mapping),
+        )
+    return store_out_mapping, sf_store_out_mapping, fundamental_mapping
 
 
 # (...) -> ((atom_v, 1))
@@ -2024,17 +2584,14 @@ def wrap_into_copy_standard_layout(tensor: cute.Tensor):
 @cute.jit
 def fc2_f2fp(
     *tensors,
-    fc2_output_dtype: Type[cutlass.Numeric],
     alpha_val: Optional[cutlass.Float32] = None,
     **_,
 ) -> cute.Tensor:
-    # cvt every input fp32 rmem -> fc2_output_dtype and concatenate, in order,
-    # into one flat rmem tensor. Each block is stored contiguously (no scalar
-    # element copy) at its running offset.
+    reorder_dtype = cutlass.BFloat16
     total_size = 0
     for t in tensors:
         total_size += cute.size(t)
-    converted_acc = cute.make_rmem_tensor((total_size, ), fc2_output_dtype)
+    converted_acc = cute.make_rmem_tensor((total_size, ), reorder_dtype)
     elems_processed = 0
     for t in tensors:
         current_tensor_size = cute.size(t)
@@ -2043,7 +2600,7 @@ def fc2_f2fp(
             cute.make_layout((current_tensor_size, )),
         )
         if cutlass.const_expr(alpha_val is None):
-            dst.store(t.load().to(fc2_output_dtype))
+            dst.store(t.load().to(reorder_dtype))
         else:
             if cutlass.const_expr(current_tensor_size % 2 != 0):
                 raise ValueError(
@@ -2056,7 +2613,7 @@ def fc2_f2fp(
                                                     (alpha_val, alpha_val))
                 scaled[i] = s0
                 scaled[i + 1] = s1
-            dst.store(scaled.load().to(fc2_output_dtype))
+            dst.store(scaled.load().to(reorder_dtype))
         elems_processed += current_tensor_size
     return converted_acc
 
@@ -2099,7 +2656,6 @@ def fc2_ublk_tmem_acc_load(*, tmem_subtile_tensor: cute.Tensor, epi, **_):
 def fc2_stg_post_f2fp_reorder(
         *,
         casted: cute.Tensor,  # (subtile_cnt,)
-        fc2_output_dtype: Type[cutlass.Numeric],
         tmem_subtile_view: cute.Tensor,  # (epi_tile_m, epi_tile_n)
         **_):
 
@@ -2116,7 +2672,7 @@ def fc2_stg_post_f2fp_reorder(
     #   STG pre-store order (token = lane + 32*(vid//32), hidden = vid % 32).
     gather_top_bot_map = ((2, 16, 2), (16, 1, 32))
     scatter_top_bot_map = ((16, 2, 2), (2, 1, 32))
-    dtype = fc2_output_dtype
+    dtype = cutlass.BFloat16
 
     packed = cute.make_rmem_tensor((64, ), dtype)
     cute.autovec_copy(
@@ -2162,14 +2718,12 @@ def fc2_stg_post_f2fp_reorder(
 def fc2_redg_post_f2fp_reorder(
     *,
     casted: cute.Tensor,
-    fc2_output_dtype: Type[cutlass.Numeric],
     tmem_subtile_view: cute.Tensor,
     **_,
 ):
     # (epi_tid, elem_idx) -> (token_64, hidden_128), each thread hold token_2 x hidden_32
     natural = fc2_stg_post_f2fp_reorder(
         casted=casted,
-        fc2_output_dtype=fc2_output_dtype,
         tmem_subtile_view=tmem_subtile_view,
     )
     core_matrix_reorder_sttm_atom = cute.make_copy_atom(
@@ -2223,52 +2777,87 @@ def fc2_redg_post_f2fp_reorder(
 def fc2_stg_store_function(
         *,
         epi,
-        subtile: cute.
-    Tensor,  # pre-store STG distribution (see top of fc2 section)
+        subtile: cute.Tensor,  # Always bf16 pre quant tesnor
         subtile_idx: cutlass.Int32,
         fc2_output_router: Fc2OutputRouter,
         **_):
-    copy_atom_256b = cute.make_copy_atom(
+    if cutlass.const_expr(epi.combine_format.is_quantized):
+        data_subtile, sf_regs = QuantImpl(epi.combine_format,
+                                          "regs_in_thread")(subtile)
+    else:
+        data_subtile = subtile
+        sf_regs = None
+    stg_width_elems: cutlass.Constexpr[int] = min(
+        32, 256 // data_subtile.element_type.width)
+    stg_bits: cutlass.Constexpr[
+        int] = stg_width_elems * data_subtile.element_type.width
+    copy_atom_vec = cute.make_copy_atom(
         cute.nvgpu.CopyUniversalOp(),
-        subtile.element_type,
-        num_bits_per_copy=256,
+        cutlass.Int32,
+        num_bits_per_copy=stg_bits,
     )
-    stg_width_elems: cutlass.Constexpr[int] = 256 // subtile.element_type.width
-    elems_per_thread: cutlass.Constexpr[int] = cute.size(subtile)
+    elems_per_thread: cutlass.Constexpr[int] = cute.size(data_subtile)
     if cutlass.const_expr(elems_per_thread % stg_width_elems != 0):
         raise ValueError(
             "fc2 STG store requires pre-store elems per thread to be divisible "
             f"by STG issue width, got {elems_per_thread} and {stg_width_elems}."
         )
+
+    if cutlass.const_expr(sf_regs is not None):
+        sf_scales_per_stg: cutlass.Constexpr[
+            int] = 32 // epi.combine_format.scale_block
+        token_groups_per_subtile: cutlass.Constexpr[
+            int] = epi._EpilogueTokenTileSize // 32
+        for token_group in cutlass.range_constexpr(token_groups_per_subtile):
+            sf_iter = cutlass.Int32(subtile_idx) * cutlass.Int32(
+                token_groups_per_subtile) + token_group
+            sf_ptr, sf_pred = fc2_output_router.get_sf_dst(sf_iter)
+            if sf_pred != cutlass.Int32(0):
+                sf_dst = cute.make_tensor(
+                    sf_ptr, cute.make_layout((sf_scales_per_stg, )))
+                for k in cutlass.range_constexpr(sf_scales_per_stg):
+                    sf_dst[k] = sf_regs[token_group * sf_scales_per_stg + k]
+
     iters_per_subtile: cutlass.Constexpr[
         int] = elems_per_thread // stg_width_elems
-    copy_src = cute.zipped_divide(subtile, (stg_width_elems, ))
+    copy_src = cute.zipped_divide(data_subtile, (stg_width_elems, ))
     single_copy_layout = cute.make_layout(((stg_width_elems, 1), ),
                                           stride=((1, 0), ))
     subtile_iter_base = cutlass.Int32(subtile_idx) * cutlass.Int32(
         iters_per_subtile)
     for local_iter in cutlass.range_constexpr(iters_per_subtile):
         global_iter = subtile_iter_base + cutlass.Int32(local_iter)
-        dst_ptr, pred = fc2_output_router.get_dst(global_iter)
+        dst_ptr, pred = fc2_output_router.get_data_dst(global_iter)
         if pred != cutlass.Int32(0):
             src_i = cute.make_tensor(copy_src[None, local_iter].iterator,
                                      single_copy_layout)
             dst_i = cute.make_tensor(dst_ptr, single_copy_layout)
-            cute.copy(copy_atom_256b, src_i, dst_i)
+            cute.copy(copy_atom_vec, cute.recast_tensor(src_i, cutlass.Int32),
+                      cute.recast_tensor(dst_i, cutlass.Int32))
 
 
 @cute.jit
 def fc2_ublk_store_function_impl(
     *,
     epi,
-    subtile: cute.
-    Tensor,  # pre-store UBLK distribution (see top of fc2 section)
+    subtile: cute.Tensor,  # Always bf16 pre-quant tensor
     subtile_idx: cutlass.Int32,
     fc2_output_router: Fc2OutputRouter,
+    **_,
 ):
     smem_tensor = epi.smem_tensor
     if cutlass.const_expr(smem_tensor is None):
         raise ValueError("fc2 UBLK store requires epi.smem_tensor.")
+    quantized: cutlass.Constexpr[bool] = epi.combine_format.is_quantized
+    if cutlass.const_expr(quantized):
+        data_subtile, selected_sf = QuantImpl(
+            epi.combine_format,
+            "threads_with_the_same_reg",
+            lane_idx=epi.lane_idx,
+        )(subtile)
+    else:
+        data_subtile = subtile
+        selected_sf = None
 
     smem_read_write_bar = pipeline.NamedBarrier(
         barrier_id=SwapABSwigluFp4Epilogue._EpilogueSyncWaitBarId,
@@ -2278,7 +2867,7 @@ def fc2_ublk_store_function_impl(
     lane_idx = epi.lane_idx
     warp_hidden_base = cutlass.Int32(warp_idx * 32)
 
-    regs_per_thread: cutlass.Constexpr[int] = cute.size(subtile)
+    regs_per_thread: cutlass.Constexpr[int] = cute.size(data_subtile)
     tokens_per_smem_slice: cutlass.Constexpr[int] = cute.size(smem_tensor,
                                                               mode=[0])
     if cutlass.const_expr(regs_per_thread % tokens_per_smem_slice != 0):
@@ -2288,15 +2877,36 @@ def fc2_ublk_store_function_impl(
         )
     loop_cnt: cutlass.Constexpr[int] = regs_per_thread // tokens_per_smem_slice
 
+    # SF straight out (no smem): the sf_vec lanes of a block share the CREDUX
+    # result, so each emits its slice -- one scale per slot. The sf mapping owns
+    # the (lane, slot) -> (token, hidden) layout; selected_sf[slot] is this
+    # lane's slot-th scale, aligned to sf_iter = subtile_idx*iters_per_subtile+slot.
+    if cutlass.const_expr(quantized):
+        # A scale block = sf_vec hidden = sf_vec lanes (UBLK), and those lanes
+        # split the subtile's tokens, so each emits subtile_tokens // lanes_per_block.
+        lanes_per_block: cutlass.Constexpr[int] = epi.combine_format.scale_block
+        iters_per_subtile: cutlass.Constexpr[
+            int] = epi._EpilogueTokenTileSize // lanes_per_block
+        for slot in cutlass.range_constexpr(iters_per_subtile):
+            sf_iter = cutlass.Int32(subtile_idx) * cutlass.Int32(
+                iters_per_subtile) + slot
+            sf_ptr, sf_pred = fc2_output_router.get_sf_dst(sf_iter)
+            if sf_pred != cutlass.Int32(0):
+                sf_dst = cute.make_tensor(sf_ptr, cute.make_layout((1, )))
+                sf_dst[0] = selected_sf[slot]
+
     for token32_group_idx in cutlass.range_constexpr(loop_cnt):
         if cutlass.const_expr(token32_group_idx > 0):
             cute.arch.cp_async_bulk_wait_group(0, read=True)
             smem_read_write_bar.arrive_and_wait()
 
-        # R2S transpose: each lane writes its hidden column's 32 token rows for this group.
+        # R2S transpose: each lane writes its hidden column's 32 token rows for
+        # this group. (SF already went straight out above; only DATA transposes
+        # through smem here.)
         for token_i in cutlass.range_constexpr(tokens_per_smem_slice):
             src_reg = token_i + tokens_per_smem_slice * token32_group_idx
-            smem_tensor[token_i, warp_hidden_base + lane_idx] = subtile[src_reg]
+            smem_tensor[token_i,
+                        warp_hidden_base + lane_idx] = data_subtile[src_reg]
 
         cute.arch.fence_proxy("async.shared", space="cta")
         smem_read_write_bar.arrive_and_wait()
@@ -2305,7 +2915,8 @@ def fc2_ublk_store_function_impl(
         # Gate / scratch_row specialize the store-out mapping: lane_idx//8 picks the
         # subtile, warp_idx*8 + lane_idx%8 is the token's row within the 32-group.
         ublk_iter_idx = token32_group_idx
-        dst_ptr, pred = fc2_output_router.get_dst(ublk_iter_idx)
+        # SF already went straight out above; here only the DATA row is pushed.
+        dst_ptr, pred = fc2_output_router.get_data_dst(ublk_iter_idx)
         if pred != cutlass.Int32(0) and (lane_idx //
                                          cutlass.Int32(8)) == subtile_idx:
             scratch_row = warp_idx * cutlass.Int32(
@@ -2314,7 +2925,9 @@ def fc2_ublk_store_function_impl(
             if cutlass.const_expr(epi.fc2_hidden_needs_predicate):
                 copy_elems = cutlass.Int32(
                     fc2_output_router.valid_hidden_this_cta_tile)
-            copy_bytes = copy_elems * epi.fc2_output_dtype.width // 8
+            # smem_tensor holds the combine wire dtype, so the bulk byte count
+            # scales with the wire width, not the bf16 compute dtype.
+            copy_bytes = copy_elems * epi.combine_format.act_dtype.width // 8
 
             src_row = cute.slice_(smem_tensor, (scratch_row, None))
             if cutlass.const_expr(epi.reduce_topk_in_kernel):
@@ -2342,8 +2955,7 @@ def fc2_ublk_store_function_impl(
 def fc2_redg_store_function(
     *,
     epi,
-    subtile: cute.
-    Tensor,  # pre-store REDG distribution (see top of fc2 section)
+    subtile: cute.Tensor,  # Always bf16; in-kernel reduce never quantizes
     subtile_idx: cutlass.Int32,
     fc2_output_router: Fc2OutputRouter,
     **_,
@@ -2363,7 +2975,7 @@ def fc2_redg_store_function(
 
     for local_iter in cutlass.range_constexpr(iters_per_subtile):
         global_iter = subtile_iter_base + cutlass.Int32(local_iter)
-        dst_ptr, pred = fc2_output_router.get_dst(global_iter)
+        dst_ptr, pred = fc2_output_router.get_data_dst(global_iter)
         if pred != cutlass.Int32(0):
             bf16x4 = subtile_by_redg_issue[None, local_iter]
             packed_bf16x2 = cute.recast_tensor(bf16x4, cutlass.Float32)
@@ -2376,12 +2988,12 @@ def fc2_redg_store_function(
 
 def make_fc2_stg_process_pipeline(
     *,
-    fc2_output_dtype: Type[cutlass.Numeric],
+    combine_format: CombineFormat,
     cta_token_tile_size: int,
     cta_hidden_tile_size: int,
 ) -> Fc2ProcessPipeline:
-    store_out_mapping, fundamental_mapping = make_fc2_stg_cta_store_out_contract(
-        fc2_output_dtype,
+    store_out_mapping, sf_store_out_mapping, fundamental_mapping = make_fc2_stg_cta_store_out_contract(
+        combine_format,
         cta_token_tile_size,
         cta_hidden_tile_size,
     )
@@ -2392,18 +3004,19 @@ def make_fc2_stg_process_pipeline(
         store_function=fc2_stg_store_function,
         fc2_cta_tile_contract=fundamental_mapping,
         store_out_mapping=store_out_mapping,
+        sf_store_out_mapping=sf_store_out_mapping,
         require_tmem_trans=True,
     )
 
 
 def make_fc2_redg_process_pipeline(
     *,
-    fc2_output_dtype: Type[cutlass.Numeric],
+    combine_format: CombineFormat,
     cta_token_tile_size: int,
     cta_hidden_tile_size: int,
 ) -> Fc2ProcessPipeline:
-    store_out_mapping, fundamental_mapping = make_fc2_redg_cta_store_out_contract(
-        fc2_output_dtype,
+    store_out_mapping, sf_store_out_mapping, fundamental_mapping = make_fc2_redg_cta_store_out_contract(
+        combine_format,
         cta_token_tile_size,
         cta_hidden_tile_size,
     )
@@ -2414,18 +3027,19 @@ def make_fc2_redg_process_pipeline(
         store_function=fc2_redg_store_function,
         fc2_cta_tile_contract=fundamental_mapping,
         store_out_mapping=store_out_mapping,
+        sf_store_out_mapping=sf_store_out_mapping,
         require_tmem_trans=True,
     )
 
 
 def make_fc2_ublk_process_pipeline(
     *,
-    fc2_output_dtype: Type[cutlass.Numeric],
+    combine_format: CombineFormat,
     cta_token_tile_size: int,
     cta_hidden_tile_size: int,
 ) -> Fc2ProcessPipeline:
-    store_out_mapping, fundamental_mapping = make_fc2_ublk_store_out_contract(
-        fc2_output_dtype,
+    store_out_mapping, sf_store_out_mapping, fundamental_mapping = make_fc2_ublk_store_out_contract(
+        combine_format,
         cta_token_tile_size,
         cta_hidden_tile_size,
     )
@@ -2436,5 +3050,6 @@ def make_fc2_ublk_process_pipeline(
         store_function=fc2_ublk_store_function_impl,
         fc2_cta_tile_contract=fundamental_mapping,
         store_out_mapping=store_out_mapping,
+        sf_store_out_mapping=sf_store_out_mapping,
         require_tmem_trans=False,
     )

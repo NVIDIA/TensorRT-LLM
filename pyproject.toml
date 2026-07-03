@@ -354,6 +354,7 @@ exclude = [
     "tensorrt_llm/_torch/cute_dsl_kernels/blackwell/utils.py",
     "tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/__init__.py",
     "tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/blocked_scale.py",
+    "tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/common_moe_utils.py",
     "tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/contract.py",
     "tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/custom_ext.py",
     "tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/dynamic_mainloop.py",

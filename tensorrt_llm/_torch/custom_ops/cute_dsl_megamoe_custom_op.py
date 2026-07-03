@@ -29,8 +29,8 @@ touching the MoE backend.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import os
-import time
 from typing import Any, List, Optional, Tuple
 
 import torch
@@ -51,6 +51,16 @@ from ..autotuner import (
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..utils import get_last_power_of_2_num_tokens_buckets, last_positive_power_of_2
 
+
+def _import_megamoe_kernel():
+    """Import the in-tree MegaMoE kernel class + combine-format enum (lazy so
+    non-SM100 / no-cutlass-dsl environments can still import this module)."""
+    from ..cute_dsl_kernels.mega_moe_nvfp4 import import_kernel
+    from ..cute_dsl_kernels.mega_moe_nvfp4.token_comm import CombineFormat
+
+    return import_kernel(), CombineFormat
+
+
 __all__ = [
     "IS_MEGAMOE_OP_AVAILABLE",
     "MEGAMOE_OP_UNAVAILABLE_REASON",
@@ -69,6 +79,12 @@ __all__ = [
 # ``cute_nvgpu`` / the symm-memory adapter symbols this op needs.
 IS_MEGAMOE_OP_AVAILABLE: bool = False
 MEGAMOE_OP_UNAVAILABLE_REASON: Optional[str] = None
+
+# Process-global set of (local_ws_ptr, shared_ws_ptr, world_size) keys whose
+# in-kernel barrier (counter, signal) has already been fenced-reset. Module-global
+# (not per-runner) because the runner is rebuilt every op call; the fence must
+# fire ONCE per key. See the fence logic in forward().
+_MEGAMOE_FENCED_KEYS: set = set()
 
 
 # ---------------------------------------------------------------------------
@@ -120,23 +136,8 @@ def _unpack_tactic(tactic: Tuple) -> Tuple:
     unpacks through this helper so the field order is defined once. A 9th
     tactic field is then a one-line change here plus the consumers that
     actually use it, instead of editing five copy-pasted positional unpacks
-    that must stay in lockstep.
-
-    Order::
-
-        (
-            mma_tiler_mnk,
-            cluster_shape_mnk,
-            group_hint,
-            load_balance_mode,
-            token_back_mode,
-            use_bulk_fc2_store,
-            flag_batch,
-            epi_flag_batch,
-        )
-
-    This is a plain positional unpack (no validation); callers that need
-    legality go through :func:`validate_megamoe_tactic`.
+    that must stay in lockstep. Plain positional unpack (no validation);
+    callers that need legality go through :func:`validate_megamoe_tactic`.
     """
     (
         mma_tiler,
@@ -249,6 +250,20 @@ _TOKEN_BACK_MODES_FULL: Tuple[str, ...] = (
 # ``clc`` is intentionally excluded -- it routes through a separate
 # scheduler class not wired through the fused FC12 kernel here.
 _LOAD_BALANCE_MODE_CANDIDATES: Tuple[str, ...] = ("static", "atomic_counter")
+
+# The non-bulk standalone tactic: quantized combine (fp8/fp4) and form-B reject
+# the bulk fc2 store at kernel construction, so this is the deterministic
+# default (and sizing-probe) tactic for those modes.
+_MEGAMOE_NONBULK_STANDALONE_TACTIC: Tuple = (
+    [256, 256, 256],
+    [2, 1, 1],
+    512,
+    "static",
+    "standalone_warps",
+    False,
+    1,
+    (2, 4),
+)
 
 # group_hint scan: ~512 saturates, larger is better, omission -> ~74 (worst).
 # BEST=0 scans {512, 1024}; BEST=1 adds 256 (validated but low-value).
@@ -509,8 +524,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # op is unregistered.
     try:
         import cutlass
-        import cutlass.cute as cute
-        import cutlass.torch as cutlass_torch
         import torch.distributed as dist
         import torch.distributed._symmetric_memory as torch_symm_mem
         from cutlass.cute.nvgpu import cpasync, tcgen05  # noqa: F401
@@ -527,7 +540,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             Nvfp4BlockSize,  # noqa: F401
             SfPaddingBlock,
         )
-        from ..cute_dsl_kernels.mega_moe_nvfp4.sym_buffer import SymBufferHost
 
         IS_MEGAMOE_OP_AVAILABLE = True
     except Exception as _megamoe_import_err:  # pragma: no cover - env-specific
@@ -556,6 +568,40 @@ if IS_MEGAMOE_OP_AVAILABLE:
     # multi-rank and is supplied by the caller (the MegaMoECuteDsl backend's
     # MegaMoeSymmMemProvider carves it out of the rendezvous'd buffer).
     _MEGAMOE_LOCAL_WORKSPACE_CACHE: dict = {}
+    # Cache keys whose workspace was allocated while the AutoTuner was sweeping
+    # candidate tactics (``is_tuning_mode``). The tuner profiles ~N candidates
+    # per shape, each with a DISTINCT cache_key (the workspace SIZE varies with
+    # the tactic -- see ``_tactic_cache_key`` use below) and a workspace that is
+    # multi-GiB at high ``max_tokens_per_rank``. Persisting every candidate
+    # would accumulate N x local_bytes and OOM. These profiling workspaces are
+    # throwaway -- only the winning tactic is used at runtime -- so we free a
+    # candidate's workspace as soon as the next candidate is allocated.
+    _MEGAMOE_TUNING_WORKSPACE_KEYS: set = set()
+
+    @functools.lru_cache(maxsize=1)
+    def _cute_launch_helpers():
+        """Import the cutlass-dsl launch surface ONCE per process and build the
+        tensor/pointer converters (lazy: the module must import without
+        cutlass-dsl / a GPU; hoisted out of forward() so the per-call eager
+        launch does not rebuild closures or re-run imports)."""
+        import cutlass
+        import cutlass.cute as cute
+        import cutlass.torch as cutlass_torch
+        import cutlass.utils as cutlass_utils
+        from cutlass.cute.typing import AddressSpace
+
+        from ..cute_dsl_kernels.mega_moe_nvfp4.sym_buffer import SymBufferHost
+
+        def to_cute(t, assumed_align=16):
+            ct = cutlass_torch.from_dlpack(t, assumed_align=assumed_align)
+            return ct.mark_layout_dynamic(leading_dim=cutlass_torch.get_leading_dim(t))
+
+        def to_cute_ptr(t, assumed_align=16):
+            return cute.runtime.make_ptr(
+                cutlass.Uint8, t.data_ptr(), AddressSpace.gmem, assumed_align=assumed_align
+            )
+
+        return to_cute, to_cute_ptr, SymBufferHost, cute, cutlass_utils
 
     def _get_or_alloc_local_workspace(
         kernel, cache_key: Tuple, device: torch.device
@@ -563,37 +609,52 @@ if IS_MEGAMOE_OP_AVAILABLE:
         cached = _MEGAMOE_LOCAL_WORKSPACE_CACHE.get(cache_key)
         if cached is not None:
             return cached
+        # A cache MISS means a new (tactic, shape). Release any workspace held
+        # for a PREVIOUSLY-profiled autotune candidate: it belongs to an
+        # already-timed tactic that is never relaunched (MegaMoE profiles
+        # eagerly -- ``get_tuning_config`` sets ``use_cuda_graph=False`` -- so
+        # no captured graph holds the buffer). This bounds the autotune sweep
+        # to ONE live local workspace instead of one-per-candidate. Within a
+        # single candidate's multi-launch profiling the key HITS the cache, so
+        # the buffer is never freed mid-candidate; outside tuning the set is
+        # empty, so runtime caching keeps one workspace per MoE shape.
+        if _MEGAMOE_TUNING_WORKSPACE_KEYS:
+            for stale_key in _MEGAMOE_TUNING_WORKSPACE_KEYS:
+                stale_ws = _MEGAMOE_LOCAL_WORKSPACE_CACHE.pop(stale_key, None)
+                if stale_ws is not None:
+                    # The freed local block can be handed back by the allocator
+                    # for a same-size next candidate. ``_MEGAMOE_FENCED_KEYS`` is
+                    # keyed on the raw local ptr, so drop the stale key here or a
+                    # reused ptr ABA-skips its barrier-reset fence and hangs the
+                    # dispatch barrier mid-sweep.
+                    _stale_ptr = int(stale_ws.data_ptr())
+                    _MEGAMOE_FENCED_KEYS.difference_update(
+                        {k for k in _MEGAMOE_FENCED_KEYS if k[0] == _stale_ptr}
+                    )
+            _MEGAMOE_TUNING_WORKSPACE_KEYS.clear()
         local_bytes, _ = kernel.get_workspace_sizes()
-        # MUST be zero-initialised: the local workspace embeds Int32
-        # atomic counters (l1_arrival_count, fc1_done_counter,
-        # grid_sync_counter) whose spin_wait expects v >= positive
-        # threshold; a stray negative byte from ``torch.empty`` makes
-        # the wait unsatisfiable and hangs the kernel at 100% SM.
-        local_workspace = torch.zeros(local_bytes, dtype=torch.uint8, device=device)
+        # The local workspace embeds Int32 atomic counters whose spin_wait expects
+        # v >= a positive threshold; a stray negative byte hangs the kernel at 100%
+        # SM. But ONLY the counters need zeroing -- the data/scratch regions (the
+        # multi-GiB bulk at high max_tokens_per_rank) are overwritten every launch.
+        # The kernel exposes exactly the byte ranges to zero, so allocate
+        # uninitialised and zero just those (a full ``torch.zeros`` over local_bytes
+        # is a huge wasted memset):
+        #  - the front counter prefix ``require_zero_workspace_leading_bytes[0]``
+        #    (``tail_reset_counters`` bulk-zeros it each launch; first launch needs it);
+        #  - the persisted ``nvlink_barrier_counter`` -- deliberately OUTSIDE that
+        #    prefix so the tail never resets it (the barrier rides it across launches),
+        #    hence only the FIRST launch relies on this caller zero.
+        local_workspace = torch.empty(local_bytes, dtype=torch.uint8, device=device)
+        _lead = int(kernel.require_zero_workspace_leading_bytes[0])
+        local_workspace[:_lead].zero_()
+        _bc_off = int(kernel._local_offsets["nvlink_barrier_counter"])
+        _bc_n = int(kernel._local_region_by_name["nvlink_barrier_counter"].nbytes)
+        local_workspace[_bc_off : _bc_off + _bc_n].zero_()
         _MEGAMOE_LOCAL_WORKSPACE_CACHE[cache_key] = local_workspace
+        if AutoTuner.get().is_tuning_mode:
+            _MEGAMOE_TUNING_WORKSPACE_KEYS.add(cache_key)
         return local_workspace
-
-    def _zero_local_workspace_preserving_phase(local_workspace, kernel) -> None:
-        """Per-launch zero of the local workspace that PRESERVES the
-        self-priming ``nvlink_barrier_counter`` region (multi-rank EP path).
-
-        The kernel's reusable phase-flip NVLink barrier keeps its cross-rank
-        ``nvlink_barrier_signal`` (in the symmetric shared workspace, which is
-        NOT re-zeroed per launch) in lockstep with this per-rank
-        ``nvlink_barrier_counter``. Re-zeroing the counter while the signal is
-        not reset would decouple the phase and deadlock the barrier. Every
-        other local counter (l1_arrival_count, fc1_done_counter,
-        fc2_done_counter, expert_send_count, ...) still needs a per-launch
-        reset, so we zero the whole buffer except the counter's byte range.
-        """
-        off = int(kernel._local_offsets["nvlink_barrier_counter"])
-        nbytes = int(kernel._local_region_by_name["nvlink_barrier_counter"].nbytes)
-        total = local_workspace.numel()
-        if off > 0:
-            local_workspace[:off].zero_()
-        end = off + nbytes
-        if end < total:
-            local_workspace[end:].zero_()
 
     # ----- Symmetric-memory provider (NVSHMEM-equivalent) -------------------
     #
@@ -678,7 +739,6 @@ if IS_MEGAMOE_OP_AVAILABLE:
             num_topk: int,
             output_dtype: torch.dtype,
             shared_workspace_bytes: int,
-            in_kernel_fc2_reduce: bool = False,
         ) -> None:
             if not (dist.is_available() and dist.is_initialized()):
                 raise RuntimeError("MegaMoeSymmMemProvider requires torch.distributed initialized.")
@@ -702,13 +762,13 @@ if IS_MEGAMOE_OP_AVAILABLE:
             self.max_tokens_per_rank = int(max_tokens_per_rank)
             self.num_topk = int(num_topk)
             self.output_dtype = output_dtype
-            # ``in_kernel_fc2_reduce`` (form-B) folds the top-k reduction into
-            # the kernel, so the combine region is (max_T, 1, hidden); form-A
-            # keeps (max_T, num_topk, hidden) and reduces on the host. The
-            # combine_k MUST match the kernel ``combine_output`` shape -- a
-            # mismatch silently corrupts the symmetric combine region.
-            self.in_kernel_fc2_reduce = bool(in_kernel_fc2_reduce)
-            self.combine_k = 1 if self.in_kernel_fc2_reduce else int(num_topk)
+            # The kernel returns a unified (T, hidden) output (top-k reduced
+            # in-kernel for form-B, by the TopkReduce tail kernel for form-A),
+            # so the symmetric combine region is (max_T, 1, hidden) and the op
+            # aliases it as the 2D output_activation. combine_k MUST match the
+            # kernel ``combine_output`` shape -- a mismatch silently corrupts
+            # the symmetric combine region.
+            self.combine_k = 1
 
             # Region byte sizes (worst case across launches; staging
             # writes only the live ``T`` rows). NVFP4 packs 2 elems / byte
@@ -828,17 +888,11 @@ if IS_MEGAMOE_OP_AVAILABLE:
         num_topk: int,
         output_dtype: torch.dtype,
         shared_workspace_bytes: int,
-        in_kernel_fc2_reduce: bool = False,
     ) -> MegaMoeSymmMemProvider:
         """Return a cached provider for (group, layout). The cache is
         keyed on the group ``group_name`` plus every layout knob that
         affects allocation size so two MoE layers with the same shape
         share the same symmetric buffer.
-
-        ``in_kernel_fc2_reduce`` (form selector) MUST be in the cache key:
-        form-A and form-B size the combine region differently (num_topk vs 1
-        rows per token), so a shared cache entry would hand back a
-        wrong-sized combine region.
 
         First call from each rank performs the (collective)
         ``torch_symm_mem.rendezvous``; subsequent calls return the
@@ -857,7 +911,6 @@ if IS_MEGAMOE_OP_AVAILABLE:
             int(num_topk),
             str(output_dtype),
             int(shared_workspace_bytes),
-            bool(in_kernel_fc2_reduce),
         )
         cached = _MEGAMOE_SYMM_PROVIDER_CACHE.get(cache_key)
         if cached is not None:
@@ -871,7 +924,6 @@ if IS_MEGAMOE_OP_AVAILABLE:
             num_topk=num_topk,
             output_dtype=output_dtype,
             shared_workspace_bytes=shared_workspace_bytes,
-            in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         )
         _MEGAMOE_SYMM_PROVIDER_CACHE[cache_key] = provider
         return provider
@@ -903,7 +955,6 @@ if IS_MEGAMOE_OP_AVAILABLE:
         num_topk: int,
         output_dtype: torch.dtype,
         shared_workspace_bytes: int,
-        in_kernel_fc2_reduce: bool = False,
     ):
         """Return a cached, transient symmetric scratch provider used ONLY for
         AutoTuner profiling. ``None`` for single-rank (no cross-rank exchange).
@@ -924,7 +975,6 @@ if IS_MEGAMOE_OP_AVAILABLE:
             int(num_topk),
             str(output_dtype),
             int(shared_workspace_bytes),
-            bool(in_kernel_fc2_reduce),
         )
         cached = _MEGAMOE_PROFILING_SCRATCH_CACHE.get(cache_key)
         if cached is not None:
@@ -938,7 +988,6 @@ if IS_MEGAMOE_OP_AVAILABLE:
             num_topk=num_topk,
             output_dtype=output_dtype,
             shared_workspace_bytes=shared_workspace_bytes,
-            in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         )
         _MEGAMOE_PROFILING_SCRATCH_CACHE[cache_key] = provider
         return provider
@@ -962,7 +1011,6 @@ if IS_MEGAMOE_OP_AVAILABLE:
     def query_megamoe_shared_workspace_bytes(
         *,
         world_size: int,
-        local_rank: int,
         num_topk: int,
         num_experts_per_rank: int,
         hidden_size: int,
@@ -973,6 +1021,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         apply_topk_in_fc1: bool = True,
         gate_up_clamp: Optional[float] = None,
         in_kernel_fc2_reduce: bool = False,
+        combine_format: str = "bf16",
     ) -> int:
         """Probe ``Sm100MegaMoEKernel.get_workspace_sizes()`` for the
         shared workspace byte count. The SHARED workspace size is
@@ -986,12 +1035,18 @@ if IS_MEGAMOE_OP_AVAILABLE:
         (``in_kernel_fc2_reduce`` does not change the SHARED size, only the
         LOCAL workspace, but the ctor requires it).
         """
-        from ..cute_dsl_kernels.mega_moe_nvfp4 import import_kernel
 
         if tactic is None:
             # Any valid tactic works: the shared workspace size is invariant
             # across tactics, so reuse the token-aware fallback for sizing.
-            tactic = default_megamoe_tactic(0)
+            # EXCEPTION: quantized combine (fp8/fp4) rejects bulk fc2 store at
+            # kernel construction, and default_megamoe_tactic(0) is bulk -> use
+            # the non-bulk standalone tactic so the (tactic-invariant) sizing
+            # probe can build the kernel.
+            if combine_format != "bf16":
+                tactic = _MEGAMOE_NONBULK_STANDALONE_TACTIC
+            else:
+                tactic = default_megamoe_tactic(0)
         (
             mma_tiler,
             cluster_shape,
@@ -1003,8 +1058,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             epi_flag_batch,
         ) = _unpack_tactic(tactic)
         mma_tiler = tuple(mma_tiler)
-        kernel_cls = import_kernel()
-        probe = kernel_cls(
+        common = dict(
             mma_tiler_mnk=mma_tiler,
             cluster_shape_mnk=tuple(cluster_shape),
             use_2cta_instrs=bool(mma_tiler[0] == 256),
@@ -1018,7 +1072,6 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 hidden_size,
             ),
             world_size=int(world_size),
-            local_rank=int(local_rank),
             num_topk=int(num_topk),
             max_tokens_per_rank=int(max_tokens_per_rank),
             hidden=int(hidden_size),
@@ -1032,24 +1085,14 @@ if IS_MEGAMOE_OP_AVAILABLE:
             gate_up_clamp=(None if gate_up_clamp is None else float(gate_up_clamp)),
             **_LOCKED_KERNEL_KWARGS,
         )
+        # The probe MUST be the SAME kernel that actually runs (same combine_format),
+        # else the provider carves an undersized shared region and the kernel writes
+        # the combine staging out of bounds (single-rank IMA; at EP>1 the faulting
+        # rank dies and peers spin on the dispatch barrier -> looks like a hang).
+        kernel_cls, CombineFormat = _import_megamoe_kernel()
+        probe = kernel_cls(combine_format=CombineFormat.parse(combine_format), **common)
         _, shared_bytes = probe.get_workspace_sizes()
         return int(shared_bytes)
-
-    def _to_cute(
-        tensor: torch.Tensor,
-        assumed_align: int = 16,
-        force_static_layout: bool = False,
-    ) -> "cute.Tensor":
-        cute_tensor = cutlass_torch.from_dlpack(tensor, assumed_align=assumed_align)
-        # The local workspace's internal region offsets/strides are codegen-time
-        # static constants (see megamoe_kernel _layout_regions); marking it
-        # layout-dynamic invalidates those static accesses and corrupts the
-        # FC1-output / pool / counter regions. The upstream runner passes the
-        # local workspace with force_static_layout=True for exactly this reason.
-        if force_static_layout:
-            return cute_tensor
-        leading_dim = cutlass_torch.get_leading_dim(tensor)
-        return cute_tensor.mark_layout_dynamic(leading_dim=leading_dim)
 
     class Sm100MegaMoENvfp4Runner(TunableRunner):
         """TunableRunner for the ported MegaMoE CuteDSL NVFP4 kernel.
@@ -1086,6 +1129,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             apply_topk_in_fc1: bool = True,
             gate_up_clamp: Optional[float] = None,
             in_kernel_fc2_reduce: bool = False,
+            combine_format: str = "bf16",
         ) -> None:
             super().__init__()
             if (sm_version := get_sm_version()) not in (100, 103):
@@ -1131,6 +1175,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # and for the single-rank degenerate path.
             self._profiling_scratch = None
             self.in_kernel_fc2_reduce = bool(in_kernel_fc2_reduce)
+            # combine wire format: bf16 / 32e4m3xe8m0 (fp8) / 16e2m1xbf16 (fp4);
+            # quantized requires separate-reduce + changes shared_workspace size,
+            # so it is part of unique_id (compile + workspace cache key).
+            self.combine_format = str(combine_format)
 
         def unique_id(self):
             # local_rank is intentionally excluded from the key. The kernel
@@ -1155,6 +1203,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 self.apply_topk_in_fc1,
                 self.gate_up_clamp,
                 self.in_kernel_fc2_reduce,
+                self.combine_format,
             )
 
         def get_valid_tactics(
@@ -1169,7 +1218,16 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # so the autotuner profiles ``(2, 4)`` for >8192 buckets and
             # ``(1, 1)`` otherwise.
             num_tokens = int(inputs[0].shape[0])
-            return enumerate_megamoe_candidate_tactics(num_tokens)
+            candidates = enumerate_megamoe_candidate_tactics(num_tokens)
+            # in-kernel-reduce (form-B) collapses the K routes UNSUMMED under a
+            # bulk store (silent wrong output), and fp4 combine ("16e2m1...") cannot
+            # scalar-deref sub-byte data in the UBLK smem scratch (the kernel
+            # raises). Both force non-bulk. fp8 combine ("32e4m3xe8m0") is byte-legal
+            # for the UBLK store, so fp8 bulk is left tunable here.
+            # ``_unpack_tactic(t)[5]`` is ``use_bulk_fc2_store``.
+            if self.in_kernel_fc2_reduce or self.combine_format.startswith("16e2m1"):
+                candidates = [t for t in candidates if not _unpack_tactic(t)[5]]
+            return candidates
 
         def _autotuner_inputs_pre_hook(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
             """Sanitize ONLY the autotuner-regenerated fake inputs.
@@ -1361,10 +1419,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 flag_batch,
                 epi_flag_batch,
             ) = _unpack_tactic(tactic)
-            from ..cute_dsl_kernels.mega_moe_nvfp4 import import_kernel
-
-            kernel_cls = import_kernel()
-            return kernel_cls(
+            common = dict(
                 mma_tiler_mnk=tuple(mma_tiler),
                 cluster_shape_mnk=tuple(cluster_shape),
                 # use_2cta_instrs is DERIVED from M, not a tactic field.
@@ -1379,7 +1434,6 @@ if IS_MEGAMOE_OP_AVAILABLE:
                     self.hidden_size,
                 ),
                 world_size=self.world_size,
-                local_rank=self.local_rank,
                 num_topk=self.num_topk,
                 max_tokens_per_rank=self.max_tokens_per_rank,
                 hidden=self.hidden_size,
@@ -1395,6 +1449,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 gate_up_clamp=self.gate_up_clamp,
                 **_LOCKED_KERNEL_KWARGS,
             )
+            kernel_cls, CombineFormat = _import_megamoe_kernel()
+            return kernel_cls(combine_format=CombineFormat.parse(self.combine_format), **common)
 
         def _tactic_cache_key(self, tactic: Tuple) -> Tuple:
             """Hashable cache key over ``unique_id()`` + the FULL 8-tuple.
@@ -1430,49 +1486,6 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 tuple(epi_flag_batch),
             )
 
-        def _compile_or_get(self, tactic: Tuple, kernel, runtime_kwargs):
-            (
-                mma_tiler,
-                cluster_shape,
-                group_hint,
-                load_balance_mode,
-                token_back_mode,
-                use_bulk_fc2_store,
-                flag_batch,
-                epi_flag_batch,
-            ) = _unpack_tactic(tactic)
-            cache_key = self._tactic_cache_key(tactic)
-            compiled = self.__class__.kernel_cache.get(cache_key)
-            if compiled is not None:
-                return compiled
-            compile_kwargs = dict(runtime_kwargs)
-            hardware_info = cutlass.utils.HardwareInfo()
-            cluster_size = cluster_shape[0] * cluster_shape[1] * cluster_shape[2]
-            compile_kwargs["max_active_clusters"] = hardware_info.get_max_active_clusters(
-                max(cluster_size, 1)
-            )
-            # CuTe DSL compile is the dominant first-launch cost; log start/end
-            # at DEBUG only (the per-tactic compile-time stats must never appear
-            # at INFO on the normal serving path). Enable via TLLM_LOG_LEVEL=DEBUG
-            # when diagnosing the compile gap.
-            logger.debug(
-                f"[MegaMoECuteDsl] cute.compile START tactic="
-                f"(mma_tiler={mma_tiler}, cluster={cluster_shape}, "
-                f"group_hint={group_hint}, load_balance={load_balance_mode!r}, "
-                f"token_back_mode={token_back_mode!r}, use_bulk={use_bulk_fc2_store}, "
-                f"flag_batch={flag_batch}, epi_flag_batch={epi_flag_batch}, "
-                f"in_kernel_fc2_reduce={self.in_kernel_fc2_reduce})"
-            )
-            t_compile_start = time.perf_counter()
-            compiled = cute.compile(kernel, **compile_kwargs)
-            t_compile_ms = (time.perf_counter() - t_compile_start) * 1000
-            logger.debug(
-                f"[MegaMoECuteDsl] cute.compile DONE in {t_compile_ms:.0f} ms "
-                f"(cache_keys_now={len(self.__class__.kernel_cache) + 1})"
-            )
-            self.__class__.kernel_cache[cache_key] = compiled
-            return compiled
-
         def forward(
             self,
             inputs: List[torch.Tensor],
@@ -1483,13 +1496,23 @@ if IS_MEGAMOE_OP_AVAILABLE:
             **kwargs,
         ) -> None:
             del kwargs
-            t_forward_start = time.perf_counter()
             # Resolve fallback tactic. ``inputs`` is in hand here, so the
             # autotune-disabled / tactic=-1 fallback selects the token-aware
             # ``default_megamoe_tactic(num_tokens)`` directly (3-regime).
             if tactic == -1 or tactic is None:
                 num_tokens = int(inputs[0].shape[0])
-                tactic_t = default_megamoe_tactic(num_tokens)
+                # Non-bulk is a HARD requirement for (a) in-kernel reduce (form-B /
+                # REDG: the fc2 epilogue selects bulk-store BEFORE in-kernel-reduce,
+                # so a bulk tactic collapses the K routes UNSUMMED -> silent wrong
+                # output) and (b) fp4 combine ("16e2m1...": the UBLK path cannot
+                # scalar-deref sub-byte data -> kernel raises). fp8 bulk is legal,
+                # but this non-autotune default keeps ALL quantized combine
+                # non-bulk as a deterministic fallback; the autotuner
+                # (get_valid_tactics) may recover fp8 bulk.
+                if self.in_kernel_fc2_reduce or self.combine_format != "bf16":
+                    tactic_t = _MEGAMOE_NONBULK_STANDALONE_TACTIC
+                else:
+                    tactic_t = default_megamoe_tactic(num_tokens)
             elif isinstance(tactic, list):
                 tactic_t = tuple(tactic)
             else:
@@ -1569,93 +1592,141 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # peer rank's in-kernel dispatch barrier write into this rank's
             # ``nvlink_barrier_signal``: a fast peer ``red_add(+1)``s our slot,
             # then our late ``zero_()`` wipes it, so the barrier never reaches
-            # ``world_size`` and the whole grid deadlocks (the EPLB multi-rank
-            # dispatch-barrier hang). The symmetric workspace's peer-written
-            # count regions (expert_recv_count[_sum]) are instead reset
-            # device-side by the kernel's ``tail_reset_shared_counters``,
-            # ``nvlink_barrier_signal`` self-primes (phase-flip), and
-            # ``src_token_topk_idx`` is overwritten by dispatch each launch --
-            # so the shared workspace needs no per-launch host zero at all.
-            if self.world_size > 1:
-                _zero_local_workspace_preserving_phase(local_workspace, kernel)
-            else:
-                shared_workspace.zero_()
-                local_workspace.zero_()
-
-            activation_cute = _to_cute(activation)
-            activation_sf_cute = _to_cute(activation_sf)
-            topk_idx_cute = _to_cute(topk_idx)
-            topk_weights_cute = _to_cute(topk_weights)
-            # The weights are stored ``(slots, N, K_bytes)`` (K = hidden//2 for
-            # fc1 / intermediate//2 for fc2, innermost / stride-1). The kernel
-            # reads them K-major with K innermost; present a ``transpose(1, 2)``
-            # VIEW ``(slots, K_bytes, N)`` so K stays stride-1. Do NOT
-            # ``.contiguous()`` -- materializing would move K off the innermost
-            # axis (N would become stride-1) and corrupt the GEMM (cosine ~0).
-            fc1_weight_cute = _to_cute(fc1_weight.transpose(1, 2))
-            fc1_weight_sf_cute = _to_cute(fc1_weight_sf)
-            fc2_weight_cute = _to_cute(fc2_weight.transpose(1, 2))
-            fc2_weight_sf_cute = _to_cute(fc2_weight_sf)
-            # Per-expert fp32 scale tensors are 1-D ``(num_local_slots,)``;
-            # 4-byte alignment matches the fp32 element size (the kernel
-            # reads them as a plain fp32 vector, no 16-byte TMA tile).
-            fc1_alpha_cute = _to_cute(fc1_alpha, assumed_align=4)
-            fc2_alpha_cute = _to_cute(fc2_alpha, assumed_align=4)
-            fc1_norm_const_cute = _to_cute(fc1_norm_const, assumed_align=4)
-            combine_output_cute = _to_cute(combine_output)
-            local_workspace_cute = _to_cute(local_workspace, force_static_layout=True)
-            shared_workspace_cute = _to_cute(shared_workspace)
-
-            torch_stream = torch.cuda.current_stream()
-            stream = cuda.CUstream(torch_stream.cuda_stream)
-
-            # SymBufferHost contract: ``base_addr`` is any local pointer
-            # inside the symmetric heap; ``offsets[r] = peer_base -
-            # local_base``. All five regions share the same delta
-            # because ``MegaMoeSymmMemProvider`` carves them out of one
-            # symmetric allocation, so peer_rank_ptr_mapper.map(local,
-            # r, off) maps any region's local pointer to its peer.
-            sym_buf = SymBufferHost(
-                base_addr=int(activation.data_ptr()),
-                offsets=tuple(int(off) for off in peer_offsets),
-                rank_idx=int(self.local_rank),
-                num_max_ranks=int(self.world_size),
+            # ``world_size`` and the whole grid deadlocks. The symmetric
+            # workspace's peer-written count regions (expert_recv_count[_sum])
+            # are instead reset device-side by the kernel's
+            # ``tail_reset_shared_counters``, ``nvlink_barrier_signal``
+            # self-primes (phase-flip), and ``src_token_topk_idx`` is
+            # overwritten by dispatch each launch -- so the shared workspace
+            # needs no per-launch host zero at all.
+            #
+            # In-kernel NVLink-barrier phase coherence. The kernel's
+            # sense-reversing dispatch barrier pairs a PERSISTED rank-local
+            # nvlink_barrier_counter (outside the device tail-reset prefix)
+            # with a PERSISTED shared nvlink_barrier_signal. Two regimes:
+            #  * SAME tactic (steady state): the pair rides across launches;
+            #    the kernel tail-resets its other counters device-side, so no
+            #    host work at all.
+            #  * TACTIC CHANGE (autotune candidate boundary, profiling->real
+            #    transition): local counter and shared signal can be phase-
+            #    DECOUPLED -> the next dispatch barrier spins forever. Reset
+            #    both to phase 0 under a cross-rank fence, ONCE per tactic.
+            # The fence does a host sync + collective barrier: ILLEGAL under
+            # CUDA-graph capture (the eager warmup pre-pass fences first, so
+            # capture skips it) and valid only for pure DEP (world == EP group,
+            # see the guard below).
+            _capturing = torch.cuda.is_current_stream_capturing()
+            # Fence ONCE per (local_ws, shared_ws, world) key via the
+            # module-global ``_MEGAMOE_FENCED_KEYS`` (the runner is rebuilt
+            # every op call, so per-runner state cannot carry this). Each
+            # autotune candidate has a distinct local_ws and re-fences once on
+            # its warmup launch (never in a timed window); captured forwards
+            # reuse an already-fenced workspace and skip.
+            _fkey = (
+                int(local_workspace.data_ptr()),
+                int(shared_workspace.data_ptr()),
+                int(self.world_size),
             )
+            if (_fkey not in _MEGAMOE_FENCED_KEYS) and not _capturing:
+                import torch.distributed as _dist
 
+                _sig_off = int(kernel._shared_offsets["nvlink_barrier_signal"])
+                _sig_n = int(kernel._shared_region_by_name["nvlink_barrier_signal"].nbytes)
+                _bc_off = int(kernel._local_offsets["nvlink_barrier_counter"])
+                _bc_n = int(kernel._local_region_by_name["nvlink_barrier_counter"].nbytes)
+                _have_dist = _dist.is_available() and _dist.is_initialized()
+                # The fence uses the default (WORLD) process group -- correct ONLY
+                # for pure DEP (world == EP group == moe_ep_size). Under TP x EP / PP
+                # the WORLD barrier spans ranks that never reach this MoE fence ->
+                # deadlock; fail loud here instead of hanging. (Threading the EP
+                # subgroup is the general fix.)
+                if _have_dist and _dist.get_world_size() != int(self.world_size):
+                    # Not an assert: this guard must survive ``python -O`` -- a
+                    # stripped check would let the WORLD barrier deadlock under
+                    # TP x EP / PP instead of failing loud.
+                    raise RuntimeError(
+                        "MegaMoE-CuteDSL barrier-reset fence uses the WORLD process "
+                        "group, valid only for pure DEP (world == EP). Detected WORLD="
+                        f"{_dist.get_world_size()} != EP={self.world_size} (TP x EP / "
+                        "PP) -- fence must run on the EP subgroup."
+                    )
+                torch.cuda.current_stream().synchronize()
+                if _have_dist:
+                    _dist.barrier()
+                # Reset BOTH sides of the persisted dispatch barrier to a common
+                # phase 0. The local ``nvlink_barrier_counter`` is NOT always fresh
+                # here: at the autotune profiling->real transition the winning
+                # tactic's local is cache-reused with an ALREADY-ADVANCED counter
+                # (profiling runs on a separate symmetric scratch, so the real launch
+                # has a new shared_ptr -> a new fkey fires the fence on the advanced
+                # local). Zero the tiny counter slice (NOT the multi-GiB workspace)
+                # so it matches the freshly-zeroed signal; the bulk data stays uninit.
+                local_workspace[_bc_off : _bc_off + _bc_n].zero_()
+                shared_workspace[_sig_off : _sig_off + _sig_n].zero_()
+                # The zeros above are stream-async. The post-zero dist.barrier()
+                # is NOT guaranteed on-device-ordered after them, so once a peer
+                # clears the barrier and launches, its in-kernel NVLink signal
+                # WRITE can be CLOBBERED by our still-pending zero -> our dispatch
+                # barrier spins forever. Sync so the zeros LAND before the
+                # cross-rank barrier releases peers to launch signal-writing
+                # kernels. Fires once per workspace, so it is not a hot-path cost.
+                torch.cuda.current_stream().synchronize()
+                if _have_dist:
+                    _dist.barrier()
+                _MEGAMOE_FENCED_KEYS.add(_fkey)
+            # else: SAME tactic -- the kernel's device-side tail self-reset suffices.
+
+            # === cute.compile (JIT) launch -- kernel-team mega_runner ABI ===
+            # Inputs -> cute.Tensor (from_dlpack + mark_layout_dynamic); the opaque
+            # uint8 workspaces -> cute.Pointer (make_ptr), NOT cute.Tensor: a
+            # cute.Tensor's 32-bit memref shape field overflows once the internal
+            # combine staging pushes shared_workspace past 2 GiB (the kernel
+            # addresses workspaces by raw base + Int64 byte offset). SymBufferHost
+            # carries the peer mapper.
+            _to_cute, _to_cute_ptr, SymBufferHost, cute, cutlass_utils = _cute_launch_helpers()
+
+            # ``combine_output`` is (max_T, 1, hidden) (provider combine_k=1); the
+            # unified 2D ``output_activation`` (max_T, hidden) is a free reshape
+            # over the same storage. Weights present K stride-1 via a transpose
+            # VIEW (DLPack carries the strides); do NOT ``.contiguous()``.
+            output_activation = combine_output.reshape(combine_output.shape[0], self.hidden_size)
             runtime_kwargs = dict(
-                activation=activation_cute,
-                activation_sf=activation_sf_cute,
-                topk_idx=topk_idx_cute,
-                topk_weights=topk_weights_cute,
-                fc1_weight=fc1_weight_cute,
-                fc1_weight_sf=fc1_weight_sf_cute,
-                fc2_weight=fc2_weight_cute,
-                fc2_weight_sf=fc2_weight_sf_cute,
-                fc1_alpha=fc1_alpha_cute,
-                fc2_alpha=fc2_alpha_cute,
-                fc1_norm_const=fc1_norm_const_cute,
-                combine_output=combine_output_cute,
-                local_workspace=local_workspace_cute,
-                shared_workspace=shared_workspace_cute,
-                peer_rank_ptr_mapper_host=sym_buf,
-                stream=stream,
+                activation=_to_cute(activation),
+                activation_sf=_to_cute(activation_sf),
+                topk_idx=_to_cute(topk_idx),
+                topk_weights=_to_cute(topk_weights),
+                fc1_weight=_to_cute(fc1_weight.transpose(1, 2)),
+                fc1_weight_sf=_to_cute(fc1_weight_sf),
+                fc2_weight=_to_cute(fc2_weight.transpose(1, 2)),
+                fc2_weight_sf=_to_cute(fc2_weight_sf),
+                fc1_alpha=_to_cute(fc1_alpha, assumed_align=4),
+                fc2_alpha=_to_cute(fc2_alpha, assumed_align=4),
+                fc1_norm_const=_to_cute(fc1_norm_const, assumed_align=4),
+                output_activation=_to_cute(output_activation),
+                local_workspace=_to_cute_ptr(local_workspace),
+                shared_workspace=_to_cute_ptr(shared_workspace),
+                peer_rank_ptr_mapper_host=SymBufferHost(
+                    base_addr=int(activation.data_ptr()),
+                    offsets=tuple(int(off) for off in peer_offsets),
+                    rank_idx=int(self.local_rank),
+                    num_max_ranks=int(self.world_size),
+                ),
+                stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
             )
-            compiled = self._compile_or_get(tactic_t, kernel, runtime_kwargs)
-            t_launch_start = time.perf_counter()
+            cache_key = self._tactic_cache_key(tactic_t)
+            compiled = self.__class__.kernel_cache.get(cache_key)
+            if compiled is None:
+                # ``max_active_clusters`` is a compile-time Constexpr (baked in,
+                # omitted at launch); cluster_size = cluster_shape M*N.
+                _cluster = _unpack_tactic(tactic_t)[1]
+                _max_active_clusters = cutlass_utils.HardwareInfo().get_max_active_clusters(
+                    int(_cluster[0]) * int(_cluster[1])
+                )
+                compiled = cute.compile(
+                    kernel, max_active_clusters=_max_active_clusters, **runtime_kwargs
+                )
+                self.__class__.kernel_cache[cache_key] = compiled
             compiled(**runtime_kwargs)
-            t_launch_ms = (time.perf_counter() - t_launch_start) * 1000
-            t_forward_ms = (time.perf_counter() - t_forward_start) * 1000
-            logger.debug(
-                "[MegaMoECuteDsl] forward DONE tactic="
-                "(mma_tiler=%s, cluster=%s, load_balance=%r, token_back=%r) "
-                "launch+sync=%.0fms total=%.0fms",
-                tactic_t[0],
-                tactic_t[1],
-                tactic_t[3],
-                tactic_t[4],
-                t_launch_ms,
-                t_forward_ms,
-            )
             return combine_output
 
     # ----- torch op ---------------------------------------------------------
@@ -1691,6 +1762,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
         apply_topk_in_fc1: bool = True,
         gate_up_clamp: Optional[float] = None,
         in_kernel_fc2_reduce: bool = False,
+        combine_format: str = "bf16",
+        num_tokens: int = -1,
     ) -> None:
         """Run the fused MegaMoE CuteDSL NVFP4 kernel.
 
@@ -1723,6 +1796,16 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 f"SM 103 (B300); got SM {sm_version}."
             )
 
+        # Live-token trim: the caller stages ``combine_output`` at the full
+        # bucket size (activation is padded to ``max_tokens_per_rank``), but
+        # the TopkReduce pass sizes its grid and bounds-guard from THIS
+        # tensor's dim0. Slicing to the live token count skips the dead
+        # reduce work on rows [num_tokens, max_T) -- worth ~5-8us/layer at
+        # decode. ``num_tokens < 0`` (or an oversized value, e.g. from the
+        # autotuner's regenerated profiling tensors) keeps the full bucket.
+        if num_tokens >= 0:
+            combine_output = combine_output[: min(num_tokens, combine_output.shape[0])]
+
         runner = Sm100MegaMoENvfp4Runner(
             world_size=world_size,
             local_rank=local_rank,
@@ -1736,6 +1819,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             apply_topk_in_fc1=apply_topk_in_fc1,
             gate_up_clamp=gate_up_clamp,
             in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+            combine_format=combine_format,
         )
         inputs = [
             activation,
@@ -1752,31 +1836,40 @@ if IS_MEGAMOE_OP_AVAILABLE:
             combine_output,
         ]
         tuner = AutoTuner.get()
-        # AutoTuner profiling must use a SYMMETRIC buffer for the cross-rank
-        # inputs. The backend hands off a transient symmetric scratch (its own
-        # peer_offsets + shared_workspace); the profiling pre-hook routes the
-        # cross-rank inputs through it so the real staging buffer is never
-        # corrupted. Single-rank / no-scratch falls back to the staging buffer.
-        prof_scratch = _ACTIVE_MEGAMOE_PROFILING_SCRATCH if world_size > 1 else None
-        if prof_scratch is not None:
-            runner._profiling_scratch = prof_scratch
-            prof_peer_offsets = list(prof_scratch.peer_offsets)
-            prof_shared_workspace = prof_scratch.shared_workspace
+        if os.environ.get("MEGAMOE_AUTOTUNE", "0") != "1":
+            # Default: BYPASS the AutoTuner candidate sweep and use the token-bucket
+            # heuristic tactic (one forward, no tactic changes). The sweep IS
+            # supported via the tactic-change barrier fence in ``forward`` (reset
+            # (counter, signal) to a common phase under a cross-rank barrier on every
+            # tactic boundary) -- enable it with ``MEGAMOE_AUTOTUNE=1`` to pick the
+            # best tactic per shape. Kept OFF by default as the conservative path.
+            best_tactic = -1
         else:
-            runner._profiling_scratch = None
-            prof_peer_offsets = peer_offsets
-            prof_shared_workspace = shared_workspace
-        try:
-            _, best_tactic = tuner.choose_one(
-                "trtllm::cute_dsl_megamoe_nvfp4_blackwell",
-                [runner],
-                runner.get_tuning_config(),
-                inputs,
-                peer_offsets=prof_peer_offsets,
-                shared_workspace=prof_shared_workspace,
-            )
-        finally:
-            runner._profiling_scratch = None
+            # AutoTuner profiling must use a SYMMETRIC buffer for the cross-rank
+            # inputs. The backend hands off a transient symmetric scratch (its own
+            # peer_offsets + shared_workspace); the profiling pre-hook routes the
+            # cross-rank inputs through it so the real staging buffer is never
+            # corrupted. Single-rank / no-scratch falls back to the staging buffer.
+            prof_scratch = _ACTIVE_MEGAMOE_PROFILING_SCRATCH if world_size > 1 else None
+            if prof_scratch is not None:
+                runner._profiling_scratch = prof_scratch
+                prof_peer_offsets = list(prof_scratch.peer_offsets)
+                prof_shared_workspace = prof_scratch.shared_workspace
+            else:
+                runner._profiling_scratch = None
+                prof_peer_offsets = peer_offsets
+                prof_shared_workspace = shared_workspace
+            try:
+                _, best_tactic = tuner.choose_one(
+                    "trtllm::cute_dsl_megamoe_nvfp4_blackwell",
+                    [runner],
+                    runner.get_tuning_config(),
+                    inputs,
+                    peer_offsets=prof_peer_offsets,
+                    shared_workspace=prof_shared_workspace,
+                )
+            finally:
+                runner._profiling_scratch = None
         # Real run always uses the caller's staging buffer + peer_offsets.
         runner(
             inputs,
@@ -1812,5 +1905,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         apply_topk_in_fc1: bool = True,
         gate_up_clamp: Optional[float] = None,
         in_kernel_fc2_reduce: bool = False,
+        combine_format: str = "bf16",
+        num_tokens: int = -1,
     ) -> None:
         return None
