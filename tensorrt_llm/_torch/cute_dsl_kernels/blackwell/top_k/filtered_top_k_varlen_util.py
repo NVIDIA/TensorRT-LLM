@@ -357,7 +357,6 @@ class FilteredTopKKernelVarlen:
         bin_val,
         threshold,
         idx_int32,
-        idx,
         raw_input,
         offset,
         r_idx,
@@ -376,13 +375,13 @@ class FilteredTopKKernelVarlen:
         """Per-element if/elif handler for refinement rounds.
 
         idx_int32  – Int32 column index, used for score lookup and buffer writes.
-        idx        – self.index_type version, used for s_indices / s_input_idx writes.
 
         bin_val < threshold  → write to s_indices.
         bin_val == threshold → last round: s_last_remain countdown;
                                otherwise: store to s_input_idx[r_idx^1] (+ optional
                                buffer) and update s_histogram for the next round.
         """
+        idx = self.index_type(idx_int32)
         if bin_val < threshold:
             pos = atomicAdd(s_counter.iterator, val_one)
             s_indices[pos] = idx
@@ -952,13 +951,11 @@ class FilteredTopKKernelVarlen:
                                 idx_tmp = s_input_idx[r_idx, i]
                                 idx_int32 = cutlass.Int32(cutlass.Uint32(idx_tmp))
                                 raw_input = score[idx_int32]
-                                idx = self.index_type(idx_int32)
                                 bin_val = (self.to_ordered(raw_input) >> offset) & 0xFF
                                 self._filter_and_histogram_per_elem_refine(
                                     bin_val,
                                     threshold,
                                     idx_int32,
-                                    idx,
                                     raw_input,
                                     offset,
                                     r_idx,
@@ -984,13 +981,11 @@ class FilteredTopKKernelVarlen:
                                 ):
                                     idx_int32 = buffer[r_idx, i]
                                     raw_input = score[idx_int32]
-                                    idx = self.index_type(idx_int32)
                                     bin_val = (self.to_ordered(raw_input) >> offset) & 0xFF
                                     self._filter_and_histogram_per_elem_refine(
                                         bin_val,
                                         threshold,
                                         idx_int32,
-                                        idx,
                                         raw_input,
                                         offset,
                                         r_idx,
@@ -1079,41 +1074,6 @@ class FilteredTopKKernelVarlen:
             tiled_copy,
             tiler_mn,
         )
-
-    @cute.jit
-    def predicate_tile(self, tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
-        tApA = cute.make_fragment(
-            cute.make_layout(
-                (
-                    cute.size(tAcA, mode=[0, 1]),
-                    cute.size(tAcA, mode=[1]),
-                    cute.size(tAcA, mode=[2]),
-                ),
-                stride=(cute.size(tAcA, mode=[2]), 0, 1),
-            ),
-            cutlass.Boolean,
-        )
-        for rest_v in range(tApA.shape[0]):
-            for rest_k in range(tApA.shape[2]):
-                tApA[rest_v, 0, rest_k] = cute.elem_less(tAcA[(0, rest_v), 0, rest_k][1], limit)
-        return tApA
-
-    @cute.jit
-    def _fill_oob(self, tXrX: cute.Tensor, tXpX: cute.Tensor, fill_value: cute.Numeric) -> None:
-        """Fill out-of-bounds values in register tensor.
-
-        Args:
-            tXrX: Register tensor to fill
-            tXpX: Predicate tensor indicating valid elements
-            fill_value: Value to fill OOB locations with
-        """
-        tXrX_fill = cute.make_fragment_like(tXrX[(None, 0), None, 0])
-        tXrX_fill.fill(fill_value)
-        for rest_v in range(tXrX.shape[0][1]):
-            for rest_k in range(tXrX.shape[2]):
-                if cutlass.const_expr(tXpX is not None):
-                    if not tXpX[0, rest_v, rest_k]:
-                        cute.autovec_copy(tXrX_fill, tXrX[(None, rest_v), None, rest_k])
 
 
 def create_random_logits(
