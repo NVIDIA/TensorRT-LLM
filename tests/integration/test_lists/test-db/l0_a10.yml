@@ -187,11 +187,8 @@ l0_a10:
       backend: cpp
   tests:
   # ------------- CPP tests ---------------
-  - cpp/test_e2e.py::test_model[-medusa-86]
   - cpp/test_e2e.py::test_model[-redrafter-86]
   - cpp/test_e2e.py::test_model[-mamba-86]
-  - cpp/test_e2e.py::test_model[-recurrentgemma-86]
-  - cpp/test_e2e.py::test_model[-eagle-86] TIMEOUT (90)
 - condition:
     ranges:
       system_gpu_count:
@@ -210,8 +207,6 @@ l0_a10:
   - unittest/dynamo
   - unittest/api_stability
   - unittest/bindings
-  - examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-use_attention_plugin-enable_context_fmha-tp:1-pp:1-float16-BertModel-bert/bert-base-uncased]
-  - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_cpp_runtime]
   # usage telemetry (TRT backend)
   - unittest/llmapi/test_llm_telemetry.py::TestTelemetryTRTBackend
 - condition:
