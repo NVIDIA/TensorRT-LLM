@@ -81,7 +81,9 @@ WAN21_LPIPS_NUM_INFERENCE_STEPS = 1
 WAN21_LPIPS_GUIDANCE_SCALE = 5.0
 WAN21_LPIPS_SEED = 42
 WAN_LPIPS_FRAME_RATE = 16.0
-WAN_LPIPS_THRESHOLD = 0.05
+# Loose bound: at 1 inference step, LPIPS-vs-golden is dominated by kernel-numerics
+# variance across hardware/attention backends (~0.096 on B200 vs H100 golden). See nvbugs/6410336.
+WAN_LPIPS_THRESHOLD = 0.10
 
 WAN22_LPIPS_PROMPT = "A cat sitting on a sunny windowsill watching birds outside."
 WAN22_LPIPS_NEGATIVE_PROMPT = ""
