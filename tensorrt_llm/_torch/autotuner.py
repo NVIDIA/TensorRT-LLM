@@ -246,6 +246,25 @@ class TunableRunner(ABC):
         """
         raise NotImplementedError
 
+    def filter_tactics_with_heuristics(self, inputs: List[torch.Tensor],
+                                       profile: OptimizationProfile,
+                                       tactics: List[Any],
+                                       tuning_config: "TuningConfig",
+                                       **kwargs) -> List[Any]:
+        """Optionally rank/prune the valid tactics before profiling.
+
+        Called by the AutoTuner right after get_valid_tactics() and before the
+        tactics are split for distributed profiling. The default is a no-op that
+        returns the tactics unchanged. Runners may override this to consult an
+        analytical model (e.g. nvMatmulHeuristics) and keep only the most
+        promising candidates, which reduces compile + benchmark time.
+
+        Implementations MUST be purely additive: on any failure or when the
+        model has no opinion, return the input ``tactics`` unchanged so the
+        autotuner never loses a valid candidate.
+        """
+        return tactics
+
     def unique_id(self):
         """
         Returns a tuple of the unique id of the runner. The unique id will be converted to a string for the cache key.
@@ -1217,6 +1236,12 @@ class AutoTuner:
             }
             all_valid_tactics = runner.get_valid_tactics(
                 input_tensors, profile, **kwargs)
+            # Optionally rank/prune tactics with an analytical model before the
+            # expensive compile+benchmark loop. No-op by default; runners that
+            # override it must degrade gracefully to the full list.
+            all_valid_tactics = runner.filter_tactics_with_heuristics(
+                input_tensors, profile, all_valid_tactics, tuning_config,
+                **kwargs)
             total_pairs += len(all_valid_tactics)
             candidates.append(
                 (runner_id, runner, runner_arg_names, all_valid_tactics))
