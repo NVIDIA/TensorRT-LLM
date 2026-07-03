@@ -302,7 +302,7 @@ class MajorityVoteController(Controller):
 
         assert isinstance(majority_answer, str), "majority_vote failed"
         # The task returned by majority vote does not have output_tokens and logits.
-        tasks[0].result = tasks_list[majority_index][0].result
+        tasks[0].output_str = tasks_list[majority_index][0].output_str
 
     def majority_vote(self, candidates_tasks: List[List[Task]],
                       **kwargs) -> Tuple[int, str]:
