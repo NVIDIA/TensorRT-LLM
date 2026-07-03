@@ -75,6 +75,16 @@ public:
     void TearDown() {}
 };
 
+TEST_F(LRUPolicyTest, IsEnqueuedTest)
+{
+    auto block = std::get<0>(policy->getFreeBlock(0));
+    EXPECT_TRUE(policy->isEnqueued(block));
+    policy->claimBlock(block);
+    EXPECT_FALSE(policy->isEnqueued(block));
+    policy->releaseBlock(block);
+    EXPECT_TRUE(policy->isEnqueued(block));
+}
+
 TEST_F(LRUPolicyTest, NumFreeBlocksTest)
 {
     EXPECT_EQ(NUM_PRIMARY_BLOCKS, policy->getNumFreeBlocks(0));
@@ -120,7 +130,8 @@ TEST_F(LRUPolicyTest, ReleaseBlockTest)
 
 TEST_F(LRUPolicyTest, PooledPlaceholderReleaseReturnsToPlaceholderQueue)
 {
-    constexpr SizeType32 kPlaceholderCacheLevel = 2;
+    // Placeholders live one past the real cache levels (0=GPU, 1=host, 2=disk).
+    constexpr SizeType32 kPlaceholderCacheLevel = 3;
     constexpr SizeType32 kWindowSize = 64;
     auto constexpr kPooledPlaceholderBlockId = KVCacheBlock::kCachedBlocksRootId - 1;
 
