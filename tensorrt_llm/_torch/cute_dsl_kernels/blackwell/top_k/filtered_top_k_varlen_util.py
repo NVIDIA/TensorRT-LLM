@@ -415,6 +415,204 @@ class FilteredTopKKernelVarlen:
                         atomicAdd(s_histogram.iterator + cutlass.Int32(sub_bin), val_one)
 
     @cute.jit
+    def _filter_and_histogram_coarse(
+        self,
+        tidx,
+        threshold_bin,
+        s_counter,
+        s_indices,
+        s_input_idx,
+        s_num_input,
+        s_histogram,
+        val_one,
+        g_num_input,
+        buffer,
+        _copy_atom,
+        scan_frag,
+        _aligned_base,
+        _elem_bytes,
+        _align_bytes,
+        vec_start,
+        aligned_size,
+        _step_vec,
+        score,
+        row_start,
+        prologue_elems,
+        left_start,
+        left_size,
+    ):
+        """Reset histogram, filter all input elements through three loops, then barrier.
+
+        Covers vec-aligned GMEM, prologue scalar, and left scalar segments.
+        """
+        cute.arch.barrier()
+        for _hi in range(tidx, self.radix + 1, self.num_threads_per_cta):
+            s_histogram[_hi] = 0
+        cute.arch.barrier()
+
+        vec_size = self.vec_size
+        ic = tidx * cutlass.Int32(vec_size)
+        while ic + cutlass.Int32(vec_size - 1) < aligned_size:
+            cute.copy(
+                _copy_atom,
+                cute.make_tensor(
+                    cute.make_ptr(
+                        self.dtype,
+                        _aligned_base + cutlass.Int64(ic) * cutlass.Int64(_elem_bytes),
+                        cute.AddressSpace.gmem,
+                        assumed_align=_align_bytes,
+                    ),
+                    cute.make_layout((vec_size,)),
+                ),
+                scan_frag,
+            )
+            for j in cutlass.range_constexpr(vec_size):
+                raw_input = scan_frag[j]
+                bin_val = self.to_coarse_key(raw_input)
+                idx = self.index_type(vec_start + ic + cutlass.Int32(j))
+                self._filter_and_histogram_per_elem_coarse(
+                    bin_val,
+                    threshold_bin,
+                    idx,
+                    raw_input,
+                    s_counter,
+                    s_indices,
+                    s_input_idx,
+                    s_num_input,
+                    s_histogram,
+                    val_one,
+                    g_num_input,
+                    buffer,
+                )
+            ic = ic + cutlass.Int32(_step_vec)
+
+        for j in range(tidx, prologue_elems, self.num_threads_per_cta):
+            col_idx = cutlass.Int32(row_start + j)
+            raw = score[col_idx]
+            bin_val = self.to_coarse_key(raw)
+            idx = self.index_type(col_idx)
+            self._filter_and_histogram_per_elem_coarse(
+                bin_val,
+                threshold_bin,
+                idx,
+                raw,
+                s_counter,
+                s_indices,
+                s_input_idx,
+                s_num_input,
+                s_histogram,
+                val_one,
+                g_num_input,
+                buffer,
+            )
+
+        for j in range(tidx, left_size, self.num_threads_per_cta):
+            col_idx = cutlass.Int32(left_start + j)
+            raw = score[col_idx]
+            bin_val = self.to_coarse_key(raw)
+            idx = self.index_type(col_idx)
+            self._filter_and_histogram_per_elem_coarse(
+                bin_val,
+                threshold_bin,
+                idx,
+                raw,
+                s_counter,
+                s_indices,
+                s_input_idx,
+                s_num_input,
+                s_histogram,
+                val_one,
+                g_num_input,
+                buffer,
+            )
+        fence_acq_rel_cta()
+        cute.arch.barrier()
+
+    @cute.jit
+    def _filter_and_histogram_refine(
+        self,
+        tidx,
+        threshold,
+        offset,
+        r_idx,
+        is_last_round,
+        num_input,
+        cur_g_num_input,
+        score,
+        s_counter,
+        s_indices,
+        s_input_idx,
+        s_num_input,
+        s_histogram,
+        s_last_remain,
+        val_one,
+        val_one_negative,
+        g_num_input,
+        buffer,
+    ):
+        """Reset histogram, filter all threshold-bucket elements, then barrier.
+
+        Covers SMEM s_input_idx loop and optional GMEM buffer loop.
+        """
+        cute.arch.barrier()
+        for _hi in range(tidx, self.radix + 1, self.num_threads_per_cta):
+            s_histogram[_hi] = 0
+        cute.arch.barrier()
+
+        for i in range(tidx, num_input, self.num_threads_per_cta):
+            idx_tmp = s_input_idx[r_idx, i]
+            idx_int32 = cutlass.Int32(cutlass.Uint32(idx_tmp))
+            raw_input = score[idx_int32]
+            bin_val = (self.to_ordered(raw_input) >> offset) & 0xFF
+            self._filter_and_histogram_per_elem_refine(
+                bin_val,
+                threshold,
+                idx_int32,
+                raw_input,
+                offset,
+                r_idx,
+                is_last_round,
+                s_counter,
+                s_indices,
+                s_input_idx,
+                s_num_input,
+                s_histogram,
+                s_last_remain,
+                val_one,
+                val_one_negative,
+                g_num_input,
+                buffer,
+            )
+
+        cute.arch.barrier()
+        if cutlass.const_expr(self.enable_gmem_store):
+            for i in range(tidx, cur_g_num_input, self.num_threads_per_cta):
+                idx_int32 = buffer[r_idx, i]
+                raw_input = score[idx_int32]
+                bin_val = (self.to_ordered(raw_input) >> offset) & 0xFF
+                self._filter_and_histogram_per_elem_refine(
+                    bin_val,
+                    threshold,
+                    idx_int32,
+                    raw_input,
+                    offset,
+                    r_idx,
+                    is_last_round,
+                    s_counter,
+                    s_indices,
+                    s_input_idx,
+                    s_num_input,
+                    s_histogram,
+                    s_last_remain,
+                    val_one,
+                    val_one_negative,
+                    g_num_input,
+                    buffer,
+                )
+        fence_acq_rel_cta()
+        cute.arch.barrier()
+
+    @cute.jit
     def prefix_sum_and_find_threshold_coarse(
         self,
         tidx,
@@ -807,91 +1005,31 @@ class FilteredTopKKernelVarlen:
                     left_size,
                 )
             else:
-                # Reset histogram for refinement
-                cute.arch.barrier()
-                for _hi in range(tidx, self.radix + 1, self.num_threads_per_cta):
-                    s_histogram[_hi] = 0
-                cute.arch.barrier()
-
-                # Filter and build next round histogram
-                ic = tidx * cutlass.Int32(vec_size)
-                while ic + cutlass.Int32(vec_size - 1) < aligned_size:
-                    cute.copy(
-                        _copy_atom,
-                        cute.make_tensor(
-                            cute.make_ptr(
-                                self.dtype,
-                                _aligned_base + cutlass.Int64(ic) * cutlass.Int64(_elem_bytes),
-                                cute.AddressSpace.gmem,
-                                assumed_align=_align_bytes,
-                            ),
-                            cute.make_layout((vec_size,)),
-                        ),
-                        scan_frag,
-                    )
-                    for j in cutlass.range_constexpr(vec_size):
-                        raw_input = scan_frag[j]
-                        bin_val = self.to_coarse_key(raw_input)
-                        idx = self.index_type(vec_start + ic + cutlass.Int32(j))
-                        self._filter_and_histogram_per_elem_coarse(
-                            bin_val,
-                            threshold_bin,
-                            idx,
-                            raw_input,
-                            s_counter,
-                            s_indices,
-                            s_input_idx,
-                            s_num_input,
-                            s_histogram,
-                            val_one,
-                            g_num_input,
-                            buffer,
-                        )
-                    ic = ic + cutlass.Int32(_step_vec)
-
-                # for initial scalar load part.
-                for j in range(tidx, prologue_elems, self.num_threads_per_cta):
-                    col_idx = cutlass.Int32(row_start + j)
-                    raw = score[col_idx]
-                    bin_val = self.to_coarse_key(raw)
-                    idx = self.index_type(col_idx)
-                    self._filter_and_histogram_per_elem_coarse(
-                        bin_val,
-                        threshold_bin,
-                        idx,
-                        raw,
-                        s_counter,
-                        s_indices,
-                        s_input_idx,
-                        s_num_input,
-                        s_histogram,
-                        val_one,
-                        g_num_input,
-                        buffer,
-                    )
-
-                # for left part
-                for j in range(tidx, left_size, self.num_threads_per_cta):
-                    col_idx = cutlass.Int32(left_start + j)
-                    raw = score[col_idx]
-                    bin_val = self.to_coarse_key(raw)
-                    idx = self.index_type(col_idx)
-                    self._filter_and_histogram_per_elem_coarse(
-                        bin_val,
-                        threshold_bin,
-                        idx,
-                        raw,
-                        s_counter,
-                        s_indices,
-                        s_input_idx,
-                        s_num_input,
-                        s_histogram,
-                        val_one,
-                        g_num_input,
-                        buffer,
-                    )
-                fence_acq_rel_cta()
-                cute.arch.barrier()
+                self._filter_and_histogram_coarse(
+                    tidx,
+                    threshold_bin,
+                    s_counter,
+                    s_indices,
+                    s_input_idx,
+                    s_num_input,
+                    s_histogram,
+                    val_one,
+                    g_num_input,
+                    buffer,
+                    _copy_atom,
+                    scan_frag,
+                    _aligned_base,
+                    _elem_bytes,
+                    _align_bytes,
+                    vec_start,
+                    aligned_size,
+                    _step_vec,
+                    score,
+                    row_start,
+                    prologue_elems,
+                    left_start,
+                    left_size,
+                )
 
                 # Phase 2: Refinement rounds
                 run_next_round = True
@@ -940,69 +1078,26 @@ class FilteredTopKKernelVarlen:
                             )
                             run_next_round = False
                         else:
-                            # Reset histogram
-                            cute.arch.barrier()
-                            for _hi in range(tidx, self.radix + 1, self.num_threads_per_cta):
-                                s_histogram[_hi] = 0
-                            cute.arch.barrier()
-
-                            # Filter and build next round histogram.
-                            for i in range(tidx, num_input, self.num_threads_per_cta):
-                                idx_tmp = s_input_idx[r_idx, i]
-                                idx_int32 = cutlass.Int32(cutlass.Uint32(idx_tmp))
-                                raw_input = score[idx_int32]
-                                bin_val = (self.to_ordered(raw_input) >> offset) & 0xFF
-                                self._filter_and_histogram_per_elem_refine(
-                                    bin_val,
-                                    threshold,
-                                    idx_int32,
-                                    raw_input,
-                                    offset,
-                                    r_idx,
-                                    is_last_round,
-                                    s_counter,
-                                    s_indices,
-                                    s_input_idx,
-                                    s_num_input,
-                                    s_histogram,
-                                    s_last_remain,
-                                    val_one,
-                                    val_one_negative,
-                                    g_num_input,
-                                    buffer,
-                                )
-
-                            cute.arch.barrier()
-                            if cutlass.const_expr(self.enable_gmem_store):
-                                for i in range(
-                                    tidx,
-                                    cur_g_num_input,
-                                    self.num_threads_per_cta,
-                                ):
-                                    idx_int32 = buffer[r_idx, i]
-                                    raw_input = score[idx_int32]
-                                    bin_val = (self.to_ordered(raw_input) >> offset) & 0xFF
-                                    self._filter_and_histogram_per_elem_refine(
-                                        bin_val,
-                                        threshold,
-                                        idx_int32,
-                                        raw_input,
-                                        offset,
-                                        r_idx,
-                                        is_last_round,
-                                        s_counter,
-                                        s_indices,
-                                        s_input_idx,
-                                        s_num_input,
-                                        s_histogram,
-                                        s_last_remain,
-                                        val_one,
-                                        val_one_negative,
-                                        g_num_input,
-                                        buffer,
-                                    )
-                            fence_acq_rel_cta()
-                            cute.arch.barrier()
+                            self._filter_and_histogram_refine(
+                                tidx,
+                                threshold,
+                                offset,
+                                r_idx,
+                                is_last_round,
+                                num_input,
+                                cur_g_num_input,
+                                score,
+                                s_counter,
+                                s_indices,
+                                s_input_idx,
+                                s_num_input,
+                                s_histogram,
+                                s_last_remain,
+                                val_one,
+                                val_one_negative,
+                                g_num_input,
+                                buffer,
+                            )
 
             # Phase 3: Output phase
             vecsize_out = cutlass.const_expr(
