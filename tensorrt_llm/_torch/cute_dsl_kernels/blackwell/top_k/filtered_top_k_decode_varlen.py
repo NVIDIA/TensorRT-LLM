@@ -168,7 +168,6 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         varlen_merge_input: bool = False,
         num_sms: int = 148,
         overflow_policy: str = "GMEM_SPILL",
-        debug: bool = False,
     ):
         super().__init__(
             dtype,
@@ -239,21 +238,6 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             _vec_cap = max(1, 2 ** int(math.log2(max(self.max_num_cols // _tgt, 1))))
             self.num_copy_bits = min(self.num_copy_bits, _vec_cap * self.dtype.width)
             self.vec_size = self.num_copy_bits // self.dtype.width
-
-        # only used for debug info
-        if cutlass.const_expr(debug):
-            print(f"dtype: {self.dtype}, vec_size: {self.vec_size}")
-            print(
-                f"max_num_cols: {self.max_num_cols}, num_threads_per_cta: {self.num_threads_per_cta}"
-            )
-            print(f"filtered_topk_smem_input_size: {self.filtered_topk_smem_input_size}")
-            print(f"enable_gmem_store: {self.enable_gmem_store}")
-            print(f"return_val: {self.return_val}")
-            print(f"large_occupancy: {large_occupancy}")
-            print(f"filtered_topk_smem_input_size: {self.filtered_topk_smem_input_size}")
-            print(
-                f"first_refine_shift: {self.first_refine_shift}, num_refine_rounds: {self.num_refine_rounds}"
-            )
 
     @cute.jit
     def run_kernel(

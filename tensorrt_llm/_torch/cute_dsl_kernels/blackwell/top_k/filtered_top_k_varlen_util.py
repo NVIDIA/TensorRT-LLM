@@ -204,7 +204,6 @@ class FilteredTopKKernelVarlen:
         threshold_bin,
         s_counter,
         s_indices,
-        val_one,
         _copy_atom,
         scan_frag,
         _aligned_base,
@@ -217,6 +216,7 @@ class FilteredTopKKernelVarlen:
         left_size,
     ):
         """Collect all indices with coarse bin < threshold_bin from GMEM, then barrier."""
+        val_one = cutlass.Int32(1)
         _elem_bytes = self.dtype.width // 8
         _align_bytes = self.num_copy_bits // 8
         _step_vec = self.num_threads_per_cta * self.vec_size
@@ -273,11 +273,11 @@ class FilteredTopKKernelVarlen:
         score,
         s_counter,
         s_indices,
-        val_one,
         cur_g_num_input,
         buffer,
     ):
         """Collect all indices with refined bin < threshold from SMEM (and GMEM buffer), then barrier."""
+        val_one = cutlass.Int32(1)
         for i in range(tidx, num_input, self.num_threads_per_cta):
             idx = s_input_idx[r_idx, i]
             idx = cutlass.Int32(cutlass.Uint32(idx))
@@ -306,7 +306,6 @@ class FilteredTopKKernelVarlen:
         s_input_idx,
         s_num_input,
         s_histogram,
-        val_one,
         g_num_input,
         buffer,
     ):
@@ -316,6 +315,7 @@ class FilteredTopKKernelVarlen:
         bin_val == threshold_bin → store to s_input_idx (+ optional buffer) and
                                    update s_histogram for the next refinement round.
         """
+        val_one = cutlass.Int32(1)
         if bin_val < threshold_bin:
             pos = atomicAdd(s_counter.iterator, val_one)
             s_indices[pos] = idx
@@ -367,8 +367,6 @@ class FilteredTopKKernelVarlen:
         s_num_input,
         s_histogram,
         s_last_remain,
-        val_one,
-        val_one_negative,
         g_num_input,
         buffer,
     ):
@@ -383,6 +381,8 @@ class FilteredTopKKernelVarlen:
                                otherwise: store to s_input_idx[r_idx^1] (+ optional
                                buffer) and update s_histogram for the next round.
         """
+        val_one = cutlass.Int32(1)
+        val_one_negative = cutlass.Int32(-1)
         idx = self.index_type(idx_int32)
         if bin_val < threshold:
             pos = atomicAdd(s_counter.iterator, val_one)
@@ -422,7 +422,6 @@ class FilteredTopKKernelVarlen:
         s_input_idx,
         s_num_input,
         s_histogram,
-        val_one,
         g_num_input,
         buffer,
         _copy_atom,
@@ -478,7 +477,6 @@ class FilteredTopKKernelVarlen:
                     s_input_idx,
                     s_num_input,
                     s_histogram,
-                    val_one,
                     g_num_input,
                     buffer,
                 )
@@ -499,7 +497,6 @@ class FilteredTopKKernelVarlen:
                 s_input_idx,
                 s_num_input,
                 s_histogram,
-                val_one,
                 g_num_input,
                 buffer,
             )
@@ -519,7 +516,6 @@ class FilteredTopKKernelVarlen:
                 s_input_idx,
                 s_num_input,
                 s_histogram,
-                val_one,
                 g_num_input,
                 buffer,
             )
@@ -543,8 +539,6 @@ class FilteredTopKKernelVarlen:
         s_num_input,
         s_histogram,
         s_last_remain,
-        val_one,
-        val_one_negative,
         g_num_input,
         buffer,
     ):
@@ -577,8 +571,6 @@ class FilteredTopKKernelVarlen:
                 s_num_input,
                 s_histogram,
                 s_last_remain,
-                val_one,
-                val_one_negative,
                 g_num_input,
                 buffer,
             )
@@ -604,8 +596,6 @@ class FilteredTopKKernelVarlen:
                     s_num_input,
                     s_histogram,
                     s_last_remain,
-                    val_one,
-                    val_one_negative,
                     g_num_input,
                     buffer,
                 )
@@ -911,7 +901,6 @@ class FilteredTopKKernelVarlen:
             topk_remaining = self.top_k
 
             val_one = cutlass.Int32(1)
-            val_one_negative = cutlass.Int32(-1)
 
             # Stage 1: Coarse histogram.
             # Use a strided loop so every bin is cleared even when
@@ -989,7 +978,6 @@ class FilteredTopKKernelVarlen:
                     threshold_bin,
                     s_counter,
                     s_indices,
-                    val_one,
                     _copy_atom,
                     scan_frag,
                     _aligned_base,
@@ -1010,7 +998,6 @@ class FilteredTopKKernelVarlen:
                     s_input_idx,
                     s_num_input,
                     s_histogram,
-                    val_one,
                     g_num_input,
                     buffer,
                     _copy_atom,
@@ -1066,7 +1053,6 @@ class FilteredTopKKernelVarlen:
                                 score,
                                 s_counter,
                                 s_indices,
-                                val_one,
                                 cur_g_num_input,
                                 buffer,
                             )
@@ -1087,8 +1073,6 @@ class FilteredTopKKernelVarlen:
                                 s_num_input,
                                 s_histogram,
                                 s_last_remain,
-                                val_one,
-                                val_one_negative,
                                 g_num_input,
                                 buffer,
                             )

@@ -53,7 +53,6 @@ class FilteredTopKKernelVarlenPrefill(FilteredTopKKernelVarlen):
         num_copy_bits: int = 256,
         return_val: bool = False,
         overflow_policy: str = "GMEM_SPILL",
-        debug: bool = False,
     ):
         super().__init__(
             dtype,
@@ -98,19 +97,6 @@ class FilteredTopKKernelVarlenPrefill(FilteredTopKKernelVarlen):
 
         # Always 512 threads for large-occupancy path.
         self.num_threads_per_cta = 512
-
-        if debug:
-            print(f"dtype: {self.dtype}, vec_size: {self.vec_size}")
-            print(
-                f"max_num_cols: {self.max_num_cols}, "
-                f"num_threads_per_cta: {self.num_threads_per_cta}"
-            )
-            print(f"filtered_topk_smem_input_size: {self.filtered_topk_smem_input_size}")
-            print(
-                f"overflow_policy: {overflow_policy}, enable_gmem_store: {self.enable_gmem_store}, "
-                f"enable_truncate: {self.enable_truncate}"
-            )
-            print(f"subtract_row_start_on_output: {self.subtract_row_start_on_output}")
 
     @cute.kernel
     def filtered_topk_kernel(
