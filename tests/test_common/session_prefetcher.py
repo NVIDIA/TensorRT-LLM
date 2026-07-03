@@ -10,8 +10,9 @@ threads — hiding those costs behind the previous test's runtime. The
 prefetched pool must NOT touch CUDA until it is handed over (asserted at
 ``take()``).
 
-Enable with ``TRTLLM_TEST_PREFETCH_SESSION=1``; off by default so CI behavior
-is unchanged until the mechanism has soaked.
+Enabled by default; set ``TRTLLM_TEST_PREFETCH_SESSION=0`` to disable. With
+no test declaring a spec/model marker the prefetcher never fires, so plain
+suites are unaffected either way.
 
 Wiring (see tests/unittest/llmapi/conftest.py):
 - ``pytest_collection_modifyitems`` -> ``PREFETCHER.on_collection(items)``
@@ -41,6 +42,15 @@ from concurrent.futures import ThreadPoolExecutor
 
 _WEIGHT_GLOBS = ("*.safetensors", "*.bin")
 _READ_CHUNK = 64 << 20  # 64MB
+
+# MpiPoolSession workers freeze their environment at spawn time, so a pool
+# prefetched during test A must not be handed to test B if B changed any env
+# var the workers care about (proven silent-failure class).
+_ENV_PREFIXES = ("TRTLLM", "TLLM", "NCCL_", "CUDA_", "UCX_", "OMPI_")
+
+
+def _env_snapshot():
+    return {k: v for k, v in os.environ.items() if k.startswith(_ENV_PREFIXES)}
 
 
 def _spec_of(item):
@@ -102,12 +112,13 @@ class SessionPrefetcher:
         self._thread = None
         self._built_spec = None
         self._built_session = None
+        self._built_env = None
         self._items = []
         self._warmed_dirs = set()
 
     @property
     def enabled(self) -> bool:
-        return os.environ.get("TRTLLM_TEST_PREFETCH_SESSION", "0").lower() in (
+        return os.environ.get("TRTLLM_TEST_PREFETCH_SESSION", "1").lower() in (
             "1",
             "true",
             "yes",
@@ -173,11 +184,13 @@ class SessionPrefetcher:
                 return
             from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 
+            env = _env_snapshot()  # workers freeze env at spawn: snapshot now
             session = MpiPoolSession(n_workers=spec)
             session.submit_sync(_worker_import_and_assert_cuda_clean)
             with self._lock:
                 self._built_spec = spec
                 self._built_session = session
+                self._built_env = env
         except Exception as e:  # prefetch must never break the tests
             print(
                 f"[session-prefetch] background build failed (falling back to synchronous): {e}",
@@ -190,18 +203,88 @@ class SessionPrefetcher:
             return None
         thread = self._thread
         if thread is not None:
-            thread.join(timeout=600)
+            # Slowest legitimate build measured is ~117s (busy node); 180s
+            # gives 1.5x margin. On a genuine hang we give up and fall back
+            # to a synchronous build instead of stalling the suite.
+            thread.join(timeout=180)
         with self._lock:
             self._thread = None
-            if self._built_spec == spec and self._built_session is not None:
+            if (
+                self._built_spec == spec
+                and self._built_session is not None
+                and self._built_env == _env_snapshot()
+            ):
                 session, self._built_session, self._built_spec = (self._built_session, None, None)
                 print(f"[session-prefetch] handing over prefetched {spec}-worker pool", flush=True)
                 return session
-            # Spec mismatch (e.g. the expected test was skipped): discard.
+            # Spec/env mismatch (test skipped, reordered, or changed env vars
+            # the frozen workers would not see): discard, build synchronously.
             if self._built_session is not None:
                 stale, self._built_session, self._built_spec = (self._built_session, None, None)
                 threading.Thread(target=stale.shutdown, daemon=True).start()
         return None
+
+    # ---- shadow mode: zero-test-change prefetch at the pool-creation seam ----
+
+    def schedule_shadow(self, spec: int) -> None:
+        """Start building a spare ``spec``-worker pool in the background.
+
+        Heuristic: the next test most likely needs a pool of the same size as
+        the current one. A miss is discarded at ``take()`` and the sync build
+        is no slower than without prefetch.
+        """
+        if not self.enabled or spec <= 1:
+            return
+        with self._lock:
+            if self._thread is not None or self._built_spec == spec:
+                return  # already building / built
+            self._thread = threading.Thread(target=self._build, args=(spec,), daemon=True)
+            self._thread.start()
+
+    def _make_factory(self, real_cls):
+        """A drop-in for ``MpiPoolSession`` that consumes and re-arms the shadow."""
+
+        def factory(n_workers, *args, **kwargs):
+            if args or kwargs or n_workers <= 1:
+                return real_cls(n_workers, *args, **kwargs)
+            session = self.take(n_workers) or real_cls(n_workers=n_workers)
+            self.schedule_shadow(n_workers)  # re-arm for the NEXT test
+            return session
+
+        return factory
+
+    def install_pool_factory(self) -> None:
+        """Patch the pool-creation seams for zero-test-change prefetch.
+
+        Bare ``LLM(...)`` tests then consume prefetched pools automatically.
+        Only the ``mpi_session is None`` branches construct ``MpiPoolSession``
+        directly, so tests passing their own session (shared/grouped pools)
+        are never intercepted.
+        """
+        import importlib
+
+        from tensorrt_llm.llmapi.mpi_session import MpiPoolSession as real_cls
+
+        factory = self._make_factory(real_cls)
+        for name in (
+            "tensorrt_llm.executor.proxy",
+            "tensorrt_llm.executor.rpc_proxy",
+            "tensorrt_llm.llmapi.llm",
+        ):
+            mod = importlib.import_module(name)
+            if getattr(mod, "MpiPoolSession", None) is real_cls:
+                mod.MpiPoolSession = factory
+
+    def dispose(self) -> None:
+        """Shut down any unconsumed shadow pool (end-of-session cleanup)."""
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=60)
+        with self._lock:
+            self._thread = None
+            stale, self._built_session, self._built_spec = (self._built_session, None, None)
+        if stale is not None:
+            stale.shutdown()
 
 
 PREFETCHER = SessionPrefetcher()

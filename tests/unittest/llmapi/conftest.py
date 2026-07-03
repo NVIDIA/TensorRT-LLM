@@ -41,6 +41,14 @@ def pytest_configure(config):
         "markers",
         "prefetch_model_dir(path): model dir the test loads, for page-cache warming",
     )
+    if PREFETCHER.enabled:
+        # Shadow mode: intercept bare LLM(...) pool creation so tests consume
+        # prefetched pools with zero test changes.
+        PREFETCHER.install_pool_factory()
+
+
+def pytest_sessionfinish(session, exitstatus):
+    PREFETCHER.dispose()
 
 
 def pytest_collection_modifyitems(items):

@@ -44,8 +44,13 @@ def _run_setup_and_join(p, item):
             th.join(timeout=10)
 
 
-def test_disabled_is_noop(monkeypatch):
+def test_enabled_by_default(monkeypatch):
     monkeypatch.delenv("TRTLLM_TEST_PREFETCH_SESSION", raising=False)
+    assert SessionPrefetcher().enabled
+
+
+def test_disabled_is_noop(monkeypatch):
+    monkeypatch.setenv("TRTLLM_TEST_PREFETCH_SESSION", "0")
     p = SessionPrefetcher()
     p.on_collection([_FakeItem(spec=2)])
     assert p._items == []
@@ -128,6 +133,45 @@ def test_fixture_falls_back_to_sync_build(request, monkeypatch):
     monkeypatch.setattr(mpi_session_mod, "MpiPoolSession", _FakePool)
     session = request.getfixturevalue("prefetched_mpi_session")
     assert isinstance(session, _FakePool) and session.n_workers == 2
+
+
+def test_factory_miss_builds_sync_and_arms_shadow(prefetcher, monkeypatch):
+    # _build is stubbed by the fixture to record specs instead of spawning.
+    factory = prefetcher._make_factory(_FakePool)
+    session = factory(4)  # nothing prefetched yet -> sync build
+    assert isinstance(session, _FakePool) and session.n_workers == 4
+    prefetcher._thread.join(timeout=10)
+    assert prefetcher.built == [4]  # shadow armed for the next test
+
+
+def test_factory_hit_hands_over_shadow(prefetcher, monkeypatch):
+    pool = _FakePool(4)
+    prefetcher._built_spec, prefetcher._built_session = 4, pool
+    prefetcher._built_env = session_prefetcher._env_snapshot()
+    factory = prefetcher._make_factory(_FakePool)
+    assert factory(4) is pool  # prefetched pool handed over
+
+
+def test_take_discards_on_env_mismatch(prefetcher, monkeypatch):
+    pool = _FakePool(4)
+    prefetcher._built_spec, prefetcher._built_session = 4, pool
+    prefetcher._built_env = session_prefetcher._env_snapshot()
+    monkeypatch.setenv("TLLM_TEST_ONLY_FLAG", "changed-after-spawn")
+    assert prefetcher.take(4) is None  # frozen workers would miss the new env
+    for _ in range(100):
+        if pool.shut:
+            break
+        import time
+
+        time.sleep(0.05)
+    assert pool.shut  # stale shadow torn down in the background
+
+
+def test_factory_single_worker_passthrough(prefetcher):
+    factory = prefetcher._make_factory(_FakePool)
+    session = factory(1)
+    assert isinstance(session, _FakePool)
+    assert prefetcher._thread is None  # no shadow for 1-GPU pools
 
 
 def test_warm_page_cache_reads_weight_files(tmp_path):
