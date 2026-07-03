@@ -208,15 +208,13 @@ def test_moe_per_expert_lora_changes_output():
 
 
 @requires_cuda_and_op
-def test_moe_lora_slot_indexed_matches_per_request(monkeypatch):
+def test_moe_lora_slot_indexed_matches_per_request():
     """The slot-indexed (CUDA-graph) input schema must produce bit-identical
-    output to the per-request schema for the same adapter, since both expand to
-    the same per-token (rank, A_ptr, B_ptr) arrays inside the op.
+    output to the per-request (eager) schema for the same adapter, since both
+    expand to the same per-token (rank, A_ptr, B_ptr) arrays inside the op.
 
-    The slot-indexed schema always takes the capture-safe device path, so for an
-    apples-to-apples bit-exact comparison we force the per-request schema onto
-    the device path too (TLLM_MOE_LORA_USE_DEVICE_PATH=1). Both then share the
-    pointer-expand + grouped-GEMM kernels, so identical per-token tables yield
+    Both schemas feed the identical grouped-GEMM LoRA core (pointer-expand +
+    problem-builder + grouped GEMM), so identical per-token tables yield
     bit-identical output.
     """
     from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
@@ -255,8 +253,7 @@ def test_moe_lora_slot_indexed_matches_per_request(monkeypatch):
         rank=rank,
     )
 
-    # Force both schemas onto the device path, via a fresh runner.
-    monkeypatch.setenv("TLLM_MOE_LORA_USE_DEVICE_PATH", "1")
+    # Both schemas feed the same grouped-GEMM core; use a fresh runner.
     MoERunner.runner_dict.clear()
     try:
         out_per_request = _call_fused_moe(
@@ -1317,20 +1314,16 @@ def _build_fp8_moe_inputs(x_bf16, w3_w1_bf16, w2_bf16):
 
 @requires_cuda_and_op
 @pytest.mark.parametrize("schema", ["per_request", "slot_indexed"])
-def test_moe_fp8_lora_changes_output(schema, monkeypatch):
+def test_moe_fp8_lora_changes_output(schema):
     """FP8 (qdq) base weights + routed-expert LoRA must run and apply the LoRA.
 
     Validates the FP8 enablement end to end through `torch.ops.trtllm.fused_moe`
-    for both LoRA input schemas (per-request host path and slot-indexed device
-    path): the op accepts FP8 weights/activations together with LoRA tensors,
-    produces finite output, and the output differs from the FP8 no-LoRA
-    baseline (the LoRA delta is actually applied on the FP8 base).
+    for both LoRA input schemas (per-request and slot-indexed), which share the
+    grouped-GEMM LoRA core: the op accepts FP8 weights/activations together with
+    LoRA tensors, produces finite output, and the output differs from the FP8
+    no-LoRA baseline (the LoRA delta is actually applied on the FP8 base).
     """
     from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
-
-    # Force the per-request schema onto the capture-safe device path too, so
-    # both schemas exercise the same FP8 dequant + grouped-GEMM LoRA kernels.
-    monkeypatch.setenv("TLLM_MOE_LORA_USE_DEVICE_PATH", "1")
 
     MoERunner.runner_dict.clear()
     try:
