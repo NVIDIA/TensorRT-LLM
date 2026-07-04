@@ -1081,6 +1081,10 @@ class KVCacheManagerV2(BaseResourceManager):
           default 1).
         - ``TRTLLM_KV_ARENA_WRITE_THROUGH``: ``on_free`` (default) or
           ``on_commit`` (§4.3).
+        - ``TRTLLM_KV_ARENA_LAZY_RETENTION``: ``1`` keeps freed sequence
+          ranges mapped until the page budget needs them, turning reuse hits
+          on still-resident blocks into D2D copies (§4.4 phase 2; default
+          ``0``).
         """
         page_mb = int(os.environ.get("TRTLLM_KV_ARENA_PHYS_PAGE_SIZE_MB", "2"))
         map_ahead = int(os.environ.get("TRTLLM_KV_ARENA_MAP_AHEAD_PAGES", "1"))
@@ -1089,12 +1093,14 @@ class KVCacheManagerV2(BaseResourceManager):
             f"TRTLLM_KV_ARENA_WRITE_THROUGH must be 'on_free' or 'on_commit', "
             f"got {write_through_env!r}"
         )
+        lazy_retention = os.environ.get("TRTLLM_KV_ARENA_LAZY_RETENTION", "0") == "1"
         return ContiguousArenaConfig(
             phys_page_size=page_mb << 20,
             map_ahead_pages=map_ahead,
             write_through=WriteThroughPolicy.ON_COMMIT
             if write_through_env == "on_commit"
             else WriteThroughPolicy.ON_FREE,
+            lazy_gpu_retention=lazy_retention,
         )
 
     def _extra_buffers_per_layer(
@@ -2443,6 +2449,15 @@ class KVCacheManagerV2(BaseResourceManager):
         for kv_cache in self.kv_cache_map.values():
             kv_cache.close()
         self.kv_cache_map.clear()
+        if self._arena_enabled:
+            storage = self.impl._storage._gpu_arena_storage()
+            for pg_idx in range(int(storage.num_pool_groups)):
+                group = storage.pool_group(pg_idx)
+                if group.ghost_hits or group.ghost_misses or group.spilled_ranges:
+                    logger.info(
+                        f"[arena] pool group {pg_idx}: ghost hits={group.ghost_hits} "
+                        f"misses={group.ghost_misses} spilled ranges={group.spilled_ranges}"
+                    )
         self.impl.shutdown()
 
     def get_max_resource_count(self) -> int:

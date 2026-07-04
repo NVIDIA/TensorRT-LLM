@@ -30,6 +30,7 @@ if sys.version_info[:2] >= (3, 12):
 else:
     from typing_extensions import override
 
+from .. import rawref
 from .._common import (
     BAD_FILE_DESCRIPTOR,
     NDEBUG,
@@ -673,6 +674,7 @@ class SequenceRange:
         "_freed",
         "_gate_events",
         "_free_event",
+        "_ghost_keys",
     )
     base_block: int
     num_blocks: int  # reserved (padded) length in blocks
@@ -680,6 +682,9 @@ class SequenceRange:
     _freed: bool
     _gate_events: list[CachedCudaEvent]  # pending ready events of released slots
     _free_event: CachedCudaEvent
+    # Ghost registry keys (§4.4 phase 2): ids of host pages whose bytes still
+    # live in this (retained) range; purged when the range is reclaimed.
+    _ghost_keys: list[int]
 
     def __init__(self, base_block: int, num_blocks: int) -> None:
         self.base_block = base_block
@@ -688,6 +693,7 @@ class SequenceRange:
         self._freed = False
         self._gate_events = []
         self._free_event = CachedCudaEvent.NULL
+        self._ghost_keys = []
 
     @property
     def end_block(self) -> int:
@@ -724,11 +730,31 @@ class ArenaPoolGroup(PoolGroupBase):
     destinations inside that range (§4.4).
     """
 
-    __slots__ = ("_arena", "_ranges", "_range_bases", "_pending_reclaim")
+    __slots__ = (
+        "_arena",
+        "_ranges",
+        "_range_bases",
+        "_pending_reclaim",
+        "_budget",
+        "_lazy_retention",
+        "_retained",
+        "_ghosts",
+        "ghost_hits",
+        "ghost_misses",
+        "spilled_ranges",
+    )
     _arena: SequenceArena
     _ranges: dict[int, SequenceRange]  # base_block -> live range
     _range_bases: list[int]  # sorted, for slot_id -> range lookup on release
     _pending_reclaim: list[SequenceRange]
+    _budget: PageBudget
+    _lazy_retention: bool
+    # Lazily retained freed ranges (§4.4 phase 2), insertion-ordered = LRU by
+    # retire time. Pages stay mapped; reclaimed only under pressure.
+    _retained: dict[int, SequenceRange]
+    # id(host page) -> (identity ref, retained-range base, ordinal): where a
+    # committed block's bytes still live on GPU after its owner closed.
+    _ghosts: "dict[int, tuple[rawref.ref, int, int]]"
 
     def __init__(
         self,
@@ -738,6 +764,7 @@ class ArenaPoolGroup(PoolGroupBase):
         page_budget: PageBudget,
         map_ahead_pages: int,
         page_index_scale: int,
+        lazy_retention: bool = False,
     ) -> None:
         # The int31 kernel-offset ceiling must hold for every offset this
         # arena can emit (DESIGN.md §4.1); fail loudly at startup.
@@ -760,6 +787,13 @@ class ArenaPoolGroup(PoolGroupBase):
         self._ranges = {}
         self._range_bases = []
         self._pending_reclaim = []
+        self._budget = page_budget
+        self._lazy_retention = lazy_retention
+        self._retained = {}
+        self._ghosts = {}
+        self.ghost_hits = 0
+        self.ghost_misses = 0
+        self.spilled_ranges = 0
 
     @override
     def destroy(self) -> None:
@@ -770,12 +804,17 @@ class ArenaPoolGroup(PoolGroupBase):
         # Teardown can run right after sequences finished, with their ranges
         # still in the event-gated deferred-reclaim queue (§4.2). Teardown is
         # allowed to block: synchronize the gates and drain, then anything
-        # left is a genuine leak.
+        # left besides retained ranges is a genuine leak.
         for rng in self._pending_reclaim:
             rng._free_event.synchronize()
             for ev in rng._gate_events:
                 ev.synchronize()
         self.drain_reclaim()
+        for rng in list(self._retained.values()):
+            for ev in rng._gate_events:
+                ev.synchronize()
+        assert self.spill_retained(1 << 62) >= 0
+        assert not self._retained
         assert not self._ranges and not self._pending_reclaim, (
             "destroying ArenaPoolGroup with live sequence ranges"
         )
@@ -823,23 +862,99 @@ class ArenaPoolGroup(PoolGroupBase):
         self._pending_reclaim.append(rng)
 
     def drain_reclaim(self) -> int:
-        """Unmap and recycle every freed range whose gating conditions have
-        all completed. Returns the number of ranges reclaimed. Call at
-        iteration boundaries."""
+        """Process every freed range whose gating conditions have all
+        completed: unmap and recycle it, or -- with lazy retention (§4.4
+        phase 2) -- keep its pages mapped and park it on the retained LRU,
+        to be reclaimed only under pressure (:meth:`spill_retained`).
+        Returns the number of ranges processed. Call at iteration
+        boundaries."""
         remaining: list[SequenceRange] = []
-        reclaimed = 0
+        processed = 0
         for rng in self._pending_reclaim:
             if rng._ready_to_reclaim():
-                self._arena.reclaim(rng.base_block)
-                del self._ranges[rng.base_block]
-                idx = bisect_right(self._range_bases, rng.base_block) - 1
-                assert self._range_bases[idx] == rng.base_block
-                self._range_bases.pop(idx)
-                reclaimed += 1
+                if self._lazy_retention:
+                    self._retained[rng.base_block] = rng
+                    self._budget.retain(self._arena.mapped_pages_in_range(rng.base_block))
+                else:
+                    self._reclaim_range(rng)
+                processed += 1
             else:
                 remaining.append(rng)
         self._pending_reclaim = remaining
-        return reclaimed
+        return processed
+
+    def _reclaim_range(self, rng: SequenceRange) -> None:
+        """Unmap a range's pages, return its block indices, purge its ghosts."""
+        for key in rng._ghost_keys:
+            entry = self._ghosts.get(key)
+            # A newer registration (e.g. a later sequence's private copy of
+            # the same canonical block) may have superseded this range's
+            # entry; only purge entries that still point here.
+            if entry is not None and entry[1] == rng.base_block:
+                self._ghosts.pop(key)
+        rng._ghost_keys.clear()
+        self._arena.reclaim(rng.base_block)
+        del self._ranges[rng.base_block]
+        idx = bisect_right(self._range_bases, rng.base_block) - 1
+        assert self._range_bases[idx] == rng.base_block
+        self._range_bases.pop(idx)
+
+    def spill_retained(self, min_pages: int) -> int:
+        """Reclaim retained ranges (LRU first, skipping ranges with pending
+        gate events) until at least ``min_pages`` physical pages have been
+        freed or nothing more is spillable. Returns pages freed."""
+        freed = 0
+        for base in list(self._retained):
+            if freed >= min_pages:
+                break
+            rng = self._retained[base]
+            if not rng._ready_to_reclaim():
+                continue  # e.g. an in-flight D2D onboard still reads from it
+            pages = self._arena.mapped_pages_in_range(base)
+            del self._retained[base]
+            self._budget.unretain(pages)
+            self._reclaim_range(rng)
+            self.spilled_ranges += 1
+            freed += pages
+        return freed
+
+    @property
+    def retained_pages(self) -> int:
+        return sum(self._arena.mapped_pages_in_range(base) for base in self._retained)
+
+    # -- ghost registry (§4.4 phase 2): D2D reuse from retained ranges ------
+
+    def register_ghosts(self, rng: SequenceRange, entries: "Sequence[tuple[int, object]]") -> None:
+        """Record that the bytes of ``page`` (now living in the stale tier)
+        are still present at ``rng.base_block + ordinal`` for each
+        ``(ordinal, page)`` entry. Valid until the range is reclaimed."""
+        if not self._lazy_retention:
+            return
+        for ordinal, page in entries:
+            key = id(page)
+            self._ghosts[key] = (rawref.ref(page), rng.base_block, ordinal)
+            rng._ghost_keys.append(key)
+
+    def lookup_ghost(self, page: object) -> "tuple[SlotId, SequenceRange] | None":
+        """If ``page``'s bytes are still resident in a *retained* range,
+        return (slot id of the resident copy, the retained range) -- the
+        caller must gate the range's reclaim on its copy (append to
+        ``_gate_events``). Returns None on any staleness."""
+        entry = self._ghosts.get(id(page))
+        if entry is None:
+            self.ghost_misses += 1
+            return None
+        ref, base, ordinal = entry
+        if ref() is not page:
+            self._ghosts.pop(id(page), None)  # id was reused by a new object
+            self.ghost_misses += 1
+            return None
+        rng = self._retained.get(base)
+        if rng is None:
+            self.ghost_misses += 1
+            return None  # still pending (bytes not settled) or already spilled
+        self.ghost_hits += 1
+        return SlotId(base + ordinal), rng
 
     def _find_range(self, slot_id: int) -> SequenceRange:
         idx = bisect_right(self._range_bases, slot_id) - 1
@@ -1255,6 +1370,7 @@ class GpuArenaCacheLevelStorage(CacheLevelStorage):
         quota: int,
         phys_page_size: int,
         map_ahead_pages: int,
+        lazy_retention: bool = False,
     ):
         num_pool_groups = typed_len(slot_size_lists)
         assert num_pool_groups == typed_len(block_capacity_list), (
@@ -1279,6 +1395,7 @@ class GpuArenaCacheLevelStorage(CacheLevelStorage):
                 self.page_budget,
                 map_ahead_pages,
                 page_index_scale_list[pg_idx],
+                lazy_retention,
             ),
             num_pool_groups,
         )
@@ -1296,6 +1413,18 @@ class GpuArenaCacheLevelStorage(CacheLevelStorage):
             assert type(pg) is ArenaPoolGroup
             reclaimed += pg.drain_reclaim()
         return reclaimed
+
+    def spill_retained(self, min_pages: int) -> int:
+        """Reclaim lazily retained ranges (§4.4 phase 2), LRU-first per pool
+        group, until ``min_pages`` physical pages are freed or nothing more
+        is spillable. Returns pages freed."""
+        freed = 0
+        for pg in self._pool_groups:
+            if freed >= min_pages:
+                break
+            assert type(pg) is ArenaPoolGroup
+            freed += pg.spill_retained(min_pages - freed)
+        return freed
 
     @property
     def pool_size_granularity(self) -> int:

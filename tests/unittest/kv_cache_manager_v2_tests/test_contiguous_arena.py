@@ -1205,6 +1205,202 @@ class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
 
 
 @requires_cuda
+class TestArenaLazyRetention(unittest.TestCase):
+    """§4.4 phase 2 (P2): lazy GPU retention.
+
+    Freed ranges stay mapped on a retained LRU; reuse hits copy D2D from the
+    resident "ghost" bytes; pressure spills LRU-first; the resume gate counts
+    retained pages as available.
+    """
+
+    TPB = 16
+    WRITE_THROUGH = WriteThroughPolicy.ON_FREE
+
+    def setUp(self) -> None:
+        init_cuda_once()
+        cfg = _make_manager_config(gpu_quota=32 * MiB, host_quota=32 * MiB)
+        cfg.contiguous_arena = ContiguousArenaConfig(
+            map_ahead_pages=0, lazy_gpu_retention=True, write_through=self.WRITE_THROUGH
+        )
+        self.manager = KVCacheManager(cfg)
+
+    def tearDown(self) -> None:
+        self.manager.shutdown()
+        del self.manager
+
+    def _block_floats(self, page_index: int) -> "torch.Tensor":
+        addr = int(
+            self.manager._storage.slot_address(
+                GPU_LEVEL, PoolGroupIndex(0), page_index, PoolIndex(0)
+            )
+        )
+        return TestSparseVirtMem._tensor_at(addr, (4 * 8192) // 4)
+
+    def _host_floats(self, slot_id: int) -> "torch.Tensor":
+        import ctypes
+
+        addr = int(
+            self.manager._storage.slot_address(
+                CacheLevel(1), PoolGroupIndex(0), slot_id, PoolIndex(0)
+            )
+        )
+        buf = (ctypes.c_float * ((4 * 8192) // 4)).from_address(addr)
+        return torch.frombuffer(buf, dtype=torch.float32)
+
+    def _commit_and_close(self, tokens, value: float):
+        manager = self.manager
+        kv = manager.create_kv_cache(max_capacity=4 * self.TPB)
+        with TemporaryCudaStream([]) as s:
+            stream = CudaStream(s.handle)
+            self.assertTrue(kv.resume(stream))
+            self.assertTrue(kv.resize(2 * self.TPB))
+            for j, idx in enumerate(kv.get_base_page_indices(LifeCycleId(0))):
+                self._block_floats(idx).fill_(value + j)
+            torch.cuda.synchronize()
+            kv.commit(tokens)
+            kv.close()
+        s.take_finish_event().synchronize()
+
+    def test_retention_keeps_pages_utilization_reports_free(self) -> None:
+        manager = self.manager
+        budget = manager._storage.gpu_page_budget
+        tokens = [900 + i for i in range(2 * self.TPB)]
+        self._commit_and_close(tokens, 11.0)
+        self.assertEqual(manager.drain_gpu_reclaim(), 1)  # parked, not unmapped
+        self.assertGreater(budget.used_pages, 0)
+        self.assertEqual(budget.retained_pages, budget.used_pages)
+        # retained pages count as available for the resume gate
+        self.assertEqual(manager._storage.get_utilization(GPU_LEVEL), [0.0])
+
+    def test_reuse_onboards_d2d_from_ghost(self) -> None:
+        manager = self.manager
+        tokens = [910 + i for i in range(2 * self.TPB)]
+        self._commit_and_close(tokens, 21.0)
+        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        # corrupt the HOST copies: if onboarding reads from host, the new
+        # sequence sees junk; correct data proves the D2D ghost path
+        kv2 = manager.create_kv_cache(input_tokens=tokens, max_capacity=4 * self.TPB)
+        self.assertEqual(kv2.history_length, 2 * self.TPB)
+        for ordinal in range(2):
+            host_id = kv2._blocks[ordinal].pages[0][LifeCycleId(0)].page.slot_id
+            self._host_floats(host_id).fill_(-999.0)
+        with TemporaryCudaStream([]) as s:
+            stream = CudaStream(s.handle)
+            self.assertTrue(kv2.resume(stream))
+            torch.cuda.synchronize()
+            for j, idx in enumerate(kv2.get_base_page_indices(LifeCycleId(0))):
+                data = self._block_floats(idx)
+                self.assertTrue(bool((data == 21.0 + j).all().item()), f"block {j} not D2D")
+            kv2.close()
+        s.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim()
+
+    def test_pressure_spills_retained_and_falls_back_to_host(self) -> None:
+        manager = self.manager
+        budget = manager._storage.gpu_page_budget
+        tokens = [920 + i for i in range(2 * self.TPB)]
+        self._commit_and_close(tokens, 31.0)
+        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        retained_before = budget.retained_pages
+        self.assertGreater(retained_before, 0)
+        # a large fresh sequence needs (nearly) the whole 16-page budget:
+        # mapping must succeed by spilling the retained range
+        kv2 = manager.create_kv_cache(max_capacity=1024 * self.TPB)
+        with TemporaryCudaStream([]) as s:
+            stream = CudaStream(s.handle)
+            self.assertTrue(kv2.resume(stream))
+            self.assertTrue(kv2.resize(1024 * self.TPB))
+            self.assertEqual(budget.retained_pages, 0)  # spilled
+            kv2.close()
+        s.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim()
+        # the ghost is gone; reuse now falls back to the (intact) host copy
+        kv3 = manager.create_kv_cache(input_tokens=tokens, max_capacity=4 * self.TPB)
+        self.assertEqual(kv3.history_length, 2 * self.TPB)
+        with TemporaryCudaStream([]) as s2:
+            stream2 = CudaStream(s2.handle)
+            self.assertTrue(kv3.resume(stream2))
+            torch.cuda.synchronize()
+            for j, idx in enumerate(kv3.get_base_page_indices(LifeCycleId(0))):
+                data = self._block_floats(idx)
+                self.assertTrue(bool((data == 31.0 + j).all().item()))
+            kv3.close()
+        s2.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim()
+
+    def test_private_copies_refresh_ghosts(self) -> None:
+        """Ghost refresh by private copies.
+
+        A hot prefix's D2D source must survive its original committer's range
+        being spilled: every closing user re-registers its private copy as
+        the (fresher) ghost.
+        """
+        manager = self.manager
+        budget = manager._storage.gpu_page_budget
+        tokens = [940 + i for i in range(2 * self.TPB)]
+        self._commit_and_close(tokens, 41.0)  # kv1: canonical + oldest ghost
+        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        # kv2 reuses (D2D) and closes: its private copies refresh the ghosts
+        kv2 = manager.create_kv_cache(input_tokens=tokens, max_capacity=4 * self.TPB)
+        with TemporaryCudaStream([]) as s:
+            stream = CudaStream(s.handle)
+            self.assertTrue(kv2.resume(stream))
+            kv2.close()
+        s.take_finish_event().synchronize()
+        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        # spill ONLY the LRU (kv1's) range; kv2's stays retained
+        self.assertGreater(manager._storage.spill_gpu_retained(1), 0)
+        self.assertGreater(budget.retained_pages, 0)
+        # corrupt host copies; correct data proves the refreshed D2D ghost
+        kv3 = manager.create_kv_cache(input_tokens=tokens, max_capacity=4 * self.TPB)
+        self.assertEqual(kv3.history_length, 2 * self.TPB)
+        for ordinal in range(2):
+            host_id = kv3._blocks[ordinal].pages[0][LifeCycleId(0)].page.slot_id
+            self._host_floats(host_id).fill_(-888.0)
+        with TemporaryCudaStream([]) as s2:
+            stream2 = CudaStream(s2.handle)
+            self.assertTrue(kv3.resume(stream2))
+            torch.cuda.synchronize()
+            for j, idx in enumerate(kv3.get_base_page_indices(LifeCycleId(0))):
+                data = self._block_floats(idx)
+                self.assertTrue(bool((data == 41.0 + j).all().item()), f"block {j} lost ghost")
+            kv3.close()
+        s2.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim()
+
+    def test_va_pressure_spills_retained(self) -> None:
+        manager = self.manager
+        # VA capacity is 8192 blocks; three 4096-block reservations only fit
+        # if the retained first range is spilled for its VA
+        blocks = 4096
+        kv1 = manager.create_kv_cache(max_capacity=blocks * self.TPB)
+        with TemporaryCudaStream([]) as s:
+            stream = CudaStream(s.handle)
+            self.assertTrue(kv1.resume(stream))
+            self.assertTrue(kv1.resize(2 * self.TPB))
+            kv1.close()
+        s.take_finish_event().synchronize()
+        self.assertEqual(manager.drain_gpu_reclaim(), 1)  # retained (holds VA)
+        kv2 = manager.create_kv_cache(max_capacity=blocks * self.TPB)
+        kv3 = manager.create_kv_cache(max_capacity=blocks * self.TPB)
+        with TemporaryCudaStream([]) as s2:
+            stream2 = CudaStream(s2.handle)
+            self.assertTrue(kv2.resume(stream2))
+            self.assertTrue(kv3.resume(stream2))  # requires spilling kv1's VA
+            kv2.close()
+            kv3.close()
+        s2.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim()
+
+
+@requires_cuda
+class TestArenaLazyRetentionOnCommit(TestArenaLazyRetention):
+    """P2 x §4.3 ON_COMMIT: adopted host copies register ghosts too."""
+
+    WRITE_THROUGH = WriteThroughPolicy.ON_COMMIT
+
+
+@requires_cuda
 class TestArenaWriteThroughOnCommit(TestArenaKVCacheManagerEndToEnd):
     """The §4.3 ON_COMMIT write-through policy.
 

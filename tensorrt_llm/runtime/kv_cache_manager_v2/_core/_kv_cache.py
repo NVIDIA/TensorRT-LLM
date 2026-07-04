@@ -64,7 +64,7 @@ from .._page import (
     batched_lock_to_gpu,
 )
 from .._stats import KVCacheIterationStatsDelta, KVCacheStatsDelta
-from .._storage._core import PoolGroupIndex, SequenceRange, Slot
+from .._storage._core import PoolGroupIndex, SequenceRange, Slot, SlotId
 from .._storage_manager import StorageManager
 from .._utils import (
     CachedCudaEvent,
@@ -536,13 +536,40 @@ class _KVCache:
         if arena_ranges is not None:
             storage = manager._storage
             assert arena_closing is not None
+            arena_lazy = (
+                storage.arena_config is not None and storage.arena_config.lazy_gpu_retention
+            )
             for pg_idx in typed_range(storage.num_pool_groups):
                 # Written-through blocks move copy-free (§4.3).
                 storage.adopt_stale_copies(
                     pg_idx, arena_closing.adopt_pages[pg_idx], arena_closing.adopt_slots[pg_idx]
                 )
+                if arena_lazy:
+                    # The bytes stay resident in the (soon-retained) range:
+                    # register them as D2D reuse sources (§4.4 phase 2).
+                    storage.register_arena_ghosts(
+                        pg_idx,
+                        arena_ranges[pg_idx],
+                        list(
+                            zip(
+                                arena_closing.adopt_ordinals[pg_idx],
+                                arena_closing.adopt_pages[pg_idx],
+                            )
+                        ),
+                    )
                 try:
                     storage.offload_arena_pages(pg_idx, arena_closing.offload[pg_idx])
+                    if arena_lazy:
+                        storage.register_arena_ghosts(
+                            pg_idx,
+                            arena_ranges[pg_idx],
+                            list(
+                                zip(
+                                    arena_closing.offload_ordinals[pg_idx],
+                                    arena_closing.offload[pg_idx],
+                                )
+                            ),
+                        )
                 except OutOfPagesError:
                     # Host tier cannot take the write-out: drop the blocks
                     # instead of keeping them (reuse loss only, never an
@@ -550,6 +577,20 @@ class _KVCache:
                     for page in arena_closing.offload[pg_idx]:
                         if page.scheduled_for_eviction:
                             storage.exclude_from_eviction(page)
+            if arena_lazy:
+                # Re-register each private copy's bytes as a fresh ghost for
+                # its canonical entry: hot prefixes get their D2D source
+                # refreshed by every closing user, so an LRU spill of the
+                # oldest copy does not lose the (newer) resident one.
+                for page, (ordinal, lc_idx) in zip(
+                    arena_closing.private, arena_closing.private_meta, strict=True
+                ):
+                    canonical = self._find_canonical(page, lc_idx)
+                    if canonical is not None and canonical is not page:
+                        pg_idx = storage.get_pool_group_index(lc_idx)
+                        storage.register_arena_ghosts(
+                            pg_idx, arena_ranges[pg_idx], [(ordinal, canonical)]
+                        )
             # Private copies are never evictable (nothing queues them); they
             # die with our refs, freeing their slots into their range.
             arena_closing = None  # drop our strong refs before range release
@@ -682,12 +723,17 @@ class _KVCache:
     class _ArenaClosingPages(NamedTuple):
         # canonical committed pages without a write-through copy: copy-on-free
         offload: "TypedIndexList[PoolGroupIndex, list[CommittedPage]]"
+        offload_ordinals: "TypedIndexList[PoolGroupIndex, list[int]]"
         # canonical committed pages with a valid write-through host copy, and
         # those copies: adopted copy-free (§4.3)
         adopt_pages: "TypedIndexList[PoolGroupIndex, list[CommittedPage]]"
         adopt_slots: "TypedIndexList[PoolGroupIndex, list[Slot]]"
-        # sequence-private reuse copies (§4.4): dropped
+        adopt_ordinals: "TypedIndexList[PoolGroupIndex, list[int]]"
+        # sequence-private reuse copies (§4.4): dropped -- but under lazy
+        # retention their bytes re-register as fresh ghosts for the canonical
+        # entry, keeping hot prefixes' D2D sources LRU-recent
         private: list[CommittedPage]
+        private_meta: list[tuple[int, LifeCycleId]]  # (ordinal, lc) per entry
 
     def _arena_collect_committed_gpu_pages(self) -> "_KVCache._ArenaClosingPages":
         """Collect this sequence's committed GPU pages before the block chain
@@ -706,8 +752,11 @@ class _KVCache:
         storage = self.manager._storage
         ret = _KVCache._ArenaClosingPages(
             make_typed(lambda _: list[CommittedPage](), storage.num_pool_groups),
+            make_typed(lambda _: list[int](), storage.num_pool_groups),
             make_typed(lambda _: list[CommittedPage](), storage.num_pool_groups),
             make_typed(lambda _: list[Slot](), storage.num_pool_groups),
+            make_typed(lambda _: list[int](), storage.num_pool_groups),
+            [],
             [],
         )
         for ordinal, block in enumerate(self._blocks):
@@ -721,14 +770,17 @@ class _KVCache:
                     if isinstance(page, CommittedPage) and page.cache_level == GPU_LEVEL:
                         if type(page) is not CommittedPage:
                             ret.private.append(page)
+                            ret.private_meta.append((ordinal, lc_idx))
                             continue
                         pg_idx = storage.get_pool_group_index(lc_idx)
                         wt_slot = self._arena_take_write_through_slot(ordinal, lc_idx)
                         if wt_slot is not None:
                             ret.adopt_pages[pg_idx].append(page)
                             ret.adopt_slots[pg_idx].append(wt_slot)
+                            ret.adopt_ordinals[pg_idx].append(ordinal)
                         else:
                             ret.offload[pg_idx].append(page)
+                            ret.offload_ordinals[pg_idx].append(ordinal)
         return ret
 
     @staticmethod
@@ -855,24 +907,30 @@ class _KVCache:
             storage.release_slot(LifeCycleId(lc_int), CacheLevel(GPU_LEVEL + 1), slot)
         self._write_through_slots.clear()
 
+    # Pages to free per spill step under pressure; small enough to preserve
+    # most of the retained cache, large enough to bound retry loops.
+    _ARENA_SPILL_CHUNK_PAGES: ClassVar[int] = 64
+
     def _arena_ensure_mapped(self, num_valid_blocks: int) -> bool:
         """Demand-map physical pages covering the first ``num_valid_blocks`` of
         this sequence's range in every pool group (DESIGN.md §4.2). On page
-        exhaustion, drains deferred reclaim and retries once; returns False if
-        pages are still unavailable — the caller backs off exactly like a
-        failed slot allocation (§4.6)."""
+        exhaustion, drains deferred reclaim, then spills lazily retained
+        ranges (LRU-first, §4.4 phase 2), retrying while either makes
+        progress; returns False if pages are still unavailable — the caller
+        backs off exactly like a failed slot allocation (§4.6)."""
         storage = self._storage
         ranges = self._arena_ranges
         assert ranges is not None
         for pg_idx, rng in typed_enumerate(ranges):
-            try:
-                storage.ensure_gpu_mapped(pg_idx, rng, num_valid_blocks)
-            except OutOfPagesError:
-                if storage.drain_gpu_reclaim() == 0:
-                    return False
+            while True:
                 try:
                     storage.ensure_gpu_mapped(pg_idx, rng, num_valid_blocks)
+                    break
                 except OutOfPagesError:
+                    if storage.drain_gpu_reclaim() > 0:
+                        continue
+                    if storage.spill_gpu_retained(self._ARENA_SPILL_CHUNK_PAGES) > 0:
+                        continue
                     return False
         return True
 
@@ -907,13 +965,25 @@ class _KVCache:
         if not self._arena_ensure_mapped(self.num_blocks):
             return False
         # One explicit-destination migrate per (pool group, source level,
-        # copy-vs-move).
+        # copy-vs-move); committed sources whose bytes are still resident in a
+        # retained range short-circuit to D2D copies (§4.4 phase 2).
         dst_slots = list[Slot]()
         groups: dict[tuple[PoolGroupIndex, CacheLevel, bool], list[int]] = {}
+        ghost_groups: dict[PoolGroupIndex, list[int]] = {}
+        ghost_srcs: dict[PoolGroupIndex, list[SlotId]] = {}
+        ghost_rngs: dict[PoolGroupIndex, list[SequenceRange]] = {}
         for i, (ordinal, lc_idx, holder) in enumerate(entries):
             pg_idx = storage.get_pool_group_index(lc_idx)
             dst_slots.append(storage.take_gpu_sequence_slot(pg_idx, ranges[pg_idx], int(ordinal)))
             page = holder.page
+            if page.is_committed():
+                ghost = storage.lookup_arena_ghost(pg_idx, page)
+                if ghost is not None:
+                    src_id, src_rng = ghost
+                    ghost_groups.setdefault(pg_idx, []).append(i)
+                    ghost_srcs.setdefault(pg_idx, []).append(src_id)
+                    ghost_rngs.setdefault(pg_idx, []).append(src_rng)
+                    continue
             if page.scheduled_for_eviction:
                 # Migration requires unscheduled sources; being held again on
                 # the other side of onboarding re-schedules them as usual.
@@ -935,6 +1005,13 @@ class _KVCache:
                 assert ret is not None
                 for i, slot in zip(idx_list, ret):
                     copied[i] = slot
+        for pg_idx, idx_list in ghost_groups.items():
+            ghost_dsts = [dst_slots[i] for i in idx_list]
+            storage.onboard_from_retained(
+                pg_idx, ghost_srcs[pg_idx], ghost_dsts, ghost_rngs[pg_idx]
+            )
+            for i, slot in zip(idx_list, ghost_dsts):
+                copied[i] = slot
         stream_wait_events(
             self.cuda_stream,
             (
@@ -1374,8 +1451,16 @@ class _KVCache:
             max_blocks = div_up(max_capacity, self.tokens_per_block)
             ranges = list[SequenceRange]()
             try:
-                for pg_idx in typed_range(storage.num_pool_groups):
-                    ranges.append(storage.reserve_gpu_sequence(pg_idx, max_blocks))
+                pg_idx = PoolGroupIndex(0)
+                while pg_idx < storage.num_pool_groups:
+                    try:
+                        ranges.append(storage.reserve_gpu_sequence(pg_idx, max_blocks))
+                        pg_idx = PoolGroupIndex(pg_idx + 1)
+                    except MemoryError:
+                        # VA exhaustion: retained ranges hold VA too (§4.4
+                        # phase 2); spill everything spillable and retry once.
+                        if storage.spill_gpu_retained(1 << 62) == 0:
+                            raise
             except MemoryError:
                 # VA exhaustion / fragmentation: back off like any other
                 # resource shortage. Nothing was mapped; undo the bookkeeping.

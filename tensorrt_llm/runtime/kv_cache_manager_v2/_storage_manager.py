@@ -167,6 +167,7 @@ class CacheLevelManager:
                         config.quota,
                         arena_spec.config.phys_page_size,
                         arena_spec.config.map_ahead_pages,
+                        arena_spec.config.lazy_gpu_retention,
                     )
                 granularity = CacheLevelManager.cache_tier_granularity(
                     CacheTier.GPU_MEM, config.quota
@@ -525,8 +526,78 @@ class StorageManager:
     def drain_gpu_reclaim(self) -> int:
         """Unmap and recycle freed ranges whose gating events completed; call
         at iteration boundaries (§4.2). Returns the number of ranges
-        reclaimed."""
+        reclaimed (or parked on the retained LRU under lazy retention)."""
         return self._gpu_arena_storage().drain_reclaim()
+
+    def spill_gpu_retained(self, min_pages: int) -> int:
+        """Reclaim lazily retained ranges (§4.4 phase 2) until ``min_pages``
+        physical pages are freed or nothing is spillable. Returns pages
+        freed."""
+        return self._gpu_arena_storage().spill_retained(min_pages)
+
+    def register_arena_ghosts(
+        self,
+        pg_idx: PoolGroupIndex,
+        rng: SequenceRange,
+        entries: Sequence[tuple[int, Page]],
+    ) -> None:
+        """Record, for each ``(ordinal, page)``, that the (now host-resident)
+        page's bytes are still present at ``rng.base_block + ordinal`` --
+        usable as a D2D reuse source while the range stays retained (§4.4
+        phase 2). No-op unless lazy retention is enabled."""
+        self._gpu_arena_storage().pool_group(pg_idx).register_ghosts(rng, entries)
+
+    def lookup_arena_ghost(
+        self, pg_idx: PoolGroupIndex, page: Page
+    ) -> "tuple[SlotId, SequenceRange] | None":
+        return self._gpu_arena_storage().pool_group(pg_idx).lookup_ghost(page)
+
+    def onboard_from_retained(
+        self,
+        pg_idx: PoolGroupIndex,
+        src_slot_ids: Sequence[SlotId],
+        dst_slots: Sequence[Slot],
+        gate_ranges: Sequence[SequenceRange],
+    ) -> None:
+        """D2D reuse onboarding from retained ranges (§4.4 phase 2): copy each
+        ghost source block into its explicit arena destination. Sources are
+        settled (their range left the pending queue) and immutable; the copy
+        finish event is set as every dst slot's ready event AND appended to
+        each source range's reclaim gates, so a spill can never unmap a range
+        an onboard is still reading."""
+        assert len(src_slot_ids) == len(dst_slots)
+        if not dst_slots:
+            return
+        num_pools = self.num_pools(pg_idx)
+        slot_sizes = self.slot_size(pg_idx)
+        gpu_tier = self._levels[GPU_LEVEL].cache_tier
+        tasks_per_pool: TypedIndexList[PoolIndex, list[CopyTask]] = make_typed(
+            lambda _: list[CopyTask](), num_pools
+        )
+        for src_id, dst in zip(src_slot_ids, dst_slots):
+            for pool_idx in typed_range(num_pools):
+                tasks_per_pool[pool_idx].append(
+                    CopyTask(
+                        self.slot_address(GPU_LEVEL, pg_idx, dst.slot_id, pool_idx),
+                        self.slot_address(GPU_LEVEL, pg_idx, src_id, pool_idx),
+                    )
+                )
+        with TemporaryCudaStream([]) as stream:
+            for pool_idx, tasks in typed_enumerate(tasks_per_pool):
+                # Consecutive ordinals in both the source (dead) and the
+                # destination range make these coalesce well.
+                for merged_size, merged_tasks in _coalesce_copy_tasks(
+                    slot_sizes[pool_idx], tasks
+                ).items():
+                    batched_copy(gpu_tier, gpu_tier, merged_size, merged_tasks, stream.get())
+        finish_event = stream.take_finish_event()
+        for dst in dst_slots:
+            dst.ready_event = finish_event
+        seen = set()
+        for rng in gate_ranges:
+            if id(rng) not in seen:
+                seen.add(id(rng))
+                rng._gate_events.append(finish_event)
 
     def offload_arena_pages(self, pg_idx: PoolGroupIndex, pages: Sequence[Page]) -> None:
         """Active->stale copy-on-free (§4.3): migrate a freeing sequence's
@@ -997,8 +1068,11 @@ class StorageManager:
         if level == GPU_LEVEL and self.is_arena_mode:
             # Slot counts describe VA in arena mode; physical utilization is
             # the shared page budget (§4.6), identical for every pool group.
+            # Lazily retained pages are reclaimable at will and count as
+            # available, mirroring classic "evictable" accounting.
             budget = self.gpu_page_budget
-            return filled_list(budget.used_pages / budget.total_pages, self.num_pool_groups)
+            frac = (budget.used_pages - budget.retained_pages) / budget.total_pages
+            return filled_list(frac, self.num_pool_groups)
         ret = filled_list(0.0, self.num_pool_groups)
         stats = self.get_statistics(level)
         for pg_idx in typed_range(self.num_pool_groups):
@@ -1008,7 +1082,7 @@ class StorageManager:
     def get_overall_utilization(self, level: CacheLevel = GPU_LEVEL) -> float:
         if level == GPU_LEVEL and self.is_arena_mode:
             budget = self.gpu_page_budget
-            return budget.used_pages / budget.total_pages
+            return (budget.used_pages - budget.retained_pages) / budget.total_pages
         stats = self.get_statistics(level)
         return sum(sum(s.slot_size) * s.unavailable for s in stats) / sum(
             sum(s.slot_size) * s.total for s in stats

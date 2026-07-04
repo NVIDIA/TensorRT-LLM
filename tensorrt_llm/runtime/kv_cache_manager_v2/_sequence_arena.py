@@ -89,14 +89,18 @@ class PageBudget:
     handles live in the shared :class:`PooledPhysMemAllocator`).
     """
 
-    __slots__ = ("_total", "_used")
+    __slots__ = ("_total", "_used", "_retained")
     _total: int
     _used: int
+    # Subset of _used held by lazily retained ranges (§4.4 phase 2): mapped
+    # but reclaimable at will, analogous to classic "evictable" blocks.
+    _retained: int
 
     def __init__(self, total_pages: int) -> None:
         assert total_pages > 0
         self._total = total_pages
         self._used = 0
+        self._retained = 0
 
     @property
     def total_pages(self) -> int:
@@ -107,8 +111,20 @@ class PageBudget:
         return self._used
 
     @property
+    def retained_pages(self) -> int:
+        return self._retained
+
+    @property
     def free_pages(self) -> int:
         return self._total - self._used
+
+    def retain(self, num_pages: int) -> None:
+        assert 0 <= num_pages and self._retained + num_pages <= self._used
+        self._retained += num_pages
+
+    def unretain(self, num_pages: int) -> None:
+        assert 0 <= num_pages <= self._retained
+        self._retained -= num_pages
 
     def consume(self, num_pages: int) -> None:
         """Take ``num_pages`` from the budget; raises ``OutOfPagesError``
@@ -359,6 +375,18 @@ class SequenceArena:
 
     def reserved_len(self, base_block: int) -> int:
         return self._alloc.reserved_len(base_block)
+
+    def mapped_pages_in_range(self, base_block: int) -> int:
+        """Number of physical pages currently mapped inside the range starting
+        at ``base_block``, across all pools."""
+        num_blocks = self._alloc.reserved_len(base_block)
+        page = self._phys_page_size
+        total = 0
+        for pool in range(len(self._vms)):
+            lo, hi = self._chunk_range(pool, base_block, num_blocks)
+            vm = self._vms[pool]
+            total += sum(1 for chunk in range(lo, hi) if vm.is_mapped(chunk * page))
+        return total
 
     def reserve(self, max_blocks: int) -> int:
         """Reserve VA for a sequence's maximum block count; returns base_block.
