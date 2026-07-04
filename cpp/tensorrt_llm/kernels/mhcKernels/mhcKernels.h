@@ -27,15 +27,6 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels::mhc
 {
 
-// DSV4-Pro O_b FP8 block-scaled GEMM. Emits split-major BF16 partials
-// [num_splits, M, N]; mHC consumes and reduces them in its x input path.
-// The current specialization supports N=7168, K=16384, positive M, and
-// num_splits in {2, 4} on the SM100 family. Attention dispatches it only for
-// M<=128, where split-K improves occupancy.
-void dsv4Fp8SplitKGemmLaunch(void const* a, int32_t const* sfa, void const* b, int32_t const* sfb,
-    __nv_bfloat16* partials, int M, int N, int K, int sfa_k_stride, int sfb_k_stride, int num_splits,
-    cudaStream_t stream);
-
 // `norm_weight` (bf16 [hidden_size], optional) enables fused next-layer RMSNorm
 // on `layer_input`: when non-null, layer_input is written normalized
 //   bf16(li * rsqrt(mean(li²)+norm_eps) * norm_weight[h]).

@@ -733,7 +733,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     max_active_clusters,
                     stream,
                     swap_ab,
-                    options=f"--opt-level 2 --enable-tvm-ffi"
+                    options="--opt-level 2 --enable-tvm-ffi"
                     if self.use_tvm_ffi else "--opt-level 2",
                 )
 
@@ -1141,7 +1141,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     max_active_clusters,
                     stream,
                     False,  # swap_ab=False for SwiGLU
-                    options=f"--opt-level 2 --enable-tvm-ffi"
+                    options="--opt-level 2 --enable-tvm-ffi"
                     if self.use_tvm_ffi else "--opt-level 2",
                 )
 
@@ -1479,7 +1479,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     norm_const_cute_tensor,
                     max_active_clusters,
                     stream,
-                    options=f"--opt-level 2 --enable-tvm-ffi"
+                    options="--opt-level 2 --enable-tvm-ffi"
                     if self.use_tvm_ffi else "--opt-level 2",
                 )
 
@@ -3439,7 +3439,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     c_cute_tensor,
                     max_active_clusters=max_active_clusters,
                     stream=stream,
-                    options=f"--opt-level 2 --enable-tvm-ffi"
+                    options="--opt-level 2 --enable-tvm-ffi"
                     if self.use_tvm_ffi else "--opt-level 2",
                 )
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
@@ -3533,6 +3533,508 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # output is fixed as bf16
         ret = mat_a.new_empty(shape, dtype=torch.bfloat16)
         return ret
+
+    class CuteDSLFp8SplitKGemmRunner:
+        """DSV4-Pro O_b runner using native block-scaled tcgen05 MMA."""
+
+        kernel_class = Sm100BlockScaledPersistentDenseGemmKernel
+        kernel_cache = dict()
+        alpha_cache = dict()
+        _SWAPPED_TILE_N_64 = (
+            64,
+            64,
+            96,
+            128,
+            160,
+            192,
+            240,
+            256,
+            128,
+            128,
+            144,
+            160,
+            176,
+            192,
+            192,
+            208,
+            224,
+            240,
+            176,
+            192,
+            192,
+            208,
+            224,
+            224,
+            240,
+            240,
+            176,
+            192,
+            192,
+            192,
+            208,
+            208,
+            224,
+            224,
+            224,
+            240,
+            240,
+            192,
+            192,
+            208,
+            208,
+            208,
+            224,
+            224,
+            224,
+            240,
+            240,
+            240,
+            224,
+            224,
+            224,
+            224,
+            240,
+            240,
+            240,
+            240,
+            208,
+            208,
+            240,
+            224,
+            224,
+            224,
+            224,
+            240,
+            240,
+            240,
+            240,
+            208,
+            224,
+            224,
+            224,
+            224,
+            224,
+            240,
+            240,
+            240,
+            240,
+            240,
+            224,
+            224,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            224,
+            224,
+            224,
+            224,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            224,
+            224,
+            224,
+            224,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            224,
+            224,
+            224,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            224,
+            224,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            224,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+            240,
+        )
+        _NO_SWAP_TILE_N = {
+            256: 128,
+            448: 208,
+            512: 208,
+            2304: 224,
+            3776: 224,
+            4032: 224,
+            4096: 224,
+            5568: 224,
+            5824: 224,
+            5888: 224,
+            7616: 224,
+            7680: 224,
+            9408: 224,
+            9472: 224,
+        }
+
+        def __init__(self, use_tvm_ffi: bool = True):
+            self.use_tvm_ffi = use_tvm_ffi
+
+        @classmethod
+        def _get_tactic(cls, m: int, num_splits: int):
+            if num_splits > 1 and m <= 32:
+                # Preserve enough O_b N tiles to fill the B200 while making
+                # the token tail exact; 256x64 leaves half of MMA-N idle here.
+                return (128, 32), (2, 1), True, None, True
+            no_swap_tile_n = (cls._NO_SWAP_TILE_N.get(m)
+                              if num_splits == 1 else None)
+            if no_swap_tile_n is not None:
+                return ((256, no_swap_tile_n), (2, 1), False, None, m != 2304)
+
+            bucket = max(1, min((m + 63) // 64, len(cls._SWAPPED_TILE_N_64)))
+            tile_n = cls._SWAPPED_TILE_N_64[bucket - 1]
+            if num_splits > 1 and m <= 128:
+                tile_n = 64 if m <= 64 else 128
+            max_ab_stages = 8 if m <= 64 else None
+            return (256, tile_n), (2, 1), True, max_ab_stages, True
+
+        def forward(self, inputs: List[torch.Tensor], num_splits: int) -> None:
+            a_tensor, a_sf_tensor, b_tensor, b_sf_tensor, partials = inputs
+            m, k = a_tensor.shape
+            n = b_tensor.shape[0]
+            c_tmp = partials.permute(1, 2, 0)
+
+            (mma_tiler_mn, cluster_shape_mn, swap_ab, max_ab_stages,
+             l2_swizzle) = self._get_tactic(m, num_splits)
+            # Keep A/B TMA independent of scale staging once persistent tiles
+            # are large enough to amortize the scale warp's TMA state machine.
+            scale_tma_on_scale_warp = m >= 512
+            tma_packed_scales = scale_tma_on_scale_warp
+            if swap_ab:
+                kernel_m, kernel_n = n, m
+                kernel_a, kernel_b = b_tensor, a_tensor
+                kernel_sfa, kernel_sfb = b_sf_tensor, a_sf_tensor
+            else:
+                kernel_m, kernel_n = m, n
+                kernel_a, kernel_b = a_tensor, b_tensor
+                kernel_sfa, kernel_sfb = a_sf_tensor, b_sf_tensor
+            kernel_sfa_stride = kernel_sfa.stride(1)
+            kernel_sfb_stride = kernel_sfb.stride(1)
+            dynamic_mma_n = kernel_n % mma_tiler_mn[1] != 0
+            cache_key = (kernel_m, kernel_n, k, num_splits, kernel_sfa_stride,
+                         kernel_sfb_stride, mma_tiler_mn, cluster_shape_mn,
+                         swap_ab, dynamic_mma_n, max_ab_stages, l2_swizzle,
+                         tma_packed_scales, scale_tma_on_scale_warp,
+                         self.use_tvm_ffi)
+
+            a_ptr = make_ptr(
+                cutlass.Float8E4M3FN,
+                kernel_a.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            b_ptr = make_ptr(
+                cutlass.Float8E4M3FN,
+                kernel_b.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            a_sf_ptr = make_ptr(
+                cutlass.Uint32,
+                kernel_sfa.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            b_sf_ptr = make_ptr(
+                cutlass.Uint32,
+                kernel_sfb.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            c_cute_tensor = cute.runtime.from_dlpack(c_tmp).mark_layout_dynamic(
+                leading_dim=1)
+            device_key = a_tensor.device
+            alpha = self.__class__.alpha_cache.get(device_key)
+            if alpha is None:
+                alpha = torch.ones((1, ),
+                                   device=device_key,
+                                   dtype=torch.float32)
+                self.__class__.alpha_cache[device_key] = alpha
+            alpha_cute_tensor = cute.runtime.from_dlpack(alpha)
+            stream = (cute.runtime.make_fake_stream(
+                use_tvm_ffi_env_stream=True) if self.use_tvm_ffi else
+                      cuda.CUstream(torch.cuda.current_stream().cuda_stream))
+
+            if cache_key not in self.__class__.kernel_cache:
+                gemm = self.__class__.kernel_class(
+                    32,
+                    mma_tiler_mn,
+                    cluster_shape_mn,
+                    False,
+                    packed_k128_scales=True,
+                    tma_packed_scales=tma_packed_scales,
+                    scale_tma_on_scale_warp=scale_tma_on_scale_warp,
+                    dynamic_mma_n=dynamic_mma_n,
+                    apply_alpha=False,
+                    max_ab_stages=max_ab_stages,
+                    l2_swizzle=l2_swizzle,
+                )
+                hardware_info = cutlass.utils.HardwareInfo()
+                max_active_clusters = hardware_info.get_max_active_clusters(
+                    cluster_shape_mn[0] * cluster_shape_mn[1])
+                compiled_gemm = cute.compile(
+                    gemm.wrapper_dsv4_splitk_packed_ue8m0,
+                    kernel_m,
+                    kernel_n,
+                    k,
+                    num_splits,
+                    kernel_sfa_stride,
+                    kernel_sfb_stride,
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    c_cute_tensor,
+                    alpha_cute_tensor,
+                    max_active_clusters,
+                    stream,
+                    swap_ab,
+                    options=("--opt-level 2 --enable-tvm-ffi"
+                             if self.use_tvm_ffi else "--opt-level 2"),
+                )
+                self.__class__.kernel_cache[cache_key] = compiled_gemm
+            else:
+                compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            if self.use_tvm_ffi:
+                compiled_gemm(
+                    kernel_a.data_ptr(),
+                    kernel_b.data_ptr(),
+                    kernel_sfa.data_ptr(),
+                    kernel_sfb.data_ptr(),
+                    c_tmp,
+                    alpha,
+                )
+            else:
+                compiled_gemm(
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    c_cute_tensor,
+                    alpha_cute_tensor,
+                    stream=stream,
+                )
+
+    @torch.library.custom_op(
+        "trtllm::dsv4_fp8_splitk_gemm",
+        mutates_args=("partials", ),
+        device_types="cuda",
+    )
+    def dsv4_fp8_splitk_gemm(
+        a: torch.Tensor,
+        sfa: torch.Tensor,
+        b: torch.Tensor,
+        sfb: torch.Tensor,
+        partials: torch.Tensor,
+        num_splits: int,
+    ) -> None:
+        """Emit split-major BF16 partials for the DSV4 O_b FP8 GEMM."""
+        if not is_sm_100f():
+            raise ValueError(
+                f"dsv4_fp8_splitk_gemm requires the SM100 family, got {get_sm_version()}"
+            )
+        if num_splits not in (1, 2, 4):
+            raise ValueError(f"num_splits must be 1, 2, or 4, got {num_splits}")
+        if not all(t.is_cuda for t in (a, sfa, b, sfb, partials)):
+            raise ValueError(
+                "all dsv4_fp8_splitk_gemm tensors must be CUDA tensors")
+        if len({t.device for t in (a, sfa, b, sfb, partials)}) != 1:
+            raise ValueError(
+                "all dsv4_fp8_splitk_gemm tensors must be on the same device")
+        if a.dtype != torch.float8_e4m3fn or b.dtype != torch.float8_e4m3fn:
+            raise TypeError("A and B must have dtype torch.float8_e4m3fn")
+        if sfa.dtype != torch.int32 or sfb.dtype != torch.int32:
+            raise TypeError(
+                "SFA and SFB must contain packed int32 UE8M0 scales")
+        if partials.dtype != torch.bfloat16:
+            raise TypeError("partials must have dtype torch.bfloat16")
+        if a.dim() != 2 or b.dim(
+        ) != 2 or not a.is_contiguous() or not b.is_contiguous():
+            raise ValueError("A and B must be contiguous rank-2 tensors")
+
+        m, k = a.shape
+        n = b.shape[0]
+        if b.shape[1] != k:
+            raise ValueError("A and B K dimensions must match")
+        if k % (512 * num_splits) != 0:
+            raise ValueError(f"K={k} must be divisible by 512*num_splits")
+        if n % 128 != 0:
+            raise ValueError(f"N={n} must be divisible by 128")
+        if partials.shape != (num_splits, m, n) or not partials.is_contiguous():
+            raise ValueError(
+                f"partials must be contiguous with shape {(num_splits, m, n)}")
+
+        packed_k = k // 512
+        if (sfa.dim() != 2 or sfa.shape != (m, packed_k) or sfa.stride(0) != 1
+                or sfa.stride(1) < m or sfa.stride(1) % 4 != 0):
+            raise ValueError(
+                "SFA must be packed MN-major [M,K/512] with 4-aligned K stride")
+        if (sfb.dim() != 2 or sfb.shape != (n, packed_k) or sfb.stride(0) != 1
+                or sfb.stride(1) != n):
+            raise ValueError("SFB must be packed MN-major [N,K/512]")
+
+        CuteDSLFp8SplitKGemmRunner(use_tvm_ffi=True).forward(
+            [a, sfa, b, sfb, partials], num_splits)
+
+    @torch.library.register_fake("trtllm::dsv4_fp8_splitk_gemm")
+    def _(
+        a: torch.Tensor,
+        sfa: torch.Tensor,
+        b: torch.Tensor,
+        sfb: torch.Tensor,
+        partials: torch.Tensor,
+        num_splits: int,
+    ) -> None:
+        return None
 
     class CuteDSLFp8BlackwellBmmRunner(TunableRunner):
         kernel_class = Sm100BlockwiseGemmKernel
@@ -3753,7 +4255,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     c_cute_tensor,
                     max_active_clusters=max_active_clusters,
                     stream=stream,
-                    options=f"--opt-level 2 --enable-tvm-ffi"
+                    options="--opt-level 2 --enable-tvm-ffi"
                     if self.use_tvm_ffi else "--opt-level 2",
                 )
                 self.__class__.kernel_cache[cache_key] = compiled_gemm

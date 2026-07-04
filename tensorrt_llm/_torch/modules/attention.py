@@ -24,6 +24,7 @@ from ..attention_backend.interface import (AttentionBackend, AttentionMask,
 from ..attention_backend.sparse.dsa import (
     DSAtrtllmAttentionMetadata, transform_local_topk_and_prepare_pool_view)
 from ..attention_backend.utils import create_attention, get_attention_backend
+from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
                            cp_allgather, reducescatter)
 from ..model_config import ModelConfig
@@ -52,7 +53,7 @@ def _select_dsv4_ob_split_k(num_tokens: int,
     if configured_split is None:
         env_split = int(os.environ.get("TRTLLM_DSV4_OB_SPLIT_K", "0"))
         split_k = env_split if env_split else (
-            2 if 64 <= num_tokens <= 128 else 1)
+            2 if 0 < num_tokens <= 128 else 1)
     else:
         split_k = configured_split
     if split_k not in (1, 2, 4):
@@ -2036,10 +2037,9 @@ class MLA(nn.Module):
         aligned_m = ((num_tokens + 3) // 4) * 4
         n_tiles = (o_lora_rank + 127) // 128
         packed_k = (num_groups * n_tiles + 3) // 4
-        o_lora_fp8 = torch.empty(
-            [num_tokens, num_groups, o_lora_rank],
-            device=attn_fp8.device,
-            dtype=torch.float8_e4m3fn)
+        o_lora_fp8 = torch.empty([num_tokens, num_groups, o_lora_rank],
+                                 device=attn_fp8.device,
+                                 dtype=torch.float8_e4m3fn)
         sf_storage = torch.zeros(packed_k * aligned_m,
                                  device=attn_fp8.device,
                                  dtype=torch.int32)
@@ -2052,30 +2052,15 @@ class MLA(nn.Module):
 
     def _fused_ob_gemm(self, o_lora_fp8: torch.Tensor, sf_out: torch.Tensor,
                        num_tokens: int) -> torch.Tensor:
-        """Run the fused DSV4 O_b GEMM and emit mHC-ready partials."""
+        """Run the DSV4-Pro O_b FP8 GEMM and emit mHC-ready split partials."""
         from tensorrt_llm import deep_gemm
+
         M, N = num_tokens, self.hidden_size
         K_ob = o_lora_fp8.shape[1]
         w, wsf = self.o_b_proj.weight, self.o_b_proj.weight_scale
-        nkb4, wcols = sf_out.shape[1], wsf.shape[-1]
         SK = _select_dsv4_ob_split_k(M, getattr(self, "ob_split_k", None))
-        can_split = (SK > 1 and M <= 128 and N == 7168 and K_ob == 16384
-                     and K_ob % SK == 0 and (K_ob // SK) % 512 == 0
-                     and nkb4 % SK == 0 and wcols % SK == 0)
-        if not can_split:
-            hidden = torch.empty([M, N],
-                                 device=o_lora_fp8.device,
-                                 dtype=self.dtype)
-            deep_gemm.fp8_gemm_nt((o_lora_fp8, sf_out), (w, wsf),
-                                  hidden,
-                                  c=None,
-                                  disable_ue8m0_cast=False)
-            return hidden
-        logger.info_once(
-            f"[obsk-fused] O_b split-K ENGAGED (TRT-LLM C++): SK={SK} "
-            f"M={M} K={K_ob} N={N}",
-            key="obsk_fused_engaged")
-        if wsf.dtype != torch.int32:
+        if (IS_CUTLASS_DSL_AVAILABLE and N == 7168 and K_ob == 16384
+                and wsf.dtype != torch.int32):
             from tensorrt_llm.quantization.utils.fp8_utils import \
                 transform_sf_into_required_layout
             wsf = self.o_b_proj.__dict__.setdefault(
@@ -2085,11 +2070,39 @@ class MLA(nn.Module):
                                                   k=K_ob,
                                                   recipe=(1, 128, 128),
                                                   is_sfa=False))
+
+        packed_k = K_ob // 512
+        can_use_cute = (IS_CUTLASS_DSL_AVAILABLE and M > 0
+                        and (M >= 256 or SK > 1) and N == 7168 and K_ob == 16384
+                        and K_ob % (512 * SK) == 0
+                        and sf_out.dtype == torch.int32 and sf_out.dim() == 2
+                        and sf_out.shape == (M, packed_k)
+                        and sf_out.stride(0) == 1 and sf_out.stride(1) >= M
+                        and sf_out.stride(1) % 4 == 0
+                        and wsf.dtype == torch.int32 and wsf.dim() == 2
+                        and wsf.shape == (N, packed_k) and wsf.stride(0) == 1
+                        and wsf.stride(1) == N)
+        if not can_use_cute:
+            hidden = torch.empty([M, N],
+                                 device=o_lora_fp8.device,
+                                 dtype=self.dtype)
+            deep_gemm.fp8_gemm_nt((o_lora_fp8, sf_out), (w, wsf),
+                                  hidden,
+                                  c=None,
+                                  disable_ue8m0_cast=False)
+            return hidden
+
+        logger.info_once(
+            f"[obsk-fused] O_b CuTe DSL ENGAGED: SK={SK} M={M} "
+            f"K={K_ob} N={N}",
+            key="obsk_fused_engaged")
         partials = torch.empty([SK, M, N],
                                device=o_lora_fp8.device,
                                dtype=self.dtype)
         torch.ops.trtllm.dsv4_fp8_splitk_gemm(o_lora_fp8, sf_out, w, wsf,
                                               partials, SK)
+        if SK == 1:
+            return partials[0]
         return partials.reshape(SK * M, N)
 
     def _deepseek_v4_o_proj(

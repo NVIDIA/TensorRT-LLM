@@ -19,7 +19,7 @@
 # this directory (bench_*.cu, probe_*.cu, profile_*.cu, test_*.cu) are
 # standalone binaries with their own main() and must NOT be compiled into the
 # trtllm shared library.
-set(SRC_CU dsv4Fp8SplitKGemm.cu mhcKernels.cu mhcFusedHcKernel.cu)
+set(SRC_CU mhcKernels.cu mhcFusedHcKernel.cu)
 add_library(mhcKernels_src OBJECT ${SRC_CU})
 
 set_property(TARGET mhcKernels_src PROPERTY POSITION_INDEPENDENT_CODE ON)
@@ -28,7 +28,7 @@ target_compile_options(mhcKernels_src
                        PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
 
 # Expose the DeepGEMM SM100 MMA/TMA building blocks used by the fused
-# post-mapping kernels and DSV4 O_b split-K GEMM.
+# post-mapping kernels.
 target_include_directories(
   mhcKernels_src
   PRIVATE ${CMAKE_BINARY_DIR}/_deps/deepgemm-src/deep_gemm/include)

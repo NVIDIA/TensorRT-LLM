@@ -294,6 +294,7 @@ class Sm100BlockwiseGemmKernel:
         use_2cta_instrs: bool,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
+        smem_reserve_bytes: int = 1024,
     ):
         """Initializes the configuration for a Blackwell blockwise dense GEMM kernel.
 
@@ -316,11 +317,15 @@ class Sm100BlockwiseGemmKernel:
         :type use_2cta_instrs: bool
         :param cluster_shape_mn: Tuple (ClusterM, ClusterN) shape of the cluster.
         :type cluster_shape_mn: Tuple[int, int]
+        :param smem_reserve_bytes: Shared-memory bytes reserved for barriers,
+            alignment, and other non-tensor storage.
+        :type smem_reserve_bytes: int
         """
 
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
         self.cluster_shape_mn = cluster_shape_mn
+        self.smem_reserve_bytes = smem_reserve_bytes
         # K dimension is deferred in _setup_attributes
         self.mma_tiler = (*mma_tiler_mn, 1)
 
@@ -470,6 +475,7 @@ class Sm100BlockwiseGemmKernel:
             self.scale_n_per_tile * self.scale_k_per_tile,
             self.num_smem_capacity,
             self.occupancy,
+            self.smem_reserve_bytes,
         )
         if self.fp8_smem_epi_mode:
             # Reserve one 32-KiB A/B stage for a full 128x128 BF16 epilogue
@@ -1133,8 +1139,13 @@ class Sm100BlockwiseGemmKernel:
         # Partition global/shared tensor for TMA load A/B
         #
         # load scaleA/scaleB
+        scale_copy_op = (
+            cute.nvgpu.CopyUniversalOp()
+            if mSFA_mkl.element_type.width < 32
+            else cute.nvgpu.cpasync.CopyG2SOp()
+        )
         atom_copy = cute.make_copy_atom(
-            cute.nvgpu.cpasync.CopyG2SOp(),
+            scale_copy_op,
             mSFA_mkl.element_type,
             num_bits_per_copy=mSFA_mkl.element_type.width,
         )
@@ -1721,11 +1732,11 @@ class Sm100BlockwiseGemmKernel:
 
                 tTR_rSFA = cute.make_rmem_tensor(
                     cute.slice_(tTR_sSFA, (None, None, None, 0, None, 0)).shape,
-                    self.acc_dtype,
+                    self.sfa_dtype,
                 )
                 tTR_rSFB = cute.make_rmem_tensor(
                     cute.slice_(tTR_sSFB, (None, None, None, 0, None, 0)).shape,
-                    self.acc_dtype,
+                    self.sfb_dtype,
                 )
 
                 scale_consumer_state.reset_count()
@@ -1759,14 +1770,19 @@ class Sm100BlockwiseGemmKernel:
                         (None, None, None, 0, None, scale_consumer_state.index),
                     )
 
-                    scale_atom_copy = cute.make_copy_atom(
+                    sfa_atom_copy = cute.make_copy_atom(
                         cute.nvgpu.CopyUniversalOp(),
-                        self.acc_dtype,
-                        num_bits_per_copy=self.acc_dtype.width,
+                        self.sfa_dtype,
+                        num_bits_per_copy=self.sfa_dtype.width,
+                    )
+                    sfb_atom_copy = cute.make_copy_atom(
+                        cute.nvgpu.CopyUniversalOp(),
+                        self.sfb_dtype,
+                        num_bits_per_copy=self.sfb_dtype.width,
                     )
 
-                    cute.copy(scale_atom_copy, tTR_sSFA_slice, tTR_rSFA)
-                    cute.copy(scale_atom_copy, tTR_sSFB_slice, tTR_rSFB)
+                    cute.copy(sfa_atom_copy, tTR_sSFA_slice, tTR_rSFA)
+                    cute.copy(sfb_atom_copy, tTR_sSFB_slice, tTR_rSFB)
 
                     #
                     # Wait for accumulator buffer full
@@ -1796,8 +1812,8 @@ class Sm100BlockwiseGemmKernel:
 
                         acc_vec = tTR_rAcc.load()
                         final_vec = tTR_rAcc_subtile.load()
-                        scale_a = tTR_rSFA_subtile.load()
-                        scale_b = tTR_rSFB_subtile.load()
+                        scale_a = tTR_rSFA_subtile.load().to(self.acc_dtype)
+                        scale_b = tTR_rSFB_subtile.load().to(self.acc_dtype)
                         scale = scale_a * scale_b
                         final_vec = acc_vec * scale + final_vec
                         tTR_rAcc_subtile.store(final_vec.to(self.acc_dtype))
@@ -2157,23 +2173,20 @@ class Sm100BlockwiseGemmKernel:
                     global_kblock = (
                         mma_tile_coord_mnl[2] * n_tiles_per_group + mma_tile_coord_mnl[1]
                     )
-                    # byte offset = (kb//4)*aligned_mn*4 + m*4 + (kb%4)
-                    col = global_kblock >> cutlass.Int32(2)  # kb // 4
-                    byte_in_col = global_kblock & cutlass.Int32(3)  # kb % 4
-                    byte_offset = (
-                        col * sf_aligned_mn * cutlass.Int32(4)
-                        + global_m * cutlass.Int32(4)
-                        + byte_in_col
-                    )
-                    # Int64 address arithmetic avoids LLVM dialect type issues.
-                    eff_sf_addr = sf_out_addr + cutlass.Int64(byte_offset)
                     # Tail guard: predicate on global_m < M to skip OOB stores for
                     # small/tail M (e.g. M=4 leaves rows 4..127 of the tile unmapped).
                     # The amax scan above is harmless unconditionally; only the store
                     # must be guarded.
                     runtime_m = cutlass.Int32(mC_mnl.shape[0])
                     if global_m < runtime_m:
-                        stg_u8_raw(eff_sf_addr, ue8m0_byte_i32)
+                        col = global_kblock >> cutlass.Int32(2)
+                        byte_in_col = global_kblock & cutlass.Int32(3)
+                        byte_offset = (
+                            col * sf_aligned_mn * cutlass.Int32(4)
+                            + global_m * cutlass.Int32(4)
+                            + byte_in_col
+                        )
+                        stg_u8_raw(sf_out_addr + cutlass.Int64(byte_offset), ue8m0_byte_i32)
 
                     # Step 2: quantize from cached bf16 registers (NO second TMEM load).
                     sf_rcp = cutlass.Float32(1.0) / sf_fp32
@@ -2763,6 +2776,7 @@ class Sm100BlockwiseGemmKernel:
         sfb_count: int,
         num_smem_capacity: int,
         occupancy: int,
+        smem_reserve_bytes: int,
     ) -> Tuple[int, int, int]:
         """Computes the number of stages for A/B/C operands based on heuristics.
 
@@ -2824,8 +2838,6 @@ class Sm100BlockwiseGemmKernel:
         ab_bytes_per_stage = cute.size_in_bytes(
             a_dtype, a_smem_layout_stage_one
         ) + cute.size_in_bytes(b_dtype, b_smem_layout_staged_one)
-        # 1024B alignment
-        mbar_helpers_bytes = 1024
         c_bytes_per_stage = cute.size_in_bytes(c_dtype, c_smem_layout_staged_one)
         c_bytes = c_bytes_per_stage * num_c_stage
         sfa_bytes = sfa_count * (sfa_dtype.width // 8) * num_scale_stage
@@ -2837,7 +2849,7 @@ class Sm100BlockwiseGemmKernel:
         # Subtract reserved bytes and initial C stages bytes
         # Divide remaining by bytes needed per A/B stage
         num_ab_stage = (
-            num_smem_capacity // occupancy - (mbar_helpers_bytes + c_bytes + scale_bytes)
+            num_smem_capacity // occupancy - (smem_reserve_bytes + c_bytes + scale_bytes)
         ) // ab_bytes_per_stage
 
         # Refine epilogue stages:
@@ -2846,7 +2858,7 @@ class Sm100BlockwiseGemmKernel:
         num_c_stage += (
             num_smem_capacity
             - occupancy * ab_bytes_per_stage * num_ab_stage
-            - occupancy * (mbar_helpers_bytes + c_bytes + scale_bytes)
+            - occupancy * (smem_reserve_bytes + c_bytes + scale_bytes)
         ) // (occupancy * c_bytes_per_stage)
         return num_acc_stage, num_ab_stage, num_c_stage, num_scale_stage, num_tile_stage
 
@@ -3182,6 +3194,88 @@ class Sm100BlockwiseGemmKernel:
             layout=cute.make_ordered_layout(
                 (sf_n, sf_k, batch_size),
                 order=(1, 0, 2),
+            ),
+        )
+
+        self(
+            a_tensor,
+            b_tensor,
+            c_tensor,
+            sfa_tensor,
+            sfb_tensor,
+            max_active_clusters,
+            stream,
+        )
+
+    @cute.jit
+    def wrapper_splitk_packed_ue8m0(
+        self,
+        m: cutlass.Int32,
+        n: cutlass.Int32,
+        k: cutlass.Int32,
+        num_splits: cutlass.Int32,
+        sfa_k_stride: cutlass.Int32,
+        sfb_k_stride: cutlass.Int32,
+        a_ptr: cute.Pointer,
+        b_ptr: cute.Pointer,
+        a_sf_ptr: cute.Pointer,
+        b_sf_ptr: cute.Pointer,
+        c_tensor: cute.Tensor,
+        max_active_clusters: cutlass.Constexpr,
+        stream: cuda.CUstream,
+    ):
+        """Run split-K as a strided batched GEMM over packed UE8M0 scales.
+
+        The existing device kernel already schedules the third tensor mode as
+        an independent batch.  Expose each K slice as one batch entry while
+        retaining the original row strides of A and B.  The output tensor is a
+        ``(M, N, num_splits)`` view of split-major ``[num_splits, M, N]``
+        storage, so every split writes directly to the layout consumed by mHC.
+
+        SFA/SFB store four consecutive 1x128 UE8M0 scale bytes in each int32.
+        A hierarchical K layout describes those bytes without unpacking them:
+        ``(4, K/512)`` with strides ``(1, 4*k_stride)``.  SFB is replicated for
+        every N row by the DeepGEMM-compatible transform, so this wrapper takes
+        the first row of each 128-row scale block.
+        """
+        k_per_split = k // num_splits
+        packed_k_per_split = k_per_split // 512
+
+        a_tensor = cute.make_tensor(
+            a_ptr,
+            layout=cute.make_layout(
+                (m, k_per_split, num_splits),
+                stride=(k, 1, k_per_split),
+            ),
+        )
+        b_tensor = cute.make_tensor(
+            b_ptr,
+            layout=cute.make_layout(
+                (n, k_per_split, num_splits),
+                stride=(k, 1, k_per_split),
+            ),
+        )
+
+        sfa_tensor = cute.make_tensor(
+            a_sf_ptr,
+            layout=cute.make_layout(
+                (m, (4, packed_k_per_split), num_splits),
+                stride=(
+                    4,
+                    (1, 4 * sfa_k_stride),
+                    4 * sfa_k_stride * packed_k_per_split,
+                ),
+            ),
+        )
+        sfb_tensor = cute.make_tensor(
+            b_sf_ptr,
+            layout=cute.make_layout(
+                (n // 128, (4, packed_k_per_split), num_splits),
+                stride=(
+                    4 * 128,
+                    (1, 4 * sfb_k_stride),
+                    4 * sfb_k_stride * packed_k_per_split,
+                ),
             ),
         )
 
