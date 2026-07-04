@@ -801,8 +801,8 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 
             // Wait for all active peers to signal; skip dead ranks (otherwise we would
             // spin forever — this is the bug the rank-mask is here to prevent).
-#pragma unroll 1 // No unroll
             bool wait_aborted = false;
+#pragma unroll 1 // No unroll
             for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize)
             {
                 if constexpr (ENABLE_RANK_MASK)
@@ -1491,8 +1491,8 @@ __global__ void moeA2ACombineKernel(
 
             // Wait for all active peers to signal; skip dead ranks (otherwise we would spin
             // forever — this is the bug the rank-mask is here to prevent).
-#pragma unroll 1 // No unroll
             bool wait_aborted = false;
+#pragma unroll 1 // No unroll
             for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize)
             {
                 if constexpr (ENABLE_RANK_MASK)
