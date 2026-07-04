@@ -19,6 +19,7 @@ from weakref import WeakSet
 import pytest
 import torch
 
+from tensorrt_llm._torch.alltoall_watchdog import ActiveRankMaskSnapshot
 from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
 from tensorrt_llm._torch.moe_a2a_execution_control import (
@@ -269,6 +270,30 @@ def test_moe_alltoall_wires_one_epoch_and_resets_all_shared_wrappers(
             self.begin_calls.append(execution_epoch)
             return 8 if execution_epoch is None else execution_epoch
 
+    class FakeWatchdogCoordinator:
+        def capture_active_rank_mask(
+            self, active_rank_mask: torch.Tensor | None
+        ) -> ActiveRankMaskSnapshot:
+            return ActiveRankMaskSnapshot(active_rank_mask, None)
+
+        def active_rank_mask_for_combine(
+            self,
+            snapshot: ActiveRankMaskSnapshot,
+            active_rank_mask: torch.Tensor | None,
+        ) -> torch.Tensor | None:
+            assert active_rank_mask is None
+            return snapshot.active_rank_mask
+
+        def watch_collective(
+            self,
+            watchdog: object | None,
+            phase: str,
+            active_rank_mask: torch.Tensor | None,
+        ) -> None:
+            assert watchdog is None
+            assert phase in ("dispatch", "combine")
+            assert active_rank_mask is None
+
     fake_control = FakeExecutionControl()
     workspace = torch.empty((1, 256), dtype=torch.uint8)
     metainfo = torch.zeros(10, dtype=torch.int64)
@@ -287,6 +312,8 @@ def test_moe_alltoall_wires_one_epoch_and_resets_all_shared_wrappers(
         wrapper.enable_eplb = False
         wrapper.eplb_stats_num_experts = None
         wrapper._execution_control = fake_control
+        wrapper._watchdog_coordinator = FakeWatchdogCoordinator()
+        wrapper._alltoall_watchdog = None
         wrapper.reset_state()
         workspace_state["instances"].add(wrapper)
         return wrapper
@@ -378,8 +405,10 @@ def test_moe_alltoall_wires_one_epoch_and_resets_all_shared_wrappers(
     assert first._state.execution_epoch == 7
     first.combine(payload.view(1, 2, 4), 2)
     assert first._state.phase == "idle"
+    assert dispatch_calls[0][-3] is None
     assert dispatch_calls[0][-2] is control_tensor
     assert dispatch_calls[0][-1] == 7
+    assert combine_calls[0][-3] is None
     assert combine_calls[0][-2] is control_tensor
     assert combine_calls[0][-1] == 7
 

@@ -60,10 +60,6 @@ from unittest.mock import MagicMock
 import cloudpickle
 import pytest
 import torch
-from _torch.modules.moe.moe_a2a_abort_worker import (
-    run_combine_abort_worker,
-    run_dispatch_abort_worker,
-)
 from mpi4py import MPI
 
 import tensorrt_llm as tllm
@@ -287,21 +283,27 @@ def _run_nvlink_rank_mask_dispatch(
     execution_epoch: int,
 ) -> Tuple[List[torch.Tensor], int, torch.Tensor, torch.Tensor]:
     """Run raw NVLink one-sided dispatch with an optional active rank mask."""
-    recv_tensors, combine_payload_offset, _ = torch.ops.trtllm.moe_a2a_dispatch(
-        token_selected_experts,
-        [payload],
-        comm.workspace,
-        comm.moe_a2a_metainfo,
-        runtime_max_tokens_per_rank,
-        comm.ep_rank,
-        comm.ep_size,
-        comm.top_k,
-        comm.num_experts,
-        None,  # eplb_local_stats
-        active_rank_mask,
-        comm._execution_control.tensor,
-        execution_epoch,
-    )
+
+    # Keep direct torch.ops access inside runtime-created helpers. This module is
+    # pickled by value for MPI workers, and cloudpickle cannot pickle torch.ops.
+    def _dispatch():
+        return torch.ops.trtllm.moe_a2a_dispatch(
+            token_selected_experts,
+            [payload],
+            comm.workspace,
+            comm.moe_a2a_metainfo,
+            runtime_max_tokens_per_rank,
+            comm.ep_rank,
+            comm.ep_size,
+            comm.top_k,
+            comm.num_experts,
+            None,  # eplb_local_stats
+            active_rank_mask,
+            comm._execution_control.tensor,
+            execution_epoch,
+        )
+
+    recv_tensors, combine_payload_offset, _ = _dispatch()
 
     topk_target_ranks = _read_nvlink_topk_target_ranks(
         comm,
@@ -326,22 +328,28 @@ def _run_nvlink_rank_mask_combine(
     execution_epoch: int,
 ) -> torch.Tensor:
     """Run raw NVLink one-sided combine with an optional active rank mask."""
-    return torch.ops.trtllm.moe_a2a_combine(
-        combine_payload,
-        local_num_tokens,
-        comm.workspace,
-        comm.moe_a2a_metainfo,
-        runtime_max_tokens_per_rank,
-        comm.ep_rank,
-        comm.ep_size,
-        comm.top_k,
-        combine_payload_offset,
-        False,  # payload_in_workspace
-        False,  # use_low_precision
-        active_rank_mask,
-        comm._execution_control.tensor,
-        execution_epoch,
-    )
+
+    # See _run_nvlink_rank_mask_dispatch: keep torch.ops out of the globals
+    # traversed while cloudpickle serializes the MPI worker by value.
+    def _combine():
+        return torch.ops.trtllm.moe_a2a_combine(
+            combine_payload,
+            local_num_tokens,
+            comm.workspace,
+            comm.moe_a2a_metainfo,
+            runtime_max_tokens_per_rank,
+            comm.ep_rank,
+            comm.ep_size,
+            comm.top_k,
+            combine_payload_offset,
+            False,  # payload_in_workspace
+            False,  # use_low_precision
+            active_rank_mask,
+            comm._execution_control.tensor,
+            execution_epoch,
+        )
+
+    return _combine()
 
 
 def _run_nvlink_rank_mask_dispatch_combine(
@@ -1423,10 +1431,15 @@ def _worker_rank_mask_inactive_before_combine(
 
 
 def _set_execution_timeout_for_testing(comm: NVLinkOneSided, timeout_cycles: int) -> None:
-    torch.ops.trtllm.moe_a2a_set_execution_timeout_for_testing(
-        comm._execution_control.tensor,
-        timeout_cycles,
-    )
+    # See _run_nvlink_rank_mask_dispatch_combine: keep torch.ops out of the
+    # globals traversed while cloudpickle serializes the MPI worker by value.
+    def _set_timeout():
+        torch.ops.trtllm.moe_a2a_set_execution_timeout_for_testing(
+            comm._execution_control.tensor,
+            timeout_cycles,
+        )
+
+    _set_timeout()
 
 
 def _poll_execution_abort_status(
@@ -2962,7 +2975,7 @@ def _run_running_dispatch_abort_test(
     worker_args = [(config, missing_rank, abort_source)] * config.ep_size
     results = list(
         mpi_pool_executor.map(
-            run_dispatch_abort_worker,
+            _worker_running_dispatch_abort,
             *zip(*worker_args),
             timeout=EXECUTION_ABORT_EXECUTOR_TIMEOUT_S,
         )
@@ -2991,7 +3004,7 @@ def _run_running_combine_abort_test(
     worker_args = [(config, missing_rank, abort_source)] * config.ep_size
     results = list(
         mpi_pool_executor.map(
-            run_combine_abort_worker,
+            _worker_running_combine_abort,
             *zip(*worker_args),
             timeout=EXECUTION_ABORT_EXECUTOR_TIMEOUT_S,
         )
@@ -3159,9 +3172,9 @@ class TestMoEComm:
         )
 
     def test_moe_a2a_abort_worker_entrypoints_are_pickleable(self) -> None:
-        """Keep MPI entry points serialized by reference, outside this by-value module."""
-        for worker in (run_dispatch_abort_worker, run_combine_abort_worker):
-            assert cloudpickle.loads(cloudpickle.dumps(worker)) is worker
+        """Keep the by-value MPI entry points free of unpickleable torch.ops globals."""
+        for worker in (_worker_running_dispatch_abort, _worker_running_combine_abort):
+            assert cloudpickle.dumps(worker)
 
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize(
