@@ -742,6 +742,7 @@ class ArenaPoolGroup(PoolGroupBase):
         "ghost_hits",
         "ghost_misses",
         "spilled_ranges",
+        "_pending_maps",
     )
     _arena: SequenceArena
     _ranges: dict[int, SequenceRange]  # base_block -> live range
@@ -794,6 +795,9 @@ class ArenaPoolGroup(PoolGroupBase):
         self.ghost_hits = 0
         self.ghost_misses = 0
         self.spilled_ranges = 0
+        # base_block -> [range, target frontier (blocks), pages charged]:
+        # growth maps deferred to the per-iteration batched sweep (§4.2).
+        self._pending_maps: dict[int, list] = {}
 
     @override
     def destroy(self) -> None:
@@ -801,6 +805,10 @@ class ArenaPoolGroup(PoolGroupBase):
         # partially constructed group has nothing to tear down.
         if not hasattr(self, "_destroyed") or self._destroyed:
             return
+        # Deferred maps that never ran only hold budget; return it.
+        for _, (_, _, charged) in self._pending_maps.items():
+            self._budget.release(charged)
+        self._pending_maps.clear()
         # Teardown can run right after sequences finished, with their ranges
         # still in the event-gated deferred-reclaim queue (§4.2). Teardown is
         # allowed to block: synchronize the gates and drain, then anything
@@ -850,6 +858,60 @@ class ArenaPoolGroup(PoolGroupBase):
         nothing) if the page budget is exhausted (§4.6)."""
         assert num_valid_blocks <= rng.num_blocks
         return self._arena.ensure_mapped(rng.base_block, num_valid_blocks)
+
+    # -- batched map sweep (§4.2): defer growth maps to one pass/iteration --
+
+    def queue_mapping(self, rng: SequenceRange, num_valid_blocks: int) -> int:
+        """Charge the page budget for the pages a target frontier needs (so
+        admission control behaves exactly like an immediate map) but defer the
+        actual ``cuMemMap``/``cuMemSetAccess`` calls to :meth:`flush_mappings`.
+        Raises ``OutOfPagesError`` (charging nothing) on budget exhaustion.
+        Returns the pages charged. The caller MUST run the flush before any
+        GPU work touches the new blocks."""
+        assert not rng._freed and num_valid_blocks <= rng.num_blocks
+        base = rng.base_block
+        entry = self._pending_maps.get(base)
+        if entry is None:
+            pages = self._arena.pending_pages(base, num_valid_blocks)
+            if pages:
+                self._budget.consume(pages)  # raises; nothing recorded yet
+                self._pending_maps[base] = [rng, num_valid_blocks, pages]
+            return pages
+        if num_valid_blocks <= entry[1]:
+            return 0
+        # Nothing was mapped since the first queue call, so pending_pages is
+        # monotone in the frontier and the delta charge is exact.
+        pages = self._arena.pending_pages(base, num_valid_blocks)
+        delta = pages - entry[2]
+        assert delta >= 0
+        if delta:
+            self._budget.consume(delta)
+        entry[1] = num_valid_blocks
+        entry[2] = pages
+        return delta
+
+    def flush_mappings(self) -> int:
+        """Execute all deferred maps back-to-back (§4.2's batched
+        per-iteration sweep). Entries whose range was freed in the meantime
+        release their charge instead. Returns pages mapped."""
+        if not self._pending_maps:
+            return 0
+        mapped_total = 0
+        for base, (rng, target, charged) in self._pending_maps.items():
+            if rng._freed or base not in self._ranges:
+                self._budget.release(charged)
+                continue
+            mapped = self._arena.ensure_mapped(base, target, precharged=True)
+            mapped_total += mapped
+            if mapped != charged:
+                # Defensive: the plan is deterministic, so this indicates
+                # concurrent mutation; reconcile the budget either way.
+                if mapped < charged:
+                    self._budget.release(charged - mapped)
+                else:
+                    self._budget.consume(mapped - charged)
+        self._pending_maps.clear()
+        return mapped_total
 
     def free_sequence(self, rng: SequenceRange, last_consumer: CachedCudaEvent) -> None:
         """Queue the whole range for deferred reclaim (§4.2). The range is
@@ -1425,6 +1487,15 @@ class GpuArenaCacheLevelStorage(CacheLevelStorage):
             assert type(pg) is ArenaPoolGroup
             freed += pg.spill_retained(min_pages - freed)
         return freed
+
+    def flush_mappings(self) -> int:
+        """Execute every pool group's deferred growth maps back-to-back
+        (§4.2 batched per-iteration sweep). Returns pages mapped."""
+        mapped = 0
+        for pg in self._pool_groups:
+            assert type(pg) is ArenaPoolGroup
+            mapped += pg.flush_mappings()
+        return mapped
 
     @property
     def pool_size_granularity(self) -> int:

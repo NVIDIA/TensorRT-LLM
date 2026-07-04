@@ -424,20 +424,11 @@ class SequenceArena:
             runs.append((run_start, hi - run_start))
         return runs
 
-    def ensure_mapped(self, base_block: int, num_valid_blocks: int) -> int:
-        """Map physical pages covering ``[base_block, base_block + num_valid_blocks)``
-        plus ``map_ahead_pages`` of margin, in every pool, skipping
-        already-mapped pages. Returns the number of newly mapped pages.
-
-        Maps are issued as contiguous runs (one :meth:`VirtMem.map_range` per
-        run) so a single ``cuMemSetAccess`` covers each run (DESIGN.md §4.2).
-        Safe to call concurrently with running kernels: it only touches pages
-        strictly ahead of the write frontier.
-
-        If a page budget is attached and cannot cover the new pages, raises
-        ``OutOfPagesError`` *before mapping anything* — the caller reclaims or
-        preempts and retries (§4.6).
-        """
+    def _mapping_plan(
+        self, base_block: int, num_valid_blocks: int
+    ) -> tuple[list[list[tuple[int, int]]], int]:
+        """Missing-page runs per pool (with map-ahead margin, clamped to the
+        reserved extent) for a target frontier, and their total page count."""
         assert num_valid_blocks >= 0
         reserved = self._alloc.reserved_len(base_block)
         margin = self._map_ahead_pages
@@ -455,10 +446,35 @@ class SequenceArena:
             runs_per_pool.append(runs)
             for _, num_chunks in runs:
                 total_new += num_chunks
+        return runs_per_pool, total_new
+
+    def pending_pages(self, base_block: int, num_valid_blocks: int) -> int:
+        """Pages :meth:`ensure_mapped` would map for this target frontier."""
+        return self._mapping_plan(base_block, num_valid_blocks)[1]
+
+    def ensure_mapped(
+        self, base_block: int, num_valid_blocks: int, precharged: bool = False
+    ) -> int:
+        """Map physical pages covering ``[base_block, base_block + num_valid_blocks)``
+        plus ``map_ahead_pages`` of margin, in every pool, skipping
+        already-mapped pages. Returns the number of newly mapped pages.
+
+        Maps are issued as contiguous runs (one :meth:`VirtMem.map_range` per
+        run) so a single ``cuMemSetAccess`` covers each run (DESIGN.md §4.2).
+        Safe to call concurrently with running kernels: it only touches pages
+        strictly ahead of the write frontier.
+
+        If a page budget is attached and cannot cover the new pages, raises
+        ``OutOfPagesError`` *before mapping anything* — the caller reclaims or
+        preempts and retries (§4.6). With ``precharged=True`` the caller has
+        already charged the budget (batched map sweep) and no charge happens
+        here; failure rollback still returns unmapped remainders.
+        """
+        runs_per_pool, total_new = self._mapping_plan(base_block, num_valid_blocks)
         if total_new == 0:
             return 0
         budget = self._budget
-        if budget is not None:
+        if budget is not None and not precharged:
             budget.consume(total_new)  # raises OutOfPagesError; nothing mapped yet
         page = self._phys_page_size
         num_mapped = 0

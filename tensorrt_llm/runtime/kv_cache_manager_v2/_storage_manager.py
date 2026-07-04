@@ -535,6 +535,19 @@ class StorageManager:
         freed."""
         return self._gpu_arena_storage().spill_retained(min_pages)
 
+    def queue_gpu_mapping(
+        self, pg_idx: PoolGroupIndex, rng: SequenceRange, num_valid_blocks: int
+    ) -> int:
+        """Charge the page budget for a growth target but defer the driver
+        calls to :meth:`flush_gpu_mappings` (§4.2 batched sweep). Raises
+        ``OutOfPagesError`` (charging nothing) on exhaustion."""
+        return self._gpu_arena_storage().pool_group(pg_idx).queue_mapping(rng, num_valid_blocks)
+
+    def flush_gpu_mappings(self) -> int:
+        """Execute all deferred growth maps back-to-back. Must run after
+        scheduling and before any GPU work touches the grown blocks."""
+        return self._gpu_arena_storage().flush_mappings()
+
     def register_arena_ghosts(
         self,
         pg_idx: PoolGroupIndex,

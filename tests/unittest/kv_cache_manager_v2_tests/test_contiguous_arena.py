@@ -1205,6 +1205,114 @@ class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
 
 
 @requires_cuda
+class TestArenaBatchedMapSweep(unittest.TestCase):
+    """§4.2 batched per-iteration map sweep.
+
+    Growth charges the budget at resize time but defers cuMemMap /
+    cuMemSetAccess to flush_gpu_mappings.
+    """
+
+    TPB = 16
+
+    def setUp(self) -> None:
+        init_cuda_once()
+        cfg = _make_manager_config(gpu_quota=32 * MiB, host_quota=32 * MiB)
+        cfg.contiguous_arena = ContiguousArenaConfig(map_ahead_pages=0, batched_map_sweep=True)
+        self.manager = KVCacheManager(cfg)
+
+    def tearDown(self) -> None:
+        self.manager.shutdown()
+        del self.manager
+
+    def _mapped_pages(self) -> int:
+        return (
+            self.manager._storage._gpu_arena_storage()
+            .pool_group(PoolGroupIndex(0))
+            ._arena.mapped_pages
+        )
+
+    def test_growth_defers_until_flush(self) -> None:
+        manager = self.manager
+        budget = manager._storage.gpu_page_budget
+        kv = manager.create_kv_cache(max_capacity=256 * self.TPB)
+        with TemporaryCudaStream([]) as s:
+            stream = CudaStream(s.handle)
+            self.assertTrue(kv.resume(stream))
+            self.assertTrue(kv.resize(128 * self.TPB))  # 2 pages
+            # budget charged (admission control unchanged), nothing mapped yet
+            self.assertEqual(budget.used_pages, 2)
+            self.assertEqual(self._mapped_pages(), 0)
+            # growing again in the same iteration charges only the delta
+            self.assertTrue(kv.resize(256 * self.TPB))  # 4 pages total
+            self.assertEqual(budget.used_pages, 4)
+            self.assertEqual(self._mapped_pages(), 0)
+            self.assertEqual(manager.flush_gpu_mappings(), 4)
+            self.assertEqual(self._mapped_pages(), 4)
+            # pages are writable after the flush
+            for idx in kv.get_base_page_indices(LifeCycleId(0))[:4]:
+                addr = int(
+                    manager._storage.slot_address(GPU_LEVEL, PoolGroupIndex(0), idx, PoolIndex(0))
+                )
+                TestSparseVirtMem._tensor_at(addr, 16).fill_(1.0)
+            torch.cuda.synchronize()
+            kv.close()
+        s.take_finish_event().synchronize()
+        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        self.assertEqual(budget.used_pages, 0)
+
+    def test_freed_before_flush_releases_charge(self) -> None:
+        manager = self.manager
+        budget = manager._storage.gpu_page_budget
+        kv = manager.create_kv_cache(max_capacity=128 * self.TPB)
+        with TemporaryCudaStream([]) as s:
+            stream = CudaStream(s.handle)
+            self.assertTrue(kv.resume(stream))
+            self.assertTrue(kv.resize(128 * self.TPB))
+            self.assertEqual(budget.used_pages, 2)
+            kv.close()  # close() itself flushes (its write-out reads pages)
+        s.take_finish_event().synchronize()
+        manager.flush_gpu_mappings()
+        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        self.assertEqual(budget.used_pages, 0)
+
+    def test_reuse_onboarding_stays_synchronous(self) -> None:
+        manager = self.manager
+        tokens = [970 + i for i in range(2 * self.TPB)]
+        kv1 = manager.create_kv_cache(max_capacity=4 * self.TPB)
+        with TemporaryCudaStream([]) as s:
+            stream = CudaStream(s.handle)
+            self.assertTrue(kv1.resume(stream))
+            self.assertTrue(kv1.resize(2 * self.TPB))
+            manager.flush_gpu_mappings()
+            for j, idx in enumerate(kv1.get_base_page_indices(LifeCycleId(0))):
+                addr = int(
+                    manager._storage.slot_address(GPU_LEVEL, PoolGroupIndex(0), idx, PoolIndex(0))
+                )
+                TestSparseVirtMem._tensor_at(addr, (4 * 8192) // 4).fill_(3.0 + j)
+            torch.cuda.synchronize()
+            kv1.commit(tokens)
+            kv1.close()
+        s.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim()
+        # reuse hit: onboarding maps synchronously (its copies run immediately)
+        kv2 = manager.create_kv_cache(input_tokens=tokens, max_capacity=4 * self.TPB)
+        self.assertEqual(kv2.history_length, 2 * self.TPB)
+        with TemporaryCudaStream([]) as s2:
+            stream2 = CudaStream(s2.handle)
+            self.assertTrue(kv2.resume(stream2))
+            torch.cuda.synchronize()
+            for j, idx in enumerate(kv2.get_base_page_indices(LifeCycleId(0))):
+                addr = int(
+                    manager._storage.slot_address(GPU_LEVEL, PoolGroupIndex(0), idx, PoolIndex(0))
+                )
+                data = TestSparseVirtMem._tensor_at(addr, (4 * 8192) // 4)
+                self.assertTrue(bool((data == 3.0 + j).all().item()))
+            kv2.close()
+        s2.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim()
+
+
+@requires_cuda
 class TestArenaLazyRetention(unittest.TestCase):
     """§4.4 phase 2 (P2): lazy GPU retention.
 

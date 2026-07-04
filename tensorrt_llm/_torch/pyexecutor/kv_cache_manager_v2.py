@@ -1085,6 +1085,11 @@ class KVCacheManagerV2(BaseResourceManager):
           ranges mapped until the page budget needs them, turning reuse hits
           on still-resident blocks into D2D copies (§4.4 phase 2; default
           ``0``).
+        - ``TRTLLM_KV_ARENA_BATCHED_MAP``: ``1`` defers growth maps and
+          executes them in one batched pass per iteration (§4.2); the adapter
+          owns the flush points. Measured perf-neutral versus synchronous
+          mapping (same driver-call count), so it defaults to ``0`` until the
+          flush can run on a helper thread.
         """
         page_mb = int(os.environ.get("TRTLLM_KV_ARENA_PHYS_PAGE_SIZE_MB", "2"))
         map_ahead = int(os.environ.get("TRTLLM_KV_ARENA_MAP_AHEAD_PAGES", "1"))
@@ -1094,6 +1099,7 @@ class KVCacheManagerV2(BaseResourceManager):
             f"got {write_through_env!r}"
         )
         lazy_retention = os.environ.get("TRTLLM_KV_ARENA_LAZY_RETENTION", "0") == "1"
+        batched_map = os.environ.get("TRTLLM_KV_ARENA_BATCHED_MAP", "0") == "1"
         return ContiguousArenaConfig(
             phys_page_size=page_mb << 20,
             map_ahead_pages=map_ahead,
@@ -1101,6 +1107,7 @@ class KVCacheManagerV2(BaseResourceManager):
             if write_through_env == "on_commit"
             else WriteThroughPolicy.ON_FREE,
             lazy_gpu_retention=lazy_retention,
+            batched_map_sweep=batched_map,
         )
 
     def _extra_buffers_per_layer(
@@ -1652,6 +1659,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"{request.py_request_id} by {delta} tokens "
                 f"(target capacity {new_capacity})"
             )
+        if self._arena_enabled:
+            # This runs after prepare_resources (CUDA-graph padding), so the
+            # per-iteration sweep has already flushed: map the delta now.
+            self.impl.flush_gpu_mappings()
 
     def suspend_request(self, req: LlmRequest) -> None:
         """Suspend a request's KV cache (move to host tier)."""
@@ -1675,18 +1686,22 @@ class KVCacheManagerV2(BaseResourceManager):
 
     @nvtx_range("prepare_resources_kv_cache_manager_v2")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        if self._arena_enabled:
-            # Arena mode: unmap and recycle freed sequence ranges whose gating
-            # events completed (deferred reclaim, DESIGN.md §4.2). Growth
-            # paths also drain on demand; this keeps the page budget fresh at
-            # iteration boundaries.
-            self.impl.drain_gpu_reclaim()
         if self.is_draft:
             # Draft V2 manager: mirror the main manager by creating/resizing
             # KV caches for scheduled requests (the main V2 scheduler does not
             # know about the draft manager).
             self._prepare_draft_resources(scheduled_batch)
+            if self._arena_enabled:
+                self.impl.flush_gpu_mappings()
+                self.impl.drain_gpu_reclaim()
             return
+        if self._arena_enabled:
+            # Arena mode: execute the batched map sweep for this iteration's
+            # growth (§4.2) BEFORE any forward touches the new blocks, then
+            # unmap/recycle freed ranges whose gating events completed
+            # (deferred reclaim). Growth paths also drain on demand.
+            self.impl.flush_gpu_mappings()
+            self.impl.drain_gpu_reclaim()
 
     def _prepare_draft_resources(self, scheduled_batch: ScheduledRequests):
         """Create/resize KV caches in the draft V2 manager for scheduled requests.
@@ -2248,6 +2263,15 @@ class KVCacheManagerV2(BaseResourceManager):
                 _populate_dummy_mrope_config(req, token_num, is_gen)
             requests.append(req)
 
+        if prepare_resource and self._arena_enabled:
+            # Warmup / CUDA-graph capture runs forwards over these caches
+            # without going through prepare_resources: execute any deferred
+            # growth maps now (§4.2 batched sweep flush point).
+            self.impl.flush_gpu_mappings()
+            if draft_kv_cache_manager is not None and getattr(
+                draft_kv_cache_manager, "_arena_enabled", False
+            ):
+                draft_kv_cache_manager.impl.flush_gpu_mappings()
         return requests
 
     def try_commit_blocks_for_reuse(self, request: LlmRequest, kv_cache) -> None:

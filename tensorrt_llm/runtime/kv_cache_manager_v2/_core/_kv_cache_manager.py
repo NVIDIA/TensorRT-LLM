@@ -573,6 +573,13 @@ class KVCacheManager:
         the number of ranges reclaimed."""
         return self._storage.drain_gpu_reclaim()
 
+    def flush_gpu_mappings(self) -> int:
+        """Arena mode with ``batched_map_sweep`` (DESIGN.md §4.2): execute all
+        deferred growth maps back-to-back. The executor must call this after
+        scheduling and before any GPU work touches the newly grown blocks.
+        Returns the number of pages mapped."""
+        return self._storage.flush_gpu_mappings()
+
     @property
     def enable_partial_match(self) -> bool:
         # Arena mode P0 onboards full committed blocks only; partial-block

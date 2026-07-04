@@ -526,6 +526,11 @@ class _KVCache:
         arena_closing: _KVCache._ArenaClosingPages | None = None
         arena_last_consumer = CachedCudaEvent.NULL
         if arena_ranges is not None:
+            arena_cfg = manager._storage.arena_config
+            if arena_cfg is not None and arena_cfg.batched_map_sweep:
+                # The write-out below reads this sequence's pages; make sure
+                # any still-deferred growth maps have executed.
+                manager._storage.flush_gpu_mappings()
             arena_closing = self._arena_collect_committed_gpu_pages()
         with self._record_event():
             self._clear_blocks()
@@ -911,20 +916,30 @@ class _KVCache:
     # most of the retained cache, large enough to bound retry loops.
     _ARENA_SPILL_CHUNK_PAGES: ClassVar[int] = 64
 
-    def _arena_ensure_mapped(self, num_valid_blocks: int) -> bool:
-        """Demand-map physical pages covering the first ``num_valid_blocks`` of
-        this sequence's range in every pool group (DESIGN.md §4.2). On page
-        exhaustion, drains deferred reclaim, then spills lazily retained
-        ranges (LRU-first, §4.4 phase 2), retrying while either makes
-        progress; returns False if pages are still unavailable — the caller
-        backs off exactly like a failed slot allocation (§4.6)."""
+    def _arena_ensure_mapped(self, num_valid_blocks: int, sync: bool = False) -> bool:
+        """Make physical pages covering the first ``num_valid_blocks`` of this
+        sequence's range available in every pool group (DESIGN.md §4.2).
+
+        With ``batched_map_sweep`` (and ``sync=False``) the budget is charged
+        now but the driver calls are deferred to the owner's per-iteration
+        ``flush_gpu_mappings`` sweep; callers that touch the pages immediately
+        (e.g. reuse onboarding copies) pass ``sync=True``. On page exhaustion,
+        drains deferred reclaim, then spills lazily retained ranges
+        (LRU-first, §4.4 phase 2), retrying while either makes progress;
+        returns False if pages are still unavailable — the caller backs off
+        exactly like a failed slot allocation (§4.6)."""
         storage = self._storage
         ranges = self._arena_ranges
         assert ranges is not None
+        arena_cfg = storage.arena_config
+        defer = not sync and arena_cfg is not None and arena_cfg.batched_map_sweep
         for pg_idx, rng in typed_enumerate(ranges):
             while True:
                 try:
-                    storage.ensure_gpu_mapped(pg_idx, rng, num_valid_blocks)
+                    if defer:
+                        storage.queue_gpu_mapping(pg_idx, rng, num_valid_blocks)
+                    else:
+                        storage.ensure_gpu_mapped(pg_idx, rng, num_valid_blocks)
                     break
                 except OutOfPagesError:
                     if storage.drain_gpu_reclaim() > 0:
@@ -962,7 +977,7 @@ class _KVCache:
             entries.append((ordinal, lc_idx, holder))
         if not entries:
             return True
-        if not self._arena_ensure_mapped(self.num_blocks):
+        if not self._arena_ensure_mapped(self.num_blocks, sync=True):
             return False
         # One explicit-destination migrate per (pool group, source level,
         # copy-vs-move); committed sources whose bytes are still resident in a
@@ -1412,6 +1427,11 @@ class _KVCache:
             # §4.5: move this sequence's pages out of its arena ranges, then
             # release the whole VA reservation (event-gated unmap). Resume
             # reserves fresh ranges and copies the resident state back in.
+            arena_cfg = self.manager._storage.arena_config
+            if arena_cfg is not None and arena_cfg.batched_map_sweep:
+                # Evacuation reads this sequence's pages; execute any
+                # still-deferred growth maps first.
+                self.manager._storage.flush_gpu_mappings()
             self._arena_evacuate()
             storage = self.manager._storage
             for pg_idx, rng in typed_enumerate(self._arena_ranges):

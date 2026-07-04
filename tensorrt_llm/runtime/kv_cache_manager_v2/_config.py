@@ -235,6 +235,13 @@ class ContiguousArenaConfig:
     write_through: WriteThroughPolicy = WriteThroughPolicy.ON_FREE
     lazy_gpu_retention: bool = False
     max_va_bytes_per_pool: int = 0
+    # Defer growth maps and execute them in one batched pass per iteration
+    # (§4.2). The budget is still charged at resize time, so admission
+    # control is unchanged -- but the OWNER of the manager must call
+    # KVCacheManager.flush_gpu_mappings() after scheduling and before any
+    # GPU work touches the newly grown blocks (the executor adapter does).
+    # Off by default so direct users keep synchronous mapping semantics.
+    batched_map_sweep: bool = False
 
     def __post_init__(self) -> None:
         _MIN_GRANULARITY = 2 << 20
