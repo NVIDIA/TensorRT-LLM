@@ -903,7 +903,7 @@ def test_ltx2_lpips_against_golden(request, tmp_path, ltx2_two_stage_bf16_video_
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_ltx2_cuda_graph_lpips_matches_eager(tmp_path):
+def test_ltx2_cuda_graph_lpips_matches_eager(_visual_gen_deps, tmp_path):
     eager_path = tmp_path / "ltx2_eager_generated.mp4"
     cuda_graph_path = tmp_path / "ltx2_cuda_graph_generated.mp4"
 
