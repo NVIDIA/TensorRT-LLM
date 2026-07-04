@@ -1,3 +1,4 @@
+import time
 import uuid
 from collections import defaultdict
 from itertools import chain
@@ -63,6 +64,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._kv_cache_manager = kv_cache_manager
         self._mapping = mapping
         self.kv_transfer_timeout_ms = cache_transceiver_config.kv_transfer_timeout_ms
+        self.kv_transfer_poll_interval_ms = cache_transceiver_config.kv_transfer_poll_interval_ms
         self._sender_future_timeout_ms = (
             cache_transceiver_config.kv_transfer_sender_future_timeout_ms
         )
@@ -181,7 +183,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         )
 
         if token_range is None and req.prompt_len > 0:
-            # Align with KV cache allocation (resize_context /
+            # Align with KV cache allocation (prepare_disagg_gen_init /
             # _get_context_bytes), which reserves prompt_len +
             # num_extra_kv_tokens slots for speculative decoding methods
             # (e.g. EAGLE3) that consume extra KV positions per request.
@@ -486,7 +488,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if result == WaitResult.COMPLETED:
                 if self._need_aux_transfer(req):
                     self._apply_aux(session, req)
-                self._trim_kv_to_prompt_history(req)
+                self._assert_disagg_history_declared(req)
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             else:
                 req.state = LlmRequestState.DISAGG_TRANS_ERROR
@@ -517,7 +519,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def check_context_transfer_status(
         self, at_least_request_num: Optional[int], mark_complete: bool = False
     ):
-        if not self._ever_had_send_session and not self._ctx_need_pp_sync:
+        if not self._ever_had_send_session and not (
+            self._ctx_need_tp_sync or self._ctx_need_pp_sync
+        ):
             return [], []
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
@@ -533,11 +537,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         completed, timed_out, failed, cancelled = [], [], [], []
         for rid in to_process:
             session = self._send_sessions[rid]
-            result = session.wait_complete()
+            result = session.wait_complete(blocking=block_all)
             if session.status == SessionStatus.CANCELLED:
                 cancelled.append(rid)
             elif result == WaitResult.COMPLETED:
                 completed.append(rid)
+            elif result is None:
+                continue
             elif result == WaitResult.TIMEOUT:
                 logger.warning(
                     f"TxSession rid={session.disagg_request_id} timed out after {self._sender_future_timeout_ms}ms"
@@ -572,16 +578,19 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return completed, failed
 
     def check_gen_transfer_status(self, at_least_request_num: Optional[int]):
-        if not self._ever_had_recv_session and not self._ctx_need_pp_sync:
+        if not self._ever_had_recv_session and not self._gen_need_sync:
             return [], [], []
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
+        need_progress = wait_num > 0
+        if need_progress:
+            self._poll_gen_sessions_for_poll_interval(wait_num)
 
         local_completed, local_failed = self._collect_done(self._recv_sessions, self._recv_reqs)
         to_process = self._build_to_process(
             self._recv_sessions,
             self._gen_consensus(local_completed + local_failed),
-            wait_num,
+            0 if need_progress else wait_num,
             block_all,
         )
 
@@ -618,7 +627,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req = self._recv_reqs[rid]
             if self._need_aux_transfer(req):
                 self._apply_aux(session, req)
-            self._trim_kv_to_prompt_history(req)
+            self._assert_disagg_history_declared(req)
             req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             session.close()
             del self._recv_reqs[rid]
@@ -632,38 +641,56 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
         return completed, failed, cancelled_reqs
 
+    def _poll_gen_sessions_for_poll_interval(self, wait_num: int) -> None:
+        poll_interval_s = (self.kv_transfer_poll_interval_ms or 0) / 1000.0
+        deadline = time.monotonic() + poll_interval_s
+        while True:
+            completed, failed = self._collect_done(self._recv_sessions, self._recv_reqs)
+            if len(completed) + len(failed) >= wait_num:
+                return
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                return
+            for session in self._recv_sessions.values():
+                session.wait_complete(blocking=False)
+            time.sleep(min(0.001, remaining_s))
+
     def check_gen_transfer_complete(self):
         return len(self._recv_sessions) == 0
 
-    def _trim_kv_to_prompt_history(self, req: LlmRequest) -> None:
-        """Mark received KV as historic so SWA pools release pre-window blocks.
+    def _assert_disagg_history_declared(self, req: LlmRequest) -> None:
+        """Verify the V2 scheduler pre-declared prompt_len as history.
 
-        Call right before the TRANS_COMPLETE state transition.  The cache
-        was sized to hold the full prompt by ``resize_context`` and just
-        got fully populated by the transfer; setting ``history_length`` to
-        the prompt length triggers ``_unlock_stale_blocks`` inside V2's
-        ``resize()`` for any sliding-window life cycle, releasing blocks
-        before the window back to their pool group.
+        Call right before the TRANS_COMPLETE state transition.  The V2
+        scheduler's ``_try_schedule_disagg_gen_init`` calls
+        ``prepare_disagg_gen_init``, which sets ``kv_cache.history_length``
+        to ``prompt_len`` at allocation time so SWA stale computation
+        skips pre-window blocks. If that contract is violated, SWA /
+        sparse-attn pools may fill with pre-window prompt blocks and the
+        V2 scheduler can deadlock under high concurrency (e.g., benchmark
+        fill-phase).
 
-        This closes the gap between transfer completion and
-        ``update_resources`` (which only runs after the *first* forward
-        pass and would otherwise be the first thing to update
-        ``history_length``).  In benchmark fill-phase the first forward
-        is gated until every disagg-gen request is ready, so without
-        this trim the SWA / sparse-attn pool groups stay 100% occupied
-        with pre-window prompt blocks and the V2 scheduler deadlocks
-        on the next ``resize(+1)``.
-
-        No-op for V1 managers and for V2 caches with only full-context
-        life cycles.
+        No-op for V1 managers (which lack ``get_history_length``) and for
+        V2 caches with only full-context life cycles (where the watermark
+        has no allocation effect).
         """
-        trim = getattr(self._kv_cache_manager, "trim_to_history", None)
-        if trim is None:
+        get_history = getattr(self._kv_cache_manager, "get_history_length", None)
+        if get_history is None:
             return
         prompt_len = getattr(req, "prompt_len", None)
         if not prompt_len or prompt_len <= 0:
             return
-        trim(req, prompt_len)
+        history = get_history(req)
+        if history is None:
+            # Cache was already released (e.g., cancelled mid-transfer); nothing to verify.
+            return
+        if history < prompt_len:
+            raise RuntimeError(
+                f"req {req.py_request_id}: kv_cache.history_length={history} "
+                f"< prompt_len={prompt_len} at TRANS_COMPLETE boundary. "
+                f"V2 scheduler must call prepare_disagg_gen_init() in "
+                f"_try_schedule_disagg_gen_init."
+            )
 
     def cancel_request(self, req: LlmRequest) -> bool:
         """Cancel the transfer for the given request.

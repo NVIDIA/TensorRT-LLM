@@ -2,10 +2,10 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Sharding-IR equivalence test for the StepFun Step-3.7-Flash AutoDeploy custom model.
+"""Sharding numerical-correctness test for the StepFun Step-3.7-Flash AutoDeploy custom model.
 
-This is a model-specific, directly-runnable wrapper around the generic sharding-IR equivalence
-harness in ``test_sharding_ir_equivalence.py``. Unlike the generic test (which is skipped unless
+This is a model-specific, directly-runnable wrapper around the generic sharding numerical-correctness
+harness in ``test_sharding_num_correctness.py``. Unlike the generic test (which is skipped unless
 ``--sharding-ir-modeling-file`` is supplied on the command line), this file pins the modeling file
 to ``modeling_step3p7.py`` and parametrizes over every parallelism configuration, so it runs with a
 plain::
@@ -36,7 +36,7 @@ _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
-from test_sharding_ir_equivalence import (  # noqa: E402
+from test_sharding_num_correctness import (  # noqa: E402
     _DIST_CONFIGS,
     _gpu_check,
     _run_equivalence_job,
@@ -53,7 +53,7 @@ pytestmark = pytest.mark.threadleak(enabled=False)
 
 
 @pytest.mark.parametrize("dist_config", list(_DIST_CONFIGS))
-def test_step3p7_sharding_ir_equivalence(dist_config: str, monkeypatch) -> None:
+def test_step3p7_sharding_num_correctness(dist_config: str, monkeypatch) -> None:
     """Sharded == unsharded prefill for Step-3.7-Flash under each parallelism config."""
     skip = _gpu_check(dist_config)
     if skip:
@@ -66,6 +66,6 @@ def test_step3p7_sharding_ir_equivalence(dist_config: str, monkeypatch) -> None:
 
     world_size = _DIST_CONFIGS[dist_config]["world_size"]
     dist_common.spawn_multiprocess_job(
-        job=partial(_run_equivalence_job, _MODELING_FILE, dist_config),
+        job=partial(_run_equivalence_job, _MODELING_FILE, dist_config, "none"),
         size=world_size,
     )

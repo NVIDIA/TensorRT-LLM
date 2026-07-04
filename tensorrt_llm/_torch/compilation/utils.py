@@ -102,6 +102,12 @@ def inplace_info():
         torch.ops.trtllm.moe_output_memset_inplace.default: {
             1: "input"
         },
+        torch.ops.trtllm.megamoe_prepare.default: {
+            1: "x_out",
+            2: "x_sf_out",
+            3: "topk_idx_out",
+            4: "topk_weights_out"
+        },
         torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell.default:
         {
             1: "output"
@@ -163,6 +169,11 @@ def inplace_info():
         },
         torch.ops.trtllm.inplace_slice_copy.default: {
             1: "dest"
+        },
+        torch.ops.trtllm.verify_dynamic_tree_rejection_out_op.default: {
+            5: "acceptIndex",
+            6: "acceptTokenNum",
+            7: "acceptToken"
         }
     }
     if IS_CUDA_TILE_AVAILABLE:

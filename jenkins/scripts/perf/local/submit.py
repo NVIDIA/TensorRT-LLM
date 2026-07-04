@@ -368,7 +368,7 @@ def generate_srun_args(args, runtime_mode, timestamp, llm_src="", hardware_confi
 
     lines.append("--container-env=NVIDIA_IMEX_CHANNELS")
 
-    # Single-GPU aggregated jobs run one process without MPI -- drop --mpi=pmi2
+    # Single-GPU aggregated jobs run one process without MPI -- drop --mpi=pmix
     is_single_gpu_aggr = (
         is_aggr and hardware_config is not None and hardware_config.get("total_gpus") == 1
     )
@@ -376,7 +376,7 @@ def generate_srun_args(args, runtime_mode, timestamp, llm_src="", hardware_confi
     if args.mpi_type:
         lines.append(f"--mpi={args.mpi_type}")
     elif is_aggr and not is_single_gpu_aggr:
-        lines.append("--mpi=pmi2")
+        lines.append("--mpi=pmix")
 
     return lines
 
@@ -561,7 +561,7 @@ def main():
         "--mpi-type",
         default="",
         help="MPI type for srun (e.g. pmix, pmi2). If not set, aggregated runs default to"
-        " --mpi=pmi2; non-aggregated runs omit --mpi entirely.",
+        " --mpi=pmix; non-aggregated runs omit --mpi entirely.",
     )
     parser.add_argument(
         "--disagg-server-port",

@@ -178,6 +178,7 @@ _str_to_np_dict = dict(
     int64=np.int64,
     int32=np.int32,
     int8=np.int8,
+    uint8=np.uint8,
     bool=np.bool_,
     bfloat16=np_bfloat16,
     fp8=np_float8,
@@ -197,6 +198,7 @@ _str_to_torch_dtype_dict = dict(
     int64=torch.int64,
     int32=torch.int32,
     int8=torch.int8,
+    uint8=torch.uint8,
     bool=torch.bool,
     fp8=torch.float8_e4m3fn,
 )
@@ -215,6 +217,7 @@ _str_to_binding_dtype_dict = dict(
     int64=DataType.INT64,
     int32=DataType.INT32,
     int8=DataType.INT8,
+    uint8=DataType.UINT8,
     bool=DataType.BOOL,
     fp8=DataType.FP8,
 )

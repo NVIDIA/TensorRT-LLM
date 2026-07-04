@@ -26,6 +26,7 @@ except ImportError:
 # Aliases for built-in custom tokenizers.
 TOKENIZER_ALIASES = {
     "deepseek_v32": "tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer",
+    "deepseek_v4": "tensorrt_llm.tokenizer.deepseek_v4.DeepseekV4Tokenizer",
 }
 
 TLLM_INCREMENTAL_DETOKENIZATION_BACKEND = os.environ.get(
@@ -271,13 +272,19 @@ class TransformersTokenizer(TokenizerBase):
         try:
             tokenizer = AutoTokenizer.from_pretrained(pretrained_model_dir,
                                                       **kwargs)
-        except AttributeError as e:
-            # transformers 5.x: bare PreTrainedConfig fallback (for model_types
-            # not in CONFIG_MAPPING_NAMES, e.g. deepseek_v32) hits
-            # modeling_rope_utils → self.max_position_embeddings → AttributeError
-            # because PreTrainedConfig is now a dataclass with declared fields.
-            # See deepseek-ai/DeepSeek-V3#1207.
-            if "max_position_embeddings" not in str(e):
+        except Exception as e:
+            # Two transformers 5.x regressions for model_types not registered
+            # in CONFIG_MAPPING_NAMES. PreTrainedTokenizerFast reads
+            # tokenizer.json directly and skips AutoConfig, so it sidesteps
+            # both:
+            #  - deepseek_v32: bare PreTrainedConfig fallback hits
+            #    modeling_rope_utils → self.max_position_embeddings →
+            #    AttributeError (PreTrainedConfig is now a dataclass with
+            #    declared fields). See deepseek-ai/DeepSeek-V3#1207.
+            #  - glm_moe_dsa: layer_types=['deepseek_sparse_attention', ...] is
+            #    rejected by validate_layer_type (not in ALLOWED_LAYER_TYPES).
+            msg = str(e)
+            if "max_position_embeddings" not in msg and "layer_types" not in msg:
                 raise
             tokenizer = _fallback_to_fast_tokenizer(pretrained_model_dir, e,
                                                     **kwargs)

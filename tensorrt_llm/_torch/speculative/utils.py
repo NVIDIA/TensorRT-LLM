@@ -32,6 +32,13 @@ from .save_hidden_state import (SaveHiddenStatesResourceManager,
 from .suffix_automaton import SuffixAutomatonManager
 
 
+def _is_effective_dynamic_tree(spec_config) -> bool:
+    # At dynamic_tree_max_topK == 1 the tree collapses to a linear chain; route
+    # to the linear Eagle3 one-model path to avoid divergence in tree bookkeeping.
+    return (getattr(spec_config, 'use_dynamic_tree', False)
+            and getattr(spec_config, 'dynamic_tree_max_topK', 0) > 1)
+
+
 def get_spec_metadata(spec_config,
                       model_config,
                       max_num_requests,
@@ -87,6 +94,7 @@ def get_spec_metadata(spec_config,
             is_mtp_eagle=True,
         )
     if spec_config.spec_dec_mode.is_eagle3():
+        effective_dynamic_tree = _is_effective_dynamic_tree(spec_config)
         return Eagle3SpecMetadata(
             max_draft_len=spec_config.max_draft_len,
             max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
@@ -102,8 +110,8 @@ def get_spec_metadata(spec_config,
             is_mtp_eagle=False,
             eagle_choices=spec_config.eagle_choices,
             is_spec_dec_tree=spec_config.eagle_choices is not None
-            or spec_config.use_dynamic_tree,
-            is_spec_dec_dynamic_tree=spec_config.use_dynamic_tree,
+            or effective_dynamic_tree,
+            is_spec_dec_dynamic_tree=effective_dynamic_tree,
         )
     if spec_config.spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelSpecMetadata(
@@ -118,7 +126,7 @@ def get_spec_metadata(spec_config,
             use_rejection_sampling=use_rejection_sampling,
             vocab_size=vocab_size,
             spec_resource_manager=spec_resource_manager,
-            use_dynamic_tree=spec_config.use_dynamic_tree,
+            use_dynamic_tree=_is_effective_dynamic_tree(spec_config),
             eagle_choices=spec_config.eagle_choices,
         )
     if spec_config.spec_dec_mode.is_pard():
@@ -183,6 +191,16 @@ def get_spec_metadata(spec_config,
     return None
 
 
+def get_mtp_hidden_size(model_config) -> int:
+    pretrained_config = getattr(model_config, "pretrained_config", model_config)
+    hidden_size = getattr(pretrained_config, "hidden_size", None)
+    if hidden_size is None:
+        hidden_size = getattr(model_config, "hidden_size")
+    if getattr(pretrained_config, "model_type", None) == "deepseek_v4":
+        return hidden_size * getattr(pretrained_config, "hc_mult", 1)
+    return hidden_size
+
+
 def get_spec_resource_manager(model_engine, draft_model_engine=None):
     spec_config = model_engine.spec_config
     if spec_config is None:
@@ -205,7 +223,7 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             return Eagle3ResourceManager(
                 spec_config,
                 model_config.torch_dtype,
-                model_config.hidden_size,
+                get_mtp_hidden_size(model_config),
                 max_num_requests,
                 max_seq_len,
                 max_num_tokens,
@@ -222,12 +240,12 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
         return MTPHiddenStatesManager(
             spec_config,
             model_config.torch_dtype,
-            model_config.hidden_size,
+            get_mtp_hidden_size(model_config),
             max_num_requests,
             sa_manager=sa_manager,
         )
-    if spec_dec_mode.is_eagle3_one_model() and getattr(
-            spec_config, 'use_dynamic_tree', False):
+    if spec_dec_mode.is_eagle3_one_model() and _is_effective_dynamic_tree(
+            spec_config):
         return Eagle3OneModelDynamicTreeResourceManager(spec_config,
                                                         max_num_requests)
     if spec_dec_mode.is_eagle3_one_model():
@@ -374,7 +392,7 @@ def get_spec_worker(spec_config,
         return MTPEagleWorker(spec_config, model_config,
                               use_separate_draft_kv_cache)
     if spec_dec_mode.is_eagle3_one_model():
-        if getattr(spec_config, 'use_dynamic_tree', False):
+        if _is_effective_dynamic_tree(spec_config):
             return Eagle3OneModelDynamicTreeWorker(spec_config, mapping,
                                                    use_separate_draft_kv_cache)
         return Eagle3OneModelWorker(

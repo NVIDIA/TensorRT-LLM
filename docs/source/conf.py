@@ -105,6 +105,7 @@ myst_enable_extensions = [
     "substitution",
     "dollarmath",
     "amsmath",
+    "html_inline",
 ]
 
 myst_substitutions = {

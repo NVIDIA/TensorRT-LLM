@@ -11,6 +11,12 @@
   "guidance_scale": 5.0,
   "seed": 42,
   "frame_rate": 16.0,
+  "torch_compile": false,
+  "deterministic_algorithms": true,
   "lpips_net": "alex",
-  "lpips_threshold": 0.05
+  "lpips_threshold": 0.05,
+  "diffusers_version": "0.38.0",
+  "tensorrt_llm_version": "1.3.0rc20",
+  "tensorrt_llm_commit": "85665f5fd331d0154a78172954846d843085e83f",
+  "container_image": "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/release@sha256:3308a2dc0192a8329ea02eca7b5c44f290f5e894cd8c5921099308d84c3e5691"
 }

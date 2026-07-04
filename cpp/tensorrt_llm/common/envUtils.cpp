@@ -259,6 +259,12 @@ bool getEnvEnablePDL()
     return enablePDL;
 }
 
+bool getEnvEnableCascadeMmha()
+{
+    static bool const enable = getBoolEnv("TRTLLM_ENABLE_CASCADE_MMHA");
+    return enable;
+}
+
 bool getEnvEnableTrtllmgenMoeRoutingRenormPDL()
 {
     static std::once_flag flag;
@@ -491,6 +497,12 @@ bool getEnvKVCacheTransferAllBlocksForWindow()
 {
     static bool const allBlocksForWindow = getBoolEnv("TRTLLM_KVCACHE_TRANSFER_ALL_BLOCKS_FOR_WINDOW");
     return allBlocksForWindow;
+}
+
+bool getEnvKVCachePoolUseFabricMemory()
+{
+    static bool const useFabricMemory = getBoolEnv("TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY");
+    return useFabricMemory;
 }
 
 uint16_t getEnvNixlPort()

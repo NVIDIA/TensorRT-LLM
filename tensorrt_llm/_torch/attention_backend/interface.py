@@ -3,8 +3,8 @@ import weakref
 from collections import namedtuple
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from typing import (TYPE_CHECKING, Any, Dict, Generic, List, Optional, Protocol,
-                    Tuple, Type, TypeVar, Union)
+from typing import (TYPE_CHECKING, Any, Dict, Generic, List, Literal, Optional,
+                    Protocol, Tuple, Type, TypeVar, Union)
 
 import torch
 from typing_extensions import Self
@@ -25,6 +25,7 @@ from ..metadata import KVCacheParams
 from ..pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from ..pyexecutor.mamba_cache_manager import BaseMambaCacheManager
 from ..pyexecutor.resource_manager import KVCacheManager
+from ..pyexecutor.trace_log_utils import log_tensor_size
 from ..utils import get_model_extra_attrs
 from .sparse.params import SparseMetadataParams
 
@@ -42,8 +43,10 @@ class AttentionRuntimeFeatures:
     chunked_prefill: bool = False
     cache_reuse: bool = False
     has_speculative_draft_tokens: bool = False
-    chunk_size: int = 0  # this is the chunk size for MLA chunked prefill, it will split kv cache into chunks to save global memory.
-    chunked_prefill_buffer_batch_size: int = 4  # real chunk size for MLA chunked prefill is chunked_prefill_buffer_batch_size * chunk_size.
+    # This is the chunk size for MLA chunked prefill, which splits KV cache into chunks.
+    chunk_size: int = 0
+    # The real chunk size for MLA chunked prefill is this value * chunk_size.
+    chunked_prefill_buffer_batch_size: int = 4
 
 
 # The type of requests in qkv passed to attention
@@ -73,6 +76,10 @@ class AttentionMetadata:
     mapping: Optional[Mapping] = None
     # Sparse settings for metadata allocation/update; dense metadata leaves it None.
     sparse_metadata_params: Optional[SparseMetadataParams] = None
+    # Paged KV-cache block layout:
+    # NHD: [max_num_pages, 2, page_size, num_kv_heads, head_dim]
+    # HND: [max_num_pages, 2, num_kv_heads, page_size, head_dim]
+    kv_layout: Literal["NHD", "HND"] = "HND"
 
     enable_flash_mla: bool = False
     enable_context_mla_with_cached_kv: bool = False
@@ -320,6 +327,14 @@ class AttentionMetadata:
         Hook to be called before the forward step of the model.
         """
         self._prepare_mamba_metadata()
+
+    def prepare_encoder_only(self) -> None:
+        """Hook for encoder-only (no-KV-cache) forward setup.
+
+        Defaults to the full ``prepare()``; backends with a leaner encoder-only
+        path override this.
+        """
+        self.prepare()
 
     def _prepare_mamba_metadata(self):
         if self.mamba_metadata is False:
@@ -749,6 +764,14 @@ class RopeParams:
                 if rope_inv_freq is not None else None,
                 weakref.ref(rope_cos_sin),
             )
+        # One-shot log on cache miss (typically 2-4 times per model load).
+        log_tensor_size("rope/new_table",
+                        rope_cos_sin,
+                        max_pos=self.max_positions,
+                        dim=self.dim,
+                        theta=self.theta,
+                        scale_type=self.scale_type,
+                        interleave=interleave)
         return rope_inv_freq, rope_cos_sin
 
 
@@ -853,6 +876,10 @@ class AttentionForwardArgs:
     cu_q_seqlens: Optional[torch.Tensor] = None
     cu_kv_seqlens: Optional[torch.Tensor] = None
     fmha_scheduler_counter: Optional[torch.Tensor] = None
+    # Testing only: skip the RoPE step of MLA generation (the standalone harness
+    # feeds a pre-RoPE'd fused_q). The TRTLLM backend then appends the new latent
+    # and inits the trtllm-gen scheduler buffers itself.
+    skip_mla_rope_generation: bool = False
 
     mla_bmm1_scale: Optional[torch.Tensor] = None
     mla_bmm2_scale: Optional[torch.Tensor] = None

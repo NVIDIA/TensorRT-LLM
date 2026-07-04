@@ -270,9 +270,16 @@ and benchmark srun steps never see MPI flags.
 **Where MPI is configured:**
 - `jenkins/scripts/perf/disaggregated/slurm_launch_draft.sh` — `--mpi=pmix` on
   ctx/gen srun commands only
-- `jenkins/scripts/perf/local/submit.py` — `--mpi=pmi2` for aggregated mode only,
+- `jenkins/scripts/perf/local/submit.py` — `--mpi=pmix` for aggregated mode only,
   no MPI flag for disaggregated mode (handled by the draft template)
-- `jenkins/L0_Test.groovy` — `--mpi=pmi2` for non-disagg multi-node only
+- `jenkins/L0_Test.groovy` — `--mpi=pmix` for non-disagg multi-node only
+
+> The DLFW base image (PyTorch 26.03+) ships an Open MPI build with PMIx support
+> only and **no classic PMI-2**. Under `--mpi=pmi2` srun exposes a PMI-2 server
+> but no PMIx server, so OMPI's `pmix3x_client` fails with
+> `OPAL ERROR: Unreachable in pmix3x_client.c at line 111` and aborts in
+> `MPI_Init_thread`. `--mpi=pmix` matches what the disagg path has always used
+> and works against the new OMPI build.
 
 ### Key Rules
 

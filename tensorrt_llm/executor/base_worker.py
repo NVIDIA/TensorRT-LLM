@@ -16,13 +16,11 @@ import datetime
 import enum
 import gc
 import json
-import os
 import weakref
 from pathlib import Path
 from queue import Queue
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
-import psutil
 import torch
 
 from tensorrt_llm.logger import logger
@@ -36,7 +34,7 @@ from ..builder import ConfigEncoder, Engine, EngineConfig
 from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType, PybindMirror
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import _SyncQueue, get_numa_aware_cpu_affinity, logger_debug
+from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
 from ..lora_manager import LoraManager
 from ..prompt_adapter_manager import PromptAdapterManager
 from ..runtime import ModelConfig
@@ -138,58 +136,6 @@ class BaseWorker(GenerationExecutor):
     def resource_governor_queue(self):
         return self._resource_governor_queue
 
-    def _configure_affinity(self, device_id):
-        '''Probe and configure the CPU affinity of the worker based on NUMA topology.
-
-        Args:
-            device_id: The CUDA device ID to determine optimal CPU affinity.
-
-        Note:
-            If the process already has constrained affinity, a warning is logged.
-            Configuration is handled as follows:
-                TLLM_NUMA_AWARE_WORKER_AFFINITY = <unset>
-                    -> Affinity is automatically configured if it is unconstrained,
-                       and deleted if it is constrained externally by the user.
-                TLLM_NUMA_AWARE_WORKER_AFFINITY = 1
-                    -> Affinity is unconditionally auto-configured.
-                TLLM_NUMA_AWARE_WORKER_AFFINITY = 0 or any other value
-                    -> Affinity is unconditionally _not_ auto-configured.
-        '''
-
-        # Get the current affinity setting
-        pid = os.getpid()
-        process = psutil.Process(pid)
-        cpu_affinity = process.cpu_affinity()
-
-        all_cpus = list(range(psutil.cpu_count()))
-
-        constrained_affinity = (cpu_affinity != all_cpus)
-        numa_aware_affinity = os.environ.get("TLLM_NUMA_AWARE_WORKER_AFFINITY")
-
-        # If affinity is constrained but the user hasn't explicitly
-        # requested NUMA-aware affinity, remove the constraints.
-        if constrained_affinity:
-            logger.warning(
-                f"Worker process {pid} is affined to run on the following CPUs: "
-                f"{cpu_affinity} (subset of all logical CPUs). This may harm "
-                f"performance if set incorrectly.")
-            if numa_aware_affinity is None:
-                logger.warning(
-                    f"Worker process {pid} has constrained CPU affinity "
-                    f"but `TLLM_NUMA_AWARE_WORKER_AFFINITY` is not set. "
-                    f"Removing CPU affinity constraints.")
-                process.cpu_affinity(all_cpus)
-
-        # If affinity is unconstrained and the user hasn't explicitly
-        # prohibited it or the user has explicitly requested it, choose the
-        # optimal affinity based upon the NUMA topology
-        if ((numa_aware_affinity is None and not constrained_affinity)
-                or (numa_aware_affinity == "1")):
-            process.cpu_affinity(get_numa_aware_cpu_affinity(device_id))
-            logger.info(
-                f"Worker process {pid} CPU affinity set to "
-                f"{process.cpu_affinity()} for optimal NUMA-aware scheduling.")
-
     def _get_comm_ranks_device_id(self):
         device_id = self.global_rank % torch.cuda.device_count()
         torch.cuda.set_device(device_id)
@@ -198,7 +144,7 @@ class BaseWorker(GenerationExecutor):
         comm_ranks = mpi_comm().allgather(global_rank)
         device_ids = mpi_comm().allgather(device_id)
 
-        self._configure_affinity(device_id)
+        configure_cpu_affinity(device_id)
 
         return comm_ranks, device_ids
 
@@ -449,7 +395,18 @@ class BaseWorker(GenerationExecutor):
         else:
             lora_config = None
 
-        prompt_token_ids = list(request.prompt_token_ids)
+        # prompt_token_ids stays list[int] for all consumers. If an int32 buffer
+        # rode along on the wire (GenerationRequest._prompt_token_ids_i32), hand
+        # THAT to the C++ Request ctor (memcpy) instead of the list -- this avoids
+        # the O(ISL) list copy + element-wise nanobind cast on the GIL-held submit
+        # thread. No buffer (in-process, or prompt-adapter prepend) -> list path.
+        # If both forms exist, they are assumed to describe the same token ids;
+        # in-place mutations of request.prompt_token_ids must clear the i32 buffer.
+        i32_buf = getattr(request, "_prompt_token_ids_i32", None)
+        if i32_buf is not None and request.prompt_adapter_request is None:
+            prompt_token_ids = i32_buf
+        else:
+            prompt_token_ids = list(request.prompt_token_ids)
         prompt_tuning_config = None
         if request.prompt_adapter_request is not None:
             self._load_prompt_adapter(request.prompt_adapter_request)
@@ -625,6 +582,10 @@ class BaseWorker(GenerationExecutor):
             executor_request.py_scheduling_params = None
             if self._is_pytorch_backend and request.scheduling_params is not None:
                 executor_request.py_scheduling_params = request.scheduling_params
+
+            executor_request.py_conversation_params = None
+            if self._is_pytorch_backend and request.conversation_params is not None:
+                executor_request.py_conversation_params = request.conversation_params
 
             if request.arrival_time is not None:
                 executor_request.py_arrival_time = request.arrival_time

@@ -31,6 +31,7 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
@@ -352,6 +353,24 @@ class MiniMaxM3MoE(nn.Module):
     that the previous independent-reduction wiring incurred.
     """
 
+    @staticmethod
+    def _get_experts_quant_config(model_config: "ModelConfig", layer_idx: int) -> QuantConfig:
+        """Return the per-layer quant config for the routed experts.
+
+        For MIXED_PRECISION checkpoints (MXFP8 base + NVFP4 experts),
+        ``ModelConfig._set_minimax_m3_moe_quant_config`` pre-populates
+        ``quant_config_dict`` with coarse entries keyed by
+        ``model.layers.N.block_sparse_moe.experts``.  Falls back to the
+        global ``quant_config`` when no per-layer entry exists (e.g. BF16
+        or user-supplied global NVFP4 config).
+        """
+        if getattr(model_config, "quant_config_dict", None) is None:
+            return model_config.quant_config
+        return model_config.quant_config_dict.get(
+            f"model.layers.{layer_idx}.block_sparse_moe.experts",
+            model_config.quant_config,
+        )
+
     def __init__(
         self,
         model_config: "ModelConfig[PretrainedConfig]",
@@ -415,6 +434,7 @@ class MiniMaxM3MoE(nn.Module):
         # (matches DeepSeekV3). Under Attention DP the fused MoE already
         # skips its in-op all-reduce, so ``reduce_results=False`` is
         # also the correct flag there.
+        experts_quant_config = MiniMaxM3MoE._get_experts_quant_config(model_config, layer_idx)
         self.experts = create_moe(
             routing_method=self.gate.routing_method,
             num_experts=self.num_experts,
@@ -422,6 +442,7 @@ class MiniMaxM3MoE(nn.Module):
             reduce_results=False,
             model_config=model_config,
             layer_idx=layer_idx,
+            override_quant_config=experts_quant_config,
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
             swiglu_limit=self.swiglu_limit,

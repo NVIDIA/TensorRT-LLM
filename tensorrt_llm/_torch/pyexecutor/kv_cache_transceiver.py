@@ -179,6 +179,7 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
 
         self.kv_transfer_timeout_ms = cache_transceiver_config.kv_transfer_timeout_ms
         self.kv_transfer_sender_future_timeout_ms = cache_transceiver_config.kv_transfer_sender_future_timeout_ms
+        self.kv_transfer_poll_interval_ms = cache_transceiver_config.kv_transfer_poll_interval_ms
 
         # Get RNN state manager and layer distribution if mamba_cache_manager is provided.
         rnn_state_manager = None

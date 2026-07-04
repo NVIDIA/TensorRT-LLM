@@ -192,6 +192,63 @@ model_kwargs:
         assert llm_args.model_kwargs['num_hidden_layers'] == 2
 
 
+@pytest.mark.parametrize("llm_args_cls", [TorchLlmArgs])
+class TestEncoderRuntimeSizes:
+    """Cover encoder runtime size fields and fallback to LLM limits.
+
+    `encoder_max_batch_size` / `encoder_max_num_tokens` are user-facing
+    knobs that size multimodal encoder AttentionMetadata; when unset they
+    fall back to the LLM-side `max_batch_size` / `max_num_tokens`. They are
+    PyTorch-backend only (the multimodal encoder profiling path), so they
+    live on `TorchLlmArgs` rather than the shared `BaseLlmArgs`.
+    """
+
+    def test_defaults_are_none(self, llm_args_cls):
+        llm_args = llm_args_cls(model=llama_model_path)
+        assert llm_args.encoder_max_batch_size is None
+        assert llm_args.encoder_max_num_tokens is None
+
+    @pytest.mark.parametrize(
+        "kwargs, expected_runtime_sizes",
+        [
+            # Neither encoder knob set -- falls back to LLM limits.
+            (dict(max_batch_size=64, max_num_tokens=2048), (64, 2048)),
+            # Only encoder_max_batch_size overrides.
+            (dict(max_batch_size=64,
+                  max_num_tokens=2048,
+                  encoder_max_batch_size=512), (512, 2048)),
+            # Only encoder_max_num_tokens overrides.
+            (dict(max_batch_size=64,
+                  max_num_tokens=2048,
+                  encoder_max_num_tokens=32768), (64, 32768)),
+            # Both encoder knobs override.
+            (dict(max_batch_size=64,
+                  max_num_tokens=2048,
+                  encoder_max_batch_size=512,
+                  encoder_max_num_tokens=32768), (512, 32768)),
+        ],
+        ids=["fallback", "only_batch", "only_tokens", "both"],
+    )
+    def test_get_encoder_runtime_sizes(self, llm_args_cls, kwargs,
+                                       expected_runtime_sizes):
+        llm_args = llm_args_cls(model=llama_model_path, **kwargs)
+        assert llm_args.get_encoder_runtime_sizes() == expected_runtime_sizes
+
+    @pytest.mark.parametrize(
+        "field_name, invalid_value",
+        [
+            ("encoder_max_batch_size", 0),
+            ("encoder_max_batch_size", -1),
+            ("encoder_max_num_tokens", 0),
+            ("encoder_max_num_tokens", -1),
+        ],
+    )
+    def test_rejects_non_positive(self, llm_args_cls, field_name,
+                                  invalid_value):
+        with pytest.raises(ValidationError):
+            llm_args_cls(model=llama_model_path, **{field_name: invalid_value})
+
+
 def test_decoding_type_eagle3_parses_to_eagle3_decoding_config():
     adapter = TypeAdapter(SpeculativeConfig)
     spec_cfg = adapter.validate_python(
@@ -227,6 +284,20 @@ def test_decoding_type_eagle3_errors_on_tensorrt_backend():
     with pytest.raises(ValueError,
                        match="only supported on the PyTorch backend"):
         TrtLlmArgs(model=llama_model_path, speculative_config=spec_cfg)
+
+
+def test_post_processor_hook_rejected_with_skip_tokenizer_init():
+    """post_processor_hook + skip_tokenizer_init must fail fast.
+
+    The hook is a text-based guardrail; pairing it with skip_tokenizer_init (no
+    detokenized text) must be rejected rather than silently disabling it.
+    """
+    with pytest.raises(ValidationError, match="skip_tokenizer_init"):
+        TorchLlmArgs(model="/tmp/dummy_model",
+                     skip_tokenizer_init=True,
+                     post_processor_hook="my_pkg.guardrail.Hook")
+    # skip_tokenizer_init alone (no hook) is still fine.
+    TorchLlmArgs(model="/tmp/dummy_model", skip_tokenizer_init=True)
 
 
 class TestModelDefaults:
@@ -337,6 +408,8 @@ class TestModelDefaults:
 
 def test_KvCacheConfig_declaration():
     assert KvCacheConfig().kv_cache_event_hash_algo == "auto"
+    assert KvCacheConfig().block_reuse_policy == "all_reusable"
+    assert KvCacheConfig().enable_swa_scratch_reuse is False
 
     config = KvCacheConfig(enable_block_reuse=True,
                            max_tokens=1024,
@@ -349,8 +422,12 @@ def test_KvCacheConfig_declaration():
                            secondary_offload_min_priority=1,
                            event_buffer_max_size=0,
                            kv_cache_event_hash_algo="v2_sha256_64",
+                           enable_swa_scratch_reuse=True,
                            enable_partial_reuse=True,
                            copy_on_partial_reuse=True,
+                           pool_ratio=[0.25, 0.75],
+                           avg_seq_len=2048,
+                           block_reuse_policy="per_request",
                            attention_dp_events_gather_period_ms=10)
 
     pybind_config = config._to_pybind()
@@ -361,10 +438,19 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.host_cache_size == 1024
     assert config.disk_cache_size == 2048
     assert config.disk_cache_path == "/tmp"
+    assert config.enable_swa_scratch_reuse is True
+    assert KvCacheConfig().enable_swa_scratch_reuse is False
     assert pybind_config.cross_kv_cache_fraction == 0.5
     assert pybind_config.secondary_offload_min_priority == 1
     assert pybind_config.event_buffer_max_size == 0
     assert config.kv_cache_event_hash_algo == "v2_sha256_64"
+    assert config.pool_ratio == [0.25, 0.75]
+    assert config.avg_seq_len == 2048
+    assert config.block_reuse_policy == "per_request"
+    assert not hasattr(pybind_config, "pool_ratio")
+    assert not hasattr(pybind_config, "avg_seq_len")
+    assert not hasattr(pybind_config, "block_reuse_policy")
+    assert not hasattr(pybind_config, "enable_swa_scratch_reuse")
     assert KvCacheConfig(
         kv_cache_event_hash_algo="auto").kv_cache_event_hash_algo == "auto"
     assert KvCacheConfig(kv_cache_event_hash_algo="v1_block_key"
@@ -372,6 +458,8 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.enable_partial_reuse == True
     assert pybind_config.copy_on_partial_reuse == True
     assert pybind_config.attention_dp_events_gather_period_ms == 10
+    with pytest.raises(ValidationError):
+        KvCacheConfig(block_reuse_policy="invalid")
 
 
 def test_KvCacheConfig_disk_cache_validation(tmp_path):
@@ -462,6 +550,25 @@ class TestMultimodalConfig:
         )
         encoder_graph = args.multimodal_config.encoder_cuda_graph
         assert encoder_graph["vision"].buckets == [(1035, 1), (2069, 2)]
+
+
+@pytest.mark.parametrize("kwargs", [
+    {
+        "pool_ratio": []
+    },
+    {
+        "pool_ratio": [0.0, 1.0]
+    },
+    {
+        "pool_ratio": [0.25, 0.25]
+    },
+    {
+        "avg_seq_len": 0
+    },
+])
+def test_KvCacheConfig_pool_ratio_avg_seq_len_validation(kwargs):
+    with pytest.raises(ValidationError):
+        KvCacheConfig(**kwargs)
 
 
 def test_CapacitySchedulerPolicy():
@@ -570,20 +677,27 @@ def test_DynamicBatchConfig_declaration():
     assert pybind_config.dynamic_batch_moving_average_window == 10
 
 
-def test_SchedulerConfig_declaration():
+def test_SchedulerConfig_declaration() -> None:
+    default_config = SchedulerConfig()
+    default_pybind_config = PybindMirror.maybe_to_pybind(default_config)
+    assert default_config.enable_prefix_aware_scheduling is True
+    assert default_pybind_config.enable_prefix_aware_scheduling is True
+
     config = SchedulerConfig(
         capacity_scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
         context_chunking_policy=ContextChunkingPolicy.EQUAL_PROGRESS,
         dynamic_batch_config=DynamicBatchConfig(
             enable_batch_size_tuning=True,
             enable_max_num_tokens_tuning=True,
-            dynamic_batch_moving_average_window=10))
+            dynamic_batch_moving_average_window=10),
+        enable_prefix_aware_scheduling=False)
 
     pybind_config = PybindMirror.maybe_to_pybind(config)
     assert pybind_config.capacity_scheduler_policy == tle.CapacitySchedulerPolicy.MAX_UTILIZATION
     assert pybind_config.context_chunking_policy == tle.ContextChunkingPolicy.EQUAL_PROGRESS
     assert PybindMirror.pybind_equals(pybind_config.dynamic_batch_config,
                                       config.dynamic_batch_config._to_pybind())
+    assert pybind_config.enable_prefix_aware_scheduling is False
 
 
 def test_PeftCacheConfig_declaration():
@@ -1741,6 +1855,7 @@ class TestStrictBaseModelArbitraryArgs:
                                         max_tokens_in_buffer=1024)
         assert config.backend == "UCX"
         assert config.max_tokens_in_buffer == 1024
+        assert config.kv_transfer_poll_interval_ms == 5000
 
         # Arbitrary arguments should be rejected
         with pytest.raises(
