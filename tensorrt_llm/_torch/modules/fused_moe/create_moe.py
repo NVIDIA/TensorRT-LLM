@@ -81,7 +81,7 @@ def get_moe_cls(
             # hybrid CUTLASS-prefill / FlashInfer NVFP4 MoE decode backend
             # (CuteDslB12xFusedMoE). Prefer it when flashinfer is importable;
             # otherwise fall through to CuteDslFusedMoE for SM100 / SM103.
-            if quant_config.quant_mode.has_nvfp4():
+            if quant_config.quant_algo == QuantAlgo.NVFP4:
                 from tensorrt_llm._utils import get_sm_version
                 sm_version = get_sm_version()
                 if sm_version in CuteDslB12xFusedMoE._SUPPORTED_SM_VERSIONS:
