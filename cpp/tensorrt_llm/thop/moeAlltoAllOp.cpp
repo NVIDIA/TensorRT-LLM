@@ -77,6 +77,11 @@ public:
         return mDeviceWords;
     }
 
+    uint64_t const* getHostWords() const
+    {
+        return static_cast<uint64_t const*>(mTensor.const_data_ptr());
+    }
+
     int getDeviceIndex() const
     {
         return mDeviceIndex;
@@ -111,8 +116,8 @@ public:
     }
 
 private:
-    [[maybe_unused]] torch::Tensor mTensor; // Owns the mapped allocation until explicit release.
-    torch::Tensor mWorkspace;               // Keeps the device-status words alive for every asynchronous launch.
+    torch::Tensor mTensor;    // Owns the mapped allocation until explicit release.
+    torch::Tensor mWorkspace; // Keeps the device-status words alive for every asynchronous launch.
     uint64_t* mDeviceWords{};
     int mDeviceIndex{};
     int64_t mEpRank{};
@@ -266,7 +271,7 @@ inline ExecutionControlMapping getExecutionControlRegistration(
         TORCH_CHECK(it->second.getEpRank() == expectedEpRank, "execution_control belongs to ep_rank ",
             it->second.getEpRank(), " but was used with ep_rank ", expectedEpRank);
     }
-    return {static_cast<uint64_t const*>(hostPtr), it->second.getDeviceWords()};
+    return {it->second.getHostWords(), it->second.getDeviceWords()};
 }
 
 inline uint64_t* getExecutionDeviceStatusPtr(torch::Tensor const& workspace, int64_t epRank)

@@ -60,6 +60,10 @@ from unittest.mock import MagicMock
 import cloudpickle
 import pytest
 import torch
+from _torch.modules.moe.moe_a2a_abort_worker import (
+    run_combine_abort_worker,
+    run_dispatch_abort_worker,
+)
 from mpi4py import MPI
 
 import tensorrt_llm as tllm
@@ -2958,7 +2962,7 @@ def _run_running_dispatch_abort_test(
     worker_args = [(config, missing_rank, abort_source)] * config.ep_size
     results = list(
         mpi_pool_executor.map(
-            _worker_running_dispatch_abort,
+            run_dispatch_abort_worker,
             *zip(*worker_args),
             timeout=EXECUTION_ABORT_EXECUTOR_TIMEOUT_S,
         )
@@ -2987,7 +2991,7 @@ def _run_running_combine_abort_test(
     worker_args = [(config, missing_rank, abort_source)] * config.ep_size
     results = list(
         mpi_pool_executor.map(
-            _worker_running_combine_abort,
+            run_combine_abort_worker,
             *zip(*worker_args),
             timeout=EXECUTION_ABORT_EXECUTOR_TIMEOUT_S,
         )
@@ -3153,6 +3157,11 @@ class TestMoEComm:
             local_num_tokens,
             top_k,
         )
+
+    def test_moe_a2a_abort_worker_entrypoints_are_pickleable(self) -> None:
+        """Keep MPI entry points serialized by reference, outside this by-value module."""
+        for worker in (run_dispatch_abort_worker, run_combine_abort_worker):
+            assert cloudpickle.loads(cloudpickle.dumps(worker)) is worker
 
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize(
