@@ -122,6 +122,7 @@ def test_get_cutlass_dsl_cuda_major_reads_public_cutlass_api(monkeypatch, cuda_v
         QuantAlgo.FP8_BLOCK_SCALES,
         QuantAlgo.W4A16_MXFP4,
         QuantAlgo.W4A8_MXFP4_FP8,
+        QuantAlgo.W4A8_MXFP4_MXFP8,
     ],
 )
 def test_can_implement_rejects_non_nvfp4(quant_algo):
@@ -133,6 +134,22 @@ def test_can_implement_rejects_non_nvfp4(quant_algo):
         ok, reason = CuteDslB12xFusedMoE.can_implement(quant_algo)
     assert not ok
     assert reason is not None and "NVFP4" in reason
+
+
+def test_get_moe_cls_cutedsl_does_not_apply_b12x_gate_to_mixed_fp8_fp4():
+    cfg = ModelConfig()
+    cfg.moe_backend = "CUTEDSL"
+    cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8)
+    with (
+        patch("tensorrt_llm._utils.get_sm_version", return_value=120),
+        patch.object(
+            CuteDslB12xFusedMoE,
+            "_get_cutlass_dsl_cuda_major",
+            side_effect=AssertionError("B12x gate should only run for pure NVFP4"),
+        ),
+    ):
+        cls = get_moe_cls(cfg)
+    assert cls is CutlassFusedMoE
 
 
 def test_can_implement_rejects_swiglu_gptoss_style():
