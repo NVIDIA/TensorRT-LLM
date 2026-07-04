@@ -427,35 +427,18 @@ def _save_lpips_video_mp4(video, output_path, frame_rate):
 
     try:
         save_video(video, output_path, frame_rate=frame_rate)
-        return
     except RuntimeError as err:
         if "MP4 format requires ffmpeg" not in str(err):
             raise
-
-    import cv2
-
-    if video.dim() == 5:
-        video = video[0]
-    output_path = str(output_path)
-    output_dir = os.path.dirname(output_path)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-
-    video_np = video.detach().cpu().numpy()
-    num_frames, height, width, channels = video_np.shape
-    assert channels == 3, f"Expected RGB video with 3 channels, got {channels}"
-    writer = cv2.VideoWriter(
-        output_path,
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        float(frame_rate),
-        (width, height),
-    )
-    assert writer.isOpened(), f"Failed to open MP4 writer for {output_path}"
-    try:
-        for frame in video_np:
-            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-    finally:
-        writer.release()
+        # Never fall back to another codec here: the goldens are H.264/x264 and
+        # LPIPS compares decoded pixels, so a silent cv2/mp4v fallback compares
+        # codec artifacts, not model output (this produced a spurious 0.059 on
+        # wan22 while the generated frames were identical to the golden).
+        pytest.fail(
+            "ffmpeg is unavailable for LPIPS video encoding; refusing to fall back "
+            "to another codec because the golden comparison would measure codec "
+            f"artifacts instead of model output: {err}"
+        )
     assert os.path.isfile(output_path), f"Visual gen did not produce {output_path}"
 
 
@@ -539,9 +522,9 @@ def _preserve_lpips_candidate_on_failure(request, score, threshold, candidate_pa
     print(f"[LPIPS] candidate preserved for golden refresh: {dest}")
     # CI's per-stage results tarball only collects flat files (results.xml etc.), not
     # this subdirectory — and junit stdout IS collected. Small candidates therefore
-    # also go into stdout as base64 so a threshold failure is recoverable from the
-    # archived results.xml alone (goldens for these tests must be CI-generated: wan22
-    # measured a 0.059 cross-fleet eager offset that no dev-machine regen can close).
+    # also go into stdout as base64 so a threshold failure is diagnosable from the
+    # archived results.xml alone (this is how wan22's spurious 0.059 was traced to a
+    # silent mpeg4 codec fallback rather than a generation difference).
     size = os.path.getsize(dest)
     if size <= 8 * 1024 * 1024:
         with open(dest, "rb") as fh:
