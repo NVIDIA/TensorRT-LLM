@@ -20,10 +20,12 @@ without adding host syncs in the hot path; the implicit sync from
 occurs when the response is consumed.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+
+from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.executor import DiffusionResponse
@@ -75,6 +77,22 @@ class PipelineOutput:
     pre_denoise: float = 0.0
     denoise: float = 0.0
     post_denoise: float = 0.0
+
+    def to_handle(self) -> None:
+        """Replace media tensors with handle dicts in place (avoids pickling the full blob over IPC)."""
+        for f in fields(self):
+            t = getattr(self, f.name)
+            if isinstance(t, torch.Tensor):
+                setattr(self, f.name, SharedTensorContainer.from_tensor(t).dump_to_dict())
+
+    def to_tensor(self) -> None:
+        """Rebuild media tensors from handle dicts, in place. ``clone()`` so the client
+        owns the data and the producer's shared block releases via the refcount.
+        """
+        for f in fields(self):
+            v = getattr(self, f.name)
+            if isinstance(v, dict) and "method_key" in v:
+                setattr(self, f.name, SharedTensorContainer.from_dict(v).get_local_view().clone())
 
 
 class CudaPhaseTimer:
