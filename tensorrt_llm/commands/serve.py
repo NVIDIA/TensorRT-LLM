@@ -342,14 +342,7 @@ def _build_llm_args_from_disagg_server_cfg(other_args: Dict) -> Dict:
 
 
 def _diagnose_port_in_use(port: int) -> str:
-    """Describe which process currently holds the given port, best effort.
-
-    Returns a human-readable string for logs and error messages when a bind
-    fails with EADDRINUSE. Such bind failures are usually races: the port was
-    free at selection time, then taken before the rebind. They are not
-    reproducible, so capturing the holder at failure time is the best chance
-    to diagnose them.
-    """
+    """Describe which process currently holds the given port, best effort."""
     try:
         import psutil
     except ImportError:
