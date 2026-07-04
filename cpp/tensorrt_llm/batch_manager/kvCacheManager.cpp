@@ -1299,8 +1299,9 @@ void WindowBlockManager::releaseSubtree(BlockPtr const& block)
 
 BlockPtr WindowBlockManager::claimDiskTarget()
 {
-    // Cheap victims (empty slots; unmarked content in spill-all mode) live in bucket 0,
-    // so the policy's front candidate is only a retained block when nothing cheap exists.
+    // Priority order: empty slots (kMin) < unmarked content (kDefault) < retained (kMax),
+    // so getFreeBlock returns empties first and a retained block only when nothing cheaper
+    // (empty slot or unmarked cached block) remains.
     auto candidate = std::get<0>(mEvictionPolicy->getFreeBlock(kDiskLevel));
     if (!candidate->isRetainedNow())
     {
@@ -1380,8 +1381,10 @@ BlockPtr WindowBlockManager::reclaimSecondaryBlock()
     }
     else
     {
-        // Spill-all mode only: unmarked content is displaced before any retained block.
-        victim->setPriority(executor::KvCacheRetentionConfig::kMinRetentionPriority);
+        // Spill-all: rank unmarked content above empty slots (kMin) but below retained
+        // (kMax) — empties are consumed as spill targets first, so cached blocks evict
+        // LRU only once the disk is genuinely full.
+        victim->setPriority(executor::KvCacheRetentionConfig::kDefaultRetentionPriority);
     }
     mEvictionPolicy->releaseBlock(victim); // re-enters the free queues at kDiskLevel
     ++mDiskSpills;

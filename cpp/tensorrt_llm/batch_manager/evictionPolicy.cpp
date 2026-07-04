@@ -78,11 +78,20 @@ void LRUEvictionPolicy::initialize(std::vector<BlockPtr>& mAllBlocksById, std::v
 
     for (SizeType32 cacheLevel = 0; cacheLevel < kNumCacheLevels; cacheLevel++)
     {
-        auto& freeQueue = mFreeQueues[cacheLevel][defaultPriorityIdx];
+        // Poolless disk slots start empty; give them the lowest priority so getFreeBlock
+        // hands out empty slots as spill targets before displacing any cached disk block.
+        bool const isDisk = (cacheLevel == kDiskLevel);
+        SizeType32 const initPriIdx = isDisk ? getPriorityIdx(kMinPriority) : defaultPriorityIdx;
+        auto& freeQueue = mFreeQueues[cacheLevel][initPriIdx];
 
         for (SizeType32 blockId = 0; blockId < sizesPadded[cacheLevel]; blockId++)
         {
-            // Initialize all blocks to be the default priority level
+            // Keep block priority in lockstep with its bucket so later claim/release
+            // erase from the correct queue.
+            if (isDisk)
+            {
+                mAllBlocksById[startIdx + blockId]->setPriority(kMinPriority);
+            }
             mFreeBlockIterators[startIdx + blockId]
                 = freeQueue.insert(freeQueue.end(), mAllBlocksById[startIdx + blockId]);
         }
