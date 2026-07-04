@@ -1010,8 +1010,12 @@ __device__ __forceinline__ void vec_convert(
         out[j] = DstT(static_cast<float>(in[j]));
 }
 
-// BF16 → FP8 e4m3: paired PTX cvt.rn.satfinite.e4m3x2.bf16x2 (SM100+, Blackwell).
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+// BF16 → FP8 e4m3: paired PTX cvt.rn.satfinite.e4m3x2.bf16x2 (SM100-family only).
+// Consumer Blackwell (sm_120/121) passes the >= 1000 check but has no bf16x2
+// source variant for this cvt; ptxas rejects it ("Unexpected instruction types
+// specified for 'cvt'"), breaking any --cuda_architectures 120/121 build.
+// SM12x falls back to the generic float-path vec_convert above.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && (__CUDA_ARCH__ < 1200)
 template <size_t VEC_SIZE, std::enable_if_t<(VEC_SIZE % 2 == 0), int> = 0>
 __device__ __forceinline__ void vec_convert(
     flashinfer::vec_t<__nv_fp8_e4m3, VEC_SIZE>& out, flashinfer::vec_t<__nv_bfloat16, VEC_SIZE> const& in)
