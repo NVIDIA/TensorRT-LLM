@@ -1,3 +1,0 @@
-cache_transceiver_config:
-  backend: UCX
-  max_tokens_in_buffer: 2048

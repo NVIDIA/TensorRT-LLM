@@ -1,8 +1,0 @@
-regex
-fire
-tritonclient[all]
-transformers==5.5.4
-pandas
-tabulate
-flash_attn
-torchao>=0.14.1

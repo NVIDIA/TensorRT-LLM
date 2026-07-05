@@ -1,8 +1,0 @@
-methods:
-  __init__:
-    parameters:
-      conversation_id:
-        annotation: str
-        default: inspect._empty
-    return_annotation: None
-properties: {}

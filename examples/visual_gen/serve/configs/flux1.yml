@@ -1,8 +1,0 @@
-cache_config:
-  cache_backend: teacache
-  teacache_thresh: 0.6
-attention_config:
-   backend: VANILLA
-parallel_config:
-   cfg_size: 1
-   ulysses_size: 1
