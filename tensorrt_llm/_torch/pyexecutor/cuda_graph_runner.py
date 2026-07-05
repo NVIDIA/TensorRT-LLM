@@ -84,6 +84,69 @@ class CUDAGraphRunnerConfig:
     kv_cache_manager_key: Any
     dynamic_draft_len_mapping: Optional[Dict[int, int]] = None
     sparse_attention_config: Optional[BaseSparseAttentionConfig] = None
+    use_kv_cache_manager_v2: bool = False
+
+
+_DEEPSEEK_V4_MTP_DENSE_EXACT_NEAR_MAX_WINDOW = 4
+
+
+def _is_mtp_spec_config(spec_config: Optional[DecodingBaseConfig]) -> bool:
+    spec_dec_mode = getattr(spec_config, "spec_dec_mode", None)
+    if spec_dec_mode is None:
+        return False
+
+    for attr in (
+            "is_mtp_one_model",
+            "is_mtp_vanilla",
+            "is_mtp_eagle",
+            "is_mtp_eagle_one_model",
+    ):
+        predicate = getattr(spec_dec_mode, attr, None)
+        if callable(predicate) and predicate():
+            return True
+    return False
+
+
+def _is_dense_exact_cuda_graph_batch_sizes(
+        cuda_graph_batch_sizes: list[int],
+        max_cuda_graph_batch_size: int) -> bool:
+    if max_cuda_graph_batch_size <= 0:
+        return False
+    return set(range(1, max_cuda_graph_batch_size + 1)).issubset(
+        set(cuda_graph_batch_sizes))
+
+
+def should_skip_cuda_graph_for_deepseek_v4_mtp(
+        *,
+        batch_size: int,
+        cuda_graph_padding_enabled: bool,
+        cuda_graph_batch_sizes: list[int],
+        max_cuda_graph_batch_size: int,
+        spec_config: Optional[DecodingBaseConfig],
+        sparse_attention_config: Optional[BaseSparseAttentionConfig],
+        use_kv_cache_manager_v2: bool,
+        is_draft_model: bool,
+        near_max_window: int = _DEEPSEEK_V4_MTP_DENSE_EXACT_NEAR_MAX_WINDOW,
+) -> bool:
+    """Return True for the DeepSeek-V4 MTP dense-exact graph bucket at risk.
+
+    The issue has only been observed with unpadded per-size graph capture near
+    max batch size. Padded mode and sparse bucket graphs intentionally keep
+    their existing CUDA graph behavior.
+    """
+    if (is_draft_model or cuda_graph_padding_enabled
+            or not use_kv_cache_manager_v2):
+        return False
+    if getattr(sparse_attention_config, "algorithm", None) != "deepseek_v4":
+        return False
+    if not _is_mtp_spec_config(spec_config):
+        return False
+    if not _is_dense_exact_cuda_graph_batch_sizes(
+            cuda_graph_batch_sizes, max_cuda_graph_batch_size):
+        return False
+    if batch_size not in cuda_graph_batch_sizes:
+        return False
+    return batch_size >= max(1, max_cuda_graph_batch_size - near_max_window)
 
 
 class CUDAGraphRunner:
@@ -302,6 +365,21 @@ class CUDAGraphRunner:
                 return None, None, None
 
         if not self.enabled or not can_run_cuda_graph:
+            return None, None, None
+        if should_skip_cuda_graph_for_deepseek_v4_mtp(
+                batch_size=batch_size,
+                cuda_graph_padding_enabled=self.padding_enabled,
+                cuda_graph_batch_sizes=self.supported_batch_sizes,
+                max_cuda_graph_batch_size=self.max_supported_batch_size,
+                spec_config=self.spec_config,
+                sparse_attention_config=self.sparse_config,
+                use_kv_cache_manager_v2=self.config.use_kv_cache_manager_v2,
+                is_draft_model=self.config.is_draft_model):
+            logger.warning_once(
+                "Skipping CUDA graph replay for DeepSeek-V4 sparse MTP "
+                "generation with KV cache manager v2 at near-max dense exact "
+                f"batch size {batch_size}; falling back to eager for this batch.",
+                key="deepseek_v4_mtp_dense_exact_cuda_graph_fallback")
             return None, None, None
         if self.config.use_mrope and any(
                 self._needs_mrope_delta_cache_update(request)

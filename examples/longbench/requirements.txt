@@ -1,3 +1,0 @@
-jieba
-fuzzywuzzy
-rouge

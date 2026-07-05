@@ -1,2 +1,0 @@
-latex2sympy2
-word2number

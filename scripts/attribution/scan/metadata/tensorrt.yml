@@ -1,4 +1,0 @@
-name: tensorrt
-description: tensorrt libraries and components
-directory_matches:
-- tensorrt

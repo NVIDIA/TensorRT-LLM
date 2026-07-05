@@ -687,6 +687,9 @@ class PyTorchModelEngine(ModelEngine):
             dist=self.dist,
             kv_cache_manager_key=self.kv_cache_manager_key,
             sparse_attention_config=self.sparse_attention_config,
+            use_kv_cache_manager_v2=bool(
+                getattr(self.llm_args.kv_cache_config,
+                        "use_kv_cache_manager_v2", False)),
         )
         self.cuda_graph_runner = CUDAGraphRunner(cuda_graph_runner_config)
 

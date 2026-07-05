@@ -1,5 +1,0 @@
-attention_config:
-  backend: VANILLA
-parallel_config:
-  cfg_size: 1
-  ulysses_size: 1
