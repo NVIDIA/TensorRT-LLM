@@ -16,6 +16,8 @@ meta-llama/Llama-3.1-8B-Instruct:
   - spec_dec_algo: PARD
     extra_acc_spec: use_sa_spec
     accuracy: 74.20
+  - spec_dec_algo: Draft_Target
+    accuracy: 74.20
   - spec_dec_algo: DFlash
     accuracy: 74.20
   - quant_algo: FP8
@@ -449,6 +451,9 @@ MiniMaxAI/MiniMax-M3:
 MiniMaxAI/MiniMax-M3-MXFP8:
   - quant_algo: MXFP8
     accuracy: 89
+nvidia/MiniMax-M3-NVFP4:
+  - quant_algo: MIXED_PRECISION
+    accuracy: 88
 nvidia/NVIDIA-Nemotron-Nano-9B-v2:
   - accuracy: 85.027
   - quant_algo: FP8
