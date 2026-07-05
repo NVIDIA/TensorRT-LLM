@@ -64,9 +64,7 @@ from tensorrt_llm.serve.openai_protocol import (
     ImageGenerationResponse, ImageObject, MemoryUpdateRequest, ModelCard,
     ModelList, PromptTokensDetails, ResponseFormat, ResponsesRequest,
     ResponsesResponse, TokenizeRequest, TokenizeResponse, UpdateWeightsRequest,
-    UsageInfo, ensure_request_chat_template_allowed,
-    ResponsesResponse, UpdateWeightsRequest, UsageInfo,
-    ensure_request_chat_template_allowed, to_llm_conversation_params,
+    UsageInfo, ensure_request_chat_template_allowed, to_llm_conversation_params,
     to_llm_disaggregated_params)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
 from tensorrt_llm.serve.postprocess_handlers import (
