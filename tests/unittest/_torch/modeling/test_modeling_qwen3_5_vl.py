@@ -38,9 +38,9 @@ from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
 #   - No MoE fields (num_experts / moe_intermediate_size / ...); a native
 #     `intermediate_size` is present and must be preserved by the normalizer
 #     (the Qwen3Next-alias synthesis is a no-op for dense).
-#   - `deepstack_visual_indexes: []` matches the real dense checkpoint, whose
-#     processor reserves no deepstack placeholder tokens. (The MoE config uses
-#     [8, 16, 24].) `use_deepstack` stays truthy via `hasattr`, but
+#   - `deepstack_visual_indexes: []` matches the real dense checkpoint (as it
+#     does for the MoE one — the Qwen3.5 family dropped Qwen3-VL's deepstack).
+#     `use_deepstack` stays truthy via `hasattr`, but
 #     `deepstack_num_level == 0` makes the split a no-op.
 #   - `attn_output_gate: true` mirrors the real config and matches TRT-LLM's
 #     Qwen3NextAttention, which hardcodes output gating.
@@ -76,9 +76,10 @@ def _write_qwen35_dense_vl_config(tmp_path: Path) -> Path:
             "num_key_value_heads": 2,
             "rms_norm_eps": 1e-6,
             "rope_parameters": {
+                "mrope_interleaved": True,
                 "mrope_section": [11, 11, 10],
                 "partial_rotary_factor": 0.25,
-                "rope_theta": 1000000.0,
+                "rope_theta": 10000000.0,
                 "rope_type": "default",
             },
             "use_cache": True,
@@ -119,14 +120,19 @@ def test_qwen35_dense_vl_config_preserves_vlm_architecture(
     # Dense: native intermediate_size is preserved (no MoE synthesis).
     assert config.text_config.intermediate_size == 2048
     assert getattr(config.text_config, "num_experts", 0) in (0, None)
-    # Dense contract: deepstack stays disabled (empty), unlike the MoE
-    # config's [8, 16, 24]. Normalization must not synthesize indices —
-    # the dense placeholder path depends on this staying empty.
+    # Qwen3.5 family contract: deepstack stays disabled (empty) — both real
+    # checkpoints (dense 27B and MoE 35B-A3B) publish []. Normalization must
+    # not synthesize indices; the placeholder path depends on this staying
+    # empty (see re-greening item D in the MoE testing-notes doc).
     assert config.vision_config.deepstack_visual_indexes == []
-    assert config.text_config.rope_theta == 1000000.0
+    assert config.text_config.rope_theta == 10000000.0
     assert config.text_config.partial_rotary_factor == 0.25
     assert config.text_config.rope_scaling["type"] == "mrope"
     assert config.text_config.rope_scaling["mrope_section"] == [11, 11, 10]
+    # mrope_interleaved must survive normalization: the fused QK-norm-RoPE op
+    # gates the mRoPE path on it, and without it position_ids gets flattened
+    # to 3*num_tokens and mismatches the QKV token count.
+    assert config.text_config.rope_scaling["mrope_interleaved"] is True
     assert config.text_config.mamba_ssm_dtype == "float32"
     assert config.get_text_config() is config.text_config
 
@@ -179,10 +185,10 @@ def test_qwen35_dense_vl_placeholder_metadata_registered() -> None:
 #
 #   - dense MLP: native `intermediate_size` (no MoE fields), so Qwen3NextModel
 #     selects GatedMLP for the feed-forward layers.
-#   - `deepstack_visual_indexes=[]` matches the real dense checkpoint's
-#     processor (which reserves no deepstack placeholders); `depth=2` is the
-#     minimum that doesn't host deepstack indices. This is the inverse of the
-#     MoE config and exercises the `deepstack_num_level == 0` no-op path.
+#   - `deepstack_visual_indexes=[]` matches the real dense checkpoint (same
+#     as the MoE parity config — the Qwen3.5 family dropped deepstack);
+#     `depth=2` keeps the tower tiny since nothing pins its depth, and the
+#     config exercises the `deepstack_num_level == 0` no-op path.
 #
 # `_name_or_path` points at the real checkpoint dir so the test can load the
 # tokenizer/processor (only the processor; not the full model weights).
@@ -215,9 +221,10 @@ QWEN3_5_VL_DENSE_PARITY_CONFIG = {
         "num_key_value_heads": 2,
         "rms_norm_eps": 1e-6,
         "rope_parameters": {
+            "mrope_interleaved": True,
             "mrope_section": [11, 11, 10],
             "partial_rotary_factor": 0.25,
-            "rope_theta": 1000000.0,
+            "rope_theta": 10000000.0,
             "rope_type": "default",
         },
         "use_cache": True,
@@ -259,7 +266,8 @@ class TestQwen3_5VL(TestModelingMultimodal):
 
     Two-config design (same as the MoE test): `self.hf_config` stays raw HF
     schema; TRT-LLM gets a deep-copied + normalized copy via the
-    `create_trtllm_model` override, mirroring production `load_pretrained_config`
+    `get_trtllm_pretrained_config` override, mirroring production
+    `load_pretrained_config`
     (`_normalize_qwen35_vl_config(..., inner_arch="Qwen3_5ForCausalLM")`).
     """
 
@@ -281,36 +289,15 @@ class TestQwen3_5VL(TestModelingMultimodal):
     def get_model_config_class(self):
         return transformers.Qwen3_5Config
 
-    def create_trtllm_model(
-        self,
-        load_weights: bool = False,
-        hf_model_state_dict: Optional[dict] = None,
-        **kwargs,
-    ):
-        """Build the TRT-LLM model from a *normalized copy* of `self.hf_config`.
+    def get_trtllm_pretrained_config(self) -> transformers.PretrainedConfig:
+        """Return a normalized config copy for TRT-LLM model construction.
 
         Mirrors the MoE test but passes `inner_arch="Qwen3_5ForCausalLM"` to the
         shared normalizer so the dense text decoder is selected.
         """
         trtllm_config = deepcopy(self.hf_config)
         _normalize_qwen35_vl_config(trtllm_config, inner_arch="Qwen3_5ForCausalLM")
-
-        model_config = ModelConfig(pretrained_config=trtllm_config)
-        model_class = self.get_trtllm_model_class()
-        model = model_class(model_config, **kwargs).to("cuda")
-
-        if load_weights:
-            weight_mapper = self.get_weight_mapper_class()()
-            weight_mapper.init_model_and_config(model, trtllm_config)
-            model.load_weights(hf_model_state_dict, weight_mapper)
-
-            for module in model.modules():
-                if hasattr(module, "post_load_weights") and not getattr(
-                    module, "_weights_removed", False
-                ):
-                    module.post_load_weights()
-
-        return model, model_config
+        return trtllm_config
 
     def _dummy_request_kwargs(self, scenario):
         """Qwen3.5-VL uses mRoPE; the cache manager needs the mRoPE
@@ -367,14 +354,35 @@ class TestQwen3_5VL(TestModelingMultimodal):
                 )
                 gen_multimodal_params_list.append(multimodal_param)
             trtllm_inputs["multimodal_params"] = gen_multimodal_params_list
+            # Cached-mRoPE read slots (added in #11943): the decode path reads
+            # per-request deltas from the cache by seq slot.
+            trtllm_inputs["mrope_delta_read_seq_slots"] = torch.arange(
+                len(multimodal_params_list), device=self.device, dtype=torch.long
+            )
         else:
+            # Mrope position ids. For chunked prefill / KV cache reuse we must
+            # mirror production `PyTorchModelEngine` and slice each request's
+            # full `mrope_position_ids` to the current chunk's token range —
+            # the fused QK-norm-RoPE op requires position_ids tokens to match
+            # the QKV token count.
+            chunk_len = input_ids.shape[-1]
+            if num_cached_tokens_per_seq is None:
+                begin_offsets = [0] * len(multimodal_params_list)
+            elif isinstance(num_cached_tokens_per_seq, int):
+                begin_offsets = [num_cached_tokens_per_seq] * len(multimodal_params_list)
+            else:
+                begin_offsets = list(num_cached_tokens_per_seq)
             mrope_position_ids = []
-            for multimodal_param in multimodal_params_list:
-                mrope_position_ids.append(
-                    multimodal_param.multimodal_data["mrope_config"]["mrope_position_ids"]
-                )
+            for multimodal_param, begin in zip(multimodal_params_list, begin_offsets):
+                full_mrope = multimodal_param.multimodal_data["mrope_config"]["mrope_position_ids"]
+                mrope_position_ids.append(full_mrope[:, :, begin : begin + chunk_len])
             position_ids = torch.cat(mrope_position_ids, dim=-1).to(self.device)
             trtllm_inputs["position_ids"] = position_ids
+            # Cached-mRoPE write slots (added in #11943): the context path
+            # writes per-request deltas into the cache by seq slot.
+            trtllm_inputs["mrope_delta_write_seq_slots"] = torch.arange(
+                len(multimodal_params_list), device=self.device, dtype=torch.long
+            )
 
         return trtllm_inputs
 
