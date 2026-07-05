@@ -25,7 +25,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from tensorrt_llm._torch.modules.linear import Linear, NVFP4LinearMethod
+from tensorrt_llm._torch.modules.linear import Linear, NVFP4SVDLinearMethod
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
@@ -53,190 +53,6 @@ _NON_SERIALIZED_QUANT_PARAM_NAMES = (
     "kv_scales",
     "inv_kv_scales",
 )
-
-# SVDQuant (NVFP4_SVD) checkpoints carry, per quantized Linear, three tensors on
-# top of the NVFP4 residual: a per-input-channel smoothing scale and the two
-# low-rank LoRA factors. They are consumed by NVFP4SVDLinearMethod, not by the
-# module's named parameters, so they are excluded from the strict key check.
-_SVDQUANT_PROVIDED_SUFFIXES = (
-    ".pre_quant_scale",
-    ".svdquant_lora_a",
-    ".svdquant_lora_b",
-)
-
-
-class NVFP4SVDLinearMethod(NVFP4LinearMethod):
-    """SVDQuant: NVFP4 residual GEMM + rank-r BF16 LoRA correction.
-
-    ModelOpt SVDQuant factorizes ``W ≈ R + L1·L2`` with per-input-channel
-    activation smoothing ``s`` (``pre_quant_scale``). With ``X̂ = X · s``, the
-    smoothed-space residual ``R`` (NVFP4) and low-rank term give::
-
-        Y = nvfp4_gemm(quant(X̂), R) · scales + (X̂ @ L2ᵀ) @ L1ᵀ  [+ bias]
-
-    where ``svdquant_lora_a`` = L2 ``[r, in]`` and ``svdquant_lora_b`` = L1
-    ``[out, r]``. The NVFP4 residual reuses the base method; this subclass adds
-    the smoothing + LoRA correction. On the supported SM100 target, the residual
-    and rank-r LoRA-up are fused into one CUTLASS kernel
-    (``nvfp4_svdquant_gemm``), with smoothing folded into quantization.
-    """
-
-    def create_weights(self, module, in_features, out_features, bias, dtype):
-        super().create_weights(module, in_features, out_features, bias, dtype)
-        # Materialized lazily in load_weights_vanilla (rank comes from the ckpt).
-        module.svdquant_lora_a = None
-        module.svdquant_lora_b = None
-        module.register_buffer("_svdquant_l2t_smoothed", None, persistent=False)
-        module.register_buffer("_svdquant_l1_scaled", None, persistent=False)
-        module._svdquant_use_fused = False
-
-    def load_weights_vanilla(self, module, weights, allow_partial_loading: bool = False) -> None:
-        super().load_weights_vanilla(module, weights, allow_partial_loading)
-        w = weights[0]
-        device = module.weight.device
-        # pre_quant_scale ([in_features]) may already be loaded by the base NVFP4
-        # method on newer releases; load it here too for robustness.
-        if getattr(module, "pre_quant_scale", None) is None and "pre_quant_scale" in w:
-            module.pre_quant_scale = nn.Parameter(
-                w["pre_quant_scale"].to(device), requires_grad=False
-            )
-        if "svdquant_lora_a" in w:
-            module.svdquant_lora_a = nn.Parameter(
-                w["svdquant_lora_a"].to(device), requires_grad=False
-            )
-            module.svdquant_lora_b = nn.Parameter(
-                w["svdquant_lora_b"].to(device), requires_grad=False
-            )
-
-    def transform_weights(self, module) -> None:
-        super().transform_weights(module)
-        lora_a = getattr(module, "svdquant_lora_a", None)
-        lora_b = getattr(module, "svdquant_lora_b", None)
-        pqs = getattr(module, "pre_quant_scale", None)
-
-        def set_derived_buffer(name: str, value: Optional[torch.Tensor]) -> None:
-            # Qwen swaps an already-created NVFP4 Linear to this method after construction, so
-            # create_weights() is not guaranteed to have registered these derived buffers.
-            if name in module._buffers:
-                setattr(module, name, value)
-            else:
-                module.register_buffer(name, value, persistent=False)
-
-        shapes_are_supported = (
-            lora_a is not None
-            and lora_b is not None
-            and pqs is not None
-            and lora_a.dim() == 2
-            and lora_b.dim() == 2
-            and lora_a.shape[0] == 32
-            and lora_b.shape[1] == 32
-            and module.weight.shape[0] == lora_b.shape[0]
-            and module.weight.shape[1] * 2 == lora_a.shape[1]
-            and pqs.numel() == lora_a.shape[1]
-        )
-        if not shapes_are_supported:
-            set_derived_buffer("_svdquant_l2t_smoothed", None)
-            set_derived_buffer("_svdquant_l1_scaled", None)
-            module._svdquant_use_fused = False
-            return
-
-        # These factors are invariant after checkpoint loading. Preparing them here avoids a
-        # device-to-host .item(), tensor allocation, and module mutation inside torch.compile or
-        # CUDA graph capture.
-        l2t_smoothed = (
-            pqs.to(torch.bfloat16).unsqueeze(1) * lora_a.t().to(torch.bfloat16)
-        ).contiguous()
-        l1_scaled = (
-            (lora_b.to(torch.float32) / module.alpha.reshape(-1)[:1])
-            .to(torch.bfloat16)
-            .contiguous()
-        )
-        set_derived_buffer("_svdquant_l2t_smoothed", l2t_smoothed)
-        set_derived_buffer("_svdquant_l1_scaled", l1_scaled)
-        module._svdquant_use_fused = True
-
-    def apply(self, module, input, bias):
-        a = getattr(module, "svdquant_lora_a", None)
-        b = getattr(module, "svdquant_lora_b", None)
-        pqs = getattr(module, "pre_quant_scale", None)
-        # On SM100 the NVFP4 residual GEMM and rank-r LoRA-up are fused into one CUTLASS kernel,
-        # with pre_quant_scale smoothing folded into quantization. Disabling the fused dispatch is
-        # the same-checkpoint reference path used to isolate the kernel's effect.
-        if a is not None and b is not None and pqs is not None:
-            if getattr(module, "_svdquant_use_fused", False):
-                return self._apply_svdquant_gemm(module, input, bias, pqs)
-            return self._apply_svdquant_reference(module, input, bias, pqs, a, b)
-        return super().apply(module, input, bias)
-
-    def _apply_svdquant_reference(self, module, input, bias, pqs, lora_a, lora_b):
-        """Capture-safe unfused control with the same quantize and rank-down frontend."""
-        orig_shape, x2d, xq, x_sf = self._prepare_svdquant_input(module, input, pqs)
-        l2t_smoothed = getattr(module, "_svdquant_l2t_smoothed", None)
-        if l2t_smoothed is None:
-            down = torch.mm(x2d * pqs, lora_a.t())
-        else:
-            down = torch.mm(x2d, l2t_smoothed)
-
-        residual = torch.ops.trtllm.nvfp4_gemm(
-            xq,
-            module.weight,
-            x_sf,
-            module.weight_scale,
-            module.alpha,
-            module.dtype,
-            allowed_backends=",".join(module.nvfp4_allowed_backends),
-            bias=bias,
-        )
-        out = residual + torch.mm(down, lora_b.t()).to(residual.dtype)
-        return out.reshape(*orig_shape[:-1], out.shape[-1])
-
-    def _apply_svdquant_gemm(self, module, input, bias, pqs):
-        orig_shape, x2d, xq, x_sf = self._prepare_svdquant_input(module, input, pqs)
-        down = torch.mm(x2d, module._svdquant_l2t_smoothed)
-        return self._apply_svdquant_precomputed(
-            module,
-            orig_shape,
-            xq,
-            x_sf,
-            down,
-            bias,
-        )
-
-    def _prepare_svdquant_input(self, module, input, pqs):
-        orig_shape = input.shape
-        x2d = input.reshape(-1, orig_shape[-1]).to(torch.bfloat16).contiguous()
-        xq, x_sf = self._quantize_svdquant_input(module, x2d, pqs)
-        return orig_shape, x2d, xq, x_sf
-
-    @staticmethod
-    def _quantize_svdquant_input(module, x2d, pqs):
-        global_scale = module.input_scale.to(torch.float32).reshape(1).contiguous()
-        return torch.ops.trtllm.nvfp4_quantize_smooth(
-            x2d, pqs.to(torch.bfloat16).contiguous(), global_scale
-        )
-
-    @staticmethod
-    def _apply_svdquant_precomputed(
-        module,
-        orig_shape,
-        xq,
-        x_sf,
-        down,
-        bias,
-    ):
-        out = torch.ops.trtllm.nvfp4_svdquant_gemm_tuned(
-            xq.view(torch.uint8),
-            module.weight.view(torch.uint8),
-            x_sf.view(torch.uint8),
-            module.weight_scale.view(torch.uint8),
-            module.alpha,
-            down,
-            module._svdquant_l1_scaled,
-            torch.bfloat16,
-            bias,
-        )
-        out = out.reshape(*orig_shape[:-1], out.shape[-1])
-        return out
 
 
 def _remap_checkpoint_keys(weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -1132,7 +948,9 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         # SVDQuant LoRA factors + pre_quant_scale are loaded by the quant method
         # (not module params at this point), so they are not "unexpected".
         unexpected = sorted(
-            k for k in (provided - expected) if not k.endswith(_SVDQUANT_PROVIDED_SUFFIXES)
+            k
+            for k in (provided - expected)
+            if not k.endswith(NVFP4SVDLinearMethod.PROVIDED_CKPT_SUFFIXES)
         )
         # Dynamic quantization creates scale parameters while loading Linear
         # modules, so those keys are expected to be absent from BF16 checkpoints.
