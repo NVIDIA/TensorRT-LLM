@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@dev-yanchaol-fix-step-log-retry', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -941,14 +941,18 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             throw e
         }
     } finally {
-        captureSlurmJobNodeList(pipeline, cluster, partition.clusterName, slurmJobID, placementContext, stageName)
-        stage("Clean Up Slurm Resource") {
-            // Workaround to handle the interruption during clean up SLURM resources
-            retry(3) {
-                try {
-                    cleanUpNodeResources(pipeline, cluster, partition.clusterName, nodeName, slurmJobID)
-                } catch (Exception e) {
-                    error "Error during clean up SLURM resources: ${e.getMessage()} and retrying."
+        // Resource cleanup must run even if SLURM metadata capture is interrupted.
+        try {
+            captureSlurmJobNodeList(pipeline, cluster, partition.clusterName, slurmJobID, placementContext, stageName)
+        } finally {
+            stage("Clean Up Slurm Resource") {
+                // Workaround to handle the interruption during clean up SLURM resources
+                retry(3) {
+                    try {
+                        cleanUpNodeResources(pipeline, cluster, partition.clusterName, nodeName, slurmJobID)
+                    } catch (Exception e) {
+                        error "Error during clean up SLURM resources: ${e.getMessage()} and retrying."
+                    }
                 }
             }
         }
@@ -1707,15 +1711,19 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
         stageIsInterrupted = true
         throw e
     } finally {
-        captureSlurmJobNodeList(pipeline, cluster, partition.clusterName, placementContext?.slurmJobId ?: null, placementContext, stageName, jobWorkspace)
-        uploadResults(pipeline, cluster, partition.clusterName, jobUID, stageName, stageIsInterrupted, postTag)
-        stage("Clean Up Slurm Resource") {
-            // Workaround to handle the interruption during clean up SLURM resources
-            retry(3) {
-                try {
-                    cleanUpSlurmResources(pipeline, cluster, partition.clusterName, jobUID)
-                } catch (Exception e) {
-                    error "Error during clean up SLURM resources: ${e.getMessage()} and retrying."
+        // Resource cleanup must run even if metadata capture or result upload is interrupted.
+        try {
+            captureSlurmJobNodeList(pipeline, cluster, partition.clusterName, placementContext?.slurmJobId ?: null, placementContext, stageName, jobWorkspace)
+            uploadResults(pipeline, cluster, partition.clusterName, jobUID, stageName, stageIsInterrupted, postTag)
+        } finally {
+            stage("Clean Up Slurm Resource") {
+                // Workaround to handle the interruption during clean up SLURM resources
+                retry(3) {
+                    try {
+                        cleanUpSlurmResources(pipeline, cluster, partition.clusterName, jobUID)
+                    } catch (Exception e) {
+                        error "Error during clean up SLURM resources: ${e.getMessage()} and retrying."
+                    }
                 }
             }
         }
@@ -2493,6 +2501,12 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                         - SYS_ADMIN"""
         break
     }
+    // Temporarily avoid an arm64 CPU builder with repeated pod DNS/JNLP failures seen in Build-SBSA #5564.
+    def blockedNodeAffinity = targetCloud == "kubernetes-cpu" && arch == "arm64" ? '''
+                              - key: "kubernetes.io/hostname"
+                                operator: NotIn
+                                values:
+                                - "rl300-0021.ipp2a1.colossus"''' : ""
     def nodeLabel = trtllm_utils.generateNodeLabel(nodeLabelPrefix)
     def pvcVolume = """
                 - name: sw-tensorrt-pvc
@@ -2548,6 +2562,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                                 values:
                                 - "core"
                                 - "qa_only"
+${blockedNodeAffinity}
                 nodeSelector: ${selectors}
                 containers:
                   ${containerConfig}
