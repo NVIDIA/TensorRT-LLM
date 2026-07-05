@@ -80,6 +80,16 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # when beam search is enabled.
     beam_width: int = 1
 
+    @property
+    def effective_beam_width(self) -> int:
+        # Only use this for the fallback kernel's beam_width argument.
+        # Cross-attention reads request-scoped encoder K/V that is written once
+        # and reused unchanged by every decoder beam. Metadata preparation still
+        # uses beam_width to expand cross block-offset rows to decoder-sequence
+        # scope, but the fallback kernel should treat the cross K/V cache as
+        # non-beam-packed.
+        return 1 if self.is_cross else self.beam_width
+
     # TrtllmAttention needs to know the max sequence length.
     # Implemented as a property to support no cache mode.
     max_seq_len: Optional[int]
