@@ -34,7 +34,7 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.attention import MLA
+from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm._utils import (get_sm_version, str_dtype_to_binding,
                                  torch_dtype_to_str)
 from tensorrt_llm.functional import PositionEmbeddingType, RopeEmbeddingUtils

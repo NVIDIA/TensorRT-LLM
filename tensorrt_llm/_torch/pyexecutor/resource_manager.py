@@ -643,11 +643,19 @@ class KVCacheManager(BaseResourceManager):
             device='cpu')
         self.blocks_per_window = blocks_per_window
 
-    def probe_prefix_match_length(self, input_tokens, lora_task_id=None):
+    def probe_prefix_match_length(self,
+                                  input_tokens,
+                                  lora_task_id=None,
+                                  cache_salt=None):
         """Probe the KV cache radix tree for prefix match length.
 
         Returns the number of prefix tokens already cached on this rank.
         Used by KVCacheAwareADPRouter for cache-aware routing.
+
+        ``cache_salt`` scopes the probe to the same per-request
+        namespace that ``_create_kv_cache`` uses; without it, salted
+        requests would be probed against the salt=None namespace and the
+        router would see the wrong match length.
         """
         if not self.enable_block_reuse:
             return 0
@@ -664,12 +672,16 @@ class KVCacheManager(BaseResourceManager):
             LlmRequest as CppLlmRequest
         block_key = BlockKey(tokens=input_tokens, lora_task_id=lora_task_id)
         unique_tokens = block_key.unique_tokens
+        # buildBlockKeys() on the C++ side derives the salt id from
+        # cache_salt, so the dummy request must carry the same string used by
+        # the real create_kv_cache path.
         dummy_req = CppLlmRequest(request_id=0,
                                   max_new_tokens=0,
                                   input_tokens=input_tokens,
                                   sampling_config=SamplingConfig(),
                                   is_streaming=False,
-                                  lora_task_id=lora_task_id)
+                                  lora_task_id=lora_task_id,
+                                  cache_salt=cache_salt)
         summary = self.impl.analyze_prefix_reuse(unique_tokens, dummy_req)
         return summary.reusable_blocks_all * self.tokens_per_block
 

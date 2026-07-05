@@ -818,6 +818,37 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         self.seq_len_threshold = self.index_topk
         return self.skip_indexer_for_short_seqs
 
+    @staticmethod
+    def _is_full_indexer_layer(pretrained_config, layer_idx) -> bool:
+        """Whether a DSA layer runs its own indexer ("full") or reuses the
+        previous full layer's top-k ("shared") -- cross-layer indexer sharing.
+
+        Resolved from the HF config: index_topk_pattern, else
+        index_topk_freq/index_skip_topk_offset. The MTP/nextn layer
+        (>= num_hidden_layers) is always full. Defaults to full (a dense
+        per-layer indexer, e.g. DeepSeek-V3.2).
+        """
+        if pretrained_config is None or layer_idx is None:
+            return True
+        n = getattr(pretrained_config, "num_hidden_layers", None)
+        if n is not None and layer_idx >= n:
+            return True  # MTP/nextn layer
+        pattern = getattr(pretrained_config, "index_topk_pattern", None)
+        if pattern is not None:
+            is_full = not (layer_idx < len(pattern)
+                           and str(pattern[layer_idx]).upper() == "S")
+        else:
+            freq = max(getattr(pretrained_config, "index_topk_freq", 1) or 1, 1)
+            offset = getattr(pretrained_config, "index_skip_topk_offset", 2)
+            is_full = (max(layer_idx - offset + 1, 0) % freq) == 0
+        if layer_idx == 0 and not is_full:
+            logger.warning(
+                "DSA layer 0 resolved to 'shared' but has no prior full layer's "
+                "top-k to reuse; forcing it to 'full'. Check index_topk_pattern."
+            )
+            is_full = True
+        return is_full
+
     def to_sparse_params(self, **kwargs):
         from tensorrt_llm._torch.attention_backend.sparse.dsa import DSAParams
 
@@ -843,6 +874,8 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             indexer_rope_interleave=self.indexer_rope_interleave,
             enable_heuristic_topk=self.enable_heuristic_topk,
             indexer_k_dtype=self.indexer_k_dtype,
+            is_full_indexer_layer=self._is_full_indexer_layer(
+                pretrained_config, kwargs.get("layer_idx")),
         )
 
     def to_sparse_metadata_params(self, **kwargs):
@@ -1275,6 +1308,43 @@ class AttentionDpConfig(StrictBaseModel):
         "scatter requests that would otherwise consolidate on a single warm "
         "rank, wasting prefill. Default False preserves pre-warmup routing. "
         "Only used when enable_kv_cache_aware_routing is True.")
+    kv_cache_routing_account_for_in_transfer: bool = Field(
+        default=False,
+        description=
+        "In-transfer load accounting in KV cache-aware routing. When True, "
+        "requests still streaming KV to the GEN worker (tracked by the "
+        "PyExecutor AsyncTransferManager but no longer in active_requests) "
+        "are folded back into the per-rank load reported via RankState. "
+        "This can improve balance under heavy disagg traffic but inflates "
+        "num_active_requests reported upstream, which lets the inference "
+        "loop's idle-fetch wait expire even when no requests are runnable "
+        "and causes empty fetch cycles. Default False preserves the prior "
+        "behaviour (fetch blocks when truly idle). "
+        "Only used when enable_kv_cache_aware_routing is True.")
+    kv_cache_routing_conversation_affinity: bool = Field(
+        default=False,
+        description=
+        "Enable explicit conversation-affinity routing for attention DP. When "
+        "True, the first request of each conversation is round-robined across "
+        "ranks and every subsequent request carrying the same "
+        "conversation_params.conversation_id is pinned to that conversation's "
+        "first-turn rank. OpenAI requests use the body conversation_params as "
+        "canonical; the serve edge only creates conversation_params from the "
+        "X-Session-ID header when the body does not provide it. This keeps a "
+        "multi-turn conversation's KV-cache prefix on one rank (maximizing "
+        "block reuse, minimizing cross-rank migration). Unlike "
+        "enable_kv_cache_aware_routing (affinity inferred from prefix-match "
+        "length, which is lost when blocks are evicted), the conversation->rank "
+        "map is explicit and survives eviction. Falls back to load-balanced "
+        "round-robin when no conversation_id is available. Takes precedence "
+        "over enable_kv_cache_aware_routing when both are set.")
+    kv_cache_routing_max_sessions: int = Field(
+        default=65536,
+        description=
+        "LRU cap on the conversation->rank map used by conversation-affinity "
+        "routing. The oldest conversations are evicted once more than this many "
+        "are tracked, bounding memory on long-running servers. Only used when "
+        "kv_cache_routing_conversation_affinity is True.")
 
     @model_validator(mode='after')
     def validate_attention_dp_config(self) -> 'AttentionDpConfig':
@@ -3297,6 +3367,13 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         status="prototype",
         description="Whether to use the KV cache manager v2 (experimental).")
 
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    enable_swa_scratch_reuse: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Whether KV cache manager v2 uses SWA scratch reuse during prefill.")
+
     kv_cache_event_hash_algo: Literal[
         "auto", "v1_block_key", "v2_sha256", "v2_sha256_64"] = Field(
             default="auto",
@@ -3336,6 +3413,34 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "Number of queued context requests to prefetch disk-tier KV cache blocks to host for. "
         "Set to 0 to disable prefetch. Only effective with KV cache manager v2 and block reuse enabled."
     )
+
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    pool_ratio: Optional[List[float]] = Field(
+        default=None,
+        min_length=1,
+        status="prototype",
+        description=
+        "Initial pool ratios for KV cache manager v2. When used by DeepSeek-V4, "
+        "values map to KVCacheManagerV2 pool_group_id order and must sum to 1.0. "
+        "When set, DeepSeek-V4 uses this directly and avg_seq_len does not take effect."
+    )
+
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    avg_seq_len: Optional[PositiveInt] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "Average sequence length used by DeepSeek-V4 to build the KV cache manager v2 "
+        "typical step. If unset, max_seq_len is used. This does not take effect when "
+        "pool_ratio is set.")
+
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    block_reuse_policy: Literal["all_reusable", "per_request"] = Field(
+        default="all_reusable",
+        status="prototype",
+        description="KV cache manager v2 block reuse policy. "
+        "With SWA scratch reuse and 'all_reusable', only non-scratch "
+        "blocks are saved for reuse.")
 
     def _to_pybind(self):
         config = _KvCacheConfig(
@@ -3436,6 +3541,19 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         if not 0 <= v <= 1:
             raise ValueError(
                 "kv_cache_config.max_util_for_resume must be between 0 and 1")
+        return v
+
+    @field_validator('pool_ratio')
+    @classmethod
+    def validate_pool_ratio(cls, v: Optional[List[float]]):
+        if v is None:
+            return v
+        if any(r <= 0 for r in v):
+            raise ValueError(
+                "kv_cache_config.pool_ratio values must be positive")
+        if not math.isclose(sum(v), 1.0, rel_tol=0.0, abs_tol=1e-6):
+            raise ValueError(
+                "kv_cache_config.pool_ratio values must sum to 1.0")
         return v
 
 
@@ -3738,12 +3856,18 @@ class BaseLlmArgs(StrictBaseModel):
 
     iter_stats_max_iterations: Optional[int] = Field(
         default=None,
-        description="The maximum number of iterations for iter stats.",
+        ge=-1,
+        description=
+        "The maximum number of iterations for iter stats. Set to -1 to keep all iteration stats. "
+        "Set to 0 to disable iteration stats in the TensorRT executor.",
         status="prototype")
 
     request_stats_max_iterations: Optional[int] = Field(
         default=None,
-        description="The maximum number of iterations for request stats.",
+        ge=-1,
+        description=
+        "The maximum number of iterations for request stats. Set to -1 to keep all request stats. "
+        "Set to 0 to disable request stats.",
         status="prototype")
 
     # A handful of options from PretrainedConfig
@@ -4655,6 +4779,32 @@ class TorchLlmArgs(BaseLlmArgs):
         description="DWDP (Distributed Weight Data Parallelism) config.",
         status="prototype")
 
+    encoder_max_batch_size: Optional[int] = Field(
+        default=None,
+        description=(
+            "Maximum batch size for the multimodal encoder's AttentionMetadata. "
+            "Falls back to `max_batch_size` when unset. This budget is shared "
+            "proportionately across all modalities the model encodes, not set "
+            "per modality; per-modality knobs may be added later."),
+        status="prototype")
+
+    encoder_max_num_tokens: Optional[int] = Field(
+        default=None,
+        description=(
+            "Maximum number of tokens for the multimodal encoder's "
+            "AttentionMetadata. Falls back to `max_num_tokens` when unset. This "
+            "budget is shared proportionately across all modalities the model "
+            "encodes, not set per modality; per-modality knobs may be added "
+            "later."),
+        status="prototype")
+
+    @field_validator("encoder_max_batch_size", "encoder_max_num_tokens")
+    @classmethod
+    def validate_encoder_runtime_sizes(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v <= 0:
+            raise ValueError("must be a positive integer when set")
+        return v
+
     attn_backend: str = Field(
         default='TRTLLM',
         description="Attention backend to use.",
@@ -4918,8 +5068,19 @@ class TorchLlmArgs(BaseLlmArgs):
 
     max_stats_len: int = Field(
         default=1000,
-        description="The max number of performance statistic entries.",
-        status="prototype")
+        ge=-1,
+        description=
+        "The max number of performance statistic entries. Set to -1 to keep all entries. "
+        "Set to 0 to use a minimum buffer size of 1.",
+        status="prototype",
+    )
+
+    @field_validator('max_stats_len')
+    @classmethod
+    def normalize_max_stats_len(cls, v):
+        if v == -1:
+            return v
+        return max(v, 1)
 
     layer_wise_benchmarks_config: LayerwiseBenchmarksConfig = Field(
         default_factory=LayerwiseBenchmarksConfig,
@@ -4944,6 +5105,20 @@ class TorchLlmArgs(BaseLlmArgs):
     @quant_config.setter
     def quant_config(self, value: QuantConfig):
         self._quant_config = value
+
+    def get_encoder_runtime_sizes(self) -> Tuple[int, int]:
+        """Return encoder runtime batch and token limits.
+
+        Returns `(encoder_max_batch_size, encoder_max_num_tokens)`, falling
+        back to the LLM-side `max_batch_size` / `max_num_tokens` when the
+        encoder-specific knobs are not set.
+        """
+        return (
+            self.encoder_max_batch_size
+            if self.encoder_max_batch_size is not None else self.max_batch_size,
+            self.encoder_max_num_tokens
+            if self.encoder_max_num_tokens is not None else self.max_num_tokens,
+        )
 
     # TODO: remove backend later
     backend: Literal["pytorch"] = Field(

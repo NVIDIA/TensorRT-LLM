@@ -43,6 +43,7 @@ from ..modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from .modeling_auto import AutoModelForCausalLM
+from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_mixin import MultimodalModelMixin
 from .modeling_multimodal_utils import (
     filter_mm_token_from_input_ids,
@@ -74,13 +75,13 @@ def _expand_prompt_token_ids_for_mm_handoff(
     image_token_id: int,
     video_token_id: int,
     vision_start_token_id: int,
-    placeholder_id: int,
 ) -> DisaggPrefillMultimodalInputs:
     """Expand Qwen3-VL image/video placeholders and emit sparse MM layout.
 
     Qwen handoff has one coarse <image_pad> or <video_pad> token per item.
     This helper expands that one token to the number of embedding rows in the
-    handoff handle, then returns the sparse layout metadata.
+    handoff handle using the original in-vocab placeholder token, then returns
+    the sparse layout metadata.
 
     Agg gets this expansion from Qwen's HF processor taking raw images/videos
     as inputs. Reusing that would be wasteful here, hence this helper that
@@ -128,7 +129,7 @@ def _expand_prompt_token_ids_for_mm_handoff(
         run_start = write_pos - 1 if has_leading_special else write_pos
         prompt_mm_length = mm_token_num + int(has_leading_special)
 
-        expanded_ids[write_pos : write_pos + mm_token_num] = placeholder_id
+        expanded_ids[write_pos : write_pos + mm_token_num] = token_id
         mm_token_offsets.append(run_start)
         mm_token_lengths.append(prompt_mm_length)
         multimodal_embedding_lengths.append(mm_token_num)
@@ -201,6 +202,12 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         # so the per-grid block is a plain ``np.indices`` lattice (no
         # ``tokens_per_second`` scaling).
         return np.indices((llm_grid_t, llm_grid_h, llm_grid_w)).reshape(3, -1)
+
+    # Deterministic dummy-input sizing (`spatial_merge_unit`,
+    # `_num_vision_tokens`, `get_size_for_max_tokens`) and the
+    # `get_num_tokens_per_image` override are inherited unchanged from
+    # `Qwen2VLInputProcessorBase` -- the grid math and the HF `smart_resize`
+    # it defers to are identical for Qwen3-VL.
 
     @classmethod
     def get_rope_index(
@@ -353,7 +360,6 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             image_token_id=self.config.image_token_id,
             video_token_id=self.config.video_token_id,
             vision_start_token_id=self.config.vision_start_token_id,
-            placeholder_id=self.tllm_multimodal_token_id,
         )
 
 
@@ -629,7 +635,7 @@ def _triton_pos_embed_interpolate(
     return output
 
 
-class Qwen3VisionModel(torch.nn.Module):
+class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__()
         self.model_config = model_config
@@ -703,19 +709,38 @@ class Qwen3VisionModel(torch.nn.Module):
 
         self.attn_metadata: Optional[AttentionMetadata] = None
 
-        # Pre-allocated `arange` for the vision block's
-        # `rope_position_ids`; per-call code just slices `[:seq_len]`
-        # instead of allocating a fresh `(seq_len,) int32` + H->D copy.
-        # TODO: Make capacity dynamic with the encoder's `max_num_tokens`.
-        self.register_buffer(
-            "_rope_position_ids_buffer",
-            torch.arange(32768, dtype=torch.int32, device="cuda"),
-            persistent=False,
-        )
+        # Vision block's `rope_position_ids` scratch. Registered empty here;
+        # `setup_attn_metadata` allocates it as an `arange` (see there).
+        self.register_buffer("_rope_position_ids_buffer", None, persistent=False)
 
     @property
     def device(self) -> torch.device:
         return self.patch_embed.proj.weight.device
+
+    def setup_attn_metadata(self, max_num_requests: int, max_num_tokens: int) -> None:
+        # Override the mixin default: each image / video frame is its own
+        # attention segment (``seq_lens.extend([h * w] * t)`` in ``forward``),
+        # so a single multi-image or video request can produce many more
+        # segments than ``max_batch_size``. The number of segments in one
+        # encoder forward is bounded by the token budget (every segment holds
+        # at least one token), NOT by the request count -- so floor the
+        # metadata's request capacity at ``max_num_tokens`` to keep the
+        # per-request buffers (prompt_lens / host_request_types / kv_lens) from
+        # overflowing when ``num_contexts`` is set to the segment count.
+        max_num_requests = max(max_num_requests, max_num_tokens)
+        self.attn_metadata = self.metadata_cls(
+            max_num_requests=max_num_requests,
+            max_num_tokens=max_num_tokens,
+            kv_cache_manager=None,
+        )
+        # Pre-allocate the vision-block ``rope_position_ids`` as an ``arange``
+        # sized to the encoder's ``max_num_tokens`` (engine-driven) so per-call
+        # code just slices ``[:seq_len]`` instead of allocating a fresh
+        # ``(seq_len,) int32`` + H->D copy; ``forward`` still grows it on the
+        # rare miss above the budget (e.g. packed multi-video batches).
+        self._rope_position_ids_buffer = torch.arange(
+            max_num_tokens, dtype=torch.int32, device=self.device
+        )
 
     @staticmethod
     @lru_cache(maxsize=1024)
@@ -837,10 +862,9 @@ class Qwen3VisionModel(torch.nn.Module):
         attn_metadata: Optional[AttentionMetadata] = None,
     ):
         if attn_metadata is None:
-            attn_metadata = self.metadata_cls(
-                max_num_requests=8192,  # TODO: Make this dynamic
-                max_num_tokens=8192,  # TODO: Make this dynamic
-                kv_cache_manager=None,
+            raise RuntimeError(
+                "Vision encoder AttentionMetadata is not initialized. "
+                "It must be set up before the encoder forward runs."
             )
         return _prepare_qwen_vl_vision_attn_metadata(seq_lens, attn_metadata)
 
@@ -873,7 +897,10 @@ class Qwen3VisionModel(torch.nn.Module):
         # the gate clears when `head_dim % 64 == 0`. Keep the pre-allocated
         # buffer large enough for packed multi-video batches.
         seq_len = hidden_states.shape[0]
-        if seq_len > self._rope_position_ids_buffer.numel():
+        if (
+            self._rope_position_ids_buffer is None
+            or seq_len > self._rope_position_ids_buffer.numel()
+        ):
             self._rope_position_ids_buffer = torch.arange(
                 seq_len, dtype=torch.int32, device=self.device
             )
@@ -1035,7 +1062,23 @@ class Qwen3VisionModelBase(nn.Module):
         return embeds
 
 
-class Qwen3VLModelBase(PreTrainedModel):
+class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
+    def encode_multimodal_inputs(
+        self, multimodal_params: List[MultimodalParams], **encoder_kwargs: Any
+    ) -> torch.Tensor:
+        """Uniform encoder entry (``MultimodalModelMixin`` contract).
+
+        Runs the vision encoder over ``multimodal_params`` and returns the
+        embeddings as a single tensor (Qwen3-VL folds deepstack streams into
+        the hidden dim, so the single-tensor contract holds). Used by the
+        startup memory profiler to invoke the encoder directly; the model's
+        own ``forward`` keeps its custom deepstack fusion path.
+        """
+        mm_embeds = get_multimodal_embeddings(
+            encoder_forward_fn=self.mm_encoder.forward, multimodal_params=list(multimodal_params)
+        )
+        return mm_embeds[0]
+
     def _check_and_adjust_experts_implementation(self, *args, **kwargs):
         """No-op override.
 
@@ -1137,7 +1180,7 @@ class Qwen3VLModelBase(PreTrainedModel):
         if self.use_deepstack:
             # Pre-allocated `(L, max_num_tokens, hidden)` scratch buffer for
             # per-layer deepstack embeddings; replaces `L` fresh
-            # `torch.zeros` + `L` scatters per prefill (vLLM-style).
+            # `torch.zeros` + `L` scatters per prefill.
             # `persistent=False` keeps it out of `state_dict`.
             self.register_buffer(
                 "deepstack_input_embeds",
@@ -1151,7 +1194,23 @@ class Qwen3VLModelBase(PreTrainedModel):
                 persistent=False,
             )
 
+        # Surface the in-vocab image / video placeholder IDs to the model
+        # engine's ``_prepare_multimodal_indices`` so it selects the
+        # ``torch.isin`` predicate.
+        _mm_ids = [
+            tid
+            for tid in (
+                getattr(config, "image_token_id", None),
+                getattr(config, "video_token_id", None),
+            )
+            if tid is not None
+        ]
+        self._mm_token_ids = torch.tensor(_mm_ids, dtype=torch.int32)
         self.post_config()
+
+    @property
+    def mm_token_ids(self) -> torch.Tensor:
+        return self._mm_token_ids
 
     def post_config(self):
         # use llm.config as config for pytorch model engine
@@ -1294,6 +1353,7 @@ class Qwen3VLModelBase(PreTrainedModel):
             text_token_indices, mm_token_indices = filter_mm_token_from_input_ids(
                 input_ids,
                 vocab_size=self.llm.model.embed_tokens.num_embeddings,
+                mm_token_ids=self.mm_token_ids,
             )
 
         # Expand the per-level deepstack mm embeddings into the pre-allocated

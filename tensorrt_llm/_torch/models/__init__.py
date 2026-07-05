@@ -1,8 +1,9 @@
 import transformers
 
 # Importing _torch.configs triggers AutoConfig registration for TRT-LLM-only
-# model_types (deepseek_v32, kimi_k2) so AutoTokenizer.from_pretrained works
-# under transformers >= 5.5; see _torch/configs/__init__.py.
+# model_types (deepseek_v32, kimi_k2, gemma4_unified) so AutoConfig /
+# AutoTokenizer.from_pretrained work under transformers >= 5.5; see
+# _torch/configs/__init__.py.
 import tensorrt_llm._torch.configs  # noqa: F401
 
 from .modeling_afmoe import AfmoeForCausalLM
@@ -20,6 +21,9 @@ from .modeling_exaone4_5 import Exaone4_5_ForConditionalGeneration
 from .modeling_exaone_moe import ExaoneMoeForCausalLM
 from .modeling_gemma3 import Gemma3ForCausalLM
 from .modeling_gemma3vl import Gemma3VLM
+from .modeling_gemma4 import Gemma4ForCausalLM
+from .modeling_gemma4_unified import Gemma4UnifiedForConditionalGeneration
+from .modeling_gemma4mm import Gemma4ForConditionalGeneration
 from .modeling_glm import Glm4MoeForCausalLM
 from .modeling_gpt_oss import GptOssForCausalLM
 from .modeling_hunyuan_dense import HunYuanDenseV1ForCausalLM
@@ -74,6 +78,9 @@ __all__ = [
     "ExaoneMoeForCausalLM",
     "Gemma3ForCausalLM",
     "Gemma3VLM",
+    "Gemma4ForCausalLM",
+    "Gemma4ForConditionalGeneration",
+    "Gemma4UnifiedForConditionalGeneration",
     "HCXVisionForCausalLM",
     "LagunaForCausalLM",
     "HunYuanDenseV1ForCausalLM",
@@ -130,15 +137,3 @@ else:
     print(
         f"Failed to import MllamaForConditionalGeneration as transformers.__version__ {transformers.__version__} < 4.45.1"
     )
-
-# Gemma4 requires transformers>=5.5.0 (native Gemma4 config/model classes).
-# Import silently on failure -- `get_model_architecture` in modeling_utils.py
-# raises a targeted "upgrade transformers" error only when the user actually
-# tries to load a Gemma4 model.
-try:
-    from .modeling_gemma4 import Gemma4ForCausalLM  # noqa
-    from .modeling_gemma4mm import Gemma4ForConditionalGeneration  # noqa
-
-    __all__.extend(["Gemma4ForCausalLM", "Gemma4ForConditionalGeneration"])
-except ImportError:
-    pass

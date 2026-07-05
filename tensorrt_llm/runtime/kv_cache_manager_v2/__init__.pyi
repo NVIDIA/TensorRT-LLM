@@ -86,6 +86,14 @@ class KVCacheIterationStatsDelta:
     iter_offload_bytes: int = 0
     iter_intra_device_copy_blocks: int = 0
     iter_intra_device_copy_bytes: int = 0
+    iter_host_dropped_blocks: int = 0
+    iter_host_dropped_bytes: int = 0
+
+@dataclass(slots=True, frozen=True)
+class PoolGroupPeakBlockStats:
+    available: int
+    unavailable: int
+    evictable: int
 
 # From _config.py
 DataRole = NewType("DataRole", str)
@@ -171,6 +179,7 @@ class KVCacheManagerConfig:
     enable_partial_reuse: bool = True
     constraints: list[BatchDesc] = ...
     typical_step: BatchDesc | None = None
+    initial_pool_ratio: list[float] | None = None
     ssm_reuse_interval: int = 512
     swa_scratch_reuse: SwaScratchReuseConfig | None = None
     enable_stats: bool = True
@@ -449,6 +458,9 @@ class KVCacheManager:
     def get_quota(self, cache_level: CacheLevel) -> int: ...
     def get_committed_stats(self) -> KVCacheStatsDelta: ...
     def get_and_reset_iteration_stats(self) -> dict[LifeCycleId, KVCacheIterationStatsDelta]: ...
+    def get_and_reset_iteration_peak_block_stats(
+        self, cache_level: CacheLevel
+    ) -> Sequence[PoolGroupPeakBlockStats]: ...
     def mark_stats_dirty(self, kv_cache_id: int | None) -> None: ...
     def clear_stats_dirty(self, kv_cache_id: int | None) -> None: ...
     def get_dirty_stats_kv_cache_ids(self) -> set[int]: ...

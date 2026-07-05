@@ -1,0 +1,108 @@
+{
+    "subjects": [
+      {
+        "description": "Blurry, poorly defined subjects with inconsistent shapes and unrealistic proportions.",
+        "appearance_details": "Distorted features, visible compression artifacts, muddy textures lacking fine detail, color bleeding between elements, and unnatural skin tones or surface textures that appear artificial or computer-generated.",
+        "relationship": "Subjects appear disconnected from the environment, floating or improperly grounded in the scene without proper occlusion or spatial coherence.",
+        "location": "Subjects are poorly placed within the frame, appearing at awkward positions that violate basic compositional rules.",
+        "relative_size": "Inconsistent scale relationships between subjects and the environment, with objects appearing too large or too small relative to their surroundings.",
+        "orientation": "Unnatural orientations that defy physics and spatial logic.",
+        "pose": "Stiff, mannequin-like poses with unnatural joint angles and impossible limb positions that look computer-generated.",
+        "action": "Incoherent motion with visible frame-to-frame discontinuities. Movement appears as a slideshow rather than smooth animation. Limbs and appendages pop between positions without interpolation.",
+        "state_changes": "Visual state transitions are abrupt and jarring. Colors shift without motivation. Surface textures flicker between different materials randomly. Outlines shimmer and vibrate.",
+        "clothing": "Clothing appears painted on with no sense of material weight or drape. Fabric textures are flat and repeat visibly.",
+        "expression": "Frozen, uncanny valley expressions or expressions that change abruptly without natural transition.",
+        "gender": "",
+        "age": "",
+        "skin_tone_and_texture": "Waxy, plastic-looking skin with visible artifacts and inconsistent texture resolution across the frame.",
+        "facial_features": "Asymmetric facial features, extra fingers or limbs, teeth that appear blurry or malformed.",
+        "number_of_subjects": 0,
+        "number_of_arms": 0,
+        "number_of_legs": 0
+      },
+      {
+        "description": "Extremely low-quality subjects with visible rendering artifacts, broken mesh geometry, and completely unrealistic proportions throughout.",
+        "appearance_details": "Distorted features, visible compression artifacts, muddy textures lacking fine detail, color bleeding between elements, and unnatural skin tones or surface textures that appear artificial or computer-generated.",
+        "relationship": "Subjects appear disconnected from the environment, floating or improperly grounded in the scene without proper occlusion or spatial coherence.",
+        "location": "Subjects are poorly placed within the frame, appearing at awkward positions that violate basic compositional rules.",
+        "relative_size": "Inconsistent scale relationships between subjects and the environment, with objects appearing too large or too small relative to their surroundings.",
+        "orientation": "Unnatural orientations that defy physics and spatial logic.",
+        "pose": "Stiff, mannequin-like poses with unnatural joint angles and impossible limb positions that look computer-generated.",
+        "action": "Incoherent motion with visible frame-to-frame discontinuities. Movement appears as a slideshow rather than smooth animation. Limbs and appendages pop between positions without interpolation.",
+        "state_changes": "Visual state transitions are abrupt and jarring. Colors shift without motivation. Surface textures flicker between different materials randomly. Outlines shimmer and vibrate.",
+        "clothing": "Clothing appears painted on with no sense of material weight or drape. Fabric textures are flat and repeat visibly.",
+        "expression": "Frozen, uncanny valley expressions or expressions that change abruptly without natural transition.",
+        "gender": "",
+        "age": "",
+        "skin_tone_and_texture": "Waxy, plastic-looking skin with visible artifacts and inconsistent texture resolution across the frame.",
+        "facial_features": "Asymmetric facial features, extra fingers or limbs, teeth that appear blurry or malformed.",
+        "number_of_subjects": 0,
+        "number_of_arms": 0,
+        "number_of_legs": 0
+      },
+      {
+        "description": "Poorly generated subjects exhibiting all hallmarks of failed neural rendering \u2014 flickering edges, inconsistent depth, and uncanny spatial relationships.",
+        "appearance_details": "Distorted features, visible compression artifacts, muddy textures lacking fine detail, color bleeding between elements, and unnatural skin tones or surface textures that appear artificial or computer-generated.",
+        "relationship": "Subjects appear disconnected from the environment, floating or improperly grounded in the scene without proper occlusion or spatial coherence.",
+        "location": "Subjects are poorly placed within the frame, appearing at awkward positions that violate basic compositional rules.",
+        "relative_size": "Inconsistent scale relationships between subjects and the environment, with objects appearing too large or too small relative to their surroundings.",
+        "orientation": "Unnatural orientations that defy physics and spatial logic.",
+        "pose": "Stiff, mannequin-like poses with unnatural joint angles and impossible limb positions that look computer-generated.",
+        "action": "Incoherent motion with visible frame-to-frame discontinuities. Movement appears as a slideshow rather than smooth animation. Limbs and appendages pop between positions without interpolation.",
+        "state_changes": "Visual state transitions are abrupt and jarring. Colors shift without motivation. Surface textures flicker between different materials randomly. Outlines shimmer and vibrate.",
+        "clothing": "Clothing appears painted on with no sense of material weight or drape. Fabric textures are flat and repeat visibly.",
+        "expression": "Frozen, uncanny valley expressions or expressions that change abruptly without natural transition.",
+        "gender": "",
+        "age": "",
+        "skin_tone_and_texture": "Waxy, plastic-looking skin with visible artifacts and inconsistent texture resolution across the frame.",
+        "facial_features": "Asymmetric facial features, extra fingers or limbs, teeth that appear blurry or malformed.",
+        "number_of_subjects": 0,
+        "number_of_arms": 0,
+        "number_of_legs": 0
+      }
+    ],
+    "background_setting": "A poorly rendered, flat background with visible seams, repeated textures, and inconsistent depth cues. The environment lacks volumetric depth and appears as a painted backdrop rather than a three-dimensional space. Vegetation looks like flat cutouts with no volumetric depth. The background appears to have been composited from multiple source materials at different resolutions, creating visible seams and edge artifacts where elements meet. Textures swim and shift across surfaces in a way that breaks the illusion of solidity \u2014 patterns drift laterally rather than staying anchored to the geometry they belong to. Background elements flicker in and out of existence between frames, particularly at the edges of the field of view. The rendering resolution is visibly lower for distant elements, creating a jarring transition between near and far objects. Cloud textures repeat obviously in the sky with visible tiling. Water surfaces lack proper reflection and refraction, appearing as flat animated textures. Fog and atmospheric effects pop in and out rather than smoothly transitioning. Trees and vegetation exhibit obvious LOD (level-of-detail) switching. Building facades have inconsistent window spacing and pattern repetition. The overall scene feels like a poorly assembled collage of individually rendered elements rather than a coherent whole.",
+    "lighting": {
+      "conditions": "Harsh, flat lighting with no natural variation. The scene appears uniformly lit as if by a single overhead fluorescent light, removing all sense of depth and atmosphere.",
+      "direction": "Inconsistent light sources \u2014 shadows point in multiple contradictory directions, breaking physical plausibility.",
+      "shadows": "Hard-edged, unrealistic shadows that pop in and out of existence between frames. Some objects cast no shadows while others have impossibly dark ones that don't animate smoothly with the object's motion. Shadow edges exhibit visible staircase aliasing artifacts. Shadow maps appear to have been rendered at extremely low resolution, creating blocky patterns. Self-shadowing on characters shows visible peter-panning artifacts where shadows detach from their source. Contact shadows between objects and the ground appear and disappear as objects move slightly. Shadow color is pure black with no ambient contribution, creating an unnaturally harsh contrast that flattens the image. Multiple shadow cascades have visible boundaries where resolution changes. The shadow rendering appears to be temporally unstable \u2014 even static objects have shadows that shimmer and crawl frame to frame, breaking the illusion of a stable light source.",
+      "illumination_effect": "No bounce light, no ambient occlusion, no subtle color interactions between surfaces. The scene looks like a poorly lit 3D render from the early 2000s."
+    },
+    "aesthetics": {
+      "composition": "Cluttered, poorly framed composition with no clear focal point. Important elements are cut off by the frame edges. The rule of thirds is completely ignored, leading to an unbalanced and visually unpleasant arrangement.",
+      "color_scheme": "Oversaturated, garish colors that clash violently. Color banding is visible in gradient areas. The overall palette feels artificial and digitally processed rather than natural.",
+      "mood_atmosphere": "Unsettling, uncanny atmosphere that fails to evoke any intended emotional response. The scene feels lifeless and sterile despite attempting to portray dynamic action.",
+      "patterns": "Visible tiling artifacts in textures, moir\u00e9 patterns, and aliasing on edges."
+    },
+    "cinematography": {
+      "camera_motion": "Extremely shaky, unstable camera with visible rolling shutter artifacts. The motion is jerky and discontinuous, causing motion sickness and making the scene impossible to follow.",
+      "framing": "Poorly framed shots that cut off important elements and include unnecessary empty space.",
+      "camera_angle": "Awkward, disorienting camera angles that provide no useful spatial information about the scene. The camera path exhibits visible mathematical artifacts suggesting simple interpolation between keyframes rather than natural camera operation. Camera motion is completely disconnected from the scene content \u2014 panning away from action, dollying during dialogue, and shaking during still moments. The camera appears to pass through solid objects occasionally. Zoom is applied digitally rather than optically, revealing progressively worse resolution. Camera motion exhibits non-physical acceleration profiles \u2014 instant starts and stops rather than smooth ease-in/ease-out. Rolling shutter simulation is applied inconsistently, present in some frames but not others. The camera occasionally exhibits impossible motion like teleporting between positions. Virtual camera stabilization creates an uncanny floating sensation disconnected from any physical camera rig.",
+      "depth_of_field": "Uniform focus throughout, creating a flat, documentary-like appearance with no cinematic depth separation.",
+      "focus": "Soft, out-of-focus imagery with visible chromatic aberration and lens distortion that was not corrected in post-processing.",
+      "lens_focal_length": "Inappropriate focal length causing barrel distortion and unnatural perspective compression."
+    },
+    "style_medium": "Low quality compressed digital video with visible encoding artifacts",
+    "artistic_style": "Amateur, unpolished with inconsistent visual style",
+    "context": "A poorly produced video with numerous technical and artistic flaws that detract from any intended narrative or visual impact.",
+    "actions": [
+      {
+        "time": "0:00-0:08",
+        "description": "Subjects attempt to move but their motion is jerky, temporally inconsistent, and physically implausible. Background elements flicker and shift between frames."
+      }
+    ],
+    "text_and_signage_elements": [],
+    "segments": [
+      {
+        "segment_index": 0,
+        "time_range": "0:00-0:08",
+        "description": "A single continuous shot suffering from severe temporal inconsistencies \u2014 subjects that morph and deform between frames, backgrounds that shift and wobble, and rendering quality that fluctuates visibly over time. Motion blur is applied incorrectly, smearing in directions that don't match actual movement. Frame-to-frame coherence breaks down with individual pixels changing color randomly in flat areas. Texture detail level fluctuates between frames as if the rendering budget varied shot to shot. Color grading drifts over the duration with no creative motivation. Noise patterns change between frames in ways that draw attention rather than being invisible. Overall visual quality degrades progressively from start to finish.",
+        "key_changes": "No meaningful progression or narrative development. Visual quality degrades over time.",
+        "camera": "Unstable, poorly controlled camera work with visible mathematical interpolation artifacts."
+      }
+    ],
+    "transitions": [],
+    "temporal_caption": "The scene opens at 0.0 seconds with a poorly rendered establishing shot that immediately reveals low production quality. At 1.0 seconds, subjects begin to move but their motion is jerky and inconsistent, with limbs bending at unnatural angles and objects clipping through each other. From 2.0 to 4.0 seconds, the camera shakes violently while the scene exhibits visible compression artifacts, color banding in the sky, and flickering in the shadows. Between 4.0 and 6.0 seconds, temporal coherence breaks down as elements appear and disappear between frames, textures swim and morph unnaturally, and the lighting shifts abruptly without physical cause. In the final 2 seconds, the overall visual quality deteriorates further with increasing noise, blur, and a general loss of spatial coherence that makes the scene nearly unwatchable. Additionally, the frame rate appears inconsistent with visible judder and stuttering throughout. Color temperature shifts randomly between warm and cool tones with no motivation. The encode quality degrades in complex regions showing macro-blocking and mosquito noise around moving edges. Temporal noise patterns are spatially correlated, creating swimming artifacts on flat surfaces.",
+    "audio_description": "",
+    "physical_realism": "No adherence to physical laws. Objects defy gravity, pass through solid surfaces, and change mass and momentum without cause. Fluid dynamics, cloth simulation, and rigid body physics are all fundamentally broken. Furthermore, conservation of energy is violated as objects gain or lose kinetic energy spontaneously. Elastic collisions produce inelastic results and vice versa. Surface friction is inconsistent \u2014 objects slide on rough surfaces while sticking to smooth ones. Air resistance appears to affect only some objects while others move through the atmosphere unimpeded."
+  }
