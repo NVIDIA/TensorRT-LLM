@@ -235,7 +235,10 @@ def _visual_gen_deps(llm_venv):
     """Install av + diffusers + ffmpeg once per session (shared by all video-gen fixtures)."""
     llm_venv.run_cmd(["-m", "pip", "install", "av"])
     llm_venv.run_cmd(["-m", "pip", "install", "diffusers>=0.37.0"])
-    # Install ffmpeg system package required by save_video() for MP4 encoding
+    # Skip apt-get when ffmpeg is already present: it is typically preinstalled in
+    # the container image, and apt-get requires root which is not always available.
+    if shutil.which("ffmpeg"):
+        return
     check_call(["apt-get", "update", "-y"], shell=False)
     check_call(["apt-get", "install", "-y", "ffmpeg"], shell=False)
 
