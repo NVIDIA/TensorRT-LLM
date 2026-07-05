@@ -198,7 +198,9 @@ class SequenceSharder:
         start = self._rank * chunk
         idx = [slice(None)] * tensor.ndim
         idx[dim] = slice(start, start + chunk)
-        return tensor[tuple(idx)]
+        # A dim>=1 block slice is non-contiguous when a leading dim is >1 (e.g.
+        # batched CFG B=2); fused DiT kernels need a dense buffer. No-op at B==1.
+        return tensor[tuple(idx)].contiguous()
 
     def shard_rope(
         self,

@@ -64,6 +64,7 @@ def test_to_disaggregated_params():
                 "cached_tokens": 4,
             },
         },
+        conversation_id="conv-abc",
     )
     openai_params = to_disaggregated_params(llm_params)
 
@@ -74,6 +75,7 @@ def test_to_disaggregated_params():
     assert openai_params.ctx_info_endpoint == "tcp://10.0.0.1:5000"
     assert openai_params.ctx_usage.prompt_tokens == 10
     assert openai_params.ctx_usage.prompt_tokens_details.cached_tokens == 4
+    assert openai_params.conversation_id == "conv-abc"
 
 
 def test_to_llm_disaggregated_params():
@@ -94,6 +96,7 @@ def test_to_llm_disaggregated_params():
             total_tokens=10,
             prompt_tokens_details=PromptTokensDetails(cached_tokens=4),
         ),
+        conversation_id="conv-xyz",
     )
     llm_params = to_llm_disaggregated_params(openai_params)
 
@@ -103,6 +106,26 @@ def test_to_llm_disaggregated_params():
     assert llm_params.ctx_info_endpoint == "tcp://10.0.0.1:5000"
     assert llm_params.ctx_usage["prompt_tokens"] == 10
     assert llm_params.ctx_usage["prompt_tokens_details"]["cached_tokens"] == 4
+    assert llm_params.conversation_id == "conv-xyz"
+
+
+def test_disaggregated_params_conversation_id():
+    """conversation_id defaults to None and survives the serve<->llm round-trip."""
+    from tensorrt_llm.serve.openai_protocol import DisaggregatedParams as OpenAIDisaggregatedParams
+    from tensorrt_llm.serve.openai_protocol import (
+        to_disaggregated_params,
+        to_llm_disaggregated_params,
+    )
+
+    assert DisaggregatedParams().conversation_id is None
+
+    # serve -> llm -> serve preserves the conversation id end to end.
+    openai_params = OpenAIDisaggregatedParams(
+        request_type="context_only", conversation_id="conv-roundtrip"
+    )
+    llm_params = to_llm_disaggregated_params(openai_params)
+    assert llm_params.conversation_id == "conv-roundtrip"
+    assert to_disaggregated_params(llm_params).conversation_id == "conv-roundtrip"
 
 
 @patch("tensorrt_llm.disaggregated_params.tllme")
