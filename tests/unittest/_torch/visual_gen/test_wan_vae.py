@@ -138,7 +138,7 @@ def test_wan22_ti2v_vae_matches_diffusers_decode_checkpoint(
 ):
     checkpoint_dir = _require_wan22_ti2v_checkpoint()
     reference_vae, wan_vae = _make_reference_and_wan_vae(checkpoint_dir)
-    assert wan_vae.config.is_residual is True  # residual encoder/decoder path
+    assert wan_vae.config.is_residual is True
 
     torch.manual_seed(1)
     frames = 81
@@ -185,7 +185,7 @@ def test_wan22_ti2v_vae_matches_diffusers_encode_checkpoint(
 ):
     checkpoint_dir = _require_wan22_ti2v_checkpoint()
     reference_vae, wan_vae = _make_reference_and_wan_vae(checkpoint_dir)
-    assert wan_vae.config.is_residual is True  # residual encoder/decoder path
+    assert wan_vae.config.is_residual is True
 
     torch.manual_seed(2)
     video = (
@@ -222,7 +222,7 @@ def test_wan22_ti2v_vae_matches_diffusers_encode_checkpoint(
 def test_wan21_t2v_vae_matches_diffusers_decode_checkpoint():
     checkpoint_dir = _require_wan21_t2v_1p3b_checkpoint()
     reference_vae, wan_vae = _make_reference_and_wan_vae(checkpoint_dir)
-    assert wan_vae.config.is_residual is False  # non-residual encoder/decoder path
+    assert wan_vae.config.is_residual is False
 
     torch.manual_seed(1)
     frames, height, width = 81, 480, 832
@@ -249,7 +249,7 @@ def test_wan21_t2v_vae_matches_diffusers_decode_checkpoint():
 def test_wan21_t2v_vae_matches_diffusers_encode_checkpoint():
     checkpoint_dir = _require_wan21_t2v_1p3b_checkpoint()
     reference_vae, wan_vae = _make_reference_and_wan_vae(checkpoint_dir)
-    assert wan_vae.config.is_residual is False  # non-residual encoder/decoder path
+    assert wan_vae.config.is_residual is False
 
     torch.manual_seed(2)
     height, width = 480, 832

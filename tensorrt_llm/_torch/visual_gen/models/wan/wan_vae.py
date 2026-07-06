@@ -100,6 +100,39 @@ def _to_device_if_needed(x: torch.Tensor, device: torch.device) -> torch.Tensor:
     return x.to(device)
 
 
+def _causal_conv_with_cache(
+    conv: "WanCausalConv3d",
+    x: torch.Tensor,
+    feat_cache: list[torch.Tensor | str | None],
+    feat_idx: list[int],
+) -> torch.Tensor:
+    """Run a causal Conv3d while threading the trailing-frame cache.
+
+    Encapsulates the cache protocol shared by every plain causal conv call site
+    (encoder/decoder ``conv_in`` / ``conv_out`` and both convs of
+    ``WanResidualBlock``): take the last ``CACHE_T`` frames as the next chunk's
+    left context, backfill from the previous cache when the current chunk is
+    shorter than the temporal kernel, run the conv against the previous cache,
+    then store the new cache and advance ``feat_idx``. The ``WanResample``
+    up/downsample paths use a different ("Rep"-sentinel) protocol and are not
+    routed through here.
+    """
+    idx = feat_idx[0]
+    cache_x = x[:, :, -CACHE_T:, :, :]
+    if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
+        cache_x = torch.cat(
+            [
+                _to_device_if_needed(feat_cache[idx][:, :, -1, :, :].unsqueeze(2), cache_x.device),
+                cache_x,
+            ],
+            dim=2,
+        )
+    x = conv(x, feat_cache[idx])
+    feat_cache[idx] = cache_x
+    feat_idx[0] += 1
+    return x
+
+
 def _to_channels_last(module: nn.Module) -> None:
     if isinstance(module, nn.Conv3d):
         module.to(memory_format=torch.channels_last_3d)
@@ -460,42 +493,14 @@ class WanResidualBlock(nn.Module):
         x = self.nonlinearity(self.norm1(x))
 
         if feat_cache is not None and feat_idx is not None:
-            idx = feat_idx[0]
-            cache_x = x[:, :, -CACHE_T:, :, :]
-            if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
-                cache_x = torch.cat(
-                    [
-                        _to_device_if_needed(
-                            feat_cache[idx][:, :, -1, :, :].unsqueeze(2), cache_x.device
-                        ),
-                        cache_x,
-                    ],
-                    dim=2,
-                )
-            x = self.conv1(x, feat_cache[idx])
-            feat_cache[idx] = cache_x
-            feat_idx[0] += 1
+            x = _causal_conv_with_cache(self.conv1, x, feat_cache, feat_idx)
         else:
             x = self.conv1(x)
 
         x = self.dropout(self.nonlinearity(self.norm2(x)))
 
         if feat_cache is not None and feat_idx is not None:
-            idx = feat_idx[0]
-            cache_x = x[:, :, -CACHE_T:, :, :]
-            if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
-                cache_x = torch.cat(
-                    [
-                        _to_device_if_needed(
-                            feat_cache[idx][:, :, -1, :, :].unsqueeze(2), cache_x.device
-                        ),
-                        cache_x,
-                    ],
-                    dim=2,
-                )
-            x = self.conv2(x, feat_cache[idx])
-            feat_cache[idx] = cache_x
-            feat_idx[0] += 1
+            x = _causal_conv_with_cache(self.conv2, x, feat_cache, feat_idx)
         else:
             x = self.conv2(x)
 
@@ -662,21 +667,7 @@ class WanEncoder3d(nn.Module):
             raise ValueError("feat_idx is required when feat_cache is provided")
 
         if feat_cache is not None and feat_idx is not None:
-            idx = feat_idx[0]
-            cache_x = x[:, :, -CACHE_T:, :, :]
-            if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
-                cache_x = torch.cat(
-                    [
-                        _to_device_if_needed(
-                            feat_cache[idx][:, :, -1, :, :].unsqueeze(2), cache_x.device
-                        ),
-                        cache_x,
-                    ],
-                    dim=2,
-                )
-            x = self.conv_in(x, feat_cache[idx])
-            feat_cache[idx] = cache_x
-            feat_idx[0] += 1
+            x = _causal_conv_with_cache(self.conv_in, x, feat_cache, feat_idx)
         else:
             x = self.conv_in(x)
 
@@ -689,21 +680,7 @@ class WanEncoder3d(nn.Module):
         x = self.mid_block(x, feat_cache=feat_cache, feat_idx=feat_idx)
         x = self.nonlinearity(self.norm_out(x))
         if feat_cache is not None and feat_idx is not None:
-            idx = feat_idx[0]
-            cache_x = x[:, :, -CACHE_T:, :, :]
-            if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
-                cache_x = torch.cat(
-                    [
-                        _to_device_if_needed(
-                            feat_cache[idx][:, :, -1, :, :].unsqueeze(2), cache_x.device
-                        ),
-                        cache_x,
-                    ],
-                    dim=2,
-                )
-            x = self.conv_out(x, feat_cache[idx])
-            feat_cache[idx] = cache_x
-            feat_idx[0] += 1
+            x = _causal_conv_with_cache(self.conv_out, x, feat_cache, feat_idx)
         else:
             x = self.conv_out(x)
         return _channels_last_3d_if_needed(x)
@@ -864,21 +841,7 @@ class WanDecoder3d(nn.Module):
             raise ValueError("feat_idx is required when feat_cache is provided")
 
         if feat_cache is not None and feat_idx is not None:
-            idx = feat_idx[0]
-            cache_x = x[:, :, -CACHE_T:, :, :]
-            if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
-                cache_x = torch.cat(
-                    [
-                        _to_device_if_needed(
-                            feat_cache[idx][:, :, -1, :, :].unsqueeze(2), cache_x.device
-                        ),
-                        cache_x,
-                    ],
-                    dim=2,
-                )
-            x = self.conv_in(x, feat_cache[idx])
-            feat_cache[idx] = cache_x
-            feat_idx[0] += 1
+            x = _causal_conv_with_cache(self.conv_in, x, feat_cache, feat_idx)
         else:
             x = self.conv_in(x)
 
@@ -888,21 +851,7 @@ class WanDecoder3d(nn.Module):
 
         x = self.nonlinearity(self.norm_out(x))
         if feat_cache is not None and feat_idx is not None:
-            idx = feat_idx[0]
-            cache_x = x[:, :, -CACHE_T:, :, :]
-            if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
-                cache_x = torch.cat(
-                    [
-                        _to_device_if_needed(
-                            feat_cache[idx][:, :, -1, :, :].unsqueeze(2), cache_x.device
-                        ),
-                        cache_x,
-                    ],
-                    dim=2,
-                )
-            x = self.conv_out(x, feat_cache[idx])
-            feat_cache[idx] = cache_x
-            feat_idx[0] += 1
+            x = _causal_conv_with_cache(self.conv_out, x, feat_cache, feat_idx)
         else:
             x = self.conv_out(x)
         return _channels_last_3d_if_needed(x)
