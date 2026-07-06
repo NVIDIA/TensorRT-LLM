@@ -1169,16 +1169,15 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def coverageConfigFile = "${jobWorkspace}/.coveragerc"
 
             stage("Initialize Test") {
-                timeout(time: 30, unit: 'MINUTES') {
                 println("Selected Cluster: ${cluster.name}")
                 // Create Job Workspace folder in Frontend Node
                 Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"mkdir -p ${jobWorkspace}\""), numRetries: 3)
 
                 // Download and Unzip Tar File
-                timeout(time: 15, unit: 'MINUTES') {
+                timeout(time: 30, unit: 'MINUTES') {
                     trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv ${llmTarfile}")
-                    sh "cd ${llmPath} && tar -zxf ${BUILD_CONFIGS[config][TARNAME]}"
                 }
+                sh "cd ${llmPath} && tar -zxf ${BUILD_CONFIGS[config][TARNAME]}"
 
                 Utils.exec(pipeline, script: "echo \"Script for Slurm srun job to submit: \" && cat ${scriptRunLocalPath}")
                 Utils.copyFileToRemoteHost(
@@ -1554,7 +1553,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     scriptSubmitPathNode,
                     true
                 )
-                } // timeout 30 min
             }
 
             stage("[${stageName}] Run Pytest") {
@@ -3480,7 +3478,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
     // Step 2: run tests
     stage ("Setup Environment")
     {
-        timeout(time: 45, unit: 'MINUTES') {
         // Random sleep to avoid resource contention
         sleep(10 * Math.random())
         sh "curl ifconfig.me || true"
@@ -3505,13 +3502,13 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // download TRT-LLM tarfile
         def tarName = BUILD_CONFIGS[config][TARNAME]
         def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
-        timeout(time: 15, unit: 'MINUTES') {
+        timeout(time: 30, unit: 'MINUTES') {
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv ${llmTarfile}")
-            sh "cd ${llmPath} && tar -zxf ${tarName}"
         }
+        sh "cd ${llmPath} && tar -zxf ${tarName}"
 
         // install python package
-        timeout(time: 30, unit: 'MINUTES') {
+        timeout(time: 45, unit: 'MINUTES') {
             if (env.alternativeTRT) {
                 sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
             }
@@ -3531,7 +3528,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && cp TensorRT-LLM/triton_backend/inflight_batcher_llm/trtllmExecutorWorker /opt/tritonserver/backends/tensorrtllm/")
         }
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "git config --global --add safe.directory \"*\"")
-        } // timeout 45 min
     }
 
     if (testFilter[(DEBUG_MODE)]) {
