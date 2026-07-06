@@ -318,6 +318,7 @@ class SequenceArena:
         "_map_ahead_pages",
         "_budget",
         "_reclaim",
+        "_frontiers",
     )
     _vms: list[VirtMem]
     _alloc: BlockRangeAllocator
@@ -326,6 +327,12 @@ class SequenceArena:
     _map_ahead_pages: int
     _budget: "PageBudget | None"
     _reclaim: list[_ReclaimEntry]
+    # base_block -> per-pool mapped high-water chunk index. A range's mapped
+    # chunks are always the prefix [range start, frontier): every mapping plan
+    # extends from the current frontier and ranges are page-disjoint, so no
+    # holes can form. Lets growth/reclaim work in O(1) per pool instead of
+    # rescanning every chunk from the range start.
+    _frontiers: dict[int, list[int]]
 
     def __init__(
         self,
@@ -350,6 +357,7 @@ class SequenceArena:
         self._map_ahead_pages = map_ahead_pages
         self._budget = page_budget
         self._reclaim = []
+        self._frontiers = {}
 
     @property
     def num_pools(self) -> int:
@@ -379,19 +387,20 @@ class SequenceArena:
     def mapped_pages_in_range(self, base_block: int) -> int:
         """Number of physical pages currently mapped inside the range starting
         at ``base_block``, across all pools."""
-        num_blocks = self._alloc.reserved_len(base_block)
-        page = self._phys_page_size
+        frontiers = self._frontiers[base_block]
         total = 0
         for pool in range(len(self._vms)):
-            lo, hi = self._chunk_range(pool, base_block, num_blocks)
-            vm = self._vms[pool]
-            total += sum(1 for chunk in range(lo, hi) if vm.is_mapped(chunk * page))
+            total += frontiers[pool] - self._chunk_range(pool, base_block, 0)[0]
         return total
 
     def reserve(self, max_blocks: int) -> int:
         """Reserve VA for a sequence's maximum block count; returns base_block.
         No physical memory is mapped yet (that happens in :meth:`ensure_mapped`)."""
-        return self._alloc.allocate(max_blocks)
+        base_block = self._alloc.allocate(max_blocks)
+        self._frontiers[base_block] = [
+            self._chunk_range(pool, base_block, 0)[0] for pool in range(len(self._vms))
+        ]
+        return base_block
 
     def _chunk_range(self, pool: int, base_block: int, num_blocks: int) -> tuple[int, int]:
         """Half-open physical-chunk index range in ``pool`` covering
@@ -404,48 +413,34 @@ class SequenceArena:
         hi = div_up((base_block + num_blocks) * stride, page)
         return lo, hi
 
-    def _missing_runs(self, pool: int, lo: int, hi: int) -> list[tuple[int, int]]:
-        """Contiguous runs of unmapped chunks in ``pool`` within ``[lo, hi)``,
-        as (start_chunk, num_chunks) pairs."""
-        vm = self._vms[pool]
-        page = self._phys_page_size
-        runs: list[tuple[int, int]] = []
-        run_start = -1
-        chunk = lo
-        while chunk < hi:
-            if not vm.is_mapped(chunk * page):
-                if run_start < 0:
-                    run_start = chunk
-            elif run_start >= 0:
-                runs.append((run_start, chunk - run_start))
-                run_start = -1
-            chunk += 1
-        if run_start >= 0:
-            runs.append((run_start, hi - run_start))
-        return runs
-
     def _mapping_plan(
         self, base_block: int, num_valid_blocks: int
     ) -> tuple[list[list[tuple[int, int]]], int]:
         """Missing-page runs per pool (with map-ahead margin, clamped to the
-        reserved extent) for a target frontier, and their total page count."""
+        reserved extent) for a target frontier, and their total page count.
+        At most one run per pool: mapped chunks are the prefix below the
+        range's mapped frontier, so the missing chunks are exactly
+        ``[frontier, target hi)``."""
         assert num_valid_blocks >= 0
         reserved = self._alloc.reserved_len(base_block)
         margin = self._map_ahead_pages
+        frontiers = self._frontiers[base_block]
         runs_per_pool: list[list[tuple[int, int]]] = []
         total_new = 0
         for pool in range(len(self._vms)):
-            lo, hi = self._chunk_range(pool, base_block, num_valid_blocks)
+            _, hi = self._chunk_range(pool, base_block, num_valid_blocks)
             hi += margin
             # Clamp to this sequence's reserved extent so map-ahead never
             # spills into a neighbour's pages.
             max_hi = self._chunk_range(pool, base_block, reserved)[1]
             if hi > max_hi:
                 hi = max_hi
-            runs = self._missing_runs(pool, lo, hi)
-            runs_per_pool.append(runs)
-            for _, num_chunks in runs:
-                total_new += num_chunks
+            frontier = frontiers[pool]
+            if hi > frontier:
+                runs_per_pool.append([(frontier, hi - frontier)])
+                total_new += hi - frontier
+            else:
+                runs_per_pool.append([])
         return runs_per_pool, total_new
 
     def pending_pages(self, base_block: int, num_valid_blocks: int) -> int:
@@ -477,12 +472,14 @@ class SequenceArena:
         if budget is not None and not precharged:
             budget.consume(total_new)  # raises OutOfPagesError; nothing mapped yet
         page = self._phys_page_size
+        frontiers = self._frontiers[base_block]
         num_mapped = 0
         try:
             for pool in range(len(self._vms)):
                 vm = self._vms[pool]
                 for start_chunk, num_chunks in runs_per_pool[pool]:
                     vm.map_range(start_chunk * page, num_chunks)
+                    frontiers[pool] = start_chunk + num_chunks
                     num_mapped += num_chunks
         except Exception:
             # map_range rolls itself back; return the unmapped remainder to
@@ -529,35 +526,19 @@ class SequenceArena:
     def _reclaim_now(self, base_block: int) -> None:
         """Unmap a range's pages in every pool and return the block range to
         the allocator. Caller guarantees no in-flight work references it."""
-        num_blocks = self._alloc.reserved_len(base_block)
+        frontiers = self._frontiers.pop(base_block)
+        page = self._phys_page_size
         num_unmapped = 0
         for pool in range(len(self._vms)):
-            lo, hi = self._chunk_range(pool, base_block, num_blocks)
-            # Unmap only the pages we actually mapped for this range.
-            num_unmapped += self._unmap_mapped_run(pool, lo, hi)
+            # Mapped chunks are exactly the prefix [range start, frontier).
+            lo = self._chunk_range(pool, base_block, 0)[0]
+            hi = frontiers[pool]
+            if hi > lo:
+                self._vms[pool].unmap_range(lo * page, hi - lo)
+                num_unmapped += hi - lo
         self._alloc.free(base_block)
         if self._budget is not None:
             self._budget.release(num_unmapped)
-
-    def _unmap_mapped_run(self, pool: int, lo: int, hi: int) -> int:
-        vm = self._vms[pool]
-        page = self._phys_page_size
-        num_unmapped = 0
-        run_start = -1
-        chunk = lo
-        while chunk < hi:
-            if vm.is_mapped(chunk * page):
-                if run_start < 0:
-                    run_start = chunk
-            elif run_start >= 0:
-                vm.unmap_range(run_start * page, chunk - run_start)
-                num_unmapped += chunk - run_start
-                run_start = -1
-            chunk += 1
-        if run_start >= 0:
-            vm.unmap_range(run_start * page, hi - run_start)
-            num_unmapped += hi - run_start
-        return num_unmapped
 
     def destroy(self) -> None:
         if self._budget is not None:
@@ -565,3 +546,4 @@ class SequenceArena:
         for vm in self._vms:
             vm.destroy()
         self._reclaim = []
+        self._frontiers = {}
