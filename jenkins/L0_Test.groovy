@@ -941,14 +941,18 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             throw e
         }
     } finally {
-        captureSlurmJobNodeList(pipeline, cluster, partition.clusterName, slurmJobID, placementContext, stageName)
-        stage("Clean Up Slurm Resource") {
-            // Workaround to handle the interruption during clean up SLURM resources
-            retry(3) {
-                try {
-                    cleanUpNodeResources(pipeline, cluster, partition.clusterName, nodeName, slurmJobID)
-                } catch (Exception e) {
-                    error "Error during clean up SLURM resources: ${e.getMessage()} and retrying."
+        // Resource cleanup must run even if SLURM metadata capture is interrupted.
+        try {
+            captureSlurmJobNodeList(pipeline, cluster, partition.clusterName, slurmJobID, placementContext, stageName)
+        } finally {
+            stage("Clean Up Slurm Resource") {
+                // Workaround to handle the interruption during clean up SLURM resources
+                retry(3) {
+                    try {
+                        cleanUpNodeResources(pipeline, cluster, partition.clusterName, nodeName, slurmJobID)
+                    } catch (Exception e) {
+                        error "Error during clean up SLURM resources: ${e.getMessage()} and retrying."
+                    }
                 }
             }
         }
@@ -1707,15 +1711,19 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
         stageIsInterrupted = true
         throw e
     } finally {
-        captureSlurmJobNodeList(pipeline, cluster, partition.clusterName, placementContext?.slurmJobId ?: null, placementContext, stageName, jobWorkspace)
-        uploadResults(pipeline, cluster, partition.clusterName, jobUID, stageName, stageIsInterrupted, postTag)
-        stage("Clean Up Slurm Resource") {
-            // Workaround to handle the interruption during clean up SLURM resources
-            retry(3) {
-                try {
-                    cleanUpSlurmResources(pipeline, cluster, partition.clusterName, jobUID)
-                } catch (Exception e) {
-                    error "Error during clean up SLURM resources: ${e.getMessage()} and retrying."
+        // Resource cleanup must run even if metadata capture or result upload is interrupted.
+        try {
+            captureSlurmJobNodeList(pipeline, cluster, partition.clusterName, placementContext?.slurmJobId ?: null, placementContext, stageName, jobWorkspace)
+            uploadResults(pipeline, cluster, partition.clusterName, jobUID, stageName, stageIsInterrupted, postTag)
+        } finally {
+            stage("Clean Up Slurm Resource") {
+                // Workaround to handle the interruption during clean up SLURM resources
+                retry(3) {
+                    try {
+                        cleanUpSlurmResources(pipeline, cluster, partition.clusterName, jobUID)
+                    } catch (Exception e) {
+                        error "Error during clean up SLURM resources: ${e.getMessage()} and retrying."
+                    }
                 }
             }
         }
@@ -2281,7 +2289,7 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             if (stageIsFailed && !suppressTestReporting) {
                 if (stageIsInterrupted) {
                     echo "Stage is interrupted, skip to generate terminated unexpectedly test result."
-                } else {
+                } else if (!fileExists("${stageName}/results-timeout.xml")) {
                     // Generate timeout test result xml if there are terminated unexpectedly tests
                     generateTimeoutTestResultXml(pipeline, stageName)
                 }
@@ -2493,6 +2501,12 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                         - SYS_ADMIN"""
         break
     }
+    // Temporarily avoid an arm64 CPU builder with repeated pod DNS/JNLP failures seen in Build-SBSA #5564.
+    def blockedNodeAffinity = targetCloud == "kubernetes-cpu" && arch == "arm64" ? '''
+                              - key: "kubernetes.io/hostname"
+                                operator: NotIn
+                                values:
+                                - "rl300-0021.ipp2a1.colossus"''' : ""
     def nodeLabel = trtllm_utils.generateNodeLabel(nodeLabelPrefix)
     def pvcVolume = """
                 - name: sw-tensorrt-pvc
@@ -2548,6 +2562,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                                 values:
                                 - "core"
                                 - "qa_only"
+${blockedNodeAffinity}
                 nodeSelector: ${selectors}
                 containers:
                   ${containerConfig}
@@ -3713,6 +3728,13 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                             error "Regular tests failed after rerun attempt"
                         }
                         rerunFailed = true
+                    } else if (generateTimeoutTestResultXml(pipeline, stageName)) {
+                        // Rerun passed but the first run had a timeout: mark this
+                        // stage FAILURE so "[${stageName}] Run Pytest" turns red,
+                        // not just the enclosing parent stage.
+                        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                            error "Some tests terminated unexpectedly, please check the test report."
+                        }
                     }
                 }
 
@@ -3742,6 +3764,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
         if (rerunFailed) {
             error "Some tests still failed after rerun attempts, please check the test report."
+        }
+
+        if (fileExists("${stageName}/results-timeout.xml") || generateTimeoutTestResultXml(pipeline, stageName)) {
+            error "Some tests terminated unexpectedly, please check the test report."
         }
 
         if (perfMode) {
@@ -4544,7 +4570,7 @@ def launchTestJobs(pipeline, testFilter)
     x86SlurmTestConfigs = cbtsResizeSplits(x86SlurmTestConfigs)
     fullSet += x86SlurmTestConfigs.keySet()
 
-    parallelSlurmJobs = x86SlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "amd64"), { attemptTag, isFinalAttempt, retryContext = null ->
+    parallelSlurmJobs = x86SlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE.replace("aarch64", "x86_64"), "slurm", "amd64"), { attemptTag, isFinalAttempt, retryContext = null ->
         // attemptTag comes from runKubernetesPodWithInfraRetry for the outer
         // dispatcher pod (when retry is enabled — see opts below) and is
         // threaded into runLLMTestlistOnSlurm so a future re-enable of outer
@@ -4816,7 +4842,7 @@ def launchTestJobs(pipeline, testFilter)
         // singleAttempt:true disables the outer K8s pod retry; see the x86
         // SLURM closure above for the full rationale (cap nested retry budget
         // so consistently-timing-out tests don't burn ~36h on retry cascades).
-        parallelSlurmJobs = SBSASlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "arm64"), { attemptTag, isFinalAttempt, retryContext = null ->
+        parallelSlurmJobs = SBSASlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE.replace("aarch64", "x86_64"), "slurm", "amd64"), { attemptTag, isFinalAttempt, retryContext = null ->
             // attemptTag is threaded into runLLMTestlistOnSlurm as the outer
             // dispatcher pod's tag so the inner SLURM retry's postTag can't
             // collide with a previous dispatcher pod's upload. See the x86
@@ -4834,7 +4860,7 @@ def launchTestJobs(pipeline, testFilter)
 
         // Add SBSA multi node Slurm jobs
         // singleAttempt:true disables the outer K8s pod retry; see above.
-        parallelMultiNodesSBSAJobs = multiNodesSBSAConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "arm64"), { attemptTag, isFinalAttempt, retryContext = null ->
+        parallelMultiNodesSBSAJobs = multiNodesSBSAConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE.replace("aarch64", "x86_64"), "slurm", "amd64"), { attemptTag, isFinalAttempt, retryContext = null ->
             def config = LINUX_AARCH64_CONFIG
             if (key.contains("single-device")) {
                 config = SINGLE_DEVICE_CONFIG

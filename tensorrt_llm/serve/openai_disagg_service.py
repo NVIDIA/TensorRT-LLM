@@ -105,6 +105,10 @@ class OpenAIDisaggregatedService(OpenAIService):
         if not await self.is_ready():
             raise RuntimeError("Cluster is not ready")
         if not isinstance(request.prompt, str):
+            # Reject empty prompt lists explicitly so the router does not
+            # index prompt[0] on an empty list.
+            if isinstance(request.prompt, list) and len(request.prompt) == 0:
+                raise ValueError("Disaggregated server does not support empty prompt list")
             # Check if it's a list and contains integers
             if type(request.prompt) is list and len(request.prompt) == 1:
                 request.prompt = request.prompt[0]
