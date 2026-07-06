@@ -14,3 +14,4 @@ l0_cpu_x86:
       orchestrator: mpi
   tests:
   - unittest/executor/test_rpc.py
+  - unittest/others/test_http_utils_fail_fast.py
