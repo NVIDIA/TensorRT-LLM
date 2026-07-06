@@ -312,15 +312,16 @@ def test_eagle(tritonserver_test_root, test_name, llm_root, model_path,
 
 
 @pytest.mark.parametrize("test_name", ["whisper"], indirect=True)
-def test_whisper(tritonserver_test_root, test_name, llm_root, model_path,
-                 engine_dir):
-    build_model(test_name, llm_root, tritonserver_test_root)
-    tokenizer_type = "auto"
-    decoder_path = f"{engine_dir}/decoder"
-    encoder_path = f"{engine_dir}/encoder"
-    run_shell_command(
-        f"cd {tritonserver_test_root} && ./test.sh {test_name} {decoder_path} {model_path} {tokenizer_type} skip skip {encoder_path}",
-        llm_root)
+def test_whisper(tritonserver_test_root, test_name, llm_root):
+    # examples/models/core/whisper/convert_checkpoint.py was removed with the
+    # legacy TensorRT-backend cleanup; guard against silent reintroduction.
+    whisper_convert_script = os.path.join(llm_root, "examples", "models",
+                                          "core", "whisper",
+                                          "convert_checkpoint.py")
+    assert not os.path.exists(whisper_convert_script), (
+        f"{whisper_convert_script} was reintroduced; update this test or "
+        "restore the Triton whisper build pipeline in build_model.sh and "
+        "test.sh.")
 
 
 @pytest.mark.parametrize("test_name", ["t5-ib"], indirect=True)
