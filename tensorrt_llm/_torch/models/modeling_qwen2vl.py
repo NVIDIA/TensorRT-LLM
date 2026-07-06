@@ -312,7 +312,11 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         if isinstance(first_frame, torch.Tensor):
             frame_h = int(first_frame.shape[-2])
             frame_w = int(first_frame.shape[-1])
-        else:
+        elif isinstance(first_frame, np.ndarray):
+            # hwc_uint8 frames from VideoMediaIO: shape (H, W, C).
+            frame_h = int(first_frame.shape[0])
+            frame_w = int(first_frame.shape[1])
+        else:  # PIL.Image
             frame_h, frame_w = first_frame.height, first_frame.width
         encoder_tokens = self._num_vision_tokens(width=frame_w,
                                                  height=frame_h,
