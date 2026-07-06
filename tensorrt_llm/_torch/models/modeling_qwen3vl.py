@@ -1622,12 +1622,12 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
         placeholders_separator="",
         content_format=ContentFormat.STRING,
-        # Preserve prompt order across modalities so downstream ordering
-        # (derive_mm_item_order, encoder interleave) sees `<|image_pad|>` /
-        # `<|video_pad|>` in the order the user sent them. Without this,
-        # add_multimodal_placeholders bulk-prepends all image placeholders
-        # then all video placeholders and collapses mixed prompts to
-        # modality-grouped order.
+        # Place ``<|image_pad|>`` / ``<|video_pad|>`` at their content-part
+        # position (via ``interleave_mm_placeholders`` in chat_utils) so the
+        # rendered text is the source of truth for per-item prompt order —
+        # required by ``derive_mm_item_order`` and downstream cache/encoder
+        # ordering. ``placeholder_placement`` above is retained as the
+        # fallback for callers that don't provide ``content_parts``.
         interleave_placeholders=True,
     ),
 )
