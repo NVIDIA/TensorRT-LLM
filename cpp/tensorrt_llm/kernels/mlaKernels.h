@@ -111,6 +111,11 @@ struct MlaParams
     // For FP8 context qkv quantization
     float const* quant_scale_qkv = nullptr;
 
+    // Fused FP8-Q-quant in the absorption-mode context RoPE kernel: the rope
+    // STG goes to `quant_q_buf` as FP8 and the standalone quantize pass is
+    // skipped. Nope segment must be pre-filled (see deepseek_v4_q_norm_fused_fp8).
+    bool fuse_q_fp8_in_rope = false;
+
     // for Helix parallelism: the rotary position offsets [b]
     int32_t const* helix_position_offsets{nullptr};
 

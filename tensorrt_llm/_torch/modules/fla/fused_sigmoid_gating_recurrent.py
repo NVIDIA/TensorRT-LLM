@@ -241,6 +241,7 @@ def _flashinfer_gdn_decode(
     scale: float,
     use_qk_l2norm_in_kernel: bool,
     cu_seqlens: torch.Tensor,
+    output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """GDN standard decode via the FlashInfer CuTe-DSL bf16-state kernel.
 
@@ -260,7 +261,8 @@ def _flashinfer_gdn_decode(
     a_bat = a.view(N, T_per_seq, -1)
     b_bat = b.view(N, T_per_seq, -1)
 
-    output = q.new_empty(N, T_per_seq, HV, V)
+    output = (output.view(N, T_per_seq, HV, V)
+              if output is not None else q.new_empty(N, T_per_seq, HV, V))
 
     assert T_per_seq == 1, (
         f"_flashinfer_gdn_decode expects standard decode (T_per_seq == 1), got "
@@ -301,6 +303,7 @@ def fused_sigmoid_gating_delta_rule_update(
     scale: Optional[float] = None,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: Optional[torch.Tensor] = None,
+    output: Optional[torch.Tensor] = None,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -341,6 +344,7 @@ def fused_sigmoid_gating_delta_rule_update(
             scale=scale,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             cu_seqlens=cu_seqlens,
+            output=output,
         )
 
     # Fallback: Triton kernel path.
@@ -357,7 +361,7 @@ def fused_sigmoid_gating_delta_rule_update(
     num_stages = 3
     num_warps = 1
 
-    o = q.new_empty(NK, *v.shape)
+    o = output.unsqueeze(0) if output is not None else q.new_empty(NK, *v.shape)
     # (NK, NV, N * HV) is found faster than (N * HV, NV, NK)
     # As max of grid.z is 65535, we cap grid.z and let each Triton program
     # grid-stride across the remaining N * HV tiles.

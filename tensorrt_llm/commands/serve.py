@@ -26,7 +26,8 @@ from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.commands._serve_stability import stability_option
 from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
                                          get_is_diffusion_only_model)
-from tensorrt_llm.executor.utils import LlmLauncherEnvs
+from tensorrt_llm.executor.utils import (LlmLauncherEnvs,
+                                         set_spawn_proxy_process_ipc_hmac_key)
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
                                  DynamicBatchConfig, KvCacheConfig,
@@ -338,6 +339,37 @@ def _build_llm_args_from_disagg_server_cfg(other_args: Dict) -> Dict:
     return update_llm_args_with_extra_dict(llm_args, llm_args_extra_dict)
 
 
+def _diagnose_port_in_use(port: int) -> str:
+    """Describe which process currently holds the given port, best effort."""
+    try:
+        import psutil
+    except ImportError:
+        return "psutil unavailable; cannot identify the process holding the port"
+
+    details = []
+    try:
+        for conn in psutil.net_connections(kind="inet"):
+            if conn.laddr and conn.laddr.port == port:
+                holder = ""
+                if conn.pid is not None:
+                    try:
+                        proc = psutil.Process(conn.pid)
+                        holder = (f" pid={conn.pid} name={proc.name()} "
+                                  f"cmdline={' '.join(proc.cmdline())}")
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        holder = f" pid={conn.pid}"
+                details.append(
+                    f"{conn.laddr.ip}:{conn.laddr.port} status={conn.status}{holder}"
+                )
+    except (psutil.Error, OSError) as e:
+        return f"failed to inspect port holders: {e}"
+
+    if not details:
+        return ("no listening socket found for this port; it may have already "
+                "been released, indicating a transient race")
+    return "; ".join(details)
+
+
 def launch_server(
         host: str,
         port: int,
@@ -366,7 +398,12 @@ def launch_server(
             if port == 0:
                 port = s.getsockname()[1]
         except OSError as e:
-            raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}")
+            holder = _diagnose_port_in_use(port)
+            logger.error(
+                f"Failed to bind server socket to {host}:{port} "
+                f"(pid={os.getpid()}): {e}. Current port holder(s): {holder}")
+            raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}. "
+                               f"Port holder(s): {holder}")
 
         if backend == 'pytorch':
             llm_args.pop("build_config", None)
@@ -581,7 +618,12 @@ def launch_visual_gen_server(
         try:
             s.bind((host, port))
         except OSError as e:
-            raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}")
+            holder = _diagnose_port_in_use(port)
+            logger.error(
+                f"Failed to bind VisualGen server socket to {host}:{port} "
+                f"(pid={os.getpid()}): {e}. Current port holder(s): {holder}")
+            raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}. "
+                               f"Port holder(s): {holder}")
 
         logger.info(f"Initializing VisualGen ({model})")
 
@@ -1390,13 +1432,20 @@ def disaggregated(
     # Inherited by child processes via env var; used for deduplication at query time.
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_DEPLOYMENT_ID] = uuid.uuid4().hex
 
+    logger.info(f"Reserving disaggregated server address "
+                f"{disagg_cfg.hostname}:{disagg_cfg.port} (pid={os.getpid()})")
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.bind((disagg_cfg.hostname, disagg_cfg.port))
         except OSError as e:
+            holder = _diagnose_port_in_use(disagg_cfg.port)
+            logger.error(
+                f"Failed to bind disaggregated server socket to "
+                f"{disagg_cfg.hostname}:{disagg_cfg.port} (pid={os.getpid()}): "
+                f"{e}. Current port holder(s): {holder}")
             raise RuntimeError(
-                f"Failed to bind socket to {disagg_cfg.hostname}:{disagg_cfg.port}: {e}"
-            )
+                f"Failed to bind socket to {disagg_cfg.hostname}:{disagg_cfg.port}: {e}. "
+                f"Port holder(s): {holder}")
 
         metadata_server_cfg = parse_metadata_server_config_file(
             metadata_server_config_file)
@@ -1555,11 +1604,13 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
     # This mimics the behavior of trtllm-llmapi-launch
     # TODO: Make the port allocation atomic
     free_ipc_addr = find_free_ipc_addr()
+    ipc_hmac_key = secrets.token_hex(32)
+    set_spawn_proxy_process_ipc_hmac_key(ipc_hmac_key)
+    os.environ.pop(
+        LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_FD.value, None)
     os.environ[LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS] = "1"
     os.environ[
         LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR.value] = free_ipc_addr
-    os.environ[LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY.
-               value] = secrets.token_hex(32)
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT.
                value] = "1"
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX] = str(instance_idx)
@@ -1575,7 +1626,6 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
 
     assert LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS in non_mpi_env
     assert LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR in non_mpi_env
-    assert LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY in non_mpi_env
     assert DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX in non_mpi_env
     assert DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT in non_mpi_env
 
@@ -1598,13 +1648,24 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
     signal.signal(signal.SIGTERM, _signal_handler_cleanup_child)
     signal.signal(signal.SIGINT, _signal_handler_cleanup_child)
 
+    read_fd = -1
+    write_fd = -1
     try:
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, ipc_hmac_key.encode("ascii"))
+        os.close(write_fd)
+        write_fd = -1
+        non_mpi_env[LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_FD.
+                    value] = str(read_fd)
         _child_p_global = subprocess.Popen(
             command,
             env=non_mpi_env,
             stdout=sys.stdout,  # Redirect to parent's stdout
             stderr=sys.stderr,  # Redirect to parent's stderr
+            pass_fds=(read_fd, ),
             start_new_session=True)
+        os.close(read_fd)
+        read_fd = -1
 
         logger.info(
             f"Parent process (PID {os.getpid()}) launched child process (PID {_child_p_global.pid})."
@@ -1618,6 +1679,11 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
         launch_remote_mpi_session_server(sub_comm)
 
     finally:
+        if write_fd != -1:
+            os.close(write_fd)
+        if read_fd != -1:
+            os.close(read_fd)
+
         # Restore original signal handlers
         signal.signal(signal.SIGTERM, original_sigterm_handler)
         signal.signal(signal.SIGINT, original_sigint_handler)
