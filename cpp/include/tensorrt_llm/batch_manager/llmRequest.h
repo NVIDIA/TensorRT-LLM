@@ -1857,14 +1857,18 @@ public:
         mDecodingIter = iter;
     }
 
+    // Callers must pass a global-steady-clock time point (getSteadyClockNow(),
+    // or a value merged from such time points). Normalizing again here would
+    // apply sGlobalSteadyClockOffset twice, which corrupts cross-node
+    // min/max merging whenever the offset is non-zero.
     void setKvCacheTransferStart(TimePoint time) const
     {
-        mPerfMetrics.timingMetrics.kvCacheTransferStart = maybeToGlobalSteadyClock(time);
+        mPerfMetrics.timingMetrics.kvCacheTransferStart = time;
     }
 
     void setKvCacheTransferEnd(TimePoint time) const
     {
-        mPerfMetrics.timingMetrics.kvCacheTransferEnd = maybeToGlobalSteadyClock(time);
+        mPerfMetrics.timingMetrics.kvCacheTransferEnd = time;
     }
 
     TimePoint getKvCacheTransferStart() const

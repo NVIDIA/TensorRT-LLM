@@ -659,7 +659,7 @@ class Sender(SenderBase):
             else:
                 task.complete()
                 if all(t.status == TaskStatus.TRANSFERRED for t in session.kv_tasks):
-                    session.transfer_end_time = tensorrt_llm.bindings.steady_clock_now()
+                    session.transfer_end_time = tensorrt_llm.bindings.global_steady_clock_now()
 
         logger.debug(
             f"deliver_kv_to_agent completed: unique_rid={write_meta.unique_rid}, "
@@ -1246,7 +1246,7 @@ class TxSession(TxSessionBase):
 
     def send(self, slice: KVSlice) -> None:
         if self.transfer_start_time is None:
-            self.transfer_start_time = tensorrt_llm.bindings.steady_clock_now()
+            self.transfer_start_time = tensorrt_llm.bindings.global_steady_clock_now()
         with self.lock:
             params = self._base_args.params
             slice_id = len(self.kv_tasks)
@@ -1856,7 +1856,7 @@ class RxSession(RxSessionBase):
 
     def receive(self, slice: KVSlice) -> None:
         if self.transfer_start_time is None:
-            self.transfer_start_time = tensorrt_llm.bindings.steady_clock_now()
+            self.transfer_start_time = tensorrt_llm.bindings.global_steady_clock_now()
         params = self._base_args.params
         slice_id = len(self._kv_tasks)
         task = KVRecvTask(
@@ -1942,7 +1942,9 @@ class RxSession(RxSessionBase):
                             if all(
                                 t.status == TaskStatus.TRANSFERRED for t in self._kv_tasks
                             ):
-                                self.transfer_end_time = tensorrt_llm.bindings.steady_clock_now()
+                                self.transfer_end_time = (
+                                    tensorrt_llm.bindings.global_steady_clock_now()
+                                )
                             logger.debug(
                                 f"KV transfer complete for request {request_id} "
                                 f"slice={sender_slice_id}"

@@ -544,4 +544,8 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     m.def("ipc_nvls_supported", &tr::ipcNvlsSupported);
 
     m.def("steady_clock_now", []() { return std::chrono::steady_clock::now(); });
+    // Global (offset-normalized) steady clock, matching what
+    // LlmRequest::setKvCacheTransferStart/End expect. Uses this module's copy
+    // of sGlobalSteadyClockOffset, set by PyExecutor at startup.
+    m.def("global_steady_clock_now", []() { return tb::LlmRequest::getSteadyClockNow(); });
 }

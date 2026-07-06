@@ -536,7 +536,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     @nvtx_range("KvCacheTransceiverV2.respond_and_send_async")
     def respond_and_send_async(self, req: LlmRequest):
         self._ever_had_send_session = True
-        req.set_kv_cache_transfer_start(tensorrt_llm.bindings.steady_clock_now())
+        req.set_kv_cache_transfer_start(tensorrt_llm.bindings.global_steady_clock_now())
         session = self._get_or_create_send_session(req)
         req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
         session.send(self._create_kv_slice(req))
@@ -581,7 +581,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_async")
     def request_and_receive_async(self, req: LlmRequest):
         self._ever_had_recv_session = True
-        req.set_kv_cache_transfer_start(tensorrt_llm.bindings.steady_clock_now())
+        req.set_kv_cache_transfer_start(tensorrt_llm.bindings.global_steady_clock_now())
         rid = get_unique_rid(req)
         if rid in self._recv_sessions:
             logger.warning(
