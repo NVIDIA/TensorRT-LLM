@@ -108,14 +108,28 @@ QWENIMAGE_LPIPS_THRESHOLD = 0.05
 # Cosmos3-Nano (text-to-video + text-to-image) — default-setting LPIPS golden.
 # Params are the Cosmos3 720P defaults (cosmos3/defaults.py:COSMOS3_720P_PARAMS).
 # Cosmos3 requires VANILLA attention and guardrails disabled in CI.
+# The negative-prompt and max_sequence_length constants below pin the values that
+# were the pipeline defaults at the time the LPIPS golden was baked; they were
+# changed by the Cosmos3 audio-output feature (f50ca53dae) but the LPIPS golden
+# still exercises the original pre-audio conditioning.
 COSMOS3_NANO_MODEL_SUBPATH = "Cosmos3-Nano"
 COSMOS3_LPIPS_PROMPT = "A serene mountain landscape with snow-capped peaks and a flowing river"
+COSMOS3_LPIPS_NEGATIVE_PROMPT = (
+    "The video captures a series of frames showing ugly scenes, static with no motion, "
+    "motion blur, over-saturation, shaky footage, low resolution, grainy texture, "
+    "pixelated images, poorly lit areas, underexposed and overexposed scenes, poor "
+    "color balance, washed out colors, choppy sequences, jerky movements, low frame "
+    "rate, artifacting, color banding, unnatural transitions, outdated special effects, "
+    "fake elements, unconvincing visuals, poorly edited content, jump cuts, visual "
+    "noise, and flickering. Overall, the video is of poor quality."
+)
 COSMOS3_LPIPS_HEIGHT = 720
 COSMOS3_LPIPS_WIDTH = 1280
 COSMOS3_LPIPS_T2V_NUM_FRAMES = 189
 COSMOS3_LPIPS_T2I_NUM_FRAMES = 1
 COSMOS3_LPIPS_NUM_INFERENCE_STEPS = 35
 COSMOS3_LPIPS_GUIDANCE_SCALE = 6.0
+COSMOS3_LPIPS_MAX_SEQUENCE_LENGTH = 1024
 COSMOS3_LPIPS_SEED = 42
 COSMOS3_LPIPS_FRAME_RATE = 24.0
 COSMOS3_LPIPS_THRESHOLD = 0.05
@@ -907,12 +921,14 @@ def _run_cosmos3_lpips_pipeline(num_frames):
             with torch.no_grad():
                 result = pipeline.forward(
                     prompt=COSMOS3_LPIPS_PROMPT,
+                    negative_prompt=COSMOS3_LPIPS_NEGATIVE_PROMPT,
                     seed=COSMOS3_LPIPS_SEED,
                     height=COSMOS3_LPIPS_HEIGHT,
                     width=COSMOS3_LPIPS_WIDTH,
                     num_frames=num_frames,
                     num_inference_steps=COSMOS3_LPIPS_NUM_INFERENCE_STEPS,
                     guidance_scale=COSMOS3_LPIPS_GUIDANCE_SCALE,
+                    max_sequence_length=COSMOS3_LPIPS_MAX_SEQUENCE_LENGTH,
                     frame_rate=COSMOS3_LPIPS_FRAME_RATE,
                     use_guardrails=False,
                 )
