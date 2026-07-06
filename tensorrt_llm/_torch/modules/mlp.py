@@ -6,6 +6,7 @@ from torch import nn
 
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
@@ -109,9 +110,18 @@ class MLP(nn.Module):
         # GPUs the kernel is a no-op, so fall back to unfused relu2 → separate
         # quantize in the downstream linear layer.
         is_sm100_or_later = get_sm_version() >= 100
+        # Weight-only NVFP4 (W4A16_NVFP4) takes bf16 activations and cannot
+        # consume the FP4 tensor the fused relu2+quant kernel emits, so keep the
+        # fused path off for it. Gate on the quant algo (known now); input_scale
+        # is not yet resolved to None until weights are loaded.
+        down_quant_config = getattr(self.down_proj, 'quant_config', None)
+        is_weight_only_nvfp4 = (down_quant_config is not None
+                                and down_quant_config.quant_algo
+                                == QuantAlgo.W4A16_NVFP4)
 
         self._use_fused_relu2_quant = (has_nvfp4 and has_kernel and has_scale
-                                       and is_relu2 and is_sm100_or_later)
+                                       and is_relu2 and is_sm100_or_later
+                                       and not is_weight_only_nvfp4)
 
         # Static eligibility for the fused GELU(tanh) CuteDSL epilogue (mirrors
         # GatedMLP); the runtime quant_method check is deferred to first forward.

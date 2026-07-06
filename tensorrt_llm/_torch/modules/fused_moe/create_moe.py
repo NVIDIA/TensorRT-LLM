@@ -73,6 +73,19 @@ def get_moe_cls(
         return CutlassFusedMoE
     elif moe_backend.upper() == "VANILLA":
         return VanillaMoE
+    # Weight-only NVFP4 (W4A16_NVFP4) is implemented only by the CutlassFusedMoE
+    # dequant path (W4A16NVFP4CutlassFusedMoEMethod). Force CUTLASS regardless of
+    # the requested backend so native-FP4 (W4A4) backends don't allocate expert
+    # weights the dequant method cannot consume.
+    if (quant_config is not None
+            and quant_config.quant_algo == QuantAlgo.W4A16_NVFP4
+            and moe_backend.upper() not in ("MARLIN", )):
+        if moe_backend.upper() != "CUTLASS":
+            logger.warning(
+                f"{layer_prefix}moe_backend={moe_backend} does not support "
+                "W4A16_NVFP4 (weight-only NVFP4); using CutlassFusedMoE instead."
+            )
+        return CutlassFusedMoE
     elif moe_backend.upper() == "CUTEDSL":
         if quant_config is not None and (
                 quant_config.quant_mode.has_fp8_block_scales()

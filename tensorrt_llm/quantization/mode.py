@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -40,6 +40,7 @@ class QuantAlgo(StrEnum, metaclass=BaseEnumMeta):
     INT8 = auto()
     MIXED_PRECISION = auto()
     NVFP4 = auto()
+    W4A16_NVFP4 = auto()
     W4A8_NVFP4_FP8 = auto()
     W4A8_MXFP4_FP8 = auto()
     W4A8_MXFP4_MXFP8 = auto()
@@ -423,6 +424,12 @@ class QuantMode(IntFlag):
         elif quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
             quant_mode = QuantMode.from_description(use_fp8_block_scales=True)
         elif quant_algo == QuantAlgo.NVFP4:
+            quant_mode = QuantMode.from_description(use_nvfp4=True)
+        elif quant_algo == QuantAlgo.W4A16_NVFP4:
+            # Weight-only NVFP4 (FP4 weights, high-precision activations). Weights
+            # are stored identically to NVFP4, so it shares the NVFP4 QuantMode;
+            # the weight-only execution path is selected at method dispatch time
+            # via the QuantAlgo (see linear.get_quant_method / MoE _get_quant_method).
             quant_mode = QuantMode.from_description(use_nvfp4=True)
         elif quant_algo == QuantAlgo.NVFP4_AWQ:
             # NVFP4_AWQ uses the same QuantMode as NVFP4, distinction is at QuantAlgo level

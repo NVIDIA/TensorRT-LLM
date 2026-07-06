@@ -52,8 +52,15 @@ class MarlinFusedMoE(CutlassFusedMoE):
     compatible. Requires the fused kernel to be built (no fallback path).
     """
 
+    # Marlin is inherently weight-only (W4A16): FP4 weights, bf16 activations.
+    # Both the plain NVFP4 label and the explicit weight-only W4A16_NVFP4 label
+    # map to the same packed-FP4 weights, so both are served here.
     _QUANT_SUPPORT_TABLE = {
         QuantAlgo.NVFP4: {
+            "sm_constraint": ("in", {90}),
+            "dtypes": {torch.bfloat16},
+        },
+        QuantAlgo.W4A16_NVFP4: {
             "sm_constraint": ("in", {90}),
             "dtypes": {torch.bfloat16},
         },
@@ -68,9 +75,9 @@ class MarlinFusedMoE(CutlassFusedMoE):
     ) -> Tuple[bool, Optional[str]]:
         sm_version = get_sm_version()
 
-        if quant_algo != QuantAlgo.NVFP4:
+        if quant_algo not in (QuantAlgo.NVFP4, QuantAlgo.W4A16_NVFP4):
             return _warn_and_return(
-                f"MarlinFusedMoE only supports NVFP4 (got quant_algo={quant_algo})"
+                f"MarlinFusedMoE only supports NVFP4 / W4A16_NVFP4 (got quant_algo={quant_algo})"
             )
 
         if sm_version != 90:

@@ -8,6 +8,41 @@ from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import \
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 from tensorrt_llm._torch.utils import split
 
+# E2M1 (NVFP4) 4-bit code -> value lookup table.
+_E2M1_VALUES = torch.tensor([
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0,
+    -4.0, -6.0
+],
+                            dtype=torch.float32)
+
+
+def _dequant_nvfp4_linear(weight_uint8: torch.Tensor,
+                          block_scale_fp8: torch.Tensor,
+                          global_scale: torch.Tensor) -> torch.Tensor:
+    """Dequantize a 2-D weight-only NVFP4 weight to bf16.
+
+    ``weight_uint8`` is ``[M, K/2]`` (two e2m1 nibbles per byte), ``block_scale_fp8``
+    is ``[M, K/16]`` (fp8_e4m3, un-swizzled linear layout as stored by modelopt),
+    and ``global_scale`` is a scalar. Runs on GPU when available (the per-element
+    LUT gather is far cheaper there than on CPU).
+    """
+    device = 'cuda' if torch.cuda.is_available() else weight_uint8.device
+    w = weight_uint8.to(device)
+    s1 = block_scale_fp8.to(device=device, dtype=torch.float32)
+    s2 = global_scale.to(device=device, dtype=torch.float32).reshape([])
+    lut = _E2M1_VALUES.to(device)
+
+    K = w.shape[-1] * 2
+    high = (w >> 4) & 0x0F
+    low = w & 0x0F
+    vals = torch.empty(*w.shape[:-1], K, dtype=torch.float32, device=device)
+    vals[..., 0::2] = lut[low.long()]
+    vals[..., 1::2] = lut[high.long()]
+
+    scale = (s1 * s2).unsqueeze(-1)
+    vals = vals.view(*w.shape[:-1], K // 16, 16) * scale
+    return vals.view(*w.shape[:-1], K).to(torch.bfloat16).cpu()
+
 
 @register_mapper("HF", "NemotronHPuzzleForCausalLM")
 @register_mapper("HF", "NemotronHForCausalLM")
@@ -184,6 +219,16 @@ class NemotronHHfWeightMapper(HfWeightMapper):
                         new_weights[key] = weights[name]
                     else:
                         raise ValueError(f"Unknown MoE weight: {key}")
+            # lm_head is kept in bf16 in TRT-LLM (LMHead is built unquantized,
+            # see modeling_utils). If the checkpoint quantized it as weight-only
+            # NVFP4, dequantize FP4 -> bf16 here (numerically equivalent to the
+            # W4A16 dequant-then-GEMM path) and drop the standalone scale tensors.
+            elif key.startswith("lm_head.") and "weight_scale" in key:
+                continue
+            elif key == "lm_head.weight" and "lm_head.weight_scale" in weights:
+                new_weights[key] = _dequant_nvfp4_linear(
+                    weights["lm_head.weight"], weights["lm_head.weight_scale"],
+                    weights["lm_head.weight_scale_2"])
             else:
                 new_weights[key] = weights[name]
 

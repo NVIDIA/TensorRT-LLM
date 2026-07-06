@@ -105,6 +105,12 @@ class CutlassFusedMoE(MoE):
             "sm_constraint": ("in", {100, 103, 120, 121}),
             "dtypes": {torch.float16, torch.bfloat16, torch.float8_e4m3fn},
         },
+        # W4A16_NVFP4 (weight-only NVFP4): dequant FP4 -> bf16 then bf16 GEMM,
+        # so it runs anywhere the bf16 fused_moe does (SM >= 80).
+        QuantAlgo.W4A16_NVFP4: {
+            "sm_constraint": ("min", 80),
+            "dtypes": {torch.float16, torch.bfloat16},
+        },
         # W4A8_AWQ: SM in {89, 90} only
         QuantAlgo.W4A8_AWQ: {
             "sm_constraint": ("in", {89, 90}),
@@ -893,6 +899,10 @@ class CutlassFusedMoE(MoE):
             elif self.quant_config.layer_quant_mode.has_fp8_block_scales():
                 return DeepSeekFP8BlockScalesFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_nvfp4():
+                if self.quant_config.quant_algo == QuantAlgo.W4A16_NVFP4:
+                    # Weight-only NVFP4: dequant experts FP4 -> bf16 then bf16
+                    # fused_moe (SM-agnostic), instead of native FP4 GEMM.
+                    return W4A16NVFP4CutlassFusedMoEMethod()
                 return NVFP4CutlassFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.is_int4_weight_only_per_group(
             ):

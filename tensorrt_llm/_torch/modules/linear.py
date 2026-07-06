@@ -3127,7 +3127,15 @@ def get_quant_method(quant_config: Optional[QuantConfig] = None):
     if quant_config.layer_quant_mode.has_fp8_block_scales():
         return FP8BlockScalesLinearMethod()
     if quant_config.layer_quant_mode.has_nvfp4():
-        if quant_config.quant_algo == QuantAlgo.NVFP4_ARC:
+        if quant_config.quant_algo == QuantAlgo.W4A16_NVFP4:
+            # Weight-only NVFP4. Prefer the native Marlin mixed-input GEMM
+            # (FP4 weights kept packed, dequant fused in the mainloop) on Hopper
+            # when enabled; otherwise fall back to the dequant-to-bf16 path
+            # (SM-agnostic Triton dequant + cublas).
+            if is_nvfp4_marlin_enabled():
+                return MarlinNVFP4LinearMethod()
+            return W4A16NVFP4LinearMethod()
+        elif quant_config.quant_algo == QuantAlgo.NVFP4_ARC:
             return NVFP4ARCLinearMethod()
         elif is_nvfp4_marlin_enabled():
             return MarlinNVFP4LinearMethod()
