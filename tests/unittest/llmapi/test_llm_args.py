@@ -681,7 +681,9 @@ class TestModelDefaults:
 
 
 @pytest.mark.cpu_only
-def test_KvCacheConfig_declaration():
+def test_KvCacheConfig_declaration(monkeypatch):
+    monkeypatch.setattr(llm_args_mod, "is_device_integrated", lambda: False)
+
     assert KvCacheConfig().mamba_state_cache_interval is None
     assert KvCacheConfig().mamba_state_config.periodic_snapshot_interval == 0
     assert KvCacheConfig().kv_cache_event_hash_algo == "auto"
@@ -933,6 +935,23 @@ def test_config_file_merge_rejects_legacy_and_new_mamba_intervals():
 
 
 @pytest.mark.cpu_only
+def test_KvCacheConfig_unified_memory_forces_host_cache_size_zero(monkeypatch):
+    monkeypatch.setattr(llm_args_mod, "is_device_integrated", lambda: True)
+
+    config = KvCacheConfig(host_cache_size=1024)
+
+    assert config.host_cache_size == 0
+
+
+@pytest.mark.cpu_only
+def test_KvCacheConfig_discrete_memory_preserves_host_cache_size(monkeypatch):
+    monkeypatch.setattr(llm_args_mod, "is_device_integrated", lambda: False)
+
+    config = KvCacheConfig(host_cache_size=1024)
+
+    assert config.host_cache_size == 1024
+
+
 def test_KvCacheConfig_disk_cache_validation(tmp_path):
     config = KvCacheConfig(disk_cache_size=2048, disk_cache_path=str(tmp_path))
 
