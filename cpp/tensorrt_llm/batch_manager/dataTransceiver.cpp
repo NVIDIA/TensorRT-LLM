@@ -34,6 +34,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <variant>
 #include <unordered_map>
 
 namespace tensorrt_llm::batch_manager
@@ -322,8 +323,7 @@ public:
         llmRequest->setKvCacheTransferStart(LlmRequest::getSteadyClockNow());
         {
             std::scoped_lock lkResp(mSenderMutex);
-            mReadyResponses.emplace(
-                llmRequest->mRequestId, Response{llmRequest, llmRequest->mRequestId, std::move(promise)});
+            mReadyResponses.emplace(llmRequest->mRequestId, Response{llmRequest, std::move(promise)});
         }
         return future;
     }
@@ -490,14 +490,26 @@ public:
 private:
     struct Response
     {
-        // shared_ptr so this struct co-owns the request until the promise resolves;
-        // protects worker-side dereferences and the promise itself from premature destruction.
-        // May be nullptr for the arbitrary-transfer reuse-tree path, which carries no LlmRequest;
-        // mRequestId still identifies the request in that case.
-        std::shared_ptr<LlmRequest> mRequest;
-        RequestIdType mRequestId;
+        // Single source of truth for the request identity. A response is either:
+        // - backed by an LlmRequest (normal disagg flow): the shared_ptr co-owns the
+        //   request until the promise resolves, and the request id is the request's own
+        //   mRequestId; or
+        // - id-only (llmRequest-agnostic reuse-tree transfer): just the RequestIdType.
+        std::variant<std::shared_ptr<LlmRequest>, RequestIdType> mRequestOrId;
         std::promise<void> mPromise;
         std::vector<kv_cache_manager::KVCacheBlock::IdType> mPinnedBlockIds;
+
+        [[nodiscard]] LlmRequest* getRequest() const
+        {
+            auto const* request = std::get_if<std::shared_ptr<LlmRequest>>(&mRequestOrId);
+            return request != nullptr ? request->get() : nullptr;
+        }
+
+        [[nodiscard]] RequestIdType getRequestId() const
+        {
+            auto const* request = getRequest();
+            return request != nullptr ? request->mRequestId : std::get<RequestIdType>(mRequestOrId);
+        }
     };
 
     struct AsyncSendResource
@@ -530,12 +542,11 @@ private:
                 resp = std::move(resource.mSendQueue.front());
                 resource.mSendQueue.pop_front();
             }
-            // Read mRequestId (a plain value) before the move: argument
-            // initializations are indeterminately sequenced, so inlining a read
-            // of resp alongside std::move(resp) is UB. Using mRequestId rather
-            // than resp.mRequest->mRequestId also supports the reuse-tree path,
-            // where mRequest is null.
-            sendAndRemoveResponse(resp.mRequestId, std::move(resp));
+            // Read the id before the move: argument initializations are
+            // indeterminately sequenced, so calling resp.getRequestId() inline
+            // alongside std::move(resp) could observe a moved-from response.
+            auto const requestId = resp.getRequestId();
+            sendAndRemoveResponse(requestId, std::move(resp));
         }
     }
 
@@ -544,9 +555,9 @@ private:
         try
         {
             TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
-            if (resp.mRequest != nullptr)
+            if (auto* llmRequest = resp.getRequest(); llmRequest != nullptr)
             {
-                sendSync(*resp.mRequest);
+                sendSync(*llmRequest);
             }
             else
             {
@@ -738,7 +749,8 @@ private:
                         {
                             sendReadySignal(reqId, true);
                             std::promise<void> promise;
-                            Response resp{nullptr, reqId, std::move(promise), std::move(pinnedIds)};
+                            // Id-only response: the reuse-tree path has no LlmRequest.
+                            Response resp{reqId, std::move(promise), std::move(pinnedIds)};
                             if (dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager) != nullptr)
                             {
                                 sendAndRemoveResponse(reqId, std::move(resp));
