@@ -239,7 +239,11 @@ def _visual_gen_deps(llm_venv):
     """Install av + diffusers + ffmpeg once per session (shared by all video-gen fixtures)."""
     llm_venv.run_cmd(["-m", "pip", "install", "av"])
     llm_venv.run_cmd(["-m", "pip", "install", "diffusers>=0.37.0"])
-    # Install ffmpeg system package required by save_video() for MP4 encoding
+    # ffmpeg is typically preinstalled in the CI container image; skip apt-get when it's
+    # already on PATH so this fixture works under non-root runners (apt-get needs root
+    # and exits 100 otherwise, blocking the actual LPIPS assertion). See nvbugs/6401921.
+    if shutil.which("ffmpeg"):
+        return
     check_call(["apt-get", "update", "-y"], shell=False)
     check_call(["apt-get", "install", "-y", "ffmpeg"], shell=False)
 
