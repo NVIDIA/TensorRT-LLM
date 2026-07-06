@@ -623,19 +623,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         else:
             self._saved_generation_lengths = None
 
-        # Save Helix per-token buffers that the draft loop overwrites so the
-        # target verify metadata can be restored (needed for CUDA graph capture).
+        # Save Helix buffers overwritten by the draft loop (CUDA graph capture).
         self._saved_helix_position_offsets = None
         self._saved_helix_is_inactive_rank = None
         self._saved_kv_lens_cuda = None
-        # The draft loop disables the Helix MTP verify-flatten flag (see the
-        # gathered-step handling in _forward_linear_draft_loop) but never turns
-        # it back on. Under CUDA graph capture, prepare() runs once but the
-        # forward runs multiple times (warmup + capture): if the flag were left
-        # False, the 2nd warmup and the actual capture would record the target
-        # verify attention on the *non-flattened* path, so replay would silently
-        # drop cached KV on inactive CP ranks. Save the pre-loop value here and
-        # restore it after the loop so every capture iteration re-flattens.
+        # Draft loop disables verify-flatten; restore after loop for CUDA graph capture.
         self._saved_helix_gen_flatten_active = getattr(
             attn_metadata, '_helix_gen_flatten_active', None)
         if getattr(attn_metadata, 'helix_position_offsets', None) is not None:
@@ -644,9 +636,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         if getattr(attn_metadata, 'helix_is_inactive_rank', None) is not None:
             self._saved_helix_is_inactive_rank = attn_metadata.helix_is_inactive_rank.clone(
             )
-            # Under Helix the draft loop grows kv_lens_cuda per-step by each
-            # draft token's owner rank; save it so the target verify state can
-            # be restored after the loop (and across CUDA graph capture).
+            # Save kv_lens_cuda grown per draft step under Helix.
             if getattr(attn_metadata, 'kv_lens_cuda', None) is not None:
                 self._saved_kv_lens_cuda = attn_metadata.kv_lens_cuda[:
                                                                       batch_size].clone(
@@ -667,9 +657,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             attn_metadata.kv_lens_cuda[:batch_size].copy_(
                 self._saved_kv_lens_cuda)
             self._saved_kv_lens_cuda = None
-        # Re-arm the Helix MTP verify-flatten flag (disabled by the draft loop)
-        # so the next target verify forward, and each CUDA graph capture/warmup
-        # iteration, takes the flattened per-query-row read path.
+        # Restore verify-flatten flag after the draft loop.
         if self._saved_helix_gen_flatten_active is not None:
             attn_metadata._helix_gen_flatten_active = (
                 self._saved_helix_gen_flatten_active)
@@ -696,18 +684,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
     def _helix_draft_owner_mask(self, attn_metadata, position_ids, batch_size):
         """Per-request owner mask for a draft-loop step under Helix.
 
-        Ownership is per request and fixed for the whole decode group: the draft
-        tokens a request generates stay on the same CP rank that owns its verify
-        group (the owner of the group's anchor decode-index g). So ownership is
-        not recomputed here; the verify's per-request helix_is_inactive_rank flags
-        are reused and only the RoPE positions are refreshed, since they advance
-        each draft step. This keeps the golden token, the verified drafts, and the
-        newly generated drafts all on one rank (no mixed ownership) and matches
-        how the Helix MLA generation KV-write kernel indexes the flag (per
-        request, by batch_idx).
-
-        Returns the boolean owner mask of shape [batch_size], or None when Helix
-        is not active.
+        Reuses verify-time helix_is_inactive_rank; only RoPE positions refresh.
+        Returns shape [batch_size], or None when Helix is inactive.
         """
         if self.mapping is None or not self.mapping.has_cp_helix():
             return None
@@ -850,10 +828,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
             for i in range(runtime_draft_len):
-                # Under Helix, set this draft step's per-token global positions
-                # and KV ownership before the draft forward. Returns the owner
-                # mask (None when Helix is inactive) used for the kv_lens update
-                # below.
+                # Set per-token global positions and ownership before draft forward.
                 helix_owner_mask = self._helix_draft_owner_mask(
                     attn_metadata, inputs["position_ids"], batch_size)
 
@@ -977,13 +952,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     attn_metadata._seq_lens[:batch_size].fill_(1)
                     attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
                     attn_metadata.on_update()
-                    # The Helix verify-flatten (one q_len==1 request per verify
-                    # row) only matches draft step 0, which reuses the full
-                    # verify-length input. From step 1 on, the loop gathers to a
-                    # single token per sequence, so the flattened row count no
-                    # longer matches num_tokens and the C++ op would assert. Those
-                    # gathered steps are plain q_len==1 decodes with no causal-slope
-                    # bug, so disable the flatten for them.
+                    # Verify-flatten applies only to draft step 0 (full verify input).
                     if getattr(attn_metadata, "_helix_gen_flatten_active",
                                False):
                         attn_metadata._helix_gen_flatten_active = False
@@ -995,10 +964,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                         attn_metadata.num_contexts = 0
                     if hasattr(attn_metadata, 'kv_lens_cuda'):
                         if helix_owner_mask is not None:
-                            # Under Helix, the verify kv_lens already reflects
-                            # this rank's owned (speculatively written) draft
-                            # tokens. The first draft step then appends the new
-                            # draft token only on its owner rank.
+                            # Append new draft token on the owner rank only.
                             attn_metadata.kv_lens_cuda[:batch_size] += (
                                 helix_owner_mask.to(
                                     attn_metadata.kv_lens_cuda.dtype))
@@ -1024,8 +990,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 else:
                     if hasattr(attn_metadata, 'kv_lens_cuda'):
                         if helix_owner_mask is not None:
-                            # Only the rank that owns this draft token stored its
-                            # KV, so only its kv_lens grows.
+                            # Only the owner rank grows kv_lens.
                             attn_metadata.kv_lens_cuda[:batch_size] += (
                                 helix_owner_mask.to(
                                     attn_metadata.kv_lens_cuda.dtype))
@@ -1332,8 +1297,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             # d2t-aware argmax. (Routing ADP/LM-head-TP through draft_sampler
             # without its mapping_lm_head_tp arg hits the None-mapping branch
             # and crashes with 'NoneType has no attribute tp_group'.)
-            # sampler_mapping folds the Helix CP ranks into TP, so this is the
-            # plain-TP vocab-shard check post-attention.
+            # Vocab-shard check after attention (CP ranks folded into TP).
             mapping = self.sampler_mapping
             if (self.is_mtp_eagle and mapping is not None
                     and mapping.tp_size > 1

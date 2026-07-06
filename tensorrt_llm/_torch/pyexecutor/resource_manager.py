@@ -736,15 +736,9 @@ class KVCacheManager(BaseResourceManager):
         return req.prompt_len
 
     def _helix_owns_decode_group(self, group_index: int) -> bool:
-        """Return whether this CP rank owns the verify group with the given index.
+        """Return whether this CP rank owns the verify group at group_index.
 
-        Ownership is per request (per verify group), anchored on a deterministic
-        per-request group counter rather than the accept-dependent global decode
-        length, so the owner is host-computable even under the overlap scheduler
-        (where the accepted-token count is known only on-device). The counter
-        advances by one per reserved group, and owner is
-        (group_index // tokens_per_block) % cp_size, so a rank owns
-        tokens_per_block consecutive groups before ownership rotates.
+        Owner = (group_index // tokens_per_block) % cp_size.
         """
         block_id = group_index // self.tokens_per_block
         return block_id % self.mapping.cp_size == self.mapping.cp_rank
@@ -753,27 +747,13 @@ class KVCacheManager(BaseResourceManager):
                                      draft_len: int) -> None:
         """Reserve KV cache slots for a Helix generation or verify forward.
 
-        Ownership is per request (per verify group), not per token: the whole
-        group of query tokens written this forward (the re-fed golden token plus
-        its drafts) is assigned to the single CP rank that owns the request's
-        verify-group index. This keeps golden and draft tokens on one rank even
-        when a verify block crosses a tokens_per_block boundary. The owner
-        reserves a slot per group token plus reserve slack; non-owner ranks
-        reserve none.
-
-        The reserve-time ownership decision is pushed to a per-request FIFO
-        (py_helix_pending_group_owns) so the rewind of this forward consumes
-        exactly this decision, even when it runs an iteration later under the
-        overlap scheduler. py_helix_prev_group_owns records the prior group's
-        ownership and gates the on-device kv-length correction under overlap.
-        py_helix_local_past_seen is the per-rank cached length; the owned-decode
-        count has no closed form under per-group ownership, so it is tracked
-        incrementally in py_helix_owned_decode_seen.
+        The owning rank reserves slots for the whole verify group plus slack.
+        Reserve-time ownership is pushed to py_helix_pending_group_owns for the
+        matching rewind.
         """
         group_index = req.py_helix_decode_group_index
         owns_group = self._helix_owns_decode_group(group_index)
-        # Record the prior group's ownership before extending the FIFO for this
-        # forward (the FIFO tail is the most recently reserved group).
+        # Prior group's ownership before extending the reserve FIFO.
         req.py_helix_prev_group_owns = (req.py_helix_pending_group_owns[-1]
                                         if req.py_helix_pending_group_owns else
                                         False)
@@ -783,49 +763,34 @@ class KVCacheManager(BaseResourceManager):
         req.py_helix_local_past_seen = (req.py_helix_context_seqlen_cp +
                                         req.py_helix_owned_decode_seen)
 
-        # Reserve owned KV slots for the tokens written this forward plus reserve
-        # slack. The owner rank reserves the whole group; over-reservation is
-        # rewound later.
+        # Owner reserves the whole group plus slack; non-owner reserves none.
         reserve = max(draft_len, self._kv_reserve_draft_tokens)
         n_reserve = 1 + reserve
         if owns_group:
             for _ in range(n_reserve):
                 self.impl.add_token(req.py_request_id)
 
-        # Per-request ownership flag consumed by the verify-path input prep this
-        # iteration. Both the plain-decode generation path and the speculative
-        # verify path use this single flag (the verify path replicates it across
-        # the group's query tokens) so golden and draft tokens always land on the
-        # same rank.
+        # Per-request inactive flag for verify-path input prep.
         req.py_helix_is_inactive_rank = not owns_group
 
     def _helix_rewind_generation_kv(self, req: LlmRequest) -> None:
-        """Rewind this rank's rejected and slack draft KV, then advance lengths.
-
-        The owner of the group being rewound is the reserve-time decision popped
-        from the FIFO, so reserve and rewind agree even when they run an iteration
-        apart under the overlap scheduler. Only the owner reserved this group, so
-        only it rewinds the rejected and slack draft slots and grows
-        py_helix_owned_decode_seen by 1 + accepted. The committed decode length
-        always advances by 1 + accepted.
-        """
+        """Rewind rejected and slack draft KV, then advance decode lengths."""
         g = req.py_helix_global_decode_len
         accepted = req.py_num_accepted_draft_tokens
         runtime_draft_len = req.py_rewind_len + accepted
         reserve = max(runtime_draft_len, self._kv_reserve_draft_tokens)
-        # Consume the reserve-time ownership decision for this exact group.
+        # Pop the reserve-time ownership decision for this group.
         owns_group = (
             req.py_helix_pending_group_owns.pop(0)
             if req.py_helix_pending_group_owns else
             self._helix_owns_decode_group(req.py_helix_decode_group_index - 1))
 
-        # Total rewound tokens (rejected drafts plus reserve slack). Only the owner
-        # rank reserved this group, so only it rewinds and grows its owned count.
+        # Only the owner rank rewinds and grows its owned decode count.
         rewind_count = reserve - accepted
         if owns_group:
             if rewind_count > 0:
                 self.rewind_kv_cache(req, rewind_count)
-            # Committed this group: golden plus accepted drafts (1 + accepted).
+            # Golden plus accepted drafts (1 + accepted).
             req.py_helix_owned_decode_seen += 1 + accepted
 
         # Advance the committed decode length and recompute the per-rank KV length.
@@ -1056,17 +1021,13 @@ class KVCacheManager(BaseResourceManager):
                         req.seqlen_this_rank_cp = req.prompt_len
                         req.total_input_len_cp = token_num * self.mapping.cp_size - 1
                         req.py_decoding_iter = 1
-                    # Initialize the Helix speculative-decode bookkeeping so the
-                    # verify-path input prep reads consistent values.
+                    # Initialize Helix speculative-decode bookkeeping.
                     req.py_helix_global_decode_len = req.py_decoding_iter
                     req.py_helix_context_seqlen_cp = req.seqlen_this_rank_cp
                     req.py_helix_local_past_seen = req.seqlen_this_rank_cp
-                    # No decode tokens owned yet for this (dummy) request; the
-                    # per-rank cached length above is the context-only base.
+                    # Context-only cached length; no owned decode tokens yet.
                     req.py_helix_owned_decode_seen = 0
-                    # Deterministic verify-group ownership counter and its pending
-                    # reserve/rewind FIFO start empty for a fresh generation
-                    # request (see _helix_prepare_generation_kv).
+                    # Fresh generation request: empty ownership FIFO.
                     req.py_helix_decode_group_index = 0
                     req.py_helix_pending_group_owns = []
                     req.py_helix_prev_group_owns = False
@@ -1108,8 +1069,7 @@ class KVCacheManager(BaseResourceManager):
                                      LlmRequestState.CONTEXT_INIT):
                     continue
                 if self.mapping.has_cp_helix():
-                    # Helix rewinds only this rank's owned rejected and slack
-                    # tokens and advances the committed decode length.
+                    # Rewind owned rejected and slack tokens; advance decode length.
                     self._helix_rewind_generation_kv(request)
                     continue
                 if request.py_rewind_len > 0:

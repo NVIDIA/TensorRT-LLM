@@ -216,15 +216,8 @@ class AccuracyTask:
         is_integration_test = is_integration_test or os.getenv(
             'INTEGRATION_TEST', '0') == '1'
 
-        # Optional dev/debug overrides for GSM8K:
-        #   TRTLLM_GSM8K_NUM_SAMPLES: run a deterministic small subset of the
-        #     dataset. The lm-eval task is shuffled with a fixed seed
-        #     (random_seed=0) and then the first N samples are taken, so the
-        #     subset is reproducible across runs.
-        #   TRTLLM_GSM8K_OUTPUT_DIR: dump per-sample inputs/outputs to this dir.
-        # These are debugging aids, so requesting a custom sample count also
-        # skips the accuracy hypothesis test (a tiny subset cannot meet the
-        # statistical threshold).
+        # Optional GSM8K debug env vars: TRTLLM_GSM8K_NUM_SAMPLES, TRTLLM_GSM8K_OUTPUT_DIR.
+        # A custom sample count skips the accuracy hypothesis test.
         gsm8k_num_samples = None
         gsm8k_output_dir = None
         if self.DATASET == "gsm8k":

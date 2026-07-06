@@ -2425,10 +2425,7 @@ class PyTorchModelEngine(ModelEngine):
                             )
                     inputs['attn_metadata'].on_update_kv_lens()
 
-                # Helix overlap: correct the remaining accept-dependent verify
-                # metadata (global RoPE positions and the flattened verify read)
-                # on-device. kv_lens_cuda was corrected just above via the
-                # (Helix-repurposed) previous_kv_lens_offsets_cuda.
+                # On-device Helix overlap corrections (RoPE positions and flattened read).
                 if self.mapping.has_cp_helix():
                     self._apply_helix_overlap_corrections(
                         inputs['attn_metadata'],
@@ -2484,9 +2481,7 @@ class PyTorchModelEngine(ModelEngine):
                                 previous_kv_lens_offsets_cuda[:num_gen_requests]
                             )
 
-                # Undo the Helix overlap corrections applied in
-                # _preprocess_inputs so CUDA-graph capture (which replays the
-                # forward multiple times over a base built once) stays consistent.
+                # Undo Helix overlap corrections for CUDA graph replay consistency.
                 if self.mapping.has_cp_helix():
                     self._apply_helix_overlap_corrections(
                         inputs['attn_metadata'],
@@ -2498,21 +2493,10 @@ class PyTorchModelEngine(ModelEngine):
     def _apply_helix_overlap_corrections(self, attn_metadata, num_ctx_tokens,
                                          previous_batch_tokens,
                                          num_gen_requests, sign):
-        """On-device Helix verify-metadata corrections for the overlap scheduler.
+        """On-device Helix verify metadata corrections for overlap scheduling.
 
-        Under overlap the accept-dependent verify metadata is stale by the prior
-        step's committed count (1 + accepted) at prepare time. Ownership stays
-        host-deterministic, and kv_lens_cuda is corrected by the caller, so only
-        two quantities are fixed here:
-
-        - Global RoPE positions (helix_position_offsets): add the prior step's
-          committed count to every query token, as for position_ids.
-        - The flattened per-query-row verify read bounds: add the same per-request
-          owner-gated correction to each of a request's rows and rebuild the
-          cumulative KV offsets on-device.
-
-        Called with sign=+1 in _preprocess_inputs and sign=-1 in
-        _postprocess_inputs. A no-op outside a Helix verify.
+        Fixes accept-dependent RoPE positions and flattened per-row KV bounds.
+        kv_lens_cuda is corrected by the caller. No-op outside a Helix verify.
         """
         helix_pos = getattr(attn_metadata, 'helix_position_offsets', None)
         if helix_pos is not None and previous_batch_tokens > 0:
@@ -2523,8 +2507,7 @@ class PyTorchModelEngine(ModelEngine):
         apply_flat = getattr(attn_metadata,
                              'apply_helix_overlap_flatten_correction', None)
         if apply_flat is not None and num_gen_requests > 0:
-            # max per-row extra is a full verify group (1 + runtime_draft_len);
-            # used only as a safe upper bound for the host total-KV sizing hint.
+            # Upper bound for host total-KV sizing hint (1 + runtime_draft_len).
             apply_flat(self.previous_kv_lens_offsets_cuda[:num_gen_requests],
                        1 + self.runtime_draft_len,
                        sign=sign)
@@ -3248,22 +3231,9 @@ class PyTorchModelEngine(ModelEngine):
                                    tokens_per_block: int):
         """Compute Helix parameters for a speculative verify forward.
 
-        Returns (global_positions, is_inactive, num_active). global_positions are
-        the absolute positions of the 1 + num_draft query tokens, computed
-        globally because each rank holds only a shard for RoPE. is_inactive is a
-        single per-request flag (this rank writes no KV for the request's query
-        tokens). num_active is the count of query tokens this rank writes KV for.
-
-        Ownership is per request (per verify group) and is resolved at KV-reserve
-        time (resource_manager._helix_prepare_generation_kv), stashed on the
-        request as py_helix_is_inactive_rank. Reusing that flag here keeps the
-        verify metadata, the KV reserve, and the rewind in agreement, including
-        under the overlap scheduler where reserve and rewind run an iteration
-        apart. Global positions are anchored on py_helix_global_decode_len; under
-        overlap it is stale by the prior step's committed count, so the base
-        positions are corrected on-device in _preprocess_inputs, mirroring the
-        position_ids correction. tokens_per_block is accepted for call-site
-        symmetry and unused.
+        Returns (global_positions, is_inactive, num_active). Ownership comes from
+        py_helix_is_inactive_rank, set at KV reserve time. Overlap corrections
+        run on-device in _preprocess_inputs.
         """
         del tokens_per_block
         g = request.py_helix_global_decode_len
@@ -3576,15 +3546,9 @@ class PyTorchModelEngine(ModelEngine):
             self.runtime_draft_len)
         runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
 
-        # Helix CP parameters. helix_position_offsets is per query token, since
-        # RoPE needs each token's global position. helix_is_inactive_rank is per
-        # request, since ownership is per verify group and the Helix KV-write
-        # kernel indexes the flag per sequence. Both are populated in the extend
-        # (speculative verify) and generation loops below.
+        # helix_position_offsets: per query token. helix_is_inactive_rank: per request.
         helix_is_inactive_rank, helix_position_offsets = [], []
-        # Per overlap verify request: whether this rank owns the prior decode
-        # iteration's verify group. Collected below in previous_batch_indices
-        # order and used to build the on-device Helix kv-length correction.
+        # Prior group's ownership for on-device kv-length correction under overlap.
         helix_prev_group_owns = []
         # Cache invariant method result to avoid repeated calls per-request.
         _has_cp_helix = self.mapping.has_cp_helix()
@@ -3627,9 +3591,7 @@ class PyTorchModelEngine(ModelEngine):
                         range(len(position_ids),
                               len(position_ids) + 1 + num_draft_tokens)))
                 if _has_cp_helix:
-                    # Under Helix each rank holds only a shard of the sequence, so
-                    # query token positions are computed globally and the per-rank
-                    # cached length is provided by the resource manager.
+                    # Global positions and per-rank cached length under Helix.
                     positions_h, is_inactive_h, _ = self._helix_verify_token_params(
                         request, num_draft_tokens, _helix_tokens_per_block)
                     past_seen_token_num = request.py_helix_local_past_seen
@@ -3661,8 +3623,7 @@ class PyTorchModelEngine(ModelEngine):
                         range(len(position_ids),
                               len(position_ids) + runtime_tokens_per_gen_step)))
                 if _has_cp_helix:
-                    # Overlap-scheduler verify path under Helix: global positions
-                    # and per-rank cached length (see _helix_verify_token_params).
+                    # Overlap verify path under Helix.
                     positions_h, is_inactive_h, _ = self._helix_verify_token_params(
                         request, runtime_draft_token_buffer_width,
                         _helix_tokens_per_block)
@@ -3672,23 +3633,23 @@ class PyTorchModelEngine(ModelEngine):
                 else:
                     position_ids.extend(
                         list(
-                            range(past_seen_token_num, past_seen_token_num +
-                                  runtime_tokens_per_gen_step)))
+                            range(
+                                past_seen_token_num, past_seen_token_num +
+                                runtime_tokens_per_gen_step)))
                 # previous tensor
                 previous_batch_indices.append(previous_batch_idx)
                 previous_pos_indices.extend([previous_batch_idx] *
                                             runtime_tokens_per_gen_step)
 
                 if _has_cp_helix:
-                    # Ownership of the prior iteration's group, whose committed
-                    # count new_tokens_lens_device measures.
+                    # Prior group's ownership for kv-length correction.
                     helix_prev_group_owns.append(
                         request.py_helix_prev_group_owns)
                     num_cached_tokens_per_seq.append(
                         request.py_helix_local_past_seen)
                 else:
-                    num_cached_tokens_per_seq.append(past_seen_token_num +
-                                                     runtime_tokens_per_gen_step)
+                    num_cached_tokens_per_seq.append(
+                        past_seen_token_num + runtime_tokens_per_gen_step)
                 request.cached_tokens = num_cached_tokens_per_seq[-1]
                 if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                         self.attn_backend) and spec_config.is_linear_tree:
@@ -3801,16 +3762,12 @@ class PyTorchModelEngine(ModelEngine):
 
                 position_id = past_seen_token_num
                 if _has_cp_helix:
-                    # We compute a global position_id because each helix rank has only a subset of
-                    # tokens for a sequence. The per-rank cached length is recomputed from ownership
-                    # by the resource manager (py_helix_local_past_seen).
+                    # Global position and per-rank cached length under Helix.
                     position_id = request.total_input_len_cp + request.py_decoding_iter - 1
                     past_seen_token_num = request.py_helix_local_past_seen
 
                     for beam in range(beam_width):
-                        # Update helix-specific parameters. Plain decode writes a
-                        # single token, so this rank owns exactly one query token
-                        # when active and none when inactive.
+                        # Plain decode: one query token when active, none when inactive.
                         helix_is_inactive_rank.append(
                             request.py_helix_is_inactive_rank)
                         helix_position_offsets.append(position_id)
@@ -4096,12 +4053,7 @@ class PyTorchModelEngine(ModelEngine):
                         non_blocking=True)
 
                 if _has_cp_helix:
-                    # Helix per-rank kv-length correction. Under Helix only the
-                    # owner of the prior iteration's group cached its committed
-                    # tokens (1 + accepted = new_tokens_lens), so the correction is
-                    # prev_owned_mask * new_tokens_lens, applied to kv_lens_cuda in
-                    # _preprocess_inputs via this buffer. Non-owner ranks correct
-                    # by zero.
+                    # Owner-gated kv-length correction for overlap scheduling.
                     helix_prev_owned_cuda = torch.tensor(
                         helix_prev_group_owns,
                         dtype=torch.int,

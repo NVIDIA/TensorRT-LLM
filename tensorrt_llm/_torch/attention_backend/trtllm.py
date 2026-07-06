@@ -444,10 +444,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 device='cpu',
                 pin_memory=prefer_pinned(),
             )
-            # One flag per sequence. Helix ownership is per verify group: all of
-            # a sequence's query tokens (golden and drafts) are owned by a single
-            # CP rank, and the Helix KV-write kernel indexes the flag per sequence
-            # (batch_idx).
+            # One inactive flag per sequence; Helix ownership is per verify group.
             self.helix_is_inactive_rank = self.get_empty(
                 buffers,
                 (self.max_num_sequences, ),
@@ -461,18 +458,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 pin_memory=prefer_pinned(),
             )
 
-            # Helix MTP verify: flattened per-query-row generation view.
-            # The trtllm-gen MLA generation kernel derives each query row's KV
-            # length from a single per-request scalar plus a +1-per-row causal
-            # slope (when mMaxSeqLenQ > 1). That slope is only correct for ranks
-            # that own the contiguous bottom rows of the block, so it drops
-            # cached tokens on inactive ranks (which own none). Presenting the
-            # generation read as one q_len==1 request per query row makes
-            # mMaxSeqLenQ == 1, removing the slope so each row attends its exact
-            # KV bound (cached + owned_count(r)). These static buffers hold that
-            # flattened view so it stays CUDA-graph capturable. The KV write runs
-            # on the un-flattened per-sequence layout earlier in the forward, so
-            # only the read is reshaped here.
+            # Static buffers for the flattened per-query-row generation read.
             self._helix_gen_flatten_active = False
             self._helix_flat_total_q = 0
             self._helix_flat_kv_lens_cuda = self.get_empty(
@@ -515,9 +501,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 dtype=torch.int,
                 capture_graph=capture_graph,
             )
-            # Per flattened row: index of the sequence it belongs to. Used to
-            # broadcast a per-request overlap kv-length correction onto the
-            # flattened per-row bounds (see apply_helix_overlap_flatten_correction).
+            # Sequence index per flattened row (for overlap kv-length correction).
             self._helix_flat_row_to_seq = self.get_empty(
                 buffers,
                 (self.max_num_tokens, ),
@@ -557,22 +541,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def _maybe_prepare_helix_flatten(self, cached_token_lens: torch.Tensor,
                                      kv_lens: torch.Tensor) -> None:
-        """Populate the flattened per-query-row generation view for Helix MTP.
+        """Build the flattened per-query-row generation view for Helix MTP verify.
 
-        Presents the generation attention read as one q_len == 1 request per
-        query row so the trtllm-gen causal slope vanishes, giving each row its
-        exact KV bound cached + owned_count(r). With per-request ownership a rank
-        owns all of a sequence's query rows (active) or none (inactive), so
-        owned_count(r) is the inclusive within-segment row index on an active
-        sequence and 0 on an inactive one. This keeps inactive ranks, which own
-        no new tokens but still attend the cached prefix, from losing cached
-        positions to the kernel's causal-tail reservation.
-
-        Only triggers for a pure-generation batch (num_contexts == 0) running a
-        multi-token verify (total_q > num_seqs); otherwise leaves
-        _helix_gen_flatten_active False so the normal path is used. A plain
-        q_len == 1 decode needs no flattening because its slope term is already
-        zero.
+        Each query row is presented as q_len == 1 so the trtllm-gen causal slope
+        vanishes and each row attends its exact KV bound. Only runs for a pure-
+        generation multi-token verify (num_contexts == 0 and total_q > num_seqs).
         """
         self._helix_gen_flatten_active = False
         if not (self.enable_helix and self.num_contexts == 0
@@ -586,9 +559,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if total_q <= num_seqs:
             return
 
-        # Per-request ownership: every query row of a sequence is owned (active
-        # rank) or not (inactive rank). owned_count(r) is the inclusive
-        # within-segment row index (1..q_len) on an active sequence, 0 otherwise.
+        # Active rank: inclusive row index (1..q_len). Inactive rank: 0.
         active = (~self.helix_is_inactive_rank_cpu[:num_seqs]).to(torch.int64)
         seg_starts = torch.cumsum(seg_lens, 0) - seg_lens
         row_incl = (torch.arange(total_q, dtype=torch.int64) -
@@ -621,10 +592,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self._helix_flat_cu_kv_seqlens[:total_q + 1].copy_(kv_offsets,
                                                            non_blocking=True)
 
-        # Row -> sequence index, so an overlap-scheduler per-request kv-length
-        # correction can be broadcast onto the per-row bounds on-device (the
-        # cached lengths used above are stale under overlap; see
-        # apply_helix_overlap_flatten_correction).
+        # Row to sequence index for on-device overlap kv-length correction.
         row_to_seq = torch.repeat_interleave(
             torch.arange(num_seqs, dtype=torch.int), seg_lens.to(torch.int))
         self._helix_flat_row_to_seq[:total_q].copy_(row_to_seq,
@@ -650,22 +618,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             per_request_kv_offset: torch.Tensor,
             max_extra_per_row: int,
             sign: int = 1) -> None:
-        """Correct the flattened per-row KV bounds for the overlap scheduler.
+        """Correct flattened per-row KV bounds for the overlap scheduler.
 
-        _maybe_prepare_helix_flatten builds the per-row bounds from cached lengths
-        that, under overlap, are stale by the prior step's committed count. This
-        adds the per-request kv-length correction (per_request_kv_offset, the
-        Helix owner-gated value already applied to kv_lens_cuda) to every
-        flattened row of the request and rebuilds the cumulative KV offsets.
-
-        Applied with sign=+1 in _preprocess_inputs and undone with sign=-1 in
-        _postprocess_inputs, so CUDA-graph capture (which replays the forward over
-        a base built once) stays consistent.
-
-        host_total_kv_lens[1] is a host scalar and cannot be made exact without a
-        device-to-host sync, so it is bumped by a safe upper bound
-        (total_q * max_extra_per_row); the FMHA op treats it as a sizing hint. A
-        no-op when flattening is inactive.
+        Broadcasts the per-request kv-length correction onto each flattened row
+        and rebuilds cumulative KV offsets. Applied with sign=+1 in
+        _preprocess_inputs and undone with sign=-1 in _postprocess_inputs.
         """
         if not getattr(self, "_helix_gen_flatten_active", False):
             return
@@ -675,38 +632,24 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         off_rows = per_request_kv_offset[self._helix_flat_row_to_seq[:n].to(
             torch.long)].to(self._helix_flat_kv_lens_cuda.dtype)
         self._helix_flat_kv_lens_cuda[:n] += sign * off_rows
-        # Only the device kv-length is corrected; the host copy (kv_lens_runtime)
-        # is left stale, matching how the non-Helix overlap path corrects only
-        # kv_lens_cuda. The device tensor is the authoritative per-request read
-        # bound, and a device-to-host copy here would serialize the pipeline.
-        #
-        # This runs inside the captured CUDA-graph region, so the leading zero is
-        # written with a device memset rather than a Python-scalar assignment,
-        # which would synchronize and abort capture.
+        # Device-only correction; host kv_lens stays stale (non-Helix overlap path).
+        # Leading zero via device memset (CUDA graph capture safe).
         self._helix_flat_cu_kv_seqlens[:1].zero_()
         torch.cumsum(self._helix_flat_kv_lens_cuda[:n],
                      0,
                      out=self._helix_flat_cu_kv_seqlens[1:n + 1])
-        # Safe upper bound on the flattened generation total; over-provision is
-        # tolerated (the FMHA op treats it as a sizing hint, matching capture).
-        # host_total_kv_lens lives on the CPU, so this stays a host-only update
-        # and does not touch the captured stream.
+        # Host sizing hint only; exact total would require a device sync.
         self._helix_flat_host_total_kv_lens[1] = (
             int(self._helix_flat_host_total_kv_lens[1]) +
             sign * n * max_extra_per_row)
 
     @contextlib.contextmanager
     def helix_flattened_generation(self):
-        """Temporarily swap the generation attention metadata to the flattened
-        per-query-row view for a Helix MTP verify.
+        """Swap generation attention metadata to the flattened per-row view.
 
         Yields (cu_q_seqlens, cu_kv_seqlens) for the flattened layout, or
-        (None, None) when flattening is inactive. The swap targets the
-        per-request fields the trtllm-gen MLA generation FMHA consumes. num_seqs
-        is derived in C++ from host_context_lengths.size(0), which is
-        prompt_lens_cpu_runtime, so presenting total_q rows makes
-        mMaxSeqLenQ == 1. The KV write already ran un-flattened, so this only
-        reshapes the read.
+        (None, None) when flattening is inactive. Reshapes the read only; the KV
+        write already ran on the un-flattened layout.
         """
         if not getattr(self, "_helix_gen_flatten_active", False):
             yield None, None
@@ -733,8 +676,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.host_total_kv_lens[1] = self._helix_flat_host_total_kv_lens[1]
         if self._helix_flat_block_offsets is not None:
             self.kv_cache_block_offsets = self._helix_flat_block_offsets[:, :n]
-        # The C++ op sizes its semaphore and workspace arrays from
-        # max_num_requests, and the flattened batch has total_q requests.
+        # Flattened batch has total_q requests; size C++ workspace accordingly.
         self.max_num_requests = max(self.max_num_requests, n)
         try:
             yield (self._helix_flat_cu_q_seqlens[:n + 1],
@@ -836,12 +778,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.enable_helix:
             assert cached_token_lens is not None, "cached_token_lens should be set for helix"
             kv_lens = cached_token_lens.clone()
-            # Ownership is per request, with one inactive flag per sequence. An
-            # active rank owns all of a sequence's query tokens (1 for plain
-            # decode, 1 + draft_len for a speculative verify) and an inactive rank
-            # owns none. So the per-rank kv length grows by seq_lens_kv on active
-            # sequences and not at all on inactive ones. The same rule covers
-            # plain decode, context, and the multi-token verify.
+            # Active sequences grow kv length by seq_lens_kv; inactive ones do not.
             active_rank = ~self.helix_is_inactive_rank_cpu[:self.num_seqs]
             kv_lens[active_rank] += self.seq_lens_kv[active_rank]
         else:
@@ -889,9 +826,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     self.draft_kv_cache_block_offsets, self.request_ids,
                     self.beam_width, self.num_contexts, self.num_seqs)
 
-        # Helix MTP verify: build the flattened per-query-row generation view.
-        # Must run after copy_batch_block_offsets so the per-row block-table
-        # replication reads this step's block offsets, not a stale or zero buffer.
+        # Build flattened view after block offsets are ready.
         self._maybe_prepare_helix_flatten(cached_token_lens, kv_lens)
 
         # Don't pass self.kv_lens as kv_lens here because it includes extra

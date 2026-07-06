@@ -371,7 +371,7 @@ def merge_helix_requests(
         )
         req.total_input_len_cp = input_len
         req.seqlen_this_rank_cp = len(input_ids_this_rank)
-        # Context-shard length this rank owns, the base for the per-rank KV length.
+        # Context shard length owned by this rank (base for per-rank KV length).
         req.py_helix_context_seqlen_cp = len(input_ids_this_rank)
         req_with_children.append(req)
         if req.child_requests:

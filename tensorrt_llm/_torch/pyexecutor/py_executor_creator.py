@@ -415,15 +415,8 @@ def create_py_executor(
                 f"decoding requires multiple tokens per sequence. Please use 'TRTLLM' attention "
                 f"backend instead by setting attn_backend='TRTLLM'.")
 
-        # Helix CP + speculative decoding supports the overlap scheduler only for
-        # the one-model MTP-Eagle / Eagle3 modes on the TRTLLM attention backend.
-        # Under overlap the per-step accepted-token count is known only
-        # on-device, so the host-computed Helix verify metadata would be stale.
-        # For the supported modes this is handled by keeping KV ownership
-        # host-deterministic (resource_manager._helix_prepare_generation_kv) and
-        # correcting the accept-dependent RoPE positions and per-rank kv-lengths
-        # on-device (model_engine._apply_helix_overlap_corrections). Any other
-        # Helix + speculative-decoding combination still force-disables overlap.
+        # Helix CP + spec decode: overlap only for MTP-Eagle/Eagle3 on TRTLLM backend.
+        # Ownership stays host-deterministic; accept-dependent metadata is fixed on-device.
         if (not llm_args.disable_overlap_scheduler
                 and llm_args.context_parallel_size > 1
                 and llm_args.cp_config is not None

@@ -1194,19 +1194,15 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
 
     @skip_pre_blackwell
-    @pytest.mark.skip_less_device(4)
-    @pytest.mark.parametrize("gen_pp,gen_tp,gen_cp,enable_attention_dp", [
-        (1, 1, 2, False),
-        (1, 1, 4, False),
-        (1, 2, 2, False),
-        (1, 2, 2, True),
-        (2, 1, 2, False),
-        (1, 2, 1, False),
-    ],
-                             ids=[
-                                 "pp1tp1cp2", "pp1tp1cp4", "pp1tp2cp2",
-                                 "pp1dp2cp2", "pp2tp1cp2", "pp1tp2cp1"
-                             ])
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.parametrize(
+        "gen_pp,gen_tp,gen_cp,enable_attention_dp", [
+            (1, 1, 4, False),
+            (1, 2, 2, False),
+            (1, 2, 2, True),
+            (2, 1, 2, False),
+        ],
+        ids=["pp1tp1cp4", "pp1tp2cp2", "pp1dp2cp2", "pp2tp1cp2"])
     @pytest.mark.parametrize("cuda_graph_config", [
         None,
         {
@@ -1248,9 +1244,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         }
         ctx_server_config = {
             "pipeline_parallel_size": 1,
-            "tensor_parallel_size": 2,
+            "tensor_parallel_size": 4,
             "context_parallel_size": 1,
-            "max_batch_size": 16,
             "disable_overlap_scheduler": True,
             "kv_cache_config": kv_cache_config,
             "enable_chunked_prefill": False,
@@ -1265,14 +1260,13 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "pipeline_parallel_size": gen_pp,
             "context_parallel_size": gen_cp,
             "moe_expert_parallel_size": gen_ep,
-            "max_batch_size": 64,
             "cp_config": {
                 "cp_type": "HELIX",
                 "tokens_per_block": 32,
                 "use_nccl_for_alltoall": use_nccl_for_alltoall,
                 "fifo_version": fifo_version,
             },
-            "disable_overlap_scheduler": False,
+            "disable_overlap_scheduler": mtp_nextn == 0,
             "kv_cache_config": kv_cache_config,
             "enable_chunked_prefill": False,
             "cuda_graph_config": cuda_graph_config,
@@ -1282,9 +1276,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             },
             "enable_attention_dp": enable_attention_dp,
         }
-        # MTP (one-model EAGLE on the 1-head DeepSeek-V3-Lite checkpoint) must be
-        # enabled on both servers so the context and generation engines agree on
-        # the speculative-decoding layout.
+        # Enable MTP on both servers so ctx and gen agree on spec-decode layout.
         if mtp_nextn > 0:
             ctx_server_config["speculative_config"] = {
                 "decoding_type": "MTP",

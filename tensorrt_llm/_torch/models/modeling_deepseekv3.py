@@ -1619,12 +1619,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
                  aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
                  is_separate_draft_engine: bool = False,
                  mapping_with_cp: Optional[Mapping] = None):
-        # Under Helix CP, CP ranks are repurposed to TP for non-attention
-        # layers, so model_config.mapping has tp_size == cp_size folded in.
-        # mapping_with_cp carries the original (un-repurposed) mapping and must
-        # be threaded into attention so the MTP layer's MLA keeps the full head
-        # count, matching how the main decoder layers are built (and what the
-        # shared kv_b_proj weight loader expects).
+        # Thread mapping_with_cp into attention so MLA keeps the full head count.
         super().__init__(model_config,
                          layer_idx,
                          aux_stream_dict,
@@ -1705,12 +1700,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             disable_on_compile=True,
         )
         hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
-        # Split hidden_states columnwise based on TP. Use self.mapping (captured
-        # at construction) rather than self.model_config.mapping: under Helix CP
-        # the latter is restored to the original (un-repurposed) mapping after
-        # __init__, whereas eh_proj was built (ROW-parallel) with the repurposed
-        # mapping. self.mapping matches eh_proj's sharding and the rest of this
-        # forward.
+        # Use self.mapping (captured at construction), not model_config.mapping.
         tp_size = self.mapping.tp_size
         tp_rank = self.mapping.tp_rank
 

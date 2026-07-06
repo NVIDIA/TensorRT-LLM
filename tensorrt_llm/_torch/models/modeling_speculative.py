@@ -1439,8 +1439,7 @@ class MTPForCausalLM(nn.Module):
         # Import here to avoid circular import
         model_type = model_config.pretrained_config.model_type
         mtp_layer = None
-        # Only DeepseekV3MTP threads the original (un-repurposed) Helix CP
-        # mapping into its attention; other MTP layer types do not accept it.
+        # Only DeepseekV3MTP accepts mapping_with_cp for Helix CP attention.
         supports_mapping_with_cp = False
         match model_type:
             case "glm4_moe":
@@ -1482,9 +1481,7 @@ class MTPForCausalLM(nn.Module):
 
         moe_load_balancer_set_repeated_for_next_layer(mtp_repeat_count)
 
-        # Under Helix CP the target model holds the original mapping (with CP)
-        # as mapping_with_cp; thread it into the MTP attention so its MLA is
-        # built with the same head count as the main decoder layers.
+        # Thread mapping_with_cp into MTP attention for correct MLA head count.
         mtp_layer_kwargs = {}
         mapping_with_cp = getattr(model, 'mapping_with_cp', None)
         if supports_mapping_with_cp and mapping_with_cp is not None:
