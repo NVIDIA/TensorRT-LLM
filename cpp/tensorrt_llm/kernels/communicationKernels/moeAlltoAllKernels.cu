@@ -213,8 +213,13 @@ __device__ __forceinline__ int compute_target_rank_id(int expert_id, int base, i
 // Test bit `rank` in a kRankMaskWords-wide little-endian uint64 bitmask.
 // Word 0 covers ranks 0..63, word 1 covers ranks 64..127, etc.
 // `rank >> 6` and `rank & 63` divide / modulo by 64.
-__device__ __forceinline__ bool is_rank_active(uint64_t const* mask, int rank)
+template <bool ENABLE_FAULT_TOLERANCE>
+__host__ __device__ __forceinline__ bool is_rank_active(uint64_t const* mask, int rank)
 {
+    if constexpr (!ENABLE_FAULT_TOLERANCE)
+    {
+        return true;
+    }
     return (mask[rank >> 6] >> (rank & 63)) & 1ULL;
 }
 
@@ -392,7 +397,7 @@ __global__ void moeA2APrepareDispatchKernel(
 // Dispatch Kernels
 // ============================================================================
 
-template <typename ThreadingPolicy, int TOP_K, bool ENABLE_EPLB>
+template <typename ThreadingPolicy, int TOP_K, bool ENABLE_EPLB, bool ENABLE_FAULT_TOLERANCE>
 __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [local_num_tokens, TOP_K]
     const DispatchKernelPointers ptrs,                                      // Struct containing all kernel pointers
     int num_payloads,                                                       // Number of payloads
@@ -440,15 +445,11 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
             // Supports the non-divisible case where num_experts % ep_size != 0.
             int target_rank = compute_target_rank_id(expert_id, ep_base, ep_remainder);
 
-            // Skip duplicates AND dead ranks: both produce the same -1 sentinel that combine
-            // checks via topk_send_indices[k] < 0. A token whose only target is dead is dropped
-            // from this collective; higher-layer logic (EPLB redistribution) is responsible
-            // for re-routing such tokens on subsequent iterations.
+            // Skip duplicate target ranks. Runtime routing is expected to avoid inactive ranks.
             int const mask_word = target_rank >> 6;
             uint64_t const mask_bit = 1ULL << (target_rank & 63);
-            bool const target_already_copied = already_copied[mask_word] & mask_bit;
-            bool const target_dead = !is_rank_active(ptrs.active_rank_mask, target_rank);
-            if (target_already_copied || target_dead)
+            bool const target_already_copied = (already_copied[mask_word] & mask_bit) != 0;
+            if (target_already_copied)
             {
                 if (thread_idx == 0)
                 {
@@ -527,12 +528,11 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 
         if (is_last_token)
         {
-// Store send_counters to recv_counters.
-// Skip masked target ranks: their symmetric memory may be inaccessible.
 #pragma unroll 1 // No unroll as one iter is typically enough
             for (int target_rank = lane_id; target_rank < ep_size; target_rank += warpSize)
             {
-                if (!is_rank_active(ptrs.active_rank_mask, target_rank))
+                // Do not write counters into inactive ranks' symmetric workspace.
+                if (!is_rank_active<ENABLE_FAULT_TOLERANCE>(ptrs.active_rank_mask, target_rank))
                     continue;
                 int send_count = ptrs.send_counters[target_rank];
                 ptrs.recv_counters[target_rank][rank_id] = send_count;
@@ -541,11 +541,11 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
             if constexpr (ENABLE_EPLB)
             {
                 // Write local stats into peer buffers before the release fence below.
-                // Skip masked target ranks for the same reason as above.
 #pragma unroll 1
                 for (int target_rank = 0; target_rank < ep_size; ++target_rank)
                 {
-                    if (!is_rank_active(ptrs.active_rank_mask, target_rank))
+                    // Do not publish EPLB stats into inactive ranks' symmetric workspace.
+                    if (!is_rank_active<ENABLE_FAULT_TOLERANCE>(ptrs.active_rank_mask, target_rank))
                         continue;
                     int* target_stats = ptrs.eplb_gathered_stats[target_rank];
                     for (int expert_id = lane_id; expert_id < eplb_stats_num_experts; expert_id += warpSize)
@@ -565,12 +565,11 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 #else
             asm volatile("fence.acq_rel.sys;");
 #endif
-            // Signal completion to all active peers; skip dead ranks (their symmetric memory
-            // is unreachable).
 #pragma unroll 1 // No unroll as one iter is typically enough
             for (int target_rank = lane_id; target_rank < ep_size; target_rank += warpSize)
             {
-                if (!is_rank_active(ptrs.active_rank_mask, target_rank))
+                // Do not signal inactive peers; their flag memory may be unreachable.
+                if (!is_rank_active<ENABLE_FAULT_TOLERANCE>(ptrs.active_rank_mask, target_rank))
                     continue;
                 uint32_t* flag_addr = &ptrs.completion_flags[target_rank][rank_id];
                 asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(expected_value));
@@ -581,12 +580,11 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 #endif
             }
 
-            // Wait for all active peers to signal; skip dead ranks (otherwise we would
-            // spin forever — this is the bug the rank-mask is here to prevent).
 #pragma unroll 1 // No unroll
             for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize)
             {
-                if (!is_rank_active(ptrs.active_rank_mask, peer_rank))
+                // Do not wait on inactive peers; they will not signal this collective.
+                if (!is_rank_active<ENABLE_FAULT_TOLERANCE>(ptrs.active_rank_mask, peer_rank))
                     continue;
                 bool flag_set = false;
                 auto s = clock64();
@@ -636,10 +634,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     TLLM_CHECK(params.ep_rank >= 0 && params.ep_rank < params.ep_size);
     TLLM_CHECK(params.local_num_tokens >= 0);
     TLLM_CHECK(params.num_payloads > 0 && params.num_payloads <= kMaxPayloads);
-    // The local rank must always be marked active in its own view of the mask;
-    // otherwise the kernel itself would be running on a "dead" rank.
-    TLLM_CHECK_WITH_INFO((params.active_rank_mask[params.ep_rank >> 6] >> (params.ep_rank & 63)) & 1ULL,
-        "active_rank_mask must mark the local ep_rank (%d) as active", params.ep_rank);
+    bool const enable_fault_tolerance = params.enable_fault_tolerance;
 
     // Prepare kernel pointers struct
     DispatchKernelPointers kernel_ptrs = {};
@@ -693,12 +688,15 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
         grid_size = 1;
     }
     int shared_bytes = 2 * params.top_k * (int) sizeof(int);
-    SWITCH_BOOL(params.enable_eplb, EPLB_STATS, SWITCH_TOP_K(params.top_k, TOP_K, {
-        auto kernel_fn = moeA2ADispatchKernel<BlockPolicy, TOP_K, EPLB_STATS>;
-        launchWithPdlWhenEnabled("moeA2ADispatchKernel", kernel_fn, grid_size, kBlockSize, shared_bytes, params.stream,
-            params.token_selected_experts, kernel_ptrs, params.num_payloads, params.max_tokens_per_rank,
-            params.local_num_tokens, params.ep_rank, params.ep_size, params.num_experts, params.eplb_stats_num_experts);
-    }))
+    SWITCH_BOOL(enable_fault_tolerance, ENABLE_FAULT_TOLERANCE, {SWITCH_BOOL(params.enable_eplb, EPLB_STATS, {
+        SWITCH_TOP_K(params.top_k, TOP_K, {
+            auto kernel_fn = moeA2ADispatchKernel<BlockPolicy, TOP_K, EPLB_STATS, ENABLE_FAULT_TOLERANCE>;
+            launchWithPdlWhenEnabled("moeA2ADispatchKernel", kernel_fn, grid_size, kBlockSize, shared_bytes,
+                params.stream, params.token_selected_experts, kernel_ptrs, params.num_payloads,
+                params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank, params.ep_size, params.num_experts,
+                params.eplb_stats_num_experts);
+        });
+    })})
 }
 
 // ============================================================================
@@ -741,7 +739,7 @@ __device__ void vectorized_combine_impl(T* dst_typed_base, int size_per_token, i
         {
             int target_rank = ptrs.topk_target_ranks[local_token_idx * TOP_K + k];
             int dst_idx = ptrs.topk_send_indices[local_token_idx * TOP_K + k];
-            if (dst_idx < 0 || !is_rank_active(ptrs.active_rank_mask, target_rank))
+            if (dst_idx < 0)
             {
                 acc[k].fill(0.0f);
                 continue;
@@ -766,12 +764,6 @@ __device__ void vectorized_combine_impl(T* dst_typed_base, int size_per_token, i
 #pragma unroll
         for (int k = 0; k < TOP_K; ++k)
         {
-            int target_rank = ptrs.topk_target_ranks[local_token_idx * TOP_K + k];
-            int dst_idx = ptrs.topk_send_indices[local_token_idx * TOP_K + k];
-            if (dst_idx < 0 || !is_rank_active(ptrs.active_rank_mask, target_rank))
-            {
-                continue; // acc[k] already holds 0.0f from fill() above
-            }
 #pragma unroll
             for (int j = elems_per_vec - 1; j >= 0; --j)
                 acc[k][j] = static_cast<float>(reinterpret_cast<InT const*>(&acc[k])[j]);
@@ -1158,7 +1150,7 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, void cons
 // Generic Combine Kernel Implementation (Templated by data type)
 // ============================================================================
 
-template <typename T, typename ThreadingPolicy, int TOP_K>
+template <typename T, typename ThreadingPolicy, int TOP_K, bool ENABLE_FAULT_TOLERANCE>
 __global__ void moeA2ACombineKernel(
     const CombineKernelPointers ptrs, // Combine-specific struct, src_data_ptrs[0] is output
     int max_tokens_per_rank, int elements_per_token, int local_num_tokens, int rank_id, int ep_size,
@@ -1203,7 +1195,8 @@ __global__ void moeA2ACombineKernel(
 #pragma unroll 1 // No unroll
             for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize)
             {
-                if (!is_rank_active(ptrs.active_rank_mask, peer_rank))
+                // Do not signal inactive peers; their flag memory may be unreachable.
+                if (!is_rank_active<ENABLE_FAULT_TOLERANCE>(ptrs.active_rank_mask, peer_rank))
                     continue;
                 uint32_t* flag_addr = &ptrs.completion_flags[peer_rank][rank_id];
                 asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(expected_value));
@@ -1214,12 +1207,11 @@ __global__ void moeA2ACombineKernel(
             }
         }
 
-        // Wait for all active peers to signal; skip dead ranks (otherwise we would spin
-        // forever — this is the bug the rank-mask is here to prevent).
 #pragma unroll 1 // No unroll
         for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize)
         {
-            if (!is_rank_active(ptrs.active_rank_mask, peer_rank))
+            // Do not wait on inactive peers; they will not signal this collective.
+            if (!is_rank_active<ENABLE_FAULT_TOLERANCE>(ptrs.active_rank_mask, peer_rank))
                 continue;
             bool flag_set = false;
             auto s = clock64();
@@ -1327,10 +1319,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     TLLM_CHECK(params.ep_rank >= 0 && params.ep_rank < params.ep_size);
     TLLM_CHECK(params.local_num_tokens >= 0);
     TLLM_CHECK(params.elements_per_token > 0);
-    // The local rank must always be marked active in its own view of the mask;
-    // otherwise the kernel itself would be running on a "dead" rank.
-    TLLM_CHECK_WITH_INFO((params.active_rank_mask[params.ep_rank >> 6] >> (params.ep_rank & 63)) & 1ULL,
-        "active_rank_mask must mark the local ep_rank (%d) as active", params.ep_rank);
+    bool const enable_fault_tolerance = params.enable_fault_tolerance;
 
     // Configure kernel launch (one block per token).
     int const kBlockSize = tensorrt_llm::common::getEnvMoeA2ACombineBlockSize();
@@ -1385,14 +1374,16 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     auto const effective_dtype = params.use_low_precision ? nvinfer1::DataType::kFP8 : params.dtype;
 
     // Launch appropriate kernel with compact macros
-    SWITCH_DTYPE(effective_dtype, TKernelType, {
-        SWITCH_TOP_K(params.top_k, TOP_K, {
-            auto kernel_fn = moeA2ACombineKernel<TKernelType, BlockPolicy, TOP_K>;
-            launchWithPdlWhenEnabled("moeA2ACombineKernel", kernel_fn, grid, kBlockSize, 0, params.stream, kernel_ptrs,
-                params.max_tokens_per_rank, params.elements_per_token, params.local_num_tokens, params.ep_rank,
-                params.ep_size, stride_per_token);
+    SWITCH_BOOL(enable_fault_tolerance, ENABLE_FAULT_TOLERANCE, {
+        SWITCH_DTYPE(effective_dtype, TKernelType, {
+            SWITCH_TOP_K(params.top_k, TOP_K, {
+                auto kernel_fn = moeA2ACombineKernel<TKernelType, BlockPolicy, TOP_K, ENABLE_FAULT_TOLERANCE>;
+                launchWithPdlWhenEnabled("moeA2ACombineKernel", kernel_fn, grid, kBlockSize, 0, params.stream,
+                    kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token, params.local_num_tokens,
+                    params.ep_rank, params.ep_size, stride_per_token);
+            });
         });
-    });
+    })
 }
 
 // Kernel to sanitize expert ids for invalid tokens

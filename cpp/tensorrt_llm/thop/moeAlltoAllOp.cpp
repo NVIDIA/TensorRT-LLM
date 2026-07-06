@@ -79,6 +79,11 @@ inline void resolveActiveRankMask(torch::optional<torch::Tensor> const& maskTens
         ") as active");
 }
 
+inline bool hasActiveRankMask(torch::optional<torch::Tensor> const& maskTensor)
+{
+    return maskTensor.has_value() && maskTensor.value().defined();
+}
+
 // Calculate auxiliary data offsets
 MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens, int eplbStatsNumExperts)
 {
@@ -403,9 +408,11 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
         params.eplb_local_stats = nullptr;
     }
 
-    // Resolve the optional active-rank mask. Default (no mask) = all bits set, which
-    // exactly reproduces the pre-fault-tolerance kernel behavior.
-    resolveActiveRankMask(activeRankMask, epRank, params.active_rank_mask);
+    params.enable_fault_tolerance = hasActiveRankMask(activeRankMask);
+    if (params.enable_fault_tolerance)
+    {
+        resolveActiveRankMask(activeRankMask, epRank, params.active_rank_mask);
+    }
 
     params.stream = at::cuda::getCurrentCUDAStream();
 
@@ -570,8 +577,11 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
         params.recv_buffers[target_rank] = target_workspace_ptr + combinePayloadOffset;
     }
 
-    // Resolve the optional active-rank mask. Default (no mask) = all bits set.
-    resolveActiveRankMask(activeRankMask, epRank, params.active_rank_mask);
+    params.enable_fault_tolerance = hasActiveRankMask(activeRankMask);
+    if (params.enable_fault_tolerance)
+    {
+        resolveActiveRankMask(activeRankMask, epRank, params.active_rank_mask);
+    }
 
     params.stream = at::cuda::getCurrentCUDAStream();
 

@@ -70,9 +70,9 @@ struct DispatchKernelPointers
     int* eplb_gathered_stats[kMaxRanks]; // [ep_size, eplb_stats_num_experts] per rank
 
     // Active-rank bitmask: bit i set => rank i is alive and participates in this collective.
-    // Word 0 covers ranks 0..63; word 1 covers ranks 64..127. Tokens routed to a masked
-    // rank are dropped (topk_*[k] = -1); flag writes/waits to/from masked peers are skipped.
-    // The local rank's own bit must always be set; this is checked at launch time.
+    // Word 0 covers ranks 0..63; word 1 covers ranks 64..127. Routing is expected to avoid
+    // inactive ranks; the kernel uses this mask only for peer counters, stats, and completion
+    // flag writes/waits.
     uint64_t active_rank_mask[kRankMaskWords];
 };
 
@@ -93,8 +93,7 @@ struct CombineKernelPointers
     int const* topk_send_indices; // dst index per k, -1 for duplicates
 
     // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Combine skips flag
-    // writes/waits to/from masked peers and also skips per-token accumulation for ranks that
-    // become inactive between dispatch and combine.
+    // writes/waits to/from masked peers.
     uint64_t active_rank_mask[kRankMaskWords];
 };
 
@@ -139,9 +138,11 @@ struct MoeA2ADispatchParams
     int const* eplb_local_stats;         // [eplb_stats_num_experts]
     int* eplb_gathered_stats[kMaxRanks]; // [ep_size, eplb_stats_num_experts] per rank
 
-    // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. The launch function
-    // copies these words into the kernel pointers struct. Defaults to all-ones for
-    // backwards-compatible "no masking" behavior.
+    // Whether to instantiate kernels with active-rank checks enabled.
+    bool enable_fault_tolerance{false};
+
+    // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Used only when
+    // enable_fault_tolerance is true; defaults to all-ones for backwards-compatible behavior.
     uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}, ~uint64_t{0}};
 
     // CUDA stream
@@ -189,9 +190,11 @@ struct MoeA2ACombineParams
                                            // rank has signaled the target rank
     void const* recv_buffers[kMaxRanks];   // Per-rank receive buffers (only for single payload)
 
-    // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. The launch function
-    // copies these words into the kernel pointers struct. Defaults to all-ones for
-    // backwards-compatible "no masking" behavior.
+    // Whether to instantiate kernels with active-rank checks enabled.
+    bool enable_fault_tolerance{false};
+
+    // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Used only when
+    // enable_fault_tolerance is true; defaults to all-ones for backwards-compatible behavior.
     uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}, ~uint64_t{0}};
 
     // CUDA stream
