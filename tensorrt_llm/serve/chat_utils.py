@@ -511,9 +511,8 @@ def parse_chat_messages_coroutines(
                     msg_placeholder_counts)
         mm_placeholder_counts.append(msg_placeholder_counts)
 
-    # ``mm_item_order`` is captured synchronously from the tracker; it does
-    # not need to ride the coroutine. Downstream callers who care attach it
-    # to their prompt dict alongside the awaited multi_modal_data.
+    # ``item_order`` is populated synchronously by ``add_data``, so it can
+    # be returned directly (not through the coroutine).
     return (conversation, mm_data_tracker.retrieve_all_async(),
             mm_placeholder_counts, mm_data_tracker.item_order())
 

@@ -372,10 +372,9 @@ class MultimodalDataTracker:
         self._embeddings = defaultdict[str, list](list)
         self._placeholder_counts = defaultdict[str, int](int)
         self._placeholder_to_modality: dict[str, str] = {}
-        # Prompt-order manifest of data-backed items, populated by add_data.
-        # Each entry is ``{"modality": m, "index": i}`` where ``i`` indexes
-        # into ``self._data[m]``. Embedding-backed items are skipped since
-        # the encoder-interleave manifest addresses raw payload only.
+        # Prompt-order manifest of data-backed items. Populated by
+        # ``add_data`` (skipping ``is_embedding=True`` items — the
+        # interleave manifest addresses raw payload only).
         self._item_order: list[dict[str, Union[str, int]]] = []
         self._multimodal_server_config = multimodal_server_config if multimodal_server_config is not None else MultimodalServerConfig(
         )
@@ -468,11 +467,8 @@ class MultimodalDataTracker:
     def item_order(self) -> List[Dict[str, Union[str, int]]]:
         """Prompt-order manifest of data-backed items.
 
-        Each entry is ``{"modality": m, "index": i}`` where ``i`` addresses
-        the item's position in ``multi_modal_data[m]``. Populated in
-        content-parts order by ``add_data`` — the same order the placeholders
-        will occupy in the rendered prompt for models that opt into
-        ``interleave_placeholders=True``.
+        Each entry is ``{"modality": m, "index": i}`` where ``i`` indexes
+        ``multi_modal_data[m]``.
         """
         return list(self._item_order)
 

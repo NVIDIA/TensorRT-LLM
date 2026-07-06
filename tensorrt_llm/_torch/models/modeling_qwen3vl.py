@@ -1062,10 +1062,8 @@ class Qwen3VisionModelBase(nn.Module):
     def _parse_and_batch_multimodal_data(
         self, multimodal_params: List[MultimodalParams]
     ) -> Tuple[Dict[str, Any], Dict[str, List[Any]]]:
-        # Per-request validation: any individual request carrying both
-        # modalities MUST provide a prompt-order manifest. Batch-level checks
-        # would false-positive on heterogeneous single-modality batches
-        # (image-only request batched with a video-only request).
+        # Only the request itself knows how its image and video items
+        # interleave in the prompt, so a mixed request must carry a manifest.
         for mp in multimodal_params:
             data = mp.multimodal_data or {}
             if (
@@ -1077,9 +1075,8 @@ class Qwen3VisionModelBase(nn.Module):
                     "Qwen3-VL mixed-modality requests must carry mm_item_order on MultimodalParams."
                 )
 
-        # Any mixed request in the batch triggers the interleave path;
-        # single-modality (per-request) requests piggyback on it. Otherwise
-        # fall through to the unchanged per-modality contiguous path below.
+        # A single mixed request drives the whole batch through the interleave
+        # path; single-modality requests piggyback on it.
         if any(
             mp.mm_item_order
             and mp.multimodal_data.get("image") is not None
@@ -1158,8 +1155,8 @@ class Qwen3VisionModelBase(nn.Module):
             vid_pv = vid.get("pixel_values_videos")
             vid_thw = vid.get("video_grid_thw")
 
-            # Single-modality request piggybacking on the mixed path: append
-            # rows in natural per-modality order.
+            # Single-modality request in a mixed batch — no interleave
+            # needed, just append its rows.
             if not order or img_pv is None or vid_pv is None:
                 if img_pv is not None:
                     pixels.append(img_pv)
@@ -1201,13 +1198,10 @@ class Qwen3VisionModelBase(nn.Module):
         image_grid_thw = mm_extra_data.get("image_grid_thw", None)
         video_grid_thw = mm_extra_data.get("video_grid_thw", None)
 
-        # Reaching here with both keys populated means the batch contained
-        # a mix of image-only and video-only single-modality requests
-        # (mixed-modality requests would have been dispatched to the
-        # interleave path above). The two-branch encoder call below returns
-        # per-modality embed tensors that downstream cannot split back to
-        # per-request without additional plumbing — refuse rather than
-        # silently drop modalities.
+        # Both keys populated here means a heterogeneous single-modality
+        # batch. The two-branch encoder call would emit per-modality embed
+        # tensors that downstream cannot split back to per-request — refuse
+        # rather than silently drop modalities.
         if pixel_values is not None and pixel_values_videos is not None:
             raise ValueError(
                 "Qwen3-VL does not currently support batching image-only "
@@ -1640,11 +1634,8 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
         placeholders_separator="",
         content_format=ContentFormat.STRING,
         # Place `<|image_pad|>` / `<|video_pad|>` at their content-part
-        # position (via `interleave_mm_placeholders` in chat_utils) so the
-        # rendered prompt token order agrees with the `mm_item_order`
-        # manifest recorded by `MultimodalDataTracker`.
-        # `placeholder_placement` above is retained as the fallback for
-        # callers that don't provide `content_parts`.
+        # position so the rendered prompt token order agrees with
+        # `MultimodalParams.mm_item_order`.
         interleave_placeholders=True,
     ),
 )

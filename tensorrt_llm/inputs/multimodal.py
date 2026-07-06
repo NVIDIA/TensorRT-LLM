@@ -503,11 +503,10 @@ class MultimodalParams:
     multimodal_data: Optional[Dict[str, Any]] = field(default_factory=dict)
     multimodal_runtime: Optional[MultimodalRuntimeData] = None
     input_ids_start_offset: int = 0
-    # Prompt-order manifest of data-backed multimodal items, recorded by
-    # ``MultimodalDataTracker`` in content-parts order. Each entry is
-    # ``{"modality": m, "index": i}`` where ``i`` addresses
-    # ``multi_modal_data[m]``. Consumed by encoders that interleave items
-    # across modalities in prompt order (e.g. Qwen3-VL mixed image+video).
+    # Prompt-order manifest of data-backed items. Each entry is
+    # ``{"modality": m, "index": i}`` where ``i`` indexes
+    # ``multi_modal_data[m]``. Read by encoders that interleave items
+    # across modalities in prompt order.
     mm_item_order: Optional[List[Dict[str, Union[str, int]]]] = None
     # CUDA event recorded on a side stream by the MM encoder prefetch path.
     # When set, the consume site in `get_multimodal_embeddings` issues a
@@ -821,12 +820,7 @@ def _update_hash(hasher, item: object) -> None:
 
 
 class MMHashResult(NamedTuple):
-    """Per-modality outputs from :func:`apply_mm_hashes`.
-
-    Named to disambiguate the two parallel-indexed dicts. Callers can still
-    tuple-unpack (``hashes, uuids = apply_mm_hashes(...)``) or index by
-    position — ``NamedTuple`` supports both.
-    """
+    """Per-modality outputs from :func:`apply_mm_hashes`."""
     hashes: Dict[str, List[str]]
     uuids: Optional[Dict[str, List[Optional[str]]]]
 
@@ -849,16 +843,12 @@ def apply_mm_hashes(mm_data: Dict[str, Any],
         hash_lib: Hash function to use (default: blake3)
 
     Returns:
-        Tuple of two per-modality dicts, parallel-indexed by modality then
-        by within-modality item position:
-        - Modality -> list of hash hex strings (64 chars each)
-        - Modality -> list of original UUID strings (None entries for items
-          that fell back to content-only hashing). The whole dict is `None`
-          when the caller supplied no UUIDs at all.
-
-        The per-modality shape mirrors ``mm_data``/``mm_uuids`` and lets
-        callers re-order into prompt order via a manifest without needing
-        to reconstruct per-modality offsets from a flat list.
+        MMHashResult of two per-modality dicts, parallel-indexed by
+        modality then by within-modality item position:
+        - ``hashes``: modality -> list of hash hex strings (64 chars each)
+        - ``uuids``: modality -> list of UUID strings (``None`` entries for
+          items that fell back to content-only hashing). The whole dict is
+          ``None`` when the caller supplied no UUIDs at all.
     """
 
     def _hash_item(item):

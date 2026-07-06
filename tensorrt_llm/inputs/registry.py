@@ -1106,10 +1106,9 @@ def create_input_processor_with_hash(
             raise ValueError(
                 "multimodal hashing could not determine multimodal token "
                 "lengths for the provided input.")
-        # Per-item token counts must be listed in prompt order so downstream
-        # `mm_hashes_flat`, `start_positions`, and `num_mm_tokens` all index
-        # the same items at the same offsets. Fall back to the single-modality
-        # bucket when no prompt-order manifest is present.
+        # `mm_hashes_flat`, `start_positions`, and `num_mm_tokens` must all
+        # index items at the same offsets — project into prompt order via the
+        # manifest.
         mm_item_order = inputs.get("mm_item_order")
         if mm_item_order:
             num_mm_tokens = [
@@ -1163,10 +1162,8 @@ def create_input_processor_with_hash(
                ) > 0 and mm_special_token_ids is not None:
             extra_processed_inputs["multimodal_data"][
                 "special_token_offsets"] = start_special_token_positions
-        # Flatten hashes in prompt order (same rationale as `num_mm_tokens`
-        # above): the radix-tree cache key indexes each item's digest by its
-        # `start_positions` offset, so per-modality dict order would misalign
-        # hashes when a request interleaves modalities.
+        # Same prompt-order projection as `num_mm_tokens` above — the cache
+        # key indexes each item's digest by its `start_positions` offset.
         mm_item_order = inputs.get("mm_item_order")
         if mm_item_order:
             mm_hashes_flat = [
@@ -1176,10 +1173,8 @@ def create_input_processor_with_hash(
             mm_hashes_flat = [
                 h for hashes in mm_hashes.values() for h in hashes
             ]
-        # `MultimodalInput.multimodal_uuids` is a flat list that must index in
-        # lockstep with `multimodal_hashes`, so project the per-modality UUID
-        # dict through the same manifest — otherwise cache-event UUIDs attach
-        # to the wrong item.
+        # `MultimodalInput.multimodal_uuids` must index in lockstep with
+        # `multimodal_hashes`, so project through the same manifest.
         if mm_uuids_by_key is None:
             mm_uuid_list = None
         elif mm_item_order:
@@ -1207,9 +1202,8 @@ def create_input_processor_with_hash(
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         try_multimodal_hashing = False  # only used for first time
         use_multimodal_hashing = False  # used for subsequent calls
-        # Any subset of the supported modalities is eligible for hashing;
-        # a request may mix them freely (e.g. image+video). Modalities with
-        # a `None` payload are skipped so an empty bucket doesn't gate off
+        # Any subset of the supported modalities is eligible for hashing.
+        # ``None`` payloads are skipped so an empty bucket doesn't gate off
         # hashing for the modalities that are actually present.
         _SUPPORTED_HASHING_MODALITIES = ('image', 'video', 'audio')
         modalities = [
