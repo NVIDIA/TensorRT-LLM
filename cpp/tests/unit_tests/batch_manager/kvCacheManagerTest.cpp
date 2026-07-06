@@ -6858,8 +6858,8 @@ TEST(KVCacheManagerReuseAccountingTest, CountReusableBlocksPartialMatch)
         = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
     EXPECT_EQ(neededOneStep, promptLength / tokensPerBlock); // All 4 context blocks
 
-    // Blocks are free (released via removeSequence), so onlyAllocated=true yields 0 reusable blocks.
-    EXPECT_EQ(req1.getEstimatedReusableTokens(), 0);
+    // Free-but-cached blocks still consume free-pool capacity, but their tokens do not require recomputation.
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), summaryShared.reusableBlocksAll * tokensPerBlock);
 }
 
 TEST(KVCacheManagerReuseAccountingTest, GetRemainingBlocksToCompletionWithPartialReuse)
@@ -6976,7 +6976,7 @@ TEST(KVCacheManagerReuseAccountingTest, GetNeededBlocksOneStepWithFullReuse)
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(req0);
     kvCacheManager->removeSequence(req0.mRequestId, req0);
 
-    // Second request with identical tokens - all context blocks should be reusable
+    // Second request with identical tokens - the recoverable cached prefix should be reusable
     auto req1 = LlmRequest{
         1,
         maxNewTokens,
@@ -6989,11 +6989,12 @@ TEST(KVCacheManagerReuseAccountingTest, GetNeededBlocksOneStepWithFullReuse)
     // getNeededBlocksOneStep must NOT subtract free reusable blocks.
     auto const neededOneStep
         = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
-    auto const numSharedBlocks = promptLength / tokensPerBlock; // 3 blocks
-    EXPECT_EQ(neededOneStep, numSharedBlocks);                  // All 3 context blocks
+    auto const numContextBlocks = promptLength / tokensPerBlock; // 3 blocks
+    EXPECT_EQ(neededOneStep, numContextBlocks);                  // All 3 context blocks
 
-    // Blocks are free (released via removeSequence), so onlyAllocated=true yields 0 reusable blocks.
-    EXPECT_EQ(req1.getEstimatedReusableTokens(), 0);
+    // Sequence insertion omits the final prompt token, so only the preceding full blocks are recoverable.
+    auto const expectedReusableBlocks = (promptLength - 1) / tokensPerBlock;
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), expectedReusableBlocks * tokensPerBlock);
 }
 
 TEST(KVCacheManagerReuseAccountingTest, ReuseDisabledReturnsFullBlockCount)
@@ -7131,8 +7132,8 @@ TEST(KVCacheManagerReuseAccountingTest, MultipleRequestsWithSharedPrefix)
         = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
     EXPECT_EQ(neededOneStep, promptLength / tokensPerBlock); // All 4 context blocks
 
-    // Blocks are free (released via removeSequence), so onlyAllocated=true yields 0 reusable blocks.
-    EXPECT_EQ(req1.getEstimatedReusableTokens(), 0);
+    // Free-but-cached blocks still consume free-pool capacity, but their tokens do not require recomputation.
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), summaryPrefix.reusableBlocksAll * tokensPerBlock);
 
     // getRemainingBlocksToCompletion: 4 context + 1 gen = 5 blocks (no subtraction; blocks are free)
     auto const remaining = kvCacheManager->getRemainingBlocksToCompletion(req1, onlyWindowSize);
