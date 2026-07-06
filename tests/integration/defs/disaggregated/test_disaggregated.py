@@ -225,6 +225,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_overlap_gen_first_pp4.yaml",
         "overlap_transceiver_runtime_python":
         f"{test_configs_root}/disagg_config_overlap_transceiver_runtime_python.yaml",
+        "overlap_transceiver_runtime_python_bounce":
+        f"{test_configs_root}/disagg_config_overlap_transceiver_runtime_python_bounce.yaml",
         "tool_calls":
         f"{test_configs_root}/disagg_config_overlap.yaml",
         "perf_metrics":
@@ -1151,6 +1153,29 @@ def test_disaggregated_overlap_transceiver_runtime_python_fabric_memory(
     env["TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY"] = "1"
     run_disaggregated_test(disaggregated_example_root,
                            "overlap_transceiver_runtime_python",
+                           env=env,
+                           model_path=llama_model_root,
+                           cwd=llm_venv.get_working_directory())
+
+
+# Exercises the disaggregated KV-cache transfer path with the Python cache transceiver AND the
+# KV-cache bounce optimization (cache_transceiver_config.kv_cache_bounce_size_mb > 0): scattered
+# per-block WRITEs are gathered into one coalesced fabric-VMM buffer before a single NIXL WRITE.
+# Restricted to GB200/GB300 since the bounce arena is fabric (MNNVL) VMM memory.
+@pytest.mark.skip_device_not_contain(["GB200", "GB300"])
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_overlap_transceiver_runtime_python_bounce(
+        disaggregated_test_root, llm_venv, disaggregated_example_root,
+        llama_model_root):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
+    env = llm_venv._new_env.copy()
+    env["UCX_TLS"] = get_ucx_tls()
+    env["TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY"] = "1"
+    run_disaggregated_test(disaggregated_example_root,
+                           "overlap_transceiver_runtime_python_bounce",
                            env=env,
                            model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
