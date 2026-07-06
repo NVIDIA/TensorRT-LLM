@@ -8,7 +8,7 @@ from tensorrt_llm._torch.disaggregation.base.region import (
     SpecRegionPair,
 )
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
-from tensorrt_llm._torch.disaggregation.resource.utils import PoolRole
+from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._utils import nvtx_range
 
 
@@ -404,7 +404,7 @@ class AttentionPolicy:
         self,
         *,
         peer_ri: RankInfo,
-        pool_role: PoolRole,
+        mapper_kind: MapperKind,
         transfer_layers: int,
         self_layer_offset: int,
         peer_layer_offset: int,
@@ -419,7 +419,7 @@ class AttentionPolicy:
             return IdentityMapper()
 
         if head_match:
-            if pool_role == PoolRole.INDEXER:
+            if mapper_kind == MapperKind.FLAT:
                 block_size_per_layer = self_pool_slot_bytes // self_pool_num_layers
                 return IndexerKCacheHeadMatchMapper(
                     transfer_layers=transfer_layers,
@@ -445,7 +445,7 @@ class AttentionPolicy:
                 slot_size_per_layer=slot_size_per_layer,
             )
 
-        if pool_role == PoolRole.INDEXER:
+        if mapper_kind == MapperKind.FLAT:
             raise ValueError("IndexerKCacheHeadMatchMapper is not supported for head mismatch case")
 
         return HeadMismatchMapper(

@@ -1150,6 +1150,7 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
             "Qwen3VLMoeForConditionalGeneration": "Qwen3MoeForCausalLM",
             "QwenImageBenchForConditionalGeneration": "Qwen3_5ForCausalLM",
             "Cosmos3ForConditionalGeneration": "Qwen3ForCausalLM",
+            "Qwen3_5MoeForConditionalGeneration": "Qwen3_5MoeForCausalLM",
         }
         llm_arch = vlm_to_llm_arch.get(self.original_arch)
         if llm_arch is None:
@@ -1238,9 +1239,12 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
             mrope_section=config.rope_scaling.get("mrope_section", None),
             mrope_interleaved=config.rope_scaling.get("mrope_interleaved", False),
         )
+        head_dim = getattr(config, "head_dim", None)
+        if not isinstance(head_dim, int):
+            head_dim = config.hidden_size // config.num_attention_heads
         self.rotary_emb = MRotaryEmbedding(
             pos_embd_params.rope,
-            head_dim=config.hidden_size // config.num_attention_heads,
+            head_dim=head_dim,
             is_neox=pos_embd_params.is_neox,
             mrope_section=pos_embd_params.mrope_section,
             mrope_interleaved=pos_embd_params.mrope_interleaved,
@@ -1370,6 +1374,13 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
             )
             deepstack_embeds = list(deepstack_buffer.unbind(0))
 
+        # Preserve the pre-fusion token IDs. `fuse_input_embeds` collapses
+        # input_ids -> None when MM embeddings are fused in, but spec
+        # decoding (MTP / Eagle) still needs the original prompt token
+        # IDs for drafter context preparation; pass them through as a
+        # dedicated kwarg consumed by `SpecDecOneEngineForCausalLM.forward`.
+        orig_input_ids = input_ids
+
         input_ids, input_embeds = fuse_input_embeds(
             self.llm.model.embed_tokens,
             input_ids,
@@ -1386,8 +1397,14 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
             return_context_logits=return_context_logits,
             deepstack_embeds=deepstack_embeds,
             mrope_config=mrope_config,
+            spec_metadata=kwargs.get("spec_metadata"),
+            resource_manager=kwargs.get("resource_manager"),
+            orig_input_ids=orig_input_ids,
         )
-        logger.debug(f"output shape: {output_prob.shape}")
+        # Spec-decoding (MTP / Eagle) returns a dict (accepted tokens,
+        # draft tokens, logits); plain forward returns a tensor.
+        if hasattr(output_prob, "shape"):
+            logger.debug(f"output shape: {output_prob.shape}")
         return output_prob
 
     def _get_requests_with_mm_data(self, multimodal_params):

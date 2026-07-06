@@ -20,6 +20,7 @@ l0_a10:
   - unittest/utils/test_logger.py
   - unittest/_torch/test_model_config.py
   - unittest/models/test_quant_config_utils.py
+  - unittest/quantization/test_mode.py
   - unittest/_torch/modeling/test_modeling_mistral.py
   - unittest/_torch/modeling/test_modeling_pixtral.py
   - unittest/_torch/modeling/test_modeling_cohere2.py
@@ -122,6 +123,7 @@ l0_a10:
   - unittest/visual_gen/test_iteration_stats.py
   - unittest/visual_gen/test_media_encoding.py
   - unittest/_torch/visual_gen/test_tensor_payload.py
+  - unittest/_torch/visual_gen/test_flux_infer.py
   - unittest/_torch/visual_gen/test_qwen_image_infer.py
   - unittest/_torch/visual_gen/test_qwen_image_pipeline.py
   # llmapi
@@ -185,11 +187,8 @@ l0_a10:
       backend: cpp
   tests:
   # ------------- CPP tests ---------------
-  - cpp/test_e2e.py::test_model[-medusa-86]
   - cpp/test_e2e.py::test_model[-redrafter-86]
   - cpp/test_e2e.py::test_model[-mamba-86]
-  - cpp/test_e2e.py::test_model[-recurrentgemma-86]
-  - cpp/test_e2e.py::test_model[-eagle-86] TIMEOUT (90)
 - condition:
     ranges:
       system_gpu_count:
@@ -208,8 +207,6 @@ l0_a10:
   - unittest/dynamo
   - unittest/api_stability
   - unittest/bindings
-  - examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-use_attention_plugin-enable_context_fmha-tp:1-pp:1-float16-BertModel-bert/bert-base-uncased]
-  - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_cpp_runtime]
   # usage telemetry (TRT backend)
   - unittest/llmapi/test_llm_telemetry.py::TestTelemetryTRTBackend
 - condition:
@@ -226,13 +223,6 @@ l0_a10:
       backend: tensorrt
   tests:
   # ------------- Move from pre_merge to post_merge ---------------
-  - unittest/trt/attention/test_gpt_attention.py -k "partition0"
-  - unittest/trt/attention/test_gpt_attention.py -k "partition1"
-  - unittest/trt/attention/test_gpt_attention.py -k "partition2"
-  - unittest/trt/attention/test_gpt_attention.py -k "partition3"
-  - unittest/trt/attention/test_gpt_attention.py -k "xqa_generic"
-  - unittest/trt/model/test_mistral.py
-  - unittest/trt/model/test_llama.py
   - llmapi/test_llm_examples.py::test_llmapi_chat_example
   - llmapi/test_llm_e2e.py::test_llmapi_exit
   - llmapi/test_llm_examples.py::test_llmapi_server_example
@@ -246,14 +236,7 @@ l0_a10:
   - test_e2e.py::test_openai_reasoning[trt]
   - test_e2e.py::test_trtllm_bench_sanity[--non-streaming-FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
   - test_e2e.py::test_trtllm_bench_latency_sanity[FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
-  - unittest/trt/quantization
-  - unittest/trt/python_plugin
-  - unittest/trt/functional # 37 mins
   - llmapi/test_llm_examples.py::test_llmapi_quickstart_atexit
-  - unittest/test_model_runner_cpp.py
-  - unittest/llmapi/test_build_cache.py
-  - unittest/trt/attention/test_gpt_attention_IFB.py
-  - unittest/trt/attention/test_gpt_attention_no_cache.py
 - condition:
     ranges:
       system_gpu_count:

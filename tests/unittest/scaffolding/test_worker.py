@@ -18,7 +18,6 @@ from tensorrt_llm.scaffolding import (ChatTask, GenerationTask, TaskStatus,
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from llmapi.test_llm import get_model_path
 
-_SCAFFOLDING_MCP_NVBUG = pytest.mark.skip(reason="https://nvbugs/6337229")
 
 
 @pytest.fixture(scope="module")
