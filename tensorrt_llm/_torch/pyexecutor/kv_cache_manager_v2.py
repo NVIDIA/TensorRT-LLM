@@ -996,7 +996,17 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self._log_kv_cache_pool_lifecycle_mapping()
 
-    def _prepare_page_table_tensor(self, index_mapper_capacity: int) -> None:
+    def _build_pool_mapping_tensors(self):
+        """Build the ``(kv_cache_pool_pointers, kv_cache_pool_mapping)`` tensors.
+
+        Extracted into an overridable hook: subclasses whose pools
+        coalesce extra per-layer buffers alongside K/V (e.g.
+        MiniMax-M3 merges ``Role.INDEX_KEY`` into the K/V pool) cannot
+        derive the per-layer mapping offset via ``exact_div`` of the
+        byte address delta, because a layer no longer contributes
+        exactly K+V. They override this method to compute the offset
+        from the layer's position within its pool group instead.
+        """
         kv_cache_pool_pointers_list = []
         kv_cache_pool_mapping_list = []
         block_scale_pool_pointers_list = []
@@ -1094,18 +1104,22 @@ class KVCacheManagerV2(BaseResourceManager):
                     [pool_pointers[1], block_scale_pool_pointers[1]],
                 ]
 
-        self.kv_cache_pool_pointers = torch.tensor(
+        kv_cache_pool_pointers = torch.tensor(
             kv_cache_pool_pointers_list,
             dtype=torch.int64,
             device="cpu",
             pin_memory=prefer_pinned(),
         )
-        self.kv_cache_pool_mapping = torch.tensor(
+        kv_cache_pool_mapping = torch.tensor(
             kv_cache_pool_mapping_list,
             dtype=torch.int32,
             device="cpu",
             pin_memory=prefer_pinned(),
         )
+        return kv_cache_pool_pointers, kv_cache_pool_mapping
+
+    def _prepare_page_table_tensor(self, index_mapper_capacity: int) -> None:
+        self.kv_cache_pool_pointers, self.kv_cache_pool_mapping = self._build_pool_mapping_tensors()
         self.index_scales = torch.empty(
             self.num_pools, dtype=torch.int32, pin_memory=prefer_pinned(), device="cpu"
         )
