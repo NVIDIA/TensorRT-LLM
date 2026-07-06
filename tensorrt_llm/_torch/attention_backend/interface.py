@@ -3,8 +3,8 @@ import weakref
 from collections import namedtuple
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from typing import (TYPE_CHECKING, Any, Dict, Generic, List, Optional, Protocol,
-                    Tuple, Type, TypeVar, Union)
+from typing import (TYPE_CHECKING, Any, Dict, Generic, List, Literal, Optional,
+                    Protocol, Tuple, Type, TypeVar, Union)
 
 import torch
 from typing_extensions import Self
@@ -25,6 +25,7 @@ from ..metadata import KVCacheParams
 from ..pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from ..pyexecutor.mamba_cache_manager import BaseMambaCacheManager
 from ..pyexecutor.resource_manager import KVCacheManager
+from ..pyexecutor.trace_log_utils import log_tensor_size
 from ..utils import get_model_extra_attrs
 from .sparse.params import SparseMetadataParams
 
@@ -42,8 +43,10 @@ class AttentionRuntimeFeatures:
     chunked_prefill: bool = False
     cache_reuse: bool = False
     has_speculative_draft_tokens: bool = False
-    chunk_size: int = 0  # this is the chunk size for MLA chunked prefill, it will split kv cache into chunks to save global memory.
-    chunked_prefill_buffer_batch_size: int = 4  # real chunk size for MLA chunked prefill is chunked_prefill_buffer_batch_size * chunk_size.
+    # This is the chunk size for MLA chunked prefill, which splits KV cache into chunks.
+    chunk_size: int = 0
+    # The real chunk size for MLA chunked prefill is this value * chunk_size.
+    chunked_prefill_buffer_batch_size: int = 4
 
 
 # The type of requests in qkv passed to attention
@@ -73,6 +76,10 @@ class AttentionMetadata:
     mapping: Optional[Mapping] = None
     # Sparse settings for metadata allocation/update; dense metadata leaves it None.
     sparse_metadata_params: Optional[SparseMetadataParams] = None
+    # Paged KV-cache block layout:
+    # NHD: [max_num_pages, 2, page_size, num_kv_heads, head_dim]
+    # HND: [max_num_pages, 2, num_kv_heads, page_size, head_dim]
+    kv_layout: Literal["NHD", "HND"] = "HND"
 
     enable_flash_mla: bool = False
     enable_context_mla_with_cached_kv: bool = False
@@ -321,6 +328,14 @@ class AttentionMetadata:
         """
         self._prepare_mamba_metadata()
 
+    def prepare_encoder_only(self) -> None:
+        """Hook for encoder-only (no-KV-cache) forward setup.
+
+        Defaults to the full ``prepare()``; backends with a leaner encoder-only
+        path override this.
+        """
+        self.prepare()
+
     def _prepare_mamba_metadata(self):
         if self.mamba_metadata is False:
             return
@@ -440,10 +455,9 @@ class AttentionMetadata:
 
     def create_cross_metadata(
         self,
-        encoder_seq_lens: torch.Tensor,
+        encoder_seq_lens: List[int],
         cross_kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2,
                                       None] = None,
-        *,
         encoder_num_cached_tokens_per_seq: Optional[List[int]] = None,
     ) -> "AttentionMetadata":
         """Build a sub-metadata instance for cross-attention.
@@ -459,11 +473,10 @@ class AttentionMetadata:
         ``self.cross``); callers can attach it to ``self.cross`` if desired.
 
         Args:
-            encoder_seq_lens: Per-request encoder sequence length (CPU
-                int32 tensor). On the first decoder context step this is
-                the full encoder length; on generation steps it should be
-                ``0`` (no new K/V tokens to add to the cross pool — the
-                encoder K/V are already cached).
+            encoder_seq_lens: Per-request encoder sequence lengths. On the
+                first decoder context step this is the full encoder length;
+                on generation steps it should be ``0`` (no new K/V tokens to
+                add to the cross pool — the encoder K/V are already cached).
             cross_kv_cache_manager: KV cache manager for the cross pool.
                 When ``None``, the returned metadata uses the stateless
                 (no-KV-cache) path (suitable for unit tests).
@@ -484,31 +497,87 @@ class AttentionMetadata:
             # CUDA graph metadata buffers separate so preparing cross metadata
             # cannot overwrite self-attention sequence lengths.
             cross_md.cuda_graph_buffers = Buffers()
-        cross_md.kv_cache_manager = cross_kv_cache_manager
-        cross_md._seq_lens_kv = None
         cross_md._seq_lens_kv_cuda = None
         cross_md.cross = None
-        cross_md.seq_lens_kv = encoder_seq_lens
-        if encoder_num_cached_tokens_per_seq is not None:
-            from ..metadata import KVCacheParams
-            base_params = self.kv_cache_params
-            cross_md.kv_cache_params = KVCacheParams(
-                use_cache=base_params.use_cache if base_params is not None else
-                (cross_kv_cache_manager is not None),
-                num_cached_tokens_per_seq=list(
-                    encoder_num_cached_tokens_per_seq),
-                block_ids_per_seq=base_params.block_ids_per_seq
-                if base_params is not None else None,
-                host_max_attention_window_sizes=base_params.
-                host_max_attention_window_sizes
-                if base_params is not None else None,
-                host_sink_token_length=base_params.host_sink_token_length
-                if base_params is not None else None,
-                num_extra_kv_tokens=base_params.num_extra_kv_tokens
-                if base_params is not None else 0,
-            )
+        self._update_cross_metadata(
+            cross_md,
+            encoder_seq_lens,
+            cross_kv_cache_manager,
+            encoder_num_cached_tokens_per_seq,
+            base_kv_cache_params=self.kv_cache_params,
+            block_ids_per_seq=None,
+        )
         cross_md.__post_init__()
         return cross_md
+
+    def _update_cross_metadata(
+        self,
+        cross_md: "AttentionMetadata",
+        encoder_seq_lens: List[int],
+        cross_kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2, None],
+        encoder_num_cached_tokens_per_seq: Optional[List[int]],
+        *,
+        base_kv_cache_params: Optional[KVCacheParams],
+        block_ids_per_seq: Optional[List[list]],
+    ) -> "AttentionMetadata":
+        encoder_seq_lens_tensor = torch.tensor(encoder_seq_lens,
+                                               dtype=torch.int)
+        cross_md.kv_cache_manager = cross_kv_cache_manager
+        cross_md._seq_lens = self.seq_lens
+        cross_md._seq_lens_cuda = self.seq_lens_cuda
+        cross_md.seq_lens_kv = encoder_seq_lens_tensor
+
+        # Cross-attention keeps decoder-side prompt lengths for the Q-side
+        # context metadata. Encoder-side lengths are represented by
+        # seq_lens_kv and kv_cache_params.num_cached_tokens_per_seq.
+        cross_md.prompt_lens = self.prompt_lens
+
+        if encoder_num_cached_tokens_per_seq is not None:
+            cross_md.kv_cache_params = KVCacheParams(
+                use_cache=(base_kv_cache_params.use_cache
+                           if base_kv_cache_params is not None else
+                           (cross_kv_cache_manager is not None)),
+                num_cached_tokens_per_seq=list(
+                    encoder_num_cached_tokens_per_seq),
+                block_ids_per_seq=block_ids_per_seq,
+                host_max_attention_window_sizes=(
+                    base_kv_cache_params.host_max_attention_window_sizes
+                    if base_kv_cache_params is not None else None),
+                host_sink_token_length=(
+                    base_kv_cache_params.host_sink_token_length
+                    if base_kv_cache_params is not None else None),
+                num_extra_kv_tokens=(base_kv_cache_params.num_extra_kv_tokens if
+                                     base_kv_cache_params is not None else 0),
+            )
+
+        cross_md.request_ids = self.request_ids
+        cross_md.num_contexts = self.num_contexts
+        return cross_md
+
+    def update_cross_metadata(
+        self,
+        encoder_seq_lens: List[int],
+        cross_kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2, None],
+        encoder_num_cached_tokens_per_seq: Optional[List[int]] = None,
+    ) -> "AttentionMetadata":
+        """Refresh an existing CUDA graph cross-attention sub-metadata."""
+        if not self.has_cross_sub_metadata:
+            raise RuntimeError(
+                "CUDA graph cross-attention metadata has not been initialized.")
+
+        cross_md = self.cross
+        assert cross_md is not None
+        base_kv_cache_params = cross_md.kv_cache_params
+        block_ids_per_seq = (base_kv_cache_params.block_ids_per_seq
+                             if base_kv_cache_params is not None else None)
+        return self._update_cross_metadata(
+            cross_md,
+            encoder_seq_lens,
+            cross_kv_cache_manager,
+            encoder_num_cached_tokens_per_seq,
+            base_kv_cache_params=base_kv_cache_params,
+            block_ids_per_seq=block_ids_per_seq,
+        )
 
     def update_for_spec_dec(self) -> None:
         """
@@ -749,6 +818,14 @@ class RopeParams:
                 if rope_inv_freq is not None else None,
                 weakref.ref(rope_cos_sin),
             )
+        # One-shot log on cache miss (typically 2-4 times per model load).
+        log_tensor_size("rope/new_table",
+                        rope_cos_sin,
+                        max_pos=self.max_positions,
+                        dim=self.dim,
+                        theta=self.theta,
+                        scale_type=self.scale_type,
+                        interleave=interleave)
         return rope_inv_freq, rope_cos_sin
 
 
@@ -853,10 +930,18 @@ class AttentionForwardArgs:
     cu_q_seqlens: Optional[torch.Tensor] = None
     cu_kv_seqlens: Optional[torch.Tensor] = None
     fmha_scheduler_counter: Optional[torch.Tensor] = None
+    # Testing only: skip the RoPE step of MLA generation (the standalone harness
+    # feeds a pre-RoPE'd fused_q). The TRTLLM backend then appends the new latent
+    # and inits the trtllm-gen scheduler buffers itself.
+    skip_mla_rope_generation: bool = False
 
     mla_bmm1_scale: Optional[torch.Tensor] = None
     mla_bmm2_scale: Optional[torch.Tensor] = None
     quant_q_buffer: Optional[torch.Tensor] = None
+    # Per-tensor FP8 scale (fp32 [1]) for the fused DSv4 FP8-Q-quant path.
+    # When non-None alongside `quant_q_buffer`, the C++ op skips
+    # `quantizeCopyInputToFp8Kernel`.
+    quant_scale_qkv: Optional[torch.Tensor] = None
 
     sage_attn_num_elts_per_blk_q: int = 0
     sage_attn_num_elts_per_blk_k: int = 0

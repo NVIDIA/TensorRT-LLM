@@ -50,7 +50,7 @@ public:
     size_t getSize() const;
 
     static size_t getAlignedSize(size_t size);
-    static bool supportFbaricMemory();
+    static bool supportFabricMemory();
 
 private:
     class Impl;

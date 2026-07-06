@@ -13,13 +13,14 @@ from ...functional import PositionEmbeddingType, RotaryScalingType
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..model_config import ModelConfig, TConfig
-from ..modules.attention import MLA, Attention
+from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import moe_load_balancer_set_repeated_for_next_layer
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
+from ..modules.mla import MLA
 from ..modules.rms_norm import RMSNorm
 from ..modules.rotary_embedding import RotaryEmbedding
 
@@ -1509,22 +1510,6 @@ class MTPDraftModel(nn.Module):
         elif model_type in ["exaone_moe"]:
             from .modeling_exaone_moe import ExaoneMoeMTP
             mtp_layer = ExaoneMoeMTP(model_config, layer_idx, aux_stream_dict)
-
-        elif model_type == "nemotron_h":
-            from .modeling_nemotron_h import NemotronHMTP
-            mtp_layer = NemotronHMTP(model_config,
-                                     layer_idx,
-                                     aux_stream_dict,
-                                     is_separate_draft_engine=False)
-        elif model_type == "qwen3_next":
-            from .modeling_qwen3_next import Qwen3NextMTP
-            mtp_layer = Qwen3NextMTP(model_config, layer_idx, aux_stream_dict)
-        elif model_type == "deepseek_v4":
-            from .modeling_deepseekv4 import DeepseekV4MTP
-            mtp_layer = DeepseekV4MTP(model_config,
-                                      layer_idx,
-                                      aux_stream_dict,
-                                      is_separate_draft_engine=True)
         else:
             raise ValueError(
                 f"MTPDraftModel does not support model_type: {model_type}")
@@ -1794,12 +1779,17 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 True,
             )
 
-            spec_input_ids = input_ids
+            # VLM wrappers (e.g. Qwen3VLModelBase) replace input_ids with
+            # fused inputs_embeds; fall back to the pre-fusion token IDs
+            # they forward via `orig_input_ids` so MTP / Eagle drafters
+            # can still access the prompt tokens.
+            spec_input_ids = input_ids if input_ids is not None else kwargs.get(
+                "orig_input_ids")
             spec_position_ids = position_ids
             if attn_metadata.padded_num_tokens is not None:
-                if input_ids is not None:
+                if spec_input_ids is not None:
                     # Slice along the first dimension
-                    spec_input_ids = input_ids[:attn_metadata.num_tokens]
+                    spec_input_ids = spec_input_ids[:attn_metadata.num_tokens]
                 if position_ids is not None:
                     spec_position_ids = _slice_spec_position_ids(
                         position_ids, attn_metadata.num_tokens)

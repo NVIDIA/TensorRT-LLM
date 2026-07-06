@@ -59,7 +59,6 @@ from ..distributed import (
     allgather,
 )
 from ..model_config import ModelConfig
-from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.engram import Engram, EngramConfig, EngramHashProvider
@@ -78,6 +77,7 @@ from ..modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
 from ..modules.mhc.hyper_connection import HCHead, HCState, mHC
+from ..modules.mla import MLA
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..peft.lora.layer import LoraLayer
@@ -2453,7 +2453,13 @@ class DeepseekV4Model(DecoderModel):
 class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, PretrainedConfig]):
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
-        return {"kv_cache_config": {"tokens_per_block": 128}}
+        return {
+            "kv_cache_config": {
+                "tokens_per_block": 128,
+                "use_kv_cache_manager_v2": True,
+                "enable_swa_scratch_reuse": True,
+            }
+        }
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         self.mapping_with_cp = None
