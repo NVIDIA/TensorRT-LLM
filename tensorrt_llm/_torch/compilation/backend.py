@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 from collections import OrderedDict
 from typing import List, Optional
@@ -109,9 +124,20 @@ class Backend:
                 torch.cuda.Event() for _ in range(num_events - len(self.events))
             ]
 
-    def clear_piecewise_cuda_graphs(self):
-        for runner in list(self._piecewise_runners):
+    def clear_piecewise_cuda_graphs(self) -> None:
+        runners = list(self._piecewise_runners)
+        for runner in runners:
             runner.clear_cuda_graphs()
+
+        # CUDACachingAllocator does not allow a private pool handle to be
+        # reused after its last graph is reset. Preserve the sharing between
+        # runners from the same compiled graph while rotating dead handles.
+        replacement_pools: dict[tuple[int, int], tuple[int, int]] = {}
+        for runner in runners:
+            old_pool = runner.graph_pool_handle
+            if old_pool not in replacement_pools:
+                replacement_pools[old_pool] = torch.cuda.graph_pool_handle()
+            runner.graph_pool_handle = replacement_pools[old_pool]
 
     def optimize(
         self,
