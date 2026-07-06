@@ -91,6 +91,9 @@ def test_performance(client,
                                      FLAGS.protocol),
                 utils.prepare_tensor("request_output_len", output0_len,
                                      FLAGS.protocol),
+                utils.prepare_tensor("streaming",
+                                     np.array([[FLAGS.decoupled]], dtype=bool),
+                                     FLAGS.protocol),
             ]
             append_pad_id_to_tensors(pad_id, inputs)
             append_end_id_to_tensors(end_id, inputs)
@@ -131,6 +134,9 @@ def test_performance(client,
                 utils.prepare_tensor("input_lengths", input_lens[i],
                                      FLAGS.protocol),
                 utils.prepare_tensor("request_output_len", output0_len,
+                                     FLAGS.protocol),
+                utils.prepare_tensor("streaming",
+                                     np.array([[FLAGS.decoupled]], dtype=bool),
                                      FLAGS.protocol),
             ]
 

@@ -553,8 +553,10 @@ def convert_request(request,
         if inputs['max_tokens'] is None:
             raise pb_utils.TritonModelException(
                 "A value is required for request_output_len")
-        inputs['streaming'] = get_input_scalar_by_name(request, 'streaming',
-                                                       batch_size, batch_index)
+        streaming = get_input_scalar_by_name(request, 'streaming', batch_size,
+                                             batch_index)
+        inputs['streaming'] = bool(
+            streaming) if streaming is not None else False
         if inputs['streaming'] and not decoupled:
             raise pb_utils.TritonModelException(
                 "Streaming is only supported in decoupled mode.")

@@ -1,5 +1,5 @@
 #!/usr/bin/python
-# Copyright 2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -81,6 +81,8 @@ class TRTLLMBaseMetricsTest(unittest.TestCase):
                 utils.prepare_tensor("max_tokens", output0_len, "http"),
                 utils.prepare_tensor("bad_words", bad_words_list, "http"),
                 utils.prepare_tensor("stop_words", stop_words_list, "http"),
+                utils.prepare_tensor("stream", np.array([[False]], dtype=bool),
+                                     "http"),
             ]
             if beam_width_value > 1:
                 beam_width = np.ones_like(input0).astype(
