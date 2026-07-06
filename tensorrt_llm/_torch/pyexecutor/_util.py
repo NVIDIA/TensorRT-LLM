@@ -1973,7 +1973,8 @@ def create_py_executor_instance(
     execution_stream: Optional[torch.cuda.Stream] = None,
     dwdp_manager: Optional[DwdpManager] = None,
 ) -> PyExecutor:
-    set_low_latency_dispatch(llm_args.enable_low_latency_host_dispatch)
+    set_low_latency_dispatch(
+        getattr(llm_args, 'enable_low_latency_host_dispatch', False))
 
     kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
 
