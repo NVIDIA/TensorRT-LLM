@@ -60,11 +60,11 @@
 
 #include "tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_pointer_expand.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/include/moe_util_kernels.h"
-// NOTE: the device-path GEMM dispatch (cudaGraph(SplitK)GroupedGemm,
+// NOTE: the grouped-GEMM dispatch (cudaGraph(SplitK)GroupedGemm,
 // launchMoeLoraProblemBuilder) is not called here. Those wrappers pull in
 // libtorch via at::Tensor, and this file is archived into libmoe_gemm_src.a,
 // which the TensorRT plugin also links and must keep libtorch-free. The
-// dispatch is reached through the LoraParams::device_path.run function pointer,
+// dispatch is reached through the LoraParams::grouped_gemm.run function pointer,
 // populated in moeOp.cpp.
 
 #ifndef CUDART_VERSION
@@ -3680,18 +3680,19 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     sync_check_cuda_error(stream);
 }
 
-// Thin wrapper around the LoraParams::device_path.run function pointer (the
+// Thin wrapper around the LoraParams::grouped_gemm.run function pointer (the
 // libtorch-bound GEMM dispatch defined in moeOp.cpp). Validates the module was
 // populated and that a dispatch is available before calling through.
-inline void runMoeLoraDeviceModule(::tensorrt_llm::kernels::cutlass_kernels::MoeLoraDevicePathModule const& mod,
+inline void runMoeLoraGroupedGemmModule(::tensorrt_llm::kernels::cutlass_kernels::MoeLoraGroupedGemmModule const& mod,
     int64_t num_permuted_tokens, int64_t in_hidden_size, int64_t max_lora_rank, int64_t dtype_bytes,
     int64_t splitk_slices, void const* input_base, void* output_base,
-    ::tensorrt_llm::kernels::cutlass_kernels::MoeLoraDeviceRunFn run, nvinfer1::DataType data_type, cudaStream_t stream)
+    ::tensorrt_llm::kernels::cutlass_kernels::MoeLoraGroupedGemmRunFn run, nvinfer1::DataType data_type,
+    cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(mod.permuted_ranks_dev != nullptr,
-        "Device-path LoRA module is missing permuted ranks buffer (forgot to populate device_path?).");
+        "Grouped-GEMM LoRA module is missing permuted ranks buffer (forgot to populate grouped_gemm?).");
     TLLM_CHECK_WITH_INFO(run != nullptr,
-        "Device-path LoRA GEMM dispatch is unavailable: device_path.run was not populated (this consumer of "
+        "Grouped-GEMM LoRA GEMM dispatch is unavailable: grouped_gemm.run was not populated (this consumer of "
         "libmoe_gemm_src.a does not link libtorch).");
     run(mod, num_permuted_tokens, in_hidden_size, max_lora_rank, dtype_bytes, splitk_slices, input_base, output_base,
         data_type, stream);
@@ -3719,7 +3720,7 @@ constexpr nvinfer1::DataType moeLoraNvInferType()
     }
     else
     {
-        static_assert(sizeof(ScaleBiasType) == 0, "MoE LoRA device path supports fp16/bf16/fp32 only.");
+        static_assert(sizeof(ScaleBiasType) == 0, "MoE LoRA grouped-GEMM path supports fp16/bf16/fp32 only.");
     }
 }
 
@@ -3741,45 +3742,67 @@ bool CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
 
     bool all_token_without_lora = true;
 
-    // Device-path early return. When enabled, launchMoeLoraPointerExpand
+    // Grouped-GEMM early return. When enabled, launchMoeLoraPointerExpand
     // produces every consumer's input on-device, so the host pointer fan-out
     // and its gating cudaEventSynchronize are skipped. Returning false is safe:
     // zero per-token ranks collapse the grouped-GEMM problems to no-ops.
-    if (lora_params.device_path.enabled)
+    if (lora_params.grouped_gemm.enabled)
     {
-        auto const& dp = lora_params.device_path;
-        // Translate per-module device-path metadata into the MoeLoraExpandModule
+        auto const& grouped_gemm = lora_params.grouped_gemm;
+        // Validate the metadata host-side before the pointer-expand kernel
+        // computes per-expert byte offsets from it and dereferences them, so a
+        // stale dimension or unpopulated module fails with a clear message
+        // instead of a device illegal access.
+        TLLM_CHECK_WITH_INFO(grouped_gemm.dtype_bytes > 0,
+            "Grouped-GEMM LoRA dtype_bytes must be positive (grouped_gemm not fully populated?).");
+        auto validateLoraModule = [](::tensorrt_llm::kernels::cutlass_kernels::MoeLoraGroupedGemmModule const& mod,
+                                      char const* name, int64_t expectedDimA, int64_t expectedDimB)
+        {
+            TLLM_CHECK_WITH_INFO(mod.ranks_src_dev != nullptr && mod.ptrs_src_dev != nullptr
+                    && mod.permuted_ranks_dev != nullptr && mod.permuted_ptrs_dev != nullptr,
+                "Grouped-GEMM LoRA %s module is missing pointer-expand buffers.", name);
+            TLLM_CHECK_WITH_INFO(mod.dim_a == expectedDimA && mod.dim_b == expectedDimB,
+                "Grouped-GEMM LoRA %s module dimensions do not match the MoE runner dimensions.", name);
+        };
+        validateLoraModule(grouped_gemm.fc1, "fc1", hidden_size, inter_size);
+        validateLoraModule(grouped_gemm.fc2, "fc2", inter_size, hidden_size);
+        if (is_gated_activation)
+        {
+            validateLoraModule(grouped_gemm.gated, "gated", hidden_size, inter_size);
+        }
+
+        // Translate per-module grouped-GEMM metadata into the MoeLoraExpandModule
         // API that the pointer-expand kernel expects.
         ::tensorrt_llm::kernels::cutlass_kernels::MoeLoraExpandModule fc1_mod{};
-        fc1_mod.ranks_src = dp.fc1.ranks_src_dev;
-        fc1_mod.ptrs_src = dp.fc1.ptrs_src_dev;
-        fc1_mod.dim_a = dp.fc1.dim_a;
-        fc1_mod.dim_b = dp.fc1.dim_b;
-        fc1_mod.ranks_out = dp.fc1.permuted_ranks_dev;
-        fc1_mod.ptrs_out = dp.fc1.permuted_ptrs_dev;
+        fc1_mod.ranks_src = grouped_gemm.fc1.ranks_src_dev;
+        fc1_mod.ptrs_src = grouped_gemm.fc1.ptrs_src_dev;
+        fc1_mod.dim_a = grouped_gemm.fc1.dim_a;
+        fc1_mod.dim_b = grouped_gemm.fc1.dim_b;
+        fc1_mod.ranks_out = grouped_gemm.fc1.permuted_ranks_dev;
+        fc1_mod.ptrs_out = grouped_gemm.fc1.permuted_ptrs_dev;
 
         ::tensorrt_llm::kernels::cutlass_kernels::MoeLoraExpandModule fc2_mod{};
-        fc2_mod.ranks_src = dp.fc2.ranks_src_dev;
-        fc2_mod.ptrs_src = dp.fc2.ptrs_src_dev;
-        fc2_mod.dim_a = dp.fc2.dim_a;
-        fc2_mod.dim_b = dp.fc2.dim_b;
-        fc2_mod.ranks_out = dp.fc2.permuted_ranks_dev;
-        fc2_mod.ptrs_out = dp.fc2.permuted_ptrs_dev;
+        fc2_mod.ranks_src = grouped_gemm.fc2.ranks_src_dev;
+        fc2_mod.ptrs_src = grouped_gemm.fc2.ptrs_src_dev;
+        fc2_mod.dim_a = grouped_gemm.fc2.dim_a;
+        fc2_mod.dim_b = grouped_gemm.fc2.dim_b;
+        fc2_mod.ranks_out = grouped_gemm.fc2.permuted_ranks_dev;
+        fc2_mod.ptrs_out = grouped_gemm.fc2.permuted_ptrs_dev;
 
         ::tensorrt_llm::kernels::cutlass_kernels::MoeLoraExpandModule gated_mod{};
         if (is_gated_activation)
         {
-            gated_mod.ranks_src = dp.gated.ranks_src_dev;
-            gated_mod.ptrs_src = dp.gated.ptrs_src_dev;
-            gated_mod.dim_a = dp.gated.dim_a;
-            gated_mod.dim_b = dp.gated.dim_b;
-            gated_mod.ranks_out = dp.gated.permuted_ranks_dev;
-            gated_mod.ptrs_out = dp.gated.permuted_ptrs_dev;
+            gated_mod.ranks_src = grouped_gemm.gated.ranks_src_dev;
+            gated_mod.ptrs_src = grouped_gemm.gated.ptrs_src_dev;
+            gated_mod.dim_a = grouped_gemm.gated.dim_a;
+            gated_mod.dim_b = grouped_gemm.gated.dim_b;
+            gated_mod.ranks_out = grouped_gemm.gated.permuted_ranks_dev;
+            gated_mod.ptrs_out = grouped_gemm.gated.permuted_ptrs_dev;
         }
 
         ::tensorrt_llm::kernels::cutlass_kernels::launchMoeLoraPointerExpand(permuted_row_to_unpermuted_row_,
-            expert_first_token_offset_, num_experts_per_node, start_expert, num_rows, expanded_num_rows, dp.dtype_bytes,
-            fc1_mod, fc2_mod, is_gated_activation ? &gated_mod : nullptr, stream);
+            expert_first_token_offset_, num_experts_per_node, start_expert, num_rows, expanded_num_rows,
+            grouped_gemm.dtype_bytes, fc1_mod, fc2_mod, is_gated_activation ? &gated_mod : nullptr, stream);
         sync_check_cuda_error(stream);
         return /*all_token_without_lora=*/false;
     }
@@ -3896,15 +3919,15 @@ auto CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         input = reinterpret_cast<ScaleBiasType*>(permuted_data_);
     }
 
-    // Device-path branch, running entirely on the stream. setupLoraWorkspace
+    // Grouped-GEMM branch, running entirely on the stream. setupLoraWorkspace
     // has already populated the per-permuted-row ranks and pointers for fc1 and
     // gated via launchMoeLoraPointerExpand.
-    if (lora_params.device_path.enabled)
+    if (lora_params.grouped_gemm.enabled)
     {
-        auto const& dp = lora_params.device_path;
+        auto const& grouped_gemm = lora_params.grouped_gemm;
         nvinfer1::DataType const data_type = moeLoraNvInferType<ScaleBiasType>();
 
-        // The device-path GEMM skips rank-0 rows, but the bias/reorder paths
+        // The grouped-GEMM GEMM skips rank-0 rows, but the bias/reorder paths
         // read lora_fc1_result_ for every valid row. Zero the buffer first so
         // skipped rows are a deterministic no-op. It is contiguous and holds
         // both the gated and fc1 halves when gated, so one memset covers both.
@@ -3912,15 +3935,17 @@ auto CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
             * (is_gated_activation ? 2u : 1u) * sizeof(ScaleBiasType);
         TLLM_CUDA_CHECK(cudaMemsetAsync(lora_fc1_result_, 0, fc1_result_bytes, stream));
 
-        runMoeLoraDeviceModule(dp.fc1, expanded_num_rows, /*in_hidden_size=*/hidden_size, dp.max_lora_rank,
-            dp.dtype_bytes, dp.splitk_slices, /*input_base=*/static_cast<void const*>(input),
-            /*output_base=*/static_cast<void*>(lora_fc1_result), dp.run, data_type, stream);
+        runMoeLoraGroupedGemmModule(grouped_gemm.fc1, expanded_num_rows, /*in_hidden_size=*/hidden_size,
+            grouped_gemm.max_lora_rank, grouped_gemm.dtype_bytes, grouped_gemm.splitk_slices,
+            /*input_base=*/static_cast<void const*>(input),
+            /*output_base=*/static_cast<void*>(lora_fc1_result), grouped_gemm.run, data_type, stream);
 
         if (is_gated_activation)
         {
-            runMoeLoraDeviceModule(dp.gated, expanded_num_rows, /*in_hidden_size=*/hidden_size, dp.max_lora_rank,
-                dp.dtype_bytes, dp.splitk_slices, /*input_base=*/static_cast<void const*>(input),
-                /*output_base=*/static_cast<void*>(lora_gated_out), dp.run, data_type, stream);
+            runMoeLoraGroupedGemmModule(grouped_gemm.gated, expanded_num_rows, /*in_hidden_size=*/hidden_size,
+                grouped_gemm.max_lora_rank, grouped_gemm.dtype_bytes, grouped_gemm.splitk_slices,
+                /*input_base=*/static_cast<void const*>(input),
+                /*output_base=*/static_cast<void*>(lora_gated_out), grouped_gemm.run, data_type, stream);
         }
     }
     else
@@ -3988,13 +4013,13 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         input = reinterpret_cast<ScaleBiasType*>(fc1_result_);
     }
 
-    // Device-path branch, mirroring loraFC1's branch. It consumes the
+    // Grouped-GEMM branch, mirroring loraFC1's branch. It consumes the
     // per-permuted-row ranks and pointers that setupLoraWorkspace produced via
     // launchMoeLoraPointerExpand. num_tokens here is expanded_num_rows from
     // runMoe (top_k * num_rows).
-    if (lora_params.device_path.enabled)
+    if (lora_params.grouped_gemm.enabled)
     {
-        auto const& dp = lora_params.device_path;
+        auto const& grouped_gemm = lora_params.grouped_gemm;
         nvinfer1::DataType const data_type = moeLoraNvInferType<ScaleBiasType>();
 
         // As in loraFC1, zero the output so rank-0 rows the GEMM skips do not
@@ -4003,9 +4028,10 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
             = static_cast<size_t>(num_tokens) * static_cast<size_t>(hidden_size) * sizeof(ScaleBiasType);
         TLLM_CUDA_CHECK(cudaMemsetAsync(lora_fc2_result_, 0, fc2_result_bytes, stream));
 
-        runMoeLoraDeviceModule(dp.fc2, num_tokens, /*in_hidden_size=*/inter_size, dp.max_lora_rank, dp.dtype_bytes,
-            dp.splitk_slices, /*input_base=*/static_cast<void const*>(input),
-            /*output_base=*/static_cast<void*>(lora_fc2_result_), dp.run, data_type, stream);
+        runMoeLoraGroupedGemmModule(grouped_gemm.fc2, num_tokens, /*in_hidden_size=*/inter_size,
+            grouped_gemm.max_lora_rank, grouped_gemm.dtype_bytes, grouped_gemm.splitk_slices,
+            /*input_base=*/static_cast<void const*>(input),
+            /*output_base=*/static_cast<void*>(lora_fc2_result_), grouped_gemm.run, data_type, stream);
         sync_check_cuda_error(stream);
         return;
     }
@@ -4254,11 +4280,11 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
 
         bool is_gated_activation = isGatedActivation(fc1_activation_type);
 
-        // The device path builds every consumer's input on-device via
+        // The grouped-GEMM path builds every consumer's input on-device via
         // launchMoeLoraPointerExpand, so skip the host staging D2H copies and the
         // gating event. Keeping them would add a host dependency that breaks
         // CUDA-graph capture.
-        if (use_lora && !lora_params.device_path.enabled)
+        if (use_lora && !lora_params.grouped_gemm.enabled)
         {
             std::vector<int>& host_permuted_rows = host_lora_workspace_.host_permuted_rows;
             std::vector<int64_t>& host_expert_first_token_offset = host_lora_workspace_.host_expert_first_token_offset;

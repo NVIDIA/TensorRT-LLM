@@ -51,7 +51,7 @@ class NVLinkOneSided(Communication):
     """
 
     # Constants from C++ (must match moeAlltoAllKernels.h)
-    MAX_RANKS = 64
+    MAX_RANKS = 128
     MAX_TOP_K = 8
     MAX_PAYLOADS = 8
 
