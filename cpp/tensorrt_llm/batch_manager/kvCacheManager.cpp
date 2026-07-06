@@ -2129,8 +2129,20 @@ bool WindowBlockManager::blockInRadixTree(BlockPtr const& block)
     return !block->getUniqueTokens().empty() && block->getPrevBlock() != nullptr;
 }
 
+std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey)
+{
+    std::vector<KVCacheBlock::IdType> unusedPinnedBlockIds;
+    return findBlocksInReuseTreeByBlockKeyImpl(blockKey, /*pinBlocks=*/false, unusedPinnedBlockIds);
+}
+
 std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKey(
-    BlockKey const& blockKey, bool pinBlocks, std::vector<KVCacheBlock::IdType>* pinnedBlockIds)
+    BlockKey const& blockKey, std::vector<KVCacheBlock::IdType>& pinnedBlockIds)
+{
+    return findBlocksInReuseTreeByBlockKeyImpl(blockKey, /*pinBlocks=*/true, pinnedBlockIds);
+}
+
+std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKeyImpl(
+    BlockKey const& blockKey, bool pinBlocks, std::vector<KVCacheBlock::IdType>& pinnedBlockIds)
 {
     std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     auto blockedUniqueTokens
@@ -2159,10 +2171,7 @@ std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKe
             {
                 unpinBlock(block);
             }
-            if (pinnedBlockIds != nullptr)
-            {
-                pinnedBlockIds->clear();
-            }
+            pinnedBlockIds.clear();
             return nullptr;
         }
 
@@ -2170,10 +2179,7 @@ std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKe
         {
             pinBlock(matchingBlock);
             pinnedInScope.push_back(matchingBlock);
-            if (pinnedBlockIds != nullptr)
-            {
-                pinnedBlockIds->push_back(matchingBlock->getBlockId());
-            }
+            pinnedBlockIds.push_back(matchingBlock->getBlockId());
         }
 
         searchRoot = std::move(matchingBlock);
