@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import (
     _COMPILE_CACHE,
     _quantize_blockscaled_one,
+    _quantize_fp8_v,
     clear_cute_dsl_fmha_cache,
     cute_dsl_fmha_fwd,
 )
@@ -221,10 +222,12 @@ def test_cute_dsl_fmha_context_forward(
         pytest.param(4, 2, id="gqa"),
     ],
 )
+@pytest.mark.parametrize("v_block_size", [0, 1])
 def test_cute_dsl_fmha_blockscaled_forward(
     batch_size: int,
     seq_len_q: int,
     seq_len_kv: int,
+    v_block_size: int,
     is_causal: bool,
     qk_sf_vec: int,
     qk_cutlass_dtype_name: str,
@@ -235,8 +238,8 @@ def test_cute_dsl_fmha_blockscaled_forward(
 ) -> None:
     """End-to-end MXFP8 / NVFP4 block-scaled Q@K path through cute_dsl_fmha_fwd.
 
-    Drives the block-scaled kernel with TRT-LLM-quantized Q/K and bf16 V. Tolerance
-    is loose to accommodate FP8/FP4 quantization error vs. the bf16 SDPA reference.
+    Drives the block-scaled kernel with TRT-LLM-quantized Q/K and FP8 V using either
+    one tensor scale or per-head-per-channel scales.
     """
     _require_supported_gpu_arch()
 
@@ -281,10 +284,10 @@ def test_cute_dsl_fmha_blockscaled_forward(
         * 0.5
     )
 
-    # Quantize Q/K via the same helper the backend uses; V stays bf16 (kernel's
-    # pv_dtype is inferred from v.dtype).
+    # Exercise both V modes: one tensor scale (0) and an (H, D) scale tensor (1).
     q_q, q_sf, scale_q = _quantize_blockscaled_one(q_bf16, qk_sf_vec)
     k_q, k_sf, scale_k = _quantize_blockscaled_one(k_bf16, qk_sf_vec)
+    v_q, scale_v, scale_v_channels = _quantize_fp8_v(v_bf16, per_head_channel=v_block_size == 1)
     qk_cutlass_dtype = getattr(cutlass, qk_cutlass_dtype_name)
 
     out = torch.empty(
@@ -306,9 +309,11 @@ def test_cute_dsl_fmha_blockscaled_forward(
     cute_dsl_fmha_fwd(
         q_q,
         k_q,
-        v_bf16,
+        v_q,
         out,
         is_causal=is_causal,
+        scale_v=scale_v,
+        scale_v_channels=scale_v_channels,
         sm_scale=sm_scale,
         lse=lse,
         scale_q=scale_q,

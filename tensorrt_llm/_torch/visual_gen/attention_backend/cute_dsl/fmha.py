@@ -155,11 +155,12 @@ class _CacheKey(NamedTuple):
     head_dim: int
     head_dim_v: int
     mma_tiler_mn: Tuple[int, int]
-    qk_sf_vec: int  # 0 = dense/sage/QK16PV8; 32 = MXFP8; 16 = NVFP4 (selects block-scaled kernel)
+    qk_sf_vec: int  # 0 = dense Q/K; 32 = MXFP8; 16 = NVFP4
     is_persistent: bool
     mask_type: Any  # fmha_utils.MaskEnum
     with_lse: bool
     with_sink: bool
+    with_scale_v_channels: bool
     has_window: bool
     has_skip_softmax: bool
     use_tma_store: bool
@@ -234,6 +235,7 @@ def cute_dsl_fmha_fwd(
     scale_q: float | torch.Tensor = 1.0,
     scale_k: float | torch.Tensor = 1.0,
     scale_v: float | torch.Tensor = 1.0,
+    scale_v_channels: torch.Tensor | None = None,
     scale_o: float | torch.Tensor = 1.0,
     is_persistent: bool = True,
     skip_softmax_threshold_scale_factor: float | None = None,
@@ -258,6 +260,8 @@ def cute_dsl_fmha_fwd(
             raise ValueError("Block-scaled path (qk_sf_vec != 0) requires q_sf and k_sf tensors.")
         if not q_sf.is_contiguous() or not k_sf.is_contiguous():
             raise ValueError("q_sf and k_sf must be contiguous.")
+    elif scale_v_channels is not None:
+        raise ValueError("scale_v_channels is only supported by MXFP8 and NVFP4 kernels.")
 
     # The kernel hard-codes dense strides in its CuTe layout (fmha.py:447-461) and ignores the
     # input tensor's actual strides, so non-dense inputs (e.g. `qkv.split(...)` views) would
@@ -298,6 +302,19 @@ def cute_dsl_fmha_fwd(
             f"MXFP8 / NVFP4 (qk_sf_vec={qk_sf_vec}) currently requires head_dim=128, "
             f"got head_dim={head_dim}."
         )
+    if scale_v_channels is not None:
+        expected_scale_shape = (num_heads_kv, value_head_dim)
+        if tuple(scale_v_channels.shape) != expected_scale_shape:
+            raise ValueError(
+                f"scale_v_channels must have shape {expected_scale_shape}; "
+                f"got {tuple(scale_v_channels.shape)}."
+            )
+        if scale_v_channels.dtype != torch.float32:
+            raise ValueError("scale_v_channels must use torch.float32.")
+        if scale_v_channels.device != v.device:
+            raise ValueError("scale_v_channels must be on the same device as V.")
+        if not scale_v_channels.is_contiguous():
+            raise ValueError("scale_v_channels must be contiguous.")
 
     q_5d = q.view(batch_size, seq_len_q, num_heads_kv, num_head_groups, qk_storage_dim)
     o_5d = o.view(batch_size, seq_len_q, num_heads_kv, num_head_groups, value_head_dim)
@@ -348,9 +365,15 @@ def cute_dsl_fmha_fwd(
         sf_dtype = cutlass.Float8E8M0FNU if qk_sf_vec == 32 else cutlass.Float8E4M3FN
         q_sf_cute = _to_cute_tensor(q_sf, leading_dim=0, cutlass_element_type=sf_dtype)
         k_sf_cute = _to_cute_tensor(k_sf, leading_dim=0, cutlass_element_type=sf_dtype)
+        scale_v_channels_cute = (
+            _to_cute_tensor(scale_v_channels.view(-1), leading_dim=0)
+            if scale_v_channels is not None
+            else None
+        )
     else:
         q_sf_cute = None
         k_sf_cute = None
+        scale_v_channels_cute = None
     # lse_4d is (B, S_q, h_kv, h_r) contiguous → h_r is the stride-1 inner dim (index 3).
     lse_cute = (
         from_dlpack(lse_4d, assumed_align=16).mark_layout_dynamic(leading_dim=3)
@@ -396,6 +419,7 @@ def cute_dsl_fmha_fwd(
         mask_type=mask_type,
         with_lse=lse is not None,
         with_sink=False,
+        with_scale_v_channels=scale_v_channels is not None,
         has_window=has_window,
         has_skip_softmax=use_skip_softmax,
         use_tma_store=True,
@@ -420,7 +444,7 @@ def cute_dsl_fmha_fwd(
             cute_typing.Float32(scale_softmax_log2),
             cute_typing.Float32(scale_softmax),
             cute_typing.Float32(scale_output),
-            None,  # scale_v_channels
+            scale_v_channels_cute,
             skip_threshold_log2,
             ws_left,
             ws_right,
@@ -463,6 +487,20 @@ def cute_dsl_fmha_fwd(
 
 _FP8_E4M3_MAX = 448.0  # FP8 e4m3 max magnitude
 _FP4_E2M1_MAX = 6.0  # FP4 e2m1 max magnitude
+
+
+def _quantize_fp8_v(
+    v_bshd: torch.Tensor, per_head_channel: bool
+) -> Tuple[torch.Tensor, float | torch.Tensor, torch.Tensor | None]:
+    """Quantize V to FP8 with either one tensor scale or an (H, D) scale tensor."""
+    if per_head_channel:
+        v_qscale = _FP8_E4M3_MAX / v_bshd.float().abs().amax(dim=(0, 1)).clamp(min=1e-3)
+        v_quantized = (v_bshd * v_qscale).to(torch.float8_e4m3fn)
+        return v_quantized, 1.0, v_qscale.reciprocal().contiguous()
+
+    v_qscale = _FP8_E4M3_MAX / v_bshd.abs().amax().clamp(min=1e-3)
+    v_quantized = (v_bshd * v_qscale).to(torch.float8_e4m3fn)
+    return v_quantized, v_qscale.reciprocal(), None
 
 
 def _quantize_blockscaled_one(
@@ -646,25 +684,26 @@ class CuTeDSLAttention(AttentionBackend):
             device=q.device,
         )
 
-        # V quantization (per-tensor FP8) for QK16PV8 / MXFP8 / NVFP4.
+        # V is tensor-scaled by default. MXFP8/NVFP4 with v_block_size=1 use an (H, D) scale.
         scale_v = kwargs.get("scale_v", 1.0)
         scale_q = kwargs.get("scale_q", 1.0)
         scale_k = kwargs.get("scale_k", 1.0)
         qac = self.quant_attention_config
         q_sf = k_sf = qk_cutlass_dtype = None
         qk_sf_vec = 0
+        scale_v_channels = None
         if qac is not None:
-            if qac.qk_sf_vec != 0:
-                # MXFP8 / NVFP4 (block-scaled Q@K). Per-block SFs come from ops.trtllm.*_quantize.
-                qk_sf_vec = qac.qk_sf_vec
+            if qac.qk_dtype in ("mxfp8", "nvfp4"):
+                qk_sf_vec = 32 if qac.qk_dtype == "mxfp8" else 16
                 q, q_sf, gs_q = _quantize_blockscaled_one(q, qk_sf_vec)
                 k, k_sf, gs_k = _quantize_blockscaled_one(k, qk_sf_vec)
                 scale_q = scale_q * gs_q
                 scale_k = scale_k * gs_k
                 qk_cutlass_dtype = cutlass.Float4E2M1FN if qk_sf_vec == 16 else cutlass.Float8E4M3FN
-            v_qscale = 448.0 / v.abs().amax().clamp(min=1e-3)
-            v = (v * v_qscale).to(torch.float8_e4m3fn)
-            scale_v = scale_v / v_qscale
+            v, v_dequant_scale, scale_v_channels = _quantize_fp8_v(
+                v, per_head_channel=qk_sf_vec != 0 and qac.v_block_size == 1
+            )
+            scale_v = scale_v * v_dequant_scale
 
         # Skip softmax.
         skip_softmax_threshold_scale = self.skip_softmax_threshold_scale
@@ -682,6 +721,7 @@ class CuTeDSLAttention(AttentionBackend):
             scale_q=scale_q,
             scale_k=scale_k,
             scale_v=scale_v,
+            scale_v_channels=scale_v_channels,
             scale_o=kwargs.get("scale_o", 1.0),
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale,
             qk_sf_vec=qk_sf_vec,
