@@ -150,6 +150,16 @@ class ExternalCommMoEScheduler(MoEScheduler):
         else:
             all_rank_num_tokens_padded = all_rank_num_tokens
 
+        # ========== Step 2: Determine communication method ==========
+        num_chunks = moe.calculate_num_chunks(all_rank_num_tokens_padded)
+
+        if (
+            num_chunks > 1
+            and moe.backend.__class__ == CutlassFusedMoE
+            and moe.backend._moe_lora_active(lora_params)
+        ):
+            raise_moe_lora_multichunk_unsupported(num_chunks)
+
         # ========== 0-token rank deadlock fix ==========
         # When some ranks have 0 tokens in single-chunk forward with collective comm,
         # those ranks hang in CUDA kernels (e.g. NVFP4 quantize_input with 0-row tensor)
@@ -157,7 +167,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
         # non-zero ranks. Fix: activate DP padding uniformly across all ranks so every
         # rank uses sizes=None (uniform allgather) and pads x/router_logits to max_tokens.
         # Mirrors the empty-chunk substitution in _forward_multiple_chunks (line ~597-620).
-        # Existing truncation at line ~202 discards dummy-token outputs automatically.
+        # Existing truncation at Step 4 discards dummy-token outputs automatically.
+        # NOTE: kept after the multi-chunk rejection above so unit tests that stub `moe`
+        # with a minimal namespace (no `.comm`/`.use_dp`) still exercise that path; only
+        # relevant to single-chunk collective comm anyway.
         if (
             moe.comm is not None
             and moe.use_dp
@@ -174,16 +187,6 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 router_logits = torch.cat(
                     [router_logits, router_logits.new_zeros((pad, router_logits.shape[1]))], dim=0
                 )
-
-        # ========== Step 2: Determine communication method ==========
-        num_chunks = moe.calculate_num_chunks(all_rank_num_tokens_padded)
-
-        if (
-            num_chunks > 1
-            and moe.backend.__class__ == CutlassFusedMoE
-            and moe.backend._moe_lora_active(lora_params)
-        ):
-            raise_moe_lora_multichunk_unsupported(num_chunks)
 
         # May fall back AllToAll -> AllGather; this is the only sanctioned
         # mutation of ``moe.comm`` from a scheduler.
