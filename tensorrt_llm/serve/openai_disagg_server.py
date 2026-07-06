@@ -251,10 +251,13 @@ class OpenAIDisaggServer:
     def _create_client(self, router: Router, role: ServerRole, max_retries: int = 1) -> OpenAIClient:
         async def disagg_id_generator():
             return await self._coordinator.get_disagg_request_id()
-        return OpenAIHttpClient(
+        client = OpenAIHttpClient(
             router, role, self._req_timeout_secs, max_retries,
             disagg_id_generator=disagg_id_generator,
-            request_perf_metrics=self._collect_perf_metrics)
+            request_perf_metrics=self._collect_perf_metrics,
+            internal_disagg_auth_key=self._config.internal_request_auth_key)
+        self._perf_metrics_collector.add_client(client)
+        return client
 
     def register_routes(self):
         # The disagg service owns only the request-serving endpoints (/v1/*) and
