@@ -544,6 +544,18 @@ public:
         mContextPhaseParams = std::move(contextPhaseParams);
     }
 
+    /// @brief Whether this generation request performs an arbitrary (llmRequest-agnostic) KV cache
+    /// transfer from the sender's reuse tree, i.e. the sender has no live LlmRequest for it.
+    [[nodiscard]] bool isArbitraryKvCacheTransfer() const noexcept
+    {
+        return mIsArbitraryKvCacheTransfer;
+    }
+
+    void setIsArbitraryKvCacheTransfer(bool isArbitraryKvCacheTransfer) noexcept
+    {
+        mIsArbitraryKvCacheTransfer = isArbitraryKvCacheTransfer;
+    }
+
     /// @brief Get the state params of the context
     /// @return The state params of the context
     [[nodiscard]] executor::DataTransceiverState const& getDataTransceiverState() const
@@ -2181,6 +2193,9 @@ protected:
     LlmRequestType mLlmRequestType;
 
     std::optional<executor::ContextPhaseParams> mContextPhaseParams{std::nullopt};
+    // True when this generation request performs an arbitrary (llmRequest-agnostic)
+    // KV cache transfer from the sender's reuse tree.
+    bool mIsArbitraryKvCacheTransfer{false};
 
     std::shared_ptr<ContextProgress> mContextProgress{nullptr};
 

@@ -1191,6 +1191,10 @@ def executor_request_to_llm_request(
     llm_request.py_disaggregated_params = getattr(executor_request,
                                                   "py_disaggregated_params",
                                                   None)
+    # A user-provided disagg_request_id marks an arbitrary (llmRequest-agnostic) KV cache
+    # transfer: the sender serves it from its reuse tree and has no live request for it.
+    if getattr(executor_request, "disagg_request_id", None) is not None:
+        llm_request.is_arbitrary_kv_cache_transfer = True
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)

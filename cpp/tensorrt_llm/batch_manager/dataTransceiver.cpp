@@ -250,7 +250,7 @@ RequestInfo::RequestInfo(LlmRequest::RequestIdType requestId, executor::DataTran
 bool RequestInfo::operator==(RequestInfo const& rhs) const
 {
     return mRequestId == rhs.mRequestId && mIndexFromEnd == rhs.mIndexFromEnd && mLastBlockKey == rhs.mLastBlockKey
-        && mTransState == rhs.mTransState;
+        && mIsArbitraryTransfer == rhs.mIsArbitraryTransfer && mTransState == rhs.mTransState;
 }
 
 LlmRequest::RequestIdType RequestInfo::getRequestId() const noexcept
@@ -269,6 +269,7 @@ void RequestInfo::serialize(RequestInfo const& requestInfo, std::ostream& os)
     su::serialize(requestInfo.mRequestId, os);
     su::serialize(requestInfo.mIndexFromEnd, os);
     su::serialize(requestInfo.mLastBlockKey, os);
+    su::serialize(requestInfo.mIsArbitraryTransfer, os);
     su::serialize(requestInfo.mTransState, os);
 }
 
@@ -278,8 +279,11 @@ RequestInfo RequestInfo::deserialize(std::istream& is)
     auto requestId = su::deserialize<decltype(mRequestId)>(is);
     auto indexFromEnd = su::deserialize<decltype(mIndexFromEnd)>(is);
     auto lastBlockKey = su::deserialize<decltype(mLastBlockKey)>(is);
+    auto isArbitraryTransfer = su::deserialize<decltype(mIsArbitraryTransfer)>(is);
     auto transState = su::deserialize<decltype(mTransState)>(is);
-    return RequestInfo{requestId, std::move(transState), indexFromEnd, lastBlockKey};
+    auto requestInfo = RequestInfo{requestId, std::move(transState), indexFromEnd, lastBlockKey};
+    requestInfo.setIsArbitraryTransfer(isArbitraryTransfer);
+    return requestInfo;
 }
 
 std::size_t RequestInfo::serializedSize(RequestInfo const& requestInfo)
@@ -289,6 +293,7 @@ std::size_t RequestInfo::serializedSize(RequestInfo const& requestInfo)
     totalSize += su::serializedSize(requestInfo.mRequestId);
     totalSize += su::serializedSize(requestInfo.mIndexFromEnd);
     totalSize += su::serializedSize(requestInfo.mLastBlockKey);
+    totalSize += su::serializedSize(requestInfo.mIsArbitraryTransfer);
     totalSize += su::serializedSize(requestInfo.mTransState);
     return totalSize;
 }
@@ -327,6 +332,9 @@ public:
             std::scoped_lock lkResp(mSenderMutex);
             mReadyResponses.emplace(llmRequest->mRequestId, Response{llmRequest, std::move(promise)});
         }
+        // Wake the response thread in case the counterpart's RequestInfo arrived
+        // before this response was registered.
+        mResponseRegisteredCv.notify_all();
         return future;
     }
 
@@ -721,6 +729,21 @@ private:
 
                 // Check if there's a matching pre-registered response (normal disagg flow)
                 auto it = getCurrentResponse();
+                if (it == mReadyResponses.end() && !requestInfo->isArbitraryTransfer())
+                {
+                    // Normal disagg flow whose context request has not registered its
+                    // response yet (the counterpart's RequestInfo raced ahead of
+                    // sendAsync). Wait for the registration instead of misclassifying
+                    // the transfer as an arbitrary reuse-tree send.
+                    std::unique_lock lk(mSenderMutex);
+                    mResponseRegisteredCv.wait(
+                        lk, [&] { return mTerminate || mReadyResponses.find(reqId) != mReadyResponses.end(); });
+                    if (mTerminate)
+                    {
+                        return;
+                    }
+                    it = mReadyResponses.find(reqId);
+                }
                 if (it != mReadyResponses.end())
                 {
                     // Normal disagg flow — has LlmRequest
@@ -780,6 +803,8 @@ private:
     void terminate()
     {
         mTerminate = true;
+        // Wake the response thread if it is waiting for a response registration.
+        mResponseRegisteredCv.notify_all();
         mAsyncSendResource.mTerminate = true;
         mAsyncSendResource.mCVforQueue.notify_all();
         for (auto& future : mAsyncSendFutures)
@@ -823,6 +848,9 @@ private:
     std::set<LlmRequest::RequestIdType> mCancelledRequests;
     std::map<RequestIdType, Response> mReadyResponses;
     std::mutex mSenderMutex;
+    // Signalled by sendAsync when a response is registered; the response thread waits on it
+    // (with mSenderMutex) for normal transfers whose RequestInfo arrived early.
+    std::condition_variable mResponseRegisteredCv;
     std::atomic<bool> mTerminate{false};
     std::future<void> mResponseFuture;
     std::unordered_map<LlmRequest::RequestIdType, int> mRemainSendCount;
@@ -954,6 +982,11 @@ public:
                 requestInfo = RequestInfo(requestId, mSelfState, indexFromEnd, lastBlockKey);
             }
         }
+        // Tell the sender whether this transfer is llmRequest-agnostic (served from the
+        // sender's reuse tree) so it does not wait for a context request that will never
+        // arrive — and, conversely, does wait for normal transfers whose context request
+        // has not reached the sender's send queue yet.
+        requestInfo.setIsArbitraryTransfer(llmRequest.isArbitraryKvCacheTransfer());
 
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
         std::vector<std::optional<size_t>> cacheBufferIds;
