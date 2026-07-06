@@ -125,7 +125,8 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         self.mapping = model_config.mapping
 
         self.allreduce = AllReduce(mapping=model_config.mapping,
-                                   strategy=model_config.allreduce_strategy)
+                                   strategy=model_config.allreduce_strategy,
+                                   dtype=config.torch_dtype)
 
         self.aux_stream = aux_stream
 
@@ -346,7 +347,8 @@ class Qwen3NextLinearDecoderLayer(DecoderLayer):
         self.layer_idx = layer_idx
 
         self.allreduce = AllReduce(mapping=model_config.mapping,
-                                   strategy=model_config.allreduce_strategy)
+                                   strategy=model_config.allreduce_strategy,
+                                   dtype=config.torch_dtype)
 
         self.next_layer_layernorm: RMSNorm = None
 
@@ -510,7 +512,8 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
         self.layer_idx = layer_idx
 
         self.allreduce = AllReduce(mapping=model_config.mapping,
-                                   strategy=model_config.allreduce_strategy)
+                                   strategy=model_config.allreduce_strategy,
+                                   dtype=config.torch_dtype)
 
         self.next_layer_layernorm: RMSNorm = None
 
