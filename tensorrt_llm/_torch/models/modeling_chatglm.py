@@ -52,6 +52,10 @@ def normalize_chatglm_config(config: PretrainedConfig) -> PretrainedConfig:
     _set_missing("rms_norm_eps", getattr(config, "layernorm_epsilon", None))
     # ChatGLM rotates the first half of each head.
     _set_missing("partial_rotary_factor", 0.5)
+    # ChatGLM derives the RoPE base as 10000 * rope_ratio (rope_ratio defaults to 1).
+    # RopeParams.from_config reads only rope_theta, so fill it here or long-context
+    # variants (e.g. chatglm3-6b-32k, rope_ratio>1) would silently use base 10000.
+    _set_missing("rope_theta", 10000.0 * float(getattr(config, "rope_ratio", None) or 1.0))
 
     _set_missing(
         "attention_bias",
