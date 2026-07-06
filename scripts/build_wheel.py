@@ -135,8 +135,10 @@ def create_venv(project_dir: Path):
     return venv_prefix
 
 
-def setup_venv(project_dir: Path, requirements_file: Path,
-               no_venv: bool) -> tuple[Path, Path]:
+def setup_venv(project_dir: Path,
+               requirements_file: Path,
+               no_venv: bool,
+               yes: bool = False) -> tuple[Path, Path]:
     """Creates/updates a venv and installs requirements.
 
     Args:
@@ -170,7 +172,8 @@ def setup_venv(project_dir: Path, requirements_file: Path,
                 f"`build_wheel.py` can recreate a virtual environment using container-provided PyTorch installation."
             )
             print("^^^^^^^^^^ IMPORTANT WARNING ^^^^^^^^^^", file=sys.stderr)
-            input("Press Ctrl+C to stop, any key to continue...\n")
+            if not yes:
+                input("Press Ctrl+C to stop, any key to continue...\n")
 
         # Ensure inherited PyTorch version is compatible
         try:
@@ -511,7 +514,8 @@ def main(*,
          nvrtc_dynamic_linking: bool = False,
          mypyc: bool = False,
          require_dynamic_attributions: bool = False,
-         plat_name: Optional[str] = None):
+         plat_name: Optional[str] = None,
+         yes: bool = False):
 
     if clean:
         clean_wheel = True
@@ -535,7 +539,8 @@ def main(*,
     # Setup venv and install requirements
     venv_python, venv_conan = setup_venv(project_dir,
                                          project_dir / requirements_filename,
-                                         no_venv)
+                                         no_venv,
+                                         yes=yes)
 
     # Ensure base TRT is installed (check inside the venv)
     try:
@@ -1324,6 +1329,14 @@ def add_arguments(parser: ArgumentParser):
         type=_plat_name_type,
         help=
         "Wheel platform tag passed to bdist_wheel --plat-name (e.g. linux_x86_64, manylinux_2_28_x86_64)"
+    )
+    parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        default=False,
+        help=
+        "Skip interactive confirmation prompts (useful for non-interactive builds)",
     )
 
 
