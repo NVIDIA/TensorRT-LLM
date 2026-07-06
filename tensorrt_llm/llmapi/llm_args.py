@@ -3607,12 +3607,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
 
     @model_validator(mode='after')
     def apply_unified_memory_defaults(self) -> 'KvCacheConfig':
-        """Auto-detect unified memory and adjust KV cache defaults.
-
-        On unified memory systems (e.g. Grace Blackwell / DGX Spark), CPU and GPU
-        share the same physical memory pool. KV cache offload does not provide a
-        separate memory tier, so host_cache_size is ignored.
-        """
+        """Disable host KV cache on integrated GPUs."""
         try:
             unified_memory_detected = is_device_integrated()
         except RuntimeError:
