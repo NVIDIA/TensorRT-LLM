@@ -529,9 +529,75 @@ class TestMultimodalPlaceholderCounts:
 
         mock_config = _StubConfig()
 
-        _, _, mm_placeholder_counts = parse_chat_messages_coroutines(messages, mock_config, None)
+        _, _, mm_placeholder_counts, _ = parse_chat_messages_coroutines(messages, mock_config, None)
 
         assert mm_placeholder_counts == expected_mm_placeholder_counts
+
+
+class TestMmItemOrderReturn:
+    """Tests for the ``mm_item_order`` return element.
+
+    The 4th tuple element from ``parse_chat_messages_coroutines`` is the
+    ``MultimodalDataTracker.item_order()`` manifest, indexed within modality
+    in content-parts order.
+    """
+
+    @pytest.mark.parametrize(
+        "messages, expected",
+        [
+            # Mixed image+video+image within one message: proves both
+            # content-parts order preservation (image, video, image) and
+            # per-modality index advance (image indices 0, 1; video 0).
+            (
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": "a"}},
+                            {"type": "video_url", "video_url": {"url": "b"}},
+                            {"type": "image_url", "image_url": {"url": "c"}},
+                        ],
+                    }
+                ],
+                [
+                    {"modality": "image", "index": 0},
+                    {"modality": "video", "index": 0},
+                    {"modality": "image", "index": 1},
+                ],
+            ),
+            # Items spanning multiple messages: indices accumulate across
+            # messages, not per-message.
+            (
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": "a"}},
+                        ],
+                    },
+                    {"role": "assistant", "content": "ok"},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "video_url", "video_url": {"url": "b"}},
+                            {"type": "image_url", "image_url": {"url": "c"}},
+                        ],
+                    },
+                ],
+                [
+                    {"modality": "image", "index": 0},
+                    {"modality": "video", "index": 0},
+                    {"modality": "image", "index": 1},
+                ],
+            ),
+        ],
+    )
+    def test_item_order(self, messages, expected):
+        class _StubConfig:
+            model_type = _MM_MODEL_TYPE
+
+        _, _, _, item_order = parse_chat_messages_coroutines(messages, _StubConfig(), None)
+        assert item_order == expected
 
 
 class TestParseChatMessageContentPart:
