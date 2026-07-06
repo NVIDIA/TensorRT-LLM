@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from collections.abc import Callable
 from typing import Optional, Union
 
@@ -18,6 +33,8 @@ from .swiglu import swiglu
 
 class GatedMLP(nn.Module):
 
+    _CANONICAL_FC1_UNPADDED_MAX_M = 8
+
     def __init__(
         self,
         *,
@@ -35,6 +52,7 @@ class GatedMLP(nn.Module):
         use_custom_cublas_mm: bool = False,
         is_shared_expert: bool = False,
         swiglu_limit: Optional[float] = None,
+        small_m_fc1_pad_rows: int = 0,
     ):
 
         super().__init__()
@@ -45,6 +63,9 @@ class GatedMLP(nn.Module):
         self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
         self.swiglu_limit = float(
             swiglu_limit) if swiglu_limit is not None else None
+        if small_m_fc1_pad_rows not in (0, 16):
+            raise ValueError("small_m_fc1_pad_rows must be 0 or 16")
+        self.small_m_fc1_pad_rows = small_m_fc1_pad_rows
 
         config = config or ModelConfig()
         use_cute_dsl_bf16_gemm = getattr(config, "use_cute_dsl_bf16_gemm",
@@ -260,6 +281,37 @@ class GatedMLP(nn.Module):
     # because the CTA tile height exceeds the output allocation.
     _FP4OUT_MIN_M = 128
 
+    def _run_gate_up_proj(
+            self, x: Union[torch.Tensor, Fp4QuantizedTensor]) -> torch.Tensor:
+        if (self.small_m_fc1_pad_rows and isinstance(x, torch.Tensor)
+                and x.ndim == 2 and x.dtype == torch.bfloat16
+                and not self.gate_up_proj.has_any_quant):
+            num_rows = x.shape[0]
+            if torch.compiler.is_compiling():
+                # Keep the decision inside one compiled graph while avoiding
+                # a zero-pad clone for M<=8 and M>=16.
+                def padded_gate_up(value: torch.Tensor) -> torch.Tensor:
+                    rows = value.shape[0]
+                    zero_rows = rows - rows
+                    pad_rows = torch.sym_max(self.small_m_fc1_pad_rows - rows,
+                                             zero_rows)
+                    padded_value = F.pad(value, (0, 0, 0, pad_rows))
+                    return self.gate_up_proj(padded_value)[:rows]
+
+                should_pad = (num_rows > self._CANONICAL_FC1_UNPADDED_MAX_M) & (
+                    num_rows < self.small_m_fc1_pad_rows)
+                return torch.cond(should_pad, padded_gate_up, self.gate_up_proj,
+                                  (x, ))
+            if (self._CANONICAL_FC1_UNPADDED_MAX_M < num_rows <
+                    self.small_m_fc1_pad_rows):
+                # M=9..15 uses a shape-dependent cuBLAS reduction tactic.
+                # Padding only that range to M=16 preserves the established
+                # target-only arithmetic for M<=8.
+                padded_x = F.pad(
+                    x, (0, 0, 0, self.small_m_fc1_pad_rows - num_rows))
+                return self.gate_up_proj(padded_x)[:num_rows]
+        return self.gate_up_proj(x)
+
     def forward(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -289,7 +341,7 @@ class GatedMLP(nn.Module):
         elif self._can_fuse_gate_up_swiglu():
             h2 = self._fused_gate_up_swiglu(x)
         else:
-            h1 = self.gate_up_proj(x)
+            h1 = self._run_gate_up_proj(x)
             h2 = self._apply_activation(h1)
 
         output = self.down_proj(h2,
@@ -307,7 +359,7 @@ class GatedMLP(nn.Module):
         assert lora_params is not None
         assert self.layer_idx is not None, "layer_idx is required for lora"
 
-        h1 = self.gate_up_proj(x)
+        h1 = self._run_gate_up_proj(x)
 
         h1_lora = self.splitted_gate_up_lora(x, lora_params, self.layer_idx)
 

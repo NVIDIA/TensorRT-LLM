@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # --------------------------------------------------
 # Portions of this code were derived from DeepSeek‑V3:
 #   https://github.com/deepseek-ai/DeepSeek-V3
@@ -76,6 +91,17 @@ from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, EagerFusionConfig, filter_weights,
                              register_auto_model)
+
+_LAYER0_CANONICAL_SMALL_M_FC1_ROWS_ENV = \
+    "TLLM_DSV3_LAYER0_CANONICAL_SMALL_M_FC1_ROWS"
+
+
+def _get_layer0_canonical_small_m_fc1_rows(layer_idx: int) -> int:
+    value = os.environ.get(_LAYER0_CANONICAL_SMALL_M_FC1_ROWS_ENV, "0")
+    if value not in ("0", "16"):
+        raise ValueError(
+            f"{_LAYER0_CANONICAL_SMALL_M_FC1_ROWS_ENV} must be 0 or 16")
+    return int(value) if layer_idx == 0 else 0
 
 
 @triton.jit
@@ -1320,6 +1346,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             self.mlp_tp_size = self._compute_mlp_tp_size(
                 config.intermediate_size, block_size)
 
+            small_m_fc1_pad_rows = \
+                _get_layer0_canonical_small_m_fc1_rows(layer_idx)
+
             has_mlp_tp = self.mlp_tp_size > 1
             self.fusion_config.PRE_MLP_FUSION = self.enable_fusion and has_mlp_tp and self.is_nvfp4
             self.fusion_config.POST_MLP_FUSION = self.enable_fusion and has_mlp_tp
@@ -1334,6 +1363,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 reduce_output=has_mlp_tp,
                 use_cute_dsl_blockscaling_mm=model_config.
                 use_cute_dsl_blockscaling_mm,
+                small_m_fc1_pad_rows=small_m_fc1_pad_rows,
             )
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
