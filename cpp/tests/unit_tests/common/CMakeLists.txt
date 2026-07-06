@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -15,6 +15,9 @@
 
 add_gtest(cudaProfilerUtilsTest cudaProfilerUtilsTest.cpp)
 add_gtest(cudaUtilsTest cudaUtilsTest.cpp)
+if(NOT WIN32)
+  add_gtest(envUtilsTest envUtilsTest.cpp)
+endif()
 add_gtest(attentionWorkspaceTest attentionWorkspaceTest.cpp)
 add_gtest(memoryUtilsTest memoryUtilsTest.cu)
 add_gtest(optionalRefTest optionalRefTest.cpp)

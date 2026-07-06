@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -349,8 +349,7 @@ void RnnCacheFormatter::unformatSlotMode(TransferSession& session)
     size_t bufferCoverSourceNum = 0;
     std::optional<int> cacheBufferId = std::nullopt;
 
-    auto preAssignedRnnId
-        = connections[pickUpConnections[0]]->getPreAssignedBufferId(static_cast<uint8_t>(BufferKind::kRNN));
+    auto preAssignedRnnId = session.getPreAssignedBufferId(static_cast<uint8_t>(BufferKind::kRNN));
     if (preAssignedRnnId.has_value())
     {
         cacheBufferId = static_cast<int>(*preAssignedRnnId);
@@ -821,8 +820,7 @@ void RnnCacheFormatter::unformatUnifiedPoolMode(TransferSession& session)
 
             // Use pre-assigned buffer ID from NIXL connection if available (same as slot mode).
             std::optional<int> cacheBufferId = std::nullopt;
-            auto preAssignedRnnId
-                = connections[rnnRecvConns[0]]->getPreAssignedBufferId(static_cast<uint8_t>(BufferKind::kRNN));
+            auto preAssignedRnnId = session.getPreAssignedBufferId(static_cast<uint8_t>(BufferKind::kRNN));
             if (preAssignedRnnId.has_value())
             {
                 cacheBufferId = static_cast<int>(*preAssignedRnnId);

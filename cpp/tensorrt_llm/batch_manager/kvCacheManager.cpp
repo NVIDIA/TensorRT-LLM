@@ -37,6 +37,7 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <algorithm>
+#include <exception>
 #include <limits>
 #include <map>
 #include <optional>
@@ -2926,6 +2927,16 @@ std::vector<KVCacheBlock::IdType> BlockManager::storeBlocksForReuse(
     return pinnedBlockIds;
 }
 
+void BlockManager::storeBlocksForTransferLease(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest)
+{
+    if (!llmRequest.has_value() || llmRequest->isDummyRequest() || sequence.getBeamWidth() > 1
+        || mLinearAttentionMetadata.has_value())
+    {
+        return;
+    }
+    static_cast<void>(storeBlocksForReuse(sequence, llmRequest, /*pinBlocks=*/false));
+}
+
 std::optional<KVCacheBlock::IdType> BlockManager::releaseBlocks(
     GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest, bool pinBlocks)
 {
@@ -2957,6 +2968,41 @@ void BlockManager::pinBlocks(GenerationRequest& sequence)
     }
 }
 
+TransferBlockIds BlockManager::pinBlocksForTransferLease(GenerationRequest& sequence)
+{
+    TransferBlockIds blockIds;
+    blockIds.reserve(mWindowBlockManagers.size());
+    for (auto& [windowSize, manager] : mWindowBlockManagers)
+    {
+        auto windowBlockIds = manager.pinBlocksForTransferLease(sequence);
+        try
+        {
+            blockIds.emplace(windowSize, windowBlockIds);
+        }
+        catch (...)
+        {
+            manager.unpinBlocksForTransferLease(windowBlockIds);
+            for (auto const& [pinnedWindowSize, pinnedBlockIds] : blockIds)
+            {
+                mWindowBlockManagers.at(pinnedWindowSize).unpinBlocksForTransferLease(pinnedBlockIds);
+            }
+            throw;
+        }
+    }
+    return blockIds;
+}
+
+void BlockManager::unpinBlocksForTransferLease(TransferBlockIds const& blockIds)
+{
+    for (auto const& [windowSize, windowBlockIds] : blockIds)
+    {
+        auto managerIt = mWindowBlockManagers.find(windowSize);
+        TLLM_CHECK_WITH_INFO(managerIt != mWindowBlockManagers.end(),
+            "Cannot release transfer lease blocks for unknown window size %d", windowSize);
+        managerIt->second.unpinBlocksForTransferLease(windowBlockIds);
+    }
+}
+
 void BlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds)
 {
     if (mWindowBlockManagers.empty())
@@ -2982,6 +3028,82 @@ void WindowBlockManager::pinBlocks(GenerationRequest& sequence)
     for (auto& block : allocatedBlocks)
     {
         block->incRefCount();
+    }
+}
+
+std::vector<KVCacheBlock::IdType> WindowBlockManager::pinBlocksForTransferLease(GenerationRequest& sequence)
+{
+    auto const requestId = sequence.getRequestId();
+    auto const& allocatedBlocks = mAllocatedBlocksPerSeq.at(requestId);
+
+    std::vector<KVCacheBlock::IdType> blockIds;
+    std::vector<BlockPtr> blocks;
+    std::unordered_set<KVCacheBlock::IdType> seenBlockIds;
+    blockIds.reserve(allocatedBlocks.size());
+    blocks.reserve(allocatedBlocks.size());
+    seenBlockIds.reserve(allocatedBlocks.size());
+
+    for (auto const& block : allocatedBlocks)
+    {
+        TLLM_CHECK_WITH_INFO(block != nullptr, "Request %lu has a null KV cache block", requestId);
+        if (block->isPlaceholder())
+        {
+            continue;
+        }
+
+        auto const blockId = block->getBlockId();
+        TLLM_CHECK_WITH_INFO(blockId >= 0, "Request %lu has invalid real KV cache block id %d", requestId, blockId);
+        if (seenBlockIds.emplace(blockId).second)
+        {
+            blockIds.push_back(blockId);
+            blocks.push_back(block);
+        }
+    }
+
+    // Validate and allocate all temporary bookkeeping before changing refcounts, so pinning itself cannot fail
+    // part-way through.
+    for (auto const& block : blocks)
+    {
+        TLLM_CHECK_WITH_INFO(block->hasRefs(), "Cannot lease unowned KV cache block %d", block->getBlockId());
+    }
+    for (auto const& block : blocks)
+    {
+        block->incRefCount();
+    }
+    return blockIds;
+}
+
+void WindowBlockManager::unpinBlocksForTransferLease(std::vector<KVCacheBlock::IdType> const& blockIds)
+{
+    std::unordered_set<KVCacheBlock::IdType> seenBlockIds;
+    std::vector<BlockPtr> blocks;
+    seenBlockIds.reserve(blockIds.size());
+    blocks.reserve(blockIds.size());
+    for (auto const blockId : blockIds)
+    {
+        if (!seenBlockIds.emplace(blockId).second)
+        {
+            continue;
+        }
+
+        TLLM_CHECK_WITH_INFO(blockId >= 0 && static_cast<size_t>(blockId) < mAllBlocksById.size(),
+            "Transfer lease block id %d is out of range", blockId);
+        auto const& block = mAllBlocksById[blockId];
+        TLLM_CHECK_WITH_INFO(
+            block != nullptr && !block->isPlaceholder() && block->getBlockId() != KVCacheBlock::kCachedBlocksRootId,
+            "Transfer lease block id %d does not identify a real KV cache block", blockId);
+        TLLM_CHECK_WITH_INFO(block->hasRefs(), "Transfer lease block %d is already unpinned", blockId);
+        blocks.push_back(block);
+    }
+
+    for (auto const& block : blocks)
+    {
+        block->decRefCount();
+        if (!block->hasRefs())
+        {
+            // Match the sequence-release policy: uncached blocks should be reclaimed before reusable tree entries.
+            mEvictionPolicy->releaseBlock(block, /*toFront=*/block->isDetached());
+        }
     }
 }
 
@@ -3959,6 +4081,218 @@ void KVCacheManager::pinBlocks(RequestIdType requestId)
 {
     auto& sequence = getSequence(requestId);
     mBlockManager.pinBlocks(sequence);
+}
+
+void KVCacheManager::beginTransferLease(RequestIdType requestId, OptionalRef<LlmRequest const> llmRequest)
+{
+    TLLM_LOG_TRACE("[%s]::%s start", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__);
+
+    decltype(mSequences)::node_type sequenceNode;
+    {
+        std::scoped_lock lock(mSequencesMtx, mTransferLeaseMtx);
+        TLLM_CHECK_WITH_INFO(mTransferLeases.find(requestId) == mTransferLeases.end(),
+            "A KV transfer lease already exists for request %lu", requestId);
+
+        auto sequenceIt = mSequences.find(requestId);
+        TLLM_CHECK_WITH_INFO(
+            sequenceIt != mSequences.end(), "Cannot begin a KV transfer lease for unknown request %lu", requestId);
+        TLLM_CHECK_WITH_INFO(sequenceIt->second.getBeamWidth() == 1,
+            "KV transfer leases currently support only beam width 1 (request %lu has beam width %d).", requestId,
+            sequenceIt->second.getBeamWidth());
+
+        if (mEnableBlockReuse)
+        {
+            // Store while the sequence is still registered. If hashing/reuse bookkeeping fails, no transfer pins or
+            // detached sequence can be left behind.
+            mBlockManager.storeBlocksForTransferLease(sequenceIt->second, llmRequest);
+        }
+
+        auto blockIds = mBlockManager.pinBlocksForTransferLease(sequenceIt->second);
+        TransferLeaseState leaseState;
+        try
+        {
+            leaseState.blockIds = blockIds;
+            leaseState.remainingBlockIds.reserve(blockIds.size());
+            for (auto const& [windowSize, windowBlockIds] : blockIds)
+            {
+                leaseState.remainingBlockIds.emplace(
+                    windowSize, std::unordered_set<KVCacheBlock::IdType>(windowBlockIds.begin(), windowBlockIds.end()));
+            }
+            mTransferLeases.emplace(requestId, std::move(leaseState));
+        }
+        catch (...)
+        {
+            mBlockManager.unpinBlocksForTransferLease(blockIds);
+            throw;
+        }
+
+        sequenceNode = mSequences.extract(sequenceIt);
+    }
+
+    // Reuse storage was completed before extraction. Drop only the sequence-owned references here; the transfer-lease
+    // pins remain as the sole ownership needed by the asynchronous sender.
+    try
+    {
+        static_cast<void>(mBlockManager.releaseBlocks(sequenceNode.mapped(), std::nullopt, /*pinBlocks=*/false));
+    }
+    catch (...)
+    {
+        auto releaseError = std::current_exception();
+        try
+        {
+            endTransferLease(requestId);
+        }
+        catch (std::exception const& cleanupError)
+        {
+            TLLM_LOG_ERROR("Failed to clean up KV transfer lease for request %lu after detach failure: %s", requestId,
+                cleanupError.what());
+        }
+        catch (...)
+        {
+            TLLM_LOG_ERROR("Failed to clean up KV transfer lease for request %lu after detach failure", requestId);
+        }
+        std::rethrow_exception(releaseError);
+    }
+
+    TLLM_LOG_TRACE("[%s]::%s stop", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__);
+}
+
+std::optional<TransferBlockIds> KVCacheManager::getTransferLeaseBlockIds(RequestIdType requestId) const
+{
+    std::scoped_lock lock(mTransferLeaseMtx);
+    auto const leaseIt = mTransferLeases.find(requestId);
+    if (leaseIt == mTransferLeases.end())
+    {
+        return std::nullopt;
+    }
+    return leaseIt->second.blockIds;
+}
+
+bool KVCacheManager::hasActiveTransferLease(RequestIdType requestId) const
+{
+    std::scoped_lock lock(mTransferLeaseMtx);
+    return mTransferLeases.find(requestId) != mTransferLeases.end();
+}
+
+void KVCacheManager::enqueueTransferLeaseRelease(RequestIdType requestId, TransferBlockIds blockIds)
+{
+    std::scoped_lock lock(mTransferLeaseMtx);
+    if (mTransferLeases.find(requestId) == mTransferLeases.end())
+    {
+        // A worker can finish after cancellation/end. The lease has already released its remainder in that case.
+        return;
+    }
+    mPendingTransferLeaseReleases.emplace_back(requestId, std::move(blockIds));
+}
+
+void KVCacheManager::drainTransferLeaseReleases()
+{
+    std::scoped_lock lock(mTransferLeaseMtx);
+    while (!mPendingTransferLeaseReleases.empty())
+    {
+        auto const& [requestId, completedBlockIds] = mPendingTransferLeaseReleases.front();
+
+        auto leaseIt = mTransferLeases.find(requestId);
+        if (leaseIt == mTransferLeases.end())
+        {
+            mPendingTransferLeaseReleases.pop_front();
+            continue;
+        }
+
+        TransferBlockIds releasableBlockIds;
+        releasableBlockIds.reserve(completedBlockIds.size());
+        for (auto const& [windowSize, windowBlockIds] : completedBlockIds)
+        {
+            auto remainingIt = leaseIt->second.remainingBlockIds.find(windowSize);
+            if (remainingIt == leaseIt->second.remainingBlockIds.end())
+            {
+                continue;
+            }
+
+            auto& releasableForWindow = releasableBlockIds[windowSize];
+            releasableForWindow.reserve(windowBlockIds.size());
+            for (auto const blockId : windowBlockIds)
+            {
+                if (remainingIt->second.find(blockId) != remainingIt->second.end())
+                {
+                    releasableForWindow.push_back(blockId);
+                }
+            }
+            if (releasableForWindow.empty())
+            {
+                releasableBlockIds.erase(windowSize);
+            }
+        }
+
+        if (!releasableBlockIds.empty())
+        {
+            mBlockManager.unpinBlocksForTransferLease(releasableBlockIds);
+            for (auto const& [windowSize, windowBlockIds] : releasableBlockIds)
+            {
+                auto& remainingBlockIds = leaseIt->second.remainingBlockIds.at(windowSize);
+                for (auto const blockId : windowBlockIds)
+                {
+                    remainingBlockIds.erase(blockId);
+                }
+            }
+        }
+        // Keep the queue entry and lease state intact if unpinning throws so
+        // the caller can retry without silently leaking the remaining pins.
+        mPendingTransferLeaseReleases.pop_front();
+    }
+}
+
+void KVCacheManager::endTransferLease(RequestIdType requestId)
+{
+    drainTransferLeaseReleases();
+
+    std::scoped_lock lock(mTransferLeaseMtx);
+    auto leaseIt = mTransferLeases.find(requestId);
+    if (leaseIt != mTransferLeases.end())
+    {
+        TransferBlockIds remainingBlockIds;
+        remainingBlockIds.reserve(leaseIt->second.blockIds.size());
+        for (auto const& [windowSize, orderedBlockIds] : leaseIt->second.blockIds)
+        {
+            auto const remainingIt = leaseIt->second.remainingBlockIds.find(windowSize);
+            if (remainingIt == leaseIt->second.remainingBlockIds.end())
+            {
+                continue;
+            }
+
+            auto& remainingForWindow = remainingBlockIds[windowSize];
+            remainingForWindow.reserve(remainingIt->second.size());
+            for (auto const blockId : orderedBlockIds)
+            {
+                if (remainingIt->second.find(blockId) != remainingIt->second.end())
+                {
+                    remainingForWindow.push_back(blockId);
+                }
+            }
+            if (remainingForWindow.empty())
+            {
+                remainingBlockIds.erase(windowSize);
+            }
+        }
+
+        if (!remainingBlockIds.empty())
+        {
+            mBlockManager.unpinBlocksForTransferLease(remainingBlockIds);
+        }
+        mTransferLeases.erase(leaseIt);
+    }
+
+    for (auto pendingIt = mPendingTransferLeaseReleases.begin(); pendingIt != mPendingTransferLeaseReleases.end();)
+    {
+        if (pendingIt->first == requestId)
+        {
+            pendingIt = mPendingTransferLeaseReleases.erase(pendingIt);
+        }
+        else
+        {
+            ++pendingIt;
+        }
+    }
 }
 
 void KVCacheManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds)

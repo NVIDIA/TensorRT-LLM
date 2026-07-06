@@ -119,7 +119,8 @@ public:
             && mEnablePartialReuse == other.mEnablePartialReuse && mHasIndexerKCache == other.mHasIndexerKCache
             && mIndexerDimPerHead == other.mIndexerDimPerHead
             && mIndexerKCacheQuantBlockSize == other.mIndexerKCacheQuantBlockSize
-            && mIndexerKCacheUseFp4 == other.mIndexerKCacheUseFp4;
+            && mIndexerKCacheUseFp4 == other.mIndexerKCacheUseFp4
+            && mTransferChunkSizeBlocks == other.mTransferChunkSizeBlocks;
     }
 
     struct ModelConfig
@@ -298,6 +299,18 @@ public:
         return mIndexerKCacheUseFp4;
     }
 
+    [[nodiscard]] std::optional<SizeType32> getTransferChunkSizeBlocks() const noexcept
+    {
+        return mTransferChunkSizeBlocks;
+    }
+
+    void setTransferChunkSizeBlocks(std::optional<SizeType32> transferChunkSizeBlocks)
+    {
+        TLLM_CHECK_WITH_INFO(!transferChunkSizeBlocks.has_value() || transferChunkSizeBlocks.value() > 0,
+            "KV-cache transfer chunk size must be positive when set.");
+        mTransferChunkSizeBlocks = transferChunkSizeBlocks;
+    }
+
     // =========================================================================
     // RNN/Mamba cache state (optional, present only for hybrid models)
     // =========================================================================
@@ -360,6 +373,9 @@ public:
         sstring << "indexerDimPerHead:" << mIndexerDimPerHead << "\n";
         sstring << "indexerKCacheQuantBlockSize:" << mIndexerKCacheQuantBlockSize << "\n";
         sstring << "indexerKCacheUseFp4:" << mIndexerKCacheUseFp4 << "\n";
+        sstring << "transferChunkSizeBlocks:"
+                << (mTransferChunkSizeBlocks.has_value() ? std::to_string(mTransferChunkSizeBlocks.value()) : "off")
+                << "\n";
         if (mRnnCacheState.has_value())
         {
             auto const& rnn = mRnnCacheState.value();
@@ -403,6 +419,7 @@ private:
     SizeType32 mIndexerDimPerHead{0};
     SizeType32 mIndexerKCacheQuantBlockSize{128};
     bool mIndexerKCacheUseFp4{false};
+    std::optional<SizeType32> mTransferChunkSizeBlocks;
     // RNN/Mamba cache state (optional, for hybrid models)
     std::optional<RnnCacheState> mRnnCacheState;
 };

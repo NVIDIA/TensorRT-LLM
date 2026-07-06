@@ -165,11 +165,29 @@ size_t MemoryDesc::serializedSize(MemoryDesc const& memoryDesc)
 
 void AgentConnection::send(DataContext const& ctx, void const* data, size_t size) const
 {
+    struct SenderStateSnapshot
+    {
+        MemoryDesc mBufferDesc;
+        std::pair<size_t, size_t> mOffsetRatio;
+        int mValidSegmentIdx;
+    };
+
     MemoryDesc srcDesc{
         reinterpret_cast<uintptr_t>(data), size, static_cast<uint32_t>(mAgentConnectionManager->getDeviceId())};
     MemoryDescs srcDescs{MemoryType::kVRAM, {srcDesc}};
-    auto const& dstBaseDesc = mSenderState.activeBufferDesc();
-    auto const& offsetRatio = mSenderState.activeOffsetRatio();
+    auto const senderState = [this]()
+    {
+        std::scoped_lock lock(mSenderStateMutex);
+        TLLM_CHECK_WITH_INFO(
+            mActiveSenderRequestId.has_value(), "AgentConnection::send called without an active request");
+        auto const stateIt = mSenderStates.find(*mActiveSenderRequestId);
+        TLLM_CHECK_WITH_INFO(stateIt != mSenderStates.end(),
+            "AgentConnection::send has no destination state for request %ld", *mActiveSenderRequestId);
+        return SenderStateSnapshot{
+            stateIt->second.activeBufferDesc(), stateIt->second.activeOffsetRatio(), stateIt->second.validSegmentIdx};
+    }();
+    auto const& dstBaseDesc = senderState.mBufferDesc;
+    auto const& offsetRatio = senderState.mOffsetRatio;
     TLLM_CHECK_WITH_INFO(offsetRatio.second != 0, "AgentConnection::send offset ratio denominator cannot be 0");
     TLLM_CHECK_WITH_INFO(size <= dstBaseDesc.getLen(), "AgentConnection::send size exceeds destination buffer");
     auto const chunkSize = size / offsetRatio.second;
@@ -181,7 +199,7 @@ void AgentConnection::send(DataContext const& ctx, void const* data, size_t size
         "AgentConnection::send destination address overflow");
     MemoryDesc dstDesc{dstBaseDesc.getAddr() + offset, size, dstBaseDesc.getDeviceId()};
     TLLM_LOG_DEBUG(
-        "send dstDesc: %p, size: %ld ,validSegmentIdx: %ld", dstDesc.getAddr(), size, mSenderState.validSegmentIdx);
+        "send dstDesc: %p, size: %ld ,validSegmentIdx: %ld", dstDesc.getAddr(), size, senderState.mValidSegmentIdx);
     MemoryDescs dstDescs{MemoryType::kVRAM, {dstDesc}};
     TransferRequest request{TransferOp::kWRITE, srcDescs, dstDescs, mRemoteAgentName};
     auto status = mAgentConnectionManager->getAgent()->submitTransferRequests(request);
@@ -205,6 +223,7 @@ void AgentConnection::recv(DataContext const& ctx, void* data, size_t size) cons
 void AgentConnection::sendRequestAndBufferInfo(batch_manager::RequestInfo& requestInfo,
     std::vector<std::optional<size_t>> const& cacheBufferIds, int connectionIdx)
 {
+    std::scoped_lock lock(mRequestInfoMutex);
     TLLM_CHECK(!common::getEnvTryZCopyForKVCacheTransfer());
 
     TLLM_CHECK(!cacheBufferIds.empty());
@@ -229,9 +248,6 @@ void AgentConnection::sendRequestAndBufferInfo(batch_manager::RequestInfo& reque
         activeKinds.push_back(allKinds[i]);
     }
     TLLM_CHECK(!activeCacheBufferIds.empty());
-
-    mCacheBufferIds = std::move(activeCacheBufferIds);
-    mBufferKinds = activeKinds;
 
     int deviceId = -1;
     TLLM_CUDA_CHECK(cudaGetDevice(&deviceId));
@@ -258,17 +274,42 @@ void AgentConnection::sendRequestAndBufferInfo(batch_manager::RequestInfo& reque
     mAgentConnectionManager->getAgent()->notifySyncMessage(mRemoteAgentName, ss.str());
 }
 
-void AgentConnection::setSenderState(std::vector<MemoryDesc> cacheReceiverBufferDescs, int validSegmentIdx,
-    std::vector<std::pair<size_t, size_t>> offsetRatios, std::vector<uint8_t> bufferKinds)
+void AgentConnection::setSenderState(RequestIdType requestId, std::vector<MemoryDesc> cacheReceiverBufferDescs,
+    int validSegmentIdx, std::vector<std::pair<size_t, size_t>> offsetRatios, std::vector<uint8_t> bufferKinds)
 {
     TLLM_CHECK(!cacheReceiverBufferDescs.empty());
     TLLM_CHECK(offsetRatios.size() == cacheReceiverBufferDescs.size());
     TLLM_CHECK(bufferKinds.size() == cacheReceiverBufferDescs.size());
-    mSenderState.mCacheReceiverBufferDescs = std::move(cacheReceiverBufferDescs);
-    mSenderState.validSegmentIdx = validSegmentIdx;
-    mSenderState.mOffsetRatios = std::move(offsetRatios);
-    mSenderState.setActiveBufferIdx(0);
-    mBufferKinds = std::move(bufferKinds);
+    SenderState senderState;
+    senderState.mCacheReceiverBufferDescs = std::move(cacheReceiverBufferDescs);
+    senderState.validSegmentIdx = validSegmentIdx;
+    senderState.mOffsetRatios = std::move(offsetRatios);
+    senderState.mBufferKinds = std::move(bufferKinds);
+    senderState.setActiveBufferIdx(0);
+
+    std::scoped_lock lock(mSenderStateMutex);
+    auto const inserted = mSenderStates.emplace(requestId, std::move(senderState)).second;
+    TLLM_CHECK_WITH_INFO(inserted, "AgentConnection received duplicate destination state for request %ld", requestId);
+}
+
+void AgentConnection::activateRequestSenderState(RequestIdType requestId) const
+{
+    std::scoped_lock lock(mSenderStateMutex);
+    auto const stateIt = mSenderStates.find(requestId);
+    TLLM_CHECK_WITH_INFO(
+        stateIt != mSenderStates.end(), "AgentConnection has no destination state for request %ld", requestId);
+    stateIt->second.setActiveBufferIdx(0);
+    mActiveSenderRequestId = requestId;
+}
+
+void AgentConnection::eraseRequestSenderState(RequestIdType requestId) const
+{
+    std::scoped_lock lock(mSenderStateMutex);
+    mSenderStates.erase(requestId);
+    if (mActiveSenderRequestId == requestId)
+    {
+        mActiveSenderRequestId.reset();
+    }
 }
 
 void AgentConnection::setHasLoadRemoteAgent(bool hasLoadRemoteAgent)
@@ -299,26 +340,23 @@ bool AgentConnection::recvReadySignal(DataContext const& ctx) const
 
 void AgentConnection::activateBuffer(uint8_t kind) const
 {
-    for (size_t i = 0; i < mBufferKinds.size(); i++)
+    std::scoped_lock lock(mSenderStateMutex);
+    TLLM_CHECK_WITH_INFO(
+        mActiveSenderRequestId.has_value(), "AgentConnection::activateBuffer called without an active request");
+    auto const stateIt = mSenderStates.find(*mActiveSenderRequestId);
+    TLLM_CHECK_WITH_INFO(stateIt != mSenderStates.end(),
+        "AgentConnection::activateBuffer has no destination state for request %ld", *mActiveSenderRequestId);
+    auto const& bufferKinds = stateIt->second.mBufferKinds;
+    for (size_t i = 0; i < bufferKinds.size(); i++)
     {
-        if (mBufferKinds[i] == kind)
+        if (bufferKinds[i] == kind)
         {
-            mSenderState.setActiveBufferIdx(i);
+            stateIt->second.setActiveBufferIdx(i);
             return;
         }
     }
-}
-
-std::optional<size_t> AgentConnection::getPreAssignedBufferId(uint8_t kind) const
-{
-    for (size_t i = 0; i < mBufferKinds.size(); i++)
-    {
-        if (mBufferKinds[i] == kind && i < mCacheBufferIds.size())
-        {
-            return mCacheBufferIds[i];
-        }
-    }
-    return std::nullopt;
+    TLLM_THROW("AgentConnection has no destination buffer of kind %u for request %ld", static_cast<unsigned>(kind),
+        *mActiveSenderRequestId);
 }
 
 AgentConnectionManager::AgentConnectionManager(
@@ -548,8 +586,8 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
                         }
                         }
                     }
-                    connection->setSenderState(
-                        std::move(bufferDescs), connectionIdx, std::move(offsetRatios), std::move(bufferKinds));
+                    connection->setSenderState(requestInfo.getRequestId(), std::move(bufferDescs), connectionIdx,
+                        std::move(offsetRatios), std::move(bufferKinds));
                     notifIt = notifs.erase(notifIt);
                     if (notifs.empty())
                     {

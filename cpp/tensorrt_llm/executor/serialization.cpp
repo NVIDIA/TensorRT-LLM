@@ -622,6 +622,7 @@ kv_cache::CacheState Serialization::deserializeCacheState(std::istream& is)
     auto indexerDimPerHead = su::deserialize<decltype(CacheState::ModelConfig::mSizePerHead)>(is);
     auto indexerKCacheQuantBlockSize = su::deserialize<decltype(CacheState::ModelConfig::mTokensPerBlock)>(is);
     auto indexerKCacheUseFp4 = su::deserialize<bool>(is);
+    auto transferChunkSizeBlocks = su::deserialize<std::optional<SizeType32>>(is);
     // RNN config (optional)
     auto hasRnnConfig = su::deserialize<bool>(is);
     std::optional<CacheState::RnnModelConfig> rnnModelConfig;
@@ -655,6 +656,7 @@ kv_cache::CacheState Serialization::deserializeCacheState(std::istream& is)
         cacheState.setRnnConfig(
             std::move(rnnModelConfig.value()), std::move(rnnLayerNumPerPP), convStateDataType, ssmStateDataType);
     }
+    cacheState.setTransferChunkSizeBlocks(transferChunkSizeBlocks);
     return cacheState;
 }
 
@@ -679,6 +681,7 @@ void Serialization::serialize(kv_cache::CacheState const& state, std::ostream& o
     su::serialize(state.getIndexerDimPerHead(), os);
     su::serialize(state.getIndexerKCacheQuantBlockSize(), os);
     su::serialize(state.getIndexerKCacheUseFp4(), os);
+    su::serialize(state.getTransferChunkSizeBlocks(), os);
     // RNN config (optional)
     su::serialize(state.mRnnCacheState.has_value(), os);
     if (state.mRnnCacheState.has_value())
@@ -721,6 +724,7 @@ size_t Serialization::serializedSize(kv_cache::CacheState const& state)
     totalSize += su::serializedSize(state.getIndexerDimPerHead());
     totalSize += su::serializedSize(state.getIndexerKCacheQuantBlockSize());
     totalSize += su::serializedSize(state.getIndexerKCacheUseFp4());
+    totalSize += su::serializedSize(state.getTransferChunkSizeBlocks());
     // RNN config (optional)
     totalSize += su::serializedSize(state.mRnnCacheState.has_value());
     if (state.mRnnCacheState.has_value())

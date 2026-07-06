@@ -180,6 +180,10 @@ protected:
                 future.get();
             }
         }
+        mSender.reset();
+        mRequester.reset();
+        mConnectionManager.reset();
+        mCacheTransBufferManager.reset();
     }
 
     SizeType32 setUpCommunicator()
@@ -191,6 +195,39 @@ protected:
         isSender = mComm->getRank() % 2 == 0;
         tensorrt_llm::mpi::MpiComm::setSession(mComm->split(static_cast<int>(isSender), mlocalRank));
         return mWorldSize;
+    }
+
+    void exchangeContextCommState()
+    {
+        auto const& commState = mConnectionManager->getCommState();
+        namespace su = tensorrt_llm::executor::serialize_utils;
+
+        if (tensorrt_llm::mpi::MpiComm::world().getRank() == 0)
+        {
+            std::ostringstream oStream;
+            su::serialize(commState, oStream);
+            auto str = oStream.str();
+            std::vector<char> buffer(str.begin(), str.end());
+            int constexpr genRank = 1;
+            int64_t const bufferSize = buffer.size();
+            tensorrt_llm::mpi::MpiComm::world().sendRawTag(
+                &bufferSize, 1, tensorrt_llm::mpi::MpiType::kINT64, genRank, 0x1F);
+            tensorrt_llm::mpi::MpiComm::world().sendRawTag(
+                buffer.data(), buffer.size(), tensorrt_llm::mpi::MpiType::kCHAR, genRank, 0x2F);
+            mContextCommState = std::make_unique<texec::kv_cache::CommState>(commState);
+        }
+        else
+        {
+            int64_t bufferSize;
+            tensorrt_llm::mpi::MpiComm::world().recvRawTag(&bufferSize, 1, tensorrt_llm::mpi::MpiType::kINT64, 0, 0x1F);
+            std::vector<char> recvBuffer(bufferSize);
+            tensorrt_llm::mpi::MpiComm::world().recvRawTag(
+                recvBuffer.data(), bufferSize, tensorrt_llm::mpi::MpiType::kCHAR, 0, 0x2F);
+            su::VectorWrapBuf<char> strbuf(recvBuffer);
+            std::istream is(&strbuf);
+            mContextCommState
+                = std::make_unique<texec::kv_cache::CommState>(su::deserialize<texec::kv_cache::CommState>(is));
+        }
     }
 
     void setUpCacheManager()
@@ -246,46 +283,9 @@ protected:
             std::unique_ptr<tensorrt_llm::executor::kv_cache::ConnectionManager> (*makeUcxConnectionManager)();
             *(void**) (&makeUcxConnectionManager) = load_sym(WrapperLibHandle, "makeUcxConnectionManager");
             mConnectionManager = makeUcxConnectionManager();
-            auto commState = mConnectionManager->getCommState();
-            namespace su = tensorrt_llm::executor::serialize_utils;
-
-            if (tensorrt_llm::mpi::MpiComm::world().getRank() == 0)
-            {
-
-                std::ostringstream oStream;
-                su::serialize(commState, oStream);
-                auto str = oStream.str();
-                std::vector<char> buffer(str.begin(), str.end());
-                int genRank = 1;
-                int64_t bufferSize = buffer.size();
-                TLLM_LOG_DEBUG(
-                    tensorrt_llm::mpi::MpiComm::world().getRank(), "send bufferSize: %ld to %d", bufferSize, genRank);
-                tensorrt_llm::mpi::MpiComm::world().sendRawTag(
-                    &bufferSize, 1, tensorrt_llm::mpi::MpiType::kINT64, genRank, 0x1F);
-                tensorrt_llm::mpi::MpiComm::world().sendRawTag(
-                    buffer.data(), buffer.size(), tensorrt_llm::mpi::MpiType::kCHAR, genRank, 0x2F);
-                TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "send buffer to %d", genRank);
-                mContextCommState = std::make_unique<tensorrt_llm::executor::kv_cache::CommState>(commState);
-            }
-            else
-            {
-                int64_t bufferSize;
-                tensorrt_llm::mpi::MpiComm::world().recvRawTag(
-                    &bufferSize, 1, tensorrt_llm::mpi::MpiType::kINT64, 0, 0x1F);
-                TLLM_LOG_DEBUG(
-                    tensorrt_llm::mpi::MpiComm::world().getRank(), "recv bufferSize: %ld from 0", bufferSize);
-                std::vector<char> recvBuffer(bufferSize);
-                tensorrt_llm::mpi::MpiComm::world().recvRawTag(
-                    recvBuffer.data(), bufferSize, tensorrt_llm::mpi::MpiType::kCHAR, 0, 0x2F);
-                TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "recv buffer from 0", bufferSize);
-                std::istringstream iStream(std::string(recvBuffer.begin(), recvBuffer.end()));
-                su::VectorWrapBuf<char> strbuf(recvBuffer);
-                std::istream is(&strbuf);
-                mContextCommState = std::make_unique<tensorrt_llm::executor::kv_cache::CommState>(
-                    su::deserialize<tensorrt_llm::executor::kv_cache::CommState>(is));
-            }
+            exchangeContextCommState();
         }
-        else
+        else if (!tensorrt_llm::common::getEnvUseNixlKvCache() && !tensorrt_llm::common::getEnvUseMooncakeKvCache())
         {
             mConnectionManager = std::make_unique<texec::kv_cache::MpiConnectionManager>(mComm);
             mContextCommState
@@ -302,6 +302,19 @@ protected:
         mCacheTransBufferManager = std::make_unique<CacheTransBufferManager>(mManager.get(), maxNumTokens);
         std::vector<CacheTransBufferManager*> bufferManagers;
         bufferManagers.push_back(mCacheTransBufferManager.get());
+        if (tensorrt_llm::common::getEnvUseNixlKvCache() || tensorrt_llm::common::getEnvUseMooncakeKvCache())
+        {
+            bool const isNixl = tensorrt_llm::common::getEnvUseNixlKvCache();
+            if (isNixl)
+            {
+                constexpr auto port = 22345;
+                setenv("TRTLLM_NIXL_PORT", std::to_string(port).c_str(), 1);
+            }
+            std::vector<BaseTransBufferManager*> baseBufferManagers{mCacheTransBufferManager.get()};
+            mConnectionManager = std::make_unique<texec::kv_cache::AgentConnectionManager>(
+                baseBufferManagers, *mCacheState, isNixl ? "nixl" : "mooncake");
+            exchangeContextCommState();
+        }
         if (isSender)
         {
             mSender = std::make_unique<CacheSender>(mConnectionManager.get(), mlocalRank,
@@ -329,7 +342,7 @@ protected:
         return std::make_unique<LlmRequest>(mRequestId++, std::move(request));
     }
 
-    void addRequestAndTransportCache(std::shared_ptr<LlmRequest> const& llmRequest)
+    void addRequestAndTransportCache(std::shared_ptr<LlmRequest> const& llmRequest, bool useTransferLease = false)
     {
         auto constexpr beamIdx{0};
         auto constexpr beamWidth{1};
@@ -347,6 +360,10 @@ protected:
                     // fill cache with tokens (= request length), for reuse test
                     TLLM_CUDA_CHECK(cudaMemset(it->data(), llmRequest->getPromptLen(), it->getSizeInBytes()));
                 }
+            }
+            if (useTransferLease)
+            {
+                mManager->beginTransferLease(llmRequest->mRequestId, *llmRequest);
             }
             mFutures.emplace_back(mSender->sendAsync(llmRequest));
         }
@@ -423,6 +440,84 @@ TEST_F(SymmetricalCacheTest, SimpleTest)
     for (auto& future : mFutures)
     {
         future.get();
+    }
+}
+
+TEST_F(SymmetricalCacheTest, ChunkedTransfer)
+{
+    auto worldSize = setUpCommunicator();
+    if (worldSize != 2)
+    {
+        GTEST_SKIP() << "mpirun 2 processes is required to run this test.";
+    }
+    setUpCacheManager();
+    mCacheState->setTransferChunkSizeBlocks(3);
+    setUpCacheTransceiver();
+    std::vector<std::shared_ptr<tensorrt_llm::batch_manager::LlmRequest>> requests;
+
+    // Exercise multiple chunks, a short final chunk, and concurrent requests
+    // through the real sender/receiver request and chunk-control protocols.
+    for (auto len : {10, 20, 30})
+    {
+        requests.emplace_back(makeLlmRequest(len));
+        addRequestAndTransportCache(requests.back());
+    }
+    for (auto& future : mFutures)
+    {
+        future.get();
+    }
+    mFutures.clear();
+    for (auto& request : requests)
+    {
+        tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request);
+        mManager->removeSequence(request->mRequestId, request);
+    }
+    requests.clear();
+
+    // Repeat after releasing the first batch to cover buffer/session reuse.
+    for (auto len : {10, 20, 30})
+    {
+        requests.emplace_back(makeLlmRequest(len));
+        addRequestAndTransportCache(requests.back());
+    }
+    for (auto& future : mFutures)
+    {
+        future.get();
+    }
+}
+
+TEST_F(SymmetricalCacheTest, ChunkedTransferReleasesExactLeaseBlocks)
+{
+    auto worldSize = setUpCommunicator();
+    if (worldSize != 2)
+    {
+        GTEST_SKIP() << "mpirun 2 processes is required to run this test.";
+    }
+    setUpCacheManager();
+    mCacheState->setTransferChunkSizeBlocks(3);
+    setUpCacheTransceiver();
+
+    std::shared_ptr<LlmRequest> request = makeLlmRequest(30);
+    auto const requestId = request->mRequestId;
+    addRequestAndTransportCache(request, /*useTransferLease=*/true);
+    for (auto& future : mFutures)
+    {
+        future.get();
+    }
+    mFutures.clear();
+
+    if (isSender)
+    {
+        ASSERT_TRUE(mManager->hasActiveTransferLease(requestId));
+        mManager->drainTransferLeaseReleases();
+        EXPECT_EQ(mManager->getNumFreeBlocks(), mManager->getMaxNumBlocks());
+        mManager->endTransferLease(requestId);
+        EXPECT_FALSE(mManager->hasActiveTransferLease(requestId));
+    }
+    else
+    {
+        tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request);
+        mManager->removeSequence(requestId, request);
     }
 }
 

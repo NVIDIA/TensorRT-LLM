@@ -252,6 +252,12 @@ TRT-LLM uses some environment variables to control the behavior of disaggregated
 
 * `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE`: By default, TRT-LLM uses a `stream-ordered memory allocator` to allocate temporary buffers. If this environment variable is set to #Size, TRT-LLM will use `cudaMalloc` to allocate buffer of size #Size for KV cache transmission. The default value is `512MB`. Users can set `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=1GB` to allocate a 1 GB buffer with `cudaMalloc` for KV cache transmission.
 
+**Protocol compatibility:** Context and generation peers must run the same TensorRT-LLM build, even when chunked transfer is disabled. The C++ transceiver's serialized cache state and request-readiness protocol are not wire-compatible with older builds. Mixed-version deployments are unsupported and can hang. All ranks in a deployment must also use identical values for both chunked-transfer environment variables below.
+
+* `TRTLLM_KVCACHE_TRANSFER_CHUNK_SIZE_BLOCKS`: A positive decimal integer enables the C++ transceiver's chunked protocol and sets the number of KV-cache blocks staged per chunk. Unset or `0` disables chunking. The initial implementation supports beam width 1, one primary KV pool and cache window, CP=1, and a 1:1 transfer-peer topology; it rejects MLA/indexer, sliding-window, RNN/hybrid, layer-wise, and zero-copy cache layouts.
+
+* `TRTLLM_KVCACHE_TRANSFER_EARLY_RELEASE`: If set to `1`, the context executor releases exact sender-side KV blocks after each chunk has been committed by the receiver. This requires a positive `TRTLLM_KVCACHE_TRANSFER_CHUNK_SIZE_BLOCKS`. The initial implementation also requires the C++ transceiver, TP=PP=CP=1 (`world_size=1` in the PyExecutor), and no KV-cache connector.
+
 * `TRTLLM_KVCACHE_TRANSFER_USE_ASYNC_BUFFER`: If set to `1`, TRT-LLM will use `cudaMallocAsync` to allocate buffers for KV cache transmission. The default value is `0`. This environment variable only takes effect when `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE` is greater than 0.
 
 * `TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM`: The maximum number of concurrent KV cache sends. The default value is `1`. This environment variable only takes effect when `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE` is greater than 0.
