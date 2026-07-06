@@ -15,12 +15,16 @@ The flow per forward call is:
      with ``output_maxscore=True`` and ``num_kv_heads=1``. ``fmha_sm100``
      returns ``(None, max_score)`` where ``max_score`` has shape
      ``[num_index_heads, max_k_tiles, total_qo_len]``.
-  2. **Block selection.** Feed ``max_score`` into ``sparse_topk_select``
-     to produce ascending per-row top-k block indices with ``-1``
-     padding.  The kernel currently fixes ``topk = 16`` and the
-     MiniMax-M3 checkpoint matches that default exactly.
+  2. **Block selection.** Reduce ``max_score`` to KV-head granularity
+     and select top-k blocks per query (ascending indices, ``-1``
+     padded) with per-query valid-block masking and forced init/local
+     blocks.
   3. **Sparse GQA.** Run a second ``fmha_sm100`` over the main K/V
      branch, passing the block indices via ``kv_block_indexes``.
+
+Prefill runs this flow eagerly through the MSA plan/run API; pure
+decode runs it through the CUDA-graph-safe in-tree driver
+(:mod:`.decode_wrapper`).
 
 This module deliberately keeps the cache-layout adapter explicit so
 the MSA backend is selectable per-layer without disturbing the
@@ -35,7 +39,12 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
-from .backend import _write_main_kv_slots, get_minimax_m3_attention_backend_cls
+from .backend import (
+    _INIT_SCORE,
+    _LOCAL_SCORE,
+    _write_main_kv_slots,
+    get_minimax_m3_attention_backend_cls,
+)
 from .metadata import (
     MiniMaxM3SparseAttentionMetadata,
     MiniMaxM3SparseConfig,
@@ -46,10 +55,11 @@ if TYPE_CHECKING:
     from .metadata import MiniMaxM3SparseParams
 
 
-# MSA's ``sparse_topk_select`` kernel only ships a topk=16 path today,
-# and ``fmha_sm100`` only ships head_dim=128 variants. Enforce these
-# preconditions early so layer construction fails with a clear message
-# rather than a cryptic shape error from inside the MSA JIT.
+# ``fmha_sm100`` only ships head_dim=128 variants, and the in-tree
+# block-selection/driver geometry is validated for topk=16 (the
+# MiniMax-M3 checkpoint value). Enforce these preconditions early so
+# layer construction fails with a clear message rather than a cryptic
+# shape error from inside the MSA JIT.
 _MSA_REQUIRED_TOPK = 16
 _MSA_REQUIRED_HEAD_DIM = 128
 
@@ -67,8 +77,9 @@ def _require_msa_module():
     except ImportError as exc:  # pragma: no cover - install-time error
         raise RuntimeError(
             "MiniMax-M3 MSA backend requires the external `fmha_sm100` "
-            "package (MSA: https://github.com/MiniMax-AI/MSA). Install "
-            "it with `pip install fmha_sm100`, or unset "
+            "package (MSA: https://github.com/MiniMax-AI/MSA; not on "
+            "PyPI). Install it with `pip install "
+            "'git+https://github.com/MiniMax-AI/MSA.git'`, or unset "
             "`sparse_use_msa` in the sparse attention config to fall "
             "back to the Triton reference path."
         ) from exc
@@ -165,7 +176,6 @@ def _build_kv_indices_and_lens(
     slot_ids_long = metadata.slot_ids.to(torch.long)
     req_rows = metadata.req_to_token.index_select(0, slot_ids_long).to(torch.long)
     batch = int(req_rows.shape[0])
-    max_kv_len = int(req_rows.shape[1])
     seq_lens_cpu = metadata.seq_lens_cpu.to(torch.long).tolist()
 
     page_lists = []
@@ -174,16 +184,24 @@ def _build_kv_indices_and_lens(
         if kv_len <= 0:
             continue
         num_pages = (kv_len + page_size - 1) // page_size
-        # First slot of each page gives the page id (each block is a
-        # contiguous run of page_size slots, see KVCacheManagerV2).
-        # Clamp so trailing pages (rounded up beyond the request's
-        # block count) reuse the last valid block - they are masked out
-        # by seq_lens in the kernel.
-        max_page = max_kv_len // page_size
+        # First slot of each page gives the *global* page id into the paged
+        # cache (each block is a contiguous run of page_size slots, see
+        # KVCacheManagerV2). ``req_rows[b]`` already holds valid slot ids,
+        # so ``// page_size`` yields valid global page ids by construction.
+        #
+        # Do NOT clamp these to a per-request bound: ``max_kv_len //
+        # page_size`` is the per-request page count, not a global page-id
+        # bound. Clamping page ids to ``max_page - 1`` collapses the page
+        # table for every request whose pages exceed that count (i.e. every
+        # request after the first in a contiguous layout, and virtually all
+        # requests in production where block ids are global and
+        # non-contiguous), making the proxy FMHA read the wrong K/V and
+        # corrupting the block scores.  (Ported from
+        # brb/feat/minimax_m3_mxfp8_msa commit 677bcb45e5.)
         page_starts = torch.arange(num_pages, device=device, dtype=torch.long) * page_size
-        page_starts = page_starts.clamp_max(max(0, max_kv_len - 1))
+        # ``page_starts`` is bounded by ``(num_pages - 1) * page_size < kv_len``
+        # so it never over-reads; no clamp needed on the read index either.
         page_ids = req_rows[b].gather(0, page_starts) // page_size
-        page_ids = page_ids.clamp_min(0).clamp_max(max(0, max_page - 1))
         page_lists.append(page_ids.to(torch.int32))
 
     if page_lists:
@@ -221,6 +239,98 @@ def _select_proxy_fmha_class():
         if cls.is_available():
             return cls
     return None
+
+
+def _per_token_valid_blocks(
+    qo_lens_cpu: torch.Tensor,
+    kv_lens_cpu: torch.Tensor,
+    qo_offset_cpu: Optional[torch.Tensor],
+    *,
+    causal: bool,
+    block_size: int,
+) -> torch.Tensor:
+    """Per-query number of valid KV blocks (causal-aware), on CPU.
+
+    Ported from brb/feat/minimax_m3_mxfp8_msa commit 92d8405af5.
+    Expands per-request lens/offsets to a per-*token* ``[total_q]``
+    tensor so block selection can honour each query token's own causal
+    extent — which ``sparse_topk_select``'s scalar ``num_valid_pages`` /
+    ``force_end_blocks`` cannot express.
+    """
+    qo = qo_lens_cpu.to(torch.long)
+    kv = kv_lens_cpu.to(torch.long)
+    batch = int(qo.shape[0])
+    total = int(qo.sum().item())
+    if total == 0:
+        return torch.zeros(0, dtype=torch.long)
+    batch_row = torch.repeat_interleave(torch.arange(batch, dtype=torch.long), qo)
+    starts = torch.zeros(batch, dtype=torch.long)
+    if batch > 1:
+        starts[1:] = torch.cumsum(qo, 0)[:-1]
+    intra = torch.arange(total, dtype=torch.long) - starts[batch_row]
+    kv_per = kv[batch_row]
+    if causal:
+        if qo_offset_cpu is not None:
+            off = qo_offset_cpu.to(torch.long)[batch_row]
+        else:
+            off = (kv - qo)[batch_row]
+        eff = torch.minimum(off + intra + 1, kv_per)
+    else:
+        eff = kv_per
+    return (eff + block_size - 1) // block_size
+
+
+def _select_blocks_from_maxscore(
+    max_score_kv: torch.Tensor,
+    *,
+    topk: int,
+    n_valid_blocks: torch.Tensor,
+    init_blocks: int,
+    local_blocks: int,
+) -> torch.Tensor:
+    """Per-query block selection from per-KV-head block scores, in torch.
+
+    Ported from brb/feat/minimax_m3_mxfp8_msa commit 92d8405af5.
+    Mirrors the reference ``backend._index_attention_and_select``
+    selection (init/local forced blocks + per-query valid-block masking
+    + top-k) on the ``amax``-reduced per-KV-head scores
+    (``[num_kv_heads, n_blocks, total_q]``).  Replaces
+    ``fmha_sm100.sparse_topk_select``, whose scalar ``num_valid_pages``
+    / forced-block windows are batch-wide and therefore wrong for every
+    query shorter than the batch-longest.
+
+    Returns ``[total_q, num_kv_heads, topk]`` int32, ascending block
+    indices with ``-1`` tail padding (unchanged downstream contract).
+    """
+    num_kv_heads, n_blocks, total_q = max_score_kv.shape
+    device = max_score_kv.device
+    scores = max_score_kv.permute(2, 0, 1).to(torch.float32).clone()  # [q, kv, blk]
+    block_ids = torch.arange(n_blocks, device=device, dtype=torch.long)
+    nvb = n_valid_blocks.to(device=device, dtype=torch.long)  # [total_q]
+
+    if init_blocks > 0:
+        init_mask = block_ids.view(1, 1, -1) < init_blocks
+        scores = torch.where(init_mask, torch.full_like(scores, _INIT_SCORE), scores)
+    if local_blocks > 0:
+        local_start = (nvb - local_blocks).clamp_min(0)  # [total_q]
+        local_mask = (block_ids.view(1, -1) >= local_start.view(-1, 1)) & (
+            block_ids.view(1, -1) < nvb.view(-1, 1)
+        )  # [total_q, n_blocks]
+        scores = torch.where(local_mask.unsqueeze(1), torch.full_like(scores, _LOCAL_SCORE), scores)
+    # Per-query replacement for the kernel's scalar num_valid_pages clamp.
+    block_valid = block_ids.view(1, -1) < nvb.view(-1, 1)  # [total_q, n_blocks]
+    scores = scores.masked_fill(~block_valid.unsqueeze(1), float("-inf"))
+
+    k = min(topk, n_blocks)
+    vals, idx = scores.topk(k=k, dim=-1)  # [total_q, kv, k]
+    idx = torch.where(vals != float("-inf"), idx, torch.full_like(idx, -1))
+    sort_key = torch.where(idx < 0, torch.full_like(idx, n_blocks), idx)
+    sort_key, _ = torch.sort(sort_key, dim=-1)
+    idx = torch.where(sort_key >= n_blocks, torch.full_like(sort_key, -1), sort_key)
+    if k < topk:
+        pad = torch.full((total_q, num_kv_heads, topk - k), -1, dtype=idx.dtype, device=device)
+        idx = torch.cat([idx, pad], dim=-1)
+    return idx.to(torch.int32)
 
 
 def _msa_index_proxy_and_topk(
@@ -273,11 +383,6 @@ def _msa_index_proxy_and_topk(
         ``sparse_topk_select``, mirroring the
         ``score_type='max'`` reduction the reference path performs.
     """
-    # ``sparse_topk_select`` still lives in fmha_sm100 -- the
-    # top-k step is not factored into the FMHA registry today.
-    # (Future work: register it as a separate selector library.)
-    fmha_sm100 = _require_msa_module()
-
     proxy_cls = _select_proxy_fmha_class()
     if proxy_cls is None:
         raise RuntimeError(
@@ -319,14 +424,19 @@ def _msa_index_proxy_and_topk(
     else:
         max_score_kv = max_score
 
-    # ``num_valid_pages`` is per-call so the kernel masks out the
-    # rounded-up tail tiles; we pass the maximum across the batch and
-    # rely on the kernel's ``idx >= num_valid_pages`` check.
+    # Per-query valid-block counts + torch selection (replaces
+    # ``fmha_sm100.sparse_topk_select``, whose scalar num_valid_pages /
+    # forced windows are batch-wide — wrong for heterogeneous batches
+    # and for prefill where each token has its own causal extent).
     page_size = int(idx_k_paged.shape[2])
-    max_valid_pages = (
-        int(((kv_lens_cpu + page_size - 1) // page_size).max().item()) if kv_lens_cpu.numel() else 0
+    n_valid_blocks = _per_token_valid_blocks(
+        qo_lens_cpu,
+        kv_lens_cpu,
+        qo_offset_cpu,
+        causal=causal,
+        block_size=page_size,
     )
-    if max_valid_pages <= 0:
+    if n_valid_blocks.numel() == 0 or int(n_valid_blocks.max().item()) <= 0:
         # Degenerate batch (no KV) — return all-padded indices.
         return torch.full(
             (idx_q.shape[0], config.num_kv_heads, _MSA_REQUIRED_TOPK),
@@ -335,12 +445,12 @@ def _msa_index_proxy_and_topk(
             device=idx_q.device,
         )
 
-    return fmha_sm100.sparse_topk_select(
-        max_score_kv.contiguous(),
-        _MSA_REQUIRED_TOPK,
-        num_valid_pages=max_valid_pages,
-        force_begin_blocks=init_blocks,
-        force_end_blocks=local_blocks,
+    return _select_blocks_from_maxscore(
+        max_score_kv,
+        topk=_MSA_REQUIRED_TOPK,
+        n_valid_blocks=n_valid_blocks,
+        init_blocks=init_blocks,
+        local_blocks=local_blocks,
     )
 
 
@@ -414,6 +524,112 @@ def _msa_sparse_attention(
         sm_scale=sm_scale,
         causal=causal,
     )
+
+
+# ---------------------------------------------------------------------------
+# In-tree graph-safe decode driver
+# ---------------------------------------------------------------------------
+
+
+def _intree_sparse_decode(
+    q: torch.Tensor,
+    idx_q: torch.Tensor,
+    k_paged: torch.Tensor,
+    v_paged: torch.Tensor,
+    idx_k_paged: torch.Tensor,
+    metadata: MiniMaxM3SparseAttentionMetadata,
+    config: MiniMaxM3SparseConfig,
+    *,
+    sm_scale: float,
+    idx_sm_scale: float,
+    page_size: int,
+) -> torch.Tensor:
+    """Pure-decode path through the in-tree graph-safe driver.
+
+    Replaces the MSA ``fmha_sm100_plan`` / ``fmha_sm100`` /
+    ``sparse_topk_select`` host driver with
+    :mod:`.decode_wrapper.dispatch` while running the same
+    JIT-compiled kernel binaries.  Everything per-step-varying is read
+    from device tensors, so this function is CUDA-graph-capturable and
+    every replay tracks the current ``seq_lens`` / page tables (the
+    exact property the MSA host driver lacks).
+    """
+    from .decode_wrapper.dispatch import M3DecodeGeometry, get_decode_driver
+
+    batch = int(q.shape[0])
+    seq_lens = metadata.seq_lens.to(torch.int32)
+
+    msa_plans = getattr(metadata, "msa_plans", None)
+    if msa_plans is not None:
+        kv_indices = msa_plans["kv_indices"]
+        kv_page_indptr = msa_plans["kv_page_indptr"]
+        max_batch = int(msa_plans.get("max_batch") or 0)
+        max_kv_len = int(msa_plans.get("max_kv_len") or 0)
+    else:
+        # Eager fallback when prepare() did not pre-stage the page
+        # table (e.g. focused unit tests). Host-side work is fine here,
+        # but it must never run inside a capture — fail loudly instead
+        # of letting the unpinned H2D copy below produce a cryptic
+        # capture error (or worse, silently freeze stale values).
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "MiniMax-M3 in-tree decode reached the eager fallback during "
+                "CUDA graph capture: metadata.msa_plans was not pre-staged by "
+                "prepare(). This means the MSA geometry was not registered "
+                "before capture (see msa_plan_cache.set_global_msa_geometry)."
+            )
+        kv_indices, _ = _build_kv_indices_and_lens(metadata, page_size)
+        num_pages_cpu = (metadata.seq_lens_cpu.to(torch.long) + page_size - 1) // page_size
+        kv_page_indptr = torch.zeros(batch + 1, dtype=torch.int32)
+        kv_page_indptr[1:] = num_pages_cpu.to(torch.int32).cumsum(0)
+        kv_page_indptr = kv_page_indptr.to(q.device, non_blocking=True)
+        max_batch = 0
+        max_kv_len = 0
+
+    if max_batch <= 0:
+        # Stable power-of-two capacity so the driver cache key does not
+        # churn as eager batch sizes vary.
+        max_batch = max(64, 1 << (batch - 1).bit_length())
+    if max_kv_len <= 0:
+        max_kv_len = int(metadata.req_to_token.shape[1])
+
+    geometry = M3DecodeGeometry(
+        num_q_heads=config.num_q_heads,
+        num_kv_heads=config.num_kv_heads,
+        num_index_heads=config.num_index_heads,
+        head_dim=config.head_dim,
+        page_size=page_size,
+        topk=config.topk,
+        init_blocks=config.init_blocks,
+        local_blocks=config.local_blocks,
+        max_batch=max_batch,
+        max_kv_len=max_kv_len,
+    )
+    driver = get_decode_driver(geometry, q.device)
+
+    max_score = driver.proxy_max_score(
+        idx_q,
+        idx_k_paged,
+        seq_lens=seq_lens,
+        kv_page_indptr=kv_page_indptr,
+        kv_indices=kv_indices,
+        sm_scale=idx_sm_scale,
+    )
+    kv_block_indexes = driver.select_blocks(max_score, seq_lens=seq_lens)
+    out = driver.sparse_attention(
+        q,
+        k_paged,
+        v_paged,
+        kv_block_indexes,
+        seq_lens=seq_lens,
+        kv_page_indptr=kv_page_indptr,
+        kv_indices=kv_indices,
+        sm_scale=sm_scale,
+    )
+    # ``out`` aliases the driver's persistent buffer; the caller
+    # consumes it immediately (o_proj input) before the next layer's
+    # dispatch overwrites it, which is stream-ordered and safe.
+    return out.reshape(batch, config.num_q_heads * config.head_dim)
 
 
 # ---------------------------------------------------------------------------
@@ -505,8 +721,15 @@ def minimax_m3_msa_sparse_prefill(
             f"got page_size={page_size}, sparse_block_size={config.block_size}."
         )
 
-    qo_lens_cpu, kv_lens_cpu, qo_offset_cpu = _qo_lens_offsets_from_metadata(metadata)
-    kv_indices, _ = _build_kv_indices_and_lens(metadata, page_size)
+    msa_plans = getattr(metadata, "msa_plans", None)
+    if msa_plans is not None:
+        qo_lens_cpu = msa_plans["qo_lens_cpu"]
+        kv_lens_cpu = msa_plans["kv_lens_cpu"]
+        qo_offset_cpu = msa_plans["qo_offset_cpu"]
+        kv_indices = msa_plans["kv_indices"]
+    else:
+        qo_lens_cpu, kv_lens_cpu, qo_offset_cpu = _qo_lens_offsets_from_metadata(metadata)
+        kv_indices, _ = _build_kv_indices_and_lens(metadata, page_size)
 
     kv_block_indexes = _msa_index_proxy_and_topk(
         idx_q,
@@ -551,14 +774,16 @@ def minimax_m3_msa_sparse_decode(
     sm_scale: Optional[float] = None,
     idx_sm_scale: Optional[float] = None,
 ) -> torch.Tensor:
-    """Pure-decode MSA path.
+    """Pure-decode path: always the in-tree graph-safe driver.
 
     Decode is the ``qo_len == 1`` specialization of
-    :func:`minimax_m3_msa_sparse_prefill` with ``causal=False`` (the
-    new token attends to all cached positions through ``seq_lens - 1``,
-    no in-batch causality). ``MSA``'s ``fmha_sm100`` handles the
-    sub-32 query path internally via its decode kernel selection
-    (``_prefill_qlen_threshold(sparse=True) == 32``).
+    :func:`minimax_m3_msa_sparse_prefill`.  It runs the same
+    ``fmha_sm100`` kernel binaries as the prefill path but through
+    :mod:`.decode_wrapper.dispatch` — device-tensor launch
+    arguments, device-side top-k, CUDA-graph-capturable end to end.
+    The legacy MSA host-driver decode (``fmha_sm100_plan`` +
+    ``sparse_topk_select``) was removed after the in-tree driver
+    reached bit-parity in eager and passed GSM8K under CUDA graphs.
     """
     if metadata.is_prefill:
         raise ValueError("MSA decode entry called with prefill metadata")
@@ -590,38 +815,18 @@ def minimax_m3_msa_sparse_decode(
             f"got page_size={page_size}, sparse_block_size={config.block_size}."
         )
 
-    qo_lens_cpu, kv_lens_cpu, qo_offset_cpu = _qo_lens_offsets_from_metadata(metadata)
-    kv_indices, _ = _build_kv_indices_and_lens(metadata, page_size)
-
-    kv_block_indexes = _msa_index_proxy_and_topk(
-        idx_q,
-        idx_k_paged,
-        qo_lens_cpu=qo_lens_cpu,
-        kv_lens_cpu=kv_lens_cpu,
-        qo_offset_cpu=qo_offset_cpu,
-        kv_indices=kv_indices,
-        config=config,
-        idx_sm_scale=idx_sm_scale,
-        causal=False,
-        init_blocks=config.init_blocks,
-        local_blocks=config.local_blocks,
-    )
-
-    out = _msa_sparse_attention(
+    return _intree_sparse_decode(
         q,
+        idx_q,
         k_paged,
         v_paged,
-        kv_block_indexes,
-        qo_lens_cpu=qo_lens_cpu,
-        kv_lens_cpu=kv_lens_cpu,
-        qo_offset_cpu=qo_offset_cpu,
-        kv_indices=kv_indices,
+        idx_k_paged,
+        metadata,
+        config,
         sm_scale=sm_scale,
-        causal=False,
+        idx_sm_scale=idx_sm_scale,
+        page_size=page_size,
     )
-
-    batch = int(q.shape[0])
-    return out.reshape(batch, config.num_q_heads * config.head_dim).contiguous()
 
 
 # ---------------------------------------------------------------------------
@@ -678,6 +883,26 @@ def get_minimax_m3_msa_attention_backend_cls():
                 raise NotImplementedError(
                     f"MSA backend requires topk={_MSA_REQUIRED_TOPK}, got {self.m3_config.topk}."
                 )
+            # Register the per-rank sparse geometry process-wide at
+            # construction time — before any forward, hence before any
+            # CUDA graph capture — so every metadata instance's
+            # ``prepare()`` (including the CUDA graph runner's separate
+            # instances) can pre-build the MSA plans / kv-indices
+            # staging. See ``msa_plan_cache.set_global_msa_geometry``.
+            from .msa_plan_cache import MsaPlanCacheGeometry, set_global_msa_geometry
+
+            set_global_msa_geometry(
+                MsaPlanCacheGeometry(
+                    num_q_heads=int(self.m3_config.num_q_heads),
+                    num_kv_heads=int(self.m3_config.num_kv_heads),
+                    num_index_heads=int(self.m3_config.num_index_heads),
+                    head_dim=int(self.m3_config.head_dim),
+                    block_size=int(self.m3_config.block_size),
+                    topk=int(self.m3_config.topk),
+                    init_blocks=int(self.m3_config.init_blocks),
+                    local_blocks=int(self.m3_config.local_blocks),
+                )
+            )
 
         def forward_sparse(
             self,

@@ -145,6 +145,7 @@ class MsaSparseGqaFmha(BlockSparseFmha):
             page_size=page_size,
             kv_block_num=int(kv_block_indexes.shape[-1]),
             causal=causal,
+            num_kv_splits=1,
         )
         out, _ = fmha_sm100.fmha_sm100(
             q,

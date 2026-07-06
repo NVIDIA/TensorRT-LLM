@@ -1148,6 +1148,44 @@ class MiniMaxM3Attention(Attention):
                 "ModelConfig so the standard attention-backend dispatch selects "
                 "the M3 sparse runtime."
             )
+
+        # Publish the per-rank sparse geometry on the outer
+        # AttentionMetadata the first time any sparse layer dispatches.
+        # ``MiniMaxM3AttentionMetadata.prepare`` reads this on subsequent
+        # steps to pre-build the MSA (fmha_sm100) plan into
+        # CUDA-graph-stable buffers -- see
+        # :mod:`tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_plan_cache`.
+        # Doing this attach here (not in ``__init__``) is what avoids a
+        # chicken-and-egg dependency: the metadata instance is created
+        # by the pyexecutor before any layer runs, and the FIRST sparse
+        # forward is always the eager warmup pass (no capture in
+        # flight), so writing to ``_msa_geometry`` at this point is
+        # CUDA-graph-safe. All sparse layers share the same m3_config
+        # on a given rank, so any layer's write is authoritative for
+        # the rest.
+        #
+        # IMPORTANT: publish on the metadata *class*, not the instance.
+        # CUDA graph capture uses separate metadata instances (created
+        # via ``create_cuda_graph_metadata``); an instance attribute
+        # written during eager warmup would be invisible to them, their
+        # ``prepare()`` would skip the plan pre-build, and the captured
+        # decode would fall back to in-forward planning — freezing
+        # capture-time host values into every replay (the original
+        # NaN-after-layer-3 CUDA graph bug).
+        if getattr(attn_metadata, "_msa_geometry", None) is None:
+            from ..attention_backend.sparse.minimax_m3.msa_plan_cache import MsaPlanCacheGeometry
+
+            m3_config = self.attn.m3_config
+            type(attn_metadata)._msa_geometry = MsaPlanCacheGeometry(
+                num_q_heads=int(m3_config.num_q_heads),
+                num_kv_heads=int(m3_config.num_kv_heads),
+                num_index_heads=int(m3_config.num_index_heads),
+                head_dim=int(m3_config.head_dim),
+                block_size=int(m3_config.block_size),
+                topk=int(m3_config.topk),
+                init_blocks=int(m3_config.init_blocks),
+                local_blocks=int(m3_config.local_blocks),
+            )
         o = self.attn.forward(
             q,
             k,

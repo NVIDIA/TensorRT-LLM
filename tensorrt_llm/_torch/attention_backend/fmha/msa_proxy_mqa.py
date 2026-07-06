@@ -95,6 +95,13 @@ class MsaProxyMqaFmha(IndexerProxyFmha):
         worklists, KV-split workspaces) and ``fmha_sm100`` runs the
         kernel with ``output_o=False, output_maxscore=True`` so only
         the score tensor is materialized.
+
+        This wrapper serves the eager prefill path only.  Decode runs
+        through the in-tree graph-safe driver
+        (``sparse.minimax_m3.decode_wrapper``) because
+        ``fmha_sm100_plan`` is CUDA-graph-hostile (unpinned H2D
+        staging, per-call device allocations, device-side cost sweep
+        with ``.tolist()``).
         """
         # Imported here (not at module top) so the registry can still
         # advertise the class on hosts where fmha_sm100 is absent --
@@ -133,6 +140,7 @@ class MsaProxyMqaFmha(IndexerProxyFmha):
             page_size=page_size,
             output_maxscore=True,
             causal=causal,
+            num_kv_splits=1,
         )
         _, max_score = fmha_sm100.fmha_sm100(
             idx_q,
