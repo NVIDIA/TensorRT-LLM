@@ -37,10 +37,6 @@ def model_path(test_name):
     model_mapping = {
         "gpt": "gpt2",
         "opt": "opt-125m",
-        "mistral": "mistral-7b-v0.1",
-        "mistral-ib": "mistral-7b-v0.1",
-        "mistral-ib-streaming": "mistral-7b-v0.1",
-        "mistral-ib-mm": "mistral-7b-v0.1",
         "gptj": "gpt-j-6b",
         "gpt-ib": "gpt2",
         "gpt-ib-streaming": "gpt2",
@@ -74,10 +70,6 @@ def engine_dir(test_name, llm_root):
     engine_mapping = {
         "gpt": "models/core/gpt/trt_engine/gpt2/fp16/1-gpu/",
         "opt": "models/contrib/opt/trt_engine/opt-125m/fp16/1-gpu/",
-        "mistral": "models/core/llama/mistral_7b_outputs",
-        "mistral-ib": "models/core/llama/ib_mistral_7b_outputs",
-        "mistral-ib-streaming": "models/core/llama/ib_mistral_7b_outputs",
-        "mistral-ib-mm": "models/core/llama/ib_mistral_7b_outputs",
         "gptj": "models/contrib/gptj/gptj_outputs",
         "gpt-ib": "models/core/gpt/trt_engine/gpt2-ib/fp16/1-gpu/",
         "gpt-ib-streaming": "models/core/gpt/trt_engine/gpt2-ib/fp16/1-gpu/",
@@ -121,51 +113,11 @@ def test_gpt(tritonserver_test_root, test_name, llm_root, model_path,
         llm_root)
 
 
-@pytest.mark.parametrize("test_name", ["mistral"], indirect=True)
-def test_mistral(tritonserver_test_root, test_name, llm_root, model_path,
-                 engine_dir):
-    build_model(test_name, llm_root, tritonserver_test_root)
-    tokenizer_type = "llama"
-    run_shell_command(
-        f"cd {tritonserver_test_root} && ./test.sh {test_name} {engine_dir} {model_path} {tokenizer_type}",
-        llm_root)
-
-
 @pytest.mark.parametrize("test_name", ["gptj"], indirect=True)
 def test_gptj(tritonserver_test_root, test_name, llm_root, model_path,
               engine_dir):
     build_model(test_name, llm_root, tritonserver_test_root)
     tokenizer_type = "auto"
-    run_shell_command(
-        f"cd {tritonserver_test_root} && ./test.sh {test_name} {engine_dir} {model_path} {tokenizer_type}",
-        llm_root)
-
-
-@pytest.mark.parametrize("test_name", ["mistral-ib"], indirect=True)
-def test_mistral_ib(tritonserver_test_root, test_name, llm_root, model_path,
-                    engine_dir):
-    build_model(test_name, llm_root, tritonserver_test_root)
-    tokenizer_type = "llama"
-    run_shell_command(
-        f"cd {tritonserver_test_root} && ./test.sh {test_name} {engine_dir} {model_path} {tokenizer_type}",
-        llm_root)
-
-
-@pytest.mark.parametrize("test_name", ["mistral-ib-streaming"], indirect=True)
-def test_mistral_ib_streaming(tritonserver_test_root, test_name, llm_root,
-                              model_path, engine_dir):
-    build_model("mistral-ib", llm_root, tritonserver_test_root)
-    tokenizer_type = "llama"
-    run_shell_command(
-        f"cd {tritonserver_test_root} && ./test.sh {test_name} {engine_dir} {model_path} {tokenizer_type}",
-        llm_root)
-
-
-@pytest.mark.parametrize("test_name", ["mistral-ib-mm"], indirect=True)
-def test_mistral_ib_mm(tritonserver_test_root, test_name, llm_root, model_path,
-                       engine_dir):
-    build_model("mistral-ib", llm_root, tritonserver_test_root)
-    tokenizer_type = "llama"
     run_shell_command(
         f"cd {tritonserver_test_root} && ./test.sh {test_name} {engine_dir} {model_path} {tokenizer_type}",
         llm_root)

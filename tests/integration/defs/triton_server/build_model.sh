@@ -13,7 +13,6 @@ GPT2_MEDIUM=$LLM_MODELS_ROOT/gpt2-medium
 GPT2_NEXT_PTUNING=$LLM_MODELS_ROOT/email_composition
 OPT_125M=$LLM_MODELS_ROOT/opt-125m
 GPTJ=$LLM_MODELS_ROOT/gpt-j-6b
-MISTRAL=$LLM_MODELS_ROOT/mistral-7b-v0.1
 GPT_2B=$LLM_MODELS_ROOT/GPT-2B-001_bf16_tp1.nemo
 GPT_2B_LORA=$LLM_MODELS_ROOT/lora/gpt-next-2b
 VICUNA=$LLM_MODELS_ROOT/vicuna-7b-v1.3
@@ -84,59 +83,6 @@ if [ "$MODEL" = "opt" ]; then
 
 
     popd # examples/models/contrib/opt
-
-fi
-
-if [ "$MODEL" = "mistral" ]; then
-
-    pushd examples/models/core/llama
-
-    install_requirements
-
-    echo "Convert Mistral from HF"
-    python3 convert_checkpoint.py --dtype float16 \
-        --n_layer 2 --n_positions 32768 \
-        --output_dir ./c-model/mistral-7b/fp16
-
-    echo "Build Mistral"
-    trtllm-build --model_config ./c-model/mistral-7b/fp16/config.json  \
-        --context_fmha=enable \
-        --gpt_attention_plugin float16 \
-        --gemm_plugin float16 \
-        --max_input_len 8192 \
-        --max_batch_size 8 \
-        --max_num_tokens 8192 \
-        --output_dir mistral_7b_outputs
-
-    popd # examples/models/core/llama
-
-fi
-
-if [ "$MODEL" = "mistral-ib" ]; then
-
-    pushd examples/models/core/llama
-
-    install_requirements
-
-    echo "Convert Mistral from HF"
-    python3 convert_checkpoint.py --dtype float16 \
-        --model_dir ${MISTRAL} \
-        --output_dir ./c-model/mistral-7b/fp16
-
-    echo "Build Mistral with inflight batching"
-    trtllm-build --checkpoint_dir ./c-model/mistral-7b/fp16/ \
-        --context_fmha=enable \
-        --remove_input_padding=enable \
-        --kv_cache_type=paged \
-        --gpt_attention_plugin float16 \
-        --gemm_plugin float16 \
-        --max_batch_size 1 \
-        --max_seq_len 9216 \
-        --use_paged_context_fmha disable \
-        --max_beam_width 2 \
-        --output_dir ib_mistral_7b_outputs
-
-    popd # examples/models/core/llama
 
 fi
 
