@@ -572,8 +572,7 @@ def load_pretrained_config(model_name_or_path: str,
         model_config = transformers.AutoConfig.from_pretrained(
             model_name_or_path, trust_remote_code=trust_remote_code)
 
-    # ChatGLM trust_remote_code configs expose native field names; fill the
-    # canonical HF aliases the _torch modules and RopeParams.from_config read.
+    # Normalize ChatGLM-native field names for downstream _torch utilities.
     if getattr(model_config, "model_type", None) == "chatglm":
         from tensorrt_llm._torch.models.modeling_chatglm import \
             normalize_chatglm_config

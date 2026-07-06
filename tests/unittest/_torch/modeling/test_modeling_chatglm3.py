@@ -1,18 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""ChatGLM3-6B ``_torch`` modeling tests.
-
-Test selectors (mapped to acceptance criteria) so QA can run each gate on its own::
-
-    pytest -q test_modeling_chatglm3.py -k 'config or load'          # config + weight load
-    pytest -q test_modeling_chatglm3.py -k source_activation_replay  # HF-vs-TRT activation parity
-    pytest -q test_modeling_chatglm3.py -k 'real_runtime and kv_cache'  # KVCacheManagerV2 dispatch
-    pytest -q test_modeling_chatglm3.py -k source_logit_replay       # LLM-API logit parity
-    pytest -q test_modeling_chatglm3.py -k generation_parity         # LLM-API multi-step parity
-
-Every CUDA/GPU test that runs model code covers both ``cuda_graph=false`` (baseline)
-and ``cuda_graph=true`` (enabled, exercising the CUDA-graph hard path).
-"""
+"""ChatGLM3-6B ``_torch`` modeling tests."""
 
 import functools
 import json
@@ -93,19 +81,15 @@ class RuntimeCfg:
 
 BASELINE = RuntimeCfg(cuda_graph=False, overlap_scheduler=False)
 ENABLED = RuntimeCfg(cuda_graph=True, overlap_scheduler=True)
-# Stable ids so `-k baseline` / `-k cuda_graph` select a single configuration.
 CFGS = [pytest.param(BASELINE, id="baseline"), pytest.param(ENABLED, id="cuda_graph")]
 
 
 @pytest.fixture(autouse=True)
 def _force_single_process_worker(monkeypatch):
-    # LLM-API tests introspect the in-process CUDAGraphRunner for hard-path evidence,
-    # reachable only when the worker runs in-process. Harmless for module-level tests.
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
 
 
 def _patch_chatglm3_hf_tied_compat():
-    """Bridge the 2023 ChatGLM remote code onto transformers >=5.x (loader-only)."""
     from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
     cls = get_class_from_dynamic_module(
@@ -115,8 +99,6 @@ def _patch_chatglm3_hf_tied_compat():
         cls.all_tied_weights_keys = {}  # {} is correct for tie_word_embeddings=False.
 
 
-# Cached: load_weights only reads/copies out of the dict, and the two callers
-# share one checkpoint path, so this avoids re-reading multi-GB shards from disk.
 @functools.lru_cache(maxsize=1)
 def _load_checkpoint_weights(ckpt: str) -> dict:
     index = os.path.join(ckpt, "model.safetensors.index.json")
@@ -154,8 +136,6 @@ def _make_kv_cache_manager_v2(config, num_blocks=8, tokens_per_block=128):
 
 
 class _HFRef:
-    """Lazily-loaded, process-cached HF ChatGLM3 reference (real remote code)."""
-
     _model = None
     _tok = None
 
@@ -303,9 +283,6 @@ def _greedy_params(max_tokens: int, logits: bool = False) -> SamplingParams:
     )
 
 
-# --------------------------------------------------------------------------- #
-# Criterion: config / load
-# --------------------------------------------------------------------------- #
 def test_chatglm3_config_architecture_registration():
     for arch in ("ChatGLMModel", "ChatGLMForConditionalGeneration", "ChatGLMForCausalLM"):
         assert MODEL_CLASS_MAPPING[arch] is ChatGLMForCausalLM
@@ -340,8 +317,6 @@ def test_chatglm3_config_normalization():
 @skip_no_cuda
 @skip_no_ckpt
 def test_chatglm3_config_and_weight_load():
-    """Load the real checkpoint through the _torch LLM-API model path with strict
-    weight accounting; assert config evidence, vocab size, and untied output head."""
     device = torch.device("cuda")
 
     model_config = ModelConfig.from_pretrained(CHATGLM3_CKPT, trust_remote_code=True)
@@ -358,7 +333,6 @@ def test_chatglm3_config_and_weight_load():
         model = ChatGLMForCausalLM(model_config).to(device).eval()
 
     weights = _load_checkpoint_weights(CHATGLM3_CKPT)
-    # ChatGLM ships the derived RoPE buffer; the loader ignores it explicitly.
     assert "transformer.rotary_pos_emb.inv_freq" in weights
 
     model.load_weights(weights)  # raises on missing / unexpected / shape-mismatch
@@ -366,7 +340,6 @@ def test_chatglm3_config_and_weight_load():
     for name, p in model.named_parameters():
         assert torch.isfinite(p).all(), f"non-finite parameter after load: {name}"
 
-    # Untied output head: lm_head weight is a distinct tensor from the embedding.
     assert model.lm_head.weight.data_ptr() != model.model.embed_tokens.weight.data_ptr()
     assert not torch.equal(
         model.lm_head.weight.detach().float(),
@@ -405,12 +378,8 @@ def test_chatglm3_config_and_weight_load():
         torch.cuda.empty_cache()
 
 
-# --------------------------------------------------------------------------- #
-# Supporting: interleaved partial-head RoPE geometry
-# --------------------------------------------------------------------------- #
 @skip_no_cuda
 def test_chatglm3_partial_rope_boundary_and_theta():
-    """ChatGLM rotates only the first 64 of each 128-dim head, GPT-J interleaved."""
     device = torch.device("cuda")
     head_dim, rotary_dim, seq = 128, 64, 6
     rope = RopeParams(dim=rotary_dim, theta=10000.0, max_positions=8192)
@@ -422,7 +391,6 @@ def test_chatglm3_partial_rope_boundary_and_theta():
 
     q_v = q.view(1, seq, 4, head_dim)
     q_rot_v = q_rot.view(1, seq, 4, head_dim)
-    # Dims [64:128] are left untouched; dims [0:64] are rotated for pos>0.
     torch.testing.assert_close(q_rot_v[..., rotary_dim:], q_v[..., rotary_dim:], atol=0.0, rtol=0.0)
     assert not torch.allclose(q_rot_v[:, 1:, :, :rotary_dim], q_v[:, 1:, :, :rotary_dim])
 
@@ -435,17 +403,11 @@ def test_chatglm3_partial_rope_boundary_and_theta():
         torch.testing.assert_close(cos[p].float(), expected_cos, atol=1e-2, rtol=1e-2)
 
 
-# --------------------------------------------------------------------------- #
-# Criterion: source_activation_replay
-# --------------------------------------------------------------------------- #
 @skip_no_cuda
 @skip_no_ckpt
 @pytest.mark.parametrize("cfg", CFGS)
 @torch.no_grad()
 def test_chatglm3_source_activation_replay(cfg: RuntimeCfg):
-    """Replay HF ChatGLM3 activations through the TRT-LLM path at representative
-    early/middle/final layers; assert fp16 tolerances at attention, MLP, decoder-layer,
-    and logits boundaries. The enabled config exercises the CUDA-graph hard path."""
     device = torch.device("cuda")
     backend = "TRTLLM"
 
@@ -464,7 +426,6 @@ def test_chatglm3_source_activation_replay(cfg: RuntimeCfg):
         }
     )
 
-    # Structural contracts: compact 2-KV-head MQA, 32 query heads, module-side RoPE.
     attn0 = model.model.layers[0].self_attn
     assert attn0.num_key_value_heads == 2
     assert attn0.num_heads == 32
@@ -474,7 +435,6 @@ def test_chatglm3_source_activation_replay(cfg: RuntimeCfg):
 
     rep_layers = sorted({0, num_layers // 2, num_layers - 1})
 
-    # -- capture HF boundary activations (block / attention / mlp outputs) -- #
     hf_layer_out, hf_attn_out, hf_mlp_out = {}, {}, {}
 
     def _hf_hook(store, idx):
@@ -499,10 +459,8 @@ def test_chatglm3_source_activation_replay(cfg: RuntimeCfg):
     for h in hf_handles:
         h.remove()
 
-    # -- capture TRT boundary activations -- #
     trt_layer_out, trt_attn_out, trt_mlp_out = {}, {}, {}
 
-    # DecoderLayer returns (hidden, residual); the running hidden = hidden + residual.
     def _trt_hook(store, idx, extract=lambda out: out):
         def hook(_m, _inp, out):
             store[idx] = extract(out).detach().float()
@@ -545,7 +503,6 @@ def test_chatglm3_source_activation_replay(cfg: RuntimeCfg):
         for h in trt_handles:
             h.remove()
 
-        # -- compare every recorded fp16 boundary against HF -- #
         for i in rep_layers:
             for name, trt_t, hf_t in (
                 ("attention", trt_attn_out[i], hf_attn_out[i]),
@@ -566,8 +523,6 @@ def test_chatglm3_source_activation_replay(cfg: RuntimeCfg):
                 assert m["mean_abs"] <= MEAN_ABS_TOL, f"{name} L{i} mean_abs {m['mean_abs']}"
                 assert max_abs_ok, f"{name} L{i} max_abs {m['max_abs']} (hf_abs_max {hf_abs_max})"
 
-        # Final logits boundary: raw fp16 logit magnitudes over a 65k vocab legitimately
-        # exceed the hidden-state max-abs cap, so gate on cosine + greedy-argmax equality.
         hf_last = hf_out.logits[:, -1].float().squeeze(0)
         trt_last = trt_logits.float().reshape(-1)
         lm = _metrics(trt_last, hf_last)
@@ -578,7 +533,6 @@ def test_chatglm3_source_activation_replay(cfg: RuntimeCfg):
         assert lm["cosine"] >= COS_TOL, f"logits cosine {lm['cosine']}"
         assert torch.argmax(hf_last) == torch.argmax(trt_last), "prefill logits argmax mismatch"
 
-        # -- decode step with cache reuse; enabled config proves the CUDA-graph hard path -- #
         next_id = int(torch.argmax(trt_last).item())
         gen_id = torch.tensor([next_id], dtype=torch.int, device=device)
         gen_pos = torch.tensor([len(PROMPT_IDS)], dtype=torch.int, device=device).unsqueeze(0)
@@ -644,23 +598,15 @@ def test_chatglm3_source_activation_replay(cfg: RuntimeCfg):
         torch.cuda.empty_cache()
 
 
-# --------------------------------------------------------------------------- #
-# Criterion: real_runtime and kv_cache
-# --------------------------------------------------------------------------- #
 @skip_no_cuda
 @skip_no_ckpt
 @pytest.mark.parametrize("cfg", CFGS)
 @torch.no_grad()
 def test_chatglm3_real_runtime_kv_cache_prefill_decode(cfg: RuntimeCfg):
-    """KVCacheManagerV2 + TRTLLM backend dispatch at checkpoint-scale dims: prefill then
-    decode with cache reuse must equal a fresh prefill of the extended sequence (proving
-    compact 2-KV-head cache storage is read back correctly). Enabled config captures a
-    CUDA graph for the decode step (hard path)."""
     device = torch.device("cuda")
     backend = "TRTLLM"
 
     model_config = ModelConfig.from_pretrained(CHATGLM3_CKPT, trust_remote_code=True)
-    # from_pretrained returns a frozen ModelConfig already defaulted to the TRTLLM backend.
     assert model_config.attn_backend == backend, model_config.attn_backend
     hf_config = model_config.pretrained_config
     with torch.device(device):
@@ -677,13 +623,11 @@ def test_chatglm3_real_runtime_kv_cache_prefill_decode(cfg: RuntimeCfg):
     kv_cache_manager = _make_kv_cache_manager_v2(
         hf_config, num_blocks=8, tokens_per_block=tokens_per_block
     )
-    # KVCacheManagerV2 must store the compact 2-KV-head representation, not expanded 32.
     assert kv_cache_manager.num_kv_heads == hf_config.num_key_value_heads == 2
 
     prompt = list(PROMPT_IDS)
     n = len(prompt)
     try:
-        # ---- context / prefill ---- #
         req_ids, token_nums = [1], [n]
         kv_cache_manager.add_dummy_requests(req_ids, token_nums)
         prefill_md = metadata_cls(
@@ -706,7 +650,6 @@ def test_chatglm3_real_runtime_kv_cache_prefill_decode(cfg: RuntimeCfg):
         assert torch.isfinite(ctx_logits).all()
         next_id = int(torch.argmax(ctx_logits.float().reshape(-1)).item())
 
-        # ---- decode using the populated cache (cache reuse) ---- #
         gen_id = torch.tensor([next_id], dtype=torch.int, device=device)
         gen_pos = torch.tensor([[n]], dtype=torch.int, device=device)
 
@@ -730,7 +673,6 @@ def test_chatglm3_real_runtime_kv_cache_prefill_decode(cfg: RuntimeCfg):
     finally:
         kv_cache_manager.shutdown()
 
-    # ---- reference: fresh prefill of [prompt + next_id]; position n must match decode ---- #
     kv_ref = _make_kv_cache_manager_v2(hf_config, num_blocks=8, tokens_per_block=tokens_per_block)
     try:
         ext = prompt + [next_id]
@@ -753,8 +695,6 @@ def test_chatglm3_real_runtime_kv_cache_prefill_decode(cfg: RuntimeCfg):
             ref_logits = model.forward(
                 input_ids=ext_ids, position_ids=ext_pos, attn_metadata=ref_md
             )
-        # The _torch forward returns last-token logits for a prefill; take the final
-        # vocab-wide row robustly (works whether it returns [1, vocab] or [seq, vocab]).
         ref_last = ref_logits.float().reshape(-1)[-hf_config.vocab_size :]
         cache_reuse = _metrics(dec_logits.float().reshape(-1), ref_last)
         print(
@@ -769,7 +709,6 @@ def test_chatglm3_real_runtime_kv_cache_prefill_decode(cfg: RuntimeCfg):
     finally:
         kv_ref.shutdown()
 
-    # ---- enabled config: capture + replay the decode step under a CUDA graph ---- #
     if cfg.cuda_graph:
         from _torch.helpers import create_mock_cuda_graph_runner
 
@@ -813,9 +752,6 @@ def test_chatglm3_real_runtime_kv_cache_prefill_decode(cfg: RuntimeCfg):
     torch.cuda.empty_cache()
 
 
-# --------------------------------------------------------------------------- #
-# Criterion: source_logit_replay (LLM API)
-# --------------------------------------------------------------------------- #
 @skip_no_cuda
 @skip_no_ckpt
 @pytest.mark.parametrize("cfg", CFGS)
@@ -845,9 +781,6 @@ def test_chatglm3_source_logit_replay(cfg: RuntimeCfg):
         llm.shutdown()
 
 
-# --------------------------------------------------------------------------- #
-# Criterion: generation_parity (LLM API)
-# --------------------------------------------------------------------------- #
 _EOS_TOKEN_ID = 2
 
 

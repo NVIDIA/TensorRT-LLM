@@ -1,18 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""ChatGLM3-6B GSM8K accuracy gate (HF reference vs TRT-LLM via trtllm-eval).
-
-Selectors (mapped to acceptance criteria)::
-
-    pytest -q test_chatglm3_gsm8k.py -k 'smoke or accuracy_canary'    # LLM-API smoke + GSM8K canary
-    pytest -q test_chatglm3_gsm8k.py -k 'full_trtllm_eval and baseline'    # full GSM8K, cuda_graph=false
-    pytest -q test_chatglm3_gsm8k.py -k 'full_trtllm_eval and cuda_graph'  # full GSM8K, cuda_graph=true
-
-Both the HF reference and the TRT-LLM run consume the same GSM8K evaluator
-(``tensorrt_llm.evaluate.GSM8K`` -> lm-eval ``gsm8k`` task) with identical
-num_samples / seed / decoding, and each full-gate run writes a score artifact
-recording that shared config, both scores, and the CUDA-graph hard-path flag.
-"""
+"""ChatGLM3-6B GSM8K accuracy gate."""
 
 import hashlib
 import json
@@ -48,8 +36,6 @@ skip_no_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is
 
 @pytest.fixture(autouse=True)
 def _force_single_process_worker(monkeypatch):
-    # The CUDA-graph hard-path assertions introspect the in-process CUDAGraphRunner,
-    # reachable only when the worker runs in-process.
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
 
 
@@ -76,7 +62,6 @@ BASELINE = RuntimeCfg(cuda_graph=False, overlap_scheduler=False)
 ENABLED = RuntimeCfg(cuda_graph=True, overlap_scheduler=True)
 CFGS = [pytest.param(BASELINE, id="baseline"), pytest.param(ENABLED, id="cuda_graph")]
 
-# Process-cached HF reference scores keyed by num_samples (HF pass is the slow part).
 _HF_SCORE_CACHE = {}
 
 
@@ -87,7 +72,6 @@ def _make_evaluator(num_samples: int):
 
 
 def _shared_eval_config(num_samples: int) -> dict:
-    """The eval config both the HF reference and the TRT-LLM run share verbatim."""
     return {
         "benchmark": "gsm8k",
         "harness": "lm-eval gsm8k task via tensorrt_llm.evaluate.GSM8K",
@@ -124,7 +108,6 @@ def _pick_metric_key(scores: dict) -> str:
     em = sorted(m for m in numeric if m.startswith("exact_match"))
     if em:
         return em[0]
-    # Fail loudly: gating on a non-exact_match metric would compare unrelated numbers.
     raise AssertionError(f"no exact_match GSM8K metric in {list(scores)}; cannot gate accuracy")
 
 
@@ -154,7 +137,6 @@ def _find_cuda_graph_runner(llm: LLM):
 
 
 def _assert_cuda_graph_hard_path(llm: LLM, cfg: RuntimeCfg) -> bool:
-    """Returns True iff the enabled config actually captured >=1 CUDA graph."""
     runner = _find_cuda_graph_runner(llm)
     if cfg.cuda_graph:
         assert runner is not None, (
@@ -189,7 +171,6 @@ def _assert_v2_and_backend(llm: LLM, cfg: RuntimeCfg) -> bool:
 
 
 def _trtllm_score(num_samples: int, cfg: RuntimeCfg, metric_key: str):
-    """Returns (score_0_100, cuda_graph_hard_path_bool)."""
     evaluator = _make_evaluator(num_samples)
     llm = _build_llm(cfg)
     try:
@@ -215,8 +196,6 @@ def _hf_reference_scores(num_samples: int) -> dict:
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
     class _GreedyHFLM(HFLM):
-        """lm-eval HF wrapper with ChatGLM's legacy tuple-cache greedy loop."""
-
         @torch.inference_mode()
         def _model_generate(self, context, max_length=None, stop=None, **generation_kwargs):
             model = self.model
@@ -285,7 +264,6 @@ def _hf_reference_scores(num_samples: int) -> dict:
     evaluator = _make_evaluator(num_samples)
 
     cfg = AutoConfig.from_pretrained(CHATGLM3_CKPT, trust_remote_code=True)
-    # Compatibility aliases for the 2023 ChatGLM remote code under transformers >=5.x.
     if getattr(cfg, "max_length", None) is None:
         cfg.max_length = 8192
     if getattr(cfg, "num_hidden_layers", None) is None:
@@ -367,9 +345,6 @@ def _run_config(n: int, label: str, cfg: RuntimeCfg, artifact_name: str = None) 
     return payload
 
 
-# --------------------------------------------------------------------------- #
-# Criterion: smoke  (LLM-API generation is deterministic and non-empty)
-# --------------------------------------------------------------------------- #
 @skip_no_cuda
 @skip_no_ckpt
 @pytest.mark.parametrize("cfg", CFGS)
@@ -381,8 +356,10 @@ def test_chatglm3_gsm8k_smoke(cfg: RuntimeCfg):
         prompts = ["Question: What is 2 + 3?\nAnswer:", "Question: What is 10 - 4?\nAnswer:"]
         out1 = llm.generate(prompts, params)
         for o in out1:
-            assert o.outputs[0].text.strip() != "", "empty generation"
-            assert len(o.outputs[0].token_ids) > 0
+            completion = o.outputs[0]
+            assert completion.text.strip() != "" and len(completion.token_ids) > 0, (
+                "empty generation"
+            )
         out2 = llm.generate(prompts, params)
         for a, b in zip(out1, out2):
             assert list(a.outputs[0].token_ids) == list(b.outputs[0].token_ids), "non-deterministic"
@@ -390,9 +367,6 @@ def test_chatglm3_gsm8k_smoke(cfg: RuntimeCfg):
         llm.shutdown()
 
 
-# --------------------------------------------------------------------------- #
-# Criterion: accuracy_canary  (short deterministic GSM8K slice, both configs)
-# --------------------------------------------------------------------------- #
 @skip_no_cuda
 @skip_no_ckpt
 @pytest.mark.parametrize("cfg", CFGS)
@@ -400,9 +374,6 @@ def test_chatglm3_gsm8k_accuracy_canary(cfg: RuntimeCfg):
     _run_config(CANARY_N, "accuracy_canary", cfg)
 
 
-# --------------------------------------------------------------------------- #
-# Criterion: full_trtllm_eval  (full GSM8K, writes score artifact; delta <= 2 pts)
-# --------------------------------------------------------------------------- #
 @skip_no_cuda
 @skip_no_ckpt
 @pytest.mark.parametrize("cfg", CFGS)

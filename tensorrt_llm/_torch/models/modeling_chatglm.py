@@ -27,9 +27,7 @@ from .modeling_utils import (
     register_auto_model,
 )
 
-# ChatGLM persists this derived RoPE buffer; TRT-LLM rebuilds it from config.
 _IGNORABLE_WEIGHT_SUFFIXES = ("rotary_pos_emb.inv_freq",)
-# Prefix-tuning is inactive for chatglm3-6b but variants may carry artifacts.
 _IGNORABLE_WEIGHT_SUBSTRINGS = ("prefix_encoder",)
 
 
@@ -133,7 +131,6 @@ class ChatGLMDecoderLayer(DecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # RMSNorm returns the running residual used by the fused-residual path.
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -217,7 +214,6 @@ class ChatGLMModel(DecoderModel):
 @register_auto_model("ChatGLMForCausalLM")
 class ChatGLMForCausalLM(DecoderModelForCausalLM[ChatGLMModel, PretrainedConfig]):
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
-        # Covers raw configs that did not pass through load_pretrained_config.
         normalize_chatglm_config(model_config.pretrained_config)
         super().__init__(
             ChatGLMModel(model_config),
