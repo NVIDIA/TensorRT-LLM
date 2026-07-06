@@ -191,6 +191,9 @@ def inplace_info():
         "gdn_custom_op_inplace": {
             1: "output"
         },
+        "minimax_m3_attn_custom_op_inplace": {
+            1: "output"
+        },
     }
     for op_name, mutates_args in optional_inplace_infos.items():
         op = get_optional_trtllm_op(op_name)
@@ -203,26 +206,4 @@ def inplace_info():
                 1: "x",
                 2: "residual"
             }
-    optional_inplace_infos = {
-        "attn_custom_op_inplace": {
-            1: "output",
-            2: "output_sf"
-        },
-        "mla_custom_op_inplace": {
-            1: "output"
-        },
-        "mla_dsa_attn_inplace": {
-            1: "output"
-        },
-        "gdn_custom_op_inplace": {
-            1: "output"
-        },
-        "minimax_m3_attn_custom_op_inplace": {
-            1: "output"
-        },
-    }
-    for op_name, mutates_args in optional_inplace_infos.items():
-        op = get_optional_trtllm_op(op_name)
-        if op is not None:
-            inplace_map[op] = mutates_args
     return inplace_map
