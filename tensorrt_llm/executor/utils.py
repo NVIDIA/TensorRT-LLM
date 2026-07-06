@@ -1,6 +1,8 @@
 import asyncio
 import concurrent.futures
+import multiprocessing
 import os
+import platform
 import sys
 import threading
 import traceback
@@ -11,7 +13,7 @@ from typing import Any, Callable, List, NamedTuple, Optional
 from strenum import StrEnum
 
 from tensorrt_llm._utils import mpi_rank
-from tensorrt_llm.llmapi.utils import enable_llm_debug, logger_debug
+from tensorrt_llm.llmapi.utils import enable_llm_debug
 
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
@@ -156,8 +158,43 @@ class ProcessPoolExecutorSession(MpiSession):
         ]
         return [future.result() for future in futures]
 
-    def shutdown(self):
-        self.mpi_pool.shutdown(wait=True)
+    def shutdown(self, wait=True):
+        self.mpi_pool.shutdown(wait=wait)
+
+    def abort(self):
+        self.mpi_pool.shutdown(wait=False, cancel_futures=True)
+
+
+def get_mpi_session(
+    n_workers: int,
+    mpi_session: Optional[MpiSession] = None,
+) -> tuple[MpiSession, bool]:
+    """Return an MPI session and whether the caller owns it.
+
+    A supplied session is borrowed.  Otherwise this function creates the
+    platform-appropriate session and transfers ownership to the caller.
+    """
+    if mpi_session is not None:
+        external_workers = getattr(mpi_session, "n_workers", None)
+        if (external_workers is not None and external_workers != n_workers):
+            raise ValueError(
+                f"MPI session has {external_workers} workers but the model "
+                f"needs world_size={n_workers}.")
+        logger_debug('using external mpi session ...\n', "yellow")
+        return mpi_session, False
+
+    if platform.system() == "Windows":
+        # mpi4py cannot be used on Windows.
+        ctx = multiprocessing.get_context("spawn")
+        return ProcessPoolExecutorSession(n_workers=n_workers,
+                                          mp_context=ctx), True
+
+    if get_spawn_proxy_process_env():
+        logger_debug('create comm session ...\n', "yellow")
+        return create_mpi_comm_session(n_workers), True
+
+    logger_debug('create pool session ...\n', "yellow")
+    return MpiPoolSession(n_workers=n_workers), True
 
 
 class ErrorResponse(NamedTuple):

@@ -23,6 +23,8 @@ import torch
 from datasets import load_dataset
 from defs.conftest import get_sm_version, is_sm_100f
 from mpi4py.futures import MPIPoolExecutor
+from test_common.grouped_test_utils import (SharedMpiSessionRegistry,
+                                            share_torch_llm_mpi_sessions)
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.model_config import MoeLoadBalancerConfig
@@ -46,6 +48,19 @@ from ..conftest import (check_device_contain, get_device_count, llm_models_root,
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
                             JsonModeEval, LlmapiAccuracyTestHarness,
                             LongBenchV1, LongBenchV2)
+
+pytestmark = pytest.mark.threadleak(enabled=False)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _shared_mpi_pools():
+    """Reuse spawned PyTorch worker pools within this accuracy module."""
+    registry = SharedMpiSessionRegistry()
+    try:
+        with share_torch_llm_mpi_sessions(registry):
+            yield
+    finally:
+        registry.shutdown()
 
 
 # Keep helper definitions below imports so new imports do not need E402
