@@ -81,7 +81,11 @@ WAN21_LPIPS_NUM_INFERENCE_STEPS = 1
 WAN21_LPIPS_GUIDANCE_SCALE = 5.0
 WAN21_LPIPS_SEED = 42
 WAN_LPIPS_FRAME_RATE = 16.0
-WAN_LPIPS_THRESHOLD = 0.05
+# Loose bound: at low inference-step counts, LPIPS-vs-golden is dominated by kernel-numerics
+# variance across B200 hosts (measured ~0.04 drift band; e.g. wan22 4-step observed 0.0593 on
+# one B200 vs golden captured on another). Matches nvbugs/6410336 (Wan 2.1 1-step). See
+# nvbugs/6413993 for Wan 2.2 4-step recurrence.
+WAN_LPIPS_THRESHOLD = 0.10
 
 WAN22_LPIPS_PROMPT = "A cat sitting on a sunny windowsill watching birds outside."
 WAN22_LPIPS_NEGATIVE_PROMPT = ""
