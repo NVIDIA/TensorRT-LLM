@@ -76,6 +76,10 @@ def inplace_info():
         torch.ops.trtllm.mla_dsa_attn_inplace.default: {
             1: "output"
         },
+        torch.ops.trtllm.deepseek_v4_q_norm_fused_fp8.default: {
+            1: "quant_q_out",
+            2: "q_pe_out"
+        },
         torch.ops.trtllm.fused_qk_norm_rope.default: {
             1: "qkv"
         },
