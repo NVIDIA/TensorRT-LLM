@@ -857,26 +857,32 @@ public:
         if (!mCacheTransferLayer.getCacheManager()->getBlockManager().isVariableWindow())
         {
             auto* cacheManager = mCacheTransferLayer.getCacheManager();
-            auto beam = 0;
             auto const srcPpSize = destCacheState.getParallelConfig().mPipelineParallelism;
             auto requestedBlockRange = getBlockRangeForReceiving(cacheManager, llmRequest,
                 destCacheState.getEnableBlockReuse(), destCacheState.getEnablePartialReuse(),
                 /*recvSideHasCP=*/false, srcPpSize);
 
-            auto const& uniqueTokens = llmRequest.getUniqueTokens(beam);
-            auto lastBlockKey
-                = BlockKey(llmRequest.getInputTokensExtraIds().has_value(), llmRequest.getLoraTaskId(), uniqueTokens);
-            auto tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
-            SizeType32 startTokenIdx = static_cast<SizeType32>(uniqueTokens.size() / tokensPerBlock) * tokensPerBlock;
-            SizeType32 endTokenIdx = static_cast<SizeType32>(uniqueTokens.size());
-            auto extraKeys = kv_cache_manager::generateBlockHashExtraKeys(llmRequest, startTokenIdx, endTokenIdx);
-            lastBlockKey.extraKeys = std::move(extraKeys);
-            // Compute indexFromEnd from the number of requested blocks
             int32_t requestedBlockSize = requestedBlockRange.getBlockIdsPerWindow().begin()->second.size();
-            TLLM_CHECK_WITH_INFO(requestedBlockSize > 0, "requestedBlockSize must be > 0");
-            int32_t indexFromEnd = requestedBlockSize - 1;
+            // An empty Helix CP rank owns zero KV blocks for this sequence (fewer blocks than
+            // cp_size). It still sends a RequestInfo so the context's per-request counterpart count
+            // is satisfied, but requests zero blocks: the default RequestInfo (indexFromEnd=0, empty
+            // lastBlockKey) is used and the context transmits nothing to it.
+            if (requestedBlockSize > 0)
+            {
+                auto const beam = 0;
+                auto const& uniqueTokens = llmRequest.getUniqueTokens(beam);
+                auto lastBlockKey = BlockKey(
+                    llmRequest.getInputTokensExtraIds().has_value(), llmRequest.getLoraTaskId(), uniqueTokens);
+                auto tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
+                SizeType32 startTokenIdx
+                    = static_cast<SizeType32>(uniqueTokens.size() / tokensPerBlock) * tokensPerBlock;
+                SizeType32 endTokenIdx = static_cast<SizeType32>(uniqueTokens.size());
+                auto extraKeys = kv_cache_manager::generateBlockHashExtraKeys(llmRequest, startTokenIdx, endTokenIdx);
+                lastBlockKey.extraKeys = std::move(extraKeys);
+                int32_t indexFromEnd = requestedBlockSize - 1;
 
-            requestInfo = RequestInfo(requestId, mSelfState, indexFromEnd, lastBlockKey);
+                requestInfo = RequestInfo(requestId, mSelfState, indexFromEnd, lastBlockKey);
+            }
         }
 
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);

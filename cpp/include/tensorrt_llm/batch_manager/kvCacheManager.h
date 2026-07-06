@@ -103,6 +103,13 @@ template <typename T>
 std::list<std::vector<T>> chopVectorIntoBlocks(
     std::vector<T> const& vec, SizeType32 usableSize, SizeType32 elementsPerBlock, bool allowPartial)
 {
+    // No usable elements yields no blocks. Guard non-positive usableSize explicitly: callers may pass
+    // usableSize = inputLength - 1, which is -1 for a Helix CP "empty" rank with 0 input tokens. With a
+    // negative usableSize, downstream usage of "vec.begin() + usableSize" is undefined behavior.
+    if (usableSize <= 0)
+    {
+        return {};
+    }
     TLLM_CHECK_WITH_INFO(
         usableSize <= static_cast<SizeType32>(vec.size()), "usableSize=%d > %ld=vec.size()", usableSize, vec.size());
     std::list<std::vector<T>> blockedVectors;
@@ -320,8 +327,8 @@ struct KvCacheStats
     std::size_t allocatedBytes{};
 };
 
-/// @brief Per-iteration KV cache statistics. All delta counters represent changes since the last call to
-/// getIterationStats(). Gauges are instantaneous snapshots.
+/// @brief Per-iteration KV cache statistics. All delta counters and peak gauges represent values since the last call
+/// to getIterationStats(). Snapshot gauges are instantaneous.
 struct KvCacheIterationStats
 {
     // --- Instantaneous gauges ---
@@ -329,10 +336,23 @@ struct KvCacheIterationStats
     SizeType32 primaryMaxNumBlocks{0};
     SizeType32 primaryFreeNumBlocks{0};
     SizeType32 primaryUsedNumBlocks{0};
+    // Cached-but-unpinned blocks in the primary pool. Distinct from primaryUsedNumBlocks,
+    // which also counts blocks pinned during onboard memcpy windows.
+    SizeType32 primaryEvictableNumBlocks{0};
+    SizeType32 primaryPeakFreeNumBlocks{0};
+    SizeType32 primaryPeakUsedNumBlocks{0};
+    SizeType32 primaryPeakEvictableNumBlocks{0};
     // Secondary (host) pool
     SizeType32 secondaryMaxNumBlocks{0};
     SizeType32 secondaryFreeNumBlocks{0};
     SizeType32 secondaryUsedNumBlocks{0};
+    // Cached-but-unpinned blocks in the secondary pool. Useful to gauge "how full is the
+    // host cache"; secondaryUsedNumBlocks only counts pinned blocks during the sub-ms
+    // onboard memcpy window so it cannot answer that question on its own.
+    SizeType32 secondaryEvictableNumBlocks{0};
+    SizeType32 secondaryPeakFreeNumBlocks{0};
+    SizeType32 secondaryPeakUsedNumBlocks{0};
+    SizeType32 secondaryPeakEvictableNumBlocks{0};
 
     // --- Per-iteration deltas (reset on each read) ---
     // Context phase: block allocation and reuse
@@ -354,6 +374,11 @@ struct KvCacheIterationStats
     // Intra-device (GPU → GPU) block copies (e.g. partial reuse when source block has refs)
     SizeType32 iterIntraDeviceCopyBlocks{0};
     std::size_t iterIntraDeviceCopyBytes{0};
+
+    // Pages released by LRU from the last cache tier without ever being onboarded back
+    // to GPU during their stay at that tier (i.e. fully dropped from the hierarchy).
+    SizeType32 iterHostDroppedBlocks{0};
+    std::size_t iterHostDroppedBytes{0};
 };
 
 // Basic building block of a paged KV cache - a single

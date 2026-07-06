@@ -104,6 +104,8 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
     attn_metadata.kv_cache_block_offsets = attn_metadata.draft_kv_cache_block_offsets
     attn_metadata.host_kv_cache_block_offsets = (
         draft_kv_cache_manager.host_kv_cache_block_offsets)
+    if attn_metadata.enable_flash_mla:
+        attn_metadata.prepare_flash_mla()
 
     from ..attention_backend.sparse.dsa import (DSAtrtllmAttentionMetadata,
                                                 Indexer)
@@ -157,6 +159,8 @@ def restore_attn_metadata_after_draft_replay(attn_metadata, saved_state):
         saved_state['target_kv_cache_block_offsets'])
     attn_metadata.host_kv_cache_block_offsets = (
         saved_state['target_host_kv_cache_block_offsets'])
+    if attn_metadata.enable_flash_mla:
+        attn_metadata.prepare_flash_mla()
     saved_dsa = saved_state.get('saved_dsa_state')
     if saved_dsa is not None:
         m = attn_metadata
@@ -315,8 +319,9 @@ class SpeculativeDecodingMode(IntEnum):
         ) or self.is_external_drafter() or self.is_sa()
 
     def support_dynamic_draft_len(self):
-        # TODO: expand to all one-model algorithms
-        return self.is_eagle3_one_model() or self.is_mtp_eagle_one_model()
+        return self.is_mtp_one_model() or self.is_eagle3_one_model(
+        ) or self.is_mtp_eagle_one_model() or self.is_pard() or self.is_dflash(
+        ) or self.is_draft_target_one_model() or self.is_sa()
 
     def has_draft_model(self):
         return self.is_eagle3() or self.is_draft_target() or self.is_mtp_eagle()
@@ -455,6 +460,9 @@ class SpecMetadata:
     # draft_len_schedule.  Otherwise it equals max_draft_len (the static max).
     # Always set by model_engine.forward() before any downstream code reads it.
     runtime_draft_len: int = 0
+    # Total runtime tokens per generation request for the current iteration,
+    # Normally, it equals 1 + runtime_draft_len. But for PARD, it equals 2 * runtime_draft_len.
+    runtime_tokens_per_gen_step: int = 1
 
     # Auto-detected per step from populated sampling params:
     # True if every request is greedy (no temp/top_k/top_p) and we can take
@@ -1005,8 +1013,11 @@ class SpecWorkerBase(nn.Module, ABC):
                                                      dtype=torch.int64,
                                                      device=device)
 
-    def _apply_force_accepted_tokens(self, num_accepted_tokens, num_contexts,
-                                     runtime_draft_len: int):
+    def _apply_force_accepted_tokens(self,
+                                     num_accepted_tokens,
+                                     num_contexts,
+                                     runtime_draft_len: int,
+                                     spec_metadata=None):
         """
         Apply a forced (synthetic) number of accepted draft tokens if the
         ``TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS`` environment variable is
@@ -1033,12 +1044,23 @@ class SpecWorkerBase(nn.Module, ABC):
                 accepted counts (target token + accepted draft tokens).
             num_contexts: Number of context (prefill) requests in the batch.
             runtime_draft_len: The draft length for the current iteration.
+            spec_metadata: Optional SpecMetadata. When provided, used to
+                detect eager CUDA-graph warmup so the override is skipped
+                there — warmup batches use dummy requests whose KV cache and
+                draft buffers are not populated for an inflated accepted
+                count, which would drive downstream MTP ops out-of-bounds.
 
         Returns:
             Modified num_accepted_tokens tensor.
         """
         if self.force_num_accepted_tokens == 0.0:
             return num_accepted_tokens
+
+        if spec_metadata is not None:
+            is_warmup = (spec_metadata.is_cuda_graph
+                         and not torch.cuda.is_current_stream_capturing())
+            if is_warmup:
+                return num_accepted_tokens
 
         # Decompose into a deterministic integer part (always accepted) and a
         # probabilistic fractional part. ``int(...)`` truncates toward zero,
@@ -1113,9 +1135,8 @@ class SpecWorkerBase(nn.Module, ABC):
             num_accepted_tokens: [batch_size] - Number of accepted tokens per request
         """
         # Derive draft length from the actual draft_tokens shape rather than
-        # spec_metadata.runtime_draft_len, because they can differ: PARD sets
-        # runtime_draft_len = 2K-1 for input sizing but only passes K draft
-        # tokens for acceptance;
+        # spec_metadata.runtime_draft_len, because callers may slice a wider
+        # runtime token layout down to the K draft tokens used for acceptance.
         runtime_draft_len = draft_tokens.shape[-1]
         num_gens = batch_size - num_contexts
 
@@ -1151,7 +1172,10 @@ class SpecWorkerBase(nn.Module, ABC):
 
         # Apply force override if set
         num_accepted_tokens = self._apply_force_accepted_tokens(
-            num_accepted_tokens, num_contexts, runtime_draft_len)
+            num_accepted_tokens,
+            num_contexts,
+            runtime_draft_len,
+            spec_metadata=spec_metadata)
 
         return accepted_tokens, num_accepted_tokens
 
@@ -1336,7 +1360,10 @@ class SpecWorkerBase(nn.Module, ABC):
             num_accepted_tokens[num_contexts:] = gen_num_accepted
 
         num_accepted_tokens = self._apply_force_accepted_tokens(
-            num_accepted_tokens, num_contexts, runtime_draft_len)
+            num_accepted_tokens,
+            num_contexts,
+            runtime_draft_len,
+            spec_metadata=spec_metadata)
         return accepted_tokens, num_accepted_tokens
 
     def _draft_sampler_greedy(self, logits: torch.Tensor, d2t=None):
@@ -1579,6 +1606,8 @@ class SpecWorkerBase(nn.Module, ABC):
         attn_metadata.kv_cache_manager = draft_kv_cache_manager
         attn_metadata.kv_cache_block_offsets = attn_metadata.draft_kv_cache_block_offsets
         attn_metadata.host_kv_cache_block_offsets = draft_kv_cache_manager.host_kv_cache_block_offsets
+        if attn_metadata.enable_flash_mla:
+            attn_metadata.prepare_flash_mla()
 
         try:
             yield
@@ -1587,6 +1616,8 @@ class SpecWorkerBase(nn.Module, ABC):
             attn_metadata.kv_cache_manager = target_kv_cache_manager
             attn_metadata.kv_cache_block_offsets = target_kv_cache_block_offsets
             attn_metadata.host_kv_cache_block_offsets = target_host_kv_cache_block_offsets
+            if attn_metadata.enable_flash_mla:
+                attn_metadata.prepare_flash_mla()
 
     def _sample_tokens_for_batch(
         self,

@@ -304,6 +304,13 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             auto cpDomainIdx = processIdx / connectionsPerCPDomain;
             auto ppDomainIdx = (processIdx % connectionsPerCPDomain) % pPDomainSize;
             auto cacheIdx = cpDomainIdx * pPDomainSize + ppDomainIdx;
+            // Helix: skip CP ranks that own no blocks for this sequence (num_total_blocks < cp_size).
+            // The matching gen rank skips its receive, so no 0-byte transfer is posted on either side.
+            auto const& splitCache = outputSplitCaches.at(cacheIdx);
+            if (splitCache == nullptr || splitCache->getSizeInBytes() == 0)
+            {
+                return;
+            }
             if (cacheIdx < bufferCoverTargetNum)
             {
                 size_t size = outputSplitCaches.at(cacheIdx)->getSizeInBytes();
@@ -456,6 +463,13 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
                 outputBuffers.push_back(it);
                 blockNum++;
             }
+        }
+
+        // Helix: an "empty" CP rank owns no KV blocks for this sequence (num_total_blocks < cp_size).
+        // There is nothing to receive; the sender (context, CP=1) skips the matching 0-byte transfer.
+        if (blockNum == 0)
+        {
+            continue;
         }
 
         int deviceId = bufferManager.getStream().getDevice();

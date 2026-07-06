@@ -69,7 +69,8 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
         # Setup RPC server for stats (skip init_rpc_worker to keep IPC response queue)
         # Only set up if rpc_addr is provided (for stats RPC support)
         if rpc_addr is not None:
-            assert hmac_key, "hmac_key is required when rpc_addr is set"
+            if not hmac_key:
+                raise ValueError("hmac_key is required when rpc_addr is set")
             self.rpc_addr = rpc_addr
             self.hmac_key = hmac_key
             self.start_rpc_server()  # Reuse from RpcWorkerMixin
@@ -131,6 +132,20 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
         import torch.distributed
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
+
+        # Return this rank's GPU memory to the driver. Under an external MPI
+        # launch (mpirun/srun, e.g. CI), the worker process is long-lived and
+        # shared across successive LLM instances: a new GenerationExecutorWorker
+        # is built for each LLM, but the OS process -- and with it the CUDA
+        # context and PyTorch caching allocator -- persists. Setting
+        # `self.engine = None` above is not enough to free the GPU: reference
+        # cycles keep the model tensors alive until a later GC, and the allocator
+        # holds freed blocks as "reserved" instead of returning them. Without
+        # this, the previous model's ~weights-sized reservation carries into the
+        # next LLM built in this process and can OOM its load (e.g. back-to-back
+        # tests in one CI shard).
+        gc.collect()
+        torch.cuda.empty_cache()
 
         # Check if there are any errors from the threads before shutdown.
         self._handle_background_error()
@@ -281,6 +296,7 @@ def worker_main(
                 proxy_result_queue,
                 postproc_worker_config.postprocess_tokenizer_dir,
                 PostprocWorker.default_record_creator,
+                postproc_worker_config.post_processor_hook,
             )
             postprocess_worker_futures.append(fut)
 
