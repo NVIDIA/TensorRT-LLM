@@ -27,6 +27,7 @@ from typing import Mapping as TMapping
 
 import torch
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import PretrainedConfig
 
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
@@ -46,6 +47,11 @@ from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..utils import ActivationType, AuxStreamType, EventType
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, ModelConfig, register_auto_model
+
+# Dense layers use SDPA with non-contiguous Q/K/V and a bool attn_mask.
+# Limit backends to memory-efficient and math; cuDNN SDPA fails for this layout,
+# and flash SDPA does not accept attn_mask.
+_DENSE_SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
 
 # ---------------------------------------------------------------------------
 # Config normalization helpers
@@ -969,14 +975,15 @@ class MiniMaxM3Attention(Attention):
                 v_b = v_padded[b].transpose(0, 1).unsqueeze(0)  # [1, H, k, d]
                 mask_b = valid[start:end].unsqueeze(0).unsqueeze(0)  # [1, 1, q, k]
                 # SDPA: when attn_mask is a bool tensor, True = attend, False = mask.
-                out_b = torch.nn.functional.scaled_dot_product_attention(
-                    q_b.to(q.dtype),
-                    k_b.to(q.dtype),
-                    v_b.to(q.dtype),
-                    attn_mask=mask_b,
-                    dropout_p=0.0,
-                    is_causal=False,
-                )  # [1, H, q, d]
+                with sdpa_kernel(_DENSE_SDPA_BACKENDS):
+                    out_b = torch.nn.functional.scaled_dot_product_attention(
+                        q_b.to(q.dtype),
+                        k_b.to(q.dtype),
+                        v_b.to(q.dtype),
+                        attn_mask=mask_b,
+                        dropout_p=0.0,
+                        is_causal=False,
+                    )  # [1, H, q, d]
                 attn_outputs.append(out_b.squeeze(0).transpose(0, 1))  # [q, H, d]
             o = (
                 torch.cat(attn_outputs, dim=0)
@@ -998,14 +1005,15 @@ class MiniMaxM3Attention(Attention):
             k_b = k_padded.transpose(1, 2)  # [batch, H, k, d]
             v_b = v_padded.transpose(1, 2)  # [batch, H, k, d]
             mask_b = valid.unsqueeze(1).unsqueeze(1)  # [batch, 1, 1, k]
-            out_b = torch.nn.functional.scaled_dot_product_attention(
-                q_b.to(q.dtype),
-                k_b.to(q.dtype),
-                v_b.to(q.dtype),
-                attn_mask=mask_b,
-                dropout_p=0.0,
-                is_causal=False,
-            )  # [batch, H, 1, d]
+            with sdpa_kernel(_DENSE_SDPA_BACKENDS):
+                out_b = torch.nn.functional.scaled_dot_product_attention(
+                    q_b.to(q.dtype),
+                    k_b.to(q.dtype),
+                    v_b.to(q.dtype),
+                    attn_mask=mask_b,
+                    dropout_p=0.0,
+                    is_causal=False,
+                )  # [batch, H, 1, d]
             # Drop the singleton Q-length axis. The result is already the
             # ``[batch, num_heads, head_dim]`` layout the prefill branch
             # produces, so the shared flatten on line below is sufficient.
