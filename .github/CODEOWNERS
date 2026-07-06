@@ -80,6 +80,7 @@
 /.codex @NVIDIA/trt-llm-agent-devs
 /AGENTS.md @NVIDIA/trt-llm-agent-devs
 /CLAUDE.md @NVIDIA/trt-llm-agent-devs
+/scripts/check_skill_naming_convention.py @NVIDIA/trt-llm-agent-devs
 
 # ===== DOCS / EXAMPLES =====
 /CODE_OF_CONDUCT.md @NVIDIA/trt-llm-doc-devs
@@ -168,6 +169,9 @@
 /examples/llm-api/quickstart_multimodal.py @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-doc-devs
 /examples/models @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-doc-devs
 /examples/serve/*multimodal* @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-doc-devs
+/scripts/build_cpp_examples.py @NVIDIA/trt-llm-models-devs
+/scripts/generate_config_database_tests.py @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-doc-devs
+/scripts/generate_config_table.py @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-doc-devs
 /tensorrt_llm/_torch/models @NVIDIA/trt-llm-models-devs
 /tensorrt_llm/_torch/modules/mamba @NVIDIA/trt-llm-models-devs
 /tensorrt_llm/quantization @NVIDIA/trt-llm-models-devs
@@ -184,6 +188,7 @@
 /benchmarks @NVIDIA/trt-llm-perf-devs
 /cpp/micro_benchmarks @NVIDIA/trt-llm-perf-devs
 /docs/source/performance/perf-benchmarking.md @NVIDIA/trt-llm-perf-devs
+/scripts/check_pinned_memory_usage.py @NVIDIA/trt-llm-perf-devs
 /tensorrt_llm/bench @NVIDIA/trt-llm-perf-devs
 /tensorrt_llm/commands/bench.py @NVIDIA/trt-llm-perf-devs
 /tensorrt_llm/tools/layer_wise_benchmarks @NVIDIA/trt-llm-perf-devs
@@ -315,6 +320,7 @@
 # ===== VisualGen / AIGV =====
 /cpp/tensorrt_llm/thop/fusedDiT* @NVIDIA/trt-llm-torch-visual-gen-devs
 /examples/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
+/scripts/visualgen_eval @NVIDIA/trt-llm-torch-visual-gen-devs
 /tensorrt_llm/_torch/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
 /tensorrt_llm/_torch/visual_gen/attention_backend @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-torch-visual-gen-devs
 /tensorrt_llm/_torch/visual_gen/modules/attention.py @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-torch-visual-gen-devs
@@ -334,6 +340,8 @@
 # ===== SELF-MANAGED =====
 /docs/source/features/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs @NVIDIA/trt-llm-doc-devs
 /examples/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
+/scripts/check_auto_deploy_imports.py @NVIDIA/trt-llm-torch-autodeploy-devs
+/scripts/check_model_registry.py @NVIDIA/trt-llm-torch-autodeploy-devs
 /tensorrt_llm/_torch/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
 /tests/integration/defs/accuracy/test_llm_api_autodeploy.py @NVIDIA/trt-llm-torch-autodeploy-devs @NVIDIA/trt-llm-qa
 /tests/unittest/_torch/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
