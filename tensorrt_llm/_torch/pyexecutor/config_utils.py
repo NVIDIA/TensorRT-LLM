@@ -572,6 +572,13 @@ def load_pretrained_config(model_name_or_path: str,
         model_config = transformers.AutoConfig.from_pretrained(
             model_name_or_path, trust_remote_code=trust_remote_code)
 
+    # ChatGLM trust_remote_code configs expose native field names; fill the
+    # canonical HF aliases the _torch modules and RopeParams.from_config read.
+    if getattr(model_config, "model_type", None) == "chatglm":
+        from tensorrt_llm._torch.models.modeling_chatglm import \
+            normalize_chatglm_config
+        normalize_chatglm_config(model_config)
+
     # Transformers 5.x sets rope_scaling to {"rope_type": "default"} instead
     # of None for models with standard RoPE (no scaling).  Clear it so that
     # downstream code (e.g. RopeParams.from_config) treats it the same as
