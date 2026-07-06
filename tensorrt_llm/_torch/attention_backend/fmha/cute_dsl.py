@@ -411,7 +411,7 @@ class CuteDslMlaFmha(PhasedFmha):
         pool_idx = int(pool_mapping[local_layer_idx, 0])
         page_table_layer = block_offsets[pool_idx, :, 0, :]
         cache_seqs_base = params.sequence_lengths.to(torch.int32)
-        page_table = page_table_layer[meta.num_contexts:].transpose(0, 1).to(torch.int32)
+        page_table = page_table_layer[meta.num_contexts :].transpose(0, 1).to(torch.int32)
         if layers_in_pool > 1:
             page_table = page_table + layer_in_pool
 
@@ -424,10 +424,6 @@ class CuteDslMlaFmha(PhasedFmha):
 
         # Split-KV parallelism is owned ENTIRELY by the op's AutoTuner: it
         # profiles the per-shape split_kv candidates
-        from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
-            CuteDSLNVMlaDecodeBlackwellRunner,
-        )
-        import cutlass
 
         workspace = params.workspace
         softmax_scale = float(1.0 / (math.sqrt(qk_nope_head_dim + d_rope) * attn.q_scaling))

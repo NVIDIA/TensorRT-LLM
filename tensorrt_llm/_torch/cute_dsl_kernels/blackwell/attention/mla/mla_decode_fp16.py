@@ -2591,10 +2591,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
                 if apply_mask:
                     if cutlass.const_expr(self.fold_sq):
-                        q_tok = (common_params.blk_coord[1] * self.fold_sq_ratio
-                                 + (tTR_tS[i][0] +
-                                    common_params.blk_coord[0] * cta_m_rows) //
-                                 self.num_heads)
+                        q_tok = (
+                            common_params.blk_coord[1] * self.fold_sq_ratio +
+                            (tTR_tS[i][0] + common_params.blk_coord[0] *
+                             cta_m_rows) // self.num_heads)
                     else:
                         q_tok = common_params.blk_coord[1]
                     k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
@@ -2631,10 +2631,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             if apply_mask:
                 for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
                     if cutlass.const_expr(self.fold_sq):
-                        q_tok = (common_params.blk_coord[1] * self.fold_sq_ratio
-                                 + (tTR_tS[i][0] +
-                                    common_params.blk_coord[0] * cta_m_rows) //
-                                 self.num_heads)
+                        q_tok = (
+                            common_params.blk_coord[1] * self.fold_sq_ratio +
+                            (tTR_tS[i][0] + common_params.blk_coord[0] *
+                             cta_m_rows) // self.num_heads)
                     else:
                         q_tok = common_params.blk_coord[1]
                     k_bound = common_params.K - (self.seq_len_q - 1) + q_tok

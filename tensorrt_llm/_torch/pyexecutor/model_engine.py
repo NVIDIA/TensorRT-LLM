@@ -1449,7 +1449,9 @@ class PyTorchModelEngine(ModelEngine):
             warmup_requests_configs.append(
                 (1 + self.max_total_draft_tokens + 1, 1))
         else:
-            logger.debug("Skipped TRTLLM-Gen flashinfer_trtllm_gen FMHA lib JIT warmup When enable cute_dsl_mla FMHA lib")
+            logger.debug(
+                "Skipped TRTLLM-Gen flashinfer_trtllm_gen FMHA lib JIT warmup When enable cute_dsl_mla FMHA lib"
+            )
 
         for num_tokens, num_gen_requests in warmup_requests_configs:
             warmup_request = self._create_warmup_request(

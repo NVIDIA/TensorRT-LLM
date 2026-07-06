@@ -30,12 +30,12 @@ Platform: Blackwell SM100 / SM103 only.
 """
 
 import pytest
-import torch
 
 # Reuse the proven setup + reference machinery from the full MLA test.
 # The attention test directory is added to sys.path by pytest (prepend import
 # mode, no package __init__), so the sibling module is imported by bare name.
 import test_attention_mla
+import torch
 from test_attention_mla import RopeConfig, Scenario, _run_test_for_backend
 
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
@@ -134,8 +134,7 @@ def cute_dsl_decode_counter(monkeypatch):
     return counter
 
 
-def _expected_dispatches(num_heads: int, seq_len_q: int, num_layers: int,
-                         num_steps: int) -> int:
+def _expected_dispatches(num_heads: int, seq_len_q: int, num_layers: int, num_steps: int) -> int:
     """Dispatch count the FMHA gate should produce: ``num_layers * num_steps``
     when the perf allowlist admits the shape (CuTe DSL must actually run), 0
     when it rejects it (the fallback lib must serve every decode step)."""
@@ -181,8 +180,9 @@ def test_cute_dsl_mla_decode(
         v2_kv_cache=True,
     )
 
-    expected = _expected_dispatches(scenario.num_heads, generation_seq_len_q,
-                                    scenario.num_layers, _DECODE_NUM_STEPS)
+    expected = _expected_dispatches(
+        scenario.num_heads, generation_seq_len_q, scenario.num_layers, _DECODE_NUM_STEPS
+    )
     assert cute_dsl_decode_counter["calls"] == expected, (
         f"Expected {expected} CuTe DSL MLA decode dispatches, got "
         f"{cute_dsl_decode_counter['calls']}"
@@ -245,8 +245,9 @@ def test_cute_dsl_mla_decode_fold_sq(
         v2_kv_cache=True,
     )
 
-    expected = _expected_dispatches(scenario.num_heads, generation_seq_len_q,
-                                    scenario.num_layers, _DECODE_NUM_STEPS)
+    expected = _expected_dispatches(
+        scenario.num_heads, generation_seq_len_q, scenario.num_layers, _DECODE_NUM_STEPS
+    )
     assert cute_dsl_decode_counter["calls"] == expected, (
         f"Expected {expected} CuTe DSL MLA decode dispatches, got "
         f"{cute_dsl_decode_counter['calls']}"
@@ -306,8 +307,9 @@ def test_cute_dsl_mla_decode_long_decode(v2_kv_cache, num_layers, kernel, cute_d
         v2_kv_cache=v2_kv_cache,
     )
 
-    expected = _expected_dispatches(scenario.num_heads, 1, scenario.num_layers,
-                                    _LONG_DECODE_NUM_STEPS)
+    expected = _expected_dispatches(
+        scenario.num_heads, 1, scenario.num_layers, _LONG_DECODE_NUM_STEPS
+    )
     assert cute_dsl_decode_counter["calls"] == expected, (
         f"Expected {expected} CuTe DSL MLA decode dispatches, got "
         f"{cute_dsl_decode_counter['calls']}"
@@ -354,7 +356,12 @@ _STANDALONE_SHAPES = [
     ids=[f"h{h}_b{b}_kv{k}" for (h, b, k) in _STANDALONE_SHAPES],
 )
 def test_cute_dsl_mla_decode_standalone_shapes(
-    num_heads, batch, kv, generation_seq_len_q, kernel, cute_dsl_decode_counter,
+    num_heads,
+    batch,
+    kv,
+    generation_seq_len_q,
+    kernel,
+    cute_dsl_decode_counter,
     monkeypatch,
 ):
     """Decode-path parity with the standalone kernel benchmark shapes.
@@ -373,10 +380,14 @@ def test_cute_dsl_mla_decode_standalone_shapes(
     # and ``max_num_contexts`` (default 10), NOT from the actual shape. These
     # standalone shapes use ctx up to ~8k over up to 256 sequences, so bump both
     # to the real shape or the pool runs out ("Not enough pages in GPU memory").
-    monkeypatch.setattr(test_attention_mla, "max_context_sequence_length",
-                        max(kv, test_attention_mla.max_context_sequence_length))
-    monkeypatch.setattr(test_attention_mla, "max_num_contexts",
-                        max(batch, test_attention_mla.max_num_contexts))
+    monkeypatch.setattr(
+        test_attention_mla,
+        "max_context_sequence_length",
+        max(kv, test_attention_mla.max_context_sequence_length),
+    )
+    monkeypatch.setattr(
+        test_attention_mla, "max_num_contexts", max(batch, test_attention_mla.max_num_contexts)
+    )
 
     scenario = Scenario(
         dtype=dtype,
@@ -411,8 +422,9 @@ def test_cute_dsl_mla_decode_standalone_shapes(
         v2_kv_cache=True,
     )
 
-    expected = _expected_dispatches(scenario.num_heads, seq_q,
-                                    scenario.num_layers, num_generation_steps)
+    expected = _expected_dispatches(
+        scenario.num_heads, seq_q, scenario.num_layers, num_generation_steps
+    )
     assert cute_dsl_decode_counter["calls"] == expected, (
         f"Expected {expected} CuTe DSL MLA decode dispatches, got "
         f"{cute_dsl_decode_counter['calls']}"
@@ -434,7 +446,12 @@ _AUTOTUNE_SHAPES = [(2, 2048), (64, 1024)]
     "batch,kv", _AUTOTUNE_SHAPES, ids=[f"b{b}_kv{k}" for (b, k) in _AUTOTUNE_SHAPES]
 )
 def test_cute_dsl_mla_decode_autotuned(
-    batch, kv, force_persistent, kernel, cute_dsl_decode_counter, monkeypatch,
+    batch,
+    kv,
+    force_persistent,
+    kernel,
+    cute_dsl_decode_counter,
+    monkeypatch,
 ):
     """Exercise the op AutoTuner's ``is_persistent`` tactic path end-to-end.
 
@@ -460,10 +477,14 @@ def test_cute_dsl_mla_decode_autotuned(
     if force_persistent is not None:
         monkeypatch.setenv("TLLM_CUTE_DSL_FORCE_PERSISTENT", force_persistent)
 
-    monkeypatch.setattr(test_attention_mla, "max_context_sequence_length",
-                        max(kv, test_attention_mla.max_context_sequence_length))
-    monkeypatch.setattr(test_attention_mla, "max_num_contexts",
-                        max(batch, test_attention_mla.max_num_contexts))
+    monkeypatch.setattr(
+        test_attention_mla,
+        "max_context_sequence_length",
+        max(kv, test_attention_mla.max_context_sequence_length),
+    )
+    monkeypatch.setattr(
+        test_attention_mla, "max_num_contexts", max(batch, test_attention_mla.max_num_contexts)
+    )
 
     scenario = Scenario(
         dtype=dtype,
@@ -501,8 +522,9 @@ def test_cute_dsl_mla_decode_autotuned(
         autotune_warmup=True,
     )
 
-    expected = _expected_dispatches(scenario.num_heads, seq_q,
-                                    scenario.num_layers, num_generation_steps)
+    expected = _expected_dispatches(
+        scenario.num_heads, seq_q, scenario.num_layers, num_generation_steps
+    )
     assert cute_dsl_decode_counter["calls"] == expected, (
         f"Expected {expected} CuTe DSL MLA decode dispatches, got "
         f"{cute_dsl_decode_counter['calls']}"

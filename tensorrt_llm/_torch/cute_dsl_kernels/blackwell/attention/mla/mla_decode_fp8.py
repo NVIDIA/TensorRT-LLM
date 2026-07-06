@@ -271,16 +271,18 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # Debug: dump the __init__ config so both call paths (standalone run()
         # and the integration op) can be compared 1:1. Set CUTEDSL_DUMP_KERNEL_ARGS=1.
         if os.environ.get("CUTEDSL_DUMP_KERNEL_ARGS"):
-            print("[CUTEDSL_INIT] %s acc_dtype=%s lse_dtype=%s mma_qk_tiler_mn=%s "
-                  "mma_pv_tiler_mn=%s max_active_clusters=%s page_size=%d "
-                  "skip_correction_threshold=%s is_persistent=%s is_var_seq=%s "
-                  "is_var_split_kv=%s num_heads=%d seq_len_q=%d fold_sq=%s "
-                  "fold_sq_ratio=%s"
-                  % (type(self).__name__, acc_dtype, lse_dtype, mma_qk_tiler_mn,
-                     mma_pv_tiler_mn, max_active_clusters, page_size,
-                     skip_correction_threshold, is_persistent, is_var_seq,
-                     is_var_split_kv, num_heads, seq_len_q, self.fold_sq,
-                     self.fold_sq_ratio), flush=True)
+            print(
+                "[CUTEDSL_INIT] %s acc_dtype=%s lse_dtype=%s mma_qk_tiler_mn=%s "
+                "mma_pv_tiler_mn=%s max_active_clusters=%s page_size=%d "
+                "skip_correction_threshold=%s is_persistent=%s is_var_seq=%s "
+                "is_var_split_kv=%s num_heads=%d seq_len_q=%d fold_sq=%s "
+                "fold_sq_ratio=%s" %
+                (type(self).__name__, acc_dtype, lse_dtype, mma_qk_tiler_mn,
+                 mma_pv_tiler_mn, max_active_clusters, page_size,
+                 skip_correction_threshold, is_persistent, is_var_seq,
+                 is_var_split_kv, num_heads, seq_len_q, self.fold_sq,
+                 self.fold_sq_ratio),
+                flush=True)
 
     def _setup_attributes(self):
         """Set up configurations and parameters for the MLA kernel operation.
@@ -371,24 +373,34 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # @cute.jit is lowered to a cute predicate and fails ("Cannot convert
         # '1' to Boolean"). const_expr forces Python-level evaluation at trace.
         if cutlass.const_expr(bool(os.environ.get("CUTEDSL_DUMP_KERNEL_ARGS"))):
+
             def _lay(name, t):
                 # NB: no early `return` -- @cute.jit's AST preprocessor rejects
                 # early exits in nested functions (DSLAstPreprocessorError). Use
                 # a single conditional-expression return instead.
                 lay = getattr(t, "layout", None) if t is not None else None
                 et = getattr(t, "element_type", None) if t is not None else None
-                return ("%s=None" % name if t is None else
-                        "%s layout=%s dtype=%s" %
+                return ("%s=None" %
+                        name if t is None else "%s layout=%s dtype=%s" %
                         (name, lay if lay is not None else t, et))
+
             print("[CUTEDSL_CALL] " + " | ".join([
-                _lay("q_latent", q_latent), _lay("q_rope", q_rope),
-                _lay("c_latent", c_latent), _lay("c_rope", c_rope),
-                _lay("page_table", page_table), _lay("o", o), _lay("lse", lse),
-                _lay("workspace", workspace), _lay("cache_seqs", cache_seqs),
+                _lay("q_latent", q_latent),
+                _lay("q_rope", q_rope),
+                _lay("c_latent", c_latent),
+                _lay("c_rope", c_rope),
+                _lay("page_table", page_table),
+                _lay("o", o),
+                _lay("lse", lse),
+                _lay("workspace", workspace),
+                _lay("cache_seqs", cache_seqs),
                 _lay("block_split_kvs", block_split_kvs),
-            ]), flush=True)
-            print("[CUTEDSL_CALL] split_kv=%s softmax_scale=%s output_scale=%s"
-                  % (split_kv, softmax_scale, output_scale), flush=True)
+            ]),
+                  flush=True)
+            print(
+                "[CUTEDSL_CALL] split_kv=%s softmax_scale=%s output_scale=%s" %
+                (split_kv, softmax_scale, output_scale),
+                flush=True)
 
         # setup static attributes before smem/grid/tma computation
         self.q_dtype = q_latent.element_type
@@ -2602,10 +2614,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
                 if apply_mask:
                     if cutlass.const_expr(self.fold_sq):
-                        q_tok = (common_params.blk_coord[1] * self.fold_sq_ratio
-                                 + (tTR_tS[i][0] +
-                                    common_params.blk_coord[0] * cta_m_rows) //
-                                 self.num_heads)
+                        q_tok = (
+                            common_params.blk_coord[1] * self.fold_sq_ratio +
+                            (tTR_tS[i][0] + common_params.blk_coord[0] *
+                             cta_m_rows) // self.num_heads)
                     else:
                         q_tok = common_params.blk_coord[1]
                     k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
@@ -2641,10 +2653,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             if apply_mask:
                 for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
                     if cutlass.const_expr(self.fold_sq):
-                        q_tok = (common_params.blk_coord[1] * self.fold_sq_ratio
-                                 + (tTR_tS[i][0] +
-                                    common_params.blk_coord[0] * cta_m_rows) //
-                                 self.num_heads)
+                        q_tok = (
+                            common_params.blk_coord[1] * self.fold_sq_ratio +
+                            (tTR_tS[i][0] + common_params.blk_coord[0] *
+                             cta_m_rows) // self.num_heads)
                     else:
                         q_tok = common_params.blk_coord[1]
                     k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
@@ -3711,12 +3723,12 @@ def run(
             pool_abs = int(os.environ.get("CUTEDSL_POOL_PAGES_ABS", "0"))
             if cache_seqs is not None:
                 max_seq_len = torch.max(cache_seqs)
-                npages = (pool_abs if pool_abs > 0
-                          else pool_mult * B * ceil_div(max_seq_len, page_size))
+                npages = (pool_abs if pool_abs > 0 else pool_mult * B *
+                          ceil_div(max_seq_len, page_size))
                 shape = (npages, page_size, D)
             else:
-                npages = (pool_abs if pool_abs > 0
-                          else pool_mult * B * ceil_div(HK, page_size))
+                npages = (pool_abs if pool_abs > 0 else pool_mult * B *
+                          ceil_div(HK, page_size))
                 shape = (npages, page_size, D)
 
         if seq_len_q is not None:
@@ -3781,8 +3793,9 @@ def run(
             # Value is "1"/"all" (skip every tensor) or a comma list of roles
             # to skip selectively (e.g. "q", "o", "q,o", "c") for isolation.
             _nc = os.environ.get("CUTEDSL_NO_COMPACT_MARK", "")
-            _skip = bool(_nc) and (_nc in ("1", "all")
-                                   or (role is not None and role in _nc.split(",")))
+            _skip = bool(_nc) and (_nc in ("1", "all") or
+                                   (role is not None
+                                    and role in _nc.split(",")))
             if not is_lse and not _skip:
                 cute_tensor = cute_tensor.mark_compact_shape_dynamic(
                     mode=leading_dim,
@@ -3799,8 +3812,8 @@ def run(
 
         return f32_torch_tensor, cute_tensor, torch_tensor_gpu
 
-    def create_kv_pool_interleaved(batch_size, seq_len_k, latent_dim,
-                                   rope_dim, dtype, cache_seqs_ref):
+    def create_kv_pool_interleaved(batch_size, seq_len_k, latent_dim, rope_dim,
+                                   dtype, cache_seqs_ref):
         """Allocate c_latent / c_rope as INTERLEAVED views of ONE pool buffer,
         matching the real KV-cache layout the integration path feeds the kernel
         (fmha/cute_dsl.py: ``kv_pages[..., :d_latent]`` and ``[..., d_latent:]``
@@ -3868,8 +3881,13 @@ def run(
         """
         d_total = latent_dim + rope_dim
         comb_ref, _comb_cute, comb_gpu = create_data_tensor(
-            batch_size, num_heads, d_total, dtype,
-            is_dynamic_layout=True, seq_len_q=seq_len_q, role="q")
+            batch_size,
+            num_heads,
+            d_total,
+            dtype,
+            is_dynamic_layout=True,
+            seq_len_q=seq_len_q,
+            role="q")
 
         # q is [num_heads, d_total, seq_q, batch]; slice latent / rope out of the
         # contiguous d axis (dim 1). Both slices keep the d_total row pitch ->
@@ -3956,12 +3974,13 @@ def run(
             # 3B-1, ...]). Same stride-B interleave as default, different offset.
             for b in range(batch_size):
                 for j in range(page_count):
-                    page_table_ref[b, j] = (j * batch_size
-                                            + (batch_size - 1 - b)) * _pool_mult
+                    page_table_ref[b, j] = (j * batch_size +
+                                            (batch_size - 1 - b)) * _pool_mult
         else:
             for b in range(batch_size):
                 for j in range(page_count):
-                    base = (b * page_count + j) if _seqmajor else (b + j * batch_size)
+                    base = (b * page_count +
+                            j) if _seqmajor else (b + j * batch_size)
                     page_table_ref[b, j] = base * _pool_mult
         page_table_gpu = page_table_ref.permute(1, 0).cuda()
         page_table = from_dlpack(
@@ -4215,28 +4234,34 @@ def run(
     # diffed 1:1. The @cute.jit [CUTEDSL_CALL] trace dump is skipped on JIT
     # cache hits, so this host-side print is the reliable comparison point.
     if os.environ.get("CUTEDSL_DUMP_KERNEL_ARGS"):
+
         def _ss(t):
-            return "None" if t is None else "%s/%s/%s" % (
-                tuple(t.shape), tuple(t.stride()), t.dtype)
+            return "None" if t is None else "%s/%s/%s" % (tuple(
+                t.shape), tuple(t.stride()), t.dtype)
+
         def _align(t):
             if t is None:
                 return "None"
-            p = int(t.data_ptr()); a = (p & -p)  # largest power-of-2 divisor
+            p = int(t.data_ptr())
+            a = (p & -p)  # largest power-of-2 divisor
             return "ptr=0x%x align=%dB" % (p, a)
-        print("[CUTEDSL_ALIGN_STANDALONE] c_latent %s | c_rope %s | q_latent %s | o %s"
-              % (_align(c_latent_torch), _align(c_rope_torch),
-                 _align(q_latent_torch), _align(o_torch)), flush=True)
+
+        print(
+            "[CUTEDSL_ALIGN_STANDALONE] c_latent %s | c_rope %s | q_latent %s | o %s"
+            % (_align(c_latent_torch), _align(c_rope_torch),
+               _align(q_latent_torch), _align(o_torch)),
+            flush=True)
         pt = page_table_torch
         if pt is not None and pt.numel():
             row0 = pt[0].tolist() if pt.dim() > 1 else pt.tolist()
             # page_table is [page_count, batch] on the standalone path, so a
             # sequence's pages are the COLUMN pt[:, b]; check column-contiguity.
-            contig = bool((pt.dim() > 1) and torch.all(
-                pt[1:, :] == pt[:-1, :] + 1).item())
-            pt_info = ("pt_min=%d pt_max=%d col0[:8]=%s per_seq_contig=%s"
-                       % (int(pt.min()), int(pt.max()),
-                          [int(pt[i, 0]) for i in range(min(8, pt.shape[0]))]
-                          if pt.dim() > 1 else row0[:8], contig))
+            contig = bool((pt.dim() > 1)
+                          and torch.all(pt[1:, :] == pt[:-1, :] + 1).item())
+            pt_info = ("pt_min=%d pt_max=%d col0[:8]=%s per_seq_contig=%s" %
+                       (int(pt.min()), int(pt.max()),
+                        [int(pt[i, 0]) for i in range(min(8, pt.shape[0]))]
+                        if pt.dim() > 1 else row0[:8], contig))
         else:
             pt_info = "pt_info=none"
         print(
@@ -4244,14 +4269,28 @@ def run(
             "num_heads=%d page_size=%d split_kv=%s is_var_seq=%s "
             "is_var_split_kv=%s fold_sq=%s softmax_scale=%.8f output_scale=%.8f | "
             "q_latent%s q_rope%s c_latent%s c_rope%s page_table%s cache_seqs%s "
-            "o%s lse%s workspace%s | %s"
-            % (
-                batch_size, seq_len_q, seq_len_k, num_heads, page_size,
-                split_kv, is_var_seq, is_var_split_kv, fold_sq,
-                softmax_scale, output_scale,
-                _ss(q_latent_torch), _ss(q_rope_torch), _ss(c_latent_torch),
-                _ss(c_rope_torch), _ss(page_table_torch), _ss(cache_seqs_torch),
-                _ss(o_torch), _ss(lse_torch), _ss(workspace_torch), pt_info,
+            "o%s lse%s workspace%s | %s" % (
+                batch_size,
+                seq_len_q,
+                seq_len_k,
+                num_heads,
+                page_size,
+                split_kv,
+                is_var_seq,
+                is_var_split_kv,
+                fold_sq,
+                softmax_scale,
+                output_scale,
+                _ss(q_latent_torch),
+                _ss(q_rope_torch),
+                _ss(c_latent_torch),
+                _ss(c_rope_torch),
+                _ss(page_table_torch),
+                _ss(cache_seqs_torch),
+                _ss(o_torch),
+                _ss(lse_torch),
+                _ss(workspace_torch),
+                pt_info,
             ),
             flush=True,
         )

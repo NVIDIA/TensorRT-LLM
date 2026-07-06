@@ -8320,7 +8320,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.is_var_split_kv,
                 self.skip_correction_threshold,
             )
-        
+
         @classmethod
         def _get_max_active_blocks(cls) -> int:
             """``max_active_clusters * cluster_shape[0]`` -- the occupancy ceiling
@@ -8342,12 +8342,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cached = int(max_active_clusters) * cls.cluster_shape_mnk[0]
                 cls._cute_dsl_max_active_blocks = cached
             return cached
-        
+
         @staticmethod
-        def get_split_kv_candidates(B: int, S: int, max_active_blocks: int) -> List[int]:
+        def get_split_kv_candidates(B: int, S: int,
+                                    max_active_blocks: int) -> List[int]:
             # TODO: split_kv is not always the best choice. We need to optimize it.
             max_split_kv = 32
-            blocks_per_batch= max(1, max_active_blocks // B // (S * 2))
+            blocks_per_batch = max(1, max_active_blocks // B // (S * 2))
             split_kv = min(blocks_per_batch, max_split_kv)
             return [split_kv]
 
@@ -8385,16 +8386,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # cuda graph capture(B=2):   eager warmup N times  →  capture graph_2
             # ...
             # cuda graph replay
-            
-            # The latter graph capture with different batch size may have bigger workspace size, which will resize the workspace. 
-            # Then the workspace address of previsous captued graph will be invalid.
+
+            # The latter graph capture with different batch size may have bigger workspace size, which will resize the workspace.
+            # Then the workspace address of previously captured graph will be invalid.
             # So we need to return the max workspace size for all batch sizes.
-            
+
             # workspace_size = B * H * S * split_kv * (D + 1) * acc_dtype.width // 8
             # split_kv <= max_active_blocks // B // (S * 2) in get_split_kv_candidates
             # workspace_size <= H * (max_active_blocks // 2) * (D + 1) * acc_dtype.width // 8
             return H * (max_active_blocks // 2) * (D + 1) * acc_dtype.width // 8
-            
+
             # max_workspace_size = 0
             # split_kv_candidates = cls.get_split_kv_candidates(
             #     B, S, max_active_blocks)
@@ -8568,8 +8569,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             page_table = inputs[4]
             max_blocks = int(page_table.shape[0])
             num_pages = int(inputs[2].shape[2])
-            pt_valid = (page_table.to(torch.long).abs() %
-                        num_pages).to(page_table.dtype)
+            pt_valid = (page_table.to(torch.long).abs() % num_pages).to(
+                page_table.dtype)
             pt_out = torch.empty((batch, max_blocks),
                                  dtype=page_table.dtype,
                                  device=page_table.device).transpose(0, 1)
@@ -8602,20 +8603,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
             cache = self.__class__.tuning_config_cache
             if key not in cache:
                 free = self._BATCH_FREE_INPUT
-                constraint_dims = [
-                    (i, d) for (i, d) in self._BATCH_DIMS if i != free
-                ]
+                constraint_dims = [(i, d) for (i, d) in self._BATCH_DIMS
+                                   if i != free]
                 # Batch-carrying dims are tied to the free batch dim; static
                 # -size dims are reconstructed at their own real size (so the
                 # profiling tensor is valid) but excluded from the key.
                 batch_constraints = tuple(
-                    ConstraintSpec(i, d,
-                                   lambda shapes, _free=free: shapes[_free][0])
+                    ConstraintSpec(
+                        i, d, lambda shapes, _free=free: shapes[_free][0])
                     for (i, d) in constraint_dims)
                 static_constraints = tuple(
                     ConstraintSpec(
-                        i, d,
-                        lambda shapes, _i=i, _d=d: shapes[_i][_d])
+                        i, d, lambda shapes, _i=i, _d=d: shapes[_i][_d])
                     for (i, d) in self._STATIC_SIZE_DIMS)
                 cache[key] = TuningConfig(
                     dynamic_tensor_specs=(DynamicTensorSpec(
@@ -8650,8 +8649,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tactic,
             **kwargs,
         ) -> Tuple[torch.Tensor, torch.Tensor]:
-            (q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs,
-             o, lse, workspace) = inputs
+            (q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o, lse,
+             workspace) = inputs
             softmax_scale = float(kwargs.get("softmax_scale", 1.0))
             output_scale = float(kwargs.get("output_scale", 1.0))
 
@@ -8701,8 +8700,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if cache_key not in CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache:
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
-                    self.cluster_shape_mnk[0] *
-                    self.cluster_shape_mnk[1] *
+                    self.cluster_shape_mnk[0] * self.cluster_shape_mnk[1] *
                     self.cluster_shape_mnk[2])
 
                 # Fold seq_len_q into the head dimension when the head count
@@ -8854,8 +8852,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             page_size=page_size,
         )
         inputs = [
-            q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs,
-            o, lse, workspace
+            q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o, lse,
+            workspace
         ]
         tuner = AutoTuner.get()
         _, best_tactic = tuner.choose_one(
@@ -8955,8 +8953,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             page_size=page_size,
         )
         inputs = [
-            q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs,
-            o, lse, workspace
+            q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o, lse,
+            workspace
         ]
         tuner = AutoTuner.get()
         _, best_tactic = tuner.choose_one(
