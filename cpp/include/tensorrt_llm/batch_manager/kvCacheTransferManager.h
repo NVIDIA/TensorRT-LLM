@@ -89,6 +89,22 @@ public:
     void loadFromFile(BlockPtr const& dstPrimaryBlock, SizeType32 diskSlot, std::vector<KVCacheBlockPool> const& pools,
         std::string const& directory);
 
+    //! \brief Disk tier (unstaged async): spill a host block's bytes by handing the writer the source
+    //! pointers directly (no staging memcpy). The caller MUST keep the source host slot pinned until
+    //! \p spillId appears in drainCompletedSpills().
+    void spillToFileUnstaged(BlockPtr const& srcHostBlock, SizeType32 diskSlot,
+        std::vector<KVCacheBlockPool> const& pools, std::string const& directory, std::uint64_t spillId);
+
+    //! \brief Disk tier: return + clear the set of spill ids whose async writes fully completed since
+    //! the last call (unstaged path). The block manager reaps the corresponding pinned blocks.
+    [[nodiscard]] std::vector<std::uint64_t> drainCompletedSpills();
+
+    //! \brief Whether the background async-store writer thread is active (TLLM_KV_DISK_ASYNC_STORE).
+    [[nodiscard]] bool asyncDiskStoreEnabled() const
+    {
+        return mAsyncDiskStore;
+    }
+
     void syncTransfers();
 
     ~KVCacheTransferManager();
@@ -152,7 +168,9 @@ private:
     {
         std::string filename;
         std::size_t bytes{0};
-        std::vector<std::uint8_t> staged;
+        std::vector<std::uint8_t> staged; // staged-memcpy path (used when src == nullptr)
+        void const* src{nullptr};         // unstaged path: writer reads this pinned host pointer directly
+        std::uint64_t spillId{0};         // >0 => track per-spill completion for the reserved-pool reap
     };
 
     std::thread mDiskWriter;
@@ -161,6 +179,10 @@ private:
     std::condition_variable mDiskInflightCv;
     std::queue<DiskWriteJob> mDiskWriteQueue;
     std::unordered_map<std::string, int> mDiskInflight;
+    // Unstaged reserved-pool support: outstanding pool-writes per spill; when a spill's last write
+    // completes, publish its id so the block manager can reap the pinned source block.
+    std::unordered_map<std::uint64_t, int> mSpillRemaining;
+    std::vector<std::uint64_t> mCompletedSpills;
     bool mDiskWriterStop{false};
     std::size_t const mDiskWriteQueueMax{[]
         {
@@ -170,6 +192,7 @@ private:
 
     void diskWriterLoop();
     void enqueueDiskWrite(std::string filename, void const* src, std::size_t bytes);
+    void enqueueDiskWriteUnstaged(std::string filename, void const* src, std::size_t bytes, std::uint64_t spillId);
     void waitForDiskSlotWrites(std::string const& filename);
 
     // Cumulative transfer statistics, reset on each call to getAndResetTransferStats().

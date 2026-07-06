@@ -1483,6 +1483,15 @@ private:
     std::priority_queue<DiskDeadline, std::vector<DiskDeadline>, std::greater<DiskDeadline>> mDiskDeadlines;
     std::uint64_t mDiskSpillSeq{0};
 
+    // ---- Unstaged async store: reserved host-block pool (env TLLM_KV_DISK_RESERVED_BLOCKS, 0 = off) ----
+    // Target set from the environment in allocatePools. A spill hands out a reserved free host slot
+    // immediately and pins the victim's old slot until its async write drains, avoiding the staging
+    // memcpy on the scheduler thread. Reaped (drained) victim slots rejoin the pool: one out, one in.
+    SizeType32 mReservedHostBlockTarget{0};
+    std::vector<BlockPtr> mReservedHostBlocks;
+    std::unordered_map<std::uint64_t, BlockPtr> mPendingSpillBlocks;
+    std::uint64_t mUnstagedSpillSeq{0};
+
     //! \brief Pick and claim the disk block to overwrite: empty slots first, then
     //! unmarked content, then the retained block with the earliest deadline.
     [[nodiscard]] BlockPtr claimDiskTarget();

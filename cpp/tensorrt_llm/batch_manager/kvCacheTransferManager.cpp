@@ -442,10 +442,12 @@ void KVCacheTransferManager::diskWriterLoop()
         mDiskQueueCv.notify_all(); // a producer may be blocked waiting for queue space
 
         // The slow, writeback-throttle-prone part runs HERE, off the scheduler thread.
+        // Unstaged jobs (src != nullptr) read the pinned host slot directly; staged jobs read the copy.
+        void const* data = job.src ? job.src : static_cast<void const*>(job.staged.data());
         int fd = ::open(job.filename.c_str(), O_CREAT | O_WRONLY, 0644);
         if (fd >= 0)
         {
-            auto const written = ::pwrite(fd, job.staged.data(), job.bytes, 0);
+            auto const written = ::pwrite(fd, data, job.bytes, 0);
             ::close(fd);
             if (written != static_cast<ssize_t>(job.bytes))
             {
@@ -463,6 +465,16 @@ void KVCacheTransferManager::diskWriterLoop()
             if (auto it = mDiskInflight.find(job.filename); it != mDiskInflight.end() && --it->second <= 0)
             {
                 mDiskInflight.erase(it);
+            }
+            // Unstaged path: when a spill's last pool-write finishes, its source host slot is safe to
+            // reuse -> publish the spill id for the block manager to reap.
+            if (job.spillId != 0)
+            {
+                if (auto sit = mSpillRemaining.find(job.spillId); sit != mSpillRemaining.end() && --sit->second <= 0)
+                {
+                    mSpillRemaining.erase(sit);
+                    mCompletedSpills.push_back(job.spillId);
+                }
             }
         }
         mDiskQueueCv.notify_all();    // wake a producer waiting to re-write this slot
@@ -497,6 +509,43 @@ void KVCacheTransferManager::enqueueDiskWrite(std::string filename, void const* 
         mDiskWriteQueue.push(std::move(job));
     }
     mDiskQueueCv.notify_one();
+}
+
+void KVCacheTransferManager::enqueueDiskWriteUnstaged(
+    std::string filename, void const* src, std::size_t bytes, std::uint64_t spillId)
+{
+    DiskWriteJob job;
+    job.filename = std::move(filename);
+    job.bytes = bytes;
+    job.src = src; // no staging: the writer reads the pinned host slot directly
+    job.spillId = spillId;
+
+    {
+        std::unique_lock<std::mutex> lock(mDiskMutex);
+        // Same backpressure + per-slot serialization as enqueueDiskWrite.
+        mDiskQueueCv.wait(lock,
+            [this, &job]
+            {
+                return (mDiskWriteQueue.size() < mDiskWriteQueueMax
+                           && mDiskInflight.find(job.filename) == mDiskInflight.end())
+                    || mDiskWriterStop;
+            });
+        if (mDiskWriterStop)
+        {
+            return;
+        }
+        ++mDiskInflight[job.filename]; // mark BEFORE the block becomes loadable
+        mDiskWriteQueue.push(std::move(job));
+    }
+    mDiskQueueCv.notify_one();
+}
+
+std::vector<std::uint64_t> KVCacheTransferManager::drainCompletedSpills()
+{
+    std::lock_guard<std::mutex> lock(mDiskMutex);
+    std::vector<std::uint64_t> out;
+    out.swap(mCompletedSpills);
+    return out;
 }
 
 void KVCacheTransferManager::waitForDiskSlotWrites(std::string const& filename)
@@ -540,6 +589,36 @@ void KVCacheTransferManager::spillToFile(BlockPtr const& srcHostBlock, SizeType3
         }
         // Async path: copy bytes out (frees the slot immediately) and hand to the writer.
         enqueueDiskWrite(filename, ptr->data(), bytes);
+    }
+}
+
+void KVCacheTransferManager::spillToFileUnstaged(BlockPtr const& srcHostBlock, SizeType32 diskSlot,
+    std::vector<KVCacheBlockPool> const& pools, std::string const& directory, std::uint64_t spillId)
+{
+    TLLM_CHECK_WITH_INFO(!directory.empty(), "disk tier requires a directory");
+    TLLM_CHECK_WITH_INFO(mAsyncDiskStore, "spillToFileUnstaged requires the async writer");
+    // Same event discipline as spillToFile: the victim's bytes may still be the target of an in-flight
+    // GPU->host copy; block until it lands before the writer reads host memory.
+    auto const idx = getPendingTransferIndex(srcHostBlock);
+    if (auto it = mPendingWrites.find(idx); it != mPendingWrites.end())
+    {
+        it->second.synchronize();
+    }
+    // Register the whole slot's write count up-front, so an early single-pool completion cannot publish
+    // the spill before the remaining pools are enqueued.
+    {
+        std::lock_guard<std::mutex> lock(mDiskMutex);
+        mSpillRemaining[spillId] = static_cast<int>(pools.size());
+    }
+    for (size_t poolIdx = 0; poolIdx < pools.size(); ++poolIdx)
+    {
+        TLLM_CHECK_WITH_INFO(!pools[poolIdx].layerFirstLayout, "disk tier does not support layer-first layout pools");
+        auto ptr = computeBlockPointer(srcHostBlock, pools, poolIdx);
+        auto const filename = diskSlotFilename(directory, diskSlot, poolIdx);
+        auto const bytes = static_cast<std::size_t>(ptr->getSizeInBytes());
+        // The pool buffer outlives the manager, so this raw pointer stays valid after `ptr` (a view)
+        // is destroyed -- the writer reads it later off-thread.
+        enqueueDiskWriteUnstaged(filename, ptr->data(), bytes, spillId);
     }
 }
 

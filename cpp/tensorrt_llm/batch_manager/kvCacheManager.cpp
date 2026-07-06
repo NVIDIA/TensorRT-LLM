@@ -1201,6 +1201,31 @@ void WindowBlockManager::allocatePools(bool useUvm)
             pool.secondaryPtr = BufferManager::pinned(cacheShapeOffload, poolDtype);
         }
     }
+
+    // Disk-tier unstaged async store (env TLLM_KV_DISK_RESERVED_BLOCKS, 0 = off): carve a reserved pool
+    // of host blocks up-front so a spill can hand out a free host slot immediately while the victim's
+    // old slot is still draining to disk, avoiding the staging memcpy on the scheduler thread. Only
+    // meaningful with an active disk tier + async writer; capped below the host pool so the normal host
+    // cache is never starved. Reaped (drained) victim slots rejoin the pool: one out, one in.
+    if (auto const* e = std::getenv("TLLM_KV_DISK_RESERVED_BLOCKS"))
+    {
+        mReservedHostBlockTarget = static_cast<SizeType32>(std::stoi(e));
+    }
+    if (mNumDiskBlocks > 0 && mReservedHostBlockTarget > 0 && mNumSecondaryBlocks > 0
+        && mTransferManager->asyncDiskStoreEnabled())
+    {
+        auto const avail = mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel);
+        SizeType32 const want = std::min<SizeType32>(mReservedHostBlockTarget, std::max(0, avail - 16));
+        for (SizeType32 i = 0; i < want; ++i)
+        {
+            auto blk = std::get<0>(mEvictionPolicy->getFreeBlock(kSecondaryLevel));
+            mEvictionPolicy->claimBlock(blk);
+            mReservedHostBlocks.push_back(blk);
+        }
+        TLLM_LOG_INFO(
+            "[disk-tier] unstaged reserved host-block pool: reserved=%zu (requested=%d, avail=%d, windowSize=%d)",
+            mReservedHostBlocks.size(), mReservedHostBlockTarget, avail, mWindowSize);
+    }
 }
 
 void BlockManager::releasePools()
@@ -1342,6 +1367,19 @@ BlockPtr WindowBlockManager::claimDiskTarget()
 
 BlockPtr WindowBlockManager::reclaimSecondaryBlock()
 {
+    // Reap completed unstaged spills first: their pinned host slots are safe again, so the drained
+    // victim blocks rejoin the reserved pool (one out, one in).
+    if (mReservedHostBlockTarget > 0)
+    {
+        for (auto const spillId : mTransferManager->drainCompletedSpills())
+        {
+            if (auto it = mPendingSpillBlocks.find(spillId); it != mPendingSpillBlocks.end())
+            {
+                mReservedHostBlocks.push_back(it->second);
+                mPendingSpillBlocks.erase(it);
+            }
+        }
+    }
     auto victim = std::get<0>(mEvictionPolicy->getFreeBlock(kSecondaryLevel));
     mEvictionPolicy->claimBlock(victim);
     if (mNumDiskBlocks == 0 || victim->getUniqueTokens().empty() || mEvictionPolicy->getNumFreeBlocks(kDiskLevel) == 0)
@@ -1369,7 +1407,21 @@ BlockPtr WindowBlockManager::reclaimSecondaryBlock()
         }
         return victim;
     }
-    mTransferManager->spillToFile(victim, diskTarget->getDiskSlot(), mPools, mDiskCachePath);
+    bool const useUnstaged = !mReservedHostBlocks.empty() && mTransferManager->asyncDiskStoreEnabled();
+    SizeType32 const diskSlot = diskTarget->getDiskSlot();
+    std::uint64_t unstagedSpillId = 0;
+    if (useUnstaged)
+    {
+        // Unstaged: the writer reads the victim's host memory directly (no staging memcpy). That slot
+        // must stay pinned until the write drains -- after the swap it is owned by diskTarget, which we
+        // hold below (instead of returning it) so nobody can reuse the slot mid-write.
+        unstagedSpillId = ++mUnstagedSpillSeq;
+        mTransferManager->spillToFileUnstaged(victim, diskSlot, mPools, mDiskCachePath, unstagedSpillId);
+    }
+    else
+    {
+        mTransferManager->spillToFile(victim, diskSlot, mPools, mDiskCachePath);
+    }
     victim->swapDiskResidency(diskTarget); // victim's identity now disk-resident, tree intact
     victim->setDurationMs(std::nullopt);   // keep it out of upstream's expiring-block machinery
     if (victim->isRetainedNow())
@@ -1391,6 +1443,25 @@ BlockPtr WindowBlockManager::reclaimSecondaryBlock()
     if (mDiskSpills == 1 || mDiskSpills % 1000 == 0)
     {
         TLLM_LOG_INFO("[disk-tier] spills=%zu (windowSize=%d)", mDiskSpills, mWindowSize);
+    }
+    if (useUnstaged)
+    {
+        // diskTarget now owns the victim's old host slot, which the writer is still reading. It will
+        // NOT flow through getFreeBlock's cleanup (we return a reserved block instead), so evict any
+        // displaced disk-block identity it still carries HERE, then pin it until the write drains.
+        {
+            std::lock_guard<std::recursive_mutex> treeLock(mLookupTree->getMutex());
+            if (mEventManager && blockInRadixTree(diskTarget))
+            {
+                mEventManager->enqueueRemovedEvent(diskTarget, mWindowSize);
+            }
+            diskTarget->detachFromLookupNode();
+        }
+        diskTarget->clearRetention();
+        mPendingSpillBlocks[unstagedSpillId] = diskTarget; // pinned: keeps the host slot out of every free list
+        auto reserved = mReservedHostBlocks.back();        // clean, claimed, secondary host block
+        mReservedHostBlocks.pop_back();
+        return reserved;
     }
     diskTarget->clearRetention();
     return diskTarget; // owns the victim's old host slot; already claimed
