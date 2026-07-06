@@ -52,7 +52,7 @@ TllmGenFmhaRunner::TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeK, Data_ty
             || mDtypeV == DATA_TYPE_BF16,
         "Unsupported V data type");
     TLLM_CHECK_WITH_INFO(mDtypeOut == DATA_TYPE_E2M1 || mDtypeOut == DATA_TYPE_E4M3 || mDtypeOut == DATA_TYPE_FP16
-            || mDtypeOut == DATA_TYPE_BF16,
+            || mDtypeOut == DATA_TYPE_BF16 || mDtypeOut == DATA_TYPE_MXE4M3,
         "Unsupported Output data type");
     auto const [freeMemory, totalMemory] = tensorrt_llm::common::getDeviceMemoryInfo(false);
     mTotalDeviceMemory = totalMemory;

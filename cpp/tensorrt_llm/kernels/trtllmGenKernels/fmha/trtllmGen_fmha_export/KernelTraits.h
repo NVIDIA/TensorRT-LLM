@@ -57,12 +57,43 @@ inline int32_t getPaddedHeadDimForSmem(int32_t headDim) {
 // Whether the kernel uses the opt-in K-only BF16Q+FP8KV transform pipeline.
 template <typename FmhaOptions_>
 inline bool usesKOnlyTransformPipeline(FmhaOptions_ const& options) {
-  bool const isSupportedHeadDim = options.mHeadDimQk == options.mHeadDimV &&
-                                  (options.mHeadDimQk == 64 || options.mHeadDimQk == 128);
+  bool const isSupportedHeadDim =
+    options.mHeadDimQk == options.mHeadDimV &&
+    (options.mHeadDimQk == 64 || options.mHeadDimQk == 128 || options.mHeadDimQk == 256);
   return options.mEnablesBf16QFp8KvKOnlyTransform && !isContextKernel(options.mFmhaKernelType) &&
          !options.mIsMlaGen && options.mDtypeQ != options.mDtypeK && isSupportedHeadDim &&
          options.mDtypeQ == tg::Dtype::Bfloat16 && options.mDtypeK == tg::Dtype::E4m3 &&
          options.mDtypeV == tg::Dtype::E4m3 && tg::isArchBlackwell(options.mCudaArch);
+}
+
+// Whether the kernel is a Blackwell BF16Q+FP8KV generation kernel.
+template <typename FmhaOptions_> inline bool isBf16QFp8KvGeneration(FmhaOptions_ const& options) {
+  return !isContextKernel(options.mFmhaKernelType) && options.mDtypeQ == tg::Dtype::Bfloat16 &&
+         options.mDtypeK == tg::Dtype::E4m3 && options.mDtypeV == tg::Dtype::E4m3 &&
+         tg::isArchBlackwell(options.mCudaArch);
+}
+
+// Whether the kernel uses the full BF16Q+FP8KV transform pipeline.
+template <typename FmhaOptions_>
+inline bool isBf16QFp8KvFullTransformGeneration(FmhaOptions_ const& options) {
+  return isBf16QFp8KvGeneration(options) && !usesKOnlyTransformPipeline(options);
+}
+
+// Whether internal builds should use the E4M3->BF16 placeholder plus SASS patch.
+template <typename FmhaOptions_>
+inline bool usesE4m3ToBfloat16SassPatch(FmhaOptions_ const& options) {
+  return tg::isArchBlackwell(options.mCudaArch) && options.mDtypeQ == tg::Dtype::Bfloat16 &&
+         options.mDtypeK == tg::Dtype::E4m3;
+}
+
+// Whether separate transformed K/V resources are supported for this kernel.
+template <typename FmhaOptions_>
+inline bool supportsSeparateTransformedKv(FmhaOptions_ const& options) {
+  bool const isSupportedHeadDim =
+    options.mHeadDimQk == options.mHeadDimV &&
+    (options.mHeadDimQk == 64 || options.mHeadDimQk == 128 || options.mHeadDimQk == 256);
+  return isBf16QFp8KvFullTransformGeneration(options) && !options.mIsMlaGen &&
+         options.mNumInstsQ == 1 && options.mNumInstsKv == 1 && isSupportedHeadDim;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -564,8 +595,11 @@ struct MmaTraits {
     mAtomPvM = options.mSwapsMmaAb ? std::min(128, paddedHeadDimV) : options.mTileSizeQ;
     // Keep BMM2's MMA width on the logical V width when keep-AB is used. SMEM can still be padded
     // independently through mPaddedHeadDimV for shared K/V storage alignment.
-    auto headDimPvN = options.mHeadDimPerStageKv != 0 ? headDimPerStageKv * options.mClusterDimX
-                                                      : options.mHeadDimV;
+    // headDimPerStageKv is the SMEM/TMEM staging width (e.g. 128 for Blackwell context MLA) and
+    // may exceed headDimV (e.g. Mistral 128/64). BMM2-N must stay on the logical V width.
+    auto headDimPvN = options.mHeadDimPerStageKv != 0
+                        ? std::min(headDimPerStageKv, options.mHeadDimV) * options.mClusterDimX
+                        : options.mHeadDimV;
     // AtomPvN is limited to 256 (UTCMMA-N).
     mAtomPvN = options.mSwapsMmaAb ? options.mTileSizeQ : std::min(headDimPvN, 256);
 
@@ -807,6 +841,15 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
 
     // The number of transform stages for SmemTransformedKv.
     mNumSmemTransformStages = 2;
+    if (isBf16QFp8KvGeneration(options)) {
+      // BF16Q+FP8KV transform kernels use one conversion chunk so the SMEM budget goes to raw KV
+      // stages that overlap the E4M3->BF16 conversion.
+      mNumSmemTransformStages = 1;
+    }
+    if (options.mSeparateTransformedKv) {
+      // Separate transformed K/V is about producer/consumer ordering, not deeper buffering.
+      mNumStagesTransformedKv = 1;
+    }
 
     // Note: mInterleaveSfV and mUsesSharedPagedKvIdx are inherited from KernelConfigBase.
 

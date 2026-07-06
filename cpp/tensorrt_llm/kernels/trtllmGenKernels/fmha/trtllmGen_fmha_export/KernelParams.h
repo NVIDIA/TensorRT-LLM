@@ -347,9 +347,10 @@ template <class FmhaOptions> static auto makeStrideKv(FmhaOptions const& options
       strideKeysVals = hiddenDimQkv;
     } else if (isContiguousKv(options.mQkvLayout)) {
       strideKeysVals = paddedHeadDimKv;
-    } else if (isSeparateQkv(options.mQkvLayout) && !isK && options.mHeadDimQk == 192 &&
+    } else if (isSeparateQkv(options.mQkvLayout) && !isK &&
+               options.mHeadDimQk != options.mHeadDimV &&
                options.mDtypeKv != tg::Dtype::E4m3) {
-      // Non-FP8 context MLA: tensor V is not contiguous.
+      // Non-FP8 context MLA (DeepSeek 192/128, Mistral 128/64, ...): V is not head-contiguous.
       strideKeysVals = options.mNumHeadsKv * (options.mHeadDimQk - 64 + options.mHeadDimV);
     }
 

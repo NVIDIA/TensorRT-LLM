@@ -513,6 +513,8 @@ template <> inline std::string toString(MmaOrder e) {
   X(bool, mFuseEpilogueIntoCorr, true, bool)                                                       \
   /* Whether to transform K/V in the correction task. */                                           \
   X(bool, mFuseTransformKvIntoCorr, true, bool)                                                    \
+  /* Whether to allocate separate transformed-K/V resources with independent pipelines. */         \
+  X(bool, mSeparateTransformedKv, false, bool)                                                     \
   /* Whether to group the headsQ into one CTA. */                                                  \
   X(bool, mGroupsHeadsQ, false, bool)                                                              \
   /* Whether to group both tokensQ and headsQ into one CTA. */                                     \
