@@ -497,6 +497,14 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         bf16 path (``lm_head`` is also force-excluded from quantization in
         ``_normalize_qwen35_exclude_modules``).
         """
+        # When the quantized LMHead path is enabled, the normalizer keeps an
+        # NVFP4 "lm_head" entry in quant_config_dict and the module is built
+        # quantized -- the NVFP4 Linear loads the packed weight + scales
+        # directly, so skip the dequant.
+        qcd = getattr(self.config, "quant_config_dict", None) or {}
+        if "lm_head" in qcd:
+            return weights
+
         weight = weights.get("lm_head.weight")
         block_scale = weights.get("lm_head.weight_scale")
         global_scale = weights.get("lm_head.weight_scale_2")

@@ -21,6 +21,7 @@ import torch
 from transformers import PretrainedConfig
 
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization import QuantAlgo
 
 from ...inputs import (
@@ -387,7 +388,42 @@ def _normalize_qwen35_moe_vl_config(model_config) -> None:
     _normalize_qwen35_vl_config(model_config, inner_arch="Qwen3_5MoeForCausalLM")
 
 
-def _normalize_qwen35_exclude_modules(model_config):
+def _lm_head_nvfp4_enabled(model_config):
+    """Whether the checkpoint's quantized lm_head should stay quantized.
+
+    ModelOpt MIXED_PRECISION exports for Qwen3.5/3.6 quantize lm_head to
+    W4A16_NVFP4 (packed FP4 weight + per-group FP8 scales).  On SM100/103 the
+    NVFP4 (W4A4) Linear path can consume it directly, cutting the lm_head
+    GEMM's weight traffic 4x vs the bf16 dequant fallback -- the decode
+    lm_head is purely weight-bandwidth-bound.  Conditions mirror what the
+    quantized LMHead supports (see LMHead.__init__ guards) plus the paths
+    that bypass the Linear machinery entirely:
+
+    - tie_word_embeddings shares the weight with the embedding lookup, which
+      needs a dense bf16 weight;
+    - ADP builds a TP-less LMHead (or slices the raw weight for the
+      spec-decoding head), assuming bf16;
+    - COLUMN TP pads the vocab shard when it doesn't divide evenly, which the
+      quantized path does not support (vocab 248320 divides all common tp).
+
+    Must be evaluated BEFORE _normalize_qwen35_quant_config_dict runs (it
+    promotes the entry to NVFP4 or drops it).
+    """
+    qcd = getattr(model_config, "quant_config_dict", None) or {}
+    cfg = qcd.get("lm_head")
+    pretrained = model_config.pretrained_config
+    mapping = model_config.mapping
+    return (
+        cfg is not None
+        and cfg.quant_algo == QuantAlgo.W4A16_NVFP4
+        and get_sm_version() in (100, 103)
+        and not getattr(pretrained, "tie_word_embeddings", False)
+        and not mapping.enable_attention_dp
+        and getattr(pretrained, "vocab_size", 0) % mapping.tp_size == 0
+    )
+
+
+def _normalize_qwen35_exclude_modules(model_config, keep_lm_head_quant=False):
     """Normalize NVFP4/FP8 exclude_modules from HF naming to TRT-LLM naming.
 
     hf_quant_config.json stores exclude patterns in HF checkpoint namespace
@@ -396,6 +432,9 @@ def _normalize_qwen35_exclude_modules(model_config):
     map the MTP layer to ``model.layers.<num_hidden_layers>.*``.  This
     function translates the patterns so that
     ``apply_quant_config_exclude_modules`` can match them.
+
+    ``keep_lm_head_quant`` (see _lm_head_nvfp4_enabled) skips the lm_head
+    force-exclusion so the quantized LMHead path can engage.
     """
     qc = model_config.quant_config
     if qc is None or qc.exclude_modules is None:
@@ -430,15 +469,18 @@ def _normalize_qwen35_exclude_modules(model_config):
     # but conv1d is not a proper linear module and should be excluded from quant
     normalized.add("*linear_attn.conv1d")
 
-    # TRT-LLM's LMHead always allocates an unquantized (bf16) weight, so a
-    # quantized lm_head (e.g. NVFP4 in some ModelOpt MIXED_PRECISION exports)
-    # must be excluded from quant; the weight mapper dequantizes it to bf16.
-    normalized.add("lm_head")
+    # By default LMHead allocates an unquantized (bf16) weight, so a quantized
+    # lm_head (e.g. NVFP4 in some ModelOpt MIXED_PRECISION exports) must be
+    # excluded from quant and the weight mapper dequantizes it to bf16.  When
+    # the quantized LMHead path is enabled (_lm_head_nvfp4_enabled), lm_head
+    # must NOT be excluded so DecoderModelForCausalLM builds it quantized.
+    if not keep_lm_head_quant:
+        normalized.add("lm_head")
 
     qc.exclude_modules = sorted(normalized)
 
 
-def _normalize_qwen35_quant_config_dict(model_config):
+def _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=False):
     """Normalize MIXED_PRECISION per-layer quant config keys from HF naming.
 
     ModelOpt MIXED_PRECISION checkpoints key ``quant_config_dict`` by HF names
@@ -465,6 +507,11 @@ def _normalize_qwen35_quant_config_dict(model_config):
     built FP8; the weight mapper then requantizes the split weights onto one
     shared scale (_requantize_linear_attn_fp8_qkvz).  Incomplete or non-FP8
     sets get no fused entry, and the mapper dequantizes them to bf16 instead.
+
+    The ``lm_head`` entry is promoted W4A16_NVFP4 -> NVFP4 when
+    ``keep_lm_head_quant`` (see _lm_head_nvfp4_enabled) and dropped otherwise:
+    a leftover entry would make DecoderModelForCausalLM build a quantized
+    LMHead whose weights the mapper had already dequantized to bf16.
     """
     qcd = getattr(model_config, "quant_config_dict", None)
     if not qcd:
@@ -479,6 +526,20 @@ def _normalize_qwen35_quant_config_dict(model_config):
         if name.startswith(_LANG_PREFIX):
             name = "model." + name[len(_LANG_PREFIX) :]
         if name.startswith("model.visual"):
+            continue
+        if name == "lm_head":
+            if keep_lm_head_quant:
+                normalized[name] = cfg.model_copy(update={"quant_algo": QuantAlgo.NVFP4})
+            else:
+                # Make the fallback visible: the checkpoint quantizes lm_head
+                # but this configuration can't keep it quantized (see
+                # _lm_head_nvfp4_enabled), so it dequantizes to bf16 at load.
+                logger.info(
+                    f"lm_head quant entry ({cfg.quant_algo}) dropped: "
+                    "unsupported configuration for quantized LMHead "
+                    "(requires SM100/103, untied embeddings, no attention-DP, "
+                    "vocab divisible by tp_size); lm_head runs bf16"
+                )
             continue
         from_mtp = name.startswith("mtp.")
         if from_mtp:
@@ -555,8 +616,9 @@ class Qwen3_5MoeForCausalLM(Qwen3NextForCausalLM):
     """
 
     def __init__(self, model_config):
-        _normalize_qwen35_exclude_modules(model_config)
-        _normalize_qwen35_quant_config_dict(model_config)
+        keep_lm_head_quant = _lm_head_nvfp4_enabled(model_config)
+        _normalize_qwen35_exclude_modules(model_config, keep_lm_head_quant=keep_lm_head_quant)
+        _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=keep_lm_head_quant)
         super().__init__(model_config)
 
 
@@ -571,8 +633,9 @@ class Qwen3_5ForCausalLM(Qwen3NextForCausalLM):
     """
 
     def __init__(self, model_config):
-        _normalize_qwen35_exclude_modules(model_config)
-        _normalize_qwen35_quant_config_dict(model_config)
+        keep_lm_head_quant = _lm_head_nvfp4_enabled(model_config)
+        _normalize_qwen35_exclude_modules(model_config, keep_lm_head_quant=keep_lm_head_quant)
+        _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=keep_lm_head_quant)
         super().__init__(model_config)
 
 
