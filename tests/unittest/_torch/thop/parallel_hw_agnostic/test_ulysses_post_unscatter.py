@@ -77,6 +77,47 @@ def test_ulysses_post_unscatter_exact_match(P, B, Sp, H, D, layout):
         assert max_diff == 0, f"{name}: max_diff={max_diff} (expected exact match)"
 
 
+@pytest.mark.parametrize("layout", [0, 1], ids=["HND", "NHD"])
+@pytest.mark.parametrize(
+    "P,B,D,Sp_q,H_q,Sp_kv,H_kv",
+    [
+        # v2a cross-attn (ulysses=4): Q=audio, K/V=video — different seq, same heads (MHA).
+        (4, 2, 128, 256, 8, 1024, 8),
+        (4, 2, 64, 128, 8, 512, 8),
+        # GQA-like: Q vs K/V differ in BOTH seq and heads-per-rank.
+        (4, 2, 128, 256, 8, 1024, 4),
+        (2, 1, 128, 128, 16, 384, 8),
+    ],
+    ids=["mha_seqdiff", "mha_seqdiff_d64", "gqa_seq+head", "gqa_small"],
+)
+@torch.inference_mode()
+def test_ulysses_post_unscatter_cross_attn_varshape(P, B, D, Sp_q, H_q, Sp_kv, H_kv, layout):
+    """Cross-attn (v2a): Q (audio) and K/V (video) have different (Sp, H), so the op
+    can't fuse them into one launch — it launches per-tensor with each tensor's own
+    (Sp, H). Output must still match the eager per-tensor permute exactly (max_diff == 0)
+    and carry per-tensor shapes. K/V share shape (both video); Q differs."""
+    is_hnd = layout == 0
+    torch.manual_seed(0)
+    q = torch.randn(P, B, Sp_q, H_q, D, device="cuda", dtype=torch.bfloat16).contiguous()
+    k = torch.randn(P, B, Sp_kv, H_kv, D, device="cuda", dtype=torch.bfloat16).contiguous()
+    v = torch.randn(P, B, Sp_kv, H_kv, D, device="cuda", dtype=torch.bfloat16).contiguous()
+
+    q_ref, k_ref, v_ref = torch_ref(q, k, v, is_hnd=is_hnd)
+    q_out, k_out, v_out = torch.ops.trtllm.ulysses_post_unscatter_qkv(q, k, v, layout)
+
+    exp_q = (B, H_q, P * Sp_q, D) if is_hnd else (B, P * Sp_q, H_q, D)
+    exp_kv = (B, H_kv, P * Sp_kv, D) if is_hnd else (B, P * Sp_kv, H_kv, D)
+    assert q_out.shape == exp_q, f"Q shape {q_out.shape} != {exp_q}"
+    assert k_out.shape == exp_kv and v_out.shape == exp_kv
+    if is_hnd:
+        assert not q_out.is_contiguous() and not k_out.is_contiguous() and not v_out.is_contiguous()
+    else:
+        assert q_out.is_contiguous() and k_out.is_contiguous() and v_out.is_contiguous()
+    for name, ref, got in [("Q", q_ref, q_out), ("K", k_ref, k_out), ("V", v_ref, v_out)]:
+        max_diff = (ref - got).abs().max().item()
+        assert max_diff == 0, f"{name}: max_diff={max_diff} (expected exact match)"
+
+
 @torch.inference_mode()
 def test_ulysses_post_unscatter_rejects_invalid_layout():
     """layout must be 0 (HND) or 1 (NHD)."""

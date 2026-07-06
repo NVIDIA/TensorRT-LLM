@@ -45,6 +45,11 @@ TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
 _DEEPSEEK_V4_ARCHITECTURES = {"DeepseekV4ForCausalLM"}
 _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT = "layers.0.ffn.experts.0.w1.weight"
 
+_MINIMAX_M3_ARCHITECTURES = {
+    "MiniMaxM3SparseForCausalLM",
+    "MiniMaxM3SparseForConditionalGeneration",
+}
+
 
 def _unified_kv_pool_includes_mamba(
         is_disagg: bool, spec_config: Optional['SpeculativeConfig']) -> bool:
@@ -676,6 +681,81 @@ class ModelConfig(Generic[TConfig]):
         return layer_quant_config
 
     @staticmethod
+    def _set_minimax_m3_layer_quant_config(pretrained_config,
+                                           layer_quant_config):
+        """Normalize the Minimax M3 MIXED_PRECISION per-layer quant config.
+
+        Two fix-ups are applied:
+
+        1. Strip the ``language_model.`` prefix from every per-layer key.
+           The M3 VL checkpoint stores keys like
+           ``language_model.model.layers.0.self_attn.o_proj -> MXFP8`` in
+           ``hf_quant_config.json``, but the TRT-LLM module tree names the text
+           decoder ``model.layers.0.self_attn.o_proj`` (no ``language_model.``
+           prefix -- the loader strips it). ``apply_layerwise_quant_config``
+           matches *standalone* Linears (e.g. ``o_proj``, ``down_proj``) with an
+           **exact** ``name == key`` comparison, so the prefixed keys never match
+           and those layers silently fall back to the global ``MIXED_PRECISION``
+           config -> loaded unquantized (MXFP8 ``weight_scale`` dropped) -> the
+           attention/MLP output magnitude explodes. Stripping the prefix makes
+           the exact match succeed. (Fused qkv/gate_up Linears and the Attention
+           wrapper use substring matches and happened to work regardless.)
+
+        2. Inject a single coarse ``model.layers.N.block_sparse_moe.experts``
+           entry per MoE layer so ``MiniMaxM3MoE._get_experts_quant_config`` can
+           select the NVFP4 backend for the routed experts (the fine-grained
+           per-linear NVFP4 expert keys can't be used directly).
+
+        Does nothing when there is no per-layer config (e.g. the uniform MXFP8
+        or a BF16 checkpoint).
+        """
+        from tensorrt_llm.models.modeling_utils import QuantAlgo
+        if layer_quant_config is None:
+            return layer_quant_config
+
+        # (1) Strip the ``language_model.`` prefix so exact-match per-layer
+        # quant assignment works for standalone base Linears.
+        _LM_PREFIX = "language_model."
+        layer_quant_config = {
+            (k[len(_LM_PREFIX):] if k.startswith(_LM_PREFIX) else k): v
+            for k, v in layer_quant_config.items()
+        }
+
+        # (2) Inject coarse NVFP4 expert entries (only when routed experts are
+        # NVFP4).
+        has_nvfp4_experts = any(
+            "block_sparse_moe.experts" in k and isinstance(v, QuantConfig)
+            and v.quant_algo == QuantAlgo.NVFP4
+            for k, v in layer_quant_config.items())
+        if not has_nvfp4_experts:
+            return layer_quant_config
+
+        experts_quant_config = QuantConfig()
+        experts_quant_config.quant_algo = QuantAlgo.NVFP4
+        # TODO: remove the hardcoded group_size and read it from the per-linear
+        # NVFP4 expert entries in hf_quant_config.json instead. 16 is correct
+        # for standard NVFP4 today, but this is a latent bug if a checkpoint
+        # ever ships a different group size.
+        experts_quant_config.group_size = 16
+
+        text_config = getattr(pretrained_config, "text_config",
+                              pretrained_config)
+        if isinstance(text_config, dict):
+            moe_layer_freq = text_config.get("moe_layer_freq", [])
+        else:
+            moe_layer_freq = getattr(text_config, "moe_layer_freq", [])
+
+        for layer_idx, freq in enumerate(moe_layer_freq):
+            if int(freq) != 0:
+                layer_quant_config[
+                    f"model.layers.{layer_idx}.block_sparse_moe.experts"] = experts_quant_config
+
+        logger.info(
+            "Detected Minimax M3 NVFP4 routed MoE checkpoint; using NVFP4 "
+            "for routed experts.")
+        return layer_quant_config
+
+    @staticmethod
     def load_quant_config_from_dtypes_json(dtypes_json_file, moe_backend: str):
         quant_config = QuantConfig()
         layer_quant_config = None
@@ -738,7 +818,16 @@ class ModelConfig(Generic[TConfig]):
             if sparse_attention_config:
                 index_n_heads = sparse_attention_config.index_n_heads or pretrained_config.index_n_heads
                 index_head_dim = sparse_attention_config.index_head_dim or pretrained_config.index_head_dim
-                index_topk = sparse_attention_config.index_topk or pretrained_config.index_topk
+                # index_topk needs an explicit-set check rather than `or`: the
+                # DeepSeekV4SparseAttentionConfig default (512) is truthy, so a
+                # plain `or` shadows the checkpoint's index_topk (e.g. Pro's
+                # 1024) whenever the user did not set it. Mirror the window_size
+                # handling below and consult model_fields_set. (index_n_heads /
+                # index_head_dim stay on `or` since their defaults are None.)
+                if 'index_topk' in sparse_attention_config.model_fields_set:
+                    index_topk = sparse_attention_config.index_topk
+                else:
+                    index_topk = pretrained_config.index_topk
                 indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
                 skip_indexer_for_short_seqs = sparse_attention_config.skip_indexer_for_short_seqs
                 # Pass-through DSA tuning flags so user-set values survive the
@@ -759,13 +848,15 @@ class ModelConfig(Generic[TConfig]):
                 index_topk = pretrained_config.index_topk
                 indexer_max_chunk_size = None
                 skip_indexer_for_short_seqs = True
-                # Defaults match DeepSeekSparseAttentionConfig field defaults.
+                # Defaults match DeepSeekV4SparseAttentionConfig field defaults.
                 use_cute_dsl_topk = False
                 use_cute_dsl_paged_mqa_logits = False
                 q_split_threshold = 8192
                 indexer_rope_interleave = False
                 enable_heuristic_topk = False
-                indexer_k_dtype = "fp8"
+                default_sparse_attention_config = DeepSeekV4SparseAttentionConfig(
+                )
+                indexer_k_dtype = default_sparse_attention_config.indexer_k_dtype
             indexer_config = {}
             indexer_config['index_n_heads'] = index_n_heads
             indexer_config['index_head_dim'] = index_head_dim
@@ -803,7 +894,13 @@ class ModelConfig(Generic[TConfig]):
                     if sparse_attention_config:
                         index_n_heads = sparse_attention_config.index_n_heads or pretrained_config.index_n_heads
                         index_head_dim = sparse_attention_config.index_head_dim or pretrained_config.index_head_dim
-                        index_topk = sparse_attention_config.index_topk or pretrained_config.index_topk
+                        # Explicit-set check (see V4 path above): only honor a
+                        # user-provided index_topk; otherwise take the
+                        # checkpoint value rather than a truthy subclass default.
+                        if 'index_topk' in sparse_attention_config.model_fields_set:
+                            index_topk = sparse_attention_config.index_topk
+                        else:
+                            index_topk = pretrained_config.index_topk
                         indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
                         skip_indexer_for_short_seqs = sparse_attention_config.skip_indexer_for_short_seqs
                         use_cute_dsl_topk = sparse_attention_config.use_cute_dsl_topk
@@ -1060,6 +1157,10 @@ class ModelConfig(Generic[TConfig]):
                 layer_quant_config,
                 kwargs.get('spec_config', None),
                 require_layout=require_deepseek_v4_routed_moe_layout)
+
+        if architecture in _MINIMAX_M3_ARCHITECTURES:
+            layer_quant_config = cls._set_minimax_m3_layer_quant_config(
+                pretrained_config, layer_quant_config)
 
         model_config = cls(pretrained_config=pretrained_config,
                            quant_config=quant_config,

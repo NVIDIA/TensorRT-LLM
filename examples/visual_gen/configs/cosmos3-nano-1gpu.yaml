@@ -13,20 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# 1-GPU Cosmos3 (Nano / Super) with FP8 dynamic quantization.
+# 1-GPU Cosmos3 (Nano / Super).
 # Model: nvidia/Cosmos3-Nano or nvidia/Cosmos3-Super
 # Shared by offline examples (--visual_gen_args) and trtllm-serve.
 #
 # Cosmos3 constraints: VANILLA attention only;
-# no Attention2D / Ring. Use CFG + Ulysses for multi-GPU (see cosmos3-super-4gpu.yaml).
-quant_config:
-  quant_algo: FP8
-  dynamic: true
-  ignore: ["language_model.*", "vae2llm", "llm2vae", "time_embedder.*"]
+# Use CFG + Ulysses for multi-GPU (see cosmos3-super-4gpu.yaml).
 attention_config:
   backend: VANILLA
 parallel_config:
   cfg_size: 1
   ulysses_size: 1
-cuda_graph_config:
-  enable: false

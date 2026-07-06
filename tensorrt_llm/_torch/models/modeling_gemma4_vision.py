@@ -54,6 +54,7 @@ from ..attention_backend.utils import get_attention_backend
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.linear import Linear
+from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_utils import _load_weights_impl
 
 
@@ -700,7 +701,7 @@ class Gemma4VisionPooler(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class Gemma4VisionModel(nn.Module):
+class Gemma4VisionModel(nn.Module, MultimodalEncoderMixin):
     """Gemma4 vision tower.
 
     Input contract (preserved from HF ``Gemma4VisionModel.forward``):
@@ -732,27 +733,14 @@ class Gemma4VisionModel(nn.Module):
             self.register_buffer("std_bias", torch.zeros(self.config.hidden_size, dtype=dtype))
             self.register_buffer("std_scale", torch.ones(self.config.hidden_size, dtype=dtype))
 
-        # SigLip-style context-only metadata: kv_cache_manager=None, no decode
-        # phase. Re-prepared each forward with the actual per-image seq lens.
-        # Vision tower is called once per LLM step across all images in the
-        # batch (``modeling_gemma4mm._get_image_features``), so the batch
-        # axis here is the cross-request image count.
-        #
-        # Sizing rationale: vision attention dispatches to the trtllm-gen
-        # FMHA kernel (see ``Gemma4VisionAttention``: dtype cast on q/k/v
-        # before ``forward_impl``; head_dim padded to an FMHA-supported
-        # cubin size in ``__init__`` + ``load_weights``). FMHA workspace is
-        # O(max_num_tokens × hidden_size) — linear, no batch² term — so we
-        # can safely pull the LLM-side ``max_num_requests`` (typically
-        # 8192) without OOM. ``max_num_tokens`` stays at a vision-scale
-        # 8192 (covers worst-case patch counts) — pulling the LLM-side
-        # value of 16384 would still bloat workspace 4× on no reason.
+        # SigLip-style context-only metadata (kv_cache_manager=None, no decode);
+        # built by the engine via ``MultimodalEncoderMixin.setup_attn_metadata``
+        # at the encoder ``(encoder_max_batch_size, encoder_max_num_tokens)``
+        # budget, then re-prepared each forward with the actual per-image seq
+        # lens. The vision tower runs once per LLM step across all images, so
+        # the batch axis is the cross-request image count.
         self.metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
-        self.attn_metadata = self.metadata_cls(
-            max_num_requests=getattr(model_config, "max_num_requests", 8192) or 8192,
-            max_num_tokens=8192,
-            kv_cache_manager=None,
-        )
+        self.attn_metadata: Optional[AttentionMetadata] = None
 
     def _prepare_attn_metadata(self, seq_lens_cpu: torch.Tensor):
         batch_size = int(seq_lens_cpu.numel())
