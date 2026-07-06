@@ -5473,6 +5473,8 @@ pipeline {
                         } else {
                             echo "Skip multi-GPU testing. No test to run."
                         }
+                        // [TEST-ONLY] Force single-GPU failure to validate multi-GPU blocking. Remove before merge.
+                        error "[TEST] Intentional single-GPU failure for testing multi-GPU blocking behavior."
                         if (singleGpuJobs.size() > 0) {
                             singleGpuJobs.failFast = params.enableFailFast
                             parallel singleGpuJobs
