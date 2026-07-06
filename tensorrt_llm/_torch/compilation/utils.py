@@ -1,5 +1,5 @@
 import contextlib
-from typing import Callable, List, Union
+from typing import Callable, List, Optional, Union
 
 import torch
 from torch.fx import Node
@@ -31,6 +31,13 @@ def is_call_function(node: Node, target: Union[List[Callable], Callable]):
         return node.op == "call_function" and node.target in target
     else:
         return node.op == "call_function" and node.target == target
+
+
+def get_optional_trtllm_op(op_name: str) -> Optional[Callable]:
+    try:
+        return getattr(torch.ops.trtllm, op_name).default
+    except AttributeError:
+        return None
 
 
 _enable_piecewise_cuda_graph_capture = False
@@ -65,16 +72,6 @@ def inplace_info():
         torch.ops.trtllm.flashinfer_fused_add_rmsnorm_quant.default: {
             1: "out",
             2: "residual"
-        },
-        torch.ops.trtllm.attn_custom_op_inplace.default: {
-            1: "output",
-            2: "output_sf"
-        },
-        torch.ops.trtllm.mla_custom_op_inplace.default: {
-            1: "output"
-        },
-        torch.ops.trtllm.mla_dsa_attn_inplace.default: {
-            1: "output"
         },
         torch.ops.trtllm.deepseek_v4_q_norm_fused_fp8.default: {
             1: "quant_q_out",
@@ -180,6 +177,25 @@ def inplace_info():
             7: "acceptToken"
         }
     }
+    optional_inplace_infos = {
+        "attn_custom_op_inplace": {
+            1: "output",
+            2: "output_sf"
+        },
+        "mla_custom_op_inplace": {
+            1: "output"
+        },
+        "mla_dsa_attn_inplace": {
+            1: "output"
+        },
+        "gdn_custom_op_inplace": {
+            1: "output"
+        },
+    }
+    for op_name, mutates_args in optional_inplace_infos.items():
+        op = get_optional_trtllm_op(op_name)
+        if op is not None:
+            inplace_map[op] = mutates_args
     if IS_CUDA_TILE_AVAILABLE:
         # cuda.tile availability depends on GPU capability thus runtime check.
         inplace_map[
