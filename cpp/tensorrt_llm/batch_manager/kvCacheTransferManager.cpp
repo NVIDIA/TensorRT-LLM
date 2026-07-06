@@ -89,21 +89,31 @@ KVCacheTransferManager::KVCacheTransferManager(
     TLLM_CHECK(mDeviceId != -1);
     if (mAsyncDiskStore)
     {
-        mDiskWriter = std::thread(&KVCacheTransferManager::diskWriterLoop, this);
-        TLLM_LOG_INFO("[disk-tier] async store ENABLED (write-queue max=%zu)", mDiskWriteQueueMax);
+        for (std::size_t i = 0; i < mNumDiskWriters; ++i)
+        {
+            mDiskWriters.emplace_back(&KVCacheTransferManager::diskWriterLoop, this);
+        }
+        TLLM_LOG_INFO(
+            "[disk-tier] async store ENABLED (writers=%zu, write-queue max=%zu)", mNumDiskWriters, mDiskWriteQueueMax);
     }
 }
 
 KVCacheTransferManager::~KVCacheTransferManager()
 {
-    if (mDiskWriter.joinable())
+    if (!mDiskWriters.empty())
     {
         {
             std::lock_guard<std::mutex> lock(mDiskMutex);
             mDiskWriterStop = true;
         }
         mDiskQueueCv.notify_all();
-        mDiskWriter.join();
+        for (auto& t : mDiskWriters)
+        {
+            if (t.joinable())
+            {
+                t.join();
+            }
+        }
     }
 }
 
