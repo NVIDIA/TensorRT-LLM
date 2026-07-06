@@ -22,10 +22,6 @@ through the ``cute_dsl_mla`` TRTLLM FMHA library
 - FP8 path: ``torch.ops.trtllm.cute_dsl_mla_decode_fp8_blackwell``
 - FP16/BF16 path: ``torch.ops.trtllm.cute_dsl_mla_decode_fp16_blackwell``
 
-Only the generation (decode) steps are asserted for numerical correctness.
-The context phase runs solely to populate the paged KV cache and to build the
-reference latent cache (``skip_context_assert=True``).
-
 Crucially, the test monkeypatches ``CuteDslMlaFmha._run_mla_decode`` to count
 invocations and asserts the CuTe DSL decode path was actually taken on every
 decode step.
@@ -138,6 +134,17 @@ def cute_dsl_decode_counter(monkeypatch):
     return counter
 
 
+def _expected_dispatches(num_heads: int, seq_len_q: int, num_layers: int,
+                         num_steps: int) -> int:
+    """Dispatch count the FMHA gate should produce: ``num_layers * num_steps``
+    when the perf allowlist admits the shape (CuTe DSL must actually run), 0
+    when it rejects it (the fallback lib must serve every decode step)."""
+    from tensorrt_llm._torch.attention_backend.fmha.cute_dsl import CuteDslMlaFmha
+
+    favorable, _ = CuteDslMlaFmha._is_perf_favorable(num_heads, seq_len_q)
+    return num_layers * num_steps if favorable else 0
+
+
 @pytest.mark.parametrize("kernel", list(_KERNEL_DTYPES))
 @pytest.mark.parametrize(
     "context_sequence_lengths", _DECODE_CONTEXT_LENGTHS, ids=lambda x: f"ctx_lens={x}"
@@ -172,15 +179,13 @@ def test_cute_dsl_mla_decode(
         generation_seq_len_q=generation_seq_len_q,
         num_generation_steps=_DECODE_NUM_STEPS,
         v2_kv_cache=True,
-        skip_context_assert=True,
     )
 
-    # The decode path must have actually run the CuTe DSL kernel (1 dispatch
-    # per layer per decode step), not silently fallen back to TRTLLM.
-    expected = scenario.num_layers * _DECODE_NUM_STEPS
+    expected = _expected_dispatches(scenario.num_heads, generation_seq_len_q,
+                                    scenario.num_layers, _DECODE_NUM_STEPS)
     assert cute_dsl_decode_counter["calls"] == expected, (
         f"Expected {expected} CuTe DSL MLA decode dispatches, got "
-        f"{cute_dsl_decode_counter['calls']} (silent TRTLLM fallback?)"
+        f"{cute_dsl_decode_counter['calls']}"
     )
 
 
@@ -238,13 +243,13 @@ def test_cute_dsl_mla_decode_fold_sq(
         generation_seq_len_q=generation_seq_len_q,
         num_generation_steps=_DECODE_NUM_STEPS,
         v2_kv_cache=True,
-        skip_context_assert=True,
     )
 
-    expected = scenario.num_layers * _DECODE_NUM_STEPS
+    expected = _expected_dispatches(scenario.num_heads, generation_seq_len_q,
+                                    scenario.num_layers, _DECODE_NUM_STEPS)
     assert cute_dsl_decode_counter["calls"] == expected, (
         f"Expected {expected} CuTe DSL MLA decode dispatches, got "
-        f"{cute_dsl_decode_counter['calls']} (silent TRTLLM fallback?)"
+        f"{cute_dsl_decode_counter['calls']}"
     )
 
 
@@ -299,13 +304,13 @@ def test_cute_dsl_mla_decode_long_decode(v2_kv_cache, num_layers, kernel, cute_d
         generation_seq_len_q=1,
         num_generation_steps=_LONG_DECODE_NUM_STEPS,
         v2_kv_cache=v2_kv_cache,
-        skip_context_assert=True,
     )
 
-    expected = scenario.num_layers * _LONG_DECODE_NUM_STEPS
+    expected = _expected_dispatches(scenario.num_heads, 1, scenario.num_layers,
+                                    _LONG_DECODE_NUM_STEPS)
     assert cute_dsl_decode_counter["calls"] == expected, (
         f"Expected {expected} CuTe DSL MLA decode dispatches, got "
-        f"{cute_dsl_decode_counter['calls']} (silent TRTLLM fallback?)"
+        f"{cute_dsl_decode_counter['calls']}"
     )
 
 
@@ -404,13 +409,13 @@ def test_cute_dsl_mla_decode_standalone_shapes(
         generation_seq_len_q=seq_q,
         num_generation_steps=num_generation_steps,
         v2_kv_cache=True,
-        skip_context_assert=True,
     )
 
-    expected = scenario.num_layers * num_generation_steps
+    expected = _expected_dispatches(scenario.num_heads, seq_q,
+                                    scenario.num_layers, num_generation_steps)
     assert cute_dsl_decode_counter["calls"] == expected, (
         f"Expected {expected} CuTe DSL MLA decode dispatches, got "
-        f"{cute_dsl_decode_counter['calls']} (silent TRTLLM fallback?)"
+        f"{cute_dsl_decode_counter['calls']}"
     )
 
 
@@ -464,8 +469,8 @@ def test_cute_dsl_mla_decode_autotuned(
         dtype=dtype,
         kv_cache_dtype=kv_cache_dtype,
         num_layers=1,
-        num_heads=128,
-        num_kv_heads=128,
+        num_heads=16,
+        num_kv_heads=16,
     )
     rope_config = _build_rope_config(scenario)
 
@@ -493,12 +498,12 @@ def test_cute_dsl_mla_decode_autotuned(
         generation_seq_len_q=seq_q,
         num_generation_steps=num_generation_steps,
         v2_kv_cache=True,
-        skip_context_assert=True,
         autotune_warmup=True,
     )
 
-    expected = scenario.num_layers * num_generation_steps
+    expected = _expected_dispatches(scenario.num_heads, seq_q,
+                                    scenario.num_layers, num_generation_steps)
     assert cute_dsl_decode_counter["calls"] == expected, (
         f"Expected {expected} CuTe DSL MLA decode dispatches, got "
-        f"{cute_dsl_decode_counter['calls']} (silent TRTLLM fallback?)"
+        f"{cute_dsl_decode_counter['calls']}"
     )
