@@ -15,7 +15,7 @@
 
 from typing import Type
 
-import cuda.bindings.driver as drv
+import cuda.bindings.driver as drv  # type: ignore[import-untyped]
 
 from ._common import MemAddress
 from ._exceptions import CuError

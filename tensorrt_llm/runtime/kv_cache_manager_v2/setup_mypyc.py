@@ -71,7 +71,6 @@ sys.argv.extend(["--config-file", mypy_config_path])
 modules = [
     # Main module files
     "kv_cache_manager_v2/__init__.py",
-    "kv_cache_manager_v2/_block_radix_tree.py",
     "kv_cache_manager_v2/_common.py",
     "kv_cache_manager_v2/_config.py",
     "kv_cache_manager_v2/_copy_engine.py",
@@ -85,7 +84,6 @@ modules = [
     # _core submodule
     "kv_cache_manager_v2/_core/__init__.py",
     "kv_cache_manager_v2/_core/_kv_cache_manager.py",
-    "kv_cache_manager_v2/_core/_kv_cache.py",
     "kv_cache_manager_v2/_core/_pending_stats.py",
     # _eviction_controller submodule
     "kv_cache_manager_v2/_eviction_controller/__init__.py",
