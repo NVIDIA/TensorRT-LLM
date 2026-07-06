@@ -14,6 +14,7 @@ Every CUDA/GPU test that runs model code covers both ``cuda_graph=false`` (basel
 and ``cuda_graph=true`` (enabled, exercising the CUDA-graph hard path).
 """
 
+import functools
 import json
 import os
 from copy import deepcopy
@@ -114,6 +115,9 @@ def _patch_chatglm3_hf_tied_compat():
         cls.all_tied_weights_keys = {}  # {} is correct for tie_word_embeddings=False.
 
 
+# Cached: load_weights only reads/copies out of the dict, and the two callers
+# share one checkpoint path, so this avoids re-reading multi-GB shards from disk.
+@functools.lru_cache(maxsize=1)
 def _load_checkpoint_weights(ckpt: str) -> dict:
     index = os.path.join(ckpt, "model.safetensors.index.json")
     weights = {}
@@ -473,36 +477,18 @@ def test_chatglm3_source_activation_replay(cfg: RuntimeCfg):
     # -- capture HF boundary activations (block / attention / mlp outputs) -- #
     hf_layer_out, hf_attn_out, hf_mlp_out = {}, {}, {}
 
-    def _hf_layer_hook(idx):
+    def _hf_hook(store, idx):
         def hook(_m, _inp, out):
-            hf_layer_out[idx] = (
-                (out[0] if isinstance(out, tuple) else out).detach().float().squeeze(1)
-            )
-
-        return hook
-
-    def _hf_attn_hook(idx):
-        def hook(_m, _inp, out):
-            hf_attn_out[idx] = (
-                (out[0] if isinstance(out, tuple) else out).detach().float().squeeze(1)
-            )
-
-        return hook
-
-    def _hf_mlp_hook(idx):
-        def hook(_m, _inp, out):
-            hf_mlp_out[idx] = (
-                (out[0] if isinstance(out, tuple) else out).detach().float().squeeze(1)
-            )
+            store[idx] = (out[0] if isinstance(out, tuple) else out).detach().float().squeeze(1)
 
         return hook
 
     hf_handles = []
     for i in rep_layers:
         block = hf_model.transformer.encoder.layers[i]
-        hf_handles.append(block.register_forward_hook(_hf_layer_hook(i)))
-        hf_handles.append(block.self_attention.register_forward_hook(_hf_attn_hook(i)))
-        hf_handles.append(block.mlp.register_forward_hook(_hf_mlp_hook(i)))
+        hf_handles.append(block.register_forward_hook(_hf_hook(hf_layer_out, i)))
+        hf_handles.append(block.self_attention.register_forward_hook(_hf_hook(hf_attn_out, i)))
+        hf_handles.append(block.mlp.register_forward_hook(_hf_hook(hf_mlp_out, i)))
 
     input_ids_hf = torch.tensor([PROMPT_IDS], dtype=torch.long, device=device)
     position_ids = torch.arange(len(PROMPT_IDS), device=device).unsqueeze(0)
@@ -516,31 +502,21 @@ def test_chatglm3_source_activation_replay(cfg: RuntimeCfg):
     # -- capture TRT boundary activations -- #
     trt_layer_out, trt_attn_out, trt_mlp_out = {}, {}, {}
 
-    def _trt_layer_hook(idx):
+    # DecoderLayer returns (hidden, residual); the running hidden = hidden + residual.
+    def _trt_hook(store, idx, extract=lambda out: out):
         def hook(_m, _inp, out):
-            # DecoderLayer returns (hidden, residual); the running hidden = hidden + residual.
-            trt_layer_out[idx] = (out[0] + out[1]).detach().float()
-
-        return hook
-
-    def _trt_attn_hook(idx):
-        def hook(_m, _inp, out):
-            trt_attn_out[idx] = out.detach().float()
-
-        return hook
-
-    def _trt_mlp_hook(idx):
-        def hook(_m, _inp, out):
-            trt_mlp_out[idx] = out.detach().float()
+            store[idx] = extract(out).detach().float()
 
         return hook
 
     trt_handles = []
     for i in rep_layers:
         layer = model.model.layers[i]
-        trt_handles.append(layer.register_forward_hook(_trt_layer_hook(i)))
-        trt_handles.append(layer.self_attn.register_forward_hook(_trt_attn_hook(i)))
-        trt_handles.append(layer.mlp.register_forward_hook(_trt_mlp_hook(i)))
+        trt_handles.append(
+            layer.register_forward_hook(_trt_hook(trt_layer_out, i, lambda o: o[0] + o[1]))
+        )
+        trt_handles.append(layer.self_attn.register_forward_hook(_trt_hook(trt_attn_out, i)))
+        trt_handles.append(layer.mlp.register_forward_hook(_trt_hook(trt_mlp_out, i)))
 
     num_blocks, tokens_per_block = 1, 128
     kv_cache_manager = _make_kv_cache_manager_v2(
