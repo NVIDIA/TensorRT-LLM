@@ -23,7 +23,7 @@ from bisect import bisect_right, insort
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import ClassVar, NewType, final
+from typing import Any, ClassVar, NewType, final
 
 if sys.version_info[:2] >= (3, 12):
     from typing import override
@@ -755,7 +755,7 @@ class ArenaPoolGroup(PoolGroupBase):
     _retained: dict[int, SequenceRange]
     # id(host page) -> (identity ref, retained-range base, ordinal): where a
     # committed block's bytes still live on GPU after its owner closed.
-    _ghosts: "dict[int, tuple[rawref.ref, int, int]]"
+    _ghosts: "dict[int, tuple[rawref.ref[Any], int, int]]"
 
     def __init__(
         self,
@@ -797,7 +797,7 @@ class ArenaPoolGroup(PoolGroupBase):
         self.spilled_ranges = 0
         # base_block -> [range, target frontier (blocks), pages charged]:
         # growth maps deferred to the per-iteration batched sweep (§4.2).
-        self._pending_maps: dict[int, list] = {}
+        self._pending_maps: dict[int, list[Any]] = {}
 
     @override
     def destroy(self) -> None:
@@ -881,8 +881,9 @@ class ArenaPoolGroup(PoolGroupBase):
             return 0
         # Nothing was mapped since the first queue call, so pending_pages is
         # monotone in the frontier and the delta charge is exact.
+        charged: int = entry[2]
         pages = self._arena.pending_pages(base, num_valid_blocks)
-        delta = pages - entry[2]
+        delta = pages - charged
         assert delta >= 0
         if delta:
             self._budget.consume(delta)

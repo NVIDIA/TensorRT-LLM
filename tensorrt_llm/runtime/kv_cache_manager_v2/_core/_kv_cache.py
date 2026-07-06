@@ -172,6 +172,27 @@ IndexSeq = array.array | memoryview
 # three lengths equal to the number of reused tokens.
 # TODO: in __del__, we should check if committed pages are usable for SWA cases. e.g. all pages are
 # dropped except the last one. The last one is not usable.
+class _ArenaClosingPages(NamedTuple):
+    """Partition of a sequence's committed GPU pages at close() (arena mode).
+
+    A module-level class: mypyc cannot compile class definitions nested in a
+    class body."""
+
+    # canonical committed pages without a write-through copy: copy-on-free
+    offload: "TypedIndexList[PoolGroupIndex, list[CommittedPage]]"
+    offload_ordinals: "TypedIndexList[PoolGroupIndex, list[int]]"
+    # canonical committed pages with a valid write-through host copy, and
+    # those copies: adopted copy-free (§4.3)
+    adopt_pages: "TypedIndexList[PoolGroupIndex, list[CommittedPage]]"
+    adopt_slots: "TypedIndexList[PoolGroupIndex, list[Slot]]"
+    adopt_ordinals: "TypedIndexList[PoolGroupIndex, list[int]]"
+    # sequence-private reuse copies (§4.4): dropped -- but under lazy
+    # retention their bytes re-register as fresh ghosts for the canonical
+    # entry, keeping hot prefixes' D2D sources LRU-recent
+    private: list[CommittedPage]
+    private_meta: list[tuple[int, LifeCycleId]]  # (ordinal, lc) per entry
+
+
 class _KVCache:
     __slots__ = (
         "id",
@@ -523,8 +544,8 @@ class _KVCache:
             manager._num_sampled_kv_caches += 1
             manager._try_update_target_ratios()
         arena_ranges = self._arena_ranges
-        arena_closing: _KVCache._ArenaClosingPages | None = None
-        arena_last_consumer = CachedCudaEvent.NULL
+        arena_closing: _ArenaClosingPages | None = None
+        arena_last_consumer = cast(CachedCudaEvent, CachedCudaEvent.NULL)
         if arena_ranges is not None:
             arena_cfg = manager._storage.arena_config
             if arena_cfg is not None and arena_cfg.batched_map_sweep:
@@ -536,8 +557,9 @@ class _KVCache:
             self._clear_blocks()
             # _record_event clears _finish_event on exit; capture it as the
             # range-reclaim gate (§4.2) while it is live.
-            if self._finish_event is not None:
-                arena_last_consumer = self._finish_event
+            finish_event: CachedCudaEvent | None = self._finish_event
+            if finish_event is not None:
+                arena_last_consumer = finish_event
         if arena_ranges is not None:
             storage = manager._storage
             assert arena_closing is not None
@@ -725,22 +747,7 @@ class _KVCache:
             case PageIndexMode.SHARED:
                 return not self.has_scratch_slots
 
-    class _ArenaClosingPages(NamedTuple):
-        # canonical committed pages without a write-through copy: copy-on-free
-        offload: "TypedIndexList[PoolGroupIndex, list[CommittedPage]]"
-        offload_ordinals: "TypedIndexList[PoolGroupIndex, list[int]]"
-        # canonical committed pages with a valid write-through host copy, and
-        # those copies: adopted copy-free (§4.3)
-        adopt_pages: "TypedIndexList[PoolGroupIndex, list[CommittedPage]]"
-        adopt_slots: "TypedIndexList[PoolGroupIndex, list[Slot]]"
-        adopt_ordinals: "TypedIndexList[PoolGroupIndex, list[int]]"
-        # sequence-private reuse copies (§4.4): dropped -- but under lazy
-        # retention their bytes re-register as fresh ghosts for the canonical
-        # entry, keeping hot prefixes' D2D sources LRU-recent
-        private: list[CommittedPage]
-        private_meta: list[tuple[int, LifeCycleId]]  # (ordinal, lc) per entry
-
-    def _arena_collect_committed_gpu_pages(self) -> "_KVCache._ArenaClosingPages":
+    def _arena_collect_committed_gpu_pages(self) -> "_ArenaClosingPages":
         """Collect this sequence's committed GPU pages before the block chain
         is cleared at close(), partitioned by how they leave the arena:
         written-through pages adopt their host copy (copy-free), the rest are
@@ -755,7 +762,7 @@ class _KVCache:
         the (otherwise unused) GPU eviction queue.
         """
         storage = self.manager._storage
-        ret = _KVCache._ArenaClosingPages(
+        ret = _ArenaClosingPages(
             make_typed(lambda _: list[CommittedPage](), storage.num_pool_groups),
             make_typed(lambda _: list[int](), storage.num_pool_groups),
             make_typed(lambda _: list[CommittedPage](), storage.num_pool_groups),
@@ -1037,9 +1044,9 @@ class _KVCache:
         # Lock everything in place. For copies, the private page replaces the
         # holder; dropping it releases the source back to eviction control at
         # its current level. Moved pages keep their holder and simply lock.
-        for (ordinal, lc_idx, holder), slot in zip(entries, copied):
+        for (ordinal, lc_idx, holder), copied_slot in zip(entries, copied):
             src_page = holder.page
-            if slot is None:  # moved uncommitted page, now living in the arena
+            if copied_slot is None:  # moved uncommitted page, now living in the arena
                 assert src_page.cache_level == GPU_LEVEL
                 lock = holder.lock(self, beam_idx, ordinal, lc_idx, skip_wait=True)
             else:
@@ -1049,7 +1056,7 @@ class _KVCache:
                 tree_block = src_page.block()
                 assert tree_block is not None, "committed page lost its tree block while held"
                 private = PrivateCommittedPage(
-                    storage, tree_block, lc_idx, GPU_LEVEL, slot, src_page.priority
+                    storage, tree_block, lc_idx, GPU_LEVEL, copied_slot, src_page.priority
                 )
                 lock = private.lock(self, beam_idx, ordinal, lc_idx, skip_wait=True)
             self._block(ordinal, beam_idx)[lc_idx] = lock
@@ -1399,13 +1406,18 @@ class _KVCache:
     def suspend(self) -> None:
         assert self.status == self.Status.ACTIVE
         assert self._check_sanity()
-        assert self._finish_event is None
+        # Assert on a local, not the attribute: `assert self._finish_event is
+        # None` narrows the member to None for the rest of the function under
+        # mypy(c) -- it cannot see _record_event's side effect -- and compiled
+        # code would then unbox the later read as literal None.
+        entry_finish_event = self._finish_event
+        assert entry_finish_event is None
         for beam_idx, beam_indices in typed_enumerate(self._base_page_indices):
             for lc, indices in typed_enumerate(beam_indices):
                 if type(indices) is memoryview:
                     self.set_base_page_index_buf(beam_idx, lc, None)
         ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
-        arena_last_consumer = CachedCudaEvent.NULL
+        arena_last_consumer = cast(CachedCudaEvent, CachedCudaEvent.NULL)
         with self._record_event():  # used by _SharedPageLock.__del__
             for ordinal, beam_idx, lc_idx in self._active_pages():
                 beam_block = (
@@ -1421,8 +1433,9 @@ class _KVCache:
             self._free_scratch_slots()
             # _record_event clears _finish_event on exit; capture it as the
             # range-reclaim gate (§4.2) while it is live.
-            if self._finish_event is not None:
-                arena_last_consumer = self._finish_event
+            finish_event: CachedCudaEvent | None = self._finish_event
+            if finish_event is not None:
+                arena_last_consumer = finish_event
         if self._arena_ranges is not None:
             # §4.5: move this sequence's pages out of its arena ranges, then
             # release the whole VA reservation (event-gated unmap). Resume
@@ -1484,11 +1497,13 @@ class _KVCache:
             except MemoryError:
                 # VA exhaustion / fragmentation: back off like any other
                 # resource shortage. Nothing was mapped; undo the bookkeeping.
-                for pg_idx, rng in typed_enumerate(cast(TypedIndexList, ranges)):
+                for pg_idx, rng in typed_enumerate(
+                    cast("TypedIndexList[PoolGroupIndex, SequenceRange]", ranges)
+                ):
                     storage.free_gpu_sequence(pg_idx, rng, CachedCudaEvent.NULL)
                 storage.drain_gpu_reclaim()
                 return False
-            self._arena_ranges = cast(TypedIndexList, ranges)
+            self._arena_ranges = cast("TypedIndexList[PoolGroupIndex, SequenceRange]", ranges)
         ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
         life_cycles = self.manager._life_cycles
         num_life_cycles = life_cycles.size
@@ -1562,9 +1577,9 @@ class _KVCache:
             try:
                 locks = batched_lock_to_gpu(self, tasks, self._record_migrated_slots)
             except OutOfPagesError:
-                for lc_idx, slot in typed_enumerate(deferred_slots):
-                    if slot is not None:
-                        storage.release_slot(lc_idx, GPU_LEVEL, slot)
+                for lc_idx, deferred_slot in typed_enumerate(deferred_slots):
+                    if deferred_slot is not None:
+                        storage.release_slot(lc_idx, GPU_LEVEL, deferred_slot)
                 return False
 
             # Replace all holders with locks.

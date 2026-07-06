@@ -355,12 +355,13 @@ class KVCacheManagerConfig:
             assert self.helix_config is None, (
                 "contiguous_arena is not yet supported together with helix_config"
             )
-            assert all(layer.type == LayerType.ATTENTION for layer in self.layers), (
-                "contiguous_arena does not support SSM layers yet (DESIGN.md §4.7)"
-            )
-            assert all(layer.sliding_window_size is None for layer in self.layers), (
-                "contiguous_arena does not support sliding-window layers yet (DESIGN.md §4.7)"
-            )
+            for layer in self.layers:
+                assert isinstance(layer, AttentionLayerConfig), (
+                    "contiguous_arena does not support SSM layers yet (DESIGN.md §4.7)"
+                )
+                assert layer.sliding_window_size is None, (
+                    "contiguous_arena does not support sliding-window layers yet (DESIGN.md §4.7)"
+                )
             assert self.swa_scratch_reuse is None, (
                 "contiguous_arena does not support SWA scratch reuse (scattered scratch slots)"
             )
