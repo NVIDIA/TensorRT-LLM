@@ -31,6 +31,8 @@ namespace nb = nanobind;
 namespace tensorrt_llm::nanobind::thop
 {
 
+void initCompactPseudoKvBindings(nb::module_& m);
+
 namespace
 {
 
@@ -119,6 +121,8 @@ nb::tuple trtllmGenGenerationPreprocessBinding(torch::Tensor qkv_input, torch::T
 
 void initBindings(nb::module_& m)
 {
+    initCompactPseudoKvBindings(m);
+
     // Sync with torch_ext::BufferKind in tensorrt_llm/thop/outputTensor.h
     nb::enum_<torch_ext::BufferKind>(m, "BufferKind", nb::is_arithmetic())
         .value("DEFAULT", torch_ext::BufferKind::Default)
@@ -174,7 +178,11 @@ void initBindings(nb::module_& m)
         nb::arg("sage_attn_num_elts_per_blk_k") = 0, nb::arg("sage_attn_num_elts_per_blk_v") = 0,
         nb::arg("sage_attn_qk_int8") = false, nb::arg("num_contexts") = 0, nb::arg("num_ctx_tokens") = 0,
         nb::arg("trtllm_gen_jit_warmup") = false, nb::arg("compressed_kv_cache_pool_ptr") = std::nullopt,
-        nb::arg("is_cross") = false, nb::arg("cross_kv") = std::nullopt,
+        nb::arg("compact_pseudokv_key") = std::nullopt, nb::arg("compact_pseudokv_value") = std::nullopt,
+        nb::arg("compact_pseudokv_positions") = std::nullopt,
+        nb::arg("compact_pseudokv_causal_mask") = std::nullopt,
+        nb::arg("compact_pseudokv_source_seq_len") = std::nullopt, nb::arg("is_cross") = false,
+        nb::arg("cross_kv") = std::nullopt,
         nb::arg("relative_attention_bias") = std::nullopt, nb::arg("relative_attention_max_distance") = 0,
         nb::arg("spec_decoding_target_max_draft_tokens") = std::nullopt, "Multi-head attention operation",
         nb::call_guard<nb::gil_scoped_release>());

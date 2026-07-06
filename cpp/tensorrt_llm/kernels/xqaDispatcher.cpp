@@ -539,6 +539,7 @@ void XqaDispatcher::runImpl(
         tllmRunnerParams.firstSparseMaskOffsetsKvPtr = params.spec_bl_tree_first_sparse_mask_offset_kv;
         tllmRunnerParams.mSkipSoftmaxThresholdScaleFactor = params.skip_softmax_threshold_scale_factor;
         tllmRunnerParams.softmaxStatsPtr = params.softmax_stats;
+        tllmRunnerParams.compact_pseudokv_params = params.compact_pseudokv_params;
         mTllmGenFMHARunner->run(tllmRunnerParams);
     }
     else

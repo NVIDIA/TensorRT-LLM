@@ -16,6 +16,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/config.h"
+#include <NvInferRuntime.h>
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <sstream>
@@ -62,6 +63,63 @@ struct SparseAttentionParams
     }
 };
 
+struct CompactPseudoKvParams
+{
+    void const* key{nullptr};
+    void const* value{nullptr};
+    int32_t const* positions{nullptr};
+    bool const* causal_mask{nullptr};
+    int32_t compact_token_count{0};
+    int32_t source_sequence_length{0};
+    int32_t num_heads{0};
+    int32_t head_size{0};
+    int64_t key_stride_token_in_bytes{0};
+    int64_t key_stride_head_in_bytes{0};
+    int64_t value_stride_token_in_bytes{0};
+    int64_t value_stride_head_in_bytes{0};
+
+    bool isEnabled() const
+    {
+        return key != nullptr && value != nullptr && compact_token_count > 0;
+    }
+
+    std::string toString() const
+    {
+        std::stringstream ss;
+        ss << "key: " << this->key << std::endl
+           << "value: " << this->value << std::endl
+           << "positions: " << this->positions << std::endl
+           << "causal_mask: " << this->causal_mask << std::endl
+           << "compact_token_count: " << this->compact_token_count << std::endl
+           << "source_sequence_length: " << this->source_sequence_length << std::endl
+           << "num_heads: " << this->num_heads << std::endl
+           << "head_size: " << this->head_size << std::endl
+           << "key_stride_token_in_bytes: " << this->key_stride_token_in_bytes << std::endl
+           << "key_stride_head_in_bytes: " << this->key_stride_head_in_bytes << std::endl
+           << "value_stride_token_in_bytes: " << this->value_stride_token_in_bytes << std::endl
+           << "value_stride_head_in_bytes: " << this->value_stride_head_in_bytes << std::endl;
+        return ss.str();
+    }
+};
+
+struct CompactPseudoKvAttentionLaunchParams
+{
+    void const* query{nullptr};
+    void* output{nullptr};
+    CompactPseudoKvParams compact_pseudokv_params{};
+    int32_t query_token_count{0};
+    int64_t query_stride_token_in_bytes{0};
+    int64_t query_stride_head_in_bytes{0};
+    int64_t output_stride_token_in_bytes{0};
+    int64_t output_stride_head_in_bytes{0};
+    nvinfer1::DataType data_type{nvinfer1::DataType::kFLOAT};
+
+    bool isEnabled() const
+    {
+        return query != nullptr && output != nullptr && query_token_count > 0 && compact_pseudokv_params.isEnabled();
+    }
+};
+
 struct Pair
 {
     int32_t max_val;
@@ -89,6 +147,8 @@ void invokeGatherKvPageOffsets(int32_t* output_kv_page_offsets, // [num_head_kv,
     int32_t const* seq_lengths,                                 // [batch_size]
     SparseAttentionParams const sparse_params, int32_t const batch_size, int32_t const num_head_kv,
     int32_t const tokens_per_page, int32_t const max_num_pages_per_seq, cudaStream_t stream);
+
+void invokeCompactPseudoKvAttention(CompactPseudoKvAttentionLaunchParams const& params, cudaStream_t stream);
 
 } // namespace kernels
 

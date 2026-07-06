@@ -34,6 +34,26 @@ set_property(TARGET th_utils PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 target_link_libraries(th_utils PUBLIC ${TORCH_LIBRARIES} ${CUBLAS_LIB}
                                       ${CURAND_LIB})
 
+add_library(th_compact_pseudokv_kernels STATIC
+            ../kernels/compactPseudoKvAttentionKernels.cu)
+set_property(TARGET th_compact_pseudokv_kernels PROPERTY
+                                                    POSITION_INDEPENDENT_CODE ON)
+set_property(TARGET th_compact_pseudokv_kernels PROPERTY
+                                                    CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+target_link_libraries(th_compact_pseudokv_kernels PRIVATE ${CUDA_LIBRARIES})
+add_cuda_architectures(th_compact_pseudokv_kernels 89)
+
+add_library(th_compact_pseudokv_common STATIC ../common/stringUtils.cpp
+                                               ../common/tllmException.cpp)
+set_property(TARGET th_compact_pseudokv_common
+             PROPERTY POSITION_INDEPENDENT_CODE ON)
+
+add_library(th_compact_pseudokv STATIC compactPseudoKvAttentionOp.cpp)
+set_property(TARGET th_compact_pseudokv PROPERTY POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(th_compact_pseudokv PUBLIC ${TORCH_LIBRARIES}
+                      PRIVATE th_compact_pseudokv_kernels
+                              th_compact_pseudokv_common)
+
 # TODO This does not compile with internal cutlass MOE gemm
 add_library(
   th_common SHARED
@@ -138,7 +158,7 @@ add_library(
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(
   th_common PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
-                    ${SHARED_TARGET} pg_utils)
+                    ${SHARED_TARGET} pg_utils th_compact_pseudokv)
 
 if(BUILD_DEEP_GEMM)
   target_compile_definitions(th_common PRIVATE TRTLLM_MHC_ENABLE_FUSED_HC)

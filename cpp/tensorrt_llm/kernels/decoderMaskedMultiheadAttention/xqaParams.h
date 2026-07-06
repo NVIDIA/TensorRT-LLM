@@ -126,6 +126,8 @@ struct XQAParams
 
     // sparse attention parameters
     SparseAttentionParams sparse_params;
+    // compact pseudo-KV attention parameters
+    CompactPseudoKvParams compact_pseudokv_params;
     bool use_sparse_attention_gen_paged = false;
 
     // Skip softmax threshold.
@@ -215,6 +217,7 @@ struct XQAParams
            << "fp8_out_scale :" << fp8_out_scale << std ::endl
            << "encoder_input_lengths: " << encoder_input_lengths << std::endl
            << "sparse_params: " << sparse_params.toString() << std::endl
+           << "compact_pseudokv_params: " << compact_pseudokv_params.toString() << std::endl
            << "use_sparse_attention_gen_paged :" << (use_sparse_attention_gen_paged ? "true" : "false") << std ::endl
            << "skip_softmax_threshold_scale_factor :" << skip_softmax_threshold_scale_factor << std ::endl
 #ifdef SKIP_SOFTMAX_STAT

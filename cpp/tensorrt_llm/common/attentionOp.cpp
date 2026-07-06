@@ -316,6 +316,7 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.start_token_idx_sf = generationsParams.start_token_idx_sf;
     // Parameters for sparse attention
     xqaParams.sparse_params = mRuntimeSparseAttentionParams;
+    xqaParams.compact_pseudokv_params = mRuntimeCompactPseudoKvParams;
     xqaParams.use_sparse_attention_gen_paged = useTllmGenSparseAttentionPaged();
     // Skip softmax threshold.
     xqaParams.skip_softmax_threshold_scale_factor = mSkipSoftmaxThresholdScaleFactorDecode;
@@ -1394,6 +1395,7 @@ int AttentionOp::mlaGeneration(
         {
             fmhaParams.sparse_params = mRuntimeSparseAttentionParams;
         }
+        fmhaParams.compact_pseudokv_params = mRuntimeCompactPseudoKvParams;
 
         // MLA does not support skip-softmax attention right now
 
@@ -2035,6 +2037,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             fmhaParams.multiCtasKvScratchPtr = workspaceViews.fmhaMultiCtasKvScratch;
             fmhaParams.multiCtasKvCounterPtr = multiBlockSemaphores();
         }
+        fmhaParams.compact_pseudokv_params = mRuntimeCompactPseudoKvParams;
 
         // Skip-softmax attention parameters
         fmhaParams.skipSoftmaxThresholdScaleFactor = mSkipSoftmaxThresholdScaleFactorPrefill;

@@ -332,6 +332,8 @@ struct MHARunnerParams
     int vMaxNBlock;
     // sparse attention parameters
     SparseAttentionParams sparse_params;
+    // compact pseudo-KV attention parameters
+    CompactPseudoKvParams compact_pseudokv_params;
 
     // Skip-softmax attention parameters
     float skipSoftmaxThresholdScaleFactor = 0;

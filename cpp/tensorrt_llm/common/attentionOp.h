@@ -535,6 +535,7 @@ public:
     bool mFuseFp4Quant = false;
 
     kernels::SparseAttentionParams mRuntimeSparseAttentionParams;
+    kernels::CompactPseudoKvParams mRuntimeCompactPseudoKvParams;
 
     // This is implementation details which we want to save when serializing, but not expose as
     // a plugin field or a constructor parameter

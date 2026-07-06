@@ -25,12 +25,16 @@
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/debugUtils.h"
 #include "tensorrt_llm/thop/attentionOp.h"
+#include "tensorrt_llm/thop/compactPseudoKvAttentionOp.h"
 #include "tensorrt_llm/thop/thUtils.h"
+#include <cmath>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <torch/extension.h>
 #include <type_traits>
 #include <unordered_set>
+#include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -376,8 +380,13 @@ public:
         std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
         std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
         std::optional<torch::Tensor> flash_mla_num_splits, bool trtllm_gen_jit_warmup,
-        std::optional<int64_t> compressed_kv_cache_pool_ptr, bool const is_cross, std::optional<torch::Tensor> cross_kv,
-        std::optional<torch::Tensor> relative_attention_bias) const
+        std::optional<int64_t> compressed_kv_cache_pool_ptr,
+        std::optional<torch::Tensor> compact_pseudokv_key,
+        std::optional<torch::Tensor> compact_pseudokv_value,
+        std::optional<torch::Tensor> compact_pseudokv_positions,
+        std::optional<torch::Tensor> compact_pseudokv_causal_mask,
+        std::optional<int64_t> compact_pseudokv_source_seq_len, bool const is_cross,
+        std::optional<torch::Tensor> cross_kv, std::optional<torch::Tensor> relative_attention_bias) const
         = 0;
 };
 
@@ -445,8 +454,13 @@ public:
         std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
         std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
         std::optional<torch::Tensor> flash_mla_num_splits, bool trtllm_gen_jit_warmup,
-        std::optional<int64_t> compressed_kv_cache_pool_ptr, bool const is_cross, std::optional<torch::Tensor> cross_kv,
-        std::optional<torch::Tensor> relative_attention_bias) const override
+        std::optional<int64_t> compressed_kv_cache_pool_ptr,
+        std::optional<torch::Tensor> compact_pseudokv_key,
+        std::optional<torch::Tensor> compact_pseudokv_value,
+        std::optional<torch::Tensor> compact_pseudokv_positions,
+        std::optional<torch::Tensor> compact_pseudokv_causal_mask,
+        std::optional<int64_t> compact_pseudokv_source_seq_len, bool const is_cross,
+        std::optional<torch::Tensor> cross_kv, std::optional<torch::Tensor> relative_attention_bias) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
         T* attention_input = static_cast<T*>(qkv_or_q.slice(0, token_offset).data_ptr());
@@ -733,7 +747,51 @@ public:
                 }
             }
         }
+        op.mRuntimeCompactPseudoKvParams = {};
+        if (compact_pseudokv_key.has_value() || compact_pseudokv_value.has_value()
+            || compact_pseudokv_positions.has_value() || compact_pseudokv_causal_mask.has_value()
+            || compact_pseudokv_source_seq_len.has_value())
+        {
+            TORCH_CHECK(compact_pseudokv_key.has_value(), "compact_pseudokv_key is required.");
+            TORCH_CHECK(compact_pseudokv_value.has_value(), "compact_pseudokv_value is required.");
+            TORCH_CHECK(compact_pseudokv_positions.has_value(), "compact_pseudokv_positions is required.");
+            TORCH_CHECK(compact_pseudokv_causal_mask.has_value(), "compact_pseudokv_causal_mask is required.");
+            TORCH_CHECK(compact_pseudokv_source_seq_len.has_value(), "compact_pseudokv_source_seq_len is required.");
 
+            auto const& compactKey = compact_pseudokv_key.value();
+            auto const& compactValue = compact_pseudokv_value.value();
+            auto const& compactPositions = compact_pseudokv_positions.value();
+            auto const& compactCausalMask = compact_pseudokv_causal_mask.value();
+            TORCH_CHECK(compactKey.dim() == 3, "compact_pseudokv_key must be [compact_seq_len, num_heads, head_dim].");
+            TORCH_CHECK(
+                compactValue.dim() == 3, "compact_pseudokv_value must be [compact_seq_len, num_heads, head_dim].");
+            TORCH_CHECK(compactKey.sizes() == compactValue.sizes(), "compact pseudo-KV key/value shapes must match.");
+            TORCH_CHECK(compactPositions.scalar_type() == torch::kInt32, "compact_pseudokv_positions must be int32.");
+            TORCH_CHECK(compactCausalMask.scalar_type() == torch::kBool, "compact_pseudokv_causal_mask must be bool.");
+            TORCH_CHECK(
+                compactPositions.numel() == compactKey.size(0),
+                "compact_pseudokv_positions must have one entry per compact row.");
+            TORCH_CHECK(
+                compact_pseudokv_source_seq_len.value() > 0, "compact_pseudokv_source_seq_len must be positive.");
+
+            op.mRuntimeCompactPseudoKvParams.key = compactKey.data_ptr();
+            op.mRuntimeCompactPseudoKvParams.value = compactValue.data_ptr();
+            op.mRuntimeCompactPseudoKvParams.positions = compactPositions.data_ptr<int32_t>();
+            op.mRuntimeCompactPseudoKvParams.causal_mask = compactCausalMask.data_ptr<bool>();
+            op.mRuntimeCompactPseudoKvParams.compact_token_count = static_cast<int32_t>(compactKey.size(0));
+            op.mRuntimeCompactPseudoKvParams.source_sequence_length
+                = static_cast<int32_t>(compact_pseudokv_source_seq_len.value());
+            op.mRuntimeCompactPseudoKvParams.num_heads = static_cast<int32_t>(compactKey.size(1));
+            op.mRuntimeCompactPseudoKvParams.head_size = static_cast<int32_t>(compactKey.size(2));
+            op.mRuntimeCompactPseudoKvParams.key_stride_token_in_bytes
+                = compactKey.stride(0) * compactKey.element_size();
+            op.mRuntimeCompactPseudoKvParams.key_stride_head_in_bytes
+                = compactKey.stride(1) * compactKey.element_size();
+            op.mRuntimeCompactPseudoKvParams.value_stride_token_in_bytes
+                = compactValue.stride(0) * compactValue.element_size();
+            op.mRuntimeCompactPseudoKvParams.value_stride_head_in_bytes
+                = compactValue.stride(1) * compactValue.element_size();
+        }
         AttentionOp::EnqueueParams<T> common_enqueue_params;
         common_enqueue_params.attention_input = attention_input;
         common_enqueue_params.attention_sinks = attention_sinks_ptr;
@@ -1026,11 +1084,24 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata, std::optional<torch::Tensor> flash_mla_num_splits,
     int64_t sage_attn_num_elts_per_blk_q, int64_t sage_attn_num_elts_per_blk_k, int64_t sage_attn_num_elts_per_blk_v,
     bool sage_attn_qk_int8, int64_t num_contexts, int64_t num_ctx_tokens, bool trtllm_gen_jit_warmup,
-    std::optional<int64_t> compressed_kv_cache_pool_ptr, bool const is_cross, std::optional<torch::Tensor> cross_kv,
+    std::optional<int64_t> compressed_kv_cache_pool_ptr, std::optional<torch::Tensor> compact_pseudokv_key,
+    std::optional<torch::Tensor> compact_pseudokv_value, std::optional<torch::Tensor> compact_pseudokv_positions,
+    std::optional<torch::Tensor> compact_pseudokv_causal_mask, std::optional<int64_t> compact_pseudokv_source_seq_len,
+    bool const is_cross, std::optional<torch::Tensor> cross_kv,
     std::optional<torch::Tensor> relative_attention_bias, int64_t relative_attention_max_distance,
     std::optional<int64_t> spec_decoding_target_max_draft_tokens)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
+    bool const hasCompactPseudoKv = compact_pseudokv_key.has_value() || compact_pseudokv_value.has_value()
+        || compact_pseudokv_positions.has_value() || compact_pseudokv_causal_mask.has_value()
+        || compact_pseudokv_source_seq_len.has_value();
+    if (hasCompactPseudoKv)
+    {
+        runCompactPseudoKvAttention(q, output, compact_pseudokv_key, compact_pseudokv_value, compact_pseudokv_positions,
+            compact_pseudokv_causal_mask, compact_pseudokv_source_seq_len);
+        return;
+    }
+
     // Use these tensors to infer if the attention is using KV cache
     bool const use_kv_cache = kv_cache_block_offsets.has_value() && host_kv_cache_pool_pointers.has_value()
         && host_kv_cache_pool_mapping.has_value();
@@ -1326,7 +1397,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets, sparse_attn_indices_block_size,
             num_sparse_topk_value, sparse_mla_topk_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
             mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
-            trtllm_gen_jit_warmup, compressed_kv_cache_pool_ptr, is_cross, cross_kv, relative_attention_bias);
+            trtllm_gen_jit_warmup, compressed_kv_cache_pool_ptr, compact_pseudokv_key, compact_pseudokv_value,
+            compact_pseudokv_positions, compact_pseudokv_causal_mask, compact_pseudokv_source_seq_len, is_cross,
+            cross_kv, relative_attention_bias);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -1348,7 +1421,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets, sparse_attn_indices_block_size,
             num_sparse_topk_value, sparse_mla_topk_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
             mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
-            trtllm_gen_jit_warmup, compressed_kv_cache_pool_ptr, is_cross, cross_kv, relative_attention_bias);
+            trtllm_gen_jit_warmup, compressed_kv_cache_pool_ptr, compact_pseudokv_key, compact_pseudokv_value,
+            compact_pseudokv_positions, compact_pseudokv_causal_mask, compact_pseudokv_source_seq_len, is_cross,
+            cross_kv, relative_attention_bias);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", local_layer_idx);

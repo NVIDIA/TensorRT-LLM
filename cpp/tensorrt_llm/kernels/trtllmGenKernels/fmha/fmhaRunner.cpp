@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -65,6 +65,8 @@ TllmGenFmhaRunner::TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeK, Data_ty
 
 void TllmGenFmhaRunner::run(TllmGenFmhaRunnerParams const& runnerParams)
 {
+    TLLM_CHECK_WITH_INFO(!runnerParams.compact_pseudokv_params.isEnabled(),
+        "Compact pseudo-KV parameters are plumbed to TRTLLM-Gen but require a native fused consumer.");
     mKernel->run(runnerParams);
 }
 

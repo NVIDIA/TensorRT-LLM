@@ -259,6 +259,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         tllmRunnerParams.softmaxStatsPtr = reinterpret_cast<float2*>(runnerParams.softmaxStatsPtr);
         // For skip softmax
         tllmRunnerParams.mSkipSoftmaxThresholdScaleFactor = runnerParams.skipSoftmaxThresholdScaleFactor;
+        tllmRunnerParams.compact_pseudokv_params = runnerParams.compact_pseudokv_params;
 
         tllmRunnerParams.stream = runnerParams.stream;
         // Sparse context attention: reuse the generation-style kernel with per-token sparse indices.

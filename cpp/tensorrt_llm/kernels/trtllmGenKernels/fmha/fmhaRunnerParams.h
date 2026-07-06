@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 #include <cstdint>
 #include <cuda_runtime.h>
 
@@ -336,6 +337,8 @@ struct TllmGenFmhaRunnerParams
     cudaStream_t stream;
     // The layer index.
     int32_t mLayerIdx = 0;
+    // Compact pseudo-KV carrier for topology-compressed KV rows.
+    CompactPseudoKvParams compact_pseudokv_params;
     // Whether the spec-dec tree is used.
     bool mIsSpecDecTree = false;
     // The max seqLenQ used as row stride for generalPackedCustoMaskPtr.
