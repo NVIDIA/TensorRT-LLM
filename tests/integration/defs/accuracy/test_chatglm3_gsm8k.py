@@ -26,7 +26,7 @@ CANARY_N = int(os.environ.get("CHATGLM3_GSM8K_CANARY_N", "20"))
 FULL_N = int(os.environ.get("CHATGLM3_GSM8K_N", "1319"))
 MAX_INPUT_LEN = 4096
 MAX_OUTPUT_LEN = 256
-GAP_TOL = 2.0  # absolute points
+GAP_TOL = 2.0
 
 skip_no_ckpt = pytest.mark.skipif(
     not os.path.isdir(CHATGLM3_CKPT), reason=f"ChatGLM3 checkpoint not found at {CHATGLM3_CKPT}"
@@ -312,7 +312,7 @@ def _run_config(n: int, label: str, cfg: RuntimeCfg, artifact_name: str = None) 
     src = shared_cfg["dataset"]
     hf_scores = _hf_reference_scores(n)
     metric_key = _pick_metric_key(hf_scores)
-    hf = float(hf_scores[metric_key]) * 100  # lm-eval native 0-1 -> 0-100
+    hf = float(hf_scores[metric_key]) * 100
     print(f"[{label}] HF reference GSM8K [{metric_key}] = {hf:.2f} (samples={n}, dataset={src})")
 
     trt, hard_path = _trtllm_score(n, cfg, metric_key)

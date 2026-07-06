@@ -30,7 +30,6 @@ CHATGLM3_CKPT = os.environ.get(
     "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/kleinc/hf_data/chatglm3-6b",
 )
 
-# Canonical HF field values ChatGLM3-6B must normalize to.
 EXPECTED = dict(
     num_hidden_layers=28,
     hidden_size=4096,
@@ -43,10 +42,8 @@ EXPECTED = dict(
     partial_rotary_factor=0.5,
 )
 
-# A short real ChatGLM3 token sequence (gMASK, sop, ...) for module-level replay.
 PROMPT_IDS = [64790, 64792, 790, 30951, 517, 269, 30, 54761, 31211, 30910]
 
-# Fixed natural-language prompts for LLM-API logit / generation parity (>=5).
 PROMPTS = [
     "The capital of France is",
     "1 + 1 =",
@@ -55,7 +52,6 @@ PROMPTS = [
     "The sun rises in the",
 ]
 
-# fp16 activation-boundary tolerances (acceptance criterion `source_activation_replay`).
 COS_TOL = 0.999
 MEAN_ABS_TOL = 2e-2
 MAX_ABS_TOL = 2.5e-1
@@ -96,7 +92,7 @@ def _patch_chatglm3_hf_tied_compat():
         "modeling_chatglm.ChatGLMForConditionalGeneration", CHATGLM3_CKPT
     )
     if not hasattr(cls, "all_tied_weights_keys"):
-        cls.all_tied_weights_keys = {}  # {} is correct for tie_word_embeddings=False.
+        cls.all_tied_weights_keys = {}
 
 
 @functools.lru_cache(maxsize=1)
@@ -147,7 +143,7 @@ class _HFRef:
             hf_config = AutoConfig.from_pretrained(CHATGLM3_CKPT, trust_remote_code=True)
             hf_config.torch_dtype = torch.float16
             if getattr(hf_config, "max_length", None) is None:
-                hf_config.max_length = 8192  # dropped from PretrainedConfig in tf 5.x
+                hf_config.max_length = 8192
             _patch_chatglm3_hf_tied_compat()
             cls._tok = AutoTokenizer.from_pretrained(CHATGLM3_CKPT, trust_remote_code=True)
             cls._model = (
@@ -335,7 +331,7 @@ def test_chatglm3_config_and_weight_load():
     weights = _load_checkpoint_weights(CHATGLM3_CKPT)
     assert "transformer.rotary_pos_emb.inv_freq" in weights
 
-    model.load_weights(weights)  # raises on missing / unexpected / shape-mismatch
+    model.load_weights(weights)
 
     for name, p in model.named_parameters():
         assert torch.isfinite(p).all(), f"non-finite parameter after load: {name}"
@@ -394,7 +390,7 @@ def test_chatglm3_partial_rope_boundary_and_theta():
     torch.testing.assert_close(q_rot_v[..., rotary_dim:], q_v[..., rotary_dim:], atol=0.0, rtol=0.0)
     assert not torch.allclose(q_rot_v[:, 1:, :, :rotary_dim], q_v[:, 1:, :, :rotary_dim])
 
-    cos = rotary.rotary_cos_sin[:, 0, :]  # [max_pos, rotary_dim//2]
+    cos = rotary.rotary_cos_sin[:, 0, :]
     inv_freq = torch.tensor(
         [10000.0 ** (-i / (rotary_dim // 2)) for i in range(rotary_dim // 2)], device=device
     )
@@ -806,7 +802,7 @@ def test_chatglm3_generation_parity(cfg: RuntimeCfg):
         for i, (ids, out) in enumerate(zip(prompt_ids, outputs)):
             trt_tokens = list(out.outputs[0].token_ids)[:max_new]
             trt_gl = torch.as_tensor(out.outputs[0].generation_logits).float()
-            trt_gl = trt_gl.reshape(-1, trt_gl.shape[-1])[:max_new]  # [steps, vocab]
+            trt_gl = trt_gl.reshape(-1, trt_gl.shape[-1])[:max_new]
             assert trt_gl.shape[0] >= max_new and len(trt_tokens) >= max_new, (
                 f"prompt {i}: {len(trt_tokens)} tokens / {trt_gl.shape[0]} logit rows < {max_new}"
             )
