@@ -665,9 +665,10 @@ private:
             TLLM_CHECK(it != mRequestToSession.end());
             session = std::addressof(it->second);
         }
-        // format() without LlmRequest — uses reuse tree path
+        // format() without LlmRequest — uses reuse tree path. The READY signal was
+        // already sent by response() before dispatching here (the receiver consumes
+        // exactly one READY per transfer, before the data); do not send another.
         mCacheTransferLayer.format(*session);
-        sendReadySignal(requestId, true);
     }
 
     // Look up the requested chain in the sender's reuse tree and pin it so the
@@ -682,8 +683,7 @@ private:
         auto* cacheManager = mCacheTransferLayer.getCacheManager();
         auto windowSize = cacheManager->getBlockManager().getWindowSizesMetadata().begin()->first;
         std::vector<kv_cache_manager::KVCacheBlock::IdType> pinnedIds;
-        auto lastBlock
-            = cacheManager->findBlocksInReuseTreeByBlockKey(lastBlockKey, windowSize, /*pinBlocks=*/true, &pinnedIds);
+        auto lastBlock = cacheManager->findBlocksInReuseTreeByBlockKey(lastBlockKey, windowSize, pinnedIds);
         if (lastBlock == nullptr)
         {
             return {};
