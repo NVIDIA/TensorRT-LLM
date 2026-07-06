@@ -63,7 +63,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 [^4]: LTX-2 has no built-in TeaCache coefficient table in TRT-LLM; set `teacache.coefficients` explicitly when enabling TeaCache.
 
-[^5]: Qwen-Image ships a native BF16 implementation with per-module numerical parity vs `diffusers.QwenImagePipeline` (cosine >= 0.999 on the full 20B transformer) and `trtllm-serve` / `/v1/images/generations` support. FP8 blockwise and NVFP4 use VisualGen dynamic quantization from BF16 checkpoints; no pre-quantized checkpoint is required.
+[^5]: Qwen-Image ships a native BF16 implementation with per-module numerical parity against `diffusers.QwenImagePipeline` (cosine similarity >= 0.999 on the full 20B transformer) and supports `trtllm-serve` / `/v1/images/generations`. VisualGen supports FP8 blockwise and NVFP4 dynamic quantization from BF16 checkpoints, as well as direct loading of statically quantized FP8 and NVFP4 ModelOpt checkpoints.
 
 ## Quick Start
 

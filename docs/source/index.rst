@@ -128,10 +128,9 @@ Welcome to TensorRT LLM's Documentation!
 
 .. toctree::
    :maxdepth: 2
-   :caption: Use TensorRT Engine
-   :hidden:
+   :caption: Migration
 
-   legacy/tensorrt_quickstart.md
+   legacy/tensorrt-backend-removal.md
 
 Indices and tables
 ==================

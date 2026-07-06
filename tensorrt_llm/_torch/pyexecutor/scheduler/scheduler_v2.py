@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import enum
+import os
 from typing import Optional
 
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
@@ -207,6 +208,14 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._disagg_gen_init_state_value = LlmRequestState.DISAGG_GENERATION_INIT.value
         self._gen_to_complete_state_value = LlmRequestState.GENERATION_TO_COMPLETE.value
 
+        # Opt-in (default off): on the disagg generation server, schedule
+        # just-arrived generation-only requests (first token not yet emitted)
+        # ahead of older in-flight decodes to reduce TTFT under budget
+        # pressure. See _schedule_loop.
+        self._prioritize_first_token_gen = (
+            os.environ.get("TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN", "0") == "1"
+        )
+
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> SchedulerOutput:
@@ -261,6 +270,18 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Use indexed iteration (while + req_it_end) so that MAX_UTIL
         # eviction can shrink the range from the tail.
         requests_list = list(active_requests)
+
+        # Opt-in: prioritize disagg-gen first-token requests (see __init__).
+        # py_decoding_iter == 0 covers DISAGG_GENERATION_INIT /
+        # TRANS_IN_PROGRESS / TRANS_COMPLETE. A stable sort keeps FIFO arrival
+        # order within each class; no-op without generation-only requests.
+        if self._prioritize_first_token_gen:
+            requests_list.sort(
+                key=lambda req: (
+                    0 if (req.is_generation_only_request() and req.py_decoding_iter == 0) else 1
+                )
+            )
+
         req_it_end = len(requests_list)
         req_it = 0
 
@@ -474,15 +495,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         Returns ``(action, tokens)``.  *tokens* is 0 because disagg requests
         don't participate in the forward pass token budget.
         """
-        if not self.kv_cache_manager.prepare_context(req):
-            logger.debug("prepare_context failed for disagg gen init request %s", req.py_request_id)
+        if not self.kv_cache_manager.prepare_disagg_gen_init(req):
+            logger.debug("prepare_disagg_gen_init failed for request %s", req.py_request_id)
             return ScheduleAction.SKIP, 0
-
-        if not self.kv_cache_manager.resize_context(
-            req, req.context_remaining_length + get_draft_token_length(req)
-        ):
-            return ScheduleAction.SKIP, 0
-
         return ScheduleAction.SCHEDULED, 0
 
     def _try_schedule_context(
