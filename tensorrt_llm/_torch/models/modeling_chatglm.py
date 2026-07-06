@@ -55,7 +55,7 @@ def normalize_chatglm_config(config: PretrainedConfig) -> PretrainedConfig:
     # ChatGLM derives the RoPE base as 10000 * rope_ratio (rope_ratio defaults to 1).
     # RopeParams.from_config reads only rope_theta, so fill it here or long-context
     # variants (e.g. chatglm3-6b-32k, rope_ratio>1) would silently use base 10000.
-    _set_missing("rope_theta", 10000.0 * float(getattr(config, "rope_ratio", None) or 1.0))
+    _set_missing("rope_theta", 10000.0 * (getattr(config, "rope_ratio", None) or 1.0))
 
     _set_missing(
         "attention_bias",
