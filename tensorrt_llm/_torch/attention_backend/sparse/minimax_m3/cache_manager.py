@@ -25,9 +25,9 @@ from tensorrt_llm._utils import (
 )
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
-from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, LayerId
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
-from tensorrt_llm.runtime.kv_cache_manager_v2._utils import typed_range
+from tensorrt_llm.runtime.kv_cache_manager_v2._utils import exact_div
 
 from ....pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
 
@@ -341,23 +341,28 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         full_view = convert_to_torch_tensor(TensorWrapper(addr_key, torch_dtype, full_slot_shape))
         return full_view[:, :2]
 
-    def _build_pool_mapping_tensors(self):
-        """Compute pool-mapping offsets from layer position in the pool group.
+    def _prepare_page_table_tensor(self, index_mapper_capacity: int) -> None:
+        """Populate the base's page-table state without the broken exact_div.
 
-        The base method does ``exact_div(addr_offset, key_bytes *
-        kv_factor * tokens_per_block)``, which assumes each layer
-        contributes exactly K+V. When INDEX_KEY coincidentally shares
-        the same per-block size as K/V (M3 production at TP=8: all
-        three are 256 B/token), V2 coalesces all three into one pool
-        and the per-layer stride becomes ``3 * single_buffer_size`` —
-        the base ``exact_div`` then asserts.
+        The base method (renamed from ``_build_pool_mapping_tensors`` by the
+        DSv4 refactor) divides ``addr_offset`` by ``key_bytes * kv_factor *
+        tokens_per_block`` to compute the per-layer offset within a group.
+        That formula assumes each layer contributes exactly K+V to the pool.
+        When INDEX_KEY coincidentally shares the same per-block size as K/V
+        (M3 production at TP=8: all three are 256 B/token), V2 coalesces all
+        three into one pool and the per-layer stride becomes
+        ``3 * single_buffer_size`` — the base's ``exact_div`` then asserts.
 
-        Compute ``offset`` directly from
-        ``self.impl.layer_grouping[group_id]`` so the formula stays
-        correct regardless of how many extra buffers coalesce with
-        K/V. The M3 forward path uses :meth:`get_buffers` /
-        :meth:`get_index_k_buffer` rather than this mapping, so the
-        offset just needs to be consistent (layer position in group).
+        This override computes ``offset`` directly from
+        ``self.impl.layer_grouping[group_id]`` (layer position in group) so
+        the formula stays correct regardless of how many extra buffers
+        coalesce with K/V. The M3 forward path uses :meth:`get_buffers` /
+        :meth:`get_index_k_buffer`, so the mapping offset only needs to be
+        consistent with the pool layout.
+
+        The other four attributes (`index_scales`, `kv_offset`,
+        `host_kv_cache_block_offsets`, and the NVFP4-stacked pointers) mirror
+        the base's non-SWA else branch so downstream consumers keep working.
         """
         kv_cache_pool_pointers = torch.tensor(
             [
@@ -396,20 +401,46 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                 dim=-1,
             )
 
-        kv_cache_pool_mapping_list = []
-        for layer_id in typed_range(LayerId(self.num_local_layers)):
-            layer_group_id = self.impl.get_layer_group_id(layer_id)
-            layers_in_group = list(self.impl.layer_grouping[int(layer_group_id)])
-            offset = layers_in_group.index(int(layer_id))
-            kv_cache_pool_mapping_list.append([int(layer_group_id), offset])
+        kv_cache_pool_mapping_list: List[List[int]] = [[0, 0] for _ in range(self.num_local_layers)]
+        for group_id, layers in enumerate(self.impl.layer_grouping):
+            for offset, layer_id in enumerate(layers):
+                kv_cache_pool_mapping_list[int(layer_id)] = [group_id, offset]
 
-        kv_cache_pool_mapping = torch.tensor(
+        self.kv_cache_pool_pointers = kv_cache_pool_pointers
+        self.kv_cache_pool_mapping = torch.tensor(
             kv_cache_pool_mapping_list,
             dtype=torch.int32,
             device="cpu",
             pin_memory=prefer_pinned(),
         )
-        return kv_cache_pool_pointers, kv_cache_pool_mapping
+
+        self.index_scales = torch.empty(
+            self.num_pools, dtype=torch.int32, pin_memory=prefer_pinned(), device="cpu"
+        )
+        self.kv_offset = torch.empty(
+            self.num_pools, dtype=torch.int32, pin_memory=prefer_pinned(), device="cpu"
+        )
+        for pool_id in range(self.num_pools):
+            layer_id = self.impl.layer_grouping[pool_id][0]
+            self.index_scales[pool_id] = self.impl.get_page_index_scale(layer_id, Role.KEY)
+            if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
+                self.kv_offset[pool_id] = exact_div(
+                    self.impl.get_mem_pool_base_address(layer_id, Role.VALUE)
+                    - self.impl.get_mem_pool_base_address(layer_id, Role.KEY),
+                    self.impl.get_page_stride(layer_id, Role.KEY),
+                )
+            else:
+                self.kv_offset[pool_id] = 0
+
+        self.host_kv_cache_block_offsets = torch.zeros(
+            self.num_pools,
+            index_mapper_capacity * self.max_beam_width,
+            2,  # key and value
+            self.max_blocks_per_seq,
+            dtype=torch.int32,
+            pin_memory=prefer_pinned(),
+            device="cpu",
+        )
 
     def _get_batch_cache_indices_by_pool_id(
         self,
