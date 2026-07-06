@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 from pathlib import Path
 
 import pytest
@@ -95,6 +96,7 @@ _MIXED_ENCODER_EXPECTED_TEXT_FRAGMENTS_BY_MODEL = {
     "t5-small": [_EXPECTED_TRANSLATION_FRAGMENT, "Buch"],
     "flan-t5-small": [_EXPECTED_TRANSLATION_FRAGMENT, "Buch"],
 }
+_MIXED_CONTEXT_GENERATION_MAX_NEW_TOKENS = 8
 
 
 def _test_case(
@@ -106,6 +108,7 @@ def _test_case(
     num_return_sequences: int,
     exact_match: bool,
     feature_id: str,
+    cuda_graph_batch_sizes: list[int] | None = None,
     tensor_parallel_size: int = 1,
     marks=None,
 ):
@@ -141,6 +144,7 @@ def _test_case(
         num_beams,
         num_return_sequences,
         exact_match,
+        cuda_graph_batch_sizes,
         tensor_parallel_size,
         **param_kwargs,
     )
@@ -255,13 +259,23 @@ _TEST_CASES = [
         model_name="t5-small",
         torch_dtype="bfloat16",
         use_kv_cache_manager_v2=False,
-        enable_cuda_graph=False,
+        enable_cuda_graph=True,
         num_beams=1,
         num_return_sequences=1,
         exact_match=True,
-        feature_id="bf16-kv-v1-cuda-graph-off-greedy-tp2",
-        tensor_parallel_size=2,
-        marks=pytest.mark.skip_less_device(2),
+        cuda_graph_batch_sizes=[2],
+        feature_id="bf16-kv-v1-cuda-graph-on-greedy",
+    ),
+    _test_case(
+        model_name="t5-small",
+        torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=False,
+        enable_cuda_graph=True,
+        num_beams=2,
+        num_return_sequences=2,
+        exact_match=False,
+        cuda_graph_batch_sizes=[2],
+        feature_id="bf16-kv-v1-cuda-graph-on-beam2",
     ),
     # Precision coverage for beam search. KVCacheManagerV2 currently requires
     # max_beam_width == 1, so beam-search precision coverage uses v1.
@@ -320,13 +334,12 @@ _TEST_CASES = [
         model_name="t5-small",
         torch_dtype="bfloat16",
         use_kv_cache_manager_v2=True,
-        enable_cuda_graph=False,
+        enable_cuda_graph=True,
         num_beams=1,
         num_return_sequences=1,
         exact_match=True,
-        feature_id="bf16-kv-v2-cuda-graph-off-greedy-tp2",
-        tensor_parallel_size=2,
-        marks=pytest.mark.skip_less_device(2),
+        cuda_graph_batch_sizes=[2],
+        feature_id="bf16-kv-v2-cuda-graph-on-greedy",
     ),
     _test_case(
         model_name="t5-small",
@@ -389,6 +402,31 @@ _TEST_CASES = [
         exact_match=True,
         feature_id="bf16-kv-v2-cuda-graph-off-greedy",
     ),
+    # Tensor parallelism (TP=2) coverage
+    _test_case(
+        model_name="t5-small",
+        torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=False,
+        enable_cuda_graph=False,
+        num_beams=1,
+        num_return_sequences=1,
+        exact_match=True,
+        tensor_parallel_size=2,
+        feature_id="bf16-kv-v1-cuda-graph-off-greedy-tp2",
+        marks=pytest.mark.skip_less_device(2),
+    ),
+    _test_case(
+        model_name="t5-small",
+        torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=False,
+        enable_cuda_graph=True,
+        num_beams=1,
+        num_return_sequences=1,
+        exact_match=True,
+        tensor_parallel_size=2,
+        feature_id="bf16-kv-v1-cuda-graph-on-greedy-tp2",
+        marks=pytest.mark.skip_less_device(2),
+    ),
 ]
 
 
@@ -428,7 +466,7 @@ _MIXED_BATCH_TEST_CASES = [
         num_beams=2,
         num_return_sequences=2,
         exact_match=False,
-        feature_id="bf16-kv-v1-cuda-graph-off-beam2-batch2",
+        feature_id="bf16-kv-v1-decoder-cuda-graph-on-beam2-batch2",
     ),
     _mixed_batch_test_case(
         model_name="flan-t5-small",
@@ -437,7 +475,7 @@ _MIXED_BATCH_TEST_CASES = [
         num_beams=2,
         num_return_sequences=2,
         exact_match=False,
-        feature_id="bf16-kv-v1-cuda-graph-off-beam2-batch2",
+        feature_id="bf16-kv-v1-decoder-cuda-graph-on-beam2-batch2",
     ),
     _mixed_batch_test_case(
         model_name="t5-small",
@@ -446,7 +484,7 @@ _MIXED_BATCH_TEST_CASES = [
         num_beams=1,
         num_return_sequences=1,
         exact_match=True,
-        feature_id="bf16-kv-v1-cuda-graph-off-greedy-batch2",
+        feature_id="bf16-kv-v1-decoder-cuda-graph-on-greedy-batch2",
     ),
     _mixed_batch_test_case(
         model_name="t5-small",
@@ -455,9 +493,10 @@ _MIXED_BATCH_TEST_CASES = [
         num_beams=1,
         num_return_sequences=1,
         exact_match=True,
-        feature_id="bf16-kv-v2-cuda-graph-off-greedy-batch2",
+        feature_id="bf16-kv-v2-decoder-cuda-graph-on-greedy-batch2",
     ),
 ]
+
 
 pytestmark = [
     pytest.mark.skip_less_device(1),
@@ -495,16 +534,63 @@ def _sampling_params(num_beams: int, num_return_sequences: int) -> SamplingParam
     )
 
 
-def _cuda_graph_config(
-    enabled: bool,
+def _decoder_cuda_graph_config(
     batch_sizes: list[int] | None = None,
-) -> CudaGraphConfig | None:
-    return CudaGraphConfig(batch_sizes=batch_sizes or [1]) if enabled else None
+) -> CudaGraphConfig:
+    # CudaGraphConfig is decode-only. It keeps encoder CUDA graphs disabled,
+    # which is what mixed encoder-length tests want while still covering
+    # decoder graph capture/replay.
+    return CudaGraphConfig(
+        batch_sizes=batch_sizes or [1],
+        enable_padding=True,
+    )
+
+
+def _assert_decoder_cuda_graph_state(
+    llm: LLM,
+    enabled: bool,
+    batch_sizes: list[int] | None,
+) -> None:
+    model_engine = llm._executor.engine.model_engine
+
+    if not enabled:
+        assert not model_engine.encoder_cuda_graph_runner.enabled
+        assert not model_engine.cuda_graph_runner.enabled
+        assert not model_engine.encoder_cuda_graph_runner.graphs
+        assert not model_engine.cuda_graph_runner.graphs
+        return
+
+    _assert_decoder_cuda_graphs_captured(llm)
+    if batch_sizes is not None:
+        assert model_engine.cuda_graph_runner.padding_dummy_requests
+
+
+def _assert_decoder_cuda_graphs_captured(llm: LLM) -> None:
+    model_engine = llm._executor.engine.model_engine
+
+    assert not model_engine.encoder_cuda_graph_runner.enabled
+    assert not model_engine.encoder_cuda_graph_runner.graphs
+    assert model_engine.cuda_graph_runner.enabled
+    assert model_engine.cuda_graph_runner.graphs
+
+
+def _assert_mixed_context_generation_cuda_graph_state(llm: LLM) -> None:
+    _assert_decoder_cuda_graphs_captured(llm)
+    assert llm._executor.engine.model_engine.cuda_graph_runner.padding_dummy_requests
+
+
+class _SleepLogitsProcessor:
+    def __init__(self, delay_seconds: float) -> None:
+        self.delay_seconds = delay_seconds
+
+    def __call__(self, req_id, logits, token_ids, stream_ptr, client_id) -> None:
+        time.sleep(self.delay_seconds)
 
 
 def _assert_t5_response(
     response: RequestOutput,
     num_return_sequences: int,
+    max_tokens: int = _MAX_NEW_TOKENS,
 ) -> list[list[int]]:
     assert response.finished
 
@@ -512,7 +598,7 @@ def _assert_t5_response(
     token_ids_by_output = []
     for output in response.outputs:
         assert output.token_ids is not None
-        assert 0 < len(output.token_ids) <= _MAX_NEW_TOKENS
+        assert 0 < len(output.token_ids) <= max_tokens
         token_ids_by_output.append(output.token_ids)
     return token_ids_by_output
 
@@ -550,6 +636,11 @@ def _assert_expected_generation(
         assert len({tuple(token_ids) for token_ids in token_ids_by_output}) == len(
             token_ids_by_output
         )
+    if not exact_match:
+        return
+
+    assert expected_token_ids_by_output is not None
+    assert token_ids_by_output == expected_token_ids_by_output
 
 
 def _run_t5_pytorch_generate_encoder_decoder(
@@ -562,6 +653,7 @@ def _run_t5_pytorch_generate_encoder_decoder(
     num_beams: int,
     num_return_sequences: int,
     exact_match: bool,
+    cuda_graph_batch_sizes: list[int] | None,
     tensor_parallel_size: int = 1,
 ) -> None:
     if tensor_parallel_size == 1:
@@ -581,7 +673,9 @@ def _run_t5_pytorch_generate_encoder_decoder(
         model_path,
         backend="pytorch",
         attn_backend="TRTLLM",
-        cuda_graph_config=_cuda_graph_config(enable_cuda_graph),
+        cuda_graph_config=_decoder_cuda_graph_config(cuda_graph_batch_sizes)
+        if enable_cuda_graph
+        else None,
         disable_overlap_scheduler=True,
         dtype=torch_dtype,
         enable_chunked_prefill=False,
@@ -593,7 +687,7 @@ def _run_t5_pytorch_generate_encoder_decoder(
             cross_kv_cache_fraction=_CROSS_KV_CACHE_FRACTION,
             use_kv_cache_manager_v2=use_kv_cache_manager_v2,
         ),
-        max_batch_size=1,
+        max_batch_size=max(cuda_graph_batch_sizes or [1]),
         max_beam_width=num_beams,
         max_input_len=_MAX_SEQUENCE_LENGTH,
         max_num_tokens=_MAX_SEQUENCE_LENGTH,
@@ -617,11 +711,22 @@ def _run_t5_pytorch_generate_encoder_decoder(
             exact_match,
             expected_output_token_ids_by_output,
         )
+        # CUDA graph state introspection reaches into the in-process engine,
+        # which is only available when the executor runs single-process (TP=1).
+        # For TP>1 the executor is a multi-process proxy without a local engine,
+        # so we rely on the generated-output assertions above for correctness.
+        if tensor_parallel_size == 1:
+            _assert_decoder_cuda_graph_state(
+                llm,
+                enable_cuda_graph,
+                cuda_graph_batch_sizes,
+            )
 
 
 @pytest.mark.parametrize(
     "model_name,expected_output_token_ids_by_output,torch_dtype,use_kv_cache_manager_v2,"
-    "enable_cuda_graph,num_beams,num_return_sequences,exact_match,tensor_parallel_size",
+    "enable_cuda_graph,num_beams,num_return_sequences,exact_match,cuda_graph_batch_sizes,"
+    "tensor_parallel_size",
     _TEST_CASES,
 )
 def test_t5_pytorch_generate_encoder_decoder_end_to_end(
@@ -634,6 +739,7 @@ def test_t5_pytorch_generate_encoder_decoder_end_to_end(
     num_beams: int,
     num_return_sequences: int,
     exact_match: bool,
+    cuda_graph_batch_sizes: list[int] | None,
     tensor_parallel_size: int,
 ) -> None:
     _run_t5_pytorch_generate_encoder_decoder(
@@ -646,6 +752,7 @@ def test_t5_pytorch_generate_encoder_decoder_end_to_end(
         num_beams,
         num_return_sequences,
         exact_match,
+        cuda_graph_batch_sizes,
         tensor_parallel_size,
     )
 
@@ -673,14 +780,14 @@ def test_t5_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch(
     sampling_params = _sampling_params(num_beams, num_return_sequences)
     case_id = (
         f"model={model_name}, dtype={torch_dtype}, kv_v2={use_kv_cache_manager_v2}, "
-        f"cuda_graph=False, beams={num_beams}, returns={num_return_sequences}, "
+        f"decoder_cuda_graph=True, beams={num_beams}, returns={num_return_sequences}, "
         "mixed_encoder_lengths=True, batch_size=2"
     )
     with LLM(
         model_path,
         backend="pytorch",
         attn_backend="TRTLLM",
-        cuda_graph_config=None,
+        cuda_graph_config=_decoder_cuda_graph_config([2]),
         disable_overlap_scheduler=True,
         dtype=torch_dtype,
         enable_chunked_prefill=False,
@@ -734,3 +841,73 @@ def test_t5_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch(
                 expected_token_ids_by_output=expected_token_ids,
                 expected_text_fragment=expected_text_fragment,
             )
+
+        _assert_decoder_cuda_graphs_captured(llm)
+
+
+def test_t5_pytorch_generate_encoder_decoder_mixed_context_generation_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+    monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
+
+    model_name = "t5-small"
+    model_path = _get_t5_model_path(model_name)
+    first_sampling_params = SamplingParams(
+        max_tokens=_MIXED_CONTEXT_GENERATION_MAX_NEW_TOKENS,
+        temperature=0.0,
+        ignore_eos=True,
+        logits_processor=_SleepLogitsProcessor(delay_seconds=0.02),
+    )
+    second_sampling_params = SamplingParams(
+        max_tokens=_MAX_NEW_TOKENS,
+        temperature=0.0,
+    )
+
+    with LLM(
+        model_path,
+        backend="pytorch",
+        attn_backend="TRTLLM",
+        cuda_graph_config=_decoder_cuda_graph_config([2]),
+        disable_overlap_scheduler=True,
+        dtype="bfloat16",
+        enable_chunked_prefill=False,
+        kv_cache_config=KvCacheConfig(
+            enable_block_reuse=False,
+            max_tokens=_MAX_KV_TOKENS,
+            free_gpu_memory_fraction=_FREE_GPU_MEMORY_FRACTION,
+            cross_kv_cache_fraction=_CROSS_KV_CACHE_FRACTION,
+            use_kv_cache_manager_v2=False,
+        ),
+        max_batch_size=2,
+        max_beam_width=1,
+        max_input_len=_MAX_SEQUENCE_LENGTH,
+        max_num_tokens=_MAX_SEQUENCE_LENGTH,
+        max_seq_len=_MAX_SEQUENCE_LENGTH,
+        model_kwargs={"torch_dtype": "bfloat16"},
+        scheduler_config=SchedulerConfig(use_python_scheduler=True),
+    ) as llm:
+        first_response = llm.generate_async(
+            _SOURCE_TEXT,
+            sampling_params=first_sampling_params,
+            streaming=True,
+        )
+        first_stream_step = next(first_response)
+        assert not first_stream_step.finished
+
+        second_response = llm.generate_async(
+            _MIXED_ENCODER_SOURCE_TEXTS[1],
+            sampling_params=second_sampling_params,
+            streaming=False,
+        )
+
+        first_response.result()
+        second_response.result()
+
+        _assert_t5_response(
+            first_response,
+            num_return_sequences=1,
+            max_tokens=_MIXED_CONTEXT_GENERATION_MAX_NEW_TOKENS,
+        )
+        _assert_t5_response(second_response, num_return_sequences=1)
+        _assert_mixed_context_generation_cuda_graph_state(llm)

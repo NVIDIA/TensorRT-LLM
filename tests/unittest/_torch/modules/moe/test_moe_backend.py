@@ -194,6 +194,7 @@ def test_megamoe_init_rejects_uneven_num_slots_with_value_error():
             tp_size=4,
             moe_tp_size=1,
             moe_ep_size=4,
+            enable_attention_dp=True,
         ),
         moe_backend=MoeBackendType.MEGAMOE_DEEPGEMM.value,
     )

@@ -98,7 +98,16 @@ _TINY_KWARGS_UNIVERSAL: Dict[str, Any] = {
     "num_experts": 8,
     "num_experts_per_tok": 2,
     "num_local_experts": 8,
-    "moe_intermediate_size": 16,
+    # MoE intermediate sizes must stay divisible by the NVFP4 block size (16)
+    # AFTER sharding so the ``--sharding-ir-quant nvfp4`` path's on-the-fly
+    # ``fp4_quantize`` load hook (needs ``in_features % 16 == 0``) doesn't trip
+    # ``Expected k % sfVecSize == 0``. Routed experts are MoE-TP-sharded by
+    # ``moe_tp_size`` (<=2 here): 32 -> 16 stays valid. The NemotronH shared
+    # expert (``moe_shared_expert_intermediate_size``) is a dense MLP TP-sharded
+    # by the full ``tp_size`` (<=4 under ``tep``): 64 -> 16 stays valid. bf16
+    # runs are unaffected (just wider experts).
+    "moe_intermediate_size": 32,
+    "moe_shared_expert_intermediate_size": 64,
     "first_k_dense_replace": 0,
     "n_routed_experts": 8,
     "n_shared_experts": 1,
@@ -126,79 +135,6 @@ _TINY_KWARGS_UNIVERSAL: Dict[str, Any] = {
     "linear_value_head_dim": 16,
     "linear_conv_kernel_dim": 4,
 }
-
-
-def fix_moe_routers_deterministic(model) -> int:
-    """Force MoE routers to deterministically pick experts ``[0..top_k-1]``.
-
-    Walks ``model.named_modules`` looking for modules whose class name contains
-    ``Router`` or ``Gate`` (e.g. ``Qwen3_5MoeTopKRouter``, ``DeepSeekV3MoEGate``,
-    ``NemotronHTopkRouter``) with a 2-d ``weight`` of shape
-    ``(num_experts, hidden_size)`` and ``num_experts <= 64``. For each match:
-
-      * ``weight[i, :] = (num_experts - i) / sqrt(H)``  -- small but monotonic
-        decreasing coefficient over experts, keeps the linear projection in the
-        export graph.
-      * ``e_score_correction_bias[i] = (num_experts - i) * 100``  (if present)
-        -- the grouped-top-k path in DeepSeek-V3 / Nemotron-H reads this bias,
-        so making it large and monotonic dominates the routing decision.
-      * For Qwen3.5-MoE routers (no built-in bias), the router's ``forward`` is
-        replaced by a version that adds a strong monotonic logit bias before
-        softmax / top-k. The bias dominates the linear contribution from
-        ``hidden_states``, so top-k always picks experts ``[0..top_k-1]``
-        regardless of input -- killing the cross-precision routing flips that
-        would otherwise mask sharding bugs vs reduction-order noise.
-
-    Router weights themselves are not TP-sharded, so both the unsharded and
-    sharded forwards see the same router output for a given token. Returns the
-    count of fixed router modules.
-    """
-    import types
-
-    import torch
-    import torch.nn.functional as F
-
-    def _patched_qwen_router_forward(self, hidden_states):
-        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-        router_logits = F.linear(hidden_states, self.weight) + self._test_router_bias
-        routing_weights = F.softmax(router_logits, dtype=torch.float, dim=-1)
-        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
-        return routing_weights.to(hidden_states.dtype), selected_experts
-
-    fixed = 0
-    with torch.no_grad():
-        for name, mod in model.named_modules():
-            cls = type(mod).__name__
-            if "Router" not in cls and "Gate" not in cls:
-                continue
-            if not hasattr(mod, "weight"):
-                continue
-            w = mod.weight
-            if w.ndim != 2:
-                continue
-            num_experts, hidden = w.shape
-            if num_experts > 64:
-                continue  # not a router (probably a FFN projection)
-            coeffs_fp32 = torch.arange(num_experts, 0, -1, dtype=torch.float32, device=w.device)
-            new_w = (
-                (coeffs_fp32 / (hidden**0.5)).unsqueeze(1).expand(num_experts, hidden).to(w.dtype)
-            )
-            w.data.copy_(new_w)
-            if hasattr(mod, "e_score_correction_bias"):
-                # Used by DeepSeek-V3 / Nemotron-H grouped top-k path (noaux_tc_op).
-                b = mod.e_score_correction_bias
-                b.data.copy_((coeffs_fp32 * 100.0).to(b.dtype))
-            elif cls == "Qwen3_5MoeTopKRouter":
-                # Qwen3.5-MoE has no built-in bias; install one and patch forward.
-                bias = (coeffs_fp32 * 100.0).to(w.dtype)
-                if not hasattr(mod, "_test_router_bias"):
-                    mod.register_buffer("_test_router_bias", bias)
-                else:
-                    mod._test_router_bias.data.copy_(bias)
-                mod.forward = types.MethodType(_patched_qwen_router_forward, mod)
-            fixed += 1
-    return fixed
 
 
 def _balanced_layers_block_type(num_layers: int) -> list:
@@ -390,16 +326,33 @@ def spec_from_modeling_file(path: str) -> IRModelSpec:
     # caller has done any necessary sys.path / env-var setup.
     from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 
-    candidates = [
-        (cfg_name, cls)
-        for cfg_name, cls in AutoModelForCausalLMFactory._custom_model_mapping.items()
-        if cls.__module__ == module_name and cls.__name__.endswith("ForCausalLM")
-    ]
+    # Walk AutoModelForCausalLMFactory AND every subclass. Each subclass gets
+    # its own _custom_model_mapping via __init_subclass__ (see hf.py:668), so a
+    # model registered against a specialized factory (e.g. NemotronFlashForCausalLMFactory,
+    # EagleDrafterFactory) is invisible to a search on the base factory alone.
+    factories = [AutoModelForCausalLMFactory]
+    pending = [AutoModelForCausalLMFactory]
+    seen = {AutoModelForCausalLMFactory}
+    while pending:
+        cls = pending.pop()
+        for sub in cls.__subclasses__():
+            if sub not in seen:
+                seen.add(sub)
+                pending.append(sub)
+                factories.append(sub)
+
+    candidates = []
+    for factory in factories:
+        candidates.extend(
+            (cfg_name, cls)
+            for cfg_name, cls in factory._custom_model_mapping.items()
+            if cls.__module__ == module_name and cls.__name__.endswith("ForCausalLM")
+        )
     if not candidates:
         raise RuntimeError(
             f"No '*ForCausalLM' class registered from {module_name!r}. "
             "Ensure the modeling file ends with a "
-            "'AutoModelForCausalLMFactory.register_custom_model_cls(...)' "
+            "'<AutoModelForCausalLMFactory or subclass>.register_custom_model_cls(...)' "
             "call for a 'ForCausalLM' class."
         )
     config_cls_name, model_cls = candidates[0]
@@ -432,6 +385,23 @@ def spec_from_modeling_file(path: str) -> IRModelSpec:
 # -----------------------------------------------------------------------------
 
 
+def build_tiny_config(cfg_cls: type) -> Any:
+    """Default-construct ``cfg_cls`` and patch it down to the tiny test shape.
+
+    Shared by :func:`build_ir_model` (base modeling files) and
+    :func:`build_eagle_draft_model` (Eagle drafter base configs). Applies the
+    per-family quirks on the pristine config first, then the universal tiny
+    kwargs, then the layer-count-dependent quirks -- see :func:`build_ir_model`
+    for why that ordering matters.
+    """
+    config = cfg_cls()
+    _apply_per_family_quirks(config)
+    for k, v in _TINY_KWARGS_UNIVERSAL.items():
+        setattr(config, k, v)
+    _apply_layer_count_dependent_quirks(config, _TINY_KWARGS_UNIVERSAL["num_hidden_layers"])
+    return config
+
+
 def build_ir_model(spec: IRModelSpec, device: torch.device, dtype: torch.dtype) -> nn.Module:
     """Programmatically build the IR-onboarded model with a tiny config.
 
@@ -449,16 +419,140 @@ def build_ir_model(spec: IRModelSpec, device: torch.device, dtype: torch.dtype) 
     """
     cfg_module = importlib.import_module(spec.config_module)
     cfg_cls = getattr(cfg_module, spec.config_cls)
-    config = cfg_cls()
-    _apply_per_family_quirks(config)
-    for k, v in _TINY_KWARGS_UNIVERSAL.items():
-        setattr(config, k, v)
-    _apply_layer_count_dependent_quirks(config, _TINY_KWARGS_UNIVERSAL["num_hidden_layers"])
+    config = build_tiny_config(cfg_cls)
 
     modeling_module = importlib.import_module(spec.modeling_module)
     model_cls = getattr(modeling_module, spec.modeling_cls)
     model = model_cls(config).to(device=device, dtype=dtype).eval()
     return model
+
+
+# -----------------------------------------------------------------------------
+# Eagle draft-model build + forward helpers
+#
+# The Eagle draft is not a standalone registered modeling file: it is built by
+# ``EagleDrafterFactory`` from a base model config wrapped in ``EagleConfig``.
+# For the sharding-IR equivalence test we don't need the target or any
+# speculative-decoding machinery -- the draft GraphModule is just numbers in /
+# numbers out, so we build the draft on a tiny config and feed it random
+# ``(inputs_embeds, position_ids, hidden_states)`` exactly as the exported draft
+# GM expects (see ``DraftModelExportInfo._init_dynamic_shape_lookup`` and
+# ``EagleDrafterForCausalLM.forward``). Sharding correctness is a property of
+# the math, independent of whether the activations are "real".
+# -----------------------------------------------------------------------------
+
+# model_type -> (base-config module, base-config class). The base config is
+# built tiny, then wrapped via ``EagleConfig.from_base_config(base, model_type)``.
+# ``llama`` resolves directly from transformers; ``nemotron_h`` has no bundled
+# config class (see modeling_nemotron_h.py:631), so it is resolved through the
+# transformers registry by name.
+_EAGLE_BASE_CONFIG: Dict[str, Tuple[str, str]] = {
+    "llama": ("transformers.models.llama.configuration_llama", "LlamaConfig"),
+}
+
+
+def _resolve_eagle_base_config_cls(model_type: str) -> type:
+    """Return the base-model config class for an Eagle draft ``model_type``."""
+    if model_type in _EAGLE_BASE_CONFIG:
+        mod_name, cls_name = _EAGLE_BASE_CONFIG[model_type]
+        return getattr(importlib.import_module(mod_name), cls_name)
+    # Fallback: resolve by the conventional config class name via the
+    # transformers registry (handles nemotron_h, whose config class is not
+    # bundled locally).
+    guessed = "".join(part.capitalize() for part in model_type.split("_")) + "Config"
+    cfg_cls = _resolve_config_cls_from_transformers_registry(guessed)
+    if cfg_cls is None:
+        raise RuntimeError(
+            f"Could not resolve a base config class for Eagle model_type "
+            f"{model_type!r} (tried _EAGLE_BASE_CONFIG and transformers "
+            f"registry name {guessed!r})."
+        )
+    return cfg_cls
+
+
+def build_eagle_draft_model(model_type: str, device: torch.device, dtype: torch.dtype) -> nn.Module:
+    """Build a tiny ``EagleDrafterForCausalLM`` for the given base ``model_type``.
+
+    Mirrors ``EagleDrafterFactory._build_model`` (models/eagle.py): build a tiny
+    base config, wrap it via ``EagleConfig.from_base_config``, then instantiate
+    ``EagleDrafterForCausalLM``. No checkpoint / filesystem access.
+    """
+    from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import (
+        EagleConfig,
+        EagleDrafterForCausalLM,
+    )
+
+    base_cfg = build_tiny_config(_resolve_eagle_base_config_cls(model_type))
+    base_cfg.model_type = model_type
+    eagle_cfg = EagleConfig.from_base_config(base_cfg, model_type)
+    model = EagleDrafterForCausalLM(eagle_cfg).to(device=device, dtype=dtype).eval()
+    return model
+
+
+def build_random_draft_inputs(
+    batch_size: int,
+    seq_len: int,
+    hidden_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    seed: int = 42,
+    std: float = 0.05,
+) -> Dict[str, torch.Tensor]:
+    """Deterministic ``{inputs_embeds, position_ids, hidden_states}`` for the draft.
+
+    All float tensors share one generator so both equivalence sides see
+    identical inputs. ``hidden_states`` is the (already fc-compressed) target
+    hidden state the draft consumes -- shape ``[B, S, hidden_size]``.
+
+    ``std`` is small (matched to the weight-init std) on purpose. The draft
+    layer computes ``residual + attn(norm(...))``: the RMSNorm makes the
+    attention/MLP *input* scale-invariant, so their output magnitude is set by
+    the weights (~init std), while the residual is the raw ``hidden_states``.
+    If ``hidden_states`` were unit-scale (``randn``) the residual would dwarf
+    the sharded attn/MLP contribution and mask sharding bugs (a broken
+    all_reduce would only perturb the small term). Scaling the inputs to the
+    weight-init scale keeps the residual and the sharded contribution
+    comparable so the negative-control (``SHARDING_IR_SABOTAGE=1``) actually
+    trips.
+    """
+    gen = torch.Generator(device=device).manual_seed(seed)
+    inputs_embeds = (
+        torch.randn(batch_size, seq_len, hidden_size, device=device, dtype=dtype, generator=gen)
+        * std
+    )
+    hidden_states = (
+        torch.randn(batch_size, seq_len, hidden_size, device=device, dtype=dtype, generator=gen)
+        * std
+    )
+    position_ids = (
+        torch.arange(seq_len, device=device, dtype=torch.long)
+        .unsqueeze(0)
+        .expand(batch_size, seq_len)
+        .contiguous()
+    )
+    return {
+        "inputs_embeds": inputs_embeds,
+        "position_ids": position_ids,
+        "hidden_states": hidden_states,
+    }
+
+
+def extract_draft_output(out: Any) -> torch.Tensor:
+    """Pull the comparison tensor out of an ``Eagle3DraftOutput``.
+
+    Prefers ``last_hidden_state`` (always populated for both Llama and
+    NemotronH drafts); falls back to ``logits`` / ``norm_hidden_state``. Also
+    accepts a raw tensor or tuple (post-export GM output).
+    """
+    if isinstance(out, torch.Tensor):
+        return out
+    if isinstance(out, (tuple, list)):
+        return out[0]
+    for attr in ("last_hidden_state", "logits", "norm_hidden_state"):
+        val = getattr(out, attr, None)
+        if val is not None:
+            return val
+    raise TypeError(f"Cannot extract a draft output tensor from {type(out)}")
 
 
 def extract_logits(out: Any) -> torch.Tensor:

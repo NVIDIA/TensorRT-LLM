@@ -128,7 +128,7 @@ size_t FabricMemory::getAlignedSize(size_t size)
     return (size + granularity - 1) / granularity * granularity;
 }
 
-bool FabricMemory::supportFbaricMemory()
+bool FabricMemory::supportFabricMemory()
 {
 #ifdef __aarch64__
     auto support_fun = []()
@@ -309,7 +309,7 @@ size_t CacheTransBufferManager::preAllocBufferSize(
             transferBufferSize += validTokenNum * cacheSizeBytesPerToken;
         }
     }
-    bool useFabricMemory = FabricMemory::supportFbaricMemory()
+    bool useFabricMemory = FabricMemory::supportFabricMemory()
         && (!(common::getEnvKVCacheTransferUseSyncBuffer() || common::getEnvKVCacheTransferUseAsyncBuffer()));
     if (useFabricMemory)
     {
