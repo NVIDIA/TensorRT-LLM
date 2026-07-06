@@ -208,9 +208,6 @@ class OpenAIHttpClient(OpenAIClient):
                 body = _msgpack_encoder.encode(request.model_dump(mode="json", exclude_unset=True))
                 req_headers = {"Content-Type": "application/json", "X-TRTLLM-Msgpack": "1"}
             else:
-                # model_dump_json (pydantic-core) is ~2.3x faster than
-                # model_dump(mode="json") + aiohttp json= (json.dumps). Decodes to
-                # identical JSON (pydantic just emits compact UTF-8 vs spaced ASCII).
                 body = request.model_dump_json(exclude_unset=True)
                 req_headers = {"Content-Type": "application/json"}
             try:
