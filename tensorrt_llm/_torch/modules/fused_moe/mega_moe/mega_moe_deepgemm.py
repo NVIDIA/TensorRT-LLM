@@ -53,6 +53,7 @@ __all__ = ["MegaMoEDeepGemm"]
 # a key would race on the same scratch buffers.
 _MEGA_MOE_SYMM_BUFFER_CACHE: Dict[tuple, object] = {}
 
+
 # ---- Fused MXFP8 per-token quant backends --------------------------------
 # We want: BF16 (m, H) → FP8 E4M3 (m, H) + packed-UE8M0 SF (m, H/32/4) int32.
 # Three candidates, in preference order:
@@ -120,6 +121,10 @@ class MegaMoEDeepGemm(MoE):
     # Kernel owns dispatch + GEMM1 + SwiGLU + GEMM2 + combine via NVLink
     # SymmBuffer; ConfigurableMoE must NOT layer host-side comm on top.
     scheduler_kind = MoESchedulerKind.FUSED_COMM
+
+    # MegaMoE partitions the global slot table, not just the raw expert count.
+    # Let backend-specific num_slots checks handle EPLB/non-divisible layouts.
+    _supports_non_divisible_ep: bool = True
 
     # ------------------------------------------------------------------
     # Capability gating
@@ -239,23 +244,24 @@ class MegaMoEDeepGemm(MoE):
                 f"divisible by ep_size ({self.ep_size})."
             )
 
-        # ADP semantics: DG's fp8_fp4_mega_moe subsumes cross-rank token
-        # dispatch into its internal symm_mem exchange. When EP spans
-        # *all* ranks that may carry tokens (i.e. ``ep_size ==
-        # parallel_size``), no outer allgather / reducescatter is needed:
-        # every token's origin rank is inside the EP group and DG returns
-        # results to that origin. If EP is a strict subset of
-        # parallel_size (e.g. attention-DP > moe_ep_size), some tokens
-        # live on ranks that the DG kernel cannot reach — that topology
-        # is not yet supported.
+        # DG's fp8_fp4_mega_moe assumes the MoE input is partitioned across
+        # ranks (each rank's SymmBuffer holds a unique slice). Supported:
+        # single rank, or DEP with ep_size == parallel_size. Reject both
+        # DEP > EP (some tokens unreachable) and TEP (input TP-replicated
+        # so dispatch sees parallel_size duplicate copies — math correct,
+        # wall ~parallel_size× slower).
         if self.use_dp and self.parallel_size > 1:
             assert self.ep_size == self.parallel_size, (
                 f"MegaMoEDeepGemm with enable_attention_dp=True requires "
                 f"ep_size == parallel_size (got ep_size={self.ep_size}, "
-                f"parallel_size={self.parallel_size}). Configurations "
-                f"with ADP > EP are not yet supported; add the standard "
-                f"allgather(pre) + reducescatter(post) wrapper before "
-                f"calling fp8_fp4_mega_moe to support them."
+                f"parallel_size={self.parallel_size})."
+            )
+        elif (not self.use_dp) and self.parallel_size > 1:
+            raise NotImplementedError(
+                f"MegaMoEDeepGemm does not support TEP "
+                f"(enable_attention_dp=False, parallel_size="
+                f"{self.parallel_size}>1). Use moe_config.backend=TRTLLM "
+                f"or enable attention-DP with ep_size == parallel_size."
             )
 
         # apply_router_weight_on_input pre-multiplies routing weights
@@ -590,20 +596,6 @@ class MegaMoEDeepGemm(MoE):
     def create_weights(self):
         if self._weights_created:
             return
-        # Allocate the DG NVLink SymmBuffer here (lazily) rather than from
-        # ``__init__`` because ConfigurableMoE only syncs the EPLB-derived
-        # attributes (``num_slots``, ``expert_size_per_partition``, ...)
-        # onto the backend AFTER backend ``__init__`` returns, just before
-        # calling ``backend.create_weights()``. Sizing the SymmBuffer in
-        # ``__init__`` would therefore use the placeholder
-        # ``num_slots = num_experts`` and break EPLB at forward time
-        # (DeepGEMM asserts ``num_experts == num_experts_per_rank *
-        # num_ranks`` in ``mega.hpp``). Both call sites (the
-        # ConfigurableMoE-driven path and the standalone
-        # ``init_load_balancer=True`` path that runs ``create_weights``
-        # from ``__init__``) reach this point on every EP rank in
-        # lockstep, preserving the rendezvous safety invariant.
-        self._alloc_symm_buffer()
         self.quant_method = self._get_quant_method()
         self.quant_method.create_weights(self)
         self._weights_created = True
@@ -616,6 +608,25 @@ class MegaMoEDeepGemm(MoE):
     def post_load_weights(self) -> None:
         if self.quant_method is None:
             self.create_weights()
+        # Allocate the DG NVLink SymmBuffer and run its EP rendezvous here
+        # rather than in create_weights, for two reasons:
+        #   1. EPLB sizing: ConfigurableMoE syncs the EPLB-derived attributes
+        #      (num_slots, expert_size_per_partition, ...) onto the backend only
+        #      after __init__. Sizing the buffer earlier would use the
+        #      placeholder num_slots = num_experts and break EPLB at forward
+        #      time (DeepGEMM asserts num_experts == num_experts_per_rank *
+        #      num_ranks in mega.hpp).
+        #   2. MetaInitMode: the rendezvous (symm_mem.rendezvous + EP barrier
+        #      inside get_symm_buffer_for_mega_moe) is a real collective, but
+        #      create_weights runs under MetaInitMode where a c10d.barrier on a
+        #      meta tensor raises MetaInitException — aborting meta-init and
+        #      forcing the slow regular-init fallback that materializes every
+        #      weight on host RAM and OOM-kills small-host nodes (e.g. GB300,
+        #      ~900 GiB/node).
+        # The loader invokes this hook for every module in deterministic order
+        # on all EP ranks (lockstep), after MetaInitMode has exited and before
+        # forward / CUDA-graph capture. Idempotent — a no-op once allocated.
+        self._alloc_symm_buffer()
         self.quant_method.post_load_weights(self)
 
     # ------------------------------------------------------------------
@@ -650,6 +661,10 @@ class MegaMoEDeepGemm(MoE):
             return x_fp8, x_sf
         return _quantize_bf16_to_fp8_ue8m0(x_bf16)
 
+    def supports_fused_prepare(self) -> bool:
+        """Whether ``run_moe`` can prepare DG SymmBuffer directly from BF16 input."""
+        return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "megamoe_prepare")
+
     def run_moe(
         self,
         x: torch.Tensor,
@@ -660,25 +675,23 @@ class MegaMoEDeepGemm(MoE):
         output_dtype: Optional[torch.dtype] = None,
         **unused_kwargs,
     ) -> torch.Tensor:
-        """Run the fused kernel with pre-quantized activations.
+        """Run the fused kernel with either BF16 or pre-quantized activations.
 
-        ConfigurableMoE computes routing and calls ``quantize_input`` before
-        invoking this method, so the backend receives the same FP8+SF+topk
-        contract at this unified backend entry point.
+        The fused-prepare path receives BF16 activations and writes the
+        FP8+SF+topk SymmBuffer fields in one custom op. The fallback path
+        keeps the original ``quantize_input`` + copy contract.
         """
         assert not unused_kwargs, (
             f"MegaMoEDeepGemm.run_moe got unexpected kwargs: {sorted(unused_kwargs)}"
         )
         if output_dtype is None:
             output_dtype = self.dtype or torch.bfloat16
-        if x_sf is None:
-            raise ValueError("MegaMoEDeepGemm requires x_sf from quantize_input")
         dg = self._dg
         buf = self._symm_buffer
         assert buf is not None, (
-            "MegaMoE SymmBuffer not allocated — _alloc_symm_buffer should "
-            "run unconditionally in __init__; check for a subclass that "
-            "skipped the parent constructor."
+            "MegaMoE SymmBuffer not allocated — _alloc_symm_buffer runs in "
+            "post_load_weights; ensure the model loader's post_load_weights "
+            "pass ran before forward (and was not skipped by _weights_removed)."
         )
         num_tokens = x.shape[0]
         assert num_tokens <= self.max_num_tokens, (
@@ -687,10 +700,23 @@ class MegaMoEDeepGemm(MoE):
         )
 
         if num_tokens > 0:
-            buf.x[:num_tokens].copy_(x)
-            buf.x_sf[:num_tokens].copy_(x_sf)
-            buf.topk_idx[:num_tokens].copy_(token_selected_experts.to(torch.int64))
-            buf.topk_weights[:num_tokens].copy_(token_final_scales.to(torch.float32))
+            if x_sf is None:
+                if not self.supports_fused_prepare():
+                    raise ValueError("MegaMoEDeepGemm requires x_sf from quantize_input")
+                torch.ops.trtllm.megamoe_prepare(
+                    x.to(torch.bfloat16).contiguous(),
+                    token_selected_experts.contiguous(),
+                    token_final_scales.contiguous(),
+                    buf.x,
+                    buf.x_sf,
+                    buf.topk_idx,
+                    buf.topk_weights,
+                )
+            else:
+                buf.x[:num_tokens].copy_(x)
+                buf.x_sf[:num_tokens].copy_(x_sf)
+                buf.topk_idx[:num_tokens].copy_(token_selected_experts.to(torch.int64))
+                buf.topk_weights[:num_tokens].copy_(token_final_scales.to(torch.float32))
 
         y = torch.empty((num_tokens, self.hidden_size), dtype=torch.bfloat16, device=buf.x.device)
         dg.fp8_fp4_mega_moe(

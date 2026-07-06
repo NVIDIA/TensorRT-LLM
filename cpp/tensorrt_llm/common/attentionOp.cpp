@@ -23,6 +23,7 @@
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/sageQuant.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/cascadeAttentionKernel.h"
 #include "tensorrt_llm/kernels/flashMLA/flash_mla.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
@@ -117,6 +118,12 @@ struct FusedQKVMaskedAttentionDispatchParams
     float* partial_sum;
     float* partial_max;
     int* block_counter;
+    // Cascade attention prefix-side workspace (fp32).  Sliced from the same
+    // generation workspace and forwarded into Multihead_attention_params so
+    // the cascade fast-path no longer needs its own cudaMalloc.
+    float* cascade_partial_out{};
+    float* cascade_partial_max{};
+    float* cascade_partial_sum{};
     float const* kv_scale_orig_quant;
     float const* kv_scale_quant_orig;
     tc::QuantMode kv_cache_quant_mode;
@@ -693,6 +700,10 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
         params.partial_sum = input_params.partial_sum;
         params.partial_max = input_params.partial_max;
 
+        params.cascade_partial_out = input_params.cascade_partial_out;
+        params.cascade_partial_max = input_params.cascade_partial_max;
+        params.cascade_partial_sum = input_params.cascade_partial_sum;
+
         params.block_counter = input_params.block_counter;
     }
 
@@ -978,6 +989,13 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
     generationWorkspaceSizes.partialSum = partial_sum_size;
     generationWorkspaceSizes.partialMax = partial_max_size;
     generationWorkspaceSizes.shiftKCache = shift_k_cache_size;
+    {
+        auto const cascadeSizes
+            = tensorrt_llm::kernels::mmha::cascade::getCascadeWorkspaceSizes(batch_beam, mNumHeads, mHeadSize);
+        generationWorkspaceSizes.cascadeOut = cascadeSizes.out;
+        generationWorkspaceSizes.cascadeMax = cascadeSizes.mMax;
+        generationWorkspaceSizes.cascadeSum = cascadeSizes.lSum;
+    }
     generation_workspace_size = AttentionWorkspaceManager::buildGenerationLayout(generationWorkspaceSizes).totalSize;
 
     size_t xqa_workspace_size = 0;
@@ -2530,6 +2548,13 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
     workspaceSizes.partialSum = partial_sum_size;
     workspaceSizes.partialMax = partial_max_size;
     workspaceSizes.shiftKCache = shift_k_cache_size;
+    {
+        auto const cascadeSizes
+            = tensorrt_llm::kernels::mmha::cascade::getCascadeWorkspaceSizes(batch_beam, mNumHeads, mHeadSize);
+        workspaceSizes.cascadeOut = cascadeSizes.out;
+        workspaceSizes.cascadeMax = cascadeSizes.mMax;
+        workspaceSizes.cascadeSum = cascadeSizes.lSum;
+    }
     auto const workspaceLayout = AttentionWorkspaceManager::buildGenerationLayout(workspaceSizes);
     auto const workspaceViews = AttentionWorkspaceManager::materializeGeneration<T>(
         params.workspace, workspaceLayout, cpMaxPaddedSequenceLength, mNumHeads, mNumKVHeads, mHeadSize);
@@ -2598,6 +2623,9 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
     dispatch_params.partial_out = workspaceViews.partialOut;
     dispatch_params.partial_sum = workspaceViews.partialSum;
     dispatch_params.partial_max = workspaceViews.partialMax;
+    dispatch_params.cascade_partial_out = workspaceViews.cascadeOut;
+    dispatch_params.cascade_partial_max = workspaceViews.cascadeMax;
+    dispatch_params.cascade_partial_sum = workspaceViews.cascadeSum;
     dispatch_params.block_counter = mMultiBlockSemaphores.get();
     dispatch_params.kv_cache_quant_mode = mKVCacheQuantMode;
     dispatch_params.kv_scale_orig_quant = params.kv_scale_orig_quant;

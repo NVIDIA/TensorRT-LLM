@@ -1707,6 +1707,10 @@ class DecodingBaseConfig(StrictBaseModel):
         """Total tokens per gen request in one spec dec iteration (including golden token)."""
         return 1 + self.max_total_draft_tokens
 
+    def get_runtime_tokens_per_gen_step(self, runtime_draft_len: int) -> int:
+        """Total tokens per gen request for the current runtime draft length."""
+        return 1 + runtime_draft_len
+
     def num_capture_layers(self) -> int:
         return 0
 
@@ -2427,6 +2431,10 @@ class PARDDecodingConfig(DecodingBaseConfig):
         """PARD needs 2K tokens per gen request: K+1 accepted + K-1 masks."""
         return 2 * self.max_draft_len
 
+    def get_runtime_tokens_per_gen_step(self, runtime_draft_len: int) -> int:
+        """PARD needs 2K runtime tokens per gen request for logical draft length K."""
+        return 1 if runtime_draft_len == 0 else 2 * runtime_draft_len
+
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
 
@@ -2480,6 +2488,10 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         fillers through the target is pure wasted work at large batch size.
         """
         return self.max_draft_len + 1
+
+    def get_runtime_tokens_per_gen_step(self, runtime_draft_len: int) -> int:
+        """DFlash needs K+1 runtime tokens per gen request (K drafts + 1 bonus)."""
+        return 1 + runtime_draft_len
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
@@ -3367,6 +3379,13 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         status="prototype",
         description="Whether to use the KV cache manager v2 (experimental).")
 
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    enable_swa_scratch_reuse: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Whether KV cache manager v2 uses SWA scratch reuse during prefill.")
+
     kv_cache_event_hash_algo: Literal[
         "auto", "v1_block_key", "v2_sha256", "v2_sha256_64"] = Field(
             default="auto",
@@ -3406,6 +3425,34 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "Number of queued context requests to prefetch disk-tier KV cache blocks to host for. "
         "Set to 0 to disable prefetch. Only effective with KV cache manager v2 and block reuse enabled."
     )
+
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    pool_ratio: Optional[List[float]] = Field(
+        default=None,
+        min_length=1,
+        status="prototype",
+        description=
+        "Initial pool ratios for KV cache manager v2. When used by DeepSeek-V4, "
+        "values map to KVCacheManagerV2 pool_group_id order and must sum to 1.0. "
+        "When set, DeepSeek-V4 uses this directly and avg_seq_len does not take effect."
+    )
+
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    avg_seq_len: Optional[PositiveInt] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "Average sequence length used by DeepSeek-V4 to build the KV cache manager v2 "
+        "typical step. If unset, max_seq_len is used. This does not take effect when "
+        "pool_ratio is set.")
+
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    block_reuse_policy: Literal["all_reusable", "per_request"] = Field(
+        default="all_reusable",
+        status="prototype",
+        description="KV cache manager v2 block reuse policy. "
+        "With SWA scratch reuse and 'all_reusable', only non-scratch "
+        "blocks are saved for reuse.")
 
     def _to_pybind(self):
         config = _KvCacheConfig(
@@ -3506,6 +3553,19 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         if not 0 <= v <= 1:
             raise ValueError(
                 "kv_cache_config.max_util_for_resume must be between 0 and 1")
+        return v
+
+    @field_validator('pool_ratio')
+    @classmethod
+    def validate_pool_ratio(cls, v: Optional[List[float]]):
+        if v is None:
+            return v
+        if any(r <= 0 for r in v):
+            raise ValueError(
+                "kv_cache_config.pool_ratio values must be positive")
+        if not math.isclose(sum(v), 1.0, rel_tol=0.0, abs_tol=1e-6):
+            raise ValueError(
+                "kv_cache_config.pool_ratio values must sum to 1.0")
         return v
 
 
@@ -3808,12 +3868,18 @@ class BaseLlmArgs(StrictBaseModel):
 
     iter_stats_max_iterations: Optional[int] = Field(
         default=None,
-        description="The maximum number of iterations for iter stats.",
+        ge=-1,
+        description=
+        "The maximum number of iterations for iter stats. Set to -1 to keep all iteration stats. "
+        "Set to 0 to disable iteration stats in the TensorRT executor.",
         status="prototype")
 
     request_stats_max_iterations: Optional[int] = Field(
         default=None,
-        description="The maximum number of iterations for request stats.",
+        ge=-1,
+        description=
+        "The maximum number of iterations for request stats. Set to -1 to keep all request stats. "
+        "Set to 0 to disable request stats.",
         status="prototype")
 
     # A handful of options from PretrainedConfig
@@ -5014,8 +5080,19 @@ class TorchLlmArgs(BaseLlmArgs):
 
     max_stats_len: int = Field(
         default=1000,
-        description="The max number of performance statistic entries.",
-        status="prototype")
+        ge=-1,
+        description=
+        "The max number of performance statistic entries. Set to -1 to keep all entries. "
+        "Set to 0 to use a minimum buffer size of 1.",
+        status="prototype",
+    )
+
+    @field_validator('max_stats_len')
+    @classmethod
+    def normalize_max_stats_len(cls, v):
+        if v == -1:
+            return v
+        return max(v, 1)
 
     layer_wise_benchmarks_config: LayerwiseBenchmarksConfig = Field(
         default_factory=LayerwiseBenchmarksConfig,

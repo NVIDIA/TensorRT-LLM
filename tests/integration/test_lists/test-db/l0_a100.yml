@@ -77,6 +77,7 @@ l0_a100:
   - unittest/trt/model_api/test_model_api_multi_gpu.py
   - unittest/trt/model/test_gpt_e2e.py
   - unittest/trt/model/eagle
+  - unittest/trt/model/redrafter
   - unittest/llmapi/test_llm_models.py -m "part0"
   - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_cpp_runtime]
   - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime]
