@@ -148,13 +148,19 @@ def test_deepseek_v4_fused_hc_default_enabled(monkeypatch):
     assert _resolve_enable_fused_hc(config) is False
 
 
-def test_deepseek_v4_model_defaults_keep_tokens_per_block():
+def test_deepseek_v4_model_defaults():
     class LlmArgs:
         pass
 
     defaults = DeepseekV4ForCausalLM.get_model_defaults(LlmArgs())
 
-    assert defaults == {"kv_cache_config": {"tokens_per_block": 128}}
+    assert defaults == {
+        "kv_cache_config": {
+            "tokens_per_block": 128,
+            "use_kv_cache_manager_v2": True,
+            "enable_swa_scratch_reuse": True,
+        }
+    }
 
 
 def test_deepseek_v4_weight_remap_for_mxfp4_routed_experts():
@@ -630,6 +636,50 @@ def test_deepseek_v4_sparse_ratios_prefer_checkpoint_defaults(tmp_path, monkeypa
     assert model_config.sparse_attention_config.window_size == 128
 
 
+def test_deepseek_v4_model_config_defaults_to_fp4_indexer(tmp_path, monkeypatch):
+    checkpoint_ratios = [128, 128, 4, 128, 4, 128, 0, 4]
+    config = DeepseekV4Config(
+        architectures=["DeepseekV4ForCausalLM"],
+        num_hidden_layers=len(checkpoint_ratios),
+        compress_ratios=checkpoint_ratios,
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.model_config.load_pretrained_config", lambda *args, **kwargs: config
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr("tensorrt_llm._utils.get_sm_version", lambda: 100)
+
+    model_config = ModelConfig.from_pretrained(
+        str(tmp_path),
+        attn_backend="TRTLLM",
+        moe_backend="TRTLLM",
+    )
+
+    assert model_config.sparse_attention_config.indexer_k_dtype == "fp4"
+
+
+def test_deepseek_v4_model_config_defaults_to_fp8_before_blackwell(tmp_path, monkeypatch):
+    checkpoint_ratios = [128, 128, 4, 128, 4, 128, 0, 4]
+    config = DeepseekV4Config(
+        architectures=["DeepseekV4ForCausalLM"],
+        num_hidden_layers=len(checkpoint_ratios),
+        compress_ratios=checkpoint_ratios,
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.model_config.load_pretrained_config", lambda *args, **kwargs: config
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr("tensorrt_llm._utils.get_sm_version", lambda: 90)
+
+    model_config = ModelConfig.from_pretrained(
+        str(tmp_path),
+        attn_backend="TRTLLM",
+        moe_backend="TRTLLM",
+    )
+
+    assert model_config.sparse_attention_config.indexer_k_dtype == "fp8"
+
+
 def test_deepseek_v4_sparse_ratios_keep_checkpoint_length_without_mtp(tmp_path, monkeypatch):
     checkpoint_ratios = [128, 128] + [4, 128] * 29 + [0, 4]
     config = DeepseekV4Config(
@@ -733,6 +783,7 @@ def test_deepseek_v4_sanity():
     assert not model.model.layers[0].fusion_config.POST_MOE_FUSION
 
     context_sequence_length = [3, 2, 5]
+    num_contexts = len(context_sequence_length)
     sequence_length = context_sequence_length + [1, 1]
 
     # Total tokens = sum(sequence_length) = 3+2+5+1+1 = 12
@@ -742,7 +793,7 @@ def test_deepseek_v4_sanity():
     past_seen_tokens = [0, 0, 0, 62, 75]
     request_ids = list(range(len(sequence_length)))
     token_nums = (torch.tensor(past_seen_tokens) + torch.tensor(sequence_length)).tolist()
-    prompt_lens = token_nums[:3] + past_seen_tokens[3:]
+    prompt_lens = token_nums[:num_contexts] + past_seen_tokens[num_contexts:]
     tokens_per_block = 128  # DeepSeek-V4 requirement
     max_new_tokens = 1024
     required_blocks = sum(
@@ -798,14 +849,27 @@ def test_deepseek_v4_sanity():
         )
         success = kv_cache_manager.prepare_context(req)
         assert success, f"Failed to prepare context for request {req_id}"
-        # Allocate enough capacity for context tokens plus generation headroom
-        success = kv_cache_manager.resize_context(req, token_nums[i] + max_new_tokens)
+        if i < num_contexts:
+            success = kv_cache_manager.resize_context(req, req.context_chunk_size)
+        else:
+            # Warm-cache setup for a generation request: simulate
+            # past_seen_tokens[i] worth of history without running forward.
+            # Reach into kv_cache.resize directly because resize_context no
+            # longer exposes a history_length override (production callers
+            # use prepare_disagg_gen_init or update_resources to advance it).
+            kv_cache = kv_cache_manager.kv_cache_map[req.py_request_id]
+            kv_cache.enable_swa_scratch_reuse = False
+            target = (
+                req.context_current_position + token_nums[i] + kv_cache_manager.num_extra_kv_tokens
+            )
+            capacity = max(kv_cache.capacity, target)
+            success = kv_cache.resize(capacity, past_seen_tokens[i])
         assert success, f"Failed to resize context for request {req_id}"
         reqs.append(req)
 
     attn_metadata = DeepseekV4TrtllmAttentionMetadata(
         seq_lens=torch.tensor(sequence_length, dtype=torch.int32),
-        num_contexts=len(context_sequence_length),
+        num_contexts=num_contexts,
         max_num_requests=len(sequence_length),
         kv_cache_params=KVCacheParams(
             use_cache=True,
@@ -833,7 +897,8 @@ def test_deepseek_v4_sanity():
     extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
     with torch.inference_mode(), model_extra_attrs(extra_attrs):
         scheduled_batch = ScheduledRequests()
-        scheduled_batch.context_requests_last_chunk = reqs
+        scheduled_batch.context_requests_last_chunk = reqs[:num_contexts]
+        scheduled_batch.generation_requests = reqs[num_contexts:]
         kv_cache_manager.prepare_resources(scheduled_batch)
         attn_metadata.prepare()
 
@@ -841,9 +906,11 @@ def test_deepseek_v4_sanity():
             input_ids=input_ids, position_ids=position_ids, attn_metadata=attn_metadata
         )
 
-        for req in reqs:
+        for req in reqs[:num_contexts]:
             req.context_current_position = seq_lens[req.py_request_id]
+        for req in reqs:
             req.add_new_token(seq_lens[req.py_request_id], 0)
+        kv_cache_manager.update_context_resources(scheduled_batch)
         kv_cache_manager.update_resources(scheduled_batch)
     assert len(past_seen_tokens) == logits.shape[0]
 
@@ -852,6 +919,8 @@ def test_deepseek_v4_sanity():
         seq_lens = [seq_len + 1 for seq_len in seq_lens]
         scheduled_batch = ScheduledRequests()
         scheduled_batch.generation_requests = reqs
+        for req in reqs:
+            assert kv_cache_manager.try_allocate_generation(req)
         kv_cache_manager.prepare_resources(scheduled_batch)
         attn_metadata.prepare()
         logits = model.forward(

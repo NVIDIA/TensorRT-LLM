@@ -73,6 +73,10 @@ def inplace_info():
             1: "out",
             2: "residual"
         },
+        torch.ops.trtllm.deepseek_v4_q_norm_fused_fp8.default: {
+            1: "quant_q_out",
+            2: "q_pe_out"
+        },
         torch.ops.trtllm.fused_qk_norm_rope.default: {
             1: "qkv"
         },
@@ -98,6 +102,12 @@ def inplace_info():
         },
         torch.ops.trtllm.moe_output_memset_inplace.default: {
             1: "input"
+        },
+        torch.ops.trtllm.megamoe_prepare.default: {
+            1: "x_out",
+            2: "x_sf_out",
+            3: "topk_idx_out",
+            4: "topk_weights_out"
         },
         torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell.default:
         {

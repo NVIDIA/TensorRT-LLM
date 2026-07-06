@@ -34,11 +34,11 @@ from tensorrt_llm.quantization.utils.fp4_utils import (
 from tensorrt_llm.quantization.utils.fp8_utils import (
     resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
 
+from ...mmap_utils import advise_tensor_pageout
 from ...utils import (ActivationType, replace_parameter_and_save_metadata,
                       swizzle_sf, unswizzle_sf)
 from ..linear import TensorParallelMode, load_weight_shard
 from .interface import MoEWeightLoadingMode
-from .moe_load_balancer import advise_tensor_pageout
 
 # The declarations aligns with moe_kernels.h
 # pack inputs into int64, e.g. 4 x bf16 input values
@@ -4955,24 +4955,17 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
     def process_weights_after_loading(self,
                                       module: torch.nn.Module,
                                       num_elts_per_sf: int = 16):
-        # Call parent to compute global input scales, alphas, and fc31_scale_c first
         super().process_weights_after_loading(module,
                                               num_elts_per_sf=num_elts_per_sf)
 
-        # Normalize biases to account for the global scale factors,
-        # matching the kernel's expectation (similar to test_moe.py logic).
-        # This must happen after alphas are finalized.
+        # Cubin clamp / GLU bias inputs are consumed in the pre-dequant GEMM
+        # output domain (i.e. divided by fc31_alpha / fc2_alpha).
         if module.w3_w1_bias is not None:
-            # gemm1_bias * gemm1_scales_global * hidden_states_scale_global
             module.w3_w1_bias.data.div_((module.fc31_alpha.data).view(-1, 1))
-
         if module.w2_bias is not None:
-            # gemm2_bias * c_global_sf * gemm2_scales_global
             module.w2_bias.data.div_((module.fc2_alpha.data).view(-1, 1))
-
         if module.swiglu_beta is not None:
             module.swiglu_beta.data.div_((module.fc31_alpha.data))
-
         if module.swiglu_limit is not None:
             module.swiglu_limit.data.div_((module.fc31_alpha.data))
 
@@ -6360,6 +6353,11 @@ class W4A8MXFP4MXFP8MegaMoEDeepGemmMethod(FusedMoEMethodBase):
         ``MegaMoEDeepGemm._alloc_symm_buffer``.
         """
         assert module._weights_loaded, "post_load_weights before load_weights"
+        if module.num_slots % module.ep_size != 0:
+            raise ValueError(
+                f"MegaMoEDeepGemm requires num_slots ({module.num_slots}) "
+                f"divisible by ep_size ({module.ep_size}). Adjust the EPLB "
+                f"replication factor or ep_size.")
         self._transform_main_weights(module)
         self._setup_shared_weights_for_eplb(module)
         self._attach_initial_weight_assignments(module)
