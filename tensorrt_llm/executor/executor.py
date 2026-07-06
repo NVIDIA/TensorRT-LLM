@@ -41,6 +41,7 @@ from .result import GenerationResult, IterationResult
 from .utils import IntraProcessQueue, ProcessPoolExecutorSession, RequestError
 
 if TYPE_CHECKING:
+    from .._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
     from .proxy import GenerationExecutorProxy
     from .worker import GenerationExecutorWorker
 
@@ -450,7 +451,7 @@ class GenerationExecutor(ABC):
     def get_disaggregated_params(self) -> dict:
         return {}
 
-    def get_cache_transceiver(self):
+    def get_cache_transceiver(self) -> Optional["KvCacheTransceiver"]:
         return None
 
     def get_data_transceiver_state(self) -> bytes:
