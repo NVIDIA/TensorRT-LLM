@@ -132,13 +132,14 @@ def test_mistral(tritonserver_test_root, test_name, llm_root, model_path,
 
 
 @pytest.mark.parametrize("test_name", ["gptj"], indirect=True)
-def test_gptj(tritonserver_test_root, test_name, llm_root, model_path,
-              engine_dir):
-    build_model(test_name, llm_root, tritonserver_test_root)
-    tokenizer_type = "auto"
-    run_shell_command(
-        f"cd {tritonserver_test_root} && ./test.sh {test_name} {engine_dir} {model_path} {tokenizer_type}",
-        llm_root)
+def test_gptj(tritonserver_test_root, test_name, llm_root):
+    # examples/models/contrib/gptj was removed with the legacy TensorRT-backend
+    # cleanup; guard against silent reintroduction.
+    gptj_example_dir = os.path.join(llm_root, "examples", "models", "contrib",
+                                    "gptj")
+    assert not os.path.exists(gptj_example_dir), (
+        f"{gptj_example_dir} was reintroduced; update this test or restore "
+        "the Triton gptj build pipeline in build_model.sh and test.sh.")
 
 
 @pytest.mark.parametrize("test_name", ["mistral-ib"], indirect=True)
