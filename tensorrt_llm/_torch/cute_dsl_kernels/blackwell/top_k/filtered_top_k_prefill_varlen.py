@@ -146,28 +146,22 @@ class FilteredTopKKernelVarlenPrefill(FilteredTopKKernelVarlen):
             layout=cute.make_ordered_layout((self.filtered_topk_max_k,), order=(0)),
             byte_alignment=128,
         )
-        # TODO: do we need this buffer for gmem_reread_always?
-        s_input_idx = smem.allocate_tensor(
-            element_type=self.index_type,
-            layout=cute.make_ordered_layout(
-                (self.num_buffer_smem_input_idx, self.filtered_topk_smem_input_size),
-                order=(1, 0),
-            ),
-            byte_alignment=128,
-        )
+        if cutlass.const_expr(not self.enable_reread_always):
+            s_input_idx = smem.allocate_tensor(
+                element_type=self.index_type,
+                layout=cute.make_ordered_layout(
+                    (self.num_buffer_smem_input_idx, self.filtered_topk_smem_input_size),
+                    order=(1, 0),
+                ),
+                byte_alignment=128,
+            )
+        else:
+            s_input_idx = None
         s_last_remain = smem.allocate_tensor(
             element_type=cutlass.Int32,
             layout=cute.make_ordered_layout((1), order=(0)),
             byte_alignment=128,
         )
-        if cutlass.const_expr(self.enable_reread_always):
-            s_refine_thresholds = smem.allocate_tensor(
-                element_type=cutlass.Int32,
-                layout=cute.make_ordered_layout((max(1, self.num_refine_rounds),), order=(0,)),
-                byte_alignment=128,
-            )
-        else:
-            s_refine_thresholds = None
         num_warps = cutlass.const_expr(
             min(self.radix, self.num_threads_per_cta) // cutlass.Int32(32)
         )
@@ -199,7 +193,6 @@ class FilteredTopKKernelVarlenPrefill(FilteredTopKKernelVarlen):
             s_indices,
             s_input_idx,
             s_last_remain,
-            s_refine_thresholds,
             num_warps,
             s_warp_sums,
         )

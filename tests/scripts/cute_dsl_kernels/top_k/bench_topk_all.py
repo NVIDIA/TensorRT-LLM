@@ -333,7 +333,7 @@ def _header(variants, col_w=13):
     return cols, sp
 
 
-def _print_row(key1, key2, res, variants, col_w=13):
+def _print_row(key1, key2, res, variants, col_w=13, extra_policies=()):
     line = f"{key1:>6}  {key2:>7}"
     for v in variants:
         us = res.get(v, float("nan"))
@@ -344,11 +344,13 @@ def _print_row(key1, key2, res, variants, col_w=13):
             if res.get(v):
                 sp = cpp / res[v]
                 line += f"  {sp:>{col_w}.3f}x"
-        # TRUNCATE vs GMEM_SPILL ratio (T faster → ratio < 1)
-        for base, trunc in [("dsl_fp32", "dsl_fp32_t"), ("dsl_bf16", "dsl_bf16_t")]:
-            if res.get(base) and res.get(trunc):
-                ratio = res[trunc] / res[base]
-                line += f"  {ratio:>{col_w}.3f}x"
+        for pol in extra_policies:
+            sfx = f"_{pol[:1].lower()}"
+            for dtype in ["fp32", "bf16"]:
+                base, alt = f"dsl_{dtype}", f"dsl_{dtype}{sfx}"
+                if res.get(base) and res.get(alt):
+                    ratio = res[alt] / res[base]
+                    line += f"  {ratio:>{col_w}.3f}x"
     print(line)
 
 
@@ -364,13 +366,17 @@ def _make_variants_and_header_suffix(overflow_policies, col_w):
     variants = ["cpp_fp32"] + (dsl_variants if IS_B200 else [])
     if IS_B200:
         hdr_suffix += f"  {'dsl_fp32/cpp':>{col_w}}  {'dsl_bf16/cpp':>{col_w}}"
-        if len(overflow_policies) > 1:
-            hdr_suffix += f"  {'T/G_fp32':>{col_w}}  {'T/G_bf16':>{col_w}}"
+        for pol in overflow_policies:
+            if pol == "GMEM_SPILL":
+                continue
+            tag = pol[:1].upper()
+            hdr_suffix += f"  {f'{tag}/G_fp32':>{col_w}}  {f'{tag}/G_bf16':>{col_w}}"
     return variants, hdr_suffix
 
 
 def sweep_prefill_fixlen(warmup, iters, overflow_policies=("GMEM_SPILL",)):
     col_w = 13
+    extra = [p for p in overflow_policies if p != "GMEM_SPILL"]
     for nc in PREFILL_NC_LIST:
         variants, hdr_sfx = _make_variants_and_header_suffix(overflow_policies, col_w)
         print(f"\n=== mode=prefill style=fixlen num_cols={nc} ===")
@@ -384,7 +390,7 @@ def sweep_prefill_fixlen(warmup, iters, overflow_policies=("GMEM_SPILL",)):
             for nr in PREFILL_NR_LIST:
                 try:
                     res = bench_prefill_fixlen(nr, nc, tk, warmup, iters, overflow_policies)
-                    _print_row(tk, nr, res, variants, col_w)
+                    _print_row(tk, nr, res, variants, col_w, extra)
                 except Exception as e:
                     print(f"{tk:>6}  {nr:>7}  ERROR: {e}")
             print()
@@ -392,6 +398,7 @@ def sweep_prefill_fixlen(warmup, iters, overflow_policies=("GMEM_SPILL",)):
 
 def sweep_prefill_varlen(warmup, iters, overflow_policies=("GMEM_SPILL",)):
     col_w = 13
+    extra = [p for p in overflow_policies if p != "GMEM_SPILL"]
     for isl in PREFILL_ISL_LIST:
         variants, hdr_sfx = _make_variants_and_header_suffix(overflow_policies, col_w)
         print(f"\n=== mode=prefill style=varlen isl={isl} ===")
@@ -407,7 +414,7 @@ def sweep_prefill_varlen(warmup, iters, overflow_policies=("GMEM_SPILL",)):
                     continue
                 try:
                     res = bench_prefill_varlen(isl, bs, tk, warmup, iters, overflow_policies)
-                    _print_row(tk, bs, res, variants, col_w)
+                    _print_row(tk, bs, res, variants, col_w, extra)
                 except Exception as e:
                     print(f"{tk:>6}  {bs:>7}  ERROR: {e}")
             print()
@@ -415,6 +422,7 @@ def sweep_prefill_varlen(warmup, iters, overflow_policies=("GMEM_SPILL",)):
 
 def sweep_decode_fixlen(warmup, iters, next_n=1, overflow_policies=("GMEM_SPILL",)):
     col_w = 13
+    extra = [p for p in overflow_policies if p != "GMEM_SPILL"]
     for nt in DECODE_NT_LIST:
         variants, hdr_sfx = _make_variants_and_header_suffix(overflow_policies, col_w)
         print(f"\n=== mode=decode style=fixlen num_tokens={nt} next_n={next_n} ===")
@@ -428,7 +436,7 @@ def sweep_decode_fixlen(warmup, iters, next_n=1, overflow_policies=("GMEM_SPILL"
             for bs in DECODE_BS_LIST:
                 try:
                     res = bench_decode_fixlen(bs, nt, tk, next_n, warmup, iters, overflow_policies)
-                    _print_row(tk, bs, res, variants, col_w)
+                    _print_row(tk, bs, res, variants, col_w, extra)
                 except Exception as e:
                     print(f"{tk:>6}  {bs:>7}  ERROR: {e}")
             print()
@@ -436,6 +444,7 @@ def sweep_decode_fixlen(warmup, iters, next_n=1, overflow_policies=("GMEM_SPILL"
 
 def sweep_decode_varlen(warmup, iters, next_n=1, overflow_policies=("GMEM_SPILL",)):
     col_w = 13
+    extra = [p for p in overflow_policies if p != "GMEM_SPILL"]
     for nt in DECODE_VNT_LIST:
         variants, hdr_sfx = _make_variants_and_header_suffix(overflow_policies, col_w)
         print(f"\n=== mode=decode style=varlen max_tokens={nt} next_n={next_n} ===")
@@ -449,7 +458,7 @@ def sweep_decode_varlen(warmup, iters, next_n=1, overflow_policies=("GMEM_SPILL"
             for bs in DECODE_VBS_LIST:
                 try:
                     res = bench_decode_varlen(bs, nt, tk, next_n, warmup, iters, overflow_policies)
-                    _print_row(tk, bs, res, variants, col_w)
+                    _print_row(tk, bs, res, variants, col_w, extra)
                 except Exception as e:
                     print(f"{tk:>6}  {bs:>7}  ERROR: {e}")
             print()
@@ -474,7 +483,9 @@ def main():
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument(
-        "--compare_policies", action="store_true", help="bench GMEM_SPILL and TRUNCATE side by side"
+        "--compare_policies",
+        action="store_true",
+        help="bench GMEM_SPILL, TRUNCATE, and REREAD_ALWAYS side by side",
     )
     parser.add_argument("--sweep_all", action="store_true")
     parser.add_argument("--sweep_prefill", action="store_true")
@@ -485,7 +496,9 @@ def main():
     parser.add_argument("--sweep_decode_varlen", action="store_true")
     args = parser.parse_args()
 
-    overflow_policies = ("GMEM_SPILL", "TRUNCATE") if args.compare_policies else ("GMEM_SPILL",)
+    overflow_policies = (
+        ("GMEM_SPILL", "TRUNCATE", "REREAD_ALWAYS") if args.compare_policies else ("GMEM_SPILL",)
+    )
 
     cap = torch.cuda.get_device_capability()
     print(f"[TensorRT-LLM] Device: {torch.cuda.get_device_name(0)}  (sm_{cap[0]}{cap[1]})")

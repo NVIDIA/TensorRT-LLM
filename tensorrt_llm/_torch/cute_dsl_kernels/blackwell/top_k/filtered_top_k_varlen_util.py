@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import math
+
 import cutlass
 import cutlass.cute as cute
 import torch
@@ -199,6 +201,23 @@ class FilteredTopKKernelVarlen:
             return cute.Uint16(key)
 
     @cute.jit
+    def to_ordered_and_coarse(self, x):
+        """Return (ordered, coarse_key) for x.
+        For bf16/fp16, shares the half_as_ushort + sign-flip computation.
+        For fp32, the two transforms differ (fp32->fp16 truncation vs full 32-bit
+        sign-flip), so both are computed independently.
+        """
+        if cutlass.const_expr(self.dtype == cutlass.Float32):
+            return self.to_ordered(x), self.to_coarse_key(x)
+        else:
+            ordered = self.to_ordered(x)
+            coarse_shift = cutlass.const_expr(self.ordered_type.width - int(math.log2(self.radix)))
+            coarse = cute.Uint8(
+                (ordered >> self.ordered_type(coarse_shift)) & self.ordered_type(0xFF)
+            )
+            return ordered, coarse
+
+    @cute.jit
     def _collect_below_threshold_coarse(
         self,
         tidx,
@@ -344,16 +363,11 @@ class FilteredTopKKernelVarlen:
                     ordered = self.to_ordered(raw_input)
                     sub_bin = (ordered >> self.first_refine_shift) & 0xFF
                     atomicAdd(s_histogram.iterator + cutlass.Int32(sub_bin), val_one)
-            elif cutlass.const_expr(self.enable_reread_always):
-                # First pass: build refinement histogram over ALL threshold-bin elements.
-                # Phase 2 will re-scan GMEM directly; s_input_idx is not used.
-                ordered = self.to_ordered(raw_input)
-                sub_bin = (ordered >> self.first_refine_shift) & 0xFF
-                atomicAdd(s_histogram.iterator + cutlass.Int32(sub_bin), val_one)
             else:
-                pos = atomicAdd(s_num_input.iterator, val_one)
-                if pos < self.filtered_topk_smem_input_size:
-                    s_input_idx[0, pos] = idx
+                if cutlass.const_expr(not self.enable_reread_always):
+                    pos = atomicAdd(s_num_input.iterator, val_one)
+                    if pos < self.filtered_topk_smem_input_size:
+                        s_input_idx[0, pos] = idx
                 ordered = self.to_ordered(raw_input)
                 sub_bin = (ordered >> self.first_refine_shift) & 0xFF
                 atomicAdd(s_histogram.iterator + cutlass.Int32(sub_bin), val_one)
@@ -546,14 +560,12 @@ class FilteredTopKKernelVarlen:
     ):
         """Per-element handler for REREAD_ALWAYS output scan.
         include_threshold is a compile-time bool.
-        chain_mask is a compile-time int (accumulated prior-round byte mask).
-        chain_prefix is a runtime DSL value (accumulated prior-round thresholds).
-        Checks coarse bin == threshold_bin, then chain of prior-round constraints,
-        then outputs elements with fine bin < T2 (or == T2 if include_threshold).
+        chain_mask is a DSL Int32 runtime value; chain_prefix is a runtime DSL
+        ordered_type value. Both carry accumulated prior-round constraints.
+        When chain_mask == 0 (round 0), ordered & 0 == 0 is always True.
         """
-        coarse = self.to_coarse_key(raw)
+        ordered, coarse = self.to_ordered_and_coarse(raw)
         if coarse == threshold_bin:
-            ordered = self.to_ordered(raw)
             passes_chain = (ordered & self.ordered_type(chain_mask)) == chain_prefix
             if passes_chain:
                 bin_val = (ordered >> offset) & 0xFF
@@ -583,15 +595,14 @@ class FilteredTopKKernelVarlen:
         s_histogram,
     ):
         """Per-element handler for REREAD_ALWAYS non-last-round combined scan.
-        chain_mask is a compile-time int (accumulated prior-round byte mask).
-        chain_prefix is a runtime DSL value (accumulated prior-round thresholds).
+        chain_mask is a DSL Int32 runtime value; chain_prefix is a runtime DSL
+        ordered_type value. Both carry accumulated prior-round constraints.
         For elements passing coarse + chain filters:
           bin_val < T2  → write col_idx to s_indices (definitely top-K).
           bin_val == T2 → histogram at (ordered >> (offset - 8)) & 0xFF.
         """
-        coarse = self.to_coarse_key(raw)
+        ordered, coarse = self.to_ordered_and_coarse(raw)
         if coarse == threshold_bin:
-            ordered = self.to_ordered(raw)
             passes_chain = (ordered & self.ordered_type(chain_mask)) == chain_prefix
             if passes_chain:
                 bin_val = (ordered >> offset) & 0xFF
@@ -629,8 +640,8 @@ class FilteredTopKKernelVarlen:
     ):
         """GMEM scan for REREAD_ALWAYS output phase.
         include_threshold is a compile-time bool.
-        chain_mask is compile-time int; chain_prefix is a runtime DSL value —
-        both carry prior-round constraints accumulated in the outer Phase 2 loop.
+        chain_mask is a DSL Int32 runtime value; chain_prefix is a runtime DSL
+        ordered_type value — both carry prior-round constraints.
         Scans all three GMEM segments and writes qualifying indices to s_indices.
         Ends with cute.arch.barrier() to sync all writes before Phase 3.
         """
@@ -732,15 +743,20 @@ class FilteredTopKKernelVarlen:
     ):
         """GMEM scan for REREAD_ALWAYS non-last rounds: reset histogram, output < T2
         elements, and build histogram for the next round.
-        chain_mask is compile-time int; chain_prefix is a runtime DSL value —
-        both carry prior-round constraints accumulated in the outer Phase 2 loop.
+        chain_mask is a DSL Int32 runtime value; chain_prefix is a runtime DSL
+        ordered_type value — both carry prior-round constraints.
         Ends with fence_acq_rel_cta() + cute.arch.barrier().
+        Returns updated chain_prefix (runtime DSL value); caller updates chain_mask
+        via | (cutlass.Int32(0xFF) << offset).
         """
         _elem_bytes = self.dtype.width // 8
         _align_bytes = self.num_copy_bits // 8
         _step_vec = self.num_threads_per_cta * self.vec_size
         vec_size = self.vec_size
 
+        # Barrier before clearing s_histogram: ensures all threads have already
+        # read s_histogram[threshold-1] to update topk_remaining in the caller
+        # before any thread starts zeroing it here.
         cute.arch.barrier()
         for _hi in range(tidx, self.radix + 1, self.num_threads_per_cta):
             s_histogram[_hi] = 0
@@ -811,6 +827,10 @@ class FilteredTopKKernelVarlen:
 
         fence_acq_rel_cta()
         cute.arch.barrier()
+
+        # Return updated chain_prefix (runtime DSL value).
+        # Caller updates chain_mask via | (cutlass.Int32(0xFF) << offset).
+        return chain_prefix | self.ordered_type(self.ordered_type(T2) << self.ordered_type(offset))
 
     @cute.jit
     def _filter_and_histogram_refine(
@@ -1092,7 +1112,6 @@ class FilteredTopKKernelVarlen:
         s_indices,
         s_input_idx,
         s_last_remain,
-        s_refine_thresholds,
         num_warps,
         s_warp_sums,
     ):
@@ -1301,10 +1320,12 @@ class FilteredTopKKernelVarlen:
                 )
 
                 # Phase 2: Refinement rounds
-                # chain_mask (compile-time) and chain_prefix (runtime DSL value)
-                # accumulate prior-round constraints; passed to GMEM scan functions
-                # to avoid per-element SMEM reads for chain checking.
-                chain_mask = 0
+                # chain_mask (DSL Int32) and chain_prefix (runtime DSL ordered_type)
+                # accumulate prior-round constraints. chain_mask is Int32 so it
+                # survives the DSL phi-merge of the dynamic loop; const_expr is not
+                # used on it — the chain filter always runs (chain_mask=0 at round 0
+                # gives ordered & 0 == 0, which is always True).
+                chain_mask = cutlass.Int32(0)
                 chain_prefix = self.ordered_type(0)
                 run_next_round = True
                 for round in range(self.num_refine_rounds):
@@ -1380,7 +1401,7 @@ class FilteredTopKKernelVarlen:
                                         left_size,
                                     )
                                 else:
-                                    self._reread_always_gmem_combined_scan(
+                                    chain_prefix = self._reread_always_gmem_combined_scan(
                                         tidx,
                                         threshold_bin,
                                         threshold,
@@ -1401,11 +1422,8 @@ class FilteredTopKKernelVarlen:
                                         left_start,
                                         left_size,
                                     )
-                                    # Accumulate this round's threshold into the
-                                    # chain for the next round.
-                                    chain_mask |= 0xFF << offset
-                                    chain_prefix = chain_prefix | self.ordered_type(
-                                        self.ordered_type(threshold) << self.ordered_type(offset)
+                                    chain_mask = chain_mask | (
+                                        cutlass.Int32(0xFF) << cutlass.Int32(offset)
                                     )
                         else:
                             num_input = min(s_num_input[r_idx], self.filtered_topk_smem_input_size)
