@@ -124,9 +124,6 @@ std::optional<LlmRequest const*> TransferSession::getLlmRequest() const
 void TransferSession::setLlmRequest(LlmRequest const& llmRequest)
 {
     mRequest = &llmRequest;
-    // Refresh the session-owned transfer start: on the sender the session is created
-    // before the LlmRequest is known, so the constructor could not capture it.
-    mTransferStart = llmRequest.getPerfMetrics().timingMetrics.kvCacheTransferStart;
 }
 
 void TransferSession::setTime(TimeNames name)
@@ -145,9 +142,11 @@ void TransferSession::appendMeasure(LlmRequest::TimePoint start, LlmRequest::Tim
     }
 }
 
-void TransferSession::exportMeasure(std::ofstream& outFile) const
+void TransferSession::exportMeasure(std::ofstream& outFile, bool isContext) const
 {
-    if (!mTimes || mTimes->measures.empty())
+    // Request-free (llmRequest-agnostic reuse-tree) transfers are excluded from
+    // KV cache time capture: the exported row is keyed by the LlmRequest.
+    if (!mTimes || mTimes->measures.empty() || mRequest == nullptr)
     {
         return;
     }
@@ -161,12 +160,14 @@ void TransferSession::exportMeasure(std::ofstream& outFile) const
         }
         outFile << '\n';
     }
+    auto transferStart = mRequest->getPerfMetrics().timingMetrics.kvCacheTransferStart;
     using Milliseconds = std::chrono::duration<double, std::milli>;
 
-    // write measures, time is in milliseconds; identity and start time are session-owned,
-    // so this also works for llmRequest-agnostic (reuse-tree) transfers.
-    outFile << mRequestId;
-    auto previousTime = mTransferStart;
+    // write measures, time is in milliseconds
+    TLLM_CHECK(isContext || mRequest->getContextPhaseParams().has_value());
+    auto reqId = isContext ? mRequest->mRequestId : mRequest->getContextPhaseParams().value().getReqId();
+    outFile << reqId;
+    auto previousTime = transferStart;
     for (auto time : mTimes->times)
     {
         if (time == LlmRequest::TimePoint())
@@ -361,7 +362,7 @@ public:
                 TLLM_CHECK_WITH_INFO(
                     mMeasuresFile.is_open(), "Failed to open transfer output file: %s", outputPath.string().c_str());
             }
-            it->second.exportMeasure(mMeasuresFile);
+            it->second.exportMeasure(mMeasuresFile, true);
         }
         mRequestToSession.erase(it);
     }
@@ -412,8 +413,8 @@ public:
             {
                 auto session = TransferSession(std::vector<Connection const*>(allCounterparts.size(), nullptr),
                     DataContext{tagFromRequestId(requestId), mTerminate}, allCounterparts, mSelfState,
-                    info.getTransState(), mBufferManager, info.getIndexFromEnd(), info.getLastBlockKey(), requestId,
-                    nullptr, !common::getEnvKVCacheTimeOutputPath().empty());
+                    info.getTransState(), mBufferManager, info.getIndexFromEnd(), info.getLastBlockKey(), nullptr,
+                    !common::getEnvKVCacheTimeOutputPath().empty());
                 session.setTime(TransferSession::kTimeRequestInfo);
                 it = mRequestToSession.emplace(requestId, std::move(session)).first;
             }
@@ -909,7 +910,7 @@ public:
                 TLLM_CHECK_WITH_INFO(
                     mMeasuresFile.is_open(), "Failed to open transfer output file: %s", outputPath.string().c_str());
             }
-            session.exportMeasure(mMeasuresFile);
+            session.exportMeasure(mMeasuresFile, false);
         }
     }
 
@@ -1051,7 +1052,7 @@ public:
         auto const& resource = getReceiveCacheResource(llmRequest);
         return TransferSession(std::move(allConnections), DataContext{tagFromRequestId(requestId), mTerminate},
             std::move(allCounterparts), mSelfState, contextState, resource->mBufferManager,
-            requestInfo.getIndexFromEnd(), requestInfo.getLastBlockKey(), requestId, &llmRequest,
+            requestInfo.getIndexFromEnd(), requestInfo.getLastBlockKey(), &llmRequest,
             !common::getEnvKVCacheTimeOutputPath().empty());
     }
 
