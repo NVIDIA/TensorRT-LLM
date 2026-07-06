@@ -286,6 +286,34 @@ class Mamba2Mixer(nn.Module):
         else:
             self.norm.is_nvfp4 = False
 
+    def _run_ssd_scan(self, x, dt, B, C, cu_seqlens, seq_idx, chunk_indices,
+                      chunk_offsets, initial_states, out, state_dtype):
+        # Shared entry point for the SSD Triton kernel used by forward() and
+        # by the warmup pre-JIT. Kept small so forward() semantics are
+        # unchanged.
+        return mamba_chunk_scan_combined(
+            x,
+            dt,
+            self.A,
+            B,
+            C,
+            chunk_size=self.chunk_size,
+            D=self.D,
+            z=None,
+            dt_bias=self.dt_bias,
+            initial_states=initial_states,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
+            dt_softplus=self.delta_softplus,
+            dt_limit=(0.0, float("inf")),
+            cu_seqlens=cu_seqlens,
+            seq_idx=seq_idx,
+            return_varlen_states=True,
+            return_final_states=False,
+            out=out,
+            state_dtype=state_dtype,
+        )
+
     @torch.inference_mode()
     def warmup_ssd_initstates_kernels(self) -> None:
         # Pre-JIT the mamba_chunk_scan_combined + _state_passing_fwd Triton
@@ -299,7 +327,7 @@ class Mamba2Mixer(nn.Module):
             in_dtype = weight.dtype
             state_dtype = self._mamba_ssm_cache_dtype or in_dtype
             num_prefills = 2
-            seq_per = int(self.chunk_size) * 2
+            seq_per = self.chunk_size * 2
             total = num_prefills * seq_per
             x_p = torch.zeros((1, total, self.tp_nheads, self.head_dim),
                               dtype=in_dtype,
@@ -328,35 +356,19 @@ class Mamba2Mixer(nn.Module):
             chunk_indices, chunk_offsets = (
                 cu_seqlens_to_chunk_indices_offsets_triton(
                     cu_seqlens=cu_seqlens,
-                    chunk_size=int(self.chunk_size),
+                    chunk_size=self.chunk_size,
                     total_seqlens=total))
             out_buf = torch.empty((1, total, self.tp_nheads, self.head_dim),
                                   dtype=in_dtype,
                                   device=device)
-            mamba_chunk_scan_combined(
-                x_p,
-                dt_p,
-                self.A,
-                B_p,
-                C_p,
-                chunk_size=int(self.chunk_size),
-                D=self.D,
-                z=None,
-                dt_bias=self.dt_bias,
-                initial_states=initial_states,
-                chunk_indices=chunk_indices,
-                chunk_offsets=chunk_offsets,
-                dt_softplus=self.delta_softplus,
-                dt_limit=(0.0, float("inf")),
-                cu_seqlens=cu_seqlens,
-                seq_idx=seq_idx,
-                return_varlen_states=True,
-                return_final_states=False,
-                out=out_buf,
-                state_dtype=state_dtype,
-            )
-            torch.cuda.synchronize()
-        except Exception as e:
+            self._run_ssd_scan(x_p, dt_p, B_p, C_p, cu_seqlens, seq_idx,
+                               chunk_indices, chunk_offsets, initial_states,
+                               out_buf, state_dtype)
+            torch.cuda.current_stream().synchronize()
+        except torch.cuda.OutOfMemoryError:
+            # OOM at warmup means we won't fit at inference either — surface it.
+            raise
+        except Exception as e:  # noqa: BLE001 - best-effort JIT prewarm; must not break inference startup
             logger.warning_once(
                 f"Mamba SSD HAS_INITSTATES=True kernel warmup skipped: {e}",
                 key="mamba_ssd_initstates_warmup_skipped")

@@ -1096,12 +1096,10 @@ class PyTorchModelEngine(ModelEngine):
         # prefill that carries a cached prefix does not pay the compile cost
         # inline. Runs for all cache-manager kinds (incl. MambaHybridCacheManager),
         # since that manager is exactly the one that exposes the cold path.
-        model_root = getattr(self, "model", None)
-        if model_root is not None:
-            for module in model_root.modules():
-                hook = getattr(module, "warmup_ssd_initstates_kernels", None)
-                if callable(hook):
-                    hook()
+        for module in self.model.modules():
+            hook = getattr(module, "warmup_ssd_initstates_kernels", None)
+            if callable(hook):
+                hook()
 
     def _general_warmup(self, resource_manager: ResourceManager,
                         warmup_requests_configs: List[Tuple[int, int]]):
