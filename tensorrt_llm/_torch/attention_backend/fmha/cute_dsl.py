@@ -254,10 +254,6 @@ class CuteDslMlaFmha(PhasedFmha):
                 f"num_generations ({meta.num_generations}).",
             )
         seq_len_q = q.shape[0] // meta.num_generations
-        # No hard upper bound on seq_len_q here: the kernel folds up to
-        # F = min(seq_len_q, M_tile // num_heads) query tokens into the head
-        # dimension and the can_implement check below is the authority on what
-        # the kernel can actually serve for this geometry.
         if seq_len_q < 1:
             return False, f"Query length must be >= 1, got {seq_len_q}."
         # Perf gate (NOT a correctness limit): only admit shapes where CuteDSL
@@ -434,10 +430,6 @@ class CuteDslMlaFmha(PhasedFmha):
         import cutlass
 
         workspace = params.workspace
-        # split_kv is owned by the op's AutoTuner (profiled-best per shape, baked
-        # into the graph), not passed here. Variable split-KV (block_split_kvs) is
-        # unused on this path (the runner's is_var_split_kv default is False).
-
         softmax_scale = float(1.0 / (math.sqrt(qk_nope_head_dim + d_rope) * attn.q_scaling))
         output_scale = 1.0
         if kernel_dtype == torch.float8_e4m3fn:
@@ -456,21 +448,9 @@ class CuteDslMlaFmha(PhasedFmha):
 
         output_view = output.view(batch_size, seq_len_q, num_heads, d_latent)
 
-        # Single fused decode over all ``seq_len_q`` query tokens. For
-        # multi-query (MTP / linear spec-decode) the kernel applies the causal
-        # mask internally: query token ``t`` attends to KV positions
-        # ``[0, K - (seq_len_q - 1) + t)``. ``cache_seqs_base`` already counts
-        # every freshly-appended token of this step (K), so token ``t``'s bound
-        # equals ``cache_seqs_base - (seq_len_q - 1) + t`` -- exactly the
-        # per-query trim the previous one-token-at-a-time loop applied. For
-        # ``seq_len_q == 1`` this reduces to a plain decode.
         q_latent = q_view[..., :d_latent].permute(2, 3, 1, 0)
         q_rope = q_view[..., d_latent:].permute(2, 3, 1, 0)
 
-        # The kernel writes straight into ``output``. The gate's can_implement
-        # (queried with the real input AND output dtype) already rejected any
-        # output dtype the kernel cannot emit, so no temp buffer / dtype-convert
-        # copy is needed here.
         o_kernel = output_view.permute(2, 3, 1, 0)
         lse_storage = torch.empty(
             (batch_size, seq_len_q, num_heads),

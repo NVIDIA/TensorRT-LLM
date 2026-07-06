@@ -10,7 +10,6 @@ import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.interface import (
     AttentionInputType, MLAParams, PositionalEmbeddingParams, RopeParams)
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
-from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
@@ -588,28 +587,13 @@ def test_attention_mla_flashinfer(scenario: Scenario,
                           v2_kv_cache)
 
 
-def _run_test_for_backend(backend_name,
-                          num_heads,
-                          num_kv_heads,
-                          num_layers,
-                          q_lora_rank,
-                          kv_lora_rank,
-                          qk_nope_head_dim,
-                          qk_rope_head_dim,
-                          v_head_dim,
-                          rope_config,
-                          kv_cache_tokens_per_block,
-                          device,
-                          dtype,
-                          kv_cache_dtype,
-                          context_sequence_lengths,
-                          generation_seq_len_q,
-                          num_generation_steps,
-                          v2_kv_cache,
-                          skip_context_assert=False):
-    # When ``skip_context_assert`` is set, the context (step 0) result is not
-    # checked; the context phase only runs to populate the KV cache and build
-    # the reference latent cache. Used by the decode-only CuTe DSL MLA test.
+def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
+                          q_lora_rank, kv_lora_rank, qk_nope_head_dim,
+                          qk_rope_head_dim, v_head_dim, rope_config,
+                          kv_cache_tokens_per_block, device, dtype,
+                          kv_cache_dtype, context_sequence_lengths,
+                          generation_seq_len_q, num_generation_steps,
+                          v2_kv_cache):
     AttentionCls = get_attention_backend(backend_name)
     qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
 
@@ -1078,12 +1062,7 @@ def _run_test_for_backend(backend_name,
                 f"Difference mean: {(result - ref_result).abs().mean().item()}, max: {(result - ref_result).abs().max().item()}"
             )
 
-            # Assert results are close (skip context/step-0 when requested:
-            # the decode-only test treats the context phase as cache setup).
-            if skip_context_assert and step == 0:
-                print(f"Skipping context (step 0) assertion for {backend_name} "
-                      f"backend at layer {layer_idx} (decode-only mode)")
-                continue
+            # Assert results are close
             atol, rtol = accuracy_dict[kv_cache_dtype]
             assert torch.allclose(result, ref_result, atol=atol, rtol=rtol), \
                 f"Results for MLA in {backend_name} backend don't match reference implementation at layer {layer_idx} in step {step}"

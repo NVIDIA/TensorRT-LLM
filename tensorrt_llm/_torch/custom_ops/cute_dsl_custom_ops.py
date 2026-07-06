@@ -8362,18 +8362,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             (prior default)."""
             return [True, False]
 
-        def default_is_persistent(self, batch_size: int) -> bool:
-            """is_persistent for the FALLBACK (default) tactic -- used whenever
-            the AutoTuner did not tune this shape (eager, cache miss, or no
-            ``with autotune()`` warmup). The tuner, when it DOES run, profiles
-            both variants (get_is_persistent_candidates) and overrides this. We
-            still want the small-batch win without relying on tuning, so the
-            default follows the A/B crossover: persistent OFF below the effective
-            -batch threshold (batch*seq_q), ON at/above it (split_kv==1 many
-            -tiles regime)."""
-            min_eff_batch = 128
-            return batch_size * self.seq_len_q >= min_eff_batch
-
         @classmethod
         def get_max_workspace_size(
             cls,
@@ -8647,24 +8635,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ) -> Tuple[Tuple[int, int], Tuple[int, int], int, bool]:
             """Fallback 4-tuple tactic ``(mma_qk, mma_pv, split_kv,
             is_persistent)`` for when the AutoTuner cache is not warmed and
-            ``choose_one`` returns its ``-1`` sentinel. ``forward`` requires a
-            length-4 tactic (split_kv AND is_persistent are sourced ONLY from
-            the tactic, so the split + kernel variant baked into the CUDA graph
-            are deterministic), so the op wrapper calls this to build a valid
-            default: the sole candidate tiler, the occupancy-derived split_kv
-            from ``get_split_kv_candidates`` (the split the workspace was sized
-            for), and the batch-based default is_persistent
-            (``default_is_persistent``: OFF below the effective-batch threshold,
-            ON above, per the A/B -- so the small-batch win holds even when the
-            AutoTuner did not tune this shape)."""
+            ``choose_one`` returns its ``-1`` sentinel."""
             mma_qk_tiler_mn = (128, 128)
             mma_pv_tiler_mn = (128, 256)
             max_active_blocks = self._get_max_active_blocks()
             split_candidates = self.get_split_kv_candidates(
                 batch_size, self.seq_len_q, max_active_blocks)
             split_kv = split_candidates[-1] if split_candidates else 1
-            is_persistent = self.default_is_persistent(batch_size)
-            return (mma_qk_tiler_mn, mma_pv_tiler_mn, split_kv, is_persistent)
+            return (mma_qk_tiler_mn, mma_pv_tiler_mn, split_kv, False)
 
         def forward(
             self,
@@ -8765,16 +8743,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 page_table_ct = cute.runtime.from_dlpack(
                     page_table,
                     assumed_align=16).mark_layout_dynamic(leading_dim=0)
-                # Mark the (dense) output tensor as compact with a
-                # divisibility=16-byte stride hint. ``o`` is a permuted view of
-                # a freshly-allocated contiguous [B, S_q, H, d_latent] buffer
-                # ([H, d_latent, S_q, B] with d_latent innermost), so it IS
-                # compact -- unlike the rope-interleaved q/c KV views, which are
-                # not and must stay mark_layout_dynamic only. Without this the
-                # compiler emits conservative addressing for the whole kernel
-                # (~+7% SASS instrs, ~37% more long-scoreboard stalls) and the
-                # decode kernel runs ~1.7x slower (44us -> 26us at B64/H16/KV2k).
-                # stride_order (3,2,0,1) = B outer, S_q, H, d_latent innermost.
                 o_ct = cute.runtime.from_dlpack(
                     o, assumed_align=16).mark_layout_dynamic(
                         leading_dim=1).mark_compact_shape_dynamic(
@@ -8791,14 +8759,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 # kernel (which sizes its partials from the runtime split_kv)
                 # uses only a prefix -- a larger buffer is safe.
                 use_workspace = split_kv > 1 and workspace.numel() > 0
-                # assumed_align=32 (matching the standalone kernel's workspace)
-                # lets the compiler emit 256-bit (STG.E.256) stores for the
-                # split-KV partial accumulators instead of 128-bit. Without it
-                # the split_kv>1 decode kernel (small batch) writes partials in
-                # 64x128-bit stores vs 32x256-bit, the sole SASS divergence from
-                # the standalone kernel and the small-batch perf gap. The
-                # workspace is a fresh torch buffer (>=256B aligned), so a 32B
-                # hint is always valid.
                 workspace_ct = (cute.runtime.from_dlpack(
                     workspace, assumed_align=32).mark_layout_dynamic()
                                 if use_workspace else None)
@@ -8820,17 +8780,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         o_ct,
                         lse_ct,
                         workspace_ct,
-                        # split_kv MUST be a compile-time constant (Python int),
-                        # NOT cutlass.Int32(...): it is part of ``cache_key`` so
-                        # each value gets its own compiled kernel, and
-                        # ``_compute_grid`` / the persistent tile-scheduler
-                        # while-loop (get_k_tile_count) const-fold the launch
-                        # grid and loop bounds from it at compile time. Passing a
-                        # dynamic cutlass.Int32 makes the persistent while-loop's
-                        # carried Boolean un-const-foldable ->
-                        # "DSLRuntimeError: Unable to convert dynamic Boolean to
-                        # bool at compile time". The standalone run() passes the
-                        # plain int (works); match it.
                         split_kv,
                         cache_seqs_ct,
                         block_split_kvs_ct,
