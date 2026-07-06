@@ -4243,14 +4243,14 @@ jupyter = ["ipywidgets (>=7.5.1,<9)"]
 
 [[package]]
 name = "rich-rst"
-version = "2.0.3"
+version = "2.1.0"
 description = "A beautiful reStructuredText renderer for rich"
 optional = false
 python-versions = "*"
 groups = ["main"]
 files = [
-    {file = "rich_rst-2.0.3-py3-none-any.whl", hash = "sha256:8de7f59fc9ea38ed01c1be98fc07274a3af282666f7ecf812d05269aec08cda6"},
-    {file = "rich_rst-2.0.3.tar.gz", hash = "sha256:ffc7d779e594ae5bce1256e1bb95f3b89bf36c6c3566671133ace0603261e76f"},
+    {file = "rich_rst-2.1.0-py3-none-any.whl", hash = "sha256:7ecd1343ee12c879d0e7ae74c3eb6d263b023d2929c6d114212eb1fd91057255"},
+    {file = "rich_rst-2.1.0.tar.gz", hash = "sha256:f4d117b49697f338769759fa5cacf5197da4888b347b9fda2e50aef5cd8d93bd"},
 ]
 
 [package.dependencies]
@@ -4258,7 +4258,8 @@ pygments = ">=2.0.0"
 rich = ">=12.0.0"
 
 [package.extras]
-docs = ["docutils", "rich", "rich_rst", "sphinx", "sphinx_copybutton", "sphinx_rtd_theme"]
+dev = ["mypy", "pre-commit", "ruff"]
+docs = ["docutils", "sphinx", "sphinx_copybutton", "sphinx_rtd_theme"]
 tests = ["pytest", "pytest-cov"]
 
 [[package]]
