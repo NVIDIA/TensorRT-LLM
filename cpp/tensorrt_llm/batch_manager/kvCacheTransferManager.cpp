@@ -16,6 +16,7 @@
  */
 
 #include <cstdint>
+#include <cstring>
 
 #include "tensorrt_llm/batch_manager/kvCacheTransferManager.h"
 
@@ -84,6 +85,24 @@ KVCacheTransferManager::KVCacheTransferManager(
 {
     TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
     TLLM_CHECK(mDeviceId != -1);
+    if (mAsyncDiskStore)
+    {
+        mDiskWriter = std::thread(&KVCacheTransferManager::diskWriterLoop, this);
+        TLLM_LOG_INFO("[disk-tier] async store ENABLED (write-queue max=%zu)", mDiskWriteQueueMax);
+    }
+}
+
+KVCacheTransferManager::~KVCacheTransferManager()
+{
+    if (mDiskWriter.joinable())
+    {
+        {
+            std::lock_guard<std::mutex> lock(mDiskMutex);
+            mDiskWriterStop = true;
+        }
+        mDiskQueueCv.notify_all();
+        mDiskWriter.join();
+    }
 }
 
 tr::ITensor::SharedPtr KVCacheTransferManager::computeBlockPointer(
@@ -401,6 +420,96 @@ std::string diskSlotFilename(std::string const& directory, SizeType32 diskSlot, 
 }
 } // namespace
 
+void KVCacheTransferManager::diskWriterLoop()
+{
+    while (true)
+    {
+        DiskWriteJob job;
+        {
+            std::unique_lock<std::mutex> lock(mDiskMutex);
+            mDiskQueueCv.wait(lock, [this] { return !mDiskWriteQueue.empty() || mDiskWriterStop; });
+            if (mDiskWriteQueue.empty())
+            {
+                if (mDiskWriterStop)
+                {
+                    return;
+                }
+                continue;
+            }
+            job = std::move(mDiskWriteQueue.front());
+            mDiskWriteQueue.pop();
+        }
+        mDiskQueueCv.notify_all(); // a producer may be blocked waiting for queue space
+
+        // The slow, writeback-throttle-prone part runs HERE, off the scheduler thread.
+        int fd = ::open(job.filename.c_str(), O_CREAT | O_WRONLY, 0644);
+        if (fd >= 0)
+        {
+            auto const written = ::pwrite(fd, job.staged.data(), job.bytes, 0);
+            ::close(fd);
+            if (written != static_cast<ssize_t>(job.bytes))
+            {
+                TLLM_LOG_ERROR("[disk-tier] short async write to %s (%zd/%zu)", job.filename.c_str(),
+                    static_cast<ssize_t>(written), job.bytes);
+            }
+        }
+        else
+        {
+            TLLM_LOG_ERROR("[disk-tier] cannot open %s for async write", job.filename.c_str());
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mDiskMutex);
+            if (auto it = mDiskInflight.find(job.filename); it != mDiskInflight.end() && --it->second <= 0)
+            {
+                mDiskInflight.erase(it);
+            }
+        }
+        mDiskQueueCv.notify_all();    // wake a producer waiting to re-write this slot
+        mDiskInflightCv.notify_all(); // wake a loader waiting on this slot
+    }
+}
+
+void KVCacheTransferManager::enqueueDiskWrite(std::string filename, void const* src, std::size_t bytes)
+{
+    DiskWriteJob job;
+    job.filename = std::move(filename);
+    job.bytes = bytes;
+    job.staged.resize(bytes);
+    std::memcpy(job.staged.data(), src, bytes); // fast host->host copy; frees the slot
+
+    {
+        std::unique_lock<std::mutex> lock(mDiskMutex);
+        // Backpressure + per-slot serialization: wait for queue room AND no earlier write
+        // to this same slot still outstanding (so a reused slot cannot race).
+        mDiskQueueCv.wait(lock,
+            [this, &job]
+            {
+                return (mDiskWriteQueue.size() < mDiskWriteQueueMax
+                           && mDiskInflight.find(job.filename) == mDiskInflight.end())
+                    || mDiskWriterStop;
+            });
+        if (mDiskWriterStop)
+        {
+            return;
+        }
+        ++mDiskInflight[job.filename]; // mark BEFORE the block becomes loadable
+        mDiskWriteQueue.push(std::move(job));
+    }
+    mDiskQueueCv.notify_one();
+}
+
+void KVCacheTransferManager::waitForDiskSlotWrites(std::string const& filename)
+{
+    std::unique_lock<std::mutex> lock(mDiskMutex);
+    mDiskInflightCv.wait(lock,
+        [this, &filename]
+        {
+            auto it = mDiskInflight.find(filename);
+            return it == mDiskInflight.end() || it->second <= 0;
+        });
+}
+
 void KVCacheTransferManager::spillToFile(BlockPtr const& srcHostBlock, SizeType32 diskSlot,
     std::vector<KVCacheBlockPool> const& pools, std::string const& directory)
 {
@@ -417,12 +526,20 @@ void KVCacheTransferManager::spillToFile(BlockPtr const& srcHostBlock, SizeType3
         TLLM_CHECK_WITH_INFO(!pools[poolIdx].layerFirstLayout, "disk tier does not support layer-first layout pools");
         auto ptr = computeBlockPointer(srcHostBlock, pools, poolIdx);
         auto const filename = diskSlotFilename(directory, diskSlot, poolIdx);
-        int fd = ::open(filename.c_str(), O_CREAT | O_WRONLY, 0644);
-        TLLM_CHECK_WITH_INFO(fd >= 0, "disk tier: cannot open %s", filename.c_str());
-        auto const bytes = static_cast<ssize_t>(ptr->getSizeInBytes());
-        auto const written = ::pwrite(fd, ptr->data(), bytes, 0);
-        ::close(fd);
-        TLLM_CHECK_WITH_INFO(written == bytes, "disk tier: short write to %s", filename.c_str());
+        auto const bytes = static_cast<std::size_t>(ptr->getSizeInBytes());
+        if (!mAsyncDiskStore)
+        {
+            // Synchronous path -- byte-for-byte the original behavior.
+            int fd = ::open(filename.c_str(), O_CREAT | O_WRONLY, 0644);
+            TLLM_CHECK_WITH_INFO(fd >= 0, "disk tier: cannot open %s", filename.c_str());
+            auto const written = ::pwrite(fd, ptr->data(), bytes, 0);
+            ::close(fd);
+            TLLM_CHECK_WITH_INFO(
+                written == static_cast<ssize_t>(bytes), "disk tier: short write to %s", filename.c_str());
+            continue;
+        }
+        // Async path: copy bytes out (frees the slot immediately) and hand to the writer.
+        enqueueDiskWrite(filename, ptr->data(), bytes);
     }
 }
 
@@ -438,6 +555,46 @@ void KVCacheTransferManager::loadFromFile(BlockPtr const& dstPrimaryBlock, SizeT
     if (auto it = mPendingReads.find(idx); it != mPendingReads.end())
     {
         it->second.synchronize();
+    }
+    // Async store may still be persisting this slot; a read must not race the write.
+    if (mAsyncDiskStore)
+    {
+        for (size_t poolIdx = 0; poolIdx < pools.size(); ++poolIdx)
+        {
+            waitForDiskSlotWrites(diskSlotFilename(directory, diskSlot, poolIdx));
+        }
+    }
+    if (mDiskUseGds)
+    {
+        // GDS onboard: direct SSD -> GPU VRAM via the NIXL loopback agent (cuFile).
+        // Falls back to POSIX staging if the GDS backend can't be created/run.
+        try
+        {
+            if (mLoopbackAgent == nullptr)
+            {
+                kvc::BaseAgentConfig config{std::string("GDSAgent"), true, true};
+                mLoopbackAgent = kvc::makeLoopbackAgent("nixl", &config);
+            }
+            std::vector<kvc::FileDesc> fileBlobs;
+            std::vector<kvc::MemoryDesc> memoryBlobs;
+            for (size_t poolIdx = 0; poolIdx < pools.size(); ++poolIdx)
+            {
+                TLLM_CHECK_WITH_INFO(
+                    !pools[poolIdx].layerFirstLayout, "disk tier does not support layer-first layout pools");
+                auto ptr = computeBlockPointer(dstPrimaryBlock, pools, poolIdx);
+                fileBlobs.emplace_back(
+                    diskSlotFilename(directory, diskSlot, poolIdx), O_RDONLY, 0664, ptr->getSizeInBytes());
+                memoryBlobs.emplace_back(ptr->data(), ptr->getSizeInBytes(), mDeviceId);
+            }
+            kvc::FileDescs fileDescs(std::move(fileBlobs));
+            kvc::MemoryDescs memoryDescs(kvc::MemoryType::kVRAM, memoryBlobs);
+            mLoopbackAgent->executeLoopbackRequest(memoryDescs, fileDescs, /*isOffload=*/false);
+            return;
+        }
+        catch (std::exception const& e)
+        {
+            TLLM_LOG_WARNING("disk tier: GDS onboard failed (%s); falling back to POSIX", e.what());
+        }
     }
     for (size_t poolIdx = 0; poolIdx < pools.size(); ++poolIdx)
     {

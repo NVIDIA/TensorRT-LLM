@@ -19,6 +19,12 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 
+#include <condition_variable>
+#include <cstdint>
+#include <mutex>
+#include <queue>
+#include <thread>
+
 namespace tr = tensorrt_llm::runtime;
 namespace kvc = tensorrt_llm::executor::kv_cache;
 
@@ -85,6 +91,8 @@ public:
 
     void syncTransfers();
 
+    ~KVCacheTransferManager();
+
     //! \brief Get transfer stats accumulated since last call, and reset the counters.
     [[nodiscard]] KvCacheTransferStats getAndResetTransferStats();
 
@@ -132,6 +140,37 @@ private:
     // Reference to parent loopback agent
     std::shared_ptr<kvc::BaseLoopbackAgent> mLoopbackAgent;
     int mDeviceId;
+    // Disk-tier onboard (disk->GPU) uses GPUDirect Storage when TLLM_KV_DISK_GDS is set;
+    // otherwise POSIX staging. Read once at construction.
+    bool mDiskUseGds{std::getenv("TLLM_KV_DISK_GDS") != nullptr};
+
+    // ---- Disk-tier async store: spill host->disk OFF the scheduler thread ----
+    // Gated by TLLM_KV_DISK_ASYNC_STORE. Unset => synchronous spill (current behavior).
+    bool const mAsyncDiskStore{std::getenv("TLLM_KV_DISK_ASYNC_STORE") != nullptr};
+
+    struct DiskWriteJob
+    {
+        std::string filename;
+        std::size_t bytes{0};
+        std::vector<std::uint8_t> staged;
+    };
+
+    std::thread mDiskWriter;
+    std::mutex mDiskMutex;
+    std::condition_variable mDiskQueueCv;
+    std::condition_variable mDiskInflightCv;
+    std::queue<DiskWriteJob> mDiskWriteQueue;
+    std::unordered_map<std::string, int> mDiskInflight;
+    bool mDiskWriterStop{false};
+    std::size_t const mDiskWriteQueueMax{[]
+        {
+            auto* e = std::getenv("TLLM_KV_DISK_WRITE_QUEUE");
+            return e ? std::stoul(e) : 1024UL;
+        }()};
+
+    void diskWriterLoop();
+    void enqueueDiskWrite(std::string filename, void const* src, std::size_t bytes);
+    void waitForDiskSlotWrites(std::string const& filename);
 
     // Cumulative transfer statistics, reset on each call to getAndResetTransferStats().
     // Protected by mStatsMutex for thread-safe access.
