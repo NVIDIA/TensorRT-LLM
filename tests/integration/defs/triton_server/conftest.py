@@ -183,16 +183,6 @@ def tensorrt_llm_opt_example_root(llm_backend_root):
 
 
 @pytest.fixture(scope="session")
-def tensorrt_llm_medusa_example_root(llm_backend_root):
-    return os.path.join(llm_backend_root, "../examples/medusa")
-
-
-@pytest.fixture(scope="session")
-def tensorrt_llm_eagle_example_root(llm_backend_root):
-    return os.path.join(llm_backend_root, "../examples/eagle")
-
-
-@pytest.fixture(scope="session")
 def tensorrt_llm_enc_dec_example_root(llm_backend_root):
     return os.path.join(llm_backend_root, "../examples/models/core/enc_dec")
 
@@ -512,32 +502,6 @@ def vicuna_7b_model_root():
         vicuna_7b_model_root
     ), f"{vicuna_7b_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     return vicuna_7b_model_root
-
-
-@pytest.fixture(scope="session")
-def medusa_vicuna_7b_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    medusa_vicuna_7b_model_root = os.path.join(models_root,
-                                               "medusa-vicuna-7b-v1.3")
-
-    assert os.path.exists(
-        medusa_vicuna_7b_model_root
-    ), f"{medusa_vicuna_7b_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return medusa_vicuna_7b_model_root
-
-
-@pytest.fixture(scope="session")
-def eagle_vicuna_7b_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    eagle_vicuna_7b_model_root = os.path.join(models_root,
-                                              "EAGLE-Vicuna-7B-v1.3")
-
-    assert os.path.exists(
-        eagle_vicuna_7b_model_root
-    ), f"{eagle_vicuna_7b_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return eagle_vicuna_7b_model_root
 
 
 @pytest.fixture(scope="session")

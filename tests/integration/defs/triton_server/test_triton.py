@@ -50,8 +50,6 @@ def model_path(test_name):
         "gpt-ib-speculative-decoding-bls": "gpt2",
         "gpt-2b-ib-lora": "gpt-next/gpt-next-tokenizer-hf-v2",
         "gpt-gather-logits": "gpt2",
-        "medusa": "vicuna-7b-v1.3",
-        "eagle": "vicuna-7b-v1.3",
         "bart-ib": "bart-large-cnn",
         "t5-ib": "t5-small",
         "blip2-opt": "blip2-opt-2.7b",
@@ -86,8 +84,6 @@ def engine_dir(test_name, llm_root):
         "gpt-ib-lad": "models/core/gpt/trt_engine/gpt2-ib-lad/fp16/1-gpu/",
         "gpt-2b-ib-lora":
         "models/core/gpt/trt_engine/gpt-2b-lora-ib/fp16/1-gpu/",
-        "medusa": "medusa/tmp/medusa/7B/trt_engines/fp16/1-gpu/",
-        "eagle": "eagle/tmp/eagle/7B/trt_engines/fp16/1-gpu/",
         "bart-ib": "models/core/enc_dec/trt_engine/bart-ib/fp16/1-gpu/",
         "t5-ib": "models/core/enc_dec/trt_engine/t5-ib/fp16/1-gpu/",
         "blip2-opt": "models/core/multimodal/trt_engines/opt-2.7b/fp16/1-gpu",
@@ -291,24 +287,24 @@ def test_gpt_gather_logits(tritonserver_test_root, test_name, llm_root,
         llm_root)
 
 
+def _assert_example_dir_removed(llm_root, name):
+    # Regression guard for a legacy TensorRT example directory: reintroducing
+    # it without restoring the matching branches in triton_server's
+    # build_model.sh and test.sh leaves the harness pointing at dead code.
+    path = os.path.join(llm_root, "examples", name)
+    assert not os.path.exists(path), (
+        f"{path} should stay removed; if reintroduced, also restore the "
+        f"{name} branches in triton_server/build_model.sh and test.sh.")
+
+
 @pytest.mark.parametrize("test_name", ["medusa"], indirect=True)
-def test_medusa(tritonserver_test_root, test_name, llm_root, model_path,
-                engine_dir):
-    build_model(test_name, llm_root, tritonserver_test_root)
-    tokenizer_type = "llama"
-    run_shell_command(
-        f"cd {tritonserver_test_root} && ./test.sh {test_name} {engine_dir} {model_path} {tokenizer_type}",
-        llm_root)
+def test_medusa(test_name, llm_root):
+    _assert_example_dir_removed(llm_root, "medusa")
 
 
 @pytest.mark.parametrize("test_name", ["eagle"], indirect=True)
-def test_eagle(tritonserver_test_root, test_name, llm_root, model_path,
-               engine_dir):
-    build_model(test_name, llm_root, tritonserver_test_root)
-    tokenizer_type = "llama"
-    run_shell_command(
-        f"cd {tritonserver_test_root} && ./test.sh {test_name} {engine_dir} {model_path} {tokenizer_type}",
-        llm_root)
+def test_eagle(test_name, llm_root):
+    _assert_example_dir_removed(llm_root, "eagle")
 
 
 @pytest.mark.parametrize("test_name", ["whisper"], indirect=True)

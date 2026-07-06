@@ -17,8 +17,6 @@ MISTRAL=$LLM_MODELS_ROOT/mistral-7b-v0.1
 GPT_2B=$LLM_MODELS_ROOT/GPT-2B-001_bf16_tp1.nemo
 GPT_2B_LORA=$LLM_MODELS_ROOT/lora/gpt-next-2b
 VICUNA=$LLM_MODELS_ROOT/vicuna-7b-v1.3
-MEDUSA_VICUNA=$LLM_MODELS_ROOT/medusa-vicuna-7b-v1.3/
-EAGLE_VICUNA=$LLM_MODELS_ROOT/EAGLE-Vicuna-7B-v1.3/
 BART=$LLM_MODELS_ROOT/bart-large-cnn/
 T5=$LLM_MODELS_ROOT/t5-small/
 BLIP2_OPT_2_7B=$LLM_MODELS_ROOT/blip2-opt-2.7b
@@ -388,58 +386,6 @@ if [ "$MODEL" = "gpt-gather-logits" ]; then
         --max_num_tokens 38400
 
     popd # examples/models/core/gpt
-
-fi
-
-if [ "$MODEL" = "medusa" ]; then
-
-    # Medusa
-    pushd examples/medusa
-
-    install_requirements
-
-    echo "Convert Medusa from HF"
-    python convert_checkpoint.py --model_dir ${VICUNA} \
-                            --medusa_model_dir ${MEDUSA_VICUNA} \
-                            --output_dir ./tllm_checkpoint_1gpu_medusa \
-                            --dtype float16 \
-                            --num_medusa_heads 4
-
-    echo "Build Medusa: float16"
-    trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_medusa \
-             --output_dir ./tmp/medusa/7B/trt_engines/fp16/1-gpu/ \
-             --gemm_plugin float16 \
-             --speculative_decoding_mode medusa \
-             --max_batch_size 8 --max_seq_len 600 \
-             --max_num_tokens 2400
-
-    popd # examples/medusa
-
-fi
-
-if [ "$MODEL" = "eagle" ]; then
-
-    # Eagle
-    pushd examples/eagle
-
-    install_requirements
-
-    echo "Convert Eagle from HF"
-    python convert_checkpoint.py --model_dir ${VICUNA} \
-                            --eagle_model_dir ${EAGLE_VICUNA} \
-                            --output_dir ./tllm_checkpoint_1gpu_eagle \
-                            --dtype float16 \
-                            --num_eagle_layers 4
-
-    echo "Build Eagle: float16"
-    trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_eagle \
-             --output_dir ./tmp/eagle/7B/trt_engines/fp16/1-gpu/ \
-             --gemm_plugin float16 \
-             --speculative_decoding_mode eagle \
-             --max_batch_size 8 --max_seq_len 600 \
-             --max_num_tokens 2400
-
-    popd # examples/eagle
 
 fi
 
