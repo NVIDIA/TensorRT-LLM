@@ -192,6 +192,7 @@ class MoEOpBackend:
         do_finalize: bool = True,
         enable_pdl: Optional[bool] = None,
         tune_max_num_tokens: int = 8192,
+        use_dp: bool = False,
     ) -> torch.Tensor:
         """Run BF16 MoE computation."""
         raise NotImplementedError
@@ -474,6 +475,7 @@ class TRTLLMOpBackend(MoEOpBackend):
         do_finalize=True,
         enable_pdl=None,
         tune_max_num_tokens=8192,
+        use_dp=False,
     ):
         raise NotImplementedError(
             "TRTLLM native op backend does not support unquantized BF16 TRTLLM-Gen fused MoE. "
@@ -559,13 +561,13 @@ class FlashinferOpBackend(MoEOpBackend):
         enable_pdl: Optional[bool] = None,
     ):
         return self._fp4_quantize(
-            input,
-            global_scale,
-            sf_vec_size,
-            sf_use_ue8m0,
-            is_sf_swizzled_layout,
-            is_sf_8x4_layout,
-            enable_pdl,
+            input=input,
+            global_scale=global_scale,
+            sf_vec_size=sf_vec_size,
+            sf_use_ue8m0=sf_use_ue8m0,
+            is_sf_swizzled_layout=is_sf_swizzled_layout,
+            is_sf_8x4_layout=is_sf_8x4_layout,
+            enable_pdl=enable_pdl,
         )
 
     def mxfp8_quantize(
@@ -615,57 +617,34 @@ class FlashinferOpBackend(MoEOpBackend):
                 "FlashinferOpBackend.run_fp8_block_scale_moe does not yet "
                 "forward gemm1_clamp_limit; use the trtllm op backend."
             )
-        if router_logits is not None:
-            return self._fused_moe.trtllm_fp8_block_scale_moe(
-                router_logits,
-                routing_bias,
-                hidden_states,
-                hidden_states_scale,
-                gemm1_weights,
-                gemm1_weights_scale,
-                gemm2_weights,
-                gemm2_weights_scale,
-                num_experts,
-                top_k,
-                n_group,
-                topk_group,
-                intermediate_size,
-                local_expert_offset,
-                local_num_experts,
-                routed_scaling_factor,
-                self.cvt_routing_method_type(routing_method_type),
-                use_shuffled_weight=use_shuffled_weight,
-                weight_layout=weight_layout,
-                enable_pdl=enable_pdl,
-                tune_max_num_tokens=tune_max_num_tokens,
-            )
-        else:
-            packed_topk_ids = (topk_ids << 16) | topk_weights.view(torch.int16).to(torch.int32)
-            # Run with pre-computed routing (packed format)
-            return self._fused_moe.trtllm_fp8_block_scale_routed_moe(
-                topk_ids=packed_topk_ids,
-                routing_bias=routing_bias,
-                hidden_states=hidden_states,
-                hidden_states_scale=hidden_states_scale,
-                gemm1_weights=gemm1_weights,
-                gemm1_weights_scale=gemm1_weights_scale,
-                gemm2_weights=gemm2_weights,
-                gemm2_weights_scale=gemm2_weights_scale,
-                num_experts=num_experts,
-                top_k=top_k,
-                n_group=n_group,
-                topk_group=topk_group,
-                intermediate_size=intermediate_size,
-                local_expert_offset=local_expert_offset,
-                local_num_experts=num_experts,
-                routed_scaling_factor=routed_scaling_factor,
-                routing_method_type=self.cvt_routing_method_type(routing_method_type),
-                use_shuffled_weight=use_shuffled_weight,
-                weight_layout=weight_layout,
-                enable_pdl=enable_pdl,
-                output=output,
-                tune_max_num_tokens=tune_max_num_tokens,
-            )
+        outputs = torch.ops.trtllm.flashinfer_trtllm_fp8_block_scale_moe_runner(
+            router_logits,
+            routing_bias,
+            hidden_states,
+            hidden_states_scale,
+            gemm1_weights,
+            gemm1_weights_scale,
+            gemm2_weights,
+            gemm2_weights_scale,
+            num_experts,
+            top_k,
+            n_group,
+            topk_group,
+            intermediate_size,
+            local_expert_offset,
+            local_num_experts,
+            routed_scaling_factor,
+            self.cvt_routing_method_type(routing_method_type),
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            output=output,
+            use_shuffled_weight=use_shuffled_weight,
+            weight_layout=weight_layout,
+            enable_pdl=enable_pdl,
+            tune_max_num_tokens=tune_max_num_tokens,
+            use_dp=use_dp,
+        )
+        return output if output is not None else outputs[0]
 
     def run_fp4_block_scale_moe(
         self,
@@ -705,85 +684,80 @@ class FlashinferOpBackend(MoEOpBackend):
         tune_max_num_tokens=8192,
         use_dp=False,
     ):
-        if router_logits is not None:
-            outputs = self._fused_moe.trtllm_fp4_block_scale_moe(
-                router_logits,
-                routing_bias,
-                hidden_states,
-                hidden_states_scale.view(torch.float8_e4m3fn)
-                if hidden_states_scale is not None
-                else None,
-                gemm1_weights,
-                gemm1_weights_scale.view(torch.float8_e4m3fn),
-                gemm1_bias,
-                gemm1_alpha,
-                gemm1_beta,
-                gemm1_clamp_limit,
-                gemm2_weights,
-                gemm2_weights_scale.view(torch.float8_e4m3fn),
-                gemm2_bias,
-                output1_scale_scalar,
-                output1_scale_gate_scalar,
-                output2_scale_scalar,
-                num_experts,
-                top_k,
-                n_group,
-                topk_group,
-                intermediate_size,
-                local_expert_offset,
-                local_num_experts,
-                routed_scaling_factor,
-                self.cvt_routing_method_type(routing_method_type),
-                do_finalize=do_finalize,
-                enable_pdl=enable_pdl,
-                activation_type=self.cvt_activation_type(gated_act_type),
-                output=output,
-                tune_max_num_tokens=tune_max_num_tokens,
+        fi_hidden_size = hidden_states.shape[1]
+        if hidden_states.dtype == torch.uint8:
+            fi_hidden_size *= 2
+
+        if gemm2_weights.shape[1] != fi_hidden_size:
+            raise ValueError(
+                "FlashInfer FP4 MoE GEMM2 expects gemm2_weights dim 1 "
+                f"to match hidden_states hidden size {fi_hidden_size}, "
+                f"got {gemm2_weights.shape[1]}."
             )
-        else:
-            packed_tensor = (topk_ids.to(torch.int32) << 16) | topk_weights.to(torch.bfloat16).view(
-                torch.int16
+        if gemm2_weights_scale.shape[1] != fi_hidden_size:
+            raise ValueError(
+                "FlashInfer FP4 MoE GEMM2 expects gemm2_weights_scale dim 1 "
+                f"to match hidden_states hidden size {fi_hidden_size}, "
+                f"got {gemm2_weights_scale.shape[1]}."
             )
-            outputs = self._fused_moe.trtllm_fp4_block_scale_routed_moe(
-                packed_tensor,
-                routing_bias,
-                hidden_states,
-                hidden_states_scale.view(torch.float8_e4m3fn)
-                if hidden_states_scale is not None
-                else None,
-                gemm1_weights,
-                gemm1_weights_scale.view(torch.float8_e4m3fn),
-                gemm1_bias,
-                gemm1_alpha,
-                gemm1_beta,
-                gemm1_clamp_limit,
-                gemm2_weights,
-                gemm2_weights_scale.view(torch.float8_e4m3fn),
-                gemm2_bias,
-                output1_scale_scalar,
-                output1_scale_gate_scalar,
-                output2_scale_scalar,
-                num_experts,
-                top_k,
-                n_group,
-                topk_group,
-                intermediate_size,
-                local_expert_offset,
-                local_num_experts,
-                routed_scaling_factor,
-                self.cvt_routing_method_type(routing_method_type),
-                do_finalize=do_finalize,
-                enable_pdl=enable_pdl,
-                activation_type=self.cvt_activation_type(gated_act_type),
-                output=output,
-                tune_max_num_tokens=tune_max_num_tokens,
+        if gemm2_bias is not None and gemm2_bias.shape[1] != fi_hidden_size:
+            raise ValueError(
+                "FlashInfer FP4 MoE GEMM2 expects gemm2_bias dim 1 "
+                f"to match hidden_states hidden size {fi_hidden_size}, "
+                f"got {gemm2_bias.shape[1]}."
             )
+
+        outputs = torch.ops.trtllm.flashinfer_trtllm_fp4_block_scale_moe_runner(
+            router_logits,
+            routing_bias,
+            hidden_states,
+            hidden_states_scale.view(torch.float8_e4m3fn)
+            if hidden_states_scale is not None
+            else None,
+            gemm1_weights,
+            gemm1_weights_scale.view(torch.float8_e4m3fn),
+            gemm1_bias,
+            gemm1_alpha,
+            gemm1_beta,
+            gemm1_clamp_limit,
+            gemm2_weights,
+            gemm2_weights_scale.view(torch.float8_e4m3fn),
+            gemm2_bias,
+            output1_scale_scalar,
+            output1_scale_gate_scalar,
+            output2_scale_scalar,
+            num_experts,
+            top_k,
+            n_group,
+            topk_group,
+            intermediate_size,
+            local_expert_offset,
+            local_num_experts,
+            routed_scaling_factor,
+            self.cvt_routing_method_type(routing_method_type),
+            do_finalize,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            output=output,
+            enable_pdl=enable_pdl,
+            activation_type=self.cvt_activation_type(gated_act_type),
+            tune_max_num_tokens=tune_max_num_tokens,
+            use_dp=use_dp,
+        )
         if not do_finalize:
             if outputs[2].dim() != 2:
                 outputs[2] = outputs[2].view(-1, top_k)
+            # WAR: flashinfer FP4 wrapper allocates expert_weights with
+            # routing_logits.dtype (float32 for DSV3) but the routing kernel
+            # always writes bf16 (mDtypeExpW = Bfloat16). Reinterpret bytes to
+            # bf16 so downstream consumers (e.g. moe_finalize_allreduce dispatch)
+            # see the right scalar_type. Underlying bytes/data_ptr are unchanged
+            # and downstream kernels use flat (token*top_k+k) indexing.
+            if outputs[1].dtype != torch.bfloat16:
+                outputs[1] = outputs[1].view(torch.bfloat16)
             return outputs
         else:
-            final_hidden_states = outputs[0]
+            final_hidden_states = output if output is not None else outputs[0]
             return final_hidden_states
 
     def run_bf16_moe(
@@ -811,60 +785,35 @@ class FlashinferOpBackend(MoEOpBackend):
         do_finalize=True,
         enable_pdl=None,
         tune_max_num_tokens=8192,
+        use_dp=False,
     ):
-        # Forward the activation (Swiglu/Relu2) to the FlashInfer BF16 kernels.
-        activation_type = self.cvt_activation_type(gated_act_type)
+        outputs = torch.ops.trtllm.flashinfer_trtllm_bf16_moe_runner(
+            router_logits,
+            routing_bias,
+            hidden_states,
+            gemm1_weights,
+            gemm2_weights,
+            num_experts,
+            top_k,
+            n_group,
+            topk_group,
+            intermediate_size,
+            local_expert_offset,
+            local_num_experts,
+            routed_scaling_factor,
+            self.cvt_routing_method_type(routing_method_type),
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            output=output,
+            use_shuffled_weight=use_shuffled_weight,
+            weight_layout=weight_layout,
+            do_finalize=do_finalize,
+            enable_pdl=enable_pdl,
+            tune_max_num_tokens=tune_max_num_tokens,
+            use_dp=use_dp,
+            activation_type=self.cvt_activation_type(gated_act_type),
+        )
 
-        if router_logits is not None:
-            result = self._fused_moe.trtllm_bf16_moe(
-                routing_logits=router_logits,
-                routing_bias=routing_bias,
-                hidden_states=hidden_states,
-                gemm1_weights=gemm1_weights,
-                gemm2_weights=gemm2_weights,
-                num_experts=num_experts,
-                top_k=top_k,
-                n_group=n_group,
-                topk_group=topk_group,
-                intermediate_size=intermediate_size,
-                local_expert_offset=local_expert_offset,
-                local_num_experts=local_num_experts,
-                routed_scaling_factor=routed_scaling_factor,
-                routing_method_type=self.cvt_routing_method_type(routing_method_type),
-                use_shuffled_weight=use_shuffled_weight,
-                weight_layout=weight_layout,
-                do_finalize=do_finalize,
-                enable_pdl=enable_pdl,
-                tune_max_num_tokens=tune_max_num_tokens,
-                activation_type=activation_type,
-            )
-        else:
-            packed_topk_ids = (topk_ids.to(torch.int32) << 16) | topk_weights.to(
-                torch.bfloat16
-            ).contiguous().view(torch.int16).to(torch.int32)
-            result = self._fused_moe.trtllm_bf16_routed_moe(
-                packed_topk_ids,
-                hidden_states,
-                gemm1_weights,
-                gemm2_weights,
-                num_experts,
-                top_k,
-                n_group,
-                topk_group,
-                intermediate_size,
-                local_expert_offset,
-                local_num_experts,
-                routed_scaling_factor,
-                self.cvt_routing_method_type(routing_method_type),
-                use_shuffled_weight=use_shuffled_weight,
-                weight_layout=weight_layout,
-                do_finalize=do_finalize,
-                enable_pdl=enable_pdl,
-                tune_max_num_tokens=tune_max_num_tokens,
-                activation_type=activation_type,
-            )
-
-        if output is not None and do_finalize:
-            output.copy_(result)
-            return output
-        return result
+        if do_finalize:
+            return output if output is not None else outputs[0]
+        return outputs

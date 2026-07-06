@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +21,7 @@ This module provides various communication strategies for expert parallelism in 
 Available Communication Methods:
 - AllGatherReduceScatter: Default fallback method, always available
 - NVLinkTwoSided: NVLINK-optimized communication for latency (formerly MNNVLLatency)
+- NVLinkTwoSidedFlashinfer: NVLINK two-sided variant backed by FlashInfer mnnvl alltoall
 - NVLinkOneSided: NVLINK-optimized communication for throughput (formerly MNNVLThroughput)
 - DeepEP: Deep Expert Parallelism with support for large batches
 - DeepEPLowLatency: Deep Expert Parallelism optimized for low latency
@@ -36,6 +37,7 @@ from .deep_ep import DeepEP
 from .deep_ep_low_latency import DeepEPLowLatency
 from .nvlink_one_sided import NVLinkOneSided
 from .nvlink_two_sided import NVLinkTwoSided
+from .nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
 
 __all__ = [
     # Base classes and types
@@ -43,6 +45,7 @@ __all__ = [
     # Communication strategies
     "AllGatherReduceScatter",
     "NVLinkTwoSided",
+    "NVLinkTwoSidedFlashinfer",
     "NVLinkOneSided",
     "DeepEP",
     "DeepEPLowLatency",
