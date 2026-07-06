@@ -50,6 +50,7 @@ verl_config:
     - "PATH=\"${NVSHMEM_DIR}/bin:$PATH\""
     - "TRTLLM_TEST_MODEL_PATH_ROOT=/tmp/verl-models"
     - "TORCH_CUDA_ARCH_LIST="
+    - "RAY_enable_open_telemetry_on_core_worker=0"
 
   # Read-only CI model cache (flat layout: /scratch.../ModelName)
   ci_model_cache: "/scratch.trt_llm_data/llm-models"
