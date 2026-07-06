@@ -63,6 +63,13 @@ public:
     int enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
         void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream);
 
+    // Lazily (re)allocate the fused-T5 bucket-lookup table on device and
+    // populate it via `initFusedT5BucketTable`. No-op if the current buffer
+    // already covers (maxSeqLen, numBuckets, maxDistance, bidirectional).
+    // Returns true on success, false on any CUDA error or disabled state.
+    bool ensureFusedT5BucketTable(int maxSeqLen, int numBuckets, int maxDistance, bool bidirectional,
+        cudaStream_t stream);
+
     // IPluginV2Ext Methods
     nvinfer1::DataType getOutputDataType(
         int index, nvinfer1::DataType const* inputTypes, int nbInputs) const noexcept override;
@@ -87,6 +94,15 @@ private:
     bool mRelativeAttention = false;
     int mMaxDistance = 0;
     bool mRemovePadding = false;
+
+    // ── Fused T5 encoder-attention (optional, opt-in via
+    //    TRTLLM_ENABLE_FUSED_T5_ATTENTION=1 or Python config).
+    bool mFusedT5Enabled = false;
+    int16_t* mFusedT5BucketTable = nullptr;
+    int mFusedT5BucketTableCap = 0;
+    int mFusedT5BucketTableSeqLen = 0;
+    int mFusedT5BucketCount = 0;
+    int mFusedT5MaxDistance = 0;
 
     // unfused mha
     bool mQKHalfAccum = false;

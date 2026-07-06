@@ -15,11 +15,15 @@
  * limitations under the License.
  */
 #include "bertAttentionPlugin.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/recoverFromRingAtten.h"
 #include "tensorrt_llm/kernels/sageAttentionKernels.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
+#include "tensorrt_llm/kernels/fusedT5AttentionKernels.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
+
+#include <type_traits>
 
 using namespace nvinfer1;
 using namespace tensorrt_llm::kernels;
@@ -134,6 +138,15 @@ BertAttentionPlugin::BertAttentionPlugin(void const* data, size_t length)
 nvinfer1::IPluginV2DynamicExt* BertAttentionPlugin::clone() const noexcept
 {
     auto* plugin = new BertAttentionPlugin(*this);
+    // The default copy constructor would carry over the raw device pointer
+    // for the fused-T5 bucket table. Null it out so the clone owns nothing
+    // yet and re-lazy-allocates on first enqueue — otherwise both plugins
+    // would `cudaFree` the same buffer in `terminate()`.
+    plugin->mFusedT5BucketTable = nullptr;
+    plugin->mFusedT5BucketTableCap = 0;
+    plugin->mFusedT5BucketTableSeqLen = 0;
+    plugin->mFusedT5BucketCount = 0;
+    plugin->mFusedT5MaxDistance = 0;
     plugin->setPluginNamespace(mNamespace.c_str());
     plugin->initialize();
     return plugin;
@@ -237,7 +250,13 @@ size_t BertAttentionPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* i
         = enableRingAttn ? 2 * sizeof(float) * batch_size * input_seq_len * mNumHeads : 0;
     const size_t ring_block_output_size = enableRingAttn ? size * batch_size * input_seq_len * local_hidden_units_ : 0;
 
-    int const NUM_BUFFERS = 24;
+    // Fused T5 attention kernel: workspace for explicit bias extraction
+    // [num_heads, numBuckets]. Sized by the max bucket count so the same
+    // workspace works for both implicit (has table already) and explicit modes.
+    // sizeof(half) == sizeof(__nv_bfloat16) == 2, so this size is valid for both.
+    const size_t fused_t5_bias_size = mFusedT5Enabled ? mNumHeads * kFusedT5MaxNumBuckets * sizeof(half) : 0;
+
+    int const NUM_BUFFERS = 25;
 
     size_t workspaces[NUM_BUFFERS];
     workspaces[0] = CUBLAS_WORKSPACE_SIZE;
@@ -264,6 +283,7 @@ size_t BertAttentionPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* i
     workspaces[21] = ring_softmax_stats_buf_size;
     workspaces[22] = ring_softmax_stats_accu_buf_size;
     workspaces[23] = ring_block_output_size;
+    workspaces[24] = fused_t5_bias_size;
 
     return tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
 }
@@ -401,6 +421,14 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
         = reinterpret_cast<float*>(tc::nextWorkspacePtr(workspace_byte_ptr, offset, ring_softmax_stats_buf_size));
     T* ring_block_output_
         = reinterpret_cast<T*>(tc::nextWorkspacePtr(workspace_byte_ptr, offset, ring_block_output_size));
+
+    // Fused T5 attention kernel workspace for explicit bias extraction [H, numBuckets]
+    // sizeof(half) == sizeof(__nv_bfloat16) == 2, so this size is valid for both types.
+    // Retained even though the current fused path handles only implicit relative-bias
+    // mode (no reduction needed), so the workspace layout stays stable across builds.
+    const size_t fused_t5_bias_size = mFusedT5Enabled ? mNumHeads * kFusedT5MaxNumBuckets * sizeof(half) : 0;
+    [[maybe_unused]] void* fused_t5_bias_buf_
+        = tc::nextWorkspacePtr(workspace_byte_ptr, offset, fused_t5_bias_size);
 
     // build attention_mask, cu_seqlens, and padding_offset tensors
     BuildDecoderInfoParams<T> params{};
@@ -729,6 +757,71 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
     }
     else
     {
+        // ══════════════════════════════════════════════════════════════════
+        // Optional fused T5 encoder-attention path. Opt-in via
+        //   TRTLLM_ENABLE_FUSED_T5_ATTENTION=1 (per-process), and gated per
+        //   plugin instance by `mFusedT5Enabled` (set in `initialize()`).
+        // This is a SINGLE-kernel fusion of:
+        //   QKV split + QK GEMM + T5 relative bias + softmax + SV GEMM +
+        //   output transpose.
+        // Supports fp16 / bf16, head_size ∈ {32, 64, 128}, seq_len ≤ 2048,
+        // buckets even and ≤ 128, bidirectional only. SM70/75 use a SIMT
+        // reference fallback (correctness only); SM80+ use the WMMA path.
+        // ══════════════════════════════════════════════════════════════════
+        int const runtimeNumBuckets = mRelativeAttention ? inputDesc[3].dims.d[1] : 0;
+        int const runtimeMaxDistance = (mMaxDistance > 0) ? mMaxDistance : 128;
+
+        FusedT5AttentionParams fusedT5Params{};
+        fusedT5Params.batchSize       = request_batch_size;
+        fusedT5Params.numHeads        = mNumHeads;
+        fusedT5Params.headSize        = mHeadSize;
+        fusedT5Params.maxSeqLen       = attention_seq_len_2;
+        fusedT5Params.numBuckets      = runtimeNumBuckets;
+        fusedT5Params.maxDistance     = runtimeMaxDistance;
+        fusedT5Params.isBidirectional = true;
+        fusedT5Params.removePadding   = mRemovePadding;
+        fusedT5Params.forceEnable     = false;
+        fusedT5Params.qkScale         = qk_scale;
+
+        // Lazy-allocate the T5 bucket lookup table. Skipped when the fused
+        // path is off; may disable `mFusedT5Enabled` if allocation fails.
+        // NOTE: the fused kernel currently only handles the *implicit*
+        // relative-bias mode (mMaxDistance > 0, i.e. model supplies
+        // [H, numBuckets]). In explicit mode the caller has already expanded
+        // to [1, H, S, S] with an unknown (numBuckets, maxDistance) —
+        // reducing back is unsafe, so fall through to the legacy path.
+        bool const implicitRelBias = mMaxDistance > 0;
+        bool const t5TableReady = mFusedT5Enabled && mRelativeAttention && implicitRelBias
+            && ensureFusedT5BucketTable(
+                attention_seq_len_2, runtimeNumBuckets, runtimeMaxDistance, /*bidirectional=*/true, stream);
+
+        bool const useFusedT5 = t5TableReady
+            && mFusedT5BucketTable != nullptr
+            && runtimeNumBuckets == mFusedT5BucketCount
+            && attention_seq_len_2 <= mFusedT5BucketTableSeqLen
+            && FusedT5AttentionRunner::isSupported(fusedT5Params);
+
+        if (useFusedT5)
+        {
+            // WMMA path requires half / bfloat16; float would fail runner's
+            // template instantiation. `isSupported` doesn't inspect T at
+            // compile time, so guard here.
+            if constexpr (!std::is_same_v<T, float>)
+            {
+                // Implicit mode: relative_attn_table is already
+                // [H, numBuckets] in type T — feed it directly.
+                T const* bucket_bias_ptr = relative_attn_table;
+
+                FusedT5AttentionRunner runner;
+                runner.run<T>(fusedT5Params, attention_input, bucket_bias_ptr, mFusedT5BucketTable,
+                    input_lengths, mRemovePadding ? cu_seqlens : nullptr, context_buf_, stream);
+                // Output already in the final [num_tokens, H*D] layout — no
+                // QKV split, no transpose needed. Skip the unfused path.
+                return 0;
+            }
+        }
+        // ── Original unfused path: QKV split → attention → transpose ──
+
         // FIXME: a temporary solution to make sure the padding part of key/value buffer is 0
         // NOTE: pointer subtraction is used below since there could be some extra gap due to alignment.
         //  Otherwise, we could do cudaMemsetAsync(k_buf_2_, 0, k_buf_2_size + v_buf_2_size, stream);
@@ -746,6 +839,7 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
             mHeadSize, 0, 0.0f, RotaryScalingType::kNONE, 0.0f, 0, PositionEmbeddingType::kLEARNED_ABSOLUTE,
             (float*) nullptr, 0, stream);
 
+        // QK GEMM + softmax
         if (!mQKHalfAccum && gemm_data_type != CUDA_R_32F)
         {
             mCublasWrapper->stridedBatchedGemm(CUBLAS_OP_T, CUBLAS_OP_N,
@@ -764,19 +858,6 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
                 request_batch_size * mNumHeads,  // global batch size
                 CUDA_R_32F);
 
-            // add relative position bias
-            if (mRelativeAttention)
-            {
-                // add rel pos bias
-                // QK is (batch_size, local_head_num, q_length, k_length), rel pos bias is (1, local_head_num,
-                // max_output_len + 1, max_output_len + 1). broadcast along 1st dim. max_seq_len is already
-                // max_output_len + 1. In implicit mode, relative_attention_bias is rel attn table
-                // [num_heads, num_buckets], with necessary params (max_distance, num_buckets) passed at the end
-                invokeAddRelativeAttentionBiasUnaligned(qk_buf_float_, relative_attn_table, request_batch_size,
-                    mNumHeads, attention_seq_len_1, attention_seq_len_2, stream, mMaxDistance > 0,
-                    inputDesc[3].dims.d[1], mMaxDistance, true /* bidirectional */);
-            }
-
             MaskedSoftmaxParam<T, float> param;
             param.attention_score = qk_buf_;       // (batch_size, head_num, q_length, k_length)
             param.qk = qk_buf_float_;              // (batch_size, head_num, q_length, k_length)
@@ -787,6 +868,26 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
             param.num_heads = mNumHeads;
             param.qk_scale = qk_scale_softmax;
             param.linear_bias_slopes = const_cast<T*>(linear_bias_slopes); // (head_num,), optional
+
+            if (mRelativeAttention)
+            {
+                bool const implicit = mMaxDistance > 0;
+                int const num_bkts = inputDesc[3].dims.d[1];
+                param.relative_attention_bias = relative_attn_table;
+                param.implicit_relative_bias = implicit;
+                param.max_k_length = attention_seq_len_2;
+                if (implicit)
+                {
+                    param.num_buckets = num_bkts;
+                    param.max_distance = mMaxDistance;
+                    param.bidirectional = true;
+                    int const active = (true /* bidirectional */ ? num_bkts / 2 : num_bkts);
+                    int const max_exact = active / 2;
+                    param.inv_log_ratio = (mMaxDistance > max_exact && max_exact > 0)
+                        ? 1.0f / logf((float) mMaxDistance / max_exact)
+                        : 0.0f;
+                }
+            }
             invokeMaskedSoftmax(param, stream);
         }
         else
@@ -796,19 +897,6 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
                 attention_seq_len_1 * mHeadSize, qk_buf_, attention_seq_len_2,
                 attention_seq_len_2 * attention_seq_len_1, request_batch_size * mNumHeads, qk_scale_gemm,
                 0.0f); // alpha, beta
-
-            // add relative position bias
-            if (mRelativeAttention)
-            {
-                // add rel pos bias
-                // QK is (batch_size, local_head_num, q_length, k_length), rel pos bias is (1, local_head_num,
-                // max_output_len + 1, max_output_len + 1). broadcast along 1st dim. max_seq_len is already
-                // max_output_len + 1. In implicit mode, relative_attention_bias is rel attn table
-                // [num_heads, num_buckets], with necessary params (max_distance, num_buckets) passed at the end
-                invokeAddRelativeAttentionBiasUnaligned(qk_buf_, relative_attn_table, request_batch_size, mNumHeads,
-                    attention_seq_len_1, attention_seq_len_2, stream, mMaxDistance > 0, inputDesc[3].dims.d[1],
-                    mMaxDistance, true /* bidirectional */);
-            }
 
             MaskedSoftmaxParam<T, T> param;
             param.attention_score = qk_buf_;       // (batch_size, head_num, q_length, k_length)
@@ -820,14 +908,36 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
             param.num_heads = mNumHeads;
             param.qk_scale = qk_scale_softmax;
             param.linear_bias_slopes = const_cast<T*>(linear_bias_slopes); // (head_num,), optional
+
+            if (mRelativeAttention)
+            {
+                bool const implicit = mMaxDistance > 0;
+                int const num_bkts = inputDesc[3].dims.d[1];
+                param.relative_attention_bias = relative_attn_table;
+                param.implicit_relative_bias = implicit;
+                param.max_k_length = attention_seq_len_2;
+                if (implicit)
+                {
+                    param.num_buckets = num_bkts;
+                    param.max_distance = mMaxDistance;
+                    param.bidirectional = true;
+                    int const active = (true /* bidirectional */ ? num_bkts / 2 : num_bkts);
+                    int const max_exact = active / 2;
+                    param.inv_log_ratio = (mMaxDistance > max_exact && max_exact > 0)
+                        ? 1.0f / logf((float) mMaxDistance / max_exact)
+                        : 0.0f;
+                }
+            }
             invokeMaskedSoftmax(param, stream);
         }
 
+        // SV GEMM
         mCublasWrapper->stridedBatchedGemm(CUBLAS_OP_N, CUBLAS_OP_N, mHeadSize, attention_seq_len_1,
             attention_seq_len_2, v_buf_2_, mHeadSize, attention_seq_len_2 * mHeadSize, qk_buf_, attention_seq_len_2,
             attention_seq_len_1 * attention_seq_len_2, qkv_buf_2_, mHeadSize, attention_seq_len_1 * mHeadSize,
             request_batch_size * mNumHeads);
 
+        // Transpose output: [B, H, S, D] → [B, S, H*D] or [num_tokens, H*D]
         if (!mRemovePadding)
         {
             invokeTransposeQKV(context_buf_, qkv_buf_2_, request_batch_size, attention_seq_len_1, mNumHeads, mHeadSize,
@@ -969,6 +1079,29 @@ int BertAttentionPlugin::initialize() noexcept
         mEnableContextFMHA = mFmhaDispatcher->isSupported();
     }
 
+    // Enable the fused T5 encoder-attention path if:
+    //   * relative attention is on,
+    //   * dtype is fp16 or bf16 (WMMA path requires half/bfloat16),
+    //   * head_size is one of the supported specializations,
+    //   * env var TRTLLM_ENABLE_FUSED_T5_ATTENTION is set.
+    // The device-side bucket table is lazy-allocated on first enqueue
+    // because the maximum sequence length is not known until then.
+    if (mRelativeAttention
+        && (mType == DataType::kHALF
+#ifdef ENABLE_BF16
+            || mType == DataType::kBF16
+#endif
+            )
+        && (mHeadSize == kFusedT5HeadSize32 || mHeadSize == kFusedT5HeadSize64 || mHeadSize == kFusedT5HeadSize128)
+        && tc::getEnvEnableFusedT5Attention())
+    {
+        mFusedT5Enabled = true;
+    }
+    else
+    {
+        mFusedT5Enabled = false;
+    }
+
 #if ENABLE_MULTI_DEVICE
     if (mCpGroup.size() > 1 && COMM_SESSION.getSize() > 1)
     {
@@ -1020,7 +1153,75 @@ void BertAttentionPlugin::serialize(void* buffer) const noexcept
     TLLM_CHECK(d == a + getSerializationSize());
 }
 
-void BertAttentionPlugin::terminate() noexcept {}
+bool BertAttentionPlugin::ensureFusedT5BucketTable(
+    int maxSeqLen, int numBuckets, int maxDistance, bool bidirectional, cudaStream_t stream)
+{
+    if (!mFusedT5Enabled)
+    {
+        return false;
+    }
+    if (maxSeqLen <= 0 || numBuckets <= 0)
+    {
+        return false;
+    }
+
+    // Fast path: current buffer already covers the requested shape and its
+    // (numBuckets, maxDistance) match. We allow a larger allocation to be
+    // reused for shorter sequences — the extra tail is simply unused.
+    bool const sameShape = (mFusedT5BucketTable != nullptr) && (maxSeqLen <= mFusedT5BucketTableSeqLen)
+        && (numBuckets == mFusedT5BucketCount) && (maxDistance == mFusedT5MaxDistance);
+    if (sameShape)
+    {
+        return true;
+    }
+
+    // Growing / bucket-scheme change → reallocate. Guard against silent
+    // fallback: we prefer failing fast to running the fused kernel on stale
+    // bucket data.
+    if (mFusedT5BucketTable != nullptr)
+    {
+        cudaFree(mFusedT5BucketTable);
+        mFusedT5BucketTable = nullptr;
+        mFusedT5BucketTableCap = 0;
+        mFusedT5BucketTableSeqLen = 0;
+        mFusedT5BucketCount = 0;
+        mFusedT5MaxDistance = 0;
+    }
+
+    int const numEntries = 2 * maxSeqLen - 1;
+    size_t const bytes = static_cast<size_t>(numEntries) * sizeof(int16_t);
+    cudaError_t const err = cudaMalloc(reinterpret_cast<void**>(&mFusedT5BucketTable), bytes);
+    if (err != cudaSuccess || mFusedT5BucketTable == nullptr)
+    {
+        TLLM_LOG_WARNING(
+            "Fused T5 attention: cudaMalloc(%zu bytes) failed (%s); disabling fused path for this plugin instance.",
+            bytes, cudaGetErrorString(err));
+        mFusedT5BucketTable = nullptr;
+        mFusedT5Enabled = false;
+        return false;
+    }
+
+    initFusedT5BucketTable(mFusedT5BucketTable, maxSeqLen, numBuckets, maxDistance, bidirectional, stream);
+
+    mFusedT5BucketTableCap = numEntries;
+    mFusedT5BucketTableSeqLen = maxSeqLen;
+    mFusedT5BucketCount = numBuckets;
+    mFusedT5MaxDistance = maxDistance;
+    return true;
+}
+
+void BertAttentionPlugin::terminate() noexcept
+{
+    if (mFusedT5BucketTable != nullptr)
+    {
+        cudaFree(mFusedT5BucketTable);
+        mFusedT5BucketTable = nullptr;
+        mFusedT5BucketTableCap = 0;
+        mFusedT5BucketTableSeqLen = 0;
+        mFusedT5BucketCount = 0;
+        mFusedT5MaxDistance = 0;
+    }
+}
 
 ///////////////
 

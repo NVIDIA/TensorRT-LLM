@@ -280,6 +280,12 @@ bool getEnvUseUCXKvCache()
     return useUCXKVCache;
 }
 
+bool getEnvEnableFusedT5Attention()
+{
+    static bool const enable = getBoolEnv("TRTLLM_ENABLE_FUSED_T5_ATTENTION");
+    return enable;
+}
+
 bool getEnvUseMPIKvCache()
 {
     static bool const useMPIKVCache = getBoolEnv("TRTLLM_USE_MPI_KVCACHE");

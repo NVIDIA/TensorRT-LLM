@@ -290,6 +290,15 @@ class PluginConfig(StrictBaseModel):
         description=
         "Enable horizontal fusion in Gated-MLP that combines two Matmul "
         "operations into a single one followed by a separate SwiGLU kernel.")
+    use_fused_t5_attention: bool = Field(
+        default=False,
+        description=
+        "Enable the single-kernel fused T5 encoder-attention path in the "
+        "bert_attention_plugin (fuses QKV split + QK GEMM + T5 relative bias "
+        "+ softmax + SV GEMM + output transpose). Requires fp16/bf16, "
+        "head_size in {32, 64, 128}, seq_len <= 2048, bidirectional. When "
+        "enabled, the build sets TRTLLM_ENABLE_FUSED_T5_ATTENTION=1 for the "
+        "runtime process; otherwise the plugin uses the legacy path.")
     pp_reduce_scatter: bool = Field(
         default=False,
         description="Enable a pipeline parallelism optimization with "
@@ -334,6 +343,16 @@ class PluginConfig(StrictBaseModel):
     def log_field_changes(cls, v: Any, info: ValidationInfo) -> Any:
         """Log all field changes for debugging."""
         logger.info(f"Set {cls.__name__}.{info.field_name} to {v}.")
+        return v
+
+    @field_validator("use_fused_t5_attention", mode="after")
+    @classmethod
+    def propagate_fused_t5_env(cls, v: bool, info: ValidationInfo) -> bool:
+        """When the fused T5 attention flag is on, export the env var the
+        C++ plugin (`BertAttentionPlugin::initialize`) reads."""
+        if v:
+            import os
+            os.environ["TRTLLM_ENABLE_FUSED_T5_ATTENTION"] = "1"
         return v
 
     @classmethod
@@ -490,6 +509,7 @@ cli_plugin_args = [
     "reduce_fusion",
     "user_buffer",
     "use_fused_mlp",
+    "use_fused_t5_attention",
     "pp_reduce_scatter",
 ]
 

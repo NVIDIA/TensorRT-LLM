@@ -55,6 +55,11 @@ int getEnvMmhaKernelBlockSize();
 // Whether PDL is enabled.
 bool getEnvEnablePDL();
 
+// Toggle for the fused T5 encoder self-attention kernel
+// (bertAttentionPlugin -> tensorrt_llm/kernels/fusedT5AttentionKernels.cu).
+// Off by default; set TRTLLM_ENABLE_FUSED_T5_ATTENTION=1 to enable.
+bool getEnvEnableFusedT5Attention();
+
 // Whether the experimental cascade attention kernel is enabled (replaces
 // masked_multihead_attention_kernel for beam-search decoding).
 // Controlled by env var TRTLLM_ENABLE_CASCADE_MMHA (default: false).
