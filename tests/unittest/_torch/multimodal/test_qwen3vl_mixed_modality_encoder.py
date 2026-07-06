@@ -205,12 +205,11 @@ def test_batch_unordered_mixed_request_raises_even_alongside_ordered_one():
         enc.forward(params)
 
 
-def test_batch_of_image_only_and_video_only_requests_raises_framework_limit():
+def test_batch_of_image_only_and_video_only_requests_uses_interleave_path():
     """Two single-modality requests of different modalities in one batch
-    do not require a per-request manifest (neither is mixed), but Qwen3-VL
-    does not currently split the two-branch encoder output back to
-    per-request. Assert the framework-limitation error rather than silent
-    modality drop."""
+    ride the modality-blind interleave path (one ViT call), even though
+    neither individual request is mixed and neither carries a manifest.
+    """
     enc = _make_encoder()
     params = [
         _make_param(
@@ -226,5 +225,7 @@ def test_batch_of_image_only_and_video_only_requests_raises_framework_limit():
             }
         ),
     ]
-    with pytest.raises(ValueError, match="does not currently support batching image-only"):
-        enc.forward(params)
+    embeds = enc.forward(params)
+    assert len(embeds) == 1
+    expected = torch.tensor([1.0] * 2 + [2.0] * 3, dtype=torch.float32)
+    assert torch.equal(embeds[0][:, 0], expected)

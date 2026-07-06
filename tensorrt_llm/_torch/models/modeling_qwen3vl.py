@@ -1075,14 +1075,12 @@ class Qwen3VisionModelBase(nn.Module):
                     "Qwen3-VL mixed-modality requests must carry mm_item_order on MultimodalParams."
                 )
 
-        # A single mixed request drives the whole batch through the interleave
-        # path; single-modality requests piggyback on it.
-        if any(
-            mp.mm_item_order
-            and mp.multimodal_data.get("image") is not None
-            and mp.multimodal_data.get("video") is not None
-            for mp in multimodal_params
-        ):
+        # Any batch that contains both modalities — whether within a single
+        # request or spread across heterogeneous single-modality requests —
+        # goes through the modality-blind ViT via one cat'd stream.
+        has_image = any(mp.multimodal_data.get("image") is not None for mp in multimodal_params)
+        has_video = any(mp.multimodal_data.get("video") is not None for mp in multimodal_params)
+        if has_image and has_video:
             return self._interleave_multimodal_data(multimodal_params)
 
         pixel_values_list = []
@@ -1197,18 +1195,6 @@ class Qwen3VisionModelBase(nn.Module):
 
         image_grid_thw = mm_extra_data.get("image_grid_thw", None)
         video_grid_thw = mm_extra_data.get("video_grid_thw", None)
-
-        # Both keys populated here means a heterogeneous single-modality
-        # batch. The two-branch encoder call would emit per-modality embed
-        # tensors that downstream cannot split back to per-request — refuse
-        # rather than silently drop modalities.
-        if pixel_values is not None and pixel_values_videos is not None:
-            raise ValueError(
-                "Qwen3-VL does not currently support batching image-only "
-                "and video-only requests together. Route them to separate "
-                "encoder batches, or make each mixed request carry "
-                "mm_item_order."
-            )
 
         embeds: List[torch.Tensor] = []
         if pixel_values is not None:
