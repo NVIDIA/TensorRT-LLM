@@ -2852,6 +2852,12 @@ repos:
         files: ".*/auto_deploy/.*"
 -   repo: local
     hooks:
+    -   id: generate-llm-args-golden-manifest
+        name: Generate LLM args telemetry manifest
+        entry: python3 scripts/generate_llm_args_golden_manifest.py
+        language: system
+        files: ^(scripts/generate_llm_args_golden_manifest\.py|tensorrt_llm/(llmapi/llm_args\.py|models/modeling_utils\.py|usage/(config\.py|llmapi_config\.py|llm_args_golden_manifest\.json)))$
+        pass_filenames: false
     -   id: model-registry-check
         name: Validate AutoDeploy model registry
         entry: python scripts/check_model_registry.py
