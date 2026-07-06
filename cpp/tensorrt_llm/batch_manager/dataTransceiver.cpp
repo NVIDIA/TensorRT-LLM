@@ -34,8 +34,8 @@
 #include <map>
 #include <memory>
 #include <optional>
-#include <variant>
 #include <unordered_map>
+#include <variant>
 
 namespace tensorrt_llm::batch_manager
 {
