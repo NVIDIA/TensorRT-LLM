@@ -810,8 +810,7 @@ class WanDecoder3d(nn.Module):
     ):
         super().__init__()
         dim_mult = [1, 2, 4, 4] if dim_mult is None else dim_mult
-        attn_scales = [] if attn_scales is None else attn_scales
-        del attn_scales
+        del attn_scales  # accepted for symmetry with the encoder; the decoder has no attention
         temperal_upsample = [False, True, True] if temperal_upsample is None else temperal_upsample
         self.nonlinearity = _activation(non_linearity)
 

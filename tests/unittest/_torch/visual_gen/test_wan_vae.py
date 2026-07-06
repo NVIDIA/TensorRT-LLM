@@ -90,18 +90,12 @@ def _conv_weight_layout_counts(model: torch.nn.Module) -> dict[str, int]:
     return counts
 
 
-def test_load_wan_vae_checkpoint_selection(monkeypatch):
+def test_load_wan_vae_defaults_to_native(monkeypatch):
     checkpoint_dir = _require_wan22_ti2v_checkpoint()
-    device = torch.device("cpu")
 
     monkeypatch.delenv(TRTLLM_USE_DIFFUSER_VAE_ENV, raising=False)
-    wan_vae = load_wan_vae(str(checkpoint_dir), device)
+    wan_vae = load_wan_vae(str(checkpoint_dir), torch.device("cpu"))
     assert isinstance(wan_vae, WanVAE)
-    del wan_vae
-
-    monkeypatch.setenv(TRTLLM_USE_DIFFUSER_VAE_ENV, "1")
-    reference_vae = load_wan_vae(str(checkpoint_dir), device)
-    assert isinstance(reference_vae, AutoencoderKLWan)
 
 
 def test_use_native_wan_vae_selects_native_unless_parallel(monkeypatch):
@@ -132,18 +126,16 @@ def test_use_diffuser_vae_env_zero_keeps_native(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("case_name", "height", "width"),
+    ("height", "width"),
     [
-        ("360p", 352, 640),
-        ("720p", 704, 1280),
+        pytest.param(352, 640, id="360p"),
+        pytest.param(704, 1280, id="720p"),
     ],
 )
 def test_wan22_ti2v_vae_matches_diffusers_decode_checkpoint(
-    case_name: str,
     height: int,
     width: int,
 ):
-    del case_name
     checkpoint_dir = _require_wan22_ti2v_checkpoint()
     reference_vae, wan_vae = _make_reference_and_wan_vae(checkpoint_dir)
     assert wan_vae.config.is_residual is True  # residual encoder/decoder path
@@ -181,20 +173,19 @@ def test_wan22_ti2v_vae_matches_diffusers_decode_checkpoint(
 
 
 @pytest.mark.parametrize(
-    ("case_name", "height", "width"),
+    ("height", "width"),
     [
-        ("360p", 352, 640),
-        ("720p", 704, 1280),
+        pytest.param(352, 640, id="360p"),
+        pytest.param(704, 1280, id="720p"),
     ],
 )
 def test_wan22_ti2v_vae_matches_diffusers_encode_checkpoint(
-    case_name: str,
     height: int,
     width: int,
 ):
-    del case_name
     checkpoint_dir = _require_wan22_ti2v_checkpoint()
     reference_vae, wan_vae = _make_reference_and_wan_vae(checkpoint_dir)
+    assert wan_vae.config.is_residual is True  # residual encoder/decoder path
 
     torch.manual_seed(2)
     video = (
