@@ -55,6 +55,10 @@ peft>=0.18.1,<0.19.0
 patchelf
 einops
 flashinfer-python==0.6.14
+# MiniMax Sparse Attention (MSA) kernels for MiniMax-M3 (sparse_use_msa=true).
+# SM100-only, JIT-compiled on first use; MIT-licensed. Not yet on PyPI, so pin
+# a commit; pip fetches the vendored CUTLASS headers via git submodules.
+fmha_sm100 @ git+https://github.com/MiniMax-AI/MSA.git@e2ebe7656649f619af0ad1d457b534283034655e
 opencv-python-headless
 xgrammar==0.1.32
 llguidance==0.7.29

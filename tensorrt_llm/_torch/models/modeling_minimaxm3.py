@@ -705,10 +705,41 @@ class MiniMaxM3Attention(Attention):
             self.sparse_local_block = int(sparse_cfg.get("sparse_local_block", 1))
             self.sparse_score_type = str(sparse_cfg.get("sparse_score_type", "max"))
 
-            # index_q_proj is **replicated** across TP ranks. The sparse
-            # forward reshapes idx_q to
-            # ``[num_tokens, sparse_num_index_heads, sparse_index_dim]``,
-            # which requires the rank-local idx_q to carry all heads.
+            # Index head i pairs 1:1 with KV head i in the reference
+            # model (SGLang/HF): KV head i's GQA group attends only to
+            # the blocks selected by index head i. Under TP the KV
+            # heads are sharded, so each rank must score with the
+            # index heads paired to its local KV heads — the sparse
+            # forward slices ``idx_q`` down to
+            # ``[num_tokens, num_local_index_heads, sparse_index_dim]``
+            # with the offsets computed here. (Scoring with all index
+            # heads and reducing — the pre-fix behaviour — gave every
+            # KV head the union/max over all index heads' selections.)
+            num_kv_heads_global = int(config.num_key_value_heads)
+            if self.sparse_num_index_heads % num_kv_heads_global != 0:
+                raise ValueError(
+                    f"sparse_num_index_heads ({self.sparse_num_index_heads}) must be "
+                    f"divisible by num_key_value_heads ({num_kv_heads_global})"
+                )
+            index_group = self.sparse_num_index_heads // num_kv_heads_global
+            if self.tp_size <= num_kv_heads_global:
+                # Contiguous KV-head shard: rank r holds KV heads
+                # [r * local, (r + 1) * local), mirroring the qkv_proj
+                # column split.
+                kv_head_start = self.tp_rank * self.num_key_value_heads
+            else:
+                # KV heads duplicated across ranks (tp > global KV):
+                # rank r holds the single KV head r * kv // tp.
+                kv_head_start = (self.tp_rank * num_kv_heads_global) // self.tp_size
+            self.index_head_start = kv_head_start * index_group
+            self.num_local_index_heads = (
+                min(self.num_key_value_heads, num_kv_heads_global) * index_group
+            )
+
+            # index_q_proj stays **replicated** across TP ranks (the
+            # 4-head GEMM is negligible); the forward slices the local
+            # heads from its output, keeping checkpoint loading
+            # unchanged.
             index_q_total = self.sparse_num_index_heads * self.sparse_index_dim
             self.index_q_proj = Linear(
                 config.hidden_size,
@@ -1173,6 +1204,17 @@ class MiniMaxM3Attention(Attention):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         idx_q = self.index_q_proj(hidden_states)
         idx_k = self.index_k_proj(hidden_states)
+        if self.num_local_index_heads != self.sparse_num_index_heads:
+            # Keep only the index heads paired with this rank's KV
+            # heads (1:1 pairing — see __init__). Slicing before the
+            # per-head norm and RoPE is equivalent and cheaper.
+            idx_q = (
+                idx_q.view(-1, self.sparse_num_index_heads, self.sparse_index_dim)[
+                    :, self.index_head_start : self.index_head_start + self.num_local_index_heads
+                ]
+                .reshape(idx_q.shape[0], self.num_local_index_heads * self.sparse_index_dim)
+                .contiguous()
+            )
 
         # 2. Per-head Gemma RMSNorm on both branches.
         q, k = self.apply_qk_norm(q, k)
@@ -1279,6 +1321,43 @@ class MiniMaxM3Attention(Attention):
                 "sparse_attention_config=MiniMaxM3SparseAttentionConfig(...) on "
                 "ModelConfig so the standard attention-backend dispatch selects "
                 "the M3 sparse runtime."
+            )
+        # Publish the per-rank sparse geometry on the outer
+        # AttentionMetadata the first time any sparse layer dispatches.
+        # ``MiniMaxM3AttentionMetadata.prepare`` reads this on subsequent
+        # steps to pre-build the MSA (fmha_sm100) plan into
+        # CUDA-graph-stable buffers -- see
+        # :mod:`tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_plan_cache`.
+        # Doing this attach here (not in ``__init__``) is what avoids a
+        # chicken-and-egg dependency: the metadata instance is created
+        # by the pyexecutor before any layer runs, and the FIRST sparse
+        # forward is always the eager warmup pass (no capture in
+        # flight), so writing to ``_msa_geometry`` at this point is
+        # CUDA-graph-safe. All sparse layers share the same m3_config
+        # on a given rank, so any layer's write is authoritative for
+        # the rest.
+        #
+        # IMPORTANT: publish on the metadata *class*, not the instance.
+        # CUDA graph capture uses separate metadata instances (created
+        # via ``create_cuda_graph_metadata``); an instance attribute
+        # written during eager warmup would be invisible to them, their
+        # ``prepare()`` would skip the plan pre-build, and the captured
+        # decode would fall back to in-forward planning — freezing
+        # capture-time host values into every replay (the original
+        # NaN-after-layer-3 CUDA graph bug).
+        if getattr(attn_metadata, "_msa_geometry", None) is None:
+            from ..attention_backend.sparse.minimax_m3.msa_plan_cache import MsaPlanCacheGeometry
+
+            m3_config = self.attn.m3_config
+            type(attn_metadata)._msa_geometry = MsaPlanCacheGeometry(
+                num_q_heads=int(m3_config.num_q_heads),
+                num_kv_heads=int(m3_config.num_kv_heads),
+                num_index_heads=int(m3_config.num_index_heads),
+                head_dim=int(m3_config.head_dim),
+                block_size=int(m3_config.block_size),
+                topk=int(m3_config.topk),
+                init_blocks=int(m3_config.init_blocks),
+                local_blocks=int(m3_config.local_blocks),
             )
         return self.attn.forward(
             q,
