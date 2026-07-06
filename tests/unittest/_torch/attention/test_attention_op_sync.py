@@ -61,6 +61,7 @@ _SOURCE_CLASSES = {
 }
 
 _THOP_KWARG_SOURCE_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "beam_width": ("metadata", ("effective_beam_width",)),
     "context_lengths": ("metadata", ("prompt_lens_cuda_runtime",)),
     "head_size": ("attn", ("head_dim",)),
     "host_context_lengths": ("metadata", ("prompt_lens_cpu_runtime",)),
