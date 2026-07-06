@@ -16,7 +16,21 @@ from ..utils import (get_model_extra_attrs,
                      get_piecewise_cuda_graph_flag, make_weak_ref,
                      set_piecewise_running)
 from .multi_stream.auto_multi_stream import multi_stream_schedule
-from .utils import get_capture_piecewise_cuda_graph_flag, is_call_function
+from .utils import (get_capture_piecewise_cuda_graph_flag,
+                    get_optional_trtllm_op, is_call_function)
+
+
+def _piecewise_boundary_ops():
+    op_names = [
+        "attn_custom_op_inplace",
+        "mla_custom_op_inplace",
+        "mla_dsa_attn_inplace",
+        "gdn_custom_op_inplace",
+    ]
+    return [
+        op for op in (get_optional_trtllm_op(op_name) for op_name in op_names)
+        if op is not None
+    ]
 
 
 class PiecewiseInterpreter(Interpreter):
@@ -256,25 +270,21 @@ def piecewise_optimizer(
     node_to_graph_id = {}
     idx = 0
     exclude_modules_id = []
+    piecewise_boundary_ops = _piecewise_boundary_ops()
 
     for node in graph.nodes:
         if node.op in ("output", "placeholder"):
             continue
-        if (not stop_partition and is_call_function(node, [
-                torch.ops.trtllm.attn_custom_op_inplace.default,
-                torch.ops.trtllm.mla_custom_op_inplace.default,
-                torch.ops.trtllm.mla_dsa_attn_inplace.default,
-                torch.ops.aten.index.Tensor,
-                torch.ops.aten.cumsum.default,
-        ])):
+        is_boundary = is_call_function(node, piecewise_boundary_ops)
+        stop_target = is_call_function(node, [
+            torch.ops.aten.index.Tensor,
+            torch.ops.aten.cumsum.default,
+        ])
+        if not stop_partition and (is_boundary or stop_target):
             idx += 1
             node_to_graph_id[node] = idx
             exclude_modules_id.append(idx)
-            if (node.target != torch.ops.trtllm.attn_custom_op_inplace.default
-                    and node.target
-                    != torch.ops.trtllm.mla_custom_op_inplace.default
-                    and node.target
-                    != torch.ops.trtllm.mla_dsa_attn_inplace.default):
+            if not is_boundary:
                 # We only know it is safe to continue splitting after attention
                 stop_partition = True
             else:

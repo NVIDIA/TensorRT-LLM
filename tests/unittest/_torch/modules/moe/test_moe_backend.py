@@ -29,7 +29,9 @@ Design Goals:
 import itertools
 import logging
 import os
+from types import SimpleNamespace
 from typing import List, Optional
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -57,15 +59,19 @@ from tensorrt_llm._torch.modules.fused_moe import (
 )
 from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoEWeightLoadingMode
-from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoEDeepGemm
-from tensorrt_llm._torch.modules.fused_moe.quantization import W4A8MXFP4MXFP8MegaMoEDeepGemmMethod
+from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
+from tensorrt_llm._torch.modules.fused_moe.quantization import (
+    FusedMoEMethodBase,
+    NVFP4MarlinFusedMoEMethod,
+    UnquantizedFusedMoEMethod,
+    W4A8MXFP4MXFP8MegaMoEDeepGemmMethod,
+)
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 logger = logging.getLogger(__name__)
-
 
 _MEGAMOE_BACKEND_TYPES = {
     MoeBackendType.MEGAMOE_DEEPGEMM,
@@ -183,6 +189,238 @@ def create_test_backend(
         weight_loading_mode=weight_loading_mode,
         activation_type=activation_type,
     )
+
+
+def test_moe_post_load_weights_uses_idempotent_transform_hook():
+    class HookTestMoE(MoE):
+        def create_weights(self):
+            raise NotImplementedError
+
+        def load_weights(self, weights, allow_partial_loading=False):
+            raise NotImplementedError
+
+        def quantize_input(self, x, **kwargs):
+            return x, None
+
+        def run_moe(self, **kwargs):
+            raise NotImplementedError
+
+    moe = HookTestMoE.__new__(HookTestMoE)
+    torch.nn.Module.__init__(moe)
+    quant_method = SimpleNamespace(
+        transform_weights=MagicMock(),
+        cache_derived_state=MagicMock(),
+    )
+    moe.quant_method = quant_method
+
+    moe.post_load_weights()
+    moe.transform_weights()
+
+    quant_method.transform_weights.assert_called_once_with(moe)
+    quant_method.cache_derived_state.assert_called_once_with(moe)
+    assert moe._weights_transformed is True
+
+    moe.cache_derived_state()
+    assert quant_method.cache_derived_state.call_count == 2
+
+    moe._weights_transformed = False
+    moe.transform_weights()
+    assert quant_method.transform_weights.call_count == 2
+
+
+def test_fused_moe_load_weights_invalidates_transform_guard():
+    class GuardResetMethod(UnquantizedFusedMoEMethod):
+        def load_expert_weights_to_dst(
+            self,
+            module,
+            weights,
+            weight_loading_mode,
+            load_expert_ids,
+            dst_w3_w1_weight,
+            dst_w2_weight,
+            dst_w3_w1_bias,
+            dst_w2_bias,
+            allow_partial_loading=False,
+        ):
+            module.loaded_allow_partial = allow_partial_loading
+
+        def load_quant_scales(self, module, weights):
+            module.loaded_scales = bool(weights)
+
+        def setup_quant_scales(self, module):
+            module.quant_scales = ()
+
+    method = GuardResetMethod()
+    module = SimpleNamespace(
+        initial_local_expert_ids=[0],
+        w3_w1_weight=torch.empty(1, 2, 2),
+        w2_weight=torch.empty(1, 2, 2),
+        bias=False,
+        _weights_transformed=True,
+    )
+
+    method.load_weights(
+        module,
+        {"0.w1.weight": torch.ones(1)},
+        MoEWeightLoadingMode.VANILLA,
+        allow_partial_loading=True,
+    )
+
+    assert module.loaded_allow_partial is True
+    assert module.loaded_scales is True
+    assert module._weights_transformed is False
+
+
+def test_configurable_moe_post_load_weights_uses_backend_staged_hooks():
+    from tensorrt_llm._torch.modules.fused_moe.configurable_moe import ConfigurableMoE
+
+    class HookTestConfigurableMoE(ConfigurableMoE):
+        def quantize_input(self, x, **kwargs):
+            return x, None
+
+        def run_moe(self, **kwargs):
+            raise NotImplementedError
+
+    configurable_moe = HookTestConfigurableMoE.__new__(HookTestConfigurableMoE)
+    torch.nn.Module.__init__(configurable_moe)
+    backend = torch.nn.Module()
+    backend.transform_weights = MagicMock()
+    backend.cache_derived_state = MagicMock()
+    configurable_moe.backend = backend
+
+    configurable_moe.post_load_weights()
+    configurable_moe.transform_weights()
+
+    backend.transform_weights.assert_called_once_with()
+    backend.cache_derived_state.assert_called_once_with()
+    assert configurable_moe._weights_transformed is True
+
+    configurable_moe.cache_derived_state()
+    assert backend.cache_derived_state.call_count == 2
+
+
+def test_configurable_moe_load_weights_invalidates_wrapper_transform_guard():
+    from tensorrt_llm._torch.modules.fused_moe.configurable_moe import ConfigurableMoE
+
+    configurable_moe = ConfigurableMoE.__new__(ConfigurableMoE)
+    torch.nn.Module.__init__(configurable_moe)
+    backend = torch.nn.Module()
+    backend.load_weights = MagicMock(return_value="loaded")
+    configurable_moe.backend = backend
+    configurable_moe._weights_transformed = True
+
+    weights = [{"0.w1.weight": torch.ones(1)}]
+    result = configurable_moe.load_weights(weights, allow_partial_loading=True)
+
+    assert result == "loaded"
+    backend.load_weights.assert_called_once_with(weights, True)
+    assert configurable_moe._weights_transformed is False
+
+
+def test_marlin_moe_repack_is_transform_stage():
+    assert "transform_weights" in NVFP4MarlinFusedMoEMethod.__dict__
+    assert "post_load_weights" not in NVFP4MarlinFusedMoEMethod.__dict__
+    assert NVFP4MarlinFusedMoEMethod.post_load_weights is FusedMoEMethodBase.post_load_weights
+
+
+def test_megamoe_cutedsl_post_load_weights_uses_staged_hooks():
+    moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
+    torch.nn.Module.__init__(moe)
+    quant_method = SimpleNamespace(
+        transform_weights=MagicMock(),
+        cache_derived_state=MagicMock(),
+    )
+    moe.quant_method = quant_method
+
+    moe.post_load_weights()
+    moe.transform_weights()
+
+    quant_method.transform_weights.assert_called_once_with(moe)
+    quant_method.cache_derived_state.assert_called_once_with(moe)
+    assert moe._weights_transformed is True
+
+
+def test_megamoe_load_weights_invalidates_cached_deepgemm_views():
+    method = W4A8MXFP4MXFP8MegaMoEDeepGemmMethod()
+    hidden_size = 128
+    intermediate_size = 128
+    module = SimpleNamespace(
+        weight_loading_mode=MoEWeightLoadingMode.VANILLA,
+        initial_local_expert_ids=[0],
+        w3_w1_weight=torch.empty(1, intermediate_size * 2, hidden_size // 2, dtype=torch.uint8),
+        w3_w1_weight_scale=torch.empty(
+            1, intermediate_size * 2, hidden_size // 32, dtype=torch.uint8
+        ),
+        w2_weight=torch.empty(1, hidden_size, intermediate_size // 2, dtype=torch.uint8),
+        w2_weight_scale=torch.empty(1, hidden_size, intermediate_size // 32, dtype=torch.uint8),
+        _t_l1=(torch.empty(1), torch.empty(1)),
+        _t_l2=(torch.empty(1), torch.empty(1)),
+        _t_l1_weight=torch.empty(1),
+        _t_l1_scale=torch.empty(1),
+        _t_l1_scale_slot=torch.empty(1),
+        _t_l2_weight=torch.empty(1),
+        _t_l2_scale=torch.empty(1),
+        _t_l2_scale_slot=torch.empty(1),
+    )
+    weights = {
+        "0.w1.weight": torch.full((intermediate_size, hidden_size // 2), 1, dtype=torch.uint8),
+        "0.w3.weight": torch.full((intermediate_size, hidden_size // 2), 2, dtype=torch.uint8),
+        "0.w2.weight": torch.full((hidden_size, intermediate_size // 2), 3, dtype=torch.uint8),
+        "0.w1.weight_scale": torch.full(
+            (intermediate_size, hidden_size // 32), 4, dtype=torch.uint8
+        ),
+        "0.w3.weight_scale": torch.full(
+            (intermediate_size, hidden_size // 32), 5, dtype=torch.uint8
+        ),
+        "0.w2.weight_scale": torch.full(
+            (hidden_size, intermediate_size // 32), 6, dtype=torch.uint8
+        ),
+    }
+
+    method.load_weights(module, [weights])
+
+    assert module.w3_w1_weight[0, 0, 0].item() == 1
+    assert module.w3_w1_weight[0, intermediate_size, 0].item() == 2
+    assert module._weights_loaded is True
+    for attr in (
+        "_t_l1",
+        "_t_l2",
+        "_t_l1_weight",
+        "_t_l1_scale",
+        "_t_l1_scale_slot",
+        "_t_l2_weight",
+        "_t_l2_scale",
+        "_t_l2_scale_slot",
+    ):
+        assert getattr(module, attr) is None
+
+
+def test_megamoe_cache_derived_state_sets_initial_assignments_once():
+    method = W4A8MXFP4MXFP8MegaMoEDeepGemmMethod()
+    method.setup_quant_scales = MagicMock()
+    load_balancer = MagicMock()
+    module = SimpleNamespace(
+        layer_load_balancer=load_balancer,
+        initial_global_assignments=[0],
+    )
+
+    method.cache_derived_state(module)
+
+    load_balancer.set_initial_weight_assignments.assert_called_once_with([0])
+    method.setup_quant_scales.assert_called_once_with(module)
+
+
+def test_megamoe_deepgemm_cache_derived_state_allocates_symm_buffer():
+    moe = MegaMoEDeepGemm.__new__(MegaMoEDeepGemm)
+    torch.nn.Module.__init__(moe)
+    quant_method = SimpleNamespace(cache_derived_state=MagicMock())
+    moe.quant_method = quant_method
+    moe._alloc_symm_buffer = MagicMock()
+
+    moe.cache_derived_state()
+
+    moe._alloc_symm_buffer.assert_called_once_with()
+    quant_method.cache_derived_state.assert_called_once_with(moe)
 
 
 def test_megamoe_init_rejects_uneven_num_slots_with_value_error():
