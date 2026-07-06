@@ -705,10 +705,41 @@ class MiniMaxM3Attention(Attention):
             self.sparse_local_block = int(sparse_cfg.get("sparse_local_block", 1))
             self.sparse_score_type = str(sparse_cfg.get("sparse_score_type", "max"))
 
-            # index_q_proj is **replicated** across TP ranks. The sparse
-            # forward reshapes idx_q to
-            # ``[num_tokens, sparse_num_index_heads, sparse_index_dim]``,
-            # which requires the rank-local idx_q to carry all heads.
+            # Index head i pairs 1:1 with KV head i in the reference
+            # model (SGLang/HF): KV head i's GQA group attends only to
+            # the blocks selected by index head i. Under TP the KV
+            # heads are sharded, so each rank must score with the
+            # index heads paired to its local KV heads. The sparse
+            # forward slices `idx_q` down to
+            # `[num_tokens, num_local_index_heads, sparse_index_dim]`
+            # with the offsets computed here. Scoring with all index heads
+            # and reducing would give every KV head the union/max over all
+            # index heads' selections.
+            num_kv_heads_global = int(config.num_key_value_heads)
+            if self.sparse_num_index_heads % num_kv_heads_global != 0:
+                raise ValueError(
+                    f"sparse_num_index_heads ({self.sparse_num_index_heads}) must be "
+                    f"divisible by num_key_value_heads ({num_kv_heads_global})"
+                )
+            index_group = self.sparse_num_index_heads // num_kv_heads_global
+            if self.tp_size <= num_kv_heads_global:
+                # Contiguous KV-head shard: rank r holds KV heads
+                # [r * local, (r + 1) * local), mirroring the qkv_proj
+                # column split.
+                kv_head_start = self.tp_rank * self.num_key_value_heads
+            else:
+                # KV heads duplicated across ranks (tp > global KV):
+                # rank r holds the single KV head r * kv // tp.
+                kv_head_start = (self.tp_rank * num_kv_heads_global) // self.tp_size
+            self.index_head_start = kv_head_start * index_group
+            self.num_local_index_heads = (
+                min(self.num_key_value_heads, num_kv_heads_global) * index_group
+            )
+
+            # index_q_proj stays **replicated** across TP ranks (the
+            # 4-head GEMM is negligible); the forward slices the local
+            # heads from its output, keeping checkpoint loading
+            # unchanged.
             index_q_total = self.sparse_num_index_heads * self.sparse_index_dim
             self.index_q_proj = Linear(
                 config.hidden_size,
@@ -863,8 +894,8 @@ class MiniMaxM3Attention(Attention):
           3. Apply partial RoPE.
           4. Pull the paged main K/V cache from the M3 cache manager.
           5. Read the pre-built :class:`MiniMaxM3SparseAttentionMetadata`
-             from ``attn_metadata.minimax_m3``. Production code paths
-             build this attachment in
+             from `attn_metadata.m3_sparse_metadata`. Production code paths
+             build this in
              :meth:`MiniMaxM3AttentionMetadata.prepare` (called by the
              pyexecutor outside any CUDA-graph capture window); test
              code paths attach it directly. The forward path **never**
@@ -928,17 +959,11 @@ class MiniMaxM3Attention(Attention):
         k_view = k.view(num_tokens, self.num_key_value_heads, self.head_dim)
         v_view = v.view(num_tokens, self.num_key_value_heads, self.head_dim)
 
-        # 4. Paged-block main K/V pool. Keep the multi-dim view (do not
-        # reshape) so writes propagate to the underlying pool storage:
-        # ``kv_pool[:, 0]`` is a non-contiguous view (its dim-0 stride
-        # is 2× the contiguous stride because dim 1 separates K from
-        # V), so reshaping to ``[-1, num_kv_heads, head_dim]`` silently
-        # forks a copy. Writing to the copy and then discarding it is
-        # exactly the bug that drove dense layer-0 decode attention to
-        # near-zero output: the next forward call would read zeros for
-        # the prefilled positions because the pool was never updated.
-        # Pass the 4-D view directly; the helpers below address slots
-        # via ``(page, within)`` fancy indexing.
+        # 4. Paged-block main K/V pool. Keep the 4-D view: kv_pool[:, 0] is
+        # non-contiguous (dim-0 stride is 2x because dim 1 separates K from
+        # V), so reshaping to [-1, num_kv_heads, head_dim] silently forks a
+        # copy and drops the cache write. The helpers address slots via
+        # (page, within) fancy indexing.
         kv_pool = kv_cache_manager.get_buffers(self.layer_idx)
         k_cache_view = kv_pool[:, 0]
         v_cache_view = kv_pool[:, 1]
@@ -946,17 +971,16 @@ class MiniMaxM3Attention(Attention):
         # 5. Read the pre-built M3 metadata. Building is the
         # responsibility of ``MiniMaxM3AttentionMetadata.prepare`` (or
         # the test path), so the forward stays CUDA-graph-capture safe.
-        m3_attachment = getattr(attn_metadata, "minimax_m3", None)
-        if m3_attachment is None:
+        m3_meta = getattr(attn_metadata, "m3_sparse_metadata", None)
+        if m3_meta is None:
             raise RuntimeError(
                 f"MiniMax-M3 dense forward (layer {self.layer_idx}) requires "
-                "attn_metadata.minimax_m3 to be pre-built by "
+                "attn_metadata.m3_sparse_metadata to be pre-built by "
                 "MiniMaxM3AttentionMetadata.prepare(); the model_engine "
                 "configures the M3 backend's Metadata class so this happens "
-                "automatically. Test callers must attach minimax_m3 manually."
+                "automatically. Test callers must set m3_sparse_metadata manually."
             )
-        m3_meta = m3_attachment["metadata"]
-        out_cache_loc = m3_attachment["out_cache_loc"]
+        out_cache_loc = attn_metadata.m3_out_cache_loc
 
         # 6. Write the new tokens' K/V to the pool. All inputs come
         # from prepare() which lands them on the cache device, so the
@@ -1068,17 +1092,10 @@ class MiniMaxM3Attention(Attention):
                     dropout_p=0.0,
                     is_causal=False,
                 )  # [batch, H, 1, d]
-            # Drop the singleton Q-length axis and write the resulting
-            # ``[batch, num_heads, head_dim]`` tensor into the final buffer.
-            # The prior ``.transpose(1, 2).reshape(batch, H, d)`` pattern
-            # was wrong: with ``H != head_dim`` (M3 TP=8 has H=8, d=128)
-            # the non-contiguous transpose forces ``reshape`` to copy the
-            # data in C-order under its current ``[batch, d, H]`` shape,
-            # then reinterpret as ``[batch, H, d]`` — which scrambles
-            # ``(head, head_dim)`` ordering and feeds permuted activations
-            # into ``o_proj``. Prefill is unaffected because its
-            # ``transpose(0, 1)`` runs between q-len and num_heads axes
-            # which the per-batch loop already laid out correctly.
+            # Drop the singleton Q-length axis. Use squeeze(2) + a
+            # [batch, num_heads, head_dim] view rather than
+            # transpose(1, 2).reshape, which (with H != head_dim) copies in
+            # C-order and scrambles the (head, head_dim) ordering into o_proj.
             output.view(batch, self.num_heads, self.head_dim).copy_(out_b.squeeze(2))
 
         return output
@@ -1153,12 +1170,13 @@ class MiniMaxM3Attention(Attention):
 
         Production callers (the LLM API path) drive
         :meth:`MiniMaxM3AttentionMetadata.prepare` outside any
-        CUDA-graph capture window; that method attaches a pre-built
-        :class:`MiniMaxM3SparseAttentionMetadata` and an
-        ``out_cache_loc`` tensor as ``attn_metadata.minimax_m3``. Test
-        callers attach the same dict manually.  This forward path
-        always reads the pre-built attachment and never builds metadata
-        itself — both would trigger
+        CUDA-graph capture window; that method publishes a pre-built
+        :class:`MiniMaxM3SparseAttentionMetadata` as
+        `attn_metadata.m3_sparse_metadata` and the per-new-token
+        `out_cache_loc` as `attn_metadata.m3_out_cache_loc`. Test callers
+        set the same attributes manually. This forward path always reads
+        the pre-built metadata and never builds it itself; both would
+        trigger
         ``cudaErrorStreamCaptureUnsupported`` for the
         ``cuda_graph=True`` hard path because the build does
         CPU->GPU copies.
@@ -1173,6 +1191,17 @@ class MiniMaxM3Attention(Attention):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         idx_q = self.index_q_proj(hidden_states)
         idx_k = self.index_k_proj(hidden_states)
+        if self.num_local_index_heads != self.sparse_num_index_heads:
+            # Keep only the index heads paired with this rank's KV
+            # heads (1:1 pairing; see __init__). Slicing before the
+            # per-head norm and RoPE is equivalent and cheaper.
+            idx_q = (
+                idx_q.view(-1, self.sparse_num_index_heads, self.sparse_index_dim)[
+                    :, self.index_head_start : self.index_head_start + self.num_local_index_heads
+                ]
+                .reshape(idx_q.shape[0], self.num_local_index_heads * self.sparse_index_dim)
+                .contiguous()
+            )
 
         # 2. Per-head Gemma RMSNorm on both branches.
         q, k = self.apply_qk_norm(q, k)
@@ -1198,27 +1227,79 @@ class MiniMaxM3Attention(Attention):
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        """Run sparse cache updates and attention into ``output``."""
-        kv_cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
+        """Run sparse cache updates and attention into `output`.
+
+        Dispatches to the MSA (`fmha_sm100`) backend when `self.attn` is a
+        :class:`MiniMaxM3MSATrtllmAttention` (`sparse_use_msa=True`), which
+        mimics `DSATrtllmAttention`: the indexer produces the selected block
+        indices and the inherited `TrtllmAttention.forward` runs the sparse
+        GQA through the registered `MsaSparseGqaFmha`. Otherwise falls back
+        to the Triton reference backend's keyword-driven `forward`.
+        """
+        kv_cache_manager = attn_metadata.kv_cache_manager
         if kv_cache_manager is None:
             raise RuntimeError(
                 f"MiniMax-M3 sparse forward (layer {self.layer_idx}) requires "
                 "attn_metadata.kv_cache_manager to be a MiniMaxM3KVCacheManagerV2."
             )
 
-        # 4. Get the paged-block main K/V cache + flat side index-K cache.
-        # The base KVCacheManagerV2 layout is
-        # ``[num_pages, kv_factor, tokens_per_block, num_kv_heads, head_dim]``
-        # with NHD layout. Pass the multi-dim view ``kv_pool[:, kv_index]``
-        # ``[num_pages, tokens_per_block, num_kv_heads, head_dim]`` directly:
-        # ``_gather_paged_batched`` decomposes the flat slot id into
-        # ``(page, within)`` for 4-D caches, and writes go through
-        # :func:`_write_main_kv_slots_to_pool` which uses multi-dim
-        # fancy assignment. The previously used reshape pattern
-        # silently copied the K (or V) slice because ``kv_pool[:, 0]``
-        # is non-contiguous, so writes never propagated to the pool —
-        # the bug that drove the dense layer-0 decode attention to
-        # near-zero output and produced the GSM8K-100 0.0 score.
+        from ..attention_backend.sparse.minimax_m3 import (
+            get_minimax_m3_attention_backend_cls,
+            get_minimax_m3_msa_attention_backend_cls,
+        )
+
+        if isinstance(self.attn, get_minimax_m3_msa_attention_backend_cls()):
+            return self._sparse_attention_core_msa(q, k, v, idx_q, idx_k, attn_metadata, output)
+        if isinstance(self.attn, get_minimax_m3_attention_backend_cls()):
+            return self._sparse_attention_core_triton(
+                q, k, v, idx_q, idx_k, attn_metadata, output, kv_cache_manager
+            )
+        raise RuntimeError(
+            f"MiniMax-M3 sparse forward (layer {self.layer_idx}) requires self.attn "
+            f"to be a MiniMax-M3 sparse backend, got {type(self.attn).__name__}. "
+            "Construct the model with "
+            "sparse_attention_config=MiniMaxM3SparseAttentionConfig(...) on ModelConfig."
+        )
+
+    def _sparse_attention_core_msa(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        idx_q: torch.Tensor,
+        idx_k: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """MSA path: indexer + inherited `TrtllmAttention.forward` (DSA-style)."""
+        from ..attention_backend.interface import AttentionForwardArgs
+
+        # Indexer: proxy MQA + top-k block selection. Writes the index-K
+        # cache and returns [total_q, num_kv_heads, topk] selected blocks.
+        kv_block_indexes = self.attn.run_indexer(idx_q, idx_k, attn_metadata)
+        # Thread the selected blocks through forward_args.topk_indices; the
+        # backend's sparse_attn_predict publishes them as sparse_attn_indices,
+        # and MsaSparseGqaFmha writes K/V + runs the sparse GQA in place into
+        # `output`. attention_input_type defaults to mixed (ctx + gen).
+        forward_args = AttentionForwardArgs(output=output, topk_indices=kv_block_indexes)
+        self.attn.forward(q, k, v, attn_metadata, forward_args=forward_args)
+        return output
+
+    def _sparse_attention_core_triton(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        idx_q: torch.Tensor,
+        idx_k: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        output: torch.Tensor,
+        kv_cache_manager,
+    ) -> torch.Tensor:
+        """Triton reference path: keyword-driven `forward` with M3 caches."""
+        # Pass the 4-D pool views directly (kv_pool[:, 0] / [:, 1]); they are
+        # non-contiguous, so reshaping forks a copy and drops the cache write
+        # (see _dense_forward). The helpers address slots via (page, within).
         kv_pool = kv_cache_manager.get_buffers(self.layer_idx)
         # Index 0 = K, 1 = V on the kv_factor axis.
         k_cache = kv_pool[:, 0]
@@ -1239,17 +1320,16 @@ class MiniMaxM3Attention(Attention):
         # 5. Read the pre-built M3 metadata. Building is the
         # responsibility of ``MiniMaxM3AttentionMetadata.prepare`` (or
         # the test path), so the forward stays CUDA-graph-capture safe.
-        m3_attachment = getattr(attn_metadata, "minimax_m3", None)
-        if m3_attachment is None:
+        m3_meta = getattr(attn_metadata, "m3_sparse_metadata", None)
+        if m3_meta is None:
             raise RuntimeError(
                 f"MiniMax-M3 sparse forward (layer {self.layer_idx}) requires "
-                "attn_metadata.minimax_m3 to be pre-built by "
+                "attn_metadata.m3_sparse_metadata to be pre-built by "
                 "MiniMaxM3AttentionMetadata.prepare(); the model_engine "
                 "configures the M3 backend's Metadata class so this happens "
-                "automatically. Test callers must attach minimax_m3 manually."
+                "automatically. Test callers must set m3_sparse_metadata manually."
             )
-        m3_meta = m3_attachment["metadata"]
-        out_cache_loc = m3_attachment["out_cache_loc"]
+        out_cache_loc = attn_metadata.m3_out_cache_loc
 
         if not self.disable_index_value and idx_v_cache is not None:
             # The shared idx_v_proj is not part of the M3 checkpoint
@@ -1261,25 +1341,10 @@ class MiniMaxM3Attention(Attention):
                 "disable_index_value=True on every sparse layer)."
             )
 
-        # 6-7. Dispatch to the registered MiniMax-M3 sparse runtime
-        # backend, which executes the sparse path end-to-end including
-        # the cache writes. Production construction (LLM API with
-        # ``sparse_attention_config=MiniMaxM3SparseAttentionConfig()``)
-        # registers :class:`MiniMaxM3SparseRuntimeBackend` as
-        # ``self.attn``; any other backend on a sparse layer is a
-        # configuration error.
-        from ..attention_backend.sparse.minimax_m3 import get_minimax_m3_attention_backend_cls
-
-        m3_backend_cls = get_minimax_m3_attention_backend_cls()
-        if not isinstance(self.attn, m3_backend_cls):
-            raise RuntimeError(
-                f"MiniMax-M3 sparse forward (layer {self.layer_idx}) requires "
-                f"self.attn to be a MiniMaxM3SparseRuntimeBackend, got "
-                f"{type(self.attn).__name__}. Construct the model with "
-                "sparse_attention_config=MiniMaxM3SparseAttentionConfig(...) on "
-                "ModelConfig so the standard attention-backend dispatch selects "
-                "the M3 sparse runtime."
-            )
+        # 6-7. Dispatch to the Triton reference runtime backend, which
+        # executes the sparse path end-to-end including the cache writes.
+        # (Backend-type dispatch + geometry publication are handled by the
+        # caller `_sparse_attention_core`.)
         return self.attn.forward(
             q,
             k,

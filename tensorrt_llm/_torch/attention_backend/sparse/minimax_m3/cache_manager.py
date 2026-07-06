@@ -13,7 +13,7 @@ Provides:
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import torch
 
@@ -151,10 +151,11 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         **kwargs,
     ):
         # Resolve M3 sparse-layer metadata from explicit kwargs first,
-        # then from ``sparse_attn_config``, then from the M3 checkpoint
-        # convention (layers 0..2 dense, 3..N-1 sparse,
-        # disable_index_value=True, sparse_index_dim=128).
-        sparse_attn_config = kwargs.get("sparse_attn_config")
+        # then from `sparse_attention_config` (the name the pyexecutor
+        # passes), then from the M3 checkpoint convention (layers 0..2
+        # dense, 3..N-1 sparse, disable_index_value=True,
+        # sparse_index_dim=128).
+        sparse_attn_config = kwargs.get("sparse_attention_config")
         num_layers = kwargs.get("num_layers")
 
         if sparse_index_dim is None:
@@ -173,6 +174,11 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         self.sparse_layer_ids = sorted(int(i) for i in sparse_layer_ids)
         self.disable_index_value_layer_ids = set(int(i) for i in disable_index_value_layer_ids)
         self.sparse_index_dim = int(sparse_index_dim)
+        # Surface whether the runtime dispatches through the MSA-backed
+        # (`fmha_sm100`) path so `prepare()` can pre-build the MSA plans
+        # outside the CUDA graph capture window. The config's
+        # `sparse_use_msa` field is the single source of truth.
+        self.use_msa = bool(getattr(sparse_attn_config, "sparse_use_msa", False))
 
         super().__init__(*args, **kwargs)
 
@@ -417,6 +423,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         *,
         pool_id: int = 0,
         is_kv_aggregate: bool = True,
+        num_blocks_per_seq: Optional[Sequence[int]] = None,
     ):
         """Return per-request slot ids in ``[0, num_slots)`` directly.
 
@@ -434,8 +441,10 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         padding contract.
         """
         res = []
-        for req_id in request_ids:
+        for req_idx, req_id in enumerate(request_ids):
             idx_tensor = torch.as_tensor(self.kv_cache_map[req_id].get_base_page_indices(pool_id))
+            if num_blocks_per_seq is not None:
+                idx_tensor = idx_tensor[: num_blocks_per_seq[req_idx]]
             res.append(
                 (
                     torch.where(

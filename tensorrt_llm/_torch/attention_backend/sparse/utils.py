@@ -12,10 +12,10 @@ if TYPE_CHECKING:
     SparseAttentionConfig = Union[LlmSparseAttentionConfig,
                                   VisualGenSparseAttentionConfig]
 
-# Imports of the concrete backends / cache managers are kept local to each
-# function: they pull in ``trtllm`` and ``resource_manager``, which import
-# ``interface`` and would otherwise form an import cycle when this package is
-# loaded.
+# Imports of the concrete backends and cache managers are kept local to
+# each function: they pull in `trtllm` and `resource_manager`, which
+# import `interface` and would otherwise form an import cycle when this
+# package is loaded.
 
 
 def get_sparse_attn_kv_cache_manager(
@@ -42,14 +42,28 @@ def get_sparse_attn_kv_cache_manager(
         )
 
 
+def _resolve_minimax_m3_backend_cls(
+        sparse_params: "SparseParams") -> Type["AttentionBackend"]:
+    """Pick the Triton or MSA-backed M3 backend class.
+
+    Honours `use_msa` on the lowered `MiniMaxM3SparseParams` (populated
+    from the user-facing `sparse_use_msa` flag). Falls back to the Triton
+    reference path when the flag is unset.
+    """
+    from .minimax_m3 import (get_minimax_m3_attention_backend_cls,
+                             get_minimax_m3_msa_attention_backend_cls)
+    if getattr(sparse_params, "use_msa", False):
+        return get_minimax_m3_msa_attention_backend_cls()
+    return get_minimax_m3_attention_backend_cls()
+
+
 def get_vanilla_sparse_attn_attention_backend(
         sparse_params: "SparseParams") -> Type["AttentionBackend"]:
-    from .minimax_m3 import get_minimax_m3_attention_backend_cls
     from .rocket import RocketVanillaAttention
     if sparse_params.algorithm == "rocket":
         return RocketVanillaAttention
     elif sparse_params.algorithm == "minimax_m3":
-        return get_minimax_m3_attention_backend_cls()
+        return _resolve_minimax_m3_backend_cls(sparse_params)
     else:
         raise ValueError(
             f"Unsupported sparse attention algorithm in vanilla attention backend: {sparse_params.algorithm}"
@@ -62,7 +76,6 @@ def get_trtllm_sparse_attn_attention_backend(
 
     from .deepseek_v4 import DeepseekV4TrtllmAttention
     from .dsa import DSATrtllmAttention
-    from .minimax_m3 import get_minimax_m3_attention_backend_cls
     from .rocket import RocketTrtllmAttention
     if sparse_params.algorithm == "rocket":
         return RocketTrtllmAttention
@@ -78,7 +91,7 @@ def get_trtllm_sparse_attn_attention_backend(
         # `create_attention(...)` dispatch in `Attention.__init__`
         # returns an instantiable AttentionBackend under the trtllm
         # attention backend slot.
-        return get_minimax_m3_attention_backend_cls()
+        return _resolve_minimax_m3_backend_cls(sparse_params)
     else:
         raise ValueError(
             f"Unsupported sparse attention algorithm in trtllm attention backend: {sparse_params.algorithm}"
@@ -87,9 +100,8 @@ def get_trtllm_sparse_attn_attention_backend(
 
 def get_flashinfer_sparse_attn_attention_backend(
         sparse_params: "SparseParams") -> Type["AttentionBackend"]:
-    from .minimax_m3 import get_minimax_m3_attention_backend_cls
     if sparse_params.algorithm == "minimax_m3":
-        return get_minimax_m3_attention_backend_cls()
+        return _resolve_minimax_m3_backend_cls(sparse_params)
     raise ValueError(
         f"Unsupported sparse attention algorithm in flashinfer attention backend: {sparse_params.algorithm}"
     )
