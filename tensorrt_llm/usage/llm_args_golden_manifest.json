@@ -3498,6 +3498,7 @@
         "W4A8_MXFP4_FP8",
         "W4A8_MXFP4_MXFP8",
         "W4A16_MXFP4",
+        "MXFP8",
         "NVFP4_AWQ",
         "NVFP4_ARC",
         "NO_QUANT"
@@ -3553,6 +3554,7 @@
         "W4A8_MXFP4_FP8",
         "W4A8_MXFP4_MXFP8",
         "W4A16_MXFP4",
+        "MXFP8",
         "NVFP4_AWQ",
         "NVFP4_ARC",
         "NO_QUANT"

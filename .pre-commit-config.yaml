@@ -2856,7 +2856,7 @@ repos:
         name: Generate LLM args telemetry manifest
         entry: python3 scripts/generate_llm_args_golden_manifest.py
         language: system
-        files: ^(scripts/generate_llm_args_golden_manifest\.py|tensorrt_llm/(llmapi/llm_args\.py|models/modeling_utils\.py|usage/(config\.py|llmapi_config\.py|llm_args_golden_manifest\.json)))$
+        files: ^(scripts/generate_llm_args_golden_manifest\.py|tensorrt_llm/(_utils\.py|builder\.py|llmapi/(build_cache|kv_cache_type|llm_args|utils)\.py|lora_helper\.py|mapping\.py|models/modeling_utils\.py|plugin/plugin\.py|quantization/mode\.py|tokenizer/tokenizer\.py|usage/(config\.py|llmapi_config\.py|llm_args_golden_manifest\.json)))$
         pass_filenames: false
     -   id: model-registry-check
         name: Validate AutoDeploy model registry

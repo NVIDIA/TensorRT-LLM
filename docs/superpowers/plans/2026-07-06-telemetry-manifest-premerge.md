@@ -435,7 +435,7 @@ Expected summary:
 
 ```text
 TorchLlmArgs: old=235 new=258 added=23 removed=0 changed=4
-TrtLlmArgs: old=261 new=279 added=18 removed=0 changed=2
+TrtLlmArgs: old=261 new=279 added=18 removed=0 changed=4
 ```
 
 Review every printed row. Confirm annotations are bounded numeric, boolean, numeric-list, or categorical values; reject any free-form string, path, dictionary, callable, or object payload instead of blindly accepting it.
@@ -490,7 +490,7 @@ Insert this as the first hook under the existing `repo: local` block:
         name: Generate LLM args telemetry manifest
         entry: python3 scripts/generate_llm_args_golden_manifest.py
         language: system
-        files: ^(scripts/generate_llm_args_golden_manifest\.py|tensorrt_llm/(llmapi/llm_args\.py|models/modeling_utils\.py|usage/(config\.py|llmapi_config\.py|llm_args_golden_manifest\.json)))$
+        files: ^(scripts/generate_llm_args_golden_manifest\.py|tensorrt_llm/(_utils\.py|builder\.py|llmapi/(build_cache|kv_cache_type|llm_args|utils)\.py|lora_helper\.py|mapping\.py|models/modeling_utils\.py|plugin/plugin\.py|quantization/mode\.py|tokenizer/tokenizer\.py|usage/(config\.py|llmapi_config\.py|llm_args_golden_manifest\.json)))$
         pass_filenames: false
 ```
 
@@ -517,14 +517,16 @@ Run in the prepared environment:
 pre-commit validate-config
 pre-commit run generate-llm-args-golden-manifest --all-files
 pre-commit run generate-llm-args-golden-manifest --files tensorrt_llm/llmapi/llm_args.py
+pre-commit run generate-llm-args-golden-manifest --files tensorrt_llm/quantization/mode.py
 pre-commit run generate-llm-args-golden-manifest --files tensorrt_llm/usage/schemas/README.md
 ```
 
 Expected:
 
 - Config validation exits zero.
-- `--all-files` and the `llm_args.py` run pass without modifying the current manifest.
+- `--all-files`, the `llm_args.py` run, and the external-enum `quantization/mode.py` run pass without modifying the current manifest.
 - The README-only run reports `(no files to check) Skipped`, proving unrelated docs changes do not invoke the heavy import path.
+- The telemetry-docs unit test derives the live model/type/base/metaclass source closure and proves every current definition path is matched by the hook expression.
 
 - [ ] **Step 5: Prove the hook rewrites stale content and passes on its second run**
 

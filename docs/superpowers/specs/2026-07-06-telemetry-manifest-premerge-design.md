@@ -16,7 +16,7 @@ limitations under the License.
 
 # Telemetry Manifest Generation and Premerge Enforcement Design
 
-Status: approved design; implementation has not started.
+Status: implemented and validated on `venky/telemetry-manifest-premerge-gate`.
 
 ## Context
 
@@ -25,9 +25,9 @@ Status: approved design; implementation has not started.
 The current regeneration instructions are an inline `python -c` command. There is no supported generator, check mode, or pre-commit integration. A current-tree diagnostic run reached the assertion and confirmed drift:
 
 - `TorchLlmArgs`: 235 to 258 rows, with 23 additions, no removals, and 4 changed rows.
-- `TrtLlmArgs`: 261 to 279 rows, with 18 additions, no removals, and 2 changed rows.
+- `TrtLlmArgs`: 261 to 279 rows, with 18 additions, no removals, and 4 changed rows.
 
-The new rows are bounded numeric, boolean, numeric-list, or categorical values. No free-form string, path, callable, dictionary, or object payload appears in the generated delta.
+All 49 added or changed rows are bounded numeric, boolean, numeric-list, or categorical values. No free-form string, path, callable, dictionary, or object payload appears in the generated delta.
 
 ## Goals
 
@@ -81,16 +81,26 @@ Check mode never writes. It exits zero when current and nonzero when stale, prin
 
 ## Pre-commit integration
 
-Add a local `language: system` hook with `pass_filenames: false`. The hook invokes generator write mode and uses the active TensorRT-LLM development environment. It triggers only when one of these manifest-defining paths changes:
+Add a local `language: system` hook with `pass_filenames: false`. The hook invokes generator write mode and uses the active TensorRT-LLM development environment. Its scoped trigger set covers the semantic walker plus every repository source module that defines a model, annotation type, base class, or metaclass in the current manifest graph:
 
 - `scripts/generate_llm_args_golden_manifest.py`
+- `tensorrt_llm/_utils.py`
+- `tensorrt_llm/builder.py`
+- `tensorrt_llm/llmapi/build_cache.py`
+- `tensorrt_llm/llmapi/kv_cache_type.py`
 - `tensorrt_llm/llmapi/llm_args.py`
+- `tensorrt_llm/llmapi/utils.py`
+- `tensorrt_llm/lora_helper.py`
+- `tensorrt_llm/mapping.py`
 - `tensorrt_llm/models/modeling_utils.py`
+- `tensorrt_llm/plugin/plugin.py`
+- `tensorrt_llm/quantization/mode.py`
+- `tensorrt_llm/tokenizer/tokenizer.py`
 - `tensorrt_llm/usage/config.py`
 - `tensorrt_llm/usage/llmapi_config.py`
 - `tensorrt_llm/usage/llm_args_golden_manifest.json`
 
-If the active environment cannot import the required TensorRT-LLM dependencies, the hook fails rather than silently skipping. Unrelated commits do not run the hook. Indirect manifest drift outside this scoped path set is still caught in a normal full premerge run, and whenever the A10 PyTorch block is selected; explicitly filtered CI runs are outside this guarantee.
+The telemetry-docs test derives the live definition closure from both root model graphs, including nested models, annotation types, model bases, and enum metaclasses, and asserts that every current repository path matches the hook expression. If the active environment cannot import the required TensorRT-LLM dependencies, the hook fails rather than silently skipping. Unrelated commits do not run the hook. Drift from a newly introduced dependency that has not yet joined the derived closure is still caught in a normal full premerge run, and whenever the A10 PyTorch block is selected; explicitly filtered CI runs are outside this guarantee.
 
 The hook never stages files. When it rewrites the manifest, the normal workflow is: review the generated diff, stage it, and commit again.
 
@@ -132,6 +142,7 @@ End-to-end validation covers:
 - The refreshed committed manifest passes the drift gate.
 - The complete `test_llmapi_config_telemetry_docs.py` file passes in a prepared TRT-LLM test environment.
 - The scoped pre-commit hook rewrites stale content and becomes clean on the second run.
+- The derived current manifest-definition closure is fully covered by the hook's path expression.
 - `scripts/test_to_stage_mapping.py` maps the gate to A10 PyTorch premerge stages and no H100 stage through this enrollment.
 - Relevant formatting and pre-commit checks pass.
 

@@ -16,10 +16,12 @@
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
+from typing import get_args
 
 
 def _repo_root() -> Path:
@@ -168,15 +170,31 @@ def test_manifest_generator_main_propagates_generation_failure(monkeypatch):
         generator.main([])
 
 
-def test_manifest_generator_subprocess_resolves_local_source_without_pythonpath():
-    manifest_path = _repo_root() / "tensorrt_llm/usage/llm_args_golden_manifest.json"
-    committed = manifest_path.read_bytes()
+def test_manifest_generator_subprocess_resolves_local_source_without_pythonpath(tmp_path):
+    checkout = tmp_path / "checkout"
+    script_path = checkout / "scripts/generate_llm_args_golden_manifest.py"
+    usage_package = checkout / "tensorrt_llm/usage"
+    script_path.parent.mkdir(parents=True)
+    usage_package.mkdir(parents=True)
+
+    source_script = _repo_root() / "scripts/generate_llm_args_golden_manifest.py"
+    script_path.write_bytes(source_script.read_bytes())
+    (usage_package.parent / "__init__.py").write_text("")
+    (usage_package / "__init__.py").write_text("")
+    (usage_package / "llmapi_config.py").write_text(
+        "def golden_manifest():\n    return {'TorchLlmArgs': [], 'TrtLlmArgs': []}\n"
+    )
+    manifest_path = usage_package / "llm_args_golden_manifest.json"
+    committed = json.dumps({"TorchLlmArgs": [], "TrtLlmArgs": []}, indent=2, sort_keys=True) + "\n"
+    manifest_path.write_text(committed)
+
     environment = os.environ.copy()
     environment.pop("PYTHONPATH", None)
+    environment.pop("TRTLLM_MANIFEST_SOURCE_ROOT", None)
 
     result = subprocess.run(
-        [sys.executable, "-I", "scripts/generate_llm_args_golden_manifest.py", "--check"],
-        cwd=_repo_root(),
+        [sys.executable, "-I", str(script_path), "--check"],
+        cwd=checkout,
         env=environment,
         capture_output=True,
         text=True,
@@ -184,7 +202,76 @@ def test_manifest_generator_subprocess_resolves_local_source_without_pythonpath(
     )
 
     assert result.returncode == 0, result.stderr
-    assert manifest_path.read_bytes() == committed
+    assert manifest_path.read_text() == committed
+
+
+def _manifest_definition_source_paths() -> set[str]:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs, TrtLlmArgs
+    from tensorrt_llm.usage import config as telemetry_config
+    from tensorrt_llm.usage import llmapi_config
+
+    paths: set[str] = set()
+
+    def add_module(module_name: str) -> None:
+        module = sys.modules.get(module_name)
+        raw_path = getattr(module, "__file__", None)
+        if raw_path is None:
+            return
+        parts = Path(raw_path).parts
+        try:
+            package_index = parts.index("tensorrt_llm")
+        except ValueError:
+            return
+        relative_path = Path(*parts[package_index:])
+        if relative_path.suffix == ".py":
+            paths.add(relative_path.as_posix())
+
+    def add_class(cls: object) -> None:
+        if not isinstance(cls, type):
+            return
+        for base in cls.__mro__:
+            add_module(base.__module__)
+        add_module(type(cls).__module__)
+
+    def add_annotation(annotation: object) -> None:
+        add_class(annotation)
+        for argument in get_args(annotation):
+            add_annotation(argument)
+
+    seen_models: set[type] = set()
+
+    def walk_model(model: type) -> None:
+        if model in seen_models:
+            return
+        seen_models.add(model)
+        add_class(model)
+        for field in model.model_fields.values():
+            add_annotation(field.annotation)
+            for nested_model in llmapi_config._nested_models(field.annotation):
+                walk_model(nested_model)
+
+    walk_model(TorchLlmArgs)
+    walk_model(TrtLlmArgs)
+    add_module(telemetry_config.__name__)
+    add_module(llmapi_config.__name__)
+    return paths
+
+
+def test_manifest_generator_precommit_scope_covers_definition_modules():
+    import yaml
+
+    config = yaml.safe_load((_repo_root() / ".pre-commit-config.yaml").read_text())
+    local_hooks = next(repo["hooks"] for repo in config["repos"] if repo["repo"] == "local")
+    hook = next(hook for hook in local_hooks if hook["id"] == "generate-llm-args-golden-manifest")
+    file_pattern = re.compile(hook["files"])
+    source_paths = _manifest_definition_source_paths() | {
+        "scripts/generate_llm_args_golden_manifest.py",
+        "tensorrt_llm/usage/llm_args_golden_manifest.json",
+    }
+
+    uncovered = sorted(path for path in source_paths if file_pattern.search(path) is None)
+    assert not uncovered, f"manifest-defining sources missing from pre-commit scope: {uncovered}"
+    assert file_pattern.search("tensorrt_llm/usage/schemas/README.md") is None
 
 
 def test_build_capture_manifest_matches_committed_golden():
