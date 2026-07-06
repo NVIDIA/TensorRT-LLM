@@ -492,7 +492,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 self.tokenizer.tokenizer, "name_or_path", None) or getattr(
                     self.tokenizer, "name_or_path", None)
         trust_remote_code = self.generator.args.trust_remote_code
-        checkpoint_format = self.generator.args.checkpoint_format
+        checkpoint_format = getattr(self.generator.args, "checkpoint_format",
+                                    None)
         if checkpoint_format in ("mistral", "mistral_large_3"):
             # Do not load HF processor for mistral native checkpoints
             # even if it is available
