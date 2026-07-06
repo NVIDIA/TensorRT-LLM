@@ -39,12 +39,13 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.cluster_storage import (
     HttpClusterStorageServer, create_cluster_storage,
     validate_http_cluster_storage_scope)
+from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
 from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
 from tensorrt_llm.serve.openai_protocol import (
-    DisaggregatedParams, UCompletionRequest, UCompletionResponse,
+    UCompletionRequest, UCompletionResponse,
     ensure_request_chat_template_allowed)
 from tensorrt_llm.serve.perf_metrics import DisaggPerfMetricsCollector
 from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
@@ -81,13 +82,6 @@ class RawRequestResponseHooks(ResponseHooks):
 
 
 class OpenAIDisaggServer:
-    _CONVERSATION_ID_HEADERS = (
-        "x-session-id",
-        "x-correlation-id",
-        "x-session-affinity",
-        "x-multi-turn-session-id",
-    )
-
     def __init__(self,
                  config: DisaggServerConfig,
                  req_timeout_secs: int = 180,
@@ -179,38 +173,12 @@ class OpenAIDisaggServer:
 
     @staticmethod
     def _extract_conversation_id(req: UCompletionRequest, raw_req: Request):
-        """Populate conversation_id from supported session headers.
+        """Populate conversation_params.conversation_id from supported headers.
 
-        When not already set in the request body, copies the header value
-        into ``disaggregated_params.conversation_id``.
-
-        Supported headers are checked in priority order: ``X-Session-ID``,
-        ``X-Correlation-ID``, ``x-session-affinity``, and
-        ``x-multi-turn-session-id``.  We mirror these conventions so the
-        ConversationRouter can provide session affinity without requiring
-        clients to set the body field.
-
-        When ``disaggregated_params`` is ``None`` (standard OpenAI
-        requests without disagg fields), a minimal instance is created
-        to carry the conversation_id.  The service layer always rebuilds
-        ``disaggregated_params`` in ``_get_ctx_request`` /
-        ``_get_gen_request`` before forwarding to workers.
+        Body ``conversation_params.conversation_id`` is canonical. Headers are
+        used only when the body does not provide an id.
         """
-        header_conv_id = None
-        for header_name in OpenAIDisaggServer._CONVERSATION_ID_HEADERS:
-            header_conv_id = raw_req.headers.get(header_name)
-            if header_conv_id is not None and header_conv_id.strip():
-                break
-        else:
-            return
-
-        if req.disaggregated_params is None:
-            req.disaggregated_params = DisaggregatedParams(
-                request_type="context_only",
-                conversation_id=header_conv_id,
-            )
-        elif req.disaggregated_params.conversation_id is None:
-            req.disaggregated_params.conversation_id = header_conv_id
+        resolve_request_conversation_id(req, raw_req.headers)
 
     def _wrap_entry_point(self, entry_point: Callable) -> Callable:
         async def wrapper(req: UCompletionRequest, raw_req: Request) -> Response:

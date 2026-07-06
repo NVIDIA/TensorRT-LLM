@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 from subprocess import check_call
 
@@ -5,8 +8,16 @@ import pytest
 import torch
 from utils.llm_data import llm_models_root
 
+_LAYER_WISE_BENCHMARKS_NVBUG = pytest.mark.skip(reason="https://nvbugs/6337228")
 
-@pytest.mark.parametrize("world_size", [1, 4])
+
+@pytest.mark.parametrize(
+    "world_size",
+    [
+        pytest.param(1, marks=_LAYER_WISE_BENCHMARKS_NVBUG),
+        4,
+    ],
+)
 def test_deepseek_r1_ctx_dep(llm_root, world_size):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"needs {world_size:d} GPUs to run this test")
@@ -33,7 +44,13 @@ def test_deepseek_r1_ctx_dep(llm_root, world_size):
     )
 
 
-@pytest.mark.parametrize("world_size", [1, 4])
+@pytest.mark.parametrize(
+    "world_size",
+    [
+        pytest.param(1, marks=_LAYER_WISE_BENCHMARKS_NVBUG),
+        4,
+    ],
+)
 def test_deepseek_r1_ctx_tep(llm_root, world_size):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"needs {world_size:d} GPUs to run this test")
@@ -62,7 +79,13 @@ def test_deepseek_r1_ctx_tep(llm_root, world_size):
     )
 
 
-@pytest.mark.parametrize("world_size", [1, 4])
+@pytest.mark.parametrize(
+    "world_size",
+    [
+        pytest.param(1, marks=_LAYER_WISE_BENCHMARKS_NVBUG),
+        4,
+    ],
+)
 def test_deepseek_v32_ctx_dep(llm_root, world_size):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"needs {world_size:d} GPUs to run this test")

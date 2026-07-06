@@ -53,13 +53,14 @@ from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams, allgather)
 from ..model_config import ModelConfig
-from ..modules.attention import (MLA, maybe_allgather_for_helix_cp,
+from ..modules.attention import (maybe_allgather_for_helix_cp,
                                  maybe_slice_for_helix_cp)
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod, MoE,
                                  MoEWeightLoadingMode, create_moe)
 from ..modules.fused_moe.fused_moe_wide_ep import WideEPMoE
+from ..modules.mla import MLA
 
 # isort: off
 from ..modules.fused_moe.routing import Deepseekv3RoutingImpl
@@ -891,13 +892,20 @@ class DeepseekV3Gate(nn.Module):
                 out_dtype=torch.float32)
         return logits
 
-    def load_weights(self, weights: List[Dict]):
+    def load_weights(self,
+                     weights: List[Dict],
+                     allow_partial_loading: bool = False):
         assert len(weights) == 1
-
-        self.weight.copy_(weights[0]["weight"][:])
-
-        self.e_score_correction_bias.copy_(
-            weights[0]["e_score_correction_bias"][:].to(
+        w = weights[0].get("weight")
+        bias = weights[0].get("e_score_correction_bias")
+        if not allow_partial_loading:
+            assert w is not None and bias is not None, (
+                "DeepseekV3Gate expects 'weight' and 'e_score_correction_bias' "
+                "when partial loading is disabled")
+        if w is not None:
+            self.weight.copy_(w[:])
+        if bias is not None:
+            self.e_score_correction_bias.copy_(bias[:].to(
                 self.e_score_correction_bias.dtype))
 
     @property
