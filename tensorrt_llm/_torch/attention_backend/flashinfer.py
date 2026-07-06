@@ -138,6 +138,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     _cached_token_lens: torch.Tensor = field(init=False)
     _plan_params_to_wrappers: Dict[PlanParams,
                                    FlashInferWrappers] = field(init=False)
+    host_request_types: torch.Tensor = field(init=False)
+    host_request_types_runtime: torch.Tensor = field(init=False)
 
     # MLA wrappers and stable buffers.
     # Cached plan params + is-planned flag let prepare() refresh the plan
@@ -163,6 +165,19 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
     _multi_item_params: Optional[FlashInferMultiItemParams] = field(
         init=False, default=None)
+
+    # Speculative-decoding metadata. Declared on TrtllmAttentionMetadata
+    # (trtllm.py) and read/written by the spec-dec code paths
+    # (eagle3._prepare_attn_metadata_for_spec_dec / drafting_loops). Now that
+    # the FLASHINFER + spec_dec gate has been narrowed to one-engine + CUDA
+    # graph only, FlashInfer + MTP exercises this code path and would
+    # AttributeError without these fields. Schema-only parity here; actually
+    # plumbing the packed mask into BatchPrefillWithPagedKVCacheWrapper.plan
+    # (custom_mask=...) for correct numerics is a separate concern.
+    spec_decoding_position_offsets: Optional[torch.Tensor] = None
+    spec_decoding_position_offsets_cpp: Optional[torch.Tensor] = None
+    spec_decoding_packed_mask: Optional[torch.Tensor] = None
+    spec_decoding_generation_lengths: Optional[torch.Tensor] = None
 
     def needs_plan(self, plan_params: PlanParams) -> bool:
         if plan_params not in self._plan_params_to_wrappers:
@@ -402,10 +417,170 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             sm_scale=plan_params.sm_scale,
         )
 
+    def _plan_mtp_gen_prefill(self, plan_params: PlanParams,
+                              o_dtype: Optional[torch.dtype]) -> None:
+        """Plan a prefill-style wrapper for MTP generation tokens.
+
+        Called when generation requests carry more than 1 token per sequence
+        (i.e. speculative decoding / MTP is active).
+        BatchDecodeWithPagedKVCacheWrapper assumes q_len=1 per sequence; for
+        MTP we route the generation sub-batch through a paged-prefill wrapper
+        instead.  This path is NOT compatible with CUDA-graph capture (gated
+        on not self.is_cuda_graph at the call site).
+        """
+        num_gen = self.num_generations
+        num_ctx = self.num_contexts
+
+        # Rebase generation qo_indptr to start from 0.
+        gen_qo_indptr = (
+            self._qo_indptr[num_ctx:num_ctx + num_gen + 1] -
+            self._qo_indptr[num_ctx])
+
+        gen_paged_kv_indptr = self.paged_kv_indptr_decode[:num_gen + 1]
+        gen_paged_kv_indices = self._paged_kv_indices[
+            self.num_context_blocks:self.num_context_blocks +
+            self.num_generation_blocks]
+        gen_paged_kv_last_page = self._paged_kv_last_page_len[
+            num_ctx:num_ctx + num_gen]
+
+        # Allocate or reuse the MTP gen prefill wrapper and its indptr buffers.
+        # We allocate fresh each time rather than caching because batch shape
+        # can change run-to-run (and CUDA graph is disabled on this path).
+        self._mtp_gen_prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            self.workspace_buffer,
+            self.kv_layout,
+            backend="fa2",
+            use_cuda_graph=False,
+        )
+        self._mtp_gen_prefill_wrapper.plan(
+            gen_qo_indptr,
+            gen_paged_kv_indptr,
+            gen_paged_kv_indices,
+            gen_paged_kv_last_page,
+            plan_params.num_heads,
+            plan_params.num_kv_heads,
+            plan_params.head_dim,
+            self.page_size,
+            causal=True,
+            sm_scale=plan_params.sm_scale,
+            window_left=plan_params.window_left,
+            q_data_type=plan_params.q_dtype,
+            kv_data_type=plan_params.kv_dtype,
+            o_data_type=o_dtype,
+        )
+
     @property
     def paged_kv_indices(self) -> torch.Tensor:
         return self._paged_kv_indices[:self.num_generation_blocks +
                                       self.num_context_blocks]
+
+    def _pool_window_for_layer(self, layer_idx: int) -> Optional[int]:
+        """Return the per-pool window size for *layer_idx*, or None if unknown.
+
+        Linear / recurrent (Mamba2) layers use a negative INT_MAX sentinel
+        for window; real SWA / full-attention layers have window > 0
+        (or None, which V2 represents as max_seq_len).  Callers use this
+        to avoid picking a linear-pool layer as the primary pool, since
+        those pools return negative placeholder block IDs that would
+        crash append_paged_kv_cache with an illegal memory access.
+        """
+        mgr = self.kv_cache_manager
+        layer_offsets = getattr(mgr, 'layer_offsets', None)
+        if layer_offsets is not None and layer_idx in layer_offsets:
+            layer_offset = layer_offsets[layer_idx]
+            l2p = getattr(mgr, '_layer_to_pool_idx', None)
+            if l2p is not None:
+                pool_idx = l2p.get(layer_offset)
+                if pool_idx is not None:
+                    window = self._pool_window_for_pool_id(pool_idx)
+                    if window is not None:
+                        return window
+        vec = getattr(mgr, 'max_attention_window_vec', None)
+        if not vec:
+            return None
+        if layer_offsets is None or layer_idx not in layer_offsets:
+            return None
+        off = layer_offsets[layer_idx]
+        # V2 manager: has layer_to_pool_mapping_dict; vec is indexed
+        # per-layer (length matches num_layers when user supplies
+        # per-layer max_attention_window, e.g. Qwen3-Next hybrid).
+        if hasattr(mgr, 'layer_to_pool_mapping_dict') and 0 <= off < len(vec):
+            w = vec[off]
+            return w if w is not None else (1 << 31)
+        # V1 manager: vec is per-pool; resolve pool via _layer_to_pool_idx.
+        l2p = getattr(mgr, '_layer_to_pool_idx', None)
+        if l2p is not None:
+            pool_idx = l2p.get(off)
+            if pool_idx is not None and 0 <= pool_idx < len(vec):
+                w = vec[pool_idx]
+                return w if w is not None else (1 << 31)
+        return None
+
+    def _pool_window_for_pool_id(self, pool_id: int) -> Optional[int]:
+        """Return the configured window for a KV manager pool."""
+        mgr = self.kv_cache_manager
+        pool_configurations = getattr(mgr, 'pool_configurations', None)
+        if pool_configurations is not None and 0 <= pool_id < len(
+                pool_configurations):
+            window = pool_configurations[pool_id].window_size
+            return window if window is not None else (1 << 31)
+        vec = getattr(mgr, 'max_attention_window_vec', None)
+        if vec is not None and 0 <= pool_id < len(vec):
+            window = vec[pool_id]
+            return window if window is not None else (1 << 31)
+        return None
+
+    def _positive_vswa_pool_ids(self) -> list[int]:
+        """Return KV cache pool ids that can back FlashInfer paged KV."""
+        mgr = self.kv_cache_manager
+        num_pools = getattr(mgr, 'num_pools', None)
+        if num_pools is None:
+            pool_configurations = getattr(mgr, 'pool_configurations', None)
+            if pool_configurations is not None:
+                num_pools = len(pool_configurations)
+            else:
+                num_pools = len(getattr(mgr, 'max_attention_window_vec', []))
+        positive_pool_ids: list[int] = []
+        for pool_id in range(num_pools):
+            window = self._pool_window_for_pool_id(pool_id)
+            if window is not None and window > 0:
+                positive_pool_ids.append(pool_id)
+        return positive_pool_ids
+
+    def _first_positive_window_layer_id(self) -> int:
+        """Return a layer id that uses a real attention KV window."""
+        mgr = self.kv_cache_manager
+        layer_offsets = getattr(mgr, 'layer_offsets', {})
+        vec = getattr(mgr, 'max_attention_window_vec', None)
+        if vec:
+            pattern_len = len(vec)
+            for layer_idx in layer_offsets:
+                window = vec[layer_idx % pattern_len]
+                if window is not None and window > 0:
+                    return layer_idx
+        return next(iter(layer_offsets), 0)
+
+    def _pick_vswa_primary_pool_id(self) -> int:
+        """Pick a non-linear pool as the FlashInfer 'primary' pool.
+
+        On hybrid Mamba models (e.g. Qwen3-Next) layer 0 is a linear /
+        recurrent layer; its pool returns NEGATIVE placeholder block IDs
+        from BlockManager::getFreeBlock that crash append_paged_kv_cache.
+        Pick the first pool whose representative layer has window > 0.
+        Fall back to the layer-0 pool if no full-attention pool exists.
+        """
+        assert self._vswa_layer_to_pool is not None
+        default_pool = self._vswa_layer_to_pool.get(0, 0)
+        positive_pool_ids = self._positive_vswa_pool_ids()
+        if positive_pool_ids:
+            return positive_pool_ids[0]
+        for pool_id, rep_layer in self._vswa_pool_to_rep_layer.items():
+            w = self._pool_window_for_pool_id(pool_id)
+            if w is None:
+                w = self._pool_window_for_layer(rep_layer)
+            if w is not None and w > 0:
+                return pool_id
+        return default_pool
 
     def get_paged_kv_indices_for_layer(self, layer_idx: int) -> torch.Tensor:
         """Return page indices for the pool that *layer_idx* belongs to.
@@ -435,7 +610,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             return
         pool_id = self._vswa_layer_to_pool.get(layer_idx)
         if pool_id is None:
-            return  # Layer not in VSWA mapping
+            pool_id = self._pick_vswa_primary_pool_id()
         active = getattr(self, '_vswa_active_pool_id', None)
         if pool_id == active and not self.is_cuda_graph:
             return  # Buffer already has the right data
@@ -525,6 +700,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._cached_token_lens = torch.empty((self.max_num_requests, ),
                                               dtype=torch.int,
                                               device='cuda')
+        self.host_request_types = torch.empty((self.max_num_requests, ),
+                                              dtype=torch.int,
+                                              pin_memory=prefer_pinned(),
+                                              device='cpu')
         self._batch_indices = torch.empty((self.max_num_tokens, ),
                                           dtype=torch.int,
                                           device='cuda')
@@ -550,48 +729,81 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 capture_graph=capture_graph,
             )
 
-            # Detect VSWA: check if the manager has multiple pools.
-            # Guard on layer_to_pool_mapping_dict which is V2-specific — V1
-            # managers also expose is_vswa but lack the per-pool infrastructure.
-            if (getattr(self.kv_cache_manager, 'is_vswa', False) and hasattr(
-                    self.kv_cache_manager, 'layer_to_pool_mapping_dict')):
+            # Detect multi-pool managers.  kv_cache_manager.is_vswa excludes
+            # hybrid Mamba managers because their recurrent-state pool uses a
+            # negative sentinel window, but FlashInfer still needs the V2 pool
+            # mapping to avoid feeding those placeholder block IDs to paged KV.
+            has_multiple_windows = len(
+                getattr(self.kv_cache_manager, 'max_attention_window_vec',
+                        [])) > 1
+            if has_multiple_windows:
                 mgr = self.kv_cache_manager
-                self._vswa_layer_to_pool = {}
-                self._vswa_pool_to_rep_layer: Dict[int, int] = {}
-                for layer_idx in getattr(mgr, 'layer_offsets', {}):
-                    layer_offset = mgr.layer_offsets[layer_idx]
-                    pool_id = mgr.layer_to_pool_mapping_dict[layer_offset]
-                    self._vswa_layer_to_pool[layer_idx] = pool_id
-                    if pool_id not in self._vswa_pool_to_rep_layer:
-                        self._vswa_pool_to_rep_layer[pool_id] = layer_idx
-                # Build head_dim → pool_id mapping using V2 per-layer head_dim
-                self._vswa_head_dim_to_pool: Dict[int, int] = {}
-                if hasattr(mgr, 'head_dim_per_layer'):
-                    for layer_idx, pool_id in self._vswa_layer_to_pool.items():
-                        hd = mgr.head_dim_per_layer[
-                            mgr.layer_offsets[layer_idx]]
-                        if hd not in self._vswa_head_dim_to_pool:
-                            self._vswa_head_dim_to_pool[hd] = pool_id
+                layer_to_pool_mapping = getattr(mgr,
+                                                'layer_to_pool_mapping_dict',
+                                                None)
+                layer_to_pool_idx = getattr(mgr, '_layer_to_pool_idx', None)
+                if layer_to_pool_mapping is not None or layer_to_pool_idx is not None:
+                    self._vswa_layer_to_pool = {}
+                    self._vswa_pool_to_rep_layer: Dict[int, int] = {}
+                    positive_pool_ids = self._positive_vswa_pool_ids()
+                    single_positive_pool_id = (positive_pool_ids[0] if len(
+                        positive_pool_ids) == 1 else None)
+                    for layer_idx in getattr(mgr, 'layer_offsets', {}):
+                        layer_offset = mgr.layer_offsets[layer_idx]
+                        if layer_to_pool_mapping is not None:
+                            pool_id = layer_to_pool_mapping[layer_offset]
+                        else:
+                            pool_id = layer_to_pool_idx.get(layer_offset)
+                            if pool_id is None:
+                                if single_positive_pool_id is None:
+                                    continue
+                                pool_id = single_positive_pool_id
+                        pool_window = self._pool_window_for_pool_id(pool_id)
+                        if ((pool_window is None or pool_window <= 0)
+                                and single_positive_pool_id is not None):
+                            pool_id = single_positive_pool_id
+                        self._vswa_layer_to_pool[layer_idx] = pool_id
+                        if pool_id not in self._vswa_pool_to_rep_layer:
+                            self._vswa_pool_to_rep_layer[pool_id] = layer_idx
+                    # Build head_dim → pool_id mapping using V2 per-layer head_dim
+                    self._vswa_head_dim_to_pool: Dict[int, int] = {}
+                    if hasattr(mgr, 'head_dim_per_layer'):
+                        for layer_idx, pool_id in self._vswa_layer_to_pool.items():
+                            hd = mgr.head_dim_per_layer[
+                                mgr.layer_offsets[layer_idx]]
+                            if hd not in self._vswa_head_dim_to_pool:
+                                self._vswa_head_dim_to_pool[hd] = pool_id
 
-                # Pre-allocate VSWA pool cache buffers.  These must be
-                # stable (never reallocated) so that CUDA-graph-recorded
-                # copies reference valid addresses across replays.
-                # Use the maximum page count across ALL pools (not just the
-                # primary) so that secondary pool buffers are large enough.
-                all_pool_pages = max_num_pages
-                if hasattr(self.kv_cache_manager, 'layer_offsets'):
-                    for lid in self.kv_cache_manager.layer_offsets:
-                        lbuf = self.kv_cache_manager.get_buffers(lid)
-                        if lbuf is not None:
-                            all_pool_pages = max(all_pool_pages, lbuf.shape[0])
-                for pool_id in set(self._vswa_layer_to_pool.values()):
-                    buf_key = f'_vswa_pool_buf_{pool_id}'
-                    if getattr(self, buf_key, None) is None:
-                        setattr(
-                            self, buf_key,
-                            torch.empty(all_pool_pages,
-                                        dtype=torch.int,
-                                        device='cuda'))
+                    # Pre-allocate VSWA pool cache buffers.  These must be
+                    # stable (never reallocated) so that CUDA-graph-recorded
+                    # copies reference valid addresses across replays.
+                    # Use the maximum page count across ALL pools (not just the
+                    # primary) so that secondary pool buffers are large enough.
+                    all_pool_pages = max_num_pages
+                    if hasattr(self.kv_cache_manager, 'layer_offsets'):
+                        for lid in self.kv_cache_manager.layer_offsets:
+                            layer_offset = self.kv_cache_manager.layer_offsets[lid]
+                            if (self.kv_cache_manager.
+                                    num_kv_heads_per_layer[layer_offset] == 0):
+                                continue
+                            lbuf = self.kv_cache_manager.get_buffers(lid)
+                            if lbuf is not None:
+                                all_pool_pages = max(all_pool_pages,
+                                                     lbuf.shape[0])
+                    pool_ids = set(self._vswa_layer_to_pool.values())
+                    num_pools = getattr(self.kv_cache_manager, 'num_pools',
+                                        None)
+                    if num_pools is not None:
+                        pool_ids.update(range(num_pools))
+                    pool_ids.add(self._pick_vswa_primary_pool_id())
+                    for pool_id in pool_ids:
+                        buf_key = f'_vswa_pool_buf_{pool_id}'
+                        if getattr(self, buf_key, None) is None:
+                            setattr(
+                                self, buf_key,
+                                torch.empty(all_pool_pages,
+                                            dtype=torch.int,
+                                            device='cuda'))
         # Stable buffers for FlashInfer MLA decode; required for CUDA graphs.
         self._mla_qo_indptr_buf = self.get_empty(
             buffers,
@@ -607,6 +819,17 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             cache_name="_mla_kv_len_arr_buf",
             capture_graph=capture_graph,
         )
+        # Buffers for MTP (speculative decoding) generation path.  When
+        # generation requests carry more than 1 token per sequence the standard
+        # BatchDecodeWithPagedKVCacheWrapper cannot be used (it assumes q_len=1
+        # per request).  We instead route those through a separate prefill
+        # wrapper.  Buffers are allocated here (not inside forward()) so their
+        # addresses are stable across calls; CUDA-graph capture is NOT supported
+        # on this path (gated on not is_cuda_graph in forward).
+        self._mtp_gen_qo_indptr_buf: Optional[torch.Tensor] = None
+        self._mtp_gen_paged_kv_indptr_buf: Optional[torch.Tensor] = None
+        self._mtp_gen_prefill_wrapper: Optional[
+            flashinfer.BatchPrefillWithPagedKVCacheWrapper] = None
         # Rebind the wrapper to the freshly allocated buffers.
         self._ragged_prefill_wrapper = None
         self._mla_decode_wrapper = None
@@ -856,6 +1079,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                      dim=0,
                      dtype=torch.int32,
                      out=self._qo_indptr[1:self.seq_lens_cuda.size(0) + 1])
+        num_seqs = self.num_contexts + self.num_generations
+        self.host_request_types[:self.num_contexts].fill_(0)
+        self.host_request_types[self.num_contexts:num_seqs].fill_(1)
+        self.host_request_types_runtime = self.host_request_types[:num_seqs]
 
         if self.multi_item_part_lens is not None:
             self._multi_item_params = self._process_multi_item_part_lens(
@@ -885,8 +1112,43 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
         # indices of used cache blocks for each sequence
         assert self.request_ids is not None
+        # For VSWA models the KV cache manager has multiple pools with
+        # independent page numbering; calling get_batch_cache_indices without
+        # a layer_idx would raise ValueError.  Use the primary pool's
+        # representative layer so the initial block-count computation has a
+        # valid window_size.  Per-pool indices are rebuilt in the VSWA block
+        # below (lines ~944+) so this initial call is only used for num_blocks.
+        # For VSWA (V2) _vswa_layer_to_pool maps any layer to its pool; for
+        # VSWA (V1) that dict is None but kv_cache_manager.is_vswa is still
+        # True.  In both cases we need any valid layer_idx to resolve the
+        # window_size.  Use the first key in layer_offsets (guaranteed
+        # non-empty for any model with attention layers).
+        _vswa_init_layer: Optional[int] = None
+        if self._vswa_layer_to_pool is not None:
+            # V2 VSWA: prefer the rep layer of a non-linear (window > 0)
+            # pool.  On hybrid Mamba models layer 0 belongs to the linear
+            # pool, whose block IDs are negative placeholders that would
+            # poison _paged_kv_indices and crash append_paged_kv_cache.
+            _primary_pool = self._pick_vswa_primary_pool_id()
+            _vswa_init_layer = self._vswa_pool_to_rep_layer.get(_primary_pool)
+            if _vswa_init_layer is None:
+                _vswa_init_layer = self._first_positive_window_layer_id()
+        elif len(getattr(self.kv_cache_manager, 'max_attention_window_vec', [])) > 1:
+            # V1 manager (or any manager without per-pool dict) with multiple
+            # window sizes: get_batch_cache_indices requires layer_idx to
+            # resolve the window_size.  Prefer a layer whose pool window is
+            # positive (skip linear / recurrent pools whose window sentinel
+            # is negative); fall back to the first layer if none qualifies.
+            _layer_offsets = getattr(self.kv_cache_manager, 'layer_offsets', {})
+            if _layer_offsets:
+                _vswa_init_layer = next(iter(_layer_offsets))
+                for _lid in _layer_offsets:
+                    _w = self._pool_window_for_layer(_lid)
+                    if _w is not None and _w > 0:
+                        _vswa_init_layer = _lid
+                        break
         block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(
-            self.request_ids)
+            self.request_ids, layer_idx=_vswa_init_layer)
 
         # number of tokens in the kv cache for each sequence in the batch
         cached_token_lens = torch.tensor(
@@ -938,7 +1200,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         # capturable).
         if self._vswa_layer_to_pool is not None:
             unique_pools = set(self._vswa_layer_to_pool.values())
-            primary_pool_id = self._vswa_layer_to_pool.get(0, 0)
+            # Primary pool must be non-linear so _paged_kv_indices / the
+            # primary buffer hold positive page IDs (see _pick_vswa_primary_pool_id).
+            primary_pool_id = self._pick_vswa_primary_pool_id()
             # Use dedicated pre-allocated buffers for each pool's indices.
             # These buffers are created in __post_init__ so their addresses
             # stay stable across CUDA-graph replays.
@@ -1074,7 +1338,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         # VSWA: restore primary pool indices as the default.
         if (self._vswa_layer_to_pool is not None
                 and self._vswa_pool_indices_cache is not None):
-            primary_pool_id = self._vswa_layer_to_pool.get(0, 0)
+            primary_pool_id = self._pick_vswa_primary_pool_id()
             total_blocks = self.num_generation_blocks + self.num_context_blocks
             src = self._vswa_pool_indices_cache[primary_pool_id][:total_blocks]
             self._paged_kv_indices[:total_blocks].copy_(src, non_blocking=True)
@@ -1851,13 +2115,42 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 attention_mask_data=effective_mask_data,
                 flashinfer_backend=self.flashinfer_backend)
 
+            # Detect MTP: generation requests with >1 token per sequence.
+            # BatchDecodeWithPagedKVCacheWrapper assumes q_len=1; when MTP is
+            # active the generation sub-batch must use the prefill wrapper
+            # instead.  Not compatible with CUDA-graph capture (variable
+            # q_len per request), so this path is gated on non-graph mode.
+            gen_seq_lens = metadata.seq_lens_cuda[
+                num_contexts:num_contexts + num_generations]
+            is_mtp_gen = (num_generations > 0
+                          and not metadata.is_cuda_graph
+                          and gen_seq_lens.max().item() > 1)
+
+            def mtp_gen_forward(out: torch.Tensor):
+                """Run generation sub-batch through the paged prefill wrapper."""
+                o_dtype = (torch.bfloat16 if plan_params.q_dtype in (
+                    torch.float8_e4m3fn, torch.float8_e5m2) else None)
+                metadata._plan_mtp_gen_prefill(plan_params, o_dtype)
+                assert metadata._mtp_gen_prefill_wrapper is not None
+                metadata._mtp_gen_prefill_wrapper.run(
+                    q[num_ctx_tokens:].view(-1, self.num_heads, self.head_dim),
+                    kv_cache,
+                    out=out.view(-1, self.num_heads, self.head_dim),
+                )
+
             if num_contexts == 0:
-                decode_forward(plan_params, output)
+                if is_mtp_gen:
+                    mtp_gen_forward(output)
+                else:
+                    decode_forward(plan_params, output)
             elif num_generations == 0:
                 prefill_forward(plan_params, output)
             else:
                 prefill_forward(plan_params, output[:num_ctx_tokens, :])
-                decode_forward(plan_params, output[num_ctx_tokens:, :])
+                if is_mtp_gen:
+                    mtp_gen_forward(output[num_ctx_tokens:, :])
+                else:
+                    decode_forward(plan_params, output[num_ctx_tokens:, :])
 
     def forward(self,
                 q: torch.Tensor,
