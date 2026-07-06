@@ -1186,12 +1186,11 @@ class Qwen3VisionModelBase(nn.Module):
         image_grid_thw = mm_extra_data.get("image_grid_thw", None)
         video_grid_thw = mm_extra_data.get("video_grid_thw", None)
 
-        # When the interleave path fires, _parse_and_batch collapses both
-        # modalities into "pixel_values" + "image_grid_thw"; video_* stay None.
+        # The interleave path collapses both modalities into "pixel_values" +
+        # "image_grid_thw", so seeing both keys populated here means a mixed
+        # request slipped through without a manifest — we can't guarantee
+        # prompt-order embeddings, so refuse rather than emit misordered rows.
         if pixel_values is not None and pixel_values_videos is not None:
-            # Fallback tripwire: if any request has both modalities but the
-            # interleave path did not fire (no mm_item_order), we cannot
-            # produce correctly-ordered embeddings.
             raise ValueError(
                 "Qwen3-VL vision encoder received both pixel_values and "
                 "pixel_values_videos without a prompt-order manifest "

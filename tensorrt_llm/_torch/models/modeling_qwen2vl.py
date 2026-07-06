@@ -901,12 +901,10 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
 
         fused_input_ids = processed_inputs['input_ids'][0]
         if mm_data:
-            # Prompt-order manifest derived from the pre-expansion text: each
-            # `<|image_pad|>` / `<|video_pad|>` occurrence corresponds to one
-            # media item, so one match == one item (no video-frame timestamp
-            # bracketing to unwind). Consumers (e.g. Qwen3VisionModelBase)
-            # interleave pixel_values across modalities in prompt order,
-            # enabling a single-pass ViT forward for mixed requests.
+            # Derive the manifest from the pre-expansion text: at this stage
+            # each `<|image_pad|>` / `<|video_pad|>` occurrence corresponds to
+            # exactly one media item, so one match == one item (post-expansion
+            # would have video-frame timestamp bracketing to unwind).
             multimodal_data["mm_item_order"] = self.derive_mm_item_order(
                 text_prompt,
                 image_placeholder="<|image_pad|>",

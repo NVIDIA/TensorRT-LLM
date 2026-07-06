@@ -15,6 +15,7 @@
 import unittest
 
 from tensorrt_llm.inputs.registry import (MULTIMODAL_PLACEHOLDER_REGISTRY,
+                                          BaseMultimodalInputProcessor,
                                           MultimodalPlaceholderMetadata,
                                           MultimodalPlaceholderPlacement)
 
@@ -100,6 +101,108 @@ class TestMultimodalPlaceholderRegistry(unittest.TestCase):
 
         MULTIMODAL_PLACEHOLDER_REGISTRY.remove_placeholder_metadata(
             self.model_type)
+
+
+class TestDeriveMmItemOrder(unittest.TestCase):
+    """Tests for ``BaseMultimodalInputProcessor.derive_mm_item_order``.
+
+    The method walks pre-expansion prompt text and returns a prompt-order
+    manifest ``[{"modality": ..., "index": ...}, ...]``. It is a pure function
+    of (text, placeholder strings) and does not touch ``self``, so tests call
+    it as an unbound method with ``None`` self.
+    """
+
+    _IMAGE_PH = "<|image_pad|>"
+    _VIDEO_PH = "<|video_pad|>"
+
+    def _call(self,
+              text,
+              image_placeholder=_IMAGE_PH,
+              video_placeholder=_VIDEO_PH):
+        return BaseMultimodalInputProcessor.derive_mm_item_order(
+            None,
+            text,
+            image_placeholder=image_placeholder,
+            video_placeholder=video_placeholder,
+        )
+
+    def test_pure_image_two_items(self):
+        # Two same-modality items → per-modality index increments from 0.
+        text = f"{self._IMAGE_PH} vs {self._IMAGE_PH}"
+        self.assertEqual(self._call(text), [
+            {
+                "modality": "image",
+                "index": 0
+            },
+            {
+                "modality": "image",
+                "index": 1
+            },
+        ])
+
+    def test_video_then_image_preserves_prompt_order(self):
+        # Guards against any implementation that sorts by modality — output
+        # must reflect the text order, not group images before videos.
+        text = f"{self._VIDEO_PH} first, then {self._IMAGE_PH}"
+        self.assertEqual(self._call(text), [
+            {
+                "modality": "video",
+                "index": 0
+            },
+            {
+                "modality": "image",
+                "index": 0
+            },
+        ])
+
+    def test_image_video_image_prompt_order(self):
+        # Mixed sequence with a same-modality repeat: index for images
+        # advances (0, 1) while video's own counter stays at 0.
+        text = f"{self._IMAGE_PH} a {self._VIDEO_PH} b {self._IMAGE_PH}"
+        self.assertEqual(self._call(text), [
+            {
+                "modality": "image",
+                "index": 0
+            },
+            {
+                "modality": "video",
+                "index": 0
+            },
+            {
+                "modality": "image",
+                "index": 1
+            },
+        ])
+
+    def test_empty_or_no_placeholders_returns_empty(self):
+        # Covers three separate early-return paths: empty text, no
+        # placeholders in text, and both placeholder strings being ``None``.
+        self.assertEqual(self._call(""), [])
+        self.assertEqual(self._call("hello world with no media"), [])
+        self.assertEqual(
+            self._call(f"{self._IMAGE_PH} + {self._VIDEO_PH}",
+                       image_placeholder=None,
+                       video_placeholder=None), [])
+
+    def test_missing_video_placeholder_ignores_video_matches(self):
+        # Partial ``None`` contract: only the modality with a placeholder
+        # string is recognized; the other modality's occurrences are silently
+        # skipped rather than raising.
+        text = f"{self._IMAGE_PH} + {self._VIDEO_PH}"
+        self.assertEqual(
+            self._call(text, video_placeholder=None),
+            [{
+                "modality": "image",
+                "index": 0
+            }],
+        )
+
+    def test_regex_special_chars_in_placeholder_are_literal(self):
+        # Placeholder strings contain ``<|...|>`` — the ``|`` is a regex
+        # metacharacter that would alternate if not escaped. This asserts
+        # the implementation runs the placeholders through ``re.escape``.
+        text = "before <|image_pad|> after"
+        self.assertEqual(self._call(text), [{"modality": "image", "index": 0}])
 
 
 if __name__ == "__main__":

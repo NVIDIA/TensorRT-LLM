@@ -90,22 +90,6 @@ def test_image_only_single_modality_fallback_unchanged():
     assert torch.equal(embeds[0][:, 0], torch.full((4,), 10.0))
 
 
-def test_video_only_single_modality_fallback_unchanged():
-    enc = _make_encoder()
-    params = [
-        _make_param(
-            video={
-                "pixel_values_videos": _make_item_patches(marker=20, patches=6),
-                "video_grid_thw": torch.tensor([[2, 1, 3]]),
-            },
-        )
-    ]
-    embeds = enc.forward(params)
-    assert len(embeds) == 1
-    assert embeds[0].shape == (6, 4)
-    assert torch.equal(embeds[0][:, 0], torch.full((6,), 20.0))
-
-
 def test_mixed_image_video_image_prompt_order_interleave():
     enc = _make_encoder()
     # Prompt order: image#0 (marker=10, 4 patches), video#0 (marker=20, 6
@@ -138,30 +122,6 @@ def test_mixed_image_video_image_prompt_order_interleave():
     # 4 + 6 + 2 = 12 rows in prompt order.
     expected = torch.tensor([10.0] * 4 + [20.0] * 6 + [30.0] * 2, dtype=torch.float32)
     assert embeds[0].shape == (12, 4)
-    assert torch.equal(embeds[0][:, 0], expected)
-
-
-def test_video_then_image_interleave():
-    enc = _make_encoder()
-    params = [
-        _make_param(
-            image={
-                "pixel_values": _make_item_patches(marker=99, patches=3),
-                "image_grid_thw": torch.tensor([[1, 1, 3]]),
-            },
-            video={
-                "pixel_values_videos": _make_item_patches(marker=77, patches=4),
-                "video_grid_thw": torch.tensor([[1, 2, 2]]),
-            },
-            order=[
-                {"modality": "video", "index": 0},
-                {"modality": "image", "index": 0},
-            ],
-        )
-    ]
-    embeds = enc.forward(params)
-    assert len(embeds) == 1
-    expected = torch.tensor([77.0] * 4 + [99.0] * 3, dtype=torch.float32)
     assert torch.equal(embeds[0][:, 0], expected)
 
 

@@ -520,7 +520,7 @@ class BaseMultimodalInputProcessor(ABC):
         *,
         image_placeholder: Optional[str] = None,
         video_placeholder: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
+    ) -> List[Dict[str, Union[str, int]]]:
         """Walk the pre-expansion prompt ``text`` and return a prompt-order manifest of multimodal items.
 
         Each returned entry has the form
@@ -546,7 +546,7 @@ class BaseMultimodalInputProcessor(ABC):
             return []
         combined = "|".join(f"(?P<{modality}>{re.escape(pat)})"
                             for pat, modality in patterns)
-        order: List[Dict[str, Any]] = []
+        order: List[Dict[str, Union[str, int]]] = []
         counters: Dict[str, int] = {"image": 0, "video": 0}
         for m in re.finditer(combined, text):
             modality = m.lastgroup
@@ -1207,11 +1207,10 @@ def create_input_processor_with_hash(
                ) > 0 and mm_special_token_ids is not None:
             extra_processed_inputs["multimodal_data"][
                 "special_token_offsets"] = start_special_token_positions
-        # Flatten per-modality hashes into one prompt-ordered list so the
-        # radix-tree cache key sees each item's content digest at the exact
-        # token position that item occupies. Per-modality dict-iteration
-        # order would misalign hashes with `start_positions` when a request
-        # interleaves modalities.
+        # Flatten hashes in prompt order (same rationale as `num_mm_tokens`
+        # above): the radix-tree cache key indexes each item's digest by its
+        # `start_positions` offset, so per-modality dict order would misalign
+        # hashes when a request interleaves modalities.
         mm_item_order = extra_processed_inputs.get("multimodal_data",
                                                    {}).get("mm_item_order")
         if mm_item_order:
@@ -1223,10 +1222,9 @@ def create_input_processor_with_hash(
                 h for hashes in mm_hashes.values() for h in hashes
             ]
         # `MultimodalInput.multimodal_uuids` is a flat list that must index in
-        # lockstep with `multimodal_hashes`; project the per-modality UUID
-        # dict through the same prompt-order manifest so cache-event UUIDs
-        # attach to the correct item. Only meaningful when the caller
-        # supplied UUIDs; otherwise pass through None.
+        # lockstep with `multimodal_hashes`, so project the per-modality UUID
+        # dict through the same manifest — otherwise cache-event UUIDs attach
+        # to the wrong item.
         if mm_uuids_by_key is None:
             mm_uuid_list = None
         elif mm_item_order:
