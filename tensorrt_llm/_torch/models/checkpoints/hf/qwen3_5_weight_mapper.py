@@ -37,10 +37,11 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
        Qwen3Next checkpoints store pre-packed in_proj_qkvz and in_proj_ba
        tensors.  Qwen3.5 checkpoints store them as separate in_proj_qkv + z
        (or fully split q/k/v/z) and b + a tensors.  This mapper packs them
-       into the grouped-interleaved layout that TRT-LLM expects.
-       For FP8 checkpoints, the packed qkvz tensor is then dequantized to
-       bf16 as a temporary workaround for TP loading
-       (handled in _dequantize_linear_attn_fp8_qkvz).
+       into grouped-interleaved QKVZ/BA. NVFP4 then combines both projections
+       in rank-major consumer order; other quantization modes retain the split
+       runtime layout. For FP8 block-scale checkpoints, quantized projections
+       are dequantized to bf16 before packing while already-unquantized B/A
+       projections remain unchanged.
 
     3. MoE expert tensors (handled in handle_special_instance_module):
        Qwen3.5 BF16 checkpoints store fused gate_up_proj/down_proj per expert
@@ -198,10 +199,10 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
             target_dtype = torch.bfloat16
         return (weight.to(torch.float32) * expanded_scales).to(target_dtype).contiguous()
 
-    def _dequantize_linear_attn_fp8_qkvz(self, weights: dict) -> dict:
+    def _dequantize_linear_attn_fp8_projections(self, weights: dict) -> dict:
         updated_weights = dict(weights)
         for name in list(weights):
-            if not name.endswith(".linear_attn.in_proj_qkvz.weight"):
+            if ".linear_attn.in_proj_" not in name or not name.endswith(".weight"):
                 continue
             scale_name = name.replace(".weight", ".weight_scale_inv")
             if scale_name not in weights:
@@ -210,6 +211,16 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
                 weights[name], weights[scale_name]
             )
             updated_weights.pop(scale_name, None)
+
+        orphan_scales = [
+            name
+            for name in updated_weights
+            if ".linear_attn.in_proj_" in name and name.endswith(".weight_scale_inv")
+        ]
+        if orphan_scales:
+            raise ValueError(
+                f"Missing FP8 weight for linear-attention scales: {sorted(orphan_scales)}"
+            )
         return updated_weights
 
     def _pack_split_projections(self, weights: dict) -> dict:
@@ -321,13 +332,12 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         quant_algo = self.config.quant_config.quant_algo
 
         normalized_weights = self._normalize_weight_names(weights)
-        normalized_weights, is_modelopt_pb_wo = self._normalize_scale_names(
-            normalized_weights, quant_algo
-        )
+        normalized_weights, _ = self._normalize_scale_names(normalized_weights, quant_algo)
+
+        if quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
+            normalized_weights = self._dequantize_linear_attn_fp8_projections(normalized_weights)
 
         packed_weights = self._pack_split_projections(normalized_weights)
-        if quant_algo == QuantAlgo.FP8_BLOCK_SCALES and not is_modelopt_pb_wo:
-            packed_weights = self._dequantize_linear_attn_fp8_qkvz(packed_weights)
 
         if not getattr(self.config.pretrained_config, "num_experts", 0):
             packed_weights = self._remap_dense_mlp_weights(packed_weights)

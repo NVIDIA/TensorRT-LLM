@@ -24,8 +24,9 @@ def _extract_transpose_prefill_kernel(
     src_ptr,
     dst_ptr,
     num_prefill_tokens,
-    d_in_proj,
-    d_inner,
+    src_stride_seq,
+    src_stride_dim,
+    start_col,
     conv_dim,
     BLOCK_SEQ: tl.constexpr,
     BLOCK_CONV: tl.constexpr,
@@ -42,12 +43,17 @@ def _extract_transpose_prefill_kernel(
     conv_mask = conv_offsets < conv_dim
     mask = seq_mask[:, None] & conv_mask[None, :]
 
-    # Cast to int64 to avoid overflow: seq_offsets * d_in_proj can exceed INT32_MAX
+    # Cast to int64 to avoid overflow: seq_offsets * src_stride_seq can exceed INT32_MAX
     # (e.g., 131071 * 22656 = 2,969,544,576 > 2,147,483,647)
-    src_offsets = seq_offsets[:, None].to(tl.int64) * d_in_proj + d_inner + conv_offsets[None, :]
+    src_offsets = (
+        seq_offsets[:, None].to(tl.int64) * src_stride_seq
+        + (start_col + conv_offsets[None, :]).to(tl.int64) * src_stride_dim
+    )
     data = tl.load(src_ptr + src_offsets, mask=mask, other=0.0)
 
-    dst_offsets = conv_offsets[:, None] * num_prefill_tokens + seq_offsets[None, :]
+    dst_offsets = conv_offsets[:, None].to(tl.int64) * num_prefill_tokens + seq_offsets[None, :].to(
+        tl.int64
+    )
     tl.store(dst_ptr + dst_offsets, tl.trans(data), mask=conv_mask[:, None] & seq_mask[None, :])
 
 
@@ -72,7 +78,8 @@ def extract_transpose_prefill_slice(
         src,
         out,
         num_prefill_tokens,
-        src.shape[1],
+        src.stride(0),
+        src.stride(1),
         start_col,
         width,
         BLOCK_SEQ,
@@ -207,7 +214,8 @@ def _transpose_and_split_qkv_kernel(
     v_ptr,
     num_prefill,
     num_decode,
-    num_cols,
+    decode_stride_seq,
+    decode_stride_dim,
     q_dim: tl.constexpr,
     k_dim: tl.constexpr,
     v_dim: tl.constexpr,
@@ -251,9 +259,10 @@ def _transpose_and_split_qkv_kernel(
 
     # Decode: read from decode_ptr[T_d, D] row-major
     decode_row = seq_offsets - num_prefill
-    decode_indices = decode_row[:, None].to(tl.int64) * num_cols + (
-        src_col_offset + dim_offsets[None, :]
-    ).to(tl.int64)
+    decode_indices = (
+        decode_row[:, None].to(tl.int64) * decode_stride_seq
+        + (src_col_offset + dim_offsets[None, :]).to(tl.int64) * decode_stride_dim
+    )
     decode_data = tl.load(
         decode_ptr + decode_indices, mask=is_decode[:, None] & dim_mask[None, :], other=0.0
     )
@@ -283,7 +292,7 @@ def transpose_and_split_qkv(
 
     Replaces separate transpose_copy_back + split_qkv_contiguous for mixed batches.
     """
-    num_cols, num_prefill = prefill_t.shape
+    _, num_prefill = prefill_t.shape
     num_decode = decode.shape[0]
     total_seq = num_prefill + num_decode
 
@@ -303,7 +312,8 @@ def transpose_and_split_qkv(
         v_flat,
         num_prefill,
         num_decode,
-        num_cols,
+        decode.stride(0),
+        decode.stride(1),
         q_dim,
         k_dim,
         v_dim,

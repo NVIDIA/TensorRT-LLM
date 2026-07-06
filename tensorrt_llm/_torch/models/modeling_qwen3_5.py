@@ -182,9 +182,8 @@ class Qwen35ConfigCompat:
     def _inherit_quantization_config(config_dict: dict, text_config: dict) -> dict:
         """Copy top-level quantization_config into text_config with name normalization.
 
-        Also adds a temporary workaround that keeps packed linear-attention
-        in_proj_qkvz on the bf16 path until FP8 block-scale TP loading is
-        fixed for that layout.
+        Also keeps packed linear-attention QKVZ on the bf16 path when the
+        default split projection layout is used.
         """
         if "quantization_config" in text_config:
             return text_config
@@ -222,10 +221,7 @@ class Qwen35ConfigCompat:
 
     @staticmethod
     def _add_qkvz_bf16_workaround(text_config: dict, modules: list[str]) -> list[str]:
-        """Keep packed linear-attention qkvz on bf16 path for all linear-attention layers.
-
-        Temporary until FP8 block-scale TP loading is fixed for this layout.
-        """
+        """Keep packed linear-attention QKVZ on the bf16 path."""
         try:
             layer_types = get_qwen3_hybrid_layer_types(SimpleNamespace(**text_config))
         except (ValueError, AttributeError):
@@ -352,9 +348,9 @@ def _normalize_qwen35_exclude_modules(model_config):
 
     hf_quant_config.json stores exclude patterns in HF checkpoint namespace
     (e.g. ``model.language_model.layers.0.linear_attn*`` and ``mtp.layers.0*``),
-    but TRT-LLM modules use ``model.layers.0.linear_attn.in_proj_qkvz`` and
-    map the MTP layer to ``model.layers.<num_hidden_layers>.*``.  This
-    function translates the patterns so that
+    but TRT-LLM uses a combined ``in_proj_qkvzba`` module for NVFP4 and the
+    checkpoint-compatible ``in_proj_qkvz``/``in_proj_ba`` modules otherwise.
+    It also maps the MTP layer to ``model.layers.<num_hidden_layers>.*`` so
     ``apply_quant_config_exclude_modules`` can match them.
     """
     qc = model_config.quant_config
@@ -362,6 +358,7 @@ def _normalize_qwen35_exclude_modules(model_config):
         return
 
     n_hidden_layers = getattr(model_config.pretrained_config, "num_hidden_layers", None)
+    use_fused_projection = qc.quant_mode.has_nvfp4()
 
     normalized = set()
     for name in qc.exclude_modules:
@@ -381,9 +378,15 @@ def _normalize_qwen35_exclude_modules(model_config):
             if translated is not None:
                 normalized.add(translated)
             continue
-        # Map split projection names to packed TRT-LLM names
-        name = re.sub(r"\.in_proj_[ab](\b|\*)", ".in_proj_ba*", name)
-        name = re.sub(r"\.in_proj_(q|k|v|z|qkv)(\b|\*)", ".in_proj_qkvz*", name)
+        if use_fused_projection:
+            name = re.sub(
+                r"\.in_proj_(qkvz|qkv|q|k|v|z|ba|b|a)(\b|\*)",
+                ".in_proj_qkvzba*",
+                name,
+            )
+        else:
+            name = re.sub(r"\.in_proj_[ab](\b|\*)", ".in_proj_ba*", name)
+            name = re.sub(r"\.in_proj_(q|k|v|z|qkv)(\b|\*)", ".in_proj_qkvz*", name)
         normalized.add(name)
 
     # gdn_mixer uses Linear module for weight management of depthwise conv1d
