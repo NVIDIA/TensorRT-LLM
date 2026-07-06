@@ -39,6 +39,7 @@ import torch
 # Reuse the proven setup + reference machinery from the full MLA test.
 # The attention test directory is added to sys.path by pytest (prepend import
 # mode, no package __init__), so the sibling module is imported by bare name.
+import test_attention_mla
 from test_attention_mla import RopeConfig, Scenario, _run_test_for_backend
 
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
@@ -302,6 +303,201 @@ def test_cute_dsl_mla_decode_long_decode(v2_kv_cache, num_layers, kernel, cute_d
     )
 
     expected = scenario.num_layers * _LONG_DECODE_NUM_STEPS
+    assert cute_dsl_decode_counter["calls"] == expected, (
+        f"Expected {expected} CuTe DSL MLA decode dispatches, got "
+        f"{cute_dsl_decode_counter['calls']} (silent TRTLLM fallback?)"
+    )
+
+
+# Standalone-shape parity: run the SAME (num_heads, batch, KV, seq_q) geometries
+# the standalone kernel benchmark uses (bench/cutedsl_mla + standalone_mla_*.md)
+# through the full integration decode path, so the two are apples-to-apples.
+#
+# The standalone harness feeds the kernel a total KV length ``seq_len_k = KV``.
+# The integration path instead scans ``cache_seqs = num_cached + seq_len_q``:
+# every freshly-appended query token of this step is counted (see
+# ``attention_backend/fmha/cute_dsl.py``). To make the effective KV identical we
+# set the context length to ``KV - seq_len_q`` and take a SINGLE decode step, so
+# the decode kernel scans exactly ``KV`` positions -- matching the standalone
+# column instead of ``KV + seq_len_q``.
+#
+# num_layers is pinned to 1 (multi-layer paged-KV resolution is covered above)
+# and the batch/KV grid is curated to keep the bf16 reference cost bounded while
+# still sampling every batch magnitude, every KV length, both head counts
+# (16 = TP=8 per-rank fold path, 128 = no fold), and both seq_q values.
+_STANDALONE_SHAPES = [
+    # (num_heads, batch, kv)
+    (16, 1, 1024),
+    (16, 2, 8192),
+    (16, 8, 4096),
+    (16, 32, 2048),
+    (16, 64, 1024),
+    (16, 256, 1024),
+    (128, 1, 8192),
+    (128, 4, 4096),
+    (128, 8, 8192),
+    (128, 16, 2048),
+    (128, 64, 1024),
+]
+
+
+@pytest.mark.parametrize("kernel", list(_KERNEL_DTYPES))
+@pytest.mark.parametrize("generation_seq_len_q", [1, 2], ids=lambda x: f"gen_seq_len_q={x}")
+@pytest.mark.parametrize(
+    "num_heads,batch,kv",
+    _STANDALONE_SHAPES,
+    ids=[f"h{h}_b{b}_kv{k}" for (h, b, k) in _STANDALONE_SHAPES],
+)
+def test_cute_dsl_mla_decode_standalone_shapes(
+    num_heads, batch, kv, generation_seq_len_q, kernel, cute_dsl_decode_counter,
+    monkeypatch,
+):
+    """Decode-path parity with the standalone kernel benchmark shapes.
+
+    Effective KV equals the standalone ``KV`` column: the context length is
+    ``KV - seq_len_q`` and a single decode step is taken, so the CuTe DSL kernel
+    scans exactly ``KV`` positions.
+    """
+    seq_q = generation_seq_len_q
+    if kv - seq_q <= 0:
+        pytest.skip("KV too short for the requested seq_len_q.")
+    dtype, kv_cache_dtype = _KERNEL_DTYPES[kernel]
+
+    # ``_run_test_for_backend`` sizes the KV-cache pool from the module globals
+    # ``max_context_sequence_length`` (default 1000, for tiny correctness tests)
+    # and ``max_num_contexts`` (default 10), NOT from the actual shape. These
+    # standalone shapes use ctx up to ~8k over up to 256 sequences, so bump both
+    # to the real shape or the pool runs out ("Not enough pages in GPU memory").
+    monkeypatch.setattr(test_attention_mla, "max_context_sequence_length",
+                        max(kv, test_attention_mla.max_context_sequence_length))
+    monkeypatch.setattr(test_attention_mla, "max_num_contexts",
+                        max(batch, test_attention_mla.max_num_contexts))
+
+    scenario = Scenario(
+        dtype=dtype,
+        kv_cache_dtype=kv_cache_dtype,
+        num_layers=1,
+        num_heads=num_heads,
+        num_kv_heads=num_heads,
+    )
+    rope_config = _build_rope_config(scenario)
+
+    context_sequence_lengths = [kv - seq_q] * batch
+    num_generation_steps = 1
+
+    _run_test_for_backend(
+        "TRTLLM",
+        num_heads=scenario.num_heads,
+        num_kv_heads=scenario.num_kv_heads,
+        num_layers=scenario.num_layers,
+        q_lora_rank=scenario.q_lora_rank,
+        kv_lora_rank=scenario.kv_lora_rank,
+        qk_nope_head_dim=scenario.qk_nope_head_dim,
+        qk_rope_head_dim=scenario.qk_rope_head_dim,
+        v_head_dim=scenario.v_head_dim,
+        rope_config=rope_config,
+        kv_cache_tokens_per_block=scenario.kv_cache_tokens_per_block,
+        device=torch.device("cuda"),
+        dtype=scenario.dtype,
+        kv_cache_dtype=scenario.kv_cache_dtype,
+        context_sequence_lengths=context_sequence_lengths,
+        generation_seq_len_q=seq_q,
+        num_generation_steps=num_generation_steps,
+        v2_kv_cache=True,
+        skip_context_assert=True,
+    )
+
+    expected = scenario.num_layers * num_generation_steps
+    assert cute_dsl_decode_counter["calls"] == expected, (
+        f"Expected {expected} CuTe DSL MLA decode dispatches, got "
+        f"{cute_dsl_decode_counter['calls']} (silent TRTLLM fallback?)"
+    )
+
+
+# (batch, kv): batch=2 exercises the split_kv>1 workspace path, batch=64 the
+# split_kv==1 many-tiles path -- both under is_persistent tactic profiling.
+_AUTOTUNE_SHAPES = [(2, 2048), (64, 1024)]
+
+
+@pytest.mark.parametrize("kernel", list(_KERNEL_DTYPES))
+@pytest.mark.parametrize(
+    "force_persistent",
+    [None, "0", "1"],
+    ids=lambda v: f"force_persistent={v}",
+)
+@pytest.mark.parametrize(
+    "batch,kv", _AUTOTUNE_SHAPES, ids=[f"b{b}_kv{k}" for (b, k) in _AUTOTUNE_SHAPES]
+)
+def test_cute_dsl_mla_decode_autotuned(
+    batch, kv, force_persistent, kernel, cute_dsl_decode_counter, monkeypatch,
+):
+    """Exercise the op AutoTuner's ``is_persistent`` tactic path end-to-end.
+
+    Unlike the other decode tests (which never enter ``with autotune()`` and so
+    only run ``default_tactic``), this warms the AutoTuner on the first decode
+    step. That drives ``get_valid_tactics`` to enumerate both ``is_persistent``
+    variants (via ``get_is_persistent_candidates``), the tuner profiles the
+    ``(tiler, split_kv, is_persistent)`` 4-tuples and caches the winner, and the
+    next step reuses the tuned tactic. Both variants are numerically identical
+    (persistent is a scheduling/codegen choice, not a math change), so the
+    assertion is that every profiled+selected variant compiles, runs, and stays
+    correct with no silent fallback:
+
+    - ``force_persistent=None`` -> tuner enumerates [True, False] and PICKS one.
+    - ``force_persistent="1"/"0"`` -> ``TLLM_CUTE_DSL_FORCE_PERSISTENT`` pins the
+      single candidate, so each variant is validated through the tuner in turn.
+    """
+    seq_q = 2
+    if kv - seq_q <= 0:
+        pytest.skip("KV too short for the requested seq_len_q.")
+    dtype, kv_cache_dtype = _KERNEL_DTYPES[kernel]
+
+    if force_persistent is not None:
+        monkeypatch.setenv("TLLM_CUTE_DSL_FORCE_PERSISTENT", force_persistent)
+
+    monkeypatch.setattr(test_attention_mla, "max_context_sequence_length",
+                        max(kv, test_attention_mla.max_context_sequence_length))
+    monkeypatch.setattr(test_attention_mla, "max_num_contexts",
+                        max(batch, test_attention_mla.max_num_contexts))
+
+    scenario = Scenario(
+        dtype=dtype,
+        kv_cache_dtype=kv_cache_dtype,
+        num_layers=1,
+        num_heads=128,
+        num_kv_heads=128,
+    )
+    rope_config = _build_rope_config(scenario)
+
+    context_sequence_lengths = [kv - seq_q] * batch
+    # >=2 decode steps: step 1 warms + caches the tactic under autotune, step 2
+    # runs outside autotune and must reuse the cached tuned tactic.
+    num_generation_steps = 2
+
+    _run_test_for_backend(
+        "TRTLLM",
+        num_heads=scenario.num_heads,
+        num_kv_heads=scenario.num_kv_heads,
+        num_layers=scenario.num_layers,
+        q_lora_rank=scenario.q_lora_rank,
+        kv_lora_rank=scenario.kv_lora_rank,
+        qk_nope_head_dim=scenario.qk_nope_head_dim,
+        qk_rope_head_dim=scenario.qk_rope_head_dim,
+        v_head_dim=scenario.v_head_dim,
+        rope_config=rope_config,
+        kv_cache_tokens_per_block=scenario.kv_cache_tokens_per_block,
+        device=torch.device("cuda"),
+        dtype=scenario.dtype,
+        kv_cache_dtype=scenario.kv_cache_dtype,
+        context_sequence_lengths=context_sequence_lengths,
+        generation_seq_len_q=seq_q,
+        num_generation_steps=num_generation_steps,
+        v2_kv_cache=True,
+        skip_context_assert=True,
+        autotune_warmup=True,
+    )
+
+    expected = scenario.num_layers * num_generation_steps
     assert cute_dsl_decode_counter["calls"] == expected, (
         f"Expected {expected} CuTe DSL MLA decode dispatches, got "
         f"{cute_dsl_decode_counter['calls']} (silent TRTLLM fallback?)"

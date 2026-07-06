@@ -10,6 +10,7 @@ import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.interface import (
     AttentionInputType, MLAParams, PositionalEmbeddingParams, RopeParams)
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
@@ -375,7 +376,6 @@ scenarios = [
 
 accuracy_dict = {
     torch.bfloat16: (3e-2, 3e-3),
-    torch.float16: (3e-2, 3e-3),
     torch.float8_e4m3fn: (4e-1, 4e-2),
 }
 
