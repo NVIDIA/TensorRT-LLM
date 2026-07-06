@@ -1127,7 +1127,8 @@ def create_input_processor_with_hash(
         # Extract optional UUIDs (can be None, or dict with same structure as mm_data)
         mm_uuids = inputs.get('multi_modal_uuids', None)
 
-        mm_hashes, mm_uuid_list = apply_mm_hashes(mm_data, mm_uuids, hash_lib)
+        mm_hashes, mm_uuids_by_key = apply_mm_hashes(mm_data, mm_uuids,
+                                                     hash_lib)
 
         prompt_token_ids, extra_processed_inputs = input_processor(
             inputs, sampling_params)
@@ -1220,6 +1221,22 @@ def create_input_processor_with_hash(
         else:
             mm_hashes_flat = [
                 h for hashes in mm_hashes.values() for h in hashes
+            ]
+        # `MultimodalInput.multimodal_uuids` is a flat list that must index in
+        # lockstep with `multimodal_hashes`; project the per-modality UUID
+        # dict through the same prompt-order manifest so cache-event UUIDs
+        # attach to the correct item. Only meaningful when the caller
+        # supplied UUIDs; otherwise pass through None.
+        if mm_uuids_by_key is None:
+            mm_uuid_list = None
+        elif mm_item_order:
+            mm_uuid_list = [
+                mm_uuids_by_key[e["modality"]][e["index"]]
+                for e in mm_item_order
+            ]
+        else:
+            mm_uuid_list = [
+                u for uuids in mm_uuids_by_key.values() for u in uuids
             ]
         validate_mm_inputs(prompt_token_ids, mm_hashes_flat, start_positions,
                            num_mm_tokens)
