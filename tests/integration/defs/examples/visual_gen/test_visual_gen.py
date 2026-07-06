@@ -235,9 +235,13 @@ def _visual_gen_deps(llm_venv):
     """Install av + diffusers + ffmpeg once per session (shared by all video-gen fixtures)."""
     llm_venv.run_cmd(["-m", "pip", "install", "av"])
     llm_venv.run_cmd(["-m", "pip", "install", "diffusers>=0.37.0"])
-    # Install ffmpeg system package required by save_video() for MP4 encoding
-    check_call(["apt-get", "update", "-y"], shell=False)
-    check_call(["apt-get", "install", "-y", "ffmpeg"], shell=False)
+    if shutil.which("ffmpeg"):
+        return
+    # apt-get needs root; add `sudo` when the test harness is running as an
+    # unprivileged user (e.g. LOCAL_USER=1 dev containers) but sudo is available.
+    prefix = [] if os.geteuid() == 0 else ["sudo", "-n"]
+    check_call([*prefix, "apt-get", "update", "-y"], shell=False)
+    check_call([*prefix, "apt-get", "install", "-y", "ffmpeg"], shell=False)
 
 
 @pytest.fixture(scope="session")

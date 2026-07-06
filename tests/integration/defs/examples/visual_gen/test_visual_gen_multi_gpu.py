@@ -38,6 +38,7 @@ from defs.examples.visual_gen.test_visual_gen import (
     _run_lpips_eval,
     _run_wan_lpips_pipeline,
     _save_lpips_video_mp4,
+    _visual_gen_deps,
 )
 
 try:
@@ -164,7 +165,7 @@ def _wan22_lpips_distributed_worker(rank: int, world_size: int, **kwargs) -> Non
         dist.barrier()
 
 
-def _run_wan22_t2v_lpips_case(tmp_path, variant_name, parallel):
+def _run_wan22_t2v_lpips_case(_visual_gen_deps, tmp_path, variant_name, parallel):
     _skip_if_insufficient_gpus_for_parallel(parallel)
     parallel_cfg = ParallelConfig(**parallel)
     generated_path = tmp_path / f"wan22_t2v_generated_{variant_name}.mp4"
@@ -206,8 +207,8 @@ def _run_wan22_t2v_lpips_case(tmp_path, variant_name, parallel):
     WAN22_LPIPS_MULTI_GPU_VARIANTS,
     ids=[name for name, _ in WAN22_LPIPS_MULTI_GPU_VARIANTS],
 )
-def test_wan22_t2v_lpips_against_golden_multi_gpu(tmp_path, variant_name, parallel):
-    _run_wan22_t2v_lpips_case(tmp_path, variant_name, parallel)
+def test_wan22_t2v_lpips_against_golden_multi_gpu(_visual_gen_deps, tmp_path, variant_name, parallel):
+    _run_wan22_t2v_lpips_case(_visual_gen_deps, tmp_path, variant_name, parallel)
 
 
 @pytest.mark.parametrize(
@@ -215,5 +216,5 @@ def test_wan22_t2v_lpips_against_golden_multi_gpu(tmp_path, variant_name, parall
     WAN22_LPIPS_TP_VARIANTS,
     ids=[name for name, _ in WAN22_LPIPS_TP_VARIANTS],
 )
-def test_wan22_t2v_lpips_against_golden_tp(tmp_path, variant_name, parallel):
-    _run_wan22_t2v_lpips_case(tmp_path, variant_name, parallel)
+def test_wan22_t2v_lpips_against_golden_tp(_visual_gen_deps, tmp_path, variant_name, parallel):
+    _run_wan22_t2v_lpips_case(_visual_gen_deps, tmp_path, variant_name, parallel)
