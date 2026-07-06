@@ -38,6 +38,7 @@ from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.media_io import BaseMediaIO
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
+from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import MultimodalEncoder, SchedulingParams, tracing
@@ -201,6 +202,19 @@ class OpenAIServer(_VideoRoutesMixin):
         self.metadata_server = create_metadata_server(metadata_server_cfg)
         self.disagg_cluster_config = disagg_cluster_config
         self.multimodal_server_config = multimodal_server_config
+        # Seed media-IO decode defaults from the model's input processor, then
+        # let the server's --media_io_kwargs win (per-request kwargs still
+        # override at request time).
+        ip = getattr(self.generator, "input_processor", None)
+        if isinstance(ip, BaseMultimodalInputProcessor):
+            model_pref = ip.get_preferred_media_io_kwargs() or {}
+            if model_pref:
+                cfg = self.multimodal_server_config or MultimodalServerConfig()
+                merged = {m: dict(kw) for m, kw in model_pref.items()}
+                for modality, kw in (cfg.media_io_kwargs or {}).items():
+                    merged.setdefault(modality, {}).update(kw)
+                cfg.media_io_kwargs = merged
+                self.multimodal_server_config = cfg
         self.allow_request_chat_template = allow_request_chat_template
         self.server_role = server_role
         # Will be set in __call__

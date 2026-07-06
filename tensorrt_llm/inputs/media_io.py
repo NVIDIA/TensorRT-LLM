@@ -84,7 +84,7 @@ _SUPPORTED_IMAGE_FORMATS = ("pt", "pil")
 
 # Output representations supported by `VideoMediaIO`. See
 # `_load_video_by_cv2` for the per-format contract.
-_SUPPORTED_VIDEO_FORMATS = ("pt", "hwc_uint8", "pil")
+_SUPPORTED_VIDEO_FORMATS = ("pt", "np", "pil")
 
 # Module-level aiohttp session shared across all media fetch calls.
 # Created lazily on first use inside the async event loop, then reused so that
@@ -412,16 +412,13 @@ def _load_video_by_cv2(
     available should spill to a tempfile themselves and pass a path.
 
     `format` controls the per-frame return type:
-      `"pt"`        - list[torch.Tensor], dtype=float32, shape=(C, H, W),
-                      range [0, 1]. Frames are rescaled and permuted to
-                      CHW inside this function.
-      `"hwc_uint8"` - list[np.ndarray], dtype=uint8, shape=(H, W, 3).
-                      Frames are returned unchanged from the cv2 decode;
-                      rescale and permute are deferred to the downstream
-                      HF processor (its `do_rescale=True` path).
-      `"pil"`       - list[PIL.Image], one per sampled frame.
+      `"pt"`    - list[torch.Tensor], dtype=float32, shape=(C, H, W), range
+                  [0, 1]; rescaled and permuted to CHW here.
+      `"np"` - list[np.ndarray], dtype=uint8, shape=(H, W, 3); returned as
+                  decoded, leaving rescale/permute to the HF processor.
+      `"pil"`   - list[PIL.Image], one per sampled frame.
     """
-    assert format in ("pt", "hwc_uint8", "pil"), "format must be one of 'pt', 'hwc_uint8', 'pil'"
+    assert format in ("pt", "np", "pil"), "format must be one of 'pt', 'np', 'pil'"
 
     # Open the source. Two cases:
     #   (a) `video` is a file path / URL str -> hand it straight to cv2.
@@ -499,9 +496,8 @@ def _load_video_by_cv2(
             if device != "cpu":
                 tensor_nchw = tensor_nchw.to(device)
             loaded_frames = list(torch.unbind(tensor_nchw, dim=0))
-        elif format == "hwc_uint8":
-            # Return uint8 HWC frames as-is; let the downstream HF processor
-            # handle this internally.
+        elif format == "np":
+            # uint8 HWC frames as-is; the HF processor rescales/permutes.
             loaded_frames = [raw_frames[i] for i in valid_indices]
         else:  # "pil"
             loaded_frames = [Image.fromarray(raw_frames[i]) for i in valid_indices]
@@ -714,13 +710,13 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
         self,
         num_frames: int = 10,
         fps: int = 30,
-        format: str = "hwc_uint8",
+        format: str = "pt",
         device: str = "cpu",
         extract_audio: bool = False,
     ) -> None:
-        # Default format is `"hwc_uint8"`: frames are returned as uint8 HWC
-        # and the downstream HF processor handles rescale + permute. Pass
-        # `format="pt"` to get pre-rescaled float32 CHW tensors instead.
+        # `"pt"` is the safe default every video model handles; models tuned
+        # for the uint8-HWC path opt into `"np"` via
+        # InputProcessor.get_preferred_media_io_kwargs().
         if format not in _SUPPORTED_VIDEO_FORMATS:
             raise ValueError(f"format must be one of {_SUPPORTED_VIDEO_FORMATS}, got {format!r}")
         self._num_frames = num_frames

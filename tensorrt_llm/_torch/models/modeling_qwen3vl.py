@@ -397,6 +397,11 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             )
         return self.get_num_tokens_per_video(video=video, video_grid_thw=vgt)
 
+    def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
+        # uint8 HWC frames let the HF processor rescale/permute once, skipping
+        # the per-frame CHW-float conversion in the IO loader.
+        return {"video": {"format": "np"}}
+
     def build_disagg_prefill_multimodal_inputs(
         self, inputs: TextPrompt, mm_handles: List[Dict[str, Any]]
     ) -> DisaggPrefillMultimodalInputs:
