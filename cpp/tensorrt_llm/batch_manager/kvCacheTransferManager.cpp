@@ -15,8 +15,6 @@
  * limitations under the License.
  */
 
-#include <algorithm>
-#include <chrono>
 #include <cstdint>
 #include <cstring>
 
@@ -450,7 +448,6 @@ void KVCacheTransferManager::diskWriterLoop()
             }
             job = std::move(mDiskWriteQueue.front());
             mDiskWriteQueue.pop();
-            mProfQueuePeak = std::max(mProfQueuePeak, mDiskWriteQueue.size() + 1);
         }
         mDiskQueueCv.notify_all(); // a producer may be blocked waiting for queue space
 
@@ -489,8 +486,6 @@ void KVCacheTransferManager::diskWriterLoop()
                     mCompletedSpills.push_back(job.spillId);
                 }
             }
-            ++mProfSpills;
-            reportDiskProfLocked();
         }
         mDiskQueueCv.notify_all();    // wake a producer waiting to re-write this slot
         mDiskInflightCv.notify_all(); // wake a loader waiting on this slot
@@ -538,7 +533,6 @@ void KVCacheTransferManager::enqueueDiskWriteUnstaged(
     {
         std::unique_lock<std::mutex> lock(mDiskMutex);
         // Same backpressure + per-slot serialization as enqueueDiskWrite.
-        auto const t0 = std::chrono::steady_clock::now();
         mDiskQueueCv.wait(lock,
             [this, &job]
             {
@@ -546,14 +540,6 @@ void KVCacheTransferManager::enqueueDiskWriteUnstaged(
                            && mDiskInflight.find(job.filename) == mDiskInflight.end())
                     || mDiskWriterStop;
             });
-        auto const blkNs
-            = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
-        if (blkNs > 100000)
-        {
-            ++mProfEnqBlkCount;
-            mProfEnqBlkTotNs += static_cast<std::uint64_t>(blkNs);
-            mProfEnqBlkMaxNs = std::max<std::uint64_t>(mProfEnqBlkMaxNs, static_cast<std::uint64_t>(blkNs));
-        }
         if (mDiskWriterStop)
         {
             return;
@@ -572,57 +558,15 @@ std::vector<std::uint64_t> KVCacheTransferManager::drainCompletedSpills()
     return out;
 }
 
-void KVCacheTransferManager::reportDiskProfLocked()
-{
-    auto const now = std::chrono::steady_clock::now();
-    if (mProfLast.time_since_epoch().count() == 0)
-    {
-        mProfLast = now;
-        return;
-    }
-    auto const sec = std::chrono::duration_cast<std::chrono::seconds>(now - mProfLast).count();
-    if (sec < 5)
-    {
-        return;
-    }
-    auto const ms = [](std::uint64_t ns) { return static_cast<double>(ns) / 1.0e6; };
-    TLLM_LOG_INFO(
-        "[disk-prof] %llds spills=%zu qpeak=%zu | enqBlk n=%zu tot=%.0fms max=%.0fms | "
-        "load calls=%zu waited=%zu tot=%.0fms max=%.0fms",
-        static_cast<long long>(sec), mProfSpills, mProfQueuePeak, mProfEnqBlkCount, ms(mProfEnqBlkTotNs),
-        ms(mProfEnqBlkMaxNs), mProfLoadCalls, mProfLoadWaitCount, ms(mProfLoadWaitTotNs), ms(mProfLoadWaitMaxNs));
-    mProfSpills = 0;
-    mProfQueuePeak = 0;
-    mProfEnqBlkCount = 0;
-    mProfEnqBlkTotNs = 0;
-    mProfEnqBlkMaxNs = 0;
-    mProfLoadCalls = 0;
-    mProfLoadWaitCount = 0;
-    mProfLoadWaitTotNs = 0;
-    mProfLoadWaitMaxNs = 0;
-    mProfLast = now;
-}
-
 void KVCacheTransferManager::waitForDiskSlotWrites(std::string const& filename)
 {
     std::unique_lock<std::mutex> lock(mDiskMutex);
-    auto const t0 = std::chrono::steady_clock::now();
     mDiskInflightCv.wait(lock,
         [this, &filename]
         {
             auto it = mDiskInflight.find(filename);
             return it == mDiskInflight.end() || it->second <= 0;
         });
-    auto const wns
-        = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
-    ++mProfLoadCalls;
-    if (wns > 100000)
-    {
-        ++mProfLoadWaitCount;
-        mProfLoadWaitTotNs += static_cast<std::uint64_t>(wns);
-        mProfLoadWaitMaxNs = std::max<std::uint64_t>(mProfLoadWaitMaxNs, static_cast<std::uint64_t>(wns));
-    }
-    reportDiskProfLocked();
 }
 
 void KVCacheTransferManager::spillToFile(BlockPtr const& srcHostBlock, SizeType32 diskSlot,
