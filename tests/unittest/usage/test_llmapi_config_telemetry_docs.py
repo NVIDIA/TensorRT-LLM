@@ -15,6 +15,8 @@
 
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -164,6 +166,25 @@ def test_manifest_generator_main_propagates_generation_failure(monkeypatch):
     monkeypatch.setattr(generator, "_render_manifest", _fail_generation)
     with pytest.raises(RuntimeError, match="synthetic generation failure"):
         generator.main([])
+
+
+def test_manifest_generator_subprocess_resolves_local_source_without_pythonpath():
+    manifest_path = _repo_root() / "tensorrt_llm/usage/llm_args_golden_manifest.json"
+    committed = manifest_path.read_bytes()
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+
+    result = subprocess.run(
+        [sys.executable, "-I", "scripts/generate_llm_args_golden_manifest.py", "--check"],
+        cwd=_repo_root(),
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert manifest_path.read_bytes() == committed
 
 
 def test_build_capture_manifest_matches_committed_golden():

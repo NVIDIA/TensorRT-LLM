@@ -23,10 +23,13 @@ import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
-from tensorrt_llm.usage.llmapi_config import golden_manifest
-
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+_SOURCE_ROOT = Path(os.environ.get("TRTLLM_MANIFEST_SOURCE_ROOT", str(_REPO_ROOT))).resolve()
 _DEFAULT_MANIFEST_PATH = _REPO_ROOT / "tensorrt_llm/usage/llm_args_golden_manifest.json"
+if str(_SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SOURCE_ROOT))
+
+from tensorrt_llm.usage.llmapi_config import golden_manifest  # noqa: E402
 
 
 def _render_manifest() -> str:
