@@ -7671,6 +7671,8 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
             task = MMLU(model_name)
             task.evaluate(llm)
+            task = GSM8K(model_name)
+            task.evaluate(llm)
 
 
 @skip_pre_blackwell
