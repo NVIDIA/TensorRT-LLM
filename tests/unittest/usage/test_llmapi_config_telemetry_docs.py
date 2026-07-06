@@ -54,10 +54,6 @@ def _load_manifest_generator() -> ModuleType:
     return module
 
 
-def _golden_path() -> Path:
-    return _repo_root() / "tensorrt_llm/usage/llm_args_golden_manifest.json"
-
-
 def _sample_manifest() -> dict[str, list[dict[str, object]]]:
     # Keep both mapping levels unsorted so the test exercises recursive key sorting.
     return {
@@ -177,10 +173,8 @@ def test_build_capture_manifest_matches_committed_golden():
     ('field X now phones home') must be a deliberate, privacy-reviewed golden
     update committed in the same change.
     """
-    from tensorrt_llm.usage.llmapi_config import golden_manifest
-
-    golden = json.loads(_golden_path().read_text())
-    assert golden_manifest() == golden
+    generator = _load_manifest_generator()
+    assert generator.main(["--check"]) == 0
 
 
 def test_load_generator_does_not_leak_sys_modules():
