@@ -58,6 +58,15 @@ def _load_manifest_generator() -> ModuleType:
     return module
 
 
+def _load_release_check() -> ModuleType:
+    module_path = _repo_root() / "scripts/release_check.py"
+    spec = importlib.util.spec_from_file_location("release_check", module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def _sample_manifest() -> dict[str, list[dict[str, object]]]:
     # Keep both mapping levels unsorted so the test exercises recursive key sorting.
     return {
@@ -203,6 +212,77 @@ def test_manifest_generator_subprocess_resolves_local_source_without_pythonpath(
 
     assert result.returncode == 0, result.stderr
     assert manifest_path.read_text() == committed
+
+
+def test_manifest_generator_subprocess_prefers_checkout_over_shadow_package(tmp_path):
+    checkout = tmp_path / "checkout"
+    script_path = checkout / "scripts/generate_llm_args_golden_manifest.py"
+    checkout_usage = checkout / "tensorrt_llm/usage"
+    shadow = tmp_path / "shadow"
+    shadow_usage = shadow / "tensorrt_llm/usage"
+    script_path.parent.mkdir(parents=True)
+    checkout_usage.mkdir(parents=True)
+    shadow_usage.mkdir(parents=True)
+
+    source_script = _repo_root() / "scripts/generate_llm_args_golden_manifest.py"
+    script_path.write_bytes(source_script.read_bytes())
+    for usage_package in (checkout_usage, shadow_usage):
+        (usage_package.parent / "__init__.py").write_text("")
+        (usage_package / "__init__.py").write_text("")
+    checkout_usage.joinpath("llmapi_config.py").write_text(
+        "def golden_manifest():\n    return {'source': 'checkout'}\n"
+    )
+    shadow_usage.joinpath("llmapi_config.py").write_text(
+        "def golden_manifest():\n    return {'source': 'shadow'}\n"
+    )
+    manifest_path = checkout_usage / "llm_args_golden_manifest.json"
+    committed = json.dumps({"source": "checkout"}, indent=2, sort_keys=True) + "\n"
+    manifest_path.write_text(committed)
+
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join((str(shadow), str(checkout)))
+    environment.pop("TRTLLM_MANIFEST_SOURCE_ROOT", None)
+
+    result = subprocess.run(
+        [sys.executable, str(script_path), "--check"],
+        cwd=checkout,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert manifest_path.read_text() == committed
+
+
+def test_release_check_skips_runtime_manifest_hook_and_preserves_existing_skip(monkeypatch):
+    from types import SimpleNamespace
+
+    release_check = _load_release_check()
+    captured_environment = None
+
+    def _run_cmd(_command):
+        return SimpleNamespace(stdout="Total lines skipped (#nosec): 0\n")
+
+    def _run_precommit(_command, *, env=None):
+        nonlocal captured_environment
+        captured_environment = env
+
+    monkeypatch.setattr(release_check, "run_cmd", _run_cmd)
+    monkeypatch.setattr(release_check, "run_precommit_with_timing", _run_precommit)
+    monkeypatch.setattr(sys, "argv", ["release_check.py", "--all-files"])
+    monkeypatch.setenv("SKIP", "existing-hook")
+    monkeypatch.chdir(_repo_root())
+
+    release_check.main()
+
+    assert captured_environment is not None
+    assert captured_environment["SKIP"].split(",") == [
+        "existing-hook",
+        "generate-llm-args-golden-manifest",
+    ]
+    assert os.environ["SKIP"] == "existing-hook"
 
 
 def _manifest_definition_source_paths() -> set[str]:

@@ -75,6 +75,8 @@ python3 scripts/generate_llm_args_golden_manifest.py --check
 
 Canonical output is `json.dumps(golden_manifest(), indent=2, sort_keys=True) + "\n"`. Internal functions accept an explicit `Path` so tests can use `tmp_path`; the public CLI always targets the repository manifest and does not expose an arbitrary output option.
 
+Before importing TensorRT-LLM, the generator resolves its selected source root, removes duplicate occurrences from `sys.path`, and inserts that root at index zero. This makes the checkout containing the generator authoritative even when `PYTHONPATH` already contains the same checkout after a stale or shadow package. `TRTLLM_MANIFEST_SOURCE_ROOT` remains available for the prepared compatibility environment, where the installed dependency closure is overlaid with the current checkout's manifest-defining sources.
+
 Write mode compares content before writing. If content differs, it writes a sibling temporary file and atomically replaces the manifest. If content is already current, it performs no write. It exits successfully after a rewrite and relies on pre-commit's modified-file detection to stop the commit.
 
 Check mode never writes. It exits zero when current and nonzero when stale, printing a concise unified diff between committed and generated text. Expected file-I/O failures produce a concise error and nonzero exit; unexpected import or generation failures propagate with their traceback. Both cases leave the committed file unchanged.
@@ -100,7 +102,9 @@ Add a local `language: system` hook with `pass_filenames: false`. The hook invok
 - `tensorrt_llm/usage/llmapi_config.py`
 - `tensorrt_llm/usage/llm_args_golden_manifest.json`
 
-The telemetry-docs test derives the live definition closure from both root model graphs, including nested models, annotation types, model bases, and enum metaclasses, and asserts that every current repository path matches the hook expression. If the active environment cannot import the required TensorRT-LLM dependencies, the hook fails rather than silently skipping. Unrelated commits do not run the hook. Drift from a newly introduced dependency that has not yet joined the derived closure is still caught in a normal full premerge run, and whenever the A10 PyTorch block is selected; explicitly filtered CI runs are outside this guarantee.
+The telemetry-docs test derives the live definition closure from both root model graphs, including nested models, annotation types, model bases, and enum metaclasses, and asserts that every current repository path matches the hook expression. If the active development environment cannot import the required TensorRT-LLM dependencies, the hook fails rather than silently skipping. Unrelated commits do not run the hook. Drift from a newly introduced dependency that has not yet joined the derived closure is still caught in a normal full premerge run, and whenever the A10 PyTorch block is selected; explicitly filtered CI runs are outside this guarantee.
+
+The repository's Release-Check job runs in a lightweight Go image and installs only the pre-commit, bandit, and mypy dependencies. It therefore preserves any caller-provided `SKIP` value and adds `generate-llm-args-golden-manifest` before launching pre-commit. The mapped A10 PyTorch unit test, which runs with the TensorRT-LLM runtime dependency closure, is the authoritative read-only premerge enforcement. This split keeps automatic local regeneration while avoiding a false Release-Check failure before the A10 gate runs.
 
 The hook never stages files. When it rewrites the manifest, the normal workflow is: review the generated diff, stage it, and commit again.
 
@@ -136,6 +140,8 @@ Generator-focused tests cover:
 - Check-mode success for current content.
 - Check-mode nonzero result and unified diff for stale content.
 - Preservation of the prior target when generation or writing fails.
+- Checkout source precedence over a shadow package earlier on `PYTHONPATH`.
+- Release-Check hook skipping without clobbering an existing `SKIP` value.
 
 End-to-end validation covers:
 
@@ -150,6 +156,7 @@ End-to-end validation covers:
 
 - `.pre-commit-config.yaml`
 - `scripts/generate_llm_args_golden_manifest.py` (new)
+- `scripts/release_check.py`
 - `tensorrt_llm/usage/llm_args_golden_manifest.json`
 - `tensorrt_llm/usage/schemas/README.md`
 - `tests/integration/test_lists/test-db/l0_a10.yml`
@@ -165,6 +172,7 @@ No public API signature, runtime telemetry payload contract, or manifest-selecti
 - A stale committed manifest fails A10 premerge with an actionable diff.
 - The regenerated current-tree manifest passes the gate and receives privacy CODEOWNER review.
 - Unrelated commits do not invoke the heavy generator hook.
+- Lightweight Release-Check runs skip the runtime-dependent hook, while A10 premerge still executes the read-only drift gate.
 
 ## Rejected alternatives
 

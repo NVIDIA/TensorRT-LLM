@@ -15,10 +15,13 @@
 # limitations under the License.
 
 import argparse
+import os
 import re
 import subprocess as sp
 import sys
 import time
+
+_RELEASE_CHECK_SKIPPED_PRECOMMIT_HOOKS = ("generate-llm-args-golden-manifest", )
 
 
 def run_cmd(cmd):
@@ -35,12 +38,13 @@ def run_cmd(cmd):
     return result
 
 
-def run_precommit_with_timing(cmd):
+def run_precommit_with_timing(cmd, *, env=None):
     """Run pre-commit with timing information for each hook.
 
     Args:
         cmd: Command as a list of arguments (passed directly to Popen
              without shell=True, avoiding ARG_MAX limits).
+        env: Optional subprocess environment.
     """
 
     print("Running pre-commit checks with performance monitoring...")
@@ -62,6 +66,7 @@ def run_precommit_with_timing(cmd):
     process = sp.Popen(cmd,
                        stdout=sp.PIPE,
                        stderr=sp.STDOUT,
+                       env=env,
                        text=True,
                        bufsize=1,
                        universal_newlines=True)
@@ -150,6 +155,20 @@ def run_precommit_with_timing(cmd):
     return Result(returncode, ''.join(output_lines))
 
 
+def _release_check_environment():
+    """Return an environment for hooks supported by Release-Check's image."""
+    environment = os.environ.copy()
+    skipped_hooks = [
+        hook.strip() for hook in environment.get("SKIP", "").split(",")
+        if hook.strip()
+    ]
+    for hook in _RELEASE_CHECK_SKIPPED_PRECOMMIT_HOOKS:
+        if hook not in skipped_hooks:
+            skipped_hooks.append(hook)
+    environment["SKIP"] = ",".join(skipped_hooks)
+    return environment
+
+
 def handle_check_failure(error_msg):
     """Handle check failures with consistent messaging."""
     print(f"\nError: {error_msg}")
@@ -219,7 +238,8 @@ def main():
 
     # Run pre-commit with performance monitoring
     try:
-        run_precommit_with_timing(precommit_cmd)
+        run_precommit_with_timing(precommit_cmd,
+                                  env=_release_check_environment())
     except SystemExit:
         handle_check_failure("pre-commit checks failed")
 

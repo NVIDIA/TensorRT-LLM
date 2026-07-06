@@ -38,6 +38,7 @@ limitations under the License.
 ## File responsibility map
 
 - Create `scripts/generate_llm_args_golden_manifest.py`: canonical rendering, atomic write mode, read-only check mode, unified drift output, CLI exit codes.
+- Modify `scripts/release_check.py`: preserve existing skipped hooks and exclude the runtime-dependent generator from the lightweight Release-Check image.
 - Modify `tests/unittest/usage/test_llmapi_config_telemetry_docs.py`: focused generator tests and the committed-golden privacy gate.
 - Modify `tensorrt_llm/usage/llm_args_golden_manifest.json`: generated current-tree privacy surface only.
 - Modify `.pre-commit-config.yaml`: scoped `language: system` mutating hook.
@@ -45,6 +46,8 @@ limitations under the License.
 - Modify `tests/integration/test_lists/test-db/l0_a10.yml`: one A10 PyTorch premerge enrollment.
 
 No runtime API, telemetry selection rule, schema, or payload behavior changes.
+
+Council follow-up adds two hardening requirements to the implementation: the generator must always import from its selected checkout even when a shadow package precedes it on `PYTHONPATH`, and Release-Check must skip the generator hook because that job does not install the TensorRT-LLM runtime dependency closure. The A10 test remains the authoritative read-only premerge gate.
 
 ### Task 1: Build the deterministic generator with unit tests
 
@@ -675,6 +678,17 @@ pre-commit run generate-llm-args-golden-manifest --all-files
 
 Expected: both exit zero and `git status --short` shows no new manifest modification.
 
+Also run the source-precedence and Release-Check regressions:
+
+```bash
+python3 -m pytest \
+  tests/unittest/usage/test_llmapi_config_telemetry_docs.py \
+  -k 'prefers_checkout_over_shadow_package or skips_runtime_manifest_hook' \
+  -q -p no:cacheprovider
+```
+
+Expected: both pass. The source-precedence case must select the checkout despite an earlier shadow package, and the Release-Check case must append the generator hook to an existing `SKIP` value without mutating the parent environment.
+
 - [ ] **Step 3: Reconfirm CI mapping and privacy ownership**
 
 ```bash
@@ -698,6 +712,7 @@ The CODEOWNERS search must show the manifest assigned to `@NVIDIA/trt-llm-oss-co
 pre-commit run --files \
   .pre-commit-config.yaml \
   scripts/generate_llm_args_golden_manifest.py \
+  scripts/release_check.py \
   tensorrt_llm/usage/llm_args_golden_manifest.json \
   tensorrt_llm/usage/schemas/README.md \
   tests/integration/test_lists/test-db/l0_a10.yml \
@@ -711,6 +726,7 @@ Expected: all applicable hooks pass and the branch diff has no whitespace errors
 git add \
   .pre-commit-config.yaml \
   scripts/generate_llm_args_golden_manifest.py \
+  scripts/release_check.py \
   tensorrt_llm/usage/llm_args_golden_manifest.json \
   tensorrt_llm/usage/schemas/README.md \
   tests/integration/test_lists/test-db/l0_a10.yml \
@@ -729,5 +745,5 @@ git log --oneline --decorate upstream/main..HEAD
 Expected:
 
 - The only untracked entry is the required `slop/` scratch symlink.
-- Tracked changes are limited to the design/plan documents and the six implementation files in the file map.
+- Tracked changes are limited to the design/plan documents and the seven implementation files in the file map.
 - Every new implementation commit contains a DCO sign-off and one concern.
