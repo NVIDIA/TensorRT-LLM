@@ -4,7 +4,7 @@
 import functools
 import itertools
 import math
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Type
 
 import torch
 
@@ -8238,8 +8238,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
     from ..cute_dsl_kernels.blackwell.attention.mla.mla_decode_fp16 import \
         BlackwellMultiHeadLatentAttentionForwardFP16
 
-    _CUTE_DSL_MLA_CLUSTER_SHAPE_MNK = (2, 1, 1)
-
     class CuteDSLNVMlaDecodeBlackwellRunner(TunableRunner):
         """Generic TunableRunner for the Blackwell CuTe DSL MLA decode kernels.
 
@@ -8264,6 +8262,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         tilers coexist without collisions.
         """
         kernel_cache = dict()
+        tuning_config_cache = dict()
+
+        cluster_shape_mnk = (2, 1, 1)
 
         # in_dtype -> kernel class. The kernels' own ``can_implement`` is
         # what ultimately rejects unsupported dtypes, but this lookup
@@ -8305,18 +8306,115 @@ if IS_CUTLASS_DSL_AVAILABLE:
         def unique_id(self):
             # `kernel_class` is derived from `in_dtype`, so dropping it
             # from the key keeps cache slots 1-to-1 with the in_dtype.
-            # The tilers are NOT here - they're part of the tactic and
-            # appended into the cache key inside ``forward``.
+            # The tilers, split_kv AND is_persistent are NOT here - they're
+            # part of the tactic (the AutoTuner profiles over them) and are
+            # appended into the compiled-kernel cache key inside ``forward``.
+            # Keeping is_persistent OUT of unique_id is what lets ON/OFF share
+            # ONE tuner slot so the AutoTuner can pick between them per shape.
             return (
                 self.in_dtype,
                 self.num_heads,
                 self.seq_len_q,
                 self.page_size,
-                self.is_persistent,
                 self.is_var_seq,
                 self.is_var_split_kv,
                 self.skip_correction_threshold,
             )
+        
+        @classmethod
+        def _get_max_active_blocks(cls) -> int:
+            """``max_active_clusters * cluster_shape[0]`` -- the occupancy ceiling
+            the split_kv heuristic divides. Queried once via HardwareInfo and
+            cached at class scope; must be populated by an eager warmup before
+            CUDA-graph capture (HardwareInfo cannot run during capture)."""
+            cached = getattr(cls, "_cute_dsl_max_active_blocks", None)
+            if cached is None:
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "CuteDSLNVMlaDecodeBlackwellRunner: max_active_blocks was "
+                        "not cached before CUDA graph capture (run an eager "
+                        "warmup first).")
+                cluster_product = (cls.cluster_shape_mnk[0] *
+                                   cls.cluster_shape_mnk[1] *
+                                   cls.cluster_shape_mnk[2])
+                max_active_clusters = cutlass.utils.HardwareInfo(
+                ).get_max_active_clusters(cluster_product)
+                cached = int(max_active_clusters) * cls.cluster_shape_mnk[0]
+                cls._cute_dsl_max_active_blocks = cached
+            return cached
+        
+        @staticmethod
+        def get_split_kv_candidates(B: int, S: int, max_active_blocks: int) -> List[int]:
+            # TODO: split_kv is not always the best choice. We need to optimize it.
+            max_split_kv = 32
+            blocks_per_batch= max(1, max_active_blocks // B // (S * 2))
+            split_kv = min(blocks_per_batch, max_split_kv)
+            return [split_kv]
+
+        @staticmethod
+        def get_is_persistent_candidates() -> List[bool]:
+            """``is_persistent`` values the AutoTuner profiles over (it is the
+            4th tactic element, NOT a fixed compile-time flag): the persistent
+            tile-scheduler wins at large effective batch (split_kv==1 many-tiles
+            regime) while non-persistent is ~1-2% faster at small batch, so
+            instead of a hard batch threshold we let the tuner pick the faster
+            variant per shape. True is listed first so it wins exact ties
+            (prior default)."""
+            return [True, False]
+
+        def default_is_persistent(self, batch_size: int) -> bool:
+            """is_persistent for the FALLBACK (default) tactic -- used whenever
+            the AutoTuner did not tune this shape (eager, cache miss, or no
+            ``with autotune()`` warmup). The tuner, when it DOES run, profiles
+            both variants (get_is_persistent_candidates) and overrides this. We
+            still want the small-batch win without relying on tuning, so the
+            default follows the A/B crossover: persistent OFF below the effective
+            -batch threshold (batch*seq_q), ON at/above it (split_kv==1 many
+            -tiles regime)."""
+            min_eff_batch = 128
+            return batch_size * self.seq_len_q >= min_eff_batch
+
+        @classmethod
+        def get_max_workspace_size(
+            cls,
+            H: int,
+            S: int,
+            D: int,
+            B: int,
+            acc_dtype: Type[cutlass.Numeric],
+        ) -> int:
+            """Workspace bytes the FMHA layer must allocate so that ANY split_kv
+            the AutoTuner may pick for this shape fits. The candidates are the
+            SAME ``get_split_kv_candidates`` the AutoTuner profiles over in
+            ``get_valid_tactics``, so the workspace is sized to exactly the
+            largest split the tuner can pick. Returns the max
+            ``get_workspace_size`` over those candidates (0 when the only
+            candidate is split_kv=1, i.e. no partials)."""
+            max_active_blocks = cls._get_max_active_blocks()
+
+            # cuda graph capture(B=8):   eager warmup N times  →  capture graph_8
+            # cuda graph capture(B=4):   eager warmup N times  →  capture graph_4
+            # cuda graph capture(B=2):   eager warmup N times  →  capture graph_2
+            # ...
+            # cuda graph replay
+            
+            # The latter graph capture with different batch size may have bigger workspace size, which will resize the workspace. 
+            # Then the workspace address of previsous captued graph will be invalid.
+            # So we need to return the max workspace size for all batch sizes.
+            
+            # workspace_size = B * H * S * split_kv * (D + 1) * acc_dtype.width // 8
+            # split_kv <= max_active_blocks // B // (S * 2) in get_split_kv_candidates
+            # workspace_size <= H * (max_active_blocks // 2) * (D + 1) * acc_dtype.width // 8
+            return H * (max_active_blocks // 2) * (D + 1) * acc_dtype.width // 8
+            
+            # max_workspace_size = 0
+            # split_kv_candidates = cls.get_split_kv_candidates(
+            #     B, S, max_active_blocks)
+            # for split_kv in split_kv_candidates:
+            #     workspace_size = BlackwellMultiHeadLatentAttentionForwardFP8.get_workspace_size(
+            #         H, S, D, B, split_kv, acc_dtype)
+            #     max_workspace_size = max(max_workspace_size, workspace_size)
+            # return max_workspace_size
 
         def get_valid_tactics(
             self,
@@ -8332,7 +8430,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if get_sm_version() not in (100, 103):
                 return []
             q_latent, q_rope, _c_latent, _c_rope, _page_table, cache_seqs, \
-                _block_split_kvs, o, *_rest = inputs
+                o, *_rest = inputs
             h, latent_dim, seq_len_q, _ = q_latent.shape
             rope_dim = q_rope.shape[1]
             batch_size = cache_seqs.shape[0]
@@ -8349,44 +8447,224 @@ if IS_CUTLASS_DSL_AVAILABLE:
             candidate_tiler_tactics = [
                 ((128, 128), (128, 256)),
             ]
+            # Tactic = (mma_qk, mma_pv, split_kv, is_persistent). The AutoTuner
+            # profiles every (tiler x split_kv x is_persistent) combo and keeps
+            # the fastest per shape. split candidates come from the SAME
+            # ``get_split_kv_candidates`` the workspace is sized for; is_persistent
+            # candidates from ``get_is_persistent_candidates`` (both variants, so
+            # the tuner -- not a hard batch threshold -- picks the faster).
+            max_active_blocks = self._get_max_active_blocks()
+            split_candidates = self.get_split_kv_candidates(
+                batch_size, seq_len_q, max_active_blocks)
+            persistent_candidates = self.get_is_persistent_candidates()
 
             valid = []
             for mma_qk_tiler_mn, mma_pv_tiler_mn in candidate_tiler_tactics:
-                if self.kernel_class.can_implement(
-                        batch_size,
-                        seq_len_q,
-                        self.page_size,
-                        h,
-                        latent_dim,
-                        rope_dim,
-                        self.in_dtype,  # in_dtype
-                        out_dtype,
-                        cutlass.Float32,  # acc_dtype
-                        cutlass.Float32,  # lse_dtype
-                        mma_qk_tiler_mn,
-                        mma_pv_tiler_mn,
-                        1,
-                        self.is_persistent,
-                        self.is_var_seq,
-                        self.is_var_split_kv,
-                        self.page_size,
-                ):
-                    valid.append((mma_qk_tiler_mn, mma_pv_tiler_mn))
-                else:
-                    logger.debug(
-                        "CuteDSLNVMlaDecodeBlackwellRunner.can_implement "
-                        "rejected tactic: kernel=%s in_dtype=%s "
-                        "H=%d L=%d R=%d S=%d B=%d page_size=%d "
-                        "mma_qk=%s mma_pv=%s persistent=%s var_seq=%s "
-                        "var_split=%s", self.kernel_class.__name__,
-                        self.in_dtype, h, latent_dim, rope_dim, seq_len_q,
-                        batch_size, self.page_size, mma_qk_tiler_mn,
-                        mma_pv_tiler_mn, self.is_persistent, self.is_var_seq,
-                        self.is_var_split_kv)
+                for split_kv in split_candidates:
+                    for is_persistent in persistent_candidates:
+                        if self.kernel_class.can_implement(
+                                batch_size,
+                                seq_len_q,
+                                self.page_size,
+                                h,
+                                latent_dim,
+                                rope_dim,
+                                self.in_dtype,  # in_dtype
+                                out_dtype,
+                                cutlass.Float32,  # acc_dtype
+                                cutlass.Float32,  # lse_dtype
+                                mma_qk_tiler_mn,
+                                mma_pv_tiler_mn,
+                                split_kv,
+                                is_persistent,
+                                self.is_var_seq,
+                                self.is_var_split_kv,
+                                self.page_size,
+                        ):
+                            valid.append((mma_qk_tiler_mn, mma_pv_tiler_mn,
+                                          split_kv, is_persistent))
+                        else:
+                            logger.debug(
+                                "CuteDSLNVMlaDecodeBlackwellRunner.can_implement "
+                                "rejected tactic: kernel=%s in_dtype=%s "
+                                "H=%d L=%d R=%d S=%d B=%d page_size=%d "
+                                "mma_qk=%s mma_pv=%s persistent=%s var_seq=%s "
+                                "var_split=%s", self.kernel_class.__name__,
+                                self.in_dtype, h, latent_dim, rope_dim,
+                                seq_len_q, batch_size, self.page_size,
+                                mma_qk_tiler_mn, mma_pv_tiler_mn, is_persistent,
+                                self.is_var_seq, self.is_var_split_kv)
             return valid
 
+        # MLA decode inputs (order MUST match the op / forward):
+        #   0 q_latent  1 q_rope  2 c_latent  3 c_rope  4 page_table
+        #   5 cache_seqs  6 o  7 lse  8 workspace
+        # batch is the ONLY free tuning dim (split_kv & is_persistent depend on
+        # it). It appears on inputs 0/1/4/5/6/7 at different dim indices.
+        #   q_latent/q_rope (H, D, S, B) -> dim 3;  cache_seqs (B,) -> dim 0;
+        #   o (H, D, S, B) -> dim 3;  lse (H, S, B) -> dim 2;
+        #   page_table is (max_blocks, B) -> batch is dim 1 (NOT dim 0; dim 0 is
+        #   max_blocks). Keying batch on page_table dim 0 mismatches the profiled
+        #   (batch-at-dim0) vs runtime (batch-at-dim1) shapes and made the op
+        #   miss the AutoTuner cache for every batch except B==max_blocks.
+        _BATCH_DIMS = ((0, 3), (1, 3), (4, 1), (5, 0), (6, 3), (7, 2))
+        _BATCH_FREE_INPUT = 5  # cache_seqs -- the free dynamic batch dim
+        # (input, dim) pairs whose SIZE is a static config quantity, NOT the
+        # per-request KV or the tactic, so they must NOT key the tactic cache:
+        #   page_table dim 0 = max_blocks = ceil(max_seq_len / page_size)
+        # A ConstraintSpec sets these to -1 in the profiling AND inference cache
+        # keys (so they never differentiate) while reconstructing the profiling
+        # tensor at its real size. page_table is already rebuilt for the batch
+        # dim, so excluding its max_blocks dim is free. (num_pages -- c_latent /
+        # c_rope dim 2, the whole-pool page count -- is likewise KV-irrelevant
+        # but is deliberately NOT specced here: it is constant within a run and
+        # those pool tensors are otherwise never reconstructed, so it already
+        # matches between profiling and inference; adding a spec would force a
+        # multi-hundred-MB pool realloc per profile for no keying benefit.)
+        _STATIC_SIZE_DIMS = ((4, 0), )
+
+        def _tuning_inputs_pre_hook(
+                self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+            """Fix up the RECONSTRUCTED profiling tensors so the decode kernel
+            both COMPILES and runs in-bounds during AutoTuner profiling.
+            ``_prepare_input_tensors`` rebuilds every tensor whose profile has a
+            DynamicDim (all the batch-carrying inputs: q_latent/q_rope/o/lse/
+            page_table/cache_seqs) via ``_create_tensor_like`` = a plain
+            row-major-CONTIGUOUS ``torch.rand`` tensor. That discards the
+            permuted views the real decode path passes, so the kernel's
+            ``from_dlpack(...).mark_layout_dynamic(leading_dim=k)`` (which asserts
+            stride[k] == 1) fails for EVERY tactic with
+            ``Expected strides[leading_dim] == 1, but got <seq_len_q>`` -> the
+            tuner finds no valid tactic and silently falls back to
+            ``default_tactic`` (so the tuned split_kv/is_persistent is never
+            used). Re-permute each rebuilt tensor back to the real layout:
+              q_latent/q_rope/o : [H, D, S_q, B], D (dim 1) innermost
+              lse               : [H, S_q, B],    H (dim 0) innermost
+              page_table        : [max_blocks, B], max_blocks (dim 0) innermost
+            (c_latent/c_rope have only StaticDims -> not rebuilt -> already real.)
+
+            page_table ALSO needs valid CONTENT: its dims are (StaticDim blocks,
+            DynamicDim batch), which misses ``_create_tensor_like``'s int32
+            row-repeat special case (that requires dim0 dynamic), so it is filled
+            with random garbage page ids -> we clamp them into the pool's page
+            range so the gather stays in-bounds. cache_seqs (1-D int32) is
+            likewise garbage -> overwrite with a fixed representative KV (2048)
+            clamped to the page_table block capacity so several K-tiles run and
+            the persistent-scheduler effect shows. The tactic (split_kv,
+            is_persistent) is KV-independent, so one representative KV is fine."""
+            inputs = list(inputs)
+
+            def _relayout(t, base_shape, permute_order):
+                # Allocate contiguous in ``base_shape`` then permute so the
+                # result has the same logical shape as ``t`` but the real
+                # (leading-dim-contiguous) strides; copy the reconstructed data.
+                out = torch.empty(base_shape, dtype=t.dtype,
+                                  device=t.device).permute(*permute_order)
+                out.copy_(t)
+                return out
+
+            # q_latent [H, D, S_q, B] <- (B, S_q, H, D).permute(2, 3, 1, 0)
+            H, d_latent, seq_len_q, batch = inputs[0].shape
+            inputs[0] = _relayout(inputs[0], (batch, seq_len_q, H, d_latent),
+                                  (2, 3, 1, 0))
+            d_rope = inputs[1].shape[1]
+            inputs[1] = _relayout(inputs[1], (batch, seq_len_q, H, d_rope),
+                                  (2, 3, 1, 0))  # q_rope
+            inputs[6] = _relayout(inputs[6], (batch, seq_len_q, H, d_latent),
+                                  (2, 3, 1, 0))  # o
+            inputs[7] = _relayout(inputs[7], (batch, seq_len_q, H),
+                                  (2, 1, 0))  # lse [H, S_q, B]
+
+            # page_table [max_blocks, B] <- (B, max_blocks).transpose(0, 1),
+            # with in-bounds page ids ([0, num_pages) from the c_latent pool).
+            page_table = inputs[4]
+            max_blocks = int(page_table.shape[0])
+            num_pages = int(inputs[2].shape[2])
+            pt_valid = (page_table.to(torch.long).abs() %
+                        num_pages).to(page_table.dtype)
+            pt_out = torch.empty((batch, max_blocks),
+                                 dtype=page_table.dtype,
+                                 device=page_table.device).transpose(0, 1)
+            pt_out.copy_(pt_valid)
+            inputs[4] = pt_out
+
+            cache_seqs = inputs[5]
+            if isinstance(cache_seqs, torch.Tensor) and cache_seqs.numel():
+                max_kv = max_blocks * self.page_size
+                kv = max(1, min(2048, max_kv))
+                inputs[5] = torch.full((cache_seqs.shape[0], ),
+                                       kv,
+                                       dtype=cache_seqs.dtype,
+                                       device=cache_seqs.device)
+            return inputs
+
         def get_tuning_config(self) -> TuningConfig:
-            return TuningConfig()
+            """Make the AutoTuner cache hit across batch sizes so the tuned
+            (split_kv, is_persistent) tactic is actually used (not the
+            default_tactic fallback). Without specs the profile keys on EVERY
+            dim of all 9 inputs, so a single mismatched shape misses -> falls
+            back. Here batch is the one free tuning dim: bucket it (power-of-2)
+            on cache_seqs and tie every other batch-carrying dim to it via
+            constraints, so any runtime batch maps to a profiled bucket. The KV
+            length lives in cache_seqs VALUES (not shapes) and is tactic
+            -irrelevant, so it does not key the cache. ``_STATIC_SIZE_DIMS``
+            (page_table's max_blocks) are excluded from the key too (constraint
+            -> -1) so a differing max_seq_len does not miss."""
+            key = self.unique_id()
+            cache = self.__class__.tuning_config_cache
+            if key not in cache:
+                free = self._BATCH_FREE_INPUT
+                constraint_dims = [
+                    (i, d) for (i, d) in self._BATCH_DIMS if i != free
+                ]
+                # Batch-carrying dims are tied to the free batch dim; static
+                # -size dims are reconstructed at their own real size (so the
+                # profiling tensor is valid) but excluded from the key.
+                batch_constraints = tuple(
+                    ConstraintSpec(i, d,
+                                   lambda shapes, _free=free: shapes[_free][0])
+                    for (i, d) in constraint_dims)
+                static_constraints = tuple(
+                    ConstraintSpec(
+                        i, d,
+                        lambda shapes, _i=i, _d=d: shapes[_i][_d])
+                    for (i, d) in self._STATIC_SIZE_DIMS)
+                cache[key] = TuningConfig(
+                    dynamic_tensor_specs=(DynamicTensorSpec(
+                        free,
+                        0,
+                        get_last_power_of_2_num_tokens_buckets,
+                        last_positive_power_of_2,
+                    ), ),
+                    constraint_specs=batch_constraints + static_constraints,
+                    inputs_pre_hook=self._tuning_inputs_pre_hook,
+                )
+            return cache[key]
+
+        def default_tactic(
+            self,
+            batch_size: int,
+        ) -> Tuple[Tuple[int, int], Tuple[int, int], int, bool]:
+            """Fallback 4-tuple tactic ``(mma_qk, mma_pv, split_kv,
+            is_persistent)`` for when the AutoTuner cache is not warmed and
+            ``choose_one`` returns its ``-1`` sentinel. ``forward`` requires a
+            length-4 tactic (split_kv AND is_persistent are sourced ONLY from
+            the tactic, so the split + kernel variant baked into the CUDA graph
+            are deterministic), so the op wrapper calls this to build a valid
+            default: the sole candidate tiler, the occupancy-derived split_kv
+            from ``get_split_kv_candidates`` (the split the workspace was sized
+            for), and the batch-based default is_persistent
+            (``default_is_persistent``: OFF below the effective-batch threshold,
+            ON above, per the A/B -- so the small-batch win holds even when the
+            AutoTuner did not tune this shape)."""
+            mma_qk_tiler_mn = (128, 128)
+            mma_pv_tiler_mn = (128, 256)
+            max_active_blocks = self._get_max_active_blocks()
+            split_candidates = self.get_split_kv_candidates(
+                batch_size, self.seq_len_q, max_active_blocks)
+            split_kv = split_candidates[-1] if split_candidates else 1
+            is_persistent = self.default_is_persistent(batch_size)
+            return (mma_qk_tiler_mn, mma_pv_tiler_mn, split_kv, is_persistent)
 
         def forward(
             self,
@@ -8395,19 +8673,25 @@ if IS_CUTLASS_DSL_AVAILABLE:
             **kwargs,
         ) -> Tuple[torch.Tensor, torch.Tensor]:
             (q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs,
-             block_split_kvs, o, lse, workspace) = inputs
-            split_kv = int(kwargs.get("split_kv", 1))
+             o, lse, workspace) = inputs
             softmax_scale = float(kwargs.get("softmax_scale", 1.0))
             output_scale = float(kwargs.get("output_scale", 1.0))
 
-            # Unpack the tactic produced by ``get_valid_tactics``. When
-            # AutoTuner isn't engaged (e.g. the FMHA library calls the op
-            # without ``choose_one``), tactic may be ``None`` -
-            # fall back to the default (128,128)/(128,256) shape.
-            if isinstance(tactic, tuple) and len(tactic) == 2:
-                mma_qk_tiler_mn, mma_pv_tiler_mn = tactic
-            else:
-                mma_qk_tiler_mn, mma_pv_tiler_mn = (128, 128), (128, 256)
+            # The tactic MUST be a 4-tuple ``(mma_qk, mma_pv, split_kv,
+            # is_persistent)``: split_kv AND is_persistent come ONLY from the
+            # tactic (never a kwarg/shape fallback), so the exact split + kernel
+            # variant chosen at warmup are the ones baked into the CUDA graph at
+            # capture. The op wrapper normalizes choose_one's result to a 4-tuple
+            # (it builds the default tactic when the tuner returns its -1
+            # fallback), so a non-4-tuple here is a real bug.
+            if not (isinstance(tactic, tuple) and len(tactic) == 4):
+                raise RuntimeError(
+                    "CuteDSLNVMlaDecodeBlackwellRunner.forward expected a 4-tuple "
+                    "tactic (mma_qk, mma_pv, split_kv, is_persistent), got "
+                    f"{tactic!r}.")
+            mma_qk_tiler_mn, mma_pv_tiler_mn, split_kv, is_persistent = tactic
+            split_kv = int(split_kv)
+            is_persistent = bool(is_persistent)
             mma_qk_tiler_mn = tuple(mma_qk_tiler_mn)
             mma_pv_tiler_mn = tuple(mma_pv_tiler_mn)
 
@@ -8421,17 +8705,27 @@ if IS_CUTLASS_DSL_AVAILABLE:
             else:
                 out_dtype = self.in_dtype
 
+            # split_kv is part of the key: ``_compute_grid`` bakes the launch
+            # grid from it at compile time, so each split_kv needs its own
+            # compiled kernel (the AutoTuner compiles one per candidate during
+            # warmup). split_kv == 1 vs > 1 also flips the workspace path below.
+            # is_persistent is now a tactic element (not in unique_id), so it
+            # MUST be in the compiled-kernel cache key -- ON/OFF are distinct
+            # compiled kernels (the persistent tile-scheduler const-folds its
+            # grid/loop from it).
             cache_key = self.unique_id() + (
                 out_dtype,
                 mma_qk_tiler_mn,
-                mma_pv_tiler_mn
+                mma_pv_tiler_mn,
+                split_kv,
+                is_persistent,
             )
             if cache_key not in CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache:
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
-                    _CUTE_DSL_MLA_CLUSTER_SHAPE_MNK[0] *
-                    _CUTE_DSL_MLA_CLUSTER_SHAPE_MNK[1] *
-                    _CUTE_DSL_MLA_CLUSTER_SHAPE_MNK[2])
+                    self.cluster_shape_mnk[0] *
+                    self.cluster_shape_mnk[1] *
+                    self.cluster_shape_mnk[2])
 
                 # Fold seq_len_q into the head dimension when the head count
                 # alone does not fill the MMA M tile (num_heads < M) and there
@@ -8450,7 +8744,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     max_active_clusters,
                     self.page_size,
                     self.skip_correction_threshold,
-                    self.is_persistent,
+                    is_persistent,
                     self.is_var_seq,
                     self.is_var_split_kv,
                     num_heads=self.num_heads,
@@ -8489,20 +8783,31 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             divisibility=(128 // out_dtype.width))
                 lse_ct = cute.runtime.from_dlpack(
                     lse, assumed_align=16).mark_layout_dynamic(leading_dim=0)
-                # An empty workspace means split_kv == 1: the kernel's
-                # initialize_workspace builds the acc_o/acc_lse accumulators iff
-                # ``workspace is not None`` (regardless of split_kv), so a
-                # non-None but zero-sized workspace makes it write the partials
-                # into a 0-byte buffer (illegal global write). Pass None so the
-                # split_kv kernel writes the final result straight into ``o``.
+                # split_kv == 1 -> no partials: the kernel's initialize_workspace
+                # builds the acc_o/acc_lse accumulators iff ``workspace is not
+                # None``, so for split_kv == 1 we MUST pass None (write the final
+                # result straight into ``o``). For split_kv > 1 the caller
+                # over-allocates the workspace to the max tuned split, so the
+                # kernel (which sizes its partials from the runtime split_kv)
+                # uses only a prefix -- a larger buffer is safe.
+                use_workspace = split_kv > 1 and workspace.numel() > 0
+                # assumed_align=32 (matching the standalone kernel's workspace)
+                # lets the compiler emit 256-bit (STG.E.256) stores for the
+                # split-KV partial accumulators instead of 128-bit. Without it
+                # the split_kv>1 decode kernel (small batch) writes partials in
+                # 64x128-bit stores vs 32x256-bit, the sole SASS divergence from
+                # the standalone kernel and the small-batch perf gap. The
+                # workspace is a fresh torch buffer (>=256B aligned), so a 32B
+                # hint is always valid.
                 workspace_ct = (cute.runtime.from_dlpack(
-                    workspace, assumed_align=16).mark_layout_dynamic()
-                                if workspace.numel() > 0 else None)
+                    workspace, assumed_align=32).mark_layout_dynamic()
+                                if use_workspace else None)
                 cache_seqs_ct = cute.runtime.from_dlpack(
                     cache_seqs, assumed_align=16).mark_layout_dynamic()
-                block_split_kvs_ct = (cute.runtime.from_dlpack(
-                    block_split_kvs, assumed_align=16).mark_layout_dynamic()
-                                      if self.is_var_split_kv else None)
+                # Variable split-KV (block_split_kvs) is not used on this path:
+                # is_var_split_kv is always False, split_kv is a fixed per-shape
+                # scalar owned by the AutoTuner tactic.
+                block_split_kvs_ct = None
 
                 CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache[cache_key] = \
                     cute.compile(
@@ -8515,7 +8820,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         o_ct,
                         lse_ct,
                         workspace_ct,
-                        cutlass.Int32(split_kv),
+                        # split_kv MUST be a compile-time constant (Python int),
+                        # NOT cutlass.Int32(...): it is part of ``cache_key`` so
+                        # each value gets its own compiled kernel, and
+                        # ``_compute_grid`` / the persistent tile-scheduler
+                        # while-loop (get_k_tile_count) const-fold the launch
+                        # grid and loop bounds from it at compile time. Passing a
+                        # dynamic cutlass.Int32 makes the persistent while-loop's
+                        # carried Boolean un-const-foldable ->
+                        # "DSLRuntimeError: Unable to convert dynamic Boolean to
+                        # bool at compile time". The standalone run() passes the
+                        # plain int (works); match it.
+                        split_kv,
                         cache_seqs_ct,
                         block_split_kvs_ct,
                         cutlass.Float32(softmax_scale),
@@ -8534,10 +8850,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 page_table,
                 o,
                 lse,
-                workspace if workspace.numel() > 0 else None,
+                workspace if (split_kv > 1 and workspace.numel() > 0) else None,
                 split_kv,
                 cache_seqs,
-                block_split_kvs if self.is_var_split_kv else None,
+                None,  # block_split_kvs: var-split path unused (is_var_split_kv False)
                 softmax_scale,
                 output_scale,
                 stream,
@@ -8556,17 +8872,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
         c_rope: torch.Tensor,
         page_table: torch.Tensor,
         cache_seqs: torch.Tensor,
-        block_split_kvs: torch.Tensor,
         o: torch.Tensor,
         lse: torch.Tensor,
         workspace: torch.Tensor,
         num_heads: int,
         seq_len_q: int,
         page_size: int,
-        is_persistent: bool,
-        is_var_seq: bool,
-        is_var_split_kv: bool,
-        split_kv: int,
         softmax_scale: float,
         output_scale: float,
     ) -> None:
@@ -8580,18 +8891,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 f"trtllm::cute_dsl_mla_decode_fp8_blackwell requires SM 100 or "
                 f"SM 103, got SM {sm_version}")
 
+        # split_kv and is_persistent are chosen per shape by the runner's
+        # AutoTuner (they are the 3rd/4th tactic elements -- see
+        # get_split_kv_candidates / get_is_persistent_candidates /
+        # get_valid_tactics), NOT at the op boundary. is_var_seq / is_var_split_kv
+        # are fixed for this integration path (var-seq decode, fixed split), so
+        # the runner is constructed with its defaults (is_persistent=True,
+        # is_var_seq=True, is_var_split_kv=False).
         runner = CuteDSLNVMlaDecodeBlackwellRunner(
             in_dtype=cutlass.Float8E4M3FN,
             num_heads=num_heads,
             seq_len_q=seq_len_q,
             page_size=page_size,
-            is_persistent=is_persistent,
-            is_var_seq=is_var_seq,
-            is_var_split_kv=is_var_split_kv,
         )
         inputs = [
             q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs,
-            block_split_kvs, o, lse, workspace
+            o, lse, workspace
         ]
         tuner = AutoTuner.get()
         _, best_tactic = tuner.choose_one(
@@ -8600,10 +8915,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
             runner.get_tuning_config(),
             inputs,
         )
+        # ``forward`` requires a 4-tuple tactic; if the tuner returned its -1
+        # fallback (cache not warmed), supply the default 4-tuple so split_kv +
+        # is_persistent still come from a length-4 tactic.
+        if not (isinstance(best_tactic, tuple) and len(best_tactic) == 4):
+            best_tactic = runner.default_tactic(int(q_latent.shape[-1]))
         runner(
             inputs,
             tactic=best_tactic,
-            split_kv=split_kv,
             softmax_scale=softmax_scale,
             output_scale=output_scale,
         )
@@ -8616,17 +8935,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
         c_rope: torch.Tensor,
         page_table: torch.Tensor,
         cache_seqs: torch.Tensor,
-        block_split_kvs: torch.Tensor,
         o: torch.Tensor,
         lse: torch.Tensor,
         workspace: torch.Tensor,
         num_heads: int,
         seq_len_q: int,
         page_size: int,
-        is_persistent: bool,
-        is_var_seq: bool,
-        is_var_split_kv: bool,
-        split_kv: int,
         softmax_scale: float,
         output_scale: float,
     ) -> None:
@@ -8644,17 +8958,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
         c_rope: torch.Tensor,
         page_table: torch.Tensor,
         cache_seqs: torch.Tensor,
-        block_split_kvs: torch.Tensor,
         o: torch.Tensor,
         lse: torch.Tensor,
         workspace: torch.Tensor,
         num_heads: int,
         seq_len_q: int,
         page_size: int,
-        is_persistent: bool,
-        is_var_seq: bool,
-        is_var_split_kv: bool,
-        split_kv: int,
         softmax_scale: float,
         output_scale: float,
     ) -> None:
@@ -8685,18 +8994,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 f"q_rope={q_rope.dtype}, c_latent={c_latent.dtype}, "
                 f"c_rope={c_rope.dtype}, o={o.dtype}")
 
+        # split_kv / is_persistent are chosen per shape by the runner's
+        # AutoTuner (3rd/4th tactic elements), not at the op boundary -- see the
+        # fp8 op above. is_var_seq / is_var_split_kv are fixed for this path, so
+        # the runner uses its defaults (is_persistent=True, is_var_seq=True,
+        # is_var_split_kv=False).
         runner = CuteDSLNVMlaDecodeBlackwellRunner(
             in_dtype=in_dtype,
             num_heads=num_heads,
             seq_len_q=seq_len_q,
             page_size=page_size,
-            is_persistent=is_persistent,
-            is_var_seq=is_var_seq,
-            is_var_split_kv=is_var_split_kv,
         )
         inputs = [
             q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs,
-            block_split_kvs, o, lse, workspace
+            o, lse, workspace
         ]
         tuner = AutoTuner.get()
         _, best_tactic = tuner.choose_one(
@@ -8705,10 +9016,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
             runner.get_tuning_config(),
             inputs,
         )
+        # ``forward`` requires a 4-tuple tactic; if the tuner returned its -1
+        # fallback (cache not warmed), supply the default 4-tuple so split_kv +
+        # is_persistent still come from a length-4 tactic.
+        if not (isinstance(best_tactic, tuple) and len(best_tactic) == 4):
+            best_tactic = runner.default_tactic(int(q_latent.shape[-1]))
         runner(
             inputs,
             tactic=best_tactic,
-            split_kv=split_kv,
             softmax_scale=softmax_scale,
             output_scale=output_scale,
         )
@@ -8721,17 +9036,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
         c_rope: torch.Tensor,
         page_table: torch.Tensor,
         cache_seqs: torch.Tensor,
-        block_split_kvs: torch.Tensor,
         o: torch.Tensor,
         lse: torch.Tensor,
         workspace: torch.Tensor,
         num_heads: int,
         seq_len_q: int,
         page_size: int,
-        is_persistent: bool,
-        is_var_seq: bool,
-        is_var_split_kv: bool,
-        split_kv: int,
         softmax_scale: float,
         output_scale: float,
     ) -> None:

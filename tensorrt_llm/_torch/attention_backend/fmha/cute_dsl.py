@@ -15,7 +15,6 @@
 """CuTe DSL MLA decode FMHA library."""
 
 import math
-import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -38,15 +37,6 @@ if TYPE_CHECKING:
     )
 
 _LOG2_E = math.log2(math.e)
-
-# Diagnostic for "why didn't CuteDSL engage" (e.g. seq_len_q=8 / H=16 at MTP
-# draft_len=7 silently fell back). When TLLM_CUTE_DSL_GATE_LOG is set, the gate
-# logs -- once per (layer_idx, supported, reason) -- the is_supported verdict
-# plus the batch shape it saw (q rows, num_generations, num_contexts), so a
-# single run reveals exactly which check rejects a given geometry. Host metadata
-# only (no device sync) -> CUDA-graph-capture-safe.
-_DEBUG_GATE = bool(os.environ.get("TLLM_CUTE_DSL_GATE_LOG"))
-_GATE_LOG_SEEN = set()
 
 
 class CuteDslMlaFmha(PhasedFmha):
@@ -112,8 +102,21 @@ class CuteDslMlaFmha(PhasedFmha):
         return None
 
     @staticmethod
+    def _to_cutlass_dtype(dtype: torch.dtype):
+        """Map a torch dtype to the cutlass dtype the kernel expects, or None
+        if the kernel has no counterpart for it."""
+        import cutlass
+
+        return {
+            torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+            torch.float16: cutlass.Float16,
+            torch.bfloat16: cutlass.BFloat16,
+        }.get(dtype)
+
+    @staticmethod
     def _kernel_can_implement(
-        kernel_dtype: torch.dtype,
+        in_dtype: torch.dtype,
+        out_dtype: torch.dtype,
         batch_size: int,
         seq_len_q: int,
         page_size: int,
@@ -124,12 +127,13 @@ class CuteDslMlaFmha(PhasedFmha):
         """Ask the CuTe DSL kernel's own ``can_implement`` whether it accepts
         this problem under the tiler the FMHA library launches with.
 
-        The custom op only runs ``can_implement`` when the AutoTuner is engaged
-        (``CuteDSLNVMlaDecodeBlackwellRunner.get_valid_tactics``); the FMHA
-        library calls the op directly with ``tactic=None`` -> the default
-        ``((128, 128), (128, 256))`` tiler, bypassing that check. Mirror the
-        op's launch configuration here so the gate refuses any request the
-        kernel cannot actually serve instead of failing at launch.
+        ``in_dtype`` / ``out_dtype`` are the actual kernel input/output torch
+        dtypes (the input is fp8 on the fp8-KV path, the output is q's dtype);
+        they are converted to cutlass dtypes here and the kernel class is
+        selected from the input dtype. Passing the real dtypes lets
+        can_implement reject an unsupported combination (e.g. an fp16 output on
+        the fp8 input path, which the kernel does not support) instead of
+        failing at launch.
         """
         import cutlass
 
@@ -140,17 +144,18 @@ class CuteDslMlaFmha(PhasedFmha):
             BlackwellMultiHeadLatentAttentionForwardFP16,
         )
 
-        if kernel_dtype == torch.float8_e4m3fn:
-            kernel_class = BlackwellMultiHeadLatentAttentionForwardFP8
-            in_dtype, out_dtype = cutlass.Float8E4M3FN, cutlass.BFloat16
-        elif kernel_dtype == torch.float16:
-            kernel_class = BlackwellMultiHeadLatentAttentionForwardFP16
-            in_dtype, out_dtype = cutlass.Float16, cutlass.Float16
-        elif kernel_dtype == torch.bfloat16:
-            kernel_class = BlackwellMultiHeadLatentAttentionForwardFP16
-            in_dtype, out_dtype = cutlass.BFloat16, cutlass.BFloat16
-        else:
-            return False, f"Unsupported CuTe DSL kernel dtype {kernel_dtype}."
+        cute_in_dtype = CuteDslMlaFmha._to_cutlass_dtype(in_dtype)
+        if cute_in_dtype is None:
+            return False, f"Unsupported CuTe DSL input dtype {in_dtype}."
+        cute_out_dtype = CuteDslMlaFmha._to_cutlass_dtype(out_dtype)
+        if cute_out_dtype is None:
+            return False, f"Unsupported CuTe DSL output dtype {out_dtype}."
+
+        kernel_class = (
+            BlackwellMultiHeadLatentAttentionForwardFP8
+            if cute_in_dtype == cutlass.Float8E4M3FN
+            else BlackwellMultiHeadLatentAttentionForwardFP16
+        )
 
         # Default launch tiler and flags -- keep in sync with
         # ``CuteDSLNVMlaDecodeBlackwellRunner`` in cute_dsl_custom_ops.py
@@ -159,12 +164,12 @@ class CuteDslMlaFmha(PhasedFmha):
         if not kernel_class.can_implement(
             batch_size,
             seq_len_q,
-            page_size,  # K -- mirrors the op's get_valid_tactics call
+            2,  # A fake K to bypass can_implement check
             num_heads,
             kv_lora_rank,
             qk_rope_head_dim,
-            in_dtype,
-            out_dtype,
+            cute_in_dtype,
+            cute_out_dtype,
             cutlass.Float32,  # acc_dtype
             cutlass.Float32,  # lse_dtype
             mma_qk_tiler_mn,
@@ -178,103 +183,22 @@ class CuteDslMlaFmha(PhasedFmha):
             return (
                 False,
                 "CuTe DSL MLA kernel can_implement rejected the problem "
-                f"(dtype={kernel_dtype}, H={num_heads}, L={kv_lora_rank}, "
-                f"R={qk_rope_head_dim}, S={seq_len_q}, B={batch_size}, "
-                f"page_size={page_size}).",
+                f"(in_dtype={in_dtype}, out_dtype={out_dtype}, H={num_heads}, "
+                f"L={kv_lora_rank}, R={qk_rope_head_dim}, S={seq_len_q}, "
+                f"B={batch_size}, page_size={page_size}).",
             )
         return True, ""
 
-    @staticmethod
-    def _select_page_table_layer(
-        block_offsets: torch.Tensor,
-        layer_idx: int,
-        host_kv_cache_pool_mapping: Optional[torch.Tensor] = None,
-    ) -> Optional[torch.Tensor]:
-        if block_offsets.dim() == 4:
-            if block_offsets.shape[2] < 1:
-                return None
-            if host_kv_cache_pool_mapping is not None:
-                if layer_idx >= host_kv_cache_pool_mapping.shape[0]:
-                    return None
-                pool_idx = int(host_kv_cache_pool_mapping[layer_idx, 0])
-            else:
-                pool_idx = layer_idx if block_offsets.shape[0] > 1 else 0
-            if pool_idx >= block_offsets.shape[0]:
-                return None
-            return block_offsets[pool_idx, :, 0, :]
-        if block_offsets.dim() == 3:
-            if block_offsets.shape[1] < 1:
-                return None
-            return block_offsets[:, 0, :]
-        if block_offsets.dim() == 2:
-            return block_offsets
-        return None
-
-    # ---- variable split-KV (KV-dimension parallelism) --------------------
+    # ---- split-KV (KV-dimension parallelism) -----------------------------
     # The decode kernel's MMA grid is starved when batch_size is small: with
     # split_kv=1 only ~batch*heads CTAs launch, so attention-DP (batch ≈
     # concurrency/tp) leaves most SMs idle. Splitting the KV dimension lets
     # multiple CTAs cooperate on one sequence (partials reduced via an fp32
-    # workspace). We mirror the kernel's own ``get_split_kv`` heuristic. The
-    # kernel's SUPPORTED split mode is the VARIABLE path (is_var_split_kv=True
-    # + per-sequence block_split_kvs); the fixed-split path is broken for
-    # split>1. CUDA-graph-safe by construction: the scalar split_kv (which
-    # bakes the launch grid) is derived from HOST-known sizes only, while the
-    # per-sequence block_split_kvs is computed on-device from cache_seqs with
-    # no host sync (no ``.item()``).
-    _CUTE_DSL_QK_TILE_K = 128  # mma_qk_tiler_mn[1] the op launches with
-    _CUTE_DSL_MAX_SPLIT_KV = 32  # kernel's get_split_kv hard cap
-
-    def _get_max_active_blocks(self) -> int:
-        """``max_active_clusters * cluster_shape[0]`` (cluster shape (2,1,1)),
-        matching the op's get_split_kv input. Queried once and cached before
-        CUDA-graph capture (the eager warmup populates it)."""
-        cached = getattr(self, "_cute_dsl_max_active_blocks", None)
-        if cached is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "CuTe DSL MLA FMHA: max_active_blocks was not cached "
-                    "before CUDA graph capture (run an eager warmup first)."
-                )
-            import cutlass
-            hw = cutlass.utils.HardwareInfo()
-            max_active_clusters = hw.get_max_active_clusters(2)  # cluster product
-            cached = int(max_active_clusters) * 2  # * cluster_shape_mnk[0]
-            self._cute_dsl_max_active_blocks = cached
-        return cached
-
-    @classmethod
-    def _split_kv_from_max_splits(
-        cls, max_splits: int, batch_size: int, seq_len_q: int, max_active_blocks: int
-    ) -> int:
-        """Host scalar form of the kernel's ``get_split_kv``."""
-        blocks_per_batch = max(1, max_active_blocks // batch_size // (seq_len_q * 2))
-        split_heur = min(max_splits, blocks_per_batch)
-        k_waves = (max_splits + split_heur - 1) // split_heur
-        split_wave_aware = (max_splits + k_waves - 1) // k_waves
-        return min(split_wave_aware, cls._CUTE_DSL_MAX_SPLIT_KV)
-
-    def _compute_block_split_kvs(
-        self,
-        cache_seqs: torch.Tensor,
-        batch_size: int,
-        seq_len_q: int,
-        max_active_blocks: int,
-        split_kv_max: int,
-    ) -> torch.Tensor:
-        """Per-sequence split count, vectorized over the device ``cache_seqs``
-        tensor (capture-safe; no host sync). Mirrors ``get_split_kv`` with the
-        per-sequence KV length ``cache_seqs[b]`` and clamps to the host grid
-        max ``split_kv_max``."""
-        blocks_per_batch = max(1, max_active_blocks // batch_size // (seq_len_q * 2))
-        k = cache_seqs.to(torch.int64)
-        tile_k = self._CUTE_DSL_QK_TILE_K
-        max_splits = torch.clamp((k + tile_k - 1) // tile_k, min=1)
-        split_heur = torch.clamp(max_splits, max=blocks_per_batch)
-        k_waves = (max_splits + split_heur - 1) // split_heur
-        split_wave_aware = (max_splits + k_waves - 1) // k_waves
-        cap = min(self._CUTE_DSL_MAX_SPLIT_KV, split_kv_max)
-        return torch.clamp(split_wave_aware, max=cap).to(torch.int32)
+    # workspace). The best split is shape-dependent; choosing it is owned
+    # ENTIRELY by the op's AutoTuner (profiled per shape over
+    # ``CuteDSLNVMlaDecodeBlackwellRunner.get_split_kv_candidates``, cached, and
+    # baked into the CUDA graph at capture). This FMHA layer only sizes the
+    # workspace for the largest candidate; see ``_run_mla_decode``.
 
     def is_supported(
         self,
@@ -292,21 +216,29 @@ class CuteDslMlaFmha(PhasedFmha):
         )
         if not supported:
             logger.debug(f"CuTe DSL MLA FMHA does not support request: {reason}")
-        if _DEBUG_GATE:
-            key = (self.attn.layer_idx, supported, reason)
-            if key not in _GATE_LOG_SEEN:
-                _GATE_LOG_SEEN.add(key)
-                print(
-                    "[CUTEDSL_GATE] layer=%d supported=%s q_rows=%d "
-                    "num_generations=%d num_contexts=%d reason=%s"
-                    % (
-                        self.attn.layer_idx, supported, q.shape[0],
-                        metadata.num_generations, metadata.num_contexts,
-                        reason or "(ok)",
-                    ),
-                    flush=True,
-                )
         return supported
+
+    @staticmethod
+    def _is_perf_favorable(num_heads: int, seq_len_q: int) -> tuple[bool, str]:
+        """Perf-only allowlist, separate from the correctness checks: admit
+        just the (num_heads, seq_len_q) shapes where CuteDSL decode is an
+        end-to-end win over the default backend.
+
+        Shapes where the CuTe DSL decode kernel BEATS the default TRTLLM path
+        end-to-end (DeepSeek-V3 8xB200 TP=8/EP=8 A/B, ISL1024/OSL2048):
+          H=16  (TP=8, attention-DP off): seq_len_q=2 +1.0%, seq_len_q=4 +2.2%
+          H=128 (attention-DP on)       : seq_len_q=1 +1.4%
+        Every other measured cell is at or below parity (H=128/seq_len_q=4 is
+        about -14%), so the gate admits only the winning shapes and lets
+        everything else fall back to the next FMHA library."""
+        perf_favorable_shapes = frozenset({(16, 2), (16, 4), (128, 1)})
+        if (num_heads, seq_len_q) in perf_favorable_shapes:
+            return True, ""
+        return False, (
+            f"CuTe DSL MLA decode is not a perf win for num_heads={num_heads}, "
+            f"seq_len_q={seq_len_q}; allowed (num_heads, seq_len_q): "
+            f"{sorted(perf_favorable_shapes)}."
+        )
 
     def _is_supported_with_reason(
         self,
@@ -346,26 +278,18 @@ class CuteDslMlaFmha(PhasedFmha):
         # the kernel can actually serve for this geometry.
         if seq_len_q < 1:
             return False, f"Query length must be >= 1, got {seq_len_q}."
+        # Perf gate (NOT a correctness limit): only admit shapes where CuteDSL
+        # beats the default path E2E; everything else falls back.
+        favorable, reason = self._is_perf_favorable(attn.num_heads, seq_len_q)
+        if not favorable:
+            return False, reason
         if meta.kv_cache_block_offsets is None:
             return False, "Paged KV block offsets are required."
-        # ``host_kv_cache_pool_mapping`` is indexed by the LOCAL (compacted)
-        # layer index, not the global ``attn.layer_idx`` -- they coincide for a
-        # full model but differ when the KV cache manager allocates a subset of
-        # layers (e.g. PP, or the layer-wise benchmark's ``layer_mask``).
-        local_layer_idx = attn.get_local_layer_idx(meta)
-        page_table_layer = self._select_page_table_layer(
-            meta.kv_cache_block_offsets,
-            local_layer_idx,
-            meta.host_kv_cache_pool_mapping,
-        )
-        if page_table_layer is None:
-            return (
-                False,
-                "Unsupported KV block offsets shape "
-                f"{tuple(meta.kv_cache_block_offsets.shape)} for layer_idx={attn.layer_idx}.",
-            )
         if meta.kv_cache_manager is None:
             return False, "KV cache manager is required."
+        pool_mapping = meta.host_kv_cache_pool_mapping
+        if pool_mapping is None:
+            return False, "KV cache pool mapping is required."
         if fwd.latent_cache is None:
             return False, "latent_cache is required."
         if fwd.output is None:
@@ -374,12 +298,13 @@ class CuteDslMlaFmha(PhasedFmha):
         tokens_per_block = meta.tokens_per_block
         if tokens_per_block is None:
             tokens_per_block = getattr(meta.kv_cache_manager, "tokens_per_block", 0)
-        if tokens_per_block <= 1 or 128 % tokens_per_block != 0:
+        if tokens_per_block <= 1:
             return (
                 False,
-                f"tokens_per_block must divide 128 and be greater than 1, got {tokens_per_block}.",
+                f"tokens_per_block must be greater than 1, got {tokens_per_block}.",
             )
 
+        # The kernel type is the input dtype
         kernel_dtype = self._get_kernel_dtype(attn, q)
         if kernel_dtype is None:
             return (
@@ -408,8 +333,15 @@ class CuteDslMlaFmha(PhasedFmha):
         # tiler the op launches with (the FMHA library bypasses the AutoTuner's
         # can_implement filter), so a request that reaches the gate is one the
         # kernel can actually serve.
+        # Real kernel input/output torch dtypes: the input is fp8 on the fp8-KV
+        # path (``kernel_dtype``), the output is written straight into
+        # ``fwd.output`` (no temp buffer in ``_run_mla_decode``), so its dtype is
+        # the authoritative output dtype -- can_implement rejects the request if
+        # the kernel cannot emit it. ``_kernel_can_implement`` converts both to
+        # cutlass dtypes internally.
         return self._kernel_can_implement(
             kernel_dtype,
+            fwd.output.dtype,
             meta.num_generations,
             seq_len_q,
             tokens_per_block,
@@ -428,31 +360,21 @@ class CuteDslMlaFmha(PhasedFmha):
         attn = params.attn
         meta = params.meta
 
+        # dtype / batch / MLA-dim validity is already enforced before dispatch
+        # (``is_available`` + ``_is_supported_with_reason`` + the kernel's
+        # ``can_implement``), so they are taken as given here.
         if kernel_dtype == torch.float8_e4m3fn:
             op = torch.ops.trtllm.cute_dsl_mla_decode_fp8_blackwell
-        elif kernel_dtype in (torch.float16, torch.bfloat16):
-            op = torch.ops.trtllm.cute_dsl_mla_decode_fp16_blackwell
         else:
-            raise ValueError(
-                f"CuTe DSL MLA FMHA got unsupported kernel_dtype={kernel_dtype}; "
-                "expected torch.float8_e4m3fn, torch.float16, or torch.bfloat16."
-            )
+            op = torch.ops.trtllm.cute_dsl_mla_decode_fp16_blackwell
 
         num_tokens = q.shape[0]
         batch_size = params.num_requests
         seq_len_q = num_tokens // batch_size
-        if seq_len_q * batch_size != num_tokens:
-            raise RuntimeError(
-                f"CuTe DSL MLA decode expects num_tokens ({num_tokens}) divisible by "
-                f"batch_size ({batch_size})."
-            )
 
         d_latent = attn.kv_lora_rank
         d_rope = attn.qk_rope_head_dim
         qk_nope_head_dim = attn.qk_nope_head_dim
-        if d_latent is None or d_rope is None or qk_nope_head_dim is None:
-            raise RuntimeError("CuTe DSL MLA decode requires complete MLA dimensions.")
-
         num_heads = attn.num_heads
         page_size = params.tokens_per_block
 
@@ -463,11 +385,6 @@ class CuteDslMlaFmha(PhasedFmha):
         q_view = q_kernel.view(batch_size, seq_len_q, num_heads, d_latent + d_rope)
 
         kv_pool = meta.kv_cache_manager.get_buffers(attn.layer_idx)
-        if kernel_dtype in (torch.float16, torch.bfloat16) and kv_pool.dtype != kernel_dtype:
-            raise RuntimeError(
-                f"CuTe DSL MLA {kernel_dtype} fast path requires matching "
-                f"KV cache dtype, got {kv_pool.dtype}."
-            )
         # Paged-pool layout normalization for both KV cache managers.
         # KVCacheManagerV2 exposes each layer as a densely-packed page pool.
         # KVCacheManagerV1 exposes a per-layer view over one interleaved pool,
@@ -505,18 +422,16 @@ class CuteDslMlaFmha(PhasedFmha):
             )
 
         block_offsets = meta.kv_cache_block_offsets
-        # See ``_is_supported_with_reason``: the pool mapping is local-indexed.
+        pool_mapping = meta.host_kv_cache_pool_mapping
+        # Select this layer's [num_seqs, max_blocks] page table from the 4D
+        # kv_cache_block_offsets via the layer -> pool mapping.
+        # ``host_kv_cache_pool_mapping`` is indexed by the LOCAL (compacted)
+        # layer index, not the global ``attn.layer_idx`` -- they coincide for a
+        # full model but differ when the KV cache manager allocates a subset of
+        # layers (e.g. PP, or the layer-wise benchmark's ``layer_mask``).
         local_layer_idx = attn.get_local_layer_idx(meta)
-        page_table_layer = self._select_page_table_layer(
-            block_offsets,
-            local_layer_idx,
-            meta.host_kv_cache_pool_mapping,
-        )
-        if page_table_layer is None:
-            raise RuntimeError(
-                "CuTe DSL MLA decode got unsupported KV block offsets shape "
-                f"{tuple(block_offsets.shape)} for layer_idx={attn.layer_idx}."
-            )
+        pool_idx = int(pool_mapping[local_layer_idx, 0])
+        page_table_layer = block_offsets[pool_idx, :, 0, :]
         cache_seqs_base = params.sequence_lengths.to(torch.int32)
         page_table = page_table_layer[meta.num_contexts:].transpose(0, 1).to(torch.int32)
         if layers_in_pool > 1:
@@ -529,40 +444,21 @@ class CuteDslMlaFmha(PhasedFmha):
         c_pool_latent = kv_pages[..., :d_latent].permute(1, 2, 0)
         c_pool_rope = kv_pages[..., d_latent:].permute(1, 2, 0)
 
-        # Variable split-KV: parallelize the KV dimension when the batch is too
-        # small to fill the SMs (see the helper block above). Default ON; set
-        # TLLM_CUTE_DSL_VAR_SPLIT_KV=0 to force the legacy split_kv=1 path.
-        is_var_split_kv = False
-        block_split_kvs = torch.empty(0, dtype=torch.int32, device=q.device)
-        split_kv = 1
-        workspace = torch.empty(0, dtype=torch.int8, device=q.device)
-        if os.environ.get("TLLM_CUTE_DSL_VAR_SPLIT_KV", "1") != "0":
-            max_active_blocks = self._get_max_active_blocks()
-            # Host upper bound on KV length: per-sequence page capacity * page
-            # size (page_table is [pages_per_seq, batch], a fixed shape under
-            # CUDA-graph capture). Yields the grid's split_kv max on the host.
-            k_max = page_table.shape[0] * page_size
-            max_splits = max(1, (k_max + self._CUTE_DSL_QK_TILE_K - 1) // self._CUTE_DSL_QK_TILE_K)
-            split_kv = self._split_kv_from_max_splits(
-                max_splits, batch_size, seq_len_q, max_active_blocks
-            )
-            if split_kv > 1:
-                is_var_split_kv = True
-                block_split_kvs = self._compute_block_split_kvs(
-                    cache_seqs_base, batch_size, seq_len_q, max_active_blocks, split_kv
-                )
-                # get_workspace_size = B*H*S*split_kv*(D+1)*acc_width//8; fold
-                # cancels (H_eff*S_eff == H*S), acc=fp32 (width 32 -> //8 = 4).
-                ws_bytes = batch_size * num_heads * seq_len_q * split_kv * (d_latent + 1) * 4
-                workspace = torch.empty(ws_bytes, dtype=torch.int8, device=q.device)
-            else:
-                split_kv = 1
+        # Split-KV parallelism is owned ENTIRELY by the op's AutoTuner: it
+        # profiles the per-shape split_kv candidates
+        from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+            CuteDSLNVMlaDecodeBlackwellRunner,
+        )
+        import cutlass
+
+        workspace = params.workspace
+        # split_kv is owned by the op's AutoTuner (profiled-best per shape, baked
+        # into the graph), not passed here. Variable split-KV (block_split_kvs) is
+        # unused on this path (the runner's is_var_split_kv default is False).
 
         softmax_scale = float(1.0 / (math.sqrt(qk_nope_head_dim + d_rope) * attn.q_scaling))
         output_scale = 1.0
         if kernel_dtype == torch.float8_e4m3fn:
-            if params.fwd.mla_bmm1_scale is None or params.fwd.mla_bmm2_scale is None:
-                raise RuntimeError("FP8 CuTe DSL MLA decode requires MLA FP8 scales.")
             cached = getattr(self, "_cute_dsl_fp8_scale", None)
             if cached is None:
                 if torch.cuda.is_current_stream_capturing():
@@ -575,28 +471,7 @@ class CuteDslMlaFmha(PhasedFmha):
                 self._cute_dsl_fp8_scale = (softmax_scale, output_scale)
             else:
                 softmax_scale, output_scale = cached
-                if (
-                    os.environ.get("TLLM_CUTE_DSL_SCALE_DUMP")
-                    and not torch.cuda.is_current_stream_capturing()
-                ):
-                    live_softmax_scale = float(params.fwd.mla_bmm1_scale[1].item()) / _LOG2_E
-                    live_output_scale = float(params.fwd.mla_bmm2_scale[0].item())
-                    print(
-                        "[CUTEDSL_SCALE] layer=%d cached=(%.8f,%.8f) "
-                        "live=(%.8f,%.8f) drift=%s"
-                        % (
-                            attn.layer_idx,
-                            softmax_scale,
-                            output_scale,
-                            live_softmax_scale,
-                            live_output_scale,
-                            abs(live_softmax_scale - softmax_scale) > 1e-6
-                            or abs(live_output_scale - output_scale) > 1e-6,
-                        ),
-                        flush=True,
-                    )
 
-        out_kernel_dtype = torch.bfloat16 if kernel_dtype == torch.float8_e4m3fn else kernel_dtype
         output_view = output.view(batch_size, seq_len_q, num_heads, d_latent)
 
         # Single fused decode over all ``seq_len_q`` query tokens. For
@@ -610,38 +485,17 @@ class CuteDslMlaFmha(PhasedFmha):
         q_latent = q_view[..., :d_latent].permute(2, 3, 1, 0)
         q_rope = q_view[..., d_latent:].permute(2, 3, 1, 0)
 
-        # When the kernel output dtype matches the module output dtype (the
-        # common fp8-KV case: both bf16), have the kernel write straight into
-        # ``output`` instead of a temp buffer that is then D2D-copied back. That
-        # copy was ~1.7us/call and, at small batch where the decode win is only
-        # a few us, ate the win (MLA module went flat/slightly slower despite a
-        # faster decode kernel). ``output_view`` is a contiguous
-        # [B, S_q, H, d_latent] view, so its permute(2,3,1,0) is byte-identical
-        # in layout to a fresh contiguous o_storage's -- the op's compact-shape
-        # marking still holds. Only fall back to the temp+copy on a dtype
-        # mismatch (the kernel can only emit out_kernel_dtype).
-        write_output_direct = output.dtype == out_kernel_dtype
-        if write_output_direct:
-            o_storage = output_view
-        else:
-            o_storage = torch.empty(
-                (batch_size, seq_len_q, num_heads, d_latent),
-                dtype=out_kernel_dtype,
-                device=q.device,
-            )
-        o_kernel = o_storage.permute(2, 3, 1, 0)
+        # The kernel writes straight into ``output``. The gate's can_implement
+        # (queried with the real input AND output dtype) already rejected any
+        # output dtype the kernel cannot emit, so no temp buffer / dtype-convert
+        # copy is needed here.
+        o_kernel = output_view.permute(2, 3, 1, 0)
         lse_storage = torch.empty(
             (batch_size, seq_len_q, num_heads),
             dtype=torch.float32,
             device=q.device,
         )
         lse = lse_storage.permute(2, 1, 0)
-
-        # The decode path uses variable-seq mode by default (real serving has
-        # unequal per-request KV lengths). Experiment toggle: set
-        # TLLM_CUTE_DSL_VAR_SEQ=0 to force the fixed-length path -- only valid
-        # when every sequence shares one KV length (e.g. profiling/microbench).
-        is_var_seq = os.environ.get("TLLM_CUTE_DSL_VAR_SEQ", "1") != "0"
 
         op(
             q_latent,
@@ -650,29 +504,15 @@ class CuteDslMlaFmha(PhasedFmha):
             c_pool_rope,
             page_table,
             cache_seqs_base,
-            block_split_kvs,
             o_kernel,
             lse,
             workspace,
             num_heads,
             seq_len_q,
             page_size,
-            True,  # is_persistent
-            is_var_seq,
-            is_var_split_kv,
-            split_kv,
             softmax_scale,
             output_scale,
         )
-
-        # If the kernel wrote into a temp (dtype mismatch), copy/convert back
-        # into ``output``. In the common matched-dtype case the kernel already
-        # wrote ``output`` directly (o_storage IS output_view), so skip the copy.
-        if not write_output_direct:
-            # o_kernel is [num_heads, d_latent, seq_len_q, batch_size]; restore
-            # the [batch_size, seq_len_q, num_heads, d_latent] view.
-            attn_out = o_kernel.permute(3, 2, 0, 1)
-            output_view.copy_(attn_out.to(output.dtype))
 
     def run_mla_generation(
         self,
@@ -695,3 +535,34 @@ class CuteDslMlaFmha(PhasedFmha):
             params,
             kernel_dtype,
         )
+
+    def prepare_workspace(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+        workspace: torch.Tensor,
+    ) -> None:
+        import cutlass
+
+        from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+            CuteDSLNVMlaDecodeBlackwellRunner,
+        )
+
+        required_workspace_size = CuteDSLNVMlaDecodeBlackwellRunner.get_max_workspace_size(
+            self.attn.num_heads,
+            q.shape[0] // metadata.num_generations,
+            self.attn.kv_lora_rank,
+            metadata.num_generations,
+            cutlass.Float32,
+        )
+        current_workspace_size = workspace.numel() * workspace.element_size()
+        if current_workspace_size < required_workspace_size:
+            if metadata.is_cuda_graph and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Attention CUDA graph workspace is smaller than the required size for Cute DSL MLA decode."
+                )
+            required_workspace_numel = math.ceil(required_workspace_size / workspace.element_size())
+            workspace.resize_((required_workspace_numel,))

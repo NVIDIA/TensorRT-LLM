@@ -1509,7 +1509,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
     @staticmethod
     def get_split_kv_simplified(B: int, S: int, max_active_blocks: int) -> int:
-        """Occupancy-only split_kv heuristic (flashinfer PR #2743).
+        """Occupancy-only split_kv heuristic.
 
         Unlike ``get_split_kv`` this does NOT depend on the KV length: it picks
         the split count purely from how many CTA slots are free per batch entry,
@@ -3704,12 +3704,20 @@ def run(
             # TLB / DRAM-row latency (integration's pages live in a much bigger
             # cache-manager pool) rather than coalescing.
             pool_mult = int(os.environ.get("CUTEDSL_POOL_PAGES_MULT", "1"))
+            # CUTEDSL_POOL_PAGES_ABS=N forces the pool to exactly N pages (to
+            # replicate the integration KV-cache manager's absolute pool size,
+            # which is not an integer multiple of B*pages_per_seq). Overrides
+            # pool_mult. The page_table still only indexes the accessed prefix.
+            pool_abs = int(os.environ.get("CUTEDSL_POOL_PAGES_ABS", "0"))
             if cache_seqs is not None:
                 max_seq_len = torch.max(cache_seqs)
-                shape = (pool_mult * B * ceil_div(max_seq_len, page_size),
-                         page_size, D)
+                npages = (pool_abs if pool_abs > 0
+                          else pool_mult * B * ceil_div(max_seq_len, page_size))
+                shape = (npages, page_size, D)
             else:
-                shape = (pool_mult * B * ceil_div(HK, page_size), page_size, D)
+                npages = (pool_abs if pool_abs > 0
+                          else pool_mult * B * ceil_div(HK, page_size))
+                shape = (npages, page_size, D)
 
         if seq_len_q is not None:
             shape = (B, seq_len_q, HK, D)
@@ -3740,6 +3748,19 @@ def run(
             init_type=cutlass.torch.TensorInitType.RANDOM,
             init_config=init_config,
         )
+
+        # CUTEDSL_DATA_FILL: override the RANDOM init to a CONSTANT so the
+        # online-softmax correction (rescale when a K-tile raises the running
+        # max) becomes data-invariant. With a constant KV, all QK scores are
+        # equal -> row_max never increases after tile 0 -> ~zero corrections.
+        # Isolates whether the standalone<->integration gap is a DATA-DEPENDENT
+        # correction-count difference (random KV vs the integration bench's
+        # garbage/uniform cache content) rather than any memory/layout effect.
+        _fill = os.environ.get("CUTEDSL_DATA_FILL", "")
+        if _fill == "zero":
+            torch_tensor_cpu.zero_()
+        elif _fill == "const":
+            torch_tensor_cpu.fill_(1)
 
         # Create dtype torch tensor (gpu)
         torch_tensor_gpu = torch_tensor_cpu.cuda()
@@ -3836,11 +3857,53 @@ def run(
             (c_rope_ref, _mk(c_rope_gpu), c_rope_gpu),
         )
 
+    def create_q_fused(batch_size, num_heads, latent_dim, rope_dim, dtype,
+                       seq_len_q):
+        """Allocate q_latent / q_rope as views of ONE [num_heads, latent+rope,
+        seq_q, batch] buffer (per-head row pitch latent+rope), matching the
+        integration q layout (q stride (576,1,9216,9216): q_latent + q_rope live
+        in the same 576-wide row). The default create_data_tensor allocates two
+        SEPARATE dense q buffers (q_latent pitch 512, q_rope its own 64-wide
+        tensor). Mirrors create_kv_pool_interleaved but for the 4-D q layout.
+        """
+        d_total = latent_dim + rope_dim
+        comb_ref, _comb_cute, comb_gpu = create_data_tensor(
+            batch_size, num_heads, d_total, dtype,
+            is_dynamic_layout=True, seq_len_q=seq_len_q, role="q")
+
+        # q is [num_heads, d_total, seq_q, batch]; slice latent / rope out of the
+        # contiguous d axis (dim 1). Both slices keep the d_total row pitch ->
+        # exactly the integration strides (fp8: (576, 1, page_size-free 9216)).
+        def _split(t):
+            return t[:, :latent_dim, :, :], t[:, latent_dim:d_total, :, :]
+
+        q_latent_gpu, q_rope_gpu = _split(comb_gpu)
+        q_latent_ref, q_rope_ref = _split(comb_ref)
+
+        def _mk(t_gpu):
+            ct = from_dlpack(t_gpu, assumed_align=16)
+            ct.element_type = dtype
+            # 576-pitch view is non-compact (rope gap) -> mark_layout_dynamic
+            # only, exactly like the integration op marks q_latent/q_rope.
+            return ct.mark_layout_dynamic(leading_dim=1)
+
+        return (
+            (q_latent_ref, _mk(q_latent_gpu), q_latent_gpu),
+            (q_rope_ref, _mk(q_rope_gpu), q_rope_gpu),
+        )
+
     def create_cache_seqs(batch_size, seq_len_k, is_var_seq):
         cache_seqs_ref = torch.ones(batch_size, dtype=torch.int32) * seq_len_k
         cache_seqs_gpu = cache_seqs_ref.cuda()
         cache_seqs = from_dlpack(cache_seqs_gpu,
                                  assumed_align=16).mark_layout_dynamic()
+        # Bench knob: compile the is_var_seq=True kernel variant (matching the
+        # integration/layer-perf path) but keep every sequence at exactly
+        # ``seq_len_k`` so the standalone A/B runs at a UNIFORM, tile-matched KV.
+        # Lets us diff SASS against the integration arm (same is_var_seq flag ->
+        # same codegen) while the time stays apples-to-apples with a fixed KV.
+        if is_var_seq and os.environ.get("CUTEDSL_VARSEQ_UNIFORM"):
+            return cache_seqs_ref, cache_seqs, cache_seqs_gpu
         if is_var_seq:
             max_seq_len = seq_len_k
             min_seq_len = int(seq_len_k * 0.8)
@@ -3870,14 +3933,36 @@ def run(
         # test whether the page_table mapping (vs the default batch-interleaved
         # b + j*batch_size) is what drives uncoalesced KV reads.
         import os as _os
-        _seqmajor = _os.environ.get("CUTEDSL_PAGE_LAYOUT") == "seqmajor"
+        _layout = _os.environ.get("CUTEDSL_PAGE_LAYOUT", "")
+        _seqmajor = _layout == "seqmajor"
         # Spread accessed pages with stride M across the M-enlarged pool (see
         # create_data_tensor CUTEDSL_POOL_PAGES_MULT).
         _pool_mult = int(_os.environ.get("CUTEDSL_POOL_PAGES_MULT", "1"))
-        for b in range(batch_size):
-            for j in range(page_count):
-                base = (b * page_count + j) if _seqmajor else (b + j * batch_size)
-                page_table_ref[b, j] = base * _pool_mult
+        if _layout == "shuffle":
+            # Assign every (seq, page) a DISTINCT random physical page from the
+            # pool. Tests whether the physical page -> DRAM channel/bank
+            # distribution (not the stride pattern) is what drives the
+            # standalone<->integration gap: if a random remap moves the time,
+            # the address distribution is the lever.
+            torch.manual_seed(0)
+            total = _pool_mult * batch_size * page_count
+            perm = torch.randperm(total, dtype=torch.int64)
+            page_table_ref = perm[:batch_size * page_count].to(
+                torch.int32).reshape(batch_size, page_count)
+        elif _layout == "integration":
+            # Reproduce the observed integration page_table content: within each
+            # stride-batch_size group, seq b gets offset (batch_size-1 - b), i.e.
+            # seq b page j = j*batch_size + (batch_size-1-b)  (row0 = [B-1, 2B-1,
+            # 3B-1, ...]). Same stride-B interleave as default, different offset.
+            for b in range(batch_size):
+                for j in range(page_count):
+                    page_table_ref[b, j] = (j * batch_size
+                                            + (batch_size - 1 - b)) * _pool_mult
+        else:
+            for b in range(batch_size):
+                for j in range(page_count):
+                    base = (b * page_count + j) if _seqmajor else (b + j * batch_size)
+                    page_table_ref[b, j] = base * _pool_mult
         page_table_gpu = page_table_ref.permute(1, 0).cuda()
         page_table = from_dlpack(
             page_table_gpu, assumed_align=16).mark_layout_dynamic(leading_dim=0)
@@ -3934,6 +4019,14 @@ def run(
                 mma_qk_tiler_mn,
                 max_active_clusters * cluster_shape_mnk[0],
             )
+            if os.environ.get("CUTEDSL_PRINT_SPLIT", "0") == "1":
+                print(
+                    f"[HEUR_SPLIT] B={batch_size} Sq={seq_len_q} "
+                    f"KV={cache_seqs_ref[0].item()} "
+                    f"max_active_blocks={max_active_clusters * cluster_shape_mnk[0]} "
+                    f"-> split_kv={split_kv}",
+                    flush=True,
+                )
         return split_kv, block_split_kvs_ref, block_split_kvs, block_split_kvs_gpu
 
     def create_workspace(num_heads, seq_len_q, latent_dim, batch_size, split_kv,
@@ -3983,24 +4076,33 @@ def run(
             max_active_clusters,
         ))
 
-    q_latent_ref, q_latent, q_latent_torch = create_data_tensor(
-        batch_size,
-        num_heads,
-        latent_dim,
-        in_dtype,
-        is_dynamic_layout=True,
-        seq_len_q=seq_len_q,
-        role="q",
-    )
-    q_rope_ref, q_rope, q_rope_torch = create_data_tensor(
-        batch_size,
-        num_heads,
-        rope_dim,
-        in_dtype,
-        is_dynamic_layout=True,
-        seq_len_q=seq_len_q,
-        role="q",
-    )
+    # CUTEDSL_Q_INTERLEAVE=1 lays q_latent/q_rope out as views of ONE 576-wide
+    # buffer (row pitch latent+rope), matching the integration q layout; default
+    # keeps the legacy two-separate-dense-buffers layout.
+    if os.environ.get("CUTEDSL_Q_INTERLEAVE") == "1":
+        (q_latent_ref, q_latent, q_latent_torch), \
+            (q_rope_ref, q_rope, q_rope_torch) = create_q_fused(
+                batch_size, num_heads, latent_dim, rope_dim, in_dtype,
+                seq_len_q)
+    else:
+        q_latent_ref, q_latent, q_latent_torch = create_data_tensor(
+            batch_size,
+            num_heads,
+            latent_dim,
+            in_dtype,
+            is_dynamic_layout=True,
+            seq_len_q=seq_len_q,
+            role="q",
+        )
+        q_rope_ref, q_rope, q_rope_torch = create_data_tensor(
+            batch_size,
+            num_heads,
+            rope_dim,
+            in_dtype,
+            is_dynamic_layout=True,
+            seq_len_q=seq_len_q,
+            role="q",
+        )
 
     # CUTEDSL_KV_INTERLEAVE=1 lays c_latent/c_rope out as interleaved views of a
     # single pool buffer (row pitch latent+rope), matching the integration KV
@@ -4075,8 +4177,16 @@ def run(
         fold_sq=fold_sq,
     )
 
-    # Get current CUDA stream from PyTorch
-    torch_stream = torch.cuda.current_stream()
+    # Benchmark with CUDA graphs (opt-in via CUTEDSL_BENCH_CUDA_GRAPH=1). Graph
+    # capture removes per-launch host overhead, but cudaStreamBeginCapture is not
+    # permitted on the legacy default stream, so allocate a dedicated non-default
+    # stream and use it for compile / launch / capture alike. Off by default keeps
+    # the validated CUDA-event timing path (and its measurements) unchanged.
+    use_cuda_graphs = os.environ.get("CUTEDSL_BENCH_CUDA_GRAPH", "0") == "1"
+    if use_cuda_graphs:
+        torch_stream = torch.cuda.Stream()
+    else:
+        torch_stream = torch.cuda.current_stream()
     # Get the raw stream pointer as a CUstream
     stream = cuda.CUstream(torch_stream.cuda_stream)
 
@@ -4108,19 +4218,40 @@ def run(
         def _ss(t):
             return "None" if t is None else "%s/%s/%s" % (
                 tuple(t.shape), tuple(t.stride()), t.dtype)
+        def _align(t):
+            if t is None:
+                return "None"
+            p = int(t.data_ptr()); a = (p & -p)  # largest power-of-2 divisor
+            return "ptr=0x%x align=%dB" % (p, a)
+        print("[CUTEDSL_ALIGN_STANDALONE] c_latent %s | c_rope %s | q_latent %s | o %s"
+              % (_align(c_latent_torch), _align(c_rope_torch),
+                 _align(q_latent_torch), _align(o_torch)), flush=True)
+        pt = page_table_torch
+        if pt is not None and pt.numel():
+            row0 = pt[0].tolist() if pt.dim() > 1 else pt.tolist()
+            # page_table is [page_count, batch] on the standalone path, so a
+            # sequence's pages are the COLUMN pt[:, b]; check column-contiguity.
+            contig = bool((pt.dim() > 1) and torch.all(
+                pt[1:, :] == pt[:-1, :] + 1).item())
+            pt_info = ("pt_min=%d pt_max=%d col0[:8]=%s per_seq_contig=%s"
+                       % (int(pt.min()), int(pt.max()),
+                          [int(pt[i, 0]) for i in range(min(8, pt.shape[0]))]
+                          if pt.dim() > 1 else row0[:8], contig))
+        else:
+            pt_info = "pt_info=none"
         print(
             "[CUTEDSL_CALL_STANDALONE] batch_size=%d seq_len_q=%d seq_len_k=%d "
             "num_heads=%d page_size=%d split_kv=%s is_var_seq=%s "
             "is_var_split_kv=%s fold_sq=%s softmax_scale=%.8f output_scale=%.8f | "
             "q_latent%s q_rope%s c_latent%s c_rope%s page_table%s cache_seqs%s "
-            "o%s lse%s workspace%s"
+            "o%s lse%s workspace%s | %s"
             % (
                 batch_size, seq_len_q, seq_len_k, num_heads, page_size,
                 split_kv, is_var_seq, is_var_split_kv, fold_sq,
                 softmax_scale, output_scale,
                 _ss(q_latent_torch), _ss(q_rope_torch), _ss(c_latent_torch),
                 _ss(c_rope_torch), _ss(page_table_torch), _ss(cache_seqs_torch),
-                _ss(o_torch), _ss(lse_torch), _ss(workspace_torch),
+                _ss(o_torch), _ss(lse_torch), _ss(workspace_torch), pt_info,
             ),
             flush=True,
         )
@@ -4405,6 +4536,7 @@ def run(
         stream=stream,
         warmup_iterations=warmup_iterations,
         iterations=iterations,
+        use_cuda_graphs=use_cuda_graphs,
     )
 
     return avg_time_us  # Return execution time in microseconds
@@ -4595,7 +4727,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    run(
+    time_us = run(
         args.batch_size,
         args.seq_len_q,
         args.seq_len_k,
@@ -4623,4 +4755,4 @@ if __name__ == "__main__":
         args.use_cold_l2,
     )
 
-    print("PASS")
+    print(f"PASS, time_us: {time_us}")
