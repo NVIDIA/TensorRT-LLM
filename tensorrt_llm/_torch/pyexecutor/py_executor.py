@@ -4186,7 +4186,7 @@ class PyExecutor:
 
         self.active_requests.extend(validated_requests)
         for req in validated_requests:
-            if req.is_generation_only_request:
+            if req.is_generation_only_request():
                 logger.info(
                     f"[DISAGG] Activated generation_only request {req.py_request_id}, "
                     f"state={req.state}, has_context_phase_params={req.context_phase_params is not None}"
