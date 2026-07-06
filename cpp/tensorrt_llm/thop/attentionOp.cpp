@@ -386,7 +386,8 @@ public:
         std::optional<torch::Tensor> compact_pseudokv_positions,
         std::optional<torch::Tensor> compact_pseudokv_causal_mask,
         std::optional<int64_t> compact_pseudokv_source_seq_len, bool const is_cross,
-        std::optional<torch::Tensor> cross_kv, std::optional<torch::Tensor> relative_attention_bias) const
+        std::optional<torch::Tensor> cross_kv, std::optional<torch::Tensor> relative_attention_bias,
+        std::optional<torch::Tensor> quant_scale_qkv = std::nullopt) const
         = 0;
 };
 
@@ -460,7 +461,8 @@ public:
         std::optional<torch::Tensor> compact_pseudokv_positions,
         std::optional<torch::Tensor> compact_pseudokv_causal_mask,
         std::optional<int64_t> compact_pseudokv_source_seq_len, bool const is_cross,
-        std::optional<torch::Tensor> cross_kv, std::optional<torch::Tensor> relative_attention_bias) const override
+        std::optional<torch::Tensor> cross_kv, std::optional<torch::Tensor> relative_attention_bias,
+        std::optional<torch::Tensor> quant_scale_qkv) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
         T* attention_input = static_cast<T*>(qkv_or_q.slice(0, token_offset).data_ptr());
@@ -508,6 +510,24 @@ public:
                 mla_params.q_pe = static_cast<T*>(q_pe->data_ptr());
                 mla_params.q_pe_ld = q_pe->strides()[1];
                 mla_params.q_pe_stride = q_pe->strides()[0];
+
+                // Fused FP8-Q path: forward caller's quant_q_buffer / scale so
+                // applyMLARopeAndAssignQKVKernelOptContext<kOutputFp8Q=true>
+                // appends rope FP8 in place and the standalone quantize is
+                // skipped. Without this wiring the sparse-MLA context branch
+                // runs the legacy quantize over the bf16 placeholder q.
+                mla_params.bmm1_scale = mla_bmm1_scale.has_value()
+                    ? reinterpret_cast<float*>(mla_bmm1_scale.value().data_ptr())
+                    : nullptr;
+                mla_params.bmm2_scale = mla_bmm2_scale.has_value()
+                    ? reinterpret_cast<float*>(mla_bmm2_scale.value().data_ptr())
+                    : nullptr;
+                mla_params.quant_q_buf
+                    = quant_q_buffer.has_value() ? reinterpret_cast<void*>(quant_q_buffer.value().data_ptr()) : nullptr;
+                mla_params.quant_scale_qkv = quant_scale_qkv.has_value()
+                    ? reinterpret_cast<float const*>(quant_scale_qkv.value().data_ptr())
+                    : nullptr;
+                mla_params.fuse_q_fp8_in_rope = (quant_q_buffer.has_value() && quant_scale_qkv.has_value());
             }
             else if (is_context)
             {
@@ -569,6 +589,12 @@ public:
                     : nullptr;
                 mla_params.quant_q_buf
                     = quant_q_buffer.has_value() ? reinterpret_cast<void*>(quant_q_buffer.value().data_ptr()) : nullptr;
+                mla_params.quant_scale_qkv = quant_scale_qkv.has_value()
+                    ? reinterpret_cast<float const*>(quant_scale_qkv.value().data_ptr())
+                    : nullptr;
+                // Request the fused FP8-Q path; common/attentionOp.cpp gates the
+                // actual skip on FP8 KV cache + absorption mode.
+                mla_params.fuse_q_fp8_in_rope = (quant_q_buffer.has_value() && quant_scale_qkv.has_value());
             }
             mla_params.q_buf = attention_input;
             mla_params.context_buf = reinterpret_cast<T*>(context_buf);
@@ -1089,7 +1115,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> compact_pseudokv_causal_mask, std::optional<int64_t> compact_pseudokv_source_seq_len,
     bool const is_cross, std::optional<torch::Tensor> cross_kv,
     std::optional<torch::Tensor> relative_attention_bias, int64_t relative_attention_max_distance,
-    std::optional<int64_t> spec_decoding_target_max_draft_tokens)
+    std::optional<int64_t> spec_decoding_target_max_draft_tokens, std::optional<torch::Tensor> quant_scale_qkv)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
     bool const hasCompactPseudoKv = compact_pseudokv_key.has_value() || compact_pseudokv_value.has_value()
@@ -1396,10 +1422,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             spec_decoding_bl_tree_mask, spec_bl_tree_first_sparse_mask_offset_kv, attention_sinks, sparse_kv_indices,
             sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets, sparse_attn_indices_block_size,
             num_sparse_topk_value, sparse_mla_topk_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
-            mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
             trtllm_gen_jit_warmup, compressed_kv_cache_pool_ptr, compact_pseudokv_key, compact_pseudokv_value,
             compact_pseudokv_positions, compact_pseudokv_causal_mask, compact_pseudokv_source_seq_len, is_cross,
-            cross_kv, relative_attention_bias);
+            cross_kv, relative_attention_bias, quant_scale_qkv);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -1420,10 +1445,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             spec_decoding_bl_tree_mask, spec_bl_tree_first_sparse_mask_offset_kv, attention_sinks, sparse_kv_indices,
             sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets, sparse_attn_indices_block_size,
             num_sparse_topk_value, sparse_mla_topk_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
-            mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
             trtllm_gen_jit_warmup, compressed_kv_cache_pool_ptr, compact_pseudokv_key, compact_pseudokv_value,
             compact_pseudokv_positions, compact_pseudokv_causal_mask, compact_pseudokv_source_seq_len, is_cross,
-            cross_kv, relative_attention_bias);
+            cross_kv, relative_attention_bias, quant_scale_qkv);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", local_layer_idx);

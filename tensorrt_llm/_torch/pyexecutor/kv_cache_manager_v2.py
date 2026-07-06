@@ -2602,6 +2602,7 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_reserve_draft_tokens: Optional[int] = None,
         use_mrope: bool = False,
         max_beam_width: int = 1,
+        encoder_output_lens: Optional[List[int]] = None,
         num_extra_decoding_steps: int = 0,
         draft_kv_cache_manager: Optional["BaseResourceManager"] = None,
     ):
@@ -2635,8 +2636,10 @@ class KVCacheManagerV2(BaseResourceManager):
             token_num = token_nums[i] if token_nums is not None else 1 + max_num_draft_tokens
             # token_num - 1 is the past history length in generation.
             history_hint = max(0, token_num - 1) if is_gen else None
-            # TODO: support cross attention
-            encoder_input_tokens = None
+            encoder_output_len = encoder_output_lens[i] if encoder_output_lens is not None else None
+            encoder_input_tokens = (
+                [1] * encoder_output_len if encoder_output_len is not None else None
+            )
             # Using 1 instead of 0 prevents NaN during warmup in e.g. Deepseek
             input_tokens = [1 for _ in range(token_num)]
             req = LlmRequest(
@@ -2646,6 +2649,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 sampling_config=SamplingConfig(sampling_params._get_sampling_config()),
                 is_streaming=False,
                 encoder_input_tokens=encoder_input_tokens,
+                encoder_output_len=encoder_output_len,
             )
             req.is_dummy_request = True
             req.paged_kv_block_ids = []
@@ -2772,18 +2776,29 @@ class KVCacheManagerV2(BaseResourceManager):
             self.index_mapper.remove_sequence(request.py_request_id)
 
     def get_batch_cache_indices(
-        self, request_ids: List[int], layer_idx: Optional[int] = None
+        self,
+        request_ids: List[int],
+        layer_idx: Optional[int] = None,
+        num_blocks_per_seq: Optional[Sequence[int]] = None,
     ) -> List[List[int]]:
         if layer_idx is None:
             pool_id = 0
         else:
             pool_id = self.layer_to_pool_mapping_dict[self.layer_offsets[layer_idx]]
         return self._get_batch_cache_indices_by_pool_id(
-            request_ids, pool_id=pool_id, is_kv_aggregate=True
+            request_ids,
+            pool_id=pool_id,
+            is_kv_aggregate=True,
+            num_blocks_per_seq=num_blocks_per_seq,
         )
 
     def _get_batch_cache_indices_by_pool_id(
-        self, request_ids: List[int], *, pool_id: int = 0, is_kv_aggregate: bool = True
+        self,
+        request_ids: List[int],
+        *,
+        pool_id: int = 0,
+        is_kv_aggregate: bool = True,
+        num_blocks_per_seq: Optional[Sequence[int]] = None,
     ) -> List[List[int]]:
         if is_kv_aggregate:
             # Div by kv_factor to index kv cache with size
@@ -2792,18 +2807,25 @@ class KVCacheManagerV2(BaseResourceManager):
         else:
             div_factor = 1
 
+        index_scale = int(self.index_scales[pool_id])
         res = []
 
-        for req_id in request_ids:
-            idx_tensor = torch.as_tensor(self.kv_cache_map[req_id].get_base_page_indices(pool_id))
+        for req_idx, req_id in enumerate(request_ids):
+            kv_cache = self.kv_cache_map[req_id]
+            # Zero-copy page-index buffers are padded to max_blocks_per_seq.
+            # Only convert blocks owned by this request; attention callers
+            # discard the padded tail immediately.
+            num_blocks = kv_cache.num_blocks
+            if num_blocks_per_seq is not None:
+                num_blocks = min(num_blocks, num_blocks_per_seq[req_idx])
+            base_page_indices = kv_cache.get_base_page_indices(pool_id)[:num_blocks]
             res.append(
-                (
-                    torch.where(
-                        idx_tensor != BAD_PAGE_INDEX,
-                        idx_tensor * self.index_scales[pool_id] // div_factor,
-                        BAD_PAGE_INDEX,
-                    )
-                ).tolist()
+                [
+                    base_page_index * index_scale // div_factor
+                    if base_page_index != BAD_PAGE_INDEX
+                    else BAD_PAGE_INDEX
+                    for base_page_index in base_page_indices
+                ]
             )
 
         return res

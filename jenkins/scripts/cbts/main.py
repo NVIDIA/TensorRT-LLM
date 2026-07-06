@@ -242,7 +242,9 @@ def _load_pr_inputs(input_json_path: Path) -> PRInputs:
     # Pre-strip blank- and comment-only `+/-` lines once so every rule
     # sees a "meaningful changes only" diff. Avoids spurious anchor
     # walk-up and stage-select misfires from cosmetic edits.
-    diffs = {path: strip_noop_diff_lines(d) for path, d in data.get("diffs", {}).items()}
+    # A null diff (PR API omits the patch for binary, rename, or
+    # too-large diffs) normalizes to an empty diff.
+    diffs = {path: strip_noop_diff_lines(d or "") for path, d in data.get("diffs", {}).items()}
     return PRInputs(
         changed_files=list(data.get("changed_files", [])),
         diffs=diffs,

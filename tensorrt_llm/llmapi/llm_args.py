@@ -785,8 +785,9 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
 
         DeepGEMM's fp8_fp4_mqa_logits / fp8_fp4_paged_mqa_logits kernels
         require SM>=100, and invokeFusedCatFp4 hard-asserts head_dim==128.
-        Surface both as Pydantic errors so invalid configs fail fast at
-        construction instead of with a cryptic kernel-launch failure.
+        Surface explicitly requested invalid configs as Pydantic errors so
+        they fail fast instead of with a cryptic kernel-launch failure. The
+        DeepSeek-V4 default falls back to fp8 on pre-Blackwell GPUs.
 
         The SM check is skipped when CUDA is unavailable (config
         construction on CPU-only hosts or at doc-gen time), leaving the
@@ -802,10 +803,39 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
                 from tensorrt_llm._utils import get_sm_version
                 sm = get_sm_version()
                 if sm < 100:
-                    raise ValueError(
-                        f"indexer_k_dtype='fp4' requires SM>=100 (Blackwell); "
-                        f"current device is SM{sm}. Set indexer_k_dtype='fp8' "
-                        f"for non-Blackwell GPUs.")
+                    if 'indexer_k_dtype' not in self.model_fields_set:
+                        logger.warning(
+                            "DeepSeek-V4 defaults indexer_k_dtype to 'fp4', "
+                            f"but the current device is SM{sm}; falling back "
+                            "to 'fp8'.")
+                        self.indexer_k_dtype = "fp8"
+                    else:
+                        raise ValueError(
+                            f"indexer_k_dtype='fp4' requires SM>=100 "
+                            f"(Blackwell); current device is SM{sm}. Set "
+                            f"indexer_k_dtype='fp8' for non-Blackwell GPUs.")
+        return self
+
+    @model_validator(mode="after")
+    def _warn_heuristic_topk_unsupported(self):
+        """Warn when GVR Top-K cannot accelerate the configured index_topk.
+
+        This warning does not reject the configuration.
+
+        The C++ ``indexer_topk_decode`` dispatcher silently falls back to the
+        radix Top-K path for unsupported K, so without this warning a user may
+        believe GVR is active when it is not. ``index_topk`` may still be None
+        here (it is filled from the checkpoint later), so only validate
+        concrete values.
+        """
+        supported_topk = (512, 1024, 2048)
+        if (self.enable_heuristic_topk and self.index_topk is not None
+                and self.index_topk not in supported_topk):
+            logger.warning(
+                f"enable_heuristic_topk=True but index_topk={self.index_topk} "
+                f"is not in the GVR-supported set {supported_topk}; the indexer "
+                f"will silently fall back to the radix Top-K path. Set "
+                f"index_topk to one of {supported_topk} to use GVR.")
         return self
 
     def supports_backend(self, backend: str) -> bool:
@@ -908,6 +938,13 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
     index_head_dim: Optional[int] = Field(
         default=128,
         description="The dimension of the DeepSeek-V4 indexer heads.")
+    indexer_k_dtype: Literal["fp8", "fp4"] = Field(
+        default="fp4",
+        description=
+        "Data type used for the indexer K cache. DeepSeek-V4 defaults to "
+        "`fp4` to reduce the per-token indexer K footprint on Blackwell+ "
+        "(SM>=100). Set to `fp8` for the legacy FP8 indexer K cache path.",
+    )
     skip_indexer_for_short_seqs: bool = Field(
         default=False,
         description=
