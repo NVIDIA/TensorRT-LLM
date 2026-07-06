@@ -66,6 +66,9 @@ public:
   // Select the MLA generation kernel.
   void selectMlaGenerationKernel();
 
+  // Select the grouped Q64 MLA generation kernel when the capability predicate matches.
+  void selectGroupedMlaGenerationKernel();
+
 private:
   // computeNumCtas uses the same cluster occupancy helper as enableCgaReduction.
   friend std::tuple<int32_t, int32_t, int32_t> computeNumCtas(FmhaOptions& options,
