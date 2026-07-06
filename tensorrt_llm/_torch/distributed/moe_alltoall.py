@@ -310,9 +310,19 @@ class MoeAlltoAll:
             payload_in_workspace, use_low_precision_combine)
 
         # Reset state for next round
-        self._state = _A2AState()
+        self.reset_state()
 
         return output
+
+    def reset_state(self) -> None:
+        """Reset the dispatch/combine state machine to ``idle``.
+
+        Safe to call between forward passes (or from an error handler) to
+        recover from a forward that called ``dispatch`` but did not reach
+        ``combine`` — e.g. because an OOM aborted the forward. Without this,
+        the next ``dispatch`` would fire the assert at line 239.
+        """
+        self._state = _A2AState()
 
     def get_combine_payload_tensor_in_workspace(
             self, runtime_max_tokens_per_rank: int, hidden_size: int,

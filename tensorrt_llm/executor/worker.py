@@ -69,7 +69,8 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
         # Setup RPC server for stats (skip init_rpc_worker to keep IPC response queue)
         # Only set up if rpc_addr is provided (for stats RPC support)
         if rpc_addr is not None:
-            assert hmac_key, "hmac_key is required when rpc_addr is set"
+            if not hmac_key:
+                raise ValueError("hmac_key is required when rpc_addr is set")
             self.rpc_addr = rpc_addr
             self.hmac_key = hmac_key
             self.start_rpc_server()  # Reuse from RpcWorkerMixin
@@ -281,6 +282,7 @@ def worker_main(
                 proxy_result_queue,
                 postproc_worker_config.postprocess_tokenizer_dir,
                 PostprocWorker.default_record_creator,
+                postproc_worker_config.post_processor_hook,
             )
             postprocess_worker_futures.append(fut)
 

@@ -7,8 +7,8 @@ from typing import Iterable, Mapping, Optional, Set
 import click
 from click.core import ParameterSource
 
-from tensorrt_llm._torch.visual_gen.config import ParallelConfig
 from tensorrt_llm.llmapi.utils import download_hf_partial
+from tensorrt_llm.visual_gen.args import ParallelConfig
 
 logger = logging.getLogger(__name__)
 
@@ -83,12 +83,42 @@ def is_diffusers_model_path(model_path: str) -> bool:
     return True
 
 
-def get_is_diffusion_model(model_path: str):
+def has_registered_llm_architecture(model_path: str) -> bool:
+    """Return whether the model declares a registered LLM/VLM runtime architecture."""
+    config_path = os.path.join(model_path, "config.json")
+    if not os.path.exists(config_path):
+        return False
+
+    with open(config_path) as f:
+        architectures = json.load(f).get("architectures") or []
+
+    # Importing the models package runs the @register_auto_model decorators
+    # that populate MODEL_CLASS_MAPPING. Done lazily to avoid a heavy import at
+    # module load time and to sidestep circular imports via commands.serve.
+    import tensorrt_llm._torch.models  # noqa: F401
+    from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPING
+
+    return any(arch in MODEL_CLASS_MAPPING for arch in architectures)
+
+
+def get_is_diffusion_only_model(model_path: str):
     model_path = _maybe_download_model(model_path)
-    is_diffusion_model = is_diffusers_model_path(model_path)
-    if is_diffusion_model:
-        logger.info("Diffusion model detected")
-    return is_diffusion_model
+    if not is_diffusers_model_path(model_path):
+        return False
+
+    # Some checkpoints ship a diffusers layout (model_index.json) alongside a
+    # regular language/vision-language model (e.g. Cosmos3-Nano). Prefer the
+    # regular model path in that case and only treat the checkpoint as a pure
+    # diffusion model when no registered LLM/VLM architecture is present.
+    if has_registered_llm_architecture(model_path):
+        logger.info(
+            "Diffusers layout detected, but the checkpoint also advertises a "
+            "registered LLM/VLM architecture; treating it as a language model."
+        )
+        return False
+
+    logger.info("Diffusion model detected")
+    return True
 
 
 def get_model_path(extra_argv):

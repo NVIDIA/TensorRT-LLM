@@ -378,6 +378,7 @@ _GlobalTrtllmPlanner = _TrtllmPlanner()
 _TRTLLM_ATTN_FP8_INPUT_SCALE_KEY = "trtllm_attention_input_scale"
 _TRTLLM_ATTN_OUT_SCALE_KEY = "trtllm_attention_out_scale"
 _TRTLLM_ROPE_INFO_KEY = "_trtllm_rope_info"
+_TRTLLM_ATTN_SINKS_F32_KEY = "_trtllm_attention_sinks_f32"
 
 
 def set_trtllm_attention_fp8_input_scale(attn_node: Node, input_scale: Node) -> None:
@@ -1005,6 +1006,26 @@ class TrtllmAttention(AttentionDescriptor):
             cos_sin_node.meta["val"] = cos_sin_tensor
             rope_info["cos_sin_node"] = cos_sin_node
 
+        # Attention sinks: the thop kernel needs fp32, but models store them at
+        # param dtype (e.g. bf16). Pre-cast once here (post weight-load) so the
+        # per-call ``.to(float32)`` is not captured into the CUDA graph — one cast
+        # kernel per layer/token removed. Value is bit-identical to the runtime cast.
+        sinks_node = extract_op_args(attn_node, "sinks")[0]
+        if isinstance(sinks_node, Node) and sinks_node.op == "get_attr":
+            sinks_val = gm
+            for atom in sinks_node.target.split("."):
+                sinks_val = getattr(sinks_val, atom)
+            if isinstance(sinks_val, torch.Tensor) and sinks_val.dtype != torch.float32:
+                f32_name = f"{sinks_node.target.replace('.', '_')}_f32"
+                if not hasattr(gm, f32_name):
+                    gm.register_buffer(
+                        f32_name, sinks_val.detach().to(torch.float32), persistent=False
+                    )
+                with gm.graph.inserting_before(attn_node):
+                    sinks_f32_node = gm.graph.create_node("get_attr", f32_name)
+                sinks_f32_node.meta["val"] = getattr(gm, f32_name)
+                attn_node.meta[_TRTLLM_ATTN_SINKS_F32_KEY] = sinks_f32_node
+
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
         """Extract constants from the source attention node.
@@ -1042,8 +1063,11 @@ class TrtllmAttention(AttentionDescriptor):
 
         # Forward optional attention sinks (per-head learnable scalar) — used by
         # GPT-OSS-style models. Stored as an FX get_attr Node when present and
-        # bound to the actual nn.Parameter at runtime.
-        sinks_node = extract_op_args(source_attn_node, "sinks")[0]
+        # bound to the actual nn.Parameter at runtime. Prefer the fp32-precast
+        # buffer (prepare_node_for_cache_insertion) to avoid a per-call cast.
+        sinks_node = source_attn_node.meta.get(_TRTLLM_ATTN_SINKS_F32_KEY)
+        if not isinstance(sinks_node, Node):
+            sinks_node = extract_op_args(source_attn_node, "sinks")[0]
 
         # Optional out_scale is injected by prepare_node_for_cache_insertion when available.
         out_scale = source_attn_node.meta.get(_TRTLLM_ATTN_OUT_SCALE_KEY)

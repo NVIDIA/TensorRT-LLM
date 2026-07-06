@@ -1,10 +1,15 @@
+import json
+import struct
 import types
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.pyexecutor.model_loader import validate_and_set_kv_cache_quant
+from tensorrt_llm._torch.model_config import _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT, ModelConfig
+from tensorrt_llm._torch.pyexecutor.model_loader import (
+    validate_and_set_kv_cache_quant,
+    validate_encoder_decoder_kv_cache_config,
+)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -16,6 +21,7 @@ def make_pretrained_config(
     head_dim: int | None = None,
     num_hidden_layers: int = 1,
     vocab_size: int = 3000,
+    is_encoder_decoder: bool = False,
 ):
     # A minimal config object that provides the attributes used by
     # ModelConfig.get_bindings_model_config().
@@ -32,6 +38,7 @@ def make_pretrained_config(
         num_hidden_layers=num_hidden_layers,
         vocab_size=vocab_size,
         torch_dtype=torch.float16,
+        is_encoder_decoder=is_encoder_decoder,
     )
 
 
@@ -100,6 +107,15 @@ def _make_model_config_with_kv_quant(kv_cache_quant_algo):
     return ModelConfig(quant_config=QuantConfig(kv_cache_quant_algo=kv_cache_quant_algo))
 
 
+def _make_kv_cache_config(
+    *, use_kv_cache_manager_v2: bool = False, cross_kv_cache_fraction: float | None = None
+):
+    return types.SimpleNamespace(
+        use_kv_cache_manager_v2=use_kv_cache_manager_v2,
+        cross_kv_cache_fraction=cross_kv_cache_fraction,
+    )
+
+
 def test_validate_and_set_kv_cache_quant_auto_uses_checkpoint():
     model_config = _make_model_config_with_kv_quant(QuantAlgo.FP8)
     validate_and_set_kv_cache_quant(model_config, "auto")
@@ -116,3 +132,112 @@ def test_validate_and_set_kv_cache_quant_rejects_invalid_dtype():
     model_config = _make_model_config_with_kv_quant(QuantAlgo.FP8)
     with pytest.raises(ValueError, match="Accepted types are"):
         validate_and_set_kv_cache_quant(model_config, "invalid_dtype")
+
+
+def _write_safetensors_header(checkpoint_dir, tensor_dtype, tensor_shape):
+    shard_name = "model-00001-of-00001.safetensors"
+    header = {
+        _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT: {
+            "dtype": tensor_dtype,
+            "shape": tensor_shape,
+            "data_offsets": [0, 0],
+        }
+    }
+    encoded_header = json.dumps(header).encode("utf-8")
+
+    with open(checkpoint_dir / shard_name, "wb") as f:
+        f.write(struct.pack("<Q", len(encoded_header)))
+        f.write(encoded_header)
+
+    with open(checkpoint_dir / "model.safetensors.index.json", "w") as f:
+        json.dump({"weight_map": {_DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT: shard_name}}, f)
+
+
+@pytest.mark.parametrize(
+    "tensor_dtype,tensor_shape,expected_layout,expected_is_base",
+    [
+        pytest.param("I8", [2048, 2048], "mxfp4", False, id="mxfp4"),
+        pytest.param("U8", [2048, 2048], "nvfp4", False, id="nvfp4"),
+        pytest.param("F8_E4M3", [2048, 4096], None, True, id="base-fp8"),
+    ],
+)
+def test_deepseek_v4_base_checkpoint_detection(
+    tmp_path, tensor_dtype, tensor_shape, expected_layout, expected_is_base
+):
+    _write_safetensors_header(tmp_path, tensor_dtype, tensor_shape)
+
+    assert ModelConfig._detect_deepseek_v4_routed_moe_layout(str(tmp_path)) == expected_layout
+    assert ModelConfig._is_deepseek_v4_base_checkpoint(str(tmp_path)) is expected_is_base
+
+
+def test_model_config_sets_is_encoder_decoder_from_pretrained_config():
+    model_config = ModelConfig(
+        pretrained_config=make_pretrained_config(
+            head_dim=4,
+            is_encoder_decoder=True,
+        )
+    )
+
+    assert model_config.is_encoder_decoder is True
+
+
+def test_validate_encoder_decoder_kv_cache_config_accepts_v1_enc_dec():
+    """V1 KVCacheManager is the default and production target for enc-dec models.
+
+    Both V1 and V2 are supported as long as ``cross_kv_cache_fraction`` is set.
+    """
+    model_config = ModelConfig(
+        pretrained_config=make_pretrained_config(
+            head_dim=4,
+            is_encoder_decoder=True,
+        )
+    )
+
+    validate_encoder_decoder_kv_cache_config(
+        model_config,
+        _make_kv_cache_config(use_kv_cache_manager_v2=False, cross_kv_cache_fraction=0.5),
+    )
+
+
+def test_validate_encoder_decoder_kv_cache_config_requires_cross_fraction():
+    model_config = ModelConfig(
+        pretrained_config=make_pretrained_config(
+            head_dim=4,
+            is_encoder_decoder=True,
+        )
+    )
+
+    with pytest.raises(ValueError, match="cross_kv_cache_fraction to be set"):
+        validate_encoder_decoder_kv_cache_config(
+            model_config,
+            _make_kv_cache_config(use_kv_cache_manager_v2=True),
+        )
+
+
+def test_validate_encoder_decoder_kv_cache_config_rejects_cross_fraction_for_decoder_only():
+    model_config = ModelConfig(
+        pretrained_config=make_pretrained_config(
+            head_dim=4,
+            is_encoder_decoder=False,
+        )
+    )
+
+    with pytest.raises(ValueError, match="should only be set for encoder-decoder models"):
+        validate_encoder_decoder_kv_cache_config(
+            model_config,
+            _make_kv_cache_config(cross_kv_cache_fraction=0.5),
+        )
+
+
+def test_validate_encoder_decoder_kv_cache_config_accepts_v2_enc_dec():
+    model_config = ModelConfig(
+        pretrained_config=make_pretrained_config(
+            head_dim=4,
+            is_encoder_decoder=True,
+        )
+    )
+
+    validate_encoder_decoder_kv_cache_config(
+        model_config,
+        _make_kv_cache_config(use_kv_cache_manager_v2=True, cross_kv_cache_fraction=0.5),
+    )

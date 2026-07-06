@@ -18,7 +18,7 @@ from collections import defaultdict
 from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Iterable, Iterator, cast
+from typing import TYPE_CHECKING, Iterable, Iterator, cast
 
 from .. import rawref
 from .._block_radix_tree import BlockRadixTree, ReuseMatch, ReuseScope
@@ -39,6 +39,7 @@ from .._common import (
 from .._config import DataRole, KVCacheManagerConfig
 from .._life_cycle_registry import LayerGroupId, LifeCycle, LifeCycleId, LifeCycleRegistry
 from .._page import Page, _PageHolder
+from .._stats import KVCacheIterationStatsDelta, KVCacheStatsDelta
 from .._storage._config import BufferId, create_storage_config
 from .._storage._core import PoolGroupIndex, PoolIndex, SlotId
 from .._storage_manager import StorageManager
@@ -57,6 +58,9 @@ from .._utils import (
 )
 from ._kv_cache import _KVCache
 from ._moving_average import MovingAverage
+
+if TYPE_CHECKING:
+    from .._event_manager import KVCacheEventManager
 
 
 @dataclass(slots=True, frozen=True)
@@ -178,6 +182,13 @@ class PageIndexConverter:
         return result
 
 
+@dataclass(slots=True, frozen=True)
+class PoolGroupPeakBlockStats:
+    available: int
+    unavailable: int
+    evictable: int
+
+
 class KVCacheManager:
     __slots__ = (
         "_init_config",
@@ -194,6 +205,13 @@ class KVCacheManager:
         "_num_sampled_kv_caches",
         "_last_adjustment_time",
         "_last_update_num_sampled_kv_caches",
+        "_event_manager",
+        "_stats_enabled",
+        "_committed_stats",
+        "_iteration_stats_by_life_cycle",
+        "_iteration_peak_num_blocks_by_cache_level",
+        "_dirty_stats_kv_cache_ids",
+        "_stats_excluded_kv_cache_ids",
     )
     _init_config: KVCacheManagerConfig
     _life_cycles: LifeCycleRegistry
@@ -216,13 +234,26 @@ class KVCacheManager:
     _num_sampled_kv_caches: int
     _last_adjustment_time: float
     _last_update_num_sampled_kv_caches: int
+    _event_manager: "KVCacheEventManager | None"
+    _stats_enabled: bool
+    _committed_stats: KVCacheStatsDelta
+    _iteration_stats_by_life_cycle: dict[LifeCycleId, KVCacheIterationStatsDelta]
+    _iteration_peak_num_blocks_by_cache_level: TypedIndexList[
+        CacheLevel, TypedIndexList[PoolGroupIndex, PoolGroupPeakBlockStats]
+    ]
+    _dirty_stats_kv_cache_ids: set[int]
+    _stats_excluded_kv_cache_ids: set[int]
 
-    def __init__(self, config: KVCacheManagerConfig) -> None:
+    def __init__(
+        self,
+        config: KVCacheManagerConfig,
+        event_manager: "KVCacheEventManager | None" = None,
+    ) -> None:
         init_cuda_once()
         config = deepcopy(config)
         self._init_config = config
         self._life_cycles = LifeCycleRegistry(config)
-        self._radix_tree = BlockRadixTree(self._life_cycles, config.tokens_per_block)
+        self._radix_tree = BlockRadixTree(self._life_cycles, config.tokens_per_block, event_manager)
         storage_config = create_storage_config(config)
         self._storage = StorageManager(
             self._life_cycles,
@@ -231,6 +262,8 @@ class KVCacheManager:
             config.swa_scratch_reuse,
             typical_batch=config.typical_step,
             constraints=config.constraints,
+            initial_pool_ratio=config.initial_pool_ratio,
+            event_manager=event_manager,
         )
         self._living_kv_caches = set[rawref.ref[_KVCache]]()
         decay = 0.9999
@@ -243,6 +276,13 @@ class KVCacheManager:
         self._num_sampled_kv_caches = 0
         self._last_adjustment_time = time.monotonic()
         self._last_update_num_sampled_kv_caches = 0
+        self._event_manager = event_manager
+        self._stats_enabled = config.enable_stats
+        self._committed_stats = KVCacheStatsDelta()
+        self._iteration_stats_by_life_cycle = {}
+        self._reset_iteration_peak_num_blocks()
+        self._dirty_stats_kv_cache_ids = set()
+        self._stats_excluded_kv_cache_ids = set()
 
     def __del__(self) -> None:
         self.shutdown()
@@ -346,11 +386,13 @@ class KVCacheManager:
         id: int | None = None,
         custom_priority_callback: Callable[[BlockOrdinal, LifeCycle], Priority] = lambda _,
         __: PRIORITY_DEFAULT,
+        expected_prompt_length: int | None = None,
     ) -> _KVCache:
         """
         reuse_scope: namespace to match before matching any tokens.
         custom_priority_callback: takes block index and layer sliding window size, returns priority.
         If priority returned is higher than existing priority for reused blocks, the block priority is updated.
+        expected_prompt_length: optional prompt length hint used to size SWA scratch slots.
         Newly created KV cache is suspended. You need to call resume() with a cuda stream to make it active
         & ready in that stream.
         Returns None if suspended=False and we don't have enough resource.
@@ -364,12 +406,15 @@ class KVCacheManager:
         reuse_match = (
             self._match_reuse(reuse_scope, input_tokens) if input_tokens is not None else None
         )
+        if expected_prompt_length is None and input_tokens is not None:
+            expected_prompt_length = len(input_tokens)
         return _KVCache(
             self,
             reuse_scope,
             reuse_match,
             id,
             custom_priority_callback,
+            expected_prompt_length,
         )
 
     def _match_reuse(
@@ -416,6 +461,129 @@ class KVCacheManager:
     def get_quota(self, cache_level: CacheLevel) -> int:
         return self._storage._levels[cache_level].storage.total_quota
 
+    def _current_block_stats_by_cache_level(
+        self,
+    ) -> TypedIndexList[CacheLevel, TypedIndexList[PoolGroupIndex, PoolGroupPeakBlockStats]]:
+        def collect(
+            cache_level: CacheLevel,
+        ) -> TypedIndexList[PoolGroupIndex, PoolGroupPeakBlockStats]:
+            stats_by_pool_group = self._storage.get_statistics(cache_level)
+            return make_typed(
+                lambda pool_group_index: PoolGroupPeakBlockStats(
+                    available=stats_by_pool_group[pool_group_index].available,
+                    unavailable=stats_by_pool_group[pool_group_index].unavailable,
+                    evictable=stats_by_pool_group[pool_group_index].evictable,
+                ),
+                self._storage.num_pool_groups,
+            )
+
+        return make_typed(collect, self._storage.num_cache_levels)
+
+    def _reset_iteration_peak_num_blocks(self, cache_level: CacheLevel | None = None) -> None:
+        if cache_level is None:
+            self._iteration_peak_num_blocks_by_cache_level = (
+                self._current_block_stats_by_cache_level()
+            )
+            return
+        stats_by_pool_group = self._storage.get_statistics(cache_level)
+        self._iteration_peak_num_blocks_by_cache_level[cache_level] = make_typed(
+            lambda pool_group_index: PoolGroupPeakBlockStats(
+                available=stats_by_pool_group[pool_group_index].available,
+                unavailable=stats_by_pool_group[pool_group_index].unavailable,
+                evictable=stats_by_pool_group[pool_group_index].evictable,
+            ),
+            self._storage.num_pool_groups,
+        )
+
+    def _update_iteration_peak_num_blocks(self) -> None:
+        current = self._current_block_stats_by_cache_level()
+        for cache_level in typed_range(self._storage.num_cache_levels):
+            peak = self._iteration_peak_num_blocks_by_cache_level[cache_level]
+            current_level = current[cache_level]
+            for pool_group_index in typed_range(self._storage.num_pool_groups):
+                peak_stats = peak[pool_group_index]
+                current_stats = current_level[pool_group_index]
+                peak[pool_group_index] = PoolGroupPeakBlockStats(
+                    available=max(peak_stats.available, current_stats.available),
+                    unavailable=max(peak_stats.unavailable, current_stats.unavailable),
+                    evictable=max(peak_stats.evictable, current_stats.evictable),
+                )
+
+    def commit_stats(
+        self,
+        stats: KVCacheStatsDelta,
+        iteration_stats_by_life_cycle: dict[LifeCycleId, KVCacheIterationStatsDelta] | None = None,
+    ) -> None:
+        if not self._stats_enabled:
+            return
+        self._update_iteration_peak_num_blocks()
+        self._committed_stats.add(stats)
+        if iteration_stats_by_life_cycle is None:
+            return
+        for life_cycle, iteration_stats in iteration_stats_by_life_cycle.items():
+            if iteration_stats.empty:
+                continue
+            destination = self._iteration_stats_by_life_cycle.setdefault(
+                life_cycle, KVCacheIterationStatsDelta()
+            )
+            destination.add(iteration_stats)
+
+    def get_committed_stats(self) -> KVCacheStatsDelta:
+        return self._committed_stats.copy()
+
+    def get_and_reset_iteration_stats(self) -> dict[LifeCycleId, KVCacheIterationStatsDelta]:
+        stats = {
+            life_cycle: delta.copy()
+            for life_cycle, delta in self._iteration_stats_by_life_cycle.items()
+            if not delta.empty
+        }
+        self._iteration_stats_by_life_cycle.clear()
+        return stats
+
+    def get_and_reset_iteration_peak_block_stats(
+        self, cache_level: CacheLevel
+    ) -> TypedIndexList[PoolGroupIndex, PoolGroupPeakBlockStats]:
+        self._update_iteration_peak_num_blocks()
+        peak = make_typed(
+            lambda pool_group_index: PoolGroupPeakBlockStats(
+                available=self._iteration_peak_num_blocks_by_cache_level[cache_level][
+                    pool_group_index
+                ].available,
+                unavailable=self._iteration_peak_num_blocks_by_cache_level[cache_level][
+                    pool_group_index
+                ].unavailable,
+                evictable=self._iteration_peak_num_blocks_by_cache_level[cache_level][
+                    pool_group_index
+                ].evictable,
+            ),
+            self._storage.num_pool_groups,
+        )
+        self._reset_iteration_peak_num_blocks(cache_level)
+        return peak
+
+    def mark_stats_dirty(self, kv_cache_id: int | None) -> None:
+        if kv_cache_id is not None:
+            self._dirty_stats_kv_cache_ids.add(kv_cache_id)
+
+    def clear_stats_dirty(self, kv_cache_id: int | None) -> None:
+        if kv_cache_id is not None:
+            self._dirty_stats_kv_cache_ids.discard(kv_cache_id)
+
+    def get_dirty_stats_kv_cache_ids(self) -> set[int]:
+        return self._dirty_stats_kv_cache_ids.copy()
+
+    def mark_stats_excluded(self, kv_cache_id: int | None) -> None:
+        if kv_cache_id is not None:
+            self._stats_excluded_kv_cache_ids.add(kv_cache_id)
+            self.clear_stats_dirty(kv_cache_id)
+
+    def clear_stats_excluded(self, kv_cache_id: int | None) -> None:
+        if kv_cache_id is not None:
+            self._stats_excluded_kv_cache_ids.discard(kv_cache_id)
+
+    def is_stats_excluded(self, kv_cache_id: int | None) -> bool:
+        return kv_cache_id is not None and kv_cache_id in self._stats_excluded_kv_cache_ids
+
     # sorted by CacheLevel from warm to cold
     @property
     def cache_tier_list(self) -> HomoTuple[CacheTier]:
@@ -424,6 +592,10 @@ class KVCacheManager:
     @property
     def tokens_per_block(self) -> int:
         return self._radix_tree.tokens_per_block
+
+    @property
+    def event_manager(self) -> "KVCacheEventManager | None":
+        return self._event_manager
 
     @property
     def allow_seq_rebasing(self) -> bool:
@@ -577,7 +749,7 @@ class KVCacheManager:
             b: TypedIndexList[PoolGroupIndex, float],
             thres: float,
         ) -> bool:
-            return any(not (1 / thres < x / y < thres) for x, y in zip(a, b))
+            return any(not (1 / thres < x / y < thres) for x, y in zip(a, b, strict=True))
 
         if level == GPU_LEVEL:
             return check_mismatch(self._target_ratio_list_gpu, self._current_gpu_ratio, 1.25)
@@ -687,15 +859,19 @@ class KVCacheManager:
 
         for pg in typed_range(num_pool_groups):
             remaining_slots[pg] -= get_num_slots(1)[pg] * (batch_size - 1)
-            assert remaining_slots[pg] >= 0
+            if remaining_slots[pg] < 0:
+                return 0
 
         def is_enough(num_blocks: int) -> bool:
             return all(
                 cnt <= rem
-                for cnt, rem in zip(get_num_slots(num_blocks * tokens_per_block), remaining_slots)
+                for cnt, rem in zip(
+                    get_num_slots(num_blocks * tokens_per_block), remaining_slots, strict=True
+                )
             )
 
-        assert is_enough(1)
+        if not is_enough(1):
+            return 0
         lb = 1
         ub = div_up(token_num_upper_bound, tokens_per_block)
         if is_enough(ub):

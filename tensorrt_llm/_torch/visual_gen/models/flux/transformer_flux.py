@@ -307,6 +307,7 @@ class FluxTransformerBlock(nn.Module):
             eps=eps,
             config=config,
             layer_idx=layer_idx,
+            module_name=f"transformer_blocks.{layer_idx}.attn",
         )
 
         # FFN normalization (TRT-LLM LayerNorm)
@@ -491,6 +492,7 @@ class FluxSingleTransformerBlock(nn.Module):
             pre_only=True,  # No output projection in attention
             config=config,
             layer_idx=layer_idx,
+            module_name=f"single_transformer_blocks.{layer_idx}.attn",
         )
 
     def forward(
@@ -783,7 +785,7 @@ class FluxTransformer2DModel(BaseDiffusionModel):
             hidden_states: Latent image tokens (batch, seq_len, in_channels)
             encoder_hidden_states: T5 text embeddings (batch, txt_seq_len, joint_attention_dim)
             pooled_projections: CLIP pooled text embeddings (batch, pooled_projection_dim)
-            timestep: Timestep tensor (batch,)
+            timestep: Normalized timestep tensor in [0, 1], shape (batch,)
             img_ids: Image position IDs (seq_len, 3) or (batch, seq_len, 3)
             txt_ids: Text position IDs (txt_seq_len, 3) or (batch, txt_seq_len, 3)
             guidance: Guidance scale tensor (batch,) for FLUX.1-dev
@@ -793,6 +795,9 @@ class FluxTransformer2DModel(BaseDiffusionModel):
         Returns:
             Noise prediction tensor of shape (batch, seq_len, patch_size^2 * out_channels)
         """
+        joint_attention_kwargs = dict(joint_attention_kwargs or {})
+        joint_attention_kwargs["timestep"] = timestep
+
         # Embed inputs (contiguous needed for FP8 quantize ops)
         hidden_states = self.x_embedder(hidden_states.contiguous())
 

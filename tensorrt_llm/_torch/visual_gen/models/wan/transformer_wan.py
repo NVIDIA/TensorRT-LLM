@@ -11,6 +11,7 @@ from tensorrt_llm._torch.models.hf_parameter_utils import get_parameter_device
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.mlp import MLP
+from tensorrt_llm._torch.utils import gelu_tanh
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
@@ -314,6 +315,7 @@ class WanBlock(nn.Module):
             config=model_config,
             layer_idx=_layer_idx,
             async_ulysses=self._use_async_ulysses,
+            module_name=f"blocks.{_layer_idx}.attn1",
         )
 
         # Cross-attention with separate Q, K, V
@@ -326,6 +328,7 @@ class WanBlock(nn.Module):
             eps=eps,
             config=model_config,
             layer_idx=_layer_idx,
+            module_name=f"blocks.{_layer_idx}.attn2",
             enable_sequence_parallel=False,
         )
 
@@ -347,7 +350,7 @@ class WanBlock(nn.Module):
             hidden_size=hidden_size,
             intermediate_size=ffn_dim,
             bias=True,
-            activation=lambda x: F.gelu(x, approximate="tanh"),
+            activation=gelu_tanh,  # named (not a lambda) so MLP can detect+fuse GELU+NVFP4
             dtype=dtype,
             config=model_config,
             layer_idx=_layer_idx,
@@ -402,6 +405,7 @@ class WanBlock(nn.Module):
         temb,
         freqs_cos,
         freqs_sin,
+        timestep=None,
     ):
         if temb.ndim == 4:
             # temb: batch_size, seq_len, 6, hidden_size
@@ -431,9 +435,9 @@ class WanBlock(nn.Module):
         # so each V/Q/K GEMM + norm + RoPE overlaps with the peer push on the
         # side stream; both paths return 3D [B, S, H*D].
         if self._use_async_ulysses:
-            attn1_out = self.attn1.forward_async(normed, freqs=freqs)
+            attn1_out = self.attn1.forward_async(normed, freqs=freqs, timestep=timestep)
         else:
-            attn1_out = self.attn1(normed, freqs=freqs)
+            attn1_out = self.attn1(normed, freqs=freqs, timestep=timestep)
 
         x = (x.float() + attn1_out.float() * gate_msa).to(x.dtype)
 
@@ -458,6 +462,7 @@ class WanBlock(nn.Module):
             batch_size=batch_size,
             seq_len=seq_len,
             kv_seq_len=encoder_hidden_states_text.shape[1],
+            timestep=timestep,
         )
 
         # I2V: image cross-attention
@@ -472,6 +477,7 @@ class WanBlock(nn.Module):
                 batch_size=batch_size,
                 seq_len=seq_len,
                 kv_seq_len=encoder_hidden_states_img.shape[1],
+                timestep=timestep,
             )
             attn2_output = attn2_output + attn_img_output
 
@@ -646,8 +652,8 @@ class WanTransformer3DModel(BaseDiffusionModel):
     def forward(
         self,
         hidden_states,
-        timestep,
-        encoder_hidden_states,
+        timestep=None,
+        encoder_hidden_states=None,
         encoder_hidden_states_image=None,
         **kwargs,
     ):
@@ -660,7 +666,11 @@ class WanTransformer3DModel(BaseDiffusionModel):
             3. All-gather output sequence: [B, S/P] -> [B, S]
 
         When TeaCache is enabled, TeaCacheHook intercepts and replaces this call.
+
+        Args:
+            timestep: Normalized scheduler timestep tensor in [0, 1].
         """
+        del kwargs  # Kept for diffusers API compatibility.
         original_shape = hidden_states.shape
         B, C, T, H, W = original_shape
         pt, ph, pw = self.config.patch_size
@@ -678,17 +688,19 @@ class WanTransformer3DModel(BaseDiffusionModel):
         if rope is not None:
             freqs_cos, freqs_sin = rope
 
-        # Time and text/image embeddings
+        # Time and text/image embeddings. WAN timestep embeddings use the
+        # scheduler's 1000-step scale internally.
+        timestep_for_embedding = timestep * 1000
         # Timestep shape: [batch_size] or [batch_size, seq_len]
-        if timestep.ndim == 2:
-            ts_seq_len = timestep.shape[1]
-            timestep = timestep.flatten()
+        if timestep_for_embedding.ndim == 2:
+            ts_seq_len = timestep_for_embedding.shape[1]
+            timestep_for_embedding = timestep_for_embedding.flatten()
         else:
             ts_seq_len = None
 
         temb, temb_proj, encoder_hidden_states, encoder_hidden_states_image = (
             self.condition_embedder(
-                timestep,
+                timestep_for_embedding,
                 encoder_hidden_states,
                 encoder_hidden_states_image,
                 timestep_seq_len=ts_seq_len,
@@ -726,6 +738,7 @@ class WanTransformer3DModel(BaseDiffusionModel):
                 temb_proj,
                 freqs_cos,
                 freqs_sin,
+                timestep=timestep,
             )
 
         # All-gather sequence from all ranks: [B, S/P] -> [B, S] (no-op when inactive).

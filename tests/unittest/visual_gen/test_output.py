@@ -640,13 +640,20 @@ def _make_minimal_client_state():
 
     Carries only the dict + lock state that abandon_request_id and
     _store_response touch, without spawning the worker process or
-    background thread.
+    background thread. Also stubs ``_iter_stats`` and ``pending_requests``
+    because ``_store_response`` records lifecycle snapshots and reads the
+    queue depth on every completion.
     """
+    import queue
+
+    from tensorrt_llm._torch.visual_gen.executor import _IterationStatsTracker
     from tensorrt_llm.visual_gen.visual_gen import DiffusionRemoteClient
 
     client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
     client.completed_responses = {}
     client._abandoned_request_ids = set()
+    client._iter_stats = _IterationStatsTracker()
+    client.pending_requests = queue.Queue()
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)

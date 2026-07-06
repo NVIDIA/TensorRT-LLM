@@ -13,7 +13,8 @@ from tensorrt_llm._torch.weight_sharing import (
     IdentityCheckPolicy, SourceIdentity, check_weight_sharing_compatibility)
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import (ExecutorMemoryType,
-                                          ModelExpressConfig, TorchLlmArgs)
+                                          ModelExpressConfig,
+                                          SparseAttentionConfig, TorchLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
@@ -31,6 +32,7 @@ from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, maybe_create_moe_load_balancer)
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
+from .config_utils import resolve_hf_torch_dtype, resolve_mamba_ssm_cache_dtype
 
 _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
@@ -46,12 +48,10 @@ def validate_and_set_mamba_ssm_cache_dtype(
         mamba_ssm_stochastic_rounding: bool = False,
         mamba_ssm_philox_rounds: int = 10) -> None:
     if mamba_ssm_cache_dtype == "auto":
-        hf_dtype = getattr(config.pretrained_config, "mamba_ssm_cache_dtype",
-                           None)
-        if hf_dtype is not None:
-            mamba_ssm_cache_dtype = str_dtype_to_torch(hf_dtype)
-        else:
-            mamba_ssm_cache_dtype = config.pretrained_config.torch_dtype
+        mamba_ssm_cache_dtype = (
+            resolve_mamba_ssm_cache_dtype(config.pretrained_config)
+            or resolve_hf_torch_dtype(config.pretrained_config)
+            or config.torch_dtype)
     else:
         mamba_ssm_cache_dtype = str_dtype_to_torch(mamba_ssm_cache_dtype)
 
@@ -95,6 +95,28 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
 
     # Apply explicit override from kv_cache_config.dtype.
     model_config.quant_config.kv_cache_quant_algo = mapped_pyt_quant
+
+
+def validate_encoder_decoder_kv_cache_config(model_config: ModelConfig,
+                                             kv_cache_config) -> None:
+    """Validate encoder-decoder KV-cache requirements for the PyTorch runtime.
+
+    Both V1 (``KVCacheManager``, default and production target) and V2
+    (``KVCacheManagerV2``, additive secondary path) are supported for
+    encoder-decoder models.  Both paths require ``cross_kv_cache_fraction``
+    so the cross-attention pool can be sized.
+    """
+    if model_config.is_encoder_decoder:
+        if kv_cache_config.cross_kv_cache_fraction is None:
+            raise ValueError(
+                "Encoder-decoder models require kv_cache_config.cross_kv_cache_fraction to be set."
+            )
+        return
+
+    if kv_cache_config.cross_kv_cache_fraction is not None:
+        raise ValueError(
+            "kv_cache_config.cross_kv_cache_fraction should only be set for encoder-decoder models."
+        )
 
 
 def initialize_dummy_weights(
@@ -462,8 +484,9 @@ class ModelLoader:
             # post_load_* hooks itself, so the shared post-load block below
             # must skip them. RW handles them inside `mem_pool_scope` so the
             # committed pool reflects the post-post_load layout; RO runs
-            # `module.post_load_weights()` before `materialize_module` to
-            # wire aliases prior to zero-copy mapping.
+            # `setup_aliases()` before `materialize_module` to wire aliases
+            # prior to zero-copy mapping, then refreshes derived state after
+            # real GMS tensors are bound.
             gms_post_load_handled = False
             if load_format == LoadFormat.AUTO:
                 # Pass model= so format-specific loaders (e.g. MX) can
@@ -694,22 +717,23 @@ class ModelLoader:
                         # Hook order:
                         #   1. `post_load_apply`: format-specific apply
                         #      work (e.g., MX preshard markers).
-                        #   2. Per-module `post_load_weights`: creates
-                        #      aliases/derived parameter attributes BEFORE
-                        #      `materialize_module` walks the final module
-                        #      tree (including `draft_model` for spec dec).
-                        #   3. `materialize_module`: zero-copy bind GMS
+                        #   2. Per-module `setup_aliases`: creates structural
+                        #      aliases BEFORE `materialize_module` walks the
+                        #      final module tree (including `draft_model` for
+                        #      spec dec).
+                        #   3. SourceIdentity gate: STRICT pre-materialize
+                        #      compatibility check (GMS has no disk fallback).
+                        #   4. `materialize_module`: zero-copy bind GMS
                         #      pool storage onto the model parameters.
-                        #   4. `post_load_publish`: any receiver-side
+                        #   5. Per-module `cache_derived_state`: recompute
+                        #      Python-side state from real, materialized
+                        #      tensors without re-running one-shot transforms.
+                        #   6. `post_load_publish`: any receiver-side
                         #      publish (no-op via the receiver guard).
                         checkpoint_loader.post_load_apply(
                             model, weights_preloaded=True)
 
-                        for module in model.modules():
-                            if hasattr(module,
-                                       'post_load_weights') and not getattr(
-                                           module, '_weights_removed', False):
-                                module.post_load_weights()
+                        self._setup_aliases(model)
 
                         # Pre-materialize compatibility gate. GMS has no
                         # disk-fallback path, so a mismatch raises under STRICT
@@ -717,6 +741,7 @@ class ModelLoader:
                         self._check_gms_source_identity(gms_backend)
 
                         gms_backend.materialize_module(model)
+                        self._walk_cache_state(model)
 
                         checkpoint_loader.post_load_publish(
                             model,
@@ -781,6 +806,16 @@ class ModelLoader:
                 logger.info("moe_load_balancer finalize model done")
 
             torch.cuda.current_stream().synchronize()
+            # Reclaim segments freed during per-module post_load_weights (e.g.
+            # MegaMoE _transform_main_weights releases ~5-6 GiB of redundant
+            # weight Parameters via `.data = empty(0)` that PyTorch's caching
+            # allocator otherwise holds onto). Returning them to the driver
+            # gives downstream stages (KV cache estimation, attention workspace
+            # alloc, autotuner warmup symmetric-fabric setup) full visibility
+            # of free HBM. Single one-shot call after all modules are
+            # finalized; per-layer empty_cache here is unsafe because it can
+            # perturb NVLink barrier synchronization in multi-rank DG init.
+            torch.cuda.empty_cache()
 
         return model, moe_load_balancer
 
@@ -806,22 +841,24 @@ class ModelLoader:
 
     @staticmethod
     def _setup_aliases(model: DecoderModelForCausalLM) -> None:
-        """Run top-level structural alias setup if the model defines it.
+        """Run structural alias setup on eligible modules.
 
-        Alias wiring is a model-level concern. It is intentionally not a
-        recursive module walk, because migrated aliases are expected to be set
-        by the root model that owns the layer graph.
+        The walk is duck-typed so modules can opt in without inheriting a
+        shared base class. Modules whose weights were removed are skipped,
+        matching the legacy full post-load walk.
 
         Args:
-            model: Root decoder model whose top-level alias hook should run.
+            model: Root decoder model whose module tree should be visited.
 
         Returns:
             None.
         """
-        setup_aliases: Optional[Callable[[], None]] = getattr(
-            model, 'setup_aliases', None)
-        if setup_aliases is not None:
-            setup_aliases()
+        for module in model.modules():
+            setup_aliases: Optional[Callable[[], None]] = getattr(
+                module, 'setup_aliases', None)
+            if setup_aliases is not None and not getattr(
+                    module, '_weights_removed', False):
+                setup_aliases()
 
     @staticmethod
     def _walk_transform(model: DecoderModelForCausalLM) -> None:
@@ -912,8 +949,11 @@ class ModelLoader:
         """Reload model weights without running post-load hooks.
 
         Reload is used by incremental update paths that may provide only a
-        partial set of replacement weights. The owner of the update lifecycle is
-        responsible for running post-load processing once all bytes are present.
+        partial set of replacement weights. Full reloads reset transform guards
+        before rebinding fresh weights. Partial reloads keep existing transform
+        guards intact because untouched modules may already contain transformed
+        live weights. The owner of the update lifecycle is responsible for
+        running post-load processing once all bytes are present.
 
         Args:
             model: Model instance receiving the replacement weights.
@@ -929,6 +969,8 @@ class ModelLoader:
                 "Cannot reload weights: weight_mapper was not initialized. "
                 "This can happen when the initial load used GMS, MX P2P, or "
                 "VISION_ONLY, which bypass the standard weight mapping path.")
+        if not allow_partial_loading:
+            self._reset_weights_transformed(model)
         self._call_load_weights(model.load_weights,
                                 weights,
                                 self.weight_mapper,
@@ -988,6 +1030,7 @@ class ModelLoader:
             use_cute_dsl_blockscaling_bmm=self.llm_args.
             use_cute_dsl_blockscaling_bmm,
             video_pruning_rate=self.llm_args.video_pruning_rate,
+            multimodal_config=self.llm_args.multimodal_config,
             use_cute_dsl_bf16_bmm=self.llm_args.use_cute_dsl_bf16_bmm,
             use_cute_dsl_bf16_gemm=self.llm_args.use_cute_dsl_bf16_gemm,
         )
@@ -1021,6 +1064,8 @@ class ModelLoader:
                 f"{type(config.pretrained_config).__name__}: {e}. "
                 f"AllReduce pre-allocation will be skipped.")
 
+        validate_encoder_decoder_kv_cache_config(config,
+                                                 self.llm_args.kv_cache_config)
         validate_and_set_kv_cache_quant(config,
                                         self.llm_args.kv_cache_config.dtype)
         validate_and_set_mamba_ssm_cache_dtype(

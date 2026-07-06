@@ -22,6 +22,7 @@ from tensorrt_llm._torch.models.modeling_nemotron_nano import (
     NanoV2VLMultimodalEncoder,
     NanoV2VLVisionEncoder,
     NemotronH_Nano_VL_V2,
+    _get_vision_encoder_cuda_graph_config,
 )
 from tensorrt_llm._torch.models.modeling_parakeet import ProjectedParakeet
 from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_VISION_ENCODER_MAPPING
@@ -35,7 +36,11 @@ from tensorrt_llm.inputs import (
 )
 from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalRuntimeData
 from tensorrt_llm.llmapi import KvCacheConfig
-from tensorrt_llm.llmapi.llm_args import CudaGraphConfig
+from tensorrt_llm.llmapi.llm_args import (
+    CudaGraphConfig,
+    MultimodalConfig,
+    MultimodalEncoderCudaGraphConfig,
+)
 from tensorrt_llm.sampling_params import SamplingParams
 
 MODEL_PATH = str(os.path.join(llm_models_root(), "NVIDIA-Nemotron-Nano-12B-v2-VL-BF16"))
@@ -202,6 +207,22 @@ def test_nemotron_nano_rejects_evs_attached_video_embeddings():
             input_ids=torch.tensor([[20]], dtype=torch.long),
             multimodal_params=[param],
         )
+
+
+def test_get_vision_encoder_cuda_graph_config():
+    config = MultimodalEncoderCudaGraphConfig(buckets=[(1280, 1)])
+    mm_config = MultimodalConfig(encoder_cuda_graph={"vision": config})
+
+    assert _get_vision_encoder_cuda_graph_config(mm_config) is config
+
+
+def test_get_vision_encoder_cuda_graph_config_rejects_unknown_modalities():
+    mm_config = MultimodalConfig(
+        encoder_cuda_graph={"audio": MultimodalEncoderCudaGraphConfig(buckets=[(1024, 1)])}
+    )
+
+    with pytest.raises(ValueError, match="Unsupported multimodal encoder CUDA graph modalities"):
+        _get_vision_encoder_cuda_graph_config(mm_config)
 
 
 @pytest.fixture(scope="function")

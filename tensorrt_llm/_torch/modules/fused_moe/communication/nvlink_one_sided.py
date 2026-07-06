@@ -51,7 +51,7 @@ class NVLinkOneSided(Communication):
     """
 
     # Constants from C++ (must match moeAlltoAllKernels.h)
-    MAX_RANKS = 64
+    MAX_RANKS = 128
     MAX_TOP_K = 8
     MAX_PAYLOADS = 8
 
@@ -541,9 +541,19 @@ class NVLinkOneSided(Communication):
         )
 
         # Reset state for next round
-        self._dispatch_state = {"phase": "idle"}
+        self.reset_state()
 
         return output
+
+    def reset_state(self) -> None:
+        """Reset the dispatch/combine state machine to ``idle``.
+
+        Safe to call between forward passes (or from an error handler) to
+        recover from a forward that called ``dispatch`` but did not reach
+        ``combine`` — e.g. because an OOM aborted the forward. Without this,
+        the next ``dispatch`` would raise ``dispatch called twice``.
+        """
+        self._dispatch_state = {"phase": "idle"}
 
     def get_combine_payload_tensor_in_workspace(
         self, runtime_max_tokens_per_rank: int, hidden_size: int, dtype: torch.dtype

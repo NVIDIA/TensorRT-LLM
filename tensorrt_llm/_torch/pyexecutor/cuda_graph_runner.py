@@ -8,7 +8,8 @@ import torch
 
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.llmapi.llm_args import (BaseSparseAttentionConfig,
-                                          DecodingBaseConfig)
+                                          DecodingBaseConfig,
+                                          SeqLenAwareSparseAttentionConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -18,10 +19,11 @@ from ..expert_statistic import ExpertStatistic
 from ..memory_buffer_utils import get_memory_buffers
 from ..modules.multi_stream_utils import with_multi_stream
 from ..speculative.eagle3 import Eagle3ResourceManager
+from ..speculative.interface import SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import get_draft_kv_cache_manager
 from ..utils import make_weak_ref, piecewise_cuda_graph
-from .llm_request import get_draft_token_length
+from .llm_request import LlmRequest, get_draft_token_length
 from .resource_manager import (BaseResourceManager, ResourceManager,
                                ResourceManagerType)
 from .sampler import SampleStateTensors
@@ -29,7 +31,12 @@ from .scheduler import ScheduledRequests
 
 # A large prime number used for dummy request IDs to avoid collisions
 CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
-KeyType: TypeAlias = Tuple[int, int, bool, bool]
+# Gen dummies get prompt_len = token_num - 1. Before capturing enc-dec decode
+# graphs, prepare_cross_batch temporarily runs each dummy generation request
+# as a one-token context chunk to write its cross-KV cache, so enc-dec
+# dummies need one prompt token plus one generated token.
+ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM = 2
+KeyType: TypeAlias = Tuple[int, int, bool, bool, bool]
 
 
 @dataclass
@@ -76,6 +83,7 @@ class CUDAGraphRunnerConfig:
     original_max_total_draft_tokens: int
     is_draft_model: bool
     enable_attention_dp: bool
+    is_encoder_decoder: bool
     batch_size: int
     mapping: Optional[Mapping]
     dist: Optional[Distributed]
@@ -105,13 +113,14 @@ class CUDAGraphRunner:
         self.max_beam_width = config.max_beam_width
         self.spec_config = config.spec_config
         self.sparse_config = config.sparse_attention_config
+        self.is_encoder_decoder = config.is_encoder_decoder
 
         self.graphs: Dict[KeyType, torch.cuda.CUDAGraph] = {}
         self.graph_outputs: Dict[KeyType,
                                  Callable[[], Optional[torch.Tensor]]] = {}
         self.graph_metadata: Dict[KeyType, Dict[str, Any]] = {}
         self.memory_pool = config.cuda_graph_mem_pool
-        self.padding_dummy_requests: Dict[int, "Request"] = {}
+        self.padding_dummy_requests: Dict[int, LlmRequest] = {}
         self.dynamic_draft_len_mapping = config.dynamic_draft_len_mapping
 
         self.shared_static_tensors: Dict[str, torch.Tensor] = {}
@@ -126,8 +135,10 @@ class CUDAGraphRunner:
 
     def _create_shared_static_tensors(self):
         """Allocates static tensors sized for the largest possible batch."""
-        max_draft_len = self.config.original_max_total_draft_tokens if self.config.spec_config is not None else 0
-        token_per_request = max_draft_len + 1
+        runtime_draft_token_buffer_width = (
+            self.config.original_max_total_draft_tokens
+            if self.config.spec_config is not None else 0)
+        token_per_request = runtime_draft_token_buffer_width + 1
         max_total_tokens = (self.max_supported_batch_size *
                             self.max_beam_width * token_per_request)
         max_total_tokens = min(max_total_tokens, self.config.max_num_tokens)
@@ -150,8 +161,8 @@ class CUDAGraphRunner:
             self,
             batch: ScheduledRequests,
             new_tensors_device: Optional[SampleStateTensors] = None):
-        if self.sparse_config is not None and self.sparse_config.needs_separate_short_long_cuda_graphs(
-        ):
+        if (isinstance(self.sparse_config, SeqLenAwareSparseAttentionConfig)
+                and self.sparse_config.needs_separate_short_long_cuda_graphs()):
             # Some sparse attention algorithms need to use different forward paths for short and long sequences.
             # For example, the DSA can skip the MQA and Top-K in the indexer for short sequences to reduce the
             # computational overhead. To support this feature, we need to capture separate CUDA graphs for short
@@ -197,11 +208,20 @@ class CUDAGraphRunner:
             self,
             batch: ScheduledRequests,
             new_tensors_device: Optional[SampleStateTensors] = None,
-            spec_resource_manager: Optional[BaseResourceManager] = None):
+            spec_resource_manager: Optional[BaseResourceManager] = None,
+            spec_metadata: Optional[SpecMetadata] = None):
         batch_size = batch.batch_size
 
         # Get the sequence length mode.
         short_seq_len_mode = self._get_seq_len_mode(batch, new_tensors_device)
+
+        # Spec one-engine sampler has two code paths (argmax fast-path vs
+        # advanced sampling kernel). Include this in the key so we capture
+        # both variants and dispatch at replay based on actual batch state.
+        # Default to True (greedy fast-path) when the metadata doesn't carry
+        # this field (non-one-engine paths or non-spec batches).
+        is_all_greedy_sample = bool(
+            getattr(spec_metadata, "is_all_greedy_sample", True))
 
         if self.config.is_draft_model and spec_resource_manager is not None and isinstance(
                 spec_resource_manager, Eagle3ResourceManager):
@@ -209,7 +229,7 @@ class CUDAGraphRunner:
             # Because we will pad the input to 'max_draft_len' length for the first draft layer.
             draft_len = self.config.original_max_draft_len if spec_resource_manager.is_first_draft else 0
             key = (batch_size, draft_len, spec_resource_manager.is_first_draft,
-                   short_seq_len_mode)
+                   short_seq_len_mode, is_all_greedy_sample)
         else:
             # With dynamic spec decode, the draft length may be zero even when enable_spec_decode is True,
             # so we need to get the draft length from the batch instead of using enable_spec_decode.
@@ -219,8 +239,35 @@ class CUDAGraphRunner:
             draft_len = max(draft_len_list)
             assert len(
                 set(draft_len_list)) == 1, "All draft lengths must be the same"
-            key = (batch_size, draft_len, False, short_seq_len_mode)
+            key = (batch_size, draft_len, False, short_seq_len_mode,
+                   is_all_greedy_sample)
         return key
+
+    @staticmethod
+    def _get_mrope_position_delta(request: Any) -> Optional[Any]:
+        mrope_position_delta = getattr(request, "py_mrope_position_delta", None)
+        if mrope_position_delta is not None:
+            return mrope_position_delta
+
+        multimodal_data = getattr(request, "py_multimodal_data", None)
+        if not multimodal_data:
+            return None
+
+        mrope_config = multimodal_data.get("mrope_config")
+        if mrope_config is None:
+            return None
+        return mrope_config.get("mrope_position_deltas")
+
+    @staticmethod
+    def _needs_mrope_delta_cache_update(request: Any) -> bool:
+        if request.py_seq_slot is None or request.is_dummy:
+            return False
+
+        if getattr(request, "py_mrope_delta_cache_slot",
+                   None) == request.py_seq_slot:
+            return False
+
+        return CUDAGraphRunner._get_mrope_position_delta(request) is not None
 
     def __del__(self):
         self.clear()
@@ -230,7 +277,7 @@ class CUDAGraphRunner:
         batch: ScheduledRequests,
         enable_spec_decode: bool,
         attn_metadata: Any,
-        spec_metadata: Optional[Any] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
         draft_tokens_cuda: Optional[torch.Tensor] = None,
         new_tensors_device: Optional[SampleStateTensors] = None,
         spec_resource_manager: Optional[BaseResourceManager] = None,
@@ -264,16 +311,15 @@ class CUDAGraphRunner:
         if not self.enabled or not can_run_cuda_graph:
             return None, None, None
         if self.config.use_mrope and any(
-                request.py_seq_slot is not None and not request.is_dummy
-                and getattr(request, "py_mrope_delta_cache_slot",
-                            None) != request.py_seq_slot
+                self._needs_mrope_delta_cache_update(request)
                 for request in batch.generation_requests):
-            # Requests whose current seq slot has not been seeded in the
-            # model-side MRoPE delta cache must run eagerly. Later decode steps
-            # can replay CUDA graphs using the cache.
+            # Some MRoPE paths have no per-request delta (for example,
+            # Qwen3.5 configs normalized to text-only decoding). Requests that
+            # do carry a delta must first populate the model-side cache for their
+            # current seq slot before graph replay.
             return None, None, None
         key = self.get_graph_key(batch, new_tensors_device,
-                                 spec_resource_manager)
+                                 spec_resource_manager, spec_metadata)
 
         if key in self.graphs:
             return self.graph_metadata[key][
@@ -474,11 +520,24 @@ class CUDAGraphRunner:
         if padding_size + batch.batch_size > self.config.batch_size:
             return 0
 
+        runtime_tokens_per_gen_step = (
+            self.spec_config.get_runtime_tokens_per_gen_step(runtime_draft_len)
+            if self.spec_config is not None else 1 + runtime_draft_len)
+        runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
+
         # No padding if it would create too many concurrent requests.
         # This is not strictly required, but we should probably
         # respect the requirement just in case that changes in the future.
         # Use per-draft-len dummy requests for dynamic draft length support.
         if runtime_draft_len not in self.padding_dummy_requests:
+            dummy_encoder_output_len = None
+            if self.is_encoder_decoder:
+                cross_kv_cache_manager = resource_manager.get_resource_manager(
+                    ResourceManagerType.CROSS_KV_CACHE_MANAGER)
+                if cross_kv_cache_manager is None:
+                    return 0
+                dummy_encoder_output_len = self._get_padding_dummy_encoder_output_len(
+                    cross_kv_cache_manager)
 
             # Get draft KV cache manager only for one-model speculative decoding.
             # In two-model mode, each model has its own KV cache manager, so
@@ -490,10 +549,14 @@ class CUDAGraphRunner:
             dummy_request_id = CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len
             dummy_request = kv_cache_manager.add_dummy_requests(
                 [dummy_request_id],
+                token_nums=[ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM]
+                if self.is_encoder_decoder else None,
                 is_gen=True,
-                max_num_draft_tokens=runtime_draft_len,
+                max_num_draft_tokens=runtime_draft_token_buffer_width,
                 use_mrope=self.config.use_mrope,
                 max_beam_width=self.config.max_beam_width,
+                encoder_output_lens=[dummy_encoder_output_len]
+                if dummy_encoder_output_len is not None else None,
                 draft_kv_cache_manager=draft_kv_cache_manager)
 
             if dummy_request is None:
@@ -501,6 +564,11 @@ class CUDAGraphRunner:
             else:
                 dummy_request = dummy_request[0]
             dummy_request.is_cuda_graph_dummy = True
+            if self.is_encoder_decoder:
+                if not self._add_cross_dummy_request(
+                        dummy_request, resource_manager,
+                        dummy_encoder_output_len, draft_kv_cache_manager):
+                    return 0
 
             spec_res_mgr = resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
@@ -511,6 +579,44 @@ class CUDAGraphRunner:
         padding_dummy_request = self.padding_dummy_requests[runtime_draft_len]
         batch.generation_requests.extend([padding_dummy_request] * padding_size)
         return padding_size
+
+    def _add_cross_dummy_request(
+            self, dummy_request: LlmRequest, resource_manager: ResourceManager,
+            encoder_output_len: int,
+            draft_kv_cache_manager: Optional[BaseResourceManager]) -> bool:
+        cross_kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.CROSS_KV_CACHE_MANAGER)
+        if cross_kv_cache_manager is None:
+            return False
+
+        dummy_request.py_encoder_output = None
+        dummy_request.py_skip_cross_kv_projection = True
+
+        encoder_output_lens = [encoder_output_len]
+        cross_dummy_requests = cross_kv_cache_manager.add_dummy_requests(
+            request_ids=[dummy_request.py_request_id],
+            token_nums=encoder_output_lens,
+            is_gen=True,
+            max_beam_width=self.config.max_beam_width,
+            encoder_output_lens=encoder_output_lens)
+        if cross_dummy_requests is not None:
+            return True
+
+        kv_cache_manager = resource_manager.get_resource_manager(
+            self.config.kv_cache_manager_key)
+        kv_cache_manager.free_resources(dummy_request)
+        if draft_kv_cache_manager is not None:
+            draft_kv_cache_manager.free_resources(dummy_request)
+        return False
+
+    @staticmethod
+    def _get_padding_dummy_encoder_output_len(
+            cross_kv_cache_manager: Any) -> int:
+        encoder_output_len = 1
+        max_seq_len = getattr(cross_kv_cache_manager, "max_seq_len", None)
+        if max_seq_len is not None:
+            encoder_output_len = min(encoder_output_len, int(max_seq_len))
+        return encoder_output_len
 
     def _round_up_batch_size(self, batch_size: int) -> int:
         """Finds the smallest supported graph batch size >= the given size."""
@@ -589,11 +695,11 @@ class EncoderCUDAGraphRunnerConfig:
 
 
 class EncoderCUDAGraphRunner:
-    """CUDA graph runner for models using encode_only path.
+    """CUDA graph runner for no-cache encoder forward passes.
 
-    Designed for the `LLM.encode()` API — consumes raw inputs dicts with
-    `input_ids` (flat [total_tokens]), `seq_lens` ([batch_size]). Encoder CUDA graphs
-    are keyed on the 3-tuple (padded_batch_size, padded_num_tokens, padded_max_seq_len)
+    Designed for encoder inputs with `input_ids` (flat [total_tokens]) and
+    `seq_lens` ([batch_size]). Encoder CUDA graphs are keyed on the 3-tuple
+    (padded_batch_size, padded_num_tokens, padded_max_seq_len).
 
     Restricted to `TrtllmAttentionMetadata` — FlashInfer's per-batch planner state is not compatible with CUDA graph capture/replay.
     """
@@ -816,6 +922,14 @@ class EncoderCUDAGraphRunner:
         # New key not yet captured. Only create metadata if capture is
         # allowed (warmup time); otherwise fall back to eager.
         if not self._capture_allowed:
+            return None, None
+
+        if "multi_item_part_lens" in inputs:
+            # See model_engine.py for more details
+            logger.warning_once(
+                "Encoder CUDA graph does not support multi-item scoring; "
+                "falling back to eager.",
+                key="encoder_cuda_graph_multi_item_scoring_warning")
             return None, None
 
         if attn_metadata.has_cross_sub_metadata:

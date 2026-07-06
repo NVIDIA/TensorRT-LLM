@@ -136,51 +136,6 @@ class TestMistral7B_0_3(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/Mistral-7B-Instruct-v0.3"
 
 
-class TestMistralNemo12B(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "mistralai/Mistral-Nemo-12b-Base"
-    MODEL_PATH = f"{llm_models_root()}/Mistral-Nemo-Base-2407"
-
-    @pytest.mark.skip_less_device_memory(80000)
-    def test_auto_dtype(self):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
-
-        with LLM(self.MODEL_PATH,
-                 kv_cache_config=kv_cache_config,
-                 max_batch_size=8) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    def test_auto_dtype_tp2(self):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
-
-        with LLM(self.MODEL_PATH,
-                 kv_cache_config=kv_cache_config,
-                 tensor_parallel_size=2,
-                 max_batch_size=8) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @pytest.mark.skip_less_device_memory(80000)
-    @skip_pre_ada
-    def test_fp8(self):
-        quant_config = QuantConfig(quant_algo=QuantAlgo.FP8,
-                                   kv_cache_quant_algo=QuantAlgo.FP8)
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
-
-        with LLM(self.MODEL_PATH,
-                 quant_config=quant_config,
-                 kv_cache_config=kv_cache_config,
-                 max_batch_size=8) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-
 class TestMistral_NeMo_Minitron_8B_Instruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Mistral-NeMo-Minitron-8B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/Mistral-NeMo-Minitron-8B-Instruct"

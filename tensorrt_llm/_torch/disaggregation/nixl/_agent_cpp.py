@@ -1,4 +1,8 @@
+import os
+import time
+
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.logger import logger
 from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (  # noqa: E402
     AgentDesc,
     BaseAgentConfig,
@@ -16,8 +20,9 @@ from ..base.agent import BaseTransferAgent, RegMemoryDescs, TransferRequest, Tra
 class BindingsNixlTransferStatus(TransferStatus):
     """TransferStatus wrapper using C++ bindings with GIL release."""
 
-    def __init__(self, cpp_status):
+    def __init__(self, cpp_status, agent_name: str = "?"):
         self._cpp_status = cpp_status
+        self._agent_name = agent_name
 
     def is_completed(self) -> bool:
         """Check if transfer is completed (releases GIL)."""
@@ -26,9 +31,24 @@ class BindingsNixlTransferStatus(TransferStatus):
     @nvtx_range("BindingsNixlTransferStatus.wait")
     def wait(self, timeout_ms=None) -> bool:
         """Wait for transfer to complete (releases GIL)."""
+        start_time = time.time()
         if timeout_ms is None:
             timeout_ms = -1
-        return self._cpp_status.wait(timeout_ms) == TransferState.SUCCESS
+        result = self._cpp_status.wait(timeout_ms)
+        if result != TransferState.SUCCESS:
+            logger.error(
+                f"NIXL (cpp binding) wait returned non-SUCCESS state={result} "
+                f"after {time.time() - start_time:.3f}s (agent={self._agent_name})."
+            )
+        return result == TransferState.SUCCESS
+
+    def last_status_str(self) -> str:
+        get = getattr(self._cpp_status, "get_last_status_str", None)
+        return get() if get is not None else "<unavailable>"
+
+    def last_status(self) -> int:
+        get = getattr(self._cpp_status, "get_last_status", None)
+        return int(get()) if get is not None else -1
 
 
 class BindingsNixlTransferAgent(BaseTransferAgent):
@@ -64,6 +84,27 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
         )
         self._cpp_agent = CppNixlTransferAgent(config)
         self.name = name
+        logger.info(
+            f"BindingsNixlTransferAgent init: agent={name} "
+            f"use_prog_thread={use_prog_thread} num_threads={num_threads} "
+            f"enable_telemetry={enable_telemetry} backend_params={backend_params} "
+            f"UCX_TLS={os.environ.get('UCX_TLS', '<unset>')} "
+            f"UCX_LOG_LEVEL={os.environ.get('UCX_LOG_LEVEL', '<unset>')}"
+        )
+
+    def shutdown(self):
+        cpp_agent = getattr(self, "_cpp_agent", None)
+        if cpp_agent is None:
+            return
+        # Null out first so a re-entrant call after a raise is a no-op; errors propagate.
+        self._cpp_agent = None
+        cpp_agent.shutdown()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc_val, _exc_tb):
+        self.shutdown()
 
     def register_memory(self, descs: RegMemoryDescs):
         """Register memory regions."""
@@ -121,7 +162,7 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
         request should be a C++ TransferRequest (from tensorrt_llm_transfer_agent_binding).
         """
         cpp_status = self._cpp_agent.submit_transfer_requests(request)
-        return BindingsNixlTransferStatus(cpp_status)
+        return BindingsNixlTransferStatus(cpp_status, agent_name=self.name)
 
     def _convert_reg_memory_descs(self, descs: RegMemoryDescs) -> "MemoryDescs":
         """Convert Python RegMemoryDescs to C++ MemoryDescs.

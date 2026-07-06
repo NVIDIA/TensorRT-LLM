@@ -105,7 +105,11 @@ def build_document(
         "l_total_cases": total_cases,
         "l_cbts_cases": cbts_cases,
         "d_case_skip_rate": round(case_skip_rate, 4),
-        "flat_detail": {"hit_stages": affected, "scopes": list(decision.get("scopes") or [])},
+        "flat_detail": {
+            "hit_stages": affected,
+            "scopes": list(decision.get("scopes") or []),
+            "split_counts": decision.get("affected_stage_split_counts") or {},
+        },
     }
 
 

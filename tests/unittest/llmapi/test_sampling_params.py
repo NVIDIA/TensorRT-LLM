@@ -12,6 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
+import json
+
 import pytest
 import torch
 
@@ -20,7 +23,13 @@ from tensorrt_llm.llmapi.thinking_budget import (
     add_thinking_budget_logits_processor,
 )
 from tensorrt_llm.sampling_params import MAX_TOP_LOGPROBS, SamplingParams, check_logprobs_limit
-from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest, CompletionRequest
+from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionRequest,
+    CompletionRequest,
+    KVCacheTruncateRequest,
+    ensure_request_chat_template_allowed,
+)
+from tensorrt_llm.serve.resource_governor import ResourceGovernor
 
 
 @pytest.mark.parametrize("field", ["logprobs", "prompt_logprobs", "top_logprobs"])
@@ -52,6 +61,50 @@ def test_chat_top_logprobs_request_limit():
             logprobs=True,
             top_logprobs=MAX_TOP_LOGPROBS + 1,
         )
+
+
+def test_chat_template_request_override_respects_runtime_policy():
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[{"role": "user", "content": "hi"}],
+        chat_template="{{ messages }}",
+    )
+
+    with pytest.raises(ValueError, match="chat_template cannot be supplied"):
+        ensure_request_chat_template_allowed(request, allow_request_chat_template=False)
+
+    ensure_request_chat_template_allowed(request, allow_request_chat_template=True)
+
+
+def test_kv_cache_truncate_chat_template_respects_runtime_policy():
+    request = KVCacheTruncateRequest(
+        model="test",
+        messages=[{"role": "user", "content": "hi"}],
+        chat_template="{{ messages }}",
+    )
+
+    with pytest.raises(ValueError, match="chat_template cannot be supplied"):
+        ensure_request_chat_template_allowed(request, allow_request_chat_template=False)
+
+    ensure_request_chat_template_allowed(request, allow_request_chat_template=True)
+
+
+def test_resource_governor_rejects_request_chat_template_by_default():
+    governor = ResourceGovernor(
+        resource_governor_queue=None,
+        tokenizer=None,
+        model_config=None,
+    )
+    request = KVCacheTruncateRequest(
+        model="test",
+        messages=[{"role": "user", "content": "hi"}],
+        chat_template="{{ messages }}",
+    )
+
+    response = asyncio.run(governor._truncate_kv_cache(request))
+
+    assert response.status_code == 400
+    assert json.loads(response.body)["error"]
 
 
 def test_completion_logprobs_assignment_revalidates():

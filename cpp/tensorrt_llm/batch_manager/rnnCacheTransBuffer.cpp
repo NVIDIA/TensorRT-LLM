@@ -163,7 +163,7 @@ size_t RnnCacheTransBufferManager::preAllocBufferSize(
     size_t transferBufferSize
         = rnnStateSizeBytes > 0 ? rnnStateSizeBytes : common::getEnvMemSizeForKVCacheTransferBuffer();
 
-    bool useFabricMemory = kv_cache_manager::FabricMemory::supportFbaricMemory()
+    bool useFabricMemory = kv_cache_manager::FabricMemory::supportFabricMemory()
         && (!(common::getEnvKVCacheTransferUseSyncBuffer() || common::getEnvKVCacheTransferUseAsyncBuffer()));
 
     if (useFabricMemory)
