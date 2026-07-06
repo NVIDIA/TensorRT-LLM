@@ -115,6 +115,7 @@ class DisaggServerConfig():
     # fleet delegates to it; when absent, num_workers>1 starts an implicit in-process
     # coordinator and num_workers==1 runs a single self-contained server.
     disagg_coordinator_url: Optional[str] = None
+    internal_request_auth_key: Optional[str] = None
 
 
 @dataclass
@@ -203,6 +204,7 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                        gen_tokids_ctxbytes: bool = False,
                        num_workers: int = 1,
                        disagg_coordinator_url: Optional[str] = None,
+                       internal_request_auth_key: Optional[str] = None,
                        **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
     generation_servers = generation_servers or {}
@@ -260,6 +262,10 @@ def extract_disagg_cfg(hostname: str = 'localhost',
     config.gen_tokids_ctxbytes = gen_tokids_ctxbytes
     config.num_workers = num_workers
     config.disagg_coordinator_url = disagg_coordinator_url
+    if internal_request_auth_key is not None and not isinstance(
+            internal_request_auth_key, str):
+        raise ValueError("internal_request_auth_key must be a string")
+    config.internal_request_auth_key = internal_request_auth_key
     return config
 
 

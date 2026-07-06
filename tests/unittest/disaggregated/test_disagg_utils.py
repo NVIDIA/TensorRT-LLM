@@ -133,6 +133,17 @@ def test_extract_disagg_cfg_rejects_out_of_range_node_id(node_id):
         extract_disagg_cfg(node_id=node_id)
 
 
+@pytest.mark.parametrize("sample_yaml_config", [""], indirect=True)
+def test_extract_disagg_cfg_internal_request_auth_key(sample_yaml_config):
+    sample_yaml_config["internal_request_auth_key"] = "test-secret"
+
+    config = extract_disagg_cfg(**sample_yaml_config)
+
+    assert config.internal_request_auth_key == "test-secret"
+    assert "internal_request_auth_key" not in config.server_configs[
+        0].other_args
+
+
 def test_extract_ctx_gen_cfgs():
     configs = extract_ctx_gen_cfgs(
         type="ctx",
