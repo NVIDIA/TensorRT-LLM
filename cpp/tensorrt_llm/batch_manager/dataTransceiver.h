@@ -84,7 +84,8 @@ public:
     TransferSession(std::vector<Connection const*> connections, DataContext dataContext,
         std::vector<SizeType32> counterPartRanks, executor::DataTransceiverState const& selfState,
         executor::DataTransceiverState otherState, runtime::BufferManager const& bufferManager, int32_t indexFromEnd,
-        BlockKey const& lastBlockKey, LlmRequest const* llmRequest = nullptr, bool recordTiming = false)
+        BlockKey const& lastBlockKey, LlmRequest::RequestIdType requestId, LlmRequest const* llmRequest = nullptr,
+        bool recordTiming = false)
         : mConnections(std::move(connections))
         , mCounterPartRanks(std::move(counterPartRanks))
         , mDataContext(std::move(dataContext))
@@ -94,6 +95,9 @@ public:
         , mRequest(llmRequest)
         , mIndexFromEnd(indexFromEnd)
         , mLastBlockKey(lastBlockKey)
+        , mRequestId(requestId)
+        , mTransferStart(llmRequest != nullptr ? llmRequest->getPerfMetrics().timingMetrics.kvCacheTransferStart
+                                               : LlmRequest::getSteadyClockNow())
     {
         TLLM_CHECK(!mConnections.empty());
         if (recordTiming)
@@ -128,8 +132,10 @@ public:
 
     void appendMeasure(LlmRequest::TimePoint start, LlmRequest::TimePoint end, size_t size);
 
+    // Exports the recorded measurements using session-owned identity/timing (mRequestId,
+    // mTransferStart), so it also works for llmRequest-agnostic (reuse-tree) transfers.
     // TODO: 1. use global id instead of context request id; 2. export to llm metrics instead of file
-    void exportMeasure(std::ofstream& outFile, bool isContext) const;
+    void exportMeasure(std::ofstream& outFile) const;
 
     [[nodiscard]] int32_t getIndexFromEnd() const
     {
@@ -162,6 +168,10 @@ private:
     std::unique_ptr<KVCacheTimes> mTimes;
     int32_t mIndexFromEnd{0};
     BlockKey mLastBlockKey{};
+    // Session-owned identity/timing for measurement export; valid even when mRequest is
+    // null (llmRequest-agnostic reuse-tree transfers).
+    LlmRequest::RequestIdType mRequestId;
+    LlmRequest::TimePoint mTransferStart;
 };
 
 using UniqueToken = tensorrt_llm::runtime::UniqueToken;
