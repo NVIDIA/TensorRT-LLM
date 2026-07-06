@@ -45,8 +45,129 @@ def _load_generator() -> ModuleType:
     return module
 
 
+def _load_manifest_generator() -> ModuleType:
+    module_path = _repo_root() / "scripts/generate_llm_args_golden_manifest.py"
+    spec = importlib.util.spec_from_file_location("generate_llm_args_golden_manifest", module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def _golden_path() -> Path:
     return _repo_root() / "tensorrt_llm/usage/llm_args_golden_manifest.json"
+
+
+def _sample_manifest() -> dict[str, list[dict[str, object]]]:
+    # Keep both mapping levels unsorted so the test exercises recursive key sorting.
+    return {
+        "TrtLlmArgs": [],
+        "TorchLlmArgs": [
+            {
+                "path": "flag",
+                "kind": "value",
+                "converter": "",
+                "annotation": "<class 'bool'>",
+                "allowed_values": [],
+            }
+        ],
+    }
+
+
+def test_manifest_generator_write_is_canonical_and_idempotent(tmp_path, monkeypatch):
+    generator = _load_manifest_generator()
+    monkeypatch.setattr(generator, "golden_manifest", _sample_manifest)
+    manifest_path = tmp_path / "manifest.json"
+    canonical = json.dumps(_sample_manifest(), indent=2, sort_keys=True) + "\n"
+
+    assert generator._write_manifest(manifest_path)
+    assert manifest_path.read_text() == canonical
+    assert not generator._write_manifest(manifest_path)
+    assert generator._check_manifest(manifest_path)
+
+    manifest_path.write_bytes(canonical.replace("\n", "\r\n").encode())
+    assert not generator._check_manifest(manifest_path)
+    assert generator._write_manifest(manifest_path)
+    assert manifest_path.read_bytes() == canonical.encode()
+
+
+def test_manifest_generator_check_reports_unified_diff(tmp_path, monkeypatch, capfd):
+    generator = _load_manifest_generator()
+    monkeypatch.setattr(generator, "golden_manifest", _sample_manifest)
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text('{"stale": true}\n')
+
+    assert not generator._check_manifest(manifest_path)
+    stderr = capfd.readouterr().err
+    assert f"--- {manifest_path} (committed)" in stderr
+    assert f"+++ {manifest_path} (generated)" in stderr
+    assert '-{"stale": true}' in stderr
+    assert '+  "TorchLlmArgs": [' in stderr
+    assert manifest_path.read_text() == '{"stale": true}\n'
+
+
+def test_manifest_generator_preserves_target_when_generation_fails(tmp_path, monkeypatch):
+    import pytest
+
+    generator = _load_manifest_generator()
+    manifest_path = tmp_path / "manifest.json"
+    old_content = '{"old": true}\n'
+    manifest_path.write_text(old_content)
+
+    def _fail_generation():
+        raise RuntimeError("synthetic generation failure")
+
+    monkeypatch.setattr(generator, "golden_manifest", _fail_generation)
+    with pytest.raises(RuntimeError, match="synthetic generation failure"):
+        generator._write_manifest(manifest_path)
+
+    assert manifest_path.read_text() == old_content
+    assert list(tmp_path.iterdir()) == [manifest_path]
+
+
+def test_manifest_generator_preserves_target_when_replace_fails(tmp_path, monkeypatch):
+    import pytest
+
+    generator = _load_manifest_generator()
+    monkeypatch.setattr(generator, "golden_manifest", _sample_manifest)
+    manifest_path = tmp_path / "manifest.json"
+    old_content = '{"old": true}\n'
+    manifest_path.write_text(old_content)
+
+    def _fail_replace(*_args):
+        raise OSError("synthetic replace failure")
+
+    monkeypatch.setattr(generator.os, "replace", _fail_replace)
+    with pytest.raises(OSError, match="synthetic replace failure"):
+        generator._write_manifest(manifest_path)
+
+    assert manifest_path.read_text() == old_content
+    assert list(tmp_path.iterdir()) == [manifest_path]
+
+
+def test_manifest_generator_main_reports_file_io_failure(monkeypatch, capfd):
+    generator = _load_manifest_generator()
+    monkeypatch.setattr(generator, "_render_manifest", lambda: "{}\n")
+
+    def _fail_write(*_args, **_kwargs):
+        raise OSError("synthetic write failure")
+
+    monkeypatch.setattr(generator, "_write_manifest", _fail_write)
+    assert generator.main([]) == 2
+    assert "synthetic write failure" in capfd.readouterr().err
+
+
+def test_manifest_generator_main_propagates_generation_failure(monkeypatch):
+    import pytest
+
+    generator = _load_manifest_generator()
+
+    def _fail_generation():
+        raise RuntimeError("synthetic generation failure")
+
+    monkeypatch.setattr(generator, "_render_manifest", _fail_generation)
+    with pytest.raises(RuntimeError, match="synthetic generation failure"):
+        generator.main([])
 
 
 def test_build_capture_manifest_matches_committed_golden():
