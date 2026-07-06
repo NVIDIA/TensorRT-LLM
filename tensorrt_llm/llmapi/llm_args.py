@@ -3275,14 +3275,6 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "but increase compute cost. Only used when mamba_ssm_stochastic_rounding is enabled."
     )
 
-    unified_memory_detected: Optional[bool] = Field(
-        default=None,
-        description=
-        "Whether this device has unified CPU-GPU memory (e.g. DGX Spark, Jetson). "
-        "When None (default), auto-detects via is_device_integrated(). "
-        "When True, host_cache_size is forced to 0 since there is no separate "
-        "host DRAM to offload to.")
-
     tokens_per_block: int = Field(default=32,
                                   description="The number of tokens per block.")
 
@@ -3443,21 +3435,17 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         """Auto-detect unified memory and adjust KV cache defaults.
 
         On unified memory systems (e.g. Grace Blackwell / DGX Spark), CPU and GPU
-        share the same physical LPDDR5x pool. KV cache offload is a no-op and the
-        host_cache_size budget should be folded into the primary GPU pool. The C++
-        runtime handles the actual optimization transparently; this validator logs
-        the detection and adjusts Python-level defaults for clarity.
+        share the same physical memory pool. KV cache offload does not provide a
+        separate memory tier, so host_cache_size is ignored.
         """
-        if self.unified_memory_detected is None:
-            try:
-                unified = is_device_integrated()
-            except RuntimeError:
-                logger.debug("Unified-memory auto-detection failed; "
-                             "defaulting to disabled")
-                unified = False
-            object.__setattr__(self, 'unified_memory_detected', unified)
+        try:
+            unified_memory_detected = is_device_integrated()
+        except RuntimeError:
+            logger.debug("Unified-memory auto-detection failed; "
+                         "defaulting to disabled")
+            unified_memory_detected = False
 
-        if self.unified_memory_detected:
+        if unified_memory_detected:
             if self.host_cache_size and self.host_cache_size > 0:
                 logger.info(
                     "Unified memory detected: setting host_cache_size to 0 "
