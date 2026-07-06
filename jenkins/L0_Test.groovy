@@ -2289,7 +2289,7 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             if (stageIsFailed && !suppressTestReporting) {
                 if (stageIsInterrupted) {
                     echo "Stage is interrupted, skip to generate terminated unexpectedly test result."
-                } else {
+                } else if (!fileExists("${stageName}/results-timeout.xml")) {
                     // Generate timeout test result xml if there are terminated unexpectedly tests
                     generateTimeoutTestResultXml(pipeline, stageName)
                 }
@@ -3728,6 +3728,13 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                             error "Regular tests failed after rerun attempt"
                         }
                         rerunFailed = true
+                    } else if (generateTimeoutTestResultXml(pipeline, stageName)) {
+                        // Rerun passed but the first run had a timeout: mark this
+                        // stage FAILURE so "[${stageName}] Run Pytest" turns red,
+                        // not just the enclosing parent stage.
+                        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                            error "Some tests terminated unexpectedly, please check the test report."
+                        }
                     }
                 }
 
@@ -3757,6 +3764,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
         if (rerunFailed) {
             error "Some tests still failed after rerun attempts, please check the test report."
+        }
+
+        if (fileExists("${stageName}/results-timeout.xml") || generateTimeoutTestResultXml(pipeline, stageName)) {
+            error "Some tests terminated unexpectedly, please check the test report."
         }
 
         if (perfMode) {
