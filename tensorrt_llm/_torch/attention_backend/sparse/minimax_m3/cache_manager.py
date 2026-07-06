@@ -13,7 +13,7 @@ Provides:
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import torch
 
@@ -435,6 +435,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         *,
         pool_id: int = 0,
         is_kv_aggregate: bool = True,
+        num_blocks_per_seq: Optional[Sequence[int]] = None,
     ):
         """Return per-request slot ids in ``[0, num_slots)`` directly.
 
@@ -452,8 +453,10 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         padding contract.
         """
         res = []
-        for req_id in request_ids:
+        for req_idx, req_id in enumerate(request_ids):
             idx_tensor = torch.as_tensor(self.kv_cache_map[req_id].get_base_page_indices(pool_id))
+            if num_blocks_per_seq is not None:
+                idx_tensor = idx_tensor[: num_blocks_per_seq[req_idx]]
             res.append(
                 (
                     torch.where(
