@@ -19,6 +19,7 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
@@ -183,6 +184,18 @@ private:
     // completes, publish its id so the block manager can reap the pinned source block.
     std::unordered_map<std::uint64_t, int> mSpillRemaining;
     std::vector<std::uint64_t> mCompletedSpills;
+    // ---- disk async-store profiling: rate-limited [disk-prof] line, load-side vs write-side stalls ----
+    std::size_t mProfSpills{0};
+    std::size_t mProfQueuePeak{0};
+    std::size_t mProfEnqBlkCount{0};
+    std::uint64_t mProfEnqBlkTotNs{0};
+    std::uint64_t mProfEnqBlkMaxNs{0};
+    std::size_t mProfLoadCalls{0};
+    std::size_t mProfLoadWaitCount{0};
+    std::uint64_t mProfLoadWaitTotNs{0};
+    std::uint64_t mProfLoadWaitMaxNs{0};
+    std::chrono::steady_clock::time_point mProfLast{};
+    void reportDiskProfLocked(); // caller holds mDiskMutex
     bool mDiskWriterStop{false};
     std::size_t const mDiskWriteQueueMax{[]
         {
