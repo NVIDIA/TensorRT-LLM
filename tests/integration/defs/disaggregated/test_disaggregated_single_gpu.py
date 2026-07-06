@@ -1104,7 +1104,7 @@ def test_arbitrary_kv_cache_transfer(model, generation_overlap):
             assert cached2 <= 1, \
                 f"Expected at most 1 cached token for unrelated prompt, got {cached2}"
             assert cached2 < cached1, \
-                f"Unrelated prompt should have fewer cached tokens than transferred prompt"
+                "Unrelated prompt should have fewer cached tokens than transferred prompt"
 
         except Exception as e:
             print(f"Exception encountered: {e}", flush=True)
