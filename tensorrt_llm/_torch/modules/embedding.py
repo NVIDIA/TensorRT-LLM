@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 from typing import Dict, List, Optional, Tuple
 
@@ -9,7 +12,7 @@ from tensorrt_llm.functional import AllReduceParams
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div
 
-from ..distributed import allgather
+from ..distributed import AllReduce, allgather
 from .linear import Linear, TensorParallelMode
 
 
@@ -242,6 +245,13 @@ class Embedding(LMHead):
             reduce_output=reduce_output,
             use_custom_cublas_mm=use_custom_cublas_mm,
         )
+
+        # Column-parallel embeddings reduce masked vocabulary shards, whereas
+        # Linear only owns an allreduce for row-parallel projections.
+        if (self.all_reduce is None
+                and self.tp_mode == TensorParallelMode.COLUMN
+                and self.tp_size > 1 and self.reduce_output):
+            self.all_reduce = AllReduce(mapping=self.mapping, dtype=self.dtype)
 
         self.enable_torch_compile_for_embedding = enable_torch_compile_for_embedding
 

@@ -18,6 +18,7 @@ import pytest
 from tensorrt_llm._torch.custom_ops import torch_custom_ops
 from tensorrt_llm._torch.distributed import nccl_fault_tolerance
 from tensorrt_llm._torch.distributed import ops as distributed_ops
+from tensorrt_llm._torch.modules import embedding as embedding_module
 from tensorrt_llm._torch.modules import linear as linear_module
 from tensorrt_llm._torch.modules.fused_moe.communication import (
     allgather_reducescatter as allgather_rs_module,
@@ -354,6 +355,38 @@ def test_ft_nonparallel_linear_does_not_resolve_tp_group(monkeypatch):
 
     assert linear._tp_group_tuple == ()
     assert linear.all_reduce is None
+
+
+def test_ft_column_parallel_embedding_owns_allreduce(monkeypatch):
+    monkeypatch.setattr(linear_module, "mpi_disabled", lambda: False)
+    monkeypatch.setattr(linear_module, "get_sm_version", lambda: 0)
+    monkeypatch.setattr(linear_module.torch.cuda, "is_available", lambda: False)
+    calls = []
+
+    class FakeAllReduce(distributed_ops.torch.nn.Module):
+        def __init__(self, mapping, dtype):
+            super().__init__()
+            calls.append((mapping, dtype))
+
+        def forward(self, output):
+            calls.append(output)
+            return output
+
+    monkeypatch.setattr(embedding_module, "AllReduce", FakeAllReduce)
+    mapping = _FakeMapping()
+    embedding = embedding_module.Embedding(
+        num_embeddings=8,
+        embedding_dim=4,
+        dtype=distributed_ops.torch.float16,
+        mapping=mapping,
+        tensor_parallel_mode=TensorParallelMode.COLUMN,
+    )
+
+    output = embedding(distributed_ops.torch.tensor([4]))
+
+    assert len(calls) == 2
+    assert calls[0] == (mapping, distributed_ops.torch.float16)
+    assert calls[1] is output
 
 
 def test_ft_auto_allreduce_uses_only_watchdog_managed_nccl(monkeypatch):
