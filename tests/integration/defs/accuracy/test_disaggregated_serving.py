@@ -2565,4 +2565,3 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             llm.args.speculative_config = MTPDecodingConfig(
                 max_draft_len=speculative_config["max_draft_len"])
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
-
