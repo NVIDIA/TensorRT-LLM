@@ -331,6 +331,9 @@ methods:
       scheduling_params:
         annotation: Union[tensorrt_llm.scheduling_params.SchedulingParams, List[tensorrt_llm.scheduling_params.SchedulingParams], NoneType]
         default: null
+      conversation_params:
+        annotation: Union[tensorrt_llm.conversation_params.ConversationParams, List[tensorrt_llm.conversation_params.ConversationParams], NoneType]
+        default: null
       cache_salt:
         annotation: Union[str, Sequence[str], NoneType]
         default: null
@@ -351,6 +354,9 @@ methods:
         annotation: Optional[tensorrt_llm.scheduling_params.SchedulingParams]
         default: null
         status: prototype
+      conversation_params:
+        annotation: Optional[tensorrt_llm.conversation_params.ConversationParams]
+        default: null
       cache_salt:
         annotation: Optional[str]
         default: null

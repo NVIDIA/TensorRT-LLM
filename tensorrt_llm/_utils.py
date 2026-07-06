@@ -532,6 +532,9 @@ def get_free_ports(num=1) -> List[int]:
     ports = [s.getsockname()[1] for s in sockets]
     for s in sockets:
         s.close()
+    logger.info(
+        f"[get_free_ports] pid={os.getpid()} reserved ports={ports} via "
+        f"bind-then-close (subject to TOCTOU reuse before rebinding)")
     return ports
 
 

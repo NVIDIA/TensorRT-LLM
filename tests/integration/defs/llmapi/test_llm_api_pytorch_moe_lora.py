@@ -171,13 +171,15 @@ def _run_quantized_routed_expert_multi_lora(
     target_modules: list,
     trtllm_modules_to_hf_modules: dict,
     expected_quant_algo,
+    cuda_graph_config,
 ) -> None:
     """Serve a quantized MoE checkpoint with routed-expert LoRA and assert it applies.
 
     The batch mixes a no-LoRA (rank-0) request with every adapter, asserting the
     no-LoRA row produces output and each adapter changes the output versus the
-    base model. Used for the per-tensor FP8 (qdq) base. Caller must force the
-    device LoRA path.
+    base model. Used for the per-tensor FP8 (qdq) base. With a CUDA graph the
+    decode takes the slot-indexed input schema; without one it takes the
+    per-request schema. Both feed the same grouped-GEMM LoRA core.
     """
     lora_config = LoraConfig(
         lora_dir=lora_paths,
@@ -192,6 +194,7 @@ def _run_quantized_routed_expert_multi_lora(
         lora_config=lora_config,
         moe_config=MoeConfig(backend="CUTLASS"),
         kv_cache_config=_KV_CACHE_CONFIG,
+        cuda_graph_config=cuda_graph_config,
     )
     try:
         assert llm.args.quant_config.quant_algo == expected_quant_algo, (
@@ -223,40 +226,37 @@ def _run_quantized_routed_expert_multi_lora(
 @pytest.mark.parametrize(
     "moe_lora_mode",
     [
-        "host_path",
-        "device_path_eager",
-        "device_path_cudagraph",
+        "eager",
+        "cudagraph",
     ],
 )
-def test_qwen_moe_routed_expert_multi_lora_varying_ranks(moe_lora_mode: str, monkeypatch) -> None:
+def test_qwen_moe_routed_expert_multi_lora_varying_ranks(moe_lora_mode: str) -> None:
     """Routed-expert MoE LoRA on Qwen1.5-MoE with the PyTorch CUTLASS backend.
 
     Five dummy adapters of varying rank target the routed experts (moe_h_to_4h,
-    moe_gate, moe_4h_to_h). The same workload runs through each of the three
-    routed-expert LoRA execution paths, selected by moe_lora_mode:
+    moe_gate, moe_4h_to_h). The same workload runs through both routed-expert
+    LoRA input schemas, which share the grouped-GEMM LoRA core, selected by
+    moe_lora_mode:
 
-    - host_path: eager, legacy host path (per-request D2H pointer expand).
-    - device_path_eager: eager, capture-safe device path forced on via
-      TLLM_MOE_LORA_USE_DEVICE_PATH (per-request schema, no CUDA graph).
-    - device_path_cudagraph: CUDA graph decode, which always takes the
-      slot-indexed device path; all adapters share one captured graph,
-      exercising the slot-indexed device path and per-slot rank handling.
+    - eager: the per-request input schema (host adapter expansion) feeds the
+      grouped-GEMM core; no CUDA graph.
+    - cudagraph: CUDA-graph decode, which takes the slot-indexed input schema;
+      all adapters share one captured graph, exercising per-slot rank handling.
 
-    Current transformers stores the routed experts as fused 3D parameters, so
-    PEFT cannot produce per-expert adapter weights; the adapters are fabricated
-    directly in the per-expert key layout the TRT-LLM loader expects. An
-    explicit module mapping is supplied because the default map only knows
-    w1/w2/w3 for routed experts. lora_B is non-zero so each adapter perturbs the
-    routed-expert output, letting the test assert the LoRA is actually applied.
+    Both modes feed the identical grouped-GEMM core, but end-to-end decoded
+    tokens are not expected to be bit-identical between eager and CUDA-graph
+    runs (CUDA-graph decode pads the batch and may select different GEMM tactics
+    for the non-LoRA parts of the model). Current transformers stores the routed
+    experts as fused 3D parameters, so PEFT cannot produce per-expert adapter
+    weights; the adapters are fabricated directly in the per-expert key layout
+    the TRT-LLM loader expects. An explicit module mapping is supplied because
+    the default map only knows w1/w2/w3 for routed experts. lora_B is non-zero
+    so each adapter perturbs the routed-expert output, letting the test assert
+    the LoRA is actually applied.
     """
-    # Select the execution path. The eager device path is forced via env var
-    # (read once at FusedMoeRunner construction); the CUDA-graph path always
-    # takes the slot-indexed device path, so it needs no env opt-in.
-    cuda_graph_config = None
-    if moe_lora_mode == "device_path_eager":
-        monkeypatch.setenv("TLLM_MOE_LORA_USE_DEVICE_PATH", "1")
-    elif moe_lora_mode == "device_path_cudagraph":
-        cuda_graph_config = CudaGraphConfig(max_batch_size=10)
+    # eager drives the per-request input schema; cudagraph drives the
+    # slot-indexed schema. Both feed the same grouped-GEMM LoRA core.
+    cuda_graph_config = CudaGraphConfig(max_batch_size=10) if moe_lora_mode == "cudagraph" else None
 
     model_dir = f"{llm_models_root()}/Qwen1.5-MoE-A2.7B-Chat"
 
@@ -357,18 +357,32 @@ def test_qwen_moe_routed_expert_multi_lora_varying_ranks(moe_lora_mode: str, mon
 
 @skip_pre_ada
 @pytest.mark.skip_less_device_memory(80000)
-def test_mixtral_moe_routed_expert_fp8_multi_lora_varying_ranks(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "moe_lora_mode",
+    [
+        "eager",
+        "cudagraph",
+    ],
+)
+def test_mixtral_moe_routed_expert_fp8_multi_lora_varying_ranks(moe_lora_mode: str) -> None:
     """Routed-expert MoE LoRA on a per-tensor FP8 (qdq) Mixtral-8x7B checkpoint.
 
     Exercises the FP8 base-weight + routed-expert LoRA path end to end: the
     CUTLASS MoE kernel dequantizes the FP8 activations to the bf16 LoRA compute
     type before the LoRA GEMM, so the FP8 base and the bf16 adapters compose.
-    Forces the capture-safe device LoRA path (TLLM_MOE_LORA_USE_DEVICE_PATH=1),
-    which performs the FP8 dequant.
+    Like the Qwen test, it runs both routed-expert LoRA input schemas (which
+    share the grouped-GEMM LoRA core) so the FP8 dequant is validated under
+    each, selected by moe_lora_mode:
+
+    - eager: the per-request input schema (host adapter expansion); no CUDA
+      graph.
+    - cudagraph: CUDA-graph decode, which takes the slot-indexed input schema;
+      all adapters share one captured graph, exercising per-slot rank handling.
     """
-    # Force the eager device LoRA path, which runs the FP8 dequant before the
-    # grouped-GEMM LoRA core (loraFC1/loraFC2 in moe_kernels.cu).
-    monkeypatch.setenv("TLLM_MOE_LORA_USE_DEVICE_PATH", "1")
+    # eager drives the per-request input schema; cudagraph drives the
+    # slot-indexed schema. Both run the FP8 dequant before the grouped-GEMM
+    # LoRA core (loraFC1/loraFC2 in moe_kernels.cu).
+    cuda_graph_config = CudaGraphConfig(max_batch_size=10) if moe_lora_mode == "cudagraph" else None
 
     model_dir = f"{llm_models_root()}/Mixtral-8x7B-Instruct-v0.1-fp8"
 
@@ -416,4 +430,5 @@ def test_mixtral_moe_routed_expert_fp8_multi_lora_varying_ranks(monkeypatch) -> 
             target_modules=target_modules,
             trtllm_modules_to_hf_modules=trtllm_modules_to_hf_modules,
             expected_quant_algo=QuantAlgo.FP8,
+            cuda_graph_config=cuda_graph_config,
         )

@@ -6,12 +6,15 @@ This module tests:
 
 """
 
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.request_utils import (
+    RequestBroadcaster,
+    attach_py_objects_to_requests,
     can_process_attention_dp_request,
     derive_attention_dp_per_rank_request_cap,
     get_from_waiting_queue,
@@ -20,6 +23,7 @@ from tensorrt_llm._torch.pyexecutor.request_utils import (
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm.bindings import executor as trtllm
+from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.mapping import CpType
 
 
@@ -56,6 +60,39 @@ def create_mock_request_with_py_schedule_params(attention_dp_rank=None, attentio
     mock_request.input_token_ids = [1, 2, 3]
 
     return mock_request
+
+
+def test_request_broadcaster_collects_conversation_params_with_none():
+    conversation_params = ConversationParams(conversation_id="conv")
+    source_items = [
+        RequestQueueItem(1, SimpleNamespace(py_conversation_params=conversation_params)),
+        RequestQueueItem(2, SimpleNamespace(py_conversation_params=None)),
+    ]
+
+    py_request_objects = RequestBroadcaster._collect_py_objects(None, source_items)
+
+    py_objects = dict(py_request_objects)
+    assert py_objects["py_conversation_params"] == {
+        1: conversation_params,
+        2: None,
+    }
+
+    target_items = [
+        RequestQueueItem(1, SimpleNamespace()),
+        RequestQueueItem(2, SimpleNamespace()),
+    ]
+    attach_py_objects_to_requests(target_items, py_request_objects)
+
+    assert target_items[0].request.py_conversation_params is conversation_params
+    assert hasattr(target_items[1].request, "py_conversation_params")
+    assert target_items[1].request.py_conversation_params is None
+
+
+def test_request_broadcaster_requires_conversation_params_attr():
+    source_items = [RequestQueueItem(1, SimpleNamespace())]
+
+    with pytest.raises(AttributeError):
+        RequestBroadcaster._collect_py_objects(None, source_items)
 
 
 def test_merge_helix_requests_with_padding():
