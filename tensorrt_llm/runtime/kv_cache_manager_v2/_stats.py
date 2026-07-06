@@ -64,6 +64,11 @@ class KVCacheIterationStatsDelta(_StatsDeltaMixin):
     iter_offload_bytes: int = 0
     iter_intra_device_copy_blocks: int = 0
     iter_intra_device_copy_bytes: int = 0
+    # Host-tier pages released by LRU without ever being onboarded back to GPU
+    # in the lifetime since they were offloaded. Counted at the drop site in
+    # _storage_manager._prepare_free_slots when is_last_level(lvl).
+    iter_host_dropped_blocks: int = 0
+    iter_host_dropped_bytes: int = 0
 
     @property
     def iter_cache_hit_rate(self) -> float:

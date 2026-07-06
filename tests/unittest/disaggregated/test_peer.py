@@ -1,7 +1,6 @@
 import numpy as np
 import pytest
 
-from tensorrt_llm._torch.disaggregation.base.region import DataRole
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import (
     HeadMatchMapper,
     HeadMismatchMapper,
@@ -32,13 +31,13 @@ def make_page_table(pool_ptrs=None, block_bytes=None, global_layer_ids=None):
     if global_layer_ids is None:
         global_layer_ids = [0, 1]
 
-    # Build buffer entries: KEY + VALUE per local layer
+    # Build buffer entries: K + V per local layer
     buffer_size = 256  # bytes per buffer entry (arbitrary for tests)
     entries = []
     for i in range(len(global_layer_ids)):
         base_offset = i * buffer_size * 2
-        entries.append((i, int(DataRole.KEY), base_offset, buffer_size))
-        entries.append((i, int(DataRole.VALUE), base_offset + buffer_size, buffer_size))
+        entries.append((i, base_offset, buffer_size))
+        entries.append((i, base_offset + buffer_size, buffer_size))
     buffer_entries = np.array(entries, dtype=BUFFER_ENTRY_DTYPE)
 
     local_layers = [
