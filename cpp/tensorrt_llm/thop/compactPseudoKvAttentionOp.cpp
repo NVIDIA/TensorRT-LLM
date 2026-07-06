@@ -62,6 +62,10 @@ void runCompactPseudoKvAttention(torch::Tensor const& q, torch::Tensor& output,
     TORCH_CHECK(compactValue.is_cuda(), "compact pseudo-KV native attention requires CUDA value.");
     TORCH_CHECK(positions.is_cuda(), "compact pseudo-KV native attention requires CUDA positions.");
     TORCH_CHECK(causalMask.is_cuda(), "compact pseudo-KV native attention requires CUDA causal mask.");
+    TORCH_CHECK(output.get_device() == q.get_device() && compactKey.get_device() == q.get_device()
+            && compactValue.get_device() == q.get_device() && positions.get_device() == q.get_device()
+            && causalMask.get_device() == q.get_device(),
+        "compact pseudo-KV native attention requires all tensors on the same CUDA device.");
     TORCH_CHECK(q.scalar_type() == torch::kFloat32, "compact pseudo-KV native attention currently supports FP32.");
     TORCH_CHECK(compactKey.scalar_type() == torch::kFloat32, "compact pseudo-KV key must be FP32.");
     TORCH_CHECK(compactValue.scalar_type() == torch::kFloat32, "compact pseudo-KV value must be FP32.");
@@ -74,6 +78,12 @@ void runCompactPseudoKvAttention(torch::Tensor const& q, torch::Tensor& output,
     TORCH_CHECK(outputIsRank3 || outputIsFlattened,
         "compact pseudo-KV native output must be [query_seq_len, num_heads, head_dim] or "
         "[query_seq_len, num_heads * head_dim].");
+    TORCH_CHECK(q.stride(2) == 1, "compact pseudo-KV query head dimension must be contiguous.");
+    TORCH_CHECK(compactKey.stride(2) == 1, "compact pseudo-KV key head dimension must be contiguous.");
+    TORCH_CHECK(compactValue.stride(2) == 1, "compact pseudo-KV value head dimension must be contiguous.");
+    TORCH_CHECK(causalMask.is_contiguous(), "compact_pseudokv_causal_mask must be contiguous.");
+    TORCH_CHECK(outputIsRank3 ? output.stride(2) == 1 : output.stride(1) == 1,
+        "compact pseudo-KV output head dimension must be contiguous.");
 
     tensorrt_llm::kernels::CompactPseudoKvAttentionLaunchParams params{};
     params.query = q.data_ptr();

@@ -899,6 +899,17 @@ class SparsePrediction:
 
 
 @dataclass(kw_only=True, slots=True)
+class CompactPseudoKvPrediction:
+    """Compact pseudo-KV rows consumed by the fallback THOP attention path."""
+
+    key: torch.Tensor
+    value: torch.Tensor
+    positions: torch.Tensor
+    causal_mask: torch.Tensor
+    source_seq_len: int
+
+
+@dataclass(kw_only=True, slots=True)
 class AttentionForwardArgs:
     """Per-forward optional arguments for attention backends."""
 
@@ -957,6 +968,37 @@ class AttentionForwardArgs:
 
     sparse_prediction: SparsePrediction = field(
         default_factory=SparsePrediction)
+    compact_pseudokv: Optional[CompactPseudoKvPrediction] = None
+
+    @property
+    def compact_pseudokv_key(self) -> Optional[torch.Tensor]:
+        if self.compact_pseudokv is None:
+            return None
+        return self.compact_pseudokv.key
+
+    @property
+    def compact_pseudokv_value(self) -> Optional[torch.Tensor]:
+        if self.compact_pseudokv is None:
+            return None
+        return self.compact_pseudokv.value
+
+    @property
+    def compact_pseudokv_positions(self) -> Optional[torch.Tensor]:
+        if self.compact_pseudokv is None:
+            return None
+        return self.compact_pseudokv.positions
+
+    @property
+    def compact_pseudokv_causal_mask(self) -> Optional[torch.Tensor]:
+        if self.compact_pseudokv is None:
+            return None
+        return self.compact_pseudokv.causal_mask
+
+    @property
+    def compact_pseudokv_source_seq_len(self) -> Optional[int]:
+        if self.compact_pseudokv is None:
+            return None
+        return self.compact_pseudokv.source_seq_len
 
     @property
     def mask_type(self) -> int:

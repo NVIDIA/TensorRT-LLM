@@ -66,7 +66,6 @@ class FallbackFmha(Fmha):
             if isinstance(sparse_params, SkipSoftmaxParams)
             else SkipSoftmaxKernelParams()
         )
-
         # Every kwarg sources from ``attn`` / ``metadata`` / ``forward_args``
         # (with ``forward_args.sparse_prediction`` for sparse-attn inputs),
         # ``skip_softmax_kernel_params``, or a literal allowlisted in

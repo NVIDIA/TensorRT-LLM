@@ -19,6 +19,8 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 #include <cuda_runtime.h>
+#include <limits>
+#include <mutex>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -28,7 +30,13 @@ namespace
 {
 
 constexpr int32_t kCompactPseudoKvThreadsPerBlock = 128;
-constexpr float kCompactPseudoKvMaskedScore = -3.4028234663852886e38F;
+constexpr float kCompactPseudoKvMaskedScore = -std::numeric_limits<float>::infinity();
+
+std::mutex& compactPseudoKvLaunchMutex()
+{
+    static std::mutex mutex;
+    return mutex;
+}
 
 __device__ float compactPseudoKvReduceMax(float value)
 {
@@ -181,10 +189,11 @@ void invokeCompactPseudoKvAttention(CompactPseudoKvAttentionLaunchParams const& 
     int32_t const maxSharedMemory = compactPseudoKvMaxDynamicSharedMemoryBytes();
     TLLM_CHECK_WITH_INFO(scoreCacheBytes <= static_cast<size_t>(maxSharedMemory),
         "Compact pseudo-KV score cache exceeds per-block dynamic shared-memory capacity.");
-    TLLM_CUDA_CHECK(cudaFuncSetAttribute(compactPseudoKvAttentionFloatKernel,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int32_t>(scoreCacheBytes)));
     dim3 const grid(params.query_token_count, params.compact_pseudokv_params.num_heads, 1);
     dim3 const block(kCompactPseudoKvThreadsPerBlock, 1, 1);
+    std::lock_guard<std::mutex> const lock(compactPseudoKvLaunchMutex());
+    TLLM_CUDA_CHECK(cudaFuncSetAttribute(compactPseudoKvAttentionFloatKernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int32_t>(scoreCacheBytes)));
     compactPseudoKvAttentionFloatKernel<<<grid, block, scoreCacheBytes, stream>>>(params);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
