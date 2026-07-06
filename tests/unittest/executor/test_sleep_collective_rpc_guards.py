@@ -799,6 +799,7 @@ class TestListenerAbortAndShutdown:
                 "status": "ok",
                 "error": None,
                 "op_id": op_id,
+                "phase": _SleepWakeupAction.PREPARE,
             }
         ]
 
@@ -948,7 +949,13 @@ class TestListenerAbortAndShutdown:
         ):
             executor._sleep_wakeup_listener_loop()
 
-        assert sent_acks == [{"status": "ok", "error": None}]
+        assert sent_acks == [
+            {
+                "status": "ok",
+                "error": None,
+                "phase": _SleepWakeupAction.SHUTDOWN,
+            }
+        ]
 
     def test_rank0_shutdown_ack_drain_is_bounded(self, monkeypatch):
         """Rank 0 shutdown must not block forever if listener ACKs never arrive."""
