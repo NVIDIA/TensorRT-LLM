@@ -15,13 +15,14 @@
 """Correctness tests for overflow policies in the DSL radix top-k kernels.
 
 Overflow policies:
-  GMEM_SPILL – spill threshold-bucket overflow to a pre-allocated GMEM buffer (exact)
-  TRUNCATE   – discard overflow elements; histogram stays consistent     (non-exact)
+  GMEM_SPILL    – spill threshold-bucket overflow to a pre-allocated GMEM buffer (exact)
+  TRUNCATE      – discard overflow elements; histogram stays consistent     (non-exact)
+  REREAD_ALWAYS – first pass builds histogram only; second GMEM scan fills s_input_idx (exact)
 
 Coverage:
   * decode single-CTA: no-overflow and overflow num_tokens, multiple dtypes/shapes
   * prefill: no-overflow and overflow, zero and non-zero row_starts
-  * GMEM_SPILL verified with compare_top_k_results (same as existing tests)
+  * GMEM_SPILL / REREAD_ALWAYS verified with compare_top_k_results (exact match)
   * TRUNCATE verified with compare_truncate_result (valid-subset check)
 
 SMEM overflow thresholds (large_occupancy path, B200):
@@ -234,7 +235,7 @@ def _run_prefill_policy_test(
 # Parametrized tests
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_ALL_POLICIES = ["GMEM_SPILL", "TRUNCATE"]
+_ALL_POLICIES = ["GMEM_SPILL", "TRUNCATE", "REREAD_ALWAYS"]
 
 # ----------------------------------------------------------------------------
 # Decode single-CTA — no overflow (num_tokens ≤ smem_input_size)
@@ -367,6 +368,15 @@ def test_prefill_overflow_policy_overflow(
     overflow_policy, batch_size, top_k, num_tokens, dtype, row_start_offset
 ):
     """Prefill: all policies, large num_tokens (SMEM overflow triggered)."""
+    # Skip combinations where the logits tensor would exceed ~80 GB.
+    # logits shape = (sum_seq_lens, num_tokens); sum_seq_lens ≈ batch_size * num_tokens / 2.
+    dtype_bytes = 2 if dtype == torch.bfloat16 else 4
+    est_gb = batch_size * (num_tokens // 2) * num_tokens * dtype_bytes / (1024**3)
+    if est_gb > 80:
+        pytest.skip(
+            f"Estimated logits tensor ~{est_gb:.0f} GB exceeds memory budget; "
+            f"use smaller batch_size or num_tokens"
+        )
     _run_prefill_policy_test(
         overflow_policy,
         batch_size,

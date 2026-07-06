@@ -94,6 +94,7 @@ class FilteredTopKKernelVarlenPrefill(FilteredTopKKernelVarlen):
         _needs_extra = self.max_num_cols > self.filtered_topk_smem_input_size
         self.enable_gmem_store = (overflow_policy == "GMEM_SPILL") and _needs_extra
         self.enable_truncate = (overflow_policy == "TRUNCATE") and _needs_extra
+        self.enable_reread_always = (overflow_policy == "REREAD_ALWAYS") and _needs_extra
 
         # Always 512 threads for large-occupancy path.
         self.num_threads_per_cta = 512
@@ -145,6 +146,7 @@ class FilteredTopKKernelVarlenPrefill(FilteredTopKKernelVarlen):
             layout=cute.make_ordered_layout((self.filtered_topk_max_k,), order=(0)),
             byte_alignment=128,
         )
+        # TODO: do we need this buffer for gmem_reread_always?
         s_input_idx = smem.allocate_tensor(
             element_type=self.index_type,
             layout=cute.make_ordered_layout(
@@ -158,6 +160,14 @@ class FilteredTopKKernelVarlenPrefill(FilteredTopKKernelVarlen):
             layout=cute.make_ordered_layout((1), order=(0)),
             byte_alignment=128,
         )
+        if cutlass.const_expr(self.enable_reread_always):
+            s_refine_thresholds = smem.allocate_tensor(
+                element_type=cutlass.Int32,
+                layout=cute.make_ordered_layout((max(1, self.num_refine_rounds),), order=(0,)),
+                byte_alignment=128,
+            )
+        else:
+            s_refine_thresholds = None
         num_warps = cutlass.const_expr(
             min(self.radix, self.num_threads_per_cta) // cutlass.Int32(32)
         )
@@ -189,6 +199,7 @@ class FilteredTopKKernelVarlenPrefill(FilteredTopKKernelVarlen):
             s_indices,
             s_input_idx,
             s_last_remain,
+            s_refine_thresholds,
             num_warps,
             s_warp_sums,
         )

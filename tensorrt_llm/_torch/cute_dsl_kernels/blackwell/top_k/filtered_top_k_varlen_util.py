@@ -59,7 +59,7 @@ class FilteredTopKKernelVarlen:
         self.num_ctas_per_row = num_ctas_per_row
         self.merge_blocks = merge_blocks
         self.overflow_policy = overflow_policy
-        assert overflow_policy in ("GMEM_SPILL", "TRUNCATE"), (
+        assert overflow_policy in ("GMEM_SPILL", "TRUNCATE", "REREAD_ALWAYS"), (
             f"Unknown overflow_policy: {overflow_policy}"
         )
 
@@ -100,6 +100,7 @@ class FilteredTopKKernelVarlen:
         _needs_extra = self.max_num_cols > self.filtered_topk_smem_input_size
         self.enable_gmem_store = (overflow_policy == "GMEM_SPILL") and _needs_extra
         self.enable_truncate = (overflow_policy == "TRUNCATE") and _needs_extra
+        self.enable_reread_always = (overflow_policy == "REREAD_ALWAYS") and _needs_extra
 
         self.return_val = return_val
         # Subclasses set to True to subtract row_start from absolute indices before
@@ -343,6 +344,12 @@ class FilteredTopKKernelVarlen:
                     ordered = self.to_ordered(raw_input)
                     sub_bin = (ordered >> self.first_refine_shift) & 0xFF
                     atomicAdd(s_histogram.iterator + cutlass.Int32(sub_bin), val_one)
+            elif cutlass.const_expr(self.enable_reread_always):
+                # First pass: build refinement histogram over ALL threshold-bin elements.
+                # Phase 2 will re-scan GMEM directly; s_input_idx is not used.
+                ordered = self.to_ordered(raw_input)
+                sub_bin = (ordered >> self.first_refine_shift) & 0xFF
+                atomicAdd(s_histogram.iterator + cutlass.Int32(sub_bin), val_one)
             else:
                 pos = atomicAdd(s_num_input.iterator, val_one)
                 if pos < self.filtered_topk_smem_input_size:
@@ -519,6 +526,289 @@ class FilteredTopKKernelVarlen:
                 g_num_input,
                 buffer,
             )
+        fence_acq_rel_cta()
+        cute.arch.barrier()
+
+    @cute.jit
+    def _reread_always_per_elem_output(
+        self,
+        include_threshold,
+        raw,
+        col_idx,
+        threshold_bin,
+        T2,
+        offset,
+        chain_mask,
+        chain_prefix,
+        s_counter,
+        s_indices,
+        s_last_remain,
+    ):
+        """Per-element handler for REREAD_ALWAYS output scan.
+        include_threshold is a compile-time bool.
+        chain_mask is a compile-time int (accumulated prior-round byte mask).
+        chain_prefix is a runtime DSL value (accumulated prior-round thresholds).
+        Checks coarse bin == threshold_bin, then chain of prior-round constraints,
+        then outputs elements with fine bin < T2 (or == T2 if include_threshold).
+        """
+        coarse = self.to_coarse_key(raw)
+        if coarse == threshold_bin:
+            ordered = self.to_ordered(raw)
+            passes_chain = (ordered & self.ordered_type(chain_mask)) == chain_prefix
+            if passes_chain:
+                bin_val = (ordered >> offset) & 0xFF
+                idx = self.index_type(col_idx)
+                val_one = cutlass.Int32(1)
+                if bin_val < T2:
+                    pos = atomicAdd(s_counter.iterator, val_one)
+                    s_indices[pos] = idx
+                elif cutlass.const_expr(include_threshold):
+                    if bin_val == T2:
+                        cur_pos = atomicAdd(s_last_remain.iterator, cutlass.Int32(-1))
+                        if cur_pos > 0:
+                            s_indices[self.top_k - cur_pos] = idx
+
+    @cute.jit
+    def _reread_always_per_elem_combined(
+        self,
+        raw,
+        col_idx,
+        threshold_bin,
+        T2,
+        offset,
+        chain_mask,
+        chain_prefix,
+        s_counter,
+        s_indices,
+        s_histogram,
+    ):
+        """Per-element handler for REREAD_ALWAYS non-last-round combined scan.
+        chain_mask is a compile-time int (accumulated prior-round byte mask).
+        chain_prefix is a runtime DSL value (accumulated prior-round thresholds).
+        For elements passing coarse + chain filters:
+          bin_val < T2  → write col_idx to s_indices (definitely top-K).
+          bin_val == T2 → histogram at (ordered >> (offset - 8)) & 0xFF.
+        """
+        coarse = self.to_coarse_key(raw)
+        if coarse == threshold_bin:
+            ordered = self.to_ordered(raw)
+            passes_chain = (ordered & self.ordered_type(chain_mask)) == chain_prefix
+            if passes_chain:
+                bin_val = (ordered >> offset) & 0xFF
+                val_one = cutlass.Int32(1)
+                if bin_val < T2:
+                    pos = atomicAdd(s_counter.iterator, val_one)
+                    s_indices[pos] = self.index_type(col_idx)
+                elif bin_val == T2:
+                    next_sub_bin = (ordered >> (offset - 8)) & 0xFF
+                    atomicAdd(s_histogram.iterator + cutlass.Int32(next_sub_bin), val_one)
+
+    @cute.jit
+    def _reread_always_gmem_output_scan(
+        self,
+        include_threshold,
+        tidx,
+        threshold_bin,
+        T2,
+        offset,
+        chain_mask,
+        chain_prefix,
+        score,
+        s_counter,
+        s_indices,
+        s_last_remain,
+        _copy_atom,
+        scan_frag,
+        _aligned_base,
+        vec_start,
+        aligned_size,
+        row_start,
+        prologue_elems,
+        left_start,
+        left_size,
+    ):
+        """GMEM scan for REREAD_ALWAYS output phase.
+        include_threshold is a compile-time bool.
+        chain_mask is compile-time int; chain_prefix is a runtime DSL value —
+        both carry prior-round constraints accumulated in the outer Phase 2 loop.
+        Scans all three GMEM segments and writes qualifying indices to s_indices.
+        Ends with cute.arch.barrier() to sync all writes before Phase 3.
+        """
+        _elem_bytes = self.dtype.width // 8
+        _align_bytes = self.num_copy_bits // 8
+        _step_vec = self.num_threads_per_cta * self.vec_size
+        vec_size = self.vec_size
+
+        ic = tidx * cutlass.Int32(vec_size)
+        while ic + cutlass.Int32(vec_size - 1) < aligned_size:
+            cute.copy(
+                _copy_atom,
+                cute.make_tensor(
+                    cute.make_ptr(
+                        self.dtype,
+                        _aligned_base + cutlass.Int64(ic) * cutlass.Int64(_elem_bytes),
+                        cute.AddressSpace.gmem,
+                        assumed_align=_align_bytes,
+                    ),
+                    cute.make_layout((vec_size,)),
+                ),
+                scan_frag,
+            )
+            for j in cutlass.range_constexpr(vec_size):
+                col_idx = cutlass.Int32(vec_start + ic + cutlass.Int32(j))
+                self._reread_always_per_elem_output(
+                    include_threshold,
+                    scan_frag[j],
+                    col_idx,
+                    threshold_bin,
+                    T2,
+                    offset,
+                    chain_mask,
+                    chain_prefix,
+                    s_counter,
+                    s_indices,
+                    s_last_remain,
+                )
+            ic = ic + cutlass.Int32(_step_vec)
+
+        for j in range(tidx, prologue_elems, self.num_threads_per_cta):
+            col_idx = cutlass.Int32(row_start + j)
+            raw = score[col_idx]
+            self._reread_always_per_elem_output(
+                include_threshold,
+                raw,
+                col_idx,
+                threshold_bin,
+                T2,
+                offset,
+                chain_mask,
+                chain_prefix,
+                s_counter,
+                s_indices,
+                s_last_remain,
+            )
+
+        for j in range(tidx, left_size, self.num_threads_per_cta):
+            col_idx = cutlass.Int32(left_start + j)
+            raw = score[col_idx]
+            self._reread_always_per_elem_output(
+                include_threshold,
+                raw,
+                col_idx,
+                threshold_bin,
+                T2,
+                offset,
+                chain_mask,
+                chain_prefix,
+                s_counter,
+                s_indices,
+                s_last_remain,
+            )
+
+        cute.arch.barrier()
+
+    @cute.jit
+    def _reread_always_gmem_combined_scan(
+        self,
+        tidx,
+        threshold_bin,
+        T2,
+        offset,
+        chain_mask,
+        chain_prefix,
+        score,
+        s_counter,
+        s_indices,
+        s_histogram,
+        _copy_atom,
+        scan_frag,
+        _aligned_base,
+        vec_start,
+        aligned_size,
+        row_start,
+        prologue_elems,
+        left_start,
+        left_size,
+    ):
+        """GMEM scan for REREAD_ALWAYS non-last rounds: reset histogram, output < T2
+        elements, and build histogram for the next round.
+        chain_mask is compile-time int; chain_prefix is a runtime DSL value —
+        both carry prior-round constraints accumulated in the outer Phase 2 loop.
+        Ends with fence_acq_rel_cta() + cute.arch.barrier().
+        """
+        _elem_bytes = self.dtype.width // 8
+        _align_bytes = self.num_copy_bits // 8
+        _step_vec = self.num_threads_per_cta * self.vec_size
+        vec_size = self.vec_size
+
+        cute.arch.barrier()
+        for _hi in range(tidx, self.radix + 1, self.num_threads_per_cta):
+            s_histogram[_hi] = 0
+        cute.arch.barrier()
+
+        ic = tidx * cutlass.Int32(vec_size)
+        while ic + cutlass.Int32(vec_size - 1) < aligned_size:
+            cute.copy(
+                _copy_atom,
+                cute.make_tensor(
+                    cute.make_ptr(
+                        self.dtype,
+                        _aligned_base + cutlass.Int64(ic) * cutlass.Int64(_elem_bytes),
+                        cute.AddressSpace.gmem,
+                        assumed_align=_align_bytes,
+                    ),
+                    cute.make_layout((vec_size,)),
+                ),
+                scan_frag,
+            )
+            for j in cutlass.range_constexpr(vec_size):
+                col_idx = cutlass.Int32(vec_start + ic + cutlass.Int32(j))
+                self._reread_always_per_elem_combined(
+                    scan_frag[j],
+                    col_idx,
+                    threshold_bin,
+                    T2,
+                    offset,
+                    chain_mask,
+                    chain_prefix,
+                    s_counter,
+                    s_indices,
+                    s_histogram,
+                )
+            ic = ic + cutlass.Int32(_step_vec)
+
+        for j in range(tidx, prologue_elems, self.num_threads_per_cta):
+            col_idx = cutlass.Int32(row_start + j)
+            raw = score[col_idx]
+            self._reread_always_per_elem_combined(
+                raw,
+                col_idx,
+                threshold_bin,
+                T2,
+                offset,
+                chain_mask,
+                chain_prefix,
+                s_counter,
+                s_indices,
+                s_histogram,
+            )
+
+        for j in range(tidx, left_size, self.num_threads_per_cta):
+            col_idx = cutlass.Int32(left_start + j)
+            raw = score[col_idx]
+            self._reread_always_per_elem_combined(
+                raw,
+                col_idx,
+                threshold_bin,
+                T2,
+                offset,
+                chain_mask,
+                chain_prefix,
+                s_counter,
+                s_indices,
+                s_histogram,
+            )
+
         fence_acq_rel_cta()
         cute.arch.barrier()
 
@@ -802,6 +1092,7 @@ class FilteredTopKKernelVarlen:
         s_indices,
         s_input_idx,
         s_last_remain,
+        s_refine_thresholds,
         num_warps,
         s_warp_sums,
     ):
@@ -1010,6 +1301,11 @@ class FilteredTopKKernelVarlen:
                 )
 
                 # Phase 2: Refinement rounds
+                # chain_mask (compile-time) and chain_prefix (runtime DSL value)
+                # accumulate prior-round constraints; passed to GMEM scan functions
+                # to avoid per-element SMEM reads for chain checking.
+                chain_mask = 0
+                chain_prefix = self.ordered_type(0)
                 run_next_round = True
                 for round in range(self.num_refine_rounds):
                     if run_next_round:
@@ -1028,51 +1324,129 @@ class FilteredTopKKernelVarlen:
                             g_num_input,
                             s_num_input_idx=r_idx ^ 1,
                         )
-                        num_input = min(s_num_input[r_idx], self.filtered_topk_smem_input_size)
-                        cur_g_num_input = cutlass.Int32(0)
-                        if cutlass.const_expr(self.enable_gmem_store):
-                            cur_g_num_input = g_num_input[r_idx]
-
                         threshold = s_threshold_bin_id[0]
                         if threshold > 0:
                             topk_remaining -= s_histogram[threshold - 1]
                         offset = self.first_refine_shift - round * 8
                         is_last_round = round == self.num_refine_rounds - 1
 
-                        if topk_remaining == 0:
-                            self._collect_below_threshold_refine(
-                                tidx,
-                                threshold,
-                                offset,
-                                num_input,
-                                r_idx,
-                                s_input_idx,
-                                score,
-                                s_counter,
-                                s_indices,
-                                cur_g_num_input,
-                                buffer,
-                            )
-                            run_next_round = False
+                        if cutlass.const_expr(self.enable_reread_always):
+                            if topk_remaining == 0:
+                                self._reread_always_gmem_output_scan(
+                                    False,
+                                    tidx,
+                                    threshold_bin,
+                                    threshold,
+                                    offset,
+                                    chain_mask,
+                                    chain_prefix,
+                                    score,
+                                    s_counter,
+                                    s_indices,
+                                    s_last_remain,
+                                    _copy_atom,
+                                    scan_frag,
+                                    _aligned_base,
+                                    vec_start,
+                                    aligned_size,
+                                    row_start,
+                                    prologue_elems,
+                                    left_start,
+                                    left_size,
+                                )
+                                run_next_round = False
+                            else:
+                                if is_last_round:
+                                    self._reread_always_gmem_output_scan(
+                                        True,
+                                        tidx,
+                                        threshold_bin,
+                                        threshold,
+                                        offset,
+                                        chain_mask,
+                                        chain_prefix,
+                                        score,
+                                        s_counter,
+                                        s_indices,
+                                        s_last_remain,
+                                        _copy_atom,
+                                        scan_frag,
+                                        _aligned_base,
+                                        vec_start,
+                                        aligned_size,
+                                        row_start,
+                                        prologue_elems,
+                                        left_start,
+                                        left_size,
+                                    )
+                                else:
+                                    self._reread_always_gmem_combined_scan(
+                                        tidx,
+                                        threshold_bin,
+                                        threshold,
+                                        offset,
+                                        chain_mask,
+                                        chain_prefix,
+                                        score,
+                                        s_counter,
+                                        s_indices,
+                                        s_histogram,
+                                        _copy_atom,
+                                        scan_frag,
+                                        _aligned_base,
+                                        vec_start,
+                                        aligned_size,
+                                        row_start,
+                                        prologue_elems,
+                                        left_start,
+                                        left_size,
+                                    )
+                                    # Accumulate this round's threshold into the
+                                    # chain for the next round.
+                                    chain_mask |= 0xFF << offset
+                                    chain_prefix = chain_prefix | self.ordered_type(
+                                        self.ordered_type(threshold) << self.ordered_type(offset)
+                                    )
                         else:
-                            self._filter_and_histogram_refine(
-                                tidx,
-                                threshold,
-                                offset,
-                                r_idx,
-                                is_last_round,
-                                num_input,
-                                cur_g_num_input,
-                                score,
-                                s_counter,
-                                s_indices,
-                                s_input_idx,
-                                s_num_input,
-                                s_histogram,
-                                s_last_remain,
-                                g_num_input,
-                                buffer,
-                            )
+                            num_input = min(s_num_input[r_idx], self.filtered_topk_smem_input_size)
+                            cur_g_num_input = cutlass.Int32(0)
+                            if cutlass.const_expr(self.enable_gmem_store):
+                                cur_g_num_input = g_num_input[r_idx]
+
+                            if topk_remaining == 0:
+                                self._collect_below_threshold_refine(
+                                    tidx,
+                                    threshold,
+                                    offset,
+                                    num_input,
+                                    r_idx,
+                                    s_input_idx,
+                                    score,
+                                    s_counter,
+                                    s_indices,
+                                    cur_g_num_input,
+                                    buffer,
+                                )
+                                run_next_round = False
+                            else:
+                                self._filter_and_histogram_refine(
+                                    tidx,
+                                    threshold,
+                                    offset,
+                                    r_idx,
+                                    is_last_round,
+                                    num_input,
+                                    cur_g_num_input,
+                                    score,
+                                    s_counter,
+                                    s_indices,
+                                    s_input_idx,
+                                    s_num_input,
+                                    s_histogram,
+                                    s_last_remain,
+                                    g_num_input,
+                                    buffer,
+                                )
 
             # Phase 3: Output phase
             vecsize_out = cutlass.const_expr(
