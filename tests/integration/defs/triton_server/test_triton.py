@@ -100,6 +100,33 @@ def engine_dir(test_name, llm_root):
                         engine_mapping.get(test_name, ""))
 
 
+def _assert_example_dir_removed(llm_root, relpath):
+    path = os.path.join(llm_root, "examples", relpath)
+    assert not os.path.exists(path), (
+        f"{path} should stay removed; if reintroduced, also restore the "
+        f"matching branches in triton_server/build_model.sh and test.sh.")
+
+
+@pytest.mark.parametrize("test_name", ["mistral"], indirect=True)
+def test_mistral(test_name, llm_root):
+    _assert_example_dir_removed(llm_root, "models/core/llama")
+
+
+@pytest.mark.parametrize("test_name", ["mistral-ib"], indirect=True)
+def test_mistral_ib(test_name, llm_root):
+    _assert_example_dir_removed(llm_root, "models/core/llama")
+
+
+@pytest.mark.parametrize("test_name", ["mistral-ib-streaming"], indirect=True)
+def test_mistral_ib_streaming(test_name, llm_root):
+    _assert_example_dir_removed(llm_root, "models/core/llama")
+
+
+@pytest.mark.parametrize("test_name", ["mistral-ib-mm"], indirect=True)
+def test_mistral_ib_mm(test_name, llm_root):
+    _assert_example_dir_removed(llm_root, "models/core/llama")
+
+
 @pytest.mark.parametrize("test_name", ["gpt"], indirect=True)
 def test_gpt(tritonserver_test_root, test_name, llm_root, model_path,
              engine_dir):
