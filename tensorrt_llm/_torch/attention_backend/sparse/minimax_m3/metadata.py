@@ -40,6 +40,14 @@ class MiniMaxM3SparseParams(SparseParams):
 
     algorithm: Literal["minimax_m3"] = field(init=False, default="minimax_m3")
     num_index_heads: int = 4
+    # Global (pre-TP-shard) KV head count of the model. Needed to
+    # localize ``num_index_heads`` per rank: index head ``i`` pairs 1:1
+    # with KV head ``i`` (SGLang/HF reference semantics), so a rank
+    # holding KV heads ``[s, e)`` must score with index heads
+    # ``[s*g, e*g)`` only, where ``g = num_index_heads_global //
+    # num_kv_heads_global``. ``None`` means "assume the per-rank KV
+    # head count is the global one" (single-GPU / tests).
+    num_kv_heads_global: Optional[int] = None
     sparse_index_dim: int = 128
     block_size: int = 128
     topk: int = 16
@@ -120,12 +128,31 @@ class MiniMaxM3SparseConfig:
     ) -> "MiniMaxM3SparseConfig":
         """Build a kernel param bundle from lowered ``MiniMaxM3SparseParams``
         and the per-rank model geometry.
+
+        ``sparse_params.num_index_heads`` is the *global* index-head
+        count; the per-rank count is derived here from the per-rank KV
+        head count so that index head ``i`` stays paired 1:1 with KV
+        head ``i`` under TP (the model layer slices ``idx_q`` with the
+        matching offsets — see ``modeling_minimaxm3.py``). Selecting
+        blocks from all index heads' scores (the pre-fix behaviour)
+        gave every KV head the union/max over all index heads instead
+        of its own head's top-k.
         """
+        num_kv_heads_global = int(sparse_params.num_kv_heads_global or num_kv_heads)
+        if int(sparse_params.num_index_heads) % num_kv_heads_global != 0:
+            raise ValueError(
+                f"num_index_heads ({sparse_params.num_index_heads}) must be divisible "
+                f"by the global num_kv_heads ({num_kv_heads_global})"
+            )
+        index_group = int(sparse_params.num_index_heads) // num_kv_heads_global
+        # min() covers tp_size > num_kv_heads_global (KV heads duplicated
+        # across ranks: one KV head and its paired index head per rank).
+        num_index_heads_local = index_group * min(int(num_kv_heads), num_kv_heads_global)
         return cls(
             num_q_heads=int(num_q_heads),
             num_kv_heads=int(num_kv_heads),
             head_dim=int(head_dim),
-            num_index_heads=int(sparse_params.num_index_heads),
+            num_index_heads=num_index_heads_local,
             sparse_index_dim=int(sparse_params.sparse_index_dim),
             block_size=int(sparse_params.block_size),
             topk=int(sparse_params.topk),

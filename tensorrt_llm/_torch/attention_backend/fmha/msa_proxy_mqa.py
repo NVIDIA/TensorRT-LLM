@@ -28,6 +28,7 @@ returns ``False`` so the registry skips the class.
 
 from __future__ import annotations
 
+import importlib.util
 from typing import Optional
 
 import torch
@@ -56,9 +57,17 @@ class MsaProxyMqaFmha(IndexerProxyFmha):
 
     @classmethod
     def is_available(cls, attn=None) -> bool:
-        try:
-            import fmha_sm100  # noqa: F401
-        except ImportError:
+        # Probe with find_spec instead of importing. fmha_sm100's import
+        # has module-level side effects: it imports tvm_ffi — the FFI
+        # runtime flashinfer owns in this process — and registers global
+        # functions into it. is_available() runs at attention-layer
+        # construction for every layer, and pulling tvm_ffi up that
+        # early (outside flashinfer's own initialization order)
+        # intermittently corrupts the flashinfer dense-attention path
+        # (~1/3 of processes emit garbage logits mid-decode). The real
+        # import is deferred to first kernel use, by which point
+        # flashinfer has initialized tvm_ffi itself.
+        if importlib.util.find_spec("fmha_sm100") is None:
             logger.debug("MsaProxyMqaFmha is unavailable: fmha_sm100 package not installed.")
             return False
         if not torch.cuda.is_available():

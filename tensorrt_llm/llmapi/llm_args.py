@@ -663,8 +663,14 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.metadata import \
             MiniMaxM3SparseParams
 
+        # Global KV head count, used by the backend to localize the
+        # index heads per TP rank (index head i pairs 1:1 with KV head
+        # i in the reference model).
+        num_kv_heads_global = getattr(kwargs.get("pretrained_config"),
+                                      "num_key_value_heads", None)
         return MiniMaxM3SparseParams(
             num_index_heads=self.sparse_num_index_heads,
+            num_kv_heads_global=num_kv_heads_global,
             sparse_index_dim=self.sparse_index_dim,
             block_size=self.sparse_block_size,
             topk=self.sparse_topk_blocks,

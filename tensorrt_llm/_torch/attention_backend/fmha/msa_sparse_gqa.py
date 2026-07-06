@@ -30,6 +30,7 @@ returns ``False`` so the registry skips the class.
 
 from __future__ import annotations
 
+import importlib.util
 from typing import Optional
 
 import torch
@@ -60,9 +61,12 @@ class MsaSparseGqaFmha(BlockSparseFmha):
 
     @classmethod
     def is_available(cls, attn=None) -> bool:
-        try:
-            import fmha_sm100  # noqa: F401
-        except ImportError:
+        # Probe with find_spec instead of importing — fmha_sm100's import
+        # side effects (early tvm_ffi import + global-func registration)
+        # intermittently corrupt the flashinfer dense-attention path.
+        # See MsaProxyMqaFmha.is_available for the full story; the real
+        # import happens at first kernel use in forward_block_sparse.
+        if importlib.util.find_spec("fmha_sm100") is None:
             logger.debug("MsaSparseGqaFmha is unavailable: fmha_sm100 package not installed.")
             return False
         if not torch.cuda.is_available():
