@@ -275,18 +275,42 @@
 /cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe @NVIDIA/trt-llm-moe-devs
 /cpp/tensorrt_llm/thop/*Moe* @NVIDIA/trt-llm-moe-devs
 /cpp/tensorrt_llm/thop/moe* @NVIDIA/trt-llm-moe-devs
+/cpp/tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm/kernel/*moe* @NVIDIA/trt-llm-moe-devs
+/cpp/tensorrt_llm/kernels/communicationKernels/moe* @NVIDIA/trt-llm-moe-devs
+/cpp/tensorrt_llm/kernels/cuteDslKernels/moe* @NVIDIA/trt-llm-moe-devs
+/cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h @NVIDIA/trt-llm-moe-devs
+/cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h @NVIDIA/trt-llm-moe-devs
+/cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_util_kernels.h @NVIDIA/trt-llm-moe-devs
+/cpp/tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_gemm_kernels.h @NVIDIA/trt-llm-moe-devs
+/cpp/tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_kernels.h @NVIDIA/trt-llm-moe-devs
+/cpp/tensorrt_llm/kernels/llama4MinLatencyKernels/*Moe* @NVIDIA/trt-llm-moe-devs
+/cpp/tensorrt_llm/kernels/marlin/*moe* @NVIDIA/trt-llm-moe-devs
+/cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-moe-devs
+/cpp/tensorrt_llm/nanobind/runtime/moe* @NVIDIA/trt-llm-moe-devs
+/cpp/tensorrt_llm/runtime/moeLoadBalancer @NVIDIA/trt-llm-moe-devs
 /tensorrt_llm/_torch/cute_dsl_kernels/blackwell/moe_as_dense_gemm @NVIDIA/trt-llm-moe-devs
 /tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4 @NVIDIA/trt-llm-moe-devs
+/tensorrt_llm/_torch/custom_ops/cute_dsl_megamoe_custom_op.py @NVIDIA/trt-llm-moe-devs
 /tensorrt_llm/_torch/distributed/moe_alltoall.py @NVIDIA/trt-llm-moe-devs
 /tensorrt_llm/_torch/expert_statistic.py @NVIDIA/trt-llm-moe-devs
 /tensorrt_llm/_torch/modules/fused_moe @NVIDIA/trt-llm-moe-devs
 /tensorrt_llm/_torch/modules/fused_shared_expert.py @NVIDIA/trt-llm-moe-devs
+/tensorrt_llm/deep_ep @NVIDIA/trt-llm-moe-devs
+/tests/microbenchmarks/bench_moe @NVIDIA/trt-llm-moe-devs
+/tests/microbenchmarks/bench_moe_comm.py @NVIDIA/trt-llm-moe-devs
+/tests/microbenchmarks/compare_moe_comm.py @NVIDIA/trt-llm-moe-devs
 /tests/scripts/cute_dsl_kernels/moe_as_dense_gemm @NVIDIA/trt-llm-moe-devs
 /tests/scripts/cute_dsl_kernels/moe_workload_generator.py @NVIDIA/trt-llm-moe-devs
+/tests/unittest/_torch/modules/dwdp/test_dwdp_fixup_moe_backends.py @NVIDIA/trt-llm-moe-devs
 /tests/unittest/_torch/modules/fused_moe @NVIDIA/trt-llm-moe-devs
 /tests/unittest/_torch/modules/moe @NVIDIA/trt-llm-moe-devs
+/tests/unittest/_torch/modules/test_fused_moe.py @NVIDIA/trt-llm-moe-devs
+/tests/unittest/_torch/modules/test_fused_shared_expert.py @NVIDIA/trt-llm-moe-devs
+/tests/unittest/_torch/modules/test_moe_*.py @NVIDIA/trt-llm-moe-devs
+/tests/unittest/_torch/multi_gpu/test_moe_a2a.py @NVIDIA/trt-llm-moe-devs
 /tests/unittest/_torch/thop/parallel/*moe* @NVIDIA/trt-llm-moe-devs
 /tests/unittest/_torch/thop/serial/*moe* @NVIDIA/trt-llm-moe-devs
+/tests/unittest/bindings/test_bindings_moe.py @NVIDIA/trt-llm-moe-devs
 
 # ===== VisualGen / AIGV =====
 /cpp/tensorrt_llm/thop/fusedDiT* @NVIDIA/trt-llm-torch-visual-gen-devs
