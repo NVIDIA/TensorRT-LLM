@@ -30,7 +30,10 @@ from tensorrt_llm.executor.request import TruncateKVCacheRequest
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
-from tensorrt_llm.serve.openai_protocol import KVCacheTruncateRequest
+from tensorrt_llm.serve.openai_protocol import (
+    KVCacheTruncateRequest,
+    ensure_request_chat_template_allowed,
+)
 
 
 class ResourceGovernor:
@@ -48,12 +51,14 @@ class ResourceGovernor:
         tokenizer,
         model_config,
         processor=None,
+        allow_request_chat_template: bool = False,
         harmony_adapter_factory: Optional[Callable] = None,
     ):
         self.resource_governor_queue = resource_governor_queue
         self.tokenizer = tokenizer
         self.model_config = model_config
         self.processor = processor
+        self.allow_request_chat_template = allow_request_chat_template
         self._harmony_adapter_factory = harmony_adapter_factory
         self._harmony_adapter = None
 
@@ -114,6 +119,7 @@ class ResourceGovernor:
 
     async def _truncate_kv_cache(self, request: KVCacheTruncateRequest) -> Response:
         try:
+            ensure_request_chat_template_allowed(request, self.allow_request_chat_template)
             tool_dicts = (
                 None if request.tools is None else [tool.model_dump() for tool in request.tools]
             )
@@ -152,12 +158,15 @@ class ResourceGovernor:
                 )
             )
             return err or Response(status_code=200)
+        except ValueError as e:
+            return self._create_error_response(str(e), HTTPStatus.BAD_REQUEST)
         except Exception as e:
             logger.error(traceback.format_exc())
             return self._create_error_response(str(e), HTTPStatus.INTERNAL_SERVER_ERROR)
 
     async def _truncate_kv_cache_harmony(self, request: KVCacheTruncateRequest) -> Response:
         try:
+            ensure_request_chat_template_allowed(request, self.allow_request_chat_template)
             if self._harmony_adapter is None:
                 self._harmony_adapter = self._harmony_adapter_factory()
 
@@ -189,6 +198,8 @@ class ResourceGovernor:
                 )
             )
             return err or Response(status_code=200)
+        except ValueError as e:
+            return self._create_error_response(str(e), HTTPStatus.BAD_REQUEST)
         except Exception as e:
             logger.error(traceback.format_exc())
             return self._create_error_response(str(e), HTTPStatus.INTERNAL_SERVER_ERROR)

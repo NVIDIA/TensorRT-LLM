@@ -1,0 +1,25 @@
+{
+  "_comment": "Per-(case_id, arch) golden. Empty arch map => bootstrap: the test skips and prints the observed value. DISCRETE golden = exact scalar (== assert). CONTINUOUS golden = object {baseline_ms, cv, n, [k_sigma], [rel_floor]}; gate = baseline_ms*(1+max(k_sigma*cv, rel_floor)), defaults k_sigma=4, rel_floor=0.01. A legacy scalar continuous entry still works via the baseline*1.05 fallback. cv MUST come from a multi-run bootstrap; sm120 = cross-session (5 independent containers), sm90/sm100/sm103 = same-session REPEAT=5 (floor absorbs the gap; refine with cross-session later).",
+  "attn_ctx_dispatch":   {"sm120": false, "sm90": false, "sm100": false, "sm103": false},
+  "attn_decode_dispatch": {"sm120": 49,   "sm90": 59,    "sm100": 71,    "sm103": 71},
+  "attn_ctx_fmha_time": {
+    "sm120": {"baseline_ms": 2.7882, "cv": 0.0003, "n": 5,
+              "_src": "xsession build2800, 5 independent containers: 2.7876/2.7863/2.7884/2.7882/2.7884; cv 0.029% -> 1% floor binds"},
+    "sm90":  {"baseline_ms": 1.2344, "cv": 0.0047, "n": 5,
+              "_src": "samesession build2801 REPEAT=5 H100: 1.2220/1.2344/1.2389/1.2306/1.2359; cv 0.47% -> gate ~1.9%"},
+    "sm100": {"baseline_ms": 0.6677, "cv": 0.0009, "n": 5,
+              "_src": "samesession build2801 REPEAT=5 B200: 0.6687/0.6677/0.6671/0.6677/0.6671; cv 0.09% -> 1% floor binds"},
+    "sm103": {"baseline_ms": 1.0384, "cv": 0.0019, "n": 5,
+              "_src": "samesession build2801 REPEAT=5 B300-pcie: 1.0373/1.0363/1.0405/1.0384/1.0415; cv 0.19% -> 1% floor binds"}
+  },
+  "attn_decode_xqa_time": {
+    "sm120": {"baseline_ms": 0.0858, "cv": 0.0036, "n": 5,
+              "_src": "xsession build2800, 5 independent containers: 0.0865/0.0858/0.0856/0.0858/0.0860; cv 0.36% -> k*cv~1.43% gate"},
+    "sm90":  {"baseline_ms": 0.1183, "cv": 0.0104, "n": 5,
+              "_src": "samesession build2801 REPEAT=5 H100: 0.1191/0.1191/0.1164/0.1183/0.1164; cv 1.04% -> gate ~4.2%"},
+    "sm100": {"baseline_ms": 0.0968, "cv": 0.0041, "n": 5,
+              "_src": "samesession build2801 REPEAT=5 B200: 0.0975/0.0964/0.0965/0.0968/0.0970; cv 0.41% -> gate ~1.6%"},
+    "sm103": {"baseline_ms": 0.0532, "cv": 0.0504, "n": 5, "status": "flaky",
+              "_src": "samesession build2801 REPEAT=5 B300-pcie: 0.0599/0.0532/0.0532/0.0553/0.0522; cv 5.04% (first val warmup outlier; drop-first cv 2.11%) -> gate ~20%, NEARLY USELESS. INSENSITIVE case: 0.053ms kernel too short for stable CUDA-event timing on fast B300. TODO raise warmup/iters or treat as discrete-only (launch_count=71 still guards structure)."}
+  }
+}

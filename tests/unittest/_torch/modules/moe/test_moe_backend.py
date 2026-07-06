@@ -194,6 +194,7 @@ def test_megamoe_init_rejects_uneven_num_slots_with_value_error():
             tp_size=4,
             moe_tp_size=1,
             moe_ep_size=4,
+            enable_attention_dp=True,
         ),
         moe_backend=MoeBackendType.MEGAMOE_DEEPGEMM.value,
     )
@@ -302,6 +303,7 @@ QUANT_ALGOS_TO_TEST = [
     QuantAlgo.W4A16_MXFP4,
     QuantAlgo.W4A8_MXFP4_FP8,
     QuantAlgo.W4A8_MXFP4_MXFP8,
+    QuantAlgo.MXFP8,
     QuantAlgo.W8A16,
     QuantAlgo.W4A8_AWQ,
 ]
@@ -316,6 +318,7 @@ BACKEND_TYPES_TO_TEST = [
     MoeBackendType.MEGAMOE_DEEPGEMM,
     MoeBackendType.MEGAMOE_CUTEDSL,
     MoeBackendType.CUTE_DSL_B12X,
+    MoeBackendType.MARLIN,
 ]
 
 # Data types to test

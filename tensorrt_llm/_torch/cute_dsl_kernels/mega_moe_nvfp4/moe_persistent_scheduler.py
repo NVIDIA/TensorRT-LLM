@@ -1366,12 +1366,6 @@ class _ClcDynamicState:
 
     CLC coordinate semantics (unified across 2Dx2D and 2Dx3D after the
     WGrad linearization):
-        {$nv-internal-release begin}
-        These store the **cluster origin** coordinates from the CLC response,
-        i.e., the grid position of the first CTA of the canceled cluster.
-        This matches the CLC hardware behavior: UGETNEXTWORKID returns
-        "the first CTA of the CGA" coordinates (see ISA spec).
-        {$nv-internal-release end}
 
         Grid layouts produced by MoEDynamicSchedulerParams.get_grid_shape:
             Layout A (grid_z_lin <= 65535):  (cm,              cn, grid_z_lin)

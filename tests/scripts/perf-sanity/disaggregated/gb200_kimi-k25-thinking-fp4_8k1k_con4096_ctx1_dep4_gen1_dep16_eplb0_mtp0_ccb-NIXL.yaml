@@ -63,6 +63,7 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 16384
       backend: NIXL
+      kv_transfer_timeout_ms: 600000
     disable_overlap_scheduler: true
     trust_remote_code: true
     num_postprocess_workers: 4
@@ -88,5 +89,6 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 16384
       backend: NIXL
+      kv_transfer_timeout_ms: 600000
     disable_overlap_scheduler: true
     trust_remote_code: true

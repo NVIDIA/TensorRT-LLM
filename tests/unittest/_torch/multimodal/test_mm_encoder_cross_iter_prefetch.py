@@ -25,7 +25,6 @@ import torch
 
 from tensorrt_llm._torch.models import modeling_multimodal_mixin as mm_mixin
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
-    MultimodalEncoderOutput,
     MultimodalModelMixin,
     _get_mm_aux_stream,
     maybe_prefetch_mm_encoder_for_next_iter,
@@ -40,7 +39,7 @@ class _StubModel(MultimodalModelMixin):
         self.encoder_call_count = 0
         self.encoder_call_stream_id = None
 
-    def encode_multimodal_inputs(self, multimodal_params, **kwargs) -> MultimodalEncoderOutput:
+    def encode_multimodal_inputs(self, multimodal_params, **kwargs) -> torch.Tensor:
         self.encoder_call_count += 1
         self.encoder_call_stream_id = torch.cuda.current_stream().cuda_stream
         pv = multimodal_params[0].multimodal_data["image"]["pixel_values"]
@@ -52,7 +51,7 @@ class _StubModel(MultimodalModelMixin):
             self._hidden_size,
             device=pv.device,
         )
-        return MultimodalEncoderOutput(embeddings=embeddings)
+        return embeddings
 
 
 def _make_request(request_id: int, num_tokens: int) -> LlmRequest:

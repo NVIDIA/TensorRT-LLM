@@ -29,6 +29,7 @@ We first describe three runtime modes for running multimodal models and how to r
 - [Phi-3-vision](#phi-3-vision)
 - [Phi-4-multimodal](#phi-4-multimodal)
 - [Qwen2-VL](#qwen2-vl)
+- [Qwen-Image-Bench Evaluator](#qwen-image-bench-evaluator)
 - [Video NeVA](#video-neva)
 - [Dataset Evaluation](#dataset-evaluation)
 - [Enabling Tensor Parallelism for multi-GPU](#enabling-tensor-parallelism-for-multi-gpu)
@@ -1163,6 +1164,26 @@ pip install -r requirements-qwen2vl.txt
     --hf_model_dir tmp/hf_models/${MODEL_NAME} \
     --engine_dir tmp/trt_engines/${MODEL_NAME}/fp8/1-gpu/
     ```
+
+## Qwen-Image-Bench Evaluator
+
+[`qwen_image_bench_eval.py`](qwen_image_bench_eval.py) runs the
+Qwen-Image-Bench VLM judge through TensorRT-LLM to evaluate an image generated
+by another image or vision-language model. Provide the original generation
+prompt and the generated image path:
+
+```bash
+python examples/models/core/multimodal/qwen_image_bench_eval.py \
+    --model_path /path/to/Qwen-Image-Bench \
+    --prompt "A cute cat playing piano" \
+    --image_path examples/visual_gen/cat_piano.png \
+    --output_path qwen_image_bench_result.json \
+    --include_raw_outputs
+```
+
+The script evaluates all five Qwen-Image-Bench level-1 dimensions by default:
+Quality, Aesthetics, Alignment, Real-world Fidelity, and Creative Generation.
+
 ## Video NeVA
 
 [Video NeVA](https://github.com/NVIDIA/NeMo/blob/main/docs/source/multimodal/mllm/video_neva.rst) is a groundbreaking addition to the NeMo Multimodal ecosystem that could work with video modality. This model seamlessly integrates large language-centric models with a vision encoder, that can be deployed in TensorRT-LLM.

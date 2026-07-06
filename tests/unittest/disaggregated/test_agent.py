@@ -1,9 +1,13 @@
+import os
 from dataclasses import dataclass, field
 from unittest import TestCase
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
+
+# Exclude IB (no fabric) and gdr_copy (UCX rcache SIGABRT at teardown).
+os.environ.setdefault("UCX_TLS", "^ib,gdr_copy")
 
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.agent import (
@@ -15,6 +19,19 @@ from tensorrt_llm._torch.disaggregation.base.agent import (
     TransferStatus,
 )
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
+
+try:
+    from tensorrt_llm._torch.disaggregation.nixl._agent_cpp import (
+        BindingsNixlTransferAgent,
+        BindingsNixlTransferStatus,
+    )
+    from tensorrt_llm.tensorrt_llm_transfer_agent_binding import TransferState
+
+    _HAS_CPP_NIXL_BINDING = True
+except Exception:  # pragma: no cover - binding unavailable in some envs
+    _HAS_CPP_NIXL_BINDING = False
+
+_AGENT_CPP_MODULE = "tensorrt_llm._torch.disaggregation.nixl._agent_cpp"
 
 
 class TestTransferStatus(TestCase):
@@ -173,6 +190,95 @@ def test_transfer_between_agents(
 
     transfer_agent_src.invalidate_remote_agent("dst_agent")
     transfer_agent_dst.invalidate_remote_agent("src_agent")
+
+
+@pytest.mark.skipif(not _HAS_CPP_NIXL_BINDING, reason="nixl C++ transfer-agent binding unavailable")
+class TestBindingsNixlTransferStatus(TestCase):
+    """Cover BindingsNixlTransferStatus (#14137) with a mocked cpp_status.
+
+    Verifies wait()/is_completed()/last_status()/last_status_str() without a
+    GPU or a real NIXL agent.
+    """
+
+    def test_wait_success_returns_true(self):
+        cpp = Mock()
+        cpp.wait.return_value = TransferState.SUCCESS
+        status = BindingsNixlTransferStatus(cpp, agent_name="testAgent")
+        self.assertTrue(status.wait(timeout_ms=5000))
+        cpp.wait.assert_called_once_with(5000)
+
+    def test_wait_none_timeout_maps_to_minus_one(self):
+        cpp = Mock()
+        cpp.wait.return_value = TransferState.SUCCESS
+        status = BindingsNixlTransferStatus(cpp, agent_name="a")
+        self.assertTrue(status.wait())
+        cpp.wait.assert_called_once_with(-1)
+
+    def test_wait_failure_returns_false_and_logs(self):
+        cpp = Mock()
+        cpp.wait.return_value = TransferState.FAILURE
+        status = BindingsNixlTransferStatus(cpp, agent_name="testAgent")
+        with patch(f"{_AGENT_CPP_MODULE}.logger") as mlog:
+            self.assertFalse(status.wait())
+        mlog.error.assert_called_once()
+        msg = mlog.error.call_args.args[0]
+        self.assertIn("non-SUCCESS", msg)
+        self.assertIn("testAgent", msg)
+
+    def test_is_completed_passthrough(self):
+        cpp = Mock()
+        cpp.is_completed.return_value = True
+        self.assertTrue(BindingsNixlTransferStatus(cpp).is_completed())
+
+    def test_last_status_passthrough(self):
+        cpp = Mock()
+        cpp.get_last_status.return_value = 7
+        cpp.get_last_status_str.return_value = "NIXL_ERR_INVALID_PARAM"
+        status = BindingsNixlTransferStatus(cpp)
+        self.assertEqual(status.last_status(), 7)
+        self.assertEqual(status.last_status_str(), "NIXL_ERR_INVALID_PARAM")
+
+    def test_last_status_unavailable_fallback(self):
+        # cpp_status without get_last_status*/-> graceful sentinels, no raise.
+        cpp = Mock(spec=[])
+        status = BindingsNixlTransferStatus(cpp)
+        self.assertEqual(status.last_status(), -1)
+        self.assertEqual(status.last_status_str(), "<unavailable>")
+
+
+@pytest.mark.skipif(not _HAS_CPP_NIXL_BINDING, reason="nixl C++ transfer-agent binding unavailable")
+class TestBindingsNixlTransferAgentShutdown(TestCase):
+    """Cover BindingsNixlTransferAgent.shutdown() (#14137) idempotency.
+
+    shutdown() nulls _cpp_agent FIRST, so a second/re-entrant call is a no-op
+    and submit-after-shutdown does not reach a torn-down agent. Tested via
+    cls.__new__ + a mocked _cpp_agent to bypass the real-agent __init__.
+    """
+
+    @staticmethod
+    def _agent_with_mock_cpp():
+        agent = BindingsNixlTransferAgent.__new__(BindingsNixlTransferAgent)
+        agent._cpp_agent = Mock()
+        agent.name = "testAgent"
+        return agent
+
+    def test_shutdown_is_idempotent(self):
+        agent = self._agent_with_mock_cpp()
+        cpp = agent._cpp_agent
+        agent.shutdown()
+        agent.shutdown()  # _cpp_agent is None now -> early return, no double shutdown
+        cpp.shutdown.assert_called_once()
+        self.assertIsNone(agent._cpp_agent)
+
+    def test_shutdown_without_init_is_noop(self):
+        agent = BindingsNixlTransferAgent.__new__(BindingsNixlTransferAgent)  # never set _cpp_agent
+        agent.shutdown()  # getattr(..., None) -> None -> return, must not raise
+
+    def test_submit_after_shutdown_raises(self):
+        agent = self._agent_with_mock_cpp()
+        agent.shutdown()
+        with self.assertRaises(Exception):
+            agent.submit_transfer_requests(Mock())
 
 
 if __name__ == "__main__":

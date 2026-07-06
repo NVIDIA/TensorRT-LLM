@@ -181,6 +181,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `scheduler_config.dynamic_batch_config.dynamic_batch_moving_average_window` | `<class 'int'>` | `value` |  |  |
 | `scheduler_config.dynamic_batch_config.enable_batch_size_tuning` | `<class 'bool'>` | `value` |  |  |
 | `scheduler_config.dynamic_batch_config.enable_max_num_tokens_tuning` | `<class 'bool'>` | `value` |  |  |
+| `scheduler_config.enable_prefix_aware_scheduling` | `<class 'bool'>` | `value` |  |  |
 | `scheduler_config.use_python_scheduler` | `<class 'bool'>` | `value` |  |  |
 | `scheduler_config.waiting_queue_policy` | `<enum 'WaitingQueuePolicy'>` | `categorical` |  | `fcfs`, `priority` |
 | `skip_tokenizer_init` | `<class 'bool'>` | `value` |  |  |
@@ -460,6 +461,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `scheduler_config.dynamic_batch_config.dynamic_batch_moving_average_window` | `<class 'int'>` | `value` |  |  |
 | `scheduler_config.dynamic_batch_config.enable_batch_size_tuning` | `<class 'bool'>` | `value` |  |  |
 | `scheduler_config.dynamic_batch_config.enable_max_num_tokens_tuning` | `<class 'bool'>` | `value` |  |  |
+| `scheduler_config.enable_prefix_aware_scheduling` | `<class 'bool'>` | `value` |  |  |
 | `scheduler_config.use_python_scheduler` | `<class 'bool'>` | `value` |  |  |
 | `scheduler_config.waiting_queue_policy` | `<enum 'WaitingQueuePolicy'>` | `categorical` |  | `fcfs`, `priority` |
 | `skip_tokenizer_init` | `<class 'bool'>` | `value` |  |  |

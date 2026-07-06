@@ -259,9 +259,10 @@ class UlyssesAttention(AttentionBackend):
         compute_q: Callable[[], torch.Tensor],
         compute_k: Callable[[], torch.Tensor],
         compute_v: Callable[[], torch.Tensor],
+        issue_order: tuple = ("v", "q", "k"),
         **attn_kwargs,
     ) -> torch.Tensor:
-        """Run the async ulysses attention path (V/Q/K rolling A2A).
+        """Run the async ulysses attention path (Q/K/V rolling A2A).
 
         Args:
             compute_q / compute_k / compute_v : caller-provided closures that
@@ -269,31 +270,33 @@ class UlyssesAttention(AttentionBackend):
                 typically does `GEMM → (RMSNorm) → (RoPE) → view(4D)`; closures
                 live in the caller's compiled forward so inductor fuses each
                 into a single Triton kernel.
+            issue_order : order in which the three closures are computed +
+                issued. Default `("v", "q", "k")` (self-attn). Cross-attn passes
+                `("q", "k", "v")` to issue the small audio-Q first. Order is
+                correctness-neutral (`_join_async` syncs all recv bufs).
             **attn_kwargs : forwarded to the wrapped inner attention backend
                 (mask, scale, etc.).
 
         Returns:
             output tensor in the caller's sharded layout `[B, S/P, H, D]`.
 
-        Pipeline: V/Q/K computed in V→Q→K order on the default stream; each
-        compute's output is fed to `_issue_async` which queues push+barrier on
-        the comm side stream. Default stream proceeds to the next compute
-        immediately, so V's push overlaps with Q's compute, Q's push overlaps
-        with K's compute. `_join_async` makes default wait on the last push.
+        Pipeline: the three closures run on the default stream in `issue_order`;
+        each compute's output is fed to `_issue_async` which queues push+barrier
+        on the comm side stream. Default stream proceeds to the next compute
+        immediately, so each push overlaps with the next compute. `_join_async`
+        makes default wait on the last push.
         Post-attention permute / SDPA / reverse A2A run in the caller's outer
         compile region for additional inductor fusion."""
         P = self.world_size
 
-        v_4d = compute_v()
-        v_5d = self._issue_async(v_4d)
-
-        q_4d = compute_q()
-        q_5d = self._issue_async(q_4d)
-
-        k_4d = compute_k()
-        k_5d = self._issue_async(k_4d)
-
+        # Issue the closures in issue_order. Order is correctness-neutral (_join_async
+        # syncs all recv bufs); it only tunes which push overlaps which compute.
+        computes = {"q": compute_q, "k": compute_k, "v": compute_v}
+        recv = {}
+        for name in issue_order:
+            recv[name] = self._issue_async(computes[name]())
         self._join_async()
+        q_5d, k_5d, v_5d = recv["q"], recv["k"], recv["v"]
 
         # Fast path: one fused kernel replaces the eager post-A2A chain
         # (6 ops for HND target: permute+reshape+contig + transpose+contig
@@ -306,6 +309,7 @@ class UlyssesAttention(AttentionBackend):
             q_out, k_out, v_out = _ulysses_post_unscatter(q_5d, k_5d, v_5d, is_hnd=is_hnd)
             B = B_q
             seq_len_full = P * Sp_q
+            seq_len_kv_full = P * k_5d.shape[2]  # cross-attn: K/V seq (Sp_k) differs from Q
         else:
             v_out = post_permute_5d_to_4d(v_5d, P)
             q_out = post_permute_5d_to_4d(q_5d, P)
@@ -313,13 +317,14 @@ class UlyssesAttention(AttentionBackend):
 
             B = q_out.shape[0]
             seq_len_full = q_out.shape[1]
+            seq_len_kv_full = k_out.shape[1]  # cross-attn: K/V seq differs from Q
             if is_hnd:
                 q_out = q_out.transpose(1, 2).contiguous()
                 k_out = k_out.transpose(1, 2).contiguous()
                 v_out = v_out.transpose(1, 2).contiguous()
 
         attn_kwargs["seq_len"] = seq_len_full
-        attn_kwargs["seq_len_kv"] = seq_len_full
+        attn_kwargs["seq_len_kv"] = seq_len_kv_full
         output = self.inner_backend.forward(q=q_out, k=k_out, v=v_out, **attn_kwargs)
         return self._output_a2a(output, B, seq_len_full)
 
@@ -812,6 +817,7 @@ def wrap_parallel_attention(
     *,
     visual_gen_mapping: Optional["VisualGenMapping"] = None,
     enable_sequence_parallel: bool = True,
+    use_ulysses: bool = True,
     async_ulysses: bool = False,
 ) -> AttentionBackend:
     """Wrap a compute backend with the configured parallelism strategy.
@@ -822,6 +828,12 @@ def wrap_parallel_attention(
 
     When ``enable_sequence_parallel`` is False, no wrappers are applied (callers
     use this for cross-attention paths that cannot use Ulysses/Ring/Attention2D).
+
+    ``use_ulysses`` gates the Ulysses head-sharding wrap independently of
+    ``ulysses_size``: pass False to skip it even when ``ulysses_size > 1`` (e.g. a
+    SEPARATE_QKV cross-attn that falls back to all-gather and built its inner
+    backend with the full, un-sharded head count). This keeps the wrap consistent
+    with the caller's inner head-count decision.
     """
     if not enable_sequence_parallel or visual_gen_mapping is None:
         return attn
@@ -840,7 +852,7 @@ def wrap_parallel_attention(
     elif ring_size > 1:
         attn = RingAttention(attn, process_group=vgm.ring_group)
 
-    if ulysses_size > 1:
+    if ulysses_size > 1 and use_ulysses:
         attn = UlyssesAttention(
             attn,
             process_group=vgm.ulysses_group,

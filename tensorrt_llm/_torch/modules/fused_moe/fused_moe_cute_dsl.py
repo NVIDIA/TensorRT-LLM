@@ -63,8 +63,11 @@ class NvFp4WeightView:
 
 
 @torch.compile(options={"max-autotune": True})
-def swiglu_fused_moe(x):
+def swiglu_fused_moe(x, swiglu_limit_scalar: float = float("inf")):
     x, gate = x.chunk(2, dim=-1)
+    if swiglu_limit_scalar != float("inf"):
+        gate = gate.clamp(max=swiglu_limit_scalar)
+        x = x.clamp(min=-swiglu_limit_scalar, max=swiglu_limit_scalar)
     return F.silu(gate) * x
 
 
@@ -431,6 +434,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         VANILLA,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
+        swiglu_limit_scalar: Optional[float] = None,
         init_load_balancer: bool = True,
         without_comm: bool = False,
         activation_type: ActivationType = ActivationType.Swiglu,
@@ -447,10 +451,12 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
+            swiglu_limit_scalar=swiglu_limit_scalar,
             init_load_balancer=init_load_balancer,
             without_comm=without_comm,
             activation_type=activation_type,
         )
+        self.swiglu_limit_scalar = swiglu_limit_scalar or float("inf")
 
         if self.aux_stream_dict is None:
             self.aux_stream_dict = aux_stream_dict if aux_stream_dict is not None else {}
@@ -648,6 +654,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             local_expert_offset=slot_start,
             tile_size=tile_size,
             activation_type=self.activation_type,
+            swiglu_limit_scalar=self.swiglu_limit_scalar,
         )
 
         if self.use_fused_finalize:
@@ -760,7 +767,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             b_sf=self.quant_scales[0],
             offset_array=expert_first_token_offset,
         )
-        x = swiglu_fused_moe(x)
+        x = swiglu_fused_moe(x, self.swiglu_limit_scalar)
         x, x_sf = torch.ops.trtllm.fp8_quantize_1x128(x)
         x = cute_dsl_fp8_group_blockwise_gemm_ref(
             a=x,
@@ -852,6 +859,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             self,
             x: Union[torch.Tensor, Fp4QuantizedTensor],
             router_logits: torch.Tensor,
+            input_ids: Optional[torch.IntTensor] = None,
             output_dtype: Optional[torch.dtype] = None,
             all_rank_num_tokens: Optional[List[int]] = None,
             use_dp_padding: Optional[bool] = None,
@@ -861,7 +869,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         # This forward_chunk method is a reference implementation of the legacy path.
         # Apply routing
         token_selected_experts, token_final_scales = self.routing_method.apply(
-            router_logits)
+            router_logits, input_ids)
         assert token_selected_experts.shape[
             1] == self.routing_method.experts_per_token
         assert token_selected_experts.shape == token_final_scales.shape
