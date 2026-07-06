@@ -25,9 +25,7 @@ from ...attention_backend import AttentionMetadata
 from ...distributed import AllReduceParams
 from ...model_config import ModelConfig
 from ...speculative import SpecMetadata
-from ...utils import EventType
 from ..linear import Linear, TensorParallelMode
-from ..multi_stream_utils import maybe_execute_in_parallel
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from .causal_conv1d_triton import causal_conv1d_update as causal_conv1d_update_triton
 from .fuse_elementwise_ops import (
@@ -74,117 +72,6 @@ def divide(numerator, denominator):
     return numerator // denominator
 
 
-@triton.jit
-def fused_qkvzba_split_reshape_cat_kernel(
-    mixed_qkv,
-    z,
-    b,
-    a,
-    mixed_qkvz,
-    mixed_ba,
-    NUM_HEADS_QK: tl.constexpr,
-    NUM_HEADS_V: tl.constexpr,
-    HEAD_QK: tl.constexpr,
-    HEAD_V: tl.constexpr,
-):
-    i_bs, i_qk = tl.program_id(0), tl.program_id(1)
-    QKVZ_DIM_T: tl.constexpr = HEAD_QK * 2 + NUM_HEADS_V // NUM_HEADS_QK * HEAD_V * 2
-    BA_DIM_T: tl.constexpr = NUM_HEADS_V // NUM_HEADS_QK * 2
-    QKV_DIM_T: tl.constexpr = HEAD_QK * 2 + NUM_HEADS_V // NUM_HEADS_QK * HEAD_V
-    q_end: tl.constexpr = HEAD_QK
-    blk_q_ptr = (
-        mixed_qkvz + i_bs * NUM_HEADS_QK * QKVZ_DIM_T + i_qk * QKVZ_DIM_T + tl.arange(0, q_end)
-    )
-    k_end: tl.constexpr = q_end + HEAD_QK
-    blk_k_ptr = (
-        mixed_qkvz + i_bs * NUM_HEADS_QK * QKVZ_DIM_T + i_qk * QKVZ_DIM_T + tl.arange(q_end, k_end)
-    )
-    v_end: tl.constexpr = k_end + NUM_HEADS_V // NUM_HEADS_QK * HEAD_V
-    blk_v_ptr = (
-        mixed_qkvz + i_bs * NUM_HEADS_QK * QKVZ_DIM_T + i_qk * QKVZ_DIM_T + tl.arange(k_end, v_end)
-    )
-    z_end: tl.constexpr = v_end + NUM_HEADS_V // NUM_HEADS_QK * HEAD_V
-    blk_z_ptr = (
-        mixed_qkvz + i_bs * NUM_HEADS_QK * QKVZ_DIM_T + i_qk * QKVZ_DIM_T + tl.arange(v_end, z_end)
-    )
-    blk_q_st_ptr = (
-        mixed_qkv + i_bs * NUM_HEADS_QK * QKV_DIM_T + i_qk * HEAD_QK + tl.arange(0, HEAD_QK)
-    )
-    blk_k_st_ptr = (
-        mixed_qkv
-        + i_bs * NUM_HEADS_QK * QKV_DIM_T
-        + NUM_HEADS_QK * HEAD_QK
-        + i_qk * HEAD_QK
-        + tl.arange(0, HEAD_QK)
-    )
-    blk_v_st_ptr = (
-        mixed_qkv
-        + i_bs * NUM_HEADS_QK * QKV_DIM_T
-        + NUM_HEADS_QK * HEAD_QK * 2
-        + i_qk * HEAD_V * NUM_HEADS_V // NUM_HEADS_QK
-        + tl.arange(0, HEAD_V * NUM_HEADS_V // NUM_HEADS_QK)
-    )
-    blk_z_st_ptr = (
-        z
-        + i_bs * NUM_HEADS_V * HEAD_V
-        + i_qk * HEAD_V * NUM_HEADS_V // NUM_HEADS_QK
-        + tl.arange(0, HEAD_V * NUM_HEADS_V // NUM_HEADS_QK)
-    )
-    tl.store(blk_q_st_ptr, tl.load(blk_q_ptr))
-    tl.store(blk_k_st_ptr, tl.load(blk_k_ptr))
-    tl.store(blk_v_st_ptr, tl.load(blk_v_ptr))
-    tl.store(blk_z_st_ptr, tl.load(blk_z_ptr))
-    b_end: tl.constexpr = NUM_HEADS_V // NUM_HEADS_QK
-    a_end: tl.constexpr = b_end + NUM_HEADS_V // NUM_HEADS_QK
-    for i in tl.static_range(b_end):
-        blk_b_ptr = mixed_ba + i_bs * NUM_HEADS_QK * BA_DIM_T + i_qk * BA_DIM_T + i
-        blk_b_st_ptr = b + i_bs * NUM_HEADS_V + i_qk * NUM_HEADS_V // NUM_HEADS_QK + i
-        tl.store(blk_b_st_ptr, tl.load(blk_b_ptr))
-    for i in tl.static_range(b_end, a_end):
-        blk_a_ptr = mixed_ba + i_bs * NUM_HEADS_QK * BA_DIM_T + i_qk * BA_DIM_T + i
-        blk_a_st_ptr = a + i_bs * NUM_HEADS_V + i_qk * NUM_HEADS_V // NUM_HEADS_QK + (i - b_end)
-        tl.store(blk_a_st_ptr, tl.load(blk_a_ptr))
-
-
-def fused_qkvzba_split_reshape_cat(
-    mixed_qkvz,
-    mixed_ba,
-    num_heads_qk,
-    num_heads_v,
-    head_qk,
-    head_v,
-):
-    batch, seq_len = mixed_qkvz.shape[0], 1
-    qkv_dim_t = num_heads_qk * head_qk * 2 + num_heads_v * head_v
-    batch_seq = batch * seq_len
-
-    # Directly allocate output tensors in their final shapes (no intermediate buffers)
-    mixed_qkv = torch.empty(
-        (batch_seq, qkv_dim_t), dtype=mixed_qkvz.dtype, device=mixed_qkvz.device
-    )
-    z = torch.empty(
-        (batch_seq, num_heads_v, head_v), dtype=mixed_qkvz.dtype, device=mixed_qkvz.device
-    )
-    b = torch.empty((batch_seq, num_heads_v), dtype=mixed_ba.dtype, device=mixed_ba.device)
-    a = torch.empty((batch_seq, num_heads_v), dtype=mixed_ba.dtype, device=mixed_ba.device)
-    grid = (batch * seq_len, num_heads_qk)
-    fused_qkvzba_split_reshape_cat_kernel[grid](
-        mixed_qkv,
-        z,
-        b,
-        a,
-        mixed_qkvz,
-        mixed_ba,
-        num_heads_qk,
-        num_heads_v,
-        head_qk,
-        head_v,
-        num_warps=1,
-        num_stages=3,
-    )
-    return mixed_qkv, z, b, a
-
-
 # g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 @triton.jit
 def fused_gdn_gating_kernel(
@@ -193,6 +80,7 @@ def fused_gdn_gating_kernel(
     a,
     dt_bias,
     seq_len,
+    stride_a_token: tl.constexpr,
     NUM_HEADS: tl.constexpr,
     beta: tl.constexpr,
     threshold: tl.constexpr,
@@ -200,15 +88,19 @@ def fused_gdn_gating_kernel(
 ):
     i_b, i_s, i_d = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     head_off = i_d * BLK_HEADS + tl.arange(0, BLK_HEADS)
-    off = i_b * seq_len * NUM_HEADS + i_s * NUM_HEADS + head_off
+    # A combined-projection row can be wide enough that token * stride exceeds
+    # INT32 for long-context batches.
+    token_off = tl.cast(i_b * seq_len + i_s, tl.int64)
+    in_off = token_off * stride_a_token + head_off
+    out_off = token_off * NUM_HEADS + head_off
     mask = head_off < NUM_HEADS
     blk_A_log = tl.load(A_log + head_off, mask=mask)
-    blk_a = tl.load(a + off, mask=mask)
+    blk_a = tl.load(a + in_off, mask=mask)
     blk_bias = tl.load(dt_bias + head_off, mask=mask)
     x = blk_a.to(tl.float32) + blk_bias.to(tl.float32)
     softplus_x = tl.where(beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x)
     blk_g = -tl.exp(blk_A_log.to(tl.float32)) * softplus_x
-    tl.store(g + off, blk_g.to(g.dtype.element_ty), mask=mask)
+    tl.store(g + out_off, blk_g.to(g.dtype.element_ty), mask=mask)
 
 
 def fused_gdn_gating(
@@ -223,7 +115,17 @@ def fused_gdn_gating(
     grid = (batch, seq_len, triton.cdiv(num_heads, 8))
     g = torch.empty_like(a, dtype=torch.float32)
     fused_gdn_gating_kernel[grid](
-        g, A_log, a, dt_bias, seq_len, num_heads, beta, threshold, 8, num_warps=1
+        g,
+        A_log,
+        a,
+        dt_bias,
+        seq_len,
+        a.stride(0),
+        num_heads,
+        beta,
+        threshold,
+        8,
+        num_warps=1,
     )
     return g
 
@@ -237,6 +139,8 @@ def fused_gdn_gating_with_sigmoid_kernel(
     dt_bias,
     b,
     seq_len,
+    stride_a_token: tl.constexpr,
+    stride_b_token: tl.constexpr,
     NUM_HEADS: tl.constexpr,
     sp_beta: tl.constexpr,
     threshold: tl.constexpr,
@@ -245,21 +149,26 @@ def fused_gdn_gating_with_sigmoid_kernel(
     """Fuse gdn_gating + sigmoid(b) into one kernel."""
     i_b, i_s, i_d = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     head_off = i_d * BLK_HEADS + tl.arange(0, BLK_HEADS)
-    off = i_b * seq_len * NUM_HEADS + i_s * NUM_HEADS + head_off
+    # A combined-projection row can be wide enough that token * stride exceeds
+    # INT32 for long-context batches.
+    token_off = tl.cast(i_b * seq_len + i_s, tl.int64)
+    a_off = token_off * stride_a_token + head_off
+    b_off = token_off * stride_b_token + head_off
+    out_off = token_off * NUM_HEADS + head_off
     mask = head_off < NUM_HEADS
     blk_A_log = tl.load(A_log + head_off, mask=mask)
-    blk_a = tl.load(a + off, mask=mask)
+    blk_a = tl.load(a + a_off, mask=mask)
     blk_bias = tl.load(dt_bias + head_off, mask=mask)
     x = blk_a.to(tl.float32) + blk_bias.to(tl.float32)
     softplus_x = tl.where(
         sp_beta * x <= threshold, (1 / sp_beta) * tl.log(1 + tl.exp(sp_beta * x)), x
     )
     blk_g = -tl.exp(blk_A_log.to(tl.float32)) * softplus_x
-    tl.store(g + off, blk_g.to(g.dtype.element_ty), mask=mask)
+    tl.store(g + out_off, blk_g.to(g.dtype.element_ty), mask=mask)
     # sigmoid(b)
-    blk_b = tl.load(b + off, mask=mask)
+    blk_b = tl.load(b + b_off, mask=mask)
     blk_beta = tl.sigmoid(blk_b.to(tl.float32))
-    tl.store(beta_out + off, blk_beta.to(beta_out.dtype.element_ty), mask=mask)
+    tl.store(beta_out + out_off, blk_beta.to(beta_out.dtype.element_ty), mask=mask)
 
 
 def fused_gdn_gating_with_sigmoid(
@@ -288,6 +197,8 @@ def fused_gdn_gating_with_sigmoid(
         dt_bias,
         b,
         seq_len,
+        a.stride(0),
+        b.stride(0),
         num_heads,
         sp_beta,
         threshold,
@@ -338,6 +249,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         self.num_v_heads_per_tp = divide(self.num_v_heads, self.attn_tp_size)
         self.key_dim_per_tp = self.head_k_dim * self.num_k_heads_per_tp
         self.value_dim_per_tp = self.head_v_dim * self.num_v_heads_per_tp
+        self.conv_dim_per_tp = self.key_dim_per_tp * 2 + self.value_dim_per_tp
 
         self.conv_kernel_size = config.linear_conv_kernel_dim
         self.layer_idx = layer_idx
@@ -361,23 +273,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             use_cute_dsl_blockscaling_mm=False,
         )
 
-        self.in_proj_qkvz = Linear(
+        self.in_proj_qkvzba = Linear(
             self.hidden_size,
-            self.key_dim * 2 + self.value_dim * 2,
-            bias=False,
-            dtype=config.torch_dtype,
-            mapping=mapping,
-            tensor_parallel_mode=TensorParallelMode.COLUMN,
-            quant_config=model_config.get_quant_config(),
-            reduce_output=False,
-            skip_create_weights_in_init=model_config.skip_create_weights_in_init,
-            allreduce_strategy=model_config.allreduce_strategy,
-            force_dynamic_quantization=model_config.force_dynamic_quantization,
-            use_cute_dsl_blockscaling_mm=False,
-        )
-        self.in_proj_ba = Linear(
-            self.hidden_size,
-            self.num_v_heads * 2,
+            self.key_dim * 2 + self.value_dim * 2 + self.num_v_heads * 2,
             bias=False,
             dtype=config.torch_dtype,
             mapping=mapping,
@@ -434,69 +332,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             force_dynamic_quantization=model_config.force_dynamic_quantization,
             use_cute_dsl_blockscaling_mm=False,
         )
-
-        self.event_dict = {key: torch.cuda.Event() for key in [EventType.Main, EventType.Attention]}
-        self.aux_stream = aux_stream
-
-    def fix_query_key_value_ordering(self, mixed_qkvz, mixed_ba):
-        """
-        Derives `query`, `key` and `value` tensors from `mixed_qkvzba`.
-        """
-        batch_size = mixed_qkvz.size(0)
-        num_k_heads_local = self.num_k_heads // self.attn_tp_size
-        num_v_heads_local = self.num_v_heads // self.attn_tp_size
-        heads_ratio = self.num_v_heads // self.num_k_heads
-
-        # Reshape qkvz: [b, d] -> [b, ng, (2*hk + 2*np/ng*hv)]
-        qkvz_dim_per_head = self.head_k_dim * 2 + self.head_v_dim * heads_ratio * 2
-        mixed_qkvz = mixed_qkvz.view(batch_size, num_k_heads_local, qkvz_dim_per_head)
-
-        # Reshape ba: [b, d] -> [b, ng, 2*np/ng]
-        mixed_ba = mixed_ba.view(batch_size, num_k_heads_local, heads_ratio * 2)
-
-        # Direct slicing instead of torch.split for better performance
-        # Compute split boundaries once
-        q_end = self.head_k_dim
-        k_end = q_end + self.head_k_dim
-        v_end = k_end + heads_ratio * self.head_v_dim
-        z_end = v_end + heads_ratio * self.head_v_dim
-
-        # Slice qkvz components: [b, ng, dim] -> individual components
-        query = mixed_qkvz[..., :q_end]
-        key = mixed_qkvz[..., q_end:k_end]
-
-        # When heads_ratio == 1, ng == num_v_heads_local, so view works directly.
-        # When heads_ratio > 1 (dense models), the last-dim slice is
-        # [b, ng, ratio*hv] and we need [b, ng*ratio, hv].  A plain view
-        # fails because the slice is not contiguous in the packed qkvz
-        # tensor.  Adding .contiguous() before view is equivalent to
-        # reshape but makes the copy explicit and avoids a hidden perf
-        # drop.  An alternative zero-copy path would require changing
-        # the packing layout, which is a larger refactor.
-        if heads_ratio == 1:
-            value = mixed_qkvz[..., k_end:v_end]
-            z = mixed_qkvz[..., v_end:z_end]
-        else:
-            value = (
-                mixed_qkvz[..., k_end:v_end]
-                .contiguous()
-                .view(batch_size, num_v_heads_local, self.head_v_dim)
-            )
-            z = (
-                mixed_qkvz[..., v_end:z_end]
-                .contiguous()
-                .view(batch_size, num_v_heads_local, self.head_v_dim)
-            )
-
-        # Slice ba components: [b, ng, 2*np/ng] -> [b, np] each
-        if heads_ratio == 1:
-            b = mixed_ba[..., 0]
-            a = mixed_ba[..., 1]
-        else:
-            b = mixed_ba[..., :heads_ratio].contiguous().view(batch_size, num_v_heads_local)
-            a = mixed_ba[..., heads_ratio:].contiguous().view(batch_size, num_v_heads_local)
-
-        return query, key, value, z, b, a
 
     def forward_decode(
         self,
@@ -910,37 +745,14 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         )
         intermediate_ssm_states = layer_cache.intermediate_ssm if is_target_verify else None
 
-        def _compute_projected_states_qkvz():
-            return self.in_proj_qkvz(hidden_states)
-
-        def _compute_projected_states_ba():
-            return self.in_proj_ba(hidden_states)
-
-        projected_states_qkvz, projected_states_ba = maybe_execute_in_parallel(
-            _compute_projected_states_qkvz,
-            _compute_projected_states_ba,
-            self.event_dict[EventType.Main],
-            self.event_dict[EventType.Attention],
-            self.aux_stream,
-            disable_on_compile=True,
-        )
-
-        # Use fused kernel when possible to avoid elementwise ops
-        if self.num_v_heads // self.num_k_heads in [1, 2, 4]:  # and is_cuda_graph:
-            mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat(
-                projected_states_qkvz,
-                projected_states_ba,
-                triton.cdiv(self.num_k_heads, self.attn_tp_size),
-                triton.cdiv(self.num_v_heads, self.attn_tp_size),
-                self.head_k_dim,
-                self.head_v_dim,
-            )
-        else:
-            query, key, value, z, b, a = self.fix_query_key_value_ordering(
-                projected_states_qkvz, projected_states_ba
-            )
-            query, key, value = map(lambda x: x.reshape(x.shape[0], -1), (query, key, value))
-            mixed_qkv = torch.cat((query, key, value), dim=-1)
+        projected_states_qkvzba = self.in_proj_qkvzba(hidden_states)
+        qkv_end = self.conv_dim_per_tp
+        z_end = qkv_end + self.value_dim_per_tp
+        b_end = z_end + self.num_v_heads_per_tp
+        mixed_qkv = projected_states_qkvzba[:, :qkv_end]
+        z = projected_states_qkvzba[:, qkv_end:z_end]
+        b = projected_states_qkvzba[:, z_end:b_end]
+        a = projected_states_qkvzba[:, b_end:]
 
         kwargs = {
             "mixed_qkv": mixed_qkv,
@@ -980,13 +792,13 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 **kwargs,
             )
 
-        z_shape_og = z.shape
-        # reshape input data into 2D tensor
-        attn_out = attn_out.reshape(-1, attn_out.shape[-1])
-        z = z.reshape(-1, z.shape[-1])
+        # Keep one row per token and use head_v_dim-sized RMSNorm groups.
+        # Here z has a larger token stride because it is a view into
+        # [QKV|Z|B|A]; the grouped norm kernel consumes that stride directly
+        # without materializing a contiguous Z tensor.
+        attn_out = attn_out.reshape(-1, self.value_dim_per_tp)
+        z = z.reshape(z.shape[0], self.value_dim_per_tp)
         attn_out = self.norm(attn_out, z)
-        attn_out = attn_out.reshape(z_shape_og)
-        attn_out = attn_out.reshape(*attn_out.shape[:-2], -1)
 
         output = self.out_proj(attn_out, all_reduce_params=all_reduce_params)
         return output

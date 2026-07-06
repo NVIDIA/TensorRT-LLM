@@ -1,3 +1,6 @@
+import re
+from collections import defaultdict
+
 import torch
 from torch import nn
 
@@ -9,6 +12,101 @@ from tensorrt_llm._torch.utils import split
 
 @register_mapper("HF", "Qwen3NextForCausalLM")
 class Qwen3NextHfWeightMapper(Qwen2MoeHfWeightMapper):
+
+    _GDN_INPUT_PROJ_PATTERN = re.compile(
+        r"^(.*\.linear_attn)\.in_proj_(qkvz|ba)\.(.+)$")
+
+    def _combine_gdn_input_projections(self, weights: dict,
+                                       tp_size: int) -> dict:
+        """Pack grouped QKVZ/BA tensors in per-rank consumer order.
+
+        Column-parallel Linear slices consecutive output rows for each rank,
+        so the global tensor is rank-major and each local shard is ordered as
+        [Q, K, V, Z, B, A]. Attention-DP passes ``tp_size=1``.
+        """
+        config = self.config.pretrained_config
+        num_k_heads = config.linear_num_key_heads
+        num_v_heads = config.linear_num_value_heads
+        if num_k_heads % tp_size != 0 or num_v_heads % tp_size != 0:
+            raise ValueError(
+                f"GDN head counts must be divisible by TP size {tp_size}: "
+                f"K heads={num_k_heads}, V heads={num_v_heads}")
+        heads_ratio = num_v_heads // num_k_heads
+        head_k_dim = config.linear_key_head_dim
+        head_v_dim = config.linear_value_head_dim
+        qkvz_group_dim = head_k_dim * 2 + heads_ratio * head_v_dim * 2
+        ba_group_dim = heads_ratio * 2
+        expected_qkvz = num_k_heads * qkvz_group_dim
+        expected_ba = num_k_heads * ba_group_dim
+
+        grouped = defaultdict(dict)
+        combined_weights = {}
+        for name, tensor in weights.items():
+            match = self._GDN_INPUT_PROJ_PATTERN.match(name)
+            if match is None:
+                combined_weights[name] = tensor
+                continue
+            prefix, projection, suffix = match.groups()
+            grouped[(prefix, suffix)][projection] = tensor
+
+        for (prefix, suffix), tensors in grouped.items():
+            if tensors.keys() != {"qkvz", "ba"}:
+                raise ValueError(
+                    f"Expected both QKVZ and BA tensors for {prefix}.{suffix}, "
+                    f"got {sorted(tensors)}")
+
+            qkvz = tensors["qkvz"]
+            ba = tensors["ba"]
+            combined_name = f"{prefix}.in_proj_qkvzba.{suffix}"
+            if combined_name in combined_weights:
+                raise ValueError(
+                    f"Combined projection {combined_name} already exists")
+
+            # Scalar/per-tensor metadata is shared by the two projections. It
+            # cannot be row-reordered, so retain one copy after validating it.
+            if (qkvz.ndim == 0 or ba.ndim == 0 or qkvz.shape[0] != expected_qkvz
+                    or ba.shape[0] != expected_ba):
+                if qkvz.shape != ba.shape or not torch.equal(qkvz, ba):
+                    raise ValueError(
+                        f"Cannot combine non-row GDN projection metadata "
+                        f"{prefix}.{suffix}: QKVZ shape={tuple(qkvz.shape)}, "
+                        f"BA shape={tuple(ba.shape)}")
+                combined_weights[combined_name] = qkvz
+                continue
+
+            if qkvz.shape[1:] != ba.shape[1:]:
+                raise ValueError(
+                    f"GDN projection trailing shapes do not match for "
+                    f"{prefix}.{suffix}: {tuple(qkvz.shape)} vs {tuple(ba.shape)}"
+                )
+
+            trailing_shape = qkvz.shape[1:]
+            qkvz = qkvz.reshape(num_k_heads, qkvz_group_dim, *trailing_shape)
+            ba = ba.reshape(num_k_heads, ba_group_dim, *trailing_shape)
+
+            q_end = head_k_dim
+            k_end = q_end + head_k_dim
+            v_end = k_end + heads_ratio * head_v_dim
+            z_end = v_end + heads_ratio * head_v_dim
+            q = qkvz[:, :q_end].reshape(-1, *trailing_shape)
+            k = qkvz[:, q_end:k_end].reshape(-1, *trailing_shape)
+            v = qkvz[:, k_end:v_end].reshape(-1, *trailing_shape)
+            z = qkvz[:, v_end:z_end].reshape(-1, *trailing_shape)
+            b = ba[:, :heads_ratio].reshape(-1, *trailing_shape)
+            a = ba[:, heads_ratio:].reshape(-1, *trailing_shape)
+            rank_shards = []
+            for rank in range(tp_size):
+                rank_shards.append(
+                    torch.cat(
+                        tuple(
+                            split(tensor, tp_size, rank)
+                            for tensor in (q, k, v, z, b, a)),
+                        dim=0,
+                    ))
+            combined_weights[combined_name] = torch.cat(rank_shards,
+                                                        dim=0).contiguous()
+
+        return combined_weights
 
     def should_skip_module(self, module_name: str) -> bool:
         if module_name.startswith("draft_model"):
@@ -110,5 +208,7 @@ class Qwen3NextHfWeightMapper(Qwen2MoeHfWeightMapper):
                 new_weights[key] = w
             else:
                 new_weights[key] = weights[name]
+
+        new_weights = self._combine_gdn_input_projections(new_weights, tp_size)
 
         return new_weights
