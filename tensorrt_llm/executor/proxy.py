@@ -644,9 +644,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         try:
             return self.rpc_client.get_data_transceiver_state().remote()
         except RPCError as e:
-            logger.warning(
-                f"Error fetching data transceiver state via RPC: {e}")
-            return b""
+            logger.error(f"Error fetching data transceiver state via RPC: {e}")
+            raise
 
     def aget_stats(self, timeout: float) -> IterationResult:
         """Get iteration statistics from the runtime via RPC (async).
