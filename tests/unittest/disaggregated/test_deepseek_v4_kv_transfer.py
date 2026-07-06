@@ -8,7 +8,7 @@ different TP/PP/DP configurations.
 import os
 import threading
 import uuid
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import pytest
 import torch
@@ -600,8 +600,12 @@ def run_deepseek_v4_transfer_test(
     gen_enable_dp: bool,
     compress_ratios: List[int],
     update_before_transfer: bool = True,
+    *,
+    manager_factory: Callable = _create_managers_for_instance,
+    init_fn: Callable = _init_pool_data,
+    verify_fn: Callable = verify_all_requests,
 ):
-    """Run a full DeepSeek-V4 KV transfer test."""
+    """Run a KV transfer test with injectable model-specific cache hooks."""
     ctx_world = ctx_tp * ctx_pp
     gen_world = gen_tp * gen_pp
 
@@ -610,14 +614,14 @@ def run_deepseek_v4_transfer_test(
     request_lengths = [65, 256, 129, 383]
 
     # ===== 1. Create DeepseekV4CacheManagers =====
-    ctx_managers = _create_managers_for_instance(ctx_tp, ctx_pp, ctx_enable_dp, compress_ratios)
-    gen_managers = _create_managers_for_instance(gen_tp, gen_pp, gen_enable_dp, compress_ratios)
+    ctx_managers = manager_factory(ctx_tp, ctx_pp, ctx_enable_dp, compress_ratios)
+    gen_managers = manager_factory(gen_tp, gen_pp, gen_enable_dp, compress_ratios)
 
     # ===== 2. Initialize data =====
     # ctx: random data, seed=pp_rank (same across TP, different across PP)
-    _init_pool_data(ctx_managers, ctx_tp, seed_base=1000, fill_random=True)
+    init_fn(ctx_managers, ctx_tp, seed_base=1000, fill_random=True)
     # gen: zeros
-    _init_pool_data(gen_managers, gen_tp, fill_random=False)
+    init_fn(gen_managers, gen_tp, fill_random=False)
 
     # ===== 3. Create KvCacheTransceiverV2 instances (threaded init) =====
     config = CacheTransceiverConfig(
@@ -770,7 +774,7 @@ def run_deepseek_v4_transfer_test(
                 gen_managers[rank].update_resources(batch)
 
         # ===== 8. Verify =====
-        verify_all_requests(
+        verify_fn(
             request_lengths=request_lengths,
             compress_ratios=compress_ratios,
             ctx_managers=ctx_managers,

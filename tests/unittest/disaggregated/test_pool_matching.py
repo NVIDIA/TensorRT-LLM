@@ -251,6 +251,37 @@ def test_kv_and_indexer_in_same_lg():
     assert mapping == {(0, 0): (0, 0), (0, 1): (0, 1)}
 
 
+def test_minimax_logical_views_match_across_physical_coalescing():
+    """DEP split pools and TEP coalesced pools match by logical role/layer."""
+    dep_kv = _pool_view(0, [(0, "key"), (0, "value")])
+    dep_kv.bytes_per_region = 512
+    dep_index = _pool_view(
+        1,
+        [(0, "index_key")],
+        mapper_kind=MapperKind.REPLICATED,
+    )
+    dep_index.bytes_per_region = 128
+
+    tep_kv = _pool_view(0, [(0, "key"), (0, "value")])
+    tep_kv.bytes_per_region = 128
+    tep_index = _pool_view(
+        0,
+        [(0, "index_key")],
+        mapper_kind=MapperKind.REPLICATED,
+    )
+    tep_index.byte_offset = 128
+    tep_index.bytes_per_region = 128
+
+    dep_lg = _attn_lg(0, [(0, 10)], [dep_kv, dep_index])
+    tep_lg = _attn_lg(0, [(0, 10)], [tep_kv, tep_index])
+    dep_pt = _page_table([dep_lg], pool_specs={0: [(512, 64, 0x1000), (128, 64, 0x2000)]})
+    tep_pt = _page_table([tep_lg], pool_specs={0: [(256, 64, 0x3000)]})
+
+    reg = _registrar(dep_pt, kv_heads=8)
+    peer_ri = _rank_info(name="peer", rank=1, page_table=tep_pt, kv_heads=1)
+    assert reg.get_pool_mapping(peer_ri) == {(0, 0): (0, 0), (0, 1): (0, 1)}
+
+
 def test_pp_partial_layer_overlap():
     """Self covers global layers {10,11}, peer covers {11,12}. Match via overlap on layer 11."""
     self_lg = _attn_lg(0, [(0, 10), (1, 11)], [_kv_pool_view(0, [0, 1])])

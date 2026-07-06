@@ -24,17 +24,44 @@ class IdentityMapper(RegionMapperBase):
     dst_ptrs: [ D0 ] [ D1 ] [ D2 ] ...
     """
 
+    def __init__(
+        self,
+        self_region_bytes: int | None = None,
+        peer_region_bytes: int | None = None,
+        *,
+        mapper_name: str = "Identity",
+    ) -> None:
+        if self_region_bytes is not None and peer_region_bytes is not None:
+            if self_region_bytes != peer_region_bytes:
+                raise ValueError(
+                    f"{mapper_name} cache region size mismatch: "
+                    f"local={self_region_bytes}, peer={peer_region_bytes}"
+                )
+
     @nvtx_range("IdentityMapper.map")
     def map(self, src_regions: SpecRegion, dst_regions: SpecRegion) -> SpecRegionPair:
         src_group = src_regions.memory
         dst_group = dst_regions.memory
-        assert src_group.ptrs.size == dst_group.ptrs.size, (
-            f"Number of regions of src({src_group.ptrs.size}) and dst({dst_group.ptrs.size}) must match"
-        )
+        if src_group.ptrs.size != dst_group.ptrs.size:
+            raise ValueError(
+                f"Number of regions of src({src_group.ptrs.size}) and "
+                f"dst({dst_group.ptrs.size}) must match"
+            )
         return SpecRegionPair(
             src=SpecRegion(memory=src_group, spec=src_regions.spec),
             dst=SpecRegion(memory=dst_group, spec=dst_regions.spec),
         )
+
+
+class ReplicatedMapper(IdentityMapper):
+    """Copy a replicated cache region without KV-head remapping.
+
+    Every TP rank holds identical bytes (for example, MiniMax M3 index-key),
+    so mapping is an identity copy plus a strict source/destination size check.
+    """
+
+    def __init__(self, self_region_bytes: int, peer_region_bytes: int) -> None:
+        super().__init__(self_region_bytes, peer_region_bytes, mapper_name="Replicated")
 
 
 class HeadMatchMapper(RegionMapperBase):
@@ -94,9 +121,11 @@ class HeadMatchMapper(RegionMapperBase):
     def map(self, src_regions: SpecRegion, dst_regions: SpecRegion) -> SpecRegionPair:
         src_group = src_regions.memory
         dst_group = dst_regions.memory
-        assert src_group.ptrs.size == dst_group.ptrs.size, (
-            f"Number of regions of src({src_group.ptrs.size}) and dst({dst_group.ptrs.size}) must match"
-        )
+        if src_group.ptrs.size != dst_group.ptrs.size:
+            raise ValueError(
+                f"Number of regions of src({src_group.ptrs.size}) and "
+                f"dst({dst_group.ptrs.size}) must match"
+            )
         new_src_ptrs = src_group.ptrs + self._src_block_off
         new_dst_ptrs = dst_group.ptrs + self._dst_block_off
         new_src = MemRegionGroup(ptrs=new_src_ptrs, bytes_per_region=self._frag_size)
@@ -220,9 +249,11 @@ class HeadMismatchMapper(RegionMapperBase):
     def map(self, src_regions: SpecRegion, dst_regions: SpecRegion) -> SpecRegionPair:
         src_group = src_regions.memory
         dst_group = dst_regions.memory
-        assert src_group.ptrs.size == dst_group.ptrs.size, (
-            f"Number of regions of src({src_group.ptrs.size}) and dst({dst_group.ptrs.size}) must match"
-        )
+        if src_group.ptrs.size != dst_group.ptrs.size:
+            raise ValueError(
+                f"Number of regions of src({src_group.ptrs.size}) and "
+                f"dst({dst_group.ptrs.size}) must match"
+            )
         # np.add.outer(ptrs, offsets) produces every (base + offset) combination:
         #   shape (n_blocks, transfer_layers * kv_factor)
         # .ravel() flattens in C-order: for each block, emit all layer×kv fragments.
@@ -270,6 +301,145 @@ class HeadMismatchMapper(RegionMapperBase):
         )
 
 
+class NHDHeadMismatchMapper(HeadMismatchMapper):
+    """Map heterogeneous KV heads stored token-major as ``[N, H, D]``.
+
+    ``HeadMismatchMapper`` selects one contiguous head range per K/V buffer,
+    which is correct for HND storage. In NHD storage, the selected head range
+    is contiguous only within one token, so this mapper emits one fragment per
+    ``(layer, K/V, token)``. Only offset precomputation differs from the
+    parent; the inherited :meth:`map` consumes ``_src_flat_offsets``,
+    ``_dst_flat_offsets``, and ``_bytes_cont_heads``.
+    """
+
+    def __init__(
+        self,
+        transfer_layers: int,
+        src_layer_off: int,
+        peer_layer_off: int,
+        self_ri: RankInfo,
+        peer_ri: RankInfo,
+        self_region_bytes: int,
+        peer_region_bytes: int,
+        self_pool_num_layers: int,
+        peer_pool_num_layers: int,
+        self_buffers_per_layer: int,
+        peer_buffers_per_layer: int,
+    ) -> None:
+        # Deliberately do not call HeadMismatchMapper.__init__: its offsets
+        # assume HND-contiguous heads. Initialize the three attributes consumed
+        # by the inherited map() with NHD token-granular geometry instead.
+        self_tpb = self_ri.attention.tokens_per_block
+        peer_tpb = peer_ri.attention.tokens_per_block
+        if self_tpb != peer_tpb:
+            raise ValueError(
+                "NHDHeadMismatchMapper requires equal tokens_per_block; "
+                f"local={self_tpb}, peer={peer_tpb}"
+            )
+
+        self_heads = self_ri.attention.kv_heads_per_rank
+        peer_heads = peer_ri.attention.kv_heads_per_rank
+        if self_buffers_per_layer != peer_buffers_per_layer:
+            raise ValueError(
+                "NHD buffer count per layer mismatch: "
+                f"local={self_buffers_per_layer}, peer={peer_buffers_per_layer}"
+            )
+
+        self_bytes_per_token_head = self._bytes_per_token_head(
+            region_bytes=self_region_bytes,
+            num_layers=self_pool_num_layers,
+            buffers_per_layer=self_buffers_per_layer,
+            tokens_per_block=self_tpb,
+            heads=self_heads,
+        )
+        peer_bytes_per_token_head = self._bytes_per_token_head(
+            region_bytes=peer_region_bytes,
+            num_layers=peer_pool_num_layers,
+            buffers_per_layer=peer_buffers_per_layer,
+            tokens_per_block=peer_tpb,
+            heads=peer_heads,
+        )
+        if self_bytes_per_token_head != peer_bytes_per_token_head:
+            raise ValueError(
+                "NHD bytes per token/head mismatch: "
+                f"local={self_bytes_per_token_head}, peer={peer_bytes_per_token_head}"
+            )
+        self._bytes_cont_heads = min(self_heads, peer_heads) * self_bytes_per_token_head
+
+        src_head_off, dst_head_off = HeadMismatchMapper._compute_head_offsets(
+            self_ri.tp_size_per_dp_group,
+            peer_ri.tp_size_per_dp_group,
+            self_ri.tp_rank,
+            peer_ri.tp_rank,
+            self_kv_heads=self_heads,
+            peer_kv_heads=peer_heads,
+            bytes_per_head=self_bytes_per_token_head,
+        )
+
+        self._src_flat_offsets = self._build_flat_offsets(
+            transfer_layers=transfer_layers,
+            layer_offset=src_layer_off,
+            buffers_per_layer=self_buffers_per_layer,
+            tokens_per_block=self_tpb,
+            heads=self_heads,
+            bytes_per_token_head=self_bytes_per_token_head,
+            head_offset=src_head_off,
+        )
+        self._dst_flat_offsets = self._build_flat_offsets(
+            transfer_layers=transfer_layers,
+            layer_offset=peer_layer_off,
+            buffers_per_layer=peer_buffers_per_layer,
+            tokens_per_block=peer_tpb,
+            heads=peer_heads,
+            bytes_per_token_head=peer_bytes_per_token_head,
+            head_offset=dst_head_off,
+        )
+
+    @staticmethod
+    def _bytes_per_token_head(
+        *,
+        region_bytes: int,
+        num_layers: int,
+        buffers_per_layer: int,
+        tokens_per_block: int,
+        heads: int,
+    ) -> int:
+        denominator = num_layers * buffers_per_layer * tokens_per_block * heads
+        if denominator <= 0 or region_bytes % denominator != 0:
+            raise ValueError(
+                "NHD region geometry is not evenly divisible: "
+                f"region_bytes={region_bytes}, layers={num_layers}, "
+                f"buffers_per_layer={buffers_per_layer}, "
+                f"tokens_per_block={tokens_per_block}, kv_heads={heads}, "
+                f"denominator={denominator}"
+            )
+        return region_bytes // denominator
+
+    @staticmethod
+    def _build_flat_offsets(
+        *,
+        transfer_layers: int,
+        layer_offset: int,
+        buffers_per_layer: int,
+        tokens_per_block: int,
+        heads: int,
+        bytes_per_token_head: int,
+        head_offset: int,
+    ) -> np.ndarray:
+        layer_indices = np.arange(transfer_layers, dtype=np.int64)
+        buffer_indices = np.arange(buffers_per_layer, dtype=np.int64)
+        token_indices = np.arange(tokens_per_block, dtype=np.int64)
+        token_bytes = heads * bytes_per_token_head
+        buffer_bytes = tokens_per_block * token_bytes
+        layer_bytes = buffers_per_layer * buffer_bytes
+        return (
+            layer_bytes * (layer_offset + layer_indices)[:, None, None]
+            + buffer_bytes * buffer_indices[None, :, None]
+            + token_bytes * token_indices[None, None, :]
+            + head_offset
+        ).ravel()
+
+
 class IndexerKCacheHeadMatchMapper(RegionMapperBase):
     """
     Mapper for indexer K cache when head counts match.
@@ -300,9 +470,11 @@ class IndexerKCacheHeadMatchMapper(RegionMapperBase):
     def map(self, src_regions: SpecRegion, dst_regions: SpecRegion) -> SpecRegionPair:
         src_group = src_regions.memory
         dst_group = dst_regions.memory
-        assert src_group.ptrs.size == dst_group.ptrs.size, (
-            f"Number of regions of src({src_group.ptrs.size}) and dst({dst_group.ptrs.size}) must match"
-        )
+        if src_group.ptrs.size != dst_group.ptrs.size:
+            raise ValueError(
+                f"Number of regions of src({src_group.ptrs.size}) and "
+                f"dst({dst_group.ptrs.size}) must match"
+            )
         new_src_ptrs = src_group.ptrs + self._src_block_off
         new_dst_ptrs = dst_group.ptrs + self._dst_block_off
         new_src = MemRegionGroup(ptrs=new_src_ptrs, bytes_per_region=self._frag_size)
@@ -335,9 +507,40 @@ class AttentionPolicy:
             local != peer, f"{field} mismatch", field=field, local=local, peer=peer
         )
 
-    def _tpb_check(self, local: int, peer: int) -> bool:
+    @staticmethod
+    def _uses_exact_tpb_mapper(ri: RankInfo) -> bool:
+        if ri.page_table is None:
+            return False
+        return any(
+            pool_view.mapper_kind in (MapperKind.NHD, MapperKind.REPLICATED)
+            for layer_group in ri.page_table.layer_groups
+            for pool_view in getattr(layer_group, "pool_views", ())
+        )
+
+    @staticmethod
+    def _uses_legacy_subbyte_mapper(ri: RankInfo) -> bool:
+        element_bytes = ri.attention.element_bytes
+        if float(element_bytes).is_integer():
+            return False
+        if ri.page_table is None:
+            return True
+        return any(
+            pool_view.mapper_kind not in (MapperKind.NHD, MapperKind.REPLICATED)
+            for layer_group in ri.page_table.layer_groups
+            for pool_view in getattr(layer_group, "pool_views", ())
+        )
+
+    def _tpb_check(self, local: int, peer: int, peer_ri: RankInfo) -> bool:
         if local == peer:
             return False
+        if self._uses_exact_tpb_mapper(self._ri) or self._uses_exact_tpb_mapper(peer_ri):
+            logger.warning(
+                "AttentionPolicy: incompatible: tokens_per_block mismatch for "
+                "NHD/replicated logical pools; local=%d peer=%d",
+                local,
+                peer,
+            )
+            return True
         larger, smaller = max(local, peer), min(local, peer)
         if larger % smaller != 0:
             logger.warning(
@@ -367,7 +570,17 @@ class AttentionPolicy:
                 peer=peer_ri.cp_size,
             )
             or self._mismatch("element_bytes", a.element_bytes, b.element_bytes)
-            or self._tpb_check(a.tokens_per_block, b.tokens_per_block)
+            or self._fail_if(
+                not self.head_match(peer_ri)[0]
+                and (
+                    self._uses_legacy_subbyte_mapper(self._ri)
+                    or self._uses_legacy_subbyte_mapper(peer_ri)
+                ),
+                "sub-byte cache dtype requires geometry-aware NHD/replicated pools",
+                local_element_bytes=a.element_bytes,
+                peer_element_bytes=b.element_bytes,
+            )
+            or self._tpb_check(a.tokens_per_block, b.tokens_per_block, peer_ri)
             or self._mismatch("dims_per_head", a.dims_per_head, b.dims_per_head)
             or self._fail_if(
                 a.is_mla and (a.kv_heads_per_rank != 1 or b.kv_heads_per_rank != 1),
@@ -410,13 +623,18 @@ class AttentionPolicy:
         peer_layer_offset: int,
         self_pool_num_layers: int,
         peer_pool_num_layers: int,
+        self_buffers_per_layer: int,
+        peer_buffers_per_layer: int,
         self_pool_slot_bytes: int,
         peer_pool_slot_bytes: int,
     ) -> RegionMapperBase:
+        if mapper_kind == MapperKind.REPLICATED:
+            return ReplicatedMapper(self_pool_slot_bytes, peer_pool_slot_bytes)
+
         head_match, _ = self.head_match(peer_ri)
 
         if head_match and transfer_layers == self_pool_num_layers == peer_pool_num_layers:
-            return IdentityMapper()
+            return IdentityMapper(self_pool_slot_bytes, peer_pool_slot_bytes)
 
         if head_match:
             if mapper_kind == MapperKind.FLAT:
@@ -432,10 +650,11 @@ class AttentionPolicy:
 
             slot_size_per_layer = self_pool_slot_bytes // self_pool_num_layers
             peer_size_per_layer = peer_pool_slot_bytes // peer_pool_num_layers
-            assert slot_size_per_layer == peer_size_per_layer, (
-                f"slot_size_per_layer mismatch between self ({slot_size_per_layer}) "
-                f"and peer ({peer_size_per_layer}) for HeadMatchMapper"
-            )
+            if slot_size_per_layer != peer_size_per_layer:
+                raise ValueError(
+                    f"slot_size_per_layer mismatch between self ({slot_size_per_layer}) "
+                    f"and peer ({peer_size_per_layer}) for HeadMatchMapper"
+                )
             return HeadMatchMapper(
                 transfer_layers=transfer_layers,
                 src_layer_off=self_layer_offset,
@@ -447,6 +666,21 @@ class AttentionPolicy:
 
         if mapper_kind == MapperKind.FLAT:
             raise ValueError("IndexerKCacheHeadMatchMapper is not supported for head mismatch case")
+
+        if mapper_kind == MapperKind.NHD:
+            return NHDHeadMismatchMapper(
+                transfer_layers=transfer_layers,
+                src_layer_off=self_layer_offset,
+                peer_layer_off=peer_layer_offset,
+                self_ri=self._ri,
+                peer_ri=peer_ri,
+                self_region_bytes=self_pool_slot_bytes,
+                peer_region_bytes=peer_pool_slot_bytes,
+                self_pool_num_layers=self_pool_num_layers,
+                peer_pool_num_layers=peer_pool_num_layers,
+                self_buffers_per_layer=self_buffers_per_layer,
+                peer_buffers_per_layer=peer_buffers_per_layer,
+            )
 
         return HeadMismatchMapper(
             transfer_layers=transfer_layers,

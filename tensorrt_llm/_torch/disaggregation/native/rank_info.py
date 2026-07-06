@@ -60,6 +60,14 @@ class RankInfo:
         kvm = kv_cache_manager
         enable_attention_dp = m.enable_attention_dp
         kv_heads_per_rank = next((h for h in kvm.num_kv_heads_per_layer if h > 0), 0)
+        # Eight is the smallest element count guaranteed to occupy whole bytes
+        # for every supported sub-byte cache dtype (including NVFP4).
+        bytes_for_eight_elements = get_size_in_bytes(8, kvm.dtype)
+        element_bytes = (
+            bytes_for_eight_elements // 8
+            if bytes_for_eight_elements % 8 == 0
+            else bytes_for_eight_elements / 8
+        )
         return cls(
             instance_name=instance_name,
             instance_rank=m.rank,
@@ -81,7 +89,7 @@ class RankInfo:
                 kv_heads_per_rank=kv_heads_per_rank,
                 tokens_per_block=kvm.tokens_per_block,
                 dims_per_head=kvm.head_dim,
-                element_bytes=get_size_in_bytes(1, kvm.dtype),
+                element_bytes=element_bytes,
                 enable_attention_dp=enable_attention_dp,
                 is_mla=kvm.kv_factor == 1,
             ),

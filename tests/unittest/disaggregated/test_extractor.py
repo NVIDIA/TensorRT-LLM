@@ -5,6 +5,7 @@ from tensorrt_llm._torch.disaggregation.base.region import MemRegionGroup, SpecR
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
     KVRegionExtractorV1,
     build_page_table,
+    build_page_table_from_manager,
 )
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.disaggregation.resource.utils import (
@@ -14,6 +15,11 @@ from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_num_layers,
     get_physical_pool,
     get_unique_layers,
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
+    DisaggCacheLayout,
+    DisaggPoolViewConfig,
+    Role,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     CacheTypeCpp,
@@ -230,6 +236,184 @@ def test_layer_group_meta_serialization():
     assert restored_lg.kv_head_num_per_rank == 4
     assert len(restored_lg.local_layers) == 2
     assert len(restored_lg.pool_views[0].buffer_entries) == 2
+
+
+def test_extract_logical_pool_view_uses_physical_stride():
+    from tensorrt_llm._torch.disaggregation.resource.page import (
+        BUFFER_ENTRY_DTYPE,
+        AttentionLayerGroup,
+        KVCachePageTable,
+        LocalLayer,
+        PhysicalPool,
+        PhysicalPoolGroup,
+        PoolView,
+    )
+
+    page_table = KVCachePageTable(
+        tokens_per_block=16,
+        layer_groups=[
+            AttentionLayerGroup(
+                pool_group_idx=0,
+                kv_head_num_per_rank=1,
+                local_layers=[LocalLayer(0, 0)],
+                pool_views=[
+                    PoolView(
+                        pool_idx=0,
+                        buffer_entries=np.array([(0, 256, 128)], dtype=BUFFER_ENTRY_DTYPE),
+                        pool_role=frozenset({"index_key"}),
+                        mapper_kind=MapperKind.REPLICATED,
+                        byte_offset=256,
+                        bytes_per_region=128,
+                    )
+                ],
+            )
+        ],
+        pool_groups=[
+            PhysicalPoolGroup(pools=[PhysicalPool(base_address=1000, slot_bytes=384, num_slots=4)])
+        ],
+    )
+
+    region = KVRegionExtractorV1(page_table).extract(np.array([0, -1, 2], dtype=np.int64))
+    np.testing.assert_array_equal(region.memory.ptrs, np.array([1256, 2024]))
+    assert region.memory.bytes_per_region == 128
+
+
+def test_v2_index_key_builder_emits_per_layer_logical_views():
+    from types import SimpleNamespace
+
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier
+
+    base = 0x1000
+    slot_bytes = 640
+    attrs = {
+        (0, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=0, size=128),
+        (0, Role.VALUE): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=128, size=128),
+        (0, Role.INDEX_KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=256, size=128),
+        (1, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=384, size=128),
+        (1, Role.VALUE): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=512, size=128),
+    }
+
+    class FakePool:
+        slot_size = slot_bytes
+        num_slots = 4
+
+        @staticmethod
+        def slot_address(slot):
+            return base + slot * slot_bytes
+
+    class FakeImpl:
+        layer_grouping = ((0, 1),)
+        _life_cycles = [SimpleNamespace(window_size=None)]
+        _init_config = SimpleNamespace(
+            cache_tiers=[SimpleNamespace(tier=CacheTier.GPU_MEM)], tokens_per_block=16
+        )
+        _storage = SimpleNamespace(
+            _buffer_attr=attrs,
+            num_life_cycles=1,
+            get_pool_group_index=lambda _lc: 0,
+            _levels=[
+                SimpleNamespace(
+                    storage=SimpleNamespace(
+                        _pool_groups=[SimpleNamespace(num_pools=1, _pools=[FakePool()])]
+                    )
+                )
+            ],
+        )
+
+        def get_aggregated_pages(self, buffers):
+            local_attrs = self._storage._buffer_attr
+            ordered = sorted(buffers, key=lambda b: local_attrs[b].offset)
+            first = local_attrs[ordered[0]]
+            size = sum(local_attrs[b].size for b in ordered)
+            return [
+                SimpleNamespace(
+                    base=base + first.offset,
+                    size=size,
+                    stride=slot_bytes,
+                    buffers=[SimpleNamespace(id=b) for b in ordered],
+                )
+            ]
+
+    manager = SimpleNamespace(
+        impl=FakeImpl(),
+        pp_layers=[0, 1],
+        num_kv_heads_per_layer=[1, 1],
+        get_disagg_pool_view_config=lambda: DisaggPoolViewConfig(
+            sharded_layout=DisaggCacheLayout.NHD,
+            replicated_roles=frozenset({Role.INDEX_KEY}),
+        ),
+    )
+
+    page_table = build_page_table_from_manager(manager)
+    views = page_table.layer_groups[0].pool_views
+    assert [view.pool_role for view in views] == [
+        frozenset({"key", "value"}),
+        frozenset({"index_key"}),
+        frozenset({"key", "value"}),
+    ]
+    assert [view.mapper_kind for view in views] == [
+        MapperKind.NHD,
+        MapperKind.REPLICATED,
+        MapperKind.NHD,
+    ]
+    assert [view.byte_offset for view in views] == [0, 256, 384]
+    assert [view.bytes_per_region for view in views] == [256, 128, 256]
+
+    # A dense-only PP rank has no local INDEX_KEY entry, but model-level sparse
+    # metadata must still force per-layer views so it can interoperate with a
+    # peer PP rank that also owns sparse layers.
+    dense_impl = FakeImpl()
+    dense_impl._storage = SimpleNamespace(
+        _buffer_attr={key: attr for key, attr in attrs.items() if key[1] != Role.INDEX_KEY},
+        num_life_cycles=1,
+        get_pool_group_index=lambda _lc: 0,
+        _levels=FakeImpl._storage._levels,
+    )
+    dense_manager = SimpleNamespace(
+        impl=dense_impl,
+        pp_layers=[0, 1],
+        num_kv_heads_per_layer=[1, 1],
+        get_disagg_pool_view_config=manager.get_disagg_pool_view_config,
+    )
+    dense_views = build_page_table_from_manager(dense_manager).layer_groups[0].pool_views
+    assert len(dense_views) == 2
+    assert [get_unique_layers(view) for view in dense_views] == [{0}, {1}]
+
+    # A private attribute with a coincidental name must not opt a manager into
+    # model-specific logical views.
+    accidental_manager = SimpleNamespace(
+        impl=FakeImpl(),
+        pp_layers=[0, 1],
+        num_kv_heads_per_layer=[1, 1],
+        sparse_layer_ids=[3],
+        get_disagg_pool_view_config=lambda: None,
+    )
+    accidental_views = build_page_table_from_manager(accidental_manager).layer_groups[0].pool_views
+    assert len(accidental_views) == 1
+    assert accidental_views[0].mapper_kind == MapperKind.INDEXED
+
+    # V2 managers must expose the capability method explicitly. A missing
+    # method is a programming error rather than an invitation to guess from
+    # private attributes.
+    missing_capability_manager = SimpleNamespace(
+        impl=FakeImpl(),
+        pp_layers=[0, 1],
+        num_kv_heads_per_layer=[1, 1],
+    )
+    with pytest.raises(AttributeError, match="get_disagg_pool_view_config"):
+        build_page_table_from_manager(missing_capability_manager)
+
+    invalid_layout_manager = SimpleNamespace(
+        impl=FakeImpl(),
+        pp_layers=[0, 1],
+        num_kv_heads_per_layer=[1, 1],
+        get_disagg_pool_view_config=lambda: DisaggPoolViewConfig(
+            sharded_layout="HND",
+            replicated_roles=frozenset({Role.INDEX_KEY}),
+        ),
+    )
+    with pytest.raises(ValueError, match="Unsupported disaggregation sharded layout 'HND'"):
+        build_page_table_from_manager(invalid_layout_manager)
 
 
 def test_mamba_layer_group_serialization():

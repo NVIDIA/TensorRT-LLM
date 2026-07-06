@@ -1,10 +1,14 @@
 import numpy as np
 import pytest
 
+import tensorrt_llm._torch.disaggregation.native.peer as peer_module
+from tensorrt_llm._torch.disaggregation.base.region import MemRegionGroup, SpecRegion
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import (
     HeadMatchMapper,
     HeadMismatchMapper,
     IdentityMapper,
+    NHDHeadMismatchMapper,
+    ReplicatedMapper,
 )
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
 from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
@@ -16,6 +20,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     KVCachePageTable,
     LocalLayer,
     MambaLayerGroup,
+    MapperKind,
     PhysicalPool,
     PhysicalPoolGroup,
     PoolView,
@@ -456,6 +461,148 @@ def test_peer_registrar_get_kv_map_rejects_non_contiguous_overlap():
         reg.get_kv_map(peer_ri, (0, 0), (0, 0))
 
 
+def test_nhd_head_mismatch_mapper_slices_each_token():
+    self_ri = make_rankinfo(
+        instance_name="local",
+        tp_size=2,
+        tp_rank=0,
+        dp_size=2,
+        dp_rank=0,
+        kv_heads_per_rank=2,
+        tokens_per_block=2,
+        dims_per_head=2,
+        element_bytes=2,
+        enable_attention_dp=True,
+    )
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        tp_size=2,
+        tp_rank=0,
+        kv_heads_per_rank=1,
+        tokens_per_block=2,
+        dims_per_head=2,
+        element_bytes=2,
+    )
+    mapper = NHDHeadMismatchMapper(
+        transfer_layers=1,
+        src_layer_off=0,
+        peer_layer_off=0,
+        self_ri=self_ri,
+        peer_ri=peer_ri,
+        self_region_bytes=32,
+        peer_region_bytes=16,
+        self_pool_num_layers=1,
+        peer_pool_num_layers=1,
+        self_buffers_per_layer=2,
+        peer_buffers_per_layer=2,
+    )
+
+    pair = mapper.map(
+        SpecRegion(memory=MemRegionGroup(ptrs=np.array([1000]), bytes_per_region=32)),
+        SpecRegion(memory=MemRegionGroup(ptrs=np.array([2000]), bytes_per_region=16)),
+    )
+
+    # Source NHD has two heads per token: select head 0 at offsets 0 and 8
+    # for K, then 16 and 24 for V. Destination has one head per token.
+    assert pair.src.memory.ptrs.tolist() == [1000, 1008, 1016, 1024]
+    assert pair.dst.memory.ptrs.tolist() == [2000, 2004, 2008, 2012]
+    assert pair.src.memory.bytes_per_region == 4
+    assert pair.dst.memory.bytes_per_region == 4
+
+
+def test_nhd_head_mismatch_mapper_uses_scale_pool_geometry():
+    self_ri = make_rankinfo(
+        tp_size=2,
+        kv_heads_per_rank=2,
+        tokens_per_block=2,
+        dims_per_head=128,
+        element_bytes=0.5,
+    )
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        tp_size=1,
+        kv_heads_per_rank=1,
+        tokens_per_block=2,
+        dims_per_head=128,
+        element_bytes=0.5,
+    )
+    mapper = NHDHeadMismatchMapper(
+        transfer_layers=1,
+        src_layer_off=0,
+        peer_layer_off=0,
+        self_ri=self_ri,
+        peer_ri=peer_ri,
+        self_region_bytes=8,
+        peer_region_bytes=4,
+        self_pool_num_layers=1,
+        peer_pool_num_layers=1,
+        self_buffers_per_layer=2,
+        peer_buffers_per_layer=2,
+    )
+
+    pair = mapper.map(
+        SpecRegion(memory=MemRegionGroup(ptrs=np.array([1000]), bytes_per_region=8)),
+        SpecRegion(memory=MemRegionGroup(ptrs=np.array([2000]), bytes_per_region=4)),
+    )
+
+    assert pair.src.memory.ptrs.tolist() == [1000, 1002, 1004, 1006]
+    assert pair.dst.memory.ptrs.tolist() == [2000, 2001, 2002, 2003]
+    assert pair.src.memory.bytes_per_region == 1
+    assert pair.dst.memory.bytes_per_region == 1
+
+
+def test_replicated_mapper_ignores_kv_head_mismatch():
+    self_pt = make_page_table(global_layer_ids=[0])
+    peer_pt = make_page_table(global_layer_ids=[0])
+    for page_table in (self_pt, peer_pt):
+        view = page_table.layer_groups[0].pool_views[0]
+        view.pool_role = frozenset({"index_key"})
+        view.mapper_kind = MapperKind.REPLICATED
+        view.bytes_per_region = 256
+
+    self_rankinfo = make_rankinfo(instance_name="local", kv_heads_per_rank=1, page_table=self_pt)
+    reg = _make_peer_registrar(self_rankinfo)
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=3,
+        tp_size=1,
+        kv_heads_per_rank=8,
+        layer_num_per_pp=[1],
+        page_table=peer_pt,
+    )
+    mapper = reg.get_kv_map(peer_ri, (0, 0), (0, 0))
+    assert isinstance(mapper, ReplicatedMapper)
+
+
+def test_replicated_pool_has_single_owner_on_tp_fan_in():
+    page_table = make_page_table(global_layer_ids=[0])
+    view = page_table.layer_groups[0].pool_views[0]
+    view.mapper_kind = MapperKind.REPLICATED
+
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        tp_size=8,
+        dp_size=8,
+        enable_attention_dp=True,
+        page_table=page_table,
+        layer_num_per_pp=[1],
+    )
+    overlap = PeerOverlap()
+    ownership = []
+    for tp_rank in range(8):
+        self_ri = make_rankinfo(
+            instance_name="local",
+            tp_size=8,
+            tp_rank=tp_rank,
+            page_table=page_table,
+            layer_num_per_pp=[1],
+        )
+        reg = _make_peer_registrar(self_ri)
+        ownership.append(reg.should_send_pool(overlap, peer_ri, 0, 0))
+
+    assert ownership == [True, False, False, False, False, False, False, False]
+
+
 def test_peer_registrar_tpb_divisible_warns_but_compatible():
     # local=16, peer=32: 32 % 16 == 0 → compatible with warning, register succeeds
     self_rankinfo = make_rankinfo(instance_name="local", tokens_per_block=16)
@@ -484,3 +631,192 @@ def test_peer_registrar_tpb_not_divisible_raises():
     )
     with pytest.raises(ValueError):
         reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+
+@pytest.mark.parametrize("mapper_kind", [MapperKind.NHD, MapperKind.REPLICATED])
+def test_peer_registrar_exact_tpb_mapper_rejects_divisible_mismatch(mapper_kind):
+    self_pt = make_page_table()
+    peer_pt = make_page_table()
+    self_pt.layer_groups[0].pool_views[0].mapper_kind = mapper_kind
+    peer_pt.layer_groups[0].pool_views[0].mapper_kind = mapper_kind
+    self_ri = make_rankinfo(page_table=self_pt, tokens_per_block=16)
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=7,
+        page_table=peer_pt,
+        tokens_per_block=32,
+    )
+    reg = _make_peer_registrar(self_ri)
+
+    with pytest.raises(ValueError):
+        reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+
+def test_identity_mapper_region_size_mismatch_raises():
+    with pytest.raises(ValueError, match="Identity cache region size mismatch"):
+        IdentityMapper(256, 128)
+
+
+def test_replicated_mapper_region_size_mismatch_raises():
+    with pytest.raises(ValueError, match="Replicated cache region size mismatch"):
+        ReplicatedMapper(256, 128)
+
+
+def test_nhd_mapper_rejects_non_divisible_region_geometry():
+    self_ri = make_rankinfo(kv_heads_per_rank=2, tokens_per_block=2)
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        tp_size=1,
+        kv_heads_per_rank=4,
+        tokens_per_block=2,
+    )
+
+    with pytest.raises(ValueError, match="not evenly divisible"):
+        NHDHeadMismatchMapper(
+            transfer_layers=1,
+            src_layer_off=0,
+            peer_layer_off=0,
+            self_ri=self_ri,
+            peer_ri=peer_ri,
+            self_region_bytes=17,
+            peer_region_bytes=32,
+            self_pool_num_layers=1,
+            peer_pool_num_layers=1,
+            self_buffers_per_layer=2,
+            peer_buffers_per_layer=2,
+        )
+
+
+def test_nhd_mapper_rejects_tokens_per_block_mismatch():
+    self_ri = make_rankinfo(tokens_per_block=2)
+    peer_ri = make_rankinfo(instance_name="peer", tokens_per_block=4)
+
+    with pytest.raises(ValueError, match="requires equal tokens_per_block"):
+        NHDHeadMismatchMapper(
+            transfer_layers=1,
+            src_layer_off=0,
+            peer_layer_off=0,
+            self_ri=self_ri,
+            peer_ri=peer_ri,
+            self_region_bytes=32,
+            peer_region_bytes=64,
+            self_pool_num_layers=1,
+            peer_pool_num_layers=1,
+            self_buffers_per_layer=2,
+            peer_buffers_per_layer=2,
+        )
+
+
+def test_get_buffers_per_layer_rejects_non_uniform_nhd_entries():
+    pool_view = PoolView(
+        pool_idx=0,
+        buffer_entries=np.array(
+            [(0, 0, 16), (0, 16, 16), (1, 32, 16)],
+            dtype=BUFFER_ENTRY_DTYPE,
+        ),
+        mapper_kind=MapperKind.NHD,
+    )
+
+    with pytest.raises(ValueError, match="layer_group=3, pool=4"):
+        PeerRegistrar._get_buffers_per_layer(
+            pool_view,
+            2,
+            layer_group_id=3,
+            pool_idx=4,
+        )
+
+
+def test_indexed_mapper_ignores_non_uniform_buffer_entry_geometry():
+    """Legacy/DSV4 indexed pools do not need NHD buffer geometry."""
+    entries = np.array(
+        [(0, 0, 16), (0, 16, 16), (1, 32, 16)],
+        dtype=BUFFER_ENTRY_DTYPE,
+    )
+    self_pt = make_page_table()
+    peer_pt = make_page_table()
+    self_pt.layer_groups[0].pool_views[0].buffer_entries = entries
+    peer_pt.layer_groups[0].pool_views[0].buffer_entries = entries.copy()
+    self_ri = make_rankinfo(page_table=self_pt)
+    peer_ri = make_rankinfo(instance_name="peer", page_table=peer_pt)
+    reg = _make_peer_registrar(self_ri)
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+    mapper = reg.get_kv_map(peer_ri, (0, 0), (0, 0))
+
+    assert isinstance(mapper, IdentityMapper)
+
+
+def test_peer_registrar_rejects_legacy_subbyte_head_mismatch():
+    self_ri = make_rankinfo(
+        element_bytes=0.5,
+        kv_heads_per_rank=2,
+        tp_size=2,
+        page_table=make_page_table(),
+    )
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        element_bytes=0.5,
+        kv_heads_per_rank=4,
+        tp_size=1,
+        page_table=make_page_table(block_bytes=[2048]),
+    )
+    reg = _make_peer_registrar(self_ri)
+
+    with pytest.raises(ValueError):
+        reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+
+def test_peer_registrar_dispatches_nhd_mapper():
+    self_pt = make_page_table()
+    peer_pt = make_page_table(block_bytes=[2048])
+    self_pt.layer_groups[0].pool_views[0].mapper_kind = MapperKind.NHD
+    peer_pt.layer_groups[0].pool_views[0].mapper_kind = MapperKind.NHD
+    self_ri = make_rankinfo(
+        kv_heads_per_rank=2,
+        tp_size=2,
+        page_table=self_pt,
+    )
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        kv_heads_per_rank=4,
+        tp_size=1,
+        page_table=peer_pt,
+    )
+    reg = _make_peer_registrar(self_ri)
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+    mapper = reg.get_kv_map(peer_ri, (0, 0), (0, 0))
+
+    assert isinstance(mapper, NHDHeadMismatchMapper)
+
+
+def test_peer_registrar_warns_for_nhd_head_mismatch(monkeypatch):
+    self_pt = make_page_table()
+    peer_pt = make_page_table(block_bytes=[2048])
+    self_pt.layer_groups[0].pool_views[0].mapper_kind = MapperKind.NHD
+    peer_pt.layer_groups[0].pool_views[0].mapper_kind = MapperKind.NHD
+    self_ri = make_rankinfo(kv_heads_per_rank=2, tp_size=2, page_table=self_pt)
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        kv_heads_per_rank=4,
+        tp_size=1,
+        page_table=peer_pt,
+    )
+    warnings = []
+    monkeypatch.setattr(
+        peer_module.logger,
+        "warning_once",
+        lambda *message, key: warnings.append((" ".join(map(str, message)), key)),
+    )
+
+    _make_peer_registrar(self_ri).register(
+        peer_ri.instance_name,
+        peer_ri.instance_rank,
+        peer_ri,
+    )
+
+    assert len(warnings) == 1
+    message, key = warnings[0]
+    assert "4 NIXL descriptors per transferred token per peer" in message
+    assert "local_kv_heads=2, peer_kv_heads=4" in message
+    assert key == "native-nhd-head-mismatch-2-4-4"

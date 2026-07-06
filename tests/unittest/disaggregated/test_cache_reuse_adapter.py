@@ -20,8 +20,9 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
+import tensorrt_llm._torch.disaggregation.native.transfer as transfer_module
 from tensorrt_llm._torch.disaggregation.base.transfer import TokenRange
-from tensorrt_llm._torch.disaggregation.native.transfer import Sender
+from tensorrt_llm._torch.disaggregation.native.transfer import Sender, WriteMeta
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
     _CacheReuseAdapterV1,
@@ -651,6 +652,101 @@ class TestSenderTokenStarts:
         )
         # total_blocks for slice = 2 → raw start = 16; clamped = max(16, 16) = 16.
         assert (src_start, dst_start) == (16, 16)
+
+
+class TestPrepareKvBlocksForTransfer:
+    """Exercise the complete pure block-normalization helper."""
+
+    @staticmethod
+    def _prepare(src, dst, **kwargs):
+        defaults = dict(
+            tokens_per_block=8,
+            slice_end=24,
+            beam_width=1,
+            dst_start_token=None,
+            sliding_window_size=None,
+            prompt_len=None,
+        )
+        defaults.update(kwargs)
+        return Sender._prepare_kv_blocks_for_transfer(
+            np.asarray(src, dtype=np.int64),
+            np.asarray(dst, dtype=np.int64),
+            **defaults,
+        )
+
+    def test_trims_one_extra_draft_destination_block(self):
+        src, dst = self._prepare([10, 11, 12], [20, 21, 22, 23])
+
+        np.testing.assert_array_equal(src, [10, 11, 12])
+        np.testing.assert_array_equal(dst, [20, 21, 22])
+
+    def test_rejects_more_than_one_extra_destination_block(self):
+        with pytest.raises(ValueError, match="expected diff <= 1"):
+            self._prepare([10], [20, 21, 22])
+
+    def test_destination_prefix_start_trims_source(self):
+        src, dst = self._prepare(
+            [10, 11, 12],
+            [20, 21, 22],
+            dst_start_token=8,
+        )
+
+        np.testing.assert_array_equal(src, [11, 12])
+        np.testing.assert_array_equal(dst, [20, 21])
+
+    def test_swa_requires_prompt_length(self):
+        with pytest.raises(ValueError, match="requires session.prompt_len"):
+            self._prepare(
+                [10, 11],
+                [20, 21],
+                slice_end=16,
+                sliding_window_size=8,
+            )
+
+    def test_swa_clamps_both_sides_to_live_window(self):
+        src, dst = self._prepare(
+            [10, 11],
+            [20, 21],
+            slice_end=32,
+            sliding_window_size=16,
+            prompt_len=32,
+        )
+
+        # CacheReuseAdapter has already removed the two stale blocks. The
+        # helper assigns both suffixes the live-window origin (token 16), so
+        # neither side is trimmed a second time during alignment.
+        np.testing.assert_array_equal(src, [10, 11])
+        np.testing.assert_array_equal(dst, [20, 21])
+
+
+def test_large_python_nixl_descriptor_transfer_warns_once(monkeypatch):
+    warnings = []
+    monkeypatch.setattr(Sender, "_LARGE_DESCRIPTOR_WARNING_THRESHOLD", 2)
+    monkeypatch.setattr(transfer_module, "use_pure_python_transfer_agent", lambda: True)
+    monkeypatch.setattr(
+        transfer_module.logger,
+        "warning_once",
+        lambda *message, key: warnings.append((" ".join(map(str, message)), key)),
+    )
+    write_meta = WriteMeta(
+        task=SimpleNamespace(),
+        expected_transfers=1,
+        peer_name="peer0",
+        peer_rank=0,
+        peer_endpoint="tcp://peer",
+        unique_rid=1,
+        src_ptrs=np.array([1000, 2000], dtype=np.int64),
+        dst_ptrs=np.array([3000, 4000], dtype=np.int64),
+        sizes=np.array([64, 64], dtype=np.int64),
+        dst_device_id=0,
+    )
+
+    Sender._make_agent_request(write_meta, device_id=0)
+
+    assert len(warnings) == 1
+    message, key = warnings[0]
+    assert "2 descriptors through Python lists" in message
+    assert key == "native-large-python-nixl-descriptor-transfer"
 
 
 # ---------------------------------------------------------------------------

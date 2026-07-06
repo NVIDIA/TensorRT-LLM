@@ -7,7 +7,7 @@ class AttentionInfo:
     kv_heads_per_rank: int
     tokens_per_block: int
     dims_per_head: int
-    element_bytes: int
+    element_bytes: int | float
     enable_attention_dp: bool
     is_mla: bool
 

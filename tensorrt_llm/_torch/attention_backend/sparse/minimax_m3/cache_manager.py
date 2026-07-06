@@ -29,7 +29,12 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, LayerId
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 from tensorrt_llm.runtime.kv_cache_manager_v2._utils import typed_range
 
-from ....pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from ....pyexecutor.kv_cache_manager_v2 import (
+    DisaggCacheLayout,
+    DisaggPoolViewConfig,
+    KVCacheManagerV2,
+    Role,
+)
 
 
 class MiniMaxM3SparseIndexCache:
@@ -176,6 +181,15 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
         super().__init__(*args, **kwargs)
 
+        index_v_layer_ids = set(self.sparse_layer_ids) - self.disable_index_value_layer_ids
+        if self.is_disagg and index_v_layer_ids:
+            raise ValueError(
+                "MiniMax M3 disaggregated serving requires disable_index_value=True "
+                "for every sparse layer because the optional test-only index-V cache "
+                "is not managed or transferred by KVCacheManagerV2; enabled layers="
+                f"{sorted(index_v_layer_ids)}"
+            )
+
         # Optional plain-tensor index-V cache for non-disabled sparse
         # layers (test-only; production has disable_index_value=True
         # on every sparse layer).
@@ -211,6 +225,13 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             for layer_id in self.sparse_layer_ids
             if layer_id in self.layer_offsets
         }
+
+    def get_disagg_pool_view_config(self) -> DisaggPoolViewConfig:
+        """Declare MiniMax M3's token-major K/V and replicated index-K."""
+        return DisaggPoolViewConfig(
+            sharded_layout=DisaggCacheLayout.NHD,
+            replicated_roles=frozenset({Role.INDEX_KEY}),
+        )
 
     def _compute_num_total_slots(self) -> int:
         """Total token slots across all blocks in the main K pool.
@@ -418,9 +439,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         pool_id: int = 0,
         is_kv_aggregate: bool = True,
         num_blocks_per_seq: Optional[Sequence[int]] = None,
-        index_scale: Optional[int] = None,
     ):
-        """Return per-request slot ids in ``[0, num_slots)`` directly.
+        """Return page indices; padded entries remain ``BAD_PAGE_INDEX`` (-1).
 
         The base method converts slot ids to V1-style block ids via
         ``base_idx * index_scales[pool_id] // kv_factor``, which is
@@ -429,36 +449,30 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         breaks the V1 conversion and produces out-of-bounds block ids
         during V2 warmup.
 
-        ``index_scale`` (per-layer scale supplied by the base
-        :meth:`get_batch_cache_indices`) is accepted for
-        signature compatibility but intentionally ignored: this
-        override bypasses the scale conversion entirely.
-
         Bypass the conversion: the M3 forward path indexes paged
         views (built by :meth:`get_buffers` /
         :meth:`get_index_k_buffer`) directly by slot id.
-        ``BAD_PAGE_INDEX`` slots stay as 0 to match the legacy
-        padding contract.
+        ``BAD_PAGE_INDEX`` slots remain ``-1`` here because disaggregation's
+        :class:`KVRegionExtractorV1` filters ``region_ids >= 0``.
+        :meth:`get_block_ids_per_seq` maps them to zero for the attention
+        metadata's padded tensor.
 
-        ``num_blocks_per_seq``, when provided by the base
-        :meth:`get_batch_cache_indices`, truncates each request's slot
-        ids to the blocks it actually owns (matching the base method's
-        contract); the padded tail is discarded by attention callers.
+        Args:
+            request_ids: Request IDs whose page-index rows are returned.
+            pool_id: V2 pool whose page indices are requested.
+            is_kv_aggregate: Kept for compatibility with the base virtual method.
+            num_blocks_per_seq: Optional per-request truncation limits. When
+                omitted, preserve the full padded width required by MiniMax
+                CUDA-graph metadata initialization.
         """
         res = []
         for req_idx, req_id in enumerate(request_ids):
-            idx_tensor = torch.as_tensor(self.kv_cache_map[req_id].get_base_page_indices(pool_id))
+            kv_cache = self.kv_cache_map[req_id]
+            base_page_indices = kv_cache.get_base_page_indices(pool_id)
             if num_blocks_per_seq is not None:
-                idx_tensor = idx_tensor[: num_blocks_per_seq[req_idx]]
-            res.append(
-                (
-                    torch.where(
-                        idx_tensor != BAD_PAGE_INDEX,
-                        idx_tensor,
-                        torch.full_like(idx_tensor, BAD_PAGE_INDEX),
-                    )
-                ).tolist()
-            )
+                num_blocks = min(kv_cache.num_blocks, num_blocks_per_seq[req_idx])
+                base_page_indices = base_page_indices[:num_blocks]
+            res.append(list(base_page_indices))
         return res
 
     def get_block_ids_per_seq(self, request_ids):

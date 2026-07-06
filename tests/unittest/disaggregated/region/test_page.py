@@ -6,6 +6,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     KVCachePageTable,
     LayerGroup,
     LocalLayer,
+    MapperKind,
     PhysicalPool,
     PhysicalPoolGroup,
     PoolView,
@@ -47,6 +48,30 @@ def test_pool_view_roundtrip():
     assert len(restored.buffer_entries) == 2
     assert restored.buffer_entries[0]["offset"] == 0
     assert restored.buffer_entries[1]["offset"] == 128
+
+
+def test_logical_pool_view_roundtrip_and_legacy_defaults():
+    entries = _make_buffer_entries()
+    view = PoolView(
+        pool_idx=2,
+        buffer_entries=entries,
+        pool_role=frozenset({"index_key"}),
+        mapper_kind=MapperKind.REPLICATED,
+        byte_offset=768,
+        bytes_per_region=256,
+    )
+
+    restored = PoolView.from_dict(view.to_dict())
+    assert restored.mapper_kind == MapperKind.REPLICATED
+    assert restored.byte_offset == 768
+    assert restored.bytes_per_region == 256
+
+    legacy = view.to_dict()
+    del legacy["byte_offset"]
+    del legacy["bytes_per_region"]
+    restored_legacy = PoolView.from_dict(legacy)
+    assert restored_legacy.byte_offset == 0
+    assert restored_legacy.bytes_per_region is None
 
 
 def test_local_layer_roundtrip():

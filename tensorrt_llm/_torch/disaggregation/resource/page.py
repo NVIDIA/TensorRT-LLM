@@ -29,10 +29,16 @@ class MapperKind(IntEnum):
         ``local_layers`` order. Used today by the DSA (DeepSeek Sparse
         Attention, v3.2) indexer K cache pool, whose slot layout is a dense
         ``(numLayers, kvFactor, blockSize)`` array.
+    REPLICATED: PoolView describes an indexed logical byte range that is
+        replicated across TP ranks. It is copied without KV-head remapping,
+        and fan-in routing selects one owning sender per destination group.
+    NHD: PoolView describes ordinary K/V whose per-buffer storage is
+        token-major ``[token, head, dim]``. Heterogeneous-head transfer must
+        select the corresponding head slice inside every token rather than a
+        single contiguous head-major range.
 
-    Byte arithmetic is the same for both kinds: per-layer stride is
-    ``slot_bytes // num_layers``. The kind only affects how disagg discovers
-    the pool's layer set during pool matching.
+    INDEXED and FLAT retain the legacy full-slot byte arithmetic unless a
+    PoolView supplies a logical ``byte_offset`` / ``bytes_per_region``.
 
     Mamba state pools do not use this enum: Mamba's transfer is dispatched
     through :class:`MambaPolicy` which hard-codes the ``is_conv`` switch and
@@ -41,6 +47,8 @@ class MapperKind(IntEnum):
 
     INDEXED = 0
     FLAT = 1
+    REPLICATED = 2
+    NHD = 3
 
 
 @dataclass
@@ -115,12 +123,18 @@ class PoolView:
             are equal. Disagg never enumerates the role-name vocabulary —
             adding a new role on the manager side requires no disagg change.
         mapper_kind: Closed-set discriminator for picking the Mapper family.
+        byte_offset: Byte offset of this logical view from the physical pool's
+            slot base. Defaults to zero for legacy full-slot views.
+        bytes_per_region: Number of bytes transferred from each slot. ``None``
+            means the full physical slot for backward compatibility.
     """
 
     pool_idx: int
     buffer_entries: np.ndarray  # dtype=BUFFER_ENTRY_DTYPE
     pool_role: FrozenSet[str] = field(default_factory=frozenset)
     mapper_kind: MapperKind = MapperKind.INDEXED
+    byte_offset: int = 0
+    bytes_per_region: Optional[int] = None
 
     def to_dict(self) -> dict:
         return {
@@ -128,6 +142,10 @@ class PoolView:
             "buffer_entries": self.buffer_entries.tolist(),
             "pool_role": sorted(self.pool_role),
             "mapper_kind": int(self.mapper_kind),
+            "byte_offset": int(self.byte_offset),
+            "bytes_per_region": (
+                int(self.bytes_per_region) if self.bytes_per_region is not None else None
+            ),
         }
 
     @staticmethod
@@ -143,6 +161,10 @@ class PoolView:
             ),
             pool_role=frozenset(data["pool_role"]),
             mapper_kind=MapperKind(int(data["mapper_kind"])),
+            byte_offset=int(data.get("byte_offset", 0)),
+            bytes_per_region=(
+                int(data["bytes_per_region"]) if data.get("bytes_per_region") is not None else None
+            ),
         )
 
 

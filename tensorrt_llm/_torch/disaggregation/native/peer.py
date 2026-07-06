@@ -6,11 +6,16 @@ from tensorrt_llm._torch.disaggregation.base.region import RegionMapperBase
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import AttentionPolicy
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup, MapperKind
+from tensorrt_llm._torch.disaggregation.resource.page import (
+    AttentionLayerGroup,
+    MapperKind,
+    PoolView,
+)
 from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_global_layer_ids,
     get_layer_group_num_layers,
     get_layer_to_layer_group,
+    get_num_buffer_entries,
     get_physical_pool,
     get_pool_view_global_layer_ids,
     get_pool_view_num_layers,
@@ -56,6 +61,33 @@ class PeerRegistrar:
         peer_ri = self.get_peer_rank_info(peer_name, peer_rank)
         extractor = KVRegionExtractorV1(peer_ri.page_table)
         self._peer_ext_cache[key] = extractor
+
+        head_match, _ = self._attention_policy.head_match(peer_ri)
+        if not head_match:
+            self_page_table = self._self_ext_cache.page_table
+            nhd_fragments_per_token = sum(
+                get_num_buffer_entries(
+                    self_page_table.layer_groups[layer_group_id].pool_views[pool_idx]
+                )
+                for layer_group_id, pool_idx in self.get_pool_mapping(peer_ri)
+                if self_page_table.layer_groups[layer_group_id].pool_views[pool_idx].mapper_kind
+                == MapperKind.NHD
+            )
+            if nhd_fragments_per_token:
+                local_heads = self._ri.attention.kv_heads_per_rank
+                peer_heads = peer_ri.attention.kv_heads_per_rank
+                logger.warning_once(
+                    "NHD head-mismatched disaggregated KV transfer has no "
+                    "contiguous staging path and will emit approximately "
+                    f"{nhd_fragments_per_token} NIXL descriptors per transferred "
+                    "token per peer, excluding block-level replicated pools "
+                    f"(local_kv_heads={local_heads}, peer_kv_heads={peer_heads}). "
+                    "Long-context TEP/DEP transfers may have high latency.",
+                    key=(
+                        "native-nhd-head-mismatch-"
+                        f"{local_heads}-{peer_heads}-{nhd_fragments_per_token}"
+                    ),
+                )
 
     def peer_extractor(self, peer_name: str, peer_rank: int) -> KVRegionExtractorV1:
         return self._peer_ext_cache[self._unique_key(peer_name, peer_rank)]
@@ -297,6 +329,23 @@ class PeerRegistrar:
         self_phys = get_physical_pool(self_pt, self_lg_idx, self_pv.pool_idx)
         peer_phys = get_physical_pool(peer_pt, peer_lg_idx, peer_pv.pool_idx)
 
+        self_region_bytes = self_pv.bytes_per_region or self_phys.slot_bytes
+        peer_region_bytes = peer_pv.bytes_per_region or peer_phys.slot_bytes
+        if self_pv.mapper_kind == MapperKind.NHD:
+            self_buffers_per_layer = self._get_buffers_per_layer(
+                self_pv,
+                self_num_layers,
+                layer_group_id=self_lg_idx,
+                pool_idx=self_pi,
+            )
+            peer_buffers_per_layer = self._get_buffers_per_layer(
+                peer_pv,
+                peer_num_layers,
+                layer_group_id=peer_lg_idx,
+                pool_idx=peer_pi,
+            )
+        else:
+            self_buffers_per_layer = peer_buffers_per_layer = 1
         mapper = self._attention_policy.build_kv_mapper(
             peer_ri=peer_ri,
             mapper_kind=self_pv.mapper_kind,
@@ -305,12 +354,33 @@ class PeerRegistrar:
             peer_layer_offset=peer_layer_offset,
             self_pool_num_layers=self_num_layers,
             peer_pool_num_layers=peer_num_layers,
-            self_pool_slot_bytes=self_phys.slot_bytes,
-            peer_pool_slot_bytes=peer_phys.slot_bytes,
+            self_buffers_per_layer=self_buffers_per_layer,
+            peer_buffers_per_layer=peer_buffers_per_layer,
+            self_pool_slot_bytes=self_region_bytes,
+            peer_pool_slot_bytes=peer_region_bytes,
         )
 
         self._kv_map_cache[cache_key] = mapper
         return mapper
+
+    @staticmethod
+    def _get_buffers_per_layer(
+        pool_view: PoolView,
+        num_layers: int,
+        *,
+        layer_group_id: int,
+        pool_idx: int,
+    ) -> int:
+        num_entries = get_num_buffer_entries(pool_view)
+        if num_entries == 0:
+            return 1
+        if num_layers <= 0 or num_entries % num_layers != 0:
+            raise ValueError(
+                "PoolView buffer entries are not evenly distributed across layers: "
+                f"layer_group={layer_group_id}, pool={pool_idx}, "
+                f"entries={num_entries}, layers={num_layers}"
+            )
+        return num_entries // num_layers
 
     @staticmethod
     def _find_overlap(self_val, peer_val, self_rank, peer_rank=None):
@@ -393,13 +463,45 @@ class PeerRegistrar:
             self_tp_rank_in_dp_group % dup_head_factor
         )
 
+    def _owns_tp_fan_in(self, peer_rank_info: RankInfo) -> bool:
+        """Elect one owner when replicated bytes fan in across TP ranks.
+
+        A peer with fewer TP shards receives identical replicated data from
+        several local ranks. Elect the first local rank in each peer-sized
+        fan-in group so exactly one copy reaches each destination.
+        """
+        ratio = max(
+            1,
+            self._ri.tp_size_per_dp_group // peer_rank_info.tp_size_per_dp_group,
+        )
+        self_tp_rank = self._ri.tp_rank % self._ri.tp_size_per_dp_group
+        return self_tp_rank % ratio == 0
+
+    def should_send_pool(
+        self,
+        peer_overlap: PeerOverlap,
+        peer_rank_info: RankInfo,
+        layer_group_id: int,
+        pool_idx: int,
+    ) -> bool:
+        """Return whether this rank owns the transfer for one logical pool.
+
+        Normal KV pools retain head-duplication routing. Replicated side-cache
+        pools use one sender per fan-in group so TEP->DEP does not race several
+        identical INDEX_KEY copies into the same destination.
+        """
+        layer_group = self._self_ext_cache.page_table.layer_groups[layer_group_id]
+        pool_view = layer_group.pool_views[pool_idx]
+        if pool_view.mapper_kind != MapperKind.REPLICATED:
+            return self.should_send_kv(peer_overlap, peer_rank_info)
+
+        return self._owns_tp_fan_in(peer_rank_info)
+
     def should_send_aux(self, peer_rank_info: RankInfo) -> bool:
         # to ensure the transfer aux is not duplicated
 
         # TP: only the first rank in each peer-TP-sized group sends aux
-        ratio = max(1, self._ri.tp_size_per_dp_group // peer_rank_info.tp_size_per_dp_group)
-        self_tp_rank_in_dp_group = self._ri.tp_rank % self._ri.tp_size_per_dp_group
-        should_send_in_tp = self_tp_rank_in_dp_group % ratio == 0
+        should_send_in_tp = self._owns_tp_fan_in(peer_rank_info)
 
         # PP: only the first self-PP rank whose layers overlap with the peer's PP rank sends aux.
         # All tp/pp ranks have the same aux data, so pick the first overlapping one to avoid duplication.

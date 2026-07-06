@@ -21,10 +21,15 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     PoolView,
 )
 from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import DisaggCacheLayout
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes, nvtx_range
 from tensorrt_llm.bindings import DataType
+
+_LAYOUT_TO_MAPPER = {
+    DisaggCacheLayout.NHD: MapperKind.NHD,
+}
 
 
 class KVRegionExtractorV1(RegionExtractorBase):
@@ -71,13 +76,14 @@ class KVRegionExtractorV1(RegionExtractorBase):
         pv = lg.pool_views[pool_idx]
         pool = get_physical_pool(self._page_table, layer_group_id, pv.pool_idx)
 
-        base_ptr = pool.base_address
-        block_size = pool.slot_bytes
+        base_ptr = pool.base_address + pv.byte_offset
+        block_stride = pool.slot_bytes
+        region_size = pv.bytes_per_region or pool.slot_bytes
 
         # KV cache: filter out invalid block_ids (BAD_PAGE_INDEX = -1)
         valid = region_ids >= 0
-        ptrs = base_ptr + block_size * region_ids[valid]
-        memory = MemRegionGroup(ptrs=ptrs, bytes_per_region=block_size)
+        ptrs = base_ptr + block_stride * region_ids[valid]
+        memory = MemRegionGroup(ptrs=ptrs, bytes_per_region=region_size)
         return SpecRegion(memory=memory)
 
 
@@ -288,109 +294,198 @@ def _compute_global_layer_ids(manager, lg_idx: int) -> List[int]:
 def _build_page_table_v2(manager) -> KVCachePageTable:
     """Build a KVCachePageTable from a KVCacheManagerV2.
 
-    Uses KVCacheManagerV2's public pool_group_descs layout API. A physical
-    pool group may be shared by several layer groups; layer_groups remains
-    indexed by layer_group_id while pool_group_idx points at the shared
-    physical pool group entry.
+    Uses the V2 storage layer APIs (pool.slot_address, pool.slot_size,
+    pool.num_slots) for accurate pool metadata, and stamps each PoolView
+    with the manager's native role-name strings (``pool_role``) plus the
+    closed-set ``mapper_kind`` discriminator used by ``build_kv_mapper``.
 
-    Each PoolView is stamped with the manager's native role-name strings
-    (``pool_role``) plus the closed-set ``mapper_kind`` discriminator used
-    by ``build_kv_mapper``.
+    Important: iterates over life cycles (layer groups), not storage pool
+    groups.  Multiple life cycles with different sliding-window sizes may
+    share the same underlying storage pool group when their buffer sizes
+    are identical.  The page table must reflect life cycles so that
+    per-window transfer logic works correctly.
     """
-    config = manager.impl.init_config
-    pool_group_descs = manager.impl.pool_group_descs
+    from collections import defaultdict
 
-    def _window_size_for_layer(internal_layer_id: int):
-        if internal_layer_id < len(config.layers):
-            return getattr(config.layers[internal_layer_id], "window_size", None)
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier
 
-        if hasattr(manager, "_layer_attn_to_layer_id"):
-            for (model_layer, _attn_type), layer_id in manager._layer_attn_to_layer_id.items():
-                if layer_id != internal_layer_id:
-                    continue
-                local_layer = manager.layer_offsets.get(model_layer)
-                if local_layer is not None and local_layer < len(config.layers):
-                    return getattr(config.layers[local_layer], "window_size", None)
-                if model_layer < len(config.layers):
-                    return getattr(config.layers[model_layer], "window_size", None)
+    storage = manager.impl._storage
+    config = manager.impl._init_config
 
-        raise ValueError(f"Cannot resolve layer config for internal layer {internal_layer_id}")
+    # Find GPU level
+    gpu_level = 0
+    for level_idx, cache_tier_config in enumerate(config.cache_tiers):
+        if cache_tier_config.tier == CacheTier.GPU_MEM:
+            gpu_level = level_idx
+            break
+
+    # Collect buffer entries keyed by (life_cycle_id, pool_idx).
+    # Also collect the set of native role-name strings per pool — used as
+    # ``PoolView.pool_role``, the manager-supplied equivalence label that
+    # disagg uses to match pools across peers without enumerating roles.
+    buffer_by_lc_pool: Dict[tuple, list] = defaultdict(list)
+    buffer_ids_by_lc_layer: Dict[tuple, list] = defaultdict(list)
+    native_roles_by_pool: Dict[tuple, set] = defaultdict(set)
+
+    for buffer_id, attr in storage._buffer_attr.items():
+        layer_id, role = buffer_id
+        lc_id = attr.life_cycle_id
+        pool_idx = attr.pool_index
+        pool_key = (int(lc_id), pool_idx)
+        buffer_by_lc_pool[pool_key].append((layer_id, attr.offset, attr.size))
+        buffer_ids_by_lc_layer[(int(lc_id), int(layer_id))].append(buffer_id)
+        native_roles_by_pool[pool_key].add(str(role))
+
+    # V2 managers opt into model-specific logical views through
+    # get_disagg_pool_view_config()/DisaggPoolViewConfig. This keeps shared
+    # disaggregation independent of private model attributes and role names,
+    # and ensures dense-only PP ranks use the same scheme as sparse ranks even
+    # when no replicated role is locally allocated.
+    view_config = manager.get_disagg_pool_view_config()
+    sharded_mapper_kind = None
+    if view_config is not None:
+        sharded_mapper_kind = _LAYOUT_TO_MAPPER.get(view_config.sharded_layout)
+        if sharded_mapper_kind is None:
+            supported = ", ".join(layout.value for layout in _LAYOUT_TO_MAPPER)
+            raise ValueError(
+                "Unsupported disaggregation sharded layout "
+                f"{view_config.sharded_layout!r}; supported layouts: {supported}"
+            )
+    replicated_roles = view_config.replicated_roles if view_config is not None else frozenset()
+
+    # Iterate over life cycles (layer groups), not storage pool groups.
+    # Multiple layer_groups can share the same storage pool_group when their
+    # slot_size_list (coalesced buffer sizes) are identical.  In that case,
+    # different layer_groups draw slots from the same physical pool, but a
+    # slot is exclusively allocated to one layer_group at a time (managed by
+    # SlotAllocator).  Within a slot, each layer_group's buffer offsets start
+    # from 0 independently — the memory is reused, not concatenated.
+    # Therefore, slot_bytes / num_layers_for_this_layer_group correctly gives
+    # the per-layer size, and buffer offsets within a slot are contiguous for
+    # each layer_group.
+    num_life_cycles = storage.num_life_cycles
+    pool_group_storage = storage._levels[gpu_level].storage._pool_groups
 
     pool_groups: List[PhysicalPoolGroup] = []
     storage_pg_to_list_idx: Dict[int, int] = {}
-    layer_groups_by_id: List[LayerGroup | None] = [None] * len(manager.impl.layer_grouping)
+    layer_groups: List[LayerGroup] = []
 
-    for pg_desc in pool_group_descs:
-        storage_pg_idx = int(pg_desc.pool_group_index)
-        storage_pg_to_list_idx[storage_pg_idx] = len(pool_groups)
-        pool_groups.append(
-            PhysicalPoolGroup(
-                pools=[
-                    PhysicalPool(
-                        base_address=int(pool.base_address),
-                        slot_bytes=int(pool.slot_bytes),
-                        num_slots=int(pg_desc.num_slots),
-                    )
-                    for pool in pg_desc.pools
-                ]
-            )
-        )
+    for lc_idx in range(num_life_cycles):
+        # Resolve the storage pool group for this life cycle.
+        # storage_pg_idx may be the same for multiple lc_idx values.
+        storage_pg_idx = storage.get_pool_group_index(lc_idx)
+        pool_group = pool_group_storage[storage_pg_idx]
+        num_pools = pool_group.num_pools
 
-        for variant in pg_desc.slot_desc.variants:
-            layer_group_id = int(variant.layer_group_id)
-            all_internal_layer_ids = list(manager.impl.layer_grouping[layer_group_id])
-            all_global_layer_ids = _compute_global_layer_ids(manager, layer_group_id)
-
-            local_layers = [
-                LocalLayer(local_layer_id=int(iid), global_layer_id=int(gid))
-                for iid, gid in zip(all_internal_layer_ids, all_global_layer_ids)
-            ]
-
-            pool_views = []
-            for pool_idx, coalesced_buffer in enumerate(variant.coalesced_buffers):
-                entries = []
-                # Native role-name strings for this pool — used as
-                # ``PoolView.pool_role``, the manager-supplied equivalence
-                # label that disagg uses to match pools across peers without
-                # enumerating roles.
-                native_roles: set = set()
-                offset = 0
-                single_buffer_size = int(coalesced_buffer.single_buffer_size)
-                for buffer_id in coalesced_buffer.buffer_ids:
-                    entries.append((int(buffer_id.layer_id), offset, single_buffer_size))
-                    native_roles.add(str(buffer_id.role))
-                    offset += single_buffer_size
-
-                if entries:
-                    pool_views.append(
-                        PoolView(
-                            pool_idx=pool_idx,
-                            buffer_entries=np.array(entries, dtype=BUFFER_ENTRY_DTYPE),
-                            pool_role=frozenset(native_roles),
-                            mapper_kind=MapperKind.INDEXED,
+        # Build PhysicalPoolGroup once per unique storage pool group.
+        if storage_pg_idx not in storage_pg_to_list_idx:
+            storage_pg_to_list_idx[storage_pg_idx] = len(pool_groups)
+            pool_groups.append(
+                PhysicalPoolGroup(
+                    pools=[
+                        PhysicalPool(
+                            base_address=int(pool_group._pools[pi].slot_address(0)),
+                            slot_bytes=int(pool_group._pools[pi].slot_size),
+                            num_slots=int(pool_group._pools[pi].num_slots),
                         )
+                        for pi in range(num_pools)
+                    ]
+                )
+            )
+
+        # Compute group-level global layer IDs and internal layer IDs
+        all_internal_layer_ids = list(manager.impl.layer_grouping[lc_idx])
+        all_global_layer_ids = _compute_global_layer_ids(manager, lc_idx)
+
+        local_layers = [
+            LocalLayer(local_layer_id=int(iid), global_layer_id=int(gid))
+            for iid, gid in zip(all_internal_layer_ids, all_global_layer_ids)
+        ]
+
+        pool_views = []
+        if view_config is not None:
+            # Depending on topology, replicated side caches may occupy their
+            # own physical pools or be coalesced with sharded K/V. Describe
+            # each layer and role class as a logical byte range so matching is
+            # independent of that physical coalescing decision.
+            physical_pools = pool_groups[storage_pg_to_list_idx[storage_pg_idx]].pools
+            for layer_id in all_internal_layer_ids:
+                layer_buffers = buffer_ids_by_lc_layer.get((lc_idx, int(layer_id)), [])
+                standard_buffers = [b for b in layer_buffers if b[1] not in replicated_roles]
+                replicated_buffers = [b for b in layer_buffers if b[1] in replicated_roles]
+
+                for buffers, mapper_kind in (
+                    (standard_buffers, sharded_mapper_kind),
+                    (replicated_buffers, MapperKind.REPLICATED),
+                ):
+                    if not buffers:
+                        continue
+                    for desc in manager.impl.get_aggregated_pages(buffers):
+                        desc_buffer_ids = [expanded.id for expanded in desc.buffers]
+                        first_attr = storage._buffer_attr[desc_buffer_ids[0]]
+                        pool_idx = int(first_attr.pool_index)
+                        pool_base = physical_pools[pool_idx].base_address
+                        entries = [
+                            (
+                                int(buffer_id[0]),
+                                int(storage._buffer_attr[buffer_id].offset),
+                                int(storage._buffer_attr[buffer_id].size),
+                            )
+                            for buffer_id in desc_buffer_ids
+                        ]
+                        pool_views.append(
+                            PoolView(
+                                pool_idx=pool_idx,
+                                buffer_entries=np.array(entries, dtype=BUFFER_ENTRY_DTYPE),
+                                pool_role=frozenset(
+                                    str(buffer_id[1]) for buffer_id in desc_buffer_ids
+                                ),
+                                mapper_kind=mapper_kind,
+                                byte_offset=int(desc.base) - pool_base,
+                                bytes_per_region=int(desc.size),
+                            )
+                        )
+        else:
+            for pool_idx in range(num_pools):
+                pool_key = (lc_idx, pool_idx)
+                buffers_info = buffer_by_lc_pool.get(pool_key, [])
+
+                # Skip pools that have no buffers for this layer group.
+                # Multiple life cycles may share the same storage pool group;
+                # only include pools that actually belong to this life cycle.
+                if not buffers_info:
+                    continue
+
+                pool_views.append(
+                    PoolView(
+                        pool_idx=pool_idx,
+                        buffer_entries=np.array(buffers_info, dtype=BUFFER_ENTRY_DTYPE),
+                        pool_role=frozenset(native_roles_by_pool[pool_key]),
+                        mapper_kind=MapperKind.INDEXED,
                     )
+                )
 
-            first_local_layer = all_internal_layer_ids[0]
-            if first_local_layer < len(manager.num_kv_heads_per_layer):
-                num_kv_heads = manager.num_kv_heads_per_layer[first_local_layer]
-            else:
-                num_kv_heads = manager.num_kv_heads_per_layer[0]
-            sliding_window_size = _window_size_for_layer(first_local_layer)
+        # Determine layer group metadata.
+        # For managers with virtual layers, internal layer_ids
+        # may exceed the length of num_kv_heads_per_layer. Use index 0 as all
+        # layers within a pool group share the same kv_heads count.
+        first_local_layer = all_internal_layer_ids[0]
+        if first_local_layer < len(manager.num_kv_heads_per_layer):
+            num_kv_heads = manager.num_kv_heads_per_layer[first_local_layer]
+        else:
+            num_kv_heads = manager.num_kv_heads_per_layer[0]
+        life_cycle = manager.impl._life_cycles[lc_idx]
+        sliding_window_size = life_cycle.window_size
 
-            layer_groups_by_id[layer_group_id] = AttentionLayerGroup(
+        layer_groups.append(
+            AttentionLayerGroup(
                 pool_group_idx=storage_pg_to_list_idx[storage_pg_idx],
                 kv_head_num_per_rank=num_kv_heads,
                 sliding_window_size=sliding_window_size,
                 local_layers=local_layers,
                 pool_views=pool_views,
             )
-
-    layer_groups: List[LayerGroup] = []
-    for layer_group_id, layer_group in enumerate(layer_groups_by_id):
-        if layer_group is None:
-            raise ValueError(f"Missing V2 layer group descriptor for layer group {layer_group_id}")
-        layer_groups.append(layer_group)
+        )
 
     if isinstance(manager, MambaHybridCacheManager):
         mamba_layer_group_idx = len(pool_groups)

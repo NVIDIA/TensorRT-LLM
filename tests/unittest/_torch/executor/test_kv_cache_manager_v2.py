@@ -8,10 +8,16 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import BlockReusePolicy, KVCacheManagerV2
+import tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 as kv_cache_manager_v2_module
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
+    BlockReusePolicy,
+    KVCacheManagerV2,
+    Role,
+)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
+from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -496,3 +502,56 @@ def test_per_conversation_policy_ignores_overlapping_request(
         _free_if_active(manager, request_old_prompt)
         _free_if_active(manager, request_b)
         _free_if_active(manager, request_a)
+
+
+class _PoolMappingOverride(KVCacheManagerV2):
+    def _build_pool_mapping_tensors(self):
+        self.pool_mapping_override_called = True
+        return self.expected_pool_pointers, self.expected_pool_mapping
+
+
+class _FakePoolImpl:
+    layer_grouping = [[0]]
+
+    @staticmethod
+    def get_page_index_scale(_layer_id, _role):
+        return 1
+
+    @staticmethod
+    def get_mem_pool_base_address(_layer_id, role, _page_index_mode):
+        return 16 if role == Role.VALUE else 0
+
+    @staticmethod
+    def get_page_stride(_layer_id, _role):
+        return 16
+
+
+def test_prepare_page_table_uses_subclass_pool_mapping(monkeypatch):
+    """Keep sparse-manager pool mapping overrides on the initialization path."""
+    monkeypatch.setattr(kv_cache_manager_v2_module, "prefer_pinned", lambda: False)
+
+    manager = object.__new__(_PoolMappingOverride)
+    manager.expected_pool_pointers = torch.tensor([[11, 0]], dtype=torch.int64)
+    manager.expected_pool_mapping = torch.tensor([[0, 7]], dtype=torch.int32)
+    manager.pool_mapping_override_called = False
+    manager.num_pools = 1
+    manager.max_beam_width = 1
+    manager.max_blocks_per_seq = 4
+    manager.kv_cache_type = CacheTypeCpp.SELF
+    manager.enable_swa_scratch_reuse = False
+    manager.impl = _FakePoolImpl()
+
+    manager._prepare_page_table_tensor(index_mapper_capacity=2)
+
+    assert manager.pool_mapping_override_called
+    assert manager.kv_cache_pool_pointers is manager.expected_pool_pointers
+    assert manager.kv_cache_pool_mapping is manager.expected_pool_mapping
+    assert manager.index_scales.tolist() == [1]
+    assert manager.kv_offset.tolist() == [1]
+    assert manager.host_kv_cache_block_offsets.shape == (1, 2, 2, 4)
+
+
+def test_disagg_pool_view_capability_defaults_to_none():
+    manager = object.__new__(KVCacheManagerV2)
+
+    assert manager.get_disagg_pool_view_config() is None

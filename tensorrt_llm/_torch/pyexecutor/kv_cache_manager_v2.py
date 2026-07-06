@@ -220,6 +220,28 @@ class ConversationManager:
         self._conversation_states.clear()
 
 
+class DisaggCacheLayout(StrEnum):
+    NHD = "NHD"
+
+
+class DisaggPoolViewConfig(NamedTuple):
+    """Describe model-specific V2 cache views to native disaggregation.
+
+    ``sharded_layout`` describes non-replicated storage; ``NHD`` means
+    token-major ``[token, head, dim]`` bytes and requires token-granular head
+    remapping when peer topologies differ. ``replicated_roles`` identifies
+    side caches that contain the same bytes on every TP rank. Those regions
+    use a strict 1:1 byte copy with no KV-head remapping, and
+    :meth:`PeerRegistrar.should_send_pool` elects one sender during TP fan-in.
+
+    Returning this capability asks the generic page-table builder to expose
+    per-layer, per-role-class logical views instead of opaque whole-slot views.
+    """
+
+    sharded_layout: DisaggCacheLayout
+    replicated_roles: frozenset[DataRole]
+
+
 def _estimate_full_attn_size_per_token(
     layer_sizes: Sequence[int], attention_windows: Sequence[Optional[int]]
 ) -> int:
@@ -1155,12 +1177,49 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self._log_kv_cache_pool_lifecycle_mapping()
 
-    def _build_pool_mapping_tensors(self):
-        """Build the (kv_cache_pool_pointers, kv_cache_pool_mapping) tensors.
+    def _prepare_page_table_tensor(self, index_mapper_capacity: int) -> None:
+        # Sparse managers can add roles whose physical pool stride does not
+        # follow the base K/V-only formula, so keep mapping construction virtual.
+        (self.kv_cache_pool_pointers, self.kv_cache_pool_mapping) = (
+            self._build_pool_mapping_tensors()
+        )
 
-        An overridable hook for subclasses whose pools coalesce extra
-        per-layer buffers alongside K/V.
-        """
+        self.index_scales = torch.empty(
+            self.num_pools, dtype=torch.int32, pin_memory=prefer_pinned(), device="cpu"
+        )
+        self.kv_offset = torch.empty(
+            self.num_pools, dtype=torch.int32, pin_memory=prefer_pinned(), device="cpu"
+        )
+        for pool_id in range(self.num_pools):
+            layer_id = self.impl.layer_grouping[pool_id][0]
+            self.index_scales[pool_id] = self.impl.get_page_index_scale(layer_id, Role.KEY)
+            if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
+                self.kv_offset[pool_id] = exact_div(
+                    self.impl.get_mem_pool_base_address(layer_id, Role.VALUE, PageIndexMode.SHARED)
+                    - self.impl.get_mem_pool_base_address(layer_id, Role.KEY, PageIndexMode.SHARED),
+                    self.impl.get_page_stride(layer_id, Role.KEY),
+                )
+            else:
+                self.kv_offset[pool_id] = 0
+        # Plain-int mirror of index_scales so the per-step block-table build
+        # does not index a tensor per request (see get_batch_cache_indices*).
+        self._index_scale_ints: List[int] = self.index_scales.tolist()
+
+        # Keep unused block offsets as safe block index 0.
+        self.host_kv_cache_block_offsets = torch.zeros(
+            self.num_pools,
+            index_mapper_capacity * self.max_beam_width,
+            2,  # key and value
+            self.max_blocks_per_seq,
+            dtype=torch.int32,
+            pin_memory=prefer_pinned(),
+            device="cpu",
+        )
+        if self.enable_swa_scratch_reuse:
+            self._prepare_swa_scratch_copy_tensors(index_mapper_capacity)
+
+    def _build_pool_mapping_tensors(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build the default K/V pool pointers and per-layer pool offsets."""
         kv_cache_pool_pointers_list = []
         kv_cache_pool_mapping_list = []
         block_scale_pool_pointers_list = []
@@ -1271,42 +1330,6 @@ class KVCacheManagerV2(BaseResourceManager):
             pin_memory=prefer_pinned(),
         )
         return kv_cache_pool_pointers, kv_cache_pool_mapping
-
-    def _prepare_page_table_tensor(self, index_mapper_capacity: int) -> None:
-        self.kv_cache_pool_pointers, self.kv_cache_pool_mapping = self._build_pool_mapping_tensors()
-        self.index_scales = torch.empty(
-            self.num_pools, dtype=torch.int32, pin_memory=prefer_pinned(), device="cpu"
-        )
-        self.kv_offset = torch.empty(
-            self.num_pools, dtype=torch.int32, pin_memory=prefer_pinned(), device="cpu"
-        )
-        for pool_id in range(self.num_pools):
-            layer_id = self.impl.layer_grouping[pool_id][0]
-            self.index_scales[pool_id] = self.impl.get_page_index_scale(layer_id, Role.KEY)
-            if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
-                self.kv_offset[pool_id] = exact_div(
-                    self.impl.get_mem_pool_base_address(layer_id, Role.VALUE, PageIndexMode.SHARED)
-                    - self.impl.get_mem_pool_base_address(layer_id, Role.KEY, PageIndexMode.SHARED),
-                    self.impl.get_page_stride(layer_id, Role.KEY),
-                )
-            else:
-                self.kv_offset[pool_id] = 0
-        # Plain-int mirror of index_scales so the per-step block-table build
-        # does not index a tensor per request (see get_batch_cache_indices*).
-        self._index_scale_ints: List[int] = self.index_scales.tolist()
-
-        # Keep unused block offsets as safe block index 0.
-        self.host_kv_cache_block_offsets = torch.zeros(
-            self.num_pools,
-            index_mapper_capacity * self.max_beam_width,
-            2,  # key and value
-            self.max_blocks_per_seq,
-            dtype=torch.int32,
-            pin_memory=prefer_pinned(),
-            device="cpu",
-        )
-        if self.enable_swa_scratch_reuse:
-            self._prepare_swa_scratch_copy_tensors(index_mapper_capacity)
 
     def _get_runtime_cache_size_layer_components(self) -> tuple[List[int], List[Optional[int]]]:
         layer_sizes = []
@@ -1801,6 +1824,17 @@ class KVCacheManagerV2(BaseResourceManager):
         buffers built in :meth:`_build_base_config`. The block storage
         groups buffers by lifecycle and size with an opaque role key, so
         new roles do not require C++ changes.
+        """
+        return None
+
+    def get_disagg_pool_view_config(self) -> Optional[DisaggPoolViewConfig]:
+        """Return an explicit logical-pool contract for disaggregation.
+
+        The default ``None`` preserves the legacy whole-slot page table.
+        Model-specific managers may return :class:`DisaggPoolViewConfig`
+        without requiring the shared extractor to inspect private attributes
+        or role names. MiniMax M3, for example, declares NHD K/V plus a
+        replicated index-key side cache.
         """
         return None
 

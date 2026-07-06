@@ -28,6 +28,7 @@ from tensorrt_llm._torch.disaggregation.base.agent import (
     RegMemoryDescs,
     TransferOp,
     TransferRequest,
+    use_pure_python_transfer_agent,
 )
 from tensorrt_llm._torch.disaggregation.base.transfer import (
     KVSlice,
@@ -259,6 +260,7 @@ class Sender(SenderBase):
     # RecvReqInfo that never gets consumed.  Entries older than this
     # are evicted during periodic sweeps.
     _STALE_REQ_INFO_TTL_S = 120.0
+    _LARGE_DESCRIPTOR_WARNING_THRESHOLD = 100_000
 
     def __init__(
         self,
@@ -465,6 +467,14 @@ class Sender(SenderBase):
                 f"{write_meta.sizes.size=}"
             )
         n = write_meta.src_ptrs.size
+        if n >= Sender._LARGE_DESCRIPTOR_WARNING_THRESHOLD and use_pure_python_transfer_agent():
+            logger.warning_once(
+                "Pure-Python NIXL transfer-agent fallback is converting "
+                f"{n:,} descriptors through Python lists for one transfer. "
+                "Install/use the C++ transfer-agent binding for long-context "
+                "head-mismatched disaggregated serving.",
+                key="native-large-python-nixl-descriptor-transfer",
+            )
         if write_meta.meta_type == WriteMetaType.AUX:
             src_dev, dst_dev, mem_type = 0, 0, MemoryType.DRAM
         else:
@@ -742,6 +752,74 @@ class Sender(SenderBase):
             return block_ids.size
         return max(0, block_ids.size - (beam_width - 1))
 
+    @staticmethod
+    def _prepare_kv_blocks_for_transfer(
+        src_block_ids: np.ndarray,
+        dst_block_ids: np.ndarray,
+        *,
+        tokens_per_block: int,
+        slice_end: int,
+        beam_width: int,
+        dst_start_token: Optional[int],
+        sliding_window_size: Optional[int],
+        prompt_len: Optional[int],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Normalize and align one layer-group pair's source/destination blocks.
+
+        Each block list is a suffix of the logical blocks covering
+        ``[0, slice_end)``; its omitted prefix is inferred from list length.
+        ``prompt_len`` can exceed ``slice_end`` for non-final context chunks,
+        so SWA staleness is derived from the full prompt, not the slice.
+        """
+        # Both sides trim block lists to ceil(prompt_len / tpb) in
+        # _create_kv_slice, so dst must never exceed src. A smaller dst
+        # (generation prefix-cache reuse) is handled via dst_start below.
+        block_diff = dst_block_ids.size - src_block_ids.size
+        if block_diff > 0:
+            raise ValueError(
+                f"src/dst block count mismatch: {src_block_ids.size} vs "
+                f"{dst_block_ids.size} (dst must not exceed src)"
+            )
+
+        total_blocks = (slice_end + tokens_per_block - 1) // tokens_per_block
+        src_beam0_blocks = Sender._beam0_block_count(src_block_ids, total_blocks, beam_width)
+        dst_beam0_blocks = Sender._beam0_block_count(dst_block_ids, total_blocks, beam_width)
+        if src_beam0_blocks > total_blocks:
+            raise ValueError(
+                f"src beam-0 block list ({src_beam0_blocks}) exceeds total slice "
+                f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tokens_per_block}"
+            )
+        if dst_beam0_blocks > total_blocks:
+            raise ValueError(
+                f"dst beam-0 block list ({dst_beam0_blocks}) exceeds total slice "
+                f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tokens_per_block}"
+            )
+
+        src_start = (total_blocks - src_beam0_blocks) * tokens_per_block
+        dst_start = (total_blocks - dst_beam0_blocks) * tokens_per_block
+        if dst_start_token is not None:
+            dst_start = max(dst_start, dst_start_token)
+        if sliding_window_size is not None:
+            if prompt_len is None:
+                raise ValueError(
+                    "SWA layer requires session.prompt_len; "
+                    "set TxSession(prompt_len=request.prompt_len)."
+                )
+            stale_end = max(
+                0,
+                (prompt_len + 1 - sliding_window_size) // tokens_per_block,
+            )
+            src_start = max(stale_end * tokens_per_block, src_start)
+            dst_start = max(stale_end * tokens_per_block, dst_start)
+
+        return Sender._align_kv_blocks(
+            src_block_ids,
+            dst_block_ids,
+            src_token_start=src_start,
+            dst_token_start=dst_start,
+            tokens_per_block=tokens_per_block,
+        )
+
     @nvtx_range("_build_kv_write_meta")
     def _build_kv_write_meta(self, task: KVSendTask, req_info: RecvReqInfo) -> WriteMeta:
         peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
@@ -766,85 +844,47 @@ class Sender(SenderBase):
         peer_extractor = self._registrar.peer_extractor(
             peer_ri.instance_name, peer_ri.instance_rank
         )
-        if self._registrar.should_send_kv(targets, peer_ri):
-            pool_mapping = self._registrar.get_pool_mapping(peer_ri)
-            dst_block_ids_per_groups = req_info.block_ids_per_layer_groups
-            src_block_ids_per_groups = task._slice.block_ids_per_layer_groups
+        pool_mapping = self._registrar.get_pool_mapping(peer_ri)
+        dst_block_ids_per_groups = req_info.block_ids_per_layer_groups
+        src_block_ids_per_groups = task._slice.block_ids_per_layer_groups
 
-            # Aggregate fragments from all matching pools using numpy concatenation
-            for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
-                src_block_ids = src_block_ids_per_groups[self_lg]
-                dst_block_ids = dst_block_ids_per_groups[peer_lg]
+        aligned_blocks_by_layer_groups: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
 
-                # Both sides trim block lists to ceil(prompt_len / tpb) in
-                # _create_kv_slice, so dst must never exceed src. A smaller dst
-                # (generation prefix-cache reuse) is handled via dst_start below.
-                block_diff = dst_block_ids.size - src_block_ids.size
-                if block_diff > 0:
-                    raise ValueError(
-                        f"src/dst block count mismatch: {src_block_ids.size} vs "
-                        f"{dst_block_ids.size} (dst must not exceed src)"
-                    )
-                tpb = extractor.page_table.tokens_per_block
+        # Aggregate fragments from all matching pools using numpy concatenation.
+        # Ownership is decided per logical pool because replicated side caches
+        # have different fan-in rules from head-sharded K/V.
+        for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
+            if not self._registrar.should_send_pool(targets, peer_ri, self_lg, self_pi):
+                continue
+            layer_group_pair = (self_lg, peer_lg)
+            if layer_group_pair not in aligned_blocks_by_layer_groups:
                 token_range = task._slice.token_range
                 lg_info = extractor.page_table.layer_groups[self_lg]
-                window_size = getattr(lg_info, "sliding_window_size", None)
-
-                # Block lists are the suffix of [..., slice_end); cached prefix
-                # is implicit in their size. token_start = (total_blocks - n) * tpb.
-                slice_end = token_range.end if token_range is not None else 0
-                total_blocks = (slice_end + tpb - 1) // tpb
-                src_beam0_blocks = Sender._beam0_block_count(
-                    src_block_ids, total_blocks, task._beam_width
-                )
-                dst_beam0_blocks = Sender._beam0_block_count(
-                    dst_block_ids, total_blocks, task._beam_width
-                )
-                assert src_beam0_blocks <= total_blocks, (
-                    f"src beam-0 block list ({src_beam0_blocks}) exceeds total slice "
-                    f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
-                )
-                assert dst_beam0_blocks <= total_blocks, (
-                    f"dst beam-0 block list ({dst_beam0_blocks}) exceeds total slice "
-                    f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
-                )
-                src_start = (total_blocks - src_beam0_blocks) * tpb
-                dst_start = (total_blocks - dst_beam0_blocks) * tpb
-                if req_info.dst_start_token is not None:
-                    dst_start = max(dst_start, req_info.dst_start_token)
-                if window_size is not None:
-                    # SWA stale_end uses the request prompt_len (not slice_end —
-                    # they differ for non-final slices). prompt_len must be plumbed
-                    # via the session; falling back to slice_end is wrong on
-                    # non-final slices.
-                    assert task._prompt_len is not None, (
-                        "SWA layer requires session.prompt_len; "
-                        "set TxSession(prompt_len=request.prompt_len)."
+                aligned_blocks_by_layer_groups[layer_group_pair] = (
+                    Sender._prepare_kv_blocks_for_transfer(
+                        src_block_ids_per_groups[self_lg],
+                        dst_block_ids_per_groups[peer_lg],
+                        tokens_per_block=extractor.page_table.tokens_per_block,
+                        slice_end=token_range.end if token_range is not None else 0,
+                        beam_width=task._beam_width,
+                        dst_start_token=req_info.dst_start_token,
+                        sliding_window_size=getattr(lg_info, "sliding_window_size", None),
+                        prompt_len=task._prompt_len,
                     )
-                    stale_end = max(0, (task._prompt_len + 1 - window_size) // tpb)
-                    src_start = max(stale_end * tpb, src_start)
-                    dst_start = max(stale_end * tpb, dst_start)
-                src_block_ids, dst_block_ids = Sender._align_kv_blocks(
-                    src_block_ids,
-                    dst_block_ids,
-                    src_token_start=src_start,
-                    dst_token_start=dst_start,
-                    tokens_per_block=tpb,
                 )
+            src_block_ids, dst_block_ids = aligned_blocks_by_layer_groups[layer_group_pair]
 
-                src_region = extractor.extract(
-                    src_block_ids, layer_group_id=self_lg, pool_idx=self_pi
-                )
-                dst_region = peer_extractor.extract(
-                    dst_block_ids, layer_group_id=peer_lg, pool_idx=peer_pi
-                )
-                mapper = self._registrar.get_kv_map(peer_ri, (self_lg, self_pi), (peer_lg, peer_pi))
-                region_pair = mapper.map(src_region, dst_region)
-                region_pairs = region_pair if isinstance(region_pair, list) else [region_pair]
-                for rp in region_pairs:
-                    src_frag_parts.append(rp.src.memory.ptrs)
-                    dst_frag_parts.append(rp.dst.memory.ptrs)
-                    size_specs.append((rp.src.memory.ptrs.size, rp.src.memory.bytes_per_region))
+            src_region = extractor.extract(src_block_ids, layer_group_id=self_lg, pool_idx=self_pi)
+            dst_region = peer_extractor.extract(
+                dst_block_ids, layer_group_id=peer_lg, pool_idx=peer_pi
+            )
+            mapper = self._registrar.get_kv_map(peer_ri, (self_lg, self_pi), (peer_lg, peer_pi))
+            region_pair = mapper.map(src_region, dst_region)
+            region_pairs = region_pair if isinstance(region_pair, list) else [region_pair]
+            for rp in region_pairs:
+                src_frag_parts.append(rp.src.memory.ptrs)
+                dst_frag_parts.append(rp.dst.memory.ptrs)
+                size_specs.append((rp.src.memory.ptrs.size, rp.src.memory.bytes_per_region))
 
         if src_frag_parts:
             src_frags = np.concatenate(src_frag_parts)
@@ -1631,10 +1671,10 @@ class Receiver(ReceiverBase):
             finally:
                 messenger.stop()
 
+            rank_info_bytes = self._registrar.self_rank_info.to_bytes()
             for endpoint in sender_info.sender_endpoints:
                 dealer = self._get_or_connect_dealer(endpoint)
-                rank_info = self._registrar.self_rank_info
-                dealer.send([MessageType.REGISTER_RANK_INFO, rank_info.to_bytes()])
+                dealer.send([MessageType.REGISTER_RANK_INFO, rank_info_bytes])
 
             self._sender_ep_instance_map[info_endpoint] = sender_info
             return sender_info
@@ -2241,7 +2281,9 @@ class TransferWorker:
 
     def _setup_peer_infrastructure(self, kvm: KVCacheManager):
         self._rank_info_server = RankInfoServer(self._rank_info) if kvm.mapping.rank == 0 else None
-        self._kv_extractor = KVRegionExtractorV1(kvm)
+        if self._rank_info.page_table is None:
+            raise RuntimeError("RankInfo page table must be initialized before peer setup")
+        self._kv_extractor = KVRegionExtractorV1(self._rank_info.page_table)
         self._peer_registrar = PeerRegistrar(self._rank_info, self._kv_extractor)
 
     def _setup_transfer_engine(self):
