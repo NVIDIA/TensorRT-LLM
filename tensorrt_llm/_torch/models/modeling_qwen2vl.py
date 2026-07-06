@@ -13,6 +13,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
                           PreTrainedModel)
+from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VisionPatchEmbed, Qwen2_5_VisionTransformerPretrainedModel)
 from transformers.models.qwen2_vl.modeling_qwen2_vl import \
@@ -1080,11 +1081,15 @@ class Qwen2VisionModelBase(nn.Module):
         embeds = []
         if pixel_values is not None:
             embed = self.visual(pixel_values, grid_thw=image_grid_thw)
+            if isinstance(embed, BaseModelOutputWithPooling):
+                embed = embed.pooler_output
             embeds.append(embed)
 
         if pixel_values_videos is not None:
-            embeds.append(
-                self.visual(pixel_values_videos, grid_thw=video_grid_thw))
+            embed = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
+            if isinstance(embed, BaseModelOutputWithPooling):
+                embed = embed.pooler_output
+            embeds.append(embed)
         return embeds
 
 
@@ -1948,7 +1953,8 @@ class Qwen2VLModel(Qwen2VLModelBase):
         return [
             "image.pixel_values", "image.image_grid_thw",
             "video.pixel_values_videos", "video.video_grid_thw",
-            "multimodal_embedding"
+            "multimodal_embedding", "mrope_config.mrope_position_ids",
+            "mrope_config.mrope_position_deltas"
         ]
 
     def load_weights(self, weights, weight_mapper: BaseWeightMapper):
