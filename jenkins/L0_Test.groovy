@@ -4402,6 +4402,7 @@ def launchTestJobs(pipeline, testFilter)
         "A30-PyTorch-1": ["a30", "l0_a30", 1, 2],
         "A30-PyTorch-2": ["a30", "l0_a30", 2, 2],
         "A10-CPP-1": ["a10", "l0_a10", 1, 1],
+        "A30-CPP-1": ["a30", "l0_a30", 1, 1],
         "A30-AutoDeploy-1": ["a30", "l0_a30", 1, 1],
         "A100X-PyTorch-1": ["a100x", "l0_a100", 1, 1],
         "L40S-PyTorch-1": ["l40s", "l0_l40s", 1, 2],
