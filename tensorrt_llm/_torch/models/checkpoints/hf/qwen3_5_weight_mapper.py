@@ -36,12 +36,12 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
     2. Linear-attention projections (handled in _pack_split_projections):
        Qwen3Next checkpoints store pre-packed in_proj_qkvz and in_proj_ba
        tensors.  Qwen3.5 checkpoints store them as separate in_proj_qkv + z
-       (or fully split q/k/v/z) and b + a tensors.  This mapper first packs
-       grouped-interleaved QKVZ/BA, then converts it to rank-major consumer
-       order with [Q, K, V, Z, B, A] inside every TP shard.
-       For FP8 block-scale checkpoints, both packed projections are
-       dequantized to bf16 before they are combined
-       (handled in _dequantize_linear_attn_fp8_projections).
+       (or fully split q/k/v/z) and b + a tensors.  This mapper packs them
+       into grouped-interleaved QKVZ/BA. NVFP4 then combines both projections
+       in rank-major consumer order; other quantization modes retain the split
+       runtime layout. For FP8 block-scale checkpoints, quantized projections
+       are dequantized to bf16 before packing while already-unquantized B/A
+       projections remain unchanged.
 
     3. MoE expert tensors (handled in handle_special_instance_module):
        Qwen3.5 BF16 checkpoints store fused gate_up_proj/down_proj per expert

@@ -209,6 +209,9 @@ class Qwen3NextHfWeightMapper(Qwen2MoeHfWeightMapper):
             else:
                 new_weights[key] = weights[name]
 
-        new_weights = self._combine_gdn_input_projections(new_weights, tp_size)
+        quant_config = self.config.quant_config
+        if quant_config is not None and quant_config.quant_mode.has_nvfp4():
+            new_weights = self._combine_gdn_input_projections(
+                new_weights, tp_size)
 
         return new_weights

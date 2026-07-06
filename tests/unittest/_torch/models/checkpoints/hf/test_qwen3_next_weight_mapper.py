@@ -10,9 +10,19 @@ from tensorrt_llm._torch.models.checkpoints.hf.qwen3_5_weight_mapper import Qwen
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3_next_weight_mapper import (
     Qwen3NextHfWeightMapper,
 )
+from tensorrt_llm._torch.models.modeling_qwen3_5 import (
+    Qwen35ConfigCompat,
+    _normalize_qwen35_exclude_modules,
+)
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 
-def _make_mapper(tp_size=1, enable_attention_dp=False) -> Qwen3NextHfWeightMapper:
+def _make_mapper(
+    tp_size=1,
+    enable_attention_dp=False,
+    quant_algo=QuantAlgo.NVFP4,
+) -> Qwen3NextHfWeightMapper:
     mapper = Qwen3NextHfWeightMapper()
     mapper._config = SimpleNamespace(
         pretrained_config=SimpleNamespace(
@@ -27,6 +37,7 @@ def _make_mapper(tp_size=1, enable_attention_dp=False) -> Qwen3NextHfWeightMappe
             tp_rank=0,
             enable_attention_dp=enable_attention_dp,
         ),
+        quant_config=QuantConfig(quant_algo=quant_algo),
     )
     return mapper
 
@@ -141,6 +152,97 @@ def test_combine_gdn_input_projections_rejects_unsupported_tp_size():
 
     with pytest.raises(ValueError, match="must be divisible by TP size 4"):
         mapper._combine_gdn_input_projections({}, tp_size=4)
+
+
+@pytest.mark.parametrize("quant_algo", [None, QuantAlgo.FP8_BLOCK_SCALES])
+def test_preprocess_keeps_split_gdn_input_projections_for_non_nvfp4(quant_algo):
+    mapper = _make_mapper(quant_algo=quant_algo)
+    prefix = "model.layers.0.linear_attn"
+    qkvz = torch.empty((32, 5), dtype=torch.float8_e4m3fn)
+    ba = torch.ones((8, 5), dtype=torch.bfloat16)
+    scale = torch.ones((1, 1), dtype=torch.float32)
+    weights = {
+        f"{prefix}.in_proj_qkvz.weight": qkvz,
+        f"{prefix}.in_proj_qkvz.weight_scale_inv": scale,
+        f"{prefix}.in_proj_ba.weight": ba,
+    }
+
+    preprocessed = mapper.preprocess_weights(weights)
+
+    assert preprocessed[f"{prefix}.in_proj_qkvz.weight"] is qkvz
+    assert preprocessed[f"{prefix}.in_proj_qkvz.weight_scale_inv"] is scale
+    assert preprocessed[f"{prefix}.in_proj_ba.weight"] is ba
+    assert f"{prefix}.in_proj_qkvzba.weight" not in preprocessed
+
+
+@pytest.mark.parametrize(
+    "quant_algo,expected",
+    [
+        (QuantAlgo.NVFP4, "model.layers.1.linear_attn.in_proj_qkvzba*"),
+        (QuantAlgo.FP8_BLOCK_SCALES, "model.layers.1.linear_attn.in_proj_ba*"),
+    ],
+)
+def test_qwen35_exclude_modules_follow_projection_layout(quant_algo, expected):
+    model_config = SimpleNamespace(
+        quant_config=QuantConfig(
+            quant_algo=quant_algo,
+            exclude_modules=["model.language_model.layers.1.linear_attn.in_proj_a"],
+        ),
+        pretrained_config=SimpleNamespace(num_hidden_layers=2),
+    )
+
+    _normalize_qwen35_exclude_modules(model_config)
+
+    assert expected in model_config.quant_config.exclude_modules
+
+
+def test_qwen35_raw_fp8_excludes_map_to_split_projections():
+    normalized = Qwen35ConfigCompat._normalize_exclude_modules(
+        [
+            "model.language_model.layers.1.linear_attn.in_proj_qkv",
+            "model.language_model.layers.1.linear_attn.in_proj_a",
+        ]
+    )
+
+    assert normalized == [
+        "model.layers.1.linear_attn.in_proj_ba",
+        "model.layers.1.linear_attn.in_proj_qkvz",
+    ]
+
+
+def test_qwen35_fp8_preprocess_dequantizes_and_keeps_split_projections():
+    mapper = Qwen3_5MoeHfWeightMapper()
+    mapper._config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(
+            num_hidden_layers=1,
+            num_experts=1,
+            linear_num_key_heads=1,
+            linear_num_value_heads=1,
+            linear_key_head_dim=128,
+            linear_value_head_dim=128,
+            torch_dtype=torch.bfloat16,
+        ),
+        mapping=SimpleNamespace(tp_size=1, tp_rank=0, enable_attention_dp=False),
+        quant_config=QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES),
+    )
+    prefix = "model.language_model.layers.0.linear_attn"
+    weights = {
+        f"{prefix}.in_proj_qkv.weight": torch.ones((384, 128), dtype=torch.float8_e4m3fn),
+        f"{prefix}.in_proj_qkv.weight_scale_inv": torch.ones((3, 1)),
+        f"{prefix}.in_proj_z.weight": torch.ones((128, 128), dtype=torch.float8_e4m3fn),
+        f"{prefix}.in_proj_z.weight_scale_inv": torch.ones((1, 1)),
+        f"{prefix}.in_proj_b.weight": torch.ones((1, 128), dtype=torch.bfloat16),
+        f"{prefix}.in_proj_a.weight": torch.ones((1, 128), dtype=torch.bfloat16),
+    }
+
+    preprocessed = mapper.preprocess_weights(weights)
+    runtime_prefix = "model.layers.0.linear_attn"
+
+    assert preprocessed[f"{runtime_prefix}.in_proj_qkvz.weight"].shape == (512, 128)
+    assert preprocessed[f"{runtime_prefix}.in_proj_qkvz.weight"].dtype == torch.bfloat16
+    assert preprocessed[f"{runtime_prefix}.in_proj_ba.weight"].shape == (2, 128)
+    assert f"{runtime_prefix}.in_proj_qkvzba.weight" not in preprocessed
+    assert not any(name.endswith("weight_scale_inv") for name in preprocessed)
 
 
 def test_dequantize_linear_attn_fp8_projections_handles_qkvz_and_ba():
