@@ -36,9 +36,10 @@ def top_k_top_p_sampling_from_logits_op(
     seed: Optional[int] = None,
     offset: Optional[int] = None,
 ) -> torch.Tensor:
-    return flashinfer.sampling.top_k_top_p_sampling_from_logits(
+    tokens: torch.Tensor = flashinfer.sampling.top_k_top_p_sampling_from_logits(
         logits, top_k, top_p, seed=seed, offset=offset
     )
+    return tokens
 
 
 def sampling_from_probs_op(
@@ -46,30 +47,36 @@ def sampling_from_probs_op(
     seed: Optional[torch.Tensor] = None,
     offset: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    return flashinfer.sampling.sampling_from_probs(
+    tokens: torch.Tensor = flashinfer.sampling.sampling_from_probs(
         probs, deterministic=True, seed=seed, offset=offset
     )
+    return tokens
 
 
 def softmax_op(
     logits: torch.Tensor,
     temperature: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    return flashinfer.sampling.softmax(logits, temperature, enable_pdl=get_env_enable_pdl())
+    probs: torch.Tensor = flashinfer.sampling.softmax(
+        logits, temperature, enable_pdl=get_env_enable_pdl()
+    )
+    return probs
 
 
 def top_k_mask_logits_op(
     logits: torch.Tensor,
     top_k: torch.Tensor,
 ) -> torch.Tensor:
-    return flashinfer.sampling.top_k_mask_logits(logits, top_k)
+    masked: torch.Tensor = flashinfer.sampling.top_k_mask_logits(logits, top_k)
+    return masked
 
 
 def top_p_renorm_probs_op(
     probs: torch.Tensor,
     top_p: torch.Tensor,
 ) -> torch.Tensor:
-    return flashinfer.sampling.top_p_renorm_probs(probs, top_p)
+    renormed: torch.Tensor = flashinfer.sampling.top_p_renorm_probs(probs, top_p)
+    return renormed
 
 
 def sampling_from_probs_generator_op(
@@ -77,9 +84,10 @@ def sampling_from_probs_generator_op(
     generator: Optional[torch.Generator],
     check_nan: bool = False,
 ) -> torch.Tensor:
-    return flashinfer.sampling.sampling_from_probs(
+    tokens: torch.Tensor = flashinfer.sampling.sampling_from_probs(
         probs, deterministic=True, generator=generator, check_nan=check_nan
     )
+    return tokens
 
 
 def top_k_top_p_sampling_from_logits_with_generator_op(
@@ -89,7 +97,7 @@ def top_k_top_p_sampling_from_logits_with_generator_op(
     generator: Optional[torch.Generator],
     check_nan: bool = False,
 ) -> torch.Tensor:
-    return flashinfer.sampling.top_k_top_p_sampling_from_logits(
+    tokens: torch.Tensor = flashinfer.sampling.top_k_top_p_sampling_from_logits(
         logits,
         top_k=top_k,
         top_p=top_p,
@@ -98,6 +106,7 @@ def top_k_top_p_sampling_from_logits_with_generator_op(
         check_nan=check_nan,
         generator=generator,
     )
+    return tokens
 
 
 def top_k_sampling_from_probs_generator_op(
@@ -106,13 +115,14 @@ def top_k_sampling_from_probs_generator_op(
     generator: Optional[torch.Generator],
     check_nan: bool = False,
 ) -> torch.Tensor:
-    return flashinfer.sampling.top_k_sampling_from_probs(
+    tokens: torch.Tensor = flashinfer.sampling.top_k_sampling_from_probs(
         probs,
         top_k=top_k,
         deterministic=True,
         check_nan=check_nan,
         generator=generator,
     )
+    return tokens
 
 
 def top_p_sampling_from_probs_generator_op(
@@ -121,13 +131,14 @@ def top_p_sampling_from_probs_generator_op(
     generator: Optional[torch.Generator],
     check_nan: bool = False,
 ) -> torch.Tensor:
-    return flashinfer.sampling.top_p_sampling_from_probs(
+    tokens: torch.Tensor = flashinfer.sampling.top_p_sampling_from_probs(
         probs,
         top_p=top_p,
         deterministic=True,
         check_nan=check_nan,
         generator=generator,
     )
+    return tokens
 
 
 def compute_probs_from_logits_op(
@@ -144,7 +155,9 @@ def compute_probs_from_logits_op(
     """
     if top_k is not None:
         logits = flashinfer.sampling.top_k_mask_logits(logits, top_k)
-    probs = flashinfer.sampling.softmax(logits, temperatures, enable_pdl=get_env_enable_pdl())
+    probs: torch.Tensor = flashinfer.sampling.softmax(
+        logits, temperatures, enable_pdl=get_env_enable_pdl()
+    )
     if top_p is not None:
         probs = flashinfer.sampling.top_p_renorm_probs(probs, top_p)
     return probs

@@ -1937,7 +1937,9 @@ class TestBatchedSampling:
                 nonlocal flashinfer_keys_seen
                 assert (group_key, return_probs) not in flashinfer_keys_seen
                 flashinfer_keys_seen.add((group_key, return_probs))
-                return sample_grouped_strategies_orig(
+                result: tuple[
+                    torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor] | float
+                ] = sample_grouped_strategies_orig(
                     group_key,
                     strategies,
                     logits,
@@ -1945,6 +1947,7 @@ class TestBatchedSampling:
                     generator=generator,
                     return_probs=return_probs,
                 )
+                return result
 
             # _grouped_sampler_cls is a class; point the instance at a subclass
             # that overrides the callable, rather than mutating the shared class.

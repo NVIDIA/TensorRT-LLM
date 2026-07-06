@@ -941,9 +941,10 @@ def compute_probs_from_logits(
     if logits.is_cuda:
         # TRT-LLM C++ op (CUDA, no flashinfer). The op keeps a skip_temperature
         # flag; temperature is always applied here.
-        return torch.ops.trtllm.compute_probs_from_logits_op(
+        probs: torch.Tensor = torch.ops.trtllm.compute_probs_from_logits_op(
             logits, temperatures, top_k, top_p, False
         )
+        return probs
     return vanilla.compute_probs_from_logits_op(logits, temperatures, top_k, top_p)
 
 
