@@ -3,7 +3,7 @@
 """Multimodal utilities for handling images and other media types in TensorRT-LLM."""
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -503,6 +503,12 @@ class MultimodalParams:
     multimodal_data: Optional[Dict[str, Any]] = field(default_factory=dict)
     multimodal_runtime: Optional[MultimodalRuntimeData] = None
     input_ids_start_offset: int = 0
+    # Prompt-order manifest of data-backed multimodal items, recorded by
+    # ``MultimodalDataTracker`` in content-parts order. Each entry is
+    # ``{"modality": m, "index": i}`` where ``i`` addresses
+    # ``multi_modal_data[m]``. Consumed by encoders that interleave items
+    # across modalities in prompt order (e.g. Qwen3-VL mixed image+video).
+    mm_item_order: Optional[List[Dict[str, Union[str, int]]]] = None
     # CUDA event recorded on a side stream by the MM encoder prefetch path.
     # When set, the consume site in `get_multimodal_embeddings` issues a
     # `wait_event` on the current stream before reading cached embeddings.
@@ -814,11 +820,20 @@ def _update_hash(hasher, item: object) -> None:
     hasher.update(serialize_item(item))
 
 
-def apply_mm_hashes(
-    mm_data: Dict[str, Any],
-    mm_uuids: Optional[Dict[str, List[Optional[str]]]] = None,
-    hash_lib=default_hasher
-) -> Tuple[Dict[str, List[str]], Optional[Dict[str, List[Optional[str]]]]]:
+class MMHashResult(NamedTuple):
+    """Per-modality outputs from :func:`apply_mm_hashes`.
+
+    Named to disambiguate the two parallel-indexed dicts. Callers can still
+    tuple-unpack (``hashes, uuids = apply_mm_hashes(...)``) or index by
+    position — ``NamedTuple`` supports both.
+    """
+    hashes: Dict[str, List[str]]
+    uuids: Optional[Dict[str, List[Optional[str]]]]
+
+
+def apply_mm_hashes(mm_data: Dict[str, Any],
+                    mm_uuids: Optional[Dict[str, List[Optional[str]]]] = None,
+                    hash_lib=default_hasher) -> "MMHashResult":
     """Apply hashing to multimodal data, one hash per multimodal item.
 
     When a UUID is provided for an item, the hash is computed from both the UUID
@@ -906,7 +921,10 @@ def apply_mm_hashes(
         mm_hashes[modality] = hashes
         mm_uuids_by_key[modality] = uuids
 
-    return mm_hashes, mm_uuids_by_key if mm_uuids is not None else None
+    return MMHashResult(
+        hashes=mm_hashes,
+        uuids=mm_uuids_by_key if mm_uuids is not None else None,
+    )
 
 
 def hexdigest_to_int32(hex_digest: str) -> List[int]:

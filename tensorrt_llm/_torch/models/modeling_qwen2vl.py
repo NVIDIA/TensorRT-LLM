@@ -901,15 +901,6 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
 
         fused_input_ids = processed_inputs['input_ids'][0]
         if mm_data:
-            # Derive the manifest from the pre-expansion text: at this stage
-            # each `<|image_pad|>` / `<|video_pad|>` occurrence corresponds to
-            # exactly one media item, so one match == one item (post-expansion
-            # would have video-frame timestamp bracketing to unwind).
-            multimodal_data["mm_item_order"] = self.derive_mm_item_order(
-                text_prompt,
-                image_placeholder="<|image_pad|>",
-                video_placeholder="<|video_pad|>",
-            )
             fused_input_ids = self._postprocess(fused_input_ids)
 
         return fused_input_ids.to(torch.int32).tolist(), {

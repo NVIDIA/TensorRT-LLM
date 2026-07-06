@@ -1,5 +1,4 @@
 import enum
-import re
 import traceback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -513,48 +512,6 @@ class BaseMultimodalInputProcessor(ABC):
             image_h, image_w = image.height, image.width
         return self.get_num_multimodal_tokens([(image_h, image_w)],
                                               **kwargs)["num_image_tokens"][0]
-
-    def derive_mm_item_order(
-        self,
-        text: str,
-        *,
-        image_placeholder: Optional[str] = None,
-        video_placeholder: Optional[str] = None,
-    ) -> List[Dict[str, Union[str, int]]]:
-        """Walk the pre-expansion prompt ``text`` and return a prompt-order manifest of multimodal items.
-
-        Each returned entry has the form
-        ``{"modality": "image" | "video", "index": int}`` where ``index`` is the
-        0-based running counter within that modality (i.e. matches the position
-        of the item in ``multimodal_data["image"|"video"]``).
-
-        Runs BEFORE the HF processor expands placeholders, so each placeholder
-        string occurrence corresponds to exactly one media item — no
-        bracketing or timestamp-token complications.
-
-        A missing placeholder string (``None``) means that modality is not
-        recognized and will not be emitted.
-        """
-        if not text:
-            return []
-        patterns: List[Tuple[str, str]] = []
-        if image_placeholder:
-            patterns.append((image_placeholder, "image"))
-        if video_placeholder:
-            patterns.append((video_placeholder, "video"))
-        if not patterns:
-            return []
-        combined = "|".join(f"(?P<{modality}>{re.escape(pat)})"
-                            for pat, modality in patterns)
-        order: List[Dict[str, Union[str, int]]] = []
-        counters: Dict[str, int] = {"image": 0, "video": 0}
-        for m in re.finditer(combined, text):
-            modality = m.lastgroup
-            if modality is None:
-                continue
-            order.append({"modality": modality, "index": counters[modality]})
-            counters[modality] += 1
-        return order
 
     def get_num_tokens_per_video(
         self,
@@ -1153,8 +1110,7 @@ def create_input_processor_with_hash(
         # `mm_hashes_flat`, `start_positions`, and `num_mm_tokens` all index
         # the same items at the same offsets. Fall back to the single-modality
         # bucket when no prompt-order manifest is present.
-        mm_item_order = extra_processed_inputs.get("multimodal_data",
-                                                   {}).get("mm_item_order")
+        mm_item_order = inputs.get("mm_item_order")
         if mm_item_order:
             num_mm_tokens = [
                 num_mm_tokens_by_key[e["modality"]][e["index"]]
@@ -1211,8 +1167,7 @@ def create_input_processor_with_hash(
         # above): the radix-tree cache key indexes each item's digest by its
         # `start_positions` offset, so per-modality dict order would misalign
         # hashes when a request interleaves modalities.
-        mm_item_order = extra_processed_inputs.get("multimodal_data",
-                                                   {}).get("mm_item_order")
+        mm_item_order = inputs.get("mm_item_order")
         if mm_item_order:
             mm_hashes_flat = [
                 mm_hashes[e["modality"]][e["index"]] for e in mm_item_order

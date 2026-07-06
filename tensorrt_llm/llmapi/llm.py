@@ -905,12 +905,16 @@ class BaseLLM:
                 "prompt")  # This is the text prompt, if present.
             if extra_processed_inputs is not None:
                 query_token_ids = extra_processed_inputs.get('query_token_ids')
-                # Create unified MultimodalParams
+                # Create unified MultimodalParams. ``mm_item_order`` is
+                # populated upstream by ``MultimodalDataTracker`` (via
+                # chat_utils) and carried through the request dict; it does
+                # not need to be produced by the input processor.
                 multimodal_params = MultimodalParams(
                     multimodal_input=extra_processed_inputs.get(
                         'multimodal_input'),
                     multimodal_data=extra_processed_inputs.get(
-                        'multimodal_data'))
+                        'multimodal_data'),
+                    mm_item_order=inputs.get("mm_item_order"))
                 # Only pass it if it has content
                 if not multimodal_params.has_content():
                     multimodal_params = None

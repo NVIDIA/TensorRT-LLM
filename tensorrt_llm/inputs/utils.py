@@ -372,6 +372,11 @@ class MultimodalDataTracker:
         self._embeddings = defaultdict[str, list](list)
         self._placeholder_counts = defaultdict[str, int](int)
         self._placeholder_to_modality: dict[str, str] = {}
+        # Prompt-order manifest of data-backed items, populated by add_data.
+        # Each entry is ``{"modality": m, "index": i}`` where ``i`` indexes
+        # into ``self._data[m]``. Embedding-backed items are skipped since
+        # the encoder-interleave manifest addresses raw payload only.
+        self._item_order: list[dict[str, Union[str, int]]] = []
         self._multimodal_server_config = multimodal_server_config if multimodal_server_config is not None else MultimodalServerConfig(
         )
         # Per-request override merged with the server default at media-load
@@ -440,6 +445,11 @@ class MultimodalDataTracker:
             self._embeddings[media_type]) + 1
         placeholder = retrieve_multimodal_placeholder(self._model_type,
                                                       media_type, current_count)
+        if not is_embedding:
+            self._item_order.append({
+                "modality": media_type,
+                "index": len(self._data[media_type]),
+            })
         (self._embeddings
          if is_embedding else self._data)[media_type].append(data)
         if placeholder:
@@ -454,6 +464,17 @@ class MultimodalDataTracker:
     def placeholder_modalities(self) -> Dict[str, str]:
         """Get the mapping from placeholder string to modality name."""
         return dict(self._placeholder_to_modality)
+
+    def item_order(self) -> List[Dict[str, Union[str, int]]]:
+        """Prompt-order manifest of data-backed items.
+
+        Each entry is ``{"modality": m, "index": i}`` where ``i`` addresses
+        the item's position in ``multi_modal_data[m]``. Populated in
+        content-parts order by ``add_data`` — the same order the placeholders
+        will occupy in the rendered prompt for models that opt into
+        ``interleave_placeholders=True``.
+        """
+        return list(self._item_order)
 
 
 def add_multimodal_placeholders(model_type: str, text_prompt: str,
@@ -923,6 +944,9 @@ def default_multimodal_input_loader(
                 input[
                     "multi_modal_data"], _ = mm_data_tracker.retrieve_all_sync(
                     )
+            item_order = mm_data_tracker.item_order()
+            if item_order:
+                input["mm_item_order"] = item_order
         inputs.append(input)
 
     return inputs

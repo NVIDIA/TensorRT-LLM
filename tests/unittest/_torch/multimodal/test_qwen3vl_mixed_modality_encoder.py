@@ -61,9 +61,7 @@ def _make_param(image=None, video=None, order=None):
         data["image"] = image
     if video is not None:
         data["video"] = video
-    if order is not None:
-        data["mm_item_order"] = order
-    return SimpleNamespace(multimodal_data=data)
+    return SimpleNamespace(multimodal_data=data, mm_item_order=order)
 
 
 def _make_item_patches(marker: int, patches: int, dim: int = 2):
@@ -168,3 +166,65 @@ def test_batch_of_two_requests_single_modality_each():
     assert len(embeds) == 1
     expected = torch.tensor([1.0] * 2 + [2.0] * 3, dtype=torch.float32)
     assert torch.equal(embeds[0][:, 0], expected)
+
+
+def test_batch_unordered_mixed_request_raises_even_alongside_ordered_one():
+    """A mixed-modality request without a manifest must still be rejected
+    per-request, even when a sibling request in the same batch carries a
+    valid manifest and would otherwise route the batch through the
+    interleave path."""
+    enc = _make_encoder()
+    params = [
+        _make_param(
+            image={
+                "pixel_values": _make_item_patches(marker=10, patches=2),
+                "image_grid_thw": torch.tensor([[1, 1, 2]]),
+            },
+            video={
+                "pixel_values_videos": _make_item_patches(marker=20, patches=2),
+                "video_grid_thw": torch.tensor([[1, 1, 2]]),
+            },
+            order=[
+                {"modality": "image", "index": 0},
+                {"modality": "video", "index": 0},
+            ],
+        ),
+        _make_param(
+            image={
+                "pixel_values": _make_item_patches(marker=30, patches=1),
+                "image_grid_thw": torch.tensor([[1, 1, 1]]),
+            },
+            video={
+                "pixel_values_videos": _make_item_patches(marker=40, patches=1),
+                "video_grid_thw": torch.tensor([[1, 1, 1]]),
+            },
+            # No manifest on this request even though it has both modalities.
+        ),
+    ]
+    with pytest.raises(ValueError, match="mm_item_order"):
+        enc.forward(params)
+
+
+def test_batch_of_image_only_and_video_only_requests_raises_framework_limit():
+    """Two single-modality requests of different modalities in one batch
+    do not require a per-request manifest (neither is mixed), but Qwen3-VL
+    does not currently split the two-branch encoder output back to
+    per-request. Assert the framework-limitation error rather than silent
+    modality drop."""
+    enc = _make_encoder()
+    params = [
+        _make_param(
+            image={
+                "pixel_values": _make_item_patches(marker=1, patches=2),
+                "image_grid_thw": torch.tensor([[1, 1, 2]]),
+            }
+        ),
+        _make_param(
+            video={
+                "pixel_values_videos": _make_item_patches(marker=2, patches=3),
+                "video_grid_thw": torch.tensor([[1, 1, 3]]),
+            }
+        ),
+    ]
+    with pytest.raises(ValueError, match="does not currently support batching image-only"):
+        enc.forward(params)

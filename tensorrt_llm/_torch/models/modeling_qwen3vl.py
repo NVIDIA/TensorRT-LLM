@@ -1062,11 +1062,26 @@ class Qwen3VisionModelBase(nn.Module):
     def _parse_and_batch_multimodal_data(
         self, multimodal_params: List[MultimodalParams]
     ) -> Tuple[Dict[str, Any], Dict[str, List[Any]]]:
-        # Mixed image+video within a single request needs the ViT to see rows
-        # in prompt order. Detect and delegate; single-modality requests fall
-        # through to the unchanged per-modality contiguous path below.
+        # Per-request validation: any individual request carrying both
+        # modalities MUST provide a prompt-order manifest. Batch-level checks
+        # would false-positive on heterogeneous single-modality batches
+        # (image-only request batched with a video-only request).
+        for mp in multimodal_params:
+            data = mp.multimodal_data or {}
+            if (
+                data.get("image") is not None
+                and data.get("video") is not None
+                and not mp.mm_item_order
+            ):
+                raise ValueError(
+                    "Qwen3-VL mixed-modality requests must carry mm_item_order on MultimodalParams."
+                )
+
+        # Any mixed request in the batch triggers the interleave path;
+        # single-modality (per-request) requests piggyback on it. Otherwise
+        # fall through to the unchanged per-modality contiguous path below.
         if any(
-            mp.multimodal_data.get("mm_item_order")
+            mp.mm_item_order
             and mp.multimodal_data.get("image") is not None
             and mp.multimodal_data.get("video") is not None
             for mp in multimodal_params
@@ -1136,7 +1151,7 @@ class Qwen3VisionModelBase(nn.Module):
         grids: List[torch.Tensor] = []
         for mp in multimodal_params:
             data = mp.multimodal_data
-            order = data.get("mm_item_order") or []
+            order = mp.mm_item_order or []
             img = data.get("image") or {}
             vid = data.get("video") or {}
             img_pv, img_thw = img.get("pixel_values"), img.get("image_grid_thw")
@@ -1186,16 +1201,19 @@ class Qwen3VisionModelBase(nn.Module):
         image_grid_thw = mm_extra_data.get("image_grid_thw", None)
         video_grid_thw = mm_extra_data.get("video_grid_thw", None)
 
-        # The interleave path collapses both modalities into "pixel_values" +
-        # "image_grid_thw", so seeing both keys populated here means a mixed
-        # request slipped through without a manifest — we can't guarantee
-        # prompt-order embeddings, so refuse rather than emit misordered rows.
+        # Reaching here with both keys populated means the batch contained
+        # a mix of image-only and video-only single-modality requests
+        # (mixed-modality requests would have been dispatched to the
+        # interleave path above). The two-branch encoder call below returns
+        # per-modality embed tensors that downstream cannot split back to
+        # per-request without additional plumbing — refuse rather than
+        # silently drop modalities.
         if pixel_values is not None and pixel_values_videos is not None:
             raise ValueError(
-                "Qwen3-VL vision encoder received both pixel_values and "
-                "pixel_values_videos without a prompt-order manifest "
-                "(mm_item_order). Mixed-modality requests must carry "
-                "mm_item_order on multimodal_data."
+                "Qwen3-VL does not currently support batching image-only "
+                "and video-only requests together. Route them to separate "
+                "encoder batches, or make each mixed request carry "
+                "mm_item_order."
             )
 
         embeds: List[torch.Tensor] = []
@@ -1621,12 +1639,12 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
         placeholders_separator="",
         content_format=ContentFormat.STRING,
-        # Place ``<|image_pad|>`` / ``<|video_pad|>`` at their content-part
-        # position (via ``interleave_mm_placeholders`` in chat_utils) so the
-        # rendered text is the source of truth for per-item prompt order —
-        # required by ``derive_mm_item_order`` and downstream cache/encoder
-        # ordering. ``placeholder_placement`` above is retained as the
-        # fallback for callers that don't provide ``content_parts``.
+        # Place `<|image_pad|>` / `<|video_pad|>` at their content-part
+        # position (via `interleave_mm_placeholders` in chat_utils) so the
+        # rendered prompt token order agrees with the `mm_item_order`
+        # manifest recorded by `MultimodalDataTracker`.
+        # `placeholder_placement` above is retained as the fallback for
+        # callers that don't provide `content_parts`.
         interleave_placeholders=True,
     ),
 )
