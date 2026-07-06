@@ -33,6 +33,7 @@ from .modeling_kimi_k25 import KimiK25ForConditionalGeneration
 from .modeling_laguna import LagunaForCausalLM
 from .modeling_llama import LlamaForCausalLM
 from .modeling_llava_next import LlavaNextModel
+from .modeling_minicpmv4_6 import MiniCPMV4_6Model
 from .modeling_minimaxm2 import MiniMaxM2ForCausalLM
 from .modeling_minimaxm3 import (MiniMaxM3ForCausalLM,
                                  MiniMaxM3VLForConditionalGeneration)
@@ -89,6 +90,7 @@ __all__ = [
     "KimiK25ForConditionalGeneration",
     "LlamaForCausalLM",
     "LlavaNextModel",
+    "MiniCPMV4_6Model",
     "Mistral3VLM",
     "MistralForCausalLM",
     "MixtralForCausalLM",

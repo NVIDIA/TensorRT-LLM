@@ -369,6 +369,77 @@ def is_qwen_image_bench_config(config_dict: dict) -> bool:
             and required_multimodal_token_ids.issubset(config_dict))
 
 
+def _resolve_composite_torch_dtype(*config_dicts: dict) -> torch.dtype:
+    """Resolve a concrete torch dtype from one or more raw config dicts.
+
+    Respects an explicit ``torch_dtype``/``dtype`` declaration (string or
+    ``torch.dtype``) from the first dict that provides one, and otherwise falls
+    back to ``bfloat16`` (TensorRT-LLM's default, matching the checkpoint).
+    """
+    for config_dict in config_dicts:
+        for key in ("torch_dtype", "dtype"):
+            coerced = _coerce_torch_dtype(config_dict.get(key))
+            if coerced is not None:
+                return coerced
+    return torch.bfloat16
+
+
+def _build_minicpmv4_6_config(
+        config_dict: dict) -> transformers.PretrainedConfig:
+    """Build the composite MiniCPM-V 4.6 config from a raw config.json dict.
+
+    The top-level ``minicpmv4_6`` model_type is only known to
+    ``transformers>=5.7.0``; rebuild it locally so the PyTorch backend loads on
+    older releases.  The inner text tower is normalized into a
+    ``Qwen3NextConfig`` through the shared ``Qwen35ConfigCompat`` shim (the same
+    path standalone Qwen3.5 dense uses), and the top-level ``model_type`` is kept
+    as ``minicpmv4_6`` so ``MULTIMODAL_PLACEHOLDER_REGISTRY`` lookup succeeds.
+
+    TODO: this local builder is a transition path for the repo's pinned
+    transformers 5.5.4.  Once the pin is bumped to ``>=5.7.0``, drop the
+    ``MiniCPMV4_6Config`` shim and build the config from the native
+    ``transformers.MiniCPMV4_6Config`` instead.
+    """
+    from tensorrt_llm._torch.configs.minicpmv4_6 import MiniCPMV4_6Config
+    from tensorrt_llm._torch.models.modeling_qwen3_5 import Qwen35ConfigCompat
+
+    # Extract + normalize the Qwen3.5 dense text tower (rope flatten,
+    # quantization inheritance, architectures -> Qwen3_5ForCausalLM). MiniCPM-V
+    # 4.6 always nests its language model under ``text_config``, so force
+    # extraction of that nested config (same path Qwen-Image-Bench uses).
+    text_dict = Qwen35ConfigCompat.normalize(config_dict,
+                                             require_text_config=True)
+    text_config = transformers.Qwen3NextConfig.from_dict(text_dict)
+
+    # MiniCPM-V 4.6's config.json declares no torch_dtype/dtype (neither at the
+    # top level nor inside text_config).  Several engine-build paths read
+    # ``pretrained_config.torch_dtype`` directly with no fallback -- the hybrid
+    # (mamba) KV-cache byte sizing and ``validate_and_set_mamba_ssm_cache_dtype``
+    # -- so a ``None`` dtype crashes with ``None.itemsize``.  Pin a concrete
+    # dtype on both the text tower and the composite config so every downstream
+    # consumer (config validation before model build, and the post_config swap
+    # that replaces pretrained_config with the inner text_config) agrees.
+    resolved_dtype = _resolve_composite_torch_dtype(config_dict, text_dict)
+    text_config.torch_dtype = resolved_dtype
+
+    composite_config = MiniCPMV4_6Config(
+        text_config=text_config,
+        vision_config=config_dict.get("vision_config"),
+        insert_layer_id=config_dict.get("insert_layer_id", 6),
+        image_size=config_dict.get("image_size", 448),
+        drop_vision_last_layer=config_dict.get("drop_vision_last_layer", False),
+        image_token_id=config_dict.get("image_token_id"),
+        video_token_id=config_dict.get("video_token_id"),
+        downsample_mode=config_dict.get("downsample_mode", "16x"),
+        merge_kernel_size=config_dict.get("merge_kernel_size", (2, 2)),
+        merger_times=config_dict.get("merger_times", 1),
+        tie_word_embeddings=config_dict.get("tie_word_embeddings", False),
+        architectures=config_dict.get("architectures"),
+    )
+    composite_config.torch_dtype = resolved_dtype
+    return composite_config
+
+
 # TODO: remove this once the transformers can support all of those models in _CONFIG_REGISTRY
 class LazyConfigDict(dict):
 
@@ -452,6 +523,10 @@ def load_pretrained_config(model_name_or_path: str,
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,
                                                     **kwargs)
+    elif model_type == "minicpmv4_6" or (
+            architectures
+            and architectures[0] == "MiniCPMV4_6ForConditionalGeneration"):
+        model_config = _build_minicpmv4_6_config(config_dict)
     elif model_type in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe",
                         "qwen3_5_moe_text") or (
                             architectures and architectures[0] in (
