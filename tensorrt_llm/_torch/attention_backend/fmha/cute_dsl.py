@@ -56,13 +56,6 @@ class CuteDslMlaFmha(PhasedFmha):
         if not attn.is_mla_enable:
             logger.debug("CuTe DSL MLA FMHA is unavailable: only MLA is supported.")
             return False
-        # predicted_tokens_per_seq == seq_len_q (spec_config.tokens_per_gen_step,
-        # = max_draft_len + 1; 1 when no spec-decode). No hard upper bound here:
-        # the decode kernel folds up to F = min(seq_len_q, M_tile // num_heads)
-        # query tokens into the head dimension, and the per-request gate's
-        # can_implement check is the authority on what the kernel can serve. A
-        # [1, 4] cap here silently excluded CuteDSL from fmha_libs entirely for
-        # MTP draft_len > 3 (e.g. seq_len_q=8), so it was never even consulted.
         if attn.predicted_tokens_per_seq is None or attn.predicted_tokens_per_seq < 1:
             logger.debug(
                 "CuTe DSL MLA FMHA is unavailable: predicted_tokens_per_seq "
@@ -188,17 +181,6 @@ class CuteDslMlaFmha(PhasedFmha):
                 f"B={batch_size}, page_size={page_size}).",
             )
         return True, ""
-
-    # ---- split-KV (KV-dimension parallelism) -----------------------------
-    # The decode kernel's MMA grid is starved when batch_size is small: with
-    # split_kv=1 only ~batch*heads CTAs launch, so attention-DP (batch ≈
-    # concurrency/tp) leaves most SMs idle. Splitting the KV dimension lets
-    # multiple CTAs cooperate on one sequence (partials reduced via an fp32
-    # workspace). The best split is shape-dependent; choosing it is owned
-    # ENTIRELY by the op's AutoTuner (profiled per shape over
-    # ``CuteDSLNVMlaDecodeBlackwellRunner.get_split_kv_candidates``, cached, and
-    # baked into the CUDA graph at capture). This FMHA layer only sizes the
-    # workspace for the largest candidate; see ``_run_mla_decode``.
 
     def is_supported(
         self,
