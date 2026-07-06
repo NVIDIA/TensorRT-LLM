@@ -473,20 +473,18 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 device='cpu',
                 pin_memory=prefer_pinned(),
             )
-            self._helix_flat_prompt_lens_cuda = self.get_empty(
-                buffers,
-                (self.max_num_tokens, ),
-                cache_name="helix_flat_prompt_lens_cuda",
-                dtype=torch.int,
-                capture_graph=capture_graph,
-            )
+            # Host-only prompt lengths for the flattened rows; the generation
+            # kernel reads only host_context_lengths, so no device copy is kept.
             self._helix_flat_prompt_lens_cpu = torch.empty_like(
-                self._helix_flat_prompt_lens_cuda,
+                self._helix_flat_kv_lens_cuda,
                 device='cpu',
                 pin_memory=prefer_pinned(),
             )
+            # Flattened rows are all generation requests (RequestType 1); the
+            # buffer is read as all-ones, so fill it once.
             self._helix_flat_request_types_cpu = torch.empty_like(
                 self._helix_flat_prompt_lens_cpu)
+            self._helix_flat_request_types_cpu.fill_(1)
             self._helix_flat_cu_q_seqlens = self.get_empty(
                 buffers,
                 (self.max_num_tokens + 1, ),
@@ -577,10 +575,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self._helix_flat_kv_lens_cuda[:total_q].copy_(
             self._helix_flat_kv_lens_cpu[:total_q], non_blocking=True)
         self._helix_flat_prompt_lens_cpu[:total_q].copy_(flat_prompt)
-        self._helix_flat_prompt_lens_cuda[:total_q].copy_(
-            self._helix_flat_prompt_lens_cpu[:total_q], non_blocking=True)
-        # Every flattened request is a generation request (RequestType 1).
-        self._helix_flat_request_types_cpu[:total_q].fill_(1)
+        # _helix_flat_request_types_cpu is pre-filled with 1s at construction.
 
         # q_len == 1 per request -> cu_q_seqlens = [0, 1, 2, ..., total_q].
         q_offsets = torch.arange(total_q + 1, dtype=torch.int)
@@ -669,7 +664,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
         self.kv_lens_cuda_runtime = self._helix_flat_kv_lens_cuda[:n]
         self.kv_lens_runtime = self._helix_flat_kv_lens_cpu[:n]
-        self.prompt_lens_cuda_runtime = self._helix_flat_prompt_lens_cuda[:n]
+        # Device prompt-lens view is only shape-checked, never read here; alias
+        # the kv-lens buffer to satisfy the assertion without a separate copy.
+        self.prompt_lens_cuda_runtime = self._helix_flat_kv_lens_cuda[:n]
         self.prompt_lens_cpu_runtime = self._helix_flat_prompt_lens_cpu[:n]
         self.host_request_types_runtime = self._helix_flat_request_types_cpu[:n]
         self.host_total_kv_lens[0] = self._helix_flat_host_total_kv_lens[0]

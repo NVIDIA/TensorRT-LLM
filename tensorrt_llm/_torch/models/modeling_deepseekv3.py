@@ -1420,7 +1420,6 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-
         # Self Attention
         hidden_states = self.self_attn(
             position_ids=position_ids,
@@ -1430,7 +1429,6 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 enable_allreduce=not (self.disable_attn_allreduce)),
             **kwargs,
         )
-
         residual = maybe_slice_for_helix_cp(residual, attn_metadata,
                                             self.mapping_with_cp,
                                             self.layer_idx)
@@ -1438,7 +1436,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             if spec_metadata is not None and spec_metadata.is_layer_capture(
                     self.layer_idx):
                 self.fusion_config.POST_MOE_FUSION = False
-            hidden_states, residual = self.forward_MoE(
+            return self.forward_MoE(
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 residual=residual,
@@ -1449,13 +1447,11 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                     self.layer_idx):
                 self.fusion_config.POST_MLP_FUSION = False
             assert isinstance(self.mlp, GatedMLP)
-            hidden_states, residual = self.forward_mlp(
+            return self.forward_mlp(
                 hidden_states=hidden_states,
                 residual=residual,
                 spec_metadata=spec_metadata,
             )
-
-        return hidden_states, residual
 
     def forward_MoE(
         self,
@@ -1772,7 +1768,6 @@ class DeepseekV3Model(DecoderModel):
                  model_config: ModelConfig[PretrainedConfig],
                  mapping_with_cp: Optional[Mapping] = None):
         super().__init__(model_config)
-        self.rank = model_config.mapping.rank
         config = model_config.pretrained_config
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
@@ -1812,7 +1807,6 @@ class DeepseekV3Model(DecoderModel):
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
-
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"

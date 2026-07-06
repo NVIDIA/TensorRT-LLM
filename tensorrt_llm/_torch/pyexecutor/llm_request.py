@@ -727,17 +727,15 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.seqlen_this_rank_cp = self.prompt_len
         self.total_input_len_cp = self.prompt_len
         self.py_helix_is_inactive_rank = False
-        # Global decode length committed across CP ranks.
+        # Committed decode length across CP ranks, advanced by 1 + accepted per
+        # verify group (unlike py_decoding_iter, which counts iterations). The
+        # per-rank cached KV length lives in seqlen_this_rank_cp.
         self.py_helix_global_decode_len = 0
-        # Per-rank cached KV length before this forward's writes.
-        self.py_helix_local_past_seen = self.prompt_len
-        # Context tokens owned by this CP rank.
-        self.py_helix_context_seqlen_cp = self.prompt_len
-        # Owned decode tokens; tracked incrementally in _helix_rewind_generation_kv.
-        self.py_helix_owned_decode_seen = 0
-        # Verify-group index for ownership: owner = (index // tpb) % cp_size.
+        # Reserve-side verify-group counter: owner = (index // tpb) % cp_size.
         self.py_helix_decode_group_index = 0
-        self.py_helix_pending_group_owns = []
+        # Rewind-side verify-group counter; matches reserve in FIFO order and
+        # recovers per-group ownership deterministically under overlap.
+        self.py_helix_rewind_group_index = 0
         # Prior group's ownership; gates on-device kv-length correction under overlap.
         self.py_helix_prev_group_owns = False
         self.py_batch_idx = None

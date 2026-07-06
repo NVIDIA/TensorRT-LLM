@@ -748,20 +748,18 @@ class KVCacheManager(BaseResourceManager):
         """Reserve KV cache slots for a Helix generation or verify forward.
 
         The owning rank reserves slots for the whole verify group plus slack.
-        Reserve-time ownership is pushed to py_helix_pending_group_owns for the
-        matching rewind.
+        Ownership is a deterministic function of the reserve-side group index, so
+        the matching rewind recomputes it from its own FIFO counter rather than a
+        stored per-group decision.
         """
         group_index = req.py_helix_decode_group_index
         owns_group = self._helix_owns_decode_group(group_index)
-        # Prior group's ownership before extending the reserve FIFO.
-        req.py_helix_prev_group_owns = (req.py_helix_pending_group_owns[-1]
-                                        if req.py_helix_pending_group_owns else
-                                        False)
+        # Prior group's ownership (deterministic) gates the on-device kv-length
+        # correction applied for the overlapped previous group.
+        req.py_helix_prev_group_owns = (
+            self._helix_owns_decode_group(group_index -
+                                          1) if group_index > 0 else False)
         req.py_helix_decode_group_index = group_index + 1
-        req.py_helix_pending_group_owns.append(owns_group)
-
-        req.py_helix_local_past_seen = (req.py_helix_context_seqlen_cp +
-                                        req.py_helix_owned_decode_seen)
 
         # Owner reserves the whole group plus slack; non-owner reserves none.
         reserve = max(draft_len, self._kv_reserve_draft_tokens)
@@ -779,24 +777,22 @@ class KVCacheManager(BaseResourceManager):
         accepted = req.py_num_accepted_draft_tokens
         runtime_draft_len = req.py_rewind_len + accepted
         reserve = max(runtime_draft_len, self._kv_reserve_draft_tokens)
-        # Pop the reserve-time ownership decision for this group.
-        owns_group = (
-            req.py_helix_pending_group_owns.pop(0)
-            if req.py_helix_pending_group_owns else
-            self._helix_owns_decode_group(req.py_helix_decode_group_index - 1))
+        # Ownership for this group in FIFO order, recomputed deterministically to
+        # match the reserve-time decision (correct for any overlap depth).
+        owns_group = self._helix_owns_decode_group(
+            req.py_helix_rewind_group_index)
+        req.py_helix_rewind_group_index += 1
 
-        # Only the owner rank rewinds and grows its owned decode count.
+        # Only the owner rank rewinds and grows its per-rank KV length.
         rewind_count = reserve - accepted
         if owns_group:
             if rewind_count > 0:
                 self.rewind_kv_cache(req, rewind_count)
             # Golden plus accepted drafts (1 + accepted).
-            req.py_helix_owned_decode_seen += 1 + accepted
+            req.seqlen_this_rank_cp += 1 + accepted
 
-        # Advance the committed decode length and recompute the per-rank KV length.
+        # Advance the committed (global) decode length.
         req.py_helix_global_decode_len = g + 1 + accepted
-        req.seqlen_this_rank_cp = (req.py_helix_context_seqlen_cp +
-                                   req.py_helix_owned_decode_seen)
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         # Cross/encoder K/V is allocated once and never grows; handle it on a
@@ -1021,15 +1017,13 @@ class KVCacheManager(BaseResourceManager):
                         req.seqlen_this_rank_cp = req.prompt_len
                         req.total_input_len_cp = token_num * self.mapping.cp_size - 1
                         req.py_decoding_iter = 1
-                    # Initialize Helix speculative-decode bookkeeping.
-                    req.py_helix_global_decode_len = req.py_decoding_iter
-                    req.py_helix_context_seqlen_cp = req.seqlen_this_rank_cp
-                    req.py_helix_local_past_seen = req.seqlen_this_rank_cp
-                    # Context-only cached length; no owned decode tokens yet.
-                    req.py_helix_owned_decode_seen = 0
-                    # Fresh generation request: empty ownership FIFO.
+                    # Initialize Helix speculative-decode bookkeeping; per-rank
+                    # cached length lives in seqlen_this_rank_cp (set above).
+                    # global_decode_len starts at 0, matching real requests.
+                    req.py_helix_global_decode_len = 0
+                    # Fresh generation request: reset the reserve/rewind counters.
                     req.py_helix_decode_group_index = 0
-                    req.py_helix_pending_group_owns = []
+                    req.py_helix_rewind_group_index = 0
                     req.py_helix_prev_group_owns = False
                 req.py_draft_tokens = [1] * max_num_draft_tokens
                 if prepare_resource:

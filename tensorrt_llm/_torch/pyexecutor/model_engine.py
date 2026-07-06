@@ -3594,7 +3594,7 @@ class PyTorchModelEngine(ModelEngine):
                     # Global positions and per-rank cached length under Helix.
                     positions_h, is_inactive_h, _ = self._helix_verify_token_params(
                         request, num_draft_tokens, _helix_tokens_per_block)
-                    past_seen_token_num = request.py_helix_local_past_seen
+                    past_seen_token_num = request.seqlen_this_rank_cp
                     position_ids.extend(positions_h)
                     helix_position_offsets.extend(positions_h)
                     helix_is_inactive_rank.append(is_inactive_h)
@@ -3646,7 +3646,7 @@ class PyTorchModelEngine(ModelEngine):
                     helix_prev_group_owns.append(
                         request.py_helix_prev_group_owns)
                     num_cached_tokens_per_seq.append(
-                        request.py_helix_local_past_seen)
+                        request.seqlen_this_rank_cp)
                 else:
                     num_cached_tokens_per_seq.append(
                         past_seen_token_num + runtime_tokens_per_gen_step)
@@ -3764,7 +3764,7 @@ class PyTorchModelEngine(ModelEngine):
                 if _has_cp_helix:
                     # Global position and per-rank cached length under Helix.
                     position_id = request.total_input_len_cp + request.py_decoding_iter - 1
-                    past_seen_token_num = request.py_helix_local_past_seen
+                    past_seen_token_num = request.seqlen_this_rank_cp
 
                     for beam in range(beam_width):
                         # Plain decode: one query token when active, none when inactive.
