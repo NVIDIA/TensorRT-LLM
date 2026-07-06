@@ -140,6 +140,22 @@ def _register_fake():
     def _(q: torch.Tensor, num_heads: int, head_dim: int, eps: float):
         return torch.empty_like(q)
 
+    @torch.library.register_fake("trtllm::fused_inv_rope_fp8_quant_vllm_port")
+    def _(o: torch.Tensor, positions: torch.Tensor, cos_sin_cache: torch.Tensor,
+          n_groups: int, heads_per_group: int, nope_dim: int, rope_dim: int,
+          quant_group_size: int,
+          is_neox: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+        num_tokens, _, head_dim = o.shape
+        d = heads_per_group * head_dim
+        num_scale_blocks = d // quant_group_size
+        tma_aligned_tokens = (num_tokens + 3) // 4 * 4
+        fp8_buf = o.new_empty((n_groups, num_tokens, d),
+                              dtype=torch.float8_e4m3fn)
+        scale_buf = o.new_empty(
+            (n_groups, num_scale_blocks, tma_aligned_tokens),
+            dtype=torch.float32)
+        return fp8_buf, scale_buf
+
     @torch.library.register_fake("trtllm::allgather")
     def allgather(input, sizes, group):
         if sizes is None:
@@ -1094,14 +1110,11 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::ulysses_post_unscatter_qkv")
     def _(q_in, k_in, v_in, layout=0):
-        # Storage is always NHD-contig [B, P*Sp, H, D]. HND-shape return is a
-        # transpose-view (HND-shape, NHD-stride, non-contig) so Inductor sees
-        # the same stride pattern as the real op.
-        P, B, Sp, H, D = q_in.shape
-        nhd_shape = (B, P * Sp, H, D)
-
+        # Per-tensor NHD-contig storage [B, P*Sp, H, D] (Q/K/V may differ in Sp/H for
+        # cross-attn); layout=0 (HND) returns a transpose-view (HND-shape, NHD-stride).
         def _mk(t):
-            base = t.new_empty(nhd_shape)
+            P, B, Sp, H, D = t.shape
+            base = t.new_empty((B, P * Sp, H, D))
             return base.transpose(1, 2) if layout == 0 else base
 
         return (_mk(q_in), _mk(k_in), _mk(v_in))

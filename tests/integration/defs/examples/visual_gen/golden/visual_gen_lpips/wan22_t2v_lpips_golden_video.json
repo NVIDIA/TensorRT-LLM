@@ -16,7 +16,8 @@
   "lpips_net": "alex",
   "lpips_threshold": 0.05,
   "diffusers_version": "0.38.0",
-  "tensorrt_llm_version": "1.3.0rc20",
-  "tensorrt_llm_commit": "85665f5fd331d0154a78172954846d843085e83f",
-  "container_image": "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/release@sha256:3308a2dc0192a8329ea02eca7b5c44f290f5e894cd8c5921099308d84c3e5691"
+  "torch_version": "2.12.0a0+0291f960b6.nv26.04.48445190",
+  "tensorrt_llm_version": "1.3.0rc21",
+  "tensorrt_llm_commit": "539ee226c4df7ab15802911083fe501e9d64c66e",
+  "container_image": "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm@sha256:dad31c0b5290d836033c96d8b91f6524bdc7cc5b4d1000b4abcc57c6868ffdc0"
 }

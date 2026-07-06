@@ -41,8 +41,6 @@ from __future__ import annotations
 import types
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from tensorrt_llm._torch.pyexecutor.adp_iter_stats import (
     _ITERATION_STATS_OPTIONAL_FIELDS,
     _ITERATION_STATS_SCALAR_FIELDS,
@@ -50,9 +48,6 @@ from tensorrt_llm._torch.pyexecutor.adp_iter_stats import (
 )
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import RankIterStatsPayload, RankState
 from tensorrt_llm.bindings.executor import InflightBatchingStats, IterationStats
-
-_ITER_STATS_REQUEST_AGGREGATES_NVBUG = pytest.mark.skip(reason="https://nvbugs/6337231")
-_ITER_STATS_DUMMY_FILTERING_NVBUG = pytest.mark.skip(reason="https://nvbugs/6337233")
 
 
 class _StubRequest:
@@ -169,6 +164,8 @@ def _build_fake_self(queued_items, model_engine_iter_states, *, enable_attention
         channel so regression tests can verify ``_update_iter_stats`` uses
         the explicit scheduled-batch stats argument instead.
     """
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
     fake = MagicMock()
     fake.max_num_active_requests = 64
     fake.iter_counter = 1
@@ -178,6 +175,10 @@ def _build_fake_self(queued_items, model_engine_iter_states, *, enable_attention
     fake.drafter = None
     fake.model_engine = types.SimpleNamespace(iter_states=model_engine_iter_states)
     fake.enable_attention_dp = enable_attention_dp
+    # Bind the real dummy-request predicate: a bare MagicMock auto-generates a
+    # child Mock for attribute access (always truthy when called), which would
+    # classify every request as dummy and zero out all per-request aggregates.
+    fake._is_stats_dummy_request = PyExecutor._is_stats_dummy_request
     return fake
 
 
@@ -279,7 +280,6 @@ def test_prefill_only_no_prefix_cache():
     assert ifb.num_ctx_kv_tokens == 0  # py_last_context_chunk[0] == 0 for both
 
 
-@_ITER_STATS_REQUEST_AGGREGATES_NVBUG
 def test_prefill_with_prefix_cache_hit():
     # Prompt 1000 tokens; 256 already in prefix cache (prepopulatedPromptLen).
     # Chunk size = remaining = 744. py_last_context_chunk = (256, 1000);
@@ -295,7 +295,6 @@ def test_prefill_with_prefix_cache_hit():
     assert ifb.num_ctx_kv_tokens == 256
 
 
-@_ITER_STATS_REQUEST_AGGREGATES_NVBUG
 def test_chunked_prefill_continuation():
     # Chunked prefill: 3-chunk request, each chunk 512. This is step 2:
     # chunk size 512, previously computed 512 (== context_current_position).
@@ -311,7 +310,6 @@ def test_chunked_prefill_continuation():
     assert ifb.num_ctx_kv_tokens == 512
 
 
-@_ITER_STATS_REQUEST_AGGREGATES_NVBUG
 def test_decode_only():
     # Two decode requests: 1024 total context and 2048 total context.
     reqs = [
@@ -326,7 +324,6 @@ def test_decode_only():
     assert ifb.num_ctx_kv_tokens == 0
 
 
-@_ITER_STATS_REQUEST_AGGREGATES_NVBUG
 def test_mixed_prefill_and_decode():
     ctx = [_StubRequest(context_chunk_size=128, context_current_position=0)]
     gen = [_StubRequest(num_tokens=500), _StubRequest(num_tokens=700)]
@@ -404,7 +401,6 @@ def test_queued_routes_by_request_type():
     assert ifb.num_queued_gen_kv_tokens == 1536  # 512 + 1024
 
 
-@_ITER_STATS_REQUEST_AGGREGATES_NVBUG
 def test_paused_decode_requests():
     paused = [
         _StubRequest(num_tokens=300),
@@ -416,7 +412,6 @@ def test_paused_decode_requests():
     assert ifb.num_paused_kv_tokens == 1100
 
 
-@_ITER_STATS_DUMMY_FILTERING_NVBUG
 def test_dummy_filtering_on_kv_token_fields():
     """Verify dummy requests are excluded from KV-token-weighted counters."""
     # Dummy-padding added by Attention-DP or CUDA graph capture must not
@@ -464,7 +459,6 @@ def test_dummy_filtering_on_kv_token_fields():
     assert ifb.num_paused_kv_tokens == 0  # dummy paused filtered
 
 
-@_ITER_STATS_DUMMY_FILTERING_NVBUG
 def test_attention_dp_dummy_filtering_on_count_fields():
     """Verify Attention-DP mode excludes dummy padding from rank-local counts."""
     # Under attention-DP, the rank-local payload emitted for each rank must
@@ -509,7 +503,6 @@ def test_attention_dp_dummy_filtering_on_count_fields():
     assert ifb.num_paused_kv_tokens == 700
 
 
-@_ITER_STATS_REQUEST_AGGREGATES_NVBUG
 def test_full_mixed_iteration():
     # Realistic scenario: 3 prefill (1 fresh, 2 continuing chunks), 4 decode,
     # 2 preempted, 3 queued.
@@ -540,7 +533,6 @@ def test_full_mixed_iteration():
     assert ifb.num_paused_kv_tokens == 400 + 900
 
 
-@_ITER_STATS_REQUEST_AGGREGATES_NVBUG
 def test_num_ctx_kv_tokens_ignores_iter_states_side_channel():
     """Regression guard: num_ctx_kv_tokens must not read iter_states.
 

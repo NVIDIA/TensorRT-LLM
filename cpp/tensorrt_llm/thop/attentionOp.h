@@ -93,7 +93,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<int64_t> compressed_kv_cache_pool_ptr = std::nullopt, bool const is_cross = false,
     std::optional<torch::Tensor> cross_kv = std::nullopt,
     std::optional<torch::Tensor> relative_attention_bias = std::nullopt, int64_t relative_attention_max_distance = 0,
-    std::optional<int64_t> spec_decoding_target_max_draft_tokens = std::nullopt);
+    std::optional<int64_t> spec_decoding_target_max_draft_tokens = std::nullopt,
+    std::optional<torch::Tensor> quant_scale_qkv = std::nullopt);
 
 struct KvCachePoolPointers
 {
