@@ -2586,16 +2586,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     path: /vol/scratch26/scratch.trt_llm_data
         """
     }
-    // H100 PCIe pool label is "h100-cr" (see BUILD_CONFIGS). Do not use type.contains("h100") — that also matches "dgx-h100-*".
-    def hostnameMatch = ""
-    if (nodeLabelPrefix.contains("h100-cr")) {
-        hostnameMatch = """
-                              - key: "kubernetes.io/hostname"
-                                operator: In
-                                values:
-                                - "viking-prod-208.ipp2u1.colossus"
-"""
-    }
 
     def podConfig = [
         cloud: targetCloud,
@@ -4993,9 +4983,6 @@ def launchTestJobs(pipeline, testFilter)
     ]
 
     aarch64SanityCheckConfigs = [
-        // Workaround PyTorch 2.11.0 vs. 2.11.0a0 incompatibility issue. Once resolved, change back to:
-        // 1. DLFW_IMAGE -> UBUNTU_24_04_IMAGE
-        // 2. Extra PyTorch CUDA install: false -> true
         "PY312-UB2404": [
             LLM_WHEEL_DOCKER_IMAGE,
             "GH200",
