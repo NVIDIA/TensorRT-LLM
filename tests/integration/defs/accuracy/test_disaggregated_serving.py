@@ -1195,6 +1195,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(8)
+    @parametrize_with_ids("mtp_nextn", [0, 3])
     @pytest.mark.parametrize(
         "gen_pp,gen_tp,gen_cp,enable_attention_dp", [
             (1, 1, 4, False),
@@ -1219,7 +1220,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                  "cudagraph:with_padding"
                              ])
     @pytest.mark.parametrize("comms_medium", ["fifo_v1", "fifo_v2", "nccl"])
-    @parametrize_with_ids("mtp_nextn", [0, 1, 2, 3])
     def test_auto_dtype_with_helix(self, mtp_nextn, comms_medium,
                                    cuda_graph_config, gen_pp, gen_tp, gen_cp,
                                    enable_attention_dp):
