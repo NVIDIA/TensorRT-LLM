@@ -382,15 +382,7 @@ def check_and_rerun(
         unfinished_test_file,
     )
 
-    # Step 2: If rerun_0.txt exists, some tests can't be rerun
-    rerun_0_file = os.path.join(rerun_dir, "rerun_0.txt")
-    if os.path.exists(rerun_0_file):
-        print(f"Contents of {rerun_0_file}:")
-        print(Path(rerun_0_file).read_text())
-        print("There are some failed tests that cannot be rerun, skip the rerun step.")
-        return True, []
-
-    # Step 3: Count total failed tests
+    # Step 2: Count total failed tests
     valid_count = 0
     for times in [1, 2]:
         rerun_file = os.path.join(rerun_dir, f"rerun_{times}.txt")
@@ -400,16 +392,7 @@ def check_and_rerun(
             print(f"Found {count} {rerun_tag} tests to rerun {times} time(s)")
             valid_count += count
 
-    if valid_count > max_rerun_tests:
-        print(
-            f"There are more than {max_rerun_tests} failed {rerun_tag} tests, skip the rerun step."
-        )
-        return True, []
-    elif valid_count == 0:
-        print(f"No failed {rerun_tag} tests need to be rerun.")
-        return True, []
-
-    # Step 4: Execute reruns
+    # Step 3: Execute reruns
     is_rerun_failed = False
     rerun_xml_files = []
 
