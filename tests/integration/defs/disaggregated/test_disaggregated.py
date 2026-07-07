@@ -45,6 +45,8 @@ from test_common.perf_metrics_utils import (get_timing_metrics,
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.logger import logger
 
+_TEST_INTERNAL_DISAGG_AUTH_KEY = "test-internal-disagg-auth-key"
+
 
 @dataclass
 class TestConfig:
@@ -638,6 +640,8 @@ def setup_disagg_cluster(
     """
     with open(config_file, 'r') as f:
         config = yaml.safe_load(f)
+    config.setdefault("internal_request_auth_key",
+                      _TEST_INTERNAL_DISAGG_AUTH_KEY)
 
     speculative_config = config.get("speculative_config")
     if isinstance(speculative_config, dict):
@@ -739,6 +743,8 @@ def setup_disagg_cluster(
             config.get("conditional_disagg_config", None),
             "perf_metrics_max_requests":
             config.get("perf_metrics_max_requests", 0),
+            "internal_request_auth_key":
+            config.get("internal_request_auth_key"),
         }
         if schedule_style:
             server_config["schedule_style"] = schedule_style
