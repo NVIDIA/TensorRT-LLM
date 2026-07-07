@@ -708,6 +708,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         block_ids_per_seq = maybe_pin_memory(
             self.kv_cache_manager.get_block_ids_per_seq(self.request_ids))
         num_blocks = block_ids_per_seq.shape[1]
+        # Retain the source CPU buffer so it outlives the non-blocking H2D
+        # copies below; back-to-back prepare_flash_mla calls during CUDA-graph
+        # capture can otherwise free it before the DMA completes, leaving
+        # garbage entries that trigger an OOB read in the FlashMLA kernel.
+        self._flash_mla_src_block_ids_cpu = block_ids_per_seq
         self.kv_block_ids_per_seq.fill_(0)
         self.kv_block_ids_per_seq[:self.num_seqs, :num_blocks].copy_(
             block_ids_per_seq, non_blocking=True)
