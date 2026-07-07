@@ -92,6 +92,7 @@ WAN21_I2V_480P_PATH = _checkpoint(
 COS_SIM_THRESHOLD = 0.99
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
+WAN_TIMESTEP_SCALE = 1000.0
 
 
 # ============================================================================
@@ -103,6 +104,11 @@ def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
     a = a.reshape(-1).float()
     b = b.reshape(-1).float()
     return F.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0)).item()
+
+
+def _normalize_wan_timestep(timestep: torch.Tensor) -> torch.Tensor:
+    """Convert HF/Diffusers WAN timestep scale to TRT-LLM normalized forward input."""
+    return timestep.to(torch.float32) / WAN_TIMESTEP_SCALE
 
 
 def _load_models(checkpoint_dir: str):
@@ -276,7 +282,11 @@ class TestWanUnit:
         )
         hs, ts, enc = _transformer_inputs(str(self.DEVICE))
         with torch.inference_mode():
-            out = model(hidden_states=hs, timestep=ts, encoder_hidden_states=enc)
+            out = model(
+                hidden_states=hs,
+                timestep=_normalize_wan_timestep(ts),
+                encoder_hidden_states=enc,
+            )
         assert out.shape == hs.shape
 
     @torch.no_grad()
@@ -323,7 +333,11 @@ class TestWanUnit:
             hf_out = hf(
                 hidden_states=hs, timestep=ts, encoder_hidden_states=enc, return_dict=False
             )[0].float()
-            trt_out = trtllm(hidden_states=hs, timestep=ts, encoder_hidden_states=enc).float()
+            trt_out = trtllm(
+                hidden_states=hs,
+                timestep=_normalize_wan_timestep(ts),
+                encoder_hidden_states=enc,
+            ).float()
 
         torch.testing.assert_close(trt_out, hf_out, atol=0.4, rtol=0.4)
 
@@ -379,7 +393,7 @@ class TestWanT2VTransformerCorrectness:
 
             our_out = our_model(
                 hidden_states=hidden_states,
-                timestep=timestep,
+                timestep=_normalize_wan_timestep(timestep),
                 encoder_hidden_states=encoder_hidden_states,
             )
 
@@ -455,7 +469,7 @@ class TestWanI2VTransformerCorrectness:
 
             our_out = our_model(
                 hidden_states=hidden_states,
-                timestep=timestep,
+                timestep=_normalize_wan_timestep(timestep),
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_hidden_states_image=image_embeds,
             )

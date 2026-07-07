@@ -47,6 +47,9 @@ CacheLevel = NewType("CacheLevel", int)
 
 
 GPU_LEVEL: Final[CacheLevel] = CacheLevel(0)
+# First cache level below GPU. Its semantic tier depends on the configured
+# cache_tiers: host when a host tier exists, otherwise disk.
+CACHE_LEVEL1: Final[CacheLevel] = CacheLevel(1)
 
 # Normal token id that falls in the tokenizer vocabulary.
 TokenId = NewType("TokenId", int)

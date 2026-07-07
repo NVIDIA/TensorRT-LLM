@@ -162,33 +162,31 @@ still force VG stages.
 Block selection — entry-pattern based only:
 VisualGen has no `condition.terms.backend` of its own; VG entries
 live in `backend: pytorch` and `backend: tensorrt` blocks. A block
-"belongs to VG" iff any of its `tests:` entries matches one of the
-three stable VG path families:
-
-- `unittest/_torch/visual_gen/...` (28 entries)
-- `examples/test_visual_gen.py...` (1 entry)
-- `visual_gen/test_visual_gen_benchmark.py` (1 entry)
+"belongs to VG" iff any of its `tests:` entries lives under a dedicated
+`visual_gen/` test path or is the VisualGen perf-sanity entry under
+`perf/`.
 
 For each matched block, `block_filters` keeps only the VG entries.
 Non-VG siblings in the same block stay governed by other rules.
 
-Outward-facing fallback: unlike AutoDeploy, VG is imported eagerly
-(top-level `from tensorrt_llm._torch.visual_gen.config import ...`
-in `commands/serve.py`, `commands/utils.py`,
-`serve/openai_server.py`). The 5 files that define / re-export the
-public API symbols (`VisualGenArgs`, `ParallelConfig`, `VisualGen`,
-`VisualGenParams`) are listed in `_VG_OUTWARD_FILES`; touching any
-of them claims the changed files but emits `scope=None` so Selector
-falls back to baseline. This protects trtllm-serve / trtllm-bench
-startup paths from VG signature drift slipping through pre-merge.
+Outward-facing fallback: unlike AutoDeploy, VG public symbols are
+imported eagerly by non-VG startup paths such as `commands/serve.py`,
+`commands/utils.py`, and `serve/openai_server.py`. The public API
+package prefix (`tensorrt_llm/visual_gen/`) is listed in
+`_VG_OUTWARD_PREFIXES`; touching any non-doc file under it claims the
+changed files but emits `scope=None` so Selector falls back to baseline.
+This protects trtllm-serve / trtllm-bench startup paths from VG
+signature drift slipping through pre-merge.
 
 Outcomes:
 
 - No VG source files in the diff → rule returns `None`.
-- VG source touched, all internal → `scope=visualgenonly`; sanity
-  off (VG changes don't affect wheel sanity); perfsanity on iff a
-  matched block lives in `l0_perf` or `*perf_sanity*`.
-- VG source touched, any outward-facing file → `scope=None`
+- VG source touched, all internal (`examples/visual_gen/**` or
+  `tensorrt_llm/_torch/visual_gen/**`) → `scope=visualgenonly`;
+  sanity off (VG changes don't affect wheel sanity); perfsanity on iff
+  a matched block lives in `l0_perf` or `*perf_sanity*`.
+- VG source touched, any outward-facing path under
+  `tensorrt_llm/visual_gen/` → `scope=None`
   (fallback).
 - VG source touched but no VG block found anywhere (defensive) →
   `scope=None` (fallback).

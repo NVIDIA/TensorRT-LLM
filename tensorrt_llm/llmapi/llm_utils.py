@@ -87,10 +87,10 @@ class _ModelInfo:
 
 @dataclass
 class _ModelRuntimeContext:
-    ''' _ModelRuntimeContext holds the minimum runtime resources for running a model.
+    """_ModelRuntimeContext holds the minimum runtime resources for running a model.
 
     It could be a runtime cache in MPI nodes.
-    '''
+    """
     engine: Optional[Engine] = None
     mapping: Optional[Mapping] = None
     model_info: Optional[_ModelInfo] = None
@@ -105,10 +105,10 @@ class _ModelRuntimeContext:
 
 
 class ModelLoader:
-    ''' The ModelLoader is used to build an end-to-end model for a single-gpu.
+    """The ModelLoader is used to build an end-to-end model for a single-gpu.
 
     It accepts model name or a local model dir, and will download the model if necessary.
-    '''
+    """
 
     def __init__(self,
                  llm_args: LlmArgs,
@@ -248,9 +248,8 @@ class ModelLoader:
             self.counter += 1
 
     def __call__(self, engine_dir: Optional[Path] = None) -> Path:
-        '''
-        The engine_dir is the path to save the built engine.
-        '''
+        """The engine_dir is the path to save the built engine.
+        """
         if self.llm_args.model_format is _ModelFormatKind.TLLM_ENGINE:
             return self.model_obj.model_dir
 
@@ -301,7 +300,7 @@ class ModelLoader:
         model_dir: str,
         engine_dir: str,
     ):
-        ''' Save the built engine on a single GPU to the given path. '''
+        """Save the built engine on a single GPU to the given path."""
         model.engine.save(engine_dir)
         if model.mapping.rank == 0:
             tokenizer = ModelLoader.load_hf_tokenizer(
@@ -312,7 +311,7 @@ class ModelLoader:
                 tokenizer.save_pretrained(engine_dir)
 
     def _download_hf_model(self):
-        ''' Download HF model from third-party model hub like www.modelscope.cn or huggingface.  '''
+        """Download HF model from third-party model hub like www.modelscope.cn or huggingface."""
         model_dir = None
         # Only the rank0 are allowed to download model
         if mpi_rank() == 0:
@@ -404,6 +403,7 @@ class ModelLoader:
             "fp8": QuantAlgo.FP8,
             "nvfp4": QuantAlgo.NVFP4,
         }.get(kv_cache_dtype)
+        requires_global_quant_config_fallback = False
 
         hf_quant_config_path = f"{self._model_dir}/hf_quant_config.json"
         if os.path.exists(hf_quant_config_path):
@@ -424,9 +424,20 @@ class ModelLoader:
                     )
             except FileNotFoundError:
                 pass
-            self._apply_modelopt_quant_config(normalized,
-                                              explicit_kv_cache_quant_algo)
-            return True
+            if normalized.get("quant_algo") is None:
+                if normalized.get("quantized_layers") is not None:
+                    requires_global_quant_config_fallback = True
+                    logger.info(
+                        "hf_quant_config.json does not set a global quant_algo; "
+                        "falling back to config.json or model_kwargs for global "
+                        "quantization.")
+                else:
+                    raise ValueError(
+                        "Pre-quantized checkpoint must have quant_algo.")
+            else:
+                self._apply_modelopt_quant_config(normalized,
+                                                  explicit_kv_cache_quant_algo)
+                return True
 
         hf_config_path = f"{self._model_dir}/config.json"
         hf_quant_config = None
@@ -448,6 +459,11 @@ class ModelLoader:
                 f"Use quantization_config from {hf_config_path}: quantization_config={hf_quant_config}"
             )
 
+        if requires_global_quant_config_fallback and hf_quant_config is None:
+            raise ValueError(
+                "hf_quant_config.json does not set a global quant_algo and no "
+                "quantization_config fallback was found.")
+
         if hf_quant_config is not None:
             if is_modelopt_quant_config(hf_quant_config):
                 self._apply_modelopt_quant_config(
@@ -459,6 +475,8 @@ class ModelLoader:
             if hf_quant_config.get("quant_method") == "fp8":
                 if hf_quant_config.get("weight_block_size") is not None:
                     quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+                    quant_config.group_size = hf_quant_config[
+                        "weight_block_size"][0]
                     quant_config.exclude_modules = ["*eh_proj"]
                 else:
                     # Ministral 3 static quant
@@ -472,6 +490,27 @@ class ModelLoader:
                     'block.*.attn.out', 'block.*.mlp.gate', 'block.*.attn.qkv',
                     'embedding', 'unembedding'
                 ]
+            # MXFP8 checkpoints (e4m3 weights + UE8M0 1x32 block scales, dynamic
+            # MXFP8 acts).
+            elif hf_quant_config.get("quant_method") == "mxfp8":
+                quant_config.quant_algo = QuantAlgo.MXFP8
+                block_size = hf_quant_config.get("weight_block_size", [1, 32])
+                # MXFP8 uses 1x32 blocks along the K dim; group_size is the K
+                # block (32).
+                assert tuple(block_size) == (1, 32), (
+                    f"MXFP8 only supports weight_block_size=[1,32], got {block_size}"
+                )
+                quant_config.group_size = block_size[1]
+
+                # Layers the producer left in BF16.
+                ignored = hf_quant_config.get("ignored_layers", [])
+                hf_exclude_modules = hf_quant_config.get(
+                    'modules_to_not_convert', None)
+                if hf_exclude_modules is not None:
+                    quant_config.exclude_modules = list(
+                        dict.fromkeys(hf_exclude_modules + ignored))
+                else:
+                    quant_config.exclude_modules = list(ignored)
             # NOTE: This is for llm-compressor's quantized checkpoints.
             elif hf_quant_config.get("quant_method") == "compressed-tensors":
                 update_quant_config_from_compressed_tensors(
@@ -503,7 +542,7 @@ class ModelLoader:
         return False
 
     def _load_model_from_hf(self):
-        ''' Load a TRT-LLM model from a HF model. '''
+        """Load a TRT-LLM model from a HF model."""
         assert self._model_dir is not None
 
         model_cls = AutoModelForCausalLM.get_trtllm_model_class(
@@ -566,7 +605,7 @@ class ModelLoader:
 
     @print_traceback_on_error
     def _load_model_from_ckpt(self):
-        ''' Load a TRT-LLM model from checkpoint. '''
+        """Load a TRT-LLM model from checkpoint."""
         self.pretrained_config = PretrainedConfig.from_json_file(
             os.path.join(self._model_dir, 'config.json'))
         self.pretrained_config.mapping = self.mapping
@@ -615,14 +654,14 @@ class ModelLoader:
         logger_debug(f"rank{mpi_rank()} build engine done\n", "green")
 
     def _save_engine_for_runtime(self):
-        '''Persist the engine to disk for the cpp runtime.
+        """Persist the engine to disk for the cpp runtime.
 
         Currently, the cpp runtime can accept an engine path,
         that requires the engine should always be saved to disk.
 
         This explicit saving will be removed in the future when the cpp runtime can accept the engine buffer directly.
         But this is necessary for a build cache, but it can be optimized to async IO.
-        '''
+        """
         if self.build_cache_enabled:
             self._model_dir = self.engine_cache_stage.cache_dir
             self._model_format = _ModelFormatKind.TLLM_ENGINE
@@ -662,15 +701,19 @@ class ModelLoader:
             trust_remote_code: bool = True,
             **kwargs) -> Optional[transformers.PretrainedConfig]:
         try:
-            # Route via AutoConfig so model_types registered through
-            # transformers.models.auto.configuration_auto.CONFIG_MAPPING
-            # (e.g. deepseek_v32 / kimi_k2 via tensorrt_llm/_torch/configs/)
-            # are dispatched to their TRT-LLM-local config class. Calling
-            # PretrainedConfig.from_pretrained directly bypasses CONFIG_MAPPING
-            # and on transformers 5.5.x returns a bare PretrainedConfig that
-            # lacks attributes like max_position_embeddings.
-            return transformers.AutoConfig.from_pretrained(
-                model_dir, trust_remote_code=trust_remote_code, **kwargs)
+            # Route via load_pretrained_config so model_types registered in
+            # TRT-LLM's _CONFIG_REGISTRY (e.g. deepseek_v32 / kimi_k2 /
+            # glm_moe_dsa) are dispatched to their TRT-LLM-local config class
+            # and get the same compat handling as the engine's own config load
+            # (e.g. dropping GLM-MoE-DSA's unsupported layer_types); it falls
+            # back to AutoConfig for everything else. Calling AutoConfig /
+            # PretrainedConfig.from_pretrained directly here would instead hit
+            # transformers' validate_layer_type and return None.
+            from tensorrt_llm._torch.pyexecutor.config_utils import \
+                load_pretrained_config
+            return load_pretrained_config(model_dir,
+                                          trust_remote_code=trust_remote_code,
+                                          **kwargs)
         except Exception as e:
             logger.warning(
                 f"Failed to load hf model config from {model_dir}, encountered error: {e}"
@@ -679,9 +722,8 @@ class ModelLoader:
 
 
 class CachedModelLoader:
-    '''
-    The CachedModelLoader is used to build the model in both single or multi-gpu, with optional caching.
-    '''
+    """The CachedModelLoader is used to build the model in both single or multi-gpu, with optional caching.
+    """
 
     def __init__(
         self,
@@ -818,7 +860,7 @@ class CachedModelLoader:
                                              is _ModelFormatKind.HF)
 
     def _get_engine_cache_stage(self) -> CachedStage:
-        ''' Get the cache stage for engine building. '''
+        """Get the cache stage for engine building."""
         build_cache = BuildCache(self.llm_args.enable_build_cache)
 
         assert self._hf_model_dir is not None, "HF model dir is required for cache key."
@@ -851,10 +893,11 @@ class CachedModelLoader:
         )
 
     def get_pretrained_config(self) -> PretrainedConfig:
-        ''' Get the PretrainedConfig for cache key.
+        """Get the PretrainedConfig for cache key.
 
         NOTE, this is not the HF model's config, but the TRT-LLM's config. We use this as a generic information for
-        HF and other models. '''
+        HF and other models.
+        """
         assert self._hf_model_dir is not None
         return AutoConfig.from_hugging_face(
             self._hf_model_dir,
@@ -909,7 +952,7 @@ class CachedModelLoader:
 
                     if not has_storage:
                         print_colored(
-                            f"Build cache is disabled since the cache storage is too small.\n ",
+                            "Build cache is disabled since the cache storage is too small.\n ",
                             'yellow')
                         print_colored(
                             f"Free storage: {free_storage}GB, Required storage: {require_size}GB\n",
@@ -975,7 +1018,7 @@ class CachedModelLoader:
 
 @dataclass
 class LlmBuildStats:
-    ''' LlmBuildStats is the statistics for the LLM model building. '''
+    """LlmBuildStats is the statistics for the LLM model building."""
     # Whether the cache is hit for the engine
     cache_hitted: bool = False
     cache_info: Optional[str] = None

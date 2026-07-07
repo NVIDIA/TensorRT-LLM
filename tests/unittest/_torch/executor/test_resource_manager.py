@@ -12,8 +12,9 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
-                                                             PeftCacheManager)
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    KVCacheManager, PeftCacheManager,
+    _warn_if_unsupported_v1_kv_cache_event_hash_algo)
 from tensorrt_llm.bindings import LayerType
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings import executor as tllm
@@ -24,6 +25,9 @@ from tensorrt_llm.bindings.internal.testing import \
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_hash import (KV_CACHE_HASH_ALGO_AUTO,
+                                                KV_CACHE_HASH_ALGO_V1,
+                                                KV_CACHE_HASH_ALGO_V2)
 from tensorrt_llm.sampling_params import SamplingParams
 
 DataType = tensorrt_llm.bindings.DataType
@@ -33,6 +37,33 @@ current_dir = pathlib.Path(__file__).parent.resolve()
 root_dir = current_dir.parent.parent.parent.parent
 
 sys.path.append(str(root_dir / "tests" / "integration"))
+
+
+def test_v1_kv_cache_event_hash_algo_warning_for_non_v1():
+    with patch("tensorrt_llm._torch.pyexecutor.resource_manager.logger.warning"
+               ) as warning:
+        _warn_if_unsupported_v1_kv_cache_event_hash_algo(KV_CACHE_HASH_ALGO_V2)
+
+    warning.assert_called_once()
+    assert KV_CACHE_HASH_ALGO_V1 in warning.call_args.args[0]
+    assert KV_CACHE_HASH_ALGO_V2 in warning.call_args.args[0]
+
+
+def test_v1_kv_cache_event_hash_algo_no_warning_for_v1():
+    with patch("tensorrt_llm._torch.pyexecutor.resource_manager.logger.warning"
+               ) as warning:
+        _warn_if_unsupported_v1_kv_cache_event_hash_algo(KV_CACHE_HASH_ALGO_V1)
+
+    warning.assert_not_called()
+
+
+def test_v1_kv_cache_event_hash_algo_no_warning_for_auto():
+    with patch("tensorrt_llm._torch.pyexecutor.resource_manager.logger.warning"
+               ) as warning:
+        _warn_if_unsupported_v1_kv_cache_event_hash_algo(
+            KV_CACHE_HASH_ALGO_AUTO)
+
+    warning.assert_not_called()
 
 
 class TestResourceManager(unittest.TestCase):
@@ -793,6 +824,42 @@ class TestResourceManager(unittest.TestCase):
         )
         simulate_prefill_completion_only_use_for_testing(req3)
         kv_cache_manager.free_resources(req3)
+
+    def test_batch_cache_indices_honor_requested_blocks_with_beams(self):
+        """V1 truncates packed beam cache indices to the requested blocks."""
+        kv_cache_manager = KVCacheManager(
+            kv_cache_config=KvCacheConfig(max_tokens=256,
+                                          enable_block_reuse=False),
+            kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
+            CacheType.SELF,
+            num_layers=2,
+            num_kv_heads=2,
+            head_dim=128,
+            tokens_per_block=8,
+            max_seq_len=64,
+            max_batch_size=1,
+            max_beam_width=2,
+            mapping=Mapping(),
+        )
+        try:
+            request_id = 7
+            kv_cache_manager.add_dummy_requests([request_id], [64],
+                                                max_beam_width=2)
+
+            full_indices = kv_cache_manager.get_batch_cache_indices(
+                [request_id], beam_width=2)
+            requested_blocks = 4
+            truncated_indices = kv_cache_manager.get_batch_cache_indices(
+                [request_id],
+                beam_width=2,
+                num_blocks_per_seq=[requested_blocks],
+            )
+
+            self.assertGreater(len(full_indices[0]), requested_blocks)
+            self.assertEqual(truncated_indices,
+                             [full_indices[0][:requested_blocks]])
+        finally:
+            kv_cache_manager.shutdown()
 
     def test_kv_cache_manager_with_execution_stream(self):
         """

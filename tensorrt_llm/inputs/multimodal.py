@@ -503,6 +503,13 @@ class MultimodalParams:
     multimodal_data: Optional[Dict[str, Any]] = field(default_factory=dict)
     multimodal_runtime: Optional[MultimodalRuntimeData] = None
     input_ids_start_offset: int = 0
+    # CUDA event recorded on a side stream by the MM encoder prefetch path.
+    # When set, the consume site in `get_multimodal_embeddings` issues a
+    # `wait_event` on the current stream before reading cached embeddings.
+    # Always `None` unless `TLLM_MM_SIDE_STREAM_MAX_AHEAD` is positive and a prefetch ran.
+    encoder_event: Optional[torch.cuda.Event] = field(default=None,
+                                                      repr=False,
+                                                      compare=False)
 
     def __post_init__(self):
         """Ensure default values are properly set."""

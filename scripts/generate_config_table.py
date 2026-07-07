@@ -90,6 +90,10 @@ MODEL_INFO = {
         "display_name": "Kimi-K2-Thinking (NVFP4)",
         "url": "https://huggingface.co/nvidia/Kimi-K2-Thinking-NVFP4",
     },
+    "MiniMaxAI/MiniMax-M3": {
+        "display_name": "MiniMax-M3 (BF16)",
+        "url": "https://huggingface.co/MiniMaxAI/MiniMax-M3",
+    },
 }
 
 

@@ -665,9 +665,9 @@ public:
         return mEncoderUniqueTokens;
     }
 
-    /// @brief Get length of encoder input (could be tokens or features length)
-    /// @return An integer.
-    [[nodiscard]] SizeType32 getEncoderInputLen() const
+    /// @brief Get length of encoder input when present, without throwing for decoder-only requests.
+    /// @return Encoder input length, or nullopt when this request has no encoder side.
+    [[nodiscard]] std::optional<SizeType32> tryGetEncoderInputLen() const
     {
         if (mEncoderInputFeatures.has_value())
         {
@@ -678,19 +678,45 @@ public:
             return getEncoderTokens().value()->size();
         }
 
+        return std::nullopt;
+    }
+
+    /// @brief Get length of encoder input (could be tokens or features length)
+    /// @return An integer.
+    [[nodiscard]] SizeType32 getEncoderInputLen() const
+    {
+        auto const encoderInputLen = tryGetEncoderInputLen();
+        if (encoderInputLen.has_value())
+        {
+            return encoderInputLen.value();
+        }
+
         TLLM_THROW("GenericLlmRequest::getEncoderInputLen - Do not have encoder length!");
     }
 
-    /// @brief Get length of encoder output. Fall back to encoder input length if not present
-    /// @return An integer.
-    [[nodiscard]] SizeType32 getEncoderOutputLen() const
+    /// @brief Get length of encoder output when present, without throwing for decoder-only requests.
+    /// @return Encoder output length, or nullopt when this request has no encoder side.
+    [[nodiscard]] std::optional<SizeType32> tryGetEncoderOutputLen() const
     {
         if (mEncoderOutputLength.has_value())
         {
             return mEncoderOutputLength.value();
         }
 
-        return getEncoderInputLen();
+        return tryGetEncoderInputLen();
+    }
+
+    /// @brief Get length of encoder output, or throw if the request has no encoder side.
+    /// @return Explicit encoder output length, or encoder input length when the output length is not present.
+    [[nodiscard]] SizeType32 getEncoderOutputLen() const
+    {
+        auto const encoderOutputLen = tryGetEncoderOutputLen();
+        if (encoderOutputLen.has_value())
+        {
+            return encoderOutputLen.value();
+        }
+
+        TLLM_THROW("GenericLlmRequest::getEncoderInputLen - Do not have encoder length!");
     }
 
     [[nodiscard]] std::optional<std::shared_ptr<std::vector<SizeType32>>> getPositionIds() const
@@ -1882,6 +1908,15 @@ public:
         return mPerfMetrics.kvCacheMetrics.numNewAllocatedBlocks;
     }
 
+    void updateKvCachePerfMetrics(
+        SizeType32 allocTotalBlocks, SizeType32 allocNewBlocks, SizeType32 reusedBlocks, SizeType32 missedBlocks)
+    {
+        updateAllocTotalBlocksPerRequest(allocTotalBlocks);
+        updateAllocNewBlocksPerRequest(allocNewBlocks);
+        updateReusedBlocksPerRequest(reusedBlocks);
+        updateMissedBlocksPerRequest(missedBlocks);
+    }
+
     void updateReusedBlocksPerRequest(SizeType32 reusedBlocksPerRequest)
     {
         mPerfMetrics.kvCacheMetrics.numReusedBlocks += reusedBlocksPerRequest;
@@ -2212,7 +2247,10 @@ private:
 
         // Scatter the input tokens to other beam
         mTokens = BeamTokens(mSamplingConfig.beamWidth, inputTokens);
-        mLastTokens = VecTokens(mSamplingConfig.beamWidth, inputTokens.back());
+        // A request may legitimately have no input tokens on this rank (e.g. an "empty" Helix CP rank that owns zero KV
+        // blocks for the sequence). Guard against calling .back() on an empty vector (undefined behavior).
+        mLastTokens = inputTokens.empty() ? VecTokens(mSamplingConfig.beamWidth)
+                                          : VecTokens(mSamplingConfig.beamWidth, inputTokens.back());
 
         // Init mUniqueTokens
         VecUniqueTokens uniqueTokens{inputTokens.size()};

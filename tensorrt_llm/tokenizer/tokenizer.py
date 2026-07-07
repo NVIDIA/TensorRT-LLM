@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import importlib
 import os
 import pickle  # nosec B403
@@ -26,12 +41,14 @@ except ImportError:
 # Aliases for built-in custom tokenizers.
 TOKENIZER_ALIASES = {
     "deepseek_v32": "tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer",
+    "deepseek_v4": "tensorrt_llm.tokenizer.deepseek_v4.DeepseekV4Tokenizer",
 }
 
 TLLM_INCREMENTAL_DETOKENIZATION_BACKEND = os.environ.get(
     "TLLM_INCREMENTAL_DETOKENIZATION_BACKEND", "HF")
 TLLM_STREAM_INTERVAL_THRESHOLD = int(
     os.environ.get("TLLM_STREAM_INTERVAL_THRESHOLD", "24"))
+_HF_DECODE_STREAM_INVALID_PREFIX_ERROR = "Invalid prefix encountered"
 try:
     from tokenizers.decoders import DecodeStream  # noqa
 except ImportError:
@@ -245,6 +262,9 @@ class TransformersTokenizer(TokenizerBase):
     def decode(self, token_ids: List[int], *args, **kwargs) -> str:
         return self.tokenizer.decode(token_ids, *args, **kwargs)
 
+    def convert_tokens_to_ids(self, tokens, *args, **kwargs):
+        return self.tokenizer.convert_tokens_to_ids(tokens, *args, **kwargs)
+
     def batch_encode_plus(self, texts: List[str], *args, **kwargs) -> dict:
         # transformers 5.x removed batch_encode_plus; __call__ has the same signature.
         return self.tokenizer(texts, *args, **kwargs)
@@ -268,13 +288,19 @@ class TransformersTokenizer(TokenizerBase):
         try:
             tokenizer = AutoTokenizer.from_pretrained(pretrained_model_dir,
                                                       **kwargs)
-        except AttributeError as e:
-            # transformers 5.x: bare PreTrainedConfig fallback (for model_types
-            # not in CONFIG_MAPPING_NAMES, e.g. deepseek_v32) hits
-            # modeling_rope_utils → self.max_position_embeddings → AttributeError
-            # because PreTrainedConfig is now a dataclass with declared fields.
-            # See deepseek-ai/DeepSeek-V3#1207.
-            if "max_position_embeddings" not in str(e):
+        except Exception as e:
+            # Two transformers 5.x regressions for model_types not registered
+            # in CONFIG_MAPPING_NAMES. PreTrainedTokenizerFast reads
+            # tokenizer.json directly and skips AutoConfig, so it sidesteps
+            # both:
+            #  - deepseek_v32: bare PreTrainedConfig fallback hits
+            #    modeling_rope_utils → self.max_position_embeddings →
+            #    AttributeError (PreTrainedConfig is now a dataclass with
+            #    declared fields). See deepseek-ai/DeepSeek-V3#1207.
+            #  - glm_moe_dsa: layer_types=['deepseek_sparse_attention', ...] is
+            #    rejected by validate_layer_type (not in ALLOWED_LAYER_TYPES).
+            msg = str(e)
+            if "max_position_embeddings" not in msg and "layer_types" not in msg:
                 raise
             tokenizer = _fallback_to_fast_tokenizer(pretrained_model_dir, e,
                                                     **kwargs)
@@ -481,11 +507,24 @@ class TransformersTokenizer(TokenizerBase):
             }
 
         decode_stream = states.get('decode_stream')
-        results = [
-            result for tid in token_ids
-            if (result := decode_stream.step(self.tokenizer._tokenizer, tid)
-                ) is not None
-        ]
+        results = []
+        for tid in token_ids:
+            try:
+                result = decode_stream.step(self.tokenizer._tokenizer, tid)
+            except Exception as error:
+                # PyO3 exposes tokenizers' DecodeStreamError as a plain Exception.
+                if not str(error).startswith(
+                        _HF_DECODE_STREAM_INVALID_PREFIX_ERROR):
+                    raise
+                logger.warning(
+                    "HF DecodeStream encountered an invalid prefix while decoding token %d. "
+                    "Resetting the decode stream.", tid)
+                decode_stream = DecodeStream(
+                    skip_special_tokens=skip_special_tokens)
+                states['decode_stream'] = decode_stream
+                result = decode_stream.step(self.tokenizer._tokenizer, tid)
+            if result is not None:
+                results.append(result)
         curr_new_text = "".join(results)
         if clean_up_tokenization_spaces is None:
             clean_up_tokenization_spaces = self.clean_up_tokenization_spaces

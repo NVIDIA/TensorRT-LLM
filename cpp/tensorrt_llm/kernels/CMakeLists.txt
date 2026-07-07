@@ -30,6 +30,8 @@ add_subdirectory(dsv3MinLatencyKernels)
 add_subdirectory(causalConv1d)
 add_subdirectory(fusedGatedRMSNormQuant)
 add_subdirectory(mamba2MTPSSMCache)
+add_subdirectory(mhcKernels)
+add_subdirectory(compressorKernels)
 
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
@@ -55,6 +57,13 @@ list(FILTER SRC_CU EXCLUDE REGEX "userbuffers/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "fusedLayernormKernels/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "fusedGatedRMSNormQuant/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "mamba2MTPSSMCache/.*")
+list(FILTER SRC_CPP EXCLUDE REGEX "mhcKernels/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "mhcKernels/.*")
+list(FILTER SRC_CPP EXCLUDE REGEX "compressorKernels/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "compressorKernels/.*")
+# Marlin is built as its own Hopper-only OBJECT library below.
+list(FILTER SRC_CPP EXCLUDE REGEX "marlin/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "marlin/.*")
 
 if(NOT ENABLE_MULTI_DEVICE)
   list(FILTER SRC_CU EXCLUDE REGEX "customAllReduceKernels*.*cu$")
@@ -73,7 +82,26 @@ if(FAST_BUILD)
     STATUS "FAST_BUILD enabled for kernels: using -O1 for CUDA compilation")
 endif()
 
-add_library(kernels_src STATIC ${SRC_CPP} ${SRC_CU})
+# Marlin NVFP4: Hopper-only OBJECT library. Pinned to sm_90 so the global
+# CMAKE_CUDA_ARCHITECTURES doesn't propagate.
+file(GLOB_RECURSE MARLIN_SRC "marlin/*.cu" "marlin/*.cpp")
+if(MARLIN_SRC)
+  add_library(marlin_src OBJECT ${MARLIN_SRC})
+  set_property(TARGET marlin_src PROPERTY POSITION_INDEPENDENT_CODE ON)
+  set_property(TARGET marlin_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  target_include_directories(
+    marlin_src
+    PRIVATE
+      $<TARGET_PROPERTY:${INTERNAL_CUTLASS_KERNELS_TARGET},INTERFACE_INCLUDE_DIRECTORIES>
+  )
+  target_link_libraries(marlin_src PRIVATE trtllm_gen_fmha_interface)
+  set_cuda_architectures(marlin_src 90)
+endif()
+
+add_library(
+  kernels_src STATIC
+  ${SRC_CPP} ${SRC_CU}
+  $<$<TARGET_EXISTS:marlin_src>:$<TARGET_OBJECTS:marlin_src>>)
 set_property(TARGET kernels_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET kernels_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 target_include_directories(

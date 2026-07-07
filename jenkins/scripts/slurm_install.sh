@@ -29,7 +29,7 @@ slurm_install_setup() {
             echo "SKIP_INSTALL=1: skipping pip installs (packages pre-installed in fat sqsh)"
         else
             if [[ ${pytestCommand:-} == *--run-ray* ]]; then
-                retry_command pip3 install --retries 10 "ray[default]==2.54.1"
+                retry_command pip3 install --retries 10 "ray[default]==2.55.1"
             fi
             retry_command bash -c "cd $llmSrcNode && pip3 install --retries 10 -r requirements-dev.txt"
             retry_command bash -c "cd $resourcePathNode && pip3 install --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl"

@@ -14,7 +14,7 @@ attn_backend: trtllm
 compile_backend: torch-cudagraph
 skip_loading_weights: false
 max_batch_size: 128
-max_seq_len: 4096
+# Use higher max_num_tokens (e.g., 16384) for high throughput case (e.g., >= 128)
 max_num_tokens: 8192
 enable_chunked_prefill: true
 cuda_graph_config:
@@ -30,7 +30,8 @@ transforms:
   apply_sharding_hints:
     enabled: true
     requires_shape_prop: true
-    shard_layers: ["mha", "moe", "lm_head"]  # V3: vocab-parallel lm_head (colwise + all_gather)
+    shard_layers: ["mha", "moe"]
+    simple_shard_filter: "lm_head"  # vocab-parallel lm_head (column split + all_gather), upstream pattern
     # TP2 trial: AUTO -> tunable_allreduce picks oneshot-lamport fused AR.
     # NCCL has no fused residual+rmsnorm kernel -> RING_LL + separate rmsnorm.
     allreduce_strategy: AUTO
@@ -45,3 +46,4 @@ transforms:
     enabled: true
   fuse_add_rms_norm:
     enabled: true
+stream_interval: 20

@@ -1,6 +1,11 @@
 import base64
+import importlib.util
+import multiprocessing
 import pickle
 import re
+import subprocess
+import sys
+import traceback
 from typing import Callable, List, Optional, Tuple
 
 import pytest
@@ -14,7 +19,7 @@ from torch.multiprocessing.reductions import reduce_tensor
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from utils.llm_data import llm_models_root
 from utils.torch_ref import RefHFModel
-from utils.util import skip_pre_blackwell
+from utils.util import skip_pre_blackwell, skip_pre_hopper
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import (
@@ -22,7 +27,7 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import 
     _quantize_nvfp4,
 )
 from tensorrt_llm._torch.utils import get_device_uuid
-from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
+from tensorrt_llm.llmapi import KvCacheConfig, MoeConfig, SamplingParams
 
 
 @pytest.mark.part0
@@ -579,3 +584,166 @@ def test_llm_partial_update_weights_nvfp4(model_dir, kv_cache_dtype):
         llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
         # Use a looser threshold because NVFP4 logits are compared against a BF16 reference.
         compare_logits(llm_logits, ref_logits, threshold=0.8)
+
+
+@pytest.fixture
+def mamba_deps():
+    """Install mamba-ssm and causal-conv1d for the duration of the test, then
+    restore the full pip environment. Uses a pip-freeze diff so transitive
+    dependencies (e.g. quack-kernels pinning nvidia-cutlass-dsl==4.6.0.dev0,
+    which breaks tensorrt-llm's pin of 4.5.0) are also reverted."""
+
+    def _freeze():
+        out = subprocess.check_output(
+            [sys.executable, "-m", "pip", "freeze", "--disable-pip-version-check"],
+            text=True,
+        )
+        result = {}
+        for line in out.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or " @ " in line:
+                continue
+            if "==" in line:
+                name, ver = line.split("==", 1)
+                result[name.lower()] = ver
+        return result
+
+    pkgs = ["mamba-ssm", "causal-conv1d"]
+    mod_names = {"mamba-ssm": "mamba_ssm", "causal-conv1d": "causal_conv1d"}
+    need_install = [p for p in pkgs if importlib.util.find_spec(mod_names[p]) is None]
+
+    before = _freeze() if need_install else None
+    try:
+        if need_install:
+            # --no-deps: avoid pulling in optional kernel deps (quack-kernels,
+            # tilelang) that upgrade nvidia-cutlass-dsl and break tensorrt-llm.
+            # The container already provides torch/einops/etc.
+            subprocess.check_call(
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "install",
+                    "--no-build-isolation",
+                    "--no-deps",
+                    *need_install,
+                ]
+            )
+            importlib.invalidate_caches()
+        yield
+    finally:
+        if before is None:
+            return
+        after = _freeze()
+        new_pkgs = [p for p in after if p not in before]
+        changed = [(p, before[p]) for p in after if p in before and after[p] != before[p]]
+        if new_pkgs:
+            subprocess.check_call([sys.executable, "-m", "pip", "uninstall", "-y", *new_pkgs])
+        if changed:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", *[f"{p}=={v}" for p, v in changed]]
+            )
+
+
+def _nemotron_h_body():
+    """Body of test_llm_update_weights_nemotron_h. Executed in a fresh
+    subprocess via spawn so HF transformers re-imports cleanly and the
+    mamba-ssm / causal-conv1d fast path (installed by the mamba_deps
+    fixture) is picked up. Running this in-process would let the parent
+    pytest's already-resolved negative caches force the naive Python
+    selective_scan path, which OOMs on Nemotron-H and produces unmatched logits."""
+    model_dir = str(llm_models_root() / "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16")
+    num_hidden_layers = 7
+    hf_model = RefHFModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    # Nemotron-H's Mamba state dominates the cache budget; 0.25 of free memory
+    # leaves enough room for HF (resident on cuda:0 + replicas on cuda:1..3)
+    # plus the TRT-LLM model shard. BF16 model -> CUTLASS MoE backend.
+    # mamba_ssm_cache_dtype="float32" matches the official Nemotron-Nano
+    # accuracy test (TestNemotronV3Nano::test_auto_dtype) — BF16 SSM cache
+    # loses precision in long-decode selective_state_update.
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True, free_gpu_memory_fraction=0.25, mamba_ssm_cache_dtype="float32"
+    )
+    moe_config = MoeConfig(backend="CUTLASS")
+    with LLM(
+        model=model_dir,
+        ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
+        tensor_parallel_size=4,
+        load_format="dummy",
+        pipeline_parallel_size=1,
+        kv_cache_config=kv_cache_config,
+        moe_config=moe_config,
+        max_batch_size=4,
+        model_kwargs={"num_hidden_layers": num_hidden_layers},
+    ) as llm:
+        prompts_texts = [
+            "Hello, my name is",
+            "The president of the United States is",
+            "The capital of France is",
+            "The future of AI is",
+        ]
+        prompts = [tokenizer.encode(p) for p in prompts_texts]
+        del tokenizer
+        sampling_params = SamplingParams(
+            temperature=0, return_generation_logits=True, max_tokens=32
+        )
+
+        # Warm the KV-cache prefix reuse store with the *dummy* weights before
+        # update_weights. If update_weights' finalize path fails to invalidate
+        # the prefix cache, the second generation would reuse cached KV blocks
+        # produced by random weights and the logits comparison would fail —
+        # a stricter check of enable_block_reuse=True correctness than just
+        # running once after update_weights.
+        llm.generate(prompts, sampling_params)
+
+        # Group weights by trailing suffix (e.g. "input_layernorm.weight",
+        # "mixer.A_log"); send one filtered batch per suffix.
+        layer_prefix_pattern = re.compile(r"^model\.layers\.\d+\.")
+        filter_set = set()
+        for name, _ in hf_model.all_weights[hf_model.device_id]:
+            filter_set.add(layer_prefix_pattern.sub("", name))
+        filter_list = sorted(filter_set)
+
+        def common_filter(filter_name: str) -> Callable[[str], bool]:
+            def filter_fn(name: str) -> bool:
+                return name.endswith(filter_name)
+
+            return filter_fn
+
+        for fname in filter_list:
+            ipc_handles = hf_model.get_weight_ipc_handles_serialized(
+                weight_filter=common_filter(fname)
+            )
+            llm._collective_rpc("update_weights", (ipc_handles,))
+        # Finalize once to trigger post_load_weights on all modules.
+        llm._collective_rpc("update_weights", (None,))
+
+        llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
+        compare_logits(llm_logits, ref_logits)
+
+
+def _nemotron_h_subprocess_entry(result_queue):
+    try:
+        _nemotron_h_body()
+        result_queue.put(None)
+    except BaseException:
+        result_queue.put(traceback.format_exc())
+
+
+@pytest.mark.part4
+@skip_pre_hopper
+def test_llm_update_weights_nemotron_h(mamba_deps):
+    """Runs _nemotron_h_body in a spawned subprocess so HF transformers
+    sees the mamba-ssm / causal-conv1d fast path installed by the
+    mamba_deps fixture. See _nemotron_h_body docstring for why."""
+    ctx = multiprocessing.get_context("spawn")
+    queue = ctx.Queue()
+    proc = ctx.Process(target=_nemotron_h_subprocess_entry, args=(queue,))
+    proc.start()
+    proc.join()
+    err = queue.get() if not queue.empty() else None
+    if proc.exitcode != 0:
+        pytest.fail(f"Subprocess exited with code {proc.exitcode}\n{err or ''}")
+    if err is not None:
+        pytest.fail(err)
