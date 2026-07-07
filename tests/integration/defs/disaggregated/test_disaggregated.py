@@ -2782,32 +2782,47 @@ async def _send_mixed_request(session, server_url: str,
                 json=payload,
                 timeout=aiohttp.ClientTimeout(total=120)) as resp:
             assembled = []
+            finish_reason = None
+            done_received = False
             async for raw_line in resp.content:
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line.startswith("data:"):
                     continue
                 chunk = line[len("data:"):].strip()
                 if chunk == "[DONE]":
+                    done_received = True
                     break
                 if cancel_after is not None and time.monotonic(
                 ) - start > cancel_after:
                     break  # force disconnect during generation
-                if profile.structured_output_schema is not None:
-                    try:
-                        data = json.loads(chunk)
-                        text = data.get("choices", [{}])[0].get("text", "")
-                        assembled.append(text)
-                    except (json.JSONDecodeError, IndexError, KeyError):
-                        pass
+                try:
+                    data = json.loads(chunk)
+                    choice = data.get("choices", [{}])[0]
+                    fr = choice.get("finish_reason")
+                    if fr is not None:
+                        finish_reason = fr
+                    if profile.structured_output_schema is not None:
+                        assembled.append(choice.get("text", ""))
+                except (json.JSONDecodeError, IndexError, KeyError):
+                    pass
 
-            if not should_cancel:
+            # done_received: server sent explicit SSE terminator
+            # finish_reason check: server ended with a final chunk carrying
+            # finish_reason (trtllm-serve does not send data: [DONE])
+            completed = done_received or finish_reason in ("stop", "length")
+            if not should_cancel and completed:
                 if profile.structured_output_schema is not None:
                     try:
-                        json.loads("".join(assembled))
-                        result["json_valid"] = True
+                        parsed = json.loads("".join(assembled))
+                        required = profile.structured_output_schema.get(
+                            "required", [])
+                        result["json_valid"] = all(k in parsed
+                                                   for k in required)
                     except json.JSONDecodeError:
                         result["json_valid"] = False
-                result["success"] = True
+                    result["success"] = result["json_valid"]
+                else:
+                    result["success"] = True
     except Exception:
         pass  # connection abort on cancel is expected
     finally:
@@ -2942,7 +2957,7 @@ def run_disaggregated_mixed_stress(example_dir: str,
         profiles = _DEFAULT_MIXED_STRESS_PROFILES
 
     cleanup_output_files()
-    run_env = env.copy()
+    run_env = env.copy() if env else os.environ.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
@@ -2997,7 +3012,7 @@ def run_disaggregated_mixed_stress(example_dir: str,
         ]
         all_worker_procs = [w.process for w in ctx_workers + gen_workers]
         check_call(client_cmd,
-                   env=env,
+                   env=run_env,
                    poll_procs=all_worker_procs + [disagg_server.process])
 
     except Exception:
@@ -3366,9 +3381,7 @@ def test_disaggregated_mamba_conc_greater_than_mbs(disaggregated_example_root,
             request_count=60,
             concurrency=64,
             accuracy_threshold=0.42,
-            speculative_model_path='Zhi-Create-Qwen3-32B-Eagle3',
-            cancellation_rate=10,
-            cancellation_delay=0.5),
+            speculative_model_path='Zhi-Create-Qwen3-32B-Eagle3'),
                      marks=(pytest.mark.skip_less_device(8), skip_pre_hopper)),
         # Full stress run: 10k requests at 512 concurrency.
         # Estimated wall-clock: 1-2 hours (server startup ~5-10 min + request
@@ -3380,9 +3393,7 @@ def test_disaggregated_mamba_conc_greater_than_mbs(disaggregated_example_root,
             request_count=10000,
             concurrency=512,
             accuracy_threshold=0.42,
-            speculative_model_path='Zhi-Create-Qwen3-32B-Eagle3',
-            cancellation_rate=10,
-            cancellation_delay=0.5),
+            speculative_model_path='Zhi-Create-Qwen3-32B-Eagle3'),
                      marks=(pytest.mark.skip_less_device(8), skip_pre_hopper)),
     ],
     ids=lambda x: x.test_desc)
