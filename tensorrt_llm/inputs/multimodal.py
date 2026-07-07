@@ -449,6 +449,8 @@ class MultimodalRuntimeData:
 _CPU_ONLY_MULTIMODAL_DATA_KEYS = frozenset({
     "multimodal_embed_mask_cumsum",
     "multimodal_embedding_lengths",
+    "multimodal_encoder_token_lengths",
+    "multimodal_item_refs",
 })
 
 
