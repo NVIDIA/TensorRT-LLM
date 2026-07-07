@@ -36,6 +36,7 @@ _ABORT_WORLD_MARKER = "WIDEEP_MPI_ABORT_WORLD_OK"
 _TERMINAL_READY_MARKER = "WIDEEP_MPI_TERMINAL_READY"
 _TERMINAL_COMPLETE_MARKER = "WIDEEP_MPI_TERMINAL_COMPLETE"
 _TERMINAL_DONE_MARKER = "WIDEEP_MPI_TERMINAL_DONE"
+_TERMINAL_EXITING_MARKER = "WIDEEP_MPI_TERMINAL_EXITING"
 _TERMINAL_ERROR_MARKER = "WIDEEP_MPI_TERMINAL_ERROR"
 _TERMINAL_ATEXIT_MARKER = "WIDEEP_MPI_TERMINAL_ATEXIT_RAN"
 _WORKER_TIMEOUT_SEC = 30.0
@@ -51,6 +52,7 @@ _PROPAGATION_PATTERN = re.compile(
 _TERMINAL_READY_PATTERN = re.compile(rf"^{_TERMINAL_READY_MARKER} rank=(\d+) world_size=(\d+)$")
 _TERMINAL_COMPLETE_PATTERN = re.compile(rf"^{_TERMINAL_COMPLETE_MARKER} world_size=(\d+)$")
 _TERMINAL_DONE_PATTERN = re.compile(rf"^{_TERMINAL_DONE_MARKER} rank=(\d+) world_size=(\d+)$")
+_TERMINAL_EXITING_PATTERN = re.compile(rf"^{_TERMINAL_EXITING_MARKER} rank=(\d+) world_size=(\d+)$")
 
 
 class _ReapableProcess(Protocol):
@@ -133,7 +135,7 @@ def _validate_rank_marker_set(
 
 
 def _validate_terminal_completion(output: str, expected_world_size: int) -> None:
-    """Require exact READY/DONE sets around one global completion marker."""
+    """Require exact READY/DONE/EXITING sets around one completion marker."""
     if _TERMINAL_ERROR_MARKER in output:
         pytest.fail(f"terminal MPI worker reported an error:\n{output}", pytrace=False)
     if _TERMINAL_ATEXIT_MARKER in output:
@@ -172,6 +174,12 @@ def _validate_terminal_completion(output: str, expected_world_size: int) -> None
         expected_world_size,
         _TERMINAL_DONE_MARKER,
         _TERMINAL_DONE_PATTERN,
+    )
+    _validate_rank_marker_set(
+        output,
+        expected_world_size,
+        _TERMINAL_EXITING_MARKER,
+        _TERMINAL_EXITING_PATTERN,
     )
 
 
@@ -268,6 +276,32 @@ def _kill_and_reap_launcher(process: _ReapableProcess, timeout: float) -> bool:
     return True
 
 
+def _accept_reaped_terminal_timeout(
+    output: str,
+    *,
+    mode: str,
+    required: bool,
+    expected_world_size: int,
+    launcher_reaped: bool,
+) -> bool:
+    """Accept bounded launcher cleanup after complete no-Finalize evidence."""
+    if mode != _TERMINAL_MODE or not launcher_reaped or _TERMINAL_COMPLETE_MARKER not in output:
+        return False
+
+    # Some MPI launchers wait indefinitely when every worker deliberately uses
+    # os._exit() instead of MPI_Finalize. The strict terminal validator still
+    # requires complete READY/DONE/EXITING rank sets and rejects worker or
+    # atexit errors.
+    _validate_worker_result(
+        -signal.SIGKILL,
+        output,
+        required=required,
+        mode=mode,
+        expected_world_size=expected_world_size,
+    )
+    return True
+
+
 @pytest.mark.parametrize(
     ("environment", "expected"),
     [
@@ -325,7 +359,13 @@ def _terminal_completion_output(world_size: int) -> str:
     done = [
         f"{_TERMINAL_DONE_MARKER} rank={rank} world_size={world_size}" for rank in range(world_size)
     ]
-    return "\n".join([*ready, f"{_TERMINAL_COMPLETE_MARKER} world_size={world_size}", *done])
+    exiting = [
+        f"{_TERMINAL_EXITING_MARKER} rank={rank} world_size={world_size}"
+        for rank in range(world_size)
+    ]
+    return "\n".join(
+        [*ready, f"{_TERMINAL_COMPLETE_MARKER} world_size={world_size}", *done, *exiting]
+    )
 
 
 @pytest.mark.parametrize("returncode", [0, 1, 137], ids=["zero", "open-mpi", "signal-style"])
@@ -337,6 +377,74 @@ def test_mpi_ft_terminal_result_accepts_complete_evidence(returncode: int) -> No
         mode=_TERMINAL_MODE,
         expected_world_size=4,
     )
+
+
+def test_mpi_ft_terminal_timeout_accepts_complete_evidence_after_reap() -> None:
+    assert _accept_reaped_terminal_timeout(
+        _terminal_completion_output(4),
+        mode=_TERMINAL_MODE,
+        required=True,
+        expected_world_size=4,
+        launcher_reaped=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("mode", "launcher_reaped"),
+    [
+        (_HEALTHY_MODE, True),
+        (_TERMINAL_MODE, False),
+    ],
+    ids=["healthy-mode", "unreaped-launcher"],
+)
+def test_mpi_ft_terminal_timeout_requires_terminal_mode_and_reap(
+    mode: str,
+    launcher_reaped: bool,
+) -> None:
+    assert not _accept_reaped_terminal_timeout(
+        _terminal_completion_output(2),
+        mode=mode,
+        required=True,
+        expected_world_size=2,
+        launcher_reaped=launcher_reaped,
+    )
+
+
+def test_mpi_ft_terminal_timeout_rejects_incomplete_evidence() -> None:
+    output = "\n".join(
+        [
+            *(f"{_TERMINAL_READY_MARKER} rank={rank} world_size=2" for rank in range(2)),
+            f"{_TERMINAL_COMPLETE_MARKER} world_size=2",
+            f"{_TERMINAL_DONE_MARKER} rank=0 world_size=2",
+        ]
+    )
+    with pytest.raises(pytest.fail.Exception, match=_TERMINAL_DONE_MARKER):
+        _accept_reaped_terminal_timeout(
+            output,
+            mode=_TERMINAL_MODE,
+            required=True,
+            expected_world_size=2,
+            launcher_reaped=True,
+        )
+
+
+def test_mpi_ft_terminal_result_rejects_incomplete_exiting_set() -> None:
+    output = "\n".join(
+        [
+            *(f"{_TERMINAL_READY_MARKER} rank={rank} world_size=2" for rank in range(2)),
+            f"{_TERMINAL_COMPLETE_MARKER} world_size=2",
+            *(f"{_TERMINAL_DONE_MARKER} rank={rank} world_size=2" for rank in range(2)),
+            f"{_TERMINAL_EXITING_MARKER} rank=0 world_size=2",
+        ]
+    )
+    with pytest.raises(pytest.fail.Exception, match=_TERMINAL_EXITING_MARKER):
+        _validate_worker_result(
+            -signal.SIGKILL,
+            output,
+            required=True,
+            mode=_TERMINAL_MODE,
+            expected_world_size=2,
+        )
 
 
 @pytest.mark.parametrize(
@@ -663,10 +771,19 @@ def test_ep_failure_broadcast_real_mpi(world_size: int) -> None:
                 )
                 pytest.fail(
                     f"{world_size}-rank WideEP MPI {mode} smoke timed out after "
-                    f"{_WORKER_TIMEOUT_SEC:.0f}s and could not be reaped within "
-                    f"{_REAP_TIMEOUT_SEC:.0f}s; {reap_status}\n{output}"
+                    f"{_WORKER_TIMEOUT_SEC:.0f}s and could not close its output "
+                    f"within {_REAP_TIMEOUT_SEC:.0f}s; {reap_status}\n{output}"
                 )
             output = _merge_subprocess_output(partial_output, output)
+            if _accept_reaped_terminal_timeout(
+                output,
+                mode=mode,
+                required=required,
+                expected_world_size=world_size,
+                launcher_reaped=True,
+            ):
+                outputs[mode] = output
+                continue
             pytest.fail(
                 f"{world_size}-rank WideEP MPI {mode} smoke timed out after "
                 f"{_WORKER_TIMEOUT_SEC:.0f}s\n{output}"
