@@ -61,10 +61,12 @@ from tensorrt_llm.runtime.kv_cache_manager_v2._common import (
     CACHE_LEVEL1,
     GPU_LEVEL,
     CacheLevel,
+    CudaStream,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
 from tensorrt_llm.runtime.kv_cache_manager_v2._event_manager import KVCacheEventManager
 from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import CuError
+from tensorrt_llm.runtime.kv_cache_manager_v2._utils import CachedCudaEvent
 from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import (
     OutOfMemoryError as KVCacheOutOfMemoryError,
 )
@@ -1558,6 +1560,13 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         if kv_cache.is_active:
             return True
+        if self._arena_enabled:
+            # resume() drains reclaim before its utilization gate (the §4.2 x
+            # §4.6 anti-livelock); ranges freed since the last fenced drain
+            # need their iteration fence (risk #3) assigned first or they can
+            # pin utilization forever when prepare_resources is never reached
+            # (e.g. the KV-capacity estimation phase).
+            self.impl.fence_gpu_reclaim(self._reclaim_fence())
         if not kv_cache.resume(self._stream.cuda_stream):
             return False
         self._restore_page_index_bufs(req_id, kv_cache)
@@ -1637,6 +1646,16 @@ class KVCacheManagerV2(BaseResourceManager):
         pre_cap = kv_cache.capacity
 
         success = kv_cache.resize(capacity, history_length)
+        if not success and self._arena_enabled:
+            # Growth may have failed only because freed ranges still await
+            # their iteration fence (risk #3) and no fenced drain has run yet
+            # — prepare_resources (the usual fence point) is skipped when
+            # nothing was scheduled, e.g. during KV-capacity estimation.
+            # Fence now and retry once; the impl's internal pressure drain can
+            # then reclaim fence-complete ranges. If the fence has not
+            # completed yet, the scheduler simply retries next iteration.
+            self.impl.fence_gpu_reclaim(self._reclaim_fence())
+            success = kv_cache.resize(capacity, history_length)
         if not success:
             if req.is_first_context_chunk:
                 kv_cache.suspend()
@@ -1668,6 +1687,10 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache = self.kv_cache_map[request.py_request_id]
         new_capacity = kv_cache.capacity + delta
         success = kv_cache.resize(new_capacity)
+        if not success and self._arena_enabled:
+            # Same fence-then-retry as resize_context (risk #3).
+            self.impl.fence_gpu_reclaim(self._reclaim_fence())
+            success = kv_cache.resize(new_capacity)
         if not success:
             raise ValueError(
                 f"Failed to extend capacity of KV cache for request "
@@ -1699,6 +1722,21 @@ class KVCacheManagerV2(BaseResourceManager):
 
     # ---- prepare_resources ----
 
+    def _reclaim_fence(self) -> CachedCudaEvent:
+        """Forward-stream fence for the arena's deferred reclaim (risk #3).
+
+        With the overlap scheduler, a step that still reads (and appends to) a
+        just-finished request's range may already be enqueued when the request
+        is freed, and the free/gate events (recorded on the manager stream at
+        close time) do not order against it. An event recorded *here* — at the
+        iteration boundary, on the executor thread's CURRENT stream — covers
+        every previously enqueued step, because ``_forward_step`` runs on that
+        same thread-current stream (it is NOT wrapped in the executor's
+        side ``execution_stream``); steps enqueued later no longer contain the
+        freed sequence. Hence a completed fence is a safe unmap gate.
+        """
+        return CachedCudaEvent(CudaStream(torch.cuda.current_stream().cuda_stream))
+
     @nvtx_range("prepare_resources_kv_cache_manager_v2")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         if self.is_draft:
@@ -1708,15 +1746,18 @@ class KVCacheManagerV2(BaseResourceManager):
             self._prepare_draft_resources(scheduled_batch)
             if self._arena_enabled:
                 self.impl.flush_gpu_mappings()
-                self.impl.drain_gpu_reclaim()
+                self.impl.drain_gpu_reclaim(self._reclaim_fence())
             return
         if self._arena_enabled:
             # Arena mode: execute the batched map sweep for this iteration's
             # growth (§4.2) BEFORE any forward touches the new blocks, then
             # unmap/recycle freed ranges whose gating events completed
             # (deferred reclaim). Growth paths also drain on demand.
+            # The fence (recorded on the execution stream) keeps ranges freed
+            # since the previous iteration from being unmapped under a
+            # speculatively enqueued overlap-scheduler step (risk #3).
             self.impl.flush_gpu_mappings()
-            self.impl.drain_gpu_reclaim()
+            self.impl.drain_gpu_reclaim(self._reclaim_fence())
 
     def _prepare_draft_resources(self, scheduled_batch: ScheduledRequests):
         """Create/resize KV caches in the draft V2 manager for scheduled requests.
@@ -2645,13 +2686,20 @@ class KVCacheManagerV2(BaseResourceManager):
         copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
         assert copy_idx.shape[0] == num_seqs
 
+        # Enqueue on the CALLER'S current stream (the forward stream), exactly
+        # like the v1 manager's plain ``.copy_()``: the block-offset refresh
+        # must be ordered before this iteration's attention kernels and after
+        # the previous iteration's. Enqueuing it on the manager's side stream
+        # (as done previously) lets a forward read STALE rows — which point at
+        # freed sequences' ranges: silently wrong reads in classic paged mode,
+        # and illegal accesses in arena mode once the range is unmapped.
         copy_batch_block_offsets_to_device(
             self.host_kv_cache_block_offsets,
             dst_tensor,
             copy_idx,
             self.index_scales,
             self.kv_offset,
-            self._stream.cuda_stream,
+            torch.cuda.current_stream().cuda_stream,
         )
 
     def _create_kv_cache(

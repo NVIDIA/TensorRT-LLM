@@ -44,6 +44,7 @@ from .._storage._config import BufferId, create_storage_config
 from .._storage._core import PoolGroupIndex, PoolIndex, SlotId
 from .._storage_manager import StorageManager, StorageStatistics
 from .._utils import (
+    CachedCudaEvent,
     HalfOpenRange,
     HomoTuple,
     TypedIndexList,
@@ -567,11 +568,18 @@ class KVCacheManager:
         # copy path (DESIGN.md §4.4) lands.
         return not self._storage.is_arena_mode
 
-    def drain_gpu_reclaim(self) -> int:
+    def drain_gpu_reclaim(self, fence: CachedCudaEvent | None = None) -> int:
         """Arena mode (DESIGN.md §4.2): unmap and recycle freed sequence ranges
-        whose gating events completed. Call at iteration boundaries. Returns
-        the number of ranges reclaimed."""
-        return self._storage.drain_gpu_reclaim()
+        whose gating events completed. Call at iteration boundaries; pass an
+        execution-stream ``fence`` so ranges freed since the last fenced drain
+        cannot be unmapped under a speculatively enqueued step (risk #3).
+        Returns the number of ranges reclaimed."""
+        return self._storage.drain_gpu_reclaim(fence)
+
+    def fence_gpu_reclaim(self, fence: CachedCudaEvent) -> None:
+        """Arena mode: assign the iteration-boundary reclaim fence (risk #3)
+        to ranges freed since the last fence, without draining."""
+        self._storage.fence_gpu_reclaim(fence)
 
     def flush_gpu_mappings(self) -> int:
         """Arena mode with ``batched_map_sweep`` (DESIGN.md §4.2): execute all

@@ -505,7 +505,7 @@ class TestArenaPoolGroup(unittest.TestCase):
             for s in slots:
                 group.release(s)
             group.free_sequence(rng, CachedCudaEvent.NULL)
-            self.assertEqual(group.drain_reclaim(), 1)
+            self.assertEqual(group.drain_reclaim(CachedCudaEvent.NULL), 1)
             self.assertEqual(group.mapped_pages, 0)
             self.assertEqual(self.budget.used_pages, 0)
         finally:
@@ -518,9 +518,31 @@ class TestArenaPoolGroup(unittest.TestCase):
             group.ensure_mapped(rng, 2)
             slot = group.take_slot(rng, 0)
             group.free_sequence(rng, CachedCudaEvent.NULL)
-            self.assertEqual(group.drain_reclaim(), 0)  # slot still outstanding
+            self.assertEqual(group.drain_reclaim(CachedCudaEvent.NULL), 0)  # slot still outstanding
             group.release(slot)
+            self.assertEqual(group.drain_reclaim(CachedCudaEvent.NULL), 1)
+        finally:
+            group.destroy()
+
+    def test_reclaim_gated_on_iteration_fence(self) -> None:
+        """Risk #3: a freed range must NOT be reclaimed before an
+        execution-stream fence recorded at a later drain point completes —
+        the overlap scheduler may have speculatively enqueued a step that
+        still reads the range when free_sequence runs."""
+        group = self._group()
+        try:
+            rng = group.reserve_sequence(2)
+            group.ensure_mapped(rng, 2)
+            group.free_sequence(rng, CachedCudaEvent.NULL)
+            # Unfenced drains (e.g. the impl's internal pressure drains) must
+            # never reclaim a range that has no fence assigned yet.
+            self.assertEqual(group.drain_reclaim(), 0)
+            self.assertEqual(group.drain_reclaim(None), 0)
+            self.assertGreater(group.mapped_pages, 0)
+            # Assign-only fence, then an unfenced drain may reclaim.
+            group.fence_pending_frees(CachedCudaEvent.NULL)
             self.assertEqual(group.drain_reclaim(), 1)
+            self.assertEqual(group.mapped_pages, 0)
         finally:
             group.destroy()
 
@@ -541,7 +563,7 @@ class TestArenaPoolGroup(unittest.TestCase):
             with self.assertRaises(MemoryError):
                 group.reserve_sequence(1)
             group.free_sequence(rng, CachedCudaEvent.NULL)
-            group.drain_reclaim()
+            group.drain_reclaim(CachedCudaEvent.NULL)
         finally:
             group.destroy()
 
@@ -577,7 +599,7 @@ class TestGpuArenaCacheLevelStorage(unittest.TestCase):
             # free the first sequence; the second can now finish mapping
             g0.free_sequence(r0, CachedCudaEvent.NULL)
             g1.free_sequence(r1, CachedCudaEvent.NULL)
-            self.assertEqual(storage.drain_reclaim(), 2)
+            self.assertEqual(storage.drain_reclaim(CachedCudaEvent.NULL), 2)
             self.assertEqual(storage.page_budget.used_pages, 0)
         finally:
             storage.destroy()
@@ -758,7 +780,7 @@ class TestStorageManagerArenaMode(unittest.TestCase):
         self.assertEqual(slot.slot_id, rng.base_block)
         storage.release_slot(self.LC0, GPU_LEVEL, slot)
         storage.free_gpu_sequence(self.PG0, rng, CachedCudaEvent.NULL)
-        self.assertEqual(storage.drain_gpu_reclaim(), 1)
+        self.assertEqual(storage.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
         self.assertEqual(budget.used_pages, 0)
 
     def test_offload_migrates_data_and_gates_reclaim(self) -> None:
@@ -787,7 +809,7 @@ class TestStorageManagerArenaMode(unittest.TestCase):
             self.assertTrue(bool((host_data == value).all().item()))
         # the vacated arena slots returned to the range: reclaim succeeds
         storage.free_gpu_sequence(self.PG0, rng, CachedCudaEvent.NULL)
-        self.assertEqual(storage.drain_gpu_reclaim(), 1)
+        self.assertEqual(storage.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
         self.assertEqual(storage.gpu_page_budget.used_pages, 0)
         for page in pages:
             storage.release_slot(self.LC0, CacheLevel(1), page)
@@ -832,7 +854,7 @@ class TestStorageManagerArenaMode(unittest.TestCase):
         for slot in ret:
             storage.release_slot(self.LC0, GPU_LEVEL, slot)
         storage.free_gpu_sequence(self.PG0, rng, CachedCudaEvent.NULL)
-        self.assertEqual(storage.drain_gpu_reclaim(), 1)
+        self.assertEqual(storage.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
         for page in src_pages:
             storage.release_slot(self.LC0, CacheLevel(1), page)
 
@@ -862,7 +884,7 @@ class TestStorageManagerArenaMode(unittest.TestCase):
         storage.release_slot(self.LC0, CacheLevel(1), host_slots[0])
         storage.release_slot(self.LC0, GPU_LEVEL, page)
         storage.free_gpu_sequence(self.PG0, rng, CachedCudaEvent.NULL)
-        self.assertEqual(storage.drain_gpu_reclaim(), 1)
+        self.assertEqual(storage.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
 
 
 @requires_cuda
@@ -907,7 +929,7 @@ class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
             kv.close()
         s.take_finish_event().synchronize()
         # copy-on-free write-out finished -> the range is reclaimable
-        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
         self.assertEqual(budget.used_pages, 0)
         # the 4 committed blocks live on in the host tier
         host_stats = manager._storage.get_statistics(CacheLevel(1))[0]
@@ -943,7 +965,7 @@ class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
                 kv.resize(3 * self.TPB)  # beyond the VA reservation
             kv.close()
         s.take_finish_event().synchronize()
-        manager.drain_gpu_reclaim()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
 
     def test_growth_backs_off_on_page_exhaustion(self) -> None:
         manager = self.manager
@@ -957,13 +979,16 @@ class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
             self.assertTrue(kv1.resize(1024 * self.TPB))  # takes all 16 pages
             self.assertFalse(kv2.resize(512 * self.TPB))  # backs off, no crash
             kv1.close()
-            # kv1's range reclaim is gated on its finish event; once complete,
-            # kv2's next growth attempt drains it and succeeds.
+            # kv1's range reclaim is gated on its finish event AND an
+            # execution-stream fence assigned at an iteration-boundary drain
+            # (risk #3; the pyexecutor adapter fences every iteration). Model
+            # that boundary, then kv2's growth succeeds on the freed pages.
             torch.cuda.synchronize()
+            manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
             self.assertTrue(kv2.resize(512 * self.TPB))
             kv2.close()
         s.take_finish_event().synchronize()
-        manager.drain_gpu_reclaim()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
 
     def _block_floats(self, page_index: int) -> "torch.Tensor":
         addr = int(
@@ -995,7 +1020,7 @@ class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
             kv1.commit(tokens)
             kv1.close()
         s.take_finish_event().synchronize()
-        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
         host_stats = manager._storage.get_statistics(CacheLevel(1))[0]
         self.assertEqual(host_stats.total - host_stats.free, 2)
 
@@ -1019,7 +1044,7 @@ class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
             self.assertEqual(indices, list(range(indices[0], indices[0] + 3)))
             kv2.close()
         s.take_finish_event().synchronize()
-        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
         self.assertEqual(budget.used_pages, 0)
         # private copies were dropped, not offloaded: still exactly 2 host blocks
         host_stats = manager._storage.get_statistics(CacheLevel(1))[0]
@@ -1036,7 +1061,7 @@ class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
             kv1.commit(tokens)
             kv1.close()
         s.take_finish_event().synchronize()
-        manager.drain_gpu_reclaim()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
         with self.assertRaises(ValueError):
             manager.create_kv_cache(input_tokens=tokens, max_capacity=self.TPB)
 
@@ -1063,7 +1088,11 @@ class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
             self.assertEqual(budget.used_pages, budget.total_pages)
             kv1.close()
         s.take_finish_event().synchronize()
-        # reclaim is queued but deliberately NOT drained: utilization reads 100%
+        # reclaim is queued but deliberately NOT drained: utilization reads 100%.
+        # Assign the iteration-boundary fence only (risk #3) — in production the
+        # adapter fences every iteration; resume()'s internal drain may then
+        # reclaim fenced entries.
+        manager.fence_gpu_reclaim(CachedCudaEvent.NULL)
         self.assertEqual(budget.used_pages, budget.total_pages)
         kv2 = manager.create_kv_cache(max_capacity=2 * self.TPB)
         with TemporaryCudaStream([]) as s2:
@@ -1072,7 +1101,7 @@ class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
             self.assertTrue(kv2.resize(2 * self.TPB))
             kv2.close()
         s2.take_finish_event().synchronize()
-        manager.drain_gpu_reclaim()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
         self.assertEqual(budget.used_pages, 0)
 
     def test_intra_batch_commit_conflict_keeps_committing(self) -> None:
@@ -1101,7 +1130,7 @@ class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
             kv1.close()
             kv2.close()
         s.take_finish_event().synchronize()
-        self.assertEqual(manager.drain_gpu_reclaim(), 2)
+        self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 2)
         self.assertEqual(budget.used_pages, 0)
         # only the canonical copies were offloaded: no duplicates on host
         self.assertEqual(self._host_used(), 2)
@@ -1130,7 +1159,7 @@ class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
             kv.commit([400 + i for i in range(2 * self.TPB)])  # block 2 stays uncommitted
             kv.suspend()
         s.take_finish_event().synchronize()
-        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
         self.assertEqual(budget.used_pages, 0)
         self.assertEqual(self._host_used(), 3)  # 2 canonical + 1 uncommitted
 
@@ -1151,7 +1180,7 @@ class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
             self.assertEqual(indices, list(range(indices[0], indices[0] + 4)))
             kv.close()
         s2.take_finish_event().synchronize()
-        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
         self.assertEqual(budget.used_pages, 0)
         self.assertEqual(self._host_used(), 2)
 
@@ -1176,7 +1205,7 @@ class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
             kv1.commit(tokens)
             kv1.close()
         s.take_finish_event().synchronize()
-        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
         self.assertEqual(self._host_used(), 2)
 
         kv2 = manager.create_kv_cache(input_tokens=tokens, max_capacity=4 * self.TPB)
@@ -1187,7 +1216,7 @@ class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
             torch.cuda.synchronize()
             kv2.suspend()
         s2.take_finish_event().synchronize()
-        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
         self.assertEqual(budget.used_pages, 0)
         self.assertEqual(self._host_used(), 2)  # privates dropped, no duplicates
 
@@ -1200,7 +1229,7 @@ class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
                 self.assertTrue(bool((data == 5.0 + j).all().item()))
             kv2.close()
         s3.take_finish_event().synchronize()
-        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
         self.assertEqual(self._host_used(), 2)
 
 
@@ -1257,7 +1286,7 @@ class TestArenaBatchedMapSweep(unittest.TestCase):
             torch.cuda.synchronize()
             kv.close()
         s.take_finish_event().synchronize()
-        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
         self.assertEqual(budget.used_pages, 0)
 
     def test_freed_before_flush_releases_charge(self) -> None:
@@ -1272,7 +1301,7 @@ class TestArenaBatchedMapSweep(unittest.TestCase):
             kv.close()  # close() itself flushes (its write-out reads pages)
         s.take_finish_event().synchronize()
         manager.flush_gpu_mappings()
-        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
         self.assertEqual(budget.used_pages, 0)
 
     def test_reuse_onboarding_stays_synchronous(self) -> None:
@@ -1293,7 +1322,7 @@ class TestArenaBatchedMapSweep(unittest.TestCase):
             kv1.commit(tokens)
             kv1.close()
         s.take_finish_event().synchronize()
-        manager.drain_gpu_reclaim()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
         # reuse hit: onboarding maps synchronously (its copies run immediately)
         kv2 = manager.create_kv_cache(input_tokens=tokens, max_capacity=4 * self.TPB)
         self.assertEqual(kv2.history_length, 2 * self.TPB)
@@ -1309,7 +1338,7 @@ class TestArenaBatchedMapSweep(unittest.TestCase):
                 self.assertTrue(bool((data == 3.0 + j).all().item()))
             kv2.close()
         s2.take_finish_event().synchronize()
-        manager.drain_gpu_reclaim()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
 
 
 @requires_cuda
@@ -1374,7 +1403,7 @@ class TestArenaLazyRetention(unittest.TestCase):
         budget = manager._storage.gpu_page_budget
         tokens = [900 + i for i in range(2 * self.TPB)]
         self._commit_and_close(tokens, 11.0)
-        self.assertEqual(manager.drain_gpu_reclaim(), 1)  # parked, not unmapped
+        self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)  # parked, not unmapped
         self.assertGreater(budget.used_pages, 0)
         self.assertEqual(budget.retained_pages, budget.used_pages)
         # retained pages count as available for the resume gate
@@ -1384,7 +1413,7 @@ class TestArenaLazyRetention(unittest.TestCase):
         manager = self.manager
         tokens = [910 + i for i in range(2 * self.TPB)]
         self._commit_and_close(tokens, 21.0)
-        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
         # corrupt the HOST copies: if onboarding reads from host, the new
         # sequence sees junk; correct data proves the D2D ghost path
         kv2 = manager.create_kv_cache(input_tokens=tokens, max_capacity=4 * self.TPB)
@@ -1401,14 +1430,14 @@ class TestArenaLazyRetention(unittest.TestCase):
                 self.assertTrue(bool((data == 21.0 + j).all().item()), f"block {j} not D2D")
             kv2.close()
         s.take_finish_event().synchronize()
-        manager.drain_gpu_reclaim()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
 
     def test_pressure_spills_retained_and_falls_back_to_host(self) -> None:
         manager = self.manager
         budget = manager._storage.gpu_page_budget
         tokens = [920 + i for i in range(2 * self.TPB)]
         self._commit_and_close(tokens, 31.0)
-        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
         retained_before = budget.retained_pages
         self.assertGreater(retained_before, 0)
         # a large fresh sequence needs (nearly) the whole 16-page budget:
@@ -1421,7 +1450,7 @@ class TestArenaLazyRetention(unittest.TestCase):
             self.assertEqual(budget.retained_pages, 0)  # spilled
             kv2.close()
         s.take_finish_event().synchronize()
-        manager.drain_gpu_reclaim()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
         # the ghost is gone; reuse now falls back to the (intact) host copy
         kv3 = manager.create_kv_cache(input_tokens=tokens, max_capacity=4 * self.TPB)
         self.assertEqual(kv3.history_length, 2 * self.TPB)
@@ -1434,7 +1463,7 @@ class TestArenaLazyRetention(unittest.TestCase):
                 self.assertTrue(bool((data == 31.0 + j).all().item()))
             kv3.close()
         s2.take_finish_event().synchronize()
-        manager.drain_gpu_reclaim()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
 
     def test_private_copies_refresh_ghosts(self) -> None:
         """Ghost refresh by private copies.
@@ -1447,7 +1476,7 @@ class TestArenaLazyRetention(unittest.TestCase):
         budget = manager._storage.gpu_page_budget
         tokens = [940 + i for i in range(2 * self.TPB)]
         self._commit_and_close(tokens, 41.0)  # kv1: canonical + oldest ghost
-        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
         # kv2 reuses (D2D) and closes: its private copies refresh the ghosts
         kv2 = manager.create_kv_cache(input_tokens=tokens, max_capacity=4 * self.TPB)
         with TemporaryCudaStream([]) as s:
@@ -1455,7 +1484,7 @@ class TestArenaLazyRetention(unittest.TestCase):
             self.assertTrue(kv2.resume(stream))
             kv2.close()
         s.take_finish_event().synchronize()
-        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
         # spill ONLY the LRU (kv1's) range; kv2's stays retained
         self.assertGreater(manager._storage.spill_gpu_retained(1), 0)
         self.assertGreater(budget.retained_pages, 0)
@@ -1474,7 +1503,7 @@ class TestArenaLazyRetention(unittest.TestCase):
                 self.assertTrue(bool((data == 41.0 + j).all().item()), f"block {j} lost ghost")
             kv3.close()
         s2.take_finish_event().synchronize()
-        manager.drain_gpu_reclaim()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
 
     def test_va_pressure_spills_retained(self) -> None:
         manager = self.manager
@@ -1488,7 +1517,7 @@ class TestArenaLazyRetention(unittest.TestCase):
             self.assertTrue(kv1.resize(2 * self.TPB))
             kv1.close()
         s.take_finish_event().synchronize()
-        self.assertEqual(manager.drain_gpu_reclaim(), 1)  # retained (holds VA)
+        self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)  # retained (holds VA)
         kv2 = manager.create_kv_cache(max_capacity=blocks * self.TPB)
         kv3 = manager.create_kv_cache(max_capacity=blocks * self.TPB)
         with TemporaryCudaStream([]) as s2:
@@ -1498,7 +1527,7 @@ class TestArenaLazyRetention(unittest.TestCase):
             kv2.close()
             kv3.close()
         s2.take_finish_event().synchronize()
-        manager.drain_gpu_reclaim()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
 
 
 @requires_cuda
@@ -1545,7 +1574,7 @@ class TestArenaWriteThroughOnCommit(TestArenaKVCacheManagerEndToEnd):
             self.assertEqual(len(wt_ids), 2)
             kv.close()
         s.take_finish_event().synchronize()
-        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
         # the free path adopted the write-through copies: no new host slots
         self.assertEqual(self._host_used(), 2)
         # the canonical pages now live in exactly those pre-copied slots
@@ -1563,7 +1592,7 @@ class TestArenaWriteThroughOnCommit(TestArenaKVCacheManagerEndToEnd):
                 self.assertTrue(bool((data == 7.0 + j).all().item()))
             kv2.close()
         s2.take_finish_event().synchronize()
-        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
         self.assertEqual(self._host_used(), 2)
 
     def test_suspend_adopts_write_through_copies(self) -> None:
@@ -1580,7 +1609,7 @@ class TestArenaWriteThroughOnCommit(TestArenaKVCacheManagerEndToEnd):
             self.assertEqual(self._host_used(), 2)  # written through at commit
             kv.suspend()
         s.take_finish_event().synchronize()
-        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
         # committed blocks adopted (still 2) + the uncommitted block moved (1)
         self.assertEqual(self._host_used(), 3)
         with TemporaryCudaStream([]) as s2:
@@ -1592,7 +1621,7 @@ class TestArenaWriteThroughOnCommit(TestArenaKVCacheManagerEndToEnd):
                 self.assertTrue(bool((data == 9.0 + j).all().item()))
             kv.close()
         s2.take_finish_event().synchronize()
-        self.assertEqual(manager.drain_gpu_reclaim(), 1)
+        self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
         self.assertEqual(self._host_used(), 2)
 
 

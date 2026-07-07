@@ -204,7 +204,12 @@ class TestArenaAdapter(unittest.TestCase):
         mgr.kv_cache_map.pop(1)
         mgr.index_mapper.remove_sequence(1)
         torch.cuda.synchronize()
-        self.assertGreaterEqual(mgr.impl.drain_gpu_reclaim(), 1)
+        # Fenced drains, as the adapter issues each iteration (risk #3). The
+        # fence may complete between the two calls, so assert on the total.
+        reclaimed = mgr.impl.drain_gpu_reclaim(mgr._reclaim_fence())
+        torch.cuda.synchronize()
+        reclaimed += mgr.impl.drain_gpu_reclaim(mgr._reclaim_fence())
+        self.assertGreaterEqual(reclaimed, 1)
         self.assertEqual(budget.used_pages, 0)
 
 

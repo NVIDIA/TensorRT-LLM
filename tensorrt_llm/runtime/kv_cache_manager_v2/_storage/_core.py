@@ -674,6 +674,7 @@ class SequenceRange:
         "_freed",
         "_gate_events",
         "_free_event",
+        "_reclaim_fence",
         "_ghost_keys",
     )
     base_block: int
@@ -682,6 +683,14 @@ class SequenceRange:
     _freed: bool
     _gate_events: list[CachedCudaEvent]  # pending ready events of released slots
     _free_event: CachedCudaEvent
+    # Execution-stream fence recorded at the first drain point after the free
+    # (DESIGN.md §4.2, risk #3). The overlap scheduler may have speculatively
+    # enqueued a step that still reads this range when free_sequence runs; the
+    # free/gate events do not order against that step. A fence recorded on the
+    # execution stream at a later drain point covers every launch that could
+    # reference the range (steps enqueued after it no longer contain the
+    # sequence). None until the first fenced drain sees this range.
+    _reclaim_fence: CachedCudaEvent | None
     # Ghost registry keys (§4.4 phase 2): ids of host pages whose bytes still
     # live in this (retained) range; purged when the range is reclaimed.
     _ghost_keys: list[int]
@@ -693,6 +702,7 @@ class SequenceRange:
         self._freed = False
         self._gate_events = []
         self._free_event = CachedCudaEvent.NULL
+        self._reclaim_fence = None
         self._ghost_keys = []
 
     @property
@@ -704,6 +714,8 @@ class SequenceRange:
 
     def _ready_to_reclaim(self) -> bool:
         if not self._freed or self._outstanding != 0:
+            return False
+        if self._reclaim_fence is None or not self._reclaim_fence.query_complete():
             return False
         if not self._free_event.query_complete():
             return False
@@ -817,6 +829,13 @@ class ArenaPoolGroup(PoolGroupBase):
             rng._free_event.synchronize()
             for ev in rng._gate_events:
                 ev.synchronize()
+            # Teardown blocks until the device is quiet, so the speculative-step
+            # fence is moot; substitute the (complete) null event for unfenced
+            # ranges and synchronize real ones.
+            if rng._reclaim_fence is None:
+                rng._reclaim_fence = CachedCudaEvent.NULL
+            else:
+                rng._reclaim_fence.synchronize()
         self.drain_reclaim()
         for rng in list(self._retained.values()):
             for ev in rng._gate_events:
@@ -924,13 +943,22 @@ class ArenaPoolGroup(PoolGroupBase):
         rng._free_event = last_consumer
         self._pending_reclaim.append(rng)
 
-    def drain_reclaim(self) -> int:
+    def drain_reclaim(self, fence: CachedCudaEvent | None = None) -> int:
         """Process every freed range whose gating conditions have all
         completed: unmap and recycle it, or -- with lazy retention (§4.4
         phase 2) -- keep its pages mapped and park it on the retained LRU,
         to be reclaimed only under pressure (:meth:`spill_retained`).
         Returns the number of ranges processed. Call at iteration
-        boundaries."""
+        boundaries.
+
+        ``fence`` must be an event recorded on the *execution* stream at the
+        call site; it is attached to ranges freed since the previous fenced
+        drain and gates their reclaim (risk #3: a speculatively enqueued step
+        may still read a just-freed range — see ``SequenceRange._reclaim_fence``).
+        Unfenced ranges are never reclaimed, so fenced drains must happen
+        periodically (the pyexecutor adapter fences every iteration)."""
+        if fence is not None:
+            self.fence_pending_frees(fence)
         remaining: list[SequenceRange] = []
         processed = 0
         for rng in self._pending_reclaim:
@@ -945,6 +973,15 @@ class ArenaPoolGroup(PoolGroupBase):
                 remaining.append(rng)
         self._pending_reclaim = remaining
         return processed
+
+    def fence_pending_frees(self, fence: CachedCudaEvent) -> None:
+        """Attach ``fence`` (an event recorded on the execution stream at an
+        iteration boundary) to every pending freed range that has none yet.
+        Assign-only variant of the ``fence`` parameter of
+        :meth:`drain_reclaim`."""
+        for rng in self._pending_reclaim:
+            if rng._reclaim_fence is None:
+                rng._reclaim_fence = fence
 
     def _reclaim_range(self, rng: SequenceRange) -> None:
         """Unmap a range's pages, return its block indices, purge its ghosts."""
@@ -1468,14 +1505,23 @@ class GpuArenaCacheLevelStorage(CacheLevelStorage):
         assert type(pg) is ArenaPoolGroup
         return pg
 
-    def drain_reclaim(self) -> int:
+    def drain_reclaim(self, fence: CachedCudaEvent | None = None) -> int:
         """Drain every pool group's deferred-reclaim queue (call at iteration
-        boundaries). Returns the number of sequence ranges reclaimed."""
+        boundaries). ``fence`` gates newly freed ranges against speculatively
+        enqueued steps (see :meth:`ArenaPoolGroup.drain_reclaim`). Returns the
+        number of sequence ranges reclaimed."""
         reclaimed = 0
         for pg in self._pool_groups:
             assert type(pg) is ArenaPoolGroup
-            reclaimed += pg.drain_reclaim()
+            reclaimed += pg.drain_reclaim(fence)
         return reclaimed
+
+    def fence_pending_frees(self, fence: CachedCudaEvent) -> None:
+        """Assign the iteration-boundary reclaim fence in every pool group
+        without draining (see :meth:`ArenaPoolGroup.fence_pending_frees`)."""
+        for pg in self._pool_groups:
+            assert type(pg) is ArenaPoolGroup
+            pg.fence_pending_frees(fence)
 
     def spill_retained(self, min_pages: int) -> int:
         """Reclaim lazily retained ranges (§4.4 phase 2), LRU-first per pool
