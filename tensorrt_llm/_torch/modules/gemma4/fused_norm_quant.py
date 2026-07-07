@@ -38,8 +38,8 @@ The only residual difference vs the unfused chain is the fp32 reduction
 order inside the norm's sum of squares (same class as the other fused
 Gemma4 kernels).
 
-The unfused path is kept as the reference / fallback; set
-TRTLLM_GEMMA4_DISABLE_FUSED_NORM_QUANT=1 to force it (rollback switch).
+The unfused path is kept only for configurations this kernel does not
+support (non-NVFP4 gate_up_proj, MoE block, LoRA, torch.compile).
 """
 
 from typing import Tuple

@@ -50,10 +50,8 @@ difference is the fp32 reduction order inside the sums of squares (same
 class as the other fused Gemma4 kernels; measured ~5e-6 one-step bf16 flips
 at serving shapes).
 
-The unfused paths are kept as the reference / fallback; the rollback
-switches are TRTLLM_GEMMA4_DISABLE_FUSED_TAIL=1 (tail),
-TRTLLM_GEMMA4_DISABLE_FUSED_NORM_ADD=1 (post-attention norm+add) and
-TRTLLM_GEMMA4_DISABLE_FUSED_TAIL_NORM2=1 (secondary next-layer norm output).
+The unfused paths are kept only for configurations these kernels do not
+support (MoE block, PLE, non-bf16 norms, torch.compile).
 """
 
 from typing import Optional, Tuple, Union

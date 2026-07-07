@@ -15,7 +15,6 @@
 """TensorRT-LLM PyTorch backend implementation for Gemma4 text model."""
 
 import math
-import os
 from typing import Dict, Optional, Tuple, Union
 
 import torch
@@ -116,8 +115,7 @@ class _Gemma4GeluQuantMLP(GatedMLP):
     and returns an Fp4QuantizedTensor, which Linear's NVFP4 method consumes
     directly (using the same static input_scale / alpha the unfused quantize
     would use) - so down_proj sees byte-identical inputs.  The unfused path
-    stays as the reference / fallback; set
-    TRTLLM_GEMMA4_DISABLE_FUSED_GELU_QUANT=1 to force it (rollback switch).
+    remains only for configurations the kernel does not support.
     """
 
     def __init__(self, *args, **kwargs):
@@ -130,8 +128,7 @@ class _Gemma4GeluQuantMLP(GatedMLP):
         if self._fused_gelu_quant is None:
             dp = self.down_proj
             self._fused_gelu_quant = (
-                os.environ.get("TRTLLM_GEMMA4_DISABLE_FUSED_GELU_QUANT", "0") != "1"
-                and self.activation is gelu_tanh
+                self.activation is gelu_tanh
                 # Mirror the checks the pre-quantized-input path in
                 # Linear._input_prepare enforces for Fp4QuantizedTensor.
                 and getattr(dp, "has_nvfp4", False)
@@ -380,8 +377,7 @@ class Gemma4Attention(QKNormRoPEAttention):
         if self._fused_qkv_prep is None:
             rot = self.rotary_emb
             self._fused_qkv_prep = (
-                os.environ.get("TRTLLM_GEMMA4_DISABLE_FUSED_QKV_PREP", "0") != "1"
-                and not self.is_kv_shared
+                not self.is_kv_shared
                 and not self.fuse_qk_norm_rope
                 and not self.skip_rope
                 # The kernel emits KV-cache-dtype FP8 and replicates the
@@ -780,8 +776,7 @@ class Gemma4DecoderLayer(DecoderLayer):
         if self._fused_tail is None:
             norm = self.post_feedforward_layernorm
             self._fused_tail = (
-                os.environ.get("TRTLLM_GEMMA4_DISABLE_FUSED_TAIL", "0") != "1"
-                and not self.enable_moe_block
+                not self.enable_moe_block
                 and not self.hidden_size_per_layer_input
                 # The kernel replicates the plain (use_gemma=False)
                 # flashinfer rmsnorm the module dispatches to.
@@ -811,9 +806,7 @@ class Gemma4DecoderLayer(DecoderLayer):
 
     def _fused_norm_add_enabled(self) -> bool:
         if self._fused_norm_add is None:
-            self._fused_norm_add = os.environ.get(
-                "TRTLLM_GEMMA4_DISABLE_FUSED_NORM_ADD", "0"
-            ) != "1" and self._norm_is_plain_bf16(self.post_attention_layernorm)
+            self._fused_norm_add = self._norm_is_plain_bf16(self.post_attention_layernorm)
             logger.info_once(
                 f"Gemma4 fused post-attention norm+add path: "
                 f"{'enabled' if self._fused_norm_add else 'disabled'}",
@@ -825,8 +818,7 @@ class Gemma4DecoderLayer(DecoderLayer):
         if self._fused_norm_quant is None:
             gu = self.mlp.gate_up_proj
             self._fused_norm_quant = (
-                os.environ.get("TRTLLM_GEMMA4_DISABLE_FUSED_NORM_QUANT", "0") != "1"
-                and not self.enable_moe_block
+                not self.enable_moe_block
                 and self._norm_is_plain_bf16(self.pre_feedforward_layernorm)
                 # Mirror the checks the pre-quantized-input path in
                 # Linear._input_prepare enforces for Fp4QuantizedTensor.
@@ -846,11 +838,7 @@ class Gemma4DecoderLayer(DecoderLayer):
     def _fused_tail_norm2_enabled(self) -> bool:
         if self._fused_tail_norm2 is None:
             nxt = self._next_input_layernorm
-            self._fused_tail_norm2 = (
-                os.environ.get("TRTLLM_GEMMA4_DISABLE_FUSED_TAIL_NORM2", "0") != "1"
-                and nxt is not None
-                and self._norm_is_plain_bf16(nxt)
-            )
+            self._fused_tail_norm2 = nxt is not None and self._norm_is_plain_bf16(nxt)
             logger.info_once(
                 f"Gemma4 fused tail next-layer-norm output path: "
                 f"{'enabled' if self._fused_tail_norm2 else 'disabled'}",
@@ -901,9 +889,8 @@ class Gemma4DecoderLayer(DecoderLayer):
             **kwargs,
         )
         # Fused post_attention RMSNorm + residual add (one kernel instead of
-        # a norm round-trip plus a separate add). The unfused sequence stays
-        # as the reference / fallback; set
-        # TRTLLM_GEMMA4_DISABLE_FUSED_NORM_ADD=1 to force it.
+        # a norm round-trip plus a separate add). The unfused sequence remains
+        # for configurations the kernel does not support.
         if (
             isinstance(hidden_states, torch.Tensor)
             and hidden_states.dim() == 2
@@ -927,8 +914,7 @@ class Gemma4DecoderLayer(DecoderLayer):
         # Fused pre_feedforward RMSNorm + gate_up NVFP4 quantize: the normed
         # tensor is consumed only by gate_up_proj's input quantize, so emit
         # the FP4 payload + swizzled scales directly (same static
-        # input_scale / alpha, byte-identical inputs to the GEMM). Fallback
-        # switch: TRTLLM_GEMMA4_DISABLE_FUSED_NORM_QUANT=1.
+        # input_scale / alpha, byte-identical inputs to the GEMM).
         if (
             not lora_params
             and isinstance(hidden_states, torch.Tensor)
@@ -972,8 +958,8 @@ class Gemma4DecoderLayer(DecoderLayer):
         # Fused tail: post_ffn RMSNorm + residual add + fp32 layer_scalar mul
         # + bf16 cast in one kernel (the unfused chain materializes a full
         # fp32 [M, H] tensor because layer_scalar is an fp32 buffer). The
-        # unfused sequence below stays as the reference / fallback; set
-        # TRTLLM_GEMMA4_DISABLE_FUSED_TAIL=1 to force it.
+        # unfused sequence below remains for configurations the kernel does
+        # not support (MoE block, PLE, non-bf16).
         if (
             per_layer_input is None
             and isinstance(hidden_states, torch.Tensor)
@@ -986,8 +972,7 @@ class Gemma4DecoderLayer(DecoderLayer):
             if self._fused_tail_norm2_enabled():
                 # Also emit the next layer's input norm as a second output
                 # (returned as a (hidden, pre_normed) pair the model loop
-                # hands to the next layer). Fallback switch:
-                # TRTLLM_GEMMA4_DISABLE_FUSED_TAIL_NORM2=1.
+                # hands to the next layer).
                 nxt = self._next_input_layernorm
                 return gemma4_fused_norm_add_scale(
                     hidden_states,

@@ -35,8 +35,8 @@ Numerics replicate the unfused chain byte-for-byte on SM100:
   get_sf_out_offset_128x4 (rows padded to 128; padding is zero-filled here,
   uninitialized in the unfused op).
 
-The unfused path is kept as the reference / fallback; set
-TRTLLM_GEMMA4_DISABLE_FUSED_GELU_QUANT=1 to force it (rollback switch).
+The unfused path is kept only for configurations this kernel does not
+support (non-NVFP4 down_proj, LoRA, torch.compile).
 """
 
 from typing import Tuple

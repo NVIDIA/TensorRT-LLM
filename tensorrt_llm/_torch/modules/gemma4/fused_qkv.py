@@ -40,8 +40,9 @@ CUDA-graph capture). Tuned on B200: 363 -> ~75 us/call at ~6.5k tokens for
 the 64-head hd=256 shape (~4.3 TB/s effective), 2.8x on the graph-replayed
 decode shape.
 
-The unfused path is kept as the reference / fallback; set
-TRTLLM_GEMMA4_DISABLE_FUSED_QKV_PREP=1 to force it (rollback switch).
+The unfused path is kept only for configurations this kernel does not
+support (KV-shared layers, non-FP8 KV cache, custom-mask multimodal
+prefill, torch.compile).
 """
 
 from typing import Tuple
