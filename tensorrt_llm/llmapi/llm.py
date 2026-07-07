@@ -9,7 +9,8 @@ import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Literal, Optional, Sequence, Tuple, Union, cast
+from typing import (Any, Dict, List, Literal, Optional, Sequence, Tuple, Union,
+                    cast)
 
 import torch
 import transformers
@@ -201,6 +202,132 @@ def _contains_bart_forced_tokens_logits_processor(processor: Any) -> bool:
             _contains_bart_forced_tokens_logits_processor(item)
             for item in processors)
     return False
+
+
+class _WhisperSuppressTokensLogitsProcessor(LogitsProcessor):
+    """Apply Whisper suppress-token lists from the HF generation config.
+
+    ``suppress_token_ids`` are masked at every generation step;
+    ``begin_suppress_token_ids`` only when sampling the first token after the
+    decoder prompt. The prompt length is captured from the first callback
+    (which runs before the first sampled token, when ``token_ids`` holds
+    exactly the prompt) so variable-length decoder prompts need no plumbing.
+    """
+
+    # Cap on tracked request ids so a SamplingParams object reused across many
+    # generate() calls does not grow the map unboundedly. Far above any
+    # realistic number of in-flight requests, so pruning (oldest closed-window
+    # entries first) never touches an active sequence in practice.
+    _MAX_TRACKED_REQUESTS = 16384
+
+    def __init__(self, *, suppress_token_ids: List[int],
+                 begin_suppress_token_ids: List[int]) -> None:
+        self.suppress_token_ids = [int(t) for t in suppress_token_ids or []]
+        self.begin_suppress_token_ids = [
+            int(t) for t in begin_suppress_token_ids or []
+        ]
+        # req_id -> prompt length while the begin-suppress window is open, then
+        # None once it closes. Don't delete the entry: a missing key would be
+        # re-captured at the current length, re-arming begin-suppression
+        # mid-sequence.
+        self._prompt_len_by_req: Dict[int, Optional[int]] = {}
+
+    def __call__(
+        self,
+        req_id: int,
+        logits: torch.Tensor,
+        token_ids: List[List[int]],
+        stream_ptr: Optional[int],
+        client_id: Optional[int],
+    ) -> None:
+        del client_id
+        if stream_ptr is None:
+            self._apply(req_id, token_ids, logits)
+            return
+        with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
+            self._apply(req_id, token_ids, logits)
+
+    def _apply(self, req_id: int, token_ids: List[List[int]],
+               logits: torch.Tensor) -> None:
+        if req_id not in self._prompt_len_by_req:
+            self._prune_closed_entries()
+            # First callback runs before the first sampled token, when the
+            # sequence holds exactly the decoder prompt.
+            self._prompt_len_by_req[req_id] = len(token_ids[0])
+        prompt_len = self._prompt_len_by_req[req_id]
+        for beam_idx, beam_token_ids in enumerate(token_ids):
+            target = logits
+            if logits.dim() > 1 and logits.shape[0] == len(token_ids):
+                target = logits[beam_idx]
+            if self.suppress_token_ids:
+                target[..., self.suppress_token_ids] = float("-inf")
+            if (prompt_len is not None and self.begin_suppress_token_ids
+                    and len(beam_token_ids) == prompt_len):
+                target[..., self.begin_suppress_token_ids] = float("-inf")
+        if prompt_len is not None and len(token_ids[0]) > prompt_len:
+            # Begin-suppress window closed; keep the entry as a tombstone.
+            self._prompt_len_by_req[req_id] = None
+
+    def _prune_closed_entries(self) -> None:
+        """Evict the oldest closed-window entries once the map is at capacity.
+
+        Only ``None`` tombstones are eligible: evicting an entry whose window
+        is still open (or a tombstone of a still-active request) would let the
+        next callback re-capture the prompt length mid-sequence and re-arm
+        begin-suppression at the wrong position.
+        """
+        if len(self._prompt_len_by_req) < self._MAX_TRACKED_REQUESTS:
+            return
+        excess = len(self._prompt_len_by_req) - self._MAX_TRACKED_REQUESTS + 1
+        stale = [
+            rid for rid, prompt_len in self._prompt_len_by_req.items()
+            if prompt_len is None
+        ]
+        for rid in stale[:excess]:
+            del self._prompt_len_by_req[rid]
+
+
+def _contains_whisper_suppress_tokens_logits_processor(processor: Any) -> bool:
+    if isinstance(processor, _WhisperSuppressTokensLogitsProcessor):
+        return True
+    if isinstance(processor, list):
+        return any(
+            _contains_whisper_suppress_tokens_logits_processor(item)
+            for item in processor)
+    processors = getattr(processor, "processors", None)
+    if isinstance(processors, list):
+        return any(
+            _contains_whisper_suppress_tokens_logits_processor(item)
+            for item in processors)
+    return False
+
+
+def _append_logits_processor(sampling_params: SamplingParams,
+                             processor: LogitsProcessor) -> None:
+    """Attach a logits processor without clobbering user-provided ones."""
+    existing = sampling_params.logits_processor
+    if existing is None:
+        sampling_params.logits_processor = processor
+    elif isinstance(existing, list):
+        existing.append(processor)
+    else:
+        sampling_params.logits_processor = [existing, processor]
+
+
+def _multimodal_params_have_encoder_features(
+        multimodal_params: Optional["MultimodalParams"]) -> bool:
+    """True when multimodal data carries an encoder feature tensor.
+
+    Audio encoder-decoder models (e.g. Whisper) feed the encoder a feature
+    tensor instead of token ids; its presence switches the prompt handling in
+    ``_preprocess``. Keyed on the purpose-specific ``encoder_input_features``,
+    not the generic HF ``input_features`` that decoder-only audio models emit.
+    """
+    if multimodal_params is None or multimodal_params.multimodal_data is None:
+        return False
+    audio_data = multimodal_params.multimodal_data.get("audio")
+    return isinstance(audio_data,
+                      dict) and "encoder_input_features" in audio_data
 
 
 TRT_LLM_DOCSTRING = TRT_LLMARGS_EXPLICIT_DOCSTRING + """
@@ -933,8 +1060,25 @@ class BaseLLM:
 
         normalized_encoder_input_token_ids = None
         if self._is_encoder_decoder_model():
-            normalized_encoder_input_token_ids = prompt_token_ids
-            prompt_token_ids = [self._get_decoder_start_token_id()]
+            if _multimodal_params_have_encoder_features(multimodal_params):
+                # Audio encoder-decoder models (e.g. Whisper): the encoder reads
+                # the feature tensor from multimodal data and the processor's
+                # token ids are already the decoder prompt — leave both as-is.
+                pass
+            elif getattr(self.input_processor, "requires_encoder_features",
+                         False):
+                # Feature-driven encoder but no features: reject now, before the
+                # request reaches the encoder step where feeding tokens as
+                # encoder input would fail the whole co-scheduled batch.
+                raise ValueError(
+                    "This encoder-decoder model takes its encoder input from "
+                    "multi_modal_data (e.g. audio), not from prompt tokens; "
+                    "token-only prompts are not supported.")
+            else:
+                # Text encoder-decoder models (BART/T5): the tokenized prompt
+                # feeds the encoder; the decoder starts from its start token.
+                normalized_encoder_input_token_ids = prompt_token_ids
+                prompt_token_ids = [self._get_decoder_start_token_id()]
 
         return (prompt_token_ids, prompt, query_token_ids, multimodal_params,
                 normalized_encoder_input_token_ids)
@@ -1295,6 +1439,7 @@ class BaseLLM:
                 sampling_params._setup(self.tokenizer, self._hf_model_config,
                                        self._generation_config)
             self._add_bart_forced_tokens_logits_processor(sampling_params)
+            self._add_whisper_suppress_tokens_logits_processor(sampling_params)
             add_thinking_budget_logits_processor(
                 sampling_params,
                 reasoning_parser=self.args.reasoning_parser,
@@ -1345,12 +1490,33 @@ class BaseLLM:
             forced_eos_token_id=forced_eos_token_id,
             max_tokens=sampling_params.max_tokens,
         )
-        if existing is None:
-            sampling_params.logits_processor = processor
-        elif isinstance(existing, list):
-            existing.append(processor)
-        else:
-            sampling_params.logits_processor = [existing, processor]
+        _append_logits_processor(sampling_params, processor)
+
+    def _add_whisper_suppress_tokens_logits_processor(
+            self, sampling_params: SamplingParams) -> None:
+        if self.args.backend != "pytorch":
+            return
+        if getattr(self._hf_model_config, "model_type", None) != "whisper":
+            return
+        if self._generation_config is None:
+            return
+
+        suppress_token_ids = getattr(self._generation_config, "suppress_tokens",
+                                     None) or []
+        begin_suppress_token_ids = getattr(self._generation_config,
+                                           "begin_suppress_tokens", None) or []
+        if not suppress_token_ids and not begin_suppress_token_ids:
+            return
+
+        existing = sampling_params.logits_processor
+        if _contains_whisper_suppress_tokens_logits_processor(existing):
+            return
+
+        processor = _WhisperSuppressTokensLogitsProcessor(
+            suppress_token_ids=suppress_token_ids,
+            begin_suppress_token_ids=begin_suppress_token_ids,
+        )
+        _append_logits_processor(sampling_params, processor)
 
     def _check_arguments(self, prompt_len: int, query_len: int,
                          sampling_params: SamplingParams,
