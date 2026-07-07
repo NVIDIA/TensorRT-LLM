@@ -2742,9 +2742,11 @@ _DEFAULT_MIXED_STRESS_PROFILES = [
 ]
 
 
-async def _send_mixed_request(session, server_url: str,
+async def _send_mixed_request(session,
+                              server_url: str,
                               profile: _MixedStressProfile,
-                              results: list) -> None:
+                              results: list,
+                              model_name: str = "test-model") -> None:
     """Send one request according to profile and record the outcome.
 
     Three behaviors keyed on profile:
@@ -2758,7 +2760,7 @@ async def _send_mixed_request(session, server_url: str,
     prompt = "test " * (prompt_len // 5)
 
     payload = {
-        "model": "test-model",
+        "model": model_name,
         "prompt": prompt,
         "max_tokens": profile.output_len,
         "temperature": profile.temperature,
@@ -2840,6 +2842,7 @@ async def _run_mixed_stress_async(server_url: str,
                                   profiles: list,
                                   total_requests: int,
                                   concurrency: int,
+                                  model_name: str = "test-model",
                                   progress_callback=None,
                                   progress_interval: int = 30) -> dict:
     """Drive total_requests requests at the given concurrency level.
@@ -2881,8 +2884,9 @@ async def _run_mixed_stress_async(server_url: str,
                                          weights=weights,
                                          k=total_requests)
         tasks = [
-            bounded(_send_mixed_request(session, server_url, p, results))
-            for p in chosen_profiles
+            bounded(
+                _send_mixed_request(session, server_url, p, results,
+                                    model_name)) for p in chosen_profiles
         ]
         monitor = asyncio.create_task(_progress_monitor())
         try:
@@ -2987,6 +2991,7 @@ def run_disaggregated_mixed_stress(example_dir: str,
                                     profiles,
                                     total_requests,
                                     concurrency,
+                                    model_name=model_path,
                                     progress_callback=progress_callback))
 
         logger.info("Mixed stress summary: %s", summary)
