@@ -16,6 +16,8 @@ from transformers import Qwen3NextConfig
 
 from tensorrt_llm._torch.modules.fla.fused_recurrent import fused_recurrent_gated_delta_rule_update
 from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
+    _can_use_flashinfer_gdn_verify,
+    _flashinfer_gdn_verify,
     fused_sigmoid_gating_delta_rule_update,
 )
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import use_cpp_mamba_cache_manager
@@ -667,6 +669,46 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
             a = a.reshape(num_decodes, draft_token_num, -1)
             b = b.reshape(num_decodes, draft_token_num, -1)
+
+            # Prefer the FlashInfer MTP kernel (raw a/b gating in-kernel,
+            # initial state gathered from the pool via cache indices, per-step
+            # intermediate states written to the batch-scoped [:num_decodes]
+            # prefix consumed by update_mamba_states()); fall back to the
+            # Triton recurrent kernel when unavailable.
+            if _can_use_flashinfer_gdn_verify(
+                ssm_states, self.head_k_dim, self.head_v_dim, draft_token_num
+            ):
+                output_d = None
+                if output is not None:
+                    output_d = output.view(
+                        num_decodes,
+                        draft_token_num,
+                        self.num_v_heads // self.attn_tp_size,
+                        self.head_v_dim,
+                    )
+                return _flashinfer_gdn_verify(
+                    A_log=self.A_log,
+                    a=a,
+                    dt_bias=self.dt_bias,
+                    softplus_beta=1.0,
+                    softplus_threshold=20.0,
+                    q=query,
+                    k=key,
+                    v=value,
+                    b=b,
+                    initial_state_source=ssm_states,
+                    initial_state_indices=cache_indices[:num_decodes],
+                    intermediate_states_buffer=intermediate_ssm_states[:num_decodes],
+                    scale=self.head_k_dim**-0.5,
+                    use_qk_l2norm_in_kernel=True,
+                    output=output_d,
+                ).view(
+                    1,
+                    num_decodes * draft_token_num,
+                    self.num_v_heads // self.attn_tp_size,
+                    self.head_v_dim,
+                )
+
             beta = b.sigmoid()
             g = fused_gdn_gating(
                 self.A_log,
@@ -921,41 +963,67 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
             a_d = a_d.reshape(num_decodes, draft_token_num, -1)
             b_d = b_d.reshape(num_decodes, draft_token_num, -1)
-            beta_d = b_d.sigmoid()
-            g_d = fused_gdn_gating(
-                self.A_log,
-                a_d.view(num_decodes * draft_token_num, -1),
-                self.dt_bias,
-            ).reshape(num_decodes, draft_token_num, -1)
-
-            recurrent_state_source = ssm_states[state_indices_d]
-            recurrent_state_indices = torch.arange(
-                num_decodes, dtype=torch.int32, device=state_indices_d.device
-            )
+            out_v_heads = self.num_v_heads // self.attn_tp_size
 
             output_d = None
             if output is not None:
                 output_d = output[:, num_prefill_tokens:, :, :].view(
                     num_decodes,
                     draft_token_num,
-                    self.num_v_heads // self.attn_tp_size,
+                    out_v_heads,
                     self.head_v_dim,
                 )
 
-            attn_out_decode = fused_recurrent_gated_delta_rule_update(
-                q=query_d,
-                k=key_d,
-                v=value_d,
-                g=g_d,
-                beta=beta_d,
-                initial_state_source=recurrent_state_source,
-                initial_state_indices=recurrent_state_indices,
-                use_qk_l2norm_in_kernel=True,
-                disable_state_update=True,
-                intermediate_states_buffer=intermediate_ssm_states,
-                cache_steps=draft_token_num,
-                output=output_d,
-            ).view(1, num_decode_tokens, self.num_v_heads // self.attn_tp_size, self.head_v_dim)
+            if _can_use_flashinfer_gdn_verify(
+                ssm_states, self.head_k_dim, self.head_v_dim, draft_token_num
+            ):
+                # FI gathers the initial state from the pool via state_indices_d
+                # (no host gather) and writes batch-scoped intermediate states;
+                # the [:num_decodes] prefix matches update_mamba_states()'s rows.
+                attn_out_decode = _flashinfer_gdn_verify(
+                    A_log=self.A_log,
+                    a=a_d,
+                    dt_bias=self.dt_bias,
+                    softplus_beta=1.0,
+                    softplus_threshold=20.0,
+                    q=query_d,
+                    k=key_d,
+                    v=value_d,
+                    b=b_d,
+                    initial_state_source=ssm_states,
+                    initial_state_indices=state_indices_d,
+                    intermediate_states_buffer=intermediate_ssm_states[:num_decodes],
+                    scale=self.head_k_dim**-0.5,
+                    use_qk_l2norm_in_kernel=True,
+                    output=output_d,
+                ).reshape(1, num_decode_tokens, out_v_heads, self.head_v_dim)
+            else:
+                beta_d = b_d.sigmoid()
+                g_d = fused_gdn_gating(
+                    self.A_log,
+                    a_d.view(num_decodes * draft_token_num, -1),
+                    self.dt_bias,
+                ).reshape(num_decodes, draft_token_num, -1)
+
+                recurrent_state_source = ssm_states[state_indices_d]
+                recurrent_state_indices = torch.arange(
+                    num_decodes, dtype=torch.int32, device=state_indices_d.device
+                )
+
+                attn_out_decode = fused_recurrent_gated_delta_rule_update(
+                    q=query_d,
+                    k=key_d,
+                    v=value_d,
+                    g=g_d,
+                    beta=beta_d,
+                    initial_state_source=recurrent_state_source,
+                    initial_state_indices=recurrent_state_indices,
+                    use_qk_l2norm_in_kernel=True,
+                    disable_state_update=True,
+                    intermediate_states_buffer=intermediate_ssm_states,
+                    cache_steps=draft_token_num,
+                    output=output_d,
+                ).view(1, num_decode_tokens, out_v_heads, self.head_v_dim)
 
             if output is not None:
                 return output

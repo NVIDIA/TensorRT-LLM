@@ -68,6 +68,7 @@ l0_a10:
   - unittest/disaggregated/test_cluster_storage.py
   - unittest/disaggregated/test_extractor.py
   - unittest/disaggregated/test_peer.py
+  - unittest/disaggregated/test_bounce.py
   - unittest/disaggregated/region/test_block.py
   - unittest/disaggregated/test_mamba_transfer.py
   - unittest/tools

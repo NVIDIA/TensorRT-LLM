@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import inspect
 import os
 from functools import cached_property
@@ -23,6 +38,7 @@ from ...utils import (ActivationType, AuxStreamType, EventType,
                       Fp4QuantizedTensor)
 from .interface import AlltoallMethodType, MoE
 from .quantization import UnquantizedFusedMoEMethod
+from .wide_ep_ft import get_wide_ep_ft_options
 
 # isort: off
 from .quantization import (
@@ -348,6 +364,8 @@ class CutlassFusedMoE(MoE):
                         dtype,
                         self.num_experts if self.layer_load_balancer else None,
                     )
+                    ep_group_health, watchdog_timeout_s, watchdog_poll_interval_s = (
+                        get_wide_ep_ft_options(model_config))
 
                     self.moe_a2a = MoeAlltoAll(
                         mapping=self.mapping,
@@ -357,6 +375,10 @@ class CutlassFusedMoE(MoE):
                         workspace_size_per_rank=workspace_size,
                         num_experts=self.num_experts
                         if self.layer_load_balancer else None,
+                        ep_group_health=ep_group_health,
+                        alltoall_watchdog_timeout_s=watchdog_timeout_s,
+                        alltoall_watchdog_poll_interval_s=
+                        watchdog_poll_interval_s,
                     )
                 elif self.alltoall_method_type == AlltoallMethodType.DeepEP or self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                     raise NotImplementedError(
@@ -1621,6 +1643,3 @@ class CutlassFusedMoE(MoE):
             kargs["allow_partial_loading"] = allow_partial_loading
         self.quant_method.load_weights(self, weights, self.weight_loading_mode,
                                        **kargs)
-
-    def post_load_weights(self):
-        self.quant_method.post_load_weights(self)

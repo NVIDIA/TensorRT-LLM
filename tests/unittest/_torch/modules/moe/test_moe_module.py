@@ -527,7 +527,9 @@ def _test_moe_worker_impl(
     # Setup mapping
     mapping = mapping or Mapping()
     mapping.rank = mpi_rank()
-    all_rank_num_tokens = [seq_len] * mapping.world_size
+    # DP modes need per-rank token counts for cross-rank dispatch; non-DP modes
+    # (TTP/TEP) have no dispatch and the scheduler derives [x.shape[0]] from None.
+    all_rank_num_tokens = [seq_len] * mapping.world_size if mapping.enable_attention_dp else None
     torch.cuda.set_device(mapping.rank)
     _ensure_dist_for_megamoe(moe_backend, mapping.rank, mapping.world_size)
 

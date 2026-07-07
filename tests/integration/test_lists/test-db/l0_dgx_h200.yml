@@ -44,6 +44,7 @@ l0_dgx_h200:
   - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_genpp4[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_ctxtp2ep2pp2_gentp4_one_mtp_block_reuse[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_qwen3_32b_fp8[Qwen3/Qwen3-32B-FP8]
+  - disaggregated/test_disaggregated.py::test_disaggregated_mixed_stress_test[req60-conc64-qwen3_32b_fp8_mixed_stress]
   - unittest/llmapi/test_llm_pytorch.py::test_nemotron_nas_lora
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_only_spec_dec
 - condition:
