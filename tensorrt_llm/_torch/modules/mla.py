@@ -44,7 +44,7 @@ from ..attention_backend.sparse.dsa import (
     DSAtrtllmAttentionMetadata,
     transform_local_topk_and_prepare_pool_view,
 )
-from ..attention_backend.utils import create_attention, get_attention_backend
+from ..attention_backend.utils import create_attention
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..utils import is_torch_compiling, maybe_compiled_cat, maybe_compiled_copy_
@@ -53,7 +53,6 @@ from .attention import (
     _helix_cp_output_projection,
     _helix_post_process,
     _helix_zero_kv_mask,
-    _lower_sparse_attention_params,
     extract_extra_attrs,
 )
 from .linear import Linear, TensorParallelMode
@@ -353,8 +352,7 @@ class MLA(nn.Module):
         config = config or ModelConfig()
         sparse_attn_cfg = config.sparse_attention_config
         sparse_params = (
-            _lower_sparse_attention_params(
-                sparse_attn_cfg,
+            sparse_attn_cfg.to_sparse_params(
                 pretrained_config=config.pretrained_config,
                 layer_idx=self.layer_idx,
             )
@@ -591,8 +589,8 @@ class MLA(nn.Module):
         self.has_dsv4_indexer = (
             self.is_deepseek_v4
             and layer_idx is not None
-            and config.sparse_attention_config is not None
-            and config.sparse_attention_config.compress_ratios[layer_idx] == 4
+            and sparse_params is not None
+            and sparse_params.compress_ratios[layer_idx] == 4
         )
         self.indexer_stream = None
         self.indexer_aux_stream = None
@@ -605,9 +603,6 @@ class MLA(nn.Module):
             self.indexer_aux_stream if self.indexer_aux_stream is not None else aux_stream
         )
 
-        mqa_cls = get_attention_backend(
-            config.attn_backend, sparse_attention_config=config.sparse_attention_config
-        )
         self.mqa = create_attention(
             config.attn_backend,
             self.layer_idx,
@@ -626,7 +621,6 @@ class MLA(nn.Module):
             hidden_size=self.hidden_size,
             predicted_tokens_per_seq=self.predicted_tokens_per_seq,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-            attn_cls=mqa_cls,
             sparse_params=sparse_params,
             dtype=dtype,
             aux_stream=mqa_aux_stream,
@@ -681,10 +675,7 @@ class MLA(nn.Module):
             self.is_dsa and self.short_seq_mha_threshold > 0 and not self.apply_rotary_emb
         )
         if (not self.is_dsa or _short_seq_mha) and not self.is_deepseek_v4:
-            mha_sparse_config = None if _short_seq_mha else config.sparse_attention_config
-            mha_cls = get_attention_backend(
-                config.attn_backend, sparse_attention_config=mha_sparse_config
-            )
+            mha_sparse_params = None if _short_seq_mha else sparse_params
             self.mha = create_attention(
                 config.attn_backend,
                 self.layer_idx,
@@ -702,8 +693,7 @@ class MLA(nn.Module):
                 v_head_dim=self.v_head_dim,
                 predicted_tokens_per_seq=self.predicted_tokens_per_seq,
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
-                attn_cls=mha_cls,
-                sparse_params=(None if _short_seq_mha else sparse_params),
+                sparse_params=mha_sparse_params,
             )
         else:
             self.mha = None

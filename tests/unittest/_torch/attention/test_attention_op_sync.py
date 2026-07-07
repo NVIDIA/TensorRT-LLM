@@ -48,7 +48,6 @@ from tensorrt_llm._torch.attention_backend.fmha.fallback import (
     FallbackFmha,
 )
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
-from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import SkipSoftmaxKernelParams
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 
 # Roots used as the LHS of attribute chains at the call site. Match the
@@ -57,11 +56,9 @@ _SOURCE_CLASSES = {
     "attn": TrtllmAttention,
     "metadata": TrtllmAttentionMetadata,
     "forward_args": AttentionForwardArgs,
-    "skip_softmax_kernel_params": SkipSoftmaxKernelParams,
 }
 
 _THOP_KWARG_SOURCE_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
-    "beam_width": ("metadata", ("effective_beam_width",)),
     "context_lengths": ("metadata", ("prompt_lens_cuda_runtime",)),
     "head_size": ("attn", ("head_dim",)),
     "host_context_lengths": ("metadata", ("prompt_lens_cpu_runtime",)),
@@ -79,6 +76,20 @@ _THOP_KWARG_SOURCE_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
     "spec_decoding_target_max_draft_tokens": (
         "metadata",
         ("max_total_draft_tokens",),
+    ),
+    "skip_softmax_threshold_scale_factor_decode": (
+        "forward_args",
+        (
+            "skip_softmax_kernel_params",
+            "threshold_scale_factor_decode",
+        ),
+    ),
+    "skip_softmax_threshold_scale_factor_prefill": (
+        "forward_args",
+        (
+            "skip_softmax_kernel_params",
+            "threshold_scale_factor_prefill",
+        ),
     ),
     "workspace_": ("metadata", ("effective_workspace",)),
 }
