@@ -4,7 +4,7 @@
 """DeepSeek Sparse Attention backend package."""
 
 from .backend import DSATrtllmAttention
-from .cache_manager import DSACacheManager
+from .cache_manager import DSACacheManager, DSACacheManagerV2
 from .indexer import (
     _DG_SCHEDULE_BLOCK_KV,
     HAS_FAST_HADAMARD,
@@ -29,6 +29,7 @@ __all__ = [
     "HAS_FAST_HADAMARD",
     "DSABackendForwardArgs",
     "DSACacheManager",
+    "DSACacheManagerV2",
     "DSAMetadataParams",
     "DSAParams",
     "DSATrtllmAttention",
