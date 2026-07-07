@@ -266,6 +266,3 @@ class KVCacheManagerConfig:
             assert self.commit_min_snapshot, (
                 "commit_min_snapshot must be True when SSM layers are present"
             )
-            assert not self.enable_partial_reuse, (
-                "enable_partial_reuse must be False when SSM layers are present"
-            )

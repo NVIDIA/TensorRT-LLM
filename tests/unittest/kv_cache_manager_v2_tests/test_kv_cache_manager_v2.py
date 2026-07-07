@@ -1669,7 +1669,7 @@ class TestSSMSupport(unittest.TestCase):
         )
 
     def test_ssm_reuse_snapshots_each_commit(self) -> None:
-        """SSM keeps a reusable snapshot for each block-boundary commit()."""
+        """SSM keeps reusable snapshots at committed prefix lengths."""
         cfg = self._make_ssm_reuse_config(tokens_per_block=32)
         self.manager = KVCacheManager(cfg)
         stream_holder = CachedCudaStream()
@@ -1747,10 +1747,9 @@ class TestSSMSupport(unittest.TestCase):
         kv2.close()
 
     def test_ssm_reuse_keeps_snapshots_from_multiple_commits(self) -> None:
-        """Multiple block-boundary commit() calls keep independently reusable SSM snapshots."""
+        """Multiple commit() calls keep independently reusable SSM snapshots."""
         cfg = self._make_ssm_reuse_config(tokens_per_block=32)
         self.manager = KVCacheManager(cfg)
-        engine = FakeEngine(cfg)
         stream_holder = CachedCudaStream()
         stream = cast(CudaStream, stream_holder.handle)
 
@@ -1758,18 +1757,15 @@ class TestSSMSupport(unittest.TestCase):
         kv1 = self.manager.create_kv_cache()
         kv1.resume(stream)
         kv1.capacity = 32
-        engine.execute([Step(kv1, prompt[:32], [])], stream)
         kv1.commit(prompt[:32])
 
         kv1.capacity = 64
-        engine.execute([Step(kv1, prompt[32:64], prompt[:32])], stream)
         kv1.commit(prompt[32:64])
         kv1.close()
 
         kv2 = self.manager.create_kv_cache(input_tokens=prompt[:32])
         self.assertEqual(kv2.num_committed_tokens, 32)
         kv2.resume(stream)
-        engine.execute([Step(kv2, [], prompt[:32])], stream)
         kv2.close()
 
         kv3 = self.manager.create_kv_cache(input_tokens=prompt[:48])
@@ -1780,11 +1776,98 @@ class TestSSMSupport(unittest.TestCase):
         kv4 = self.manager.create_kv_cache(input_tokens=prompt)
         self.assertEqual(kv4.num_committed_tokens, 64)
         kv4.resume(stream)
-        engine.execute([Step(kv4, [], prompt[:64])], stream)
         kv4.close()
 
-    def test_commit_min_snapshot_requires_history_and_block_boundaries(self) -> None:
-        """commit_min_snapshot requires commit() to align with history and token blocks."""
+    def test_ssm_partial_snapshot_respects_partial_reuse_setting(self) -> None:
+        """Partial SSM snapshots are created, but partial prompt reuse remains optional."""
+        tokens_per_block = 32
+        prompt = [self.next_token() for _ in range(64)]
+
+        for enable_partial_reuse, expected_long_match in ((False, 32), (True, 48)):
+            cfg = self._make_ssm_config(
+                tokens_per_block=tokens_per_block,
+                enable_partial_reuse=enable_partial_reuse,
+            )
+            self.manager = KVCacheManager(cfg)
+            stream_holder = CachedCudaStream()
+            stream = cast(CudaStream, stream_holder.handle)
+
+            kv1 = self.manager.create_kv_cache()
+            kv1.resume(stream)
+            kv1.capacity = 32
+            kv1.commit(prompt[:32])
+
+            kv1.capacity = 48
+            kv1.commit(prompt[32:48])
+            kv1.close()
+
+            longer = self.manager.create_kv_cache(input_tokens=prompt)
+            self.assertEqual(longer.num_committed_tokens, expected_long_match)
+            longer.resume(stream)
+            longer.close()
+
+            exact = self.manager.create_kv_cache(input_tokens=prompt[:48])
+            self.assertEqual(exact.num_committed_tokens, 48)
+            exact.resume(stream)
+            exact.close()
+
+            match = self.manager._radix_tree.match(
+                ReuseScope(), prompt[:48], self.manager.enable_partial_match
+            )
+            self.assertEqual(match.num_tokens, 48)
+            assert self.manager._life_cycles.ssm_life_cycle_id is not None
+            page_ref = match.blocks[-1].storage[self.manager._life_cycles.ssm_life_cycle_id]
+            assert page_ref is not None
+            page = unwrap_rawref(page_ref)
+            self.assertEqual(page.num_tokens_in_block, 16)
+
+            del exact, kv1, longer, match, page, page_ref
+            gc.collect()
+            stream_holder.synchronize()
+            self.manager.shutdown()
+            del self.manager
+
+    def test_commit_is_end_moves_partial_attention_and_ssm_pages(self) -> None:
+        """Final partial commits move live pages into the tree instead of copying them."""
+        tokens_per_block = 32
+        cfg = self._make_ssm_config(tokens_per_block=tokens_per_block, enable_partial_reuse=True)
+        self.manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        prompt = [self.next_token() for _ in range(48)]
+
+        kv_cache = self.manager.create_kv_cache()
+        kv_cache.resume(stream)
+        kv_cache.capacity = len(prompt)
+        kv_cache.history_length = len(prompt)
+
+        attn_lc_id = next(iter(self.manager._life_cycles.attention_life_cycles()))[0]
+        assert self.manager._life_cycles.ssm_life_cycle_id is not None
+        ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
+        attn_tail_slot = kv_cache.get_base_page_indices(LayerGroupId(attn_lc_id))[1]
+        ssm_slot = kv_cache.get_ssm_block_base_index(LayerGroupId(ssm_lc_id))
+
+        kv_cache.commit(prompt, is_end=True)
+        kv_cache.close()
+
+        match = self.manager._radix_tree.match(
+            ReuseScope(), prompt, self.manager.enable_partial_match
+        )
+        self.assertEqual(match.num_tokens, len(prompt))
+        tree_block = match.blocks[-1]
+
+        attn_ref = tree_block.storage[attn_lc_id]
+        ssm_ref = tree_block.storage[ssm_lc_id]
+        assert attn_ref is not None
+        assert ssm_ref is not None
+        attn_page = unwrap_rawref(attn_ref)
+        ssm_page = unwrap_rawref(ssm_ref)
+        self.assertEqual(attn_page.slot_id, attn_tail_slot)
+        self.assertEqual(ssm_page.slot_id, ssm_slot)
+        self.assertEqual(ssm_page.num_tokens_in_block, 16)
+
+    def test_commit_min_snapshot_requires_history_alignment(self) -> None:
+        """commit_min_snapshot requires commit() to start or end at history length."""
         cfg = self._make_ssm_config(tokens_per_block=32)
         self.manager = KVCacheManager(cfg)
         stream_holder = CachedCudaStream()
@@ -1817,15 +1900,13 @@ class TestSSMSupport(unittest.TestCase):
         kv4.resume(stream)
         kv4.capacity = 48
         kv4.history_length = 48
-        with self.assertRaises(AssertionError):
-            kv4.commit(prompt[:48])
-        self.assertEqual(kv4.num_committed_tokens, 0)
+        kv4.commit(prompt[:48])
+        self.assertEqual(kv4.num_committed_tokens, 48)
         kv4.close()
 
     def test_ssm_reuse_config_validation(self) -> None:
-        """Invalid SSM reuse settings raise assertion."""
-        with self.assertRaises(AssertionError):
-            self._make_ssm_config(enable_partial_reuse=True)
+        """SSM reuse requires commit_min_snapshot."""
+        self._make_ssm_config(enable_partial_reuse=True)
         with self.assertRaises(AssertionError):
             self._make_ssm_config(commit_min_snapshot=False)
 
