@@ -822,7 +822,12 @@ def main(*,
 
         # Helper function to resolve symlinks and copy actual content
         def copy_resolving_symlink(src_path, dst_path):
-            """Copy file or directory, resolving symlinks to copy actual content."""
+            """Copy file or directory, resolving symlinks to copy actual content.
+
+            Skips the copy when dst already exists and is at least as new as src
+            (mtime comparison). This avoids redundant large tree copies (e.g.
+            the CUTLASS headers) on incremental rebuilds over slow filesystems.
+            """
             if src_path.is_symlink():
                 resolved_src = src_path.resolve()
             else:
@@ -830,10 +835,20 @@ def main(*,
 
             if resolved_src.is_dir():
                 if dst_path.exists():
+                    if dst_path.stat().st_mtime >= resolved_src.stat().st_mtime:
+                        return  # destination is up to date
                     rmtree(dst_path)
-                # Use symlinks=False (default) to follow symlinks and copy actual content
-                # This ensures nested symlinks are also resolved
-                copytree(resolved_src, dst_path, symlinks=False)
+                # Shell out to cp -rL: dereferences symlinks like copytree(symlinks=False)
+                # but uses kernel-level copy primitives, which is significantly faster
+                # than Python's file-by-file copytree on network-mounted filesystems.
+                # Fall back to copytree if cp is unavailable (non-Linux or minimal containers).
+                try:
+                    run(["cp", "-rL",
+                         str(resolved_src),
+                         str(dst_path)],
+                        check=True)
+                except (FileNotFoundError, Exception):
+                    copytree(resolved_src, dst_path, symlinks=False)
             else:
                 if dst_path.is_dir():
                     dst_path = dst_path / src_path.name
