@@ -4872,7 +4872,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 num_copy_bits=num_copy_bits,
                 return_val=return_val,
                 large_occupancy=large_occupancy,
-                num_sms=_get_num_sms(),
                 overflow_policy=overflow_policy,
             )
             compiled_kernel = cute.compile(

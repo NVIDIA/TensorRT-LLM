@@ -32,6 +32,14 @@ from .filtered_top_k_varlen_util import (
     run_reference_top_k,
 )
 
+
+def _get_num_sms() -> int:
+    """Return the number of SMs on the current device (cached)."""
+    if not hasattr(_get_num_sms, "_value"):
+        _get_num_sms._value = torch.cuda.get_device_properties().multi_processor_count
+    return _get_num_sms._value
+
+
 """
 A high-performance topk kernel example based on radix-based filter algorithm for
 the NVIDIA Blackwell SM100 architecture based on CuTe DSL.
@@ -165,8 +173,6 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         merge_blocks: bool = False,
         enable_dynamic_multi_cta: bool = False,
         varlen_merge_input: bool = False,
-        # TODO: dont give default value, need to get the num_sms from the device
-        num_sms: int = 148,
         overflow_policy: str = "REREAD",
     ):
         self._large_occupancy = large_occupancy
@@ -189,7 +195,6 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         self.num_ctas_per_row = num_ctas_per_row
         self.enable_dynamic_multi_cta = enable_dynamic_multi_cta
         self.varlen_merge_input = varlen_merge_input
-        self.num_sms = num_sms
 
         if cutlass.const_expr(large_occupancy):
             # set the number of threads per cta to 512.
@@ -483,8 +488,7 @@ def cute_dsl_topk_wrapper(
     num_rows, num_cols = input_values.shape
     bucketed_num_cols = _bucket_num_cols(num_cols)
 
-    # TODO: need to get the num_sms from the device.
-    large_occupancy = num_rows > 148
+    large_occupancy = num_rows > _get_num_sms()
 
     # Note: don't forget num_cols, which means the maximum columns.
     key = (
@@ -604,8 +608,7 @@ def cute_dsl_topk_multi_cta_wrapper(
     num_rows, num_cols = input_values.shape
     bucketed_num_cols = _bucket_num_cols(num_cols)
 
-    # TODO: need to get the num_sms from the device.
-    large_occupancy = num_rows > 148
+    large_occupancy = num_rows > _get_num_sms()
 
     # Note: don't forget num_cols, which means the maximum columns.
     enable_multi_cta = True
