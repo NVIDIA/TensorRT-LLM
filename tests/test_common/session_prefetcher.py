@@ -53,14 +53,21 @@ _PATCH_TARGETS = (
 _WEIGHT_GLOBS = ("*.safetensors", "*.bin")
 _READ_CHUNK = 64 << 20  # 64MB
 
-# MpiPoolSession workers freeze their environment at spawn time, so a pool
-# prefetched during test A must not be handed to test B if B changed any env
-# var the workers care about (proven silent-failure class).
+# MpiPoolSession workers freeze their environment AND sys.path at spawn time
+# (MPIPoolExecutor(path=sys.path, env=...)), so a pool prefetched during test A
+# must not be handed to test B if B changed any env var the workers care about
+# (proven silent-failure class) or prepended to sys.path (proven hard-failure
+# class: test_modeling_out_of_tree monkeypatches sys.path before LLM(), CI
+# build 46175 "Executor worker died during initialization" on 4 platforms).
 _ENV_PREFIXES = ("TRTLLM", "TLLM", "NCCL_", "CUDA_", "UCX_", "OMPI_")
 
 
-def _env_snapshot():
-    return {k: v for k, v in os.environ.items() if k.startswith(_ENV_PREFIXES)}
+def _spawn_snapshot():
+    """The worker-visible state a pool freezes at spawn: filtered env + sys.path."""
+    return (
+        {k: v for k, v in os.environ.items() if k.startswith(_ENV_PREFIXES)},
+        list(sys.path),
+    )
 
 
 def _spec_of(item):
@@ -89,6 +96,91 @@ def _worker_import_report_cuda() -> bool:
     import tensorrt_llm  # noqa: F401
 
     return torch.cuda.is_initialized()
+
+
+# GPU-memory settle barrier at handover (see wait_gpu_memory_settle).
+_SETTLE_MIN_FREE_FRAC = 0.85  # "GPU is essentially free" — stop waiting
+_SETTLE_POLL_S = 0.5
+_SETTLE_FLAT_POLLS = 3  # consecutive non-increasing polls => memory is in use
+_SETTLE_EPSILON = 256 << 20  # free-memory delta below this counts as flat
+_SETTLE_TIMEOUT_S = 30.0
+
+
+def _visible_gpu_indices(count: int):
+    """NVML indices of the GPUs this process may touch (CUDA_VISIBLE_DEVICES)."""
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if not visible:
+        return list(range(count))
+    indices = []
+    for token in visible.split(","):
+        token = token.strip()
+        if not token.isdigit() or int(token) >= count:
+            return list(range(count))  # UUID/MIG form: fall back to all GPUs
+        indices.append(int(token))
+    return indices or list(range(count))
+
+
+def wait_gpu_memory_settle(timeout: float = _SETTLE_TIMEOUT_S) -> None:
+    """Wait for a dying previous worker to release its GPU memory.
+
+    A handed-over live pool skips the ~50s synchronous spawn that used to
+    give the previous LLM's worker process time to exit: MPI pool shutdown
+    returns at disconnect, but the child's CUDA memory is only released when
+    the process actually exits. Building the next model into that race fails
+    with "Executor creation failed due to insufficient GPU memory" (CI build
+    46175: nemotron_h/nano_v2_vl/qwen3_lora, free 16-19 GiB at model load).
+
+    Polls NVML (context-free) until every visible GPU is mostly free, or its
+    free memory stops increasing (memory legitimately in use — e.g. another
+    fixture's live LLM), or ``timeout``. Fast no-op on an already-free GPU.
+    Never raises: on any NVML problem the handover proceeds as before.
+    """
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+    except Exception:
+        return
+    try:
+        handles = [
+            pynvml.nvmlDeviceGetHandleByIndex(i)
+            for i in _visible_gpu_indices(pynvml.nvmlDeviceGetCount())
+        ]
+
+        def _free_total():
+            infos = [pynvml.nvmlDeviceGetMemoryInfo(h) for h in handles]
+            return [i.free for i in infos], [i.total for i in infos]
+
+        t0 = time.monotonic()
+        flat, prev = 0, None
+        while True:
+            free, total = _free_total()
+            if all(f >= _SETTLE_MIN_FREE_FRAC * t for f, t in zip(free, total)):
+                break
+            if prev is not None and all(f - p < _SETTLE_EPSILON for f, p in zip(free, prev)):
+                flat += 1
+                if flat >= _SETTLE_FLAT_POLLS:
+                    break  # not increasing: that memory is legitimately in use
+            else:
+                flat = 0
+            if time.monotonic() - t0 >= timeout:
+                break
+            prev = free
+            time.sleep(_SETTLE_POLL_S)
+        waited = time.monotonic() - t0
+        if waited >= _SETTLE_POLL_S:
+            print(
+                f"[session-prefetch] waited {waited:.1f}s before handover for GPU "
+                f"memory release (free {min(f / t for f, t in zip(free, total)):.0%})",
+                flush=True,
+            )
+    except Exception as e:
+        print(f"[session-prefetch] GPU settle check skipped: {e}", flush=True)
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
 
 
 def warm_page_cache(model_dir: str) -> float:
@@ -127,7 +219,7 @@ class SessionPrefetcher:
         self._thread = None
         self._built_spec = None
         self._built_session = None
-        self._built_env = None
+        self._built_snapshot = None
         self._items = []
         self._warmed_dirs = set()
         self._patched = set()
@@ -207,7 +299,7 @@ class SessionPrefetcher:
                 return
             from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 
-            env = _env_snapshot()  # workers freeze env at spawn: snapshot now
+            snapshot = _spawn_snapshot()  # workers freeze env+sys.path at spawn
             session = MpiPoolSession(n_workers=spec)
             cuda_state = session.submit_sync(_worker_import_report_cuda)
             if any(cuda_state) if isinstance(cuda_state, (list, tuple)) else cuda_state:
@@ -219,7 +311,7 @@ class SessionPrefetcher:
             with self._lock:
                 self._built_spec = spec
                 self._built_session = session
-                self._built_env = env
+                self._built_snapshot = snapshot
         except Exception as e:  # prefetch must never break the tests
             print(
                 f"[session-prefetch] background build failed (falling back to synchronous): {e}",
@@ -230,30 +322,40 @@ class SessionPrefetcher:
         """Return a prefetched session for ``spec``, or None to build sync."""
         if not self.enabled:
             return None
-        thread = self._thread
+        # Read _thread under the lock: schedule_shadow() assigns-then-starts
+        # inside its critical section, and an unlocked read here can observe
+        # the assigned-but-not-yet-started thread ("cannot join thread before
+        # it is started", CI build 46175, tests creating LLMs concurrently).
+        with self._lock:
+            thread = self._thread
         if thread is not None:
             # Slowest legitimate build measured is ~117s (busy node); 180s
             # gives 1.5x margin. On a genuine hang we give up and fall back
             # to a synchronous build instead of stalling the suite.
             thread.join(timeout=180)
+        session = None
         with self._lock:
             self._thread = None
             if (
                 self._built_spec == spec
                 and self._built_session is not None
-                and self._built_env == _env_snapshot()
+                and self._built_snapshot == _spawn_snapshot()
             ):
                 session, self._built_session, self._built_spec = (self._built_session, None, None)
-                print(f"[session-prefetch] handing over prefetched {spec}-worker pool", flush=True)
-                return session
-            # Spec/env mismatch (test skipped, reordered, or changed env vars
-            # the frozen workers would not see): discard, build synchronously.
-            if self._built_session is not None:
+            # Spec/env/sys.path mismatch (test skipped, reordered, or changed
+            # state the frozen workers would not see): discard, build sync.
+            elif self._built_session is not None:
                 stale, self._built_session, self._built_spec = (self._built_session, None, None)
                 threading.Thread(
                     target=stale.shutdown, daemon=True, name="session-prefetch-discard"
                 ).start()
-        return None
+        if session is not None:
+            # An instant handover skips the ~50s synchronous spawn that used
+            # to give the PREVIOUS LLM's worker time to exit and release its
+            # GPU memory; don't start the next model build into that race.
+            wait_gpu_memory_settle()
+            print(f"[session-prefetch] handing over prefetched {spec}-worker pool", flush=True)
+        return session
 
     # ---- shadow mode: zero-test-change prefetch at the pool-creation seam ----
 
@@ -315,7 +417,8 @@ class SessionPrefetcher:
 
     def dispose(self) -> None:
         """Shut down any unconsumed shadow pool (end-of-session cleanup)."""
-        thread = self._thread
+        with self._lock:  # same assigned-but-unstarted hazard as take()
+            thread = self._thread
         if thread is not None:
             thread.join(timeout=60)
         with self._lock:

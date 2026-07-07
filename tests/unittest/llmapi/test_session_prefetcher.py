@@ -32,6 +32,8 @@ def prefetcher(monkeypatch):
     built, warmed = [], []
     monkeypatch.setattr(SessionPrefetcher, "_build", lambda self, spec: built.append(spec))
     monkeypatch.setattr(SessionPrefetcher, "_warm", lambda self, d: warmed.append(d))
+    # No real NVML polling in pure-logic tests.
+    monkeypatch.setattr(session_prefetcher, "wait_gpu_memory_settle", lambda: None)
     p.built, p.warmed = built, warmed
     return p
 
@@ -147,7 +149,7 @@ def test_factory_miss_builds_sync_and_arms_shadow(prefetcher, monkeypatch):
 def test_factory_hit_hands_over_shadow(prefetcher, monkeypatch):
     pool = _FakePool(4)
     prefetcher._built_spec, prefetcher._built_session = 4, pool
-    prefetcher._built_env = session_prefetcher._env_snapshot()
+    prefetcher._built_snapshot = session_prefetcher._spawn_snapshot()
     factory = prefetcher._make_factory(_FakePool)
     assert factory(4) is pool  # prefetched pool handed over
 
@@ -155,7 +157,7 @@ def test_factory_hit_hands_over_shadow(prefetcher, monkeypatch):
 def test_take_discards_on_env_mismatch(prefetcher, monkeypatch):
     pool = _FakePool(4)
     prefetcher._built_spec, prefetcher._built_session = 4, pool
-    prefetcher._built_env = session_prefetcher._env_snapshot()
+    prefetcher._built_snapshot = session_prefetcher._spawn_snapshot()
     monkeypatch.setenv("TLLM_TEST_ONLY_FLAG", "changed-after-spawn")
     assert prefetcher.take(4) is None  # frozen workers would miss the new env
     for _ in range(100):
@@ -167,6 +169,49 @@ def test_take_discards_on_env_mismatch(prefetcher, monkeypatch):
     assert pool.shut  # stale shadow torn down in the background
 
 
+def test_take_discards_on_syspath_mismatch(prefetcher, monkeypatch):
+    # CI build 46175: test_modeling_out_of_tree monkeypatches sys.path before
+    # LLM(); pool workers freeze sys.path at spawn (MPIPoolExecutor(path=...)),
+    # so a pool spawned earlier can't import the out-of-tree module and dies
+    # during initialization. sys.path must be part of the handover guard.
+    pool = _FakePool(4)
+    prefetcher._built_spec, prefetcher._built_session = 4, pool
+    prefetcher._built_snapshot = session_prefetcher._spawn_snapshot()
+    monkeypatch.syspath_prepend("/oot/example/path")
+    assert prefetcher.take(4) is None  # frozen workers would miss the new path
+
+
+def test_take_does_not_join_unstarted_shadow_thread(prefetcher, monkeypatch):
+    # CI build 46175: a test creating LLMs concurrently (ThreadPoolExecutor)
+    # raced take()'s unlocked read of _thread against schedule_shadow()'s
+    # assign-then-start critical section, joining a thread that had not been
+    # started yet ("cannot join thread before it is started"). A slow start()
+    # widens the assign->start window deterministically.
+    import threading
+    import time
+
+    class _SlowStartThread(threading.Thread):
+        def start(self):
+            time.sleep(0.3)  # hold the assigned-but-unstarted state visible
+            super().start()
+
+    monkeypatch.setattr(session_prefetcher.threading, "Thread", _SlowStartThread)
+    errors = []
+
+    def _taker():
+        time.sleep(0.1)  # let schedule_shadow enter its critical section first
+        try:
+            prefetcher.take(1)
+        except RuntimeError as e:  # pre-fix: "cannot join thread before it is started"
+            errors.append(e)
+
+    taker = threading.Thread(target=_taker)
+    taker.start()
+    prefetcher.schedule_shadow(1)
+    taker.join(timeout=10)
+    assert errors == []
+
+
 def test_factory_single_worker_also_prefetches(prefetcher):
     # The default single-GPU path spawns a 1-worker pool too (executor.py ->
     # proxy.py), paying the same ~50s spawn+import: it must benefit as well.
@@ -175,6 +220,98 @@ def test_factory_single_worker_also_prefetches(prefetcher):
     assert isinstance(session, _FakePool)
     prefetcher._thread.join(timeout=10)
     assert prefetcher.built == [1]  # shadow armed for the next 1-GPU test
+
+
+def test_handover_waits_for_gpu_settle(prefetcher, monkeypatch):
+    # The instant handover must first let the previous test's dying worker
+    # release its GPU memory (CI build 46175 OOM class).
+    pool = _FakePool(4)
+    prefetcher._built_spec, prefetcher._built_session = 4, pool
+    prefetcher._built_snapshot = session_prefetcher._spawn_snapshot()
+    settled = []
+    monkeypatch.setattr(session_prefetcher, "wait_gpu_memory_settle", lambda: settled.append(1))
+    assert prefetcher.take(4) is pool
+    assert settled == [1]
+
+
+_GIB = 1 << 30
+
+
+class _FakeMem:
+    def __init__(self, free, total):
+        self.free, self.total = free, total
+
+
+def _fake_pynvml(free_sequence, total):
+    """A pynvml stand-in whose reported free memory follows ``free_sequence``."""
+    import types
+
+    mod = types.ModuleType("pynvml")
+    calls = {"n": 0}
+    mod.nvmlInit = lambda: None
+    mod.nvmlShutdown = lambda: None
+    mod.nvmlDeviceGetCount = lambda: 1
+    mod.nvmlDeviceGetHandleByIndex = lambda i: i
+
+    def _mem_info(handle):
+        free = free_sequence[min(calls["n"], len(free_sequence) - 1)]
+        calls["n"] += 1
+        return _FakeMem(free, total)
+
+    mod.nvmlDeviceGetMemoryInfo = _mem_info
+    mod.calls = calls
+    return mod
+
+
+def test_settle_noop_when_gpu_free(monkeypatch):
+    import sys as _sys
+    import time
+
+    fake = _fake_pynvml([75 * _GIB], 80 * _GIB)
+    monkeypatch.setitem(_sys.modules, "pynvml", fake)
+    t0 = time.monotonic()
+    session_prefetcher.wait_gpu_memory_settle()
+    assert time.monotonic() - t0 < 0.2  # no polling on an already-free GPU
+    assert fake.calls["n"] == 1
+
+
+def test_settle_waits_for_previous_worker_release(monkeypatch):
+    import sys as _sys
+
+    # Free memory rising as the previous worker exits: 17 -> 40 -> 75 GiB.
+    fake = _fake_pynvml([17 * _GIB, 40 * _GIB, 75 * _GIB], 80 * _GIB)
+    monkeypatch.setitem(_sys.modules, "pynvml", fake)
+    monkeypatch.setattr(session_prefetcher, "_SETTLE_POLL_S", 0.01)
+    session_prefetcher.wait_gpu_memory_settle()
+    assert fake.calls["n"] == 3  # polled until the release completed
+
+
+def test_settle_gives_up_when_memory_stays_in_use(monkeypatch):
+    import sys as _sys
+    import time
+
+    fake = _fake_pynvml([17 * _GIB], 80 * _GIB)  # flat: legitimately in use
+    monkeypatch.setitem(_sys.modules, "pynvml", fake)
+    monkeypatch.setattr(session_prefetcher, "_SETTLE_POLL_S", 0.01)
+    t0 = time.monotonic()
+    session_prefetcher.wait_gpu_memory_settle(timeout=5)
+    assert time.monotonic() - t0 < 1.0  # flat-detection, not the full timeout
+
+
+def test_settle_without_pynvml_is_noop(monkeypatch):
+    import builtins
+    import sys as _sys
+
+    monkeypatch.delitem(_sys.modules, "pynvml", raising=False)
+    real_import = builtins.__import__
+
+    def _no_pynvml(name, *args, **kwargs):
+        if name == "pynvml":
+            raise ImportError("no pynvml")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _no_pynvml)
+    session_prefetcher.wait_gpu_memory_settle()  # must not raise
 
 
 def test_warm_page_cache_reads_weight_files(tmp_path):
