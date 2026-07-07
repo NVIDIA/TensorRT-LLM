@@ -8,7 +8,7 @@ different TP/PP/DP configurations.
 import os
 import threading
 import uuid
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Protocol, Sequence, Tuple, TypeVar
 
 import pytest
 import torch
@@ -26,6 +26,7 @@ from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool, get_pool_bytes
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
@@ -53,6 +54,52 @@ MAX_SEQ_LEN = 512
 MAX_BATCH_SIZE = 16
 VOCAB_SIZE = 129280
 NUM_KV_HEADS = 1
+
+_CacheManagerT = TypeVar("_CacheManagerT", bound=KVCacheManagerV2)
+_CacheManagerT_co = TypeVar("_CacheManagerT_co", bound=KVCacheManagerV2, covariant=True)
+_CacheManagerT_contra = TypeVar("_CacheManagerT_contra", bound=KVCacheManagerV2, contravariant=True)
+
+
+class _ManagerFactory(Protocol[_CacheManagerT_co]):
+    def __call__(
+        self,
+        tp: int,
+        pp: int,
+        enable_dp: bool,
+        model_config: List[int],
+        /,
+    ) -> Sequence[_CacheManagerT_co]: ...
+
+
+class _CacheInitializer(Protocol[_CacheManagerT_contra]):
+    def __call__(
+        self,
+        managers: Sequence[_CacheManagerT_contra],
+        tp: int,
+        /,
+        *,
+        seed_base: int = 0,
+        fill_random: bool = True,
+    ) -> None: ...
+
+
+class _CacheVerifier(Protocol[_CacheManagerT_contra]):
+    def __call__(
+        self,
+        *,
+        request_lengths: List[int],
+        compress_ratios: List[int],
+        ctx_managers: Sequence[_CacheManagerT_contra],
+        gen_managers: Sequence[_CacheManagerT_contra],
+        ctx_tp: int,
+        ctx_pp: int,
+        gen_tp: int,
+        gen_pp: int,
+        ctx_enable_dp: bool,
+        gen_enable_dp: bool,
+        ctx_request_ids: List[int],
+        gen_request_ids: List[int],
+    ) -> None: ...
 
 
 # DeepSeek-V4 specific ratios (mirrors module constants)
@@ -195,7 +242,11 @@ def _create_transceiver_in_thread(rank, mapping, cache_manager, dist_mock, confi
 
 
 def create_instance_transceivers(
-    tp: int, pp: int, enable_dp: bool, cache_managers: List, config: CacheTransceiverConfig
+    tp: int,
+    pp: int,
+    enable_dp: bool,
+    cache_managers: Sequence[KVCacheManagerV2],
+    config: CacheTransceiverConfig,
 ) -> List[KvCacheTransceiverV2]:
     """Create KvCacheTransceiverV2 for all ranks via threaded init."""
     world_size = tp * pp
@@ -301,7 +352,12 @@ def _create_managers_for_instance(
     return managers
 
 
-def _init_pool_data(managers: List, tp: int, seed_base: int = 0, fill_random: bool = True):
+def _init_pool_data(
+    managers: Sequence[DeepseekV4CacheManager],
+    tp: int,
+    seed_base: int = 0,
+    fill_random: bool = True,
+) -> None:
     """Initialize pool data for all managers.
 
     Uses half-precision view of pool memory for initialization.
@@ -470,7 +526,7 @@ def _read_cache_data(
 
 def _find_ctx_rank_for_layer(
     layer_idx: int,
-    ctx_managers: List[DeepseekV4CacheManager],
+    ctx_managers: Sequence[DeepseekV4CacheManager],
     ctx_tp: int,
     ctx_enable_dp: bool,
     req_idx: int,
@@ -495,8 +551,8 @@ def _find_ctx_rank_for_layer(
 def verify_all_requests(
     request_lengths: List[int],
     compress_ratios: List[int],
-    ctx_managers: List[DeepseekV4CacheManager],
-    gen_managers: List[DeepseekV4CacheManager],
+    ctx_managers: Sequence[DeepseekV4CacheManager],
+    gen_managers: Sequence[DeepseekV4CacheManager],
     ctx_tp: int,
     ctx_pp: int,
     gen_tp: int,
@@ -601,10 +657,10 @@ def run_deepseek_v4_transfer_test(
     compress_ratios: List[int],
     update_before_transfer: bool = True,
     *,
-    manager_factory: Callable = _create_managers_for_instance,
-    init_fn: Callable = _init_pool_data,
-    verify_fn: Callable = verify_all_requests,
-):
+    manager_factory: _ManagerFactory[_CacheManagerT] = _create_managers_for_instance,
+    init_fn: _CacheInitializer[_CacheManagerT] = _init_pool_data,
+    verify_fn: _CacheVerifier[_CacheManagerT] = verify_all_requests,
+) -> None:
     """Run a KV transfer test with injectable model-specific cache hooks."""
     ctx_world = ctx_tp * ctx_pp
     gen_world = gen_tp * gen_pp
@@ -614,8 +670,8 @@ def run_deepseek_v4_transfer_test(
     request_lengths = [65, 256, 129, 383]
 
     # ===== 1. Create DeepseekV4CacheManagers =====
-    ctx_managers = manager_factory(ctx_tp, ctx_pp, ctx_enable_dp, compress_ratios)
-    gen_managers = manager_factory(gen_tp, gen_pp, gen_enable_dp, compress_ratios)
+    ctx_managers = list(manager_factory(ctx_tp, ctx_pp, ctx_enable_dp, compress_ratios))
+    gen_managers = list(manager_factory(gen_tp, gen_pp, gen_enable_dp, compress_ratios))
 
     # ===== 2. Initialize data =====
     # ctx: random data, seed=pp_rank (same across TP, different across PP)

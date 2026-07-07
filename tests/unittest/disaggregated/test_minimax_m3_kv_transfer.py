@@ -9,6 +9,8 @@ replicated INDEX_KEY cache. The TP=2 TEP layout coalesces K/V/INDEX_KEY in one
 physical pool, while attention-DP keeps INDEX_KEY in a separate pool.
 """
 
+from collections.abc import Sequence
+
 import pytest
 import test_deepseek_v4_kv_transfer as transfer_harness
 import torch
@@ -267,7 +269,7 @@ def _find_ctx_source(
 
 
 def _initialize_cache(
-    managers: list[MiniMaxM3KVCacheManagerV2],
+    managers: Sequence[MiniMaxM3KVCacheManagerV2],
     _tp: int,
     seed_base: int = 0,
     fill_random: bool = True,
@@ -306,18 +308,18 @@ def _initialize_cache(
 
 
 def _verify_cache(
-    request_lengths,
-    compress_ratios,
-    ctx_managers,
-    gen_managers,
-    ctx_tp,
-    ctx_pp,
-    gen_tp,
-    gen_pp,
-    ctx_enable_dp,
-    gen_enable_dp,
-    ctx_request_ids,
-    gen_request_ids,
+    request_lengths: list[int],
+    compress_ratios: list[int],
+    ctx_managers: Sequence[MiniMaxM3KVCacheManagerV2],
+    gen_managers: Sequence[MiniMaxM3KVCacheManagerV2],
+    ctx_tp: int,
+    ctx_pp: int,
+    gen_tp: int,
+    gen_pp: int,
+    ctx_enable_dp: bool,
+    gen_enable_dp: bool,
+    ctx_request_ids: list[int],
+    gen_request_ids: list[int],
 ) -> None:
     del compress_ratios, ctx_pp
 

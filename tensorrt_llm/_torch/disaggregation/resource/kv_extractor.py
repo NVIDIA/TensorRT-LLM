@@ -33,11 +33,10 @@ _LAYOUT_TO_MAPPER = {
 
 
 class KVRegionExtractorV1(RegionExtractorBase):
-    """
-    Descriptor and region extractor for KV cache pool managed by
-    KVCacheManager, KVCacheManagerV2, or described by a KVCachePageTable.
+    """Extract descriptors and regions from KV cache pools.
 
-    Provides region descriptors for adapting block-wise view.
+    Supports pools managed by KVCacheManager or KVCacheManagerV2, as well as
+    pools described directly by a KVCachePageTable.
     """
 
     def __init__(self, kv_arg):
@@ -59,14 +58,11 @@ class KVRegionExtractorV1(RegionExtractorBase):
         layer_group_id: int = 0,
         pool_idx: int = 0,
     ) -> SpecRegion:
-        """
-        Given a list of region_ids (block IDs or slot IDs), returns a single
-        SpecRegion whose memory is a MemRegionGroup containing all blocks
-        described by region_ids.
+        """Return the memory regions for the provided block or slot IDs.
 
-        For KV cache: each ptr = base_address + slot_id * slot_bytes, pointing
-        to the start of a full slot.  The slot contains buffer entries for all
-        layers in this layer_group laid out contiguously from offset 0.
+        Each pointer is ``base_address + slot_id * slot_bytes`` and addresses
+        the selected logical view within a slot. The slot contains entries for
+        all layers in this layer group laid out contiguously from offset zero.
 
         Args:
             layer_group_id: The layer group index (= life cycle index).
@@ -78,7 +74,7 @@ class KVRegionExtractorV1(RegionExtractorBase):
 
         base_ptr = pool.base_address + pv.byte_offset
         block_stride = pool.slot_bytes
-        region_size = pv.bytes_per_region or pool.slot_bytes
+        region_size = pv.bytes_per_region if pv.bytes_per_region is not None else pool.slot_bytes
 
         # KV cache: filter out invalid block_ids (BAD_PAGE_INDEX = -1)
         valid = region_ids >= 0

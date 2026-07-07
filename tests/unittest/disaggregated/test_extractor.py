@@ -238,7 +238,11 @@ def test_layer_group_meta_serialization():
     assert len(restored_lg.pool_views[0].buffer_entries) == 2
 
 
-def test_extract_logical_pool_view_uses_physical_stride():
+@pytest.mark.parametrize(
+    ("bytes_per_region", "expected_region_size"),
+    [(128, 128), (0, 0), (None, 384)],
+)
+def test_extract_logical_pool_view_uses_physical_stride(bytes_per_region, expected_region_size):
     from tensorrt_llm._torch.disaggregation.resource.page import (
         BUFFER_ENTRY_DTYPE,
         AttentionLayerGroup,
@@ -263,7 +267,7 @@ def test_extract_logical_pool_view_uses_physical_stride():
                         pool_role=frozenset({"index_key"}),
                         mapper_kind=MapperKind.REPLICATED,
                         byte_offset=256,
-                        bytes_per_region=128,
+                        bytes_per_region=bytes_per_region,
                     )
                 ],
             )
@@ -275,7 +279,7 @@ def test_extract_logical_pool_view_uses_physical_stride():
 
     region = KVRegionExtractorV1(page_table).extract(np.array([0, -1, 2], dtype=np.int64))
     np.testing.assert_array_equal(region.memory.ptrs, np.array([1256, 2024]))
-    assert region.memory.bytes_per_region == 128
+    assert region.memory.bytes_per_region == expected_region_size
 
 
 def test_v2_index_key_builder_emits_per_layer_logical_views():

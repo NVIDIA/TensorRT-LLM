@@ -694,8 +694,14 @@ class TestPrepareKvBlocksForTransfer:
         np.testing.assert_array_equal(src, [11, 12])
         np.testing.assert_array_equal(dst, [20, 21])
 
+    def test_shorter_destination_trims_source_to_shared_suffix(self):
+        src, dst = self._prepare([10, 11, 12], [20, 21])
+
+        np.testing.assert_array_equal(src, [11, 12])
+        np.testing.assert_array_equal(dst, [20, 21])
+
     def test_swa_requires_prompt_length(self):
-        with pytest.raises(ValueError, match="requires session.prompt_len"):
+        with pytest.raises(ValueError, match=r"requires session\.prompt_len"):
             self._prepare(
                 [10, 11],
                 [20, 21],
