@@ -235,7 +235,7 @@ def _run_prefill_policy_test(
 # Parametrized tests
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_ALL_POLICIES = ["GMEM_SPILL", "TRUNCATE", "REREAD_ALWAYS"]
+_ALL_POLICIES = ["GMEM_SPILL", "TRUNCATE", "REREAD_ALWAYS", "REREAD"]
 
 # ----------------------------------------------------------------------------
 # Decode single-CTA — no overflow (num_tokens ≤ smem_input_size)
@@ -286,6 +286,43 @@ def test_decode_overflow_policy_overflow(
 ):
     """Decode single-CTA: all policies, large num_tokens (SMEM overflow triggered)."""
     _run_decode_policy_test(overflow_policy, batch_size, next_n, top_k, num_tokens, dtype)
+
+
+# ----------------------------------------------------------------------------
+# Decode — REREAD policy: enable_reread=True but did_overflow=False at runtime
+#
+# REREAD has two compile-time conditions:
+#   enable_reread=True  requires num_tokens > filtered_topk_smem_input_size
+#                       (large_occ bf16: 16384, fp32: 8192)
+#   did_overflow=False  at runtime: threshold-bin count fits in SMEM
+#
+# With uniform random data and top_k=512, the threshold bin holds
+#   ~num_tokens / 256 ≈ 128 elements (bf16@32768) or 64 elements (fp32@16384),
+# both far below smem_input_size → did_overflow=False → SMEM-refinement path.
+#
+# This test exercises the REREAD path that test_decode_overflow_policy_no_overflow
+# cannot cover (those use num_tokens ≤ smem_size → enable_reread=False).
+# ----------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("batch_size", [1, 64, 256])
+@pytest.mark.parametrize("next_n", [1, 3])
+@pytest.mark.parametrize("top_k", [512, 2048])
+@pytest.mark.parametrize(
+    "num_tokens, dtype",
+    [
+        (32768, torch.bfloat16),  # large_occ bf16: enable_reread=True, threshold-bin ~128 << 16384
+        (16384, torch.float32),  # large_occ fp32: enable_reread=True, threshold-bin ~64  <<  8192
+    ],
+)
+def test_decode_reread_no_smem_overflow(batch_size, next_n, top_k, num_tokens, dtype):
+    """REREAD: enable_reread=True (num_tokens > smem_size) but runtime did_overflow=False.
+
+    Exercises the SMEM-based refinement path inside the REREAD policy.
+    """
+    _run_decode_policy_test("REREAD", batch_size, next_n, top_k, num_tokens, dtype)
 
 
 # ----------------------------------------------------------------------------

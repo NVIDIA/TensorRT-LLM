@@ -39,6 +39,14 @@ IS_B200 = torch.cuda.get_device_capability() >= (10, 0)
 
 _K_MAX_BLOCKS_PER_ROW_DECODE = 10  # mirrors kMaxBlocksPerRowDecode
 
+# Result-dict key suffix per overflow policy (must be unique).
+POLICY_SUFFIX = {
+    "GMEM_SPILL": "",
+    "TRUNCATE": "_t",
+    "REREAD_ALWAYS": "_r",
+    "REREAD": "_rr",
+}
+
 # ── sweep grids ──────────────────────────────────────────────────────────────
 
 TOP_K_LIST = [512, 1024, 2048]
@@ -109,7 +117,7 @@ def bench_prefill_fixlen(
 
     if IS_B200 and _has_op("cute_dsl_indexer_topk_prefill_blackwell"):
         for pol in overflow_policies:
-            sfx = "" if pol == "GMEM_SPILL" else f"_{pol[:1].lower()}"
+            sfx = POLICY_SUFFIX[pol]
 
             def run_dsl_fp32(p=pol):
                 torch.ops.trtllm.cute_dsl_indexer_topk_prefill_blackwell(
@@ -157,7 +165,7 @@ def bench_prefill_varlen(
 
     if IS_B200 and _has_op("cute_dsl_indexer_topk_prefill_blackwell"):
         for pol in overflow_policies:
-            sfx = "" if pol == "GMEM_SPILL" else f"_{pol[:1].lower()}"
+            sfx = POLICY_SUFFIX[pol]
 
             def run_dsl_fp32(p=pol):
                 torch.ops.trtllm.cute_dsl_indexer_topk_prefill_blackwell(
@@ -217,7 +225,7 @@ def bench_decode_fixlen(
 
     if IS_B200 and _has_op("cute_dsl_indexer_topk_decode"):
         for pol in overflow_policies:
-            sfx = "" if pol == "GMEM_SPILL" else f"_{pol[:1].lower()}"
+            sfx = POLICY_SUFFIX[pol]
             out_fp32 = torch.empty((num_gen, top_k), dtype=torch.int32, device="cuda")
 
             def run_dsl_fp32(p=pol):
@@ -290,7 +298,7 @@ def bench_decode_varlen(
 
     if IS_B200 and _has_op("cute_dsl_indexer_topk_decode"):
         for pol in overflow_policies:
-            sfx = "" if pol == "GMEM_SPILL" else f"_{pol[:1].lower()}"
+            sfx = POLICY_SUFFIX[pol]
             out_fp32 = torch.empty((num_gen, top_k), dtype=torch.int32, device="cuda")
 
             def run_dsl_fp32(p=pol):
@@ -345,7 +353,7 @@ def _print_row(key1, key2, res, variants, col_w=13, extra_policies=()):
                 sp = cpp / res[v]
                 line += f"  {sp:>{col_w}.3f}x"
         for pol in extra_policies:
-            sfx = f"_{pol[:1].lower()}"
+            sfx = POLICY_SUFFIX[pol]
             for dtype in ["fp32", "bf16"]:
                 base, alt = f"dsl_{dtype}", f"dsl_{dtype}{sfx}"
                 if res.get(base) and res.get(alt):
@@ -357,11 +365,19 @@ def _print_row(key1, key2, res, variants, col_w=13, extra_policies=()):
 # ── sweep runners ─────────────────────────────────────────────────────────────
 
 
+POLICY_HEADER_TAG = {
+    "GMEM_SPILL": "",
+    "TRUNCATE": "T",
+    "REREAD_ALWAYS": "R",
+    "REREAD": "RR",
+}
+
+
 def _make_variants_and_header_suffix(overflow_policies, col_w):
     dsl_variants = []
     hdr_suffix = ""
     for pol in overflow_policies:
-        sfx = "" if pol == "GMEM_SPILL" else f"_{pol[:1].lower()}"
+        sfx = POLICY_SUFFIX[pol]
         dsl_variants += [f"dsl_fp32{sfx}", f"dsl_bf16{sfx}"]
     variants = ["cpp_fp32"] + (dsl_variants if IS_B200 else [])
     if IS_B200:
@@ -369,7 +385,7 @@ def _make_variants_and_header_suffix(overflow_policies, col_w):
         for pol in overflow_policies:
             if pol == "GMEM_SPILL":
                 continue
-            tag = pol[:1].upper()
+            tag = POLICY_HEADER_TAG[pol]
             hdr_suffix += f"  {f'{tag}/G_fp32':>{col_w}}  {f'{tag}/G_bf16':>{col_w}}"
     return variants, hdr_suffix
 
@@ -485,7 +501,7 @@ def main():
     parser.add_argument(
         "--compare_policies",
         action="store_true",
-        help="bench GMEM_SPILL, TRUNCATE, and REREAD_ALWAYS side by side",
+        help="bench GMEM_SPILL, TRUNCATE, REREAD_ALWAYS, and REREAD side by side",
     )
     parser.add_argument("--sweep_all", action="store_true")
     parser.add_argument("--sweep_prefill", action="store_true")
@@ -497,7 +513,9 @@ def main():
     args = parser.parse_args()
 
     overflow_policies = (
-        ("GMEM_SPILL", "TRUNCATE", "REREAD_ALWAYS") if args.compare_policies else ("GMEM_SPILL",)
+        ("GMEM_SPILL", "TRUNCATE", "REREAD_ALWAYS", "REREAD")
+        if args.compare_policies
+        else ("GMEM_SPILL",)
     )
 
     cap = torch.cuda.get_device_capability()

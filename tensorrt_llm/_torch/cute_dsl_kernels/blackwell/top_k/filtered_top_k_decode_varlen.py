@@ -217,6 +217,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             self.enable_gmem_store = (overflow_policy == "GMEM_SPILL") and _needs_extra
             self.enable_truncate = (overflow_policy == "TRUNCATE") and _needs_extra
             self.enable_reread_always = (overflow_policy == "REREAD_ALWAYS") and _needs_extra
+            self.enable_reread = (overflow_policy == "REREAD") and _needs_extra
 
             # set the number of threads per cta to 512.
             if cutlass.const_expr(not self.merge_blocks):
@@ -306,9 +307,17 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             )
         else:
             s_input_idx = None
+        if cutlass.const_expr(self.enable_reread):
+            s_overflow_flag = smem.allocate_tensor(
+                element_type=cutlass.Int32,
+                layout=cute.make_ordered_layout((1,), order=(0,)),
+                byte_alignment=128,
+            )
+        else:
+            s_overflow_flag = None
         s_last_remain = smem.allocate_tensor(
             element_type=cutlass.Int32,
-            layout=cute.make_ordered_layout((1), order=(0)),
+            layout=cute.make_ordered_layout((1,), order=(0,)),
             byte_alignment=128,
         )
         num_warps = cutlass.const_expr(
@@ -403,6 +412,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
                     s_last_remain,
                     num_warps,
                     s_warp_sums,
+                    s_overflow_flag,
                 )
         else:
             num_rows = input.shape[0]
@@ -451,6 +461,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
                     s_last_remain,
                     num_warps,
                     s_warp_sums,
+                    s_overflow_flag,
                 )
 
             # Subsequent tasks: dynamic work stealing via atomic counter.
@@ -494,6 +505,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
                         s_last_remain,
                         num_warps,
                         s_warp_sums,
+                        s_overflow_flag,
                     )
                 work_remaining = has_work
 

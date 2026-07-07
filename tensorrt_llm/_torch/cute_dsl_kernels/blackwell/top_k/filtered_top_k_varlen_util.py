@@ -61,7 +61,7 @@ class FilteredTopKKernelVarlen:
         self.num_ctas_per_row = num_ctas_per_row
         self.merge_blocks = merge_blocks
         self.overflow_policy = overflow_policy
-        assert overflow_policy in ("GMEM_SPILL", "TRUNCATE", "REREAD_ALWAYS"), (
+        assert overflow_policy in ("GMEM_SPILL", "TRUNCATE", "REREAD_ALWAYS", "REREAD"), (
             f"Unknown overflow_policy: {overflow_policy}"
         )
 
@@ -103,6 +103,11 @@ class FilteredTopKKernelVarlen:
         self.enable_gmem_store = (overflow_policy == "GMEM_SPILL") and _needs_extra
         self.enable_truncate = (overflow_policy == "TRUNCATE") and _needs_extra
         self.enable_reread_always = (overflow_policy == "REREAD_ALWAYS") and _needs_extra
+        self.enable_reread = (overflow_policy == "REREAD") and _needs_extra
+        # NOTE: subclasses that override filtered_topk_smem_input_size (e.g. prefill and
+        # decode clamp it for occupancy) MUST recompute all enable_* flags afterward, since
+        # _needs_extra depends on the final clamped value.  Failing to do so silently uses
+        # the wrong policy path for inputs in (clamped_size, max_num_cols].
 
         self.return_val = return_val
         # Subclasses set to True to subtract row_start from absolute indices before
@@ -328,6 +333,7 @@ class FilteredTopKKernelVarlen:
         s_histogram,
         g_num_input,
         buffer,
+        s_overflow_flag,
     ):
         """Per-element if/elif handler for the coarse filter pass.
 
@@ -363,6 +369,18 @@ class FilteredTopKKernelVarlen:
                     ordered = self.to_ordered(raw_input)
                     sub_bin = (ordered >> self.first_refine_shift) & 0xFF
                     atomicAdd(s_histogram.iterator + cutlass.Int32(sub_bin), val_one)
+            elif cutlass.const_expr(self.enable_reread):
+                pos = atomicAdd(s_num_input.iterator, val_one)
+                if pos < self.filtered_topk_smem_input_size:
+                    s_input_idx[0, pos] = idx
+                else:
+                    # Use atomicAdd (not plain store) to avoid concurrent non-atomic writes
+                    # from multiple threads to the same SMEM address.  Any non-zero value
+                    # means overflow; the did_overflow check uses != 0.
+                    atomicAdd(s_overflow_flag.iterator, val_one)
+                ordered = self.to_ordered(raw_input)
+                sub_bin = (ordered >> self.first_refine_shift) & 0xFF
+                atomicAdd(s_histogram.iterator + cutlass.Int32(sub_bin), val_one)
             else:
                 if cutlass.const_expr(not self.enable_reread_always):
                     pos = atomicAdd(s_num_input.iterator, val_one)
@@ -455,6 +473,7 @@ class FilteredTopKKernelVarlen:
         prologue_elems,
         left_start,
         left_size,
+        s_overflow_flag,
     ):
         """Reset histogram, filter all input elements through three loops, then barrier.
 
@@ -500,6 +519,7 @@ class FilteredTopKKernelVarlen:
                     s_histogram,
                     g_num_input,
                     buffer,
+                    s_overflow_flag,
                 )
             ic = ic + cutlass.Int32(_step_vec)
 
@@ -520,6 +540,7 @@ class FilteredTopKKernelVarlen:
                 s_histogram,
                 g_num_input,
                 buffer,
+                s_overflow_flag,
             )
 
         for j in range(tidx, left_size, self.num_threads_per_cta):
@@ -539,6 +560,7 @@ class FilteredTopKKernelVarlen:
                 s_histogram,
                 g_num_input,
                 buffer,
+                s_overflow_flag,
             )
         fence_acq_rel_cta()
         cute.arch.barrier()
@@ -833,6 +855,110 @@ class FilteredTopKKernelVarlen:
         return chain_prefix | self.ordered_type(self.ordered_type(T2) << self.ordered_type(offset))
 
     @cute.jit
+    def _reread_gmem_rescan(
+        self,
+        topk_remaining,
+        is_last_round,
+        tidx,
+        threshold_bin,
+        threshold,
+        offset,
+        chain_mask,
+        chain_prefix,
+        score,
+        s_counter,
+        s_indices,
+        s_last_remain,
+        s_histogram,
+        _copy_atom,
+        scan_frag,
+        _aligned_base,
+        vec_start,
+        aligned_size,
+        row_start,
+        prologue_elems,
+        left_start,
+        left_size,
+    ):
+        """GMEM re-scan phase shared by REREAD_ALWAYS and REREAD-overflow paths.
+
+        Returns (run_next_round, chain_mask, chain_prefix).
+        """
+        run_next_round = True
+        if topk_remaining == 0:
+            self._reread_always_gmem_output_scan(
+                False,
+                tidx,
+                threshold_bin,
+                threshold,
+                offset,
+                chain_mask,
+                chain_prefix,
+                score,
+                s_counter,
+                s_indices,
+                s_last_remain,
+                _copy_atom,
+                scan_frag,
+                _aligned_base,
+                vec_start,
+                aligned_size,
+                row_start,
+                prologue_elems,
+                left_start,
+                left_size,
+            )
+            run_next_round = False
+        else:
+            if is_last_round:
+                self._reread_always_gmem_output_scan(
+                    True,
+                    tidx,
+                    threshold_bin,
+                    threshold,
+                    offset,
+                    chain_mask,
+                    chain_prefix,
+                    score,
+                    s_counter,
+                    s_indices,
+                    s_last_remain,
+                    _copy_atom,
+                    scan_frag,
+                    _aligned_base,
+                    vec_start,
+                    aligned_size,
+                    row_start,
+                    prologue_elems,
+                    left_start,
+                    left_size,
+                )
+            else:
+                chain_prefix = self._reread_always_gmem_combined_scan(
+                    tidx,
+                    threshold_bin,
+                    threshold,
+                    offset,
+                    chain_mask,
+                    chain_prefix,
+                    score,
+                    s_counter,
+                    s_indices,
+                    s_histogram,
+                    _copy_atom,
+                    scan_frag,
+                    _aligned_base,
+                    vec_start,
+                    aligned_size,
+                    row_start,
+                    prologue_elems,
+                    left_start,
+                    left_size,
+                )
+                chain_mask = chain_mask | (cutlass.Int32(0xFF) << cutlass.Int32(offset))
+        return run_next_round, chain_mask, chain_prefix
+
+    @cute.jit
     def _filter_and_histogram_refine(
         self,
         tidx,
@@ -1114,6 +1240,7 @@ class FilteredTopKKernelVarlen:
         s_last_remain,
         num_warps,
         s_warp_sums,
+        s_overflow_flag,
     ):
         """CuTe DSL implementation of TopK kernel based on radix-based filter algorithm."""
         # # Thread and block indexing
@@ -1214,6 +1341,9 @@ class FilteredTopKKernelVarlen:
             # num_threads_per_cta < radix (e.g. 128 < 256).
             for _hi in range(tidx, self.radix + 1, self.num_threads_per_cta):
                 s_histogram[_hi] = 0
+            if cutlass.const_expr(self.enable_reread):
+                if tidx == 0:
+                    s_overflow_flag[0] = 0
             cute.arch.barrier()
 
             # 1.1 Build histogram
@@ -1317,16 +1447,24 @@ class FilteredTopKKernelVarlen:
                     prologue_elems,
                     left_start,
                     left_size,
+                    s_overflow_flag,
                 )
 
                 # Phase 2: Refinement rounds
                 # chain_mask (DSL Int32) and chain_prefix (runtime DSL ordered_type)
-                # accumulate prior-round constraints. chain_mask is Int32 so it
-                # survives the DSL phi-merge of the dynamic loop; const_expr is not
-                # used on it — the chain filter always runs (chain_mask=0 at round 0
-                # gives ordered & 0 == 0, which is always True).
+                # accumulate prior-round constraints for REREAD_ALWAYS / REREAD overflow
+                # fallback. chain_mask is Int32 so it survives DSL phi-merge across the
+                # dynamic loop.
                 chain_mask = cutlass.Int32(0)
                 chain_prefix = self.ordered_type(0)
+                # REREAD: read overflow flag once before the loop; runtime bool that
+                # selects SMEM refinement (no overflow) vs GMEM re-scan (overflow).
+                # Visibility of s_overflow_flag[0] is guaranteed by the fence_acq_rel_cta()
+                # + barrier() at the end of _filter_and_histogram_coarse above; no additional
+                # barrier is needed here.  If that function's terminal barrier is ever moved
+                # to the call site, a barrier must be inserted before this read.
+                if cutlass.const_expr(self.enable_reread):
+                    did_overflow = s_overflow_flag[0] != 0
                 run_next_round = True
                 for round in range(self.num_refine_rounds):
                     if run_next_round:
@@ -1352,9 +1490,36 @@ class FilteredTopKKernelVarlen:
                         is_last_round = round == self.num_refine_rounds - 1
 
                         if cutlass.const_expr(self.enable_reread_always):
-                            if topk_remaining == 0:
-                                self._reread_always_gmem_output_scan(
-                                    False,
+                            run_next_round, chain_mask, chain_prefix = self._reread_gmem_rescan(
+                                topk_remaining,
+                                is_last_round,
+                                tidx,
+                                threshold_bin,
+                                threshold,
+                                offset,
+                                chain_mask,
+                                chain_prefix,
+                                score,
+                                s_counter,
+                                s_indices,
+                                s_last_remain,
+                                s_histogram,
+                                _copy_atom,
+                                scan_frag,
+                                _aligned_base,
+                                vec_start,
+                                aligned_size,
+                                row_start,
+                                prologue_elems,
+                                left_start,
+                                left_size,
+                            )
+                        elif cutlass.const_expr(self.enable_reread):
+                            if did_overflow:
+                                # Overflow fallback: REREAD_ALWAYS-style GMEM re-scan.
+                                run_next_round, chain_mask, chain_prefix = self._reread_gmem_rescan(
+                                    topk_remaining,
+                                    is_last_round,
                                     tidx,
                                     threshold_bin,
                                     threshold,
@@ -1365,6 +1530,7 @@ class FilteredTopKKernelVarlen:
                                     s_counter,
                                     s_indices,
                                     s_last_remain,
+                                    s_histogram,
                                     _copy_atom,
                                     scan_frag,
                                     _aligned_base,
@@ -1375,55 +1541,45 @@ class FilteredTopKKernelVarlen:
                                     left_start,
                                     left_size,
                                 )
-                                run_next_round = False
                             else:
-                                if is_last_round:
-                                    self._reread_always_gmem_output_scan(
-                                        True,
+                                # No overflow: SMEM-based refinement (same as GMEM_SPILL).
+                                num_input = min(
+                                    s_num_input[r_idx], self.filtered_topk_smem_input_size
+                                )
+                                cur_g_num_input = cutlass.Int32(0)
+                                if topk_remaining == 0:
+                                    self._collect_below_threshold_refine(
                                         tidx,
-                                        threshold_bin,
                                         threshold,
                                         offset,
-                                        chain_mask,
-                                        chain_prefix,
+                                        num_input,
+                                        r_idx,
+                                        s_input_idx,
                                         score,
                                         s_counter,
                                         s_indices,
-                                        s_last_remain,
-                                        _copy_atom,
-                                        scan_frag,
-                                        _aligned_base,
-                                        vec_start,
-                                        aligned_size,
-                                        row_start,
-                                        prologue_elems,
-                                        left_start,
-                                        left_size,
+                                        cur_g_num_input,
+                                        None,
                                     )
+                                    run_next_round = False
                                 else:
-                                    chain_prefix = self._reread_always_gmem_combined_scan(
+                                    self._filter_and_histogram_refine(
                                         tidx,
-                                        threshold_bin,
                                         threshold,
                                         offset,
-                                        chain_mask,
-                                        chain_prefix,
+                                        r_idx,
+                                        is_last_round,
+                                        num_input,
+                                        cur_g_num_input,
                                         score,
                                         s_counter,
                                         s_indices,
+                                        s_input_idx,
+                                        s_num_input,
                                         s_histogram,
-                                        _copy_atom,
-                                        scan_frag,
-                                        _aligned_base,
-                                        vec_start,
-                                        aligned_size,
-                                        row_start,
-                                        prologue_elems,
-                                        left_start,
-                                        left_size,
-                                    )
-                                    chain_mask = chain_mask | (
-                                        cutlass.Int32(0xFF) << cutlass.Int32(offset)
+                                        s_last_remain,
+                                        None,
+                                        None,
                                     )
                         else:
                             num_input = min(s_num_input[r_idx], self.filtered_topk_smem_input_size)
