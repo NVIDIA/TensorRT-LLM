@@ -211,7 +211,9 @@ class CuteDslMlaFmha(PhasedFmha):
         return supported
 
     @staticmethod
-    def _is_perf_favorable(num_heads: int, seq_len_q: int) -> tuple[bool, str]:
+    def _is_perf_favorable(
+        num_heads: int, seq_len_q: int, predicted_tokens_per_seq: int
+    ) -> tuple[bool, str]:
         """Perf-only allowlist, separate from the correctness checks: admit
         just the (num_heads, seq_len_q) shapes where CuteDSL decode is an
         end-to-end win over the default backend.
@@ -219,17 +221,30 @@ class CuteDslMlaFmha(PhasedFmha):
         Shapes where the CuTe DSL decode kernel BEATS the default TRTLLM path
         end-to-end (DeepSeek-V3 8xB200 TP=8/EP=8 A/B, ISL1024/OSL2048):
           H=16  (TP=8, attention-DP off): seq_len_q=2 +1.0%, seq_len_q=4 +2.2%
-          H=128 (attention-DP on)       : seq_len_q=1 +1.4%
-        Every other measured cell is at or below parity (H=128/seq_len_q=4 is
-        about -14%), so the gate admits only the winning shapes and lets
-        everything else fall back to the next FMHA library."""
-        perf_favorable_shapes = frozenset({(16, 2), (16, 4), (128, 1)})
-        if (num_heads, seq_len_q) in perf_favorable_shapes:
+          H=128 (attention-DP on)       : seq_len_q=1 +1.5%
+        Every other measured cell is at or below parity, so the gate admits
+        only the winning shapes and lets everything else fall back to the next
+        FMHA library.
+
+        The (128, 1) entry additionally requires spec-decode OFF
+        (``predicted_tokens_per_seq == 1``): with MTP enabled, seq_len_q == 1
+        requests are the draft-step forwards, whose tiny effective batch makes
+        CuteDSL a net E2E loss (ADP+MTP3 measured about -13%), while the
+        allowlisted win was measured on the MTP-off main decode."""
+        if (num_heads, seq_len_q) in ((16, 2), (16, 4)):
             return True, ""
+        if (num_heads, seq_len_q) == (128, 1):
+            if predicted_tokens_per_seq == 1:
+                return True, ""
+            return False, (
+                "CuTe DSL MLA decode (128, 1) is only a perf win without "
+                "spec-decode; got predicted_tokens_per_seq="
+                f"{predicted_tokens_per_seq} (draft-step forward)."
+            )
         return False, (
             f"CuTe DSL MLA decode is not a perf win for num_heads={num_heads}, "
             f"seq_len_q={seq_len_q}; allowed (num_heads, seq_len_q): "
-            f"{sorted(perf_favorable_shapes)}."
+            "[(16, 2), (16, 4), (128, 1)]."
         )
 
     def _is_supported_with_reason(
@@ -280,7 +295,9 @@ class CuteDslMlaFmha(PhasedFmha):
             return False, f"Query length must be >= 1, got {seq_len_q}."
         # Perf gate (NOT a correctness limit): only admit shapes where CuteDSL
         # beats the default path E2E; everything else falls back.
-        favorable, reason = self._is_perf_favorable(attn.num_heads, seq_len_q)
+        favorable, reason = self._is_perf_favorable(
+            attn.num_heads, seq_len_q, attn.predicted_tokens_per_seq
+        )
         if not favorable:
             return False, reason
         if meta.kv_cache_block_offsets is None:
