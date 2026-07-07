@@ -52,6 +52,34 @@ class FilteredTopKKernelVarlen:
         merge_blocks: bool = False,
         overflow_policy: str = "GMEM_SPILL",
     ):
+        """
+        Args:
+            overflow_policy: Controls behavior when threshold-bin candidates exceed the
+                SMEM input buffer (filtered_topk_smem_input_size).  Only takes effect
+                when max_num_cols > filtered_topk_smem_input_size; otherwise all policies
+                are equivalent and no extra cost is incurred.
+
+                "GMEM_SPILL"    -- Spill excess candidates to a pre-allocated GMEM
+                                   extra_buffer.  Exact result.  Requires caller to
+                                   allocate extra_buffer proportional to batch size;
+                                   may OOM at large batch.
+                "TRUNCATE"      -- Discard candidates that overflow SMEM.  Histogram is
+                                   always updated, so the selected threshold bin is
+                                   correct, but refinement only iterates the retained
+                                   candidates.  Non-exact (may output fewer than top_k
+                                   indices when the threshold bin is dense).  No
+                                   extra_buffer needed.
+                "REREAD_ALWAYS" -- Skip SMEM collection entirely in the coarse pass;
+                                   always perform a second GMEM scan to collect
+                                   threshold-bin candidates.  Exact result.  No
+                                   extra_buffer needed; costs one extra GMEM read per
+                                   row unconditionally.
+                "REREAD"        -- Optimistic: attempt SMEM collection first.  If
+                                   overflow is detected at runtime (s_overflow_flag),
+                                   fall back to a REREAD_ALWAYS-style second GMEM scan.
+                                   Exact result.  No extra_buffer needed; pays the
+                                   extra GMEM read only when overflow actually occurs.
+        """
         self.dtype = dtype
         self.max_num_cols = max_num_cols
         self.top_k = top_k
@@ -97,17 +125,13 @@ class FilteredTopKKernelVarlen:
             else:
                 self.max_smem_input_size = 32 * 1024
 
-        self.filtered_topk_smem_input_size = min(self.max_smem_input_size, self.max_num_cols)
+        self.filtered_topk_smem_input_size = self._compute_smem_input_size()
 
         _needs_extra = self.max_num_cols > self.filtered_topk_smem_input_size
         self.enable_gmem_store = (overflow_policy == "GMEM_SPILL") and _needs_extra
         self.enable_truncate = (overflow_policy == "TRUNCATE") and _needs_extra
         self.enable_reread_always = (overflow_policy == "REREAD_ALWAYS") and _needs_extra
         self.enable_reread = (overflow_policy == "REREAD") and _needs_extra
-        # NOTE: subclasses that override filtered_topk_smem_input_size (e.g. prefill and
-        # decode clamp it for occupancy) MUST recompute all enable_* flags afterward, since
-        # _needs_extra depends on the final clamped value.  Failing to do so silently uses
-        # the wrong policy path for inputs in (clamped_size, max_num_cols].
 
         self.return_val = return_val
         # Subclasses set to True to subtract row_start from absolute indices before
@@ -144,6 +168,9 @@ class FilteredTopKKernelVarlen:
             self.ordered_type = cute.Uint16
             self.first_refine_shift = 0
             self.num_refine_rounds = 1
+
+    def _compute_smem_input_size(self) -> int:
+        return min(self.max_smem_input_size, self.max_num_cols)
 
     @cute.jit
     def to_coarse_key(self, x):

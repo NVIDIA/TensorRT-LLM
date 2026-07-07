@@ -70,6 +70,10 @@ class FilteredTopKKernelVarlenPrefill(FilteredTopKKernelVarlen):
         # Output local indices: subtract row_start before writing to output.
         self.subtract_row_start_on_output = True
 
+        # Always 512 threads for large-occupancy path.
+        self.num_threads_per_cta = 512
+
+    def _compute_smem_input_size(self) -> int:
         # Clamp filtered_topk_smem_input_size so the kernel fits 4 blocks/SM on
         # B200 (256 KB/SM ÷ 4 = 64 KB/block budget).
         #
@@ -89,16 +93,7 @@ class FilteredTopKKernelVarlenPrefill(FilteredTopKKernelVarlen):
             max_S = 8192 if self.num_buffer_smem_input_idx == 2 else 16384
         else:  # Uint32 (max_num_cols > 65536)
             max_S = 4096 if self.num_buffer_smem_input_idx == 2 else 8192
-
-        self.filtered_topk_smem_input_size = min(max_S, self.max_num_cols)
-        _needs_extra = self.max_num_cols > self.filtered_topk_smem_input_size
-        self.enable_gmem_store = (overflow_policy == "GMEM_SPILL") and _needs_extra
-        self.enable_truncate = (overflow_policy == "TRUNCATE") and _needs_extra
-        self.enable_reread_always = (overflow_policy == "REREAD_ALWAYS") and _needs_extra
-        self.enable_reread = (overflow_policy == "REREAD") and _needs_extra
-
-        # Always 512 threads for large-occupancy path.
-        self.num_threads_per_cta = 512
+        return min(max_S, self.max_num_cols)
 
     @cute.kernel
     def filtered_topk_kernel(
