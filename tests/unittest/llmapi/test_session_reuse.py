@@ -147,6 +147,29 @@ def test_weight_cache_env_respects_user_setting(reuse_cache, monkeypatch):
     assert s._real.spawn_env_weight_cache == "0"  # explicit user value wins
 
 
+def test_abort_after_release_never_kills_cached_pool(reuse_cache):
+    # Late executor error paths can call shutdown_abort AFTER shutdown already
+    # returned the pool to the cache; the pool may belong to the NEXT test by
+    # then and must not be killed through the stale wrapper.
+    s1 = reuse_cache.acquire(_FakePool, 2)
+    real = s1._real
+    s1.shutdown()  # released to cache
+    s1.shutdown_abort()  # late abort on the stale wrapper: must be a no-op
+    assert not real.shut
+    s2 = reuse_cache.acquire(_FakePool, 2)
+    assert s2._real is real  # still reusable
+
+
+def test_disable_after_patch_bypasses_cache(reuse_cache, monkeypatch):
+    # The kill switch must keep meaning "off" even after the seams were
+    # patched: acquire() consults it on every call.
+    s1 = reuse_cache.acquire(_FakePool, 2)
+    s1.shutdown()
+    monkeypatch.setenv("TRTLLM_TEST_REUSE_SESSION", "0")
+    s2 = reuse_cache.acquire(_FakePool, 2)
+    assert isinstance(s2, _FakePool)  # raw private pool, cache untouched
+
+
 def test_drain_shuts_cached_pools(reuse_cache):
     s = reuse_cache.acquire(_FakePool, 2)
     real = s._real

@@ -108,7 +108,7 @@ def _visible_gpu_indices(count: int):
     return indices or list(range(count))
 
 
-def wait_gpu_memory_settle(timeout: float = _SETTLE_TIMEOUT_S) -> None:
+def wait_gpu_memory_settle() -> None:
     """Wait until visible GPUs are mostly free or free memory stops rising.
 
     Never raises: on any NVML problem the handover proceeds as before.
@@ -141,7 +141,7 @@ def wait_gpu_memory_settle(timeout: float = _SETTLE_TIMEOUT_S) -> None:
                     break  # not increasing: that memory is legitimately in use
             else:
                 flat = 0
-            if time.monotonic() - t0 >= timeout:
+            if time.monotonic() - t0 >= _SETTLE_TIMEOUT_S:
                 break
             prev = free
             time.sleep(_SETTLE_POLL_S)
@@ -184,23 +184,32 @@ class _ReusableSession:
     """
 
     def __init__(self, real, cache):
-        # Set via __dict__ to avoid __getattr__ recursion.
-        self.__dict__["_real"] = real
-        self.__dict__["_cache"] = cache
-        self.__dict__["_dead"] = False
+        self._real = real
+        self._cache = cache
+        self._dead = False
+        self._released = False
 
     def __getattr__(self, name):
+        # Only fires for names NOT set on the wrapper (plain attribute reads
+        # of _real/_cache/... resolve normally, no recursion hazard). Reads
+        # after release stay delegated (harmless); destructive calls are
+        # gated in shutdown()/shutdown_abort() below.
         return getattr(self.__dict__["_real"], name)
 
     def shutdown(self):
-        if self.__dict__["_dead"]:
+        if self._dead or self._released:
             return
-        self.__dict__["_cache"]._release(self.__dict__["_real"])
+        self._released = True
+        self._cache._release(self._real)
 
     def shutdown_abort(self, *args, **kwargs):
-        self.__dict__["_dead"] = True
-        self.__dict__["_cache"]._forget(self.__dict__["_real"])
-        return self.__dict__["_real"].shutdown_abort(*args, **kwargs)
+        if self._released:
+            # The pool went back to the cache at shutdown() and may already
+            # belong to the NEXT test: never kill it from a late error path.
+            return None
+        self._dead = True
+        self._cache._forget(self._real)
+        return self._real.shutdown_abort(*args, **kwargs)
 
 
 class SessionReuseCache:
@@ -251,6 +260,11 @@ class SessionReuseCache:
 
         def factory(n_workers, *args, **kwargs):
             if args or kwargs:  # unknown calling convention: stay out of the way
+                print(
+                    "[session-reuse] bypassing reuse: MpiPoolSession called with "
+                    "unexpected arguments (library signature changed?)",
+                    flush=True,
+                )
                 return real_cls(n_workers, *args, **kwargs)
             return cache.acquire(real_cls, n_workers)
 
@@ -270,9 +284,10 @@ class SessionReuseCache:
 
     def acquire(self, real_cls, n_workers):
         """Hand out a cached same-size pool (reset + settled) or build one."""
-        if self._suspended:
-            # Opt-out test (private_mpi_session): untracked fresh pool that
-            # the LLM owns and destroys normally.
+        if self._suspended or not self.enabled:
+            # Opt-out test (private_mpi_session) or the kill switch flipped
+            # after the seams were patched: untracked fresh pool that the LLM
+            # owns and destroys normally.
             return real_cls(n_workers=n_workers)
         with self._lock:
             real = self._pools.pop(n_workers, None)
@@ -359,7 +374,14 @@ class SessionReuseCache:
         for t in threads:
             t.start()
         for t in threads:
-            t.join()
+            # Bounded wait: one wedged pool shutdown must not turn a drain at
+            # a shared seam (sessionfinish / RPC construction) into a
+            # suite-wide hang; a leaked wedged pool is the lesser evil.
+            t.join(timeout=60)
+            if t.is_alive():
+                print(
+                    "[session-reuse] WARNING: pool shutdown did not finish within 60s", flush=True
+                )
         print(f"[session-reuse] drained {len(pools)} cached pool(s)", flush=True)
 
 
