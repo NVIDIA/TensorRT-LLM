@@ -185,6 +185,9 @@ class AutoPipeline:
             if "QwenImage" in class_name:
                 return "QwenImagePipeline"
 
+            if "HunyuanDiT" in class_name:
+                return "HunyuanDiTPipeline"
+
             if "Cosmos3" in class_name:
                 return "Cosmos3OmniMoTPipeline"
 
