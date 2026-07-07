@@ -271,6 +271,18 @@ class KvCacheCreator:
                                                   KVCacheManagerV2)
         self._draft_config = draft_config
         self._skip_est = skip_est
+        # Hybrid DFlash ctx: resolve the draft layer count before any manager
+        # is created (get_num_spec_layers reads it via get_pp_layers).
+        if (self._is_dflash_hybrid_ctx()
+                and self._speculative_config._num_draft_layers is None
+                and draft_config is not None):
+            self._speculative_config._num_draft_layers = (
+                draft_config.pretrained_config.num_hidden_layers)
+
+    def _is_dflash_hybrid_ctx(self) -> bool:
+        sc = self._speculative_config
+        return (sc is not None and sc.spec_dec_mode.is_dflash()
+                and getattr(sc, 'use_hybrid_context', False))
 
     def _get_model_kv_cache_manager_cls(
         self,
@@ -423,6 +435,14 @@ class KvCacheCreator:
                     effective_draft_config,
                     kv_cache_config,
                     num_layers=self._get_num_draft_layers())
+        if self._is_dflash_hybrid_ctx() and self._mapping.is_last_pp_rank():
+            # Hybrid ctx: draft layers live in the target manager, so their
+            # per-token cost adds to the same budget.
+            total += self._per_manager_cache_cost(
+                self._kv_cache_manager_cls,
+                self._get_effective_draft_config(),
+                kv_cache_config,
+                num_layers=self._get_num_draft_layers())
         return total
 
     def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,

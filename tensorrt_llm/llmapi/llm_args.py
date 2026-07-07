@@ -2510,11 +2510,28 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         "for cross-attention in the draft model. If None, read from the draft "
         "model config (dflash_config.target_layer_ids).")
 
+    use_hybrid_context: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Store the draft cross-attention context as spec layers of the target "
+        "KV cache manager instead of a dense per-request buffer. Context "
+        "memory then scales with the KV pool, and prefix-cache hits restore "
+        "the draft context.")
+
     decoding_type: Literal["DFlash"] = Field(default="DFlash")
+
+    # Draft attention layer count; resolved from the draft model config by
+    # KvCacheCreator when use_hybrid_context is enabled.
+    _num_draft_layers: Optional[int] = PrivateAttr(default=None)
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
         self.max_total_draft_tokens = self.max_draft_len
+        if self.use_hybrid_context:
+            # Draft context lives in the target manager; a separate one-model
+            # draft KV cache would be redundant.
+            self._allow_separate_draft_kv_cache = False
         return self
 
     @property

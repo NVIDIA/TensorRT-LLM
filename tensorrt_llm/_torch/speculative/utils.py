@@ -361,6 +361,11 @@ def get_num_spec_layers(spec_config):
     if spec_config.spec_dec_mode.is_eagle3_one_model():
         num_draft_hidden_layers = spec_config._num_draft_hidden_layers
         return num_draft_hidden_layers if num_draft_hidden_layers is not None else 1
+    if (spec_config.spec_dec_mode.is_dflash()
+            and getattr(spec_config, 'use_hybrid_context', False)):
+        # Hybrid ctx: draft cross-attn K/V lives in the target manager as
+        # extra spec layers (_num_draft_layers resolved by KvCacheCreator).
+        return spec_config._num_draft_layers or 0
     return 0
 
 
