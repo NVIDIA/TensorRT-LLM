@@ -19,17 +19,18 @@ if TYPE_CHECKING:
 
 
 def get_sparse_attn_kv_cache_manager(
-        sparse_attention_config: "SparseAttentionConfig") -> type:
+        sparse_attention_config: "SparseAttentionConfig",
+        use_kv_cache_manager_v2: bool = False) -> type:
     from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 
     from .deepseek_v4 import DeepseekV4CacheManager
-    from .dsa import DSACacheManager
+    from .dsa import DSACacheManager, DSACacheManagerV2
     from .minimax_m3 import MiniMaxM3KVCacheManagerV2
     from .rocket import RocketKVCacheManager
     if sparse_attention_config.algorithm == "rocket":
         return RocketKVCacheManager
     elif sparse_attention_config.algorithm == "dsa":
-        return DSACacheManager
+        return DSACacheManagerV2 if use_kv_cache_manager_v2 else DSACacheManager
     elif sparse_attention_config.algorithm == "deepseek_v4":
         return DeepseekV4CacheManager
     elif sparse_attention_config.algorithm == "skip_softmax":

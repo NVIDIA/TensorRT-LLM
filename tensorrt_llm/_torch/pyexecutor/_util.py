@@ -112,7 +112,10 @@ def get_kv_cache_manager_cls(
             logger.info("Hybrid linear model has 0 mamba layers; using "
                         "KV cache manager without mamba caching")
             if sparse_attn_config is not None:
-                return get_sparse_attn_kv_cache_manager(sparse_attn_config)
+                return get_sparse_attn_kv_cache_manager(
+                    sparse_attn_config,
+                    use_kv_cache_manager_v2=kv_cache_config.
+                    use_kv_cache_manager_v2)
             return _non_hybrid_kv_cache_manager_cls(config, kv_cache_config)
 
         if (sparse_attn_config is not None
@@ -160,7 +163,9 @@ def get_kv_cache_manager_cls(
                 )
         return default_cls
     elif sparse_attn_config is not None:
-        return get_sparse_attn_kv_cache_manager(sparse_attn_config)
+        return get_sparse_attn_kv_cache_manager(
+            sparse_attn_config,
+            use_kv_cache_manager_v2=kv_cache_config.use_kv_cache_manager_v2)
     else:
         return _non_hybrid_kv_cache_manager_cls(config, kv_cache_config)
 
@@ -390,6 +395,11 @@ class KvCacheCreator:
                 incompat.append("kv_connector_manager")
             if self._max_beam_width is not None and self._max_beam_width > 1:
                 incompat.append("beam_width > 1")
+            sparse_attn_config = model_config.sparse_attention_config
+            if (sparse_attn_config is not None
+                    and sparse_attn_config.algorithm == "dsa"
+                    and self._mapping.cp_config.get("cp_type") == CpType.STAR):
+                incompat.append("STAR context parallelism")
             if incompat:
                 incompat_str = ", ".join(incompat)
                 # Some models are structurally bound to V2 and cannot fall
@@ -401,8 +411,14 @@ class KvCacheCreator:
                 #   * Gemma4 hybrid uses per-layer head_dim that V1 would
                 #     coerce to ``max(head_dim)``, changing per-layer KV
                 #     byte sizes — correctness bug, not just efficiency.
-                sparse_attn_config = model_config.sparse_attention_config
                 if sparse_attn_config is not None:
+                    if sparse_attn_config.algorithm == "dsa":
+                        logger.warning(
+                            "DSA with KVCacheManagerV2 is not supported with %s. "
+                            "Falling back to DSACacheManager (V1).",
+                            incompat_str)
+                        return get_sparse_attn_kv_cache_manager(
+                            sparse_attn_config, use_kv_cache_manager_v2=False)
                     raise NotImplementedError(
                         f"Sparse-attention models "
                         f"(algorithm={sparse_attn_config.algorithm!r}) require "
