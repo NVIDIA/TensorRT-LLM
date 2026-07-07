@@ -13,6 +13,7 @@ from tensorrt_llm.serve.tool_parser.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from tensorrt_llm.serve.tool_parser.utils import infer_type_from_json_schema
 
 # M3's chat template prefixes every tool-call-related tag with this literal
 # namespace string (the ``ns_token`` in chat_template.jinja). It is just
@@ -25,15 +26,17 @@ _M3_NS_RE = re.escape(_M3_NS)
 def _get_param_type(param_name: str, func_name: str, tools: List[Tool]) -> Optional[str]:
     """Look up the declared JSON-schema type of a parameter, if any."""
     for tool in tools:
-        if tool.function.name == func_name:
-            props = (tool.function.parameters or {}).get("properties", {})
-            if param_name in props:
-                type_val = props[param_name].get("type")
-                if isinstance(type_val, str):
-                    return type_val
-                if isinstance(type_val, list):
-                    non_null = [t for t in type_val if t != "null"]
-                    return non_null[0] if non_null else "string"
+        if tool.function.name != func_name:
+            continue
+        parameters = tool.function.parameters
+        if not isinstance(parameters, dict):
+            continue
+        properties = parameters.get("properties")
+        if not isinstance(properties, dict):
+            continue
+        if param_name not in properties:
+            continue
+        return infer_type_from_json_schema(properties[param_name])
     return None
 
 

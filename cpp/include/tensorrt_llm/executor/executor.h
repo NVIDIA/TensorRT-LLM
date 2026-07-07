@@ -758,6 +758,7 @@ public:
     ~Request();
 
     [[nodiscard]] VecTokens getInputTokenIds() const;
+    [[nodiscard]] SizeType32 getNumInputTokens() const;
     [[nodiscard]] SizeType32 getMaxTokens() const;
     [[nodiscard]] bool getStreaming() const;
     [[nodiscard]] SamplingConfig getSamplingConfig() const;
@@ -989,6 +990,8 @@ public:
 
     [[nodiscard]] std::vector<std::pair<SizeType32, SizeType32>> getBatchSizeTable() const;
 
+    bool operator==(DynamicBatchConfig const& other) const;
+
     /// @brief The default value of batch size table
     static std::vector<std::pair<SizeType32, SizeType32>> const kDefaultBatchSizeTable;
 
@@ -1019,7 +1022,7 @@ public:
     explicit SchedulerConfig(
         CapacitySchedulerPolicy capacitySchedulerPolicy = CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT,
         std::optional<ContextChunkingPolicy> contextChunkingPolicy = std::nullopt,
-        std::optional<DynamicBatchConfig> dynamicBatchConfig = std::nullopt);
+        std::optional<DynamicBatchConfig> dynamicBatchConfig = std::nullopt, bool enablePrefixAwareScheduling = true);
 
     bool operator==(SchedulerConfig const& other) const;
 
@@ -1028,6 +1031,8 @@ public:
     [[nodiscard]] std::optional<ContextChunkingPolicy> getContextChunkingPolicy() const;
 
     [[nodiscard]] std::optional<DynamicBatchConfig> getDynamicBatchConfig() const;
+
+    [[nodiscard]] bool getEnablePrefixAwareScheduling() const;
 
 private:
     friend class Serialization;
@@ -1040,6 +1045,9 @@ private:
 
     /// @brief The config for tuning batch size dynamically. See DynamicBatchSizeConfig.
     std::optional<DynamicBatchConfig> mDynamicBatchConfig;
+
+    /// @brief Whether schedulers use KV prefix-reuse estimates for admission and token-budget decisions.
+    bool mEnablePrefixAwareScheduling;
 };
 
 /// @brief Configuration class for the KV cache
@@ -1501,20 +1509,25 @@ public:
         NIXL = 3,
         MOONCAKE = 4
     };
+    static constexpr int kDefaultKvTransferPollIntervalMs = 5000;
+
     explicit CacheTransceiverConfig(std::optional<BackendType> backendType = std::nullopt,
         std::optional<size_t> maxNumTokens = std::nullopt, std::optional<int> kvTransferTimeoutMs = std::nullopt,
-        std::optional<int> kvTransferSenderFutureTimeoutMs = std::nullopt);
+        std::optional<int> kvTransferSenderFutureTimeoutMs = std::nullopt,
+        std::optional<int> kvTransferPollIntervalMs = kDefaultKvTransferPollIntervalMs);
 
     bool operator==(CacheTransceiverConfig const& other) const;
     void setBackendType(std::optional<BackendType> backendType);
     void setMaxTokensInBuffer(std::optional<size_t> maxTokensInBuffer);
     void setKvTransferTimeoutMs(std::optional<int> kvTransferTimeoutMs);
     void setKvTransferSenderFutureTimeoutMs(std::optional<int> kvTransferSenderFutureTimeoutMs);
+    void setKvTransferPollIntervalMs(std::optional<int> kvTransferPollIntervalMs);
 
     [[nodiscard]] std::optional<size_t> getMaxTokensInBuffer() const;
     [[nodiscard]] std::optional<BackendType> getBackendType() const;
     [[nodiscard]] std::optional<int> getKvTransferTimeoutMs() const;
     [[nodiscard]] std::optional<int> getKvTransferSenderFutureTimeoutMs() const;
+    [[nodiscard]] std::optional<int> getKvTransferPollIntervalMs() const;
 
 private:
     std::optional<BackendType> mBackendType;
@@ -1526,6 +1539,9 @@ private:
     // @brief Timeout in milliseconds to wait for the sender future to be ready when scheduled batch size is 0. This
     // allows the request to be eventually cancelled by the user or because of kv_transfer_timeout_ms
     std::optional<int> mKvTransferSenderFutureTimeoutMs;
+    // @brief Bounded wait interval in milliseconds for polling KV transfer progress when active transfers block
+    // disaggregated admission.
+    std::optional<int> mKvTransferPollIntervalMs;
 };
 
 /// @brief Configuration class for the model executor
@@ -1539,6 +1555,9 @@ public:
 
     // Per request stats may have additional overhead due to going through all requests. Turned off by default.
     static constexpr SizeType32 kDefaultRequestStatsMaxIterations = 0;
+
+    // A value of -1 keeps all iteration/request stats until they are fetched.
+    static constexpr SizeType32 kUnlimitedStatsMaxIterations = -1;
 
     explicit ExecutorConfig(SizeType32 maxBeamWidth = 1, SchedulerConfig schedulerConfig = SchedulerConfig(),
         KvCacheConfig kvCacheConfig = KvCacheConfig(), bool enableChunkedContext = true, bool normalizeLogProbs = false,
@@ -1645,9 +1664,11 @@ private:
     bool mNormalizeLogProbs;
 
     /// @brief Controls the maximum number of iterations for which to keep statistics.
+    ///        Set to -1 to keep all iteration statistics. Set to 0 to disable iteration statistics.
     SizeType32 mIterStatsMaxIterations;
 
     /// @brief Controls the maximum number of iterations for which to keep per-request statistics.
+    ///        Set to -1 to keep all per-request statistics. Set to 0 to disable per-request statistics.
     SizeType32 mRequestStatsMaxIterations;
 
     /// @brief The type of batching strategy to use. See BatchingType.
@@ -1928,12 +1949,12 @@ public:
     void shutdown();
 
     /// @brief  Returns the per-iterations statistics computed since last call to getLatestIterationStats.
-    ///         Contains at most iterStatsMaxIterations iterations.
+    ///         Contains at most iterStatsMaxIterations iterations, or all iterations when set to -1.
     /// @return Iteration stats
     std::deque<IterationStats> getLatestIterationStats();
 
     /// @brief  Returns the request stats of each iteration computed since last call to getLatestRequestStats.
-    ///         Contains at most requestStatsMaxIterations iterations.
+    ///         Contains at most requestStatsMaxIterations iterations, or all iterations when set to -1.
     /// @return Request stats grouped by iterations
     std::deque<RequestStatsPerIteration> getLatestRequestStats();
 

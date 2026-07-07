@@ -17,13 +17,18 @@ from unittest.mock import Mock
 
 import pytest
 
+from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
+from tensorrt_llm._torch.pyexecutor.py_executor import DisaggTransferAdmissionController, PyExecutor
+from tensorrt_llm._torch.pyexecutor.scheduler import (
+    FCFSWaitingQueue,
+    ScheduledRequests,
+    SerializableSchedulerOutput,
+)
 
 
 class MockPyExecutor:
@@ -186,14 +191,24 @@ def test_getter_methods(mock_executor):
     assert mock_executor.get_waiting_queue_size() == 1
 
 
-def _classify_termination(request, enable_partial_reuse_for_disagg, is_vswa, pp_size):
+def _classify_termination(
+    request, enable_partial_reuse_for_disagg, is_vswa, is_kv_manager_v2, pp_size=1
+):
     """Reproduce the termination logic from _handle_responses (py_executor.py).
+
+    Mirrors ``force_terminate_for_partial_reuse = force_terminate_ctx_for_partial_reuse``:
+    the early-termination path is enabled only for partial-reuse disagg on the
+    V1 KVCacheManager at PP=1. It is disabled for VSWA, KVCacheManagerV2 (no
+    store_blocks_for_reuse equivalent), and PP>1 — where termination is routed
+    through the DisaggPPTerminationHandler ring consensus via the
+    transfer-complete path. (Eager block store stays enabled for PP>1, but it
+    is a separate, rank-local concern that does not affect this branch.)
 
     Returns:
         "terminate" | "stats_only" | "skip"
     """
     force_terminate_for_partial_reuse = (
-        enable_partial_reuse_for_disagg and not is_vswa and pp_size == 1
+        enable_partial_reuse_for_disagg and not is_vswa and not is_kv_manager_v2 and pp_size == 1
     )
     if request.is_disagg_context_complete_state:
         return "stats_only"
@@ -219,38 +234,87 @@ class TestDisaggTerminationGuard:
     def test_normal_path_skips_context_complete(self):
         """Without partial reuse, CONTEXT_COMPLETE goes to stats only."""
         req = _make_request(complete_state=True, transmission_state=False)
-        assert _classify_termination(req, False, False, 1) == "stats_only"
+        assert _classify_termination(req, False, False, False) == "stats_only"
 
     def test_normal_path_skips_transmission_in_progress(self):
         """Without partial reuse, TRANS_IN_PROGRESS is skipped (still in flight)."""
         req = _make_request(complete_state=False, transmission_state=True)
-        assert _classify_termination(req, False, False, 1) == "skip"
+        assert _classify_termination(req, False, False, False) == "skip"
 
     def test_normal_path_terminates_regular_request(self):
         """Without partial reuse, a normal finished request is terminated."""
         req = _make_request(complete_state=False, transmission_state=False)
-        assert _classify_termination(req, False, False, 1) == "terminate"
+        assert _classify_termination(req, False, False, False) == "terminate"
 
     def test_partial_reuse_terminates_non_complete(self):
         """With partial reuse, non-CONTEXT_COMPLETE requests are terminated."""
         for complete, transmission in [(False, True), (False, False)]:
             req = _make_request(complete, transmission)
-            assert _classify_termination(req, True, False, 1) == "terminate"
+            assert _classify_termination(req, True, False, False) == "terminate"
+
+    def test_partial_reuse_early_terminate_is_pp1_only(self):
+        """Early termination of an in-transmission ctx request is a PP=1-only
+        optimization. Under PP>1 it is skipped here and terminated later via
+        the transfer-complete path (ring consensus); eager store still applies."""
+        req = _make_request(complete_state=False, transmission_state=True)
+        assert _classify_termination(req, True, False, False, pp_size=1) == "terminate"
+        req = _make_request(complete_state=False, transmission_state=True)
+        assert _classify_termination(req, True, False, False, pp_size=4) == "skip"
 
     def test_partial_reuse_skips_context_complete(self):
         """With partial reuse, CONTEXT_COMPLETE still goes to stats only."""
         req = _make_request(complete_state=True, transmission_state=False)
-        assert _classify_termination(req, True, False, 1) == "stats_only"
+        assert _classify_termination(req, True, False, False) == "stats_only"
 
     def test_partial_reuse_disabled_by_vswa(self):
         """VSWA disables partial reuse path, falling back to normal logic."""
-        req = _make_request(complete_state=True, transmission_state=False)
-        assert _classify_termination(req, True, True, 1) == "stats_only"
+        req = _make_request(complete_state=False, transmission_state=True)
+        assert _classify_termination(req, True, True, False) == "skip"
 
-    def test_partial_reuse_disabled_by_pp(self):
-        """PP > 1 disables partial reuse path, falling back to normal logic."""
-        req = _make_request(complete_state=True, transmission_state=False)
-        assert _classify_termination(req, True, False, 2) == "stats_only"
+    def test_partial_reuse_disabled_by_kv_manager_v2(self):
+        """KVCacheManagerV2 disables the eager-store path (no
+        store_blocks_for_reuse), falling back to normal logic."""
+        req = _make_request(complete_state=False, transmission_state=True)
+        assert _classify_termination(req, True, False, True) == "skip"
+
+    def test_pp_gt_1_terminates_on_transfer_complete(self):
+        """PP>1: the early path leaves the request out of requests_to_terminate
+        AND out of new_active_requests, so it is removed from active_requests
+        but retained by AsyncTransferManager. The real
+        _end_transfer_and_maybe_terminate must then terminate it exactly once
+        when the transfer completes (force_terminate_ctx_for_partial_reuse=False)."""
+        req = Mock()
+        executor = types.SimpleNamespace(
+            kv_cache_transceiver=Mock(),
+            active_requests=[],  # already removed by _handle_responses
+            async_transfer_manager=Mock(),
+            force_terminate_ctx_for_partial_reuse=False,
+            _terminate_request=Mock(),
+        )
+        executor.async_transfer_manager.end_transfer.return_value = True
+
+        PyExecutor._end_transfer_and_maybe_terminate(executor, req)
+
+        executor._terminate_request.assert_called_once_with(req)
+
+    def test_pp1_does_not_double_terminate_on_transfer_complete(self):
+        """PP=1: the early path already terminated the request (and removed it
+        from active_requests). The real _end_transfer_and_maybe_terminate must
+        skip re-terminating it (force_terminate_ctx_for_partial_reuse=True) to
+        avoid a double free_resources (nvbug/5961736)."""
+        req = Mock()
+        executor = types.SimpleNamespace(
+            kv_cache_transceiver=Mock(),
+            active_requests=[],  # already removed + terminated by early path
+            async_transfer_manager=Mock(),
+            force_terminate_ctx_for_partial_reuse=True,
+            _terminate_request=Mock(),
+        )
+        executor.async_transfer_manager.end_transfer.return_value = True
+
+        PyExecutor._end_transfer_and_maybe_terminate(executor, req)
+
+        executor._terminate_request.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +344,287 @@ def _make_gen_request(num_draft_tokens=0):
     req = Mock()
     req.num_draft_tokens = num_draft_tokens
     return req
+
+
+def _make_disagg_transfer_request(
+    request_id, prompt_len, in_progress=False, total_input_len_cp=None
+):
+    """Helper to create a mock disaggregated generation transfer request."""
+    req = Mock()
+    req.request_id = request_id
+    req.py_request_id = request_id
+    req.py_prompt_len = prompt_len
+    req.total_input_len_cp = prompt_len if total_input_len_cp is None else total_input_len_cp
+    req.is_disagg_generation_transmission_in_progress = in_progress
+    return req
+
+
+class TestDisaggTransferAdmissionController:
+    def test_disabled_preserves_candidates(self):
+        controller = DisaggTransferAdmissionController(
+            max_tokens_in_buffer=None, tokens_per_block=32
+        )
+        candidate = _make_disagg_transfer_request(1, 64)
+
+        result = controller.select(active_requests=[], candidates=[candidate])
+
+        assert result.admitted_requests == [candidate]
+        assert result.deferred_request_count == 0
+        assert not result.is_blocked_by_active_transfers()
+
+    def test_fcfs_budget_counts_active_transfers(self):
+        controller = DisaggTransferAdmissionController(max_tokens_in_buffer=64, tokens_per_block=32)
+        active = _make_disagg_transfer_request(1, 32, in_progress=True)
+        admitted = _make_disagg_transfer_request(2, 32)
+        deferred = _make_disagg_transfer_request(3, 32)
+
+        result = controller.select(active_requests=[active], candidates=[admitted, deferred])
+
+        assert result.admitted_requests == [admitted]
+        assert result.active_transfer_blocks == 1
+        assert result.admitted_transfer_blocks == 1
+        assert result.deferred_request_count == 1
+        assert result.limited_by_budget
+        assert not result.is_blocked_by_active_transfers()
+
+    def test_reports_active_transfer_budget_block(self):
+        controller = DisaggTransferAdmissionController(max_tokens_in_buffer=32, tokens_per_block=32)
+        active = _make_disagg_transfer_request(1, 32, in_progress=True)
+        candidate = _make_disagg_transfer_request(2, 32)
+
+        result = controller.select(active_requests=[active], candidates=[candidate])
+
+        assert result.admitted_requests == []
+        assert result.active_transfer_blocks == 1
+        assert result.deferred_request_count == 1
+        assert result.is_blocked_by_active_transfers()
+
+    def test_admits_oversized_head_when_idle(self):
+        controller = DisaggTransferAdmissionController(max_tokens_in_buffer=32, tokens_per_block=32)
+        oversized = _make_disagg_transfer_request(1, 96)
+        deferred = _make_disagg_transfer_request(2, 32)
+
+        result = controller.select(active_requests=[], candidates=[oversized, deferred])
+
+        assert result.admitted_requests == [oversized]
+        assert result.admitted_transfer_blocks == 3
+        assert result.deferred_request_count == 1
+        assert result.limited_by_budget
+        assert not result.is_blocked_by_active_transfers()
+
+    def test_uses_global_cp_prompt_length_for_transfer_cost(self):
+        controller = DisaggTransferAdmissionController(
+            max_tokens_in_buffer=128, tokens_per_block=32
+        )
+        request = _make_disagg_transfer_request(1, 32, total_input_len_cp=96)
+
+        result = controller.select(active_requests=[], candidates=[request])
+
+        assert result.admitted_requests == [request]
+        assert result.admitted_transfer_blocks == 3
+
+    def test_apply_reverts_deferred_v2_allocations(self):
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_transceiver = Mock()
+        executor._is_kv_manager_v2 = True
+        executor._revert_ctx_alloc = Mock()
+        executor.active_requests = [_make_disagg_transfer_request(1, 32, in_progress=True)]
+        executor._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
+            max_tokens_in_buffer=32, tokens_per_block=32
+        )
+        candidate = _make_disagg_transfer_request(2, 32)
+
+        admitted, wait_for_progress = PyExecutor._apply_disagg_transfer_admission(
+            executor, [candidate]
+        )
+
+        assert admitted == []
+        assert wait_for_progress
+        executor._revert_ctx_alloc.assert_called_once_with([candidate])
+
+    def test_apply_missing_controller_preserves_candidates(self):
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_transceiver = Mock()
+        executor.active_requests = []
+        candidate = _make_disagg_transfer_request(1, 32)
+
+        admitted, wait_for_progress = PyExecutor._apply_disagg_transfer_admission(
+            executor, [candidate]
+        )
+
+        assert admitted == [candidate]
+        assert not wait_for_progress
+
+    def test_apply_missing_v2_flag_defaults_to_non_v2(self):
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_transceiver = Mock()
+        executor._revert_ctx_alloc = Mock()
+        executor.active_requests = [_make_disagg_transfer_request(1, 32, in_progress=True)]
+        executor._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
+            max_tokens_in_buffer=32, tokens_per_block=32
+        )
+        candidate = _make_disagg_transfer_request(2, 32)
+
+        admitted, wait_for_progress = PyExecutor._apply_disagg_transfer_admission(
+            executor, [candidate]
+        )
+
+        assert admitted == []
+        assert wait_for_progress
+        executor._revert_ctx_alloc.assert_not_called()
+
+
+class TestDisaggTransferIdleProgress:
+    def test_gen_transfer_status_polls_active_transfers(self):
+        executor = object.__new__(PyExecutor)
+        executor.active_requests = [_make_disagg_transfer_request(1, 32, in_progress=True)]
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+
+        PyExecutor._check_disagg_gen_transfer_status(executor)
+
+        executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(0)
+
+    def test_gen_transfer_status_enters_without_local_active_transfers(self):
+        executor = object.__new__(PyExecutor)
+        executor.active_requests = []
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+
+        PyExecutor._check_disagg_gen_transfer_status(executor)
+
+        executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(0)
+
+    def test_polls_generation_transfer_when_admission_blocked(self):
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(tp_size=1)
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._check_disagg_ctx_cache_transfer_status = Mock()
+
+        PyExecutor._check_disagg_transfer_progress_when_idle(
+            executor,
+            num_fitting_reqs=0,
+            fitting_disagg_gen_init_requests=[],
+            wait_for_disagg_gen_transfer_progress=True,
+            all_gen_first=False,
+        )
+
+        executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(1)
+        executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
+
+    def test_peer_rank_enters_bounded_progress_poll(self):
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(tp_size=1, cp_size=4, world_size=4)
+        executor.dist.allreduce.return_value = 1
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._check_disagg_ctx_cache_transfer_status = Mock()
+
+        PyExecutor._check_disagg_transfer_progress_when_idle(
+            executor,
+            num_fitting_reqs=1,
+            fitting_disagg_gen_init_requests=[],
+            wait_for_disagg_gen_transfer_progress=True,
+            all_gen_first=False,
+        )
+
+        executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(1)
+        executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
+        executor.dist.allreduce.assert_called_once_with(0, op=ReduceOp.MAX)
+
+    def test_falls_back_to_context_transfer_when_not_generation_blocked(self):
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(tp_size=1)
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._check_disagg_ctx_cache_transfer_status = Mock()
+
+        PyExecutor._check_disagg_transfer_progress_when_idle(
+            executor,
+            num_fitting_reqs=0,
+            fitting_disagg_gen_init_requests=[],
+            wait_for_disagg_gen_transfer_progress=False,
+            all_gen_first=False,
+        )
+
+        executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(1)
+        executor._check_disagg_gen_cache_transfer_status.assert_not_called()
+
+    def test_peer_cp_rank_enters_context_progress_poll(self):
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(tp_size=1, cp_size=4, world_size=4)
+        executor.dist.allreduce.return_value = 0
+        executor.dist.tp_cp_allgather.return_value = [0, 1, 0, 0]
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._check_disagg_ctx_cache_transfer_status = Mock()
+
+        PyExecutor._check_disagg_transfer_progress_when_idle(
+            executor,
+            num_fitting_reqs=1,
+            fitting_disagg_gen_init_requests=[],
+            wait_for_disagg_gen_transfer_progress=False,
+            all_gen_first=False,
+        )
+
+        executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(0)
+        executor._check_disagg_gen_cache_transfer_status.assert_not_called()
+        executor.dist.tp_cp_allgather.assert_called_once_with(0)
+
+
+class TestDisaggTransferAdmissionPP:
+    def test_pp_schedule_applies_gate_before_serializing(self):
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(
+            rank=0, is_first_pp_rank=True, is_last_pp_rank=True, tp_size=1, cp_size=1
+        )
+        executor.enable_attention_dp = False
+        executor.kv_cache_transceiver = Mock()
+        executor.active_requests = [_make_disagg_transfer_request(1, 32, in_progress=True)]
+        executor._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
+            max_tokens_in_buffer=32, tokens_per_block=32
+        )
+        scheduled_batch = ScheduledRequests()
+        candidate = _make_disagg_transfer_request(2, 32)
+        executor._schedule = Mock(return_value=(scheduled_batch, [candidate], 0))
+
+        scheduled, fitting, num_fitting, wait_for_progress = PyExecutor._pp_schedule_and_propagate(
+            executor, microbatch_id=0
+        )
+
+        assert scheduled is scheduled_batch
+        assert fitting == []
+        assert num_fitting == 0
+        assert wait_for_progress
+
+    def test_pp_schedule_restores_propagated_gate_decision(self):
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(
+            rank=1,
+            is_first_pp_rank=False,
+            is_last_pp_rank=True,
+            prev_pp_rank=0,
+            tp_size=1,
+            cp_size=1,
+        )
+        executor.enable_attention_dp = False
+        executor.active_requests = [
+            _make_disagg_transfer_request(1, 32, in_progress=True),
+            _make_disagg_transfer_request(2, 32),
+        ]
+        serializable_schedule = SerializableSchedulerOutput(
+            encoder_requests=[],
+            context_requests_chunking=[],
+            context_requests_last_chunk=[],
+            generation_requests=[],
+            paused_requests=[],
+            fitting_disagg_gen_init_requests=[2],
+            num_fitting_requests=0,
+            wait_for_disagg_gen_transfer_progress=True,
+        )
+        executor.dist.recv_object = Mock(return_value=serializable_schedule)
+
+        _, fitting, _, wait_for_progress = PyExecutor._pp_schedule_and_propagate(
+            executor, microbatch_id=0
+        )
+
+        assert [req.py_request_id for req in fitting] == [2]
+        assert wait_for_progress
 
 
 class TestComputeScheduledTokens:

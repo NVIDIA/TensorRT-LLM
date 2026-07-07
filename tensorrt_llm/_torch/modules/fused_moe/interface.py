@@ -834,8 +834,18 @@ class MoE(nn.Module):
         """
         raise NotImplementedError
 
-    def post_load_weights(self):
-        pass
+    def transform_weights(self) -> None:
+        if getattr(self, "_weights_transformed", False):
+            return
+        self.quant_method.transform_weights(self)
+        self._weights_transformed = True
+
+    def cache_derived_state(self) -> None:
+        self.quant_method.cache_derived_state(self)
+
+    def post_load_weights(self) -> None:
+        self.transform_weights()
+        self.cache_derived_state()
 
     def process_weights_after_loading(self):
         """
@@ -1067,6 +1077,12 @@ class MoE(nn.Module):
     def has_w4a16_mxfp4(self):
         assert self._weights_created
         return self.quant_config is not None and self.quant_config.layer_quant_mode.has_w4a16_mxfp4(
+        )
+
+    @property
+    def has_mxfp8(self):
+        assert self._weights_created
+        return self.quant_config is not None and self.quant_config.layer_quant_mode.has_mxfp8(
         )
 
     @property

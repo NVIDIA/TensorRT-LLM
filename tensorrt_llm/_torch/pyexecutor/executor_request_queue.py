@@ -24,6 +24,11 @@ class RequestQueueItem:
     child_req_ids: Optional[list] = None
     is_canceled_request: bool = False
     query: Optional[list] = None  # only used in `StarAttention`
+    # Only meaningful for control requests. True = drain active/waiting
+    # queues before firing the action. False = fire at the next scheduler
+    # step boundary with in-flight requests still in the engine.
+    # See ``PyExecutor.control_action``.
+    control_requires_drain: bool = True
 
     @property
     def is_shutdown_request(self):
@@ -126,9 +131,12 @@ class ExecutorRequestQueue:
             self.request_queue.put(
                 RequestQueueItem(req_id, is_canceled_request=True))
 
-    def enqueue_control_request(self):
+    def enqueue_control_request(self, drain: bool = True):
+        """Enqueue a control-action sentinel. See ``PyExecutor.control_action``."""
         with self.enqueue_lock:
-            self.request_queue.put(RequestQueueItem(id=CONTROL_REQUEST_ID))
+            self.request_queue.put(
+                RequestQueueItem(id=CONTROL_REQUEST_ID,
+                                 control_requires_drain=drain))
 
     def enqueue_shutdown_request(self):
         with self.enqueue_lock:
