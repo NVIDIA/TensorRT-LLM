@@ -423,6 +423,10 @@ class GMSBackend:
         committed layout. The transition is in-place: this client
         keeps the same socket connection.
 
+        If finalization fails, the local backend is cleaned up because
+        upstream GMS may have partially committed or transitioned the
+        client before raising. The original exception is re-raised.
+
         Mirrors `gpu_memory_service.integrations.common.utils.
         finalize_gms_write`.
 
@@ -447,39 +451,39 @@ class GMSBackend:
         if self._is_rw is False:
             raise RuntimeError("GMS finalize_write() is only valid in RW mode.")
 
-        from gpu_memory_service.integrations.common.utils import finalize_gms_write
+        try:
+            from gpu_memory_service.integrations.common.utils import finalize_gms_write
 
-        commit_result = finalize_gms_write(self._client, model)
-        # Both the current and legacy finalize_gms_write implementations
-        # commit and reconnect in RO mode before returning. Mirror that state
-        # transition before interpreting the return value so a contract error
-        # cannot leave this adapter incorrectly reporting RW.
-        self._is_rw = False
+            commit_result = finalize_gms_write(self._client, model)
+            # Both the current and legacy finalize_gms_write implementations
+            # commit and reconnect in RO mode before returning. Mirror that
+            # state transition before interpreting the return value.
+            self._is_rw = False
 
-        # Current GMS returns GMSCommittedMemoryStats. Keep the integer branch
-        # for the pre-stats GMS API generation this adapter originally
-        # supported; reject other shapes instead of silently coercing them.
-        # TODO(GMS-API): Remove the legacy branch once TRT-LLM declares GMS
-        # package version bounds.
-        if isinstance(commit_result, int) and not isinstance(commit_result, bool):
-            bytes_committed = commit_result
-        else:
-            try:
-                bytes_committed = commit_result.committed_bytes
-            except AttributeError as error:
-                raise TypeError(
-                    "Unsupported gpu_memory_service finalize_gms_write() result: "
-                    "expected GMSCommittedMemoryStats with an integer "
-                    "committed_bytes field or a legacy integer byte count, "
-                    f"got {type(commit_result).__name__}."
-                ) from error
-
-            if not isinstance(bytes_committed, int) or isinstance(bytes_committed, bool):
-                raise TypeError(
-                    "Unsupported gpu_memory_service finalize_gms_write() result: "
-                    "GMSCommittedMemoryStats.committed_bytes must be an integer, "
-                    f"got {type(bytes_committed).__name__}."
-                )
+            # Current GMS returns GMSCommittedMemoryStats. Keep the integer
+            # branch for the pre-stats GMS API generation this adapter
+            # originally supported; reject other shapes instead of silently
+            # coercing them.
+            # TODO(GMS-API): Remove the legacy branch once TRT-LLM declares
+            # GMS package version bounds.
+            if isinstance(commit_result, int) and not isinstance(commit_result, bool):
+                bytes_committed = commit_result
+            else:
+                bytes_committed = getattr(commit_result, "committed_bytes", None)
+                if not isinstance(bytes_committed, int) or isinstance(bytes_committed, bool):
+                    raise TypeError(
+                        "Unsupported gpu_memory_service finalize_gms_write() result: "
+                        "expected an integer GMSCommittedMemoryStats.committed_bytes "
+                        "field or a legacy integer byte count; got "
+                        f"{type(commit_result).__name__}.committed_bytes="
+                        f"{type(bytes_committed).__name__}."
+                    )
+        except Exception:
+            # Upstream finalization mutates the session in stages. Its state is
+            # unknowable after an exception, so prevent reuse of a partially
+            # committed, reconnected, or remapped client.
+            self.cleanup()
+            raise
 
         logger.info(
             "GMS RW->RO: committed %.2f GiB at %s (tag=%s)",

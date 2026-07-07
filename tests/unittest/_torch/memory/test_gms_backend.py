@@ -229,26 +229,41 @@ class TestFinalizeWrite:
         )
         return finalize_gms_write
 
+    @staticmethod
+    def _install_fake_cleanup(monkeypatch):
+        evict_gms_client_memory_manager = MagicMock()
+        fake_allocator = SimpleNamespace(
+            evict_gms_client_memory_manager=evict_gms_client_memory_manager
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "gpu_memory_service.client.torch.allocator",
+            fake_allocator,
+        )
+        return evict_gms_client_memory_manager
+
     @pytest.mark.parametrize(
-        "committed_bytes",
-        [pytest.param(0, id="zero"), pytest.param(4096, id="nonzero")],
+        "result, expected_bytes",
+        [
+            pytest.param(
+                SimpleNamespace(committed_bytes=0, pruned_bytes=1024),
+                0,
+                id="current-stats-zero",
+            ),
+            pytest.param(
+                SimpleNamespace(committed_bytes=4096, pruned_bytes=1024),
+                4096,
+                id="current-stats-nonzero",
+            ),
+            pytest.param(4096, 4096, id="legacy-integer"),
+        ],
     )
-    def test_consumes_current_stats_result(self, monkeypatch, committed_bytes):
+    def test_consumes_supported_result(self, monkeypatch, result, expected_bytes):
         backend = self._rw_backend()
         model = MagicMock()
-        stats = SimpleNamespace(committed_bytes=committed_bytes, pruned_bytes=1024)
-        finalize_gms_write = self._install_finalize_result(monkeypatch, stats)
+        finalize_gms_write = self._install_finalize_result(monkeypatch, result)
 
-        assert backend.finalize_write(model) == committed_bytes
-        finalize_gms_write.assert_called_once_with(backend._client, model)
-        assert backend.is_rw is False
-
-    def test_accepts_legacy_integer_result(self, monkeypatch):
-        backend = self._rw_backend()
-        model = MagicMock()
-        finalize_gms_write = self._install_finalize_result(monkeypatch, 4096)
-
-        assert backend.finalize_write(model) == 4096
+        assert backend.finalize_write(model) == expected_bytes
         finalize_gms_write.assert_called_once_with(backend._client, model)
         assert backend.is_rw is False
 
@@ -261,18 +276,44 @@ class TestFinalizeWrite:
                 SimpleNamespace(committed_bytes="4096", pruned_bytes=0),
                 id="non-integer-committed-bytes",
             ),
+            pytest.param(
+                SimpleNamespace(committed_bytes=True, pruned_bytes=0),
+                id="boolean-committed-bytes",
+            ),
         ],
     )
-    def test_rejects_unsupported_result_after_ro_transition(self, monkeypatch, result):
+    def test_rejects_unsupported_result_and_cleans_up(self, monkeypatch, result):
         backend = self._rw_backend()
+        client = backend._client
         self._install_finalize_result(monkeypatch, result)
+        evict_gms_client_memory_manager = self._install_fake_cleanup(monkeypatch)
 
         with pytest.raises(TypeError, match="Unsupported gpu_memory_service"):
             backend.finalize_write(MagicMock())
 
-        # The upstream helper returned, so it already committed and
-        # reconnected RO even though its return contract was unsupported.
-        assert backend.is_rw is False
+        client.close.assert_called_once_with()
+        evict_gms_client_memory_manager.assert_called_once_with(client)
+        assert backend._client is None
+        assert backend.is_rw is None
+
+    def test_finalizer_failure_cleans_up_and_preserves_exception(self, monkeypatch):
+        backend = self._rw_backend()
+        client = backend._client
+        finalize_gms_write = MagicMock(side_effect=RuntimeError("remap failed"))
+        monkeypatch.setitem(
+            sys.modules,
+            "gpu_memory_service.integrations.common.utils",
+            SimpleNamespace(finalize_gms_write=finalize_gms_write),
+        )
+        evict_gms_client_memory_manager = self._install_fake_cleanup(monkeypatch)
+
+        with pytest.raises(RuntimeError, match="remap failed"):
+            backend.finalize_write(MagicMock())
+
+        client.close.assert_called_once_with()
+        evict_gms_client_memory_manager.assert_called_once_with(client)
+        assert backend._client is None
+        assert backend.is_rw is None
 
 
 # ---------------------------------------------------------------------------
