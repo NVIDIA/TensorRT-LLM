@@ -523,13 +523,16 @@ class StorageManager:
         (§4.2)."""
         self._gpu_arena_storage().pool_group(pg_idx).free_sequence(rng, last_consumer)
 
-    def drain_gpu_reclaim(self, fence: CachedCudaEvent | None = None) -> int:
+    def drain_gpu_reclaim(self, fence: CachedCudaEvent | None = None, wait: bool = False) -> int:
         """Unmap and recycle freed ranges whose gating events completed; call
         at iteration boundaries (§4.2). ``fence`` (an execution-stream event
         recorded at the call site) gates newly freed ranges against
         speculatively enqueued steps. Returns the number of ranges
-        reclaimed (or parked on the retained LRU under lazy retention)."""
-        return self._gpu_arena_storage().drain_reclaim(fence)
+        reclaimed (or parked on the retained LRU under lazy retention).
+        ``wait=True`` blocks on in-flight gating events instead of skipping
+        their ranges (§4.6 preemption headroom — see
+        ``ArenaPoolGroup.drain_reclaim``)."""
+        return self._gpu_arena_storage().drain_reclaim(fence, wait)
 
     def fence_gpu_reclaim(self, fence: CachedCudaEvent) -> None:
         """Assign the iteration-boundary reclaim fence (risk #3) to freed

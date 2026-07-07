@@ -1422,11 +1422,44 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         return current_capacity + 1 + self._effective_draft_len(req)
 
+    def _arena_reclaim_blocking(self) -> bool:
+        """Fence and BLOCKING-drain the arena's deferred reclaim mid-scheduling.
+
+        Pages freed by the scheduler's own evictions (suspend) — and by
+        requests that finished since the last iteration — are stuck in the
+        pending-reclaim queue until (a) their evacuation copies finish and
+        (b) a fence recorded on the execution stream at a drain point covers
+        them (risk #3). Both normally happen at the next
+        ``prepare_resources``, which runs AFTER scheduling — so within a
+        scheduling pass an eviction frees nothing, the scheduler cascades
+        through every victim, and a fully suspended batch deadlocks (resume
+        refused by the utilization gate while the freed pages are still
+        charged; nothing left to evict).
+
+        Recording the fence here is safe by the same argument as
+        ``_reclaim_fence``: the scheduler runs on the executor thread whose
+        current stream is the forward stream, so the event orders after
+        every previously enqueued step, and this iteration's forward (not
+        yet enqueued) cannot reference freed sequences. The wait is bounded
+        by the just-enqueued evacuation copies and any in-flight forward.
+
+        Returns True if any range was reclaimed (or parked reclaimable-for-
+        budget under lazy retention) — i.e. whether a retry can make
+        progress."""
+        if not self._arena_enabled:
+            return False
+        return self.impl.drain_gpu_reclaim(self._reclaim_fence(), wait=True) > 0
+
     def try_allocate_generation(self, req: LlmRequest) -> bool:
         """Try to allocate one additional KV cache slot for a generation request.
 
         Resumes from suspended state if needed, then resizes capacity by 1 (+
         draft tokens). Returns True on success, False if allocation failed.
+
+        In arena mode a failed resume/resize retries once after a blocking
+        fenced reclaim drain (see ``_arena_reclaim_blocking``) so pages freed
+        mid-scheduling-pass — by this pass's evictions or by just-finished
+        requests — actually become allocatable within the pass.
         """
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None:
@@ -1434,12 +1467,18 @@ class KVCacheManagerV2(BaseResourceManager):
 
         if not kv_cache.is_active:
             if not kv_cache.resume(self._stream.cuda_stream):
-                return False
+                if not (
+                    self._arena_reclaim_blocking() and kv_cache.resume(self._stream.cuda_stream)
+                ):
+                    return False
             self._restore_page_index_bufs(req.py_request_id, kv_cache)
 
         draft_len = self._effective_draft_len(req)
         self._allocated_draft_lens[req.py_request_id] = draft_len
-        return kv_cache.resize(self._required_gen_capacity(req, kv_cache.capacity))
+        target = self._required_gen_capacity(req, kv_cache.capacity)
+        if kv_cache.resize(target):
+            return True
+        return self._arena_reclaim_blocking() and kv_cache.resize(target)
 
     def trim_to_history(self, req: LlmRequest, history_length: int) -> bool:
         """Mark *history_length* tokens of this request's KV as historic.

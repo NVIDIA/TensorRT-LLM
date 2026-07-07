@@ -525,10 +525,13 @@ class TestArenaPoolGroup(unittest.TestCase):
             group.destroy()
 
     def test_reclaim_gated_on_iteration_fence(self) -> None:
-        """Risk #3: a freed range must NOT be reclaimed before an
+        """Risk #3: reclaim requires a later execution-stream fence.
+
+        A freed range must NOT be reclaimed before an
         execution-stream fence recorded at a later drain point completes —
         the overlap scheduler may have speculatively enqueued a step that
-        still reads the range when free_sequence runs."""
+        still reads the range when free_sequence runs.
+        """
         group = self._group()
         try:
             rng = group.reserve_sequence(2)
@@ -542,6 +545,68 @@ class TestArenaPoolGroup(unittest.TestCase):
             # Assign-only fence, then an unfenced drain may reclaim.
             group.fence_pending_frees(CachedCudaEvent.NULL)
             self.assertEqual(group.drain_reclaim(), 1)
+            self.assertEqual(group.mapped_pages, 0)
+        finally:
+            group.destroy()
+
+    def test_blocking_drain_waits_for_gate_events(self) -> None:
+        """§4.6 preemption headroom: the blocking drain waits out gate events.
+
+        ``drain_reclaim(wait=True)`` blocks on a
+        pending gate event (e.g. a suspend-evacuation copy still in flight)
+        and reclaims in the same call. The scheduler's mid-pass eviction path
+        depends on this — a non-waiting drain skips the range, the freed
+        pages stay charged, and a fully suspended batch deadlocks.
+        """
+        group = self._group()
+        try:
+            rng = group.reserve_sequence(2)
+            group.ensure_mapped(rng, 2)
+            slot = group.take_slot(rng, 0)
+            # Simulate an in-flight evacuation copy: the released slot's
+            # ready event is recorded behind a device sleep.
+            stream = torch.cuda.Stream()
+            with torch.cuda.stream(stream):
+                torch.cuda._sleep(50_000_000)
+            ev = CachedCudaEvent(CudaStream(stream.cuda_stream))
+            slot.ready_event = ev
+            group.release(slot)
+            group.free_sequence(rng, CachedCudaEvent.NULL)
+            # Pending gate: the plain drain skips the range...
+            self.assertEqual(group.drain_reclaim(CachedCudaEvent.NULL), 0)
+            # ...and the blocking drain waits it out and reclaims.
+            self.assertEqual(group.drain_reclaim(CachedCudaEvent.NULL, wait=True), 1)
+            self.assertTrue(ev.query_complete())
+            self.assertEqual(group.mapped_pages, 0)
+            self.assertEqual(self.budget.used_pages, 0)
+        finally:
+            group.destroy()
+
+    def test_blocking_drain_respects_outstanding_slots_and_fence(self) -> None:
+        """``wait=True`` must not bypass non-event gating conditions.
+
+        It must not hang on (or reclaim) ranges whose gating
+        conditions are host-side state rather than events: an outstanding
+        slot has no event to wait for, and an unfenced range keeps its
+        risk-#3 protection.
+        """
+        group = self._group()
+        try:
+            # Outstanding slot: skipped, promptly.
+            rng = group.reserve_sequence(2)
+            group.ensure_mapped(rng, 2)
+            slot = group.take_slot(rng, 0)
+            group.free_sequence(rng, CachedCudaEvent.NULL)
+            self.assertEqual(group.drain_reclaim(CachedCudaEvent.NULL, wait=True), 0)
+            group.release(slot)
+            self.assertEqual(group.drain_reclaim(CachedCudaEvent.NULL, wait=True), 1)
+            # Unfenced range: wait=True with no fence must not bypass risk #3.
+            rng2 = group.reserve_sequence(2)
+            group.ensure_mapped(rng2, 2)
+            group.free_sequence(rng2, CachedCudaEvent.NULL)
+            self.assertEqual(group.drain_reclaim(None, wait=True), 0)
+            self.assertGreater(group.mapped_pages, 0)
+            self.assertEqual(group.drain_reclaim(CachedCudaEvent.NULL, wait=True), 1)
             self.assertEqual(group.mapped_pages, 0)
         finally:
             group.destroy()

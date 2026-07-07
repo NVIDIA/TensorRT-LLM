@@ -943,7 +943,7 @@ class ArenaPoolGroup(PoolGroupBase):
         rng._free_event = last_consumer
         self._pending_reclaim.append(rng)
 
-    def drain_reclaim(self, fence: CachedCudaEvent | None = None) -> int:
+    def drain_reclaim(self, fence: CachedCudaEvent | None = None, wait: bool = False) -> int:
         """Process every freed range whose gating conditions have all
         completed: unmap and recycle it, or -- with lazy retention (§4.4
         phase 2) -- keep its pages mapped and park it on the retained LRU,
@@ -956,9 +956,30 @@ class ArenaPoolGroup(PoolGroupBase):
         drain and gates their reclaim (risk #3: a speculatively enqueued step
         may still read a just-freed range — see ``SequenceRange._reclaim_fence``).
         Unfenced ranges are never reclaimed, so fenced drains must happen
-        periodically (the pyexecutor adapter fences every iteration)."""
+        periodically (the pyexecutor adapter fences every iteration).
+
+        With ``wait=True`` the call BLOCKS until each pending range's gating
+        events complete (fence, free event, released-slot gates) instead of
+        skipping ranges whose events are still in flight. This is the §4.6
+        preemption-headroom escape hatch: the scheduler's eviction path frees
+        ranges in the middle of a scheduling pass — before the iteration-
+        boundary fenced drain could possibly run — and without a blocking
+        drain those pages stay charged to the budget, admission keeps
+        failing, and a fully suspended batch deadlocks (every resume refused
+        by the utilization gate while nothing is left to evict). The wait is
+        bounded: the gates are the just-enqueued evacuation copies plus
+        already-enqueued forward steps. Ranges with outstanding slots are
+        skipped (their release is host-side state, not an event)."""
         if fence is not None:
             self.fence_pending_frees(fence)
+        if wait:
+            for rng in self._pending_reclaim:
+                if rng._outstanding != 0 or rng._reclaim_fence is None:
+                    continue
+                rng._reclaim_fence.synchronize()
+                rng._free_event.synchronize()
+                for ev in rng._gate_events:
+                    ev.synchronize()
         remaining: list[SequenceRange] = []
         processed = 0
         for rng in self._pending_reclaim:
@@ -1505,15 +1526,17 @@ class GpuArenaCacheLevelStorage(CacheLevelStorage):
         assert type(pg) is ArenaPoolGroup
         return pg
 
-    def drain_reclaim(self, fence: CachedCudaEvent | None = None) -> int:
+    def drain_reclaim(self, fence: CachedCudaEvent | None = None, wait: bool = False) -> int:
         """Drain every pool group's deferred-reclaim queue (call at iteration
         boundaries). ``fence`` gates newly freed ranges against speculatively
-        enqueued steps (see :meth:`ArenaPoolGroup.drain_reclaim`). Returns the
-        number of sequence ranges reclaimed."""
+        enqueued steps; ``wait=True`` blocks on in-flight gating events
+        instead of skipping their ranges (see
+        :meth:`ArenaPoolGroup.drain_reclaim`). Returns the number of sequence
+        ranges reclaimed."""
         reclaimed = 0
         for pg in self._pool_groups:
             assert type(pg) is ArenaPoolGroup
-            reclaimed += pg.drain_reclaim(fence)
+            reclaimed += pg.drain_reclaim(fence, wait)
         return reclaimed
 
     def fence_pending_frees(self, fence: CachedCudaEvent) -> None:

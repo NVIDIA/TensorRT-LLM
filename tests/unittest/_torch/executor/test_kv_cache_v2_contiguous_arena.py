@@ -49,8 +49,8 @@ GPU_QUOTA = MAX_TOKENS * BYTES_PER_TOKEN
 
 
 def _create_arena_manager(**kv_cache_kwargs) -> KVCacheManagerV2:
+    kv_cache_kwargs.setdefault("max_tokens", MAX_TOKENS)
     kv_cache_config = KvCacheConfig(
-        max_tokens=MAX_TOKENS,
         enable_block_reuse=True,
         host_cache_size=64 * MiB,
         use_contiguous_kv_arena=True,
@@ -211,6 +211,62 @@ class TestArenaAdapter(unittest.TestCase):
         reclaimed += mgr.impl.drain_gpu_reclaim(mgr._reclaim_fence())
         self.assertGreaterEqual(reclaimed, 1)
         self.assertEqual(budget.used_pages, 0)
+
+
+@requires_cuda
+class TestArenaSchedulerDeadlockRecovery(unittest.TestCase):
+    """§4.6 preemption headroom: pages freed mid-scheduling-pass sit in
+    UNFENCED pending-reclaim (the iteration fence is only assigned in
+    prepare_resources, which runs after scheduling), so they stay charged to
+    the page budget. In the terminal state — every request suspended — each
+    resume() is refused by the max_util_for_resume gate while nothing is
+    left to evict, and the V2 scheduler's deadlock guard raises fatally.
+    try_allocate_generation must recover by fencing + blocking-draining the
+    reclaim queue in-pass."""
+
+    def _gen_req(self, request_id: int):
+        return mock.Mock(
+            py_request_id=request_id,
+            py_draft_tokens=[],
+            is_disagg_generation_transmission_complete=False,
+            context_phase_params=None,
+        )
+
+    def test_try_allocate_generation_recovers_from_all_suspended(self) -> None:
+        # Budget = exactly the pages one 31-block request maps, so a single
+        # suspended request pins utilization at 100% (> the 0.95 resume gate)
+        # until its freed range actually drains.
+        mgr = _create_arena_manager(max_tokens=512)
+        try:
+            budget = mgr.impl._storage.gpu_page_budget
+            self.assertEqual(budget.total_pages, 2)
+            kv = mgr._create_kv_cache(1, None, None)
+            kv.cuda_stream = mgr._stream.cuda_stream
+            self.assertTrue(kv.resume(mgr._stream.cuda_stream))
+            self.assertTrue(kv.resize(31 * TOKENS_PER_BLOCK))
+            self.assertEqual(budget.used_pages, 2)
+
+            # Scheduler self-eviction mid-pass: the freed range lands in
+            # UNFENCED pending-reclaim; the pages stay charged, and a bare
+            # resume() (what the pre-fix allocation path amounts to) is
+            # refused by the utilization gate — the deadlock terminal state.
+            kv.suspend()
+            self.assertEqual(budget.used_pages, 2)
+            self.assertFalse(kv.resume(mgr._stream.cuda_stream))
+
+            # The scheduler's allocation path recovers within the pass:
+            # fence + blocking drain + retry.
+            self.assertTrue(mgr.try_allocate_generation(self._gen_req(1)))
+            self.assertTrue(kv.is_active)
+
+            kv.close()
+            mgr.kv_cache_map.pop(1)
+            mgr.index_mapper.remove_sequence(1)
+            torch.cuda.synchronize()
+            mgr.impl.drain_gpu_reclaim(mgr._reclaim_fence(), wait=True)
+            self.assertEqual(budget.used_pages, 0)
+        finally:
+            mgr.shutdown()
 
 
 if __name__ == "__main__":

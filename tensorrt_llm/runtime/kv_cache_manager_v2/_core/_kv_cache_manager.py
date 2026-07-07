@@ -568,13 +568,15 @@ class KVCacheManager:
         # copy path (DESIGN.md §4.4) lands.
         return not self._storage.is_arena_mode
 
-    def drain_gpu_reclaim(self, fence: CachedCudaEvent | None = None) -> int:
+    def drain_gpu_reclaim(self, fence: CachedCudaEvent | None = None, wait: bool = False) -> int:
         """Arena mode (DESIGN.md §4.2): unmap and recycle freed sequence ranges
         whose gating events completed. Call at iteration boundaries; pass an
         execution-stream ``fence`` so ranges freed since the last fenced drain
         cannot be unmapped under a speculatively enqueued step (risk #3).
-        Returns the number of ranges reclaimed."""
-        return self._storage.drain_gpu_reclaim(fence)
+        Returns the number of ranges reclaimed. ``wait=True`` blocks on
+        in-flight gating events instead of skipping their ranges (§4.6
+        preemption headroom for the scheduler's mid-pass eviction path)."""
+        return self._storage.drain_gpu_reclaim(fence, wait)
 
     def fence_gpu_reclaim(self, fence: CachedCudaEvent) -> None:
         """Arena mode: assign the iteration-boundary reclaim fence (risk #3)
