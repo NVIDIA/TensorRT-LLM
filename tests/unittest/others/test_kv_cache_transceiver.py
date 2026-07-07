@@ -237,6 +237,7 @@ def _run_cpp_nixl_sync_transfer_stress():
     dist = Distributed.get(mapping)
     manager_kwargs = {
         "max_tokens": request_count * prompt_len * 2,
+        # This test validates transfer only, so no decode capacity is needed.
         "max_seq_len": prompt_len,
         "max_batch_size": request_count,
     }
@@ -279,7 +280,7 @@ def _run_cpp_nixl_sync_transfer_stress():
 
         def poll_context_transfers():
             completed, failed = transceiver_ctx.check_context_transfer_status(1)
-            assert failed == []
+            assert failed == [], f"context transfers failed: {failed}"
             completed_ctx_ids.update(completed)
 
         for request_index, ctx_request in enumerate(ctx_requests):

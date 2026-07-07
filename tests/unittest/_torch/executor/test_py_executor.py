@@ -1401,16 +1401,23 @@ def _err_req(request_id=1):
     return _make_adp_request(LlmRequestState.DISAGG_TRANS_ERROR, request_id=request_id)
 
 
+_DEFAULT_KV_CACHE_TRANSCEIVER = object()
+
+
 def _make_disagg_err_stub(
     *,
     enable_attention_dp=True,
-    kv_cache_transceiver=object(),
+    kv_cache_transceiver=_DEFAULT_KV_CACHE_TRANSCEIVER,
     world_size=2,
     active_requests=None,
     tp_allgather_result=None,
 ):
     stub = types.SimpleNamespace()
     stub.enable_attention_dp = enable_attention_dp
+    if kv_cache_transceiver is _DEFAULT_KV_CACHE_TRANSCEIVER:
+        kv_cache_transceiver = Mock()
+        kv_cache_transceiver.supports_inflight_request_cancellation.return_value = False
+        kv_cache_transceiver.has_poisoned_transfer_buffer.return_value = False
     stub.kv_cache_transceiver = kv_cache_transceiver
     stub.active_requests = active_requests if active_requests is not None else []
     stub.dist = Mock()

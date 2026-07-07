@@ -161,6 +161,21 @@ TEST_P(BufferIndexHolderLifecycleTest, NulloptIndexReleasesNothing)
     EXPECT_EQ(inUse(), before);
 }
 
+// A nullopt holder owns no concrete slot but retains the manager binding needed
+// to poison a dynamic buffer after an unquiesced transfer exit.
+TEST_P(BufferIndexHolderLifecycleTest, NulloptIndexCanPoisonManager)
+{
+    int const before = inUse();
+    BufferIndexHolder holder{mgr(), std::nullopt, isRecv()};
+    EXPECT_FALSE(holder.held());
+
+    holder.poison();
+
+    EXPECT_FALSE(holder.held());
+    EXPECT_TRUE(mgr().hasPoisonedBuffer());
+    EXPECT_EQ(inUse(), before);
+}
+
 // RAII: a held slot is released when the holder goes out of scope.
 TEST_P(BufferIndexHolderLifecycleTest, ValidIndexReleasedOnDestruction)
 {
