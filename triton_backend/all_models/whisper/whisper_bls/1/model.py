@@ -209,6 +209,7 @@ class TritonPythonModel:
                             flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL)
                     else:
                         responses.append(error)
+                        continue
                 llm_responses = self._prepare_llm_response(llm_request_inputs)
 
                 for triton_response in llm_responses:
