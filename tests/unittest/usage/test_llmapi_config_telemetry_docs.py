@@ -188,7 +188,6 @@ def test_manifest_generator_subprocess_resolves_local_source_without_pythonpath(
 
     environment = os.environ.copy()
     environment.pop("PYTHONPATH", None)
-    environment.pop("TRTLLM_MANIFEST_SOURCE_ROOT", None)
 
     result = subprocess.run(
         [sys.executable, "-I", str(script_path), "--check"],
@@ -230,7 +229,6 @@ def test_manifest_generator_subprocess_prefers_checkout_over_shadow_package(tmp_
 
     environment = os.environ.copy()
     environment["PYTHONPATH"] = os.pathsep.join((str(shadow), str(checkout)))
-    environment.pop("TRTLLM_MANIFEST_SOURCE_ROOT", None)
 
     result = subprocess.run(
         [sys.executable, str(script_path), "--check"],
@@ -254,8 +252,22 @@ def test_manifest_generator_is_not_a_normal_precommit_hook():
     assert all(hook["id"] != "generate-llm-args-golden-manifest" for hook in local_hooks)
 
 
-def _assert_committed_manifest_current(generator) -> None:
-    if generator.main(["--check"]) != 0:
+def _run_committed_manifest_check() -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "scripts/generate_llm_args_golden_manifest.py", "--check"],
+        cwd=_repo_root(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _assert_committed_manifest_current(
+    run_check=_run_committed_manifest_check,
+) -> None:
+    result = run_check()
+    if result.returncode != 0:
+        sys.stderr.write(result.stderr)
         raise AssertionError(
             "The committed LLM args telemetry manifest is stale.\n\n"
             "FIX: From the TensorRT-LLM repository root, run exactly:\n\n"
@@ -272,10 +284,10 @@ def test_committed_golden_failure_gives_exact_regeneration_command():
 
     import pytest
 
-    generator = SimpleNamespace(main=lambda _args: 1)
-
     with pytest.raises(AssertionError) as failure:
-        _assert_committed_manifest_current(generator)
+        _assert_committed_manifest_current(
+            run_check=lambda: SimpleNamespace(returncode=1, stderr="")
+        )
 
     assert str(failure.value) == (
         "The committed LLM args telemetry manifest is stale.\n\n"
@@ -291,12 +303,11 @@ def test_committed_golden_failure_gives_exact_regeneration_command():
 def test_build_capture_manifest_matches_committed_golden():
     """The CI privacy gate (closes TRTLLM-12872).
 
-    Regenerate in-memory and diff against the committed golden; any drift
-    ('field X now phones home') must be a deliberate, privacy-reviewed golden
-    update committed in the same change.
+    Regenerate in a fresh Python process and diff against the committed golden;
+    any drift ('field X now phones home') must be a deliberate, privacy-reviewed
+    golden update committed in the same change.
     """
-    generator = _load_manifest_generator()
-    _assert_committed_manifest_current(generator)
+    _assert_committed_manifest_current()
 
 
 def test_load_generator_does_not_leak_sys_modules():

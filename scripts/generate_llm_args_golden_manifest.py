@@ -24,13 +24,20 @@ from collections.abc import Sequence
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_SOURCE_ROOT = Path(os.environ.get("TRTLLM_MANIFEST_SOURCE_ROOT", str(_REPO_ROOT))).resolve()
 _DEFAULT_MANIFEST_PATH = _REPO_ROOT / "tensorrt_llm/usage/llm_args_golden_manifest.json"
-_SOURCE_ROOT_STRING = str(_SOURCE_ROOT)
-sys.path[:] = [entry for entry in sys.path if entry != _SOURCE_ROOT_STRING]
-sys.path.insert(0, _SOURCE_ROOT_STRING)
 
-from tensorrt_llm.usage.llmapi_config import golden_manifest  # noqa: E402
+
+def golden_manifest():
+    original_path = sys.path.copy()
+    repo_root = str(_REPO_ROOT)
+    try:
+        sys.path[:] = [entry for entry in sys.path if entry != repo_root]
+        sys.path.insert(0, repo_root)
+        from tensorrt_llm.usage.llmapi_config import golden_manifest as build_golden_manifest
+
+        return build_golden_manifest()
+    finally:
+        sys.path[:] = original_path
 
 
 def _render_manifest() -> str:
