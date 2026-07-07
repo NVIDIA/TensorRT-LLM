@@ -33,6 +33,8 @@ target_sources(bounceTransferPlanTest
                PRIVATE ${BOUNCE_DIR}/BounceTransferPlan.cpp)
 add_gtest(bounceMessageCodecTest bounceMessageCodecTest.cpp)
 target_sources(bounceMessageCodecTest PRIVATE ${BOUNCE_DIR}/BounceMessage.cpp)
+# Header-only: env-var parsing (byte-size suffixes, garbage fallback).
+add_gtest(bounceConfigTest bounceConfigTest.cpp)
 add_gtest(buddyAllocatorTest buddyAllocatorTest.cpp)
 target_sources(buddyAllocatorTest PRIVATE ${BOUNCE_DIR}/BuddyAllocator.cpp)
 # GPU test: execution-context pool (stream/event/scratch/hostPinned)

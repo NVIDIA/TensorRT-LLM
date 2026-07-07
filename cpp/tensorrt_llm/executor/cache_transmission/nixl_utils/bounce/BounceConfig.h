@@ -21,12 +21,15 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <string>
 
 namespace tensorrt_llm::executor::kv_cache::bounce
 {
 
 /// POD config for the bounce v2 pipeline. `fromEnv()` snapshots `TRTLLM_NIXL_BOUNCE_*` once.
+/// Byte-valued vars (ARENA_BYTES, MIN_BLOCK, MAX_CHUNK_BYTES, MAX_AVG) accept an optional
+/// case-insensitive binary suffix: "256MB", "1gb", "512KiB" (K/M/G == KiB/MiB/GiB, powers of two).
 struct BounceConfig
 {
     bool enabled{false};                      // TRTLLM_NIXL_BOUNCE_ENABLE
@@ -96,18 +99,66 @@ struct BounceConfig
             }
             return parsed;
         };
+        // Byte sizes additionally accept a binary suffix — K/KB/KiB, M/MB/MiB, G/GB/GiB
+        // (case-insensitive, no space), e.g. "256MB", "1gb", "512kib". All suffixes are
+        // powers of two (MB == MiB == 2^20). Bare numbers and a trailing "B" stay bytes.
+        auto envBytes = [](char const* name, std::uint64_t def) -> std::uint64_t
+        {
+            char const* v = std::getenv(name);
+            if (v == nullptr || v[0] == '\0')
+            {
+                return def;
+            }
+            char* end = nullptr;
+            std::uint64_t const parsed = std::strtoull(v, &end, 10);
+            if (end == v)
+            {
+                return def;
+            }
+            std::string suffix;
+            for (char const* p = end; *p != '\0'; ++p)
+            {
+                suffix.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(*p))));
+            }
+            std::uint64_t mult = 1;
+            if (suffix.empty() || suffix == "b")
+            {
+                mult = 1;
+            }
+            else if (suffix == "k" || suffix == "kb" || suffix == "kib")
+            {
+                mult = 1ULL << 10;
+            }
+            else if (suffix == "m" || suffix == "mb" || suffix == "mib")
+            {
+                mult = 1ULL << 20;
+            }
+            else if (suffix == "g" || suffix == "gb" || suffix == "gib")
+            {
+                mult = 1ULL << 30;
+            }
+            else
+            {
+                return def; // unknown suffix -> default, same rationale as envU64
+            }
+            if (mult > 1 && parsed > std::numeric_limits<std::uint64_t>::max() / mult)
+            {
+                return def; // would overflow
+            }
+            return parsed * mult;
+        };
 
         cfg.enabled = envBool("TRTLLM_NIXL_BOUNCE_ENABLE", false);
-        cfg.arenaBytes = static_cast<std::size_t>(envU64("TRTLLM_NIXL_BOUNCE_ARENA_BYTES", cfg.arenaBytes));
-        cfg.minBlock = static_cast<std::size_t>(envU64("TRTLLM_NIXL_BOUNCE_MIN_BLOCK", cfg.minBlock));
-        cfg.maxChunkBytes = static_cast<std::size_t>(envU64("TRTLLM_NIXL_BOUNCE_MAX_CHUNK_BYTES", cfg.maxChunkBytes));
+        cfg.arenaBytes = static_cast<std::size_t>(envBytes("TRTLLM_NIXL_BOUNCE_ARENA_BYTES", cfg.arenaBytes));
+        cfg.minBlock = static_cast<std::size_t>(envBytes("TRTLLM_NIXL_BOUNCE_MIN_BLOCK", cfg.minBlock));
+        cfg.maxChunkBytes = static_cast<std::size_t>(envBytes("TRTLLM_NIXL_BOUNCE_MAX_CHUNK_BYTES", cfg.maxChunkBytes));
         cfg.windowDepth = static_cast<std::uint32_t>(envU64("TRTLLM_NIXL_BOUNCE_DEPTH", cfg.windowDepth));
         cfg.window = static_cast<std::uint32_t>(envU64("TRTLLM_NIXL_BOUNCE_WINDOW", cfg.window));
         cfg.execCtxCount = static_cast<std::uint32_t>(envU64("TRTLLM_NIXL_BOUNCE_EXEC_CTX", cfg.execCtxCount));
         cfg.scatterWorkers
             = static_cast<std::uint32_t>(envU64("TRTLLM_NIXL_BOUNCE_SCATTER_WORKERS", cfg.scatterWorkers));
         cfg.minDescCount = static_cast<std::size_t>(envU64("TRTLLM_NIXL_BOUNCE_MIN_DESC", cfg.minDescCount));
-        cfg.maxAvgDescBytes = static_cast<std::size_t>(envU64("TRTLLM_NIXL_BOUNCE_MAX_AVG", cfg.maxAvgDescBytes));
+        cfg.maxAvgDescBytes = static_cast<std::size_t>(envBytes("TRTLLM_NIXL_BOUNCE_MAX_AVG", cfg.maxAvgDescBytes));
         cfg.leaseTimeoutMs = static_cast<int>(
             envU64("TRTLLM_NIXL_BOUNCE_LEASE_TIMEOUT_MS", static_cast<std::uint64_t>(cfg.leaseTimeoutMs)));
         cfg.forceFallback = envBool("TRTLLM_NIXL_BOUNCE_FORCE_FALLBACK", false);
