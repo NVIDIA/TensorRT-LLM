@@ -33,16 +33,15 @@ class LlmLauncherEnvs(StrEnum):
 _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY: bytes | None = None
 
 
-def _set_process_non_dumpable() -> None:
+def _scrub_process_env_value(key_name: str, value: str) -> None:
     if sys.platform != "linux":
         return
 
-    pr_set_dumpable = 4
-    suid_dump_disable = 0
     libc = ctypes.CDLL(None, use_errno=True)
-    if libc.prctl(pr_set_dumpable, suid_dump_disable, 0, 0, 0) != 0:
-        err = ctypes.get_errno()
-        raise OSError(err, os.strerror(err))
+    libc.getenv.restype = ctypes.c_void_p
+    value_ptr = libc.getenv(key_name.encode())
+    if value_ptr:
+        ctypes.memset(value_ptr, 0, len(value))
 
 
 def _normalize_spawn_proxy_process_ipc_hmac_key(key: str) -> bytes:
@@ -68,13 +67,14 @@ def get_spawn_proxy_process_ipc_hmac_key_env() -> bytes:
     if _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY is not None:
         return _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY
 
-    _set_process_non_dumpable()
-    key = os.environ.pop(
-        LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY.value, None)
+    env_name = LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY.value
+    key = os.environ.get(env_name)
     if key is None:
         raise RuntimeError(
             f"{LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY} is not set. "
             "HMAC encryption is required for IPC communication.")
+    _scrub_process_env_value(env_name, key)
+    os.environ.pop(env_name, None)
 
     _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY = (
         _normalize_spawn_proxy_process_ipc_hmac_key(key))
