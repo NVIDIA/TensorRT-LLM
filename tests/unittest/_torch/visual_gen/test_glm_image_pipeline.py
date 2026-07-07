@@ -18,9 +18,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from tensorrt_llm._torch.modules.linear import Linear
-
-os.environ["TLLM_DISABLE_MPI"] = "1"
+os.environ.setdefault("TLLM_DISABLE_MPI", "1")
 
 import numpy as np
 import pytest
@@ -28,16 +26,10 @@ import torch
 import torch.nn.functional as F
 from diffusers import DiffusionPipeline
 
+from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.models.glm_image import GlmImagePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent, PipelineLoader
 from tensorrt_llm.visual_gen.args import AttentionConfig, TorchCompileConfig, VisualGenArgs
-
-
-@pytest.fixture(autouse=True, scope="module")
-def _cleanup_mpi_env():
-    yield
-    os.environ.pop("TLLM_DISABLE_MPI", None)
-
 
 # ============================================================================
 # Test constants
