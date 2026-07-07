@@ -186,7 +186,6 @@ full:DGX_B200/unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend 
 full:DGX_B200/unittest/auto_deploy/multigpu/custom_ops/test_ad_dist_strategies.py::test_allreduce_strategies[MIN_LATENCY] SKIP (https://nvbugs/6403920)
 full:DGX_B200/unittest/auto_deploy/multigpu/custom_ops/test_ad_dist_strategies.py::test_allreduce_strategies[ONESHOT] SKIP (https://nvbugs/6403920)
 full:DGX_B200/unittest/auto_deploy/multigpu/custom_ops/test_ad_dist_strategies.py::test_allreduce_strategies[TWOSHOT] SKIP (https://nvbugs/6403920)
-full:DGX_H100/unittest/_torch/attention/test_attention_backends.py::test_attention_backend[qwen2_0_5b_gqa_hd64-ctx-bf16-HND-p32-v1] SKIP (https://nvbugs/6403909)
 full:GB200/accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_eagle3[eagle3_one_model=False-overlap_scheduler=False] SKIP (https://nvbugs/6402500)
 full:GB200/accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_guided_decoding_with_eagle3[llguidance-eagle3_one_model=False] SKIP (https://nvbugs/6402500)
 full:GB200/accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_guided_decoding_with_eagle3[xgrammar-eagle3_one_model=False] SKIP (https://nvbugs/6402500)
