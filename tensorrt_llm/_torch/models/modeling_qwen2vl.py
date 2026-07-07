@@ -1160,7 +1160,10 @@ class Qwen2_5_VLVisionAttention(Attention):
         # uses head_dim=80 (e.g. 1280 hidden / 16 heads), so use PyTorch RoPE.
         if IS_FLASHINFER_AVAILABLE and self.head_dim % 64 == 0 and position_ids is not None:
             try:
-                cos_sin_cache = torch.cat([cos, sin], dim=-1).contiguous()
+                # flashinfer requires cos_sin_cache in float32; upstream may cache
+                # cos/sin in the vision tower dtype (e.g. bf16) as a perf hint.
+                cos_sin_cache = torch.cat([cos, sin], dim=-1).to(
+                    torch.float32).contiguous()
                 flashinfer_apply_rope_with_cos_sin_cache_inplace(
                     position_ids,
                     q,
@@ -1170,7 +1173,7 @@ class Qwen2_5_VLVisionAttention(Attention):
                     is_neox=True,
                 )
                 return q, k, v
-            except RuntimeError as err:
+            except (RuntimeError, ValueError) as err:
                 logger.warning(
                     "Qwen2.5-VL vision RoPE: FlashInfer failed (%s); "
                     "falling back to PyTorch RotaryEmbedding.apply_rotary_pos_emb.",
