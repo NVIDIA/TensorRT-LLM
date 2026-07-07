@@ -219,6 +219,11 @@ TEST_F(KVCacheManagerTest, BlockManagerTest)
     EXPECT_EQ(idSet.size(), occupiedBlocks);
     blockManager.releaseBlocks(seq0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
+    for (auto const blockId : idSet)
+    {
+        auto const block = blockManager.getBlockById(blockId, maxAttentionWindow);
+        EXPECT_EQ(block->getPrevBlockInSeq(), nullptr);
+    }
 
     // Test: last block shared (inputLength aligned to tokensPerBlock)
     auto inputTokensAligned = makeInputTokens(numTokens);
