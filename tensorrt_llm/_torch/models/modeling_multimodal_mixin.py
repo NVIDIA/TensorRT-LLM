@@ -225,7 +225,36 @@ class MultimodalModelMixin:
         self,
         selected_items: Sequence[tuple[MultimodalParams, int]],
     ) -> list[torch.Tensor]:
-        """Encode compatible consecutive atomic items in scheduler order."""
+        """Prepare and encode atomic items in scheduler order."""
+        return self.encode_prepared_multimodal_items(self.prepare_multimodal_items(selected_items))
+
+    def prepare_multimodal_items(
+        self,
+        selected_items: Sequence[tuple[MultimodalParams, int]],
+    ) -> list[tuple[MultimodalParams, int, str]]:
+        """Slice selected items before any caller performs H2D transfer."""
+        prepared_items: list[tuple[MultimodalParams, int, str]] = []
+        for multimodal_param, item_idx in selected_items:
+            multimodal_data = multimodal_param.multimodal_data or {}
+            item_refs = multimodal_data.get("multimodal_item_refs")
+            embedding_lengths = multimodal_data.get("multimodal_embedding_lengths")
+            if not isinstance(item_refs, list) or not isinstance(embedding_lengths, list):
+                raise ValueError("MM item metadata is required for item encoding")
+            modality = item_refs[item_idx][0]
+            prepared_items.append(
+                (
+                    self._select_multimodal_item(multimodal_param, item_idx),
+                    embedding_lengths[item_idx],
+                    modality,
+                )
+            )
+        return prepared_items
+
+    def encode_prepared_multimodal_items(
+        self,
+        prepared_items: Sequence[tuple[MultimodalParams, int, str]],
+    ) -> list[torch.Tensor]:
+        """Encode already-sliced compatible items in scheduler order."""
         outputs: list[torch.Tensor] = []
         group_params: list[MultimodalParams] = []
         group_lengths: list[int] = []
@@ -241,18 +270,12 @@ class MultimodalModelMixin:
             group_params.clear()
             group_lengths.clear()
 
-        for multimodal_param, item_idx in selected_items:
-            multimodal_data = multimodal_param.multimodal_data or {}
-            item_refs = multimodal_data.get("multimodal_item_refs")
-            embedding_lengths = multimodal_data.get("multimodal_embedding_lengths")
-            if not isinstance(item_refs, list) or not isinstance(embedding_lengths, list):
-                raise ValueError("MM item metadata is required for item encoding")
-            modality = item_refs[item_idx][0]
+        for multimodal_param, embedding_length, modality in prepared_items:
             if group_modality is not None and modality != group_modality:
                 flush_group()
             group_modality = modality
-            group_params.append(self._select_multimodal_item(multimodal_param, item_idx))
-            group_lengths.append(embedding_lengths[item_idx])
+            group_params.append(multimodal_param)
+            group_lengths.append(embedding_length)
         flush_group()
         return outputs
 

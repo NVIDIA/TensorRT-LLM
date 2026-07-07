@@ -251,6 +251,7 @@ def _strip_py_multimodal_data_post_prefill(request: LlmRequest) -> None:
         return
     strip_mm_data_for_generation(mm_data)
     request.py_mm_encoder_outputs.clear()
+    request.py_mm_encoder_output_buffer = None
     request.py_mm_encoder_inflight_items.clear()
 
 

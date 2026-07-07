@@ -26,7 +26,8 @@ from tensorrt_llm.inputs.multimodal import (MultimodalInput, MultimodalParams,
                                             MultimodalRuntimeData,
                                             _has_mm_payload_keys,
                                             check_mm_embed_cumsum_if_needed,
-                                            strip_mm_data_for_generation)
+                                            strip_mm_data_for_generation,
+                                            strip_mm_encoder_inputs)
 from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
                                           create_input_processor,
                                           create_input_processor_with_hash)
@@ -2530,19 +2531,21 @@ class PyTorchModelEngine(ModelEngine):
             request = request_by_id[request_id]
             multimodal_param = MultimodalParams(
                 multimodal_data=request.py_multimodal_data)
-            multimodal_param.to_device(
+            for item_idx in item_indices:
+                selected.append((multimodal_param, item_idx))
+                selected_owners.append((request, item_idx))
+
+        prepared_items = self.model.prepare_multimodal_items(selected)
+        for item_param, _, _ in prepared_items:
+            item_param.to_device(
                 "multimodal_data",
                 "cuda",
                 pin_memory=prefer_pinned(),
                 target_keywords=getattr(self.model,
                                         "multimodal_data_device_paths", None),
             )
-            request.py_multimodal_data = multimodal_param.multimodal_data
-            for item_idx in item_indices:
-                selected.append((multimodal_param, item_idx))
-                selected_owners.append((request, item_idx))
 
-        outputs = self.model.encode_multimodal_items(selected)
+        outputs = self.model.encode_prepared_multimodal_items(prepared_items)
         if len(outputs) != len(selected_owners):
             raise RuntimeError(
                 "MM item encoder must return one output per item")
@@ -2556,7 +2559,28 @@ class PyTorchModelEngine(ModelEngine):
                 raise ValueError(
                     f"MM item {item_idx} produced {output.shape[0]} embeddings; "
                     f"expected {embedding_lengths[item_idx]}")
-            request.py_mm_encoder_outputs[item_idx] = output
+            if embedding_lengths is None:
+                raise ValueError(
+                    f"MM request {request.py_request_id} is missing embedding lengths"
+                )
+            if request.py_mm_encoder_output_buffer is None:
+                request.py_mm_encoder_output_buffer = torch.empty(
+                    (sum(embedding_lengths), *output.shape[1:]),
+                    dtype=output.dtype,
+                    device=output.device,
+                )
+            output_buffer = request.py_mm_encoder_output_buffer
+            if (output_buffer.shape[1:] != output.shape[1:]
+                    or output_buffer.dtype != output.dtype
+                    or output_buffer.device != output.device):
+                raise ValueError(
+                    "MM encoder items for one request must have matching "
+                    "output shape, dtype, and device")
+            output_start = sum(embedding_lengths[:item_idx])
+            output_end = output_start + embedding_lengths[item_idx]
+            output_view = output_buffer[output_start:output_end]
+            output_view.copy_(output)
+            request.py_mm_encoder_outputs[item_idx] = output_view
             request.py_mm_encoder_inflight_items.discard(item_idx)
 
         touched_requests = {
@@ -2566,8 +2590,9 @@ class PyTorchModelEngine(ModelEngine):
         for request in touched_requests.values():
             if all(output is not None
                    for output in request.py_mm_encoder_outputs):
-                request.py_multimodal_data["multimodal_embedding"] = torch.cat(
-                    request.py_mm_encoder_outputs, dim=0)
+                request.py_multimodal_data["multimodal_embedding"] = (
+                    request.py_mm_encoder_output_buffer)
+                strip_mm_encoder_inputs(request.py_multimodal_data)
 
     def _set_up_multimodal_encoder_attn_metadata(self) -> None:
         """Construct AttentionMetadata for any multimodal encoders inside the

@@ -684,6 +684,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_mm_item_order = kwargs.pop("py_mm_item_order", None)
         self.py_is_multimodal_encoder_request = False
         self.py_mm_encoder_outputs: List[Optional[torch.Tensor]] = []
+        self.py_mm_encoder_output_buffer: Optional[torch.Tensor] = None
         self.py_mm_encoder_inflight_items: set[int] = set()
         encoder_input_tokens = kwargs.get("encoder_input_tokens")
         encoder_output_len = kwargs.get("encoder_output_len")
@@ -1122,6 +1123,7 @@ def initialize_multimodal_encoder_request(request: LlmRequest,
     request.py_is_multimodal_encoder_request = token_lengths is not None
     request.py_mm_encoder_outputs = ([None] * len(token_lengths)
                                      if token_lengths is not None else [])
+    request.py_mm_encoder_output_buffer = None
     request.py_mm_encoder_inflight_items.clear()
 
 

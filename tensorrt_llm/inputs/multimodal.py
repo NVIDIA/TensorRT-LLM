@@ -167,6 +167,18 @@ def strip_mm_data_for_generation(mm_data: Dict[str, Any]) -> None:
         mm_data['mrope_config'] = {'mrope_position_deltas': mrope_deltas}
 
 
+def strip_mm_encoder_inputs(mm_data: Dict[str, Any]) -> None:
+    """Drop raw encoder payloads while preserving cached MM embeddings.
+
+    Item-level encoder scheduling keeps the original request payload on CPU
+    and transfers only selected items to GPU. Once every item is encoded, the
+    raw modality dictionaries are no longer needed and must not be moved to
+    GPU by the subsequent LLM input-preparation path.
+    """
+    for modality in ("image", "video", "audio"):
+        mm_data.pop(modality, None)
+
+
 @dataclass
 class MultimodalInput:
     """Per-logical-unit multimodal metadata for KV-cache hashing (C++ layer).

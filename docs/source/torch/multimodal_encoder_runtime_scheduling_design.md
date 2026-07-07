@@ -231,6 +231,7 @@ The Python request owns fixed-size item slots and an in-flight set:
 
 ```python
 py_mm_encoder_outputs: list[Optional[torch.Tensor]]
+py_mm_encoder_output_buffer: Optional[torch.Tensor]
 py_mm_encoder_inflight_items: set[int]
 ```
 
@@ -246,10 +247,12 @@ The scheduler marks an item `INFLIGHT` at selection time, before execution. This
 an overlapped or pipelined scheduling turn from selecting the same item twice. An old in-flight item is
 not considered ready for same-step LLM eligibility.
 
-On successful execution, the executor writes the output to its original index and removes the item
-from the in-flight set. Once all slots are ready, it concatenates outputs in canonical item order and
-populates the existing full `multimodal_embedding` path. On request cancellation, validation failure,
-or execution error, the request-local slots and reservations are released with the request.
+On the first successful item, the executor allocates one contiguous final output buffer using the
+declared per-item embedding lengths. Each completed item is copied directly into its canonical slice;
+the output slots hold views into this buffer rather than independent allocations. Once all slots are
+ready, that same buffer becomes `multimodal_embedding` without a final `torch.cat` allocation. On
+request cancellation, validation failure, or execution error, the buffer, slots, and reservations are
+released with the request.
 
 ## Scheduler architecture
 
@@ -411,7 +414,8 @@ def encode_multimodal_items(
 ```
 
 The scheduler knows only request IDs, item indices, and costs. The executor resolves the selected
-request/item pairs and calls the model. The model owns:
+request/item pairs and calls the model. Item slicing happens while the original payload is still on
+CPU; only the prepared microbatch is transferred to GPU. The model owns:
 
 - slicing raw model-specific tensors by item;
 - determining physical forward compatibility;
@@ -419,6 +423,10 @@ request/item pairs and calls the model. The model owns:
 - constructing exact attention metadata;
 - executing the encoder and connector; and
 - splitting outputs back into one tensor per selected item.
+
+The executor owns the selected-only H2D transfer, direct copies into the final contiguous output
+buffer, and removal of raw modality payloads after all items complete. Completed outputs remain on
+GPU for same-step LLM consumption; this design does not offload them.
 
 The existing `encode_multimodal_inputs` remains available for the legacy path and existing prefetch
 behavior.
@@ -482,7 +490,7 @@ The first implementation is serial from the scheduler's perspective:
 
 ```text
 selected MM encoder forward group(s)
-    -> request-local output commit and full embedding assembly
+    -> direct commit into request-local final embedding buffer
     -> selected LLM forward
 ```
 
@@ -566,6 +574,7 @@ item at normal verbosity:
 - number of physical encoder forward groups;
 - requests blocked by atomic item/token budget;
 - request-local ready bytes, especially in independent mode;
+- selected H2D bytes and peak allocated memory around each encoder forward;
 - waiting time to first encoder item and time from final item to first LLM prefill;
 - cache hits/misses when cache integration lands; and
 - whether the experimental independent policy is enabled.
@@ -608,7 +617,10 @@ with LLM work.
 3. Pack atomic items for admitted/active requests under both budgets.
 4. Filter partial requests before MicroBatchScheduler while preserving policy order.
 5. Execute selected items and preserve same-iteration LLM forward.
-6. Verify no non-MM regression and no native encoder-decoder behavior change.
+6. Slice items before H2D and transfer only the selected microbatch.
+7. Assemble outputs directly into one contiguous final buffer without `torch.cat`.
+8. Drop raw encoder payloads after completion so LLM preparation cannot transfer them again.
+9. Verify no non-MM regression and no native encoder-decoder behavior change.
 
 ### Phase 4: experimental independent admission
 
