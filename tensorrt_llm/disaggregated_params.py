@@ -54,6 +54,9 @@ class DisaggregatedParams:
     ctx_dp_rank: Optional[int] = None
     ctx_info_endpoint: Optional[str] = None
     schedule_style: Optional[DisaggScheduleStyle] = None
+    # generation_only: receive the KV transfer + commit it for reuse, then finish
+    # without generating (prewarming, cache migration/replication, pre-positioning).
+    kv_transfer_only: Optional[bool] = None
     ctx_usage: Optional[Dict[str, Any]] = None
     # Multi-turn conversation id (from session headers such as X-Session-ID),
     # carried through so worker-side consumers (e.g. the ADP router) can see
