@@ -7614,6 +7614,39 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             task = GSM8K(model_name)
             task.evaluate(llm)
 
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
+    def test_mxfp8_piecewise_cuda_graph(self, tp_size, ep_size):
+        model_name = "MiniMaxAI/MiniMax-M3-MXFP8"
+        model_path = f"{llm_models_root()}/MiniMax-M3-MXFP8"
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
+                                        enable_block_reuse=False)
+        sparse_attention_config = MiniMaxM3SparseAttentionConfig()
+        cuda_graph_config = CudaGraphConfig(
+            enable_padding=True, batch_sizes=[1, 2, 4, 8, 12, 16, 24, 32])
+        torch_compile_config = TorchCompileConfig(
+            enable_piecewise_cuda_graph=True,
+            capture_num_tokens=[1, 8192],
+            max_num_streams=3)
+
+        with LLM(model_path,
+                 tensor_parallel_size=tp_size,
+                 moe_expert_parallel_size=ep_size,
+                 enable_attention_dp=True,
+                 moe_config=MoeConfig(backend="TRTLLM"),
+                 kv_cache_config=kv_cache_config,
+                 sparse_attention_config=sparse_attention_config,
+                 cuda_graph_config=cuda_graph_config,
+                 torch_compile_config=torch_compile_config,
+                 max_seq_len=2048,
+                 max_num_tokens=8192,
+                 max_batch_size=32,
+                 trust_remote_code=True) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.MXFP8
+            task = GSM8K(model_name)
+            task.evaluate(llm)
+
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
     @parametrize_with_ids("tp_size,ep_size", [(4, 4)])

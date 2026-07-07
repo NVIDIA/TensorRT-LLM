@@ -765,9 +765,13 @@ def _distributed_worker_function(world_size, strategy):
                          tuning_config=config_independent,
                          inputs=inputs)
 
-    # Check only one file is created in the cache path
-    assert len(os.listdir(os.path.dirname(
-        cache_path))) == 1, "Only one rank file should be created"
+    # Check only one cache file is created in the cache path.
+    # The sibling ".lock" file is an implementation artifact of
+    # _exclusive_cache_lock (see tensorrt_llm/_torch/autotuner.py) and is not
+    # a per-rank cache file.
+    cache_dir = os.path.dirname(cache_path)
+    cache_files = [f for f in os.listdir(cache_dir) if not f.endswith(".lock")]
+    assert len(cache_files) == 1, "Only one rank file should be created"
 
     dist.barrier()
 
