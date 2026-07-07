@@ -49,6 +49,18 @@ __device__ __forceinline__ int64_t flatIndexToMemoryOffset(
     return i0 * s0 + i1 * s1 + i2 * s2 + i3 * s3;
 }
 
+__device__ __forceinline__ int64_t scalePageIndex(int64_t flatIndex, int64_t blockStride, int32_t pageIndexScale)
+{
+    if (pageIndexScale == 1)
+    {
+        return flatIndex;
+    }
+
+    int64_t const blockIndex = flatIndex / blockStride;
+    int64_t const inBlockOffset = flatIndex - blockIndex * blockStride;
+    return blockIndex * pageIndexScale * blockStride + inBlockOffset;
+}
+
 } // anonymous namespace
 
 /**
@@ -63,7 +75,7 @@ __device__ __forceinline__ int64_t flatIndexToMemoryOffset(
  * @param out_scale           Output scale data [num_tokens, scale_size] contiguous
  * @param k_token_start       Start offset into slot_mapping arrays
  * @param num_tokens          Number of tokens to gather
- * @param head_dim            Head dimension (must be 128)
+ * @param head_dim            Payload byte width (128 for FP8, 64 for packed FP4)
  * @param scale_size          Scale size in bytes (must be 4)
  * @param cache_stride_0      Stride for k_cache dimension 0 (in bytes)
  * @param cache_stride_1      Stride for k_cache dimension 1 (in bytes)
@@ -73,12 +85,14 @@ __device__ __forceinline__ int64_t flatIndexToMemoryOffset(
  * @param cache_dim_1         Size of k_cache dimension 1
  * @param cache_dim_2         Size of k_cache dimension 2
  * @param cache_dim_3         Size of k_cache dimension 3
+ * @param page_index_scale    Scale from physical block ID to V2 shared-page index
  */
 __global__ void indexerKCacheGatherUnifiedKernel(uint8_t const* __restrict__ k_cache,
     int64_t const* __restrict__ slot_mapping_fp8, int64_t const* __restrict__ slot_mapping_scale,
     uint8_t* __restrict__ out_fp8, uint8_t* __restrict__ out_scale, int32_t k_token_start, int32_t num_tokens,
     int32_t head_dim, int32_t scale_size, int64_t cache_stride_0, int64_t cache_stride_1, int64_t cache_stride_2,
-    int64_t cache_stride_3, int32_t cache_dim_0, int32_t cache_dim_1, int32_t cache_dim_2, int32_t cache_dim_3)
+    int64_t cache_stride_3, int32_t cache_dim_0, int32_t cache_dim_1, int32_t cache_dim_2, int32_t cache_dim_3,
+    int32_t page_index_scale)
 {
     // For head_dim=128, each thread handles 4 bytes/elements per read/write instruction
     constexpr int VEC_SIZE = 4;
@@ -104,6 +118,9 @@ __global__ void indexerKCacheGatherUnifiedKernel(uint8_t const* __restrict__ k_c
 
     int32_t head_dim_idx = threadIdx.x * VEC_SIZE;
     int64_t flat_idx = flat_idx_fp8_base + head_dim_idx;
+    int64_t const blockStride = static_cast<int64_t>(cache_dim_1) * cache_dim_2 * cache_dim_3;
+    flat_idx = scalePageIndex(flat_idx, blockStride, page_index_scale);
+    flat_idx_scale_base = scalePageIndex(flat_idx_scale_base, blockStride, page_index_scale);
 
     // Convert flat index to memory offset using strides (k cache pool from cpp kv cache manager is non-contiguous)
     int64_t src_offset = flatIndexToMemoryOffset(flat_idx, cache_dim_0, cache_dim_1, cache_dim_2, cache_dim_3,
@@ -130,7 +147,7 @@ void invokeIndexerKCacheGather(uint8_t const* k_cache, int64_t const* slot_mappi
     int64_t const* slot_mapping_scale, uint8_t* out_fp8, uint8_t* out_scale, int32_t k_token_start, int32_t num_tokens,
     int32_t head_dim, int32_t scale_size, int32_t cache_dim_0, int32_t cache_dim_1, int32_t cache_dim_2,
     int32_t cache_dim_3, int64_t cache_stride_0, int64_t cache_stride_1, int64_t cache_stride_2, int64_t cache_stride_3,
-    cudaStream_t stream)
+    int32_t page_index_scale, cudaStream_t stream)
 {
     if (num_tokens == 0)
     {
@@ -145,6 +162,7 @@ void invokeIndexerKCacheGather(uint8_t const* k_cache, int64_t const* slot_mappi
     TLLM_CHECK_WITH_INFO(head_dim % VEC_SIZE == 0, "head_dim (%d) must be a multiple of %d", head_dim, VEC_SIZE);
     TLLM_CHECK_WITH_INFO(scale_size == 4,
         "scale_size must equal 4 bytes (packed UE8M0 x4 for FP4, 1 float32 for FP8, got %d)", scale_size);
+    TLLM_CHECK_WITH_INFO(page_index_scale >= 1, "page_index_scale must be at least 1 (got %d)", page_index_scale);
 
     int32_t const threads_per_block = head_dim / VEC_SIZE;
 
@@ -153,7 +171,7 @@ void invokeIndexerKCacheGather(uint8_t const* k_cache, int64_t const* slot_mappi
 
     indexerKCacheGatherUnifiedKernel<<<grid, block, 0, stream>>>(k_cache, slot_mapping_fp8, slot_mapping_scale, out_fp8,
         out_scale, k_token_start, num_tokens, head_dim, scale_size, cache_stride_0, cache_stride_1, cache_stride_2,
-        cache_stride_3, cache_dim_0, cache_dim_1, cache_dim_2, cache_dim_3);
+        cache_stride_3, cache_dim_0, cache_dim_1, cache_dim_2, cache_dim_3, page_index_scale);
 
     // Check for kernel launch errors
     TLLM_CUDA_CHECK(cudaGetLastError());
