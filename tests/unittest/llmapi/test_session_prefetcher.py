@@ -307,8 +307,12 @@ def test_warm_selects_files_like_the_weight_loader(tmp_path):
 
 def test_warm_falls_back_to_bin_then_pth(tmp_path):
     payload = b"x" * (1 << 20)
-    (tmp_path / "pytorch_model.bin").write_bytes(payload)
-    assert warm_page_cache(str(tmp_path)) == pytest.approx(1 / 1024, rel=1e-3)
+    bin_dir, pth_dir = tmp_path / "bin", tmp_path / "pth"
+    bin_dir.mkdir(), pth_dir.mkdir()
+    (bin_dir / "pytorch_model.bin").write_bytes(payload)
+    (pth_dir / "model.pth").write_bytes(payload)
+    assert warm_page_cache(str(bin_dir)) == pytest.approx(1 / 1024, rel=1e-3)
+    assert warm_page_cache(str(pth_dir)) == pytest.approx(1 / 1024, rel=1e-3)
 
 
 def test_warm_page_cache_ignores_non_weight_dirs(tmp_path):
@@ -384,13 +388,13 @@ def _fake_pynvml(free_sequence, total):
 
 
 @pytest.fixture
-def no_visible_devices_mask(monkeypatch):
+def unset_cuda_visible_devices(monkeypatch):
     # The settle helper resolves CUDA_VISIBLE_DEVICES; pin it unset so the
     # fake single-GPU pynvml is used as-is.
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
 
 
-def test_settle_noop_when_gpu_free(monkeypatch, no_visible_devices_mask):
+def test_settle_noop_when_gpu_free(monkeypatch, unset_cuda_visible_devices):
     fake = _fake_pynvml([75 * _GIB], 80 * _GIB)
     monkeypatch.setitem(sys.modules, "pynvml", fake)
     t0 = time.monotonic()
@@ -399,7 +403,7 @@ def test_settle_noop_when_gpu_free(monkeypatch, no_visible_devices_mask):
     assert fake.calls["n"] == 1
 
 
-def test_settle_waits_for_previous_worker_release(monkeypatch, no_visible_devices_mask):
+def test_settle_waits_for_previous_worker_release(monkeypatch, unset_cuda_visible_devices):
     # Free memory rising as the previous worker exits: 17 -> 40 -> 75 GiB.
     fake = _fake_pynvml([17 * _GIB, 40 * _GIB, 75 * _GIB], 80 * _GIB)
     monkeypatch.setitem(sys.modules, "pynvml", fake)
@@ -408,7 +412,7 @@ def test_settle_waits_for_previous_worker_release(monkeypatch, no_visible_device
     assert fake.calls["n"] == 3  # polled until the release completed
 
 
-def test_settle_gives_up_when_memory_stays_in_use(monkeypatch, no_visible_devices_mask):
+def test_settle_gives_up_when_memory_stays_in_use(monkeypatch, unset_cuda_visible_devices):
     fake = _fake_pynvml([17 * _GIB], 80 * _GIB)  # flat: legitimately in use
     monkeypatch.setitem(sys.modules, "pynvml", fake)
     monkeypatch.setattr(session_prefetcher, "_SETTLE_POLL_S", 0.01)

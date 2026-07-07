@@ -30,9 +30,10 @@ pool prefetch (pool reuse does not cover model IO). Page cache is
 reclaimable memory, so warming cannot OOM the host; a wasted warm (test
 skipped or reordered) costs only IO bandwidth.
 
-Enabled by default; set ``TRTLLM_TEST_PREFETCH_SESSION=0`` to disable.
-Suites that never import tensorrt_llm's executor modules pay nothing —
-not even the tensorrt_llm import.
+Enabled by default; ``TRTLLM_TEST_PREFETCH_SESSION=0`` disables BOTH pool
+prefetch and weight warming (one kill switch for the whole plugin). Suites
+that never import tensorrt_llm's executor modules pay nothing — not even
+the tensorrt_llm import.
 """
 
 import glob
@@ -201,6 +202,9 @@ _SETTLE_MIN_FREE_FRAC = 0.85  # "GPU is essentially free" — stop waiting
 _SETTLE_POLL_S = 0.5
 _SETTLE_FLAT_POLLS = 3  # consecutive non-increasing polls => memory is in use
 _SETTLE_EPSILON = 256 << 20  # free-memory delta below this counts as flat
+# Hard cap. A dying worker's release completes in a few seconds; 30s is far
+# above that while still bounding a pathological slow-release to a fraction
+# of the ~50s the handover saves.
 _SETTLE_TIMEOUT_S = 30.0
 
 
@@ -230,8 +234,8 @@ def _visible_gpu_handles(pynvml):
                     raise ValueError(token)
                 handles.append(pynvml.nvmlDeviceGetHandleByIndex(index))
         except Exception:
-            # Unparsable form: fall back to all GPUs (the caller's
-            # flat-detection keeps a too-wide scan bounded).
+            # Unparsable or out-of-range form: fall back to all GPUs (the
+            # caller's flat-detection keeps a too-wide scan bounded).
             return [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(count)]
     return handles
 
@@ -249,7 +253,8 @@ def wait_gpu_memory_settle(timeout: float = _SETTLE_TIMEOUT_S) -> None:
     TODO: the deeper fix is MpiPoolSession.shutdown(wait=True) not returning
     until the spawned worker processes have exited — that would close the
     race for every consumer (back-to-back LLM() creations included) and
-    retire this heuristic. Library-behavior change, tracked separately.
+    retire this heuristic. Needs a library-behavior change (blocking
+    shutdown affects all callers), so it belongs in a follow-up PR.
 
     Polls NVML (context-free) until every visible GPU is mostly free, or its
     free memory stops increasing (memory legitimately in use — e.g. another
@@ -439,7 +444,7 @@ class SessionPrefetcher:
             if gen == self._build_gen and self._built is None:
                 self._built = _Built(spec, session, snapshot)
                 return
-        print("[session-prefetch] discarding abandoned background build", flush=True)
+        print("[session-prefetch] discarding superseded background build", flush=True)
         session.shutdown()
 
     def _drain(self, timeout: float):
@@ -527,7 +532,12 @@ class SessionPrefetcher:
             self._patched.add(name)
 
     def dispose(self) -> None:
-        """Shut down any unconsumed shadow pool (end-of-session cleanup)."""
+        """Shut down any unconsumed shadow pool (end-of-session cleanup).
+
+        60s (vs take()'s 180s): at session end there is no test left to hand
+        the pool to, so a still-running build is only worth a short grace
+        before it is abandoned to its generation-bump cleanup.
+        """
         built = self._drain(timeout=60)
         if built is not None:
             built.session.shutdown()
