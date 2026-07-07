@@ -1675,7 +1675,7 @@ def _run_cute_dsl_topk_prefill_test(batch_size, index_topk, num_tokens, dtype, r
 @pytest.mark.parametrize("index_topk", [512, 1024, 2048])
 @pytest.mark.parametrize("num_tokens", [4096, 8192])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_cute_dsl_topk_prefill_zero_row_starts(batch_size, index_topk, num_tokens, dtype):
+def test_cute_dsl_radix_topk_prefill_zero_row_starts(batch_size, index_topk, num_tokens, dtype):
     """Correctness test for CuTE DSL prefill top-k with row_start=0 (all rows).
 
     Note: batch_size here is the number of sequences; num_rows = sum(seq_lens)
@@ -1690,7 +1690,7 @@ def test_cute_dsl_topk_prefill_zero_row_starts(batch_size, index_topk, num_token
 @pytest.mark.parametrize("index_topk", [512, 1024, 2048])
 @pytest.mark.parametrize("num_tokens", [4096, 8192])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_cute_dsl_topk_prefill_nonzero_row_starts(batch_size, index_topk, num_tokens, dtype):
+def test_cute_dsl_radix_topk_prefill_nonzero_row_starts(batch_size, index_topk, num_tokens, dtype):
     """Correctness test for CuTE DSL prefill top-k with nonzero row_starts.
 
     Uses a fixed offset = index_topk // 4 to verify that output indices are
