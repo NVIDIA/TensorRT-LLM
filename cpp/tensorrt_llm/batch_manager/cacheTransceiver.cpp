@@ -243,6 +243,12 @@ std::unique_ptr<BaseCacheTransceiver> CacheTransceiverFactory::createCacheTransc
         return nullptr;
     }
     auto backendType = cacheTransceiverConfig.value().getBackendType();
+    if (common::getEnvDisaggEnableInflightCancel())
+    {
+        TLLM_CHECK_WITH_INFO(backendType.value() != executor::CacheTransceiverConfig::BackendType::DEFAULT,
+            "TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1 requires an explicit cache transceiver backend; "
+            "BackendType::DEFAULT is not supported.");
+    }
     if (backendType.value() == executor::CacheTransceiverConfig::BackendType::DEFAULT)
     {
         if (common::getEnvUseUCXKvCache())
@@ -297,6 +303,20 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     : mCacheTransceiverConfig{cacheTransceiverConfig}
 {
     using tensorrt_llm::batch_manager::kv_cache_manager::CacheFormatter;
+    TLLM_CHECK_WITH_INFO(mCacheTransceiverConfig.has_value(), "CacheTransceiverConfig is not set.");
+    auto const backendType = mCacheTransceiverConfig.value().getBackendType();
+    TLLM_CHECK_WITH_INFO(
+        backendType.has_value() && (backendType.value() != executor::CacheTransceiverConfig::BackendType::DEFAULT),
+        " CacheTransceiverConfig::BackendType is not set.");
+    if (common::getEnvDisaggEnableInflightCancel())
+    {
+        auto const nixlBackend = common::getEnvNixlBackend();
+        TLLM_CHECK_WITH_INFO(
+            backendType.value() == executor::CacheTransceiverConfig::BackendType::NIXL && nixlBackend == "UCX",
+            "TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1 is experimental and currently supported only with the "
+            "NIXL cache transceiver and the UCX NIXL backend.");
+    }
+
     if (useMPI())
     {
         mGroupComm = std::make_shared<CacheTransceiverComm>(std::addressof(tensorrt_llm::mpi::MpiComm::session()));
@@ -347,12 +367,6 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         }
     }
     bool isMLA = attentionType == executor::kv_cache::CacheState::AttentionType::kMLA;
-    TLLM_CHECK_WITH_INFO(mCacheTransceiverConfig.has_value(), "CacheTransceiverConfig is not set.");
-    auto backendType = mCacheTransceiverConfig.value().getBackendType();
-    TLLM_CHECK_WITH_INFO(
-        backendType.has_value() && (backendType.value() != executor::CacheTransceiverConfig::BackendType::DEFAULT),
-        " CacheTransceiverConfig::BackendType is not set.");
-
     std::optional<size_t> maxNumTokens = mCacheTransceiverConfig.value().getMaxTokensInBuffer();
 
     mCacheTransBufferManagers.push_back(
@@ -795,12 +809,29 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 LlmRequest::getSteadyClockNow() - request->getKvCacheTransferStart());
             auto elapsedMs = static_cast<long>(elapsed.count());
-            if (elapsedMs > kvTransferTimeoutMs.value() && mTimedOutSenderIds.insert(requestId).second)
+            if (elapsedMs > kvTransferTimeoutMs.value())
             {
-                TLLM_LOG_WARNING(
-                    "Context KV cache transfer for request %ld exceeded configured timeout: "
-                    "elapsed %ld ms > limit %d ms (observe-only).",
-                    requestId, elapsedMs, kvTransferTimeoutMs.value());
+                bool const inflightCancelEnabled = common::getEnvDisaggEnableInflightCancel();
+                if (mTimedOutSenderIds.insert(requestId).second)
+                {
+                    TLLM_LOG_WARNING(
+                        "Context KV cache transfer for request %ld exceeded configured timeout: "
+                        "elapsed %ld ms > limit %d ms (%s).",
+                        requestId, elapsedMs, kvTransferTimeoutMs.value(),
+                        inflightCancelEnabled ? "requesting cancellation" : "observe-only");
+                }
+                if (inflightCancelEnabled
+                    && mCancelRequestedSenderIds.find(requestId) == mCancelRequestedSenderIds.end())
+                {
+                    if (mCacheSender->cancelRequest(*request))
+                    {
+                        mCancelRequestedSenderIds.insert(requestId);
+                    }
+                    else
+                    {
+                        TLLM_LOG_DEBUG("Context cancellation for request %ld was not accepted; will retry", requestId);
+                    }
+                }
             }
         }
         if (blockAll || (toCompleteIdSet.find(requestId) != toCompleteIdSet.end()))
@@ -861,6 +892,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         requestIt->second->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
         requestsStatus.errorRequestIds.insert(requestId);
         mTimedOutSenderIds.erase(requestId);
+        mCancelRequestedSenderIds.erase(requestId);
         eraseLocalTransferOutcome(
             requestId, mCompletedSenderRequestIds, mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
     }
@@ -877,6 +909,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
             requestIt->second->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
         }
         mTimedOutSenderIds.erase(requestId);
+        mCancelRequestedSenderIds.erase(requestId);
         eraseLocalTransferOutcome(
             requestId, mCompletedSenderRequestIds, mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
     }
@@ -991,12 +1024,30 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 LlmRequest::getSteadyClockNow() - request->getKvCacheTransferStart());
             auto elapsedMs = static_cast<long>(elapsed.count());
-            if (elapsedMs > kvTransferTimeoutMs.value() && mTimedOutRequesterIds.insert(requestId).second)
+            if (elapsedMs > kvTransferTimeoutMs.value())
             {
-                TLLM_LOG_WARNING(
-                    "Generation KV cache transfer for request %ld exceeded configured timeout: "
-                    "elapsed %ld ms > limit %d ms (observe-only).",
-                    requestId, elapsedMs, kvTransferTimeoutMs.value());
+                bool const inflightCancelEnabled = common::getEnvDisaggEnableInflightCancel();
+                if (mTimedOutRequesterIds.insert(requestId).second)
+                {
+                    TLLM_LOG_WARNING(
+                        "Generation KV cache transfer for request %ld exceeded configured timeout: "
+                        "elapsed %ld ms > limit %d ms (%s).",
+                        requestId, elapsedMs, kvTransferTimeoutMs.value(),
+                        inflightCancelEnabled ? "requesting cancellation" : "observe-only");
+                }
+                if (inflightCancelEnabled
+                    && mCancelRequestedRequesterIds.find(requestId) == mCancelRequestedRequesterIds.end())
+                {
+                    if (mCacheReceiver->cancelRequest(*request))
+                    {
+                        mCancelRequestedRequesterIds.insert(requestId);
+                    }
+                    else
+                    {
+                        TLLM_LOG_DEBUG(
+                            "Generation cancellation for request %ld was not accepted; will retry", requestId);
+                    }
+                }
             }
         }
         if (blockAll || toCompleteIdSet.find(requestId) != toCompleteIdSet.end())
@@ -1070,6 +1121,7 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         }
         requestIt->second->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
         mTimedOutRequesterIds.erase(requestId);
+        mCancelRequestedRequesterIds.erase(requestId);
         eraseLocalTransferOutcome(
             requestId, mCompletedRequesterRequestIds, mFailedRequesterRequestIds, mRequesterRequestsAwaitingConsensus);
     }
@@ -1088,6 +1140,7 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             updateKVCacheTransferBW(syncComm, requestIt->second.get());
         }
         mTimedOutRequesterIds.erase(requestId);
+        mCancelRequestedRequesterIds.erase(requestId);
         eraseLocalTransferOutcome(
             requestId, mCompletedRequesterRequestIds, mFailedRequesterRequestIds, mRequesterRequestsAwaitingConsensus);
     }
@@ -1096,6 +1149,12 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
 bool CacheTransceiver::checkGenTransferComplete() const
 {
     return mRequesterFutures.empty() && mCompletedRequesterRequestIds.empty() && mFailedRequesterRequestIds.empty();
+}
+
+bool CacheTransceiver::hasPoisonedTransferBuffer() const
+{
+    return std::any_of(mCacheTransBufferManagerPtrs.begin(), mCacheTransBufferManagerPtrs.end(),
+        [](BaseTransBufferManager const* manager) { return manager != nullptr && manager->hasPoisonedBuffer(); });
 }
 
 bool CacheTransceiver::cancelRequest(std::shared_ptr<LlmRequest> llmRequest)
