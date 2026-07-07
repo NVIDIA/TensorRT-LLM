@@ -36,6 +36,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         BufferConfig,
         BufferId,
         CacheLevel,
+        CommittedBlockRecord,
         CudaStream,
         DataRole,
         DiskCacheTierConfig,
@@ -91,6 +92,7 @@ else:
         BufferConfig,
         BufferId,
         CacheLevel,
+        CommittedBlockRecord,
         CudaStream,
         DataRole,
         DiskCacheTierConfig,
@@ -604,6 +606,41 @@ class TestNoBatching(TestKVCacheManagerV2):
         kv2 = self.manager.create_kv_cache(input_tokens=prompt)
         self.assertEqual(kv2.num_committed_tokens, len(prompt))
         kv2.close()
+
+    def test_committed_block_record(self) -> None:
+        self.prepare(16 << 20, 0, 0, 2, 8, 0, tokens_per_block=8)
+        long_tokens = [self.next_token() for _ in range(24)]
+        short_tokens = long_tokens[:8]
+
+        def record(tokens: list[TokenIdExt]) -> CommittedBlockRecord:
+            kv_cache = self.manager.create_kv_cache(None, tokens)
+            with TemporaryCudaStream([]) as stream_holder:
+                stream = cast(CudaStream, stream_holder.handle)
+                self.assertTrue(kv_cache.resume(stream))
+                self.assertTrue(kv_cache.resize(len(tokens)))
+                uncommitted = tokens[kv_cache.num_committed_tokens :]
+                if uncommitted:
+                    kv_cache.commit(uncommitted)
+                kv_cache.stop_committing()
+                block_record = kv_cache.record_committed_blocks()
+                self.assertIsNotNone(block_record)
+                self.assertIsInstance(block_record, CommittedBlockRecord)
+            kv_cache.close()
+            assert block_record is not None
+            return block_record
+
+        long_record = record(long_tokens)
+        short_record = record(short_tokens)
+        self.assertEqual(self.manager.probe_reuse(None, short_tokens), len(short_tokens))
+
+        short_record.release()
+        self.assertEqual(self.manager.probe_reuse(None, short_tokens), 0)
+        self.assertEqual(self.manager.probe_reuse(None, long_tokens), len(long_tokens))
+
+        long_record.release()
+        self.assertEqual(self.manager.probe_reuse(None, long_tokens), 0)
+        with self.assertRaisesRegex(ValueError, "already been released"):
+            long_record.release()
 
     def test_reuse_scope_isolates_reuse(self) -> None:
         self.prepare(16 << 20, 0, 0, 2, None, 0, tokens_per_block=8)

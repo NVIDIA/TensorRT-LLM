@@ -16,7 +16,7 @@
 import array
 import enum
 import math
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import chain
@@ -37,6 +37,7 @@ from .._common import (
     CudaStream,
     PageIndex,
     PageIndexMode,
+    PageStatus,
     Priority,
     TokenIdExt,
 )
@@ -127,6 +128,45 @@ class SeqBlock:
     def __del__(self) -> None:
         self.tree_block = None
         self.pages.clear()
+
+
+class CommittedBlockRecord:
+    __slots__ = ("_page_refs",)
+
+    _page_refs: tuple[rawref.ref[CommittedPage], ...] | None
+
+    def __init__(self, pages: Iterable[CommittedPage]) -> None:
+        recorded_pages = tuple({id(page): page for page in pages}.values())
+        self._page_refs = tuple(rawref.ref(page) for page in recorded_pages)
+        for page in recorded_pages:
+            page.recorded_count += 1
+
+    def release(self) -> None:
+        page_refs = self._page_refs
+        if page_refs is None:
+            raise ValueError("Committed block record has already been released")
+
+        pages = list[CommittedPage]()
+        for page_ref in page_refs:
+            page = page_ref()
+            if page is not None:
+                if page.recorded_count <= 0:
+                    raise ValueError("Committed page has no live record")
+                pages.append(page)
+
+        self._page_refs = None
+        for page in pages:
+            page.recorded_count -= 1
+            if (
+                page.recorded_count == 0
+                and page.status == PageStatus.DROPPABLE
+                and page.scheduled_for_eviction
+            ):
+                page.manager.exclude_from_eviction(page)
+
+    def __del__(self) -> None:
+        if self._page_refs is not None:
+            self.release()
 
 
 class _Status(enum.Enum):
@@ -984,6 +1024,42 @@ class _KVCache:
     @property
     def num_committed_tokens(self) -> int:
         return len(self._committed_tokens)
+
+    def record_committed_blocks(self) -> CommittedBlockRecord | None:
+        """Record blocks useful only to the next request in a conversation.
+
+        Full-attention and attention-sink blocks are not recorded because they
+        are needed by every turn. Recording SSM state is not yet supported.
+        This must be called after stop_committing(). Returns None if any required
+        SWA page is unavailable.
+        """
+        if self._commit_state != self.CommitState.USER_STOP:
+            raise LogicError("record_committed_blocks() requires stop_committing()")
+
+        end = self._num_committed_blocks
+        retained_pages: list[CommittedPage] = []
+        for lc_idx, lc in self.manager._life_cycles.items():
+            if isinstance(lc, SsmLifeCycle):
+                # TODO: Support recording reusable SSM state pages.
+                continue
+            if lc.window_size is None:
+                continue
+            stale_range = _KVCache._get_stale_range(
+                self.tokens_per_block, self.num_committed_tokens, lc
+            )
+            window_start = min(stale_range.end, end)
+            for ordinal in typed_range(window_start, end):
+                tree_block = self._blocks[ordinal].tree_block
+                if tree_block is None:
+                    return None
+                page_ref = tree_block.storage[lc_idx]
+                if page_ref is None:
+                    return None
+                page = page_ref()
+                if page is None:
+                    return None
+                retained_pages.append(page)
+        return CommittedBlockRecord(retained_pages)
 
     # Users promise to not commit any more tokens. For cases where we shouldn't reuse generated tokens
     # (eg. CoT), this helps us drop (instead of evict) out-of-window blocks for SWA layers.

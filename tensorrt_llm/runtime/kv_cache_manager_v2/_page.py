@@ -229,6 +229,7 @@ class UncommittedPage(Page):
 @dataclass(slots=True)
 class CommittedPage(Page):
     block: rawref.ref["Block"]
+    recorded_count: int
     __rawref__: rawref.ref["CommittedPage"]
 
     def is_committed(self) -> bool:
@@ -244,6 +245,7 @@ class CommittedPage(Page):
         priority: Priority,
     ):
         self.block = rawref.ref(block)
+        self.recorded_count = 0
         self.__rawref__ = rawref.NULL
         Page.__init__(
             self,

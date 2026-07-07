@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from .._common import DEFAULT_BEAM_INDEX, BeamIndex
-from ._kv_cache import _KVCache
+from ._kv_cache import CommittedBlockRecord, _KVCache
 from ._kv_cache_manager import (
     AggregatedPageDesc,
     KVCacheManager,
@@ -26,6 +26,7 @@ from ._kv_cache_manager import (
 __all__ = [
     "KVCacheManager",
     "_KVCache",
+    "CommittedBlockRecord",
     "BeamIndex",
     "DEFAULT_BEAM_INDEX",
     "AggregatedPageDesc",
