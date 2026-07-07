@@ -26,6 +26,7 @@
 #include <trtllm/gen/Expr.h>
 #include <trtllm/gen/Kernel.h>
 #endif // TLLM_FMHA_TRTLLM_COMPAT
+#include "Dsv4Constants.h"
 #include <nlohmann/json.hpp>
 #include <cassert>
 #include <numeric>
@@ -57,8 +58,9 @@ inline int32_t getPaddedHeadDimForSmem(int32_t headDim) {
 // Whether the kernel uses the opt-in K-only BF16Q+FP8KV transform pipeline.
 template <typename FmhaOptions_>
 inline bool usesKOnlyTransformPipeline(FmhaOptions_ const& options) {
-  bool const isSupportedHeadDim = options.mHeadDimQk == options.mHeadDimV &&
-                                  (options.mHeadDimQk == 64 || options.mHeadDimQk == 128);
+  bool const isSupportedHeadDim =
+    options.mHeadDimQk == options.mHeadDimV &&
+    (options.mHeadDimQk == 64 || options.mHeadDimQk == 128 || options.mHeadDimQk == 256);
   return options.mEnablesBf16QFp8KvKOnlyTransform && !isContextKernel(options.mFmhaKernelType) &&
          !options.mIsMlaGen && options.mDtypeQ != options.mDtypeK && isSupportedHeadDim &&
          options.mDtypeQ == tg::Dtype::Bfloat16 && options.mDtypeK == tg::Dtype::E4m3 &&
@@ -88,8 +90,9 @@ inline bool usesE4m3ToBfloat16SassPatch(FmhaOptions_ const& options) {
 // Whether separate transformed K/V resources are supported for this kernel.
 template <typename FmhaOptions_>
 inline bool supportsSeparateTransformedKv(FmhaOptions_ const& options) {
-  bool const isSupportedHeadDim = options.mHeadDimQk == options.mHeadDimV &&
-                                  (options.mHeadDimQk == 64 || options.mHeadDimQk == 128);
+  bool const isSupportedHeadDim =
+    options.mHeadDimQk == options.mHeadDimV &&
+    (options.mHeadDimQk == 64 || options.mHeadDimQk == 128 || options.mHeadDimQk == 256);
   return isBf16QFp8KvFullTransformGeneration(options) && !options.mIsMlaGen &&
          options.mNumInstsQ == 1 && options.mNumInstsKv == 1 && isSupportedHeadDim;
 }
@@ -166,10 +169,6 @@ struct KernelConfig : public KernelConfigBase {
     }
 
     // The data type of softmax computation.
-    if (options.mEnablesFp16Softmax) {
-      // E4m3 kernels will also use Fp16 for softmax computation.
-      mDtypeSoftmax = (mDtypeQ == tg::Dtype::Bfloat16) ? tg::Dtype::Bfloat16 : tg::Dtype::Fp16;
-    }
 
     // The maximum headDim for K and V.
     mMaxHeadDimKv = std::max(mHeadDimQk, mHeadDimV);
@@ -291,11 +290,6 @@ struct KernelConfig : public KernelConfigBase {
       if (mHeadDimPerStageKv == 0 && keepsMmaAbForDsMlaGen) {
         TLLM_CHECK_ERROR(options.mSeparateSmemKv, "Not supported");
         mNumStagesKv = int32_t{4 * 8 /*bits*/ / std::max(tg::dtypeGetNumBits(mDtypeQ), 8)};
-#ifdef TLLM_RUBIN_FEATURES
-        if (tg::isArchRubin(options.mCudaArch)) {
-          mNumStagesKv = int32_t{6 * 8 /*bits*/ / std::max(tg::dtypeGetNumBits(mDtypeQ), 8)};
-        }
-#endif // TLLM_RUBIN_FEATURES
       } else if (keepsMmaAbForDsMlaGen) {
         // For DS MLA-generation kernels with keepsMmaAb, allocate at most 112 KiB shared memory for
         // 2-CTA mode and 128 KiB shared memory for 1-CTA mode. This preserves the previous stage
