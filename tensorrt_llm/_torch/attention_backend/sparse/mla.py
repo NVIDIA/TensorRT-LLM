@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Sparse MLA context and generation phase dispatch."""
+"""Sparse backend phase dispatch for the shared MLA module."""
 
 from typing import TYPE_CHECKING, Optional
 
@@ -10,7 +10,7 @@ import torch
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._utils import get_sm_version
 
-from .dsa.module import forward_sparse_mla_kvcache_bf16, should_use_short_mha
+from .dsa.mla_backend import forward_sparse_mla_kvcache_bf16, should_use_short_mha
 
 if TYPE_CHECKING:
     pass

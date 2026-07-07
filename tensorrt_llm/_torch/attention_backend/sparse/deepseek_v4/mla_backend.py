@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""DeepSeek-V4-specific orchestration for the generic MLA module."""
+"""DeepSeek-V4-specific hooks for the shared MLA module."""
 
 import os
 from typing import Optional

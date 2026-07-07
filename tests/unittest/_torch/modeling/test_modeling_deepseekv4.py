@@ -371,7 +371,7 @@ def test_deepseek_v4_q_b_layernorm_differs_from_joint_flat_rms():
 
 
 def test_deepseek_v4_mla_q_b_layernorm_init_and_forward_shape():
-    from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module import (
+    from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.mla_backend import (
         deepseek_v4_q_b_layernorm,
         forward_impl_with_deepseek_v4,
     )
