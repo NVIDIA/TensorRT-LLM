@@ -11,11 +11,11 @@ verl_config:
       git clone -b v2.5.1 https://github.com/NVIDIA/gdrcopy.git &&
       (cd gdrcopy && make prefix=/usr/local lib_install) &&
       rm -rf gdrcopy
-    # Install nvshmem
-    - "pip install nvidia-nvshmem-cu13==3.3.20"
-    # Expose the pip-installed nvshmem package (host + device libs + headers) at a
-    # stable NVSHMEM_DIR so DeepEP links against the matching 3.3.20 device library.
-    # The pip install path is Python-version dependent, so resolve it dynamically.
+    # Expose the nvshmem package that PyTorch already depends on (host + device
+    # libs + headers) at a stable NVSHMEM_DIR so DeepEP links against the exact
+    # NVSHMEM version torch was built against, avoiding libtorch_nvshmem.so symbol
+    # mismatches. Do NOT pip-install a separate nvshmem: that shadows torch's copy.
+    # The package path is Python-version dependent, so resolve it dynamically.
     - >-
       NVSHMEM_PKG=$(python3 -c "import nvidia.nvshmem as n; print(list(n.__path__)[0])") &&
       ln -sfn "$NVSHMEM_PKG" /opt/nvshmem &&
