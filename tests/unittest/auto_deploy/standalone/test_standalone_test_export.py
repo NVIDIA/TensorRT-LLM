@@ -24,10 +24,12 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[4]
 CREATE_SCRIPT = REPO_ROOT / "examples" / "auto_deploy" / "llmc" / "create_standalone_package.py"
 AD_MULTIGPU_TESTS = REPO_ROOT / "tests" / "unittest" / "auto_deploy" / "multigpu"
+LLMC_TRTLLM_SMOKE_TEST = Path("smoke/test_ad_build_small_multi.py")
 
 EXPECTED_MULTIGPU_FILES = {
     Path("custom_ops/test_dist.py"),
     Path("custom_ops/test_sharded_rmsnorm.py"),
+    LLMC_TRTLLM_SMOKE_TEST,
     Path("transformations/library/conftest.py"),
     Path("transformations/library/test_apply_sharding_hints.py"),
     Path("transformations/library/test_bmm_sharding.py"),
@@ -39,6 +41,23 @@ EXPECTED_MULTIGPU_FILES = {
 }
 CANONICAL_IMPORT = "tensorrt_llm._torch.auto_deploy"
 STANDALONE_IMPORT = "llmc"
+BUILD_AND_RUN_AD_IMPORT = "from build_and_run_ad import ExperimentConfig, main"
+LLMC_TRTLLM_RUNNER_IMPORT = """
+if os.environ.get("TRTLLM_REDIRECT_AD_TO_LLMC") != "true":
+    pytest.skip(
+        "LLMC TRT-LLM redirect smoke requires TRTLLM_REDIRECT_AD_TO_LLMC=true",
+        allow_module_level=True,
+    )
+pytest.importorskip("tensorrt_llm")
+from runners.trtllm.build_and_run_llmc_trtllm import ExperimentConfig, main"""
+
+
+def _expected_exported_test(source: str, relative_path: Path) -> str:
+    expected = source.replace(CANONICAL_IMPORT, STANDALONE_IMPORT)
+    if relative_path == LLMC_TRTLLM_SMOKE_TEST:
+        expected = expected.replace("import pytest\n", "import os\n\nimport pytest\n")
+        expected = expected.replace(BUILD_AND_RUN_AD_IMPORT, LLMC_TRTLLM_RUNNER_IMPORT)
+    return expected
 
 
 @pytest.fixture(scope="module")
@@ -68,6 +87,13 @@ def test_registers_inert_threadleak_marker(generated_multigpu_tests: Path) -> No
     assert '"threadleak(enabled): configure thread-leak checks' in pyproject.read_text()
 
 
+def test_conftest_allows_explicit_redirect_mode(generated_multigpu_tests: Path) -> None:
+    conftest = generated_multigpu_tests.parent / "conftest.py"
+    content = conftest.read_text()
+    assert "TRTLLM_REDIRECT_AD_TO_LLMC" in content
+    assert "set TRTLLM_REDIRECT_AD_TO_LLMC=true only for redirect smoke tests" in content
+
+
 @pytest.mark.parametrize("relative_path", sorted(EXPECTED_MULTIGPU_FILES, key=str), ids=str)
 def test_rewrites_multigpu_auto_deploy_imports(
     generated_multigpu_tests: Path, relative_path: Path
@@ -75,5 +101,9 @@ def test_rewrites_multigpu_auto_deploy_imports(
     source = (AD_MULTIGPU_TESTS / relative_path).read_text()
     exported = (generated_multigpu_tests / relative_path).read_text()
 
-    assert exported == source.replace(CANONICAL_IMPORT, STANDALONE_IMPORT)
+    assert exported == _expected_exported_test(source, relative_path)
     assert CANONICAL_IMPORT not in exported
+    if relative_path == LLMC_TRTLLM_SMOKE_TEST:
+        assert BUILD_AND_RUN_AD_IMPORT not in exported
+        assert "build_and_run_llmc_trtllm" in exported
+        assert "TRTLLM_REDIRECT_AD_TO_LLMC" in exported

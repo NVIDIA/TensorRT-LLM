@@ -207,6 +207,7 @@ EXCLUDE_TEST_FILES = {
 STANDALONE_MULTIGPU_TEST_FILES = (
     "custom_ops/test_dist.py",
     "custom_ops/test_sharded_rmsnorm.py",
+    "smoke/test_ad_build_small_multi.py",
     "transformations/library/test_apply_sharding_hints.py",
     "transformations/library/test_bmm_sharding.py",
     "transformations/library/test_ep_sharding.py",
@@ -222,6 +223,15 @@ STANDALONE_MULTIGPU_SUPPORT_FILES = ("transformations/library/conftest.py",)
 # Import path rewrite: old -> new (applied to test files only).
 _IMPORT_REWRITE = "tensorrt_llm._torch.auto_deploy"
 _IMPORT_TARGET = "llmc"
+_BUILD_AND_RUN_AD_IMPORT = "from build_and_run_ad import ExperimentConfig, main"
+_LLMC_TRTLLM_RUNNER_IMPORT = """
+if os.environ.get("TRTLLM_REDIRECT_AD_TO_LLMC") != "true":
+    pytest.skip(
+        "LLMC TRT-LLM redirect smoke requires TRTLLM_REDIRECT_AD_TO_LLMC=true",
+        allow_module_level=True,
+    )
+pytest.importorskip("tensorrt_llm")
+from runners.trtllm.build_and_run_llmc_trtllm import ExperimentConfig, main"""
 
 # Paths that the script owns and regenerates on every run.
 # Everything else in the output directory (e.g., .git/, .github/) is preserved
@@ -290,6 +300,9 @@ def _rewrite_imports_in_file(filepath: str) -> int:
 
     original = content
     content = content.replace(_IMPORT_REWRITE, _IMPORT_TARGET)
+    if _BUILD_AND_RUN_AD_IMPORT in content:
+        content = content.replace("import pytest\n", "import os\n\nimport pytest\n")
+        content = content.replace(_BUILD_AND_RUN_AD_IMPORT, _LLMC_TRTLLM_RUNNER_IMPORT)
 
     replacements = sum(1 for a, b in zip(original, content) if a != b)  # rough count
     if content != original:
@@ -438,10 +451,14 @@ def _create_test_conftest(tests_dir: str) -> None:
         import os
         import sys
 
+        _allow_trtllm_redirect = (
+            os.environ.get("TRTLLM_REDIRECT_AD_TO_LLMC") == "true"
+        )
         _trtllm_spec = importlib.util.find_spec("tensorrt_llm")
-        if _trtllm_spec is not None:
+        if _trtllm_spec is not None and not _allow_trtllm_redirect:
             raise RuntimeError(
                 "Standalone llmc tests must not be able to import tensorrt_llm; "
+                "set TRTLLM_REDIRECT_AD_TO_LLMC=true only for redirect smoke tests; "
                 f"found {getattr(_trtllm_spec, 'origin', None)!r}"
             )
 
