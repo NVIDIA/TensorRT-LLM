@@ -320,6 +320,40 @@ __device__ inline Vec<KVCachePageIndex, nbLoadedPages> getPage(KVCacheList<true>
     return ret;
 }
 
+#if PAGED_KV_LINEAR
+// Pages of one sequence are consecutive in the pool (entry j == entry 0 + j * PAGED_KV_IDX_STRIDE),
+// so load entry 0 once per sequence and compute later page indices arithmetically.
+__device__ inline KVCachePageIndex getLinearBasePage(
+    KVCacheList<true> const& cacheList, bool isK, uint32_t idxReq, uint32_t idxBeam)
+{
+    auto const maxNbPagesPerSeq = cacheList.maxNbPagesPerSeq;
+#if PAGED_KV_CACHE_LAYOUT == 1
+    unused(isK);
+    unused(idxBeam);
+    return cacheList.kvCachePageList[maxNbPagesPerSeq * idxReq];
+#else
+    return cacheList.kvCachePageList[beamWidth * 2 * maxNbPagesPerSeq * idxReq + 2 * maxNbPagesPerSeq * idxBeam
+        + maxNbPagesPerSeq * (isK ? 0U : 1U)];
+#endif
+}
+
+template <uint32_t nbLoadedPages>
+__device__ inline Vec<KVCachePageIndex, nbLoadedPages> getPageLinear(
+    KVCachePageIndex basePage, uint32_t idxPageBeg, uint32_t nbPages, uint32_t nbSkipLeadingPages)
+{
+    Vec<KVCachePageIndex, nbLoadedPages> ret;
+#pragma unroll
+    for (uint32_t i = 0; i < nbLoadedPages; i++)
+    {
+        uint32_t const idxPage = idxPageBeg + i;
+        ret[i] = ((idxPage >= nbSkipLeadingPages && idxPage < nbPages)
+                ? static_cast<KVCachePageIndex>(basePage + static_cast<int32_t>(idxPage) * PAGED_KV_IDX_STRIDE)
+                : kBAD_PAGE_INDEX);
+    }
+    return ret;
+}
+#endif
+
 template <uint32_t nbWarps, uint32_t nbLoadedPages>
 __device__ inline void loadPagesForBeamSearchAsync(uint32_t idxWarp,
     Vec<Vec<KVCachePageIndex, nbLoadedPages>, beamWidth>& dst, KVCacheList<true> const& cacheList, bool isK,

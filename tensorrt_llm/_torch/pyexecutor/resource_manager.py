@@ -283,6 +283,13 @@ class KVCacheManager(BaseResourceManager):
         pool_configurations: Optional[List[PoolConfiguration]] = None,
         **kwargs,
     ) -> None:
+        if os.getenv("TRTLLM_KV_ARENA_LINEAR_KERNELS") == "1":
+            # The attention op reads this env var directly; the classic paged manager does not
+            # allocate consecutive pages, so linear kernel addressing would read wrong blocks.
+            raise ValueError(
+                "TRTLLM_KV_ARENA_LINEAR_KERNELS=1 requires the KVCacheManagerV2 contiguous arena "
+                "(KvCacheConfig(use_contiguous_kv_arena=True)); it cannot be used with the "
+                "classic paged KV cache manager.")
         self.mapping = mapping
         self.dtype = dtype
         self.kv_cache_type = kv_cache_type

@@ -114,6 +114,23 @@ static_assert(SPEC_DEC, "SPEC_Q_SEQ_LEN should only be used when SPEC_DEC is ena
 // don't modify
 #define USE_BEAM_SEARCH (BEAM_WIDTH > 1)
 
+// When non-zero, KV cache pages of one sequence are assumed consecutive in the pool:
+// page-list entry j == entry 0 + j * PAGED_KV_IDX_STRIDE. Entry 0 is loaded once per
+// sequence and later entries are computed arithmetically, skipping the per-tile
+// page-table load. Requires a runtime that allocates each sequence's cache pages
+// consecutively (e.g. contiguous KV arenas).
+#ifndef PAGED_KV_LINEAR
+#define PAGED_KV_LINEAR 0
+#endif
+#if PAGED_KV_LINEAR
+#ifndef PAGED_KV_IDX_STRIDE
+#define PAGED_KV_IDX_STRIDE 1
+#endif
+#if !USE_PAGED_KV_CACHE || USE_BEAM_SEARCH
+#error "PAGED_KV_LINEAR requires paged KV cache and beam width 1"
+#endif
+#endif
+
 #if CACHE_ELEM_ENUM == 0
 #define PRAGMA_UNROLL_FP16_ONLY _Pragma("unroll")
 #else

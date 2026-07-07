@@ -72,6 +72,11 @@ extern "C"
         bool is_spec_dec_tree
             = true; // useful only when multi_query_tokens, should be true unless using linear tree in spec-dec.
         bool use_skip_softmax_attn;
+
+        // When > 0, each sequence's KV cache pages are consecutive in the pool with this stride
+        // between page-list entries; the kernel computes page indices arithmetically instead of
+        // loading them per tile. 0 disables. Only honored by the HMMA kernel with beam width 1.
+        unsigned int linear_kv_page_stride;
     } tllmXqaJitContext;
 
     // tllmXqaJitProgram is an opaque handle for a program.

@@ -474,6 +474,10 @@ public:
     // NOTE: default values for paged kv cache.
     bool mPagedKVCache = true;
     int mTokensPerBlock = 0;
+    // When > 0, each sequence's KV cache pages are consecutive in the pool with this stride between
+    // page-list entries (requires a per-sequence-contiguous cache allocator, e.g. contiguous KV
+    // arenas); generation kernels may then compute page indices arithmetically. 0 disables.
+    int32_t mLinearKvPageStride = 0;
     tensorrt_llm::common::QuantMode mKVCacheQuantMode;
     int mTpSize = 1;
     int mTpRank = 0;
@@ -564,7 +568,8 @@ public:
             (int8_t) mRotaryEmbeddingScaleType, mRotaryEmbeddingScale, mRotaryEmbeddingShortMscale,
             mRotaryEmbeddingLongMscale, mRotaryEmbeddingMaxPositions, mRotaryEmbeddingOriginalMaxPositions,
             (int8_t) mPositionEmbeddingType, mUseLognScaling, mRemovePadding, (int32_t) mMaskType,
-            mBlockSparseParams.data(), mPagedKVCache, mTokensPerBlock, mKVCacheQuantMode.value(), mTpSize, mTpRank,
+            mBlockSparseParams.data(), mPagedKVCache, mTokensPerBlock, mLinearKvPageStride,
+            mKVCacheQuantMode.value(), mTpSize, mTpRank,
             mUnfuseQkvGemm, (int32_t) mType, mMaxContextLength, mMaxSeqLen, mMaxNumRequests, mQKVBiasEnabled,
             mCrossAttention, mMaxDistance, mPosShiftEnabled, mPagedContextFMHA, mFP8ContextFMHA, mFP8AttenOutput,
             mFP8ContextMLA, mFP8GenerationMLA, mChunkPrefillBufferBatchSize, mDenseContextFMHA, mHasFullAttentionMask,

@@ -99,6 +99,11 @@ struct XQAParams
     bool paged_kv_cache;
     int tokens_per_block;
     int max_blocks_per_sequence;
+    // When > 0, each sequence's KV cache pages are consecutive in the pool: page-list entry j ==
+    // entry 0 + j * linear_kv_page_stride. Lets the kernel compute page indices arithmetically
+    // instead of loading them per tile. Requires a runtime with per-sequence-contiguous cache
+    // (e.g. KVCacheManagerV2 contiguous arenas) and beam width 1. 0 disables.
+    int32_t linear_kv_page_stride = 0;
     tensorrt_llm::common::QuantMode kv_cache_quant_mode;
     int tp_size = 1;
     int tp_rank = 0;

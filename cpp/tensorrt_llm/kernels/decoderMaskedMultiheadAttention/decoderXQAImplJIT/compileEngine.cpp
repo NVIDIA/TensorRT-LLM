@@ -19,6 +19,7 @@
 #include "nvrtcWrapper/include/nvrtcWrapper.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/common/utils.h"
@@ -108,13 +109,22 @@ CubinObj CompileEngine::compile() const
         applyRoPEInXqaKernel ? static_cast<uint32_t>(mXqaParams.rotary_embedding_dim)
                              : static_cast<uint32_t>(mXqaParams.head_size),
         /*is_spec_dec_tree=*/mXqaParams.is_spec_dec_tree,
-        /*use_skip_softmax_attn=*/mXqaParams.skip_softmax_threshold_scale_factor != 0};
+        /*use_skip_softmax_attn=*/mXqaParams.skip_softmax_threshold_scale_factor != 0,
+        /*linear_kv_page_stride=*/static_cast<unsigned int>(mXqaParams.linear_kv_page_stride > 0 ? mXqaParams.linear_kv_page_stride : 0)};
     if (context.kernel_type == TLLM_XQA_JIT_MLA)
     {
         auto const& c = context;
         TLLM_CHECK(c.head_size == 576 && c.num_q_heads == 128 && c.num_kv_heads == 1 && c.beam_width == 1
             && c.data_type == DATA_TYPE_E4M3 && c.kv_cache_data_type == DATA_TYPE_E4M3 && c.fp8_output == false
             && !c.use_input_kv && ropeStyle == TLLM_XQA_JIT_ROPE_NONE);
+    }
+
+    if (context.linear_kv_page_stride > 0 && context.kernel_type == TLLM_XQA_JIT_HMMA && context.beam_width == 1
+        && context.paged_kv_cache)
+    {
+        TLLM_LOG_INFO(
+            "XQA JIT: compiling HMMA kernel with linear KV page addressing (stride %u)",
+            context.linear_kv_page_stride);
     }
 
     CHECK_TLLM_XQA_JIT_ERROR(tllmXqaJitCreateAndCompileProgram(&program, &context));

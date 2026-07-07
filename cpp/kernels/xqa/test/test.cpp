@@ -558,7 +558,8 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
         std::fill_n(output[0][0][0].data, outElems, OutputElem(NAN));
 #endif
 #endif
-#if USE_PAGED_KV_CACHE
+#if USE_PAGED_KV_CACHE && !PAGED_KV_LINEAR
+// PAGED_KV_LINEAR assumes each sequence's pages are consecutive; keep the identity fill.
 #if PAGED_KV_CACHE_LAYOUT == 1
         std::shuffle(&pageList[0][0], &pageList[0][0] + totalNbPages, rng);
 #else
@@ -677,7 +678,7 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
         }
     }
 
-#if USE_PAGED_KV_CACHE && SLIDING_WINDOW && XQA_TEST_POISON_SLIDING_WINDOW_PREFIX_PAGES
+#if USE_PAGED_KV_CACHE && SLIDING_WINDOW && XQA_TEST_POISON_SLIDING_WINDOW_PREFIX_PAGES && !PAGED_KV_LINEAR
     {
         constexpr KVCachePageIndex kPoisonPageIdx = static_cast<KVCachePageIndex>(1U << 20);
 #if SPEC_DEC

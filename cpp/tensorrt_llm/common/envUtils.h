@@ -88,6 +88,11 @@ bool getEnvUseNixlKvCache();
 
 bool getEnvUseMooncakeKvCache();
 
+// Opt-in for linear (consecutive-pages) KV cache addressing in generation kernels. Only valid when
+// the runtime allocates each sequence's cache pages consecutively (KVCacheManagerV2 contiguous
+// arenas, KvCacheConfig.use_contiguous_kv_arena).
+bool getEnvKvArenaLinearKernels();
+
 std::string getEnvUCXInterface();
 
 std::string getEnvNixlInterface();

@@ -266,6 +266,11 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.max_attention_window_size = generationsParams.max_attention_window_size;
     xqaParams.cyclic_attention_window_size = generationsParams.cyclic_attention_window_size;
     xqaParams.max_blocks_per_sequence = generationsParams.max_blocks_per_sequence;
+    // Linear (consecutive-pages) KV addressing: only valid for paged self-attention with beam width 1.
+    xqaParams.linear_kv_page_stride
+        = (mLinearKvPageStride > 0 && generationsParams.beam_width == 1 && mPagedKVCache && !mCrossAttention)
+        ? mLinearKvPageStride
+        : 0;
     xqaParams.sink_token_length = generationsParams.sink_token_length;
     xqaParams.max_past_kv_length = generationsParams.max_past_kv_length;
     xqaParams.qkv_bias = generationsParams.qkv_bias;

@@ -18,6 +18,7 @@
 #include "tensorrt_llm/common/attentionOp.h"
 #include "tensorrt_llm/common/attentionWorkspace.h"
 #include "tensorrt_llm/common/dataType.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/flashMLA/flash_mla.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
@@ -1243,6 +1244,27 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
         // For chunked prefill MLA, we need larger buffer size for k and v
         op->mChunkPrefillBufferBatchSize
             = chunked_prefill_buffer_batch_size.has_value() ? chunked_prefill_buffer_batch_size.value() : 1;
+    }
+
+    // Linear (consecutive-pages) KV addressing (design §4.9 phase 1): opt-in via
+    // TRTLLM_KV_ARENA_LINEAR_KERNELS, only valid when the runtime allocates each sequence's cache
+    // pages consecutively (KVCacheManagerV2 contiguous arenas). The page-index stride between
+    // consecutive blocks of one sequence equals num_layers_in_this_pool * kv_factor
+    // (KVCacheManagerV2's page-index scale). Computed before the op cache key / runner->prepare()
+    // so the prepared cubin matches the runtime dispatch key.
+    if (tensorrt_llm::common::getEnvKvArenaLinearKernels() && op->useKVCache()
+        && host_kv_cache_pool_mapping.has_value() && beam_width == 1 && !op->mIsMLAEnabled)
+    {
+        auto const& pool_mapping = host_kv_cache_pool_mapping.value();
+        int32_t const pool_index = pool_mapping.index({op->mLayerIdx, 0}).item<int32_t>();
+        auto const* mapping_ptr = pool_mapping.data_ptr<int32_t>();
+        auto const row_stride = pool_mapping.stride(0);
+        int32_t num_layers_in_pool = 0;
+        for (int64_t l = 0; l < pool_mapping.size(0); ++l)
+        {
+            num_layers_in_pool += (mapping_ptr[l * row_stride] == pool_index) ? 1 : 0;
+        }
+        op->mLinearKvPageStride = num_layers_in_pool * 2; // kv_factor is 2 (non-MLA)
     }
 
     auto cache_key = std::make_tuple(op->data(), runner->data());

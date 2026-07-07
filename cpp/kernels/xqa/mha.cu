@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -1770,13 +1770,20 @@ CUBIN_EXPORT __global__
 #if USE_PAGED_KV_CACHE
 #if BEAM_WIDTH == 1
         KCachePageIndices pageIdx = KCachePageIndices::filled(kBAD_PAGE_INDEX);
+#if PAGED_KV_LINEAR
+        KVCachePageIndex const kSeqBasePage = getLinearBasePage(cacheList, true, idxReq, 0);
+#endif
 #endif
         auto loadPages = [&](uint32_t idxPage) mutable
         {
 #if BEAM_WIDTH == 1
+#if PAGED_KV_LINEAR
+            pageIdx = getPageLinear<KCachePageIndices::size>(kSeqBasePage, idxPage, nbPages, nbSkipLeadingPages);
+#else
             uint32_t const idxBeam = 0;
             pageIdx = getPage<KCachePageIndices::size>(
                 cacheList, true, idxReq, idxBeam, idxPage, nbPages, nbSkipLeadingPages);
+#endif
 #else
             auto& dst = smem.kCachePages[warpIdx.x];
             loadPagesForBeamSearchAsync<1>(0U, dst, cacheList, true, idxReq, idxPage, nbPages, nbSkipLeadingPages);
@@ -2098,13 +2105,20 @@ CUBIN_EXPORT __global__
 #if USE_PAGED_KV_CACHE
 #if BEAM_WIDTH == 1
         VCachePageIndices pageIdx = VCachePageIndices::filled(kBAD_PAGE_INDEX);
+#if PAGED_KV_LINEAR
+        KVCachePageIndex const vSeqBasePage = getLinearBasePage(cacheList, false, idxReq, 0);
+#endif
 #endif
         auto loadPages = [&](uint32_t idxPageBeg) mutable
         {
 #if BEAM_WIDTH == 1
+#if PAGED_KV_LINEAR
+            pageIdx = getPageLinear<VCachePageIndices::size>(vSeqBasePage, idxPageBeg, nbPages, nbSkipLeadingPages);
+#else
             uint32_t const idxBeam = 0;
             pageIdx = getPage<VCachePageIndices::size>(
                 cacheList, false, idxReq, idxBeam, idxPageBeg, nbPages, nbSkipLeadingPages);
+#endif
 #else
             auto& dst = smem.vCachePages[grpLoadV ? warpGrpIdx : warpIdx.x];
             loadPagesForBeamSearchAsync<grpLoadV ? gemm1WarpsPerGrp : 1U>(

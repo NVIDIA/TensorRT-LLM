@@ -79,6 +79,8 @@ struct XQAKernelRuntimeHashKey
     PositionEmbeddingType position_embedding_type;
     // Number of head elements RoPE is applied to. A value of 0 means rotary dim is not part of this key.
     int rotary_embedding_dim;
+    // Linear (consecutive-pages) KV addressing stride; 0 means disabled. Compiled into the kernel.
+    int linear_kv_page_stride;
 
     bool operator==(XQAKernelRuntimeHashKey const& other) const
     {
@@ -87,7 +89,8 @@ struct XQAKernelRuntimeHashKey
             && multi_query_tokens == other.multi_query_tokens && m_tilesize == other.m_tilesize
             && tokens_per_page == other.tokens_per_page && paged_kv_cache == other.paged_kv_cache
             && is_fp8_output == other.is_fp8_output && position_embedding_type == other.position_embedding_type
-            && rotary_embedding_dim == other.rotary_embedding_dim;
+            && rotary_embedding_dim == other.rotary_embedding_dim
+            && linear_kv_page_stride == other.linear_kv_page_stride;
     }
 };
 
@@ -127,7 +130,8 @@ inline XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQAParams const& x
     return {xqaParams.kv_cache_data_type, headSize, beamWidth, kernelNumQHeadsOverKV, kernelMTilesize,
         xqaParams.paged_kv_cache ? static_cast<unsigned int>(xqaParams.tokens_per_block) : 0, xqaParams.paged_kv_cache,
         xqaParams.multi_query_tokens, xqaParams.is_fp8_output, xqaParams.position_embedding_type,
-        includesRotaryDim ? xqaParams.rotary_embedding_dim : 0};
+        includesRotaryDim ? xqaParams.rotary_embedding_dim : 0,
+        xqaParams.linear_kv_page_stride > 0 ? xqaParams.linear_kv_page_stride : 0};
 }
 
 struct XQAKernelRuntimeHasher
@@ -155,6 +159,8 @@ struct XQAKernelRuntimeHasher
         key ^= static_cast<int8_t>(s.position_embedding_type);
         key <<= 9;                   // 62; rotary dims are <= 256, 0 means not used.
         key ^= static_cast<size_t>(s.rotary_embedding_dim);
+        key <<= 2;                   // 64; fold the linear stride into the low bits.
+        key ^= static_cast<size_t>(s.linear_kv_page_stride);
         return key;
     }
 };

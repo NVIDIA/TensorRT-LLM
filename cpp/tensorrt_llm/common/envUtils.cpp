@@ -292,6 +292,12 @@ bool getEnvUseMooncakeKvCache()
     return useMooncakeKvCache;
 }
 
+bool getEnvKvArenaLinearKernels()
+{
+    static bool const kvArenaLinearKernels = getBoolEnv("TRTLLM_KV_ARENA_LINEAR_KERNELS");
+    return kvArenaLinearKernels;
+}
+
 std::string getEnvUCXInterface()
 {
     static std::once_flag flag;

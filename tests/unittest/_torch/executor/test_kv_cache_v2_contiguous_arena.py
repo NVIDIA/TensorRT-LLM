@@ -100,6 +100,63 @@ class TestKvCacheConfigArenaField(unittest.TestCase):
         self.assertEqual(arena_cfg.write_through, WriteThroughPolicy.ON_FREE)
 
 
+class TestLinearKernelsEnvGuard(unittest.TestCase):
+    """TRTLLM_KV_ARENA_LINEAR_KERNELS is read directly by the C++ attention op; both KV
+    cache managers must fail loudly when it is set without the arena allocator (§4.9)."""
+
+    _ENV = {"TRTLLM_KV_ARENA_LINEAR_KERNELS": "1"}
+
+    def test_v1_manager_rejects(self) -> None:
+        from tensorrt_llm._torch.pyexecutor.resource_manager import (
+            KVCacheManager as KVCacheManagerV1,
+        )
+
+        with mock.patch.dict("os.environ", self._ENV):
+            with self.assertRaisesRegex(ValueError, "use_contiguous_kv_arena"):
+                KVCacheManagerV1(
+                    KvCacheConfig(max_tokens=MAX_TOKENS),
+                    CacheType.SELF,
+                    num_layers=NUM_LAYERS,
+                    num_kv_heads=NUM_KV_HEADS,
+                    head_dim=HEAD_DIM,
+                    tokens_per_block=TOKENS_PER_BLOCK,
+                    max_seq_len=MAX_SEQ_LEN,
+                    max_batch_size=4,
+                    mapping=Mapping(world_size=1, tp_size=1, rank=0),
+                    dtype=DataType.HALF,
+                )
+
+    @requires_cuda
+    def test_v2_without_arena_rejects(self) -> None:
+        kv_cache_config = KvCacheConfig(
+            max_tokens=MAX_TOKENS,
+            enable_block_reuse=True,
+            host_cache_size=64 * MiB,
+            use_kv_cache_manager_v2=True,
+        )
+        with mock.patch.dict("os.environ", self._ENV):
+            with self.assertRaisesRegex(ValueError, "use_contiguous_kv_arena"):
+                KVCacheManagerV2(
+                    kv_cache_config,
+                    CacheType.SELF,
+                    num_layers=NUM_LAYERS,
+                    num_kv_heads=NUM_KV_HEADS,
+                    head_dim=HEAD_DIM,
+                    tokens_per_block=TOKENS_PER_BLOCK,
+                    max_seq_len=MAX_SEQ_LEN,
+                    max_batch_size=4,
+                    mapping=Mapping(world_size=1, tp_size=1, rank=0),
+                    dtype=DataType.HALF,
+                    vocab_size=32000,
+                )
+
+    @requires_cuda
+    def test_arena_accepts(self) -> None:
+        with mock.patch.dict("os.environ", self._ENV):
+            mgr = _create_arena_manager()
+        mgr.shutdown()
+
+
 @requires_cuda
 class TestArenaAdapter(unittest.TestCase):
     def setUp(self) -> None:

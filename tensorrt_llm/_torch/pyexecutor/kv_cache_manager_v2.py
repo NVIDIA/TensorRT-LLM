@@ -717,6 +717,15 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.kv_cache_manager_py_config = config
         self._arena_enabled = config.contiguous_arena is not None
+        if os.getenv("TRTLLM_KV_ARENA_LINEAR_KERNELS") == "1" and not self._arena_enabled:
+            # The attention op reads this env var directly and would compute page indices
+            # arithmetically against a cache whose pages are NOT consecutive.
+            raise ValueError(
+                "TRTLLM_KV_ARENA_LINEAR_KERNELS=1 requires "
+                "KvCacheConfig(use_contiguous_kv_arena=True): linear kernel addressing assumes "
+                "each sequence's cache pages are consecutive, which only the contiguous arena "
+                "allocator guarantees."
+            )
 
         try:
             self.impl = KVCacheManagerPy(config, event_manager=self.event_manager)
@@ -1090,6 +1099,12 @@ class KVCacheManagerV2(BaseResourceManager):
           owns the flush points. Measured perf-neutral versus synchronous
           mapping (same driver-call count), so it defaults to ``0`` until the
           flush can run on a helper thread.
+        - ``TRTLLM_KV_ARENA_LINEAR_KERNELS``: ``1`` lets generation attention
+          kernels compute KV page indices arithmetically instead of loading
+          them from the block-offset table (§4.9 phase 1; read directly by the
+          C++ attention op; XQA HMMA family, beam width 1). Only valid with
+          the arena allocator; both KV cache managers fail loudly if it is set
+          without ``use_contiguous_kv_arena``. Default ``0``.
         """
         page_mb = int(os.environ.get("TRTLLM_KV_ARENA_PHYS_PAGE_SIZE_MB", "2"))
         map_ahead = int(os.environ.get("TRTLLM_KV_ARENA_MAP_AHEAD_PAGES", "1"))

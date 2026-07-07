@@ -193,6 +193,13 @@ tllmXqaJitStatus getMacroFlags(tllmXqaJitContext const* context, std::vector<std
         = std::to_string(context->rotary_embedding_dim != 0 ? context->rotary_embedding_dim : head_size);
     macros["IS_SPEC_DEC_TREE"] = context->is_spec_dec_tree ? "1" : "0";
     macros["SKIP_SOFTMAX_ATTN"] = context->use_skip_softmax_attn ? "1" : "0";
+    // Linear (consecutive-pages) KV addressing: only the HMMA kernel implements it.
+    if (context->linear_kv_page_stride > 0 && context->kernel_type == TLLM_XQA_JIT_HMMA && context->beam_width == 1
+        && context->paged_kv_cache)
+    {
+        macros["PAGED_KV_LINEAR"] = "1";
+        macros["PAGED_KV_IDX_STRIDE"] = std::to_string(context->linear_kv_page_stride);
+    }
 #ifdef SKIP_SOFTMAX_STAT
     macros["SKIP_SOFTMAX_ATTN_BLOCK_STATS"] = context->use_skip_softmax_attn ? "1" : "0";
 #endif
