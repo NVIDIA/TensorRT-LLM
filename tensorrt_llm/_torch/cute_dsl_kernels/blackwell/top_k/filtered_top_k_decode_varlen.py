@@ -245,7 +245,6 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         input: cute.Tensor,
         indices: cute.Tensor,
         extra_buffer: cute.Tensor,
-        g_global_counter: cute.Tensor,
         seqlen: cute.Tensor,
         output_indices: cute.Tensor,
         output_values: cute.Tensor,
@@ -414,7 +413,6 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         input_values,
         indices,
         extra_buffer,
-        g_global_counter,
         seqlen,
         output_indices,
         output_values,
@@ -429,7 +427,6 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             input_values,
             indices,
             extra_buffer,
-            g_global_counter,
             seqlen,
             output_indices,
             output_values,
@@ -555,7 +552,6 @@ def cute_dsl_topk_wrapper(
             input_fake,
             None,  # indices_fake,
             buffer_fake,
-            None,  # g_global_counter_fake,
             seqlen_fake,
             output_indices_fake,
             output_values_fake,
@@ -581,14 +577,12 @@ def cute_dsl_topk_wrapper(
         )
     else:
         buffer_torch = None
-    g_global_counter_torch = None
 
     # TVM FFI uses env stream automatically
     compiled_kernel(
         input_values,
         None,  # indices, used for merge blocks kernel of the multi-cta.
         buffer_torch,
-        g_global_counter_torch,
         seq_lens,
         output_indices_torch,
         output_values_torch,
@@ -684,7 +678,6 @@ def cute_dsl_topk_multi_cta_wrapper(
             input_fake,
             None,  # indices_fake,
             buffer_fake,
-            None,  # g_global_counter_fake,
             seqlen_fake,
             # output_indices_fake,
             # output_values_fake,
@@ -730,7 +723,6 @@ def cute_dsl_topk_multi_cta_wrapper(
             input_fake,
             indices_fake,
             buffer_fake,
-            None,  # g_global_counter_fake,
             seqlen_fake,
             output_indices_fake,
             output_values_fake,
@@ -766,14 +758,11 @@ def cute_dsl_topk_multi_cta_wrapper(
         dtype=torch.int32,
         device="cuda",
     )
-    g_global_counter_torch = None
-
     # TVM FFI uses env stream automatically
     compiled_kernel_first(
         input_values,
         None,  # indices, used for merge blocks kernel of the multi-cta.
         buffer_torch,
-        g_global_counter_torch,
         seq_lens,
         first_kernel_output_indices_torch,
         first_kernel_output_values_torch,
@@ -783,7 +772,6 @@ def cute_dsl_topk_multi_cta_wrapper(
         first_kernel_output_values_torch,
         first_kernel_output_indices_torch,
         buffer_torch,
-        g_global_counter_torch,
         seq_lens,
         output_indices_torch,
         output_values_torch,
@@ -879,9 +867,6 @@ def run_filtered_topk_decode(
         stride_order=(2, 1, 0),
         assumed_align=32,
     )
-    g_global_counter_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (1,), stride_order=(0,)
-    )
     seqlen_fake = cute.runtime.make_fake_compact_tensor(
         cute.Int32,
         (n_batch,),
@@ -918,7 +903,6 @@ def run_filtered_topk_decode(
         input_fake,
         None,  # indices, used for merge blocks kernel of the multi-cta.
         buffer_fake,
-        g_global_counter_fake,
         seqlen_fake,
         output_indices_fake,
         output_values_fake,
@@ -930,7 +914,6 @@ def run_filtered_topk_decode(
 
     # Set input data
     # num_gen_tokens is the number of rows in the input tensor
-    g_global_counter_torch = torch.zeros(1, dtype=torch.int32, device="cuda")
     torch.cuda.synchronize()
     num_gen_tokens = batch_size * next_n  # Use the same variable name as dsa.py
     row_starts = torch.zeros(num_gen_tokens, dtype=torch.int32, device="cuda")
@@ -967,7 +950,6 @@ def run_filtered_topk_decode(
         input_torch,
         None,  # indices, used for merge blocks kernel of the multi-cta.
         buffer_torch,
-        g_global_counter_torch,
         seq_lens,
         output_indices_torch,
         output_values_torch,
@@ -1048,7 +1030,6 @@ def run_filtered_topk_decode(
     if do_benchmark:
 
         def generate_inputs():
-            g_global_counter_torch = torch.zeros(1, dtype=torch.int32, device="cuda")
             torch.cuda.synchronize()
             input_tensor = create_random_logits(
                 row_starts,
@@ -1070,7 +1051,6 @@ def run_filtered_topk_decode(
                 input_tensor,
                 None,  # indices, used for merge blocks kernel of the multi-cta.
                 buffer_torch,
-                g_global_counter_torch,
                 seq_lens,
                 output_indices_tensor,
                 output_values_tensor,

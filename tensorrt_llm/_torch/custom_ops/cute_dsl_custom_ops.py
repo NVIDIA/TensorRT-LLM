@@ -4875,13 +4875,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 num_sms=_get_num_sms(),
                 overflow_policy=overflow_policy,
             )
-            g_global_counter_fake = None
             compiled_kernel = cute.compile(
                 filtered_topk_func,
                 input_fake,
                 None,  # indices_fake
                 buffer_fake,
-                g_global_counter_fake,
                 seqlen_fake,
                 output_indices_fake,
                 output_values_fake,
@@ -4958,14 +4956,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 buffer_torch = buffer_torch[:, :, :num_cols]
             else:
                 buffer_torch = None
-            g_global_counter_torch = None
 
             # Execute kernel (TVM FFI uses env stream automatically)
             compiled_kernel(
                 input_values,
                 None,  # indices
                 buffer_torch,
-                g_global_counter_torch,
                 seq_lens,
                 output_indices_torch,
                 output_values_torch,
@@ -5377,7 +5373,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 input_fake,
                 None,  # indices_fake
                 buffer_fake,
-                None,  # g_global_counter_fake
                 seqlen_fake,
                 first_kernel_output_indices_fake,
                 first_kernel_output_values_fake,
@@ -5424,7 +5419,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 input_fake,
                 indices_fake,
                 buffer_fake,
-                None,  # g_global_counter_fake
                 seqlen_fake,
                 output_indices_fake,
                 output_values_fake,
@@ -5523,7 +5517,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 input_values,
                 None,  # indices
                 buffer_torch,
-                None,  # g_global_counter_torch
                 seq_lens,
                 first_output_indices,
                 first_output_values,
@@ -5534,7 +5527,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 first_output_values,
                 first_output_indices,
                 buffer_torch,
-                None,  # g_global_counter_torch
                 seq_lens,
                 output_indices_torch,
                 output_values_torch,
