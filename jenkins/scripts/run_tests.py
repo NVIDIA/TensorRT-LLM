@@ -339,7 +339,14 @@ def build_isolated_command(base_cmd, test_list, xml_path, csv_path):
 # Rerun logic: replaces Groovy rerunFailedTests()
 # ---------------------------------------------------------------------------
 def check_and_rerun(
-    result_xml, base_cmd, working_dir, output_dir, rerun_tag, fail_signatures, max_rerun_tests
+    result_xml,
+    base_cmd,
+    working_dir,
+    output_dir,
+    rerun_tag,
+    fail_signatures,
+    max_rerun_tests,
+    test_list_file,
 ):
     """Analyze test failures and rerun eligible tests.
 
@@ -351,6 +358,8 @@ def check_and_rerun(
         rerun_tag: Tag for this rerun (e.g., "regular", "isolated_0").
         fail_signatures: List of failure signature strings.
         max_rerun_tests: Max number of failed tests that can trigger rerun.
+        test_list_file: Path to the test list file that drove this pytest run
+            (used to detect tests that never ran).
 
     Returns:
         Tuple of (is_rerun_failed: bool, rerun_xml_files: list of paths to rerun result XMLs).
@@ -364,7 +373,14 @@ def check_and_rerun(
 
     # Step 1: Generate rerun test lists
     print(f"Generating rerun test lists for {rerun_tag}...")
-    test_rerun.generate_rerun_tests_list(rerun_dir, result_xml, fail_signatures)
+    unfinished_test_file = os.path.join(output_dir, "unfinished_test.txt")
+    test_rerun.generate_rerun_tests_list(
+        rerun_dir,
+        result_xml,
+        fail_signatures,
+        test_list_file,
+        unfinished_test_file,
+    )
 
     # Step 2: If rerun_0.txt exists, some tests can't be rerun
     rerun_0_file = os.path.join(rerun_dir, "rerun_0.txt")
@@ -471,6 +487,7 @@ def run_regular_tests(
                 "regular",
                 fail_signatures,
                 max_rerun_tests,
+                regular_list,
             )
             all_xml_files.extend(rerun_xmls)
             return is_rerun_failed, all_xml_files
@@ -542,6 +559,7 @@ def run_isolated_tests(
                     f"isolated_{i}",
                     fail_signatures,
                     max_rerun_tests,
+                    single_test_file,
                 )
                 all_xml_files.extend(rerun_xmls)
                 if is_rerun_failed:
