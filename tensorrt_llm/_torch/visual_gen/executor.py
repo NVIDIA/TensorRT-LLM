@@ -435,7 +435,10 @@ class DiffusionExecutor:
             output = self.pipeline.infer(req)
             generation = time.perf_counter() - generation_start  # seconds
             if self.rank == 0:
-                output.to_handle()
+                # External launch co-locates this worker with the coordinator in one
+                # process; to_handle(local=True) hands the tensor over in-process
+                # instead of cross-process CUDA IPC (invalid same-process).
+                output.to_handle(local=_detect_external_launch() is not None)
                 self.response_queue.put(
                     DiffusionResponse(
                         request_id=req.request_id,
