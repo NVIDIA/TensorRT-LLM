@@ -14,11 +14,130 @@
 # limitations under the License.
 """Utilities for Prometheus Metrics Collection."""
 
+import logging
 import math
+import threading
 import time
-from typing import Dict, List, Optional, Union
+from collections import deque
+from typing import Dict, List, NamedTuple, Optional, Union
 
 from .enums import MetricNames
+
+_LOGGER = logging.getLogger(__name__)
+
+# Phase-1 WideEP uses the two-word uint64 active-rank-mask ABI. Reject a
+# malformed payload before it can create unbounded Prometheus cardinality on
+# the serving event loop.
+_MAX_EP_HEALTH_RANKS = 128
+# Prometheus gauges are IEEE-754 doubles. Keep the monotonic generation exact
+# so stale/conflict comparisons have the same meaning before and after export.
+_MAX_EP_HEALTH_GENERATION = (1 << 53) - 1
+_MAX_EP_HEALTH_SOURCE_EPOCH_LENGTH = 128
+_MAX_RETIRED_EP_HEALTH_SOURCE_EPOCHS = 32
+
+
+class _EPHealthSnapshot(NamedTuple):
+    """One immutable snapshot exported by the local Prometheus collector."""
+
+    world_size: int
+    active_count: int
+    failed_ranks: frozenset[int]
+    generation: int
+
+
+class _EPHealthPrometheusCollector:
+    """Export a coherent EP snapshot without multiprocess gauge merging.
+
+    ``prometheus_client`` combines each multiprocess gauge independently.  A
+    rank vector, its aggregate counts, and its validity bit therefore cannot
+    form an atomic snapshot when more than one process writes the same label
+    set.  EP health is polled by the OpenAI server itself, so keep its latest
+    immutable value in that process and register this collector directly on
+    the server's scrape registry instead.
+    """
+
+    def __init__(self, labels: Dict[str, str], metric_prefix: str) -> None:
+        self._label_names = list(labels)
+        self._label_values = [labels[name] for name in self._label_names]
+        self._metric_prefix = metric_prefix
+        self._lock = threading.Lock()
+        self._snapshot: Optional[_EPHealthSnapshot] = None
+        self._available = False
+
+    def publish(self, snapshot: _EPHealthSnapshot) -> None:
+        """Atomically replace the snapshot and mark it available."""
+        with self._lock:
+            self._snapshot = snapshot
+            self._available = True
+
+    def mark_unavailable(self) -> None:
+        """Atomically invalidate the retained snapshot."""
+        with self._lock:
+            self._available = False
+
+    def collect(self) -> list:
+        """Build all metric families from one locked state read."""
+        with self._lock:
+            snapshot = self._snapshot
+            available = self._available
+
+        # Do not advertise EP health for non-EP or non-FT deployments. Once a
+        # producer has published a valid snapshot, retain its samples during an
+        # outage and use the availability family as their validity bit.
+        if snapshot is None:
+            return []
+
+        from prometheus_client.core import GaugeMetricFamily
+
+        metrics = []
+        rank_active = GaugeMetricFamily(
+            self._metric_prefix + "ep_rank_active",
+            "Whether an Expert Parallel rank is included in coordinator-committed "
+            "data-plane membership (1) or excluded (0); not physical liveness.",
+            labels=[*self._label_names, MetricsCollector.labelname_ep_rank],
+        )
+        for rank in range(snapshot.world_size):
+            rank_active.add_metric(
+                [*self._label_values, str(rank)],
+                int(rank not in snapshot.failed_ranks),
+            )
+        metrics.append(rank_active)
+
+        for name, documentation, value in (
+            (
+                "ep_active_ranks",
+                "Number of ranks in coordinator-committed EP data-plane membership.",
+                snapshot.active_count,
+            ),
+            (
+                "ep_failed_ranks",
+                "Number of ranks excluded from coordinator-committed EP data-plane "
+                "membership; not a physical-failure detector.",
+                snapshot.world_size - snapshot.active_count,
+            ),
+            (
+                "ep_health_generation",
+                "Committed EP membership version; increments on each effective transition.",
+                snapshot.generation,
+            ),
+        ):
+            metric = GaugeMetricFamily(
+                self._metric_prefix + name,
+                documentation,
+                labels=self._label_names,
+            )
+            metric.add_metric(self._label_values, value)
+            metrics.append(metric)
+
+        availability = GaugeMetricFamily(
+            self._metric_prefix + "ep_health_available",
+            "Whether rank-0 committed EP membership telemetry is available. "
+            "When 0, ignore all other trtllm_ep_* health samples.",
+            labels=self._label_names,
+        )
+        availability.add_metric(self._label_values, int(available))
+        metrics.append(availability)
+        return metrics
 
 
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0rc1/vllm/engine/metrics.py#L30
@@ -51,6 +170,13 @@ class MetricsCollector:
             trtllm_prefill_perplexity
             trtllm_generation_perplexity
             trtllm_request_error_total
+
+        Expert Parallel health metrics:
+            trtllm_ep_rank_active
+            trtllm_ep_active_ranks
+            trtllm_ep_failed_ranks
+            trtllm_ep_health_generation
+            trtllm_ep_health_available
 
         Iteration-level metrics:
             trtllm_kv_cache_hit_rate
@@ -102,6 +228,7 @@ class MetricsCollector:
             trtllm_kv_cache_config_info
     """
     labelname_finish_reason = "finished_reason"
+    labelname_ep_rank = "ep_rank"
 
     def __init__(
         self,
@@ -314,6 +441,17 @@ class MetricsCollector:
             name=self.metric_prefix + "max_num_active_requests",
             documentation="Maximum number of active requests",
             labelnames=self.labels.keys())
+
+        # Committed Expert Parallel membership is passively observed from the
+        # rank-0 worker through a dedicated internal RPC. Unlike independent
+        # multiprocess gauges, this local collector preserves the rank vector,
+        # aggregate counts, generation, and availability as one snapshot.
+        self._last_ep_health_state = None
+        self._last_ep_health_rejection = None
+        self._retired_ep_health_source_epochs = set()
+        self._retired_ep_health_source_epoch_order = deque()
+        self._ep_health_prometheus_collector = _EPHealthPrometheusCollector(
+            self.labels, self.metric_prefix)
 
         # Iteration latency
         self.iteration_latency_seconds = Gauge(
@@ -867,6 +1005,113 @@ class MetricsCollector:
             if total_intra_device_copy_bytes > 0:
                 self._log_counter(self.kv_cache_intra_device_copy_bytes_total,
                                   {}, total_intra_device_copy_bytes)
+
+    def _reject_ep_health_stats(self, message: str, *args: object) -> bool:
+        """Mark telemetry unavailable and warn once per repeated rejection."""
+        signature = (message, tuple(str(arg) for arg in args))
+        if signature != self._last_ep_health_rejection:
+            _LOGGER.warning(message, *args)
+            self._last_ep_health_rejection = signature
+        self.log_ep_health_unavailable()
+        return False
+
+    def log_ep_health_stats(self, ep_health_stats: dict) -> bool:
+        """Materialize committed ``EPGroupHealth`` membership as gauges.
+
+        Returns ``False`` when the payload is invalid, stale, or conflicts with
+        the last accepted snapshot. Callers may retry because a later generation
+        or a never-before-seen producer epoch can restore a coherent stream.
+        ``sourceEpoch`` is required so a producer restart cannot be confused
+        with delayed state from a retired producer. This passive consumer does
+        not interpret the snapshot as physical liveness or mutate recovery
+        state.
+        """
+        try:
+            world_size = ep_health_stats["worldSize"]
+            active_count = ep_health_stats["activeCount"]
+            generation = ep_health_stats["generation"]
+            failed_rank_list = ep_health_stats["failedRanks"]
+            source_epoch = ep_health_stats["sourceEpoch"]
+            scalar_values = (world_size, active_count, generation)
+            if any(type(value) is not int for value in scalar_values):
+                raise TypeError(
+                    "worldSize, activeCount, and generation must be integers")
+            if (world_size <= 0 or world_size > _MAX_EP_HEALTH_RANKS
+                    or not 0 <= active_count <= world_size or generation < 0
+                    or generation > _MAX_EP_HEALTH_GENERATION):
+                raise ValueError("EP health scalar values are out of range")
+            if not isinstance(failed_rank_list, list):
+                raise TypeError("failedRanks must be a list")
+            if (not isinstance(source_epoch, str) or not source_epoch
+                    or len(source_epoch) > _MAX_EP_HEALTH_SOURCE_EPOCH_LENGTH):
+                raise TypeError(
+                    "sourceEpoch must be a bounded non-empty string")
+            if len(failed_rank_list) > world_size:
+                raise ValueError("failedRanks contains too many ranks")
+            if any(
+                    type(rank) is not int or not 0 <= rank < world_size
+                    for rank in failed_rank_list):
+                raise ValueError("failedRanks contains an invalid rank")
+            failed_ranks = set(failed_rank_list)
+            if (len(failed_ranks) != len(failed_rank_list)
+                    or active_count != world_size - len(failed_ranks)):
+                raise ValueError("EP health counts are inconsistent")
+        except (KeyError, TypeError, ValueError) as error:
+            return self._reject_ep_health_stats(
+                "Ignoring invalid epHealthStats payload: %s", error)
+
+        state = (source_epoch, world_size, generation,
+                 tuple(sorted(failed_ranks)))
+        last_source_epoch = None
+        if self._last_ep_health_state is not None:
+            last_source_epoch, last_world_size, last_generation, last_failed_ranks = (
+                self._last_ep_health_state)
+            if world_size != last_world_size:
+                return self._reject_ep_health_stats(
+                    "Ignoring epHealthStats world-size change from %s to %s",
+                    last_world_size, world_size)
+            if source_epoch == last_source_epoch and generation < last_generation:
+                return self._reject_ep_health_stats(
+                    "Ignoring stale epHealthStats generation %s after %s",
+                    generation, last_generation)
+            if (source_epoch == last_source_epoch
+                    and generation == last_generation
+                    and state[3] != last_failed_ranks):
+                return self._reject_ep_health_stats(
+                    "Conflicting epHealthStats payloads at generation %s",
+                    generation)
+            if source_epoch != last_source_epoch:
+                if source_epoch in self._retired_ep_health_source_epochs:
+                    return self._reject_ep_health_stats(
+                        "Ignoring epHealthStats from retired source epoch %s",
+                        source_epoch)
+
+        if last_source_epoch is not None and source_epoch != last_source_epoch:
+            if (len(self._retired_ep_health_source_epoch_order) ==
+                    _MAX_RETIRED_EP_HEALTH_SOURCE_EPOCHS):
+                expired_epoch = self._retired_ep_health_source_epoch_order.popleft(
+                )
+                self._retired_ep_health_source_epochs.remove(expired_epoch)
+            self._retired_ep_health_source_epoch_order.append(last_source_epoch)
+            self._retired_ep_health_source_epochs.add(last_source_epoch)
+        self._last_ep_health_state = state
+        self._last_ep_health_rejection = None
+        self._ep_health_prometheus_collector.publish(
+            _EPHealthSnapshot(
+                world_size=world_size,
+                active_count=active_count,
+                failed_ranks=frozenset(failed_ranks),
+                generation=generation,
+            ))
+        return True
+
+    def log_ep_health_unavailable(self) -> None:
+        """Mark the last EP health telemetry read as unavailable."""
+        self._ep_health_prometheus_collector.mark_unavailable()
+
+    def register_ep_health_metrics(self, registry: object) -> None:
+        """Register coherent EP health metrics on a scrape registry."""
+        registry.register(self._ep_health_prometheus_collector)
 
     def log_request_error(self, http_code: Union[int, str] = "") -> None:
         """Increment the error counter, labeled by HTTP status code."""
