@@ -40,9 +40,6 @@ void initBindings(nb::module_& m)
         });
 
     m.def("shutdown_pg", []() { pg_utils::shutdown_pg(); });
-
-    // Release references to pg_world/pg_local so they are properly destroyed.
-    nb::module_::import_("atexit").attr("register")(m.attr("shutdown_pg"));
 }
 
 } // namespace tensorrt_llm::nanobind::process_group
