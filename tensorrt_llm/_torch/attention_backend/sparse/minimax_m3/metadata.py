@@ -22,11 +22,12 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Literal, Optional, Tuple
 
 import torch
+
+from tensorrt_llm.logger import logger
 
 from ..params import SparseParams
 
@@ -1025,8 +1026,6 @@ def get_minimax_m3_attention_metadata_cls():
             # memory and either produces wrong tokens or fires
             # ``Indexing.cu:1515`` ``srcIndex < srcSelectDimSize``.
             self.minimax_m3 = None
-            if os.environ.get("TLLM_M3_SYNC") == "pre":
-                torch.cuda.synchronize()
 
             # Production path: build the M3 metadata from the standard
             # AttentionMetadata fields. Requires kv_cache_manager + the
@@ -1145,18 +1144,12 @@ def get_minimax_m3_attention_metadata_cls():
             # to an in-forward plan call, which is safe outside capture and
             # bootstraps the geometry.
             use_msa = bool(getattr(kv_cache_manager, "use_msa", False))
-            if os.environ.get("TLLM_M3_DEBUG_PREPARE") == "1":
-                import sys as _sys
-
-                print(
-                    f"[m3-prepare-debug] is_cuda_graph={getattr(self, 'is_cuda_graph', None)} "
-                    f"use_msa={use_msa} inst_geom={self._msa_geometry is not None} "
-                    f"batch={batch_size} is_extend={is_extend} "
-                    f"kv_lens={kv_lens_cpu_list[:4]} num_cached={list(num_cached_per_seq)[:4]} "
-                    f"m3_meta_id={id(m3_meta)} self_id={id(self)}",
-                    file=_sys.stderr,
-                    flush=True,
-                )
+            logger.debug(
+                f"[m3-prepare] is_cuda_graph={getattr(self, 'is_cuda_graph', None)} "
+                f"use_msa={use_msa} inst_geom={self._msa_geometry is not None} "
+                f"batch={batch_size} is_extend={is_extend} "
+                f"kv_lens={kv_lens_cpu_list[:4]} num_cached={list(num_cached_per_seq)[:4]}"
+            )
             geometry = self._msa_geometry
             if geometry is None:
                 # Fall back to the process-wide geometry registered at layer

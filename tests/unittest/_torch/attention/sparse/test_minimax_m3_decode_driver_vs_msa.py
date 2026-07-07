@@ -385,7 +385,6 @@ def test_cuda_graph_replay_tracks_device_state():
     _require_env()
     batch = 8
     driver = _driver(max_batch=batch)
-    driver.warmup_shapes(batch)
 
     # Persistent input buffers the graph will read.
     pool_pages = batch * (MAX_KV_LEN // PAGE_SIZE)

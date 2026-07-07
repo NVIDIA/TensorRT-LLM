@@ -179,17 +179,6 @@ class M3DecodeKernelDriver:
             self._worklist_cache[key] = cached
         return cached
 
-    def warmup_shapes(self, batch: int) -> None:
-        """Pre-build all per-batch-size constants for `batch`.
-
-        Call once per CUDA graph bucket before capture so no host-side
-        cache misses happen inside the captured region.
-        """
-        self._qo_consts(batch, self.pf_proxy)
-        self._qo_consts(batch, self.pf_sparse)
-        self._worklist(batch, self.heads_packed_proxy)
-        self._worklist(batch, self.heads_packed_sparse)
-
     # ------------------------------------------------------------------
     # Shared per-call device-side metadata refresh
     # ------------------------------------------------------------------

@@ -651,6 +651,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
                      "instead of the in-tree Triton and SDPA reference path. "
                      "Requires SM100 and the external `fmha_sm100` package "
                      "(https://github.com/MiniMax-AI/MSA) to be importable."),
+        status="prototype",
     )
 
     def supports_backend(self, backend: str) -> bool:
