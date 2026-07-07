@@ -689,6 +689,9 @@ def setup_disagg_cluster(
             device_ids = ",".join(
                 str(d) for d in dict.fromkeys((next_device + j) % num_gpus
                                               for j in range(gpus_per_ctx)))
+            print(
+                f"Launching ctx worker {i + 1}/{num_ctx_instances} on device {device_ids}"
+            )
             ctx_workers.append(
                 run_ctx_worker(model,
                                ctx_worker_config,
@@ -703,6 +706,9 @@ def setup_disagg_cluster(
             device_ids = ",".join(
                 str(d) for d in dict.fromkeys((next_device + j) % num_gpus
                                               for j in range(gpus_per_gen)))
+            print(
+                f"Launching gen worker {i + 1}/{num_gen_instances} on device {device_ids}"
+            )
             gen_workers.append(
                 run_gen_worker(model,
                                gen_worker_config,
