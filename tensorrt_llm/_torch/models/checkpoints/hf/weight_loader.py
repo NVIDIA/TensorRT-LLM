@@ -83,8 +83,8 @@ class HfWeightLoader(BaseWeightLoader):
                 (os.path.abspath(file_name), stat.st_size, stat.st_mtime_ns))
         return (tuple(file_fingerprint), use_consolidated)
 
-    @classmethod
-    def _clear_weight_cache(cls) -> None:
+    @staticmethod
+    def _clear_weight_cache() -> None:
         with _WEIGHT_CACHE_LOCK:
             _WEIGHT_CACHE.clear()
 
@@ -106,7 +106,8 @@ class HfWeightLoader(BaseWeightLoader):
         if max_entries <= 0:
             return
 
-        HfWeightLoader._evict_to_make_room()
+        # Room was already made by the caller-side evict-before-load in
+        # _with_weight_cache (the load-bearing one for the memory peak).
         with _WEIGHT_CACHE_LOCK:
             _WEIGHT_CACHE[cache_key] = dict(loaded_weights)
 
