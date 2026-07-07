@@ -501,7 +501,7 @@ void runPartialCopyTest()
         }
     }
     EXPECT_EQ(numBad, 0);
-    blockManager.onboardBlock(seq2, partialCopyBlock, maxAttentionWindow, transferMode, directory);
+    blockManager.onboardBlock(seq2, partialCopyBlock, maxAttentionWindow, KvCacheTransferMode::DRAM);
     EXPECT_TRUE(partialCopyBlock->isPrimary());
     EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
