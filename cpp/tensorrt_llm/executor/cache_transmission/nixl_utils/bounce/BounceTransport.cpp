@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceTransport.h"
 
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceNvtx.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/GatherScatterKernel.h"
 
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -172,6 +173,13 @@ void BounceReceiver::joinWorkers()
             t.join();
         }
     }
+    // Workers are gone; any never-dequeued job still holds an open queue-wait span — close them so
+    // shutdown doesn't leave dangling NVTX ranges (their regions die with the arena right after).
+    std::lock_guard<std::mutex> lk(mJobMu);
+    for (auto& j : mJobs)
+    {
+        bounceRangeEnd(j.nvtxQueue);
+    }
 }
 
 void BounceReceiver::onWant(std::string const& peer, BounceMsgHeader const& h, std::string const& blob)
@@ -233,6 +241,8 @@ void BounceReceiver::onData(std::string const& peer, BounceMsgHeader const& h, s
     // IO-thread-only scheduler. Used to bound scatter reads to THIS flow's region (below).
     job.regionBytes = mCtx.scheduler.regionBytes(h.regionHandle);
     job.entries = std::move(entries);
+    job.nvtxQueue = bounceRangeStart(
+        kNvtxScatterQueue, "scatterQueue rid=%llu chunk=%u", static_cast<unsigned long long>(h.requestId), h.chunkIdx);
     mScattering.emplace(job.offset, false); // a worker is about to read this incoming region (not yet orphaned)
     {
         std::lock_guard<std::mutex> lk(mJobMu);
@@ -302,6 +312,7 @@ void BounceReceiver::forget(std::string const& peer)
         {
             if (j.peer == peer)
             {
+                bounceRangeEnd(j.nvtxQueue); // job dropped, close its queue-wait span
                 mScattering.erase(j.offset);
             }
             else
@@ -324,6 +335,7 @@ void BounceReceiver::forget(std::string const& peer)
 
 void BounceReceiver::scatterWorkerLoop()
 {
+    bounceNameThread("bounceScatter");
     // Pin this worker to our device. Can't throw out of a thread fn -> warn-only (the loop's CUDA ops
     // would then target the wrong device, so this is a real fault, just non-recoverable here).
     TLLM_CUDA_CHECK_WARN(cudaSetDevice(mCtx.deviceId));
@@ -347,6 +359,10 @@ void BounceReceiver::scatterWorkerLoop()
             job = std::move(mJobs.front());
             mJobs.pop_front();
         }
+        bounceRangeEnd(job.nvtxQueue); // dequeued: the queue-wait leg ends here
+        // Covers exec-context acquire + scatter launch + stream sync (the scatter's real GPU wait).
+        BounceNvtxScope scatterScope(kNvtxScatter, "scatter rid=%llu chunk=%u n=%zu",
+            static_cast<unsigned long long>(job.rid), job.chunkIdx, job.entries.size());
         // Borrow an exec context (stream/scratch) for this scatter. The arena region (job.offset) is
         // held by the scheduler until ACK; the exec context is needed only while the kernel runs, so
         // it comes from the small shared pool. If all are busy, briefly retry (backpressure, never
@@ -425,8 +441,12 @@ BounceSender::BounceSender(BounceContext& ctx)
 std::shared_future<TransferState> BounceSender::submit(
     TransferDescs const& srcDescs, TransferDescs const& dstDescs, std::string const& peer)
 {
-    auto plan = BounceTransferPlan::build(
-        srcDescs, dstDescs, mCtx.cfg.maxChunkBytes, std::max<std::size_t>(1024ULL, mCtx.cfg.maxChunkBytes / 256ULL));
+    BounceTransferPlan plan;
+    {
+        BounceNvtxScope planScope(kNvtxBuildPlan, "buildPlan nDesc=%zu", srcDescs.getDescs().size());
+        plan = BounceTransferPlan::build(srcDescs, dstDescs, mCtx.cfg.maxChunkBytes,
+            std::max<std::size_t>(1024ULL, mCtx.cfg.maxChunkBytes / 256ULL));
+    }
     auto const numChunks = static_cast<std::uint32_t>(plan.numChunks());
 
     auto promise = std::make_shared<std::promise<TransferState>>();
@@ -446,6 +466,7 @@ std::shared_future<TransferState> BounceSender::submit(
     }
 
     std::uint64_t const rid = mNextRid.fetch_add(1, std::memory_order_relaxed);
+    std::uint64_t const planBytes = plan.totalBytes();
     {
         std::lock_guard<std::mutex> lk(mReqMu);
         Request req;
@@ -454,6 +475,11 @@ std::shared_future<TransferState> BounceSender::submit(
         req.plan = std::move(plan);
         req.promise = promise;
         req.lastProgress = std::chrono::steady_clock::now();
+        req.nvtxReq = bounceRangeStart(kNvtxRequest, "req rid=%llu chunks=%u bytes=%llu",
+            static_cast<unsigned long long>(rid), numChunks, static_cast<unsigned long long>(planBytes));
+        // Ends at the FIRST GRANT (onGrant) — the credit-wait leg of the request.
+        req.nvtxGrantWait
+            = bounceRangeStart(kNvtxGrantWait, "grantWait rid=%llu", static_cast<unsigned long long>(rid));
         mRequests.emplace(rid, std::move(req));
     }
     // Ask the receiver to grant a region for each chunk of this request flow. The WANT carries our
@@ -477,6 +503,8 @@ void BounceSender::onGrant(std::string const& peer, BounceMsgHeader const& h, st
         return; // late grant for a finished/cancelled request
     }
     Request& req = it->second;
+    bounceRangeEnd(req.nvtxGrantWait);     // first GRANT ends the credit-wait span (no-op on later GRANTs)
+    bounceRangeEnd(req.nvtxCreditStarved); // a GRANT ends the current starvation period (pump may reopen one)
     for (auto const& credit : credits)
     {
         req.pendingCredits.push_back(credit);
@@ -536,6 +564,10 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
         BounceCreditEntry const credit = req.pendingCredits.front();
         req.pendingCredits.pop_front();
         auto const nDesc = static_cast<std::uint32_t>(chunk.srcPtrs.size());
+        // Covers plan-array prep + gather launch + event record (the synchronous launch cost;
+        // the gather's GPU time is the async `gather` span ended in drainGatherReady).
+        BounceNvtxScope gatherLaunchScope(kNvtxGatherLaunch, "gatherLaunch rid=%llu chunk=%u n=%u bytes=%llu",
+            static_cast<unsigned long long>(rid), chunkIdx, nDesc, static_cast<unsigned long long>(chunk.packedBytes));
         std::vector<std::uint64_t> hsrcs(nDesc);
         std::vector<std::uint64_t> hdsts(nDesc);
         std::vector<std::uint32_t> hsizes(nDesc);
@@ -578,9 +610,34 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
         // the gather launch/record failed, go straight to GatherFailed so drainGatherReady fails the
         // request without ever trusting the (un)recorded event.
         p.state = gatherFailed ? PostState::GatherFailed : PostState::Gathering;
+        if (!gatherFailed)
+        {
+            p.nvtxGather = bounceRangeStart(kNvtxGather, "gather rid=%llu chunk=%u bytes=%llu",
+                static_cast<unsigned long long>(rid), chunkIdx, static_cast<unsigned long long>(chunk.packedBytes));
+        }
         req.posted.push_back(std::move(p));
         req.nextPost += 1;
         req.lastProgress = std::chrono::steady_clock::now(); // forward progress: a chunk's gather launched
+    }
+    // Reconcile the pipeline-starvation NVTX spans after every pump pass (perf visibility only):
+    // - creditStarved: every granted credit is consumed but chunks remain -> the flow is waiting on
+    //   the receiver's next re-GRANT. Ended in onGrant, so each wait period is its own range.
+    // - arenaStarved: exited the loop with credits still parked -> blocked on LOCAL resources (gather
+    //   region / exec ctx). One continuous range per park period, ended here once the park drains.
+    // Both are idempotent across repeated pump attempts (drainPendingPosts retries every IO pass).
+    if (req.pendingCredits.empty())
+    {
+        bounceRangeEnd(req.nvtxArenaStarved);
+        if (req.nextPost < req.numChunks && req.nvtxCreditStarved == 0)
+        {
+            req.nvtxCreditStarved = bounceRangeStart(kNvtxCreditStarved, "creditStarved rid=%llu posted=%u/%u",
+                static_cast<unsigned long long>(rid), req.nextPost, req.numChunks);
+        }
+    }
+    else if (req.nvtxArenaStarved == 0)
+    {
+        req.nvtxArenaStarved = bounceRangeStart(kNvtxArenaStarved, "arenaStarved rid=%llu parked=%zu",
+            static_cast<unsigned long long>(rid), req.pendingCredits.size());
     }
 }
 
@@ -632,6 +689,9 @@ bool BounceSender::drainGatherReady()
             // correct to wait for the gather before posting). The gather has completed, so the write
             // no longer needs the gather stream's ordering — return the exec context immediately for
             // another chunk to reuse (the region stays held until ACK).
+            bounceRangeEnd(p.nvtxGather);
+            p.nvtxWrite = bounceRangeStart(kNvtxNixlWrite, "nixlWrite rid=%llu chunk=%u bytes=%u",
+                static_cast<unsigned long long>(rid), p.chunkIdx, p.writeBytes);
             p.xfer = mCtx.engine->postWrite(
                 req.peer, mCtx.arena->at(p.localOffset), p.remoteAddr, p.remoteDevId, p.writeBytes, p.ctx->stream);
             mCtx.exec->release(p.ctx);
@@ -679,9 +739,12 @@ bool BounceSender::pollSenderHandles()
                     entries[i].size = chunk.sizes[i];
                     entries[i].deviceId = chunk.dstDeviceId;
                 }
+                bounceRangeEnd(p.nvtxWrite);
                 mCtx.channel->sendTo(req.peer, encodeData(rid, p.chunkIdx, req.numChunks, p.remoteHandle, entries));
                 mCtx.engine->release(p.xfer);
                 p.state = PostState::Sent;
+                p.nvtxAckWait = bounceRangeStart(
+                    kNvtxAckWait, "ackWait rid=%llu chunk=%u", static_cast<unsigned long long>(rid), p.chunkIdx);
                 didWork = true;
             }
             else if (st == XferState::kFailed)
@@ -718,6 +781,11 @@ void BounceSender::onAck(std::string const& peer, BounceMsgHeader const& h)
     {
         if (pit->chunkIdx == h.chunkIdx)
         {
+            // nvtxGather/nvtxWrite are 0 by Sent state; ending them too keeps a protocol-anomalous
+            // early ACK (which erases this Posted) from leaving their spans dangling.
+            bounceRangeEnd(pit->nvtxGather);
+            bounceRangeEnd(pit->nvtxWrite);
+            bounceRangeEnd(pit->nvtxAckWait);
             // Return the gather-staging region to the shared arena; re-schedule may hand the freed
             // bytes to a waiting remote flow.
             mCtx.sendGrants(mCtx.scheduler.releaseLocal(pit->localOffset));
@@ -736,6 +804,10 @@ void BounceSender::onAck(std::string const& peer, BounceMsgHeader const& h)
     req.lastProgress = std::chrono::steady_clock::now(); // forward progress: a chunk was ACKed
     if (req.acked >= req.numChunks)
     {
+        bounceRangeEnd(req.nvtxGrantWait);
+        bounceRangeEnd(req.nvtxCreditStarved);
+        bounceRangeEnd(req.nvtxArenaStarved);
+        bounceRangeEnd(req.nvtxReq);
         try
         {
             req.promise->set_value(TransferState::kSUCCESS);
@@ -836,6 +908,10 @@ void BounceSender::failRequest(std::uint64_t rid, Request& req)
     bool deferredWrite = false;
     for (auto& p : req.posted)
     {
+        // Close this chunk's NVTX spans (whichever leg it died in); 0 handles are no-ops.
+        bounceRangeEnd(p.nvtxGather);
+        bounceRangeEnd(p.nvtxWrite);
+        bounceRangeEnd(p.nvtxAckWait);
         if (p.state == PostState::Writing)
         {
             mOrphanLocal.push_back(OrphanLocal{p.xfer, p.localOffset, req.peer, rid});
@@ -868,6 +944,10 @@ void BounceSender::failRequest(std::uint64_t rid, Request& req)
     {
         mCtx.channel->sendTo(req.peer, encodeCancel(rid, mCtx.channel->localEndpoint()));
     }
+    bounceRangeEnd(req.nvtxGrantWait);
+    bounceRangeEnd(req.nvtxCreditStarved);
+    bounceRangeEnd(req.nvtxArenaStarved);
+    bounceRangeEnd(req.nvtxReq);
     try
     {
         req.promise->set_value(TransferState::kFAILURE);
@@ -912,6 +992,9 @@ void BounceSender::failAll()
     {
         for (auto& p : req.posted)
         {
+            bounceRangeEnd(p.nvtxGather);
+            bounceRangeEnd(p.nvtxWrite);
+            bounceRangeEnd(p.nvtxAckWait);
             if (p.state == PostState::Writing)
             {
                 mCtx.engine->release(p.xfer); // RDMA write in flight -> release its transfer handle
@@ -922,6 +1005,10 @@ void BounceSender::failAll()
                 p.ctx = nullptr;
             }
         }
+        bounceRangeEnd(req.nvtxGrantWait);
+        bounceRangeEnd(req.nvtxCreditStarved);
+        bounceRangeEnd(req.nvtxArenaStarved);
+        bounceRangeEnd(req.nvtxReq);
         try
         {
             req.promise->set_value(TransferState::kFAILURE);
@@ -1044,6 +1131,7 @@ void BounceTransport::drainForgets()
 
 void BounceTransport::ioLoop()
 {
+    bounceNameThread("bounceIO");
     // Pin this thread to our device up front; if it fails, every CUDA op in the loop targets the wrong
     // device (the transport is effectively broken). Can't throw out of a thread fn -> warn-only.
     TLLM_CUDA_CHECK_WARN(cudaSetDevice(mCtx.deviceId));

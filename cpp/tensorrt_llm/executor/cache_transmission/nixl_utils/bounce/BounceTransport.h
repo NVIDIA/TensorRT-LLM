@@ -169,6 +169,7 @@ private:
         std::uint64_t offset{};      // receiver arena region offset (the granted region handle) to scatter from
         std::uint64_t regionBytes{}; // byte size of the buddy block backing `offset` (bounds scatter reads)
         std::vector<BounceScatterEntry> entries;
+        std::uint64_t nvtxQueue{0};  // NVTX span: enqueued on the IO thread -> dequeued by a worker
     };
 
     struct ScatterDone
@@ -277,6 +278,10 @@ private:
         std::uint32_t remoteDevId{};
         std::uint32_t writeBytes{};
         PostState state{PostState::Gathering};
+        // Cross-thread NVTX spans for this chunk's async legs (0 == none; ended on failure paths too).
+        std::uint64_t nvtxGather{0};  // gather launched -> event signaled (in-flight incl. GPU queueing)
+        std::uint64_t nvtxWrite{0};   // RDMA write posted -> poll terminal
+        std::uint64_t nvtxAckWait{0}; // DATA sent -> ACK received
     };
 
     struct Request
@@ -297,6 +302,12 @@ private:
         // A request stuck with no progress for leaseTimeoutMs (e.g. the peer never GRANTs because
         // it is unreachable / not bounce-ready) is failed rather than hanging wait() forever.
         std::chrono::steady_clock::time_point lastProgress;
+        // Cross-thread NVTX spans (0 == none; ended on failure paths too).
+        std::uint64_t nvtxReq{0};       // submit -> promise resolved
+        std::uint64_t nvtxGrantWait{0}; // WANT sent -> first GRANT arrives
+        // Pipeline-starvation spans (can open/close several times per request, one range per period):
+        std::uint64_t nvtxCreditStarved{0}; // every credit consumed, chunks left -> next GRANT (onGrant ends)
+        std::uint64_t nvtxArenaStarved{0};  // credits parked: no local region / exec ctx -> parked credits drain
     };
 
     // Regions of a FAILED request whose RDMA write was still in flight (state == Writing).
