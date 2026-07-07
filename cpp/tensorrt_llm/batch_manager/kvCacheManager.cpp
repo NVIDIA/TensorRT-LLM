@@ -1395,6 +1395,23 @@ BlockPtr WindowBlockManager::reclaimSecondaryBlock()
         }
         return victim; // unmarked or expired: discard, exactly as stock
     }
+    // Reuse-gate: only spill blocks whose content has been reused >= k times (TLLM_KV_DISK_MIN_REUSE; 0=off).
+    // Skips one-shot blocks so the SSD tier holds only genuinely-hot prefixes. Env read once, cached.
+    static SizeType32 const kDiskMinReuse = []() -> SizeType32
+    {
+        auto const* e = std::getenv("TLLM_KV_DISK_MIN_REUSE");
+        return e ? static_cast<SizeType32>(std::atoi(e)) : 0;
+    }();
+    if (kDiskMinReuse > 0 && victim->getReuseCount() < kDiskMinReuse)
+    {
+        ++mDiskGateDropped;
+        if (mDiskGateDropped == 1 || mDiskGateDropped % 10000 == 0)
+        {
+            TLLM_LOG_INFO("[disk-tier] reuse-gate dropped=%zu (k=%d, windowSize=%d)", mDiskGateDropped,
+                static_cast<int>(kDiskMinReuse), mWindowSize);
+        }
+        return victim; // reused fewer than k times: discard, don't spill
+    }
     auto diskTarget = claimDiskTarget();
     if (diskTarget == nullptr)
     {
@@ -2134,6 +2151,7 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
         addBlockToAllBeams(claimed.block, sequence);
         if (!claimed.isPlaceholder)
         {
+            claimed.block->incReuseCount(); // per-block reuse count for the disk reuse-gate
             ++mReusedBlocks;
             if (claimed.isPartialMatch)
             {

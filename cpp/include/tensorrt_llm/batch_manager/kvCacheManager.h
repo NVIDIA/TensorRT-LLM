@@ -487,6 +487,17 @@ public:
         mRetentionExpiry = std::nullopt;
     }
 
+    //! \brief Times this block's content has been reused (prefix-matched); drives the disk reuse-gate.
+    [[nodiscard]] SizeType32 getReuseCount() const
+    {
+        return mReuseCount;
+    }
+
+    void incReuseCount()
+    {
+        ++mReuseCount;
+    }
+
     void incRefCount();
 
     void decRefCount();
@@ -647,6 +658,10 @@ private:
 
     // Disk-tier retention deadline (steady clock); nullopt = never marked.
     std::optional<std::chrono::steady_clock::time_point::duration> mRetentionExpiry;
+
+    // How many times this block's content has been reused (prefix-matched). Metadata on the block object,
+    // so it survives tier moves like mRetentionExpiry (swapDiskResidency swaps only residency pointers).
+    SizeType32 mReuseCount{0};
 };
 
 class GenerationRequest
