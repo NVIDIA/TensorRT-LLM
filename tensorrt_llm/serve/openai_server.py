@@ -1329,18 +1329,29 @@ class OpenAIServer(_VideoRoutesMixin):
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
-                prompt: str = apply_chat_template(
-                    model_type=resolve_top_level_model_type(self.model_config),
-                    tokenizer=self.tokenizer,
-                    processor=self.processor,
-                    conversation=conversation,
-                    add_generation_prompt=request.add_generation_prompt,
-                    mm_placeholder_counts=mm_placeholder_counts,
-                    tools=tool_dicts,
-                    documents=request.documents,
-                    chat_template=request.chat_template or self.chat_template,
-                    chat_template_kwargs=request.chat_template_kwargs or {},
-                )
+                # Rendering the chat template is pure-CPU jinja + python work
+                # that grows with conversation length (hundreds of ms for
+                # ~100k-token agentic chats). Run it on the input-processor
+                # pool so a burst of long-context requests cannot serialize
+                # behind the event loop.
+                prompt: str = await asyncio.get_event_loop().run_in_executor(
+                    self._input_proc_executor,
+                    functools.partial(
+                        apply_chat_template,
+                        model_type=resolve_top_level_model_type(
+                            self.model_config),
+                        tokenizer=self.tokenizer,
+                        processor=self.processor,
+                        conversation=conversation,
+                        add_generation_prompt=request.add_generation_prompt,
+                        mm_placeholder_counts=mm_placeholder_counts,
+                        tools=tool_dicts,
+                        documents=request.documents,
+                        chat_template=request.chat_template
+                        or self.chat_template,
+                        chat_template_kwargs=request.chat_template_kwargs
+                        or {},
+                    ))
             prompt = prompt_inputs(prompt)
 
             mm_data, mm_embeddings = await mm_coroutines
