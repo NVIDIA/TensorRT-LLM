@@ -2751,7 +2751,7 @@ async def _send_mixed_request(session,
 
     Three behaviors keyed on profile:
     - cancel: stream until cancel_after seconds then disconnect (success stays False)
-    - structured_output: drain full stream, assemble text, validate json.loads
+    - structured_output: drain full stream, assemble text, validate JSON schema
     - free-text / long-context: drain full stream, mark success
     """
     import random
@@ -2768,7 +2768,7 @@ async def _send_mixed_request(session,
     }
     if profile.structured_output_schema is not None:
         payload["response_format"] = {
-            "type": "json_object",
+            "type": "json",
             "schema": profile.structured_output_schema,
         }
 
