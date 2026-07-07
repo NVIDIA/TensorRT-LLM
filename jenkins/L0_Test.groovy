@@ -1229,7 +1229,11 @@ export ENROOT_CACHE_PATH='/home/svc_tensorrt/.cache/enroot'
 
 # Resolve base sqsh using image digest (shared cache, same logic as srunPrologue).
 mkdir -p "${containerDir}"
-imageDigest=\$(printf '%s' "${container}" | sha256sum | cut -d' ' -f1)
+if printf '%s' "${container}" | grep -q '@sha256:'; then
+    imageDigest=\$(printf '%s' "${container}" | grep -oP '(?<=@sha256:)[a-f0-9]+')
+else
+    imageDigest=\$(printf '%s' "${container}" | sha256sum | cut -d' ' -f1)
+fi
 baseSqshPath="${containerDir}/container-\${imageDigest}.sqsh"
 
 # Import base sqsh if not already cached (flock so concurrent builds share one import).
