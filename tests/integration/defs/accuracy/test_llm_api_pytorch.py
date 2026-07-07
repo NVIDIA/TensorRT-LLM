@@ -979,6 +979,33 @@ class TestMinistral8BInstruct(LlmapiAccuracyTestHarness):
             pytest.skip("FP8 pre-quantized Ministral-8B model not available")
 
 
+class TestChatGLM3_6B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "THUDM/chatglm3-6b"
+    MODEL_PATH = f"{llm_models_root()}/chatglm3-6b"
+
+    def test_auto_dtype(self):
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        use_kv_cache_manager_v2=True)
+        with LLM(self.MODEL_PATH,
+                 trust_remote_code=True,
+                 attn_backend="TRTLLM",
+                 kv_cache_config=kv_cache_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    def test_cuda_graph_overlap(self):
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        use_kv_cache_manager_v2=True)
+        with LLM(self.MODEL_PATH,
+                 trust_remote_code=True,
+                 attn_backend="TRTLLM",
+                 kv_cache_config=kv_cache_config,
+                 cuda_graph_config=CudaGraphConfig(),
+                 disable_overlap_scheduler=False) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
 @skip_post_blackwell
 @skip_pre_hopper
 class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
