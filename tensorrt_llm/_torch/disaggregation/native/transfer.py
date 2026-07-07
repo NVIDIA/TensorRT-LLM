@@ -1939,9 +1939,7 @@ class RxSession(RxSessionBase):
                             # Transfer end for perf/time-sync: only meaningful once every slice has
                             # landed. Plain attribute write (atomic under the GIL); on_done must stay
                             # lock-free, and consumers only read it after wait_complete succeeds.
-                            if all(
-                                t.status == TaskStatus.TRANSFERRED for t in self._kv_tasks
-                            ):
+                            if all(t.status == TaskStatus.TRANSFERRED for t in self._kv_tasks):
                                 self.transfer_end_time = (
                                     tensorrt_llm.bindings.global_steady_clock_now()
                                 )

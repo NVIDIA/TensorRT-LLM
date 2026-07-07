@@ -451,7 +451,6 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     if (!LlmRequest::sGlobalSteadyClockOffset.has_value())
     {
         using Duration = LlmRequest::Duration;
-        using TimePoint = LlmRequest::TimePoint;
         // Barrier + take local timestamp
         if (useMPI())
         {
