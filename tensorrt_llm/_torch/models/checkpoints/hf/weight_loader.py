@@ -15,6 +15,8 @@
 import glob
 import multiprocessing
 import os
+import threading
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, List
 
@@ -33,6 +35,15 @@ from tensorrt_llm._utils import (ENABLE_MULTI_DEVICE, local_mpi_barrier,
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+_WEIGHT_CACHE_ENV = "TRTLLM_HF_WEIGHT_CACHE"
+_WEIGHT_CACHE_MAX_ENTRIES_ENV = "TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES"
+# Default to a single cached checkpoint: each entry pins a full copy of the
+# raw weights in CPU RAM, so callers wanting cross-model caching must opt in
+# via TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES.
+_DEFAULT_WEIGHT_CACHE_MAX_ENTRIES = 1
+_WEIGHT_CACHE_LOCK = threading.Lock()
+_WEIGHT_CACHE: OrderedDict[tuple, dict[str, Any]] = OrderedDict()
+
 
 @register_checkpoint_weight_loader("MX")
 @register_checkpoint_weight_loader("mistral")
@@ -42,6 +53,75 @@ class HfWeightLoader(BaseWeightLoader):
     """
     Loads weights from SafeTensors/bin/pth files.
     """
+
+    @staticmethod
+    def _is_weight_cache_enabled() -> bool:
+        return os.environ.get(_WEIGHT_CACHE_ENV,
+                              "0").lower() in ("1", "true", "yes", "on")
+
+    @staticmethod
+    def _weight_cache_max_entries() -> int:
+        try:
+            return max(
+                0,
+                int(
+                    os.environ.get(_WEIGHT_CACHE_MAX_ENTRIES_ENV,
+                                   _DEFAULT_WEIGHT_CACHE_MAX_ENTRIES)))
+        except ValueError:
+            logger.warning(
+                f"Invalid {_WEIGHT_CACHE_MAX_ENTRIES_ENV} value; disabling HF weight cache."
+            )
+            return 0
+
+    @staticmethod
+    def _weight_files_cache_key(weight_files: List[str],
+                                use_consolidated: bool) -> tuple:
+        file_fingerprint = []
+        for file_name in sorted(weight_files):
+            stat = os.stat(file_name)
+            file_fingerprint.append(
+                (os.path.abspath(file_name), stat.st_size, stat.st_mtime_ns))
+        return (tuple(file_fingerprint), use_consolidated)
+
+    @classmethod
+    def _clear_weight_cache(cls) -> None:
+        with _WEIGHT_CACHE_LOCK:
+            _WEIGHT_CACHE.clear()
+
+    @staticmethod
+    def _evict_to_make_room() -> None:
+        """Evict LRU entries on a miss BEFORE the new load, so CPU never holds
+        the old (cached) and new (loading) weights at once (a ~2x peak)."""
+        max_entries = HfWeightLoader._weight_cache_max_entries()
+        if max_entries <= 0:
+            return
+        with _WEIGHT_CACHE_LOCK:
+            while len(_WEIGHT_CACHE) >= max_entries:
+                _WEIGHT_CACHE.popitem(last=False)
+
+    @staticmethod
+    def _cache_loaded_weights(cache_key: tuple,
+                              loaded_weights: dict[str, Any]) -> None:
+        max_entries = HfWeightLoader._weight_cache_max_entries()
+        if max_entries <= 0:
+            return
+
+        HfWeightLoader._evict_to_make_room()
+        with _WEIGHT_CACHE_LOCK:
+            _WEIGHT_CACHE[cache_key] = dict(loaded_weights)
+
+    @staticmethod
+    def _get_cached_weights(cache_key: tuple) -> ConsumableWeightsDict | None:
+        with _WEIGHT_CACHE_LOCK:
+            weights = _WEIGHT_CACHE.get(cache_key)
+            if weights is None:
+                return None
+            _WEIGHT_CACHE.move_to_end(cache_key)
+            # Return a fresh dict wrapper because model loaders call
+            # mark_consumed(). Tensor values are intentionally shared: this
+            # cache targets read-only raw checkpoint tensors, not per-config
+            # materialized module weights.
+            return ConsumableWeightsDict(dict(weights))
 
     @staticmethod
     def _get_local_available_host_memory() -> int:
@@ -61,6 +141,36 @@ class HfWeightLoader(BaseWeightLoader):
                                               op=_MPI.MIN)
         return available_host_memory
 
+    def _with_weight_cache(self, weight_files: List[str],
+                           use_consolidated: bool, barrier_on_hit: bool,
+                           load_fn) -> ConsumableWeightsDict:
+        """Wrap ``load_fn`` with the optional raw-weight cache.
+
+        Key -> hit (optionally joining the local barrier the miss path is
+        about to enter) -> evict-before-load (so CPU never holds the old
+        cached and the new loading weights at once) -> load -> store.
+        """
+        cache_key = self._weight_files_cache_key(
+            weight_files,
+            use_consolidated) if self._is_weight_cache_enabled() else None
+        if cache_key is not None:
+            cached_weights = self._get_cached_weights(cache_key)
+            if cached_weights is not None:
+                logger.info("Reusing cached HF checkpoint weights.")
+                if barrier_on_hit:
+                    # The safetensors miss path has a local barrier before
+                    # deserialization. Cache hits must participate as well:
+                    # rank-local caches can diverge after eviction, and a hit
+                    # on one rank must not skip a barrier that a miss on
+                    # another rank is about to enter.
+                    local_mpi_barrier()
+                return cached_weights
+            self._evict_to_make_room()
+        weights = load_fn()
+        if cache_key is not None:
+            self._cache_loaded_weights(cache_key, weights)
+        return weights
+
     def load_weights(self,
                      checkpoint_dir: str,
                      mapping: Mapping,
@@ -77,41 +187,53 @@ class HfWeightLoader(BaseWeightLoader):
         if len(filtered_weight_files) > 0:
             weight_files = filtered_weight_files
         if weight_files:
-            # Prefetch the weight files to CPU memory if the size is less than 90% of the available memory.
-            # This is a heuristic to avoid prefetching files that are too large and causing file cache thrashing.
-            prefetch_size = sum(os.path.getsize(file) for file in weight_files)
-            # If the layer number is overridden, it indicates that only a subset of layers are loaded.
-            # Prefetching all layers is unnecessary.
-            num_layers = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM", "0"))
-            enable_prefetch = (prefetch_size
-                               < self._get_local_available_host_memory() * 0.9
-                               and num_layers == 0)
-            if enable_prefetch:
-                logger.info(
-                    f"Prefetching {prefetch_size / (1024**3):.2f}GB checkpoint files."
-                )
-                self.prefetch_files(weight_files)
-            # Sync all local ranks unconditionally. `enable_prefetch` depends on
-            # `psutil.virtual_memory().available`, a per-rank volatile value, so
-            # different ranks may take different branches; gating the barrier on
-            # it would deadlock between ranks that prefetched and ranks that
-            # skipped. Ranks that didn't prefetch reach the barrier immediately.
-            local_mpi_barrier()
-
-            return self._load_weights_in_parallel(
-                weight_files, self._load_safetensors_file,
-                "Loading safetensors weights in parallel")
+            return self._with_weight_cache(
+                weight_files,
+                use_consolidated,
+                barrier_on_hit=True,
+                load_fn=lambda: self._prefetch_and_load(weight_files))
 
         weight_files = glob.glob(f"{checkpoint_dir}/*.bin")
         if not weight_files:
             weight_files = glob.glob(f"{checkpoint_dir}/*.pth")
 
         if weight_files:
-            return self._load_weights_in_parallel(
-                weight_files, self._load_bin_or_path_file,
-                "Loading bin weights in parallel")
+            return self._with_weight_cache(
+                weight_files,
+                use_consolidated,
+                barrier_on_hit=False,
+                load_fn=lambda: self._load_weights_in_parallel(
+                    weight_files, self._load_bin_or_path_file,
+                    "Loading bin weights in parallel"))
 
         raise RuntimeError(f"No weight files found in {checkpoint_dir}.")
+
+    def _prefetch_and_load(self,
+                           weight_files: List[str]) -> ConsumableWeightsDict:
+        # Prefetch the weight files to CPU memory if the size is less than 90% of the available memory.
+        # This is a heuristic to avoid prefetching files that are too large and causing file cache thrashing.
+        prefetch_size = sum(os.path.getsize(file) for file in weight_files)
+        # If the layer number is overridden, it indicates that only a subset of layers are loaded.
+        # Prefetching all layers is unnecessary.
+        num_layers = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM", "0"))
+        enable_prefetch = (prefetch_size
+                           < self._get_local_available_host_memory() * 0.9
+                           and num_layers == 0)
+        if enable_prefetch:
+            logger.info(
+                f"Prefetching {prefetch_size / (1024**3):.2f}GB checkpoint files."
+            )
+            self.prefetch_files(weight_files)
+        # Sync all local ranks unconditionally. `enable_prefetch` depends on
+        # `psutil.virtual_memory().available`, a per-rank volatile value, so
+        # different ranks may take different branches; gating the barrier on
+        # it would deadlock between ranks that prefetched and ranks that
+        # skipped. Ranks that didn't prefetch reach the barrier immediately.
+        local_mpi_barrier()
+
+        return self._load_weights_in_parallel(
+            weight_files, self._load_safetensors_file,
+            "Loading safetensors weights in parallel")
 
     def _load_weights_in_parallel(self, weight_files: List[str], load_func,
                                   description: str) -> ConsumableWeightsDict:
