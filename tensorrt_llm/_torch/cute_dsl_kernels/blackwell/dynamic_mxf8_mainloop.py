@@ -11,11 +11,7 @@ from cutlass._mlir.dialects import nvvm as _nvvm_raw
 from cutlass.cute.arch.nvvm_wrappers import nvvm
 from cutlass.cutlass_dsl import Boolean, Int32, Uint32, dsl_user_op
 
-_MXF8_SCALE_VEC_SIZE = getattr(
-    _nvvm_raw.Tcgen05MMAScaleVecSize,
-    "BLOCK32",
-    _nvvm_raw.Tcgen05MMAScaleVecSize.X1,
-)
+_MXF8_SCALE_VEC_SIZE = _nvvm_raw.Tcgen05MMAScaleVecSize.X1
 
 
 def _align16(x):
