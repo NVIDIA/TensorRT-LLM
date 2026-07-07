@@ -921,6 +921,7 @@ def get_minimax_m3_msa_attention_backend_cls():
             m3_metadata: "MiniMaxM3SparseAttentionMetadata",
             sm_scale: Optional[float] = None,
             idx_sm_scale: Optional[float] = None,
+            output: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
             """MSA-backed sparse forward.
 
@@ -930,6 +931,16 @@ def get_minimax_m3_msa_attention_backend_cls():
             kernels read directly from the paged caches we just
             populated; we do **not** gather K/V into per-batch padded
             slabs.
+
+            ``output`` mirrors the parent class's preallocated-output
+            contract: the standard ``forward`` entry point always calls
+            ``forward_sparse(..., output=output)``. The MSA prefill /
+            decode primitives allocate and return their own result
+            tensor, so when a preallocated ``output`` is supplied we copy
+            the result into it in place and return it — the model layer
+            (``MiniMaxM3Attention._forward_attention_core``) allocates
+            ``output`` and returns *that* buffer, ignoring our return
+            value, so writing in place is mandatory for correctness.
             """
             if idx_v is not None:
                 raise NotImplementedError(
@@ -970,7 +981,7 @@ def get_minimax_m3_msa_attention_backend_cls():
             _write_main_kv_slots(idx_k_cache, out_cache_loc, idx_k_view)
 
             if m3_metadata.is_prefill:
-                return minimax_m3_msa_sparse_prefill(
+                result = minimax_m3_msa_sparse_prefill(
                     q_view,
                     k_cache,
                     v_cache,
@@ -981,17 +992,23 @@ def get_minimax_m3_msa_attention_backend_cls():
                     sm_scale=sm_scale,
                     idx_sm_scale=idx_sm_scale,
                 )
-            return minimax_m3_msa_sparse_decode(
-                q_view,
-                idx_q_view,
-                k_cache,
-                v_cache,
-                idx_k_cache,
-                m3_metadata,
-                self.m3_config,
-                sm_scale=sm_scale,
-                idx_sm_scale=idx_sm_scale,
-            )
+            else:
+                result = minimax_m3_msa_sparse_decode(
+                    q_view,
+                    idx_q_view,
+                    k_cache,
+                    v_cache,
+                    idx_k_cache,
+                    m3_metadata,
+                    self.m3_config,
+                    sm_scale=sm_scale,
+                    idx_sm_scale=idx_sm_scale,
+                )
+
+            if output is not None:
+                output.view_as(result).copy_(result)
+                return output
+            return result
 
     return MiniMaxM3MSARuntimeBackend
 
