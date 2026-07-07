@@ -89,7 +89,7 @@ Note that currently TRT-LLM only supports FP8 weight/activation quantization whe
 
 #### W8A8 SmoothQuant (INT8)
 
-W8A8 SmoothQuant (`int8_sq`) quantizes both weights and activations to INT8. It uses [SmoothQuant](https://arxiv.org/abs/2211.10438) to migrate quantization difficulty from activations to weights before applying per-channel or per-tensor INT8 quantization. Use the `quantize.py` script from `examples/quantization/`:
+W8A8 SmoothQuant (`int8_sq`) quantizes both weights and activations to INT8. It uses [SmoothQuant](https://arxiv.org/abs/2211.10438) to migrate quantization difficulty from activations to weights, then exports `W8A8_SQ_PER_CHANNEL` checkpoints with channel-wise INT8 weights and tensor-wise calibrated activation ranges. Use the `quantize.py` script from `examples/quantization/`:
 
 ```bash
 python examples/quantization/quantize.py \
@@ -101,28 +101,28 @@ python examples/quantization/quantize.py \
 
 ## Model Support Matrix
 
-| Model          |  NVFP4  | MXFP4  | FP8(per tensor)| FP8(block scaling) | FP8(rowwise) | FP8 KV Cache | NVFP4 KV Cache | W4A8 AWQ  | W4A16 AWQ | W4A8 GPTQ  | W4A16 GPTQ |
-| :------------- | :---:   | :---:  | :---: | :---: | :---: | :---: |:---:| :-------: | :-------: | :--------: | :--------: |
-| BERT           |   .     |   .    |   .   |   .   |   .   |   Y   |  .  |     .     |     .     |     .      |     .      |
-| DeepSeek-R1    |   Y     |   .    |   .   |   Y   |   .   |   Y   |  .  |     .     |     .     |     .      |     .      |
-| EXAONE         |   .     |   .    |   Y   |   .   |   .   |   Y   |  .  |     Y     |     Y     |     .      |     .      |
-| Gemma 3        |   .     |   .    |   Y   |   .   |   .   |   Y   |  .  |     Y     |     Y     |     .      |     .      |
-| GPT-OSS        |   .     |   Y    |   .   |   .   |   .   |   Y   |  .  |     .     |     .     |     .      |     .      |
-| LLaMA          |   Y     |   .    |   Y   |   .   |   .   |   Y   |  .  |     .     |     Y     |     .      |     Y      |
-| LLaMA-v2       |   Y     |   .    |   Y   |   .   |   .   |   Y   |  Y  |     Y     |     Y     |     .      |     Y      |
-| LLaMA 3        |   .     |   .    |   .   |   .   |   Y   |   Y   |  Y  |     Y     |     .     |     .      |     .      |
-| LLaMA 4        |   Y     |   .    |   Y   |   .   |   .   |   Y   |  .  |     .     |     .     |     .      |     .      |
-| Mistral        |   .     |   .    |   Y   |   .   |   .   |   Y   |  .  |     .     |     Y     |     .      |     .      |
-| Mixtral        |   Y     |   .    |   Y   |   .   |   .   |   Y   |  .  |     .     |     .     |     .      |     .      |
-| Phi            |   .     |   .    |   .   |   .   |   .   |   Y   |  .  |     Y     |     .     |     .      |     .      |
-| Qwen           |   .     |   .    |   .   |   .   |   .   |   Y   |  .  |     Y     |     Y     |     .      |     Y      |
-| Qwen-2/2.5     |   Y     |   .    |   Y   |   .   |   .   |   Y   |  .  |     Y     |     Y     |     .      |     Y      |
-| Qwen-3         |   Y     |   .    |   Y   |   .   |   .   |   Y   |  Y  |     .     |     Y     |     .      |     Y      |
-| BLIP2-OPT      |   .     |   .    |   .   |   .   |   .   |   Y   |  .  |     .     |     .     |     .      |     .      |
-| BLIP2-T5       |   .     |   .    |   .   |   .   |   .   |   Y   |  .  |     .     |     .     |     .      |     .      |
-| LLaVA          |   .     |   .    |   Y   |   .   |   .   |   Y   |  .  |     .     |     Y     |     .      |     Y      |
-| VILA           |   .     |   .    |   Y   |   .   |   .   |   Y   |  .  |     .     |     Y     |     .      |     Y      |
-| Nougat         |   .     |   .    |   .   |   .   |   .   |   Y   |  .  |     .     |     .     |     .      |     .      |
+| Model          |  NVFP4  | MXFP4  | FP8(per tensor)| FP8(block scaling) | FP8(rowwise) | FP8 KV Cache | NVFP4 KV Cache | W8A8 SQ | W4A8 AWQ  | W4A16 AWQ | W4A8 GPTQ  | W4A16 GPTQ |
+| :------------- | :---:   | :---:  | :---: | :---: | :---: | :---: |:---:| :-----: | :-------: | :-------: | :--------: | :--------: |
+| BERT           |   .     |   .    |   .   |   .   |   .   |   Y   |  .  |    .    |     .     |     .     |     .      |     .      |
+| DeepSeek-R1    |   Y     |   .    |   .   |   Y   |   .   |   Y   |  .  |    .    |     .     |     .     |     .      |     .      |
+| EXAONE         |   .     |   .    |   Y   |   .   |   .   |   Y   |  .  |    .    |     Y     |     Y     |     .      |     .      |
+| Gemma 3        |   .     |   .    |   Y   |   .   |   .   |   Y   |  .  |    Y    |     Y     |     Y     |     .      |     .      |
+| GPT-OSS        |   .     |   Y    |   .   |   .   |   .   |   Y   |  .  |    .    |     .     |     .     |     .      |     .      |
+| LLaMA          |   Y     |   .    |   Y   |   .   |   .   |   Y   |  .  |    Y    |     .     |     Y     |     .      |     Y      |
+| LLaMA-v2       |   Y     |   .    |   Y   |   .   |   .   |   Y   |  Y  |    Y    |     Y     |     Y     |     .      |     Y      |
+| LLaMA 3        |   .     |   .    |   .   |   .   |   Y   |   Y   |  Y  |    Y    |     Y     |     .     |     .      |     .      |
+| LLaMA 4        |   Y     |   .    |   Y   |   .   |   .   |   Y   |  .  |    .    |     .     |     .     |     .      |     .      |
+| Mistral        |   .     |   .    |   Y   |   .   |   .   |   Y   |  .  |    Y    |     .     |     Y     |     .      |     .      |
+| Mixtral        |   Y     |   .    |   Y   |   .   |   .   |   Y   |  .  |    .    |     .     |     .     |     .      |     .      |
+| Phi            |   .     |   .    |   .   |   .   |   .   |   Y   |  .  |    .    |     Y     |     .     |     .      |     .      |
+| Qwen           |   .     |   .    |   .   |   .   |   .   |   Y   |  .  |    Y    |     Y     |     Y     |     .      |     Y      |
+| Qwen-2/2.5     |   Y     |   .    |   Y   |   .   |   .   |   Y   |  .  |    Y    |     Y     |     Y     |     .      |     Y      |
+| Qwen-3         |   Y     |   .    |   Y   |   .   |   .   |   Y   |  Y  |    Y    |     .     |     Y     |     .      |     Y      |
+| BLIP2-OPT      |   .     |   .    |   .   |   .   |   .   |   Y   |  .  |    .    |     .     |     .     |     .      |     .      |
+| BLIP2-T5       |   .     |   .    |   .   |   .   |   .   |   Y   |  .  |    .    |     .     |     .     |     .      |     .      |
+| LLaVA          |   .     |   .    |   Y   |   .   |   .   |   Y   |  .  |    Y    |     .     |     Y     |     .      |     Y      |
+| VILA           |   .     |   .    |   Y   |   .   |   .   |   Y   |  .  |    Y    |     .     |     Y     |     .      |     Y      |
+| Nougat         |   .     |   .    |   .   |   .   |   .   |   Y   |  .  |    .    |     .     |     .     |     .      |     .      |
 
 
 ```{note}
@@ -133,13 +133,13 @@ The language component decides which quantization methods are supported by a giv
 
 ## Hardware Support Matrix
 
-| Model          |  NVFP4  | MXFP4  | FP8(per tensor)| FP8(block scaling) | FP8(rowwise) | FP8 KV Cache | NVFP4 KV Cache | W4A8 AWQ  | W4A16 AWQ | W4A8 GPTQ  | W4A16 GPTQ |
-| :------------- | :---:   | :---:  | :---: | :---: | :---: | :---: | :---: | :-------: | :-------: | :--------: | :--------: |
-| Blackwell(sm120)       |   Y     |   Y    |   Y   |   .   |   .   |   Y   |   .   |     .     |     .     |     .      |     .      |
-| Blackwell(sm100/103)       |   Y     |   Y    |   Y   |   Y   |   .   |   Y   |   Y   |     Y     |     Y     |     Y      |     Y      |
-| Hopper           |   .     |   .    |   Y   |   Y   |   Y   |   Y   |   .   |     Y     |     Y     |     Y      |     Y      |
-| Ada Lovelace          |   .     |   .    |   Y   |   .   |   .   |   Y   |   .   |     Y     |     Y     |     Y      |     Y      |
-| Ampere         |   .     |   .    |   .   |   .   |   .   |   Y   |   .   |     .     |     Y     |     .      |     Y      |
+| Model          |  NVFP4  | MXFP4  | FP8(per tensor)| FP8(block scaling) | FP8(rowwise) | FP8 KV Cache | NVFP4 KV Cache | W8A8 SQ | W4A8 AWQ  | W4A16 AWQ | W4A8 GPTQ  | W4A16 GPTQ |
+| :------------- | :---:   | :---:  | :---: | :---: | :---: | :---: | :---: | :-----: | :-------: | :-------: | :--------: | :--------: |
+| Blackwell(sm120)       |   Y     |   Y    |   Y   |   .   |   .   |   Y   |   .   |    .    |     .     |     .     |     .      |     .      |
+| Blackwell(sm100/103)       |   Y     |   Y    |   Y   |   Y   |   .   |   Y   |   Y   |    .    |     Y     |     Y     |     Y      |     Y      |
+| Hopper           |   .     |   .    |   Y   |   Y   |   Y   |   Y   |   .   |    Y    |     Y     |     Y     |     Y      |     Y      |
+| Ada Lovelace          |   .     |   .    |   Y   |   .   |   .   |   Y   |   .   |    Y    |     Y     |     Y     |     Y      |     Y      |
+| Ampere         |   .     |   .    |   .   |   .   |   .   |   Y   |   .   |    Y    |     .     |     Y     |     .      |     Y      |
 
 ```{note}
 FP8 block wise scaling GEMM kernels for sm100/103 are using MXFP8 recipe (E4M3 act/weight and UE8M0 act/weight scale), which is slightly different from SM90 FP8 recipe (E4M3 act/weight and FP32 act/weight scale).
