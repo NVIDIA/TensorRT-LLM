@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import copy
 import inspect
 import os
@@ -263,6 +266,8 @@ class ModelLoader:
     Handles the loading, configuration, and weight initialization of a PyTorch model.
     This class isolates model loading logic from the main execution engine.
     """
+    _MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION = 1
+    _MX_STAGED_RECEIVER_ALLOWLIST = frozenset()
 
     def __init__(self,
                  llm_args: TorchLlmArgs,
@@ -480,6 +485,9 @@ class ModelLoader:
                 f"Use {rank_model_storage / (1024**3):.2f} GB for model weights."
             )
             weights_preloaded = False
+            loads_draft_weights = (
+                self.spec_config is not None
+                and self.spec_config.spec_dec_mode.need_load_draft_weights())
             # Set when either GMS RW or GMS RO branch has already run the
             # post_load_* hooks itself, so the shared post-load block below
             # must skip them. RW handles them inside `mem_pool_scope` so the
@@ -499,6 +507,13 @@ class ModelLoader:
                     # Generic loaders ignore it; MXCheckpointLoader pops it.
                     "source_identity": self._source_identity,
                 }
+                if checkpoint_loader.checkpoint_format == "MX":
+                    # If a separate draft model still needs a raw disk load,
+                    # do not accept post-transform bytes for only the target
+                    # model. Enable this only after target and draft subgraphs
+                    # have an explicit mixed-layout policy.
+                    load_weights_kwargs["allow_post_transform_weights"] = (
+                        not loads_draft_weights)
 
                 if hasattr(model, 'llm_checkpoint_dir'):
                     weights = checkpoint_loader.load_weights(
@@ -518,8 +533,7 @@ class ModelLoader:
                     self._call_load_weights(model.load_weights, weights,
                                             self.weight_mapper)
 
-                if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
-                ):
+                if loads_draft_weights:
                     weights = checkpoint_loader.load_weights(
                         self.spec_config.speculative_model,
                         mapping=self.mapping)
@@ -646,8 +660,7 @@ class ModelLoader:
                                     "commit an unpopulated model to the GMS "
                                     "pool.")
 
-                            if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
-                            ):
+                            if loads_draft_weights:
                                 draft_weights = checkpoint_loader.load_weights(
                                     self.spec_config.speculative_model,
                                     mapping=self.mapping)
@@ -764,8 +777,7 @@ class ModelLoader:
                 self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
                     model, config)
                 initialize_dummy_weights(model)
-                if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
-                ):
+                if loads_draft_weights:
                     model.draft_model.load_weights_from_target_model(model)
 
             elif load_format == LoadFormat.VISION_ONLY:
@@ -781,12 +793,21 @@ class ModelLoader:
             if not gms_post_load_handled:
                 checkpoint_loader.post_load_apply(
                     model, weights_preloaded=weights_preloaded)
+                mx_staged_receiver_path = self._should_run_mx_staged_receiver_path(
+                    checkpoint_loader,
+                    model,
+                    weights_preloaded=weights_preloaded,
+                    loads_draft_weights=loads_draft_weights)
+                if mx_staged_receiver_path:
+                    self._setup_aliases(model)
+                    self._mark_weights_transformed(model)
+                    self._walk_cache_state(model)
                 checkpoint_loader.post_load_publish(
                     model,
                     checkpoint_dir=checkpoint_dir,
                     weights_preloaded=weights_preloaded)
-
-                self._walk_full_post_load(model)
+                if not mx_staged_receiver_path:
+                    self._walk_full_post_load(model)
 
             # TODO(GMS-MOE-LB): when the (MoE, GMS) combination is enabled,
             # `register_weight_slots_after_to_cuda` and `finalize_model`
@@ -838,6 +859,78 @@ class ModelLoader:
             gms_backend.get_source_identity(),
             IdentityCheckPolicy.STRICT,
         )
+
+    @classmethod
+    def _should_run_mx_staged_receiver_path(
+            cls,
+            checkpoint_loader: BaseCheckpointLoader,
+            model: DecoderModelForCausalLM,
+            *,
+            weights_preloaded: bool,
+            loads_draft_weights: bool = False) -> bool:
+        """Whether an MX receiver can skip one-shot weight transforms.
+
+        Production keeps this dormant until model validation and source
+        metadata are explicit. Tests opt in a synthetic model by patching both
+        signals.
+        """
+        if checkpoint_loader.checkpoint_format != "MX" or not weights_preloaded:
+            return False
+
+        method = getattr(type(checkpoint_loader),
+                         'is_post_transform_weights_preloaded', None)
+        if method is None or not checkpoint_loader.is_post_transform_weights_preloaded(
+        ):
+            return False
+
+        if loads_draft_weights:
+            raise RuntimeError(
+                "MX receiver accepted post-transform weights while a separate "
+                "draft-model load is required. This is unsafe because the "
+                "target and draft subgraphs may need different post-load "
+                "transform handling. Disable post-transform MX for this load "
+                "or add an explicit mixed target/draft policy.")
+
+        allowlist_key = (
+            type(model),
+            cls._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        )
+        if allowlist_key in cls._MX_STAGED_RECEIVER_ALLOWLIST:
+            logger.info(
+                "MX receiver using staged post-load path for %s "
+                "(transform protocol v%d).",
+                type(model).__name__,
+                cls._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            )
+            return True
+
+        # TODO(MX-POST-TRANSFORM): When MX can publish transformed bytes,
+        # reject non-allow-listed transfers before P2P or validate the model
+        # and add it to the allow-list. Do not run the full post-load path on
+        # transformed bytes.
+        logger.info(
+            "MX receiver got post-transform weights for %s, but the model is "
+            "not allow-listed for staged post-load transform protocol v%d. "
+            "Running the full post-load path.",
+            type(model).__name__,
+            cls._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        )
+        return False
+
+    @staticmethod
+    def _mark_weights_transformed(model: DecoderModelForCausalLM) -> None:
+        """Mark modules with transform guards as already transformed.
+
+        Post-transform sharing paths skip transform_weights() because the
+        incoming bytes already use the final runtime layout. Preserve that
+        lifecycle state on modules that participate in the transform guard
+        protocol so a later orchestrator/refactor does not treat them as raw
+        checkpoint bytes.
+        """
+        for module in model.modules():
+            if hasattr(module, '_weights_transformed') and not getattr(
+                    module, '_weights_removed', False):
+                module._weights_transformed = True
 
     @staticmethod
     def _setup_aliases(model: DecoderModelForCausalLM) -> None:

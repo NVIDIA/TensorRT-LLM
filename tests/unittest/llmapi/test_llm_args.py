@@ -1858,6 +1858,15 @@ class TestStrictBaseModelArbitraryArgs:
         assert config.max_tokens_in_buffer == 1024
         assert config.kv_transfer_poll_interval_ms == 5000
 
+        # The bounce on/off switch defaults to off (0), accepts a positive size, and rejects
+        # negatives at the Pydantic boundary (ge=0). It is a Python-only field consumed directly by
+        # the v2 transceiver, so it is intentionally not part of _to_pybind().
+        assert config.kv_cache_bounce_size_mb == 0
+        assert CacheTransceiverConfig(
+            kv_cache_bounce_size_mb=384).kv_cache_bounce_size_mb == 384
+        with pytest.raises(pydantic_core._pydantic_core.ValidationError):
+            CacheTransceiverConfig(kv_cache_bounce_size_mb=-1)
+
         # Arbitrary arguments should be rejected
         with pytest.raises(
                 pydantic_core._pydantic_core.ValidationError) as exc_info:
@@ -2906,6 +2915,17 @@ class TestDeepSeekV4SparseAttentionConfig:
 
         with pytest.raises(ValidationError, match="requires SM>=100"):
             DeepSeekV4SparseAttentionConfig(indexer_k_dtype="fp4")
+
+    def test_lowers_to_deepseek_v4_sparse_params(self):
+        config = DeepSeekV4SparseAttentionConfig(compress_ratios=[0, 4, 128])
+
+        sparse_params = config.to_sparse_params()
+        sparse_metadata_params = config.to_sparse_metadata_params()
+
+        assert sparse_params.algorithm == "deepseek_v4"
+        assert sparse_params.compress_ratios == [1, 4, 128]
+        assert sparse_metadata_params.compress_ratios == [1, 4, 128]
+        assert sparse_metadata_params.window_size == 128
 
     @pytest.mark.parametrize("compress_ratios", [[], [-1, 4, 128]])
     def test_invalid_compress_ratios_raise(self, compress_ratios):

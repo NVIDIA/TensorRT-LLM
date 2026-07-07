@@ -253,10 +253,14 @@ def _parse_python_csvs(csv_dir):
     return per_rid  # {rid: [per-rank GB/s]}
 
 
-# Transport in the last column of a UCX_PROTO_INFO=y table row, e.g.
+# Protocol selection in the last column of a UCX_PROTO_INFO=y table row, e.g.
 #   "... | rendezvous zero-copy read from remote | cuda_ipc/cuda |"
-# Group 1 is the transport name, group 2 the memory/device suffix.
-_PROTO_LAST_COL = re.compile(r"\|\s*([a-z0-9_]+)(?:/([a-z0-9_]+))?\s*\|\s*$")
+# Multi-lane configs may contain weighted entries such as
+# `50% on rc_mlx5/mlx5_0:1 and 50% on rc_mlx5/mlx5_1:1`.
+_PROTO_LAST_COL = re.compile(r"\|\s*([^|]+?)\s*\|\s*$")
+_TRANSPORT_TOKEN = re.compile(
+    rf"(?<![a-z0-9_])({'|'.join(map(re.escape, TRANSPORT_TOKENS))})(?![a-z0-9_])"
+)
 # A UCX_PROTO_INFO config header line (one per operation/peer/size-class).
 _CONFIG_HEADER = re.compile(r"cfg#\d")
 # Case boundary the driver prints at the start of each (sweep, combination) case.
@@ -281,6 +285,15 @@ def _is_kv_data_header(line):
     return any(op in line for op in _KV_DATA_OPS)
 
 
+def _proto_row_transports(line):
+    """Return known transports from the final column of a protocol-table row."""
+    match = _PROTO_LAST_COL.search(line)
+    if not match:
+        return []
+    found = set(_TRANSPORT_TOKEN.findall(match.group(1)))
+    return [tok for tok in TRANSPORT_TOKENS if tok in found]
+
+
 class _TransportAcc:
     """Scans a UCX_PROTO_INFO=y table, tracking the current config header.
 
@@ -299,18 +312,17 @@ class _TransportAcc:
         if _CONFIG_HEADER.search(line):
             self._in_kv = _is_kv_data_header(line)
             return
-        m = _PROTO_LAST_COL.search(line)
-        if not m or m.group(1) not in TRANSPORT_TOKENS:
+        transports = _proto_row_transports(line)
+        if not transports:
             return
-        tok = m.group(1)
-        self.any.add(tok)
+        self.any.update(transports)
         if self._in_kv:
-            self.kv.add(tok)
+            self.kv.update(transports)
             if "software emulation" in line:
                 self.sw_emul = True
 
-    def ranked(self):
-        chosen = self.kv or self.any
+    def ranked(self, kv_only=False):
+        chosen = self.kv if kv_only else self.kv or self.any
         out = [t for t in TRANSPORT_TOKENS if t in chosen]
         # Flag host-staged fallback so a tcp KV path isn't read as "fine".
         if self.sw_emul and "tcp" in out:
@@ -318,7 +330,7 @@ class _TransportAcc:
         return out
 
 
-def _parse_proto_info(log_glob):
+def _parse_proto_info(log_glob, kv_only=False):
     """Sweep-level transport(s) UCX selected for the KV transfer.
 
     UCX_PROTO_INFO=y prints a protocol-selection table; the transport that
@@ -327,7 +339,8 @@ def _parse_proto_info(log_glob):
     instead of grepping token substrings anywhere in the log -- the latter also
     matches the `UCX_TLS=...` echo line and small-message/control protocols.
     The KV blocks are large CUDA buffers, so CUDA-memory bulk rows win. Falls
-    back to a substring scan only if no parseable table is present (older logs).
+    back to a substring scan only if no parseable table is present (older logs),
+    unless `kv_only` requires evidence from a CUDA KV-data table.
 
     This is sweep-granular; prefer `_parse_proto_info_by_case` when the per-case
     CTT_CASE_BEGIN markers are present.
@@ -341,9 +354,11 @@ def _parse_proto_info(log_glob):
             continue
         for line in lines:
             acc.feed(line)
-    ranked = acc.ranked()
+    ranked = acc.ranked(kv_only=kv_only)
     if ranked:
         return ranked
+    if kv_only:
+        return []
     # Fallback: no parseable proto table (e.g. older logs) -- substring scan.
     chosen = set()
     for path in glob.glob(log_glob):
@@ -358,14 +373,15 @@ def _parse_proto_info(log_glob):
     return [t for t in TRANSPORT_TOKENS if t in chosen]
 
 
-def _parse_proto_info_by_case(log_glob):
+def _parse_proto_info_by_case(log_glob, kv_only=False):
     """Return {case_idx: [transports]} attributed per (sweep, combination).
 
     Splits each rank log on the driver's `[CTT_CASE_BEGIN] ci=N` markers.
     Transport is constant across a case's request lengths (one transceiver per
     case), so this is the right granularity. Returns {} if no markers are
     present (older logs), so the caller can fall back to sweep-level
-    `_parse_proto_info`.
+    `_parse_proto_info`. When `kv_only` is true, control-table fallbacks are
+    excluded from each case.
     """
     accs = {}  # ci -> _TransportAcc
     saw_marker = False
@@ -387,7 +403,7 @@ def _parse_proto_info_by_case(log_glob):
                 accs[cur].feed(line)
     if not saw_marker:
         return {}
-    return {ci: acc.ranked() for ci, acc in accs.items()}
+    return {ci: acc.ranked(kv_only=kv_only) for ci, acc in accs.items()}
 
 
 # Driver per-request log timestamp, e.g. "[06/03/2026-06:59:17] ... rid=12 ...
@@ -466,13 +482,13 @@ def _parse_proto_info_by_case_ts(log_glob, case_starts):
                 if not in_kv:
                     continue
                 mt = _UCX_TS.search(line)
-                mr = _PROTO_LAST_COL.search(line)
-                if not mt or not mr or mr.group(1) not in TRANSPORT_TOKENS:
+                transports = _proto_row_transports(line)
+                if not mt or not transports:
                     continue
                 ci = _ci_for(float(mt.group(1)))
                 if ci is None:
                     continue
-                kv.setdefault(ci, set()).add(mr.group(1))
+                kv.setdefault(ci, set()).update(transports)
                 if "software emulation" in line:
                     sw[ci] = True
     out = {}
@@ -511,7 +527,7 @@ def _read_status(work_dir, sweep_idx):
     return merged
 
 
-def aggregate(cfg, out_path):
+def aggregate(cfg, out_path, require_kv_transport=False):
     work_dir = cfg["environment"]["work_dir"]
     cases = build_cases(cfg)
     req_lens = cfg["test_matrix"]["request_lengths"]
@@ -537,8 +553,8 @@ def aggregate(cfg, out_path):
         # then sweep-level, for logs lacking per-request timestamps.
         per_case_transport = _parse_proto_info_by_case_ts(log_glob, _case_start_times(log_glob))
         if not per_case_transport:
-            per_case_transport = _parse_proto_info_by_case(log_glob)
-        sweep_transport = _parse_proto_info(log_glob)
+            per_case_transport = _parse_proto_info_by_case(log_glob, kv_only=require_kv_transport)
+        sweep_transport = _parse_proto_info(log_glob, kv_only=require_kv_transport)
         status_map = _read_status(work_dir, sweep_idx)
 
         cpp_bw = _parse_cpp_recv_csvs(gen_csv_dir)
@@ -702,6 +718,11 @@ def main():
     g.add_argument("--aggregate", action="store_true")
     ap.add_argument("--sweep", type=int, default=0)
     ap.add_argument("--out", type=str, default=None)
+    ap.add_argument(
+        "--require-kv-transport",
+        action="store_true",
+        help="accept transport only from CUDA KV-data protocol tables",
+    )
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -711,7 +732,7 @@ def main():
         emit_ucx_env(cfg, args.sweep)
     elif args.aggregate:
         out = args.out or os.path.join(cfg["environment"]["work_dir"], "results.json")
-        aggregate(cfg, out)
+        aggregate(cfg, out, require_kv_transport=args.require_kv_transport)
         print(f"\nWrote {out}", file=sys.stderr)
 
 

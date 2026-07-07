@@ -3673,6 +3673,13 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "Bounded wait interval in milliseconds for polling KV transfer "
         "progress when active transfers block disaggregated admission.")
 
+    kv_cache_bounce_size_mb: int = Field(
+        default=0,
+        ge=0,
+        description=
+        "Per-region size in MiB of the native-disagg KV-cache bounce buffer (one for send, one for recv). Bounce coalesces a request's scattered per-block KV into one contiguous fabric-VMM buffer and issues a single multi-rail NIXL write. The size doubles as the on/off switch: 0 (default) keeps the per-block path, >0 enables bounce at that capacity. Only used by the Python (v2) transceiver."
+    )
+
     def _to_pybind(self):
         return _CacheTransceiverConfig(
             backend=_CacheTransceiverBackendType.from_string(self.backend),

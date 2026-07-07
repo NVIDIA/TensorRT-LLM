@@ -27,7 +27,7 @@ from ..pyexecutor.mamba_cache_manager import BaseMambaCacheManager
 from ..pyexecutor.resource_manager import KVCacheManager
 from ..pyexecutor.trace_log_utils import log_tensor_size
 from ..utils import get_model_extra_attrs
-from .sparse.params import SparseMetadataParams
+from .sparse.params import SkipSoftmaxKernelParams, SparseMetadataParams
 
 try:
     # Transformers v5
@@ -957,6 +957,8 @@ class AttentionForwardArgs:
 
     sparse_prediction: SparsePrediction = field(
         default_factory=SparsePrediction)
+    skip_softmax_kernel_params: SkipSoftmaxKernelParams = field(
+        default_factory=SkipSoftmaxKernelParams)
 
     @property
     def mask_type(self) -> int:

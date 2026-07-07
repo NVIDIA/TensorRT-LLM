@@ -20,7 +20,7 @@ from defs.common import get_free_port_in_ci as get_free_port
 
 from tensorrt_llm.executor.result import GenerationResultBase
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
-from tensorrt_llm.llmapi.llm_args import LlmArgs
+from tensorrt_llm.llmapi.llm_args import LlmArgs, MTPDecodingConfig
 from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
 
 from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
@@ -1503,15 +1503,17 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
 
     @pytest.mark.skip_less_device(2)
+    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
+                             ids=["cache_mgr_v1", "cache_mgr_v2"])
     @skip_pre_hopper
-    def test_kv_cache_v2_nixl_python(self):
-        """Test with use_kv_cache_manager_v2=True, block_reuse=False, backend=NIXL, transceiver_runtime=PYTHON."""
+    def test_kv_cache_v2_nixl_python(self, use_kv_cache_manager_v2):
+        """Test with KV cache manager v1 and v2, block_reuse=False, backend=NIXL, transceiver_runtime=PYTHON."""
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "cuda_graph_config": None,
             "kv_cache_config": {
                 "enable_block_reuse": False,
-                "use_kv_cache_manager_v2": True
+                "use_kv_cache_manager_v2": use_kv_cache_manager_v2
             },
             "cache_transceiver_config": {
                 "backend": "NIXL",
@@ -1523,7 +1525,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             "cuda_graph_config": None,
             "kv_cache_config": {
                 "enable_block_reuse": False,
-                "use_kv_cache_manager_v2": True
+                "use_kv_cache_manager_v2": use_kv_cache_manager_v2
             },
             "cache_transceiver_config": {
                 "backend": "NIXL",
@@ -1568,7 +1570,8 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
-                "backend": "DEFAULT",
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
                 "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 4
@@ -1576,7 +1579,8 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         gen_server_config = {
             "disable_overlap_scheduler": False,
             "cache_transceiver_config": {
-                "backend": "DEFAULT",
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
                 "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 4
@@ -2483,4 +2487,83 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
         ctx_cfg, gen_cfg, disagg_cfg = self._make_configs(use_py_transceiver)
         with launch_disaggregated_llm(disagg_cfg, ctx_cfg, gen_cfg,
                                       self.MODEL_PATH) as llm:
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+
+@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
+@skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(80000)
+class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "zai-org/GLM-5.2"
+    MODEL_PATH = f"{llm_models_root()}/GLM-5.2-NVFP4"
+
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False],
+                             ids=["cache_mgr_v1"])
+    def test_nvfp4_nixl_python(self, use_kv_cache_manager_v2):
+        kv_cache_config = {
+            "free_gpu_memory_fraction": 0.7,
+            "enable_block_reuse": False,
+            "use_kv_cache_manager_v2": use_kv_cache_manager_v2,
+        }
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+        }
+        moe_config = {"backend": "CUTEDSL"}
+        speculative_config = {
+            "decoding_type": "MTP",
+            "max_draft_len": 1,
+        }
+        ctx_server_config = {
+            "tensor_parallel_size": 4,
+            "pipeline_parallel_size": 1,
+            "moe_expert_parallel_size": 4,
+            "enable_attention_dp": True,
+            "disable_overlap_scheduler": True,
+            "enable_chunked_prefill": True,
+            "cuda_graph_config": None,
+            "trust_remote_code": True,
+            "max_seq_len": 8192,
+            "kv_cache_config": kv_cache_config,
+            "moe_config": moe_config,
+            "speculative_config": speculative_config,
+            "cache_transceiver_config": cache_transceiver_config,
+        }
+        gen_server_config = {
+            "tensor_parallel_size": 4,
+            "pipeline_parallel_size": 1,
+            "moe_expert_parallel_size": 4,
+            "enable_attention_dp": True,
+            "disable_overlap_scheduler": False,
+            "enable_chunked_prefill": True,
+            "trust_remote_code": True,
+            "max_seq_len": 8192,
+            "kv_cache_config": kv_cache_config,
+            "moe_config": moe_config,
+            "speculative_config": speculative_config,
+            "cache_transceiver_config": cache_transceiver_config,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      self.MODEL_PATH,
+                                      max_workers=128) as llm:
+            # launch_disaggregated_llm builds a bare LlmArgs for the DuckLLM,
+            # so the specs used for the accuracy reference lookup must be
+            # filled in to match the registered entry (NVFP4 + FP8 KV cache
+            # + MTP).
+            llm.args.quant_config.kv_cache_quant_algo = "FP8"
+            llm.args.speculative_config = MTPDecodingConfig(
+                max_draft_len=speculative_config["max_draft_len"])
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
