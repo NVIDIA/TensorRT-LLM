@@ -143,7 +143,6 @@ examples/test_qwen2audio.py::test_llm_qwen2audio_single_gpu[qwen2_audio_7b_instr
 examples/test_ray.py::test_ray_disaggregated_serving[tp2] SKIP (https://nvbugs/5612502)
 examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-disable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime] SKIP (https://nvbugs/5244570)
 examples/visual_gen/test_visual_gen.py::test_cosmos3_nano_t2i_lpips_against_golden SKIP (https://nvbugs/6418815)
-examples/visual_gen/test_visual_gen.py::test_cosmos3_nano_t2v_lpips_against_golden SKIP (https://nvbugs/6422299)
 examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[attn2d_2x2] SKIP (https://nvbugs/6272644)
 examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[cfg2_ulysses2] SKIP (https://nvbugs/6272644)
 examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[cfg2_ulysses2_attn2d_2x1] SKIP (https://nvbugs/6272644)
