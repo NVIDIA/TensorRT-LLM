@@ -22,7 +22,6 @@ import cutlass.cute as cute
 import cutlass.utils as utils
 import torch
 from cutlass.torch import dtype as torch_dtype
-from cutlass.utils.distributed import atomicAdd
 
 from ..utils import TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents, griddepcontrol_wait
 from .block_scan import block_prefix_sum_kernel
@@ -250,7 +249,6 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         seqlen: cute.Tensor,
         output_indices: cute.Tensor,
         output_values: cute.Tensor,
-        enable_persistent_dynamic_scheduling: cutlass.Constexpr[bool] = False,
     ):
         """CuTe DSL implementation of TopK kernel based on radix-based filter algorithm."""
         griddepcontrol_wait()
@@ -327,185 +325,86 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             byte_alignment=128,
         )
 
-        if cutlass.const_expr(not enable_persistent_dynamic_scheduling):
-            # Thread and block indexing
-            bidx, bidy, _ = cute.arch.block_idx()
+        # Thread and block indexing
+        bidx, bidy, _ = cute.arch.block_idx()
 
-            if cutlass.const_expr(self.enable_dynamic_multi_cta):
-                # 2D grid with early exit: bidx = row_id, bidy = chunk_id.
-                # Each CTA computes how many chunks its row actually needs
-                # from seqlen and exits early if bidy >= num_needed_ctas.
-                # This avoids prefix sum + binary search overhead entirely.
-                num_rows_val = seqlen.shape[0] * self.next_n
+        if cutlass.const_expr(self.enable_dynamic_multi_cta):
+            # 2D grid with early exit: bidx = row_id, bidy = chunk_id.
+            # Each CTA computes how many chunks its row actually needs
+            # from seqlen and exits early if bidy >= num_needed_ctas.
+            # This avoids prefix sum + binary search overhead entirely.
+            num_rows_val = seqlen.shape[0] * self.next_n
 
-            row_start = 0
-            row_end = 0
-            length = 0
-            seq_len = 0
+        row_start = 0
+        row_end = 0
+        length = 0
+        seq_len = 0
 
-            if not cutlass.const_expr(self.merge_blocks):
-                seq_len = seqlen[bidx // self.next_n]
-                row_end = seq_len - self.next_n + (bidx % self.next_n) + 1
-                length = row_end - row_start
+        if not cutlass.const_expr(self.merge_blocks):
+            seq_len = seqlen[bidx // self.next_n]
+            row_end = seq_len - self.next_n + (bidx % self.next_n) + 1
+            length = row_end - row_start
 
-            if cutlass.const_expr(self.enable_multi_cta):
-                # update row_start and row_end.
-                row_start = self.chunk_size_per_cta * bidy
-                row_end = min(row_end, row_start + self.chunk_size_per_cta)
-                length = row_end - row_start
-                output_indices = cute.flat_divide(output_indices, (1, self.top_k))[
-                    0, None, bidx, bidy
-                ]
-                output_values = cute.flat_divide(output_values, (1, self.top_k))[
-                    0, None, bidx, bidy
-                ]
+        if cutlass.const_expr(self.enable_multi_cta):
+            # update row_start and row_end.
+            row_start = self.chunk_size_per_cta * bidy
+            row_end = min(row_end, row_start + self.chunk_size_per_cta)
+            length = row_end - row_start
+            output_indices = cute.flat_divide(output_indices, (1, self.top_k))[0, None, bidx, bidy]
+            output_values = cute.flat_divide(output_values, (1, self.top_k))[0, None, bidx, bidy]
 
-            if cutlass.const_expr(self.merge_blocks):
-                if cutlass.const_expr(self.varlen_merge_input):
-                    # Varlen merge: compute per-row valid length from seqlen.
-                    _batch = bidx // self.next_n
-                    _off = bidx % self.next_n
-                    _eff = seqlen[_batch] - self.next_n + _off + 1
-                    _num_ctas = (_eff + self.chunk_size_per_cta - 1) // self.chunk_size_per_cta
-                    if _num_ctas < 1:
-                        _num_ctas = 1
-                    merge_width = _num_ctas * self.top_k
-                    row_end = merge_width
-                    length = merge_width
-                else:
-                    # Existing fixed-length path
-                    # Note, after 1st kernel, the output is fix-lenght.
-                    # Note, for merge_block kernels, need to ensure max_num_cols is the same as bucketed_num_cols.
-                    row_end = self.max_num_cols
-                    length = self.max_num_cols
+        if cutlass.const_expr(self.merge_blocks):
+            if cutlass.const_expr(self.varlen_merge_input):
+                # Varlen merge: compute per-row valid length from seqlen.
+                _batch = bidx // self.next_n
+                _off = bidx % self.next_n
+                _eff = seqlen[_batch] - self.next_n + _off + 1
+                _num_ctas = (_eff + self.chunk_size_per_cta - 1) // self.chunk_size_per_cta
+                if _num_ctas < 1:
+                    _num_ctas = 1
+                merge_width = _num_ctas * self.top_k
+                row_end = merge_width
+                length = merge_width
+            else:
+                # Existing fixed-length path
+                # Note, after 1st kernel, the output is fix-lenght.
+                # Note, for merge_block kernels, need to ensure max_num_cols is the same as bucketed_num_cols.
+                row_end = self.max_num_cols
+                length = self.max_num_cols
 
-            # Skip CTAs that exceed this row's actual chunk count.
-            _should_run = True
-            if cutlass.const_expr(self.enable_dynamic_multi_cta):
-                _batch_check = bidx // self.next_n
-                _off_check = bidx % self.next_n
-                _eff_check = seqlen[_batch_check] - self.next_n + _off_check + 1
-                _needed_ctas = (_eff_check + self.chunk_size_per_cta - 1) // self.chunk_size_per_cta
-                if _needed_ctas < 1:
-                    _needed_ctas = 1
-                _should_run = (bidx < num_rows_val) and (bidy < _needed_ctas)
+        # Skip CTAs that exceed this row's actual chunk count.
+        _should_run = True
+        if cutlass.const_expr(self.enable_dynamic_multi_cta):
+            _batch_check = bidx // self.next_n
+            _off_check = bidx % self.next_n
+            _eff_check = seqlen[_batch_check] - self.next_n + _off_check + 1
+            _needed_ctas = (_eff_check + self.chunk_size_per_cta - 1) // self.chunk_size_per_cta
+            if _needed_ctas < 1:
+                _needed_ctas = 1
+            _should_run = (bidx < num_rows_val) and (bidy < _needed_ctas)
 
-            if _should_run:
-                self.filtered_topk_kernel_per_row(
-                    input,
-                    indices,
-                    extra_buffer,
-                    output_indices,
-                    output_values,
-                    row_start,
-                    length,
-                    bidx,
-                    s_histogram,
-                    s_counter,
-                    s_threshold_bin_id,
-                    s_num_input,
-                    g_num_input,
-                    s_indices,
-                    s_input_idx,
-                    s_last_remain,
-                    num_warps,
-                    s_warp_sums,
-                    s_overflow_flag,
-                )
-        else:
-            num_rows = input.shape[0]
-            tidx, _, _ = cute.arch.thread_idx()
-            bidx, _, _ = cute.arch.block_idx()
-
-            row_start = cutlass.Int32(0)
-            row_end = cutlass.Int32(0)
-            length = cutlass.Int32(0)
-            seq_len = cutlass.Int32(0)
-
-            # Persistent dynamic scheduler.
-            # First task: use bidx directly (no atomic needed).
-            # Subsequent tasks: use atomicAdd (counter pre-initialized
-            # to grid_size on host, so values start from grid_size).
-            s_row_id = smem.allocate_tensor(
-                element_type=cute.Int32,
-                layout=cute.make_ordered_layout((1,), order=(0,)),
-                byte_alignment=128,
+        if _should_run:
+            self.filtered_topk_kernel_per_row(
+                input,
+                indices,
+                extra_buffer,
+                output_indices,
+                output_values,
+                row_start,
+                length,
+                bidx,
+                s_histogram,
+                s_counter,
+                s_threshold_bin_id,
+                s_num_input,
+                g_num_input,
+                s_indices,
+                s_input_idx,
+                s_last_remain,
+                num_warps,
+                s_warp_sums,
+                s_overflow_flag,
             )
-
-            # First task: deterministic assignment by block index.
-            task_id = bidx
-            if task_id < num_rows:
-                row_start = 0
-                seq_len = seqlen[task_id // self.next_n]
-                row_end = seq_len - self.next_n + (task_id % self.next_n) + 1
-                length = row_end - row_start
-
-                self.filtered_topk_kernel_per_row(
-                    input,
-                    indices,
-                    extra_buffer,
-                    output_indices,
-                    output_values,
-                    row_start,
-                    length,
-                    task_id,
-                    s_histogram,
-                    s_counter,
-                    s_threshold_bin_id,
-                    s_num_input,
-                    g_num_input,
-                    s_indices,
-                    s_input_idx,
-                    s_last_remain,
-                    num_warps,
-                    s_warp_sums,
-                    s_overflow_flag,
-                )
-
-            # Subsequent tasks: dynamic work stealing via atomic counter.
-            # Counter starts at 0, so offset by grid_size to skip
-            # the first-round tasks already handled by bidx.
-            grid_size_x, _, _ = cute.arch.grid_dim()
-            work_remaining = task_id < num_rows
-            while work_remaining:
-                if tidx == 0:
-                    s_row_id[0] = (
-                        atomicAdd(g_global_counter.iterator, cutlass.Int32(1)) + grid_size_x
-                    )
-                cute.arch.barrier()
-
-                row_id = s_row_id[0]
-                has_work = row_id < num_rows
-
-                if has_work:
-                    task_id = row_id
-                    row_start = 0
-                    seq_len = seqlen[task_id // self.next_n]
-                    row_end = seq_len - self.next_n + (task_id % self.next_n) + 1
-                    length = row_end - row_start
-
-                    self.filtered_topk_kernel_per_row(
-                        input,
-                        indices,
-                        extra_buffer,
-                        output_indices,
-                        output_values,
-                        row_start,
-                        length,
-                        task_id,
-                        s_histogram,
-                        s_counter,
-                        s_threshold_bin_id,
-                        s_num_input,
-                        g_num_input,
-                        s_indices,
-                        s_input_idx,
-                        s_last_remain,
-                        num_warps,
-                        s_warp_sums,
-                        s_overflow_flag,
-                    )
-                work_remaining = has_work
 
         griddepcontrol_launch_dependents()
 
@@ -520,23 +419,11 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         output_indices,
         output_values,
         stream: cuda.CUstream,
-        enable_persistent_dynamic_scheduling: cutlass.Constexpr[bool] = False,
         min_blocks_per_mp: cutlass.Constexpr[int] = 1,
     ):
         """Host function for the filtered topk kernel"""
-        # now we don't support it.
-        assert not (self.enable_multi_cta and enable_persistent_dynamic_scheduling), (
-            "enable_multi_cta and enable_persistent_dynamic_scheduling cannot both be True"
-        )
-
         num_rows = input_values.shape[0]
-        # each cta processes one row of input.
-        if cutlass.const_expr(self.enable_dynamic_multi_cta):
-            blocks = (num_rows, self.num_ctas_per_row, 1)
-        elif cutlass.const_expr(not enable_persistent_dynamic_scheduling):
-            blocks = (num_rows, self.num_ctas_per_row, 1)
-        else:
-            blocks = (min(self.num_sms * min_blocks_per_mp, num_rows), self.num_ctas_per_row, 1)
+        blocks = (num_rows, self.num_ctas_per_row, 1)
 
         self.filtered_topk_kernel(
             input_values,
@@ -546,7 +433,6 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             seqlen,
             output_indices,
             output_values,
-            enable_persistent_dynamic_scheduling,
         ).launch(
             grid=blocks,
             block=(self.num_threads_per_cta, 1, 1),
@@ -592,7 +478,6 @@ def cute_dsl_topk_wrapper(
     top_k,
     next_n,
     return_val=True,
-    load_balance=False,
     num_copy_bits=256,
     overflow_policy: str = "REREAD",
 ):
@@ -603,7 +488,6 @@ def cute_dsl_topk_wrapper(
 
     # TODO: need to get the num_sms from the device.
     large_occupancy = num_rows > 148
-    assert not load_balance
 
     # Note: don't forget num_cols, which means the maximum columns.
     key = (
@@ -613,7 +497,6 @@ def cute_dsl_topk_wrapper(
         next_n,
         return_val,
         num_copy_bits,
-        load_balance,
         large_occupancy,
         overflow_policy,
     )
@@ -677,8 +560,8 @@ def cute_dsl_topk_wrapper(
             output_indices_fake,
             output_values_fake,
             stream=fake_stream,
-            enable_persistent_dynamic_scheduling=load_balance,
-            min_blocks_per_mp=1,  # TODO: do we need this one?
+            # TODO: check the perf.
+            min_blocks_per_mp=4 if large_occupancy else 1,
             options="--enable-tvm-ffi",
         )
         compiled_filter_topk_dict[key] = compiled_kernel
@@ -719,7 +602,6 @@ def cute_dsl_topk_multi_cta_wrapper(
     top_k,
     next_n,
     return_val=True,
-    load_balance=False,
     num_copy_bits=256,
     chunk_size_per_cta=16384,
 ):
@@ -730,7 +612,6 @@ def cute_dsl_topk_multi_cta_wrapper(
 
     # TODO: need to get the num_sms from the device.
     large_occupancy = num_rows > 148
-    assert not load_balance
 
     # Note: don't forget num_cols, which means the maximum columns.
     enable_multi_cta = True
@@ -742,7 +623,6 @@ def cute_dsl_topk_multi_cta_wrapper(
         next_n,
         return_val,
         num_copy_bits,
-        load_balance,
         large_occupancy,
         enable_multi_cta,
         chunk_size_per_cta,
@@ -811,7 +691,6 @@ def cute_dsl_topk_multi_cta_wrapper(
             first_kernel_output_indices_fake,
             first_kernel_output_values_fake,
             stream=fake_stream,
-            enable_persistent_dynamic_scheduling=load_balance,
             min_blocks_per_mp=1,
             options="--enable-tvm-ffi",
         )
@@ -856,7 +735,6 @@ def cute_dsl_topk_multi_cta_wrapper(
             output_indices_fake,
             output_values_fake,
             stream=fake_stream,
-            enable_persistent_dynamic_scheduling=load_balance,
             min_blocks_per_mp=1,
             options="--enable-tvm-ffi",
         )
@@ -936,7 +814,6 @@ def run_filtered_topk_decode(
     max_num_cols,
     top_k,
     next_n,
-    load_balance: bool = False,
     num_copy_bits=256,
     return_val=True,
     large_occupancy=False,
@@ -965,7 +842,6 @@ def run_filtered_topk_decode(
         print(f"    next_n: {next_n}")
         print(f"    max_num_cols: {max_num_cols}")
         print(f"    top_k: {top_k}")
-        print(f"    load_balance: {load_balance}")
         print(f"    num_copy_bits: {num_copy_bits}")
         print(f"    return_val: {return_val}")
         print(f"    large_occupancy: {large_occupancy}")
@@ -1047,7 +923,6 @@ def run_filtered_topk_decode(
         output_indices_fake,
         output_values_fake,
         stream=fake_stream,
-        enable_persistent_dynamic_scheduling=load_balance,
         # TODO: confirm this parameter.
         min_blocks_per_mp=4 if large_occupancy else 1,
         options="--enable-tvm-ffi",
@@ -1114,68 +989,61 @@ def run_filtered_topk_decode(
         if print_verbose:
             print("PASSED")
 
-        if not load_balance:
-            wrapper_output_indices, wrapper_output_values = cute_dsl_topk_wrapper(
+        wrapper_output_indices, wrapper_output_values = cute_dsl_topk_wrapper(
+            input_torch,
+            seq_lens,
+            top_k,
+            next_n,
+            return_val,
+            num_copy_bits,
+        )
+        wrapper_output_val_sorted = torch.sort(
+            wrapper_output_values.cpu(), dim=1, descending=True
+        ).values
+        output_val_ref_sorted = torch.sort(output_values_torch.cpu(), dim=1, descending=True).values
+
+        assert torch.allclose(wrapper_output_val_sorted, output_val_ref_sorted, atol=1e-5), (
+            "CUDA top_k_per_row results don't match wrapper"
+        )
+        if print_verbose:
+            print("Wrapper: PASSED")
+
+        # test multi-cta version.
+        wrapper_output_indices_multi_cta, wrapper_output_values_multi_cta = (
+            cute_dsl_topk_multi_cta_wrapper(
                 input_torch,
                 seq_lens,
                 top_k,
                 next_n,
                 return_val,
-                load_balance,
                 num_copy_bits,
+                chunk_size_per_cta=8192,
             )
-            wrapper_output_val_sorted = torch.sort(
-                wrapper_output_values.cpu(), dim=1, descending=True
-            ).values
-            output_val_ref_sorted = torch.sort(
-                output_values_torch.cpu(), dim=1, descending=True
-            ).values
+        )
+        wrapper_output_val_sorted_multi_cta = torch.sort(
+            wrapper_output_values_multi_cta.cpu(), dim=1, descending=True
+        ).values
+        output_val_ref_sorted = torch.sort(output_values_torch.cpu(), dim=1, descending=True).values
 
-            assert torch.allclose(wrapper_output_val_sorted, output_val_ref_sorted, atol=1e-5), (
-                "CUDA top_k_per_row results don't match wrapper"
-            )
-            if print_verbose:
-                print("Wrapper: PASSED")
-
-            # test multi-cta version.
-            wrapper_output_indices_multi_cta, wrapper_output_values_multi_cta = (
-                cute_dsl_topk_multi_cta_wrapper(
-                    input_torch,
-                    seq_lens,
-                    top_k,
-                    next_n,
-                    return_val,
-                    load_balance,
-                    num_copy_bits,
-                    chunk_size_per_cta=8192,
-                )
-            )
-            wrapper_output_val_sorted_multi_cta = torch.sort(
-                wrapper_output_values_multi_cta.cpu(), dim=1, descending=True
-            ).values
-            output_val_ref_sorted = torch.sort(
-                output_values_torch.cpu(), dim=1, descending=True
-            ).values
-
-            for i in range(num_gen_tokens):
-                if not torch.allclose(
-                    wrapper_output_val_sorted_multi_cta[i, :],
-                    output_val_ref_sorted[i, :],
-                    atol=1e-5,
-                ):
-                    print(f"FAILED for row_id: {i}")
-                    print(
-                        f"wrapper_output_val_sorted_multi_cta: {wrapper_output_val_sorted_multi_cta[i]}"
-                    )
-                    print(f"output_values_torch: {output_val_ref_sorted[i]}")
-                    break
-            assert torch.allclose(
-                wrapper_output_val_sorted_multi_cta,
-                output_val_ref_sorted.cpu(),
+        for i in range(num_gen_tokens):
+            if not torch.allclose(
+                wrapper_output_val_sorted_multi_cta[i, :],
+                output_val_ref_sorted[i, :],
                 atol=1e-5,
-            ), "CUDA top_k_per_row results don't match wrapper multi-cta"
-            if print_verbose:
-                print("Wrapper multi-cta: PASSED")
+            ):
+                print(f"FAILED for row_id: {i}")
+                print(
+                    f"wrapper_output_val_sorted_multi_cta: {wrapper_output_val_sorted_multi_cta[i]}"
+                )
+                print(f"output_values_torch: {output_val_ref_sorted[i]}")
+                break
+        assert torch.allclose(
+            wrapper_output_val_sorted_multi_cta,
+            output_val_ref_sorted.cpu(),
+            atol=1e-5,
+        ), "CUDA top_k_per_row results don't match wrapper multi-cta"
+        if print_verbose:
+            print("Wrapper multi-cta: PASSED")
 
     if do_benchmark:
 
@@ -1208,28 +1076,8 @@ def run_filtered_topk_decode(
                 output_values_tensor,
             )
 
-        workspace_count = 1
-        if use_cold_l2:
-            one_workspace_bytes = (
-                input_torch.numel() * input_torch.element_size()
-                + row_starts.numel() * row_starts.element_size()
-                + row_ends.numel() * row_ends.element_size()
-                + seq_lens.numel() * seq_lens.element_size()
-                + output_indices_torch.numel() * output_indices_torch.element_size()
-                + (
-                    output_values_torch.numel() * output_values_torch.element_size()
-                    if return_val
-                    else 0
-                )
-            )
-            workspace_count = cute.testing.get_workspace_count(
-                one_workspace_bytes, warmup_iterations, iterations
-            )
-            # Note: when load-balance is enabled, we need to memset g_global_counter_torch to 0 for each iteration.
-            # without this, the kernel will accumulate the global counter from previous iterations.
-            # Here, we war the memset by setting the workspace_count to the sum of warmup_iterations and iterations.
-            workspace_count = iterations + warmup_iterations
-            print("workspace_count: ", workspace_count)
+        workspace_count = iterations + warmup_iterations if use_cold_l2 else 1
+        print("workspace_count: ", workspace_count)
         torch_stream = torch.cuda.Stream()
         benchmark_stream = cuda.CUstream(torch_stream.cuda_stream)
         time = cute.testing.benchmark(
@@ -1253,7 +1101,6 @@ def run_topk_decode(
     max_num_cols: int,
     top_k: int,
     next_n: int,
-    load_balance: bool = False,
     num_copy_bits: int = 256,
     return_val: bool = True,
     large_occupancy: bool = False,
@@ -1269,7 +1116,6 @@ def run_topk_decode(
         max_num_cols,
         top_k,
         next_n,
-        load_balance,
         num_copy_bits,
         return_val,
         large_occupancy,
@@ -1303,12 +1149,6 @@ if __name__ == "__main__":
     parser.add_argument("--max_num_cols", type=int, default=4096, help="max_num_cols")
     parser.add_argument("--next_n", type=int, default=3, help="next_n")
     parser.add_argument("--top_k", type=int, default=2048, help="top_k")
-    parser.add_argument(
-        "--load_balance",
-        action="store_true",
-        default=False,
-        help="Use load balance for varlen optimization",
-    )
     parser.add_argument(
         "--num_copy_bits",
         type=int,
@@ -1350,7 +1190,6 @@ if __name__ == "__main__":
         max_num_cols=args.max_num_cols,
         top_k=args.top_k,
         next_n=args.next_n,
-        load_balance=args.load_balance,
         num_copy_bits=args.num_copy_bits,
         return_val=args.return_val,
         large_occupancy=args.large_occupancy,

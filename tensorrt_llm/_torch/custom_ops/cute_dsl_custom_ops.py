@@ -4799,7 +4799,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Attributes:
             kernel_cache: Class-level dict mapping configuration tuples to compiled kernels.
                          Keys are (dtype, num_cols, top_k, next_n, return_val, num_copy_bits,
-                         load_balance, large_occupancy).
+                         large_occupancy, overflow_policy).
 
         Note:
             - Requires Blackwell architecture (SM100+)
@@ -4812,8 +4812,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         @classmethod
         def _compile(cls, dtype, bucketed_num_cols, top_k, next_n, return_val,
-                     num_copy_bits, load_balance, large_occupancy,
-                     overflow_policy):
+                     num_copy_bits, large_occupancy, overflow_policy):
             """Compile and cache a single-CTA top-k kernel for the given config."""
             key = (
                 dtype,
@@ -4822,7 +4821,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 next_n,
                 return_val,
                 num_copy_bits,
-                load_balance,
                 large_occupancy,
                 overflow_policy,
             )
@@ -4877,11 +4875,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 num_sms=_get_num_sms(),
                 overflow_policy=overflow_policy,
             )
-            if load_balance:
-                g_global_counter_fake = cute.runtime.make_fake_compact_tensor(
-                    cutlass.Int32, (1, ), stride_order=(0, ))
-            else:
-                g_global_counter_fake = None
+            g_global_counter_fake = None
             compiled_kernel = cute.compile(
                 filtered_topk_func,
                 input_fake,
@@ -4892,7 +4886,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 output_indices_fake,
                 output_values_fake,
                 stream=fake_stream,
-                enable_persistent_dynamic_scheduling=load_balance,
                 min_blocks_per_mp=4 if large_occupancy else 1,
                 options="--enable-tvm-ffi",
             )
@@ -4907,7 +4900,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             next_n: int,
             return_val: bool = False,
             num_copy_bits: int = 256,
-            load_balance: bool = False,
             overflow_policy: str = "REREAD",
             output_indices: Optional[torch.Tensor] = None,
         ):
@@ -4927,7 +4919,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 next_n,
                 return_val,
                 num_copy_bits,
-                load_balance,
                 large_occupancy,
                 overflow_policy,
             )
@@ -4967,16 +4958,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 buffer_torch = buffer_torch[:, :, :num_cols]
             else:
                 buffer_torch = None
-            # Prepare global counter for persistent dynamic scheduling
-            if load_balance:
-                g_global_counter_torch = cls.buffers.get_buffer(
-                    [1],
-                    torch.int32,
-                    buffer_name="single_cta_g_global_counter",
-                    reserve_buffer=reserve)
-                g_global_counter_torch.zero_()
-            else:
-                g_global_counter_torch = None
+            g_global_counter_torch = None
 
             # Execute kernel (TVM FFI uses env stream automatically)
             compiled_kernel(
@@ -5000,7 +4982,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         top_k: int,
         next_n: int = 1,
         num_copy_bits: int = 256,
-        load_balance: bool = False,
     ) -> torch.Tensor:
         """CuteDSL-based Top-K selection optimized for Blackwell decode phase.
 
@@ -5010,7 +4991,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             top_k: Number of top elements to select (max 2048)
             next_n: Number of candidates per sequence (for speculative decoding)
             num_copy_bits: Number of bits for vectorized memory copy (128 or 256)
-            load_balance: Enable persistent dynamic scheduling for load balancing
 
         Returns:
             indices: Top-k indices [batch_size * next_n, top_k]
@@ -5060,7 +5040,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             next_n=next_n,
             return_val=False,  # Only return indices
             num_copy_bits=num_copy_bits,
-            load_balance=load_balance,
         )
         return indices
 
@@ -5071,7 +5050,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         top_k: int,
         next_n: int = 1,
         num_copy_bits: int = 256,
-        load_balance: bool = False,
     ):
         num_rows = input_values.shape[0]
         input_values.dtype
@@ -5327,7 +5305,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      next_n,
                      return_val,
                      num_copy_bits,
-                     load_balance,
                      large_occupancy,
                      chunk_size_per_cta,
                      num_ctas_per_row,
@@ -5339,7 +5316,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 next_n,
                 return_val,
                 num_copy_bits,
-                load_balance,
                 large_occupancy,
                 chunk_size_per_cta,
                 num_ctas_per_row,
@@ -5406,7 +5382,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 first_kernel_output_indices_fake,
                 first_kernel_output_values_fake,
                 stream=fake_stream,
-                enable_persistent_dynamic_scheduling=load_balance,
                 min_blocks_per_mp=1,
                 options="--enable-tvm-ffi",
             )
@@ -5454,7 +5429,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 output_indices_fake,
                 output_values_fake,
                 stream=fake_stream,
-                enable_persistent_dynamic_scheduling=load_balance,
                 min_blocks_per_mp=1,
                 options="--enable-tvm-ffi",
             )
@@ -5481,7 +5455,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             num_sms = _get_num_sms()
             large_occupancy = num_rows > num_sms
-            load_balance = False
 
             num_ctas_per_row = math.ceil(num_cols / chunk_size_per_cta)
             merge_cols = num_ctas_per_row * top_k
@@ -5492,7 +5465,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 next_n,
                 return_val,
                 num_copy_bits,
-                load_balance,
                 large_occupancy,
                 chunk_size_per_cta,
                 num_ctas_per_row,
@@ -6957,8 +6929,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     next_n,
                     return_val,
                     num_copy_bits,
-                    load_balance=False,
                     large_occupancy=large_occupancy,
+                    overflow_policy="REREAD",
                 )
 
         if single_pass_multi_cta:
@@ -7030,7 +7002,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         next_n,
                         return_val,
                         num_copy_bits,
-                        load_balance=False,
                         large_occupancy=large_occupancy,
                         chunk_size_per_cta=chunk_size_per_cta,
                         num_ctas_per_row=num_ctas_per_row,
