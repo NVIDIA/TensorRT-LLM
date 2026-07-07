@@ -72,6 +72,7 @@ l0_h100:
   - unittest/disaggregated/test_messenger.py
   - unittest/disaggregated/test_extractor.py
   - unittest/disaggregated/test_peer.py
+  - unittest/disaggregated/test_bounce.py
   - unittest/disaggregated/region/test_block.py
   - unittest/disaggregated/region/test_aux.py
   - unittest/disaggregated/region/test_page.py
