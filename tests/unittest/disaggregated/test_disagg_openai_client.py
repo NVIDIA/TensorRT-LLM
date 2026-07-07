@@ -18,6 +18,7 @@ import aiohttp
 import pytest
 
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
+from tensorrt_llm.serve.disagg_auth import INTERNAL_DISAGG_AUTH_HEADER
 from tensorrt_llm.serve.openai_client import OpenAIHttpClient
 from tensorrt_llm.serve.openai_protocol import (
     CompletionRequest,
@@ -115,6 +116,75 @@ class TestOpenAIHttpClient:
         assert client._role == ServerRole.GENERATION
         assert client._session == mock_session
         assert client._max_retries == 5
+
+    @pytest.mark.asyncio
+    async def test_generation_request_with_opaque_state_is_signed(self, mock_router, mock_session):
+        """Opaque state forwarded to generation workers gets internal auth."""
+        from prometheus_client.registry import REGISTRY
+
+        REGISTRY._names_to_collectors = {}
+        REGISTRY._collector_to_names = {}
+        client = OpenAIHttpClient(
+            router=mock_router,
+            role=ServerRole.GENERATION,
+            timeout_secs=300,
+            max_retries=0,
+            session=mock_session,
+            internal_disagg_auth_key="secret",
+        )
+        mock_response = self.dummy_response()
+        mock_http_response = AsyncMock()
+        mock_http_response.status = 200
+        mock_http_response.headers = {"Content-Type": "application/json"}
+        mock_http_response.json = AsyncMock(return_value=mock_response.model_dump())
+        mock_http_response.__aenter__ = AsyncMock(return_value=mock_http_response)
+        mock_http_response.__aexit__ = AsyncMock()
+        mock_session.post.return_value = mock_http_response
+
+        request = CompletionRequest(
+            model="test-model",
+            prompt="Hello, world!",
+            stream=False,
+            disaggregated_params=DisaggregatedParams(
+                request_type="generation_only",
+                encoded_opaque_state="b3BhcXVl",
+            ),
+        )
+
+        await client.send_request(request)
+
+        headers = mock_session.post.call_args.kwargs["headers"]
+        assert headers[INTERNAL_DISAGG_AUTH_HEADER].startswith("sha256=")
+
+    @pytest.mark.asyncio
+    async def test_generation_request_with_opaque_state_requires_key(
+        self, mock_router, mock_session
+    ):
+        """The proxy refuses to forward opaque state without auth configured."""
+        from prometheus_client.registry import REGISTRY
+
+        REGISTRY._names_to_collectors = {}
+        REGISTRY._collector_to_names = {}
+        client = OpenAIHttpClient(
+            router=mock_router,
+            role=ServerRole.GENERATION,
+            timeout_secs=300,
+            max_retries=0,
+            session=mock_session,
+        )
+        request = CompletionRequest(
+            model="test-model",
+            prompt="Hello, world!",
+            stream=False,
+            disaggregated_params=DisaggregatedParams(
+                request_type="generation_only",
+                encoded_opaque_state="b3BhcXVl",
+            ),
+        )
+
+        with pytest.raises(ValueError, match="requires authenticated"):
+            await client.send_request(request)
+        mock_session.post.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_non_streaming_completion_request(

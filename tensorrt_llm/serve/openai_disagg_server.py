@@ -154,7 +154,8 @@ class OpenAIDisaggServer:
         node_id = self._config.node_id
         client = OpenAIHttpClient(
             router, role, self._req_timeout_secs, max_retries,
-            disagg_id_generator=lambda: get_global_disagg_request_id(node_id))
+            disagg_id_generator=lambda: get_global_disagg_request_id(node_id),
+            internal_disagg_auth_key=self._config.internal_request_auth_key)
         self._perf_metrics_collector.add_client(client)
         return client
 
