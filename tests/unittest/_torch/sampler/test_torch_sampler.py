@@ -2618,3 +2618,64 @@ class TestBatchedSampling:
                 input_offset += steps
 
         run_test_with_warmup(_uut_provider, max_sync_s=0.2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+class TestApplyBadWords:
+    """Unit tests for TorchSampler._apply_bad_words.
+
+    Single-token words are banned unconditionally; multi-token words ban their
+    final token only when the token suffix (prompt + generated) matches the
+    word prefix.
+    """
+
+    VOCAB = 16
+
+    class MockLlmRequest:
+        """Minimal stub exposing the attributes _apply_bad_words reads."""
+
+        def __init__(self, tokens, *, bad_words=None, prompt_len=0):
+            # get_tokens(beam) returns the full token sequence (prompt +
+            # generated); py_orig_prompt_len marks where generation starts.
+            self.py_orig_prompt_len = prompt_len
+            self._tokens = list(tokens)
+            self.py_bad_words = bad_words
+
+        def get_tokens(self, beam_idx):
+            return self._tokens
+
+    def _run(self, requests, num_steps, num_beams):
+        total_rows = sum(s * b for s, b in zip(num_steps, num_beams))
+        logits = torch.zeros(total_rows, self.VOCAB, device="cuda")
+        TorchSampler._apply_bad_words(
+            logits, cast(list[LlmRequest], requests), num_steps, num_beams
+        )
+        return logits
+
+    @staticmethod
+    def _banned_cols(logits_row):
+        return set(torch.nonzero(torch.isinf(logits_row)).flatten().tolist())
+
+    def test_single_token_unconditional(self):
+        req = self.MockLlmRequest(tokens=[3, 4], bad_words=[[7]])
+        logits = self._run([req], num_steps=[1], num_beams=[1])
+        assert self._banned_cols(logits[0]) == {7}
+
+    def test_multi_token_prefix_hit(self):
+        # tokens end with [9]; word [9, 2] -> ban token 2.
+        req = self.MockLlmRequest(tokens=[1, 9], bad_words=[[9, 2]])
+        logits = self._run([req], num_steps=[1], num_beams=[1])
+        assert self._banned_cols(logits[0]) == {2}
+
+    def test_multi_token_prefix_miss(self):
+        # tokens end with [3]; word [9, 2] prefix [9] does not match.
+        req = self.MockLlmRequest(tokens=[1, 3], bad_words=[[9, 2]])
+        logits = self._run([req], num_steps=[1], num_beams=[1])
+        assert self._banned_cols(logits[0]) == set()
+
+    def test_multi_token_prefix_in_prompt(self):
+        # The prefix [9] lies in the prompt (nothing generated yet); the word
+        # [9, 2] must still ban token 2.
+        req = self.MockLlmRequest(tokens=[1, 9], bad_words=[[9, 2]], prompt_len=2)
+        logits = self._run([req], num_steps=[1], num_beams=[1])
+        assert self._banned_cols(logits[0]) == {2}

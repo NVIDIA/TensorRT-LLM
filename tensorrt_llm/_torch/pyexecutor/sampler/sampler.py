@@ -4339,6 +4339,74 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             logits.index_put_((row_idx, col_idx), neg_inf, accumulate=False)
 
     @staticmethod
+    @torch.inference_mode()
+    def _apply_bad_words(
+        logits: torch.Tensor,
+        requests: list[LlmRequest],
+        num_steps: list[int],
+        num_beams: list[int],
+    ) -> None:
+        """Inplace ban "bad words" by masking their final token's logit to -inf.
+
+        A single-token word is banned unconditionally; a multi-token word
+        ``[t0, ..., t_{k-1}]`` bans its final token ``t_{k-1}`` only when the
+        ``k-1`` most recently generated tokens exactly match the prefix
+        ``[t0, ..., t_{k-2}]``.
+
+        Args:
+            logits: Flattened ``[total_rows, vocab]`` logits; rows are packed per
+                request as ``num_steps * num_beams`` consecutive entries, in
+                beam-major / step-minor order (same layout as
+                ``_apply_min_length_penalty``). Modified in-place.
+            requests: The requests, aligned with the packed logits rows.
+            num_steps: Number of steps per request.
+            num_beams: Number of beams per request.
+        """
+        rows: list[int] = []
+        cols: list[int] = []
+        current_offset = 0
+        for index, r in enumerate(requests):
+            request_offset = current_offset
+            # Advance to the next request's rows before any early continue.
+            current_offset += num_steps[index] * num_beams[index]
+
+            bad_words = getattr(r, "py_bad_words", None)
+            if not bad_words:
+                continue
+
+            for beam_idx in range(num_beams[index]):
+                # Full token sequence for this beam (prompt + generated), so a
+                # bad-word prefix ending inside the prompt is also matched.
+                context = r.get_tokens(beam_idx)
+                for word in bad_words:
+                    k = len(word)
+                    if k == 0:
+                        continue
+                    if k == 1:
+                        # Single-token word: banned unconditionally.
+                        col = word[0]
+                    elif len(context) >= k - 1 and context[-(k - 1) :] == word[:-1]:
+                        # Multi-token word: ban the final token only when the
+                        # generated suffix matches the word prefix.
+                        col = word[-1]
+                    else:
+                        continue
+                    # Apply to every step row of this beam.
+                    for step in range(num_steps[index]):
+                        rows.append(request_offset + num_steps[index] * beam_idx + step)
+                        cols.append(col)
+
+        if rows:
+            neg_inf = torch.full((), float("-inf"), dtype=logits.dtype, device=logits.device)
+            row_idx = torch.tensor(rows, dtype=torch.long, pin_memory=prefer_pinned()).to(
+                logits.device, non_blocking=True
+            )
+            col_idx = torch.tensor(cols, dtype=torch.long, pin_memory=prefer_pinned()).to(
+                logits.device, non_blocking=True
+            )
+            logits.index_put_((row_idx, col_idx), neg_inf, accumulate=False)
+
+    @staticmethod
     def _select_generated_logits(
         scheduled_requests: ScheduledRequests,
         raw_logits_cuda: torch.Tensor,
@@ -4649,6 +4717,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             sampling_requests_metadata.req_num_steps,
             sampling_requests_metadata.req_num_beams,
         )
+
+        if any(getattr(r, "py_bad_words", None) for r in sampling_requests):
+            self._apply_bad_words(
+                logits_cuda,
+                sampling_requests,
+                sampling_requests_metadata.req_num_steps.tolist(),
+                sampling_requests_metadata.req_num_beams.tolist(),
+            )
 
         # Fast path for greedy sampling
         if self._can_use_fast_greedy_path(sampling_requests):
