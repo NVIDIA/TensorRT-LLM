@@ -745,124 +745,6 @@ def _run_cute_dsl_topk_test(batch_size, next_n, index_topk, num_tokens, dtype, r
     ), "CuTE DSL top-k results don't match torch.topk"
 
 
-@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
-@skip_pre_blackwell
-@pytest.mark.parametrize("batch_size", [1, 4, 64, 256])
-@pytest.mark.parametrize("next_n", [1, 3])
-@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
-@pytest.mark.parametrize("num_tokens", [4096, 8192])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_cute_dsl_topk_decode_single_cta(batch_size, next_n, index_topk, num_tokens, dtype):
-    """Correctness test for CuTE DSL single-CTA TopK decode on Blackwell."""
-    _run_cute_dsl_topk_test(
-        batch_size,
-        next_n,
-        index_topk,
-        num_tokens,
-        dtype,
-        lambda logits, seq_lens: torch.ops.trtllm.cute_dsl_topk_decode_blackwell(
-            input_values=logits,
-            seq_lens=seq_lens,
-            top_k=index_topk,
-            next_n=next_n,
-            num_copy_bits=256,
-        ),
-    )
-
-
-@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
-@skip_pre_blackwell
-@pytest.mark.parametrize("batch_size", [1, 4, 64])
-@pytest.mark.parametrize("next_n", [1, 3])
-@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
-@pytest.mark.parametrize("num_tokens", [32768, 65536])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("chunk_size_per_cta", [16384])
-@pytest.mark.parametrize("dynamic", [False, True])
-def test_cute_dsl_topk_decode_multi_cta(
-    batch_size, next_n, index_topk, num_tokens, dtype, chunk_size_per_cta, dynamic
-):
-    """Correctness test for CuTE DSL multi-CTA TopK decode on Blackwell."""
-    _run_cute_dsl_topk_test(
-        batch_size,
-        next_n,
-        index_topk,
-        num_tokens,
-        dtype,
-        lambda logits, seq_lens: torch.ops.trtllm.cute_dsl_topk_decode_multi_cta_blackwell(
-            input_values=logits,
-            seq_lens=seq_lens,
-            top_k=index_topk,
-            next_n=next_n,
-            num_copy_bits=256,
-            chunk_size_per_cta=chunk_size_per_cta,
-            dynamic=dynamic,
-        ),
-    )
-
-
-@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
-@skip_pre_blackwell
-@pytest.mark.parametrize("batch_size", [1, 4, 64, 128])
-@pytest.mark.parametrize("next_n", [1, 2])
-@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
-@pytest.mark.parametrize("num_tokens", [4096, 8192, 65536, 131072])
-def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens):
-    """Correctness test for CuTE DSL indexer TopK decode with in-place output."""
-    num_gen_tokens = batch_size * next_n
-
-    def run_fn(logits, seq_lens):
-        """Run CuTE DSL indexer TopK decode and return output indices."""
-        output_indices = torch.empty(num_gen_tokens, index_topk, dtype=torch.int32, device="cuda")
-        torch.ops.trtllm.cute_dsl_indexer_topk_decode(
-            input_values=logits,
-            seq_lens=seq_lens,
-            output_indices=output_indices,
-            top_k=index_topk,
-            next_n=next_n,
-            num_copy_bits=256,
-        )
-        return output_indices
-
-    _run_cute_dsl_topk_test(
-        batch_size,
-        next_n,
-        index_topk,
-        num_tokens,
-        torch.float32,
-        run_fn,
-    )
-
-
-@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
-@skip_pre_blackwell
-@pytest.mark.parametrize("batch_size", [1, 4, 8, 16, 256])
-@pytest.mark.parametrize("next_n", [1, 2, 3])
-@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
-@pytest.mark.parametrize("num_tokens", [32768, 65536, 131072, 262144])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_cute_dsl_topk_decode_single_pass_multi_cta(
-    batch_size, next_n, index_topk, num_tokens, dtype
-):
-    """Correctness test for CuTE DSL single-pass multi-CTA TopK on Blackwell."""
-    _run_cute_dsl_topk_test(
-        batch_size,
-        next_n,
-        index_topk,
-        num_tokens,
-        dtype,
-        lambda logits,
-        seq_lens: cute_dsl_custom_ops.CuteDSLTopKDecodeSinglePassMultiCTARunner.forward(
-            input_values=logits,
-            seq_lens=seq_lens,
-            top_k=index_topk,
-            next_n=next_n,
-            return_val=False,
-            num_copy_bits=256,
-        )[0],
-    )
-
-
 # ---------------------------------------------------------------------------
 # Distribution configs for heuristic decode correctness tests
 #
@@ -1324,9 +1206,7 @@ def generate_pre_idx_v4(
 @pytest.mark.parametrize("index_topk", [512, 1024, 2048])
 @pytest.mark.parametrize("num_tokens", [4096, 8192])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_cute_dsl_topk_decode_single_cta(  # noqa: F811
-    batch_size, next_n, index_topk, num_tokens, dtype
-):
+def test_cute_dsl_radix_topk_decode_single_cta(batch_size, next_n, index_topk, num_tokens, dtype):
     """Correctness test for CuTE DSL single-CTA TopK decode on Blackwell."""
     _run_cute_dsl_topk_test(
         batch_size,
@@ -1353,7 +1233,7 @@ def test_cute_dsl_topk_decode_single_cta(  # noqa: F811
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("chunk_size_per_cta", [16384])
 @pytest.mark.parametrize("dynamic", [False, True])
-def test_cute_dsl_topk_decode_multi_cta(  # noqa: F811
+def test_cute_dsl_radix_topk_decode_multi_cta(
     batch_size, next_n, index_topk, num_tokens, dtype, chunk_size_per_cta, dynamic
 ):
     """Correctness test for CuTE DSL multi-CTA TopK decode on Blackwell."""
@@ -1381,7 +1261,7 @@ def test_cute_dsl_topk_decode_multi_cta(  # noqa: F811
 @pytest.mark.parametrize("next_n", [1, 2])
 @pytest.mark.parametrize("index_topk", [512, 1024, 2048])
 @pytest.mark.parametrize("num_tokens", [4096, 8192, 65536, 131072])
-def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens):  # noqa: F811
+def test_cute_dsl_indexer_radix_topk_decode(batch_size, next_n, index_topk, num_tokens):
     """Correctness test for CuTE DSL indexer TopK decode with in-place output."""
     num_gen_tokens = batch_size * next_n
 
@@ -1415,7 +1295,7 @@ def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens
 @pytest.mark.parametrize("index_topk", [512, 1024, 2048])
 @pytest.mark.parametrize("num_tokens", [32768, 131072])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_cute_dsl_topk_decode_single_pass_multi_cta(  # noqa: F811
+def test_cute_dsl_radix_topk_decode_single_pass_multi_cta(
     batch_size, next_n, index_topk, num_tokens, dtype
 ):
     """Correctness test for CuTE DSL single-pass multi-CTA TopK on Blackwell."""
@@ -1444,7 +1324,7 @@ def test_cute_dsl_topk_decode_single_pass_multi_cta(  # noqa: F811
 @pytest.mark.parametrize("index_topk", [512, 1024, 2048])
 @pytest.mark.parametrize("num_tokens", [32768, 131072])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_cute_dsl_topk_decode_single_pass_multi_cta_cluster(
+def test_cute_dsl_radix_topk_decode_single_pass_multi_cta_cluster(
     batch_size, next_n, index_topk, num_tokens, dtype
 ):
     """Correctness test for CuTE DSL single-pass multi-CTA cluster TopK on Blackwell."""
