@@ -511,10 +511,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                                               device='cpu',
                                                               dtype=torch.int)
             if self.kv_cache_manager is not None:
+                num_attention_op_pools = getattr(
+                    self.kv_cache_manager, "num_attention_op_pools",
+                    self.kv_cache_manager.num_pools)
                 self._helix_flat_block_offsets = self.get_empty(
                     buffers,
                     [
-                        self.kv_cache_manager.num_pools, self.max_num_tokens, 2,
+                        num_attention_op_pools, self.max_num_tokens, 2,
                         self.kv_cache_manager.max_blocks_per_seq
                     ],
                     cache_name="helix_flat_block_offsets",

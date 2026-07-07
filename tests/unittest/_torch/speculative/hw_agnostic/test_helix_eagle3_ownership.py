@@ -22,7 +22,7 @@ ownership matches under overlap scheduling.
 import pytest
 
 
-def owns_decode_index(decode_index, tpb, cp_size, cp_rank):
+def owns_decode_index(decode_index: int, tpb: int, cp_size: int, cp_rank: int) -> bool:
     return (decode_index // tpb) % cp_size == cp_rank
 
 
@@ -35,8 +35,9 @@ def test_verify_group_owned_by_exactly_one_rank(tpb, cp_size, g):
     assert owners == [(g // tpb) % cp_size]
 
 
-def verify_token_params(total_input_len, g, num_draft, tpb, cp_size, cp_rank):
-    """Mirror of model_engine._helix_verify_token_params."""
+def verify_token_params(
+    total_input_len: int, g: int, num_draft: int, tpb: int, cp_size: int, cp_rank: int
+) -> tuple[list[int], list[bool], int]:
     first_decode_index = g
     first_pos = total_input_len + first_decode_index
     global_positions = list(range(first_pos, first_pos + 1 + num_draft))
@@ -114,9 +115,7 @@ def test_verify_token_params_no_mixed_ownership(tpb, cp_size, g, num_draft):
 # ---------------------------------------------------------------------------
 
 
-def owns_decode_group(group_index, tpb, cp_size, cp_rank):
-    """Mirror of resource_manager._helix_owns_decode_group."""
-    return (group_index // tpb) % cp_size == cp_rank
+owns_decode_group = owns_decode_index
 
 
 @pytest.mark.parametrize("tpb", [1, 4, 32])
@@ -142,25 +141,25 @@ def test_decode_group_ownership_is_balanced(tpb, cp_size):
 
 
 class _FifoRankState:
-    """Minimal mirror of per-rank reserve/rewind bookkeeping."""
+    """Per-rank reserve and rewind state."""
 
-    def __init__(self, tpb, cp_size, cp_rank):
+    def __init__(self, tpb: int, cp_size: int, cp_rank: int) -> None:
         self.tpb = tpb
         self.cp_size = cp_size
         self.cp_rank = cp_rank
-        self.group_index = 0
-        self.pending = []
-        self.reserve_log = []
-        self.rewind_log = []
+        self.group_index: int = 0
+        self.pending: list[bool] = []
+        self.reserve_log: list[bool] = []
+        self.rewind_log: list[bool] = []
 
-    def reserve(self):
+    def reserve(self) -> bool:
         owns = owns_decode_group(self.group_index, self.tpb, self.cp_size, self.cp_rank)
         self.group_index += 1
         self.pending.append(owns)
         self.reserve_log.append(owns)
         return owns
 
-    def rewind(self):
+    def rewind(self) -> bool:
         owns = self.pending.pop(0)
         self.rewind_log.append(owns)
         return owns

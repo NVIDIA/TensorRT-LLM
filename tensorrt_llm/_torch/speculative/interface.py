@@ -35,6 +35,8 @@ from ..pyexecutor.resource_manager import (BaseResourceManager,
                                            ResourceManagerType)
 
 if TYPE_CHECKING:
+    from tensorrt_llm.mapping import Mapping
+
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
     from ..pyexecutor.llm_request import LlmRequest
 
@@ -872,10 +874,10 @@ class SpecWorkerBase(nn.Module, ABC):
         self._force_accept_rng_pool: Optional[torch.Tensor] = None
         self._force_accept_rng_counter: Optional[torch.Tensor] = None
         # Repurposed CP-to-TP mapping for draft-token sampling under Helix CP.
-        self._sampler_mapping_cache = None
+        self._sampler_mapping_cache: Optional["Mapping"] = None
 
     @property
-    def sampler_mapping(self):
+    def sampler_mapping(self) -> Optional["Mapping"]:
         """Mapping for vocab-parallel draft-token sampling.
 
         Under Helix CP, ranks are repurposed to TP past attention. Returns
