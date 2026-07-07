@@ -58,10 +58,15 @@ QKVPreprocessingParams<T, KVCacheBuffer> makeQKVPreprocessingParams(XQAParams co
     memset(&preprocessingParms, 0, sizeof(preprocessingParms));
     // Set parameters.
     preprocessingParms.qkv_input = static_cast<T*>(const_cast<void*>(params.qkv));
+    preprocessingParms.input_token_stride = params.qkv_token_stride;
     preprocessingParms.q_output = static_cast<T*>(xqa_q_input_ptr);
     preprocessingParms.kv_cache_buffer = kv_cache_buffer;
     preprocessingParms.kv_cache_block_scales_buffer = kv_cache_block_scales_buffer;
     preprocessingParms.qkv_bias = static_cast<T const*>(params.qkv_bias);
+    preprocessingParms.q_norm_weight = static_cast<T const*>(params.q_norm_weight);
+    preprocessingParms.k_norm_weight = static_cast<T const*>(params.k_norm_weight);
+    preprocessingParms.qk_norm_eps = params.qk_norm_eps;
+    preprocessingParms.qk_norm_use_gemma = params.qk_norm_use_gemma;
     // Prepare values for fmha.
     preprocessingParms.fmha_bmm1_scale = launchParams.bmm1_scale_ptr;
     preprocessingParms.fmha_bmm2_scale = launchParams.bmm2_scale_ptr;
@@ -339,6 +344,12 @@ template <typename T, typename KVCacheBuffer>
 void XqaDispatcher::runImpl(
     XQAParams params, KVCacheBuffer const& kv_cache_buffer, KVCacheBuffer const& kv_cache_block_scales_buffer)
 {
+    // Only the TRTLLM-Gen path supports a strided qkv input (the preprocessing kernel routes Q to a
+    // separate packed buffer that the FMHA reads); the legacy XQA kernels read qkv directly.
+    TLLM_CHECK_WITH_INFO(params.qkv_token_stride == 0 || mUseTllmGen
+            || params.qkv_token_stride
+                == (params.num_q_heads + 2 * params.num_kv_heads) * static_cast<int32_t>(params.head_size),
+        "Strided qkv input is not supported by the legacy XQA generation path.");
     if (mUseTllmGen)
     {
         TLLM_LOG_DEBUG("Running TRTLLM-GEN generation kernel.");

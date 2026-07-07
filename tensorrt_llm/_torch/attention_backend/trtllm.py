@@ -1235,6 +1235,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         )
         self.position_embedding_type = int(
             pos_embd_params.type) if pos_embd_params is not None else 0
+        self.q_norm_weight: Optional[torch.Tensor] = None
+        self.k_norm_weight: Optional[torch.Tensor] = None
+        self.qk_norm_eps = 0.0
+        self.qk_norm_use_gemma = False
         self.skip_softmax_stat = torch.zeros(2,
                                              dtype=torch.uint32,
                                              device='cuda')
@@ -1260,6 +1264,28 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.fmha_libs: List[Fmha] = []
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)
+
+    def configure_qk_norm_preprocessing(
+        self,
+        pos_embd_params: PositionalEmbeddingParams,
+        q_norm_weight: torch.Tensor,
+        k_norm_weight: torch.Tensor,
+        eps: float,
+        use_gemma: bool,
+    ) -> None:
+        """Configure QK RMSNorm + RoPE in the THOP preprocessing kernel."""
+        assert not self.is_mla_enable
+        assert pos_embd_params.rope is not None
+        self.rope_params = pos_embd_params.rope
+        self.rotary_inv_freq, self.rotary_cos_sin = self.rope_params.create_rope_const_params(
+        )
+        self.position_embedding_type = int(pos_embd_params.type)
+        self.q_norm_weight = q_norm_weight
+        self.k_norm_weight = k_norm_weight
+        self.qk_norm_eps = eps
+        self.qk_norm_use_gemma = use_gemma
+        # FMHA library support depends on the positional-embedding mode.
+        self.fmha_libs = []
 
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config or QuantConfig()
@@ -1497,6 +1523,16 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             raise ValueError(
                 "DSv4 epilogue fusion requires caller-provided output and "
                 "output_sf buffers.")
+
+        has_strided_fused_qkv = (q.dim() == 2 and k is None and v is None
+                                 and q.stride(1) == 1
+                                 and q.stride(0) != q.shape[1])
+        if has_strided_fused_qkv and metadata.num_contexts > 0:
+            assert not self.is_mla_enable
+            # The raw row-strided QKV view cannot feed the context FMHA
+            # directly. Force preprocessing to materialize packed Q and append
+            # K/V before context attention, including fresh-prefill requests.
+            metadata.use_paged_context_fmha = True
 
         if forward_args.output is None:
             is_gen_only = (forward_args.attention_input_type ==

@@ -67,7 +67,14 @@ public:
     {
     public:
         T const* attention_input = nullptr;
+        // Token stride (in elements) of attention_input. 0 means packed. May be larger when
+        // attention_input is a row-strided view into a wider tensor (e.g. fused QKV+gate GEMM output).
+        int32_t attention_input_token_stride = 0;
         T const* qkv_bias = nullptr;
+        T const* q_norm_weight = nullptr;
+        T const* k_norm_weight = nullptr;
+        float qk_norm_eps = 0.0f;
+        bool qk_norm_use_gemma = false;
         // Attention mask input, which has shape of [batch_size, attention_mask_stride].
         bool const* attention_mask = nullptr;
         // Attention sinks with shape of [num_heads_q] float.

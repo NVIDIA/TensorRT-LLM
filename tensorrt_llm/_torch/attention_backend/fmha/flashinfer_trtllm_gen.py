@@ -607,6 +607,10 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         fwd: AttentionForwardArgs,
     ) -> Tuple[bool, str]:
         is_mla_enable = attn.is_mla_enable
+        if q.dim() == 2 and not q.is_contiguous():
+            # Row-strided qkv views (gate-tail [Q|K|V|G] layout) are only handled by
+            # the fallback thop path, which passes the token stride to its kernels.
+            return False, "Strided qkv input is only supported by the fallback path."
         sparse_params = attn.sparse_params
         has_skip_softmax = sparse_params is not None and sparse_params.algorithm == "skip_softmax"
         has_sparse_attention = sparse_params is not None and not has_skip_softmax

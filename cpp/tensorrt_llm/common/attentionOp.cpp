@@ -247,6 +247,11 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
 
     xqaParams.output = generationsParams.context_buf;
     xqaParams.qkv = generationsParams.attention_input;
+    xqaParams.qkv_token_stride = generationsParams.attention_input_token_stride;
+    xqaParams.q_norm_weight = generationsParams.q_norm_weight;
+    xqaParams.k_norm_weight = generationsParams.k_norm_weight;
+    xqaParams.qk_norm_eps = generationsParams.qk_norm_eps;
+    xqaParams.qk_norm_use_gemma = generationsParams.qk_norm_use_gemma;
     xqaParams.cache_indir = generationsParams.cache_indir;
     xqaParams.attention_sinks = generationsParams.attention_sinks;
     xqaParams.kv_scale_orig_quant = generationsParams.kv_scale_orig_quant;
@@ -1761,12 +1766,29 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
 
         // Buffers.
         preprocessingParams.qkv_input = const_cast<T*>(attention_input);
+        // A strided qkv_input is only valid when the FMHA consumes the preprocessing outputs
+        // (separate q buffer / quantized qkv buffer), never the raw attention_input.
+        if (params.attention_input_token_stride != 0)
+        {
+            // Requires separate_q_kv_output below: the preprocessing kernel then writes Q packed
+            // into q_output and K/V into the KV cache, so nothing re-reads the strided input.
+            bool const fmha_reads_preprocessed_buffers = (mPagedKVCache && mPagedContextFMHA) || isCrossAttention();
+            TLLM_CHECK_WITH_INFO(
+                params.attention_input_token_stride == (mNumAttnHeads + 2 * mNumAttnKVHeads) * getHeadSize()
+                    || (fmha_reads_preprocessed_buffers && mCpSize == 1 && !mIsMLAEnabled && !useSageAttnSeparateQkv),
+                "Strided attention_input is not supported by this context attention configuration.");
+            preprocessingParams.input_token_stride = params.attention_input_token_stride;
+        }
         preprocessingParams.cross_kv_input = const_cast<T*>(params.cross_kv);
         preprocessingParams.quantized_qkv_output = workspaceViews.fp8QkvBuf;
         preprocessingParams.q_output = workspaceViews.qBuf;
         preprocessingParams.kv_cache_buffer = kv_cache_buffer;
         preprocessingParams.kv_cache_block_scales_buffer = kv_scale_cache_buffer;
         preprocessingParams.qkv_bias = params.qkv_bias;
+        preprocessingParams.q_norm_weight = params.q_norm_weight;
+        preprocessingParams.k_norm_weight = params.k_norm_weight;
+        preprocessingParams.qk_norm_eps = params.qk_norm_eps;
+        preprocessingParams.qk_norm_use_gemma = params.qk_norm_use_gemma;
         preprocessingParams.tokens_info = decoder_params.tokensInfo;
         preprocessingParams.seq_lens = params.context_lengths;
         // For self-attention, cache_seq_lens indicates whether chunked context is used
@@ -2102,6 +2124,9 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     {
         TLLM_CHECK_DEBUG_WITH_INFO(params.logn_scaling_ptr == nullptr, "Unfused MHA does not support logn scaling");
         TLLM_CHECK_WITH_INFO(mAttentionChunkSize == std::nullopt, "Unfused MHA does not support chunked attention");
+        TLLM_CHECK_WITH_INFO(params.attention_input_token_stride == 0
+                || params.attention_input_token_stride == (mNumAttnHeads + 2 * mNumAttnKVHeads) * getHeadSize(),
+            "Strided attention_input is not supported by the unfused context MHA path.");
         // FIXME: a temporary solution to make sure the padding part of key/value buffer is 0
         // NOTE: pointer subtraction is used below since there could be some extra gap due to alignment.
         //  Otherwise, we could do cudaMemsetAsync(workspaceViews.kBuf, 0, k_buf_2_size + v_buf_2_size, stream).
@@ -2605,6 +2630,10 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
     }
 
     FusedQKVMaskedAttentionDispatchParams<T, KVCacheBuffer> dispatch_params{};
+    // The MMHA fallback reads the qkv buffer assuming a packed token stride.
+    TLLM_CHECK_WITH_INFO(params.attention_input_token_stride == 0
+            || params.attention_input_token_stride == (mNumAttnHeads + 2 * mNumAttnKVHeads) * getHeadSize(),
+        "Strided attention_input is not supported by the masked MHA generation path.");
     dispatch_params.mUnfuseQkvGemm = mUnfuseQkvGemm;
     dispatch_params.qkv_buf = attention_input;
     dispatch_params.qkv_bias = params.qkv_bias;

@@ -1,4 +1,5 @@
 import math
+import os
 import weakref
 from typing import List, Optional, Tuple, Union
 
@@ -464,6 +465,16 @@ class Attention(nn.Module):
         if self.attn_output_gate:
             logger.info_once("using attn output gate!", key="attn_output_gate")
 
+        # Opt-in [Q|K|V|G] gate-tail layout: the fused QKV(+gate) weight rows are permuted at
+        # load time (see post_load_weights) from the per-head-interleaved [q0|g0|q1|g1|...|K|V]
+        # HF layout to [Q|K|V|G]. Q/K/V then form one contiguous slice of the GEMM output,
+        # which removes the q/gate de-interleave copies and the q,k,v re-concat before the
+        # fused qk-norm-rope kernel; the attention op consumes [Q|K|V] as a row-strided view.
+        self._gate_tail_layout_requested = (
+            self.attn_output_gate
+            and os.environ.get("TRTLLM_ATTN_GATE_TAIL_LAYOUT", "0") == "1")
+        self._gate_tail_layout_active = False
+
         # [Chunked Attention]
         # Chunked attention is applied to context requests only. Chunked attention will be
         # applied when this field is specified and mMaskType == CAUSAL.
@@ -690,6 +701,53 @@ class Attention(nn.Module):
                                 or self.o_proj.has_fp8_block_scales
                                 or self.o_proj.has_fp8_rowwise
                                 or self.o_proj.has_w4a8_nvfp4_fp8)
+
+    def post_load_weights(self):
+        self._maybe_permute_gate_tail_layout()
+
+    def _maybe_permute_gate_tail_layout(self):
+        """Permute qkv_proj weight rows from [q0|g0|q1|g1|...|K|V] to [Q|K|V|G].
+
+        Load-time-only transform enabling the copy-free gate path in forward. Only
+        engaged for plain (unquantized) weights with the TRTLLM backend and the fused
+        qk-norm-rope kernel, where the strided [Q|K|V] view is supported end to end.
+        """
+        if not self._gate_tail_layout_requested or self._gate_tail_layout_active:
+            return
+        has_quant = (self.quant_config is not None
+                     and self.quant_config.layer_quant_mode.has_any_quant(
+                         exclude_kv_cache=True))
+        supported = (self.attn_backend == "TRTLLM" and self.support_fused_qkv
+                     and getattr(self, "fuse_qk_norm_rope", False)
+                     and not getattr(self, "skip_rope", False) and not has_quant
+                     and self.mapping.cp_size == 1
+                     and self.qkv_proj.weight.dtype
+                     in (torch.bfloat16, torch.float16, torch.float32))
+        if not supported:
+            logger.warning_once(
+                "TRTLLM_ATTN_GATE_TAIL_LAYOUT requested but not supported for "
+                "this attention configuration; keeping interleaved layout.",
+                key="gate_tail_layout_unsupported")
+            return
+        device = self.qkv_proj.weight.device
+        d = self.head_dim
+        q_gate_rows = torch.arange(2 * self.q_size,
+                                   device=device).view(self.num_heads, 2, d)
+        perm = torch.cat([
+            q_gate_rows[:, 0, :].reshape(-1),  # Q
+            torch.arange(2 * self.kv_size, device=device) +
+            2 * self.q_size,  # K, V
+            q_gate_rows[:, 1, :].reshape(-1),  # gate
+        ])
+        with torch.no_grad():
+            self.qkv_proj.weight.data.copy_(
+                self.qkv_proj.weight.data.index_select(0, perm))
+            if self.qkv_proj.bias is not None:
+                self.qkv_proj.bias.data.copy_(
+                    self.qkv_proj.bias.data.index_select(0, perm))
+        self._gate_tail_layout_active = True
+        logger.info_once("gate-tail [Q|K|V|G] qkv layout engaged",
+                         key="gate_tail_layout_engaged")
 
     def split_qkv(self, q, k=None, v=None):
         if k is None and v is None:
@@ -984,14 +1042,24 @@ class Attention(nn.Module):
                 qkv = qkv + qkv_lora
 
         if self.attn_output_gate:
-            q_gate, k, v = qkv.split(
-                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
-            orig_shape = q_gate.shape[:-1]
-            # Single line: view -> chunk -> reshape both q and gate
-            q, gate = [
-                t.reshape(*orig_shape, -1) for t in torch.chunk(
-                    q_gate.view(*orig_shape, self.num_heads, -1), 2, dim=-1)
-            ]
+            if self._gate_tail_layout_active:
+                # Weights were permuted at load time so the GEMM output is [Q|K|V|G].
+                # Keep the full tensor: the in-place fused qk-norm-rope treats the gate
+                # tail as pass-through V heads, and q/gate become copy-free views.
+                assert not bool(
+                    lora_params
+                ), "gate-tail QKV layout is incompatible with LoRA"
+                q, k, v = qkv, None, None
+                gate = qkv[:, self.q_size + 2 * self.kv_size:]
+            else:
+                q_gate, k, v = qkv.split(
+                    [self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
+                orig_shape = q_gate.shape[:-1]
+                # Single line: view -> chunk -> reshape both q and gate
+                q, gate = [
+                    t.reshape(*orig_shape, -1) for t in torch.chunk(
+                        q_gate.view(*orig_shape, self.num_heads, -1), 2, dim=-1)
+                ]
         else:
             q, k, v = qkv, None, None
 
@@ -1010,6 +1078,11 @@ class Attention(nn.Module):
 
         q, k, v = self.apply_rope(q, k, v, position_ids)
         q, k, v = self.convert_qkv(q, k, v)
+
+        if self.attn_output_gate and self._gate_tail_layout_active:
+            # Drop the gate tail: the attention op consumes the [Q|K|V] slice as a
+            # row-strided view (token stride = full GEMM output width).
+            q = q[:, :self.q_size + 2 * self.kv_size]
 
         if attention_sinks is not None:
             assert self.attn_backend == "TRTLLM", (

@@ -95,7 +95,10 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> relative_attention_bias = std::nullopt, int64_t relative_attention_max_distance = 0,
     std::optional<int64_t> spec_decoding_target_max_draft_tokens = std::nullopt,
     std::optional<torch::Tensor> quant_scale_qkv = std::nullopt,
-    std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache = std::nullopt, bool enable_dsv4_epilogue_fusion = false);
+    std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache = std::nullopt, bool enable_dsv4_epilogue_fusion = false,
+    std::optional<torch::Tensor> q_norm_weight = std::nullopt,
+    std::optional<torch::Tensor> k_norm_weight = std::nullopt, double qk_norm_eps = 0.0,
+    bool qk_norm_use_gemma = false);
 
 struct KvCachePoolPointers
 {

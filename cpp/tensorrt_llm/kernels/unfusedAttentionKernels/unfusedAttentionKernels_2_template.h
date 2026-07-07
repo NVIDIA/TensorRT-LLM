@@ -403,7 +403,9 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
     int const hidden_idx = head_idx * params.size_per_head + head_dim_idx;
     int const kv_head_idx = head_idx / params.qheads_per_kv_head;
     int const hidden_idx_kv = kv_head_idx * params.size_per_head + head_dim_idx;
-    int const hidden_size = params.hidden_size;
+    // Token stride of qkv_input; equals hidden_size unless qkv_input is a row-strided view
+    // (only allowed with separate_q_kv_output, so qkv_input is never written back then).
+    int const input_token_stride = params.input_token_stride;
     int const src_k_offset = params.q_hidden_size;
     int const src_v_offset = src_k_offset + params.kv_head_num * params.size_per_head;
 
@@ -454,9 +456,11 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
             //   src QKV: [batch, time, 3, head_num, size_per_head]
             // head_num != kv_head_num:
             //   src QKV: [batch, time, head_num * size_per_head + 2 * kv_head_num * size_per_head]
-            auto const src_q_idx = static_cast<size_t>(global_token_idx) * hidden_size + hidden_idx;
-            auto const src_k_idx = static_cast<size_t>(global_token_idx) * hidden_size + src_k_offset + hidden_idx_kv;
-            auto const src_v_idx = static_cast<size_t>(global_token_idx) * hidden_size + src_v_offset + hidden_idx_kv;
+            auto const src_q_idx = static_cast<size_t>(global_token_idx) * input_token_stride + hidden_idx;
+            auto const src_k_idx
+                = static_cast<size_t>(global_token_idx) * input_token_stride + src_k_offset + hidden_idx_kv;
+            auto const src_v_idx
+                = static_cast<size_t>(global_token_idx) * input_token_stride + src_v_offset + hidden_idx_kv;
 
             VecType q, k, v, q_pair, k_pair;
             // key without position embedding
@@ -728,6 +732,68 @@ struct VecType<__nv_bfloat16>
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+#ifdef ENABLE_BF16
+__device__ __forceinline__ void applyQkNormRopeGptNeox(mmha::bf16_8_t& q, mmha::bf16_8_t& k,
+    mmha::bf16_8_t const& qPair, mmha::bf16_8_t const& kPair, __nv_bfloat16 const* qNormWeight,
+    __nv_bfloat16 const* kNormWeight, int headDimIdx, int rotatedHeadDimOffset, int headSize, float eps, bool useGemma,
+    float2 const* rotaryCoefCache, bool validRotaryDim, bool firstHalf)
+{
+    constexpr int kElementsPerVector = 8;
+    auto qFloat = mmha::convert_to_float(q);
+    auto kFloat = mmha::convert_to_float(k);
+    auto qPairFloat = mmha::convert_to_float(qPair);
+    auto kPairFloat = mmha::convert_to_float(kPair);
+    auto qWeightFloat = mmha::convert_to_float(*reinterpret_cast<mmha::bf16_8_t const*>(qNormWeight + headDimIdx));
+    auto kWeightFloat = mmha::convert_to_float(*reinterpret_cast<mmha::bf16_8_t const*>(kNormWeight + headDimIdx));
+    auto qPairWeightFloat = mmha::convert_to_float(
+        *reinterpret_cast<mmha::bf16_8_t const*>(qNormWeight + headDimIdx + rotatedHeadDimOffset));
+    auto kPairWeightFloat = mmha::convert_to_float(
+        *reinterpret_cast<mmha::bf16_8_t const*>(kNormWeight + headDimIdx + rotatedHeadDimOffset));
+
+    auto* qValues = reinterpret_cast<float*>(&qFloat);
+    auto* kValues = reinterpret_cast<float*>(&kFloat);
+    auto* qPairValues = reinterpret_cast<float*>(&qPairFloat);
+    auto* kPairValues = reinterpret_cast<float*>(&kPairFloat);
+    auto const* qWeightValues = reinterpret_cast<float const*>(&qWeightFloat);
+    auto const* kWeightValues = reinterpret_cast<float const*>(&kWeightFloat);
+    auto const* qPairWeightValues = reinterpret_cast<float const*>(&qPairWeightFloat);
+    auto const* kPairWeightValues = reinterpret_cast<float const*>(&kPairWeightFloat);
+
+    float qSumSquares = 0.0f;
+    float kSumSquares = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kElementsPerVector; ++i)
+    {
+        qSumSquares += qValues[i] * qValues[i];
+        kSumSquares += kValues[i] * kValues[i];
+    }
+    qSumSquares = tensorrt_llm::common::warpReduceSum(qSumSquares);
+    kSumSquares = tensorrt_llm::common::warpReduceSum(kSumSquares);
+    float const qRmsRcp = rsqrtf(qSumSquares / static_cast<float>(headSize) + eps);
+    float const kRmsRcp = rsqrtf(kSumSquares / static_cast<float>(headSize) + eps);
+
+#pragma unroll
+    for (int i = 0; i < kElementsPerVector; ++i)
+    {
+        float const qWeight = useGemma ? 1.0f + qWeightValues[i] : qWeightValues[i];
+        float const kWeight = useGemma ? 1.0f + kWeightValues[i] : kWeightValues[i];
+        float const qPairWeight = useGemma ? 1.0f + qPairWeightValues[i] : qPairWeightValues[i];
+        float const kPairWeight = useGemma ? 1.0f + kPairWeightValues[i] : kPairWeightValues[i];
+        qValues[i] *= qRmsRcp * qWeight;
+        kValues[i] *= kRmsRcp * kWeight;
+        qPairValues[i] *= qRmsRcp * qPairWeight;
+        kPairValues[i] *= kRmsRcp * kPairWeight;
+
+        float2 rotaryCoef = validRotaryDim ? rotaryCoefCache[i] : make_float2(1.0f, 0.0f);
+        rotaryCoef.y = firstHalf ? -rotaryCoef.y : rotaryCoef.y;
+        qValues[i] = qValues[i] * rotaryCoef.x + qPairValues[i] * rotaryCoef.y;
+        kValues[i] = kValues[i] * rotaryCoef.x + kPairValues[i] * rotaryCoef.y;
+    }
+    mmha::convert_from_float(&q, qFloat);
+    mmha::convert_from_float(&k, kFloat);
+}
+#endif
+
 template <typename T, typename TCache, int BLOCK_SIZE, int Dh, bool ADD_BIAS, bool STORE_QKV, bool FP8_OUTPUT,
     bool GEN_PHASE, typename KVCacheBuffer, RotaryPositionEmbeddingType ROTARY_TYPE>
 __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBuffer> params)
@@ -867,11 +933,11 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
         //   src QKV: [batch, time, 3, head_num, size_per_head]
         // head_num != kv_head_num:
         //   src QKV: [batch, time, head_num * size_per_head + 2 * kv_head_num * size_per_head]
-        auto const src_q_idx = static_cast<size_t>(bounded_global_token_idx) * params.hidden_size + hidden_idx;
+        auto const src_q_idx = static_cast<size_t>(bounded_global_token_idx) * params.input_token_stride + hidden_idx;
         auto const src_k_idx
-            = static_cast<size_t>(bounded_global_token_idx) * params.hidden_size + src_k_offset + hidden_idx_kv;
+            = static_cast<size_t>(bounded_global_token_idx) * params.input_token_stride + src_k_offset + hidden_idx_kv;
         auto const src_v_idx
-            = static_cast<size_t>(bounded_global_token_idx) * params.hidden_size + src_v_offset + hidden_idx_kv;
+            = static_cast<size_t>(bounded_global_token_idx) * params.input_token_stride + src_v_offset + hidden_idx_kv;
 
         auto q = *reinterpret_cast<VecT const*>(&params.qkv_input[src_q_idx]);
         auto k = *reinterpret_cast<VecT const*>(&params.qkv_input[src_k_idx]);
@@ -924,21 +990,37 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
         if constexpr (ROTARY_TYPE == RotaryPositionEmbeddingType::GPT_NEOX)
         {
             rotary_coef_cache_buffer += gptneox_rotary_dim_idx;
-#pragma unroll
-            for (int elt_id = 0; elt_id < ELTS_PER_VEC; elt_id++)
+            bool qk_norm_applied = false;
+#ifdef ENABLE_BF16
+            if constexpr (std::is_same_v<T, __nv_bfloat16>)
             {
-                GPTNeoXEltT& q_ = reinterpret_cast<GPTNeoXEltT*>(&q)[elt_id];
-                GPTNeoXEltT q_pair_ = reinterpret_cast<GPTNeoXEltT*>(&q_pair)[elt_id];
-                GPTNeoXEltT& k_ = reinterpret_cast<GPTNeoXEltT*>(&k)[elt_id];
-                GPTNeoXEltT k_pair_ = reinterpret_cast<GPTNeoXEltT*>(&k_pair)[elt_id];
+                if (params.q_norm_weight != nullptr)
+                {
+                    applyQkNormRopeGptNeox(q, k, q_pair, k_pair, params.q_norm_weight, params.k_norm_weight,
+                        head_dim_idx, rotated_head_dim_offset, params.size_per_head, params.qk_norm_eps,
+                        params.qk_norm_use_gemma, rotary_coef_cache_buffer, valid_rotary_dim_idx, first_half);
+                    qk_norm_applied = true;
+                }
+            }
+#endif
+            if (!qk_norm_applied)
+            {
+#pragma unroll
+                for (int elt_id = 0; elt_id < ELTS_PER_VEC; elt_id++)
+                {
+                    GPTNeoXEltT& q_ = reinterpret_cast<GPTNeoXEltT*>(&q)[elt_id];
+                    GPTNeoXEltT q_pair_ = reinterpret_cast<GPTNeoXEltT*>(&q_pair)[elt_id];
+                    GPTNeoXEltT& k_ = reinterpret_cast<GPTNeoXEltT*>(&k)[elt_id];
+                    GPTNeoXEltT k_pair_ = reinterpret_cast<GPTNeoXEltT*>(&k_pair)[elt_id];
 
-                // Load cos/sin from cache.
-                float2 rotary_coef_cache
-                    = valid_rotary_dim_idx ? rotary_coef_cache_buffer[elt_id] : masked_rotary_cos_sin;
+                    // Load cos/sin from cache.
+                    float2 rotary_coef_cache
+                        = valid_rotary_dim_idx ? rotary_coef_cache_buffer[elt_id] : masked_rotary_cos_sin;
 
-                // Preprocess sin for second half rotary dim.
-                rotary_coef_cache.y = first_half ? -rotary_coef_cache.y : rotary_coef_cache.y;
-                mmha::apply_rotary_embedding_gptneox(q_, q_pair_, k_, k_pair_, rotary_coef_cache);
+                    // Preprocess sin for second half rotary dim.
+                    rotary_coef_cache.y = first_half ? -rotary_coef_cache.y : rotary_coef_cache.y;
+                    mmha::apply_rotary_embedding_gptneox(q_, q_pair_, k_, k_pair_, rotary_coef_cache);
+                }
             }
         }
         else if constexpr (ROTARY_TYPE == RotaryPositionEmbeddingType::GPTJ)
@@ -1451,7 +1533,7 @@ __global__ void updateKVCacheForCrossAttention(QKVPreprocessingParams<T, KVCache
             int global_token_idx = token_idx + decoder_seq_offset;
 
             // The memory offset.
-            auto const src_q_idx = static_cast<size_t>(global_token_idx) * params.hidden_size + hidden_idx;
+            auto const src_q_idx = static_cast<size_t>(global_token_idx) * params.input_token_stride + hidden_idx;
             auto const dst_q_idx = static_cast<size_t>(global_token_idx) * params.q_hidden_size + hidden_idx;
 
             // Only load Q tokens from decoder qkv input.
@@ -1611,17 +1693,24 @@ void invokeApplyBiasRopeUpdateKVCacheDispatch(QKVPreprocessingParams<T, KVCacheB
         || params.max_kv_seq_len > params.rotary_embedding_max_positions;
     bool const has_rotary_cos_sin_cache = params.rotary_coef_cache_buffer != nullptr;
     bool const has_sink_tokens = params.sink_token_len > 0;
-    bool const use_v1_for_mrope
-        = params.position_embedding_type == PositionEmbeddingType::kROPE_M && params.mrope_rotary_cos_sin == nullptr;
+    // Text-only requests for an mRoPE-configured model have scalar position IDs
+    // (all three mRoPE axes are identical), so there is no per-token mRoPE
+    // cos/sin buffer. Fused QK norm is implemented in V2 and can use the normal
+    // scalar-position cos/sin cache for this case. Multimodal requests provide
+    // mrope_rotary_cos_sin and also use V2.
+    bool const use_v1_for_mrope = params.position_embedding_type == PositionEmbeddingType::kROPE_M
+        && params.mrope_rotary_cos_sin == nullptr && params.q_norm_weight == nullptr;
     // V2 implementation requires multiple of paired 16 bytes for gpt-neox rotation.
     bool const support_rotary_for_v2 = (params.position_embedding_type != PositionEmbeddingType::kROPE_GPT_NEOX
                                            && params.position_embedding_type != PositionEmbeddingType::kLONG_ROPE)
         || params.rotary_embedding_dim % 16 == 0;
 
     // Use v2 kernel for absolute_position_embedding.
-    if (!absolute_position_embedding
-        && (long_seq_rotary_support || !has_rotary_cos_sin_cache || has_sink_tokens || !support_rotary_for_v2
-            || use_v1_for_mrope))
+    bool const requires_v1 = long_seq_rotary_support || !has_rotary_cos_sin_cache || has_sink_tokens
+        || !support_rotary_for_v2 || use_v1_for_mrope;
+    TLLM_CHECK_WITH_INFO(params.q_norm_weight == nullptr || !requires_v1,
+        "Fused QK norm preprocessing requires the V2 QKV preprocessing kernel.");
+    if (!absolute_position_embedding && requires_v1)
     {
         kernelV1Dispatch<T, TCache, KVCacheBuffer>(params, stream);
         return;

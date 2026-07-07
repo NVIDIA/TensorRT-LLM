@@ -14,11 +14,13 @@
 # limitations under the License.
 
 import math
+import os
 from typing import Optional
 
 import torch
 from transformers import PretrainedConfig
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend.interface import PositionalEmbeddingParams
@@ -178,6 +180,13 @@ class QKNormRoPEAttention(Attention):
         rope_fusion &= (not self.fuse_qk_norm_rope and not skip_rope
                         and not attn_output_gate and not use_gemma_rms_norm)
         self.is_qk_norm = is_qk_norm
+        self._gate_tail_fused_preprocess_requested = (
+            bool(attn_output_gate) and fuse_qk_norm_rope and is_qk_norm
+            and use_gemma_rms_norm and not skip_rope
+            and os.environ.get("TRTLLM_ATTN_GATE_TAIL_LAYOUT", "0") == "1"
+            and os.environ.get("TRTLLM_ATTN_GATE_TAIL_FUSED_PREPROCESS",
+                               "0") == "1")
+        self._gate_tail_fused_preprocess_active = False
         assert not (fuse_qk_norm_rope and skip_rope
                     ), "Fusing qk norm and skipping rope is not supported"
 
@@ -212,6 +221,42 @@ class QKNormRoPEAttention(Attention):
                               use_gemma=use_gemma_rms_norm)
         self.aux_stream = torch.cuda.Stream()
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+
+    def post_load_weights(self):
+        super().post_load_weights()
+        if not self._gate_tail_fused_preprocess_requested:
+            return
+
+        supported = (self._gate_tail_layout_active and self.mapping.cp_size == 1
+                     and self.head_dim == 256
+                     and self.qkv_proj.weight.dtype == torch.bfloat16
+                     and self.q_norm.weight is not None
+                     and self.k_norm.weight is not None
+                     and self.q_norm.weight.dtype == torch.bfloat16
+                     and self.k_norm.weight.dtype == torch.bfloat16
+                     and self.pos_embd_params is not None
+                     and self.pos_embd_params.rope is not None
+                     and self.pos_embd_params.is_neox
+                     and hasattr(self.attn, "configure_qk_norm_preprocessing"))
+        if not supported:
+            logger.warning_once(
+                "TRTLLM_ATTN_GATE_TAIL_FUSED_PREPROCESS requested but not "
+                "supported for this attention configuration; keeping the "
+                "standalone fused QK-norm/RoPE kernel.",
+                key="gate_tail_fused_preprocess_unsupported")
+            return
+
+        self.attn.configure_qk_norm_preprocessing(
+            self.pos_embd_params,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.q_norm.variance_epsilon,
+            self.use_gemma_rms_norm,
+        )
+        self._gate_tail_fused_preprocess_active = True
+        logger.info_once(
+            "gate-tail QK-norm/RoPE fused into attention preprocessing",
+            key="gate_tail_fused_preprocess_engaged")
 
     def apply_qk_norm(self, q, k):
 
@@ -258,18 +303,28 @@ class QKNormRoPEAttention(Attention):
                 torch.int32)
             mrope_section1, mrope_section2 = mrope_section[1], mrope_section[2]
         else:
-            position_ids_arg = position_ids.reshape(-1).contiguous().to(
-                torch.int32)
+            # position_ids is identical for every layer; cache the flattened int32
+            # copy on the tensor object so the cast runs once per forward instead
+            # of once per layer (fresh position_ids objects are created each step).
+            position_ids_arg = getattr(position_ids, "_tllm_flat_int32", None)
+            if position_ids_arg is None:
+                position_ids_arg = position_ids.reshape(-1).contiguous().to(
+                    torch.int32)
+                position_ids._tllm_flat_int32 = position_ids_arg
             mrope_section1, mrope_section2 = 0, 0
 
+        # The kernel never touches V heads, so any extra trailing dims (e.g. the gate
+        # tail of the [Q|K|V|G] layout) are declared as pass-through V heads.
+        num_heads_v = (qkv.shape[-1] // self.head_dim - self.num_heads -
+                       self.num_key_value_heads)
         torch.ops.trtllm.fused_qk_norm_rope(
-            qkv, self.num_heads, self.num_key_value_heads,
-            self.num_key_value_heads, self.head_dim, rotary_dim,
-            self.q_norm.variance_epsilon, self.q_norm.weight,
-            self.k_norm.weight, self.pos_embd_params.rope.theta,
-            self.pos_embd_params.is_neox, position_ids_arg, factor, low, high,
-            attention_factor, self.is_qk_norm, self.use_gemma_rms_norm,
-            use_mrope, mrope_section1, mrope_section2)
+            qkv, self.num_heads, self.num_key_value_heads, num_heads_v,
+            self.head_dim, rotary_dim, self.q_norm.variance_epsilon,
+            self.q_norm.weight, self.k_norm.weight,
+            self.pos_embd_params.rope.theta, self.pos_embd_params.is_neox,
+            position_ids_arg, factor, low, high, attention_factor,
+            self.is_qk_norm, self.use_gemma_rms_norm, use_mrope, mrope_section1,
+            mrope_section2)
         return qkv, None, None
 
     def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],
@@ -278,6 +333,13 @@ class QKNormRoPEAttention(Attention):
         The apply_rope method is called in the forward method of the Attention class.
         The apply_rope method is overridden in this class to apply QK norm and RoPE to the input tensor.
         """
+        # The attention preprocessing kernel applies QK norm and RoPE while it
+        # writes packed Q and the paged KV cache. Keep the raw gate-tail tensor
+        # here so no intermediate Q/K global-memory round trip is introduced.
+        if self._gate_tail_fused_preprocess_active:
+            assert k is None and v is None
+            return q, None, None
+
         # Apply QK norm before RoPE.
         if not self.fuse_qk_norm_rope:
             q, k, v = self.split_qkv(q, k, v)

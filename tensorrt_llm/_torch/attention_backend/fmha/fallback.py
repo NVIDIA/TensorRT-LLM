@@ -142,6 +142,10 @@ class FallbackFmha(Fmha):
             relative_attention_max_distance=forward_args.relative_attention_max_distance,
             skip_softmax_threshold_scale_factor_prefill=forward_args.skip_softmax_kernel_params.threshold_scale_factor_prefill,
             skip_softmax_threshold_scale_factor_decode=forward_args.skip_softmax_kernel_params.threshold_scale_factor_decode,
+            q_norm_weight=attn.q_norm_weight,
+            k_norm_weight=attn.k_norm_weight,
+            qk_norm_eps=attn.qk_norm_eps,
+            qk_norm_use_gemma=attn.qk_norm_use_gemma,
             # --- Module config (TrtllmAttention) ---
             rotary_inv_freq=attn.rotary_inv_freq,
             rotary_cos_sin=attn.rotary_cos_sin,

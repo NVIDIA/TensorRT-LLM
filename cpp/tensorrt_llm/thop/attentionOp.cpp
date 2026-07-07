@@ -380,7 +380,9 @@ public:
         std::optional<torch::Tensor> relative_attention_bias,
         std::optional<torch::Tensor> quant_scale_qkv = std::nullopt,
         std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache = std::nullopt,
-        bool enable_dsv4_epilogue_fusion = false) const
+        bool enable_dsv4_epilogue_fusion = false, std::optional<torch::Tensor> q_norm_weight = std::nullopt,
+        std::optional<torch::Tensor> k_norm_weight = std::nullopt, double qk_norm_eps = 0.0,
+        bool qk_norm_use_gemma = false) const
         = 0;
 };
 
@@ -450,10 +452,20 @@ public:
         std::optional<torch::Tensor> flash_mla_num_splits, bool trtllm_gen_jit_warmup,
         std::optional<int64_t> compressed_kv_cache_pool_ptr, bool const is_cross, std::optional<torch::Tensor> cross_kv,
         std::optional<torch::Tensor> relative_attention_bias, std::optional<torch::Tensor> quant_scale_qkv,
-        std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion) const override
+        std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion,
+        std::optional<torch::Tensor> q_norm_weight, std::optional<torch::Tensor> k_norm_weight, double qk_norm_eps,
+        bool qk_norm_use_gemma) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
         T* attention_input = static_cast<T*>(qkv_or_q.slice(0, token_offset).data_ptr());
+        // qkv_or_q may be a row-strided view into a wider tensor (e.g. fused QKV+gate GEMM output
+        // laid out as [Q|K|V|Gate]); pass the token stride so kernels index it correctly.
+        int32_t attention_input_token_stride = 0;
+        if (qkv_or_q.dim() == 2 && !qkv_or_q.is_contiguous())
+        {
+            TORCH_CHECK(qkv_or_q.stride(1) == 1, "qkv_or_q innermost dim must be contiguous");
+            attention_input_token_stride = static_cast<int32_t>(qkv_or_q.stride(0));
+        }
         T* k_ptr = nullptr;
         T* v_ptr = nullptr;
         AttentionOutT* context_buf = static_cast<AttentionOutT*>(output.slice(0, token_offset).data_ptr());
@@ -477,6 +489,35 @@ public:
             }
         }
 
+        T const* q_norm_weight_ptr = nullptr;
+        T const* k_norm_weight_ptr = nullptr;
+        TORCH_CHECK(q_norm_weight.has_value() == k_norm_weight.has_value(),
+            "q_norm_weight and k_norm_weight must be provided together");
+        if (q_norm_weight.has_value())
+        {
+            TORCH_CHECK(qkv_or_q.scalar_type() == at::ScalarType::BFloat16,
+                "Fused QK norm preprocessing currently supports BF16 attention input only");
+            TORCH_CHECK(op.getHeadSize() == 256, "Fused QK norm preprocessing currently requires head_size == 256");
+            TORCH_CHECK(
+                op.isRoPE() && op.mPositionEmbeddingType != tensorrt_llm::kernels::PositionEmbeddingType::kROPE_GPTJ,
+                "Fused QK norm preprocessing requires a GPT-NeoX-compatible RoPE mode");
+            TORCH_CHECK(qk_norm_eps > 0.0, "qk_norm_eps must be positive");
+            auto const& qNormWeight = q_norm_weight.value();
+            auto const& kNormWeight = k_norm_weight.value();
+            TORCH_CHECK(qNormWeight.is_cuda() && kNormWeight.is_cuda(), "QK norm weights must be CUDA tensors");
+            TORCH_CHECK(
+                qNormWeight.get_device() == qkv_or_q.get_device() && kNormWeight.get_device() == qkv_or_q.get_device(),
+                "QK norm weights must be on the same device as q");
+            TORCH_CHECK(qNormWeight.scalar_type() == qkv_or_q.scalar_type()
+                    && kNormWeight.scalar_type() == qkv_or_q.scalar_type(),
+                "QK norm weights must have the same dtype as q");
+            TORCH_CHECK(
+                qNormWeight.is_contiguous() && kNormWeight.is_contiguous(), "QK norm weights must be contiguous");
+            TORCH_CHECK(qNormWeight.numel() == op.getHeadSize() && kNormWeight.numel() == op.getHeadSize(),
+                "QK norm weights must contain exactly head_size elements");
+            q_norm_weight_ptr = static_cast<T const*>(qNormWeight.data_ptr());
+            k_norm_weight_ptr = static_cast<T const*>(kNormWeight.data_ptr());
+        }
         void* workspace_ptr = workspace.data_ptr();
         [[maybe_unused]] MlaParams<T> mla_params;
         if (op.isMLAEnabled())
@@ -791,6 +832,11 @@ public:
 
         AttentionOp::EnqueueParams<T> common_enqueue_params;
         common_enqueue_params.attention_input = attention_input;
+        common_enqueue_params.attention_input_token_stride = attention_input_token_stride;
+        common_enqueue_params.q_norm_weight = q_norm_weight_ptr;
+        common_enqueue_params.k_norm_weight = k_norm_weight_ptr;
+        common_enqueue_params.qk_norm_eps = static_cast<float>(qk_norm_eps);
+        common_enqueue_params.qk_norm_use_gemma = qk_norm_use_gemma;
         common_enqueue_params.attention_sinks = attention_sinks_ptr;
         common_enqueue_params.rotary_inv_freq = rotary_inv_freq_ptr;
         common_enqueue_params.rotary_cos_sin = rotary_cos_sin_ptr;
@@ -1084,7 +1130,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<int64_t> compressed_kv_cache_pool_ptr, bool const is_cross, std::optional<torch::Tensor> cross_kv,
     std::optional<torch::Tensor> relative_attention_bias, int64_t relative_attention_max_distance,
     std::optional<int64_t> spec_decoding_target_max_draft_tokens, std::optional<torch::Tensor> quant_scale_qkv,
-    std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion)
+    std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion,
+    std::optional<torch::Tensor> q_norm_weight, std::optional<torch::Tensor> k_norm_weight, double qk_norm_eps,
+    bool qk_norm_use_gemma)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -1384,7 +1432,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             num_sparse_topk_value, sparse_mla_topk_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
             mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
             trtllm_gen_jit_warmup, compressed_kv_cache_pool_ptr, is_cross, cross_kv, relative_attention_bias,
-            quant_scale_qkv, dsv4_inv_rope_cos_sin_cache, enable_dsv4_epilogue_fusion);
+            quant_scale_qkv, dsv4_inv_rope_cos_sin_cache, enable_dsv4_epilogue_fusion, q_norm_weight, k_norm_weight,
+            qk_norm_eps, qk_norm_use_gemma);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -1407,7 +1456,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             num_sparse_topk_value, sparse_mla_topk_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
             mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
             trtllm_gen_jit_warmup, compressed_kv_cache_pool_ptr, is_cross, cross_kv, relative_attention_bias,
-            quant_scale_qkv, dsv4_inv_rope_cos_sin_cache, enable_dsv4_epilogue_fusion);
+            quant_scale_qkv, dsv4_inv_rope_cos_sin_cache, enable_dsv4_epilogue_fusion, q_norm_weight, k_norm_weight,
+            qk_norm_eps, qk_norm_use_gemma);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", local_layer_idx);
