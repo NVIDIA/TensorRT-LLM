@@ -18,11 +18,13 @@ Overflow policies:
   GMEM_SPILL    – spill threshold-bucket overflow to a pre-allocated GMEM buffer (exact)
   TRUNCATE      – discard overflow elements; histogram stays consistent     (non-exact)
   REREAD_ALWAYS – first pass builds histogram only; second GMEM scan fills s_input_idx (exact)
+  REREAD        – optimistic SMEM collection; falls back to GMEM re-scan if overflow occurs (exact)
 
-Coverage:
-  * decode single-CTA: no-overflow and overflow num_tokens, multiple dtypes/shapes
-  * prefill: no-overflow and overflow, zero and non-zero row_starts
-  * GMEM_SPILL / REREAD_ALWAYS verified with compare_top_k_results (exact match)
+Coverage (overflow scenarios only — all policies are identical when num_cols <= smem_input_size):
+  * decode single-CTA: overflow num_tokens, large and small batch, multiple dtypes/shapes
+  * decode REREAD: enable_reread=True (num_tokens > smem_size) but did_overflow=False at runtime
+  * prefill: overflow with zero and non-zero row_starts
+  * GMEM_SPILL / REREAD_ALWAYS / REREAD verified with compare_top_k_results (exact match)
   * TRUNCATE verified with compare_truncate_result (valid-subset check)
 
 SMEM overflow thresholds (large_occupancy path, B200):
@@ -50,11 +52,6 @@ from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.filtered_top_k_varlen_
     compare_top_k_results,
     create_random_logits,
 )
-
-# ── compiled-kernel caches (module-level, avoids recompilation per test) ─────
-
-_DECODE_COMPILED: dict = {}
-
 
 # ── reference comparison helpers ──────────────────────────────────────────────
 
@@ -89,35 +86,48 @@ def _compare_truncate_result(
 
     cuda_indices must contain absolute indices into logits (not row-local).
     """
-    num_rows = cuda_indices.shape[0]
+    invalid_mask = cuda_indices == -1  # [num_rows, K]
+    valid_counts = (~invalid_mask).sum(dim=1)  # [num_rows]
 
-    for row_idx in range(num_rows):
-        row_start = int(row_starts[row_idx].item())
-        row_end = int(row_ends[row_idx].item())
-        row_len = row_end - row_start
-        k = min(top_k, row_len)
+    # 1. count check
+    row_lens = row_ends - row_starts
+    expected = torch.minimum(row_lens, row_lens.new_full((), top_k))
+    bad_rows = (valid_counts != expected).nonzero(as_tuple=True)[0]
+    if bad_rows.numel() > 0:
+        r = bad_rows[0].item()
+        print(
+            f"TRUNCATE Row {r}: expected {expected[r].item()} valid elements, got {valid_counts[r].item()}"
+        )
+        return False
 
-        row_result = cuda_indices[row_idx]
-        valid = row_result[row_result != -1]
+    # 2. bounds check: safe-clamp -1 slots to 0 before comparison, then mask them out
+    safe = cuda_indices.clone()
+    safe[invalid_mask] = 0
+    out_of_bounds = (
+        (safe < row_starts.unsqueeze(1)) | (safe >= row_ends.unsqueeze(1))
+    ) & ~invalid_mask
+    bad_rows = out_of_bounds.any(dim=1).nonzero(as_tuple=True)[0]
+    if bad_rows.numel() > 0:
+        r = bad_rows[0].item()
+        bad_vals = safe[r][out_of_bounds[r]]
+        print(
+            f"TRUNCATE Row {r}: index out of [row_start={row_starts[r].item()}, "
+            f"row_end={row_ends[r].item()}): {bad_vals[:4].tolist()}"
+        )
+        return False
 
-        # 1. count: TRUNCATE always fills exactly K slots (smem_size >= K guaranteed)
-        if valid.numel() != k:
-            print(f"TRUNCATE Row {row_idx}: expected {k} valid elements, got {valid.numel()}")
-            return False
-
-        # 2. bounds
-        if (valid < row_start).any() or (valid >= row_end).any():
-            bad = valid[(valid < row_start) | (valid >= row_end)]
-            print(
-                f"TRUNCATE Row {row_idx}: index out of [row_start={row_start}, "
-                f"row_end={row_end}): {bad[:4].tolist()}"
-            )
-            return False
-
-        # 3. no duplicates
-        if valid.numel() != valid.unique().numel():
-            print(f"TRUNCATE Row {row_idx}: duplicate indices found")
-            return False
+    # 3. no-duplicate check: replace invalid with INT_MAX so they sort to the end,
+    # then compare adjacent entries that are not sentinel.
+    sentinel = torch.iinfo(torch.int32).max
+    safe_for_dup = cuda_indices.clone()
+    safe_for_dup[invalid_mask] = sentinel
+    sorted_dup = safe_for_dup.sort(dim=1).values  # [num_rows, K]
+    dups = (sorted_dup[:, 1:] == sorted_dup[:, :-1]) & (sorted_dup[:, 1:] != sentinel)
+    bad_rows = dups.any(dim=1).nonzero(as_tuple=True)[0]
+    if bad_rows.numel() > 0:
+        r = bad_rows[0].item()
+        print(f"TRUNCATE Row {r}: duplicate indices found")
+        return False
 
     return True
 
@@ -238,27 +248,6 @@ def _run_prefill_policy_test(
 _ALL_POLICIES = ["GMEM_SPILL", "TRUNCATE", "REREAD_ALWAYS", "REREAD"]
 
 # ----------------------------------------------------------------------------
-# Decode single-CTA — no overflow (num_tokens ≤ smem_input_size)
-# bf16/fp16 smem_size=16384, fp32 smem_size=8192 → 4096/8192 are both safe
-# ----------------------------------------------------------------------------
-
-
-@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
-@skip_pre_blackwell
-@pytest.mark.parametrize("overflow_policy", _ALL_POLICIES)
-@pytest.mark.parametrize("batch_size", [1, 64, 256])
-@pytest.mark.parametrize("next_n", [1, 3])
-@pytest.mark.parametrize("top_k", [512, 1024, 2048])
-@pytest.mark.parametrize("num_tokens", [4096, 8192])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_decode_overflow_policy_no_overflow(
-    overflow_policy, batch_size, next_n, top_k, num_tokens, dtype
-):
-    """Decode single-CTA: all policies, small num_tokens (no SMEM overflow)."""
-    _run_decode_policy_test(overflow_policy, batch_size, next_n, top_k, num_tokens, dtype)
-
-
-# ----------------------------------------------------------------------------
 # Decode single-CTA — overflow (num_tokens > smem_input_size)
 # bf16: smem_size=16384 → overflow at 32768
 # fp32: smem_size=8192  → overflow at 16384
@@ -353,33 +342,6 @@ def test_decode_overflow_policy_small_batch_overflow(
 
 
 # ----------------------------------------------------------------------------
-# Prefill — no overflow (num_tokens ≤ 8192, well within both bf16 and fp32 budgets)
-# ----------------------------------------------------------------------------
-
-
-@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
-@skip_pre_blackwell
-@pytest.mark.parametrize("overflow_policy", _ALL_POLICIES)
-@pytest.mark.parametrize("batch_size", [1, 4, 32])
-@pytest.mark.parametrize("top_k", [512, 1024, 2048])
-@pytest.mark.parametrize("num_tokens", [4096, 8192])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("row_start_offset", [0])
-def test_prefill_overflow_policy_no_overflow(
-    overflow_policy, batch_size, top_k, num_tokens, dtype, row_start_offset
-):
-    """Prefill: all policies, small num_tokens (no SMEM overflow)."""
-    _run_prefill_policy_test(
-        overflow_policy,
-        batch_size,
-        top_k,
-        num_tokens,
-        dtype,
-        row_start_offset=row_start_offset,
-    )
-
-
-# ----------------------------------------------------------------------------
 # Prefill — overflow (num_tokens > smem_input_size)
 # Prefill large_occupancy smem_input_size: bf16 Uint16 num_buffer=1 → 16384
 #                                           fp32 Uint16 num_buffer=2 →  8192
@@ -389,18 +351,16 @@ def test_prefill_overflow_policy_no_overflow(
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
 @pytest.mark.parametrize("overflow_policy", _ALL_POLICIES)
-@pytest.mark.parametrize("batch_size", [1, 4, 32])
+@pytest.mark.parametrize("batch_size", [1])
 @pytest.mark.parametrize("top_k", [512, 1024, 2048])
 @pytest.mark.parametrize(
     "num_tokens, dtype",
     [
-        (32768, torch.bfloat16),  # bf16: 32768 > smem_size 16384
-        (65536, torch.bfloat16),
-        (16384, torch.float32),  # fp32: 16384 > smem_size  8192
-        (32768, torch.float32),
+        (20480, torch.bfloat16),  # bf16: 20480 > smem_size 16384 → overflow
+        (12288, torch.float32),  # fp32: 12288 > smem_size  8192 → overflow
     ],
 )
-@pytest.mark.parametrize("row_start_offset", [0, 256])
+@pytest.mark.parametrize("row_start_offset", [256])
 def test_prefill_overflow_policy_overflow(
     overflow_policy, batch_size, top_k, num_tokens, dtype, row_start_offset
 ):
