@@ -679,6 +679,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
         encoder_input_tokens = kwargs.get("encoder_input_tokens")
         encoder_output_len = kwargs.get("encoder_output_len")
+        # Python-side handle to the encoder feature tensor (audio enc-dec
+        # models): the C++ binding takes the kwarg but exposes no getter, so
+        # the encoder step reads it here. Kept for the request's lifetime —
+        # pause() re-enters ENCODER_INIT and re-runs the encoder from it.
+        self.py_encoder_input_features = kwargs.get("encoder_input_features")
         return_encoder_output = bool(kwargs.get("return_encoder_output", False))
         if return_encoder_output:
             kwargs["return_encoder_output"] = False
@@ -1108,6 +1113,29 @@ def executor_request_to_llm_request(
     if getattr(executor_request, "py_scheduling_params", None) is not None:
         agent_hierarchy = executor_request.py_scheduling_params.agent_hierarchy
 
+    # Audio encoder-decoder models (e.g. Whisper) carry the encoder input as a
+    # feature tensor, not encoder token ids. Route it into the request's native
+    # encoder_input_features / encoder_output_len fields so the C++ state machine
+    # admits it to the encoder step and cross-KV sizing sees the post-encoder
+    # length rather than a token count.
+    encoder_input_features = None
+    encoder_output_len = None
+    py_mm_data = getattr(executor_request, "py_multimodal_data", None) or {}
+    audio_mm_data = py_mm_data.get("audio") or {}
+    if isinstance(audio_mm_data, dict):
+        # Only enc-dec input processors emit encoder_input_features (decoder-only
+        # audio models use the generic HF input_features), so its presence is a
+        # safe routing signal.
+        encoder_input_features = audio_mm_data.get("encoder_input_features")
+        if encoder_input_features is not None:
+            if "encoder_output_len" not in audio_mm_data:
+                raise ValueError(
+                    "multimodal_data['audio'] carries encoder_input_features "
+                    "without encoder_output_len; encoder-decoder input "
+                    "processors must emit both (the post-encoder length "
+                    "sizes the cross-KV cache).")
+            encoder_output_len = int(audio_mm_data["encoder_output_len"])
+
     llm_request = LlmRequest(
         request_id=req_id,
         max_new_tokens=executor_request.max_tokens,
@@ -1167,6 +1195,8 @@ def executor_request_to_llm_request(
         py_logits_post_processors=getattr(executor_request,
                                           "py_logits_post_processors", None),
         encoder_input_tokens=executor_request.encoder_input_token_ids,
+        encoder_input_features=encoder_input_features,
+        encoder_output_len=encoder_output_len,
         return_encoder_output=executor_request.output_config.
         return_encoder_output,
         client_id=executor_request.client_id
