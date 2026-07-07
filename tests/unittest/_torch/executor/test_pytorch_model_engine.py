@@ -337,7 +337,16 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         num_free_before = kv_cache_manager.get_num_free_blocks()
         model_engine.warmup(resource_manager)
-        # Make sure we don't leak any blocks.
+
+        # Warmup pre-allocates the CUDA graph padding dummy (draft_len 0),
+        # which intentionally keeps holding its KV blocks so padding cannot
+        # fall back to eager once the cache saturates.
+        padding_dummies = model_engine.cuda_graph_runner.padding_dummy_requests
+        self.assertIn(0, padding_dummies)
+
+        # Make sure we don't leak any blocks beyond that dummy: freeing it
+        # must restore the exact pre-warmup free-block count.
+        kv_cache_manager.free_resources(padding_dummies[0])
         self.assertEqual(num_free_before,
                          kv_cache_manager.get_num_free_blocks())
 

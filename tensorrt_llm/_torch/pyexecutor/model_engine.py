@@ -1090,6 +1090,12 @@ class PyTorchModelEngine(ModelEngine):
             self._general_warmup(resource_manager, warmup_requests_configs)
             log_mem_snapshot("warmup/after_memory_pool_prepop")
 
+        # Allocate the CUDA graph padding dummy now, while the KV cache is
+        # empty. Waiting for the first padded step can race KV saturation:
+        # once the cache is full, the lazy allocation in _get_padded_batch
+        # fails every step and padded batches silently run eager.
+        self.cuda_graph_runner.preallocate_padding_dummy(resource_manager)
+
     def _general_warmup(self, resource_manager: ResourceManager,
                         warmup_requests_configs: List[Tuple[int, int]]):
         """
