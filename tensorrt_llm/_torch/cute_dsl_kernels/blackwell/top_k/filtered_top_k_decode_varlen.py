@@ -547,6 +547,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             output_indices,
             output_values,
             enable_persistent_dynamic_scheduling,
+            # TODO: fix this issue. delete this param, Need to set it in launch parameters.
             min_blocks_per_mp,
         ).launch(
             grid=blocks,
