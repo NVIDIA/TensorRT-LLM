@@ -8,7 +8,6 @@ accuracy/test_disaggregated_serving.py::TestQwen3NextInstruct::test_auto_dtype[u
 accuracy/test_disaggregated_serving.py::TestQwen3_30B_A3B::test_mixed_ctx_gen_model[ctxpp2gentp2] SKIP (https://nvbugs/5748664)
 accuracy/test_epd_disagg_multimodal.py::TestVideoMMEEPD::test_disaggregated_videomme[qwen3vl_2b_instruct] SKIP (https://nvbugs/6422294)
 accuracy/test_llm_api.py::TestLlama3_1_8BInstruct::test_guided_decoding_4gpus[xgrammar] SKIP (https://nvbugs/5346443)
-accuracy/test_llm_api_autodeploy.py::TestGemmaE2B::test_gemma3n_e2b_it SKIP (https://nvbugs/6417265)
 accuracy/test_llm_api_autodeploy.py::TestMiniMaxM2::test_finegrained_fp8 SKIP (https://nvbugs/6396422)
 accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[bf16-4-attn_dp_off-trtllm] SKIP (https://nvbugs/6367792)
 accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-4-attn_dp_off-trtllm] SKIP (https://nvbugs/6367792)
