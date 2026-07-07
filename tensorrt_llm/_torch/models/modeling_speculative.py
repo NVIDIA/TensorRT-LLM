@@ -1218,6 +1218,9 @@ class DFlashForCausalLM(nn.Module):
         ctx_k_cache: torch.Tensor,
         ctx_v_cache: torch.Tensor,
         ctx_cache_batch_idx: torch.Tensor,
+        hybrid_k_bufs: Optional[List[torch.Tensor]] = None,
+        hybrid_v_bufs: Optional[List[torch.Tensor]] = None,
+        hybrid_block_idx: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """DFlash draft forward with cross-attention over a pooled K/V buffer.
 
@@ -1230,10 +1233,17 @@ class DFlashForCausalLM(nn.Module):
             ctx_k_cache: [pool_batch, L, max_ctx+block_size, nkv, hd]
             ctx_v_cache: [pool_batch, L, max_ctx+block_size, nkv, hd]
             ctx_cache_batch_idx: [B] — slot index into the pool per batch entry
+            hybrid_k_bufs/hybrid_v_bufs: per-layer manager pool views
+                [pages, tokens_per_block, nkv, hd] (hybrid ctx only)
+            hybrid_block_idx: [B, W] page ids per request (hybrid ctx only)
         Returns:
             [B * block_size, hidden_size]
         """
-        from flash_attn import flash_attn_with_kvcache
+        if hybrid_k_bufs is not None:
+            from ..speculative.dflash_hybrid_attn import \
+                dflash_ctx_paged_attention
+        else:
+            from flash_attn import flash_attn_with_kvcache
 
         if self._fused_kv_weight is None:
             self._build_fused_kv_buffers()
@@ -1365,24 +1375,37 @@ class DFlashForCausalLM(nn.Module):
                                                    num_kv_heads_per_rank,
                                                    head_dim)
 
-            # Per-layer view into the pooled ctx cache.
-            # [pool_batch, max_ctx+block, nkv, hd]; flash_attn dereferences
-            # each batch via cache_batch_idx, no gather.
-            layer_k_cache = ctx_k_cache[:, layer_idx]
-            layer_v_cache = ctx_v_cache[:, layer_idx]
+            if hybrid_k_bufs is not None:
+                # Hybrid: ctx K/V paged in the target manager's pool; the
+                # per-step noise K/V is a dense suffix, never cached.
+                out = dflash_ctx_paged_attention(
+                    Q_bshd,
+                    hybrid_k_bufs[layer_idx],
+                    hybrid_v_bufs[layer_idx],
+                    hybrid_block_idx,
+                    cache_seqlens_i32,
+                    k_noise_bshd,
+                    v_noise_bshd,
+                )
+            else:
+                # Per-layer view into the pooled ctx cache.
+                # [pool_batch, max_ctx+block, nkv, hd]; flash_attn dereferences
+                # each batch via cache_batch_idx, no gather.
+                layer_k_cache = ctx_k_cache[:, layer_idx]
+                layer_v_cache = ctx_v_cache[:, layer_idx]
 
-            # flash_attn appends k_noise/v_noise in-place at
-            # cache_seqlens[i]..+block_size for each batch i.
-            out = flash_attn_with_kvcache(
-                q=Q_bshd,
-                k_cache=layer_k_cache,
-                v_cache=layer_v_cache,
-                k=k_noise_bshd,
-                v=v_noise_bshd,
-                cache_seqlens=cache_seqlens_i32,
-                cache_batch_idx=cache_batch_idx_i32,
-                causal=False,
-            )
+                # flash_attn appends k_noise/v_noise in-place at
+                # cache_seqlens[i]..+block_size for each batch i.
+                out = flash_attn_with_kvcache(
+                    q=Q_bshd,
+                    k_cache=layer_k_cache,
+                    v_cache=layer_v_cache,
+                    k=k_noise_bshd,
+                    v=v_noise_bshd,
+                    cache_seqlens=cache_seqlens_i32,
+                    cache_batch_idx=cache_batch_idx_i32,
+                    causal=False,
+                )
             attn_output = out.reshape(B * block_size, q_size)
 
             # o_proj (flat 2D, handles all-reduce internally)
