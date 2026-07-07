@@ -554,7 +554,7 @@ def cute_dsl_topk_wrapper(
         compiled_kernel = cute.compile(
             filtered_topk_func,
             input_fake,
-            None,  # indices_fake,
+            None,  # indices_fake: unused in this path; pass None to match runtime
             buffer_fake,
             seqlen_fake,
             output_indices_fake,
@@ -679,7 +679,7 @@ def cute_dsl_topk_multi_cta_wrapper(
         compiled_kernel_first = cute.compile(
             filtered_topk_func_first,
             input_fake,
-            None,  # indices_fake,
+            None,  # indices_fake: unused in this path; pass None to match runtime
             buffer_fake,
             seqlen_fake,
             # output_indices_fake,
