@@ -167,7 +167,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         enable_dynamic_multi_cta: bool = False,
         varlen_merge_input: bool = False,
         num_sms: int = 148,
-        overflow_policy: str = "GMEM_SPILL",
+        overflow_policy: str = "REREAD",
     ):
         self._large_occupancy = large_occupancy
         super().__init__(
@@ -595,7 +595,7 @@ def cute_dsl_topk_wrapper(
     return_val=True,
     load_balance=False,
     num_copy_bits=256,
-    overflow_policy: str = "GMEM_SPILL",
+    overflow_policy: str = "REREAD",
 ):
     torch_dtype = input_values.dtype
     dtype = _TORCH_TO_CUTLASS_DTYPE[torch_dtype]

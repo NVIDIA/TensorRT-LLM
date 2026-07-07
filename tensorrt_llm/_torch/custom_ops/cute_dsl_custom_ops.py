@@ -4908,7 +4908,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return_val: bool = False,
             num_copy_bits: int = 256,
             load_balance: bool = False,
-            overflow_policy: str = "GMEM_SPILL",
+            overflow_policy: str = "REREAD",
             output_indices: Optional[torch.Tensor] = None,
         ):
             """Execute filtered top-k selection on input logits."""
@@ -5176,7 +5176,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             top_k: int,
             return_val: bool = False,
             num_copy_bits: int = 256,
-            overflow_policy: str = "GMEM_SPILL",
+            overflow_policy: str = "REREAD",
             output_indices: Optional[torch.Tensor] = None,
         ):
             """Execute filtered top-k selection for prefill rows."""
@@ -5243,7 +5243,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         row_ends: torch.Tensor,
         top_k: int,
         num_copy_bits: int = 256,
-        overflow_policy: str = "GMEM_SPILL",
+        overflow_policy: str = "REREAD",
     ) -> torch.Tensor:
         """CuTE DSL radix-based top-k for prefill.
 
@@ -5281,7 +5281,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         row_ends: torch.Tensor,
         top_k: int,
         num_copy_bits: int = 256,
-        overflow_policy: str = "GMEM_SPILL",
+        overflow_policy: str = "REREAD",
     ):
         num_rows = input_values.shape[0]
         return input_values.new_empty((num_rows, top_k), dtype=torch.int32)
@@ -6040,7 +6040,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         dynamic: bool = True,
         single_pass_multi_cta: bool = False,
         single_pass_multi_cta_cluster: bool = False,
-        overflow_policy: str = "GMEM_SPILL",
+        overflow_policy: str = "REREAD",
     ) -> None:
         """Unified CuTE DSL Top-K that auto-selects single-CTA or multi-CTA (2-pass multi-CTA) or
         single-pass multi-CTA. When single_pass_multi_cta=True, it selects between single-CTA
@@ -6230,7 +6230,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         dynamic: bool = True,
         single_pass_multi_cta: bool = False,
         single_pass_multi_cta_cluster: bool = False,
-        overflow_policy: str = "GMEM_SPILL",
+        overflow_policy: str = "REREAD",
     ) -> None:
         return None
 

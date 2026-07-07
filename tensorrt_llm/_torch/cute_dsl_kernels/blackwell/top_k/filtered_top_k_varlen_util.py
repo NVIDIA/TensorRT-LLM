@@ -50,7 +50,7 @@ class FilteredTopKKernelVarlen:
         chunk_size_per_cta: int = 16384,
         num_ctas_per_row: int = 1,
         merge_blocks: bool = False,
-        overflow_policy: str = "GMEM_SPILL",
+        overflow_policy: str = "REREAD",
     ):
         """
         Args:

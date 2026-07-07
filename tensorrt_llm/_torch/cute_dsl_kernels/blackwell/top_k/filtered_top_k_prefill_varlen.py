@@ -52,7 +52,7 @@ class FilteredTopKKernelVarlenPrefill(FilteredTopKKernelVarlen):
         top_k: int,
         num_copy_bits: int = 256,
         return_val: bool = False,
-        overflow_policy: str = "GMEM_SPILL",
+        overflow_policy: str = "REREAD",
     ):
         super().__init__(
             dtype,
