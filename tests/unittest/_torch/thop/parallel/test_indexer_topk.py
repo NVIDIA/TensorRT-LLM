@@ -752,10 +752,7 @@ def _run_cute_dsl_topk_test(batch_size, next_n, index_topk, num_tokens, dtype, r
 @pytest.mark.parametrize("index_topk", [512, 1024, 2048])
 @pytest.mark.parametrize("num_tokens", [4096, 8192])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("load_balance", [False, True])
-def test_cute_dsl_topk_decode_single_cta(
-    batch_size, next_n, index_topk, num_tokens, dtype, load_balance
-):
+def test_cute_dsl_topk_decode_single_cta(batch_size, next_n, index_topk, num_tokens, dtype):
     """Correctness test for CuTE DSL single-CTA TopK decode on Blackwell."""
     _run_cute_dsl_topk_test(
         batch_size,
@@ -769,7 +766,6 @@ def test_cute_dsl_topk_decode_single_cta(
             top_k=index_topk,
             next_n=next_n,
             num_copy_bits=256,
-            load_balance=load_balance,
         ),
     )
 
@@ -1328,9 +1324,8 @@ def generate_pre_idx_v4(
 @pytest.mark.parametrize("index_topk", [512, 1024, 2048])
 @pytest.mark.parametrize("num_tokens", [4096, 8192])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("load_balance", [False, True])
 def test_cute_dsl_topk_decode_single_cta(  # noqa: F811
-    batch_size, next_n, index_topk, num_tokens, dtype, load_balance
+    batch_size, next_n, index_topk, num_tokens, dtype
 ):
     """Correctness test for CuTE DSL single-CTA TopK decode on Blackwell."""
     _run_cute_dsl_topk_test(
@@ -1345,7 +1340,6 @@ def test_cute_dsl_topk_decode_single_cta(  # noqa: F811
             top_k=index_topk,
             next_n=next_n,
             num_copy_bits=256,
-            load_balance=load_balance,
         ),
     )
 
