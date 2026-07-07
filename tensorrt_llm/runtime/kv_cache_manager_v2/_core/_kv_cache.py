@@ -1600,8 +1600,9 @@ class _KVCache:
                 assert not block.is_committed
                 for beam_block in block.pages:
                     if beam_block[lc_idx] is None:
-                        assert self.enable_swa_scratch_reuse or self.manager.commit_min_snapshot
-                        continue  # Scratch or commit_min_snapshot block — already handled
+                        # Nothing to release: scratch block, commit_min_snapshot early
+                        # release, or a stale block created unallocated by resize().
+                        continue
                     assert isinstance(beam_block[lc_idx], _PageHolder)
                     beam_block[lc_idx] = None
         assert NDEBUG or self._check_sanity()
@@ -1638,8 +1639,9 @@ class _KVCache:
                     )
                     for beam_idx, beam_block in typed_enumerate(block.pages):
                         if beam_block[lc_idx] is None:
-                            assert self.enable_swa_scratch_reuse or self.manager.commit_min_snapshot
-                            continue  # Scratch or commit_min_snapshot block — no page to unlock
+                            # No page to unlock: scratch block, commit_min_snapshot early
+                            # release, or a stale block created unallocated by resize().
+                            continue
                         holder = expect_type(_SharedPageLock, beam_block[lc_idx]).holder
                         ret.append((ordinal, beam_idx, lc_idx, holder))
                         beam_block[lc_idx] = holder if hold_for_commit else None
