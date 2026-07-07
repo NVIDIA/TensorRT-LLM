@@ -2697,13 +2697,7 @@ class Indexer(nn.Module):
                         metadata.heuristic_scratch_values[
                             :num_gen_tokens]
 
-                # CuTE DSL top-k with GMEM_SPILL allocates O(num_gen_tokens *
-                # kv_len) global memory. Beyond 256 tokens the extra memory
-                # becomes significant, so we cap it at 256 for now and fall
-                # back to the CUDA C++ indexer_topk_decode.
-                # TODO: remove this cap once overflow_policy defaults to REREAD
-                # (no extra_buffer needed, no OOM risk at large num_gen_tokens).
-                if (self.use_cute_dsl_topk and num_gen_tokens <= 256
+                if (self.use_cute_dsl_topk
                         and (self.compress_ratio == 1 or next_n == 1)):
                     torch.ops.trtllm.cute_dsl_indexer_topk_decode(
                         logits_decode, context_lens
