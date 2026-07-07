@@ -608,7 +608,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     ) -> Tuple[bool, str]:
         is_mla_enable = attn.is_mla_enable
         sparse_params = attn.sparse_params
-        has_skip_softmax = getattr(sparse_params, "algorithm", None) == "skip_softmax"
+        has_skip_softmax = sparse_params is not None and sparse_params.algorithm == "skip_softmax"
         has_sparse_attention = sparse_params is not None and not has_skip_softmax
         if fwd.compact_pseudokv is not None:
             return False, "trtllm-gen does not support compact pseudo-KV."

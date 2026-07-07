@@ -191,6 +191,9 @@ def inplace_info():
         "gdn_custom_op_inplace": {
             1: "output"
         },
+        "minimax_m3_attn_custom_op_inplace": {
+            1: "output"
+        },
     }
     for op_name, mutates_args in optional_inplace_infos.items():
         op = get_optional_trtllm_op(op_name)

@@ -816,7 +816,8 @@ class MegaMoECuteDsl(MoE):
     def post_load_weights(self) -> None:
         if self.quant_method is None:
             self.create_weights()
-        self.quant_method.post_load_weights(self)
+        self.transform_weights()
+        self.cache_derived_state()
 
     def process_weights_after_loading(self) -> None:
         """Run quant-method weight transforms; idempotent across calls.
