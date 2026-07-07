@@ -60,6 +60,7 @@ from .._page import (
     _PageHolder,
     _SharedPageLock,
     batched_lock_to_gpu,
+    bulk_lock_new_pages,
 )
 from .._stats import KVCacheIterationStatsDelta, KVCacheStatsDelta
 from .._storage._core import Slot
@@ -827,28 +828,66 @@ class _KVCache:
                 excluded_ranges,
                 record_generation_alloc_stats,
             )
-            for ordinal in typed_range(old_num_blocks, new_num_blocks):
-                block = make_typed(
-                    lambda _: filled_list(cast(BlockPage, None), num_life_cycles), beam_width
+            # Range-decomposed bulk path. Instead of building the page-lock object tree
+            # block-by-block (per ordinal x beam x lc), decompose [old, new) per life
+            # cycle into contiguous allocatable segments (the complement of the
+            # stale/scratch range) and build each segment's locks in one fused loop
+            # (bulk_lock_new_pages). Semantics match the per-block path; two deliberate
+            # differences:
+            #  - slot-to-ordinal assignment order (slots of one pool are fungible here:
+            #    all ready events were waited above),
+            #  - _base_page_indices is written per segment via slice assignment instead
+            #    of per element inside _SharedPageLock.__init__.
+            num_new = int(new_num_blocks) - int(old_num_blocks)
+            new_block_range = HalfOpenRange(old_num_blocks, new_num_blocks)
+            new_grids = [
+                cast(
+                    "TypedIndexList[BeamIndex, TypedIndexList[LifeCycleId, BlockPage]]",
+                    [[None] * int(num_life_cycles) for _ in range(int(beam_width))],
                 )
+                for _ in range(num_new)
+            ]
+            for lc in typed_range(num_life_cycles):
+                if lc == ssm_lc_id:
+                    continue  # SSM pages live in _ssm_blocks, not in _blocks
+                excluded = intersect(
+                    scratch_ranges[lc] if enable_scratch else stale_ranges[lc],
+                    new_block_range,
+                )
+                if excluded:
+                    segments = [
+                        HalfOpenRange(old_num_blocks, excluded.beg),
+                        HalfOpenRange(excluded.end, new_num_blocks),
+                    ]
+                else:
+                    segments = [new_block_range]
+                lc_slots = slots[lc]
                 for beam_index in typed_range(beam_width):
-                    for lc in typed_range(num_life_cycles):
-                        if lc == ssm_lc_id:
-                            continue  # SSM pages live in _ssm_blocks, not in _blocks
-                        if enable_scratch:
-                            # Assertion guarantees no new block is stale.
-                            if ordinal in scratch_ranges[lc]:
-                                continue  # Scratch block — no per-block page allocation
-                        else:
-                            stale_beg, stale_end = stale_ranges[lc]
-                            if stale_beg <= ordinal < stale_end:
-                                continue
-                        slot = slots[lc].pop()
+                    for seg in segments:
+                        if not seg:
+                            continue
+                        n = len(seg)
                         # We have already waited for ready_event of the slots.
-                        block[beam_index][lc] = UncommittedPage(
-                            self, ordinal, lc, GPU_LEVEL, slot, beam_index
-                        ).lock(self, beam_index, ordinal, lc, skip_wait=True)
-                self._blocks.append(SeqBlock(block, None))
+                        seg_slots = lc_slots[-n:]
+                        del lc_slots[-n:]
+                        locks, page_ids = bulk_lock_new_pages(
+                            self, beam_index, lc, GPU_LEVEL, seg.beg, seg_slots
+                        )
+                        base = int(seg.beg) - int(old_num_blocks)
+                        for i, locked in enumerate(locks):
+                            new_grids[base + i][beam_index][lc] = locked
+                        indices = self._base_page_indices[beam_index][lc]
+                        assert NDEBUG or all(
+                            indices[o] == BAD_PAGE_INDEX for o in range(seg.beg, seg.end)
+                        )
+                        if type(indices) is array.array:
+                            indices[seg.beg : seg.end] = page_ids
+                        else:
+                            seg_beg_i = int(seg.beg)
+                            for i in range(n):
+                                indices[seg_beg_i + i] = page_ids[i]
+            for grid in new_grids:
+                self._blocks.append(SeqBlock(grid, None))
             assert all(len(slots[lc]) == 0 for lc in typed_range(num_life_cycles))
         self._capacity = capacity
         self._history_length = history_length

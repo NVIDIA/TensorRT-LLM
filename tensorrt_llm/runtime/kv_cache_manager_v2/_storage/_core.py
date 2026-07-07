@@ -22,6 +22,7 @@ import warnings
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
+from itertools import chain
 from typing import ClassVar, NewType, final
 
 if sys.version_info[:2] >= (3, 12):
@@ -372,7 +373,45 @@ class SlotAllocator:
     def allocate_multiple(self, num_slots: int) -> list[Slot]:
         if self.num_free_slots < num_slots:
             raise OutOfPagesError("Not enough free slots")
-        return [self.allocate() for _ in range(num_slots)]
+        if num_slots == 0:
+            return []
+        # Batched equivalent of calling allocate() num_slots times, with the same
+        # preference order (ready recycled > new > not-ready recycled) and the same
+        # return order, but the batch structure is decided once instead of being
+        # re-evaluated per slot. One deliberate difference: events are scrubbed once
+        # up front, so a recycled slot whose event completes mid-batch may be handed
+        # out as not-ready; callers must wait on ready_event either way.
+        self._scrub_events()
+        recycled = self._recycled_slots
+        num_ready = self._num_ready_recycled_slots
+        num_from_ready = min(num_ready, num_slots)
+        mint_headroom = min(self.num_slots, self._target_capacity) - self._num_active_slots
+        num_minted = min(max(mint_headroom, 0), num_slots - num_from_ready)
+        num_from_pending = num_slots - num_from_ready - num_minted
+        assert num_from_pending <= len(recycled) - num_from_ready
+        out: list[Slot] = []
+        for _ in range(num_from_ready):
+            out.append(recycled.popleft())
+        self._num_ready_recycled_slots = num_ready - num_from_ready
+        assert NDEBUG or all(
+            s.has_valid_slot and s.ready_event is CachedCudaEvent.NULL for s in out
+        )
+        if num_minted:
+            base = self._num_active_slots
+            null_event = CachedCudaEvent.NULL
+            out.extend(Slot(SlotId(base + i), null_event) for i in range(num_minted))
+            self._num_active_slots = base + num_minted
+            self._occupied_mask.set_range(base, base + num_minted)
+        for _ in range(num_from_pending):
+            slot = recycled.popleft()
+            assert slot.has_valid_slot
+            out.append(slot)
+        if num_from_ready or num_from_pending:
+            self._occupied_mask.set_many(
+                s.slot_id for s in chain(out[:num_from_ready], out[num_from_ready + num_minted :])
+            )
+        assert NDEBUG or self._check()
+        return out
 
     def release(self, slot: Slot) -> None:
         assert slot.has_valid_slot

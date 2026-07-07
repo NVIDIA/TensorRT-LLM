@@ -660,6 +660,38 @@ class DynamicBitset:
             self._bits[index // 64] &= ~(1 << (index % 64))
             self._num_set_bits -= 1
 
+    def set_many(self, indices: "Iterable[int]") -> None:
+        "Batched set(). Equivalent to calling set() for each index."
+        bits = self._bits
+        num_new = 0
+        for index in indices:
+            word = index >> 6
+            mask = 1 << (index & 63)
+            if not bits[word] & mask:
+                bits[word] |= mask
+                num_new += 1
+        self._num_set_bits += num_new
+
+    def set_range(self, beg: int, end: int) -> None:
+        "Batched set() for a contiguous [beg, end) range; sets whole 64-bit words at a time."
+        if beg >= end:
+            return
+        bits = self._bits
+        num_new = 0
+        word_beg, word_end = beg >> 6, (end - 1) >> 6
+        for word in range(word_beg, word_end + 1):
+            mask = self.ALL_SET_MASK
+            if word == word_beg:
+                mask &= self.ALL_SET_MASK << (beg & 63) & self.ALL_SET_MASK
+            if word == word_end:
+                mask &= self.ALL_SET_MASK >> (63 - ((end - 1) & 63))
+            old = bits[word]
+            new = old | mask
+            if new != old:
+                num_new += (new ^ old).bit_count()
+                bits[word] = new
+        self._num_set_bits += num_new
+
     @property
     def num_set_bits(self) -> int:
         return self._num_set_bits
