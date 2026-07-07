@@ -1269,6 +1269,9 @@ public:
     void onboardBlock(GenerationRequest& sequence, BlockPtr const& offloadBlock,
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
 
+    //! \brief True when every block held by requestId has its disk read landed (safe to forward).
+    [[nodiscard]] bool areBlocksReady(LlmRequest::RequestIdType requestId);
+
     //! \brief Bring block from primary to secondary memory.
     //! \details Does nothing if block is already in secondary memory.
     void offloadBlock(BlockPtr const& block, executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM,
@@ -1712,6 +1715,9 @@ public:
     //! \details Does nothing if block is already in primary memory.
     void onboardBlock(GenerationRequest& sequence, BlockPtr const& offloadBlock, SizeType32 windowSize,
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
+
+    //! \brief True when every block held by requestId (across windows) has its disk read landed.
+    [[nodiscard]] bool areBlocksReady(LlmRequest::RequestIdType requestId);
 
     //! \brief Bring block from primary to secondary memory for window size.
     //! \details Does nothing if block is already in secondary memory.
@@ -2536,6 +2542,12 @@ public:
     [[nodiscard]] SizeType32 getNumFreeBlocks() const override
     {
         return mBlockManager.getNumFreeBlocks();
+    }
+
+    //! \brief True when every KV block held by requestId has its disk read landed (detached onboard).
+    [[nodiscard]] bool areBlocksReady(LlmRequest::RequestIdType requestId)
+    {
+        return mBlockManager.areBlocksReady(requestId);
     }
 
     [[nodiscard]] SizeType32 getNumPools() const override

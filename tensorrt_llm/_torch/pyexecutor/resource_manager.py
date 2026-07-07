@@ -728,6 +728,12 @@ class KVCacheManager(BaseResourceManager):
     def _context_seq_len(self, req: LlmRequest, is_cross: bool,
                          is_star_cp: bool) -> Optional[int]:
         """Return the sequence length to pass to add_sequence_batch, or None to skip this request."""
+        if getattr(req, "py_onboard_pending", False):
+            # Blocks were claimed on a prior step and the detached disk-onboard read is still in flight.
+            # Do not re-add; the request is held out of the forward until areBlocksReady()
+            # (see PyExecutor._park_requests_awaiting_onboard). Same "add once, forward later" path
+            # that chunked context already uses.
+            return None
         if is_cross:
             if (getattr(req, "py_skip_cross_kv_projection", False)
                     or not req.is_first_context_chunk
@@ -1399,6 +1405,11 @@ class KVCacheManager(BaseResourceManager):
             if beam and beam[-1] != beam0_last:
                 packed.append(beam[-1])
         return packed
+
+    def are_blocks_ready(self, request) -> bool:
+        """True when every KV block this request holds has its disk read landed (detached onboard).
+        Always True for requests with no in-flight disk read, so it is cheap for the common case."""
+        return self.impl.are_blocks_ready(request.py_request_id)
 
     def get_num_free_blocks(self) -> int:
         if self.is_linear_attention:

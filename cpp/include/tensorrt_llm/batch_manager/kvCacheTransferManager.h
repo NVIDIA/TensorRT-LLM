@@ -24,6 +24,9 @@
 #include <mutex>
 #include <queue>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 namespace tr = tensorrt_llm::runtime;
 namespace kvc = tensorrt_llm::executor::kv_cache;
@@ -85,9 +88,24 @@ public:
     void spillToFile(BlockPtr const& srcHostBlock, SizeType32 diskSlot, std::vector<KVCacheBlockPool> const& pools,
         std::string const& directory);
 
-    //! \brief Disk tier: read slot files into a GPU-resident block (synchronous POSIX).
+    //! \brief Disk tier: read a block's slot files into GPU memory. With a reader pool the block's reads are
+    //! handed off and tracked under \p trackBlockId (POSIX or GDS, decided by the reader); the owning request
+    //! must be gated on isBlockReadPending() / areBlocksReady() before it is forwarded. With no pool
+    //! (\p trackBlockId < 0) the read is synchronous on the calling thread.
     void loadFromFile(BlockPtr const& dstPrimaryBlock, SizeType32 diskSlot, std::vector<KVCacheBlockPool> const& pools,
-        std::string const& directory);
+        std::string const& directory, std::int32_t trackBlockId = -1);
+
+    //! \brief Return + clear the block ids whose reads have landed since the last call.
+    [[nodiscard]] std::vector<std::int32_t> drainCompletedBlockReads();
+
+    //! \brief True while block blockId still has an in-flight disk read (not yet safe to read on the GPU).
+    [[nodiscard]] bool isBlockReadPending(std::int32_t blockId);
+
+    //! \brief True when a reader pool is present, so onboards can be detached from the scheduler thread.
+    [[nodiscard]] bool asyncDiskReadEnabled() const
+    {
+        return mNumDiskReaders >= 1;
+    }
 
     //! \brief Disk tier (unstaged async): spill a host block's bytes by handing the writer the source
     //! pointers directly (no staging memcpy). The caller MUST keep the source host slot pinned until
@@ -201,6 +219,37 @@ private:
     void enqueueDiskWrite(std::string filename, void const* src, std::size_t bytes);
     void enqueueDiskWriteUnstaged(std::string filename, void const* src, std::size_t bytes, std::uint64_t spillId);
     void waitForDiskSlotWrites(std::string const& filename);
+
+    // ---- Disk-tier async ONBOARD: read slot files disk->GPU OFF the scheduler thread ----
+    // Gated by TLLM_KV_DISK_READERS (0/unset => synchronous read = current behavior; N>=1 => N reader
+    // threads drain a shared read queue). A job carries all of one block's pools; a request is forward-safe
+    // once areBlocksReady() reports every block it holds has landed. See loadFromFile / isBlockReadPending.
+    struct DiskReadJob
+    {
+        std::int32_t blockId{-1};       // block whose readiness this job satisfies (tracking key)
+        bool useGds{false};             // GDS DMA (true) vs POSIX read + H2D copy (false)
+        std::vector<void*> dsts;        // GPU destination pointer, per pool
+        std::vector<std::string> files; // disk slot file, per pool
+        std::vector<std::size_t> bytes; // byte count, per pool
+    };
+
+    std::size_t const mNumDiskReaders{[]
+        {
+            auto* e = std::getenv("TLLM_KV_DISK_READERS");
+            return e ? std::stoul(e) : 0UL;
+        }()};
+    std::vector<std::thread> mDiskReaders;
+    std::mutex mReadMutex;
+    std::condition_variable mReadQueueCv;
+    std::queue<DiskReadJob> mReadQueue;
+    // Blocks with a disk read in flight, keyed by the matched-identity block id so every request reusing that
+    // prefix gates on the same key. A block is forward-safe once it leaves this set.
+    std::unordered_set<std::int32_t> mPendingBlockReads;
+    std::vector<std::int32_t> mCompletedBlockReads;
+    bool mDiskReaderStop{false};
+
+    void diskReaderLoop();
+    void enqueueDiskRead(DiskReadJob job);
 
     // Cumulative transfer statistics, reset on each call to getAndResetTransferStats().
     // Protected by mStatsMutex for thread-safe access.

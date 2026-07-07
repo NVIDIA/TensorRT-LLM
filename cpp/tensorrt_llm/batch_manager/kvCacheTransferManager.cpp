@@ -94,6 +94,14 @@ KVCacheTransferManager::KVCacheTransferManager(
         TLLM_LOG_INFO(
             "[disk-tier] async store ENABLED (writers=%zu, write-queue max=%zu)", mNumDiskWriters, mDiskWriteQueueMax);
     }
+    if (asyncDiskReadEnabled())
+    {
+        for (std::size_t i = 0; i < mNumDiskReaders; ++i)
+        {
+            mDiskReaders.emplace_back(&KVCacheTransferManager::diskReaderLoop, this);
+        }
+        TLLM_LOG_INFO("[disk-tier] async onboard ENABLED (readers=%zu)", mNumDiskReaders);
+    }
 }
 
 KVCacheTransferManager::~KVCacheTransferManager()
@@ -106,6 +114,21 @@ KVCacheTransferManager::~KVCacheTransferManager()
         }
         mDiskQueueCv.notify_all();
         for (auto& t : mDiskWriters)
+        {
+            if (t.joinable())
+            {
+                t.join();
+            }
+        }
+    }
+    if (!mDiskReaders.empty())
+    {
+        {
+            std::lock_guard<std::mutex> lock(mReadMutex);
+            mDiskReaderStop = true;
+        }
+        mReadQueueCv.notify_all();
+        for (auto& t : mDiskReaders)
         {
             if (t.joinable())
             {
@@ -569,6 +592,123 @@ void KVCacheTransferManager::waitForDiskSlotWrites(std::string const& filename)
         });
 }
 
+void KVCacheTransferManager::diskReaderLoop()
+{
+    // Each reader owns its own CUDA stream (H2D copies stay off the null stream and the onboard/offload
+    // managers) and its own GDS agent (readers never share one). cudaStreamSynchronize (POSIX) or the agent's
+    // internal wait (GDS) makes each transfer device-complete before the block is published, so per-block
+    // readiness alone is a sufficient pre-forward gate.
+    cudaStream_t stream;
+    TLLM_CUDA_CHECK(cudaStreamCreate(&stream));
+    std::vector<std::uint8_t> hostBuffer;
+    std::shared_ptr<kvc::BaseLoopbackAgent> gdsAgent; // per-reader GDS agent, created lazily on the first GDS job
+    while (true)
+    {
+        DiskReadJob job;
+        {
+            std::unique_lock<std::mutex> lock(mReadMutex);
+            mReadQueueCv.wait(lock, [this] { return !mReadQueue.empty() || mDiskReaderStop; });
+            if (mReadQueue.empty())
+            {
+                if (mDiskReaderStop)
+                {
+                    break;
+                }
+                continue;
+            }
+            job = std::move(mReadQueue.front());
+            mReadQueue.pop();
+        }
+
+        // Perform the block's transfer. GDS issues one batched SSD->GPU DMA for all pools; POSIX reads each
+        // pool into a host buffer and copies it up. Both are device-complete before we publish the block.
+        if (job.useGds)
+        {
+            try
+            {
+                if (gdsAgent == nullptr)
+                {
+                    kvc::BaseAgentConfig config{std::string("GDSReaderAgent"), true, true};
+                    gdsAgent = kvc::makeLoopbackAgent("nixl", &config);
+                }
+                std::vector<kvc::FileDesc> fileBlobs;
+                std::vector<kvc::MemoryDesc> memoryBlobs;
+                for (size_t i = 0; i < job.dsts.size(); ++i)
+                {
+                    fileBlobs.emplace_back(job.files[i], O_RDONLY, 0664, job.bytes[i]);
+                    memoryBlobs.emplace_back(job.dsts[i], job.bytes[i], mDeviceId);
+                }
+                kvc::FileDescs fileDescs(std::move(fileBlobs));
+                kvc::MemoryDescs memoryDescs(kvc::MemoryType::kVRAM, memoryBlobs);
+                gdsAgent->executeLoopbackRequest(memoryDescs, fileDescs, /*isOffload=*/false);
+            }
+            catch (std::exception const& e)
+            {
+                TLLM_LOG_WARNING("disk tier: GDS onboard failed (%s); falling back to POSIX", e.what());
+                job.useGds = false; // fall through to POSIX for this job
+            }
+        }
+        if (!job.useGds)
+        {
+            for (size_t i = 0; i < job.dsts.size(); ++i)
+            {
+                int fd = ::open(job.files[i].c_str(), O_RDONLY);
+                if (fd < 0)
+                {
+                    TLLM_LOG_ERROR("[disk-tier] cannot open %s for async read", job.files[i].c_str());
+                    continue;
+                }
+                hostBuffer.resize(job.bytes[i]);
+                auto const got = ::read(fd, hostBuffer.data(), job.bytes[i]);
+                ::close(fd);
+                if (got == static_cast<ssize_t>(job.bytes[i]))
+                {
+                    TLLM_CUDA_CHECK(
+                        cudaMemcpyAsync(job.dsts[i], hostBuffer.data(), job.bytes[i], cudaMemcpyHostToDevice, stream));
+                }
+                else
+                {
+                    TLLM_LOG_ERROR("[disk-tier] short async read from %s (%zd/%zu)", job.files[i].c_str(),
+                        static_cast<ssize_t>(got), job.bytes[i]);
+                }
+            }
+            TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mReadMutex);
+            // The transfer is device-complete, so publish the block: any request holding it can be forwarded.
+            mPendingBlockReads.erase(job.blockId);
+            mCompletedBlockReads.push_back(job.blockId);
+        }
+    }
+    cudaStreamDestroy(stream);
+}
+
+void KVCacheTransferManager::enqueueDiskRead(DiskReadJob job)
+{
+    {
+        std::lock_guard<std::mutex> lock(mReadMutex);
+        mPendingBlockReads.insert(job.blockId); // mark pending before the job becomes poppable
+        mReadQueue.push(std::move(job));
+    }
+    mReadQueueCv.notify_one();
+}
+
+std::vector<std::int32_t> KVCacheTransferManager::drainCompletedBlockReads()
+{
+    std::lock_guard<std::mutex> lock(mReadMutex);
+    std::vector<std::int32_t> out;
+    out.swap(mCompletedBlockReads);
+    return out;
+}
+
+bool KVCacheTransferManager::isBlockReadPending(std::int32_t blockId)
+{
+    std::lock_guard<std::mutex> lock(mReadMutex);
+    return mPendingBlockReads.find(blockId) != mPendingBlockReads.end();
+}
+
 void KVCacheTransferManager::spillToFile(BlockPtr const& srcHostBlock, SizeType32 diskSlot,
     std::vector<KVCacheBlockPool> const& pools, std::string const& directory)
 {
@@ -633,7 +773,7 @@ void KVCacheTransferManager::spillToFileUnstaged(BlockPtr const& srcHostBlock, S
 }
 
 void KVCacheTransferManager::loadFromFile(BlockPtr const& dstPrimaryBlock, SizeType32 diskSlot,
-    std::vector<KVCacheBlockPool> const& pools, std::string const& directory)
+    std::vector<KVCacheBlockPool> const& pools, std::string const& directory, std::int32_t trackBlockId)
 {
     TLLM_CHECK_WITH_INFO(!directory.empty(), "disk tier requires a directory");
     auto const idx = getPendingTransferIndex(dstPrimaryBlock);
@@ -653,6 +793,29 @@ void KVCacheTransferManager::loadFromFile(BlockPtr const& dstPrimaryBlock, SizeT
             waitForDiskSlotWrites(diskSlotFilename(directory, diskSlot, poolIdx));
         }
     }
+    // Detached onboard: when a reader pool is present, package all of the block's pools into one tracked job
+    // and hand it off. The reader performs the transfer (GDS DMA if enabled, else POSIX read + copy) and makes
+    // it device-complete before publishing the block; the request is forward-safe once areBlocksReady() sees
+    // its blocks land. trackBlockId < 0 (no pool) takes the synchronous fallback below.
+    if (asyncDiskReadEnabled() && trackBlockId >= 0)
+    {
+        DiskReadJob job;
+        job.blockId = trackBlockId;
+        job.useGds = mDiskUseGds;
+        for (size_t poolIdx = 0; poolIdx < pools.size(); ++poolIdx)
+        {
+            TLLM_CHECK_WITH_INFO(
+                !pools[poolIdx].layerFirstLayout, "disk tier does not support layer-first layout pools");
+            auto ptr = computeBlockPointer(dstPrimaryBlock, pools, poolIdx);
+            job.dsts.push_back(ptr->data());
+            job.files.push_back(diskSlotFilename(directory, diskSlot, poolIdx));
+            job.bytes.push_back(static_cast<std::size_t>(ptr->getSizeInBytes()));
+        }
+        enqueueDiskRead(std::move(job));
+        return;
+    }
+
+    // Synchronous fallback (no reader pool): read inline on the calling thread.
     if (mDiskUseGds)
     {
         // GDS onboard: direct SSD -> GPU VRAM via the NIXL loopback agent (cuFile).

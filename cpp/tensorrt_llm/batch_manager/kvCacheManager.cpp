@@ -1596,6 +1596,19 @@ void BlockManager::onboardBlock(GenerationRequest& sequence, BlockPtr const& off
     mWindowBlockManagers.at(windowSize).onboardBlock(sequence, offloadBlock, mode, directory);
 }
 
+bool BlockManager::areBlocksReady(LlmRequest::RequestIdType requestId)
+{
+    // Forward-safe only when every window's blocks for this request have their disk reads landed.
+    for (auto& [windowSize, manager] : mWindowBlockManagers)
+    {
+        if (!manager.areBlocksReady(requestId))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
 void WindowBlockManager::onboardBlock(GenerationRequest& sequence, BlockPtr const& offloadBlock,
     executor::KvCacheTransferMode mode, std::string const& directory)
 {
@@ -1604,8 +1617,13 @@ void WindowBlockManager::onboardBlock(GenerationRequest& sequence, BlockPtr cons
         // A fresh GPU block; this may itself trigger the GPU->host cascade (unchanged, correct).
         auto block = getFreeBlock(
             sequence, executor::KvCacheRetentionConfig::kDefaultRetentionPriority, std::nullopt, mode, directory);
-        mTransferManager->loadFromFile(block, offloadBlock->getDiskSlot(), mPools, mDiskCachePath);
-        offloadBlock->swapDiskResidency(block); // matched identity now GPU-resident
+        // Detach the onboard when a reader pool is present: hand the read off (POSIX or GDS, decided by the
+        // reader) tagged with the matched identity's block id (stable across swapDiskResidency), so every
+        // request reusing this prefix gates on the same key. No pool -> synchronous read inside loadFromFile.
+        auto const trackId = mTransferManager->asyncDiskReadEnabled() ? offloadBlock->getBlockId()
+                                                                      : static_cast<KVCacheBlock::IdType>(-1);
+        mTransferManager->loadFromFile(block, offloadBlock->getDiskSlot(), mPools, mDiskCachePath, trackId);
+        offloadBlock->swapDiskResidency(block); // matched identity now GPU-resident (bytes may still be in flight)
         offloadBlock->setPriority(executor::KvCacheRetentionConfig::kDefaultRetentionPriority);
         block->clearRetention();
         block->setPriority(executor::KvCacheRetentionConfig::kMinRetentionPriority); // freed card = empty slot again
@@ -1634,6 +1652,25 @@ void WindowBlockManager::onboardBlock(GenerationRequest& sequence, BlockPtr cons
         mEvictionPolicy->releaseBlock(block); // append block to offload queue
                                               // offloadBlock is now in primary memory pool
     }
+}
+
+bool WindowBlockManager::areBlocksReady(LlmRequest::RequestIdType requestId)
+{
+    // A request is forward-safe only when every block it holds has its disk read landed. Keyed by block id,
+    // so a request sharing an in-flight onboarded block waits on the same key as the request that started it.
+    auto it = mAllocatedBlocksPerSeq.find(requestId);
+    if (it == mAllocatedBlocksPerSeq.end())
+    {
+        return true;
+    }
+    for (auto const& block : it->second)
+    {
+        if (mTransferManager->isBlockReadPending(block->getBlockId()))
+        {
+            return false;
+        }
+    }
+    return true;
 }
 
 void BlockManager::offloadBlock(

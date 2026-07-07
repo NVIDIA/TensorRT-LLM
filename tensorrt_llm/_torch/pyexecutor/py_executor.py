@@ -2539,6 +2539,7 @@ class PyExecutor:
                     self._handle_dynamic_draft_len(scheduled_batch)
 
                     self.resource_manager.prepare_resources(scheduled_batch)
+                    self._park_requests_awaiting_onboard(scheduled_batch)
 
                     # The generation requests that do not have batch_idx
                     # need to be in front of the batch due to the assumptions
@@ -3093,6 +3094,36 @@ class PyExecutor:
         if send_handles[microbatch_id] is not None:
             send_handles[microbatch_id].wait()
             send_handles[microbatch_id] = None
+
+    def _park_requests_awaiting_onboard(self, scheduled_batch):
+        """Hold context requests whose detached disk-onboard reads have not landed out of this forward.
+        Their KV blocks are allocated but not yet filled, so forwarding now would read stale KV. A parked
+        request stays active and is re-scheduled next step -- the capacity scheduler counts its already
+        allocated blocks (getRemainingBlocksToCompletion) and _context_seq_len skips re-adding it -- then it
+        is admitted once are_blocks_ready() reports its blocks landed."""
+        kv = getattr(self, "kv_cache_manager", None)
+        if kv is None or not hasattr(kv, "are_blocks_ready"):
+            return
+        ctx = scheduled_batch.context_requests
+        if not ctx:
+            return
+        kept = []
+        parked = 0
+        for req in ctx:
+            if kv.are_blocks_ready(req):
+                req.py_onboard_pending = False
+                kept.append(req)
+            else:
+                req.py_onboard_pending = True
+                parked += 1
+        if parked:
+            scheduled_batch.reset_context_requests(kept)
+            self._onboard_parked_total = getattr(self, "_onboard_parked_total",
+                                                 0) + parked
+            if self._onboard_parked_total <= 5 or self._onboard_parked_total % 500 == 0:
+                logger.info(
+                    "disk-onboard: parked %d context request(s) awaiting KV read (cumulative %d)",
+                    parked, self._onboard_parked_total)
 
     def _handle_dynamic_draft_len(self,
                                   scheduled_batch: ScheduledRequests) -> None:
@@ -3776,6 +3807,7 @@ class PyExecutor:
                     self._handle_dynamic_draft_len(scheduled_batch)
 
                     self.resource_manager.prepare_resources(scheduled_batch)
+                    self._park_requests_awaiting_onboard(scheduled_batch)
 
                 if self.kv_connector_manager:
                     self.kv_connector_manager.handle_metadata()
@@ -4241,6 +4273,7 @@ class PyExecutor:
                     self._handle_dynamic_draft_len(scheduled_batch)
 
                     self.resource_manager.prepare_resources(scheduled_batch)
+                    self._park_requests_awaiting_onboard(scheduled_batch)
 
                 if self.kv_connector_manager:
                     self.kv_connector_manager.handle_metadata()

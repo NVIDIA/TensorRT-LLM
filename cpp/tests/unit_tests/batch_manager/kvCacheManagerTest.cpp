@@ -10740,6 +10740,40 @@ TEST_F(KVCacheManagerTest, DiskTierSpillAllRoundTripTest)
     releaseDiskTierSequence(blockManager, seqA2);
 }
 
+// Detached onboard (reader pool on): reusing a spilled prefix must produce the SAME observable reuse as the
+// synchronous path above, and the request must report forward-safe via areBlocksReady() once its onboard
+// lands. Same spill/evict/reuse scenario as DiskTierSpillAllRoundTripTest, only with TLLM_KV_DISK_READERS set.
+TEST_F(KVCacheManagerTest, DiskTierDetachedOnboardReadyTest)
+{
+    setenv("TLLM_KV_DISK_READERS", "4", /*overwrite=*/1);
+    auto const stream = std::make_shared<tr::CudaStream>();
+    DiskTierDir dir;
+    auto blockManagerPtr
+        = makeDiskTierBlockManager(stream, dir.str(), /*retainedOnly=*/false, /*prim=*/4, /*sec=*/2, /*disk=*/8);
+    auto& blockManager = *blockManagerPtr;
+
+    auto seqA = addDiskTierSequence(blockManager, 0, iotaTokens(0, 16), std::nullopt);
+    releaseDiskTierSequence(blockManager, seqA);
+    churnOnce(blockManager, 1, 100); // evict A's blocks through to disk
+
+    auto seqA2 = addDiskTierSequence(blockManager, 2, iotaTokens(0, 16), std::nullopt);
+
+    // The onboard was handed to the reader pool; the request is forward-safe only once its blocks land.
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (!blockManager.areBlocksReady(/*requestId=*/2))
+    {
+        ASSERT_LT(std::chrono::steady_clock::now(), deadline) << "detached onboard never became ready";
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    // Same reuse outcome as the synchronous path: >=3 of 4 blocks reused, part served from disk.
+    EXPECT_GE(seqA2.req->getContextCurrentPosition(), 12);
+    EXPECT_GE(blockManager.getNumDiskOnboards(), 1u);
+
+    releaseDiskTierSequence(blockManager, seqA2);
+    unsetenv("TLLM_KV_DISK_READERS");
+}
+
 // Retained-only mode: unmarked victims are discarded at the gate; marked ones spill.
 TEST_F(KVCacheManagerTest, DiskTierRetainedOnlyGateTest)
 {
@@ -10900,4 +10934,112 @@ TEST_F(KVCacheManagerTest, DiskTierProtectEvictsExpiredTest)
     churnOnce(blockManager, 3, 300);
     EXPECT_GT(blockManager.getNumDiskSpills(), spillsFilled);
     EXPECT_EQ(blockManager.getNumDiskAdmissionRefused(), 0u);
+}
+
+namespace
+{
+// Per-slot-distinct byte pattern for the disk round-trip. Distinct across slots so a cross-slot
+// mixup (slot i's bytes landing in slot j) is caught, not just intra-block corruption.
+float diskPatternValue(int slot, int i)
+{
+    return static_cast<float>((i * 3 + slot * 101) % 997);
+}
+
+// Spill nSlots distinct-pattern blocks to disk, onboard each into a GPU slot via loadFromFile (detached
+// through the reader pool when readers>0, inline when readers==0), wait for per-block readiness, and verify
+// every GPU slot holds its EXACT pattern. Unlike DiskTierSpillAllRoundTripTest (which only checks reuse
+// accounting), this asserts the onboarded KV *bytes* -- the property the detached reader must preserve.
+// TLLM_KV_DISK_ASYNC_STORE is left unset so spills are synchronous and this isolates the read path.
+void runDiskOnboardByteRoundTrip(char const* readers, int nSlots)
+{
+    setenv("TLLM_KV_DISK_READERS", readers, /*overwrite=*/1);
+    DiskTierDir dir;
+    int constexpr blockSize = 2048; // floats per slot
+
+    auto bufferManager = tr::BufferManager(std::make_shared<tr::CudaStream>());
+    auto transferManager = KVCacheTransferManager(bufferManager); // reads TLLM_KV_DISK_READERS at construction
+
+    auto pool = KVCacheBlockPool(0, /*kvFactor=*/2, 0, 0, 0);
+    pool.primaryPtr = bufferManager.gpu(tr::ITensor::makeShape({nSlots, blockSize}), nvinfer1::DataType::kFLOAT);
+    bufferManager.setZero(*pool.primaryPtr);
+    pool.secondaryPtr
+        = tr::BufferManager::pinned(tr::ITensor::makeShape({nSlots, blockSize}), nvinfer1::DataType::kFLOAT);
+
+    // Fill each host slot with its pattern and spill it to disk slot k (synchronous write).
+    float* secBase = tr::bufferCast<float>(*pool.secondaryPtr);
+    for (int k = 0; k < nSlots; ++k)
+    {
+        for (int i = 0; i < blockSize; ++i)
+        {
+            secBase[static_cast<std::size_t>(k) * blockSize + i] = diskPatternValue(k, i);
+        }
+        auto src = std::make_shared<KVCacheBlock>(k, tk::KVCacheIndex(k, /*isSecondary=*/true));
+        transferManager.spillToFile(src, /*diskSlot=*/k, {pool}, dir.str());
+    }
+
+    // Ensure the GPU pool's zero-fill has completed before detached readers overwrite the slots.
+    bufferManager.getStream().synchronize();
+
+    // Onboard each disk slot into GPU slot k, tracked by k so readers>0 exercises the detached reader pool
+    // (readers==0 reads inline on this thread).
+    std::vector<BlockPtr> dst;
+    for (int k = 0; k < nSlots; ++k)
+    {
+        auto d = std::make_shared<KVCacheBlock>(nSlots + k, tk::KVCacheIndex(k, /*isSecondary=*/false));
+        transferManager.loadFromFile(d, /*diskSlot=*/k, {pool}, dir.str(), /*trackBlockId=*/k);
+        dst.push_back(d);
+    }
+    // Detached reads land asynchronously; wait until each slot's read has completed. readers==0 never enters
+    // the pending set, so this returns immediately for the synchronous path.
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    for (int k = 0; k < nSlots; ++k)
+    {
+        while (transferManager.isBlockReadPending(k))
+        {
+            ASSERT_LT(std::chrono::steady_clock::now(), deadline) << "onboard did not complete for slot " << k;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    bufferManager.getStream().synchronize();
+
+    // Read each GPU slot back to host and verify byte-exact against its pattern.
+    std::vector<float> hostCopy(blockSize);
+    float const* primBase = tr::bufferCast<float>(*pool.primaryPtr);
+    for (int k = 0; k < nSlots; ++k)
+    {
+        ASSERT_EQ(cudaMemcpy(hostCopy.data(), primBase + static_cast<std::size_t>(k) * blockSize,
+                      blockSize * sizeof(float), cudaMemcpyDeviceToHost),
+            cudaSuccess);
+        int bad = 0;
+        for (int i = 0; i < blockSize; ++i)
+        {
+            if (hostCopy[i] != diskPatternValue(k, i))
+            {
+                ++bad;
+            }
+        }
+        EXPECT_EQ(bad, 0) << "readers=" << readers << " slot=" << k << ": disk onboard corrupted " << bad << "/"
+                          << blockSize << " elements";
+    }
+    unsetenv("TLLM_KV_DISK_READERS");
+}
+} // namespace
+
+// The detached reader pool must onboard byte-exact KV from disk (4 readers, 4 slots).
+TEST_F(KVCacheManagerTest, DiskTierAsyncOnboardByteExactTest)
+{
+    runDiskOnboardByteRoundTrip(/*readers=*/"4", /*nSlots=*/4);
+}
+
+// More slots than readers => concurrent draining; distinct per-slot patterns catch any cross-slot
+// mixup (slot i's bytes landing in slot j).
+TEST_F(KVCacheManagerTest, DiskTierAsyncOnboardConcurrentNoMixupTest)
+{
+    runDiskOnboardByteRoundTrip(/*readers=*/"3", /*nSlots=*/8);
+}
+
+// Control: the synchronous read path (readers=0) is byte-exact too => detached matches inline.
+TEST_F(KVCacheManagerTest, DiskTierSyncOnboardByteExactTest)
+{
+    runDiskOnboardByteRoundTrip(/*readers=*/"0", /*nSlots=*/4);
 }
