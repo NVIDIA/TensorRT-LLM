@@ -43,8 +43,8 @@ _K_MAX_BLOCKS_PER_ROW_DECODE = 10  # mirrors kMaxBlocksPerRowDecode
 POLICY_SUFFIX = {
     "GMEM_SPILL": "",
     "TRUNCATE": "_t",
-    "REREAD_ALWAYS": "_r",
-    "REREAD": "_rr",
+    "REREAD_ALWAYS": "_ra",
+    "REREAD": "_r",
 }
 
 # ── sweep grids ──────────────────────────────────────────────────────────────
@@ -336,8 +336,8 @@ def bench_decode_varlen(
 
 def _header(variants, col_w=13):
     cols = "  ".join(f"{v:>{col_w}}" for v in variants)
-    sp = "  ".join(f"{'dsl_fp32/cpp':>{col_w}}" for _ in ["fp32"])
-    sp += "  " + f"{'dsl_bf16/cpp':>{col_w}}"
+    sp = "  ".join(f"{'cpp/dsl_fp32':>{col_w}}" for _ in ["fp32"])
+    sp += "  " + f"{'cpp/dsl_bf16':>{col_w}}"
     return cols, sp
 
 
@@ -357,7 +357,14 @@ def _print_row(key1, key2, res, variants, col_w=13, extra_policies=()):
             for dtype in ["fp32", "bf16"]:
                 base, alt = f"dsl_{dtype}", f"dsl_{dtype}{sfx}"
                 if res.get(base) and res.get(alt):
-                    ratio = res[alt] / res[base]
+                    ratio = res[base] / res[alt]  # >1 means alt is faster
+                    line += f"  {ratio:>{col_w}.3f}x"
+        if "REREAD" in extra_policies:
+            sfx = POLICY_SUFFIX["REREAD"]
+            for dtype in ["fp32", "bf16"]:
+                r_col = f"dsl_{dtype}{sfx}"
+                if res.get(r_col):
+                    ratio = cpp / res[r_col]  # >1 means REREAD faster than C++
                     line += f"  {ratio:>{col_w}.3f}x"
     print(line)
 
@@ -368,8 +375,8 @@ def _print_row(key1, key2, res, variants, col_w=13, extra_policies=()):
 POLICY_HEADER_TAG = {
     "GMEM_SPILL": "",
     "TRUNCATE": "T",
-    "REREAD_ALWAYS": "R",
-    "REREAD": "RR",
+    "REREAD_ALWAYS": "RA",
+    "REREAD": "R",
 }
 
 
@@ -381,12 +388,14 @@ def _make_variants_and_header_suffix(overflow_policies, col_w):
         dsl_variants += [f"dsl_fp32{sfx}", f"dsl_bf16{sfx}"]
     variants = ["cpp_fp32"] + (dsl_variants if IS_B200 else [])
     if IS_B200:
-        hdr_suffix += f"  {'dsl_fp32/cpp':>{col_w}}  {'dsl_bf16/cpp':>{col_w}}"
+        hdr_suffix += f"  {'cpp/dsl_fp32':>{col_w}}  {'cpp/dsl_bf16':>{col_w}}"
         for pol in overflow_policies:
             if pol == "GMEM_SPILL":
                 continue
             tag = POLICY_HEADER_TAG[pol]
-            hdr_suffix += f"  {f'{tag}/G_fp32':>{col_w}}  {f'{tag}/G_bf16':>{col_w}}"
+            hdr_suffix += f"  {f'G/{tag}_fp32':>{col_w}}  {f'G/{tag}_bf16':>{col_w}}"
+        if "REREAD" in overflow_policies:
+            hdr_suffix += f"  {'cpp/R_fp32':>{col_w}}  {'cpp/R_bf16':>{col_w}}"
     return variants, hdr_suffix
 
 
