@@ -188,15 +188,39 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
 
     print(f"Running unit test:\"python {' '.join(command)}\"")
 
+    def build_pythonpath():
+        pythonpath = os.environ.get("PYTHONPATH", "")
+        pythonpath_entries = [f"{llm_root}/tests/unittest"]
+
+        # MPI worker processes start from the tests directory and otherwise
+        # may resolve an older site-packages triton_kernels package.
+        triton_kernels_src = os.path.join(llm_root, "triton_kernels")
+        if os.path.isdir(triton_kernels_src):
+            pythonpath_overrides_dir = os.path.join(
+                output_dir, f"pythonpath-overrides-{case_fn}")
+            os.makedirs(pythonpath_overrides_dir, exist_ok=True)
+            triton_kernels_link = os.path.join(pythonpath_overrides_dir,
+                                               "triton_kernels")
+            if os.path.lexists(triton_kernels_link):
+                is_expected_link = False
+                if os.path.islink(triton_kernels_link):
+                    is_expected_link = (
+                        os.readlink(triton_kernels_link) == triton_kernels_src)
+                if not is_expected_link:
+                    raise RuntimeError(
+                        f"Unexpected triton_kernels path: {triton_kernels_link}"
+                    )
+            else:
+                os.symlink(triton_kernels_src, triton_kernels_link)
+            pythonpath_entries.insert(0, pythonpath_overrides_dir)
+
+        if pythonpath:
+            pythonpath_entries.append(pythonpath)
+        return os.pathsep.join(pythonpath_entries)
+
     def run_command(cmd, num_workers=1):
         try:
-            pythonpath = os.environ.get("PYTHONPATH", "")
-            # Keep the source root ahead of site-packages so spawned MPI
-            # workers resolve repo-local packages such as triton_kernels.
-            pythonpath_entries = [llm_root, f"{llm_root}/tests/unittest"]
-            if pythonpath:
-                pythonpath_entries.append(pythonpath)
-            env = {'PYTHONPATH': os.pathsep.join(pythonpath_entries)}
+            env = {'PYTHONPATH': build_pythonpath()}
             if s3_secret_key:
                 env["S3_SECRET_KEY"] = s3_secret_key
             if num_workers > 1:
