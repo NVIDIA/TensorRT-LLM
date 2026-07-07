@@ -16,7 +16,7 @@ import json
 import threading
 from typing import List, Optional, Union
 
-from ..llmapi.mpi_session import MpiPoolSession, MpiSession
+from ..llmapi.mpi_session import MpiSession
 from ..llmapi.utils import logger_debug, print_colored
 from ..logger import logger
 from .executor import GenerationExecutor
@@ -25,7 +25,7 @@ from .proxy import _check_collective_rpc_guard
 from .result import IterationResult
 from .rpc_proxy_mixin import RpcExecutorMixin
 from .rpc_worker import RpcWorker
-from .utils import create_mpi_comm_session, get_spawn_proxy_process_env
+from .utils import get_mpi_session
 
 
 class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
@@ -64,7 +64,8 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         )
 
         self.model_world_size = model_world_size
-        self._create_mpi_session(model_world_size, mpi_session)
+        self.mpi_session, self._owns_mpi_session = get_mpi_session(
+            model_world_size, mpi_session)
 
         # Inject the generated HMAC key into worker_kwargs for workers
         worker_kwargs['hmac_key'] = self.hmac_key
@@ -82,9 +83,9 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
     def launch_workers(self):
         logger.debug(f"Launching workers")
         assert self.mpi_session is not None
-        self.mpi_session.submit(RpcWorker.main_task,
-                                rpc_addr=self.rpc_addr,
-                                **self.worker_kwargs)
+        self.worker_futures = self.mpi_session.submit(RpcWorker.main_task,
+                                                      rpc_addr=self.rpc_addr,
+                                                      **self.worker_kwargs)
 
     def _setup_mainloop_with_tasks(self):
         """Setup mainloop with tasks needed for RpcProxy.
@@ -251,8 +252,15 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         logger_debug(f"Shutting down GenerationExecutorRpcProxy",
                      color="yellow")
 
+        shutdown_error = None
+
         # 1. shutdown the rpc server (PyExecutor Rank 0 + RPC server)
-        self.shutdown_remote()
+        try:
+            if self.rpc_client is not None:
+                self.shutdown_remote()
+        except Exception as e:
+            shutdown_error = e
+            logger.warning(f"Failed to shut down the remote RPC server: {e}")
 
         # 2. stop the main loop, so that no new rpc requests
         if self.main_loop and self.main_loop_task_obj:
@@ -276,29 +284,48 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         # 3. shutdown the mpi session, this should wait until all the PyExecutor
         # processes are shutdown
         if self.mpi_session is not None:
-            logger_debug(f"Shutting down mpi session", color="yellow")
-            self.mpi_session.shutdown()
+            if self._owns_mpi_session:
+                logger_debug(f"Shutting down mpi session", color="yellow")
+                try:
+                    self.mpi_session.shutdown()
+                except Exception as e:
+                    shutdown_error = shutdown_error or e
+                    logger.warning(f"Failed to shut down mpi session: {e}")
+            else:
+                # A borrowed pool must stay alive, but this executor's RPC
+                # worker tasks must finish before the pool is reused.
+                for future in getattr(self, "worker_futures", []):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        shutdown_error = shutdown_error or e
+                        logger.warning(
+                            f"RPC worker task raised during shutdown: {e}")
             logger_debug(f"Mpi session shutdown", color="yellow")
             self.mpi_session = None
 
-        self.rpc_client.close()
+        if self.rpc_client is not None:
+            try:
+                self.rpc_client.close()
+            except Exception as e:
+                shutdown_error = shutdown_error or e
+                logger.warning(f"Failed to close the RPC client: {e}")
+            finally:
+                self.rpc_client = None
+
+        if shutdown_error is not None:
+            raise shutdown_error
+
+    def __del__(self):
+        try:
+            self.shutdown()
+        except Exception:
+            # Destructors must not mask the original constructor or shutdown
+            # error. Explicit shutdown still reports failures to the caller.
+            pass
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.shutdown()
-
-    def _create_mpi_session(self, model_world_size: int,
-                            mpi_session: Optional[MpiSession]):
-        mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
-        if mpi_session is None:
-            if mpi_process_pre_spawned:
-                logger_debug('[proxy] create comm session ...\n', "yellow")
-                self.mpi_session = create_mpi_comm_session(model_world_size)
-            else:
-                logger_debug('[proxy] create pool session ...\n', "yellow")
-                self.mpi_session = MpiPoolSession(n_workers=model_world_size)
-        else:
-            logger_debug('[proxy] using external mpi session ...\n', "yellow")
-            self.mpi_session = mpi_session

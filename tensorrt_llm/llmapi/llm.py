@@ -314,6 +314,11 @@ class BaseLLM:
         logger_debug(f"LLM.args.mpi_session: {self.args.mpi_session}\n",
                      "yellow")
         self.mpi_session = self.args.mpi_session
+        # Keep ownership on LLM. The session object is removed from args
+        # before args are sent to model/executor workers because MpiSession is
+        # not pickleable.
+        self._owns_mpi_session = False
+        self.args.mpi_session = None
 
         # Build this LLM's post-processing hook for the in-proxy detok path (each
         # postproc worker builds its own). Resolving here fails fast on a bad
@@ -333,7 +338,7 @@ class BaseLLM:
             logger.info(
                 f'start MpiSession with {self.args.parallel_config.world_size} workers'
             )
-            if not self.mpi_session:
+            if self.mpi_session is None:
                 mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
                 if not mpi_process_pre_spawned:
                     logger_debug("LLM create MpiPoolSession\n", "yellow")
@@ -343,6 +348,7 @@ class BaseLLM:
                     logger_debug("LLM create MpiCommSession\n", "yellow")
                     self.mpi_session = create_mpi_comm_session(
                         self.args.parallel_config.world_size)
+                self._owns_mpi_session = True
 
         try:
             # Due to the Executor can only accept a engine path, we need to save the engine to a directory
@@ -365,8 +371,15 @@ class BaseLLM:
             self._build_model()
 
         except Exception:
-            if self.mpi_session is not None:
-                self.mpi_session.shutdown()
+            if self.mpi_session is not None and self._owns_mpi_session:
+                mpi_session = self.mpi_session
+                self.mpi_session = None
+                try:
+                    mpi_session.shutdown()
+                except Exception as shutdown_error:
+                    logger.error(
+                        f"Failed to shut down MPI session after construction failure: {shutdown_error}"
+                    )
             raise
 
         # --- Usage telemetry (fail-silent) ---
@@ -1472,18 +1485,36 @@ class BaseLLM:
 
     @set_api_status("beta")
     def shutdown(self) -> None:
-        if hasattr(self, "_executor") and self._executor is not None:
-            self._executor.shutdown()
-            self._executor = None
+        shutdown_error = None
 
-        if hasattr(self,
-                   "_encoder_executor") and self._encoder_executor is not None:
-            self._encoder_executor.shutdown()
-            self._encoder_executor = None
+        for executor_attr in ("_executor", "_encoder_executor"):
+            executor = getattr(self, executor_attr, None)
+            if executor is None:
+                continue
+            try:
+                executor.shutdown()
+            except Exception as e:
+                # Do not skip owned MPI-session cleanup when an executor
+                # reports a fatal worker error during shutdown.
+                shutdown_error = shutdown_error or e
+                logger.error(f"Failed to shut down {executor_attr}: {e}")
+            finally:
+                setattr(self, executor_attr, None)
 
-        if hasattr(self, 'mpi_session') and self.mpi_session is not None:
-            self.mpi_session.shutdown()
-            self.mpi_session = None
+        owns_mpi_session = getattr(self, "_owns_mpi_session", False)
+        mpi_session = getattr(self, "mpi_session", None)
+        if mpi_session is not None:
+            try:
+                if owns_mpi_session:
+                    mpi_session.shutdown()
+            except Exception as e:
+                shutdown_error = shutdown_error or e
+                logger.error(f"Failed to shut down MPI session: {e}")
+            finally:
+                self.mpi_session = None
+
+        if shutdown_error is not None:
+            raise shutdown_error
 
     def _check_health(self) -> bool:
         """Check if the LLM is healthy.
@@ -1564,7 +1595,7 @@ class _TrtLLM(BaseLLM):
         if self._engine_dir.absolute() == os.path.abspath(engine_dir):
             return
 
-        if not self.mpi_session or not self.mpi_session.is_comm_session():
+        if self.mpi_session is None or not self.mpi_session.is_comm_session():
             shutil.copytree(self._engine_dir, engine_dir, dirs_exist_ok=True)
         else:
             # NFS is fragile, so we copy files one by one

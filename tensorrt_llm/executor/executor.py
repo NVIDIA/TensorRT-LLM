@@ -1,6 +1,5 @@
 import atexit
 import faulthandler
-import multiprocessing
 import platform
 import signal
 import traceback
@@ -39,7 +38,7 @@ from .postproc_worker import PostprocParams, PostprocWorkerConfig
 from .request import (DEFAULT_REQUEST_PRIORITY, GenerationRequest, LoRARequest,
                       PromptAdapterRequest)
 from .result import GenerationResult, IterationResult
-from .utils import IntraProcessQueue, ProcessPoolExecutorSession, RequestError
+from .utils import IntraProcessQueue, RequestError
 
 if TYPE_CHECKING:
     from .proxy import GenerationExecutorProxy
@@ -632,35 +631,22 @@ class GenerationExecutor(ABC):
         # Partition the workload to multiple processes for streaming performance.
         # While this requires users to protect their entrypoint to
         # `if __name__ == "__main__":`.
-        if not platform.system() == 'Windows':
-            if orchestrator_is_rpc:
-                return GenerationExecutor._create_rpc_executor(
-                    worker_kwargs,
-                    model_world_size=model_world_size,
-                    mpi_session=mpi_session,
-                    postproc_worker_config=postproc_worker_config,
-                    is_llm_executor=is_llm_executor)
-
-            return GenerationExecutor._create_ipc_executor(
-                worker_kwargs,
-                model_world_size=model_world_size,
-                mpi_session=None,  # use mpi4py
-                postproc_worker_config=postproc_worker_config,
-                is_llm_executor=is_llm_executor,
-                use_worker=False)
-        else:
-            ctx = multiprocessing.get_context("spawn")
-            # The ProcessPoolExecutorSession is used to support Windows, as mpi4py cannot.
-            mpi_session = ProcessPoolExecutorSession(n_workers=1,
-                                                     mp_context=ctx)
-            # TODO: add rpc worker here
-            return GenerationExecutor._create_ipc_executor(
+        if orchestrator_is_rpc and platform.system() != "Windows":
+            return GenerationExecutor._create_rpc_executor(
                 worker_kwargs,
                 model_world_size=model_world_size,
                 mpi_session=mpi_session,
                 postproc_worker_config=postproc_worker_config,
-                is_llm_executor=is_llm_executor,
-                use_worker=False)
+                is_llm_executor=is_llm_executor)
+
+        # TODO: add rpc worker on Windows.
+        return GenerationExecutor._create_ipc_executor(
+            worker_kwargs,
+            model_world_size=model_world_size,
+            mpi_session=mpi_session,
+            postproc_worker_config=postproc_worker_config,
+            is_llm_executor=is_llm_executor,
+            use_worker=False)
 
     def wait_first_completed(
         self, futures: List[GenerationResult]

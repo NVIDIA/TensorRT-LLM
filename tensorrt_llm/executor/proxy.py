@@ -28,7 +28,7 @@ import zmq.asyncio
 from tensorrt_llm.logger import logger
 
 from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
-from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
+from ..llmapi.mpi_session import (MpiCommSession, MpiSession,
                                   RemoteMpiCommSessionClient)
 from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
@@ -41,8 +41,7 @@ from .result import GenerationResult, IterationResult
 from .rpc import RPCClient
 from .rpc.rpc_common import RPCError, get_unique_ipc_addr
 from .utils import (ErrorResponse, RequestError, WorkerCommIpcAddrs,
-                    create_mpi_comm_session, get_spawn_proxy_process_env,
-                    is_llm_response, print_alive_threads)
+                    get_mpi_session, is_llm_response, print_alive_threads)
 from .worker import GenerationExecutorWorker, worker_main
 
 __all__ = [
@@ -97,18 +96,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.workers_started = False
         self.worker_cls = worker_cls
 
-        mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
-
-        if mpi_session is None:
-            if mpi_process_pre_spawned:
-                logger_debug('create comm session ...\n', "yellow")
-                self.mpi_session = create_mpi_comm_session(model_world_size)
-            else:
-                logger_debug('create pool session ...\n', "yellow")
-                self.mpi_session = MpiPoolSession(n_workers=model_world_size)
-        else:
-            logger_debug('using external mpi session ...\n', "yellow")
-            self.mpi_session = mpi_session
+        self.mpi_session, self._owns_mpi_session = get_mpi_session(
+            model_world_size, mpi_session)
 
         if isinstance(self.mpi_session,
                       (MpiCommSession, RemoteMpiCommSessionClient)):
@@ -435,14 +424,30 @@ class GenerationExecutorProxy(GenerationExecutor):
                 break
             if any(fut.done() for fut in self.mpi_futures):
                 logger.error("Executor worker died during initialization.")
+                if not self._owns_mpi_session:
+                    self._cleanup_startup_workers()
                 raise RuntimeError("Executor worker died during initialization")
             self._handle_background_error()
 
         if ready_signal != GenerationExecutorProxy.READY_SIGNAL:
             logger.error(f"Executor worker initialization error: {error_trace}")
-            self.mpi_session.shutdown_abort(reason=ready_signal)
+            if self._owns_mpi_session:
+                self.mpi_session.shutdown_abort(reason=ready_signal)
+            else:
+                self._cleanup_startup_workers()
             raise RuntimeError(
                 "Executor worker returned error") from ready_signal
+
+    def _cleanup_startup_workers(self):
+        """Stop workers after a failed startup without closing a borrowed pool."""
+        if not self.workers_started:
+            return
+        try:
+            self.shutdown()
+        except Exception as cleanup_error:
+            logger.warning(
+                f"Failed to fully clean executor startup workers: {cleanup_error}"
+            )
 
     def _abort_all_requests(self):
         # The results can be finished during this loop, so self._results may be changed.
@@ -527,7 +532,8 @@ class GenerationExecutorProxy(GenerationExecutor):
             self._resource_governor_queue.close()
 
         self.workers_started = False
-        self.mpi_session.shutdown()
+        if self._owns_mpi_session:
+            self.mpi_session.shutdown()
 
         # Process the errors in-case error during shutting down the threads
         self._handle_background_error()
@@ -720,7 +726,12 @@ class GenerationExecutorProxy(GenerationExecutor):
         return self._iter_kv_events_result
 
     def __del__(self):
-        self.shutdown()
+        try:
+            self.shutdown()
+        except Exception:
+            # Destructors must not mask the original constructor or shutdown
+            # error. Explicit shutdown still reports failures to the caller.
+            pass
 
     def __enter__(self):
         return self
