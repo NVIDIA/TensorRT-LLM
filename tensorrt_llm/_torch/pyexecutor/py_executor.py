@@ -3954,13 +3954,6 @@ class PyExecutor:
                         )
                         gpu_forward_events_from_perf_pool = True
 
-                    scheduled_request_ids = [
-                        req.py_request_id
-                        for req in scheduled_batch.all_requests()
-                    ]
-                    logger.info(
-                        f"[{time.time()}] Starting forward step for scheduled "
-                        f"batch request_ids={scheduled_request_ids}")
                     with self.perf_manager.record_perf_events(
                             gpu_forward_start, gpu_forward_end) as fwd_timing:
                         if self.dwdp_manager is not None:
@@ -5715,7 +5708,6 @@ class PyExecutor:
         chunk_end_block = (chunk_end_pos + tpb - 1) // tpb
         is_last_chunk = request.context_remaining_length == 0
 
-        logger.info(f"[{time.time()}] Sending prefill chunk for request {request.py_request_id} from block {chunk_start_block} to {chunk_end_block}")
         self.kv_cache_transceiver.send_prefill_chunk(
             request,
             chunk_start_block=chunk_start_block,
@@ -5751,9 +5743,11 @@ class PyExecutor:
                             req.py_request_id)
                     # Order is important here: we need to start the transfer before responding
                     # to make sure the blocks are stored for reuse before they are sent.
-                    self.async_transfer_manager.start_transfer(req) # TODO: I think this is the right place for pipelined transfer?
-                    # If pipelined transfer is enabled, skip re-sending.
-                    if not self.kv_cache_transceiver.enable_pipelined_transfer:
+                    self.async_transfer_manager.start_transfer(req)
+
+                    if self.kv_cache_transceiver.enable_pipelined_transfer:
+                        self.kv_cache_transceiver.finalize_pipelined_send(req)
+                    else:
                         self.kv_cache_transceiver.respond_and_send_async(req)
 
                     if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:

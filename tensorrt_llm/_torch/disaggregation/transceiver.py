@@ -580,7 +580,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
         if is_last_chunk:
             req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
-            self._finalize_send(req, session)
+
+    @nvtx_range("KvCacheTransceiverV2.finalize_pipelined_send")
+    def finalize_pipelined_send(self, req: LlmRequest) -> None:
+        """Finalize a pipelined send after the first generated token is ready."""
+        rid = get_unique_rid(req)
+        assert rid is not None
+        session = self._send_sessions.get(rid)
+        if session is None:
+            logger.warning(
+                f"finalize_pipelined_send: rid={rid} has no send session, skipping"
+            )
+            return
+
+        self._finalize_send(req, session)
 
     @nvtx_range("KvCacheTransceiverV2.respond_and_send_async")
     def respond_and_send_async(self, req: LlmRequest) -> None:

@@ -40,6 +40,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     TaskStatus,
     TxSession,
 )
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 
@@ -453,17 +454,69 @@ def test_pipelined_transfer_requires_gen_first_flow():
     ):
         PyExecutor._validate_request(executor, request)
 
-def test_cuda_event_stored_on_task():
-    """KVSendTask stores cuda_event correctly."""
-    s = KVSlice(is_last_slice=False, block_ids_per_layer_groups=[[0, 1]])
+
+def test_pipelined_last_chunk_defers_aux_finalization(monkeypatch):
+    """Last chunk sends KV, while aux waits until sampling has updated tokens."""
+    from tensorrt_llm._torch.disaggregation import transceiver as transceiver_module
+    from tensorrt_llm._torch.disaggregation.transceiver import \
+        KvCacheTransceiverV2
+
     event = MagicMock()
-    task = KVSendTask(s, MagicMock(disagg_request_id=1), slice_id=0, cuda_event=event)
-    assert task.cuda_event is event
+    monkeypatch.setattr(transceiver_module.torch.cuda, "Event",
+                        lambda: event)
+    monkeypatch.setattr(transceiver_module.torch.cuda, "current_stream",
+                        MagicMock(return_value=MagicMock()))
+
+    session = MagicMock()
+    session.kv_tasks = []
+
+    transceiver = MagicMock()
+    transceiver._get_or_create_send_session.return_value = session
+    transceiver._send_sessions = {42: session}
+    transceiver._send_reqs = {}
+    transceiver._reuse_adapter.tokens_per_block = 4
+    transceiver._page_table = MagicMock()
+    transceiver._collect_base_slice.return_value = KVSlice(
+        is_last_slice=False,
+        block_ids_per_layer_groups=[
+            np.array([0, 1], dtype=np.int64),
+        ],
+    )
+
+    request = SimpleNamespace(
+        py_disaggregated_params=DisaggregatedParams(disagg_request_id=42),
+        request_id=42,
+        prompt_len=8,
+    )
+
+    KvCacheTransceiverV2.send_prefill_chunk(
+        transceiver,
+        request,
+        chunk_start_block=0,
+        chunk_end_block=2,
+        is_last_chunk=True,
+    )
+
+    assert request.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+    sent_slice = session.send.call_args.args[0]
+    assert sent_slice.is_last_slice is True
+    transceiver._finalize_send.assert_not_called()
+
+    KvCacheTransceiverV2.finalize_pipelined_send(transceiver, request)
+
+    transceiver._finalize_send.assert_called_once_with(request, session)
+
+
+def test_cuda_event_stored_on_task():
+    """KVSlice stores cuda_event correctly."""
+    event = MagicMock()
+    s = KVSlice(is_last_slice=False, cuda_event=event, block_ids_per_layer_groups=[[0, 1]])
+    task = KVSendTask(s, MagicMock(disagg_request_id=1), slice_id=0)
+    assert task._slice.cuda_event is event
 
 
 def test_cuda_event_none_by_default():
-    """KVSendTask.cuda_event defaults to None."""
+    """KVSlice.cuda_event defaults to None."""
     s = KVSlice(is_last_slice=True, block_ids_per_layer_groups=[[0]])
     task = KVSendTask(s, MagicMock(disagg_request_id=1), slice_id=0)
-    assert task.cuda_event is None
-# TODO(athenac): need to add more e2e tests! accuracy tests!
+    assert task._slice.cuda_event is None

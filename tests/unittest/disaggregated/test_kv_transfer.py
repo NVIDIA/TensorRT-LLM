@@ -4,7 +4,7 @@ import os
 import random
 import time
 import uuid
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 # Exclude IB (no fabric) and gdr_copy (UCX rcache SIGABRT at teardown).
 os.environ.setdefault("UCX_TLS", "^ib,gdr_copy")
@@ -21,6 +21,7 @@ import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # TODO: remove it.  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
+from tensorrt_llm._torch.disaggregation import transceiver as transceiver_mod
 from tensorrt_llm._torch.disaggregation.base.transfer import (
     KVSlice,
     LayerRange,
@@ -159,34 +160,76 @@ def test_session_status_enum():
 
 
 # ---------------------------------------------------------------------------
-# Chunked KV slice creation tests
+# Pipelined prefill chunk creation tests
 # ---------------------------------------------------------------------------
 
 
-def _chunk_block_ids(all_block_ids, transfer_chunk_size, mamba_state_index=None):
-    """Call the real _create_kv_slices via a mock transceiver."""
-    from unittest.mock import MagicMock
-
-    from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice
-
+def _send_prefill_chunks(
+    all_block_ids,
+    chunk_size_blocks,
+    mamba_state_index=None,
+    tokens_per_block=1,
+    sender_session=None,
+    fake_cuda_events=True,
+):
+    """Create/send chunks through the real pipelined send_prefill_chunk path."""
+    all_block_ids = [np.asarray(ids, dtype=np.int64) for ids in all_block_ids]
+    total_blocks = max((len(ids) for ids in all_block_ids), default=0)
     base_slice = KVSlice(
-        is_last_slice=True,
         block_ids_per_layer_groups=all_block_ids,
         mamba_state_index=mamba_state_index,
     )
-
+    session = sender_session if sender_session is not None else MagicMock()
+    session.kv_tasks = []
     transceiver = MagicMock()
-    transceiver._transfer_chunk_size = transfer_chunk_size
+    transceiver._get_or_create_send_session.return_value = session
     transceiver._collect_base_slice = MagicMock(return_value=base_slice)
-    transceiver._reuse_adapter.tokens_per_block = 1
-    transceiver._create_kv_slices = KvCacheTransceiverV2._create_kv_slices.__get__(transceiver)
+    transceiver._reuse_adapter.tokens_per_block = tokens_per_block
+    transceiver._send_reqs = {}
 
+    prompt_len = total_blocks * tokens_per_block
     req = MagicMock()
-    return transceiver._create_kv_slices(req)
+    req.py_disaggregated_params = DisaggregatedParams(disagg_request_id=42)
+    req.prompt_len = prompt_len
+
+    if chunk_size_blocks is None or chunk_size_blocks >= total_blocks:
+        chunk_ranges = [(0, total_blocks)]
+    else:
+        chunk_ranges = [
+            (start, min(start + chunk_size_blocks, total_blocks))
+            for start in range(0, total_blocks, chunk_size_blocks)
+        ]
+    if not chunk_ranges:
+        chunk_ranges = [(0, 0)]
+
+    def send_chunks():
+        for idx, (chunk_start, chunk_end) in enumerate(chunk_ranges):
+            KvCacheTransceiverV2.send_prefill_chunk(
+                transceiver,
+                req,
+                chunk_start_block=chunk_start,
+                chunk_end_block=chunk_end,
+                is_last_chunk=idx == len(chunk_ranges) - 1,
+            )
+
+    if fake_cuda_events:
+        event = MagicMock()
+        with patch.object(transceiver_mod.torch.cuda, "Event",
+                          lambda: event), patch.object(
+                              transceiver_mod.torch.cuda,
+                              "current_stream",
+                              MagicMock(return_value=MagicMock())):
+            send_chunks()
+    else:
+        send_chunks()
+
+    if sender_session is not None:
+        return []
+    return [call.args[0] for call in session.send.call_args_list]
 
 
 @pytest.mark.parametrize(
-    "all_block_ids,chunk_size,expected_num_slices",
+        "all_block_ids,chunk_size_blocks,expected_num_slices",
     [
         ([[0, 1, 2, 3, 4, 5, 6, 7]], None, 1),
         ([[0, 1, 2, 3, 4, 5, 6, 7]], 4, 2),
@@ -196,9 +239,10 @@ def _chunk_block_ids(all_block_ids, transfer_chunk_size, mamba_state_index=None)
     ],
     ids=["no_chunking", "even_split", "uneven_split", "empty_blocks", "chunk_larger_than_total"],
 )
-def test_create_kv_slices_basic(all_block_ids, chunk_size, expected_num_slices):
-    """Chunking produces the expected number of slices."""
-    slices = _chunk_block_ids(all_block_ids, transfer_chunk_size=chunk_size)
+def test_send_prefill_chunks_basic(all_block_ids, chunk_size_blocks,
+                                   expected_num_slices):
+    """Pipelined prefill chunking produces the expected number of slices."""
+    slices = _send_prefill_chunks(all_block_ids, chunk_size_blocks)
     assert len(slices) == expected_num_slices
     assert slices[-1].is_last_slice is True
     if expected_num_slices > 1:
@@ -206,10 +250,10 @@ def test_create_kv_slices_basic(all_block_ids, chunk_size, expected_num_slices):
             assert s.is_last_slice is False
 
 
-def test_create_kv_slices_integrity_check():
+def test_send_prefill_chunks_integrity_check():
     """Reassembled block IDs from all slices must match the original."""
     all_block_ids = [list(range(17)), list(range(5))]
-    slices = _chunk_block_ids(all_block_ids, transfer_chunk_size=4)
+    slices = _send_prefill_chunks(all_block_ids, chunk_size_blocks=4)
     for lg_idx, original in enumerate(all_block_ids):
         reassembled = []
         for s in slices:
@@ -217,10 +261,10 @@ def test_create_kv_slices_integrity_check():
         assert reassembled == original
 
 
-def test_create_kv_slices_multiple_layer_groups():
+def test_send_prefill_chunks_multiple_layer_groups():
     """Shorter layer groups are projected into the overlapping global chunk."""
     all_block_ids = [list(range(8)), list(range(3))]
-    slices = _chunk_block_ids(all_block_ids, transfer_chunk_size=4)
+    slices = _send_prefill_chunks(all_block_ids, chunk_size_blocks=4)
     assert len(slices) == 2
     assert np.array_equal(slices[0].block_ids_per_layer_groups[0], np.array([0, 1, 2, 3]))
     assert np.array_equal(slices[1].block_ids_per_layer_groups[0], np.array([4, 5, 6, 7]))
@@ -230,19 +274,21 @@ def test_create_kv_slices_multiple_layer_groups():
     assert slices[1].token_range == TokenRange(start=4, end=8)
 
 
-def test_create_kv_slices_preserves_mamba_state_index():
+def test_send_prefill_chunks_preserves_mamba_state_index():
     """mamba_state_index is propagated to every chunk slice."""
     all_block_ids = [list(range(8))]
-    slices = _chunk_block_ids(all_block_ids, transfer_chunk_size=4, mamba_state_index=42)
+    slices = _send_prefill_chunks(all_block_ids,
+                                  chunk_size_blocks=4,
+                                  mamba_state_index=42)
     assert len(slices) == 2
     for s in slices:
         assert s.mamba_state_index == 42
 
 
-def test_create_kv_slices_none_mamba_state_index():
+def test_send_prefill_chunks_none_mamba_state_index():
     """mamba_state_index=None is preserved when not set."""
     all_block_ids = [list(range(4))]
-    slices = _chunk_block_ids(all_block_ids, transfer_chunk_size=4)
+    slices = _send_prefill_chunks(all_block_ids, chunk_size_blocks=4)
     assert len(slices) == 1
     assert slices[0].mamba_state_index is None
 
@@ -1174,11 +1220,11 @@ def test_transfer_worker_v2_with_window(
 @pytest.mark.timeout(120)
 @pytest.mark.parametrize("use_v2", [False, True], ids=["v1", "v2"])
 @pytest.mark.parametrize(
-    "transfer_chunk_size",
+    "chunk_size_blocks",
     [None, 2],
     ids=["single_slice", "sender_chunked"],
 )
-def test_transfer_with_gen_prefix_offset(use_v2, transfer_chunk_size):
+def test_transfer_with_gen_prefix_offset(use_v2, chunk_size_blocks):
     """Verify that only suffix blocks are transferred when gen has a prefix offset.
 
     Simulates gen-side prefix cache: ctx sends all blocks for [0, request_len),
@@ -1278,7 +1324,7 @@ def test_transfer_with_gen_prefix_offset(use_v2, transfer_chunk_size):
         )
         rx.receive(recv_slice)
 
-        if transfer_chunk_size is None:
+        if chunk_size_blocks is None:
             tx.send(
                 KVSlice(
                     is_last_slice=True,
@@ -1287,21 +1333,13 @@ def test_transfer_with_gen_prefix_offset(use_v2, transfer_chunk_size):
                 )
             )
         else:
-            transceiver = MagicMock()
-            transceiver._transfer_chunk_size = transfer_chunk_size
-            transceiver._collect_base_slice = MagicMock(
-                return_value=KVSlice(
-                    is_last_slice=True,
-                    block_ids_per_layer_groups=ctx_block_ids,
-                    token_range=TokenRange(start=0, end=request_len),
-                )
+            _send_prefill_chunks(
+                ctx_block_ids,
+                chunk_size_blocks=chunk_size_blocks,
+                tokens_per_block=tokens_per_block,
+                sender_session=tx,
+                fake_cuda_events=False,
             )
-            transceiver._reuse_adapter.tokens_per_block = tokens_per_block
-            transceiver._create_kv_slices = KvCacheTransceiverV2._create_kv_slices.__get__(
-                transceiver
-            )
-            for kv_slice in transceiver._create_kv_slices(ctx_request):
-                tx.send(kv_slice)
 
         result = tx.wait_complete()
         assert result == WaitResult.COMPLETED, f"tx wait_complete returned {result}"
@@ -1575,7 +1613,7 @@ def add_and_verify_chunked_request(
     ctx_request_id,
     gen_request_id,
     request_len,
-    transfer_chunk_size,
+    chunk_size_blocks,
 ):
     """Chunked transfer variant: sender sends N slices, receiver sends 1."""
     ctx_transfer_workers = setup["ctx_transfer_workers"]
@@ -1588,19 +1626,13 @@ def add_and_verify_chunked_request(
 
     sender_sessions = [tw.create_tx_session(ctx_info["ctx_request"]) for tw in ctx_transfer_workers]
     for sender_session, block_ids_per_groups in zip(sender_sessions, ctx_block_ids, strict=True):
-        transceiver = MagicMock()
-        transceiver._transfer_chunk_size = transfer_chunk_size
-        transceiver._collect_base_slice = MagicMock(
-            return_value=KVSlice(
-                is_last_slice=True,
-                block_ids_per_layer_groups=block_ids_per_groups,
-                token_range=token_range,
-            )
+        _send_prefill_chunks(
+            block_ids_per_groups,
+            chunk_size_blocks=chunk_size_blocks,
+            tokens_per_block=setup["tokens_per_block"],
+            sender_session=sender_session,
+            fake_cuda_events=False,
         )
-        transceiver._reuse_adapter.tokens_per_block = setup["tokens_per_block"]
-        transceiver._create_kv_slices = KvCacheTransceiverV2._create_kv_slices.__get__(transceiver)
-        for kv_slice in transceiver._create_kv_slices(ctx_info["ctx_request"]):
-            sender_session.send(kv_slice)
 
     receiver_sessions = [
         tw.create_rx_session(ctx_info["gen_request"]) for tw in gen_transfer_workers
@@ -1659,8 +1691,8 @@ def test_transfer_worker_chunked(
     chunk_size = max(1, total_blocks // 2)
 
     try:
-        add_and_verify_chunked_request(setup, 0, 1, request_len, transfer_chunk_size=chunk_size)
-        add_and_verify_chunked_request(setup, 2, 3, request_len * 2, transfer_chunk_size=chunk_size)
+        add_and_verify_chunked_request(setup, 0, 1, request_len, chunk_size_blocks=chunk_size)
+        add_and_verify_chunked_request(setup, 2, 3, request_len * 2, chunk_size_blocks=chunk_size)
     finally:
         for worker in setup["ctx_transfer_workers"]:
             worker.shutdown()
@@ -1801,8 +1833,6 @@ def add_and_verify_pipelined_request(
     chunk_size_blocks,
 ):
     """Pipelined transfer: sender sends chunks with CUDA events, receiver sends 1."""
-    import math
-
     ctx_transfer_workers = setup["ctx_transfer_workers"]
     gen_transfer_workers = setup["gen_transfer_workers"]
 
@@ -1811,44 +1841,31 @@ def add_and_verify_pipelined_request(
     gen_block_ids = ctx_info["gen_block_ids"]
 
     sender_sessions = [tw.create_tx_session(ctx_info["ctx_request"]) for tw in ctx_transfer_workers]
-    send_futures = []
     for sender_session, block_ids_per_groups in zip(sender_sessions, ctx_block_ids):
-        max_blocks = max(len(ids) for ids in block_ids_per_groups)
-        num_chunks = math.ceil(max_blocks / chunk_size_blocks)
-        chunk_offset = 0
-        for chunk_idx in range(num_chunks):
-            start = chunk_idx * chunk_size_blocks
-            end = start + chunk_size_blocks
-            is_last = chunk_idx == num_chunks - 1
-            chunk_block_ids = [ids[start:end] for ids in block_ids_per_groups]
-            kv_slice = KVSlice(
-                is_last_slice=is_last,
-                block_ids_per_layer_groups=chunk_block_ids,
-            )
-            cuda_event = torch.cuda.Event()
-            cuda_event.record()
-            send_futures.append(
-                sender_session.send(
-                    kv_slice, chunk_block_offset=chunk_offset, cuda_event=cuda_event
-                )
-            )
-            chunk_offset += max(len(ids) for ids in chunk_block_ids)
+        _send_prefill_chunks(
+            block_ids_per_groups,
+            chunk_size_blocks=chunk_size_blocks,
+            tokens_per_block=setup["tokens_per_block"],
+            sender_session=sender_session,
+            fake_cuda_events=False,
+        )
 
     receiver_sessions = [
         tw.create_rx_session(ctx_info["gen_request"]) for tw in gen_transfer_workers
     ]
-    recv_futures = []
     for recv_session, block_ids_per_groups in zip(receiver_sessions, gen_block_ids):
         full_slice = KVSlice(
             is_last_slice=True,
             block_ids_per_layer_groups=block_ids_per_groups,
         )
-        recv_futures.append(recv_session.receive(full_slice))
+        recv_session.receive(full_slice)
 
-    for f in send_futures:
-        f.result()
-    for f in recv_futures:
-        f.result()
+    for session in sender_sessions:
+        result = session.wait_complete()
+        assert result == WaitResult.COMPLETED, f"tx wait_complete returned {result}"
+    for session in receiver_sessions:
+        result = session.wait_complete(blocking=True)
+        assert result == WaitResult.COMPLETED, f"rx wait_complete returned {result}"
 
     _verify_and_cleanup_chunked(setup, ctx_info, sender_sessions, receiver_sessions)
 

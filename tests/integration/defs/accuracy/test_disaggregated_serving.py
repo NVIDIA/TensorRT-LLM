@@ -740,9 +740,11 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
     @skip_pre_hopper
     @pytest.mark.skip_less_device(2)
-    @parametrize_with_ids("enable_block_reuse", [False, True])
+    @parametrize_with_ids("enable_block_reuse", [True, False])
+    @parametrize_with_ids("disable_overlap_scheduler", [True, False])
     def test_pipelined_kv_transfer_nixl_python_accuracy(self,
-                                                      enable_block_reuse: bool):
+                                                      enable_block_reuse: bool,
+                                                      disable_overlap_scheduler: bool):
         """Test pipelined KV transfer accuracy using Python transceiver and C++ KVCacheManager."""
         kv_cache_config = {
             "use_kv_cache_manager_v2": False,
@@ -755,13 +757,14 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "enable_pipelined_transfer": True,
         }
         ctx_server_config = {
-            "disable_overlap_scheduler": True,
+            "max_num_tokens": 256, # cap prefill chunk size
+            "disable_overlap_scheduler": disable_overlap_scheduler,
             "kv_cache_config": dict(kv_cache_config),
             "cache_transceiver_config": dict(cache_transceiver_config),
             "enable_chunked_prefill": True,
         }
         gen_server_config = {
-            "disable_overlap_scheduler": False,
+            "disable_overlap_scheduler": disable_overlap_scheduler,
             "kv_cache_config": dict(kv_cache_config),
             "cache_transceiver_config": dict(cache_transceiver_config),
             "enable_chunked_prefill": True,
