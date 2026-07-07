@@ -610,6 +610,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         sparse_params = attn.sparse_params
         has_skip_softmax = getattr(sparse_params, "algorithm", None) == "skip_softmax"
         has_sparse_attention = sparse_params is not None and not has_skip_softmax
+        if fwd.enable_dsv4_epilogue_fusion:
+            return False, "trtllm-gen does not support DSv4 epilogue fusion."
         if (
             fwd.sage_attn_num_elts_per_blk_q > 0
             or fwd.sage_attn_num_elts_per_blk_k > 0
