@@ -439,6 +439,8 @@ class GMSBackend:
         Raises:
             RuntimeError: If `connect()` has not been called yet, or
                 if the granted lock is RO (only the writer may commit).
+            TypeError: If the installed GMS returns an unsupported
+                finalization result.
         """
         if self._client is None:
             raise RuntimeError("GMS client not connected. Call connect() first.")
@@ -447,10 +449,38 @@ class GMSBackend:
 
         from gpu_memory_service.integrations.common.utils import finalize_gms_write
 
-        bytes_committed = int(finalize_gms_write(self._client, model))
-        # finalize_gms_write internally commits and reconnects in RO mode,
-        # so we mirror that state transition here.
+        commit_result = finalize_gms_write(self._client, model)
+        # Both the current and legacy finalize_gms_write implementations
+        # commit and reconnect in RO mode before returning. Mirror that state
+        # transition before interpreting the return value so a contract error
+        # cannot leave this adapter incorrectly reporting RW.
         self._is_rw = False
+
+        # Current GMS returns GMSCommittedMemoryStats. Keep the integer branch
+        # for the pre-stats GMS API generation this adapter originally
+        # supported; reject other shapes instead of silently coercing them.
+        # TODO(GMS-API): Remove the legacy branch once TRT-LLM declares GMS
+        # package version bounds.
+        if isinstance(commit_result, int) and not isinstance(commit_result, bool):
+            bytes_committed = commit_result
+        else:
+            try:
+                bytes_committed = commit_result.committed_bytes
+            except AttributeError as error:
+                raise TypeError(
+                    "Unsupported gpu_memory_service finalize_gms_write() result: "
+                    "expected GMSCommittedMemoryStats with an integer "
+                    "committed_bytes field or a legacy integer byte count, "
+                    f"got {type(commit_result).__name__}."
+                ) from error
+
+            if not isinstance(bytes_committed, int) or isinstance(bytes_committed, bool):
+                raise TypeError(
+                    "Unsupported gpu_memory_service finalize_gms_write() result: "
+                    "GMSCommittedMemoryStats.committed_bytes must be an integer, "
+                    f"got {type(bytes_committed).__name__}."
+                )
+
         logger.info(
             "GMS RW->RO: committed %.2f GiB at %s (tag=%s)",
             bytes_committed / (1 << 30),

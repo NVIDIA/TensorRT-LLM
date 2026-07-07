@@ -29,6 +29,7 @@ here. Tracked as a follow-up PR; see PR #13926 review thread
 
 import sys
 from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -200,6 +201,78 @@ class TestRwOnlyMethodsGated:
     def test_method_raises_when_granted_ro(self, method_name, invoke):
         with pytest.raises(RuntimeError, match="only valid in RW mode"):
             invoke(self._ro_backend())
+
+
+# ---------------------------------------------------------------------------
+# finalize_write() return contract and state transition
+# ---------------------------------------------------------------------------
+
+
+class TestFinalizeWrite:
+    """GMS finalization consumes supported byte-count return contracts."""
+
+    @staticmethod
+    def _rw_backend():
+        backend = GMSBackend(socket_path="/tmp/gms.sock", mapping=MagicMock())
+        backend._client = MagicMock()
+        backend._is_rw = True
+        return backend
+
+    @staticmethod
+    def _install_finalize_result(monkeypatch, result):
+        finalize_gms_write = MagicMock(return_value=result)
+        fake_utils = SimpleNamespace(finalize_gms_write=finalize_gms_write)
+        monkeypatch.setitem(
+            sys.modules,
+            "gpu_memory_service.integrations.common.utils",
+            fake_utils,
+        )
+        return finalize_gms_write
+
+    @pytest.mark.parametrize(
+        "committed_bytes",
+        [pytest.param(0, id="zero"), pytest.param(4096, id="nonzero")],
+    )
+    def test_consumes_current_stats_result(self, monkeypatch, committed_bytes):
+        backend = self._rw_backend()
+        model = MagicMock()
+        stats = SimpleNamespace(committed_bytes=committed_bytes, pruned_bytes=1024)
+        finalize_gms_write = self._install_finalize_result(monkeypatch, stats)
+
+        assert backend.finalize_write(model) == committed_bytes
+        finalize_gms_write.assert_called_once_with(backend._client, model)
+        assert backend.is_rw is False
+
+    def test_accepts_legacy_integer_result(self, monkeypatch):
+        backend = self._rw_backend()
+        model = MagicMock()
+        finalize_gms_write = self._install_finalize_result(monkeypatch, 4096)
+
+        assert backend.finalize_write(model) == 4096
+        finalize_gms_write.assert_called_once_with(backend._client, model)
+        assert backend.is_rw is False
+
+    @pytest.mark.parametrize(
+        "result",
+        [
+            pytest.param(None, id="none"),
+            pytest.param(True, id="boolean"),
+            pytest.param(
+                SimpleNamespace(committed_bytes="4096", pruned_bytes=0),
+                id="non-integer-committed-bytes",
+            ),
+        ],
+    )
+    def test_rejects_unsupported_result_after_ro_transition(self, monkeypatch, result):
+        backend = self._rw_backend()
+        self._install_finalize_result(monkeypatch, result)
+
+        with pytest.raises(TypeError, match="Unsupported gpu_memory_service"):
+            backend.finalize_write(MagicMock())
+
+        # The upstream helper returned, so it already committed and
+        # reconnected RO even though its return contract was unsupported.
+        assert backend.is_rw is False
 
 
 # ---------------------------------------------------------------------------
