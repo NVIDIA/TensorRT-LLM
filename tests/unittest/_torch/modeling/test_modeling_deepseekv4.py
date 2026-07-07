@@ -16,15 +16,15 @@ from transformers import PretrainedConfig
 # from utils.util import default_dtype
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.cache_manager import (
-    DeepseekV4CacheManager,
-)
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.compressor import Compressor
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import (
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.backend import (
     DeepseekV4Indexer,
     DeepseekV4TrtllmAttention,
     DeepseekV4TrtllmAttentionMetadata,
 )
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.cache_manager import (
+    DeepseekV4CacheManager,
+)
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.compressor import Compressor
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm._torch.configs.deepseekv4 import DeepseekV4Config
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -371,15 +371,15 @@ def test_deepseek_v4_q_b_layernorm_differs_from_joint_flat_rms():
 
 
 def test_deepseek_v4_mla_q_b_layernorm_init_and_forward_shape():
-    from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.mla_backend import (
+    from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.mla_module import (
         deepseek_v4_q_b_layernorm,
-        forward_impl_with_deepseek_v4,
+        forward_sparse_mla,
     )
     from tensorrt_llm._torch.modules.mla import MLA
 
     init_src = inspect.getsource(MLA.__init__)
     helper_src = inspect.getsource(deepseek_v4_q_b_layernorm)
-    forward_src = inspect.getsource(forward_impl_with_deepseek_v4)
+    forward_src = inspect.getsource(forward_sparse_mla)
     init_src_no_ws = "".join(init_src.split())
 
     assert "self.q_b_layernorm=RMSNorm(hidden_size=self.qk_head_dim" in init_src_no_ws

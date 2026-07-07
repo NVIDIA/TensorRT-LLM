@@ -36,8 +36,8 @@ from tensorrt_llm._torch.attention_backend.interface import (
     RopeParams,
 )
 from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
-from tensorrt_llm._torch.attention_backend.sparse.dsa.mla_backend import should_use_short_mha
-from tensorrt_llm._torch.attention_backend.sparse.mla import forward_context_sparse_mla
+from tensorrt_llm._torch.attention_backend.sparse.dsa.mla_module import should_use_short_mha
+from tensorrt_llm._torch.attention_backend.sparse.module import forward_context_sparse_mla
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig

@@ -3,7 +3,7 @@
 """Dense Sparse Attention (DSA) backend for TRT-LLM with indexer-based TopK selection."""
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -18,9 +18,6 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from .indexer import Indexer, transform_local_topk_and_prepare_pool_view
 from .metadata import DSAtrtllmAttentionMetadata
 from .params import DSAParams
-
-if TYPE_CHECKING:
-    from tensorrt_llm._torch.modules.mla import MLA
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
@@ -89,48 +86,6 @@ class DSATrtllmAttention(TrtllmAttention):
                                    aux_stream=aux_stream)
         else:
             self.indexer = None
-
-    def forward_mla_module(
-        self,
-        mla: "MLA",
-        position_ids: Optional[torch.Tensor],
-        hidden_states: torch.Tensor,
-        metadata: DSAtrtllmAttentionMetadata,
-        output: torch.Tensor,
-        latent_cache_gen: Optional[torch.Tensor] = None,
-    ) -> None:
-        """Run the DSA-specific implementation behind MLA's unified interface."""
-        from .mla_backend import forward_impl_with_dsa
-
-        forward_impl_with_dsa(mla, position_ids, hidden_states, metadata,
-                              output)
-
-    def forward_mla_custom_op(
-        self,
-        mla: "MLA",
-        hidden_states: torch.Tensor,
-        position_ids: Optional[torch.Tensor],
-        output: torch.Tensor,
-        latent_cache_gen: Optional[torch.Tensor],
-    ) -> None:
-        """Run DSA's two-stage MLA custom ops for CUDA graph capture."""
-        from . import custom_ops  # noqa: F401
-
-        proj_outputs = torch.ops.trtllm.mla_dsa_proj(hidden_states,
-                                                     position_ids,
-                                                     mla.layer_idx_str)
-        q, compressed_kv, k_pe, latent_cache = proj_outputs[:4]
-        indexer_intermediates = proj_outputs[4:]
-        torch.ops.trtllm.mla_dsa_attn_inplace(
-            q,
-            compressed_kv,
-            k_pe,
-            latent_cache,
-            indexer_intermediates,
-            position_ids,
-            mla.layer_idx_str,
-            output,
-        )
 
     def sparse_attn_predict(
         self,

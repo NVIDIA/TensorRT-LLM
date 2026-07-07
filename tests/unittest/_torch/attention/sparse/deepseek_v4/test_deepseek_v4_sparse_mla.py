@@ -38,7 +38,7 @@ from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
     DeepseekV4CacheManager,
     DeepseekV4TrtllmAttention,
 )
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import (
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.backend import (
     DeepseekV4TrtllmAttentionMetadata,
     get_token_bytes,
 )
@@ -1494,7 +1494,7 @@ def test_deepseek_v4_sparse_mla_mixed_batch(context_lengths: List[int]):
     )
     mixed_metadata.prepare()
 
-    # 5. Per-layer forward + verify (mirrors forward_impl_with_deepseek_v4).
+    # 5. Per-layer forward + verify (mirrors forward_sparse_mla).
     for li in TEST_LAYERS:
         ratio = scenario.compress_ratios[li]
         print(f"\n--- Mixed: layer {li}, compress_ratio={ratio} ---")

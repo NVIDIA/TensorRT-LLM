@@ -120,45 +120,27 @@ def _extract_mla_extra_attrs(layer_idx: str):
     return metadata, mla_layer
 
 
-def _forward_impl_with_dsa(*args, **kwargs):
-    from ..attention_backend.sparse.dsa.module import forward_impl_with_dsa
+def _should_use_sparse_mla_epilogue_fusion(*args, **kwargs):
+    from ..attention_backend.sparse.module import should_use_sparse_mla_epilogue_fusion
 
-    return forward_impl_with_dsa(*args, **kwargs)
-
-
-def _forward_impl_with_deepseek_v4(*args, **kwargs):
-    from ..attention_backend.sparse.deepseek_v4.module import forward_impl_with_deepseek_v4
-
-    return forward_impl_with_deepseek_v4(*args, **kwargs)
+    return should_use_sparse_mla_epilogue_fusion(*args, **kwargs)
 
 
-def _deepseek_v4_o_proj(*args, **kwargs):
-    from ..attention_backend.sparse.deepseek_v4.module import deepseek_v4_o_proj
+def _create_sparse_mla_epilogue_buffers(*args, **kwargs):
+    from ..attention_backend.sparse.module import create_sparse_mla_epilogue_buffers
 
-    return deepseek_v4_o_proj(*args, **kwargs)
-
-
-def _should_use_dsv4_epilogue_fusion(*args, **kwargs):
-    from ..attention_backend.sparse.deepseek_v4.module import should_use_dsv4_epilogue_fusion
-
-    return should_use_dsv4_epilogue_fusion(*args, **kwargs)
+    return create_sparse_mla_epilogue_buffers(*args, **kwargs)
 
 
-def _create_dsv4_epilogue_buffers(*args, **kwargs):
-    from ..attention_backend.sparse.deepseek_v4.module import create_dsv4_epilogue_buffers
+def _validate_sparse_mla_epilogue_buffers(*args, **kwargs):
+    from ..attention_backend.sparse.module import validate_sparse_mla_epilogue_buffers
 
-    return create_dsv4_epilogue_buffers(*args, **kwargs)
-
-
-def _validate_dsv4_epilogue_buffers(*args, **kwargs):
-    from ..attention_backend.sparse.deepseek_v4.module import validate_dsv4_epilogue_buffers
-
-    return validate_dsv4_epilogue_buffers(*args, **kwargs)
+    return validate_sparse_mla_epilogue_buffers(*args, **kwargs)
 
 
 def create_mla_outputs_impl(hidden_states: torch.Tensor, layer_idx: str) -> list[torch.Tensor]:
     metadata, mla_layer = _extract_mla_extra_attrs(layer_idx)
-    enable_dsv4_epilogue_fusion = _should_use_dsv4_epilogue_fusion(
+    enable_dsv4_epilogue_fusion = _should_use_sparse_mla_epilogue_fusion(
         mla_layer, metadata.num_contexts, metadata.num_generations
     )
     output_input = hidden_states[:0] if enable_dsv4_epilogue_fusion else hidden_states
@@ -166,7 +148,7 @@ def create_mla_outputs_impl(hidden_states: torch.Tensor, layer_idx: str) -> list
     outputs = [attn_output]
     if enable_dsv4_epilogue_fusion:
         outputs.extend(
-            _create_dsv4_epilogue_buffers(mla_layer, hidden_states, metadata.num_tokens)
+            _create_sparse_mla_epilogue_buffers(mla_layer, hidden_states, metadata.num_tokens)
         )
     return outputs
 
@@ -207,33 +189,22 @@ def mla_custom_op_inplace(
             scaling_factor=hidden_states_sf,
             unquantized_hidden_states=hidden_states,
         )
-    if mla_layer.is_deepseek_v4:
-        if enable_dsv4_epilogue_fusion:
-            if dsv4_output is None or dsv4_output_sf is None:
-                raise RuntimeError(
-                    "DSv4 fused epilogue requires caller-provided output and output_sf buffers."
-                )
-            dsv4_epilogue_output = (dsv4_output, dsv4_output_sf)
-        else:
-            if dsv4_output is not None or dsv4_output_sf is not None:
-                raise RuntimeError(
-                    "DSv4 fused epilogue buffers require epilogue fusion to be enabled."
-                )
-            dsv4_epilogue_output = None
-        _forward_impl_with_deepseek_v4(
-            mla_layer,
-            position_ids,
-            hidden_states,
-            metadata,
-            output=output,
-            dsv4_epilogue_output=dsv4_epilogue_output,
-        )
+    if enable_dsv4_epilogue_fusion:
+        if dsv4_output is None or dsv4_output_sf is None:
+            raise RuntimeError("Sparse MLA fused epilogue requires caller-provided output buffers.")
+        dsv4_epilogue_output = (dsv4_output, dsv4_output_sf)
     else:
-        if enable_dsv4_epilogue_fusion:
-            raise RuntimeError("DSv4 fused epilogue cannot be enabled for non-DeepSeek-V4 MLA.")
-        mla_layer.forward_impl(
-            position_ids, hidden_states, metadata, output=output, latent_cache_gen=latent_cache_gen
-        )
+        if dsv4_output is not None or dsv4_output_sf is not None:
+            raise RuntimeError("Sparse MLA epilogue buffers require epilogue fusion to be enabled.")
+        dsv4_epilogue_output = None
+    mla_layer.forward_impl(
+        position_ids,
+        hidden_states,
+        metadata,
+        output=output,
+        latent_cache_gen=latent_cache_gen,
+        dsv4_epilogue_output=dsv4_epilogue_output,
+    )
 
 
 def fp8_block_scaling_bmm_out(
@@ -383,6 +354,7 @@ class MLA(nn.Module):
             if sparse_attn_cfg is not None
             else None
         )
+        self.sparse_params = sparse_params
 
         sparse_algorithm = getattr(sparse_params, "algorithm", None)
         self.is_dsa = sparse_algorithm == "dsa"
@@ -1000,10 +972,26 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
         latent_cache_gen: Optional[torch.Tensor] = None,
+        dsv4_epilogue_output: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> None:
-        """Run MLA through the backend-selected module implementation."""
-        self.mqa.forward_mla_module(
-            self,
+        """Run the dense or sparse implementation of the shared MLA module."""
+        if self.sparse_params is not None:
+            from ..attention_backend.sparse.module import forward_sparse_mla
+
+            forward_sparse_mla(
+                self,
+                position_ids,
+                hidden_states,
+                attn_metadata,
+                output,
+                dsv4_epilogue_output=dsv4_epilogue_output,
+            )
+            return
+
+        if dsv4_epilogue_output is not None:
+            raise RuntimeError("Dense MLA does not support sparse MLA epilogue buffers")
+
+        self._forward_impl(
             position_ids,
             hidden_states,
             attn_metadata,
@@ -1656,7 +1644,7 @@ class MLA(nn.Module):
         if enable_dsv4_epilogue_fusion:
             assert self.is_deepseek_v4
             assert dsv4_epilogue_output is not None
-            dsv4_output, dsv4_output_sf = _validate_dsv4_epilogue_buffers(
+            dsv4_output, dsv4_output_sf = _validate_sparse_mla_epilogue_buffers(
                 self, num_tokens, dsv4_epilogue_output
             )
             dsv4_cos_sin_cache = self.inverse_rotary_emb.rotary_cos_sin
@@ -1833,7 +1821,7 @@ class MLA(nn.Module):
         if enable_dsv4_epilogue_fusion:
             assert self.is_deepseek_v4
             assert dsv4_epilogue_output is not None
-            dsv4_output, dsv4_output_sf = _validate_dsv4_epilogue_buffers(
+            dsv4_output, dsv4_output_sf = _validate_sparse_mla_epilogue_buffers(
                 self, num_tokens, dsv4_epilogue_output
             )
             dsv4_cos_sin_cache = self.inverse_rotary_emb.rotary_cos_sin
@@ -1916,22 +1904,70 @@ class MLA(nn.Module):
         position_ids: Optional[torch.Tensor],
         attn_output: torch.Tensor,
         latent_cache_gen: Optional[torch.Tensor],
+        dsv4_epilogue_output: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> None:
-        """Run the module's registered custom-op implementation."""
-        self.mqa.forward_mla_custom_op(
-            self, hidden_states, position_ids, attn_output, latent_cache_gen
-        )
+        """Run the dense or sparse registered custom-op implementation."""
+        if self.sparse_params is not None:
+            from ..attention_backend.sparse.module import forward_sparse_mla_custom_op
+
+            forward_sparse_mla_custom_op(
+                self,
+                hidden_states,
+                position_ids,
+                attn_output,
+                latent_cache_gen,
+                dsv4_epilogue_output=dsv4_epilogue_output,
+            )
+            return
+
+        if dsv4_epilogue_output is not None:
+            raise RuntimeError("Dense MLA does not support sparse MLA epilogue buffers")
+
+        if isinstance(hidden_states, Fp4QuantizedTensor):
+            torch.ops.trtllm.mla_custom_op_inplace(
+                hidden_states.unquantized_hidden_states,
+                position_ids,
+                self.layer_idx_str,
+                attn_output,
+                latent_cache_gen,
+                None,
+                None,
+                False,
+                hidden_states.fp4_tensor,
+                hidden_states.scaling_factor,
+            )
+        else:
+            torch.ops.trtllm.mla_custom_op_inplace(
+                hidden_states,
+                position_ids,
+                self.layer_idx_str,
+                attn_output,
+                latent_cache_gen,
+                None,
+                None,
+                False,
+            )
 
     def _project_output(
         self,
-        attn_output: torch.Tensor,
+        attn_output: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         position_ids: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams],
     ) -> torch.Tensor:
         """Apply the MLA output projection."""
-        return self.mqa.project_mla_output(
-            self, attn_output, position_ids, attn_metadata, all_reduce_params
+        if self.sparse_params is not None:
+            from ..attention_backend.sparse.module import project_sparse_mla_output
+
+            return project_sparse_mla_output(
+                self, attn_output, position_ids, attn_metadata, all_reduce_params
+            )
+
+        if isinstance(attn_output, tuple):
+            raise RuntimeError("Dense MLA does not support sparse MLA epilogue buffers")
+
+        return self._project_output_impl(
+            attn_output, position_ids, attn_metadata, all_reduce_params
         )
 
     def _project_output_impl(
@@ -1964,132 +2000,54 @@ class MLA(nn.Module):
             hidden_states, attn_metadata, self.mapping, self.layer_idx
         )
 
-        dsv4_epilogue_output: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+        sparse_epilogue_output: Optional[tuple[torch.Tensor, torch.Tensor]] = None
         if self.register_to_config:
-            if self.is_deepseek_v4:
-                outputs = torch.ops.trtllm.create_mla_outputs(hidden_states, self.layer_idx_str)
-                attn_output = outputs[0]
-                dsv4_output = None
-                dsv4_output_sf = None
-                if len(outputs) == 3:
-                    dsv4_output, dsv4_output_sf = outputs[1], outputs[2]
-                    dsv4_epilogue_output = (dsv4_output, dsv4_output_sf)
-                elif len(outputs) != 1:
-                    raise RuntimeError(
-                        "create_mla_outputs must return either legacy output or "
-                        "legacy output plus DSv4 fused epilogue buffers."
-                    )
-
-                torch.ops.trtllm.mla_custom_op_inplace(
-                    hidden_states,
-                    position_ids,
-                    self.layer_idx_str,
-                    attn_output,
-                    latent_cache_gen,
-                    dsv4_output,
-                    dsv4_output_sf,
-                    dsv4_epilogue_output is not None,
+            output_hidden_states = hidden_states
+            if isinstance(hidden_states, Fp4QuantizedTensor):
+                assert hidden_states.unquantized_hidden_states is not None, (
+                    "MLA.forward received an Fp4QuantizedTensor without a "
+                    "unquantized_hidden_states view"
                 )
-            else:
-                attn_output = self.create_output(hidden_states, attn_metadata.num_contexts)
-                if self.is_dsa:
-                    if isinstance(hidden_states, Fp4QuantizedTensor):
-                        proj_outputs = torch.ops.trtllm.mla_dsa_proj(
-                            hidden_states.unquantized_hidden_states,
-                            position_ids,
-                            self.layer_idx_str,
-                            hidden_states.fp4_tensor,
-                            hidden_states.scaling_factor,
-                        )
-                    else:
-                        proj_outputs = torch.ops.trtllm.mla_dsa_proj(
-                            hidden_states, position_ids, self.layer_idx_str
-                        )
-                    q, compressed_kv, k_pe, latent_cache = proj_outputs[:4]
-                    indexer_intermediates = proj_outputs[4:]
-                    torch.ops.trtllm.mla_dsa_attn_inplace(
-                        q,
-                        compressed_kv,
-                        k_pe,
-                        latent_cache,
-                        indexer_intermediates,
-                        position_ids,
-                        self.layer_idx_str,
-                        attn_output,
-                    )
-                else:
-                    if isinstance(hidden_states, Fp4QuantizedTensor):
-                        torch.ops.trtllm.mla_custom_op_inplace(
-                            hidden_states.unquantized_hidden_states,
-                            position_ids,
-                            self.layer_idx_str,
-                            attn_output,
-                            latent_cache_gen,
-                            None,
-                            None,
-                            False,
-                            hidden_states.fp4_tensor,
-                            hidden_states.scaling_factor,
-                        )
-                    else:
-                        torch.ops.trtllm.mla_custom_op_inplace(
-                            hidden_states,
-                            position_ids,
-                            self.layer_idx_str,
-                            attn_output,
-                            latent_cache_gen,
-                            None,
-                            None,
-                            False,
-                        )
+                output_hidden_states = hidden_states.unquantized_hidden_states
+            outputs = torch.ops.trtllm.create_mla_outputs(output_hidden_states, self.layer_idx_str)
+            attn_output = outputs[0]
+            if len(outputs) == 3:
+                sparse_epilogue_output = (outputs[1], outputs[2])
+            elif len(outputs) != 1:
+                raise RuntimeError(
+                    "create_mla_outputs must return either the attention output or "
+                    "the attention output plus sparse MLA epilogue buffers."
+                )
+            self._forward_custom_op(
+                hidden_states,
+                position_ids,
+                attn_output,
+                latent_cache_gen,
+                dsv4_epilogue_output=sparse_epilogue_output,
+            )
         else:
-            enable_dsv4_epilogue_fusion = self.is_deepseek_v4 and _should_use_dsv4_epilogue_fusion(
+            enable_sparse_epilogue_fusion = _should_use_sparse_mla_epilogue_fusion(
                 self, attn_metadata.num_contexts, attn_metadata.num_generations
             )
-            if enable_dsv4_epilogue_fusion:
-                dsv4_epilogue_output = _create_dsv4_epilogue_buffers(
+            if enable_sparse_epilogue_fusion:
+                sparse_epilogue_output = _create_sparse_mla_epilogue_buffers(
                     self, hidden_states, attn_metadata.num_tokens
                 )
-            output_input = hidden_states[:0] if enable_dsv4_epilogue_fusion else hidden_states
+            output_input = hidden_states[:0] if enable_sparse_epilogue_fusion else hidden_states
             attn_output = self.create_output(output_input, attn_metadata.num_contexts)
-            if self.is_dsa:
-                _forward_impl_with_dsa(
-                    self, position_ids, hidden_states, attn_metadata, output=attn_output
-                )
-            elif self.is_deepseek_v4:
-                _forward_impl_with_deepseek_v4(
-                    self,
-                    position_ids,
-                    hidden_states,
-                    attn_metadata,
-                    output=attn_output,
-                    dsv4_epilogue_output=dsv4_epilogue_output,
-                )
-            else:
-                self.forward_impl(
-                    position_ids,
-                    hidden_states,
-                    attn_metadata,
-                    output=attn_output,
-                    latent_cache_gen=latent_cache_gen,
-                )
-
-        if self.is_deepseek_v4:
-            if dsv4_epilogue_output is not None:
-                attn_output = _deepseek_v4_o_proj(self, dsv4_epilogue_output)
-            else:
-                attn_output = _deepseek_v4_o_proj(self, attn_output, position_ids)
-        else:
-            attn_output = _helix_cp_output_projection(
-                self.o_proj,
-                attn_output,
+            self.forward_impl(
+                position_ids,
+                hidden_states,
                 attn_metadata,
-                all_reduce_params,
-                self.mapping,
-                self.mapping_o,
-                self.layer_idx,
+                output=attn_output,
+                latent_cache_gen=latent_cache_gen,
+                dsv4_epilogue_output=sparse_epilogue_output,
             )
-        return attn_output
+
+        projection_input = sparse_epilogue_output or attn_output
+        return self._project_output(
+            projection_input, position_ids, attn_metadata, all_reduce_params
+        )
 
     def resmooth_parameters(self, module_weight, module_weight_scale, recipe=(1, 128, 128)):
         weight, weight_scale = fp8_utils.resmooth_to_fp8_e8m0(module_weight, module_weight_scale)

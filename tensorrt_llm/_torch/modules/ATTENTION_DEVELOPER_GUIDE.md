@@ -108,17 +108,18 @@ KV-cache contract. At a high level, it owns:
 (`is_lite == True`). In lite mode there is no separate Q low-rank compression
 stage. `is_lite` changes the projection structure, not just a small code path.
 
-Dense MLA and current sparse MLA variants still use the same module/backend/
-metadata/KV-cache split described above. Sparse-specific routing may currently
-pass through `MLA`, but that should be treated as an implementation detail
-rather than a stable design boundary.
+Dense and sparse MLA variants use the same `MLA` module. `MLA.forward_impl()`
+selects the dense implementation or the sparse facade in
+`attention_backend/sparse/module.py`. The facade then dispatches by sparse
+algorithm to its `mla_module.py`; MLA-specific dispatch is intentionally not
+part of the generic `AttentionBackend` interface.
 
 For MLA-related tasks, first check whether the work fits the current
 projection structure, can stay on an existing backend and metadata family, and
 can preserve the current latent-cache / paged-KV contract. If it can, the
 task usually stays within the existing MLA stack. If it depends on sparse
-helper-level control flow, read `mla.py` and the relevant sparse
-backend code directly.
+helper-level control flow, read `mla.py`, `attention_backend/sparse/module.py`,
+and the relevant algorithm's `mla_module.py` directly.
 
 ## 2. Backend Layer Reference
 
@@ -345,7 +346,8 @@ Working rules:
 
 - Stay on `Attention` or `MLA` plus an existing backend family when possible.
 - Extend the `TRTLLM` backend path before adding a new backend.
-- Extend module-level hooks before adding a new backend.
+- Extend the sparse module facade and the algorithm's `mla_module.py` for
+  sparse MLA module-side behavior.
 - Follow an existing sparse family pattern before adding a new sparse
   abstraction.
 - Treat cache-manager mismatch as a real blocker.
@@ -362,7 +364,9 @@ Working rules:
 | `tensorrt_llm/_torch/attention_backend/fmha/` | Internal TRTLLM FMHA libraries |
 | `tensorrt_llm/_torch/attention_backend/vanilla.py` | Torch fallback backend and metadata |
 | `tensorrt_llm/_torch/attention_backend/flashinfer.py` | FlashInfer backend and metadata |
-| `tensorrt_llm/_torch/attention_backend/sparse/` | Sparse MLA hooks, prediction backends, metadata, cache managers, and kernels |
+| `tensorrt_llm/_torch/attention_backend/sparse/module.py` | Sparse MLA module facade and algorithm dispatch |
+| `tensorrt_llm/_torch/attention_backend/sparse/<algorithm>/mla_module.py` | Algorithm-specific sparse MLA module implementation |
+| `tensorrt_llm/_torch/attention_backend/sparse/` | Sparse prediction backends, metadata, cache managers, and kernels |
 
 ## 6. Testing Notes
 

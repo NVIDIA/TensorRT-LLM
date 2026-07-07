@@ -13,8 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .cache_manager import DeepseekV4CacheManager
-from .deepseek_v4 import (
+from .backend import (
     DeepseekV4AttentionType,
     DeepSeekV4MetadataParams,
     DeepSeekV4Params,
@@ -22,6 +21,7 @@ from .deepseek_v4 import (
     make_deepseek_v4_sparse_metadata_params,
     make_deepseek_v4_sparse_params,
 )
+from .cache_manager import DeepseekV4CacheManager
 
 __all__ = [
     "DeepSeekV4MetadataParams",

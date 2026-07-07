@@ -27,10 +27,15 @@ import torch
 from utils.util import getSMVersion
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs, SparsePrediction
+from tensorrt_llm._torch.attention_backend.interface import (
+    AttentionBackend,
+    AttentionForwardArgs,
+    SparsePrediction,
+)
 from tensorrt_llm._torch.attention_backend.sparse.dsa.kernels import (
     triton_convert_req_index_to_global_index,
 )
+from tensorrt_llm._torch.attention_backend.sparse.module import forward_sparse_mla
 from tensorrt_llm._torch.attention_backend.sparse.params import SparseParams
 from tensorrt_llm._torch.attention_backend.sparse.prediction import prepare_sparse_prediction
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
@@ -190,14 +195,21 @@ def test_prepare_sparse_prediction_uses_optional_hooks() -> None:
     assert prediction.sparse_mla_topk_lens is forward_args.sparse_prediction.sparse_mla_topk_lens
 
 
-def test_mla_forward_uses_unified_backend_interface() -> None:
+def test_mla_forward_uses_sparse_module_facade() -> None:
     forward_source = inspect.getsource(MLA.forward)
     forward_impl_source = inspect.getsource(MLA.forward_impl)
+    sparse_facade_source = inspect.getsource(forward_sparse_mla)
 
     assert "is_dsa" not in forward_source
     assert "is_deepseek_v4" not in forward_source
     assert "mla_dsa" not in forward_source
-    assert "forward_mla_module" in forward_impl_source
+    assert "forward_sparse_mla" in forward_impl_source
+    assert "self.mqa.forward_mla" not in forward_impl_source
+    assert 'algorithm == "dsa"' in sparse_facade_source
+    assert 'algorithm == "deepseek_v4"' in sparse_facade_source
+    assert not hasattr(AttentionBackend, "forward_mla_module")
+    assert not hasattr(AttentionBackend, "forward_mla_custom_op")
+    assert not hasattr(AttentionBackend, "project_mla_output")
 
 
 def test_prepare_sparse_prediction_allows_backend_without_prediction() -> None:

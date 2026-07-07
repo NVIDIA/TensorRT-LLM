@@ -10,8 +10,6 @@ import torch
 from typing_extensions import Self
 
 if TYPE_CHECKING:
-    from ..distributed import AllReduceParams
-    from ..modules.mla import MLA
     from ..speculative.interface import SpecMetadata
     from ..speculative.spec_tree_manager import SpecTreeManager
 
@@ -1072,49 +1070,6 @@ class AttentionBackend(Generic[TMetadata]):
             torch.Tensor with shape (num_q_tokens, num_heads * head_dim)
         """
         raise NotImplementedError
-
-    def forward_mla_module(
-        self,
-        mla: "MLA",
-        position_ids: Optional[torch.Tensor],
-        hidden_states: torch.Tensor,
-        metadata: TMetadata,
-        output: torch.Tensor,
-        latent_cache_gen: Optional[torch.Tensor] = None,
-    ) -> None:
-        """Run the default MLA module implementation."""
-        mla._forward_impl(
-            position_ids,
-            hidden_states,
-            metadata,
-            output,
-            latent_cache_gen=latent_cache_gen,
-        )
-
-    def forward_mla_custom_op(
-        self,
-        mla: "MLA",
-        hidden_states: torch.Tensor,
-        position_ids: Optional[torch.Tensor],
-        output: torch.Tensor,
-        latent_cache_gen: Optional[torch.Tensor],
-    ) -> None:
-        """Run the default registered MLA custom op."""
-        torch.ops.trtllm.mla_custom_op_inplace(hidden_states, position_ids,
-                                               mla.layer_idx_str, output,
-                                               latent_cache_gen)
-
-    def project_mla_output(
-        self,
-        mla: "MLA",
-        attn_output: torch.Tensor,
-        position_ids: Optional[torch.Tensor],
-        metadata: TMetadata,
-        all_reduce_params: Optional["AllReduceParams"],
-    ) -> torch.Tensor:
-        """Apply the default MLA output projection."""
-        return mla._project_output_impl(attn_output, position_ids, metadata,
-                                        all_reduce_params)
 
     @classmethod
     def support_fused_rope(cls) -> bool:
