@@ -785,7 +785,7 @@ def test_mhc_fused_hc_backends(n: int, hidden_size: int, hc_mult: int):
 @pytest.mark.parametrize(
     "tactic",
     [
-        ("fused_half_mma", 0, 4, 512, 1),
+        ("fused_half_mma", 0, 0, 0, 1),
         ("fused_half_fma", 3, 2, 256, 1),
     ],
 )

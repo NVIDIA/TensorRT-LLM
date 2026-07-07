@@ -3540,95 +3540,81 @@ if IS_CUTLASS_DSL_AVAILABLE:
         kernel_class = Sm100BlockScaledPersistentDenseGemmKernel
         kernel_cache = dict()
         alpha_cache = dict()
-        # Per-64-token tactics through M=16384.
-        _SWAPPED_TILE_N_64 = tuple(tile_n for tile_n, run_length in (
-            (64, 2),
-            (96, 1),
-            (128, 1),
-            (160, 1),
-            (192, 1),
-            (240, 1),
-            (256, 1),
-            (128, 2),
-            (144, 1),
-            (160, 1),
-            (176, 1),
-            (192, 2),
-            (208, 1),
-            (224, 1),
-            (240, 1),
-            (176, 1),
-            (192, 2),
-            (208, 1),
-            (224, 2),
-            (240, 2),
-            (176, 1),
-            (192, 3),
-            (208, 2),
-            (224, 3),
-            (240, 2),
-            (192, 2),
-            (208, 3),
-            (224, 3),
-            (240, 3),
-            (224, 4),
-            (240, 4),
-            (208, 2),
-            (240, 1),
-            (224, 4),
-            (240, 4),
-            (208, 1),
-            (224, 5),
-            (240, 5),
-            (224, 2),
-            (240, 7),
-            (224, 4),
-            (240, 6),
-            (224, 4),
-            (240, 15),
-            (224, 3),
-            (240, 8),
-            (224, 2),
-            (240, 17),
-            (224, 1),
-            (240, 109),
-        ) for _ in range(run_length))
-        _NO_SWAP_TILE_N = {
-            256: 128,
-            448: 208,
-            512: 208,
-            2304: 224,
-            3776: 224,
-            4032: 224,
-            4096: 224,
-            5568: 224,
-            5824: 224,
-            5888: 224,
-            7616: 224,
-            7680: 224,
-            9408: 224,
-            9472: 224,
-        }
+        active_clusters_cache = dict()
+        _TILE_M = 256
+        _CLUSTER_M = 2
+        _M_BUCKET = 64
+        _TILE_N_GRANULARITY = 16
+        _MAX_SWAPPED_TILE_N = 240
+        _SCALE_BLOCK_K = 128
+        _SCALES_PER_WORD = 4
+        _PACKED_SCALE_K = _SCALE_BLOCK_K * _SCALES_PER_WORD
 
         def __init__(self, use_tvm_ffi: bool = True):
             self.use_tvm_ffi = use_tvm_ffi
 
         @classmethod
-        def _get_tactic(cls, m: int, num_splits: int):
-            if num_splits > 1 and m <= 32:
-                # A 128x32 tile exposes more work at tiny M.
-                return (128, 32), (2, 1), True, None, True
-            no_swap_tile_n = (cls._NO_SWAP_TILE_N.get(m)
-                              if num_splits == 1 else None)
-            if no_swap_tile_n is not None:
-                return ((256, no_swap_tile_n), (2, 1), False, None, m != 2304)
+        def _get_swapped_tile_n(cls, m: int, n: int,
+                                max_active_clusters: int) -> int:
+            bucket_m = pad_up(m, cls._M_BUCKET)
+            if bucket_m <= cls._TILE_M * cls._CLUSTER_M:
+                return pad_up(ceil_div(bucket_m, cls._CLUSTER_M),
+                              cls._TILE_N_GRANULARITY)
 
-            bucket = max(1, min((m + 63) // 64, len(cls._SWAPPED_TILE_N_64)))
-            tile_n = cls._SWAPPED_TILE_N_64[bucket - 1]
-            if num_splits > 1 and m <= 128:
-                tile_n = 64 if m <= 64 else 128
-            max_ab_stages = 8 if m <= 64 else None
-            return (256, tile_n), (2, 1), True, max_ab_stages, True
+            # Fill complete cluster waves within the tile-N cap.
+            clusters_per_n_tile = ceil_div(n, cls._TILE_M)
+            min_n_tiles = ceil_div(bucket_m, cls._MAX_SWAPPED_TILE_N)
+            waves = ceil_div(
+                min_n_tiles * clusters_per_n_tile,
+                max_active_clusters,
+            )
+            available_clusters = waves * max_active_clusters
+            n_tiles = max(
+                1,
+                available_clusters // clusters_per_n_tile,
+            )
+            return pad_up(ceil_div(bucket_m, n_tiles), cls._TILE_N_GRANULARITY)
+
+        @classmethod
+        def _get_no_swap_tile_n(cls, m: int, num_splits: int) -> Optional[int]:
+            if num_splits != 1:
+                return None
+            # Small-M no-swap cases avoid underfilled swapped tiles.
+            if (448 <= m <= cls._TILE_M * cls._CLUSTER_M
+                    and m % cls._M_BUCKET == 0):
+                return 208
+
+            # No-swap resonances repeat every seven M tiles from M=2304.
+            m_tiles = ceil_div(m, cls._TILE_M)
+            first_resonant_m_tiles = 9
+            resonance_period_m_tiles = 7
+            is_resonant = (m_tiles >= first_resonant_m_tiles
+                           and (m_tiles - first_resonant_m_tiles) %
+                           resonance_period_m_tiles == 0)
+            if m % cls._TILE_M == 0 and is_resonant:
+                return 224
+            return None
+
+        @classmethod
+        def _get_tactic(cls, m: int, n: int, num_splits: int,
+                        max_active_clusters: int):
+            if num_splits > 1 and m <= cls._M_BUCKET // 2:
+                # A 128x32 tile exposes more work at tiny M.
+                return ((cls._TILE_M // cls._CLUSTER_M,
+                         cls._M_BUCKET // cls._CLUSTER_M), (cls._CLUSTER_M, 1),
+                        True, None, True)
+            no_swap_tile_n = cls._get_no_swap_tile_n(m, num_splits)
+            if no_swap_tile_n is not None:
+                # Grouped L2 traversal regresses at the M=2304 resonance.
+                return ((cls._TILE_M, no_swap_tile_n), (cls._CLUSTER_M, 1),
+                        False, None, m != 2304)
+
+            tile_n = cls._get_swapped_tile_n(m, n, max_active_clusters)
+            if num_splits > 1 and m <= 2 * cls._M_BUCKET:
+                tile_n = cls._M_BUCKET if m <= cls._M_BUCKET else 2 * cls._M_BUCKET
+            max_ab_stages = 8 if m <= cls._M_BUCKET else None
+            return ((cls._TILE_M, tile_n), (cls._CLUSTER_M, 1), True,
+                    max_ab_stages, True)
 
         def forward(self, inputs: List[torch.Tensor], num_splits: int) -> None:
             a_tensor, a_sf_tensor, b_tensor, b_sf_tensor, partials = inputs
@@ -3636,11 +3622,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
             n = b_tensor.shape[0]
             c_tmp = partials.permute(1, 2, 0)
 
+            device_key = a_tensor.device
+            max_active_clusters = self.__class__.active_clusters_cache.get(
+                device_key)
+            if max_active_clusters is None:
+                max_active_clusters = cutlass.utils.HardwareInfo(
+                ).get_max_active_clusters(self._CLUSTER_M)
+                self.__class__.active_clusters_cache[
+                    device_key] = max_active_clusters
             (mma_tiler_mn, cluster_shape_mn, swap_ab, max_ab_stages,
-             l2_swizzle) = self._get_tactic(m, num_splits)
+             l2_swizzle) = self._get_tactic(m, n, num_splits,
+                                            max_active_clusters)
             # Large M amortizes a dedicated scale-TMA warp.
-            scale_tma_on_scale_warp = m >= 512
-            tma_packed_scales = scale_tma_on_scale_warp
+            tma_packed_scales = m >= 512
             if swap_ab:
                 # Swap M/N to expose more output tiles.
                 kernel_m, kernel_n = n, m
@@ -3657,8 +3651,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             cache_key = (kernel_m, kernel_n, k, num_splits, kernel_sfa_stride,
                          kernel_sfb_stride, mma_tiler_mn, cluster_shape_mn,
                          swap_ab, dynamic_mma_n, max_ab_stages, l2_swizzle,
-                         tma_packed_scales, scale_tma_on_scale_warp,
-                         self.use_tvm_ffi)
+                         tma_packed_scales, self.use_tvm_ffi)
 
             a_ptr = make_ptr(
                 cutlass.Float8E4M3FN,
@@ -3686,7 +3679,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             )
             c_cute_tensor = cute.runtime.from_dlpack(c_tmp).mark_layout_dynamic(
                 leading_dim=1)
-            device_key = a_tensor.device
             alpha = self.__class__.alpha_cache.get(device_key)
             if alpha is None:
                 alpha = torch.ones((1, ),
@@ -3706,15 +3698,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     False,
                     packed_k128_scales=True,
                     tma_packed_scales=tma_packed_scales,
-                    scale_tma_on_scale_warp=scale_tma_on_scale_warp,
                     dynamic_mma_n=dynamic_mma_n,
                     apply_alpha=False,
                     max_ab_stages=max_ab_stages,
                     l2_swizzle=l2_swizzle,
                 )
-                hardware_info = cutlass.utils.HardwareInfo()
-                max_active_clusters = hardware_info.get_max_active_clusters(
-                    cluster_shape_mn[0] * cluster_shape_mn[1])
                 compiled_gemm = cute.compile(
                     gemm.wrapper_dsv4_splitk_packed_ue8m0,
                     kernel_m,
@@ -3800,22 +3788,28 @@ if IS_CUTLASS_DSL_AVAILABLE:
         n = b.shape[0]
         if b.shape[1] != k:
             raise ValueError("A and B K dimensions must match")
-        if k % (512 * num_splits) != 0:
-            raise ValueError(f"K={k} must be divisible by 512*num_splits")
-        if n % 128 != 0:
-            raise ValueError(f"N={n} must be divisible by 128")
+        packed_scale_k = CuteDSLFp8SplitKGemmRunner._PACKED_SCALE_K
+        scale_block_k = CuteDSLFp8SplitKGemmRunner._SCALE_BLOCK_K
+        scales_per_word = CuteDSLFp8SplitKGemmRunner._SCALES_PER_WORD
+        if k % (packed_scale_k * num_splits) != 0:
+            raise ValueError(
+                f"K={k} must be divisible by {packed_scale_k}*num_splits")
+        if n % scale_block_k != 0:
+            raise ValueError(f"N={n} must be divisible by {scale_block_k}")
         if partials.shape != (num_splits, m, n) or not partials.is_contiguous():
             raise ValueError(
                 f"partials must be contiguous with shape {(num_splits, m, n)}")
 
-        packed_k = k // 512
+        packed_k = k // packed_scale_k
         if (sfa.dim() != 2 or sfa.shape != (m, packed_k) or sfa.stride(0) != 1
-                or sfa.stride(1) < m or sfa.stride(1) % 4 != 0):
+                or sfa.stride(1) < m or sfa.stride(1) % scales_per_word != 0):
             raise ValueError(
-                "SFA must be packed MN-major [M,K/512] with 4-aligned K stride")
+                f"SFA must be packed MN-major [M,K/{packed_scale_k}] with "
+                f"{scales_per_word}-aligned K stride")
         if (sfb.dim() != 2 or sfb.shape != (n, packed_k) or sfb.stride(0) != 1
                 or sfb.stride(1) != n):
-            raise ValueError("SFB must be packed MN-major [N,K/512]")
+            raise ValueError(
+                f"SFB must be packed MN-major [N,K/{packed_scale_k}]")
 
         CuteDSLFp8SplitKGemmRunner(use_tvm_ffi=True).forward(
             [a, sfa, b, sfb, partials], num_splits)
@@ -4098,10 +4092,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tactic=None,
         ) -> None:
             """Run the fixed DSV4 o_a tactic with FP8 and packed-UE8M0 output."""
-            use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = (
-                tactic if isinstance(tactic, tuple) else
-                (False, (128, 128), (1, 1)))
             fixed_tactic = (False, (128, 128), (1, 1))
+            use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = (
+                tactic if isinstance(tactic, tuple) else fixed_tactic)
             if (use_2cta_instrs, mma_tiler_mn,
                     cluster_shape_mn) != fixed_tactic:
                 raise ValueError("FP8-output BMM supports only the fixed "
@@ -4113,11 +4106,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
              sf_out_tensor) = inputs
             batch_size, m, k = a_tensor.shape
             n = b_tensor.shape[1]
-            sf_m = pad_up(m, 4)
+            aligned_m = pad_up(m, 4)
+            sf_m = aligned_m
             sf_k = ceil_div(k, 128)
             sf_n = ceil_div(n, 128)
-            aligned_mn = pad_up(m, 4)
-            n_tiles_per_group = ceil_div(n, 128)
             # SMEM cooperation wins through M=32.
             use_fp8_smem_epilogue = m <= 32
             fp8_smem_row_iters = ceil_div(m, 16) if use_fp8_smem_epilogue else 1
@@ -4128,10 +4120,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     "FP8-output BMM output must have shape [batch, M, N] "
                     "and dtype float8_e4m3fn")
             if sf_out_tensor.dtype != torch.int32 or sf_out_tensor.stride() != (
-                    1, aligned_mn):
+                    1, aligned_m):
                 raise ValueError(
                     "FP8-output BMM scales must be int32 with MN-major "
-                    f"stride (1, {aligned_mn})")
+                    f"stride (1, {aligned_m})")
 
             c_tmp = c_tensor.permute(1, 2, 0)
             cache_key = (
@@ -4173,12 +4165,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
                 )
+                cluster_size = cluster_shape_mn[0] * cluster_shape_mn[1]
                 max_active_clusters = cutlass.utils.HardwareInfo(
-                ).get_max_active_clusters(1)
+                ).get_max_active_clusters(cluster_size)
                 stream = cute.runtime.make_fake_stream(
                     use_tvm_ffi_env_stream=True)
                 compiled_gemm = cute.compile(
-                    gemm._wrapper_fp8sf_impl,
+                    gemm.wrapper_fp8sf,
                     m,
                     n,
                     k,
@@ -4194,8 +4187,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     max_active_clusters,
                     stream,
                     sf_out_ptr,
-                    aligned_mn,
-                    n_tiles_per_group,
+                    aligned_m,
+                    sf_n,
                     fp8_smem_row_iters,
                     use_fp8_smem_epilogue,
                     options="--opt-level 2 --enable-tvm-ffi",
@@ -4218,8 +4211,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 b_sf_tensor.data_ptr(),
                 c_tmp,
                 sf_out_tensor.data_ptr(),
-                aligned_mn,
-                n_tiles_per_group,
+                aligned_m,
+                sf_n,
             )
 
     # a/b: fp8, scale: fp32, output: bf16

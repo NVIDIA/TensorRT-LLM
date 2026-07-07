@@ -175,7 +175,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
     auto smem_res = PatternVisitor(
         [&, base = cursor](uint32_t const& i) { return reinterpret_cast<nv_bfloat16*>(base + i * SMEM_RES_PER_ISTG); });
     cursor += N_INPUT_STAGES * SMEM_RES_PER_ISTG;
-    // Reuse the x buffers as an FP32 reduction ring.
+    // Stream split-x tiles through the existing x buffers.
     auto smem_x_stg = PatternVisitor(
         [&, base = cursor](uint32_t const& i) { return reinterpret_cast<nv_bfloat16*>(base + i * SMEM_X_PER_ISTG); });
     cursor += N_INPUT_STAGES * SMEM_X_PER_ISTG;

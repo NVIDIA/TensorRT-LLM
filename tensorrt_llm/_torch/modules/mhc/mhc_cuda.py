@@ -801,6 +801,7 @@ def _alloc_fused_hc_outputs(
 # valid everywhere.
 _FUSED_HC_FALLBACK_TACTIC_MMA = ("fused_half_mma", 0, 0, 0, 1)
 _FUSED_HC_FALLBACK_TACTIC_FMA = ("fused_half_fma", 2, 1, 256, 1)
+_FUSED_HC_SPLIT_X_FMA_TACTIC = ("fused_half_fma", 3, 2, 256, 1)
 
 
 def _get_fused_hc_fallback_tactic(hidden_size: int | None = None):
@@ -808,19 +809,6 @@ def _get_fused_hc_fallback_tactic(hidden_size: int | None = None):
     if hidden_size is not None:
         mma_ok = mma_ok and hidden_size in _FUSED_HC_MMA_SUPPORTED_HIDDEN_SIZES
     return _FUSED_HC_FALLBACK_TACTIC_MMA if mma_ok else _FUSED_HC_FALLBACK_TACTIC_FMA
-
-
-def _pick_hidden_splits_for_split_x(M: int) -> int:
-    """Mirror the half-MMA C++ heuristic used by the fused split-x path."""
-    if M <= 512:
-        return 16
-    if M <= 1024:
-        return 8
-    if M <= 2048:
-        return 4
-    if M <= 4096:
-        return 2
-    return 1
 
 
 class MhcFusedHcRunner(TunableRunner):
@@ -1138,16 +1126,10 @@ def mhc_fused_hc(
     if x_num_splits in (2, 4):
         if B <= 32:
             # CUDA-core FMA wins at tiny M.
-            best_tactic = ("fused_half_fma", 3, 2, 256, 1)
+            best_tactic = _FUSED_HC_SPLIT_X_FMA_TACTIC
         else:
-            # Half-MMA streams O_b partials through its x-ring.
-            best_tactic = (
-                "fused_half_mma",
-                0,
-                _pick_hidden_splits_for_split_x(B),
-                0,
-                1,
-            )
+            # C++ selects split-K and BigFuse geometry from M.
+            best_tactic = _FUSED_HC_FALLBACK_TACTIC_MMA
     else:
         tuner = AutoTuner.get()
         _, best_tactic = tuner.choose_one(

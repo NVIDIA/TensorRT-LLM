@@ -69,19 +69,22 @@ def test_dsv4_fmha_epilogue_output_uses_fused_oproj():
         (64, 2, ((256, 64), (2, 1), True, 8, True)),
         (96, 2, ((256, 128), (2, 1), True, None, True)),
         (128, 2, ((256, 128), (2, 1), True, None, True)),
-        (256, 1, ((256, 128), (2, 1), False, None, True)),
+        (256, 1, ((256, 128), (2, 1), True, None, True)),
         (448, 1, ((256, 208), (2, 1), False, None, True)),
         (512, 1, ((256, 208), (2, 1), False, None, True)),
         (704, 1, ((256, 144), (2, 1), True, None, True)),
         (2240, 1, ((256, 224), (2, 1), True, None, True)),
         (2304, 1, ((256, 224), (2, 1), False, None, False)),
+        (3776, 1, ((256, 224), (2, 1), True, None, True)),
         (4096, 1, ((256, 224), (2, 1), False, None, True)),
+        (5888, 1, ((256, 224), (2, 1), False, None, True)),
+        (9472, 1, ((256, 224), (2, 1), False, None, True)),
         (16384, 1, ((256, 240), (2, 1), True, None, True)),
     ],
 )
 def test_dsv4_ob_cute_tactic(num_tokens, num_splits, expected):
     runner = cute_dsl_custom_ops.CuteDSLFp8SplitKGemmRunner
-    assert runner._get_tactic(num_tokens, num_splits) == expected
+    assert runner._get_tactic(num_tokens, 7168, num_splits, 74) == expected
 
 
 def test_dsv4_ob_split_k_one_uses_cute_dsl_and_caches_weight_scale(monkeypatch):
@@ -224,7 +227,7 @@ def test_dsv4_ob_unsplit_mid_m_uses_deep_gemm(m, monkeypatch):
 @skip_pre_blackwell
 @pytest.mark.parametrize(
     ("num_tokens", "num_splits"),
-    [(1, 2), (2, 2), (32, 2), (64, 2), (128, 2), (256, 1), (64, 4)],
+    [(1, 2), (2, 2), (32, 2), (64, 2), (128, 2), (256, 1), (512, 1), (64, 4)],
 )
 def test_dsv4_pro_fp8_splitk_gemm_partials(num_tokens: int, num_splits: int):
     if get_sm_version() // 10 != 10:

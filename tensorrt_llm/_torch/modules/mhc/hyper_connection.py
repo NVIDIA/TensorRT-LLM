@@ -163,10 +163,7 @@ class mHC(nn.Module):
         kernel launch on the model's pre-attention norm.
 
         Args:
-            x_prev:        [..., hidden] or [SK * B, hidden] bf16
-                           (attn / MoE output of prev block). The second form is
-                           split-major O-projection partials; fused_hc reduces
-                           them in FP32 before applying the hyper-connection.
+            x_prev:        [..., hidden] or split-major [SK * B, hidden] bf16
             residual_prev: [..., mult, hidden] bf16
             post_mix_prev: [..., mult] or [..., mult, 1] fp32
             comb_mix_prev: [..., mult, mult] fp32

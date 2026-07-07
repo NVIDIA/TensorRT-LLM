@@ -60,6 +60,11 @@ from .custom_pipeline import PipelineTmaUmma, PipelineUmmaAsync
 from .utils import (TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents,
                     griddepcontrol_wait, is_power_of_2)
 
+_SCALE_BLOCK_K = 128
+_SCALES_PER_WORD = 4
+_PACKED_SCALE_K = _SCALE_BLOCK_K * _SCALES_PER_WORD
+_PACKED_SCALE_BYTES = 4
+
 
 class Sm100BlockScaledPersistentDenseGemmKernel:
     """Implements batched matrix multiplication (C = A x SFA x B x SFB) with support for various data types
@@ -106,7 +111,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         apply_alpha: bool = True,
         max_ab_stages: Optional[int] = None,
         l2_swizzle: bool = False,
-        scale_tma_on_scale_warp: bool = False,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -135,10 +139,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.use_prefetch = use_prefetch
         self.packed_k128_scales = packed_k128_scales
         self.tma_packed_scales = tma_packed_scales
-        self.scale_tma_on_scale_warp = scale_tma_on_scale_warp
-        if self.scale_tma_on_scale_warp and not self.tma_packed_scales:
-            raise ValueError(
-                "scale_tma_on_scale_warp requires tma_packed_scales")
         self.max_ab_stages = max_ab_stages
         self.dynamic_mma_n = dynamic_mma_n
         self.apply_alpha = apply_alpha
@@ -295,11 +295,14 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         )
         if self.max_ab_stages is not None:
             self.num_ab_stage = min(self.num_ab_stage, self.max_ab_stages)
-        if self.scale_tma_on_scale_warp:
+        if self.tma_packed_scales:
             self.num_c_stage = 2
         self.num_scale_stage = self.num_ab_stage
         if self.packed_k128_scales:
-            self.num_scale_stage = max(2, (self.num_ab_stage + 3) // 4)
+            self.num_scale_stage = max(
+                2,
+                (self.num_ab_stage + _SCALES_PER_WORD - 1) // _SCALES_PER_WORD,
+            )
 
         # Compute A/B/SFA/SFB/C shared memory layout
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
@@ -409,7 +412,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
     ):
         """Run the DSV4 O_b GEMM and emit split-major partials."""
         split_k = k // num_splits
-        packed_k_per_split = split_k // 512
+        packed_k_per_split = split_k // _PACKED_SCALE_K
         a_tensor = cute.make_tensor(
             a_ptr,
             cute.make_layout(
@@ -668,8 +671,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.num_scale_tma_load_bytes = 0
         if cutlass.const_expr(self.packed_k128_scales
                               and self.tma_packed_scales):
-            self.num_scale_tma_load_bytes = (self.cta_tile_shape_mnk[0] +
-                                             self.cta_tile_shape_mnk[1]) * 4
+            self.num_scale_tma_load_bytes = (
+                self.cta_tile_shape_mnk[0] +
+                self.cta_tile_shape_mnk[1]) * _PACKED_SCALE_BYTES
 
         # Setup TMA store for C
         epi_smem_layout = cute.slice_(self.c_smem_layout_staged,
@@ -693,8 +697,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sfb_storage_elems = cute.cosize(self.sfb_smem_layout_staged)
         if cutlass.const_expr(self.packed_k128_scales):
             sfb_storage_elems = (
-                cute.round_up(self.cta_tile_shape_mnk[1], 128) * 4 *
-                self.num_scale_stage)
+                cute.round_up(self.cta_tile_shape_mnk[1], _SCALE_BLOCK_K) *
+                _PACKED_SCALE_BYTES * self.num_scale_stage)
         scale_tma_mbar_elems = 0
         if cutlass.const_expr(self.packed_k128_scales
                               and self.tma_packed_scales):
@@ -951,7 +955,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # (MMA, MMA_N, MMA_K, STAGE)
         sSFB = storage.sSFB.get_tensor(sfb_smem_layout_staged)
         if cutlass.const_expr(self.packed_k128_scales):
-            num_sfb_rows = cute.round_up(self.cta_tile_shape_mnk[1], 128)
+            num_sfb_rows = cute.round_up(self.cta_tile_shape_mnk[1],
+                                         _SCALE_BLOCK_K)
             sSFA_raw = cute.make_tensor(
                 cute.recast_ptr(storage.sSFA.data_ptr(), dtype=cutlass.Uint32),
                 cute.make_layout(
@@ -964,7 +969,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 cute.make_layout(
                     sSFB.shape,
                     stride=(sSFB.stride[0], sSFB.stride[1], sSFB.stride[2],
-                            num_sfb_rows * 4),
+                            num_sfb_rows * _PACKED_SCALE_BYTES),
                 ),
             )
             sSFB_raw = cute.make_tensor(
@@ -1185,11 +1190,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
             ab_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_ab_stage)
-            if cutlass.const_expr(self.packed_k128_scales
-                                  and self.tma_packed_scales
-                                  and not self.scale_tma_on_scale_warp):
-                scale_tma_producer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer, self.num_scale_stage)
             while work_tile.is_valid_tile:
 
                 # Get tile coord from tile scheduler
@@ -1312,10 +1312,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
                 # Peek (try_wait) AB buffer empty for k_block = prefetch_k_block_cnt
                 ab_producer_state.reset_count()
-                if cutlass.const_expr(self.packed_k128_scales
-                                      and self.tma_packed_scales
-                                      and not self.scale_tma_on_scale_warp):
-                    scale_tma_producer_state.reset_count()
                 peek_ab_empty_status = cutlass.Boolean(1)
                 if ab_producer_state.count < k_block_cnt:
                     peek_ab_empty_status = ab_pipeline.producer_try_acquire(
@@ -1324,35 +1320,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 # Tma load loop
                 #
                 for k_block in cutlass.range(0, k_block_cnt, 1, unroll=1):
-                    if cutlass.const_expr(self.packed_k128_scales
-                                          and self.tma_packed_scales
-                                          and not self.scale_tma_on_scale_warp):
-                        if k_block % 4 == 0:
-                            scale_tma_pipeline.producer_acquire(
-                                scale_tma_producer_state)
-                            scale_group = k_block // 4
-                            scale_tma_bar = (
-                                scale_tma_pipeline.producer_get_barrier(
-                                    scale_tma_producer_state))
-                            cute.copy(
-                                tma_atom_sfa,
-                                tAgSFA_tma[(None, cur_tile_coord[0],
-                                            scale_group,
-                                            mma_tile_coord_mnl[2])],
-                                tAsSFA_tma[(None,
-                                            scale_tma_producer_state.index)],
-                                tma_bar_ptr=scale_tma_bar,
-                            )
-                            cute.copy(
-                                tma_atom_sfb,
-                                tBgSFB_tma[(None, mma_tile_coord_mnl[1],
-                                            scale_group,
-                                            mma_tile_coord_mnl[2])],
-                                tBsSFB_tma[(None,
-                                            scale_tma_producer_state.index)],
-                                tma_bar_ptr=scale_tma_bar,
-                            )
-                            scale_tma_producer_state.advance()
                     ab_pipeline.producer_acquire(ab_producer_state,
                                                  peek_ab_empty_status)
 
@@ -1433,10 +1400,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             # Wait A/B buffer empty
             #
             ab_pipeline.producer_tail(ab_producer_state)
-            if cutlass.const_expr(self.packed_k128_scales
-                                  and self.tma_packed_scales
-                                  and not self.scale_tma_on_scale_warp):
-                scale_tma_pipeline.producer_tail(scale_tma_producer_state)
 
         # Load and transpose packed scales on a dedicated warp.
         if cutlass.const_expr(self.packed_k128_scales):
@@ -1448,14 +1411,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 scale_stage_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.num_scale_stage)
                 if cutlass.const_expr(self.tma_packed_scales):
-                    if cutlass.const_expr(self.scale_tma_on_scale_warp):
-                        scale_tma_producer_state = pipeline.make_pipeline_state(
-                            pipeline.PipelineUserType.Producer,
-                            self.num_scale_stage)
+                    scale_tma_producer_state = pipeline.make_pipeline_state(
+                        pipeline.PipelineUserType.Producer,
+                        self.num_scale_stage)
                     scale_tma_consumer_state = pipeline.make_pipeline_state(
                         pipeline.PipelineUserType.Consumer,
                         self.num_scale_stage)
-                scale_group_cnt = cute.ceil_div(k_block_cnt, 4)
+                scale_group_cnt = cute.ceil_div(k_block_cnt, _SCALES_PER_WORD)
 
                 while work_tile.is_valid_tile:
                     cur_tile_coord = self._swizzle_work_tile(
@@ -1475,8 +1437,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
                     scale_stage_state.reset_count()
                     if cutlass.const_expr(self.tma_packed_scales):
-                        if cutlass.const_expr(self.scale_tma_on_scale_warp):
-                            scale_tma_producer_state.reset_count()
+                        scale_tma_producer_state.reset_count()
                         scale_tma_consumer_state.reset_count()
 
                     for scale_group in cutlass.range(0,
@@ -1488,31 +1449,30 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         lane_idx = tidx % 32
                         scale_stage = scale_stage_state.index
                         if cutlass.const_expr(self.tma_packed_scales):
-                            if cutlass.const_expr(self.scale_tma_on_scale_warp):
-                                scale_tma_pipeline.producer_acquire(
-                                    scale_tma_producer_state)
-                                scale_tma_bar = (
-                                    scale_tma_pipeline.producer_get_barrier(
-                                        scale_tma_producer_state))
-                                cute.copy(
-                                    tma_atom_sfa,
-                                    tAgSFA_tma[(None, cur_tile_coord[0],
-                                                scale_group,
-                                                mma_tile_coord_mnl[2])],
-                                    tAsSFA_tma[(
-                                        None, scale_tma_producer_state.index)],
-                                    tma_bar_ptr=scale_tma_bar,
-                                )
-                                cute.copy(
-                                    tma_atom_sfb,
-                                    tBgSFB_tma[(None, mma_tile_coord_mnl[1],
-                                                scale_group,
-                                                mma_tile_coord_mnl[2])],
-                                    tBsSFB_tma[(
-                                        None, scale_tma_producer_state.index)],
-                                    tma_bar_ptr=scale_tma_bar,
-                                )
-                                scale_tma_producer_state.advance()
+                            scale_tma_pipeline.producer_acquire(
+                                scale_tma_producer_state)
+                            scale_tma_bar = (
+                                scale_tma_pipeline.producer_get_barrier(
+                                    scale_tma_producer_state))
+                            cute.copy(
+                                tma_atom_sfa,
+                                tAgSFA_tma[(None, cur_tile_coord[0],
+                                            scale_group,
+                                            mma_tile_coord_mnl[2])],
+                                tAsSFA_tma[(None,
+                                            scale_tma_producer_state.index)],
+                                tma_bar_ptr=scale_tma_bar,
+                            )
+                            cute.copy(
+                                tma_atom_sfb,
+                                tBgSFB_tma[(None, mma_tile_coord_mnl[1],
+                                            scale_group,
+                                            mma_tile_coord_mnl[2])],
+                                tBsSFB_tma[(None,
+                                            scale_tma_producer_state.index)],
+                                tma_bar_ptr=scale_tma_bar,
+                            )
+                            scale_tma_producer_state.advance()
                             scale_tma_pipeline.consumer_wait(
                                 scale_tma_consumer_state)
                             scale_stage = scale_tma_consumer_state.index
@@ -1640,8 +1600,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     tile_sched.advance_to_next_work()
                     work_tile = tile_sched.get_current_work()
 
-                if cutlass.const_expr(self.tma_packed_scales
-                                      and self.scale_tma_on_scale_warp):
+                if cutlass.const_expr(self.tma_packed_scales):
                     scale_tma_pipeline.producer_tail(scale_tma_producer_state)
                 if cutlass.const_expr(not self.tma_packed_scales):
                     scale_pipeline.producer_tail(scale_stage_state)
@@ -1761,7 +1720,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     peek_ab_full_status = ab_pipeline.consumer_try_wait(
                         ab_consumer_state)
                 if cutlass.const_expr(self.packed_k128_scales):
-                    scale_group_cnt = cute.ceil_div(k_block_cnt, 4)
+                    scale_group_cnt = cute.ceil_div(k_block_cnt,
+                                                    _SCALES_PER_WORD)
                     scale_consumer_state.reset_count()
                     if cutlass.const_expr(self.tma_packed_scales):
                         scale_tma_mma_state.reset_count()
@@ -1814,7 +1774,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         ab_pipeline.consumer_wait(ab_consumer_state,
                                                   peek_ab_full_status)
                         if cutlass.const_expr(self.packed_k128_scales):
-                            if k_block % 4 == 0:
+                            if k_block % _SCALES_PER_WORD == 0:
                                 scale_pipeline.consumer_wait(
                                     scale_consumer_state,
                                     peek_scale_full_status)
@@ -1835,7 +1795,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         tCsSFB_compact_s2t_staged = tCsSFB_compact_s2t[
                             s2t_stage_coord]
                         if cutlass.const_expr(self.packed_k128_scales):
-                            if k_block % 4 == 0:
+                            if k_block % _SCALES_PER_WORD == 0:
                                 cute.copy(
                                     tiled_copy_s2t_sfa,
                                     tCsSFA_compact_s2t_staged,
@@ -1870,12 +1830,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                                 sfb_tensor=tCtSFB_mma,
                                 k_tile_idx=k_block,
                                 valid_n=valid_mma_n,
-                                sfa_kphase_idx=(k_block %
-                                                4 if self.packed_k128_scales
-                                                else None),
-                                sfb_kphase_idx=(k_block %
-                                                4 if self.packed_k128_scales
-                                                else None),
+                                sfa_kphase_idx=(k_block % _SCALES_PER_WORD
+                                                if self.packed_k128_scales else
+                                                None),
+                                sfb_kphase_idx=(k_block % _SCALES_PER_WORD
+                                                if self.packed_k128_scales else
+                                                None),
                                 mma_tiler_mnk=self.mma_tiler,
                             )
                         else:
@@ -1891,7 +1851,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
                                 sf_kphase_idx = kphase_idx
                                 if cutlass.const_expr(self.packed_k128_scales):
-                                    sf_kphase_idx = k_block % 4
+                                    sf_kphase_idx = k_block % _SCALES_PER_WORD
                                 sf_kphase_coord = (None, None, sf_kphase_idx)
                                 tiled_mma.set(
                                     tcgen05.Field.SFA,
@@ -1916,7 +1876,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         ab_pipeline.consumer_release(ab_consumer_state)
 
                         if cutlass.const_expr(self.packed_k128_scales):
-                            if k_block % 4 == 0:
+                            if k_block % _SCALES_PER_WORD == 0:
                                 if cutlass.const_expr(self.tma_packed_scales):
                                     scale_empty_mbar = (
                                         scale_tma_pipeline.sync_object_empty.

@@ -57,6 +57,9 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
+_FP8_E4M3_MAX = 448.0
+_MIN_AMAX = 1e-4
+
 
 @dsl_user_op
 def ceil_to_ue8m0_device(
@@ -170,6 +173,13 @@ def max_nan_f32_device(
             ip=ip,
         )
     )
+
+
+def _tree_reduce_max_nan_f32(values):
+    """Build a balanced max tree for a trace-time value list."""
+    while len(values) > 1:
+        values = [max_nan_f32_device(values[i], values[i + 1]) for i in range(0, len(values), 2)]
+    return values[0]
 
 
 """
@@ -2002,12 +2012,8 @@ class Sm100BlockwiseGemmKernel:
                 if cutlass.const_expr(self.fp8_sf_mode and not self.fp8_smem_epi_mode):
                     # Register FP8 epilogue: one thread owns one M row.
                     _num_elems_per_subtile = cute.size(tTR_rAcc.shape)
-                    # Five levels reduce the fixed 32-value subtile.
                     _total_elems = subtile_cnt * _num_elems_per_subtile
                     acc_saved_bf16 = cute.make_rmem_tensor((_total_elems,), cutlass.BFloat16)
-
-                    # Emit the balanced max tree during tracing.
-                    _f32t = cutlass.Float32.mlir_type
 
                     thread_amax = cutlass.Float32(0.0)
                     for subtile_idx in cutlass.range(subtile_cnt):
@@ -2023,95 +2029,14 @@ class Sm100BlockwiseGemmKernel:
                             val_bf16 = cutlass.BFloat16(acc_fp32[ei])
                             # Cache BF16 to avoid a second TMEM load.
                             acc_saved_bf16[base + ei] = val_bf16
-                            val_f32 = cutlass.Float32(val_bf16)
-                            _subtile_abs.append(
-                                cutlass.Float32(
-                                    llvm.inline_asm(
-                                        _f32t,
-                                        [val_f32.ir_value()],
-                                        "abs.f32 $0, $1;",
-                                        "=f,f",
-                                        has_side_effects=False,
-                                    )
-                                )
-                            )
-                        # Reduce 32 values to one amax.
-                        _lvl = _subtile_abs
-                        _lvl = [
-                            cutlass.Float32(
-                                llvm.inline_asm(
-                                    _f32t,
-                                    [_lvl[_k].ir_value(), _lvl[_k + 1].ir_value()],
-                                    "max.NaN.f32 $0, $1, $2;",
-                                    "=f,f,f",
-                                    has_side_effects=False,
-                                )
-                            )
-                            for _k in range(0, len(_lvl), 2)
-                        ]
-                        _lvl = [
-                            cutlass.Float32(
-                                llvm.inline_asm(
-                                    _f32t,
-                                    [_lvl[_k].ir_value(), _lvl[_k + 1].ir_value()],
-                                    "max.NaN.f32 $0, $1, $2;",
-                                    "=f,f,f",
-                                    has_side_effects=False,
-                                )
-                            )
-                            for _k in range(0, len(_lvl), 2)
-                        ]
-                        _lvl = [
-                            cutlass.Float32(
-                                llvm.inline_asm(
-                                    _f32t,
-                                    [_lvl[_k].ir_value(), _lvl[_k + 1].ir_value()],
-                                    "max.NaN.f32 $0, $1, $2;",
-                                    "=f,f,f",
-                                    has_side_effects=False,
-                                )
-                            )
-                            for _k in range(0, len(_lvl), 2)
-                        ]
-                        _lvl = [
-                            cutlass.Float32(
-                                llvm.inline_asm(
-                                    _f32t,
-                                    [_lvl[_k].ir_value(), _lvl[_k + 1].ir_value()],
-                                    "max.NaN.f32 $0, $1, $2;",
-                                    "=f,f,f",
-                                    has_side_effects=False,
-                                )
-                            )
-                            for _k in range(0, len(_lvl), 2)
-                        ]
-                        _lvl = [
-                            cutlass.Float32(
-                                llvm.inline_asm(
-                                    _f32t,
-                                    [_lvl[_k].ir_value(), _lvl[_k + 1].ir_value()],
-                                    "max.NaN.f32 $0, $1, $2;",
-                                    "=f,f,f",
-                                    has_side_effects=False,
-                                )
-                            )
-                            for _k in range(0, len(_lvl), 2)
-                        ]
-                        subtile_max = _lvl[0]
+                            _subtile_abs.append(abs_f32_device(cutlass.Float32(val_bf16)))
+                        subtile_max = _tree_reduce_max_nan_f32(_subtile_abs)
                         # Merge the four N subtiles.
-                        thread_amax = cutlass.Float32(
-                            llvm.inline_asm(
-                                _f32t,
-                                [thread_amax.ir_value(), subtile_max.ir_value()],
-                                "max.NaN.f32 $0, $1, $2;",
-                                "=f,f,f",
-                                has_side_effects=False,
-                            )
-                        )
+                        thread_amax = max_nan_f32_device(thread_amax, subtile_max)
 
                     # Avoid zero UE8M0 scales.
-                    thread_amax = cutlass.max(thread_amax, cutlass.Float32(1e-4))
-                    sf_fp32 = ceil_to_ue8m0_device(thread_amax / cutlass.Float32(448.0))
+                    thread_amax = cutlass.max(thread_amax, cutlass.Float32(_MIN_AMAX))
+                    sf_fp32 = ceil_to_ue8m0_device(thread_amax / cutlass.Float32(_FP8_E4M3_MAX))
 
                     # UE8M0 stores only the exponent byte.
                     i32_ty = cutlass.Int32.mlir_type
@@ -2260,23 +2185,7 @@ class Sm100BlockwiseGemmKernel:
                         level = []
                         for value_idx in cutlass.range_constexpr(16):
                             level.append(abs_f32_device(cutlass.Float32(row_values[value_idx])))
-                        level = [
-                            max_nan_f32_device(level[i], level[i + 1])
-                            for i in range(0, len(level), 2)
-                        ]
-                        level = [
-                            max_nan_f32_device(level[i], level[i + 1])
-                            for i in range(0, len(level), 2)
-                        ]
-                        level = [
-                            max_nan_f32_device(level[i], level[i + 1])
-                            for i in range(0, len(level), 2)
-                        ]
-                        level = [
-                            max_nan_f32_device(level[i], level[i + 1])
-                            for i in range(0, len(level), 2)
-                        ]
-                        row_amax = level[0]
+                        row_amax = _tree_reduce_max_nan_f32(level)
                         for shuffle_idx in cutlass.range_constexpr(3):
                             other_amax = cute.arch.shuffle_sync_bfly(
                                 row_amax,
@@ -2284,8 +2193,8 @@ class Sm100BlockwiseGemmKernel:
                             )
                             row_amax = max_nan_f32_device(row_amax, other_amax)
 
-                        row_amax = cutlass.max(row_amax, cutlass.Float32(1e-4))
-                        sf_fp32 = ceil_to_ue8m0_device(row_amax / cutlass.Float32(448.0))
+                        row_amax = cutlass.max(row_amax, cutlass.Float32(_MIN_AMAX))
+                        sf_fp32 = ceil_to_ue8m0_device(row_amax / cutlass.Float32(_FP8_E4M3_MAX))
                         sf_bits = cutlass.Int32(
                             llvm.bitcast(cutlass.Int32.mlir_type, sf_fp32.ir_value())
                         )
@@ -3140,138 +3049,7 @@ class Sm100BlockwiseGemmKernel:
         )
 
     @cute.jit
-    def wrapper_splitk_packed_ue8m0(
-        self,
-        m: cutlass.Int32,
-        n: cutlass.Int32,
-        k: cutlass.Int32,
-        num_splits: cutlass.Int32,
-        sfa_k_stride: cutlass.Int32,
-        sfb_k_stride: cutlass.Int32,
-        a_ptr: cute.Pointer,
-        b_ptr: cute.Pointer,
-        a_sf_ptr: cute.Pointer,
-        b_sf_ptr: cute.Pointer,
-        c_tensor: cute.Tensor,
-        max_active_clusters: cutlass.Constexpr,
-        stream: cuda.CUstream,
-    ):
-        """Map K splits to batches over packed UE8M0 scales."""
-        k_per_split = k // num_splits
-        packed_k_per_split = k_per_split // 512
-
-        a_tensor = cute.make_tensor(
-            a_ptr,
-            layout=cute.make_layout(
-                (m, k_per_split, num_splits),
-                stride=(k, 1, k_per_split),
-            ),
-        )
-        b_tensor = cute.make_tensor(
-            b_ptr,
-            layout=cute.make_layout(
-                (n, k_per_split, num_splits),
-                stride=(k, 1, k_per_split),
-            ),
-        )
-
-        sfa_tensor = cute.make_tensor(
-            a_sf_ptr,
-            layout=cute.make_layout(
-                (m, (4, packed_k_per_split), num_splits),
-                stride=(
-                    4,
-                    (1, 4 * sfa_k_stride),
-                    4 * sfa_k_stride * packed_k_per_split,
-                ),
-            ),
-        )
-        # SFB stores one packed scale row per 128 output rows.
-        sfb_tensor = cute.make_tensor(
-            b_sf_ptr,
-            layout=cute.make_layout(
-                (n // 128, (4, packed_k_per_split), num_splits),
-                stride=(
-                    4 * 128,
-                    (1, 4 * sfb_k_stride),
-                    4 * sfb_k_stride * packed_k_per_split,
-                ),
-            ),
-        )
-
-        self(
-            a_tensor,
-            b_tensor,
-            c_tensor,
-            sfa_tensor,
-            sfb_tensor,
-            max_active_clusters,
-            stream,
-        )
-
     def wrapper_fp8sf(
-        self,
-        m,
-        n,
-        k,
-        sf_m,
-        sf_n,
-        sf_k,
-        batch_size,
-        a_ptr,
-        b_ptr,
-        a_sf_ptr,
-        b_sf_ptr,
-        c_tensor,
-        max_active_clusters,
-        stream,
-        sf_out_ptr,
-        sf_aligned_mn,
-        n_tiles_per_group=0,
-        fp8_smem_row_iters=1,
-        use_fp8_smem_epilogue=False,
-    ):
-        """Validate FP8 scale indexing before JIT tracing."""
-        # Zero aliases every group to the first scale block.
-        if sf_out_ptr is not None and n_tiles_per_group <= 0:
-            raise ValueError(
-                "wrapper_fp8sf: n_tiles_per_group must be a positive integer "
-                "when sf_out_ptr is provided (fp8+SF mode). "
-                "Pass ceil_div(per_group_N, BLOCK_N) explicitly. "
-                "Default 0 would silently corrupt multi-group scale-factor output."
-            )
-        if use_fp8_smem_epilogue:
-            required_row_iters = min((m + 15) // 16, 8)
-            if fp8_smem_row_iters != required_row_iters:
-                raise ValueError(
-                    "wrapper_fp8sf: fp8_smem_row_iters must cover every row "
-                    f"in an M tile; expected {required_row_iters}, got "
-                    f"{fp8_smem_row_iters}"
-                )
-        return self._wrapper_fp8sf_impl(
-            m,
-            n,
-            k,
-            sf_m,
-            sf_n,
-            sf_k,
-            batch_size,
-            a_ptr,
-            b_ptr,
-            a_sf_ptr,
-            b_sf_ptr,
-            c_tensor,
-            max_active_clusters,
-            stream,
-            sf_out_ptr,
-            sf_aligned_mn,
-            n_tiles_per_group,
-            fp8_smem_row_iters,
-            use_fp8_smem_epilogue,
-        )
-
-    @cute.jit
-    def _wrapper_fp8sf_impl(
         self,
         m: cutlass.Int32,
         n: cutlass.Int32,
@@ -3293,7 +3071,7 @@ class Sm100BlockwiseGemmKernel:
         fp8_smem_row_iters: cutlass.Constexpr,
         use_fp8_smem_epilogue: cutlass.Constexpr,
     ):
-        """JIT implementation of wrapper_fp8sf (called after Python-level validation)."""
+        """Run blockwise GEMM with fused FP8 and packed-scale output."""
         a_tensor = cute.make_tensor(
             a_ptr,
             layout=cute.make_ordered_layout((m, k, batch_size), order=(1, 0, 2)),

@@ -48,12 +48,21 @@ def _is_env_truthy(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "on")
 
 
+_DSV4_OB_SCALE_BLOCK_K = 128
+_UE8M0_SCALES_PER_WORD = 4
+_DSV4_OB_PACKED_SCALE_K = _DSV4_OB_SCALE_BLOCK_K * _UE8M0_SCALES_PER_WORD
+_DSV4_OB_SPLIT_K_MAX_M = 128
+_DSV4_OB_CUTE_SK1_MIN_M = 256
+_DSV4_PRO_OB_N = 7168
+_DSV4_PRO_OB_K = 16384
+
+
 def _select_dsv4_ob_split_k(num_tokens: int,
                             configured_split: Optional[int] = None) -> int:
     if configured_split is None:
         env_split = int(os.environ.get("TRTLLM_DSV4_OB_SPLIT_K", "0"))
         split_k = env_split if env_split else (
-            2 if 0 < num_tokens <= 128 else 1)
+            2 if 0 < num_tokens <= _DSV4_OB_SPLIT_K_MAX_M else 1)
     else:
         split_k = configured_split
     if split_k not in (1, 2, 4):
@@ -2034,9 +2043,12 @@ class MLA(nn.Module):
                           attn_scale: torch.Tensor,
                           num_tokens: int) -> torch.Tensor:
         num_groups, o_lora_rank = self.n_local_groups, self.o_lora_rank
-        aligned_m = ((num_tokens + 3) // 4) * 4
-        n_tiles = (o_lora_rank + 127) // 128
-        packed_k = (num_groups * n_tiles + 3) // 4
+        aligned_m = ((num_tokens + _UE8M0_SCALES_PER_WORD - 1) //
+                     _UE8M0_SCALES_PER_WORD) * _UE8M0_SCALES_PER_WORD
+        n_tiles = ((o_lora_rank + _DSV4_OB_SCALE_BLOCK_K - 1) //
+                   _DSV4_OB_SCALE_BLOCK_K)
+        packed_k = ((num_groups * n_tiles + _UE8M0_SCALES_PER_WORD - 1) //
+                    _UE8M0_SCALES_PER_WORD)
         o_lora_fp8 = torch.empty([num_tokens, num_groups, o_lora_rank],
                                  device=attn_fp8.device,
                                  dtype=torch.float8_e4m3fn)
@@ -2059,15 +2071,16 @@ class MLA(nn.Module):
         K_ob = o_lora_fp8.shape[1]
         w, wsf = self.o_b_proj.weight, self.o_b_proj.weight_scale
         SK = _select_dsv4_ob_split_k(M, getattr(self, "ob_split_k", None))
-        packed_k = K_ob // 512
+        packed_k = K_ob // _DSV4_OB_PACKED_SCALE_K
         # CuTe specializes the DSV4-Pro O_b shape.
         can_try_cute = (IS_CUTLASS_DSL_AVAILABLE and M > 0
-                        and (M >= 256 or SK > 1) and N == 7168 and K_ob == 16384
-                        and K_ob % (512 * SK) == 0
+                        and (M >= _DSV4_OB_CUTE_SK1_MIN_M or SK > 1)
+                        and N == _DSV4_PRO_OB_N and K_ob == _DSV4_PRO_OB_K
+                        and K_ob % (_DSV4_OB_PACKED_SCALE_K * SK) == 0
                         and sf_out.dtype == torch.int32 and sf_out.dim() == 2
                         and sf_out.shape == (M, packed_k)
                         and sf_out.stride(0) == 1 and sf_out.stride(1) >= M
-                        and sf_out.stride(1) % 4 == 0)
+                        and sf_out.stride(1) % _UE8M0_SCALES_PER_WORD == 0)
         cute_wsf = wsf
         if can_try_cute and cute_wsf.dtype != torch.int32:
             from tensorrt_llm.quantization.utils.fp8_utils import \
@@ -2075,12 +2088,16 @@ class MLA(nn.Module):
             cute_wsf = getattr(self.o_b_proj, "_ob_wsf_int", None)
             if cute_wsf is None:
                 # Convert the static weight scale once.
-                cute_wsf = transform_sf_into_required_layout(wsf,
-                                                             mn=N,
-                                                             k=K_ob,
-                                                             recipe=(1, 128,
-                                                                     128),
-                                                             is_sfa=False)
+                cute_wsf = transform_sf_into_required_layout(
+                    wsf,
+                    mn=N,
+                    k=K_ob,
+                    recipe=(
+                        1,
+                        _DSV4_OB_SCALE_BLOCK_K,
+                        _DSV4_OB_SCALE_BLOCK_K,
+                    ),
+                    is_sfa=False)
                 self.o_b_proj._ob_wsf_int = cute_wsf
 
         can_use_cute = (can_try_cute and cute_wsf.dtype == torch.int32
