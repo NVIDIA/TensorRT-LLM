@@ -3676,9 +3676,10 @@ class PyExecutor:
                 # Need to wait for the copy of previous iteration before
                 # modifying any host memory copied to GPU. Scheduler V2
                 # modifies the host page table, so wait before scheduling.
-                # This wait is also needed for legacy scheduler, but it can
-                # be pushed later, e.g. before model_engine._prepare_inputs().
-                self._wait_for_model_engine_input_copy()
+                # (Pre-#15633 legacy scheduler ran without any such sync;
+                # gate on V2 to avoid paying the cost on V1.)
+                if self._is_kv_manager_v2:
+                    self._wait_for_model_engine_input_copy()
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
 
                 if scheduled_batch is None:
@@ -3868,7 +3869,9 @@ class PyExecutor:
                     # dummy requests, which frees V2 KV pages and overwrites
                     # host page-index entries with BAD_PAGE_INDEX. Wait until
                     # the current input preparation has consumed those buffers.
-                    self._wait_for_model_engine_input_copy()
+                    # V2-only concern.
+                    if self._is_kv_manager_v2:
+                        self._wait_for_model_engine_input_copy()
                     self._update_request_states(scheduled_batch)
 
                     # Update context requests' KV cache so that sliding-window
@@ -3886,7 +3889,8 @@ class PyExecutor:
                     # _process_previous_batch may terminate requests or resize
                     # generation KV caches, both of which can mutate V2 page
                     # indices used by the current batch's input preparation.
-                    self._wait_for_model_engine_input_copy()
+                    if self._is_kv_manager_v2:
+                        self._wait_for_model_engine_input_copy()
                     self._process_previous_batch()
                     self.perf_manager.compute_batch_gpu_times(
                         self.previous_batch.scheduled_requests.all_requests())

@@ -2837,14 +2837,10 @@ class PyTorchModelEngine(ModelEngine):
 
         # Set iteration states - batch dictionary updates
         self.iter_states.update({
-            'num_ctx_requests':
-            0,
-            'num_ctx_tokens':
-            0,
-            'num_generation_tokens':
-            num_generation_tokens,
-            'cached_kv_tokens':
-            sum(num_cached_tokens_per_seq),
+            'num_ctx_requests': 0,
+            'num_ctx_tokens': 0,
+            'num_generation_tokens': num_generation_tokens,
+            'cached_kv_tokens': sum(num_cached_tokens_per_seq),
         })
 
         return lora_params
@@ -3485,8 +3481,13 @@ class PyTorchModelEngine(ModelEngine):
         # will contain previous batch indices of generation requests
         previous_batch_indices = []
         previous_pos_indices = []
-        runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(
-            self.runtime_draft_len)
+        if self.enable_spec_decode:
+            runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(
+                self.runtime_draft_len)
+        else:
+            # Non-spec-decode path: callee is `lambda _: 1` when spec_config is None
+            # (see __init__:539). Inline the constant to skip the per-call frame setup.
+            runtime_tokens_per_gen_step = 1
         runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
         for request in extend_requests:
             request_ids.append(request.py_request_id)
@@ -3642,12 +3643,18 @@ class PyTorchModelEngine(ModelEngine):
             num_accepted_draft_tokens.extend([0] * (_n_gen * beam_width))
 
             for request in generation_requests:
+                # Snapshot per-request attributes once per iteration so read-sites
+                # below pay LOAD_FAST instead of LOAD_ATTR. Write-site
+                # `request.py_batch_idx = request.py_seq_slot` still fires after
+                # every read, so snapshot-before-write ordering is preserved.
+                _py_batch_idx = request.py_batch_idx
+                _max_beam_num_tokens = request.max_beam_num_tokens
                 request_ids.append(request.py_request_id)
                 # the request has no previous tensor:
                 # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
                 # (2) a dummy request; or
                 # (3) the first step in the generation server of disaggregated serving
-                if new_tokens_device is None or request.is_dummy or request.py_batch_idx is None:
+                if new_tokens_device is None or request.is_dummy or _py_batch_idx is None:
                     # skip adding input_ids of CUDA graph dummy requests so that new_tokens_device
                     # can be aligned to the correct positions.
                     if not request.is_cuda_graph_dummy:
@@ -3663,12 +3670,12 @@ class PyTorchModelEngine(ModelEngine):
                                     (start_idx, end_idx, slot_idx))
                             else:
                                 input_ids.append(request.get_last_tokens(beam))
-                    past_seen_token_num = request.max_beam_num_tokens - 1
+                    past_seen_token_num = _max_beam_num_tokens - 1
                 else:
                     # the request has previous tensor
                     # previous_batch_indices is per-request, not per-beam
-                    previous_batch_indices.append(request.py_batch_idx)
-                    past_seen_token_num = request.max_beam_num_tokens
+                    previous_batch_indices.append(_py_batch_idx)
+                    past_seen_token_num = _max_beam_num_tokens
 
                 position_id = past_seen_token_num
                 if _has_cp_helix:
@@ -3751,7 +3758,7 @@ class PyTorchModelEngine(ModelEngine):
                 # first so non-multimodal models pay one LOAD_FAST per request
                 # instead of LOAD_ATTR(py_multimodal_data) + LOAD_ATTR(py_batch_idx).
                 if (_has_any_multimodal_request and request.py_multimodal_data
-                        and request.py_batch_idx is None):
+                        and _py_batch_idx is None):
                     strip_mm_data_for_generation(request.py_multimodal_data)
 
                 request.py_batch_idx = request.py_seq_slot
