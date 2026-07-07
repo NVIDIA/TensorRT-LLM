@@ -8,8 +8,9 @@ import torch
 from tensorrt_llm._torch.models.modeling_mistral import Mistral3InputProcessor
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2VLInputProcessorBase
+from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import MultimodalScheduler
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import MultimodalParams, strip_mm_encoder_inputs
 
 
 class _CapacityScheduler:
@@ -156,6 +157,93 @@ def test_item_encoder_slices_and_restores_selected_item_order():
         [2, 3, 4],
         [0, 1],
     ]
+
+
+def test_prepare_multimodal_items_slices_before_device_transfer():
+    multimodal_param = MultimodalParams(
+        multimodal_data={
+            "image": {
+                "pixel_values": torch.arange(5).unsqueeze(1),
+                "image_grid_thw": torch.tensor([[1, 1, 2], [1, 1, 3]]),
+            },
+            "multimodal_item_refs": [("image", 0), ("image", 1)],
+            "multimodal_embedding_lengths": [2, 3],
+        }
+    )
+
+    prepared = MultimodalModelMixin.prepare_multimodal_items(
+        MultimodalModelMixin(), [(multimodal_param, 1)]
+    )
+
+    item_param, embedding_length, modality = prepared[0]
+    assert modality == "image"
+    assert embedding_length == 3
+    assert item_param.multimodal_data["image"]["pixel_values"].squeeze(1).tolist() == [2, 3, 4]
+    assert multimodal_param.multimodal_data["image"]["pixel_values"].shape[0] == 5
+
+
+def test_strip_mm_encoder_inputs_preserves_embedding_and_runtime_metadata():
+    embedding = torch.empty(3, 4)
+    mm_data = {
+        "image": {"pixel_values": torch.empty(2, 3)},
+        "video": {"pixel_values_videos": torch.empty(2, 3)},
+        "multimodal_embedding": embedding,
+        "multimodal_embed_mask_cumsum": torch.tensor([0, 1]),
+    }
+
+    strip_mm_encoder_inputs(mm_data)
+
+    assert "image" not in mm_data
+    assert "video" not in mm_data
+    assert mm_data["multimodal_embedding"] is embedding
+    assert "multimodal_embed_mask_cumsum" in mm_data
+
+
+def test_item_outputs_fill_one_contiguous_buffer_and_release_raw_data(monkeypatch):
+    class _Model(MultimodalModelMixin):
+        def encode_prepared_multimodal_items(self, prepared_items):
+            return [
+                torch.full((embedding_length, 2), float(embedding_length))
+                for _, embedding_length, _ in prepared_items
+            ]
+
+    monkeypatch.setattr(MultimodalParams, "to_device", lambda self, *args, **kwargs: self)
+    engine = object.__new__(PyTorchModelEngine)
+    engine.model = _Model()
+    request = SimpleNamespace(
+        request_id=1,
+        py_request_id=1,
+        py_multimodal_data={
+            "image": {
+                "pixel_values": torch.arange(5).unsqueeze(1),
+                "image_grid_thw": torch.tensor([[1, 1, 2], [1, 1, 3]]),
+            },
+            "multimodal_item_refs": [("image", 0), ("image", 1)],
+            "multimodal_embedding_lengths": [2, 3],
+        },
+        py_mm_encoder_outputs=[None, None],
+        py_mm_encoder_output_buffer=None,
+        py_mm_encoder_inflight_items={0, 1},
+        multimodal_lengths=None,
+    )
+
+    engine.execute_multimodal_encoder_items([request], {1: [0]})
+
+    output_buffer = request.py_mm_encoder_output_buffer
+    assert output_buffer.shape == (5, 2)
+    assert request.py_mm_encoder_outputs[0].data_ptr() == output_buffer.data_ptr()
+    assert request.py_mm_encoder_outputs[1] is None
+    assert "image" in request.py_multimodal_data
+
+    engine.execute_multimodal_encoder_items([request], {1: [1]})
+
+    assert request.py_multimodal_data["multimodal_embedding"] is output_buffer
+    assert (
+        request.py_mm_encoder_outputs[1].untyped_storage().data_ptr()
+        == output_buffer.untyped_storage().data_ptr()
+    )
+    assert output_buffer.tolist() == [[2.0, 2.0], [2.0, 2.0], [3.0, 3.0], [3.0, 3.0], [3.0, 3.0]]
+    assert "image" not in request.py_multimodal_data
 
 
 def test_qwen_item_metadata_uses_prompt_order_and_pre_merger_costs():
