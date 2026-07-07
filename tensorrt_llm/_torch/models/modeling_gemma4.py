@@ -46,13 +46,13 @@ from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
+from ..modules.gemma4.fused_gelu_quant import gemma4_fused_gelu_mul_fp4
+from ..modules.gemma4.fused_norm_quant import gemma4_fused_norm_fp4
+from ..modules.gemma4.fused_qkv import gemma4_fused_qkv_norm_rope_quant
+from ..modules.gemma4.fused_tail import gemma4_fused_norm_add, gemma4_fused_norm_add_scale
 from ..modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from ..modules.rms_norm import RMSNorm
 from ..utils import ActivationType, Fp4QuantizedTensor, is_torch_compiling
-from .gemma4_fused_gelu_quant import gemma4_fused_gelu_mul_fp4
-from .gemma4_fused_norm_quant import gemma4_fused_norm_fp4
-from .gemma4_fused_qkv import gemma4_fused_qkv_norm_rope_quant
-from .gemma4_fused_tail import gemma4_fused_norm_add, gemma4_fused_norm_add_scale
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
 
 _MIN_TRANSFORMERS_FOR_GEMMA4 = "5.5.0"

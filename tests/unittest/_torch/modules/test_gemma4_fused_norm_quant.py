@@ -30,8 +30,8 @@ import torch
 
 import tensorrt_llm  # noqa: F401  (registers trtllm torch ops)
 import tensorrt_llm._torch.custom_ops.flashinfer_custom_ops  # noqa: F401
-from tensorrt_llm._torch.models.gemma4_fused_gelu_quant import sf_swizzled_offsets
-from tensorrt_llm._torch.models.gemma4_fused_norm_quant import gemma4_fused_norm_fp4
+from tensorrt_llm._torch.modules.gemma4.fused_gelu_quant import sf_swizzled_offsets
+from tensorrt_llm._torch.modules.gemma4.fused_norm_quant import gemma4_fused_norm_fp4
 
 
 def _reference(x, w, eps, gs):

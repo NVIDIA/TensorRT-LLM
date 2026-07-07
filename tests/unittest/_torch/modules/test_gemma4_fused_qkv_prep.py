@@ -22,7 +22,7 @@ the fp32 cos/sin table (bf16 round) -> .to(float8_e4m3fn).
 import pytest
 import torch
 
-from tensorrt_llm._torch.models.gemma4_fused_qkv import gemma4_fused_qkv_norm_rope_quant
+from tensorrt_llm._torch.modules.gemma4.fused_qkv import gemma4_fused_qkv_norm_rope_quant
 
 
 def _make_cos_sin(max_pos: int, head_dim: int, rotary_frac: float, theta: float) -> torch.Tensor:

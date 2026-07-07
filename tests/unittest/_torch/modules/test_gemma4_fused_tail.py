@@ -31,7 +31,7 @@ import torch
 
 import tensorrt_llm  # noqa: F401  (registers trtllm torch ops)
 import tensorrt_llm._torch.custom_ops.flashinfer_custom_ops  # noqa: F401
-from tensorrt_llm._torch.models.gemma4_fused_tail import (
+from tensorrt_llm._torch.modules.gemma4.fused_tail import (
     gemma4_fused_norm_add,
     gemma4_fused_norm_add_scale,
 )
