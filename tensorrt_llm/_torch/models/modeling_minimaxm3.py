@@ -709,12 +709,12 @@ class MiniMaxM3Attention(Attention):
             # model (SGLang/HF): KV head i's GQA group attends only to
             # the blocks selected by index head i. Under TP the KV
             # heads are sharded, so each rank must score with the
-            # index heads paired to its local KV heads — the sparse
-            # forward slices ``idx_q`` down to
-            # ``[num_tokens, num_local_index_heads, sparse_index_dim]``
-            # with the offsets computed here. (Scoring with all index
-            # heads and reducing — the pre-fix behaviour — gave every
-            # KV head the union/max over all index heads' selections.)
+            # index heads paired to its local KV heads. The sparse
+            # forward slices `idx_q` down to
+            # `[num_tokens, num_local_index_heads, sparse_index_dim]`
+            # with the offsets computed here. Scoring with all index heads
+            # and reducing would give every KV head the union/max over all
+            # index heads' selections.
             num_kv_heads_global = int(config.num_key_value_heads)
             if self.sparse_num_index_heads % num_kv_heads_global != 0:
                 raise ValueError(
@@ -1206,7 +1206,7 @@ class MiniMaxM3Attention(Attention):
         idx_k = self.index_k_proj(hidden_states)
         if self.num_local_index_heads != self.sparse_num_index_heads:
             # Keep only the index heads paired with this rank's KV
-            # heads (1:1 pairing — see __init__). Slicing before the
+            # heads (1:1 pairing; see __init__). Slicing before the
             # per-head norm and RoPE is equivalent and cheaper.
             idx_q = (
                 idx_q.view(-1, self.sparse_num_index_heads, self.sparse_index_dim)[
@@ -1231,18 +1231,13 @@ class MiniMaxM3Attention(Attention):
         return self.o_proj(o)
 
     def _maybe_publish_msa_geometry(self, attn_metadata: AttentionMetadata) -> None:
-        """Publish the per-rank sparse geometry on the metadata *class*.
+        """Publish the per-rank sparse geometry on the metadata class.
 
-        ``prepare()`` reads this on subsequent steps to pre-build the MSA
-        (``fmha_sm100``) plan into CUDA-graph-stable buffers -- see
-        :mod:`tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_plan_cache`.
-        Publishing here (not in ``__init__``) avoids a chicken-and-egg
-        dependency: the FIRST sparse forward is always the eager warmup pass
-        (no capture in flight), so writing ``_msa_geometry`` is CUDA-graph-safe.
-
-        IMPORTANT: publish on the metadata *class*, not the instance. CUDA
-        graph capture uses separate metadata instances; an instance attribute
-        written during eager warmup would be invisible to them.
+        prepare() reads this on later steps to pre-build the MSA plan into
+        CUDA-graph-stable buffers. Published on the class (not the
+        instance) because CUDA graph capture uses separate metadata
+        instances that would not see an instance attribute written during
+        the first (eager warmup) forward.
         """
         if getattr(attn_metadata, "_msa_geometry", None) is not None:
             return
@@ -1270,14 +1265,14 @@ class MiniMaxM3Attention(Attention):
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        """Run sparse cache updates and attention into ``output``.
+        """Run sparse cache updates and attention into `output`.
 
-        Dispatches to the MSA (``fmha_sm100``) backend when ``self.attn`` is a
-        :class:`MiniMaxM3MSATrtllmAttention` (``sparse_use_msa=True``), which
-        mimics ``DSATrtllmAttention``: the indexer produces the selected block
-        indices and the inherited ``TrtllmAttention.forward`` runs the sparse
-        GQA through the registered ``MsaSparseGqaFmha``. Otherwise falls back
-        to the Triton reference backend's keyword-driven ``forward``.
+        Dispatches to the MSA (`fmha_sm100`) backend when `self.attn` is a
+        :class:`MiniMaxM3MSATrtllmAttention` (`sparse_use_msa=True`), which
+        mimics `DSATrtllmAttention`: the indexer produces the selected block
+        indices and the inherited `TrtllmAttention.forward` runs the sparse
+        GQA through the registered `MsaSparseGqaFmha`. Otherwise falls back
+        to the Triton reference backend's keyword-driven `forward`.
         """
         kv_cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
         if kv_cache_manager is None:
@@ -1315,7 +1310,7 @@ class MiniMaxM3Attention(Attention):
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        """MSA path: indexer + inherited ``TrtllmAttention.forward`` (DSA-style)."""
+        """MSA path: indexer + inherited `TrtllmAttention.forward` (DSA-style)."""
         from ..attention_backend.interface import AttentionForwardArgs
 
         # Indexer: proxy MQA + top-k block selection. Writes the index-K
@@ -1324,7 +1319,7 @@ class MiniMaxM3Attention(Attention):
         # Thread the selected blocks through forward_args.topk_indices; the
         # backend's sparse_attn_predict publishes them as sparse_attn_indices,
         # and MsaSparseGqaFmha writes K/V + runs the sparse GQA in place into
-        # ``output``. attention_input_type defaults to mixed (ctx + gen).
+        # `output`. attention_input_type defaults to mixed (ctx + gen).
         forward_args = AttentionForwardArgs(output=output, topk_indices=kv_block_indexes)
         self.attn.forward(q, k, v, attn_metadata, forward_args=forward_args)
         return output
@@ -1340,7 +1335,7 @@ class MiniMaxM3Attention(Attention):
         output: torch.Tensor,
         kv_cache_manager,
     ) -> torch.Tensor:
-        """Triton reference path: keyword-driven ``forward`` with M3 caches."""
+        """Triton reference path: keyword-driven `forward` with M3 caches."""
         # 4. Get the paged-block main K/V cache + flat side index-K cache.
         # The base KVCacheManagerV2 layout is
         # ``[num_pages, kv_factor, tokens_per_block, num_kv_heads, head_dim]``
@@ -1399,7 +1394,7 @@ class MiniMaxM3Attention(Attention):
         # 6-7. Dispatch to the Triton reference runtime backend, which
         # executes the sparse path end-to-end including the cache writes.
         # (Backend-type dispatch + geometry publication are handled by the
-        # caller ``_sparse_attention_core``.)
+        # caller `_sparse_attention_core`.)
         return self.attn.forward(
             q,
             k,

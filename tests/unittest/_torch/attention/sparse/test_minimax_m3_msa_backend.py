@@ -2,19 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for the MSA-backed MiniMax-M3 sparse attention runtime.
 
-The MSA stack (``fmha_sm100`` package) is SM100-only and not installed in
-the standard CI runners, so these tests are GPU-free structural checks of
-the DSA-style rewrite:
+The MSA stack (`fmha_sm100` package) is SM100-only and not installed in
+the standard CI runners, so these tests are GPU-free structural checks:
 
-  * config -> params -> backend-class wiring (``sparse_use_msa``),
-  * the decoupling required by review: the MSA backend is a
-    :class:`TrtllmAttention` subclass and does **not** inherit the Triton
-    reference backend,
-  * the backend-neutral helpers in :mod:`...minimax_m3.common`
-    (cache-layout adapters, per-request page-table / length derivation),
-  * the FMHA wiring: ``MsaSparseGqaFmha`` is a dispatch-participating
-    :class:`Fmha` registered under ``msa_sparse_gqa``,
-  * regression guards that the removed proxy-wrapper / duplicate-resolver
+  * config to params to backend-class wiring (`sparse_use_msa`),
+  * the MSA backend is a `TrtllmAttention` subclass and does not inherit
+    the Triton reference backend,
+  * the backend-neutral helpers in `common` (cache-layout adapters,
+    per-request page-table and length derivation),
+  * the FMHA wiring: `MsaSparseGqaFmha` is a dispatch-participating `Fmha`
+    registered under `msa_sparse_gqa`,
+  * regression guards that the removed proxy-wrapper and duplicate-resolver
     symbols stay gone.
 
 End-to-end kernel parity is covered by the MiniMax-M3 integration
@@ -43,7 +41,7 @@ msa_backend = pytest.importorskip(
 
 
 def test_sparse_attention_config_threads_use_msa_into_params():
-    """``sparse_use_msa=True`` must land on the lowered SparseParams."""
+    """`sparse_use_msa=True` must land on the lowered SparseParams."""
     from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
     cfg = MiniMaxM3SparseAttentionConfig(sparse_use_msa=True)
@@ -52,15 +50,15 @@ def test_sparse_attention_config_threads_use_msa_into_params():
 
 
 def test_backend_dispatch_picks_msa_when_flag_set():
-    """``utils._resolve_minimax_m3_backend_cls`` honours sparse_use_msa."""
+    """`utils._resolve_minimax_m3_backend_cls` honours sparse_use_msa."""
     from tensorrt_llm._torch.attention_backend.sparse.utils import _resolve_minimax_m3_backend_cls
     from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
     triton_cls = sparse_minimax_m3.get_minimax_m3_attention_backend_cls()
     msa_cls = sparse_minimax_m3.get_minimax_m3_msa_attention_backend_cls()
 
-    # ``_resolve_minimax_m3_backend_cls`` consumes the lowered
-    # ``MiniMaxM3SparseParams`` (``.use_msa``), not the user-facing config.
+    # _resolve_minimax_m3_backend_cls consumes the lowered
+    # MiniMaxM3SparseParams (.use_msa), not the user-facing config.
     triton_params = MiniMaxM3SparseAttentionConfig(sparse_use_msa=False).to_sparse_params()
     msa_params = MiniMaxM3SparseAttentionConfig(sparse_use_msa=True).to_sparse_params()
     assert _resolve_minimax_m3_backend_cls(triton_params) is triton_cls
@@ -68,10 +66,10 @@ def test_backend_dispatch_picks_msa_when_flag_set():
 
 
 def test_msa_backend_is_trtllm_subclass_not_triton_subclass():
-    """Review requirement: the MSA backend mimics DSATrtllmAttention.
+    """The MSA backend mimics DSATrtllmAttention.
 
-    It must subclass :class:`TrtllmAttention` (to reuse the FMHA dispatch
-    loop) and must **not** inherit the Triton reference backend.
+    It must subclass `TrtllmAttention` (to reuse the FMHA dispatch loop)
+    and must not inherit the Triton reference backend.
     """
     from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
 
@@ -87,7 +85,7 @@ def test_msa_backend_is_trtllm_subclass_not_triton_subclass():
 
 
 def test_duplicate_resolver_helper_removed():
-    """The duplicate ``get_..._with_msa`` resolver must be gone (single resolver)."""
+    """The duplicate `get_..._with_msa` resolver must be gone (single resolver)."""
     assert not hasattr(msa_backend, "get_minimax_m3_attention_backend_cls_with_msa")
     assert not hasattr(sparse_minimax_m3, "get_minimax_m3_attention_backend_cls_with_msa")
 
@@ -147,7 +145,7 @@ def _build_metadata_for_test(
     extend_seq_lens: List[int] | None = None,
     page_size: int = 128,
 ):
-    """Construct a minimal :class:`MiniMaxM3SparseAttentionMetadata`."""
+    """Construct a minimal `MiniMaxM3SparseAttentionMetadata`."""
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.metadata import (
         MiniMaxM3SparseAttentionMetadata,
     )
@@ -228,9 +226,8 @@ def test_build_kv_indices_packs_per_request_pages():
 def test_msa_sparse_gqa_registered_as_fmha():
     """The block-sparse main FMHA is a registered dispatch-participating Fmha.
 
-    It inherits :class:`Fmha` directly (not :class:`PhasedFmha`): MSA does
-    its own whole-batch dispatch, so there is no ctx/gen phase split to
-    reuse (review follow-up).
+    It inherits `Fmha` directly (not `PhasedFmha`): MSA does its own
+    whole-batch dispatch, so there is no ctx/gen phase split to reuse.
     """
     from tensorrt_llm._torch.attention_backend.fmha import FMHA_LIBS, MsaSparseGqaFmha, PhasedFmha
     from tensorrt_llm._torch.attention_backend.fmha.interface import Fmha

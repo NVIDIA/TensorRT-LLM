@@ -997,12 +997,12 @@ class KVCacheManagerV2(BaseResourceManager):
         self._log_kv_cache_pool_lifecycle_mapping()
 
     def _build_pool_mapping_tensors(self):
-        """Build the ``(kv_cache_pool_pointers, kv_cache_pool_mapping)`` tensors.
+        """Build the `(kv_cache_pool_pointers, kv_cache_pool_mapping)` tensors.
 
         Extracted into an overridable hook: subclasses whose pools
         coalesce extra per-layer buffers alongside K/V (e.g.
-        MiniMax-M3 merges ``Role.INDEX_KEY`` into the K/V pool) cannot
-        derive the per-layer mapping offset via ``exact_div`` of the
+        MiniMax-M3 merges `Role.INDEX_KEY` into the K/V pool) cannot
+        derive the per-layer mapping offset via `exact_div` of the
         byte address delta, because a layer no longer contributes
         exactly K+V. They override this method to compute the offset
         from the layer's position within its pool group instead.

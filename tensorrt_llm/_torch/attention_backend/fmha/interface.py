@@ -31,14 +31,13 @@ if TYPE_CHECKING:
 class Fmha(ABC):
     """Common runtime contract for TRT-LLM attention FMHA libraries.
 
-    Most FMHA backends are owned by a :class:`TrtllmAttention` layer and
-    are driven by :meth:`TrtllmAttention.forward`. A small subset
-    (indexer-style proxy FMHA libraries used by sparse-attention
-    predictors) live in the same registry but have no owning attention
-    layer; they pass ``None`` for ``attn``. The :meth:`attn` property
-    raises only when callers actually dereference the owner, so the
-    no-owner subclasses never trip it as long as they do not call into
-    ``self.attn``.
+    Most FMHA backends are owned by a `TrtllmAttention` layer and are
+    driven by `TrtllmAttention.forward`. A small subset (indexer-style
+    proxy FMHA libraries used by sparse-attention predictors) live in the
+    same registry but have no owning attention layer; they pass None for
+    `attn`. The `attn` property raises only when callers actually
+    dereference the owner, so the no-owner subclasses never trip it as
+    long as they do not call into `self.attn`.
     """
 
     def __init__(self, attn: Optional["TrtllmAttention"] = None):

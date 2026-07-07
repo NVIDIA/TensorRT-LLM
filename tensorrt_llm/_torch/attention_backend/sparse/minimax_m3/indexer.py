@@ -2,27 +2,25 @@
 # SPDX-License-Identifier: Apache-2.0
 """MiniMax-M3 MSA sparse-attention indexer.
 
-Mirrors the DSA ``Indexer`` pattern (see
-:class:`tensorrt_llm._torch.attention_backend.sparse.dsa.Indexer`): a
-small submodule owned by the sparse-attention backend that runs the
-predictor pass and produces the per-query selected KV block indices the
-main attention consumes.
+Mirrors the DSA `Indexer` pattern: a small submodule owned by the
+sparse-attention backend that runs the predictor pass and produces the
+per-query selected KV block indices the main attention consumes.
 
-Per the design review, the proxy attention calls ``fmha_sm100`` **directly**
-(like DSA's ``sparse_attn_indexer`` calls ``fp8_paged_mqa_logits``) rather
-than wrapping it as an ``Fmha`` registry library:
+The proxy attention calls `fmha_sm100` directly (like DSA's
+`sparse_attn_indexer` calls `fp8_paged_mqa_logits`) rather than wrapping
+it as an `Fmha` registry library:
 
-  * **Prefill** runs ``fmha_sm100_plan`` + ``fmha_sm100`` eagerly in
-    ``output_maxscore`` mode, reduces the per-index-head max score to
+  * Prefill runs `fmha_sm100_plan` + `fmha_sm100` eagerly in
+    `output_maxscore` mode, reduces the per-index-head max score to
     KV-head granularity, and selects top-k blocks per query.
-  * **Decode** runs through the CUDA-graph-safe in-tree driver
-    (:mod:`.decode_wrapper.dispatch`), which itself calls the same
-    ``fmha_sm100`` kernel binaries with device-tensor launch arguments.
+  * Decode runs through the CUDA-graph-safe in-tree driver
+    (`decode_wrapper.dispatch`), which itself calls the same `fmha_sm100`
+    kernel binaries with device-tensor launch arguments.
 
-The selected block indices are returned as ``[total_q, num_kv_heads,
-topk]`` int32 (ascending, ``-1`` padded) and published on
-``forward_args.sparse_prediction.sparse_attn_indices`` by the owning
-:class:`MiniMaxM3MSATrtllmAttention.sparse_attn_predict`.
+The selected block indices are returned as `[total_q, num_kv_heads,
+topk]` int32 (ascending, -1 padded) and published on
+`forward_args.sparse_prediction.sparse_attn_indices` by the owning
+`sparse_attn_predict`.
 """
 
 from __future__ import annotations
@@ -55,13 +53,13 @@ def _proxy_max_score_direct(
     sm_scale: float,
     causal: bool,
 ) -> torch.Tensor:
-    """Direct ``fmha_sm100`` MQA proxy pass (no Fmha-lib wrapper).
+    """Direct `fmha_sm100` MQA proxy pass (no Fmha-lib wrapper).
 
-    Follows MSA's two-call pattern: ``fmha_sm100_plan`` builds the plan
-    with ``output_maxscore=True`` and ``num_kv_heads=1`` (MQA), and
-    ``fmha_sm100`` runs with ``output_o=False`` so only the per-block max
-    score is materialized. Returns ``[num_index_heads, max_k_tiles,
-    total_q]`` float32.
+    Follows MSA's two-call pattern: `fmha_sm100_plan` builds the plan with
+    `output_maxscore=True` and `num_kv_heads=1` (MQA), and `fmha_sm100`
+    runs with `output_o=False` so only the per-block max score is
+    materialized. Returns `[num_index_heads, max_k_tiles, total_q]`
+    float32.
     """
     fmha_sm100 = require_msa_module()
 
@@ -91,7 +89,7 @@ def _proxy_max_score_direct(
     _, max_score = fmha_sm100.fmha_sm100(
         idx_q,
         idx_k_paged,
-        idx_k_paged,  # v passthrough -- proxy ignores V via output_o=False
+        idx_k_paged,  # v passthrough; proxy ignores V via output_o=False
         proxy_plan,
         kv_indices=kv_indices,
         output_o=False,
@@ -117,17 +115,17 @@ def _group_max_reduce(max_score: torch.Tensor, config: "MiniMaxM3SparseConfig") 
 
 
 class MsaIndexer:
-    """Predictor submodule: proxy MQA + top-k block selection.
+    """Predictor submodule: proxy MQA and top-k block selection.
 
-    Owned by :class:`MiniMaxM3MSATrtllmAttention`. Stateless except for a
-    cached decode driver (keyed by geometry/device) that keeps
-    CUDA-graph-stable persistent buffers.
+    Owned by `MiniMaxM3MSATrtllmAttention`. Stateless except for a cached
+    decode driver (keyed by geometry/device) that keeps CUDA-graph-stable
+    persistent buffers.
     """
 
     def __init__(self, config: "MiniMaxM3SparseConfig"):
         self.config = config
 
-    # -- prefill: eager direct fmha_sm100 --------------------------------
+    # prefill: eager, direct fmha_sm100
 
     def select_blocks_prefill(
         self,
@@ -141,7 +139,7 @@ class MsaIndexer:
         qo_offset_cpu: Optional[torch.Tensor],
         kv_indices: torch.Tensor,
     ) -> torch.Tensor:
-        """Return ``[total_q, num_kv_heads, topk]`` selected block indices."""
+        """Return `[total_q, num_kv_heads, topk]` selected block indices."""
         config = self.config
         idx_k_paged = idx_cache_to_msa_paged(idx_k_cache)
 
@@ -180,7 +178,7 @@ class MsaIndexer:
             local_blocks=config.local_blocks,
         )
 
-    # -- decode: CUDA-graph-safe in-tree driver --------------------------
+    # decode: CUDA-graph-safe in-tree driver
 
     def select_blocks_decode(
         self,
@@ -191,13 +189,11 @@ class MsaIndexer:
         idx_sm_scale: float,
         page_size: int,
     ) -> torch.Tensor:
-        """Return ``kv_block_indexes`` via the graph-safe decode driver.
+        """Return `kv_block_indexes` via the graph-safe decode driver.
 
-        The driver runs the same ``fmha_sm100`` proxy binary + device-side
+        The driver runs the same `fmha_sm100` proxy binary and device-side
         top-k with persistent buffers, so this path is CUDA-graph
-        capturable. Returns the driver's ``kv_block_indexes`` plus the
-        staged page table needed by the sparse GQA pass (attached to the
-        driver's persistent buffers).
+        capturable.
         """
         from .decode_wrapper.dispatch import M3DecodeGeometry, get_decode_driver
 

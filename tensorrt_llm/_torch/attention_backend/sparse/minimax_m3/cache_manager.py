@@ -154,14 +154,11 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         # then from ``sparse_attn_config``, then from the M3 checkpoint
         # convention (layers 0..2 dense, 3..N-1 sparse,
         # disable_index_value=True, sparse_index_dim=128).
-        # The pyexecutor constructs KV cache managers with the kwarg
-        # named ``sparse_attention_config`` (see
-        # ``_util.py:_create_kv_cache_manager``); accept the short
-        # spelling too for direct test construction. Reading only the
-        # short name silently yielded ``use_msa=False`` in production,
-        # so ``prepare()`` never pre-built MSA plans and the captured
-        # decode fell back to in-forward planning (the frozen-plan CUDA
-        # graph bug).
+        # The pyexecutor passes `sparse_attention_config`, so accept that
+        # name as well as the short `sparse_attn_config` used by direct
+        # test construction. Reading only the short name yields
+        # `use_msa=False`, which skips MSA plan pre-build and forces the
+        # captured decode into in-forward planning.
         sparse_attn_config = kwargs.get("sparse_attn_config") or kwargs.get(
             "sparse_attention_config"
         )
@@ -184,12 +181,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         self.disable_index_value_layer_ids = set(int(i) for i in disable_index_value_layer_ids)
         self.sparse_index_dim = int(sparse_index_dim)
         # Surface whether the runtime dispatches through the MSA-backed
-        # FMHA (``fmha_sm100``) path so ``MiniMaxM3AttentionMetadata.prepare()``
-        # can pre-build the MSA plan objects outside the CUDA graph
-        # capture window. Read from the sparse-attention config; the
-        # config's ``sparse_use_msa`` field is the single source of truth
-        # for backend dispatch (see
-        # :func:`tensorrt_llm._torch.attention_backend.sparse.utils._resolve_minimax_m3_backend_cls`).
+        # (`fmha_sm100`) path so `prepare()` can pre-build the MSA plans
+        # outside the CUDA graph capture window. The config's
+        # `sparse_use_msa` field is the single source of truth.
         self.use_msa = bool(getattr(sparse_attn_config, "sparse_use_msa", False))
 
         super().__init__(*args, **kwargs)

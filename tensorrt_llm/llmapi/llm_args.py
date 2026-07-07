@@ -647,9 +647,9 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
     sparse_use_msa: bool = Field(
         default=False,
         description=("If True, route the sparse forward through the MSA-backed "
-                     "FMHA runtime (``fmha_sm100`` + ``sparse_topk_select``) "
-                     "instead of the in-tree Triton + SDPA reference path. "
-                     "Requires SM100 and the external ``fmha_sm100`` package "
+                     "FMHA runtime (`fmha_sm100` and `sparse_topk_select`) "
+                     "instead of the in-tree Triton and SDPA reference path. "
+                     "Requires SM100 and the external `fmha_sm100` package "
                      "(https://github.com/MiniMax-AI/MSA) to be importable."),
     )
 

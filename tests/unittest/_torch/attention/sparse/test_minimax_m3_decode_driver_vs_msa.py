@@ -1,21 +1,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""M3/M4 validation: in-tree decode driver vs MSA api path, bit-exact.
+"""Validation: in-tree decode driver vs MSA api path, bit-exact.
 
 Runs the same JIT-compiled SM100 kernel binaries through (a) MSA's
-host-centric ``fmha_sm100_plan`` / ``fmha_sm100`` driver and (b) the
-in-tree graph-safe ``dispatch.M3DecodeKernelDriver``, on identical
-inputs, and asserts bit-equality:
+host-centric `fmha_sm100_plan` / `fmha_sm100` driver and (b) the in-tree
+graph-safe `dispatch.M3DecodeKernelDriver`, on identical inputs, and
+asserts bit-equality:
 
-* proxy MQA max-score pass — uniform and heterogeneous KV lens;
-* top-k block selection — bit-diff vs ``sparse_topk_select`` on
-  uniform lens (global == per-row there), reference-diff vs a pure
-  Python implementation on heterogeneous lens;
-* sparse block-GQA pass — same ``kv_block_indexes`` fed to both;
-* full pipeline under CUDA graph capture/replay with mutated lengths
-  and contents between replays (the property MSA's driver lacks).
+* proxy MQA max-score pass: uniform and heterogeneous KV lens;
+* top-k block selection: bit-diff vs `sparse_topk_select` on uniform lens
+  (global equals per-row there), reference-diff vs a pure Python
+  implementation on heterogeneous lens;
+* sparse block-GQA pass: same `kv_block_indexes` fed to both;
+* full pipeline under CUDA graph capture/replay with mutated lengths and
+  contents between replays (the property MSA's driver lacks).
 
-Requires SM100 + the ``fmha_sm100`` package (see requirements.txt).
+Requires SM100 + the `fmha_sm100` package (see requirements.txt).
 """
 
 import math
@@ -72,7 +72,7 @@ def _geometry(max_batch):
 def _make_inputs(kv_lens, seed=0, pool_pages=None):
     """Build synthetic paged caches + decode Q for the given KV lengths.
 
-    ``pool_pages`` fixes the physical page-pool size so tensors keep
+    `pool_pages` fixes the physical page-pool size so tensors keep
     identical shapes across calls (required by the CUDA graph test's
     in-place refreshes).
     """
@@ -168,13 +168,13 @@ def _msa_topk(max_score, kv_lens_cpu):
 def _msa_sparse(inp, kv_block_indexes, causal=False):
     """MSA reference sparse pass.
 
-    ``causal=False`` is the production decode configuration: MSA then
-    overwrites ``qo_offset`` with the *global* ``max_kv_len``, which in
-    sparse mode (no secondary seqlen clip) lets short requests attend
-    stale positions inside forced/OOB blocks — a real MSA hetero-batch
-    defect. ``causal=True`` keeps the per-request ``kv_len - 1``
-    offsets and is the exact-semantics reference the in-tree driver
-    implements; both agree on uniform batches.
+    `causal=False` is the production decode configuration: MSA then
+    overwrites `qo_offset` with the global `max_kv_len`, which in sparse
+    mode (no secondary seqlen clip) lets short requests attend stale
+    positions inside forced/OOB blocks, a real MSA hetero-batch defect.
+    `causal=True` keeps the per-request `kv_len - 1` offsets and is the
+    exact-semantics reference the in-tree driver implements; both agree on
+    uniform batches.
     """
     import fmha_sm100
 
@@ -335,8 +335,8 @@ def test_sparse_gqa_bitdiff(kv_lens):
     driver = _driver(max_batch=len(kv_lens))
 
     # Use MSA's own block selection for both sides to isolate the
-    # sparse kernel + driver comparison.  Heterogeneous batches need
-    # the causal=True reference (per-request offsets — see _msa_sparse
+    # sparse kernel and driver comparison. Heterogeneous batches need
+    # the causal=True reference (per-request offsets; see _msa_sparse
     # docstring); uniform batches match the production causal=False
     # path bit-exactly as well.
     ms = _msa_proxy_max_score(inp)
@@ -378,9 +378,9 @@ def test_full_pipeline_bitdiff_uniform():
 def test_cuda_graph_replay_tracks_device_state():
     """Capture once, mutate lengths + contents, replay: must match eager.
 
-    This is exactly the failure mode of the MSA driver (frozen plan) —
-    the in-tree driver must produce bit-identical results to its own
-    eager execution for every replay.
+    This is exactly the failure mode of the MSA driver (frozen plan): the
+    in-tree driver must produce bit-identical results to its own eager
+    execution for every replay.
     """
     _require_env()
     batch = 8

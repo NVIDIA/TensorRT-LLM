@@ -12,10 +12,10 @@ if TYPE_CHECKING:
     SparseAttentionConfig = Union[LlmSparseAttentionConfig,
                                   VisualGenSparseAttentionConfig]
 
-# Imports of the concrete backends / cache managers are kept local to each
-# function: they pull in ``trtllm`` and ``resource_manager``, which import
-# ``interface`` and would otherwise form an import cycle when this package is
-# loaded.
+# Imports of the concrete backends and cache managers are kept local to
+# each function: they pull in `trtllm` and `resource_manager`, which
+# import `interface` and would otherwise form an import cycle when this
+# package is loaded.
 
 
 def get_sparse_attn_kv_cache_manager(
@@ -46,10 +46,9 @@ def _resolve_minimax_m3_backend_cls(
         sparse_params: "SparseParams") -> Type["AttentionBackend"]:
     """Pick the Triton or MSA-backed M3 backend class.
 
-    Honours ``use_msa`` on the lowered :class:`MiniMaxM3SparseParams`
-    (populated from the user-facing ``sparse_use_msa`` flag). Falls back
-    to the Triton reference path when the flag is unset, preserving the
-    legacy behaviour for callers that have not opted in.
+    Honours `use_msa` on the lowered `MiniMaxM3SparseParams` (populated
+    from the user-facing `sparse_use_msa` flag). Falls back to the Triton
+    reference path when the flag is unset.
     """
     from .minimax_m3 import (get_minimax_m3_attention_backend_cls,
                              get_minimax_m3_msa_attention_backend_cls)

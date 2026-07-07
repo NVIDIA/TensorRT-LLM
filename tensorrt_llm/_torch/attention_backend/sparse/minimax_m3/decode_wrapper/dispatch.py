@@ -2,24 +2,23 @@
 # SPDX-License-Identifier: Apache-2.0
 """Graph-safe decode driver for MiniMax-M3 sparse attention.
 
-Replaces MSA's host-centric ``fmha_sm100_plan`` / ``fmha_sm100`` driver
-(``api.py``) for the decode path while invoking the *same* JIT-compiled
-SM100 kernel binaries via ``fmha_sm100.jit.get_fmha_variant``: the MSA
-plan bakes host-side values into the launch, which CUDA graph replays
-would freeze, so only the driver is replaced and the kernels are
-reused.
+Replaces MSA's host-centric `fmha_sm100_plan` / `fmha_sm100` driver for
+the decode path while invoking the same JIT-compiled SM100 kernel
+binaries via `fmha_sm100.jit.get_fmha_variant`. MSA's plan bakes
+host-side values into the launch, which CUDA graph replays would freeze,
+so only the driver is replaced and the kernels are reused.
 
 Design contract:
 
-* No plan/run split — every call assembles launch args directly.
-* Everything per-step-varying is a device tensor: ``seq_lens``,
-  ``kv_page_indptr``, ``kv_indices``, ``kv_block_indexes``, the
-  ``max_score`` contents.
-* Host-baked values are geometry / per-batch-size constants only:
-  head counts, pack factor, page size, ``max_k_tiles`` capacity,
-  worklists (a pure function of batch size for decode).
-* Every method is callable inside a CUDA graph capture and yields
-  correct results at replay: no ``.item()`` / ``.cpu()`` / ``.tolist()``.
+* No plan/run split: every call assembles launch args directly.
+* Everything per-step-varying is a device tensor: `seq_lens`,
+  `kv_page_indptr`, `kv_indices`, `kv_block_indexes`, and the `max_score`
+  contents.
+* Host-baked values are geometry or per-batch-size constants only: head
+  counts, pack factor, page size, `max_k_tiles` capacity, and worklists
+  (a pure function of batch size for decode).
+* Every method is callable inside a CUDA graph capture and yields correct
+  results at replay: no `.item()`, `.cpu()`, or `.tolist()`.
 """
 
 from __future__ import annotations
@@ -40,7 +39,7 @@ _WORKSPACE_BYTES = 32 * 1024 * 1024
 
 
 def _compute_pack_factor(max_qo_len: int, num_qo_heads: int, num_kv_heads: int) -> int:
-    """Verbatim port of ``fmha_sm100.api._compute_pack_factor``."""
+    """Verbatim port of `fmha_sm100.api._compute_pack_factor`."""
     if num_kv_heads == -1:
         return 1
     h_r = num_qo_heads // num_kv_heads
@@ -54,7 +53,7 @@ def _compute_pack_factor(max_qo_len: int, num_qo_heads: int, num_kv_heads: int) 
 
 
 def _max_k_tiles_capacity(max_kv_len: int) -> int:
-    """MSA's ``max_k_tiles`` formula (``api.py:658``) at max capacity.
+    """MSA's `max_k_tiles` formula at max capacity.
 
     Number of 128-token KV blocks rounded up to a multiple of 128 (the
     kernel's max-score tile stride granularity).
@@ -93,19 +92,18 @@ class M3DecodeKernelDriver:
     """Persistent-state decode driver for one (device, geometry) pair.
 
     Allocates every buffer once at construction with max-capacity
-    geometry; per-call views are prefixes/strided views of those
-    buffers so their ``data_ptr()`` is stable across CUDA graph
-    replays.
+    geometry; per-call views are prefix or strided views of those buffers
+    so their `data_ptr()` is stable across CUDA graph replays.
     """
 
     def __init__(self, geometry: M3DecodeGeometry, device: torch.device):
-        import fmha_sm100  # noqa: F401 — hard dependency of this driver
+        import fmha_sm100  # noqa: F401  (hard dependency of this driver)
         from fmha_sm100.jit import _dlpack_dtype_code, get_fmha_variant
 
         self.geom = g = geometry
         self.device = device
 
-        # --- pack factors and packed head counts (decode: qo_len == 1) ---
+        # Pack factors and packed head counts (decode: qo_len == 1).
         self.pf_proxy = _compute_pack_factor(1, g.num_index_heads, 1)
         self.heads_packed_proxy = g.num_index_heads // self.pf_proxy
         self.pf_sparse = _compute_pack_factor(1, g.num_q_heads, g.num_kv_heads)
@@ -150,7 +148,7 @@ class M3DecodeKernelDriver:
 
     # ------------------------------------------------------------------
     # Cached per-batch-size constants (host work happens once per shape,
-    # outside any capture — callers warm shapes up before capturing).
+    # outside any capture; callers warm shapes up before capturing).
     # ------------------------------------------------------------------
 
     def _qo_consts(self, batch: int, pack_factor: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -182,7 +180,7 @@ class M3DecodeKernelDriver:
         return cached
 
     def warmup_shapes(self, batch: int) -> None:
-        """Pre-build all per-batch-size constants for ``batch``.
+        """Pre-build all per-batch-size constants for `batch`.
 
         Call once per CUDA graph bucket before capture so no host-side
         cache misses happen inside the captured region.
@@ -203,15 +201,13 @@ class M3DecodeKernelDriver:
         return view
 
     def _qo_offset_view(self, seq_lens: torch.Tensor, batch: int) -> torch.Tensor:
-        """Per-request causal offset ``kv_len - 1`` (device op).
+        """Per-request causal offset `kv_len - 1` (device op).
 
         The kernel's causal bound is inclusive (attend positions
-        ``<= offset + q_idx``); with one query token at position
-        ``kv_len - 1`` this unmasks exactly the ``kv_len`` cached
-        positions.  ``kv_len`` itself would leak one stale slot from a
-        partially-filled last page in *sparse* mode, which has no
-        secondary seqlen clip (verified empirically in
-        ``test_minimax_m3_decode_driver_vs_msa.py`` hetero cases).
+        `<= offset + q_idx`); with one query token at position
+        `kv_len - 1` this unmasks exactly the `kv_len` cached positions.
+        `kv_len` itself would leak one stale slot from a partially-filled
+        last page in sparse mode, which has no secondary seqlen clip.
         """
         view = self._qo_offset[:batch]
         torch.sub(seq_lens, 1, out=view)
@@ -235,17 +231,17 @@ class M3DecodeKernelDriver:
 
         Parameters
         ----------
-        idx_q : ``[batch, num_index_heads, 128]`` bf16 (decode: 1 token/req).
-        idx_k_paged : ``[num_pages, 1, page_size, 128]`` bf16 (HND).
-        seq_lens : ``[batch]`` int32 device — per-request KV length.
-        kv_page_indptr : ``[batch + 1]`` int32 device.
-        kv_indices : ``[total_pages]`` int32 device page table.
+        idx_q : `[batch, num_index_heads, 128]` bf16 (decode: 1 token/req).
+        idx_k_paged : `[num_pages, 1, page_size, 128]` bf16 (HND).
+        seq_lens : `[batch]` int32 device; per-request KV length.
+        kv_page_indptr : `[batch + 1]` int32 device.
+        kv_indices : `[total_pages]` int32 device page table.
         sm_scale : softmax scale (does not affect max-score ranking).
 
         Returns
         -------
-        ``[num_index_heads, max_k_tiles, batch]`` fp32 view into the
-        persistent max-score buffer; unwritten tiles are ``-inf``.
+        `[num_index_heads, max_k_tiles, batch]` fp32 view into the
+        persistent max-score buffer; unwritten tiles are -inf.
         """
         g = self.geom
         batch = idx_q.shape[0]
@@ -313,8 +309,8 @@ class M3DecodeKernelDriver:
     ) -> torch.Tensor:
         """Group-reduce index-head scores to KV heads and pick top-k blocks.
 
-        Returns ``[batch, num_kv_heads, topk]`` int32 view into the
-        persistent ``kv_block_indexes`` buffer.
+        Returns `[batch, num_kv_heads, topk]` int32 view into the
+        persistent `kv_block_indexes` buffer.
         """
         g = self.geom
         batch = max_score.shape[2]
@@ -361,16 +357,16 @@ class M3DecodeKernelDriver:
 
         Parameters
         ----------
-        q : ``[batch, num_q_heads, 128]`` bf16.
-        k_paged / v_paged : ``[num_pages, num_kv_heads, page_size, 128]`` bf16.
-        kv_block_indexes : ``[batch, num_kv_heads, topk]`` int32 ascending,
-            ``-1`` tail padded.
-        seq_lens / kv_page_indptr / kv_indices : as in ``proxy_max_score``.
+        q : `[batch, num_q_heads, 128]` bf16.
+        k_paged / v_paged : `[num_pages, num_kv_heads, page_size, 128]` bf16.
+        kv_block_indexes : `[batch, num_kv_heads, topk]` int32 ascending,
+            -1 tail padded.
+        seq_lens / kv_page_indptr / kv_indices : as in `proxy_max_score`.
 
         Returns
         -------
-        ``[batch, num_q_heads, 128]`` bf16 view into the persistent
-        output buffer.
+        `[batch, num_q_heads, 128]` bf16 view into the persistent output
+        buffer.
         """
         batch = q.shape[0]
         seq_lens = seq_lens[:batch]

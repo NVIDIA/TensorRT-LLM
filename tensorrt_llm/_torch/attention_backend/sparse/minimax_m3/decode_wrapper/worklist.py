@@ -2,29 +2,28 @@
 # SPDX-License-Identifier: Apache-2.0
 """Static persistent-CTA worklists for the M3 sparse decode kernels.
 
-The MSA C++ SM100 FMHA kernel (``csrc/include/fmha_tile_scheduler.hpp``,
-``HostPrecomputedTileScheduler``) walks a device worklist:
+The MSA C++ SM100 FMHA kernel's `HostPrecomputedTileScheduler` walks a
+device worklist:
 
-* ``packed_work_range[cta] = end << 32 | start`` — the slice of
-  ``packed_work_info`` CTA ``cta`` owns;
-* ``packed_work_info[i] = qo_tile << 32 | (head & 0xFFFF) << 16 |
-  (batch & 0xFFFF)`` — one (batch, packed-head, qo-tile) work item.
+* `packed_work_range[cta] = end << 32 | start`: the slice of
+  `packed_work_info` that CTA `cta` owns.
+* `packed_work_info[i] = qo_tile << 32 | (head & 0xFFFF) << 16 |
+  (batch & 0xFFFF)`: one (batch, packed-head, qo-tile) work item.
 
-MSA computes these with a device planner kernel
-(``csrc/include/plan.cuh``) parameterised by per-step KV lengths for
-load balancing.  For **decode** (``qo_len == 1`` per request,
-``num_kv_splits == 1``) the *set* of work items is a pure function of
-``(batch_size, num_packed_heads)`` — KV lengths only affect which CTA
+MSA computes these with a device planner kernel parameterised by
+per-step KV lengths for load balancing. For decode (`qo_len == 1` per
+request, `num_kv_splits == 1`) the set of work items is a pure function
+of `(batch_size, num_packed_heads)`: KV lengths only affect which CTA
 runs which item, never whether an item exists, and each item reads its
-own KV bounds from device tensors at execution time.  So the worklist
-is a per-batch-size constant: build it once on the host, keep it in a
-persistent device buffer, and CUDA graph replays stay correct for any
-KV lengths.
+own KV bounds from device tensors at execution time. So the worklist is
+a per-batch-size constant: build it once on the host, keep it in a
+persistent device buffer, and CUDA graph replays stay correct for any KV
+lengths.
 
-Item order is batch-major then head; CTA assignment is contiguous
-chunks (equal cost per item is the decode regime).  Per-item outputs
-are independent, so assignment differences vs. MSA's greedy planner
-cannot change results — only load balance.
+Item order is batch-major then head; CTA assignment is contiguous chunks
+(equal cost per item is the decode regime). Per-item outputs are
+independent, so assignment differences from MSA's greedy planner change
+only load balance, not results.
 """
 
 from __future__ import annotations
@@ -41,23 +40,23 @@ def build_decode_worklist(
     num_ctas: int,
     device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Build ``(packed_work_range, packed_work_info)`` for one decode shape.
+    """Build `(packed_work_range, packed_work_info)` for one decode shape.
 
     Parameters
     ----------
-    batch_size : number of requests (== work-item batch dim; for the
-        per-token-expanded sparse pass this equals ``total_q``).
-    num_packed_heads : ``num_qo_heads // pack_factor`` — the head count
-        the kernel iterates after pack-GQA folding.
+    batch_size : number of requests (the work-item batch dim; for the
+        per-token-expanded sparse pass this equals `total_q`).
+    num_packed_heads : `num_qo_heads // pack_factor`, the head count the
+        kernel iterates after pack-GQA folding.
     num_ctas : persistent grid width (SM count); also the length of
-        ``packed_work_range``.
+        `packed_work_range`.
     device : CUDA device for the returned buffers.
 
     Returns
     -------
-    (packed_work_range ``[num_ctas]`` int64, packed_work_info ``[n]`` int64)
-    with ``n = batch_size * num_packed_heads`` (every item has
-    ``qo_tile == 0`` because decode packs at most 128 q rows per tile).
+    (packed_work_range `[num_ctas]` int64, packed_work_info `[n]` int64)
+    with `n = batch_size * num_packed_heads` (every item has
+    `qo_tile == 0` because decode packs at most 128 q rows per tile).
     """
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
@@ -68,7 +67,7 @@ def build_decode_worklist(
 
     n_items = batch_size * num_packed_heads
 
-    # Batch-major enumeration: item = b * H + h  ->  head h, batch b.
+    # Batch-major enumeration: item = b * H + h maps to head h, batch b.
     batch_idx = torch.arange(n_items, dtype=torch.int64) // num_packed_heads
     head_idx = torch.arange(n_items, dtype=torch.int64) % num_packed_heads
     work_info = (head_idx << 16) | batch_idx  # qo_tile == 0

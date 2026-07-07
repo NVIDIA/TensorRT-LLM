@@ -2,21 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shared, backend-neutral helpers for MiniMax-M3 sparse attention.
 
-This module hosts the pure-torch primitives that both the Triton
-reference backend (:mod:`.backend`) and the MSA (``fmha_sm100``) backend
-(:mod:`.msa_backend` / :mod:`.indexer`) rely on, so the MSA path does not
+Hosts the pure-torch primitives that both the Triton reference backend
+and the MSA (`fmha_sm100`) backend rely on, so the MSA path does not
 import Triton-backend internals:
 
-  * KV-slot writers (paged / flat-slot aware).
+  * KV-slot writers (paged and flat-slot aware).
   * Init/local block-priority sentinels.
-  * MSA cache-layout adapters (pool NHD -> ``fmha_sm100`` HND).
-  * Per-query valid-block counting + torch top-k block selection.
-  * The lazy ``fmha_sm100`` import guard and kernel precondition
-    constants.
+  * MSA cache-layout adapters (pool NHD to `fmha_sm100` HND).
+  * Per-query valid-block counting and torch top-k block selection.
+  * The lazy `fmha_sm100` import guard and kernel precondition constants.
 
-None of these functions require CUDA graph capture windows to be closed;
-they either operate on device tensors with static shapes (forward hot
-path) or run once per scheduler step during ``prepare()``.
+None of these functions require CUDA graph capture windows to be closed:
+they either operate on device tensors with static shapes on the forward
+hot path, or run once per scheduler step during `prepare()`.
 """
 
 from __future__ import annotations
@@ -35,22 +33,22 @@ if TYPE_CHECKING:
 _INIT_SCORE = 1e30
 _LOCAL_SCORE = 1e29
 
-# ``fmha_sm100`` only ships head_dim=128 variants, and the in-tree
+# fmha_sm100 only ships head_dim=128 variants, and the in-tree
 # block-selection/driver geometry is validated for topk=16 (the
-# MiniMax-M3 checkpoint value). Callers enforce these preconditions
-# early so layer construction fails with a clear message rather than a
-# cryptic shape error from inside the MSA JIT.
+# MiniMax-M3 checkpoint value). Callers enforce these preconditions early
+# so layer construction fails with a clear message rather than a cryptic
+# shape error from inside the MSA JIT.
 _MSA_REQUIRED_TOPK = 16
 _MSA_REQUIRED_HEAD_DIM = 128
 
 
 def require_msa_module():
-    """Lazy-import ``fmha_sm100`` and raise a clear error on failure.
+    """Lazy-import `fmha_sm100` and raise a clear error on failure.
 
-    Returns the imported module. The import is guarded so that the MSA
-    backend can be advertised in the config schema even on hosts where
-    MSA is not installed; the error only fires when a sparse layer
-    actually attempts to dispatch the MSA path.
+    Returns the imported module. The import is guarded so the MSA backend
+    can be advertised in the config schema even where MSA is not
+    installed; the error only fires when a sparse layer actually
+    dispatches the MSA path.
     """
     try:
         import fmha_sm100  # noqa: F401
@@ -79,16 +77,16 @@ def _assert_paged_write_in_bounds(
 ) -> None:
     """Optional CPU-side bounds check for paged-cache writes.
 
-    The runtime computes per-token slot ids from ``KVCacheManagerV2``'s
-    block ids; if the runtime ever produces a block id that does not fit
-    the per-layer view's dim-0 the write falls into another layer's
-    coalesced memory and corrupts the cache, or fires the CUDA
-    ``IndexKernel.cu`` device-side assert during fancy indexing.
+    The runtime computes per-token slot ids from `KVCacheManagerV2`'s
+    block ids. If it ever produces a block id that does not fit the
+    per-layer view's dim-0, the write falls into another layer's memory
+    and corrupts the cache, or fires the CUDA device-side assert during
+    fancy indexing.
 
-    When ``TRTLLM_MINIMAX_M3_DEBUG_BOUNDS`` is set this check runs a
-    CPU-side max/min comparison, surfacing the misindex with exact tensor
-    names and values instead of a device-side assert. It is opt-in
-    because the comparison forces a CPU sync.
+    When `TRTLLM_MINIMAX_M3_DEBUG_BOUNDS` is set, this runs a CPU-side
+    max/min comparison that surfaces the misindex with exact tensor names
+    and values instead of a device-side assert. It is opt-in because the
+    comparison forces a CPU sync.
     """
     if not os.environ.get("TRTLLM_MINIMAX_M3_DEBUG_BOUNDS"):
         return
@@ -99,12 +97,12 @@ def _assert_paged_write_in_bounds(
     within_max = int(within.max().item()) if within.numel() else -1
     within_min = int(within.min().item()) if within.numel() else 0
     assert 0 <= page_min and page_max < num_pages, (
-        f"{name}: page index out of bounds — page.min={page_min} "
+        f"{name}: page index out of bounds: page.min={page_min} "
         f"page.max={page_max} but cache.shape[0]={num_pages} "
         f"(shape={tuple(cache.shape)})."
     )
     assert 0 <= within_min and within_max < tokens_per_block, (
-        f"{name}: within-page offset out of bounds — within.min="
+        f"{name}: within-page offset out of bounds: within.min="
         f"{within_min} within.max={within_max} but tokens_per_block="
         f"{tokens_per_block} (shape={tuple(cache.shape)})."
     )
@@ -119,19 +117,18 @@ def write_main_kv_slots(
 
     Supports two layouts:
 
-      * **3-D flat-slot** ``[num_slots, num_heads, channel]``:
-        ``index_copy_(0, ...)`` writes propagate because the tensor IS
-        the storage (focused unit tests).
-      * **4-D multi-dim paged** ``[num_pages, tokens_per_block, num_heads,
-        channel]``: a view of ``kv_pool[:, 0]`` / ``kv_pool[:, 1]`` (or
-        the paged index-K view). The view is non-contiguous, so
-        ``index_copy_(0, ...)`` would silently fork a copy and lose the
-        write; decompose the flat slot id into ``(page, within)`` and use
-        multi-dim fancy assignment so the write propagates to the pool.
+      * 3-D flat-slot `[num_slots, num_heads, channel]`: index_copy_
+        writes propagate because the tensor is the storage (unit tests).
+      * 4-D paged `[num_pages, tokens_per_block, num_heads, channel]`: a
+        view of `kv_pool[:, 0]` / `kv_pool[:, 1]` (or the paged index-K
+        view). The view is non-contiguous, so index_copy_ would silently
+        fork a copy and lose the write; instead decompose the flat slot id
+        into (page, within) and use multi-dim fancy assignment so the
+        write propagates to the pool.
     """
-    # KV-cache writes never need autograd; wrap in no_grad so callers
-    # with an active grad context (unit tests without inference_mode) do
-    # not trip the in-place autograd guard on the cache view chain.
+    # KV-cache writes never need autograd; wrap in no_grad so callers with
+    # an active grad context (unit tests without inference_mode) do not
+    # trip the in-place autograd guard on the cache view chain.
     with torch.no_grad():
         if cache.ndim >= 4:
             tokens_per_block = int(cache.shape[1])
@@ -149,23 +146,22 @@ def write_main_kv_slots(
 # ---------------------------------------------------------------------------
 #
 # TRT-LLM's KVCacheManagerV2 stores the main K/V cache as a 5-D pool
-# ``[num_pages, kv_factor, tokens_per_block, num_kv_heads, head_dim]``
-# (NHD). ``fmha_sm100`` expects paged K/V tensors with layout
-# ``[num_pages, num_kv_heads, page_size, head_dim]`` (HND). The side
-# index-K cache is ``[num_slots, 1, sparse_index_dim]`` (flat) or the 4-D
-# paged variant ``[num_pages, tokens_per_block, 1, sparse_index_dim]``.
+# [num_pages, kv_factor, tokens_per_block, num_kv_heads, head_dim] (NHD).
+# fmha_sm100 expects paged K/V tensors with layout
+# [num_pages, num_kv_heads, page_size, head_dim] (HND). The side index-K
+# cache is [num_slots, 1, sparse_index_dim] (flat) or the 4-D paged
+# variant [num_pages, tokens_per_block, 1, sparse_index_dim].
 #
 # The helpers below produce MSA-compatible views without mutating the
-# pool's underlying storage; they permute and ``.contiguous()`` once per
-# call.
+# pool's storage; they permute and call .contiguous() once per call.
 
 
 def cache_view_to_msa_paged(cache_view: torch.Tensor) -> torch.Tensor:
-    """Convert ``[num_pages, page_size, num_kv_heads, head_dim]`` -> HND.
+    """Convert `[num_pages, page_size, num_kv_heads, head_dim]` to HND.
 
-    For flat-slot 3-D caches (focused unit tests) the cache is treated as
-    a single virtual page of size ``num_slots`` -> ``[1, num_kv_heads,
-    num_slots, head_dim]``.
+    A flat-slot 3-D cache (unit tests) is treated as a single virtual
+    page of size `num_slots`, giving `[1, num_kv_heads, num_slots,
+    head_dim]`.
     """
     if cache_view.dim() == 4:
         return cache_view.permute(0, 2, 1, 3).contiguous()
@@ -181,9 +177,10 @@ def idx_cache_to_msa_paged(idx_cache: torch.Tensor) -> torch.Tensor:
     """Convert the side index-K cache to MSA's HND paged layout.
 
     Accepts:
-      * 3-D ``[num_slots, 1, sparse_index_dim]`` -> ``[1, 1, num_slots, sparse_index_dim]``
-      * 4-D ``[num_pages, tokens_per_block, 1, sparse_index_dim]``
-        -> ``[num_pages, 1, tokens_per_block, sparse_index_dim]``
+      * 3-D `[num_slots, 1, sparse_index_dim]` to
+        `[1, 1, num_slots, sparse_index_dim]`
+      * 4-D `[num_pages, tokens_per_block, 1, sparse_index_dim]` to
+        `[num_pages, 1, tokens_per_block, sparse_index_dim]`
     """
     if idx_cache.dim() == 4:
         return idx_cache.permute(0, 2, 1, 3).contiguous()
@@ -204,13 +201,13 @@ def build_kv_indices_and_lens(
     metadata: "MiniMaxM3SparseAttentionMetadata",
     page_size: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Build ``kv_indices`` and ``kv_segment_lens`` for ``fmha_sm100``.
+    """Build `kv_indices` and `kv_segment_lens` for `fmha_sm100`.
 
-    ``kv_indices`` is the flattened per-request page table
-    ``concat([pages_of(seq_0), pages_of(seq_1), ...])`` int32; the pages
-    of a sequence come from ``req_to_token[slot, ::page_size] //
-    page_size``. ``kv_segment_lens`` is the per-request effective KV
-    length (already on the cache device inside ``metadata``).
+    `kv_indices` is the flattened per-request page table
+    `concat([pages_of(seq_0), pages_of(seq_1), ...])` int32; a sequence's
+    pages come from `req_to_token[slot, ::page_size] // page_size`.
+    `kv_segment_lens` is the per-request effective KV length (already on
+    the cache device inside `metadata`).
     """
     device = metadata.req_to_token.device
     slot_ids_long = metadata.slot_ids.to(torch.long)
@@ -255,8 +252,8 @@ def per_token_valid_blocks(
 ) -> torch.Tensor:
     """Per-query number of valid KV blocks (causal-aware), on CPU.
 
-    Expands per-request lens/offsets to a per-*token* ``[total_q]`` tensor
-    so block selection can honour each query token's own causal extent.
+    Expands per-request lens/offsets to a per-token `[total_q]` tensor so
+    block selection can honour each query token's own causal extent.
     """
     qo = qo_lens_cpu.to(torch.long)
     kv = kv_lens_cpu.to(torch.long)
@@ -291,11 +288,10 @@ def select_blocks_from_maxscore(
 ) -> torch.Tensor:
     """Per-query block selection from per-KV-head block scores, in torch.
 
-    Mirrors the reference selection (init/local forced blocks + per-query
-    valid-block masking + top-k) on the ``amax``-reduced per-KV-head
-    scores ``[num_kv_heads, n_blocks, total_q]``. Returns ``[total_q,
-    num_kv_heads, topk]`` int32, ascending block indices with ``-1`` tail
-    padding.
+    Mirrors the reference selection (init/local forced blocks, per-query
+    valid-block masking, top-k) on the amax-reduced per-KV-head scores
+    `[num_kv_heads, n_blocks, total_q]`. Returns `[total_q, num_kv_heads,
+    topk]` int32: ascending block indices with -1 tail padding.
     """
     num_kv_heads, n_blocks, total_q = max_score_kv.shape
     device = max_score_kv.device

@@ -13,41 +13,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Block-sparse GQA FMHA backed by MSA's ``fmha_sm100`` kernel.
+"""Block-sparse GQA FMHA backed by MSA's `fmha_sm100` kernel.
 
-This module provides :class:`MsaSparseGqaFmha`, an :class:`Fmha`
-implementation that wraps MSA's ``fmha_sm100`` paged sparse GQA kernel
-and participates in the standard :meth:`TrtllmAttention.forward`
-dispatch loop.
+`MsaSparseGqaFmha` is an `Fmha` that wraps MSA's `fmha_sm100` paged
+sparse GQA kernel and participates in the standard
+`TrtllmAttention.forward` dispatch loop. It mirrors `DSATrtllmAttention`:
 
-Design (mirrors ``DSATrtllmAttention``):
+  * The MiniMax-M3 MSA attention backend `MiniMaxM3MSATrtllmAttention`
+    subclasses `TrtllmAttention` and owns this FMHA plus an `MsaIndexer`.
+    The indexer runs the proxy MQA and top-k block selection, then
+    publishes the per-query selected block indices onto
+    `forward_args.sparse_prediction` via `sparse_attn_predict`.
+  * This class inherits `Fmha` directly rather than `PhasedFmha`. The
+    indexer, plan, and selected block indices are built over the whole
+    batch, and `fmha_sm100` handles mixed decode/prefill varlen batches
+    in one call, so there is no context/generation phase split to reuse.
+    `forward` does its own whole-batch dispatch: eager `fmha_sm100` for
+    prefill/mixed batches, the CUDA-graph-safe in-tree driver for pure
+    decode. The paged K/V views, page table, and per-request lengths come
+    from the owning metadata via `MsaSparseMetadataProtocol`.
 
-  * The MiniMax-M3 MSA attention backend
-    (:class:`tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend.MiniMaxM3MSATrtllmAttention`)
-    subclasses :class:`TrtllmAttention` and owns this FMHA plus an
-    :class:`~...sparse.minimax_m3.indexer.MsaIndexer`. The indexer runs
-    the proxy MQA + top-k block selection and publishes the per-query
-    selected block indices onto ``forward_args.sparse_prediction`` via
-    ``MiniMaxM3MSATrtllmAttention.sparse_attn_predict`` (exactly the DSA
-    pattern).
-  * This class inherits :class:`Fmha` directly rather than
-    :class:`PhasedFmha`: the indexer, plan, and selected block indices
-    are built over the WHOLE batch, and ``fmha_sm100`` natively handles
-    mixed decode+prefill varlen batches in a single call, so there is no
-    context / generation phase split to reuse. :meth:`forward` does its
-    own whole-batch dispatch -- eager ``fmha_sm100`` for prefill / mixed
-    batches, the CUDA-graph-safe in-tree driver for pure decode. The
-    paged HND K/V views, page table, and per-request CPU lengths are read
-    from the owning metadata through :class:`MsaSparseMetadataProtocol`.
+The kernel is SM100-only and `fmha_sm100` is an optional external
+dependency (https://github.com/MiniMax-AI/MSA). When either is missing,
+`is_available` returns False so the registry skips the class.
 
-The kernel is SM100-only and the ``fmha_sm100`` Python package is an
-optional external dependency (https://github.com/MiniMax-AI/MSA). On
-hosts where either precondition is missing, :meth:`is_available`
-returns ``False`` so the registry skips the class.
-
-The prefill path funnels through the single kernel core
-:func:`run_msa_sparse_gqa`, which is also importable for focused unit
-tests that want to drive the kernel directly.
+The prefill path funnels through `run_msa_sparse_gqa`, which is also
+importable for focused unit tests that drive the kernel directly.
 """
 
 from __future__ import annotations
@@ -71,35 +62,33 @@ if TYPE_CHECKING:
 
 @runtime_checkable
 class MsaSparseMetadataProtocol(Protocol):
-    """Fields a metadata must expose to drive :class:`MsaSparseGqaFmha`.
+    """Fields a metadata must expose to drive `MsaSparseGqaFmha`.
 
-    Implemented by
-    :class:`...sparse.minimax_m3.msa_backend.MiniMaxM3MSATrtllmAttentionMetadata`.
-    :class:`MsaSparseGqaFmha` reads the whole-batch q / output straight
-    from :meth:`Fmha.forward`'s arguments; this protocol supplies the
-    extra MSA-specific staging (paged K/V views, whole-batch lengths,
-    main-KV / index-K writes, graph-safe decode) that does not fit the
-    standard :class:`AttentionForwardArgs`.
+    Implemented by `MiniMaxM3MSATrtllmAttentionMetadata`. The FMHA reads
+    the whole-batch q and output straight from `Fmha.forward`'s
+    arguments; this protocol supplies the extra MSA-specific staging
+    (paged K/V views, whole-batch lengths, main-KV and index-K writes,
+    graph-safe decode) that does not fit `AttentionForwardArgs`.
     """
 
     def msa_get_paged_kv(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return ``(k_paged, v_paged)`` in HND layout.
+        """Return `(k_paged, v_paged)` in HND layout.
 
-        Shapes ``[num_pages, num_kv_heads, page_size, head_dim]``.
+        Each is `[num_pages, num_kv_heads, page_size, head_dim]`.
         """
         ...
 
     def msa_write_main_kv(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor) -> None:
         """Write the new-token K/V into this layer's paged main cache.
 
-        ``k`` / ``v`` are ``[num_tokens, num_kv_heads * head_dim]`` (or the
-        already-3-D per-head views). The write targets the per-new-token
-        slots staged in the metadata's ``out_cache_loc``.
+        `k` and `v` are `[num_tokens, num_kv_heads * head_dim]` (or the
+        equivalent per-head views). The write targets the per-new-token
+        slots staged in the metadata's `out_cache_loc`.
         """
         ...
 
     def msa_is_prefill(self) -> bool:
-        """``True`` when the step routes through the extend/prefill kernel.
+        """True when the step routes through the extend/prefill kernel.
 
         Mixed context+decode batches are prefill (decode rows appear as
         1-token causal extends); pure-decode batches are not.
@@ -111,16 +100,15 @@ class MsaSparseMetadataProtocol(Protocol):
         *,
         causal: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
-        """Return whole-batch ``(qo_lens_cpu, kv_lens_cpu, qo_offset_cpu, kv_indices)``.
+        """Return whole-batch `(qo_lens_cpu, kv_lens_cpu, qo_offset_cpu, kv_indices)`.
 
-        Covers every request in the step (context + decode) so the kernel
-        runs once over the entire batch -- matching the whole-batch
-        ``kv_block_indexes`` the MiniMax-M3 indexer produces.
-        ``qo_lens_cpu`` / ``kv_lens_cpu`` are ``[batch]`` int32 on CPU;
-        ``qo_offset_cpu`` is the per-request causal prefix offset on CPU for
-        ``causal=True`` (prefill) or ``None`` otherwise; ``kv_indices`` is
-        the flattened paged-KV page table for the whole batch, int32 on the
-        cache device.
+        Covers every request in the step (context and decode) so the
+        kernel runs once over the whole batch, matching the whole-batch
+        block indices the indexer produces. `qo_lens_cpu` and `kv_lens_cpu`
+        are `[batch]` int32 on CPU; `qo_offset_cpu` is the per-request
+        causal prefix offset on CPU when `causal=True`, else None;
+        `kv_indices` is the flattened paged-KV page table for the whole
+        batch, int32 on the cache device.
         """
         ...
 
@@ -134,10 +122,10 @@ class MsaSparseMetadataProtocol(Protocol):
     ) -> torch.Tensor:
         """Run the decode sparse GQA via the CUDA-graph-safe in-tree driver.
 
-        Decode is CUDA-graph captured, so it must NOT go through the eager
-        ``fmha_sm100_plan`` host driver (unpinned H2D staging, per-call
-        device allocations, device-side ``.tolist()`` cost sweep). Returns
-        ``[num_tokens, num_q_heads * head_dim]``.
+        Decode is CUDA-graph captured, so it must not go through the eager
+        `fmha_sm100_plan` host driver, which uses unpinned H2D staging,
+        per-call device allocations, and a device-side cost sweep. Returns
+        `[num_tokens, num_q_heads * head_dim]`.
         """
         ...
 
@@ -156,16 +144,16 @@ def run_msa_sparse_gqa(
     causal: bool,
     head_dim: int = 128,
 ) -> torch.Tensor:
-    """Single kernel core: ``fmha_sm100`` block-sparse paged GQA.
+    """Single kernel core: `fmha_sm100` block-sparse paged GQA.
 
-    Follows MSA's two-call pattern: ``fmha_sm100_plan`` builds the
-    per-shape sparse plan (with ``kv_block_num`` derived from
-    ``kv_block_indexes.shape[-1]``) and ``fmha_sm100`` runs the kernel
-    with the block indices threaded through. Returns
-    ``[total_q, num_qo_heads, head_dim]`` bfloat16.
+    Follows MSA's two-call pattern: `fmha_sm100_plan` builds the per-shape
+    sparse plan (with `kv_block_num` derived from
+    `kv_block_indexes.shape[-1]`), then `fmha_sm100` runs the kernel with
+    the block indices threaded through. Returns
+    `[total_q, num_qo_heads, head_dim]` bfloat16.
     """
-    # Imported here (not at module top) so the registry can still
-    # advertise the class on hosts where fmha_sm100 is absent --
+    # Imported here, not at module top, so the registry can still
+    # advertise the class on hosts where fmha_sm100 is absent.
     # is_available() handles the off-host case.
     import fmha_sm100
 
@@ -224,14 +212,13 @@ def run_msa_sparse_gqa(
 
 
 def _sm100_fmha_available(class_name: str) -> bool:
-    """Shared availability probe for the MSA ``fmha_sm100`` backends.
+    """Shared availability probe for the MSA `fmha_sm100` backend.
 
-    Probes with :func:`importlib.util.find_spec` instead of importing --
-    ``fmha_sm100``'s import side effects (early ``tvm_ffi`` import +
-    global-func registration) intermittently corrupt the flashinfer
-    dense-attention path when pulled in at layer-construction time. The
-    real import happens at first kernel use. See the module docstrings of
-    ``msa_sparse_gqa`` / the MSA indexer for the full story.
+    Probes with `importlib.util.find_spec` instead of importing:
+    `fmha_sm100`'s import side effects (an early `tvm_ffi` import plus
+    global-func registration) can corrupt the flashinfer dense-attention
+    path when pulled in at layer-construction time. The real import
+    happens at first kernel use.
     """
     if importlib.util.find_spec("fmha_sm100") is None:
         logger.debug(f"{class_name} is unavailable: fmha_sm100 package not installed.")
@@ -253,27 +240,25 @@ def _sm100_fmha_available(class_name: str) -> bool:
 
 
 class MsaSparseGqaFmha(Fmha):
-    """SM100 block-sparse GQA FMHA powered by MSA's ``fmha_sm100`` kernel.
+    """SM100 block-sparse GQA FMHA powered by MSA's `fmha_sm100` kernel.
 
-    Consumes the per-query selected KV block indices published on
-    ``forward_args.sparse_prediction.sparse_attn_indices`` (produced by
-    the MiniMax-M3 MSA indexer) and runs paged GQA attention over the
-    selected blocks. Participates in the standard
-    :meth:`TrtllmAttention.forward` dispatch loop
-    (:meth:`is_supported` returns ``True`` for M3 MSA sparse requests).
+    Consumes the per-query selected KV block indices on
+    `forward_args.sparse_prediction.sparse_attn_indices` (produced by the
+    MiniMax-M3 MSA indexer) and runs paged GQA attention over the selected
+    blocks. Participates in the standard `TrtllmAttention.forward`
+    dispatch loop; `is_supported` returns True only for M3 MSA sparse
+    requests.
 
-    Inherits :class:`Fmha` directly (not :class:`PhasedFmha`): the
-    MiniMax-M3 indexer, plan, and selected block indices are all built
-    over the WHOLE batch, and ``fmha_sm100`` natively handles mixed
-    decode+prefill varlen batches in a single call, so there is no
-    ``PhasedFmha`` context / generation split to reuse -- this class does
-    its own whole-batch dispatch in :meth:`forward`.
+    Inherits `Fmha` directly, not `PhasedFmha`: the indexer, plan, and
+    selected block indices are built over the whole batch, and
+    `fmha_sm100` handles mixed decode/prefill varlen batches in one call,
+    so there is no context/generation split to reuse. `forward` does its
+    own whole-batch dispatch.
 
     Hard requirements (checked at runtime):
-      * ``q``/``k``/``v`` head dim is 128 -- the only ``fmha_sm100``
-        variant shipped today.
-      * paged K/V are 4-D HND caches with matching ``num_kv_heads`` and
-        ``page_size`` (supplied by :class:`MsaSparseMetadataProtocol`).
+      * q, k, v head dim is 128, the only supported `fmha_sm100` variant.
+      * paged K/V are 4-D HND caches with matching `num_kv_heads` and
+        `page_size` (supplied by `MsaSparseMetadataProtocol`).
     """
 
     HEAD_DIM = 128
@@ -281,14 +266,13 @@ class MsaSparseGqaFmha(Fmha):
 
     def __init__(self, attn: Optional["TrtllmAttention"] = None):
         # The registry constructs this with an owning TrtllmAttention (for
-        # layer_idx / num_heads / scale). Owner-less construction is
+        # layer_idx, num_heads, scale). Owner-less construction is
         # tolerated for focused unit tests that only exercise
-        # is_available() / run_msa_sparse_gqa().
+        # is_available() or run_msa_sparse_gqa().
         #
-        # kv_factor / out-head-size are set for parity with the other FMHA
-        # libs; nothing in the MSA whole-batch path reads them (they are
-        # only consumed by PhasedFmha.forward, which this class does not
-        # use), but keeping them avoids surprising a future caller.
+        # kv_factor and the out-head sizes are set for parity with the
+        # other FMHA libs. The whole-batch path does not read them, but
+        # keeping them avoids surprising a future caller.
         super().__init__(attn)
         self.kv_factor = 2
         self.generation_out_head_size = self.HEAD_DIM
@@ -306,10 +290,10 @@ class MsaSparseGqaFmha(Fmha):
         metadata: "TrtllmAttentionMetadata",
         forward_args: "AttentionForwardArgs",
     ) -> bool:
-        # Only claim MiniMax-M3 MSA sparse requests: the upstream indexer
-        # (MiniMaxM3MSATrtllmAttention.sparse_attn_predict) must have
-        # populated the per-query selected block indices, and the owning
-        # metadata must expose the MSA staging protocol.
+        # Only claim MiniMax-M3 MSA sparse requests: the indexer must have
+        # populated the per-query selected block indices via
+        # sparse_attn_predict, and the metadata must expose the MSA
+        # staging protocol.
         sparse_prediction = getattr(forward_args, "sparse_prediction", None)
         if sparse_prediction is None:
             return False
@@ -330,17 +314,14 @@ class MsaSparseGqaFmha(Fmha):
         metadata: "TrtllmAttentionMetadata",
         forward_args: "AttentionForwardArgs",
     ) -> None:
-        # Whole-batch dispatch (this is why the class inherits Fmha, not
-        # PhasedFmha). The MiniMax-M3 indexer and metadata are built over
-        # the WHOLE batch: the indexer's selected block indices carry one
-        # row per query token across the entire batch, and the plan lengths
-        # span the whole batch. Splitting q by phase while the plan / block
-        # indices span the whole batch would mismatch the kernel's
-        # ``total_q`` against ``q.shape[0]`` (fmha_sm100's sparse schedule
-        # ``split_counts`` validation). fmha_sm100 natively handles mixed
-        # decode+prefill varlen batches (decode rows are 1-token causal
-        # extends), so a single whole-batch call is both correct and what
-        # the pre-refactor path did.
+        # Whole-batch dispatch, which is why this class inherits Fmha
+        # rather than PhasedFmha. The indexer's selected block indices
+        # carry one row per query token across the entire batch, and the
+        # plan lengths span the whole batch. Splitting q by phase would
+        # mismatch the kernel's total_q against q.shape[0] (fmha_sm100's
+        # sparse schedule split_counts validation). fmha_sm100 handles
+        # mixed decode/prefill varlen batches (decode rows are 1-token
+        # causal extends), so a single whole-batch call is correct.
         if not isinstance(metadata, MsaSparseMetadataProtocol):
             raise RuntimeError(
                 "MsaSparseGqaFmha requires metadata implementing "
@@ -351,10 +332,10 @@ class MsaSparseGqaFmha(Fmha):
         if output is None:
             raise RuntimeError(f"{type(self).__name__} requires output.")
 
-        # ``fmha_sm100`` reads the paged K/V cache directly, so (unlike the
-        # standard C++ FMHA path) the new-token K/V must be written into the
-        # cache here before the sparse GQA runs. The index-K write is done by
-        # the indexer (see MiniMaxM3MSATrtllmAttention.sparse_attn_predict).
+        # fmha_sm100 reads the paged K/V cache directly, so (unlike the
+        # standard C++ FMHA path) the new-token K/V must be written into
+        # the cache here before the sparse GQA runs. The index-K write is
+        # done by the indexer via sparse_attn_predict.
         if k is not None and v is not None:
             metadata.msa_write_main_kv(attn.layer_idx, k, v)
 
@@ -376,8 +357,8 @@ class MsaSparseGqaFmha(Fmha):
         sm_scale = self._sm_scale()
 
         if metadata.msa_is_prefill():
-            # Context / mixed batch: eager fmha_sm100 (not CUDA-graph
-            # captured), matching the pre-refactor prefill path.
+            # Context or mixed batch: eager fmha_sm100 (not CUDA-graph
+            # captured).
             k_paged, v_paged = metadata.msa_get_paged_kv(attn.layer_idx)
             qo_lens_cpu, kv_lens_cpu, qo_offset_cpu, kv_indices = metadata.msa_whole_batch_lens(
                 causal=True

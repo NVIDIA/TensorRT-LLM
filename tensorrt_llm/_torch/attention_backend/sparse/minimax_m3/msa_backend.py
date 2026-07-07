@@ -1,45 +1,34 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""MSA-backed MiniMax-M3 sparse attention on the ``TrtllmAttention`` stack.
+"""MSA-backed MiniMax-M3 sparse attention on the `TrtllmAttention` stack.
 
-Rewritten (per design review) to mimic
-:class:`tensorrt_llm._torch.attention_backend.sparse.dsa.DSATrtllmAttention`:
+Mimics `DSATrtllmAttention`:
 
-  * :class:`MiniMaxM3MSATrtllmAttention` subclasses :class:`TrtllmAttention`
-    and reuses its inherited ``forward`` (the standard ``fmha_libs``
-    dispatch loop). It overrides only the sparse hooks
-    (:meth:`sparse_attn_predict`, :meth:`sparse_kv_predict`) and owns an
-    :class:`~.indexer.MsaIndexer`. It does **not** inherit the Triton
-    reference backend.
-  * The main sparse GQA runs through the registered
-    :class:`~...fmha.msa_sparse_gqa.MsaSparseGqaFmha` (an
-    :class:`~...fmha.interface.Fmha` that does its own whole-batch
-    dispatch) selected by the dispatch loop.
-  * The indexer calls ``fmha_sm100`` directly (prefill) / the graph-safe
+  * `MiniMaxM3MSATrtllmAttention` subclasses `TrtllmAttention` and reuses
+    its inherited `forward` (the standard `fmha_libs` dispatch loop). It
+    overrides only the sparse hooks (`sparse_attn_predict`,
+    `sparse_kv_predict`) and owns an `MsaIndexer`. It does not inherit the
+    Triton reference backend.
+  * The main sparse GQA runs through the registered `MsaSparseGqaFmha`
+    (an `Fmha` that does its own whole-batch dispatch) selected by the
+    dispatch loop.
+  * The indexer calls `fmha_sm100` directly (prefill) or the graph-safe
     decode driver (decode) to produce the per-query selected block
     indices, which the model layer threads through
-    ``forward_args.topk_indices``.
-  * :class:`MiniMaxM3MSATrtllmAttentionMetadata` subclasses
-    :class:`TrtllmAttentionMetadata`, so the inherited ``forward`` reads
-    the standard metadata fields, while the MSA-specific paged views /
-    page tables / block writes are supplied through the
-    :class:`~...fmha.msa_sparse_gqa.MsaSparseMetadataProtocol` methods
-    added here (reusing the validated staging in :mod:`.metadata`).
+    `forward_args.topk_indices`.
+  * `MiniMaxM3MSATrtllmAttentionMetadata` subclasses
+    `TrtllmAttentionMetadata`, so the inherited `forward` reads the
+    standard metadata fields, while the MSA-specific paged views, page
+    tables, and block writes are supplied through the
+    `MsaSparseMetadataProtocol` methods added here (reusing the staging in
+    `metadata`).
 
-The backend + metadata classes are defined inside
-:func:`get_minimax_m3_msa_attention_backend_cls` (with a lazy ``trtllm``
-import) so that importing this module during attention-backend package
-initialization does not pull in ``trtllm`` -> ``fmha`` -> ``interface``
-and form an import cycle. This mirrors the Triton reference backend's
-``get_minimax_m3_attention_backend_cls`` factory.
-
-.. note::
-   This rewrite has been validated for import/lint only. The
-   ``fmha_sm100`` kernel contract, the interaction of
-   :class:`TrtllmAttentionMetadata` with
-   :class:`~.cache_manager.MiniMaxM3KVCacheManagerV2`, and the context /
-   generation phase splitting for mixed batches must be validated on SM100
-   (B200) hardware with the MiniMax-M3 checkpoint.
+The backend and metadata classes are defined inside
+`get_minimax_m3_msa_attention_backend_cls` (with a lazy `trtllm` import)
+so that importing this module during attention-backend package init does
+not pull in `trtllm` -> `fmha` -> `interface` and form an import cycle.
+This mirrors the Triton reference backend's
+`get_minimax_m3_attention_backend_cls` factory.
 """
 
 from __future__ import annotations
@@ -68,10 +57,10 @@ def _whole_batch_lens(
     m3_meta: "MiniMaxM3SparseAttentionMetadata",
     page_size: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
-    """Whole-batch ``(qo_lens_cpu, kv_lens_cpu, qo_offset_cpu, kv_indices)``.
+    """Whole-batch `(qo_lens_cpu, kv_lens_cpu, qo_offset_cpu, kv_indices)`.
 
-    Prefers the pre-staged ``msa_plans`` (CUDA-graph-stable buffers) and
-    falls back to an eager rebuild for focused tests / the first eager
+    Prefers the pre-staged `msa_plans` (CUDA-graph-stable buffers) and
+    falls back to an eager rebuild for focused tests and the first eager
     warmup pass.
     """
     msa_plans = getattr(m3_meta, "msa_plans", None)
@@ -98,11 +87,11 @@ def _whole_batch_lens(
 
 @functools.lru_cache(maxsize=1)
 def get_minimax_m3_msa_attention_backend_cls():
-    """Return :class:`MiniMaxM3MSATrtllmAttention` (selection entry point).
+    """Return `MiniMaxM3MSATrtllmAttention` (selection entry point).
 
-    Defined lazily (with a deferred ``trtllm`` import) so importing this
+    Defined lazily (with a deferred `trtllm` import) so importing this
     module during attention-backend package init does not form the
-    ``trtllm`` -> ``fmha`` -> ``interface`` import cycle.
+    `trtllm` -> `fmha` -> `interface` import cycle.
     """
     from dataclasses import dataclass
 
@@ -113,16 +102,16 @@ def get_minimax_m3_msa_attention_backend_cls():
 
     @dataclass(init=False)
     class MiniMaxM3MSATrtllmAttentionMetadata(TrtllmAttentionMetadata):
-        """``TrtllmAttentionMetadata`` for MiniMax-M3 MSA sparse layers.
+        """`TrtllmAttentionMetadata` for MiniMax-M3 MSA sparse layers.
 
         Layers the MSA staging (paged HND views, page tables, per-request
         CPU lengths, main/index-K writes) on top of the standard metadata
-        so :class:`MsaSparseGqaFmha` can drive its whole-batch dispatch.
-        Implements :class:`~...fmha.msa_sparse_gqa.MsaSparseMetadataProtocol`.
+        so `MsaSparseGqaFmha` can drive its whole-batch dispatch.
+        Implements `MsaSparseMetadataProtocol`.
         """
 
-        # Published by the model layer's first sparse forward (on the
-        # *class*, so CUDA-graph metadata clones see it before capture).
+        # Published by the model layer's first sparse forward. Set on the
+        # class so CUDA-graph metadata clones see it before capture.
         _msa_geometry = None
 
         def __init__(self, *args, **kwargs):
@@ -131,7 +120,7 @@ def get_minimax_m3_msa_attention_backend_cls():
             self._m3_static_buffers: Optional[dict] = None
             self._msa_plan_cache = None
 
-        # -- lifecycle ---------------------------------------------------
+        # lifecycle
 
         def _cache_device(self) -> torch.device:
             kv_cache_manager = getattr(self, "kv_cache_manager", None)
@@ -185,7 +174,7 @@ def get_minimax_m3_msa_attention_backend_cls():
             )
             self.minimax_m3 = attachment
 
-        # -- internal accessors -----------------------------------------
+        # internal accessors
 
         def _require_attachment(self) -> dict:
             if self.minimax_m3 is None:
@@ -204,18 +193,18 @@ def get_minimax_m3_msa_attention_backend_cls():
             return self._require_attachment()["out_cache_loc"]
 
         def _kv_views(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-            """Per-layer NHD K/V slot views ``[num_pages, page_size, num_kv_heads, head_dim]``."""
+            """Per-layer NHD K/V slot views `[num_pages, page_size, num_kv_heads, head_dim]`."""
             buffers = self.kv_cache_manager.get_buffers(layer_idx)
             return buffers[:, 0], buffers[:, 1]
 
-        # -- MsaSparseMetadataProtocol ----------------------------------
+        # MsaSparseMetadataProtocol
 
         def msa_get_paged_kv(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
             k_view, v_view = self._kv_views(layer_idx)
             return cache_view_to_msa_paged(k_view), cache_view_to_msa_paged(v_view)
 
         def msa_idx_k_cache(self, layer_idx: int) -> torch.Tensor:
-            """Raw paged index-K view for the indexer (HND conversion done there)."""
+            """Raw paged index-K view for the indexer; HND conversion is done there."""
             return self.kv_cache_manager.get_index_k_buffer(layer_idx)
 
         def msa_write_main_kv(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor) -> None:
@@ -247,13 +236,13 @@ def get_minimax_m3_msa_attention_backend_cls():
             *,
             causal: bool,
         ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
-            # The MiniMax-M3 indexer + metadata are built over the whole
-            # batch, and fmha_sm100 handles mixed decode+prefill varlen
-            # batches in one call (decode rows are 1-token causal extends),
-            # so the FMHA runs the whole batch at once rather than splitting
-            # into per-request context / generation phases. Returning the
-            # whole-batch lengths keeps the plan's total_q consistent with
-            # the whole-batch q the model passes and the whole-batch block
+            # The indexer and metadata are built over the whole batch, and
+            # fmha_sm100 handles mixed decode/prefill varlen batches in one
+            # call (decode rows are 1-token causal extends), so the FMHA
+            # runs the whole batch at once rather than splitting into
+            # per-request context/generation phases. Returning whole-batch
+            # lengths keeps the plan's total_q consistent with the
+            # whole-batch q the model passes and the whole-batch block
             # indices the indexer produced.
             page_size = int(self._kv_views(0)[0].shape[1])
             qo_all, kv_all, qo_off_all, kv_indices_all = _whole_batch_lens(self.m3_meta, page_size)
@@ -270,9 +259,9 @@ def get_minimax_m3_msa_attention_backend_cls():
             """CUDA-graph-safe decode sparse GQA via the in-tree driver.
 
             Reuses the same geometry-keyed driver instance the indexer used
-            for proxy + block selection (``get_decode_driver`` caches by
-            ``(geometry, device)``), so the persistent buffers are shared.
-            Returns ``[num_tokens, num_q_heads * head_dim]``.
+            for proxy and block selection (`get_decode_driver` caches by
+            `(geometry, device)`), so the persistent buffers are shared.
+            Returns `[num_tokens, num_q_heads * head_dim]`.
             """
             from .decode_wrapper.dispatch import M3DecodeGeometry, get_decode_driver
 
@@ -316,7 +305,7 @@ def get_minimax_m3_msa_attention_backend_cls():
             return out.reshape(batch, geometry_cfg.num_q_heads * geometry_cfg.head_dim)
 
     class MiniMaxM3MSATrtllmAttention(TrtllmAttention):
-        """MSA-backed MiniMax-M3 sparse attention (mimics ``DSATrtllmAttention``)."""
+        """MSA-backed MiniMax-M3 sparse attention (mimics `DSATrtllmAttention`)."""
 
         Metadata = MiniMaxM3MSATrtllmAttentionMetadata
 
@@ -376,8 +365,9 @@ def get_minimax_m3_msa_attention_backend_cls():
 
         def _register_global_geometry(self) -> None:
             # Register the per-rank sparse geometry process-wide at
-            # construction (before any forward / CUDA graph capture) so every
-            # metadata instance's prepare() can pre-build the MSA plans.
+            # construction, before any forward or CUDA graph capture, so
+            # every metadata instance's prepare() can pre-build the MSA
+            # plans.
             from .msa_plan_cache import MsaPlanCacheGeometry, set_global_msa_geometry
 
             set_global_msa_geometry(
@@ -400,18 +390,18 @@ def get_minimax_m3_msa_attention_backend_cls():
             return False
 
         def create_fmha_libs(self) -> None:
-            # The MiniMax-M3 MSA layer runs its main attention exclusively
-            # through the fmha_sm100 block-sparse GQA kernel. Restrict the
-            # dispatch loop to MsaSparseGqaFmha so the standard libs
-            # (flashinfer trtllm-gen / fallback) -- which come first in the
-            # registry and would otherwise claim the request but cannot
-            # handle the M3 sparse contract (unfused q/k/v + selected block
-            # indices) -- never win.
+            # The MSA layer runs its main attention exclusively through the
+            # fmha_sm100 block-sparse GQA kernel. Restrict the dispatch loop
+            # to MsaSparseGqaFmha so the standard libs (flashinfer
+            # trtllm-gen, fallback), which come first in the registry and
+            # would otherwise claim the request but cannot handle the M3
+            # sparse contract (unfused q/k/v plus selected block indices),
+            # never win.
             from tensorrt_llm._torch.attention_backend.fmha import MsaSparseGqaFmha
 
             self.fmha_libs = [MsaSparseGqaFmha(self)]
 
-        # -- indexer entry point (called by the model layer, DSA-style) --
+        # indexer entry point (called by the model layer, DSA-style)
 
         def run_indexer(
             self,
@@ -423,9 +413,10 @@ def get_minimax_m3_msa_attention_backend_cls():
         ) -> torch.Tensor:
             """Write the index-K cache and return the selected block indices.
 
-            Mirrors DSA's ``indexer.sparse_attn_indexer``: the model layer
-            runs this before ``forward`` and threads the result through
-            ``forward_args.topk_indices``. Returns ``[total_q, num_kv_heads, topk]``.
+            Mirrors DSA's `indexer.sparse_attn_indexer`: the model layer
+            runs this before `forward` and threads the result through
+            `forward_args.topk_indices`. Returns `[total_q, num_kv_heads,
+            topk]`.
             """
             config = self.m3_config
             idx_sm_scale = (
@@ -460,7 +451,7 @@ def get_minimax_m3_msa_attention_backend_cls():
                 page_size=page_size,
             )
 
-        # -- sparse hooks (consumed by inherited TrtllmAttention.forward) --
+        # sparse hooks (consumed by inherited TrtllmAttention.forward)
 
         def sparse_attn_predict(
             self,
