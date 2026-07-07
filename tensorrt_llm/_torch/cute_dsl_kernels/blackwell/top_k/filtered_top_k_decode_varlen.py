@@ -166,6 +166,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         merge_blocks: bool = False,
         enable_dynamic_multi_cta: bool = False,
         varlen_merge_input: bool = False,
+        # TODO: dont give default value, need to get the num_sms from the device
         num_sms: int = 148,
         overflow_policy: str = "REREAD",
     ):
@@ -250,7 +251,6 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         output_indices: cute.Tensor,
         output_values: cute.Tensor,
         enable_persistent_dynamic_scheduling: cutlass.Constexpr[bool] = False,
-        min_blocks_per_mp: cutlass.Constexpr[int] = 1,
     ):
         """CuTe DSL implementation of TopK kernel based on radix-based filter algorithm."""
         griddepcontrol_wait()
@@ -547,13 +547,12 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             output_indices,
             output_values,
             enable_persistent_dynamic_scheduling,
-            # TODO: fix this issue. delete this param, Need to set it in launch parameters.
-            min_blocks_per_mp,
         ).launch(
             grid=blocks,
             block=(self.num_threads_per_cta, 1, 1),
             stream=stream,
             use_pdl=TRTLLM_ENABLE_PDL,
+            min_blocks_per_mp=min_blocks_per_mp,
         )
         return
 
@@ -602,6 +601,7 @@ def cute_dsl_topk_wrapper(
     num_rows, num_cols = input_values.shape
     bucketed_num_cols = _bucket_num_cols(num_cols)
 
+    # TODO: need to get the num_sms from the device.
     large_occupancy = num_rows > 148
     assert not load_balance
 
@@ -728,6 +728,7 @@ def cute_dsl_topk_multi_cta_wrapper(
     num_rows, num_cols = input_values.shape
     bucketed_num_cols = _bucket_num_cols(num_cols)
 
+    # TODO: need to get the num_sms from the device.
     large_occupancy = num_rows > 148
     assert not load_balance
 
