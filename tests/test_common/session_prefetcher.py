@@ -60,8 +60,8 @@ _PATCH_TARGETS = (
 # during test A must not be handed to test B if B changed ANY env var (proven
 # silent-failure class: OVERRIDE_QUANT_ALGO and other non-prefixed test knobs
 # are read inside workers) or prepended to sys.path (proven hard-failure
-# class: test_modeling_out_of_tree monkeypatches sys.path before LLM(), CI
-# build 46175 "Executor worker died during initialization" on 4 platforms).
+# class: test_modeling_out_of_tree monkeypatches sys.path before LLM(); a
+# pool spawned earlier dies during worker initialization).
 # The snapshot therefore covers the FULL environment, minus process
 # bookkeeping that legitimately drifts between tests without affecting
 # workers. A false mismatch only costs a synchronous rebuild.
@@ -199,6 +199,12 @@ def _worker_import_report_cuda() -> bool:
 
 # GPU-memory settle barrier at handover (see wait_gpu_memory_settle).
 _SETTLE_MIN_FREE_FRAC = 0.85  # "GPU is essentially free" — stop waiting
+# Below this free fraction a handover is refused outright (sync fallback):
+# flat-detection cannot distinguish "legitimately in use" from "dying worker
+# that has not started releasing yet", and handing over into a mostly-used
+# GPU just moves the OOM into the worker's model build (seen in pre-merge
+# CI). The ~50s synchronous spawn restores the natural release window.
+_SETTLE_HANDOVER_MIN_FREE_FRAC = 0.5
 _SETTLE_POLL_S = 0.5
 _SETTLE_FLAT_POLLS = 3  # consecutive non-increasing polls => memory is in use
 _SETTLE_EPSILON = 256 << 20  # free-memory delta below this counts as flat
@@ -240,15 +246,15 @@ def _visible_gpu_handles(pynvml):
     return handles
 
 
-def wait_gpu_memory_settle(timeout: float = _SETTLE_TIMEOUT_S) -> None:
+def wait_gpu_memory_settle(timeout: float = _SETTLE_TIMEOUT_S) -> bool:
     """Wait for a dying previous worker to release its GPU memory.
 
     A handed-over live pool skips the ~50s synchronous spawn that used to
     give the previous LLM's worker process time to exit: MPI pool shutdown
     returns at disconnect, but the child's CUDA memory is only released when
     the process actually exits. Building the next model into that race fails
-    with "Executor creation failed due to insufficient GPU memory" (CI build
-    46175: nemotron_h/nano_v2_vl/qwen3_lora, free 16-19 GiB at model load).
+    with "Executor creation failed due to insufficient GPU memory" while the
+    previous model's weights are still resident (seen in pre-merge CI).
 
     TODO: the deeper fix is MpiPoolSession.shutdown(wait=True) not returning
     until the spawned worker processes have exited — that would close the
@@ -260,17 +266,22 @@ def wait_gpu_memory_settle(timeout: float = _SETTLE_TIMEOUT_S) -> None:
     free memory stops increasing (memory legitimately in use — e.g. another
     fixture's live LLM), or ``timeout``. Fast no-op on an already-free GPU.
     Never raises: on any NVML problem the handover proceeds as before.
+
+    Returns False when the GPUs ended up still mostly used
+    (< _SETTLE_HANDOVER_MIN_FREE_FRAC free) — the caller must then discard
+    the prefetched pool and build synchronously rather than start a model
+    build that is likely to OOM.
     """
     try:
         import pynvml
 
         pynvml.nvmlInit()
     except Exception:
-        return
+        return True  # no NVML: hand over as before (fail-open)
     try:
         handles = _visible_gpu_handles(pynvml)
         if not handles:
-            return
+            return True  # no GPUs visible: nothing to wait for
 
         def _free_total():
             infos = [pynvml.nvmlDeviceGetMemoryInfo(h) for h in handles]
@@ -293,14 +304,17 @@ def wait_gpu_memory_settle(timeout: float = _SETTLE_TIMEOUT_S) -> None:
             prev = free
             time.sleep(_SETTLE_POLL_S)
         waited = time.monotonic() - t0
+        min_free_frac = min(f / t for f, t in zip(free, total))
         if waited >= _SETTLE_POLL_S:
             print(
                 f"[session-prefetch] waited {waited:.1f}s before handover for GPU "
-                f"memory release (free {min(f / t for f, t in zip(free, total)):.0%})",
+                f"memory release (free {min_free_frac:.0%})",
                 flush=True,
             )
+        return min_free_frac >= _SETTLE_HANDOVER_MIN_FREE_FRAC
     except Exception as e:
         print(f"[session-prefetch] GPU settle check skipped: {e}", flush=True)
+        return True  # fail-open: behave as before the barrier existed
     finally:
         try:
             pynvml.nvmlShutdown()
@@ -452,7 +466,7 @@ class SessionPrefetcher:
         # Read _thread under the lock: schedule_shadow() assigns-then-starts
         # inside its critical section, and an unlocked read here can observe
         # the assigned-but-not-yet-started thread ("cannot join thread before
-        # it is started", CI build 46175, tests creating LLMs concurrently).
+        # it is started" when a test creates LLMs concurrently).
         with self._lock:
             thread = self._thread
         if thread is not None:
@@ -480,11 +494,19 @@ class SessionPrefetcher:
             # An instant handover skips the ~50s synchronous spawn that used
             # to give the PREVIOUS LLM's worker time to exit and release its
             # GPU memory; don't start the next model build into that race.
-            wait_gpu_memory_settle()
-            print(f"[session-prefetch] handing over prefetched {spec}-worker pool", flush=True)
-            return built.session
+            if wait_gpu_memory_settle():
+                print(f"[session-prefetch] handing over prefetched {spec}-worker pool", flush=True)
+                return built.session
+            # GPUs still mostly used after the wait: a handed-over build
+            # would likely OOM. The sync fallback's ~50s spawn restores the
+            # natural release window.
+            print(
+                "[session-prefetch] GPU memory still mostly used: discarding "
+                "prefetched pool, building synchronously",
+                flush=True,
+            )
         # Spec/env/sys.path mismatch (test skipped, reordered, or changed
-        # state the frozen workers would not see): discard, build sync.
+        # state the frozen workers would not see) or busy GPU: discard.
         threading.Thread(
             target=built.session.shutdown, daemon=True, name="session-prefetch-discard"
         ).start()
