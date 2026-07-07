@@ -89,7 +89,7 @@ def test_metadata_cache_geometry_comes_from_sparse_metadata_params():
     metadata.create_buffers_for_indexer = Mock()
 
     with patch(
-        "tensorrt_llm._torch.attention_backend.sparse.dsa.TrtllmAttentionMetadata.__post_init__"
+        "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.TrtllmAttentionMetadata.__post_init__"
     ):
         DSAtrtllmAttentionMetadata.__post_init__(metadata)
 

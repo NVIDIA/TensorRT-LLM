@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""DeepSeek-V4-specific hooks for the shared MLA module."""
+"""DeepSeek-V4 module-side implementation for the shared MLA module."""
 
 import os
 from typing import Optional
@@ -9,7 +9,7 @@ from typing import Optional
 import torch
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
-from tensorrt_llm._torch.attention_backend.sparse.mla import (
+from tensorrt_llm._torch.attention_backend.sparse.module import (
     forward_context_sparse_mla,
     forward_generation_sparse_mla,
 )
@@ -125,9 +125,7 @@ def deepseek_v4_q_b_layernorm(self, q: torch.Tensor) -> torch.Tensor:
     )
 
 
-def should_use_dsv4_epilogue_fusion(
-    self, num_contexts: int, num_generations: int
-) -> bool:
+def should_use_dsv4_epilogue_fusion(self, num_contexts: int, num_generations: int) -> bool:
     if self._disable_dsv4_epilogue_fusion:
         return False
     if not self.is_deepseek_v4:
@@ -197,7 +195,7 @@ def validate_dsv4_epilogue_buffers(
     return fp8_o, output_sf
 
 
-def deepseek_v4_o_proj(
+def project_sparse_mla_output(
     self,
     attn_out_latent: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     position_ids: Optional[torch.Tensor] = None,
@@ -299,7 +297,7 @@ def deepseek_v4_o_proj(
     return output
 
 
-def forward_impl_with_deepseek_v4(
+def forward_sparse_mla(
     self,
     position_ids: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
@@ -328,9 +326,7 @@ def forward_impl_with_deepseek_v4(
     num_tokens = attn_metadata.num_tokens
     enable_dsv4_epilogue_fusion = dsv4_epilogue_output is not None
     if enable_dsv4_epilogue_fusion and ((num_contexts > 0) == (num_generations > 0)):
-        raise RuntimeError(
-            "DSv4 epilogue fusion requires a context-only or generation-only batch."
-        )
+        raise RuntimeError("DSv4 epilogue fusion requires a context-only or generation-only batch.")
 
     hidden_states = hidden_states[:num_tokens, ...]
     if position_ids is not None:

@@ -32,7 +32,7 @@ from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
     DeepseekV4CacheManager, make_deepseek_v4_sparse_metadata_params)
 from tensorrt_llm._torch.attention_backend.sparse.dsa import (HAS_FAST_HADAMARD,
                                                               DSACacheManager)
-from tensorrt_llm._torch.attention_backend.sparse.mla import (
+from tensorrt_llm._torch.attention_backend.sparse.module import (
     forward_context_sparse_mla, forward_generation_sparse_mla)
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -1920,7 +1920,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
     if num_layers > 1:
         print(f"  Testing layer {layer_idx} of {num_layers} (multi-layer pool)")
     else:
-        print(f"  Testing single layer (baseline)")
+        print("  Testing single layer (baseline)")
 
     # For deepseek_v4: derive freqs_cis from the production RotaryEmbedding to
     # guarantee matching frequencies (the reference precompute_freqs_cis may
@@ -2013,7 +2013,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
 
     # Allocate and pre-populate KV cache in batch order [context...][generation...]
 
-    print(f"  Allocating and pre-populating cache...")
+    print("  Allocating and pre-populating cache...")
 
     # Allocate context requests first
     for req_idx in ctx_indices:
@@ -2065,7 +2065,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
         raise ValueError(
             f"Invalid sparse attention algorithm: {sparse_attn_algo}")
 
-    print(f"  ✓ KV cache allocated and pre-populated")
+    print("  ✓ KV cache allocated and pre-populated")
 
     # Generate inputs directly in batch order [context...][generation...]
     batch_order = ctx_indices + gen_indices
@@ -2363,7 +2363,7 @@ def test_forward_sparse_mla_unified_fused_q_fp8(monkeypatch, batch_name):
     monkeypatch.setenv("TRTLLM_DISABLE_FUSED_Q_FP8_QUANT", "0")
 
     from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import \
-        module as deepseek_v4_module
+        mla_module as deepseek_v4_module
 
     original_fwd = deepseek_v4_module.forward_context_sparse_mla
 

@@ -45,8 +45,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
-from .compressor import KVCacheDtype
-from .deepseek_v4 import (
+from .backend import (
     DEEPSEEK_V4_NON_SLIDING_ATTENTION,
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DEEPSEEK_V4_SPARSE_RATIO,
@@ -56,6 +55,7 @@ from .deepseek_v4 import (
     get_token_bytes,
     is_overlap_compressor,
 )
+from .compressor import KVCacheDtype
 
 
 def _estimate_non_sliding_attn_size_per_token(

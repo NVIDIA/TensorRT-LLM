@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""DSA-specific hooks for the shared MLA module."""
+"""DSA module-side implementation for the shared MLA module."""
 
 from typing import List, Optional
 
@@ -9,7 +9,7 @@ import torch
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
-from tensorrt_llm._torch.utils import is_torch_compiling
+from tensorrt_llm._torch.utils import Fp4QuantizedTensor, is_torch_compiling
 from tensorrt_llm._utils import get_sm_version, nvtx_range, nvtx_range_debug
 from tensorrt_llm.logger import logger
 
@@ -29,18 +29,18 @@ def _fp8_block_scaling_bmm_out(*args, **kwargs):
 
 
 def _forward_context_sparse_mla(*args, **kwargs):
-    from ..mla import forward_context_sparse_mla
+    from ..module import forward_context_sparse_mla
 
     return forward_context_sparse_mla(*args, **kwargs)
 
 
 def _forward_generation_sparse_mla(*args, **kwargs):
-    from ..mla import forward_generation_sparse_mla
+    from ..module import forward_generation_sparse_mla
 
     return forward_generation_sparse_mla(*args, **kwargs)
 
 
-def forward_impl_with_dsa(
+def forward_sparse_mla(
     self,
     position_ids: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
@@ -72,6 +72,41 @@ def forward_impl_with_dsa(
         indexer_intermediates,
         position_ids,
         attn_metadata,
+        output,
+    )
+
+
+def forward_sparse_mla_custom_op(
+    self,
+    hidden_states: torch.Tensor,
+    position_ids: Optional[torch.Tensor],
+    output: torch.Tensor,
+) -> None:
+    """Run DSA's two-stage custom ops for piecewise CUDA graph capture."""
+    from . import custom_ops  # noqa: F401
+
+    if isinstance(hidden_states, Fp4QuantizedTensor):
+        proj_outputs = torch.ops.trtllm.mla_dsa_proj(
+            hidden_states.unquantized_hidden_states,
+            position_ids,
+            self.layer_idx_str,
+            hidden_states.fp4_tensor,
+            hidden_states.scaling_factor,
+        )
+    else:
+        proj_outputs = torch.ops.trtllm.mla_dsa_proj(
+            hidden_states, position_ids, self.layer_idx_str
+        )
+    q, compressed_kv, k_pe, latent_cache = proj_outputs[:4]
+    indexer_intermediates = proj_outputs[4:]
+    torch.ops.trtllm.mla_dsa_attn_inplace(
+        q,
+        compressed_kv,
+        k_pe,
+        latent_cache,
+        indexer_intermediates,
+        position_ids,
+        self.layer_idx_str,
         output,
     )
 

@@ -27,7 +27,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import (
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.backend import (
     DeepseekV4AttentionType,
     get_token_bytes,
 )

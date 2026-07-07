@@ -9,7 +9,7 @@ import torch
 
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 
-from .mla_backend import forward_dsa_attn, forward_dsa_proj
+from .mla_module import forward_dsa_attn, forward_dsa_proj
 
 
 def _extract_extra_attrs(layer_idx: str):
