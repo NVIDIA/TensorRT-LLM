@@ -88,33 +88,18 @@ void mhcFusedHcOp(torch::Tensor x_prev, torch::Tensor residual_prev, torch::Tens
 
     TORCH_CHECK(x_prev.dtype() == torch::kBFloat16, "mhc_fused_hc: x_prev must be bfloat16");
     TORCH_CHECK(x_prev.is_contiguous(), "mhc_fused_hc: x_prev must be contiguous");
-    TORCH_CHECK(
-        x_num_splits >= 1 && x_num_splits <= 16, "mhc_fused_hc: x_num_splits must be in [1, 16], got ", x_num_splits);
+    TORCH_CHECK(x_num_splits == 1 || x_num_splits == 2 || x_num_splits == 4,
+        "mhc_fused_hc: x_num_splits must be 1, 2, or 4, got ", x_num_splits);
     TORCH_CHECK(x_prev.dim() == 2 && x_prev.size(0) == x_num_splits * M && x_prev.size(1) == hidden_size,
         "mhc_fused_hc: x_prev must have shape [x_num_splits * M, hidden_size]");
 
     auto const* x_prev_ptr = reinterpret_cast<__nv_bfloat16 const*>(x_prev.data_ptr<at::BFloat16>());
-    // The half-MMA backend streams XS=2/4 partials through its pmap x-ring;
-    // half-FMA sums them in registers at its existing vector x-load. The
-    // all-in-one backends use the common entry reduction below.
-    bool const fuse_x_reduction = (backend == 0 || backend == 1) && (x_num_splits == 2 || x_num_splits == 4);
-    if (x_num_splits > 1 && !fuse_x_reduction)
-    {
-        TORCH_CHECK(layer_input_cur.dtype() == torch::kBFloat16 && layer_input_cur.is_contiguous(),
-            "mhc_fused_hc: layer_input_cur must be contiguous bfloat16");
-        TORCH_CHECK(layer_input_cur.numel() == M * hidden_size,
-            "mhc_fused_hc: layer_input_cur has the wrong size for split-x reduction");
-        auto* reduced_x = reinterpret_cast<__nv_bfloat16*>(layer_input_cur.data_ptr<at::BFloat16>());
-        tk::mhcReduceSplitXLaunch(x_prev_ptr, reduced_x, static_cast<int>(M), static_cast<int>(hidden_size),
-            static_cast<int>(x_num_splits), stream);
-        x_prev_ptr = reduced_x;
-    }
+    // Half-MMA uses an x-ring; half-FMA reduces in registers.
+    bool const fuse_x_reduction = x_num_splits > 1;
+    TORCH_CHECK(!fuse_x_reduction || backend == 0 || backend == 1,
+        "mhc_fused_hc: split x is supported only by fused_half_mma/fma");
 
-    // Fused next-layer RMSNorm on layer_input_cur. All four backends (Path B/D
-    // for MMA and Path E/F for FMA) support it now: Path B/E fuse the norm into
-    // the bigfuse kernel's Phase 2 layer_input write; Path D/F fuse it into the
-    // single-kernel Phase 4 epilogue. When norm_weight is null, layer_input is
-    // left un-normalized (caller must run RMSNorm separately).
+    // A null norm_weight leaves layer_input_cur unnormalized.
     __nv_bfloat16 const* norm_weight_ptr = nullptr;
     if (norm_weight.has_value() && norm_weight->defined())
     {

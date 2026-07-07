@@ -65,26 +65,18 @@ def ceil_to_ue8m0_device(
     loc=None,
     ip=None,
 ) -> cutlass.Float32:
-    """Compute ceil_to_ue8m0(amax_f32): round amax_f32 up to the nearest
-    power-of-2 representable as a UE8M0 float (mantissa=0, exponent-only).
-
-    Contract (matches deep_gemm.utils.math.ceil_to_ue8m0):
-      bits = amax.view(int32)
-      exp  = ((bits >> 23) & 0xFF) + (1 if (bits & 0x7FFFFF) != 0 else 0)
-      exp  = clamp(exp, 1, 254)
-      return (exp << 23).view(float32)
-    """
+    """Round an FP32 scale up to UE8M0."""
     i32_ty = cutlass.Int32.mlir_type
     f32_ty = cutlass.Float32.mlir_type
     bits = cutlass.Int32(
         llvm.bitcast(i32_ty, cutlass.Float32(amax_f32).ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
     )
     exp = (bits >> cutlass.Int32(23)) & cutlass.Int32(0xFF)
-    # Branchless "mantissa != 0 ? 1 : 0": (mantissa + 0x7FFFFF) >> 23.
+    # A nonzero mantissa rounds the exponent up.
     mantissa = bits & cutlass.Int32(0x7FFFFF)
     mantissa_nonzero = (mantissa + cutlass.Int32(0x7FFFFF)) >> cutlass.Int32(23)
     exp = exp + mantissa_nonzero
-    # clamp to [1, 254] via PTX max/min.
+    # Clamp away zero and reserved exponents.
     exp = cutlass.Int32(
         llvm.inline_asm(
             i32_ty,
@@ -119,11 +111,7 @@ def stg_u8_raw(
     loc=None,
     ip=None,
 ) -> None:
-    """``st.global.u8 [addr], value;`` — write one byte to a global memory address.
-
-    :param addr: Complete 64-bit byte address (already includes offset).
-    :param value: Byte value as Int32 (low 8 bits written).
-    """
+    """Store the low byte of value to a global address."""
     from cutlass._mlir.dialects import llvm as _llvm
 
     _llvm.inline_asm(
@@ -478,9 +466,7 @@ class Sm100BlockwiseGemmKernel:
             self.smem_reserve_bytes,
         )
         if self.fp8_smem_epi_mode:
-            # Reserve one 32-KiB A/B stage for a full 128x128 BF16 epilogue
-            # tile. The quantization pass consumes this staging tile with a
-            # different thread/value layout after TMEM has been released.
+            # Trade one A/B stage for the BF16 epilogue tile.
             self.num_ab_stage -= 1
 
         # Compute A/B/C/Scale shared memory layout
@@ -601,7 +587,7 @@ class Sm100BlockwiseGemmKernel:
         self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
         self.c_layout = utils.LayoutEnum.from_tensor(c)
 
-        # A Python bool used by setup and kernel const_expr branches.
+        # Select the FP8 epilogue at trace time.
         self.fp8_sf_mode = sf_out_tensor is not None
         self.fp8_smem_epi_mode = self.fp8_sf_mode and use_fp8_smem_epilogue
         self.fp8_smem_row_iters = fp8_smem_row_iters
@@ -732,7 +718,7 @@ class Sm100BlockwiseGemmKernel:
                 ],
                 self.buffer_align_bytes,
             ]
-            # Full 128x128 BF16 staging tile for the FP8-output epilogue.
+            # BF16 staging for cooperative FP8 quantization.
             sEpiBf16: cute.struct.Align[
                 cute.struct.MemRange[cutlass.BFloat16, fp8_bf16_smem_size],
                 self.buffer_align_bytes,
@@ -760,8 +746,7 @@ class Sm100BlockwiseGemmKernel:
 
         self.shared_storage = SharedStorage
 
-        # Guard: FP8+SF mode <=> c_dtype==Float8E4M3FN (compile-time const_expr, which
-        # lets @cute.jit raise on a misconfigured pairing).
+        # FP8 output always requires a scale buffer.
         if cutlass.const_expr(self.fp8_sf_mode and self.c_dtype is not cutlass.Float8E4M3FN):
             raise ValueError(
                 f"fp8+SF mode requires c_dtype=Float8E4M3FN, got {self.c_dtype}. "
@@ -773,8 +758,7 @@ class Sm100BlockwiseGemmKernel:
                 "Direct fp8 output without a scale-factor buffer is not supported."
             )
 
-        # Guard: FP8+SF mode only supports the layout the warp*32+lane row mapping
-        # assumes — single-CTA, (128,128) tile, 4 epilogue warps.
+        # The FP8 lane mapping is fixed to one 128x128 CTA tile.
         if cutlass.const_expr(self.fp8_sf_mode and self.use_2cta_instrs):
             raise ValueError(
                 "fp8+SF mode does not support use_2cta_instrs=True. "
@@ -794,9 +778,7 @@ class Sm100BlockwiseGemmKernel:
                 f"fp8+SF mode requires exactly 4 epilogue warps, got {len(self.epilog_warp_id)}."
             )
 
-        # Pass sf_out_tensor directly; the kernel extracts the base address via
-        # .iterator.toint() (Int64 from a tensor pointer passes correctly through the
-        # CuTe DSL launch). BF16 mode passes None, disabling the fp8 branch.
+        # Keep the scale pointer as a tensor for CuTe ABI compatibility.
         kernel_sf_out_tensor = sf_out_tensor
         kernel_sf_aligned_mn = cutlass.Int32(sf_aligned_mn)
         kernel_n_tiles_per_group = cutlass.Int32(n_tiles_per_group)
@@ -868,8 +850,7 @@ class Sm100BlockwiseGemmKernel:
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
         lane_idx = cute.arch.lane_idx()
-        # FP8+SF mode: sf_out base address from the tensor iterator (a tensor pointer
-        # passes the 64-bit address correctly through the CuTe DSL launch).
+        # Recover the scale address from the tensor iterator.
         if cutlass.const_expr(self.fp8_sf_mode):
             sf_out_addr = mSfOut.iterator.toint()
 
@@ -2019,45 +2000,28 @@ class Sm100BlockwiseGemmKernel:
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
 
                 if cutlass.const_expr(self.fp8_sf_mode and not self.fp8_smem_epi_mode):
-                    # ---- FP8 + SF epilogue (single-pass) ----
-                    # One TMEM drain: load each subtile once, cache bf16 values in
-                    # registers, compute per-row amax, write SF, then quantize from the
-                    # cached bf16 (no second TMEM load). Each epilogue thread owns
-                    # exactly ONE M-row across all subtiles (Ld32x32bOp, 4 warps,
-                    # 128x128 tile, epi_tile_n=32 => 4 subtiles x 32 fp32 = one M-row).
-                    # bf16-packed register cache (2 bf16/reg) keeps the budget < 255.
-
-                    # Step 1: TMEM drain + cache bf16 + compute amax.
+                    # Register FP8 epilogue: one thread owns one M row.
                     _num_elems_per_subtile = cute.size(tTR_rAcc.shape)
-                    # The per-subtile amax tree below is HARD-CODED to 5 levels
-                    # (32->16->8->4->2->1), correct ONLY for 32 elems/subtile. A runtime
-                    # guard is impossible (@cute.kernel forbids `raise`); the __call__
-                    # config guards ((128,128)/1-CTA/4-warp) pin this shape — if the
-                    # epilogue tiling changes, the tree depth here must be updated.
+                    # Five levels reduce the fixed 32-value subtile.
                     _total_elems = subtile_cnt * _num_elems_per_subtile
                     acc_saved_bf16 = cute.make_rmem_tensor((_total_elems,), cutlass.BFloat16)
 
-                    # amax via max.NaN.f32 inline PTX (1 op vs arith.maximumf's 4),
-                    # tree-reduced at trace time through Python list comprehensions so
-                    # the emitted PTX is a balanced binary tree (depth ~9 vs a 512-deep
-                    # serial chain), with no runtime DSL control flow. Logic is inlined:
-                    # CuTe DSL can't call closures from inside compiled range() loops.
+                    # Emit the balanced max tree during tracing.
                     _f32t = cutlass.Float32.mlir_type
 
                     thread_amax = cutlass.Float32(0.0)
                     for subtile_idx in cutlass.range(subtile_cnt):
                         tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
                         cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
-                        # retile to get fp32 values
+                        # Retile one TMEM subtile for reduction.
                         acc_fp32 = tiled_copy_r2s.retile(tTR_rAcc).load()
                         num_elems = cute.size(acc_fp32.shape)
                         base = subtile_idx * num_elems
-                        # Collect abs values (range_constexpr unrolls at trace time
-                        # -> _subtile_abs is a Python list of Float32 DSL values).
+                        # Trace-time list construction fully unrolls the tree.
                         _subtile_abs = []
                         for ei in cutlass.range_constexpr(num_elems):
                             val_bf16 = cutlass.BFloat16(acc_fp32[ei])
-                            # Save bf16 value for quantization pass (no second TMEM load)
+                            # Cache BF16 to avoid a second TMEM load.
                             acc_saved_bf16[base + ei] = val_bf16
                             val_f32 = cutlass.Float32(val_bf16)
                             _subtile_abs.append(
@@ -2071,8 +2035,7 @@ class Sm100BlockwiseGemmKernel:
                                     )
                                 )
                             )
-                        # 5-level balanced tree (32->16->8->4->2->1, all even, no tail)
-                        # via list comprehensions: runs at trace time, emits max.NaN.f32.
+                        # Reduce 32 values to one amax.
                         _lvl = _subtile_abs
                         _lvl = [
                             cutlass.Float32(
@@ -2134,9 +2097,8 @@ class Sm100BlockwiseGemmKernel:
                             )
                             for _k in range(0, len(_lvl), 2)
                         ]
-                        # After 5 levels: 32 → 16 → 8 → 4 → 2 → 1
                         subtile_max = _lvl[0]
-                        # Merge per-subtile max into running thread_amax (1 op)
+                        # Merge the four N subtiles.
                         thread_amax = cutlass.Float32(
                             llvm.inline_asm(
                                 _f32t,
@@ -2147,36 +2109,26 @@ class Sm100BlockwiseGemmKernel:
                             )
                         )
 
-                    # Clamp amax to [1e-4, inf) before dividing by 448
+                    # Avoid zero UE8M0 scales.
                     thread_amax = cutlass.max(thread_amax, cutlass.Float32(1e-4))
                     sf_fp32 = ceil_to_ue8m0_device(thread_amax / cutlass.Float32(448.0))
 
-                    # Compute UE8M0 byte = (sf_bits >> 23) & 0xFF (kept as Int32)
+                    # UE8M0 stores only the exponent byte.
                     i32_ty = cutlass.Int32.mlir_type
                     sf_bits = cutlass.Int32(llvm.bitcast(i32_ty, sf_fp32.ir_value()))
                     ue8m0_byte_i32 = (sf_bits >> cutlass.Int32(23)) & cutlass.Int32(0xFF)
 
-                    # Global M-row / kblock for the sf byte offset: each epilogue warp
-                    # owns 32 consecutive M-rows (lane_idx = M-offset within warp);
-                    # coord[0] = tile-M-index, coord[1] = N-tile = kblock
-                    # (scale_granularity_n=128=tile_n, one kblock per tile).
+                    # Map each epilogue lane to one global M row.
                     epi_warp_local = warp_idx - cutlass.Int32(self.epilog_warp_id[0])
                     local_m = epi_warp_local * cutlass.Int32(32) + lane_idx
                     global_m = (
                         mma_tile_coord_mnl[0] * cutlass.Int32(self.cta_tile_shape_mnk[0]) + local_m
                     )
-                    # global_kblock indexes the FLATTENED kblock space across groups:
-                    # D=[L,M,N] is transposed to o_lora=[M,L*N], so global_kblock =
-                    # group * n_tiles_per_group + n_local_tile (coord[2]=group,
-                    # coord[1]=N-tile within group). Missing the group term was a
-                    # multi-group bug (G>1 wrote every group's sf to group 0's slot).
+                    # Flatten group and N tile into the scale K block.
                     global_kblock = (
                         mma_tile_coord_mnl[2] * n_tiles_per_group + mma_tile_coord_mnl[1]
                     )
-                    # Tail guard: predicate on global_m < M to skip OOB stores for
-                    # small/tail M (e.g. M=4 leaves rows 4..127 of the tile unmapped).
-                    # The amax scan above is harmless unconditionally; only the store
-                    # must be guarded.
+                    # Only the scale store needs an M-tail guard.
                     runtime_m = cutlass.Int32(mC_mnl.shape[0])
                     if global_m < runtime_m:
                         col = global_kblock >> cutlass.Int32(2)
@@ -2188,10 +2140,9 @@ class Sm100BlockwiseGemmKernel:
                         )
                         stg_u8_raw(sf_out_addr + cutlass.Int64(byte_offset), ue8m0_byte_i32)
 
-                    # Step 2: quantize from cached bf16 registers (NO second TMEM load).
+                    # Quantize from the cached BF16 row.
                     sf_rcp = cutlass.Float32(1.0) / sf_fp32
                     for subtile_idx in cutlass.range(subtile_cnt):
-                        # Read bf16 values from register cache and scale to fp8.
                         num_elems = _num_elems_per_subtile
                         base = subtile_idx * num_elems
                         acc_scaled = cute.make_rmem_tensor((num_elems,), cutlass.Float32)
@@ -2201,9 +2152,7 @@ class Sm100BlockwiseGemmKernel:
 
                         tRS_rC.store(acc_scaled.load().to(self.c_dtype))
 
-                        #
-                        # Store C (fp8) to shared memory and then TMA to global
-                        #
+                        # Stage FP8 output for TMA.
                         num_prev_subtiles = num_prev_subtiles + 1
                         c_buffer = num_prev_subtiles % self.num_c_stage
                         cute.copy(
@@ -2225,10 +2174,7 @@ class Sm100BlockwiseGemmKernel:
                         self.epilog_sync_barrier.arrive_and_wait()
 
                 elif cutlass.const_expr(self.fp8_smem_epi_mode):
-                    # ---- BF16 SMEM staging + 8-lane/row FP8 quantization ----
-                    # Drain all four 128x32 subtiles first. This preserves the BF16
-                    # quantization boundary while allowing the TMEM buffer to be
-                    # released before the cooperative quantization pass.
+                    # Drain TMEM before cooperative FP8 quantization.
                     for subtile_idx in cutlass.range(subtile_cnt):
                         tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
                         cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
@@ -2245,9 +2191,7 @@ class Sm100BlockwiseGemmKernel:
                     epi_pipeline.consumer_release(epi_consumer_state)
                     epi_consumer_state.advance()
 
-                    # The cooperative pass materializes all four FP8 subtiles before
-                    # issuing TMA stores. Drain stores from the previous persistent
-                    # tile before reusing their circular SMEM stages.
+                    # Finish prior TMA stores before reusing SMEM stages.
                     c_pipeline.producer_tail()
                     self.epilog_sync_barrier.arrive_and_wait()
 
@@ -2286,9 +2230,7 @@ class Sm100BlockwiseGemmKernel:
                         lane_in_group & cutlass.Int32(1)
                     )
 
-                    # Four epilogue warps provide 16 independent 8-lane
-                    # subgroups. The host specializes the number of iterations
-                    # for the runtime M; output TMA predicates tail rows.
+                    # Four warps form 16 independent 8-lane row groups.
                     tile_m_offset = mma_tile_coord_mnl[0] * cutlass.Int32(
                         self.cta_tile_shape_mnk[0]
                     )
@@ -2393,24 +2335,17 @@ class Sm100BlockwiseGemmKernel:
                         self.epilog_sync_barrier.arrive_and_wait()
 
                 else:
-                    # ---- BF16 epilogue (original path, byte-identical) ----
+                    # Standard BF16 epilogue.
                     for subtile_idx in cutlass.range(subtile_cnt):
-                        #
-                        # Load accumulator from tensor memory buffer to register
-                        #
+                        # Load and convert one accumulator subtile.
                         tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
                         cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
 
-                        #
-                        # Convert to C type
-                        #
                         acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
                         acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
                         tRS_rC.store(acc_vec)
 
-                        #
-                        # Store C to shared memory
-                        #
+                        # Stage output for TMA.
                         num_prev_subtiles = num_prev_subtiles + 1
                         c_buffer = num_prev_subtiles % self.num_c_stage
                         cute.copy(
@@ -2418,20 +2353,17 @@ class Sm100BlockwiseGemmKernel:
                             tRS_rC,
                             tRS_sC[(None, None, None, c_buffer)],
                         )
-                        # Fence and barrier to make sure shared memory store is visible to TMA store
+                        # Publish SMEM before TMA.
                         cute.arch.fence_view_async_shared()
                         self.epilog_sync_barrier.arrive_and_wait()
 
-                        #
-                        # TMA store C to global memory
-                        #
                         if warp_idx == self.epilog_warp_id[0]:
                             cute.copy(
                                 tma_atom_c,
                                 bSG_sC[(None, c_buffer)],
                                 bSG_gC[(None, subtile_idx)],
                             )
-                            # Fence and barrier to make sure shared memory store is visible to TMA store
+                            # Commit before reusing this stage.
                             c_pipeline.producer_commit()
                             c_pipeline.producer_acquire()
                         self.epilog_sync_barrier.arrive_and_wait()
@@ -3224,20 +3156,7 @@ class Sm100BlockwiseGemmKernel:
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
-        """Run split-K as a strided batched GEMM over packed UE8M0 scales.
-
-        The existing device kernel already schedules the third tensor mode as
-        an independent batch.  Expose each K slice as one batch entry while
-        retaining the original row strides of A and B.  The output tensor is a
-        ``(M, N, num_splits)`` view of split-major ``[num_splits, M, N]``
-        storage, so every split writes directly to the layout consumed by mHC.
-
-        SFA/SFB store four consecutive 1x128 UE8M0 scale bytes in each int32.
-        A hierarchical K layout describes those bytes without unpacking them:
-        ``(4, K/512)`` with strides ``(1, 4*k_stride)``.  SFB is replicated for
-        every N row by the DeepGEMM-compatible transform, so this wrapper takes
-        the first row of each 128-row scale block.
-        """
+        """Map K splits to batches over packed UE8M0 scales."""
         k_per_split = k // num_splits
         packed_k_per_split = k_per_split // 512
 
@@ -3267,6 +3186,7 @@ class Sm100BlockwiseGemmKernel:
                 ),
             ),
         )
+        # SFB stores one packed scale row per 128 output rows.
         sfb_tensor = cute.make_tensor(
             b_sf_ptr,
             layout=cute.make_layout(
@@ -3311,15 +3231,8 @@ class Sm100BlockwiseGemmKernel:
         fp8_smem_row_iters=1,
         use_fp8_smem_epilogue=False,
     ):
-        """Like wrapper but also passes sf_out pointer for the FP8+SF epilogue path.
-
-        BUG3 guard (Python-level, before JIT trace): when sf_out_ptr is not None
-        (fp8+SF mode), n_tiles_per_group MUST be a positive integer supplied by
-        the caller as ceil_div(per_group_N, BLOCK_N). Leaving it at 0 silently
-        corrupts multi-group scale-factor output (all groups write to the same
-        kblock columns). This check runs outside @cute.jit where Python ints are
-        freely comparable.
-        """
+        """Validate FP8 scale indexing before JIT tracing."""
+        # Zero aliases every group to the first scale block.
         if sf_out_ptr is not None and n_tiles_per_group <= 0:
             raise ValueError(
                 "wrapper_fp8sf: n_tiles_per_group must be a positive integer "
@@ -3397,8 +3310,7 @@ class Sm100BlockwiseGemmKernel:
             b_sf_ptr,
             layout=cute.make_ordered_layout((sf_n, sf_k, batch_size), order=(1, 0, 2)),
         )
-        # Build a 1-element tensor from sf_out_ptr to carry the 64-bit address
-        # into the kernel via CuTe DSL's pointer mechanism (avoids Int64 param issues).
+        # Carry the scale address through CuTe's tensor ABI.
         if cutlass.const_expr(sf_out_ptr is not None):
             sf_out_tensor_arg = cute.make_tensor(sf_out_ptr, cute.make_layout(1))
         else:

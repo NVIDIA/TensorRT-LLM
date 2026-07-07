@@ -117,9 +117,7 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_ksplit(__nv_bfloat16 
     // contiguous positions per step; stride BLOCK_SIZE*BF16_VEC.
     for (int h = h_start + tid * BF16_VEC; h < h_end; h += BLOCK_SIZE * BF16_VEC)
     {
-        // Load split-major x[split, token, h:h+BF16_VEC) and reduce the O_b
-        // partials in FP32 before applying pmap. Vector width depends on
-        // BF16_VEC; X_NUM_SPLITS=1 compiles to the original single load.
+        // Reduce split-major O_b partials before pmap.
         float xf[BF16_VEC] = {};
 #pragma unroll
         for (int xs = 0; xs < X_NUM_SPLITS; ++xs)

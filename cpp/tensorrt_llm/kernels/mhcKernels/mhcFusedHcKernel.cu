@@ -91,66 +91,7 @@ inline void fhcZeroWorkspaces(float* y_acc, uint32_t y_elems, float* r_acc, uint
         y_acc, y_elems, r_acc, r_elems, done_counter, done_elems);
 }
 
-// O_b split-K emits BF16 partials in split-major layout. Each thread reduces
-// one 16-byte vector, keeping all eight lanes in FP32 until the final store.
-__global__ void fhcReduceSplitXKernel(
-    uint4 const* __restrict__ partials, uint4* __restrict__ reduced, uint32_t vectors_per_split, int num_splits)
-{
-    uint32_t const tid = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t const stride = gridDim.x * blockDim.x;
-    for (uint32_t vector_idx = tid; vector_idx < vectors_per_split; vector_idx += stride)
-    {
-        float2 accum[4] = {
-            make_float2(0.0f, 0.0f),
-            make_float2(0.0f, 0.0f),
-            make_float2(0.0f, 0.0f),
-            make_float2(0.0f, 0.0f),
-        };
-        for (int split = 0; split < num_splits; ++split)
-        {
-            uint4 const raw = __ldg(&partials[static_cast<uint64_t>(split) * vectors_per_split + vector_idx]);
-            auto const* pairs = reinterpret_cast<__nv_bfloat162 const*>(&raw);
-#pragma unroll
-            for (int pair = 0; pair < 4; ++pair)
-            {
-                float2 const value = __bfloat1622float2(pairs[pair]);
-                accum[pair].x += value.x;
-                accum[pair].y += value.y;
-            }
-        }
-
-        uint4 packed;
-        auto* pairs = reinterpret_cast<__nv_bfloat162*>(&packed);
-#pragma unroll
-        for (int pair = 0; pair < 4; ++pair)
-        {
-            pairs[pair] = __float22bfloat162_rn(accum[pair]);
-        }
-        reduced[vector_idx] = packed;
-    }
-}
-
 } // namespace
-
-void mhcReduceSplitXLaunch(
-    __nv_bfloat16 const* partials, __nv_bfloat16* reduced, int M, int hidden_size, int num_splits, cudaStream_t stream)
-{
-    TLLM_CHECK_WITH_INFO(partials != nullptr && reduced != nullptr, "split-x reduction received a null pointer");
-    TLLM_CHECK_WITH_INFO(M > 0 && hidden_size > 0, "split-x reduction requires positive M and hidden_size");
-    TLLM_CHECK_WITH_INFO(
-        num_splits > 1 && num_splits <= 16, "split-x reduction supports num_splits in [2, 16], got %d", num_splits);
-    TLLM_CHECK_WITH_INFO(
-        hidden_size % 8 == 0, "split-x reduction requires hidden_size divisible by 8, got %d", hidden_size);
-
-    uint64_t const elements = static_cast<uint64_t>(M) * static_cast<uint64_t>(hidden_size);
-    uint64_t const vectors64 = elements / 8;
-    TLLM_CHECK_WITH_INFO(vectors64 <= UINT32_MAX, "split-x reduction tensor is too large");
-    uint32_t const vectors = static_cast<uint32_t>(vectors64);
-    constexpr uint32_t kBlock = 256;
-    uint32_t const blocks = min(static_cast<uint32_t>((vectors + kBlock - 1) / kBlock), 148u * 8u);
-    fhcReduceSplitXKernel<<<blocks, kBlock, 0, stream>>>(
-        reinterpret_cast<uint4 const*>(partials), reinterpret_cast<uint4*>(reduced), vectors, num_splits);
-}
 
 // ---- mHC fused kernel shape constants (mirrors the Python module) ----
 // HC_MULT * (2 + HC_MULT) = 4 * 6 = 24.
@@ -518,8 +459,7 @@ static void mhcFusedHcLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloat16 cons
         /*swizzleBytes=*/128, sizeof(__nv_bfloat16));
 
     // ---- Step 1: fused post-mapping + TF32 GEMM + sqrsum + residual_out ----
-    // Split-x reuses the baseline x data buffers and only adds full/empty
-    // barriers for the partial ring.
+    // Split-x adds barriers but reuses the x data buffers.
     uint32_t const extra_x_smem = (x_num_splits > 1) ? (2u * FHC_N_INPUT_STG * sizeof(uint64_t)) : 0u;
     uint32_t const fused_smem = fhcSmemSize() + extra_x_smem;
     FusedRoutFn fa

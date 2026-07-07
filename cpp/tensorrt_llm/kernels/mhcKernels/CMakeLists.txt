@@ -27,8 +27,9 @@ set_property(TARGET mhcKernels_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 target_compile_options(mhcKernels_src
                        PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
 
-# Expose the DeepGEMM SM100 MMA/TMA building blocks used by the fused
-# post-mapping kernels.
+# Expose DeepGEMM helper headers (sm100_utils.cuh, utils.cuh, tma_utils.cuh,
+# reduction.cuh) Used by the tcgen05.mma-based fused post-mapping + GEMM kernel
+# on SM100.
 target_include_directories(
   mhcKernels_src
   PRIVATE ${CMAKE_BINARY_DIR}/_deps/deepgemm-src/deep_gemm/include)

@@ -84,24 +84,27 @@ def test_dsv4_ob_cute_tactic(num_tokens, num_splits, expected):
     assert runner._get_tactic(num_tokens, num_splits) == expected
 
 
-def test_dsv4_ob_split_k_one_uses_cute_dsl(monkeypatch):
+def test_dsv4_ob_split_k_one_uses_cute_dsl_and_caches_weight_scale(monkeypatch):
     from tensorrt_llm import deep_gemm
+    from tensorrt_llm.quantization.utils import fp8_utils
 
     m, n, k = 256, 7168, 16384
     packed_k = k // 512
     weight_scale_storage = torch.empty((packed_k, n), device="meta", dtype=torch.int32)
+    transformed_scale = torch.as_strided(weight_scale_storage, (n, packed_k), (1, n))
     module = SimpleNamespace(
         hidden_size=n,
         dtype=torch.bfloat16,
         ob_split_k=1,
         o_b_proj=SimpleNamespace(
             weight=torch.empty((n, k), device="meta", dtype=torch.float8_e4m3fn),
-            weight_scale=torch.as_strided(weight_scale_storage, (n, packed_k), (1, n)),
+            weight_scale=torch.empty((n // 128, k // 128), device="meta"),
         ),
     )
     activation = torch.empty((m, k), device="meta", dtype=torch.float8_e4m3fn)
     activation_scale = torch.empty_strided((m, packed_k), (1, m), device="meta", dtype=torch.int32)
     calls = []
+    transforms = []
 
     def fail_deep_gemm(*args, **kwargs):
         raise AssertionError("supported SK1 must not dispatch to DeepGEMM")
@@ -109,18 +112,28 @@ def test_dsv4_ob_split_k_one_uses_cute_dsl(monkeypatch):
     def splitk_gemm(a, sfa, b, sfb, partials, num_splits):
         calls.append((a, sfa, b, sfb, partials, num_splits))
 
+    def transform_weight_scale(scale, **kwargs):
+        transforms.append((scale, kwargs))
+        return transformed_scale
+
     monkeypatch.setattr(attention_module, "IS_CUTLASS_DSL_AVAILABLE", True)
     monkeypatch.setattr(deep_gemm, "fp8_gemm_nt", fail_deep_gemm)
+    monkeypatch.setattr(fp8_utils, "transform_sf_into_required_layout", transform_weight_scale)
     monkeypatch.setattr(torch.ops.trtllm, "dsv4_fp8_splitk_gemm", splitk_gemm)
     output = MLA._fused_ob_gemm(module, activation, activation_scale, m)
+    cached_output = MLA._fused_ob_gemm(module, activation, activation_scale, m)
 
     assert output.shape == (m, n)
+    assert cached_output.shape == (m, n)
     assert output.device.type == "meta"
-    assert len(calls) == 1
+    assert len(transforms) == 1
+    assert transforms[0][0] is module.o_b_proj.weight_scale
+    assert module.o_b_proj._ob_wsf_int is transformed_scale
+    assert len(calls) == 2
     assert calls[0][0] is activation
     assert calls[0][1] is activation_scale
     assert calls[0][2] is module.o_b_proj.weight
-    assert calls[0][3] is module.o_b_proj.weight_scale
+    assert calls[0][3] is transformed_scale
     assert calls[0][4].shape == (1, m, n)
     assert calls[0][5] == 1
 
@@ -168,17 +181,17 @@ def test_dsv4_ob_auto_split_through_m128_uses_cute_dsl(m, monkeypatch):
 @pytest.mark.parametrize("m", [160])
 def test_dsv4_ob_unsplit_mid_m_uses_deep_gemm(m, monkeypatch):
     from tensorrt_llm import deep_gemm
+    from tensorrt_llm.quantization.utils import fp8_utils
 
     n, k = 7168, 16384
     packed_k = k // 512
-    weight_scale_storage = torch.empty((packed_k, n), device="meta", dtype=torch.int32)
     module = SimpleNamespace(
         hidden_size=n,
         dtype=torch.bfloat16,
         ob_split_k=None,
         o_b_proj=SimpleNamespace(
             weight=torch.empty((n, k), device="meta", dtype=torch.float8_e4m3fn),
-            weight_scale=torch.as_strided(weight_scale_storage, (n, packed_k), (1, n)),
+            weight_scale=torch.empty((n // 128, k // 128), device="meta"),
         ),
     )
     activation = torch.empty((m, k), device="meta", dtype=torch.float8_e4m3fn)
@@ -191,8 +204,12 @@ def test_dsv4_ob_unsplit_mid_m_uses_deep_gemm(m, monkeypatch):
     def fail_cute(*args, **kwargs):
         raise AssertionError("default unsplit M below 256 must dispatch to DeepGEMM")
 
+    def fail_transform(*args, **kwargs):
+        raise AssertionError("DeepGEMM fallback must not transform the weight scale")
+
     monkeypatch.setattr(attention_module, "IS_CUTLASS_DSL_AVAILABLE", True)
     monkeypatch.setattr(deep_gemm, "fp8_gemm_nt", deep_gemm_nt)
+    monkeypatch.setattr(fp8_utils, "transform_sf_into_required_layout", fail_transform)
     monkeypatch.setattr(torch.ops.trtllm, "dsv4_fp8_splitk_gemm", fail_cute)
     output = MLA._fused_ob_gemm(module, activation, activation_scale, m)
 
@@ -219,7 +236,7 @@ def test_dsv4_pro_fp8_splitk_gemm_partials(num_tokens: int, num_splits: int):
     a = torch.full((num_tokens, k), 0.03125, device="cuda", dtype=torch.float8_e4m3fn)
     b = torch.full((n, k), 0.03125, device="cuda", dtype=torch.float8_e4m3fn)
 
-    # Four UE8M0 scale=1 bytes (exponent 127) are packed in each int32.
+    # Pack four unit UE8M0 scales per int32.
     sfa_storage = torch.full((aligned_m * packed_k,), 0x7F7F7F7F, device="cuda", dtype=torch.int32)
     sfb_storage = torch.full((n * packed_k,), 0x7F7F7F7F, device="cuda", dtype=torch.int32)
     sfa = torch.as_strided(sfa_storage, (num_tokens, packed_k), (1, aligned_m))
@@ -474,12 +491,7 @@ def _build_dsv4_o_proj_case(num_tokens: int, dtype_str: str, device: torch.devic
             fp8_a_weight = fp8_a_weight.reshape(n_local_groups, o_lora_rank, dim)
             mla.o_a_proj.data = fp8_a_weight
             mla.o_a_proj_scale.data = fp8_a_scale
-            # mla.o_a_proj_dequant is None for DSv4 on SM100: PR #14254
-            # decouples the FP8-native o_a_proj path from
-            # use_cute_dsl_blockscaling_bmm, so DSv4 unconditionally uses the
-            # fused inv-RoPE + FP8 quant + cute-dsl BMM chain and never needs
-            # the bf16-dequant fallback buffer. The reference path below uses
-            # o_a_proj_bf16 directly.
+            # SM100 keeps only the quantized O_a weights.
 
         # Initialize o_b_proj weights
         if dtype_str == "bf16":
@@ -507,8 +519,7 @@ def _build_dsv4_o_proj_case(num_tokens: int, dtype_str: str, device: torch.devic
     attn_out_latent = torch.randn(num_tokens, num_heads, qk_head_dim, dtype=dtype, device=device)
     position_ids = torch.arange(num_tokens, dtype=torch.int32, device=device)
 
-    # Reference weights: the FP8-native path consumes the quantized o_a_proj plus
-    # block scales (dequantized here), not the original BF16 weight.
+    # Dequantize the weights actually consumed by the FP8 path.
     if dtype_str == "bf16":
         o_a_proj_ref = mla.o_a_proj.data
         o_b_proj_weight_ref = mla.o_b_proj.weight.data
@@ -563,8 +574,7 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
         num_tokens, dtype_str, device
     )
 
-    # Call the deepseek_v4 output projection (mla_rope_inplace modifies attn_out_latent
-    # in-place, so clone before passing to preserve original for reference)
+    # Preserve the input because inverse RoPE is in-place.
     output = mla._deepseek_v4_o_proj(attn_out_latent.clone(), position_ids)
 
     reference_output = calculate_reference_deepseek_v4_o_proj(
@@ -613,7 +623,7 @@ def test_deepseek_v4_o_proj_fused_fp8_equivalence(num_tokens: int, monkeypatch):
     equivalent to the default unfused path.
 
     Fused (DSV4_FUSE_OPROJ=1): o_a's CuTe-DSL GEMM emits o_lora directly as fp8
-    e4m3 + packed-UE8M0 1x128 scale factors, fed straight to DeepGEMM.
+    e4m3 + packed-UE8M0 1x128 scale factors, fed straight to o_b.
     Unfused (default): o_a emits bf16 o_lora, then ``o_b_proj`` runs the separate
     1x128 quant + DeepGEMM. Since the fusion only folds the *same* quant into o_a's
     epilogue, the two production paths must match far tighter than the fp8-vs-bf16
@@ -625,8 +635,7 @@ def test_deepseek_v4_o_proj_fused_fp8_equivalence(num_tokens: int, monkeypatch):
     device = torch.device("cuda")
     mla, attn_out_latent, position_ids, refs = _build_dsv4_o_proj_case(num_tokens, "fp8", device)
 
-    # Guard: confirm the fused branch's static gates hold, so this test actually
-    # exercises the fused path instead of silently falling back to the unfused one.
+    # Ensure the fused path is eligible.
     assert mla.o_a_proj.dtype == torch.float8_e4m3fn
     assert mla.n_local_groups == mla.num_groups
     assert getattr(mla.o_b_proj, "tp_size", 1) == 1
@@ -694,35 +703,3 @@ def test_deepseek_v4_o_proj_fused_fp8_equivalence(num_tokens: int, monkeypatch):
             is compiled_gemm
         )
         torch.testing.assert_close(out_cached, out_unfused, rtol=0, atol=0)
-
-    if num_tokens > 128:
-        return
-
-    # The CuTe DSL split-K path is specialized for the DSV4-Pro production
-    # o_b shape N=7168, K=16384. This compact analytic test uses N=4096,
-    # K=8192 and therefore validates only the standard fused o_b path.
-    if mla.hidden_size != 7168 or mla.n_local_groups * mla.o_lora_rank != 16384:
-        return
-
-    # Split-K: with ob_split_k>1 the fused o_b emits SK partials [SK*M, hidden]
-    # (partial p = rows [p*M,(p+1)*M)) summed downstream by mHC's x-ring. The
-    # persistent GEMM partitions K internally and writes BF16 partials directly,
-    # so their FP32 sum must equal the unsplit fused o_b (same-call reference: the
-    # fused o_a's fp8 quant differs from the unfused standalone quant by fp8 noise,
-    # so compare like-for-like).
-    K_ob = mla.n_local_groups * mla.o_lora_rank
-    for SK in (2, 4):
-        if K_ob % SK != 0 or (K_ob // SK) % 512 != 0:
-            continue
-        full_same = mla._deepseek_v4_o_proj(attn_out_latent.clone(), position_ids)
-        mla.ob_split_k = SK
-        parts = mla._deepseek_v4_o_proj(attn_out_latent.clone(), position_ids)
-        mla.ob_split_k = 1
-        assert parts.shape == (SK * num_tokens, out_unfused.shape[1]), (
-            f"SK={SK} partials shape {tuple(parts.shape)}"
-        )
-        assert parts.dtype == full_same.dtype
-        summed = parts.view(SK, num_tokens, -1).to(torch.float32).sum(0).to(full_same.dtype)
-        diff_full = _calc_diff(summed, full_same)
-        print(f"  SK={SK}: partials{tuple(parts.shape)} Σ-vs-fused-full={diff_full:.3e}")
-        assert diff_full < 1e-3, f"split-K SK={SK} Σ-vs-fused-full {diff_full=}"

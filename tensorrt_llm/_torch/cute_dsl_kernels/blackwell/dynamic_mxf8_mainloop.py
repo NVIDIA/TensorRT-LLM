@@ -95,6 +95,7 @@ def issue_dynamic_mxf8_mma_tile(
         packed_sfb_i32 = _tmem_ptr_to_i32(_as_value(packed_sfb_atom.iterator))
 
     packed_idesc = idesc_base
+    # Encode packed-scale TMEM phases in the instruction descriptor.
     if packed_sfa_i32 is not None:
         packed_idesc = packed_idesc | ((Uint32(packed_sfa_i32) & Uint32(0xC0000000)) >> Uint32(1))
     if packed_sfb_i32 is not None:

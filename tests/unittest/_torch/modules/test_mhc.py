@@ -787,12 +787,10 @@ def test_mhc_fused_hc_backends(n: int, hidden_size: int, hc_mult: int):
     [
         ("fused_half_mma", 0, 4, 512, 1),
         ("fused_half_fma", 3, 2, 256, 1),
-        ("fused_all_mma", 0, 4, 0, 1),
-        ("fused_all_fma", 2, 2, 0, 1),
     ],
 )
-def test_mhc_fused_hc_reduces_split_x_for_all_backends(tactic):
-    """Every fused-HC backend consumes split-major O_b partials correctly."""
+def test_mhc_fused_hc_reduces_split_x_for_production_backends(tactic):
+    """Production half backends consume split-major O_b partials correctly."""
     from tensorrt_llm._torch.modules.mhc.mhc_cuda import MhcFusedHcRunner
 
     n, hidden_size, hc_mult, x_splits = 32, 7168, 4, 4

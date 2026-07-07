@@ -46,11 +46,6 @@ void mhcHcHeadApplyLaunch(float const* mixes, float const* sqrsum, __nv_bfloat16
 void mhcPostMappingLaunch(__nv_bfloat16 const* residual, __nv_bfloat16 const* x, float const* post_mix,
     float const* comb_mix, __nv_bfloat16* out, int B, int hidden_size, cudaStream_t stream);
 
-// Reduce split-major BF16 O-projection partials [num_splits, M, hidden]
-// into [M, hidden], accumulating in FP32 and rounding once to BF16.
-void mhcReduceSplitXLaunch(
-    __nv_bfloat16 const* partials, __nv_bfloat16* reduced, int M, int hidden_size, int num_splits, cudaStream_t stream);
-
 // Single-launch fused hyper-connection boundary op (SM100 only).
 //
 // Produces (residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur) in two

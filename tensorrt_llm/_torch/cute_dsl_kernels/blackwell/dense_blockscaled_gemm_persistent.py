@@ -368,8 +368,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         cluster_coord_n = tile_coord[1] // cluster_n
         linear_cluster = cluster_coord_m + num_clusters_m * cluster_coord_n
 
-        # Match DeepGEMM's 1D grouping heuristic. Group boundaries are kept
-        # cluster-aligned so both CTAs of a 2-CTA MMA receive adjacent tiles.
+        # Group clusters like DeepGEMM for L2 reuse.
         group_ctas = (16 if self.cta_tile_shape_mnk[1] >= 128 else 8)
         group_clusters = group_ctas // cluster_m
         clusters_per_group = group_clusters * num_clusters_n
@@ -520,6 +519,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes()
 
+        # Packed scales already use their runtime MN-major layout.
         if cutlass.const_expr(not self.packed_k128_scales):
             # ((Atom_M, Rest_M),(Atom_K, Rest_K),RestL)
             sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(
@@ -590,6 +590,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         tma_tensor_sfb = sfb_tensor
         if cutlass.const_expr(self.packed_k128_scales
                               and self.tma_packed_scales):
+            # TMA one packed scale word per output row.
             scale_tma_op = cpasync.CopyBulkTensorTileG2SOp()
             sfa_raw_stage_layout = cute.make_layout(
                 (self.cta_tile_shape_mnk[0], ), stride=(1, ))
@@ -1437,9 +1438,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                                   and not self.scale_tma_on_scale_warp):
                 scale_tma_pipeline.producer_tail(scale_tma_producer_state)
 
-        #
-        # Specialized packed-scale load and transpose warp
-        #
+        # Load and transpose packed scales on a dedicated warp.
         if cutlass.const_expr(self.packed_k128_scales):
             if warp_idx == self.scale_warp_id:
                 tile_sched = utils.StaticPersistentTileScheduler.create(
@@ -1859,8 +1858,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                                 tCtSFB_compact_s2t,
                             )
 
-                        # tCtAcc += tCrA * tCrSFA * tCrB * tCrSFB
                         if cutlass.const_expr(self.dynamic_mma_n):
+                            # Mask the swapped N-tail in the MMA descriptor.
                             dynamic_mxf8_mainloop.issue_dynamic_mxf8_mma_tile(
                                 acc_tensor=tCtAcc,
                                 a_frag_tile=tCrA[(None, None, None,

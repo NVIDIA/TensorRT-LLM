@@ -199,7 +199,7 @@ class mHC(nn.Module):
             f"of B * hidden = {expected_per_split}"
         )
         x_num_splits = x_prev.numel() // expected_per_split
-        assert 1 <= x_num_splits <= 16, f"unsupported x_prev split count: {x_num_splits}"
+        assert x_num_splits in (1, 2, 4), f"unsupported x_prev split count: {x_num_splits}"
         x_prev_flat = x_prev.reshape(x_num_splits * B, hidden).contiguous()
         post_mix_prev_flat = post_mix_prev.reshape(B, n)
         comb_mix_prev_flat = comb_mix_prev.reshape(B, n, n)

@@ -2059,30 +2059,36 @@ class MLA(nn.Module):
         K_ob = o_lora_fp8.shape[1]
         w, wsf = self.o_b_proj.weight, self.o_b_proj.weight_scale
         SK = _select_dsv4_ob_split_k(M, getattr(self, "ob_split_k", None))
-        if (IS_CUTLASS_DSL_AVAILABLE and N == 7168 and K_ob == 16384
-                and wsf.dtype != torch.int32):
-            from tensorrt_llm.quantization.utils.fp8_utils import \
-                transform_sf_into_required_layout
-            wsf = self.o_b_proj.__dict__.setdefault(
-                "_ob_wsf_int",
-                transform_sf_into_required_layout(wsf,
-                                                  mn=N,
-                                                  k=K_ob,
-                                                  recipe=(1, 128, 128),
-                                                  is_sfa=False))
-
         packed_k = K_ob // 512
-        can_use_cute = (IS_CUTLASS_DSL_AVAILABLE and M > 0
+        # CuTe specializes the DSV4-Pro O_b shape.
+        can_try_cute = (IS_CUTLASS_DSL_AVAILABLE and M > 0
                         and (M >= 256 or SK > 1) and N == 7168 and K_ob == 16384
                         and K_ob % (512 * SK) == 0
                         and sf_out.dtype == torch.int32 and sf_out.dim() == 2
                         and sf_out.shape == (M, packed_k)
                         and sf_out.stride(0) == 1 and sf_out.stride(1) >= M
-                        and sf_out.stride(1) % 4 == 0
-                        and wsf.dtype == torch.int32 and wsf.dim() == 2
-                        and wsf.shape == (N, packed_k) and wsf.stride(0) == 1
-                        and wsf.stride(1) == N)
+                        and sf_out.stride(1) % 4 == 0)
+        cute_wsf = wsf
+        if can_try_cute and cute_wsf.dtype != torch.int32:
+            from tensorrt_llm.quantization.utils.fp8_utils import \
+                transform_sf_into_required_layout
+            cute_wsf = getattr(self.o_b_proj, "_ob_wsf_int", None)
+            if cute_wsf is None:
+                # Convert the static weight scale once.
+                cute_wsf = transform_sf_into_required_layout(wsf,
+                                                             mn=N,
+                                                             k=K_ob,
+                                                             recipe=(1, 128,
+                                                                     128),
+                                                             is_sfa=False)
+                self.o_b_proj._ob_wsf_int = cute_wsf
+
+        can_use_cute = (can_try_cute and cute_wsf.dtype == torch.int32
+                        and cute_wsf.dim() == 2
+                        and cute_wsf.shape == (N, packed_k)
+                        and cute_wsf.stride(0) == 1 and cute_wsf.stride(1) == N)
         if not can_use_cute:
+            # Keep DeepGEMM for unsupported shapes and layouts.
             hidden = torch.empty([M, N],
                                  device=o_lora_fp8.device,
                                  dtype=self.dtype)
@@ -2096,10 +2102,11 @@ class MLA(nn.Module):
             f"[obsk-fused] O_b CuTe DSL ENGAGED: SK={SK} M={M} "
             f"K={K_ob} N={N}",
             key="obsk_fused_engaged")
+        # mHC consumes split-major rows directly.
         partials = torch.empty([SK, M, N],
                                device=o_lora_fp8.device,
                                dtype=self.dtype)
-        torch.ops.trtllm.dsv4_fp8_splitk_gemm(o_lora_fp8, sf_out, w, wsf,
+        torch.ops.trtllm.dsv4_fp8_splitk_gemm(o_lora_fp8, sf_out, w, cute_wsf,
                                               partials, SK)
         if SK == 1:
             return partials[0]
@@ -2131,14 +2138,7 @@ class MLA(nn.Module):
         attn_out_latent = attn_out_latent.view(num_tokens, self.num_heads_tp,
                                                -1)
 
-        # When o_a_proj is FP8 on SM100 (which is always the case for DSv4
-        # under FP8 block-scales after init), fuse the inverse-RoPE into the
-        # FP8-quant epilogue (vLLM-ported Triton kernel) and call
-        # cute_dsl_fp8_bmm_blackwell directly. Saves one BF16 read+write of
-        # the latent vs the mla_rope_inplace +
-        # fp8_batched_quantize_1x128_permute102 pair. Decoupled from
-        # use_cute_dsl_blockscaling_bmm (which gates the separate K/V
-        # absorption BMM kernel choice).
+        # Fuse inverse RoPE and FP8 quantization on SM100.
         fused_inv_rope_fp8 = (self.o_a_proj.dtype == torch.float8_e4m3fn
                               and is_sm_100f())
         if fused_inv_rope_fp8:
