@@ -177,7 +177,9 @@ void initBindings(nb::module_& m)
         nb::arg("is_cross") = false, nb::arg("cross_kv") = std::nullopt,
         nb::arg("relative_attention_bias") = std::nullopt, nb::arg("relative_attention_max_distance") = 0,
         nb::arg("spec_decoding_target_max_draft_tokens") = std::nullopt, nb::arg("quant_scale_qkv") = std::nullopt,
-        "Multi-head attention operation", nb::call_guard<nb::gil_scoped_release>());
+        nb::arg("q_norm_weight") = std::nullopt, nb::arg("k_norm_weight") = std::nullopt, nb::arg("qk_norm_eps") = 0.0,
+        nb::arg("qk_norm_use_gemma") = false, "Multi-head attention operation",
+        nb::call_guard<nb::gil_scoped_release>());
 
     m.def(
         "get_helix_workspace_size_per_rank",

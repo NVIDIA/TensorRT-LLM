@@ -35,6 +35,14 @@ struct XQAParams
     void* output = nullptr;
     void* output_sf = nullptr;
     void const* qkv = nullptr;
+    // Token stride (in elements) of qkv. 0 means packed. May be larger when qkv is a row-strided
+    // view into a wider tensor (e.g. fused QKV+gate GEMM output). Only supported by the TRTLLM-Gen
+    // path (Q is routed to a separate buffer by the preprocessing kernel).
+    int32_t qkv_token_stride = 0;
+    void const* q_norm_weight = nullptr;
+    void const* k_norm_weight = nullptr;
+    float qk_norm_eps = 0.0f;
+    bool qk_norm_use_gemma = false;
     int32_t const* cache_indir = nullptr;
     float const* attention_sinks = nullptr;
     float const* kv_scale_orig_quant = nullptr;

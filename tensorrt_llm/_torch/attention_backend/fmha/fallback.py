@@ -147,6 +147,10 @@ class FallbackFmha(Fmha):
             cross_kv=forward_args.cross_kv,
             relative_attention_bias=forward_args.relative_attention_bias,
             relative_attention_max_distance=forward_args.relative_attention_max_distance,
+            q_norm_weight=attn.q_norm_weight,
+            k_norm_weight=attn.k_norm_weight,
+            qk_norm_eps=attn.qk_norm_eps,
+            qk_norm_use_gemma=attn.qk_norm_use_gemma,
             # --- Module config (TrtllmAttention) ---
             rotary_inv_freq=attn.rotary_inv_freq,
             rotary_cos_sin=attn.rotary_cos_sin,

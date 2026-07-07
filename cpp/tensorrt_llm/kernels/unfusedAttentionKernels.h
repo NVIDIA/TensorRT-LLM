@@ -132,6 +132,10 @@ struct QKVPreprocessingParams
     // Pool for FP4 KV cache block scales. Unused for other KV cache dtypes.
     KVCacheBuffer kv_cache_block_scales_buffer{};
     T const* qkv_bias{nullptr};
+    T const* q_norm_weight{nullptr};
+    T const* k_norm_weight{nullptr};
+    float qk_norm_eps{0.0f};
+    bool qk_norm_use_gemma{false};
 
     // Fuse the computation of FMHA quantization scales into the preprocessing kernels.
     // This can also be done in gptKernels.h if there is no preprocessing kernels.
@@ -211,6 +215,10 @@ struct QKVPreprocessingParams
     int multi_processor_count{0};
     int rotary_vision_start{0};
     int rotary_vision_length{0};
+    // Token stride (in elements) of qkv_input. 0 means packed (hidden_size). It may be larger when
+    // qkv_input is a row-strided view into a wider tensor (e.g. the [Q|K|V|Gate] output of a fused
+    // QKV+gate GEMM). Only supported with separate_q_kv_output (qkv_input is read-only then).
+    int input_token_stride{0};
     // Pre-compute on host.
     int half_rotary_dim{0};
     int q_hidden_size{0};
@@ -223,6 +231,10 @@ struct QKVPreprocessingParams
         q_hidden_size = head_num * size_per_head;
         kv_hidden_size = kv_head_num * size_per_head;
         hidden_size = q_hidden_size + 2 * kv_hidden_size;
+        if (input_token_stride == 0)
+        {
+            input_token_stride = hidden_size;
+        }
     }
 
     std::string toString() const
@@ -373,6 +385,15 @@ template <typename T, typename KVCacheBuffer>
 void invokeQKVPreprocessing(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream)
 {
     params.setCommonParameters();
+    // A strided (non-packed) qkv_input is only supported when nothing is written back into it:
+    // separate_q_kv_output routes Q to q_output and K/V to the KV cache.
+    TLLM_CHECK_WITH_INFO(params.input_token_stride == params.hidden_size || params.separate_q_kv_output,
+        "Strided qkv_input requires separate_q_kv_output.");
+    TLLM_CHECK_WITH_INFO((params.q_norm_weight == nullptr) == (params.k_norm_weight == nullptr),
+        "QK norm weights must be provided together.");
+    TLLM_CHECK_WITH_INFO(params.q_norm_weight == nullptr
+            || (params.separate_q_kv_output && params.size_per_head == 256 && params.qk_norm_eps > 0.0f),
+        "Fused QK norm preprocessing requires separate output, head_size 256, and positive epsilon.");
     if (params.cache_type == KvCacheDataType::INT8)
     {
         invokeApplyBiasRopeUpdateKVCacheDispatch<T, int8_t, KVCacheBuffer>(params, stream);
