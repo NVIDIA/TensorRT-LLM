@@ -16,12 +16,10 @@
 import importlib.util
 import json
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
-from typing import get_args
 
 
 def _repo_root() -> Path:
@@ -52,15 +50,6 @@ def _load_generator() -> ModuleType:
 def _load_manifest_generator() -> ModuleType:
     module_path = _repo_root() / "scripts/generate_llm_args_golden_manifest.py"
     spec = importlib.util.spec_from_file_location("generate_llm_args_golden_manifest", module_path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
-
-
-def _load_release_check() -> ModuleType:
-    module_path = _repo_root() / "scripts/release_check.py"
-    spec = importlib.util.spec_from_file_location("release_check", module_path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -256,102 +245,36 @@ def test_manifest_generator_subprocess_prefers_checkout_over_shadow_package(tmp_
     assert manifest_path.read_text() == committed
 
 
-def test_release_check_skips_runtime_manifest_hook_and_preserves_existing_skip(monkeypatch):
-    from types import SimpleNamespace
-
-    release_check = _load_release_check()
-    captured_environment = None
-
-    def _run_cmd(_command):
-        return SimpleNamespace(stdout="Total lines skipped (#nosec): 0\n")
-
-    def _run_precommit(_command, *, env=None):
-        nonlocal captured_environment
-        captured_environment = env
-
-    monkeypatch.setattr(release_check, "run_cmd", _run_cmd)
-    monkeypatch.setattr(release_check, "run_precommit_with_timing", _run_precommit)
-    monkeypatch.setattr(sys, "argv", ["release_check.py", "--all-files"])
-    monkeypatch.setenv("SKIP", "existing-hook")
-    monkeypatch.chdir(_repo_root())
-
-    release_check.main()
-
-    assert captured_environment is not None
-    assert captured_environment["SKIP"].split(",") == [
-        "existing-hook",
-        "generate-llm-args-golden-manifest",
-    ]
-    assert os.environ["SKIP"] == "existing-hook"
-
-
-def _manifest_definition_source_paths() -> set[str]:
-    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs, TrtLlmArgs
-    from tensorrt_llm.usage import config as telemetry_config
-    from tensorrt_llm.usage import llmapi_config
-
-    paths: set[str] = set()
-
-    def add_module(module_name: str) -> None:
-        module = sys.modules.get(module_name)
-        raw_path = getattr(module, "__file__", None)
-        if raw_path is None:
-            return
-        parts = Path(raw_path).parts
-        try:
-            package_index = parts.index("tensorrt_llm")
-        except ValueError:
-            return
-        relative_path = Path(*parts[package_index:])
-        if relative_path.suffix == ".py":
-            paths.add(relative_path.as_posix())
-
-    def add_class(cls: object) -> None:
-        if not isinstance(cls, type):
-            return
-        for base in cls.__mro__:
-            add_module(base.__module__)
-        add_module(type(cls).__module__)
-
-    def add_annotation(annotation: object) -> None:
-        add_class(annotation)
-        for argument in get_args(annotation):
-            add_annotation(argument)
-
-    seen_models: set[type] = set()
-
-    def walk_model(model: type) -> None:
-        if model in seen_models:
-            return
-        seen_models.add(model)
-        add_class(model)
-        for field in model.model_fields.values():
-            add_annotation(field.annotation)
-            for nested_model in llmapi_config._nested_models(field.annotation):
-                walk_model(nested_model)
-
-    walk_model(TorchLlmArgs)
-    walk_model(TrtLlmArgs)
-    add_module(telemetry_config.__name__)
-    add_module(llmapi_config.__name__)
-    return paths
-
-
-def test_manifest_generator_precommit_scope_covers_definition_modules():
+def test_manifest_generator_is_not_a_normal_precommit_hook():
     import yaml
 
     config = yaml.safe_load((_repo_root() / ".pre-commit-config.yaml").read_text())
     local_hooks = next(repo["hooks"] for repo in config["repos"] if repo["repo"] == "local")
-    hook = next(hook for hook in local_hooks if hook["id"] == "generate-llm-args-golden-manifest")
-    file_pattern = re.compile(hook["files"])
-    source_paths = _manifest_definition_source_paths() | {
-        "scripts/generate_llm_args_golden_manifest.py",
-        "tensorrt_llm/usage/llm_args_golden_manifest.json",
-    }
 
-    uncovered = sorted(path for path in source_paths if file_pattern.search(path) is None)
-    assert not uncovered, f"manifest-defining sources missing from pre-commit scope: {uncovered}"
-    assert file_pattern.search("tensorrt_llm/usage/schemas/README.md") is None
+    assert all(hook["id"] != "generate-llm-args-golden-manifest" for hook in local_hooks)
+
+
+def _assert_committed_manifest_current(generator) -> None:
+    assert generator.main(["--check"]) == 0, (
+        "The committed LLM args telemetry manifest is stale. Regenerate it with:\n\n"
+        "  python3 scripts/generate_llm_args_golden_manifest.py\n\n"
+        "Review and commit the resulting privacy-sensitive manifest diff."
+    )
+
+
+def test_committed_golden_failure_explains_regeneration():
+    from types import SimpleNamespace
+
+    import pytest
+
+    generator = SimpleNamespace(main=lambda _args: 1)
+
+    with pytest.raises(AssertionError) as failure:
+        _assert_committed_manifest_current(generator)
+
+    message = str(failure.value)
+    assert "python3 scripts/generate_llm_args_golden_manifest.py" in message
+    assert "review and commit" in message.lower()
 
 
 def test_build_capture_manifest_matches_committed_golden():
@@ -362,7 +285,7 @@ def test_build_capture_manifest_matches_committed_golden():
     update committed in the same change.
     """
     generator = _load_manifest_generator()
-    assert generator.main(["--check"]) == 0
+    _assert_committed_manifest_current(generator)
 
 
 def test_load_generator_does_not_leak_sys_modules():
