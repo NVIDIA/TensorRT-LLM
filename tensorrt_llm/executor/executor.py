@@ -21,6 +21,7 @@ from tensorrt_llm.logger import logger, set_level
 from .._utils import mpi_world_size
 from ..bindings import executor as tllm
 from ..builder import Engine
+from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.llm_args import BaseLlmArgs, TorchLlmArgs
 from ..llmapi.llm_utils import KvCacheRetentionConfig
@@ -134,6 +135,7 @@ class GenerationExecutor(ABC):
         postproc_params: Optional[PostprocParams] = None,
         multimodal_params: Optional[MultimodalParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
+        conversation_params: Optional[ConversationParams] = None,
         cache_salt: Optional[str] = None,
         arrival_time: Optional[float] = None,
         encoder_input_token_ids: Optional[Union[torch.Tensor, np.ndarray,
@@ -164,6 +166,7 @@ class GenerationExecutor(ABC):
             trace_headers=trace_headers,
             multimodal_params=multimodal_params,
             scheduling_params=scheduling_params,
+            conversation_params=conversation_params,
             cache_salt=cache_salt,
             arrival_time=arrival_time,
             encoder_input_token_ids=encoder_input_token_ids,
@@ -183,6 +186,7 @@ class GenerationExecutor(ABC):
         prompt_adapter_request: Optional[Union[
             PromptAdapterRequest, List[PromptAdapterRequest]]] = None,
         disaggregated_params: Optional[DisaggregatedParams] = None,
+        conversation_params: Optional[ConversationParams] = None,
         cache_salt: Optional[Union[str, List[Optional[str]]]] = None,
     ) -> Union[GenerationResult, List[GenerationResult]]:
         """Generate output for the given prompt token ids in the synchronous mode.
@@ -218,6 +222,7 @@ class GenerationExecutor(ABC):
                 prompt_adapter_request=pa_req,
                 streaming=False,
                 disaggregated_params=disaggregated_params,
+                conversation_params=conversation_params,
                 cache_salt=cs)
             futures.append(future)
 

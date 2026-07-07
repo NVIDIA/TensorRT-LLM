@@ -403,6 +403,7 @@ class ModelLoader:
             "fp8": QuantAlgo.FP8,
             "nvfp4": QuantAlgo.NVFP4,
         }.get(kv_cache_dtype)
+        requires_global_quant_config_fallback = False
 
         hf_quant_config_path = f"{self._model_dir}/hf_quant_config.json"
         if os.path.exists(hf_quant_config_path):
@@ -423,9 +424,20 @@ class ModelLoader:
                     )
             except FileNotFoundError:
                 pass
-            self._apply_modelopt_quant_config(normalized,
-                                              explicit_kv_cache_quant_algo)
-            return True
+            if normalized.get("quant_algo") is None:
+                if normalized.get("quantized_layers") is not None:
+                    requires_global_quant_config_fallback = True
+                    logger.info(
+                        "hf_quant_config.json does not set a global quant_algo; "
+                        "falling back to config.json or model_kwargs for global "
+                        "quantization.")
+                else:
+                    raise ValueError(
+                        "Pre-quantized checkpoint must have quant_algo.")
+            else:
+                self._apply_modelopt_quant_config(normalized,
+                                                  explicit_kv_cache_quant_algo)
+                return True
 
         hf_config_path = f"{self._model_dir}/config.json"
         hf_quant_config = None
@@ -447,6 +459,11 @@ class ModelLoader:
                 f"Use quantization_config from {hf_config_path}: quantization_config={hf_quant_config}"
             )
 
+        if requires_global_quant_config_fallback and hf_quant_config is None:
+            raise ValueError(
+                "hf_quant_config.json does not set a global quant_algo and no "
+                "quantization_config fallback was found.")
+
         if hf_quant_config is not None:
             if is_modelopt_quant_config(hf_quant_config):
                 self._apply_modelopt_quant_config(
@@ -458,6 +475,8 @@ class ModelLoader:
             if hf_quant_config.get("quant_method") == "fp8":
                 if hf_quant_config.get("weight_block_size") is not None:
                     quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+                    quant_config.group_size = hf_quant_config[
+                        "weight_block_size"][0]
                     quant_config.exclude_modules = ["*eh_proj"]
                 else:
                     # Ministral 3 static quant
@@ -471,9 +490,27 @@ class ModelLoader:
                     'block.*.attn.out', 'block.*.mlp.gate', 'block.*.attn.qkv',
                     'embedding', 'unembedding'
                 ]
+            # MXFP8 checkpoints (e4m3 weights + UE8M0 1x32 block scales, dynamic
+            # MXFP8 acts).
             elif hf_quant_config.get("quant_method") == "mxfp8":
-                raise NotImplementedError(
-                    "MXFP8 quantization is not supported yet.")
+                quant_config.quant_algo = QuantAlgo.MXFP8
+                block_size = hf_quant_config.get("weight_block_size", [1, 32])
+                # MXFP8 uses 1x32 blocks along the K dim; group_size is the K
+                # block (32).
+                assert tuple(block_size) == (1, 32), (
+                    f"MXFP8 only supports weight_block_size=[1,32], got {block_size}"
+                )
+                quant_config.group_size = block_size[1]
+
+                # Layers the producer left in BF16.
+                ignored = hf_quant_config.get("ignored_layers", [])
+                hf_exclude_modules = hf_quant_config.get(
+                    'modules_to_not_convert', None)
+                if hf_exclude_modules is not None:
+                    quant_config.exclude_modules = list(
+                        dict.fromkeys(hf_exclude_modules + ignored))
+                else:
+                    quant_config.exclude_modules = list(ignored)
             # NOTE: This is for llm-compressor's quantized checkpoints.
             elif hf_quant_config.get("quant_method") == "compressed-tensors":
                 update_quant_config_from_compressed_tensors(
@@ -664,15 +701,19 @@ class ModelLoader:
             trust_remote_code: bool = True,
             **kwargs) -> Optional[transformers.PretrainedConfig]:
         try:
-            # Route via AutoConfig so model_types registered through
-            # transformers.models.auto.configuration_auto.CONFIG_MAPPING
-            # (e.g. deepseek_v32 / kimi_k2 via tensorrt_llm/_torch/configs/)
-            # are dispatched to their TRT-LLM-local config class. Calling
-            # PretrainedConfig.from_pretrained directly bypasses CONFIG_MAPPING
-            # and on transformers 5.5.x returns a bare PretrainedConfig that
-            # lacks attributes like max_position_embeddings.
-            return transformers.AutoConfig.from_pretrained(
-                model_dir, trust_remote_code=trust_remote_code, **kwargs)
+            # Route via load_pretrained_config so model_types registered in
+            # TRT-LLM's _CONFIG_REGISTRY (e.g. deepseek_v32 / kimi_k2 /
+            # glm_moe_dsa) are dispatched to their TRT-LLM-local config class
+            # and get the same compat handling as the engine's own config load
+            # (e.g. dropping GLM-MoE-DSA's unsupported layer_types); it falls
+            # back to AutoConfig for everything else. Calling AutoConfig /
+            # PretrainedConfig.from_pretrained directly here would instead hit
+            # transformers' validate_layer_type and return None.
+            from tensorrt_llm._torch.pyexecutor.config_utils import \
+                load_pretrained_config
+            return load_pretrained_config(model_dir,
+                                          trust_remote_code=trust_remote_code,
+                                          **kwargs)
         except Exception as e:
             logger.warning(
                 f"Failed to load hf model config from {model_dir}, encountered error: {e}"

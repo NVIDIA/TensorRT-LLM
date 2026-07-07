@@ -24,13 +24,32 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._utils import local_mpi_size
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from .backend import MoeBackendType, get_backend_class
-from .mapping import _resolve_mapping_layout
+from .mapping import _PARALLEL_MODE_LAYOUTS, _resolve_mapping_layout
 from .specs import _ALL_BACKENDS, _FORCED_COMM_ENV_VALUES, ConfigSpec, ModelSpec, SearchSpec
 
 _FUSED_COMM_BACKENDS = frozenset({"MEGAMOE_DEEPGEMM"})
+
+
+def _is_deepep_feasible(num_ranks: int) -> bool:
+    """Return True if DeepEP supports the given EP rank count on this node topology.
+
+    Intranode: num_ranks in {2, 4, 8} and num_ranks == local_mpi_size().
+    Internode: exactly 8 ranks per node, with 2/4/8/16 RDMA nodes.
+    Mirrors the feasibility check in fused_moe_wide_ep.py::select_alltoall_method_type.
+    """
+    _INTRANODE_RANKS = {2, 4, 8}
+    _REQUIRED_LOCAL_SIZE = 8
+    _INTERNODE_RDMA_NODES = {2, 4, 8, 16}
+    mpi_size = local_mpi_size()
+    if num_ranks == mpi_size and num_ranks in _INTRANODE_RANKS:
+        return True
+    if mpi_size != _REQUIRED_LOCAL_SIZE:
+        return False
+    return (num_ranks // mpi_size) in _INTERNODE_RDMA_NODES
 
 
 def _check_backend_can_implement(
@@ -65,6 +84,23 @@ def _comm_axis_for_backend(backend: Any, comm_methods: Tuple[Any, ...]) -> Tuple
     return comm_methods
 
 
+def _comm_axis_for_parallel_mode(pmode: str, comm_methods: Tuple[Any, ...]) -> Tuple[Any, ...]:
+    """Collapse comm axis to AUTO for parallel modes without attention DP.
+
+    Non-AUTO forced comm methods require enable_attention_dp=True (see
+    is_candidate_valid). TEP and TTP have enable_dp=False, so only AUTO
+    is ever valid for them. Generating forced-comm candidates for these
+    modes only produces prune rows — handle it at generation time instead.
+    CUSTOM mode is passed through unchanged (validated separately).
+    """
+    layout = _PARALLEL_MODE_LAYOUTS.get(str(pmode).upper())
+    if layout is None:
+        return comm_methods  # CUSTOM: unknown layout, keep as-is
+    if not layout["enable_attention_dp"]:
+        return ("AUTO",)
+    return comm_methods
+
+
 def expand_search(
     base_config: ConfigSpec,
     search: SearchSpec,
@@ -88,7 +124,13 @@ def expand_search(
     for backend, pmode, cgraph, combine in itertools.product(
         backends, parallel_modes, cuda_graph_options, combine_options
     ):
-        for comm in _comm_axis_for_backend(backend, comm_methods):
+        effective_comm = _comm_axis_for_backend(backend, comm_methods)
+        # For non-fused backends apply parallel-mode comm constraint at
+        # generation time so TEP/TTP always get comm=AUTO instead of
+        # generating forced-comm candidates that are immediately pruned.
+        if effective_comm != ("NONE",):
+            effective_comm = _comm_axis_for_parallel_mode(pmode, effective_comm)
+        for comm in effective_comm:
             candidate = replace(
                 base_config,
                 backend=str(backend).upper(),
@@ -121,6 +163,68 @@ def is_candidate_valid(
     except ValueError as exc:
         return False, str(exc)
 
+    # DenseGEMM only supports TP; any EP configuration (TEP, DEP, custom ep>1) is unsupported.
+    if config.backend.upper() == "DENSEGEMM" and moe_ep > 1:
+        return False, (
+            f"DENSEGEMM does not support EP (ep_size={moe_ep}); "
+            "use TEP/DEP only with other backends"
+        )
+
+    # MegaMoEDeepGemm is EP-only (asserts moe_tp_size == 1 in __init__); DTP/TTP are invalid.
+    if config.backend.upper() == "MEGAMOE_DEEPGEMM" and moe_tp > 1:
+        return False, (
+            f"MEGAMOE_DEEPGEMM does not support MoE-TP (moe_tp_size={moe_tp}); "
+            "use DEP/TEP modes only"
+        )
+
+    # DENSEGEMM DTP: FC2 kernel requires (intermediate_size / moe_tp_size) % 256 == 0.
+    # DENSEGEMM __init__ only checks the full intermediate_size, so a model like
+    # DeepSeek V3 (intermediate_size=2048, 2048%256=0) passes __init__ but fails
+    # at runtime with moe_tp_size=16 (2048/16=128, 128%256!=0).
+    if config.backend.upper() == "DENSEGEMM" and moe_ep == 1 and moe_tp > 1:
+        if model.intermediate_size % moe_tp != 0:
+            return False, (
+                f"DENSEGEMM DTP: intermediate_size={model.intermediate_size} "
+                f"not divisible by moe_tp_size={moe_tp}"
+            )
+        per_tp_k = model.intermediate_size // moe_tp
+        _DENSEGEMM_MMA_TILE_K = 256
+        if per_tp_k % _DENSEGEMM_MMA_TILE_K != 0:
+            return False, (
+                f"DENSEGEMM DTP moe_tp_size={moe_tp}: intermediate_size/tp={per_tp_k} "
+                f"not aligned to FC2 MMA tile-K={_DENSEGEMM_MMA_TILE_K}"
+            )
+
+    # NVFP4 on CuteDSL / TRTLLM-Gen requires the per-partition intermediate size
+    # (intermediate_size / moe_tp_size) to be a multiple of the NVFP4 weight
+    # alignment (128). Unlike CUTLASS (which pads intermediate_size_per_partition
+    # up to 128), these backends use the unpadded logical size when laying out the
+    # block-scale tensor and fail during weight load: CUTEDSL raises a reshape
+    # RuntimeError (e.g. "shape '[-1, 192, 448]' is invalid for input of size
+    # 114688" — 192 padded to 256) and TRTLLM-Gen hits `assert intermediate_size %
+    # weight_alignment == 0`. Prune the unsupported combo with a clear reason
+    # instead of letting it crash mid-sweep. Example: DeepSeek-V4-Pro
+    # (intermediate_size=3072) at moe_tp_size=32 -> 3072/32=96, 96%128!=0.
+    if (
+        config.backend.upper() in ("CUTEDSL", "TRTLLM")
+        and model.quant_algo_enum == QuantAlgo.NVFP4
+        and moe_tp > 1
+    ):
+        _NVFP4_WEIGHT_ALIGNMENT = 128
+        if model.intermediate_size % moe_tp != 0:
+            return False, (
+                f"{config.backend.upper()} NVFP4: intermediate_size="
+                f"{model.intermediate_size} not divisible by moe_tp_size={moe_tp}"
+            )
+        per_tp_k = model.intermediate_size // moe_tp
+        if per_tp_k % _NVFP4_WEIGHT_ALIGNMENT != 0:
+            return False, (
+                f"{config.backend.upper()} NVFP4 moe_tp_size={moe_tp}: "
+                f"intermediate_size/tp={per_tp_k} not aligned to NVFP4 weight "
+                f"alignment={_NVFP4_WEIGHT_ALIGNMENT} (CUTLASS pads to 128, "
+                f"CUTEDSL/TRTLLM do not)"
+            )
+
     # Forced communication on non-DP / MoE-TP paths.
     forced = config.comm_method.upper()
     if forced not in ("AUTO", "NONE"):
@@ -130,6 +234,12 @@ def is_candidate_valid(
             return False, f"comm_method={forced} requires moe_tp_size=1 (got {moe_tp})"
         if world_size == 1:
             return False, f"comm_method={forced} has no effect at world_size=1"
+        if forced == "DEEPEP" and not _is_deepep_feasible(moe_ep):
+            return False, (
+                f"comm_method={forced}: moe_ep_size={moe_ep} not supported by DeepEP topology "
+                f"(local_mpi_size={local_mpi_size()}; supported: intranode {{2,4,8}}, "
+                f"internode 8-ranks/node x {{2,4,8,16}} nodes)"
+            )
 
     return True, None
 

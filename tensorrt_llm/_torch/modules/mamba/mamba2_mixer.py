@@ -149,10 +149,8 @@ class Mamba2Mixer(nn.Module):
             allreduce_strategy=config.allreduce_strategy)
 
         # A
-        self.A = nn.Parameter(
-            torch.empty(self.tp_nheads,
-                        dtype=torch.float32,
-                        requires_grad=False))
+        self.A = nn.Parameter(torch.empty(self.tp_nheads, dtype=torch.float32),
+                              requires_grad=False)
 
         # Choose between flashinfer and native implementation. (default to flashinfer)
         self._mamba_ssm_cache_dtype = config.quant_config.mamba_ssm_cache_dtype
@@ -202,16 +200,13 @@ class Mamba2Mixer(nn.Module):
                     key="stochastic_rounding_disabled")
 
         # D
-        self.D = nn.Parameter(
-            torch.empty(self.tp_nheads,
-                        dtype=torch.float32,
-                        requires_grad=False))
+        self.D = nn.Parameter(torch.empty(self.tp_nheads, dtype=torch.float32),
+                              requires_grad=False)
 
         # dt_bias
-        self.dt_bias = nn.Parameter(
-            torch.empty(self.tp_nheads,
-                        dtype=torch.float32,
-                        requires_grad=False))
+        self.dt_bias = nn.Parameter(torch.empty(self.tp_nheads,
+                                                dtype=torch.float32),
+                                    requires_grad=False)
 
         # LoRA layers require regular bf16 tensors, not Fp4QuantizedTensor.
         # Disable fused RMSNorm+NVFP4 when LoRA is configured.
@@ -255,22 +250,32 @@ class Mamba2Mixer(nn.Module):
         self.aux_steram = torch.cuda.Stream()
         self.events = [torch.cuda.Event(), torch.cuda.Event()]
 
-    def post_load_weights(self):
-        """Post-process after loading weights."""
+    def cache_derived_state(self) -> None:
+        """Recompute state derived from loaded weights."""
         if (self.norm.is_nvfp4 and fused_gated_rmsnorm_quant_shape_ok(
                 self.norm.hidden_size, self.norm.group_size)
                 and self.norm.nvfp4_scale is None):
             self._try_attach_nvfp4_scale()
 
         # Pre-expand A, D, dt_bias for the decode path.
-        self._A_expanded = repeat(self.A,
-                                  "h -> h p n",
-                                  p=self.head_dim,
-                                  n=self.d_state).to(dtype=torch.float32)
-        self._dt_bias_expanded = repeat(self.dt_bias,
-                                        "h -> h p",
-                                        p=self.head_dim)
-        self._D_expanded = repeat(self.D, "h -> h p", p=self.head_dim)
+        # On first call: register as non-persistent buffers so the addresses are
+        # stable for CUDA-graph capture.  On subsequent calls (e.g. update_weights):
+        # update in-place so the captured addresses remain valid.
+        a_exp = repeat(self.A, "h -> h p n", p=self.head_dim,
+                       n=self.d_state).to(dtype=torch.float32)
+        dt_exp = repeat(self.dt_bias, "h -> h p", p=self.head_dim)
+        d_exp = repeat(self.D, "h -> h p", p=self.head_dim)
+        if '_A_expanded' not in self._buffers:
+            self.register_buffer('_A_expanded', a_exp, persistent=False)
+            self.register_buffer('_dt_bias_expanded', dt_exp, persistent=False)
+            self.register_buffer('_D_expanded', d_exp, persistent=False)
+        else:
+            self._A_expanded.copy_(a_exp)
+            self._dt_bias_expanded.copy_(dt_exp)
+            self._D_expanded.copy_(d_exp)
+
+    def post_load_weights(self) -> None:
+        self.cache_derived_state()
 
     def _try_attach_nvfp4_scale(self):
         """Attach input_scale from out_proj to norm for fused RMSNorm+Quant."""

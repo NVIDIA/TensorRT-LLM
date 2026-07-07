@@ -20,6 +20,7 @@ import io
 import os
 import re
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -702,6 +703,16 @@ class AbstractPerfScriptTestClass(abc.ABC):
         if self._gpu_clock_lock:
             device_subtype = self._gpu_clock_lock.get_device_subtype()
 
+        # Node(s) that ran this case. Recorded per-case (not per-run) because
+        # parallel splits are submitted as separate SLURM allocations and can
+        # land on different nodes within a single run — a per-run hostname would
+        # be ambiguous. Prefer the SLURM nodelist (a single string that also
+        # covers multinode cases) and fall back to the local hostname for
+        # bare-metal/non-SLURM runs.
+        node_hostname = (os.environ.get("SLURM_JOB_NODELIST")
+                         or os.environ.get("SLURM_NODELIST")
+                         or socket.gethostname())
+
         test_description_dict = {
             "network_name": self.get_test_name(),
             "network_hash":
@@ -709,7 +720,8 @@ class AbstractPerfScriptTestClass(abc.ABC):
             "sm_clk": gpu_clocks.get("gpu_clock__MHz", None),
             "mem_clk": gpu_clocks.get("memory_clock__MHz", None),
             "gpu_idx": gpu_idx,
-            "device_subtype": device_subtype
+            "device_subtype": device_subtype,
+            "hostname": node_hostname
         }
 
         # Serialize the commands.

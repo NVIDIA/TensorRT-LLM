@@ -21,7 +21,9 @@ from .suffix_automaton import SuffixAutomatonManager
 from .utils import (get_draft_kv_cache_manager, get_num_extra_kv_tokens,
                     get_num_spec_layers, get_spec_decoder, get_spec_drafter,
                     get_spec_metadata, get_spec_resource_manager,
-                    get_spec_worker, update_spec_config_from_model_config)
+                    get_spec_worker, update_spec_config_from_draft_model_config,
+                    update_spec_config_from_loaded_model,
+                    update_spec_config_from_model_config)
 
 __all__ = [
     "DFlashSpecMetadata",
@@ -60,6 +62,8 @@ __all__ = [
     "prepare_attn_metadata_for_draft_replay",
     "restore_attn_metadata_after_draft_replay",
     "should_use_separate_draft_kv_cache",
+    "update_spec_config_from_draft_model_config",
+    "update_spec_config_from_loaded_model",
     "update_spec_config_from_model_config",
     "suggest_spec_config",
     "SpecTreeManager",
