@@ -608,6 +608,212 @@ class FP4GemmRunner(TunableRunner):
         return out
 
 
+@lru_cache(maxsize=1)
+def _get_flashinfer_svdquant_module():
+    """Load FlashInfer's SM100 CUTLASS NVFP4 SVDQuant module (raw tactic-level FFI).
+
+    TensorRT-LLM drives tactic selection with its own AutoTuner, so it consumes the
+    module's raw ``nvfp4_svdquant_gemm(..., tactic)`` / ``nvfp4_svdquant_gemm_tactic_num()``
+    entry points rather than FlashInfer's autotuned ``mm_nvfp4_svdquant`` API.
+    """
+    assert IS_FLASHINFER_AVAILABLE, (
+        "NVFP4 SVDQuant requires flashinfer (with nvfp4_svdquant_gemm support) to be installed"
+    )
+    from flashinfer.gemm.gemm_svdquant import get_nvfp4_svdquant_module
+    return get_nvfp4_svdquant_module()
+
+
+_SVDQUANT_WORKSPACE_SIZE = 32 * 1024 * 1024
+_svdquant_workspace_dict = dict()
+
+
+def _get_svdquant_workspace(device: torch.device) -> torch.Tensor:
+    # Persistent per-device scratch so no allocation happens inside CUDA-graph capture.
+    buf = _svdquant_workspace_dict.get(device)
+    if buf is None:
+        buf = torch.empty(_SVDQUANT_WORKSPACE_SIZE,
+                          dtype=torch.uint8,
+                          device=device)
+        _svdquant_workspace_dict[device] = buf
+    return buf
+
+
+def _flashinfer_nvfp4_svdquant_gemm(
+    act_fp4: torch.Tensor,
+    weight: torch.Tensor,
+    act_sf: torch.Tensor,
+    weight_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    down: torch.Tensor,
+    lora_up: torch.Tensor,
+    output_dtype: torch.dtype,
+    bias: Optional[torch.Tensor],
+    tactic: int,
+) -> torch.Tensor:
+    assert output_dtype == torch.bfloat16, (
+        "nvfp4_svdquant_gemm supports bf16 output only")
+    module = _get_flashinfer_svdquant_module()
+    out = torch.empty(act_fp4.shape[0],
+                      weight.shape[0],
+                      dtype=output_dtype,
+                      device=act_fp4.device)
+    module.nvfp4_svdquant_gemm(act_fp4, weight, act_sf, weight_sf, alpha, down,
+                               lora_up, bias, out,
+                               _get_svdquant_workspace(act_fp4.device), tactic,
+                               get_env_enable_pdl())
+    return out
+
+
+@fast_custom_op("trtllm::nvfp4_svdquant_gemm", mutates_args=())
+def nvfp4_svdquant_gemm(
+    a: torch.Tensor,
+    wq: torch.Tensor,
+    a_sf: torch.Tensor,
+    w_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    down: torch.Tensor,
+    lora_up: torch.Tensor,
+    out_dtype: Optional[torch.dtype],
+    bias: Optional[torch.Tensor] = None,
+    tactic: int = -1,
+) -> torch.Tensor:
+    """Raw (fixed-tactic) SVDQuant fused NVFP4 GEMM, backed by FlashInfer's kernel."""
+    return _flashinfer_nvfp4_svdquant_gemm(
+        a, wq, a_sf, w_sf, alpha, down, lora_up,
+        out_dtype if out_dtype is not None else torch.bfloat16, bias,
+        max(int(tactic), 0))
+
+
+@nvfp4_svdquant_gemm.register_fake
+def _(
+    a: torch.Tensor,
+    wq: torch.Tensor,
+    a_sf: torch.Tensor,
+    w_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    down: torch.Tensor,
+    lora_up: torch.Tensor,
+    out_dtype: Optional[torch.dtype],
+    bias: Optional[torch.Tensor] = None,
+    tactic: int = -1,
+) -> torch.Tensor:
+    del a_sf, w_sf, alpha, down, lora_up, bias, tactic
+    return a.new_empty(
+        (a.shape[0], wq.shape[0]),
+        dtype=out_dtype if out_dtype is not None else torch.bfloat16)
+
+
+@fast_custom_op("trtllm::nvfp4_quantize_smooth", mutates_args=())
+def nvfp4_quantize_smooth(
+    x: torch.Tensor,
+    pre_quant_scale: torch.Tensor,
+    global_scale: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """(xq, sf) = NVFP4-quantize(x * pre_quant_scale) in one pass (FlashInfer kernel).
+
+    Byte-identical to a separate x_hat = x * s elementwise pass followed by fp4_quantize.
+    """
+    module = _get_flashinfer_svdquant_module()
+    output_shape, scale_size = fp4_utils.get_fp4_shape(x.shape, 16)
+    xq = x.new_empty(output_shape, dtype=torch.uint8)
+    sf = x.new_empty((scale_size, ), dtype=torch.uint8)
+    module.nvfp4_quantize_smooth(x, pre_quant_scale, global_scale, xq, sf,
+                                 get_env_enable_pdl())
+    return xq, sf
+
+
+@nvfp4_quantize_smooth.register_fake
+def _(
+    x: torch.Tensor,
+    pre_quant_scale: torch.Tensor,
+    global_scale: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    del pre_quant_scale, global_scale
+    output_shape, scale_size = fp4_utils.get_fp4_shape(x.shape, 16)
+    return (x.new_empty(output_shape, dtype=torch.uint8),
+            x.new_empty((scale_size, ), dtype=torch.uint8))
+
+
+class NVFP4SVDQuantGemmRunner(TunableRunner):
+    """Exact-shape tuner for the FlashInfer residual-plus-rank-32 CUTLASS GEMM."""
+
+    # Image-token counts such as 6889 and 8192 must remain distinct. The regular NVFP4
+    # power-of-two M bucketing is intentionally not used for this composite kernel. Rotate
+    # cloned operands while profiling so cluster selection reflects the model's hundreds of
+    # distinct weights instead of repeatedly hitting one weight in L2.
+    tuning_config = TuningConfig(use_cold_l2_cache=True)
+
+    def __init__(self, output_dtype: torch.dtype):
+        self.output_dtype = output_dtype
+        self.module = _get_flashinfer_svdquant_module()
+
+    def unique_id(self):
+        # The version invalidates persisted tactic IDs if the tactic order changes.
+        return ("nvfp4-svdquant-sm100-flashinfer-v1", self.output_dtype)
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+        **kwargs,
+    ) -> List[int]:
+        del inputs, profile, kwargs
+        return list(range(self.module.nvfp4_svdquant_gemm_tactic_num()))
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = -1,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        act_fp4, weight, act_sf, weight_sf, alpha, down, lora_up = inputs
+        return _flashinfer_nvfp4_svdquant_gemm(act_fp4, weight, act_sf,
+                                               weight_sf, alpha, down, lora_up,
+                                               self.output_dtype, bias,
+                                               max(int(tactic), 0))
+
+
+@fast_custom_op("trtllm::nvfp4_svdquant_gemm_tuned", mutates_args=())
+def nvfp4_svdquant_gemm_tuned(
+    act_fp4: torch.Tensor,
+    weight: torch.Tensor,
+    act_sf: torch.Tensor,
+    weight_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    down: torch.Tensor,
+    lora_up: torch.Tensor,
+    output_dtype: torch.dtype,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    runner = NVFP4SVDQuantGemmRunner(output_dtype)
+    inputs = [act_fp4, weight, act_sf, weight_sf, alpha, down, lora_up]
+    _, best_tactic = AutoTuner.get().choose_one(
+        "trtllm::nvfp4_svdquant_gemm::flashinfer_v1",
+        [runner],
+        runner.tuning_config,
+        inputs,
+        bias=bias,
+    )
+    return runner(inputs, tactic=best_tactic, bias=bias)
+
+
+@nvfp4_svdquant_gemm_tuned.register_fake
+def _(
+    act_fp4: torch.Tensor,
+    weight: torch.Tensor,
+    act_sf: torch.Tensor,
+    weight_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    down: torch.Tensor,
+    lora_up: torch.Tensor,
+    output_dtype: torch.dtype,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    del act_sf, weight_sf, alpha, down, lora_up, bias
+    return act_fp4.new_empty((act_fp4.shape[0], weight.shape[0]),
+                             dtype=output_dtype)
+
+
 class CublasLtFP4GemmRunner(TunableRunner):
     """CublasLt-based FP4 GEMM runner with auto-tuning support.
 
