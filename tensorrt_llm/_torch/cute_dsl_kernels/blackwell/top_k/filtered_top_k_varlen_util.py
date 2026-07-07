@@ -63,11 +63,11 @@ class FilteredTopKKernelVarlen:
                                    extra_buffer.  Exact result.  Requires caller to
                                    allocate extra_buffer proportional to batch size;
                                    may OOM at large batch.
-                "TRUNCATE"      -- Discard candidates that overflow SMEM.  Histogram is
-                                   always updated, so the selected threshold bin is
-                                   correct, but refinement only iterates the retained
-                                   candidates.  Non-exact (may output fewer than top_k
-                                   indices when the threshold bin is dense).  No
+                "TRUNCATE"      -- Discard candidates that overflow SMEM.  Only
+                                   retained candidates contribute to the refinement
+                                   histogram, so refinement operates consistently on
+                                   the stored set.  Non-exact (may output fewer than
+                                   top_k indices when the threshold bin is dense).  No
                                    extra_buffer needed.
                 "REREAD_ALWAYS" -- Skip SMEM collection entirely in the coarse pass;
                                    always perform a second GMEM scan to collect
