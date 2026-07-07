@@ -19,8 +19,8 @@ import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
-from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Set, Tuple,
-                    Union)
+from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence,
+                    Set, Tuple, Union)
 
 import torch
 from mpi4py import MPI
@@ -860,6 +860,7 @@ class KVCacheManager(BaseResourceManager):
         kv_reserve_draft_tokens: Optional[int] = None,
         use_mrope: bool = False,
         max_beam_width: int = 1,
+        encoder_output_lens: Optional[List[int]] = None,
         # For capturable drafting loops. During normal inference, the draft model always
         # has enough KV cache space to fit all of our draft tokens. During warmup, however,
         # we need to make the KV cache manager aware that multiple autoregressive steps will
@@ -893,9 +894,10 @@ class KVCacheManager(BaseResourceManager):
             # in _prepare_tp_inputs; need token_num >= 2 so that doesn't go negative.
             if self.mapping.has_cp_helix():
                 token_num = max(token_num, 2)
-            encoder_input_tokens = [
-                1
-            ] * token_num if self.impl.cross_kv else None
+            encoder_output_len = (encoder_output_lens[i]
+                                  if encoder_output_lens is not None else None)
+            encoder_input_tokens = ([1] * encoder_output_len
+                                    if encoder_output_len is not None else None)
             # Using 1 instead of 0 prevents NaN during warmup in e.g. Deepseek
             req = LlmRequest(request_id=req_id,
                              max_new_tokens=1,
@@ -903,7 +905,8 @@ class KVCacheManager(BaseResourceManager):
                              sampling_config=SamplingConfig(
                                  sampling_params._get_sampling_config()),
                              is_streaming=False,
-                             encoder_input_tokens=encoder_input_tokens)
+                             encoder_input_tokens=encoder_input_tokens,
+                             encoder_output_len=encoder_output_len)
             req.is_dummy_request = True
             req.paged_kv_block_ids = []
             if prepare_resource:
@@ -1338,6 +1341,7 @@ class KVCacheManager(BaseResourceManager):
         layer_idx: Optional[int] = None,
         window_size: Optional[int] = None,
         beam_width: Optional[int] = 1,
+        num_blocks_per_seq: Optional[Sequence[int]] = None,
     ) -> List[List[int]]:
         beam_width = beam_width or 1
         if window_size is None:
@@ -1361,6 +1365,8 @@ class KVCacheManager(BaseResourceManager):
             )
             result[i] = beams[
                 0] if beam_width == 1 else self._pack_beam_cache_indices(beams)
+            if num_blocks_per_seq is not None:
+                result[i] = result[i][:num_blocks_per_seq[i]]
         return result
 
     @staticmethod

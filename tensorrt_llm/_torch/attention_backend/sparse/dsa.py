@@ -1088,25 +1088,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # Create expanded buffers for MTP support
         self.create_expanded_buffers(capture_graph=capture_graph)
 
-    def _create_radix_aux_buffers(self, capture_graph=False):
-        """Create persistent scratch for the fp32 radix split-work TopK path."""
-        max_blocks_per_row = 10
-        max_gen_tokens = self.max_num_sequences * (1 + self.max_draft_tokens)
-        self.radix_aux_indices = self.get_empty(
-            self.cuda_graph_buffers,
-            (max_gen_tokens, max_blocks_per_row, self.num_sparse_topk),
-            cache_name="radix_aux_indices",
-            dtype=torch.int32,
-            capture_graph=capture_graph,
-        )
-        self.radix_aux_logits = self.get_empty(
-            self.cuda_graph_buffers,
-            (max_gen_tokens, max_blocks_per_row, self.num_sparse_topk),
-            cache_name="radix_aux_logits",
-            dtype=torch.float32,
-            capture_graph=capture_graph,
-        )
-
     def _create_kv_lens_2d_buffer(self, capture_graph=False):
         """Pre-allocated buffer for the DeepGEMM 2D context_lens API.
 
@@ -1761,15 +1742,18 @@ class Indexer(nn.Module):
             warmup_heuristic_topk_decode(top_k=self.index_topk)
 
         # Fused wk + weights_proj weight for single FP32 cuBLAS GEMM
-        # (populated in post_load_weights; maps to TF32 tensor cores on Ampere+)
+        # (populated in cache_derived_state; maps to TF32 tensor cores on Ampere+)
         self._fused_wk_wp_weight: Optional[torch.Tensor] = None
 
-    def post_load_weights(self):
+    def cache_derived_state(self) -> None:
         """Fuse wk + weights_proj into single FP32 weight for F.linear GEMM under allow_tf32 (TF32 tensor cores on Ampere+)."""
         # wk: [head_dim, hidden_size] + weights_proj: [n_heads, hidden_size]
         # → fused: [head_dim + n_heads, hidden_size]
         self._fused_wk_wp_weight = torch.cat(
             [self.wk.weight.data, self.weights_proj.weight.data], dim=0)
+
+    def post_load_weights(self) -> None:
+        self.cache_derived_state()
 
     @staticmethod
     def prepare_one_prefill_chunk(
@@ -2835,7 +2819,7 @@ class Indexer(nn.Module):
         split in MLA.forward_dsa_proj sees a stable signature.
         """
         assert self._fused_wk_wp_weight is not None, \
-            "post_load_weights() must be called before forward()"
+            "cache_derived_state() must be called before forward()"
         hidden_float = _to_float(hidden_states)
         with _tf32_matmul_enabled():
             # F.linear computes input @ weight.T internally; no explicit .t() needed.

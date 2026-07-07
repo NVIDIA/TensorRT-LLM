@@ -104,6 +104,8 @@ class KvCacheConfigV2:
     dtype: str = "auto"
     pool_ratio: Optional[List[float]] = None
     avg_seq_len: Optional[int] = None
+    block_reuse_policy: str = "all_reusable"
+    enable_swa_scratch_reuse: bool = False
     disk_prefetch_num_reqs: int = 4
     max_util_for_resume: float = 0.95
 
@@ -171,12 +173,13 @@ def build_kv_cache_manager(cfg_kv, mapping, use_v2):
 def add_sequence(mgr, req, prompt_len, use_v2):
     """Allocate KV blocks for the request. Returns a handle to close (V2) or None."""
     if use_v2:
-        kv = mgr._create_kv_cache(req.py_request_id, None, None)
-        ok = kv.resume(torch.cuda.current_stream().cuda_stream)
+        if req.is_disagg_generation_init_state:
+            ok = mgr.prepare_disagg_gen_init(req)
+        else:
+            ok = mgr.prepare_context(req) and mgr.resize_context(req, prompt_len)
         if not ok:
-            raise RuntimeError(f"V2 resume failed for request {req.py_request_id}")
-        kv.resize(prompt_len)
-        return kv
+            raise RuntimeError(f"V2 KV cache allocation failed for request {req.py_request_id}")
+        return None
     mgr.impl.add_sequence_batch([(req.py_request_id, prompt_len, 1)], [req])
     return None
 

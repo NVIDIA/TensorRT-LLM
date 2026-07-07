@@ -55,6 +55,7 @@ def chunk_gated_delta_rule(
     cu_seqlens: Optional[torch.Tensor] = None,
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
+    output: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Adapter for FlashInfer's chunk_gated_delta_rule."""
     # FlashInfer is imported lazily so importing this module on a non-FlashInfer
@@ -118,7 +119,11 @@ def chunk_gated_delta_rule(
     num_o_heads = max(q3.shape[1], v3.shape[1])
     head_size = q3.shape[2]
     need_state = inplace_indexed_state_update or output_final_state
-    output_buf = q3.new_empty(total_seq_len, num_o_heads, head_size)
+    output_buf = (
+        output.squeeze(0)
+        if output is not None
+        else q3.new_empty(total_seq_len, num_o_heads, head_size)
+    )
     if need_state:
         num_seqs = cu_seqlens.shape[0] - 1
         state_buf = q3.new_empty(num_seqs, num_o_heads, head_size, head_size, dtype=torch.float32)

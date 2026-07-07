@@ -273,6 +273,18 @@ class ShardingTransformConfig(TransformConfig):
         "Only effective when shard_all_unprocessed is True. "
         "When None, all unprocessed linear nodes are sharded.",
     )
+    exclude_shard_node_filter: Optional[str] = Field(
+        default=None,
+        description="Comma-separated list of substrings. Linear nodes whose name contains "
+        "ANY of the listed substrings are kept TP-replicated across all ranks "
+        "(no column-shard / row-shard / AllGather / AllReduce added) regardless of which "
+        "sharding path (heuristic catch-all, MHA, MLA, MoE, MLP) selected them. "
+        "Other sharding for the same layer (e.g. q_b_proj head-shard, o_proj row-shard) is "
+        "unaffected. Use to match PT-style replicated patterns -- for example, DeepseekV3 "
+        "keeps q_a_proj + kv_a_proj_with_mqa replicated (TP-unsharded, no AllGather) while "
+        "still column-sharding q_b/kv_b by heads. Example: "
+        "'q_a_proj,kv_a_proj_with_mqa'. When None (default), all sharding paths run as-is.",
+    )
     allreduce_strategy: AllReduceStrategy = Field(
         default=AllReduceStrategy.AUTO,
         description="AllReduce strategy for distributed operations. "
@@ -400,6 +412,11 @@ class ShardingTransformInfo(BaseModel, ABC):
 
     target_node: str
     config: ShardingTransformConfig
+    # Weight/param name (e.g. "...self_attn.q_a_proj.weight") resolved at from_node()
+    # time, where the FX node is available. exclude_shard_node_filter is documented in
+    # weight-name terms, so the central exclusion check matches against this (falling
+    # back to target_node). None when the node has no extractable weight.
+    weight_name: Optional[str] = None
 
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
         """
@@ -428,16 +445,17 @@ class ShardingTransformInfo(BaseModel, ABC):
         return True
 
     def __hash__(self) -> int:
-        """Make the transform info hashable by excluding the config field.
+        """Make the transform info hashable by excluding non-identity fields.
 
-        The config field is excluded because:
-        1. It may not be hashable (ShardingTransformConfig is mutable)
-        2. Tests set config=None before comparison anyway
+        Excluded:
+        - config: may not be hashable (ShardingTransformConfig is mutable); tests
+          set config=None before comparison anyway.
+        - weight_name: derived from the node (hence from target_node), so it is
+          redundant for identity; tests construct expected transforms without it.
         """
-        # Get all fields except 'config' for hashing
         field_values = []
         for field_name, field_info in self.model_fields.items():
-            if field_name != "config":
+            if field_name not in ("config", "weight_name"):
                 value = getattr(self, field_name)
                 # Handle enums
                 if isinstance(value, (Enum, IntEnum)):
@@ -479,7 +497,12 @@ class WeightShardingInfo(ShardingTransformInfo):
         Create the correct TPShardingInfo subclass (FP8/FP4/base) based on `node`.
         """
         subcls = _resolve_tp_cls_from_node(node)
-        return subcls(target_node=node.name, **kwargs)
+        wname = extract_weight_name(node)
+        return subcls(
+            target_node=node.name,
+            weight_name=wname if isinstance(wname, str) else None,
+            **kwargs,
+        )
 
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
         """Validate the transformation configuration."""
@@ -934,7 +957,12 @@ class EPShardingInfo(ShardingTransformInfo):
         Create the correct EPShardingInfo subclass (FP8/NVFP4/base) based on `node`.
         """
         subcls = _resolve_ep_cls_from_node(node)
-        return subcls(target_node=node.name, **kwargs)
+        wname = extract_weight_name(node)
+        return subcls(
+            target_node=node.name,
+            weight_name=wname if isinstance(wname, str) else None,
+            **kwargs,
+        )
 
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
         """Validate the transformation configuration."""
@@ -1401,6 +1429,12 @@ class ShardingTransformContainer(BaseModel):
     def add(self, transform: ShardingTransformInfo) -> bool:
         """Append a transform only if that node was
         not sharded before. Do not overwrite existing transforms.
+
+        Honors ``ShardingTransformConfig.exclude_shard_node_filter``: nodes whose
+        name matches any of the configured substrings are kept replicated across
+        TP ranks (the transform is silently dropped). The exclusion applies to
+        all weight/EP sharding paths so callers do not need to thread the filter
+        through every heuristic.
         """
         # Find the appropriate list by checking inheritance
         transform_list = None
@@ -1411,6 +1445,17 @@ class ShardingTransformContainer(BaseModel):
 
         if transform_list is None:
             raise ValueError(f"Unknown transform type: {type(transform)}")
+
+        # Global node-exclusion filter -- keeps matching nodes replicated
+        # regardless of which sharding heuristic picked them up.
+        if isinstance(transform, (WeightShardingInfo, EPShardingInfo)) and _is_node_excluded(
+            transform.weight_name or transform.target_node, self.config
+        ):
+            ad_logger.info(
+                f"Skipping sharding for node {transform.target_node!r} "
+                f"due to exclude_shard_node_filter"
+            )
+            return False
 
         # Check if node already has a transform
         for existing_transform in transform_list:
@@ -1423,6 +1468,21 @@ class ShardingTransformContainer(BaseModel):
 ########################################################
 #  Helper functions
 ########################################################
+
+
+def _is_node_excluded(node_name: str, config: "ShardingTransformConfig") -> bool:
+    """Return True if ``node_name`` matches any keyword in
+    ``ShardingTransformConfig.exclude_shard_node_filter``.
+
+    The filter is a comma-separated list of substrings; a node is excluded if its
+    name contains ANY of the listed substrings. Used to keep selected linears
+    replicated across TP ranks (no sharding/AllGather/AllReduce inserted).
+    """
+    pattern = getattr(config, "exclude_shard_node_filter", None)
+    if not pattern:
+        return False
+    keywords = [k.strip() for k in pattern.split(",") if k.strip()]
+    return any(kw in node_name for kw in keywords)
 
 
 def _load_hook_remove(
@@ -2557,13 +2617,19 @@ def _process_mla_sharding(
     # extract o_proj node
     o_proj = layer_subgraph.terminating_node
 
-    # add the sharding strategies for the q_a_proj and kv_a_proj nodes
-    num_simple_shards = _process_simple_shard(
-        [q_a_proj, kv_a_proj], transform_container, layer_type=LayerType.MLA
-    )
-    if num_simple_shards < 2:
-        # it means that "someone else" already sharded these nodes. Skipping.
-        return 0
+    # Simple-shard the q_a_proj/kv_a_proj opening linears (replicated output).
+    # Nodes excluded via exclude_shard_node_filter stay replicated. add() dedups
+    # nodes an earlier sharding source already touched, so we always continue to
+    # q_b/kv_b/o_proj instead of aborting the layer. The filter matches the WEIGHT
+    # name (e.g. "q_a_proj"), not the FX linear-node name, so resolve it.
+    def _excl_name(n):
+        w = extract_weight_name(n)
+        return w if isinstance(w, str) else n.name
+
+    a_proj_candidates = [q_a_proj, kv_a_proj]
+    a_proj_to_shard = [n for n in a_proj_candidates if not _is_node_excluded(_excl_name(n), config)]
+    if a_proj_to_shard:
+        _process_simple_shard(a_proj_to_shard, transform_container, layer_type=LayerType.MLA)
 
     # extract the sub-subgraph from q_b_proj and kv_b_proj to o_proj
     sub_subgraph = subgraph(
