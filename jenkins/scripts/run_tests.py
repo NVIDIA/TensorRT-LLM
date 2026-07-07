@@ -22,9 +22,11 @@ SLURM (slurm_run.sh) execution paths.
 import argparse
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 # Allow importing test_rerun from the same directory
@@ -37,6 +39,7 @@ import test_rerun
 sys.stdout.reconfigure(line_buffering=True)
 
 BANNER_WIDTH = 80
+COLLECT_TIMEOUT_SECONDS = 600
 
 
 def print_banner(title, char="="):
@@ -103,7 +106,8 @@ def render_test_list(test_db_list, working_dir, splits, group, perf_mode):
             cleaned_lines.append(stripped)
 
     # Write cleaned test list (without ISOLATION markers)
-    cleaned_file = test_db_list.replace(".txt", "_cleaned.txt")
+    test_db_path = Path(test_db_list)
+    cleaned_file = str(test_db_path.with_stem(test_db_path.stem + "_cleaned"))
     Path(cleaned_file).write_text("\n".join(cleaned_lines) + "\n" if cleaned_lines else "")
     print(f"Created cleaned testDBList: {cleaned_file} with {len(cleaned_lines)} lines")
     print(f"Original testDBList contains {len(isolation_tests)} tests with ISOLATION markers")
@@ -129,14 +133,28 @@ def render_test_list(test_db_list, working_dir, splits, group, perf_mode):
             f"--output-dir={collect_output_dir}"
         )
         print(f"Running: {collect_cmd}")
-        result = subprocess.run(
-            collect_cmd,
-            shell=True,
-            capture_output=True,
-            text=True,
-            cwd=working_dir,
-            env=env_vars,
-        )
+        try:
+            result = subprocess.run(
+                collect_cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                cwd=working_dir,
+                env=env_vars,
+                timeout=COLLECT_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as e:
+            partial_stdout = (e.stdout or "").strip() if isinstance(e.stdout, str) else ""
+            partial_stderr = (e.stderr or "").strip() if isinstance(e.stderr, str) else ""
+            print(
+                f"Error: pytest --collect-only timed out after {COLLECT_TIMEOUT_SECONDS}s "
+                f"(possible import-time deadlock)"
+            )
+            if partial_stdout:
+                print(f"partial stdout:\n{partial_stdout}")
+            if partial_stderr:
+                print(f"partial stderr:\n{partial_stderr}")
+            sys.exit(1)
 
         output = result.stdout.strip()
         print("<<<START_PYTEST_OUTPUT>>>")
@@ -196,8 +214,8 @@ def render_test_list(test_db_list, working_dir, splits, group, perf_mode):
                     regular_tests.append(cleaned_match)
 
     # Write regular and isolate list files
-    regular_file = test_db_list.replace(".txt", "_regular.txt")
-    isolate_file = test_db_list.replace(".txt", "_isolate.txt")
+    regular_file = str(test_db_path.with_stem(test_db_path.stem + "_regular"))
+    isolate_file = str(test_db_path.with_stem(test_db_path.stem + "_isolate"))
 
     Path(regular_file).write_text("\n".join(regular_tests) + "\n" if regular_tests else "")
     Path(isolate_file).write_text("\n".join(isolate_tests) + "\n" if isolate_tests else "")
@@ -229,6 +247,38 @@ def run_pytest(pytest_cmd, working_dir):
     return result.returncode, elapsed
 
 
+def rebuild_pytest_command(base_cmd, drop_patterns, append_args):
+    """Drop args matching any prefix in drop_patterns, then append append_args.
+
+    For tokens of the form ``--flag=value`` the single token is dropped; for
+    ``--flag value`` the following value token is also dropped (when it does
+    not look like another flag).
+
+    Args:
+        base_cmd: The original pytest command string.
+        drop_patterns: Argument prefixes to strip from base_cmd.
+        append_args: Tokens to append after stripping (already individually
+            shell-safe; quoting is handled by ``shlex.join``).
+
+    Returns:
+        Rebuilt pytest command string.
+    """
+    parts = []
+    tokens = shlex.split(base_cmd)
+    skip_next = False
+    for i, token in enumerate(tokens):
+        if skip_next:
+            skip_next = False
+            continue
+        if any(token.startswith(p) for p in drop_patterns):
+            if "=" not in token and i + 1 < len(tokens) and not tokens[i + 1].startswith("-"):
+                skip_next = True
+            continue
+        parts.append(token)
+    parts.extend(append_args)
+    return shlex.join(parts)
+
+
 def build_rerun_command(base_cmd, test_list, xml_path, csv_path, reruns):
     """Build a rerun pytest command by stripping split/cov args and replacing test-list/output args.
 
@@ -242,36 +292,24 @@ def build_rerun_command(base_cmd, test_list, xml_path, csv_path, reruns):
     Returns:
         Modified pytest command string.
     """
-    # Remove args that shouldn't be in rerun commands
-    no_need_patterns = ["--splitting-algorithm", "--splits", "--group", "--cov"]
-    need_to_change_patterns = ["--test-list", "--csv", "--periodic-junit-xmlpath"]
-
-    parts = []
-    tokens = base_cmd.split()
-    skip_next = False
-    for i, token in enumerate(tokens):
-        if skip_next:
-            skip_next = False
-            continue
-        # Check if this token should be removed
-        if any(token.startswith(p) for p in no_need_patterns):
-            if "=" not in token and i + 1 < len(tokens) and not tokens[i + 1].startswith("-"):
-                skip_next = True
-            continue
-        # Check if this token should be replaced
-        if any(token.startswith(p) for p in need_to_change_patterns):
-            if "=" not in token and i + 1 < len(tokens) and not tokens[i + 1].startswith("-"):
-                skip_next = True
-            continue
-        parts.append(token)
-
-    cmd = " ".join(parts)
-    cmd += f" --test-list={test_list}"
-    cmd += f" --csv={csv_path}"
-    cmd += f" --periodic-junit-xmlpath {xml_path}"
+    drop_patterns = [
+        "--splitting-algorithm",
+        "--splits",
+        "--group",
+        "--cov",
+        "--test-list",
+        "--csv",
+        "--periodic-junit-xmlpath",
+    ]
+    append_args = [
+        f"--test-list={test_list}",
+        f"--csv={csv_path}",
+        "--periodic-junit-xmlpath",
+        xml_path,
+    ]
     if reruns > 0:
-        cmd += f" --reruns {reruns}"
-    return cmd
+        append_args.extend(["--reruns", str(reruns)])
+    return rebuild_pytest_command(base_cmd, drop_patterns, append_args)
 
 
 def build_isolated_command(base_cmd, test_list, xml_path, csv_path):
@@ -286,27 +324,15 @@ def build_isolated_command(base_cmd, test_list, xml_path, csv_path):
     Returns:
         Modified pytest command string.
     """
-    need_to_change_patterns = ["--test-list", "--test-prefix", "--csv", "--periodic-junit-xmlpath"]
-
-    parts = []
-    tokens = base_cmd.split()
-    skip_next = False
-    for i, token in enumerate(tokens):
-        if skip_next:
-            skip_next = False
-            continue
-        if any(token.startswith(p) for p in need_to_change_patterns):
-            if "=" not in token and i + 1 < len(tokens) and not tokens[i + 1].startswith("-"):
-                skip_next = True
-            continue
-        parts.append(token)
-
-    cmd = " ".join(parts)
-    cmd += f" --test-list={test_list}"
-    cmd += f" --csv={csv_path}"
-    cmd += f" --periodic-junit-xmlpath {xml_path}"
-    cmd += " --cov-append"
-    return cmd
+    drop_patterns = ["--test-list", "--test-prefix", "--csv", "--periodic-junit-xmlpath"]
+    append_args = [
+        f"--test-list={test_list}",
+        f"--csv={csv_path}",
+        "--periodic-junit-xmlpath",
+        xml_path,
+        "--cov-append",
+    ]
+    return rebuild_pytest_command(base_cmd, drop_patterns, append_args)
 
 
 # ---------------------------------------------------------------------------
@@ -556,15 +582,23 @@ def merge_results(output_dir, stage_name, all_xml_files):
     """
     # Fix testsuite names in all XMLs
     for xml_file in all_xml_files:
-        if os.path.exists(xml_file):
+        if not os.path.exists(xml_file):
+            continue
+        try:
+            tree = ET.parse(xml_file)
+        except (OSError, ET.ParseError) as e:
+            print(f"Warning: Failed to parse {xml_file}: {e}")
+            continue
+        modified = False
+        for ts in tree.iter("testsuite"):
+            if ts.get("name") == "pytest":
+                ts.set("name", stage_name)
+                modified = True
+        if modified:
             try:
-                content = Path(xml_file).read_text()
-                content = content.replace(
-                    'testsuite name="pytest"', f'testsuite name="{stage_name}"'
-                )
-                Path(xml_file).write_text(content)
-            except Exception as e:
-                print(f"Warning: Failed to fix testsuite name in {xml_file}: {e}")
+                tree.write(xml_file, encoding="utf-8", xml_declaration=True)
+            except OSError as e:
+                print(f"Warning: Failed to write {xml_file}: {e}")
 
     # Separate original results and rerun results
     rerun_result_files = []
