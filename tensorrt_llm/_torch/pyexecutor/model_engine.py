@@ -2357,6 +2357,8 @@ class PyTorchModelEngine(ModelEngine):
         self._init_max_num_tokens()
 
     def _release_cuda_graphs(self):
+        if self._torch_compile_backend is not None:
+            self._torch_compile_backend.clear_piecewise_cuda_graphs()
         if hasattr(self,
                    'cuda_graph_runner') and self.cuda_graph_runner is not None:
             self.cuda_graph_runner.clear()
