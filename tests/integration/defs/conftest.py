@@ -53,6 +53,12 @@ from .trt_test_alternative import (call, check_output, exists, is_windows,
                                    wsl_to_win_path)
 from .utils.periodic_junit import PeriodicJUnitXML
 
+# Registered here (not via "-p" in pytest.ini addopts): "-p" plugins import at
+# pytest preparse, BEFORE the ini pythonpath entries are usable, so whether
+# "test_common" resolves would depend on the invocation cwd. Loading from the
+# top-level conftest runs after pythonpath insertion and works from any cwd.
+pytest_plugins = ("test_common.session_prefetcher_hooks", )
+
 try:
     from llm import trt_environment
 except ImportError:

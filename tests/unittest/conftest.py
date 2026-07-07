@@ -41,6 +41,12 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from integration.defs import test_list_parser
 from test_common import s3_output
 
+# Registered here (not via "-p" in pytest.ini addopts): "-p" plugins import at
+# pytest preparse, BEFORE the ini pythonpath entries are usable, so whether
+# "test_common" resolves would depend on the invocation cwd. Loading from the
+# top-level conftest runs after the sys.path setup above and works from any cwd.
+pytest_plugins = ("test_common.session_prefetcher_hooks", )
+
 
 def dump_threads(signum, frame):
     print_all_stacks()

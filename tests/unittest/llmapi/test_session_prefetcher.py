@@ -27,10 +27,13 @@ class _FakeItem:
 @pytest.fixture
 def prefetcher(monkeypatch):
     monkeypatch.setenv("TRTLLM_TEST_PREFETCH_SESSION", "1")
+    # These pure-logic tests may themselves run under xdist; pin the worker
+    # marker off so the prefetcher's xdist guard does not disable it here.
+    monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
     p = SessionPrefetcher()
     # Record trigger calls instead of spawning MPI pools / reading weights.
     built, warmed = [], []
-    monkeypatch.setattr(SessionPrefetcher, "_build", lambda self, spec: built.append(spec))
+    monkeypatch.setattr(SessionPrefetcher, "_build", lambda self, spec, gen: built.append(spec))
     monkeypatch.setattr(SessionPrefetcher, "_warm", lambda self, d: warmed.append(d))
     # No real NVML polling in pure-logic tests.
     monkeypatch.setattr(session_prefetcher, "wait_gpu_memory_settle", lambda: None)
@@ -48,6 +51,7 @@ def _run_setup_and_join(p, item):
 
 def test_enabled_by_default(monkeypatch):
     monkeypatch.delenv("TRTLLM_TEST_PREFETCH_SESSION", raising=False)
+    monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
     assert SessionPrefetcher().enabled
 
 
@@ -167,6 +171,60 @@ def test_take_discards_on_env_mismatch(prefetcher, monkeypatch):
 
         time.sleep(0.05)
     assert pool.shut  # stale shadow torn down in the background
+
+
+def test_take_discards_on_nonprefixed_env_mismatch(prefetcher, monkeypatch):
+    # Workers inherit the WHOLE parent env at spawn; test knobs outside any
+    # TRTLLM*/TLLM* prefix (e.g. OVERRIDE_QUANT_ALGO, read inside workers by
+    # model_config.py) must also invalidate a prefetched pool, else workers
+    # silently run with stale env (review finding on the prefix allowlist).
+    pool = _FakePool(4)
+    prefetcher._built_spec, prefetcher._built_session = 4, pool
+    prefetcher._built_snapshot = session_prefetcher._spawn_snapshot()
+    monkeypatch.setenv("OVERRIDE_QUANT_ALGO", "W4A16_MXFP4")
+    assert prefetcher.take(4) is None
+
+
+def test_pytest_current_test_drift_does_not_discard(prefetcher, monkeypatch):
+    # PYTEST_CURRENT_TEST changes every test phase by design; it must not
+    # invalidate the snapshot or no prefetched pool would ever be handed over.
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_a (call)")
+    pool = _FakePool(4)
+    prefetcher._built_spec, prefetcher._built_session = 4, pool
+    prefetcher._built_snapshot = session_prefetcher._spawn_snapshot()
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_b (setup)")
+    assert prefetcher.take(4) is pool
+
+
+def test_disabled_in_xdist_worker(monkeypatch):
+    # Under xdist each worker sees the full collection but runs a subset:
+    # collection-order lookahead would prefetch for other workers' tests and
+    # multiply live pools by the worker count.
+    monkeypatch.setenv("TRTLLM_TEST_PREFETCH_SESSION", "1")
+    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw0")
+    assert not SessionPrefetcher().enabled
+
+
+def test_abandoned_build_publish_discards_pool(prefetcher):
+    # A build that outlives take()'s join timeout is abandoned (generation
+    # bump); its late _publish() must shut the pool down, not land it —
+    # landing would overwrite (and leak) a newer pool or hand stale state
+    # to a future test.
+    pool = _FakePool(4)
+    gen = prefetcher._build_gen
+    prefetcher._build_gen += 1  # what take()/dispose() do on abandonment
+    prefetcher._publish(4, pool, session_prefetcher._spawn_snapshot(), gen)
+    assert pool.shut
+    assert prefetcher._built_session is None
+
+
+def test_publish_never_overwrites_unconsumed_pool(prefetcher):
+    first, second = _FakePool(4), _FakePool(4)
+    snap = session_prefetcher._spawn_snapshot()
+    prefetcher._publish(4, first, snap, prefetcher._build_gen)
+    prefetcher._publish(4, second, snap, prefetcher._build_gen)
+    assert prefetcher._built_session is first  # slot kept
+    assert second.shut and not first.shut  # newcomer discarded, not the slot
 
 
 def test_take_discards_on_syspath_mismatch(prefetcher, monkeypatch):
@@ -312,6 +370,15 @@ def test_settle_without_pynvml_is_noop(monkeypatch):
 
     monkeypatch.setattr(builtins, "__import__", _no_pynvml)
     session_prefetcher.wait_gpu_memory_settle()  # must not raise
+
+
+def test_warm_io_thread_names_covered_by_threadleak_exclude():
+    # Both pytest.ini threadleak_exclude lists contain r"session-prefetch-\w+";
+    # the warm executor's thread_name_prefix must keep its IO workers inside
+    # that pattern (a large warm can outlive the test that started it).
+    import re
+
+    assert re.fullmatch(r"session-prefetch-\w+", "session-prefetch-io_0")
 
 
 def test_warm_page_cache_reads_weight_files(tmp_path):
