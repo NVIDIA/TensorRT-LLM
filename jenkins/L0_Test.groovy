@@ -4034,7 +4034,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             "${WORKSPACE}/${stageName}",
             coverageConfigFile,
             "",  // pytestUtil
-            extraArgs,  // extraArgs
+            extraArgs,  // S3 upload args; test-list/durations handled by run_tests.py
             containerPortStart,
             containerPortNum
         )
