@@ -1,0 +1,155 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Pure-logic tests for automatic MPI session reuse — no MPI, no GPU."""
+
+import pytest
+from test_common import session_reuse
+from test_common.session_reuse import SessionReuseCache
+
+
+class _FakePool:
+    def __init__(self, n_workers):
+        self.n_workers = n_workers
+        self.shut = False
+        import os
+
+        self.spawn_env_weight_cache = os.environ.get("TRTLLM_HF_WEIGHT_CACHE")
+
+    def shutdown(self):
+        self.shut = True
+
+    def shutdown_abort(self, *args, **kwargs):
+        self.shut = True
+
+
+@pytest.fixture
+def reuse_cache(monkeypatch):
+    monkeypatch.setenv("TRTLLM_TEST_REUSE_SESSION", "1")
+    monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
+    cache = SessionReuseCache()
+    # No real MPI / NVML in pure-logic tests: record the calls instead.
+    resets = []
+    monkeypatch.setattr(session_reuse, "submit_sync_per_worker", lambda s, fn: resets.append(s))
+    monkeypatch.setattr(session_reuse, "wait_gpu_memory_settle", lambda: None)
+    cache.resets = resets
+    return cache
+
+
+def _wait(pred, timeout=5.0):
+    import time
+
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        if pred():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_reuse_hands_back_same_pool(reuse_cache):
+    s1 = reuse_cache.acquire(_FakePool, 2)
+    real = s1._real
+    s1.shutdown()  # released to cache, not killed
+    assert not real.shut
+    s2 = reuse_cache.acquire(_FakePool, 2)
+    assert s2._real is real  # the SAME pool, reused
+    assert reuse_cache.resets  # workers were reset between handouts
+
+
+def test_reuse_size_mismatch_builds_new(reuse_cache):
+    s1 = reuse_cache.acquire(_FakePool, 2)
+    s1.shutdown()
+    s2 = reuse_cache.acquire(_FakePool, 4)
+    assert s2._real.n_workers == 4 and s2._real is not s1._real
+
+
+def test_reuse_env_change_retires_pool(reuse_cache, monkeypatch):
+    s1 = reuse_cache.acquire(_FakePool, 2)
+    real = s1._real
+    s1.shutdown()
+    monkeypatch.setenv("SOME_TEST_KNOB", "changed-after-spawn")
+    s2 = reuse_cache.acquire(_FakePool, 2)
+    assert s2._real is not real  # stale-env pool not handed out
+    assert _wait(lambda: real.shut)  # and it was retired in the background
+
+
+def test_reuse_syspath_change_retires_pool(reuse_cache, monkeypatch):
+    s1 = reuse_cache.acquire(_FakePool, 2)
+    real = s1._real
+    s1.shutdown()
+    monkeypatch.syspath_prepend("/oot/example/path")
+    s2 = reuse_cache.acquire(_FakePool, 2)
+    assert s2._real is not real  # frozen workers could not import from it
+
+
+def test_reuse_max_uses_retires_pool(reuse_cache, monkeypatch):
+    monkeypatch.setenv("TRTLLM_TEST_REUSE_MAX_USES", "2")
+    s = reuse_cache.acquire(_FakePool, 2)
+    first = s._real
+    s.shutdown()
+    s = reuse_cache.acquire(_FakePool, 2)  # use #2 (cap)
+    assert s._real is first
+    s.shutdown()
+    s = reuse_cache.acquire(_FakePool, 2)  # over the cap -> fresh pool
+    assert s._real is not first
+    assert _wait(lambda: first.shut)
+
+
+def test_reuse_abort_never_recycles(reuse_cache):
+    s1 = reuse_cache.acquire(_FakePool, 2)
+    real = s1._real
+    s1.shutdown_abort()
+    s2 = reuse_cache.acquire(_FakePool, 2)
+    assert s2._real is not real
+
+
+def test_reuse_failed_reset_rebuilds(reuse_cache, monkeypatch):
+    s1 = reuse_cache.acquire(_FakePool, 2)
+    real = s1._real
+    s1.shutdown()
+
+    def _boom(session, fn):
+        raise RuntimeError("worker died")
+
+    monkeypatch.setattr(session_reuse, "submit_sync_per_worker", _boom)
+    s2 = reuse_cache.acquire(_FakePool, 2)  # health probe fails -> fresh pool
+    assert s2._real is not real
+    assert _wait(lambda: real.shut)
+
+
+def test_suspended_gives_private_untracked_pool(reuse_cache):
+    reuse_cache.suspend(True)
+    s = reuse_cache.acquire(_FakePool, 2)
+    assert isinstance(s, _FakePool)  # raw pool: the LLM owns and destroys it
+    reuse_cache.suspend(False)
+
+
+def test_disabled_under_xdist(monkeypatch):
+    monkeypatch.setenv("TRTLLM_TEST_REUSE_SESSION", "1")
+    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw0")
+    assert not SessionReuseCache().enabled
+
+
+def test_weight_cache_env_scoped_to_spawn(reuse_cache, monkeypatch):
+    import os
+
+    monkeypatch.delenv("TRTLLM_HF_WEIGHT_CACHE", raising=False)
+    s = reuse_cache.acquire(_FakePool, 2)
+    # Workers froze the cache env at spawn...
+    assert s._real.spawn_env_weight_cache == "1"
+    # ...but the suite's environment is untouched afterwards.
+    assert "TRTLLM_HF_WEIGHT_CACHE" not in os.environ
+
+
+def test_weight_cache_env_respects_user_setting(reuse_cache, monkeypatch):
+    monkeypatch.setenv("TRTLLM_HF_WEIGHT_CACHE", "0")
+    s = reuse_cache.acquire(_FakePool, 2)
+    assert s._real.spawn_env_weight_cache == "0"  # explicit user value wins
+
+
+def test_drain_shuts_cached_pools(reuse_cache):
+    s = reuse_cache.acquire(_FakePool, 2)
+    real = s._real
+    s.shutdown()
+    reuse_cache.drain()
+    assert real.shut
