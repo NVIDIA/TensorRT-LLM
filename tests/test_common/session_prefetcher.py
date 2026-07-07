@@ -85,8 +85,39 @@ def _spawn_snapshot():
     )
 
 
-_WEIGHT_GLOBS = ("*.safetensors", "*.bin")
 _READ_CHUNK = 64 << 20  # 64MB
+
+
+def _weight_files(model_dir: str):
+    """The weight files the loader will actually read, in loader order.
+
+    Mirrors HfWeightLoader.load_weights' selection: safetensors first —
+    minus "consolidated" copies, which the loader deliberately skips (they
+    duplicate the shards and can be enormous) — else *.bin, else *.pth.
+    Warming anything else is pure wasted IO.
+    """
+    files = [
+        f
+        for f in glob.glob(os.path.join(model_dir, "*.safetensors"))
+        if "consolidated" not in os.path.basename(f)
+    ]
+    for fallback in ("*.bin", "*.pth"):
+        if files:
+            break
+        files = glob.glob(os.path.join(model_dir, fallback))
+    return sorted(files)
+
+
+def _available_host_memory():
+    """MemAvailable from /proc/meminfo in bytes, or None when unreadable."""
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
 
 
 def _model_dir_of(item):
@@ -112,9 +143,20 @@ def warm_page_cache(model_dir: str) -> float:
     IO — never touches CUDA, safe to run while another test owns the GPUs.
     Returns the number of GiB read.
     """
-    files = sorted(f for pat in _WEIGHT_GLOBS for f in glob.glob(os.path.join(model_dir, pat)))
+    files = _weight_files(model_dir)
     if not files:
         return 0.0  # not a local weight dir (e.g. an HF model id): nothing to warm
+    total_bytes = sum(os.stat(f).st_size for f in files)
+    available = _available_host_memory()
+    if available is not None and total_bytes > available:
+        # Larger than RAM: pages would be evicted before the test loads them —
+        # pure filer traffic with zero benefit (e.g. multi-hundred-GB models).
+        print(
+            f"[session-prefetch] skipping warm of {model_dir}: {total_bytes >> 30} GiB "
+            f"exceeds available host memory ({available >> 30} GiB)",
+            flush=True,
+        )
+        return 0.0
     t0 = time.monotonic()
 
     def _read(path):
@@ -276,7 +318,7 @@ class SessionPrefetcher:
         self._build_gen = 0  # bumped when a pending build is abandoned
         self._built = None  # Optional[_Built], set only by _publish()
         self._patched = set()
-        self._next_model = {}  # item -> next declared model dir (on_collection)
+        self._next_model = None  # item -> next model dir; built lazily
         self._warmed_dirs = set()
 
     @property
@@ -293,40 +335,44 @@ class SessionPrefetcher:
             "on",
         )
 
-    def on_collection(self, items) -> None:
-        """Precompute, per item, the model dir of the NEXT test declaring one.
+    @staticmethod
+    def _next_model_map(items):
+        """Per item, the model dir of the NEXT test declaring one.
 
-        One reverse pass, one marker lookup per item — O(n) once. Suites with
-        no ``prefetch_model_dir`` markers keep an empty map, so their
-        ``on_test_setup`` is a single dict lookup. (The naive alternative —
-        scanning the remaining collection at every test setup — costs O(n^2)
-        marker lookups per session, seconds to minutes on large suites.)
+        One reverse pass, one lookup per item — O(n) once; ``on_test_setup``
+        then costs a single dict lookup per test. (The naive alternative —
+        scanning the remaining collection at every test setup — is O(n^2)
+        lookups per session, seconds to minutes on large suites.)
         """
-        if not self.enabled:
-            return
-        next_model, mapping, seen = None, {}, False
+        next_model, mapping = None, {}
         for item in reversed(items):
             mapping[item] = next_model
             model = _model_dir_of(item)
             if model is not None:
-                next_model, seen = model, True
-        if seen:
-            self._next_model = mapping
+                next_model = model
+        return mapping
 
     def on_test_setup(self, item) -> None:
         """Warm the NEXT test's model weights while this test runs.
 
-        Fires when the next declared model differs from the current one —
-        including between tests that share a pool (pool prefetch does not
-        cover model IO).
+        Fires when the next model differs from the current one — including
+        between tests that share a pool (pool prefetch does not cover model
+        IO). The next-model map is built lazily on the FIRST test setup, from
+        ``session.items``: by then every reordering/deselecting plugin
+        (pytest-split runs trylast, --test-list filtering, -k/-m) has produced
+        the final run order, which a ``pytest_collection_modifyitems`` hook
+        could not guarantee.
         """
+        if self._next_model is None:
+            items = getattr(item.session, "items", None) or [item]
+            self._next_model = self._next_model_map(items) if self.enabled else {}
         nxt = self._next_model.get(item)
         if not nxt or nxt == _model_dir_of(item):
             return
-        with self._lock:
-            if nxt in self._warmed_dirs:
-                return  # already warmed (or being warmed) this session
-            self._warmed_dirs.add(nxt)
+        # Main-pytest-thread only (pytest_runtest_setup): no lock needed.
+        if nxt in self._warmed_dirs:
+            return  # already warmed (or being warmed) this session
+        self._warmed_dirs.add(nxt)
         threading.Thread(
             target=self._warm, args=(nxt,), daemon=True, name="session-prefetch-warm"
         ).start()

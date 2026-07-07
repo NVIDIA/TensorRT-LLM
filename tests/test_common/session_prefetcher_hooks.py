@@ -19,10 +19,6 @@ def pytest_configure(config):
     )
 
 
-def pytest_collection_modifyitems(items):
-    PREFETCHER.on_collection(items)
-
-
 def pytest_runtest_setup(item):
     PREFETCHER.install_pool_factory_if_loaded()
     PREFETCHER.on_test_setup(item)

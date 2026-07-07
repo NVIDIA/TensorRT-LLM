@@ -2,6 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pure-logic tests for the session prefetcher — no MPI, no GPU."""
 
+import re
+import sys
+import threading
+import time
+import types
+from pathlib import Path
+
 import pytest
 from test_common import session_prefetcher
 from test_common.session_prefetcher import SessionPrefetcher, warm_page_cache
@@ -19,6 +26,24 @@ class _FakeItem:
 
     def get_closest_marker(self, name):
         return self._marker if name == "prefetch_model_dir" else None
+
+
+def _as_session(*items):
+    """Link fake items into a fake pytest session (final run order)."""
+    session = types.SimpleNamespace(items=list(items))
+    for item in items:
+        item.session = session
+    return list(items)
+
+
+def _wait_for(cond, timeout=5.0):
+    """Poll ``cond`` (fire-and-forget background work) until true or timeout."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if cond():
+            return True
+        time.sleep(0.05)
+    return cond()
 
 
 @pytest.fixture
@@ -111,13 +136,7 @@ def test_take_discards_on_env_mismatch(prefetcher, monkeypatch):
     _arm(prefetcher, pool, spec=4)
     monkeypatch.setenv("TLLM_TEST_ONLY_FLAG", "changed-after-spawn")
     assert prefetcher.take(4) is None  # frozen workers would miss the new env
-    import time
-
-    for _ in range(100):
-        if pool.shut:
-            break
-        time.sleep(0.05)
-    assert pool.shut  # stale shadow torn down in the background
+    assert _wait_for(lambda: pool.shut)  # stale shadow torn down in background
 
 
 def test_take_discards_on_nonprefixed_env_mismatch(prefetcher, monkeypatch):
@@ -158,9 +177,6 @@ def test_take_does_not_join_unstarted_shadow_thread(prefetcher, monkeypatch):
     # assign-then-start critical section, joining a thread that had not been
     # started yet ("cannot join thread before it is started"). A slow start()
     # widens the assign->start window deterministically.
-    import threading
-    import time
-
     class _SlowStartThread(threading.Thread):
         def start(self):
             time.sleep(0.3)  # hold the assigned-but-unstarted state visible
@@ -216,16 +232,10 @@ def test_handover_waits_for_gpu_settle(prefetcher, monkeypatch):
 
 
 def test_model_switch_triggers_warm_and_dedups(prefetcher):
-    items = [_FakeItem("/models/a"), _FakeItem("/models/b")]
-    prefetcher.on_collection(items)
+    items = _as_session(_FakeItem("/models/a"), _FakeItem("/models/b"))
     prefetcher.on_test_setup(items[0])
     # Warm threads are fire-and-forget; poll briefly for the recorded call.
-    import time
-
-    for _ in range(100):
-        if prefetcher.warmed:
-            break
-        time.sleep(0.05)
+    assert _wait_for(lambda: prefetcher.warmed)
     assert prefetcher.warmed == ["/models/b"]
     # Same next-model again: deduplicated.
     prefetcher.on_test_setup(items[0])
@@ -235,22 +245,16 @@ def test_model_switch_triggers_warm_and_dedups(prefetcher):
 
 def test_same_next_model_does_not_warm(prefetcher):
     # Consecutive tests on the same model: its weights are already hot.
-    items = [_FakeItem("/models/a"), _FakeItem("/models/a")]
-    prefetcher.on_collection(items)
+    items = _as_session(_FakeItem("/models/a"), _FakeItem("/models/a"))
     prefetcher.on_test_setup(items[0])
-    import time
-
     time.sleep(0.2)
     assert prefetcher.warmed == []
 
 
 def test_no_marker_suite_never_warms(prefetcher):
-    # Suites without prefetch_model_dir markers must stay O(1) per test:
-    # on_collection keeps an empty map (no per-setup collection scans).
-    items = [_FakeItem(), _FakeItem(), _FakeItem()]
-    prefetcher.on_collection(items)
-    assert prefetcher._next_model == {}
+    items = _as_session(_FakeItem(), _FakeItem(), _FakeItem())
     prefetcher.on_test_setup(items[0])
+    time.sleep(0.2)
     assert prefetcher.warmed == []
 
 
@@ -263,15 +267,9 @@ def test_auto_model_dir_from_accuracy_class_attr(prefetcher):
     class _TestQwen:
         MODEL_PATH = "/models/qwen"
 
-    items = [_FakeItem(cls=_TestLlama), _FakeItem(cls=_TestQwen)]
-    prefetcher.on_collection(items)
+    items = _as_session(_FakeItem(cls=_TestLlama), _FakeItem(cls=_TestQwen))
     prefetcher.on_test_setup(items[0])
-    import time
-
-    for _ in range(100):
-        if prefetcher.warmed:
-            break
-        time.sleep(0.05)
+    assert _wait_for(lambda: prefetcher.warmed)
     assert prefetcher.warmed == ["/models/qwen"]
 
 
@@ -283,27 +281,54 @@ def test_marker_overrides_class_model_path():
     assert session_prefetcher._model_dir_of(item) == "/models/from-marker"
 
 
+def test_accuracy_harness_still_declares_model_path():
+    # _model_dir_of auto-discovers models via the MODEL_PATH class attribute of
+    # the accuracy harnesses (accuracy_core.py); renaming that attribute would
+    # silently kill warming repo-wide. Textual check — importing accuracy_core
+    # would drag integration-only dependencies into this unit test.
+    core = Path(__file__).parents[2] / "integration" / "defs" / "accuracy" / "accuracy_core.py"
+    assert re.search(r"^\s+MODEL_PATH\s*=", core.read_text(), re.MULTILINE), (
+        "accuracy_core.py no longer declares MODEL_PATH — update "
+        "session_prefetcher._model_dir_of to the harness's new convention"
+    )
+
+
+def test_warm_selects_files_like_the_weight_loader(tmp_path):
+    # Selection must mirror HfWeightLoader.load_weights: safetensors first
+    # (minus huge "consolidated" copies the loader skips), so the .bin copy
+    # and the consolidated file must NOT be read here.
+    payload = b"x" * (1 << 20)
+    (tmp_path / "model-00001.safetensors").write_bytes(payload)
+    (tmp_path / "consolidated.safetensors").write_bytes(payload * 4)
+    (tmp_path / "pytorch_model.bin").write_bytes(payload)
+    (tmp_path / "config.json").write_bytes(b"{}")  # not a weight file
+    assert warm_page_cache(str(tmp_path)) == pytest.approx(1 / 1024, rel=1e-3)
+
+
+def test_warm_falls_back_to_bin_then_pth(tmp_path):
+    payload = b"x" * (1 << 20)
+    (tmp_path / "pytorch_model.bin").write_bytes(payload)
+    assert warm_page_cache(str(tmp_path)) == pytest.approx(1 / 1024, rel=1e-3)
+
+
 def test_warm_page_cache_ignores_non_weight_dirs(tmp_path):
     # MODEL_PATH may be an HF model id or a dir without local weights: no-op.
     assert warm_page_cache(str(tmp_path)) == 0.0
     assert warm_page_cache("not/a/real/dir") == 0.0
 
 
-def test_warm_page_cache_reads_weight_files(tmp_path):
-    payload = b"x" * (1 << 20)
-    (tmp_path / "model-00001.safetensors").write_bytes(payload)
-    (tmp_path / "pytorch_model.bin").write_bytes(payload)
-    (tmp_path / "config.json").write_bytes(b"{}")  # not a weight file
-    gib = warm_page_cache(str(tmp_path))
-    assert gib == pytest.approx(2 / 1024, rel=1e-3)
+def test_warm_skips_models_larger_than_host_memory(tmp_path, monkeypatch):
+    # Warming a model bigger than free RAM is pure filer traffic: the pages
+    # would be evicted before the test loads them (DeepSeek-R1-class dirs).
+    (tmp_path / "model-00001.safetensors").write_bytes(b"x" * (1 << 20))
+    monkeypatch.setattr(session_prefetcher, "_available_host_memory", lambda: 1 << 10)
+    assert warm_page_cache(str(tmp_path)) == 0.0
 
 
 def test_warm_io_thread_names_covered_by_threadleak_exclude():
     # Both pytest.ini threadleak_exclude lists contain r"session-prefetch-\w+";
     # the warm executor's thread_name_prefix must keep its IO workers inside
     # that pattern (a large warm can outlive the test that started it).
-    import re
-
     assert re.fullmatch(r"session-prefetch-\w+", "session-prefetch-io_0")
 
 
@@ -312,9 +337,6 @@ def test_patch_targets_cover_all_library_construction_sites():
     # library grows another MpiPoolSession(...) construction site, prefetch
     # would silently stop covering it (armed spare pools would idle next to
     # directly-constructed ones) — turn that drift into a red test.
-    import re
-    from pathlib import Path
-
     import tensorrt_llm
 
     root = Path(tensorrt_llm.__file__).parent
@@ -344,8 +366,6 @@ class _FakeMem:
 
 def _fake_pynvml(free_sequence, total):
     """A pynvml stand-in whose reported free memory follows ``free_sequence``."""
-    import types
-
     mod = types.ModuleType("pynvml")
     calls = {"n": 0}
     mod.nvmlInit = lambda: None
@@ -371,11 +391,8 @@ def no_visible_devices_mask(monkeypatch):
 
 
 def test_settle_noop_when_gpu_free(monkeypatch, no_visible_devices_mask):
-    import sys as _sys
-    import time
-
     fake = _fake_pynvml([75 * _GIB], 80 * _GIB)
-    monkeypatch.setitem(_sys.modules, "pynvml", fake)
+    monkeypatch.setitem(sys.modules, "pynvml", fake)
     t0 = time.monotonic()
     session_prefetcher.wait_gpu_memory_settle()
     assert time.monotonic() - t0 < 0.2  # no polling on an already-free GPU
@@ -383,22 +400,17 @@ def test_settle_noop_when_gpu_free(monkeypatch, no_visible_devices_mask):
 
 
 def test_settle_waits_for_previous_worker_release(monkeypatch, no_visible_devices_mask):
-    import sys as _sys
-
     # Free memory rising as the previous worker exits: 17 -> 40 -> 75 GiB.
     fake = _fake_pynvml([17 * _GIB, 40 * _GIB, 75 * _GIB], 80 * _GIB)
-    monkeypatch.setitem(_sys.modules, "pynvml", fake)
+    monkeypatch.setitem(sys.modules, "pynvml", fake)
     monkeypatch.setattr(session_prefetcher, "_SETTLE_POLL_S", 0.01)
     session_prefetcher.wait_gpu_memory_settle()
     assert fake.calls["n"] == 3  # polled until the release completed
 
 
 def test_settle_gives_up_when_memory_stays_in_use(monkeypatch, no_visible_devices_mask):
-    import sys as _sys
-    import time
-
     fake = _fake_pynvml([17 * _GIB], 80 * _GIB)  # flat: legitimately in use
-    monkeypatch.setitem(_sys.modules, "pynvml", fake)
+    monkeypatch.setitem(sys.modules, "pynvml", fake)
     monkeypatch.setattr(session_prefetcher, "_SETTLE_POLL_S", 0.01)
     t0 = time.monotonic()
     session_prefetcher.wait_gpu_memory_settle(timeout=5)
@@ -406,12 +418,10 @@ def test_settle_gives_up_when_memory_stays_in_use(monkeypatch, no_visible_device
 
 
 def test_settle_skips_when_no_gpus_visible(monkeypatch):
-    import sys as _sys
-
     # CUDA_VISIBLE_DEVICES="" means NO GPUs are visible to this process:
     # nothing to wait for (and no polling of other jobs' GPUs).
     fake = _fake_pynvml([17 * _GIB], 80 * _GIB)
-    monkeypatch.setitem(_sys.modules, "pynvml", fake)
+    monkeypatch.setitem(sys.modules, "pynvml", fake)
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
     session_prefetcher.wait_gpu_memory_settle()
     assert fake.calls["n"] == 0  # no memory queries at all
@@ -419,9 +429,8 @@ def test_settle_skips_when_no_gpus_visible(monkeypatch):
 
 def test_settle_without_pynvml_is_noop(monkeypatch):
     import builtins
-    import sys as _sys
 
-    monkeypatch.delitem(_sys.modules, "pynvml", raising=False)
+    monkeypatch.delitem(sys.modules, "pynvml", raising=False)
     real_import = builtins.__import__
 
     def _no_pynvml(name, *args, **kwargs):
