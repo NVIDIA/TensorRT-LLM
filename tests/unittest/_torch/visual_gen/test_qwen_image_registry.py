@@ -26,6 +26,7 @@ from tensorrt_llm._torch.modules.linear import (
 from tensorrt_llm._torch.visual_gen import models  # noqa: F401
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.qwen_image import (
+    QwenImageEditPlusPipeline,
     QwenImagePipeline,
     QwenImageTransformer2DModel,
 )
@@ -78,6 +79,23 @@ def test_auto_pipeline_detects_qwen_image_class_name(tmp_path):
     """model_index.json with _class_name=QwenImagePipeline resolves."""
     (tmp_path / "model_index.json").write_text(json.dumps({"_class_name": "QwenImagePipeline"}))
     assert AutoPipeline._detect_from_checkpoint(str(tmp_path)) == "QwenImagePipeline"
+
+
+def test_qwen_image_edit_plus_pipeline_is_registered():
+    """Qwen-Image-Edit checkpoints should route to the edit-plus pipeline."""
+    assert "QwenImageEditPlusPipeline" in PIPELINE_REGISTRY
+    assert PIPELINE_REGISTRY["QwenImageEditPlusPipeline"].pipeline_cls is QwenImageEditPlusPipeline
+    assert "Qwen/Qwen-Image-Edit-2511" in PIPELINE_REGISTRY[
+        "QwenImageEditPlusPipeline"
+    ].hf_ids
+
+
+def test_auto_pipeline_detects_qwen_image_edit_plus_class_name(tmp_path):
+    """model_index.json with _class_name=QwenImageEditPlusPipeline resolves."""
+    (tmp_path / "model_index.json").write_text(
+        json.dumps({"_class_name": "QwenImageEditPlusPipeline"})
+    )
+    assert AutoPipeline._detect_from_checkpoint(str(tmp_path)) == "QwenImageEditPlusPipeline"
 
 
 def test_transformer_constructs_with_defaults():
