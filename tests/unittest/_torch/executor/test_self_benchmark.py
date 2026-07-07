@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import types
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -35,19 +36,20 @@ class _FakeLlmRequest:
         self.py_self_benchmark_point_id = None
 
 
-def _fake_to_llm_request(req_id, executor_request, child_req_ids,
-                         exclude_last_generation_logits, **kwargs):
+def _fake_to_llm_request(
+    req_id, executor_request, child_req_ids, exclude_last_generation_logits, **kwargs
+):
     return _FakeLlmRequest(req_id, executor_request)
 
 
 @pytest.fixture(autouse=True)
 def _patch_executor_request_to_llm_request(monkeypatch):
-    monkeypatch.setattr(self_benchmark_module, "executor_request_to_llm_request",
-                        _fake_to_llm_request)
+    monkeypatch.setattr(
+        self_benchmark_module, "executor_request_to_llm_request", _fake_to_llm_request
+    )
 
 
 class _FakeRequest:
-
     def __init__(self):
         self.is_dummy_request = True
         self.is_attention_dp_dummy = False
@@ -57,19 +59,16 @@ class _FakeRequest:
 
     @property
     def is_dummy(self):
-        return (self.is_dummy_request or self.is_attention_dp_dummy
-                or self.is_cuda_graph_dummy)
+        return self.is_dummy_request or self.is_attention_dp_dummy or self.is_cuda_graph_dummy
 
 
 class _FakeKvStats:
-
     def __init__(self, tokens_per_block=32):
         self.tokens_per_block = tokens_per_block
         self.max_num_blocks = 128
 
 
 class _FakeKvCacheManager:
-
     def __init__(self, tokens_per_block=32, enable_block_reuse=True):
         self.add_dummy_calls = []
         self._tokens_per_block = tokens_per_block
@@ -84,7 +83,6 @@ class _FakeKvCacheManager:
 
 
 class _FakeResourceManager:
-
     def __init__(self, kv_cache_manager):
         self._kv_cache_manager = kv_cache_manager
 
@@ -95,7 +93,6 @@ class _FakeResourceManager:
 
 
 class _FakeScheduledBatch:
-
     def __init__(self, requests):
         self._requests = requests
 
@@ -103,12 +100,12 @@ class _FakeScheduledBatch:
         return self._requests
 
 
-def _make_executor(config: SelfBenchmarkConfig,
-                   tokens_per_block=32,
-                   enable_block_reuse=True) -> types.SimpleNamespace:
+def _make_executor(
+    config: SelfBenchmarkConfig, tokens_per_block=32, enable_block_reuse=True
+) -> types.SimpleNamespace:
     kv_cache_manager = _FakeKvCacheManager(
-        tokens_per_block=tokens_per_block,
-        enable_block_reuse=enable_block_reuse)
+        tokens_per_block=tokens_per_block, enable_block_reuse=enable_block_reuse
+    )
     return types.SimpleNamespace(
         llm_args=types.SimpleNamespace(self_benchmark_config=config),
         max_input_len=16,
@@ -118,56 +115,75 @@ def _make_executor(config: SelfBenchmarkConfig,
         max_batch_size=4,
         max_total_draft_tokens=0,
         max_beam_width=1,
-        model_engine=types.SimpleNamespace(max_draft_loop_tokens=0,
-                                           use_mrope=False),
+        model_engine=types.SimpleNamespace(max_draft_loop_tokens=0, use_mrope=False),
         resource_manager=_FakeResourceManager(kv_cache_manager),
         dist=types.SimpleNamespace(rank=0),
     )
 
 
 def test_torch_llm_args_self_benchmark_enables_iter_stats():
-    args = TorchLlmArgs(model="dummy",
-                        self_benchmark_config=SelfBenchmarkConfig())
+    args = TorchLlmArgs(model="dummy", self_benchmark_config=SelfBenchmarkConfig())
 
     assert args.enable_iter_perf_stats is True
 
 
+def test_pyexecutor_self_benchmark_creation_is_explicit_and_missing_config_safe(
+    monkeypatch,
+):
+    import tensorrt_llm._torch.pyexecutor.py_executor as py_executor_module
+
+    executor = object.__new__(py_executor_module.PyExecutor)
+    executor.llm_args = types.SimpleNamespace()
+    benchmark = object()
+    benchmark_cls = MagicMock(return_value=benchmark)
+    monkeypatch.setattr(py_executor_module, "SelfBenchmark", benchmark_cls)
+
+    # AutoDeploy uses a partial SimpleNamespace without self_benchmark_config.
+    assert executor._create_self_benchmark(True) is None
+    benchmark_cls.assert_not_called()
+
+    executor.llm_args.self_benchmark_config = object()
+    assert executor._create_self_benchmark(False) is None
+    benchmark_cls.assert_not_called()
+
+    assert executor._create_self_benchmark(True) is benchmark
+    benchmark_cls.assert_called_once_with(executor)
+
+
 def test_torch_llm_args_self_benchmark_rejects_encode_only():
     with pytest.raises(ValueError, match="decoder generation workloads"):
-        TorchLlmArgs(model="dummy",
-                     encode_only=True,
-                     self_benchmark_config=SelfBenchmarkConfig())
+        TorchLlmArgs(model="dummy", encode_only=True, self_benchmark_config=SelfBenchmarkConfig())
 
 
 def test_torch_llm_args_self_benchmark_rejects_attention_dp():
     with pytest.raises(ValueError, match="attention data parallelism"):
-        TorchLlmArgs(model="dummy",
-                     enable_attention_dp=True,
-                     self_benchmark_config=SelfBenchmarkConfig())
+        TorchLlmArgs(
+            model="dummy", enable_attention_dp=True, self_benchmark_config=SelfBenchmarkConfig()
+        )
 
 
 def test_torch_llm_args_self_benchmark_accepts_pure_tp():
     # Per-rank deterministic replication makes pure tensor parallelism safe:
     # every TP rank builds the same forward batch in lockstep.
-    args = TorchLlmArgs(model="dummy",
-                        tensor_parallel_size=2,
-                        self_benchmark_config=SelfBenchmarkConfig())
+    args = TorchLlmArgs(
+        model="dummy", tensor_parallel_size=2, self_benchmark_config=SelfBenchmarkConfig()
+    )
     assert args.parallel_config.tp_size == 2
     assert args.enable_iter_perf_stats is True
 
 
 def test_torch_llm_args_self_benchmark_rejects_pipeline_parallel():
     with pytest.raises(ValueError, match="pipeline parallelism"):
-        TorchLlmArgs(model="dummy",
-                     pipeline_parallel_size=2,
-                     self_benchmark_config=SelfBenchmarkConfig())
+        TorchLlmArgs(
+            model="dummy", pipeline_parallel_size=2, self_benchmark_config=SelfBenchmarkConfig()
+        )
 
 
 def test_torch_llm_args_self_benchmark_rejects_context_parallel():
     with pytest.raises(ValueError, match="context parallelism"):
-        TorchLlmArgs(model="dummy",
-                     context_parallel_size=2,
-                     self_benchmark_config=SelfBenchmarkConfig())
+        TorchLlmArgs(
+            model="dummy", context_parallel_size=2, self_benchmark_config=SelfBenchmarkConfig()
+        )
 
 
 def test_grid_generation_uses_executor_limits():
@@ -190,17 +206,21 @@ def test_grid_generation_uses_executor_limits():
         "decode",
         "decode",
     ]
-    assert [point.isl for point in benchmark._grid
-            if point.point_type == "prefill"] == [1, 8]
-    assert [point.kv_read_tokens for point in benchmark._grid
-            if point.point_type == "prefill"] == [0, 0]
-    assert {(point.context_length, point.batch_size)
-            for point in benchmark._grid if point.point_type == "decode"} == {
-                (1, 1),
-                (1, 4),
-                (7, 1),
-                (7, 4),
-            }
+    assert [point.isl for point in benchmark._grid if point.point_type == "prefill"] == [1, 8]
+    assert [point.kv_read_tokens for point in benchmark._grid if point.point_type == "prefill"] == [
+        0,
+        0,
+    ]
+    assert {
+        (point.context_length, point.batch_size)
+        for point in benchmark._grid
+        if point.point_type == "decode"
+    } == {
+        (1, 1),
+        (1, 4),
+        (7, 1),
+        (7, 4),
+    }
 
 
 def test_prefill_grid_includes_block_aligned_kv_read_axis():
@@ -213,15 +233,13 @@ def test_prefill_grid_includes_block_aligned_kv_read_axis():
 
     benchmark = SelfBenchmark(_make_executor(config, tokens_per_block=4))
 
-    assert [(point.point_type, point.isl, point.kv_read_tokens)
-            for point in benchmark._grid] == [
-                ("prefill", 1, 0),
-                ("prefill", 8, 0),
-                ("prefill_seed", 4, 4),
-                ("prefill", 8, 4),
-            ]
-    assert benchmark._grid[2].cache_salt_id == benchmark._grid[
-        3].cache_salt_id
+    assert [(point.point_type, point.isl, point.kv_read_tokens) for point in benchmark._grid] == [
+        ("prefill", 1, 0),
+        ("prefill", 8, 0),
+        ("prefill_seed", 4, 4),
+        ("prefill", 8, 4),
+    ]
+    assert benchmark._grid[2].cache_salt_id == benchmark._grid[3].cache_salt_id
 
 
 def test_prefill_grid_omits_kv_read_axis_when_block_reuse_disabled():
@@ -232,20 +250,16 @@ def test_prefill_grid_omits_kv_read_axis_when_block_reuse_disabled():
         warmup_iterations=0,
     )
 
-    benchmark = SelfBenchmark(
-        _make_executor(config, tokens_per_block=4, enable_block_reuse=False))
+    benchmark = SelfBenchmark(_make_executor(config, tokens_per_block=4, enable_block_reuse=False))
 
-    assert [(point.point_type, point.isl, point.kv_read_tokens)
-            for point in benchmark._grid] == [
-                ("prefill", 1, 0),
-                ("prefill", 8, 0),
-            ]
+    assert [(point.point_type, point.isl, point.kv_read_tokens) for point in benchmark._grid] == [
+        ("prefill", 1, 0),
+        ("prefill", 8, 0),
+    ]
 
 
 def test_prefill_request_built_per_rank_marks_llm_request():
-    config = SelfBenchmarkConfig(mode="prefill",
-                                 prefill_isl_granularity=1,
-                                 warmup_iterations=0)
+    config = SelfBenchmarkConfig(mode="prefill", prefill_isl_granularity=1, warmup_iterations=0)
     benchmark = SelfBenchmark(_make_executor(config))
 
     requests = benchmark.make_prefill_requests([], [])
@@ -265,9 +279,7 @@ def test_prefill_request_is_rank_independent():
     being rank 0. Every input is a deterministic function of the grid point, so
     a rank-1 executor produces a bit-identical request id / tokens / cache_salt.
     """
-    config = SelfBenchmarkConfig(mode="prefill",
-                                 prefill_isl_granularity=1,
-                                 warmup_iterations=0)
+    config = SelfBenchmarkConfig(mode="prefill", prefill_isl_granularity=1, warmup_iterations=0)
     rank0 = SelfBenchmark(_make_executor(config))
     executor_rank1 = _make_executor(config)
     executor_rank1.dist = types.SimpleNamespace(rank=1)
@@ -284,9 +296,7 @@ def test_prefill_request_is_rank_independent():
 
 def test_shutdown_finishes_benchmark_without_starting_next_point(tmp_path):
     output_path = tmp_path / "benchmark.json"
-    config = SelfBenchmarkConfig(mode="prefill",
-                                 output_path=str(output_path),
-                                 warmup_iterations=0)
+    config = SelfBenchmarkConfig(mode="prefill", output_path=str(output_path), warmup_iterations=0)
     executor = _make_executor(config)
     executor.is_shutdown = True
     benchmark = SelfBenchmark(executor)
@@ -300,16 +310,10 @@ def test_prefill_seed_and_measure_requests_share_cache_salt():
     config = SelfBenchmarkConfig(mode="prefill", warmup_iterations=0)
     benchmark = SelfBenchmark(_make_executor(config))
     benchmark._grid = [
-        BenchmarkPoint(point_type="prefill_seed",
-                       index=0,
-                       isl=4,
-                       kv_read_tokens=4,
-                       cache_salt_id=123),
-        BenchmarkPoint(point_type="prefill",
-                       index=1,
-                       isl=8,
-                       kv_read_tokens=4,
-                       cache_salt_id=123),
+        BenchmarkPoint(
+            point_type="prefill_seed", index=0, isl=4, kv_read_tokens=4, cache_salt_id=123
+        ),
+        BenchmarkPoint(point_type="prefill", index=1, isl=8, kv_read_tokens=4, cache_salt_id=123),
     ]
 
     seed_items = benchmark.make_prefill_requests([], [])
@@ -323,10 +327,9 @@ def test_prefill_seed_and_measure_requests_share_cache_salt():
 
 
 def test_decode_injection_uses_dummy_kv_path():
-    config = SelfBenchmarkConfig(mode="decode",
-                                 decode_context_granularity=1,
-                                 decode_batch_granularity=1,
-                                 warmup_iterations=0)
+    config = SelfBenchmarkConfig(
+        mode="decode", decode_context_granularity=1, decode_batch_granularity=1, warmup_iterations=0
+    )
     executor = _make_executor(config)
     benchmark = SelfBenchmark(executor)
 
@@ -334,8 +337,7 @@ def test_decode_injection_uses_dummy_kv_path():
 
     assert len(requests) == 4
     assert all(request.is_self_benchmark_request for request in requests)
-    add_dummy_call = executor.resource_manager._kv_cache_manager.add_dummy_calls[
-        0]
+    add_dummy_call = executor.resource_manager._kv_cache_manager.add_dummy_calls[0]
     assert add_dummy_call["request_ids"] == [
         900_000_000,
         900_000_001,
@@ -346,13 +348,58 @@ def test_decode_injection_uses_dummy_kv_path():
     assert add_dummy_call["is_gen"] is True
 
 
+@pytest.mark.parametrize("gpu_forward_time_ms", [0.0, None])
+def test_process_iter_stats_propagates_gpu_forward_time_to_self_benchmark(
+    gpu_forward_time_ms,
+):
+    from tensorrt_llm._torch.pyexecutor.py_executor import BatchState, PyExecutor
+
+    serialized_stats = MagicMock()
+    serialized_stats.to_json_str.return_value = json.dumps(
+        {"inflightBatchingStats": {"numContextRequests": 1}}
+    )
+    observe_iteration = MagicMock(return_value=True)
+    scheduled_requests = object()
+    fake_executor = types.SimpleNamespace(
+        _latest_host_step_time_ms=None,
+        _latest_prev_device_step_time_ms=None,
+        perf_manager=types.SimpleNamespace(
+            try_compute_gpu_elapsed_time_ms=MagicMock(return_value=gpu_forward_time_ms)
+        ),
+        enable_iter_req_stats=False,
+        enable_iter_perf_stats=True,
+        _update_iter_stats=MagicMock(return_value=serialized_stats),
+        self_benchmark=types.SimpleNamespace(
+            active=True,
+            observe_iteration=observe_iteration,
+        ),
+        disable_overlap_scheduler=True,
+        dist=types.SimpleNamespace(pp_size=1),
+        enable_attention_dp=False,
+        _append_iter_stats=MagicMock(),
+    )
+    batch_state = BatchState(
+        scheduled_requests=scheduled_requests,
+        sample_state=None,
+        iter_stats=object(),
+    )
+
+    PyExecutor._process_iter_stats(fake_executor, [], [], batch_state)
+
+    observed_stats = observe_iteration.call_args.args[1]
+    if gpu_forward_time_ms is None:
+        assert "gpuForwardTimeMS" not in observed_stats
+    else:
+        assert observed_stats["gpuForwardTimeMS"] == gpu_forward_time_ms
+    fake_executor._append_iter_stats.assert_not_called()
+
+
 def test_observe_iteration_sanitizes_queue_counters_and_records_result():
     config = SelfBenchmarkConfig(mode="prefill", warmup_iterations=0)
     benchmark = SelfBenchmark(_make_executor(config))
     point = BenchmarkPoint(point_type="prefill", index=0, isl=4)
     benchmark._current = BenchmarkPointResult(point=point)
-    request = types.SimpleNamespace(is_self_benchmark_request=True,
-                                    is_dummy=False)
+    request = types.SimpleNamespace(is_self_benchmark_request=True, is_dummy=False)
     stats = {
         "numQueuedRequests": 3,
         "inflightBatchingStats": {
@@ -364,16 +411,14 @@ def test_observe_iteration_sanitizes_queue_counters_and_records_result():
         },
     }
 
-    consumed = benchmark.observe_iteration(_FakeScheduledBatch([request]),
-                                           stats)
+    consumed = benchmark.observe_iteration(_FakeScheduledBatch([request]), stats)
 
     assert consumed is True
     assert benchmark._current is None
     assert len(benchmark._results) == 1
     recorded_stats = benchmark._results[0].stats[0]
     assert recorded_stats["numQueuedRequests"] == 0
-    assert recorded_stats["inflightBatchingStats"][
-        "numQueuedContextRequests"] == 0
+    assert recorded_stats["inflightBatchingStats"]["numQueuedContextRequests"] == 0
     assert recorded_stats["inflightBatchingStats"]["numQueuedCtxTokens"] == 0
     assert recorded_stats["inflightBatchingStats"]["numQueuedGenRequests"] == 0
     assert recorded_stats["inflightBatchingStats"]["numQueuedGenKvTokens"] == 0
@@ -382,15 +427,14 @@ def test_observe_iteration_sanitizes_queue_counters_and_records_result():
 def test_observe_iteration_records_cache_hit_validation():
     config = SelfBenchmarkConfig(mode="prefill", warmup_iterations=0)
     benchmark = SelfBenchmark(_make_executor(config))
-    point = BenchmarkPoint(point_type="prefill",
-                           index=0,
-                           isl=8,
-                           kv_read_tokens=4)
+    point = BenchmarkPoint(point_type="prefill", index=0, isl=8, kv_read_tokens=4)
     benchmark._current = BenchmarkPointResult(point=point)
-    request = types.SimpleNamespace(is_self_benchmark_request=True,
-                                    py_self_benchmark_point_id=0,
-                                    cached_tokens=4,
-                                    is_dummy=False)
+    request = types.SimpleNamespace(
+        is_self_benchmark_request=True,
+        py_self_benchmark_point_id=0,
+        cached_tokens=4,
+        is_dummy=False,
+    )
     stats = {
         "numQueuedRequests": 0,
         "inflightBatchingStats": {
@@ -398,8 +442,7 @@ def test_observe_iteration_records_cache_hit_validation():
         },
     }
 
-    consumed = benchmark.observe_iteration(_FakeScheduledBatch([request]),
-                                           stats)
+    consumed = benchmark.observe_iteration(_FakeScheduledBatch([request]), stats)
 
     assert consumed is True
     result = benchmark._results[0]
@@ -415,15 +458,14 @@ def test_observe_iteration_records_cache_hit_validation():
 def test_observe_iteration_records_cache_hit_mismatch_without_skip():
     config = SelfBenchmarkConfig(mode="prefill", warmup_iterations=0)
     benchmark = SelfBenchmark(_make_executor(config))
-    point = BenchmarkPoint(point_type="prefill",
-                           index=0,
-                           isl=8,
-                           kv_read_tokens=4)
+    point = BenchmarkPoint(point_type="prefill", index=0, isl=8, kv_read_tokens=4)
     benchmark._current = BenchmarkPointResult(point=point)
-    request = types.SimpleNamespace(is_self_benchmark_request=True,
-                                    py_self_benchmark_point_id=0,
-                                    cached_tokens=0,
-                                    is_dummy=False)
+    request = types.SimpleNamespace(
+        is_self_benchmark_request=True,
+        py_self_benchmark_point_id=0,
+        cached_tokens=0,
+        is_dummy=False,
+    )
     stats = {
         "numQueuedRequests": 0,
         "inflightBatchingStats": {
@@ -431,8 +473,7 @@ def test_observe_iteration_records_cache_hit_mismatch_without_skip():
         },
     }
 
-    consumed = benchmark.observe_iteration(_FakeScheduledBatch([request]),
-                                           stats)
+    consumed = benchmark.observe_iteration(_FakeScheduledBatch([request]), stats)
 
     assert consumed is True
     result = benchmark._results[0]
@@ -448,21 +489,16 @@ def test_observe_iteration_records_cache_hit_mismatch_without_skip():
 
 def test_write_output(tmp_path):
     output_path = tmp_path / "benchmark.json"
-    config = SelfBenchmarkConfig(mode="prefill",
-                                 output_path=str(output_path),
-                                 warmup_iterations=0)
+    config = SelfBenchmarkConfig(mode="prefill", output_path=str(output_path), warmup_iterations=0)
     benchmark = SelfBenchmark(_make_executor(config))
     benchmark._results.append(
         BenchmarkPointResult(
             point=BenchmarkPoint(point_type="prefill", index=0, isl=8),
-            stats=[{
-                "inflightBatchingStats": {
-                    "numContextRequests": 1
-                }
-            }],
+            stats=[{"inflightBatchingStats": {"numContextRequests": 1}}],
             observed_kv_read_tokens=0,
             cache_hit_validated=True,
-        ))
+        )
+    )
 
     benchmark.write_output()
 
@@ -476,5 +512,6 @@ def test_write_output(tmp_path):
     assert data["results"][0]["point"]["isl"] == 8
     assert data["results"][0]["observed_kv_read_tokens"] == 0
     assert data["results"][0]["cache_hit_validated"] is True
-    assert data["results"][0]["iteration_stats"][0][
-        "inflightBatchingStats"]["numContextRequests"] == 1
+    assert (
+        data["results"][0]["iteration_stats"][0]["inflightBatchingStats"]["numContextRequests"] == 1
+    )

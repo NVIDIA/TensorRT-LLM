@@ -421,6 +421,12 @@ class PyExecutor:
     # 1024 in-flight micro batches can avoid synchronization in most cases and keep host memory usage low.
     MIN_ASYNC_MICRO_BATCH_NUM = 1024
 
+    def _create_self_benchmark(self, enabled: bool) -> Optional[SelfBenchmark]:
+        if (not enabled or getattr(self.llm_args, "self_benchmark_config", None)
+                is None):
+            return None
+        return SelfBenchmark(self)
+
     def __init__(
             self,
             resource_manager,
@@ -432,6 +438,7 @@ class PyExecutor:
             drafter: Optional[Drafter] = None,
             disable_overlap_scheduler: bool = False,
             enable_early_first_token_response: bool = False,
+            enable_self_benchmark: bool = True,
             max_input_len: int = 0x7fffffff,
             max_batch_size: int = 8,
             max_beam_width: int = 1,
@@ -794,8 +801,7 @@ class PyExecutor:
         # Waiting queue for requests that have been fetched but not yet scheduled
         self.waiting_queue: WaitingQueue = create_waiting_queue(
             waiting_queue_policy)
-        self.self_benchmark = SelfBenchmark(
-            self) if self.llm_args.self_benchmark_config is not None else None
+        self.self_benchmark = self._create_self_benchmark(enable_self_benchmark)
 
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()
@@ -2103,10 +2109,12 @@ class PyExecutor:
                 stats_dict["hostStepTimeMS"] = host_step_time_ms
             if prev_device_step_time_ms is not None:
                 stats_dict["prevDeviceStepTimeMS"] = prev_device_step_time_ms
+            if gpu_forward_time_ms is not None:
+                stats_dict["gpuForwardTimeMS"] = gpu_forward_time_ms
             is_overlap_like = (not self.disable_overlap_scheduler
                                or self.dist.pp_size > 1)
-            stats_dict["schedulerMode"] = (
-                "overlap" if is_overlap_like else "non_overlap")
+            stats_dict["schedulerMode"] = ("overlap" if is_overlap_like else
+                                           "non_overlap")
             if self.self_benchmark.observe_iteration(
                     batch_state.scheduled_requests, stats_dict):
                 return

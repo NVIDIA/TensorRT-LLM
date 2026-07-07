@@ -71,8 +71,9 @@ class SelfBenchmark:
         self._done = self.config is None
         self._started_at = time.monotonic()
         self._run_id = uuid.uuid4().hex[:12]
-        self._output_path = (None if self.config is None else
-                             self._rank_output_path(self.config.output_path))
+        self._output_path = (
+            None if self.config is None else self._rank_output_path(self.config.output_path)
+        )
         self._identity = self._build_identity()
         if not self._done:
             logger.info("Self-benchmark enabled: %s", self.config)
@@ -86,8 +87,8 @@ class SelfBenchmark:
         return not self._done
 
     def make_prefill_requests(
-            self, active_requests: list["LlmRequest"],
-            waiting_queue: WaitingQueue) -> list["LlmRequest"]:
+        self, active_requests: list["LlmRequest"], waiting_queue: WaitingQueue
+    ) -> list["LlmRequest"]:
         """Build the synthetic prefill request for the next grid point.
 
         Per-rank lockstep rationale: this runs on EVERY TP rank (alongside
@@ -124,14 +125,15 @@ class SelfBenchmark:
             req_id=self._request_id(point.index, 0),
             executor_request=request,
             child_req_ids=None,
-            exclude_last_generation_logits=self._exclude_last_generation_logits(
-            ))
+            exclude_last_generation_logits=self._exclude_last_generation_logits(),
+        )
         llm_request.is_self_benchmark_request = True
         llm_request.py_self_benchmark_point_id = point.index
         return [llm_request]
 
-    def make_decode_requests(self, active_requests: list["LlmRequest"],
-                             waiting_queue: WaitingQueue) -> list["LlmRequest"]:
+    def make_decode_requests(
+        self, active_requests: list["LlmRequest"], waiting_queue: WaitingQueue
+    ) -> list["LlmRequest"]:
         if not self._can_start_next_point(active_requests, waiting_queue):
             return []
         point = self._peek_next_point()
@@ -143,17 +145,16 @@ class SelfBenchmark:
 
         self._start_point(point)
         kv_cache_manager = self._executor.resource_manager.get_resource_manager(
-            ResourceManagerType.KV_CACHE_MANAGER)
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
         if kv_cache_manager is None:
             self._skip_current_point("KV cache manager is not available")
             return []
         draft_kv_cache_manager = self._executor.resource_manager.get_resource_manager(
-            ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER
+        )
         token_num = max(1, point.context_length + 1)
-        request_ids = [
-            self._request_id(point.index, offset)
-            for offset in range(point.batch_size)
-        ]
+        request_ids = [self._request_id(point.index, offset) for offset in range(point.batch_size)]
         try:
             requests = kv_cache_manager.add_dummy_requests(
                 request_ids=request_ids,
@@ -161,18 +162,19 @@ class SelfBenchmark:
                 is_gen=True,
                 max_num_draft_tokens=self._executor.max_total_draft_tokens,
                 kv_reserve_draft_tokens=getattr(
-                    self._executor.model_engine, "max_draft_loop_tokens",
-                    self._executor.max_total_draft_tokens),
-                use_mrope=getattr(self._executor.model_engine, "use_mrope",
-                                  False),
+                    self._executor.model_engine,
+                    "max_draft_loop_tokens",
+                    self._executor.max_total_draft_tokens,
+                ),
+                use_mrope=getattr(self._executor.model_engine, "use_mrope", False),
                 max_beam_width=self._executor.max_beam_width,
-                draft_kv_cache_manager=draft_kv_cache_manager)
+                draft_kv_cache_manager=draft_kv_cache_manager,
+            )
         except Exception as exc:
             # add_dummy_requests only prechecks for >=1 free block, so a large
             # batch can still fail mid-allocation when pages run out. Skip the
             # point instead of crashing the engine.
-            self._skip_current_point(
-                f"synthetic decode KV allocation failed: {exc}")
+            self._skip_current_point(f"synthetic decode KV allocation failed: {exc}")
             return []
         if requests is None:
             self._skip_current_point("insufficient KV cache for synthetic decode")
@@ -181,8 +183,7 @@ class SelfBenchmark:
             self._mark_benchmark_request(request, point)
         return requests
 
-    def observe_iteration(self, scheduled_batch: ScheduledRequests,
-                          stats: dict) -> bool:
+    def observe_iteration(self, scheduled_batch: ScheduledRequests, stats: dict) -> bool:
         """Record benchmark stats for benchmark-only batches.
 
         Returns:
@@ -195,12 +196,11 @@ class SelfBenchmark:
         requests = scheduled_batch.all_requests()
         if not requests:
             return False
-        if not all(self._is_benchmark_request(req)
-                   or bool(getattr(req, "is_dummy", False))
-                   for req in requests):
-            logger.warning(
-                "Self-benchmark saw a mixed batch; ignoring it for benchmark output."
-            )
+        if not all(
+            self._is_benchmark_request(req) or bool(getattr(req, "is_dummy", False))
+            for req in requests
+        ):
+            logger.warning("Self-benchmark saw a mixed batch; ignoring it for benchmark output.")
             return False
 
         self._sanitize_queue_counters(stats)
@@ -233,12 +233,16 @@ class SelfBenchmark:
                     "skipped_reason": result.skipped_reason,
                     "observed_kv_read_tokens": result.observed_kv_read_tokens,
                     "cache_hit_validated": result.cache_hit_validated,
-                } for result in self._results
+                }
+                for result in self._results
             ],
         }
         self._atomic_write_json(self._output_path, output)
-        logger.info("Self-benchmark results written to %s (%d point(s))",
-                    self._output_path, len(self._results))
+        logger.info(
+            "Self-benchmark results written to %s (%d point(s))",
+            self._output_path,
+            len(self._results),
+        )
 
     def _invalidate_output(self) -> None:
         """Replace any prior-run output with an invalid 'running' sentinel.
@@ -266,8 +270,9 @@ class SelfBenchmark:
         except FileNotFoundError:
             pass
         except OSError as exc:
-            logger.warning("Failed to remove stale self-benchmark output %s: %s",
-                           self._output_path, exc)
+            logger.warning(
+                "Failed to remove stale self-benchmark output %s: %s", self._output_path, exc
+            )
         self._atomic_write_json(self._output_path, output)
 
     def _atomic_write_json(self, output_path: str, output: dict) -> None:
@@ -276,10 +281,9 @@ class SelfBenchmark:
         basename = os.path.basename(output_path)
         # Process-unique temp file so co-located writers never clobber a shared
         # ".tmp"; os.replace then publishes atomically.
-        fd, tmp_path = tempfile.mkstemp(prefix=f".{basename}.{os.getpid()}.",
-                                        suffix=".tmp",
-                                        dir=output_dir,
-                                        text=True)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=f".{basename}.{os.getpid()}.", suffix=".tmp", dir=output_dir, text=True
+        )
         try:
             with os.fdopen(fd, "w") as f:
                 json.dump(output, f, indent=2)
@@ -317,46 +321,54 @@ class SelfBenchmark:
         next_index = 0
         warmup_isl = min(8, self._max_prefill_isl())
         for _ in range(self.config.warmup_iterations):
-            grid.append(
-                BenchmarkPoint(point_type="warmup",
-                               index=next_index,
-                               isl=warmup_isl))
+            grid.append(BenchmarkPoint(point_type="warmup", index=next_index, isl=warmup_isl))
             next_index += 1
 
         if self.config.mode in ("prefill", "agg"):
-            for isl in self._sample_values(self._max_prefill_isl(),
-                                           self.config.prefill_isl_granularity):
+            for isl in self._sample_values(
+                self._max_prefill_isl(), self.config.prefill_isl_granularity
+            ):
                 for kv_read_tokens in self._kv_read_values_for_isl(isl):
                     cache_salt_id = self._cache_salt_id(next_index)
                     if kv_read_tokens > 0:
                         grid.append(
-                            BenchmarkPoint(point_type="prefill_seed",
-                                           index=next_index,
-                                           isl=kv_read_tokens,
-                                           kv_read_tokens=kv_read_tokens,
-                                           cache_salt_id=cache_salt_id))
+                            BenchmarkPoint(
+                                point_type="prefill_seed",
+                                index=next_index,
+                                isl=kv_read_tokens,
+                                kv_read_tokens=kv_read_tokens,
+                                cache_salt_id=cache_salt_id,
+                            )
+                        )
                         next_index += 1
                     grid.append(
-                        BenchmarkPoint(point_type="prefill",
-                                       index=next_index,
-                                       isl=isl,
-                                       kv_read_tokens=kv_read_tokens,
-                                       cache_salt_id=cache_salt_id))
+                        BenchmarkPoint(
+                            point_type="prefill",
+                            index=next_index,
+                            isl=isl,
+                            kv_read_tokens=kv_read_tokens,
+                            cache_salt_id=cache_salt_id,
+                        )
+                    )
                     next_index += 1
 
         if self.config.mode in ("decode", "agg"):
             context_values = self._sample_values(
-                self._max_decode_context_length(),
-                self.config.decode_context_granularity)
-            batch_values = self._sample_values(self._max_decode_batch_size(),
-                                               self.config.decode_batch_granularity)
+                self._max_decode_context_length(), self.config.decode_context_granularity
+            )
+            batch_values = self._sample_values(
+                self._max_decode_batch_size(), self.config.decode_batch_granularity
+            )
             for context_length in context_values:
                 for batch_size in batch_values:
                     grid.append(
-                        BenchmarkPoint(point_type="decode",
-                                       index=next_index,
-                                       context_length=context_length,
-                                       batch_size=batch_size))
+                        BenchmarkPoint(
+                            point_type="decode",
+                            index=next_index,
+                            context_length=context_length,
+                            batch_size=batch_size,
+                        )
+                    )
                     next_index += 1
         return grid
 
@@ -374,13 +386,13 @@ class SelfBenchmark:
             # shaped like real requests (the decode path already passes
             # max_beam_width to add_dummy_requests). Using the default beam=1
             # under a beam>1 engine would mis-shape the forward batch.
-            sampling_config=SamplingConfig(
-                beam_width=self._executor.max_beam_width),
+            sampling_config=SamplingConfig(beam_width=self._executor.max_beam_width),
             end_id=-1,
             pad_id=0,
             output_config=output_config,
             return_all_generated_tokens=False,
-            cache_salt=str(cache_salt_id))
+            cache_salt=str(cache_salt_id),
+        )
         request.py_is_self_benchmark_request = True
         request.py_self_benchmark_point_id = point.index
         return request
@@ -388,23 +400,19 @@ class SelfBenchmark:
     def _exclude_last_generation_logits(self) -> bool:
         # Engine-wide flag derived from disable_overlap_scheduler and pp_size;
         # identical across TP ranks, so it does not perturb per-rank lockstep.
-        return bool(
-            getattr(self._executor, "should_exclude_last_generation_logits",
-                    False))
+        return bool(getattr(self._executor, "should_exclude_last_generation_logits", False))
 
-    def _mark_benchmark_request(self, request: "LlmRequest",
-                                point: BenchmarkPoint) -> None:
+    def _mark_benchmark_request(self, request: "LlmRequest", point: BenchmarkPoint) -> None:
         request.is_self_benchmark_request = True
         request.py_self_benchmark_point_id = point.index
 
-    def _can_start_next_point(self, active_requests: list["LlmRequest"],
-                              waiting_queue: WaitingQueue) -> bool:
+    def _can_start_next_point(
+        self, active_requests: list["LlmRequest"], waiting_queue: WaitingQueue
+    ) -> bool:
         if self._done or self._current is not None:
             return False
         if getattr(self._executor, "is_shutdown", False):
-            logger.info(
-                "Self-benchmark stopping early because shutdown was requested."
-            )
+            logger.info("Self-benchmark stopping early because shutdown was requested.")
             self._finish()
             return False
         return not active_requests and len(waiting_queue) == 0
@@ -429,8 +437,7 @@ class SelfBenchmark:
     def _skip_current_point(self, reason: str) -> None:
         if self._current is None:
             return
-        logger.warning("Skipping self-benchmark point %s: %s",
-                       self._current.point, reason)
+        logger.warning("Skipping self-benchmark point %s: %s", self._current.point, reason)
         self._current.skipped_reason = reason
         if self._should_record_current_point():
             self._results.append(self._current)
@@ -441,21 +448,18 @@ class SelfBenchmark:
             self._finish_current_point()
         self._done = True
         self.write_output()
-        logger.info("Self-benchmark completed in %.3fs",
-                    time.monotonic() - self._started_at)
+        logger.info("Self-benchmark completed in %.3fs", time.monotonic() - self._started_at)
 
     def _point_is_complete(self, stats: dict) -> bool:
         if self._current is None:
             return False
-        if self._current.point.point_type in ("warmup", "prefill_seed",
-                                              "prefill"):
+        if self._current.point.point_type in ("warmup", "prefill_seed", "prefill"):
             return self._num_context_requests(stats) > 0
         if self._current.point.point_type == "decode":
             return self._num_decode_requests(stats) > 0
         return False
 
-    def _record_cache_hit_validation(self, requests: list["LlmRequest"],
-                                     stats: dict) -> None:
+    def _record_cache_hit_validation(self, requests: list["LlmRequest"], stats: dict) -> None:
         if self._current is None:
             return
         point = self._current.point
@@ -471,25 +475,32 @@ class SelfBenchmark:
             "cacheHitValidated": validated,
         }
         if not validated:
-            logger.warning("Self-benchmark cache-hit validation failed for "
-                           "point %s: observed cached_tokens=%s",
-                           point, observed)
+            logger.warning(
+                "Self-benchmark cache-hit validation failed for "
+                "point %s: observed cached_tokens=%s",
+                point,
+                observed,
+            )
 
     @staticmethod
-    def _observed_cached_tokens(requests: list["LlmRequest"],
-                                point: BenchmarkPoint) -> Optional[int]:
+    def _observed_cached_tokens(
+        requests: list["LlmRequest"], point: BenchmarkPoint
+    ) -> Optional[int]:
         observed = [
             int(getattr(req, "cached_tokens"))
             for req in requests
-            if (getattr(req, "py_self_benchmark_point_id", None) == point.index
-                and hasattr(req, "cached_tokens"))
+            if (
+                getattr(req, "py_self_benchmark_point_id", None) == point.index
+                and hasattr(req, "cached_tokens")
+            )
         ]
         return max(observed) if observed else None
 
     def _should_record_current_point(self) -> bool:
-        return (self._current is not None
-                and self._current.point.point_type
-                not in ("warmup", "prefill_seed"))
+        return self._current is not None and self._current.point.point_type not in (
+            "warmup",
+            "prefill_seed",
+        )
 
     @staticmethod
     def _sanitize_queue_counters(stats: dict) -> None:
@@ -502,23 +513,18 @@ class SelfBenchmark:
 
     @staticmethod
     def _num_context_requests(stats: dict) -> int:
-        return int(stats.get("inflightBatchingStats", {}).get(
-            "numContextRequests", 0))
+        return int(stats.get("inflightBatchingStats", {}).get("numContextRequests", 0))
 
     @staticmethod
     def _num_decode_requests(stats: dict) -> int:
-        return int(stats.get("inflightBatchingStats", {}).get(
-            "numGenRequests", 0))
+        return int(stats.get("inflightBatchingStats", {}).get("numGenRequests", 0))
 
     @staticmethod
     def _sample_values(max_value: int, granularity: int) -> list[int]:
         max_value = max(1, int(max_value))
         if granularity <= 1:
             return [max_value]
-        values = {
-            round(1 + i * (max_value - 1) / (granularity - 1))
-            for i in range(granularity)
-        }
+        values = {round(1 + i * (max_value - 1) / (granularity - 1)) for i in range(granularity)}
         return sorted(max(1, min(max_value, int(value))) for value in values)
 
     def _kv_read_values_for_isl(self, isl: int) -> list[int]:
@@ -529,20 +535,20 @@ class SelfBenchmark:
         if max_read_tokens == 0:
             return [0]
         return self._sample_block_aligned_values(
-            max_read_tokens, self.config.prefill_kv_read_granularity,
-            block_size)
+            max_read_tokens, self.config.prefill_kv_read_granularity, block_size
+        )
 
     @staticmethod
-    def _sample_block_aligned_values(max_value: int, granularity: int,
-                                     block_size: int) -> list[int]:
+    def _sample_block_aligned_values(
+        max_value: int, granularity: int, block_size: int
+    ) -> list[int]:
         block_values = list(range(0, max_value + 1, block_size))
         if granularity <= 1:
             return [0]
         if len(block_values) <= granularity:
             return block_values
         sampled_indices = {
-            round(i * (len(block_values) - 1) / (granularity - 1))
-            for i in range(granularity)
+            round(i * (len(block_values) - 1) / (granularity - 1)) for i in range(granularity)
         }
         return [block_values[i] for i in sorted(sampled_indices)]
 
@@ -555,9 +561,9 @@ class SelfBenchmark:
     def _bounded_length(self, default: int) -> int:
         candidates = []
         for value in (
-                getattr(self._executor, "max_input_len", None),
-                getattr(self._executor, "max_seq_len", None),
-                getattr(self._executor, "max_num_tokens", None),
+            getattr(self._executor, "max_input_len", None),
+            getattr(self._executor, "max_seq_len", None),
+            getattr(self._executor, "max_num_tokens", None),
         ):
             if isinstance(value, int) and 0 < value < 2**30:
                 candidates.append(value)
@@ -566,8 +572,8 @@ class SelfBenchmark:
     def _max_decode_batch_size(self) -> int:
         candidates = []
         for value in (
-                getattr(self._executor, "max_num_active_requests", None),
-                getattr(self._executor, "max_batch_size", None),
+            getattr(self._executor, "max_num_active_requests", None),
+            getattr(self._executor, "max_batch_size", None),
         ):
             if isinstance(value, int) and value > 0:
                 candidates.append(value)
@@ -575,7 +581,8 @@ class SelfBenchmark:
 
     def _tokens_per_block(self) -> int:
         kv_cache_manager = self._executor.resource_manager.get_resource_manager(
-            ResourceManagerType.KV_CACHE_MANAGER)
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
         if kv_cache_manager is None:
             return 0
         kv_stats = kv_cache_manager.get_kv_cache_stats()
@@ -583,14 +590,15 @@ class SelfBenchmark:
 
     def _enable_block_reuse(self) -> bool:
         kv_cache_manager = self._executor.resource_manager.get_resource_manager(
-            ResourceManagerType.KV_CACHE_MANAGER)
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
         return bool(getattr(kv_cache_manager, "enable_block_reuse", False))
 
     def _limits(self) -> dict:
         kv_cache_manager = self._executor.resource_manager.get_resource_manager(
-            ResourceManagerType.KV_CACHE_MANAGER)
-        kv_stats = kv_cache_manager.get_kv_cache_stats(
-        ) if kv_cache_manager is not None else None
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
+        kv_stats = kv_cache_manager.get_kv_cache_stats() if kv_cache_manager is not None else None
         return {
             "max_num_scheduled_tokens": self._executor.max_num_tokens,
             "max_num_running_reqs": self._executor.max_num_active_requests,
@@ -608,8 +616,7 @@ class SelfBenchmark:
         return f"{stem}_rank{rank}{ext}"
 
     def _request_id(self, point_index: int, offset: int) -> int:
-        return (_BENCHMARK_REQUEST_ID_BASE + point_index * self._id_stride +
-                offset)
+        return _BENCHMARK_REQUEST_ID_BASE + point_index * self._id_stride + offset
 
     @staticmethod
     def _cache_salt_id(point_index: int) -> int:

@@ -90,10 +90,11 @@ class _DummyKvCacheCreator:
         self._max_seq_len = kwargs["max_seq_len"]
         self._kv_cache_config = kwargs["kv_cache_config"]
         self._execution_stream = kwargs["execution_stream"]
+        self.estimate_kv_cache = False
 
     def try_prepare_estimation(self):
-        """Skip estimation phase (no-op)."""
-        return False
+        """Return whether the mocked estimation phase is enabled."""
+        return self.estimate_kv_cache
 
     def build_managers(self, resources, estimating_kv_cache):
         """Build KV cache manager with reuse configuration.
@@ -107,6 +108,13 @@ class _DummyKvCacheCreator:
             enable_block_reuse=self._kv_cache_config.enable_block_reuse,
             _stream=self._execution_stream,
         )
+
+    def configure_kv_cache_capacity(self, py_executor):
+        """Complete the mocked estimation phase without running requests."""
+
+    def teardown_managers(self, resources):
+        """Remove managers allocated for the mocked estimation phase."""
+        resources.pop(ResourceManagerType.KV_CACHE_MANAGER, None)
 
 
 class _DummyModelEngine:
@@ -169,6 +177,7 @@ def _make_llm_args():
         attn_backend="TRTLLM",
         speculative_config=None,
         disable_overlap_scheduler=True,
+        self_benchmark_config=None,
         sleep_config=None,
         cache_transceiver_config=None,
         dwdp_config=None,
@@ -185,7 +194,15 @@ def _make_llm_args():
     )
 
 
-def _run_create_py_executor(monkeypatch, *, sm_version, kv_cache_quant_algo):
+def _run_create_py_executor(
+    monkeypatch,
+    *,
+    sm_version,
+    kv_cache_quant_algo,
+    estimate_kv_cache=False,
+    self_benchmark_config=None,
+    executor_call_records=None,
+):
     """Execute create_py_executor with mocked dependencies and return cache reuse flags.
 
     Mocks all external dependencies (model engine, resource managers, etc.) to isolate
@@ -201,6 +218,7 @@ def _run_create_py_executor(monkeypatch, *, sm_version, kv_cache_quant_algo):
         Tuple of (kv_cache_reuse_flag, runtime_cache_reuse_flag) from created executor.
     """
     llm_args = _make_llm_args()
+    llm_args.self_benchmark_config = self_benchmark_config
     fake_mapping = SimpleNamespace(
         rank=0,
         tp_size=1,
@@ -233,7 +251,13 @@ def _run_create_py_executor(monkeypatch, *, sm_version, kv_cache_quant_algo):
     monkeypatch.setattr(py_executor_creator, "is_mla", lambda _: True)
     monkeypatch.setattr(py_executor_creator, "is_hybrid_linear", lambda _: False)
     monkeypatch.setattr(py_executor_creator, "get_sm_version", lambda: sm_version)
-    monkeypatch.setattr(py_executor_creator, "KvCacheCreator", _DummyKvCacheCreator)
+
+    def _create_kv_cache_creator(**kwargs):
+        creator = _DummyKvCacheCreator(**kwargs)
+        creator.estimate_kv_cache = estimate_kv_cache
+        return creator
+
+    monkeypatch.setattr(py_executor_creator, "KvCacheCreator", _create_kv_cache_creator)
 
     monkeypatch.setattr(py_executor_creator.torch.cuda, "mem_get_info", lambda: (2 << 30, 4 << 30))
     monkeypatch.setattr(py_executor_creator.torch.cuda, "empty_cache", lambda: None)
@@ -246,14 +270,24 @@ def _run_create_py_executor(monkeypatch, *, sm_version, kv_cache_quant_algo):
     )
 
     def _create_model_engine(**kwargs):
-        return _DummyModelEngine(
+        model_engine = _DummyModelEngine(
             attn_runtime_features=kwargs["attn_runtime_features"],
             kv_cache_quant_algo=kv_cache_quant_algo,
         )
+        model_engine.llm_args = kwargs["llm_args"]
+        return model_engine
 
     monkeypatch.setattr(py_executor_creator, "PyTorchModelEngine", _create_model_engine)
 
     def _create_py_executor_instance(**kwargs):
+        if executor_call_records is not None:
+            executor_call_records.append(
+                {
+                    "enable_self_benchmark": kwargs.get("enable_self_benchmark", True),
+                    "executor_uses_canonical_args": kwargs["llm_args"] is llm_args,
+                    "model_engine_uses_canonical_args": kwargs["model_engine"].llm_args is llm_args,
+                }
+            )
         return _DummyPyExecutor(
             resources=kwargs["resources"],
             model_engine=kwargs["model_engine"],
@@ -336,3 +370,23 @@ def test_mla_supported_configuration_preserves_cache_reuse(monkeypatch):
 
     assert kv_cache_reuse is True
     assert runtime_cache_reuse is True
+
+
+def test_kv_estimation_keeps_args_stable_and_gates_self_benchmark(monkeypatch):
+    executor_call_records = []
+
+    _run_create_py_executor(
+        monkeypatch,
+        sm_version=90,
+        kv_cache_quant_algo=QuantAlgo.NO_QUANT,
+        estimate_kv_cache=True,
+        self_benchmark_config=object(),
+        executor_call_records=executor_call_records,
+    )
+
+    assert [record["enable_self_benchmark"] for record in executor_call_records] == [
+        False,
+        True,
+    ]
+    assert all(record["executor_uses_canonical_args"] for record in executor_call_records)
+    assert all(record["model_engine_uses_canonical_args"] for record in executor_call_records)
