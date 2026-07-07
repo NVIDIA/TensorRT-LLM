@@ -42,6 +42,7 @@ NOT here; the storage-side seam (``ArenaPoolGroup``) lives in
 ``_storage/_core.py``.
 """
 
+import os
 from collections.abc import Sequence
 from math import gcd
 
@@ -49,6 +50,16 @@ from ._common import MemAddress
 from ._cuda_virt_mem import PooledPhysMemAllocator, VirtMem
 from ._exceptions import OutOfPagesError
 from ._utils import CachedCudaEvent, div_up
+
+# Quiesce the GPU before every reclaim unmap batch (default on; set to "0" to
+# disable). cuMemUnmap issued while kernels are in flight can fault reads of
+# OTHER, still-mapped ranges of the same VA reservation (device-side MMU
+# faults, reproduced on H100 with Llama-3.1-8B under the overlap scheduler;
+# the fault vanishes when unmaps are serialized against kernels and is immune
+# to event-level ordering fixes, pointing at driver-level TLB interference).
+# The sync happens only at reclaim waves - once per admission burst - so the
+# cost is bounded; disable only for experiments.
+_SYNC_BEFORE_UNMAP = os.getenv("TRTLLM_KV_ARENA_SYNC_BEFORE_UNMAP") != "0"
 
 # Kernel-facing offsets are int32, and v1's KVCacheIndex steals the high bit for
 # primary/secondary selection, leaving int31. The emitted value is
@@ -525,7 +536,16 @@ class SequenceArena:
 
     def _reclaim_now(self, base_block: int) -> None:
         """Unmap a range's pages in every pool and return the block range to
-        the allocator. Caller guarantees no in-flight work references it."""
+        the allocator. Caller guarantees no in-flight work references it --
+        and, because concurrent unmaps can fault unrelated in-flight reads at
+        the driver level (see ``_SYNC_BEFORE_UNMAP``), the GPU is quiesced
+        before the unmap batch unless explicitly disabled."""
+        if _SYNC_BEFORE_UNMAP:
+            from ._cuda_virt_mem import drv
+
+            from ._utils import _unwrap
+
+            _unwrap(drv.cuCtxSynchronize())
         frontiers = self._frontiers.pop(base_block)
         page = self._phys_page_size
         num_unmapped = 0
