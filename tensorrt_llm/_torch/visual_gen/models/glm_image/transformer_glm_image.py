@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -138,7 +138,7 @@ class GlmImageTimestepEmbedding(torch.nn.Module):
         self,
         in_channels: int,
         time_embed_dim: int,
-        out_dim: int = None,
+        out_dim: Optional[int] = None,
         model_config: Optional[DiffusionModelConfig] = None,
     ):
         super().__init__()
@@ -277,7 +277,7 @@ class GlmImageAdaLayerNormZero(torch.nn.Module):
 
     def forward(
         self, hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor, temb: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         dtype = hidden_states.dtype
         norm_hidden_states = self.norm(hidden_states).to(dtype=dtype)
         norm_encoder_hidden_states = self.norm_context(encoder_hidden_states).to(dtype=dtype)
@@ -433,8 +433,8 @@ class GlmImageAttention(Attention):
         attention_mask: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
-        batch_size, text_seq_length, embed_dim = encoder_hidden_states.shape
-        batch_size, image_seq_length, embed_dim = hidden_states.shape
+        batch_size, text_seq_length, _ = encoder_hidden_states.shape
+        batch_size, image_seq_length, _ = hidden_states.shape
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
         # QKV Proj
@@ -525,13 +525,16 @@ class GlmImageTransformerBlock(torch.nn.Module):
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
-        temb: torch.Tensor | None = None,
-        image_rotary_emb: tuple[torch.Tensor, torch.Tensor]
-        | list[tuple[torch.Tensor, torch.Tensor]]
-        | None = None,
-        attention_mask: dict[str, torch.Tensor] | None = None,
-        attention_kwargs: dict[str, Any] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        temb: Optional[torch.Tensor] = None,
+        image_rotary_emb: Optional[
+            Union[
+                Tuple[torch.Tensor, torch.Tensor],
+                List[Tuple[torch.Tensor, torch.Tensor]],
+            ]
+        ] = None,
+        attention_mask: Optional[Dict[str, torch.Tensor]] = None,
+        attention_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         # 1. Timestep conditioning
         (
             norm_hidden_states,
@@ -720,13 +723,16 @@ class GlmImageTransformer2DModel(BaseDiffusionModel):
         timestep: torch.LongTensor,
         target_size: torch.Tensor,
         crop_coords: torch.Tensor,
-        attention_kwargs: dict[str, Any] | None = None,
+        attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
-        attention_mask: torch.Tensor | None = None,
-        image_rotary_emb: tuple[torch.Tensor, torch.Tensor]
-        | list[tuple[torch.Tensor, torch.Tensor]]
-        | None = None,
-    ) -> tuple[torch.Tensor] | Transformer2DModelOutput:
+        attention_mask: Optional[torch.Tensor] = None,
+        image_rotary_emb: Optional[
+            Union[
+                Tuple[torch.Tensor, torch.Tensor],
+                List[Tuple[torch.Tensor, torch.Tensor]],
+            ]
+        ] = None,
+    ) -> Union[Tuple[torch.Tensor], Transformer2DModelOutput]:
         batch_size, num_channels, height, width = hidden_states.shape
 
         # 1. RoPE
@@ -749,7 +755,7 @@ class GlmImageTransformer2DModel(BaseDiffusionModel):
         temb = self.time_condition_embed(timestep, target_size, crop_coords, hidden_states.dtype)
 
         # 3. Transformer blocks
-        for idx, block in enumerate(self.transformer_blocks):
+        for block in self.transformer_blocks:
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 hidden_states, encoder_hidden_states = self._gradient_checkpointing_func(
                     block,

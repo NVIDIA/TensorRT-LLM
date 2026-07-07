@@ -16,4 +16,4 @@
 from .pipeline_glm_image import GlmImagePipeline
 from .transformer_glm_image import GlmImageAttention, GlmImageTransformer2DModel
 
-__all__ = ["GlmImagePipeline", "GlmImageTransformer2DModel", "GlmImageAttention"]
+__all__ = ["GlmImageAttention", "GlmImagePipeline", "GlmImageTransformer2DModel"]

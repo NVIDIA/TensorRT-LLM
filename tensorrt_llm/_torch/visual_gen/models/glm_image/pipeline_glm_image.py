@@ -513,7 +513,7 @@ class GlmImagePipeline(BasePipeline):
 
     def _get_glyph_embeds(
         self,
-        prompt: Union[str, List[str]] = None,
+        prompt: Optional[Union[str, List[str]]] = None,
         max_sequence_length: int = 2048,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
@@ -1095,7 +1095,7 @@ class GlmImagePipeline(BasePipeline):
 
     def _init_transformer(self) -> None:
         """Initialize GlmImage transformer with quantization support."""
-        logger.info("Creating HunyuanVideo1.5  transformer with quantization support...")
+        logger.info("Creating GlmImage transformer with quantization support...")
         self.transformer = GlmImageTransformer2DModel(
             model_config=self.pipeline_config.model_configs["transformer"]
         )
