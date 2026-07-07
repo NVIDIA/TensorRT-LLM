@@ -47,12 +47,7 @@ from ..attention_backend.sparse.dsa import (
 from ..attention_backend.utils import create_attention
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
-from ..utils import (
-    Fp4QuantizedTensor,
-    is_torch_compiling,
-    maybe_compiled_cat,
-    maybe_compiled_copy_,
-)
+from ..utils import Fp4QuantizedTensor, is_torch_compiling, maybe_compiled_cat, maybe_compiled_copy_
 from .attention import (
     _helix_cp_allgather_input,
     _helix_cp_output_projection,
@@ -1300,11 +1295,7 @@ class MLA(nn.Module):
             qa = self.q_a_layernorm
             # q_b_proj must be static-NVFP4 (shared predicate) and q_a_layernorm
             # a plain (non-gemma, non-quantizing) RMSNorm.
-            if (
-                is_static_nvfp4_input_eligible(qb)
-                and not getattr(qa, "use_gemma", False)
-                and not getattr(qa, "is_nvfp4", False)
-            ):
+            if is_static_nvfp4_input_eligible(qb) and not qa.use_gemma and not qa.is_nvfp4:
                 eligible = True
         if eligible:
             # Mark q_a_layernorm as an NVFP4 norm and attach q_b_proj's static

@@ -3498,11 +3498,11 @@ class Linear(nn.Module):
 
 
 def is_static_nvfp4_input_eligible(linear) -> bool:
-    """Whether ``linear`` consumes a static (calibrated) NVFP4 input, making it
+    """Whether `linear` consumes a static (calibrated) NVFP4 input, making it
     eligible to have its input-quantize folded into a producing RMSNorm.
 
     Eligible iff the Linear has NVFP4 weights, a calibrated (static)
-    ``input_scale``, no AWQ ``pre_quant_scale``, and is not forced to dynamic
+    `input_scale`, no AWQ `pre_quant_scale`, and is not forced to dynamic
     quantization. This is the single canonical definition shared by every
     NVFP4-fold site (the layer-boundary / dense folds in modeling_deepseekv3.py
     and the q_a_layernorm -> q_b_proj fold in attention.py's MLA) so the gate

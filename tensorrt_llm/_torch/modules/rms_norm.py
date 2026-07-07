@@ -103,6 +103,14 @@ class RMSNorm(nn.Module):
                 return_hp_output = False
         self.return_hp_output = return_hp_output
 
+        # Static NVFP4 input scale of the Linear this norm feeds, enabling the
+        # fused (add +) RMSNorm + NVFP4-quantize path in forward. It cannot be
+        # set at construction time because the consuming Linear's calibrated
+        # input_scale only exists after weight loading; the owning model
+        # attaches it afterwards (DeepseekV3 post_load_weights /
+        # MLA._resolve_qa_fused_scale). None keeps the fusion disabled.
+        self.nvfp4_scale: Optional[torch.Tensor] = None
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -130,8 +138,7 @@ class RMSNorm(nn.Module):
         # for MoE-gate consumers). When is_nvfp4 but no scale is attached yet
         # (e.g. a layer's first input_layernorm whose consumer has no static
         # scale), fall through to the plain norm below.
-        nvfp4_scale = getattr(self, "nvfp4_scale",
-                              None) if self.is_nvfp4 else None
+        nvfp4_scale = self.nvfp4_scale if self.is_nvfp4 else None
         if nvfp4_scale is not None and not self.use_gemma:
             return self._fused_nvfp4_quant(hidden_states, residual, nvfp4_scale,
                                            return_norm_out)

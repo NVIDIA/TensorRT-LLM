@@ -147,10 +147,10 @@ def moe_reduce_add_shared_output(routed_output, shared_output, out=None):
 
 
 def _static_nvfp4_input_scale(linear):
-    """Return ``linear``'s calibrated NVFP4 input_scale if it is eligible to be
+    """Return `linear`'s calibrated NVFP4 input_scale if it is eligible to be
     folded into a producing RMSNorm's fused NVFP4 quantize, else None.
 
-    Eligibility is the shared ``is_static_nvfp4_input_eligible`` predicate, also
+    Eligibility is the shared `is_static_nvfp4_input_eligible` predicate, also
     used by MLA._resolve_qa_fused_scale, so every fold site agrees on what
     "static-NVFP4 eligible" means."""
     if is_static_nvfp4_input_eligible(linear):
@@ -1446,7 +1446,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = hidden_states
-            if getattr(self.input_layernorm, "nvfp4_scale", None) is not None:
+            if self.input_layernorm.nvfp4_scale is not None:
                 # Layer-0 prologue: the residual-less input_layernorm folds the
                 # NVFP4 kv_a_proj input-quant via its attached .nvfp4_scale
                 # (RMSNorm.forward), returning an Fp4QuantizedTensor.
@@ -1588,7 +1588,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         and dense layers."""
         if self.next_layer_layernorm is None:
             return hidden_states, residual
-        if getattr(self.next_layer_layernorm, "nvfp4_scale", None) is not None:
+        if self.next_layer_layernorm.nvfp4_scale is not None:
             return self.next_layer_layernorm(hidden_states,
                                              residual,
                                              return_norm_out=True)
@@ -1625,8 +1625,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                         eps=self.post_attention_layernorm.variance_epsilon,
                     ),
                 )
-        elif getattr(self.post_attention_layernorm, "nvfp4_scale",
-                     None) is not None:
+        elif self.post_attention_layernorm.nvfp4_scale is not None:
             # Attention-DP path (no allreduce): post_attention_layernorm folds
             # the dense MLP's NVFP4 gate_up_proj input-quant into one kernel via
             # its attached .nvfp4_scale (RMSNorm.forward), mirroring the
