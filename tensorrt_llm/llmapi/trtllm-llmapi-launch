@@ -40,9 +40,10 @@ function maybe_export_free_tcp_addr_for_spawn_proxy_process {
 export tllm_mpi_size=$(mpi_world_size)
 log_stderr "tllm_mpi_size: $tllm_mpi_size"
 
-export TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY=$(openssl rand -hex 32)
+unset TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY
 
 if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
+    export TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY=$(openssl rand -hex 32)
 
     # IPC only works on localhost and in MPI rank0 process
     maybe_export_free_tcp_addr_for_spawn_proxy_process
