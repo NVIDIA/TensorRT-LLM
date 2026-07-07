@@ -47,6 +47,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `nvidia/Cosmos3-Edge` | Text-to-Image, Text-to-Video, Image-to-Video (Nemotron-dense backbone, 480p-native) |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | Text-to-Video |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | Text-to-Video |
+| `zai-org/GLM-Image` | Text-to-Image |
 
 
 Models are auto-detected from the checkpoint directory. Diffusers-format models are detected via `model_index.json`; LTX-2 monolithic safetensors checkpoints are detected via embedded metadata. The `AutoPipeline` registry selects the appropriate pipeline class automatically.
@@ -67,6 +68,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | No | Yes | No | No | Yes | Yes | No | No | No | No | No |
 | **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
 | **HunyuanVideo 1.5** | Yes | Yes | No | No | No | No | No | No | No | Yes | No | No | No | No |
+| **GlmImage** [^9] | Yes | Yes | No | No | No | No | No | No | No | Yes | No | No | No | No |
 
 [^1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
 
@@ -79,6 +81,8 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 [^6]: Qwen-Image-Layered supports baseline BF16 image-conditioned layer decomposition and returns the generated RGBA layer stack as a saveable image grid. FP8 blockwise, NVFP4, cache acceleration, attention-parallel/Sage/VSA backends, Tensor Parallelism, and `trtllm-serve` image-edit routing are not enabled for this pipeline yet.
 
 [^7]: `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` — a distilled version of Wan2.2-TI2V-5B with 3 denoising steps. CFG parallelism, TeaCache, and Cache-DiT are not applicable.
+
+[^9]: GlmImage currently supports single-GPU text-to-image with BF16 parity vs `diffusers` (cosine >= 0.99 on the full transformer). FP8 blockwise and NVFP4 use VisualGen dynamic quantization from BF16 checkpoints. Image-to-image conditioning, sequence/CFG parallelism, parallel VAE, and caching (TeaCache / Cache-DiT) are not yet supported.
 
 ## Quick Start
 

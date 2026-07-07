@@ -1,0 +1,5 @@
+# GlmImage text-to-image (single GPU).
+# Image-to-image conditioning, sequence/CFG parallelism, and caching are not yet supported.
+parallel_config:
+  cfg_size: 1
+  ulysses_size: 1
