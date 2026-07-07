@@ -1,5 +1,4 @@
 import math
-import os
 import weakref
 from typing import List, Optional, Tuple, Union
 
@@ -465,14 +464,12 @@ class Attention(nn.Module):
         if self.attn_output_gate:
             logger.info_once("using attn output gate!", key="attn_output_gate")
 
-        # Opt-in [Q|K|V|G] gate-tail layout: the fused QKV(+gate) weight rows are permuted at
+        # [Q|K|V|G] gate-tail layout: the fused QKV(+gate) weight rows are permuted at
         # load time (see post_load_weights) from the per-head-interleaved [q0|g0|q1|g1|...|K|V]
         # HF layout to [Q|K|V|G]. Q/K/V then form one contiguous slice of the GEMM output,
         # which removes the q/gate de-interleave copies and the q,k,v re-concat before the
         # fused qk-norm-rope kernel; the attention op consumes [Q|K|V] as a row-strided view.
-        self._gate_tail_layout_requested = (
-            self.attn_output_gate
-            and os.environ.get("TRTLLM_ATTN_GATE_TAIL_LAYOUT", "0") == "1")
+        self._gate_tail_layout_enabled = bool(self.attn_output_gate)
         self._gate_tail_layout_active = False
 
         # [Chunked Attention]
@@ -712,7 +709,7 @@ class Attention(nn.Module):
         engaged for plain (unquantized) weights with the TRTLLM backend and the fused
         qk-norm-rope kernel, where the strided [Q|K|V] view is supported end to end.
         """
-        if not self._gate_tail_layout_requested or self._gate_tail_layout_active:
+        if not self._gate_tail_layout_enabled or self._gate_tail_layout_active:
             return
         has_quant = (self.quant_config is not None
                      and self.quant_config.layer_quant_mode.has_any_quant(
@@ -725,8 +722,8 @@ class Attention(nn.Module):
                      in (torch.bfloat16, torch.float16, torch.float32))
         if not supported:
             logger.warning_once(
-                "TRTLLM_ATTN_GATE_TAIL_LAYOUT requested but not supported for "
-                "this attention configuration; keeping interleaved layout.",
+                "Gate-tail QKV layout is not supported for this attention "
+                "configuration; keeping the interleaved layout.",
                 key="gate_tail_layout_unsupported")
             return
         device = self.qkv_proj.weight.device
