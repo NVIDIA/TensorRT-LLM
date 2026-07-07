@@ -13,8 +13,9 @@ class _FakeMarker:
 
 
 class _FakeItem:
-    def __init__(self, model_dir=None):
+    def __init__(self, model_dir=None, cls=None):
         self._marker = _FakeMarker(model_dir) if model_dir else None
+        self.cls = cls
 
     def get_closest_marker(self, name):
         return self._marker if name == "prefetch_model_dir" else None
@@ -251,6 +252,41 @@ def test_no_marker_suite_never_warms(prefetcher):
     assert prefetcher._next_model == {}
     prefetcher.on_test_setup(items[0])
     assert prefetcher.warmed == []
+
+
+def test_auto_model_dir_from_accuracy_class_attr(prefetcher):
+    # Accuracy-harness classes declare MODEL_PATH; warming must pick it up
+    # automatically, with no marker on the test.
+    class _TestLlama:
+        MODEL_PATH = "/models/llama"
+
+    class _TestQwen:
+        MODEL_PATH = "/models/qwen"
+
+    items = [_FakeItem(cls=_TestLlama), _FakeItem(cls=_TestQwen)]
+    prefetcher.on_collection(items)
+    prefetcher.on_test_setup(items[0])
+    import time
+
+    for _ in range(100):
+        if prefetcher.warmed:
+            break
+        time.sleep(0.05)
+    assert prefetcher.warmed == ["/models/qwen"]
+
+
+def test_marker_overrides_class_model_path():
+    class _TestCls:
+        MODEL_PATH = "/models/from-class"
+
+    item = _FakeItem(model_dir="/models/from-marker", cls=_TestCls)
+    assert session_prefetcher._model_dir_of(item) == "/models/from-marker"
+
+
+def test_warm_page_cache_ignores_non_weight_dirs(tmp_path):
+    # MODEL_PATH may be an HF model id or a dir without local weights: no-op.
+    assert warm_page_cache(str(tmp_path)) == 0.0
+    assert warm_page_cache("not/a/real/dir") == 0.0
 
 
 def test_warm_page_cache_reads_weight_files(tmp_path):

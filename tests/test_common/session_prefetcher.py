@@ -20,13 +20,15 @@ spare pool of the same size for the next test. A miss falls back to the
 normal synchronous spawn, so a wrong prefetch can only cost time, never
 correctness.
 
-Weight page-cache warming (opt-in per test): mark tests with
-``@pytest.mark.prefetch_model_dir("/path/to/model")``; when the NEXT test's
-declared model differs from the current one, its weight files are read in a
-background thread so the kernel page cache is hot by the time that test
-loads weights. This complements pool prefetch (pool reuse does not cover
-model IO). Page cache is reclaimable memory, so warming cannot OOM the
-host; a wasted warm (test skipped or reordered) costs only IO bandwidth.
+Weight page-cache warming: when the NEXT test's model differs from the
+current one, its weight files are read in a background thread so the kernel
+page cache is hot by the time that test loads weights. The next model is
+discovered automatically from the accuracy-harness ``MODEL_PATH`` class
+attribute, or declared explicitly with
+``@pytest.mark.prefetch_model_dir("/path/to/model")``. This complements
+pool prefetch (pool reuse does not cover model IO). Page cache is
+reclaimable memory, so warming cannot OOM the host; a wasted warm (test
+skipped or reordered) costs only IO bandwidth.
 
 Enabled by default; set ``TRTLLM_TEST_PREFETCH_SESSION=0`` to disable.
 Suites that never import tensorrt_llm's executor modules pay nothing —
@@ -88,9 +90,19 @@ _READ_CHUNK = 64 << 20  # 64MB
 
 
 def _model_dir_of(item):
-    """A test item's model dir from its ``prefetch_model_dir`` marker, or None."""
+    """A test item's model dir: explicit marker, else the class convention.
+
+    The accuracy-test harness declares the model as a ``MODEL_PATH`` class
+    attribute (120+ classes across tests/integration/defs/accuracy), so those
+    suites get weight warming automatically, with the marker as the explicit
+    override for everything else. A value that is not a real directory of
+    weight files makes ``warm_page_cache`` a silent no-op.
+    """
     marker = item.get_closest_marker("prefetch_model_dir")
-    return marker.args[0] if marker is not None and marker.args else None
+    if marker is not None and marker.args:
+        return marker.args[0]
+    model_path = getattr(getattr(item, "cls", None), "MODEL_PATH", None)
+    return model_path if isinstance(model_path, str) else None
 
 
 def warm_page_cache(model_dir: str) -> float:
@@ -101,6 +113,8 @@ def warm_page_cache(model_dir: str) -> float:
     Returns the number of GiB read.
     """
     files = sorted(f for pat in _WEIGHT_GLOBS for f in glob.glob(os.path.join(model_dir, pat)))
+    if not files:
+        return 0.0  # not a local weight dir (e.g. an HF model id): nothing to warm
     t0 = time.monotonic()
 
     def _read(path):
