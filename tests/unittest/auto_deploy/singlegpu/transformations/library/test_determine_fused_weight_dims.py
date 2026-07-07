@@ -29,9 +29,7 @@ import torch.nn as nn
 from torch.fx import GraphModule
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401 — register custom ops
-from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
-    _determine_fused_weight_dims,
-)
+from tensorrt_llm._torch.auto_deploy.transform.library.sharding import _determine_fused_weight_dims
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op
 
 
