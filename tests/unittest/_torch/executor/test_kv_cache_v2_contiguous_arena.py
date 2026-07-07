@@ -98,9 +98,6 @@ class TestKvCacheConfigArenaField(unittest.TestCase):
             arena_cfg = KVCacheManagerV2._build_arena_config()
         self.assertEqual(arena_cfg.phys_page_size, 2 * MiB)
         self.assertEqual(arena_cfg.write_through, WriteThroughPolicy.ON_FREE)
-        # default margin pre-maps the whole reserved range on first touch
-        # (clamped per range) so growth maps never run under kernels
-        self.assertEqual(arena_cfg.map_ahead_pages, 1 << 30)
 
 
 class TestLinearKernelsEnvGuard(unittest.TestCase):

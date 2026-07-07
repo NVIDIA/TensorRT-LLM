@@ -1095,16 +1095,8 @@ class KVCacheManagerV2(BaseResourceManager):
         - ``TRTLLM_KV_ARENA_PHYS_PAGE_SIZE_MB``: physical mapping granularity
           ("super-page", multiple of 2; default 2). Larger pages amortize the
           fixed per-mapping cuMemSetAccess cost (§4.8).
-        - ``TRTLLM_KV_ARENA_MAP_AHEAD_PAGES``: demand-paging margin (§4.2).
-          Default ``-1`` = pre-map each sequence's whole reserved range at
-          its first mapping (the margin is clamped to the reserved extent).
-          Growth-time ``cuMemMap``/``cuMemSetAccess`` concurrent with
-          in-flight kernels reading the same range is the only remaining
-          trigger of the H100 MMU-fault interference (see
-          ``_sequence_arena._SYNC_BEFORE_UNMAP``): pre-mapping at admission
-          removes growth maps entirely and is the one configuration
-          validated crash-free at every tested scale. Small margins trade
-          that safety for lower physical footprint (experiments only).
+        - ``TRTLLM_KV_ARENA_MAP_AHEAD_PAGES``: demand-paging margin (§4.2,
+          default 1).
         - ``TRTLLM_KV_ARENA_WRITE_THROUGH``: ``on_free`` (default) or
           ``on_commit`` (§4.3).
         - ``TRTLLM_KV_ARENA_LAZY_RETENTION``: ``1`` keeps freed sequence
@@ -1124,12 +1116,7 @@ class KVCacheManagerV2(BaseResourceManager):
           without ``use_contiguous_kv_arena``. Default ``0``.
         """
         page_mb = int(os.environ.get("TRTLLM_KV_ARENA_PHYS_PAGE_SIZE_MB", "2"))
-        map_ahead = int(os.environ.get("TRTLLM_KV_ARENA_MAP_AHEAD_PAGES", "-1"))
-        if map_ahead < 0:
-            # Pre-map-at-resume: a margin larger than any range pre-maps the
-            # whole reserved extent on first touch (the mapping plan clamps
-            # to the range), so no growth maps ever run under kernels.
-            map_ahead = 1 << 30
+        map_ahead = int(os.environ.get("TRTLLM_KV_ARENA_MAP_AHEAD_PAGES", "1"))
         write_through_env = os.environ.get("TRTLLM_KV_ARENA_WRITE_THROUGH", "on_free").lower()
         assert write_through_env in ("on_free", "on_commit"), (
             f"TRTLLM_KV_ARENA_WRITE_THROUGH must be 'on_free' or 'on_commit', "
