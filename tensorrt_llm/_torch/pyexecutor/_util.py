@@ -357,8 +357,8 @@ class KvCacheCreator:
                 logger.warning(
                     "KVCacheManagerV2 is not supported with %s. "
                     "Falling back to KVCacheManager.", incompat_str)
-                cls = KVCacheManager
-        return cls
+                return KVCacheManager
+        return kv_cache_manager_cls
 
     def _enable_kv_cache_stats(self) -> bool:
         return (self._llm_args.enable_iter_perf_stats
