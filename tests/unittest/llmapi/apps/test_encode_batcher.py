@@ -183,6 +183,53 @@ async def test_encode_failure_propagates_and_worker_survives():
         await batcher.shutdown()
 
 
+async def test_cancelled_request_does_not_kill_worker():
+    """A request cancelled while in flight must not take down the worker.
+
+    If a caller's future is cancelled (e.g. the client disconnects) after its
+    batch has been formed, the success path would call set_result() on an
+    already-done future, raise InvalidStateError, and kill the sole worker —
+    hanging every subsequent request. The worker must instead skip the cancelled
+    future and keep serving.
+    """
+    import asyncio
+    import threading
+
+    encode_started = threading.Event()
+    release = threading.Event()
+
+    def encode_fn(batch):
+        encode_started.set()
+        # Block until the test has had a chance to cancel the in-flight request.
+        release.wait(timeout=5.0)
+        return [sum(token_ids) for token_ids in batch]
+
+    batcher = EncodeBatcher(
+        encode_fn,
+        max_batch_size=1,  # one request per batch, so the cancelled one dispatches alone
+        max_queue_delay=0.01,
+        max_queue_size=100,
+    )
+    await batcher.start()
+    try:
+        # Submit a request and wait until its batch is being encoded.
+        task = asyncio.ensure_future(batcher.submit([1, 2, 3]))
+        await asyncio.get_running_loop().run_in_executor(None, encode_started.wait, 5.0)
+        # Cancel it mid-encode so its future is done (cancelled) before dispatch
+        # tries to resolve it, then let encode_fn finish.
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # The worker must still be alive and serving.
+        assert batcher.is_alive()
+        result = await asyncio.wait_for(batcher.submit([4, 5, 6]), timeout=1.0)
+        assert result == 15
+    finally:
+        await batcher.shutdown()
+
+
 async def test_event_loop_stays_responsive_during_blocking_encode():
     """A blocking encode_fn must not freeze the event loop.
 

@@ -688,6 +688,12 @@ class OpenAIServer(_VideoRoutesMixin):
         )
 
     def _check_health(self) -> bool:
+        # An embedding server's requests flow through the batcher worker; if it
+        # has exited the engine is up but every /v1/embeddings request hangs, so
+        # report unhealthy rather than a misleading 200.
+        batcher = self.embedding_batcher
+        if batcher is not None and not batcher.is_alive():
+            return False
         if isinstance(self.generator, LLM):
             return self.generator._check_health()
         # llmapi.LLM (e.g. PyTorch backend) is not isinstance(_tensorrt_engine.LLM)

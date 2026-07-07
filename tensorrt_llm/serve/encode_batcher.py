@@ -82,6 +82,15 @@ class EncodeBatcher:
     async def start(self) -> None:
         self._worker = asyncio.create_task(self._run())
 
+    def is_alive(self) -> bool:
+        """Whether the background worker is running.
+
+        Returns False if the worker was never started or has exited (e.g. it
+        crashed). A dead worker means every queued and future request hangs, so
+        the server's health check reports unhealthy when this is False.
+        """
+        return self._worker is not None and not self._worker.done()
+
     def validate_input(self, token_ids: List[int]) -> None:
         """Validate a single input against the model's capacity.
 
@@ -169,7 +178,12 @@ class EncodeBatcher:
                     request.future.set_exception(exc)
             return
         for request, result in zip(batch, results):
-            request.future.set_result(result)
+            # A request whose future was cancelled while queued (e.g. the client
+            # disconnected) is already done; set_result() would raise
+            # InvalidStateError and kill the sole worker, hanging every later
+            # request. Skip those and only resolve futures still awaiting.
+            if not request.future.done():
+                request.future.set_result(result)
 
     async def shutdown(self) -> None:
         if self._worker is not None:
