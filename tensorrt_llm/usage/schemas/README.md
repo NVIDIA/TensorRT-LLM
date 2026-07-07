@@ -217,6 +217,19 @@ over time.
 
 ## For Developers: Adding a New Field
 
+### If the LLM args telemetry manifest test fails
+
+The failure is an intentional privacy gate. From the TensorRT-LLM repository root, run exactly:
+
+```bash
+python3 scripts/generate_llm_args_golden_manifest.py
+```
+
+Review and commit `tensorrt_llm/usage/llm_args_golden_manifest.json`. Do not accept the generated
+diff blindly: it is the privacy review for every newly capturable field and requires approval from
+the telemetry/privacy CODEOWNER. If a field is captured unexpectedly, correct its annotation or
+telemetry metadata instead of approving the generated diff.
+
 Checklist for adding a telemetry field:
 
 1. **`tensorrt_llm/usage/schema.py`** — Add field to `TrtllmInitialReport` (or `TrtllmHeartbeat`) Pydantic model with alias.

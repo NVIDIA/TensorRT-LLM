@@ -255,14 +255,19 @@ def test_manifest_generator_is_not_a_normal_precommit_hook():
 
 
 def _assert_committed_manifest_current(generator) -> None:
-    assert generator.main(["--check"]) == 0, (
-        "The committed LLM args telemetry manifest is stale. Regenerate it with:\n\n"
-        "  python3 scripts/generate_llm_args_golden_manifest.py\n\n"
-        "Review and commit the resulting privacy-sensitive manifest diff."
-    )
+    if generator.main(["--check"]) != 0:
+        raise AssertionError(
+            "The committed LLM args telemetry manifest is stale.\n\n"
+            "FIX: From the TensorRT-LLM repository root, run exactly:\n\n"
+            "  python3 scripts/generate_llm_args_golden_manifest.py\n\n"
+            "Then review and commit:\n"
+            "  tensorrt_llm/usage/llm_args_golden_manifest.json\n\n"
+            "Do not update the golden blindly. Its diff is the privacy review for every newly "
+            "capturable field and requires approval from the telemetry/privacy CODEOWNER."
+        )
 
 
-def test_committed_golden_failure_explains_regeneration():
+def test_committed_golden_failure_gives_exact_regeneration_command():
     from types import SimpleNamespace
 
     import pytest
@@ -272,9 +277,15 @@ def test_committed_golden_failure_explains_regeneration():
     with pytest.raises(AssertionError) as failure:
         _assert_committed_manifest_current(generator)
 
-    message = str(failure.value)
-    assert "python3 scripts/generate_llm_args_golden_manifest.py" in message
-    assert "review and commit" in message.lower()
+    assert str(failure.value) == (
+        "The committed LLM args telemetry manifest is stale.\n\n"
+        "FIX: From the TensorRT-LLM repository root, run exactly:\n\n"
+        "  python3 scripts/generate_llm_args_golden_manifest.py\n\n"
+        "Then review and commit:\n"
+        "  tensorrt_llm/usage/llm_args_golden_manifest.json\n\n"
+        "Do not update the golden blindly. Its diff is the privacy review for every newly "
+        "capturable field and requires approval from the telemetry/privacy CODEOWNER."
+    )
 
 
 def test_build_capture_manifest_matches_committed_golden():
@@ -415,6 +426,8 @@ def test_renderer_emits_table_from_committed_golden(tmp_path):
     generator.generate_telemetry_reference(_repo_root(), out)
     text = out.read_text()
     assert "## LLM API Configuration Fields" in text
+    assert "## When the Premerge Manifest Check Fails" in text
+    assert "python3 scripts/generate_llm_args_golden_manifest.py" in text
     assert "explicitly marked" not in text  # opt-in prose must be gone
     assert "`backend`" in text  # a known captured key renders
 

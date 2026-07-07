@@ -193,7 +193,20 @@ Add the field to the appropriate schema file:
     # No status field for committed arguments
   ```
 
-#### 3. Run validation tests
+#### 3. Regenerate and review the telemetry manifest
+
+LLM API configuration telemetry is type-driven, so adding or changing an `LlmArgs` field can change
+the privacy-sensitive capture surface. From the TensorRT-LLM repository root, run exactly:
+
+```bash
+python3 scripts/generate_llm_args_golden_manifest.py
+```
+
+Review and commit `tensorrt_llm/usage/llm_args_golden_manifest.json`. Do not accept the generated
+diff blindly: every newly captured field requires approval from the telemetry/privacy CODEOWNER. If
+the field should not be captured, correct its annotation or telemetry metadata before continuing.
+
+#### 4. Run validation tests
 
 ```bash
 python -m pytest tests/unittest/api_stability/test_llm_api.py

@@ -41,6 +41,19 @@ unless a field carries an explicit allowlist (`TelemetryField.categorical(...)`)
 and any field may opt out with `telemetry=False`. Every captured field is listed
 below; the runtime can capture nothing absent from this list.
 
+## When the Premerge Manifest Check Fails
+
+From the TensorRT-LLM repository root, run exactly:
+
+```bash
+python3 scripts/generate_llm_args_golden_manifest.py
+```
+
+Review and commit `tensorrt_llm/usage/llm_args_golden_manifest.json`. Do not accept the generated
+diff blindly: it is the privacy review for every newly capturable field and requires approval from
+the telemetry/privacy CODEOWNER. If a field is captured unexpectedly, correct its annotation or
+telemetry metadata instead of approving the generated diff.
+
 ## LLM API Configuration Fields
 
 A field can still be absent from a specific payload when its parent config is

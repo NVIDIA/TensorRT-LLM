@@ -551,6 +551,20 @@ When defining any user-facing configuration classes (particularly `LlmArgs` or a
 - Prefer `PositiveInt`, `NonNegativeInt`, `NonNegativeFloat`, `PositiveFloat`, `Field(gt=0)`, `Field(ge=0)`, etc. for numeric constraints instead of defining custom validators
 - Use `Field(min_length=1)` to enforce minimum length of a list
 
+**LLM args telemetry manifest (required):** LLM API configuration telemetry is type-driven. Adding,
+removing, renaming, retyping, or re-nesting a field in `BaseLlmArgs`, `TorchLlmArgs`, `TrtLlmArgs`,
+or any configuration class reachable from them can change which fields are captured. After any such
+change, run this exact command from the TensorRT-LLM repository root:
+
+```bash
+python3 scripts/generate_llm_args_golden_manifest.py
+```
+
+Review and commit `tensorrt_llm/usage/llm_args_golden_manifest.json`. Never edit or accept the golden
+blindly: its diff is the privacy review for every newly capturable field and requires approval from
+the telemetry/privacy CODEOWNER. If a field is captured unexpectedly, correct its annotation or
+telemetry metadata instead of approving the generated diff.
+
 **Validation:**
 - Use `@field_validator` and `@model_validator` instead of manual `validate()` or `is_valid()` methods
 - Raise `ValueError` instead of using assertions
