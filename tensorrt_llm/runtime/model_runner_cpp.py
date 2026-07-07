@@ -890,7 +890,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
 
     def _prepare_mrope_executor(self, batch_input_ids_list, mrope: MropeParams):
         mrope_configs = len(batch_input_ids_list) * [None]
-        if mrope != None:
+        if mrope is not None:
             mrope_rotary_cos_sin = mrope.mrope_rotary_cos_sin
             assert isinstance(
                 mrope_rotary_cos_sin,
