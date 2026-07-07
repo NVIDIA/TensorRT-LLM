@@ -176,7 +176,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def _create_kv_slice(
         self,
         req: LlmRequest,
-        token_range: Optional[TokenRange] = None,
         is_last_slice: bool = True,
     ) -> KVSlice:
         adapter = self._reuse_adapter
@@ -191,7 +190,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             else [0] * len(layer_groups)
         )
 
-        if token_range is None and req.prompt_len > 0:
+        token_range = None
+        if req.prompt_len > 0:
             # Align with KV cache allocation (prepare_disagg_gen_init /
             # _get_context_bytes), which reserves prompt_len +
             # num_extra_kv_tokens slots for speculative decoding methods
