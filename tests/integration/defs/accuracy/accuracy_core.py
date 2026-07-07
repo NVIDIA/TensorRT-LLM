@@ -216,7 +216,31 @@ class AccuracyTask:
         is_integration_test = is_integration_test or os.getenv(
             'INTEGRATION_TEST', '0') == '1'
 
-        if is_integration_test:
+        # Optional GSM8K debug env vars: TRTLLM_GSM8K_NUM_SAMPLES, TRTLLM_GSM8K_OUTPUT_DIR.
+        # A custom sample count skips the accuracy hypothesis test.
+        gsm8k_num_samples = None
+        gsm8k_output_dir = None
+        if self.DATASET == "gsm8k":
+            gsm8k_output_dir = os.getenv("TRTLLM_GSM8K_OUTPUT_DIR") or None
+            num_samples_env = os.getenv("TRTLLM_GSM8K_NUM_SAMPLES")
+            if num_samples_env is not None:
+                gsm8k_num_samples = int(num_samples_env)
+                if gsm8k_num_samples <= 0:
+                    raise ValueError(
+                        "TRTLLM_GSM8K_NUM_SAMPLES must be a positive integer, "
+                        f"got {num_samples_env!r}.")
+
+        if gsm8k_num_samples is not None:
+            logger.info(
+                f"Running GSM8K on a deterministic subset of {gsm8k_num_samples} "
+                "sample(s) (TRTLLM_GSM8K_NUM_SAMPLES) and skipping accuracy "
+                "verification.")
+            hypothesis_testing_params = HypothesisTestingParams(
+                ref_accuracy=0 if self.HIGHER_IS_BETTER else math.inf,
+                num_samples=gsm8k_num_samples,
+                metric_name=self.METRIC_NAME,
+                higher_is_better=self.HIGHER_IS_BETTER)
+        elif is_integration_test:
             logger.info(
                 "Running in INTEGRATION_TEST mode: using only 1 sample and skipping accuracy verification"
             )
@@ -248,6 +272,12 @@ class AccuracyTask:
             evaluator_kwargs.update(self.EVALUATOR_KWARGS)
         if extra_evaluator_kwargs is not None:
             evaluator_kwargs.update(extra_evaluator_kwargs)
+        if gsm8k_output_dir is not None:
+            evaluator_kwargs["output_dir"] = gsm8k_output_dir
+            logger.info(
+                "Dumping GSM8K inference inputs/outputs to "
+                f"{os.path.realpath(gsm8k_output_dir)} (TRTLLM_GSM8K_OUTPUT_DIR)."
+            )
         evaluator = self.EVALUATOR_CLS(
             num_samples=hypothesis_testing_params.num_samples,
             **evaluator_kwargs)

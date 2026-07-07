@@ -35,6 +35,8 @@ from ..pyexecutor.resource_manager import (BaseResourceManager,
                                            ResourceManagerType)
 
 if TYPE_CHECKING:
+    from tensorrt_llm.mapping import Mapping
+
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
     from ..pyexecutor.llm_request import LlmRequest
 
@@ -871,6 +873,25 @@ class SpecWorkerBase(nn.Module, ABC):
         # seed/offset pattern in `_sample_tokens_for_batch`).
         self._force_accept_rng_pool: Optional[torch.Tensor] = None
         self._force_accept_rng_counter: Optional[torch.Tensor] = None
+        # Repurposed CP-to-TP mapping for draft-token sampling under Helix CP.
+        self._sampler_mapping_cache: Optional["Mapping"] = None
+
+    @property
+    def sampler_mapping(self) -> Optional["Mapping"]:
+        """Mapping for vocab-parallel draft-token sampling.
+
+        Under Helix CP, ranks are repurposed to TP past attention. Returns
+        model_config.mapping when Helix CP is inactive.
+        """
+        model_config = getattr(self, "model_config", None)
+        if model_config is None or not hasattr(model_config, "mapping"):
+            return None
+        mapping = model_config.mapping
+        if mapping is None or not mapping.has_cp_helix():
+            return mapping
+        if self._sampler_mapping_cache is None:
+            self._sampler_mapping_cache = mapping.repurpose_helix_cp_to_tp()
+        return self._sampler_mapping_cache
 
     @property
     @abstractmethod

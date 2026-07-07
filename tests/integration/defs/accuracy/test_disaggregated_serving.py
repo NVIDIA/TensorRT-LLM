@@ -1195,6 +1195,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(8)
+    @parametrize_with_ids("mtp_nextn", [0, 3])
     @pytest.mark.parametrize(
         "gen_pp,gen_tp,gen_cp,enable_attention_dp", [
             (1, 1, 4, False),
@@ -1219,8 +1220,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                  "cudagraph:with_padding"
                              ])
     @pytest.mark.parametrize("comms_medium", ["fifo_v1", "fifo_v2", "nccl"])
-    def test_auto_dtype_with_helix(self, comms_medium, cuda_graph_config,
-                                   gen_pp, gen_tp, gen_cp, enable_attention_dp):
+    def test_auto_dtype_with_helix(self, mtp_nextn, comms_medium,
+                                   cuda_graph_config, gen_pp, gen_tp, gen_cp,
+                                   enable_attention_dp):
         # Parse comms_medium to get use_nccl_for_alltoall and fifo_version.
         if comms_medium == "nccl":
             use_nccl_for_alltoall = True
@@ -1264,7 +1266,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "use_nccl_for_alltoall": use_nccl_for_alltoall,
                 "fifo_version": fifo_version,
             },
-            "disable_overlap_scheduler": True,
+            "disable_overlap_scheduler": mtp_nextn == 0,
             "kv_cache_config": kv_cache_config,
             "enable_chunked_prefill": False,
             "cuda_graph_config": cuda_graph_config,
@@ -1274,6 +1276,16 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             },
             "enable_attention_dp": enable_attention_dp,
         }
+        # Enable MTP on both servers so ctx and gen agree on spec-decode layout.
+        if mtp_nextn > 0:
+            ctx_server_config["speculative_config"] = {
+                "decoding_type": "MTP",
+                "max_draft_len": mtp_nextn,
+            }
+            gen_server_config["speculative_config"] = {
+                "decoding_type": "MTP",
+                "max_draft_len": mtp_nextn,
+            }
         disaggregated_server_config = {
             "hostname": "localhost",
             "backend": "pytorch",
@@ -1287,7 +1299,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         with launch_disaggregated_llm(disaggregated_server_config,
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
-            run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(60000)

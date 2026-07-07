@@ -370,6 +370,8 @@ def merge_helix_requests(
             position_ids=position_ids_this_rank,
         )
         req.total_input_len_cp = input_len
+        # Per-rank cached KV length; seeded with this rank's context shard and
+        # advanced at rewind (see KVCacheManager._helix_rewind_generation_kv).
         req.seqlen_this_rank_cp = len(input_ids_this_rank)
         req_with_children.append(req)
         if req.child_requests:

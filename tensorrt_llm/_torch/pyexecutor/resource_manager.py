@@ -735,6 +735,65 @@ class KVCacheManager(BaseResourceManager):
             return None
         return req.prompt_len
 
+    def _helix_owns_decode_group(self, group_index: int) -> bool:
+        """Return whether this CP rank owns the verify group at group_index.
+
+        Owner = (group_index // tokens_per_block) % cp_size.
+        """
+        block_id = group_index // self.tokens_per_block
+        return block_id % self.mapping.cp_size == self.mapping.cp_rank
+
+    def _helix_prepare_generation_kv(self, req: LlmRequest,
+                                     draft_len: int) -> None:
+        """Reserve KV cache slots for a Helix generation or verify forward.
+
+        The owning rank reserves slots for the whole verify group plus slack.
+        Ownership is a deterministic function of the reserve-side group index, so
+        the matching rewind recomputes it from its own FIFO counter rather than a
+        stored per-group decision.
+        """
+        group_index = req.py_helix_decode_group_index
+        owns_group = self._helix_owns_decode_group(group_index)
+        # Prior group's ownership (deterministic) gates the on-device kv-length
+        # correction applied for the overlapped previous group.
+        req.py_helix_prev_group_owns = (
+            self._helix_owns_decode_group(group_index -
+                                          1) if group_index > 0 else False)
+        req.py_helix_decode_group_index = group_index + 1
+
+        # Owner reserves the whole group plus slack; non-owner reserves none.
+        reserve = max(draft_len, self._kv_reserve_draft_tokens)
+        n_reserve = 1 + reserve
+        if owns_group:
+            for _ in range(n_reserve):
+                self.impl.add_token(req.py_request_id)
+
+        # Per-request inactive flag for verify-path input prep.
+        req.py_helix_is_inactive_rank = not owns_group
+
+    def _helix_rewind_generation_kv(self, req: LlmRequest) -> None:
+        """Rewind rejected and slack draft KV, then advance decode lengths."""
+        g = req.py_helix_global_decode_len
+        accepted = req.py_num_accepted_draft_tokens
+        runtime_draft_len = req.py_rewind_len + accepted
+        reserve = max(runtime_draft_len, self._kv_reserve_draft_tokens)
+        # Ownership for this group in FIFO order, recomputed deterministically to
+        # match the reserve-time decision (correct for any overlap depth).
+        owns_group = self._helix_owns_decode_group(
+            req.py_helix_rewind_group_index)
+        req.py_helix_rewind_group_index += 1
+
+        # Only the owner rank rewinds and grows its per-rank KV length.
+        rewind_count = reserve - accepted
+        if owns_group:
+            if rewind_count > 0:
+                self.rewind_kv_cache(req, rewind_count)
+            # Golden plus accepted drafts (1 + accepted).
+            req.seqlen_this_rank_cp += 1 + accepted
+
+        # Advance the committed (global) decode length.
+        req.py_helix_global_decode_len = g + 1 + accepted
+
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         # Cross/encoder K/V is allocated once and never grows; handle it on a
         # dedicated path so the self-attention flow below stays unconditional.
@@ -769,18 +828,10 @@ class KVCacheManager(BaseResourceManager):
                             req, block_ids)
 
             for req in scheduled_batch.generation_requests:
-                if self.mapping.has_cp_helix():
-                    # Distribute the decode blocks across CP ranks in a round-robin manner.
-                    decode_block_id = (req.py_decoding_iter -
-                                       1) // self.tokens_per_block
-                    if decode_block_id % self.mapping.cp_size == self.mapping.cp_rank:
-                        req.py_helix_is_inactive_rank = False
-                        req.seqlen_this_rank_cp += 1
-                    else:
-                        req.py_helix_is_inactive_rank = True
-                        # Skip allocating KV cache at decode for inactive helix ranks.
-                        continue
                 draft_len = get_draft_token_length(req)
+                if self.mapping.has_cp_helix():
+                    self._helix_prepare_generation_kv(req, draft_len)
+                    continue
                 self.impl.add_token(req.py_request_id)
                 for _ in range(max(draft_len, self._kv_reserve_draft_tokens)):
                     self.impl.add_token(req.py_request_id)
@@ -966,6 +1017,14 @@ class KVCacheManager(BaseResourceManager):
                         req.seqlen_this_rank_cp = req.prompt_len
                         req.total_input_len_cp = token_num * self.mapping.cp_size - 1
                         req.py_decoding_iter = 1
+                    # Initialize Helix speculative-decode bookkeeping; per-rank
+                    # cached length lives in seqlen_this_rank_cp (set above).
+                    # global_decode_len starts at 0, matching real requests.
+                    req.py_helix_global_decode_len = 0
+                    # Fresh generation request: reset the reserve/rewind counters.
+                    req.py_helix_decode_group_index = 0
+                    req.py_helix_rewind_group_index = 0
+                    req.py_helix_prev_group_owns = False
                 req.py_draft_tokens = [1] * max_num_draft_tokens
                 if prepare_resource:
                     for _ in range(_kv_draft):
@@ -1002,6 +1061,10 @@ class KVCacheManager(BaseResourceManager):
             for request in scheduled_batch.generation_requests:
                 if request.state in (LlmRequestState.GENERATION_COMPLETE,
                                      LlmRequestState.CONTEXT_INIT):
+                    continue
+                if self.mapping.has_cp_helix():
+                    # Rewind owned rejected and slack tokens; advance decode length.
+                    self._helix_rewind_generation_kv(request)
                     continue
                 if request.py_rewind_len > 0:
                     self.rewind_kv_cache(request, request.py_rewind_len)

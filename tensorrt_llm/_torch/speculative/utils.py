@@ -389,7 +389,7 @@ def get_spec_worker(spec_config,
     if spec_dec_mode.is_mtp_vanilla():
         return MTPWorker(spec_config, model_config, use_separate_draft_kv_cache)
     if spec_dec_mode.is_mtp_eagle_one_model():
-        return MTPEagleWorker(spec_config, model_config,
+        return MTPEagleWorker(spec_config, model_config, mapping,
                               use_separate_draft_kv_cache)
     if spec_dec_mode.is_eagle3_one_model():
         if _is_effective_dynamic_tree(spec_config):

@@ -1439,6 +1439,8 @@ class MTPForCausalLM(nn.Module):
         # Import here to avoid circular import
         model_type = model_config.pretrained_config.model_type
         mtp_layer = None
+        # Only DeepseekV3MTP accepts mapping_with_cp for Helix CP attention.
+        supports_mapping_with_cp = False
         match model_type:
             case "glm4_moe":
                 from .modeling_glm import Glm4MTP
@@ -1446,6 +1448,7 @@ class MTPForCausalLM(nn.Module):
             case "deepseek_v3" | "deepseek_v32" | "glm_moe_dsa":
                 from .modeling_deepseekv3 import DeepseekV3MTP
                 mtp_layer = DeepseekV3MTP
+                supports_mapping_with_cp = True
             case "exaone_moe":
                 from .modeling_exaone_moe import ExaoneMoeMTP
                 mtp_layer = ExaoneMoeMTP
@@ -1478,9 +1481,15 @@ class MTPForCausalLM(nn.Module):
 
         moe_load_balancer_set_repeated_for_next_layer(mtp_repeat_count)
 
+        # Thread mapping_with_cp into MTP attention for correct MLA head count.
+        mtp_layer_kwargs = {}
+        mapping_with_cp = getattr(model, 'mapping_with_cp', None)
+        if supports_mapping_with_cp and mapping_with_cp is not None:
+            mtp_layer_kwargs['mapping_with_cp'] = mapping_with_cp
+
         self.mtp_layers = nn.ModuleList([
             mtp_layer(model_config, layer_idx + start_layer_idx,
-                      model.aux_stream_dict)
+                      model.aux_stream_dict, **mtp_layer_kwargs)
             for layer_idx in range(mtp_num_layers)
         ])
         self.lm_head = lm_head

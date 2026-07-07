@@ -1613,9 +1613,14 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
                  model_config: ModelConfig[PretrainedConfig],
                  layer_idx: int,
                  aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
-                 is_separate_draft_engine: bool = False):
-        super().__init__(model_config, layer_idx, aux_stream_dict,
-                         is_separate_draft_engine)
+                 is_separate_draft_engine: bool = False,
+                 mapping_with_cp: Optional[Mapping] = None):
+        # Thread mapping_with_cp into attention so MLA keeps the full head count.
+        super().__init__(model_config,
+                         layer_idx,
+                         aux_stream_dict,
+                         is_separate_draft_engine,
+                         mapping_with_cp=mapping_with_cp)
         config = model_config.pretrained_config
         self.hidden_dim = config.hidden_size
         self.moe_intermediate_size = config.moe_intermediate_size
@@ -1691,11 +1696,11 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             disable_on_compile=True,
         )
         hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
-        # Split hidden_states columnwise based on TP
-        tp_size = self.model_config.mapping.tp_size
-        tp_rank = self.model_config.mapping.tp_rank
+        # Use self.mapping (captured at construction), not model_config.mapping.
+        tp_size = self.mapping.tp_size
+        tp_rank = self.mapping.tp_rank
 
-        if tp_size > 1 and not (self.model_config.mapping.enable_attention_dp):
+        if tp_size > 1 and not (self.mapping.enable_attention_dp):
             hidden_states = torch.chunk(hidden_states, tp_size, dim=-1)[tp_rank]
         hidden_states = self.eh_proj(hidden_states)
 
