@@ -201,3 +201,82 @@ def test_weight_cache_disabled_by_default(tmp_path, monkeypatch):
         loader.load_weights(str(checkpoint_dir), mapping=Mapping())
 
     assert load_weights_in_parallel.call_count == 2
+
+
+def test_weight_cache_detects_inplace_mutation_and_reloads(tmp_path, monkeypatch):
+    # The cache shares raw tensors across loads (read-only by contract). A
+    # consumer mutating one in place (e.g. an in-place transform in a weight
+    # mapper) must be detected on the next hit: the poisoned entry is dropped
+    # and the weights are reloaded from disk instead of silently corrupted.
+    import torch
+
+    monkeypatch.setenv("TRTLLM_HF_WEIGHT_CACHE", "1")
+
+    checkpoint_dir = tmp_path / "foo"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "model.safetensors").touch()
+
+    loader = HfWeightLoader()
+
+    def fresh_weights(*args, **kwargs):
+        return ConsumableWeightsDict({"a.weight": torch.ones(64)})
+
+    with (
+        mock.patch.object(
+            loader, "_load_weights_in_parallel", side_effect=fresh_weights
+        ) as load_weights_in_parallel,
+        mock.patch.object(loader, "prefetch_files"),
+    ):
+        first = loader.load_weights(str(checkpoint_dir), mapping=Mapping())
+        first["a.weight"].neg_()  # in-place mutation through the shared tensor
+
+        second = loader.load_weights(str(checkpoint_dir), mapping=Mapping())
+
+    assert load_weights_in_parallel.call_count == 2  # poisoned hit -> reload
+    assert torch.equal(second["a.weight"], torch.ones(64))  # clean weights
+
+
+def test_cache_hit_and_miss_issue_identical_collectives(tmp_path, monkeypatch):
+    # Rank-local caches can diverge, so a hit on one rank and a miss on
+    # another must enqueue the SAME collectives in the same order (Allreduce
+    # from _get_local_available_host_memory, then Barrier) or the job
+    # deadlocks. Record the sequence each path produces and compare.
+    monkeypatch.setenv("TRTLLM_HF_WEIGHT_CACHE", "1")
+
+    checkpoint_dir = tmp_path / "foo"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "model.safetensors").touch()
+
+    loader = HfWeightLoader()
+    sequences = {"miss": [], "hit": []}
+    current: list = []
+
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.checkpoints.hf.weight_loader.local_mpi_barrier",
+        lambda: current.append("barrier"),
+    )
+
+    def record_allreduce():
+        current.append("allreduce")
+        return 1 << 60  # plenty of host memory
+
+    with (
+        mock.patch.object(
+            loader,
+            "_load_weights_in_parallel",
+            return_value=ConsumableWeightsDict({"foo.weight": object()}),
+        ),
+        mock.patch.object(loader, "prefetch_files"),
+        mock.patch.object(
+            HfWeightLoader,
+            "_get_local_available_host_memory",
+            side_effect=record_allreduce,
+        ),
+    ):
+        current = sequences["miss"]
+        loader.load_weights(str(checkpoint_dir), mapping=Mapping())
+        current = sequences["hit"]
+        loader.load_weights(str(checkpoint_dir), mapping=Mapping())
+
+    assert sequences["miss"] == ["allreduce", "barrier"]
+    assert sequences["hit"] == sequences["miss"]  # divergence-safe ordering

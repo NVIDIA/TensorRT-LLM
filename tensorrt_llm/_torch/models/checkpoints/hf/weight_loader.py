@@ -100,29 +100,75 @@ class HfWeightLoader(BaseWeightLoader):
                 _WEIGHT_CACHE.popitem(last=False)
 
     @staticmethod
+    def _tensor_sig(t: torch.Tensor) -> tuple:
+        """A cheap integrity fingerprint: shape, dtype and a sampled sum.
+
+        Recomputing the same sum over the same (unmutated) memory is exactly
+        deterministic, so plain equality detects in-place mutation. Sampling
+        up to 1024 strided elements keeps this at microseconds per tensor.
+        """
+        flat = t.detach().reshape(-1)
+        stride = max(1, flat.numel() // 1024)
+        sample = flat[::stride][:1024]
+        return (tuple(t.shape), str(t.dtype),
+                float(torch.nan_to_num(sample.float()).sum()))
+
+    @staticmethod
+    def _fingerprint(weights: dict[str, Any]) -> dict[str, tuple]:
+        return {
+            key: HfWeightLoader._tensor_sig(value)
+            for key, value in weights.items() if torch.is_tensor(value)
+        }
+
+    @staticmethod
     def _cache_loaded_weights(cache_key: tuple,
                               loaded_weights: dict[str, Any]) -> None:
         max_entries = HfWeightLoader._weight_cache_max_entries()
         if max_entries <= 0:
             return
 
+        weights = dict(loaded_weights)
+        # Fingerprint outside the lock; the cache shares tensors across loads
+        # (read-only by contract), and the fingerprint turns a violation of
+        # that contract into a detected, self-healing miss instead of
+        # silently corrupted weights (see _get_cached_weights).
+        sigs = HfWeightLoader._fingerprint(weights)
         # Room was already made by the caller-side evict-before-load in
         # _with_weight_cache (the load-bearing one for the memory peak).
         with _WEIGHT_CACHE_LOCK:
-            _WEIGHT_CACHE[cache_key] = dict(loaded_weights)
+            _WEIGHT_CACHE[cache_key] = (weights, sigs)
 
     @staticmethod
     def _get_cached_weights(cache_key: tuple) -> ConsumableWeightsDict | None:
         with _WEIGHT_CACHE_LOCK:
-            weights = _WEIGHT_CACHE.get(cache_key)
-            if weights is None:
+            entry = _WEIGHT_CACHE.get(cache_key)
+            if entry is None:
                 return None
+            weights, sigs = entry
             _WEIGHT_CACHE.move_to_end(cache_key)
-            # Return a fresh dict wrapper because model loaders call
-            # mark_consumed(). Tensor values are intentionally shared: this
-            # cache targets read-only raw checkpoint tensors, not per-config
-            # materialized module weights.
-            return ConsumableWeightsDict(dict(weights))
+        # Integrity check: cached tensors are shared, so an earlier consumer
+        # mutating them in place (e.g. an in-place transform in a weight
+        # mapper) would poison every later load. Detect it, name the culprit
+        # keys, drop the entry and let the caller reload from disk.
+        mutated = [
+            key for key, sig in sigs.items()
+            if HfWeightLoader._tensor_sig(weights[key]) != sig
+        ]
+        if mutated:
+            logger.warning(
+                "HF weight cache entry was mutated in place since it was "
+                f"stored (keys: {mutated[:5]}{'...' if len(mutated) > 5 else ''}); "
+                "dropping it and reloading from disk. Weight preprocessing "
+                "must not mutate raw checkpoint tensors.")
+            with _WEIGHT_CACHE_LOCK:
+                if _WEIGHT_CACHE.get(cache_key) is entry:
+                    del _WEIGHT_CACHE[cache_key]
+            return None
+        # Return a fresh dict wrapper because model loaders call
+        # mark_consumed(). Tensor values are intentionally shared: this
+        # cache targets read-only raw checkpoint tensors, not per-config
+        # materialized module weights.
+        return ConsumableWeightsDict(dict(weights))
 
     @staticmethod
     def _get_local_available_host_memory() -> int:
@@ -143,7 +189,8 @@ class HfWeightLoader(BaseWeightLoader):
         return available_host_memory
 
     def _with_weight_cache(self, weight_files: List[str],
-                           use_consolidated: bool, barrier_on_hit: bool,
+                           use_consolidated: bool,
+                           mirror_load_collectives: bool,
                            load_fn) -> ConsumableWeightsDict:
         """Wrap ``load_fn`` with the optional raw-weight cache.
 
@@ -158,12 +205,14 @@ class HfWeightLoader(BaseWeightLoader):
             cached_weights = self._get_cached_weights(cache_key)
             if cached_weights is not None:
                 logger.info("Reusing cached HF checkpoint weights.")
-                if barrier_on_hit:
-                    # The safetensors miss path has a local barrier before
-                    # deserialization. Cache hits must participate as well:
-                    # rank-local caches can diverge after eviction, and a hit
-                    # on one rank must not skip a barrier that a miss on
-                    # another rank is about to enter.
+                if mirror_load_collectives:
+                    # Rank-local caches can diverge, so a hit on one rank must
+                    # enqueue EXACTLY the collectives a miss on another rank
+                    # enqueues, in the same order, or the job deadlocks. The
+                    # safetensors miss path performs an Allreduce (inside
+                    # _get_local_available_host_memory) and then a Barrier;
+                    # mirror both here (the allreduce result is unused).
+                    self._get_local_available_host_memory()
                     local_mpi_barrier()
                 return cached_weights
             self._evict_to_make_room()
@@ -191,7 +240,7 @@ class HfWeightLoader(BaseWeightLoader):
             return self._with_weight_cache(
                 weight_files,
                 use_consolidated,
-                barrier_on_hit=True,
+                mirror_load_collectives=True,
                 load_fn=lambda: self._prefetch_and_load(weight_files))
 
         weight_files = glob.glob(f"{checkpoint_dir}/*.bin")
@@ -202,7 +251,7 @@ class HfWeightLoader(BaseWeightLoader):
             return self._with_weight_cache(
                 weight_files,
                 use_consolidated,
-                barrier_on_hit=False,
+                mirror_load_collectives=False,
                 load_fn=lambda: self._load_weights_in_parallel(
                     weight_files, self._load_bin_or_path_file,
                     "Loading bin weights in parallel"))
