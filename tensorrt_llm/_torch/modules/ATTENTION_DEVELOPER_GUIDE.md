@@ -362,7 +362,7 @@ Working rules:
 | `tensorrt_llm/_torch/attention_backend/fmha/` | Internal TRTLLM FMHA libraries |
 | `tensorrt_llm/_torch/attention_backend/vanilla.py` | Torch fallback backend and metadata |
 | `tensorrt_llm/_torch/attention_backend/flashinfer.py` | FlashInfer backend and metadata |
-| `tensorrt_llm/_torch/attention_backend/sparse/` | DSA, Rocket sparse backends, metadata, cache managers |
+| `tensorrt_llm/_torch/attention_backend/sparse/` | Sparse MLA hooks, prediction backends, metadata, cache managers, and kernels |
 
 ## 6. Testing Notes
 

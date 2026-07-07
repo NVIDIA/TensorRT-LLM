@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""DSA-specific orchestration for the generic MLA module."""
+"""DSA-specific hooks for the shared MLA module."""
 
 from typing import List, Optional
 

@@ -1001,6 +1001,24 @@ class MLA(nn.Module):
         output: torch.Tensor,
         latent_cache_gen: Optional[torch.Tensor] = None,
     ) -> None:
+        """Run MLA through the backend-selected module implementation."""
+        self.mqa.forward_mla_module(
+            self,
+            position_ids,
+            hidden_states,
+            attn_metadata,
+            output,
+            latent_cache_gen=latent_cache_gen,
+        )
+
+    def _forward_impl(
+        self,
+        position_ids: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        output: torch.Tensor,
+        latent_cache_gen: Optional[torch.Tensor] = None,
+    ) -> None:
         """
         Forward pass for the MLA module. Writes result into output tensor in-place.
 
@@ -1891,6 +1909,48 @@ class MLA(nn.Module):
             raise NotImplementedError(f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
 
         return output
+
+    def _forward_custom_op(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+        attn_output: torch.Tensor,
+        latent_cache_gen: Optional[torch.Tensor],
+    ) -> None:
+        """Run the module's registered custom-op implementation."""
+        self.mqa.forward_mla_custom_op(
+            self, hidden_states, position_ids, attn_output, latent_cache_gen
+        )
+
+    def _project_output(
+        self,
+        attn_output: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+        all_reduce_params: Optional[AllReduceParams],
+    ) -> torch.Tensor:
+        """Apply the MLA output projection."""
+        return self.mqa.project_mla_output(
+            self, attn_output, position_ids, attn_metadata, all_reduce_params
+        )
+
+    def _project_output_impl(
+        self,
+        attn_output: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+        all_reduce_params: Optional[AllReduceParams],
+    ) -> torch.Tensor:
+        """Apply the default MLA output projection implementation."""
+        return _helix_cp_output_projection(
+            self.o_proj,
+            attn_output,
+            attn_metadata,
+            all_reduce_params,
+            self.mapping,
+            self.mapping_o,
+            self.layer_idx,
+        )
 
     def forward(
         self,

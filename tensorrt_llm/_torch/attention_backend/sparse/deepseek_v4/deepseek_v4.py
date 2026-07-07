@@ -49,6 +49,8 @@ from .compressor import Compressor, KVCacheDtype, resolve_kv_cache_dtype
 from .kernels import deepseek_v4_local_to_global_indices
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.distributed import AllReduceParams
+    from tensorrt_llm._torch.modules.mla import MLA
     from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 
 DEEPSEEK_V4_SPARSE_RATIO = 4
@@ -1434,6 +1436,34 @@ class DeepseekV4Indexer(Indexer):
 
 class DeepseekV4TrtllmAttention(TrtllmAttention):
     Metadata = DeepseekV4TrtllmAttentionMetadata
+
+    def forward_mla_module(
+        self,
+        mla: "MLA",
+        position_ids: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        metadata: DeepseekV4TrtllmAttentionMetadata,
+        output: torch.Tensor,
+        latent_cache_gen: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Run the DeepSeek-V4 implementation behind MLA's unified interface."""
+        from .mla_backend import forward_impl_with_deepseek_v4
+
+        forward_impl_with_deepseek_v4(mla, position_ids, hidden_states, metadata, output)
+
+    def project_mla_output(
+        self,
+        mla: "MLA",
+        attn_output: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+        metadata: DeepseekV4TrtllmAttentionMetadata,
+        all_reduce_params: Optional["AllReduceParams"],
+    ) -> torch.Tensor:
+        """Apply the DeepSeek-V4 grouped MLA output projection."""
+        from .mla_backend import deepseek_v4_o_proj
+
+        assert position_ids is not None
+        return deepseek_v4_o_proj(mla, attn_output, position_ids)
 
     def __init__(
         self,

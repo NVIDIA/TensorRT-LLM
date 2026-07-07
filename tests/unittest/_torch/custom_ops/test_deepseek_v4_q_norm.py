@@ -211,7 +211,7 @@ def test_deepseek_v4_q_b_layernorm_fused_fp8_returns_3d_q_pe(num_tokens):
     import types
     from types import SimpleNamespace
 
-    from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module import (
+    from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.mla_backend import (
         deepseek_v4_q_b_layernorm_fused_fp8,
     )
 

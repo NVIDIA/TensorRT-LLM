@@ -17,6 +17,7 @@
 Unit tests for sparse attention with TrtllmAttention backend.
 """
 
+import inspect
 import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -34,6 +35,7 @@ from tensorrt_llm._torch.attention_backend.sparse.params import SparseParams
 from tensorrt_llm._torch.attention_backend.sparse.prediction import prepare_sparse_prediction
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -186,6 +188,16 @@ def test_prepare_sparse_prediction_uses_optional_hooks() -> None:
     assert prediction.sparse_attn_offsets is None
     assert prediction.sparse_attn_indices_block_size == 1
     assert prediction.sparse_mla_topk_lens is forward_args.sparse_prediction.sparse_mla_topk_lens
+
+
+def test_mla_forward_uses_unified_backend_interface() -> None:
+    forward_source = inspect.getsource(MLA.forward)
+    forward_impl_source = inspect.getsource(MLA.forward_impl)
+
+    assert "is_dsa" not in forward_source
+    assert "is_deepseek_v4" not in forward_source
+    assert "mla_dsa" not in forward_source
+    assert "forward_mla_module" in forward_impl_source
 
 
 def test_prepare_sparse_prediction_allows_backend_without_prediction() -> None:

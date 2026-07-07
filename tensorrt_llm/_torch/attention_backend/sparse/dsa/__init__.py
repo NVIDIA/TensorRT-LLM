@@ -3,7 +3,6 @@
 
 """DeepSeek Sparse Attention backend package."""
 
-from . import custom_ops as _custom_ops  # noqa: F401
 from .backend import DSATrtllmAttention
 from .cache_manager import DSACacheManager
 from .indexer import (

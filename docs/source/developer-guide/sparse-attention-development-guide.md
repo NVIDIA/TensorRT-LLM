@@ -149,12 +149,17 @@ Algorithm implementations live under
 
 - `rocket/` — RocketKV backend, metadata, cache manager, parameters, and kernels.
 - `dsa/` — DSA backend, indexer, metadata, cache manager, parameters, custom ops, and kernels.
-- `deepseek_v4/` — DeepSeek-V4 sparse MLA modules and index conversion kernels.
+- `deepseek_v4/` — DeepSeek-V4 prediction, cache, metadata, and index conversion kernels.
 - `skip_softmax/` — SkipSoftmax parameter parsing and runtime scheduler.
 - `kernels/` — kernels shared by multiple sparse algorithms (importance scoring, Top-K).
 - `prediction.py` — common prediction-hook orchestration and payload construction.
 - `registry.py` — backend, metadata, and cache-manager dispatch helpers.
-- `mla.py` — sparse MLA phase dispatch shared by DSA and DeepSeek-V4.
+
+Dense and sparse MLA share the same `MLA` module interface. Algorithm-specific
+behavior is selected by backend hooks implemented in each algorithm directory;
+new sparse algorithms should not add a parallel MLA module. The FlashMLA
+adapter remains with DSA because it directly wraps the algorithm-specific
+sparse attention kernel.
 
 ### AttentionOp behavior
 
