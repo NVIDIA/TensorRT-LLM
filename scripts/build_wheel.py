@@ -824,9 +824,13 @@ def main(*,
         def copy_resolving_symlink(src_path, dst_path):
             """Copy file or directory, resolving symlinks to copy actual content.
 
-            Skips the copy when dst already exists and is at least as new as src
-            (mtime comparison). This avoids redundant large tree copies (e.g.
-            the CUTLASS headers) on incremental rebuilds over slow filesystems.
+            Skips the copy when dst already exists and a stamp file confirms the
+            previous copy completed successfully, and the stamp is at least as new
+            as src.  Using a stamp (rather than dst mtime) avoids two pitfalls:
+            - Directory mtime on Linux only reflects direct-child changes, not
+              deeply nested ones, so a modified source file may not update it.
+            - An interrupted copy leaves dst with a fresh mtime that would
+              incorrectly satisfy an mtime check, causing the next build to skip.
             """
             if src_path.is_symlink():
                 resolved_src = src_path.resolve()
@@ -834,21 +838,31 @@ def main(*,
                 resolved_src = src_path
 
             if resolved_src.is_dir():
-                if dst_path.exists():
-                    if dst_path.stat().st_mtime >= resolved_src.stat().st_mtime:
+                stamp = dst_path.parent / f".{dst_path.name}.stamp"
+                if dst_path.exists() and stamp.exists():
+                    if stamp.stat().st_mtime >= resolved_src.stat().st_mtime:
                         return  # destination is up to date
                     rmtree(dst_path)
+                elif dst_path.exists():
+                    rmtree(
+                        dst_path)  # dst exists but no stamp — interrupted copy
+                stamp.unlink(missing_ok=True)
                 # Shell out to cp -rL: dereferences symlinks like copytree(symlinks=False)
                 # but uses kernel-level copy primitives, which is significantly faster
                 # than Python's file-by-file copytree on network-mounted filesystems.
                 # Fall back to copytree if cp is unavailable (non-Linux or minimal containers).
-                try:
-                    run(["cp", "-rL",
-                         str(resolved_src),
-                         str(dst_path)],
-                        check=True)
-                except (FileNotFoundError, Exception):
+                cp_bin = shutil.which("cp")
+                if cp_bin is not None:
+                    try:
+                        run([cp_bin, "-rL",
+                             str(resolved_src),
+                             str(dst_path)],
+                            check=True)
+                    except FileNotFoundError:
+                        copytree(resolved_src, dst_path, symlinks=False)
+                else:
                     copytree(resolved_src, dst_path, symlinks=False)
+                stamp.touch()
             else:
                 if dst_path.is_dir():
                     dst_path = dst_path / src_path.name
