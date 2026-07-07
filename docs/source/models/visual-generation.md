@@ -28,6 +28,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `black-forest-labs/FLUX.2-dev` | Text-to-Image |
 | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | Text-to-Video |
 | `Wan-AI/Wan2.1-T2V-14B-Diffusers` | Text-to-Video |
+| `FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers` | Text-to-Video (VSA) |
 | `Wan-AI/Wan2.1-I2V-14B-480P-Diffusers` | Image-to-Video |
 | `Wan-AI/Wan2.1-I2V-14B-720P-Diffusers` | Image-to-Video |
 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | Text-to-Video |
@@ -43,23 +44,26 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 ### Feature Matrix
 
-| Model | FP8 blockwise | NVFP4 | TeaCache | Cache-DiT | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism |
-|---|---|---|---|---|---|---|---|---|---|---|--|--|--|
-| **FLUX.1** | Yes | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
-| **FLUX.2** | Yes | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
-| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| **Wan 2.2** | Yes | Yes | Yes [^2] | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| **LTX-2** | Yes | Yes | Yes [^3] | Yes | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No |
-| **Qwen-Image** [^4] | Yes | Yes | No | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | No |
-| **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
+| Model | FP8 blockwise | NVFP4 | TeaCache | Cache-DiT | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism | VSA |
+|---|---|---|---|---|---|---|---|---|---|---|--|--|--|--|
+| **FLUX.1** | Yes | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **FLUX.2** | Yes | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **Wan 2.1 VSA** [^2] | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | Yes |
+| **Wan 2.2** | Yes | Yes | Yes [^3] | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **LTX-2** | Yes | Yes | Yes [^4] | Yes | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No | No |
+| **Qwen-Image** [^5] | Yes | Yes | No | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
+| **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
 
 [^1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
 
-[^2]: Wan 2.2 has two stage transformers; TeaCache requires explicit `teacache.coefficients` (high-noise) and `teacache.coefficients_2` (low-noise). There is no built-in coefficient table for Wan 2.2.
+[^2]: `FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers` — VSA-fine-tuned checkpoint with learned sparse-attention gates. Requires `CUTEDSL` on Blackwell sm_100+ (falls back to dense SDPA on older hardware). Ring and Attention2D not supported (no LSE output); Ulysses supported.
 
-[^3]: LTX-2 has no built-in TeaCache coefficient table in TRT-LLM; set `teacache.coefficients` explicitly when enabling TeaCache.
+[^3]: Wan 2.2 has two stage transformers; TeaCache requires explicit `teacache.coefficients` (high-noise) and `teacache.coefficients_2` (low-noise). There is no built-in coefficient table for Wan 2.2.
 
-[^4]: Qwen-Image ships a native BF16 implementation with per-module numerical parity against `diffusers.QwenImagePipeline` (cosine similarity >= 0.999 on the full 20B transformer) and supports `trtllm-serve` / `/v1/images/generations`. VisualGen supports FP8 blockwise and NVFP4 dynamic quantization from BF16 checkpoints, as well as direct loading of statically quantized FP8 and NVFP4 ModelOpt checkpoints.
+[^4]: LTX-2 has no built-in TeaCache coefficient table in TRT-LLM; set `teacache.coefficients` explicitly when enabling TeaCache.
+
+[^5]: Qwen-Image ships a native BF16 implementation with per-module numerical parity against `diffusers.QwenImagePipeline` (cosine similarity >= 0.999 on the full 20B transformer) and supports `trtllm-serve` / `/v1/images/generations`. VisualGen supports FP8 blockwise and NVFP4 dynamic quantization from BF16 checkpoints, as well as direct loading of statically quantized FP8 and NVFP4 ModelOpt checkpoints.
 
 ## Quick Start
 
@@ -225,6 +229,44 @@ args = VisualGenArgs(
 | `force_refresh_step_policy` | `"once"` \| `"repeat"` | `"once"` | Whether `force_refresh_step_hint` fires only on the first call (`"once"`) or at that interval repeatedly (`"repeat"`). |
 
 **Wan 2.2 dual-transformer note:** Wan 2.2 uses two expert transformers (high-noise and low-noise stacks). All `CacheDiTConfig` parameters apply to both stacks, except `max_warmup_steps` and `max_cached_steps`: the low-noise stack always uses fixed internal caps (`max_warmup_steps=2`, `max_cached_steps=20`) regardless of user config.
+
+### Video Sparse Attention (VSA)
+
+VSA reduces the compute cost of self-attention in video diffusion models by selectively attending to only the most relevant spatial-temporal blocks. It uses a two-branch design: a lightweight coarse mean-pool branch computes block-level attention scores to identify the top-K most relevant token blocks, then a fine branch runs a block-sparse CuTe kernel over only those blocks. The two outputs are blended with learned gates.
+
+**Requirements:**
+- VSA-fine-tuned checkpoint: [`FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers`](https://huggingface.co/FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers). Standard Wan checkpoints do not have the learned VSA gates.
+- Blackwell GPU (sm_100+) for the CuTe JIT kernel. Falls back to dense SDPA on older hardware with no accuracy loss.
+- `CUTEDSL` attention backend.
+- Not compatible with Ring attention or Attention2D (VSA does not produce per-split LSE). Ulysses is supported.
+
+**`vsa_sparsity`** controls the fraction of K/V blocks skipped in the fine branch (0.0 = dense, 0.9 = 90% blocks skipped). Higher sparsity gives more speedup at the cost of some quality.
+
+Python API:
+
+```python
+from tensorrt_llm import VisualGenArgs
+from tensorrt_llm.visual_gen.args import AttentionConfig, VideoSparseAttentionConfig
+
+args = VisualGenArgs(
+    model="FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers",
+    attention_config=AttentionConfig(
+        backend="CUTEDSL",
+        sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=0.9),
+    ),
+)
+```
+
+YAML (for use with `--visual_gen_args` or `trtllm-serve`):
+
+```yaml
+attention_config:
+  backend: CUTEDSL
+  sparse_attention_config:
+    algorithm: vsa
+    vsa_sparsity: 0.90
+```
+
 
 ### Multi-GPU Parallelism
 
