@@ -191,7 +191,12 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     def run_command(cmd, num_workers=1):
         try:
             pythonpath = os.environ.get("PYTHONPATH", "")
-            env = {'PYTHONPATH': f"{llm_root}/tests/unittest:{pythonpath}"}
+            # Keep the source root ahead of site-packages so spawned MPI
+            # workers resolve repo-local packages such as triton_kernels.
+            pythonpath_entries = [llm_root, f"{llm_root}/tests/unittest"]
+            if pythonpath:
+                pythonpath_entries.append(pythonpath)
+            env = {'PYTHONPATH': os.pathsep.join(pythonpath_entries)}
             if s3_secret_key:
                 env["S3_SECRET_KEY"] = s3_secret_key
             if num_workers > 1:
