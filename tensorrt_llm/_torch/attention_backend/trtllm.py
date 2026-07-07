@@ -1482,10 +1482,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # Cross-attention uses the THOP path; the trtllm-gen backend API does
         # not carry encoder K/V tensors yet.
 
-        # cpp/tensorrt_llm/thop/attentionOp.cpp enables mFP8ContextFMHA for an
-        # FP8 KV cache only when use_paged_context_fmha is true. Force paged
-        # context so QKV preprocessing and context FMHA use the FP8 path.
-        if self.has_fp8_kv_cache:
+        # Paged context with an FP8 KV cache selects mFP8ContextFMHA, which
+        # requires a quantized-output scale. Keep KV-only quantization on the
+        # BF16-output path when the caller did not request output quantization.
+        if self.has_fp8_kv_cache and forward_args.out_scale is not None:
             metadata.use_paged_context_fmha = True
 
         # Sparse mqa/gqa attention uses generation kernel which reads Q from qPtr (separate buffer).
