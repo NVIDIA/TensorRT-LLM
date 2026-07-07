@@ -194,10 +194,7 @@ class FilteredTopKKernelVarlen:
             return cute.Uint8((key >> 8) & 0xFF)
         else:
             # For half/bfloat16, extract high 8 bits directly
-            if cutlass.const_expr(self.dtype == cutlass.Float16):
-                bits = half_as_ushort(x)
-            else:  # BFloat16
-                bits = half_as_ushort(x)
+            bits = half_as_ushort(x)
 
             key = cute.Uint16(0)
             if bits & 0x8000:
@@ -220,10 +217,7 @@ class FilteredTopKKernelVarlen:
                 key = (bits ^ cutlass.Uint32(0xFFFFFFFF)) & cutlass.Uint32(0x7FFFFFFF)
             return cute.Uint32(key)
         else:
-            if cutlass.const_expr(self.dtype == cutlass.Float16):
-                bits = half_as_ushort(x)
-            else:  # BFloat16
-                bits = half_as_ushort(x)
+            bits = half_as_ushort(x)
 
             key = cute.Uint16(0)
             if bits & 0x8000:
