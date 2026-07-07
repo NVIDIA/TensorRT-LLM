@@ -1,3 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Request schedulers used by the PyTorch executor."""
+
 import dataclasses
 import inspect
 from abc import ABC, abstractmethod
@@ -13,7 +18,12 @@ from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 
 # Assuming these imports exist in your environment
-from ..llm_request import LlmRequest, LlmRequestState
+from ..llm_request import (
+    LlmRequest,
+    LlmRequestState,
+    get_multimodal_encoder_token_lengths,
+    is_multimodal_encoder_ready,
+)
 
 RequestList = list[LlmRequest]
 PrefixReuseSummary: TypeAlias = tb_internal.batch_manager.PrefixReuseSummary
@@ -62,7 +72,9 @@ SchedulerOutput = namedtuple(
         "paused_requests",
         "fitting_disagg_gen_init_requests",
         "num_fitting_requests",
+        "scheduled_mm_encoder_items",
     ],
+    defaults=[None],
 )
 
 
@@ -159,6 +171,7 @@ class ScheduledRequests:
         self.context_requests_last_chunk: RequestList = []
         self.generation_requests: RequestList = []
         self.paused_requests: RequestList = []
+        self.scheduled_mm_encoder_items: dict[int, list[int]] | None = None
 
     @property
     def is_generation_only(self) -> bool:
@@ -257,6 +270,7 @@ class SerializableSchedulerOutput:
     ]  # request ids of fitting disaggregated generation initialization requests
     num_fitting_requests: int  # number of fitting requests
     wait_for_disagg_gen_transfer_progress: bool = False
+    scheduled_mm_encoder_items: dict[int, list[int]] | None = None
 
     @classmethod
     def from_scheduler_result(
@@ -281,6 +295,7 @@ class SerializableSchedulerOutput:
             ],
             num_fitting_requests=num_fitting_requests,
             wait_for_disagg_gen_transfer_progress=wait_for_disagg_gen_transfer_progress,
+            scheduled_mm_encoder_items=scheduled_requests.scheduled_mm_encoder_items,
         )
 
     def to_scheduler_result(
@@ -303,6 +318,7 @@ class SerializableSchedulerOutput:
         scheduled_requests.paused_requests = [
             id_to_request[req_id] for req_id in self.paused_requests
         ]
+        scheduled_requests.scheduled_mm_encoder_items = self.scheduled_mm_encoder_items
         fitting_disagg_gen_init_requests = [
             id_to_request[req_id] for req_id in self.fitting_disagg_gen_init_requests
         ]
@@ -451,6 +467,163 @@ class SimpleScheduler(RequestScheduler):
         requests = drop_decoder_context_requests_waiting_for_encoder_output(requests)
         fitting_requests, _, _ = self.capacity_scheduler.schedule_request(requests)
         return len(fitting_requests) == len(requests)
+
+
+class MultimodalScheduler(RequestScheduler):
+    """Add atomic multimodal item budgeting around the existing scheduler.
+
+    The wrapper is constructed only for ``MultimodalModelMixin`` models. It
+    deliberately reuses the wrapped scheduler's capacity and microbatch
+    schedulers so MM encoder costs never enter the LLM token budget.
+    """
+
+    def __init__(
+        self,
+        scheduler: SimpleScheduler,
+        max_batch_size: int,
+        max_num_tokens: int,
+        independent: bool = False,
+    ) -> None:
+        self.scheduler = scheduler
+        self.max_batch_size = max_batch_size
+        self.max_num_tokens = max_num_tokens
+        self.independent = independent
+        self.has_separate_stages = hasattr(scheduler, "capacity_scheduler") and hasattr(
+            scheduler, "micro_batch_scheduler"
+        )
+
+    def _select_items(self, requests: RequestList) -> tuple[dict[int, list[int]], RequestList]:
+        remaining_items = self.max_batch_size
+        remaining_tokens = self.max_num_tokens
+        selected: dict[int, list[int]] = {}
+        llm_eligible: RequestList = []
+
+        for request in requests:
+            if not request.py_is_multimodal_encoder_request:
+                llm_eligible.append(request)
+                continue
+            if is_multimodal_encoder_ready(request):
+                llm_eligible.append(request)
+                continue
+
+            token_lengths = get_multimodal_encoder_token_lengths(request)
+            if token_lengths is None:
+                raise ValueError(
+                    f"Multimodal request {request.py_request_id} is missing "
+                    "multimodal_encoder_token_lengths"
+                )
+
+            request_items: list[int] = []
+            for item_idx, (cost, output) in enumerate(
+                zip(token_lengths, request.py_mm_encoder_outputs)
+            ):
+                if output is not None:
+                    continue
+                if item_idx in request.py_mm_encoder_inflight_items:
+                    break
+                if remaining_items == 0 or cost > remaining_tokens:
+                    break
+                request.py_mm_encoder_inflight_items.add(item_idx)
+                request_items.append(item_idx)
+                remaining_items -= 1
+                remaining_tokens -= cost
+
+            if request_items:
+                selected[request.request_id] = request_items
+
+            unresolved = [
+                item_idx
+                for item_idx, output in enumerate(request.py_mm_encoder_outputs)
+                if output is None
+            ]
+            if unresolved and all(item_idx in request_items for item_idx in unresolved):
+                llm_eligible.append(request)
+
+        return selected, llm_eligible
+
+    def _fits_legacy_encoder_path(self, requests: RequestList) -> bool:
+        """Return whether pristine MM requests fit one legacy encoder call.
+
+        Keeping the existing path for an in-budget batch avoids item-state
+        bookkeeping and preserves its established latency characteristics.
+        Once item scheduling has made partial progress, continue through the
+        item path until the request is complete.
+        """
+        remaining_items = self.max_batch_size
+        remaining_tokens = self.max_num_tokens
+
+        for request in requests:
+            if not request.py_is_multimodal_encoder_request or is_multimodal_encoder_ready(request):
+                continue
+            token_lengths = get_multimodal_encoder_token_lengths(request)
+            if token_lengths is None:
+                return False
+            if request.py_mm_encoder_inflight_items or any(
+                output is not None for output in request.py_mm_encoder_outputs
+            ):
+                return False
+            if len(token_lengths) > remaining_items or sum(token_lengths) > remaining_tokens:
+                return False
+            remaining_items -= len(token_lengths)
+            remaining_tokens -= sum(token_lengths)
+
+        return True
+
+    def schedule_request(
+        self, active_requests: RequestList, inflight_request_ids: set[int]
+    ) -> SchedulerOutput:
+        if not self.has_separate_stages:
+            if self.independent:
+                selected_items, llm_eligible = self._select_items(active_requests)
+                scheduler_output = self.scheduler.schedule_request(
+                    llm_eligible, inflight_request_ids
+                )
+                return scheduler_output._replace(scheduled_mm_encoder_items=selected_items or None)
+            scheduler_output = self.scheduler.schedule_request(
+                active_requests, inflight_request_ids
+            )
+            if self._fits_legacy_encoder_path(list(scheduler_output.context_requests)):
+                return scheduler_output
+            selected_items, llm_eligible = self._select_items(
+                list(scheduler_output.context_requests)
+            )
+            return scheduler_output._replace(
+                context_requests=llm_eligible,
+                scheduled_mm_encoder_items=selected_items or None,
+            )
+
+        active_requests = drop_decoder_context_requests_waiting_for_encoder_output(active_requests)
+        selected_items = None
+        llm_eligible_ids = None
+        if self.independent:
+            selected_items, llm_eligible = self._select_items(active_requests)
+            llm_eligible_ids = {request.request_id for request in llm_eligible}
+        fitting_requests, fitting_disagg_gen_init_requests, paused_requests = (
+            self.scheduler.capacity_scheduler.schedule_request(active_requests)
+        )
+        if self.independent:
+            llm_eligible = [
+                request for request in fitting_requests if request.request_id in llm_eligible_ids
+            ]
+        elif self._fits_legacy_encoder_path(list(fitting_requests)):
+            llm_eligible = fitting_requests
+        else:
+            selected_items, llm_eligible = self._select_items(list(fitting_requests))
+        encoder_requests, context_requests, generation_requests = (
+            self.scheduler.micro_batch_scheduler.schedule(llm_eligible, inflight_request_ids)
+        )
+        return SchedulerOutput(
+            encoder_requests=encoder_requests,
+            context_requests=context_requests,
+            generation_requests=generation_requests,
+            paused_requests=list(paused_requests),
+            fitting_disagg_gen_init_requests=list(fitting_disagg_gen_init_requests),
+            num_fitting_requests=len(fitting_requests),
+            scheduled_mm_encoder_items=selected_items or None,
+        )
+
+    def can_schedule(self, requests: RequestList) -> bool:
+        return self.scheduler.can_schedule(requests)
 
 
 class ChunkingPolicy(Enum):

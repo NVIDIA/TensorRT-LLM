@@ -33,12 +33,38 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
 
 _MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
+_MM_ENCODER_FORWARD_LOG_ENV_NAME = "TLLM_MM_ENCODER_FORWARD_LOG"
 
 
 # Make this a runtime lookup rather than a module-wide constant for easier unit testing.
 # MM E/P split flag. Not generic disaggregated serving.
 def _is_mm_disagg() -> bool:
     return os.getenv(_MULTIMODAL_ENV_NAME, "0") == "1"
+
+
+def _log_mm_encoder_forward_shape(
+        multimodal_params: List[MultimodalParams]) -> None:
+    """Log Qwen-style encoder item and token counts for diagnostics."""
+    if os.getenv(_MM_ENCODER_FORWARD_LOG_ENV_NAME, "0") != "1":
+        return
+
+    num_items = 0
+    num_tokens = 0
+    for param in multimodal_params:
+        multimodal_data = param.multimodal_data or {}
+        for modality, grid_key in (("image", "image_grid_thw"),
+                                   ("video", "video_grid_thw")):
+            modality_data = multimodal_data.get(modality)
+            if not isinstance(modality_data, dict):
+                continue
+            grids = modality_data.get(grid_key)
+            if not isinstance(grids, torch.Tensor):
+                continue
+            num_items += len(grids)
+            num_tokens += int(torch.prod(grids, dim=1).sum().item())
+
+    logger.info("MM encoder forward diagnostics: "
+                f"items={num_items}, encoder_tokens={num_tokens}")
 
 
 def has_raw_multimodal_payload(param: MultimodalParams) -> bool:
@@ -281,6 +307,7 @@ def get_multimodal_embeddings(
     # Step 2: Run encoder forward only on uncached parameters
     if uncached_multimodal_params:
         kwargs = encoder_kwargs or {}
+        _log_mm_encoder_forward_shape(uncached_multimodal_params)
         encoder_embeddings = encoder_forward_fn(uncached_multimodal_params,
                                                 **kwargs)
         encoder_embeddings = _normalize_encoder_embeddings(encoder_embeddings)

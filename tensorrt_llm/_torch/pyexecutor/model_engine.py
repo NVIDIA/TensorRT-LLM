@@ -439,6 +439,30 @@ class PyTorchModelEngine(ModelEngine):
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
             self.model.extra_attrs = {}
+        processor_metadata_fn = getattr(type(self.input_processor),
+                                        "get_mm_encoder_item_metadata", None)
+        self.supports_mm_encoder_item_scheduling = (
+            isinstance(self.model, MultimodalModelMixin)
+            and processor_metadata_fn is not None and processor_metadata_fn
+            is not BaseMultimodalInputProcessor.get_mm_encoder_item_metadata)
+        self.model_max_mm_encoder_item_tokens: Optional[int] = None
+        if self.supports_mm_encoder_item_scheduling:
+            max_tokens_per_item = self.input_processor.get_mm_max_tokens_per_item(
+            )
+            if max_tokens_per_item:
+                model_max_atomic_item_tokens = max(max_tokens_per_item.values())
+                self.model_max_mm_encoder_item_tokens = (
+                    model_max_atomic_item_tokens)
+                if model_max_atomic_item_tokens > self.encoder_max_num_tokens:
+                    logger.warning_once(
+                        f"encoder_max_num_tokens={self.encoder_max_num_tokens} "
+                        "is smaller than the model's largest atomic "
+                        f"multimodal item ({model_max_atomic_item_tokens}); "
+                        f"using {model_max_atomic_item_tokens} as the "
+                        "effective runtime budget.",
+                        key="raise_encoder_max_num_tokens_for_atomic_item",
+                    )
+                    self.encoder_max_num_tokens = model_max_atomic_item_tokens
         self._set_up_multimodal_encoder_attn_metadata()
         if self.llm_args.enable_layerwise_nvtx_marker:
             layerwise_nvtx_marker = LayerwiseNvtxMarker()
@@ -2485,6 +2509,65 @@ class PyTorchModelEngine(ModelEngine):
         if isinstance(self.model, MultimodalModelMixin):
             return True
         return isinstance(self.input_processor, BaseMultimodalInputProcessor)
+
+    @torch.inference_mode()
+    def execute_multimodal_encoder_items(
+        self,
+        requests: List[LlmRequest],
+        scheduled_items: Dict[int, List[int]],
+    ) -> None:
+        """Execute selected atomic MM items and commit request-local outputs."""
+        if not scheduled_items:
+            return
+        if not isinstance(self.model, MultimodalModelMixin):
+            raise TypeError(
+                "Item-level MM scheduling requires MultimodalModelMixin")
+
+        request_by_id = {request.request_id: request for request in requests}
+        selected = []
+        selected_owners: List[Tuple[LlmRequest, int]] = []
+        for request_id, item_indices in scheduled_items.items():
+            request = request_by_id[request_id]
+            multimodal_param = MultimodalParams(
+                multimodal_data=request.py_multimodal_data)
+            multimodal_param.to_device(
+                "multimodal_data",
+                "cuda",
+                pin_memory=prefer_pinned(),
+                target_keywords=getattr(self.model,
+                                        "multimodal_data_device_paths", None),
+            )
+            request.py_multimodal_data = multimodal_param.multimodal_data
+            for item_idx in item_indices:
+                selected.append((multimodal_param, item_idx))
+                selected_owners.append((request, item_idx))
+
+        outputs = self.model.encode_multimodal_items(selected)
+        if len(outputs) != len(selected_owners):
+            raise RuntimeError(
+                "MM item encoder must return one output per item")
+
+        for output, (request, item_idx) in zip(outputs,
+                                               selected_owners,
+                                               strict=True):
+            embedding_lengths = get_multimodal_embedding_lengths(request)
+            if (embedding_lengths is not None
+                    and output.shape[0] != embedding_lengths[item_idx]):
+                raise ValueError(
+                    f"MM item {item_idx} produced {output.shape[0]} embeddings; "
+                    f"expected {embedding_lengths[item_idx]}")
+            request.py_mm_encoder_outputs[item_idx] = output
+            request.py_mm_encoder_inflight_items.discard(item_idx)
+
+        touched_requests = {
+            request.request_id: request
+            for request, _ in selected_owners
+        }
+        for request in touched_requests.values():
+            if all(output is not None
+                   for output in request.py_mm_encoder_outputs):
+                request.py_multimodal_data["multimodal_embedding"] = torch.cat(
+                    request.py_mm_encoder_outputs, dim=0)
 
     def _set_up_multimodal_encoder_attn_metadata(self) -> None:
         """Construct AttentionMetadata for any multimodal encoders inside the

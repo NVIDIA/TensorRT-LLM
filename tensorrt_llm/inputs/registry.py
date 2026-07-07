@@ -13,6 +13,7 @@
 # limitations under the License.
 #
 # SPDX-License-Identifier: Apache-2.0
+"""Input processor registry and multimodal preprocessing helpers."""
 
 import enum
 import traceback
@@ -176,6 +177,18 @@ class BaseMultimodalInputProcessor(ABC):
     # When True, `__call__` may route `prompt_token_ids + multi_modal_data`
     # inputs to `call_with_token_ids` instead of detokenizing upstream.
     supports_token_id_mm_expansion: ClassVar[bool] = False
+
+    def get_mm_encoder_item_metadata(
+        self,
+        prompt_token_ids: List[int],
+        multimodal_data: Dict[str, Any],
+    ) -> Optional[Tuple[List[Tuple[str, int]], List[int], List[int]]]:
+        """Return item refs, physical costs, and encoder output lengths.
+
+        Models opting into runtime MM encoder scheduling override this hook.
+        The default keeps legacy multimodal processors unchanged.
+        """
+        return None
 
     def __init__(self,
                  model_path,
@@ -1306,6 +1319,25 @@ def create_input_processor_with_hash(
 
         maybe_compute_mm_embed_cumsum(prompt_token_ids, extra_processed_inputs,
                                       input_processor)
+        if extra_processed_inputs is not None:
+            multimodal_data = extra_processed_inputs.get("multimodal_data")
+            if (isinstance(multimodal_data, dict)
+                    and multimodal_data.get("multimodal_embedding") is None):
+                metadata_fn = getattr(input_processor,
+                                      "get_mm_encoder_item_metadata", None)
+                item_metadata = (metadata_fn(prompt_token_ids, multimodal_data)
+                                 if metadata_fn is not None else None)
+                if item_metadata is not None:
+                    item_refs, token_lengths, embedding_lengths = item_metadata
+                    if not (len(item_refs) == len(token_lengths) ==
+                            len(embedding_lengths)):
+                        raise ValueError("Multimodal encoder item references "
+                                         "and lengths must align")
+                    multimodal_data["multimodal_item_refs"] = item_refs
+                    multimodal_data[
+                        "multimodal_encoder_token_lengths"] = token_lengths
+                    multimodal_data.setdefault("multimodal_embedding_lengths",
+                                               embedding_lengths)
         return prompt_token_ids, extra_processed_inputs
 
     return input_processor_wrapper

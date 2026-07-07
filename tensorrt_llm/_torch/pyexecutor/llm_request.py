@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Python extensions for executor requests."""
+
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, cast
@@ -678,6 +682,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # Multimodal data
         self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
         self.py_mm_item_order = kwargs.pop("py_mm_item_order", None)
+        self.py_is_multimodal_encoder_request = False
+        self.py_mm_encoder_outputs: List[Optional[torch.Tensor]] = []
+        self.py_mm_encoder_inflight_items: set[int] = set()
         encoder_input_tokens = kwargs.get("encoder_input_tokens")
         encoder_output_len = kwargs.get("encoder_output_len")
         return_encoder_output = bool(kwargs.get("return_encoder_output", False))
@@ -1066,6 +1073,66 @@ def get_multimodal_embedding_lengths(
                     f"multimodal_lengths[{item_idx}]")
 
     return multimodal_embedding_lengths
+
+
+def get_multimodal_encoder_token_lengths(
+        request: LlmRequest) -> Optional[List[int]]:
+    """Return per-item physical encoder attention-token costs."""
+    py_multimodal_data = request.py_multimodal_data
+    if py_multimodal_data is not None and not isinstance(
+            py_multimodal_data, dict):
+        raise TypeError("py_multimodal_data must be a dict")
+    token_lengths = _validate_optional_int_list(
+        py_multimodal_data.get("multimodal_encoder_token_lengths")
+        if py_multimodal_data is not None else None,
+        "multimodal_encoder_token_lengths")
+    if token_lengths is None:
+        return None
+    if any(length <= 0 for length in token_lengths):
+        raise ValueError(
+            "multimodal_encoder_token_lengths must contain positive values")
+
+    embedding_lengths = get_multimodal_embedding_lengths(request)
+    if (embedding_lengths is not None
+            and len(token_lengths) != len(embedding_lengths)):
+        raise ValueError("multimodal_encoder_token_lengths length must match "
+                         "multimodal_embedding_lengths")
+    return token_lengths
+
+
+def initialize_multimodal_encoder_request(request: LlmRequest,
+                                          max_num_tokens: Optional[int] = None
+                                          ) -> None:
+    """Initialize immutable request kind and mutable per-item encoder state."""
+    mm_data = request.py_multimodal_data
+    has_raw_payload = isinstance(mm_data, dict) and any(
+        isinstance(mm_data.get(modality), dict)
+        for modality in ("image", "video", "audio"))
+    has_full_embedding = (isinstance(mm_data, dict)
+                          and mm_data.get("multimodal_embedding") is not None)
+    token_lengths = get_multimodal_encoder_token_lengths(
+        request) if has_raw_payload and not has_full_embedding else None
+    if (token_lengths is not None and max_num_tokens is not None
+            and any(length > max_num_tokens for length in token_lengths)):
+        largest = max(token_lengths)
+        raise ValueError(
+            f"Multimodal item requires {largest} encoder tokens, exceeding "
+            f"the startup maximum {max_num_tokens}")
+
+    request.py_is_multimodal_encoder_request = token_lengths is not None
+    request.py_mm_encoder_outputs = ([None] * len(token_lengths)
+                                     if token_lengths is not None else [])
+    request.py_mm_encoder_inflight_items.clear()
+
+
+def is_multimodal_encoder_ready(request: LlmRequest) -> bool:
+    """Return whether this request needs no further MM encoder work."""
+    if not request.py_is_multimodal_encoder_request:
+        return True
+    if (isinstance(request.py_multimodal_data, dict) and
+            request.py_multimodal_data.get("multimodal_embedding") is not None):
+        return True
+    return all(output is not None for output in request.py_mm_encoder_outputs)
 
 
 def executor_request_to_llm_request(

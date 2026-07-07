@@ -69,8 +69,7 @@ from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 from ..modules.gated_mlp import GatedMLP
 from ..modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_encoder import (_ENCODER_FALLBACK_MAX_NUM_REQUESTS,
-                                          MultimodalEncoderMixin)
+from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_mixin import MultimodalModelMixin
 from .modeling_multimodal_utils import (
     _install_processor_output_validation_filter, find_input_mm_embeds,
@@ -238,6 +237,105 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
     @property
     def dtype(self) -> torch.dtype:
         return self._dtype
+
+    def get_mm_encoder_item_metadata(
+        self,
+        prompt_token_ids: List[int],
+        multimodal_data: Dict[str, Any],
+    ) -> Optional[Tuple[List[Tuple[str, int]], List[int], List[int]]]:
+        """Return prompt-ordered Qwen vision items and pre-merger costs."""
+        grids_by_modality: Dict[str, torch.Tensor] = {}
+        for modality, grid_key in (("image", "image_grid_thw"),
+                                   ("video", "video_grid_thw")):
+            modality_data = multimodal_data.get(modality)
+            if isinstance(modality_data,
+                          dict) and modality_data.get(grid_key) is not None:
+                grids_by_modality[modality] = modality_data[grid_key]
+        if not grids_by_modality:
+            return None
+
+        config = self.config
+        token_to_modality = {
+            int(config.image_token_id): "image",
+            int(config.video_token_id): "video",
+        }
+        vision_start_token_id = int(config.vision_start_token_id)
+        vision_end_token_id = int(config.vision_end_token_id)
+
+        modalities: List[str] = []
+        item_start = 0
+        while item_start < len(prompt_token_ids):
+            if prompt_token_ids[item_start] != vision_start_token_id:
+                item_start += 1
+                continue
+            item_end = item_start + 1
+            modality = None
+            while (item_end < len(prompt_token_ids)
+                   and prompt_token_ids[item_end] != vision_end_token_id):
+                modality = token_to_modality.get(prompt_token_ids[item_end],
+                                                 modality)
+                item_end += 1
+            if modality is not None:
+                modalities.append(modality)
+            item_start = item_end + 1
+
+        video_grids = grids_by_modality.get("video")
+        num_video_spans = modalities.count("video")
+        video_spans_per_item: List[int] = []
+        if video_grids is not None:
+            if num_video_spans == len(video_grids):
+                video_spans_per_item = [1] * len(video_grids)
+            else:
+                temporal_spans = [int(grid[0]) for grid in video_grids]
+                if num_video_spans != sum(temporal_spans):
+                    raise ValueError(
+                        "Prompt video spans do not match processed video grids")
+                video_spans_per_item = temporal_spans
+
+        canonical_modalities: List[str] = []
+        span_idx = 0
+        video_idx = 0
+        while span_idx < len(modalities):
+            modality = modalities[span_idx]
+            canonical_modalities.append(modality)
+            if modality == "image":
+                span_idx += 1
+                continue
+            if video_idx >= len(video_spans_per_item):
+                raise ValueError(
+                    "Prompt contains more video items than encoder grids")
+            spans = video_spans_per_item[video_idx]
+            if modalities[span_idx:span_idx + spans] != ["video"] * spans:
+                raise ValueError(
+                    "One original video must occupy consecutive prompt spans")
+            span_idx += spans
+            video_idx += 1
+        if video_idx != len(video_spans_per_item):
+            raise ValueError(
+                "Processed video grids contain items absent from the prompt")
+
+        local_indices = {"image": 0, "video": 0}
+        item_refs: List[Tuple[str, int]] = []
+        token_lengths: List[int] = []
+        for modality in canonical_modalities:
+            local_idx = local_indices[modality]
+            grids = grids_by_modality.get(modality)
+            if grids is None or local_idx >= len(grids):
+                raise ValueError(
+                    f"Prompt contains more {modality} items than encoder grids")
+            item_refs.append((modality, local_idx))
+            token_lengths.append(int(torch.prod(grids[local_idx]).item()))
+            local_indices[modality] += 1
+
+        expected_items = sum(len(grids) for grids in grids_by_modality.values())
+        if len(item_refs) != expected_items:
+            raise ValueError("Prompt multimodal item order does not match "
+                             "processed Qwen encoder grids")
+        embedding_lengths = [
+            token_length // self.spatial_merge_unit
+            for token_length in token_lengths
+        ]
+        return item_refs, token_lengths, embedding_lengths
 
     # ------------------------------------------------------------------
     # Deterministic dummy-input sizing for multimodal profiling.
@@ -1413,15 +1511,10 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         # Override: Qwen2/2.5-VL uses two metadata objects (full + window
         # attention) instead of the mixin's single ``attn_metadata``.
         #
-        # Windowed attention splits each image into many attention sequences
-        # (one per window grid cell), so ``max_num_requests`` here is the
-        # **window** count, not the image count, and can far exceed the
-        # LLM-side ``max_batch_size`` that ``encoder_max_batch_size`` falls back
-        # to. Floor it at the same legacy fallback the mixin uses (see the TODO
-        # there: derive from ``encoder_max_num_tokens`` once the scheduler caps
-        # encoder forwards at it).
-        max_num_requests = max(max_num_requests,
-                               _ENCODER_FALLBACK_MAX_NUM_REQUESTS)
+        # Windowed attention uses one metadata sequence per non-empty window.
+        # Runtime scheduling now caps the sum of physical attention tokens, so
+        # the number of non-empty windows cannot exceed ``max_num_tokens``.
+        max_num_requests = max(max_num_requests, max_num_tokens)
         kwargs = dict(max_num_requests=max_num_requests,
                       max_num_tokens=max_num_tokens,
                       kv_cache_manager=None)

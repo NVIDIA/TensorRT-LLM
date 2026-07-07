@@ -74,7 +74,8 @@ from .kv_cache_transceiver import (KvCacheTransceiver,
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID,
                           MAX_SPEC_DECODE_POSITIONS, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
-                          get_draft_token_length)
+                          get_draft_token_length,
+                          initialize_multimodal_encoder_request)
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   MixedMambaHybridCacheManager)
 from .model_engine import ModelEngine
@@ -86,9 +87,9 @@ from .resource_manager import (NoFreeSlotsError, ResourceManager,
                                ResourceManagerType, request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors, TRTLLMSampler)
-from .scheduler import (RequestScheduler, ScheduledRequests,
-                        SerializableSchedulerOutput, WaitingQueue,
-                        create_waiting_queue)
+from .scheduler import (MultimodalScheduler, RequestScheduler,
+                        ScheduledRequests, SerializableSchedulerOutput,
+                        WaitingQueue, create_waiting_queue)
 from .scheduler.adp_router import ADPRouter
 
 if TYPE_CHECKING:
@@ -108,6 +109,10 @@ PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
 # Environment variable to enable PyTorch profiler tracing.
 # Set to a path to save detailed tracing of PyTorch operations.
 PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
+MM_ENCODER_INDEPENDENT_SCHEDULING_ENV_VAR_NAME = (
+    "TLLM_MM_ENCODER_INDEPENDENT_SCHEDULING")
+MM_ENCODER_RUNTIME_SCHEDULING_ENV_VAR_NAME = (
+    "TLLM_MM_ENCODER_RUNTIME_SCHEDULING")
 
 # Environment variable to control which ranks print step logging.
 # Format: comma-separated rank IDs, e.g. "0,1,3", or "all" for all ranks.
@@ -245,6 +250,8 @@ def _strip_py_multimodal_data_post_prefill(request: LlmRequest) -> None:
     if not mm_data:
         return
     strip_mm_data_for_generation(mm_data)
+    request.py_mm_encoder_outputs.clear()
+    request.py_mm_encoder_inflight_items.clear()
 
 
 @dataclasses.dataclass
@@ -564,10 +571,52 @@ class PyExecutor:
 
         # related modules
         self.resource_manager = resource_manager
-        self.scheduler = scheduler
         self.model_engine = model_engine
         self._enable_dsv4_adp_dummy_fixes = getattr(
             model_engine, "_enable_dsv4_adp_dummy_fixes", False)
+        supports_mm_encoder_item_scheduling = getattr(
+            model_engine, "supports_mm_encoder_item_scheduling", False)
+        mm_encoder_runtime_scheduling_enabled = os.environ.get(
+            MM_ENCODER_RUNTIME_SCHEDULING_ENV_VAR_NAME, "1") != "0"
+        self.is_multimodal_model = (supports_mm_encoder_item_scheduling
+                                    and mm_encoder_runtime_scheduling_enabled)
+        self.independent_mm_scheduling = False
+        if (supports_mm_encoder_item_scheduling
+                and not mm_encoder_runtime_scheduling_enabled):
+            logger.warning(
+                "Multimodal encoder runtime scheduling is disabled by "
+                f"{MM_ENCODER_RUNTIME_SCHEDULING_ENV_VAR_NAME}=0; using the "
+                "legacy all-items encoder path. This mode is intended for "
+                "performance comparison only.")
+        if self.is_multimodal_model:
+            mm_side_stream_max_ahead = os.environ.get(
+                "TLLM_MM_SIDE_STREAM_MAX_AHEAD", "0")
+            try:
+                mm_side_stream_enabled = int(mm_side_stream_max_ahead) > 0
+            except ValueError:
+                mm_side_stream_enabled = False
+            if mm_side_stream_enabled:
+                raise NotImplementedError(
+                    "MM side-stream prefetch is not yet compatible with "
+                    "item-level encoder scheduling; unset "
+                    "TLLM_MM_SIDE_STREAM_MAX_AHEAD")
+            self.independent_mm_scheduling = os.environ.get(
+                MM_ENCODER_INDEPENDENT_SCHEDULING_ENV_VAR_NAME, "0") == "1"
+            if self.independent_mm_scheduling and (
+                    model_engine.enable_attention_dp or kv_cache_transceiver):
+                raise NotImplementedError(
+                    "Independent MM encoder scheduling does not yet support "
+                    "attention DP or disaggregated serving")
+            if self.independent_mm_scheduling:
+                logger.info("Independent multimodal encoder scheduling is "
+                            "enabled for capacity-rejected active requests.")
+            scheduler = MultimodalScheduler(
+                scheduler,
+                max_batch_size=model_engine.encoder_batch_size,
+                max_num_tokens=model_engine.encoder_max_num_tokens,
+                independent=self.independent_mm_scheduling,
+            )
+        self.scheduler = scheduler
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.dist = dist
         self.sampler = sampler
@@ -2559,6 +2608,8 @@ class PyExecutor:
                             local_disagg_candidates,
                             fitting_disagg_gen_init_requests)
 
+                self._execute_scheduled_mm_encoder_items(scheduled_batch)
+
                 # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
                 if self.kv_cache_transceiver:
                     self._prepare_disagg_gen_init(
@@ -3655,6 +3706,8 @@ class PyExecutor:
 
         scheduled_batch, scheduler_fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
         )
+
+        self._execute_scheduled_mm_encoder_items(scheduled_batch)
 
         if self.drafter is not None and not self.use_spec_decode:
             for request in scheduled_batch.all_requests():
@@ -4944,12 +4997,67 @@ class PyExecutor:
                 self._fill_admit_cap = min(self._fill_admit_cap * 2, total_max)
             max_new_requests = min(max_new_requests, self._fill_admit_cap)
 
-        return get_from_waiting_queue(
+        new_requests = get_from_waiting_queue(
             waiting_queue,
             max_new_requests,
             enable_attention_dp=self.enable_attention_dp,
             max_num_active_requests=self.max_num_active_requests,
             all_ranks_num_active_requests=all_ranks_num_active_requests)
+        if (not getattr(self, "is_multimodal_model", False)
+                or self.enable_attention_dp):
+            return new_requests
+
+        remaining_items = self.model_engine.encoder_batch_size
+        remaining_tokens = self.model_engine.encoder_max_num_tokens
+
+        def consume_pending(costs, ready_outputs=None, inflight_items=None):
+            nonlocal remaining_items, remaining_tokens
+            ready_outputs = ready_outputs or [None] * len(costs)
+            inflight_items = inflight_items or set()
+            progressed = False
+            for item_idx, (cost, output) in enumerate(zip(costs,
+                                                          ready_outputs)):
+                if output is not None:
+                    continue
+                if item_idx in inflight_items:
+                    break
+                if remaining_items == 0 or cost > remaining_tokens:
+                    break
+                remaining_items -= 1
+                remaining_tokens -= cost
+                progressed = True
+            return progressed
+
+        for request in self.active_requests:
+            if not request.py_is_multimodal_encoder_request:
+                continue
+            mm_data = request.py_multimodal_data or {}
+            costs = mm_data.get("multimodal_encoder_token_lengths") or []
+            consume_pending(costs, request.py_mm_encoder_outputs,
+                            request.py_mm_encoder_inflight_items)
+
+        admitted = []
+        deferred = []
+        blocked = False
+        for queue_item in new_requests:
+            if blocked:
+                deferred.append(queue_item)
+                continue
+            mm_data = getattr(queue_item.request, "py_multimodal_data", None)
+            costs = (mm_data.get("multimodal_encoder_token_lengths")
+                     if isinstance(mm_data, dict) else None)
+            has_full_embedding = (isinstance(mm_data, dict)
+                                  and mm_data.get("multimodal_embedding")
+                                  is not None)
+            if costs and not has_full_embedding and not consume_pending(costs):
+                blocked = True
+                deferred.append(queue_item)
+                continue
+            admitted.append(queue_item)
+
+        if deferred:
+            waiting_queue.prepend_requests(deferred)
+        return admitted
 
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(
@@ -5085,6 +5193,11 @@ class PyExecutor:
             """
             try:
                 self._validate_request(request)
+                if self.is_multimodal_model:
+                    initialize_multimodal_encoder_request(
+                        request,
+                        max_num_tokens=self.model_engine.
+                        model_max_mm_encoder_item_tokens)
                 return False
             except Exception as e:
                 self._handle_errors(str(e),
@@ -5269,8 +5382,21 @@ class PyExecutor:
         scheduled_requests.reset_context_requests(scheduled_context_requests)
         scheduled_requests.generation_requests = scheduler_output.generation_requests
         scheduled_requests.paused_requests = scheduler_output.paused_requests
+        scheduled_requests.scheduled_mm_encoder_items = (
+            scheduler_output.scheduled_mm_encoder_items)
 
         return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, num_fitting
+
+    def _execute_scheduled_mm_encoder_items(
+            self, scheduled_requests: ScheduledRequests) -> None:
+        scheduled_items = scheduled_requests.scheduled_mm_encoder_items
+        if not scheduled_items:
+            return
+        self.execution_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self.execution_stream):
+            self.model_engine.execute_multimodal_encoder_items(
+                self.active_requests, scheduled_items)
+        torch.cuda.current_stream().wait_stream(self.execution_stream)
 
     # ---------------------------------------------------------------
     # Encoder-decoder support: encoder iteration in the executor loop.

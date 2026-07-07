@@ -165,6 +165,97 @@ class MultimodalModelMixin:
         """
         raise NotImplementedError
 
+    @staticmethod
+    def _select_multimodal_item(
+        multimodal_param: MultimodalParams,
+        item_idx: int,
+    ) -> MultimodalParams:
+        """Build encoder inputs for one canonical original MM item."""
+        multimodal_data = multimodal_param.multimodal_data or {}
+        item_refs = multimodal_data.get("multimodal_item_refs")
+        if not isinstance(item_refs, list) or item_idx >= len(item_refs):
+            raise ValueError(f"Missing multimodal item reference for index {item_idx}")
+        modality, local_idx = item_refs[item_idx]
+        modality_data = multimodal_data.get(modality)
+        if not isinstance(modality_data, dict):
+            raise ValueError(f"Missing {modality} encoder data for item {item_idx}")
+
+        selected_data: Dict[str, Any] = {}
+        grid_key = (
+            "image_grid_thw"
+            if modality == "image"
+            else "video_grid_thw"
+            if modality == "video"
+            else None
+        )
+        pixel_key = (
+            "pixel_values"
+            if modality == "image"
+            else "pixel_values_videos"
+            if modality == "video"
+            else None
+        )
+        if (
+            grid_key is not None
+            and pixel_key is not None
+            and grid_key in modality_data
+            and pixel_key in modality_data
+        ):
+            grids = modality_data[grid_key]
+            if local_idx >= len(grids):
+                raise ValueError(f"Invalid {modality} item index {local_idx}")
+            patch_counts = torch.prod(grids, dim=1).tolist()
+            patch_start = sum(int(count) for count in patch_counts[:local_idx])
+            patch_end = patch_start + int(patch_counts[local_idx])
+            selected_data[pixel_key] = modality_data[pixel_key][patch_start:patch_end]
+            selected_data[grid_key] = grids[local_idx : local_idx + 1]
+        elif modality == "image" and "image_sizes" in modality_data:
+            image_sizes = modality_data["image_sizes"]
+            pixel_values = modality_data["pixel_values"]
+            selected_data["image_sizes"] = image_sizes[local_idx : local_idx + 1]
+            selected_data["pixel_values"] = pixel_values[local_idx : local_idx + 1]
+        else:
+            raise NotImplementedError(
+                f"Item-level encoder slicing is not implemented for {modality}"
+            )
+
+        return MultimodalParams(multimodal_data={modality: selected_data})
+
+    def encode_multimodal_items(
+        self,
+        selected_items: Sequence[tuple[MultimodalParams, int]],
+    ) -> list[torch.Tensor]:
+        """Encode compatible consecutive atomic items in scheduler order."""
+        outputs: list[torch.Tensor] = []
+        group_params: list[MultimodalParams] = []
+        group_lengths: list[int] = []
+        group_modality: Optional[str] = None
+
+        def flush_group() -> None:
+            if not group_params:
+                return
+            embeddings = self.encode_multimodal_inputs(group_params)
+            if embeddings.shape[0] != sum(group_lengths):
+                raise ValueError("MM encoder output length does not match selected items")
+            outputs.extend(torch.split(embeddings, group_lengths, dim=0))
+            group_params.clear()
+            group_lengths.clear()
+
+        for multimodal_param, item_idx in selected_items:
+            multimodal_data = multimodal_param.multimodal_data or {}
+            item_refs = multimodal_data.get("multimodal_item_refs")
+            embedding_lengths = multimodal_data.get("multimodal_embedding_lengths")
+            if not isinstance(item_refs, list) or not isinstance(embedding_lengths, list):
+                raise ValueError("MM item metadata is required for item encoding")
+            modality = item_refs[item_idx][0]
+            if group_modality is not None and modality != group_modality:
+                flush_group()
+            group_modality = modality
+            group_params.append(self._select_multimodal_item(multimodal_param, item_idx))
+            group_lengths.append(embedding_lengths[item_idx])
+        flush_group()
+        return outputs
+
     @property
     def multimodal_token_ids(self) -> Optional[Sequence[int] | torch.Tensor]:
         """Return placeholder token ids in `input_ids` replaced by MM embeds.

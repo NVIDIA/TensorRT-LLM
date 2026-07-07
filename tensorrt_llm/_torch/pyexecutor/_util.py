@@ -587,7 +587,7 @@ class KvCacheCreator:
         if getattr(self._model_engine.model, "mm_encoder", object()) is None:
             return []
         input_processor = self._model_engine.input_processor
-        _, encoder_max_num_tokens = self._llm_args.get_encoder_runtime_sizes()
+        encoder_max_num_tokens = self._model_engine.encoder_max_num_tokens
         # Modality-agnostic: the model declares each modality's per-item token
         # demand; split the shared ``encoder_max_num_tokens`` budget across them
         # in proportion to that demand (they share one encoder microbatch cap, so

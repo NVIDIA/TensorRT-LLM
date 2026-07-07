@@ -1,6 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import copy
 import dataclasses
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torchvision
@@ -412,6 +415,29 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
     @property
     def dtype(self) -> torch.dtype:
         return self._dtype
+
+    def get_mm_encoder_item_metadata(
+        self,
+        prompt_token_ids: List[int],
+        multimodal_data: Dict[str, Any],
+    ) -> Optional[Tuple[List[Tuple[str, int]], List[int], List[int]]]:
+        """Return Pixtral image items and physical ViT patch counts."""
+        del prompt_token_ids
+        image_data = multimodal_data.get("image")
+        if not isinstance(image_data, dict):
+            return None
+        image_sizes = image_data.get("image_sizes")
+        if image_sizes is None:
+            return None
+        patch, merge, _, _ = self._vision_geometry()
+        token_lengths = [(int(height) // patch) * (int(width) // patch)
+                         for height, width in image_sizes]
+        item_refs = [("image", item_idx)
+                     for item_idx in range(len(token_lengths))]
+        embedding_lengths = [
+            token_length // (merge * merge) for token_length in token_lengths
+        ]
+        return item_refs, token_lengths, embedding_lengths
 
     @torch.inference_mode()
     def call_with_text_prompt(
