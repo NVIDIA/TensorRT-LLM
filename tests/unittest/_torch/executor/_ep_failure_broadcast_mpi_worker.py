@@ -45,6 +45,7 @@ _ABORT_WORLD_MARKER = "WIDEEP_MPI_ABORT_WORLD_OK"
 _TERMINAL_READY_MARKER = "WIDEEP_MPI_TERMINAL_READY"
 _TERMINAL_COMPLETE_MARKER = "WIDEEP_MPI_TERMINAL_COMPLETE"
 _TERMINAL_DONE_MARKER = "WIDEEP_MPI_TERMINAL_DONE"
+_TERMINAL_EXITING_MARKER = "WIDEEP_MPI_TERMINAL_EXITING"
 _TERMINAL_ERROR_MARKER = "WIDEEP_MPI_TERMINAL_ERROR"
 _TERMINAL_ATEXIT_MARKER = "WIDEEP_MPI_TERMINAL_ATEXIT_RAN"
 _PROPAGATION_TARGET_SEC = 0.1
@@ -604,6 +605,13 @@ if __name__ == "__main__":
                 # No rank can trigger launcher fail-fast until rank 0 has copied
                 # the complete gathered manifest to stdout.
                 world.Barrier()
+                # Emit direct per-rank evidence after the final synchronization
+                # and immediately before the intentional no-Finalize exit. Keep
+                # this to one small os.write() so Python buffering cannot lose it.
+                os.write(
+                    sys.stdout.fileno(),
+                    (f"{_TERMINAL_EXITING_MARKER} rank={rank} world_size={world_size}\n").encode(),
+                )
             except BaseException:
                 try:
                     _write_terminal_manifest([f"{_TERMINAL_ERROR_MARKER} rank={rank} exit_code=1"])
