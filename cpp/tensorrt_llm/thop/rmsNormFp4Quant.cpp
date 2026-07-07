@@ -106,17 +106,20 @@ std::vector<at::Tensor> fused_add_rmsnorm_fp4_quantize(at::Tensor const& hidden_
     params.residual_buffer = residual.data_ptr();
     params.weight_buffer = norm_weight.data_ptr();
     params.intermediate_buffer = hidden_states.data_ptr();
+    params.scale_factor_ptr = static_cast<float const*>(scale_factor.data_ptr());
+    params.quant_out = quant_out.mutable_data_ptr();
+    params.scale_out = scale_out.mutable_data_ptr();
+    params.norm_out = norm_out_ptr;
     params.residual_out_buffer = residual_out.mutable_data_ptr();
     params.hidden_size = static_cast<int>(k);
     params.eps = static_cast<float>(eps);
     params.elts_total = hidden_states.numel();
+    params.sf_layout = tensorrt_llm::QuantizationSFLayout::SWIZZLED;
 
     auto const stream = at::cuda::getCurrentCUDAStream(hidden_states.get_device());
     auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(hidden_states.scalar_type());
 
-    tensorrt_llm::kernels::residualRmsNormFp4Quant(params, quant_out.mutable_data_ptr(), scale_out.mutable_data_ptr(),
-        norm_out_ptr, static_cast<float const*>(scale_factor.data_ptr()), tensorrt_llm::QuantizationSFLayout::SWIZZLED,
-        dtype, stream);
+    tensorrt_llm::kernels::residualRmsNormFp4Quant(params, dtype, stream);
 
     // residual_out holds the residual sum (= original hidden + original residual).
     if (return_norm_out)
@@ -209,16 +212,20 @@ std::vector<at::Tensor> fused_rmsnorm_fp4_quantize(at::Tensor const& hidden_stat
     params.residual_buffer = nullptr;
     params.weight_buffer = norm_weight.data_ptr();
     params.intermediate_buffer = hidden_states.data_ptr();
+    params.scale_factor_ptr = static_cast<float const*>(scale_factor.data_ptr());
+    params.quant_out = quant_out.mutable_data_ptr();
+    params.scale_out = scale_out.mutable_data_ptr();
+    params.norm_out = norm_out_ptr;
     params.hidden_size = static_cast<int>(k);
     params.eps = static_cast<float>(eps);
     params.elts_total = hidden_states.numel();
+    params.sf_layout = tensorrt_llm::QuantizationSFLayout::SWIZZLED;
+    params.input_row_stride = input_row_stride;
 
     auto const stream = at::cuda::getCurrentCUDAStream(hidden_states.get_device());
     auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(hidden_states.scalar_type());
 
-    tensorrt_llm::kernels::residualRmsNormFp4Quant(params, quant_out.mutable_data_ptr(), scale_out.mutable_data_ptr(),
-        norm_out_ptr, static_cast<float const*>(scale_factor.data_ptr()), tensorrt_llm::QuantizationSFLayout::SWIZZLED,
-        dtype, stream, input_row_stride);
+    tensorrt_llm::kernels::residualRmsNormFp4Quant(params, dtype, stream);
 
     if (return_norm_out)
     {

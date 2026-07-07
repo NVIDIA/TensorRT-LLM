@@ -169,9 +169,7 @@ inline __device__ int4 rms_norm(float denom, PackedStruct& vec, PackedStruct& we
 //   - Caller guarantees hidden_size % SF_VEC_SIZE == 0.
 template <typename T, bool Bias = false, bool Residual = false, bool Affine = false, bool UseSmem = false,
     bool OutNorm = false>
-__global__ void rmsNormFp4QuantKernel(RmsNormFp4QuantParams params, void* quant_out, void* scale_out,
-    void* norm_out_ptr, float const* scale_factor_ptr, ::tensorrt_llm::QuantizationSFLayout sf_layout,
-    int input_row_stride)
+__global__ void rmsNormFp4QuantKernel(RmsNormFp4QuantParams params)
 {
     static constexpr int kPackedSize = kBytesPerAccess / sizeof(T);
     static constexpr int kSfVecSize = 16;
@@ -188,7 +186,7 @@ __global__ void rmsNormFp4QuantKernel(RmsNormFp4QuantParams params, void* quant_
     T const* weight_buffer = reinterpret_cast<T const*>(params.weight_buffer);
     T const* intermediate_buffer = reinterpret_cast<T const*>(params.intermediate_buffer);
     T* residual_out_buffer = reinterpret_cast<T*>(params.residual_out_buffer);
-    T* norm_out = reinterpret_cast<T*>(norm_out_ptr);
+    T* norm_out = reinterpret_cast<T*>(params.norm_out);
 
     int const block_offset = bid * params.hidden_size;
     // Input rows may be strided (e.g. a column slice of a wider projection,
@@ -196,7 +194,7 @@ __global__ void rmsNormFp4QuantKernel(RmsNormFp4QuantParams params, void* quant_
     // input_row_stride <= 0 it defaults to hidden_size (packed rows), making
     // this byte-identical to all existing callers. Only the INPUT read offset
     // uses the stride; every output (residual/norm/quant/scale) stays packed.
-    int const input_block_offset = bid * (input_row_stride > 0 ? input_row_stride : params.hidden_size);
+    int const input_block_offset = bid * (params.input_row_stride > 0 ? params.input_row_stride : params.hidden_size);
     int const thread_offset = tid * kPackedSize;
 
     if constexpr (Residual)
@@ -245,37 +243,68 @@ __global__ void rmsNormFp4QuantKernel(RmsNormFp4QuantParams params, void* quant_
     acc = block_reduce_sum(acc);
     float const denom = rsqrtf(acc / params.hidden_size + params.eps);
 
-    float const sf_scale = scale_factor_ptr ? *scale_factor_ptr : 1.f;
+    float const sf_scale = params.scale_factor_ptr ? *params.scale_factor_ptr : 1.f;
     int const hidden_dim_packed = params.hidden_size / kSfVecSize;
 
-    for (int offset = thread_offset; offset < params.hidden_size; offset += blockDim.x * kPackedSize)
+    // cvt_warp_fp16_to_fp4 performs full-mask __shfl_xor_sync exchanges, which
+    // require every lane of the warp to execute the call. When hidden_size /
+    // kPackedSize is not a multiple of kWarpSize (e.g. hidden_size = 32, 128,
+    // 8208), the tail warp would otherwise be only partially active in this
+    // loop -- undefined behavior. Iterate with a warp-uniform bound (the warp's
+    // lane-0 offset) so all 32 lanes stay converged through the shuffle, and
+    // mask the per-lane loads/stores instead. Out-of-range lanes feed zeros to
+    // the shuffle; this is safe because hidden_size % kSfVecSize == 0 makes the
+    // active region end on an SF-pair boundary, so a padding lane's xor-1
+    // partner is always another padding lane.
+    int const lane_id = tid % kWarpSize;
+    for (int offset = thread_offset; offset - lane_id * kPackedSize < params.hidden_size;
+         offset += blockDim.x * kPackedSize)
     {
-        if constexpr (UseSmem)
+        bool const valid = offset < params.hidden_size;
+        if (valid)
         {
-            inter_vec.packed = *reinterpret_cast<int4 const*>(&smem[offset]);
+            if constexpr (UseSmem)
+            {
+                inter_vec.packed = *reinterpret_cast<int4 const*>(&smem[offset]);
+            }
+            if constexpr (Affine)
+            {
+                weight_vec.packed = *reinterpret_cast<int4 const*>(weight_buffer + offset);
+            }
+            inter_vec.packed = rms_norm<T, Affine>(denom, inter_vec, weight_vec);
+            if constexpr (OutNorm)
+            {
+                *reinterpret_cast<int4*>(norm_out + offset) = inter_vec.packed;
+            }
         }
-        if constexpr (Affine)
+        else
         {
-            weight_vec.packed = *reinterpret_cast<int4 const*>(weight_buffer + offset);
-        }
-        inter_vec.packed = rms_norm<T, Affine>(denom, inter_vec, weight_vec);
-        if constexpr (OutNorm)
-        {
-            *reinterpret_cast<int4*>(norm_out + offset) = inter_vec.packed;
+            // Benign values for the warp-cooperative SF exchange below (a
+            // padding lane's first-loop inter_vec may be uninitialized).
+            inter_vec.packed = make_int4(0, 0, 0, 0);
         }
 
         // FP4 quantize this 8-element packed vec; warp-cooperate with the
         // neighbour thread (offset ^ kPackedSize) to compute a single SF for
-        // their joint 16-element block.
+        // their joint 16-element block. All lanes (incl. padding) must execute
+        // this call; padding lanes pass a null SF pointer and drop the result.
         ::tensorrt_llm::kernels::PackedVec<T> pv
             = *reinterpret_cast<::tensorrt_llm::kernels::PackedVec<T>*>(&inter_vec);
-        int const access_id = bid * (params.hidden_size / kPackedSize) + (offset / kPackedSize);
-        int const access_id_in_token = offset / kPackedSize;
-        uint8_t* sf_out_ptr = ::tensorrt_llm::kernels::cvt_quant_get_sf_out_offset<uint32_t, 2>(std::nullopt, bid,
-            access_id_in_token, std::nullopt, hidden_dim_packed, reinterpret_cast<uint32_t*>(scale_out), sf_layout);
-        reinterpret_cast<uint32_t*>(quant_out)[access_id]
-            = ::tensorrt_llm::kernels::cvt_warp_fp16_to_fp4<T, kSfVecSize, /*UE8M0_SF=*/false>(
-                pv, sf_scale, sf_out_ptr);
+        uint8_t* sf_out_ptr = nullptr;
+        if (valid)
+        {
+            int const access_id_in_token = offset / kPackedSize;
+            sf_out_ptr = ::tensorrt_llm::kernels::cvt_quant_get_sf_out_offset<uint32_t, 2>(std::nullopt, bid,
+                access_id_in_token, std::nullopt, hidden_dim_packed, reinterpret_cast<uint32_t*>(params.scale_out),
+                params.sf_layout);
+        }
+        uint32_t const quant_val = ::tensorrt_llm::kernels::cvt_warp_fp16_to_fp4<T, kSfVecSize, /*UE8M0_SF=*/false>(
+            pv, sf_scale, sf_out_ptr);
+        if (valid)
+        {
+            int const access_id = bid * (params.hidden_size / kPackedSize) + (offset / kPackedSize);
+            reinterpret_cast<uint32_t*>(params.quant_out)[access_id] = quant_val;
+        }
     }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
     cudaTriggerProgrammaticLaunchCompletion();
@@ -283,9 +312,7 @@ __global__ void rmsNormFp4QuantKernel(RmsNormFp4QuantParams params, void* quant_
 }
 
 template <typename T, bool OutNorm = false>
-void launchRmsNormFp4QuantKernel(RmsNormFp4QuantParams& params, void* quant_out, void* scale_out, void* norm_out_ptr,
-    float const* scale_factor_ptr, ::tensorrt_llm::QuantizationSFLayout sf_layout, cudaStream_t stream,
-    int input_row_stride = 0)
+void launchRmsNormFp4QuantKernel(RmsNormFp4QuantParams const& params, cudaStream_t stream)
 {
     static constexpr int kPackedSize = kBytesPerAccess / sizeof(T);
     TLLM_CHECK(params.hidden_size % kPackedSize == 0);
@@ -310,8 +337,7 @@ void launchRmsNormFp4QuantKernel(RmsNormFp4QuantParams& params, void* quant_out,
     {                                                                                                                  \
         tensorrt_llm::common::launchWithPdlWhenEnabled("rmsNormFp4Quant",                                              \
             rmsNormFp4QuantKernel<T, BIAS, RESIDUAL, AFFINE, SMEM, OutNorm>, dim3(cta_num), dim3(cta_size),            \
-            static_cast<size_t>(smem_size), stream, params, quant_out, scale_out, norm_out_ptr, scale_factor_ptr,      \
-            sf_layout, input_row_stride);                                                                              \
+            static_cast<size_t>(smem_size), stream, params);                                                           \
     }
 
     auto launch = [&]()
@@ -363,9 +389,7 @@ void launchRmsNormFp4QuantKernel(RmsNormFp4QuantParams& params, void* quant_out,
 
 } // namespace rms_norm_fp4_quant
 
-void residualRmsNormFp4Quant(RmsNormFp4QuantParams& params, void* quant_out, void* scale_out, void* norm_out_ptr,
-    float const* scale_factor_ptr, ::tensorrt_llm::QuantizationSFLayout sf_layout, nvinfer1::DataType dataType,
-    cudaStream_t stream, int input_row_stride)
+void residualRmsNormFp4Quant(RmsNormFp4QuantParams const& params, nvinfer1::DataType dataType, cudaStream_t stream)
 {
     // The NVFP4 epilogue (cvt_warp_fp16_to_fp4) is compiled only for
     // __CUDA_ARCH__ >= 1000 and emits zeros otherwise, so this kernel is correct
@@ -377,21 +401,21 @@ void residualRmsNormFp4Quant(RmsNormFp4QuantParams& params, void* quant_out, voi
         "residualRmsNormFp4Quant requires SM 10.x (Blackwell); got SM %d. The fused NVFP4 epilogue is unsupported on "
         "this arch.",
         sm);
+    TLLM_CHECK_WITH_INFO(params.quant_out != nullptr && params.scale_out != nullptr,
+        "residualRmsNormFp4Quant requires quant_out and scale_out output buffers.");
     sync_check_cuda_error(stream);
-    bool const out_norm = (norm_out_ptr != nullptr);
+    bool const out_norm = (params.norm_out != nullptr);
     if (out_norm)
     {
         switch (dataType)
         {
 #ifdef ENABLE_BF16
         case nvinfer1::DataType::kBF16:
-            rms_norm_fp4_quant::launchRmsNormFp4QuantKernel<__nv_bfloat16, /*OutNorm=*/true>(
-                params, quant_out, scale_out, norm_out_ptr, scale_factor_ptr, sf_layout, stream, input_row_stride);
+            rms_norm_fp4_quant::launchRmsNormFp4QuantKernel<__nv_bfloat16, /*OutNorm=*/true>(params, stream);
             break;
 #endif
         case nvinfer1::DataType::kHALF:
-            rms_norm_fp4_quant::launchRmsNormFp4QuantKernel<half, /*OutNorm=*/true>(
-                params, quant_out, scale_out, norm_out_ptr, scale_factor_ptr, sf_layout, stream, input_row_stride);
+            rms_norm_fp4_quant::launchRmsNormFp4QuantKernel<half, /*OutNorm=*/true>(params, stream);
             break;
         default: TLLM_THROW("Unsupported dataType for residualRmsNormFp4Quant");
         }
@@ -402,13 +426,11 @@ void residualRmsNormFp4Quant(RmsNormFp4QuantParams& params, void* quant_out, voi
         {
 #ifdef ENABLE_BF16
         case nvinfer1::DataType::kBF16:
-            rms_norm_fp4_quant::launchRmsNormFp4QuantKernel<__nv_bfloat16, /*OutNorm=*/false>(
-                params, quant_out, scale_out, nullptr, scale_factor_ptr, sf_layout, stream, input_row_stride);
+            rms_norm_fp4_quant::launchRmsNormFp4QuantKernel<__nv_bfloat16, /*OutNorm=*/false>(params, stream);
             break;
 #endif
         case nvinfer1::DataType::kHALF:
-            rms_norm_fp4_quant::launchRmsNormFp4QuantKernel<half, /*OutNorm=*/false>(
-                params, quant_out, scale_out, nullptr, scale_factor_ptr, sf_layout, stream, input_row_stride);
+            rms_norm_fp4_quant::launchRmsNormFp4QuantKernel<half, /*OutNorm=*/false>(params, stream);
             break;
         default: TLLM_THROW("Unsupported dataType for residualRmsNormFp4Quant");
         }
