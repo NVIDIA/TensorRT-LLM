@@ -25,7 +25,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.linear import Linear, NVFP4SVDLinearMethod
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
@@ -945,13 +945,34 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         # model-vs-checkpoint key check. Exempt only their known non-serialized
         # parameters while retaining strict validation for real Qwen weights.
         missing = sorted((expected - provided) - self._non_serialized_quant_parameter_names())
-        unexpected = sorted(provided - expected)
+        # SVDQuant LoRA factors + pre_quant_scale are loaded by the quant method
+        # (not module params at this point), so they are not "unexpected".
+        unexpected = sorted(
+            k
+            for k in (provided - expected)
+            if not k.endswith(NVFP4SVDLinearMethod.PROVIDED_CKPT_SUFFIXES)
+        )
         # Dynamic quantization creates scale parameters while loading Linear
         # modules, so those keys are expected to be absent from BF16 checkpoints.
         if missing and not self.model_config.dynamic_weight_quant:
             raise RuntimeError(f"Missing keys when loading transformer: {missing[:5]}...")
         if unexpected:
             raise RuntimeError(f"Unexpected keys when loading transformer: {unexpected[:5]}...")
+
+        # SVDQuant: the residual loaded above is plain NVFP4; swap in the method
+        # that also loads + applies the rank-r BF16 LoRA correction. Detected by
+        # the presence of LoRA factors in the checkpoint (config maps
+        # NVFP4_SVD -> NVFP4 so the residual uses the NVFP4 path).
+        if any(k.endswith(".svdquant_lora_a") for k in provided):
+            for _, module in self.named_modules():
+                if (
+                    isinstance(module, Linear)
+                    and module.quant_config is not None
+                    and module.quant_config.quant_algo is not None
+                ):
+                    module.quant_method = NVFP4SVDLinearMethod()
+                    module.svdquant_lora_a = None
+                    module.svdquant_lora_b = None
 
         loader = DynamicLinearWeightLoader(self.model_config)
         for name, module in self.named_modules():
