@@ -56,6 +56,16 @@ class CuteDslMlaFmha(PhasedFmha):
         if not attn.is_mla_enable:
             logger.debug("CuTe DSL MLA FMHA is unavailable: only MLA is supported.")
             return False
+        # Sparse attention (DSA / RocketKV / skip-softmax): the CuTe DSL kernel
+        # computes dense attention over the full paged KV and cannot honor
+        # predicted sparse indices; accepting such a layer would silently drop
+        # them and produce wrong results.
+        if getattr(attn, "sparse_params", None) is not None:
+            logger.debug(
+                "CuTe DSL MLA FMHA is unavailable: sparse attention "
+                f"({type(attn.sparse_params).__name__}) is not supported."
+            )
+            return False
         if attn.predicted_tokens_per_seq is None or attn.predicted_tokens_per_seq < 1:
             logger.debug(
                 "CuTe DSL MLA FMHA is unavailable: predicted_tokens_per_seq "
@@ -235,6 +245,18 @@ class CuteDslMlaFmha(PhasedFmha):
             return False, "CuTe DSL MLA FMHA only supports decode-only batches."
         if meta.beam_width != 1:
             return False, f"Beam search is not supported, got beam_width={meta.beam_width}."
+        # The kernel is dense-only, so any sparse layer or predicted sparse/topk
+        # indices must fall back to a library that consumes them.
+        sparse_kv_indices = fwd.sparse_prediction.sparse_kv_indices
+        sparse_attn_indices = fwd.sparse_prediction.sparse_attn_indices
+        if (
+            (sparse_kv_indices is not None and sparse_kv_indices.numel() > 0)
+            or (sparse_attn_indices is not None and sparse_attn_indices.numel() > 0)
+            or (fwd.topk_indices is not None and fwd.topk_indices.numel() > 0)
+            or meta.num_sparse_topk > 0
+            or attn.sparse_params is not None
+        ):
+            return False, "CuTe DSL MLA FMHA does not support sparse attention."
         # Linear-chain MTP / spec-decode (seq_len_q > 1) IS supported: the
         # kernel applies the implicit causal mask (q token t attends to KV
         # [0, K - (seq_len_q - 1) + t)). Tree / dynamic-tree spec-decode carries
