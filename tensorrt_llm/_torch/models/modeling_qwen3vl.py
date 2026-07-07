@@ -1306,6 +1306,19 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
     def vocab_size_padded(self) -> int:
         return self.llm.vocab_size_padded
 
+    # Forward spec-dec attrs to the inner causal LM (``self.llm``): this wrapper
+    # is not a spec-dec model but is the outer model those paths look them up on.
+    @property
+    def draft_config(self):
+        return getattr(self.llm, "draft_config", None)
+
+    @property
+    def draft_model(self):
+        return getattr(self.llm, "draft_model", None)
+
+    def load_draft_weights(self, *args, **kwargs):
+        return self.llm.load_draft_weights(*args, **kwargs)
+
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
 
