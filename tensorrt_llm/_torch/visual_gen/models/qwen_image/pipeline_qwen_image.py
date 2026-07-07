@@ -34,7 +34,6 @@ _PROMPT_TEMPLATE = (
 )
 _PROMPT_TEMPLATE_START_IDX = 34  # tokens to drop before the user prompt
 
-
 def _calculate_shift(
     image_seq_len: int,
     base_seq_len: int = 256,
@@ -50,7 +49,6 @@ def _calculate_shift(
     b = base_shift - m * base_seq_len
     return image_seq_len * m + b
 
-
 _DEFAULT_GENERATION_PARAMS = {
     "height": 1328,
     "width": 1328,
@@ -58,7 +56,6 @@ _DEFAULT_GENERATION_PARAMS = {
     "guidance_scale": 4.0,
     "max_sequence_length": 1024,
 }
-
 
 @register_pipeline("QwenImagePipeline")
 class QwenImagePipeline(BasePipeline):
@@ -532,3 +529,4 @@ class QwenImagePipeline(BasePipeline):
 
         timer.mark_end()
         return timer.fill(PipelineOutput(image=image))
+
