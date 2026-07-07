@@ -148,3 +148,46 @@ TEST(BounceTransport, MaxChunkBytesClampedToUsableArena)
     B->tx->shutdown();
     bounce_test::freeXferBufs(bufs);
 }
+
+// Sender-side arena backpressure: the receiver's arena/window is generous (grants every chunk's
+// credit up front) but the SENDER's arena only fits a few concurrent gather regions, so most
+// credits get parked in pendingCredits and drain via drainPendingPosts as ACKs free regions. The
+// transfer must still complete byte-exact (parked != dropped). This is also the path the
+// `arenaStarved` NVTX span instruments.
+TEST(BounceTransport, SenderArenaBackpressureParksCredits)
+{
+    if (!bounce_test::hasCuda())
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    b::BounceConfig small; // sender: 64KiB usable -> at most 4 in-flight 16KiB gather regions
+    small.maxChunkBytes = 16 * 1024;
+    small.minBlock = 256;
+    small.windowDepth = 8;
+    small.window = 8;
+    small.scatterWorkers = 2;
+    small.arenaBytes = 64 * 1024;
+    b::BounceConfig big = small; // receiver: room to grant the full 8-credit window at once
+    big.arenaBytes = 1ULL << 20;
+    std::size_t const maxDescs = std::max<std::size_t>(1024ULL, small.maxChunkBytes / 256ULL);
+
+    auto A = bounce_test::makeNode("btParkA", small, maxDescs);
+    auto B = bounce_test::makeNode("btParkB", big, maxDescs);
+    if (!A || !B)
+    {
+        GTEST_SKIP() << "NIXL agent/backend unavailable";
+    }
+    bounce_test::wirePair(*A, *B);
+
+    // 32 x 4KiB = 128KiB in ~8 chunks of 16KiB: double the sender's usable arena, so at least half
+    // the granted credits must park and retry.
+    auto bufs = bounce_test::makeXferBufs(/*nDescs=*/32, /*descBytes=*/4096, /*seed=*/11);
+    auto fut = A->tx->submit(bufs.srcDescs, bufs.dstDescs, B->name);
+    ASSERT_EQ(fut.wait_for(std::chrono::seconds(30)), std::future_status::ready) << "transfer hung";
+    EXPECT_EQ(fut.get(), kvc::TransferState::kSUCCESS);
+    EXPECT_TRUE(bounce_test::verifyXferBufs(bufs)) << "byte mismatch";
+
+    A->tx->shutdown();
+    B->tx->shutdown();
+    bounce_test::freeXferBufs(bufs);
+}
