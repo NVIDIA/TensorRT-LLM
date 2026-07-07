@@ -1,38 +1,36 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in background prefetch of the NEXT test's session and model page cache.
+"""Background prefetch of the NEXT test's MPI session — zero test changes.
 
-Multi-GPU LLM-API tests pay ~50-65s per test to spawn an MPI pool whose
-workers import ``tensorrt_llm``, plus a cold read of the model weights. Both
-are pure CPU/IO work, so while the CURRENT test is running on the GPUs the
-next test's pool can be spawned and its weight files pre-read in background
-threads — hiding those costs behind the previous test's runtime. Prefetched
-workers run no kernels and allocate nothing before handover; depending on
-the library version, importing tensorrt_llm may leave an idle CUDA context
-(~a few hundred MB), which safely coexists with the running test.
+Multi-GPU LLM-API tests pay ~50-65s per bare ``LLM(...)`` to spawn an MPI
+pool whose workers import ``tensorrt_llm``. That is pure CPU/IO work, so
+while the CURRENT test runs on the GPUs a spare pool for the next test can
+be spawned in a background thread — hiding the spawn cost behind the
+previous test's runtime. Prefetched workers run no kernels and allocate
+nothing before handover; depending on the library version, importing
+tensorrt_llm may leave an idle CUDA context (~a few hundred MB), which
+safely coexists with the running test.
 
-Enabled by default; set ``TRTLLM_TEST_PREFETCH_SESSION=0`` to disable. With
-no test declaring a spec/model marker the prefetcher never fires, so plain
-suites are unaffected either way.
-
-Wiring (see tests/unittest/llmapi/conftest.py):
-- ``pytest_collection_modifyitems`` -> ``PREFETCHER.on_collection(items)``
-- ``pytest_runtest_setup``          -> ``PREFETCHER.on_test_setup(item)``
-- session-scoped fixtures call ``PREFETCHER.take(n_workers)`` and fall back
-  to building synchronously when it returns ``None``.
-
-Tests declare their session spec with ``@pytest.mark.prefetch_session(N)``
-(or a class attribute ``n_gpus``). Consecutive tests with the SAME spec are
-assumed to share one session (that is what makes the fixture reuse safe), so
-prefetch only fires at a spec boundary.
+Mechanism (wired by ``tests/test_common/session_prefetcher_hooks.py``,
+loaded from each test tree's top-level conftest): ``pytest_runtest_setup``
+lazily patches the library seams that construct ``MpiPoolSession`` for a
+bare ``LLM(...)`` with a factory that (a) hands over the prefetched pool
+when its size and spawn-time env/sys.path still match, and (b) re-arms a
+spare pool of the same size for the next test. A miss falls back to the
+normal synchronous spawn, so a wrong prefetch can only cost time, never
+correctness.
 
 Weight page-cache warming (opt-in per test): mark tests with
 ``@pytest.mark.prefetch_model_dir("/path/to/model")``; when the NEXT test's
-model differs from the current one, its weight files are read in a background
-thread so the kernel page cache is hot by the time that test loads weights.
-This fires even between tests that share a session (pool reuse does not
-cover model IO). Page cache is reclaimable memory, so warming cannot OOM the
+declared model differs from the current one, its weight files are read in a
+background thread so the kernel page cache is hot by the time that test
+loads weights. This complements pool prefetch (pool reuse does not cover
+model IO). Page cache is reclaimable memory, so warming cannot OOM the
 host; a wasted warm (test skipped or reordered) costs only IO bandwidth.
+
+Enabled by default; set ``TRTLLM_TEST_PREFETCH_SESSION=0`` to disable.
+Suites that never import tensorrt_llm's executor modules pay nothing —
+not even the tensorrt_llm import.
 """
 
 import glob
@@ -41,17 +39,17 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from typing import NamedTuple
 
 # The only places in the library that construct MpiPoolSession for a bare
 # LLM(...); tests passing their own _mpi_session never reach these lines.
+# test_patch_targets_cover_all_library_construction_sites keeps this list
+# honest against new construction sites appearing in the library.
 _PATCH_TARGETS = (
     "tensorrt_llm.executor.proxy",
     "tensorrt_llm.executor.rpc_proxy",
     "tensorrt_llm.llmapi.llm",
 )
-
-_WEIGHT_GLOBS = ("*.safetensors", "*.bin")
-_READ_CHUNK = 64 << 20  # 64MB
 
 # MpiPoolSession workers freeze their environment AND sys.path at spawn time
 # (they inherit the whole parent env at MPI spawn, plus MPIPoolExecutor's
@@ -85,18 +83,47 @@ def _spawn_snapshot():
     )
 
 
-def _spec_of(item):
-    """A test item's session spec: ``prefetch_session`` marker or class ``n_gpus``."""
-    marker = item.get_closest_marker("prefetch_session")
-    if marker is not None and marker.args:
-        return marker.args[0]
-    return getattr(getattr(item, "cls", None), "n_gpus", None)
+_WEIGHT_GLOBS = ("*.safetensors", "*.bin")
+_READ_CHUNK = 64 << 20  # 64MB
 
 
 def _model_dir_of(item):
     """A test item's model dir from its ``prefetch_model_dir`` marker, or None."""
     marker = item.get_closest_marker("prefetch_model_dir")
     return marker.args[0] if marker is not None and marker.args else None
+
+
+def warm_page_cache(model_dir: str) -> float:
+    """Read ``model_dir``'s weight files to keep them in the OS page cache.
+
+    The next LLM create then loads the weights from RAM, not disk. Pure file
+    IO — never touches CUDA, safe to run while another test owns the GPUs.
+    Returns the number of GiB read.
+    """
+    files = sorted(f for pat in _WEIGHT_GLOBS for f in glob.glob(os.path.join(model_dir, pat)))
+    t0 = time.monotonic()
+
+    def _read(path):
+        n = 0
+        with open(path, "rb") as fh:
+            while True:
+                chunk = fh.read(_READ_CHUNK)
+                if not chunk:
+                    return n
+                n += len(chunk)
+
+    # thread_name_prefix keeps the IO workers inside the pytest.ini
+    # threadleak_exclude pattern (session-prefetch-\w+): a large warm can
+    # legitimately still be reading during the next test's threadleak check.
+    with ThreadPoolExecutor(max_workers=4, thread_name_prefix="session-prefetch-io") as ex:
+        total = sum(ex.map(_read, files))
+    gib = total / (1 << 30)
+    print(
+        f"[session-prefetch] warmed page cache: {gib:.1f} GiB from "
+        f"{model_dir} in {time.monotonic() - t0:.1f}s",
+        flush=True,
+    )
+    return gib
 
 
 def _worker_import_report_cuda() -> bool:
@@ -121,18 +148,36 @@ _SETTLE_EPSILON = 256 << 20  # free-memory delta below this counts as flat
 _SETTLE_TIMEOUT_S = 30.0
 
 
-def _visible_gpu_indices(count: int):
-    """NVML indices of the GPUs this process may touch (CUDA_VISIBLE_DEVICES)."""
+def _visible_gpu_handles(pynvml):
+    """NVML handles of the GPUs this process may touch (CUDA_VISIBLE_DEVICES).
+
+    Handles both the index form ("0,1") and the UUID form ("GPU-..."/"MIG-...")
+    used on shared CI nodes — falling back to all devices there would make the
+    settle barrier poll GPUs owned by other jobs. An explicitly EMPTY value
+    means no GPUs are visible: nothing to wait for.
+    """
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if not visible:
-        return list(range(count))
-    indices = []
+    if visible is not None and not visible.strip():
+        return []
+    count = pynvml.nvmlDeviceGetCount()
+    if visible is None:
+        return [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(count)]
+    handles = []
     for token in visible.split(","):
         token = token.strip()
-        if not token.isdigit() or int(token) >= count:
-            return list(range(count))  # UUID/MIG form: fall back to all GPUs
-        indices.append(int(token))
-    return indices or list(range(count))
+        try:
+            if token.startswith(("GPU-", "MIG-")):
+                handles.append(pynvml.nvmlDeviceGetHandleByUUID(token))
+            else:
+                index = int(token)
+                if index >= count:
+                    raise ValueError(token)
+                handles.append(pynvml.nvmlDeviceGetHandleByIndex(index))
+        except Exception:
+            # Unparsable form: fall back to all GPUs (the caller's
+            # flat-detection keeps a too-wide scan bounded).
+            return [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(count)]
+    return handles
 
 
 def wait_gpu_memory_settle(timeout: float = _SETTLE_TIMEOUT_S) -> None:
@@ -144,6 +189,11 @@ def wait_gpu_memory_settle(timeout: float = _SETTLE_TIMEOUT_S) -> None:
     the process actually exits. Building the next model into that race fails
     with "Executor creation failed due to insufficient GPU memory" (CI build
     46175: nemotron_h/nano_v2_vl/qwen3_lora, free 16-19 GiB at model load).
+
+    TODO: the deeper fix is MpiPoolSession.shutdown(wait=True) not returning
+    until the spawned worker processes have exited — that would close the
+    race for every consumer (back-to-back LLM() creations included) and
+    retire this heuristic. Library-behavior change, tracked separately.
 
     Polls NVML (context-free) until every visible GPU is mostly free, or its
     free memory stops increasing (memory legitimately in use — e.g. another
@@ -157,10 +207,9 @@ def wait_gpu_memory_settle(timeout: float = _SETTLE_TIMEOUT_S) -> None:
     except Exception:
         return
     try:
-        handles = [
-            pynvml.nvmlDeviceGetHandleByIndex(i)
-            for i in _visible_gpu_indices(pynvml.nvmlDeviceGetCount())
-        ]
+        handles = _visible_gpu_handles(pynvml)
+        if not handles:
+            return
 
         def _free_total():
             infos = [pynvml.nvmlDeviceGetMemoryInfo(h) for h in handles]
@@ -198,37 +247,12 @@ def wait_gpu_memory_settle(timeout: float = _SETTLE_TIMEOUT_S) -> None:
             pass
 
 
-def warm_page_cache(model_dir: str) -> float:
-    """Read ``model_dir``'s weight files to keep them in the OS page cache.
+class _Built(NamedTuple):
+    """A finished background build: everything published (and consumed) together."""
 
-    The next LLM create then loads the weights from RAM, not disk. Pure file
-    IO — never touches CUDA, safe to run while another test owns the GPUs.
-    Returns the number of GiB read.
-    """
-    files = sorted(f for pat in _WEIGHT_GLOBS for f in glob.glob(os.path.join(model_dir, pat)))
-    t0 = time.monotonic()
-
-    def _read(path):
-        n = 0
-        with open(path, "rb") as fh:
-            while True:
-                chunk = fh.read(_READ_CHUNK)
-                if not chunk:
-                    return n
-                n += len(chunk)
-
-    # thread_name_prefix keeps the IO workers inside the pytest.ini
-    # threadleak_exclude pattern (session-prefetch-\w+): a large warm can
-    # legitimately still be reading during the next test's threadleak check.
-    with ThreadPoolExecutor(max_workers=4, thread_name_prefix="session-prefetch-io") as ex:
-        total = sum(ex.map(_read, files))
-    gib = total / (1 << 30)
-    print(
-        f"[session-prefetch] warmed page cache: {gib:.1f} GiB from "
-        f"{model_dir} in {time.monotonic() - t0:.1f}s",
-        flush=True,
-    )
-    return gib
+    spec: int
+    session: object
+    snapshot: object
 
 
 class SessionPrefetcher:
@@ -236,19 +260,16 @@ class SessionPrefetcher:
         self._lock = threading.Lock()
         self._thread = None
         self._build_gen = 0  # bumped when a pending build is abandoned
-        self._built_spec = None
-        self._built_session = None
-        self._built_snapshot = None
-        self._items = []
-        self._warmed_dirs = set()
+        self._built = None  # Optional[_Built], set only by _publish()
         self._patched = set()
+        self._next_model = {}  # item -> next declared model dir (on_collection)
+        self._warmed_dirs = set()
 
     @property
     def enabled(self) -> bool:
         # Under pytest-xdist every worker sees the FULL collection but runs a
-        # scheduler-assigned subset: collection-order lookahead would prefetch
-        # pools/models for tests that run in other workers, and N workers
-        # would each hold a live pool plus a spare. Disable in xdist workers.
+        # scheduler-assigned subset, and N workers would each hold a live
+        # pool plus a spare. Disable in xdist workers.
         if os.environ.get("PYTEST_XDIST_WORKER"):
             return False
         return os.environ.get("TRTLLM_TEST_PREFETCH_SESSION", "1").lower() in (
@@ -259,65 +280,68 @@ class SessionPrefetcher:
         )
 
     def on_collection(self, items) -> None:
-        if self.enabled:
-            self._items = list(items)
+        """Precompute, per item, the model dir of the NEXT test declaring one.
+
+        One reverse pass, one marker lookup per item — O(n) once. Suites with
+        no ``prefetch_model_dir`` markers keep an empty map, so their
+        ``on_test_setup`` is a single dict lookup. (The naive alternative —
+        scanning the remaining collection at every test setup — costs O(n^2)
+        marker lookups per session, seconds to minutes on large suites.)
+        """
+        if not self.enabled:
+            return
+        next_model, mapping, seen = None, {}, False
+        for item in reversed(items):
+            mapping[item] = next_model
+            model = _model_dir_of(item)
+            if model is not None:
+                next_model, seen = model, True
+        if seen:
+            self._next_model = mapping
 
     def on_test_setup(self, item) -> None:
-        """Prefetch the next block's pool / next model's weights.
+        """Warm the NEXT test's model weights while this test runs.
 
-        If ``item`` is the last test of its session block, start building the
-        next block's pool in a background thread. Independently, if the next
-        test declaring a model uses a DIFFERENT model than ``item``, start
-        warming that model's page cache.
+        Fires when the next declared model differs from the current one —
+        including between tests that share a pool (pool prefetch does not
+        cover model IO).
         """
-        if not self.enabled or not self._items:
-            return
-        try:
-            idx = self._items.index(item)
-        except ValueError:
-            return
-
-        # Model-weight warming: independent of the pool trigger, so it also
-        # fires between tests that share a session but switch models.
-        cur_model = _model_dir_of(item)
-        nxt_model = next(
-            (_model_dir_of(it) for it in self._items[idx + 1 :] if _model_dir_of(it) is not None),
-            None,
-        )
-        if nxt_model and nxt_model != cur_model:
-            with self._lock:
-                start_warm = nxt_model not in self._warmed_dirs
-                self._warmed_dirs.add(nxt_model)
-            if start_warm:
-                threading.Thread(
-                    target=self._warm,
-                    args=(nxt_model,),
-                    daemon=True,
-                    name="session-prefetch-warm",
-                ).start()
-
-        cur = _spec_of(item)
-        nxt = next(
-            (_spec_of(it) for it in self._items[idx + 1 :] if _spec_of(it) is not None), None
-        )
-        if nxt is None or nxt == cur:
+        nxt = self._next_model.get(item)
+        if not nxt or nxt == _model_dir_of(item):
             return
         with self._lock:
-            if self._thread is not None or self._built_spec == nxt:
-                return  # already building / built
-            self._thread = threading.Thread(
-                target=self._build,
-                args=(nxt, self._build_gen),
-                daemon=True,
-                name="session-prefetch-build",
-            )
-            self._thread.start()
+            if nxt in self._warmed_dirs:
+                return  # already warmed (or being warmed) this session
+            self._warmed_dirs.add(nxt)
+        threading.Thread(
+            target=self._warm, args=(nxt,), daemon=True, name="session-prefetch-warm"
+        ).start()
 
     def _warm(self, model_dir: str) -> None:
         try:
             warm_page_cache(model_dir)
         except Exception as e:  # warming must never break the tests
             print(f"[session-prefetch] page-cache warm failed (harmless): {e}", flush=True)
+
+    def schedule_shadow(self, spec: int) -> None:
+        """Start building a spare ``spec``-worker pool in the background.
+
+        Heuristic: the next test most likely needs a pool of the same size as
+        the current one. A miss is discarded at ``take()`` and the sync build
+        is no slower than without prefetch.
+        """
+        if not self.enabled or spec < 1:
+            return
+        with self._lock:
+            if self._thread is not None or (self._built is not None and self._built.spec == spec):
+                return  # already building / built
+            self._thread = threading.Thread(
+                target=self._build,
+                args=(spec, self._build_gen),
+                daemon=True,
+                name="session-prefetch-build",
+            )
+            self._thread.start()
 
     def _build(self, spec: int, gen: int) -> None:
         try:
@@ -329,8 +353,7 @@ class SessionPrefetcher:
 
             snapshot = _spawn_snapshot()  # workers freeze env+sys.path at spawn
             session = MpiPoolSession(n_workers=spec)
-            cuda_state = session.submit_sync(_worker_import_report_cuda)
-            if any(cuda_state) if isinstance(cuda_state, (list, tuple)) else cuda_state:
+            if any(session.submit_sync(_worker_import_report_cuda)):
                 print(
                     "[session-prefetch] note: tensorrt_llm import initialized an idle "
                     "CUDA context in the prefetched workers (library version behavior)",
@@ -346,25 +369,21 @@ class SessionPrefetcher:
     def _publish(self, spec, session, snapshot, gen: int) -> None:
         """Publish a finished background build, unless it was abandoned.
 
-        ``take()``/``dispose()`` bump ``_build_gen`` when a build outlives its
-        join timeout; such a late build must shut its pool down instead of
+        ``_drain()`` bumps ``_build_gen`` when a build outlives its join
+        timeout; such a late build must shut its pool down instead of
         publishing (a late publish would overwrite — and leak — a newer pool,
         or hand a stale pool to a future test). The empty-slot check likewise
         prevents overwriting an unconsumed pool.
         """
         with self._lock:
-            if gen == self._build_gen and self._built_session is None:
-                self._built_spec = spec
-                self._built_session = session
-                self._built_snapshot = snapshot
+            if gen == self._build_gen and self._built is None:
+                self._built = _Built(spec, session, snapshot)
                 return
         print("[session-prefetch] discarding abandoned background build", flush=True)
         session.shutdown()
 
-    def take(self, spec: int):
-        """Return a prefetched session for ``spec``, or None to build sync."""
-        if not self.enabled:
-            return None
+    def _drain(self, timeout: float):
+        """Join a pending build (abandoning it on timeout) and pop the slot."""
         # Read _thread under the lock: schedule_shadow() assigns-then-starts
         # inside its critical section, and an unlocked read here can observe
         # the assigned-but-not-yet-started thread ("cannot join thread before
@@ -372,59 +391,39 @@ class SessionPrefetcher:
         with self._lock:
             thread = self._thread
         if thread is not None:
-            # Slowest legitimate build measured is ~117s (busy node); 180s
-            # gives 1.5x margin. On a genuine hang we give up and fall back
-            # to a synchronous build instead of stalling the suite.
-            thread.join(timeout=180)
-        session = None
+            thread.join(timeout=timeout)
         with self._lock:
             if thread is not None and thread.is_alive():
                 # Abandon the overdue build: bump the generation so its late
                 # _publish() shuts the pool down instead of landing.
                 self._build_gen += 1
             self._thread = None
-            if (
-                self._built_spec == spec
-                and self._built_session is not None
-                and self._built_snapshot == _spawn_snapshot()
-            ):
-                session, self._built_session, self._built_spec = (self._built_session, None, None)
-            # Spec/env/sys.path mismatch (test skipped, reordered, or changed
-            # state the frozen workers would not see): discard, build sync.
-            elif self._built_session is not None:
-                stale, self._built_session, self._built_spec = (self._built_session, None, None)
-                threading.Thread(
-                    target=stale.shutdown, daemon=True, name="session-prefetch-discard"
-                ).start()
-        if session is not None:
+            built, self._built = self._built, None
+        return built
+
+    def take(self, spec: int):
+        """Return a prefetched session for ``spec``, or None to build sync."""
+        if not self.enabled:
+            return None
+        # Slowest legitimate build measured is ~117s (busy node); 180s gives
+        # 1.5x margin. On a genuine hang we give up and fall back to a
+        # synchronous build instead of stalling the suite.
+        built = self._drain(timeout=180)
+        if built is None:
+            return None
+        if built.spec == spec and built.snapshot == _spawn_snapshot():
             # An instant handover skips the ~50s synchronous spawn that used
             # to give the PREVIOUS LLM's worker time to exit and release its
             # GPU memory; don't start the next model build into that race.
             wait_gpu_memory_settle()
             print(f"[session-prefetch] handing over prefetched {spec}-worker pool", flush=True)
-        return session
-
-    # ---- shadow mode: zero-test-change prefetch at the pool-creation seam ----
-
-    def schedule_shadow(self, spec: int) -> None:
-        """Start building a spare ``spec``-worker pool in the background.
-
-        Heuristic: the next test most likely needs a pool of the same size as
-        the current one. A miss is discarded at ``take()`` and the sync build
-        is no slower than without prefetch.
-        """
-        if not self.enabled or spec < 1:
-            return
-        with self._lock:
-            if self._thread is not None or self._built_spec == spec:
-                return  # already building / built
-            self._thread = threading.Thread(
-                target=self._build,
-                args=(spec, self._build_gen),
-                daemon=True,
-                name="session-prefetch-build",
-            )
-            self._thread.start()
+            return built.session
+        # Spec/env/sys.path mismatch (test skipped, reordered, or changed
+        # state the frozen workers would not see): discard, build sync.
+        threading.Thread(
+            target=built.session.shutdown, daemon=True, name="session-prefetch-discard"
+        ).start()
+        return None
 
     def _make_factory(self, real_cls):
         """A drop-in for ``MpiPoolSession`` that consumes and re-arms the shadow."""
@@ -453,6 +452,8 @@ class SessionPrefetcher:
         """
         if not self.enabled:
             return
+        if len(self._patched) == len(_PATCH_TARGETS):
+            return  # everything already patched: per-test fast path
         pending = [n for n in _PATCH_TARGETS if n in sys.modules and n not in self._patched]
         if not pending:
             return
@@ -467,17 +468,9 @@ class SessionPrefetcher:
 
     def dispose(self) -> None:
         """Shut down any unconsumed shadow pool (end-of-session cleanup)."""
-        with self._lock:  # same assigned-but-unstarted hazard as take()
-            thread = self._thread
-        if thread is not None:
-            thread.join(timeout=60)
-        with self._lock:
-            if thread is not None and thread.is_alive():
-                self._build_gen += 1  # abandon: late publish must not land
-            self._thread = None
-            stale, self._built_session, self._built_spec = (self._built_session, None, None)
-        if stale is not None:
-            stale.shutdown()
+        built = self._drain(timeout=60)
+        if built is not None:
+            built.session.shutdown()
 
 
 PREFETCHER = SessionPrefetcher()

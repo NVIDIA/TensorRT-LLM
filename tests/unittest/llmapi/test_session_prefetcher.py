@@ -13,15 +13,11 @@ class _FakeMarker:
 
 
 class _FakeItem:
-    def __init__(self, spec=None, model_dir=None):
-        self._markers = {}
-        if spec is not None:
-            self._markers["prefetch_session"] = _FakeMarker(spec)
-        if model_dir is not None:
-            self._markers["prefetch_model_dir"] = _FakeMarker(model_dir)
+    def __init__(self, model_dir=None):
+        self._marker = _FakeMarker(model_dir) if model_dir else None
 
     def get_closest_marker(self, name):
-        return self._markers.get(name)
+        return self._marker if name == "prefetch_model_dir" else None
 
 
 @pytest.fixture
@@ -31,7 +27,7 @@ def prefetcher(monkeypatch):
     # marker off so the prefetcher's xdist guard does not disable it here.
     monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
     p = SessionPrefetcher()
-    # Record trigger calls instead of spawning MPI pools / reading weights.
+    # Record build/warm triggers instead of spawning MPI pools/reading weights.
     built, warmed = [], []
     monkeypatch.setattr(SessionPrefetcher, "_build", lambda self, spec, gen: built.append(spec))
     monkeypatch.setattr(SessionPrefetcher, "_warm", lambda self, d: warmed.append(d))
@@ -39,80 +35,6 @@ def prefetcher(monkeypatch):
     monkeypatch.setattr(session_prefetcher, "wait_gpu_memory_settle", lambda: None)
     p.built, p.warmed = built, warmed
     return p
-
-
-def _run_setup_and_join(p, item):
-    p.on_test_setup(item)
-    for attr in ("_thread",):
-        th = getattr(p, attr)
-        if th is not None:
-            th.join(timeout=10)
-
-
-def test_enabled_by_default(monkeypatch):
-    monkeypatch.delenv("TRTLLM_TEST_PREFETCH_SESSION", raising=False)
-    monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
-    assert SessionPrefetcher().enabled
-
-
-def test_disabled_is_noop(monkeypatch):
-    monkeypatch.setenv("TRTLLM_TEST_PREFETCH_SESSION", "0")
-    p = SessionPrefetcher()
-    p.on_collection([_FakeItem(spec=2)])
-    assert p._items == []
-    assert p.take(2) is None
-
-
-def test_same_spec_does_not_build(prefetcher):
-    items = [_FakeItem(spec=2), _FakeItem(spec=2)]
-    prefetcher.on_collection(items)
-    _run_setup_and_join(prefetcher, items[0])
-    assert prefetcher.built == []
-
-
-def test_spec_boundary_builds_next(prefetcher):
-    items = [_FakeItem(spec=2), _FakeItem(spec=2), _FakeItem(spec=4)]
-    prefetcher.on_collection(items)
-    _run_setup_and_join(prefetcher, items[0])  # next spec == 2 -> no-op
-    assert prefetcher.built == []
-    _run_setup_and_join(prefetcher, items[1])  # next spec == 4 -> build
-    assert prefetcher.built == [4]
-
-
-def test_model_switch_triggers_warm_even_within_block(prefetcher):
-    items = [
-        _FakeItem(spec=2, model_dir="/models/a"),
-        _FakeItem(spec=2, model_dir="/models/b"),
-    ]
-    prefetcher.on_collection(items)
-    prefetcher.on_test_setup(items[0])
-    # Warm threads are fire-and-forget; poll briefly for the recorded call.
-    import time
-
-    for _ in range(100):
-        if prefetcher.warmed:
-            break
-        time.sleep(0.05)
-    assert prefetcher.warmed == ["/models/b"]
-    # Same next-model again: deduplicated.
-    prefetcher.on_test_setup(items[0])
-    time.sleep(0.2)
-    assert prefetcher.warmed == ["/models/b"]
-
-
-def test_take_spec_mismatch_returns_none(prefetcher):
-    prefetcher._built_spec = 4
-    prefetcher._built_session = None
-    assert prefetcher.take(2) is None
-
-
-def test_cls_n_gpus_fallback():
-    class _Cls:
-        n_gpus = 8
-
-    item = _FakeItem()
-    item.cls = _Cls
-    assert session_prefetcher._spec_of(item) == 8
 
 
 class _FakePool:
@@ -124,24 +46,34 @@ class _FakePool:
         self.shut = True
 
 
-@pytest.mark.prefetch_session(2)
-def test_fixture_hands_over_prefetched_pool(request, monkeypatch):
-    pool = _FakePool(2)
-    monkeypatch.setattr(session_prefetcher.PREFETCHER, "take", lambda spec: pool)
-    assert request.getfixturevalue("prefetched_mpi_session") is pool
+def _arm(prefetcher, pool, spec=4):
+    """Publish ``pool`` into the shadow slot through the real API."""
+    prefetcher._publish(spec, pool, session_prefetcher._spawn_snapshot(), prefetcher._build_gen)
 
 
-@pytest.mark.prefetch_session(2)
-def test_fixture_falls_back_to_sync_build(request, monkeypatch):
-    import tensorrt_llm.llmapi.mpi_session as mpi_session_mod
-
-    monkeypatch.setattr(session_prefetcher.PREFETCHER, "take", lambda spec: None)
-    monkeypatch.setattr(mpi_session_mod, "MpiPoolSession", _FakePool)
-    session = request.getfixturevalue("prefetched_mpi_session")
-    assert isinstance(session, _FakePool) and session.n_workers == 2
+def test_enabled_by_default(monkeypatch):
+    monkeypatch.delenv("TRTLLM_TEST_PREFETCH_SESSION", raising=False)
+    monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
+    assert SessionPrefetcher().enabled
 
 
-def test_factory_miss_builds_sync_and_arms_shadow(prefetcher, monkeypatch):
+def test_disabled_is_noop(monkeypatch):
+    monkeypatch.setenv("TRTLLM_TEST_PREFETCH_SESSION", "0")
+    p = SessionPrefetcher()
+    p.schedule_shadow(2)
+    assert p._thread is None
+    assert p.take(2) is None
+
+
+def test_disabled_in_xdist_worker(monkeypatch):
+    # Under xdist each worker runs a scheduler-assigned subset; N workers
+    # would each hold a live pool plus a spare.
+    monkeypatch.setenv("TRTLLM_TEST_PREFETCH_SESSION", "1")
+    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw0")
+    assert not SessionPrefetcher().enabled
+
+
+def test_factory_miss_builds_sync_and_arms_shadow(prefetcher):
     # _build is stubbed by the fixture to record specs instead of spawning.
     factory = prefetcher._make_factory(_FakePool)
     session = factory(4)  # nothing prefetched yet -> sync build
@@ -150,25 +82,39 @@ def test_factory_miss_builds_sync_and_arms_shadow(prefetcher, monkeypatch):
     assert prefetcher.built == [4]  # shadow armed for the next test
 
 
-def test_factory_hit_hands_over_shadow(prefetcher, monkeypatch):
+def test_factory_single_worker_also_prefetches(prefetcher):
+    # The default single-GPU path spawns a 1-worker pool too (executor.py ->
+    # proxy.py), paying the same ~50s spawn+import: it must benefit as well.
+    factory = prefetcher._make_factory(_FakePool)
+    session = factory(1)
+    assert isinstance(session, _FakePool)
+    prefetcher._thread.join(timeout=10)
+    assert prefetcher.built == [1]  # shadow armed for the next 1-GPU test
+
+
+def test_factory_hit_hands_over_shadow(prefetcher):
     pool = _FakePool(4)
-    prefetcher._built_spec, prefetcher._built_session = 4, pool
-    prefetcher._built_snapshot = session_prefetcher._spawn_snapshot()
+    _arm(prefetcher, pool, spec=4)
     factory = prefetcher._make_factory(_FakePool)
     assert factory(4) is pool  # prefetched pool handed over
 
 
+def test_take_spec_mismatch_returns_none(prefetcher):
+    pool = _FakePool(4)
+    _arm(prefetcher, pool, spec=4)
+    assert prefetcher.take(2) is None  # wrong size: sync fallback
+
+
 def test_take_discards_on_env_mismatch(prefetcher, monkeypatch):
     pool = _FakePool(4)
-    prefetcher._built_spec, prefetcher._built_session = 4, pool
-    prefetcher._built_snapshot = session_prefetcher._spawn_snapshot()
+    _arm(prefetcher, pool, spec=4)
     monkeypatch.setenv("TLLM_TEST_ONLY_FLAG", "changed-after-spawn")
     assert prefetcher.take(4) is None  # frozen workers would miss the new env
+    import time
+
     for _ in range(100):
         if pool.shut:
             break
-        import time
-
         time.sleep(0.05)
     assert pool.shut  # stale shadow torn down in the background
 
@@ -179,8 +125,7 @@ def test_take_discards_on_nonprefixed_env_mismatch(prefetcher, monkeypatch):
     # model_config.py) must also invalidate a prefetched pool, else workers
     # silently run with stale env (review finding on the prefix allowlist).
     pool = _FakePool(4)
-    prefetcher._built_spec, prefetcher._built_session = 4, pool
-    prefetcher._built_snapshot = session_prefetcher._spawn_snapshot()
+    _arm(prefetcher, pool, spec=4)
     monkeypatch.setenv("OVERRIDE_QUANT_ALGO", "W4A16_MXFP4")
     assert prefetcher.take(4) is None
 
@@ -190,41 +135,9 @@ def test_pytest_current_test_drift_does_not_discard(prefetcher, monkeypatch):
     # invalidate the snapshot or no prefetched pool would ever be handed over.
     monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_a (call)")
     pool = _FakePool(4)
-    prefetcher._built_spec, prefetcher._built_session = 4, pool
-    prefetcher._built_snapshot = session_prefetcher._spawn_snapshot()
+    _arm(prefetcher, pool, spec=4)
     monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_b (setup)")
     assert prefetcher.take(4) is pool
-
-
-def test_disabled_in_xdist_worker(monkeypatch):
-    # Under xdist each worker sees the full collection but runs a subset:
-    # collection-order lookahead would prefetch for other workers' tests and
-    # multiply live pools by the worker count.
-    monkeypatch.setenv("TRTLLM_TEST_PREFETCH_SESSION", "1")
-    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw0")
-    assert not SessionPrefetcher().enabled
-
-
-def test_abandoned_build_publish_discards_pool(prefetcher):
-    # A build that outlives take()'s join timeout is abandoned (generation
-    # bump); its late _publish() must shut the pool down, not land it —
-    # landing would overwrite (and leak) a newer pool or hand stale state
-    # to a future test.
-    pool = _FakePool(4)
-    gen = prefetcher._build_gen
-    prefetcher._build_gen += 1  # what take()/dispose() do on abandonment
-    prefetcher._publish(4, pool, session_prefetcher._spawn_snapshot(), gen)
-    assert pool.shut
-    assert prefetcher._built_session is None
-
-
-def test_publish_never_overwrites_unconsumed_pool(prefetcher):
-    first, second = _FakePool(4), _FakePool(4)
-    snap = session_prefetcher._spawn_snapshot()
-    prefetcher._publish(4, first, snap, prefetcher._build_gen)
-    prefetcher._publish(4, second, snap, prefetcher._build_gen)
-    assert prefetcher._built_session is first  # slot kept
-    assert second.shut and not first.shut  # newcomer discarded, not the slot
 
 
 def test_take_discards_on_syspath_mismatch(prefetcher, monkeypatch):
@@ -233,8 +146,7 @@ def test_take_discards_on_syspath_mismatch(prefetcher, monkeypatch):
     # so a pool spawned earlier can't import the out-of-tree module and dies
     # during initialization. sys.path must be part of the handover guard.
     pool = _FakePool(4)
-    prefetcher._built_spec, prefetcher._built_session = 4, pool
-    prefetcher._built_snapshot = session_prefetcher._spawn_snapshot()
+    _arm(prefetcher, pool, spec=4)
     monkeypatch.syspath_prepend("/oot/example/path")
     assert prefetcher.take(4) is None  # frozen workers would miss the new path
 
@@ -270,26 +182,120 @@ def test_take_does_not_join_unstarted_shadow_thread(prefetcher, monkeypatch):
     assert errors == []
 
 
-def test_factory_single_worker_also_prefetches(prefetcher):
-    # The default single-GPU path spawns a 1-worker pool too (executor.py ->
-    # proxy.py), paying the same ~50s spawn+import: it must benefit as well.
-    factory = prefetcher._make_factory(_FakePool)
-    session = factory(1)
-    assert isinstance(session, _FakePool)
-    prefetcher._thread.join(timeout=10)
-    assert prefetcher.built == [1]  # shadow armed for the next 1-GPU test
+def test_abandoned_build_publish_discards_pool(prefetcher):
+    # A build that outlives _drain()'s join timeout is abandoned (generation
+    # bump); its late _publish() must shut the pool down, not land it —
+    # landing would overwrite (and leak) a newer pool or hand stale state
+    # to a future test.
+    pool = _FakePool(4)
+    gen = prefetcher._build_gen
+    prefetcher._build_gen += 1  # what _drain() does on abandonment
+    prefetcher._publish(4, pool, session_prefetcher._spawn_snapshot(), gen)
+    assert pool.shut
+    assert prefetcher._built is None
+
+
+def test_publish_never_overwrites_unconsumed_pool(prefetcher):
+    first, second = _FakePool(4), _FakePool(4)
+    _arm(prefetcher, first, spec=4)
+    _arm(prefetcher, second, spec=4)
+    assert prefetcher._built.session is first  # slot kept
+    assert second.shut and not first.shut  # newcomer discarded, not the slot
 
 
 def test_handover_waits_for_gpu_settle(prefetcher, monkeypatch):
     # The instant handover must first let the previous test's dying worker
     # release its GPU memory (CI build 46175 OOM class).
     pool = _FakePool(4)
-    prefetcher._built_spec, prefetcher._built_session = 4, pool
-    prefetcher._built_snapshot = session_prefetcher._spawn_snapshot()
+    _arm(prefetcher, pool, spec=4)
     settled = []
     monkeypatch.setattr(session_prefetcher, "wait_gpu_memory_settle", lambda: settled.append(1))
     assert prefetcher.take(4) is pool
     assert settled == [1]
+
+
+def test_model_switch_triggers_warm_and_dedups(prefetcher):
+    items = [_FakeItem("/models/a"), _FakeItem("/models/b")]
+    prefetcher.on_collection(items)
+    prefetcher.on_test_setup(items[0])
+    # Warm threads are fire-and-forget; poll briefly for the recorded call.
+    import time
+
+    for _ in range(100):
+        if prefetcher.warmed:
+            break
+        time.sleep(0.05)
+    assert prefetcher.warmed == ["/models/b"]
+    # Same next-model again: deduplicated.
+    prefetcher.on_test_setup(items[0])
+    time.sleep(0.2)
+    assert prefetcher.warmed == ["/models/b"]
+
+
+def test_same_next_model_does_not_warm(prefetcher):
+    # Consecutive tests on the same model: its weights are already hot.
+    items = [_FakeItem("/models/a"), _FakeItem("/models/a")]
+    prefetcher.on_collection(items)
+    prefetcher.on_test_setup(items[0])
+    import time
+
+    time.sleep(0.2)
+    assert prefetcher.warmed == []
+
+
+def test_no_marker_suite_never_warms(prefetcher):
+    # Suites without prefetch_model_dir markers must stay O(1) per test:
+    # on_collection keeps an empty map (no per-setup collection scans).
+    items = [_FakeItem(), _FakeItem(), _FakeItem()]
+    prefetcher.on_collection(items)
+    assert prefetcher._next_model == {}
+    prefetcher.on_test_setup(items[0])
+    assert prefetcher.warmed == []
+
+
+def test_warm_page_cache_reads_weight_files(tmp_path):
+    payload = b"x" * (1 << 20)
+    (tmp_path / "model-00001.safetensors").write_bytes(payload)
+    (tmp_path / "pytorch_model.bin").write_bytes(payload)
+    (tmp_path / "config.json").write_bytes(b"{}")  # not a weight file
+    gib = warm_page_cache(str(tmp_path))
+    assert gib == pytest.approx(2 / 1024, rel=1e-3)
+
+
+def test_warm_io_thread_names_covered_by_threadleak_exclude():
+    # Both pytest.ini threadleak_exclude lists contain r"session-prefetch-\w+";
+    # the warm executor's thread_name_prefix must keep its IO workers inside
+    # that pattern (a large warm can outlive the test that started it).
+    import re
+
+    assert re.fullmatch(r"session-prefetch-\w+", "session-prefetch-io_0")
+
+
+def test_patch_targets_cover_all_library_construction_sites():
+    # The factory only intercepts the modules listed in _PATCH_TARGETS. If the
+    # library grows another MpiPoolSession(...) construction site, prefetch
+    # would silently stop covering it (armed spare pools would idle next to
+    # directly-constructed ones) — turn that drift into a red test.
+    import re
+    from pathlib import Path
+
+    import tensorrt_llm
+
+    root = Path(tensorrt_llm.__file__).parent
+    # mpi_session.py defines the class (and the MGMN server path, which
+    # legitimately builds its own pool outside the bare-LLM() seams).
+    exempt = {"tensorrt_llm.llmapi.mpi_session"}
+    offenders = []
+    for py in root.rglob("*.py"):
+        if re.search(r"(?<![\w.])MpiPoolSession\(", py.read_text(errors="ignore")):
+            module = "tensorrt_llm." + ".".join(py.relative_to(root).with_suffix("").parts)
+            if module not in session_prefetcher._PATCH_TARGETS and module not in exempt:
+                offenders.append(module)
+    assert not offenders, (
+        f"MpiPoolSession constructed outside _PATCH_TARGETS: {offenders} — "
+        "add the module(s) to _PATCH_TARGETS (or the exempt list above) so "
+        "the prefetch factory keeps covering every bare-LLM() pool spawn"
+    )
 
 
 _GIB = 1 << 30
@@ -321,7 +327,14 @@ def _fake_pynvml(free_sequence, total):
     return mod
 
 
-def test_settle_noop_when_gpu_free(monkeypatch):
+@pytest.fixture
+def no_visible_devices_mask(monkeypatch):
+    # The settle helper resolves CUDA_VISIBLE_DEVICES; pin it unset so the
+    # fake single-GPU pynvml is used as-is.
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+
+
+def test_settle_noop_when_gpu_free(monkeypatch, no_visible_devices_mask):
     import sys as _sys
     import time
 
@@ -333,7 +346,7 @@ def test_settle_noop_when_gpu_free(monkeypatch):
     assert fake.calls["n"] == 1
 
 
-def test_settle_waits_for_previous_worker_release(monkeypatch):
+def test_settle_waits_for_previous_worker_release(monkeypatch, no_visible_devices_mask):
     import sys as _sys
 
     # Free memory rising as the previous worker exits: 17 -> 40 -> 75 GiB.
@@ -344,7 +357,7 @@ def test_settle_waits_for_previous_worker_release(monkeypatch):
     assert fake.calls["n"] == 3  # polled until the release completed
 
 
-def test_settle_gives_up_when_memory_stays_in_use(monkeypatch):
+def test_settle_gives_up_when_memory_stays_in_use(monkeypatch, no_visible_devices_mask):
     import sys as _sys
     import time
 
@@ -354,6 +367,18 @@ def test_settle_gives_up_when_memory_stays_in_use(monkeypatch):
     t0 = time.monotonic()
     session_prefetcher.wait_gpu_memory_settle(timeout=5)
     assert time.monotonic() - t0 < 1.0  # flat-detection, not the full timeout
+
+
+def test_settle_skips_when_no_gpus_visible(monkeypatch):
+    import sys as _sys
+
+    # CUDA_VISIBLE_DEVICES="" means NO GPUs are visible to this process:
+    # nothing to wait for (and no polling of other jobs' GPUs).
+    fake = _fake_pynvml([17 * _GIB], 80 * _GIB)
+    monkeypatch.setitem(_sys.modules, "pynvml", fake)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    session_prefetcher.wait_gpu_memory_settle()
+    assert fake.calls["n"] == 0  # no memory queries at all
 
 
 def test_settle_without_pynvml_is_noop(monkeypatch):
@@ -370,21 +395,3 @@ def test_settle_without_pynvml_is_noop(monkeypatch):
 
     monkeypatch.setattr(builtins, "__import__", _no_pynvml)
     session_prefetcher.wait_gpu_memory_settle()  # must not raise
-
-
-def test_warm_io_thread_names_covered_by_threadleak_exclude():
-    # Both pytest.ini threadleak_exclude lists contain r"session-prefetch-\w+";
-    # the warm executor's thread_name_prefix must keep its IO workers inside
-    # that pattern (a large warm can outlive the test that started it).
-    import re
-
-    assert re.fullmatch(r"session-prefetch-\w+", "session-prefetch-io_0")
-
-
-def test_warm_page_cache_reads_weight_files(tmp_path):
-    payload = b"x" * (1 << 20)
-    (tmp_path / "model-00001.safetensors").write_bytes(payload)
-    (tmp_path / "pytorch_model.bin").write_bytes(payload)
-    (tmp_path / "config.json").write_bytes(b"{}")  # not a weight file
-    gib = warm_page_cache(str(tmp_path))
-    assert gib == pytest.approx(2 / 1024, rel=1e-3)
