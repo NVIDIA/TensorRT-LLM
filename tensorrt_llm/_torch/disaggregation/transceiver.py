@@ -173,11 +173,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def __exit__(self, _exc_type, _exc_val, _exc_tb):
         self.shutdown()
 
-    def _create_kv_slice(
-        self,
-        req: LlmRequest,
-        is_last_slice: bool = True,
-    ) -> KVSlice:
+    def _create_kv_slice(self, req: LlmRequest) -> KVSlice:
         adapter = self._reuse_adapter
         tpb = adapter.tokens_per_block
         assert self._page_table is not None
@@ -242,7 +238,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             mamba_state_index = self._kv_cache_manager.mamba_cache_index[req.py_request_id]
 
         return KVSlice(
-            is_last_slice=is_last_slice,
+            is_last_slice=True,
             block_ids_per_layer_groups=groups,
             mamba_state_index=mamba_state_index,
             token_range=token_range,
