@@ -1230,6 +1230,36 @@ class MiniMaxM3Attention(Attention):
         o = self._forward_attention_core(q, k, v, idx_q, idx_k, attn_metadata)
         return self.o_proj(o)
 
+    def _maybe_publish_msa_geometry(self, attn_metadata: AttentionMetadata) -> None:
+        """Publish the per-rank sparse geometry on the metadata *class*.
+
+        ``prepare()`` reads this on subsequent steps to pre-build the MSA
+        (``fmha_sm100``) plan into CUDA-graph-stable buffers -- see
+        :mod:`tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_plan_cache`.
+        Publishing here (not in ``__init__``) avoids a chicken-and-egg
+        dependency: the FIRST sparse forward is always the eager warmup pass
+        (no capture in flight), so writing ``_msa_geometry`` is CUDA-graph-safe.
+
+        IMPORTANT: publish on the metadata *class*, not the instance. CUDA
+        graph capture uses separate metadata instances; an instance attribute
+        written during eager warmup would be invisible to them.
+        """
+        if getattr(attn_metadata, "_msa_geometry", None) is not None:
+            return
+        from ..attention_backend.sparse.minimax_m3.msa_plan_cache import MsaPlanCacheGeometry
+
+        m3_config = self.attn.m3_config
+        type(attn_metadata)._msa_geometry = MsaPlanCacheGeometry(
+            num_q_heads=int(m3_config.num_q_heads),
+            num_kv_heads=int(m3_config.num_kv_heads),
+            num_index_heads=int(m3_config.num_index_heads),
+            head_dim=int(m3_config.head_dim),
+            block_size=int(m3_config.block_size),
+            topk=int(m3_config.topk),
+            init_blocks=int(m3_config.init_blocks),
+            local_blocks=int(m3_config.local_blocks),
+        )
+
     def _sparse_attention_core(
         self,
         q: torch.Tensor,
@@ -1240,14 +1270,77 @@ class MiniMaxM3Attention(Attention):
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        """Run sparse cache updates and attention into ``output``."""
+        """Run sparse cache updates and attention into ``output``.
+
+        Dispatches to the MSA (``fmha_sm100``) backend when ``self.attn`` is a
+        :class:`MiniMaxM3MSATrtllmAttention` (``sparse_use_msa=True``), which
+        mimics ``DSATrtllmAttention``: the indexer produces the selected block
+        indices and the inherited ``TrtllmAttention.forward`` runs the sparse
+        GQA through the registered ``MsaSparseGqaFmha``. Otherwise falls back
+        to the Triton reference backend's keyword-driven ``forward``.
+        """
         kv_cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
         if kv_cache_manager is None:
             raise RuntimeError(
                 f"MiniMax-M3 sparse forward (layer {self.layer_idx}) requires "
                 "attn_metadata.kv_cache_manager to be a MiniMaxM3KVCacheManagerV2."
             )
+        self._maybe_publish_msa_geometry(attn_metadata)
 
+        from ..attention_backend.sparse.minimax_m3 import (
+            get_minimax_m3_attention_backend_cls,
+            get_minimax_m3_msa_attention_backend_cls,
+        )
+
+        if isinstance(self.attn, get_minimax_m3_msa_attention_backend_cls()):
+            return self._sparse_attention_core_msa(q, k, v, idx_q, idx_k, attn_metadata, output)
+        if isinstance(self.attn, get_minimax_m3_attention_backend_cls()):
+            return self._sparse_attention_core_triton(
+                q, k, v, idx_q, idx_k, attn_metadata, output, kv_cache_manager
+            )
+        raise RuntimeError(
+            f"MiniMax-M3 sparse forward (layer {self.layer_idx}) requires self.attn "
+            f"to be a MiniMax-M3 sparse backend, got {type(self.attn).__name__}. "
+            "Construct the model with "
+            "sparse_attention_config=MiniMaxM3SparseAttentionConfig(...) on ModelConfig."
+        )
+
+    def _sparse_attention_core_msa(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        idx_q: torch.Tensor,
+        idx_k: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """MSA path: indexer + inherited ``TrtllmAttention.forward`` (DSA-style)."""
+        from ..attention_backend.interface import AttentionForwardArgs
+
+        # Indexer: proxy MQA + top-k block selection. Writes the index-K
+        # cache and returns [total_q, num_kv_heads, topk] selected blocks.
+        kv_block_indexes = self.attn.run_indexer(idx_q, idx_k, attn_metadata)
+        # Thread the selected blocks through forward_args.topk_indices; the
+        # backend's sparse_attn_predict publishes them as sparse_attn_indices,
+        # and MsaSparseGqaFmha writes K/V + runs the sparse GQA in place into
+        # ``output``. attention_input_type defaults to mixed (ctx + gen).
+        forward_args = AttentionForwardArgs(output=output, topk_indices=kv_block_indexes)
+        self.attn.forward(q, k, v, attn_metadata, forward_args=forward_args)
+        return output
+
+    def _sparse_attention_core_triton(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        idx_q: torch.Tensor,
+        idx_k: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        output: torch.Tensor,
+        kv_cache_manager,
+    ) -> torch.Tensor:
+        """Triton reference path: keyword-driven ``forward`` with M3 caches."""
         # 4. Get the paged-block main K/V cache + flat side index-K cache.
         # The base KVCacheManagerV2 layout is
         # ``[num_pages, kv_factor, tokens_per_block, num_kv_heads, head_dim]``
@@ -1303,62 +1396,10 @@ class MiniMaxM3Attention(Attention):
                 "disable_index_value=True on every sparse layer)."
             )
 
-        # 6-7. Dispatch to the registered MiniMax-M3 sparse runtime
-        # backend, which executes the sparse path end-to-end including
-        # the cache writes. Production construction (LLM API with
-        # ``sparse_attention_config=MiniMaxM3SparseAttentionConfig()``)
-        # registers :class:`MiniMaxM3SparseRuntimeBackend` as
-        # ``self.attn``; any other backend on a sparse layer is a
-        # configuration error.
-        from ..attention_backend.sparse.minimax_m3 import get_minimax_m3_attention_backend_cls
-
-        m3_backend_cls = get_minimax_m3_attention_backend_cls()
-        if not isinstance(self.attn, m3_backend_cls):
-            raise RuntimeError(
-                f"MiniMax-M3 sparse forward (layer {self.layer_idx}) requires "
-                f"self.attn to be a MiniMaxM3SparseRuntimeBackend, got "
-                f"{type(self.attn).__name__}. Construct the model with "
-                "sparse_attention_config=MiniMaxM3SparseAttentionConfig(...) on "
-                "ModelConfig so the standard attention-backend dispatch selects "
-                "the M3 sparse runtime."
-            )
-        # Publish the per-rank sparse geometry on the outer
-        # AttentionMetadata the first time any sparse layer dispatches.
-        # ``MiniMaxM3AttentionMetadata.prepare`` reads this on subsequent
-        # steps to pre-build the MSA (fmha_sm100) plan into
-        # CUDA-graph-stable buffers -- see
-        # :mod:`tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_plan_cache`.
-        # Doing this attach here (not in ``__init__``) is what avoids a
-        # chicken-and-egg dependency: the metadata instance is created
-        # by the pyexecutor before any layer runs, and the FIRST sparse
-        # forward is always the eager warmup pass (no capture in
-        # flight), so writing to ``_msa_geometry`` at this point is
-        # CUDA-graph-safe. All sparse layers share the same m3_config
-        # on a given rank, so any layer's write is authoritative for
-        # the rest.
-        #
-        # IMPORTANT: publish on the metadata *class*, not the instance.
-        # CUDA graph capture uses separate metadata instances (created
-        # via ``create_cuda_graph_metadata``); an instance attribute
-        # written during eager warmup would be invisible to them, their
-        # ``prepare()`` would skip the plan pre-build, and the captured
-        # decode would fall back to in-forward planning — freezing
-        # capture-time host values into every replay (the original
-        # NaN-after-layer-3 CUDA graph bug).
-        if getattr(attn_metadata, "_msa_geometry", None) is None:
-            from ..attention_backend.sparse.minimax_m3.msa_plan_cache import MsaPlanCacheGeometry
-
-            m3_config = self.attn.m3_config
-            type(attn_metadata)._msa_geometry = MsaPlanCacheGeometry(
-                num_q_heads=int(m3_config.num_q_heads),
-                num_kv_heads=int(m3_config.num_kv_heads),
-                num_index_heads=int(m3_config.num_index_heads),
-                head_dim=int(m3_config.head_dim),
-                block_size=int(m3_config.block_size),
-                topk=int(m3_config.topk),
-                init_blocks=int(m3_config.init_blocks),
-                local_blocks=int(m3_config.local_blocks),
-            )
+        # 6-7. Dispatch to the Triton reference runtime backend, which
+        # executes the sparse path end-to-end including the cache writes.
+        # (Backend-type dispatch + geometry publication are handled by the
+        # caller ``_sparse_attention_core``.)
         return self.attn.forward(
             q,
             k,

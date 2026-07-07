@@ -63,6 +63,17 @@ class MiniMaxM3SparseParams(SparseParams):
     # it is requested without those preconditions met.
     use_msa: bool = False
 
+    @property
+    def indices_block_size(self) -> int:
+        """Block granularity of the sparse attention indices.
+
+        ``TrtllmAttention.forward`` reads this off the sparse params to
+        stamp ``forward_args.sparse_prediction.sparse_attn_indices_block_size``.
+        For MiniMax-M3 the per-query selected indices are KV *block* indices,
+        so the granularity is the sparse block size.
+        """
+        return self.block_size
+
 
 @dataclass(frozen=True)
 class MiniMaxM3SparseConfig:
@@ -733,8 +744,8 @@ def _build_msa_plans_for_metadata(
     from .msa_plan_cache import MsaPlanCache
 
     # 1) Derive per-request CPU tensors (mirrors msa_backend.
-    #    _qo_lens_offsets_from_metadata, kept in sync here so the
-    #    forward sees the same values it would have built itself).
+    #    _whole_batch_lens, kept in sync here so the forward sees the
+    #    same values it would have built itself).
     seq_lens_cpu = m3_meta.seq_lens_cpu.to(torch.int32)
     batch = int(seq_lens_cpu.shape[0])
     if m3_meta.is_prefill:
@@ -789,6 +800,114 @@ def _build_msa_plans_for_metadata(
         "max_kv_len": int(m3_meta.req_to_token.shape[1]),
     }
     return plan_cache, msa_plans
+
+
+def build_m3_sparse_metadata_and_plans(
+    meta,
+    *,
+    static_buffers: Optional[dict],
+    plan_cache: Optional["MsaPlanCache"],
+    geometry: Optional["MsaPlanCacheGeometry"],
+) -> Tuple[Optional[dict], Optional["MsaPlanCache"]]:
+    """Build the per-step MiniMax-M3 sparse attachment + MSA plans.
+
+    Backend-neutral extraction of :meth:`MiniMaxM3AttentionMetadata.prepare`'s
+    body so metadata classes on *either* base (the Triton reference path's
+    :class:`AttentionMetadata` subclass, or the MSA path's
+    :class:`~tensorrt_llm._torch.attention_backend.trtllm.TrtllmAttentionMetadata`
+    subclass) can produce the identical attachment without duplicating the
+    logic.
+
+    ``meta`` must expose the standard attention-metadata attributes
+    (``kv_cache_manager``, ``request_ids``, ``seq_lens``, ``num_contexts``,
+    ``kv_cache_params``, ``max_num_sequences`` / ``max_num_requests``,
+    ``is_cuda_graph``). ``static_buffers`` / ``plan_cache`` carry the
+    CUDA-graph-stable buffers owned by the caller (passed through so their
+    ``data_ptr()`` stays constant across replays). ``geometry`` is the MSA
+    plan geometry (per-instance publication or the process-global
+    registration).
+
+    Returns ``(attachment_or_None, plan_cache)``. ``attachment`` is the
+    ``{"metadata", "out_cache_loc"[, "msa_plans"]}`` dict; ``None`` when the
+    manager is not an M3 sparse cache or the batch is empty.
+    """
+    kv_cache_manager = getattr(meta, "kv_cache_manager", None)
+    if kv_cache_manager is None or not hasattr(kv_cache_manager, "get_index_k_buffer"):
+        return None, plan_cache
+    request_ids = getattr(meta, "request_ids", None)
+    seq_lens = getattr(meta, "seq_lens", None)
+    if request_ids is None or seq_lens is None:
+        return None, plan_cache
+    num_contexts = int(getattr(meta, "num_contexts", 0) or 0)
+    batch_size = int(seq_lens.shape[0])
+    if batch_size == 0:
+        return None, plan_cache
+
+    try:
+        layer_buf = kv_cache_manager.get_buffers(0)
+        cache_device = layer_buf.device
+    except Exception:
+        cache_device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    seq_lens_cpu = getattr(meta, "seq_lens_cpu", None)
+    if seq_lens_cpu is None:
+        seq_lens_cpu = seq_lens.detach().to("cpu")
+
+    kv_cache_params = getattr(meta, "kv_cache_params", None)
+    num_cached_per_seq = (
+        kv_cache_params.num_cached_tokens_per_seq
+        if kv_cache_params is not None
+        else [0] * batch_size
+    )
+    kv_lens_cpu_list = [
+        int(num_cached_per_seq[b]) + int(seq_lens_cpu[b].item()) for b in range(batch_size)
+    ]
+    kv_lens_cpu = torch.tensor(kv_lens_cpu_list, dtype=torch.int32)
+    kv_lens_dev = kv_lens_cpu.to(device=cache_device, non_blocking=True)
+
+    is_extend = num_contexts > 0
+    if is_extend:
+        prefix_lens_list = [int(num_cached_per_seq[b]) for b in range(batch_size)]
+        extend_seq_lens_cpu = [kv_lens_cpu_list[b] - prefix_lens_list[b] for b in range(batch_size)]
+        prefix_lens = torch.tensor(prefix_lens_list, dtype=torch.int32, device=cache_device)
+        m3_meta, out_cache_loc = build_runtime_metadata_from_kv_manager(
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            seq_lens=kv_lens_dev,
+            seq_lens_cpu=kv_lens_cpu,
+            is_prefill=True,
+            prefix_lens=prefix_lens,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            device=cache_device,
+            static_buffers=static_buffers,
+        )
+    else:
+        m3_meta, out_cache_loc = build_runtime_metadata_from_kv_manager(
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            seq_lens=kv_lens_dev,
+            seq_lens_cpu=kv_lens_cpu,
+            is_prefill=False,
+            device=cache_device,
+            static_buffers=static_buffers,
+        )
+
+    attachment = {"metadata": m3_meta, "out_cache_loc": out_cache_loc}
+
+    use_msa = bool(getattr(kv_cache_manager, "use_msa", False))
+    if use_msa and geometry is not None:
+        max_batch = int(getattr(meta, "max_num_sequences", None) or meta.max_num_requests)
+        plan_cache, msa_plans = _build_msa_plans_for_metadata(
+            m3_meta=m3_meta,
+            geometry=geometry,
+            cache_device=cache_device,
+            max_batch=max_batch,
+            plan_cache=plan_cache,
+        )
+        if msa_plans is not None:
+            attachment["msa_plans"] = msa_plans
+            m3_meta.msa_plans = msa_plans
+    return attachment, plan_cache
 
 
 @functools.lru_cache(maxsize=1)
@@ -1095,6 +1214,7 @@ __all__ = [
     "MiniMaxM3SparseConfig",
     "MiniMaxM3SparseAttentionMetadata",
     "allocate_minimax_m3_static_buffers",
+    "build_m3_sparse_metadata_and_plans",
     "build_runtime_metadata_from_kv_manager",
     "ensure_metadata_on_device",
     "get_minimax_m3_attention_metadata_cls",

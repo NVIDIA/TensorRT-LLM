@@ -167,13 +167,13 @@ _GLOBAL_MSA_GEOMETRY: Optional["MsaPlanCacheGeometry"] = None
 def set_global_msa_geometry(geometry: "MsaPlanCacheGeometry") -> None:
     """Register the per-rank M3 sparse geometry process-wide.
 
-    Called from ``MiniMaxM3MSARuntimeBackend.__init__`` — i.e. at layer
+    Called from ``MiniMaxM3MSATrtllmAttention.__init__`` — i.e. at layer
     construction, before any forward and therefore before any CUDA
-    graph capture.  ``MiniMaxM3AttentionMetadata.prepare()`` reads this
-    so the MSA plan / kv-indices staging runs for *every* metadata
-    instance, including the separate instances the CUDA graph runner
-    creates.  Publishing only from the first sparse forward (the old
-    scheme) left graph-capture metadata without a geometry: their
+    graph capture.  The M3 metadata's ``prepare()`` reads this so the MSA
+    plan / kv-indices staging runs for *every* metadata instance,
+    including the separate instances the CUDA graph runner creates.
+    Publishing only from the first sparse forward (the old scheme) left
+    graph-capture metadata without a geometry: their
     ``prepare()`` skipped the plan pre-build and the captured forward
     fell back to in-forward planning, freezing capture-time host values
     into every replay.

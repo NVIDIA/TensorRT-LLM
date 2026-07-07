@@ -19,7 +19,6 @@ from typing import TypeAlias
 from .fallback import FallbackFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .interface import Fmha
-from .msa_proxy_mqa import MsaProxyMqaFmha
 from .msa_sparse_gqa import MsaSparseGqaFmha
 
 FmhaCls: TypeAlias = type[Fmha]
@@ -27,15 +26,15 @@ FmhaCls: TypeAlias = type[Fmha]
 FMHA_LIBS: dict[str, FmhaCls] = {
     "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
     "fallback": FallbackFmha,
-    # Indexer-style proxy FMHA. Returns False from is_supported() so the
-    # main-attention dispatch loop ignores it; sparse-attention indexers
-    # locate it via get_enabled_fmha_lib_classes() filtered to
-    # subclasses of IndexerProxyFmha.
-    "msa_proxy_mqa": MsaProxyMqaFmha,
-    # Block-sparse main-attention FMHA. Consumes kv_block_indexes
-    # produced by an upstream proxy + top-k pass. Same opt-out pattern
-    # as the proxy: returns False from is_supported() and is invoked
-    # directly by sparse-attention backends via forward_block_sparse().
+    # MiniMax-M3 MSA block-sparse main-attention FMHA (SM100-only,
+    # fmha_sm100). An Fmha that participates in the standard
+    # TrtllmAttention.forward dispatch loop: is_supported() returns True
+    # only for MiniMax-M3 MSA sparse requests (whose metadata implements
+    # MsaSparseMetadataProtocol and whose forward_args carry the indexer's
+    # selected block indices). It does its own whole-batch dispatch (no
+    # PhasedFmha ctx/gen split). The per-query block indices come from the
+    # DSA-style MsaIndexer (sparse.minimax_m3.indexer), which calls
+    # fmha_sm100 directly rather than through this registry.
     "msa_sparse_gqa": MsaSparseGqaFmha,
 }
 DEFAULT_FMHA_LIBS: tuple[str, ...] = tuple(FMHA_LIBS)

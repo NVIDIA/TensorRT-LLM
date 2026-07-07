@@ -7597,11 +7597,10 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         # model + KV footprint; cap KV cache at 0.4 of free memory and
         # constrain batch / token budget so the runtime allocator stays
         # under the PyTorch cap.
-        # The MSA sparse kernel requires page_size == sparse_block_size(128)
-        kv_cache_config = KvCacheConfig(
-            free_gpu_memory_fraction=0.4,
-            enable_block_reuse=False,
-            tokens_per_block=128 if use_msa else None)
+        # The MSA sparse kernel requires page_size == sparse_block_size(128).
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
+                                        enable_block_reuse=False,
+                                        tokens_per_block=128 if use_msa else 32)
         sparse_attention_config = MiniMaxM3SparseAttentionConfig(
             sparse_use_msa=use_msa)
         with LLM(model_path,
@@ -7626,11 +7625,10 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         tp_size, ep_size = 4, 4
         model_name = "MiniMaxAI/MiniMax-M3-MXFP8"
         model_path = f"{llm_models_root()}/MiniMax-M3-MXFP8"
-        # The MSA sparse kernel requires page_size == sparse_block_size(128)
-        kv_cache_config = KvCacheConfig(
-            free_gpu_memory_fraction=0.5,
-            enable_block_reuse=False,
-            tokens_per_block=128 if use_msa else None)
+        # The MSA sparse kernel requires page_size == sparse_block_size(128).
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
+                                        enable_block_reuse=False,
+                                        tokens_per_block=128 if use_msa else 32)
         sparse_attention_config = MiniMaxM3SparseAttentionConfig(
             sparse_use_msa=use_msa)
         cuda_graph_config = CudaGraphConfig(
@@ -7668,10 +7666,9 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         model_name = "nvidia/MiniMax-M3-NVFP4"
         model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
         # The MSA sparse kernel requires page_size == sparse_block_size(128)
-        kv_cache_config = KvCacheConfig(
-            free_gpu_memory_fraction=0.6,
-            enable_block_reuse=False,
-            tokens_per_block=128 if use_msa else None)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
+                                        enable_block_reuse=False,
+                                        tokens_per_block=128 if use_msa else 32)
         sparse_attention_config = MiniMaxM3SparseAttentionConfig(
             sparse_use_msa=use_msa)
         moe_config = MoeConfig(backend="CUTLASS")
