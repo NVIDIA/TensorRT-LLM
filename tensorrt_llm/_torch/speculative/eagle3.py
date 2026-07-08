@@ -10,7 +10,6 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
-from ..distributed.ops import allgather
 from ..model_config import ModelConfig
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
@@ -806,6 +805,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         runtime_draft_len = spec_metadata.runtime_draft_len
         num_gens = batch_size - num_contexts
         next_draft_tokens = []
+        self.reset_draft_probs_valid_for_capture(spec_metadata)
         last_tokens_idx = torch.cumsum(
             attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
         position_ids = inputs["position_ids"]
@@ -891,9 +891,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                         self.guided_decoder.execute_draft_batch(logits,
                                                                 draft_step=i)
                     else:
-                        d2t = getattr(draft_model.model, "d2t", None)
                         self.guided_decoder.execute_draft_batch(logits,
-                                                                d2t,
+                                                                self._d2t,
                                                                 draft_step=i)
 
                 # When ADP+LM-head-TP pads logits to max_num_requests, the
@@ -905,13 +904,21 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # would otherwise fail to broadcast in apply_temperature. This
                 # also keeps next_draft_tokens and the draft_probs buffer
                 # token_count-sized without a post-hoc trim.
+                mapping_lm_head_tp = None
                 if use_lm_head_tp_in_adp:
                     logits = logits[:token_count]
-                new_draft_token = self.draft_decoder(logits,
-                                                     draft_model,
-                                                     spec_metadata,
-                                                     batch_size,
-                                                     draft_step=i)
+                    # The MTP head built this per-forward mapping when producing
+                    # the vocab-sharded logits; the sampler needs it to gather.
+                    mapping_lm_head_tp = getattr(
+                        draft_model.mtp_layers[0].shared_head,
+                        "mapping_lm_head_tp", None)
+                new_draft_token = self.sample_draft_tokens(
+                    logits,
+                    spec_metadata,
+                    batch_size,
+                    draft_step=i,
+                    is_last_draft_cycle=(i == runtime_draft_len - 1),
+                    mapping_lm_head_tp=mapping_lm_head_tp)
                 next_draft_tokens.append(new_draft_token)
 
                 # Update hidden states for the next iteration.
@@ -977,20 +984,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 gen_draft_tokens)
             next_draft_tokens[num_contexts:] = gen_draft_tokens
 
-        # Probs were already scattered into the slot-indexed buffer by
-        # _draft_sampler_advanced_for_rejection on each draft step (non-greedy
-        # batches only). All-greedy batches skip storage — rejection sampling
-        # will be bypassed by _can_use_rejection_sampling. Finalize the validity
-        # flag and d2t for next-iter target-side verification.
-        if spec_metadata.use_rejection_sampling:
-            if not spec_metadata.is_all_greedy_sample:
-                d2t_param = getattr(getattr(draft_model, 'model', None), "d2t",
-                                    None)
-                spec_metadata.d2t = d2t_param.data if d2t_param is not None else None
-                spec_metadata.draft_probs_valid = True
-            else:
-                spec_metadata.draft_probs_valid = False
-
         return next_draft_tokens
 
     def _get_step_all_rank_num_tokens(self, spec_metadata, step_idx: int):
@@ -1042,63 +1035,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         ])
         attn_metadata.block_ids_per_seq[:batch_size, :].copy_(
             reorder_block_ids_per_seq, non_blocking=True)
-
-    @torch.compile(options={"max-autotune": True})
-    def _get_local_max_and_combined(self, logits, mapping_lm_tp=None):
-        local_max_values, local_argmax = torch.max(logits, dim=-1, keepdim=True)
-        vocab_per_rank = logits.shape[-1]
-        mapping_lm_tp = mapping_lm_tp if mapping_lm_tp is not None else \
-            self.model_config.mapping
-        max_index_per_rank = local_argmax.type(
-            torch.int32) + (mapping_lm_tp.tp_rank * vocab_per_rank)
-        max_index_per_rank_float = max_index_per_rank.float()
-        local_max_values_float32 = local_max_values.float()
-        combined = torch.stack(
-            [max_index_per_rank_float, local_max_values_float32],
-            dim=-1).flatten(-2)
-        return combined
-
-    @torch.compile(options={"max-autotune": True})
-    def _get_draft_tokens_from_gathered(self, gathered):
-        gathered_indices_float = gathered[..., 0::2]
-        gathered_values_float = gathered[..., 1::2]
-        max_indices = torch.argmax(gathered_values_float, dim=-1, keepdim=True)
-        draft_tokens = torch.gather(gathered_indices_float, -1,
-                                    max_indices).squeeze(-1).type(torch.int32)
-        return draft_tokens
-
-    def draft_sampler(
-        self,
-        logits: torch.Tensor,
-        mapping_lm_head_tp=None,
-    ):
-        """TP-aware greedy draft token sampler (MTP Eagle path).
-
-        Falls back to simple argmax when no tensor parallelism is active or
-        when only attention DP is enabled without LM-head TP.
-        """
-        if (self.model_config is not None
-                and hasattr(self.model_config, 'mapping')
-                and self.model_config.mapping.tp_size > 1
-                and not self.model_config.mapping.enable_attention_dp):
-            combined = self._get_local_max_and_combined(logits)
-            gathered = allgather(combined, self.model_config.mapping, dim=-1)
-            return self._get_draft_tokens_from_gathered(gathered)
-        elif (self.model_config is not None
-              and hasattr(self.model_config, 'mapping')
-              and self.model_config.mapping.tp_size > 1
-              and self.model_config.mapping.enable_lm_head_tp_in_adp):
-            combined = self._get_local_max_and_combined(logits,
-                                                        mapping_lm_head_tp)
-            gathered = allgather(combined, mapping_lm_head_tp, dim=-1)
-            batch_size = logits.shape[0]
-            local_batch_size = batch_size // mapping_lm_head_tp.tp_size
-            gathered = gathered.view(mapping_lm_head_tp.tp_size,
-                                     local_batch_size, -1)
-            sliced_gathered = gathered[mapping_lm_head_tp.tp_rank]
-            return self._get_draft_tokens_from_gathered(sliced_gathered)
-        else:
-            return self._draft_sampler_greedy(logits)
 
     @torch.compile(options={"max-autotune": True})
     def _topk_kernel(self, gen_logprobs, num_gens, mtp_num_modules,
@@ -1209,78 +1145,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 0, runtime_draft_len, dtype=torch.int, device=logits.device)
         return self._accept_draft_tokens(logits, draft_tokens, num_contexts,
                                          batch_size, spec_metadata)
-
-    def draft_decoder(
-        self,
-        logits: torch.Tensor,
-        draft_model: nn.Module,
-        spec_metadata: Eagle3OneModelSpecMetadata,
-        batch_size: int,
-        draft_step: Optional[int] = None,
-    ):
-        '''
-        Sample draft tokens using the target's per-request sampling params
-        (temperature/top_k/top_p).
-
-        When rejection sampling is enabled and draft_step is provided, take the
-        single-pass path that also scatters the draft prob distribution into the
-        slot-indexed buffer (avoids a redundant softmax later).
-
-        Args:
-            logits: [batch_size, vocab_size] - Draft model logits.
-            draft_model: The draft model.
-            spec_metadata: Carries per-request sampling param tensors.
-            batch_size: Active requests, used to slice per-request tensors.
-            draft_step: Current draft step index (0..max_draft_len-1). Required
-                for the rejection-sampling code path so probs are written to
-                the correct slice of spec_metadata.draft_probs.
-        '''
-
-        d2t = getattr(getattr(draft_model, 'model', None), "d2t", None)
-        # All-greedy fast path must stay TP-aware. When the draft LM head is
-        # tensor-parallel (tp_size>1 without attention DP, or LM-head-TP in
-        # ADP), the draft logits are sharded along the vocab dim. A plain
-        # per-rank argmax then picks a different token on each rank, which
-        # desyncs the speculative-decoding control flow across ranks and
-        # deadlocks the next collective (observed as a generation hang on
-        # MTP-Eagle + TP). draft_sampler() all-gathers the sharded logits
-        # before argmax (and falls back to a plain argmax when no TP gather is
-        # needed). Eagle3 (non-MTP) keeps its d2t-aware argmax.
-        if spec_metadata.is_all_greedy_sample:
-            # Only plain tensor parallelism (tp_size>1 without attention DP)
-            # shards the draft logits over the vocab dim and thus needs
-            # draft_sampler()'s all-gather argmax. The LM-head-TP-in-ADP case
-            # already produces full-vocab logits per rank (gathered upstream),
-            # and the no-TP / Eagle3 cases need nothing, so they take the plain
-            # d2t-aware argmax. (Routing ADP/LM-head-TP through draft_sampler
-            # without its mapping_lm_head_tp arg hits the None-mapping branch
-            # and crashes with 'NoneType has no attribute tp_group'.)
-            if (self.is_mtp_eagle and self.model_config is not None
-                    and hasattr(self.model_config, 'mapping')
-                    and self.model_config.mapping.tp_size > 1
-                    and not self.model_config.mapping.enable_attention_dp):
-                return self.draft_sampler(logits)
-            return self._draft_sampler_greedy(logits, d2t)
-        # Non-greedy (advanced) draft sampling has the same TP hazard as the
-        # greedy path: when the draft LM head is plain tensor-parallel
-        # (tp_size>1 without attention DP), each rank only holds a vocab shard
-        # of the draft logits. Random per-rank sampling then draws different
-        # tokens on different ranks, desyncing the spec-decode control flow and
-        # deadlocking the next collective. All-gather the shards into the full
-        # vocab first so every rank samples from the same distribution with the
-        # shared seed. (Greedy uses draft_sampler()'s lighter max+index gather;
-        # random sampling needs the full distribution. The LM-head-TP-in-ADP
-        # case is handled upstream and must not be gathered again here.)
-        if (self.is_mtp_eagle and self.model_config is not None
-                and hasattr(self.model_config, 'mapping')
-                and self.model_config.mapping.tp_size > 1
-                and not self.model_config.mapping.enable_attention_dp):
-            logits = allgather(logits, self.model_config.mapping, dim=-1)
-        if spec_metadata.use_rejection_sampling and draft_step is not None:
-            return self._draft_sampler_advanced_for_rejection(
-                logits, spec_metadata, batch_size, d2t, draft_step)
-        return self._draft_sampler_advanced(logits, spec_metadata, batch_size,
-                                            d2t)
 
     def prepare_1st_drafter_inputs(
         self,

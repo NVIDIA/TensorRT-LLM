@@ -213,6 +213,8 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
         next_draft_tokens = []
         original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
+        self.reset_draft_probs_valid_for_capture(spec_metadata)
+
         # Get the draft KV cache manager if using separate layouts
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
 
@@ -257,10 +259,15 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
                     hidden_states[gather_ids], draft_model.lm_head, attn_metadata, True
                 )
                 if self.guided_decoder is not None:
-                    d2t = getattr(draft_model.model, "d2t", None)
-                    self.guided_decoder.execute_draft_batch(logits, d2t, draft_step=i)
+                    self.guided_decoder.execute_draft_batch(logits, self._d2t, draft_step=i)
 
-                new_draft_token = self.draft_decoder(logits, draft_model)
+                new_draft_token = self.sample_draft_tokens(
+                    logits,
+                    spec_metadata,
+                    batch_size,
+                    draft_step=i,
+                    is_last_draft_cycle=(i == runtime_draft_len - 1),
+                )
                 next_draft_tokens.append(new_draft_token)
 
                 # Update inputs and metadata for next draft step
@@ -313,36 +320,6 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
             "next_draft_tokens": next_draft_tokens,
             "next_new_tokens": next_new_tokens,
         }
-
-    def sample_and_accept_draft_tokens(
-        self,
-        logits: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        spec_metadata: DraftTargetOneModelSpecMetadata,
-    ):
-        batch_size = attn_metadata.num_seqs
-        num_contexts = attn_metadata.num_contexts
-        num_gens = batch_size - num_contexts
-        runtime_draft_len = spec_metadata.runtime_draft_len
-
-        if spec_metadata.draft_tokens is None:
-            draft_tokens = torch.zeros(
-                (num_gens, runtime_draft_len), dtype=torch.int, device=logits.device
-            )
-        else:
-            draft_tokens = spec_metadata.draft_tokens.reshape(num_gens, runtime_draft_len)
-
-        return self._sample_and_accept_draft_tokens_base(
-            logits, draft_tokens, num_contexts, batch_size, spec_metadata
-        )
-
-    def draft_decoder(
-        self,
-        logits: torch.Tensor,
-        draft_model: nn.Module,
-    ):
-        d2t = getattr(draft_model.model, "d2t", None)
-        return self._draft_sampler_greedy(logits, d2t)
 
     def prepare_1st_drafter_inputs(
         self,

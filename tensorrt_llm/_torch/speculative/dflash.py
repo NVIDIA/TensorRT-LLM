@@ -407,17 +407,8 @@ class DFlashWorker(SpecWorkerBase):
 
         self._execute_guided_decoder_if_present(logits)
 
-        # Target now emits K+1 logits per gen request and the previous step
-        # stored K draft tokens per gen request (no filler padding).
-        if num_gens > 0:
-            draft_tokens = spec_metadata.draft_tokens.reshape(num_gens, K)
-        else:
-            draft_tokens = spec_metadata.draft_tokens.reshape(0, K)
-
-        logits_for_accept = logits
-
-        accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens_base(
-            logits_for_accept, draft_tokens, num_contexts, batch_size, spec_metadata
+        accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
+            logits, attn_metadata, spec_metadata
         )
 
         # Update GDN/Mamba recurrent states to the accepted token's state.
@@ -471,6 +462,8 @@ class DFlashWorker(SpecWorkerBase):
 
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
 
+        self.reset_draft_probs_valid_for_capture(spec_metadata)
+
         if num_gens > 0:
             with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
                 hidden_states_out = draft_model.dflash_forward(
@@ -498,13 +491,13 @@ class DFlashWorker(SpecWorkerBase):
                 vocab_size = gen_logits.shape[-1]
                 gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
 
-                d2t = getattr(draft_model.model, "d2t", None)
-                gen_draft_tokens = torch.argmax(gen_logits, dim=-1, keepdim=False).long()
-
-                if d2t is not None:
-                    gen_draft_tokens = d2t[gen_draft_tokens] + gen_draft_tokens
-
-                gen_draft_tokens = gen_draft_tokens.type(torch.int32)
+                gen_draft_tokens = self.sample_draft_tokens(
+                    gen_logits,
+                    spec_metadata,
+                    batch_size,
+                    num_contexts=num_contexts,
+                    is_last_draft_cycle=True,
+                )
 
         else:
             gen_draft_tokens = torch.empty((0, K), dtype=torch.int32, device="cuda")

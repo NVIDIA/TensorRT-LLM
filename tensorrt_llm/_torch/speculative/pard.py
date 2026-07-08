@@ -196,25 +196,8 @@ class PARDWorker(SpecWorkerBase):
 
         self._execute_guided_decoder_if_present(logits)
 
-        # draft_tokens buffer has (2K-1) entries per gen request; extract the K real drafts
-        if num_gens > 0:
-            draft_tokens = spec_metadata.draft_tokens[: num_gens * (2 * K - 1)]
-            draft_tokens = draft_tokens.reshape(num_gens, 2 * K - 1)[:, :K]
-        else:
-            draft_tokens = spec_metadata.draft_tokens.reshape(0, K)
-
-        # logits have 2K entries per gen request; extract K+1 for acceptance
-        if num_gens > 0:
-            ctx_logits = logits[:num_contexts]
-            vocab_size = logits.shape[-1]
-            gen_logits_2k = logits[num_contexts:].reshape(num_gens, 2 * K, vocab_size)
-            gen_logits_kp1 = gen_logits_2k[:, : K + 1, :].reshape(-1, vocab_size)
-            logits_for_accept = torch.cat([ctx_logits, gen_logits_kp1], dim=0)
-        else:
-            logits_for_accept = logits
-
-        accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens_base(
-            logits_for_accept, draft_tokens, num_contexts, batch_size, spec_metadata
+        accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
+            logits, attn_metadata, spec_metadata
         )
 
         # Pad accepted_tokens from (batch, K+1) to (batch, 2K) to match sampler buffer
@@ -255,6 +238,8 @@ class PARDWorker(SpecWorkerBase):
 
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
 
+        self.reset_draft_probs_valid_for_capture(spec_metadata)
+
         if num_gens > 0:
             with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
                 hidden_states_out = draft_model.model(**inputs)
@@ -285,14 +270,13 @@ class PARDWorker(SpecWorkerBase):
                 vocab_size = gen_logits.shape[-1]
                 gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
 
-                # Use torch.argmax directly to avoid cute_argmax stride issues
-                d2t = getattr(draft_model.model, "d2t", None)
-                gen_draft_tokens = torch.argmax(gen_logits, dim=-1, keepdim=False).long()
-
-                if d2t is not None:
-                    gen_draft_tokens = d2t[gen_draft_tokens] + gen_draft_tokens
-
-                gen_draft_tokens = gen_draft_tokens.type(torch.int32)
+                gen_draft_tokens = self.sample_draft_tokens(
+                    gen_logits,
+                    spec_metadata,
+                    batch_size,
+                    num_contexts=num_contexts,
+                    is_last_draft_cycle=True,
+                )
 
                 if self.sa_enhancer is not None and sa_manager is not None:
                     gen_draft_tokens = self.sa_enhancer.maybe_override_all_draft_tokens(
@@ -347,23 +331,26 @@ class PARDWorker(SpecWorkerBase):
             "next_new_tokens": next_new_tokens,
         }
 
-    def draft_decoder(
-        self,
-        logits: torch.Tensor,
-        draft_model: nn.Module,
-    ):
-        """
-        Sample draft tokens using greedy decoding.
+    def _reshape_draft_tokens_for_accept(self, spec_metadata, num_gens, device):
+        # draft_tokens buffer has (2K-1) entries per gen request; extract the K real drafts.
+        K = spec_metadata.runtime_draft_len
+        if num_gens > 0:
+            draft_tokens = spec_metadata.draft_tokens[: num_gens * (2 * K - 1)]
+            return draft_tokens.reshape(num_gens, 2 * K - 1)[:, :K]
+        # Context-only batch: return an empty view without reshaping the
+        # (possibly preallocated, non-empty) draft_tokens buffer.
+        return torch.empty((0, K), dtype=torch.int32, device=device)
 
-        Args:
-            logits: [num_tokens, vocab_size] from the draft model.
-            draft_model: The draft model (used to read the d2t mapping).
-
-        Returns:
-            draft_tokens: [batch_size * max_draft_len] flattened token ids.
-        """
-        d2t = getattr(draft_model.model, "d2t", None)
-        return self._draft_sampler_greedy(logits, d2t)
+    def _reshape_logits_for_accept(self, logits, num_contexts, num_gens, spec_metadata):
+        # logits have 2K entries per gen request; extract K+1 for acceptance.
+        if num_gens == 0:
+            return logits
+        K = spec_metadata.runtime_draft_len
+        ctx_logits = logits[:num_contexts]
+        vocab_size = logits.shape[-1]
+        gen_logits_2k = logits[num_contexts:].reshape(num_gens, 2 * K, vocab_size)
+        gen_logits_kp1 = gen_logits_2k[:, : K + 1, :].reshape(-1, vocab_size)
+        return torch.cat([ctx_logits, gen_logits_kp1], dim=0)
 
     def prepare_1st_drafter_inputs(
         self,

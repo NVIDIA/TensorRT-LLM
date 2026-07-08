@@ -76,5 +76,50 @@ def test_pard(disable_overlap_scheduler: bool):
     llm_spec.shutdown()
 
 
+@pytest.mark.high_cuda_memory
+def test_pard_rejection():
+    """PARD with rejection sampling on: the block-capture rejection path
+    (draft-prob scatter -> fail-closed guard -> rejection acceptance) runs
+    end-to-end with non-greedy sampling and produces coherent output."""
+    total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    if total_mem_gb < 35:
+        pytest.skip("Not enough memory to load target + draft model")
+
+    models_path = llm_models_root()
+    pard_model_dir = f"{models_path}/PARD-Llama-3.2-1B"
+    target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
+
+    spec_config = PARDDecodingConfig(
+        max_draft_len=4,
+        speculative_model=pard_model_dir,
+        use_rejection_sampling=True,
+    )
+    llm_spec = LLM(
+        model=target_model_dir,
+        attn_backend="TRTLLM",
+        disable_overlap_scheduler=True,
+        cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2], enable_padding=True),
+        max_batch_size=2,
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False, max_tokens=2048),
+        max_seq_len=2048,
+        speculative_config=spec_config,
+    )
+    prompts = [
+        "The capital of France is",
+        "The president of the United States is",
+    ]
+    # Non-greedy so rejection sampling actually engages (all-greedy bypasses it).
+    sampling_params = SamplingParams(
+        max_tokens=32, temperature=0.8, top_p=0.95, top_k=50, seed=1234
+    )
+    outputs = llm_spec.generate(prompts, sampling_params)
+    llm_spec.shutdown()
+
+    assert len(outputs) == len(prompts)
+    for out in outputs:
+        assert len(out.outputs[0].token_ids) > 0
+        assert out.outputs[0].text.strip()
+
+
 if __name__ == "__main__":
     unittest.main()
