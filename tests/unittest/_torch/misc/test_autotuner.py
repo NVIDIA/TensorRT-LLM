@@ -1226,8 +1226,10 @@ def test_cutedsl_nvfp4_heuristic_matches_full_sweep(monkeypatch):
     sweep_tactic = _best_tactic()
 
     # Pruned: nvMatmulHeuristics drives the (coupled) tile+cluster candidates.
+    # Pin MAX_TACTICS so the tolerance below is not affected by an env override.
     monkeypatch.setenv("TRTLLM_CUTEDSL_NVMMH_ENABLE", "1")
     monkeypatch.setenv("TRTLLM_CUTEDSL_NVMMH_FIELDS", "tile,cluster")
+    monkeypatch.setenv("TRTLLM_CUTEDSL_NVMMH_MAX_TACTICS", "5")
     heuristic_tactic = _best_tactic()
 
     # cuBLASLt runs its own heuristic auto-tuning; warm it under autotune().

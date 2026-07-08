@@ -242,8 +242,8 @@ def rank_configs(m: int, n: int, k: int, precision: str, count: int) -> List[Heu
         # hw=None targets the current GPU.
         try:
             interface.loadInternalDiscoverySet(layout, None)
-        except Exception:  # noqa: BLE001 - discovery data is optional
-            pass
+        except Exception as e:  # noqa: BLE001 - discovery data is optional
+            logger.debug(f"[nvMatmulHeuristics] loadInternalDiscoverySet skipped: {e}")
         configs = interface.get_with_mnk(int(m), int(n), int(k), layout, int(count), None)
     except Exception as e:  # noqa: BLE001 - any failure must degrade gracefully
         logger.warning_once(
