@@ -916,7 +916,7 @@ class ArenaPoolGroup(PoolGroupBase):
         if not hasattr(self, "_destroyed") or self._destroyed:
             return
         # Deferred maps that never ran only hold budget; return it.
-        for _, (_, _, charged) in self._pending_maps.items():
+        for _, (_, _, charged, _) in self._pending_maps.items():
             self._budget.release(charged)
         self._pending_maps.clear()
         # Teardown can run right after sequences finished, with their ranges
@@ -1045,28 +1045,59 @@ class ArenaPoolGroup(PoolGroupBase):
         """Charge the page budget for the pages a target frontier needs (so
         admission control behaves exactly like an immediate map) but defer the
         actual ``cuMemMap``/``cuMemSetAccess`` calls to :meth:`flush_mappings`.
-        Raises ``OutOfPagesError`` (charging nothing) on budget exhaustion.
-        Returns the pages charged. The caller MUST run the flush before any
-        GPU work touches the new blocks."""
+        The map-ahead margin degrades to zero before the charge fails (the
+        margin is a latency-hiding hint -- see ``SequenceArena.ensure_mapped``);
+        the margin actually charged is recorded on the entry so the flush
+        replays the exact same plan. Raises ``OutOfPagesError`` (charging
+        nothing) only if the frontier alone does not fit. Returns the pages
+        charged. The caller MUST run the flush before any GPU work touches
+        the new blocks."""
         assert not rng._freed and num_valid_blocks <= rng.num_blocks
         base = rng.base_block
         entry = self._pending_maps.get(base)
         if entry is None:
+            margin = -1
             pages = self._arena.pending_pages(base, num_valid_blocks)
-            if pages:
+            if not pages:
+                return 0
+            try:
+                self._budget.consume(pages)
+            except OutOfPagesError:
+                margin = 0
+                pages = self._arena.pending_pages(base, num_valid_blocks, 0)
+                if not pages:
+                    return 0
                 self._budget.consume(pages)  # raises; nothing recorded yet
-                self._pending_maps[base] = [rng, num_valid_blocks, pages]
+            self._pending_maps[base] = [rng, num_valid_blocks, pages, margin]
             return pages
         if num_valid_blocks <= entry[1]:
             return 0
         # Nothing was mapped since the first queue call, so pending_pages is
-        # monotone in the frontier and the delta charge is exact.
+        # monotone in the frontier (at a fixed margin) and the delta charge
+        # is exact.
         charged: int = entry[2]
-        pages = self._arena.pending_pages(base, num_valid_blocks)
+        margin: int = entry[3]
+        pages = self._arena.pending_pages(base, num_valid_blocks, margin)
         delta = pages - charged
         assert delta >= 0
         if delta:
-            self._budget.consume(delta)
+            try:
+                self._budget.consume(delta)
+            except OutOfPagesError:
+                if margin == 0:
+                    raise
+                # Degrade this entry's margin. The margin-less plan for the
+                # new target can even be SMALLER than what is already charged
+                # (margin wider than the added blocks): release the excess so
+                # the invariant charged == pending_pages(target, margin)
+                # holds exactly for the flush.
+                pages = self._arena.pending_pages(base, num_valid_blocks, 0)
+                delta = pages - charged
+                if delta > 0:
+                    self._budget.consume(delta)  # raises; entry unchanged
+                elif delta < 0:
+                    self._budget.release(-delta)
+                entry[3] = 0
         entry[1] = num_valid_blocks
         entry[2] = pages
         return delta
@@ -1078,11 +1109,11 @@ class ArenaPoolGroup(PoolGroupBase):
         if not self._pending_maps:
             return 0
         mapped_total = 0
-        for base, (rng, target, charged) in self._pending_maps.items():
+        for base, (rng, target, charged, margin) in self._pending_maps.items():
             if rng._freed or base not in self._ranges:
                 self._budget.release(charged)
                 continue
-            mapped = self._arena.ensure_mapped(base, target, precharged=True)
+            mapped = self._arena.ensure_mapped(base, target, precharged=True, margin=margin)
             mapped_total += mapped
             if mapped != charged:
                 # Defensive: the plan is deterministic, so this indicates

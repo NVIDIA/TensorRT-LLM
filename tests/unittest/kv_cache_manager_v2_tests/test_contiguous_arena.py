@@ -860,6 +860,95 @@ class TestArenaPoolGroup(unittest.TestCase):
         finally:
             group.destroy()
 
+    def _tight_group(self, budget_pages: int, map_ahead: int) -> "ArenaPoolGroup":
+        """Group with its own small budget for margin-degrade tests."""
+        self.tight_budget = PageBudget(budget_pages)
+        return ArenaPoolGroup(
+            block_capacity=16,
+            slot_size_list=[2 * MiB, 1 * MiB],
+            shared_phys_mem_pool=self.allocator,
+            page_budget=self.tight_budget,
+            map_ahead_pages=map_ahead,
+            page_index_scale=64,
+        )
+
+    def test_map_ahead_margin_degrades_before_failing(self) -> None:
+        """The map-ahead margin is a hint at the budget edge.
+
+        Growth maps the frontier without margin instead of raising
+        OutOfPagesError; only an unsatisfiable frontier raises.
+        """
+        # 2 blocks in pools (2MiB, 1MiB) = 3 frontier pages; margin would
+        # add 1 page per pool (5 total) but only 3 fit.
+        group = self._tight_group(budget_pages=3, map_ahead=1)
+        try:
+            rng = group.reserve_sequence(4)
+            self.assertEqual(group.ensure_mapped(rng, 2), 3)  # frontier only
+            self.assertEqual(self.tight_budget.used_pages, 3)
+            self.assertEqual(group.mapped_pages, 3)
+            # Same frontier again: margin still does not fit, frontier is
+            # covered -> no-op, no exception.
+            self.assertEqual(group.ensure_mapped(rng, 2), 0)
+            self.assertEqual(self.tight_budget.used_pages, 3)
+            # Growing past the budget still fails cleanly (charging nothing).
+            with self.assertRaises(OutOfPagesError):
+                group.ensure_mapped(rng, 4)
+            self.assertEqual(self.tight_budget.used_pages, 3)
+            group.free_sequence(rng, CachedCudaEvent.NULL)
+            group.drain_reclaim(CachedCudaEvent.NULL)
+            group.spill_retained(1 << 62)
+        finally:
+            group.destroy()
+
+    def test_queued_mapping_margin_degrades_and_flush_replays_charge(self) -> None:
+        """Batched-sweep margin degrade is deterministic across the flush.
+
+        The charge records the degraded margin and the flush maps exactly
+        the charged pages.
+        """
+        group = self._tight_group(budget_pages=3, map_ahead=1)
+        try:
+            rng = group.reserve_sequence(4)
+            self.assertEqual(group.queue_mapping(rng, 2), 3)  # degraded charge
+            self.assertEqual(self.tight_budget.used_pages, 3)
+            self.assertEqual(group.mapped_pages, 0)  # deferred
+            self.assertEqual(group.flush_mappings(), 3)
+            self.assertEqual(group.mapped_pages, 3)
+            self.assertEqual(self.tight_budget.used_pages, 3)  # no reconcile
+            group.free_sequence(rng, CachedCudaEvent.NULL)
+            group.drain_reclaim(CachedCudaEvent.NULL)
+            group.spill_retained(1 << 62)
+        finally:
+            group.destroy()
+
+    def test_queued_mapping_delta_degrade_releases_excess(self) -> None:
+        """Delta-degrade on a margin-charged entry releases excess exactly.
+
+        A frontier bump that no longer fits degrades the entry; the
+        margin-less plan can be SMALLER than what is already charged
+        (margin wider than the added blocks) and the difference must be
+        released so charged == pending_pages(target, margin) holds for
+        the flush.
+        """
+        # 1 block with margin 2: pool0 min(1+2, 4)=3, pool1 min(1+2, 2)=2
+        # -> 5 pages charged. Bump to 2 blocks: margin plan needs +1 (no
+        # budget left); margin-less plan is 3 -> release 2.
+        group = self._tight_group(budget_pages=5, map_ahead=2)
+        try:
+            rng = group.reserve_sequence(4)
+            self.assertEqual(group.queue_mapping(rng, 1), 5)  # full margin fits
+            self.assertEqual(self.tight_budget.used_pages, 5)
+            self.assertEqual(group.queue_mapping(rng, 2), -2)  # degrade+release
+            self.assertEqual(self.tight_budget.used_pages, 3)
+            self.assertEqual(group.flush_mappings(), 3)
+            self.assertEqual(group.mapped_pages, 3)
+            self.assertEqual(self.tight_budget.used_pages, 3)
+            group.free_sequence(rng, CachedCudaEvent.NULL)
+            group.drain_reclaim(CachedCudaEvent.NULL)
+            group.spill_retained(1 << 62)
+        finally:
+            group.destroy()
+
     class _FakeCanonicalPage:
         """Stand-in for a canonical (host-tier) page in registry tests."""
 

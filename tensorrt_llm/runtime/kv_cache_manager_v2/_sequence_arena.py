@@ -517,16 +517,18 @@ class SequenceArena:
         return lo, hi
 
     def _mapping_plan(
-        self, base_block: int, num_valid_blocks: int
+        self, base_block: int, num_valid_blocks: int, margin: int = -1
     ) -> tuple[list[list[tuple[int, int]]], int]:
         """Missing-page runs per pool (with map-ahead margin, clamped to the
         reserved extent) for a target frontier, and their total page count.
         At most one run per pool: mapped chunks are the prefix below the
         range's mapped frontier, so the missing chunks are exactly
-        ``[frontier, target hi)``."""
+        ``[frontier, target hi)``. ``margin`` overrides the configured
+        map-ahead margin (negative = use the configured value)."""
         assert num_valid_blocks >= 0
         reserved = self._alloc.reserved_len(base_block)
-        margin = self._map_ahead_pages
+        if margin < 0:
+            margin = self._map_ahead_pages
         frontiers = self._frontiers[base_block]
         runs_per_pool: list[list[tuple[int, int]]] = []
         total_new = 0
@@ -546,12 +548,18 @@ class SequenceArena:
                 runs_per_pool.append([])
         return runs_per_pool, total_new
 
-    def pending_pages(self, base_block: int, num_valid_blocks: int) -> int:
-        """Pages :meth:`ensure_mapped` would map for this target frontier."""
-        return self._mapping_plan(base_block, num_valid_blocks)[1]
+    def pending_pages(self, base_block: int, num_valid_blocks: int, margin: int = -1) -> int:
+        """Pages :meth:`ensure_mapped` would map for this target frontier.
+        ``margin`` overrides the configured map-ahead margin (negative =
+        configured value)."""
+        return self._mapping_plan(base_block, num_valid_blocks, margin)[1]
 
     def ensure_mapped(
-        self, base_block: int, num_valid_blocks: int, precharged: bool = False
+        self,
+        base_block: int,
+        num_valid_blocks: int,
+        precharged: bool = False,
+        margin: int = -1,
     ) -> int:
         """Map physical pages covering ``[base_block, base_block + num_valid_blocks)``
         plus ``map_ahead_pages`` of margin, in every pool, skipping
@@ -562,18 +570,32 @@ class SequenceArena:
         Safe to call concurrently with running kernels: it only touches pages
         strictly ahead of the write frontier.
 
-        If a page budget is attached and cannot cover the new pages, raises
-        ``OutOfPagesError`` *before mapping anything* — the caller reclaims or
-        preempts and retries (§4.6). With ``precharged=True`` the caller has
-        already charged the budget (batched map sweep) and no charge happens
-        here; failure rollback still returns unmapped remainders.
+        If a page budget is attached and cannot cover the new pages, the
+        margin degrades before the call fails: the margin is a latency-hiding
+        hint, and at the capacity edge charging it atomically with the
+        frontier converts a satisfiable growth into a failed allocation (and
+        a spill or preemption) for pages nobody needs yet. Only if the
+        frontier alone does not fit does the call raise ``OutOfPagesError``
+        *before mapping anything* — the caller reclaims or preempts and
+        retries (§4.6). With ``precharged=True`` the caller has already
+        charged the budget (batched map sweep) and no charge happens here;
+        ``margin`` must then be the value the charge was computed with.
+        Failure rollback still returns unmapped remainders.
         """
-        runs_per_pool, total_new = self._mapping_plan(base_block, num_valid_blocks)
+        runs_per_pool, total_new = self._mapping_plan(base_block, num_valid_blocks, margin)
         if total_new == 0:
             return 0
         budget = self._budget
         if budget is not None and not precharged:
-            budget.consume(total_new)  # raises OutOfPagesError; nothing mapped yet
+            try:
+                budget.consume(total_new)  # raises OutOfPagesError; nothing mapped yet
+            except OutOfPagesError:
+                if margin == 0 or (margin < 0 and self._map_ahead_pages == 0):
+                    raise
+                runs_per_pool, total_new = self._mapping_plan(base_block, num_valid_blocks, 0)
+                if total_new == 0:
+                    return 0
+                budget.consume(total_new)  # raises; nothing mapped yet
         page = self._phys_page_size
         frontiers = self._frontiers[base_block]
         num_mapped = 0
