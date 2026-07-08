@@ -122,6 +122,34 @@ def validate_encoder_decoder_kv_cache_config(model_config: ModelConfig,
         )
 
 
+def validate_encoder_decoder_tp_scope(model_config: ModelConfig) -> None:
+    """Validate initially supported encoder-decoder TP combinations."""
+    if not model_config.is_encoder_decoder:
+        return
+
+    mapping = model_config.mapping
+    if mapping.enable_attention_dp:
+        raise ValueError(
+            "Encoder-decoder models do not support attention DP yet. "
+            "Set enable_attention_dp=False.")
+
+    if mapping.cp_size > 1:
+        raise ValueError(
+            "Encoder-decoder models do not support context parallelism yet. "
+            "Set context_parallel_size=1.")
+
+    if mapping.pp_size > 1:
+        raise ValueError(
+            "Encoder-decoder models do not support pipeline parallelism yet. "
+            "Set pipeline_parallel_size=1.")
+
+    if mapping.tp_size > 1 and model_config.attn_backend != "TRTLLM":
+        raise ValueError(
+            "Encoder-decoder tensor parallelism currently supports "
+            f"attn_backend='TRTLLM' only, but got "
+            f"attn_backend='{model_config.attn_backend}'.")
+
+
 def initialize_dummy_weights(
     model: torch.nn.Module,
     low: float = -1e-3,
@@ -1158,6 +1186,7 @@ class ModelLoader:
                 f"{type(config.pretrained_config).__name__}: {e}. "
                 f"AllReduce pre-allocation will be skipped.")
 
+        validate_encoder_decoder_tp_scope(config)
         validate_encoder_decoder_kv_cache_config(config,
                                                  self.llm_args.kv_cache_config)
         validate_and_set_kv_cache_quant(config,
