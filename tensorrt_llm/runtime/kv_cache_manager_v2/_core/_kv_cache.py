@@ -529,7 +529,13 @@ class _KVCache:
 
     # destroy ownership of memory blocks, so KV cache manager can decide to evict or drop them. After
     # close, uncommitted data in blocks for (beam_index >= beam_width) will be lost.
-    def close(self) -> None:
+    def close(self, prior_event: CachedCudaEvent = CachedCudaEvent.NULL) -> None:
+        """Close the sequence. ``prior_event`` should cover the sequence's
+        last KV writes on the *forward* stream (see
+        ``StorageManager.offload_arena_pages``): under the overlap scheduler a
+        speculatively enqueued step may still be appending to the tail block
+        when the request is freed, and the arena write-out below would
+        otherwise copy it stale."""
         assert NDEBUG or self._check_sanity()
         if self.status == self.Status.CLOSED:
             return
@@ -585,7 +591,7 @@ class _KVCache:
                         ),
                     )
                 try:
-                    storage.offload_arena_pages(pg_idx, arena_closing.offload[pg_idx])
+                    storage.offload_arena_pages(pg_idx, arena_closing.offload[pg_idx], prior_event)
                     if arena_lazy:
                         storage.register_arena_ghosts(
                             pg_idx,
@@ -807,9 +813,14 @@ class _KVCache:
             return None
         return ref()
 
-    def _arena_evacuate(self) -> None:
+    def _arena_evacuate(self, prior_event: CachedCudaEvent = CachedCudaEvent.NULL) -> None:
         """Suspend-side write-out (DESIGN.md §4.5): move this sequence's GPU
         pages out of its arena ranges so the ranges can be unmapped.
+
+        ``prior_event`` orders the evacuation copies after the sequence's last
+        KV writes on the forward stream (see
+        ``StorageManager.offload_arena_pages``) -- a scheduler eviction can
+        suspend a sequence whose current step is still in flight.
 
         Written-through committed pages adopt their host copy (copy-free,
         §4.3); other canonical committed pages and uncommitted pages migrate
@@ -873,7 +884,7 @@ class _KVCache:
         dropped.clear()
         for pg_idx in typed_range(storage.num_pool_groups):
             storage.adopt_stale_copies(pg_idx, adopt_pages[pg_idx], adopt_slots[pg_idx])
-            storage.offload_arena_pages(pg_idx, move[pg_idx])
+            storage.offload_arena_pages(pg_idx, move[pg_idx], prior_event)
         self._arena_release_unused_write_through()
 
     def _arena_write_through(self, ordinal: BlockOrdinal) -> None:
@@ -1403,7 +1414,14 @@ class _KVCache:
 
     # Suspend, allow the KV cache manager to evict buffers from GPU, but don't drop them.
     # suspend+resume allows us to implement dynamic batch size. May also be used to support HSTU model.
-    def suspend(self) -> None:
+    def suspend(self, prior_event: CachedCudaEvent = CachedCudaEvent.NULL) -> None:
+        """Suspend the sequence, evacuating its GPU state to the host tier.
+
+        ``prior_event`` should cover the sequence's last KV writes on the
+        *forward* stream (see ``StorageManager.offload_arena_pages``): the
+        scheduler evicts mid-pass, when the victim's current step may still be
+        in flight, and the evacuation copies would otherwise read its tail
+        block before the step's writes land."""
         assert self.status == self.Status.ACTIVE
         assert self._check_sanity()
         # Assert on a local, not the attribute: `assert self._finish_event is
@@ -1445,7 +1463,7 @@ class _KVCache:
                 # Evacuation reads this sequence's pages; execute any
                 # still-deferred growth maps first.
                 self.manager._storage.flush_gpu_mappings()
-            self._arena_evacuate()
+            self._arena_evacuate(prior_event)
             storage = self.manager._storage
             for pg_idx, rng in typed_enumerate(self._arena_ranges):
                 storage.free_gpu_sequence(pg_idx, rng, arena_last_consumer)

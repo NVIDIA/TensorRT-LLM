@@ -879,6 +879,47 @@ class TestStorageManagerArenaMode(unittest.TestCase):
         for page in pages:
             storage.release_slot(self.LC0, CacheLevel(1), page)
 
+    def test_batched_migrate_orders_after_extra_prior_event(self) -> None:
+        """§4.5 write-out ordering, mechanism level.
+
+        The batched-copy kernel reads its sources at execution time with no
+        ordering against other streams. A suspend/close write-out's source
+        blocks may still be receiving the in-flight step's KV writes on the
+        forward stream (overlap scheduler); ``extra_prior_event`` must gate
+        the copy or the host tier captures the block pre-write.
+        """
+        storage = self.storage
+        rng = storage.reserve_gpu_sequence(self.PG0, 64)
+        storage.ensure_gpu_mapped(self.PG0, rng, 2)
+        # Warm up the batched-copy kernel first: its first-call module-load
+        # latency exceeds the race window and would mask the assertion.
+        s0 = storage.take_gpu_sequence_slot(self.PG0, rng, 0)
+        p0 = self._gpu_page(s0)
+        storage._batched_migrate(self.PG0, CacheLevel(1), GPU_LEVEL, [p0], update_src=True)
+        torch.cuda.synchronize()
+        # The race: a delayed write on a foreign ("forward") stream is still
+        # pending when the write-out is enqueued.
+        s1 = storage.take_gpu_sequence_slot(self.PG0, rng, 1)
+        sid1 = s1.slot_id
+        self._slot_floats(GPU_LEVEL, sid1).fill_(1.0)
+        torch.cuda.synchronize()
+        page = self._gpu_page(s1)
+        fwd = torch.cuda.Stream()
+        with torch.cuda.stream(fwd):
+            torch.cuda._sleep(100_000_000)
+            self._slot_floats(GPU_LEVEL, sid1).fill_(2.0)
+        prior = CachedCudaEvent(CudaStream(fwd.cuda_stream))
+        storage._batched_migrate(
+            self.PG0, CacheLevel(1), GPU_LEVEL, [page], update_src=True, extra_prior_event=prior
+        )
+        torch.cuda.synchronize()
+        host_data = self._slot_floats(CacheLevel(1), page.slot_id)
+        self.assertTrue(bool((host_data == 2.0).all().item()))
+        storage.free_gpu_sequence(self.PG0, rng, CachedCudaEvent.NULL)
+        self.assertEqual(storage.drain_gpu_reclaim(CachedCudaEvent.NULL, wait=True), 1)
+        for p in (p0, page):
+            storage.release_slot(self.LC0, CacheLevel(1), p)
+
     def test_onboard_explicit_destination(self) -> None:
         """§4.4 stale->active mechanics.
 
@@ -1248,6 +1289,55 @@ class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
         self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
         self.assertEqual(budget.used_pages, 0)
         self.assertEqual(self._host_used(), 2)
+
+    def test_suspend_orders_evacuation_after_forward_stream_writes(self) -> None:
+        """§4.5 write-out ordering vs the in-flight step.
+
+        A scheduler eviction can suspend a sequence whose current step is
+        still writing its tail block on the FORWARD stream; the sequence's
+        manager-stream events and the pages' ready events do not order
+        against it. The evacuation copies must wait on the caller-supplied
+        ``prior_event`` or the host copy captures the block pre-write and
+        resume restores stale bytes.
+        """
+        manager = self.manager
+        # Warm up the batched-copy kernel: its first-call module-load latency
+        # exceeds the race window below and would mask the assertion.
+        kv0 = manager.create_kv_cache(max_capacity=self.TPB)
+        with TemporaryCudaStream([]) as s0:
+            self.assertTrue(kv0.resume(CudaStream(s0.handle)))
+            self.assertTrue(kv0.resize(self.TPB))
+            kv0.suspend()
+        s0.take_finish_event().synchronize()
+        kv0.close()
+        torch.cuda.synchronize()
+        kv = manager.create_kv_cache(max_capacity=4 * self.TPB)
+        with TemporaryCudaStream([]) as s:
+            stream = CudaStream(s.handle)
+            self.assertTrue(kv.resume(stream))
+            self.assertTrue(kv.resize(2 * self.TPB))
+            old_indices = list(kv.get_base_page_indices(LifeCycleId(0)))
+            for idx in old_indices:
+                self._block_floats(idx).fill_(1.0)
+            torch.cuda.synchronize()
+            kv.commit([500 + i for i in range(self.TPB)])  # block 1 = uncommitted tail
+            # The in-flight "forward step": a delayed overwrite of the tail
+            # block on a separate stream, still pending when suspend() runs.
+            fwd = torch.cuda.Stream()
+            with torch.cuda.stream(fwd):
+                torch.cuda._sleep(50_000_000)
+                self._block_floats(old_indices[-1]).fill_(2.0)
+            kv.suspend(CachedCudaEvent(CudaStream(fwd.cuda_stream)))
+        torch.cuda.synchronize()
+        with TemporaryCudaStream([]) as s2:
+            self.assertTrue(kv.resume(CudaStream(s2.handle)))
+            torch.cuda.synchronize()
+            indices = list(kv.get_base_page_indices(LifeCycleId(0)))
+            tail = self._block_floats(indices[-1])
+            self.assertTrue(bool((tail == 2.0).all().item()))
+            kv.close()
+        torch.cuda.synchronize()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL, wait=True)
 
     def test_suspend_drops_private_copies(self) -> None:
         """§4.5 x §4.4 interaction.

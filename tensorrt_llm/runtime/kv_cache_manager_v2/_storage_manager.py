@@ -622,11 +622,25 @@ class StorageManager:
                 seen.add(id(rng))
                 rng._gate_events.append(finish_event)
 
-    def offload_arena_pages(self, pg_idx: PoolGroupIndex, pages: Sequence[Page]) -> None:
+    def offload_arena_pages(
+        self,
+        pg_idx: PoolGroupIndex,
+        pages: Sequence[Page],
+        prior_event: CachedCudaEvent = CachedCudaEvent.NULL,
+    ) -> None:
         """Active->stale copy-on-free (§4.3): migrate a freeing sequence's
         committed GPU pages to the host tier and schedule them for host-level
         eviction. The vacated arena slots return to their sequence range with
-        the copy's finish event as a reclaim gate."""
+        the copy's finish event as a reclaim gate.
+
+        ``prior_event`` must cover the sequence's last KV writes. Those writes
+        run on the *forward* stream, and under the overlap scheduler a
+        speculatively enqueued step may still be writing when the sequence is
+        closed or suspended; the pages' ready events and the sequence's
+        manager-stream events do not order against it, so without this event
+        the copies can read a stale tail block (silent corruption surfacing on
+        reuse or resume). Callers pass an event recorded on the execution
+        stream at the write-out site."""
         if not pages:
             return
         assert self.is_arena_mode
@@ -641,7 +655,9 @@ class StorageManager:
         for p in pages:
             if p.scheduled_for_eviction:
                 self.exclude_from_eviction(p)
-        self._batched_migrate(pg_idx, host_lvl, GPU_LEVEL, pages, update_src=True)
+        self._batched_migrate(
+            pg_idx, host_lvl, GPU_LEVEL, pages, update_src=True, extra_prior_event=prior_event
+        )
         for p in pages:
             self.schedule_for_eviction(p)
 

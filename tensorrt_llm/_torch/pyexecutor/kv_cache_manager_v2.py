@@ -1579,7 +1579,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"{kv_cache.capacity} to {pre_cap}"
             )
         if pre_cap > 0:
-            kv_cache.suspend()
+            kv_cache.suspend(self._arena_write_out_fence())
 
     def _restore_page_index_bufs(self, request_id: int, kv_cache) -> None:
         """Re-connect host page-index buffers after resume().
@@ -1704,7 +1704,7 @@ class KVCacheManagerV2(BaseResourceManager):
             success = kv_cache.resize(capacity, history_length)
         if not success:
             if req.is_first_context_chunk:
-                kv_cache.suspend()
+                kv_cache.suspend(self._arena_write_out_fence())
             return False
 
         # None means "no growth this iter, nothing to revert"; this also
@@ -1752,7 +1752,7 @@ class KVCacheManagerV2(BaseResourceManager):
         """Suspend a request's KV cache (move to host tier)."""
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is not None and kv_cache.is_active:
-            kv_cache.suspend()
+            kv_cache.suspend(self._arena_write_out_fence())
 
     def resume_request(self, req: LlmRequest) -> bool:
         """Resume a previously-suspended KV cache for *req*.
@@ -1804,6 +1804,18 @@ class KVCacheManagerV2(BaseResourceManager):
             # speculatively enqueued overlap-scheduler step (risk #3).
             self.impl.flush_gpu_mappings()
             self.impl.drain_gpu_reclaim(self._reclaim_fence())
+
+    def _arena_write_out_fence(self) -> CachedCudaEvent:
+        """Forward-stream event covering a sequence's last KV writes, passed
+        to the arena write-outs at suspend/close (see
+        ``StorageManager.offload_arena_pages``). Under the overlap scheduler a
+        victim's / finishing request's current step may still be in flight;
+        an event recorded here on the executor thread's current stream (= the
+        forward stream) orders after it. NULL in classic mode (no arena
+        write-out exists there)."""
+        if not self._arena_enabled:
+            return CachedCudaEvent.NULL
+        return self._reclaim_fence()
 
     def _prepare_draft_resources(self, scheduled_batch: ScheduledRequests):
         """Create/resize KV caches in the draft V2 manager for scheduled requests.
@@ -2411,7 +2423,7 @@ class KVCacheManagerV2(BaseResourceManager):
             return
         kv_cache.discard_pending_stats()
         self.try_commit_blocks_for_reuse(request, kv_cache)
-        kv_cache.close()
+        kv_cache.close(self._arena_write_out_fence())
         self.impl.clear_stats_excluded(request.py_request_id)
         if request.py_request_id in self._early_freed_index_requests:
             self._early_freed_index_requests.discard(request.py_request_id)
