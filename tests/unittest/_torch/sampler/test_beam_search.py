@@ -36,7 +36,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
 from tensorrt_llm._torch.pyexecutor.sampler import (BeamHistory,
                                                     SampleStateTorch,
                                                     TorchSampler)
-from tensorrt_llm._torch.pyexecutor.sampling_utils import (
+from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import (
     BEAM_SEARCH_PAD_TOKEN, BeamSearchMetadata, beam_search_sampling_batch)
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.executor import RequestError

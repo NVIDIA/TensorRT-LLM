@@ -2754,9 +2754,11 @@ legacy-files: &legacy_files |
 # Files to be subjected to static analysis
 static-analysis-files: &static_analysis_files |
     (?x)^(
-        tensorrt_llm/_torch/pyexecutor/sampler.py |
-        tensorrt_llm/_torch/pyexecutor/sampling_utils.py |
-        tensorrt_llm/_torch/pyexecutor/sampling_utils_flashinfer.py |
+        tensorrt_llm/_torch/pyexecutor/sampler/sampler.py |
+        tensorrt_llm/_torch/pyexecutor/sampler/sampling_utils.py |
+        tensorrt_llm/_torch/pyexecutor/sampler/ops/interface.py |
+        tensorrt_llm/_torch/pyexecutor/sampler/ops/flashinfer.py |
+        tensorrt_llm/_torch/pyexecutor/sampler/ops/vanilla.py |
         tests/unittest/_torch/sampler/test_torch_sampler.py |
         tests/unittest/_torch/sampler/test_beam_search.py |
         tests/unittest/_torch/sampler/test_beam_search_util.py |
