@@ -1,9 +1,9 @@
 THUDM/chatglm3-6b:
-  # PROVISIONAL reference pending the measured HF GSM8K run for this
-  # checkpoint; the TRTLLM gate must land within 2 points of the measured HF
-  # score (task.yaml). Replace with the measured HF number before treating the
-  # accuracy gate as validated.
-  - accuracy: 40.00
+  # Measured HF reference: chatglm3-6b greedy-decoded through the same
+  # lm-eval gsm8k task/scoring as trtllm-eval (workspace
+  # hf_gsm8k_reference.py, batched left-padded greedy). The TRT gate
+  # (baseline & CUDA-graph/overlap) lands within 2 points.
+  - accuracy: 52.73
 meta-llama/Llama-3.1-8B-Instruct:
   - accuracy: 74.20
   - spec_dec_algo: NGram
