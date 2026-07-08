@@ -706,6 +706,10 @@ accuracy/test_llm_api_pytorch.py::TestPhi4MiniInstruct::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestChatGLM3_6B::test_llm_api_smoke
 accuracy/test_llm_api_pytorch.py::TestChatGLM3_6B::test_auto_dtype[cuda_graph=False]
 accuracy/test_llm_api_pytorch.py::TestChatGLM3_6B::test_auto_dtype[cuda_graph=True]
+accuracy/test_chatglm3_parity.py::test_source_logit_replay[baseline]
+accuracy/test_chatglm3_parity.py::test_source_logit_replay[enabled]
+accuracy/test_chatglm3_parity.py::test_generation_parity[baseline]
+accuracy/test_chatglm3_parity.py::test_generation_parity[enabled]
 accuracy/test_llm_api_pytorch.py::TestQwen2_7BInstruct::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_fp8[latency]
 accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_fp8[throughput_latency]

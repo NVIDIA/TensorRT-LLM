@@ -17,15 +17,16 @@ import os
 
 import pytest
 import torch
-from _torch.helpers import create_mock_cuda_graph_runner
 
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_chatglm import ChatGLMForCausalLM
+from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.utils import piecewise_cuda_graph
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.skipif(
@@ -139,6 +140,50 @@ def _cos(a, b):
     return torch.nn.functional.cosine_similarity(
         a.float().flatten(), b.float().flatten(), dim=0
     ).item()
+
+
+def _replay_decode_logits_under_cuda_graph(model, gen_ids, dec_pos, dec_metadata):
+    """Capture the full-model decode into a real CUDA graph and replay it.
+
+    Uses the production graph-reuse hard path proven for the TRTLLM backend +
+    ``KVCacheManagerV2`` in ``tests/unittest/_torch/attention/backend_case.py``:
+    the cuda-graph metadata is prepared once *before* capture, the decode inputs
+    live in fixed-address static buffers, and warmup runs on a side stream so
+    host-syncing metadata work stays outside the capture region. The decode
+    kernel appends the single new token's K/V to the same fixed cache slot on
+    every warmup/capture/replay pass, so the repeated append is idempotent.
+    ``with_multi_stream``/``piecewise_cuda_graph`` mirror ``CUDAGraphRunner`` so
+    any aux-stream attention work is captured, not silently dropped. Returns the
+    replayed decode logits (a genuine capture+replay, not a ``cuda_graph=true``
+    flag over an eager fallback).
+    """
+    cg_md = dec_metadata.create_cuda_graph_metadata(1)
+    cg_md.seq_lens = torch.tensor([1], dtype=torch.int)
+    cg_md.num_contexts = 0
+    cg_md.prepare()
+
+    # Fixed-address static input buffers the captured graph reads on every replay.
+    static_ids = torch.zeros_like(gen_ids)
+    static_pos = torch.zeros_like(dec_pos)
+    static_ids.copy_(gen_ids)
+    static_pos.copy_(dec_pos)
+
+    def _fwd():
+        return model.forward(input_ids=static_ids, position_ids=static_pos, attn_metadata=cg_md)
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with with_multi_stream(True), piecewise_cuda_graph(False):
+        with torch.cuda.stream(side):
+            for _ in range(2):
+                _fwd()
+        torch.cuda.current_stream().wait_stream(side)
+        with torch.cuda.graph(graph):
+            out = _fwd()
+    graph.replay()
+    torch.cuda.synchronize()
+    return out.clone()
 
 
 @torch.no_grad()
@@ -256,36 +301,23 @@ def _assert_cuda_graph_matches_hf(model, hf, config, device, backend):
         attn_metadata, position_ids, request_ids = _context_metadata(
             backend, kv_cache_manager, seq_len, device
         )
-        with torch.inference_mode():
-            attn_metadata.prepare()
-            model.forward(
-                input_ids=input_ids, position_ids=position_ids, attn_metadata=attn_metadata
-            )
-            hf_out = hf.forward(
-                input_ids=input_ids.unsqueeze(0), position_ids=position_ids, use_cache=True
-            )
+        attn_metadata.prepare()
+        model.forward(input_ids=input_ids, position_ids=position_ids, attn_metadata=attn_metadata)
+        hf_out = hf.forward(
+            input_ids=input_ids.unsqueeze(0), position_ids=position_ids, use_cache=True
+        )
 
         gen_ids = torch.tensor([PROMPT_IDS[-1]], dtype=torch.int32, device=device)
         dec_metadata, dec_pos = _decode_metadata(
             backend, kv_cache_manager, request_ids, seq_len, device
         )
-        dec_metadata = dec_metadata.create_cuda_graph_metadata(1)
-        graph_runner = create_mock_cuda_graph_runner(1)
-        inputs = {"input_ids": gen_ids, "position_ids": dec_pos, "attn_metadata": dec_metadata}
-        key = (1, 0, False)
-        with torch.inference_mode():
-            dec_metadata.prepare()
-            graph_runner.capture(key, lambda inp: model.forward(**inp), inputs)
-            for _ in range(2):
-                dec_metadata.prepare()
-                trt_logits = graph_runner.replay(key, inputs)
-            hf_dec = hf.forward(
-                input_ids=gen_ids.unsqueeze(0),
-                position_ids=dec_pos,
-                past_key_values=hf_out.past_key_values,
-                use_cache=True,
-            )
-        graph_runner.clear()
+        trt_logits = _replay_decode_logits_under_cuda_graph(model, gen_ids, dec_pos, dec_metadata)
+        hf_dec = hf.forward(
+            input_ids=gen_ids.unsqueeze(0),
+            position_ids=dec_pos,
+            past_key_values=hf_out.past_key_values,
+            use_cache=True,
+        )
         assert trt_logits.argmax(-1).item() == hf_dec.logits[:, -1].argmax(-1).item(), (
             "cuda-graph decode token mismatch"
         )
@@ -318,14 +350,11 @@ def test_real_runtime_cuda_graph_hard_path(enable_cuda_graph):
         attn_metadata, position_ids, request_ids = _context_metadata(
             backend, kv_cache_manager, seq_len, device
         )
-        with torch.inference_mode():
-            attn_metadata.prepare()
-            model.forward(
-                input_ids=input_ids, position_ids=position_ids, attn_metadata=attn_metadata
-            )
-            hf_out = hf.forward(
-                input_ids=input_ids.unsqueeze(0), position_ids=position_ids, use_cache=True
-            )
+        attn_metadata.prepare()
+        model.forward(input_ids=input_ids, position_ids=position_ids, attn_metadata=attn_metadata)
+        hf_out = hf.forward(
+            input_ids=input_ids.unsqueeze(0), position_ids=position_ids, use_cache=True
+        )
 
         gen_ids = torch.tensor([PROMPT_IDS[-1]], dtype=torch.int32, device=device)
         dec_metadata, dec_pos = _decode_metadata(
@@ -333,31 +362,22 @@ def test_real_runtime_cuda_graph_hard_path(enable_cuda_graph):
         )
 
         if enable_cuda_graph:
-            dec_metadata = dec_metadata.create_cuda_graph_metadata(1)
-            graph_runner = create_mock_cuda_graph_runner(1)
-            inputs = {"input_ids": gen_ids, "position_ids": dec_pos, "attn_metadata": dec_metadata}
-            key = (1, 0, False)
-            with torch.inference_mode():
-                dec_metadata.prepare()
-                graph_runner.capture(key, lambda inp: model.forward(**inp), inputs)
-                for _ in range(2):
-                    dec_metadata.prepare()
-                    trt_logits = graph_runner.replay(key, inputs)
-            graph_runner.clear()
-        else:
-            with torch.inference_mode():
-                dec_metadata.prepare()
-                trt_logits = model.forward(
-                    input_ids=gen_ids, position_ids=dec_pos, attn_metadata=dec_metadata
-                )
-
-        with torch.inference_mode():
-            hf_dec = hf.forward(
-                input_ids=gen_ids.unsqueeze(0),
-                position_ids=dec_pos,
-                past_key_values=hf_out.past_key_values,
-                use_cache=True,
+            # Enabled config: prove the CUDA-graph hard path (real capture+replay).
+            trt_logits = _replay_decode_logits_under_cuda_graph(
+                model, gen_ids, dec_pos, dec_metadata
             )
+        else:
+            dec_metadata.prepare()
+            trt_logits = model.forward(
+                input_ids=gen_ids, position_ids=dec_pos, attn_metadata=dec_metadata
+            )
+
+        hf_dec = hf.forward(
+            input_ids=gen_ids.unsqueeze(0),
+            position_ids=dec_pos,
+            past_key_values=hf_out.past_key_values,
+            use_cache=True,
+        )
         assert trt_logits.argmax(-1).item() == hf_dec.logits[:, -1].argmax(-1).item()
     finally:
         kv_cache_manager.shutdown()
