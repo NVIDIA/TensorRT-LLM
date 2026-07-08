@@ -15,7 +15,9 @@ import base64
 from io import BytesIO
 from typing import Any, Dict, Optional
 
+import numpy as np
 import pytest
+from fastapi import UploadFile
 from PIL import Image
 
 from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest, VideoGenerationRequest
@@ -288,6 +290,83 @@ class TestInputReferenceMaterialization:
         request = VideoGenerationRequest(prompt="x", input_reference=b64)
         with pytest.raises(ValueError, match="media_storage_path"):
             parse_visual_gen_params(request, "vid-2", generator, media_storage_path=None)
+
+    @staticmethod
+    def _mp4_bytes() -> bytes:
+        """Encode a 2-frame 16x16 mpeg4-in-mp4 clip in memory.
+
+        ``mpeg4`` is a built-in FFmpeg encoder, so this works on any
+        PyAV wheel (h264 may be absent from LGPL builds).
+        """
+        av = pytest.importorskip("av")
+        buf = BytesIO()
+        with av.open(buf, "w", format="mp4") as container:
+            stream = container.add_stream("mpeg4", rate=4)
+            stream.width = 16
+            stream.height = 16
+            stream.pix_fmt = "yuv420p"
+            for _ in range(2):
+                frame = av.VideoFrame.from_ndarray(
+                    np.zeros((16, 16, 3), dtype=np.uint8), format="rgb24"
+                )
+                container.mux(stream.encode(frame))
+            container.mux(stream.encode())
+        return buf.getvalue()
+
+    def test_multipart_video_reference_routes_to_extra_params(self, tmp_path):
+        generator = _StubVisualGen()
+        upload = UploadFile(file=BytesIO(self._mp4_bytes()), filename="clip.mp4")
+        request = VideoGenerationRequest(prompt="x", input_reference=upload)
+        params = parse_visual_gen_params(
+            request, "vid-3", generator, media_storage_path=str(tmp_path)
+        )
+        # Video content routes to extra_params["video"], not params.image,
+        # and the written suffix drives the worker's decode dispatch.
+        assert params.image is None
+        assert params.extra_params is not None
+        assert str(params.extra_params["video"]).endswith("vid-3_reference.mp4")
+        assert (tmp_path / "vid-3_reference.mp4").exists()
+
+    def test_base64_video_reference_routes_to_extra_params(self, tmp_path):
+        # Classification is content-based, so the JSON/base64 path can
+        # carry video even though it has no content-type or filename.
+        generator = _StubVisualGen()
+        b64 = base64.b64encode(self._mp4_bytes()).decode()
+        request = VideoGenerationRequest(prompt="x", input_reference=b64)
+        params = parse_visual_gen_params(
+            request, "vid-4", generator, media_storage_path=str(tmp_path)
+        )
+        assert params.image is None
+        assert str(params.extra_params["video"]).endswith("vid-4_reference.mp4")
+
+    def test_multipart_image_reference_routes_to_image(self, tmp_path):
+        # JPEG upload: content sniffing classifies it as an image even
+        # though the stored name is the cosmetic ``.png`` (PIL identifies
+        # by content, not suffix).
+        generator = _StubVisualGen()
+        img = Image.new("RGB", (4, 4), (10, 20, 30))
+        buf = BytesIO()
+        img.save(buf, format="JPEG")
+        buf.seek(0)
+        upload = UploadFile(file=buf, filename="ref.jpg")
+        request = VideoGenerationRequest(prompt="x", input_reference=upload)
+        params = parse_visual_gen_params(
+            request, "vid-5", generator, media_storage_path=str(tmp_path)
+        )
+        assert params.extra_params is None
+        assert str(params.image).endswith("vid-5_reference.png")
+
+    def test_undecodable_reference_raises_and_cleans_up(self, tmp_path):
+        pytest.importorskip("av")
+        generator = _StubVisualGen()
+        b64 = base64.b64encode(b"neither an image nor a video").decode()
+        request = VideoGenerationRequest(prompt="x", input_reference=b64)
+        with pytest.raises(ValueError, match="neither a decodable image"):
+            parse_visual_gen_params(
+                request, "vid-6", generator, media_storage_path=str(tmp_path)
+            )
+        # The temporary materialization is removed on rejection.
+        assert list(tmp_path.iterdir()) == []
 
 
 # =============================================================================
