@@ -608,7 +608,12 @@ void KVCacheTransferManager::diskReaderLoop()
     TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
     cudaStream_t stream;
     TLLM_CUDA_CHECK(cudaStreamCreate(&stream));
-    std::vector<std::uint8_t> hostBuffer;
+    // Per-reader PINNED staging buffer, grown on demand to one job's total pool bytes (fixed after the first
+    // job). Pinned so cudaMemcpyAsync is a real async DMA (~20+ GB/s) instead of the driver's hidden pageable
+    // staging copy (~5-8 GB/s, secretly synchronous). pageableFallback is used only if a pinned alloc is refused.
+    std::uint8_t* pinnedBuf = nullptr;
+    std::size_t pinnedCap = 0;
+    std::vector<std::uint8_t> pageableFallback;
     std::shared_ptr<kvc::BaseLoopbackAgent> gdsAgent; // per-reader GDS agent, created lazily on the first GDS job
     while (true)
     {
@@ -669,20 +674,53 @@ void KVCacheTransferManager::diskReaderLoop()
         }
         if (!job.useGds)
         {
+            // Stage the whole block through the pinned buffer, each pool at its OWN offset, so no region is
+            // overwritten while its DMA is still reading it (a pinned cudaMemcpyAsync returns before the DMA
+            // finishes). One stream sync after the loop makes the buffer safe to reuse for the next job.
+            std::size_t total = 0;
+            for (auto const b : job.bytes)
+            {
+                total += b;
+            }
+            if (total > pinnedCap)
+            {
+                if (pinnedBuf != nullptr)
+                {
+                    cudaFreeHost(pinnedBuf);
+                    pinnedBuf = nullptr;
+                }
+                if (cudaHostAlloc(reinterpret_cast<void**>(&pinnedBuf), total, cudaHostAllocDefault) == cudaSuccess)
+                {
+                    pinnedCap = total;
+                }
+                else
+                {
+                    pinnedBuf = nullptr;
+                    pinnedCap = 0;
+                    TLLM_LOG_WARNING(
+                        "[disk-tier] pinned host alloc of %zu B refused; falling back to pageable staging", total);
+                }
+            }
+            std::uint8_t* buf = pinnedBuf;
+            if (buf == nullptr)
+            {
+                pageableFallback.resize(total);
+                buf = pageableFallback.data();
+            }
+            std::size_t off = 0;
             for (size_t i = 0; i < job.dsts.size(); ++i)
             {
                 int fd = ::open(job.files[i].c_str(), O_RDONLY);
                 TLLM_CHECK_WITH_INFO(fd >= 0,
                     "[disk-tier] cannot open %s for async read; failing loudly rather than serving corrupt KV",
                     job.files[i].c_str());
-                hostBuffer.resize(job.bytes[i]);
-                auto const got = ::read(fd, hostBuffer.data(), job.bytes[i]);
+                auto const got = ::read(fd, buf + off, job.bytes[i]);
                 ::close(fd);
                 TLLM_CHECK_WITH_INFO(got == static_cast<ssize_t>(job.bytes[i]),
                     "[disk-tier] short async read from %s (%zd/%zu); failing loudly rather than serving corrupt KV",
                     job.files[i].c_str(), static_cast<ssize_t>(got), job.bytes[i]);
-                TLLM_CUDA_CHECK(
-                    cudaMemcpyAsync(job.dsts[i], hostBuffer.data(), job.bytes[i], cudaMemcpyHostToDevice, stream));
+                TLLM_CUDA_CHECK(cudaMemcpyAsync(job.dsts[i], buf + off, job.bytes[i], cudaMemcpyHostToDevice, stream));
+                off += job.bytes[i];
             }
             TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
         }
@@ -693,6 +731,10 @@ void KVCacheTransferManager::diskReaderLoop()
             mPendingBlockReads.erase(job.blockId);
             mReadInflightCount.store(mPendingBlockReads.size(), std::memory_order_release);
         }
+    }
+    if (pinnedBuf != nullptr)
+    {
+        cudaFreeHost(pinnedBuf);
     }
     cudaStreamDestroy(stream);
 }
