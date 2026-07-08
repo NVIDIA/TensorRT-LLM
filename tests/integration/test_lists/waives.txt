@@ -415,8 +415,6 @@ test_e2e.py::test_trtllm_bench_iteration_log[TRT-streaming-meta-llama/Llama-3.1-
 triton_server/test_triton.py::test_cpp_unit_tests[cpp-unit-tests] SKIP (https://nvbugs/5619359)
 triton_server/test_triton.py::test_python_bls_unit_tests[python-bls-unit-tests] SKIP (https://nvbugs/5477392)
 unittest/_torch/attention/sparse/deepseek_v4/test_compressor_kernel.py::test_prefill_varlen[varlen_hd512_overlap] SKIP (https://nvbugs/6426860)
-unittest/_torch/attention/test_attention_op_sync.py::test_attr_kwarg_names_match_source_leaf_attrs_except_allowlisted_aliases SKIP (https://nvbugs/6425425)
-unittest/_torch/attention/test_attention_op_sync.py::test_every_forward_args_field_is_consumed SKIP (https://nvbugs/6425441)
 unittest/_torch/misc/test_share_tensor.py::TestShareTensor::test_share_tensor_different_dtypes SKIP (https://nvbugs/6418021)
 unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend[act=Relu2-e60_k4_h2048_i1408-seq=8-dtype=torch.bfloat16-backend=TRTLLM-quant=NVFP4-routing=Renormalize] SKIP (https://nvbugs/5989912)
 unittest/_torch/modules/tests_lora_modules/test_nemotron_h_lora_sanity.py::TestNemotronHLoRA::test_lora_pp2_sanity SKIP (https://nvbugs/6428124)
