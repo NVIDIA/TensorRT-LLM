@@ -10,7 +10,7 @@ import time
 import traceback
 from contextlib import contextmanager
 from enum import IntEnum
-from queue import Queue
+from queue import Empty, Queue
 from typing import (TYPE_CHECKING, Callable, Dict, Iterable, List, Optional,
                     Tuple, Union)
 
@@ -958,13 +958,11 @@ class PyExecutor:
 
         if self.dist.pp_size > 1:
             self.event_loop = self._executor_loop_pp
-            # `TLLM_PP_ASYNC_BROADCAST_SAMPLE_STATE` controls whether to broadcast the sample state asynchronously.
-            # If true, the executor loop can broadcast and handle sample states asynchronously to achieve best perf.
-            # If false, the executor loop can only broadcast and handle each sample state in a pre-defined iteration.
-            # It is only for debugging purposes.
-            # Some tests can disable it to get a deterministic behavior.
+            # Sample-state relay mode. "1": a background thread relays them,
+            # overlapping with forward, but it needs the GIL and can be starved
+            # into a PP deadlock by GIL-holding native calls. "0": relay inline.
             self.pp_async_broadcast_sample_state = os.environ.get(
-                "TLLM_PP_ASYNC_BROADCAST_SAMPLE_STATE", "1") == "1"
+                "TLLM_PP_ASYNC_BROADCAST_SAMPLE_STATE", "0") == "1"
         else:
             self.event_loop = self._executor_loop if self.disable_overlap_scheduler else self._executor_loop_overlap
         if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
@@ -1223,10 +1221,13 @@ class PyExecutor:
         with self.worker_lock:
             if not self.worker_started:
                 if self.dist.pp_size > 1:
-                    self.executed_batch_queue: Queue[BatchStatePP] = Queue(
-                        maxsize=self.num_micro_batches)
+                    # Both relay modes deposit relayed sample states here
+                    # for the executor loop to handle.
                     self.executed_batch_response_queue: Queue[
                         BatchStatePP] = Queue(maxsize=-1)
+                if self.dist.pp_size > 1 and self.pp_async_broadcast_sample_state:
+                    self.executed_batch_queue: Queue[BatchStatePP] = Queue(
+                        maxsize=self.num_micro_batches)
                     # Duplicate the communicator on the main thread before the
                     # PP event loop starts. MPI_Comm_dup is collective across
                     # ranks, so doing it here avoids racing with the worker
@@ -1448,7 +1449,7 @@ class PyExecutor:
             logger.error("Hang detected, shutting down immediately.")
             return
         self.worker_thread.join()
-        if self.dist.pp_size > 1:
+        if self.dist.pp_size > 1 and self.pp_async_broadcast_sample_state:
             self.executed_batch_queue.put(None)
             self.broadcast_sample_state_handler.join()
         # Signal non-rank-0 sleep/wakeup listener threads to exit.  This runs
@@ -2595,6 +2596,13 @@ class PyExecutor:
                 else:
                     logger.debug(f"microbatch {microbatch_id} can be queued")
 
+                    if not self.pp_async_broadcast_sample_state:
+                        # Drain pending relay isends before forward: rendezvous
+                        # sends need this rank to keep entering MPI, and a forward
+                        # blocked in a native call would starve the receiving rank.
+                        for mb in range(self.num_micro_batches):
+                            self.wait_on_pp_send_handles(self.send_handles, mb)
+
                     self._add_inflight_ids(scheduled_batch)
 
                     if self.kv_cache_transceiver:
@@ -2727,7 +2735,13 @@ class PyExecutor:
                                           offset) % self.num_micro_batches
                 executed_batch = self.micro_batches[executed_microbatch_id]
                 if executed_batch is not None:
-                    self.executed_batch_queue.put(executed_batch)
+                    if self.pp_async_broadcast_sample_state:
+                        self.executed_batch_queue.put(executed_batch)
+                    else:
+                        # Relay inline on the executor thread; unlike the
+                        # background thread, delivery cannot be starved by the
+                        # GIL when a forward blocks inside a native call.
+                        self._ring_broadcast_sample_state(executed_batch)
                     self.unhandled_batch_counter += 1
                 self.micro_batches[executed_microbatch_id] = None
 
@@ -2777,8 +2791,23 @@ class PyExecutor:
                         dequeue_counter = 0
                         while dequeue_counter < executed_batch_num:
                             with nvtx_range("get_executed_batch"):
-                                executed_batch = self.executed_batch_response_queue.get(
-                                )
+                                if self.pp_async_broadcast_sample_state:
+                                    executed_batch = self.executed_batch_response_queue.get(
+                                    )
+                                else:
+                                    # The inline relay deposits batches in the
+                                    # same iteration they are handled; an empty
+                                    # queue means the PP ranks diverged.
+                                    try:
+                                        executed_batch = self.executed_batch_response_queue.get_nowait(
+                                        )
+                                    except Empty as e:
+                                        raise RuntimeError(
+                                            f"PP rank {self.dist.pp_rank} expected "
+                                            f"{executed_batch_num} relayed sample states "
+                                            f"this iteration but found only {dequeue_counter}; "
+                                            f"PP ranks diverged on the microbatch schedule."
+                                        ) from e
                             self._handle_executed_batch(executed_batch)
                             dequeue_counter += 1
                     else:
