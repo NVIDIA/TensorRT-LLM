@@ -293,6 +293,133 @@ def test_cute_dsl_gvr_topk_decode(
 
 
 # ===========================================================================
+# GVR top-K multi-CTA short-row degrade boundary tests.
+#
+# For cluster_size > 1 each row is owned by a cluster of CTAs.  When the
+# actual row length N_eff fits within a single CTA's static slice
+# (N_eff <= ceil(buffer_N / cluster_size)), the cluster degrades: CTA 0
+# scans the row solo (no cluster sync) and the other CTAs exit early.
+# When N_eff > max_slice_len all CTAs cooperate via DSMEM.
+# ===========================================================================
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("cluster_size", [2, 4])
+@pytest.mark.parametrize(
+    "dtype,top_k",
+    [(torch.bfloat16, 512), (torch.float32, 2048)],
+)
+def test_cute_dsl_gvr_topk_multi_cta_shortrow_degrade_boundary(dtype, top_k, cluster_size):
+    """GVR top-K multi-CTA short-row degrade: correctness at the cluster transition boundary.
+
+    When ``cluster_size > 1``, each row is dispatched to a cluster of
+    ``cluster_size`` CTAs.  Whether the cluster cooperates depends on the
+    actual row length N_eff relative to ``max_slice_len = ceil(buffer_N /
+    cluster_size)`` — the per-CTA design slice width:
+
+    * N_eff <= max_slice_len (short row): all tokens fit in CTA 0's static
+      slice; CTA 0 scans solo (``do_cluster_sync=False``), the other
+      ``cluster_size - 1`` CTAs exit early.  This avoids wasted mbarrier
+      overhead when the cluster would add no parallelism.
+
+    * N_eff > max_slice_len (long row): tokens span multiple CTAs; all
+      ``cluster_size`` CTAs cooperate via DSMEM (``do_cluster_sync=True``).
+
+    This test pins N_eff at max_slice_len − 1 / max_slice_len /
+    max_slice_len + 1 to verify correctness exactly at the boundary, and
+    adds a mixed batch with alternating short and long rows.
+    """
+    next_n = 1
+    compress_ratio = 1
+    # Choose N so that per_cta_design (the kernel's ceil(N/cs)) is:
+    #   (a) a multiple of vec_size (128-bit load width) — CTA k starts at
+    #       k*per_cta_design, which must be vec_size-aligned to avoid
+    #       cudaErrorMisalignedAddress on global vector loads.
+    #   (b) >= 2*top_k — GVR histogram uses 256 bins over the value range;
+    #       when N_eff barely exceeds top_k (ratio ~1) the per-bin count is
+    #       too coarse for the threshold bucket to converge, causing -1 outputs.
+    #       A ratio of 2 (per_cta_design = 2*top_k) matches the smallest
+    #       N tested in test_cute_dsl_gvr_topk_decode (N=4096, K=2048).
+    vec_size = 16 // dtype.itemsize  # 128-bit = 16 bytes; bf16→8, fp32→4
+    per_cta_design = ((top_k * 2) + vec_size - 1) // vec_size * vec_size
+    N = per_cta_design * cluster_size
+    max_slice_len = (N + cluster_size - 1) // cluster_size  # == per_cta_design
+
+    torch.manual_seed(7)
+    torch.cuda.manual_seed(7)
+
+    for n_eff, case_name in [
+        (max_slice_len - 1, "degrade_below"),  # CTA 0 solo, N_eff < max_slice_len
+        (max_slice_len, "degrade_exact"),  # CTA 0 solo, fills slice exactly
+        (max_slice_len + 1, "coop_one_extra"),  # CTA 1 gets 1 element
+    ]:
+        batch_size = 8
+        logits = torch.randn(batch_size, N, dtype=dtype, device="cuda") * 2.0
+        seq_lens = torch.full((batch_size,), n_eff, dtype=torch.int32, device="cuda")
+        # Junk-arange pre_idx (same pattern as _make_inputs with preidx_hit_rate=0):
+        # slot 0 = per-row argmax; slots 1..K-1 = arange 1..K-1.  This avoids
+        # duplicate-0 degenerate pre_idx that forces the kernel to find all K
+        # indices from refinement alone.
+        pre_idx = (
+            torch.arange(top_k, dtype=torch.int32, device="cuda")
+            .unsqueeze(0)
+            .expand(batch_size, -1)
+            .clone()
+        )
+        pre_idx[:, 0] = logits[:, :n_eff].argmax(dim=-1).int()
+
+        out_indices = torch.empty(batch_size, top_k, dtype=torch.int32, device="cuda")
+        torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+            logits,
+            pre_idx,
+            seq_lens,
+            out_indices,
+            top_k=top_k,
+            next_n=next_n,
+            compress_ratio=compress_ratio,
+            cluster_size=cluster_size,
+        )
+        torch.cuda.synchronize()
+        _tie_aware_check(
+            out_indices, logits, seq_lens, top_k, next_n, compress_ratio=compress_ratio
+        )
+
+    # Mixed batch: alternating degrade (even rows) and co-op (odd rows).
+    batch_size = 8
+    logits = torch.randn(batch_size, N, dtype=dtype, device="cuda") * 2.0
+    n_eff_short = max_slice_len - 1  # degrade
+    n_eff_long = max_slice_len + 1  # co-op
+    seq_lens = torch.tensor(
+        [n_eff_short if i % 2 == 0 else n_eff_long for i in range(batch_size)],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    pre_idx = (
+        torch.arange(top_k, dtype=torch.int32, device="cuda")
+        .unsqueeze(0)
+        .expand(batch_size, -1)
+        .clone()
+    )
+    for i in range(batch_size):
+        n_eff_i = int(seq_lens[i].item())
+        pre_idx[i, 0] = int(logits[i, :n_eff_i].argmax().item())
+
+    out_indices = torch.empty(batch_size, top_k, dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+        logits,
+        pre_idx,
+        seq_lens,
+        out_indices,
+        top_k=top_k,
+        next_n=next_n,
+        compress_ratio=compress_ratio,
+        cluster_size=cluster_size,
+    )
+    torch.cuda.synchronize()
+    _tie_aware_check(out_indices, logits, seq_lens, top_k, next_n, compress_ratio=compress_ratio)
+
+
+# ===========================================================================
 # Load-Balance (hybrid multi-CTA + single-CTA) tests.
 #
 # The LB kernel adds a prepare step that classifies requests as long
