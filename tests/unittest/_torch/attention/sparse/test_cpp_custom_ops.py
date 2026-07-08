@@ -126,17 +126,6 @@ def _create_4d_cache_and_mappings(
     return k_cache, slot_mapping_fp8, slot_mapping_scale
 
 
-def _scale_flat_slot_mapping(
-    slot_mapping: torch.Tensor,
-    block_stride: int,
-    page_index_scale: int,
-) -> torch.Tensor:
-    """Convert physical-block flat offsets to shared-page flat offsets."""
-    block_idx = torch.div(slot_mapping, block_stride, rounding_mode="floor")
-    in_block_offset = slot_mapping - block_idx * block_stride
-    return block_idx * page_index_scale * block_stride + in_block_offset
-
-
 @pytest.mark.parametrize(
     "total_kv_len,num_blocks,block_size,k_token_start,num_tokens",
     [
@@ -256,112 +245,6 @@ def test_indexer_k_cache_gather_noncontiguous(
     assert torch.equal(cpp_scale.view(torch.uint8), ref_scale.view(torch.uint8)), (
         "Scale data mismatch (non-contiguous)"
     )
-
-
-@pytest.mark.parametrize("payload_bytes", [128, 64], ids=["fp8", "fp4"])
-def test_indexer_k_cache_gather_page_index_scale(payload_bytes):
-    """Gather converts physical block IDs to V2 shared-page indices."""
-    device = torch.device("cuda")
-    page_index_scale = 4
-    num_blocks = 8
-    block_size = 16
-    num_tokens = 64
-    per_token_size = payload_bytes + SCALE_BYTES
-    block_stride = block_size * per_token_size
-
-    physical_cache = torch.randint(
-        0,
-        256,
-        (num_blocks, block_size, 1, per_token_size),
-        dtype=torch.uint8,
-        device=device,
-    )
-    k_cache = torch.zeros(
-        (num_blocks * page_index_scale, block_size, 1, per_token_size),
-        dtype=torch.uint8,
-        device=device,
-    )
-    k_cache[::page_index_scale] = physical_cache
-
-    perm = torch.randperm(num_blocks * block_size, device=device)[:num_tokens]
-    slot_data = perm.to(torch.int64) * per_token_size
-    slot_scale = slot_data + payload_bytes
-    gathered_data, gathered_scale = torch.ops.trtllm.indexer_k_cache_gather_op(
-        k_cache,
-        slot_data,
-        slot_scale,
-        0,
-        num_tokens,
-        payload_bytes,
-        page_index_scale,
-    )
-
-    scaled_data = _scale_flat_slot_mapping(slot_data, block_stride, page_index_scale)
-    scaled_scale = _scale_flat_slot_mapping(slot_scale, block_stride, page_index_scale)
-    flat_cache = k_cache.reshape(-1)
-    data_offsets = torch.arange(payload_bytes, device=device, dtype=torch.int64)
-    scale_offsets = torch.arange(SCALE_BYTES, device=device, dtype=torch.int64)
-    expected_data = flat_cache[scaled_data[:, None] + data_offsets[None, :]]
-    expected_scale = flat_cache[scaled_scale[:, None] + scale_offsets[None, :]]
-
-    assert torch.equal(gathered_data.view(torch.uint8), expected_data)
-    assert torch.equal(gathered_scale.view(torch.uint8), expected_scale)
-
-
-@pytest.mark.parametrize("payload_bytes", [128, 64], ids=["fp8", "fp4"])
-def test_indexer_k_cache_scatter_page_index_scale(payload_bytes):
-    """Scatter converts physical block IDs to V2 shared-page indices."""
-    device = torch.device("cuda")
-    page_index_scale = 4
-    num_blocks = 8
-    block_size = 16
-    num_tokens = 64
-    per_token_size = payload_bytes + SCALE_BYTES
-    block_stride = block_size * per_token_size
-
-    k_cache = torch.zeros(
-        (num_blocks * page_index_scale, block_size, 1, per_token_size),
-        dtype=torch.uint8,
-        device=device,
-    )
-    expected = torch.zeros_like(k_cache)
-    perm = torch.randperm(num_blocks * block_size, device=device)[:num_tokens]
-    slot_data = perm.to(torch.int64) * per_token_size
-    slot_scale = slot_data + payload_bytes
-    data_bytes = torch.randint(
-        0,
-        256,
-        (num_tokens, payload_bytes),
-        dtype=torch.uint8,
-        device=device,
-    )
-    scale_bytes = torch.randint(
-        0,
-        256,
-        (num_tokens, SCALE_BYTES),
-        dtype=torch.uint8,
-        device=device,
-    )
-
-    torch.ops.trtllm.indexer_k_cache_scatter_op(
-        data_bytes.view(torch.float8_e4m3fn),
-        scale_bytes.view(torch.float32).view(num_tokens, 1),
-        k_cache,
-        slot_data,
-        slot_scale,
-        num_tokens,
-        page_index_scale,
-    )
-
-    scaled_data = _scale_flat_slot_mapping(slot_data, block_stride, page_index_scale)
-    scaled_scale = _scale_flat_slot_mapping(slot_scale, block_stride, page_index_scale)
-    flat_expected = expected.reshape(-1)
-    data_offsets = torch.arange(payload_bytes, device=device, dtype=torch.int64)
-    scale_offsets = torch.arange(SCALE_BYTES, device=device, dtype=torch.int64)
-    flat_expected[scaled_data[:, None] + data_offsets[None, :]] = data_bytes
-    flat_expected[scaled_scale[:, None] + scale_offsets[None, :]] = scale_bytes
-
-    assert torch.equal(k_cache, expected)
 
 
 @pytest.mark.parametrize(

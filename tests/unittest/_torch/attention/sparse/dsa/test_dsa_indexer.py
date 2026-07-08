@@ -38,6 +38,7 @@ from tensorrt_llm._torch.attention_backend.interface import PositionalEmbeddingP
 from tensorrt_llm._torch.attention_backend.sparse.dsa import (
     DSACacheManager,
     DSACacheManagerV2,
+    DSAMetadataParams,
     DSAtrtllmAttentionMetadata,
     Indexer,
     _effective_compress_ratio_divisor,
@@ -46,6 +47,7 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa import (
     split_prefill_chunks,
 )
 from tensorrt_llm._torch.attention_backend.sparse.utils import get_sparse_attn_kv_cache_manager
+from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.speculative.interface import (
     prepare_attn_metadata_for_draft_replay,
@@ -200,6 +202,32 @@ def test_dsa_cache_manager_selection_honors_v2_config():
     )
 
 
+def test_dsa_metadata_accepts_kv_cache_manager_v2():
+    cache_manager = object.__new__(DSACacheManagerV2)
+    cache_manager.tokens_per_block = 32
+    metadata = object.__new__(DSAtrtllmAttentionMetadata)
+    metadata.kv_cache_manager = cache_manager
+    metadata.sparse_metadata_params = DSAMetadataParams(
+        indexer_max_chunk_size=8192,
+        max_sparse_topk=2048,
+        index_head_dim=128,
+        enable_indexer_skip=False,
+        enable_heuristic_topk=False,
+        use_cute_dsl_paged_mqa_logits=False,
+        q_split_threshold=8192,
+    )
+    metadata.is_cuda_graph = False
+
+    with (
+        patch.object(TrtllmAttentionMetadata, "__post_init__"),
+        patch.object(DSAtrtllmAttentionMetadata, "create_buffers_for_mla_rope_append"),
+        patch.object(DSAtrtllmAttentionMetadata, "create_buffers_for_indexer"),
+    ):
+        metadata.__post_init__()
+
+    assert metadata._tokens_per_block == cache_manager.tokens_per_block
+
+
 @pytest.mark.parametrize(
     "indexer_k_dtype,indexer_bytes_per_token",
     [
@@ -246,7 +274,7 @@ def test_dsa_cache_manager_v2_cache_size_estimate_includes_indexer(
     ["fp8", pytest.param("fp4", marks=skip_pre_blackwell)],
 )
 def test_dsa_cache_manager_v2_indexer_pool_layout(indexer_k_dtype):
-    """V2 exposes shared-page indexer buffers and physical block metadata."""
+    """V2 exposes shared-page indexer buffers and role-specific page metadata."""
     num_layers = 3
     tokens_per_block = 16
     head_dim = 128
@@ -262,7 +290,7 @@ def test_dsa_cache_manager_v2_indexer_pool_layout(indexer_k_dtype):
 
     try:
         assert isinstance(cache_manager, DSACacheManagerV2)
-        page_index_scale = cache_manager.get_indexer_k_cache_page_index_scale(0)
+        page_index_scale = cache_manager.indexer_k_cache_page_scale
         assert page_index_scale == num_layers
         payload_bytes = head_dim // 2 if indexer_k_dtype == "fp4" else head_dim
         indexer_bytes_per_token = payload_bytes + 4
@@ -284,10 +312,6 @@ def test_dsa_cache_manager_v2_indexer_pool_layout(indexer_k_dtype):
                 buffer for buffer in layer_config.buffers if buffer.role == Role.INDEX_KEY
             )
             assert indexer_buffer_config.size == (indexer_bytes_per_token * tokens_per_block)
-
-        physical_blocks = torch.tensor([[0, 1, 3]], device="cuda", dtype=torch.int32)
-        scaled_blocks = cache_manager.scale_indexer_k_cache_block_table(physical_blocks, 0)
-        assert torch.equal(scaled_blocks, physical_blocks * page_index_scale)
 
         indexer_buffer = cache_manager.get_indexer_k_cache_buffers(0)
         assert indexer_buffer.shape == (
@@ -320,11 +344,18 @@ def test_dsa_cache_manager_v2_indexer_pool_layout(indexer_k_dtype):
             request_ids=list(reversed(request_ids)),
             num_contexts=len(request_ids),
         )
+        indexer_page_indices = pool_indices * page_index_scale
+        reversed_indexer_page_indices = reversed_pool_indices * page_index_scale
         assert pool_indices.shape[0] == len(request_ids)
         assert pool_indices.min() >= 0
         assert pool_indices.max() < cache_manager.blocks_in_primary_pool
         assert torch.equal(reversed_pool_indices[0], pool_indices[1])
         assert torch.equal(reversed_pool_indices[1], pool_indices[0])
+        assert torch.equal(indexer_page_indices, pool_indices * page_index_scale)
+        assert indexer_page_indices.min() >= 0
+        assert indexer_page_indices.max() < indexer_buffer.shape[0]
+        assert torch.equal(reversed_indexer_page_indices[0], indexer_page_indices[1])
+        assert torch.equal(reversed_indexer_page_indices[1], indexer_page_indices[0])
     finally:
         cache_manager.shutdown()
 
