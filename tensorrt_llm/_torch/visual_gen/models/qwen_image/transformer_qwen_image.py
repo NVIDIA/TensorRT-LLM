@@ -483,6 +483,9 @@ class QwenJointAttention(Attention):
         )
         self.heads = num_attention_heads
         self.head_dim = attention_head_dim
+        self._supports_key_padding_mask = _supports_qwen_key_padding_mask(
+            self.attn_backend, self.attn
+        )
 
         # Text-stream QKV (diffusers names).
         self.add_q_proj = Linear(
@@ -583,28 +586,25 @@ class QwenJointAttention(Attention):
         joint_k = torch.cat([txt_k, img_k], dim=1)
         joint_v = torch.cat([txt_v, img_v], dim=1)
 
-        # SDPA expects (B, H, S, D); diffusers dispatch_attention_fn
-        # accepts (B, S, H, D) and transposes internally. Do the same.
-        joint_q = joint_q.transpose(1, 2)
-        joint_k = joint_k.transpose(1, 2)
-        joint_v = joint_v.transpose(1, 2)
-
-        attn_mask = None
-        if attention_mask is not None:
-            # attention_mask is (B, Sjoint) bool or float. Expand to
-            # (B, 1, 1, Sjoint) so SDPA broadcasts over (H, Sq).
-            # Qwen pads text embeddings before concatenating [text | image],
-            # so masked SDPA is required to ignore padded text tokens.
-            attn_mask = attention_mask[:, None, None, :]
-
-        if attn_mask is None:
+        if attention_mask is None or self._supports_key_padding_mask:
+            attn_kwargs = {}
+            if attention_mask is not None:
+                attn_kwargs["key_padding_mask"] = attention_mask
             out = self._attn_impl(
-                joint_q.transpose(1, 2).flatten(2),
-                joint_k.transpose(1, 2).flatten(2),
-                joint_v.transpose(1, 2).flatten(2),
+                joint_q.flatten(2),
+                joint_k.flatten(2),
+                joint_v.flatten(2),
                 timestep=timestep,
+                **attn_kwargs,
             )
         else:
+            # Fallback for backends that do not accept arbitrary key padding masks.
+            # SDPA expects (B, H, S, D); diffusers dispatch_attention_fn accepts
+            # (B, S, H, D) and transposes internally. Do the same.
+            joint_q = joint_q.transpose(1, 2)
+            joint_k = joint_k.transpose(1, 2)
+            joint_v = joint_v.transpose(1, 2)
+            attn_mask = attention_mask[:, None, None, :]
             out = F.scaled_dot_product_attention(
                 joint_q, joint_k, joint_v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
             )
@@ -756,6 +756,31 @@ class QwenImageTransformerBlock(nn.Module):
 # ===========================================================================
 # Top-level transformer.
 # ===========================================================================
+
+
+def _supports_qwen_key_padding_mask(attn_backend: str, attn: Any) -> bool:
+    return attn_backend in ("VANILLA", "FA4") and type(attn).__name__ not in (
+        "Attention2DAttention",
+        "RingAttention",
+        "UlyssesAttention",
+    )
+
+
+def _build_joint_attention_mask(
+    encoder_hidden_states_mask: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    if encoder_hidden_states_mask is None:
+        return None
+    if encoder_hidden_states_mask.dtype != torch.bool:
+        encoder_hidden_states_mask = encoder_hidden_states_mask.to(torch.bool)
+    batch_size, image_seq_len = hidden_states.shape[:2]
+    image_mask = torch.ones(
+        (batch_size, image_seq_len),
+        dtype=torch.bool,
+        device=hidden_states.device,
+    )
+    return torch.cat([encoder_hidden_states_mask, image_mask], dim=1)
 
 
 class QwenImageTransformer2DModel(BaseDiffusionModel):
@@ -1041,18 +1066,9 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         )
 
         # Build joint attention mask [text_mask | all-ones image_mask] once.
-        block_attention_mask = None
-        if encoder_hidden_states_mask is not None:
-            if encoder_hidden_states_mask.dtype != torch.bool:
-                encoder_hidden_states_mask = encoder_hidden_states_mask.to(torch.bool)
-            if not encoder_hidden_states_mask.all():
-                batch_size, image_seq_len = hidden_states.shape[:2]
-                image_mask = torch.ones(
-                    (batch_size, image_seq_len),
-                    dtype=torch.bool,
-                    device=hidden_states.device,
-                )
-                block_attention_mask = torch.cat([encoder_hidden_states_mask, image_mask], dim=1)
+        block_attention_mask = _build_joint_attention_mask(
+            encoder_hidden_states_mask, hidden_states
+        )
 
         for block in self.transformer_blocks:
             encoder_hidden_states, hidden_states = block(

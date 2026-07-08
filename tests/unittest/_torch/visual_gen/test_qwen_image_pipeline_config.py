@@ -12,9 +12,10 @@ import torch
 # Importing the models package applies the Qwen-Image registration side effect.
 from tensorrt_llm._torch.visual_gen import models  # noqa: F401
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, DiffusionPipelineConfig
-from tensorrt_llm._torch.visual_gen.models.qwen_image import (
-    QwenImageTransformer2DModel,
-    QwenJointAttention,
+from tensorrt_llm._torch.visual_gen.models.qwen_image import QwenImagePipeline, QwenJointAttention
+from tensorrt_llm._torch.visual_gen.models.qwen_image.transformer_qwen_image import (
+    _build_joint_attention_mask,
+    _supports_qwen_key_padding_mask,
 )
 from tensorrt_llm._torch.visual_gen.modules.attention import QKVMode
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
@@ -232,40 +233,130 @@ def test_qwen_joint_attention_keeps_separate_qkv_path_unwrapped(visual_gen_mappi
     assert attention.attn.__class__.__name__ != not_wrapped_as
 
 
-def test_qwen_transformer_treats_all_true_text_mask_as_unmasked():
-    torch.manual_seed(0)
-    model = QwenImageTransformer2DModel(
-        patch_size=2,
-        in_channels=4,
-        out_channels=4,
-        num_layers=1,
-        attention_head_dim=8,
+class _FakeTokenBatch:
+    def __init__(self, attention_mask):
+        self.attention_mask = attention_mask
+        self.input_ids = torch.arange(attention_mask.numel()).view_as(attention_mask)
+
+    def to(self, device):
+        self.attention_mask = self.attention_mask.to(device)
+        self.input_ids = self.input_ids.to(device)
+        return self
+
+
+class _FakeTokenizer:
+    def __init__(self, attention_mask):
+        self.attention_mask = attention_mask
+
+    def __call__(self, *args, **kwargs):
+        return _FakeTokenBatch(self.attention_mask.clone())
+
+
+class _FakeTextEncoder:
+    def __call__(self, input_ids, **kwargs):
+        hidden = torch.arange(
+            input_ids.numel() * 4,
+            dtype=torch.float32,
+            device=input_ids.device,
+        ).view(*input_ids.shape, 4)
+        return SimpleNamespace(hidden_states=[hidden])
+
+
+@pytest.mark.parametrize(
+    ("attention_mask", "expect_none"),
+    [
+        pytest.param(torch.ones(2, 36, dtype=torch.long), True, id="all-valid"),
+        pytest.param(
+            torch.tensor([[1] * 36, [1] * 35 + [0]], dtype=torch.long),
+            False,
+            id="has-padding",
+        ),
+    ],
+)
+def test_qwen_encode_prompt_returns_none_for_all_valid_masks(attention_mask, expect_none):
+    pipeline = QwenImagePipeline(SimpleNamespace(torch_dtype=torch.float32))
+    pipeline.tokenizer = _FakeTokenizer(attention_mask)
+    pipeline.text_encoder = _FakeTextEncoder()
+
+    prompt_embeds, prompt_embeds_mask = pipeline._encode_prompt(
+        ["one", "two"],
+        torch.device("cpu"),
+        max_sequence_length=8,
+    )
+
+    assert prompt_embeds.shape == (2, 2, 4)
+    if expect_none:
+        assert prompt_embeds_mask is None
+    else:
+        assert prompt_embeds_mask is not None
+        assert prompt_embeds_mask.shape == (2, 2)
+        assert not prompt_embeds_mask.bool().all()
+
+
+def test_qwen_joint_attention_passes_padding_mask_to_backend(monkeypatch):
+    attention = QwenJointAttention(
+        dim=16,
         num_attention_heads=2,
-        joint_attention_dim=16,
-        axes_dims_rope=(2, 2, 4),
-    ).eval()
+        attention_head_dim=8,
+        config=DiffusionModelConfig(attention=AttentionConfig(backend="VANILLA")),
+    )
+    captured = {}
 
-    hidden_states = torch.randn(1, 4, 4)
+    def fake_attn_impl(q, k, v, **kwargs):
+        captured["key_padding_mask"] = kwargs.get("key_padding_mask")
+        return q.new_zeros(q.shape)
+
+    monkeypatch.setattr(attention, "_attn_impl", fake_attn_impl)
+
+    hidden_states = torch.randn(1, 4, 16)
     encoder_hidden_states = torch.randn(1, 3, 16)
-    timestep = torch.tensor([0.5])
-    img_shapes = [(1, 2, 2)]
+    attention_mask = torch.tensor([[True, False, True, True, True, True, True]])
 
-    with torch.inference_mode():
-        unmasked = model(
-            hidden_states=hidden_states,
-            encoder_hidden_states=encoder_hidden_states,
-            encoder_hidden_states_mask=None,
-            timestep=timestep,
-            img_shapes=img_shapes,
-            return_dict=False,
-        )[0]
-        all_true_masked = model(
-            hidden_states=hidden_states,
-            encoder_hidden_states=encoder_hidden_states,
-            encoder_hidden_states_mask=torch.ones(1, 3, dtype=torch.bool),
-            timestep=timestep,
-            img_shapes=img_shapes,
-            return_dict=False,
-        )[0]
+    attention(
+        hidden_states=hidden_states,
+        encoder_hidden_states=encoder_hidden_states,
+        attention_mask=attention_mask,
+    )
 
-    torch.testing.assert_close(all_true_masked, unmasked)
+    assert captured["key_padding_mask"] is attention_mask
+
+
+def test_qwen_key_padding_mask_support_excludes_sequence_parallel_wrappers():
+    class VanillaAttention:
+        pass
+
+    class Attention2DAttention:
+        pass
+
+    class RingAttention:
+        pass
+
+    class UlyssesAttention:
+        pass
+
+    assert _supports_qwen_key_padding_mask("VANILLA", VanillaAttention())
+    assert _supports_qwen_key_padding_mask("FA4", VanillaAttention())
+    assert not _supports_qwen_key_padding_mask("TRTLLM", VanillaAttention())
+    assert not _supports_qwen_key_padding_mask("VANILLA", Attention2DAttention())
+    assert not _supports_qwen_key_padding_mask("VANILLA", RingAttention())
+    assert not _supports_qwen_key_padding_mask("VANILLA", UlyssesAttention())
+
+
+def test_qwen_build_joint_attention_mask_appends_valid_image_tokens():
+    hidden_states = torch.empty(2, 4, 8)
+    text_mask = torch.tensor([[1, 0, 1], [1, 1, 0]], dtype=torch.int64)
+
+    joint_mask = _build_joint_attention_mask(text_mask, hidden_states)
+
+    expected = torch.tensor(
+        [
+            [True, False, True, True, True, True, True],
+            [True, True, False, True, True, True, True],
+        ],
+        dtype=torch.bool,
+    )
+    torch.testing.assert_close(joint_mask, expected)
+
+
+def test_qwen_build_joint_attention_mask_none_stays_none():
+    assert _build_joint_attention_mask(None, torch.empty(2, 4, 8)) is None
