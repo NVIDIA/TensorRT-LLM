@@ -31,7 +31,7 @@ import numpy as np
 from mpi4py import MPI
 
 from tensorrt_llm._torch.pyexecutor.ep_failure_broadcast import (
-    DetectedRankState,
+    FailureEvidenceState,
     MpiFtSubcomm,
     MpiFtSubcommConfig,
 )
@@ -139,7 +139,7 @@ def _run_invalid_topology_smoke(world: MPI.Intracomm) -> str | None:
     try:
         unexpected_broadcaster = MpiFtSubcomm(
             mapping,
-            DetectedRankState(world_size),
+            FailureEvidenceState(world_size),
             MpiFtSubcommConfig(startup_timeout_sec=5.0, stop_timeout_sec=5.0),
         )
     except Exception as error:
@@ -180,7 +180,7 @@ def _run_healthy_lifecycle_smoke(world: MPI.Intracomm) -> str | None:
         # collective validation and Split, and owns MPI progress directly.
         broadcaster = MpiFtSubcomm(
             mapping,
-            DetectedRankState(world_size),
+            FailureEvidenceState(world_size),
             config,
         )
         ft_comm = broadcaster._comm
@@ -224,7 +224,7 @@ def _run_failure_propagation_smoke(world: MPI.Intracomm) -> str | None:
     rank = world.Get_rank()
     world_size = world.Get_size()
     mapping = _mapping(world_size, rank)
-    health = DetectedRankState(world_size)
+    failure_evidence = FailureEvidenceState(world_size)
     owner: MpiFtSubcomm | None = None
     broadcaster: MpiFtSubcomm | None = None
     detector_rank = 0
@@ -243,14 +243,14 @@ def _run_failure_propagation_smoke(world: MPI.Intracomm) -> str | None:
         # view so this smoke deterministically exercises typed Isend/Irecv+Test.
         owner = MpiFtSubcomm(
             mapping,
-            DetectedRankState(world_size),
+            FailureEvidenceState(world_size),
             config,
         )
         ft_comm = owner._comm
         owner.stop()
         broadcaster = MpiFtSubcomm(
             mapping,
-            health,
+            failure_evidence,
             config,
             comm=_NonUlfmComm(ft_comm),
         )
@@ -290,7 +290,7 @@ def _run_failure_propagation_smoke(world: MPI.Intracomm) -> str | None:
             assert broadcaster is not None
             deadline = time.monotonic() + _CONVERGENCE_TIMEOUT_SEC
             while not phase_errors and rank != failure_rank and time.monotonic() < deadline:
-                failure_observed = not health.is_active(failure_rank)
+                failure_observed = failure_evidence.has_failure(failure_rank)
                 failure_reconciled = broadcaster.failure_detection_is_reconciled(failure_rank)
                 if failure_observed and failure_reconciled:
                     if rank == detector_rank:
@@ -299,9 +299,9 @@ def _run_failure_propagation_smoke(world: MPI.Intracomm) -> str | None:
                     break
                 time.sleep(0.005)
             local_converged = rank == failure_rank or (
-                not health.is_active(failure_rank)
+                failure_evidence.has_failure(failure_rank)
                 and broadcaster.failure_detection_is_reconciled(failure_rank)
-                and broadcaster.detected_state_is_reconciled()
+                and broadcaster.failure_evidence_is_reconciled()
                 and broadcaster.world_is_poisoned()
             )
         except Exception:
@@ -408,7 +408,7 @@ def _run_terminal_abort_smoke(world: MPI.Intracomm) -> str | None:
         # scenario specifically validates the bounded ABORT echo fallback.
         owner = MpiFtSubcomm(
             mapping,
-            DetectedRankState(world_size),
+            FailureEvidenceState(world_size),
             MpiFtSubcommConfig(startup_timeout_sec=5.0, stop_timeout_sec=5.0),
         )
         ft_comm = owner._comm
@@ -416,7 +416,7 @@ def _run_terminal_abort_smoke(world: MPI.Intracomm) -> str | None:
         wrapped_comm = _NonUlfmComm(ft_comm)
         broadcaster = MpiFtSubcomm(
             mapping,
-            DetectedRankState(world_size),
+            FailureEvidenceState(world_size),
             MpiFtSubcommConfig(
                 startup_timeout_sec=5.0,
                 stop_timeout_sec=5.0,
