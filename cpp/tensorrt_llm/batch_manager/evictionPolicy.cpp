@@ -125,10 +125,11 @@ void LRUEvictionPolicy::initializePlaceholders(std::vector<BlockPtr>& allPlaceho
 
 bool LRUEvictionPolicy::verifyQueueIntegrity() const
 {
-    static char const* const levelToStr[] = {"primary", "secondary", "placeholder"};
+    static char const* const levelToStr[] = {"primary", "secondary", "disk", "placeholder"};
     static const std::function<bool(BlockPtr const&)> levelValidators[]
         = {[](BlockPtr const& block) { return block->isPrimary(); },
-            [](BlockPtr const& block) { return !block->isPrimary(); },
+            [](BlockPtr const& block) { return !block->isPrimary() && !block->isOnDisk() && !block->isPlaceholder(); },
+            [](BlockPtr const& block) { return block->isOnDisk(); },
             [](BlockPtr const& block) { return block->isPlaceholder(); }};
     bool queueCompromised = false;
     for (SizeType32 queueLevel = 0; queueLevel < kNumCacheLevels + 1; queueLevel++)
