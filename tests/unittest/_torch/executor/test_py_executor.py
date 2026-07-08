@@ -24,6 +24,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.py_executor import DisaggTransferAdmissionController, PyExecutor
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import (
     FCFSWaitingQueue,
     ScheduledRequests,
@@ -189,6 +190,80 @@ def test_getter_methods(mock_executor):
     assert mock_executor.get_expected_num_active_requests() == 5
     assert mock_executor._get_new_active_requests_queue_latency() == 10.5
     assert mock_executor.get_waiting_queue_size() == 1
+
+
+def _make_executor_with_kv_cache_manager(kv_cache_manager):
+    executor = PyExecutor.__new__(PyExecutor)
+    executor.resource_manager = Mock()
+    executor.resource_manager.resource_managers = {
+        ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager
+    }
+    return executor
+
+
+def test_get_kv_cache_capacity_without_manager():
+    executor = _make_executor_with_kv_cache_manager(None)
+
+    assert executor.get_kv_cache_capacity() == {}
+
+
+def test_get_kv_cache_capacity_from_stats():
+    """KV capacity is available without consuming iteration stats."""
+    kv_stats = Mock()
+    kv_stats.max_num_blocks = 123
+    kv_stats.tokens_per_block = 64
+
+    kv_cache_manager = Mock()
+    kv_cache_manager.get_kv_cache_stats.return_value = kv_stats
+
+    executor = _make_executor_with_kv_cache_manager(kv_cache_manager)
+
+    assert executor.get_kv_cache_capacity() == {
+        "maxNumBlocks": 123,
+        "tokensPerBlock": 64,
+        "maxNumTokens": 7872,
+    }
+
+
+def test_get_kv_cache_capacity_falls_back_to_manager_pool_size():
+    """KVCacheManagerV2 exposes capacity through pool attributes."""
+    kv_stats = Mock()
+    kv_stats.max_num_blocks = 0
+    kv_stats.tokens_per_block = 0
+
+    kv_cache_manager = Mock()
+    kv_cache_manager.get_kv_cache_stats.return_value = kv_stats
+    kv_cache_manager.get_max_resource_count.return_value = 0
+    kv_cache_manager.blocks_in_primary_pool = 256
+    kv_cache_manager.tokens_per_block = 32
+
+    executor = _make_executor_with_kv_cache_manager(kv_cache_manager)
+
+    assert executor.get_kv_cache_capacity() == {
+        "maxNumBlocks": 256,
+        "tokensPerBlock": 32,
+        "maxNumTokens": 8192,
+    }
+
+
+def test_get_kv_cache_capacity_falls_back_to_max_resource_count():
+    kv_stats = Mock()
+    kv_stats.max_num_blocks = 0
+    kv_stats.tokens_per_block = 0
+
+    kv_cache_manager = Mock()
+    kv_cache_manager.get_kv_cache_stats.return_value = kv_stats
+    kv_cache_manager.blocks_in_primary_pool = 0
+    kv_cache_manager.get_max_resource_count.return_value = 512
+    kv_cache_manager.tokens_per_block = 16
+
+    executor = _make_executor_with_kv_cache_manager(kv_cache_manager)
+
+    assert executor.get_kv_cache_capacity() == {
+        "maxNumBlocks": 512,
+        "tokensPerBlock": 16,
+        "maxNumTokens": 8192,
+    }
 
 
 def _classify_termination(

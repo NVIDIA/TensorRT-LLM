@@ -344,6 +344,7 @@ def _select_routing_inputs(
     routing_plan: RoutingPlan,
     rank: int,
     moe_ep_size: int,
+    enable_attention_dp: bool,
     base_router_logits: torch.Tensor,
     device: torch.device,
     act_dtype: torch.dtype,
@@ -410,6 +411,21 @@ def _select_routing_inputs(
         )
     except Exception as exc:
         return None, _RoutingSkip(f"native logits projection error: {type(exc).__name__}: {exc}")
+
+    # In attention-DP + MoE-TP layouts (DTP / CUSTOM-DP), _project_router_logits
+    # returns logits shaped [agg_tokens, E] covering all DP shards aggregated
+    # onto ep_axis_rank.  The MoE internally allgathers each rank's local
+    # router_logits before routing, so each rank must supply only its local
+    # slice [offset_r : offset_r + n_r] of the full projected tensor.
+    world_size_inferred = len(routing_plan.per_rank_num_tokens)
+    if enable_attention_dp and int(moe_ep_size) < world_size_inferred:
+        offset = sum(
+            routing_plan.per_rank_num_tokens[s]
+            for s in range(world_size_inferred)
+            if s % int(moe_ep_size) == ep_axis_rank and s < rank
+        )
+        local_n = routing_plan.per_rank_num_tokens[rank]
+        new_logits = new_logits[offset : offset + local_n]
 
     if projection_status != "exact" and rc_spec.projection_policy == "reject":
         return None, _RoutingSkip(
@@ -536,21 +552,6 @@ def _resolve_layout_and_plan(
     except ValueError as exc:
         return _short_circuit(result, "skipped", str(exc))
 
-    # Routing-control's dispatch_matrix axis is ``moe_ep_size`` while
-    # ``per_rank_num_tokens`` follows the world (DP source) axis. When the two
-    # disagree (DTP/TTP/CUSTOM with ``moe_ep_size != world_size``) the plan
-    # either crashes inside ``_build_routing_plan`` or silently drops the
-    # tokens of world ranks beyond ``moe_ep_size``. Skip cleanly.
-    if rc_active and int(moe_ep_size) != int(world_size):
-        return _short_circuit(
-            result,
-            "skipped",
-            f"routing-control requires moe_ep_size == world_size "
-            f"(got moe_ep_size={moe_ep_size}, world_size={world_size}); "
-            "the dispatch_matrix axis would not align with the per-rank token "
-            "distribution. Use parallel_mode in {DEP, TEP} or drop routing-control.",
-        )
-
     routing_plan: Optional[RoutingPlan] = None
     if rc_active:
         try:
@@ -561,6 +562,7 @@ def _resolve_layout_and_plan(
                 top_k=int(model.top_k),
                 num_experts=int(model.num_experts),
                 moe_ep_size=int(moe_ep_size),
+                enable_dp=bool(_enable_dp),
             )
         except Exception as exc:
             reason = f"routing plan error: {type(exc).__name__}: {exc}"
@@ -568,7 +570,7 @@ def _resolve_layout_and_plan(
             return _short_circuit(result, "skipped", reason)
         per_rank = list(routing_plan.per_rank_num_tokens)
     else:
-        per_rank = _per_rank_tokens(workload, world_size)
+        per_rank = _per_rank_tokens(workload, world_size, enable_dp=bool(_enable_dp))
 
     return int(moe_ep_size), per_rank, routing_plan
 
@@ -663,6 +665,11 @@ def _run_one_candidate(
     result.moe_tp_size = int(mapping.moe_tp_size)
     result.enable_attention_dp = bool(mapping.enable_attention_dp)
 
+    # TEP/TTP (no attention DP): no cross-rank dispatch; the scheduler fills
+    # all_rank_num_tokens from x.shape[0]. Pass None to follow that path.
+    if not mapping.enable_attention_dp:
+        all_rank_num_tokens = None
+
     AutoTuner.get().setup_distributed_state(mapping)
     AutoTuner.get().clear_cache()
 
@@ -683,7 +690,11 @@ def _run_one_candidate(
                 mapping=mapping,
                 moe_backend=config.backend,
                 use_cuda_graph=bool(config.cuda_graph),
-                max_num_tokens=max(int(local_num_tokens), 1),
+                # Symmetric-memory comm backends (e.g. NVLINK_ONE_SIDED) size their
+                # workspace from max_num_tokens and require every rank to allocate the
+                # same size, so use the global per-rank maximum rather than this rank's
+                # local token count (which differs under uneven attention-DP shards).
+                max_num_tokens=max(int(max(per_rank)) if per_rank else 0, 1),
                 use_low_precision_moe_combine=bool(config.use_low_precision_moe_combine),
                 enable_perfect_router=enable_perfect_router,
                 dtype=act_dtype,
@@ -735,6 +746,7 @@ def _run_one_candidate(
                 routing_plan=routing_plan,
                 rank=rank,
                 moe_ep_size=int(moe_ep_size),
+                enable_attention_dp=bool(result.enable_attention_dp),
                 base_router_logits=router_logits,
                 device=device,
                 act_dtype=act_dtype,

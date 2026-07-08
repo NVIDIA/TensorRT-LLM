@@ -855,6 +855,35 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
     @skip_pre_hopper
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
+    def test_guided_decoding_with_eagle3_low_latency_dispatch(
+            self, backend: str, mocker):
+        """Smoke-test enable_low_latency_host_dispatch with Eagle3 + guided decoding.
+
+        Eagle3 spec-dec captures guided-decoder hostfuncs inside the CUDA graph
+        (via _execute_guided_decoder_if_present in the target forward pass), so
+        this combination exercises the cudaLaunchHostFunc_v2 / spin-wait path.
+        """
+        mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
+        cuda_graph_config = CudaGraphConfig(enable_padding=True)
+        spec_config = Eagle3DecodingConfig(
+            max_draft_len=3,
+            speculative_model=f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B",
+            eagle3_one_model=True)
+        llm = LLM(self.MODEL_PATH,
+                  guided_decoding_backend=backend,
+                  kv_cache_config=kv_cache_config,
+                  cuda_graph_config=cuda_graph_config,
+                  enable_chunked_prefill=True,
+                  max_num_tokens=256,
+                  speculative_config=spec_config,
+                  enable_low_latency_host_dispatch=True)
+        with llm:
+            task = JsonModeEval(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_hopper
+    @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
     def test_guided_decoding_with_ngram(self, backend: str, mocker):
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
@@ -7611,6 +7640,39 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.quant_algo == QuantAlgo.MXFP8
             task = MMLU(model_name)
             task.evaluate(llm)
+            task = GSM8K(model_name)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
+    def test_mxfp8_piecewise_cuda_graph(self, tp_size, ep_size):
+        model_name = "MiniMaxAI/MiniMax-M3-MXFP8"
+        model_path = f"{llm_models_root()}/MiniMax-M3-MXFP8"
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
+                                        enable_block_reuse=False)
+        sparse_attention_config = MiniMaxM3SparseAttentionConfig()
+        cuda_graph_config = CudaGraphConfig(
+            enable_padding=True, batch_sizes=[1, 2, 4, 8, 12, 16, 24, 32])
+        torch_compile_config = TorchCompileConfig(
+            enable_piecewise_cuda_graph=True,
+            capture_num_tokens=[1, 8192],
+            max_num_streams=3)
+
+        with LLM(model_path,
+                 tensor_parallel_size=tp_size,
+                 moe_expert_parallel_size=ep_size,
+                 enable_attention_dp=True,
+                 moe_config=MoeConfig(backend="TRTLLM"),
+                 kv_cache_config=kv_cache_config,
+                 sparse_attention_config=sparse_attention_config,
+                 cuda_graph_config=cuda_graph_config,
+                 torch_compile_config=torch_compile_config,
+                 max_seq_len=2048,
+                 max_num_tokens=8192,
+                 max_batch_size=32,
+                 trust_remote_code=True) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.MXFP8
             task = GSM8K(model_name)
             task.evaluate(llm)
 

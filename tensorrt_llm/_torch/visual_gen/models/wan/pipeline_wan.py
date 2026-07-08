@@ -10,6 +10,10 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from transformers import AutoTokenizer, UMT5EncoderModel
 
+from tensorrt_llm._torch.visual_gen.attention_backend import (
+    VSAMetadataBuilder,
+    set_vsa_forward_context,
+)
 from tensorrt_llm._torch.visual_gen.cache.teacache import (
     ExtractorConfig,
     register_extractor_from_config,
@@ -522,9 +526,22 @@ class WanPipeline(BasePipeline):
                 f"guidance_scale={guidance_scale}, guidance_scale_2={guidance_scale_2}"
             )
 
+        # VSA: build metadata builder once per forward() call; reused across timesteps.
+        _attn_cfg = self.pipeline_config.primary_model_config.attention
+        _sparse_cfg = getattr(_attn_cfg, "sparse_attention_config", None)
+        _vsa_active = (
+            getattr(_attn_cfg, "backend", "VANILLA") == "CUTEDSL"
+            and _sparse_cfg is not None
+            and getattr(_sparse_cfg, "algorithm", None) == "vsa"
+        )
+        _vsa_builder = VSAMetadataBuilder() if _vsa_active else None
+        _vsa_patch_size = tuple(getattr(self.config, "patch_size", [1, 2, 2]))  # (pT, pH, pW)
+        _vsa_sparsity = _sparse_cfg.vsa_sparsity if _vsa_active else 0.0
+
         # Denoising with two-stage support
         # Track which model was used in last step (for logging model transitions)
         last_model_used = [None]
+        _vsa_step_counter = [0]
 
         def forward_fn(
             latents,
@@ -572,6 +589,24 @@ class WanPipeline(BasePipeline):
                 else:
                     # T2V: current_t for all frames
                     timestep = current_t.reshape(1, 1).expand(latents.shape[0], nf * nh * nw)
+
+            if _vsa_active and _vsa_builder is not None:
+                # latents: [B, C, T_latent, H_latent, W_latent]
+                raw_latent_shape = (latents.shape[2], latents.shape[3], latents.shape[4])
+                vsa_metadata = _vsa_builder.build(
+                    current_timestep=_vsa_step_counter[0],
+                    raw_latent_shape=raw_latent_shape,
+                    patch_size=_vsa_patch_size,
+                    vsa_sparsity=_vsa_sparsity,
+                    device=latents.device,
+                )
+                _vsa_step_counter[0] += 1
+                with set_vsa_forward_context(vsa_metadata):
+                    return current_model(
+                        hidden_states=latents,
+                        timestep=timestep / self.scheduler.config.num_train_timesteps,
+                        encoder_hidden_states=encoder_hidden_states,
+                    )
 
             return current_model(
                 hidden_states=latents,

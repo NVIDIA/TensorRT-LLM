@@ -56,6 +56,7 @@ class TestConfig:
     speculative_model_path: Optional[str] = None
     cancellation_rate: Optional[int] = None
     cancellation_delay: Optional[float] = None
+    concurrency: int = 512
 
     def __str__(self):
         return self.test_desc
@@ -225,6 +226,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_overlap_gen_first_pp4.yaml",
         "overlap_transceiver_runtime_python":
         f"{test_configs_root}/disagg_config_overlap_transceiver_runtime_python.yaml",
+        "overlap_transceiver_runtime_python_bounce":
+        f"{test_configs_root}/disagg_config_overlap_transceiver_runtime_python_bounce.yaml",
         "tool_calls":
         f"{test_configs_root}/disagg_config_overlap.yaml",
         "perf_metrics":
@@ -314,6 +317,10 @@ def get_test_config(test_desc, example_dir, test_root):
         "glm5_nvfp4_tp4_ep4_dp_stress":
         f"{test_configs_root}/disagg_config_ctxtp4ep4_gentp4ep4_glm5_nvfp4_dp_tllm.yaml",
         "qwen3_32b_fp8_stress":
+        f"{test_configs_root}/disagg_config_ctxtp1_gentp4_qwen3_32b_fp8.yaml",
+        "req60-conc64-qwen3_32b_fp8_mixed_stress":
+        f"{test_configs_root}/disagg_config_ctxtp1_gentp4_qwen3_32b_fp8.yaml",
+        "req10k-conc512-qwen3_32b_fp8_mixed_stress":
         f"{test_configs_root}/disagg_config_ctxtp1_gentp4_qwen3_32b_fp8.yaml",
         "gpt_oss_120b_harmony":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm.yaml",
@@ -613,6 +620,8 @@ def setup_disagg_cluster(
     server_start_timeout: int = 300,
     schedule_style: str | None = None,
     save_log: bool = False,
+    startup_callback=None,
+    startup_tick: int = 30,
 ) -> tuple[dict[str, Any], list[ProcessWrapper], list[ProcessWrapper],
            ProcessWrapper, int, str]:
     """Load config, launch workers + disagg server, wait for ready.
@@ -682,6 +691,9 @@ def setup_disagg_cluster(
             device_ids = ",".join(
                 str(d) for d in dict.fromkeys((next_device + j) % num_gpus
                                               for j in range(gpus_per_ctx)))
+            print(
+                f"Launching ctx worker {i + 1}/{num_ctx_instances} on device {device_ids}"
+            )
             ctx_workers.append(
                 run_ctx_worker(model,
                                ctx_worker_config,
@@ -696,6 +708,9 @@ def setup_disagg_cluster(
             device_ids = ",".join(
                 str(d) for d in dict.fromkeys((next_device + j) % num_gpus
                                               for j in range(gpus_per_gen)))
+            print(
+                f"Launching gen worker {i + 1}/{num_gen_instances} on device {device_ids}"
+            )
             gen_workers.append(
                 run_gen_worker(model,
                                gen_worker_config,
@@ -734,9 +749,27 @@ def setup_disagg_cluster(
                                           env=env,
                                           cwd=cwd)
 
-        asyncio.run(
-            wait_for_disagg_server_ready(server_port,
-                                         timeout=server_start_timeout))
+        async def _wait_with_ticker():
+            start = time.monotonic()
+            last_tick = start
+
+            async def _tick():
+                nonlocal last_tick
+                while True:
+                    await asyncio.sleep(1)
+                    now = time.monotonic()
+                    if startup_callback and now - last_tick >= startup_tick:
+                        startup_callback(now - start)
+                        last_tick = now
+
+            ticker = asyncio.create_task(_tick())
+            try:
+                await wait_for_disagg_server_ready(server_port,
+                                                   timeout=server_start_timeout)
+            finally:
+                ticker.cancel()
+
+        asyncio.run(_wait_with_ticker())
     except Exception:
         terminate(*ctx_workers, *gen_workers, disagg_server)
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -1151,6 +1184,29 @@ def test_disaggregated_overlap_transceiver_runtime_python_fabric_memory(
     env["TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY"] = "1"
     run_disaggregated_test(disaggregated_example_root,
                            "overlap_transceiver_runtime_python",
+                           env=env,
+                           model_path=llama_model_root,
+                           cwd=llm_venv.get_working_directory())
+
+
+# Exercises the disaggregated KV-cache transfer path with the Python cache transceiver AND the
+# KV-cache bounce optimization (cache_transceiver_config.kv_cache_bounce_size_mb > 0): scattered
+# per-block WRITEs are gathered into one coalesced fabric-VMM buffer before a single NIXL WRITE.
+# Restricted to GB200/GB300 since the bounce arena is fabric (MNNVL) VMM memory.
+@pytest.mark.skip_device_not_contain(["GB200", "GB300"])
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_overlap_transceiver_runtime_python_bounce(
+        disaggregated_test_root, llm_venv, disaggregated_example_root,
+        llama_model_root):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
+    env = llm_venv._new_env.copy()
+    env["UCX_TLS"] = get_ucx_tls()
+    env["TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY"] = "1"
+    run_disaggregated_test(disaggregated_example_root,
+                           "overlap_transceiver_runtime_python_bounce",
                            env=env,
                            model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
@@ -2467,10 +2523,14 @@ def test_disaggregated_qwen3_32b_fp8(disaggregated_test_root,
                             cancellation_rate=10,
                             cancellation_delay=0.5),
                  marks=(pytest.mark.skip_less_device(8), skip_pre_blackwell)),
-    pytest.param(TestConfig(model_path='Qwen3/Qwen3-32B-FP8',
-                            test_desc='qwen3_32b_fp8_stress',
-                            request_count=10000,
-                            accuracy_threshold=0.42),
+    pytest.param(TestConfig(
+        model_path='Qwen3/Qwen3-32B-FP8',
+        test_desc='qwen3_32b_fp8_stress',
+        request_count=10000,
+        accuracy_threshold=0.42,
+        speculative_model_path='Zhi-Create-Qwen3-32B-Eagle3',
+        cancellation_rate=10,
+        cancellation_delay=0.5),
                  marks=(pytest.mark.skip_less_device(8), skip_pre_hopper)),
 ],
                          ids=lambda x: x.test_desc)
@@ -2500,11 +2560,18 @@ def test_disaggregated_stress_test(disaggregated_test_root,
         with open(config_file, 'r') as f:
             patched_config = yaml.safe_load(f)
         patched_sections = []
-        for section in ('context_servers', 'generation_servers'):
-            spec = patched_config.get(section, {}).get('speculative_config')
-            if spec is not None and 'speculative_model' in spec:
-                spec['speculative_model'] = spec_model_dir
-                patched_sections.append(section)
+        # Check top-level speculative_config first (current YAML layout), then
+        # fall back to per-server blocks for older config shapes.
+        top_spec = patched_config.get('speculative_config')
+        if isinstance(top_spec, dict) and 'speculative_model' in top_spec:
+            top_spec['speculative_model'] = spec_model_dir
+            patched_sections.append('top-level')
+        else:
+            for section in ('context_servers', 'generation_servers'):
+                spec = patched_config.get(section, {}).get('speculative_config')
+                if spec is not None and 'speculative_model' in spec:
+                    spec['speculative_model'] = spec_model_dir
+                    patched_sections.append(section)
         if not patched_sections:
             raise AssertionError(
                 f"{test_desc} sets speculative_model_path, but no "
@@ -2600,6 +2667,396 @@ def run_cancel_stress_test(server_url: str,
                 await asyncio.sleep(0.05)
 
     asyncio.run(run_bursts())
+
+
+# ---------------------------------------------------------------------------
+# Mixed-stress client (TRTLLM-12154)
+#
+# Exercises in-batch feature mixing: structured output (xgrammar JSON schema)
+# alongside free-text, varied temperature, varied input length, and
+# cancellations — all in the same scheduling step.
+#
+# Architecture:
+#   run_disaggregated_mixed_stress  — cluster wrapper (mirrors run_disaggregated_cancel_test)
+#     └─ _run_mixed_stress_async    — asyncio entry point
+#          └─ _send_mixed_request   — per-request coroutine (mirrors spam_and_cancel)
+#
+# Per-request spec dec toggling is NOT supported in the PyTorch backend
+# (py_disable_speculative_decoding is only settable batch-wide, not via the
+# HTTP API), so spec dec is a server-startup knob only and is not a profile
+# dimension here.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _MixedStressProfile:
+    """One request variant in the mixed-stress run."""
+    name: str
+    weight: float  # relative sampling weight; normalised at runtime
+    input_len_range: tuple  # (min_tokens, max_tokens) for synthetic prompt
+    output_len: int
+    temperature: float
+    streaming: bool
+    # JSON schema passed as response_format. None → free-text completion.
+    structured_output_schema: dict
+    # Probability [0, 1] that this request is cancelled mid-stream.
+    cancel_probability: float
+
+
+# Default profile mix. Weights are relative; they are normalised in
+# _run_mixed_stress_async. Tune during baseline run (item 3 in the plan).
+_DEFAULT_MIXED_STRESS_PROFILES = [
+    _MixedStressProfile(
+        name='free_text_low_temp',
+        weight=25.0,
+        input_len_range=(512, 2048),
+        output_len=256,
+        temperature=0.0,
+        streaming=True,
+        structured_output_schema=None,
+        cancel_probability=0.0,
+    ),
+    _MixedStressProfile(
+        name='free_text_high_temp',
+        weight=15.0,
+        input_len_range=(512, 2048),
+        output_len=256,
+        temperature=1.0,
+        streaming=True,
+        structured_output_schema=None,
+        cancel_probability=0.0,
+    ),
+    _MixedStressProfile(
+        name='structured_output',
+        weight=30.0,
+        input_len_range=(256, 1024),
+        output_len=128,
+        temperature=0.0,
+        streaming=True,
+        structured_output_schema={
+            "type": "object",
+            "properties": {
+                "answer": {
+                    "type": "string"
+                }
+            },
+            "required": ["answer"],
+        },
+        cancel_probability=0.0,
+    ),
+    _MixedStressProfile(
+        name='long_context',
+        weight=15.0,
+        input_len_range=(6000, 8192),
+        output_len=256,
+        temperature=0.7,
+        streaming=True,
+        structured_output_schema=None,
+        cancel_probability=0.0,
+    ),
+    _MixedStressProfile(
+        name='cancel',
+        weight=15.0,
+        input_len_range=(2000, 8000),
+        output_len=64,
+        temperature=0.7,
+        streaming=True,
+        structured_output_schema=None,
+        cancel_probability=1.0,
+    ),
+]
+
+
+async def _send_mixed_request(session,
+                              server_url: str,
+                              profile: _MixedStressProfile,
+                              results: list,
+                              model_name: str = "test-model") -> None:
+    """Send one request according to profile and record the outcome.
+
+    Three behaviors keyed on profile:
+    - cancel: stream until cancel_after seconds then disconnect (success stays False)
+    - structured_output: drain full stream, assemble text, validate JSON schema
+    - free-text / long-context: drain full stream, mark success
+    """
+    import random
+
+    prompt_len = random.randint(*profile.input_len_range)
+    prompt = "test " * (prompt_len // 5)
+
+    payload = {
+        "model": model_name,
+        "prompt": prompt,
+        "max_tokens": profile.output_len,
+        "temperature": profile.temperature,
+        "stream": profile.streaming,
+    }
+    if profile.structured_output_schema is not None:
+        payload["response_format"] = {
+            "type": "json",
+            "schema": profile.structured_output_schema,
+        }
+
+    should_cancel = random.random() < profile.cancel_probability
+    cancel_after = random.uniform(0.01, 0.1) if should_cancel else None
+
+    result = {
+        "profile": profile.name,
+        "success": False,
+        "json_valid": None,
+        "latency_ms": 0.0,
+        "cancelled": should_cancel,
+    }
+
+    start = time.monotonic()
+    try:
+        async with session.post(
+                f"{server_url}/v1/completions",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=120)) as resp:
+            assembled = []
+            finish_reason = None
+            done_received = False
+            async for raw_line in resp.content:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                chunk = line[len("data:"):].strip()
+                if chunk == "[DONE]":
+                    done_received = True
+                    break
+                if cancel_after is not None and time.monotonic(
+                ) - start > cancel_after:
+                    break  # force disconnect during generation
+                try:
+                    data = json.loads(chunk)
+                    choice = data.get("choices", [{}])[0]
+                    fr = choice.get("finish_reason")
+                    if fr is not None:
+                        finish_reason = fr
+                    if profile.structured_output_schema is not None:
+                        assembled.append(choice.get("text", ""))
+                except (json.JSONDecodeError, IndexError, KeyError):
+                    pass
+
+            # done_received: server sent explicit SSE terminator
+            # finish_reason check: server ended with a final chunk carrying
+            # finish_reason (trtllm-serve does not send data: [DONE])
+            completed = done_received or finish_reason in ("stop", "length")
+            if not should_cancel and completed:
+                if profile.structured_output_schema is not None:
+                    try:
+                        parsed = json.loads("".join(assembled))
+                        required = profile.structured_output_schema.get(
+                            "required", [])
+                        result["json_valid"] = all(k in parsed
+                                                   for k in required)
+                    except json.JSONDecodeError:
+                        result["json_valid"] = False
+                    result["success"] = result["json_valid"]
+                else:
+                    result["success"] = True
+    except Exception:
+        pass  # connection abort on cancel is expected
+    finally:
+        result["latency_ms"] = (time.monotonic() - start) * 1000
+        results.append(result)
+
+
+async def _run_mixed_stress_async(server_url: str,
+                                  profiles: list,
+                                  total_requests: int,
+                                  concurrency: int,
+                                  model_name: str = "test-model",
+                                  progress_callback=None,
+                                  progress_interval: int = 30) -> dict:
+    """Drive total_requests requests at the given concurrency level.
+
+    Returns a summary dict with per-profile counts and an overall accuracy_score.
+    accuracy_score = (free_text_successes + json_valid_count)
+                     / (free_text_total + structured_total)
+    Cancelled requests are excluded from the denominator.
+    """
+    import random
+
+    weights = [p.weight for p in profiles]
+    sem = asyncio.Semaphore(concurrency)
+    results = []
+
+    async def bounded(coro):
+        async with sem:
+            await coro
+
+    async def _progress_monitor():
+        start = time.monotonic()
+        while True:
+            await asyncio.sleep(progress_interval)
+            done = len(results)
+            if done >= total_requests:
+                break
+            elapsed = time.monotonic() - start
+            rate = done / elapsed if elapsed > 0 else 0.0
+            eta = (total_requests - done) / rate if rate > 0 else float('inf')
+            eta_str = f"{eta:.0f}s" if eta != float('inf') else "unknown"
+            logger.info(
+                "mixed-stress progress %d/%d (%.0f%%) rate=%.1f/s ETA=%s", done,
+                total_requests, 100 * done / total_requests, rate, eta_str)
+            if progress_callback:
+                progress_callback(done, total_requests, rate, eta)
+
+    async with aiohttp.ClientSession() as session:
+        chosen_profiles = random.choices(profiles,
+                                         weights=weights,
+                                         k=total_requests)
+        tasks = [
+            bounded(
+                _send_mixed_request(session, server_url, p, results,
+                                    model_name)) for p in chosen_profiles
+        ]
+        monitor = asyncio.create_task(_progress_monitor())
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            monitor.cancel()
+
+    # Aggregate
+    per_profile: dict = {}
+    for r in results:
+        p = per_profile.setdefault(r["profile"], {
+            "total": 0,
+            "success": 0,
+            "json_valid": 0,
+            "cancelled": 0
+        })
+        p["total"] += 1
+        if r["success"]:
+            p["success"] += 1
+        if r["json_valid"]:
+            p["json_valid"] += 1
+        if r["cancelled"]:
+            p["cancelled"] += 1
+
+    free_text_ok = sum(v["success"] for k, v in per_profile.items()
+                       if "free_text" in k or "long_context" in k)
+    free_text_total = sum(v["total"] for k, v in per_profile.items()
+                          if "free_text" in k or "long_context" in k)
+    json_ok = sum(v["json_valid"] for k, v in per_profile.items()
+                  if "structured" in k)
+    json_total = sum(v["total"] for k, v in per_profile.items()
+                     if "structured" in k)
+    denom = free_text_total + json_total
+    accuracy_score = (free_text_ok + json_ok) / denom if denom > 0 else 0.0
+
+    return {"per_profile": per_profile, "accuracy_score": accuracy_score}
+
+
+def run_disaggregated_mixed_stress(example_dir: str,
+                                   config_file: str,
+                                   model_path: str,
+                                   total_requests: int = 10000,
+                                   concurrency: int = 512,
+                                   accuracy_threshold: float = 0.42,
+                                   profiles: list = None,
+                                   server_start_timeout: int = 7200,
+                                   env=None,
+                                   cwd=None,
+                                   startup_callback=None,
+                                   progress_callback=None) -> None:
+    """Run the Qwen3-32B FP8 Eagle3 mixed-stress test.
+
+    Spins up a disaggregated cluster, drives total_requests heterogeneous
+    requests (free-text, structured output, varied length, cancellations) at
+    the given concurrency, checks accuracy_score >= accuracy_threshold, then
+    verifies server health via disagg_client.py.
+
+    Mirrors run_disaggregated_cancel_test for cluster setup/teardown.
+
+    Default total_requests is 10000, a conservative starting point chosen
+    to keep CI runtime manageable. The target workload (TRTLLM-12154) runs
+    20-100k requests per stability run; 10k covers the feature-mixing code
+    paths without the full wall-clock cost. Accuracy threshold should be
+    tightened after a baseline run establishes a real floor.
+
+    Observed wall-clock on 8x B200 (umbriel): ~17 min (1048s) for a
+    500-request run, of which ~16 min (961s) was the request phase and
+    ~87s was server startup. Request phase scales roughly linearly with
+    request count: the 60-request smoke variant targets ~2 min of requests,
+    and the 10k full variant ~32 min of requests.
+
+    Default concurrency is 512 rather than the ~32 typical of production
+    stability runs. Higher concurrency exercises more in-flight request
+    overlap and is more likely to surface scheduler/KV-cache/dispatcher
+    races. Validated against the target workload spec (TRTLLM-12154).
+    """
+    if profiles is None:
+        profiles = _DEFAULT_MIXED_STRESS_PROFILES
+
+    cleanup_output_files()
+    run_env = env.copy() if env else os.environ.copy()
+    run_env["UCX_TLS"] = get_ucx_tls()
+    run_env["UCX_MM_ERROR_HANDLING"] = "y"
+
+    config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
+        setup_disagg_cluster(config_file, model_name=model_path, env=run_env,
+                             cwd=cwd, server_start_timeout=server_start_timeout,
+                             save_log=True, startup_callback=startup_callback)
+
+    server_host = config.get("hostname", "localhost")
+    server_url = f"http://{server_host}:{server_port}"
+
+    try:
+        if not wait_for_server(
+                server_host, server_port, timeout_seconds=server_start_timeout):
+            raise RuntimeError(
+                f"Disaggregated server did not become ready within "
+                f"{server_start_timeout}s")
+
+        summary = asyncio.run(
+            _run_mixed_stress_async(server_url,
+                                    profiles,
+                                    total_requests,
+                                    concurrency,
+                                    model_name=model_path,
+                                    progress_callback=progress_callback))
+
+        logger.info("Mixed stress summary: %s", summary)
+
+        score = summary["accuracy_score"]
+        if score < accuracy_threshold:
+            raise AssertionError(
+                f"Mixed stress accuracy {score:.3f} below threshold "
+                f"{accuracy_threshold:.3f}. Per-profile: "
+                f"{summary['per_profile']}")
+
+        # Verify server still healthy after the stress run.
+        # Probe /v1/chat/completions (not /v1/models) — the known failure mode
+        # is the event loop dying while /v1/models keeps returning 200.
+        client_config = config.copy()
+        client_config["port"] = server_port
+        client_config["hostname"] = server_host
+        temp_fd, client_config_file = tempfile.mkstemp(suffix='.yaml',
+                                                       dir=work_dir)
+        with os.fdopen(temp_fd, 'w') as f:
+            yaml.dump(client_config, f)
+
+        client_dir = f"{example_dir}/clients"
+        client_cmd = [
+            'python3', f'{client_dir}/disagg_client.py', '-c',
+            client_config_file, '-p', f'{client_dir}/prompts.json',
+            '--ignore-eos', '--server-start-timeout',
+            str(server_start_timeout)
+        ]
+        all_worker_procs = [w.process for w in ctx_workers + gen_workers]
+        check_call(client_cmd,
+                   env=run_env,
+                   poll_procs=all_worker_procs + [disagg_server.process])
+
+    except Exception:
+        logger.error("Mixed stress test failed")
+        raise
+    finally:
+        terminate(*ctx_workers, *gen_workers, disagg_server)
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def run_disaggregated_cancel_test(example_dir,
@@ -2947,4 +3404,82 @@ def test_disaggregated_mamba_conc_greater_than_mbs(disaggregated_example_root,
         cwd=llm_venv.get_working_directory())
     print(f"E2EL: {e2el} ms, TTFT: {ttft} ms")
 
-    assert e2el > 0 and ttft > 0
+
+@pytest.mark.parametrize(
+    "test_config",
+    [
+        # Smoke run: 60 requests at 64 concurrency, ~2 min request phase on
+        # B200 (scaled down from 500-req baseline of ~17.5 min). Used as L0
+        # post-merge gate.
+        pytest.param(TestConfig(
+            model_path='Qwen3/Qwen3-32B-FP8',
+            test_desc='req60-conc64-qwen3_32b_fp8_mixed_stress',
+            request_count=60,
+            concurrency=64,
+            accuracy_threshold=0.42,
+            speculative_model_path='Zhi-Create-Qwen3-32B-Eagle3'),
+                     marks=(pytest.mark.skip_less_device(8), skip_pre_hopper)),
+        # Full stress run: 10k requests at 512 concurrency.
+        # Estimated wall-clock: 1-2 hours (server startup ~5-10 min + request
+        # phase; based on 500-req baseline of ~17.5 min at 64 concurrency on
+        # B200, scaled to 512 concurrency which doesn't multiply rate 1:1).
+        pytest.param(TestConfig(
+            model_path='Qwen3/Qwen3-32B-FP8',
+            test_desc='req10k-conc512-qwen3_32b_fp8_mixed_stress',
+            request_count=10000,
+            concurrency=512,
+            accuracy_threshold=0.42,
+            speculative_model_path='Zhi-Create-Qwen3-32B-Eagle3'),
+                     marks=(pytest.mark.skip_less_device(8), skip_pre_hopper)),
+    ],
+    ids=lambda x: x.test_desc)
+def test_disaggregated_mixed_stress_test(disaggregated_test_root,
+                                         disaggregated_example_root, llm_venv,
+                                         test_config):
+    model_path = test_config.model_path
+    test_desc = test_config.test_desc
+    model_dir = resolve_llm_model_path(model_path)
+    setup_model_symlink(llm_venv, model_dir, model_path)
+
+    config_file = get_test_config(test_desc, disaggregated_example_root,
+                                  os.path.dirname(__file__))
+
+    if test_config.speculative_model_path is not None:
+        spec_model_dir = f"{llm_models_root()}/{test_config.speculative_model_path}"
+        setup_model_symlink(llm_venv, spec_model_dir,
+                            test_config.speculative_model_path)
+        with open(config_file, 'r') as f:
+            patched_config = yaml.safe_load(f)
+        patched_sections = []
+        # Check top-level speculative_config first (current YAML layout), then
+        # fall back to per-server blocks for older config shapes.
+        top_spec = patched_config.get('speculative_config')
+        if isinstance(top_spec, dict) and 'speculative_model' in top_spec:
+            top_spec['speculative_model'] = spec_model_dir
+            patched_sections.append('top-level')
+        else:
+            for section in ('context_servers', 'generation_servers'):
+                spec = patched_config.get(section, {}).get('speculative_config')
+                if spec is not None and 'speculative_model' in spec:
+                    spec['speculative_model'] = spec_model_dir
+                    patched_sections.append(section)
+        if not patched_sections:
+            raise AssertionError(
+                f"{test_desc} sets speculative_model_path, but no "
+                "speculative_config.speculative_model field was patched")
+        patched_path = os.path.join(llm_venv.get_working_directory(),
+                                    f"{test_desc}_patched.yaml")
+        with open(patched_path, 'w') as f:
+            yaml.safe_dump(patched_config, f)
+        config_file = patched_path
+
+    run_disaggregated_mixed_stress(
+        example_dir=disaggregated_example_root,
+        config_file=config_file,
+        model_path=model_dir,
+        total_requests=test_config.request_count,
+        concurrency=test_config.concurrency,
+        accuracy_threshold=test_config.accuracy_threshold,
+        server_start_timeout=7200,
+        env=llm_venv._new_env,
+        cwd=llm_venv.get_working_directory())

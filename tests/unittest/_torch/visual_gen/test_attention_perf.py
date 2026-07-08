@@ -29,12 +29,17 @@ Usage:
 """
 
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from typing import Dict, Optional, Tuple
 
 import pytest
 import torch
+
+from tensorrt_llm._torch.visual_gen.attention_backend import (
+    VSAMetadataBuilder,
+    set_vsa_forward_context,
+)
 
 # ============================================================================
 # Flash Attention 4 availability
@@ -49,7 +54,11 @@ from tensorrt_llm._torch.visual_gen.config import (
     create_attention_metadata_state,
 )
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
-from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig
+from tensorrt_llm.visual_gen.args import (
+    AttentionConfig,
+    QuantAttentionConfig,
+    VideoSparseAttentionConfig,
+)
 
 _flash_attn4_available = _fa4_fwd is not None
 _cute_dsl_available = _cute_dsl_import_error is None
@@ -130,6 +139,17 @@ def cuda_timer(device: torch.device):
         yield get_elapsed_time
 
 
+def bench_fn(device: torch.device, fn, n_iters: int) -> torch.Tensor:
+    """Time `fn` over `n_iters` GPU-timed iterations; returns per-iteration ms."""
+    times = []
+    with torch.no_grad():
+        for _ in range(n_iters):
+            with cuda_timer(device) as get_t:
+                fn()
+            times.append(get_t())
+    return torch.tensor(times)
+
+
 @contextmanager
 def nvtx_range(name: str):
     """Context manager for NVTX range profiling."""
@@ -171,6 +191,7 @@ def create_model_config(
     eps: float = 1e-6,
     attn_backend: str = "VANILLA",
     quant_attention_config: "QuantAttentionConfig | None" = None,
+    vsa_sparsity: "float | None" = None,
 ) -> DiffusionModelConfig:
     """Create a mock DiffusionModelConfig for testing."""
     pretrained_config = SimpleNamespace(
@@ -180,11 +201,16 @@ def create_model_config(
         eps=eps,
     )
 
+    sparse_attention_config = (
+        VideoSparseAttentionConfig(vsa_sparsity=vsa_sparsity) if vsa_sparsity is not None else None
+    )
+
     config = DiffusionModelConfig(
         pretrained_config=pretrained_config,
         attention=AttentionConfig(
             backend=attn_backend,
             quant_attention_config=quant_attention_config,
+            sparse_attention_config=sparse_attention_config,
         ),
         skip_create_weights_in_init=False,
     )
@@ -228,6 +254,21 @@ def _is_sage_attention_enabled(model: Attention) -> bool:
     attention_backend = getattr(model, "attn", None)
     inner_backend = getattr(attention_backend, "inner_backend", attention_backend)
     return getattr(inner_backend, "quant_attention_config", None) is not None
+
+
+def _init_attention_weights(attn: Attention, std: float = 0.02) -> None:
+    """Initialize TRT-LLM Linear weights to N(0, std) to avoid RMSNorm NaN."""
+    with torch.no_grad():
+        if getattr(attn, "qkv_proj", None) is not None:
+            attn.qkv_proj.weight.normal_(0.0, std)
+            if attn.qkv_proj.bias is not None:
+                attn.qkv_proj.bias.zero_()
+        if getattr(attn, "qk_norm", False):
+            attn.norm_q.weight.fill_(1.0)
+            attn.norm_k.weight.fill_(1.0)
+        attn.to_out[0].weight.normal_(0.0, std)
+        if attn.to_out[0].bias is not None:
+            attn.to_out[0].bias.zero_()
 
 
 # ============================================================================
@@ -286,6 +327,8 @@ class WanAttentionPerformanceBenchmark:
         head_dim: int,
         backend: str,
         quant_attention_config: "QuantAttentionConfig | None" = None,
+        vsa_sparsity: "float | None" = None,
+        init_std: "float | None" = None,
     ) -> Attention:
         """Create a WAN self-attention model with specified backend."""
         config = create_model_config(
@@ -294,11 +337,14 @@ class WanAttentionPerformanceBenchmark:
             head_dim,
             attn_backend=backend,
             quant_attention_config=quant_attention_config,
+            vsa_sparsity=vsa_sparsity,
         )
         model = Attention(hidden_size, num_heads, qkv_mode=QKVMode.FUSE_QKV, config=config).to(
             self.device
         )
         model.eval()
+        if init_std is not None:
+            _init_attention_weights(model, init_std)
         return model
 
     def create_cross_attention_model(
@@ -434,8 +480,15 @@ class WanAttentionPerformanceBenchmark:
         backend: str,
         verbose: bool = True,
         quant_attention_config: "QuantAttentionConfig | None" = None,
+        vsa_sparsity: "float | None" = None,
+        latent_shape: "Tuple[int, int, int] | None" = None,
+        init_std: "float | None" = None,
     ) -> Optional[Dict]:
         """Benchmark a single configuration.
+
+        For the VSA path, pass ``vsa_sparsity`` and the 3-D ``latent_shape``
+        (T, H, W) with ``seq_len == T * H * W``; the forward is run inside a
+        VSA forward context with a zero ``gate_compress``.
 
         Returns:
             Dict with timing statistics or None if test failed/skipped
@@ -452,16 +505,56 @@ class WanAttentionPerformanceBenchmark:
         try:
             # Create model and data
             model = self.create_attention_model(
-                hidden_size, num_heads, head_dim, backend, quant_attention_config
+                hidden_size,
+                num_heads,
+                head_dim,
+                backend,
+                quant_attention_config,
+                vsa_sparsity=vsa_sparsity,
+                init_std=init_std,
             )
             hidden_states, freqs = self.create_test_data(batch_size, seq_len, hidden_size, head_dim)
+
+            # Fail fast if the requested backend silently resolved to something
+            # else (e.g. CUTEDSL/VSA downgraded to VANILLA dense for an
+            # unsupported config).
+            resolved_backend = getattr(model, "attn_backend", backend)
+            if vsa_sparsity is not None:
+                assert resolved_backend == "CUTEDSL", (
+                    f"VSA run requested CUTEDSL but the attention module resolved to "
+                    f"{resolved_backend!r}; refusing to report VSA timings for a dense fallback."
+                )
+
+            # VSA needs an active forward context + a zero gate_compress; other
+            # backends use neither.
+            vsa_metadata = None
+            gate_compress = None
+            if vsa_sparsity is not None:
+                vsa_metadata = VSAMetadataBuilder().build(
+                    current_timestep=0,
+                    raw_latent_shape=latent_shape,
+                    patch_size=(1, 1, 1),
+                    vsa_sparsity=vsa_sparsity,
+                    device=self.device,
+                )
+                gate_compress = torch.zeros_like(hidden_states)
+
+            def _forward():
+                ctx = (
+                    set_vsa_forward_context(vsa_metadata)
+                    if vsa_metadata is not None
+                    else nullcontext()
+                )
+                kwargs = {"gate_compress": gate_compress} if gate_compress is not None else {}
+                with ctx:
+                    return model(hidden_states, freqs=freqs, **kwargs)
 
             # Warmup
             with nvtx_range(f"warmup_{backend}"):
                 with torch_profiler_range(f"warmup_{backend}"):
                     with torch.no_grad():
                         for _ in range(self.warmup_iterations):
-                            _ = model(hidden_states, freqs=freqs)
+                            _ = _forward()
 
             if self.device.type == "cuda":
                 torch.cuda.synchronize()
@@ -474,7 +567,7 @@ class WanAttentionPerformanceBenchmark:
                         for i in range(self.benchmark_iterations):
                             with nvtx_range(f"iter_{backend}_{i}"):
                                 with cuda_timer(self.device) as get_time:
-                                    _ = model(hidden_states, freqs=freqs)
+                                    _ = _forward()
                                 times.append(get_time())
 
             # Statistics
@@ -489,6 +582,7 @@ class WanAttentionPerformanceBenchmark:
                 "p99_ms": torch.quantile(times_tensor, 0.99).item(),
                 "times_ms": times,
                 "uses_sage": _is_sage_attention_enabled(model),
+                "resolved_backend": resolved_backend,
             }
 
             # Calculate throughput (approximate TOPS)
@@ -504,6 +598,9 @@ class WanAttentionPerformanceBenchmark:
 
             return stats
 
+        except AssertionError:
+            # Backend-resolution / fail-fast checks are genuine test failures.
+            raise
         except Exception as e:
             if verbose:
                 print(f"  {backend}: ERROR - {e}")
@@ -933,6 +1030,226 @@ class TestFlashAttn4CrossAttnPerformance:
             )
             assert result is not None, f"{backend} cross-attn failed"
             assert result["avg_ms"] > 0
+
+
+# ============================================================================
+# VSA fine-stage kernel vs FA4 (kernel-level)
+# ============================================================================
+
+
+class TestVsaVsFa4KernelPerformance:
+    """Kernel-level VSA fine-stage vs FA4 benchmark.
+
+    Times the two kernels directly (no QKV proj / norm / gate / tile-untile) so
+    the comparison reflects only the attention math.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        if not _flash_attn4_available:
+            pytest.skip(
+                "FlashAttention 4 not available"
+                + (f": {_fa4_import_error}" if _fa4_import_error else "")
+            )
+        from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.video_sparse_attention import (
+            CUTE_AVAILABLE,
+            block_sparse_attn_from_indices_cute,
+            is_cute_supported,
+        )
+
+        if not CUTE_AVAILABLE:
+            pytest.skip("cuda-bindings or cutlass-dsl not importable (VSA CuTe path)")
+        self.device = torch.device("cuda")
+        self.dtype = torch.bfloat16
+        self.warmup = 10
+        self.iters = 50
+        self._cute_fn = block_sparse_attn_from_indices_cute
+        self._is_cute_supported = is_cute_supported
+
+    @pytest.mark.parametrize(
+        "batch,num_heads,seq_len,head_dim,block_size,sparsity",
+        [
+            (1, 40, 131_072, 128, 64, 0.5),
+        ],
+        ids=["wan_BS1_H40_S131k_D128_blk64_s0.5"],
+    )
+    def test_vsa_kernel_vs_fa4(
+        self,
+        batch: int,
+        num_heads: int,
+        seq_len: int,
+        head_dim: int,
+        block_size: int,
+        sparsity: float,
+    ):
+        from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import VSA_KERNEL_MAX_CUBES
+
+        assert seq_len % block_size == 0, "seq_len must be a multiple of block_size"
+        num_cubes = seq_len // block_size
+        if num_cubes > VSA_KERNEL_MAX_CUBES:
+            pytest.skip(
+                f"num_cubes={num_cubes} exceeds VSA_KERNEL_MAX_CUBES={VSA_KERNEL_MAX_CUBES}"
+            )
+        topk = max(1, int(round((1.0 - sparsity) * num_cubes)))
+
+        # FA4 expects [B, S, H, D]; VSA CuTe expects [B, H, S, D].
+        q_nhd = torch.randn(
+            batch, seq_len, num_heads, head_dim, device=self.device, dtype=self.dtype
+        )
+        k_nhd = torch.randn_like(q_nhd)
+        v_nhd = torch.randn_like(q_nhd)
+        q_bhsd = q_nhd.transpose(1, 2).contiguous()
+        k_bhsd = k_nhd.transpose(1, 2).contiguous()
+        v_bhsd = v_nhd.transpose(1, 2).contiguous()
+
+        if not self._is_cute_supported(q_bhsd):
+            pytest.skip("VSA CuTe path requires sm_100+ Blackwell + bf16/fp16 + head_dim=128")
+
+        # Group2QInterleaveKV requires paired Q-blocks (2i, 2i+1) to share KV
+        # selections. A constant index set across all Q-blocks trivially satisfies that.
+        q2k_idx = (
+            torch.arange(topk, device=self.device, dtype=torch.int32)
+            .view(1, 1, 1, topk)
+            .expand(batch, num_heads, num_cubes, topk)
+            .contiguous()
+        )
+        q2k_num = torch.full(
+            (batch, num_heads, num_cubes), topk, dtype=torch.int32, device=self.device
+        )
+        variable_block_sizes = torch.full(
+            (num_cubes,), block_size, dtype=torch.int32, device=self.device
+        )
+
+        softmax_scale = head_dim**-0.5
+
+        def fa4_call():
+            _fa4_fwd(
+                q_nhd,
+                k_nhd,
+                v_nhd,
+                softmax_scale=softmax_scale,
+                causal=False,
+                window_size_left=None,
+                window_size_right=None,
+                learnable_sink=None,
+                softcap=0.0,
+                pack_gqa=None,
+                mask_mod=None,
+                block_sparse_tensors=None,
+                return_lse=True,
+            )
+
+        def vsa_call():
+            self._cute_fn(
+                q_bhsd,
+                k_bhsd,
+                v_bhsd,
+                q2k_idx,
+                q2k_num,
+                variable_block_sizes,
+            )
+
+        with torch.no_grad():
+            for _ in range(self.warmup):
+                fa4_call()
+                vsa_call()
+        torch.cuda.synchronize()
+
+        with nvtx_range("bench_fa4"):
+            fa4_times = bench_fn(self.device, fa4_call, self.iters)
+        with nvtx_range("bench_vsa_fine"):
+            vsa_times = bench_fn(self.device, vsa_call, self.iters)
+
+        fa4_avg = fa4_times.mean().item()
+        vsa_avg = vsa_times.mean().item()
+        speedup = fa4_avg / vsa_avg
+
+        print(
+            f"\n  VSA vs FA4 (BS={batch}, H={num_heads}, S={seq_len}, "
+            f"D={head_dim}, blk={block_size}, sparsity={sparsity:.2f}, "
+            f"topk={topk}/{num_cubes}):"
+        )
+        print(f"    FA4 (dense):      avg={fa4_avg:.3f}ms")
+        print(f"    VSA (fine-stage): avg={vsa_avg:.3f}ms")
+        print(f"    VSA speedup vs FA4: {speedup:.2f}x ({'faster' if speedup > 1 else 'slower'})")
+        assert fa4_avg > 0 and vsa_avg > 0
+
+
+# ============================================================================
+# VSA vs VANILLA at Wan 2.2 T2V 14B production shape — module-level
+# ============================================================================
+
+
+class TestVsaVsVanillaWan22T2v14bModulePerformance:
+    """Module-level VSA vs VANILLA at Wan 2.2 T2V 14B 720p / 81-frame shape.
+
+    Drives the shared WanAttentionPerformanceBenchmark engine so VSA is timed
+    and reported exactly like the VANILLA/TRTLLM/FA4 backends.
+    """
+
+    _BATCH = 1
+    _NUM_HEADS = 40
+    _HEAD_DIM = 128
+    _LATENT_SHAPE = (21, 45, 80)  # DiT seq shape after VAE + patchify
+    _SEQ_LEN = 21 * 45 * 80  # 75_600
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.video_sparse_attention import (
+            CUTE_AVAILABLE,
+            is_cute_supported,
+        )
+
+        if not CUTE_AVAILABLE:
+            pytest.skip("cuda-bindings or cutlass-dsl not importable (VSA CuTe path)")
+        self._is_cute_supported = is_cute_supported
+        self.benchmark = WanAttentionPerformanceBenchmark(
+            warmup_iterations=5, benchmark_iterations=20
+        )
+
+    @pytest.mark.parametrize(
+        "sparsity",
+        [0.5, 0.75, 0.85, 0.875],
+        ids=["s0.5", "s0.75", "s0.85", "s0.875"],
+    )
+    def test_vsa_module_vs_vanilla_wan22_t2v_14b(self, sparsity: float):
+        bench = self.benchmark
+        probe_q = torch.empty(
+            self._BATCH,
+            self._NUM_HEADS,
+            64,
+            self._HEAD_DIM,
+            device=bench.device,
+            dtype=bench.dtype,
+        )
+        if not self._is_cute_supported(probe_q):
+            pytest.skip("VSA CuTe path requires sm_100+ Blackwell + bf16/fp16 + head_dim=128")
+
+        common = dict(
+            batch_size=self._BATCH,
+            num_heads=self._NUM_HEADS,
+            seq_len=self._SEQ_LEN,
+            head_dim=self._HEAD_DIM,
+            init_std=0.02,
+            verbose=False,
+        )
+        vanilla = bench.benchmark_single(backend="VANILLA", **common)
+        vsa = bench.benchmark_single(
+            backend="CUTEDSL", vsa_sparsity=sparsity, latent_shape=self._LATENT_SHAPE, **common
+        )
+        assert vanilla is not None and vsa is not None, "benchmark returned None (skipped/failed)"
+        assert vsa["resolved_backend"] == "CUTEDSL", (
+            f"VSA timings came from {vsa['resolved_backend']!r}, not the CUTEDSL/VSA path"
+        )
+        assert vanilla["avg_ms"] > 0 and vsa["avg_ms"] > 0
+
+        speedup = vanilla["avg_ms"] / vsa["avg_ms"]
+        print(
+            f"\n  VSA vs VANILLA (Wan 2.2 T2V 14B 720p/81f, latent={self._LATENT_SHAPE}, "
+            f"S={self._SEQ_LEN}, sparsity={sparsity:.3f}): "
+            f"VANILLA={vanilla['avg_ms']:.3f}ms, VSA={vsa['avg_ms']:.3f}ms, "
+            f"speedup={speedup:.2f}x ({'faster' if speedup > 1 else 'slower'})"
+        )
 
 
 # ============================================================================

@@ -41,6 +41,7 @@ from tensorrt_llm.lora_manager import load_torch_lora
 from tensorrt_llm.mapping import CpType, Mapping
 
 from ..attention_backend import get_sparse_attn_kv_cache_manager
+from ..hostfunc import set_low_latency_dispatch
 from ..model_config import ModelConfig
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
@@ -103,16 +104,26 @@ def get_kv_cache_manager_cls(
       * ``TRTLLM_USE_PY_MAMBA=1``  — Mixed manager with PythonMambaCacheManager.
     """
     config = model_config.pretrained_config
-    sparse_attention_config = model_config.sparse_attention_config
-    if sparse_attention_config is not None:
-        return get_sparse_attn_kv_cache_manager(sparse_attention_config)
-    elif is_hybrid_linear(config):
+    sparse_attn_config = model_config.sparse_attention_config
+    sparse_attn_algorithm = getattr(sparse_attn_config, "algorithm", None)
+    if is_hybrid_linear(config):
         # Degenerate case: model is flagged as hybrid but the config has zero
-        # mamba layers. Fall through to the standard non-hybrid manager.
+        # mamba layers. Fall through to the standard non-hybrid routes.
         if model_config.get_num_mamba_layers() == 0:
             logger.info("Hybrid linear model has 0 mamba layers; using "
-                        "KVCacheManager without mamba caching")
+                        "KV cache manager without mamba caching")
+            if sparse_attn_config is not None:
+                return get_sparse_attn_kv_cache_manager(sparse_attn_config)
             return _non_hybrid_kv_cache_manager_cls(config, kv_cache_config)
+
+        if (sparse_attn_config is not None
+                and sparse_attn_algorithm != "skip_softmax"):
+            raise ValueError(
+                f"Sparse attention algorithm {sparse_attn_algorithm!r} is not "
+                "supported with hybrid Mamba / linear-attention models.")
+
+        # Skip Softmax only changes attention kernels. Hybrid models still
+        # need a Mamba-capable cache manager for recurrent state.
         if use_py_mamba_cache_manager():
             if kv_cache_config.enable_block_reuse:
                 raise ValueError(
@@ -153,6 +164,8 @@ def get_kv_cache_manager_cls(
                     f"Expected 'CPP' or 'MIXED'. Using default {default_cls.__name__}."
                 )
         return default_cls
+    elif sparse_attn_config is not None:
+        return get_sparse_attn_kv_cache_manager(sparse_attn_config)
     else:
         return _non_hybrid_kv_cache_manager_cls(config, kv_cache_config)
 
@@ -1972,6 +1985,9 @@ def create_py_executor_instance(
     execution_stream: Optional[torch.cuda.Stream] = None,
     dwdp_manager: Optional[DwdpManager] = None,
 ) -> PyExecutor:
+    set_low_latency_dispatch(
+        getattr(llm_args, 'enable_low_latency_host_dispatch', False))
+
     kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
 
     spec_config = model_engine.spec_config

@@ -330,21 +330,43 @@ def _normalize_qwen35_quantization_config(model_config) -> None:
     quantization_config["modules_to_not_convert"] = sorted(set(normalized_modules))
 
 
-def _normalize_qwen35_moe_vl_config(model_config) -> None:
-    """Adapt HF Qwen3.5-MoE VLM config to TRT-LLM runtime conventions."""
+# Map the inner (text) causal-LM arch to the outer VLM arch, used only for the
+# defensive fallback when a config arrives without an `architectures` field.
+_INNER_TO_OUTER_VL_ARCH = {
+    "Qwen3_5MoeForCausalLM": "Qwen3_5MoeForConditionalGeneration",
+    "Qwen3_5ForCausalLM": "Qwen3_5ForConditionalGeneration",
+}
+
+
+def _normalize_qwen35_vl_config(model_config, inner_arch: str) -> None:
+    """Adapt an HF Qwen3.5 VLM config (MoE or dense) to TRT-LLM conventions.
+
+    Shared by both the MoE (`Qwen3_5MoeForConditionalGeneration` ->
+    `Qwen3_5MoeForCausalLM`) and dense (`Qwen3_5ForConditionalGeneration` ->
+    `Qwen3_5ForCausalLM`) VLM paths. The only difference between the two is the
+    inner causal-LM arch string written onto `text_config`; everything else
+    (mRoPE flattening, Qwen3Next text aliases, quantization exclude-module
+    rewrite) is identical. `_normalize_qwen35_qwen3next_text_aliases` is a no-op
+    for dense (its native `intermediate_size` is already present).
+    """
     if not getattr(model_config, "architectures", None):
-        model_config.architectures = ["Qwen3_5MoeForConditionalGeneration"]
+        model_config.architectures = [_INNER_TO_OUTER_VL_ARCH.get(inner_arch, inner_arch)]
 
     text_config = getattr(model_config, "text_config", None)
     if text_config is None:
-        raise ValueError("Qwen3.5-MoE VLM config is missing text_config")
+        raise ValueError("Qwen3.5 VLM config is missing text_config")
 
-    text_config.architectures = ["Qwen3_5MoeForCausalLM"]
+    text_config.architectures = [inner_arch]
     _normalize_qwen35_qwen3next_text_aliases(text_config)
     _normalize_qwen35_mrope_config(text_config)
 
     model_config.get_text_config = lambda decoder=False: text_config
     _normalize_qwen35_quantization_config(model_config)
+
+
+def _normalize_qwen35_moe_vl_config(model_config) -> None:
+    """Adapt HF Qwen3.5-MoE VLM config to TRT-LLM runtime conventions."""
+    _normalize_qwen35_vl_config(model_config, inner_arch="Qwen3_5MoeForCausalLM")
 
 
 def _normalize_qwen35_exclude_modules(model_config):
@@ -435,25 +457,41 @@ class Qwen3_5ForCausalLM(Qwen3NextForCausalLM):
         super().__init__(model_config)
 
 
-# TODO: Add tests for disaggregated support.
-@support_multimodal_disaggregated
-@register_vision_encoder(Qwen3VisionModelBase, vlm_base_model=Qwen3VisionModel)
-@register_auto_model("Qwen3_5MoeForConditionalGeneration")
-@register_input_processor(
-    Qwen3VLInputProcessorBase,
-    model_type="qwen3_5_moe",
-    placeholder_metadata=MultimodalPlaceholderMetadata(
-        placeholder_map={
-            "image": "<|vision_start|><|image_pad|><|vision_end|>",
-            "video": "<|vision_start|><|video_pad|><|vision_end|>",
-        },
-        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
-        placeholders_separator="",
-        content_format=ContentFormat.STRING,
-    ),
+# Shared placeholder metadata for both Qwen3.5 VLM variants. The image/video
+# placeholder layout is identical for MoE and dense; only the registration
+# `model_type` differs (set per concrete class below).
+_QWEN3_5_VL_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
+    placeholder_map={
+        "image": "<|vision_start|><|image_pad|><|vision_end|>",
+        "video": "<|vision_start|><|video_pad|><|vision_end|>",
+    },
+    placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+    placeholders_separator="",
+    content_format=ContentFormat.STRING,
 )
-class Qwen3_5MoeVLModel(Qwen3VLModelBase):
-    """VLM wrapper composing Qwen3 vision encoder with Qwen3.5 MoE text decoder."""
+
+
+class _Qwen3_5VLModel(Qwen3VLModelBase):
+    """Shared VLM wrapper composing the Qwen3 vision encoder with a Qwen3.5
+    (Qwen3Next-based) text decoder.
+
+    MoE and dense differ only in the inner causal-LM the config normalizer
+    selects (`Qwen3_5MoeForCausalLM` vs `Qwen3_5ForCausalLM`) — both reuse the
+    same vision tower, weight mapper, and forward path, so the wrapper body is
+    shared here. The concrete subclasses below carry only the registration
+    decorators (outer arch string + input-processor `model_type`).
+    """
+
+    @classmethod
+    def get_model_defaults(cls, llm_args):
+        # `ModelLoader` applies `get_model_defaults()` on the resolved outer
+        # model class (this VLM wrapper), not on the inner decoder. Both
+        # inner LMs (`Qwen3_5MoeForCausalLM` / `Qwen3_5ForCausalLM`) inherit
+        # `Qwen3NextForCausalLM`'s defaults unchanged, so delegate to it to
+        # propagate `enable_block_reuse=False` — the hybrid Mamba/SSM path
+        # doesn't support KV-cache block reuse. Without this the VLM path
+        # would silently fall back to the global default (block reuse on).
+        return Qwen3NextForCausalLM.get_model_defaults(llm_args)
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         kwargs["vision_model_class"] = Qwen3VisionModel
@@ -481,3 +519,35 @@ class Qwen3_5MoeVLModel(Qwen3VLModelBase):
             r"^model\.language_model\.(.*)$": r"model.\1",
         }
         self.llm.load_weights(filtered_weights, weight_mapper, params_map=params_map)
+
+
+# TODO(TRTLLM-13417): Add tests for disaggregated support.
+@support_multimodal_disaggregated
+@register_vision_encoder(Qwen3VisionModelBase, vlm_base_model=Qwen3VisionModel)
+@register_auto_model("Qwen3_5MoeForConditionalGeneration")
+@register_input_processor(
+    Qwen3VLInputProcessorBase,
+    model_type="qwen3_5_moe",
+    placeholder_metadata=_QWEN3_5_VL_PLACEHOLDER_METADATA,
+)
+class Qwen3_5MoeVLModel(_Qwen3_5VLModel):
+    """VLM wrapper composing Qwen3 vision encoder with Qwen3.5 MoE text decoder."""
+
+
+# TODO(TRTLLM-13417): Add tests for disaggregated support.
+@support_multimodal_disaggregated
+@register_vision_encoder(Qwen3VisionModelBase, vlm_base_model=Qwen3VisionModel)
+@register_auto_model("Qwen3_5ForConditionalGeneration")
+@register_input_processor(
+    Qwen3VLInputProcessorBase,
+    model_type="qwen3_5",
+    placeholder_metadata=_QWEN3_5_VL_PLACEHOLDER_METADATA,
+)
+class Qwen3_5VLModel(_Qwen3_5VLModel):
+    """VLM wrapper composing Qwen3 vision encoder with dense Qwen3.5 text decoder.
+
+    Dense sibling of `Qwen3_5MoeVLModel` (arch `Qwen3_5ForConditionalGeneration`,
+    `model_type="qwen3_5"`). Same hybrid Qwen3Next runtime, with `GatedMLP`
+    instead of `SparseMoeBlock` (the dense text config has a native `intermediate_size`
+    and no `num_experts`).
+    """
