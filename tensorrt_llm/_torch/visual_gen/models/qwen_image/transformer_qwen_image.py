@@ -553,6 +553,7 @@ class QwenJointAttention(Attention):
         return (
             self.fuse_qk_norm_rope
             and image_rotary_emb is not None
+            and self.qk_norm
             and hidden_states.is_cuda
             and hidden_states.dtype == torch.bfloat16
             and self.head_dim in (64, 128, 256)
@@ -576,8 +577,11 @@ class QwenJointAttention(Attention):
         img_freqs, txt_freqs = image_rotary_emb
         txt_cos, txt_sin = qwen_complex_freqs_to_cos_sin(txt_freqs)
         img_cos, img_sin = qwen_complex_freqs_to_cos_sin(img_freqs)
-        freqs_cos = torch.cat([txt_cos, img_cos], dim=0)
-        freqs_sin = torch.cat([txt_sin, img_sin], dim=0)
+        freqs_cos = torch.cat([txt_cos, img_cos], dim=0).squeeze(1)
+        freqs_sin = torch.cat([txt_sin, img_sin], dim=0).squeeze(1)
+        if qkv.shape[0] > 1:
+            freqs_cos = freqs_cos.repeat(qkv.shape[0], 1)
+            freqs_sin = freqs_sin.repeat(qkv.shape[0], 1)
 
         self.apply_packed_qk_norm_rope(
             qkv,

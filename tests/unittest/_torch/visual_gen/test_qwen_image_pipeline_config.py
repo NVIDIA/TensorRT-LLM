@@ -251,6 +251,59 @@ def test_qwen_complex_freqs_convert_to_shared_rope_format():
     torch.testing.assert_close(out, ref, rtol=1e-6, atol=1e-6)
 
 
+def test_qwen_joint_attention_fused_rope_passes_2d_freqs_to_kernel(monkeypatch):
+    torch.manual_seed(0)
+    txt_seq = 5
+    img_seq = 7
+    batch_size = 2
+    head_dim = 8
+    attention = QwenJointAttention(
+        dim=16,
+        num_attention_heads=2,
+        attention_head_dim=head_dim,
+        config=DiffusionModelConfig(),
+    )
+    captured = {}
+
+    def fake_apply_packed_qk_norm_rope(qkv, freqs_cos, freqs_sin, **kwargs):
+        captured["cos_shape"] = tuple(freqs_cos.shape)
+        captured["sin_shape"] = tuple(freqs_sin.shape)
+
+    monkeypatch.setattr(attention, "apply_packed_qk_norm_rope", fake_apply_packed_qk_norm_rope)
+
+    hidden_states = torch.randn(batch_size, img_seq, 16)
+    encoder_hidden_states = torch.randn(batch_size, txt_seq, 16)
+    img_phases = torch.randn(img_seq, head_dim // 2)
+    txt_phases = torch.randn(txt_seq, head_dim // 2)
+    image_rotary_emb = (
+        torch.polar(torch.ones_like(img_phases), img_phases),
+        torch.polar(torch.ones_like(txt_phases), txt_phases),
+    )
+
+    attention._prepare_qkv_fused(hidden_states, encoder_hidden_states, image_rotary_emb)
+
+    assert captured == {
+        "cos_shape": (batch_size * (txt_seq + img_seq), head_dim),
+        "sin_shape": (batch_size * (txt_seq + img_seq), head_dim),
+    }
+
+
+def test_qwen_joint_attention_fused_rope_requires_qk_norm():
+    attention = QwenJointAttention(
+        dim=16,
+        num_attention_heads=2,
+        attention_head_dim=8,
+        config=DiffusionModelConfig(),
+    )
+    hidden_states = SimpleNamespace(is_cuda=True, dtype=torch.bfloat16)
+    image_rotary_emb = (object(), object())
+
+    assert attention._use_fused_qk_norm_rope(hidden_states, image_rotary_emb)
+
+    attention.qk_norm = False
+    assert not attention._use_fused_qk_norm_rope(hidden_states, image_rotary_emb)
+
+
 def test_qwen_transformer_cpu_fallback_uses_unfused_qk_norm_rope():
     torch.manual_seed(0)
     model = QwenImageTransformer2DModel(
