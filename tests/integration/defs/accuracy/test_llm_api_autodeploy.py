@@ -1563,6 +1563,12 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
                               use_beam_search=False)
 
     @pytest.mark.skip_less_device_memory(32000)
+    # Opt out of MPI session reuse: on a reused worker (pool use #2) this test
+    # fails with "expanded size of the tensor (128) must match the existing
+    # size (256)" -- AutoDeploy worker-process state sized for the previous
+    # test's config leaks into the next engine. Keep private until the state
+    # source is root-caused.
+    @pytest.mark.private_mpi_session
     @pytest.mark.parametrize("accuracy_check", [False, True])
     @pytest.mark.parametrize("model_name,config_overrides,tasks",
                              MODEL_REGISTRY_ACCURACY_PARAMS)
