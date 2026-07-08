@@ -268,6 +268,11 @@ def _build_mla(rope_config, device, threshold):
     return mla, mapping, sparse_config, model_config
 
 
+def _attention_cls_for_sparse_config(sparse_config, model_config):
+    sparse_params = sparse_config.to_sparse_params(pretrained_config=model_config.pretrained_config)
+    return get_attention_backend("TRTLLM", sparse_params=sparse_params)
+
+
 def _init_mla_weights(mla):
     """Initialize MLA weights deterministically in the loaded layout.
 
@@ -417,7 +422,7 @@ def test_forward_context_short_mha(name: str, seq_lens: List[int], threshold_off
     _init_mla_weights(mla)
 
     kv_mgr = _build_kv_cache_manager(mapping, sparse_config, model_config, seq_lens, device)
-    attn_cls = get_attention_backend("TRTLLM", sparse_attention_config=sparse_config)
+    attn_cls = _attention_cls_for_sparse_config(sparse_config, model_config)
     q, compressed_kv, k_pe, latent_cache, position_ids = _make_inputs(seq_lens, device)
     metadata = _make_metadata(attn_cls, seq_lens, kv_mgr, mapping, sparse_config)
 
@@ -457,7 +462,7 @@ def test_standard_path_when_exceeds_threshold():
     _init_mla_weights(mla)
 
     kv_mgr = _build_kv_cache_manager(mapping, sparse_config, model_config, seq_lens, device)
-    attn_cls = get_attention_backend("TRTLLM", sparse_attention_config=sparse_config)
+    attn_cls = _attention_cls_for_sparse_config(sparse_config, model_config)
     q, compressed_kv, k_pe, latent_cache, position_ids = _make_inputs(seq_lens, device)
 
     total_tokens = sum(seq_lens)
@@ -511,7 +516,7 @@ def test_agrees_with_absorption_path():
     q, compressed_kv, k_pe, latent_cache, position_ids = _make_inputs(seq_lens, device)
     hidden_states = torch.randn(total_tokens, HIDDEN_SIZE, dtype=torch.bfloat16, device=device)
     qr = torch.randn(total_tokens, Q_LORA_RANK, dtype=torch.bfloat16, device=device)
-    attn_cls = get_attention_backend("TRTLLM", sparse_attention_config=sparse_config)
+    attn_cls = _attention_cls_for_sparse_config(sparse_config, model_config)
 
     def _run(mla_module):
         kv_mgr = _build_kv_cache_manager(mapping, sparse_config, model_config, seq_lens, device)
@@ -559,7 +564,7 @@ def test_chunked_correctness(name: str, chunk_specs: List[Tuple[int, int]], chun
 
     mla, mapping, sparse_config, model_config = _build_mla(rope_config, device, threshold)
     _init_mla_weights(mla)
-    attn_cls = get_attention_backend("TRTLLM", sparse_attention_config=sparse_config)
+    attn_cls = _attention_cls_for_sparse_config(sparse_config, model_config)
 
     q, compressed_kv, k_pe, latent_cache, position_ids = _make_inputs(total_per_seq, device)
 
@@ -640,7 +645,7 @@ def test_chunked_context_rejects_when_kv_exceeds_threshold():
 
     mla, mapping, sparse_config, model_config = _build_mla(rope_config, device, threshold)
     _init_mla_weights(mla)
-    attn_cls = get_attention_backend("TRTLLM", sparse_attention_config=sparse_config)
+    attn_cls = _attention_cls_for_sparse_config(sparse_config, model_config)
 
     q, compressed_kv, k_pe, latent_cache, position_ids = _make_inputs(total_per_seq, device)
 

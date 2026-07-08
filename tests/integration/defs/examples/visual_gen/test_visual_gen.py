@@ -14,12 +14,14 @@
 # limitations under the License.
 """Integration tests for VisualGen examples and visual quality checks."""
 
+import base64
 import contextlib
 import gc
 import glob
 import json
 import os
 import random
+import shutil
 import subprocess
 import sys
 import time
@@ -425,35 +427,18 @@ def _save_lpips_video_mp4(video, output_path, frame_rate):
 
     try:
         save_video(video, output_path, frame_rate=frame_rate)
-        return
     except RuntimeError as err:
         if "MP4 format requires ffmpeg" not in str(err):
             raise
-
-    import cv2
-
-    if video.dim() == 5:
-        video = video[0]
-    output_path = str(output_path)
-    output_dir = os.path.dirname(output_path)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-
-    video_np = video.detach().cpu().numpy()
-    num_frames, height, width, channels = video_np.shape
-    assert channels == 3, f"Expected RGB video with 3 channels, got {channels}"
-    writer = cv2.VideoWriter(
-        output_path,
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        float(frame_rate),
-        (width, height),
-    )
-    assert writer.isOpened(), f"Failed to open MP4 writer for {output_path}"
-    try:
-        for frame in video_np:
-            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-    finally:
-        writer.release()
+        # Never fall back to another codec here: the goldens are H.264/x264 and
+        # LPIPS compares decoded pixels, so a silent cv2/mp4v fallback compares
+        # codec artifacts, not model output (this produced a spurious 0.059 on
+        # wan22 while the generated frames were identical to the golden).
+        pytest.fail(
+            "ffmpeg is unavailable for LPIPS video encoding; refusing to fall back "
+            "to another codec because the golden comparison would measure codec "
+            f"artifacts instead of model output: {err}"
+        )
     assert os.path.isfile(output_path), f"Visual gen did not produce {output_path}"
 
 
@@ -517,6 +502,39 @@ def _assert_lpips_below_threshold(score, threshold):
     assert score < threshold, f"LPIPS too high: {score:.6f} (expected < {threshold:.6f})"
 
 
+def _preserve_lpips_candidate_on_failure(request, score, threshold, candidate_path, artifact_name):
+    """Copy the generated candidate into pytest's --output-dir when the LPIPS gate fails.
+
+    CI archives the output dir per stage, so a threshold failure leaves behind the
+    exact CI-generated media needed to refresh the golden without guessing at
+    machine-to-machine kernel-stack drift (measured ~0.04 LPIPS across B200 hosts
+    on the same container for 1-step Wan2.1).
+    """
+    if score < threshold:
+        return
+    output_dir = request.config.getoption("--output-dir", default=None)
+    if not output_dir:
+        return
+    dest_dir = os.path.join(str(output_dir), "lpips_failure_artifacts")
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, artifact_name)
+    shutil.copy2(str(candidate_path), dest)
+    print(f"[LPIPS] candidate preserved for golden refresh: {dest}")
+    # CI's per-stage results tarball only collects flat files (results.xml etc.), not
+    # this subdirectory — and junit stdout IS collected. Small candidates therefore
+    # also go into stdout as base64 so a threshold failure is diagnosable from the
+    # archived results.xml alone (this is how wan22's spurious 0.059 was traced to a
+    # silent mpeg4 codec fallback rather than a generation difference).
+    size = os.path.getsize(dest)
+    if size <= 8 * 1024 * 1024:
+        with open(dest, "rb") as fh:
+            encoded = base64.b64encode(fh.read()).decode("ascii")
+        print(f"[LPIPS-B64-BEGIN {artifact_name} {size}]")
+        for i in range(0, len(encoded), 3072):
+            print(encoded[i : i + 3072])
+        print(f"[LPIPS-B64-END {artifact_name}]")
+
+
 def _generate_flux_lpips_image(model_path, output_path):
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
     from tensorrt_llm.media.encoding import save_image
@@ -561,7 +579,10 @@ def _generate_ltx2_lpips_video(output_path, *, enable_cuda_graph=False):
     _skip_if_missing(distilled_lora_path, "LTX-2 distilled LoRA")
     _disable_inductor_compile_worker_quiesce()
 
-    with _lpips_deterministic_algorithms():
+    # TorchCompileConfig(enable=False) does not suppress nested @torch.compile decorators.
+    # Wrapped here (not in the fixture) so the golden fixture and both sides of
+    # test_ltx2_cuda_graph_lpips_matches_eager run the same eager numerics.
+    with _lpips_deterministic_algorithms(), torch.compiler.set_stance("force_eager"):
         args = VisualGenArgs(
             model=checkpoint_path,
             pipeline_config={
@@ -676,19 +697,21 @@ def wan21_bf16_video_path(_visual_gen_deps, llm_venv):
     output_path = _visual_gen_output_path(llm_venv, "wan21_bf16")
     if os.path.isfile(output_path):
         return output_path
-    _generate_wan_lpips_video(
-        _lpips_model_path("Wan2.1-T2V-1.3B-Diffusers"),
-        output_path,
-        WAN21_LPIPS_PROMPT,
-        WAN21_LPIPS_NEGATIVE_PROMPT,
-        WAN21_LPIPS_HEIGHT,
-        WAN21_LPIPS_WIDTH,
-        WAN21_LPIPS_NUM_FRAMES,
-        WAN21_LPIPS_NUM_INFERENCE_STEPS,
-        WAN21_LPIPS_GUIDANCE_SCALE,
-        WAN21_LPIPS_SEED,
-        WAN_LPIPS_FRAME_RATE,
-    )
+    # TorchCompileConfig(enable=False) does not suppress nested @torch.compile decorators.
+    with torch.compiler.set_stance("force_eager"):
+        _generate_wan_lpips_video(
+            _lpips_model_path("Wan2.1-T2V-1.3B-Diffusers"),
+            output_path,
+            WAN21_LPIPS_PROMPT,
+            WAN21_LPIPS_NEGATIVE_PROMPT,
+            WAN21_LPIPS_HEIGHT,
+            WAN21_LPIPS_WIDTH,
+            WAN21_LPIPS_NUM_FRAMES,
+            WAN21_LPIPS_NUM_INFERENCE_STEPS,
+            WAN21_LPIPS_GUIDANCE_SCALE,
+            WAN21_LPIPS_SEED,
+            WAN_LPIPS_FRAME_RATE,
+        )
     return output_path
 
 
@@ -697,19 +720,21 @@ def wan22_bf16_video_path(_visual_gen_deps, llm_venv):
     output_path = _visual_gen_output_path(llm_venv, "wan22_bf16")
     if os.path.isfile(output_path):
         return output_path
-    _generate_wan_lpips_video(
-        _lpips_model_path("Wan2.2-T2V-A14B-Diffusers"),
-        output_path,
-        WAN22_LPIPS_PROMPT,
-        WAN22_LPIPS_NEGATIVE_PROMPT,
-        WAN22_LPIPS_HEIGHT,
-        WAN22_LPIPS_WIDTH,
-        WAN22_LPIPS_NUM_FRAMES,
-        WAN22_LPIPS_NUM_INFERENCE_STEPS,
-        WAN22_LPIPS_GUIDANCE_SCALE,
-        WAN22_LPIPS_SEED,
-        WAN22_LPIPS_FRAME_RATE,
-    )
+    # TorchCompileConfig(enable=False) does not suppress nested @torch.compile decorators.
+    with torch.compiler.set_stance("force_eager"):
+        _generate_wan_lpips_video(
+            _lpips_model_path("Wan2.2-T2V-A14B-Diffusers"),
+            output_path,
+            WAN22_LPIPS_PROMPT,
+            WAN22_LPIPS_NEGATIVE_PROMPT,
+            WAN22_LPIPS_HEIGHT,
+            WAN22_LPIPS_WIDTH,
+            WAN22_LPIPS_NUM_FRAMES,
+            WAN22_LPIPS_NUM_INFERENCE_STEPS,
+            WAN22_LPIPS_GUIDANCE_SCALE,
+            WAN22_LPIPS_SEED,
+            WAN22_LPIPS_FRAME_RATE,
+        )
     return output_path
 
 
@@ -855,7 +880,7 @@ def test_flux2_lpips_against_golden(tmp_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_ltx2_lpips_against_golden(tmp_path, ltx2_two_stage_bf16_video_path):
+def test_ltx2_lpips_against_golden(request, tmp_path, ltx2_two_stage_bf16_video_path):
     golden_path = _golden_media_path(
         tmp_path, "ltx2_lpips_golden_video.mp4", "LTX-2 LPIPS golden video"
     )
@@ -867,11 +892,18 @@ def test_ltx2_lpips_against_golden(tmp_path, ltx2_two_stage_bf16_video_path):
         golden_path,
         ltx2_two_stage_bf16_video_path,
     )
+    _preserve_lpips_candidate_on_failure(
+        request,
+        score,
+        LTX2_LPIPS_THRESHOLD,
+        ltx2_two_stage_bf16_video_path,
+        "ltx2_lpips_golden_video.mp4",
+    )
     _assert_lpips_below_threshold(score, LTX2_LPIPS_THRESHOLD)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_ltx2_cuda_graph_lpips_matches_eager(tmp_path):
+def test_ltx2_cuda_graph_lpips_matches_eager(_visual_gen_deps, tmp_path):
     eager_path = tmp_path / "ltx2_eager_generated.mp4"
     cuda_graph_path = tmp_path / "ltx2_cuda_graph_generated.mp4"
 
@@ -889,7 +921,7 @@ def test_ltx2_cuda_graph_lpips_matches_eager(tmp_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_wan21_t2v_lpips_against_golden(tmp_path, wan21_bf16_video_path):
+def test_wan21_t2v_lpips_against_golden(request, tmp_path, wan21_bf16_video_path):
     golden_path = _golden_media_path(
         tmp_path, "wan21_t2v_lpips_golden_video.mp4", "Wan 2.1 LPIPS golden video"
     )
@@ -901,11 +933,18 @@ def test_wan21_t2v_lpips_against_golden(tmp_path, wan21_bf16_video_path):
         golden_path,
         wan21_bf16_video_path,
     )
+    _preserve_lpips_candidate_on_failure(
+        request,
+        score,
+        WAN_LPIPS_THRESHOLD,
+        wan21_bf16_video_path,
+        "wan21_t2v_lpips_golden_video.mp4",
+    )
     _assert_lpips_below_threshold(score, WAN_LPIPS_THRESHOLD)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_wan22_t2v_lpips_against_golden(tmp_path, wan22_bf16_video_path):
+def test_wan22_t2v_lpips_against_golden(request, tmp_path, wan22_bf16_video_path):
     golden_path = _golden_media_path(
         tmp_path, "wan22_t2v_lpips_golden_video.mp4", "Wan 2.2 LPIPS golden video"
     )
@@ -916,6 +955,13 @@ def test_wan22_t2v_lpips_against_golden(tmp_path, wan22_bf16_video_path):
         WAN22_LPIPS_PROMPT,
         golden_path,
         wan22_bf16_video_path,
+    )
+    _preserve_lpips_candidate_on_failure(
+        request,
+        score,
+        WAN_LPIPS_THRESHOLD,
+        wan22_bf16_video_path,
+        "wan22_t2v_lpips_golden_video.mp4",
     )
     _assert_lpips_below_threshold(score, WAN_LPIPS_THRESHOLD)
 

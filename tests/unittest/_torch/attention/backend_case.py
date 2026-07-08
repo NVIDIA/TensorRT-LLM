@@ -80,8 +80,7 @@ class BackendCase:
 
     # Cross-attention: new KV (encoder) tokens per request. None => self-attention
     # (KV tokens == seq_lens). When set, the case is cross-attention (must be
-    # non-causal). Same-length cross runs on TRTLLM/FlashInfer/Vanilla; unequal
-    # q/kv lengths are gated for TRTLLM in the capability matrix.
+    # non-causal).
     seq_lens_kv: Optional[List[int]] = None
 
     dtype: str = "float16"
@@ -113,9 +112,9 @@ class BackendCase:
     # mla_rope_generation (feeding a pre-formed fused_q and explicit q_pe), so
     # all three backends run RoPE-free and stay aligned; TRTLLM additionally
     # pre-writes the new latent into the cache and Python-initializes the
-    # trtllm-gen scheduler buffers. MLA *context* (up-projected K/V) runs on
-    # Vanilla/FlashInfer; the TRTLLM context FMHA fuses RoPE and is validated in
-    # test_attention_mla.py.
+    # trtllm-gen scheduler buffers. MLA context uses coherent up-projected K/V
+    # and latent-cache inputs: TRTLLM fuses RoPE while Vanilla/FlashInfer receive
+    # the equivalent pre-rotated tensors.
     v_head_dim: Optional[int] = None
     q_lora_rank: Optional[int] = None
     kv_lora_rank: Optional[int] = None
@@ -562,18 +561,104 @@ def _run_mla_gen_backend(
         mgr.shutdown()
 
 
+def _mla_context_pos_embd_params(case: BackendCase) -> PositionalEmbeddingParams:
+    """Build the GPT-J-style RoPE configuration required by TRTLLM MLA context."""
+    if case.rope is None:
+        raise ValueError("TRTLLM MLA context requires RoPE parameters.")
+
+    rope_config = dict(case.rope)
+    rope_config.update(dim=case.qk_rope_head_dim, duplicate_data=True)
+    return PositionalEmbeddingParams(
+        type=PositionEmbeddingType.rope_gptj,
+        rope=_rope_params_from_dict(rope_config),
+        is_neox=False,
+    )
+
+
 def generate_mla_context_inputs(case: BackendCase, seed: int = 0) -> Dict:
-    """Random up-projected MLA context inputs (asymmetric K/V)."""
+    """Random production-layout MLA context inputs before RoPE."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
     cdt = case.compute_dtype
     H, Hkv = case.num_heads, case.num_kv_heads
     qk_head = case.qk_nope_head_dim + case.qk_rope_head_dim
-    d_latent = case.kv_lora_rank + case.qk_rope_head_dim
+    compressed_kv = _randn(gen, cdt, case.nnz_q, case.kv_lora_rank)
+    k_pe = _randn(gen, cdt, case.nnz_q, case.qk_rope_head_dim)
+    packed_kv = _randn(
+        gen,
+        cdt,
+        case.nnz_q,
+        Hkv * (case.qk_nope_head_dim + case.v_head_dim),
+    )
+    k_nope, v = packed_kv.split([Hkv * case.qk_nope_head_dim, Hkv * case.v_head_dim], dim=-1)
+    k = torch.cat(
+        [
+            k_nope.view(-1, Hkv, case.qk_nope_head_dim),
+            k_pe.view(-1, 1, case.qk_rope_head_dim).expand(-1, Hkv, -1),
+        ],
+        dim=-1,
+    ).view(-1, Hkv * qk_head)
     return dict(
         q=_randn(gen, cdt, case.nnz_q, H * qk_head),
-        k=_randn(gen, cdt, case.nnz_q, Hkv * qk_head),
-        v=_randn(gen, cdt, case.nnz_q, Hkv * case.v_head_dim),
-        latent_cache=_randn(gen, cdt, case.nnz_q, d_latent),  # appended for later gen
+        k=k,
+        # Keep the split view: TRTLLM MLA context expects token stride to include
+        # the packed k_nope portion, and Vanilla/FlashInfer support that layout.
+        v=v,
+        compressed_kv=compressed_kv,
+        k_pe=k_pe,
+        latent_cache=torch.cat([compressed_kv, k_pe], dim=-1),
+    )
+
+
+def _prepare_mla_context_inputs(
+    case: BackendCase,
+    inputs: Dict,
+    pos_embd_params: PositionalEmbeddingParams,
+    *,
+    fuse_rope: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prepare backend inputs and the expected post-RoPE latent cache."""
+    position_ids = make_position_ids(case.seq_lens, case.num_cached_tokens)
+    rope_params = pos_embd_params.rope
+    assert rope_params is not None
+
+    rotated_k_pe = apply_rope(
+        inputs["k_pe"],
+        position_ids,
+        rope_params,
+        case.qk_rope_head_dim,
+        is_neox=pos_embd_params.is_neox,
+    )
+    expected_latent_cache = torch.cat([inputs["compressed_kv"], rotated_k_pe], dim=-1)
+
+    if fuse_rope:
+        return (
+            inputs["q"].clone(),
+            inputs["k"].clone(),
+            inputs["v"],
+            inputs["latent_cache"],
+            expected_latent_cache,
+        )
+
+    q = inputs["q"].clone().view(-1, case.num_heads, case.head_dim)
+    q_pe = q[..., case.qk_nope_head_dim :].reshape(
+        case.nnz_q, case.num_heads * case.qk_rope_head_dim
+    )
+    q[..., case.qk_nope_head_dim :] = apply_rope(
+        q_pe,
+        position_ids,
+        rope_params,
+        case.qk_rope_head_dim,
+        is_neox=pos_embd_params.is_neox,
+    ).view(case.nnz_q, case.num_heads, case.qk_rope_head_dim)
+
+    k = inputs["k"].clone().view(-1, case.num_kv_heads, case.head_dim)
+    k[..., case.qk_nope_head_dim :] = rotated_k_pe.view(case.nnz_q, 1, case.qk_rope_head_dim)
+    return (
+        q.view(case.nnz_q, -1),
+        k.view(case.nnz_q, -1),
+        inputs["v"],
+        expected_latent_cache,
+        expected_latent_cache,
     )
 
 
@@ -582,6 +667,7 @@ def _run_mla_context_backend(case, backend, inputs, *, kv_layout: str) -> torch.
     AttentionCls = get_attention_backend(backend)
     qk_head = case.qk_nope_head_dim + case.qk_rope_head_dim
     request_ids = list(range(case.num_seqs))
+    pos_embd_params = _mla_context_pos_embd_params(case)
     attn = create_attention(
         backend,
         layer_idx=0,
@@ -589,6 +675,7 @@ def _run_mla_context_backend(case, backend, inputs, *, kv_layout: str) -> torch.
         head_dim=qk_head,
         num_kv_heads=case.num_kv_heads,
         q_scaling=case.q_scaling,
+        pos_embd_params=pos_embd_params,
         is_mla_enable=True,
         q_lora_rank=case.q_lora_rank,
         kv_lora_rank=case.kv_lora_rank,
@@ -598,7 +685,15 @@ def _run_mla_context_backend(case, backend, inputs, *, kv_layout: str) -> torch.
     )
     mgr = _build_mla_kv_cache_manager(case, backend)
     mgr.add_dummy_requests(request_ids, case.token_nums)
-    expected_latents = _split_packed_tokens(inputs["latent_cache"], case.seq_lens)
+    fuse_rope = AttentionCls.support_fused_rope()
+    q, k, v, latent_cache, expected_latent_cache = _prepare_mla_context_inputs(
+        case,
+        inputs,
+        pos_embd_params,
+        fuse_rope=fuse_rope,
+    )
+    expected_latents = _split_packed_tokens(expected_latent_cache, case.seq_lens)
+    cache_atol, cache_rtol = _tolerances(case, case.compute_dtype) if fuse_rope else (0.0, 0.0)
     metadata = AttentionCls.Metadata(
         num_contexts=case.num_contexts,
         kv_cache_params=KVCacheParams(
@@ -615,12 +710,12 @@ def _run_mla_context_backend(case, backend, inputs, *, kv_layout: str) -> torch.
     metadata.prepare()
     try:
         out = attn.forward(
-            inputs["q"],
-            inputs["k"],
-            inputs["v"],
+            q,
+            k,
+            v,
             metadata,
             forward_args=AttentionForwardArgs(
-                latent_cache=inputs["latent_cache"],
+                latent_cache=latent_cache,
                 attention_input_type=AttentionInputType.context_only,
             ),
         )
@@ -635,6 +730,8 @@ def _run_mla_context_backend(case, backend, inputs, *, kv_layout: str) -> torch.
             expected_latents,
             kv_layout=metadata.kv_layout,
             cache_kind="mla",
+            atol=cache_atol,
+            rtol=cache_rtol,
         )
         return out[: case.nnz_q].contiguous()
     finally:
@@ -865,7 +962,7 @@ def run_backend(
                 max_num_tokens=case.max_num_tokens,
                 kv_cache_manager=mgr,
                 request_ids=request_ids,
-                prompt_lens=case.token_nums,
+                prompt_lens=case.seq_lens if case.is_cross else case.token_nums,
                 kv_layout=kv_layout,
             )
 

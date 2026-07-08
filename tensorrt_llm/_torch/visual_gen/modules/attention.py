@@ -96,13 +96,27 @@ class Attention(nn.Module):
         # Select compute backend (orthogonal to parallelism)
         vgm = config.visual_gen_mapping
         ulysses_size = vgm.ulysses_size if vgm else 1
+        cp_size = vgm.cp_size if vgm else 1
         base_backend = config.attention.backend
+        _sa_cfg = config.attention.sparse_attention_config
+        _is_vsa = (
+            base_backend == "CUTEDSL"
+            and _sa_cfg is not None
+            and getattr(_sa_cfg, "algorithm", None) == "vsa"
+        )
 
-        # TRTLLM doesn't support cross-attention (different Q/KV seq lengths); fall back to VANILLA
-        if self.qkv_mode == QKVMode.SEPARATE_QKV and base_backend == "TRTLLM":
+        # Cross-attention fallback: TRTLLM and CUTEDSL VSA are self-attn only.
+        if self.qkv_mode == QKVMode.SEPARATE_QKV and (base_backend == "TRTLLM" or _is_vsa):
             backend_name = "VANILLA"
         else:
             backend_name = base_backend
+
+        if _is_vsa and cp_size > 1:
+            raise ValueError(
+                f"VSA needs the full token sequence per rank, so it is incompatible "
+                f"with context parallelism (Attention2D/Ring, cp_size={cp_size}). Use "
+                f"ulysses or cfg parallelism instead."
+            )
         self.attn_backend = backend_name
         self.qk_norm = qk_norm
         self.qk_norm_mode = qk_norm_mode
@@ -471,8 +485,10 @@ class Attention(nn.Module):
         """
         Call attention backend with appropriate tensor layout.
 
-        Dimensions are derived from tensor shapes. Extra ``**kwargs``
-        (e.g. ``attention_mask``) are forwarded to the backend.
+        Dimensions are derived from tensor shapes. Extra **kwargs are
+        forwarded to the backend. Backend-specific tensors that share
+        Q/K/V's [B, S, H*D] layout (e.g. VSA's gate_compress /
+        gate_fine) are reshaped here to the backend's 4-D layout.
 
         Two layout paths:
         1. HND backends (VANILLA): [B, S, H*D] -> [B, H, S, D]
@@ -483,6 +499,12 @@ class Attention(nn.Module):
         batch_size = q.shape[0]
         seq_len = q.shape[1]
         seq_len_kv = k.shape[1] if k is not None else seq_len
+
+        def _reshape_gate(gate: torch.Tensor) -> torch.Tensor:
+            gate = gate.view(batch_size, -1, self.local_num_attention_heads, self.head_dim)
+            if backend_layout == AttentionTensorLayout.HND:
+                gate = gate.transpose(1, 2)
+            return gate
 
         # Reshape inputs: [B, S, H*D] -> backend's preferred 4D layout
         if backend_layout == AttentionTensorLayout.HND:
@@ -507,13 +529,11 @@ class Attention(nn.Module):
                 "seq_len_kv": seq_len_kv,
             }
         )
+        for gate_key in ("gate_compress", "gate_fine"):
+            if kwargs.get(gate_key) is not None:
+                kwargs[gate_key] = _reshape_gate(kwargs[gate_key])
 
-        out = self.attn.forward(
-            q=q,
-            k=k,
-            v=v,
-            **kwargs,
-        )
+        out = self.attn.forward(q=q, k=k, v=v, **kwargs)
 
         # Flatten back to [B, S, H*D]
         if backend_layout == AttentionTensorLayout.HND:
@@ -527,6 +547,7 @@ class Attention(nn.Module):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         timestep: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> torch.Tensor:
         # hidden_states may be [B, S, H] or an Fp4QuantizedTensor from an upstream
         # fused norm+quant kernel; downstream Linear accepts either.
@@ -548,7 +569,7 @@ class Attention(nn.Module):
             freqs_cos, freqs_sin = freqs
             self.apply_packed_qk_norm_rope(qkv, freqs_cos, freqs_sin)
             q, k, v = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
-            out = self._attn_impl(q, k, v, timestep=timestep)
+            out = self._attn_impl(q, k, v, timestep=timestep, **kwargs)
             return self.to_out[0](out)
 
         # Unfused path: separate QK norm → separate RoPE → attention
@@ -567,7 +588,7 @@ class Attention(nn.Module):
             q = q.flatten(2)
             k = k.flatten(2)
 
-        out = self._attn_impl(q, k, v, timestep=timestep)
+        out = self._attn_impl(q, k, v, timestep=timestep, **kwargs)
         out = self.to_out[0](out)
         return out
 

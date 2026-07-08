@@ -160,6 +160,34 @@ class ExternalCommMoEScheduler(MoEScheduler):
         ):
             raise_moe_lora_multichunk_unsupported(num_chunks)
 
+        # ========== 0-token rank deadlock fix ==========
+        # When some ranks have 0 tokens in single-chunk forward with collective comm,
+        # those ranks hang in CUDA kernels (e.g. NVFP4 quantize_input with 0-row tensor)
+        # before reaching moe.comm.dispatch(), causing NCCL AllGather deadlock on
+        # non-zero ranks. Fix: activate DP padding uniformly across all ranks so every
+        # rank uses sizes=None (uniform allgather) and pads x/router_logits to max_tokens.
+        # Mirrors the empty-chunk substitution in _forward_multiple_chunks (line ~597-620).
+        # Existing truncation at Step 4 discards dummy-token outputs automatically.
+        # NOTE: kept after the multi-chunk rejection above so unit tests that stub `moe`
+        # with a minimal namespace (no `.comm`/`.use_dp`) still exercise that path; only
+        # relevant to single-chunk collective comm anyway.
+        if (
+            moe.comm is not None
+            and moe.use_dp
+            and all_rank_max_num_tokens > 0
+            and not use_dp_padding
+            and any(t == 0 for t in all_rank_num_tokens_padded)
+        ):
+            use_dp_padding = True
+            all_rank_num_tokens_padded = [all_rank_max_num_tokens] * len(all_rank_num_tokens)
+            local_n = x.shape[0]
+            if local_n < all_rank_max_num_tokens:
+                pad = all_rank_max_num_tokens - local_n
+                x = torch.cat([x, x.new_zeros((pad, x.shape[1]))], dim=0)
+                router_logits = torch.cat(
+                    [router_logits, router_logits.new_zeros((pad, router_logits.shape[1]))], dim=0
+                )
+
         # May fall back AllToAll -> AllGather; this is the only sanctioned
         # mutation of ``moe.comm`` from a scheduler.
         moe.determine_communication_method(all_rank_num_tokens_padded, num_chunks)
@@ -345,8 +373,11 @@ class ExternalCommMoEScheduler(MoEScheduler):
         # ========== Step 1: EPLB - Start wait GPU stage ==========
         moe._load_balancer_start_wait_gpu_stage(is_first_call)
 
-        # ========== Step 2: Apply routing (only if backend supports load balancer) ==========
-        if moe.backend._supports_load_balancer():
+        # ========== Step 2: Apply routing ==========
+        requires_separated_routing = (
+            moe.backend._supports_load_balancer() or moe.routing_method.requires_separated_routing
+        )
+        if requires_separated_routing:
             # Separated routing: ConfigurableMoE calls routing_method
             token_selected_experts, token_final_scales = moe.routing_method.apply(
                 router_logits, input_ids
@@ -895,6 +926,8 @@ class FusedCommMoEScheduler(MoEScheduler):
         if not outputs:
             cast_dtype = output_dtype if output_dtype is not None else x.dtype
             return x.new_empty((0, x.shape[1]), dtype=cast_dtype)
+        if len(outputs) == 1:
+            return outputs[0]
         return torch.cat(outputs, dim=0)
 
     def _strip_adp_padding(
@@ -1136,23 +1169,26 @@ class FusedCommMoEScheduler(MoEScheduler):
             moe.num_slots, token_selected_slots
         )
 
-        # ----- quantize -----
-        # Always delegate to ``backend.quantize_input`` so each fused-comm
-        # backend owns its own empty-tensor layout. Both ``MegaMoEDeepGemm``
-        # and ``MegaMoECuteDsl`` short-circuit ``x.shape[0] == 0`` inside
-        # their quantize_input contracts (DG returns FP8 + packed-UE8M0
-        # int32 SF; CuteDSL returns NVFP4 packed bytes + plain K-major FP8
-        # SF). Synthesizing the DG-specific empty layout here would lock
-        # the scheduler to a single backend; the unconditional delegation
-        # keeps it layout-agnostic.
-        x_fp8, x_sf = moe.backend.quantize_input(x_chunk_real)
+        # ----- quantize / prepare -----
+        if getattr(moe.backend, "supports_fused_prepare", lambda: False)():
+            # MegaMoE can fuse BF16->MXFP8 quantization with the SymmBuffer
+            # topk copies, so keep the original activations and let run_moe
+            # prepare its workspace.
+            moe_input = x_chunk_real
+            x_sf = None
+        else:
+            # Delegate to ``backend.quantize_input`` so each fused-comm backend
+            # owns its own empty-tensor layout. Both MegaMoEDeepGemm and
+            # MegaMoECuteDsl short-circuit ``x.shape[0] == 0`` inside their
+            # quantize_input contracts.
+            moe_input, x_sf = moe.backend.quantize_input(x_chunk_real)
 
         # ----- MoE compute -----
         # ``token_selected_slots`` is in [0, num_slots), matching the kernel's
         # ``num_experts`` template parameter (SymmBuffer / weights sized to
         # num_slots in quantization.py).
         out = moe.backend.run_moe(
-            x=x_fp8,
+            x=moe_input,
             token_selected_experts=token_selected_slots,
             token_final_scales=token_final_scales,
             x_sf=x_sf,

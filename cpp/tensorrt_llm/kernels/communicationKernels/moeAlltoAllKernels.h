@@ -93,8 +93,8 @@ struct CombineKernelPointers
     int const* topk_send_indices; // dst index per k, -1 for duplicates
 
     // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Combine skips flag
-    // writes/waits to/from masked peers; per-token accumulation uses topk_send_indices[k] < 0
-    // (set by dispatch) to skip dead-targeted slots, so no explicit mask check is needed there.
+    // writes/waits to/from masked peers and also skips per-token accumulation for ranks that
+    // become inactive between dispatch and combine.
     uint64_t active_rank_mask[kRankMaskWords];
 };
 
