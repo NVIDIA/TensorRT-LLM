@@ -234,7 +234,7 @@ class ChatGLMForCausalLM(DecoderModelForCausalLM[ChatGLMModel, PretrainedConfig]
 
         converted: Dict[str, torch.Tensor] = {}
 
-        def rename_layer(i: int, weights: Dict) -> None:
+        def rename_layer(i: int) -> None:
             src = f"transformer.encoder.layers.{i}."
             dst = f"model.layers.{i}."
             # Fused [Q, grouped K, grouped V] -> separate q/k/v; the shared
@@ -264,7 +264,7 @@ class ChatGLMForCausalLM(DecoderModelForCausalLM[ChatGLMModel, PretrainedConfig]
             ]
 
         for i in range(config.num_hidden_layers):
-            rename_layer(i, weights)
+            rename_layer(i)
 
         converted["model.embed_tokens.weight"] = weights[
             "transformer.embedding.word_embeddings.weight"
