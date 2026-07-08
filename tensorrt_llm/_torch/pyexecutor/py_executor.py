@@ -688,11 +688,6 @@ class PyExecutor:
                     "pp_size > 1 is not supported for encoder-decoder models "
                     "in the PyTorch flow; encoder send/recv hooks are out of "
                     "scope. Set pp_size=1 to run T5/BART/mBART.")
-            if not self.disable_overlap_scheduler:
-                raise NotImplementedError(
-                    "Overlap scheduler is not yet wired for encoder-decoder "
-                    "models. Set disable_overlap_scheduler=True for "
-                    "encoder-decoder runs.")
             if getattr(self.model_engine, "_torch_compile_piecewise_cuda_graph",
                        False):
                 raise NotImplementedError(
@@ -866,6 +861,12 @@ class PyExecutor:
                 "TLLM_PP_ASYNC_BROADCAST_SAMPLE_STATE", "1") == "1"
         else:
             self.event_loop = self._executor_loop if self.disable_overlap_scheduler else self._executor_loop_overlap
+            if not self.disable_overlap_scheduler and hasattr(
+                    self.model_engine, "_execute_logit_post_processors"):
+                # _executor_loop_overlap applies logits post processors
+                # explicitly after _update_requests so they observe an
+                # up-to-date token list; see model_engine.forward.
+                self.model_engine.defer_logits_post_processors = True
         if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
             self.event_loop = trace_func(self.event_loop)
 
@@ -3725,6 +3726,9 @@ class PyExecutor:
                 if not self._is_kv_manager_v2:
                     self._terminate_requests(scheduled_batch.paused_requests)
 
+                if scheduled_batch.encoder_requests:
+                    self._run_encoder_step(scheduled_batch.encoder_requests)
+
                 gpu_forward_events_from_perf_pool = False
                 can_queue, can_queue_this_rank = self._can_queue(
                     scheduled_batch)
@@ -3877,6 +3881,18 @@ class PyExecutor:
                     guided_decoder_failed_requests = None
                     with self.perf_manager.record_perf_events(
                             None, gpu_sample_end) as sample_timing:
+                        if getattr(self.model_engine,
+                                   "defer_logits_post_processors", False):
+                            # Deferred from model_engine.forward: the
+                            # previous iteration's tokens were appended to
+                            # the requests only in _update_requests above.
+                            # Running the processors earlier would expose a
+                            # one-step-stale token list (e.g. BART forced
+                            # BOS would fire twice). inference_mode matches
+                            # forward, whose logits are inference tensors.
+                            with torch.inference_mode():
+                                self.model_engine._execute_logit_post_processors(
+                                    scheduled_batch, batch_outputs)
                         if self.guided_decoder is not None:
                             # add_batch must be called again to have updated new tokens.
                             self.guided_decoder.add_batch(scheduled_batch)

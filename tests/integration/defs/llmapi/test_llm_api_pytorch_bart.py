@@ -75,6 +75,7 @@ def _test_case(
     feature_id: str,
     cuda_graph_batch_sizes: list[int] | None = None,
     kv_cache_dtype: str = "auto",
+    disable_overlap_scheduler: bool = True,
     tensor_parallel_size: int = 1,
     marks=None,
 ):
@@ -98,6 +99,7 @@ def _test_case(
         exact_match,
         cuda_graph_batch_sizes,
         kv_cache_dtype,
+        disable_overlap_scheduler,
         tensor_parallel_size,
         **param_kwargs,
     )
@@ -167,6 +169,50 @@ _TEST_CASES = [
         num_return_sequences=1,
         exact_match=True,
         feature_id="bf16-kv-v2-cuda-graph-on-greedy",
+    ),
+    # Overlap-scheduler cases: outputs must be identical to the non-overlap
+    # runs above; this covers the deferred logits post-processors (forced
+    # BOS/EOS) which would otherwise observe a one-step-stale token list.
+    _test_case(
+        torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=False,
+        enable_cuda_graph=False,
+        num_beams=1,
+        num_return_sequences=1,
+        exact_match=True,
+        disable_overlap_scheduler=False,
+        feature_id="bf16-kv-v1-cuda-graph-off-greedy-overlap",
+    ),
+    _test_case(
+        torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=False,
+        enable_cuda_graph=True,
+        num_beams=1,
+        num_return_sequences=1,
+        exact_match=True,
+        cuda_graph_batch_sizes=[2],
+        disable_overlap_scheduler=False,
+        feature_id="bf16-kv-v1-cuda-graph-on-greedy-overlap",
+    ),
+    _test_case(
+        torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=False,
+        enable_cuda_graph=False,
+        num_beams=2,
+        num_return_sequences=2,
+        exact_match=True,
+        disable_overlap_scheduler=False,
+        feature_id="bf16-kv-v1-cuda-graph-off-beam2-overlap",
+    ),
+    _test_case(
+        torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=False,
+        enable_cuda_graph=True,
+        num_beams=2,
+        num_return_sequences=2,
+        exact_match=True,
+        disable_overlap_scheduler=False,
+        feature_id="bf16-kv-v1-cuda-graph-on-beam2-overlap",
     ),
     # Tensor parallelism (TP=2) coverage
     _test_case(
@@ -360,6 +406,7 @@ def _run_bart_pytorch_generate_encoder_decoder(
     exact_match: bool,
     cuda_graph_batch_sizes: list[int] | None,
     kv_cache_dtype: str = "auto",
+    disable_overlap_scheduler: bool = True,
     tensor_parallel_size: int = 1,
 ) -> None:
     if tensor_parallel_size == 1:
@@ -371,7 +418,7 @@ def _run_bart_pytorch_generate_encoder_decoder(
     case_id = (
         f"model={_MODEL_NAME}, dtype={torch_dtype}, kv_v2={use_kv_cache_manager_v2}, "
         f"cuda_graph={enable_cuda_graph}, beams={num_beams}, returns={num_return_sequences}, "
-        f"kv_dtype={kv_cache_dtype}, tp={tensor_parallel_size}"
+        f"kv_dtype={kv_cache_dtype}, overlap={not disable_overlap_scheduler}, tp={tensor_parallel_size}"
     )
     sampling_params = _sampling_params(num_beams, num_return_sequences)
 
@@ -382,7 +429,7 @@ def _run_bart_pytorch_generate_encoder_decoder(
         cuda_graph_config=_decoder_cuda_graph_config(cuda_graph_batch_sizes)
         if enable_cuda_graph
         else None,
-        disable_overlap_scheduler=True,
+        disable_overlap_scheduler=disable_overlap_scheduler,
         dtype=torch_dtype,
         enable_chunked_prefill=False,
         tensor_parallel_size=tensor_parallel_size,
@@ -433,7 +480,7 @@ def _run_bart_pytorch_generate_encoder_decoder(
 @pytest.mark.parametrize(
     "expected_output_token_ids_by_output,torch_dtype,use_kv_cache_manager_v2,"
     "enable_cuda_graph,num_beams,num_return_sequences,exact_match,cuda_graph_batch_sizes,"
-    "kv_cache_dtype,tensor_parallel_size",
+    "kv_cache_dtype,disable_overlap_scheduler,tensor_parallel_size",
     _TEST_CASES,
 )
 def test_bart_pytorch_generate_encoder_decoder_end_to_end(
@@ -447,6 +494,7 @@ def test_bart_pytorch_generate_encoder_decoder_end_to_end(
     exact_match: bool,
     cuda_graph_batch_sizes: list[int] | None,
     kv_cache_dtype: str,
+    disable_overlap_scheduler: bool,
     tensor_parallel_size: int,
 ) -> None:
     _run_bart_pytorch_generate_encoder_decoder(
@@ -460,6 +508,7 @@ def test_bart_pytorch_generate_encoder_decoder_end_to_end(
         exact_match,
         cuda_graph_batch_sizes,
         kv_cache_dtype,
+        disable_overlap_scheduler,
         tensor_parallel_size,
     )
 

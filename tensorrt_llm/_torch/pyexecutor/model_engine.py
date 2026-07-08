@@ -262,6 +262,13 @@ class PyTorchModelEngine(ModelEngine):
         _configure_deep_gemm_pdl()
 
         self.forward_pass_callable = None
+        # When True (set by PyExecutor for the overlap scheduler loop),
+        # forward() skips logits post processors and the executor loop
+        # applies them explicitly after the previous iteration's tokens
+        # have been appended to the requests. Applying them inside
+        # forward() would let processors observe a token list that is
+        # one step stale under the overlap scheduler.
+        self.defer_logits_post_processors = False
         self.ub_buffers = None
         if llm_args.encode_only and llm_args.mm_encoder_only:
             raise ValueError(
@@ -737,6 +744,11 @@ class PyTorchModelEngine(ModelEngine):
         self.kv_cache_dtype_byte_size = self.get_kv_cache_dtype_byte_size()
 
         self._prepare_inputs_event: Optional[torch.cuda.Event] = None
+
+        # Cache for enc-dec cross-attention stable generation steps.
+        # Populated on the first CUDA-graph generation step; cleared whenever
+        # the batch composition changes (new encoder request arrives).
+        self._cross_attn_stable_cached_tokens: Optional[List[int]] = None
 
     def register_forward_pass_callable(self, callable: Callable):
         self.forward_pass_callable = callable
@@ -2649,12 +2661,40 @@ class PyTorchModelEngine(ModelEngine):
             skip_cross_kv_projection = True
 
         if attn_metadata.is_cuda_graph and attn_metadata.has_cross_sub_metadata:
-            cross_attn_metadata = attn_metadata.update_cross_metadata(
-                encoder_seq_lens=encoder_seq_lens,
-                cross_kv_cache_manager=cross_kv_cache_manager,
-                encoder_num_cached_tokens_per_seq=
-                encoder_num_cached_tokens_per_seq,
+            # Fast path for stable CUDA-graph generation steps: the encoder
+            # KV lengths (kv_lens_cuda) and the frozen prompt lengths
+            # (prompt_lens_cuda) are identical across all generation steps
+            # for a fixed batch. Skip the expensive torch.tensor() allocations
+            # and H2D copies inside prepare() when nothing has changed.
+            is_stable_gen_step = (
+                new_encoder_tokens == 0  # pure generation, no new cross-KV
+                and self._cross_attn_stable_cached_tokens ==
+                encoder_num_cached_tokens_per_seq  # same batch
             )
+            if is_stable_gen_step:
+                cross_attn_metadata = attn_metadata.cross
+                # Only refresh the decoder-side Python references that the
+                # kernel reads; these are pointer-level updates with no alloc.
+                cross_attn_metadata._seq_lens = attn_metadata.seq_lens
+                cross_attn_metadata._seq_lens_cuda = attn_metadata.seq_lens_cuda
+                cross_attn_metadata.prompt_lens = attn_metadata.prompt_lens
+                cross_attn_metadata.request_ids = attn_metadata.request_ids
+                cross_attn_metadata.num_contexts = attn_metadata.num_contexts
+            else:
+                cross_attn_metadata = attn_metadata.update_cross_metadata(
+                    encoder_seq_lens=encoder_seq_lens,
+                    cross_kv_cache_manager=cross_kv_cache_manager,
+                    encoder_num_cached_tokens_per_seq=
+                    encoder_num_cached_tokens_per_seq,
+                )
+                cross_attn_metadata.prepare()
+                if new_encoder_tokens == 0:
+                    # Record this stable state for future fast-path use.
+                    self._cross_attn_stable_cached_tokens = list(
+                        encoder_num_cached_tokens_per_seq)
+                else:
+                    # Batch changed (new encoder request); reset cache.
+                    self._cross_attn_stable_cached_tokens = None
         else:
             cross_attn_metadata = attn_metadata.create_cross_metadata(
                 cross_kv_cache_manager=cross_kv_cache_manager,
@@ -2664,7 +2704,12 @@ class PyTorchModelEngine(ModelEngine):
             )
             if attn_metadata.is_cuda_graph:
                 attn_metadata.cross = cross_attn_metadata
-        cross_attn_metadata.prepare()
+                if new_encoder_tokens == 0:
+                    self._cross_attn_stable_cached_tokens = list(
+                        encoder_num_cached_tokens_per_seq)
+                else:
+                    self._cross_attn_stable_cached_tokens = None
+            cross_attn_metadata.prepare()
 
         return {
             "encoder_hidden_states": packed_encoder_hidden_states,
@@ -5477,7 +5522,8 @@ class PyTorchModelEngine(ModelEngine):
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()
 
-            self._execute_logit_post_processors(scheduled_requests, outputs)
+            if not self.defer_logits_post_processors:
+                self._execute_logit_post_processors(scheduled_requests, outputs)
 
             return outputs
 
