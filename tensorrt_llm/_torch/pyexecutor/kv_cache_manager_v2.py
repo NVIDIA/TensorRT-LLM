@@ -236,6 +236,15 @@ class DisaggPoolViewConfig(NamedTuple):
 
     Returning this capability asks the generic page-table builder to expose
     per-layer, per-role-class logical views instead of opaque whole-slot views.
+
+    Scope: ``sharded_layout`` asserts what the manager's *paired attention
+    backend* actually writes; the pool memory itself is layout-agnostic (see
+    :meth:`KVCacheManagerV2.get_buffers`). Declaring it statically is only
+    valid when the manager and backend form a fixed pair with one layout
+    (e.g. MiniMax M3's sparse backend, always token-major). A manager whose
+    backend selects the layout at runtime (e.g. FlashInfer NHD/HND) must
+    derive this value from the backend configuration instead of hardcoding
+    it.
     """
 
     sharded_layout: DisaggCacheLayout
