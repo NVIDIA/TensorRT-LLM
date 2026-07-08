@@ -1322,8 +1322,27 @@ void WindowBlockManager::releaseSubtree(BlockPtr const& block)
     }
 }
 
+void WindowBlockManager::reapReadPendingReleases()
+{
+    // Cards whose async onboard read has landed can rejoin the disk free queue: their slot file is no
+    // longer being read, so a later spill may safely overwrite it.
+    for (auto it = mReadPendingReleases.begin(); it != mReadPendingReleases.end();)
+    {
+        if (mTransferManager->isBlockReadPending(it->first))
+        {
+            ++it;
+            continue;
+        }
+        mEvictionPolicy->releaseBlock(it->second);
+        it = mReadPendingReleases.erase(it);
+    }
+}
+
 BlockPtr WindowBlockManager::claimDiskTarget()
 {
+    // Reclaim onboarded slots whose read has landed before handing out a disk slot, so a slot with an
+    // in-flight read is never claimable -- its file must not be overwritten while that read is pending.
+    reapReadPendingReleases();
     // Priority order: empty slots (kMin) < unmarked content (kDefault) < retained (kMax),
     // so getFreeBlock returns empties first and a retained block only when nothing cheaper
     // (empty slot or unmarked cached block) remains.
@@ -1644,7 +1663,18 @@ void WindowBlockManager::onboardBlock(GenerationRequest& sequence, BlockPtr cons
         offloadBlock->setPriority(executor::KvCacheRetentionConfig::kDefaultRetentionPriority);
         block->clearRetention();
         block->setPriority(executor::KvCacheRetentionConfig::kMinRetentionPriority); // freed card = empty slot again
-        mEvictionPolicy->releaseBlock(block); // freed card returns to the disk free queue
+        if (trackId >= 0)
+        {
+            // The async read of this slot is still queued/in-flight. Returning the freed card to the disk
+            // free queue now would let the next spill claim + overwrite the slot file before the read runs
+            // (read-vs-write race -> the reader onboards the wrong block). Hold the card until the read
+            // lands; reapReadPendingReleases() (from claimDiskTarget) returns it once !isBlockReadPending.
+            mReadPendingReleases.emplace(trackId, block);
+        }
+        else
+        {
+            mEvictionPolicy->releaseBlock(block); // synchronous read already complete: slot safe to reuse
+        }
         ++mDiskOnboards;
         if (mDiskOnboards == 1 || mDiskOnboards % 1000 == 0)
         {

@@ -683,7 +683,6 @@ void KVCacheTransferManager::diskReaderLoop()
             // The transfer is device-complete, so publish the block: any request holding it can be forwarded.
             mPendingBlockReads.erase(job.blockId);
             mReadInflightCount.store(mPendingBlockReads.size(), std::memory_order_release);
-            mCompletedBlockReads.push_back(job.blockId);
         }
     }
     cudaStreamDestroy(stream);
@@ -698,14 +697,6 @@ void KVCacheTransferManager::enqueueDiskRead(DiskReadJob job)
         mReadQueue.push(std::move(job));
     }
     mReadQueueCv.notify_one();
-}
-
-std::vector<std::int32_t> KVCacheTransferManager::drainCompletedBlockReads()
-{
-    std::lock_guard<std::mutex> lock(mReadMutex);
-    std::vector<std::int32_t> out;
-    out.swap(mCompletedBlockReads);
-    return out;
 }
 
 bool KVCacheTransferManager::isBlockReadPending(std::int32_t blockId)

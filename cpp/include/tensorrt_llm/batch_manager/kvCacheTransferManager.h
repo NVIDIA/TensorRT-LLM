@@ -96,9 +96,6 @@ public:
     void loadFromFile(BlockPtr const& dstPrimaryBlock, SizeType32 diskSlot, std::vector<KVCacheBlockPool> const& pools,
         std::string const& directory, std::int32_t trackBlockId = -1);
 
-    //! \brief Return + clear the block ids whose reads have landed since the last call.
-    [[nodiscard]] std::vector<std::int32_t> drainCompletedBlockReads();
-
     //! \brief True while block blockId still has an in-flight disk read (not yet safe to read on the GPU).
     [[nodiscard]] bool isBlockReadPending(std::int32_t blockId);
 
@@ -255,7 +252,6 @@ private:
     // Lock-free mirror of mPendingBlockReads.size() (updated under mReadMutex on every insert/erase) so
     // areBlocksReady() can skip its per-block scan + the mutex when nothing is in flight (common case).
     std::atomic<std::size_t> mReadInflightCount{0};
-    std::vector<std::int32_t> mCompletedBlockReads;
     bool mDiskReaderStop{false};
 
     void diskReaderLoop();

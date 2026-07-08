@@ -1508,6 +1508,11 @@ private:
     SizeType32 mReservedHostBlockTarget{0};
     std::vector<BlockPtr> mReservedHostBlocks;
     std::unordered_map<std::uint64_t, BlockPtr> mPendingSpillBlocks;
+    // Onboarded disk cards whose async read is still in flight, keyed by the read's tracked block id.
+    // Held out of the disk free queue until the read lands so a spill cannot overwrite the slot file
+    // mid-read; reapReadPendingReleases() returns each card once its read completes.
+    std::unordered_map<KVCacheBlock::IdType, BlockPtr> mReadPendingReleases;
+    void reapReadPendingReleases();
     std::uint64_t mUnstagedSpillSeq{0};
 
     //! \brief Pick and claim the disk block to overwrite: empty slots first, then
