@@ -99,7 +99,7 @@ class CrossAttention(nn.Module):
             )
 
         self.num_heads = self.num_heads // tp_size
-        self.num_key_value_heads = self.num_key_value_heads // tp_size
+        self.num_key_value_heads = (self.num_key_value_heads + tp_size - 1) // tp_size
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_key_value_heads * self.head_dim
 
@@ -113,9 +113,6 @@ class CrossAttention(nn.Module):
             gpus_per_node=self.mapping.gpus_per_node,
             enable_attention_dp=self.mapping.enable_attention_dp,
         )
-        self.tp_rank = mapping.tp_rank
-        self.tp_size = tp_size
-        self.cp_size = cp_size
 
         mapping_o = Mapping(
             world_size=dp_size * tp_size * pp_size * cp_size,

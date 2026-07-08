@@ -26,11 +26,13 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, ResourceManagerType
-from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
+from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -72,31 +74,15 @@ def _make_mock_kv_cache_config(
     free_gpu_memory_fraction=0.9,
     host_cache_size=None,
 ):
-    """Create a mock KvCacheConfig with the fields KvCacheCreator needs."""
-    config = SimpleNamespace(
+    """Create a KvCacheConfig with the fields KvCacheCreator needs."""
+    return KvCacheConfig(
         cross_kv_cache_fraction=cross_kv_cache_fraction,
-        max_gpu_total_bytes=max_gpu_total_bytes,
+        max_gpu_total_bytes=max_gpu_total_bytes or 0,
         use_kv_cache_manager_v2=use_kv_cache_manager_v2,
         max_tokens=max_tokens,
         free_gpu_memory_fraction=free_gpu_memory_fraction,
         host_cache_size=host_cache_size,
-        max_attention_window=None,
-        event_buffer_max_size=0,
-        attention_dp_events_gather_period_ms=0,
-        enable_block_reuse=False,
-        enable_partial_reuse=False,
-        copy_on_partial_reuse=False,
-        secondary_offload_min_priority=0,
-        kv_cache_event_hash_algo=None,
     )
-
-    def model_copy():
-        fields = vars(config).copy()
-        fields.pop("model_copy", None)
-        return SimpleNamespace(**fields)
-
-    config.model_copy = model_copy
-    return config
 
 
 def _make_mock_model_config(
@@ -117,10 +103,7 @@ def _make_mock_model_config(
         hidden_size=512,
         head_dim=64,
         vocab_size=32000,
-        quantization=SimpleNamespace(
-            quant_algo=None,
-            kv_cache_quant_algo=None,
-        ),
+        quantization=QuantConfig(),
     )
     for key, value in pretrained_overrides.items():
         setattr(pretrained, key, value)
@@ -431,9 +414,6 @@ class TestCrossKvCacheConstruction:
         assert kwargs["num_kv_heads"] == 12
         assert kwargs["head_dim"] == 64
         assert kwargs["max_seq_len"] == 1024
-
-        import tensorrt_llm
-
         assert kwargs["kv_cache_type"] == (
             tensorrt_llm.bindings.internal.batch_manager.CacheType.CROSS
         )
@@ -791,11 +771,7 @@ class TestKVCacheV2SchedulerCrossParam:
             ResourceManagerType.CROSS_KV_CACHE_MANAGER: cross_mgr,
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER: None,
         }
-        mapping = SimpleNamespace(
-            pp_size=1,
-            enable_attention_dp=False,
-            has_pp=lambda: False,
-        )
+        mapping = Mapping()
         model_engine = SimpleNamespace(
             spec_config=None,
             model=SimpleNamespace(
@@ -811,7 +787,7 @@ class TestKVCacheV2SchedulerCrossParam:
             extra_resource_managers={},
             disable_overlap_scheduler=True,
             enable_early_first_token_response=False,
-            kv_cache_config=SimpleNamespace(enable_kv_pool_rebalance=False),
+            kv_cache_config=KvCacheConfig(),
         )
 
         with (
