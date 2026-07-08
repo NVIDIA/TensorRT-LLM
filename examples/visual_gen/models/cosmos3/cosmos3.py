@@ -23,6 +23,11 @@ Cosmos3 supports the following generation modes from a single checkpoint:
 - **I2V / TI2V** — image-conditioned video (``prompts/i2v.json``). Condition on a reference frame via the prompt
   file's ``vision_path`` or ``--image_path``. The image may be a local path, a
   ``file://`` / ``http(s)://`` URL, or a ``data:`` URI.
+- **V2V** — video-conditioned video (``prompts/v2v.json``). Condition on the
+  first (or last, per ``condition_video_keep``) frames of a reference video
+  via ``--video_path`` (a local frame directory, ``.mp4``/``.avi`` file, or
+  single image; ``.mp4``/``.avi`` decode requires the ``av`` package).
+  Passing ``--video_path`` without ``--action_mode`` selects V2V.
 - **T2AV** — text-to-video with synchronized audio (``prompts/t2av.json`` with
   ``enable_audio: true``, or pass ``--enable_audio``). Combine with a
   ``vision_path`` for image-conditioned audio-video (TI2AV).
@@ -73,6 +78,12 @@ Usage::
     python cosmos3.py --model nvidia/Cosmos3-Nano \
         --prompt_file prompts/i2v.json \
         --image_path https://example.com/frame.jpg \
+        --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+
+    # V2V: video-conditioned video (continues the first frames of --video_path)
+    python cosmos3.py --model nvidia/Cosmos3-Nano \
+        --prompt_file prompts/v2v.json \
+        --video_path /path/to/reference.mp4 \
         --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
 
     # T2AV: text-to-video with synchronized audio
@@ -404,7 +415,8 @@ def main():
         "--video_path",
         type=str,
         default=None,
-        help="Frame directory, .mp4/.avi video, or image path for inverse_dynamics",
+        help="Reference video for V2V (or inverse_dynamics with --action_mode): "
+        "a local frame directory, .mp4/.avi file, or image path",
     )
     parser.add_argument(
         "--action_resolution",

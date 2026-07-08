@@ -842,6 +842,64 @@ class TestVideoGenerationSync:
         assert params.image.endswith("_reference.png")
         assert os.path.exists(params.image)
 
+    def test_sync_video_generation_multipart_with_video_reference(self, video_client, tmp_path):
+        """A video ``input_reference`` routes to ``extra_params["video"]`` (V2V).
+
+        The reference is classified by decoding its content, so the clip is
+        synthesized in-test with PyAV — no video asset ships with the repo.
+        """
+        av = pytest.importorskip("av")
+        np = pytest.importorskip("numpy")
+        ref_path = tmp_path / "ref.mp4"
+        with av.open(str(ref_path), "w") as container:
+            # mpeg4 is a built-in FFmpeg encoder (h264 may be absent from
+            # LGPL PyAV wheels).
+            stream = container.add_stream("mpeg4", rate=4)
+            stream.width = 16
+            stream.height = 16
+            stream.pix_fmt = "yuv420p"
+            for _ in range(2):
+                frame = av.VideoFrame.from_ndarray(
+                    np.zeros((16, 16, 3), dtype=np.uint8), format="rgb24"
+                )
+                container.mux(stream.encode(frame))
+            container.mux(stream.encode())
+
+        with open(ref_path, "rb") as f:
+            resp = video_client.post(
+                "/v1/videos/generations",
+                data={
+                    "prompt": "Continue the same scene",
+                    "size": "64x64",
+                    "seconds": "1.0",
+                    "fps": "8",
+                },
+                files={"input_reference": ("ref.mp4", f, "video/mp4")},
+            )
+        assert resp.status_code == 200
+        assert len(resp.content) > 0
+
+        # Video content must NOT land on params.image; it rides
+        # extra_params["video"] (the same pipeline entry the offline
+        # example's --video_path uses), stored with a .mp4 suffix.
+        params = video_client.mock_gen.last_params
+        assert params.image is None
+        assert isinstance(params.extra_params, dict)
+        video_ref = params.extra_params["video"]
+        assert video_ref.endswith("_reference.mp4")
+        assert os.path.exists(video_ref)
+
+    def test_sync_video_generation_undecodable_reference_400(self, video_client):
+        """Content neither PIL nor PyAV can decode is rejected at the boundary."""
+        pytest.importorskip("av")
+        resp = video_client.post(
+            "/v1/videos/generations",
+            data={"prompt": "x"},
+            files={"input_reference": ("doc.txt", BytesIO(b"not media"), "text/plain")},
+        )
+        assert resp.status_code == 400
+        assert "neither a decodable image" in resp.text
+
     def test_sync_video_failure(self, failing_client):
         resp = failing_client.post(
             "/v1/videos/generations",
