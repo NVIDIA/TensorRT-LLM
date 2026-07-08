@@ -3467,6 +3467,9 @@ class PyExecutor:
         speculative step, so expose placeholder draft tokens to the scheduler
         for every speculative decoder, not only executor-level drafters.
         """
+        if not getattr(self, 'use_spec_decode', True):
+            return
+
         if (self.drafter is None
                 and getattr(self.model_engine, 'spec_config', None) is None):
             return
