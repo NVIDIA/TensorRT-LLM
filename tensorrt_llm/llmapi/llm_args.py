@@ -2779,12 +2779,18 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "pool_ratio is set.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
-    block_reuse_policy: Literal["all_reusable", "per_request"] = Field(
-        default="all_reusable",
-        status="prototype",
-        description="KV cache manager v2 block reuse policy. "
-        "With SWA scratch reuse and 'all_reusable', only non-scratch "
-        "blocks are saved for reuse.")
+    block_reuse_policy: Literal[
+        "all_reusable", "per_request", "per_conversation"] = Field(
+            default="all_reusable",
+            status="prototype",
+            description="KV cache manager v2 block reuse policy. "
+            "'all_reusable' saves reusable context blocks after every context chunk; "
+            "'per_request' saves them only after the full request context is processed; "
+            "'per_conversation' additionally keeps the latest completed request's "
+            "committed blocks for each conversation reusable until the next turn. "
+            "Requests without conversation params use 'per_request' behavior. When "
+            "'all_reusable' and SWA scratch reuse are both enabled, only non-scratch "
+            "blocks are saved for reuse.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     enable_swa_scratch_reuse: bool = Field(

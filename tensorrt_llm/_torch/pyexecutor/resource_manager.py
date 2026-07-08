@@ -80,6 +80,7 @@ from ..._utils import binding_to_str_dtype, mpi_rank, nvtx_range
 from ...logger import logger
 from ...mapping import CpType, Mapping
 from .connectors.kv_cache_connector import KvCacheConnectorManager
+from .conversation_manager import ConversationManager
 from .kv_cache_stats import (KVCacheV2IterationStatsReport,
                              KVCacheV2LifeCycleIterationStats,
                              KVCacheV2PoolGroupIterationStats)
@@ -138,6 +139,7 @@ class ResourceManagerType(enum.Enum):
 class BlockReusePolicy(StrEnum):
     ALL_REUSABLE = "all_reusable"
     PER_REQUEST = "per_request"
+    PER_CONVERSATION = "per_conversation"
 
 
 class Role:
@@ -2344,6 +2346,12 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
         self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
+        enable_conversation_manager = (self.enable_block_reuse
+                                       and self.block_reuse_policy
+                                       == BlockReusePolicy.PER_CONVERSATION
+                                       and not self.is_draft)
+        self.conversation_manager = (ConversationManager()
+                                     if enable_conversation_manager else None)
 
         # With pipeline parallelism, multiple microbatches can be in-flight
         # simultaneously, so we need slots for all concurrent sequences.
@@ -2946,6 +2954,8 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _prepare_context_impl(self, req: LlmRequest) -> bool:
         if req.is_first_context_chunk:
+            if self.conversation_manager is not None:
+                self.conversation_manager.update_conversation(req)
             kv_cache = self.kv_cache_map.get(req.py_request_id)
             if kv_cache is None:
                 all_tokens = req.get_tokens(DEFAULT_BEAM_INDEX)
@@ -3918,6 +3928,8 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_cache.close()
         self.kv_cache_map.clear()
         self.impl.shutdown()
+        if self.conversation_manager is not None:
+            self.conversation_manager.clear()
 
     def get_max_resource_count(self) -> int:
         # TODO: implement this
@@ -3988,6 +4000,8 @@ class KVCacheManagerV2(BaseResourceManager):
             if should_commit:
                 self.try_commit_blocks(req)
             if req.context_remaining_length == 0:
+                if self.conversation_manager is not None:
+                    self.conversation_manager.record_conversation(req, kv_cache)
                 # Scratch blocks are only for prefill chunks. Disable them at
                 # the context/generation boundary so generation uses normal KV
                 # pages before the first generation allocation.
@@ -4133,6 +4147,8 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def reset_reuse_state(self):
         self.impl.clear_reusable_blocks()
+        if self.conversation_manager is not None:
+            self.conversation_manager.clear()
 
 
 class SlotManager:
