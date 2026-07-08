@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Dense Sparse Attention (DSA) backend for TRT-LLM with indexer-based TopK selection."""
-import math
 import os
 import threading
 from contextlib import contextmanager
@@ -31,8 +30,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, maybe_compile
 from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
-                                 get_size_in_bytes, get_sm_version,
-                                 maybe_pin_memory, prefer_pinned)
+                                 get_sm_version, maybe_pin_memory,
+                                 prefer_pinned)
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import \
