@@ -841,6 +841,27 @@ class KVCacheManagerV2(BaseResourceManager):
             # suspend/resume works out of the box.  Cap at available host
             # memory and pinnable memory limit to avoid allocation failures.
             import resource
+            import socket
+
+            # Rank-aware host tier sizing: count how many ranks share this
+            # physical node so their host tiers don't collectively exceed
+            # node RAM.  Each rank independently provisions a host tier;
+            # without dividing the per-node budget by the local rank count,
+            # N co-located ranks each reserving a device-quota-sized block
+            # can OOM the host (observed on GB300 NVL72 with 4 ranks/node
+            # and ~170GiB device quota each on a 975GiB node).
+            local_ranks = 1
+            try:
+                if mapping.world_size > 1:
+                    hostnames = Distributed.get(mapping).allgather(socket.gethostname())
+                    if hostnames:
+                        self_hostname = socket.gethostname()
+                        local_ranks = max(1, sum(1 for h in hostnames if h == self_hostname))
+            except Exception:
+                try:
+                    local_ranks = max(1, mapping.gpus_per_node)
+                except Exception:
+                    local_ranks = 1
 
             try:
                 mem_available = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
@@ -853,12 +874,17 @@ class KVCacheManagerV2(BaseResourceManager):
                 memlock_limit = float("inf")
             candidates = [quota]
             if mem_available != float("inf"):
-                candidates.append(int(mem_available * 0.5))
+                candidates.append(int(mem_available / local_ranks * 0.5))
             if memlock_limit != float("inf"):
                 candidates.append(int(memlock_limit * 0.8))
             host_quota = min(candidates)
             if host_quota <= 0:
                 host_quota = quota
+            logger.info(
+                f"KV cache manager v2 auto host tier sizing: "
+                f"{local_ranks} co-located rank(s) on this node, "
+                f"available host memory {mem_available / (1 << 30):.2f}GiB"
+            )
         if host_quota > 0:
             cache_tiers.append(HostCacheTierConfig(quota=host_quota))
             logger.info(
