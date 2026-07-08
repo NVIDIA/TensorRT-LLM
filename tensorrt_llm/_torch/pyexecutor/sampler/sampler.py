@@ -1099,6 +1099,8 @@ class SampleStateTensorsHostTorch(SampleStateTensors):
     finish_reasons: torch.Tensor | None
     first_finish_reasons: torch.Tensor | None
     logprobs_state: LogProbsState | None = None
+    use_host_stop_criteria: bool = False
+    """Whether update_requests should evaluate end-ID and length limits on the host."""
 
     def finish_reasons_list(self) -> FinishReasonsList:
         """`(num_seq_slots, num_steps)`"""
@@ -1113,8 +1115,6 @@ class SampleStateTensorsHostTorch(SampleStateTensors):
 @dataclass(kw_only=True)
 class SampleStateTorch(SampleState[SampleStateTensorsHostTorch, SampleStateTensors]):
     beam_history_builders: list[BeamHistoryBuilder | None] | None = None
-    use_host_stop_criteria: bool = False
-    """Whether update_requests should evaluate end-ID and length limits on the host."""
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -3736,7 +3736,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 req.py_rewind_len = 0
             else:
                 processed = 1
-                if state.use_host_stop_criteria:
+                if state.host.use_host_stop_criteria:
                     new_token = add_token(req, new_tokens_list, beam_idx=DEFAULT_BEAM_IDX)
                     self._handle_stop_criteria(
                         req,
@@ -3892,10 +3892,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 finish_reasons=finish_reasons_host,
                 first_finish_reasons=first_finish_reasons_host,
                 logprobs_state=logprobs_state,
+                use_host_stop_criteria=use_host_stop_criteria,
             ),
             sampler_event=sampler_event,
             beam_history_builders=beam_history_builders,
-            use_host_stop_criteria=use_host_stop_criteria,
         )
 
     @staticmethod

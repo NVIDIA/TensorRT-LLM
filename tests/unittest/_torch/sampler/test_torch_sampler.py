@@ -42,6 +42,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     get_draft_token_length,
 )
 from tensorrt_llm._torch.pyexecutor.sampler import (
+    SampleStateTorch,
     TorchSampler,
     _BatchedSamplingResult,
     _request_get_sampling_params,
@@ -929,11 +930,18 @@ class TestFinishReasons:
             model_outputs={"logits": logits},
             num_context_logits_prefix_sum=[0],
         )
-        assert state.use_host_stop_criteria
         assert state.host is not None
+        assert state.host.use_host_stop_criteria
         assert state.host.finish_reasons is None
 
-        sampler.update_requests(state)
+        # PP ranks only receive the host state, so all state required by
+        # update_requests must survive reconstructing the outer sample state.
+        transferred_state = SampleStateTorch(
+            requests=state.requests,
+            host=state.host,
+            sampler_event=state.sampler_event,
+        )
+        sampler.update_requests(transferred_state)
 
         write_finish_reasons.assert_not_called()
         assert request.get_tokens(0)[-1] == sampled_token
