@@ -7,11 +7,15 @@ import json
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 # Importing the models package applies the Qwen-Image registration side effect.
 from tensorrt_llm._torch.visual_gen import models  # noqa: F401
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, DiffusionPipelineConfig
-from tensorrt_llm._torch.visual_gen.models.qwen_image import QwenJointAttention
+from tensorrt_llm._torch.visual_gen.models.qwen_image import (
+    QwenImageTransformer2DModel,
+    QwenJointAttention,
+)
 from tensorrt_llm._torch.visual_gen.modules.attention import QKVMode
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -226,3 +230,42 @@ def test_qwen_joint_attention_keeps_separate_qkv_path_unwrapped(visual_gen_mappi
 
     assert attention.qkv_mode == QKVMode.SEPARATE_QKV
     assert attention.attn.__class__.__name__ != not_wrapped_as
+
+
+def test_qwen_transformer_treats_all_true_text_mask_as_unmasked():
+    torch.manual_seed(0)
+    model = QwenImageTransformer2DModel(
+        patch_size=2,
+        in_channels=4,
+        out_channels=4,
+        num_layers=1,
+        attention_head_dim=8,
+        num_attention_heads=2,
+        joint_attention_dim=16,
+        axes_dims_rope=(2, 2, 4),
+    ).eval()
+
+    hidden_states = torch.randn(1, 4, 4)
+    encoder_hidden_states = torch.randn(1, 3, 16)
+    timestep = torch.tensor([0.5])
+    img_shapes = [(1, 2, 2)]
+
+    with torch.inference_mode():
+        unmasked = model(
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_hidden_states_mask=None,
+            timestep=timestep,
+            img_shapes=img_shapes,
+            return_dict=False,
+        )[0]
+        all_true_masked = model(
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_hidden_states_mask=torch.ones(1, 3, dtype=torch.bool),
+            timestep=timestep,
+            img_shapes=img_shapes,
+            return_dict=False,
+        )[0]
+
+    torch.testing.assert_close(all_true_masked, unmasked)

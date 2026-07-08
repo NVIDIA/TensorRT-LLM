@@ -1045,13 +1045,14 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         if encoder_hidden_states_mask is not None:
             if encoder_hidden_states_mask.dtype != torch.bool:
                 encoder_hidden_states_mask = encoder_hidden_states_mask.to(torch.bool)
-            batch_size, image_seq_len = hidden_states.shape[:2]
-            image_mask = torch.ones(
-                (batch_size, image_seq_len),
-                dtype=torch.bool,
-                device=hidden_states.device,
-            )
-            block_attention_mask = torch.cat([encoder_hidden_states_mask, image_mask], dim=1)
+            if not encoder_hidden_states_mask.all():
+                batch_size, image_seq_len = hidden_states.shape[:2]
+                image_mask = torch.ones(
+                    (batch_size, image_seq_len),
+                    dtype=torch.bool,
+                    device=hidden_states.device,
+                )
+                block_attention_mask = torch.cat([encoder_hidden_states_mask, image_mask], dim=1)
 
         for block in self.transformer_blocks:
             encoder_hidden_states, hidden_states = block(
