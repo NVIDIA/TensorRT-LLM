@@ -550,17 +550,28 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 capture_graph=capture_graph,
             )
 
-            # Detect VSWA: check if the manager has multiple pools.
-            # Guard on layer_to_pool_mapping_dict which is V2-specific — V1
-            # managers also expose is_vswa but lack the per-pool infrastructure.
-            if (getattr(self.kv_cache_manager, 'is_vswa', False) and hasattr(
-                    self.kv_cache_manager, 'layer_to_pool_mapping_dict')):
-                mgr = self.kv_cache_manager
-                self._vswa_layer_to_pool = {}
-                self._vswa_pool_to_rep_layer: Dict[int, int] = {}
+            # Layers may share one page-index list only when they are in the
+            # same pool AND have the same page-index scale: VSWA splits pools,
+            # and per-layer geometry (e.g. Gemma4 sliding/global head_dim)
+            # splits scales even when all windows collapse to max_seq_len and
+            # is_vswa is False. Guarded on V2-specific attributes (V1 managers
+            # lack the per-pool infrastructure).
+            mgr = self.kv_cache_manager
+            _get_scale = getattr(mgr, 'get_layer_page_index_scale', None)
+            _layer_space: Dict[int, int] = {}
+            if hasattr(mgr, 'layer_to_pool_mapping_dict') and _get_scale:
+                _space_ids = {}
                 for layer_idx in getattr(mgr, 'layer_offsets', {}):
                     layer_offset = mgr.layer_offsets[layer_idx]
-                    pool_id = mgr.layer_to_pool_mapping_dict[layer_offset]
+                    key = (mgr.layer_to_pool_mapping_dict[layer_offset],
+                           _get_scale(layer_idx))
+                    _space_ids.setdefault(key, len(_space_ids))
+                    _layer_space[layer_idx] = _space_ids[key]
+            if _layer_space and (getattr(mgr, 'is_vswa', False)
+                                 or len(set(_layer_space.values())) > 1):
+                self._vswa_layer_to_pool = {}
+                self._vswa_pool_to_rep_layer: Dict[int, int] = {}
+                for layer_idx, pool_id in _layer_space.items():
                     self._vswa_layer_to_pool[layer_idx] = pool_id
                     if pool_id not in self._vswa_pool_to_rep_layer:
                         self._vswa_pool_to_rep_layer[pool_id] = layer_idx

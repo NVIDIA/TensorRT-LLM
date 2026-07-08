@@ -2775,6 +2775,12 @@ class KVCacheManagerV2(BaseResourceManager):
         else:
             self.index_mapper.remove_sequence(request.py_request_id)
 
+    def get_layer_page_index_scale(self, layer_idx: int) -> int:
+        """Page-index scale of this layer's KV buffer. Layers in one pool can
+        have different scales (e.g. different head_dim), so per-layer callers
+        must not use the pool-level scale."""
+        return int(self.impl.get_page_index_scale(self.layer_offsets[layer_idx], Role.KEY))
+
     def get_batch_cache_indices(
         self,
         request_ids: List[int],
@@ -2783,13 +2789,16 @@ class KVCacheManagerV2(BaseResourceManager):
     ) -> List[List[int]]:
         if layer_idx is None:
             pool_id = 0
+            index_scale = None
         else:
             pool_id = self.layer_to_pool_mapping_dict[self.layer_offsets[layer_idx]]
+            index_scale = self.get_layer_page_index_scale(layer_idx)
         return self._get_batch_cache_indices_by_pool_id(
             request_ids,
             pool_id=pool_id,
             is_kv_aggregate=True,
             num_blocks_per_seq=num_blocks_per_seq,
+            index_scale=index_scale,
         )
 
     def _get_batch_cache_indices_by_pool_id(
@@ -2799,6 +2808,7 @@ class KVCacheManagerV2(BaseResourceManager):
         pool_id: int = 0,
         is_kv_aggregate: bool = True,
         num_blocks_per_seq: Optional[Sequence[int]] = None,
+        index_scale: Optional[int] = None,
     ) -> List[List[int]]:
         if is_kv_aggregate:
             # Div by kv_factor to index kv cache with size
@@ -2807,7 +2817,8 @@ class KVCacheManagerV2(BaseResourceManager):
         else:
             div_factor = 1
 
-        index_scale = int(self.index_scales[pool_id])
+        if index_scale is None:
+            index_scale = int(self.index_scales[pool_id])
         res = []
 
         for req_idx, req_id in enumerate(request_ids):

@@ -227,6 +227,48 @@ def test_e2e_text_31b_dummy():
 
 
 @requires_gemma4_transformers
+@pytest.mark.skipif(not _model_available("E2B"), reason="gemma-4-E2B-it not found")
+@pytest.mark.parametrize("max_seq_len", [256, 512])
+def test_e2e_text_e2b_dummy_small_max_seq_len(max_seq_len):
+    """E2E with max_seq_len <= sliding_window (256 and 512).
+
+    Regression test: when max_seq_len is at most the sliding window size, all
+    attention windows clamp to max_seq_len, the KV cache manager reports a
+    single window (is_vswa False), and the FlashInfer metadata used to skip
+    the per-pool page-index mapping — while the pools still differ by
+    head_dim. The shared page-index list then sends out-of-range page ids to
+    the smaller (global head_dim) pool and append_paged_kv_cache crashes with
+    an illegal memory access during the warmup prefill.
+    """
+    from tensorrt_llm.llmapi import LLM, SamplingParams
+
+    # Real E2B geometry with dummy weights: the sliding (head_dim 256) and
+    # global (head_dim 512) layers must keep different page-index scales,
+    # and sliding_window must stay 512 so both max_seq_len values are at
+    # most the window. Shrinking the config changes both and hides the bug.
+    dummy_dir = _make_dummy_config_dir(
+        MODEL_PATHS["E2B"],
+        dummy_head_dim=256,
+        dummy_global_head_dim=512,
+        shrink_hidden=False,
+    )
+    try:
+        llm = LLM(
+            dummy_dir,
+            load_format="dummy",
+            attn_backend="FLASHINFER",
+            dtype="bfloat16",
+            max_seq_len=max_seq_len,
+        )
+        with llm:
+            output = llm.generate(["Hello"], SamplingParams(max_tokens=4))
+            assert len(output) == 1
+            assert len(output[0].outputs[0].token_ids) > 0
+    finally:
+        shutil.rmtree(dummy_dir, ignore_errors=True)
+
+
+@requires_gemma4_transformers
 @pytest.mark.skipif(not _model_available("E4B"), reason="gemma-4-E4B-it not found")
 def test_e2e_text_e4b_dummy():
     """E2E text generation for E4B (KV sharing + hybrid attn)."""
