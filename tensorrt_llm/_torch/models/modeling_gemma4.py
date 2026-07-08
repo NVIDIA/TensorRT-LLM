@@ -46,7 +46,7 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.gemma4.fused_gelu_quant import gemma4_fused_gelu_mul_fp4
-from ..modules.gemma4.fused_norm_quant import gemma4_fused_norm_fp4
+from ..modules.gemma4.fused_norm_quant import gemma4_fused_norm_fp4, gemma4_fused_norm_fp4_available
 from ..modules.gemma4.fused_qkv import gemma4_fused_qkv_norm_rope_quant
 from ..modules.gemma4.fused_tail import gemma4_fused_norm_add, gemma4_fused_norm_add_scale
 from ..modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
@@ -818,7 +818,10 @@ class Gemma4DecoderLayer(DecoderLayer):
         if self._fused_norm_quant is None:
             gu = self.mlp.gate_up_proj
             self._fused_norm_quant = (
-                not self.enable_moe_block
+                # flashinfer's CuTe-DSL kernel backs this fusion (SM100+,
+                # needs nvidia-cutlass-dsl importable).
+                gemma4_fused_norm_fp4_available()
+                and not self.enable_moe_block
                 and self._norm_is_plain_bf16(self.pre_feedforward_layernorm)
                 # Mirror the checks the pre-quantized-input path in
                 # Linear._input_prepare enforces for Fp4QuantizedTensor.
@@ -914,7 +917,9 @@ class Gemma4DecoderLayer(DecoderLayer):
         # Fused pre_feedforward RMSNorm + gate_up NVFP4 quantize: the normed
         # tensor is consumed only by gate_up_proj's input quantize, so emit
         # the FP4 payload + swizzled scales directly (same static
-        # input_scale / alpha, byte-identical inputs to the GEMM).
+        # input_scale / alpha the unfused quantize would use; the fused
+        # kernel skips the intermediate bf16 round, so the GEMM inputs are
+        # near- rather than byte-identical).
         if (
             not lora_params
             and isinstance(hidden_states, torch.Tensor)
