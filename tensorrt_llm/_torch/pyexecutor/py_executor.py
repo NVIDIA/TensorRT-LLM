@@ -3501,6 +3501,17 @@ class PyExecutor:
         torch.cuda.current_stream().synchronize()
         self._consume_previous_batch_for_rebalance()
 
+        # CUDA-graph padding dummies hold persistent ACTIVE KV caches that
+        # never appear in active_requests, but adjust() requires every
+        # living cache to be suspended. Close them and let _pad_batch
+        # recreate them on the next padded batch, with the post-adjust
+        # pool layout.
+        runner = getattr(self.model_engine, "cuda_graph_runner", None)
+        if runner is not None and runner.padding_dummy_requests:
+            for dummy in runner.padding_dummy_requests.values():
+                mgr.free_resources(dummy)
+            runner.padding_dummy_requests = {}
+
         paused: List[LlmRequest] = []
         for req in self.active_requests:
             if mgr.is_request_active(req.py_request_id):
