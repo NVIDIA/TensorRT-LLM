@@ -620,6 +620,16 @@ class LTX2Pipeline(BasePipeline):
     ``transformers`` library.
     """
 
+    def __init__(self, model_config):
+        _sa_cfg = model_config.attention.sparse_attention_config
+        if _sa_cfg is not None and getattr(_sa_cfg, "algorithm", None) == "vsa":
+            raise ValueError(
+                "Video Sparse Attention (sparse_attention_config.algorithm='vsa') is "
+                "only supported by the Wan 2.1 T2V 14B (720P) pipeline. Remove "
+                "sparse_attention_config for LTX-2."
+            )
+        super().__init__(model_config)
+
     @classmethod
     def resolve_variant(cls, config):
         if getattr(config, "cache_backend", None) == "cache_dit":

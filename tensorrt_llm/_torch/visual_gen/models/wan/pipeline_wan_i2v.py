@@ -97,6 +97,14 @@ class WanImageToVideoPipeline(BasePipeline):
         )
         self.is_wan22_14b = self.boundary_ratio is not None
 
+        _sa_cfg = pipeline_config.attention.sparse_attention_config
+        if _sa_cfg is not None and getattr(_sa_cfg, "algorithm", None) == "vsa":
+            raise ValueError(
+                "Video Sparse Attention (sparse_attention_config.algorithm='vsa') is "
+                "only supported by the Wan 2.1 T2V 14B (720P) pipeline. Remove "
+                "sparse_attention_config for Wan I2V."
+            )
+
         super().__init__(pipeline_config)
 
     def _compute_wan_timestep_embedding(self, module, timestep=None, **kwargs):

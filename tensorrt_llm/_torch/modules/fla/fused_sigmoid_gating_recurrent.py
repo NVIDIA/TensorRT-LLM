@@ -16,11 +16,22 @@ from tensorrt_llm.logger import logger
 try:
     # A missing build raises ImportError; a CuTe/CUTLASS mismatch raises
     # RuntimeError (mirror FlashInfer's own guard) -> Triton fallback.
+    # gated_delta_rule: T=1 decode entry (dispatches to the wide_vec fast path
+    # when B*HV is large). gated_delta_rule_mtp: T>=1 with batch-scoped
+    # intermediate_states_buffer and disable_state_update support, used by the
+    # speculative-decoding target-verify path.
     from flashinfer.gdn_kernels.gdn_decode_bf16_state import \
         gated_delta_rule as _fi_gdn_decode_bf16_state_t1
+    from flashinfer.gdn_kernels.gdn_decode_bf16_state import \
+        gated_delta_rule_mtp as _fi_gdn_decode_bf16_state_mtp
     _FLASHINFER_GDN_BF16_STATE_AVAILABLE = True
 except (ImportError, RuntimeError):
     _FLASHINFER_GDN_BF16_STATE_AVAILABLE = False
+
+# Max per-sequence token count served by the FlashInfer MTP verify kernel; the
+# parity test (test_flashinfer_gdn_verify.py) covers T=1..8 against the Triton
+# reference. Longer drafts fall back to the Triton recurrent kernel.
+_FI_GDN_MAX_MTP_T = 8
 
 
 @triton.heuristics({
@@ -286,6 +297,103 @@ def _flashinfer_gdn_decode(
 
     # Reshape output from [N, T, HV, V] back to [1, N*T, HV, V].
     return output.reshape(1, T_total, HV, -1)
+
+
+def _can_use_flashinfer_gdn_verify(
+    initial_state_source: Optional[torch.Tensor],
+    head_k_dim: int,
+    head_v_dim: int,
+    draft_token_num: int,
+) -> bool:
+    """Whether the FlashInfer MTP kernel should serve the speculative verify step.
+
+    Default ON when eligible; set ``TRTLLM_FLA_DISABLE_FLASHINFER_GDN_VERIFY=1``
+    to force the Triton recurrent verify kernel (``TRTLLM_FLA_DISABLE_FLASHINFER_GDN=1``
+    disables all FlashInfer GDN decode paths, including this one). The same
+    constraints as the decode path apply (bf16 state pool, K==V==128, supported
+    arch, FI MTP API available) plus a per-sequence draft length in
+    [1, _FI_GDN_MAX_MTP_T]; longer drafts fall back to Triton.
+    """
+    if os.environ.get("TRTLLM_FLA_DISABLE_FLASHINFER_GDN", "0") == "1":
+        return False
+    if os.environ.get("TRTLLM_FLA_DISABLE_FLASHINFER_GDN_VERIFY", "0") == "1":
+        return False
+    if not _FLASHINFER_GDN_BF16_STATE_AVAILABLE:
+        return False
+    if not is_flashinfer_gdn_supported_arch():
+        return False
+    if initial_state_source is None or initial_state_source.dtype != torch.bfloat16:
+        return False
+    if head_k_dim != 128 or head_v_dim != 128:
+        return False
+    if not (1 <= draft_token_num <= _FI_GDN_MAX_MTP_T):
+        return False
+    return True
+
+
+def _flashinfer_gdn_verify(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    softplus_beta: float,
+    softplus_threshold: float,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    b: torch.Tensor,
+    initial_state_source: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    intermediate_states_buffer: torch.Tensor,
+    scale: float,
+    use_qk_l2norm_in_kernel: bool,
+    output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """GDN MTP *verify* via the FlashInfer bf16-state kernel.
+
+    Inputs are batched ``[N, draft_token_num, H, D]``. The kernel gathers the
+    initial state from the pool via ``initial_state_indices`` (no host-side
+    gather copy), writes the SSM state after each draft token into the
+    batch-scoped ``intermediate_states_buffer`` (``[N, draft_token_num, HV, V,
+    K]``, matching the Triton verify kernel) and leaves the live state pool
+    untouched (``disable_state_update``) so the cache manager selects the
+    accepted-position state afterwards. Returns the attention output
+    ``[N, draft_token_num, HV, V]``.
+    """
+    logger.info_once(
+        "Using FlashInfer CuTe-DSL kernel for GDN MTP verify "
+        "(bf16 state, K=V=128)",
+        key="flashinfer_gdn_verify")
+    N, T = q.shape[0], q.shape[1]
+    HV, V = v.shape[2], v.shape[3]
+    output = (output.view(N, T, HV, V) if output is not None else q.new_empty(
+        N, T, HV, V))
+    # The FI CuTe-DSL kernel asserts 32-byte data alignment on every tensor
+    # argument. The int32 index tensor may be a slice of a larger buffer
+    # (e.g. state_indices_d = cache_indices[num_prefills:]) whose 4*offset
+    # storage offset breaks that; .int() is a no-op for int32, so realign
+    # with an explicit copy when needed.
+    initial_state_indices = initial_state_indices.int()
+    if initial_state_indices.data_ptr() % 32 != 0:
+        initial_state_indices = initial_state_indices.clone()
+    _fi_gdn_decode_bf16_state_mtp(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        initial_state_source=initial_state_source,
+        initial_state_indices=initial_state_indices,
+        intermediate_states_buffer=intermediate_states_buffer,
+        disable_state_update=True,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        scale=scale,
+        output=output,
+    )
+    return output
 
 
 def fused_sigmoid_gating_delta_rule_update(
