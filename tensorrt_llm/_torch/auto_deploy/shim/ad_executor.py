@@ -51,7 +51,7 @@ from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSampler
 from tensorrt_llm._utils import get_free_port, mpi_rank, mpi_world_size, nvtx_range
 from tensorrt_llm.inputs.multimodal import MultimodalRuntimeData, check_mm_embed_cumsum_if_needed
-from tensorrt_llm.llmapi.llm_args import ContextChunkingPolicy, SamplerType
+from tensorrt_llm.llmapi.llm_args import ContextChunkingPolicy, MultimodalConfig, SamplerType
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase
 from tensorrt_llm.mapping import Mapping
 
@@ -461,6 +461,9 @@ class ADEngine(ModelEngine):
         self.llm_args.enable_iter_req_stats = reporting_info.enable_iter_req_stats
         self.llm_args.max_num_tokens = cache_seq_interface.info.max_num_tokens
         self.llm_args.max_seq_len = cache_seq_interface.info.max_seq_len
+        self.llm_args.multimodal_config = (
+            ad_config.multimodal_config if ad_config else MultimodalConfig()
+        )
         self.iter_counter = 0
         self.iter_states = {}
 

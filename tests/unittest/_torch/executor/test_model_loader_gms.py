@@ -25,8 +25,6 @@ _SOURCE_IDENTITY = model_loader_mod.SourceIdentity(
     shard_fingerprint="shard",
 )
 
-pytestmark = pytest.mark.skip(reason="https://nvbugs/6337235")
-
 
 class _TinyModel(nn.Module):
     def __init__(self, events, *, include_draft=False):

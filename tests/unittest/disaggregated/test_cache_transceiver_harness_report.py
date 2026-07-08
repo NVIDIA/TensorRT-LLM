@@ -277,6 +277,14 @@ class TestTransportAcc:
         acc = _TransportAcc()
         assert acc.ranked() == []
 
+    def test_kv_only_excludes_control_transport(self):
+        acc = _TransportAcc()
+        acc.feed("cfg#0 tagged message (cuda/cuda)")
+        acc.feed("  | eager short | self/memory |")
+
+        assert acc.ranked() == ["self"]
+        assert acc.ranked(kv_only=True) == []
+
 
 class TestParseProtoInfo:
     def _write_log(self, path, lines):
@@ -288,11 +296,38 @@ class TestParseProtoInfo:
             tmp_path / "rank0.log",
             [
                 "cfg#0 ucp_put (cuda/cuda)",
-                "  | rendezvous zero-copy | rc_mlx5/cuda |",
+                "  | rendezvous zero-copy | rc_mlx5/mlx5_0:1 |",
             ],
         )
         result = _parse_proto_info(str(tmp_path / "rank*.log"))
         assert "rc_mlx5" in result
+
+    def test_kv_only_ignores_control_traffic_and_env_echo(self, tmp_path):
+        self._write_log(
+            tmp_path / "rank0.log",
+            [
+                "export UCX_TLS=all,self,rc_mlx5",
+                "cfg#0 tagged message (cuda/cuda)",
+                "  | eager short | self/memory |",
+            ],
+        )
+
+        result = _parse_proto_info(str(tmp_path / "rank*.log"), kv_only=True)
+
+        assert result == []
+
+    def test_kv_only_parses_weighted_multi_lane_transport(self, tmp_path):
+        self._write_log(
+            tmp_path / "rank0.log",
+            [
+                "cfg#0 ucp_put (cuda/cuda)",
+                "  | rendezvous zero-copy | 50% on rc_mlx5/mlx5_0:1 and 50% on rc_mlx5/mlx5_1:1 |",
+            ],
+        )
+
+        result = _parse_proto_info(str(tmp_path / "rank*.log"), kv_only=True)
+
+        assert result == ["rc_mlx5"]
 
     def test_no_files(self, tmp_path):
         result = _parse_proto_info(str(tmp_path / "rank*.log"))
@@ -313,6 +348,21 @@ class TestParseProtoInfo:
         result = _parse_proto_info_by_case(str(tmp_path / "rank*.log"))
         assert "cuda_ipc" in result[0]
         assert "rc_mlx5" in result[1]
+
+    def test_by_case_kv_only_ignores_control_traffic(self, tmp_path):
+        self._write_log(
+            tmp_path / "rank0.log",
+            [
+                "[CTT_CASE_BEGIN] ci=0 label=NIXL/PYTHON/V1",
+                "export UCX_TLS=all,self",
+                "cfg#0 tagged message (cuda/cuda)",
+                "  | eager short | self/memory |",
+            ],
+        )
+
+        result = _parse_proto_info_by_case(str(tmp_path / "rank*.log"), kv_only=True)
+
+        assert result == {0: []}
 
 
 # ---------------------------------------------------------------------------
@@ -466,3 +516,19 @@ class TestAggregate:
         # Best file should also be written
         best_path = str(work / "results.best.json")
         assert os.path.exists(best_path)
+
+    def test_aggregate_requires_kv_data_transport(self, tmp_path, sample_cfg):
+        work = self._setup_work_dir(tmp_path, sample_cfg)
+        with open(work / "logs" / "sweep0_gen_rank0.log", "w") as f:
+            f.write(
+                "[CTT_CASE_BEGIN] ci=0 label=NIXL/PYTHON/V1\n"
+                "export UCX_TLS=all,self\n"
+                "cfg#0 tagged message (cuda/cuda)\n"
+                "  | eager short | self/memory |\n"
+            )
+
+        out_path = str(work / "results.json")
+        results = aggregate(sample_cfg, out_path, require_kv_transport=True)
+
+        sweep = results["by_combination"][0]["sweeps"][0]
+        assert sweep["selected_transport"] == ""
