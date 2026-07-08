@@ -752,6 +752,23 @@ class TestSampleStateBroadcastPP:
         assert terminal_batch.sample_state.use_host_stop_criteria is True
         terminal.dist.isend_object.assert_not_called()
 
+    def test_ring_defaults_for_other_sampler_states(self) -> None:
+        source = self._make_executor(is_last_pp_rank=True, is_second_last_pp_rank=False)
+        source_batch = self._make_batch(use_host_stop_criteria=False)
+        del source_batch.sample_state.use_host_stop_criteria
+        PyExecutor._ring_broadcast_sample_state(source, source_batch)
+        source_payload = source.dist.isend_object.call_args.args[0]
+        assert source_payload[2] is False
+
+        relay = self._make_executor(is_last_pp_rank=False, is_second_last_pp_rank=False)
+        relay_batch = self._make_batch(use_host_stop_criteria=False)
+        del relay_batch.sample_state.use_host_stop_criteria
+        relay.dist.recv_object.return_value = source_payload
+        PyExecutor._ring_broadcast_sample_state(relay, relay_batch)
+        relay_payload = relay.dist.isend_object.call_args.args[0]
+        assert not hasattr(relay_batch.sample_state, "use_host_stop_criteria")
+        assert relay_payload[2] is False
+
 
 class TestComputeScheduledTokens:
     """Tests for PyExecutor._compute_scheduled_tokens.

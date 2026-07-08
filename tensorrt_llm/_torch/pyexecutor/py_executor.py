@@ -2608,7 +2608,8 @@ class PyExecutor:
                     src=self.dist.prev_pp_rank,
                     tag=tag,
                 )
-            sample_state.use_host_stop_criteria = use_host_stop_criteria
+            if hasattr(sample_state, "use_host_stop_criteria"):
+                sample_state.use_host_stop_criteria = use_host_stop_criteria
 
             for request, py_result_diff in zip(requests, py_result_diffs):
                 request.py_result.apply_diff(py_result_diff)
