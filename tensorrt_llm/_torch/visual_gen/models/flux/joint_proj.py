@@ -161,6 +161,7 @@ class FluxJointQKVMLPProj(nn.Module):
         quant_config=None,
         skip_create_weights_in_init: bool = False,
         force_dynamic_quantization: bool = False,
+        use_cute_dsl_blockscaling_mm: bool = False,
         mapping: Optional[Mapping] = None,
     ):
         super().__init__()
@@ -231,6 +232,7 @@ class FluxJointQKVMLPProj(nn.Module):
                 mapping=mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 reduce_output=False,
+                use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
             )
             self.local_qkv_dim = (q_dim + 2 * kv_dim) // self.tp_size
             self.local_mlp_dim = mlp_dim // self.tp_size
