@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,6 +24,23 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels::ar_fusion
 {
+__device__ __forceinline__ float warpReduceSumActive(float val)
+{
+    auto const mask = __activemask();
+    auto const lane = threadIdx.x & (warpSize - 1);
+    auto const activeLanes = __popc(mask);
+#pragma unroll
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+    {
+        auto const other = __shfl_down_sync(mask, val, offset);
+        if (lane + offset < activeLanes)
+        {
+            val += other;
+        }
+    }
+    return val;
+}
+
 template <int NRanks>
 struct SyncComm
 {
@@ -296,7 +313,14 @@ protected:
             float v = static_cast<float>(reinterpret_cast<DType const*>(&residual)[i]);
             acc += v * v;
         }
-        tensorrt_llm::common::blockReduceSumV2<float, 1>(&acc);
+        if (blockDim.x < warpSize)
+        {
+            acc = warpReduceSumActive(acc);
+        }
+        else
+        {
+            tensorrt_llm::common::blockReduceSumV2<float, 1>(&acc);
+        }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
         cg::cluster_group cluster = cg::this_cluster();
         if (cluster.num_blocks() > 1)

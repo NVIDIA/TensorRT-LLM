@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -620,6 +620,16 @@ TEST(Kernel, AllReduce)
         }
     }
     EXPECT_TRUE(pass);
+
+    // Exercise the partial-warp RMSNorm reduction used by small AutoDeploy test models.
+    // At hidden_size=64, a 16-bit dtype processes eight 128-bit accesses per token, so the
+    // all-reduce kernel launches fewer than one warp of threads.
+    Workspace small_hidden_workspace(world_size, rank, 8192, 64);
+    pass = pass
+        && test(small_hidden_workspace, 8192, 64, false, true, 3, 3, AllReduceStrategyType::TWOSHOT,
+            AllReduceStrategyConfig(0), AllReduceFusionOp::RESIDUAL_RMS_NORM);
+    EXPECT_TRUE(pass);
+
     ops[0] = AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM;
     for (auto config : configs)
     {
