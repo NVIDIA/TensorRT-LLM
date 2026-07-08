@@ -12,8 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""ChatGLM3-6B greedy parity against the HF source."""
-
 import gc
 import os
 
@@ -85,7 +83,7 @@ def _load_hf(model_dir, dtype, device):
 def _hf_final_logits(hf, input_ids, device):
     pos = torch.arange(input_ids.shape[1], device=device).unsqueeze(0)
     out = hf.forward(input_ids=input_ids, position_ids=pos, use_cache=True)
-    return out.logits[:, -1].float().squeeze(0).cpu()  # [vocab]
+    return out.logits[:, -1].float().squeeze(0).cpu()
 
 
 @torch.no_grad()
@@ -147,7 +145,7 @@ def test_source_logit_replay(config_name):
     try:
         for i, out in enumerate(outs):
             trt_tok = int(out.outputs[0].token_ids[0])
-            trt_logits = out.outputs[0].generation_logits[0].float().cpu()  # [vocab]
+            trt_logits = out.outputs[0].generation_logits[0].float().cpu()
             cos = torch.nn.functional.cosine_similarity(hf_logits[i], trt_logits, dim=0).item()
             max_abs = (hf_logits[i] - trt_logits).abs().max().item()
             print(

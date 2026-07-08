@@ -511,8 +511,6 @@ _CONFIG_REGISTRY: dict[str, type[transformers.PretrainedConfig]] = LazyConfigDic
 
 def _normalize_chatglm_config(
         model_config: transformers.PretrainedConfig) -> None:
-    """Set standard aliases for ChatGLM's Megatron-style config fields."""
-
     def set_if_absent(name: str, value: object | None) -> None:
         if getattr(model_config, name, None) is None and value is not None:
             setattr(model_config, name, value)
@@ -540,9 +538,7 @@ def _normalize_chatglm_config(
     set_if_absent("rms_norm_eps",
                   getattr(model_config, "layernorm_epsilon", None))
     set_if_absent("partial_rotary_factor", 0.5)
-    # ChatGLM3/GLM-4 fold rope_ratio into the rotary base (theta *= rope_ratio),
-    # matching the legacy converter. ChatGLM2 instead maps rope_ratio to a linear
-    # position-scaling factor; that variant is out of scope for this decoder.
+    # ChatGLM3 folds rope_ratio into the rotary base.
     rope_ratio = getattr(model_config, "rope_ratio", None)
     if rope_ratio is None:
         rope_ratio = 1.0

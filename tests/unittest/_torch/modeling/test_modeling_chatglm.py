@@ -12,8 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""ChatGLM3-6B PyTorch-backend parity tests."""
-
 import os
 
 import pytest
@@ -42,7 +40,6 @@ def _model_dir() -> str:
 
 
 def _load_hf_chatglm(model_dir, dtype, device):
-    """Load the ChatGLM remote code under modern transformers."""
     from transformers import AutoConfig, AutoModelForCausalLM
     from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
@@ -102,12 +99,12 @@ def test_chatglm_config_recognition_and_normalization():
     assert config.architectures == ["ChatGLMModel"]
     assert config.num_hidden_layers == 28
     assert config.num_attention_heads == 32
-    assert config.num_key_value_heads == 2  # multi_query_group_num
-    assert config.head_dim == 128  # kv_channels
-    assert config.intermediate_size == 13696  # ffn_hidden_size
-    assert config.max_position_embeddings == 8192  # seq_length
-    assert config.rms_norm_eps == 1e-5  # layernorm_epsilon
-    assert config.vocab_size == 65024  # padded_vocab_size
+    assert config.num_key_value_heads == 2
+    assert config.head_dim == 128
+    assert config.intermediate_size == 13696
+    assert config.max_position_embeddings == 8192
+    assert config.rms_norm_eps == 1e-5
+    assert config.vocab_size == 65024
     assert config.tie_word_embeddings is False
     assert config.partial_rotary_factor == 0.5
 

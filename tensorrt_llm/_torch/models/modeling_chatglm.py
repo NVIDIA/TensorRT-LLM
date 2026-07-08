@@ -12,8 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""ChatGLM3-6B decoder for the PyTorch backend."""
-
 from typing import Optional
 
 import torch
@@ -36,8 +34,6 @@ from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto
 
 
 class ChatGLMAttention(Attention):
-    """Fused-QKV attention with partial interleaved RoPE."""
-
     def __init__(
         self,
         model_config: ModelConfig[PretrainedConfig],
@@ -74,8 +70,6 @@ class ChatGLMAttention(Attention):
 
 
 class ChatGLMDecoderLayer(DecoderLayer):
-    """Pre-norm attention plus SwiGLU MLP block."""
-
     def __init__(
         self,
         model_config: ModelConfig[PretrainedConfig],
@@ -198,7 +192,6 @@ class ChatGLMForCausalLM(DecoderModelForCausalLM[ChatGLMModel, PretrainedConfig]
         )
 
     def load_weights(self, weights: dict[str, torch.Tensor], weight_mapper=None):
-        """Rename ChatGLM HF weights to the standard TensorRT-LLM names."""
         config = self.config
         head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         q_dim = config.num_attention_heads * head_dim

@@ -12,8 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""ChatGLM3-6B attention backend tests."""
-
 import os
 
 import pytest
@@ -143,7 +141,6 @@ def _cos(a, b):
 
 
 def _replay_decode_logits_under_cuda_graph(model, gen_ids, dec_pos, dec_metadata):
-    """Capture full-model decode in a CUDA graph and return replayed logits."""
     cg_md = dec_metadata.create_cuda_graph_metadata(1)
     cg_md.seq_lens = torch.tensor([1], dtype=torch.int)
     cg_md.num_contexts = 0
