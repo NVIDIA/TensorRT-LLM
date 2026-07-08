@@ -34,7 +34,7 @@ This mirrors the Triton reference backend's
 from __future__ import annotations
 
 import functools
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, ClassVar, Optional, Tuple
 
 import torch
 
@@ -51,6 +51,7 @@ from .metadata import MiniMaxM3SparseConfig, build_m3_sparse_metadata_and_plans
 
 if TYPE_CHECKING:
     from .metadata import MiniMaxM3SparseAttentionMetadata
+    from .msa_plan_cache import MsaPlanCacheGeometry
 
 
 def _whole_batch_lens(
@@ -112,7 +113,7 @@ def get_minimax_m3_msa_attention_backend_cls():
 
         # Published by the model layer's first sparse forward. Set on the
         # class so CUDA-graph metadata clones see it before capture.
-        _msa_geometry = None
+        _msa_geometry: ClassVar[Optional["MsaPlanCacheGeometry"]] = None
 
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
@@ -316,11 +317,10 @@ def get_minimax_m3_msa_attention_backend_cls():
             head_dim: int,
             num_kv_heads: Optional[int] = None,
             quant_config=None,
-            sparse_params=None,
+            *,
+            sparse_params,
             **kwargs,
         ):
-            if sparse_params is None:
-                raise ValueError("sparse_params is required for MiniMaxM3MSATrtllmAttention")
             TrtllmAttention.__init__(
                 self,
                 layer_idx,
