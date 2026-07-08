@@ -169,6 +169,8 @@ full:B200/disaggregated/test_disaggregated.py::test_disaggregated_stress_test[in
 full:B200/perf/test_perf.py::test_perf[quant:int8_sq_per_tensor] SKIP (https://nvbugs/5161074)
 full:B200/perf/test_perf.py::test_perf[quant:int8_sq_per_token_channel] SKIP (https://nvbugs/5161074)
 full:B200/perf/test_perf.py::test_perf[quant:w4a8_awq] SKIP (https://nvbugs/5161074)
+full:B200/test_e2e.py::test_multi_nodes_eval[Qwen3/Qwen3-235B-A22B-tp16-mmlu] SKIP (https://nvbugs/6424188)
+full:B200/test_e2e.py::test_multi_nodes_eval[Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf-tp16-mmlu] SKIP (https://nvbugs/6424188)
 full:B300/accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype_with_helix[fifo_v1-cudagraph:with_padding-pp1tp1cp4] SKIP (https://nvbugs/6410881)
 full:B300/accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype_with_helix[fifo_v2-cudagraph:with_padding-pp1tp1cp4] SKIP (https://nvbugs/6410881)
 full:B300/accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype_with_helix[fifo_v2-cudagraph:with_padding-pp1tp2cp2] SKIP (https://nvbugs/6410881)
