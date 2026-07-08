@@ -3513,7 +3513,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     @classmethod
     def validate_free_gpu_memory_fraction(cls, v: float):
         """Validates that the fraction is between 0.0 and 1.0."""
-        if v is not None and not 0 <= v <= 1:
+        if not 0 <= v <= 1:
             raise ValueError(
                 "kv_cache_config.free_gpu_memory_fraction must be a float between 0 and 1"
             )

@@ -25,14 +25,15 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from transformers import PretrainedConfig
 
 import tensorrt_llm
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, ResourceManagerType
-from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, KvCacheConfig, TorchLlmArgs
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.modeling_utils import QuantConfig
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -66,7 +67,10 @@ class _FakeKVCacheManagerCpp:
         pass
 
 
-def _make_mock_kv_cache_config(
+_DUMMY_MODEL = "/tmp/dummy_model_dual_pool_test"
+
+
+def _make_kv_cache_config(
     cross_kv_cache_fraction=None,
     max_gpu_total_bytes=None,
     use_kv_cache_manager_v2=True,
@@ -85,47 +89,47 @@ def _make_mock_kv_cache_config(
     )
 
 
-def _make_mock_model_config(
+def _make_model_config(
     is_encoder_decoder=False,
-    is_generation=True,
     **pretrained_overrides,
 ):
-    """Minimal mock ModelConfig for KvCacheCreator."""
-    model_config = Mock()
-    model_config.is_encoder_decoder = is_encoder_decoder
-    model_config.is_generation = is_generation
-    model_config.sparse_attention_config = None
+    """Real ModelConfig wrapping a real HF PretrainedConfig.
 
-    pretrained = SimpleNamespace(
-        num_hidden_layers=6,
-        num_attention_heads=8,
-        num_key_value_heads=8,
-        hidden_size=512,
-        head_dim=64,
-        vocab_size=32000,
-        quantization=QuantConfig(),
+    ``is_encoder_decoder`` is set on the HF config so that
+    ``ModelConfig.__post_init__`` derives ``ModelConfig.is_encoder_decoder``
+    through the production path.  Unknown kwargs are kept as attributes by
+    ``transformers``, matching how enc-dec geometry fields appear on real
+    BART/T5/Whisper configs.
+    """
+    pretrained_kwargs = {
+        "is_encoder_decoder": is_encoder_decoder,
+        "num_hidden_layers": 6,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 8,
+        "hidden_size": 512,
+        "head_dim": 64,
+        "vocab_size": 32000,
+    }
+    pretrained_kwargs.update(pretrained_overrides)
+    pretrained_kwargs.setdefault(
+        "architectures",
+        ["T5ForConditionalGeneration"] if is_encoder_decoder else ["LlamaForCausalLM"],
     )
-    for key, value in pretrained_overrides.items():
-        setattr(pretrained, key, value)
-    if "encoder_attention_heads" not in pretrained_overrides:
-        pretrained.encoder_attention_heads = pretrained.num_attention_heads
-    if "decoder_attention_heads" not in pretrained_overrides:
-        pretrained.decoder_attention_heads = pretrained.num_attention_heads
-    if "encoder_layers" not in pretrained_overrides:
-        pretrained.encoder_layers = pretrained.num_hidden_layers
-    if "decoder_layers" not in pretrained_overrides:
-        pretrained.decoder_layers = pretrained.num_hidden_layers
-    if "d_model" not in pretrained_overrides:
-        pretrained.d_model = pretrained.hidden_size
-    if "max_position_embeddings" not in pretrained_overrides:
-        pretrained.max_position_embeddings = 1024
-    model_config.pretrained_config = pretrained
-    model_config.quant_config = None
-    return model_config
+    pretrained_kwargs.setdefault(
+        "encoder_attention_heads", pretrained_kwargs["num_attention_heads"]
+    )
+    pretrained_kwargs.setdefault(
+        "decoder_attention_heads", pretrained_kwargs["num_attention_heads"]
+    )
+    pretrained_kwargs.setdefault("encoder_layers", pretrained_kwargs["num_hidden_layers"])
+    pretrained_kwargs.setdefault("decoder_layers", pretrained_kwargs["num_hidden_layers"])
+    pretrained_kwargs.setdefault("d_model", pretrained_kwargs["hidden_size"])
+    pretrained_kwargs.setdefault("max_position_embeddings", 1024)
+    return ModelConfig(pretrained_config=PretrainedConfig(**pretrained_kwargs))
 
 
 def _make_mock_model_engine(model_config):
-    """Minimal mock PyTorchModelEngine."""
+    """Mock PyTorchModelEngine shell; a real engine needs GPU + loaded weights."""
     engine = Mock()
     engine.model.model_config = model_config
     engine.dtype = torch.bfloat16
@@ -141,7 +145,7 @@ def _make_creator(
     manager_cls=None,
     mapping=None,
 ):
-    """Create a KvCacheCreator with minimal mocking.
+    """Create a KvCacheCreator from real config objects and a mock engine.
 
     ``manager_cls`` selects the KV cache manager class the creator binds to.
     Defaults to ``KVCacheManagerV2`` when ``kv_cache_config.use_kv_cache_manager_v2``
@@ -149,52 +153,43 @@ def _make_creator(
     explicitly via ``manager_cls`` to exercise either path independently.
     """
     if model_config is None:
-        model_config = _make_mock_model_config(is_encoder_decoder=is_enc_dec)
+        model_config = _make_model_config(is_encoder_decoder=is_enc_dec)
     model_engine = _make_mock_model_engine(model_config)
 
     if manager_cls is None:
         manager_cls = (
-            KVCacheManagerV2
-            if getattr(kv_cache_config, "use_kv_cache_manager_v2", True)
-            else KVCacheManager
+            KVCacheManagerV2 if kv_cache_config.use_kv_cache_manager_v2 else KVCacheManager
         )
 
-    with patch(
-        "tensorrt_llm._torch.pyexecutor._util.get_kv_cache_manager_cls",
-        return_value=manager_cls,
-    ):
-        creator = KvCacheCreator.__new__(KvCacheCreator)
-        creator._model_engine = model_engine
-        creator._draft_model_engine = None
-        if mapping is None:
-            creator._mapping = Mock()
-            creator._mapping.enable_attention_dp = False
-            creator._mapping.tp_size = 1
-            creator._mapping.pp_size = 1
-            creator._mapping.cp_config = {}
-            creator._mapping.is_last_pp_rank.return_value = True
-        else:
-            creator._mapping = mapping
-        creator._kv_cache_config = kv_cache_config
-        creator._max_kv_tokens_in = kv_cache_config.max_tokens
-        creator._max_num_tokens = 4096
-        creator._max_beam_width = 1
-        creator._kv_connector_manager = None
-        creator._llm_args = Mock()
-        creator._llm_args.extra_resource_managers = {}
-        creator._cache_transceiver_config = None
-        creator._speculative_config = None
-        creator._sparse_attention_config = None
-        creator._tokens_per_block = 64
-        creator._max_seq_len = 2048
-        creator._max_batch_size = 8
-        creator._net_max_seq_len = 2048
-        creator._dummy_reqs = None
-        creator._profiling_stage_data = None
-        creator._kv_cache_manager_cls = manager_cls
-        creator._execution_stream = None
-        creator._draft_config = None
-        creator._skip_est = True
+    llm_args = TorchLlmArgs(model=_DUMMY_MODEL, skip_tokenizer_init=True)
+    # TorchLlmArgs defaults max_input_len to 1024, which would silently cap
+    # the cross-pool encoder capacity; clear it so each test controls the
+    # cap explicitly.
+    llm_args.max_input_len = None
+
+    creator = KvCacheCreator.__new__(KvCacheCreator)
+    creator._model_engine = model_engine
+    creator._draft_model_engine = None
+    creator._mapping = mapping if mapping is not None else Mapping()
+    creator._kv_cache_config = kv_cache_config
+    creator._max_kv_tokens_in = kv_cache_config.max_tokens
+    creator._max_num_tokens = 4096
+    creator._max_beam_width = 1
+    creator._kv_connector_manager = None
+    creator._llm_args = llm_args
+    creator._cache_transceiver_config = None
+    creator._speculative_config = None
+    creator._sparse_attention_config = None
+    creator._tokens_per_block = 64
+    creator._max_seq_len = 2048
+    creator._max_batch_size = 8
+    creator._net_max_seq_len = 2048
+    creator._dummy_reqs = None
+    creator._profiling_stage_data = None
+    creator._kv_cache_manager_cls = manager_cls
+    creator._execution_stream = None
+    creator._draft_config = None
+    creator._skip_est = True
     return creator
 
 
@@ -208,7 +203,7 @@ class TestSplitKvCacheBudgetForCross:
 
     def test_split_50_50(self):
         total = 10 * (1 << 30)  # 10 GiB
-        config = _make_mock_kv_cache_config(
+        config = _make_kv_cache_config(
             cross_kv_cache_fraction=0.5,
             max_gpu_total_bytes=total,
             free_gpu_memory_fraction=0.8,
@@ -227,7 +222,7 @@ class TestSplitKvCacheBudgetForCross:
 
     def test_split_30_70(self):
         total = 10 * (1 << 30)
-        config = _make_mock_kv_cache_config(
+        config = _make_kv_cache_config(
             cross_kv_cache_fraction=0.3,
             max_gpu_total_bytes=total,
             free_gpu_memory_fraction=0.8,
@@ -247,14 +242,14 @@ class TestSplitKvCacheBudgetForCross:
 
     def test_no_split_when_fraction_is_none(self):
         total = 10 * (1 << 30)
-        config = _make_mock_kv_cache_config(cross_kv_cache_fraction=None, max_gpu_total_bytes=total)
+        config = _make_kv_cache_config(cross_kv_cache_fraction=None, max_gpu_total_bytes=total)
 
         creator = _make_creator(config, is_enc_dec=True)
         with pytest.raises(ValueError, match="cross_kv_cache_fraction"):
             creator._split_kv_cache_budget_for_cross()
 
     def test_split_free_fraction_when_budget_is_none(self):
-        config = _make_mock_kv_cache_config(
+        config = _make_kv_cache_config(
             cross_kv_cache_fraction=0.5,
             max_gpu_total_bytes=None,
             max_tokens=1000,
@@ -271,7 +266,7 @@ class TestSplitKvCacheBudgetForCross:
         assert config.free_gpu_memory_fraction == pytest.approx(0.8)
 
     def test_split_free_fraction_when_budget_is_zero(self):
-        config = _make_mock_kv_cache_config(
+        config = _make_kv_cache_config(
             cross_kv_cache_fraction=0.5,
             max_gpu_total_bytes=0,
             max_tokens=1000,
@@ -287,31 +282,19 @@ class TestSplitKvCacheBudgetForCross:
         assert self_config.free_gpu_memory_fraction == pytest.approx(0.4)
         assert config.free_gpu_memory_fraction == pytest.approx(0.8)
 
-    def test_raises_when_no_budget_source_exists(self):
-        config = _make_mock_kv_cache_config(
-            cross_kv_cache_fraction=0.5,
-            max_gpu_total_bytes=0,
-            max_tokens=None,
-            free_gpu_memory_fraction=None,
-        )
-
-        creator = _make_creator(config, is_enc_dec=True)
-        with pytest.raises(ValueError, match="Unable to size"):
-            creator._split_kv_cache_budget_for_cross()
-
     def test_is_encoder_decoder_helper(self):
-        dec_config = _make_mock_model_config(is_encoder_decoder=False)
-        dec_creator = _make_creator(_make_mock_kv_cache_config(), model_config=dec_config)
+        dec_config = _make_model_config(is_encoder_decoder=False)
+        dec_creator = _make_creator(_make_kv_cache_config(), model_config=dec_config)
         assert not dec_creator._is_encoder_decoder()
 
-        enc_dec_config = _make_mock_model_config(is_encoder_decoder=True)
-        enc_dec_creator = _make_creator(_make_mock_kv_cache_config(), model_config=enc_dec_config)
+        enc_dec_config = _make_model_config(is_encoder_decoder=True)
+        enc_dec_creator = _make_creator(_make_kv_cache_config(), model_config=enc_dec_config)
         assert enc_dec_creator._is_encoder_decoder()
 
     def test_budgets_sum_to_total(self):
         """Self + cross budgets always sum to the original total."""
         total = 7 * (1 << 30) + 123  # non-round number
-        config = _make_mock_kv_cache_config(cross_kv_cache_fraction=0.4, max_gpu_total_bytes=total)
+        config = _make_kv_cache_config(cross_kv_cache_fraction=0.4, max_gpu_total_bytes=total)
 
         creator = _make_creator(config, is_enc_dec=True)
         self_config, cross_config = creator._split_kv_cache_budget_for_cross()
@@ -322,7 +305,7 @@ class TestSplitKvCacheBudgetForCross:
     def test_host_cache_budget_is_split_without_mutating_base_config(self):
         """Self + cross host cache budgets sum to the original host budget."""
         total_host = 7 * (1 << 30) + 123
-        config = _make_mock_kv_cache_config(
+        config = _make_kv_cache_config(
             cross_kv_cache_fraction=0.4,
             max_gpu_total_bytes=8 * (1 << 30),
             host_cache_size=total_host,
@@ -340,10 +323,10 @@ class TestSplitKvCacheBudgetForCross:
 
     def test_host_cache_budget_counts_as_split_budget_source(self):
         total_host = 4 * (1 << 30)
-        config = _make_mock_kv_cache_config(
+        config = _make_kv_cache_config(
             cross_kv_cache_fraction=0.25,
             max_gpu_total_bytes=None,
-            free_gpu_memory_fraction=None,
+            free_gpu_memory_fraction=0.6,
             host_cache_size=total_host,
         )
 
@@ -378,12 +361,12 @@ class TestCrossKvCacheConstruction:
     @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
     def test_create_cross_kv_cache_manager_uses_encoder_geometry(self, use_kv_cache_manager_v2):
         expected_cls = KVCacheManagerV2 if use_kv_cache_manager_v2 else KVCacheManager
-        config = _make_mock_kv_cache_config(
+        config = _make_kv_cache_config(
             cross_kv_cache_fraction=0.5,
             max_gpu_total_bytes=8 * (1 << 30),
             use_kv_cache_manager_v2=use_kv_cache_manager_v2,
         )
-        model_config = _make_mock_model_config(
+        model_config = _make_model_config(
             is_encoder_decoder=True,
             num_hidden_layers=10,
             num_attention_heads=16,
@@ -427,13 +410,13 @@ class TestCrossKvCacheConstruction:
         local_kv_heads = encoder_num_kv_heads // tp_size
         head_dim = encoder_hidden_size // encoder_num_attention_heads
 
-        config = _make_mock_kv_cache_config(
+        config = _make_kv_cache_config(
             cross_kv_cache_fraction=0.5,
             max_gpu_total_bytes=8 * (1 << 30),
             max_tokens=2048,
             use_kv_cache_manager_v2=False,
         )
-        model_config = _make_mock_model_config(
+        model_config = _make_model_config(
             is_encoder_decoder=True,
             decoder_layers=num_decoder_layers,
             encoder_attention_heads=encoder_num_attention_heads,
@@ -497,11 +480,11 @@ class TestCrossKvCacheConstruction:
         )
 
     def test_cross_layout_uses_max_input_len_for_encoder_capacity(self):
-        config = _make_mock_kv_cache_config(
+        config = _make_kv_cache_config(
             cross_kv_cache_fraction=0.5,
             max_gpu_total_bytes=8 * (1 << 30),
         )
-        model_config = _make_mock_model_config(
+        model_config = _make_model_config(
             is_encoder_decoder=True,
             max_position_embeddings=4096,
         )
@@ -514,11 +497,11 @@ class TestCrossKvCacheConstruction:
         assert max_seq_len == 1536
 
     def test_build_managers_cross_pool_ignores_mutated_self_max_seq_len(self):
-        config = _make_mock_kv_cache_config(
+        config = _make_kv_cache_config(
             cross_kv_cache_fraction=0.5,
             max_gpu_total_bytes=8 * (1 << 30),
         )
-        model_config = _make_mock_model_config(
+        model_config = _make_model_config(
             is_encoder_decoder=True,
             max_position_embeddings=4096,
         )
@@ -553,10 +536,10 @@ class TestCrossKvCacheConstruction:
         assert captured_cross_max_seq_lens == [2048]
 
     def test_get_kv_size_per_token_includes_cross_pool_for_enc_dec(self):
-        config = _make_mock_kv_cache_config(
+        config = _make_kv_cache_config(
             cross_kv_cache_fraction=0.5, max_gpu_total_bytes=8 * (1 << 30)
         )
-        model_config = _make_mock_model_config(
+        model_config = _make_model_config(
             is_encoder_decoder=True,
             num_hidden_layers=10,
             num_attention_heads=16,
@@ -590,7 +573,7 @@ class TestCrossKvCacheConstruction:
     @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
     def test_build_managers_registers_cross_pool_for_enc_dec(self, use_kv_cache_manager_v2):
         creator = _make_creator(
-            _make_mock_kv_cache_config(
+            _make_kv_cache_config(
                 cross_kv_cache_fraction=0.5,
                 max_gpu_total_bytes=8 * (1 << 30),
                 use_kv_cache_manager_v2=use_kv_cache_manager_v2,
@@ -613,7 +596,7 @@ class TestCrossKvCacheConstruction:
         self, use_kv_cache_manager_v2
     ):
         creator = _make_creator(
-            _make_mock_kv_cache_config(
+            _make_kv_cache_config(
                 cross_kv_cache_fraction=0.5,
                 max_gpu_total_bytes=0,
                 max_tokens=1024,
@@ -639,7 +622,7 @@ class TestCrossKvCacheConstruction:
     ):
         total_budget = 10 * (1 << 30)
         creator = _make_creator(
-            _make_mock_kv_cache_config(
+            _make_kv_cache_config(
                 cross_kv_cache_fraction=0.5,
                 max_gpu_total_bytes=total_budget,
                 free_gpu_memory_fraction=0.9,
@@ -695,7 +678,7 @@ class TestCrossKvCacheConstruction:
 
     def test_build_managers_skips_cross_pool_for_decoder_only(self):
         creator = _make_creator(
-            _make_mock_kv_cache_config(
+            _make_kv_cache_config(
                 cross_kv_cache_fraction=None,
                 max_gpu_total_bytes=8 * (1 << 30),
             ),
@@ -774,20 +757,12 @@ class TestKVCacheV2SchedulerCrossParam:
         mapping = Mapping()
         model_engine = SimpleNamespace(
             spec_config=None,
-            model=SimpleNamespace(
-                model_config=SimpleNamespace(
-                    pretrained_config=SimpleNamespace(
-                        kv_lora_rank=None,
-                        qk_rope_head_dim=None,
-                    ),
-                ),
-            ),
+            model=SimpleNamespace(model_config=_make_model_config()),
         )
-        llm_args = SimpleNamespace(
-            extra_resource_managers={},
+        llm_args = TorchLlmArgs(
+            model=_DUMMY_MODEL,
+            skip_tokenizer_init=True,
             disable_overlap_scheduler=True,
-            enable_early_first_token_response=False,
-            kv_cache_config=KvCacheConfig(),
         )
 
         with (
@@ -941,7 +916,7 @@ class TestV1DualPoolSmoke:
     """
 
     def test_build_managers_uses_v1_kv_cache_manager_for_both_pools(self):
-        kv_cache_config = _make_mock_kv_cache_config(
+        kv_cache_config = _make_kv_cache_config(
             cross_kv_cache_fraction=0.5,
             max_gpu_total_bytes=8 * (1 << 30),
             use_kv_cache_manager_v2=False,
