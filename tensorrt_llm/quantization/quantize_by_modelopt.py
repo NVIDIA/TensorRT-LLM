@@ -789,6 +789,35 @@ def combine_medusa_weight(tp_size, pp_size, base_model_output_dir,
     logger.info("Combine medusa heads' weight, done.")
 
 
+def override_smoothquant_alpha(quant_cfg: dict, qformat: str,
+                               smoothquant_alpha: float | None) -> dict:
+    """Override the SmoothQuant migration strength (alpha) in ``quant_cfg`` when requested.
+
+    A user-specified ``smoothquant_alpha`` (from ``--smoothquant_alpha``) replaces ModelOpt's
+    default (alpha=1.0) and the Gemma special case, for the ``int8_sq`` qformat only. The dict is
+    deep-copied first so the input (e.g. a shared ModelOpt preset) is never mutated. No-op that
+    returns ``quant_cfg`` unchanged when ``smoothquant_alpha`` is None or the qformat is not
+    int8_sq. Range validation is intentionally left to the CLI (``--smoothquant_alpha``); this
+    helper applies whatever value it is given.
+
+    Args:
+        quant_cfg: The ModelOpt quantization config dict to potentially override.
+        qformat: The quantization format string (e.g. ``"int8_sq"``).
+        smoothquant_alpha: User-specified alpha, or ``None`` to keep the defaults.
+
+    Returns:
+        The input ``quant_cfg`` unchanged (no-op case), or a deep-copied dict with
+        ``algorithm`` set to the requested SmoothQuant alpha.
+    """
+    if smoothquant_alpha is not None and "int8_sq" in qformat:
+        quant_cfg = copy.deepcopy(quant_cfg)
+        quant_cfg["algorithm"] = {
+            "method": "smoothquant",
+            "alpha": smoothquant_alpha
+        }
+    return quant_cfg
+
+
 def quantize_and_export(*,
                         model_dir,
                         device,
@@ -814,7 +843,8 @@ def quantize_and_export(*,
                         quant_medusa_head=None,
                         auto_quantize_bits=None,
                         device_map="auto",
-                        quantize_lm_head=False):
+                        quantize_lm_head=False,
+                        smoothquant_alpha=None):
     '''
         Load model from the model_dir, call Modelopt to quantize the model, and then export
         the quantized model as TRT-LLM checkpoint
@@ -882,12 +912,15 @@ def quantize_and_export(*,
         quant_cfg = None
         if not auto_quantize_bits:
             if qformat in quant_cfg_choices():
-                quant_cfg = quant_cfg_choices()[qformat]
+                # Deep-copy the selected preset: the values in quant_cfg_choices() are
+                # ModelOpt's shared module-level config dicts, and the in-place updates
+                # below (kv-cache, Gemma alpha, lm_head) must not leak into later
+                # quantize calls in the same process.
+                quant_cfg = copy.deepcopy(quant_cfg_choices()[qformat])
             else:
                 raise ValueError(f"Unsupported quantization format: {qformat}")
 
             if "awq" in qformat:
-                quant_cfg = copy.deepcopy(quant_cfg_choices()[qformat])
                 weight_quantizer = quant_cfg["quant_cfg"]["*weight_quantizer"]
                 if isinstance(weight_quantizer, list):
                     weight_quantizer = weight_quantizer[0]
@@ -912,6 +945,11 @@ def quantize_and_export(*,
             # Gemma 7B has accuracy regression using alpha 1. We set 0.5 instead.
             if model_type == "gemma" and "int8_sq" in qformat:
                 quant_cfg["algorithm"] = {"method": "smoothquant", "alpha": 0.5}
+
+            # A user-specified SmoothQuant alpha (--smoothquant_alpha) overrides the defaults
+            # above (ModelOpt's alpha=1.0, or the Gemma special case).
+            quant_cfg = override_smoothquant_alpha(quant_cfg, qformat,
+                                                   smoothquant_alpha)
 
             if qformat == 'fp8' and quantize_lm_head:
                 print_rank_0("Quantizing lm_head layer")
