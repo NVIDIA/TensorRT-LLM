@@ -216,3 +216,109 @@ def test_submit_rechecks_engine_death_after_registration(monkeypatch):
 
     # The raced result must not be left dangling in _results.
     assert 42 not in proxy._results
+
+
+# --- Remote (TLLM_SPAWN_PROXY_PROCESS / trtllm-llmapi-launch) mode coverage ---
+# RemoteMpiCommSessionClient.submit() returns no futures, so worker death must
+# travel server -> client as a RemoteWorkerDeath over the control socket and be
+# surfaced by the proxy's _check_remote_worker_death().
+
+
+def test_remote_worker_death_roundtrip():
+    from tensorrt_llm.llmapi.mpi_session import RemoteWorkerDeath
+
+    death = RemoteWorkerDeath.from_exception(ValueError("rank 3 exploded"))
+    exc = death.to_exception()
+    assert isinstance(exc, RuntimeError)
+    assert "ValueError" in str(exc)
+    assert "rank 3 exploded" in str(exc)
+
+
+def test_server_async_callback_forwards_only_failures():
+    from concurrent.futures import Future
+
+    from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionServer, RemoteWorkerDeath
+
+    server = object.__new__(RemoteMpiCommSessionServer)
+    sent = []
+    server.queue = type("Q", (), {"put": lambda self, m: sent.append(m)})()
+
+    ok = Future()
+    ok.set_result(42)
+    server.mpi_async_error_callback(ok)
+    assert sent == []
+
+    cancelled = Future()
+    cancelled.cancel()
+    server.mpi_async_error_callback(cancelled)
+    assert sent == []
+
+    failed = Future()
+    failed.set_exception(RuntimeError("worker segfault"))
+    server.mpi_async_error_callback(failed)
+    assert len(sent) == 1 and isinstance(sent[0], RemoteWorkerDeath)
+    assert sent[0].message == "worker segfault"
+
+
+class _FakeZmqQueue:
+    """poll()/get() stub fed with a fixed message sequence."""
+
+    def __init__(self, messages):
+        self._messages = list(messages)
+
+    def poll(self, timeout):
+        return bool(self._messages)
+
+    def get(self):
+        return self._messages.pop(0)
+
+
+def _bare_remote_client(messages):
+    from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionClient
+
+    client = object.__new__(RemoteMpiCommSessionClient)  # bypass singleton
+    client._is_shutdown = False
+    client._pending_responses = []
+    client.queue = _FakeZmqQueue(messages)
+    return client
+
+
+def test_client_check_worker_error_returns_death_and_buffers_others():
+    from tensorrt_llm.llmapi.mpi_session import RemoteWorkerDeath
+
+    death = RemoteWorkerDeath.from_exception(RuntimeError("boom"))
+    client = _bare_remote_client([[1, 2, 3], death])
+
+    exc = client.check_worker_error()
+    assert isinstance(exc, RuntimeError) and "boom" in str(exc)
+    # The non-error message was buffered for poll() (submit_sync path).
+    assert client.poll() == [1, 2, 3]
+    # Nothing left.
+    assert client.check_worker_error() is None
+
+
+def test_proxy_check_remote_worker_death_marks_engine_dead():
+    proxy = _bare_proxy()
+    proxy._fatal_error = None
+    proxy._error_queue = _queue.Queue()
+    proxy.doing_shutdown = False
+    pre_shutdowns = []
+    proxy.pre_shutdown = lambda: pre_shutdowns.append(1)
+    r = _FakeResult()
+    proxy._results = {1: r}
+
+    death_exc = RuntimeError("Remote MPI worker died: X: boom")
+    proxy.mpi_session = type("S", (), {"check_worker_error": lambda self: death_exc})()
+
+    assert proxy._check_remote_worker_death() is True
+    # Same fast-death behavior as the local-futures path:
+    assert proxy._engine_dead is True
+    assert isinstance(r.queue.get_nowait(), EngineDeadError)
+    assert proxy._fatal_error is death_exc
+    assert proxy._error_queue.get_nowait() is death_exc
+    assert pre_shutdowns == [1]
+
+    # Sessions without the hook (MpiPoolSession) are a no-op.
+    proxy2 = _bare_proxy()
+    proxy2.mpi_session = object()
+    assert proxy2._check_remote_worker_death() is False

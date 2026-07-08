@@ -285,24 +285,61 @@ class GenerationExecutorProxy(GenerationExecutor):
         self._error_queue.put_nowait(error)
         self._mark_engine_dead(error)
 
+    def _check_remote_worker_death(self) -> bool:
+        """Poll a remote (pre-spawned) MPI session for forwarded worker deaths.
+
+        Under ``TLLM_SPAWN_PROXY_PROCESS=1`` / ``trtllm-llmapi-launch`` the
+        session is a ``RemoteMpiCommSessionClient`` whose ``submit()`` returns
+        no futures, so the ``mpi_done_callback`` path never fires and
+        ``_check_mpi_futures()`` has nothing to watch. The remote server
+        forwards worker exceptions over its control socket instead
+        (``RemoteWorkerDeath``); surface them here into the same fast-death
+        path so this deployment mode gets identical EngineDeadError behavior.
+
+        Returns:
+            True if a dead worker was detected.
+        """
+        check = getattr(self.mpi_session, "check_worker_error", None)
+        if check is None:
+            return False
+        try:
+            error = check()
+        except Exception as exc:  # noqa: BLE001 - monitor must not die
+            logger.debug(f"check_worker_error failed (ignored): {exc!r}")
+            return False
+        if error is None:
+            return False
+        logger.error(f"Remote MPI worker death reported: {error!r}")
+        self._handle_worker_death(error)
+        self._set_fatal_error(error)
+        if not self.doing_shutdown:
+            self.pre_shutdown()
+        return True
+
     def _error_monitor_loop(self) -> None:
         """Background thread that reaps a dead engine and drives pre_shutdown.
 
-        Checks MPI worker futures and drains the error queue using
-        the shared ``_check_mpi_futures()`` and ``_drain_error_queue()``
-        helpers.
+        Checks MPI worker futures, remote-session worker-death notifications,
+        and the error queue using the shared ``_check_mpi_futures()``,
+        ``_check_remote_worker_death()`` and ``_drain_error_queue()`` helpers.
 
         Propagation to pending requests is event-driven via
-        ``_handle_worker_death`` (the MPI future done-callback), so this loop is
-        only the backstop that records the fatal error and runs pre_shutdown; a
-        coarse poll interval is therefore fine. Uses ``_shutdown_event`` for
-        clean wakeup instead of a sleep loop, so shutdown is immediate.
+        ``_handle_worker_death`` (the MPI future done-callback) where futures
+        exist; for remote sessions it is bounded by this loop's poll interval.
+        Uses ``_shutdown_event`` for clean wakeup instead of a sleep loop, so
+        shutdown is immediate.
         """
         while not self.doing_shutdown and self._fatal_error is None:
             try:
                 if self._check_mpi_futures():
                     logger.error("Error monitor: MPI worker crash detected, "
                                  "shutting down")
+                    return
+
+                if self._check_remote_worker_death():
+                    logger.error(
+                        "Error monitor: remote MPI worker death detected, "
+                        "shutting down")
                     return
 
                 self._drain_error_queue()

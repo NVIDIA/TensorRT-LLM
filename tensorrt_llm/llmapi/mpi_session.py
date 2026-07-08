@@ -302,6 +302,26 @@ class RemoteTask(NamedTuple):
     sync: bool = False  # if True, the result will be sent back to the client
 
 
+class RemoteWorkerDeath(NamedTuple):
+    """Worker-death notification forwarded by RemoteMpiCommSessionServer.
+
+    Async (fire-and-forget) task submissions have no result channel, so a
+    crashed worker would otherwise be invisible to the client and pending
+    requests would block forever. The exception is carried as strings (not
+    the exception object) because arbitrary exceptions may not pickle.
+    """
+    exc_type: str
+    message: str
+
+    @classmethod
+    def from_exception(cls, e: BaseException) -> "RemoteWorkerDeath":
+        return cls(exc_type=type(e).__name__, message=str(e))
+
+    def to_exception(self) -> RuntimeError:
+        return RuntimeError(
+            f"Remote MPI worker died: {self.exc_type}: {self.message}")
+
+
 class RemoteMpiCommSessionClient(MpiSession):
     '''
     RemoteMpiCommSessionClient is a variant of MpiCommSession that is used to connect to a remote MPI pool.
@@ -344,6 +364,9 @@ class RemoteMpiCommSessionClient(MpiSession):
                                  socket_type=zmq.PAIR,
                                  use_hmac_encryption=True)
         self._is_shutdown = False
+        # Non-error messages consumed by check_worker_error() while scanning
+        # for RemoteWorkerDeath are buffered here for poll() (submit_sync).
+        self._pending_responses: list = []
         self._initialized = True
 
     def submit(self,
@@ -388,10 +411,32 @@ class RemoteMpiCommSessionClient(MpiSession):
         '''
         if self._is_shutdown:
             return False
+        if self._pending_responses:
+            return self._pending_responses.pop(0)
         response = self.queue.poll(0.1)
         if response:
             return self.queue.get()  # should get a True if success
         return False
+
+    def check_worker_error(self) -> Optional[BaseException]:
+        """Non-blockingly fetch a worker-death notification, if any.
+
+        RemoteMpiCommSessionServer forwards a RemoteWorkerDeath when an async
+        (fire-and-forget) worker future fails -- the only error channel in
+        this mode, since submit() returns no futures for the client to watch.
+        Non-error messages encountered while scanning are buffered for poll().
+        """
+        if self._is_shutdown:
+            return None
+        try:
+            while self.queue.poll(0):
+                msg = self.queue.get()
+                if isinstance(msg, RemoteWorkerDeath):
+                    return msg.to_exception()
+                self._pending_responses.append(msg)
+        except Exception as e:
+            logger_debug(f"check_worker_error poll failed: {e}\n", "grey")
+        return None
 
     def abort(self):
         self.shutdown()
@@ -520,9 +565,36 @@ class RemoteMpiCommSessionServer():
                 assert len(futures) == self.num_results == mpi_world_size()
                 # Store futures to wait for them before the next task
                 pending_futures = list(futures)
-                if message.sync:
-                    for future in futures:
+                for future in futures:
+                    if message.sync:
                         future.add_done_callback(self.mpi_future_callback)
+                    else:
+                        # Fire-and-forget tasks have no result channel, but a
+                        # crashed worker must still reach the client (the
+                        # client-side session has no futures to watch); see
+                        # RemoteWorkerDeath.
+                        future.add_done_callback(self.mpi_async_error_callback)
+
+    def mpi_async_error_callback(self, future):
+        """Forward a worker exception to the client for async tasks.
+
+        Runs on the executor's callback thread, like the existing sync-path
+        mpi_future_callback (same pre-existing cross-thread ZMQ-put pattern).
+        Best-effort: the socket may already be closed at shutdown.
+        """
+        if future.cancelled():
+            return
+        exc = future.exception()
+        if exc is None:
+            return
+        print_colored(
+            f"RemoteMpiCommSessionServer: async MPI worker failed, forwarding "
+            f"to client: {type(exc).__name__}: {exc}\n", "red")
+        try:
+            self.queue.put(RemoteWorkerDeath.from_exception(exc))
+        except Exception as e:
+            logger_debug(f"Failed to forward worker death to client: {e}\n",
+                         "red")
 
     def mpi_future_callback(self, future):
         logger_debug(f"rank{global_mpi_rank()} got future: {future}\n", "red")
