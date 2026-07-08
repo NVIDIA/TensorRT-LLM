@@ -3966,7 +3966,9 @@ class PyExecutor:
                                      LlmRequestState.DISAGG_GENERATION_INIT):
                     continue
 
-                req.py_last_draft_tokens = req.py_draft_tokens
+                # Skip DISAGG_GENERATION_INIT: snapshotting the dummy py_draft_tokens leaks stale state into the first real draft.
+                if req.state == LlmRequestState.GENERATION_IN_PROGRESS:
+                    req.py_last_draft_tokens = req.py_draft_tokens
 
                 if self.max_total_draft_tokens > 0 and self.use_spec_decode and not req.py_disable_speculative_decoding:
                     req.py_draft_tokens = [0] * self.max_total_draft_tokens
