@@ -1,17 +1,18 @@
-"""ChatGLM3-6B attention-backend tests on the TRTLLM backend + KVCacheManagerV2.
-
-* ``source_activation_replay`` — capture the hidden states entering
-  representative attention layers of the HF source model and compare the
-  attention-block outputs against the TensorRT-LLM path (real checkpoint).
-* ``cuda_graph_hard_path`` / ``real_runtime`` — prove the TRTLLM attention
-  backend actually dispatches at checkpoint dims for both
-  ``(cuda_graph=false, overlap_scheduler=false)`` and
-  ``(cuda_graph=true, overlap_scheduler=true)``, the enabled run exercising the
-  CUDA-graph capture/replay hard path.
-
-Resolve the checkpoint from ``CHATGLM3_6B_MODEL_DIR`` or
-``llm_models_root()/chatglm3-6b``.
-"""
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""ChatGLM3-6B attention backend tests."""
 
 import os
 
@@ -33,7 +34,6 @@ pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="ChatGLM3 attention tests require CUDA"
 )
 
-# A fixed real ChatGLM3 prompt token id sequence ("[gMASK]sop ..." style ids).
 PROMPT_IDS = [64790, 64792, 790, 30951, 517, 30910, 30939, 30996, 13, 30910]
 REP_LAYERS = [0, 14, 27]
 
@@ -143,26 +143,12 @@ def _cos(a, b):
 
 
 def _replay_decode_logits_under_cuda_graph(model, gen_ids, dec_pos, dec_metadata):
-    """Capture the full-model decode into a real CUDA graph and replay it.
-
-    Uses the production graph-reuse hard path proven for the TRTLLM backend +
-    ``KVCacheManagerV2`` in ``tests/unittest/_torch/attention/backend_case.py``:
-    the cuda-graph metadata is prepared once *before* capture, the decode inputs
-    live in fixed-address static buffers, and warmup runs on a side stream so
-    host-syncing metadata work stays outside the capture region. The decode
-    kernel appends the single new token's K/V to the same fixed cache slot on
-    every warmup/capture/replay pass, so the repeated append is idempotent.
-    ``with_multi_stream``/``piecewise_cuda_graph`` mirror ``CUDAGraphRunner`` so
-    any aux-stream attention work is captured, not silently dropped. Returns the
-    replayed decode logits (a genuine capture+replay, not a ``cuda_graph=true``
-    flag over an eager fallback).
-    """
+    """Capture full-model decode in a CUDA graph and return replayed logits."""
     cg_md = dec_metadata.create_cuda_graph_metadata(1)
     cg_md.seq_lens = torch.tensor([1], dtype=torch.int)
     cg_md.num_contexts = 0
     cg_md.prepare()
 
-    # Fixed-address static input buffers the captured graph reads on every replay.
     static_ids = torch.zeros_like(gen_ids)
     static_pos = torch.zeros_like(dec_pos)
     static_ids.copy_(gen_ids)
@@ -188,9 +174,6 @@ def _replay_decode_logits_under_cuda_graph(model, gen_ids, dec_pos, dec_metadata
 
 @torch.no_grad()
 def test_source_activation_replay():
-    """Compare HF vs TRTLLM attention-block activations at representative
-    layers for prefill and decode, and confirm the enabled CUDA-graph hard path
-    preserves final logits."""
     model_dir = _model_dir()
     dtype = torch.float16
     device = torch.device("cuda")
@@ -198,14 +181,11 @@ def test_source_activation_replay():
 
     hf, model, config = _build_model(model_dir, dtype, device, backend)
 
-    # Hook attention-block inputs/outputs on both models.
     hf_act, trt_act = {}, {}
 
-    # Clone: the TRTLLM attention output buffer is reused across layers, so a
-    # bare .detach() would alias later layers' outputs by the time we compare.
+    # Clone because the TRTLLM attention output buffer is reused across layers.
     def hf_hook(idx):
         def _h(_m, inp, out):
-            # HF self_attention: input[0]=[seq,batch,hidden], out=(attn,kv).
             hf_act[idx] = (inp[0].detach().clone(), out[0].detach().clone())
 
         return _h
@@ -233,7 +213,6 @@ def test_source_activation_replay():
             backend, kv_cache_manager, seq_len, device
         )
 
-        # Assert selected backend + cache actually dispatched (no fallback).
         assert isinstance(model.model.layers[0].self_attn.attn, TrtllmAttention)
         assert isinstance(kv_cache_manager, KVCacheManagerV2)
 
@@ -263,7 +242,6 @@ def test_source_activation_replay():
             assert in_cos > 0.99, f"layer {i} attention input diverged"
             assert out_cos > 0.99, f"layer {i} attention output diverged"
 
-        # Decode / cache reuse: compare layer-0 attention output again.
         trt_act.clear()
         hf_act.clear()
         gen_ids = torch.tensor([PROMPT_IDS[-1]], dtype=torch.int32, device=device)
@@ -287,9 +265,6 @@ def test_source_activation_replay():
             h.remove()
         kv_cache_manager.shutdown()
 
-    # Enabled config: (cuda_graph=true, overlap_scheduler=true) hard path.
-    # Graph replay does not fire Python hooks, so validate that the captured
-    # graph preserves the final greedy token vs HF.
     _assert_cuda_graph_matches_hf(model, hf, config, device, backend)
 
 
@@ -331,8 +306,6 @@ def _assert_cuda_graph_matches_hf(model, hf, config, device, backend):
 )
 @torch.no_grad()
 def test_real_runtime_cuda_graph_hard_path(enable_cuda_graph):
-    """Prove TRTLLM-backend dispatch at checkpoint dims with KVCacheManagerV2
-    for baseline and the CUDA-graph hard path (enabled run)."""
     model_dir = _model_dir()
     dtype = torch.float16
     device = torch.device("cuda")
@@ -341,7 +314,6 @@ def test_real_runtime_cuda_graph_hard_path(enable_cuda_graph):
     hf, model, config = _build_model(model_dir, dtype, device, backend)
     kv_cache_manager = _build_kv_cache_manager(config)
     try:
-        # real_runtime: the selected backend + V2 cache are actually used.
         assert isinstance(model.model.layers[0].self_attn.attn, TrtllmAttention)
         assert isinstance(kv_cache_manager, KVCacheManagerV2)
 
@@ -362,7 +334,6 @@ def test_real_runtime_cuda_graph_hard_path(enable_cuda_graph):
         )
 
         if enable_cuda_graph:
-            # Enabled config: prove the CUDA-graph hard path (real capture+replay).
             trt_logits = _replay_decode_logits_under_cuda_graph(
                 model, gen_ids, dec_pos, dec_metadata
             )

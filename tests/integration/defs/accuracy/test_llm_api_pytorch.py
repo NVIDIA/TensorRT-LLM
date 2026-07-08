@@ -129,7 +129,6 @@ class TestChatGLM3_6B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "THUDM/chatglm3-6b"
     MODEL_PATH = f"{llm_models_root()}/chatglm3-6b"
 
-    # (cuda_graph, overlap_scheduler) configurations required by the task.
     def _pytorch_config(self, *, cuda_graph: bool, overlap: bool):
         return dict(
             attn_backend="TRTLLM",
@@ -140,7 +139,6 @@ class TestChatGLM3_6B(LlmapiAccuracyTestHarness):
         )
 
     def test_llm_api_smoke(self):
-        """Nonempty generation on both required configs with KVCacheManagerV2 + TRTLLM (no fallback)."""
         for cuda_graph in [False, True]:
             with LLM(self.MODEL_PATH,
                      trust_remote_code=True,
@@ -156,11 +154,8 @@ class TestChatGLM3_6B(LlmapiAccuracyTestHarness):
                 for out in outputs:
                     assert out.outputs[0].text.strip(), "empty generation"
 
-    # cuda_graph=False -> baseline (overlap off); cuda_graph=True -> enabled
-    # (overlap on), i.e. the two (cuda_graph, overlap_scheduler) configs.
     @parametrize_with_ids("cuda_graph", [False, True])
     def test_auto_dtype(self, cuda_graph):
-        """GSM8K gate within tolerance of the HF reference for the baseline and CUDA-graph+overlap configs."""
         with LLM(self.MODEL_PATH,
                  trust_remote_code=True,
                  **self._pytorch_config(cuda_graph=cuda_graph,

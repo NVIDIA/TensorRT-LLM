@@ -1,28 +1,18 @@
-"""ChatGLM3-6B end-to-end greedy parity vs the HF source.
-
-Runs through the real TensorRT-LLM runtime (TRTLLM backend + KVCacheManagerV2)
-for both ``(cuda_graph=false, overlap_scheduler=false)`` and
-``(cuda_graph=true, overlap_scheduler=true)``.
-
-* ``source_logit_replay`` — short real prompts, deterministic greedy decoding.
-  Compares HF and TensorRT-LLM *final-prompt logits* (the logits that pick the
-  first generated token) via ``return_generation_logits`` and requires
-  greedy-argmax token equality. Reports final-logit ``max_abs`` and cosine.
-* ``generation_parity`` — >=5 fixed prompts, >=32 generated tokens each,
-  per-step greedy-argmax token equality.
-
-Decoding is *natural* greedy (``temperature=0``, stop at EOS) on both sides so
-HF and TensorRT-LLM use an identical decode rule. An earlier version forced a
-fixed length with ``ignore_eos=True``; that pushed generation past the model's
-natural stop into a low-confidence regime where HF (raw argmax, emits EOS) and
-TensorRT-LLM (``ignore_eos`` suppresses EOS) legitimately diverge — a decode-rule
-mismatch, not a model bug. The generation-parity prompts are high-confidence
-numeric sequences that the model continues well past 32 tokens without hitting
-EOS, so natural greedy yields a long, deterministic comparison.
-
-Resolve the checkpoint from ``CHATGLM3_6B_MODEL_DIR`` or
-``llm_models_root()/chatglm3-6b``.
-"""
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""ChatGLM3-6B greedy parity against the HF source."""
 
 import gc
 import os
@@ -33,20 +23,14 @@ import torch
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
 
-EOS_ID = 2  # ChatGLM3 config.json eos_token_id
+EOS_ID = 2
 
-# Short prompts for the single-step final-logit replay. The first generated
-# token is high-confidence (never EOS) for each, so greedy-argmax is stable.
 SHORT_PROMPTS = [
     "1 + 1 =",
     "The capital of France is",
     "Question: What is 12 times 12? Answer:",
 ]
 
-# Long prompts for multi-step generation parity: high-confidence numeric
-# sequences the model continues far past 32 tokens without emitting EOS, so
-# natural greedy stays deterministic and per-step argmax agreement is a clean
-# KV-cache / attention-mask / sampling regression signal.
 LONG_PROMPTS = [
     "1, 2, 3, 4, 5, 6, 7, 8, 9, 10,",
     "2, 4, 6, 8, 10, 12, 14,",
@@ -99,7 +83,6 @@ def _load_hf(model_dir, dtype, device):
 
 @torch.no_grad()
 def _hf_final_logits(hf, input_ids, device):
-    """HF logits at the final prompt position (pick the first generated token)."""
     pos = torch.arange(input_ids.shape[1], device=device).unsqueeze(0)
     out = hf.forward(input_ids=input_ids, position_ids=pos, use_cache=True)
     return out.logits[:, -1].float().squeeze(0).cpu()  # [vocab]
@@ -107,11 +90,6 @@ def _hf_final_logits(hf, input_ids, device):
 
 @torch.no_grad()
 def _hf_greedy_tokens(hf, input_ids, max_new_tokens, device):
-    """Natural greedy decode; stops at EOS (EOS not appended).
-
-    Uses a manual loop (the 2023 remote-code ``generate`` is unreliable under
-    modern transformers) with the model's own incremental KV cache.
-    """
     cur = input_ids
     past = None
     pos = torch.arange(input_ids.shape[1], device=device).unsqueeze(0)
@@ -145,7 +123,6 @@ def _build_llm(model_dir, cfg, *, gather_logits=False):
 
 @pytest.mark.parametrize("config_name", list(CONFIGS))
 def test_source_logit_replay(config_name):
-    """Final-logit cosine/max_abs + greedy-argmax token equality (HF vs TRT)."""
     model_dir = _model_dir()
     cfg = CONFIGS[config_name]
     prompts = SHORT_PROMPTS
@@ -160,14 +137,11 @@ def test_source_logit_replay(config_name):
         prompt_ids.append(ids[0].tolist())
         hf_logits.append(fl)
         hf_argmax.append(int(fl.argmax(-1).item()))
-    # Free HF before building the TRT-LLM engine to avoid double 6B residency.
     del hf
     gc.collect()
     torch.cuda.empty_cache()
 
     llm = _build_llm(model_dir, cfg, gather_logits=True)
-    # max_tokens>=2 so the enabled config exercises at least one decode step
-    # under the captured CUDA graph; only the first token's logits are compared.
     sampling = SamplingParams(max_tokens=4, temperature=0.0, return_generation_logits=True)
     outs = llm.generate(prompt_ids, sampling)
     try:
@@ -191,12 +165,11 @@ def test_source_logit_replay(config_name):
 
 @pytest.mark.parametrize("config_name", list(CONFIGS))
 def test_generation_parity(config_name):
-    """Per-step greedy token equality vs HF (>=5 prompts, >=32 tokens)."""
     model_dir = _model_dir()
     cfg = CONFIGS[config_name]
     prompts = LONG_PROMPTS
     assert len(prompts) >= 5
-    max_new = 36  # >=32 with a small margin; short enough to stay high-confidence
+    max_new = 36
     device = torch.device("cuda")
 
     tok = _tokenizer(model_dir)
@@ -211,7 +184,6 @@ def test_generation_parity(config_name):
     torch.cuda.empty_cache()
 
     llm = _build_llm(model_dir, cfg)
-    # Natural greedy (no ignore_eos): identical decode rule to HF above.
     sampling = SamplingParams(max_tokens=max_new, temperature=0.0)
     outs = llm.generate(prompt_ids, sampling)
     try:

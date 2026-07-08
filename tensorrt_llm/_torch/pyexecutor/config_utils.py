@@ -511,16 +511,7 @@ _CONFIG_REGISTRY: dict[str, type[transformers.PretrainedConfig]] = LazyConfigDic
 
 def _normalize_chatglm_config(
         model_config: transformers.PretrainedConfig) -> None:
-    """Map ChatGLM(3)'s Megatron-style HF config names onto the standard names
-    that TensorRT-LLM's ModelConfig, KV-cache manager and attention modules
-    read.
-
-    THUDM ChatGLM checkpoints load via ``trust_remote_code`` and name fields
-    ``num_layers``, ``kv_channels``, ``multi_query_group_num``,
-    ``padded_vocab_size``, ``layernorm_epsilon`` and ``seq_length``. The
-    canonical aliases are set in place (the checkpoint on disk is untouched) and
-    any standard name already present is preserved.
-    """
+    """Set standard aliases for ChatGLM's Megatron-style config fields."""
 
     def set_if_absent(name, value):
         if getattr(model_config, name, None) is None and value is not None:
@@ -532,7 +523,6 @@ def _normalize_chatglm_config(
     if head_dim is None:
         head_dim = model_config.hidden_size // model_config.num_attention_heads
     set_if_absent("head_dim", head_dim)
-    # multi_query_attention -> GQA/MQA with multi_query_group_num KV heads.
     if getattr(model_config, "multi_query_attention", False):
         set_if_absent(
             "num_key_value_heads",
@@ -546,7 +536,6 @@ def _normalize_chatglm_config(
                   getattr(model_config, "seq_length", None))
     set_if_absent("rms_norm_eps",
                   getattr(model_config, "layernorm_epsilon", None))
-    # ChatGLM rotates only the first half of each head with GPT-J interleaving.
     set_if_absent("partial_rotary_factor", 0.5)
     set_if_absent("rope_theta", 10000.0)
     set_if_absent("vocab_size", getattr(model_config, "padded_vocab_size",

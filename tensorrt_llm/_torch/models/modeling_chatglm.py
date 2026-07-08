@@ -1,27 +1,20 @@
-"""ChatGLM (THUDM ChatGLM3-6B) for the PyTorch backend.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""ChatGLM3-6B decoder for the PyTorch backend."""
 
-ChatGLM3-6B is a dense, text-only decoder that is architecturally very close to
-a Llama/Qwen2 decoder, with three source-specific contracts that this module
-preserves exactly:
-
-* Partial, interleaved (GPT-J style) rotary embedding. Only the first
-  ``kv_channels / 2`` (= 64) dimensions of each 128-dim head are rotated, and
-  the rotation pairs *adjacent* elements (``x[..., 0], x[..., 1]``) rather than
-  splitting the head in half. This maps to TensorRT-LLM's unfused
-  ``RotaryEmbedding`` with ``is_neox=False`` and a rotary ``dim`` of 64.
-* A single fused ``query_key_value`` projection stored in ``[all Q, grouped K,
-  grouped V]`` order with a bias, consumed here as GQA/MQA with
-  ``num_key_value_heads=2`` (multi_query_group_num). The output projection and
-  both MLP projections have no bias (``add_bias_linear=false``).
-* SwiGLU MLP where ``dense_h_to_4h`` stores the SiLU gate as the first half and
-  the up-projection as the second half.
-
-The HF checkpoint advertises ``architectures=["ChatGLMModel"]`` and
-``model_type="chatglm"``; config field names are normalized to the standard
-TensorRT-LLM names in ``pyexecutor/config_utils.py`` at load time.
-"""
-
-from typing import Dict, Optional
+from typing import Optional
 
 import torch
 from torch import nn
@@ -43,7 +36,7 @@ from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto
 
 
 class ChatGLMAttention(Attention):
-    """ChatGLM self-attention: fused QKV (with bias) + partial interleaved RoPE."""
+    """Fused-QKV attention with partial interleaved RoPE."""
 
     def __init__(
         self,
@@ -53,11 +46,7 @@ class ChatGLMAttention(Attention):
         config = model_config.pretrained_config
 
         head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        # ChatGLM applies rotary embedding to only the first half of each head
-        # (partial_rotary_factor == 0.5) and rotates adjacent pairs (GPT-J /
-        # interleaved), so is_neox must be False. RoPE is applied unfused so the
-        # exact HF math is reproduced; the TRTLLM attention op still owns
-        # masking, paged KV cache and CUDA-graph capture.
+        # ChatGLM rotates only the first half of each head with GPT-J interleaving.
         rotary_dim = int(head_dim * getattr(config, "partial_rotary_factor", 0.5))
         pos_embd_params = PositionalEmbeddingParams(
             type=PositionEmbeddingType.rope_gptj,
@@ -74,28 +63,18 @@ class ChatGLMAttention(Attention):
             num_attention_heads=config.num_attention_heads,
             num_key_value_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
-            # add_qkv_bias=true -> fused QKV projection carries a bias.
             bias=True,
             pos_embd_params=pos_embd_params,
-            # Keep RoPE unfused to guarantee exact parity with HF's partial
-            # interleaved rotary; the layer scaling coefficient cancels in the
-            # source so the default 1/sqrt(head_dim) scale is correct.
             rope_fusion=False,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
-            # add_bias_linear=false -> output projection has no bias.
             dense_bias=False,
             config=model_config,
         )
 
 
 class ChatGLMDecoderLayer(DecoderLayer):
-    """Pre-norm decoder block (input norm -> attn -> post norm -> SwiGLU MLP).
-
-    ChatGLM sets apply_residual_connection_post_layernorm=false, so residuals
-    are taken from the pre-norm inputs, which is exactly the standard fused
-    RMSNorm(add_residual) contract used across TensorRT-LLM dense decoders.
-    """
+    """Pre-norm attention plus SwiGLU MLP block."""
 
     def __init__(
         self,
@@ -111,7 +90,6 @@ class ChatGLMDecoderLayer(DecoderLayer):
         self.mlp = GatedMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
-            # add_bias_linear=false -> MLP projections have no bias.
             bias=False,
             dtype=config.torch_dtype,
             config=model_config,
@@ -185,7 +163,7 @@ class ChatGLMModel(DecoderModel):
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
-        if (input_ids is None) ^ (inputs_embeds is not None):
+        if (input_ids is None) == (inputs_embeds is None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
@@ -209,8 +187,6 @@ class ChatGLMModel(DecoderModel):
         return hidden_states
 
 
-# The checkpoint advertises architectures=["ChatGLMModel"], so register this
-# causal-LM wrapper under that exact architecture string.
 @register_auto_model("ChatGLMModel")
 class ChatGLMForCausalLM(DecoderModelForCausalLM[ChatGLMModel, PretrainedConfig]):
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
@@ -221,24 +197,20 @@ class ChatGLMForCausalLM(DecoderModelForCausalLM[ChatGLMModel, PretrainedConfig]
             vocab_size=model_config.pretrained_config.vocab_size,
         )
 
-    def load_weights(self, weights: Dict, weight_mapper=None):
-        """Rename ChatGLM's fused, sequence-major HF weights to the standard
-        TensorRT-LLM per-projection names, then reuse the shared loader (which
-        fuses q/k/v -> qkv_proj and gate/up -> gate_up_proj with the correct TP
-        sharding and KV-head duplication)."""
+    def load_weights(self, weights: dict[str, torch.Tensor], weight_mapper=None):
+        """Rename ChatGLM HF weights to the standard TensorRT-LLM names."""
         config = self.config
         head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         q_dim = config.num_attention_heads * head_dim
         kv_dim = config.num_key_value_heads * head_dim
         ffn = config.intermediate_size
 
-        converted: Dict[str, torch.Tensor] = {}
+        converted: dict[str, torch.Tensor] = {}
 
         def rename_layer(i: int) -> None:
             src = f"transformer.encoder.layers.{i}."
             dst = f"model.layers.{i}."
-            # Fused [Q, grouped K, grouped V] -> separate q/k/v; the shared
-            # loader re-fuses and shards them (K/V duplicated for TP>num_kv).
+            # Split ChatGLM's fused QKV so the shared loader can shard it.
             qkv_w = weights[src + "self_attention.query_key_value.weight"]
             qkv_b = weights[src + "self_attention.query_key_value.bias"]
             q_w, k_w, v_w = qkv_w.split([q_dim, kv_dim, kv_dim], dim=0)
@@ -252,7 +224,6 @@ class ChatGLMForCausalLM(DecoderModelForCausalLM[ChatGLMModel, PretrainedConfig]
             converted[dst + "self_attn.o_proj.weight"] = weights[
                 src + "self_attention.dense.weight"
             ]
-            # dense_h_to_4h stores [SiLU gate, up]; split into gate/up.
             gate_up = weights[src + "mlp.dense_h_to_4h.weight"]
             gate_w, up_w = gate_up.split([ffn, ffn], dim=0)
             converted[dst + "mlp.gate_proj.weight"] = gate_w
@@ -271,9 +242,5 @@ class ChatGLMForCausalLM(DecoderModelForCausalLM[ChatGLMModel, PretrainedConfig]
         ]
         converted["model.norm.weight"] = weights["transformer.encoder.final_layernorm.weight"]
         converted["lm_head.weight"] = weights["transformer.output_layer.weight"]
-
-        # transformer.rotary_pos_emb.inv_freq is a derived RoPE buffer, not a
-        # learned parameter; the rotary cache is recomputed internally, so it is
-        # intentionally not loaded.
 
         super().load_weights(converted)

@@ -1,15 +1,18 @@
-"""ChatGLM3-6B PyTorch-backend parity tests.
-
-These run on CUDA against the real THUDM/chatglm3-6b checkpoint. They prove:
-* config recognition + normalization of the Megatron-style HF config;
-* exact fused-QKV / gate-up weight mapping (state-dict accounting);
-* source contracts at checkpoint dimensions (partial interleaved RoPE, GQA,
-  SwiGLU, untied LM head) via HF logit parity with KVCacheManagerV2 + the
-  TRTLLM attention backend.
-
-Resolve the checkpoint from ``CHATGLM3_6B_MODEL_DIR`` or
-``llm_models_root()/chatglm3-6b``.
-"""
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""ChatGLM3-6B PyTorch-backend parity tests."""
 
 import os
 
@@ -39,12 +42,7 @@ def _model_dir() -> str:
 
 
 def _load_hf_chatglm(model_dir, dtype, device):
-    """Load the 2023-era ChatGLM remote code under modern transformers.
-
-    Two loader-compat bridges (no semantic change): pre-2024 remote code
-    predates ``all_tied_weights_keys`` and reads ``config.max_length`` in
-    ``__init__``.
-    """
+    """Load the ChatGLM remote code under modern transformers."""
     from transformers import AutoConfig, AutoModelForCausalLM
     from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
@@ -52,7 +50,6 @@ def _load_hf_chatglm(model_dir, dtype, device):
         "modeling_chatglm.ChatGLMForConditionalGeneration", model_dir
     )
     if not hasattr(cls, "all_tied_weights_keys"):
-        # {} is correct for tie_word_embeddings=False (untied LM head).
         cls.all_tied_weights_keys = {}
 
     config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
@@ -99,14 +96,10 @@ def _build_kv_cache_manager(config, num_blocks=4, tokens_per_block=64, batch_siz
 
 
 def test_chatglm_config_recognition_and_normalization():
-    """model_type=chatglm / architectures=[ChatGLMModel] load unmodified and
-    normalize to the standard TensorRT-LLM field names, and route to the
-    registered causal-LM class."""
     config = load_pretrained_config(_model_dir(), trust_remote_code=True)
 
     assert config.model_type == "chatglm"
     assert config.architectures == ["ChatGLMModel"]
-    # Megatron-style names normalized to canonical ones.
     assert config.num_hidden_layers == 28
     assert config.num_attention_heads == 32
     assert config.num_key_value_heads == 2  # multi_query_group_num
@@ -123,8 +116,6 @@ def test_chatglm_config_recognition_and_normalization():
 
 @torch.no_grad()
 def test_chatglm_weight_loading_accounting():
-    """Fused QKV and gate/up splits round-trip exactly, and every learned HF
-    weight except the derived rotary buffer is consumed."""
     model_dir = _model_dir()
     dtype = torch.float16
     device = torch.device("cuda")
@@ -136,13 +127,10 @@ def test_chatglm_weight_loading_accounting():
     model = ChatGLMForCausalLM(model_config).to(dtype).to(device)
     model.load_weights(hf_sd)
 
-    # The only HF learned tensor intentionally NOT loaded is the derived rotary
-    # buffer (recomputed internally); everything else must map.
-    unaccounted = [k for k in hf_sd if k != "transformer.rotary_pos_emb.inv_freq" and "." in k]
-    assert len(unaccounted) == 199, f"unexpected key count: {len(unaccounted)}"
+    learned_keys = [k for k in hf_sd if k != "transformer.rotary_pos_emb.inv_freq" and "." in k]
+    assert len(learned_keys) == 199, f"unexpected key count: {len(learned_keys)}"
 
     layer0 = "transformer.encoder.layers.0."
-    # Fused QKV is stored [Q, K, V]; after split+refuse it must be identical.
     torch.testing.assert_close(
         model.model.layers[0].self_attn.qkv_proj.weight,
         hf_sd[layer0 + "self_attention.query_key_value.weight"].to(device),
@@ -151,7 +139,6 @@ def test_chatglm_weight_loading_accounting():
         model.model.layers[0].self_attn.qkv_proj.bias,
         hf_sd[layer0 + "self_attention.query_key_value.bias"].to(device),
     )
-    # dense_h_to_4h is [gate, up]; fused gate_up_proj must match it exactly.
     torch.testing.assert_close(
         model.model.layers[0].mlp.gate_up_proj.weight,
         hf_sd[layer0 + "mlp.dense_h_to_4h.weight"].to(device),
@@ -163,7 +150,6 @@ def test_chatglm_weight_loading_accounting():
     torch.testing.assert_close(
         model.lm_head.weight, hf_sd["transformer.output_layer.weight"].to(device)
     )
-    # Untied embedding / LM head.
     assert model.lm_head.weight.data_ptr() != model.model.embed_tokens.weight.data_ptr()
 
     for name, p in model.named_parameters():
@@ -172,8 +158,6 @@ def test_chatglm_weight_loading_accounting():
 
 @torch.no_grad()
 def test_chatglm_source_contracts():
-    """Checkpoint-dimension structural contracts plus HF logit parity for
-    context and decode/cache-reuse on the TRTLLM backend + KVCacheManagerV2."""
     model_dir = _model_dir()
     dtype = torch.float16
     device = torch.device("cuda")
@@ -185,18 +169,15 @@ def test_chatglm_source_contracts():
     model = ChatGLMForCausalLM(model_config).to(dtype).to(device)
     model.load_weights(hf.state_dict())
 
-    # --- Structural source contracts at checkpoint dimensions ---
     assert len(model.model.layers) == 28
     attn = model.model.layers[0].self_attn
     assert attn.num_heads == 32
     assert attn.num_key_value_heads == 2
     assert attn.head_dim == 128
     assert model.model.layers[0].input_layernorm.variance_epsilon == 1e-5
-    # add_qkv_bias=true, add_bias_linear=false.
     assert attn.qkv_proj.bias is not None
     assert attn.o_proj.bias is None
     assert model.model.layers[0].mlp.gate_up_proj.bias is None
-    # Partial interleaved (GPT-J) RoPE over 64 of 128 head dims.
     assert attn.rotary_emb is not None
     assert attn.rotary_emb.is_neox is False
     assert attn.pos_embd_params.rope.dim == 64
@@ -205,7 +186,6 @@ def test_chatglm_source_contracts():
     try:
         metadata_cls = get_attention_backend(backend).Metadata
 
-        # --- Context phase ---
         input_ids = torch.tensor(
             [64790, 64792, 790, 30951, 517, 30910, 30939, 30996], dtype=torch.int32, device=device
         )
@@ -243,7 +223,6 @@ def test_chatglm_source_contracts():
         )
         assert cos > 0.99, f"context logit cosine {cos.item()}"
 
-        # --- Generation phase (cache reuse) ---
         gen_input_ids = torch.tensor([30910], dtype=torch.int32, device=device)
         attn_metadata = metadata_cls(
             seq_lens=torch.tensor([1], dtype=torch.int),
