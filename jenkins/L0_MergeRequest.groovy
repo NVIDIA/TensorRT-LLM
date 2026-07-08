@@ -1237,38 +1237,36 @@ def collectTestResults(pipeline, testFilter, globalVars)
         }
         parallelTasks["Test Coverage"] = {
             try {
-            timeout(time: 10, unit: 'MINUTES') {
+            timeout(time: 30, unit: 'MINUTES') {
             try {
                 stage("Test Coverage") {
                     sh "ls"
-                    def CUR_PATH = sh(returnStdout: true, script: 'pwd').replaceAll("\\s","")
-                    sh "echo ${CUR_PATH}"
                     sh "rm -rf cov && mkdir -p cov"
-                    sh "find . -type f -wholename '*/.coverage.*' -exec mv {} cov/ \\; || true"
-                    sh "cd cov && find . -type f"
-                    def fileCount = sh(returnStdout: true, script: 'find cov -type f | wc -l').replaceAll("\\s","").toInteger()
+                    // Gather the per-process PY_START data files (SQLite) that rode back inside each
+                    // stage's results tarball (under <stage>/cbts/). Batch moves avoid per-file fork/exec.
+                    sh "find . -type f -name '.cbtscov.*.sqlite' -exec mv -t cov/ {} + || true"
+                    sh "cd cov && ls -la"
+                    def fileCount = sh(returnStdout: true, script: 'find cov -name ".cbtscov.*.sqlite" | wc -l').replaceAll("\\s","").toInteger()
                     if (fileCount == 0) {
-                        echo "Test coverage is skipped because there is no test data file."
+                        echo "CBTS coverage skipped: no PY_START data files."
                         return
                     }
-                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install coverage")
-                    sh "coverage --version"
-
-                    sh "cp llm/examples/openai_triton/manual_plugin/fmha_triton.py llm/examples/openai_triton/plugin_autogen/"
-                    def coverageConfigFile = "cov/.coveragerc"
+                    // Merge all stages' data into: an indexed SQLite touch DB (the selector artifact),
+                    // a per-file split HTML report (each page small; the tree compresses well), and the
+                    // file/function coverage rate against the full tensorrt_llm/ source tree.
                     sh """
-                        echo '[paths]' > ${coverageConfigFile}
-                        echo 'source1=\n    ${CUR_PATH}/llm/examples/\n    */TensorRT-LLM/src/examples/' >> ${coverageConfigFile}
-                        echo 'source2=\n    ${CUR_PATH}/llm/tensorrt_llm/\n    */tensorrt_llm/' >> ${coverageConfigFile}
-                        cat ${coverageConfigFile}
+                        python3 llm/jenkins/scripts/cbts/coverage_utils/pystart_report.py \
+                            --glob 'cov/.cbtscov.*.sqlite' \
+                            --out-sqlite cov/cbts_touchmap.sqlite \
+                            --out-dir cov/cbts_report \
+                            --source-root llm/tensorrt_llm
                     """
-
-                    sh "cd cov && coverage combine"
-                    sh "cd cov && find . -type f"
-                    sh "cd cov && coverage report -i"   // -i: ignore errors. Ignore the error that the source code file cannot be found.
-                    sh "cd cov && coverage html -d test_coverage_html -i"
-                    trtllm_utils.uploadArtifacts("cov/test_coverage_html/*", "${UPLOAD_PATH}/test-results/coverage-report/")
-                    echo "Test coverage report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/coverage-report/index.html"
+                    // The report is a directory of many small pages; compress it into a single tarball.
+                    sh "cd cov && tar czf cbts_pystart_report.tar.gz cbts_report"
+                    trtllm_utils.uploadArtifacts("cov/cbts_touchmap.sqlite", "${UPLOAD_PATH}/cbts-coverage/")
+                    trtllm_utils.uploadArtifacts("cov/cbts_pystart_report.tar.gz", "${UPLOAD_PATH}/cbts-coverage/")
+                    echo "CBTS touch DB (selector): https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/cbts-coverage/cbts_touchmap.sqlite"
+                    echo "CBTS report (tar.gz, open cbts_report/index.html): https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/cbts-coverage/cbts_pystart_report.tar.gz"
                 } // Test coverage
             }
             catch (InterruptedException e)
@@ -1279,7 +1277,7 @@ def collectTestResults(pipeline, testFilter, globalVars)
             {
                 pipeline.echo("Test coverage failed execution.")
             }
-            } // timeout 10 min
+            } // timeout 30 min
             } catch (Exception e) {
                 echo "Test Coverage failed or timed out: ${e.toString()}"
             }
