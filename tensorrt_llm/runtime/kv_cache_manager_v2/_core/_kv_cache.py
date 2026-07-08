@@ -1068,6 +1068,14 @@ class _KVCache:
                 if hit is None:
                     continue
                 if rng._alias_span_key is None:
+                    # Pressure may have spilled the registry (unpinning the
+                    # handles) between admission and this first resume; a
+                    # dead span cannot be alias-mapped -- fall back to the
+                    # copy path. Adopted ranges below are immune: their
+                    # mappings hold their own references.
+                    if not hit[1].is_live():
+                        alias_spans[pg_idx] = None
+                        continue
                     storage.alias_arena_span(pg_idx, rng, hit[0], hit[1], hit[2])
                 else:
                     assert rng._alias_span_key == (hit[0], hit[2]), (

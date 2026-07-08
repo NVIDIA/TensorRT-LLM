@@ -2256,6 +2256,55 @@ class TestArenaPrefixAliasing(unittest.TestCase):
         s4.take_finish_event().synchronize()
         manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
 
+    def test_stale_span_falls_back_to_copy(self) -> None:
+        """Spill between an admission's lookup hit and its first resume.
+
+        The hit is held unpinned across that window; pressure can spill the
+        registry in between, so the dead span must fall back to the
+        host-copy path instead of alias-mapping freed handles (this exact
+        shape crashed the tinyhost pressure run).
+        """
+        manager = self.manager
+        pg = self._pool_group()
+        n_tok = self.PREFIX_BLOCKS * self.TPB
+        tokens = [5000 + i for i in range(n_tok)]
+        kv_a = manager.create_kv_cache(max_capacity=n_tok + 4 * self.TPB)
+        with TemporaryCudaStream([]) as s:
+            self.assertTrue(kv_a.resume(CudaStream(s.handle)))
+            self.assertTrue(kv_a.resize(n_tok))
+            for j, idx in enumerate(
+                list(kv_a.get_base_page_indices(LifeCycleId(0)))[: self.PREFIX_BLOCKS]
+            ):
+                self._block_floats(idx).fill_(float(j))
+            torch.cuda.synchronize()
+            kv_a.commit(tokens)
+            kv_a.close()
+        s.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
+
+        # Admission: lookup HIT stored (unpinned) on the kv cache.
+        kv_b = manager.create_kv_cache(
+            input_tokens=tokens + [1], max_capacity=n_tok + 4 * self.TPB
+        )
+        self.assertEqual(pg.alias_hits, 1)
+        # Pressure: everything spills, registry pins drop to zero refs.
+        torch.cuda.synchronize()
+        manager._storage.spill_gpu_retained(1 << 62)
+        self.assertEqual(pg.canonical_span_pages, 0)
+        with TemporaryCudaStream([]) as s2:
+            self.assertTrue(kv_b.resume(CudaStream(s2.handle)))  # must not crash
+            self.assertIsNone(kv_b._arena_ranges[PoolGroupIndex(0)]._alias_span_key)
+            torch.cuda.synchronize()
+            # intact host copies served the fallback -> bytes are correct
+            for j, idx in enumerate(
+                list(kv_b.get_base_page_indices(LifeCycleId(0)))[: self.PREFIX_BLOCKS]
+            ):
+                data = self._block_floats(idx)
+                self.assertTrue(bool((data == float(j)).all().item()), f"block {j} wrong")
+            kv_b.close()
+        s2.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
+
     def test_alias_partial_span_from_longer_owner(self) -> None:
         """P3 partial-span aliasing: the shared-prompt benchmark shape.
 

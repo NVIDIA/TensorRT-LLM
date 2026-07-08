@@ -95,6 +95,20 @@ class _CanonicalSpan:
     page_refs: "list[rawref.ref[Any]]"
     shared_per_pool: "list[list[SharedPhysMem]]"
     num_blocks: int
+
+    def is_live(self) -> bool:
+        """Whether every pinned handle is still referenced. A registry hit is
+        held UNPINNED across the admission->first-resume window, and pressure
+        can spill the registry in between (dropping the pins); a dead span
+        must fall back to the copy path instead of alias-mapping freed
+        handles. Adopted ranges are immune -- their mappings hold their own
+        references."""
+        for shared in self.shared_per_pool:
+            for s in shared:
+                if s.num_refs == 0:
+                    return False
+        return True
+
     num_pages: int
     ready_event: CachedCudaEvent
 
