@@ -28,7 +28,7 @@ void invokeIndexerKCacheGather(uint8_t const* k_cache, int64_t const* slot_mappi
     int64_t const* slot_mapping_scale, uint8_t* out_fp8, uint8_t* out_scale, int32_t k_token_start, int32_t num_tokens,
     int32_t head_dim, int32_t scale_size, int32_t cache_dim_0, int32_t cache_dim_1, int32_t cache_dim_2,
     int32_t cache_dim_3, int64_t cache_stride_0, int64_t cache_stride_1, int64_t cache_stride_2, int64_t cache_stride_3,
-    int32_t page_index_scale, cudaStream_t stream = 0);
+    cudaStream_t stream = 0);
 
 }
 
