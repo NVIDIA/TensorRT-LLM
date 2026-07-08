@@ -1710,10 +1710,12 @@ def _shard_parameter_node(
     # `strategy` is required on the trtllm op (no default) so the caller cannot
     # accidentally drop the AD-config-selected strategy. The torch op is a plain
     # torch.distributed all_gather and intentionally has no strategy/symm_mem.
-    if all_gather_op is torch.ops.auto_deploy.trtllm_dist_all_gather.default:
-        allgather_args = (config.allgather_strategy.name, -1, None)
-    else:
+    # Compare against the always-registered torch op so standalone mode never
+    # probes the optional TRT-LLM op merely to determine the call signature.
+    if all_gather_op is torch.ops.auto_deploy.torch_dist_all_gather.default:
         allgather_args = (-1,)
+    else:
+        allgather_args = (config.allgather_strategy.name, -1, None)
     dist_lookup = {
         0: (all_gather_op, *allgather_args),
         1: (all_reduce_op, allreduce_strategy),
