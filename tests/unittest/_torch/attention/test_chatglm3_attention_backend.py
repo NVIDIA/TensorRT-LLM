@@ -16,6 +16,7 @@ import os
 
 import pytest
 import torch
+from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
@@ -33,7 +34,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 PROMPT_IDS = [64790, 64792, 790, 30951, 517, 30910, 30939, 30996, 13, 30910]
-REP_LAYERS = [0, 14, 27]
 
 
 def _model_dir() -> str:
@@ -140,6 +140,10 @@ def _cos(a, b):
     ).item()
 
 
+def _representative_layers(config: PretrainedConfig) -> list[int]:
+    return sorted({0, config.num_hidden_layers // 2, config.num_hidden_layers - 1})
+
+
 def _replay_decode_logits_under_cuda_graph(model, gen_ids, dec_pos, dec_metadata):
     cg_md = dec_metadata.create_cuda_graph_metadata(1)
     cg_md.seq_lens = torch.tensor([1], dtype=torch.int)
@@ -179,6 +183,7 @@ def test_source_activation_replay():
     hf, model, config = _build_model(model_dir, dtype, device, backend)
 
     hf_act, trt_act = {}, {}
+    rep_layers = _representative_layers(config)
 
     # Clone because the TRTLLM attention output buffer is reused across layers.
     def hf_hook(idx):
@@ -194,7 +199,7 @@ def test_source_activation_replay():
         return _h
 
     handles = []
-    for i in REP_LAYERS:
+    for i in rep_layers:
         handles.append(
             hf.transformer.encoder.layers[i].self_attention.register_forward_hook(hf_hook(i))
         )
@@ -222,7 +227,7 @@ def test_source_activation_replay():
                 input_ids=input_ids.unsqueeze(0), position_ids=position_ids, use_cache=True
             )
 
-        for i in REP_LAYERS:
+        for i in rep_layers:
             hf_in, hf_o = hf_act[i]
             trt_in, trt_o = trt_act[i]
             hf_in = hf_in.reshape(seq_len, -1)
@@ -290,9 +295,11 @@ def _assert_cuda_graph_matches_hf(model, hf, config, device, backend):
             past_key_values=hf_out.past_key_values,
             use_cache=True,
         )
-        assert trt_logits.argmax(-1).item() == hf_dec.logits[:, -1].argmax(-1).item(), (
+        hf_logits = hf_dec.logits[:, -1]
+        assert trt_logits.argmax(-1).item() == hf_logits.argmax(-1).item(), (
             "cuda-graph decode token mismatch"
         )
+        assert _cos(trt_logits, hf_logits) > 0.99, "cuda-graph decode logits diverged"
         print("[source_activation_replay] cuda_graph=true hard path token OK")
     finally:
         kv_cache_manager.shutdown()
@@ -346,6 +353,8 @@ def test_real_runtime_cuda_graph_hard_path(enable_cuda_graph):
             past_key_values=hf_out.past_key_values,
             use_cache=True,
         )
-        assert trt_logits.argmax(-1).item() == hf_dec.logits[:, -1].argmax(-1).item()
+        hf_logits = hf_dec.logits[:, -1]
+        assert trt_logits.argmax(-1).item() == hf_logits.argmax(-1).item()
+        assert _cos(trt_logits, hf_logits) > 0.99
     finally:
         kv_cache_manager.shutdown()
