@@ -17,6 +17,7 @@
 
 import asyncio
 import os
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -477,7 +478,13 @@ def disagg_cluster_config(service_discovery):
 
 
 @pytest.fixture
-def disagg_server_config(disagg_cluster_config, router, disagg_port):
+def internal_request_auth_key():
+    """Create one internal auth key shared by proxy and workers."""
+    return secrets.token_hex(32)
+
+
+@pytest.fixture
+def disagg_server_config(disagg_cluster_config, router, disagg_port, internal_request_auth_key):
     """Create disaggregated server configuration."""
     return {
         "hostname": "localhost",
@@ -485,14 +492,16 @@ def disagg_server_config(disagg_cluster_config, router, disagg_port):
         "disagg_cluster": disagg_cluster_config,
         "context_servers": {"router": {"type": router}},
         "generation_servers": {"router": {"type": router}},
+        "internal_request_auth_key": internal_request_auth_key,
     }
 
 
 @pytest.fixture
-def worker_config(disagg_cluster_config):
+def worker_config(disagg_cluster_config, internal_request_auth_key):
     """Create worker configuration."""
     return {
         "disagg_cluster": disagg_cluster_config,
+        "internal_request_auth_key": internal_request_auth_key,
         "disable_overlap_scheduler": True,
         "cache_transceiver_config": {"backend": "DEFAULT"},
         "kv_cache_config": {
