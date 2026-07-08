@@ -3470,8 +3470,9 @@ class PyExecutor:
         if not getattr(self, 'use_spec_decode', True):
             return
 
+        model_engine = getattr(self, 'model_engine', None)
         if (self.drafter is None
-                and getattr(self.model_engine, 'spec_config', None) is None):
+                and getattr(model_engine, 'spec_config', None) is None):
             return
 
         for request in self.active_requests:
