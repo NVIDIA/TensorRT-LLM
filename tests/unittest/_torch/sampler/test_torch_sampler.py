@@ -929,8 +929,8 @@ class TestFinishReasons:
             model_outputs={"logits": logits},
             num_context_logits_prefix_sum=[0],
         )
-        assert state.use_host_stop_criteria
         assert state.host is not None
+        assert state.host.use_host_stop_criteria
         assert state.host.finish_reasons is None
 
         sampler.update_requests(state)
