@@ -48,7 +48,7 @@ static bool gpuToFilePosix(tr::ITensor::SharedPtr const& srcPtr, std::string con
     TLLM_CHECK_WITH_INFO(cpyErr == cudaSuccess, "cudaMemcpy to host failed, error=%d", cpyErr);
 
     ssize_t written = ::write(fd, hostBuffer.data(), numBytes);
-    TLLM_CHECK_WITH_INFO(written >= 0, "POSIX write error=%zd", written);
+    TLLM_CHECK_WITH_INFO(written == numBytes, "POSIX write: short/failed write %zd/%zd", written, numBytes);
 
     TLLM_LOG_DEBUG("Wrote %zd bytes to %s (POSIX fallback)", written, filename.c_str());
 
@@ -65,7 +65,7 @@ static bool fileToGpuPosix(tr::ITensor::SharedPtr const& dstPtr, std::string con
     std::vector<uint8_t> hostBuffer(numBytes);
 
     ssize_t bytesRead = ::read(fd, hostBuffer.data(), numBytes);
-    TLLM_CHECK_WITH_INFO(bytesRead >= 0, "POSIX read error=%zd", bytesRead);
+    TLLM_CHECK_WITH_INFO(bytesRead == numBytes, "POSIX read: short/failed read %zd/%zd", bytesRead, numBytes);
 
     TLLM_LOG_DEBUG("Read %zd bytes from %s (POSIX fallback)", bytesRead, filename.c_str());
 
@@ -478,20 +478,14 @@ void KVCacheTransferManager::diskWriterLoop()
         // Unstaged jobs (src != nullptr) read the pinned host slot directly; staged jobs read the copy.
         void const* data = job.src ? job.src : static_cast<void const*>(job.staged.data());
         int fd = ::open(job.filename.c_str(), O_CREAT | O_WRONLY, 0644);
-        if (fd >= 0)
-        {
-            auto const written = ::pwrite(fd, data, job.bytes, 0);
-            ::close(fd);
-            if (written != static_cast<ssize_t>(job.bytes))
-            {
-                TLLM_LOG_ERROR("[disk-tier] short async write to %s (%zd/%zu)", job.filename.c_str(),
-                    static_cast<ssize_t>(written), job.bytes);
-            }
-        }
-        else
-        {
-            TLLM_LOG_ERROR("[disk-tier] cannot open %s for async write", job.filename.c_str());
-        }
+        TLLM_CHECK_WITH_INFO(fd >= 0,
+            "[disk-tier] cannot open %s for async write; failing loudly rather than leaving a corrupt slot",
+            job.filename.c_str());
+        auto const written = ::pwrite(fd, data, job.bytes, 0);
+        ::close(fd);
+        TLLM_CHECK_WITH_INFO(written == static_cast<ssize_t>(job.bytes),
+            "[disk-tier] short async write to %s (%zd/%zu); failing loudly rather than leaving a corrupt slot",
+            job.filename.c_str(), static_cast<ssize_t>(written), job.bytes);
 
         {
             std::lock_guard<std::mutex> lock(mDiskMutex);
@@ -656,24 +650,17 @@ void KVCacheTransferManager::diskReaderLoop()
             for (size_t i = 0; i < job.dsts.size(); ++i)
             {
                 int fd = ::open(job.files[i].c_str(), O_RDONLY);
-                if (fd < 0)
-                {
-                    TLLM_LOG_ERROR("[disk-tier] cannot open %s for async read", job.files[i].c_str());
-                    continue;
-                }
+                TLLM_CHECK_WITH_INFO(fd >= 0,
+                    "[disk-tier] cannot open %s for async read; failing loudly rather than serving corrupt KV",
+                    job.files[i].c_str());
                 hostBuffer.resize(job.bytes[i]);
                 auto const got = ::read(fd, hostBuffer.data(), job.bytes[i]);
                 ::close(fd);
-                if (got == static_cast<ssize_t>(job.bytes[i]))
-                {
-                    TLLM_CUDA_CHECK(
-                        cudaMemcpyAsync(job.dsts[i], hostBuffer.data(), job.bytes[i], cudaMemcpyHostToDevice, stream));
-                }
-                else
-                {
-                    TLLM_LOG_ERROR("[disk-tier] short async read from %s (%zd/%zu)", job.files[i].c_str(),
-                        static_cast<ssize_t>(got), job.bytes[i]);
-                }
+                TLLM_CHECK_WITH_INFO(got == static_cast<ssize_t>(job.bytes[i]),
+                    "[disk-tier] short async read from %s (%zd/%zu); failing loudly rather than serving corrupt KV",
+                    job.files[i].c_str(), static_cast<ssize_t>(got), job.bytes[i]);
+                TLLM_CUDA_CHECK(
+                    cudaMemcpyAsync(job.dsts[i], hostBuffer.data(), job.bytes[i], cudaMemcpyHostToDevice, stream));
             }
             TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
         }
