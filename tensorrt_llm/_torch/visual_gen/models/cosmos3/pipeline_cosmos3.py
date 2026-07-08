@@ -92,8 +92,7 @@ def _normalize_condition_frame_indexes_vision(
         raise ValueError("Cosmos3 condition_frame_indexes_vision must not be empty.")
     if any(index < 0 for index in normalized):
         raise ValueError(
-            "Cosmos3 condition_frame_indexes_vision must be non-negative, "
-            f"got {normalized}."
+            f"Cosmos3 condition_frame_indexes_vision must be non-negative, got {normalized}."
         )
     return normalized
 
