@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import cuda.bindings.driver as drv
+import cuda.bindings.driver as drv  # type: ignore[import-untyped]
 
 
 class OutOfMemoryError(Exception):

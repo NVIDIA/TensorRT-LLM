@@ -273,7 +273,7 @@ class StorageManager:
 
         num_levels = CacheLevel(len(config.cache_tiers))
         self._levels = cast(
-            TypedIndexList,
+            "TypedIndexList[CacheLevel, CacheLevelManager]",
             [
                 CacheLevelManager(
                     self._life_cycle_grouping,

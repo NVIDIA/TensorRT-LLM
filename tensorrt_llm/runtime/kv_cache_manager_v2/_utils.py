@@ -49,8 +49,8 @@ from typing import (
     cast,
 )
 
-import cuda.bindings.driver as drv
-import cuda.bindings.runtime as cudart
+import cuda.bindings.driver as drv  # type: ignore[import-untyped]
+import cuda.bindings.runtime as cudart  # type: ignore[import-untyped]
 
 from . import rawref
 from ._common import NDEBUG, CudaStream
@@ -71,7 +71,7 @@ def _unwrap(
         T,
     ]
     | tuple[drv.CUresult, T, U],
-):
+) -> Any:
     if isinstance(ret, drv.CUresult):
         if int(ret) != int(drv.CUresult.CUDA_SUCCESS):  # pyright: ignore
             if int(ret) == int(drv.CUresult.CUDA_ERROR_OUT_OF_MEMORY):  # pyright: ignore
@@ -106,31 +106,56 @@ def exact_div(x: int, y: int) -> int:
 Idx = TypeVar("Idx", bound=int)
 
 
-class HalfOpenRange(tuple[Idx, Idx], Generic[Idx]):
+class HalfOpenRange(Generic[Idx]):
     """A half-open range [beg, end). Falsy when empty (beg >= end).
-    Generic over index type. Supports unpacking into (beg, end)."""
+    Generic over index type. Supports unpacking into (beg, end) and
+    indexing with 0/1. Compares equal to 2-tuples by value.
 
-    __slots__ = ()
+    Deliberately NOT a tuple subclass: mypyc lowers ``len()``, ``bool()``
+    and ``in`` on tuple-typed values to raw tuple operations, which would
+    silently bypass the overrides below in compiled code (an empty range
+    would report len 2 and be truthy)."""
 
-    def __new__(cls, beg: Idx, end: Idx) -> "HalfOpenRange[Idx]":
-        return tuple.__new__(cls, (beg, end))
+    __slots__ = ("beg", "end")
+    beg: Idx
+    end: Idx
 
-    @property
-    def beg(self) -> Idx:
-        return self[0]
+    def __init__(self, beg: Idx, end: Idx) -> None:
+        self.beg = beg
+        self.end = end
 
-    @property
-    def end(self) -> Idx:
-        return self[1]
+    def __getitem__(self, index: int) -> Idx:
+        if index == 0:
+            return self.beg
+        if index == 1:
+            return self.end
+        raise IndexError(index)
+
+    def __iter__(self) -> Iterator[Idx]:
+        yield self.beg
+        yield self.end
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, HalfOpenRange):
+            return bool(self.beg == other.beg and self.end == other.end)
+        if isinstance(other, tuple):
+            return other == (self.beg, self.end)
+        return False
+
+    def __hash__(self) -> int:
+        return hash((self.beg, self.end))
+
+    def __repr__(self) -> str:
+        return f"HalfOpenRange({self.beg}, {self.end})"
 
     def __bool__(self) -> bool:
-        return self[0] < self[1]
+        return self.beg < self.end
 
     def __len__(self) -> int:
-        return max(0, self[1] - self[0])
+        return max(0, self.end - self.beg)
 
     def __contains__(self, item: Any) -> bool:
-        return self[0] <= item < self[1]
+        return bool(self.beg <= item < self.end)
 
 
 def intersect(a: HalfOpenRange[Idx], b: HalfOpenRange[Idx]) -> HalfOpenRange[Idx]:
@@ -211,7 +236,7 @@ def assert_critical(condition: bool, message: str | None = None) -> None:
 
 def noexcept(func: Callable[..., T]) -> Callable[..., T]:
     @functools.wraps(func)
-    def wrapper(*args, **kwargs) -> T:
+    def wrapper(*args: Any, **kwargs: Any) -> T:
         try:
             return func(*args, **kwargs)
         except Exception as e:
@@ -222,7 +247,7 @@ def noexcept(func: Callable[..., T]) -> Callable[..., T]:
 
 def not_implemented(func: Callable[..., T]) -> Callable[..., T]:
     @functools.wraps(func)
-    def wrapper(*args, **kwargs) -> T:
+    def wrapper(*args: Any, **kwargs: Any) -> T:
         raise NotImplementedError(f"The function '{func.__name__}' is not implemented yet.")
 
     return wrapper
@@ -637,7 +662,7 @@ class DynamicBitset:
     """
 
     __slots__ = ("_bits", "_num_set_bits")
-    _bits: array.array
+    _bits: "array.array[int]"
     _num_set_bits: int
 
     TYPE_CODE: ClassVar[str] = "Q"
@@ -968,7 +993,7 @@ class TemporaryCudaStream(CachedCudaStream):
     def __enter__(self) -> "TemporaryCudaStream":
         return self
 
-    def __exit__(self, exc_type, exc_value, traceback) -> None:
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
         if not exc_type:
             self._finish_event = self.record_event()
 
@@ -998,7 +1023,7 @@ class MultiStreamExecutor:
     def __enter__(self) -> "MultiStreamExecutor":
         return self
 
-    def __exit__(self, exc_type, exc_value, traceback) -> None:
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
         events = [s.take_finish_event() for s in self._streams]
         self._streams.clear()
         self._finish_event = merge_events(events)
@@ -1043,7 +1068,7 @@ class ItemHolderWithSharedPool(ItemHolderBase[T]):
         return self._pool
 
 
-HolderT = TypeVar("HolderT", bound=ItemHolderWithSharedPool)
+HolderT = TypeVar("HolderT", bound="ItemHolderWithSharedPool[Any]")
 
 
 # For subclassing if holder needs to be customized
@@ -1070,12 +1095,12 @@ class PooledFactoryBase(Generic[T, HolderT]):
 
 def query_total_gpu_memory() -> int:
     _, total = _unwrap(drv.cuMemGetInfo())  # pyright: ignore
-    return total
+    return int(total)
 
 
 def query_free_gpu_memory() -> int:
     free, _ = _unwrap(drv.cuMemGetInfo())  # pyright: ignore
-    return free
+    return int(free)
 
 
 class CudaStreamWrapper:

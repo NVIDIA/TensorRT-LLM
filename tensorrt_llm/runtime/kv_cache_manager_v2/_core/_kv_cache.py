@@ -142,7 +142,7 @@ class _CommitState(enum.Enum):
     USER_STOP = enum.auto()
 
 
-IndexSeq = array.array | memoryview
+IndexSeq = array.array[int] | memoryview
 
 
 # The _KVCache holds unique/shared ownership of memory blocks. On deletion, the ownership if destroys
@@ -170,6 +170,15 @@ IndexSeq = array.array | memoryview
 # three lengths equal to the number of reused tokens.
 # TODO: in __del__, we should check if committed pages are usable for SWA cases. e.g. all pages are
 # dropped except the last one. The last one is not usable.
+class DeltaScratchSlots(NamedTuple):
+    """Module-level rather than nested in _KVCache: mypyc cannot compile
+    class definitions nested in a class body."""
+
+    excess: "TypedIndexList[LifeCycleId, list[ScratchSlotLock]]"
+    delta_cnt: "TypedIndexList[LifeCycleId, int]"
+    scratch_ranges: "TypedIndexList[LifeCycleId, HalfOpenRange[BlockOrdinal]]"
+
+
 class _KVCache:
     __slots__ = (
         "id",
@@ -269,7 +278,7 @@ class _KVCache:
         self._capacity = 0
         self._history_length = 0
         self._commit_state = self.CommitState.ALLOWED
-        self._blocks = cast(TypedIndexList, [])
+        self._blocks = cast("TypedIndexList[BlockOrdinal, SeqBlock]", [])
         self._base_page_indices = make_typed(
             lambda _: make_typed(lambda _: array.array("i"), self.manager._storage.num_life_cycles),
             self.beam_width,
@@ -908,7 +917,7 @@ class _KVCache:
         self,
         accepted_input_tokens: Sequence[TokenIdExt],
         beam_search_indices: Sequence[int] | None = None,
-    ):
+    ) -> None:
         if self.beam_width != 1:
             raise NotImplementedError("Not implemented yet for beam search")
         if not accepted_input_tokens:
@@ -1098,10 +1107,11 @@ class _KVCache:
                 if lc_idx == ssm_lc_id:
                     if self.num_committed_tokens == 0:
                         continue  # fresh SSM — no source to copy from
-                    lock = self._ssm_blocks[beam_idx][lc_idx]
+                    blk_entry = self._ssm_blocks[beam_idx][lc_idx]
                 else:
-                    lock = self._block(last_ordinal, beam_idx)[lc_idx]
-                assert type(lock) is _SharedPageLock
+                    blk_entry = self._block(last_ordinal, beam_idx)[lc_idx]
+                assert type(blk_entry) is _SharedPageLock
+                lock = blk_entry
                 # V2 still copies a partial reuse into a private slot before writing to it.
                 # The copy allocates a block, but it is a miss only without a reusable source.
                 has_partial_reuse_source = self._has_reuse_source(lock)
@@ -1425,8 +1435,10 @@ class _KVCache:
             self._commit_state = self.CommitState.VIRTUAL_STOP
 
         if seq_block.is_committed:
-            for lc_idx, lc in self.manager._life_cycles.attention_life_cycles():
-                stale_range = _KVCache._get_stale_range(tokens_per_block, self.history_length, lc)
+            for lc_idx, attn_lc in self.manager._life_cycles.attention_life_cycles():
+                stale_range = _KVCache._get_stale_range(
+                    tokens_per_block, self.history_length, attn_lc
+                )
                 if ordinal in stale_range:
                     for beam_block in seq_block.pages:
                         beam_block[lc_idx] = None
@@ -1495,7 +1507,7 @@ class _KVCache:
 
     def _lock_held_blocks(
         self, backup_holders: list[tuple[BlockOrdinal, BeamIndex, LifeCycleId, _PageHolder]]
-    ):
+    ) -> None:
         "Revert _unlock_unused_blocks() by locking the held blocks."
         locks = batched_lock_to_gpu(
             self,
@@ -1509,11 +1521,6 @@ class _KVCache:
         for lock in locks:
             user = lock._user
             self._block(user.ordinal, user.beam_index)[user.life_cycle] = lock
-
-    class DeltaScratchSlots(NamedTuple):
-        excess: TypedIndexList[LifeCycleId, list[ScratchSlotLock]]
-        delta_cnt: TypedIndexList[LifeCycleId, int]
-        scratch_ranges: TypedIndexList[LifeCycleId, HalfOpenRange[BlockOrdinal]]
 
     def _take_excess_scratch_slots(self, capacity: int, history_length: int) -> DeltaScratchSlots:
         """
@@ -1546,7 +1553,7 @@ class _KVCache:
                     lock = self._scratch_slots[lc_idx].pop()
                     excess[lc_idx].append(lock)
 
-        return self.DeltaScratchSlots(excess, delta_cnt, scratch_ranges)
+        return DeltaScratchSlots(excess, delta_cnt, scratch_ranges)
 
     def _recover_excess_scratch_slots(
         self, excess_scratch_slots: TypedIndexList[LifeCycleId, list[ScratchSlotLock]]
@@ -1610,7 +1617,7 @@ class _KVCache:
         assert self.num_committed_tokens <= self.history_length <= self.capacity
         assert self.num_blocks == div_up(self.capacity, self.tokens_per_block)
 
-        def get_range(lc: LifeCycle):
+        def get_range(lc: LifeCycle) -> "HalfOpenRange[BlockOrdinal]":
             return _KVCache._get_stale_range(self.tokens_per_block, self.history_length, lc)
 
         stale_ranges = typed_map(self.manager._life_cycles.get(), get_range)

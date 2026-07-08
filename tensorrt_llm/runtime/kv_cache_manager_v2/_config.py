@@ -20,7 +20,7 @@
 import os
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import ClassVar, NewType, Protocol
+from typing import NewType, Protocol
 
 from ._common import CacheTier, LayerId
 
@@ -100,8 +100,6 @@ class LayerType(IntEnum):
 
 @dataclass(slots=True)
 class AttentionLayerConfig:
-    type: ClassVar[LayerType] = LayerType.ATTENTION
-
     layer_id: LayerId
     # Each page can have multiple sub-pages, e.g. separate K and V data, block quantization scales for K and/or V, etc.
     # KV cache manager will automatically group sub-pages of the same size, and redirect pages of different sizes to
@@ -112,6 +110,12 @@ class AttentionLayerConfig:
     # Note that we use None to represent "no sliding window". Sink tokens are excluded.
     sliding_window_size: int | None = None
     num_sink_tokens: int | None = None
+
+    # A property rather than a ClassVar: mypyc-compiled dataclasses treat a
+    # ClassVar as a read-only field and fail in the generated __init__.
+    @property
+    def type(self) -> LayerType:
+        return LayerType.ATTENTION
 
     @property
     def window_size(self) -> int | None:
@@ -125,11 +129,14 @@ class AttentionLayerConfig:
 
 @dataclass(slots=True)
 class SsmLayerConfig:
-    type: ClassVar[LayerType] = LayerType.SSM
-
     layer_id: LayerId
 
     buffers: list[BufferConfig]
+
+    # A property rather than a ClassVar (see AttentionLayerConfig.type).
+    @property
+    def type(self) -> LayerType:
+        return LayerType.SSM
 
     def __post_init__(self) -> None:
         assert len(set(buffer.role for buffer in self.buffers)) == len(self.buffers), (
@@ -149,6 +156,12 @@ class KVCacheDesc:
     def __post_init__(self) -> None:
         assert 0 <= self.history_length <= self.capacity
 
+    def __deepcopy__(self, memo: "dict[int, object]") -> "KVCacheDesc":
+        # All fields are immutable. Explicit override because the
+        # mypyc-compiled frozen dataclass's generated __setstate__ assigns
+        # via plain setattr and trips its own frozen __setattr__.
+        return self
+
 
 # A batch of requests, working as a use case the KVCacheManager must always support.
 @dataclass(slots=True, frozen=True)
@@ -159,6 +172,11 @@ class BatchDesc:
 
     def __post_init__(self) -> None:
         assert self.system_prompt_length >= 0
+
+    def __deepcopy__(self, memo: "dict[int, object]") -> "BatchDesc":
+        # Elements are immutable KVCacheDescs, so a fresh list is a deep
+        # copy. Explicit override for the same mypyc reason as KVCacheDesc.
+        return BatchDesc(list(self.kv_caches), self.system_prompt_length)
 
 
 @dataclass(slots=True)

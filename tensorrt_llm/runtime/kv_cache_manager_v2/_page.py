@@ -350,7 +350,7 @@ class _UniqPageLock:
                 page.manager.schedule_for_eviction(page)
         self.__rawref__.invalidate()
 
-    def notify_finish(self, event: CachedCudaEvent):
+    def notify_finish(self, event: CachedCudaEvent) -> None:
         self.finish_events.append(event)
         # Avoid unbounded growth for system prompt pages shared by all requests
         if len(self.finish_events) > 32:
@@ -505,13 +505,13 @@ class ScratchSlotLock:
         assert self.slot.has_valid_slot
         return self.slot.move_to_new_slot()
 
-    def unlock(self):
+    def unlock(self) -> None:
         assert self.slot.has_valid_slot
         kv_cache = unwrap_rawref(self.owner)
         self.slot.ready_event = kv_cache.finish_event
         kv_cache.manager._storage.release_slot(self.life_cycle, GPU_LEVEL, self.slot)
         assert not self.slot.has_valid_slot
 
-    def __del__(self):
+    def __del__(self) -> None:
         if self.slot.has_valid_slot:
             self.unlock()

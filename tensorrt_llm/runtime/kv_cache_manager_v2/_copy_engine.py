@@ -25,7 +25,7 @@ from importlib.util import find_spec
 from pathlib import Path
 from typing import ClassVar, NamedTuple, Sequence, cast
 
-import cuda.bindings.driver as drv
+import cuda.bindings.driver as drv  # type: ignore[import-untyped]
 
 from ._common import Address, CacheTier, CudaStream, MemAddress
 from ._utils import (
@@ -39,7 +39,7 @@ from ._utils import (
 )
 
 if "tensorrt_llm" in sys.modules:
-    from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (  # noqa # type: ignore
+    from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (  # type: ignore # noqa
         DiskAddress,
         DiskToDiskTask,
         DiskToHostTask,
@@ -58,7 +58,7 @@ else:
     spec = find_spec("kv_cache_manager_v2")
     assert spec is not None and spec.origin is not None
     with temporary_sys_path(str(Path(spec.origin).parent.parent.parent)):
-        from bindings.internal.batch_manager.kv_cache_manager_v2_utils import (  # noqa
+        from bindings.internal.batch_manager.kv_cache_manager_v2_utils import (  # type: ignore # noqa
             DiskAddress,
             DiskToDiskTask,
             DiskToHostTask,
@@ -79,23 +79,31 @@ class CopyTask(NamedTuple):
     src: Address
 
 
-def _copy_gpu_to_gpu(tasks: Sequence[CopyTask], num_bytes: int, stream: CudaStream):
+def _copy_gpu_to_gpu(tasks: Sequence[CopyTask], num_bytes: int, stream: CudaStream) -> None:
     _unwrap(
         drv.CUresult(
-            copy_device_to_device([MemToMemTask(dst, src) for dst, src in tasks], num_bytes, stream)
+            copy_device_to_device(
+                [MemToMemTask(cast(MemAddress, dst), cast(MemAddress, src)) for dst, src in tasks],
+                num_bytes,
+                stream,
+            )
         )
     )
 
 
-def _copy_host_to_host(tasks: Sequence[CopyTask], num_bytes: int, stream: CudaStream):
+def _copy_host_to_host(tasks: Sequence[CopyTask], num_bytes: int, stream: CudaStream) -> None:
     _unwrap(
         drv.CUresult(
-            copy_host_to_host([MemToMemTask(dst, src) for dst, src in tasks], num_bytes, stream)
+            copy_host_to_host(
+                [MemToMemTask(cast(MemAddress, dst), cast(MemAddress, src)) for dst, src in tasks],
+                num_bytes,
+                stream,
+            )
         )
     )
 
 
-def _copy_disk_to_disk(tasks: Sequence[CopyTask], num_bytes: int, stream: CudaStream):
+def _copy_disk_to_disk(tasks: Sequence[CopyTask], num_bytes: int, stream: CudaStream) -> None:
     _unwrap(
         drv.CUresult(
             copy_disk_to_disk(
@@ -119,23 +127,31 @@ def _copy_disk_to_disk(tasks: Sequence[CopyTask], num_bytes: int, stream: CudaSt
     )
 
 
-def _copy_gpu_to_host(tasks: Sequence[CopyTask], num_bytes: int, stream: CudaStream):
+def _copy_gpu_to_host(tasks: Sequence[CopyTask], num_bytes: int, stream: CudaStream) -> None:
     _unwrap(
         drv.CUresult(
-            copy_device_to_host([MemToMemTask(dst, src) for dst, src in tasks], num_bytes, stream)
+            copy_device_to_host(
+                [MemToMemTask(cast(MemAddress, dst), cast(MemAddress, src)) for dst, src in tasks],
+                num_bytes,
+                stream,
+            )
         )
     )
 
 
-def _copy_host_to_gpu(tasks: Sequence[CopyTask], num_bytes: int, stream: CudaStream):
+def _copy_host_to_gpu(tasks: Sequence[CopyTask], num_bytes: int, stream: CudaStream) -> None:
     _unwrap(
         drv.CUresult(
-            copy_host_to_device([MemToMemTask(dst, src) for dst, src in tasks], num_bytes, stream)
+            copy_host_to_device(
+                [MemToMemTask(cast(MemAddress, dst), cast(MemAddress, src)) for dst, src in tasks],
+                num_bytes,
+                stream,
+            )
         )
     )
 
 
-def _copy_disk_to_host(tasks: Sequence[CopyTask], num_bytes: int, stream: CudaStream):
+def _copy_disk_to_host(tasks: Sequence[CopyTask], num_bytes: int, stream: CudaStream) -> None:
     _unwrap(
         drv.CUresult(
             copy_disk_to_host(
@@ -153,7 +169,7 @@ def _copy_disk_to_host(tasks: Sequence[CopyTask], num_bytes: int, stream: CudaSt
     )
 
 
-def _copy_host_to_disk(tasks: Sequence[CopyTask], num_bytes: int, stream: CudaStream):
+def _copy_host_to_disk(tasks: Sequence[CopyTask], num_bytes: int, stream: CudaStream) -> None:
     _unwrap(
         drv.CUresult(
             copy_host_to_disk(
@@ -261,7 +277,7 @@ class StagingBuffer:
             stream_wait_events(self.stream, lock_and_consume_events())
             return self
 
-    def __exit__(self, exc_type, exc_value, traceback) -> None:
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
         event = CachedCudaEvent(self.stream)
         for grain in reversed(self.grains):
             grain.ready_event = event

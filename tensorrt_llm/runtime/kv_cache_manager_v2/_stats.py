@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, fields
+from typing import Self
 
 
 class _StatsDeltaMixin:
@@ -33,7 +34,7 @@ class _StatsDeltaMixin:
         for field in fields(self):
             setattr(self, field.name, 0)
 
-    def copy(self):
+    def copy(self) -> Self:
         return type(self)(**{field.name: getattr(self, field.name) for field in fields(self)})
 
     @property

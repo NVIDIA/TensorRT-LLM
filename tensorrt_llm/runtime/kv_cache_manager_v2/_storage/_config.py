@@ -150,7 +150,7 @@ class StorageConfig:
         return ret
 
     def slot_to_page_indices(self) -> TypedIndexList[LifeCycleId, TypedIndexList[PoolIndex, int]]:
-        ret = [[]] * self.num_life_cycles
+        ret: list[list[int]] = [[]] * self.num_life_cycles
         for pg in self.slot_desc_list:
             for slot in pg.variants:
                 life_cycle = slot.life_cycle_id
@@ -171,7 +171,7 @@ class StorageConfig:
                     for layer_id, count in slot_util.items():
                         if layer_id not in ret:
                             ret[layer_id] = LayerAttr(
-                                life_cycle_id, filled_list(0, num_pools), Fraction(0, 1)
+                                life_cycle_id, filled_list(0, PoolIndex(num_pools)), Fraction(0, 1)
                             )
                         attr = ret[layer_id]
                         assert attr.life_cycle_id == life_cycle_id

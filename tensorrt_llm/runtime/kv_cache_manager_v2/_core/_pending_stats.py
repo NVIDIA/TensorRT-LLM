@@ -39,7 +39,9 @@ class _PendingStatsDelta:
 
     @property
     def empty(self) -> bool:
-        return self.global_stats.empty and self.request_stats.empty and self.iteration_stats.empty
+        return bool(
+            self.global_stats.empty and self.request_stats.empty and self.iteration_stats.empty
+        )
 
 
 @dataclass(slots=True)

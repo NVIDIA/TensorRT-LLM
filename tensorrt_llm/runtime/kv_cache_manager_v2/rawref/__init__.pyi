@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Generic, Optional, TypeVar
+from typing import Any, Generic, Optional, TypeVar
 
 T = TypeVar("T")
 
@@ -73,7 +73,7 @@ class ReferenceType(Generic[T]):
 ref = ReferenceType
 
 # NULL is an invalid reference constant that can be used to initialize __rawref__
-NULL: ReferenceType
+NULL: ReferenceType[Any]
 
 # For type hints, you can use either:
 #   r: ref[MyClass] = ref(obj)

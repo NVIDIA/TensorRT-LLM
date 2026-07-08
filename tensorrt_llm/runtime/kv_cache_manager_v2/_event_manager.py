@@ -22,8 +22,8 @@ from dataclasses import dataclass, field, replace
 from threading import Condition
 from typing import Any, Callable
 
-from tensorrt_llm.logger import logger
-from tensorrt_llm.runtime.kv_cache_hash import (
+from tensorrt_llm.logger import logger  # type: ignore[import-untyped]
+from tensorrt_llm.runtime.kv_cache_hash import (  # type: ignore[import-untyped]
     KV_CACHE_HASH_ALGO_AUTO,
     KV_CACHE_HASH_ALGO_DEFAULT,
     KV_CACHE_HASH_ALGO_V1,
@@ -294,7 +294,7 @@ class KVCacheEventManager:
             if not self._events and timeout_ms is None:
                 while not self._events:
                     self._condition.wait()
-            elif not self._events and timeout_ms > 0:
+            elif not self._events and timeout_ms is not None and timeout_ms > 0:
                 deadline = time.monotonic() + timeout_ms / 1000
                 while not self._events:
                     remaining = deadline - time.monotonic()
@@ -453,7 +453,7 @@ class KVCacheEventManager:
     def _normalize_block_hash(self, block_hash: BlockHashLike) -> EventBlockHash:
         if isinstance(block_hash, bytes):
             if self._hash_algo == KV_CACHE_HASH_ALGO_V2_SHA256_64:
-                return truncate_sha256_hash_to_int64(block_hash)
+                return int(truncate_sha256_hash_to_int64(block_hash))
             return block_hash.hex()
         return block_hash
 
@@ -607,7 +607,7 @@ class KVCacheEventManager:
                 KV_CACHE_HASH_ALGO_V1,
             )
             self._warned_v1_hash_fallback = True
-        return truncate_sha256_hash_to_int64(block_key)
+        return int(truncate_sha256_hash_to_int64(block_key))
 
     @staticmethod
     def _is_radix_block(value: Any) -> bool:
@@ -630,9 +630,11 @@ class KVCacheEventManager:
         lora_task_id: int | None,
         cache_salt_id: int | None,
     ) -> int:
-        return hash_v1_block_key(
-            tokens,
-            parent_hash=parent_hash,
-            lora_task_id=lora_task_id,
-            cache_salt_id=cache_salt_id,
+        return int(
+            hash_v1_block_key(
+                tokens,
+                parent_hash=parent_hash,
+                lora_task_id=lora_task_id,
+                cache_salt_id=cache_salt_id,
+            )
         )

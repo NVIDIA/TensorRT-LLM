@@ -15,7 +15,7 @@
 
 from typing import Callable, Iterator, Protocol, cast
 
-from llist import dllist, dllistnode
+from llist import dllist, dllistnode  # type: ignore[import-not-found]
 
 from .._common import NDEBUG, CacheLevel, PageStatus, Priority
 from .._exceptions import OutOfPagesError
@@ -86,14 +86,14 @@ class LRUEvictionPolicy:
     def pop(self) -> EvictablePage:
         victim = self._queue.first
         assert victim is not None
-        page = victim.value
+        page = cast(EvictablePage, victim.value)
         self.remove(victim)
         return page
 
     def remove(self, node: dllistnode) -> EvictablePage:
         # assert isinstance(node, NodeRef) # mypyc does not support runtime_checkable
         assert node == node.value.node_ref
-        return self._queue.remove(node)
+        return cast(EvictablePage, self._queue.remove(node))
 
     def __len__(self) -> int:
         return len(self._queue)
@@ -169,7 +169,8 @@ class PerLevelEvictionController:  # for one cache level
         num_pool_groups = max(life_cycle_grouping) + 1
         assert num_pool_groups == len(set(life_cycle_grouping))
         self._policies = cast(
-            TypedIndexList, [PrioritizedLRUEvictionPolicy() for _ in range(num_pool_groups)]
+            "TypedIndexList[PoolGroupIndex, EvictionPolicy]",
+            [PrioritizedLRUEvictionPolicy() for _ in range(num_pool_groups)],
         )
 
     def __del__(self) -> None:
@@ -182,7 +183,7 @@ class PerLevelEvictionController:  # for one cache level
         pg_idx = self._life_cycle_grouping[life_cycle]
         return self._policies[pg_idx]
 
-    def schedule_for_eviction(self, page: EvictablePage, evict_first: bool = False):
+    def schedule_for_eviction(self, page: EvictablePage, evict_first: bool = False) -> None:
         assert page.node_ref is None and page.cache_level == self._cache_level
         page.node_ref = self._get_policy(page.life_cycle).push(page, evict_first)
         assert unwrap_optional(page.node_ref).value is page

@@ -43,7 +43,7 @@ class Average:
     sum: float
     count: int
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.sum = 0.0
         self.count = 0
 

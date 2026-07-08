@@ -132,11 +132,12 @@ Children = dict[BlockKey, Child]
 
 
 def try_get_tree(block: "RootBlock | Block") -> "BlockRadixTree | None":
-    node = block
+    node: "BlockRadixTree | Block | RootBlock" = block
     while not isinstance(node, BlockRadixTree):
-        node = node._prev()
-        if node is None:
+        prev = node._prev()
+        if prev is None:
             return None
+        node = prev
     return node
 
 
@@ -397,7 +398,7 @@ class Block:
         # It's possible to implement more sophisticated logic to remove useless blocks for SWA, e.g.
         # check if consecutive available blocks is sufficient for window_size. (TRTLLM-8802)
         # But for simplicity, we leave it for now.
-        curr = self
+        curr: "Block | RootBlock" = self
         while (
             (isinstance(curr, Block) and curr.storage[lc_idx] is None)
             and not curr.next
