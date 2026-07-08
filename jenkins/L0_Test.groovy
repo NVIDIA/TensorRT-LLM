@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@user/zhanruis/0614_fix_appendBuildDescription']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -5473,8 +5473,6 @@ pipeline {
                         } else {
                             echo "Skip multi-GPU testing. No test to run."
                         }
-                        // [TEST-ONLY] Force single-GPU failure to validate multi-GPU blocking + shared-lib retry. Remove before merge.
-                        error "[TEST] Intentional single-GPU failure for testing multi-GPU blocking behavior."
                         if (singleGpuJobs.size() > 0) {
                             singleGpuJobs.failFast = params.enableFailFast
                             parallel singleGpuJobs
