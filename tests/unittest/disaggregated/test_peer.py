@@ -1,7 +1,6 @@
 import numpy as np
 import pytest
 
-from tensorrt_llm._torch.disaggregation.base.region import DataRole
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import (
     HeadMatchMapper,
     HeadMismatchMapper,
@@ -32,13 +31,13 @@ def make_page_table(pool_ptrs=None, block_bytes=None, global_layer_ids=None):
     if global_layer_ids is None:
         global_layer_ids = [0, 1]
 
-    # Build buffer entries: KEY + VALUE per local layer
+    # Build buffer entries: K + V per local layer
     buffer_size = 256  # bytes per buffer entry (arbitrary for tests)
     entries = []
     for i in range(len(global_layer_ids)):
         base_offset = i * buffer_size * 2
-        entries.append((i, int(DataRole.KEY), base_offset, buffer_size))
-        entries.append((i, int(DataRole.VALUE), base_offset + buffer_size, buffer_size))
+        entries.append((i, base_offset, buffer_size))
+        entries.append((i, base_offset + buffer_size, buffer_size))
     buffer_entries = np.array(entries, dtype=BUFFER_ENTRY_DTYPE)
 
     local_layers = [
@@ -403,3 +402,33 @@ def test_peer_registrar_get_kv_map_head_mismatch():
     reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
     mapper = reg.get_kv_map(peer_ri, (0, 0), (0, 0))
     assert isinstance(mapper, HeadMismatchMapper)
+
+
+def test_peer_registrar_tpb_divisible_warns_but_compatible():
+    # local=16, peer=32: 32 % 16 == 0 → compatible with warning, register succeeds
+    self_rankinfo = make_rankinfo(instance_name="local", tokens_per_block=16)
+    reg = _make_peer_registrar(self_rankinfo)
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=5,
+        tokens_per_block=32,
+        layer_num_per_pp=[2],
+        page_table=make_page_table(),
+    )
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+    assert reg.get_peer_rank_info(peer_ri.instance_name, peer_ri.instance_rank) is not None
+
+
+def test_peer_registrar_tpb_not_divisible_raises():
+    # local=16, peer=24: 24 % 16 != 0 → incompatible, register raises ValueError
+    self_rankinfo = make_rankinfo(instance_name="local", tokens_per_block=16)
+    reg = _make_peer_registrar(self_rankinfo)
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=6,
+        tokens_per_block=24,
+        layer_num_per_pp=[2],
+        page_table=make_page_table(),
+    )
+    with pytest.raises(ValueError):
+        reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)

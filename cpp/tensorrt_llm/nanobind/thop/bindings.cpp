@@ -176,8 +176,9 @@ void initBindings(nb::module_& m)
         nb::arg("trtllm_gen_jit_warmup") = false, nb::arg("compressed_kv_cache_pool_ptr") = std::nullopt,
         nb::arg("is_cross") = false, nb::arg("cross_kv") = std::nullopt,
         nb::arg("relative_attention_bias") = std::nullopt, nb::arg("relative_attention_max_distance") = 0,
-        nb::arg("spec_decoding_target_max_draft_tokens") = std::nullopt, "Multi-head attention operation",
-        nb::call_guard<nb::gil_scoped_release>());
+        nb::arg("spec_decoding_target_max_draft_tokens") = std::nullopt, nb::arg("quant_scale_qkv") = std::nullopt,
+        nb::arg("dsv4_inv_rope_cos_sin_cache") = std::nullopt, nb::arg("enable_dsv4_epilogue_fusion") = false,
+        "Multi-head attention operation", nb::call_guard<nb::gil_scoped_release>());
 
     m.def(
         "get_helix_workspace_size_per_rank",

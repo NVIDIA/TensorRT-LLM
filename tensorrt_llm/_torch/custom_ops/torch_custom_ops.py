@@ -57,26 +57,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
 from tensorrt_llm.bindings.internal.thop import BufferKind
 
 
-def _init_deep_gemm_pdl() -> None:
-    try:
-        cuda_available = torch.cuda.is_available()
-    except RuntimeError as err:
-        logger.warning(
-            f"Failed to query CUDA availability for DeepGEMM PDL: {err}")
-        return
-
-    if not cuda_available:
-        return
-
-    try:
-        deep_gemm.set_pdl(get_env_enable_pdl())
-    except RuntimeError as err:
-        logger.warning(f"Failed to initialize DeepGEMM PDL: {err}")
-
-
-_init_deep_gemm_pdl()
-
-
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
 @torch.library.custom_op("trtllm::bmm_out", mutates_args=("out", ))
 def bmm_out(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
@@ -353,33 +333,31 @@ def fused_moe(
             "Provide either (fc1_lora_ranks, ...) or (fc1_slot_lora_ranks, ..., token_to_slot), not both."
         )
     run_moe = moe_runner.fused_moe_runner.run_moe_min_latency if min_latency_mode else moe_runner.fused_moe_runner.run_moe
+    # Both run_moe overloads share this positional prefix. The TorchBind schemas
+    # do not honor C++ default arguments, so every positional must be supplied.
+    run_moe_args = [
+        input, token_selected_experts, token_final_scales, fc1_expert_weights,
+        fc1_expert_biases, fc2_expert_weights, fc2_expert_biases, quant_scales,
+        input_sf, swizzled_input_sf, swiglu_alpha, swiglu_beta, swiglu_limit,
+        tp_size, tp_rank, ep_size, ep_rank, cluster_size,
+        cluster_rank, enable_alltoall, min_latency_mode,
+        [gemm_tactic_1, gemm_tactic_2
+         ], activation_type, unpadded_hidden_size, tuner_num_tokens, out_tensor
+    ]
+    if not min_latency_mode:
+        # run_moe takes use_dynamic_fc2_scale plus the eager (per-request) and
+        # CUDA-graph (slot-indexed) LoRA tensor families; run_moe_min_latency
+        # stops at out_tensor.
+        run_moe_args += [
+            use_dynamic_fc2_scale, fc1_lora_ranks, fc1_lora_weight_ptrs,
+            fc2_lora_ranks, fc2_lora_weight_ptrs, gated_lora_ranks,
+            gated_lora_weight_ptrs, host_request_types, host_context_lengths,
+            lora_max_low_rank, fc1_slot_lora_ranks, fc1_slot_lora_weight_ptrs,
+            fc2_slot_lora_ranks, fc2_slot_lora_weight_ptrs,
+            gated_slot_lora_ranks, gated_slot_lora_weight_ptrs, token_to_slot
+        ]
     try:
-        if min_latency_mode:
-            output = run_moe(input, token_selected_experts, token_final_scales,
-                             fc1_expert_weights, fc1_expert_biases,
-                             fc2_expert_weights, fc2_expert_biases,
-                             quant_scales, input_sf, swizzled_input_sf,
-                             swiglu_alpha, swiglu_beta, swiglu_limit, tp_size,
-                             tp_rank, ep_size, ep_rank, cluster_size,
-                             cluster_rank, enable_alltoall, min_latency_mode,
-                             [gemm_tactic_1, gemm_tactic_2], activation_type,
-                             unpadded_hidden_size, tuner_num_tokens, out_tensor)
-        else:
-            output = run_moe(
-                input, token_selected_experts, token_final_scales,
-                fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
-                fc2_expert_biases, quant_scales, input_sf, swizzled_input_sf,
-                swiglu_alpha, swiglu_beta, swiglu_limit, tp_size, tp_rank,
-                ep_size, ep_rank, cluster_size, cluster_rank, enable_alltoall,
-                min_latency_mode, [gemm_tactic_1, gemm_tactic_2],
-                activation_type, unpadded_hidden_size, tuner_num_tokens,
-                out_tensor, use_dynamic_fc2_scale, fc1_lora_ranks,
-                fc1_lora_weight_ptrs, fc2_lora_ranks, fc2_lora_weight_ptrs,
-                gated_lora_ranks, gated_lora_weight_ptrs, host_request_types,
-                host_context_lengths, lora_max_low_rank, fc1_slot_lora_ranks,
-                fc1_slot_lora_weight_ptrs, fc2_slot_lora_ranks,
-                fc2_slot_lora_weight_ptrs, gated_slot_lora_ranks,
-                gated_slot_lora_weight_ptrs, token_to_slot)
+        output = run_moe(*run_moe_args)
     except RuntimeError as e:
         error_msg = str(e)
         if "DeepGEMM only supports Hopper" in error_msg:
@@ -1865,8 +1843,19 @@ class Fp8QuantKernelRunner(TunableRunner):
 class fp8SwapABGemmRunner(TunableRunner):
     """Runs quantize + DeepGemm FP8 GEMM. Single tactic for JIT warmup."""
 
-    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
-        0, 0, deep_gemm_gen_tuning_buckets), ), )
+    # DeepGemm performs JIT compilation as a side effect of the tuning
+    # call. If we let the autotuner persist this op's tactic to disk, a
+    # subsequent process startup loads the cached tactic and skips the
+    # tuning path entirely — meaning the DeepGemm JIT warmup never runs
+    # and inference falls back to a slower uncompiled path.
+    # `exclude_from_cache=True` keeps the in-process cache working but
+    # ensures the tuning (and the JIT warmup it triggers) repeats on
+    # every process startup.
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, deep_gemm_gen_tuning_buckets), ),
+        exclude_from_cache=True,
+    )
 
     def __init__(self, output_dtype: torch.dtype, disable_ue8m0_cast: bool,
                  quant_tactic: int):
@@ -2113,17 +2102,20 @@ class AllReduceRunner(TunableRunner):
         op: int,
         eps: float,
         trigger_completion_at_end: bool,
+        input_uses_nccl_window: bool = False,
     ):
         self.tp_size = tp_size
         self.op = op
         self.group = group
         self.eps = eps
         self.trigger_completion_at_end = trigger_completion_at_end
+        self.input_uses_nccl_window = input_uses_nccl_window
 
     def unique_id(self):
         return (
             self.tp_size,
             self.op,
+            self.input_uses_nccl_window,
         )
 
     @classmethod
@@ -2260,6 +2252,16 @@ def _(
     return None
 
 
+# Host-side predicate for custom-op implementations only. Do not call this
+# directly from model forward code or compiled graphs; it returns a Python bool
+# and is intended only to let another custom op gate its setup logic.
+@torch.library.register_fake("trtllm::is_nccl_window_buffer")
+def _(input: torch.Tensor, group: List[int]) -> bool:
+    raise AssertionError(
+        "trtllm::is_nccl_window_buffer should only be called inside another "
+        "custom op runtime implementation, not from fake/tracing execution.")
+
+
 @torch.library.custom_op("trtllm::tunable_allreduce", mutates_args=())
 def tunable_allreduce(
     input: torch.Tensor,
@@ -2276,13 +2278,24 @@ def tunable_allreduce(
 ) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
+    group_list = list(group)
 
+    def _uses_nccl_symmetric_memory_window(input_tensor: torch.Tensor) -> bool:
+        # Keep is_nccl_window_buffer scoped inside this custom op. Calling it
+        # from normal model code would expose a host-side bool predicate to the
+        # graph instead of using it only to configure autotune execution.
+        return (isinstance(input_tensor, torch.Tensor) and input_tensor.is_cuda
+                and torch.ops.trtllm.is_nccl_window_buffer(
+                    input_tensor, group_list))
+
+    input_uses_nccl_window = _uses_nccl_symmetric_memory_window(input)
     allreduce_runner = AllReduceRunner(
         len(group),
         group,
         op,
         eps,
         trigger_completion_at_end,
+        input_uses_nccl_window,
     )
 
     def _inputs_pre_hook_register_nccl_symmetric_memory_window(
@@ -2290,11 +2303,13 @@ def tunable_allreduce(
         if not inputs:
             return inputs
         input_tensor = inputs[0]
+        if not input_uses_nccl_window:
+            return inputs
         if not isinstance(input_tensor,
                           torch.Tensor) or not input_tensor.is_cuda:
             return inputs
         nccl_symmetric_memory_window_tensor, actual_kind = torch.ops.trtllm.allocate_output(
-            input_tensor, int(BufferKind.NCCL_WINDOW), list(group))
+            input_tensor, int(BufferKind.NCCL_WINDOW), group_list)
         if actual_kind != int(BufferKind.NCCL_WINDOW):
             return inputs
         nccl_symmetric_memory_window_tensor.copy_(input_tensor)
@@ -2302,9 +2317,12 @@ def tunable_allreduce(
         new_inputs[0] = nccl_symmetric_memory_window_tensor
         return new_inputs
 
-    tuning_config = replace(
-        AllReduceRunner.tuning_config,
-        inputs_pre_hook=_inputs_pre_hook_register_nccl_symmetric_memory_window)
+    tuning_config = AllReduceRunner.tuning_config
+    if input_uses_nccl_window:
+        tuning_config = replace(
+            AllReduceRunner.tuning_config,
+            inputs_pre_hook=
+            _inputs_pre_hook_register_nccl_symmetric_memory_window)
 
     _, best_tactic = tuner.choose_one(
         "trtllm::tunable_allreduce::allreduce",

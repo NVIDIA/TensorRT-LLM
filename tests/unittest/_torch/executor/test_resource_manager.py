@@ -825,6 +825,42 @@ class TestResourceManager(unittest.TestCase):
         simulate_prefill_completion_only_use_for_testing(req3)
         kv_cache_manager.free_resources(req3)
 
+    def test_batch_cache_indices_honor_requested_blocks_with_beams(self):
+        """V1 truncates packed beam cache indices to the requested blocks."""
+        kv_cache_manager = KVCacheManager(
+            kv_cache_config=KvCacheConfig(max_tokens=256,
+                                          enable_block_reuse=False),
+            kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
+            CacheType.SELF,
+            num_layers=2,
+            num_kv_heads=2,
+            head_dim=128,
+            tokens_per_block=8,
+            max_seq_len=64,
+            max_batch_size=1,
+            max_beam_width=2,
+            mapping=Mapping(),
+        )
+        try:
+            request_id = 7
+            kv_cache_manager.add_dummy_requests([request_id], [64],
+                                                max_beam_width=2)
+
+            full_indices = kv_cache_manager.get_batch_cache_indices(
+                [request_id], beam_width=2)
+            requested_blocks = 4
+            truncated_indices = kv_cache_manager.get_batch_cache_indices(
+                [request_id],
+                beam_width=2,
+                num_blocks_per_seq=[requested_blocks],
+            )
+
+            self.assertGreater(len(full_indices[0]), requested_blocks)
+            self.assertEqual(truncated_indices,
+                             [full_indices[0][:requested_blocks]])
+        finally:
+            kv_cache_manager.shutdown()
+
     def test_kv_cache_manager_with_execution_stream(self):
         """
         Test that KVCacheManager uses the provided execution_stream.

@@ -5,7 +5,7 @@ import sys
 import weakref
 from dataclasses import dataclass, field
 from itertools import chain
-from typing import Any, Dict, Literal, NewType, Optional, TypeAlias, cast
+from typing import Any, Dict, NewType, Optional, TypeAlias, cast
 
 if sys.version_info[:2] >= (3, 12):
     from typing import override
@@ -42,6 +42,80 @@ from tensorrt_llm._utils import prefer_pinned
 
 _FORCE_RAGGED_FA2 = False
 """Used for testing."""
+
+_MAX_CUDA_THREADS_PER_BLOCK = 1024
+
+
+def _slice_paged_kv_cache_heads(
+    paged_kv_cache: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    start: int,
+    end: int,
+    kv_layout: str,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    if kv_layout == "HND":
+        head_axis = 2
+    elif kv_layout == "NHD":
+        head_axis = 3
+    else:
+        raise ValueError(f"Unsupported kv_layout: {kv_layout}")
+
+    if isinstance(paged_kv_cache, tuple):
+        head_axis -= 1
+        index = [slice(None)] * 4
+        index[head_axis] = slice(start, end)
+        return tuple(cache[tuple(index)] for cache in paged_kv_cache)
+
+    index = [slice(None)] * 5
+    index[head_axis] = slice(start, end)
+    return paged_kv_cache[tuple(index)]
+
+
+def _append_paged_kv_cache(
+    append_key: torch.Tensor,
+    append_value: torch.Tensor,
+    batch_indices: torch.Tensor,
+    positions: torch.Tensor,
+    paged_kv_cache: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_last_page_len: torch.Tensor,
+    kv_layout: str = "NHD",
+) -> None:
+    """Split FlashInfer paged-KV appends that exceed CUDA's CTA limit."""
+    head_dim = append_key.shape[-1]
+    vec_size = max(16 // append_key.element_size(), head_dim // 32)
+    threads_per_head = head_dim // vec_size
+    max_heads_per_launch = _MAX_CUDA_THREADS_PER_BLOCK // threads_per_head
+
+    num_kv_heads = append_key.shape[1]
+    if num_kv_heads <= max_heads_per_launch:
+        flashinfer.page.append_paged_kv_cache(
+            append_key=append_key,
+            append_value=append_value,
+            batch_indices=batch_indices,
+            positions=positions,
+            paged_kv_cache=paged_kv_cache,
+            kv_indices=kv_indices,
+            kv_indptr=kv_indptr,
+            kv_last_page_len=kv_last_page_len,
+            kv_layout=kv_layout,
+        )
+        return
+
+    for start in range(0, num_kv_heads, max_heads_per_launch):
+        end = min(start + max_heads_per_launch, num_kv_heads)
+        flashinfer.page.append_paged_kv_cache(
+            append_key=append_key[:, start:end],
+            append_value=append_value[:, start:end],
+            batch_indices=batch_indices,
+            positions=positions,
+            paged_kv_cache=_slice_paged_kv_cache_heads(paged_kv_cache, start,
+                                                       end, kv_layout),
+            kv_indices=kv_indices,
+            kv_indptr=kv_indptr,
+            kv_last_page_len=kv_last_page_len,
+            kv_layout=kv_layout,
+        )
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -126,11 +200,6 @@ class FlashInferWrappers:
 @dataclass(kw_only=True)
 class FlashInferAttentionMetadata(AttentionMetadata):
     workspace_buffer: Optional[torch.Tensor] = None
-
-    # cache concat/split kernels when using PD disaggregation
-    # expects KV cache in [max_num_pages, 2, num_kv_heads, page_size, head_dim] layout,
-    # so set kv_layout as "HND" here
-    kv_layout: Literal["NHD", "HND"] = "HND"
 
     paged_kv_indptr_decode: torch.Tensor = field(init=False)
     paged_kv_indptr_prefill: torch.Tensor = field(init=False)
@@ -888,11 +957,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             raise ValueError(
                 "multi_item_part_lens with KV cache is not supported")
 
-        # indices of used cache blocks for each sequence
-        assert self.request_ids is not None
-        block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(
-            self.request_ids)
-
         # number of tokens in the kv cache for each sequence in the batch
         cached_token_lens = torch.tensor(
             self.kv_cache_params.num_cached_tokens_per_seq, dtype=torch.int)
@@ -905,7 +969,19 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         else:
             self.num_ctx_cached_tokens = 0
 
-        # number of tokens needed in the kv cache for each sequence after the next pass
+        # Number of tokens needed in the KV cache after the next pass. Compute
+        # block counts on the host so page-table preparation does not wait for
+        # a GPU round trip before converting host-resident cache indices.
+        kv_lens_host = cached_token_lens + self.seq_lens_kv
+        self.num_blocks = ((kv_lens_host + self.page_size - 1) //
+                           self.page_size).tolist()
+
+        # indices of used cache blocks for each sequence
+        assert self.request_ids is not None
+        block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(
+            self.request_ids, num_blocks_per_seq=self.num_blocks)
+
+        # GPU copy used by the attention wrappers and last-page metadata.
         kv_lens = self.cached_token_lens + self.seq_lens_kv_cuda
 
         # start and end indices of each sequence in the ragged key and value
@@ -922,8 +998,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         # NOTE: do not use len(block_ids) - that will give you a number
         # that can be too big if using chunked prefill/kv cache reuse
         # since we allocate all blocks ahead of time.
-        num_blocks = ((kv_lens + self.page_size - 1) // self.page_size)
-        self.num_blocks = num_blocks.tolist()
         self.num_context_blocks = sum(self.num_blocks[:self.num_contexts])
         self.num_generation_blocks = sum(self.num_blocks[self.num_contexts:])
 
@@ -959,7 +1033,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                     continue
                 rep_layer = self._vswa_pool_to_rep_layer[pool_id]
                 pool_block_ids = self.kv_cache_manager.get_batch_cache_indices(
-                    self.request_ids, layer_idx=rep_layer)
+                    self.request_ids,
+                    layer_idx=rep_layer,
+                    num_blocks_per_seq=self.num_blocks)
                 pool_idx_list = []
                 for i, blk_ids in enumerate(pool_block_ids):
                     pool_idx_list.extend(blk_ids[:self.num_blocks[i]])
@@ -971,7 +1047,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self._vswa_active_pool_id = primary_pool_id
 
         # number of tokens in the last cache block used by each sequence
-        paged_kv_last_page_len = kv_lens - (num_blocks - 1) * self.page_size
+        num_blocks_cuda = ((kv_lens + self.page_size - 1) // self.page_size)
+        paged_kv_last_page_len = kv_lens - (num_blocks_cuda -
+                                            1) * self.page_size
         self._paged_kv_last_page_len[:paged_kv_last_page_len.size(0)].copy_(
             paged_kv_last_page_len, non_blocking=True)
 
@@ -1390,33 +1468,6 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             self.has_fp8_kv_cache = self.quant_config.layer_quant_mode.has_fp8_kv_cache(
             )
 
-    def mla_rope_generation(
-        self,
-        fused_q: torch.Tensor,
-        q_pe: torch.Tensor,
-        latent_cache: torch.Tensor,
-        metadata,
-        cu_q_seqlens: torch.Tensor,
-        cu_kv_seqlens: torch.Tensor,
-        fmha_scheduler_counter: torch.Tensor,
-        mla_bmm1_scale,
-        mla_bmm2_scale,
-        quant_q_buffer,
-        out_scale=None,
-    ) -> None:
-        """Stub for MLA generation rope step used when FlashInfer is the mqa backend.
-
-        FlashInferAttention does not fuse RoPE (support_fused_rope returns False),
-        so RoPE is applied externally in MLA.forward_impl before this point.
-        q_pe already has RoPE applied; we just copy it into the rope slot of
-        fused_q so that forward_absorption_generation can pass fused_q directly
-        to _mla_forward_generation.  The latent_cache KV-cache append is handled
-        inside _mla_forward_generation when forward() is called.
-        """
-        # fused_q shape: [num_tokens, num_heads, kv_lora_rank + qk_rope_head_dim]
-        # q_pe shape:    [num_tokens, num_heads, qk_rope_head_dim]
-        fused_q[..., self.kv_lora_rank:] = q_pe
-
     def _get_mla_caches(
         self,
         metadata: "FlashInferAttentionMetadata",
@@ -1771,7 +1822,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 f"KV cache dtype {kv_cache.dtype} does not match k/v dtype {k.dtype}/{v.dtype}"
             )
 
-            flashinfer.page.append_paged_kv_cache(
+            _append_paged_kv_cache(
                 append_key=k,
                 append_value=v,
                 batch_indices=metadata.batch_indices,
@@ -1929,8 +1980,8 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             else:
                 output = torch.empty_like(q)
 
-        # FlashInfer's sliding window attention is inclusive, while the attention window size defined in TRTLLM is exclusive.
-        # So we need to subtract 1 from the attention window size for a consistent behavior.
+        # FlashInfer's sliding window attention is inclusive, while the attention window size defined
+        # in TRTLLM is exclusive. Subtract 1 from the attention window size for consistent behavior.
         attention_window_size = forward_args.attention_window_size
         if attention_window_size is not None:
             attention_window_size = attention_window_size - 1

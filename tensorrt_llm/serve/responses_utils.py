@@ -663,16 +663,17 @@ def _response_output_item_to_chat_completion_message(
                 return item
             else:
                 raise ValueError(f"Invalid input message item: {item}")
-        case "message":
-            return {
-                "role": "assistant",
-                "content": item["content"][0]["text"],
-            }
-        case "reasoning":
-            return {
-                "role": "assistant",
-                "reasoning": item["content"][0]["text"],
-            }
+        case "message" | "reasoning":
+            content = item.get("content") or []
+            if not content:
+                raise ValueError(
+                    f"Input item of type {item_type!r} has empty or missing 'content'"
+                )
+            first = content[0]
+            text = first.get("text", "") if isinstance(
+                first, dict) else getattr(first, "text", "")
+            key = "content" if item_type == "message" else "reasoning"
+            return {"role": "assistant", key: text}
         case "function_call":
             return {
                 "role": "function",

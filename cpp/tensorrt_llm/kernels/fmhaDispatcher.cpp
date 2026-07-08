@@ -58,9 +58,9 @@ FmhaDispatcher::FmhaDispatcher(MHARunnerFixedParams fixedParams)
     if (mUseTllmGen)
     {
         auto [dataTypeK, dataTypeV] = unpack_kv_data_type(mFixedParams.dataTypeKv);
-        mTllmGenFMHARunner.reset(
-            new TllmGenFmhaRunner(mFixedParams.dataType, dataTypeK, dataTypeV, mFixedParams.dataTypeOut,
-                mFixedParams.sageBlockSizeQ, mFixedParams.sageBlockSizeK, 0, mFixedParams.sageBlockSizeV));
+        mTllmGenFMHARunner.reset(new TllmGenFmhaRunner(mFixedParams.dataType, dataTypeK, dataTypeV,
+            mFixedParams.dataTypeOut, mFixedParams.sageBlockSizeQ, mFixedParams.sageBlockSizeK, 0,
+            mFixedParams.sageBlockSizeV, mFixedParams.fusesDsv4InvRopeFp8Quant));
         if (!isSupported())
         {
             TLLM_LOG_WARNING("TRTLLM-GEN does not support the requested kernels.");
@@ -141,6 +141,7 @@ bool FmhaDispatcher::isSupported()
                 = (mFixedParams.useSparseMLA && mFixedParams.headSizeV == mFixedParams.headSize)
                 ? SparseType::DynamicTokenSparse
                 : SparseType::StaticTokenSparse;
+            tllmRunnerParams.mDsv4EpilogueFusion.enabled = mFixedParams.fusesDsv4InvRopeFp8Quant;
             tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
             tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
             // Generation-style kernels on long KV can pick MultiCtasKv cubins
@@ -221,6 +222,12 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         tllmRunnerParams.oSfScalePtr = runnerParams.oSfScalePtr;
         tllmRunnerParams.oPtr = runnerParams.outputPtr;
         tllmRunnerParams.oSfPtr = runnerParams.outputSfPtr;
+        if (runnerParams.dsv4EpilogueFusion.enabled)
+        {
+            tllmRunnerParams.mDsv4EpilogueFusion.enabled = true;
+            tllmRunnerParams.mDsv4EpilogueFusion.cosSinCache = runnerParams.dsv4EpilogueFusion.cosSinCache;
+            tllmRunnerParams.mDsv4EpilogueFusion.scaleBufM = runnerParams.dsv4EpilogueFusion.scaleBufM;
+        }
         // The sequence lengths for K/V.
         tllmRunnerParams.seqLensKvPtr = reinterpret_cast<int const*>(runnerParams.kvSeqLenPtr);
         // Assume same headDim for Qk and V here.

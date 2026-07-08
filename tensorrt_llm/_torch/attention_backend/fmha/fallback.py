@@ -18,10 +18,6 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
-from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
-    SkipSoftmaxKernelParams,
-    SkipSoftmaxParams,
-)
 from tensorrt_llm.bindings.internal import thop
 
 from .interface import Fmha
@@ -39,6 +35,8 @@ _THOP_EXCLUDED_FIELDS: frozenset = frozenset(
         "topk_indices",  # DSA-only
         "attention_mask_data",  # custom-mask code path
         "out_scale_sf",  # promoted into ``out_scale`` in ``TrtllmAttention.forward`` for NVFP4 path
+        "skip_mla_rope_generation",  # handled in ``TrtllmAttention.forward`` for the test-only MLA path
+        "timestep",  # used to populate skip-softmax params in ``TrtllmAttention.forward``
     }
 )
 
@@ -60,18 +58,11 @@ class FallbackFmha(Fmha):
         forward_args: AttentionForwardArgs,
     ) -> None:
         attn = self.attn
-        sparse_params = attn.sparse_params
-        skip_softmax_kernel_params = (
-            sparse_params.scheduler.get_kernel_params(timestep=forward_args.timestep)
-            if isinstance(sparse_params, SkipSoftmaxParams)
-            else SkipSoftmaxKernelParams()
-        )
 
         # Every kwarg sources from ``attn`` / ``metadata`` / ``forward_args``
         # (with ``forward_args.sparse_prediction`` for sparse-attn inputs),
-        # ``skip_softmax_kernel_params``, or a literal allowlisted in
-        # ``_THOP_LITERALS``. ``test_attention_op_sync.py`` enforces this
-        # statically.
+        # or a literal allowlisted in ``_THOP_LITERALS``.
+        # ``test_attention_op_sync.py`` enforces this statically.
         thop.attention(
             q=q,
             k=k,
@@ -94,7 +85,7 @@ class FallbackFmha(Fmha):
             block_ids_per_seq=metadata.block_ids_per_seq,
             tokens_per_block=metadata.tokens_per_block,
             max_num_requests=metadata.max_num_requests,
-            beam_width=metadata.beam_width,
+            beam_width=metadata.effective_beam_width,
             use_paged_context_fmha=metadata.use_paged_context_fmha,
             helix_position_offsets=metadata.helix_position_offsets,
             helix_is_inactive_rank=metadata.helix_is_inactive_rank,
@@ -137,6 +128,9 @@ class FallbackFmha(Fmha):
             mla_bmm1_scale=forward_args.mla_bmm1_scale,
             mla_bmm2_scale=forward_args.mla_bmm2_scale,
             quant_q_buffer=forward_args.quant_q_buffer,
+            quant_scale_qkv=forward_args.quant_scale_qkv,
+            dsv4_inv_rope_cos_sin_cache=forward_args.dsv4_inv_rope_cos_sin_cache,
+            enable_dsv4_epilogue_fusion=forward_args.enable_dsv4_epilogue_fusion,
             sage_attn_num_elts_per_blk_q=forward_args.sage_attn_num_elts_per_blk_q,
             sage_attn_num_elts_per_blk_k=forward_args.sage_attn_num_elts_per_blk_k,
             sage_attn_num_elts_per_blk_v=forward_args.sage_attn_num_elts_per_blk_v,
@@ -146,6 +140,8 @@ class FallbackFmha(Fmha):
             cross_kv=forward_args.cross_kv,
             relative_attention_bias=forward_args.relative_attention_bias,
             relative_attention_max_distance=forward_args.relative_attention_max_distance,
+            skip_softmax_threshold_scale_factor_prefill=forward_args.skip_softmax_kernel_params.threshold_scale_factor_prefill,
+            skip_softmax_threshold_scale_factor_decode=forward_args.skip_softmax_kernel_params.threshold_scale_factor_decode,
             # --- Module config (TrtllmAttention) ---
             rotary_inv_freq=attn.rotary_inv_freq,
             rotary_cos_sin=attn.rotary_cos_sin,
@@ -173,8 +169,6 @@ class FallbackFmha(Fmha):
             v_head_dim=attn.v_head_dim,
             rope_append=attn.rope_append,
             attention_chunk_size=attn.attention_chunk_size,
-            skip_softmax_threshold_scale_factor_prefill=skip_softmax_kernel_params.threshold_scale_factor_prefill,
-            skip_softmax_threshold_scale_factor_decode=skip_softmax_kernel_params.threshold_scale_factor_decode,
             skip_softmax_stat=attn.skip_softmax_stat,
             # --- Sparse-specific (AttentionForwardArgs.sparse_prediction) ---
             sparse_kv_indices=forward_args.sparse_prediction.sparse_kv_indices,

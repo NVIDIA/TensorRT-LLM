@@ -2849,6 +2849,35 @@ class TestPyCapacitySchedulerKVCacheReuse:
         assert fitting[0].request_id == 0
         assert len(paused) == 0
 
+    def test_prefix_aware_scheduling_disabled_does_not_delay_duplicates(self) -> None:
+        kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=3, enable_block_reuse=True)
+
+        def fail_analyze_prefix_reuse(
+            unique_tokens: object, req: LlmRequest
+        ) -> MockPrefixReuseSummary:
+            raise AssertionError("prefix reuse should not be probed when scheduling is disabled")
+
+        kv.analyze_prefix_reuse = fail_analyze_prefix_reuse
+        scheduler = PyCapacityScheduler(
+            max_num_requests=3,
+            kv_cache_manager=kv,
+            scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+            enable_prefix_aware_scheduling=False,
+        )
+        tokens = list(range(21))
+        r0 = _make_request(0, prompt_len=21, input_tokens=tokens)
+        r1 = _make_request(1, prompt_len=21, input_tokens=tokens)
+        r2 = _make_request(2, prompt_len=21, input_tokens=tokens)
+        fitting, disagg, paused = scheduler.schedule_request([r0, r1, r2])
+
+        assert [req.request_id for req in fitting] == [0, 1, 2]
+        assert len(disagg) == 0
+        assert len(paused) == 0
+        assert kv.enable_block_reuse is True
+        assert r0.estimated_reusable_tokens == 0
+        assert r1.estimated_reusable_tokens == 0
+        assert r2.estimated_reusable_tokens == 0
+
     def test_delay_duplicate_request_chunked(self):
         """C++ ref: DelayDuplicateRequestChunked"""
         kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=5, enable_block_reuse=True)

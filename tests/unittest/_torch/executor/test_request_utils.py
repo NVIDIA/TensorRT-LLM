@@ -6,12 +6,15 @@ This module tests:
 
 """
 
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.request_utils import (
+    RequestBroadcaster,
+    attach_py_objects_to_requests,
     can_process_attention_dp_request,
     derive_attention_dp_per_rank_request_cap,
     get_from_waiting_queue,
@@ -20,6 +23,7 @@ from tensorrt_llm._torch.pyexecutor.request_utils import (
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm.bindings import executor as trtllm
+from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.mapping import CpType
 
 
@@ -56,6 +60,39 @@ def create_mock_request_with_py_schedule_params(attention_dp_rank=None, attentio
     mock_request.input_token_ids = [1, 2, 3]
 
     return mock_request
+
+
+def test_request_broadcaster_collects_conversation_params_with_none():
+    conversation_params = ConversationParams(conversation_id="conv")
+    source_items = [
+        RequestQueueItem(1, SimpleNamespace(py_conversation_params=conversation_params)),
+        RequestQueueItem(2, SimpleNamespace(py_conversation_params=None)),
+    ]
+
+    py_request_objects = RequestBroadcaster._collect_py_objects(None, source_items)
+
+    py_objects = dict(py_request_objects)
+    assert py_objects["py_conversation_params"] == {
+        1: conversation_params,
+        2: None,
+    }
+
+    target_items = [
+        RequestQueueItem(1, SimpleNamespace()),
+        RequestQueueItem(2, SimpleNamespace()),
+    ]
+    attach_py_objects_to_requests(target_items, py_request_objects)
+
+    assert target_items[0].request.py_conversation_params is conversation_params
+    assert hasattr(target_items[1].request, "py_conversation_params")
+    assert target_items[1].request.py_conversation_params is None
+
+
+def test_request_broadcaster_requires_conversation_params_attr():
+    source_items = [RequestQueueItem(1, SimpleNamespace())]
+
+    with pytest.raises(AttributeError):
+        RequestBroadcaster._collect_py_objects(None, source_items)
 
 
 def test_merge_helix_requests_with_padding():
@@ -154,13 +191,19 @@ def test_merge_helix_requests_without_padding():
             assert llm_request.get_tokens(0) == [5, 6, 7, 8]
 
 
-def test_merge_helix_requests_insufficient_blocks_error():
-    """Test merge_helix_requests raises error when insufficient blocks."""
+def test_merge_helix_requests_empty_ranks():
+    """When num_total_blocks < cp_size, the highest CP ranks own no blocks.
+
+    Such "empty" ranks must produce an empty token list (and seqlen_this_rank_cp
+    == 0), while total_input_len_cp still reflects the full prompt length so the
+    global position ids stay correct. They are no longer rejected.
+    """
     tokens_per_block = 4
 
-    # Create input with only 12 tokens. This creates 3 blocks which is fewer than 4 CP ranks.
+    # 12 tokens -> 3 blocks, which is fewer than 4 CP ranks, so rank 3 is empty.
+    input_tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     executor_request = trtllm.Request(
-        input_token_ids=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        input_token_ids=input_tokens,
         max_tokens=12,
         streaming=False,
         sampling_config=trtllm.SamplingConfig(),
@@ -171,18 +214,92 @@ def test_merge_helix_requests_insufficient_blocks_error():
         request=executor_request,
     )
 
-    # Loop over ranks 0, 1, 2, 3 and verify that all ranks throw assertion.
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+
+    # Round-robin block distribution across 4 CP ranks (3 blocks total, 4 tokens/block):
+    #   rank 0 owns block {0} -> tokens [1,2,3,4]
+    #   rank 1 owns block {1} -> tokens [5,6,7,8]
+    #   rank 2 owns block {2} -> tokens [9,10,11,12]
+    #   rank 3 owns no blocks -> [] (empty rank)
+    expected_tokens = {
+        0: [1, 2, 3, 4],
+        1: [5, 6, 7, 8],
+        2: [9, 10, 11, 12],
+        3: [],
+    }
     for rank in range(4):
-        with pytest.raises(
-            ValueError, match="There aren't enough tokens to get at least one block per CP rank"
-        ):
-            merge_helix_requests(
-                [request_item],
-                cp_rank=rank,
-                cp_size=4,
-                tokens_per_block=tokens_per_block,
-                exclude_last_generation_logits=False,
-            )
+        result = merge_helix_requests(
+            [request_item],
+            cp_rank=rank,
+            cp_size=4,
+            tokens_per_block=tokens_per_block,
+            exclude_last_generation_logits=False,
+        )
+
+        assert len(result) == 1
+        llm_request = result[0]
+        assert isinstance(llm_request, LlmRequest)
+        assert llm_request.request_id == 1
+        assert llm_request.get_tokens(0) == expected_tokens[rank]
+        # total_input_len_cp is always the full prompt length.
+        assert llm_request.total_input_len_cp == len(input_tokens)
+        assert llm_request.seqlen_this_rank_cp == len(expected_tokens[rank])
+
+
+def test_merge_helix_requests_empty_ranks_with_padding():
+    """Exercise padding-strip-on-last-owner and empty ranks together.
+
+    With 10 tokens and tokens_per_block=4 there are 3 blocks, the last of which
+    is partially filled (tokens [9, 10]). Distributed round-robin over 4 CP
+    ranks, the last block owner (rank 2) must strip the block padding while the
+    block-less rank (rank 3) must be an empty rank.
+    """
+    tokens_per_block = 4
+
+    # 10 tokens -> 3 blocks (last block half-full), fewer than 4 CP ranks.
+    input_tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    executor_request = trtllm.Request(
+        input_token_ids=input_tokens,
+        max_tokens=12,
+        streaming=False,
+        sampling_config=trtllm.SamplingConfig(),
+        output_config=trtllm.OutputConfig(),
+    )
+    request_item = RequestQueueItem(
+        id=1,
+        request=executor_request,
+    )
+
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+
+    # Round-robin block distribution across 4 CP ranks (3 blocks, 4 tokens/block):
+    #   rank 0 owns block {0} -> tokens [1,2,3,4]
+    #   rank 1 owns block {1} -> tokens [5,6,7,8]
+    #   rank 2 owns block {2} -> tokens [9,10]  (last block; padding stripped)
+    #   rank 3 owns no blocks -> [] (empty rank)
+    expected_tokens = {
+        0: [1, 2, 3, 4],
+        1: [5, 6, 7, 8],
+        2: [9, 10],
+        3: [],
+    }
+    for rank in range(4):
+        result = merge_helix_requests(
+            [request_item],
+            cp_rank=rank,
+            cp_size=4,
+            tokens_per_block=tokens_per_block,
+            exclude_last_generation_logits=False,
+        )
+
+        assert len(result) == 1
+        llm_request = result[0]
+        assert isinstance(llm_request, LlmRequest)
+        assert llm_request.request_id == 1
+        assert llm_request.get_tokens(0) == expected_tokens[rank]
+        # total_input_len_cp is always the full prompt length.
+        assert llm_request.total_input_len_cp == len(input_tokens)
+        assert llm_request.seqlen_this_rank_cp == len(expected_tokens[rank])
 
 
 @patch("tensorrt_llm._torch.pyexecutor.request_utils.executor_request_to_llm_request")
