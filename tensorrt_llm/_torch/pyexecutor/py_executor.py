@@ -5104,10 +5104,11 @@ class PyExecutor:
             return
 
         if not self._uses_async_disagg_gen_transfer():
+            # Resources have already been prepared for every request in this
+            # batch. Drain all synchronous receives even after one fails so no
+            # prepared request is left in DISAGG_GENERATION_INIT.
             for req in new_gen_reqs:
                 self.kv_cache_transceiver.request_and_receive_sync(req)
-                if req.state == LlmRequestState.DISAGG_TRANS_ERROR:
-                    break
                 if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE:
                     self._sync_disagg_transfer_made_progress = True
             self._check_cache_transfer_errors("generation requests")

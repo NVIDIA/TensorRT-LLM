@@ -749,7 +749,7 @@ class TestDisaggTransferIdleProgress:
         executor._check_cache_transfer_errors.assert_called_once_with("generation requests")
         assert executor._sync_disagg_transfer_made_progress
 
-    def test_sync_receive_defers_error_handling_to_rank_aligned_vote(self, monkeypatch):
+    def test_sync_receive_drains_batch_before_rank_aligned_error_vote(self, monkeypatch):
         monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
         executor = object.__new__(PyExecutor)
         executor.kv_cache_transceiver = Mock()
@@ -757,32 +757,41 @@ class TestDisaggTransferIdleProgress:
         executor.dist = Mock(world_size=4, rank=0)
         executor.dist.tp_allgather.return_value = [[1], [], [], []]
         executor._handle_errors = Mock()
+        executor._check_cache_transfer_errors = Mock()
         executor._sync_disagg_transfer_made_progress = False
         error_request = Mock(
             py_request_id=1,
             state=LlmRequestState.DISAGG_GENERATION_INIT,
             is_child=False,
         )
-        deferred_request = Mock(
+        following_request = Mock(
             py_request_id=2,
             state=LlmRequestState.DISAGG_GENERATION_INIT,
             is_child=False,
         )
-        executor.active_requests = [error_request, deferred_request]
+        executor.active_requests = [error_request, following_request]
 
-        def mark_error(req):
-            req.state = LlmRequestState.DISAGG_TRANS_ERROR
+        def complete_or_error(req):
+            req.state = (
+                LlmRequestState.DISAGG_TRANS_ERROR
+                if req is error_request
+                else LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+            )
 
-        executor.kv_cache_transceiver.request_and_receive_sync.side_effect = mark_error
+        executor.kv_cache_transceiver.request_and_receive_sync.side_effect = complete_or_error
 
-        PyExecutor._recv_disagg_gen_cache(executor, [error_request, deferred_request])
+        PyExecutor._recv_disagg_gen_cache(executor, [error_request, following_request])
 
-        executor.kv_cache_transceiver.request_and_receive_sync.assert_called_once_with(
-            error_request
-        )
+        assert [
+            call.args[0]
+            for call in executor.kv_cache_transceiver.request_and_receive_sync.call_args_list
+        ] == [error_request, following_request]
+        assert error_request.state == LlmRequestState.DISAGG_TRANS_ERROR
+        assert following_request.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
         executor.kv_cache_transceiver.cancel_request.assert_not_called()
         executor._handle_errors.assert_not_called()
-        assert not executor._sync_disagg_transfer_made_progress
+        executor._check_cache_transfer_errors.assert_called_once_with("generation requests")
+        assert executor._sync_disagg_transfer_made_progress
 
         PyExecutor._handle_disagg_cache_errors_synced(executor)
 
