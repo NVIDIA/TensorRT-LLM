@@ -2600,10 +2600,15 @@ class PyExecutor:
         if not self.dist.is_last_pp_rank:
             # Receive tokens from previous pp rank (w.r.t model forward direction)
             with nvtx_range("recv_sample_state"):
-                sample_state.host, py_result_diffs = self.dist.recv_object(
+                (
+                    sample_state.host,
+                    py_result_diffs,
+                    use_host_stop_criteria,
+                ) = self.dist.recv_object(
                     src=self.dist.prev_pp_rank,
                     tag=tag,
                 )
+            sample_state.use_host_stop_criteria = use_host_stop_criteria
 
             for request, py_result_diff in zip(requests, py_result_diffs):
                 request.py_result.apply_diff(py_result_diff)
@@ -2619,9 +2624,15 @@ class PyExecutor:
                 py_result_diffs.append(diff)
                 request.py_result.reset_diff()
             self.wait_on_pp_send_handles(self.send_handles, microbatch_id)
+            # Device finish reasons are absent on the host-stop fast path, so
+            # every PP rank must select the same request-update branch.
             with nvtx_range("send_sample_state"):
                 self.send_handles[microbatch_id] = self.dist.isend_object(
-                    (sample_state.host, py_result_diffs),
+                    (
+                        sample_state.host,
+                        py_result_diffs,
+                        getattr(sample_state, "use_host_stop_criteria", False),
+                    ),
                     dest=self.dist.next_pp_rank,
                     tag=tag,
                 )

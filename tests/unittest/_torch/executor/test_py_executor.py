@@ -702,6 +702,57 @@ class TestDisaggTransferAdmissionPP:
         assert wait_for_progress
 
 
+class TestSampleStateBroadcastPP:
+    @staticmethod
+    def _make_executor(*, is_last_pp_rank: bool, is_second_last_pp_rank: bool) -> PyExecutor:
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(
+            is_last_pp_rank=is_last_pp_rank,
+            is_second_last_pp_rank=is_second_last_pp_rank,
+            prev_pp_rank=3,
+            next_pp_rank=1,
+        )
+        executor.executed_batch_response_queue = Mock()
+        executor.send_handles = {}
+        executor.wait_on_pp_send_handles = Mock()
+        return executor
+
+    @staticmethod
+    def _make_batch(*, use_host_stop_criteria: bool) -> types.SimpleNamespace:
+        py_result = Mock()
+        py_result.get_diff.return_value = {"tokens": [42]}
+        request = types.SimpleNamespace(py_result=py_result)
+        sample_state = types.SimpleNamespace(
+            requests=[request],
+            host=object(),
+            use_host_stop_criteria=use_host_stop_criteria,
+        )
+        batch = types.SimpleNamespace(microbatch_id=0, sample_state=sample_state)
+        return batch
+
+    def test_ring_preserves_host_stop_criteria(self) -> None:
+        source = self._make_executor(is_last_pp_rank=True, is_second_last_pp_rank=False)
+        source_batch = self._make_batch(use_host_stop_criteria=True)
+        PyExecutor._ring_broadcast_sample_state(source, source_batch)
+        source_payload = source.dist.isend_object.call_args.args[0]
+        assert source_payload[2] is True
+
+        relay = self._make_executor(is_last_pp_rank=False, is_second_last_pp_rank=False)
+        relay_batch = self._make_batch(use_host_stop_criteria=False)
+        relay.dist.recv_object.return_value = source_payload
+        PyExecutor._ring_broadcast_sample_state(relay, relay_batch)
+        relay_payload = relay.dist.isend_object.call_args.args[0]
+        assert relay_batch.sample_state.use_host_stop_criteria is True
+        assert relay_payload[2] is True
+
+        terminal = self._make_executor(is_last_pp_rank=False, is_second_last_pp_rank=True)
+        terminal_batch = self._make_batch(use_host_stop_criteria=False)
+        terminal.dist.recv_object.return_value = relay_payload
+        PyExecutor._ring_broadcast_sample_state(terminal, terminal_batch)
+        assert terminal_batch.sample_state.use_host_stop_criteria is True
+        terminal.dist.isend_object.assert_not_called()
+
+
 class TestComputeScheduledTokens:
     """Tests for PyExecutor._compute_scheduled_tokens.
 
