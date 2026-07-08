@@ -588,8 +588,22 @@ class MultimodalParams:
                     from tensorrt_llm._torch.shared_tensor import \
                         SharedTensorContainer
 
-                    return SharedTensorContainer.from_dict(
+                    local_view = SharedTensorContainer.from_dict(
                         input_data).get_local_view()
+                    # CPU tensor crosses to the worker via the `file_system` sharing strategy
+                    # (`/dev/shm/torch_*`). That file's lifetime is bridged only by the in-shm
+                    # refcount plus the `torch_shm_manager`, so if the worker keeps this raw view
+                    # mapped through the whole forward, an out-of-band unlink (e.g. a
+                    # `torch_shm_manager` sweep triggered by a  socket-vs-mapping lifetime desync)
+                    # can remove the file while it is still mapped. The subsequent refcounted close
+                    # then re-unlinks a missing file and aborts the process with "could not unlink
+                    # the shared memory file" (SIGABRT).
+                    # We therefore clone it into worker-private memory so we own the data and drop
+                    # the shm mapping immediately, letting the producer's shared block release
+                    # cleanly via the refcount.
+                    if not local_view.is_cuda:
+                        local_view = local_view.clone()
+                    return local_view
                 except Exception as e:
                     raise RuntimeError(
                         f"Failed to restore tensor from shared tensor dict: {e}"
