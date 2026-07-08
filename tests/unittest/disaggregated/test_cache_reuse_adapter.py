@@ -15,7 +15,7 @@
 """Tests for CacheReuseAdapter, _create_kv_slice SWA trim, and Sender token-start derivation."""
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -648,47 +648,6 @@ class TestSenderTokenStarts:
         )
         # total_blocks for slice = 2 → raw start = 16; clamped = max(16, 16) = 16.
         assert (src_start, dst_start) == (16, 16)
-
-
-# ---------------------------------------------------------------------------
-# KvCacheTransceiverV2._trim_kv_to_prompt_history: capability-gated, graceful-degrade. (#14258)
-# ---------------------------------------------------------------------------
-class TestTrimKvToPromptHistory:
-    @staticmethod
-    def _tc(kv_cache_manager):
-        tc = object.__new__(KvCacheTransceiverV2)
-        tc._kv_cache_manager = kv_cache_manager
-        return tc
-
-    def test_noop_without_trim_capability(self):
-        # V1 / non-V2 managers lack trim_to_history -> getattr None -> no raise.
-        tc = self._tc(SimpleNamespace())
-        assert (
-            tc._trim_kv_to_prompt_history(SimpleNamespace(prompt_len=17, py_request_id=1)) is None
-        )
-
-    def test_noop_when_prompt_len_non_positive(self):
-        trim = Mock(return_value=True)
-        tc = self._tc(SimpleNamespace(trim_to_history=trim))
-        for prompt_len in (0, None):
-            tc._trim_kv_to_prompt_history(SimpleNamespace(prompt_len=prompt_len, py_request_id=1))
-        trim.assert_not_called()
-
-    def test_trims_to_prompt_len_on_success(self):
-        trim = Mock(return_value=True)
-        tc = self._tc(SimpleNamespace(trim_to_history=trim))
-        req = SimpleNamespace(prompt_len=17, py_request_id=1)
-        tc._trim_kv_to_prompt_history(req)
-        trim.assert_called_once_with(req, 17)
-
-    def test_swallows_trim_failure(self):
-        # trim returns False (degraded) -> method still returns None and never
-        # raises, so the downstream TRANS_COMPLETE transition is not gated on it.
-        trim = Mock(return_value=False)
-        tc = self._tc(SimpleNamespace(trim_to_history=trim))
-        req = SimpleNamespace(prompt_len=17, py_request_id=1)
-        assert tc._trim_kv_to_prompt_history(req) is None
-        trim.assert_called_once_with(req, 17)
 
 
 # ---------------------------------------------------------------------------

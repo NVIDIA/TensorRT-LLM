@@ -56,6 +56,7 @@ class PipelineComponent(str, Enum):
     SCHEDULER = "scheduler"
     IMAGE_ENCODER = "image_encoder"
     IMAGE_PROCESSOR = "image_processor"
+    SOUND_TOKENIZER = "sound_tokenizer"
 
 
 @dataclass

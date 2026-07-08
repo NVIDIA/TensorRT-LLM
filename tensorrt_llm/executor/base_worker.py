@@ -280,6 +280,16 @@ class BaseWorker(GenerationExecutor):
         else:
             return self.engine.get_latest_iteration_stats()
 
+    def fetch_kv_cache_capacity(self) -> dict:
+        if self.engine is None or isinstance(self.engine, tllm.Executor):
+            return {}
+
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+        if isinstance(self.engine, PyExecutor):
+            return self.engine.get_kv_cache_capacity()
+
+        return {}
+
     def fetch_kv_cache_events(self) -> list:
         if isinstance(self.engine, tllm.Executor):
             return self.engine.get_latest_kv_cache_events()
@@ -395,7 +405,18 @@ class BaseWorker(GenerationExecutor):
         else:
             lora_config = None
 
-        prompt_token_ids = list(request.prompt_token_ids)
+        # prompt_token_ids stays list[int] for all consumers. If an int32 buffer
+        # rode along on the wire (GenerationRequest._prompt_token_ids_i32), hand
+        # THAT to the C++ Request ctor (memcpy) instead of the list -- this avoids
+        # the O(ISL) list copy + element-wise nanobind cast on the GIL-held submit
+        # thread. No buffer (in-process, or prompt-adapter prepend) -> list path.
+        # If both forms exist, they are assumed to describe the same token ids;
+        # in-place mutations of request.prompt_token_ids must clear the i32 buffer.
+        i32_buf = getattr(request, "_prompt_token_ids_i32", None)
+        if i32_buf is not None and request.prompt_adapter_request is None:
+            prompt_token_ids = i32_buf
+        else:
+            prompt_token_ids = list(request.prompt_token_ids)
         prompt_tuning_config = None
         if request.prompt_adapter_request is not None:
             self._load_prompt_adapter(request.prompt_adapter_request)
@@ -571,6 +592,10 @@ class BaseWorker(GenerationExecutor):
             executor_request.py_scheduling_params = None
             if self._is_pytorch_backend and request.scheduling_params is not None:
                 executor_request.py_scheduling_params = request.scheduling_params
+
+            executor_request.py_conversation_params = None
+            if self._is_pytorch_backend and request.conversation_params is not None:
+                executor_request.py_conversation_params = request.conversation_params
 
             if request.arrival_time is not None:
                 executor_request.py_arrival_time = request.arrival_time
@@ -813,6 +838,10 @@ class BaseWorker(GenerationExecutor):
 
         # Convert back to JSON string
         return json.dumps(stats_dict)
+
+    @staticmethod
+    def _kv_cache_capacity_serializer(capacity) -> str:
+        return json.dumps(capacity)
 
     # Define a Callable to serialize KV cache events
     @staticmethod

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,17 +21,20 @@ namespace tensorrt_llm::executor
 {
 
 SchedulerConfig::SchedulerConfig(CapacitySchedulerPolicy capacitySchedulerPolicy,
-    std::optional<ContextChunkingPolicy> contextChunkingPolicy, std::optional<DynamicBatchConfig> dynamicBatchConfig)
+    std::optional<ContextChunkingPolicy> contextChunkingPolicy, std::optional<DynamicBatchConfig> dynamicBatchConfig,
+    bool enablePrefixAwareScheduling)
     : mCapacitySchedulerPolicy(capacitySchedulerPolicy)
     , mContextChunkingPolicy(std::move(contextChunkingPolicy))
     , mDynamicBatchConfig(std::move(dynamicBatchConfig))
+    , mEnablePrefixAwareScheduling(enablePrefixAwareScheduling)
 {
 }
 
 bool SchedulerConfig::operator==(SchedulerConfig const& other) const
 {
     return mCapacitySchedulerPolicy == other.mCapacitySchedulerPolicy
-        && mContextChunkingPolicy == other.mContextChunkingPolicy;
+        && mContextChunkingPolicy == other.mContextChunkingPolicy && mDynamicBatchConfig == other.mDynamicBatchConfig
+        && mEnablePrefixAwareScheduling == other.mEnablePrefixAwareScheduling;
 }
 
 [[nodiscard]] CapacitySchedulerPolicy SchedulerConfig::getCapacitySchedulerPolicy() const
@@ -47,6 +50,11 @@ bool SchedulerConfig::operator==(SchedulerConfig const& other) const
 [[nodiscard]] std::optional<DynamicBatchConfig> SchedulerConfig::getDynamicBatchConfig() const
 {
     return mDynamicBatchConfig;
+}
+
+[[nodiscard]] bool SchedulerConfig::getEnablePrefixAwareScheduling() const
+{
+    return mEnablePrefixAwareScheduling;
 }
 
 } // namespace tensorrt_llm::executor
