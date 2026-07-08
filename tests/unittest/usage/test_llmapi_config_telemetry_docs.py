@@ -252,49 +252,34 @@ def test_manifest_generator_is_not_a_normal_precommit_hook():
     assert all(hook["id"] != "generate-llm-args-golden-manifest" for hook in local_hooks)
 
 
-def _run_committed_manifest_check() -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [sys.executable, "scripts/generate_llm_args_golden_manifest.py", "--check"],
-        cwd=_repo_root(),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+_REGENERATION_MESSAGE = (
+    "The LLM args telemetry manifest is stale; run "
+    "`python3 scripts/generate_llm_args_golden_manifest.py`, then review and commit "
+    "`tensorrt_llm/usage/llm_args_golden_manifest.json` with telemetry/privacy CODEOWNER approval."
+)
 
 
-def _assert_committed_manifest_current(
-    run_check=_run_committed_manifest_check,
-) -> None:
-    result = run_check()
-    if result.returncode != 0:
-        sys.stderr.write(result.stderr)
-        raise AssertionError(
-            "The LLM args telemetry manifest is stale; run "
-            "`python3 scripts/generate_llm_args_golden_manifest.py`, then review and commit "
-            "`tensorrt_llm/usage/llm_args_golden_manifest.json` with telemetry/privacy CODEOWNER approval."
-        )
+def _assert_committed_manifest_current(generated_manifest: object) -> None:
+    manifest_path = _repo_root() / "tensorrt_llm/usage/llm_args_golden_manifest.json"
+    committed_manifest = json.loads(manifest_path.read_text())
+    if generated_manifest != committed_manifest:
+        raise AssertionError(_REGENERATION_MESSAGE)
 
 
 def test_committed_golden_failure_gives_exact_regeneration_command():
-    from types import SimpleNamespace
-
     import pytest
 
     with pytest.raises(AssertionError) as failure:
-        _assert_committed_manifest_current(
-            run_check=lambda: SimpleNamespace(returncode=1, stderr="")
-        )
+        _assert_committed_manifest_current({"stale": True})
 
-    assert str(failure.value) == (
-        "The LLM args telemetry manifest is stale; run "
-        "`python3 scripts/generate_llm_args_golden_manifest.py`, then review and commit "
-        "`tensorrt_llm/usage/llm_args_golden_manifest.json` with telemetry/privacy CODEOWNER approval."
-    )
+    assert str(failure.value) == _REGENERATION_MESSAGE
 
 
 def test_build_capture_manifest_matches_committed_golden():
     """The premerge privacy gate (closes TRTLLM-12872)."""
-    _assert_committed_manifest_current()
+    from tensorrt_llm.usage.llmapi_config import golden_manifest
+
+    _assert_committed_manifest_current(golden_manifest())
 
 
 def test_load_generator_does_not_leak_sys_modules():
