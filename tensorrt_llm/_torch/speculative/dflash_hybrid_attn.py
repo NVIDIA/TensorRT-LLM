@@ -242,8 +242,9 @@ def _dflash_ctx_attn_split_kernel(
     stride_vh,
     stride_bb,
     sm_scale,
+    S,  # number of context splits (runtime: varies with eager batch size,
+    # keeping it non-constexpr avoids a Triton recompile per batch size)
     NKV: tl.constexpr,
-    S: tl.constexpr,  # number of context splits
     Q: tl.constexpr,
     GROUP: tl.constexpr,
     TPB: tl.constexpr,
@@ -300,8 +301,8 @@ def _dflash_ctx_attn_merge_kernel(
     stride_oq,
     stride_oh,
     sm_scale,
+    S,  # runtime, see split kernel
     NKV: tl.constexpr,
-    S: tl.constexpr,
     Q: tl.constexpr,
     GROUP: tl.constexpr,
     D: tl.constexpr,
