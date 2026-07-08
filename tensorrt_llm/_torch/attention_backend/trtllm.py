@@ -1492,6 +1492,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             # Context MLA uses separate qkv instead of paged_context_fmha
             metadata.use_paged_context_fmha = False
 
+        if (forward_args.enable_dsv4_epilogue_fusion and
+            (forward_args.output is None or forward_args.output_sf is None)):
+            raise ValueError(
+                "DSv4 epilogue fusion requires caller-provided output and "
+                "output_sf buffers.")
+
         if forward_args.output is None:
             is_gen_only = (forward_args.attention_input_type ==
                            AttentionInputType.generation_only)
@@ -1702,7 +1708,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # populated by `create_output` in `forward` above, so the
         # decision is correct only here, not at the modules/attention.py
         # call site where `output_sf` is always `None`.
-        if forward_args.output_sf is not None and forward_args.out_scale_sf is not None:
+        if (not forward_args.enable_dsv4_epilogue_fusion
+                and forward_args.output_sf is not None
+                and forward_args.out_scale_sf is not None):
             forward_args.out_scale = forward_args.out_scale_sf
 
         # Default `forward_args.kv_scale_*` to the layer-level mirrors when

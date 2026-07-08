@@ -1130,6 +1130,12 @@ int AttentionOp::mlaGeneration(
 
         tllmRunnerParams.oPtr = reinterpret_cast<void*>(params.context_buf);
         tllmRunnerParams.oSfPtr = generation_params.context_buf_sf;
+        if (params.dsv4_epilogue_fusion.enabled)
+        {
+            tllmRunnerParams.mDsv4EpilogueFusion.enabled = true;
+            tllmRunnerParams.mDsv4EpilogueFusion.cosSinCache = params.dsv4_epilogue_fusion.cos_sin_cache;
+            tllmRunnerParams.mDsv4EpilogueFusion.scaleBufM = params.dsv4_epilogue_fusion.scale_buf_m;
+        }
 
         // softmax stats if needed
         tllmRunnerParams.softmaxStatsPtr = generation_params.softmax_stats;
@@ -2018,6 +2024,12 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         // Only use [totalLength, h / cpSize, Dh].
         fmhaParams.outputPtr = mCpSize > 1 ? workspaceViews.gatherOutBuffer : params.context_buf;
         fmhaParams.outputSfPtr = params.context_buf_sf;
+        if (params.mla_param != nullptr && params.mla_param->dsv4_epilogue_fusion.enabled)
+        {
+            fmhaParams.dsv4EpilogueFusion.enabled = true;
+            fmhaParams.dsv4EpilogueFusion.cosSinCache = params.mla_param->dsv4_epilogue_fusion.cos_sin_cache;
+            fmhaParams.dsv4EpilogueFusion.scaleBufM = params.mla_param->dsv4_epilogue_fusion.scale_buf_m;
+        }
         fmhaParams.attentionSinksPtr = params.attention_sinks;
         fmhaParams.packedMaskPtr = params.attention_packed_mask;
         if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
@@ -2966,6 +2978,10 @@ int AttentionOp::initialize() noexcept
             fmhaParams.dataTypeKv = DATA_TYPE_E4M3;
             fmhaParams.dataTypeOut = DATA_TYPE_BF16;
         }
+        if (mFusesDsv4InvRopeFp8Quant)
+        {
+            fmhaParams.dataTypeOut = DATA_TYPE_E4M3;
+        }
         // TODO: remove forceFp32Acc from MHARunnerFixedParams after adding host_runtime_perf_knobs to
         // bertAttentionPlugin input tensors, so that we can change mLaunchParams.force_fp32_acc value in runtime.
         fmhaParams.forceFp32Acc = false;
@@ -3040,6 +3056,7 @@ int AttentionOp::initialize() noexcept
         fmhaParams.scaleAlibi = isAliBiWithScale();
         fmhaParams.useSparseMLA = useSparseMLA();
         fmhaParams.useTllmGenSparseAttention = useTllmGenSparseAttention();
+        fmhaParams.fusesDsv4InvRopeFp8Quant = mFusesDsv4InvRopeFp8Quant;
 
         // SageAttention: set block sizes for sage quantization.
         if (useSageAttn)
@@ -3084,9 +3101,14 @@ int AttentionOp::initialize() noexcept
                     qDataType = DATA_TYPE_E4M3;
                     kvDataType = DATA_TYPE_E4M3;
                 }
+                if (mFusesDsv4InvRopeFp8Quant)
+                {
+                    outputDataType = DATA_TYPE_E4M3;
+                }
 
                 // Instantiate the mTllmGenFMHARunner used for MLA
-                mTllmGenFMHARunner.reset(new TllmGenFmhaRunner(qDataType, kvDataType, kvDataType, outputDataType));
+                mTllmGenFMHARunner.reset(new TllmGenFmhaRunner(
+                    qDataType, kvDataType, kvDataType, outputDataType, 0, 0, 0, 0, mFusesDsv4InvRopeFp8Quant));
             }
             else if (mIsGenerationMLA && !mUseGenFlashMLA)
             {
