@@ -21,7 +21,6 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import click
 import numpy as np
-from tqdm import tqdm
 
 import tensorrt_llm.profiler as profiler
 from tensorrt_llm.inputs import prompt_inputs
@@ -44,8 +43,8 @@ from ..inputs.utils import interleave_mm_placeholders, resolve_hf_chat_template
 from ..llmapi import RequestOutput
 from ..logger import logger
 from ..sampling_params import SamplingParams
-from .interface import (Evaluator, dump_inference_results,
-                        get_chat_template_kwargs)
+from .interface import (Evaluator, dump_inference_results, generate_windowed,
+                        get_chat_template_kwargs, resolve_in_flight_window)
 
 # NOTE: lm_eval uses "<image>" as the default image placeholder
 # https://github.com/EleutherAI/lm-evaluation-harness/blob/7f04db12d2f8e7a99a0830d99eb78130e1ba2122/lm_eval/models/hf_vlms.py#L25
@@ -63,13 +62,17 @@ class LmEvalWrapper(TemplateLM):
                  is_force_single_image: bool = False,
                  output_dir: Optional[str] = None,
                  sampling_override: bool = False,
-                 preserve_caller_max_tokens: bool = False):
+                 preserve_caller_max_tokens: bool = False,
+                 bound_in_flight: bool = False):
         super().__init__()
         self.llm = llm
         self.sampling_params = sampling_params
         self.streaming = streaming
         self.chat_template_kwargs = chat_template_kwargs
         self.output_dir = output_dir
+        # When `True`, cap concurrently in-flight requests to the engine's `max_batch_size` instead
+        # of submitting every request up front (see `generate_windowed`). Off by default.
+        self.bound_in_flight = bound_in_flight
         # When True, CLI-provided sampling params (temperature/top_k/top_p/seed)
         # take precedence over task yaml gen_kwargs. Lets users reproduce a
         # model-card sampling recipe without editing the task yaml.
@@ -161,22 +164,19 @@ class LmEvalWrapper(TemplateLM):
 
     def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
         profiler.start("trtllm exec")
-        results = []
-        for request in tqdm(requests,
-                            desc="Submitting requests",
-                            disable=disable_tqdm):
+
+        def _submit(request):
             prompt, gen_kwargs = request.args
             sampling_params = self._get_sampling_params(gen_kwargs)
-            output = self.llm.generate_async(prompt,
-                                             sampling_params=sampling_params,
-                                             streaming=self.streaming)
-            results.append(output)
+            return self.llm.generate_async(prompt,
+                                           sampling_params=sampling_params,
+                                           streaming=self.streaming)
 
-        outputs = []
-        for output in tqdm(results,
-                           desc="Fetching responses",
-                           disable=disable_tqdm):
-            outputs.append(output.result())
+        window = resolve_in_flight_window(self.llm, self.bound_in_flight)
+        outputs = generate_windowed(_submit,
+                                    requests,
+                                    window,
+                                    disable_tqdm=disable_tqdm)
 
         if self.output_dir:
             dump_inference_results(self.output_dir, outputs,
@@ -209,7 +209,8 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
                  output_dir: Optional[str] = None,
                  sampling_override: bool = False,
                  preserve_caller_max_tokens: bool = False,
-                 post_process_fn: Optional[Callable[[str], str]] = None):
+                 post_process_fn: Optional[Callable[[str], str]] = None,
+                 bound_in_flight: bool = False):
         """
         Initialize the multimodal wrapper.
 
@@ -239,6 +240,7 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             output_dir=output_dir,
             sampling_override=sampling_override,
             preserve_caller_max_tokens=preserve_caller_max_tokens,
+            bound_in_flight=bound_in_flight,
         )
 
         # NOTE: Required by lm_eval to identify this as a multimodal model
@@ -404,11 +406,8 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             List of generated text responses
         """
         profiler.start("trtllm exec")
-        results = []
-        for request in tqdm(requests,
-                            desc="Submitting requests",
-                            disable=disable_tqdm):
 
+        def _submit(request):
             # NOTE: For now, only this part is different from the original generate_until
             prompt, gen_kwargs, media_data = request.args
             prompt = prompt_inputs(prompt)
@@ -425,16 +424,15 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             prompt["multi_modal_data"] = {"image": images}
 
             sampling_params = self._get_sampling_params(gen_kwargs)
-            output = self.llm.generate_async(prompt,
-                                             sampling_params=sampling_params,
-                                             streaming=self.streaming)
-            results.append(output)
+            return self.llm.generate_async(prompt,
+                                           sampling_params=sampling_params,
+                                           streaming=self.streaming)
 
-        outputs = []
-        for output in tqdm(results,
-                           desc="Fetching responses",
-                           disable=disable_tqdm):
-            outputs.append(output.result())
+        window = resolve_in_flight_window(self.llm, self.bound_in_flight)
+        outputs = generate_windowed(_submit,
+                                    requests,
+                                    window,
+                                    disable_tqdm=disable_tqdm)
 
         if self.output_dir:
             dump_inference_results(self.output_dir, outputs,
@@ -476,7 +474,8 @@ class LmEvalEvaluator(Evaluator):
                  output_path: Optional[str] = None,
                  output_dir: Optional[str] = None,
                  post_process_fn: Optional[Callable[[str], str]] = None,
-                 preserve_caller_max_tokens: bool = False):
+                 preserve_caller_max_tokens: bool = False,
+                 bound_in_flight: bool = False):
         try:
             import lm_eval
         except ImportError as e:
@@ -510,6 +509,7 @@ class LmEvalEvaluator(Evaluator):
         # larger than the lm-eval task's max_gen_toks. Used by thinking
         # models (e.g. Kimi K2.5) whose CoT output exceeds the task default.
         self.preserve_caller_max_tokens = preserve_caller_max_tokens
+        self.bound_in_flight = bound_in_flight
 
         task_manager = TaskManager(
             include_path=f"{os.path.dirname(__file__)}/lm_eval_tasks")
@@ -620,6 +620,7 @@ class LmEvalEvaluator(Evaluator):
             is_force_single_image=is_force_single_image,
             output_dir=self.output_dir,
             sampling_override=sampling_override,
+            bound_in_flight=self.bound_in_flight,
         )
         # post_process_fn / preserve_caller_max_tokens only consumed by multimodal.
         if self.MULTIMODAL:
@@ -1207,6 +1208,9 @@ class MMMUPro(LmEvalEvaluator):
 class MMMU(LmEvalEvaluator):
 
     def __init__(self, **kwargs):
+        # MMMU is multimodal: bound in-flight requests to `max_batch_size` by default to narrow the
+        # `SharedTensor` teardown race.
+        kwargs.setdefault("bound_in_flight", True)
         super().__init__("mmmu_val", **kwargs)
 
     @click.command("mmmu")

@@ -21,6 +21,9 @@ Consolidates the pure-Python tests that guard:
 * ``tensorrt_llm.evaluate.lm_eval_tasks.mmmu_pro.utils`` —
   ``parse_multi_choice_response`` reverse-scan and the
   ``MMMU_PRO_PROMPT_MODE`` env switch.
+* `tensorrt_llm.evaluate.interface.generate_windowed` /
+  `resolve_in_flight_window` - the bounded in-flight submission window that caps concurrent requests
+  to `max_batch_size`.
 """
 
 from __future__ import annotations
@@ -29,7 +32,10 @@ import importlib
 import os
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from tensorrt_llm.evaluate.covost2 import CoVoST2
+from tensorrt_llm.evaluate.interface import generate_windowed, resolve_in_flight_window
 from tensorrt_llm.evaluate.lm_eval import (
     LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER,
     LmEvalWrapper,
@@ -721,3 +727,110 @@ def test_mode_cot_included_in_example_format():
     finally:
         # Restore module state for other tests running in the same session.
         _reload_mmmu_pro_utils(None)
+
+
+# ===========================================================================
+# Bounded in-flight generation — generate_windowed / resolve_in_flight_window
+# ===========================================================================
+#
+# The evaluator submit loop can cap concurrently in-flight requests to the engine's `max_batch_size`
+# instead of submitting the whole list up front. This narrows the multimodal `file_system`
+# SharedTensor teardown race behind NVBug 6336747.
+# Off by default; MMMU / VideoMME / VoxPopuli opt in. The helpers below are pure Python (no GPU /
+# no engine), so we exercise the ordering + in-flight-cap invariants with a fake submitter.
+
+
+class _FakeFuture:
+    def __init__(self, value, on_result):
+        self._value = value
+        self._on_result = on_result
+
+    def result(self):
+        self._on_result()
+        return self._value
+
+
+class _ConcurrencyTracker:
+    """Fake submitter that records submission order and peak in-flight count.
+
+    Models a request as in flight between `submit()` and `.result()` so the provided window is
+    observable.
+    """
+
+    def __init__(self):
+        self.in_flight = 0
+        self.max_in_flight = 0
+        self.submitted_order = []
+
+    def submit(self, item):
+        self.in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        self.submitted_order.append(item)
+
+        return _FakeFuture(item, self._on_result)
+
+    def _on_result(self):
+        self.in_flight -= 1
+
+
+def test_generate_windowed_unbounded_submits_all_and_preserves_order():
+    tracker = _ConcurrencyTracker()
+    items = list(range(5))
+    out = generate_windowed(tracker.submit, items, None)
+    assert out == items
+    assert tracker.submitted_order == items
+    # Unbounded: every request submitted before any is fetched.
+    assert tracker.max_in_flight == len(items)
+
+
+def test_generate_windowed_window_geq_len_falls_back_to_submit_all():
+    tracker = _ConcurrencyTracker()
+    items = list(range(4))
+    out = generate_windowed(tracker.submit, items, 10)
+    assert out == items
+    assert tracker.max_in_flight == len(items)
+
+
+def test_generate_windowed_caps_in_flight_and_preserves_order():
+    tracker = _ConcurrencyTracker()
+    items = list(range(10))
+    window = 3
+    out = generate_windowed(tracker.submit, items, window)
+    assert out == items  # results returned in input order
+    assert tracker.submitted_order == items  # FIFO submission
+    assert tracker.max_in_flight == window  # never more than `window` in flight
+
+
+def _fake_llm_with_batch_size(max_batch_size) -> MagicMock:
+    fake_llm = MagicMock()
+    fake_llm.args.max_batch_size = max_batch_size
+    return fake_llm
+
+
+@pytest.mark.parametrize(
+    "max_batch_size, bound_in_flight, expected",
+    [
+        # Disabled: no cap regardless of max_batch_size.
+        pytest.param(128, False, None, id="disabled_ignores_batch_size"),
+        # Enabled with a positive max_batch_size: caps to it.
+        pytest.param(64, True, 64, id="enabled_caps_to_batch_size"),
+        # Enabled but max_batch_size unset / non-positive: unbounded fallback.
+        pytest.param(None, True, None, id="enabled_unset_batch_size"),
+        pytest.param(0, True, None, id="enabled_nonpositive_batch_size"),
+    ],
+)
+def test_resolve_in_flight_window(max_batch_size, bound_in_flight, expected):
+    llm = _fake_llm_with_batch_size(max_batch_size)
+    assert resolve_in_flight_window(llm, bound_in_flight=bound_in_flight) == expected
+
+
+def test_lm_eval_wrapper_bound_in_flight_defaults_off():
+    wrapper = _make_lm_eval_wrapper()
+    assert wrapper.bound_in_flight is False
+
+
+def test_lm_eval_wrapper_bound_in_flight_opt_in():
+    fake_llm = MagicMock()
+    fake_llm.tokenizer = MagicMock()
+    wrapper = LmEvalWrapper(fake_llm, bound_in_flight=True)
+    assert wrapper.bound_in_flight is True

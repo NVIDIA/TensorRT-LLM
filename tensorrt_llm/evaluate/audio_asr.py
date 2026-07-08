@@ -36,7 +36,13 @@ from tensorrt_llm.llmapi import RequestOutput
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
 
-from .interface import Evaluator, get_chat_template_kwargs, get_model_context
+from .interface import (
+    Evaluator,
+    generate_windowed,
+    get_chat_template_kwargs,
+    get_model_context,
+    resolve_in_flight_window,
+)
 
 
 class MultimodalASRSample(NamedTuple):
@@ -110,6 +116,7 @@ class AudioASREvaluator(Evaluator):
             apply_chat_template=True,
             system_prompt=system_prompt,
             chat_template_kwargs=chat_template_kwargs,
+            bound_in_flight=True,
         )
         self.dataset_path = dataset_path
         self.num_samples = num_samples
@@ -179,25 +186,21 @@ class AudioASREvaluator(Evaluator):
             self._make_input(llm, sample, input_context)
             for sample in tqdm(samples, desc="Loading inputs")
         ]
-        futures = []
-        references = []
-        scoring_samples = []
-        for sample, request_input in tqdm(
-            zip(samples, inputs, strict=True), desc="Submitting requests", total=len(samples)
-        ):
+        references = [sample.transcript for sample in samples]
+        scoring_samples = [_sample_for_scoring(sample) for sample in samples]
+
+        def _submit(request_input: dict[str, Any]) -> RequestOutput:
             params = (
                 copy.deepcopy(sampling_params) if sampling_params is not None else SamplingParams()
             )
-            futures.append(
-                llm.generate_async(
-                    request_input,
-                    sampling_params=params,
-                    streaming=streaming,
-                )
+            return llm.generate_async(
+                request_input,
+                sampling_params=params,
+                streaming=streaming,
             )
-            references.append(sample.transcript)
-            scoring_samples.append(_sample_for_scoring(sample))
-        outputs = [future.result() for future in tqdm(futures, desc="Fetching responses")]
+
+        window = resolve_in_flight_window(llm, self.bound_in_flight)
+        outputs = generate_windowed(_submit, inputs, window)
 
         profiler.stop("trtllm exec")
         elapsed_time = profiler.elapsed_time_in_sec("trtllm exec")

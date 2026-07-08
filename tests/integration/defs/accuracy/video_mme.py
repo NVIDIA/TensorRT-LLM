@@ -24,8 +24,10 @@ import tensorrt_llm.profiler as profiler
 from tensorrt_llm.evaluate.interface import (
     Evaluator,
     dump_inference_results,
+    generate_windowed,
     get_chat_template_kwargs,
     get_model_context,
+    resolve_in_flight_window,
 )
 from tensorrt_llm.inputs import (
     ConversationMessage,
@@ -97,6 +99,7 @@ class VideoMME(Evaluator):
             apply_chat_template=True,
             chat_template_kwargs=chat_template_kwargs,
             output_dir=output_dir,
+            bound_in_flight=True,
         )
         self.dataset_path = Path(dataset_path)
         self.annotations_path = self.dataset_path / ANNOTATIONS_FILE
@@ -139,19 +142,18 @@ class VideoMME(Evaluator):
             for sample in tqdm(samples, desc="Loading inputs")
         ]
 
-        futures = []
-        for request_input in tqdm(inputs, desc="Submitting requests"):
+        def _submit(request_input: dict[str, Any]) -> RequestOutput:
             params = (
                 copy.deepcopy(sampling_params) if sampling_params is not None else SamplingParams()
             )
-            futures.append(
-                llm.generate_async(
-                    request_input,
-                    sampling_params=params,
-                    streaming=streaming,
-                )
+            return llm.generate_async(
+                request_input,
+                sampling_params=params,
+                streaming=streaming,
             )
-        outputs = [future.result() for future in tqdm(futures, desc="Fetching responses")]
+
+        window = resolve_in_flight_window(llm, self.bound_in_flight)
+        outputs = generate_windowed(_submit, inputs, window)
 
         if self.output_dir:
             dump_inference_results(self.output_dir, outputs, getattr(llm, "tokenizer", None))

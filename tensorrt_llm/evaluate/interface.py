@@ -17,7 +17,9 @@ import json
 import os
 import random
 from abc import ABC, abstractmethod
-from typing import Any, Iterable, List, Optional, Union
+from collections import deque
+from itertools import islice
+from typing import Any, Callable, Iterable, List, Optional, Sequence, Union
 
 import numpy as np
 import torch
@@ -66,6 +68,65 @@ def get_model_context(llm: Any) -> tuple[str, str]:
     return str(model_dir), str(model_type)
 
 
+def resolve_in_flight_window(llm: Any, bound_in_flight: bool) -> Optional[int]:
+    """In-flight submission cap for `generate_windowed`."""
+    if not bound_in_flight:
+        return None
+    max_batch_size = llm.args.max_batch_size
+    if isinstance(max_batch_size, int) and max_batch_size > 0:
+        return max_batch_size
+    return None
+
+
+def generate_windowed(
+    submit: Callable[[Any], RequestOutput],
+    items: Sequence[Any],
+    window: Optional[int],
+    *,
+    submit_desc: str = "Submitting requests",
+    fetch_desc: str = "Fetching responses",
+    disable_tqdm: bool = False,
+) -> List[RequestOutput]:
+    """Submit at most `window` items at any given time.
+
+    `submit` maps one item to a `RequestOutput` future (e.g. the return of `llm.generate_async`).
+    Results are returned in input order. When `window` is `None` or `>= len(items)` the original
+    submit-all-then-fetch flow is used (every request submitted up front).
+
+    Bounding the in-flight window curbs how many `file_system` SharedTensors (multimodal payloads
+    crossing to the worker as `/dev/shm/torch_*`) are created / held / torn down concurrently,
+    which narrows the teardown race.
+    """
+    if window is None or window >= len(items):
+        # No effective cap: keep the original submit-all-then-fetch flow.
+        futures = [
+            submit(item)
+            for item in tqdm(items, desc=submit_desc, disable=disable_tqdm)
+        ]
+        return [
+            future.result()
+            for future in tqdm(futures, desc=fetch_desc, disable=disable_tqdm)
+        ]
+
+    # Prime the window, then refill one request each time the oldest in-flight request is retired
+    # (FIFO), so at most `window` requests are ever in flight and output order matches input order.
+    outputs: List[RequestOutput] = []
+    pending: deque = deque()
+    item_iter = iter(items)
+    for item in islice(item_iter, window):
+        pending.append(submit(item))
+    with tqdm(total=len(items), desc=fetch_desc,
+              disable=disable_tqdm) as progress:
+        for item in item_iter:
+            outputs.append(pending.popleft().result())
+            progress.update(1)
+            pending.append(submit(item))
+        while pending:
+            outputs.append(pending.popleft().result())
+            progress.update(1)
+    return outputs
+
+
 class Evaluator(ABC):
 
     def __init__(self,
@@ -74,7 +135,8 @@ class Evaluator(ABC):
                  fewshot_as_multiturn: bool = False,
                  system_prompt: Optional[str] = None,
                  chat_template_kwargs: Optional[dict[str, Any]] = None,
-                 output_dir: Optional[str] = None):
+                 output_dir: Optional[str] = None,
+                 bound_in_flight: bool = False):
         random.seed(random_seed)
         np.random.seed(random_seed)
         torch.manual_seed(random_seed)
@@ -83,6 +145,9 @@ class Evaluator(ABC):
         self.system_prompt = system_prompt
         self.chat_template_kwargs = chat_template_kwargs
         self.output_dir = output_dir
+        # When `True`, cap concurrently in-flight requests to the engine's `max_batch_size` instead
+        # of submitting every request up front (see `generate_windowed`). Off by default.
+        self.bound_in_flight = bound_in_flight
 
     @abstractmethod
     def generate_samples(self) -> Iterable[tuple]:
@@ -128,24 +193,23 @@ class Evaluator(ABC):
                  sampling_params: Optional[SamplingParams] = None,
                  streaming: bool = False) -> float:
         profiler.start("trtllm exec")
-        outputs, references, auxiliaries = [], [], []
+        prepared, references, auxiliaries = [], [], []
         for prompt, sampling_args, reference, *aux in tqdm(
-                self.generate_samples(), desc="Submitting requests"):
+                self.generate_samples(), desc="Preparing requests"):
             if self.apply_chat_template:
                 prompt = self.do_apply_chat_template(llm, prompt)
             sampling_params = self._get_sampline_params(sampling_params,
                                                         sampling_args)
-            output = llm.generate_async(
-                prompt,
-                sampling_params,
-                streaming=streaming,
-            )
-            outputs.append(output)
+            prepared.append((prompt, sampling_params))
             references.append(reference)
             auxiliaries.append(aux)
-        results = []
-        for output in tqdm(outputs, desc="Fetching responses"):
-            results.append(output.result())
+
+        def _submit(item):
+            prompt, params = item
+            return llm.generate_async(prompt, params, streaming=streaming)
+
+        window = resolve_in_flight_window(llm, self.bound_in_flight)
+        results = generate_windowed(_submit, prepared, window)
 
         if self.output_dir:
             dump_inference_results(self.output_dir, results,
