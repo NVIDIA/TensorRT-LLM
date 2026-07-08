@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import asyncio
 import base64
+import functools
 import json
 import os
 import re
@@ -10,6 +11,7 @@ import time
 import traceback
 import uuid
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime
 from http import HTTPStatus
@@ -34,7 +36,9 @@ from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
+from tensorrt_llm.inputs.media_io import BaseMediaIO
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
+from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import MultimodalEncoder, SchedulingParams, tracing
@@ -202,19 +206,48 @@ class OpenAIServer(_VideoRoutesMixin):
             disagg_cluster_config: Optional[DisaggClusterConfig] = None,
             multimodal_server_config: Optional[MultimodalServerConfig] = None,
             chat_template: Optional[str] = None,
-            allow_request_chat_template: bool = False):
+            allow_request_chat_template: bool = False,
+            input_processor_workers: int = 8,
+            media_load_workers: int = 8):
         self.generator = generator
         self._is_visual_gen = isinstance(generator, VisualGen)
         self.tool_parser = tool_parser
         self.metadata_server = create_metadata_server(metadata_server_cfg)
         self.disagg_cluster_config = disagg_cluster_config
         self.multimodal_server_config = multimodal_server_config
+        # Seed media-IO decode defaults from the model's input processor, then
+        # let the server's --media_io_kwargs win (per-request kwargs still
+        # override at request time).
+        ip = getattr(self.generator, "input_processor", None)
+        if isinstance(ip, BaseMultimodalInputProcessor):
+            model_pref = ip.get_preferred_media_io_kwargs() or {}
+            if model_pref:
+                cfg = self.multimodal_server_config or MultimodalServerConfig()
+                merged = {m: dict(kw) for m, kw in model_pref.items()}
+                for modality, kw in (cfg.media_io_kwargs or {}).items():
+                    merged.setdefault(modality, {}).update(kw)
+                cfg.media_io_kwargs = merged
+                self.multimodal_server_config = cfg
         self.allow_request_chat_template = allow_request_chat_template
         self.server_role = server_role
         # Will be set in __call__
         self.binding_addr = None
         self.host = None
         self.port = None
+
+        # Dedicated thread pools for the chat / completion path. Keeping
+        # multimodal preprocessing and decode work off the asyncio default
+        # executor avoids contention with unrelated `to_thread` callers and
+        # lets the two stages be sized independently.
+        self._input_proc_executor = ThreadPoolExecutor(
+            max_workers=input_processor_workers,
+            thread_name_prefix="trtllm_inputproc",
+        )
+        self._media_load_executor = ThreadPoolExecutor(
+            max_workers=media_load_workers,
+            thread_name_prefix="trtllm_media_load",
+        )
+        BaseMediaIO.set_executor(self._media_load_executor)
 
         model_dir = Path(model)
         if model_dir.exists() and model_dir.is_dir():
@@ -1341,9 +1374,11 @@ class OpenAIServer(_VideoRoutesMixin):
             generate_inputs = prompt
             preprocess_fn = getattr(self.generator, "preprocess", None)
             if preprocess_fn is not None:
-                generate_inputs = await asyncio.to_thread(
-                    preprocess_fn, prompt, sampling_params,
-                    disaggregated_params)
+                loop = asyncio.get_event_loop()
+                generate_inputs = await loop.run_in_executor(
+                    self._input_proc_executor,
+                    functools.partial(preprocess_fn, prompt, sampling_params,
+                                      disaggregated_params))
 
             promise = self.generator.generate_async(
                 inputs=generate_inputs,
@@ -1647,8 +1682,11 @@ class OpenAIServer(_VideoRoutesMixin):
 
                 prompt = prompt_inputs(prompt)
                 if prompt.get("prompt") is not None:
-                    prompt_token_ids, extra_processed_inputs = await asyncio.to_thread(
-                        self.generator.input_processor, prompt, sampling_params)
+                    loop = asyncio.get_event_loop()
+                    prompt_token_ids, extra_processed_inputs = await loop.run_in_executor(
+                        self._input_proc_executor,
+                        functools.partial(self.generator.input_processor,
+                                          prompt, sampling_params))
                     tokens_prompt = TokensPrompt(
                         prompt_token_ids=prompt_token_ids,
                         query_token_ids=extra_processed_inputs.get(

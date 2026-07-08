@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -38,6 +38,7 @@ from tensorrt_llm._utils import print_all_stacks
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from integration.defs import test_list_parser
+from test_common import s3_output
 
 
 def dump_threads(signum, frame):
@@ -90,6 +91,8 @@ def pytest_configure(config):
         print_info("PeriodicJUnitXML reporter registered (unittest)")
         print_info(f"  XML path: {periodic_junit_xmlpath}")
         print_info(f"  Batch size: {periodic_batch_size}")
+
+    s3_output.register_plugin(config)
 
 
 @pytest.hookimpl(wrapper=True)
@@ -197,6 +200,13 @@ def pytest_addoption(parser):
         help=
         "Save unfinished test name to unfinished_test.txt. Only used with --periodic-junit.",
     )
+    # S3 upload options — must be registered here so they are recognized when
+    # pytest is run with unittest paths (integration test_unittests.py spawns such a run).
+    parser.addoption("--output-dir",
+                     action="store",
+                     default=None,
+                     help="output directory for test logs")
+    s3_output.add_options(parser)
 
 
 def apply_waives_ut(waives_file, items: list[pytest.Item], config):
