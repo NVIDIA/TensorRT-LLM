@@ -617,6 +617,17 @@ void KVCacheTransferManager::diskReaderLoop()
             mReadQueue.pop();
         }
 
+        // A just-spilled slot may still have its write queued; wait it out before reading -- but HERE on the
+        // reader, not on the scheduler in loadFromFile. The owning request stays parked via isBlockReadPending
+        // until this read lands, so the engine loop is never blocked behind the writer queue.
+        if (mAsyncDiskStore)
+        {
+            for (auto const& f : job.files)
+            {
+                waitForDiskSlotWrites(f);
+            }
+        }
+
         // Perform the block's transfer. GDS issues one batched SSD->GPU DMA for all pools; POSIX reads each
         // pool into a host buffer and copies it up. Both are device-complete before we publish the block.
         if (job.useGds)
@@ -768,8 +779,11 @@ void KVCacheTransferManager::loadFromFile(BlockPtr const& dstPrimaryBlock, SizeT
     {
         it->second.synchronize();
     }
-    // Async store may still be persisting this slot; a read must not race the write.
-    if (mAsyncDiskStore)
+    // Async store may still be persisting this slot; a read must not race the write. On the detached path
+    // the reader performs this wait itself (see diskReaderLoop), so it never blocks the scheduler; only the
+    // synchronous fallback below waits here.
+    bool const detach = asyncDiskReadEnabled() && trackBlockId >= 0;
+    if (mAsyncDiskStore && !detach)
     {
         for (size_t poolIdx = 0; poolIdx < pools.size(); ++poolIdx)
         {
@@ -780,7 +794,7 @@ void KVCacheTransferManager::loadFromFile(BlockPtr const& dstPrimaryBlock, SizeT
     // and hand it off. The reader performs the transfer (GDS DMA if enabled, else POSIX read + copy) and makes
     // it device-complete before publishing the block; the request is forward-safe once areBlocksReady() sees
     // its blocks land. trackBlockId < 0 (no pool) takes the synchronous fallback below.
-    if (asyncDiskReadEnabled() && trackBlockId >= 0)
+    if (detach)
     {
         DiskReadJob job;
         job.blockId = trackBlockId;
