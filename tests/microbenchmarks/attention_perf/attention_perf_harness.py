@@ -108,7 +108,9 @@ def _pci_device_id(gpu_id: int = 0) -> str:
     try:
         out = subprocess.run(
             ["nvidia-smi", "-q", "-i", str(gpu_id)],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True,
+            text=True,
+            timeout=30,
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -144,6 +146,13 @@ _DTYPE_TO_BINDING = {
     torch.float16: tensorrt_llm.bindings.DataType.HALF,
     torch.bfloat16: tensorrt_llm.bindings.DataType.BF16,
     torch.float8_e4m3fn: tensorrt_llm.bindings.DataType.FP8,
+}
+
+# Short dtype label for the human-readable shape tag (see AttnCase.shape_tag).
+_DTYPE_LABEL = {
+    torch.float16: "fp16",
+    torch.bfloat16: "bf16",
+    torch.float8_e4m3fn: "fp8",
 }
 
 
@@ -187,11 +196,11 @@ class AttnCase:
     # below are DSA-only. NOTE: the DSA indexer's DeepGEMM MQA-logits kernels are
     # built for sm90/sm100/sm103 only — DSA cases DO NOT run on sm120 (they skip).
     is_dsa: bool = False
-    hidden_size: int = 7168               # DeepSeek-V3.2 model hidden size
-    max_position_embeddings: int = 8192   # rope cache size; must exceed seq_len
-    index_n_heads: int = 64               # indexer heads (DeepSeek-V3.2)
-    index_head_dim: int = 128             # indexer head dim
-    index_topk: int = 2048                # indexer top-k KV tokens
+    hidden_size: int = 7168  # DeepSeek-V3.2 model hidden size
+    max_position_embeddings: int = 8192  # rope cache size; must exceed seq_len
+    index_n_heads: int = 64  # indexer heads (DeepSeek-V3.2)
+    index_head_dim: int = 128  # indexer head dim
+    index_topk: int = 2048  # indexer top-k KV tokens
 
     def __post_init__(self) -> None:
         if self.phase not in ("context", "generation"):
@@ -206,6 +215,35 @@ class AttnCase:
         total = self.seq_len + self.num_cached_tokens
         return max(1, (total + self.page_size - 1) // self.page_size)
 
+    def shape_tag(self) -> str:
+        """Compact, human-readable encoding of the pinned inputs for this case.
+
+        Goes into the CSV/DB next to case_id so a dashboard row says WHICH shape
+        was measured — case_id alone (e.g. ``attn_l70b_decode_xqa_time``) carries
+        the model+phase+metric but not the batch/seq/head numbers. Purely derived
+        from the pinned fields; it NEVER keys golden/history (case_id does), so it
+        is safe to enrich without breaking baselines. Examples:
+          ``ctx·b1·s2048·h32/8·d128·bf16``
+          ``dec·b256·q1+c1024·h64/8·d128·bf16``
+          ``dec·b7·q1+c1024·mla-fp8·h128·q1536kv512·bf16``
+          ``ctx·b1·s4096·dsa·h128·topk2048·bf16``
+        """
+        ph = "ctx" if self.phase == "context" else "dec"
+        dt = _DTYPE_LABEL.get(self.dtype, str(self.dtype).rsplit(".", 1)[-1])
+        toks = (
+            f"s{self.seq_len}"
+            if self.phase == "context"
+            else f"q{self.seq_len}+c{self.num_cached_tokens}"
+        )
+        if self.is_dsa:
+            fam = f"dsa·h{self.num_heads}·topk{self.index_topk}"
+        elif self.is_mla:
+            mla = "mla-fp8" if self.kv_cache_fp8 else "mla"
+            fam = f"{mla}·h{self.num_heads}·q{self.q_lora_rank}kv{self.kv_lora_rank}"
+        else:
+            fam = f"h{self.num_heads}/{self.num_kv_heads}·d{self.head_dim}"
+        return f"{ph}·b{self.batch_size}·{toks}·{fam}·{dt}"
+
 
 @dataclass
 class Signals:
@@ -214,6 +252,9 @@ class Signals:
     case_id: str
     arch: str
     phase: str
+    # Human-readable pinned-input tag (AttnCase.shape_tag); recorded next to
+    # case_id so the DB/dashboard shows what shape a row measured.
+    shape: Optional[str] = None
     use_paged_context_fmha: Optional[bool] = None
     launch_count: Optional[int] = None
     nvrtc_compile_count: Optional[int] = None  # HOOK
@@ -385,15 +426,17 @@ class _RopeConfig:
 
     hidden_size: int = 7168
     num_attention_heads: int = 128
-    rope_scaling: dict = field(default_factory=lambda: {
-        "beta_fast": 32,
-        "beta_slow": 1,
-        "factor": 40.0,
-        "mscale": 1.0,
-        "mscale_all_dim": 1.0,
-        "original_max_position_embeddings": 4096,
-        "type": "yarn",
-    })
+    rope_scaling: dict = field(
+        default_factory=lambda: {
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "factor": 40.0,
+            "mscale": 1.0,
+            "mscale_all_dim": 1.0,
+            "original_max_position_embeddings": 4096,
+            "type": "yarn",
+        }
+    )
     max_position_embeddings: int = 163840
     rope_theta: float = 10000.0
     qk_rope_head_dim: int = 64
@@ -405,12 +448,14 @@ def _mla_kv_head_dim(case: AttnCase) -> int:
 
 
 def _mla_pos_embd_and_scaling(case: AttnCase):
-    """yarn RoPE PositionalEmbeddingParams + q_scaling (mscale correction)."""
+    """Yarn RoPE PositionalEmbeddingParams + q_scaling (mscale correction)."""
     from tensorrt_llm.functional import PositionEmbeddingType
 
-    rope_config = _RopeConfig(hidden_size=case.hidden_size,
-                              num_attention_heads=case.num_heads,
-                              qk_rope_head_dim=case.qk_rope_head_dim)
+    rope_config = _RopeConfig(
+        hidden_size=case.hidden_size,
+        num_attention_heads=case.num_heads,
+        qk_rope_head_dim=case.qk_rope_head_dim,
+    )
     pos = PositionalEmbeddingParams(
         type=PositionEmbeddingType.yarn,
         rope=RopeParams.from_config(rope_config),
@@ -441,6 +486,7 @@ def _mla_quant_config(case: AttnCase):
         return None
     from tensorrt_llm.models.modeling_utils import QuantConfig
     from tensorrt_llm.quantization.mode import QuantAlgo
+
     return QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8.value)
 
 
@@ -455,8 +501,12 @@ def _build_mla_kv_cache_manager(case: AttnCase, num_layers: int = 1) -> KVCacheM
     head_dim = _mla_kv_head_dim(case)
     per_seq = case.num_cached_tokens + case.seq_len
     max_seq_len = per_seq + tokens_per_block
-    max_tokens = ((max_seq_len + tokens_per_block - 1) // tokens_per_block
-                  * tokens_per_block * case.batch_size)
+    max_tokens = (
+        (max_seq_len + tokens_per_block - 1)
+        // tokens_per_block
+        * tokens_per_block
+        * case.batch_size
+    )
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
     mgr = KVCacheManager(
         KvCacheConfig(max_tokens=max_tokens, enable_block_reuse=False),
@@ -468,8 +518,11 @@ def _build_mla_kv_cache_manager(case: AttnCase, num_layers: int = 1) -> KVCacheM
         max_seq_len=max_seq_len,
         max_batch_size=case.batch_size,
         mapping=mapping,
-        dtype=(_DTYPE_TO_BINDING[torch.float8_e4m3fn] if case.kv_cache_fp8
-               else _DTYPE_TO_BINDING[case.dtype]),
+        dtype=(
+            _DTYPE_TO_BINDING[torch.float8_e4m3fn]
+            if case.kv_cache_fp8
+            else _DTYPE_TO_BINDING[case.dtype]
+        ),
     )
     request_ids = list(range(case.batch_size))
     token_nums = [per_seq] * case.batch_size
@@ -480,8 +533,8 @@ def _build_mla_kv_cache_manager(case: AttnCase, num_layers: int = 1) -> KVCacheM
 def _build_mla_gen_metadata(case: AttnCase, kv_mgr: KVCacheManager):
     request_ids = list(range(case.batch_size))
     kv_cache_params = KVCacheParams(
-        use_cache=True,
-        num_cached_tokens_per_seq=[case.num_cached_tokens] * case.batch_size)
+        use_cache=True, num_cached_tokens_per_seq=[case.num_cached_tokens] * case.batch_size
+    )
     seq_lens = torch.tensor([case.seq_len] * case.batch_size, dtype=torch.int)
     kwargs = dict(
         seq_lens=seq_lens,
@@ -512,12 +565,11 @@ def _make_mla_gen_inputs(case: AttnCase, device: torch.device):
     torch.manual_seed(case.seed)
     nnz = case.batch_size * case.seq_len  # seq_len = generation_seq_len_q (1)
     kvr, rope = case.kv_lora_rank, case.qk_rope_head_dim
-    fused_q = torch.empty(nnz, case.num_heads * (kvr + rope),
-                          dtype=case.dtype, device=device).uniform_(-1, 1)
-    q_pe = torch.empty(nnz, case.num_heads, rope,
-                       dtype=case.dtype, device=device).uniform_(-1, 1)
-    compressed_kv = torch.empty(nnz, kvr, dtype=case.dtype,
-                                device=device).uniform_(-1, 1)
+    fused_q = torch.empty(
+        nnz, case.num_heads * (kvr + rope), dtype=case.dtype, device=device
+    ).uniform_(-1, 1)
+    q_pe = torch.empty(nnz, case.num_heads, rope, dtype=case.dtype, device=device).uniform_(-1, 1)
+    compressed_kv = torch.empty(nnz, kvr, dtype=case.dtype, device=device).uniform_(-1, 1)
     k_pe = torch.empty(nnz, rope, dtype=case.dtype, device=device).uniform_(-1, 1)
     latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)  # (nnz, 576)
     n = case.batch_size
@@ -531,7 +583,8 @@ def _make_mla_gen_inputs(case: AttnCase, device: torch.device):
         scratch["mla_bmm1_scale"] = torch.empty(2, dtype=torch.float32, device=device)
         scratch["mla_bmm2_scale"] = torch.empty(1, dtype=torch.float32, device=device)
         scratch["quant_q_buffer"] = torch.empty(
-            nnz, case.num_heads * (kvr + rope), dtype=torch.uint8, device=device)
+            nnz, case.num_heads * (kvr + rope), dtype=torch.uint8, device=device
+        )
     else:
         scratch["mla_bmm1_scale"] = None
         scratch["mla_bmm2_scale"] = None
@@ -560,6 +613,7 @@ def _make_mla_gen_inputs(case: AttnCase, device: torch.device):
 
 def _dsa_sparse_config(case: AttnCase):
     from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
+
     return DeepSeekSparseAttentionConfig(
         index_n_heads=case.index_n_heads,
         index_head_dim=case.index_head_dim,
@@ -569,7 +623,9 @@ def _dsa_sparse_config(case: AttnCase):
 
 def _dsa_model_config(sparse_config):
     from types import SimpleNamespace
+
     from tensorrt_llm._torch.model_config import ModelConfig
+
     return ModelConfig(
         mapping=Mapping(world_size=1, tp_size=1, rank=0),
         sparse_attention_config=sparse_config,
@@ -609,10 +665,10 @@ def _build_dsa_mla_module(case: AttnCase, model_config, device: torch.device):
     with torch.no_grad():
         mla.kv_b_proj.weight.normal_(mean=0.0, std=std)
         kv_b = mla.kv_b_proj.weight.data.view(
-            case.num_heads, case.qk_nope_head_dim + case.v_head_dim, case.kv_lora_rank)
-        mla.v_b_proj.data = kv_b[:, case.qk_nope_head_dim:, :].contiguous()
-        mla.k_b_proj_trans.data = kv_b[:, :case.qk_nope_head_dim, :].transpose(
-            1, 2).contiguous()
+            case.num_heads, case.qk_nope_head_dim + case.v_head_dim, case.kv_lora_rank
+        )
+        mla.v_b_proj.data = kv_b[:, case.qk_nope_head_dim :, :].contiguous()
+        mla.k_b_proj_trans.data = kv_b[:, : case.qk_nope_head_dim, :].transpose(1, 2).contiguous()
         mla.mqa.indexer.wq_b.weight.normal_(mean=0.0, std=std)
         mla.mqa.indexer.wk.weight.normal_(mean=0.0, std=std)
         mla.mqa.indexer.weights_proj.weight.normal_(mean=0.0, std=std)
@@ -636,12 +692,10 @@ def _build_dsa_ctx(case: AttnCase, device: torch.device):
     head_size = case.kv_lora_rank + case.qk_rope_head_dim  # MLA latent dim (576)
     tokens_per_block = _mla_tokens_per_block()
     per_seq = case.seq_len  # context: seq_len tokens, no cache
-    max_seq_len = ((per_seq + tokens_per_block - 1) // tokens_per_block
-                   * tokens_per_block)
+    max_seq_len = (per_seq + tokens_per_block - 1) // tokens_per_block * tokens_per_block
 
     kv_mgr = DSACacheManager(
-        KvCacheConfig(max_tokens=max_seq_len * case.batch_size,
-                      enable_block_reuse=False),
+        KvCacheConfig(max_tokens=max_seq_len * case.batch_size, enable_block_reuse=False),
         tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
         num_layers=1,
         num_kv_heads=1,
@@ -655,9 +709,12 @@ def _build_dsa_ctx(case: AttnCase, device: torch.device):
         model_config=model_config,
     )
     request_ids = list(range(case.batch_size))
-    kv_mgr.add_dummy_requests(request_ids=request_ids,
-                              token_nums=[case.seq_len] * case.batch_size,
-                              is_gen=False, prepare_resource=True)
+    kv_mgr.add_dummy_requests(
+        request_ids=request_ids,
+        token_nums=[case.seq_len] * case.batch_size,
+        is_gen=False,
+        prepare_resource=True,
+    )
 
     AttentionCls = get_attention_backend("TRTLLM", sparse_config)
     metadata = AttentionCls.Metadata(
@@ -669,8 +726,8 @@ def _build_dsa_ctx(case: AttnCase, device: torch.device):
         max_num_tokens=case.seq_len * case.batch_size,
         kv_cache_manager=kv_mgr,
         kv_cache_params=KVCacheParams(
-            use_cache=True,
-            num_cached_tokens_per_seq=[0] * case.batch_size),
+            use_cache=True, num_cached_tokens_per_seq=[0] * case.batch_size
+        ),
         mapping=Mapping(world_size=1, tp_size=1, rank=0),
         sparse_attention_config=sparse_config,
     )
@@ -678,25 +735,29 @@ def _build_dsa_ctx(case: AttnCase, device: torch.device):
 
     torch.manual_seed(case.seed)
     total = case.batch_size * case.seq_len
-    q = torch.randn(total, case.num_heads * qk_head_dim,
-                    dtype=case.dtype, device=device)
-    compressed_kv = torch.randn(total, case.kv_lora_rank,
-                                dtype=case.dtype, device=device)
-    k_pe = torch.randn(total, case.qk_rope_head_dim,
-                       dtype=case.dtype, device=device)
-    hidden_states = torch.randn(total, case.hidden_size,
-                                dtype=case.dtype, device=device)
+    q = torch.randn(total, case.num_heads * qk_head_dim, dtype=case.dtype, device=device)
+    compressed_kv = torch.randn(total, case.kv_lora_rank, dtype=case.dtype, device=device)
+    k_pe = torch.randn(total, case.qk_rope_head_dim, dtype=case.dtype, device=device)
+    hidden_states = torch.randn(total, case.hidden_size, dtype=case.dtype, device=device)
     qr = torch.randn(total, case.q_lora_rank, dtype=case.dtype, device=device)
     latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
-    position_ids = torch.cat([
-        torch.arange(0, case.seq_len, device=device, dtype=torch.int32)
-        for _ in range(case.batch_size)
-    ])
-    output = torch.empty(total, case.num_heads * case.v_head_dim,
-                         dtype=case.dtype, device=device)
-    fwd = dict(q=q, compressed_kv=compressed_kv, k_pe=k_pe,
-               hidden_states=hidden_states, qr=qr, latent_cache=latent_cache,
-               position_ids=position_ids, output=output)
+    position_ids = torch.cat(
+        [
+            torch.arange(0, case.seq_len, device=device, dtype=torch.int32)
+            for _ in range(case.batch_size)
+        ]
+    )
+    output = torch.empty(total, case.num_heads * case.v_head_dim, dtype=case.dtype, device=device)
+    fwd = dict(
+        q=q,
+        compressed_kv=compressed_kv,
+        k_pe=k_pe,
+        hidden_states=hidden_states,
+        qr=qr,
+        latent_cache=latent_cache,
+        position_ids=position_ids,
+        output=output,
+    )
     return mla, metadata, fwd, kv_mgr
 
 
@@ -718,28 +779,38 @@ def collect_signals(
     short-circuits to the in-process path to avoid infinite re-spawn.
     """
     if os.environ.get("ATTN_INPROC") == "1":
-        return _collect_signals_inproc(
-            case, warmup=warmup, iters=iters, lock_clock=lock_clock)
+        return _collect_signals_inproc(case, warmup=warmup, iters=iters, lock_clock=lock_clock)
     case_d = dataclasses.asdict(case)
     # torch.dtype isn't JSON-serializable — round-trip it by name (e.g. bfloat16).
     case_d["dtype"] = str(case.dtype).rsplit(".", 1)[-1]
-    payload = json.dumps({
-        "case": case_d,
-        "warmup": warmup, "iters": iters, "lock_clock": lock_clock,
-    })
-    env = {**os.environ, "ATTN_INPROC": "1",
-           "PYTHONPATH": os.pathsep.join(p for p in sys.path if p)}
+    payload = json.dumps(
+        {
+            "case": case_d,
+            "warmup": warmup,
+            "iters": iters,
+            "lock_clock": lock_clock,
+        }
+    )
+    env = {
+        **os.environ,
+        "ATTN_INPROC": "1",
+        "PYTHONPATH": os.pathsep.join(p for p in sys.path if p),
+    }
     proc = subprocess.run(
         [sys.executable, os.path.abspath(__file__), payload],
-        env=env, capture_output=True, text=True, timeout=1800)
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=1800,
+    )
     marker = "ATTN_SIGNALS_JSON:"
-    line = next((ln for ln in reversed(proc.stdout.splitlines())
-                 if ln.startswith(marker)), None)
+    line = next((ln for ln in reversed(proc.stdout.splitlines()) if ln.startswith(marker)), None)
     if line is None:
         raise RuntimeError(
             f"isolated case {case.case_id} produced no signals (rc={proc.returncode}).\n"
-            f"--- child stderr (tail) ---\n{os.linesep.join(proc.stderr.splitlines()[-25:])}")
-    return Signals(**json.loads(line[len(marker):]))
+            f"--- child stderr (tail) ---\n{os.linesep.join(proc.stderr.splitlines()[-25:])}"
+        )
+    return Signals(**json.loads(line[len(marker) :]))
 
 
 def _collect_signals_inproc(
@@ -754,37 +825,40 @@ def _collect_signals_inproc(
     if not torch.cuda.is_available():
         raise RuntimeError("attention perf harness requires a CUDA device")
     device = torch.device("cuda")
-    sig = Signals(case_id=case.case_id, arch=sm_arch(), phase=case.phase)
+    sig = Signals(case_id=case.case_id, arch=sm_arch(), phase=case.phase, shape=case.shape_tag())
 
     if case.is_dsa:
         mla, metadata, fwd, kv_mgr = _build_dsa_ctx(case, device)
     else:
-        kv_mgr = (_build_mla_kv_cache_manager(case) if case.is_mla
-                  else _build_kv_cache_manager(case))
+        kv_mgr = _build_mla_kv_cache_manager(case) if case.is_mla else _build_kv_cache_manager(case)
     try:
         if case.is_dsa:
             # DSA context: indexer (sparse top-k select) + sparse MLA forward.
             # use_paged_context_fmha is recorded for parity (MLA-family forces it
             # off); the DSA tripwire is launch_count (indexer + sparse-FMHA chain).
-            sig.use_paged_context_fmha = bool(
-                getattr(metadata, "use_paged_context_fmha", None))
+            sig.use_paged_context_fmha = bool(getattr(metadata, "use_paged_context_fmha", None))
 
             def _fwd():
                 topk = mla.mqa.indexer(
-                    fwd["qr"], fwd["hidden_states"], metadata, fwd["position_ids"])
+                    fwd["qr"], fwd["hidden_states"], metadata, fwd["position_ids"]
+                )
                 return mla.forward_context_dsa(
-                    q=fwd["q"], compressed_kv=fwd["compressed_kv"],
-                    k_pe=fwd["k_pe"], attn_metadata=metadata,
-                    output=fwd["output"], latent_cache=fwd["latent_cache"],
-                    topk_indices=topk, position_ids=fwd["position_ids"])
+                    q=fwd["q"],
+                    compressed_kv=fwd["compressed_kv"],
+                    k_pe=fwd["k_pe"],
+                    attn_metadata=metadata,
+                    output=fwd["output"],
+                    latent_cache=fwd["latent_cache"],
+                    topk_indices=topk,
+                    position_ids=fwd["position_ids"],
+                )
         elif case.is_mla:
             # MLA decode: latent KV + yarn RoPE + two-call forward. num_kv_heads
             # / head_dim from AttnCase are ignored (derived from lora ranks).
             metadata = _build_mla_gen_metadata(case, kv_mgr)
             # use_paged_context_fmha is force-set False for MLA (trtllm.py) — the
             # signal is not a meaningful tripwire here, but record it for parity.
-            sig.use_paged_context_fmha = bool(
-                getattr(metadata, "use_paged_context_fmha", None))
+            sig.use_paged_context_fmha = bool(getattr(metadata, "use_paged_context_fmha", None))
             pos_embd_params, q_scaling = _mla_pos_embd_and_scaling(case)
             backend = TrtllmAttention(
                 layer_idx=0,
@@ -803,25 +877,36 @@ def _collect_signals_inproc(
                 # the paged cache in place; timing the pair is stable (same shapes
                 # / same slot each iter). Both calls = the "MLA decode" structure.
                 backend.mla_rope_generation(
-                    fused_q, q_pe, latent_cache, metadata,
-                    scratch["cu_q_seqlens"], scratch["cu_kv_seqlens"],
-                    scratch["fmha_scheduler_counter"], scratch["mla_bmm1_scale"],
-                    scratch["mla_bmm2_scale"], scratch["quant_q_buffer"])
+                    fused_q,
+                    q_pe,
+                    latent_cache,
+                    metadata,
+                    scratch["cu_q_seqlens"],
+                    scratch["cu_kv_seqlens"],
+                    scratch["fmha_scheduler_counter"],
+                    scratch["mla_bmm1_scale"],
+                    scratch["mla_bmm2_scale"],
+                    scratch["quant_q_buffer"],
+                )
                 return backend.forward(
-                    fused_q, None, None, metadata,
+                    fused_q,
+                    None,
+                    None,
+                    metadata,
                     attention_input_type=AttentionInputType.generation_only,
-                    latent_cache=latent_cache, q_pe=q_pe,
+                    latent_cache=latent_cache,
+                    q_pe=q_pe,
                     cu_q_seqlens=scratch["cu_q_seqlens"],
                     cu_kv_seqlens=scratch["cu_kv_seqlens"],
                     fmha_scheduler_counter=scratch["fmha_scheduler_counter"],
                     mla_bmm1_scale=scratch["mla_bmm1_scale"],
                     mla_bmm2_scale=scratch["mla_bmm2_scale"],
-                    quant_q_buffer=scratch["quant_q_buffer"])
+                    quant_q_buffer=scratch["quant_q_buffer"],
+                )
         else:
             metadata = _build_metadata(case, kv_mgr)
             # ---- discrete: config-deterministic, no GPU noise ----
-            sig.use_paged_context_fmha = bool(
-                getattr(metadata, "use_paged_context_fmha", None))
+            sig.use_paged_context_fmha = bool(getattr(metadata, "use_paged_context_fmha", None))
 
             backend = TrtllmAttention(
                 layer_idx=0,
@@ -914,6 +999,6 @@ if __name__ == "__main__":
     _cd["dtype"] = getattr(torch, _cd["dtype"])  # name -> torch.dtype
     _case = AttnCase(**_cd)
     _sig = _collect_signals_inproc(
-        _case, warmup=_payload["warmup"], iters=_payload["iters"],
-        lock_clock=_payload["lock_clock"])
+        _case, warmup=_payload["warmup"], iters=_payload["iters"], lock_clock=_payload["lock_clock"]
+    )
     print("ATTN_SIGNALS_JSON:" + json.dumps(dataclasses.asdict(_sig)))

@@ -27,9 +27,7 @@ from __future__ import annotations
 import math
 
 import pytest
-
 import test_attention_perf_module as m
-
 
 # --------------------------------------------------------------------------- #
 # _continuous_gate: dict (variance-based) vs legacy scalar entries
@@ -38,8 +36,7 @@ import test_attention_perf_module as m
 
 def test_continuous_gate_dict_k_sigma_dominates():
     # k_sigma * cv (4 * 0.03 = 0.12) > rel_floor (0.01) -> margin = 0.12
-    baseline, margin, threshold = m._continuous_gate(
-        {"baseline_ms": 10.0, "cv": 0.03, "n": 5})
+    baseline, margin, threshold = m._continuous_gate({"baseline_ms": 10.0, "cv": 0.03, "n": 5})
     assert baseline == 10.0
     assert margin == pytest.approx(m._DEFAULT_K_SIGMA * 0.03)
     assert threshold == pytest.approx(10.0 * (1 + m._DEFAULT_K_SIGMA * 0.03))
@@ -47,16 +44,15 @@ def test_continuous_gate_dict_k_sigma_dominates():
 
 def test_continuous_gate_dict_rel_floor_dominates():
     # k_sigma * cv (4 * 0.0001 = 0.0004) < rel_floor default (0.01) -> floor wins
-    baseline, margin, threshold = m._continuous_gate(
-        {"baseline_ms": 2.79, "cv": 0.0001, "n": 8})
+    baseline, margin, threshold = m._continuous_gate({"baseline_ms": 2.79, "cv": 0.0001, "n": 8})
     assert margin == pytest.approx(m._DEFAULT_REL_FLOOR)
     assert threshold == pytest.approx(2.79 * (1 + m._DEFAULT_REL_FLOOR))
 
 
 def test_continuous_gate_dict_respects_explicit_overrides():
     baseline, margin, threshold = m._continuous_gate(
-        {"baseline_ms": 1.0, "cv": 0.02, "n": 6, "k_sigma": 6.0,
-         "rel_floor": 0.2})
+        {"baseline_ms": 1.0, "cv": 0.02, "n": 6, "k_sigma": 6.0, "rel_floor": 0.2}
+    )
     # max(6 * 0.02 = 0.12, 0.2) -> floor override wins
     assert margin == pytest.approx(0.2)
     assert threshold == pytest.approx(1.2)
@@ -96,6 +92,7 @@ def test_observed_cv_zero_median_is_zero():
 
 def test_observed_cv_known_values():
     import statistics
+
     times = [1.0, 2.0, 3.0]
     median = 2.0
     expected = statistics.pstdev(times) / median
@@ -119,8 +116,7 @@ def test_bootstrap_or_skip_missing_golden_skips(monkeypatch):
 
 
 @pytest.mark.parametrize("falsy_golden", [False, 0])
-def test_bootstrap_or_skip_falsy_but_present_golden_returned(
-        monkeypatch, falsy_golden):
+def test_bootstrap_or_skip_falsy_but_present_golden_returned(monkeypatch, falsy_golden):
     # A blessed golden of False/0 (e.g. discrete launch_count sentinel) is a real
     # entry, NOT "missing" -> must be returned, not skipped.
     monkeypatch.setattr(m, "_golden_for", lambda *a, **k: falsy_golden)

@@ -146,8 +146,7 @@ def resolve_node_hostname() -> str:
     ``SLURM_JOB_NODELIST`` -> ``SLURM_NODELIST`` -> ``socket.gethostname()``.
     """
     return (os.environ.get("SLURM_JOB_NODELIST")
-            or os.environ.get("SLURM_NODELIST")
-            or socket.gethostname())
+            or os.environ.get("SLURM_NODELIST") or socket.gethostname())
 
 
 #if hang time > 30 mins, it will be killed

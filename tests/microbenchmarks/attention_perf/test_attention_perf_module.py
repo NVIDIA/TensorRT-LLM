@@ -65,6 +65,18 @@ _DEFAULT_K_SIGMA = 4.0
 _DEFAULT_REL_FLOOR = 0.01
 _LEGACY_CONT_THRESHOLD = 1.05  # fallback for scalar (pre-variance) golden entries
 
+# Continuous gpu_time flutters run-to-run (cross-session: fresh CUDA context,
+# clock/thermal state, allocator layout). A single run's in-call median can't
+# remove that — the whole run's median itself shifts session to session. So the
+# continuous path repeats the measurement across R FRESH subprocesses (each an
+# independent session) and gates on the median-of-medians, which is robust to a
+# lone hot/cold run. R>1 also yields the TRUE cross-run CV — exactly the cv the
+# variance gate wants (and the value to bless into the golden). Default R=3 is
+# the smallest odd count that gives a real median (drops one outlier run) at 3x
+# cost; nightly can raise ATTN_PERF_REPEATS (e.g. 5) for a tighter cv, and R=1
+# restores the single-run in-call behavior for a quick local check.
+_CONT_REPEATS = max(1, int(os.environ.get("ATTN_PERF_REPEATS", "3")))
+
 # --------------------------------------------------------------------------- #
 # golden store — JSON keyed by case_id -> gpu(device name) -> value. CSV log for raw runs.
 # Flat files on purpose: this is the research phase, not production monitoring
@@ -79,11 +91,13 @@ def _load_golden() -> dict:
 
 
 def _gpu_key() -> str:
-    """GPU identity used to key golden: the DEVICE NAME, not sm_arch. One arch
-    spans multiple GPUs (sm90=H100/H200/H20, sm120=RTX-PRO-6000/5090) whose perf
-    differs, so a baseline must be pinned to the concrete GPU. Resolves the
-    generic "NVIDIA Graphics Device" (e.g. B300) via PCI id. Single source of
-    truth for the CSV gpu_name column and the DB `gpu` column."""
+    """GPU identity used to key golden: the DEVICE NAME, not sm_arch.
+
+    One arch spans multiple GPUs (sm90=H100/H200/H20, sm120=RTX-PRO-6000/5090)
+    whose perf differs, so a baseline must be pinned to the concrete GPU.
+    Resolves the generic "NVIDIA Graphics Device" (e.g. B300) via PCI id. Single
+    source of truth for the CSV gpu_name column and the DB `gpu` column.
+    """
     return device_name()
 
 
@@ -112,6 +126,9 @@ def _log_run(row: dict) -> None:
 def _record(sig, golden, verdict: str, **extra) -> None:
     row = {
         "case_id": sig.case_id,
+        # Human-readable pinned-input shape (batch/seq/heads/dtype), so the DB
+        # row is self-describing without decoding case_id. Not a golden key.
+        "shape": sig.shape,
         "arch": sig.arch,
         # Real device name (e.g. "NVIDIA H100 80GB HBM3") so the DB stores the
         # concrete GPU per run, not just the sm_arch. Auto-correct on any node.
@@ -263,20 +280,36 @@ def test_attn_decode_dispatch():
 # --------------------------------------------------------------------------- #
 
 
-def _run_continuous(case, what: str):
+def _run_continuous(case, what: str, repeats: int = None):
     """Shared continuous-path body: measure gpu_time, gate vs threshold.
 
-    Gates against a variance-based threshold. Bootstrap-skips (printing a
-    paste-ready entry) when no golden exists for this (case, arch).
+    Repeats the measurement across ``repeats`` fresh subprocesses (default
+    ``_CONT_REPEATS``) and gates on the median-of-medians — stable against a lone
+    hot/cold run (see _CONT_REPEATS). With repeats>1 the reported cv is the TRUE
+    cross-run cv; with repeats==1 it is the single-run in-call cv (unchanged
+    behavior). Gates against a variance-based threshold. Bootstrap-skips
+    (printing a paste-ready entry) when no golden exists for this (case, arch).
     """
-    sig = collect_signals(case, warmup=10, iters=50, lock_clock=True)
-    observed = sig.gpu_time_median_ms
-    cv = _observed_cv(sig.raw_times_ms, observed)
+    repeats = _CONT_REPEATS if repeats is None else max(1, repeats)
+    runs = [collect_signals(case, warmup=10, iters=50, lock_clock=True) for _ in range(repeats)]
+    per_run = [r.gpu_time_median_ms for r in runs]
+    observed = statistics.median(per_run)
+    # Representative sig for the CSV row = the run whose median is closest to the
+    # aggregate (so raw_times/p99 recorded belong to a real, central run).
+    sig = min(runs, key=lambda r: abs((r.gpu_time_median_ms or 0.0) - observed))
+
+    if len(per_run) > 1:
+        # True cross-session noise across the R independent runs.
+        cv = statistics.pstdev(per_run) / observed if observed else 0.0
+        n = len(per_run)
+    else:
+        cv = _observed_cv(sig.raw_times_ms, observed)
+        n = len(sig.raw_times_ms)
 
     golden_entry = _golden_for(case.case_id, _gpu_key())
     if golden_entry is None:
         _record(sig, None, verdict="bootstrap", observed_cv=round(cv, 4))
-        _bootstrap_continuous_msg(case.case_id, _gpu_key(), observed, cv, len(sig.raw_times_ms))
+        _bootstrap_continuous_msg(case.case_id, _gpu_key(), observed, cv, n)
 
     baseline, margin, threshold = _continuous_gate(golden_entry)
     verdict = "pass" if observed <= threshold else "REGRESSION"
@@ -333,8 +366,9 @@ _DEC_KW = dict(phase="generation", batch_size=256, seq_len=1, num_cached_tokens=
 
 
 def _gqa(label, nh, nkv, hd, suffix, kw):
-    return AttnCase(case_id=f"attn_{label}_{suffix}", num_heads=nh, num_kv_heads=nkv,
-                    head_dim=hd, **kw)
+    return AttnCase(
+        case_id=f"attn_{label}_{suffix}", num_heads=nh, num_kv_heads=nkv, head_dim=hd, **kw
+    )
 
 
 _GQA_CTX_DISP = [_gqa(*s, "ctx_dispatch", _CTX_KW) for s in _GQA_SHAPES]
@@ -400,8 +434,14 @@ def test_gqa_decode_time(case):
 # for MLA (not a tripwire) -> the discrete signal here is launch_count.
 # --------------------------------------------------------------------------- #
 
-_MLA_DEC_KW = dict(phase="generation", batch_size=128, seq_len=1,
-                   num_cached_tokens=2048, is_mla=True, num_heads=128)
+_MLA_DEC_KW = dict(
+    phase="generation",
+    batch_size=128,
+    seq_len=1,
+    num_cached_tokens=2048,
+    is_mla=True,
+    num_heads=128,
+)
 _MLA_DEC_DISP = AttnCase(case_id="attn_mla_decode_dispatch", **_MLA_DEC_KW)
 _MLA_DEC_TIME = AttnCase(case_id="attn_mla_decode_time", **_MLA_DEC_KW)
 
@@ -477,19 +517,29 @@ def test_mla_fp8_decode_time():
 
 try:
     from tensorrt_llm._utils import get_sm_version
+
     _DSA_ARCH_OK = torch.cuda.is_available() and get_sm_version() in (90, 100, 103)
 except (ImportError, RuntimeError):
     # ImportError: _utils/get_sm_version unavailable; RuntimeError: CUDA/driver
     # query failed. Either way DSA cases can't run here -> skip, don't crash.
     _DSA_ARCH_OK = False
 _DSA = pytest.mark.skipif(
-    not _DSA_ARCH_OK,
-    reason="DSA indexer needs DeepGEMM MQA-logits kernels (sm90/sm100/sm103 only)")
+    not _DSA_ARCH_OK, reason="DSA indexer needs DeepGEMM MQA-logits kernels (sm90/sm100/sm103 only)"
+)
 
-_DSA_CTX_KW = dict(phase="context", batch_size=1, seq_len=4096,
-                   num_cached_tokens=0, is_dsa=True, num_heads=128,
-                   hidden_size=7168, max_position_embeddings=8192,
-                   index_n_heads=64, index_head_dim=128, index_topk=2048)
+_DSA_CTX_KW = dict(
+    phase="context",
+    batch_size=1,
+    seq_len=4096,
+    num_cached_tokens=0,
+    is_dsa=True,
+    num_heads=128,
+    hidden_size=7168,
+    max_position_embeddings=8192,
+    index_n_heads=64,
+    index_head_dim=128,
+    index_topk=2048,
+)
 _DSA_CTX_DISP = AttnCase(case_id="attn_dsa_ctx_dispatch", **_DSA_CTX_KW)
 _DSA_CTX_TIME = AttnCase(case_id="attn_dsa_ctx_fmha_time", **_DSA_CTX_KW)
 
