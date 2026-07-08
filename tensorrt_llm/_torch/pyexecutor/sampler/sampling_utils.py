@@ -974,7 +974,9 @@ def sampling_batch_spec_dec_one_model(
         )
     else:
         sampled = vanilla.forward_native_sampling(logits, top_k, top_p)
-    return torch.where(is_greedy, greedy_tokens, sampled)
+    # argmax yields int64; cast so torch.where preserves the sampler's dtype
+    # (flashinfer returns int32) instead of promoting the result to int64.
+    return torch.where(is_greedy, greedy_tokens.to(sampled.dtype), sampled)
 
 
 @torch.compile(options={"max-autotune": True})
@@ -988,8 +990,13 @@ def sampling_batch_spec_dec_one_model_for_rejection(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Draft sampler returning tokens AND probs for the downstream rejection-sampling path."""
     probs = compute_probs_from_logits(logits, temperatures, top_k, top_p)
-    if IS_FLASHINFER_AVAILABLE:
-        tokens = flashinfer.sampling_from_probs_op(probs, seed=seed, offset=offset)
-    else:
-        tokens = vanilla._random_sample(probs)
+    if not IS_FLASHINFER_AVAILABLE:
+        # The torch-native fallback samples from the global RNG and ignores
+        # seed/offset, which breaks determinism and cross-rank consistency that
+        # one-model speculative rejection sampling relies on. Require flashinfer
+        # instead of silently degrading (matches the pre-refactor behavior).
+        raise RuntimeError(
+            "Rejection sampling for one-model speculative decoding requires flashinfer"
+        )
+    tokens = flashinfer.sampling_from_probs_op(probs, seed=seed, offset=offset)
     return tokens, probs
