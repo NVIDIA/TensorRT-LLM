@@ -1801,6 +1801,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         return True
 
     @classmethod
+    def support_strided_fused_qkv(cls) -> bool:
+        # The gate-tail layout passes a [Q|K|V] view whose token stride still
+        # includes the trailing gate. TRTLLM-Gen preprocesses that view into a
+        # packed Q buffer, while legacy XQA/MMHA generation reads QKV directly.
+        return cls.is_sm_version_trtllm_gen_kernel(get_sm_version())
+
+    @classmethod
     def support_mla(cls) -> bool:
         return True
 
