@@ -513,7 +513,7 @@ def _normalize_chatglm_config(
         model_config: transformers.PretrainedConfig) -> None:
     """Set standard aliases for ChatGLM's Megatron-style config fields."""
 
-    def set_if_absent(name, value):
+    def set_if_absent(name: str, value: object | None) -> None:
         if getattr(model_config, name, None) is None and value is not None:
             setattr(model_config, name, value)
 
@@ -523,7 +523,10 @@ def _normalize_chatglm_config(
     if head_dim is None:
         head_dim = model_config.hidden_size // model_config.num_attention_heads
     set_if_absent("head_dim", head_dim)
-    if getattr(model_config, "multi_query_attention", False):
+    multi_query_group_num = getattr(model_config, "multi_query_group_num",
+                                    None)
+    if getattr(model_config, "multi_query_attention",
+               multi_query_group_num is not None):
         set_if_absent(
             "num_key_value_heads",
             getattr(model_config, "multi_query_group_num",
@@ -537,7 +540,10 @@ def _normalize_chatglm_config(
     set_if_absent("rms_norm_eps",
                   getattr(model_config, "layernorm_epsilon", None))
     set_if_absent("partial_rotary_factor", 0.5)
-    set_if_absent("rope_theta", 10000.0)
+    rope_ratio = getattr(model_config, "rope_ratio", None)
+    if rope_ratio is None:
+        rope_ratio = 1.0
+    set_if_absent("rope_theta", 10000.0 * rope_ratio)
     set_if_absent("vocab_size", getattr(model_config, "padded_vocab_size",
                                         None))
 
