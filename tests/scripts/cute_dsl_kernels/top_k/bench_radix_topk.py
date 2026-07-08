@@ -11,13 +11,13 @@ Covers:
 Timing: CuptiProfiler (GPU kernel time only).
 
 Usage:
-    python bench_topk_all.py --mode prefill --style fixlen --num_cols 8192
-    python bench_topk_all.py --mode prefill --style varlen
-    python bench_topk_all.py --mode decode  --style fixlen --num_tokens 32768
-    python bench_topk_all.py --mode decode  --style varlen --max_tokens 32768
-    python bench_topk_all.py --sweep_all          # run every combination
-    python bench_topk_all.py --sweep_prefill       # prefill only (fixlen + varlen)
-    python bench_topk_all.py --sweep_decode        # decode only  (fixlen + varlen)
+    python bench_radix_topk.py --mode prefill --style fixlen --num_cols 8192
+    python bench_radix_topk.py --mode prefill --style varlen
+    python bench_radix_topk.py --mode decode  --style fixlen --num_tokens 32768
+    python bench_radix_topk.py --mode decode  --style varlen --max_tokens 32768
+    python bench_radix_topk.py --sweep_all          # run every combination
+    python bench_radix_topk.py --sweep_prefill       # prefill only (fixlen + varlen)
+    python bench_radix_topk.py --sweep_decode        # decode only  (fixlen + varlen)
 """
 
 import argparse
