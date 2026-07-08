@@ -19,6 +19,7 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
@@ -100,6 +101,12 @@ public:
 
     //! \brief True while block blockId still has an in-flight disk read (not yet safe to read on the GPU).
     [[nodiscard]] bool isBlockReadPending(std::int32_t blockId);
+
+    //! \brief Lock-free: true if ANY disk read is in flight, letting areBlocksReady() skip its scan.
+    [[nodiscard]] bool anyReadPending() const noexcept
+    {
+        return mReadInflightCount.load(std::memory_order_acquire) > 0;
+    }
 
     //! \brief True when a reader pool is present, so onboards can be detached from the scheduler thread.
     [[nodiscard]] bool asyncDiskReadEnabled() const
@@ -245,6 +252,9 @@ private:
     // Blocks with a disk read in flight, keyed by the matched-identity block id so every request reusing that
     // prefix gates on the same key. A block is forward-safe once it leaves this set.
     std::unordered_set<std::int32_t> mPendingBlockReads;
+    // Lock-free mirror of mPendingBlockReads.size() (updated under mReadMutex on every insert/erase) so
+    // areBlocksReady() can skip its per-block scan + the mutex when nothing is in flight (common case).
+    std::atomic<std::size_t> mReadInflightCount{0};
     std::vector<std::int32_t> mCompletedBlockReads;
     bool mDiskReaderStop{false};
 

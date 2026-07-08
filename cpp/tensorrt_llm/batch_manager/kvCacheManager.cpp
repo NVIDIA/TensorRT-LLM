@@ -1673,6 +1673,13 @@ void WindowBlockManager::onboardBlock(GenerationRequest& sequence, BlockPtr cons
 
 bool WindowBlockManager::areBlocksReady(LlmRequest::RequestIdType requestId)
 {
+    // Fast path: with no disk read in flight (the common case) every block is trivially ready, so skip the
+    // per-block scan and its mutex entirely. Without this the park scans every block of every context
+    // request each step -- an O(context-length) mutex-locked host cost even when nothing is onboarding.
+    if (!mTransferManager->anyReadPending())
+    {
+        return true;
+    }
     // A request is forward-safe only when every block it holds has its disk read landed. Keyed by block id,
     // so a request sharing an in-flight onboarded block waits on the same key as the request that started it.
     auto it = mAllocatedBlocksPerSeq.find(requestId);

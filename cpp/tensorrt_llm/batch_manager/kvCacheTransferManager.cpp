@@ -679,6 +679,7 @@ void KVCacheTransferManager::diskReaderLoop()
             std::lock_guard<std::mutex> lock(mReadMutex);
             // The transfer is device-complete, so publish the block: any request holding it can be forwarded.
             mPendingBlockReads.erase(job.blockId);
+            mReadInflightCount.store(mPendingBlockReads.size(), std::memory_order_release);
             mCompletedBlockReads.push_back(job.blockId);
         }
     }
@@ -690,6 +691,7 @@ void KVCacheTransferManager::enqueueDiskRead(DiskReadJob job)
     {
         std::lock_guard<std::mutex> lock(mReadMutex);
         mPendingBlockReads.insert(job.blockId); // mark pending before the job becomes poppable
+        mReadInflightCount.store(mPendingBlockReads.size(), std::memory_order_release);
         mReadQueue.push(std::move(job));
     }
     mReadQueueCv.notify_one();
