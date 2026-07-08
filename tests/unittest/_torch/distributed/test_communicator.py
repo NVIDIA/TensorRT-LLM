@@ -46,7 +46,7 @@ def _valid_topologies(parent_size: int = 8) -> list[dict[str, object]]:
                 "ep_group": ep_group,
                 "ep_size": len(ep_group),
                 "ep_rank": ep_group.index(rank),
-                "health_size": None,
+                "failure_evidence_size": None,
                 "error_kind": None,
                 "error_message": None,
             }
@@ -533,17 +533,17 @@ def test_create_mpi_ft_subcomm_propagates_remote_validation_error(
     parent_comm.Split.assert_not_called()
 
 
-def test_create_mpi_ft_subcomm_collectively_validates_health_size(
+def test_create_mpi_ft_subcomm_collectively_validates_failure_evidence_size(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     parent_comm, _ = _communicators()
     monkeypatch.setattr(communicator, "MPI", _fake_mpi(parent_comm))
 
-    with pytest.raises(ValueError, match="EPGroupHealth size must match"):
+    with pytest.raises(ValueError, match="Failure-evidence state size must match"):
         communicator.create_mpi_ft_subcomm(
             _mapping(),
             parent_comm,
-            health_size=7,
+            failure_evidence_size=7,
         )
 
     parent_comm.allgather.assert_called_once()
@@ -581,7 +581,7 @@ def test_create_mpi_ft_subcomm_rejects_inconsistent_remote_ep_group(
         ("mapping_rank", 2.0, "reports mapping rank"),
         ("ep_size", 8.0, "reports EP size"),
         ("ep_rank", 2.0, "reports invalid EP rank"),
-        ("health_size", 8.0, "reports health size"),
+        ("failure_evidence_size", 8.0, "reports failure-evidence size"),
     ],
     ids=[
         "missing-group",
@@ -596,7 +596,7 @@ def test_create_mpi_ft_subcomm_rejects_inconsistent_remote_ep_group(
         "float-mapping-rank",
         "float-ep-size",
         "float-ep-rank",
-        "float-health-size",
+        "float-failure-evidence-size",
     ],
 )
 def test_create_mpi_ft_subcomm_rejects_malformed_remote_topology_schema(

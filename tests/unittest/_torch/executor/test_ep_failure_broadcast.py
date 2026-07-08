@@ -38,7 +38,7 @@ import pytest
 from tensorrt_llm._torch.modules.fused_moe.ep_group_health import EPGroupHealth
 from tensorrt_llm._torch.pyexecutor import ep_failure_broadcast
 from tensorrt_llm._torch.pyexecutor.ep_failure_broadcast import (
-    DetectedRankState,
+    FailureEvidenceState,
     MpiFtSubcomm,
     MpiFtSubcommConfig,
 )
@@ -313,23 +313,23 @@ def _make_broadcaster(
     *,
     size: int = 4,
     rank: int = 0,
-    detected_state: DetectedRankState | None = None,
+    failure_evidence: FailureEvidenceState | None = None,
     comm: _FakeComm | None = None,
     mpi: _FakeMPI | None = None,
     callback: Callable[[int, int, float], None] | None = None,
-) -> tuple[MpiFtSubcomm, DetectedRankState, _FakeComm, _FakeMPI]:
-    detected_state = detected_state or DetectedRankState(size)
+) -> tuple[MpiFtSubcomm, FailureEvidenceState, _FakeComm, _FakeMPI]:
+    failure_evidence = failure_evidence or FailureEvidenceState(size)
     comm = comm or _FakeComm(size=size, rank=rank)
     mpi = mpi or _FakeMPI()
     broadcaster = MpiFtSubcomm(
         _FakeMapping.ep_world(size, rank),
-        detected_state,
+        failure_evidence,
         _TEST_CONFIG,
         callback,
         comm=comm,
         mpi_module=mpi,
     )
-    return broadcaster, detected_state, comm, mpi
+    return broadcaster, failure_evidence, comm, mpi
 
 
 def test_committed_ep_group_health_is_rejected_before_mpi_setup() -> None:
@@ -349,14 +349,14 @@ def test_committed_ep_group_health_is_rejected_before_mpi_setup() -> None:
 
 
 def test_watchdog_callback_records_and_fans_out_detected_failure() -> None:
-    detected_state = DetectedRankState(4)
-    broadcaster, _, comm, _ = _make_broadcaster(detected_state=detected_state)
+    failure_evidence = FailureEvidenceState(4)
+    broadcaster, _, comm, _ = _make_broadcaster(failure_evidence=failure_evidence)
     broadcaster.start()
     caller_thread = threading.get_ident()
     try:
         watchdog_callback = broadcaster.report_detected_failure
         assert watchdog_callback(2) is True
-        assert detected_state.get_failed_ranks() == frozenset({2})
+        assert failure_evidence.snapshot().failed_ranks == frozenset({2})
         _wait_until(lambda: len(comm.sends) == 2, description="failure fanout")
         _wait_until(
             lambda: all(record.request.test_calls > 0 for record in comm.sends),
@@ -379,19 +379,19 @@ def test_watchdog_callback_records_and_fans_out_detected_failure() -> None:
         comm.deliver(source=1, failed_rank=2)
         comm.deliver(source=3, failed_rank=2)
         _wait_until(
-            broadcaster.detected_state_is_reconciled,
+            broadcaster.failure_evidence_is_reconciled,
             description="detection reconciliation",
         )
     finally:
         broadcaster.stop()
 
 
-def test_externally_premarked_detected_state_fails_closed() -> None:
-    detected_state = DetectedRankState(2)
-    assert detected_state.record_failure(1) is True
+def test_externally_premarked_failure_evidence_fails_closed() -> None:
+    failure_evidence = FailureEvidenceState(2)
+    assert failure_evidence._record_failure(1) is True
     broadcaster, _, comm, _ = _make_broadcaster(
         size=2,
-        detected_state=detected_state,
+        failure_evidence=failure_evidence,
     )
 
     try:
@@ -403,7 +403,7 @@ def test_externally_premarked_detected_state_fails_closed() -> None:
             pass
         _wait_until(
             lambda: isinstance(broadcaster.last_error, RuntimeError),
-            description="pre-recorded detected-state rejection",
+            description="pre-recorded failure-evidence rejection",
         )
         assert "without pre-recording evidence" in str(broadcaster.last_error)
         _wait_until(lambda: comm.revoke_calls == 1, description="pre-mark fail-closed revoke")
@@ -413,12 +413,12 @@ def test_externally_premarked_detected_state_fails_closed() -> None:
 
 def test_detection_reconciliation_does_not_mutate_committed_health() -> None:
     callbacks: list[tuple[int, int, float]] = []
-    detected_state = DetectedRankState(2)
+    failure_evidence = FailureEvidenceState(2)
     committed_health = EPGroupHealth(2)
     initial_committed_snapshot = committed_health.snapshot()
     broadcaster, _, _, _ = _make_broadcaster(
         size=2,
-        detected_state=detected_state,
+        failure_evidence=failure_evidence,
         callback=lambda failed, source, when: callbacks.append((failed, source, when)),
     )
     broadcaster.start()
@@ -429,12 +429,12 @@ def test_detection_reconciliation_does_not_mutate_committed_health() -> None:
             description="local detection coordinator handoff",
         )
         _wait_until(
-            broadcaster.detected_state_is_reconciled,
+            broadcaster.failure_evidence_is_reconciled,
             description="detection reconciliation",
         )
 
-        assert detected_state.get_failed_ranks() == frozenset({1})
-        assert detected_state.generation == 1
+        assert failure_evidence.snapshot().failed_ranks == frozenset({1})
+        assert failure_evidence.snapshot().evidence_epoch == 1
         assert committed_health.snapshot() == initial_committed_snapshot
         assert committed_health.all_active() is True
         assert callbacks[0][:2] == (1, 0)
@@ -468,37 +468,64 @@ def test_survivor_echoes_reconcile_failure_detection() -> None:
         assert len(comm.sends) == 2
         assert {send.destination for send in comm.sends} == {1, 3}
         assert all(send.message_kind == _FAILURE_MESSAGE for send in comm.sends)
-        assert broadcaster.detected_health_is_reconciled() is True
+        assert broadcaster.failure_evidence_is_reconciled() is True
         assert comm.revoke_calls == 0
     finally:
         broadcaster.stop()
 
 
-def test_detected_state_is_monotonic_for_one_communicator_epoch() -> None:
-    state = DetectedRankState(3)
+def test_failure_evidence_is_monotonic_for_one_communicator_epoch() -> None:
+    state = FailureEvidenceState(3)
 
-    assert state.snapshot() == ep_failure_broadcast.DetectedRankStateSnapshot(
-        mask=0b111,
+    assert state.snapshot() == ep_failure_broadcast.FailureEvidenceSnapshot(
         failed_ranks=frozenset(),
-        generation=0,
+        evidence_epoch=0,
     )
-    assert state.record_failure(2) is True
-    assert state.record_failure(2) is False
-    assert state.get_mask() == 0b011
-    assert state.get_failed_ranks() == frozenset({2})
-    assert state.generation == 1
+    assert state._record_failure(2) is True
+    assert state._record_failure(2) is False
+    assert state.has_failure(2) is True
+    assert state.has_failure(1) is False
+    assert state.snapshot().failed_ranks == frozenset({2})
+    assert state.snapshot().evidence_epoch == 1
+    assert not hasattr(state, "get_mask")
+    assert not hasattr(state.snapshot(), "mask")
     assert not hasattr(state, "mark_active")
 
 
-def test_detected_state_coalesces_concurrent_evidence() -> None:
-    state = DetectedRankState(4)
+@pytest.mark.parametrize("ep_size", [1.5, True], ids=["fractional", "boolean"])
+def test_failure_evidence_rejects_non_integer_size(ep_size: object) -> None:
+    with pytest.raises(TypeError, match="ep_size must be an integer"):
+        FailureEvidenceState(ep_size)
+
+
+@pytest.mark.parametrize("rank", [0.5, True], ids=["fractional", "boolean"])
+def test_non_integer_failure_rank_is_rejected(rank: object) -> None:
+    failure_evidence = FailureEvidenceState(2)
+    with pytest.raises(TypeError, match="rank must be an integer"):
+        failure_evidence._record_failure(rank)
+
+    broadcaster, _, _, _ = _make_broadcaster(
+        size=2,
+        failure_evidence=failure_evidence,
+    )
+    broadcaster.start()
+    try:
+        with pytest.raises(TypeError, match="failed_rank must be an integer"):
+            broadcaster.report_detected_failure(rank)
+        assert failure_evidence.has_failures() is False
+    finally:
+        broadcaster.stop()
+
+
+def test_failure_evidence_coalesces_concurrent_evidence() -> None:
+    state = FailureEvidenceState(4)
     barrier = threading.Barrier(8)
     results: list[bool] = []
     results_lock = threading.Lock()
 
     def record_same_failure() -> None:
         barrier.wait()
-        changed = state.record_failure(2)
+        changed = state._record_failure(2)
         with results_lock:
             results.append(changed)
 
@@ -510,18 +537,17 @@ def test_detected_state_coalesces_concurrent_evidence() -> None:
 
     assert results.count(True) == 1
     assert results.count(False) == 7
-    assert state.snapshot() == ep_failure_broadcast.DetectedRankStateSnapshot(
-        mask=0b1011,
+    assert state.snapshot() == ep_failure_broadcast.FailureEvidenceSnapshot(
         failed_ranks=frozenset({2}),
-        generation=1,
+        evidence_epoch=1,
     )
 
 
 def test_second_failure_between_claim_and_observe_cannot_open_single_failure_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    health = DetectedRankState(3)
-    broadcaster, _, _, _ = _make_broadcaster(size=3, detected_state=health)
+    failure_evidence = FailureEvidenceState(3)
+    broadcaster, _, _, _ = _make_broadcaster(size=3, failure_evidence=failure_evidence)
     original_claim = broadcaster._claim_failure
     mutated = False
 
@@ -530,23 +556,23 @@ def test_second_failure_between_claim_and_observe_cannot_open_single_failure_gat
         original_claim(failed_rank)
         if not mutated:
             mutated = True
-            assert health.record_failure(1) is True
+            assert failure_evidence._record_failure(1) is True
 
     monkeypatch.setattr(broadcaster, "_claim_failure", claim_then_add_second_failure)
     broadcaster.start()
     try:
-        assert broadcaster.broadcast_failure(2) is True
+        assert broadcaster.report_detected_failure(2) is True
         _wait_until(
             lambda: 2 in broadcaster._failure_fanout_complete,
             description="single-survivor fanout completion",
         )
-        assert health.get_failed_ranks() == frozenset({1, 2})
+        assert failure_evidence.snapshot().failed_ranks == frozenset({1, 2})
         _wait_until(
             lambda: isinstance(broadcaster.last_error, RuntimeError),
             description="second-detected-failure terminal handling",
         )
-        assert broadcaster.failure_is_reconciled(2) is False
-        assert broadcaster.health_is_reconciled() is False
+        assert broadcaster.failure_detection_is_reconciled(2) is False
+        assert broadcaster.failure_evidence_is_reconciled() is False
     finally:
         broadcaster.stop()
 
@@ -565,14 +591,14 @@ def test_reconciliation_timeout_fails_closed_while_mpi_test_is_wedged() -> None:
     )
     broadcaster = MpiFtSubcomm(
         _FakeMapping.ep_world(3),
-        DetectedRankState(3),
+        FailureEvidenceState(3),
         config,
         comm=comm,
         mpi_module=_FakeMPI(),
     )
     broadcaster.start()
     _wait_until(blocking_request.entered_test.is_set, description="blocked MPI progress")
-    assert broadcaster.pre_failover(2) is True
+    assert broadcaster.report_detected_failure(2) is True
     assert blocking_request.release_test.is_set() is False
     assert broadcaster._outbound_reports.empty() is False
 
@@ -582,10 +608,10 @@ def test_reconciliation_timeout_fails_closed_while_mpi_test_is_wedged() -> None:
     )
     _wait_until(lambda: comm.revoke_calls == 1, description="deadline-monitor revoke")
     assert blocking_request.release_test.is_set() is False
-    assert broadcaster.health_is_reconciled() is False
+    assert broadcaster.failure_evidence_is_reconciled() is False
     assert broadcaster.world_is_poisoned() is True
     with pytest.raises(RuntimeError, match="not running"):
-        broadcaster.pre_failover(1)
+        broadcaster.report_detected_failure(1)
     blocking_request.release_test.set()
     broadcaster.stop()
 
@@ -606,14 +632,14 @@ def test_reconciliation_timeout_world_aborts_when_mpi_test_is_wedged_without_ulf
     )
     broadcaster = MpiFtSubcomm(
         _FakeMapping.ep_world(3),
-        DetectedRankState(3),
+        FailureEvidenceState(3),
         config,
         comm=comm,
         mpi_module=_FakeMPI(),
     )
     broadcaster.start()
     _wait_until(blocking_request.entered_test.is_set, description="blocked MPI progress")
-    assert broadcaster.pre_failover(2) is True
+    assert broadcaster.report_detected_failure(2) is True
 
     _wait_until(lambda: comm.abort_calls == 1, description="deadline-monitor MPI_Abort")
     assert blocking_request.release_test.is_set() is False
@@ -624,30 +650,30 @@ def test_reconciliation_timeout_world_aborts_when_mpi_test_is_wedged_without_ulf
     broadcaster.stop()
 
 
-def test_second_distinct_local_failure_fails_closed_before_health_mutation() -> None:
-    broadcaster, health, comm, _ = _make_broadcaster(size=4)
+def test_second_distinct_local_failure_fails_closed_before_failure_evidence_mutation() -> None:
+    broadcaster, failure_evidence, comm, _ = _make_broadcaster(size=4)
     broadcaster.start()
-    assert broadcaster.pre_failover(3) is True
+    assert broadcaster.report_detected_failure(3) is True
 
     with pytest.raises(RuntimeError, match="exactly one distinct failed rank") as raised:
-        broadcaster.pre_failover(2)
+        broadcaster.report_detected_failure(2)
 
-    assert health.get_failed_ranks() == frozenset({3})
+    assert failure_evidence.snapshot().failed_ranks == frozenset({3})
     _wait_until(lambda: broadcaster.last_error is raised.value, description="terminal failure")
     _wait_until(lambda: comm.revoke_calls == 1, description="progress-thread abort revoke")
-    assert broadcaster.health_is_reconciled() is False
+    assert broadcaster.failure_evidence_is_reconciled() is False
     with pytest.raises(RuntimeError, match="not running"):
-        broadcaster.pre_failover(1)
+        broadcaster.report_detected_failure(1)
     broadcaster.stop()
 
 
 def test_no_ulfm_terminal_abort_relays_and_converges_without_world_abort() -> None:
     comm = _FakeComm(size=3, ulfm_probe_error=NotImplementedError())
-    broadcaster, health, _, _ = _make_broadcaster(size=3, comm=comm)
+    broadcaster, failure_evidence, _, _ = _make_broadcaster(size=3, comm=comm)
     broadcaster.start()
-    assert broadcaster.pre_failover(2) is True
+    assert broadcaster.report_detected_failure(2) is True
     with pytest.raises(RuntimeError, match="exactly one distinct failed rank"):
-        broadcaster.pre_failover(1)
+        broadcaster.report_detected_failure(1)
 
     _wait_until(
         lambda: any(send.message_kind == _ABORT_MESSAGE for send in comm.sends),
@@ -659,7 +685,7 @@ def test_no_ulfm_terminal_abort_relays_and_converges_without_world_abort() -> No
     comm.deliver(source=1, failed_rank=1, message_kind=_ABORT_MESSAGE)
     _wait_until(broadcaster._progress_failed.is_set, description="ABORT convergence")
 
-    assert health.get_failed_ranks() == frozenset({2})
+    assert failure_evidence.snapshot().failed_ranks == frozenset({2})
     assert comm.abort_calls == 0
     assert comm.revoke_calls == 0
     broadcaster.stop()
@@ -667,9 +693,9 @@ def test_no_ulfm_terminal_abort_relays_and_converges_without_world_abort() -> No
 
 def test_remote_conflicting_failure_relays_abort_before_world_abort() -> None:
     comm = _FakeComm(size=3, ulfm_probe_error=NotImplementedError())
-    broadcaster, health, _, _ = _make_broadcaster(size=3, comm=comm)
+    broadcaster, failure_evidence, _, _ = _make_broadcaster(size=3, comm=comm)
     broadcaster.start()
-    assert broadcaster.pre_failover(2) is True
+    assert broadcaster.report_detected_failure(2) is True
     _wait_until(
         lambda: any(send.message_kind == _FAILURE_MESSAGE for send in comm.sends),
         description="first failure fanout",
@@ -689,7 +715,7 @@ def test_remote_conflicting_failure_relays_abort_before_world_abort() -> None:
     comm.deliver(source=1, failed_rank=1, message_kind=_ABORT_MESSAGE)
     _wait_until(broadcaster._progress_failed.is_set, description="remote-conflict convergence")
 
-    assert health.get_failed_ranks() == frozenset({2})
+    assert failure_evidence.snapshot().failed_ranks == frozenset({2})
     assert isinstance(broadcaster.last_error, RuntimeError)
     assert "exactly one distinct failed rank" in str(broadcaster.last_error)
     assert comm.abort_calls == 0
@@ -725,7 +751,7 @@ def test_monitor_does_not_world_abort_reconciled_relay_when_mpi_test_resumes() -
     )
     broadcaster = MpiFtSubcomm(
         _FakeMapping.ep_world(2),
-        DetectedRankState(2),
+        FailureEvidenceState(2),
         config,
         comm=comm,
         mpi_module=_FakeMPI(),
@@ -777,9 +803,9 @@ def test_terminal_abort_waits_until_its_relay_completes() -> None:
     broadcaster.stop()
 
 
-def test_received_terminal_abort_is_relayed_without_mutating_health() -> None:
+def test_received_terminal_abort_is_relayed_without_mutating_failure_evidence() -> None:
     comm = _FakeComm(size=3, ulfm_probe_error=NotImplementedError())
-    broadcaster, health, _, _ = _make_broadcaster(size=3, comm=comm)
+    broadcaster, failure_evidence, _, _ = _make_broadcaster(size=3, comm=comm)
     broadcaster.start()
     _wait_until(lambda: comm.receive_count(1) == 1, description="source 1 receive")
     comm.deliver(source=1, failed_rank=2, message_kind=_ABORT_MESSAGE)
@@ -795,7 +821,7 @@ def test_received_terminal_abort_is_relayed_without_mutating_health() -> None:
     comm.deliver(source=2, failed_rank=2, message_kind=_ABORT_MESSAGE)
     _wait_until(broadcaster._progress_failed.is_set, description="peer ABORT convergence")
 
-    assert health.all_active() is True
+    assert failure_evidence.has_failures() is False
     assert isinstance(broadcaster.last_error, RuntimeError)
     assert broadcaster.world_is_poisoned() is True
     assert comm.abort_calls == 0
@@ -814,15 +840,15 @@ def test_no_ulfm_abort_timeout_uses_world_abort_before_stop_completes() -> None:
     comm = _FakeComm(size=3, ulfm_probe_error=NotImplementedError())
     broadcaster = MpiFtSubcomm(
         _FakeMapping.ep_world(3),
-        DetectedRankState(3),
+        FailureEvidenceState(3),
         config,
         comm=comm,
         mpi_module=_FakeMPI(),
     )
     broadcaster.start()
-    assert broadcaster.pre_failover(2) is True
+    assert broadcaster.report_detected_failure(2) is True
     with pytest.raises(RuntimeError, match="exactly one distinct failed rank"):
-        broadcaster.pre_failover(1)
+        broadcaster.report_detected_failure(1)
 
     # stop_event must not let the progress loop skip the pending ABORT fallback.
     broadcaster.stop(timeout=0.5)
@@ -853,7 +879,7 @@ def test_stop_cannot_bypass_abort_requested_during_blocked_drain() -> None:
     )
     broadcaster = MpiFtSubcomm(
         _FakeMapping.ep_world(3),
-        DetectedRankState(3),
+        FailureEvidenceState(3),
         config,
         comm=comm,
         mpi_module=_FakeMPI(),
@@ -886,7 +912,7 @@ def test_stop_cannot_bypass_abort_requested_during_blocked_drain() -> None:
 def test_concurrent_local_and_remote_distinct_failures_accept_only_one(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    broadcaster, health, comm, _ = _make_broadcaster(size=4)
+    broadcaster, failure_evidence, comm, _ = _make_broadcaster(size=4)
     broadcaster.start()
     _wait_until(lambda: comm.receive_count(1) == 1, description="remote receive")
 
@@ -905,7 +931,7 @@ def test_concurrent_local_and_remote_distinct_failures_accept_only_one(
 
     def report_local_failure() -> None:
         try:
-            broadcaster.pre_failover(2)
+            broadcaster.report_detected_failure(2)
         except BaseException as error:
             local_errors.append(error)
 
@@ -914,17 +940,17 @@ def test_concurrent_local_and_remote_distinct_failures_accept_only_one(
     _wait_until(local_claimed.is_set, description="local failure claim")
     comm.deliver(source=1, failed_rank=3)
     # The remote handler must wait for the local lifecycle transaction to commit
-    # its accepted rank and health generation atomically.
+    # its accepted rank and evidence epoch atomically.
     time.sleep(2 * _TEST_CONFIG.poll_interval_sec)
-    assert health.all_active() is True
+    assert failure_evidence.has_failures() is False
     release_local_claim.set()
     local_thread.join(timeout=1.0)
     assert local_thread.is_alive() is False
 
     _wait_until(lambda: broadcaster.last_error is not None, description="second-failure rejection")
     _wait_until(lambda: comm.revoke_calls == 1, description="terminal abort revoke")
-    assert len(health.get_failed_ranks()) == 1
-    assert health.get_failed_ranks() == frozenset({2})
+    assert len(failure_evidence.snapshot().failed_ranks) == 1
+    assert failure_evidence.snapshot().failed_ranks == frozenset({2})
     assert "exactly one distinct failed rank" in str(broadcaster.last_error)
     assert local_errors == []
     broadcaster.stop()
@@ -943,10 +969,10 @@ def test_isend_post_error_to_survivor_is_terminal_without_ulfm() -> None:
     )
     broadcaster, _, _, _ = _make_broadcaster(size=3, comm=comm)
     broadcaster.start()
-    assert broadcaster.pre_failover(2) is True
+    assert broadcaster.report_detected_failure(2) is True
 
     _wait_until(lambda: broadcaster.last_error is error, description="terminal Isend error")
-    assert broadcaster.health_is_reconciled() is False
+    assert broadcaster.failure_evidence_is_reconciled() is False
     assert comm.revoke_calls == 0
     assert comm.sends == ()
     broadcaster.stop()
@@ -959,11 +985,11 @@ def test_send_test_error_is_terminal_and_revokes_with_ulfm() -> None:
     comm = _FakeComm(size=3, send_factory=lambda _destination: failed_request)
     broadcaster, _, _, _ = _make_broadcaster(size=3, comm=comm)
     broadcaster.start()
-    assert broadcaster.pre_failover(2) is True
+    assert broadcaster.report_detected_failure(2) is True
 
     _wait_until(lambda: broadcaster.last_error is error, description="terminal send Test error")
     _wait_until(lambda: comm.revoke_calls == 1, description="ULFM emergency revoke")
-    assert broadcaster.health_is_reconciled() is False
+    assert broadcaster.failure_evidence_is_reconciled() is False
     assert failed_request.cancel_calls == 0
     assert broadcaster._retained_requests
     broadcaster.stop()
@@ -971,7 +997,7 @@ def test_send_test_error_is_terminal_and_revokes_with_ulfm() -> None:
 
 def test_received_report_is_idempotent_and_callback_runs_once() -> None:
     callbacks: list[tuple[int, int, float]] = []
-    broadcaster, health, comm, _ = _make_broadcaster(
+    broadcaster, failure_evidence, comm, _ = _make_broadcaster(
         size=3,
         callback=lambda failed, source, when: callbacks.append((failed, source, when)),
     )
@@ -979,29 +1005,31 @@ def test_received_report_is_idempotent_and_callback_runs_once() -> None:
     try:
         _wait_until(lambda: comm.receive_count(1) == 1, description="initial receive")
         comm.deliver(source=1, failed_rank=2)
-        _wait_until(lambda: health.is_active(2) is False, description="received failure")
+        _wait_until(lambda: failure_evidence.has_failure(2) is True, description="received failure")
         _wait_until(lambda: comm.receive_count(1) == 2, description="reposted receive")
 
         comm.deliver(source=1, failed_rank=2)
         _wait_until(lambda: comm.receive_count(1) == 3, description="duplicate receive progress")
         _wait_until(lambda: len(callbacks) == 1, description="failure callback")
 
-        assert health.generation == 1
+        assert failure_evidence.snapshot().evidence_epoch == 1
         assert len(callbacks) == 1
         failed_rank, source, event_time = callbacks[0]
         assert (failed_rank, source) == (2, 1)
         assert isinstance(event_time, float)
         _wait_until(lambda: len(comm.sends) == 1, description="failure relay")
         comm.sends[0].request.complete()
-        _wait_until(broadcaster.health_is_reconciled, description="failure reconciliation")
+        _wait_until(
+            broadcaster.failure_evidence_is_reconciled, description="failure reconciliation"
+        )
     finally:
         broadcaster.stop()
 
 
-def test_monitor_cannot_observe_remote_claim_before_detected_state_update(
+def test_monitor_cannot_observe_remote_claim_before_failure_evidence_update(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    broadcaster, health, comm, _ = _make_broadcaster(size=3)
+    broadcaster, failure_evidence, comm, _ = _make_broadcaster(size=3)
     original_claim = broadcaster._claim_failure
     claim_entered = threading.Event()
     release_claim = threading.Event()
@@ -1018,15 +1046,19 @@ def test_monitor_cannot_observe_remote_claim_before_detected_state_update(
         _wait_until(claim_entered.is_set, description="paused remote failure claim")
         time.sleep(3 * _TEST_CONFIG.poll_interval_sec)
 
-        assert health.is_active(2) is True
+        assert failure_evidence.has_failure(2) is False
         assert broadcaster.last_error is None
         assert comm.revoke_calls == 0
 
         release_claim.set()
-        _wait_until(lambda: not health.is_active(2), description="recorded remote detection")
+        _wait_until(
+            lambda: failure_evidence.has_failure(2), description="recorded remote detection"
+        )
         _wait_until(lambda: len(comm.sends) == 1, description="remote failure echo")
         comm.sends[0].request.complete()
-        _wait_until(broadcaster.health_is_reconciled, description="failure reconciliation")
+        _wait_until(
+            broadcaster.failure_evidence_is_reconciled, description="failure reconciliation"
+        )
     finally:
         release_claim.set()
         broadcaster.stop()
@@ -1040,7 +1072,7 @@ def test_blocking_callback_does_not_block_mpi_progress_and_stop_is_bounded() -> 
         callback_entered.set()
         release_callback.wait()
 
-    broadcaster, health, comm, _ = _make_broadcaster(
+    broadcaster, failure_evidence, comm, _ = _make_broadcaster(
         size=3,
         callback=blocking_callback,
     )
@@ -1055,7 +1087,7 @@ def test_blocking_callback_does_not_block_mpi_progress_and_stop_is_bounded() -> 
     _wait_until(lambda: comm.receive_count(1) == 2, description="receive repost")
     comm.deliver(source=1, failed_rank=2)
     _wait_until(lambda: comm.receive_count(1) == 3, description="duplicate receive progress")
-    assert health.get_failed_ranks() == frozenset({2})
+    assert failure_evidence.snapshot().failed_ranks == frozenset({2})
 
     start = time.monotonic()
     with pytest.raises(TimeoutError, match="callback thread did not stop"):
@@ -1070,7 +1102,7 @@ def test_blocking_callback_does_not_block_mpi_progress_and_stop_is_bounded() -> 
 
 def test_invalid_received_rank_is_ignored_and_receive_is_reposted() -> None:
     callbacks: list[tuple[int, int, float]] = []
-    broadcaster, health, comm, _ = _make_broadcaster(
+    broadcaster, failure_evidence, comm, _ = _make_broadcaster(
         size=3,
         callback=lambda failed, source, when: callbacks.append((failed, source, when)),
     )
@@ -1080,7 +1112,7 @@ def test_invalid_received_rank_is_ignored_and_receive_is_reposted() -> None:
         comm.deliver(source=1, failed_rank=99)
         _wait_until(lambda: comm.receive_count(1) == 2, description="receive after invalid payload")
 
-        assert health.all_active() is True
+        assert failure_evidence.has_failures() is False
         assert callbacks == []
         assert broadcaster.last_error is None
     finally:
@@ -1096,22 +1128,22 @@ def test_single_rank_group_has_no_peer_requests_or_sends() -> None:
         abort_timeout_sec=0.02,
     )
     comm = _FakeComm(size=1, ulfm_probe_error=NotImplementedError())
-    health = DetectedRankState(1)
+    failure_evidence = FailureEvidenceState(1)
     broadcaster = MpiFtSubcomm(
         _FakeMapping.ep_world(1),
-        health,
+        failure_evidence,
         config,
         comm=comm,
         mpi_module=_FakeMPI(),
     )
     broadcaster.start()
     try:
-        assert broadcaster.broadcast_failure(0) is True
+        assert broadcaster.report_detected_failure(0) is True
         _wait_until(broadcaster._outbound_reports.empty, description="empty single-rank report")
-        assert health.get_failed_ranks() == frozenset({0})
+        assert failure_evidence.snapshot().failed_ranks == frozenset({0})
         assert broadcaster.world_is_poisoned() is True
-        assert broadcaster.failure_is_reconciled(0) is False
-        assert broadcaster.health_is_reconciled() is False
+        assert broadcaster.failure_detection_is_reconciled(0) is False
+        assert broadcaster.failure_evidence_is_reconciled() is False
         assert comm.sends == ()
         assert comm.receive_count(0) == 0
         _wait_until(
@@ -1241,7 +1273,7 @@ def test_concurrent_stop_prevents_start_from_publishing_running() -> None:
     assert len(start_errors) == 1
     assert "did not reach running state" in str(start_errors[0])
     assert stop_errors == []
-    assert broadcaster.health_is_reconciled() is False
+    assert broadcaster.failure_evidence_is_reconciled() is False
 
 
 def test_startup_failure_publishes_error_before_failed_flag(
@@ -1312,7 +1344,7 @@ def test_startup_timeout_fails_closed_before_progress_resumes() -> None:
     )
     broadcaster = MpiFtSubcomm(
         _FakeMapping.ep_world(2),
-        DetectedRankState(2),
+        FailureEvidenceState(2),
         config,
         comm=comm,
         mpi_module=_FakeMPI(),
@@ -1369,7 +1401,7 @@ def test_startup_timeout_stops_callback_before_blocked_receive_is_released() -> 
     )
     broadcaster = MpiFtSubcomm(
         _FakeMapping.ep_world(2),
-        DetectedRankState(2),
+        FailureEvidenceState(2),
         config,
         lambda _failed, _source, _when: None,
         comm=comm,
@@ -1392,20 +1424,20 @@ def test_startup_timeout_stops_callback_before_blocked_receive_is_released() -> 
 
 def test_reconciliation_gates_fail_closed_outside_running_lifecycle() -> None:
     broadcaster, _, _, _ = _make_broadcaster(size=2)
-    assert broadcaster.health_is_reconciled() is False
-    assert broadcaster.failure_is_reconciled(1) is False
+    assert broadcaster.failure_evidence_is_reconciled() is False
+    assert broadcaster.failure_detection_is_reconciled(1) is False
 
     broadcaster.start()
-    assert broadcaster.pre_failover(1) is True
+    assert broadcaster.report_detected_failure(1) is True
     _wait_until(
-        lambda: broadcaster.failure_is_reconciled(1),
+        lambda: broadcaster.failure_detection_is_reconciled(1),
         description="single-survivor reconciliation",
     )
-    assert broadcaster.health_is_reconciled() is True
+    assert broadcaster.failure_evidence_is_reconciled() is True
 
     broadcaster.stop()
-    assert broadcaster.failure_is_reconciled(1) is False
-    assert broadcaster.health_is_reconciled() is False
+    assert broadcaster.failure_detection_is_reconciled(1) is False
+    assert broadcaster.failure_evidence_is_reconciled() is False
 
 
 @pytest.mark.parametrize("timeout", [0.0, -1.0, float("nan"), float("inf"), float("-inf")])
@@ -1438,10 +1470,10 @@ def test_stop_is_bounded_when_mpi_test_is_stuck() -> None:
     assert comm.abort_calls == 0
 
 
-def test_broadcast_rejects_report_after_stop_begins() -> None:
+def test_failure_report_is_rejected_after_stop_begins() -> None:
     blocking_request = _BlockingRequest()
     comm = _FakeComm(size=2, receive_factory=lambda _source: blocking_request)
-    broadcaster, health, _, _ = _make_broadcaster(size=2, comm=comm)
+    broadcaster, failure_evidence, _, _ = _make_broadcaster(size=2, comm=comm)
     broadcaster.start()
     _wait_until(blocking_request.entered_test.is_set, description="blocked MPI Test")
 
@@ -1458,8 +1490,8 @@ def test_broadcast_rejects_report_after_stop_begins() -> None:
     _wait_until(broadcaster._stop_event.is_set, description="stop transition")
 
     with pytest.raises(RuntimeError, match="state=stopping"):
-        broadcaster.broadcast_failure(1)
-    assert health.all_active() is True
+        broadcaster.report_detected_failure(1)
+    assert failure_evidence.has_failures() is False
 
     blocking_request.release_test.set()
     stop_thread.join(timeout=1.0)
@@ -1468,7 +1500,7 @@ def test_broadcast_rejects_report_after_stop_begins() -> None:
 
 
 def test_healthy_stop_cancels_preposted_receives() -> None:
-    broadcaster, health, comm, _ = _make_broadcaster(size=3)
+    broadcaster, failure_evidence, comm, _ = _make_broadcaster(size=3)
     broadcaster.start()
     _wait_until(
         lambda: comm.receive_count(1) == 1 and comm.receive_count(2) == 1,
@@ -1476,7 +1508,7 @@ def test_healthy_stop_cancels_preposted_receives() -> None:
     )
     receives = [comm.latest_receive(source).request for source in (1, 2)]
 
-    assert health.all_active() is True
+    assert failure_evidence.has_failures() is False
     broadcaster.stop()
 
     assert [request.cancel_calls for request in receives] == [1, 1]
@@ -1495,7 +1527,7 @@ def test_healthy_stop_cleanup_timeout_aborts_world_and_retains_request() -> None
     )
     broadcaster = MpiFtSubcomm(
         _FakeMapping.ep_world(2),
-        DetectedRankState(2),
+        FailureEvidenceState(2),
         config,
         comm=comm,
         mpi_module=_FakeMPI(),
@@ -1513,19 +1545,19 @@ def test_healthy_stop_cleanup_timeout_aborts_world_and_retains_request() -> None
     assert comm.revoke_calls == 0
 
 
-def test_poisoned_stop_keeps_progressing_until_failure_is_reconciled() -> None:
-    broadcaster, health, comm, _ = _make_broadcaster(size=3)
+def test_poisoned_stop_keeps_progressing_until_failure_detection_is_reconciled() -> None:
+    broadcaster, failure_evidence, comm, _ = _make_broadcaster(size=3)
     broadcaster.start()
     _wait_until(
         lambda: comm.receive_count(1) == 1 and comm.receive_count(2) == 1,
         description="preposted receives",
     )
     receives = [comm.latest_receive(source).request for source in (1, 2)]
-    assert broadcaster.broadcast_failure(2) is True
+    assert broadcaster.report_detected_failure(2) is True
     _wait_until(lambda: len(comm.sends) == 1, description="pending failure send")
     send = comm.sends[0]
 
-    assert health.get_failed_ranks() == frozenset({2})
+    assert failure_evidence.snapshot().failed_ranks == frozenset({2})
     initial_test_calls = send.request.test_calls
     stop_errors: list[BaseException] = []
 
@@ -1571,12 +1603,14 @@ def test_poisoned_resources_outlive_broadcaster_object() -> None:
             lambda: comm.receive_count(1) == 1 and comm.receive_count(2) == 1,
             description="preposted receives",
         )
-        assert broadcaster.pre_failover(2) is True
+        assert broadcaster.report_detected_failure(2) is True
         _wait_until(lambda: len(comm.sends) == 1, description="pending send")
         send = comm.sends[0]
         send.request.complete()
         comm.deliver(source=1, failed_rank=2)
-        _wait_until(broadcaster.health_is_reconciled, description="failure reconciliation")
+        _wait_until(
+            broadcaster.failure_evidence_is_reconciled, description="failure reconciliation"
+        )
         retained_receive = comm.latest_receive(2)
         references = (
             weakref.ref(retained_receive.request),
@@ -1634,7 +1668,7 @@ def test_constructor_requires_mpi_thread_multiple() -> None:
     with pytest.raises(RuntimeError, match="MPI.THREAD_MULTIPLE"):
         MpiFtSubcomm(
             _FakeMapping.ep_world(2),
-            DetectedRankState(2),
+            FailureEvidenceState(2),
             _TEST_CONFIG,
             comm=comm,
             mpi_module=mpi,
@@ -1666,9 +1700,9 @@ def test_collectively_created_comm_uses_frozen_setup_and_lives_for_process(
     def create_mpi_ft_subcomm(
         setup_mapping: SingleReadMapping,
         *,
-        health_size: int,
+        failure_evidence_size: int,
     ) -> types.SimpleNamespace:
-        assert health_size == 2
+        assert failure_evidence_size == 2
         local_rank = setup_mapping.moe_ep_rank
         comm.Set_errhandler(mpi.ERRORS_RETURN)
         return types.SimpleNamespace(
@@ -1693,7 +1727,7 @@ def test_collectively_created_comm_uses_frozen_setup_and_lives_for_process(
     try:
         broadcaster = MpiFtSubcomm(
             mapping,
-            DetectedRankState(2),
+            FailureEvidenceState(2),
             _TEST_CONFIG,
             mpi_module=mpi,
         )
@@ -1725,7 +1759,7 @@ def test_constructor_rejects_non_world_spanning_ep_group_for_mvp() -> None:
     with pytest.raises(ValueError, match="spanning the full MPI world"):
         MpiFtSubcomm(
             mapping,
-            DetectedRankState(2),
+            FailureEvidenceState(2),
             _TEST_CONFIG,
             comm=comm,
             mpi_module=_FakeMPI(),
@@ -1809,7 +1843,7 @@ def test_constructor_rejects_and_retains_already_revoked_comm() -> None:
 
 def test_peer_failure_reconciles_without_revoking_control_plane() -> None:
     callbacks: list[tuple[int, int, float]] = []
-    broadcaster, health, comm, _ = _make_broadcaster(
+    broadcaster, failure_evidence, comm, _ = _make_broadcaster(
         size=3,
         callback=lambda failed, source, when: callbacks.append((failed, source, when)),
     )
@@ -1819,10 +1853,13 @@ def test_peer_failure_reconciles_without_revoking_control_plane() -> None:
         _wait_until(lambda: comm.receive_count(1) == 1, description="peer receive")
         comm.latest_receive(1).request.fail(_FakeMpiException(_FakeMPI.ERR_PROC_FAILED))
 
-        _wait_until(lambda: health.is_active(1) is False, description="peer failure classification")
+        _wait_until(
+            lambda: failure_evidence.has_failure(1) is True,
+            description="peer failure classification",
+        )
         _wait_until(lambda: len(comm.sends) == 1, description="peer failure relay")
 
-        assert health.get_failed_ranks() == frozenset({1})
+        assert failure_evidence.snapshot().failed_ranks == frozenset({1})
         _wait_until(lambda: len(callbacks) == 1, description="failed-peer callback")
         assert [(failed, source) for failed, source, _ in callbacks] == [(1, 1)]
         assert comm.sends[0].destination == 2
@@ -1833,9 +1870,11 @@ def test_peer_failure_reconciles_without_revoking_control_plane() -> None:
 
         comm.sends[0].request.complete()
         comm.deliver(source=2, failed_rank=1)
-        _wait_until(broadcaster.health_is_reconciled, description="failure reconciliation")
+        _wait_until(
+            broadcaster.failure_evidence_is_reconciled, description="failure reconciliation"
+        )
         _wait_until(lambda: comm.receive_count(2) == 2, description="reposted receive")
-        assert broadcaster.health_is_reconciled() is True
+        assert broadcaster.failure_evidence_is_reconciled() is True
         assert broadcaster.last_error is None
         assert comm.revoke_calls == 0
     finally:
@@ -1847,12 +1886,12 @@ def test_remote_revoke_after_local_reconciliation_still_fails_closed() -> None:
     comm = _FakeComm(size=3)
     broadcaster, _, _, _ = _make_broadcaster(size=3, comm=comm)
     broadcaster.start()
-    assert broadcaster.pre_failover(2) is True
+    assert broadcaster.report_detected_failure(2) is True
     _wait_until(lambda: len(comm.sends) == 1, description="failure relay")
     comm.sends[0].request.complete()
     _wait_until(lambda: comm.receive_count(1) == 1, description="initial peer receive")
     comm.deliver(source=1, failed_rank=2)
-    _wait_until(broadcaster.health_is_reconciled, description="local reconciliation")
+    _wait_until(broadcaster.failure_evidence_is_reconciled, description="local reconciliation")
     _wait_until(
         lambda: comm.receive_count(1) == 2,
         description="receive after failure report",
@@ -1860,11 +1899,11 @@ def test_remote_revoke_after_local_reconciliation_still_fails_closed() -> None:
 
     comm.latest_receive(1).request.fail(error)
     _wait_until(lambda: broadcaster.last_error is error, description="terminal remote revoke")
-    assert broadcaster.health_is_reconciled() is False
+    assert broadcaster.failure_evidence_is_reconciled() is False
     assert comm.revoke_calls == 1
     with pytest.raises(RuntimeError, match="not running"):
-        broadcaster.pre_failover(1)
-    assert broadcaster._detected_state.get_failed_ranks() == frozenset({2})
+        broadcaster.report_detected_failure(1)
+    assert broadcaster._failure_evidence.snapshot().failed_ranks == frozenset({2})
     broadcaster.stop()
 
 
@@ -1873,19 +1912,19 @@ def test_premature_remote_revoke_fails_closed() -> None:
     comm = _FakeComm(size=3)
     broadcaster, _, _, _ = _make_broadcaster(size=3, comm=comm)
     broadcaster.start()
-    assert broadcaster.pre_failover(2) is True
+    assert broadcaster.report_detected_failure(2) is True
     _wait_until(lambda: comm.receive_count(1) == 1, description="initial peer receive")
 
     comm.latest_receive(1).request.fail(error)
     _wait_until(lambda: broadcaster.last_error is error, description="terminal revoke")
-    assert broadcaster.health_is_reconciled() is False
+    assert broadcaster.failure_evidence_is_reconciled() is False
     assert comm.revoke_calls == 1
     broadcaster.stop()
 
 
 def test_generic_mpi_error_is_terminal_and_revokes_once() -> None:
     comm = _FakeComm(size=2)
-    broadcaster, health, _, _ = _make_broadcaster(size=2, comm=comm)
+    broadcaster, failure_evidence, _, _ = _make_broadcaster(size=2, comm=comm)
     broadcaster.start()
     try:
         _wait_until(lambda: comm.receive_count(1) == 1, description="peer receive")
@@ -1894,9 +1933,9 @@ def test_generic_mpi_error_is_terminal_and_revokes_once() -> None:
 
         _wait_until(lambda: broadcaster.last_error is error, description="terminal MPI error")
         _wait_until(lambda: comm.revoke_calls == 1, description="communicator revoke")
-        assert health.all_active() is True
+        assert failure_evidence.has_failures() is False
         with pytest.raises(RuntimeError, match="broadcaster is not running"):
-            broadcaster.broadcast_failure(1)
+            broadcaster.report_detected_failure(1)
     finally:
         broadcaster.stop()
     assert comm.revoke_calls == 1
@@ -1904,23 +1943,28 @@ def test_generic_mpi_error_is_terminal_and_revokes_once() -> None:
 
 def test_proc_failed_is_classified_without_full_ulfm_support() -> None:
     comm = _FakeComm(size=3, ulfm_probe_error=NotImplementedError())
-    broadcaster, health, _, _ = _make_broadcaster(size=3, comm=comm)
+    broadcaster, failure_evidence, _, _ = _make_broadcaster(size=3, comm=comm)
     assert broadcaster.ulfm_available is False
     broadcaster.start()
     try:
         _wait_until(lambda: comm.receive_count(1) == 1, description="peer receive")
         comm.latest_receive(1).request.fail(_FakeMpiException(_FakeMPI.ERR_PROC_FAILED))
-        _wait_until(lambda: health.is_active(1) is False, description="peer failure classification")
+        _wait_until(
+            lambda: failure_evidence.has_failure(1) is True,
+            description="peer failure classification",
+        )
         _wait_until(lambda: len(comm.sends) == 1, description="peer failure relay")
 
-        assert health.get_failed_ranks() == frozenset({1})
+        assert failure_evidence.snapshot().failed_ranks == frozenset({1})
         assert comm.sends[0].destination == 2
         assert comm.sends[0].payload == 1
         assert broadcaster.last_error is None
         assert comm.revoke_calls == 0
         comm.sends[0].request.complete()
         comm.deliver(source=2, failed_rank=1)
-        _wait_until(broadcaster.health_is_reconciled, description="failure reconciliation")
+        _wait_until(
+            broadcaster.failure_evidence_is_reconciled, description="failure reconciliation"
+        )
     finally:
         broadcaster.stop()
 
@@ -1928,7 +1972,7 @@ def test_proc_failed_is_classified_without_full_ulfm_support() -> None:
 def test_non_ulfm_generic_receive_error_keeps_other_sources_live() -> None:
     callbacks: list[tuple[int, int, float]] = []
     comm = _FakeComm(size=3, ulfm_probe_error=NotImplementedError())
-    broadcaster, health, _, _ = _make_broadcaster(
+    broadcaster, failure_evidence, _, _ = _make_broadcaster(
         size=3,
         comm=comm,
         callback=lambda failed, source, when: callbacks.append((failed, source, when)),
@@ -1946,14 +1990,14 @@ def test_non_ulfm_generic_receive_error_keeps_other_sources_live() -> None:
             description="retained failed receive",
         )
 
-        assert health.all_active() is True
+        assert failure_evidence.has_failures() is False
         assert broadcaster.last_error is None
         assert failed_receive.cancel_calls == 0
 
         # Another survivor's rank-attributed detection remains usable even
         # when the dead source's fixed receive failed with a generic error.
         comm.deliver(source=2, failed_rank=1)
-        _wait_until(lambda: health.is_active(1) is False, description="detection report")
+        _wait_until(lambda: failure_evidence.has_failure(1) is True, description="detection report")
         _wait_until(lambda: len(comm.sends) == 1, description="failure relay")
         comm.sends[0].request.complete()
         _wait_until(lambda: comm.receive_count(2) == 2, description="live-source receive repost")
@@ -1962,7 +2006,9 @@ def test_non_ulfm_generic_receive_error_keeps_other_sources_live() -> None:
         assert [(failed, source) for failed, source, _ in callbacks] == [(1, 2)]
         assert broadcaster.last_error is None
         assert comm.revoke_calls == 0
-        _wait_until(broadcaster.health_is_reconciled, description="failure reconciliation")
+        _wait_until(
+            broadcaster.failure_evidence_is_reconciled, description="failure reconciliation"
+        )
     finally:
         broadcaster.stop()
 
@@ -1979,7 +2025,7 @@ def test_non_ulfm_generic_error_after_watchdog_report_does_not_arm_stale_deadlin
     comm = _FakeComm(size=3, ulfm_probe_error=NotImplementedError())
     broadcaster = MpiFtSubcomm(
         _FakeMapping.ep_world(3),
-        DetectedRankState(3),
+        FailureEvidenceState(3),
         config,
         comm=comm,
         mpi_module=_FakeMPI(),
@@ -2005,11 +2051,13 @@ def test_non_ulfm_generic_error_after_watchdog_report_does_not_arm_stale_deadlin
             description="retained explained receive",
         )
         comm.sends[0].request.complete()
-        _wait_until(broadcaster.health_is_reconciled, description="failure reconciliation")
+        _wait_until(
+            broadcaster.failure_evidence_is_reconciled, description="failure reconciliation"
+        )
         time.sleep(3 * config.unattributed_error_timeout_sec)
 
         assert broadcaster.last_error is None
-        assert broadcaster.health_is_reconciled() is True
+        assert broadcaster.failure_evidence_is_reconciled() is True
         assert comm.abort_calls == 0
     finally:
         broadcaster.stop()
@@ -2027,7 +2075,7 @@ def test_unattributed_error_from_other_source_keeps_reconciliation_gate_closed()
     comm = _FakeComm(size=4, ulfm_probe_error=NotImplementedError())
     broadcaster = MpiFtSubcomm(
         _FakeMapping.ep_world(4),
-        DetectedRankState(4),
+        FailureEvidenceState(4),
         config,
         comm=comm,
         mpi_module=_FakeMPI(),
@@ -2058,8 +2106,8 @@ def test_unattributed_error_from_other_source_keeps_reconciliation_gate_closed()
             description="completed failure fanout",
         )
 
-        assert broadcaster.failure_is_reconciled(3) is False
-        assert broadcaster.health_is_reconciled() is False
+        assert broadcaster.failure_detection_is_reconciled(3) is False
+        assert broadcaster.failure_evidence_is_reconciled() is False
         _wait_until(
             lambda: isinstance(broadcaster.last_error, TimeoutError),
             description="unattributed transport deadline",
@@ -2081,10 +2129,10 @@ def test_non_ulfm_unattributed_receive_error_aborts_after_bounded_deadlines(
         abort_timeout_sec=0.05,
     )
     comm = _FakeComm(size=2, ulfm_probe_error=NotImplementedError())
-    health = DetectedRankState(2)
+    failure_evidence = FailureEvidenceState(2)
     broadcaster = MpiFtSubcomm(
         _FakeMapping.ep_world(2),
-        health,
+        failure_evidence,
         config,
         comm=comm,
         mpi_module=_FakeMPI(),
@@ -2116,7 +2164,7 @@ def test_non_ulfm_unattributed_receive_error_aborts_after_bounded_deadlines(
         assert broadcaster.last_error is None
         assert broadcaster._lifecycle is ep_failure_broadcast._Lifecycle.FAILED
         assert broadcaster._unattributed_error_deadlines[1] == float("inf")
-        assert broadcaster.health_is_reconciled() is False
+        assert broadcaster.failure_evidence_is_reconciled() is False
     finally:
         release_terminal_request.set()
 
@@ -2127,14 +2175,14 @@ def test_non_ulfm_unattributed_receive_error_aborts_after_bounded_deadlines(
     assert "could not attribute" in str(broadcaster.last_error)
     # Expiry remains protocol-visible for the rest of this communicator epoch.
     assert 1 in broadcaster._unattributed_error_deadlines
-    assert broadcaster.health_is_reconciled() is False
+    assert broadcaster.failure_evidence_is_reconciled() is False
     _wait_until(
         lambda: any(send.message_kind == _ABORT_MESSAGE for send in comm.sends),
         description="terminal ABORT relay",
     )
     _wait_until(lambda: comm.abort_calls == 1, description="bounded MPI_Abort fallback")
 
-    assert health.all_active() is True
+    assert failure_evidence.has_failures() is False
     assert failed_receive.cancel_calls == 0
     assert comm.revoke_calls == 0
     broadcaster.stop()
@@ -2145,7 +2193,7 @@ def test_send_buffer_lives_until_request_test_completes() -> None:
     broadcaster, _, _, _ = _make_broadcaster(size=3, comm=comm)
     broadcaster.start()
     try:
-        assert broadcaster.broadcast_failure(2) is True
+        assert broadcaster.report_detected_failure(2) is True
         _wait_until(lambda: len(comm.sends) == 1, description="pending send")
         record = comm.sends[0]
         _wait_until(lambda: record.request.test_calls > 0, description="send Test polling")
@@ -2161,6 +2209,8 @@ def test_send_buffer_lives_until_request_test_completes() -> None:
 
         _wait_until(buffer_released, description="completed send buffer release")
         comm.deliver(source=1, failed_rank=2)
-        _wait_until(broadcaster.health_is_reconciled, description="failure reconciliation")
+        _wait_until(
+            broadcaster.failure_evidence_is_reconciled, description="failure reconciliation"
+        )
     finally:
         broadcaster.stop()

@@ -115,9 +115,10 @@ def _is_mpi_ft_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def _mpi_ft_local_topology(mapping: Mapping, parent_rank: int, parent_size: int,
-                           provided_thread_level: int,
-                           health_size: Optional[int]) -> dict[str, Any]:
+def _mpi_ft_local_topology(
+        mapping: Mapping, parent_rank: int, parent_size: int,
+        provided_thread_level: int,
+        failure_evidence_size: Optional[int]) -> dict[str, Any]:
     """Build a serializable startup record without raising locally."""
     world_size = None
     mapping_rank = None
@@ -192,11 +193,12 @@ def _mpi_ft_local_topology(mapping: Mapping, parent_rank: int, parent_size: int,
                     "WideEP FT MVP requires one MoE EP group spanning the "
                     "full MPI world; "
                     f"got world_size={world_size}, moe_ep_group={ep_group}")
-            elif health_size is not None and health_size != ep_size:
+            elif (failure_evidence_size is not None
+                  and failure_evidence_size != ep_size):
                 error_kind = "value"
                 error_message = (
-                    "EPGroupHealth size must match mapping.moe_ep_size, "
-                    f"got {health_size} and {ep_size}")
+                    "Failure-evidence state size must match mapping.moe_ep_size, "
+                    f"got {failure_evidence_size} and {ep_size}")
             elif parent_rank not in ep_group:
                 error_kind = "value"
                 error_message = (
@@ -217,7 +219,7 @@ def _mpi_ft_local_topology(mapping: Mapping, parent_rank: int, parent_size: int,
         "ep_group": ep_group,
         "ep_size": ep_size,
         "ep_rank": ep_rank,
-        "health_size": health_size,
+        "failure_evidence_size": failure_evidence_size,
         "error_kind": error_kind,
         "error_message": error_message,
     }
@@ -312,12 +314,13 @@ def _validate_mpi_ft_topologies(topologies: List[Any],
                 "WideEP FT startup topology is inconsistent: parent rank "
                 f"{gather_rank} reports invalid EP rank {ep_rank!r} for "
                 f"group {ep_group!r}")
-        health_size = topology.get("health_size")
-        if health_size is not None and (not _is_mpi_ft_int(health_size)
-                                        or health_size != parent_size):
+        failure_evidence_size = topology.get("failure_evidence_size")
+        if (failure_evidence_size is not None
+                and (not _is_mpi_ft_int(failure_evidence_size)
+                     or failure_evidence_size != parent_size)):
             raise RuntimeError(
                 "WideEP FT startup topology is inconsistent: parent rank "
-                f"{gather_rank} reports health size {health_size}, "
+                f"{gather_rank} reports failure-evidence size {failure_evidence_size}, "
                 f"expected {parent_size}")
     # Only dereference peer groups after every gathered record has passed the
     # schema/range checks above. This keeps malformed records rank-attributed and
@@ -450,13 +453,13 @@ def _mpi_ft_post_split_result(
 def create_mpi_ft_subcomm(
         mapping: Mapping,
         parent_comm: Optional[Any] = None,
-        health_size: Optional[int] = None) -> MpiFtSubcommSetup:
+        failure_evidence_size: Optional[int] = None) -> MpiFtSubcommSetup:
     """Create the dedicated MPI control-plane communicator for WideEP FT.
 
     This operation is collective across ``parent_comm`` and must run on every
     rank during startup, before any background failure-broadcast threads are
     launched. The MVP requires one MoE EP group spanning the parent world,
-    ordered by the EP-local rank used by the caller's detected-rank state.
+    ordered by the EP-local rank used by the caller's failure-evidence state.
 
     Before splitting, ranks exchange their local validation outcome and EP
     topology on the healthy parent communicator. This prevents one rank from
@@ -467,7 +470,7 @@ def create_mpi_ft_subcomm(
         parent_comm: Parent MPI communicator. Defaults to TRT-LLM's active
             ``mpi_comm()``, which wraps ``MPI.COMM_WORLD`` in the standard
             launch path and preserves custom communicator sessions.
-        health_size: Optional local detected-rank-state size to validate
+        failure_evidence_size: Optional local failure-evidence state size to validate
             collectively before splitting.
 
     Returns:
@@ -487,7 +490,8 @@ def create_mpi_ft_subcomm(
     parent_rank = parent_comm.Get_rank()
     parent_size = parent_comm.Get_size()
     local_topology = _mpi_ft_local_topology(mapping, parent_rank, parent_size,
-                                            MPI.Query_thread(), health_size)
+                                            MPI.Query_thread(),
+                                            failure_evidence_size)
     topologies = parent_comm.allgather(local_topology)
     _validate_mpi_ft_topologies(topologies, parent_size)
 
