@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Optional
+
 import pytest
 import torch
 
@@ -35,6 +37,7 @@ def _make_inputs(
     compress_ratio: int = 1,
     preidx_hit_rate: float = 0.0,
     varlen: bool = False,
+    seq_lens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build (logits, pre_idx, seq_lens) for the op.
 
@@ -55,6 +58,11 @@ def _make_inputs(
     ``[top_k*cr + next_n, N*cr]`` so the kernel's per-row N_eff varies.
     Argmax / ref_topk are computed over the smallest group's N_eff so
     they're guaranteed in-range for every row.
+
+    ``seq_lens``: optional pre-built seq_lens tensor (uncompressed space).
+    When provided, overrides ``varlen`` and the internal seq_lens generation.
+    Argmax is still computed over ``min(seq_lens)`` so pre_idx[..., 0]
+    is in-range for every row.
     """
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -65,7 +73,9 @@ def _make_inputs(
     num_groups = num_rows // next_n
 
     # seq_lens in UNCOMPRESSED space. Kernel divides by cr internally.
-    if varlen:
+    if seq_lens is not None:
+        pass  # use caller-provided seq_lens as-is
+    elif varlen:
         lo = top_k * compress_ratio + next_n  # ensures N_eff >= top_k
         seq_lens = torch.randint(
             lo, N * compress_ratio + 1, (num_groups,), dtype=torch.int32, device="cuda"
@@ -369,17 +379,17 @@ def test_lb_prepare_partition(B, ratio):
     [(torch.bfloat16, 1024), (torch.float32, 2048)],
 )
 @pytest.mark.parametrize(
-    "scenario,N,override",
+    "scenario,N,seq_lens_mode",
     [
         # N picked so all rows fall clearly below / above the 64K long_threshold.
-        ("all_short", 8 * 1024, None),
-        ("all_long", 128 * 1024, None),
-        ("mixed_half", 128 * 1024, "half"),  # 50/50 long/short via override
+        ("all_short", 8 * 1024, "uniform"),
+        ("all_long", 128 * 1024, "uniform"),
+        ("mixed_half", 128 * 1024, "half_short_half_long"),
     ],
 )
 @pytest.mark.parametrize("batch_size", [4, 32])
 @pytest.mark.parametrize("next_n", [1, 2])
-def test_lb_main_branches(dtype, top_k, scenario, N, override, batch_size, next_n):
+def test_lb_main_branches(dtype, top_k, scenario, N, seq_lens_mode, batch_size, next_n):
     """Each LB branch (all_long / all_short / mixed) produces correct top-K.
 
     For ``mixed_half`` half the rows are forced to be short (seq_len < threshold)
@@ -393,6 +403,15 @@ def test_lb_main_branches(dtype, top_k, scenario, N, override, batch_size, next_
     by ``_tie_aware_check``.
     """
     num_rows = batch_size * next_n
+    num_groups = batch_size  # batch_size groups of next_n rows each
+    # For half_short_half_long, build seq_lens first so _make_inputs computes
+    # argmax over min(seq_lens)=8K, keeping pre_idx[..., 0] in-range for all rows.
+    if seq_lens_mode == "half_short_half_long":
+        seq_lens_override = torch.empty(num_groups, dtype=torch.int32, device="cuda")
+        seq_lens_override[: batch_size // 2] = 8 * 1024  # short half
+        seq_lens_override[batch_size // 2 :] = 128 * 1024  # long half
+    else:
+        seq_lens_override = None
     logits, pre_idx, seq_lens = _make_inputs(
         num_rows,
         N,
@@ -403,11 +422,8 @@ def test_lb_main_branches(dtype, top_k, scenario, N, override, batch_size, next_
         compress_ratio=1,
         preidx_hit_rate=0.5,
         varlen=False,
+        seq_lens=seq_lens_override,
     )
-    if override == "half":
-        seq_lens = seq_lens.clone()
-        seq_lens[: batch_size // 2] = 8 * 1024  # short half (< 64K threshold)
-        seq_lens[batch_size // 2 :] = 128 * 1024  # long half  (> 64K threshold)
 
     max_batch_size = 1024
     long_threshold = 64 * 1024

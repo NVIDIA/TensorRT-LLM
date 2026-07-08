@@ -843,13 +843,15 @@ class GvrTopKKernel:
                 s_iscalars[0] = total
 
         # Snapshot local cand_count into s_iscalars[5] before the cluster
-        # all-reduce overwrites s_iscalars[0]. Phase 3's per-CTA collect
-        # needs the slice-local count (how many entries to write into its
-        # smem_keys), and the cluster handoff DSMEM-reads peer values.
+        # all-reduce overwrites s_iscalars[0]. Only needed when
+        # do_cluster_sync=True: the DSMEM gather in Phase 4 reads peer
+        # s_iscalars[5] values; skipped in short-row degrade (do_cluster_sync=False)
+        # where s_iscalars[0] is never overwritten and the gather never fires.
         if cutlass.const_expr(cluster_size > 1):
-            if tidx == cutlass.Int32(0):
-                s_iscalars[5] = s_iscalars[0]
-            cute.arch.barrier()
+            if do_cluster_sync:
+                if tidx == cutlass.Int32(0):
+                    s_iscalars[5] = s_iscalars[0]
+                cute.arch.barrier()
 
         # Cluster all-reduce of cand_count. Skipped at cluster_size==1.
         # Also skipped at runtime when do_cluster_sync=False (short-row
@@ -2007,11 +2009,12 @@ class GvrTopKKernel:
             # cooperation overhead exceeds the work saved → degrade to
             # CTA 0 solo.
             if cutlass.const_expr(cluster_size > 1):
-                max_seq_len_buf = input_data.shape[1]
-                per_cta_design = (
-                    max_seq_len_buf + cutlass.Int32(cluster_size - 1)
+                # max_slice_len: per-CTA slice upper bound when the row is
+                # long enough to warrant cluster cooperation.
+                max_slice_len = (
+                    input_data.shape[1] + cutlass.Int32(cluster_size - 1)
                 ) // cutlass.Int32(cluster_size)
-                if N > per_cta_design:
+                if N > max_slice_len:
                     # Long row: cluster cooperation, all cs CTAs scan
                     # N/cs. slice_base rounded DOWN to vec_w so each
                     # CTA's slice_start stays vec_w-aligned; the last
@@ -2189,16 +2192,29 @@ class GvrTopKKernel:
         v_lo = s_thr[1]
         v_hi = s_thr[2]
         if v_hi <= cutlass.Float32(self.NEG_FLT_MAX) or v_lo >= v_hi:
-            if tidx == 0:
-                top_k = cutlass.const_expr(self.top_k)
-                # Emit identity output (first min(top_k, N) indices)
-                emit_count = cutlass.Int32(top_k) if cutlass.Int32(top_k) < N else N
-                je = cutlass.Int32(0)
-                while je < emit_count:
-                    output_indices_row[je] = je
-                    if cutlass.const_expr(self.return_output_values):
-                        output_values_row[je] = input_row[je]
-                    je = je + cutlass.Int32(1)
+            if cutlass.const_expr(cluster_size == 1):
+                if tidx == 0:
+                    top_k = cutlass.const_expr(self.top_k)
+                    # Emit identity output (first min(top_k, N) indices)
+                    emit_count = cutlass.Int32(top_k) if cutlass.Int32(top_k) < N else N
+                    je = cutlass.Int32(0)
+                    while je < emit_count:
+                        output_indices_row[je] = je
+                        if cutlass.const_expr(self.return_output_values):
+                            output_values_row[je] = input_row[je]
+                        je = je + cutlass.Int32(1)
+            else:
+                # cs>1: all cluster CTAs enter _run_phases; only leader writes.
+                if is_leader & (tidx == cutlass.Int32(0)):
+                    top_k = cutlass.const_expr(self.top_k)
+                    # Emit identity output (first min(top_k, N) indices)
+                    emit_count = cutlass.Int32(top_k) if cutlass.Int32(top_k) < N else N
+                    je = cutlass.Int32(0)
+                    while je < emit_count:
+                        output_indices_row[je] = je
+                        if cutlass.const_expr(self.return_output_values):
+                            output_values_row[je] = input_row[je]
+                        je = je + cutlass.Int32(1)
         else:
             # Stage this CTA's slice into SMEM once before Phase 2's
             # 6-10 secant iters re-scan it. Phase 1 (preIdx) uses
@@ -2375,28 +2391,12 @@ class GvrTopKKernel:
     ):
         num_rows = input_data.shape[0]
         cluster_size = cutlass.const_expr(self.cluster_size)
-        # SMEM-cache launch-time guard: when ``enable_smem_cache=True`` the
-        # kernel stages each CTA's slice into a fixed-size
-        # ``smem_input[smem_cache_elems]`` buffer. ``load_slice_to_smem``
-        # and the Phase 2 / Phase 3 paths that read from it index by
-        # slice-local position with no out-of-bounds guard, so a slice
-        # longer than the compile-time cache budget would silently overrun
-        # SMEM. Per-CTA slice length is ``ceil(input_data.shape[1] /
-        # cluster_size)``; check the worst-case (= input_data.shape[1] when
-        # cluster_size == 1) at launch and bail out with a clear error.
-        # The docstring on ``enable_smem_cache`` promises a wrapper-side
-        # auto-disable for oversized slices but the wrapper hook is not
-        # universally wired up yet — this assert backstops any caller
-        # (UT / bench / future production) that enables the path without
-        # the matching size check.
-        if cutlass.const_expr(self.enable_smem_cache):
-            max_slice_len = (input_data.shape[1] + cluster_size - 1) // cluster_size
-            assert max_slice_len <= self.smem_cache_elems, (
-                f"enable_smem_cache=True requires per-CTA slice_len "
-                f"({max_slice_len}) <= smem_cache_elems "
-                f"({self.smem_cache_elems}); raise smem_cache_elems, "
-                f"increase cluster_size, or disable enable_smem_cache."
-            )
+        # TODO: n_cols (= input_data.shape[1] = max_seq_len) is sym_int here
+        # because the wrapper compiles with cute.sym_int() for n_cols. In
+        # practice max_seq_len is static (from model config), so adding n_cols
+        # to the wrapper cache key would allow a concrete-int fake tensor and
+        # enable a real enable_smem_cache size assertion in _compile().
+
         # Grid = num_rows * cluster_size. Adjacent bidx in
         # [cluster_id*cs, (cluster_id+1)*cs) form one thread-block cluster
         # that owns row[cluster_id]. ``cluster=None`` at cs=1 keeps the
