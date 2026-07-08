@@ -18,7 +18,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import (
+from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.fmha import (
     _COMPILE_CACHE,
     _quantize_blockscaled_one,
     _quantize_fp8_v,
