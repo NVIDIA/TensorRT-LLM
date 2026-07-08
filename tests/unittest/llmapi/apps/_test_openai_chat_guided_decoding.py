@@ -9,9 +9,8 @@ import jsonschema
 import openai
 import pytest
 import yaml
-from utils.llm_data import llm_datasets_root
+from utils.llm_data import llm_datasets_root, llm_models_root
 
-from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
 
 pytestmark = pytest.mark.threadleak(enabled=False)
@@ -19,6 +18,13 @@ os.environ['TIKTOKEN_RS_CACHE_DIR'] = os.path.join(llm_datasets_root(),
                                                    'tiktoken_vocab')
 os.environ['TIKTOKEN_ENCODINGS_BASE'] = os.path.join(llm_datasets_root(),
                                                      'tiktoken_vocab')
+
+
+def get_model_path(model_name):
+    engine_dir = os.environ.get('LLM_ENGINE_DIR')
+    if engine_dir:
+        return engine_dir
+    return str(llm_models_root() / model_name)
 
 
 @pytest.fixture(scope="module",

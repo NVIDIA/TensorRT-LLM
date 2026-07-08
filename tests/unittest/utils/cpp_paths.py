@@ -4,9 +4,6 @@ import sys as _sys
 
 import pytest
 
-import tensorrt_llm.bindings as _tb
-from tensorrt_llm.bindings.internal.testing import ModelSpec
-
 _sys.path.append(_os.path.join(_os.path.dirname(__file__), '..', '..', '..'))
 
 
@@ -37,7 +34,10 @@ def engine_path(resource_path: _pl.Path) -> _pl.Path:
     return resource_path / "models" / "rt_engine"
 
 
-def get_base_model_spec() -> ModelSpec:
+def get_base_model_spec():
+    import tensorrt_llm.bindings as _tb
+    from tensorrt_llm.bindings.internal.testing import ModelSpec
+
     model_spec_obj = ModelSpec('input_tokens.npy', _tb.DataType.HALF)
     model_spec_obj.use_gpt_plugin().set_kv_cache_type(
         _tb.KVCacheType.PAGED).use_packed_input()

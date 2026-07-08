@@ -1,18 +1,27 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/baaedfdb2d3f1d70b7dbcde08b083abfe6017a92/tests/utils.py
 import os
+import socket
 import subprocess
 import sys
 import tempfile
 import time
-from typing import List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import openai
 import requests
 import yaml
 
-from tensorrt_llm._utils import get_free_port
-from tensorrt_llm.llmapi.disagg_utils import ServerRole
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.disagg_utils import ServerRole
+else:
+    ServerRole = Any
+
+
+def get_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("", 0))
+        return sock.getsockname()[1]
 
 
 class RemoteOpenAIServer:
@@ -30,7 +39,7 @@ class RemoteOpenAIServer:
                  extra_config: Optional[dict] = None,
                  log_path: Optional[str] = None,
                  wait: bool = True,
-                 role: Optional[ServerRole] = None) -> None:
+                 role: Optional["ServerRole"] = None) -> None:
         self.host = host
         self.port = port if port is not None else get_free_port()
         self.rank = rank if rank != -1 else int(
@@ -214,8 +223,6 @@ class RemoteMMEncoderServer(RemoteOpenAIServer):
                  log_path: Optional[str] = None) -> None:
         # Reuse parent initialization but change the command
         import subprocess
-
-        from tensorrt_llm._utils import get_free_port
 
         self.host = "localhost"
         self.port = port if port is not None else get_free_port()

@@ -27,12 +27,6 @@ from typing import Any
 import yaml
 from packaging import version
 
-from tensorrt_llm import LLM as LLM_torch
-from tensorrt_llm._utils import get_free_port
-from tensorrt_llm.executor.request import LoRARequest
-from tensorrt_llm.lora_manager import LoraConfig
-from tensorrt_llm.sampling_params import SamplingParams
-
 from .trt_test_alternative import (check_call, check_output, exists, is_windows,
                                    print_info, print_warning)
 
@@ -948,6 +942,13 @@ def test_llm_torch_multi_lora_support(
     outputs (since zero-weight LoRAs should not alter behavior).
     """
 
+    # This module is imported by wrappers that run GPU workloads in a child.
+    # Delay TRT-LLM imports until this in-process GPU test actually runs.
+    from tensorrt_llm import LLM as LLM_torch
+    from tensorrt_llm.executor.request import LoRARequest
+    from tensorrt_llm.lora_manager import LoraConfig
+    from tensorrt_llm.sampling_params import SamplingParams
+
     assert zero_lora_weights, (
         "This test compares LoRA outputs against base model outputs, "
         "which is only valid when zero_lora_weights=True.")
@@ -1256,7 +1257,9 @@ def get_free_port_in_ci(max_attempts=100):
 
     # No port found in the range, try to get a random free port from the system
     for _ in range(max_attempts):
-        port = get_free_port()
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("", 0))
+            port = sock.getsockname()[1]
         if port not in PORTS_IN_USE:
             PORTS_IN_USE.add(port)
             print_info(

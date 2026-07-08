@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # # Force resource release after test
+import faulthandler
 import os
 import signal
 import sys
@@ -21,20 +22,12 @@ import warnings
 from functools import partial
 from typing import Any, Generator
 
-try:
-    import ray
-except ModuleNotFoundError:
-    from tensorrt_llm import ray_stub as ray
-
 import _pytest.outcomes
 import pytest
 import torch
 import tqdm
 from mpi4py.futures import MPIPoolExecutor
 from utils.cpp_paths import llm_root  # noqa: F401
-from utils.util import get_current_process_gpu_memory
-
-from tensorrt_llm._utils import print_all_stacks
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from integration.defs import test_list_parser
@@ -42,7 +35,7 @@ from test_common import s3_output
 
 
 def dump_threads(signum, frame):
-    print_all_stacks()
+    faulthandler.dump_traceback(all_threads=True)
 
 
 def pytest_configure(config):
@@ -108,9 +101,10 @@ def pytest_runtest_protocol(item, nextitem):
             import torch
             worker_count = int(os.environ.get('PYTEST_XDIST_WORKER_COUNT', 1))
 
-            if (torch.cuda.memory_reserved(0) + torch.cuda.memory_allocated(0)
-                ) >= (torch.cuda.get_device_properties(0).total_memory //
-                      worker_count) * 0.9:
+            if (torch.cuda.is_initialized() and
+                (torch.cuda.memory_reserved(0) + torch.cuda.memory_allocated(0))
+                    >= (torch.cuda.get_device_properties(0).total_memory //
+                        worker_count) * 0.9):
                 gc.collect()
                 print("torch.cuda.memory_allocated: %fGB" %
                       (torch.cuda.memory_allocated(0) / 1024 / 1024 / 1024))
@@ -343,7 +337,7 @@ def torch_empty_cache() -> None:
     """
     Automatically empty the torch CUDA cache before each test, to reduce risk of OOM errors.
     """
-    if torch.cuda.is_available():
+    if torch.cuda.is_initialized():
         torch.cuda.empty_cache()
 
 
@@ -440,6 +434,8 @@ def process_gpu_memory_info_available():
     torch.cuda.synchronize()
 
     # Try to get memory usage
+    from utils.util import get_current_process_gpu_memory
+
     usage = get_current_process_gpu_memory()
 
     # Clean up
@@ -457,6 +453,11 @@ def process_gpu_memory_info_available():
 @pytest.fixture(scope="function")
 def setup_ray_cluster() -> Generator[int, None, None]:
     import time
+
+    try:
+        import ray
+    except ModuleNotFoundError:
+        from tensorrt_llm import ray_stub as ray
 
     os.environ.setdefault("RAY_raylet_start_wait_time_s", "120")
     runtime_env = {

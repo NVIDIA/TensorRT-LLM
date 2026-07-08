@@ -28,20 +28,16 @@ import tempfile
 import time
 import urllib.request
 import warnings
-from functools import wraps
+from functools import cache, wraps
 from pathlib import Path
 from typing import Iterable, Sequence
 
 import defs.ci_profiler
 import psutil
 import pytest
-import torch
 import tqdm
 import yaml
 from _pytest.mark import ParameterSet
-
-from tensorrt_llm.bindings import ipc_nvls_supported
-from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 
 from .perf.gpu_clock_lock import GPUClockLock
 from .perf.session_data_writer import SessionDataWriter
@@ -1755,6 +1751,8 @@ def skip_by_device_count(request):
 def skip_by_mpi_world_size(request):
     "fixture for skip less mpi world size"
     if request.node.get_closest_marker("skip_less_mpi_world_size"):
+        from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
+
         mpi_world_size = get_mpi_world_size()
         device_count = get_device_count()
         if mpi_world_size == 1:
@@ -1784,15 +1782,29 @@ def skip_by_device_memory(request):
                 f"Device memory {device_memory} is less than {expected_memory}")
 
 
+@cache
 def get_sm_version():
-    "get compute capability"
-    if not torch.cuda.is_available():
-        return 0
+    """Get compute capability without retaining a CUDA context."""
+    probe = ("import torch\n"
+             "try:\n"
+             "    if torch.cuda.is_available():\n"
+             "        major, minor = torch.cuda.get_device_capability(0)\n"
+             "        print(major * 10 + minor)\n"
+             "    else:\n"
+             "        print(0)\n"
+             "except RuntimeError:\n"
+             "    print(0)\n")
     try:
-        prop = torch.cuda.get_device_properties(0)
-    except RuntimeError:
-        return 0
-    return prop.major * 10 + prop.minor
+        output = sp.check_output([sys.executable, "-c", probe],
+                                 stderr=sp.STDOUT,
+                                 text=True)
+    except sp.CalledProcessError as error:
+        raise RuntimeError(f"CUDA SM probe failed:\n{error.output}") from error
+    try:
+        return int(output.splitlines()[-1])
+    except (IndexError, ValueError) as error:
+        raise RuntimeError(
+            f"CUDA SM probe produced invalid output: {output!r}") from error
 
 
 def is_sm_100f(sm_version=None):
@@ -1817,13 +1829,36 @@ def check_device_contain(keyword_list):
     return any(keyword in device for keyword in keyword_list)
 
 
+@cache
 def is_ipc_nvls_supported():
-    if not torch.cuda.is_available():
-        return False
+    # These probes run while integration tests are collected. Keep their CUDA
+    # context in a short-lived child so wrappers that launch GPU-heavy tests do
+    # not reserve hundreds of MiB on the device for the rest of the session.
+    probe = ("import torch\n"
+             "from tensorrt_llm.bindings import ipc_nvls_supported\n"
+             "try:\n"
+             "    supported = (torch.cuda.is_available() and "
+             "ipc_nvls_supported())\n"
+             "except RuntimeError:\n"
+             "    supported = False\n"
+             "print(int(supported))\n")
     try:
-        return ipc_nvls_supported()
-    except RuntimeError:
-        return False
+        output = sp.check_output([sys.executable, "-c", probe],
+                                 stderr=sp.STDOUT,
+                                 text=True)
+    except sp.CalledProcessError as error:
+        raise RuntimeError(
+            f"CUDA IPC NVLS probe failed:\n{error.output}") from error
+    try:
+        supported = int(output.splitlines()[-1])
+    except (IndexError, ValueError) as error:
+        raise RuntimeError(
+            f"CUDA IPC NVLS probe produced invalid output: {output!r}"
+        ) from error
+    if supported not in (0, 1):
+        raise RuntimeError(
+            f"CUDA IPC NVLS probe produced invalid result: {supported}")
+    return bool(supported)
 
 
 skip_pre_ada = pytest.mark.skipif(
@@ -2644,7 +2679,8 @@ def torch_empty_cache() -> None:
     """
     Manually empty the torch CUDA cache before each test, to reduce risk of OOM errors.
     """
-    if torch.cuda.is_available():
+    torch_module = sys.modules.get("torch")
+    if torch_module is not None and torch_module.cuda.is_initialized():
         gc.collect()
-        torch.cuda.empty_cache()
+        torch_module.cuda.empty_cache()
         gc.collect()
