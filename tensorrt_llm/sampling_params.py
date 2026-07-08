@@ -122,6 +122,12 @@ class BatchedLogitsProcessor(ABC):
         pass  # noqa
 
 
+# Smallest non-zero temperature forwarded to the sampling backend. Positive
+# values below this overflow logits / temperature to inf/nan in fp16/bf16, so
+# they are clamped up to this floor. temperature == 0 (greedy) is left as-is.
+MIN_SAMPLING_TEMPERATURE = 1e-2
+
+
 @dataclass(slots=True, kw_only=True)
 class SamplingParams:
     """Sampling parameters for text generation.
@@ -320,6 +326,10 @@ class SamplingParams:
             raise ValueError(f"require top_k >= 0, got top_k={self.top_k}")
         if self.temperature is not None and self.temperature < 0:
             raise ValueError(f"require temperature >= 0, got temperature={self.temperature}")
+        # Clamp very small non-zero temperatures up to a numerically safe floor;
+        # keep 0.0 as-is so greedy decoding is unaffected.
+        if self.temperature is not None and 0 < self.temperature < MIN_SAMPLING_TEMPERATURE:
+            self.temperature = MIN_SAMPLING_TEMPERATURE
 
         if self.best_of is not None and self.best_of < self.n:
             raise ValueError(f"best_of ({self.best_of}) cannot be less than n ({self.n})")
