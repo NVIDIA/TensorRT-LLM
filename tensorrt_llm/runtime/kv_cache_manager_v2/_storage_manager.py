@@ -176,7 +176,21 @@ MigrationRecorder = Callable[[Sequence[Page], Sequence[Slot], CacheLevel, CacheL
 # without being migrated to any further tier (i.e. dropped from the cache hierarchy).
 DropRecorder = Callable[[Sequence[Page], CacheLevel], None]
 
-_kv_metrics_logger = logging.getLogger("tensorrt_llm.kv_cache_metrics")
+# Log [KVCacheMetrics] through the TRT-LLM logger so the lines reach the same
+# stdout handler as the rest of the server output. A bare
+# logging.getLogger("tensorrt_llm.kv_cache_metrics") is under the "tensorrt_llm"
+# root, which is disconnected from the "TRT-LLM"-prefixed logger (that logger sets
+# propagate=False and owns the only StreamHandler) -- so its records were dropped
+# by the handler-less root and never appeared. Reuse the TRT-LLM logger directly.
+from tensorrt_llm.logger import logger as _trtllm_logger
+
+
+class _KVMetricsLoggerShim:
+    def info(self, msg: str, *args) -> None:
+        _trtllm_logger.info(msg % args if args else msg)
+
+
+_kv_metrics_logger = _KVMetricsLoggerShim()
 
 
 class KVCacheMetrics:
