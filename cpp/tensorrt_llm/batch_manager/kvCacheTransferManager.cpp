@@ -598,6 +598,9 @@ void KVCacheTransferManager::diskReaderLoop()
     // managers) and its own GDS agent (readers never share one). cudaStreamSynchronize (POSIX) or the agent's
     // internal wait (GDS) makes each transfer device-complete before the block is published, so per-block
     // readiness alone is a sufficient pre-forward gate.
+    // Bind this reader thread to the manager's device: a fresh std::thread starts on device 0, so
+    // without this the stream and POSIX H2D copies target the wrong GPU on TP ranks != 0 (crash).
+    TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
     cudaStream_t stream;
     TLLM_CUDA_CHECK(cudaStreamCreate(&stream));
     std::vector<std::uint8_t> hostBuffer;
