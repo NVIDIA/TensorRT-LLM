@@ -80,6 +80,9 @@ _RANGE_ADOPTION = os.getenv("TRTLLM_KV_ARENA_RANGE_ADOPTION") != "0"
 # fully-committed prefix into multiple sequences' VA ranges (zero-copy,
 # zero-charge reuse). Default OFF while the prototype bakes.
 _PREFIX_ALIASING = os.getenv("TRTLLM_KV_ARENA_PREFIX_ALIASING") == "1"
+# Span-spill protection override (see ContiguousArenaConfig
+# .protected_span_fraction); negative = defer to the config value.
+_SPAN_PROTECT_FRACTION = float(os.getenv("TRTLLM_KV_ARENA_SPAN_PROTECT_FRACTION", "-1"))
 
 
 class _CanonicalSpan:
@@ -1775,9 +1778,12 @@ class GpuArenaCacheLevelStorage(CacheLevelStorage):
     """
 
     TIER: ClassVar[CacheTier] = CacheTier.GPU_MEM
-    __slots__ = ("shared_phys_mem_pool", "page_budget")
+    __slots__ = ("shared_phys_mem_pool", "page_budget", "_span_spill_floor")
     shared_phys_mem_pool: PooledPhysMemAllocator
     page_budget: PageBudget
+    # Canonical-span pages exempt from pressure spills (P3 span-spill
+    # protection): ``protected_span_fraction`` of the page budget.
+    _span_spill_floor: int
 
     def __init__(
         self,
@@ -1789,6 +1795,7 @@ class GpuArenaCacheLevelStorage(CacheLevelStorage):
         map_ahead_pages: int,
         lazy_retention: bool = False,
         prefix_aliasing: bool = False,
+        protected_span_fraction: float = 0.05,
     ):
         num_pool_groups = typed_len(slot_size_lists)
         assert num_pool_groups == typed_len(block_capacity_list), (
@@ -1805,6 +1812,10 @@ class GpuArenaCacheLevelStorage(CacheLevelStorage):
         super().__init__()
         self.shared_phys_mem_pool = PooledPhysMemAllocator(phys_page_size)
         self.page_budget = PageBudget(quota // phys_page_size)
+        if _SPAN_PROTECT_FRACTION >= 0.0:
+            protected_span_fraction = _SPAN_PROTECT_FRACTION
+        assert 0.0 <= protected_span_fraction <= 1.0
+        self._span_spill_floor = int(self.page_budget.total_pages * protected_span_fraction)
         self._pool_groups = make_typed(
             lambda pg_idx: ArenaPoolGroup(
                 block_capacity_list[pg_idx],
@@ -1848,19 +1859,44 @@ class GpuArenaCacheLevelStorage(CacheLevelStorage):
         """Reclaim lazily retained ranges (§4.4 phase 2), LRU-first per pool
         group, until ``min_pages`` physical pages are freed or nothing more
         is spillable; canonical-span pins (P3) are spilled last -- shared
-        prefixes are the hottest bytes on the level. Returns pages freed."""
+        prefixes are the hottest bytes on the level -- and only above the
+        protected floor (``protected_span_fraction``): spilling-last alone
+        still forfeits the whole registry under sustained pressure, and with
+        it every zero-copy alias hit, to cover a transient need worth a
+        handful of pages. Protected callers back off like any failed
+        allocation instead (§4.6). Returns pages freed."""
         freed = 0
         for pg in self._pool_groups:
             if freed >= min_pages:
                 break
             assert type(pg) is ArenaPoolGroup
             freed += pg.spill_retained(min_pages - freed)
+        spillable = -self._span_spill_floor
         for pg in self._pool_groups:
-            if freed >= min_pages:
+            assert type(pg) is ArenaPoolGroup
+            spillable += pg.canonical_span_pages
+        for pg in self._pool_groups:
+            if freed >= min_pages or spillable <= 0:
                 break
             assert type(pg) is ArenaPoolGroup
-            freed += pg.spill_canonical_spans(min_pages - freed)
+            got = pg.spill_canonical_spans(min(min_pages - freed, spillable))
+            freed += got
+            spillable -= got
         return freed
+
+    @property
+    def protected_span_pages(self) -> int:
+        """Canonical-span pages currently under the spill-protection floor.
+        These are pinned for the registry's benefit and NOT reclaimable
+        under pressure, so utilization gates must not count them available
+        the way plain retained pages are."""
+        if self._span_spill_floor == 0:
+            return 0
+        span_pages = 0
+        for pg in self._pool_groups:
+            assert type(pg) is ArenaPoolGroup
+            span_pages += pg.canonical_span_pages
+        return min(span_pages, self._span_spill_floor)
 
     def flush_mappings(self) -> int:
         """Execute every pool group's deferred growth maps back-to-back

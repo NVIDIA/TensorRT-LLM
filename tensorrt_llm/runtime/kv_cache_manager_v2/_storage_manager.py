@@ -169,6 +169,7 @@ class CacheLevelManager:
                         arena_spec.config.map_ahead_pages,
                         arena_spec.config.lazy_gpu_retention,
                         arena_spec.config.prefix_aliasing,
+                        arena_spec.config.protected_span_fraction,
                     )
                 granularity = CacheLevelManager.cache_tier_granularity(
                     CacheTier.GPU_MEM, config.quota
@@ -1162,9 +1163,15 @@ class StorageManager:
             # Slot counts describe VA in arena mode; physical utilization is
             # the shared page budget (§4.6), identical for every pool group.
             # Lazily retained pages are reclaimable at will and count as
-            # available, mirroring classic "evictable" accounting.
-            budget = self.gpu_page_budget
-            frac = (budget.used_pages - budget.retained_pages) / budget.total_pages
+            # available, mirroring classic "evictable" accounting -- EXCEPT
+            # canonical-span pages under the spill-protection floor (P3),
+            # which pressure spills refuse to touch: counting them available
+            # would admit resumes whose mapping then fails.
+            storage = self._gpu_arena_storage()
+            budget = storage.page_budget
+            reclaimable = budget.retained_pages - storage.protected_span_pages
+            assert reclaimable >= 0
+            frac = (budget.used_pages - reclaimable) / budget.total_pages
             return filled_list(frac, self.num_pool_groups)
         ret = filled_list(0.0, self.num_pool_groups)
         stats = self.get_statistics(level)

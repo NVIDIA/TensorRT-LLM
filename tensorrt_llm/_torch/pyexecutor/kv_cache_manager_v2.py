@@ -1114,6 +1114,10 @@ class KVCacheManagerV2(BaseResourceManager):
           C++ attention op; XQA HMMA family, beam width 1). Only valid with
           the arena allocator; both KV cache managers fail loudly if it is set
           without ``use_contiguous_kv_arena``. Default ``0``.
+        - ``TRTLLM_KV_ARENA_SPAN_PROTECT_FRACTION``: fraction of the page
+          budget up to which canonical-span pins (P3 prefix aliasing) are
+          exempt from pressure spills (read directly by the storage layer;
+          default 0.05, ``0`` restores unprotected spilling).
         """
         page_mb = int(os.environ.get("TRTLLM_KV_ARENA_PHYS_PAGE_SIZE_MB", "2"))
         map_ahead = int(os.environ.get("TRTLLM_KV_ARENA_MAP_AHEAD_PAGES", "1"))

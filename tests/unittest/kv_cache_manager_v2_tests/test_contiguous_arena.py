@@ -1011,6 +1011,105 @@ class TestGpuArenaCacheLevelStorage(unittest.TestCase):
         finally:
             storage.destroy()
 
+    def _aliasing_storage(self, fraction: float) -> "GpuArenaCacheLevelStorage":
+        """Aliasing-enabled level storage for the span-spill tests.
+
+        Single pool group, 2 MiB slots on 2 MiB pages (1 block = 1 page),
+        8-page budget.
+        """
+        return GpuArenaCacheLevelStorage(
+            slot_size_lists=[[2 * MiB]],
+            block_capacity_list=[16],
+            page_index_scale_list=[64],
+            quota=8 * self.PAGE,
+            phys_page_size=self.PAGE,
+            map_ahead_pages=0,
+            prefix_aliasing=True,
+            protected_span_fraction=fraction,
+        )
+
+    def _register_owner_span(
+        self, group: "ArenaPoolGroup", span_blocks: int = 2, range_blocks: int = 4
+    ):
+        """Map an owner range and register a canonical span over its prefix."""
+        rng = group.reserve_sequence(range_blocks)
+        group.ensure_mapped(rng, range_blocks)
+        canon = [TestArenaPoolGroup._FakeCanonicalPage() for _ in range(span_blocks)]
+        group.register_canonical_span(rng, canon, CachedCudaEvent.NULL)
+        return rng, canon
+
+    def test_span_spill_protection_floor(self) -> None:
+        """Pressure spills must not consume span pins under the floor.
+
+        P3 span-spill protection: parked ranges spill, the registry
+        survives, and the protected pages are reported so the utilization
+        gate can stop counting them reclaimable.
+        """
+        storage = self._aliasing_storage(fraction=0.5)  # floor = 4 pages
+        try:
+            group = storage.pool_group(0)
+            rng, canon = self._register_owner_span(group)  # 4 pages, 2-page span
+            self.assertEqual(group.canonical_span_pages, 2)
+            self.assertEqual(storage.protected_span_pages, 2)
+            group.free_sequence(rng, CachedCudaEvent.NULL)
+            self.assertEqual(group.drain_reclaim(CachedCudaEvent.NULL), 1)  # parked
+            torch.cuda.synchronize()
+            # The parked owner range spills (its 2 non-aliased pages); the
+            # 2-page span sits under the 4-page floor and survives.
+            self.assertEqual(storage.spill_retained(1 << 62), 2)
+            self.assertEqual(group.spilled_spans, 0)
+            self.assertEqual(group.canonical_span_pages, 2)
+            self.assertEqual(storage.protected_span_pages, 2)
+            self.assertEqual(storage.page_budget.used_pages, 2)
+            self.assertIsNotNone(group.lookup_canonical_span(canon[0], canon))
+        finally:
+            storage.destroy()
+
+    def test_span_spill_excess_above_floor_lru(self) -> None:
+        """Only the registry excess above the protected floor spills.
+
+        Oldest span first; the floor's worth of spans survives arbitrary
+        pressure.
+        """
+        storage = self._aliasing_storage(fraction=0.25)  # floor = 2 pages
+        try:
+            group = storage.pool_group(0)
+            rng_a, canon_a = self._register_owner_span(group)
+            rng_b, canon_b = self._register_owner_span(group)
+            self.assertEqual(group.canonical_span_pages, 4)
+            self.assertEqual(storage.protected_span_pages, 2)  # min(4, floor)
+            group.free_sequence(rng_a, CachedCudaEvent.NULL)
+            group.free_sequence(rng_b, CachedCudaEvent.NULL)
+            self.assertEqual(group.drain_reclaim(CachedCudaEvent.NULL), 2)
+            torch.cuda.synchronize()
+            # 4 pages from the two parked ranges + the 2-page excess (span A).
+            self.assertEqual(storage.spill_retained(1 << 62), 6)
+            self.assertEqual(group.spilled_spans, 1)
+            self.assertEqual(group.canonical_span_pages, 2)
+            self.assertEqual(storage.protected_span_pages, 2)
+            self.assertIsNone(group.lookup_canonical_span(canon_a[0], canon_a))
+            self.assertIsNotNone(group.lookup_canonical_span(canon_b[0], canon_b))
+        finally:
+            storage.destroy()
+
+    def test_span_spill_unprotected_when_fraction_zero(self) -> None:
+        """fraction=0 restores the previous spans-spilled-last behavior."""
+        storage = self._aliasing_storage(fraction=0.0)
+        try:
+            group = storage.pool_group(0)
+            rng, canon = self._register_owner_span(group)
+            group.free_sequence(rng, CachedCudaEvent.NULL)
+            self.assertEqual(group.drain_reclaim(CachedCudaEvent.NULL), 1)
+            torch.cuda.synchronize()
+            self.assertEqual(storage.spill_retained(1 << 62), 4)
+            self.assertEqual(group.spilled_spans, 1)
+            self.assertEqual(group.canonical_span_pages, 0)
+            self.assertEqual(storage.protected_span_pages, 0)
+            self.assertEqual(storage.page_budget.used_pages, 0)
+            self.assertIsNone(group.lookup_canonical_span(canon[0], canon))
+        finally:
+            storage.destroy()
+
     def test_int31_violation_fails_before_cuda_setup(self) -> None:
         with self.assertRaises(ValueError):
             GpuArenaCacheLevelStorage(

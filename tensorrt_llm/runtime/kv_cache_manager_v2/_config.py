@@ -248,6 +248,17 @@ class ContiguousArenaConfig:
     # with prefix-affine range adoption. Prototype; off by default. Also
     # settable via TRTLLM_KV_ARENA_PREFIX_ALIASING=1.
     prefix_aliasing: bool = False
+    # Span-spill protection: canonical-span pins are EXEMPT from pressure
+    # spills up to this fraction of the page budget (the excess stays
+    # spillable, LRU-first). Shared prefixes are the hottest bytes on the
+    # level, and spilling them "last" alone still forfeits the whole
+    # registry under sustained pressure -- and with it every zero-copy
+    # alias hit -- to cover a transient need worth a handful of pages;
+    # protected callers back off like any failed allocation instead
+    # (§4.6). 0.0 restores unprotected spilling. Only meaningful with
+    # ``prefix_aliasing``. Also settable via
+    # TRTLLM_KV_ARENA_SPAN_PROTECT_FRACTION.
+    protected_span_fraction: float = 0.05
 
     def __post_init__(self) -> None:
         _MIN_GRANULARITY = 2 << 20
@@ -257,6 +268,9 @@ class ContiguousArenaConfig:
         )
         assert self.map_ahead_pages >= 0, "map_ahead_pages must be non-negative"
         assert self.max_va_bytes_per_pool >= 0, "max_va_bytes_per_pool must be non-negative"
+        assert 0.0 <= self.protected_span_fraction <= 1.0, (
+            f"protected_span_fraction ({self.protected_span_fraction}) must be in [0, 1]"
+        )
 
 
 @dataclass(slots=True)
