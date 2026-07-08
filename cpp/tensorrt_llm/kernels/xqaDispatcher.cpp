@@ -350,6 +350,8 @@ void XqaDispatcher::runImpl(
             || params.qkv_token_stride
                 == (params.num_q_heads + 2 * params.num_kv_heads) * static_cast<int32_t>(params.head_size),
         "Strided qkv input is not supported by the legacy XQA generation path.");
+    TLLM_CHECK_WITH_INFO(params.q_norm_weight == nullptr || mUseTllmGen,
+        "Fused QK norm preprocessing is not supported by the legacy XQA generation path.");
     if (mUseTllmGen)
     {
         TLLM_LOG_DEBUG("Running TRTLLM-GEN generation kernel.");

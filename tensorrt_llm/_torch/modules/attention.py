@@ -706,15 +706,18 @@ class Attention(nn.Module):
         """Permute qkv_proj weight rows from [q0|g0|q1|g1|...|K|V] to [Q|K|V|G].
 
         Load-time-only transform enabling the copy-free gate path in forward. Only
-        engaged for plain (unquantized) weights with the TRTLLM backend and the fused
-        qk-norm-rope kernel, where the strided [Q|K|V] view is supported end to end.
+        engaged for plain (unquantized) weights with a backend that supports the
+        strided [Q|K|V] view in both context and generation paths.
         """
         if not self._gate_tail_layout_enabled or self._gate_tail_layout_active:
             return
         has_quant = (self.quant_config is not None
                      and self.quant_config.layer_quant_mode.has_any_quant(
                          exclude_kv_cache=True))
+        supports_strided_qkv = getattr(self.attn, "support_strided_fused_qkv",
+                                       lambda: False)()
         supported = (self.attn_backend == "TRTLLM" and self.support_fused_qkv
+                     and supports_strided_qkv
                      and getattr(self, "fuse_qk_norm_rope", False)
                      and not getattr(self, "skip_rope", False) and not has_quant
                      and self.mapping.cp_size == 1

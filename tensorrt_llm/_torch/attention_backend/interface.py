@@ -1071,6 +1071,11 @@ class AttentionBackend(Generic[TMetadata]):
         return False
 
     @classmethod
+    def support_strided_fused_qkv(cls) -> bool:
+        """Whether fused QKV may have a wider token stride end to end."""
+        return False
+
+    @classmethod
     def support_mla(cls) -> bool:
         return False
 
