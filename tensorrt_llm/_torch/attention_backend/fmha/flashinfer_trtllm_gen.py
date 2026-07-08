@@ -408,9 +408,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         (320, 256),
         (576, 512),
     }
-    MISSING_MLA_GENERATION_KERNELS = {
-        (576, 512, 32),
-    }
 
     def __init__(self, attn: "TrtllmAttention"):
         super().__init__(attn)
@@ -529,7 +526,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     def _check_mla_generation_support(
         cls,
         head_size: int,
-        tokens_per_block: int,
         kv_lora_rank: Optional[int],
         qk_rope_head_dim: Optional[int],
     ) -> Tuple[bool, str]:
@@ -567,14 +563,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 f"headDimQk={head_dim_qk}, headDimV={head_dim_v}. Supported: {supported}.",
             )
 
-        if (head_dim_qk, head_dim_v, tokens_per_block) in cls.MISSING_MLA_GENERATION_KERNELS:
-            return (
-                False,
-                f"[Generation][MLA] Missing TRTLLM-GEN decode kernel for "
-                f"headDimQk={head_dim_qk}, headDimV={head_dim_v}, "
-                f"tokens_per_block={tokens_per_block}.",
-            )
-
         return True, ""
 
     def is_supported(
@@ -610,6 +598,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         sparse_params = attn.sparse_params
         has_skip_softmax = sparse_params is not None and sparse_params.algorithm == "skip_softmax"
         has_sparse_attention = sparse_params is not None and not has_skip_softmax
+        if fwd.enable_dsv4_epilogue_fusion:
+            return False, "trtllm-gen does not support DSv4 epilogue fusion."
         if (
             fwd.sage_attn_num_elts_per_blk_q > 0
             or fwd.sage_attn_num_elts_per_blk_k > 0
@@ -765,7 +755,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             if is_mla_enable:
                 supported, reason = self._check_mla_generation_support(
                     head_size=attn.head_dim,
-                    tokens_per_block=tokens_per_block,
                     kv_lora_rank=attn.kv_lora_rank,
                     qk_rope_head_dim=attn.qk_rope_head_dim,
                 )
@@ -1192,7 +1181,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         batch_beam = params.num_requests * meta.beam_width
         if params.attention_input is None:
             raise RuntimeError("MLA generation requires attention_input.")
-        kv_cache, block_tables = thop.build_trtllm_gen_kv_cache_metadata(
+        kv_cache, block_tables, _kv_scale_pool = thop.build_trtllm_gen_kv_cache_metadata(
             meta.host_kv_cache_pool_pointers,  # host_kv_cache_pool_pointers
             meta.host_kv_cache_pool_mapping,  # host_kv_cache_pool_mapping
             meta.kv_cache_block_offsets,  # kv_cache_block_offsets
@@ -1222,9 +1211,43 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         mla_head_dim_qk = kv_lora_rank + qk_rope_head_dim
         q_len_per_req = params.num_tokens // batch_beam if batch_beam > 0 else 1
 
-        query = params.qkv_input.view(batch_beam, q_len_per_req, attn.num_heads, mla_head_dim_qk)
+        if QuantMode(attn.quant_mode).has_fp8_kv_cache():
+            quant_q_buffer = fwd.quant_q_buffer
+            bmm1_scale_buffer = fwd.mla_bmm1_scale
+            bmm2_scale_buffer = fwd.mla_bmm2_scale
+            if quant_q_buffer is None or bmm1_scale_buffer is None or bmm2_scale_buffer is None:
+                raise RuntimeError(
+                    "FP8 MLA generation requires quant_q_buffer, "
+                    "mla_bmm1_scale, and mla_bmm2_scale."
+                )
 
-        bmm1_scale = 1.0 / (attn.q_scaling * math.sqrt(qk_nope_head_dim + qk_rope_head_dim))
+            expected_q_elements = params.num_tokens * attn.num_heads * mla_head_dim_qk
+            if quant_q_buffer.numel() < expected_q_elements:
+                raise RuntimeError(
+                    f"FP8 MLA quant_q_buffer has {quant_q_buffer.numel()} elements; "
+                    f"expected at least {expected_q_elements}."
+                )
+            if bmm1_scale_buffer.dtype != torch.float32 or bmm1_scale_buffer.numel() < 1:
+                raise RuntimeError("FP8 MLA bmm1 scale must contain a float32 value.")
+            if bmm2_scale_buffer.dtype != torch.float32 or bmm2_scale_buffer.numel() < 1:
+                raise RuntimeError("FP8 MLA bmm2 scale must contain a float32 value.")
+
+            query = (
+                quant_q_buffer.view(torch.uint8)
+                .flatten()[:expected_q_elements]
+                .view(torch.float8_e4m3fn)
+                .view(batch_beam, q_len_per_req, attn.num_heads, mla_head_dim_qk)
+            )
+            # FlashInfer converts tensor BMM1 scales to log2 internally. The
+            # producer stores the regular scale at index 0 and log2 at index 1.
+            bmm1_scale = bmm1_scale_buffer.flatten()[:1]
+            bmm2_scale = bmm2_scale_buffer.flatten()[:1]
+        else:
+            query = params.qkv_input.view(
+                batch_beam, q_len_per_req, attn.num_heads, mla_head_dim_qk
+            )
+            bmm1_scale = 1.0 / (attn.q_scaling * math.sqrt(qk_nope_head_dim + qk_rope_head_dim))
+            bmm2_scale = 1.0
         workspace_buffer = params.workspace.view(-1, 4)
         _clear_multi_ctas_kv_counter_workspace(
             workspace_buffer, attn.num_heads, meta.max_num_requests, self._multi_processor_count
@@ -1243,7 +1266,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             0,  # sparse_mla_top_k
             params.context_buf.view(batch_beam, q_len_per_req, attn.num_heads, kv_lora_rank),  # out
             bmm1_scale,  # bmm1_scale
-            1.0,  # bmm2_scale
+            bmm2_scale,  # bmm2_scale
             fwd.attention_sinks,  # sinks
             None,  # skip_softmax_threshold_scale_factor
             self._enable_pdl,  # enable_pdl

@@ -43,6 +43,80 @@ from tensorrt_llm._utils import prefer_pinned
 _FORCE_RAGGED_FA2 = False
 """Used for testing."""
 
+_MAX_CUDA_THREADS_PER_BLOCK = 1024
+
+
+def _slice_paged_kv_cache_heads(
+    paged_kv_cache: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    start: int,
+    end: int,
+    kv_layout: str,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    if kv_layout == "HND":
+        head_axis = 2
+    elif kv_layout == "NHD":
+        head_axis = 3
+    else:
+        raise ValueError(f"Unsupported kv_layout: {kv_layout}")
+
+    if isinstance(paged_kv_cache, tuple):
+        head_axis -= 1
+        index = [slice(None)] * 4
+        index[head_axis] = slice(start, end)
+        return tuple(cache[tuple(index)] for cache in paged_kv_cache)
+
+    index = [slice(None)] * 5
+    index[head_axis] = slice(start, end)
+    return paged_kv_cache[tuple(index)]
+
+
+def _append_paged_kv_cache(
+    append_key: torch.Tensor,
+    append_value: torch.Tensor,
+    batch_indices: torch.Tensor,
+    positions: torch.Tensor,
+    paged_kv_cache: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_last_page_len: torch.Tensor,
+    kv_layout: str = "NHD",
+) -> None:
+    """Split FlashInfer paged-KV appends that exceed CUDA's CTA limit."""
+    head_dim = append_key.shape[-1]
+    vec_size = max(16 // append_key.element_size(), head_dim // 32)
+    threads_per_head = head_dim // vec_size
+    max_heads_per_launch = _MAX_CUDA_THREADS_PER_BLOCK // threads_per_head
+
+    num_kv_heads = append_key.shape[1]
+    if num_kv_heads <= max_heads_per_launch:
+        flashinfer.page.append_paged_kv_cache(
+            append_key=append_key,
+            append_value=append_value,
+            batch_indices=batch_indices,
+            positions=positions,
+            paged_kv_cache=paged_kv_cache,
+            kv_indices=kv_indices,
+            kv_indptr=kv_indptr,
+            kv_last_page_len=kv_last_page_len,
+            kv_layout=kv_layout,
+        )
+        return
+
+    for start in range(0, num_kv_heads, max_heads_per_launch):
+        end = min(start + max_heads_per_launch, num_kv_heads)
+        flashinfer.page.append_paged_kv_cache(
+            append_key=append_key[:, start:end],
+            append_value=append_value[:, start:end],
+            batch_indices=batch_indices,
+            positions=positions,
+            paged_kv_cache=_slice_paged_kv_cache_heads(paged_kv_cache, start,
+                                                       end, kv_layout),
+            kv_indices=kv_indices,
+            kv_indptr=kv_indptr,
+            kv_last_page_len=kv_last_page_len,
+            kv_layout=kv_layout,
+        )
+
 
 @dataclass(kw_only=True, frozen=True)
 class FlashInferMultiItemParams:
@@ -1748,7 +1822,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 f"KV cache dtype {kv_cache.dtype} does not match k/v dtype {k.dtype}/{v.dtype}"
             )
 
-            flashinfer.page.append_paged_kv_cache(
+            _append_paged_kv_cache(
                 append_key=k,
                 append_value=v,
                 batch_indices=metadata.batch_indices,

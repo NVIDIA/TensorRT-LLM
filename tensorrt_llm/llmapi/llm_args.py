@@ -3404,7 +3404,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     dtype: str = Field(
         default="auto",
         description=
-        "The data type to use for the KV cache. Use 'auto' to follow checkpoint metadata, otherwise force the specified dtype.",
+        "The data type for the KV cache. 'auto' (default) leaves the checkpoint's "
+        "own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo "
+        "is inherited as-is); 'fp8' or 'nvfp4' override it explicitly. Resolved at "
+        "LLM-construction time, including when set via trtllm-serve "
+        "--extra_llm_api_options.",
         telemetry=TelemetryField.categorical("auto", "float16", "bfloat16",
                                              "float32", "fp8", "nvfp4"))
 
@@ -3843,10 +3847,16 @@ class BaseLlmArgs(StrictBaseModel):
     tensor_parallel_size: int = Field(default=1,
                                       description="The tensor parallel size.")
 
-    dtype: str = Field(default="auto",
-                       description="The data type to use for the model.",
-                       telemetry=TelemetryField.categorical(
-                           "auto", "float16", "bfloat16", "float32"))
+    dtype: str = Field(
+        default="auto",
+        description="The data type to use for the model. When 'auto' "
+        "(default), it is read from the HF config.json ('dtype', or the "
+        "deprecated 'torch_dtype'); for composite/VLM configs it falls "
+        "back to the nested text_config.dtype. Defaults to bfloat16 if "
+        "none is found, and is overridden to float16 on GPUs with compute "
+        "capability < 8.0 (pre-Ampere).",
+        telemetry=TelemetryField.categorical("auto", "float16", "bfloat16",
+                                             "float32"))
 
     revision: Optional[str] = Field(
         default=None, description="The revision to use for the model.")
@@ -4937,6 +4947,16 @@ class TorchLlmArgs(BaseLlmArgs):
         "Under the overlap scheduler, emit the first-token response ahead of "
         "the next sample step to reduce TTFT. No effect when the overlap "
         "scheduler is disabled.",
+        status="prototype")
+
+    enable_low_latency_host_dispatch: bool = Field(
+        default=False,
+        description="Use low-latency spin-wait mode for CUDA host task dispatch "
+        "(cudaLaunchHostFunc_v2 with cudaHostTaskSpinWait). "
+        "Reduces callback latency at the cost of a CPU core spinning while "
+        "waiting for the GPU event. Requires CUDA 13.2+; on older CUDA "
+        "versions, falls back to the default blocking mode and logs a "
+        "one-time warning.",
         status="prototype")
 
     enable_iter_perf_stats: bool = Field(
