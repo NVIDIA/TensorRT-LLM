@@ -47,6 +47,21 @@ class _RecordingTransformer(torch.nn.Module):
         return (pattern.view(1, 1, -1).expand_as(hidden_states).clone(),)
 
 
+class _AliasingTransformer(_RecordingTransformer):
+    """Mimics CUDA graph replays that return the same static output buffer."""
+
+    def __init__(self):
+        super().__init__()
+        self._shared_output = None
+
+    def forward(self, **kwargs):
+        output = super().forward(**kwargs)[0]
+        if self._shared_output is None:
+            self._shared_output = torch.empty_like(output)
+        self._shared_output.copy_(output)
+        return (self._shared_output,)
+
+
 class _RecordingScheduler:
     def __init__(self):
         self.config = {}
@@ -78,6 +93,7 @@ class _RecordingScheduler:
 def _pipeline_with_test_doubles():
     pipe = QwenImagePipeline.__new__(QwenImagePipeline)
     torch.nn.Module.__init__(pipe)
+    pipe._cuda_graph_runners = {}
     pipe.vae_scale_factor = 8
     pipe.transformer = _RecordingTransformer()
     pipe.scheduler = _RecordingScheduler()
@@ -211,3 +227,30 @@ def test_forward_runs_true_cfg_pipeline():
     )
     assert torch.allclose(pipe.scheduler.step_calls[0]["noise_pred"], expected_cfg_noise)
     assert pipe.scheduler.step_calls[0]["return_dict"] is False
+
+
+def test_forward_preserves_positive_prediction_across_cuda_graph_cfg_replays():
+    pipe, _ = _pipeline_with_test_doubles()
+    pipe.transformer = _AliasingTransformer()
+    pipe._cuda_graph_runners = {"transformer": object()}
+
+    pipe.forward(
+        prompt=["a cat"],
+        negative_prompt="bad",
+        height=32,
+        width=48,
+        num_inference_steps=1,
+        true_cfg_scale=3.0,
+        seed=123,
+        max_sequence_length=16,
+        sigmas=[1.0],
+    )
+
+    cond_noise = _expanded_noise([1, 2, 3, 4], batch_size=1, seq_len=6)
+    neg_noise = _expanded_noise([-0.5, 0.25, 1.5, -1.0], batch_size=1, seq_len=6)
+    combined_noise = neg_noise + 3.0 * (cond_noise - neg_noise)
+    expected_cfg_noise = combined_noise * (
+        torch.norm(cond_noise, dim=-1, keepdim=True)
+        / torch.norm(combined_noise, dim=-1, keepdim=True)
+    )
+    assert torch.allclose(pipe.scheduler.step_calls[0]["noise_pred"], expected_cfg_noise)

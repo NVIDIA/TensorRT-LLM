@@ -19,19 +19,27 @@ from __future__ import annotations
 
 import functools
 import math
+from collections.abc import Callable
 from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.utils import gelu_tanh, maybe_compile
+from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
+    Attention2DAttention,
+    RingAttention,
+    UlyssesAttention,
+)
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
+from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 _WEIGHT_KEY_REMAPS = [
@@ -224,6 +232,7 @@ class AdaLayerNormContinuous(nn.Module):
         else:
             raise ValueError(f"unknown norm_type {norm_type}")
 
+    @maybe_compile()
     def forward(self, x: torch.Tensor, conditioning_embedding: torch.Tensor) -> torch.Tensor:
         emb = self.linear(self.silu(conditioning_embedding).to(x.dtype))
         scale, shift = torch.chunk(emb, 2, dim=1)
@@ -236,9 +245,15 @@ class AdaLayerNormContinuous(nn.Module):
 # ===========================================================================
 
 
-@torch.compiler.disable
-def _gelu_tanh_eager(x: torch.Tensor) -> torch.Tensor:
-    return F.gelu(x, approximate="tanh")
+def _get_feedforward_activation(activation_fn: str) -> Callable[[torch.Tensor], torch.Tensor]:
+    if activation_fn == "gelu-approximate":
+        return gelu_tanh
+    if activation_fn == "gelu":
+        return F.gelu
+    raise ValueError(
+        f"Unsupported activation_fn={activation_fn} in Qwen-Image "
+        "FeedForward; only gelu / gelu-approximate needed."
+    )
 
 
 class FeedForward(MLP):
@@ -257,15 +272,7 @@ class FeedForward(MLP):
     ):
         inner_dim = int(dim * mult)
         dim_out = dim_out if dim_out is not None else dim
-        if activation_fn == "gelu-approximate":
-            activation = _gelu_tanh_eager
-        elif activation_fn == "gelu":
-            activation = F.gelu
-        else:
-            raise ValueError(
-                f"Unsupported activation_fn={activation_fn} in Qwen-Image "
-                "FeedForward; only gelu / gelu-approximate needed."
-            )
+        activation = _get_feedforward_activation(activation_fn)
         if dim_out != dim:
             raise ValueError("TRT-LLM MLP FeedForward requires dim_out == dim")
         super().__init__(
@@ -276,7 +283,6 @@ class FeedForward(MLP):
             dtype=dtype,
             config=config,
             layer_idx=layer_idx,
-            reduce_output=False,
         )
 
 
@@ -307,6 +313,30 @@ def apply_rotary_emb_qwen(
     freqs_cis = freqs_cis.unsqueeze(1)
     x_out = torch.view_as_real(x_rotated * freqs_cis).flatten(3)
     return x_out.type_as(x)
+
+
+def qwen_complex_freqs_to_cos_sin(freqs_cis: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Convert Qwen's complex RoPE cache to shared interleaved real cos/sin tensors."""
+    freqs_cis = torch.view_as_real(freqs_cis)
+    freqs_cos = freqs_cis[..., 0].repeat_interleave(2, dim=-1).unsqueeze(1).float().contiguous()
+    freqs_sin = freqs_cis[..., 1].repeat_interleave(2, dim=-1).unsqueeze(1).float().contiguous()
+    return freqs_cos, freqs_sin
+
+
+def qwen_joint_freqs_to_cos_sin(
+    image_rotary_emb: Tuple[torch.Tensor, torch.Tensor],
+    batch_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Convert and concatenate Qwen text/image RoPE frequencies once per model forward."""
+    img_freqs, txt_freqs = image_rotary_emb
+    txt_cos, txt_sin = qwen_complex_freqs_to_cos_sin(txt_freqs)
+    img_cos, img_sin = qwen_complex_freqs_to_cos_sin(img_freqs)
+    freqs_cos = torch.cat([txt_cos, img_cos], dim=0).squeeze(1)
+    freqs_sin = torch.cat([txt_sin, img_sin], dim=0).squeeze(1)
+    if batch_size > 1:
+        freqs_cos = freqs_cos.repeat(batch_size, 1)
+        freqs_sin = freqs_sin.repeat(batch_size, 1)
+    return freqs_cos, freqs_sin
 
 
 class QwenEmbedRope(nn.Module):
@@ -474,15 +504,18 @@ class QwenJointAttention(Attention):
             qk_norm_mode="per_head",
             eps=eps,
             bias=True,
-            # TODO: enable fused qk-norm+RoPE after adapting Qwen's
-            # complex frequency cache to the shared real cos/sin format.
-            fuse_qk_norm_rope=False,
+            fuse_qk_norm_rope=(config.mapping.tp_size == 1),
             config=config,
             layer_idx=layer_idx,
             module_name=module_name,
         )
-        self.heads = num_attention_heads
         self.head_dim = attention_head_dim
+        self._supports_key_padding_mask = _supports_qwen_key_padding_mask(
+            self.attn_backend, self.attn
+        )
+        self._uses_sequence_parallel_attention = _is_qwen_sequence_parallel_attention(self.attn)
+
+        tp_mode = TensorParallelMode.COLUMN if self.tp_size > 1 else None
 
         # Text-stream QKV (diffusers names).
         self.add_q_proj = Linear(
@@ -494,6 +527,8 @@ class QwenJointAttention(Attention):
             quant_config=self.quant_config,
             skip_create_weights_in_init=self.skip_create_weights_in_init,
             force_dynamic_quantization=self.force_dynamic_quantization,
+            tensor_parallel_mode=tp_mode,
+            reduce_output=False,
         )
         self.add_k_proj = Linear(
             dim,
@@ -504,6 +539,8 @@ class QwenJointAttention(Attention):
             quant_config=self.quant_config,
             skip_create_weights_in_init=self.skip_create_weights_in_init,
             force_dynamic_quantization=self.force_dynamic_quantization,
+            tensor_parallel_mode=tp_mode,
+            reduce_output=False,
         )
         self.add_v_proj = Linear(
             dim,
@@ -514,6 +551,8 @@ class QwenJointAttention(Attention):
             quant_config=self.quant_config,
             skip_create_weights_in_init=self.skip_create_weights_in_init,
             force_dynamic_quantization=self.force_dynamic_quantization,
+            tensor_parallel_mode=tp_mode,
+            reduce_output=False,
         )
 
         # QK-norms, applied per-head on the head_dim.
@@ -533,22 +572,65 @@ class QwenJointAttention(Attention):
             quant_config=self.quant_config,
             skip_create_weights_in_init=self.skip_create_weights_in_init,
             force_dynamic_quantization=self.force_dynamic_quantization,
+            tensor_parallel_mode=TensorParallelMode.ROW if self.tp_size > 1 else None,
+            reduce_output=(self.tp_size > 1),
+            allreduce_strategy=self.allreduce_strategy,
         )
 
     @staticmethod
     def _apply_rms_norm(x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
         return F.rms_norm(x, (x.shape[-1],), norm.weight, norm.variance_epsilon)
 
-    def forward(
+    def _use_fused_qk_norm_rope(
+        self,
+        hidden_states: torch.Tensor,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> bool:
+        return (
+            self.fuse_qk_norm_rope
+            and image_rotary_emb is not None
+            and self.qk_norm
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and self.head_dim in (64, 128, 256)
+        )
+
+    def _prepare_qkv_fused(
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
-        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        timestep: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        seq_txt = encoder_hidden_states.shape[1]
+        image_rotary_emb: Tuple[torch.Tensor, torch.Tensor],
+        fused_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        img_q, img_k, img_v = self.get_qkv(hidden_states)
+        txt_q = self.add_q_proj(encoder_hidden_states)
+        txt_k = self.add_k_proj(encoder_hidden_states)
+        txt_v = self.add_v_proj(encoder_hidden_states)
 
+        txt_qkv = torch.cat([txt_q, txt_k, txt_v], dim=-1)
+        img_qkv = torch.cat([img_q, img_k, img_v], dim=-1)
+        qkv = torch.cat([txt_qkv, img_qkv], dim=1)
+
+        if fused_rotary_emb is None:
+            fused_rotary_emb = qwen_joint_freqs_to_cos_sin(image_rotary_emb, qkv.shape[0])
+        freqs_cos, freqs_sin = fused_rotary_emb
+
+        self.apply_packed_qk_norm_rope(
+            qkv,
+            freqs_cos,
+            freqs_sin,
+            num_txt_tokens=encoder_hidden_states.shape[1],
+            q_add_weight=self.norm_added_q.weight,
+            k_add_weight=self.norm_added_k.weight,
+        )
+        return qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
+
+    def _prepare_qkv_unfused(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Image QKV.
         img_q, img_k, img_v = self.get_qkv(hidden_states)
         # Text QKV.
@@ -557,12 +639,12 @@ class QwenJointAttention(Attention):
         txt_v = self.add_v_proj(encoder_hidden_states)
 
         # Reshape to (B, S, H, D).
-        img_q = img_q.unflatten(-1, (self.heads, -1))
-        img_k = img_k.unflatten(-1, (self.heads, -1))
-        img_v = img_v.unflatten(-1, (self.heads, -1))
-        txt_q = txt_q.unflatten(-1, (self.heads, -1))
-        txt_k = txt_k.unflatten(-1, (self.heads, -1))
-        txt_v = txt_v.unflatten(-1, (self.heads, -1))
+        img_q = img_q.unflatten(-1, (self.local_num_attention_heads, -1))
+        img_k = img_k.unflatten(-1, (self.local_num_key_value_heads, -1))
+        img_v = img_v.unflatten(-1, (self.local_num_key_value_heads, -1))
+        txt_q = txt_q.unflatten(-1, (self.local_num_attention_heads, -1))
+        txt_k = txt_k.unflatten(-1, (self.local_num_key_value_heads, -1))
+        txt_v = txt_v.unflatten(-1, (self.local_num_key_value_heads, -1))
 
         # Per-stream QK-norm on head dim.
         img_q = self._apply_rms_norm(img_q, self.norm_q)
@@ -579,32 +661,63 @@ class QwenJointAttention(Attention):
             txt_k = apply_rotary_emb_qwen(txt_k, txt_freqs, use_real=False)
 
         # Joint attention: [txt | img] order.
-        joint_q = torch.cat([txt_q, img_q], dim=1)
-        joint_k = torch.cat([txt_k, img_k], dim=1)
-        joint_v = torch.cat([txt_v, img_v], dim=1)
+        joint_q = torch.cat([txt_q, img_q], dim=1).flatten(2)
+        joint_k = torch.cat([txt_k, img_k], dim=1).flatten(2)
+        joint_v = torch.cat([txt_v, img_v], dim=1).flatten(2)
+        return joint_q, joint_k, joint_v
 
-        # SDPA expects (B, H, S, D); diffusers dispatch_attention_fn
-        # accepts (B, S, H, D) and transposes internally. Do the same.
-        joint_q = joint_q.transpose(1, 2)
-        joint_k = joint_k.transpose(1, 2)
-        joint_v = joint_v.transpose(1, 2)
+    def _prepare_qkv(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        fused_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._use_fused_qk_norm_rope(hidden_states, image_rotary_emb):
+            return self._prepare_qkv_fused(
+                hidden_states,
+                encoder_hidden_states,
+                image_rotary_emb,
+                fused_rotary_emb,
+            )
+        return self._prepare_qkv_unfused(hidden_states, encoder_hidden_states, image_rotary_emb)
 
-        attn_mask = None
-        if attention_mask is not None:
-            # attention_mask is (B, Sjoint) bool or float. Expand to
-            # (B, 1, 1, Sjoint) so SDPA broadcasts over (H, Sq).
-            # Qwen pads text embeddings before concatenating [text | image],
-            # so masked SDPA is required to ignore padded text tokens.
-            attn_mask = attention_mask[:, None, None, :]
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        fused_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        timestep: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        seq_txt = encoder_hidden_states.shape[1]
 
-        if attn_mask is None:
-            out = self._attn_impl(
-                joint_q.transpose(1, 2).flatten(2),
-                joint_k.transpose(1, 2).flatten(2),
-                joint_v.transpose(1, 2).flatten(2),
-                timestep=timestep,
+        joint_q, joint_k, joint_v = self._prepare_qkv(
+            hidden_states,
+            encoder_hidden_states,
+            image_rotary_emb,
+            fused_rotary_emb,
+        )
+
+        if attention_mask is None or self._supports_key_padding_mask:
+            attn_kwargs = {}
+            if attention_mask is not None:
+                attn_kwargs["key_padding_mask"] = attention_mask
+            out = self._attn_impl(joint_q, joint_k, joint_v, timestep=timestep, **attn_kwargs)
+        elif self._uses_sequence_parallel_attention:
+            raise NotImplementedError(
+                "Padded Qwen-Image prompts require a key-padding-mask-capable "
+                f"sequence-parallel attention backend, got {type(self.attn).__name__} "
+                f"wrapping {self.attn_backend}."
             )
         else:
+            attn_mask = attention_mask[:, None, None, :]
+            # SDPA expects (B, H, S, D); diffusers dispatch_attention_fn
+            # accepts (B, S, H, D) and transposes internally. Do the same.
+            joint_q = joint_q.unflatten(-1, (self.local_num_attention_heads, -1)).transpose(1, 2)
+            joint_k = joint_k.unflatten(-1, (self.local_num_key_value_heads, -1)).transpose(1, 2)
+            joint_v = joint_v.unflatten(-1, (self.local_num_key_value_heads, -1)).transpose(1, 2)
             out = F.scaled_dot_product_attention(
                 joint_q, joint_k, joint_v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
             )
@@ -699,6 +812,7 @@ class QwenImageTransformerBlock(nn.Module):
         )
 
     @staticmethod
+    @maybe_compile()
     def _modulate(x: torch.Tensor, mod_params: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         shift, scale, gate = mod_params.chunk(3, dim=-1)
         shift = shift.unsqueeze(1)
@@ -706,12 +820,22 @@ class QwenImageTransformerBlock(nn.Module):
         gate = gate.unsqueeze(1)
         return x * (1 + scale) + shift, gate
 
+    @staticmethod
+    @maybe_compile()
+    def _apply_gate_residual(
+        hidden_states: torch.Tensor,
+        gate: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> torch.Tensor:
+        return hidden_states + gate * residual
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        fused_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -730,20 +854,27 @@ class QwenImageTransformerBlock(nn.Module):
             hidden_states=img_modulated,
             encoder_hidden_states=txt_modulated,
             image_rotary_emb=image_rotary_emb,
+            fused_rotary_emb=fused_rotary_emb,
             attention_mask=attention_mask,
             timestep=timestep,
         )
 
         # Residual.
-        hidden_states = hidden_states + img_gate1 * img_attn_output
-        encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
+        hidden_states = self._apply_gate_residual(hidden_states, img_gate1, img_attn_output)
+        encoder_hidden_states = self._apply_gate_residual(
+            encoder_hidden_states, txt_gate1, txt_attn_output
+        )
 
         # Norm2 + MLP + residual.
         img_modulated2, img_gate2 = self._modulate(self.img_norm2(hidden_states), img_mod2)
-        hidden_states = hidden_states + img_gate2 * self.img_mlp(img_modulated2)
+        hidden_states = self._apply_gate_residual(
+            hidden_states, img_gate2, self.img_mlp(img_modulated2)
+        )
 
         txt_modulated2, txt_gate2 = self._modulate(self.txt_norm2(encoder_hidden_states), txt_mod2)
-        encoder_hidden_states = encoder_hidden_states + txt_gate2 * self.txt_mlp(txt_modulated2)
+        encoder_hidden_states = self._apply_gate_residual(
+            encoder_hidden_states, txt_gate2, self.txt_mlp(txt_modulated2)
+        )
 
         if encoder_hidden_states.dtype == torch.float16:
             encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
@@ -756,6 +887,32 @@ class QwenImageTransformerBlock(nn.Module):
 # ===========================================================================
 # Top-level transformer.
 # ===========================================================================
+
+
+def _is_qwen_sequence_parallel_attention(attn: Any) -> bool:
+    return isinstance(attn, (Attention2DAttention, RingAttention, UlyssesAttention))
+
+
+def _supports_qwen_key_padding_mask(attn_backend: str, attn: Any) -> bool:
+    return attn_backend == "VANILLA" and not isinstance(attn, (Attention2DAttention, RingAttention))
+
+
+def _build_joint_attention_mask(
+    encoder_hidden_states_mask: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    if encoder_hidden_states_mask is None:
+        return None
+    encoder_hidden_states_mask = encoder_hidden_states_mask.to(
+        device=hidden_states.device, dtype=torch.bool
+    )
+    batch_size, image_seq_len = hidden_states.shape[:2]
+    image_mask = torch.ones(
+        (batch_size, image_seq_len),
+        dtype=torch.bool,
+        device=hidden_states.device,
+    )
+    return torch.cat([encoder_hidden_states_mask, image_mask], dim=1)
 
 
 class QwenImageTransformer2DModel(BaseDiffusionModel):
@@ -792,6 +949,14 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         self.num_attention_heads = num_attention_heads
         self.joint_attention_dim = joint_attention_dim
         self.inner_dim = num_attention_heads * attention_head_dim
+
+        vgm = self.model_config.visual_gen_mapping
+        local_num_heads = num_attention_heads // self.model_config.mapping.tp_size
+        self.sharder = SequenceSharder.from_vgm(
+            vgm,
+            num_attention_heads=local_num_heads,
+            num_kv_heads=local_num_heads,
+        )
 
         self.pos_embed = QwenEmbedRope(theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True)
         self.time_text_embed = QwenTimestepProjEmbeddings(embedding_dim=self.inner_dim)
@@ -846,6 +1011,101 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
     @property
     def device(self) -> torch.device:
         return self.proj_out.weight.device
+
+    def _first_block_attn(self) -> Optional[QwenJointAttention]:
+        """Return the first real block attention through wrappers such as Cache-DiT."""
+        blocks = self.transformer_blocks
+        while blocks:
+            block = blocks[0]
+            attention = getattr(block, "attn", None)
+            if attention is not None:
+                return attention
+            blocks = getattr(block, "transformer_blocks", None)
+            if blocks is None:
+                raise AttributeError(
+                    f"Cannot resolve Qwen attention through {type(block).__name__}."
+                )
+        return None
+
+    def _shard_sequences(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states_mask: Optional[torch.Tensor],
+        image_rotary_emb: Tuple[torch.Tensor, torch.Tensor],
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        Tuple[torch.Tensor, torch.Tensor],
+        Optional[torch.Tensor],
+        int,
+    ]:
+        image_seq_len = hidden_states.shape[1]
+        if not self.sharder.is_active:
+            return (
+                hidden_states,
+                encoder_hidden_states,
+                image_rotary_emb,
+                _build_joint_attention_mask(encoder_hidden_states_mask, hidden_states),
+                image_seq_len,
+            )
+
+        text_seq_len = encoder_hidden_states.shape[1]
+        image_padding = (-image_seq_len) % self.sharder.size
+        text_padding = (-text_seq_len) % self.sharder.size
+        needs_mask = encoder_hidden_states_mask is not None or image_padding > 0 or text_padding > 0
+        first_block_attn = self._first_block_attn()
+        if (
+            needs_mask
+            and first_block_attn is not None
+            and not first_block_attn._supports_key_padding_mask
+        ):
+            raise NotImplementedError(
+                "Padded Qwen-Image sequence parallelism requires VANILLA Ulysses attention."
+            )
+
+        hidden_states = self.sharder.shard(hidden_states, dim=1, pad_to_multiple=True)
+        encoder_hidden_states = self.sharder.shard(
+            encoder_hidden_states, dim=1, pad_to_multiple=True
+        )
+        image_freqs, text_freqs = image_rotary_emb
+        image_rotary_emb = (
+            self.sharder.shard(image_freqs, dim=0, pad_to_multiple=True),
+            self.sharder.shard(text_freqs, dim=0, pad_to_multiple=True),
+        )
+
+        block_attention_mask = None
+        if needs_mask:
+            batch_size = hidden_states.shape[0]
+            if encoder_hidden_states_mask is None:
+                encoder_hidden_states_mask = torch.ones(
+                    (batch_size, text_seq_len),
+                    device=hidden_states.device,
+                    dtype=torch.bool,
+                )
+            else:
+                encoder_hidden_states_mask = encoder_hidden_states_mask.to(
+                    device=hidden_states.device, dtype=torch.bool
+                )
+            image_mask = torch.ones(
+                (batch_size, image_seq_len),
+                device=hidden_states.device,
+                dtype=torch.bool,
+            )
+            local_text_mask = self.sharder.shard(
+                encoder_hidden_states_mask, dim=1, pad_to_multiple=True
+            )
+            local_image_mask = self.sharder.shard(image_mask, dim=1, pad_to_multiple=True)
+            local_joint_mask = torch.cat([local_text_mask, local_image_mask], dim=1)
+            block_attention_mask = self.sharder.gather(local_joint_mask, dim=1)
+
+        return (
+            hidden_states,
+            encoder_hidden_states,
+            image_rotary_emb,
+            block_attention_mask,
+            image_seq_len,
+        )
 
     def _weight_loading_device(self) -> torch.device:
         for param in self.parameters():
@@ -1039,19 +1299,24 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         image_rotary_emb = self.pos_embed(
             img_shapes, max_txt_seq_len=text_seq_len, device=hidden_states.device
         )
-
-        # Build joint attention mask [text_mask | all-ones image_mask] once.
-        block_attention_mask = None
-        if encoder_hidden_states_mask is not None:
-            if encoder_hidden_states_mask.dtype != torch.bool:
-                encoder_hidden_states_mask = encoder_hidden_states_mask.to(torch.bool)
-            batch_size, image_seq_len = hidden_states.shape[:2]
-            image_mask = torch.ones(
-                (batch_size, image_seq_len),
-                dtype=torch.bool,
-                device=hidden_states.device,
-            )
-            block_attention_mask = torch.cat([encoder_hidden_states_mask, image_mask], dim=1)
+        (
+            hidden_states,
+            encoder_hidden_states,
+            image_rotary_emb,
+            block_attention_mask,
+            image_seq_len,
+        ) = self._shard_sequences(
+            hidden_states,
+            encoder_hidden_states,
+            encoder_hidden_states_mask,
+            image_rotary_emb,
+        )
+        fused_rotary_emb = None
+        first_block_attn = self._first_block_attn()
+        if first_block_attn is not None and first_block_attn._use_fused_qk_norm_rope(
+            hidden_states, image_rotary_emb
+        ):
+            fused_rotary_emb = qwen_joint_freqs_to_cos_sin(image_rotary_emb, hidden_states.shape[0])
 
         for block in self.transformer_blocks:
             encoder_hidden_states, hidden_states = block(
@@ -1059,10 +1324,12 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
                 encoder_hidden_states=encoder_hidden_states,
                 temb=temb,
                 image_rotary_emb=image_rotary_emb,
+                fused_rotary_emb=fused_rotary_emb,
                 attention_mask=block_attention_mask,
                 timestep=timestep,
             )
 
+        hidden_states = self.sharder.gather(hidden_states, dim=1, unpad_to=image_seq_len)
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
 
