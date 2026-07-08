@@ -183,7 +183,16 @@ jit::CubinObjKey DecoderXQARunner::getCubinObjKeyFromXQAParams(XQAParams const& 
     loadKey.sm = mSM;
 
     XQAKernelRuntimeHashKey runtimeKey = getRuntimeHashKeyFromXQAParams(xqaParams, mSM);
-    return {loadKey, runtimeKey};
+    // Mirror the JIT compile-context inputs that runtimeKey does not capture
+    // (see CompileEngine::compile): generation_input_length feeds the kernel's
+    // q_seq_len compile parameter, and is_spec_dec_tree / skip-softmax select
+    // different kernel code. Without them, cubins compiled for a different
+    // spec-dec config could be fetched from the process-global registry.
+    unsigned int const qSeqLen
+        = xqaParams.multi_query_tokens ? static_cast<unsigned int>(xqaParams.generation_input_length) : 0U;
+    bool const isSpecDecTree = xqaParams.multi_query_tokens && xqaParams.is_spec_dec_tree;
+    bool const useSkipSoftmaxAttn = xqaParams.skip_softmax_threshold_scale_factor != 0;
+    return {loadKey, runtimeKey, qSeqLen, isSpecDecTree, useSkipSoftmaxAttn};
 }
 
 void DecoderXQARunner::prepareForActualXQAParams(XQAParams const& xqaParams)

@@ -160,16 +160,31 @@ struct XQAKernelRuntimeHasher
 };
 
 // XQA kernel can be uniquely identified by (LoadHashKey, RuntimeHashKey).
+// The JIT compile context (see CompileEngine::compile) additionally depends on
+// inputs that RuntimeHashKey does not capture: the spec-dec q_seq_len (only
+// bucketed into m_tilesize), is_spec_dec_tree, and skip-softmax. Two XQA
+// configs that fold into the same RuntimeHashKey (e.g. spec-dec q_seq_len 7
+// and 61 both map to m_tilesize 32) would otherwise share one cubin registry
+// slot, and the second config would launch a cubin compiled for the first
+// config's q_seq_len, failing with CUDA_ERROR_INVALID_VALUE. Keep these fields
+// in the full key so the registry key is a superset of the JIT compile inputs.
 struct XQAKernelFullHashKey
 {
     XQAKernelLoadHashKey load_key;
     XQAKernelRuntimeHashKey runtime_key;
+    unsigned int q_seq_len = 0;
+    bool is_spec_dec_tree = false;
+    bool use_skip_softmax_attn = false;
 
     XQAKernelFullHashKey() = default;
 
-    XQAKernelFullHashKey(XQAKernelLoadHashKey const& loadKey, XQAKernelRuntimeHashKey const& runtimeKey)
+    XQAKernelFullHashKey(XQAKernelLoadHashKey const& loadKey, XQAKernelRuntimeHashKey const& runtimeKey,
+        unsigned int qSeqLen = 0, bool isSpecDecTree = false, bool useSkipSoftmaxAttn = false)
         : load_key(loadKey)
         , runtime_key(runtimeKey)
+        , q_seq_len(qSeqLen)
+        , is_spec_dec_tree(isSpecDecTree)
+        , use_skip_softmax_attn(useSkipSoftmaxAttn)
     {
     }
 
@@ -181,7 +196,8 @@ struct XQAKernelFullHashKey
 
     bool operator==(XQAKernelFullHashKey const& other) const
     {
-        return load_key == other.load_key && runtime_key == other.runtime_key;
+        return load_key == other.load_key && runtime_key == other.runtime_key && q_seq_len == other.q_seq_len
+            && is_spec_dec_tree == other.is_spec_dec_tree && use_skip_softmax_attn == other.use_skip_softmax_attn;
     }
 
     size_t getSerializationSize() const
@@ -200,7 +216,12 @@ struct XQAKernelFullHasher
 {
     size_t operator()(XQAKernelFullHashKey const& s) const
     {
-        return XQAKernelLoadHasher()(s.load_key) ^ XQAKernelRuntimeHasher()(s.runtime_key);
+        size_t key = XQAKernelLoadHasher()(s.load_key) ^ XQAKernelRuntimeHasher()(s.runtime_key);
+        key <<= 17; // q_seq_len fits in 17 bits (max_num_tokens-scale values).
+        key ^= s.q_seq_len;
+        key <<= 2;
+        key ^= (static_cast<size_t>(s.is_spec_dec_tree) << 1) | static_cast<size_t>(s.use_skip_softmax_attn);
+        return key;
     }
 };
 
