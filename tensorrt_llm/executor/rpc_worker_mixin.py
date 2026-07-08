@@ -147,6 +147,11 @@ class RpcWorkerMixin:
         # Serialize stats before sending over RPC (IterationStats objects are not picklable)
         return [self._stats_serializer(s) for s in stats]
 
+    async def fetch_kv_cache_capacity_async(self) -> str:
+        """Async version of fetch_kv_cache_capacity using asyncio.to_thread."""
+        capacity = await asyncio.to_thread(self.fetch_kv_cache_capacity)
+        return self._kv_cache_capacity_serializer(capacity)
+
     async def fetch_kv_cache_events_async(self, timeout: Optional[float] = None) -> list:
         """Async version of fetch_kv_cache_events using asyncio.to_thread.
 
