@@ -17,6 +17,7 @@ from typing import List, Optional, Sequence
 
 import torch
 
+from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._utils import (
     TensorWrapper,
     binding_to_torch_dtype,
@@ -27,14 +28,10 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, LayerId
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
+from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
 from tensorrt_llm.runtime.kv_cache_manager_v2._utils import typed_range
 
-from ....pyexecutor.kv_cache_manager_v2 import (
-    DisaggCacheLayout,
-    DisaggPoolViewConfig,
-    KVCacheManagerV2,
-    Role,
-)
+from ....pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
 
 
 class MiniMaxM3SparseIndexCache:
@@ -226,12 +223,12 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             if layer_id in self.layer_offsets
         }
 
-    def get_disagg_pool_view_config(self) -> DisaggPoolViewConfig:
+    def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
         """Declare MiniMax M3's token-major K/V and replicated index-K."""
-        return DisaggPoolViewConfig(
-            sharded_layout=DisaggCacheLayout.NHD,
-            replicated_roles=frozenset({Role.INDEX_KEY}),
-        )
+        return {
+            Role.ALL: MapperKind.NHD,
+            Role.INDEX_KEY: MapperKind.REPLICATED,
+        }
 
     def _compute_num_total_slots(self) -> int:
         """Total token slots across all blocks in the main K pool.

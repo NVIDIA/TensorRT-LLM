@@ -21,15 +21,19 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     PoolView,
 )
 from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import DisaggCacheLayout
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes, nvtx_range
 from tensorrt_llm.bindings import DataType
 
-_LAYOUT_TO_MAPPER = {
-    DisaggCacheLayout.NHD: MapperKind.NHD,
-}
+_V2_ROLE_MAPPER_KINDS = frozenset(
+    {
+        MapperKind.INDEXED,
+        MapperKind.REPLICATED,
+        MapperKind.NHD,
+    }
+)
 
 
 class KVRegionExtractorV1(RegionExtractorBase):
@@ -332,22 +336,33 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
         buffer_ids_by_lc_layer[(int(lc_id), int(layer_id))].append(buffer_id)
         native_roles_by_pool[pool_key].add(str(role))
 
-    # V2 managers opt into model-specific logical views through
-    # get_disagg_pool_view_config()/DisaggPoolViewConfig. This keeps shared
-    # disaggregation independent of private model attributes and role names,
-    # and ensures dense-only PP ranks use the same scheme as sparse ranks even
-    # when no replicated role is locally allocated.
-    view_config = manager.get_disagg_pool_view_config()
-    sharded_mapper_kind = None
-    if view_config is not None:
-        sharded_mapper_kind = _LAYOUT_TO_MAPPER.get(view_config.sharded_layout)
-        if sharded_mapper_kind is None:
-            supported = ", ".join(layout.value for layout in _LAYOUT_TO_MAPPER)
+    # Every V2 manager declares how native roles map to the closed set of
+    # disaggregation mappers. Role.ALL is the fallback for future/native roles
+    # unknown to this shared extractor. An all-INDEXED mapping preserves the
+    # legacy whole-slot page table; any logical mapper opts every PP rank into
+    # per-layer views, even when that rank has no local buffer of the overriding
+    # role (for example, a dense-only MiniMax rank without INDEX_KEY).
+    role_mapper_kinds = manager.get_disagg_role_mapper_kinds()
+    if Role.ALL not in role_mapper_kinds:
+        raise ValueError("Disaggregation role mapping must define Role.ALL")
+    for role, mapper_kind in role_mapper_kinds.items():
+        if not isinstance(mapper_kind, MapperKind):
             raise ValueError(
-                "Unsupported disaggregation sharded layout "
-                f"{view_config.sharded_layout!r}; supported layouts: {supported}"
+                f"Invalid disaggregation mapper kind {mapper_kind!r} for role {role!s}"
             )
-    replicated_roles = view_config.replicated_roles if view_config is not None else frozenset()
+        if mapper_kind not in _V2_ROLE_MAPPER_KINDS:
+            supported = ", ".join(kind.name for kind in sorted(_V2_ROLE_MAPPER_KINDS))
+            raise ValueError(
+                f"Unsupported V2 disaggregation mapper kind {mapper_kind.name} "
+                f"for role {role!s}; supported kinds: {supported}"
+            )
+    if MapperKind.INDEXED in role_mapper_kinds.values() and role_mapper_kinds != {
+        Role.ALL: MapperKind.INDEXED
+    }:
+        raise ValueError("MapperKind.INDEXED is only valid as the sole Role.ALL mapping")
+    default_mapper_kind = role_mapper_kinds[Role.ALL]
+    mapper_kind_order = list(dict.fromkeys(role_mapper_kinds.values()))
+    use_logical_views = any(kind != MapperKind.INDEXED for kind in mapper_kind_order)
 
     # Iterate over life cycles (layer groups), not storage pool groups.
     # Multiple layer_groups can share the same storage pool_group when their
@@ -399,7 +414,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
         ]
 
         pool_views = []
-        if view_config is not None:
+        if use_logical_views:
             # Depending on topology, replicated side caches may occupy their
             # own physical pools or be coalesced with sharded K/V. Describe
             # each layer and role class as a logical byte range so matching is
@@ -407,13 +422,13 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
             physical_pools = pool_groups[storage_pg_to_list_idx[storage_pg_idx]].pools
             for layer_id in all_internal_layer_ids:
                 layer_buffers = buffer_ids_by_lc_layer.get((lc_idx, int(layer_id)), [])
-                standard_buffers = [b for b in layer_buffers if b[1] not in replicated_roles]
-                replicated_buffers = [b for b in layer_buffers if b[1] in replicated_roles]
+                buffers_by_mapper_kind: Dict[MapperKind, list] = defaultdict(list)
+                for buffer_id in layer_buffers:
+                    mapper_kind = role_mapper_kinds.get(buffer_id[1], default_mapper_kind)
+                    buffers_by_mapper_kind[mapper_kind].append(buffer_id)
 
-                for buffers, mapper_kind in (
-                    (standard_buffers, sharded_mapper_kind),
-                    (replicated_buffers, MapperKind.REPLICATED),
-                ):
+                for mapper_kind in mapper_kind_order:
+                    buffers = buffers_by_mapper_kind.get(mapper_kind, [])
                     if not buffers:
                         continue
                     for desc in manager.impl.get_aggregated_pages(buffers):

@@ -18,12 +18,9 @@ import torch
 from tensorrt_llm import Mapping
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import MiniMaxM3KVCacheManagerV2
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
+from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool, get_pool_bytes
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
-    DisaggCacheLayout,
-    KVCacheManagerV2,
-    Role,
-)
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
@@ -71,13 +68,21 @@ def test_minimax_cache_indices_support_block_count_limit() -> None:
     ]
 
 
-def test_minimax_disagg_pool_view_capability() -> None:
+def test_v2_disagg_role_mapper_kind_defaults() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+
+    assert manager.get_disagg_role_mapper_kinds() == {Role.ALL: MapperKind.INDEXED}
+
+
+def test_minimax_disagg_role_mapper_kinds() -> None:
     manager = object.__new__(MiniMaxM3KVCacheManagerV2)
 
-    config = manager.get_disagg_pool_view_config()
+    role_mapper_kinds = manager.get_disagg_role_mapper_kinds()
 
-    assert config.sharded_layout is DisaggCacheLayout.NHD
-    assert config.replicated_roles == frozenset({Role.INDEX_KEY})
+    assert role_mapper_kinds == {
+        Role.ALL: MapperKind.NHD,
+        Role.INDEX_KEY: MapperKind.REPLICATED,
+    }
 
 
 def test_minimax_disagg_rejects_unmanaged_index_value(monkeypatch) -> None:

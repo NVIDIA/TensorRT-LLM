@@ -24,6 +24,7 @@ import numpy as np
 import torch
 from strenum import StrEnum
 
+from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._utils import (
     TensorWrapper,
@@ -218,37 +219,6 @@ class ConversationManager:
     def clear(self) -> None:
         """Clear state after reusable KV-cache blocks have been cleared."""
         self._conversation_states.clear()
-
-
-class DisaggCacheLayout(StrEnum):
-    NHD = "NHD"
-
-
-class DisaggPoolViewConfig(NamedTuple):
-    """Describe model-specific V2 cache views to native disaggregation.
-
-    ``sharded_layout`` describes non-replicated storage; ``NHD`` means
-    token-major ``[token, head, dim]`` bytes and requires token-granular head
-    remapping when peer topologies differ. ``replicated_roles`` identifies
-    side caches that contain the same bytes on every TP rank. Those regions
-    use a strict 1:1 byte copy with no KV-head remapping, and
-    :meth:`PeerRegistrar.should_send_pool` elects one sender during TP fan-in.
-
-    Returning this capability asks the generic page-table builder to expose
-    per-layer, per-role-class logical views instead of opaque whole-slot views.
-
-    Scope: ``sharded_layout`` asserts what the manager's *paired attention
-    backend* actually writes; the pool memory itself is layout-agnostic (see
-    :meth:`KVCacheManagerV2.get_buffers`). Declaring it statically is only
-    valid when the manager and backend form a fixed pair with one layout
-    (e.g. MiniMax M3's sparse backend, always token-major). A manager whose
-    backend selects the layout at runtime (e.g. FlashInfer NHD/HND) must
-    derive this value from the backend configuration instead of hardcoding
-    it.
-    """
-
-    sharded_layout: DisaggCacheLayout
-    replicated_roles: frozenset[DataRole]
 
 
 def _estimate_full_attn_size_per_token(
@@ -1836,16 +1806,23 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         return None
 
-    def get_disagg_pool_view_config(self) -> Optional[DisaggPoolViewConfig]:
-        """Return an explicit logical-pool contract for disaggregation.
+    def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
+        """Map native cache roles to disaggregation mapper kinds.
 
-        The default ``None`` preserves the legacy whole-slot page table.
-        Model-specific managers may return :class:`DisaggPoolViewConfig`
-        without requiring the shared extractor to inspect private attributes
-        or role names. MiniMax M3, for example, declares NHD K/V plus a
-        replicated index-key side cache.
+        ``Role.ALL`` is the required fallback for roles without an explicit
+        entry. The default preserves the legacy whole-slot ``INDEXED`` page
+        table. Model-specific managers may declare logical layouts without
+        requiring the shared extractor to inspect private attributes or role
+        names. MiniMax M3, for example, maps ordinary K/V to ``NHD`` and its
+        replicated index-key side cache to ``REPLICATED``.
+
+        Pool memory is layout-agnostic; this declaration describes what the
+        manager's paired attention backend actually writes. A static mapping
+        is valid only for a fixed manager/backend pair. A manager whose backend
+        selects the layout at runtime must derive the mapping from that
+        backend's configuration.
         """
-        return None
+        return {Role.ALL: MapperKind.INDEXED}
 
     @property
     def blocks_in_primary_pool(self) -> int:

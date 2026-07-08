@@ -9,6 +9,7 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 as kv_cache_manager_v2_module
+from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
     BlockReusePolicy,
     KVCacheManagerV2,
@@ -551,7 +552,7 @@ def test_prepare_page_table_uses_subclass_pool_mapping(monkeypatch):
     assert manager.host_kv_cache_block_offsets.shape == (1, 2, 2, 4)
 
 
-def test_disagg_pool_view_capability_defaults_to_none():
+def test_disagg_role_mapper_kinds_default_to_indexed():
     manager = object.__new__(KVCacheManagerV2)
 
-    assert manager.get_disagg_pool_view_config() is None
+    assert manager.get_disagg_role_mapper_kinds() == {Role.ALL: MapperKind.INDEXED}

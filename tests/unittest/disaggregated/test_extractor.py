@@ -16,11 +16,7 @@ from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_physical_pool,
     get_unique_layers,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
-    DisaggCacheLayout,
-    DisaggPoolViewConfig,
-    Role,
-)
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     CacheTypeCpp,
     DataType,
@@ -342,10 +338,10 @@ def test_v2_index_key_builder_emits_per_layer_logical_views():
         impl=FakeImpl(),
         pp_layers=[0, 1],
         num_kv_heads_per_layer=[1, 1],
-        get_disagg_pool_view_config=lambda: DisaggPoolViewConfig(
-            sharded_layout=DisaggCacheLayout.NHD,
-            replicated_roles=frozenset({Role.INDEX_KEY}),
-        ),
+        get_disagg_role_mapper_kinds=lambda: {
+            Role.ALL: MapperKind.NHD,
+            Role.INDEX_KEY: MapperKind.REPLICATED,
+        },
     )
 
     page_table = build_page_table_from_manager(manager)
@@ -377,7 +373,7 @@ def test_v2_index_key_builder_emits_per_layer_logical_views():
         impl=dense_impl,
         pp_layers=[0, 1],
         num_kv_heads_per_layer=[1, 1],
-        get_disagg_pool_view_config=manager.get_disagg_pool_view_config,
+        get_disagg_role_mapper_kinds=manager.get_disagg_role_mapper_kinds,
     )
     dense_views = build_page_table_from_manager(dense_manager).layer_groups[0].pool_views
     assert len(dense_views) == 2
@@ -390,7 +386,7 @@ def test_v2_index_key_builder_emits_per_layer_logical_views():
         pp_layers=[0, 1],
         num_kv_heads_per_layer=[1, 1],
         sparse_layer_ids=[3],
-        get_disagg_pool_view_config=lambda: None,
+        get_disagg_role_mapper_kinds=lambda: {Role.ALL: MapperKind.INDEXED},
     )
     accidental_views = build_page_table_from_manager(accidental_manager).layer_groups[0].pool_views
     assert len(accidental_views) == 1
@@ -404,20 +400,47 @@ def test_v2_index_key_builder_emits_per_layer_logical_views():
         pp_layers=[0, 1],
         num_kv_heads_per_layer=[1, 1],
     )
-    with pytest.raises(AttributeError, match="get_disagg_pool_view_config"):
+    with pytest.raises(AttributeError, match="get_disagg_role_mapper_kinds"):
         build_page_table_from_manager(missing_capability_manager)
 
-    invalid_layout_manager = SimpleNamespace(
+    missing_default_manager = SimpleNamespace(
         impl=FakeImpl(),
         pp_layers=[0, 1],
         num_kv_heads_per_layer=[1, 1],
-        get_disagg_pool_view_config=lambda: DisaggPoolViewConfig(
-            sharded_layout="HND",
-            replicated_roles=frozenset({Role.INDEX_KEY}),
-        ),
+        get_disagg_role_mapper_kinds=lambda: {Role.INDEX_KEY: MapperKind.REPLICATED},
     )
-    with pytest.raises(ValueError, match="Unsupported disaggregation sharded layout 'HND'"):
-        build_page_table_from_manager(invalid_layout_manager)
+    with pytest.raises(ValueError, match="must define Role.ALL"):
+        build_page_table_from_manager(missing_default_manager)
+
+    invalid_mapper_manager = SimpleNamespace(
+        impl=FakeImpl(),
+        pp_layers=[0, 1],
+        num_kv_heads_per_layer=[1, 1],
+        get_disagg_role_mapper_kinds=lambda: {Role.ALL: "HND"},
+    )
+    with pytest.raises(ValueError, match="Invalid disaggregation mapper kind 'HND'"):
+        build_page_table_from_manager(invalid_mapper_manager)
+
+    unsupported_mapper_manager = SimpleNamespace(
+        impl=FakeImpl(),
+        pp_layers=[0, 1],
+        num_kv_heads_per_layer=[1, 1],
+        get_disagg_role_mapper_kinds=lambda: {Role.ALL: MapperKind.FLAT},
+    )
+    with pytest.raises(ValueError, match="Unsupported V2 disaggregation mapper kind FLAT"):
+        build_page_table_from_manager(unsupported_mapper_manager)
+
+    mixed_indexed_manager = SimpleNamespace(
+        impl=FakeImpl(),
+        pp_layers=[0, 1],
+        num_kv_heads_per_layer=[1, 1],
+        get_disagg_role_mapper_kinds=lambda: {
+            Role.ALL: MapperKind.NHD,
+            Role.KEY: MapperKind.INDEXED,
+        },
+    )
+    with pytest.raises(ValueError, match="INDEXED is only valid as the sole Role.ALL mapping"):
+        build_page_table_from_manager(mixed_indexed_manager)
 
 
 def test_mamba_layer_group_serialization():
