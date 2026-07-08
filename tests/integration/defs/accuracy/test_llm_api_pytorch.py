@@ -855,6 +855,35 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
     @skip_pre_hopper
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
+    def test_guided_decoding_with_eagle3_low_latency_dispatch(
+            self, backend: str, mocker):
+        """Smoke-test enable_low_latency_host_dispatch with Eagle3 + guided decoding.
+
+        Eagle3 spec-dec captures guided-decoder hostfuncs inside the CUDA graph
+        (via _execute_guided_decoder_if_present in the target forward pass), so
+        this combination exercises the cudaLaunchHostFunc_v2 / spin-wait path.
+        """
+        mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
+        cuda_graph_config = CudaGraphConfig(enable_padding=True)
+        spec_config = Eagle3DecodingConfig(
+            max_draft_len=3,
+            speculative_model=f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B",
+            eagle3_one_model=True)
+        llm = LLM(self.MODEL_PATH,
+                  guided_decoding_backend=backend,
+                  kv_cache_config=kv_cache_config,
+                  cuda_graph_config=cuda_graph_config,
+                  enable_chunked_prefill=True,
+                  max_num_tokens=256,
+                  speculative_config=spec_config,
+                  enable_low_latency_host_dispatch=True)
+        with llm:
+            task = JsonModeEval(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_hopper
+    @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
     def test_guided_decoding_with_ngram(self, backend: str, mocker):
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
