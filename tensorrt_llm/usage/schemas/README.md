@@ -217,19 +217,6 @@ over time.
 
 ## For Developers: Adding a New Field
 
-### If the LLM args telemetry manifest test fails
-
-The failure is an intentional privacy gate. From the TensorRT-LLM repository root, run exactly:
-
-```bash
-python3 scripts/generate_llm_args_golden_manifest.py
-```
-
-Review and commit `tensorrt_llm/usage/llm_args_golden_manifest.json`. Do not accept the generated
-diff blindly: it is the privacy review for every newly capturable field and requires approval from
-the telemetry/privacy CODEOWNER. If a field is captured unexpectedly, correct its annotation or
-telemetry metadata instead of approving the generated diff.
-
 Checklist for adding a telemetry field:
 
 1. **`tensorrt_llm/usage/schema.py`** — Add field to `TrtllmInitialReport` (or `TrtllmHeartbeat`) Pydantic model with alias.
@@ -263,10 +250,8 @@ Checklist for adding an LLM API config capture field inside `llmApiConfigJson`:
    coverage: assert the value is captured, and for a categorical bare-string
    field assert that an out-of-allowlist value is redacted (dropped) while an
    in-allowlist value is captured.
-6. **Regenerate the manifest golden** from `build_capture_manifest`:
+6. **Regenerate the manifest golden**:
    `python3 scripts/generate_llm_args_golden_manifest.py`
-   To validate without modifying the committed file, run
-   `python3 scripts/generate_llm_args_golden_manifest.py --check`.
    Review the golden diff — **it is the privacy review.** A newly captured field
    requires sign-off from the GitHub telemetry/privacy CODEOWNER (`.github/CODEOWNERS`).
 7. **`docs/source/developer-guide/telemetry.md` is generated** from the committed

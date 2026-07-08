@@ -269,13 +269,9 @@ def _assert_committed_manifest_current(
     if result.returncode != 0:
         sys.stderr.write(result.stderr)
         raise AssertionError(
-            "The committed LLM args telemetry manifest is stale.\n\n"
-            "FIX: From the TensorRT-LLM repository root, run exactly:\n\n"
-            "  python3 scripts/generate_llm_args_golden_manifest.py\n\n"
-            "Then review and commit:\n"
-            "  tensorrt_llm/usage/llm_args_golden_manifest.json\n\n"
-            "Do not update the golden blindly. Its diff is the privacy review for every newly "
-            "capturable field and requires approval from the telemetry/privacy CODEOWNER."
+            "The LLM args telemetry manifest is stale; run "
+            "`python3 scripts/generate_llm_args_golden_manifest.py`, then review and commit "
+            "`tensorrt_llm/usage/llm_args_golden_manifest.json` with telemetry/privacy CODEOWNER approval."
         )
 
 
@@ -290,23 +286,14 @@ def test_committed_golden_failure_gives_exact_regeneration_command():
         )
 
     assert str(failure.value) == (
-        "The committed LLM args telemetry manifest is stale.\n\n"
-        "FIX: From the TensorRT-LLM repository root, run exactly:\n\n"
-        "  python3 scripts/generate_llm_args_golden_manifest.py\n\n"
-        "Then review and commit:\n"
-        "  tensorrt_llm/usage/llm_args_golden_manifest.json\n\n"
-        "Do not update the golden blindly. Its diff is the privacy review for every newly "
-        "capturable field and requires approval from the telemetry/privacy CODEOWNER."
+        "The LLM args telemetry manifest is stale; run "
+        "`python3 scripts/generate_llm_args_golden_manifest.py`, then review and commit "
+        "`tensorrt_llm/usage/llm_args_golden_manifest.json` with telemetry/privacy CODEOWNER approval."
     )
 
 
 def test_build_capture_manifest_matches_committed_golden():
-    """The CI privacy gate (closes TRTLLM-12872).
-
-    Regenerate in a fresh Python process and diff against the committed golden;
-    any drift ('field X now phones home') must be a deliberate, privacy-reviewed
-    golden update committed in the same change.
-    """
+    """The premerge privacy gate (closes TRTLLM-12872)."""
     _assert_committed_manifest_current()
 
 
@@ -437,7 +424,6 @@ def test_renderer_emits_table_from_committed_golden(tmp_path):
     generator.generate_telemetry_reference(_repo_root(), out)
     text = out.read_text()
     assert "## LLM API Configuration Fields" in text
-    assert "## When the Premerge Manifest Check Fails" in text
     assert "python3 scripts/generate_llm_args_golden_manifest.py" in text
     assert "explicitly marked" not in text  # opt-in prose must be gone
     assert "`backend`" in text  # a known captured key renders

@@ -13,9 +13,8 @@ Python and C++ codebase supporting TensorRT engine-based and PyTorch-based execu
 - `git commit -s` (DCO sign-off required). Never attribute AI tools in sign-off line. Always rely on `git` to do the sign off instead of directly adding sign off in commit message.
 - Do not add co-authors to the git commit message unless explicitly instructed to do so by the user.
 - `pre-commit` hooks run on commit — if files are modified by hooks, re-stage and commit again
-- Changes to `BaseLlmArgs`, `TorchLlmArgs`, `TrtLlmArgs`, or any nested configuration type **MUST**
-  regenerate the telemetry manifest with `python3 scripts/generate_llm_args_golden_manifest.py`;
-  review and commit the privacy-sensitive golden diff
+- LLM args or nested-config changes must run `python3 scripts/generate_llm_args_golden_manifest.py` and commit
+  `tensorrt_llm/usage/llm_args_golden_manifest.json`; new fields require telemetry/privacy CODEOWNER approval
 - PR title format: `[JIRA/NVBUG/None][type] description` (e.g., `[TRTLLM-5516][perf] optimize cuda graph padding`)
 - Set `LLM_MODELS_ROOT` env var when running tests that need model weights
 
@@ -26,7 +25,6 @@ Python and C++ codebase supporting TensorRT engine-based and PyTorch-based execu
 | Unit tests | `pytest tests/unittest/` |
 | Specific test | `pytest tests/unittest/llmapi/test_llm_args.py` |
 | Pattern match | `pytest tests/unittest -k "test_llm_args"` |
-| Regenerate LLM args telemetry manifest | `python3 scripts/generate_llm_args_golden_manifest.py` |
 | Integration tests | `LLM_MODELS_ROOT=/path/to/models pytest tests/integration/defs/...` |
 | Serve model | `trtllm-serve <hf_model> --port 8000` |
 | Serve with config | `trtllm-serve <hf_model> --config config.yaml` |
@@ -176,15 +174,6 @@ For a full list of up-to-date bot commands, post `/bot help` as a PR comment and
 
 ### Trouble Shooting
 
-- **LLM args telemetry manifest failure:** This is an intentional privacy gate. From the TensorRT-LLM
-  repository root, run exactly:
-
-  ```bash
-  python3 scripts/generate_llm_args_golden_manifest.py
-  ```
-
-  Review and commit `tensorrt_llm/usage/llm_args_golden_manifest.json`. Do not accept the generated
-  diff blindly: every newly captured field requires approval from the telemetry/privacy CODEOWNER.
 - Use `TLLM_LOG_LEVEL_BY_MODULE` to enable per-module log filtering (e.g., `"debug:_torch,runtime;info:serve"`); see [Module-Level Logging](docs/source/developer-guide/overview.md#module-level-logging) for details.
 
 ## Key Documentation
