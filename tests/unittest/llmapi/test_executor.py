@@ -2,6 +2,7 @@ import asyncio
 import datetime
 import tempfile
 import threading
+import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from tensorrt_llm.executor import (DetokenizedGenerationResultBase,
                                    GenerationRequest, GenerationResult,
                                    GenerationResultBase, PostprocWorker)
 from tensorrt_llm.executor.ipc import FusedIpcQueue, ZeroMqQueue
+from tensorrt_llm.executor.utils import ErrorResponse
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -113,6 +115,64 @@ def test_GenerationResult():
     result._handle_response(create_rsp(44, finished=True))
     assert len(result.outputs[0].token_ids) == 12
     assert result._done
+
+
+def test_result_timeout_raises():
+    request = GenerationRequest(prompt_token_ids=[12, 23, 34],
+                                sampling_params=SamplingParams(max_tokens=4))
+    result = GenerationResult(request)
+
+    # Queue stays empty (no worker pushing responses) -> must time out fast, not block indefinitely.
+    start = time.monotonic()
+    with pytest.raises(TimeoutError):
+        result.result(timeout=0.1)
+    elapsed = time.monotonic() - start
+    assert elapsed < 2.0, f"result() did not honor timeout (took {elapsed:.2f}s)"
+    assert not result._done
+
+
+def test_result_timeout_budget_across_steps():
+    request = GenerationRequest(prompt_token_ids=[12, 23, 34],
+                                sampling_params=SamplingParams(max_tokens=4))
+    result = GenerationResult(request)
+
+    # A single non-final response is available, then the queue goes empty and the request never
+    # completes.
+    result.queue.put(create_rsp(33, finished=False))
+
+    start = time.monotonic()
+    with pytest.raises(TimeoutError):
+        result.result(timeout=0.1)
+    elapsed = time.monotonic() - start
+    assert elapsed < 2.0, f"result() did not honor timeout (took {elapsed:.2f}s)"
+    assert not result._done
+
+
+def test_result_wakes_on_error_response():
+    request = GenerationRequest(prompt_token_ids=[12, 23, 34],
+                                sampling_params=SamplingParams(max_tokens=4))
+    result = GenerationResult(request)
+
+    result.queue.put(ErrorResponse(0, "Executor worker died: boom", 0))
+
+    # Generous timeout: this must return via the ErrorResponse well before it.
+    result.result(timeout=30.0)
+    assert result._done
+    assert result._error_msg == "Executor worker died: boom"
+
+
+def test_result_completes_within_timeout():
+    request = GenerationRequest(prompt_token_ids=[12, 23, 34],
+                                sampling_params=SamplingParams(max_tokens=4))
+    result = GenerationResult(request)
+
+    result.queue.put(create_rsp(33, finished=False))
+    result.queue.put(create_rsp(44, finished=True))
+
+    ret = result.result(timeout=30.0)
+    assert ret is result
+    assert result._done
+    assert len(result.outputs[0].token_ids) == 2
 
 
 def test_DetokenizedGenerationResultBase():

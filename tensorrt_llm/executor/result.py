@@ -995,7 +995,11 @@ class GenerationResult(GenerationResultBase):
         return response
 
     def _result_step(self, timeout: Optional[float] = None):
-        response = self.queue.get()
+        # Honor `timeout`: a bounded `queue.get()` lets the caller regain control if the executor
+        # worker dies silently without pushing a terminal response, instead of blocking potentially
+        # indefinitely.
+        # Raises `queue.Empty` on timeout; `result()` turns that into a `TimeoutError`.
+        response = self.queue.get(timeout=timeout)
         # Fast-fail: when a worker dies, the proxy enqueues EngineDeadError onto
         # every pending result so this get() unblocks instead of hanging forever
         # on a queue whose producer is gone. Record it as the sticky terminal
@@ -1022,15 +1026,34 @@ class GenerationResult(GenerationResultBase):
         """Wait for the completion of the request, and return the result.
 
         Args:
-            timeout (float, optional): Timeout. Defaults to None.
+            timeout (float, optional): The maximum number of seconds to wait for the request to
+                complete. `None` (default) waits indefinitely.
+                The timeout is a total budget across all streaming steps, not per-step.
 
         Returns:
             tensorrt_llm.executor.result.GenerationResult: generation result.
+
+        Raises:
+            TimeoutError: If the request does not complete within `timeout` seconds. Bounding the
+                wait prevents a silently-dead executor worker from hanging the caller forever.
         """
         if self._terminal_error is not None:
             raise self._terminal_error
+        deadline = None if timeout is None else time.time() + timeout
         while not self._done:
-            self._result_step(timeout)
+            remaining = None
+            if deadline is not None:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"Request {self.request_id} did not complete within "
+                        f"{timeout} seconds.")
+            try:
+                self._result_step(remaining)
+            except Empty:
+                raise TimeoutError(
+                    f"Request {self.request_id} did not complete within "
+                    f"{timeout} seconds.")
         return self
 
     async def aresult(self) -> "GenerationResult":

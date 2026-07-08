@@ -18,7 +18,7 @@ import weakref
 from contextlib import nullcontext
 from functools import wraps
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue
 from typing import (Any, Callable, ContextManager, Iterable, List, Optional,
                     Tuple, Type, get_type_hints)
 
@@ -535,6 +535,9 @@ class _SyncQueue:
                 return self._aq.unsafe_get()
             except asyncio.QueueEmpty:
                 time.sleep(0.01)
+        # Timed out. Raise `Empty` to match `queue.Queue.get()` semantics; a silent `None` return
+        # would be mis-handled downstream as an unknown response type.
+        raise Empty()
 
 
 def get_numa_aware_cpu_affinity(device_id):
