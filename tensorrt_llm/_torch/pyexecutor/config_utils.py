@@ -540,6 +540,9 @@ def _normalize_chatglm_config(
     set_if_absent("rms_norm_eps",
                   getattr(model_config, "layernorm_epsilon", None))
     set_if_absent("partial_rotary_factor", 0.5)
+    # ChatGLM3/GLM-4 fold rope_ratio into the rotary base (theta *= rope_ratio),
+    # matching the legacy converter. ChatGLM2 instead maps rope_ratio to a linear
+    # position-scaling factor; that variant is out of scope for this decoder.
     rope_ratio = getattr(model_config, "rope_ratio", None)
     if rope_ratio is None:
         rope_ratio = 1.0
