@@ -437,10 +437,17 @@ class KvCacheCreator:
                     num_layers=self._get_num_draft_layers())
         if self._is_dflash_hybrid_ctx() and self._mapping.is_last_pp_rank():
             # Hybrid ctx: draft layers live in the target manager, so their
-            # per-token cost adds to the same budget.
+            # per-token cost adds to the same budget. Resolve the manager
+            # class from the draft config: the target may be hybrid-Mamba
+            # while the draft context layers are plain attention.
+            effective_draft_config = self._get_effective_draft_config()
+            draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
+                effective_draft_config,
+                kv_cache_config,
+                is_disagg=self._is_disagg)
             total += self._per_manager_cache_cost(
-                self._kv_cache_manager_cls,
-                self._get_effective_draft_config(),
+                draft_kv_cache_manager_cls,
+                effective_draft_config,
                 kv_cache_config,
                 num_layers=self._get_num_draft_layers())
         return total
