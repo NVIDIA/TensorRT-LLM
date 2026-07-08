@@ -141,11 +141,6 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
 
         if self._use_attn2d_plane:
             cp_size = attn2d_size
-            if tp_size > 1:
-                raise NotImplementedError(
-                    "Combining Attention2D and TP is not yet supported. "
-                    "The row/col group construction does not account for TP ranks."
-                )
         else:
             cp_size = ring_size
 
