@@ -37,6 +37,13 @@ import PIL.Image
 import pytest
 import torch
 
+from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
+    COSMOS3_ACTION_PARAMS,
+    COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION,
+    COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP,
+    COSMOS3_EXTRA_SPECS,
+    COSMOS3_T2I_PARAMS,
+)
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
     COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
     COSMOS3_DEFAULT_SYSTEM_PROMPT,
@@ -46,13 +53,6 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
     _condition_pixel_frame_count,
     _normalize_condition_frame_indexes_vision,
     _normalize_condition_video_keep,
-)
-from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
-    COSMOS3_ACTION_PARAMS,
-    COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION,
-    COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP,
-    COSMOS3_EXTRA_SPECS,
-    COSMOS3_T2I_PARAMS,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
@@ -423,9 +423,7 @@ class TestTokenizePrompt:
             system_prompt="System text.",
         )
 
-        assert tokenizer.conversations == [
-            [{"role": "user", "content": "Describe motion."}]
-        ]
+        assert tokenizer.conversations == [[{"role": "user", "content": "Describe motion."}]]
 
 
 class TestFormatPromptWithMetadataJson:

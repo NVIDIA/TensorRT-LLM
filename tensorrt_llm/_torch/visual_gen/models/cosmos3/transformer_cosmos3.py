@@ -1165,13 +1165,11 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             provided; otherwise None.  action is set when action_latents is provided.
         """
         del kwargs  # Kept for diffusers API compatibility.
-<<<<<<< HEAD
         if timestep is None:
             raise ValueError("Cosmos3VFMTransformer.forward requires normalized timestep.")
         if raw_timestep is None:
             raise ValueError("Cosmos3VFMTransformer.forward requires raw_timestep.")
-=======
-        
+
         if action_latents is not None and audio_latents is not None:
             raise ValueError(
                 "Cosmos3 transformer does not support joint action and audio generation."
@@ -1181,7 +1179,6 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 "Cosmos3 action generation was requested, but this transformer "
                 "was initialized without action modules."
             )
->>>>>>> 270db1b2f7 (cosmos3 action init)
         T, H, W = video_shape
         Hp, Wp, _, _ = self._pad_to_patch_size(H, W)
         max_real_len = text_mask.sum(dim=1).max().item()

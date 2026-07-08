@@ -113,6 +113,7 @@ def _reference_is_video(path: str) -> bool:
     if _reference_is_image(path):
         return False
     import av
+
     try:
         with av.open(path) as container:
             return bool(container.streams.video)
@@ -207,8 +208,7 @@ def parse_visual_gen_params(
             else:
                 os.remove(tmp_path)
                 raise ValueError(
-                    "input_reference content is neither a decodable image "
-                    "nor a decodable video."
+                    "input_reference content is neither a decodable image nor a decodable video."
                 )
             ref_path = os.path.join(
                 media_storage_path, f"{id}_reference{'.mp4' if is_video else '.png'}"

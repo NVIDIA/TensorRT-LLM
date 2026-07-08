@@ -19,9 +19,7 @@ def pil_to_rgb(value: Any) -> PIL.Image.Image:
         return PIL.Image.open(value).convert("RGB")
     if isinstance(value, PIL.Image.Image):
         return value.convert("RGB")
-    raise TypeError(
-        f"Cosmos3 preprocessing expected PIL image or image path, got {type(value)!r}."
-    )
+    raise TypeError(f"Cosmos3 preprocessing expected PIL image or image path, got {type(value)!r}.")
 
 
 def decode_video_file(path: Path, max_frames: Optional[int] = None) -> List[PIL.Image.Image]:

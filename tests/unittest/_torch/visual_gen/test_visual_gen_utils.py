@@ -362,9 +362,7 @@ class TestInputReferenceMaterialization:
         b64 = base64.b64encode(b"neither an image nor a video").decode()
         request = VideoGenerationRequest(prompt="x", input_reference=b64)
         with pytest.raises(ValueError, match="neither a decodable image"):
-            parse_visual_gen_params(
-                request, "vid-6", generator, media_storage_path=str(tmp_path)
-            )
+            parse_visual_gen_params(request, "vid-6", generator, media_storage_path=str(tmp_path))
         # The temporary materialization is removed on rejection.
         assert list(tmp_path.iterdir()) == []
 
