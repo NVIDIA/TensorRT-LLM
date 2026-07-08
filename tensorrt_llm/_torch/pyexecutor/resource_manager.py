@@ -3749,6 +3749,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 request,
                 start=kv_cache.num_committed_tokens,
                 end=request.context_current_position)
+            # TODO: On a disaggregated prefill server, pass is_end=True for
+            # the last context chunk to improve performance.
             kv_cache.commit(tokens)
         if request.context_remaining_length == 0:
             kv_cache.stop_committing()
