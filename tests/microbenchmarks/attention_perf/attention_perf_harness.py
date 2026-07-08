@@ -237,9 +237,10 @@ def _try_clock_lock(gpu_id: int = 0):
     try:
         lock = GPUClockLock(gpu_id=str(gpu_id), interval_ms=100.0, enable_clock_locking=True)
         return lock
-    except Exception:
-        # Construction can fail at runtime (no NVML perms, locking unsupported);
-        # degrade to an unlocked run rather than fail the test.
+    except (RuntimeError, OSError, ValueError) as e:
+        # Construction can fail at runtime (no NVML perms, locking unsupported,
+        # bad gpu_id); degrade to an unlocked run rather than fail the test.
+        print(f"[warn] GPU clock lock unavailable, running unlocked: {e}")
         return None
 
 
@@ -874,8 +875,10 @@ def _collect_signals_inproc(
             if clock is not None:
                 try:
                     clock.teardown()
-                except Exception:
-                    pass
+                except Exception as e:  # noqa: BLE001 - teardown must not fail the test
+                    # Keep the measurement, but surface driver/NVML teardown
+                    # errors instead of hiding them (helps diagnose flaky locks).
+                    print(f"[warn] clock teardown failed: {e}")
 
         # ---- HOOKs: need a dev-exposed counter (discrete-observability gap) ----
         sig.nvrtc_compile_count = _probe_nvrtc_compile_count()  # -> None for now

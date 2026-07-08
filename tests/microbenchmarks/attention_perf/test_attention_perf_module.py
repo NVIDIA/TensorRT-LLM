@@ -478,7 +478,9 @@ def test_mla_fp8_decode_time():
 try:
     from tensorrt_llm._utils import get_sm_version
     _DSA_ARCH_OK = torch.cuda.is_available() and get_sm_version() in (90, 100, 103)
-except Exception:
+except (ImportError, RuntimeError):
+    # ImportError: _utils/get_sm_version unavailable; RuntimeError: CUDA/driver
+    # query failed. Either way DSA cases can't run here -> skip, don't crash.
     _DSA_ARCH_OK = False
 _DSA = pytest.mark.skipif(
     not _DSA_ARCH_OK,
