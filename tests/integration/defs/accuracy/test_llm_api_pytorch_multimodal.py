@@ -769,6 +769,13 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
     )
 
     @pytest.mark.skip_less_device_memory(80000)
+    # The NVBug 6336747 stress stage selects all 20 repetitions.
+    # Ordinary test lists select only repeat_1 for their usual single-run coverage.
+    @pytest.mark.parametrize(
+        "_repeat",
+        range(20),
+        ids=lambda repeat: f"repeat_{repeat + 1}",
+    )
     @pytest.mark.parametrize(
         (
             "model_name,model_path,kv_cache_config,max_batch_size,"
@@ -845,7 +852,11 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
                 ),
                 128,
                 QuantAlgo.MIXED_PRECISION,
-                (MMMU_TASK_SPEC, VOXPOPULI_TASK_SPEC),
+                (
+                    MMMU_TASK_SPEC,
+                    VOXPOPULI_TASK_SPEC,
+                    VIDEOMME_TASK_SPEC,
+                ),
                 None,
                 marks=(skip_pre_blackwell,),
                 id="nvfp4",
@@ -866,6 +877,7 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
             ...,
         ],
         multimodal_config: MultimodalConfig | None,
+        _repeat: int,
     ) -> None:
         multimodal_config_kwargs = {}
         if multimodal_config is not None:
