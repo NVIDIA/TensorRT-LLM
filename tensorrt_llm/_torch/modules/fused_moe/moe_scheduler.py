@@ -160,6 +160,34 @@ class ExternalCommMoEScheduler(MoEScheduler):
         ):
             raise_moe_lora_multichunk_unsupported(num_chunks)
 
+        # ========== 0-token rank deadlock fix ==========
+        # When some ranks have 0 tokens in single-chunk forward with collective comm,
+        # those ranks hang in CUDA kernels (e.g. NVFP4 quantize_input with 0-row tensor)
+        # before reaching moe.comm.dispatch(), causing NCCL AllGather deadlock on
+        # non-zero ranks. Fix: activate DP padding uniformly across all ranks so every
+        # rank uses sizes=None (uniform allgather) and pads x/router_logits to max_tokens.
+        # Mirrors the empty-chunk substitution in _forward_multiple_chunks (line ~597-620).
+        # Existing truncation at Step 4 discards dummy-token outputs automatically.
+        # NOTE: kept after the multi-chunk rejection above so unit tests that stub `moe`
+        # with a minimal namespace (no `.comm`/`.use_dp`) still exercise that path; only
+        # relevant to single-chunk collective comm anyway.
+        if (
+            moe.comm is not None
+            and moe.use_dp
+            and all_rank_max_num_tokens > 0
+            and not use_dp_padding
+            and any(t == 0 for t in all_rank_num_tokens_padded)
+        ):
+            use_dp_padding = True
+            all_rank_num_tokens_padded = [all_rank_max_num_tokens] * len(all_rank_num_tokens)
+            local_n = x.shape[0]
+            if local_n < all_rank_max_num_tokens:
+                pad = all_rank_max_num_tokens - local_n
+                x = torch.cat([x, x.new_zeros((pad, x.shape[1]))], dim=0)
+                router_logits = torch.cat(
+                    [router_logits, router_logits.new_zeros((pad, router_logits.shape[1]))], dim=0
+                )
+
         # May fall back AllToAll -> AllGather; this is the only sanctioned
         # mutation of ``moe.comm`` from a scheduler.
         moe.determine_communication_method(all_rank_num_tokens_padded, num_chunks)

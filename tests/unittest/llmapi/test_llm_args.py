@@ -520,11 +520,27 @@ class TestMultimodalConfig:
 
     def test_default_encoder_cuda_graph_is_none(self):
         assert MultimodalConfig().encoder_cuda_graph is None
+        assert MultimodalConfig().encoder_side_stream_max_ahead == 0
+        assert MultimodalConfig().video_pruning_rate is None
 
     def test_torch_llm_args_default_multimodal_config(self):
         args = TorchLlmArgs(model=llama_model_path)
         assert isinstance(args.multimodal_config, MultimodalConfig)
         assert args.multimodal_config.encoder_cuda_graph is None
+        assert args.multimodal_config.encoder_side_stream_max_ahead == 0
+        assert args.multimodal_config.video_pruning_rate is None
+
+    def test_torch_llm_args_with_encoder_side_stream_max_ahead(self):
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            multimodal_config=MultimodalConfig(encoder_side_stream_max_ahead=2))
+        assert args.multimodal_config.encoder_side_stream_max_ahead == 2
+
+    def test_torch_llm_args_with_multimodal_video_pruning_rate(self):
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            multimodal_config=MultimodalConfig(video_pruning_rate=0.5))
+        assert args.multimodal_config.video_pruning_rate == 0.5
 
     def test_torch_llm_args_with_encoder_cuda_graph_buckets(self):
         args = TorchLlmArgs(
@@ -551,6 +567,31 @@ class TestMultimodalConfig:
         )
         encoder_graph = args.multimodal_config.encoder_cuda_graph
         assert encoder_graph["vision"].buckets == [(1035, 1), (2069, 2)]
+
+    def test_torch_llm_args_with_encoder_side_stream_max_ahead_yaml(self):
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            multimodal_config={
+                "encoder_side_stream_max_ahead": 2,
+                "video_pruning_rate": 0.5,
+            },
+        )
+        assert args.multimodal_config.encoder_side_stream_max_ahead == 2
+        assert args.multimodal_config.video_pruning_rate == 0.5
+
+    def test_encoder_cuda_graph_and_side_stream_max_ahead_are_exclusive(self):
+        with pytest.raises(ValidationError, match="mutually exclusive"):
+            TorchLlmArgs(
+                model=llama_model_path,
+                multimodal_config={
+                    "encoder_cuda_graph": {
+                        "vision": {
+                            "buckets": [[1035, 1]]
+                        }
+                    },
+                    "encoder_side_stream_max_ahead": 1,
+                },
+            )
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -1007,6 +1048,33 @@ class TestExplicitCliKeysPrecedence:
         kv = merged["kv_cache_config"]
         assert kv.free_gpu_memory_fraction == 0.85
         assert kv.enable_block_reuse is False
+
+    def test_multimodal_config_yaml_siblings_preserved(self):
+        base = {
+            "model": "dummy",
+            "multimodal_config":
+            MultimodalConfig(encoder_side_stream_max_ahead=2),
+        }
+        yaml_dict = {
+            "multimodal_config": {
+                "video_pruning_rate": 0.5,
+            }
+        }
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        multimodal_config = merged["multimodal_config"]
+        assert multimodal_config.encoder_side_stream_max_ahead == 2
+        assert multimodal_config.video_pruning_rate == 0.5
+
+    def test_multimodal_config_null_yaml_preserves_base_config(self):
+        base = {
+            "model": "dummy",
+            "multimodal_config":
+            MultimodalConfig(encoder_side_stream_max_ahead=2),
+        }
+        yaml_dict = {"multimodal_config": None}
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        multimodal_config = merged["multimodal_config"]
+        assert multimodal_config.encoder_side_stream_max_ahead == 2
 
     def test_build_config_tier_cli_wins(self):
         # Tier 1: explicit CLI scalar wins over both top-level YAML and nested.
@@ -1858,6 +1926,15 @@ class TestStrictBaseModelArbitraryArgs:
         assert config.max_tokens_in_buffer == 1024
         assert config.kv_transfer_poll_interval_ms == 5000
 
+        # The bounce on/off switch defaults to off (0), accepts a positive size, and rejects
+        # negatives at the Pydantic boundary (ge=0). It is a Python-only field consumed directly by
+        # the v2 transceiver, so it is intentionally not part of _to_pybind().
+        assert config.kv_cache_bounce_size_mb == 0
+        assert CacheTransceiverConfig(
+            kv_cache_bounce_size_mb=384).kv_cache_bounce_size_mb == 384
+        with pytest.raises(pydantic_core._pydantic_core.ValidationError):
+            CacheTransceiverConfig(kv_cache_bounce_size_mb=-1)
+
         # Arbitrary arguments should be rejected
         with pytest.raises(
                 pydantic_core._pydantic_core.ValidationError) as exc_info:
@@ -2030,6 +2107,17 @@ class TestServeDefaults:
 
         assert llm_args.get("max_batch_size") == 128
         assert llm_args.get("tensor_parallel_size") == 4
+
+    def test_serve_video_pruning_rate_maps_to_multimodal_config(self):
+        llm_args, _ = get_llm_args(
+            model=llama_model_path,
+            backend="pytorch",
+            video_pruning_rate=0.5,
+            explicit_cli_keys={"video_pruning_rate"},
+        )
+
+        assert "video_pruning_rate" not in llm_args
+        assert llm_args["multimodal_config"].video_pruning_rate == 0.5
 
     def test_serve_backend_specific_configs(self):
         # PyTorch backend: build_config / scheduler_config stay None and are
@@ -2906,6 +2994,17 @@ class TestDeepSeekV4SparseAttentionConfig:
 
         with pytest.raises(ValidationError, match="requires SM>=100"):
             DeepSeekV4SparseAttentionConfig(indexer_k_dtype="fp4")
+
+    def test_lowers_to_deepseek_v4_sparse_params(self):
+        config = DeepSeekV4SparseAttentionConfig(compress_ratios=[0, 4, 128])
+
+        sparse_params = config.to_sparse_params()
+        sparse_metadata_params = config.to_sparse_metadata_params()
+
+        assert sparse_params.algorithm == "deepseek_v4"
+        assert sparse_params.compress_ratios == [1, 4, 128]
+        assert sparse_metadata_params.compress_ratios == [1, 4, 128]
+        assert sparse_metadata_params.window_size == 128
 
     @pytest.mark.parametrize("compress_ratios", [[], [-1, 4, 128]])
     def test_invalid_compress_ratios_raise(self, compress_ratios):

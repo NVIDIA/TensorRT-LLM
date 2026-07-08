@@ -23,6 +23,7 @@ from .executor import GenerationExecutor
 from .postproc_worker import PostprocWorkerConfig
 from .proxy import _check_collective_rpc_guard
 from .result import IterationResult
+from .rpc.rpc_common import RPCError
 from .rpc_proxy_mixin import RpcExecutorMixin
 from .rpc_worker import RpcWorker
 from .utils import create_mpi_comm_session, get_spawn_proxy_process_env
@@ -114,6 +115,17 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         except Exception as e:
             logger.debug(f"Error fetching stats via RPC: {e}")
             return []
+
+    def get_kv_cache_capacity(self) -> dict:
+        """Get static primary/GPU KV cache capacity from the runtime via RPC."""
+        try:
+            capacity = self.rpc_client.fetch_kv_cache_capacity_async().remote()
+            if isinstance(capacity, str):
+                capacity = json.loads(capacity)
+            return capacity if isinstance(capacity, dict) else {}
+        except (RPCError, json.JSONDecodeError) as e:
+            logger.debug(f"Error fetching kv cache capacity via RPC: {e}")
+            return {}
 
     def aget_stats(self, timeout: float) -> IterationResult:
         """Get iteration statistics from the runtime via RPC (async).

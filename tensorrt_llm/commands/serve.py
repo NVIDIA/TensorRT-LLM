@@ -15,6 +15,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Set
 
 import click
 import torch
+import uvloop
 import yaml
 from strenum import StrEnum
 from torch.cuda import device_count
@@ -37,7 +38,8 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               parse_disagg_config_file,
                                               parse_metadata_server_config_file,
                                               validate_config_bool)
-from tensorrt_llm.llmapi.llm_args import TorchLlmArgs, TrtLlmArgs
+from tensorrt_llm.llmapi.llm_args import (MultimodalConfig, TorchLlmArgs,
+                                          TrtLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr
 from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
@@ -149,6 +151,7 @@ def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
         "kv_cache_config": ("free_gpu_memory_fraction", "kv_cache_dtype"),
         "build_config":
         ("max_batch_size", "max_num_tokens", "max_beam_width", "max_seq_len"),
+        "multimodal_config": ("video_pruning_rate", ),
     }
     if any(s in explicit_cli_keys
            for s in cli_derived_fields.get(param_name, ())):
@@ -294,8 +297,9 @@ def get_llm_args(
         otlp_traces_endpoint,
         "fail_fast_on_attention_window_too_large":
         fail_fast_on_attention_window_too_large,
-        "video_pruning_rate":
-        video_pruning_rate,
+        "multimodal_config":
+        MultimodalConfig(video_pruning_rate=video_pruning_rate)
+        if video_pruning_rate is not None else None,
         "telemetry_config":
         _telemetry_config.TelemetryConfig(
             disabled=not telemetry,
@@ -381,7 +385,9 @@ def launch_server(
         disagg_cluster_config: Optional[DisaggClusterConfig] = None,
         multimodal_server_config: Optional[MultimodalServerConfig] = None,
         served_model_name: Optional[str] = None,
-        allow_request_chat_template: bool = False):
+        allow_request_chat_template: bool = False,
+        input_processor_workers: int = 8,
+        media_load_workers: int = 8):
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
@@ -430,14 +436,16 @@ def launch_server(
             disagg_cluster_config=disagg_cluster_config,
             multimodal_server_config=multimodal_server_config,
             chat_template=chat_template,
-            allow_request_chat_template=allow_request_chat_template)
+            allow_request_chat_template=allow_request_chat_template,
+            input_processor_workers=input_processor_workers,
+            media_load_workers=media_load_workers)
         _apply_fastapi_middlewares(server.app, middleware)
 
         # Optionally disable GC (default: not disabled)
         if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
             gc.disable()
 
-        asyncio.run(server(host, port, sockets=[s]))
+        uvloop.run(server(host, port, sockets=[s]))
 
 
 def launch_grpc_server(host: str,
@@ -563,7 +571,7 @@ def launch_grpc_server(host: str,
 
             logger.info("Shutdown complete")
 
-    asyncio.run(serve_grpc_async())
+    uvloop.run(serve_grpc_async())
 
 
 def launch_mm_encoder_server(
@@ -584,7 +592,7 @@ def launch_mm_encoder_server(
         metadata_server_cfg=metadata_server_cfg,
         tool_parser=None,
         allow_request_chat_template=allow_request_chat_template)
-    asyncio.run(server(host, port))
+    uvloop.run(server(host, port))
 
 
 def launch_visual_gen_server(
@@ -642,7 +650,7 @@ def launch_visual_gen_server(
                               metadata_server_cfg=metadata_server_cfg,
                               tool_parser=None)
         _apply_fastapi_middlewares(server.app, middleware)
-        asyncio.run(server(host, port, sockets=[s]))
+        uvloop.run(server(host, port, sockets=[s]))
 
 
 class ChoiceWithAlias(click.Choice):
@@ -809,6 +817,22 @@ class ChoiceWithAlias(click.Choice):
                   default=0,
                   help="Number of workers to postprocess raw responses "
                   "to comply with OpenAI protocol.",
+                  status="prototype")
+@stability_option("--input-processor-workers",
+                  "input_processor_workers",
+                  type=click.IntRange(min=1),
+                  default=8,
+                  help="Size of the dedicated thread pool that runs the HF "
+                  "input processor (multimodal preprocess) on the chat "
+                  "and completion endpoints.",
+                  status="prototype")
+@stability_option("--media-load-workers",
+                  "media_load_workers",
+                  type=click.IntRange(min=1),
+                  default=8,
+                  help="Size of the dedicated thread pool that decodes media "
+                  "payloads (image / video / audio) for multimodal "
+                  "requests.",
                   status="prototype")
 @stability_option("--trust_remote_code",
                   is_flag=True,
@@ -986,7 +1010,8 @@ def serve(
         moe_expert_parallel_size: Optional[int],
         moe_cluster_parallel_size: Optional[int], gpus_per_node: Optional[int],
         free_gpu_memory_fraction: float, kv_cache_dtype: str,
-        num_postprocess_workers: int, trust_remote_code: bool,
+        num_postprocess_workers: int, input_processor_workers: int,
+        media_load_workers: int, trust_remote_code: bool,
         revision: Optional[str], extra_llm_api_options: Optional[str],
         reasoning_parser: Optional[str], tool_parser: Optional[str],
         metadata_server_config_file: Optional[str], server_role: Optional[str],
@@ -1187,7 +1212,9 @@ def serve(
                 disagg_cluster_config,
                 multimodal_server_config,
                 served_model_name=served_model_name,
-                allow_request_chat_template=allow_request_chat_template)
+                allow_request_chat_template=allow_request_chat_template,
+                input_processor_workers=input_processor_workers,
+                media_load_workers=media_load_workers)
 
     def _serve_visual_gen():
         parsed_visual_gen_args = (VisualGenArgs.from_yaml(visual_gen_args)
@@ -1469,7 +1496,7 @@ def disaggregated(
         if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
             gc.disable()
 
-        asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port, sockets=[s]))
+        uvloop.run(server(disagg_cfg.hostname, disagg_cfg.port, sockets=[s]))
 
 
 def set_cuda_device():

@@ -280,6 +280,16 @@ class BaseWorker(GenerationExecutor):
         else:
             return self.engine.get_latest_iteration_stats()
 
+    def fetch_kv_cache_capacity(self) -> dict:
+        if self.engine is None or isinstance(self.engine, tllm.Executor):
+            return {}
+
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+        if isinstance(self.engine, PyExecutor):
+            return self.engine.get_kv_cache_capacity()
+
+        return {}
+
     def fetch_kv_cache_events(self) -> list:
         if isinstance(self.engine, tllm.Executor):
             return self.engine.get_latest_kv_cache_events()
@@ -828,6 +838,10 @@ class BaseWorker(GenerationExecutor):
 
         # Convert back to JSON string
         return json.dumps(stats_dict)
+
+    @staticmethod
+    def _kv_cache_capacity_serializer(capacity) -> str:
+        return json.dumps(capacity)
 
     # Define a Callable to serialize KV cache events
     @staticmethod
