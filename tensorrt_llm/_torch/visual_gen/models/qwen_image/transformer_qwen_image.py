@@ -309,6 +309,14 @@ def apply_rotary_emb_qwen(
     return x_out.type_as(x)
 
 
+def qwen_complex_freqs_to_cos_sin(freqs_cis: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Convert Qwen's complex RoPE cache to shared interleaved real cos/sin tensors."""
+    freqs_cis = torch.view_as_real(freqs_cis)
+    freqs_cos = freqs_cis[..., 0].repeat_interleave(2, dim=-1).unsqueeze(1).float().contiguous()
+    freqs_sin = freqs_cis[..., 1].repeat_interleave(2, dim=-1).unsqueeze(1).float().contiguous()
+    return freqs_cos, freqs_sin
+
+
 class QwenEmbedRope(nn.Module):
     """3D rotary position embedding over (frame, height, width) axes.
 
@@ -474,9 +482,7 @@ class QwenJointAttention(Attention):
             qk_norm_mode="per_head",
             eps=eps,
             bias=True,
-            # TODO: enable fused qk-norm+RoPE after adapting Qwen's
-            # complex frequency cache to the shared real cos/sin format.
-            fuse_qk_norm_rope=False,
+            fuse_qk_norm_rope=(config.mapping.tp_size == 1),
             config=config,
             layer_idx=layer_idx,
             module_name=module_name,
@@ -539,16 +545,56 @@ class QwenJointAttention(Attention):
     def _apply_rms_norm(x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
         return F.rms_norm(x, (x.shape[-1],), norm.weight, norm.variance_epsilon)
 
-    def forward(
+    def _use_fused_qk_norm_rope(
+        self,
+        hidden_states: torch.Tensor,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> bool:
+        return (
+            self.fuse_qk_norm_rope
+            and image_rotary_emb is not None
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and self.head_dim in (64, 128, 256)
+        )
+
+    def _prepare_qkv_fused(
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
-        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        timestep: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        seq_txt = encoder_hidden_states.shape[1]
+        image_rotary_emb: Tuple[torch.Tensor, torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        img_q, img_k, img_v = self.get_qkv(hidden_states)
+        txt_q = self.add_q_proj(encoder_hidden_states)
+        txt_k = self.add_k_proj(encoder_hidden_states)
+        txt_v = self.add_v_proj(encoder_hidden_states)
 
+        txt_qkv = torch.cat([txt_q, txt_k, txt_v], dim=-1)
+        img_qkv = torch.cat([img_q, img_k, img_v], dim=-1)
+        qkv = torch.cat([txt_qkv, img_qkv], dim=1)
+
+        img_freqs, txt_freqs = image_rotary_emb
+        txt_cos, txt_sin = qwen_complex_freqs_to_cos_sin(txt_freqs)
+        img_cos, img_sin = qwen_complex_freqs_to_cos_sin(img_freqs)
+        freqs_cos = torch.cat([txt_cos, img_cos], dim=0)
+        freqs_sin = torch.cat([txt_sin, img_sin], dim=0)
+
+        self.apply_packed_qk_norm_rope(
+            qkv,
+            freqs_cos,
+            freqs_sin,
+            num_txt_tokens=encoder_hidden_states.shape[1],
+            q_add_weight=self.norm_added_q.weight,
+            k_add_weight=self.norm_added_k.weight,
+        )
+        return qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
+
+    def _prepare_qkv_unfused(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Image QKV.
         img_q, img_k, img_v = self.get_qkv(hidden_states)
         # Text QKV.
@@ -579,15 +625,34 @@ class QwenJointAttention(Attention):
             txt_k = apply_rotary_emb_qwen(txt_k, txt_freqs, use_real=False)
 
         # Joint attention: [txt | img] order.
-        joint_q = torch.cat([txt_q, img_q], dim=1)
-        joint_k = torch.cat([txt_k, img_k], dim=1)
-        joint_v = torch.cat([txt_v, img_v], dim=1)
+        joint_q = torch.cat([txt_q, img_q], dim=1).flatten(2)
+        joint_k = torch.cat([txt_k, img_k], dim=1).flatten(2)
+        joint_v = torch.cat([txt_v, img_v], dim=1).flatten(2)
+        return joint_q, joint_k, joint_v
 
-        # SDPA expects (B, H, S, D); diffusers dispatch_attention_fn
-        # accepts (B, S, H, D) and transposes internally. Do the same.
-        joint_q = joint_q.transpose(1, 2)
-        joint_k = joint_k.transpose(1, 2)
-        joint_v = joint_v.transpose(1, 2)
+    def _prepare_qkv(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._use_fused_qk_norm_rope(hidden_states, image_rotary_emb):
+            return self._prepare_qkv_fused(hidden_states, encoder_hidden_states, image_rotary_emb)
+        return self._prepare_qkv_unfused(hidden_states, encoder_hidden_states, image_rotary_emb)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        timestep: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        seq_txt = encoder_hidden_states.shape[1]
+
+        joint_q, joint_k, joint_v = self._prepare_qkv(
+            hidden_states, encoder_hidden_states, image_rotary_emb
+        )
 
         attn_mask = None
         if attention_mask is not None:
@@ -598,13 +663,13 @@ class QwenJointAttention(Attention):
             attn_mask = attention_mask[:, None, None, :]
 
         if attn_mask is None:
-            out = self._attn_impl(
-                joint_q.transpose(1, 2).flatten(2),
-                joint_k.transpose(1, 2).flatten(2),
-                joint_v.transpose(1, 2).flatten(2),
-                timestep=timestep,
-            )
+            out = self._attn_impl(joint_q, joint_k, joint_v, timestep=timestep)
         else:
+            # SDPA expects (B, H, S, D); diffusers dispatch_attention_fn
+            # accepts (B, S, H, D) and transposes internally. Do the same.
+            joint_q = joint_q.unflatten(-1, (self.heads, -1)).transpose(1, 2)
+            joint_k = joint_k.unflatten(-1, (self.heads, -1)).transpose(1, 2)
+            joint_v = joint_v.unflatten(-1, (self.heads, -1)).transpose(1, 2)
             out = F.scaled_dot_product_attention(
                 joint_q, joint_k, joint_v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
             )

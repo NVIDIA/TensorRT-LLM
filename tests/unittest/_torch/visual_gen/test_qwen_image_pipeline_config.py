@@ -7,12 +7,20 @@ import json
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 # Importing the models package applies the Qwen-Image registration side effect.
 from tensorrt_llm._torch.visual_gen import models  # noqa: F401
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, DiffusionPipelineConfig
-from tensorrt_llm._torch.visual_gen.models.qwen_image import QwenJointAttention
-from tensorrt_llm._torch.visual_gen.modules.attention import QKVMode
+from tensorrt_llm._torch.visual_gen.models.qwen_image import (
+    QwenImageTransformer2DModel,
+    QwenJointAttention,
+    apply_rotary_emb_qwen,
+)
+from tensorrt_llm._torch.visual_gen.models.qwen_image.transformer_qwen_image import (
+    qwen_complex_freqs_to_cos_sin,
+)
+from tensorrt_llm._torch.visual_gen.modules.attention import QKVMode, apply_rotary_emb
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.visual_gen.args import (
@@ -226,3 +234,49 @@ def test_qwen_joint_attention_keeps_separate_qkv_path_unwrapped(visual_gen_mappi
 
     assert attention.qkv_mode == QKVMode.SEPARATE_QKV
     assert attention.attn.__class__.__name__ != not_wrapped_as
+
+
+def test_qwen_complex_freqs_convert_to_shared_rope_format():
+    torch.manual_seed(0)
+    seq_len = 8
+    head_dim = 16
+    x = torch.randn(2, seq_len, 3, head_dim)
+    phases = torch.randn(seq_len, head_dim // 2)
+    freqs_cis = torch.polar(torch.ones_like(phases), phases)
+
+    freqs_cos, freqs_sin = qwen_complex_freqs_to_cos_sin(freqs_cis)
+
+    ref = apply_rotary_emb_qwen(x, freqs_cis)
+    out = apply_rotary_emb(x, freqs_cos, freqs_sin)
+    torch.testing.assert_close(out, ref, rtol=1e-6, atol=1e-6)
+
+
+def test_qwen_transformer_cpu_fallback_uses_unfused_qk_norm_rope():
+    torch.manual_seed(0)
+    model = QwenImageTransformer2DModel(
+        model_config=DiffusionModelConfig(),
+        patch_size=1,
+        in_channels=4,
+        out_channels=4,
+        num_layers=1,
+        attention_head_dim=8,
+        num_attention_heads=2,
+        joint_attention_dim=16,
+        caption_channels=16,
+        axes_dims_rope=(4, 6, 6),
+    ).eval()
+
+    hidden_states = torch.randn(1, 4, 4)
+    encoder_hidden_states = torch.randn(1, 5, 16)
+    timestep = torch.tensor([1.0])
+
+    assert model.transformer_blocks[0].attn.fuse_qk_norm_rope
+    out = model(
+        hidden_states=hidden_states,
+        encoder_hidden_states=encoder_hidden_states,
+        timestep=timestep,
+        img_shapes=[(1, 2, 2)],
+        txt_seq_lens=torch.tensor([5]),
+    )
+
+    assert out[0].shape == hidden_states.shape
